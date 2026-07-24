@@ -3301,8 +3301,13 @@ fn boot_userspace_init() {
     // global input ring so /dev/console reads see them. Bounded
     // per-tick so a runaway producer can't monopolise the pump.
     fn serial_input_pump() {
+        // Non-blocking: this backstop fires on every core's every park, so
+        // it must NEVER spin on the shared CONSOLE.lock — under a
+        // thread-dense SMP workload (KDE Plasma) that becomes a
+        // machine-wide thundering herd. IRQ 4 is the primary RX path; a
+        // skipped cycle when the lock is contended is free.
         for _ in 0..16 {
-            match narf_console::try_read_byte() {
+            match narf_console::try_read_byte_uncontended() {
                 Some(b) => {
                     let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
                 }

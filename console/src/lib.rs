@@ -193,15 +193,39 @@ pub fn enable_rx_irq() {
 /// runs alongside another CPU writing — single-CPU today).
 pub fn try_read_byte() -> Option<u8> {
     let _g = CONSOLE.lock.lock();
+    read_byte_locked()
+}
+
+/// Non-blocking variant: drain one RX byte only if the console lock is
+/// FREE, returning `None` immediately when another CPU holds it.
+///
+/// The serial-input `sleep_pump` runs on EVERY core's EVERY park, and
+/// `CONSOLE.lock` is a single coarse lock shared with `write_str`. On a
+/// many-core box running a thread-dense workload (KDE Plasma: dozens of
+/// threads parking on futexes/poll thousands of times a second across
+/// all vCPUs), the blocking `try_read_byte` turns every park into a
+/// contended acquire — a thundering herd that serialises the whole
+/// machine through one lock (measured: ~28% of all CPU spinning here
+/// under Plasma, second only to idle). The pump is a DEFENSIVE BACKSTOP;
+/// IRQ 4 is the primary RX path, so a skipped pump cycle costs nothing —
+/// the IRQ (or the next uncontended park) delivers the byte. Skipping on
+/// contention removes the herd entirely.
+pub fn try_read_byte_uncontended() -> Option<u8> {
+    let _g = CONSOLE.lock.try_lock()?;
+    read_byte_locked()
+}
+
+/// Read one RX byte with `CONSOLE.lock` already held.
+fn read_byte_locked() -> Option<u8> {
     let kind = *CONSOLE.kind.get()?;
     let base = CONSOLE.base.load(Ordering::Acquire) as usize;
     if base == 0 {
         return None;
     }
     // SAFETY: kind + base were published via Release by `early_init`
-    // / `remap_to_virtual`; we hold the coarse lock; the backend's
-    // `try_read_byte` is a one-shot LSR/FR + RBR/DR read with no TX
-    // side effects.
+    // / `remap_to_virtual`; the caller holds the coarse lock; the
+    // backend's `try_read_byte` is a one-shot LSR/FR + RBR/DR read with
+    // no TX side effects.
     // SAFETY: Valid memory or trusted environment
     unsafe { backend::try_read_byte(base, kind) }
 }
