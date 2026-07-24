@@ -276,6 +276,23 @@ pub fn install_proc_ext_hooks(
     AUXV_HOOK.store(auxv as usize, Ordering::Release);
 }
 
+/// Test-only: snapshot the `fd_path` hook slot and put it back.
+///
+/// The hooks are process-global and normally installed exactly once at
+/// boot, so a test that needs one installed would otherwise leave it
+/// installed for every test that runs after it — and at least one test
+/// asserts the un-hooked behaviour. Snapshot, install, assert, restore.
+#[doc(hidden)]
+pub fn __test_fd_path_hook_snapshot() -> usize {
+    FD_PATH_HOOK.load(Ordering::Acquire)
+}
+
+/// Test-only counterpart to [`__test_fd_path_hook_snapshot`].
+#[doc(hidden)]
+pub fn __test_fd_path_hook_restore(prev: usize) {
+    FD_PATH_HOOK.store(prev, Ordering::Release);
+}
+
 /// Wire the writable per-pid procfs hooks. Called once at boot after
 /// `install_proc_ext_hooks`.
 ///

@@ -3294,6 +3294,26 @@ pub fn kernel_syscall_entry_plain_with_state(
     #[cfg(feature = "linux-compat")]
     let entry_rip = ctx.rip();
     table.dispatch(n, &mut ctx);
+    // Return-value half of the trace. Without it the log shows what was
+    // ASKED but not what was ANSWERED, which is exactly what you need when
+    // userspace takes a different branch than it does on Linux (an epoll
+    // that reports no events, a read that returns 0 instead of EAGAIN, a
+    // handler answering a bare -1 that glibc renders as EPERM). Printed as
+    // a signed decimal so negative errnos are readable at a glance.
+    #[cfg(feature = "syscall-trace")]
+    if syscall_trace_relevant(n) {
+        use core::fmt::Write as _;
+        let r = ctx.ret;
+        let _ = writeln!(
+            narf_console::Writer,
+            "SYSR t={} {} = {} ({:#x}) st={:?}",
+            crate::handlers::current_task_id(),
+            table.name_of(n).unwrap_or("?"),
+            r.value as i64,
+            r.value,
+            r.status,
+        );
+    }
     // PTRACE_SYSCALL exit-stop: after the syscall body, before returning to
     // user, stop again so the tracer can read the return value (rax). The
     // stop machinery re-uses the job-control park path, which mirrors 0 into

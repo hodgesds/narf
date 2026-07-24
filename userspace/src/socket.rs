@@ -3027,6 +3027,52 @@ impl SocketFile {
 
 const RING_CAP: usize = 64 * 1024;
 
+/// Dropping the last reference to a connected socket end is a HANGUP for
+/// the peer: its reads must start returning 0 (EOF) and its
+/// `poll`/`epoll` must report `POLLIN`/`POLLHUP`.
+///
+/// Before this, `RingBuf::close` was reachable ONLY from an explicit
+/// `shutdown(2)`. A process that simply `close(2)`d its end — or, far more
+/// commonly, just EXITED and let fd-table teardown drop it — left the
+/// peer's ring un-closed forever, so the peer saw neither data nor EOF and
+/// parked until some coarse timeout.
+///
+/// dbus-daemon is the canonical victim: its babysitter reports an
+/// activated service's exit status over a socketpair and then exits
+/// WITHOUT closing it, and dbus waits for the resulting EOF to conclude
+/// the activation. With no EOF it sat in `epoll_wait` for the full 120s
+/// `service_start_timeout`, which is what made every failed D-Bus
+/// activation cost two minutes and stalled the KDE Plasma session.
+///
+/// `Drop` is the right hook because it fires exactly when the LAST holder
+/// goes away — which is precisely POSIX's "last descriptor closed", and
+/// covers `close(2)`, `dup`'d copies, fork-inherited copies, and process
+/// exit uniformly. (The global socket registry keeps only `Weak` handles,
+/// so it does not pin the refcount.)
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        // `tx` is the ring THIS end writes into and the PEER reads from,
+        // so closing it is what surfaces EOF over there. `rx` belongs to
+        // this dying end and needs no marking.
+        let closed_tx = match &*self.state.lock() {
+            SocketState::UnixConnected { tx, .. }
+            | SocketState::InetConnected { tx, .. }
+            | SocketState::Inet6Connected { tx, .. } => {
+                tx.close();
+                true
+            }
+            _ => false,
+        };
+        if closed_tx {
+            // Same reasoning as `do_send`: go through `readiness::notify`
+            // rather than a bare wake so the generation is bumped and a
+            // peer parked in an INFINITE-timeout epoll_wait/poll actually
+            // re-runs its readiness scan instead of silently re-parking.
+            narf_net::readiness::notify(0);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RingBuf {
     inner: IrqSafeSpinLock<RingInner>,

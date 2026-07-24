@@ -531,6 +531,7 @@ fn main() {
         "sockpair_smoke",
         "sockpairfork_smoke",
         "unlinkopen_smoke",
+        "pipehup_smoke",
         "accept4_smoke",
         "mremap_smoke",
         "sendfile_smoke",

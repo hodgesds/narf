@@ -5530,22 +5530,35 @@ fn sys_linkat(ctx: &mut dyn TrapContext) {
     // named file falls through to the ordinary path-based hard link.
     let old_eff = with_dirfd(args.arg0 as i64, old_raw);
     if let Some(src_fd) = parse_proc_self_fd(&old_eff) {
-        // "Pathless" has to mean "no real filesystem path", NOT
-        // "fd_path_of returned None": that helper synthesises an
-        // `anon_inode:[TypeName]` placeholder for every fd with no
-        // recorded backing path, so it never answers None for a live fd
-        // and this branch was unreachable. Qt's QSaveFile — every
-        // KDE/KSycoca database write — materialises its O_TMPFILE inode
-        // with exactly this call, so it fell through to the path-based
-        // hard link, where `/proc/self/fd/N` and the target are in
-        // different directories and the answer was EXDEV ("Invalid
-        // cross-device link", database never written).
-        let pathless = fd_path_of(task, src_fd).is_none_or(|p| !p.starts_with('/'));
-        if pathless && fd::with_table(task, |t| t.get(src_fd).is_some()).unwrap_or(false) {
+        // `linkat(…, "/proc/self/fd/N", …, AT_SYMLINK_FOLLOW)` means "give
+        // the object this fd refers to another name", so linking the fd's
+        // NODE is the direct answer — for an anonymous O_TMPFILE inode and
+        // for an already-named file alike. Qt's QSaveFile (every
+        // KDE/KConfig/KSycoca database write) materialises its O_TMPFILE
+        // inode with exactly this call.
+        //
+        // The previous guard tried to detect an "anonymous" fd first and
+        // only then take this route, which was wrong twice over: it asked
+        // `fd_path_of(..).is_none()`, and that helper synthesises an
+        // `anon_inode:[TypeName]` placeholder rather than ever answering
+        // None — so the branch was dead and every such call fell through
+        // to the path-based hard link, where `/proc/self/fd/N` and the
+        // target sit in different directories and the answer was EXDEV
+        // ("Invalid cross-device link", database never written). Worse,
+        // `fd_path_of` can hand back a STALE path for a recycled fd
+        // number, so any predicate built on it is unreliable.
+        //
+        // Instead: take the node route whenever the fd is live, and fall
+        // back to the ordinary path-based link only if this filesystem
+        // can't adopt a foreign node (-EOPNOTSUPP from `link_node`).
+        if fd::with_table(task, |t| t.get(src_fd).is_some()).unwrap_or(false) {
+            const EOPNOTSUPP: i64 = -95;
             let new_abs = resolve_cwd_path(task, &new_eff);
             let r = link_fd_node_impl(task, src_fd, &new_abs);
-            ctx.set_return(SyscallReturn::ok(r as u64));
-            return;
+            if r != EOPNOTSUPP {
+                ctx.set_return(SyscallReturn::ok(r as u64));
+                return;
+            }
         }
     }
 

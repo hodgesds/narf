@@ -203,6 +203,59 @@ int main(void) {
         return 1;
     }
 
+    // 6) PEER EXIT must be an EOF, not silence. After the process holding
+    //    the other end goes away, the surviving end has to report hangup:
+    //    poll(2) wakes with POLLIN/POLLHUP and read(2) returns 0. The peer
+    //    here never calls close(2) — it just _exit()s, so only fd-table
+    //    teardown can mark the socket closed.
+    //
+    //    dbus-daemon waits for exactly this. Its babysitter reports the
+    //    service's exit status over the socketpair and then exits; dbus
+    //    reads the status, then waits for EOF to know the babysitter is
+    //    gone and the activation is finished. With no EOF it sits in
+    //    epoll_wait until the 120s service_start_timeout, so every failed
+    //    D-Bus activation costs two minutes.
+    int sv4[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv4) < 0) {
+        w("sockpairfork-fail: create4\n");
+        return 1;
+    }
+    pid_t pid4 = fork();
+    if (pid4 < 0) {
+        w("sockpairfork-fail: fork4\n");
+        return 1;
+    }
+    if (pid4 == 0) {
+        close(sv4[0]);
+        write(sv4[1], "bye!", 4);
+        _exit(0); // deliberately NO close(sv4[1])
+    }
+    close(sv4[1]);
+    // Drain the payload first, so what follows can only be the hangup.
+    char b4[8];
+    memset(b4, 0, sizeof(b4));
+    struct pollfd p4 = { .fd = sv4[0], .events = POLLIN };
+    if (poll(&p4, 1, 10000) <= 0 || read(sv4[0], b4, 4) != 4) {
+        w("sockpairfork-fail: payload4\n");
+        return 1;
+    }
+    int st4 = 0;
+    if (waitpid(pid4, &st4, 0) != pid4) {
+        w("sockpairfork-fail: child4 status\n");
+        return 1;
+    }
+    // Peer is now gone and the buffer is empty: this must be EOF.
+    struct pollfd h4 = { .fd = sv4[0], .events = POLLIN };
+    int hr = poll(&h4, 1, 10000);
+    if (hr <= 0 || !(h4.revents & (POLLIN | POLLHUP))) {
+        w("sockpairfork-fail: peer exit did not raise POLLIN/POLLHUP\n");
+        return 1;
+    }
+    if (read(sv4[0], b4, sizeof(b4)) != 0) {
+        w("sockpairfork-fail: read after peer exit did not report EOF\n");
+        return 1;
+    }
+
     w("sockpairfork-ok\n");
     return 0;
 }
