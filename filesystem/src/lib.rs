@@ -594,6 +594,21 @@ pub trait FileOps: Send + Sync {
         false
     }
 
+    /// True when a blocking write that made no progress (returned 0) should
+    /// PARK the writer rather than hand userspace a spurious 0 — a pipe/FIFO
+    /// whose buffer is full and still has an open reader (POSIX: a blocking
+    /// write waits for room). Default false (a 0-byte write elsewhere is a
+    /// real result, not a would-block).
+    fn write_should_block(&self) -> bool {
+        false
+    }
+
+    /// Pipe buffer capacity in bytes, for `fcntl(F_GETPIPE_SZ/F_SETPIPE_SZ)`.
+    /// `None` for a non-pipe fd (fcntl then reports EINVAL, matching Linux).
+    fn pipe_capacity(&self) -> Option<usize> {
+        None
+    }
+
     /// True when this fd is a non-seekable byte stream (pipe, socket,
     /// FIFO) rather than a regular file / block device. Linux `sendfile(2)`
     /// requires the *input* fd to be mmap-capable, so a stream source is

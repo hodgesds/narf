@@ -4263,6 +4263,11 @@ define_smoke_elf!(
     "NARF_SIGRCX_SMOKE_ELF_AARCH64"
 );
 define_smoke_elf!(
+    NARF_PIPEBLK_SMOKE_ELF,
+    "NARF_PIPEBLK_SMOKE_ELF_X86_64",
+    "NARF_PIPEBLK_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
     NARF_FS_SMOKE_ELF,
     "NARF_FS_SMOKE_ELF_X86_64",
     "NARF_FS_SMOKE_ELF_AARCH64"

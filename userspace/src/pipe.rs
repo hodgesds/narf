@@ -35,7 +35,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// Pipe ring capacity. Matches a single 4 KiB user page so a future
 /// kernel-only Stage-5 zero-copy revision can drop the VecDeque for
 /// a fixed-array-backed scheme without renumbering callers.
-const PIPE_BUF_BYTES: usize = 4096;
+const PIPE_BUF_BYTES: usize = 65536;
 
 /// Shared mutable state between the read+write halves: the byte
 /// queue plus a "writer dropped" flag. The `closed_*` flags let
@@ -189,6 +189,10 @@ impl FileOps for PipeRead {
         // duplicates pipe data, leaving the source readable.
         Some(q.iter().copied().take(n).collect())
     }
+
+    fn pipe_capacity(&self) -> Option<usize> {
+        Some(PIPE_BUF_BYTES)
+    }
 }
 
 impl FileOps for PipeWrite {
@@ -229,5 +233,17 @@ impl FileOps for PipeWrite {
             mask |= narf_filesystem::POLL_OUT;
         }
         mask
+    }
+
+    fn write_should_block(&self) -> bool {
+        // A full-pipe write returns 0; block the writer (POSIX blocking write
+        // waits for room) as long as a reader is still open. When the reader
+        // has closed, write() returns buf.len() (discard) rather than 0, so
+        // this is only consulted while the reader is present.
+        !self.shared.reader_closed.load(Ordering::Acquire)
+    }
+
+    fn pipe_capacity(&self) -> Option<usize> {
+        Some(PIPE_BUF_BYTES)
     }
 }

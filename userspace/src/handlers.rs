@@ -1588,15 +1588,16 @@ fn sys_write(ctx: &mut dyn TrapContext) {
     // spin forever with interrupts masked.
     let snapshot = fd::with_table(task, |t| {
         let e = t.get(fd)?;
-        Some((e.ops.clone(), e.offset))
+        Some((e.ops.clone(), e.offset, e.status_flags))
     });
-    let (ops, off) = match snapshot {
+    let (ops, off, status_flags) = match snapshot {
         Some(Some(v)) => v,
         _ => {
             ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
             return;
         }
     };
+    let nonblock = status_flags & crate::fd::O_NONBLOCK != 0;
     // Closure error channel: `Err(true)` ⇒ broken pipe (raise SIGPIPE +
     // return -EPIPE), `Err(false)` ⇒ generic write failure / bad fd.
     let outcome = Some({
@@ -1616,6 +1617,54 @@ fn sys_write(ctx: &mut dyn TrapContext) {
             Err(_) => Err(false),
         }
     });
+    // A write that made no progress on a full pipe (reader still open) must
+    // BLOCK, not hand userspace a spurious 0. O_NONBLOCK → -EAGAIN; blocking →
+    // park ~1ms and RE-EXECUTE (mirrors the empty-pipe read block).
+    if let Some(Ok(0)) = outcome {
+        if ops.write_should_block() {
+            if nonblock {
+                ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                return;
+            }
+            if let (Some(uctx), Some(hook)) = (
+                crate::user_task::current_user_task(),
+                crate::user_task::yield_hook(),
+            ) {
+                let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
+                // Rewind past the 2-byte `syscall`/`int 0x80` so re-entry re-runs
+                // this write with its original args.
+                let resume_rip = ctx.rip().wrapping_sub(2);
+                ctx.set_rip(resume_rip);
+                // SAFETY: `uctx` is the live per-task UserTaskCtx; we hold the
+                // only reference while setting the park deadline + saving the
+                // RIP-rewound state before the yield hook hands off the task.
+                unsafe {
+                    let uc = &*uctx;
+                    uc.sleep_deadline_ns
+                        .store(dl, core::sync::atomic::Ordering::Release);
+                    uc.futex_uaddr
+                        .store(0, core::sync::atomic::Ordering::Release);
+                    uc.net_io_wait
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    uc.epoll_park_gen.store(
+                        narf_net::readiness::generation(),
+                        core::sync::atomic::Ordering::Release,
+                    );
+                    ctx.save_user_state(uc.state.get() as *mut u8);
+                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    if narf_scheduler::stackful::user_own_stack_enabled() {
+                        own_stack_block(ctx);
+                        return;
+                    }
+                    hook(uctx);
+                }
+                // unreachable — hook() longjmps to the executor
+            }
+            // No executor (kernel-test context): fall back to a 0-byte write.
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+    }
     match outcome {
         Some(Ok(n)) => {
             // inotify: a successful write is IN_MODIFY on the fd's file.
@@ -2695,6 +2744,17 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 entry.status_flags = (entry.status_flags & !mask) | new;
                 SyscallReturn::ok(0)
             }
+            // F_GETPIPE_SZ (1032) / F_SETPIPE_SZ (1031): report the pipe buffer
+            // capacity. NARF's pipe is a fixed-size ring, so F_SETPIPE_SZ can't
+            // grow it — return the current capacity (Linux rounds the request
+            // to a page/power-of-two anyway). EINVAL for a non-pipe fd, matching
+            // Linux. stress-ng's pipe stressor queries F_GETPIPE_SZ to size its
+            // I/O buffer; without this it fell back to a 4 KiB write + a stale
+            // errno on the first full-pipe short write.
+            1032 | 1031 => match entry.ops.pipe_capacity() {
+                Some(cap) => SyscallReturn::ok(cap as u64),
+                None => SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64),
+            },
             _ => SyscallReturn::invalid_op(),
         })
     });

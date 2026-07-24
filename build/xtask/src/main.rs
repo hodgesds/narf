@@ -2066,6 +2066,7 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // sentinels in rcx/r11; the sigreturn must preserve them (full-register
         // iretq exit). See sigrcx_smoke_x86_64.c.
         ("sigrcx_smoke", "sigrcx-ok"),
+        ("pipeblk_smoke", "pipeblk-ok"),
         // RT-signal regression for the stress-ng --sigrt fixes: si_pid on
         // SA_SIGINFO for a queued signal, a forked child's clean signal mask,
         // and rt_sigtimedwait reserving an UNBLOCKED in-set signal for the

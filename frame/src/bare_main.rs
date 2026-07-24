@@ -3632,6 +3632,7 @@ fn boot_userspace_init() {
                 ("epoll_smoke", narf_verification::NARF_EPOLL_SMOKE_ELF),
                 ("signal_smoke", narf_verification::NARF_SIGNAL_SMOKE_ELF),
                 ("sigrcx_smoke", narf_verification::NARF_SIGRCX_SMOKE_ELF),
+                ("pipeblk_smoke", narf_verification::NARF_PIPEBLK_SMOKE_ELF),
                 ("sigrt_smoke", narf_verification::NARF_SIGRT_SMOKE_ELF),
                 ("strace_smoke", narf_verification::NARF_STRACE_SMOKE_ELF),
                 ("fs_smoke", narf_verification::NARF_FS_SMOKE_ELF),
