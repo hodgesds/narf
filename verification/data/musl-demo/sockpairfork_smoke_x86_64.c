@@ -141,6 +141,68 @@ int main(void) {
         return 1;
     }
 
+    // 5) dbus-daemon's ACTUAL shape: the writer is not a direct child. dbus
+    //    forks a babysitter, the babysitter forks the service and execs it,
+    //    and only after reaping it does the BABYSITTER write the status back.
+    //    So the socketpair end that reports must survive a second fork in the
+    //    middle process (and that fork's child exec'ing, which CLOEXEC-closes
+    //    its inherited copies). Phases 1-4 always wrote from a direct child.
+    int sv3[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv3) < 0) {
+        w("sockpairfork-fail: create3\n");
+        return 1;
+    }
+    int ep3 = epoll_create1(0);
+    struct epoll_event ev3 = { .events = EPOLLIN, .data.fd = sv3[0] };
+    if (ep3 < 0 || epoll_ctl(ep3, EPOLL_CTL_ADD, sv3[0], &ev3) < 0) {
+        w("sockpairfork-fail: epoll_ctl3\n");
+        return 1;
+    }
+    pid_t bab = fork();
+    if (bab < 0) {
+        w("sockpairfork-fail: fork-babysitter\n");
+        return 1;
+    }
+    if (bab == 0) {
+        close(sv3[0]);
+        pid_t svc = fork();
+        if (svc < 0) {
+            _exit(3);
+        }
+        if (svc == 0) {
+            // Exec a real binary so CLOEXEC actually fires on this fd table.
+            execl("/bin/hello", "hello", (char *)0);
+            _exit(9); // exec failed
+        }
+        int cst = 0;
+        if (waitpid(svc, &cst, 0) != svc) {
+            _exit(4);
+        }
+        // Report the grandchild's status back up, as dbus's babysitter does.
+        if (write(sv3[1], "done", 4) != 4) {
+            _exit(5);
+        }
+        _exit(0);
+    }
+    close(sv3[1]);
+    struct epoll_event out3[4];
+    int er3 = epoll_wait(ep3, out3, 4, 20000);
+    if (er3 <= 0) {
+        w("sockpairfork-fail: babysitter report never reached the parent\n");
+        return 1;
+    }
+    char b3[8];
+    memset(b3, 0, sizeof(b3));
+    if (read(sv3[0], b3, 4) != 4 || memcmp(b3, "done", 4) != 0) {
+        w("sockpairfork-fail: payload3 wrong\n");
+        return 1;
+    }
+    int bst = 0;
+    if (waitpid(bab, &bst, 0) != bab || !WIFEXITED(bst) || WEXITSTATUS(bst) != 0) {
+        w("sockpairfork-fail: babysitter status\n");
+        return 1;
+    }
+
     w("sockpairfork-ok\n");
     return 0;
 }
