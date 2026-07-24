@@ -1411,3 +1411,106 @@ fn smoke_abi_path_nested_tmpfs_mount() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_nested_tmpfs_mount);
+
+// ── O_TMPFILE + linkat("/proc/self/fd/N") — the QSaveFile shape ─────
+//
+// Qt's QSaveFile — so every KDE/KConfig/KSycoca database write — opens
+// an O_TMPFILE inode, writes it, then materialises it with
+// `linkat(AT_FDCWD, "/proc/self/fd/N", AT_FDCWD, target, AT_SYMLINK_FOLLOW)`.
+// The handler's "is this fd pathless?" guard used to ask whether
+// `fd_path_of` returned None — but that helper synthesises an
+// `anon_inode:[…]` placeholder for every pathless fd and so never
+// answers None, making the branch unreachable. The call then fell
+// through to a path-based hard link, where `/proc/self/fd/N` and the
+// target sit in different directories, and came back EXDEV: KSycoca
+// reported "Invalid cross-device link" and never wrote its database.
+fn smoke_abi_path_linkat_proc_fd_materialises_tmpfile() -> TestResult {
+    const O_TMPFILE_BIT: u64 = 0o20_000_000;
+    const O_RDWR: u64 = 2;
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    with_memfs("/p", "p", &[("seed", b"x")], || {
+        // O_TMPFILE names the DIRECTORY the inode is created in.
+        let dir = b"/p\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                dir.as_ptr() as u64,
+                O_TMPFILE_BIT | O_RDWR,
+                0o600,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(O_TMPFILE) should return an anonymous fd"),
+        };
+        let payload = b"sycoca";
+        if call(
+            Syscall::Write.raw(),
+            a3(fd, payload.as_ptr() as u64, payload.len() as u64, 0),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("writing the O_TMPFILE inode should succeed");
+        }
+        // Give it a name, exactly as Qt does.
+        let mut src = [0u8; 32];
+        let pre = b"/proc/self/fd/";
+        src[..pre.len()].copy_from_slice(pre);
+        let mut w = pre.len();
+        let mut v = fd;
+        let mut digits = [0u8; 20];
+        let mut n = 0;
+        if v == 0 {
+            digits[0] = b'0';
+            n = 1;
+        }
+        while v > 0 {
+            digits[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+        for i in (0..n).rev() {
+            src[w] = digits[i];
+            w += 1;
+        }
+        src[w] = 0;
+        let dst = b"/p/named\0";
+        match call_raw(
+            Syscall::Linkat.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: src.as_ptr() as u64,
+                arg2: AT_FDCWD,
+                arg3: dst.as_ptr() as u64,
+                arg4: AT_SYMLINK_FOLLOW,
+                arg5: 0,
+            },
+        ) {
+            r if r.status == SyscallReturn::OK && r.value as i64 == 0 => {}
+            r if r.status == SyscallReturn::OK && r.value as i64 == EXDEV => {
+                return Err("linkat(/proc/self/fd/N) must not report EXDEV")
+            }
+            _ => return Err("linkat(/proc/self/fd/N, target) should return 0"),
+        }
+        let _ = call(Syscall::Close.raw(), a3(fd, 0, 0, 0));
+        // The name now resolves and carries what was written through the fd —
+        // the inode was aliased, not copied.
+        let rfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dst.as_ptr() as u64, O_RDONLY, 0),
+        ) {
+            Some(f) if f >= 0 => f as u64,
+            _ => return Err("the materialised name should be openable"),
+        };
+        let mut buf = [0u8; 16];
+        let got = call(
+            Syscall::Read.raw(),
+            a3(rfd, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+        );
+        let _ = call(Syscall::Close.raw(), a3(rfd, 0, 0, 0));
+        if got != Some(payload.len() as i64) || &buf[..payload.len()] != payload {
+            return Err("the materialised file must hold the bytes written via the fd");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_linkat_proc_fd_materialises_tmpfile);

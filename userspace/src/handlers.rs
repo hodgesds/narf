@@ -5530,9 +5530,18 @@ fn sys_linkat(ctx: &mut dyn TrapContext) {
     // named file falls through to the ordinary path-based hard link.
     let old_eff = with_dirfd(args.arg0 as i64, old_raw);
     if let Some(src_fd) = parse_proc_self_fd(&old_eff) {
-        if fd_path_of(task, src_fd).is_none()
-            && fd::with_table(task, |t| t.get(src_fd).is_some()).unwrap_or(false)
-        {
+        // "Pathless" has to mean "no real filesystem path", NOT
+        // "fd_path_of returned None": that helper synthesises an
+        // `anon_inode:[TypeName]` placeholder for every fd with no
+        // recorded backing path, so it never answers None for a live fd
+        // and this branch was unreachable. Qt's QSaveFile — every
+        // KDE/KSycoca database write — materialises its O_TMPFILE inode
+        // with exactly this call, so it fell through to the path-based
+        // hard link, where `/proc/self/fd/N` and the target are in
+        // different directories and the answer was EXDEV ("Invalid
+        // cross-device link", database never written).
+        let pathless = fd_path_of(task, src_fd).is_none_or(|p| !p.starts_with('/'));
+        if pathless && fd::with_table(task, |t| t.get(src_fd).is_some()).unwrap_or(false) {
             let new_abs = resolve_cwd_path(task, &new_eff);
             let r = link_fd_node_impl(task, src_fd, &new_abs);
             ctx.set_return(SyscallReturn::ok(r as u64));
