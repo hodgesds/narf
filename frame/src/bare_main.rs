@@ -3656,10 +3656,7 @@ fn boot_userspace_init() {
                 ),
                 // Pipe hangup when the last writer EXITS without close():
                 // how dbus-daemon learns an activated service died.
-                (
-                    "pipehup_smoke",
-                    narf_verification::NARF_PIPEHUP_SMOKE_ELF,
-                ),
+                ("pipehup_smoke", narf_verification::NARF_PIPEHUP_SMOKE_ELF),
                 ("accept4_smoke", narf_verification::NARF_ACCEPT4_SMOKE_ELF),
                 // Linux-compat round 2: mremap / sendfile / creds / waitid.
                 ("mremap_smoke", narf_verification::NARF_MREMAP_SMOKE_ELF),

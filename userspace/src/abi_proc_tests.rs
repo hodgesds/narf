@@ -11,8 +11,6 @@
 
 use crate::abi_test_support::*;
 
-const AT_FDCWD: u64 = (-100i64) as u64;
-
 // ── getppid(2) — infallible, returns parent visible pid (0 if none) ──
 
 fn smoke_abi_proc_getppid_pos() -> TestResult {
@@ -867,11 +865,7 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_setns_neg);
 struct ReentrantFdTableFile;
 
 impl narf_filesystem::FileOps for ReentrantFdTableFile {
-    fn read<'a>(
-        &'a self,
-        _offset: u64,
-        buf: &'a mut [u8],
-    ) -> narf_filesystem::FsFuture<'a, usize> {
+    fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         alloc::boxed::Box::pin(async move {
             // The re-entry under test: consult the caller's fd table from
             // inside a FileOps::read.
@@ -885,11 +879,7 @@ impl narf_filesystem::FileOps for ReentrantFdTableFile {
         })
     }
 
-    fn write<'a>(
-        &'a self,
-        _offset: u64,
-        _buf: &'a [u8],
-    ) -> narf_filesystem::FsFuture<'a, usize> {
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         alloc::boxed::Box::pin(async move { Err(narf_filesystem::FsError::ReadOnly) })
     }
 

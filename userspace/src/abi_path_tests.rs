@@ -1209,10 +1209,9 @@ fn smoke_abi_path_rename_cross_mount_is_exdev() -> TestResult {
             Ok(h) => h,
             Err(_) => return Err("mounting the second memfs failed"),
         };
-        let outcome = match call_rename(
-            b"/run/src\0".as_ptr() as u64,
-            b"/other/src\0".as_ptr() as u64,
-        ) {
+        let src = b"/run/src\0";
+        let dst = b"/other/src\0";
+        let outcome = match call_rename(src.as_ptr() as u64, dst.as_ptr() as u64) {
             Some(EXDEV) => Ok(()),
             Some(0) => Err("rename across two mounts must not silently succeed"),
             _ => Err("rename across two mounts should return -EXDEV"),
@@ -1433,12 +1432,7 @@ fn smoke_abi_path_linkat_proc_fd_materialises_tmpfile() -> TestResult {
         let dir = b"/p\0";
         let fd = match call(
             Syscall::Openat.raw(),
-            a3(
-                AT_FDCWD,
-                dir.as_ptr() as u64,
-                O_TMPFILE_BIT | O_RDWR,
-                0o600,
-            ),
+            a3(AT_FDCWD, dir.as_ptr() as u64, O_TMPFILE_BIT | O_RDWR, 0o600),
         ) {
             Some(fd) if fd >= 0 => fd as u64,
             _ => return Err("openat(O_TMPFILE) should return an anonymous fd"),
@@ -1513,4 +1507,7 @@ fn smoke_abi_path_linkat_proc_fd_materialises_tmpfile() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_path_linkat_proc_fd_materialises_tmpfile);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_path_linkat_proc_fd_materialises_tmpfile
+);

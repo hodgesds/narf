@@ -1699,7 +1699,7 @@ impl VfsRegistry {
     where
         F: FnOnce(&dyn FsInstance, Arc<dyn DirOps>, &str, Arc<dyn DirOps>, &str) -> R,
     {
-        fn split<'p>(abs: &'p str) -> Option<(&'p str, &'p str)> {
+        fn split(abs: &str) -> Option<(&str, &str)> {
             if abs.is_empty() || abs.as_bytes()[0] != b'/' {
                 return None;
             }

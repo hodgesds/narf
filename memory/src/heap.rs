@@ -116,10 +116,13 @@ const MAX_SPILL_REGIONS: usize = 8;
 /// cursor)`. `base == 0` means the slot is unused. Written only by
 /// `add_bootstrap_spill` during single-threaded early boot; read
 /// concurrently thereafter.
-static SPILL: [(AtomicUsize, AtomicUsize, AtomicUsize); MAX_SPILL_REGIONS] = [
-    const { (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)) };
-    MAX_SPILL_REGIONS
-];
+static SPILL: [(AtomicUsize, AtomicUsize, AtomicUsize); MAX_SPILL_REGIONS] = [const {
+    (
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    )
+}; MAX_SPILL_REGIONS];
 
 /// Extend the bootstrap bump arena with a region of real RAM.
 ///

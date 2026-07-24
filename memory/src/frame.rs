@@ -276,12 +276,12 @@ fn ensure_bootstrap_headroom(need: usize) {
             return;
         };
         let bytes = (1usize << order) * PAGE_SIZE as usize;
-        // SAFETY: `base` is `1<<order` contiguous frames just handed out
-        // by the buddy (so owned by us, mapped, writable). `kernel_mut_ptr`
-        // yields the identity or direct-map VA for that phys, valid for
-        // the kernel's lifetime; the bump arena never frees, matching the
-        // donation's leak-forever contract.
         let vbase = base.start_address().kernel_mut_ptr::<u8>();
+        // SAFETY: `base` is `1<<order` contiguous frames just handed out
+        // by the buddy (so owned by us, mapped, writable), and `vbase` is
+        // its identity or direct-map VA, valid for the kernel's lifetime.
+        // The bump arena never frees, matching the donation's
+        // leak-forever contract.
         let donated = unsafe { crate::heap::add_bootstrap_spill(vbase, bytes) };
         if !donated {
             // All spill slots full — we've donated as much as the arena
