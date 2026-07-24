@@ -3638,6 +3638,12 @@ fn boot_userspace_init() {
                     narf_verification::NARF_GETRANDOM_SMOKE_ELF,
                 ),
                 ("sockpair_smoke", narf_verification::NARF_SOCKPAIR_SMOKE_ELF),
+                // socketpair(2) across fork(2): the child writes, the PARENT
+                // waits with poll/epoll — dbus-daemon's babysitter protocol.
+                (
+                    "sockpairfork_smoke",
+                    narf_verification::NARF_SOCKPAIRFORK_SMOKE_ELF,
+                ),
                 ("accept4_smoke", narf_verification::NARF_ACCEPT4_SMOKE_ELF),
                 // Linux-compat round 2: mremap / sendfile / creds / waitid.
                 ("mremap_smoke", narf_verification::NARF_MREMAP_SMOKE_ELF),

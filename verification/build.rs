@@ -529,6 +529,7 @@ fn main() {
         "eventfd_smoke",
         "getrandom_smoke",
         "sockpair_smoke",
+        "sockpairfork_smoke",
         "accept4_smoke",
         "mremap_smoke",
         "sendfile_smoke",
