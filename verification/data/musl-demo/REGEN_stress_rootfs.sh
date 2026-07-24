@@ -1,0 +1,71 @@
+#!/bin/sh
+# Build an Alpine rootfs containing stress-ng for the nightly
+# `stress-ng-under-KASAN` CI job (.github/workflows/ci.yml).
+#
+# NARF mounts this ext2 image (QEMU virtio-blk) at /mnt; `chroot_run` chroots
+# into it and execs `/bin/busybox sh /probe.sh`, which drives a rotating set of
+# stress-ng stressors. Run under `--kasan` so a stray write to a freed slab
+# block panics IN the corruptor's frame (see memory/src/kasan.rs).
+#
+# stress-ng is the right churn tool: its workers fork() in-process (they don't
+# re-exec the binary), so they sidestep the busybox same-binary-exec bug
+# (memory note narf-execve-same-binary-stale-argv) that breaks shell-driven
+# churn. It is a musl-PIE ELF against Alpine's own /lib/ld-musl, which NARF runs.
+#
+# Fully unprivileged: apk.static installs into a --root dir, mke2fs -d packs it.
+#
+#   sh verification/data/musl-demo/REGEN_stress_rootfs.sh
+#   cargo xtask run-interactive --kasan --cmd chroot_run --expect STRESS-DONE
+#
+# Output: target/narf-vblk.img (virtio_blk_image_path()). NOT committed.
+# Requires: curl, tar, mke2fs (e2fsprogs >= 1.43 for `-d`), network to the
+# Alpine CDN. ~40 MiB image.
+set -e
+
+ALPINE=v3.21
+ARCH=x86_64
+CDN=https://dl-cdn.alpinelinux.org/alpine
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")
+OUT="$ROOT/target/narf-vblk.img"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$ROOT/target"
+
+# apk.static (apk-tools-static) — the unprivileged installer.
+echo "fetching apk.static"
+IDX=$(curl -fsSL "$CDN/$ALPINE/main/$ARCH/" | grep -oE 'apk-tools-static-[0-9][^"]*\.apk' | head -1)
+[ -n "$IDX" ] || { echo "could not find apk-tools-static in the index" >&2; exit 1; }
+curl -fsSL -o "$WORK/apk.apk" "$CDN/$ALPINE/main/$ARCH/$IDX"
+mkdir -p "$WORK/apk"
+tar -xzf "$WORK/apk.apk" -C "$WORK/apk" 2>/dev/null
+APK="$WORK/apk/sbin/apk.static"
+
+# Install the base userland + stress-ng (community repo) into a rootfs dir.
+RD="$WORK/root"
+mkdir -p "$RD/etc/apk"
+echo "installing stress-ng + base userland into rootfs"
+"$APK" --root "$RD" --arch "$ARCH" --initdb \
+    -X "$CDN/$ALPINE/main" -X "$CDN/$ALPINE/community" \
+    --allow-untrusted --no-cache \
+    add alpine-baselayout busybox musl stress-ng
+
+# The workload chroot_run runs. Various stressors exercising fork/thread/alloc/
+# mmap/pipe/sock/context-switch churn; each capped so the whole pass fits the CI
+# window even under KASAN's outline-check slowdown. `--expect STRESS-DONE` (in
+# the CI job) keys on the final marker so run-interactive exits promptly.
+cat > "$RD/probe.sh" <<'PROBE'
+echo "STRESS-START pid=$$"
+DUR="${STRESS_DUR:-6s}"
+for s in "--fork 4" "--malloc 4" "--vm 2 --vm-bytes 32M" "--mmap 2" \
+         "--pthread 4" "--pipe 2" "--sock 2" "--switch 4" "--clone 2" "--cpu 2"; do
+  echo "=== stressor: $s ==="
+  /usr/bin/stress-ng $s --timeout "$DUR" --metrics-brief 2>&1 || echo "STRESSOR-RC=$? for [$s]"
+done
+echo "STRESS-DONE"
+PROBE
+chmod +x "$RD/probe.sh"
+
+# Pack into an ext2 image (256 MiB, 1 KiB blocks).
+mke2fs -q -F -t ext2 -d "$RD" -b 1024 "$OUT" 262144
+echo "built $OUT ($(du -h "$OUT" | cut -f1)); stress-ng $(ls -la "$RD/usr/bin/stress-ng" >/dev/null 2>&1 && echo present || echo MISSING)"

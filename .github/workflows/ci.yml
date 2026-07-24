@@ -426,6 +426,78 @@ jobs:
           path: ${{ runner.temp }}/cores
           if-no-files-found: ignore
 
+  stress-ng-kasan:
+    name: stress-ng under KASAN (nightly, non-blocking)
+    # Nightly + manual only: boot a rotating set of stress-ng stressors under the
+    # KASAN kernel to shake out freed-slab corruption (poisoned-block writes
+    # panic IN the corruptor's frame) and userspace fault regressions. Slow, so
+    # it never gates a push/PR. continue-on-error keeps a caught crash from
+    # failing the workflow — the artifact + ::warning:: are the signal.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rust-src llvm-tools-preview rustfmt
+      - name: Install host build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 cpio mtools dosfstools e2fsprogs ovmf \
+            musl-tools clang lld linux-libc-dev curl
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Cache build target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: target-${{ runner.os }}-x86_64-stressng-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: target-${{ runner.os }}-x86_64-
+      - name: Build stress-ng Alpine rootfs
+        run: sh verification/data/musl-demo/REGEN_stress_rootfs.sh
+      - name: stress-ng under KASAN
+        env:
+          # SMP>1 + the KASAN kernel + heavy churn = the coverage window.
+          NARF_QEMU_SMP: "16"
+          NARF_QEMU_MEM_MB: "2048"          # KASAN shadow is carved from RAM
+          XTASK_QEMU_SNAPSHOT: "1"          # boot the rootfs copy-on-write
+          XTASK_RI_PROMPT_TIMEOUT_SECS: "600"
+          # The workload runs ~10 stressors; `--expect STRESS-DONE` exits as soon
+          # as the final marker prints, so this ceiling only bounds a hang.
+          XTASK_RI_ECHO_TIMEOUT_SECS: "2400"
+        run: |
+          set -u
+          out="${{ runner.temp }}/stress"; mkdir -p "$out"
+          log="$out/kasan.log"; core="$out/kasan.core"
+          NARF_QEMU_COM2_FILE="$core" \
+            timeout 3000 cargo xtask run-interactive --kasan --cmd chroot_run \
+              --expect STRESS-DONE > "$log" 2>&1 || true
+          echo "=== stress-ng summary ==="
+          grep -E "=== stressor:|passed:|failed:|SIGSEGV|SIGILL|STRESSOR-RC|KASAN:|CPU EXCEPTION|panicked" "$log" || true
+          if grep -qE "KASAN: (store|load)|CPU EXCEPTION|KERNEL PANIC" "$log" || [ -s "$core" ]; then
+            echo "::warning::stress-ng-kasan: KERNEL crash / KASAN catch — see the uploaded core + log"
+          fi
+          if grep -qE "SIGSEGV|SIGILL|failed: [1-9]" "$log"; then
+            echo "::warning::stress-ng-kasan: a stressor worker faulted (userspace SIGSEGV/SIGILL or stressor failure)"
+          fi
+      - name: upload logs + cores
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-ng-kasan
+          path: ${{ runner.temp }}/stress
+          if-no-files-found: ignore
+
   kernel-test:
     name: kernel-test (x86_64)
     runs-on: ubuntu-latest
