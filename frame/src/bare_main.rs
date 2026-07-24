@@ -1288,11 +1288,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // already ran), not NUMA topology.
                         {
                             narf_memory::reserve_for_slab_promotion();
+                            let (spill_regions, spill_bytes) = narf_memory::heap_spill_stats();
                             let _ = writeln!(
                                 console::Writer,
-                                "  heap: promoting bump→slab (bootstrap used: {} / {} bytes)",
+                                "  heap: promoting bump→slab (bootstrap used: {} / {} bytes, \
+                                 spill: {} region(s) / {} KiB)",
                                 narf_memory::heap::used_bytes(),
-                                narf_memory::heap::capacity_bytes()
+                                narf_memory::heap::capacity_bytes(),
+                                spill_regions,
+                                spill_bytes / 1024,
                             );
                             narf_memory::heap::promote_to_slab();
                             // Status-panel diag: heap is live; mark

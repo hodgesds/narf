@@ -103,6 +103,7 @@ pub use frame::{
     MAX_NUMA_NODES as FRAME_MAX_NUMA_NODES, PAGE_SHIFT, PAGE_SIZE,
 };
 pub use heap::BumpAllocator;
+pub use heap::{bootstrap_remaining, spill_stats as heap_spill_stats};
 pub use heap_backend::{
     current_heap_backend_name, install_heap_backend, BumpBackend, HeapAuthority, HeapBackend,
     HeapError, SlabBackend, BUMP_BACKEND, SLAB_BACKEND,

@@ -105,7 +105,72 @@ impl core::fmt::Debug for BumpAllocator {
     }
 }
 
-/// Returns true iff `ptr` lies inside the bootstrap arena's bytes.
+/// How many SPILL regions the bootstrap arena can be extended with.
+/// The buddy hands out at most `1 << MAX_ORDER` frames (32 MiB) per
+/// allocation, so a handful of regions covers a very large machine:
+/// the pre-slab reservation costs ~16 bytes per 4 KiB frame, i.e.
+/// ~0.4% of RAM, so 8 × 32 MiB of spill covers ~64 GiB.
+const MAX_SPILL_REGIONS: usize = 8;
+
+/// One buddy-donated extension of the bootstrap arena: `(base, len,
+/// cursor)`. `base == 0` means the slot is unused. Written only by
+/// `add_bootstrap_spill` during single-threaded early boot; read
+/// concurrently thereafter.
+static SPILL: [(AtomicUsize, AtomicUsize, AtomicUsize); MAX_SPILL_REGIONS] = [
+    const { (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)) };
+    MAX_SPILL_REGIONS
+];
+
+/// Extend the bootstrap bump arena with a region of real RAM.
+///
+/// The `.bss` arena is a FIXED 12 MiB, but one pre-slab consumer
+/// scales with RAM: `BuddyZone::reserve_growth_capacity` reserves the
+/// pessimistic per-order free-list capacity, ~16 bytes per frame. That
+/// put a hard ~3 GiB ceiling on boot — an 8 GiB machine died in
+/// `reserve_for_slab_promotion` with "memory allocation of 2080896
+/// bytes failed" — even though the MMU maps far more. Rather than
+/// grow `.bss` for every machine, the caller allocates frames from the
+/// (already live) buddy and donates them here.
+///
+/// # Safety
+/// `base` must point to `len` bytes of RAM that are mapped, writable,
+/// and owned by the caller for the lifetime of the kernel — the bump
+/// arena never frees, and pointers into this region must stay valid
+/// after the bump→slab promotion (see [`in_bootstrap`]).
+pub unsafe fn add_bootstrap_spill(base: *mut u8, len: usize) -> bool {
+    if base.is_null() || len == 0 {
+        return false;
+    }
+    for slot in SPILL.iter() {
+        if slot
+            .0
+            .compare_exchange(0, base as usize, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            slot.1.store(len, Ordering::Release);
+            slot.2.store(0, Ordering::Release);
+            return true;
+        }
+    }
+    false
+}
+
+/// Bytes still available in the `.bss` arena plus every spill region.
+/// Lets a caller decide whether it needs to donate more before making
+/// a large pre-slab reservation.
+pub fn bootstrap_remaining() -> usize {
+    let mut free = BOOTSTRAP_CAPACITY.saturating_sub(OFFSET.load(Ordering::Relaxed));
+    for slot in SPILL.iter() {
+        if slot.0.load(Ordering::Acquire) != 0 {
+            let len = slot.1.load(Ordering::Acquire);
+            free += len.saturating_sub(slot.2.load(Ordering::Relaxed));
+        }
+    }
+    free
+}
+
+/// Returns true iff `ptr` lies inside the bootstrap arena's bytes —
+/// the `.bss` array OR any spill region donated to it.
 /// Used by `dealloc` to route freeing to the right path —
 /// stranded bump-era pointers survive the bump→slab promotion and
 /// must NOT be handed to `slab::dealloc`.
@@ -113,7 +178,53 @@ pub(crate) fn in_bootstrap(ptr: *mut u8) -> bool {
     let base = HEAP.0.get() as *mut u8 as usize;
     let end = base + BOOTSTRAP_CAPACITY;
     let p = ptr as usize;
-    p >= base && p < end
+    if p >= base && p < end {
+        return true;
+    }
+    for slot in SPILL.iter() {
+        let sbase = slot.0.load(Ordering::Acquire);
+        if sbase != 0 && p >= sbase && p < sbase + slot.1.load(Ordering::Acquire) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Carve `layout` out of a spill region. Same CAS discipline as the
+/// `.bss` arena, per region.
+fn spill_alloc(layout: Layout) -> *mut u8 {
+    let align = layout.align().max(1);
+    let size = layout.size();
+    for slot in SPILL.iter() {
+        let base = slot.0.load(Ordering::Acquire);
+        if base == 0 {
+            continue;
+        }
+        let len = slot.1.load(Ordering::Acquire);
+        loop {
+            let cur = slot.2.load(Ordering::Relaxed);
+            // Align the ABSOLUTE address, not the offset — a
+            // buddy-donated base is page-aligned, but keeping the
+            // arithmetic on real addresses is what the alignment
+            // contract is actually about.
+            let addr = match (base + cur).checked_add(align - 1) {
+                Some(a) => a & !(align - 1),
+                None => break,
+            };
+            let end_off = match (addr - base).checked_add(size) {
+                Some(e) if e <= len => e,
+                _ => break, // this region can't fit it; try the next
+            };
+            if slot
+                .2
+                .compare_exchange_weak(cur, end_off, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return addr as *mut u8;
+            }
+        }
+    }
+    core::ptr::null_mut()
 }
 
 /// Bump-arena `alloc` implementation. Public to the crate so
@@ -128,7 +239,9 @@ pub(crate) fn bump_alloc(layout: Layout) -> *mut u8 {
         let aligned = (cur + align - 1) & !(align - 1);
         let end = match aligned.checked_add(size) {
             Some(e) if e <= BOOTSTRAP_CAPACITY => e,
-            _ => return core::ptr::null_mut(),
+            // `.bss` arena full (or this request is simply bigger than
+            // what's left): fall through to any buddy-donated spill.
+            _ => return spill_alloc(layout),
         };
         if OFFSET
             .compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed)
@@ -212,6 +325,21 @@ pub fn used_bytes() -> usize {
 /// Bootstrap arena total capacity.
 pub const fn capacity_bytes() -> usize {
     BOOTSTRAP_CAPACITY
+}
+
+/// Diagnostic: `(regions, total_bytes)` of buddy-donated spill added to
+/// the bootstrap arena. `(0, 0)` on a small machine that never needed
+/// to grow past the fixed `.bss` array.
+pub fn spill_stats() -> (usize, usize) {
+    let mut n = 0;
+    let mut bytes = 0;
+    for slot in SPILL.iter() {
+        if slot.0.load(Ordering::Acquire) != 0 {
+            n += 1;
+            bytes += slot.1.load(Ordering::Acquire);
+        }
+    }
+    (n, bytes)
 }
 
 /// Backwards-compat alias. The constant is now BOOTSTRAP_CAPACITY,

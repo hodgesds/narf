@@ -361,6 +361,29 @@ impl BuddyZone {
     ///
     /// MUST be called while the global allocator is still bump (i.e.
     /// before `promote_to_slab`).
+    /// Bytes `reserve_growth_capacity` is about to demand from the
+    /// allocator for this zone: the pessimistic per-order free-list
+    /// capacity, `Σ over orders of cap * size_of::<u64>()`.
+    ///
+    /// The caller uses this to make sure the bootstrap arena can cover
+    /// the reservation BEFORE it takes `frame::ALLOC.lock()`, since the
+    /// reservation runs under that lock and must not have to go find
+    /// memory while holding it. Deliberately ignores the capacity the
+    /// free lists already have — over-estimating only costs a little
+    /// extra headroom, whereas under-estimating reintroduces the
+    /// out-of-bootstrap-memory panic this exists to prevent.
+    pub fn reservation_bytes(&self) -> usize {
+        if self.total_frames == 0 {
+            return 0;
+        }
+        let mut bytes = 0usize;
+        for order in 0..NUM_ORDERS {
+            let cap = (self.total_frames >> order).max(64) + 64;
+            bytes = bytes.saturating_add(cap * core::mem::size_of::<u64>());
+        }
+        bytes
+    }
+
     pub fn reserve_growth_capacity(&mut self) {
         // Empty zone: nothing donated, so nothing will ever come
         // back via free either. Skip the reservation entirely so

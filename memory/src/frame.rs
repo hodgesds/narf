@@ -221,9 +221,78 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
 /// the global allocator. While we're still on bump, the
 /// reservation allocations themselves don't recurse.
 pub fn reserve_for_slab_promotion() {
+    // The reservation below runs under `ALLOC.lock()` and, on a large
+    // machine, wants far more than the fixed 12 MiB `.bss` bootstrap
+    // arena holds (~16 bytes/frame, so ~3 GiB was the hard ceiling —
+    // an 8 GiB boot died right here). Buddy frames are already live, so
+    // top the bootstrap arena up from the buddy FIRST, without holding
+    // the lock, then reserve.
+    let need: usize = {
+        let g = ALLOC.lock();
+        g.zones.iter().map(|z| z.reservation_bytes()).sum()
+    };
+    ensure_bootstrap_headroom(need);
+
     let mut g = ALLOC.lock();
     for zone in g.zones.iter_mut() {
         zone.reserve_growth_capacity();
+    }
+}
+
+/// Make sure the bootstrap bump arena can satisfy `need` more bytes,
+/// donating buddy-allocated RAM to it when the `.bss` array falls short.
+///
+/// Runs while the global allocator is still the bump arena (pre
+/// `promote_to_slab`), so the donated frames' bookkeeping doesn't
+/// recurse into the slab. Each donation is one buddy allocation of up
+/// to `1 << MAX_ORDER` frames; a handful covers a very large machine.
+fn ensure_bootstrap_headroom(need: usize) {
+    // A margin over the bare reservation: `reserve_exact` strands the
+    // free lists' pre-existing (doubling-grown) buffers, and boot has
+    // other bump users still to come (per-CPU init, driver probe).
+    let target = need.saturating_add(need / 4).saturating_add(1 << 20);
+    let mut have = crate::heap::bootstrap_remaining();
+    if have >= target {
+        return;
+    }
+
+    const MAX_CHUNK_ORDER: u8 = MAX_ORDER; // 1 << 13 frames = 32 MiB
+    let mut guard = 0;
+    while have < target {
+        let deficit = target - have;
+        // Smallest order whose block covers the remaining deficit,
+        // capped at the buddy's largest allocation.
+        let want_frames = deficit.div_ceil(PAGE_SIZE as usize).max(1);
+        let mut order = 0u8;
+        while order < MAX_CHUNK_ORDER && (1usize << order) < want_frames {
+            order += 1;
+        }
+        // `alloc_pages_on` already falls back across NUMA nodes when
+        // node 0 can't satisfy the order.
+        let Ok(base) = alloc_pages_on(0, order) else {
+            // Can't grow the arena. The reservation may still fit what
+            // we already have; if not, the existing OOM panic reports it
+            // — no worse than before this path existed.
+            return;
+        };
+        let bytes = (1usize << order) * PAGE_SIZE as usize;
+        // SAFETY: `base` is `1<<order` contiguous frames just handed out
+        // by the buddy (so owned by us, mapped, writable). `kernel_mut_ptr`
+        // yields the identity or direct-map VA for that phys, valid for
+        // the kernel's lifetime; the bump arena never frees, matching the
+        // donation's leak-forever contract.
+        let vbase = base.start_address().kernel_mut_ptr::<u8>();
+        let donated = unsafe { crate::heap::add_bootstrap_spill(vbase, bytes) };
+        if !donated {
+            // All spill slots full — we've donated as much as the arena
+            // can track. Stop; the reservation uses whatever's available.
+            return;
+        }
+        have += bytes;
+        guard += 1;
+        if guard > 64 {
+            break; // defensive: never spin the donation loop
+        }
     }
 }
 
