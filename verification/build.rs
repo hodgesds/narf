@@ -410,6 +410,16 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_DISTRO_KDE_ELF_AARCH64=/dev/null");
 
+    // distro_fedora — chroot into the Fedora 43 (glibc) KDE rootfs and run
+    // /narf-start.sh. Same shape as distro_kde, different libc.
+    println!("cargo:rerun-if-changed=data/musl-demo/distro_fedora_x86_64");
+    let df = manifest_dir.join("data/musl-demo/distro_fedora_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_DISTRO_FEDORA_ELF_X86_64={}",
+        df.display()
+    );
+    println!("cargo:rustc-env=NARF_DISTRO_FEDORA_ELF_AARCH64=/dev/null");
+
     // chroot_run — generic Alpine-chroot launcher running /probe.sh (input/
     // compositor bring-up "run real software, see what breaks" harness).
     println!("cargo:rerun-if-changed=data/musl-demo/chroot_run_x86_64");

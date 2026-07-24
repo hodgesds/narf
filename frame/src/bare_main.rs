@@ -3612,6 +3612,10 @@ fn boot_userspace_init() {
                 ("distro_init", narf_verification::NARF_DISTRO_INIT_ELF),
                 ("distro_desktop", narf_verification::NARF_DISTRO_DESKTOP_ELF),
                 ("distro_kde", narf_verification::NARF_DISTRO_KDE_ELF),
+                // Fedora 43 + KDE Plasma 6 (glibc). Needs the rootfs built by
+                // REGEN_fedora_kde_rootfs.sh mounted at /mnt — boot with
+                // NARF_VBLK_IMG=target/narf-fedora-vblk.img.
+                ("distro_fedora", narf_verification::NARF_DISTRO_FEDORA_ELF),
                 ("chroot_run", narf_verification::NARF_CHROOT_RUN_ELF),
                 ("shmfork_smoke", narf_verification::NARF_SHMFORK_SMOKE_ELF),
                 ("net_smoke", narf_verification::NARF_NET_SMOKE_ELF),

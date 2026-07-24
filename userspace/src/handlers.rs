@@ -3146,33 +3146,53 @@ fn sys_fallocate(ctx: &mut dyn TrapContext) {
 // ── CopyFileRange — chunked file→file copy ─────────────────────────
 //
 // Linux copy_file_range(2): in-kernel copy without bouncing the
-// data through user memory. Real consumers (cp, rsync, container
-// runtimes) prefer this over the read/write loop. NARF's MemFs
-// has no special "copy without unmapping pages" path; we just
-// read into a stack chunk and write it out, advancing the
-// per-fd cursor when the offset arg is `!0` (sentinel = "use
-// cur") and leaving the cursor alone when an explicit offset is
-// supplied.
-
-const CFR_USE_CUR: u64 = !0;
+// data through user memory. Real consumers (cp, rsync, GNU cat,
+// container runtimes) prefer this over the read/write loop. NARF's
+// MemFs has no special "copy without unmapping pages" path; we just
+// read into a stack chunk and write it out.
+//
+// ABI (Linux, x86_64):
+//   copy_file_range(int fd_in, loff_t *off_in,
+//                   int fd_out, loff_t *off_out,
+//                   size_t len, unsigned int flags)
+// The offsets are POINTERS. NULL means "start at this fd's file
+// offset and advance it by the copied count"; a non-NULL pointer
+// means "start at *off, write back *off + copied, and leave the fd
+// cursor alone". Getting this wrong is not subtle: glibc's `cat`
+// issues `copy_file_range(3, NULL, 1, NULL, huge, 0)`, and reading
+// the args in the old NARF-native `(fd_in, fd_out, off_in, off_out)`
+// order decoded that as "read fd 3 from offset 1, write to fd 0",
+// which dropped the first byte, sent the copy to stdin's device, and
+// never advanced either offset — so `cat` looped forever.
 
 fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd_in = args.arg0 as u32;
-    let fd_out = args.arg1 as u32;
-    let off_in = args.arg2;
-    let off_out = args.arg3;
+    let off_in_ptr = args.arg1;
+    let fd_out = args.arg2 as u32;
+    let off_out_ptr = args.arg3;
     let len = args.arg4 as usize;
     let flags = args.arg5;
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    const EBADF: i64 = -9;
+    const EINVAL: i64 = -22;
 
     if flags != 0 {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
         return;
     }
     if len == 0 {
         ctx.set_return(SyscallReturn::ok(0));
         return;
+    }
+    // Fault the offset words in before any copying happens, so a bad
+    // pointer is EFAULT rather than a half-completed copy.
+    for p in [off_in_ptr, off_out_ptr] {
+        if p != 0 {
+            if let Err(e) = validate_user_range(p, 8) {
+                ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+                return;
+            }
+        }
     }
 
     // Resolve both ops + their starting offsets up-front so we
@@ -3180,23 +3200,23 @@ fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let resolved = fd::with_table(task, |t| {
         let in_e = t.get(fd_in)?;
-        let in_off = if off_in == CFR_USE_CUR {
+        let in_off = if off_in_ptr == 0 {
             in_e.offset
         } else {
-            off_in
+            read_user_u64(off_in_ptr)
         };
         let out_e = t.get(fd_out)?;
-        let out_off = if off_out == CFR_USE_CUR {
+        let out_off = if off_out_ptr == 0 {
             out_e.offset
         } else {
-            off_out
+            read_user_u64(off_out_ptr)
         };
         Some((in_e.ops.clone(), in_off, out_e.ops.clone(), out_off))
     });
     let (in_ops, mut cur_in, out_ops, mut cur_out) = match resolved {
         Some(Some(t)) => t,
         _ => {
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok(EBADF as u64));
             return;
         }
     };
@@ -3225,21 +3245,28 @@ fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
         }
     }
 
-    // Advance the per-fd cursors when the corresponding offset
-    // arg was the "use cur" sentinel.
+    // A NULL offset pointer means the copy consumed the fd's own file
+    // offset, so advance it; a non-NULL pointer leaves the cursor alone
+    // and gets the advanced value written back instead.
     let _ = fd::with_table(task, |t| {
-        if off_in == CFR_USE_CUR {
+        if off_in_ptr == 0 {
             if let Some(e) = t.get_mut(fd_in) {
                 e.offset = cur_in;
             }
         }
-        if off_out == CFR_USE_CUR {
+        if off_out_ptr == 0 {
             if let Some(e) = t.get_mut(fd_out) {
                 e.offset = cur_out;
             }
         }
         Some(())
     });
+    if off_in_ptr != 0 {
+        write_user_u64(off_in_ptr, cur_in);
+    }
+    if off_out_ptr != 0 {
+        write_user_u64(off_out_ptr, cur_out);
+    }
 
     ctx.set_return(SyscallReturn::ok(copied as u64));
 }
@@ -23911,6 +23938,17 @@ fn read_user_u64(ptr: u64) -> u64 {
     // SAFETY: same contract as read_user_u32.
     let _ = unsafe { copy_from_user(&mut b, ptr) };
     u64::from_ne_bytes(b)
+}
+
+/// Write a u64 to a user address (helper for `copy_file_range`'s
+/// `loff_t *off_in` / `*off_out` write-back, etc.)
+#[inline]
+fn write_user_u64(ptr: u64, val: u64) {
+    let b = val.to_ne_bytes();
+    // SAFETY: caller range-validated `ptr` for 8 bytes; copy_to_user
+    // re-checks and SMAP-brackets the write.
+    // SAFETY: Valid memory or trusted environment
+    let _ = unsafe { copy_to_user(ptr, &b) };
 }
 
 /// Write a u32 to a user address (helper for getsockopt length field, etc.)

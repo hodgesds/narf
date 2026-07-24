@@ -7327,14 +7327,14 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
         None => return TestResult::Fail("open dst failed"),
     };
 
-    // Copy 5 bytes from src@0 → dst@0. !0 sentinel means "use cur",
-    // explicit 0 means "start at 0 without moving the cursor".
+    // Copy 5 bytes from src@0 → dst@0. Linux ABI: the offsets are
+    // `loff_t *`, and NULL means "use + advance this fd's cursor".
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: fd_in as u64,
-            arg1: fd_out as u64,
-            arg2: 0,
-            arg3: 0,
+            arg1: 0, // off_in = NULL
+            arg2: fd_out as u64,
+            arg3: 0, // off_out = NULL
             arg4: 5,
             arg5: 0,
         },
@@ -7366,12 +7366,12 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
         return TestResult::Fail("dst contents wrong after copy_file_range");
     }
 
-    // flags != 0 rejected.
+    // flags != 0 rejected with -EINVAL, as Linux does.
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: fd_in as u64,
-            arg1: fd_out as u64,
-            arg2: 0,
+            arg1: 0,
+            arg2: fd_out as u64,
             arg3: 0,
             arg4: 1,
             arg5: 1,
@@ -7381,10 +7381,10 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
     kernel_syscall_entry(Syscall::CopyFileRange.raw(), &mut ctx);
     let flags_rejected = matches!(
         ctx.ret,
-        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-22i64) as u64,
     );
     if !flags_rejected {
-        return TestResult::Fail("copy_file_range did not reject non-zero flags");
+        return TestResult::Fail("copy_file_range did not reject non-zero flags with -EINVAL");
     }
 
     crate::fd::__test_reset();

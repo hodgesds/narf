@@ -441,13 +441,15 @@ pub enum Syscall {
     /// or read-only FS.
     Fallocate,
 
-    /// `arg0 = fd_in`, `arg1 = fd_out`, `arg2 = off_in` (u64,
-    /// `!0` = use cur), `arg3 = off_out` (u64, `!0` = use cur),
-    /// `arg4 = len`, `arg5 = flags` (must be 0). Linux
-    /// copy_file_range(2): in-kernel copy between two file
-    /// descriptors. NARF executes a chunked read-then-write
-    /// loop. Returns the byte count copied on success, -1 on
-    /// bad fd / non-zero flags.
+    /// `arg0 = fd_in`, `arg1 = off_in` (`loff_t *`, NULL = use +
+    /// advance the fd cursor), `arg2 = fd_out`, `arg3 = off_out`
+    /// (`loff_t *`, same), `arg4 = len`, `arg5 = flags` (must be
+    /// 0). Linux copy_file_range(2): in-kernel copy between two
+    /// file descriptors. NARF executes a chunked read-then-write
+    /// loop. When an offset pointer is non-NULL the value is read
+    /// from user memory, used as the starting offset, and written
+    /// back advanced by the copied count — the fd cursor is left
+    /// alone. Returns the byte count copied, or a negative errno.
     CopyFileRange,
 
     /// `arg0 = name_ptr`, `arg1 = name_len` (debug only),

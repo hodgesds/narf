@@ -538,11 +538,22 @@ impl FileOps for ConsoleFile {
         }
         Box::pin(async move { Ok(n) })
     }
+    /// fds 0/1/2 are the boot console — a TTY, so they must `fstat` as
+    /// `S_IFCHR`, exactly as `/dev/console` does. Reporting `S_IFREG`
+    /// here is not cosmetic: GNU coreutils switches `cat` from a
+    /// read/write loop to `copy_file_range(2)` when *both* ends stat as
+    /// regular files, so a "regular file" stdout sent every `cat` in a
+    /// glibc distro down the in-kernel copy path with a char device on
+    /// the other end. Anything else that branches on `S_ISREG(stdout)`
+    /// (shells deciding on buffering, `less`, `tee`) was mislead too.
     fn stat(&self) -> Stat {
         Stat {
             size: 0,
             blocks: 0,
-            mode: Mode::FILE_RW,
+            mode: Mode {
+                file_type: narf_filesystem::FileType::Special,
+                perms: 0o620,
+            },
             mtime_cycles: 0,
         }
     }

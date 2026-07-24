@@ -1015,6 +1015,15 @@ fn virtio_blk_image_path() -> PathBuf {
     if KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) {
         return virtio_blk_test_image_path();
     }
+    // `NARF_VBLK_IMG` selects an alternate rootfs disk verbatim — the
+    // Alpine image at `narf-vblk.img` is the default, but a distro
+    // bring-up (e.g. `target/narf-fedora-vblk.img`, built by
+    // `REGEN_fedora_kde_rootfs.sh`) wants its own disk without
+    // displacing the one every musl-demo / redis / oci case reads.
+    // Must already exist; we never synthesize an override path.
+    if let Some(p) = std::env::var_os("NARF_VBLK_IMG") {
+        return PathBuf::from(p);
+    }
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
     let path = root.join("target").join("narf-vblk.img");
     // CREATE-ONLY — do NOT overwrite an existing image. This path is shared:

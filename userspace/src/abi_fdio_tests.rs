@@ -885,45 +885,88 @@ fn smoke_abi_fdio_copy_file_range_pos() -> TestResult {
     with_memfs("/abi", "abi", &[("src", b"abcdef"), ("dst", b"")], || {
         let in_fd = open_fd(b"/abi/src\0")?;
         let out_fd = open_fd(b"/abi/dst\0")?;
-        // copy_file_range(in, out, off_in=0, off_out=0, len=4, flags=0)
-        // → 4 bytes copied (explicit offsets, cursors untouched).
+        // copy_file_range(in, &off_in=1, out, &off_out=0, len=4, flags=0)
+        // → 4 bytes copied from src[1..5], and the explicit offsets are
+        // written back advanced (fd cursors untouched).
+        let mut off_in: u64 = 1;
+        let mut off_out: u64 = 0;
         match call_raw(
             Syscall::CopyFileRange.raw(),
             SyscallArgs {
                 arg0: in_fd as u64,
-                arg1: out_fd as u64,
-                arg2: 0,
-                arg3: 0,
+                arg1: &mut off_in as *mut u64 as u64,
+                arg2: out_fd as u64,
+                arg3: &mut off_out as *mut u64 as u64,
                 arg4: 4,
                 arg5: 0,
             },
         ) {
-            r if r.status == SyscallReturn::OK && r.value as i64 == 4 => Ok(()),
+            r if r.status == SyscallReturn::OK && r.value as i64 == 4 => {
+                if off_in != 5 || off_out != 4 {
+                    return Err("copy_file_range did not write back advanced offsets");
+                }
+                Ok(())
+            }
             _ => Err("copy_file_range did not copy 4 bytes"),
         }
     })
 }
+
+/// NULL offset pointers mean "use and advance each fd's own file
+/// offset" — the shape glibc's `cat`/`cp` actually issue. A second
+/// call must therefore resume where the first stopped and report EOF
+/// rather than re-copying the same bytes forever.
+fn smoke_abi_fdio_copy_file_range_null_offsets() -> TestResult {
+    with_memfs("/abi", "abi", &[("src", b"abcdef"), ("dst", b"")], || {
+        let in_fd = open_fd(b"/abi/src\0")?;
+        let out_fd = open_fd(b"/abi/dst\0")?;
+        let call = |len: u64| {
+            call_raw(
+                Syscall::CopyFileRange.raw(),
+                SyscallArgs {
+                    arg0: in_fd as u64,
+                    arg1: 0, // NULL — use + advance the fd cursor
+                    arg2: out_fd as u64,
+                    arg3: 0, // NULL
+                    arg4: len,
+                    arg5: 0,
+                },
+            )
+        };
+        let first = call(6);
+        if first.status != SyscallReturn::OK || first.value as i64 != 6 {
+            return Err("copy_file_range(NULL offsets) did not copy 6 bytes");
+        }
+        // Cursor advanced to EOF ⇒ the follow-up copies nothing.
+        let second = call(6);
+        if second.status != SyscallReturn::OK || second.value as i64 != 0 {
+            return Err("copy_file_range(NULL offsets) did not advance the fd cursor");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_copy_file_range_null_offsets);
 kernel_test_in!("syscall_abi", smoke_abi_fdio_copy_file_range_pos);
 
 fn smoke_abi_fdio_copy_file_range_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("src", b"abc"), ("dst", b"")], || {
         let in_fd = open_fd(b"/abi/src\0")?;
         let out_fd = open_fd(b"/abi/dst\0")?;
-        // A non-zero flags word → -1 sentinel (NARF accepts no flags).
-        // LINUX-GAP: Linux copy_file_range(2) returns -EINVAL.
+        // A non-zero flags word → -EINVAL, as Linux does (no flag is
+        // defined for copy_file_range(2)).
         match call_raw(
             Syscall::CopyFileRange.raw(),
             SyscallArgs {
                 arg0: in_fd as u64,
-                arg1: out_fd as u64,
-                arg2: 0,
+                arg1: 0,
+                arg2: out_fd as u64,
                 arg3: 0,
                 arg4: 4,
                 arg5: 1,
             },
         ) {
-            r if r.status == SyscallReturn::OK && r.value as i64 == -1 => Ok(()),
-            _ => Err("copy_file_range with non-zero flags was not -1"),
+            r if r.status == SyscallReturn::OK && r.value as i64 == -22 => Ok(()),
+            _ => Err("copy_file_range with non-zero flags was not -EINVAL"),
         }
     })
 }
