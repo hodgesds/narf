@@ -192,6 +192,11 @@ On x86_64, `PERF_EVENT_IOC_PERIOD` synchronously validates and installs a new
 nonzero hardware sampling period while the event is disabled. Updating a live
 or remotely active event returns an error until a synchronous cross-CPU PMU
 control path exists; NARF does not defer the update and report false success.
+The aarch64 PMUv3 HAL provides architectural cycle-counter preload, overflow
+acknowledgement, and reload primitives, but `perf_event_open` continues to
+return an error for hardware events until the firmware-routed PPI produces a
+verified mmap sample. Frequency mode and programmable PMUv3 events likewise
+remain errors.
 Successful `mmap(2)` commits emit `PERF_RECORD_MMAP` or `MMAP2` for executable
 and/or data VMAs selected by `mmap`, `mmap2`, and `mmap_data`. File mappings
 carry the fd's recorded path and stable filesystem inode; anonymous mappings

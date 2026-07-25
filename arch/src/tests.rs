@@ -4230,3 +4230,34 @@ fn smoke_mte_tag_round_trip() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/mte", smoke_mte_tag_round_trip);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_pmuv3_cycle_counter_round_trip() -> TestResult {
+    use crate::aarch64::pmu;
+    if !pmu::available() {
+        return TestResult::Skip("PMUv3 not exposed by this CPU");
+    }
+    // SAFETY: kernel smoke runs at EL1 and remains on its current CPU.
+    let counter = match unsafe { pmu::alloc_cycle_counter() } {
+        Ok(counter) => counter,
+        Err(_) => return TestResult::Fail("PMUv3 cycle counter allocation failed"),
+    };
+    // SAFETY: the counter remains live and current-CPU-owned.
+    if unsafe { pmu::read(&counter) }.is_err() {
+        return TestResult::Fail("PMUv3 cycle counter read failed");
+    }
+    // SAFETY: same live current-CPU counter. This validates that preload and
+    // interrupt control registers are accessible without claiming delivery.
+    if unsafe { pmu::arm_sampling(&counter, 100_000) }.is_err()
+        || unsafe { pmu::pause_sampling(&counter) }.is_err()
+    {
+        return TestResult::Fail("PMUv3 sampling arm/pause failed");
+    }
+    // SAFETY: same live current-CPU counter.
+    if unsafe { pmu::release(counter) }.is_err() {
+        return TestResult::Fail("PMUv3 cycle counter release failed");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/pmu", smoke_pmuv3_cycle_counter_round_trip);

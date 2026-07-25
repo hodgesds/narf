@@ -97,6 +97,20 @@ pub fn pmu::last_overflow_period(cpu: usize, counter: usize) -> u64;
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn pmi::program_current_lvt_pc(vector: u8, masked: bool);
 
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::alloc_cycle_counter() -> Result<pmu::CycleCounter, pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::arm_sampling(
+    counter: &pmu::CycleCounter,
+    period: u64,
+) -> Result<(), pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::handle_sampling_overflow() -> bool;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::pause_sampling(
+    counter: &pmu::CycleCounter,
+) -> Result<(), pmu::PmuError>;
+
 #[cfg(target_arch = "x86_64")]
 pub mod amd_pstate {
     pub const MSR_AMD_CPPC_CAP1: u32 = 0xC001_02B0;

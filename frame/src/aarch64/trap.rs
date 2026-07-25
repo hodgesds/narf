@@ -94,7 +94,7 @@ pub extern "C" fn rust_aarch64_irq(frame: &TrapFrame) {
             // one driver (Stage-3 contract). Mark trap context so
             // on_irq can defer wakes (see x86_64 trap.rs for why).
             narf_lib::context::enter_trap_handler();
-            narf_interrupts::on_irq((intid & 0xFF) as u8);
+            narf_interrupts::on_irq_with_context((intid & 0xFF) as u8, frame.elr);
             narf_lib::context::exit_trap_handler();
         }
     }

@@ -137,6 +137,25 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 Some(EOPNOTSUPP) => {}
                 _ => return Err("aarch64 accepted an unimplemented raw PMU event"),
             }
+            let cycles_sample_attr = PerfEventAttr {
+                type_: 0,
+                config: 0,
+                sample_period_or_freq: 100_000,
+                sample_type: 1,
+                ..attr
+            };
+            match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(
+                    &cycles_sample_attr as *const _ as u64,
+                    0,
+                    -1i32 as u64,
+                    -1i32 as u64,
+                ),
+            ) {
+                Some(EOPNOTSUPP) => {}
+                _ => return Err("aarch64 admitted cycles sampling before PPI delivery passed"),
+            }
         }
 
         let approximate_sw_attr = PerfEventAttr {
