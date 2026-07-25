@@ -77,17 +77,28 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
         return;
     }
     let task = current_task_id();
+    let allowed = narf_scheduler::task_mems_allowed(task) & online_mask;
+    if !mpol_initial_nodemask_valid(mode, nodemask, allowed) {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
     let mut flags = a.arg5;
     if (mode & !MPOL_MODE_FLAGS) == 0 {
         flags &= !MPOL_MF_STRICT;
     }
     let mut strict_failed = false;
     if flags & (MPOL_MF_STRICT | MPOL_MF_MOVE) != 0 {
-        let allowed = narf_scheduler::task_mems_allowed(task) & online_mask;
         let policy_nodes = if nodemask == 0 {
             allowed
         } else {
-            nodemask & allowed
+            mpol_effective_nodemask(
+                StoredPolicy {
+                    mode,
+                    nodemask,
+                    home_node: u32::MAX,
+                },
+                allowed,
+            )
         };
         if policy_nodes == 0 {
             ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL

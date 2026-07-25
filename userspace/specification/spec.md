@@ -69,6 +69,9 @@ is intersected with the task's cgroup-v2 `cpuset.mems.effective` mask;
 `get_mempolicy(2)` rejects unknown/conflicting flags, undersized nodemask
 buffers, and addresses supplied without `MPOL_F_ADDR`; address+node
 queries fault in valid lazy pages and report their actual SRAT node.
+`MPOL_F_STATIC_NODES` preserves physical node identities across cpuset
+changes; `MPOL_F_RELATIVE_NODES` maps user-mask ordinals into the current
+`cpuset.mems.effective` set and folds oversized ordinals as Linux does.
 `mbind(MPOL_MF_MOVE)` immediately conforms resident private pages in the
 range, `MPOL_MF_STRICT` reports remaining misplacement as `EIO`, and
 `MPOL_MF_MOVE_ALL` requires authority NARF does not grant ambiently.

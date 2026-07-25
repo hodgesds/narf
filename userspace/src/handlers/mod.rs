@@ -3347,6 +3347,54 @@ fn mpol_policy_shape_valid(mode: u32, nodemask: u64) -> bool {
     }
 }
 
+/// Resolve a user nodemask against the task's current cpuset constraint.
+///
+/// STATIC keeps physical node identities. RELATIVE treats each set bit as
+/// an ordinal into the allowed-node set, folding ordinals modulo its weight
+/// like Linux `nodes_fold` + `nodes_onto`. An empty result after a cpuset
+/// rebind falls back to the allowed set.
+fn mpol_effective_nodemask(policy: StoredPolicy, allowed: u64) -> u64 {
+    const MPOL_F_RELATIVE_NODES: u32 = 1 << 30;
+    let allowed = allowed & ((1u64 << narf_memory::FRAME_MAX_NUMA_NODES) - 1);
+    if allowed == 0 || policy.nodemask == 0 {
+        return policy.nodemask & allowed;
+    }
+    let flags = policy.mode & MPOL_MODE_FLAGS;
+    let effective = if flags & MPOL_F_RELATIVE_NODES != 0 {
+        let weight = allowed.count_ones();
+        let mut ordinals = 0u64;
+        for bit in 0..64u32 {
+            if (policy.nodemask >> bit) & 1 != 0 {
+                ordinals |= 1u64 << (bit % weight);
+            }
+        }
+        let mut mapped = 0u64;
+        let mut ordinal = 0u32;
+        for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
+            if (allowed >> node) & 1 == 0 {
+                continue;
+            }
+            if (ordinals >> ordinal) & 1 != 0 {
+                mapped |= 1u64 << node;
+            }
+            ordinal += 1;
+        }
+        mapped
+    } else {
+        policy.nodemask & allowed
+    };
+    if effective == 0 {
+        allowed
+    } else {
+        effective
+    }
+}
+
+fn mpol_initial_nodemask_valid(mode: u32, nodemask: u64, allowed: u64) -> bool {
+    const MPOL_F_RELATIVE_NODES: u32 = 1 << 30;
+    nodemask == 0 || mode & MPOL_F_RELATIVE_NODES != 0 || nodemask & allowed != 0
+}
+
 /// Resolve the policy in force for `task` at user address `va`: a
 /// covering mbind range wins, else the task default, else DEFAULT.
 fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
@@ -3372,10 +3420,11 @@ fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
 pub fn publish_mempolicy_for_fault(va: u64) {
     let task = current_task_id();
     let policy = resolve_policy(task, va);
+    let allowed = narf_scheduler::task_mems_allowed(task);
     narf_memory::mempolicy_set(narf_memory::Mempolicy {
         mode: policy.mode & !MPOL_MODE_FLAGS,
-        nodemask: policy.nodemask,
-        allowed: narf_scheduler::task_mems_allowed(task),
+        nodemask: mpol_effective_nodemask(policy, allowed),
+        allowed,
         home_node: policy.home_node,
     });
 }

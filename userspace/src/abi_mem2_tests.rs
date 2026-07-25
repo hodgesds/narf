@@ -95,6 +95,37 @@ fn smoke_abi_mem2_set_mempolicy_flagged_mode_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem2_set_mempolicy_flagged_mode_pos);
 
+fn smoke_abi_mem2_relative_nodes_tracks_cpuset() -> TestResult {
+    if narf_memory::node_total(1) == 0 {
+        return TestResult::Skip("requires a second online NUMA node");
+    }
+    with_setup(|| {
+        let task = crate::handlers::current_task_id();
+        narf_scheduler::set_task_mems_allowed(task, 0b10);
+        let mask = 1u64; // relative ordinal 0 => first allowed node => node 1
+        let set = call(
+            Syscall::SetMempolicy.raw(),
+            a1(0x4000_0003, &mask as *const u64 as u64),
+        );
+        let mut node = -1i32;
+        let get = call(
+            Syscall::GetMempolicy.raw(),
+            SyscallArgs {
+                arg0: &mut node as *mut i32 as u64,
+                arg4: 1, // MPOL_F_NODE
+                ..a0(0)
+            },
+        );
+        narf_scheduler::clear_task_mems_allowed(task);
+        if set == Some(0) && get == Some(0) && node == 1 {
+            Ok(())
+        } else {
+            Err("relative node ordinal did not map into cpuset.mems")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem2_relative_nodes_tracks_cpuset);
+
 // ── GetMempolicy (239) — mode-pointer writeback ──────────────────────
 // abi_mem_tests covers MPOL_F_MEMS_ALLOWED and the null-everything
 // default query. Here we exercise the `mode_ptr != 0` writeback arm

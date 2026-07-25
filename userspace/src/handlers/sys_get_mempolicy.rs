@@ -106,7 +106,7 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
             }
             let pol = narf_memory::Mempolicy {
                 mode: narf_memory::MPOL_INTERLEAVE,
-                nodemask: policy.nodemask,
+                nodemask: mpol_effective_nodemask(policy, narf_scheduler::task_mems_allowed(task)),
                 allowed: narf_scheduler::task_mems_allowed(task),
                 home_node: policy.home_node,
             };

@@ -44,6 +44,11 @@ pub(crate) fn sys_set_mempolicy(ctx: &mut dyn TrapContext) {
         return;
     }
     let task = current_task_id();
+    let allowed = narf_scheduler::task_mems_allowed(task) & online_mask;
+    if !mpol_initial_nodemask_valid(mode, nodemask, allowed) {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
     let mut g = MEMPOLICY_TABLE.lock();
     g.get_or_insert_with(alloc::collections::BTreeMap::new)
         .insert(
