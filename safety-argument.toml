@@ -106,3 +106,7 @@ argument = "A netfilter control operation requires a live epoch-checked capabili
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L70"
 argument = "NetfilterAdmin copies share one capability-table object epoch; revoking one invalidates every copied handle at its next authority check while revealing only the already documented stale-cap revocation bit."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The procfs adapters read only the scheduler-published current task id, resolve its immutable network-namespace identity through userspace compatibility state, and request read-only aggregate snapshots. They neither dereference userspace memory nor modify capability, domain, frame, or scheduling state."

@@ -94,12 +94,17 @@ pub struct IfaceCounterSnapshot {
 
 /// Snapshot every registered interface's name + counters.
 pub fn snapshot_counters() -> Vec<IfaceCounterSnapshot> {
+    snapshot_counters_in(0)
+}
+
+pub fn snapshot_counters_in(net_ns_id: u64) -> Vec<IfaceCounterSnapshot> {
     let g = IFACES.lock();
     let v = match g.as_ref() {
         Some(v) => v,
         None => return Vec::new(),
     };
     v.iter()
+        .filter(|e| e.net_ns_id == net_ns_id)
         .map(|e| IfaceCounterSnapshot {
             name: e.name.clone(),
             rx_bytes: 0,
@@ -128,12 +133,17 @@ pub fn snapshot_counters() -> Vec<IfaceCounterSnapshot> {
 /// order, which the dump maps to synthetic ifindex 2, 3, … (ifindex 1 is
 /// the synthetic loopback the responder always prepends).
 pub fn snapshot_all() -> Vec<NetIfaceSnapshot> {
+    snapshot_all_in(0)
+}
+
+pub fn snapshot_all_in(net_ns_id: u64) -> Vec<NetIfaceSnapshot> {
     let g = IFACES.lock();
     let v = match g.as_ref() {
         Some(v) => v,
         None => return Vec::new(),
     };
     v.iter()
+        .filter(|e| e.net_ns_id == net_ns_id)
         .map(|e| NetIfaceSnapshot {
             name: e.name.clone(),
             mac: e.mac,

@@ -222,8 +222,16 @@ fn install_procfs_net_hooks() {
 }
 
 #[cfg(feature = "linux-compat")]
+fn current_net_ns_id() -> u64 {
+    let task = narf_userspace::handlers::current_task_id();
+    narf_userspace::namespaces::current_net_ns(task)
+        .map(|namespace| namespace.id())
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "linux-compat")]
 fn tcp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::TcbSnapshot> {
-    narf_net::tcp::core::snapshot()
+    narf_net::tcp::core::snapshot_in(current_net_ns_id())
         .into_iter()
         .map(|t| narf_filesystem::procfs::net::TcbSnapshot {
             local_addr: t.local_addr,
@@ -243,7 +251,7 @@ fn tcp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::TcbSnapshot> {
 
 #[cfg(feature = "linux-compat")]
 fn udp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::UdpSocketSnapshot> {
-    narf_net::udp_sock::snapshot()
+    narf_net::udp_sock::snapshot_in(current_net_ns_id())
         .into_iter()
         .map(|u| narf_filesystem::procfs::net::UdpSocketSnapshot {
             local_addr: u.local_addr,
@@ -261,7 +269,7 @@ fn udp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::UdpSocketSnaps
 
 #[cfg(feature = "linux-compat")]
 fn raw_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RawSocketSnapshot> {
-    narf_net::raw_sock::snapshot()
+    narf_net::raw_sock::snapshot_in(current_net_ns_id())
         .into_iter()
         .map(|r| narf_filesystem::procfs::net::RawSocketSnapshot {
             local_addr: r.local_addr,
@@ -278,7 +286,7 @@ fn raw_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RawSocketSnaps
 
 #[cfg(feature = "linux-compat")]
 fn arp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::ArpSnapshot> {
-    narf_net::arp_cache::snapshot()
+    narf_net::arp_cache::snapshot_in(current_net_ns_id())
         .into_iter()
         .map(|a| narf_filesystem::procfs::net::ArpSnapshot {
             ip: a.ip,
@@ -291,7 +299,7 @@ fn arp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::ArpSnapshot> {
 
 #[cfg(feature = "linux-compat")]
 fn route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RouteSnapshot> {
-    narf_net::route::snapshot()
+    narf_net::route::snapshot_in(current_net_ns_id())
         .into_iter()
         .map(|r| narf_filesystem::procfs::net::RouteSnapshot {
             iface: r.iface,
@@ -311,7 +319,7 @@ fn route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RouteSnapsho
 
 #[cfg(feature = "linux-compat")]
 fn iface_counters_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::IfaceCounterSnapshot> {
-    narf_net::iface::snapshot_counters()
+    narf_net::iface::snapshot_counters_in(current_net_ns_id())
         .into_iter()
         .map(|c| narf_filesystem::procfs::net::IfaceCounterSnapshot {
             name: c.name,
@@ -371,7 +379,7 @@ fn ipv6_route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6Rou
 
 #[cfg(feature = "linux-compat")]
 fn conntrack_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::ConntrackSnapshot> {
-    narf_net::netfilter::conntrack::snapshot()
+    narf_net::netfilter::conntrack::snapshot_in(current_net_ns_id())
         .into_iter()
         .map(|c| narf_filesystem::procfs::net::ConntrackSnapshot {
             l3proto: c.l3proto,

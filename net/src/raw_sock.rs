@@ -94,9 +94,14 @@ pub struct RawSocketSnapshot {
 
 /// Snapshot every raw packet socket. Cheap: only a few fields.
 pub fn snapshot() -> Vec<RawSocketSnapshot> {
+    snapshot_in(0)
+}
+
+pub fn snapshot_in(net_ns_id: u64) -> Vec<RawSocketSnapshot> {
     let socks = RAW_PKT_SOCKETS.lock();
     socks
         .iter()
+        .filter(|s| s.net_ns_id == net_ns_id)
         .map(|s| RawSocketSnapshot {
             local_addr: [0u8; 4],
             local_port: 0,

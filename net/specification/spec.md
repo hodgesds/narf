@@ -239,6 +239,9 @@ is namespace-scoped. ICMP echo and raw delivery, plus ICMP-originated TCP/UDP
 errors, are restricted to the receiving namespace. TCP, UDP, and ICMP output resolves only namespace-owned
 interfaces and routes and traverses that namespace's `LOCAL_OUT` and
 `POST_ROUTING` netfilter hooks.
+Linux `/proc/net/{tcp,udp,raw,arp,route,dev,nf_conntrack}` snapshots resolve
+the calling task's network namespace and exclude objects owned by every other
+namespace.
 
 `NETLINK_AUDIT` reports a disabled zeroed `audit_status` for `AUDIT_GET` and
 an empty completed `AUDIT_LIST_RULES` dump. `AUDIT_SET` returns `EPERM`

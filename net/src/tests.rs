@@ -123,6 +123,14 @@ fn smoke_network_namespace_transport_tables_are_isolated() -> TestResult {
     {
         return TestResult::Fail("UDP namespace snapshots are not isolated");
     }
+    let raw_a = crate::raw_sock::raw_packet_open_in(601, crate::raw_sock::ETH_P_ALL, 0);
+    let raw_b = crate::raw_sock::raw_packet_open_in(602, crate::raw_sock::ETH_P_ALL, 0);
+    if crate::raw_sock::snapshot_in(601).len() != 1 || crate::raw_sock::snapshot_in(602).len() != 1
+    {
+        return TestResult::Fail("raw socket namespace snapshots are not isolated");
+    }
+    crate::raw_sock::raw_packet_close(&raw_a);
+    crate::raw_sock::raw_packet_close(&raw_b);
     crate::udp_sock::udp_close(&udp_a);
     crate::udp_sock::udp_close(&udp_b);
     crate::tcp::core::remove_tcb(tcp_id);
