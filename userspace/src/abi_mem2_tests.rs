@@ -203,22 +203,25 @@ kernel_test_in!("syscall_abi", smoke_abi_mem2_move_pages_bad_status_neg);
 
 // ── MovePages (279) — count boundary (exactly 1<<20) ─────────────────
 // abi_mem_tests pins (1<<20)+1 → EINVAL. The boundary value 1<<20 is
-// NOT over the cap (`count > 1<<20` is strict), so with status_ptr=0 it
-// skips the writeback and returns 0 — pins the off-by-one boundary.
+// NOT over the cap (`count > 1<<20` is strict), so validation advances to
+// the required page/status pointers and returns EFAULT, not EINVAL.
 
-fn smoke_abi_mem2_move_pages_count_boundary_pos() -> TestResult {
+fn smoke_abi_mem2_move_pages_count_boundary_efault_neg() -> TestResult {
     with_setup(|| {
-        // count == 1<<20 (the cap, inclusive), status=0 → no writeback, 0.
+        // count == 1<<20 (the cap, inclusive), pointers null → EFAULT.
         let args = a1(0, 1u64 << 20);
         match call(Syscall::MovePages.raw(), args) {
-            Some(0) => Ok(()),
+            Some(v) if v == EFAULT => Ok(()),
             Some(v) if v == EINVAL => Err("move_pages(count==1<<20) is the cap, not over it"),
-            Some(_) => Err("move_pages(count==1<<20) should return 0"),
+            Some(_) => Err("move_pages(count==1<<20, null pointers) should be -EFAULT"),
             None => Err("move_pages(boundary) returned non-Ok status"),
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_mem2_move_pages_count_boundary_pos);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem2_move_pages_count_boundary_efault_neg
+);
 
 // ── ProcessMadvise (440) — iovcnt boundary (exactly 1024) ────────────
 // abi_mem_tests pins iovcnt=2048 → EINVAL and a bogus pidfd → EBADF.

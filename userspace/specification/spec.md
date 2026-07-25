@@ -58,6 +58,15 @@ system activity.
 Legacy `clone(2)` honors `CLONE_PIDFD` by installing a pidfd in the parent and
 writing its descriptor through the overloaded `parent_tid` pointer argument.
 
+Linux NUMA compatibility reports live topology rather than a structural
+single-node stub: `getcpu(2)` returns the current logical CPU and its
+SRAT proximity node, while query-form `move_pages(2)` walks the caller's
+page tables and reports the physical page's SRAT node (or per-page
+`-ENOENT` when it is not resident). Page-migration forms require an
+atomic address-space backing-frame replacement and must return an error
+until that operation is available; they must never claim a successful
+move without changing placement.
+
 Bootstrap: every new process receives two ring pairs (submit + complete)
 for the kernel ABI plus a read-only config page with capability
 handles to its parent-granted services. Additional ring pairs for

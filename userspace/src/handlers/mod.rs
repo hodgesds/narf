@@ -3252,12 +3252,45 @@ const MPOL_MODE_FLAGS: u32 = 0xc000_0000; // MPOL_F_STATIC_NODES | _RELATIVE_NOD
 // threshold — see filesystem/src/sysfs.rs). `narf-frame` provides it.
 extern "Rust" {
     fn narf_numa_node_count() -> u32;
+    fn narf_cpu_to_node(cpu: u32) -> u32;
+    fn narf_phys_to_node(addr: u64) -> u32;
 }
 
 #[inline]
 fn numa_node_count() -> u32 {
     // SAFETY: narf-frame provides the `#[no_mangle]` definition.
     unsafe { narf_numa_node_count() }.max(1)
+}
+
+#[inline]
+fn numa_node_for_cpu(cpu: u32) -> u32 {
+    // SAFETY: narf-frame provides the `#[no_mangle]` definition.
+    unsafe { narf_cpu_to_node(cpu) }
+}
+
+#[inline]
+fn numa_node_for_phys(phys: u64) -> u32 {
+    // SAFETY: narf-frame provides the `#[no_mangle]` definition.
+    unsafe { narf_phys_to_node(phys) }
+}
+
+fn mapped_phys(as_ref: &AddressSpace, va: u64) -> Option<u64> {
+    let page = VirtAddr::new(va & !0xFFF);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the live AddressSpace owns `root`; this is a read-only walk.
+        unsafe { narf_memory::x86_64::paging::translate(as_ref.root, page) }.map(|p| p.as_u64())
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: the live AddressSpace owns `root`; this is a read-only walk.
+        unsafe { narf_memory::aarch64::paging::translate(as_ref.root, page) }.map(|p| p.as_u64())
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (as_ref, page);
+        None
+    }
 }
 
 // get_mempolicy `flags` bits (uapi/linux/mempolicy.h).
@@ -7304,10 +7337,10 @@ pub fn __test_sched_param_reset() {
 
 // ── Getcpu — current CPU + NUMA node query ─────────────────────────
 //
-// Linux getcpu(2): real CPU + NUMA node lookup. NARF user mode is
-// single-CPU and single-node today — both return 0 — but library
-// code (libnuma, RT performance probes) queries this at startup
-// and the entry must exist.
+// Linux getcpu(2): real logical CPU + SRAT NUMA node lookup. Library
+// code (libnuma, RT performance probes) queries this at startup, so
+// returning the BSP unconditionally breaks placement decisions after
+// a task migrates.
 
 // ── Per-task umask ──────────────────────────────────────────────────
 //

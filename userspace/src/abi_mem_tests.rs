@@ -337,36 +337,17 @@ fn smoke_abi_mem_process_madvise_bad_pidfd_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_mem_process_madvise_bad_pidfd_neg);
 
 // ── MovePages (279) ──────────────────────────────────────────────────
-// No AS needed. count > 1<<20 → -EINVAL. A status query (status_ptr set,
-// small count) writes node-0 (i32 zeros) for each page and returns 0.
+// count > 1<<20 → -EINVAL. A zero-count query is a successful no-op;
+// non-empty queries require both the page array and status array.
 
-fn smoke_abi_mem_move_pages_status_pos() -> TestResult {
-    with_setup(|| {
-        // count=1, pages=0, nodes=0, status=&out, flags=0. Handler writes
-        // one i32 (node 0) into `out` and returns 0.
-        let mut out = [0xFFu8; 4];
-        let args = SyscallArgs {
-            arg0: 0,
-            arg1: 1,
-            arg2: 0,
-            arg3: 0,
-            arg4: out.as_mut_ptr() as u64,
-            arg5: 0,
-        };
-        match call(Syscall::MovePages.raw(), args) {
-            Some(0) => {
-                if out == [0u8; 4] {
-                    Ok(())
-                } else {
-                    Err("move_pages should report node 0 (i32 zero) per page")
-                }
-            }
-            Some(_) => Err("move_pages status query should return 0"),
-            None => Err("move_pages returned non-Ok status"),
-        }
+fn smoke_abi_mem_move_pages_zero_count_pos() -> TestResult {
+    with_setup(|| match call(Syscall::MovePages.raw(), a1(0, 0)) {
+        Some(0) => Ok(()),
+        Some(_) => Err("move_pages zero-count query should return 0"),
+        None => Err("move_pages returned non-Ok status"),
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_mem_move_pages_status_pos);
+kernel_test_in!("syscall_abi", smoke_abi_mem_move_pages_zero_count_pos);
 
 fn smoke_abi_mem_move_pages_bad_count_neg() -> TestResult {
     with_setup(|| {
