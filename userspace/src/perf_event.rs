@@ -35,6 +35,10 @@ static ACTIVE_PERF_EVENTS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 static PERF_EVENT_REGISTRY: IrqSafeSpinLock<Vec<Weak<PerfEventFile>>> =
     IrqSafeSpinLock::new(Vec::new());
+static PERF_ROTATION_CURSOR: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
+static PERF_LAST_SELECTED_TASK: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(u64::MAX) }; narf_lib::percpu::MAX_CPUS];
 #[cfg(target_arch = "x86_64")]
 static PMI_VECTOR: IrqSafeSpinLock<Option<u8>> = IrqSafeSpinLock::new(None);
 #[cfg(target_arch = "x86_64")]
@@ -55,6 +59,33 @@ static CPU_USER_SLICE_START_NS: [AtomicU64; SAMPLE_CPU_SLOTS] =
     [const { AtomicU64::new(0) }; SAMPLE_CPU_SLOTS];
 static CPU_USER_DEPTH: [AtomicU32; SAMPLE_CPU_SLOTS] =
     [const { AtomicU32::new(0) }; SAMPLE_CPU_SLOTS];
+
+#[inline]
+fn rotation_index(start: usize, offset: usize, len: usize) -> usize {
+    debug_assert!(len != 0);
+    start.wrapping_add(offset) % len
+}
+
+pub(crate) fn rotation_index_for_test(start: usize, offset: usize, len: usize) -> usize {
+    rotation_index(start, offset, len)
+}
+
+#[inline]
+fn advance_rotation_cursor(previous_task: u64, task: u64, cursor: usize) -> usize {
+    if previous_task != u64::MAX && previous_task != task {
+        cursor.wrapping_add(1)
+    } else {
+        cursor
+    }
+}
+
+pub(crate) fn advance_rotation_cursor_for_test(
+    previous_task: u64,
+    task: u64,
+    cursor: usize,
+) -> usize {
+    advance_rotation_cursor(previous_task, task, cursor)
+}
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
@@ -1925,15 +1956,78 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
     }
     let cpu = narf_lib::percpu::current_cpu();
     let mut registry = PERF_EVENT_REGISTRY.lock();
-    registry.retain(|weak| {
-        let Some(event) = weak.upgrade() else {
-            return false;
-        };
-        if event.tracks_task(task) {
-            event.task_switch(cpu, running);
+    registry.retain(|weak| weak.strong_count() != 0);
+    if registry.is_empty() {
+        return;
+    }
+
+    if !running {
+        for weak in registry.iter() {
+            if let Some(event) = weak.upgrade() {
+                if event.tracks_task(task) {
+                    event.task_switch(cpu, false);
+                }
+            }
         }
-        true
-    });
+        return;
+    }
+
+    // Record every selected task, including one without a perf event. Otherwise
+    // A -> unmonitored B -> A would look like immediate re-entry into A.
+    let previous_task = PERF_LAST_SELECTED_TASK[cpu].swap(task, Ordering::Relaxed);
+
+    // Allocation failures are expected when a task has more enabled hardware
+    // events than physical counters. Rotate across that eligible set only:
+    // perf also opens software dummy/metadata events, and including those in
+    // the cursor would starve hardware events at stable registry positions.
+    let eligible = registry
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|event| {
+            event.enabled.load(Ordering::Acquire)
+                && event.is_task_hardware_event()
+                && event.tracks_task(task)
+        })
+        .count();
+    if eligible == 0 {
+        return;
+    }
+    // `poll_to_yield` brackets every stackful execution interval, including a
+    // syscall that returns to and immediately reselects the same task. That
+    // boundary must stop the PMU so executor time is not charged, but it is not
+    // a task/context switch and therefore must not advance the multiplex epoch.
+    let cursor = PERF_ROTATION_CURSOR[cpu].load(Ordering::Relaxed);
+    let next_cursor = advance_rotation_cursor(previous_task, task, cursor);
+    if next_cursor != cursor {
+        PERF_ROTATION_CURSOR[cpu].store(next_cursor, Ordering::Relaxed);
+    }
+    let start = next_cursor % eligible;
+
+    // Two passes implement a circular walk without allocating in the scheduler
+    // context: [start, eligible), then [0, start).
+    for pass in 0..2 {
+        let mut ordinal = 0;
+        for weak in registry.iter() {
+            let Some(event) = weak.upgrade() else {
+                continue;
+            };
+            if !event.enabled.load(Ordering::Acquire)
+                || !event.is_task_hardware_event()
+                || !event.tracks_task(task)
+            {
+                continue;
+            }
+            let selected = if pass == 0 {
+                ordinal >= start
+            } else {
+                ordinal < start
+            };
+            ordinal += 1;
+            if selected {
+                event.task_switch(cpu, true);
+            }
+        }
+    }
 }
 
 fn account_cpu_user_switch(running: bool) {

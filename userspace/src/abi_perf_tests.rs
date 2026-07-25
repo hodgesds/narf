@@ -29,6 +29,18 @@ const EOPNOTSUPP: i64 = -95;
 
 fn smoke_abi_perf_event_open_validation() -> TestResult {
     with_setup(|| {
+        let rotated: [usize; 4] =
+            core::array::from_fn(|offset| crate::perf_event::rotation_index_for_test(2, offset, 4));
+        if rotated != [2, 3, 0, 1] {
+            return Err("perf multiplex cursor did not wrap fairly");
+        }
+        if crate::perf_event::advance_rotation_cursor_for_test(u64::MAX, 7, 3) != 3
+            || crate::perf_event::advance_rotation_cursor_for_test(7, 7, 3) != 3
+            || crate::perf_event::advance_rotation_cursor_for_test(7, 8, 3) != 4
+        {
+            return Err("perf multiplex cursor advanced without a task switch");
+        }
+
         #[cfg(target_arch = "x86_64")]
         {
             if crate::perf_event::frequency_period(20_000, 100_000, 10_000) != 20_000

@@ -77,8 +77,13 @@ Gaps:
   claims.
 - `time_enabled` measures the complete enabled interval while `time_running`
   measures only intervals in which a hardware event owns a real PMU slot.
-  Counter multiplexing must rotate ownership and preserve those independently
-  accumulated intervals before more events than hardware slots can be accepted.
+  Oversubscribed task events rotate their allocation priority when a CPU
+  selects a different task, so unavailable events remain stopped and later
+  receive a real slot rather than being estimated. Syscall/poll re-entry for
+  the same task does not advance the multiplex epoch. Per-CPU events still
+  allocate eagerly and fail when no physical slot is available; timer-driven
+  rotation remains necessary both for system-wide oversubscription and for a
+  lone task to share counters without relying on competing runnable tasks.
 - Raw PMU formats are architecture-specific: sysfs exposes the x86
   event/unit-mask controls or the aarch64 16-bit architectural event number.
   Model-specific event aliases must still be generated from the detected CPU
