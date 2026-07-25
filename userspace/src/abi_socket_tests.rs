@@ -2257,6 +2257,33 @@ fn smoke_abi_netlink_generic_socket_open() -> TestResult {
         if !window_contains(&reply[..n as usize], b"nlctrl\0") {
             return Err("generic netlink reply did not name nlctrl");
         }
+
+        // The wireless subsystem registers nl80211 through the generic-family
+        // registry during boot. Resolve it by name through the real socket
+        // path, proving the init hook and family dispatch boundary are live.
+        let mut wireless = [0u8; 32];
+        wireless[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        wireless[4..6].copy_from_slice(&16u16.to_ne_bytes());
+        wireless[6..8].copy_from_slice(&1u16.to_ne_bytes());
+        wireless[8..12].copy_from_slice(&92u32.to_ne_bytes());
+        wireless[16] = 3;
+        wireless[17] = 2;
+        wireless[20..22].copy_from_slice(&12u16.to_ne_bytes());
+        wireless[22..24].copy_from_slice(&2u16.to_ne_bytes());
+        wireless[24..32].copy_from_slice(b"nl80211\0");
+        if netlink_send(fd, &wireless).ok_or("nl80211 lookup send status")? != wireless.len() as i64
+        {
+            return Err("CTRL_CMD_GETFAMILY nl80211 send failed");
+        }
+        let n = netlink_recv(fd, &mut reply).ok_or("nl80211 lookup recv status")?;
+        if n < 24 || nlmsg_type_of(&reply) != 16 {
+            return Err("nl80211 lookup did not return GENL_ID_CTRL");
+        }
+        if !window_contains(&reply[..n as usize], b"nl80211\0")
+            || !window_contains(&reply[..n as usize], &0x13u16.to_ne_bytes())
+        {
+            return Err("generic netlink reply did not describe nl80211");
+        }
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())
     })
@@ -2317,7 +2344,7 @@ fn smoke_abi_netlink_generic_extended_capped_error() -> TestResult {
         request[17] = 2;
         request[20..22].copy_from_slice(&12u16.to_ne_bytes());
         request[22..24].copy_from_slice(&2u16.to_ne_bytes());
-        request[24..32].copy_from_slice(b"nl80211\0");
+        request[24..32].copy_from_slice(b"missing\0");
         if netlink_send(fd, &request).ok_or("generic error send")? != request.len() as i64 {
             return Err("unknown generic family send failed");
         }

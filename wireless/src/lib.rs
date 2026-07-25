@@ -13,6 +13,7 @@ pub mod eapol;
 pub mod iface;
 pub mod mfp;
 pub mod mlme;
+pub mod nl80211;
 pub mod reg;
 pub mod rsn;
 pub mod sae;
@@ -91,7 +92,9 @@ pub mod registry {
 }
 
 /// Force-link hook.
-pub fn register_initcalls() {}
+pub fn register_initcalls() {
+    let _ = nl80211::register();
+}
 
 // ── Smoke Tests ───────────────────────────────────────────────────
 

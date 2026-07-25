@@ -93,6 +93,16 @@ pub async fn associate(cap: &Cap<WirelessIface, Associate>, req: AssocReq) -> Re
 pub async fn set_phy_config(cap: &Cap<WirelessIface, Config>, cfg: PhyCfg) -> Result<(), WirelessError>;
 ```
 
+### 3.4 Linux nl80211 compatibility
+
+The wireless subsystem registers the `nl80211` generic-netlink family through
+the `net/` family registry. Read-only `GET_WIPHY` and `GET_INTERFACE` point and
+dump requests enumerate the canonical wireless-interface registry and emit
+Linux `NEW_WIPHY` / `NEW_INTERFACE` records. The family advertises only these
+implemented operations plus the `config` and `scan` multicast groups.
+Scan, association, key, and PHY mutations remain capability-gated native
+operations and are not accepted through ambient Linux netlink authority.
+
 ## 4. Architecture: SoftMAC vs. FullMAC
 
 NARF supports both through the `WirelessIface` trait:

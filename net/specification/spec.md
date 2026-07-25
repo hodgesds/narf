@@ -185,6 +185,11 @@ with Linux-compatible family, supported-operation, and multicast-group
 attributes; unknown families return `ENOENT`. Multiple
 aligned control requests may be batched in one datagram and retain independent
 sequence numbers.
+Subsystems may register additional generic-netlink families by stable ID and
+name, with immutable operation/group descriptors and a request callback.
+Duplicate IDs or names are rejected. Family callbacks return attribute streams;
+the netlink core owns generic headers, multipart termination, acknowledgements,
+and sequence/sender fields.
 Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
 same capped echo and diagnostic-TLV rules as rtnetlink.
 
