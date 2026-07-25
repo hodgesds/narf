@@ -26,8 +26,8 @@ use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 use super::{
     hook_auxv, hook_coredump_get, hook_coredump_set, hook_cwd_path, hook_environ, hook_exe_path,
-    hook_fd_list, hook_fd_path, hook_nice, hook_oom_adj_get, hook_oom_adj_set, hook_oom_score,
-    hook_rlimits, hook_root_path, slice_read, task_info, ProcDirMarker,
+    hook_fd_list, hook_fd_path, hook_fd_pidfd_pid, hook_nice, hook_oom_adj_get, hook_oom_adj_set,
+    hook_oom_score, hook_rlimits, hook_root_path, slice_read, task_info, ProcDirMarker,
 };
 
 // ── Extended flat-file enum ─────────────────────────────────────────
@@ -809,6 +809,18 @@ impl FileOps for ProcFdInfoFile {
             let _ = writeln!(s, "flags:\t0100002");
             // mnt_id: mount-table ID. Always 1 until per-mount id allocator lands.
             let _ = writeln!(s, "mnt_id:\t1");
+            // pidfd fds carry `Pid:`/`NSpid:` lines (Linux
+            // `fs/pidfs.c::pidfd_show_fdinfo`). Pre-pidfs userspace resolves
+            // a pidfd to its process by parsing exactly these — systemd 258's
+            // `pidfd_get_pid()` falls back here after `pidfd_spawn` (glibc
+            // posix_spawn → clone3 CLONE_PIDFD) when the PIDFD_GET_INFO
+            // ioctl/pidfs probe is unsupported, and returns ENOTTY ("Failed
+            // to spawn executor: Inappropriate ioctl for device", killing
+            // every early service) if the `Pid:` line is missing.
+            if let Some(target) = hook_fd_pidfd_pid(pid, fd) {
+                let _ = writeln!(s, "Pid:\t{}", target);
+                let _ = writeln!(s, "NSpid:\t{}", target);
+            }
             if let Some(path) = hook_fd_path(pid, fd) {
                 let _ = writeln!(s, "# backing: {}", path);
             }
@@ -1256,6 +1268,46 @@ fn smoke_fdinfo_has_pos_and_flags() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/pid_ext", smoke_fdinfo_has_pos_and_flags);
+
+/// Smoke: a pidfd fd renders `Pid:`/`NSpid:` lines in fdinfo (Linux
+/// `pidfd_show_fdinfo` parity — systemd's `pidfd_get_pid()` fallback
+/// parses `Pid:` and returns ENOTTY without it, failing every
+/// `pidfd_spawn`-based service start); a non-pidfd fd must NOT carry
+/// a `Pid:` line.
+fn smoke_fdinfo_pidfd_renders_pid_line() -> TestResult {
+    use super::poll_once;
+    fn stub(_pid: u64, fd: u32) -> Option<u64> {
+        (fd == 7).then_some(42)
+    }
+    super::set_fd_pidfd_pid_hook(stub);
+    let read_fdinfo = |fd: u32| -> Option<alloc::string::String> {
+        let f = ProcFdInfoFile { pid: 1, fd };
+        let mut buf = [0u8; 256];
+        match poll_once(f.read(0, &mut buf)) {
+            Some(Ok(n)) if n > 0 => Some(core::str::from_utf8(&buf[..n]).unwrap_or("").to_string()),
+            _ => None,
+        }
+    };
+    let pidfd = match read_fdinfo(7) {
+        Some(s) => s,
+        None => return TestResult::Fail("pidfd fdinfo read failed"),
+    };
+    if !pidfd.contains("Pid:\t42\n") || !pidfd.contains("NSpid:\t42\n") {
+        return TestResult::Fail("pidfd fdinfo missing 'Pid:'/'NSpid:' lines");
+    }
+    let plain = match read_fdinfo(0) {
+        Some(s) => s,
+        None => return TestResult::Fail("plain fdinfo read failed"),
+    };
+    if plain.contains("Pid:") {
+        return TestResult::Fail("non-pidfd fdinfo must not carry a 'Pid:' line");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_fdinfo_pidfd_renders_pid_line
+);
 
 // ── statm + magic symlink smokes ────────────────────────────────────────
 

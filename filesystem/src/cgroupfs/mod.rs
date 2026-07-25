@@ -476,6 +476,24 @@ pub fn fork_inherit(parent_pid: u64, child_pid: u64) {
     place_forced(child_pid, &dst);
 }
 
+/// `CLONE_INTO_CGROUP` (clone3): place the freshly-cloned `pid` into the
+/// cgroup at `path` (cgroupfs-relative, e.g. `/system.slice/foo.service`;
+/// `""` or `"/"` = the root cgroup). Controller vetoes are honoured
+/// (`place`), matching Linux's `cgroup_attach_task` on the clone path.
+///
+/// Linux ref: `kernel/cgroup/cgroup.c::cgroup_css_set_fork`.
+pub fn attach_by_path(path: &str, pid: u64) -> Result<(), FsError> {
+    let mut cur = root();
+    for comp in path.split('/').filter(|c| !c.is_empty()) {
+        let next = cur.children.lock().get(comp).cloned();
+        match next {
+            Some(n) => cur = n,
+            None => return Err(FsError::NotFound),
+        }
+    }
+    place(pid, &cur)
+}
+
 /// A process exited: drop its membership and uncharge controllers.
 pub fn task_exited(pid: u64) {
     let cg = TASK_CGROUP.lock().remove(&pid);

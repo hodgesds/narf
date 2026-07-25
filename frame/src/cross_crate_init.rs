@@ -89,6 +89,9 @@ fn install_proc_ext_hooks() {
     );
     // /proc/<pid>/fd enumeration: the exact open fd set from the fd table.
     narf_filesystem::procfs::set_fd_list_hook(narf_userspace::handlers::proc_fd_list);
+    // /proc/<pid>/fdinfo/<n> "Pid:"/"NSpid:" lines for pidfd fds —
+    // systemd's pidfd_get_pid() fallback parses these after pidfd_spawn.
+    narf_filesystem::procfs::set_fd_pidfd_pid_hook(narf_userspace::handlers::proc_fd_pidfd_pid);
 }
 
 #[cfg(feature = "linux-compat")]

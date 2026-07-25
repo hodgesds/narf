@@ -163,6 +163,12 @@ type FdPathFn = fn(u64, u32) -> Option<String>;
 /// Returns the fd numbers currently open for a pid — an exact snapshot of
 /// the fd table, ascending. Backs `/proc/<pid>/fd` enumeration.
 type FdListFn = fn(u64) -> Vec<u32>;
+/// Returns `Some(target_pid)` iff fd `n` of `pid` is a pidfd. Backs the
+/// `Pid:`/`NSpid:` lines in `/proc/<pid>/fdinfo/<n>` (Linux
+/// `fs/pidfs.c::pidfd_show_fdinfo`) that pre-pidfs userspace — including
+/// systemd's `pidfd_get_pid()` fallback — parses to resolve a pidfd to
+/// its process.
+type FdPidfdPidFn = fn(u64, u32) -> Option<u64>;
 type RlimitsFn = fn(u64) -> [(u64, u64); 16];
 type NiceFn = fn(u64) -> i32;
 type EnvironFn = fn(u64) -> Vec<u8>;
@@ -250,6 +256,7 @@ pub(crate) fn hook_root_path(pid: u64) -> Option<String> {
 
 static FD_PATH_HOOK: AtomicUsize = AtomicUsize::new(0);
 static FD_LIST_HOOK: AtomicUsize = AtomicUsize::new(0);
+static FD_PIDFD_PID_HOOK: AtomicUsize = AtomicUsize::new(0);
 static RLIMITS_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NICE_HOOK: AtomicUsize = AtomicUsize::new(0);
 static ENVIRON_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -317,6 +324,25 @@ pub fn install_proc_write_hooks(
 /// `install_proc_ext_hooks` so callers can install it independently.
 pub fn set_fd_list_hook(f: FdListFn) {
     FD_LIST_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Wire the pidfd-target lookup hook backing the `Pid:`/`NSpid:` fdinfo
+/// lines. Separate from `install_proc_ext_hooks` so callers can install
+/// it independently.
+pub fn set_fd_pidfd_pid_hook(f: FdPidfdPidFn) {
+    FD_PIDFD_PID_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// `Some(target_pid)` iff fd `n` of `pid` is a pidfd (via the installed
+/// hook); `None` for non-pidfd fds or when no hook is wired.
+pub(crate) fn hook_fd_pidfd_pid(pid: u64, fd: u32) -> Option<u64> {
+    let v = FD_PIDFD_PID_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: v was stored by set_fd_pidfd_pid_hook as a FdPidfdPidFn fn-pointer; non-zero confirms it.
+    let f: FdPidfdPidFn = unsafe { core::mem::transmute(v) };
+    f(pid, fd)
 }
 
 /// The open fd numbers for `pid` via the installed hook, or `None` if no

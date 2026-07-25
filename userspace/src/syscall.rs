@@ -3250,7 +3250,14 @@ pub fn kernel_syscall_entry_plain_with_state(
 ) -> SyscallReturn {
     let n = match Syscall::from_raw(num) {
         Some(v) => v,
-        None => return SyscallReturn::invalid_op(),
+        None => {
+            #[cfg(feature = "syscall-trace")]
+            {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "UNKNOWN_SYSCALL num={}", num);
+            }
+            return SyscallReturn::invalid_op();
+        }
     };
     let p = GLOBAL_TABLE.load(Ordering::Acquire);
     if p.is_null() {

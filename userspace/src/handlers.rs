@@ -2173,8 +2173,24 @@ fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    // dirfd (arg0) is honoured only as AT_FDCWD — NARF resolves absolute
-    // paths; relative paths resolve under the task's cwd/chroot.
+    // Honour a real directory fd (same shape as sys_readlinkat/sys_statx):
+    // resolve a relative path against the directory backing `dirfd`.
+    // systemd's chase() calls name_to_handle_at(parent_dir_fd, name, ...)
+    // per component to compute mount ids; resolving against the cwd
+    // instead ENOENT'd exec_setup_credentials' mount-ns child (journald
+    // 243/EXIT_CREDENTIALS).
+    let dirfd_i = a.arg0 as i32;
+    const AT_FDCWD_I32: i32 = -100;
+    let raw = if raw.starts_with('/') || dirfd_i == AT_FDCWD_I32 || dirfd_i < 0 {
+        raw
+    } else {
+        match fd_path_of(current_task_id(), dirfd_i as u32) {
+            Some(dir) if dir.starts_with('/') => {
+                alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
+            }
+            _ => raw,
+        }
+    };
     let path = apply_chroot(&raw);
     // Dir-aware resolution (files, directories, mount roots and mount
     // ancestors alike), carrying the object's stable inode. A dir-only
@@ -2901,6 +2917,124 @@ fn sys_ioctl(ctx: &mut dyn TrapContext) {
             }
         }
         return;
+    }
+    // PIDFD_GET_*_NAMESPACE (_IO(0xFF, 1..=10)): mint an fd on the pidfd
+    // target's namespace of the requested flavour (Linux 6.13 pidfs
+    // ioctls; `fs/pidfs.c::pidfd_ioctl`). systemd 258's
+    // `pidref_namespace_open_by_type()` tries this FIRST; on ENOTTY it
+    // falls back to opening `/proc/<pid>/ns/<flavour>`, and when THAT
+    // ENOENTs with /proc mounted it maps the miss to -ENOPKG — an errno
+    // its callers treat as a hard error. Concretely: the service
+    // executor's `is_idmapping_supported()` probe (setup_exec_directory,
+    // RuntimeDirectory=) calls `userns_acquire()` → this ioctl; without
+    // it every service with RuntimeDirectory= exits 233/RUNTIME_DIRECTORY
+    // ("journald/logind/udevd failed with result 'exit-code'"). The fd
+    // returned here is a real `NsFd`, so a later `setns(2)` on it works
+    // (sys_setns downcasts via as_any).
+    #[cfg(feature = "container")]
+    if (0xff01..=0xff0a).contains(&cmd) {
+        if let Some(target) = ops.pidfd_target_pid() {
+            use crate::namespaces::NsFlavour;
+            let flavour = match cmd & 0xFF {
+                1 => Some(NsFlavour::Cgroup),
+                2 => Some(NsFlavour::Ipc),
+                3 => Some(NsFlavour::Mnt),
+                4 => Some(NsFlavour::Net),
+                // 5 = PID ns, 6 = PID-for-children: NARF tracks one
+                // per-task pid-ns, serve it for both.
+                5 | 6 => Some(NsFlavour::Pid),
+                9 => Some(NsFlavour::User),
+                10 => Some(NsFlavour::Uts),
+                // 7/8 = time namespaces — not modelled; fall through to
+                // the generic ENOTTY arm below (Linux pre-6.13 shape).
+                _ => None,
+            };
+            let target_task = pid_to_task_raw(target).unwrap_or(target);
+            if let Some(nsfd) = flavour.and_then(|f| {
+                // Mount-ns fds are minted at the handlers layer (the
+                // mount-ns table lives here, not in `namespaces`).
+                if matches!(f, NsFlavour::Mnt) {
+                    None
+                } else {
+                    crate::namespaces::ns_fd_for(target_task, f)
+                }
+            }) {
+                let ops_dyn: Arc<dyn narf_filesystem::FileOps> = nsfd;
+                // Linux mints these O_CLOEXEC (pidfs open_namespace).
+                let new_fd = fd::with_table(task, |t| {
+                    t.open(fd::FdEntry {
+                        ops: ops_dyn,
+                        offset: 0,
+                        flags: crate::fd::FD_CLOEXEC,
+                        status_flags: 0,
+                    })
+                });
+                match new_fd {
+                    Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
+                    None => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),
+                }
+                return;
+            }
+        }
+        // Not a pidfd / unmodelled flavour: fall through → generic
+        // ENOTTY, which systemd tolerates (pre-pidfs kernel shape).
+    }
+    // PIDFD_GET_INFO (_IOWR(0xFF, 11, struct pidfd_info)): resolve a pidfd
+    // to its target's pid/creds. systemd 258's `pidfd_get_pid()` tries this
+    // ioctl FIRST (kernel 6.13+ path) after `pidfd_spawn`, to turn the
+    // clone3-minted pidfd into a PidRef; on failure it falls back to parsing
+    // `/proc/self/fdinfo/<n>` (which NARF doesn't render a "Pid:" line for).
+    // Matched on magic+nr+direction with ANY size so binaries built against
+    // older/newer uapi headers (the size is baked into the cmd) all land here.
+    // Linux ref: `fs/pidfs.c::pidfd_info` + `include/uapi/linux/pidfd.h`.
+    if (cmd & 0xFF) == 11 && ((cmd >> 8) & 0xFF) == 0xFF && (cmd >> 30) == 0x3 {
+        if let Some(target) = ops.pidfd_target_pid() {
+            let user_size = ((cmd >> 16) & 0x3FFF) as usize;
+            const PIDFD_INFO_SIZE_VER0: usize = 64;
+            if user_size < PIDFD_INFO_SIZE_VER0 {
+                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                return;
+            }
+            const PIDFD_INFO_PID: u64 = 1 << 0;
+            const PIDFD_INFO_CREDS: u64 = 1 << 1;
+            // struct pidfd_info (uapi VER2, 80 bytes): mask@0 cgroupid@8
+            // pid@16 tgid@20 ppid@24 ruid@28 rgid@32 euid@36 egid@40
+            // suid@44 sgid@48 fsuid@52 fsgid@56 exit_code@60
+            // coredump_mask@64 coredump_signal@68 supported_mask@72.
+            let mut info = [0u8; 80];
+            info[0..8].copy_from_slice(&(PIDFD_INFO_PID | PIDFD_INFO_CREDS).to_ne_bytes());
+            let pid32 = target as u32;
+            info[16..20].copy_from_slice(&pid32.to_ne_bytes()); // pid
+            info[20..24].copy_from_slice(&pid32.to_ne_bytes()); // tgid
+            let ppid = parent_of_get(target)
+                .map(|p| task_to_pid_raw(p).unwrap_or(p) as u32)
+                .unwrap_or(0);
+            info[24..28].copy_from_slice(&ppid.to_ne_bytes());
+            let cred_task = pid_to_task_raw(target).unwrap_or(target);
+            let ug = read_uidgid(cred_task);
+            info[28..32].copy_from_slice(&ug.uid.to_ne_bytes()); // ruid
+            info[32..36].copy_from_slice(&ug.gid.to_ne_bytes()); // rgid
+            info[36..40].copy_from_slice(&ug.euid.to_ne_bytes()); // euid
+            info[40..44].copy_from_slice(&ug.egid.to_ne_bytes()); // egid
+            info[44..48].copy_from_slice(&ug.euid.to_ne_bytes()); // suid (= euid)
+            info[48..52].copy_from_slice(&ug.egid.to_ne_bytes()); // sgid (= egid)
+            info[52..56].copy_from_slice(&ug.fsuid.to_ne_bytes());
+            info[56..60].copy_from_slice(&ug.fsgid.to_ne_bytes());
+            let n = core::cmp::min(user_size, info.len());
+            // SAFETY: `arg` is the user struct pointer for an _IOWR ioctl;
+            // copy_to_user range-validates and SMAP-brackets the write of
+            // min(user-declared size, our struct) bytes.
+            // SAFETY: Valid memory or trusted environment
+            if unsafe { copy_to_user(arg as u64, &info[..n]) }.is_err() {
+                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+        // Not a pidfd: fall through — Linux returns ENOTTY via the
+        // default file_operations dispatch, which the generic arm below
+        // reproduces (FsError::Unsupported → ENOTTY).
     }
     match ops.ioctl(cmd, arg) {
         Ok(rc) => ctx.set_return(SyscallReturn::ok(rc)),
@@ -4505,9 +4639,27 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
                 return;
             }
         };
+        // Honour a real directory fd (same shape as sys_readlinkat):
+        // resolve a relative path against the directory backing `dirfd`.
+        // systemd's chase() walks a path one component at a time via
+        // statx(parent_dir_fd, name, AT_SYMLINK_NOFOLLOW|AT_EMPTY_PATH,
+        // STATX_TYPE); without this branch every such lookup resolved
+        // against the CWD instead and ENOENT'd (exec_setup_credentials'
+        // mount-ns child → journald 243/EXIT_CREDENTIALS).
+        const AT_FDCWD_I32: i32 = -100;
+        let effective = if raw.starts_with('/') || dirfd == AT_FDCWD_I32 || dirfd < 0 {
+            raw
+        } else {
+            match fd_path_of(current_task_id(), dirfd as u32) {
+                Some(dir) if dir.starts_with('/') => {
+                    alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
+                }
+                _ => raw,
+            }
+        };
         // resolve_cwd_path resolves against the cwd AND re-roots under
         // the task's chroot — applying apply_chroot again double-composes.
-        let path_owned = resolve_cwd_path(current_task_id(), &raw);
+        let path_owned = resolve_cwd_path(current_task_id(), &effective);
         // AT_SYMLINK_NOFOLLOW → describe the symlink itself (S_IFLNK),
         // not its target; otherwise follow like plain stat.
         let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
@@ -10579,6 +10731,25 @@ const CLONE_VM: u64 = 0x0000_0100;
 /// x86_64 `do_clone3`; other arches stub clone until the EL0 user-task pipeline.
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 const CLONE_VFORK: u64 = 0x0000_4000;
+/// `CLONE_PIDFD`: mint a pidfd on the child, installed in the PARENT's fd
+/// table (the child does not inherit it — Linux allocates it after
+/// `copy_files`), number written through `clone_args.pidfd`. glibc's
+/// `pidfd_spawn` — the ONLY executor-spawn path systemd 258 uses — sets it.
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+const CLONE_PIDFD: u64 = 0x0000_1000;
+/// `CLONE_CLEAR_SIGHAND` (clone3-only): the child starts with every signal
+/// disposition SIG_DFL instead of a copy of the parent's table. glibc's
+/// `posix_spawn`/`pidfd_spawn` passes it unconditionally (2.38+).
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+/// `CLONE_INTO_CGROUP` (clone3-only): `clone_args.cgroup` is an O_PATH
+/// directory fd on cgroupfs; the child starts life in that cgroup instead
+/// of inheriting the parent's. glibc `posix_spawn` with
+/// `POSIX_SPAWN_SETCGROUP` (systemd's per-service spawn) sets it.
+/// Consumed only under the `cgroup` feature (accepted-and-inherit otherwise).
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg_attr(not(feature = "cgroup"), allow(dead_code))]
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 #[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_FS: u64 = 0x0000_0200;
@@ -10792,10 +10963,15 @@ struct CloneArgs {
     stack: u64,
     stack_size: u64,
     tls: u64,
-    // The full struct grows; later fields (set_tid, set_tid_size,
-    // cgroup) are honoured-as-zero today. We only copy as many bytes
-    // as the user provided (the second arg to clone3 is the struct
-    // size), capped at our known prefix.
+    // Linux CLONE_ARGS_SIZE_VER1 (set_tid) + VER2 (cgroup) tail. We copy
+    // only as many bytes as the user provided (the second arg to clone3
+    // is the struct size), so a VER0 (64-byte) caller leaves these zero.
+    /// `set_tid` array pointer — accepted-and-ignored (checkpoint/restore).
+    set_tid: u64,
+    /// `set_tid` array length — accepted-and-ignored.
+    set_tid_size: u64,
+    /// CLONE_INTO_CGROUP target: an O_PATH dir fd on cgroupfs.
+    cgroup: u64,
 }
 
 #[cfg(feature = "linux-compat")]
@@ -10807,6 +10983,12 @@ fn sys_clone3(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let uargs = args.arg0;
     let size = args.arg1 as usize;
+    #[cfg(feature = "syscall-trace")]
+    narf_console::write_str(&alloc::format!(
+        "[CLONE3 uargs={:#x} size={}]\n",
+        uargs,
+        size
+    ));
     if uargs == 0 || size < 8 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -10832,6 +11014,15 @@ fn sys_clone3(ctx: &mut dyn TrapContext) {
     // only read it).
     // SAFETY: Valid memory or trusted environment
     let ca: CloneArgs = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const CloneArgs) };
+    #[cfg(feature = "syscall-trace")]
+    narf_console::write_str(&alloc::format!(
+        "[CLONE3 flags={:#x} pidfd_ptr={:#x} cgroup_fd={} stack={:#x}+{:#x}]\n",
+        ca.flags,
+        ca.pidfd,
+        ca.cgroup,
+        ca.stack,
+        ca.stack_size
+    ));
     do_clone3(ctx, ca);
 }
 
@@ -10872,6 +11063,9 @@ fn sys_clone(ctx: &mut dyn TrapContext) {
         child_tid: args.arg3,
         pidfd: 0,
         exit_signal: 0,
+        set_tid: 0,
+        set_tid_size: 0,
+        cgroup: 0,
     };
     do_clone3(ctx, ca);
 }
@@ -11011,6 +11205,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // the parent's RSP" — exactly what glibc's fork() passes
     // (`clone(SIGCHLD|CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID, stack=0)`).
     if share_vm && ca.stack == 0 {
+        #[cfg(feature = "syscall-trace")]
+        narf_console::write_str(&alloc::format!(
+            "[CLONE3_FAIL share_vm stack==0 flags={:#x}]\n",
+            flags
+        ));
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
@@ -11095,6 +11294,18 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         vfork_wait_register(child_visible_pid, parent_pid);
     }
 
+    // CLONE_PIDFD: mint the shared exit-state BEFORE the child is spawned.
+    // `pidfd::notify_exit` only flips entries that already exist in the
+    // table — under SMP (or an exec-then-crash child) the child can exit
+    // before this handler finishes, and a late mint would never observe
+    // that exit (POLLIN never fires; systemd would supervise a ghost).
+    // The fd itself is installed after the child's fd-table fork below.
+    let pidfd_state = if flags & CLONE_PIDFD != 0 && ca.pidfd != 0 {
+        Some(crate::pidfd::mint_for(child_visible_pid, true))
+    } else {
+        None
+    };
+
     let proc = crate::UserProcess {
         pid: crate::ProcessId(child_visible_pid),
         address_space: child_as.clone(),
@@ -11165,8 +11376,42 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         // A clone() that creates a new process (not a thread) joins
         // the parent's cgroup. Threads share the process's membership
         // and are never placed individually in the base feature.
+        //
+        // CLONE_INTO_CGROUP instead starts the child directly in the
+        // cgroup named by `clone_args.cgroup` — an O_PATH dir fd on
+        // cgroupfs (glibc pidfd_spawn with POSIX_SPAWN_SETCGROUP; how
+        // systemd 258 spawns every service executor). Resolve the fd to
+        // its recorded open path, strip everything up to the cgroupfs
+        // mount ("/sys/fs/cgroup", chroot-prefixed or not), and attach.
+        // On any resolution/veto failure fall back to parent inheritance
+        // rather than failing the clone — the spawn itself must succeed;
+        // systemd migrates stragglers via cgroup.procs anyway.
         #[cfg(feature = "cgroup")]
-        narf_filesystem::cgroupfs::fork_inherit(parent_pid, child_visible_pid);
+        {
+            let mut placed = false;
+            if flags & CLONE_INTO_CGROUP != 0 {
+                let full = crate::mqueue::fd_path(parent_pid, ca.cgroup as u32);
+                if let Some(full) = &full {
+                    const CG_MNT: &str = "/sys/fs/cgroup";
+                    if let Some(i) = full.find(CG_MNT) {
+                        let rel = &full[i + CG_MNT.len()..];
+                        placed = narf_filesystem::cgroupfs::attach_by_path(rel, child_visible_pid)
+                            .is_ok();
+                    }
+                }
+                #[cfg(feature = "syscall-trace")]
+                if !placed {
+                    narf_console::write_str(&alloc::format!(
+                        "[CLONE3 INTO_CGROUP unresolved fd={} path={:?}]\n",
+                        ca.cgroup,
+                        full
+                    ));
+                }
+            }
+            if !placed {
+                narf_filesystem::cgroupfs::fork_inherit(parent_pid, child_visible_pid);
+            }
+        }
         // cgroup-namespace inheritance, and CLONE_NEWCGROUP → the child
         // gets a fresh cgroup-ns rooted at its current cgroup.
         #[cfg(all(feature = "cgroup", feature = "container"))]
@@ -11187,6 +11432,32 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         crate::fd::share(parent_pid, child_tid.raw());
     } else {
         crate::fd::fork(parent_pid, child_tid.raw());
+    }
+
+    // CLONE_PIDFD: install the pidfd in the PARENT's table only, AFTER the
+    // child's fd-table fork above so the child doesn't inherit it (Linux
+    // allocates it after copy_files; pidfd_prepare mints it O_CLOEXEC).
+    // Write the fd number through *clone_args.pidfd — the parent's AS is
+    // still the active CR3 here (same shape as CLONE_PARENT_SETTID below).
+    if let Some(st) = pidfd_state {
+        let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
+            alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(st));
+        let newfd = fd::with_table(parent_pid, |t| {
+            t.open(crate::fd::FdEntry {
+                ops: file,
+                offset: 0,
+                flags: crate::fd::FD_CLOEXEC,
+                status_flags: 0,
+            })
+        });
+        if let Some(n) = newfd {
+            let fd_bytes = (n as i32).to_ne_bytes();
+            // SAFETY: `ca.pidfd` is the user out-pointer (non-zero, checked at
+            // mint time); copy_to_user range-validates and SMAP-brackets the
+            // 4-byte write through the parent's still-active address space.
+            // SAFETY: Valid memory or trusted environment
+            let _ = unsafe { copy_to_user(ca.pidfd, &fd_bytes) };
+        }
     }
 
     // A child (process or thread) inherits its parent's process group,
@@ -11272,7 +11543,14 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // before this, a pthread had an EMPTY handler table and any signal
     // sent to it took the default action and killed it). Everything
     // else deep-copies (fork semantics).
-    if share_sighand || share_thread {
+    if (flags & CLONE_CLEAR_SIGHAND) != 0 && !share_sighand && !share_thread {
+        // clone3 CLONE_CLEAR_SIGHAND: the child starts with every
+        // disposition SIG_DFL. Simply don't copy the parent's table —
+        // an absent SIGACTION_TABLE entry IS the all-default table
+        // (delivery falls back to default actions; sys_rt_sigaction
+        // lazily allocates on first write). glibc posix_spawn passes
+        // this on every spawn to close the handler-inheritance race.
+    } else if share_sighand || share_thread {
         sigaction_share(parent_pid, child_tid.raw());
     } else {
         sigaction_fork(parent_pid, child_tid.raw());
@@ -12531,6 +12809,7 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
     const P_ALL: u32 = 0;
     const P_PID: u32 = 1;
     const P_PGID: u32 = 2;
+    const P_PIDFD: u32 = 3;
     const WNOHANG: u32 = 1;
     // WNOWAIT: report a waitable child WITHOUT reaping it — the zombie
     // (and its /proc/<pid> entry) stays in place for a later real wait.
@@ -12546,6 +12825,33 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
         P_ALL => -1,
         P_PID => id,
         P_PGID => -1,
+        // P_PIDFD: `id` is a pidfd; wait on its target process. The error
+        // shape is LOAD-BEARING: glibc's `__clone_pidfd_supported()` probes
+        // `waitid(P_PIDFD, INT_MAX, NULL, WEXITED|WNOHANG)` and requires
+        // -EBADF from a P_PIDFD-aware kernel. Returning -EINVAL (the old
+        // unknown-idtype arm) made glibc cache "no pidfd support", so
+        // `pidfd_spawn` — systemd 258's ONLY service-executor spawn path —
+        // returned ENOSYS without ever issuing clone3: every unit failed
+        // with "Failed to spawn executor: Function not implemented".
+        // Linux ref: `kernel/exit.c::kernel_waitid` → `pidfd_get_pid`.
+        P_PIDFD => {
+            let target = if (0..=u32::MAX as i64).contains(&id) {
+                fd::with_table(current_task_id(), |t| {
+                    t.get(id as u32).and_then(|e| e.ops.pidfd_target_pid())
+                })
+                .flatten()
+            } else {
+                None
+            };
+            match target {
+                Some(p) => p as i64,
+                // Bad fd, or an fd that isn't a pidfd: EBADF (Linux).
+                None => {
+                    ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+                    return;
+                }
+            }
+        }
         _ => {
             ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
             return;
@@ -14672,6 +14978,17 @@ const PR_GET_CHILD_SUBREAPER: u64 = 37;
 // so the ambient set is POSIX surface state (like the uid/gid table):
 // tracked so a libc consumer round-trips, not consulted for enforcement.
 const PR_CAP_AMBIENT: u64 = 47;
+/// PR_CAPBSET_READ / PR_CAPBSET_DROP — capability bounding set probes.
+/// NARF doesn't model a bounding set (privilege = uid/gid), so READ
+/// reports every valid capability as present and DROP accepts-and-
+/// ignores. systemd's `capability_bounding_set_drop()` iterates all caps
+/// with these; a bare -1 made every service with CapabilityBoundingSet=
+/// exit 218/EXIT_CAPABILITIES.
+const PR_CAPBSET_READ: u64 = 23;
+const PR_CAPBSET_DROP: u64 = 24;
+/// PR_GET/SET_SECUREBITS — see `PrctlState::securebits`.
+const PR_SET_SECUREBITS: u64 = 28;
+const PR_GET_SECUREBITS: u64 = 27;
 const PR_CAP_AMBIENT_IS_SET: u64 = 1;
 const PR_CAP_AMBIENT_RAISE: u64 = 2;
 const PR_CAP_AMBIENT_LOWER: u64 = 3;
@@ -14695,6 +15012,13 @@ struct PrctlState {
     child_subreaper: bool,
     /// Ambient capability set as a bitmask (bit N ⇒ capability N raised).
     ambient_caps: u64,
+    /// PR_SET_SECUREBITS value. Stored-not-enforced (NARF's privilege
+    /// model is uid/gid only); PR_GET_SECUREBITS must round-trip it so
+    /// systemd's executor `if (prctl(PR_GET_SECUREBITS) != secure_bits)`
+    /// check sees the default 0 and skips the (privileged) SET — an
+    /// unimplemented GET returned -1, forcing a doomed SET on every
+    /// service start (exit 213/EXIT_SECUREBITS).
+    securebits: u64,
 }
 
 impl Default for PrctlState {
@@ -14706,6 +15030,7 @@ impl Default for PrctlState {
             pdeathsig: 0,
             child_subreaper: false,
             ambient_caps: 0, // empty ambient set at exec, per Linux
+            securebits: 0,   // SECBIT_* all clear, per Linux default
         }
     }
 }
@@ -14889,6 +15214,37 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
                     }
                 }
                 _ => ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)),
+            }
+        }
+        PR_CAPBSET_READ => {
+            if arg_a > CAP_LAST_CAP {
+                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            } else {
+                // Every valid cap is "in the bounding set" — NARF doesn't
+                // model one.
+                ctx.set_return(SyscallReturn::ok(1));
+            }
+        }
+        PR_CAPBSET_DROP => {
+            if arg_a > CAP_LAST_CAP {
+                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            } else {
+                // Accept-and-ignore: nothing to drop from.
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+        }
+        PR_GET_SECUREBITS => {
+            let s = read_prctl(task);
+            ctx.set_return(SyscallReturn::ok(s.securebits));
+        }
+        PR_SET_SECUREBITS => {
+            // Stored-not-enforced; Linux validates against known SECBIT
+            // bits (mask 0xFF covers SECBIT_* incl. the _LOCKED bits).
+            if arg_a & !0xFF != 0 {
+                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            } else {
+                modify_prctl(task, |s| s.securebits = arg_a);
+                ctx.set_return(SyscallReturn::ok(0));
             }
         }
         _ => ctx.set_return(fail),
@@ -20215,6 +20571,16 @@ pub fn set_proc_auxv_pairs(pid: u64, aux: &[(u64, u64)]) {
 /// and the directory listing agree.
 pub fn proc_fd_list(pid: u64) -> alloc::vec::Vec<u32> {
     crate::fd::open_fds(pid)
+}
+
+/// `Some(target_pid)` iff fd `n` of `pid` is a pidfd — backs the
+/// `Pid:`/`NSpid:` lines of `/proc/<pid>/fdinfo/<n>` (Linux
+/// `fs/pidfs.c::pidfd_show_fdinfo`). systemd 258's `pidfd_get_pid()`
+/// parses the `Pid:` line to resolve a `pidfd_spawn`-minted pidfd when
+/// pidfs/PIDFD_GET_INFO is unavailable; without it every service spawn
+/// fails ENOTTY.
+pub fn proc_fd_pidfd_pid(pid: u64, n: u32) -> Option<u64> {
+    crate::fd::with_table(pid, |t| t.get(n).and_then(|e| e.ops.pidfd_target_pid())).flatten()
 }
 
 pub fn fd_path_of(pid: u64, n: u32) -> Option<alloc::string::String> {
