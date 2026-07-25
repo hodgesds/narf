@@ -36,7 +36,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::fuse::*;
 use crate::{
     DirEntry, DirOps, FileLock, FileOps, FileType, FsError, FsFuture, FsInstance, FsIoctlReply,
-    FsStat, FsStatx, FsStatxTimestamp, Mode, Stat, POLL_IN, POLL_OUT,
+    FsMappingRange, FsStat, FsStatx, FsStatxTimestamp, Mode, Stat, POLL_IN, POLL_OUT,
 };
 
 /// A completed reply from the daemon: the `error` field of the
@@ -1354,6 +1354,87 @@ impl FileOps for FuseFile {
                 result: out.result,
                 output: data.to_vec(),
             })
+        })
+    }
+
+    fn bmap<'a>(&'a self, block: u64, block_size: u32) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            if block_size == 0 || !block_size.is_power_of_two() {
+                return Err(FsError::InvalidData);
+            }
+            let reply = self
+                .conn
+                .request(
+                    FuseOpcode::Bmap,
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseBmapIn {
+                        block,
+                        blocksize: block_size,
+                        padding: 0,
+                    }),
+                )
+                .await?;
+            let out: FuseBmapOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(out.block)
+        })
+    }
+
+    fn setup_mapping<'a>(
+        &'a self,
+        file_offset: u64,
+        len: u64,
+        flags: u64,
+        memory_offset: u64,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if len == 0
+                || file_offset % 4096 != 0
+                || len % 4096 != 0
+                || memory_offset % 4096 != 0
+                || flags == 0
+                || flags & !(FUSE_SETUPMAPPING_FLAG_READ | FUSE_SETUPMAPPING_FLAG_WRITE) != 0
+            {
+                return Err(FsError::InvalidData);
+            }
+            let fh = self.ensure_open().await?;
+            self.conn
+                .request(
+                    FuseOpcode::SetupMapping,
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseSetupMappingIn {
+                        fh,
+                        file_offset,
+                        len,
+                        flags,
+                        memory_offset,
+                    }),
+                )
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn remove_mappings<'a>(&'a self, ranges: &'a [FsMappingRange]) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if ranges.is_empty() || ranges.len() > FUSE_REMOVEMAPPING_MAX_ENTRY {
+                return Err(FsError::InvalidData);
+            }
+            let mut body = pod_as_bytes(&FuseRemoveMappingIn {
+                count: ranges.len() as u32,
+            });
+            for range in ranges {
+                if range.len == 0 || range.memory_offset % 4096 != 0 || range.len % 4096 != 0 {
+                    return Err(FsError::InvalidData);
+                }
+                body.extend_from_slice(&pod_as_bytes(&FuseRemoveMappingOne {
+                    memory_offset: range.memory_offset,
+                    len: range.len,
+                }));
+            }
+            self.conn
+                .request(FuseOpcode::RemoveMapping, self.attr.nodeid, body)
+                .await
+                .map(|_| ())
         })
     }
 

@@ -2789,6 +2789,14 @@ fn smoke_fs_fuse_struct_sizes() -> TestResult {
     {
         return TestResult::Fail("FUSE 7.45 wire layouts drifted");
     }
+    if size_of::<FuseBmapIn>() != 16
+        || size_of::<FuseBmapOut>() != 8
+        || size_of::<FuseSetupMappingIn>() != 40
+        || size_of::<FuseRemoveMappingIn>() != 4
+        || size_of::<FuseRemoveMappingOne>() != 16
+    {
+        return TestResult::Fail("FUSE mapping wire layouts drifted");
+    }
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_struct_sizes);
@@ -3310,6 +3318,39 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
                 Some(fuse_reply(unique, -22, &[]))
             }
         }
+        37 => {
+            let input: FuseBmapIn = pod_from_bytes(body)?;
+            Some(fuse_reply(
+                unique,
+                0,
+                &pod_as_bytes(&FuseBmapOut {
+                    block: input.block + 100,
+                }),
+            ))
+        }
+        48 => {
+            let input: FuseSetupMappingIn = pod_from_bytes(body)?;
+            if input.fh == 0x44
+                && input.file_offset == 0
+                && input.len == 4096
+                && input.flags == FUSE_SETUPMAPPING_FLAG_READ
+                && input.memory_offset == 8192
+            {
+                Some(fuse_reply(unique, 0, &[]))
+            } else {
+                Some(fuse_reply(unique, -22, &[]))
+            }
+        }
+        49 => {
+            let input: FuseRemoveMappingIn = pod_from_bytes(body)?;
+            let range: FuseRemoveMappingOne =
+                pod_from_bytes(body.get(core::mem::size_of::<FuseRemoveMappingIn>()..)?)?;
+            if input.count == 1 && range.memory_offset == 8192 && range.len == 4096 {
+                Some(fuse_reply(unique, 0, &[]))
+            } else {
+                Some(fuse_reply(unique, -22, &[]))
+            }
+        }
         40 => Some(fuse_reply(
             unique,
             0,
@@ -3792,6 +3833,18 @@ fn smoke_fs_fuse_mutations() -> TestResult {
                 .await
                 .map(|stat| (stat.mask, stat.ino, stat.btime.seconds))
                 != Ok((0x0fff, 4, 123))
+            || file.bmap(7, 4096).await != Ok(107)
+            || file
+                .setup_mapping(0, 4096, crate::fuse::FUSE_SETUPMAPPING_FLAG_READ, 8192)
+                .await
+                .is_err()
+            || file
+                .remove_mappings(&[crate::FsMappingRange {
+                    memory_offset: 8192,
+                    len: 4096,
+                }])
+                .await
+                .is_err()
         {
             OUTCOME.store(4, Ordering::Relaxed);
             return;

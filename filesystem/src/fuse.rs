@@ -53,6 +53,7 @@ pub enum FuseOpcode {
     Access = 34,
     Create = 35,
     Interrupt = 36,
+    Bmap = 37,
     Destroy = 38,
     Ioctl = 39,
     Poll = 40,
@@ -63,6 +64,8 @@ pub enum FuseOpcode {
     Rename2 = 45,
     Lseek = 46,
     CopyFileRange = 47,
+    SetupMapping = 48,
+    RemoveMapping = 49,
     Syncfs = 50,
     Tmpfile = 51,
     Statx = 52,
@@ -578,6 +581,47 @@ pub struct FuseSyncfsIn {
 pub struct FuseInterruptIn {
     pub unique: u64,
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseBmapIn {
+    pub block: u64,
+    pub blocksize: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseBmapOut {
+    pub block: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseSetupMappingIn {
+    pub fh: u64,
+    pub file_offset: u64,
+    pub len: u64,
+    pub flags: u64,
+    pub memory_offset: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseRemoveMappingIn {
+    pub count: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseRemoveMappingOne {
+    pub memory_offset: u64,
+    pub len: u64,
+}
+
+pub const FUSE_SETUPMAPPING_FLAG_WRITE: u64 = 1;
+pub const FUSE_SETUPMAPPING_FLAG_READ: u64 = 2;
+pub const FUSE_REMOVEMAPPING_MAX_ENTRY: usize = 4096 / 16;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]

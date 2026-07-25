@@ -262,6 +262,11 @@ reply shape.
 `FileOps::statx_async` preserves the daemon's `FUSE_STATX` mask, birth
 time, attributes, ownership, device numbers, and nanosecond timestamps;
 malformed timestamps are rejected.
+`FileOps::bmap` forwards logical-block translation through `FUSE_BMAP`.
+`setup_mapping` and `remove_mappings` implement virtiofs DAX window
+management through `FUSE_SETUPMAPPING` and batched `FUSE_REMOVEMAPPING`;
+requests must be 4 KiB aligned, use only READ/WRITE flags, and respect
+Linux's one-page removal-entry limit.
 FUSE writes are split into requests no larger than the negotiated
 `max_write`; each request advances the file offset, an oversized daemon
 reply is rejected as invalid data, and a short reply ends the write with

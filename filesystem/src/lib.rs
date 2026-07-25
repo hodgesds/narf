@@ -237,6 +237,12 @@ pub struct FileLock {
     pub pid: u32,
 }
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsMappingRange {
+    pub memory_offset: u64,
+    pub len: u64,
+}
+
 /// A file's ownership triplet for a POSIX access check.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FileOwner {
@@ -561,6 +567,24 @@ pub trait FileOps: Send + Sync {
         _len: u64,
         _flags: u64,
     ) -> FsFuture<'a, u64> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn bmap<'a>(&'a self, _block: u64, _block_size: u32) -> FsFuture<'a, u64> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn setup_mapping<'a>(
+        &'a self,
+        _file_offset: u64,
+        _len: u64,
+        _flags: u64,
+        _memory_offset: u64,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn remove_mappings<'a>(&'a self, _ranges: &'a [FsMappingRange]) -> FsFuture<'a, ()> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
 
