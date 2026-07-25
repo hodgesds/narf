@@ -362,6 +362,14 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
         0
     );
     assert_eq!(crate::iface::lookup(name).unwrap().mtu, 9000);
+    let notifications = successful_mutation_notifications(&request, &allowed);
+    assert_eq!(notifications.len(), 1);
+    assert_eq!(notifications[0].0, 1);
+    let event = parse_hdr(&notifications[0].1).unwrap();
+    assert_eq!(event.msg_type, RTM_NEWLINK);
+    assert_eq!(event.flags, 0);
+    assert_eq!(event.seq, 0);
+    assert_eq!(event.pid, 0);
 }
 
 #[test]

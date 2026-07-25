@@ -130,6 +130,11 @@ interface-bound `AdminHandle`; undelegated or cross-interface writes return
 typed operations in §3.3. `RTM_NEWNEIGH`/`RTM_DELNEIGH` update IPv4 ARP or
 IPv6 NDP state through the same interface-bound authority.
 
+Successful mutations emit kernel-originated sequence-zero notifications to
+the Linux rtnetlink multicast group for the changed object (link, neighbor,
+IPv4 address, or IPv4 route). Only sockets subscribed through `nl_groups` or
+`NETLINK_ADD_MEMBERSHIP` receive them.
+
 Link dumps include Linux operational-state, carrier, qdisc, queue-length,
 broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero
 until a driver publishes them through the central interface registry.

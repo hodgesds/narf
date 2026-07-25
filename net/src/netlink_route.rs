@@ -941,6 +941,65 @@ pub fn build_replies_authorized(
     Ok(replies)
 }
 
+/// Build kernel-originated multicast notifications for mutations that
+/// succeeded in `build_replies_authorized`. The group mask uses the legacy
+/// sockaddr_nl bit numbering consumed by `NETLINK_ADD_MEMBERSHIP`.
+pub fn successful_mutation_notifications(
+    datagram: &[u8],
+    replies: &[Vec<u8>],
+) -> Vec<(u32, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset + NLMSG_HDRLEN <= datagram.len() {
+        let Some(hdr) = parse_hdr(&datagram[offset..]) else {
+            break;
+        };
+        let len = hdr.len as usize;
+        if len < NLMSG_HDRLEN || offset + len > datagram.len() {
+            break;
+        }
+        if !is_mutation(hdr.msg_type) {
+            offset += nlmsg_align(len);
+            continue;
+        }
+        let failed = replies.iter().any(|reply| {
+            let Some(reply_hdr) = parse_hdr(reply) else {
+                return false;
+            };
+            reply_hdr.msg_type == NLMSG_ERROR
+                && reply_hdr.seq == hdr.seq
+                && reply.len() >= NLMSG_HDRLEN + 4
+                && i32::from_ne_bytes(
+                    reply[NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                        .try_into()
+                        .unwrap_or([0; 4]),
+                ) < 0
+        });
+        if !failed {
+            let (msg_type, group) = match hdr.msg_type {
+                RTM_NEWLINK | RTM_SETLINK => (RTM_NEWLINK, 1),
+                RTM_DELLINK => (RTM_DELLINK, 1),
+                RTM_NEWNEIGH | RTM_DELNEIGH => (hdr.msg_type, 1u32 << (3 - 1)),
+                RTM_NEWADDR | RTM_DELADDR => (hdr.msg_type, 1u32 << (5 - 1)),
+                RTM_NEWROUTE | RTM_DELROUTE => (hdr.msg_type, 1u32 << (7 - 1)),
+                _ => {
+                    offset += nlmsg_align(len);
+                    continue;
+                }
+            };
+            let mut message = datagram[offset..offset + len].to_vec();
+            message[4..6].copy_from_slice(&msg_type.to_ne_bytes());
+            message[6..8].copy_from_slice(&0u16.to_ne_bytes());
+            message[8..12].copy_from_slice(&0u32.to_ne_bytes());
+            message[12..16].copy_from_slice(&0u32.to_ne_bytes());
+            message.resize(nlmsg_align(len), 0);
+            out.push((group, message));
+        }
+        offset += nlmsg_align(len);
+    }
+    out
+}
+
 #[cfg(test)]
 #[path = "netlink_route/tests.rs"]
 mod tests;

@@ -24,7 +24,7 @@
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -403,6 +403,7 @@ pub struct SocketFile {
 }
 
 static NEXT_NETLINK_PORTID: AtomicU32 = AtomicU32::new(1);
+static NETLINK_SOCKETS: IrqSafeSpinLock<Vec<Weak<SocketFile>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Faithful per-socket storage for set/getsockopt values. Defaults
 /// match Linux's documented defaults. Fields that affect packet
@@ -677,7 +678,7 @@ impl SocketFile {
         } else {
             SocketState::Fresh
         };
-        Arc::new(Self {
+        let socket = Arc::new(Self {
             domain,
             kind,
             protocol,
@@ -701,7 +702,11 @@ impl SocketFile {
             netlink_ext_ack: AtomicBool::new(false),
             netlink_strict_check: AtomicBool::new(false),
             netlink_admin: IrqSafeSpinLock::new(None),
-        })
+        });
+        if domain == AF_NETLINK {
+            NETLINK_SOCKETS.lock().push(Arc::downgrade(&socket));
+        }
+        socket
     }
 
     pub fn delegate_netlink_admin(&self, admin: narf_net::AdminHandle) -> Result<(), SockError> {
@@ -711,6 +716,26 @@ impl SocketFile {
         admin.check_live().map_err(|_| SockError::InvalidArg)?;
         *self.netlink_admin.lock() = Some(admin);
         Ok(())
+    }
+
+    fn broadcast_netlink_route(group: u32, message: &[u8]) {
+        let mut sockets = NETLINK_SOCKETS.lock();
+        sockets.retain(|weak| {
+            let Some(socket) = weak.upgrade() else {
+                return false;
+            };
+            if socket.protocol != NETLINK_ROUTE
+                || socket.netlink_groups.load(Ordering::Acquire) & group == 0
+            {
+                return true;
+            }
+            if let SocketState::NetlinkRoute { replies } = &mut *socket.state.lock() {
+                replies.push_back(message.to_vec());
+            }
+            true
+        });
+        drop(sockets);
+        narf_net::readiness::notify(0);
     }
 
     fn netlink_addr(addr: &SockAddr) -> Option<(u32, u32)> {
@@ -1461,16 +1486,19 @@ impl SocketFile {
                         Ok(msgs) => msgs,
                         Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                     };
+                let notifications =
+                    narf_net::netlink_route::successful_mutation_notifications(buf, &msgs);
                 {
                     let mut g = self.state.lock();
                     match &mut *g {
                         SocketState::NetlinkRoute { replies } => {
-                            for m in msgs {
-                                replies.push_back(m);
-                            }
+                            replies.extend(msgs);
                         }
                         _ => return SocketOpResult::Err(SockError::InvalidArg),
                     }
+                }
+                for (group, message) in notifications {
+                    Self::broadcast_netlink_route(group, &message);
                 }
                 // Wake a reader parked in poll/epoll on the reply queue.
                 narf_net::readiness::notify(0);
