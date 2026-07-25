@@ -24,6 +24,9 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 - `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot.
 - `cargo xtask test --arch=aarch64` — boot + run kernel tests.
 - `cargo xtask image --arch=x86_64 --bootloader=limine` — produce bootable ISO.
+- `packaging/build-release.sh --version X.Y.Z` — wrap the canonical
+  Multiboot2 kernel ELF in native distribution packages and emit a
+  checksummed release manifest.
 - Workspace: single Cargo workspace so Global LTO spans everything.
 
 ## 4. Invariants & safety properties
