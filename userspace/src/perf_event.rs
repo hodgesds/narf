@@ -10,11 +10,12 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_linux_perf_uapi::{
     PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_COMM, PERF_ATTR_FLAG_COMM_EXEC,
     PERF_ATTR_FLAG_DISABLED, PERF_ATTR_FLAG_ENABLE_ON_EXEC, PERF_ATTR_FLAG_EXCLUDE_GUEST,
-    PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT, PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP,
-    PERF_ATTR_FLAG_MMAP2, PERF_ATTR_FLAG_MMAP_DATA, PERF_ATTR_FLAG_SAMPLE_ID_ALL,
-    PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK, PERF_ATTR_SIZE_VER0,
-    PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_MISSES,
-    PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_DUMMY, PERF_FORMAT_GROUP,
+    PERF_ATTR_FLAG_EXCLUDE_KERNEL, PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT,
+    PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP, PERF_ATTR_FLAG_MMAP2, PERF_ATTR_FLAG_MMAP_DATA,
+    PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK,
+    PERF_ATTR_SIZE_VER0, PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES,
+    PERF_COUNT_HW_CACHE_MISSES, PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS,
+    PERF_COUNT_SW_CPU_CLOCK, PERF_COUNT_SW_DUMMY, PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP,
     PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
     PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK,
     PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP,
@@ -42,6 +43,11 @@ static PENDING_SAMPLES: [PendingSample; SAMPLE_CPU_SLOTS] =
 static PENDING_SAMPLE_LOST: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAMPLE_IDS: [[AtomicU64; 8]; SAMPLE_CPU_SLOTS] =
     [const { [const { AtomicU64::new(0) }; 8] }; SAMPLE_CPU_SLOTS];
+static CPU_USER_NS: [AtomicU64; SAMPLE_CPU_SLOTS] = [const { AtomicU64::new(0) }; SAMPLE_CPU_SLOTS];
+static CPU_USER_SLICE_START_NS: [AtomicU64; SAMPLE_CPU_SLOTS] =
+    [const { AtomicU64::new(0) }; SAMPLE_CPU_SLOTS];
+static CPU_USER_DEPTH: [AtomicU32; SAMPLE_CPU_SLOTS] =
+    [const { AtomicU32::new(0) }; SAMPLE_CPU_SLOTS];
 
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
@@ -191,6 +197,7 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
     | PERF_ATTR_FLAG_MMAP2
     | PERF_ATTR_FLAG_FREQ
     | PERF_ATTR_FLAG_INHERIT
+    | PERF_ATTR_FLAG_EXCLUDE_KERNEL
     // NARF does not execute nested guests and currently has no BPF VM or
     // runtime kernel-symbol loader. These selectors therefore describe empty
     // event domains, rather than requests whose records are being suppressed.
@@ -411,6 +418,27 @@ impl PerfEventFile {
     }
 
     fn raw_count(&self) -> u64 {
+        if self.attr.type_ == PERF_TYPE_SOFTWARE {
+            return match self.attr.config {
+                PERF_COUNT_SW_CPU_CLOCK => {
+                    let cpu = if self.target_cpu >= 0 {
+                        self.target_cpu as usize
+                    } else {
+                        narf_lib::percpu::current_cpu()
+                    };
+                    cpu_user_time_ns(cpu)
+                }
+                PERF_COUNT_SW_TASK_CLOCK => {
+                    let user = crate::handlers::cpu_time_ns_of(self.target_task);
+                    if self.attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0 {
+                        user
+                    } else {
+                        user.saturating_add(crate::handlers::kern_time_ns_of(self.target_task))
+                    }
+                }
+                _ => 0,
+            };
+        }
         #[cfg(target_arch = "x86_64")]
         if let Some(counter) = self.pmu_counter {
             // SAFETY: the counter belongs to this open file and remains allocated
@@ -1494,6 +1522,7 @@ pub(crate) fn event_tracks_task_for_test(fd_num: u32, task: u64) -> bool {
 /// Scheduler PMU context hook. Runs outside scheduler queue locks and brackets
 /// the matching task continuation on the current logical CPU.
 pub(crate) fn on_task_switch(task: u64, running: bool) {
+    account_cpu_user_switch(running);
     if !narf_lib::perf::enabled() {
         return;
     }
@@ -1508,6 +1537,51 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
         }
         true
     });
+}
+
+fn account_cpu_user_switch(running: bool) {
+    let cpu = narf_lib::percpu::current_cpu();
+    let Some(depth) = CPU_USER_DEPTH.get(cpu) else {
+        return;
+    };
+    if running {
+        if depth.fetch_add(1, Ordering::AcqRel) == 0 {
+            CPU_USER_SLICE_START_NS[cpu].store(narf_time::monotonic_ns(), Ordering::Release);
+        }
+        return;
+    }
+    let mut current = depth.load(Ordering::Acquire);
+    while current != 0 {
+        match depth.compare_exchange_weak(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) if current == 1 => {
+                let start = CPU_USER_SLICE_START_NS[cpu].swap(0, Ordering::AcqRel);
+                if start != 0 {
+                    CPU_USER_NS[cpu].fetch_add(
+                        narf_time::monotonic_ns().saturating_sub(start),
+                        Ordering::AcqRel,
+                    );
+                }
+                return;
+            }
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn cpu_user_time_ns(cpu: usize) -> u64 {
+    let Some(total) = CPU_USER_NS.get(cpu) else {
+        return 0;
+    };
+    let mut value = total.load(Ordering::Acquire);
+    if CPU_USER_DEPTH[cpu].load(Ordering::Acquire) != 0 {
+        let start = CPU_USER_SLICE_START_NS[cpu].load(Ordering::Acquire);
+        if start != 0 {
+            value = value.saturating_add(narf_time::monotonic_ns().saturating_sub(start));
+        }
+    }
+    value
 }
 
 impl Drop for PerfEventFile {
@@ -2302,34 +2376,45 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
     match attr.type_ {
         // PERF_TYPE_HARDWARE
         #[cfg(target_arch = "x86_64")]
-        PERF_TYPE_HARDWARE => matches!(
-            attr.config,
-            PERF_COUNT_HW_CPU_CYCLES
-                | PERF_COUNT_HW_INSTRUCTIONS
-                | PERF_COUNT_HW_CACHE_MISSES
-                | PERF_COUNT_HW_BRANCH_INSTRUCTIONS
-                | PERF_COUNT_HW_BRANCH_MISSES
-        ),
+        PERF_TYPE_HARDWARE => {
+            attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0
+                && matches!(
+                    attr.config,
+                    PERF_COUNT_HW_CPU_CYCLES
+                        | PERF_COUNT_HW_INSTRUCTIONS
+                        | PERF_COUNT_HW_CACHE_MISSES
+                        | PERF_COUNT_HW_BRANCH_INSTRUCTIONS
+                        | PERF_COUNT_HW_BRANCH_MISSES
+                )
+        }
         #[cfg(target_arch = "aarch64")]
-        PERF_TYPE_HARDWARE | PERF_TYPE_RAW => aarch_pmu_event(attr).is_some(),
+        PERF_TYPE_HARDWARE | PERF_TYPE_RAW => {
+            attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0 && aarch_pmu_event(attr).is_some()
+        }
         // PERF_TYPE_SOFTWARE
-        PERF_TYPE_SOFTWARE => attr.config == PERF_COUNT_SW_DUMMY,
+        PERF_TYPE_SOFTWARE => match attr.config {
+            PERF_COUNT_SW_DUMMY => attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0,
+            PERF_COUNT_SW_CPU_CLOCK => attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0,
+            PERF_COUNT_SW_TASK_CLOCK => true,
+            _ => false,
+        },
         // PERF_TYPE_HW_CACHE (3)
         #[cfg(target_arch = "x86_64")]
         PERF_TYPE_HW_CACHE => {
             let cache_id = attr.config & 0xFF;
             let op_id = (attr.config >> 8) & 0xFF;
             let result_id = (attr.config >> 16) & 0xFF;
-            (cache_id, op_id, result_id)
-                == (
-                    PERF_COUNT_HW_CACHE_LL,
-                    PERF_COUNT_HW_CACHE_OP_READ,
-                    PERF_COUNT_HW_CACHE_RESULT_MISS,
-                )
+            attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0
+                && (cache_id, op_id, result_id)
+                    == (
+                        PERF_COUNT_HW_CACHE_LL,
+                        PERF_COUNT_HW_CACHE_OP_READ,
+                        PERF_COUNT_HW_CACHE_RESULT_MISS,
+                    )
         }
         // PERF_TYPE_RAW (4)
         #[cfg(target_arch = "x86_64")]
-        PERF_TYPE_RAW => true,
+        PERF_TYPE_RAW => attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0,
         _ => false,
     }
 }

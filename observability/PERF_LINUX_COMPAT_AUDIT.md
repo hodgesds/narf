@@ -52,6 +52,8 @@ Implemented:
   and `E2BIG` for a non-zero unknown tail.
 - Hardware, software, hardware-cache, and raw event parsing on x86_64;
   PMCEID-gated hardware and architectural raw-event parsing on aarch64.
+- Exact scheduler-accounted task clocks and per-CPU user clocks selected with
+  `exclude_kernel`; all-context per-CPU software clocks remain unsupported.
 - PID, CPU, group-fd existence, open flags, CLOEXEC, and reserved-field
   validation.
 - Stable fd lifetime and PMU counter release.
@@ -61,11 +63,8 @@ Implemented:
 
 Gaps:
 
-- `pid == -1`/per-CPU and PID-target semantics are validated but not
-  scheduler-attributed.
-- Pinned/exclusive events, inheritance, output redirection, refresh,
-  period changes, filters, SIGTRAP delivery, and namespace/cgroup modes are
-  absent.
+- Pinned/exclusive events, refresh, filters, SIGTRAP delivery, and
+  namespace/cgroup modes are absent.
 - No security policy equivalent to Linux
   `perf_event_paranoid`/`CAP_PERFMON` has been projected into the Linux ABI.
   The final adapter must derive authorization from NARF PMU capabilities.

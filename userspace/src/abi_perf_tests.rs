@@ -156,8 +156,42 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             _ => return Err("perf_event_open admitted an approximate software event"),
         }
 
+        let exact_cpu_clock_attr = PerfEventAttr {
+            type_: 1,
+            config: 0,     // PERF_COUNT_SW_CPU_CLOCK
+            flags: 1 << 5, // exclude_kernel
+            ..attr
+        };
+        let cpu_clock_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &exact_cpu_clock_attr as *const _ as u64,
+                -1i32 as u64,
+                narf_lib::percpu::current_cpu() as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("exact per-CPU user clock was not admitted"),
+        };
+        crate::perf_event::on_task_switch(0xfeed, true);
+        for _ in 0..10_000 {
+            core::hint::black_box(());
+        }
+        crate::perf_event::on_task_switch(0xfeed, false);
+        let mut cpu_clock_count = [0u8; 8];
+        if call(
+            Syscall::Read.raw(),
+            a2(cpu_clock_fd as u64, cpu_clock_count.as_mut_ptr() as u64, 8),
+        ) != Some(8)
+            || u64::from_ne_bytes(cpu_clock_count) == 0
+        {
+            return Err("per-CPU user clock did not report scheduler execution");
+        }
+        let _ = call(Syscall::Close.raw(), a0(cpu_clock_fd as u64));
+
         let ignored_attr_flag = PerfEventAttr {
-            flags: 1 << 5, // exclude_user
+            flags: 1 << 5, // exclude_kernel is not implemented for hardware PMU events
             ..attr
         };
         match call(
