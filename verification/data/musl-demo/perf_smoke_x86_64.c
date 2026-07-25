@@ -2,10 +2,18 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
 #include <string.h>
 
 #define PERF_TYPE_HARDWARE 0
 #define PERF_COUNT_HW_CPU_CYCLES 0
+#define PERF_FORMAT_TOTAL_TIME_ENABLED (1ULL << 0)
+#define PERF_FORMAT_TOTAL_TIME_RUNNING (1ULL << 1)
+#define PERF_FORMAT_ID (1ULL << 2)
+#define PERF_EVENT_IOC_ENABLE _IO('$', 0)
+#define PERF_EVENT_IOC_DISABLE _IO('$', 1)
+#define PERF_EVENT_IOC_RESET _IO('$', 3)
+#define PERF_EVENT_IOC_ID _IOR('$', 7, uint64_t *)
 
 struct perf_event_attr {
     uint32_t type;
@@ -45,6 +53,10 @@ int main() {
     attr.type = PERF_TYPE_HARDWARE;
     attr.size = sizeof(attr);
     attr.config = PERF_COUNT_HW_CPU_CYCLES;
+    attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED |
+                       PERF_FORMAT_TOTAL_TIME_RUNNING |
+                       PERF_FORMAT_ID;
+    attr.flags = 1; // disabled
 
     long fd = perf_event_open(&attr, 0, -1, -1, 0);
     if (fd < 0) {
@@ -52,9 +64,11 @@ int main() {
         return 1;
     }
 
-    uint64_t val1;
-    if (read(fd, &val1, sizeof(val1)) < 8) {
-        printf("perf_smoke: ERROR - read failed\n");
+    uint64_t id = 0;
+    if (ioctl(fd, PERF_EVENT_IOC_ID, &id) != 0 || id == 0 ||
+        ioctl(fd, PERF_EVENT_IOC_RESET, 0) != 0 ||
+        ioctl(fd, PERF_EVENT_IOC_ENABLE, 0) != 0) {
+        printf("perf_smoke: ERROR - control ioctl failed\n");
         close(fd);
         return 1;
     }
@@ -65,20 +79,27 @@ int main() {
         dummy += i;
     }
 
-    uint64_t val2;
-    if (read(fd, &val2, sizeof(val2)) < 8) {
-        printf("perf_smoke: ERROR - read failed\n");
+    if (ioctl(fd, PERF_EVENT_IOC_DISABLE, 0) != 0) {
+        printf("perf_smoke: ERROR - disable ioctl failed\n");
         close(fd);
         return 1;
     }
 
-    if (val2 < val1) {
-        printf("perf_smoke: ERROR - cycle counter went backwards: %llu -> %llu\n",
-               (unsigned long long)val1, (unsigned long long)val2);
+    uint64_t stat[4] = {0};
+    if (read(fd, stat, sizeof(stat)) != sizeof(stat)) {
+        printf("perf_smoke: ERROR - stat-format read failed\n");
         close(fd);
         return 1;
     }
-    printf("perf_smoke: cycles delta %llu\n", (unsigned long long)(val2 - val1));
+    if (stat[0] == 0 || stat[1] == 0 || stat[2] == 0 ||
+        stat[1] != stat[2] || stat[3] != id) {
+        printf("perf_smoke: ERROR - invalid stat record %llu/%llu/%llu/%llu\n",
+               (unsigned long long)stat[0], (unsigned long long)stat[1],
+               (unsigned long long)stat[2], (unsigned long long)stat[3]);
+        close(fd);
+        return 1;
+    }
+    printf("perf_smoke: cycles delta %llu\n", (unsigned long long)stat[0]);
     close(fd);
 
     // Test custom software syscall counter

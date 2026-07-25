@@ -8,8 +8,27 @@
 use crate::abi_test_support::*;
 use crate::perf_event::perf_event_attr;
 
+const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
+const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
+const PERF_FORMAT_ID: u64 = 1 << 2;
+const PERF_FORMAT_GROUP: u64 = 1 << 3;
+
+const PERF_EVENT_IOC_ENABLE: u64 = 0x2400;
+const PERF_EVENT_IOC_DISABLE: u64 = 0x2401;
+const PERF_EVENT_IOC_RESET: u64 = 0x2403;
+const PERF_EVENT_IOC_ID: u64 = 0x8008_2407;
+const EOPNOTSUPP: i64 = -95;
+
 fn smoke_abi_perf_event_open_validation() -> TestResult {
     with_setup(|| {
+        if core::mem::size_of::<perf_event_attr>() != 128
+            || core::mem::offset_of!(perf_event_attr, config) != 8
+            || core::mem::offset_of!(perf_event_attr, flags) != 40
+            || core::mem::offset_of!(perf_event_attr, sig_data) != 120
+        {
+            return Err("perf_event_attr does not match Linux PERF_ATTR_SIZE_VER7 layout");
+        }
+
         // Test 1: attr_ptr == 0 -> expect EFAULT (-14)
         match call(
             Syscall::PerfEventOpen.raw(),
@@ -82,6 +101,41 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         ) {
             Some(EINVAL) => {}
             _ => return Err("perf_event_open(unknown flags) did not return EINVAL"),
+        }
+
+        // Sampling requires the mmap ring, which is deliberately outside the
+        // counting-only compatibility slice.
+        let sampling_attr = perf_event_attr {
+            sample_period_or_freq: 1000,
+            ..attr
+        };
+        match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &sampling_attr as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(EOPNOTSUPP) => {}
+            _ => return Err("perf_event_open(sampling) did not return EOPNOTSUPP"),
+        }
+
+        // PERF_FLAG_PID_CGROUP cannot be approximated as a normal pid event.
+        match call(
+            Syscall::PerfEventOpen.raw(),
+            SyscallArgs {
+                arg0: &attr as *const _ as u64,
+                arg1: 0,
+                arg2: -1i32 as u64,
+                arg3: -1i32 as u64,
+                arg4: 4,
+                ..SyscallArgs::default()
+            },
+        ) {
+            Some(EOPNOTSUPP) => {}
+            _ => return Err("perf_event_open(PID_CGROUP) did not return EOPNOTSUPP"),
         }
 
         // Test 7: Size less than PERF_ATTR_SIZE_VER0 -> expect E2BIG (-7)
@@ -199,6 +253,142 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
 
         let _ = call(Syscall::Close.raw(), a0(fd_cloexec as u64));
+
+        // Test 13: perf-stat read format and the counting-control ioctls.
+        let stat_attr = perf_event_attr {
+            type_: 1,
+            size: core::mem::size_of::<perf_event_attr>() as u32,
+            config: 0, // PERF_COUNT_SW_CPU_CLOCK
+            read_format: PERF_FORMAT_TOTAL_TIME_ENABLED
+                | PERF_FORMAT_TOTAL_TIME_RUNNING
+                | PERF_FORMAT_ID,
+            flags: 1, // disabled
+            ..perf_event_attr::default()
+        };
+        let stat_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(&stat_attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+        ) {
+            Some(f) if f >= 0 => f as u32,
+            _ => return Err("perf_event_open(stat-format event) failed"),
+        };
+
+        let mut id = 0u64;
+        match call(
+            Syscall::Ioctl.raw(),
+            a2(stat_fd as u64, PERF_EVENT_IOC_ID, &mut id as *mut _ as u64),
+        ) {
+            Some(0) if id != 0 => {}
+            _ => return Err("PERF_EVENT_IOC_ID did not return a stable non-zero id"),
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(stat_fd as u64, PERF_EVENT_IOC_RESET, 0),
+        ) != Some(0)
+            || call(
+                Syscall::Ioctl.raw(),
+                a2(stat_fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+            ) != Some(0)
+        {
+            return Err("perf reset/enable ioctl failed");
+        }
+
+        let mut stat_read = [0u64; 4];
+        match call(
+            Syscall::Read.raw(),
+            a2(
+                stat_fd as u64,
+                stat_read.as_mut_ptr() as u64,
+                core::mem::size_of_val(&stat_read) as u64,
+            ),
+        ) {
+            Some(32) => {}
+            _ => return Err("perf stat-format read did not return four u64 words"),
+        }
+        if stat_read[2] == 0 || stat_read[3] != id {
+            return Err("perf stat-format time/id fields are invalid");
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(stat_fd as u64, PERF_EVENT_IOC_DISABLE, 0),
+        ) != Some(0)
+        {
+            return Err("PERF_EVENT_IOC_DISABLE failed");
+        }
+        let mut stopped_a = [0u64; 4];
+        let mut stopped_b = [0u64; 4];
+        let _ = call(
+            Syscall::Read.raw(),
+            a2(
+                stat_fd as u64,
+                stopped_a.as_mut_ptr() as u64,
+                core::mem::size_of_val(&stopped_a) as u64,
+            ),
+        );
+        let _ = call(
+            Syscall::Read.raw(),
+            a2(
+                stat_fd as u64,
+                stopped_b.as_mut_ptr() as u64,
+                core::mem::size_of_val(&stopped_b) as u64,
+            ),
+        );
+        if stopped_a != stopped_b {
+            return Err("disabled perf event continued accumulating");
+        }
+        let _ = call(Syscall::Close.raw(), a0(stat_fd as u64));
+
+        // Test 14: group-format wire shape (nr, times, value, id).
+        let group_attr = perf_event_attr {
+            read_format: PERF_FORMAT_GROUP
+                | PERF_FORMAT_TOTAL_TIME_ENABLED
+                | PERF_FORMAT_TOTAL_TIME_RUNNING
+                | PERF_FORMAT_ID,
+            ..stat_attr
+        };
+        let group_read_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &group_attr as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(f) if f >= 0 => f as u32,
+            _ => return Err("perf_event_open(group-format event) failed"),
+        };
+        let mut group_read = [0u64; 5];
+        match call(
+            Syscall::Read.raw(),
+            a2(
+                group_read_fd as u64,
+                group_read.as_mut_ptr() as u64,
+                core::mem::size_of_val(&group_read) as u64,
+            ),
+        ) {
+            Some(40) if group_read[0] == 1 && group_read[4] != 0 => {}
+            _ => return Err("PERF_FORMAT_GROUP read layout is invalid"),
+        }
+        let _ = call(Syscall::Close.raw(), a0(group_read_fd as u64));
+
+        // Test 15: unknown read-format bits are rejected at open.
+        let bad_format_attr = perf_event_attr {
+            read_format: 1 << 63,
+            ..sw_attr
+        };
+        match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &bad_format_attr as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("perf_event_open accepted unknown read_format bits"),
+        }
 
         Ok(())
     })

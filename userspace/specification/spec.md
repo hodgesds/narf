@@ -148,6 +148,19 @@ The fd is resolved through that task's table and the typed `SocketFile`; no raw
 A public native cap-bearing operation remains unavailable until submissions
 are validated against a real per-task capability table.
 
+### 3.1 Linux perf-event compatibility
+
+With `linux-compat`, the slow syscall table exposes Linux
+`perf_event_open(2)`. The returned fd implements the counting subset of the
+Linux perf-event ABI: `read(2)` according to `attr.read_format` and
+`PERF_EVENT_IOC_{ENABLE,DISABLE,RESET,ID}`. This is a compatibility adapter
+over `observability/` PMU authority, not an independent counter subsystem.
+
+Unsupported sampling, scheduler-attribution, cgroup, filter, probe, and BPF
+features fail explicitly. The adapter must not synthesize plausible values
+for an unavailable hardware event. The audited command matrix and remaining
+gaps live in `observability/PERF_LINUX_COMPAT_AUDIT.md`.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.
