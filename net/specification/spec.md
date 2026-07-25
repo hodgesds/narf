@@ -204,7 +204,8 @@ snapshots that back `/proc/net/tcp` and `/proc/net/udp`, followed by
 `NETLINK_NETFILTER` accepts IPv4 conntrack `IPCTNL_MSG_CT_GET` dumps and
 emits Linux nfnetlink `IPCTNL_MSG_CT_NEW` records with original/reply tuples,
 status, timeout, and flow ID from the canonical conntrack table. Dumps end
-with `NLMSG_DONE`. Mutations and unsupported nfnetlink subsystems return
+with `NLMSG_DONE`; aligned requests may be batched and `NLM_F_ACK` produces a
+zero-error acknowledgement after a successful dump. Mutations and unsupported nfnetlink subsystems return
 `EOPNOTSUPP`; Linux netlink does not grant ambient filter/NAT authority.
 
 `NETLINK_AUDIT` reports a disabled zeroed `audit_status` for `AUDIT_GET` and

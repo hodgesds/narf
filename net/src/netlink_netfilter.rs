@@ -12,6 +12,8 @@ const NLMSG_HDRLEN: usize = 16;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLM_F_MULTI: u16 = 2;
+const NLM_F_REQUEST: u16 = 1;
+const NLM_F_ACK: u16 = 4;
 const NLM_F_DUMP: u16 = 0x300;
 const NLA_F_NESTED: u16 = 1 << 15;
 const NFNL_SUBSYS_CTNETLINK: u16 = 1;
@@ -118,8 +120,7 @@ fn encode_entry(entry: &crate::netfilter::conntrack::ConntrackSnapshot, seq: u32
     )
 }
 
-/// Build replies for one nfnetlink conntrack request.
-pub fn build_replies(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
     if request.len() < NLMSG_HDRLEN {
         return Err(());
     }
@@ -131,6 +132,9 @@ pub fn build_replies(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
     let flags = u16::from_ne_bytes(request[6..8].try_into().map_err(|_| ())?);
     let seq = u32::from_ne_bytes(request[8..12].try_into().map_err(|_| ())?);
     let request = &request[..declared];
+    if flags & NLM_F_REQUEST == 0 {
+        return Ok(alloc::vec![error(EINVAL, seq, request)]);
+    }
     if kind >> 8 != NFNL_SUBSYS_CTNETLINK || kind & 0xff != IPCTNL_MSG_CT_GET {
         return Ok(alloc::vec![error(EOPNOTSUPP, seq, request)]);
     }
@@ -145,7 +149,36 @@ pub fn build_replies(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
         .map(|entry| encode_entry(entry, seq))
         .collect::<Vec<_>>();
     out.push(frame(NLMSG_DONE, NLM_F_MULTI, seq, &0i32.to_ne_bytes()));
+    if flags & NLM_F_ACK != 0 {
+        out.push(error(0, seq, request));
+    }
     Ok(out)
+}
+
+/// Build replies for every aligned nfnetlink request in one datagram.
+pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+    let mut offset = 0usize;
+    let mut replies = Vec::new();
+    while offset < datagram.len() {
+        let remaining = &datagram[offset..];
+        if remaining.len() < NLMSG_HDRLEN {
+            return Err(());
+        }
+        let len = u32::from_ne_bytes(remaining[0..4].try_into().map_err(|_| ())?) as usize;
+        if len < NLMSG_HDRLEN || len > remaining.len() {
+            return Err(());
+        }
+        replies.extend(build_one(&remaining[..len])?);
+        let step = align(len);
+        if step > remaining.len() {
+            if len == remaining.len() {
+                break;
+            }
+            return Err(());
+        }
+        offset += step;
+    }
+    Ok(replies)
 }
 
 #[cfg(test)]
@@ -184,6 +217,39 @@ mod tests {
                     .unwrap()
             ),
             -EOPNOTSUPP
+        );
+    }
+
+    #[test]
+    fn batched_requests_preserve_sequences_and_ack() {
+        crate::netfilter::conntrack::__reset_for_test();
+        let first = request();
+        let mut second = request();
+        second[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP | NLM_F_ACK).to_ne_bytes());
+        second[8..12].copy_from_slice(&56u32.to_ne_bytes());
+        let mut batch = first;
+        batch.extend_from_slice(&second);
+        let replies = build_replies(&batch).unwrap();
+        assert_eq!(replies.len(), 3);
+        assert_eq!(
+            u32::from_ne_bytes(replies[0][8..12].try_into().unwrap()),
+            55
+        );
+        assert_eq!(
+            u32::from_ne_bytes(replies[1][8..12].try_into().unwrap()),
+            56
+        );
+        assert_eq!(
+            u16::from_ne_bytes(replies[2][4..6].try_into().unwrap()),
+            NLMSG_ERROR
+        );
+        assert_eq!(
+            i32::from_ne_bytes(
+                replies[2][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0
         );
     }
 }
