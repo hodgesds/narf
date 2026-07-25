@@ -948,9 +948,10 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             Ok(())
         }
         RTM_NEWADDR | RTM_DELADDR => {
-            if request.len() < NLMSG_HDRLEN + 8 || request[NLMSG_HDRLEN] != AF_INET {
+            if request.len() < NLMSG_HDRLEN + 8 {
                 return Err(EINVAL);
             }
+            let family = request[NLMSG_HDRLEN];
             let prefix_len = request[NLMSG_HDRLEN + 1];
             let ifindex = u32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
             let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
@@ -960,28 +961,48 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             let addr = find_attr(request, 8, IFA_LOCAL)
                 .or_else(|| find_attr(request, 8, IFA_ADDRESS))
                 .ok_or(EINVAL)?;
-            if addr.len() != 4 {
-                return Err(EINVAL);
-            }
-            let addr: [u8; 4] = addr.try_into().map_err(|_| EINVAL)?;
-            let exists = crate::iface::get_addrs(admin.iface_name())
-                .iter()
-                .any(|(existing, prefix)| existing.0 == addr && *prefix == prefix_len);
-            if hdr.msg_type == RTM_NEWADDR {
-                validate_new_flags(exists, hdr.flags)?;
-                admin.add_ipv4(addr, prefix_len).map_err(admin_errno)
-            } else if !exists {
-                Err(ENOENT)
-            } else {
-                admin.del_ipv4(addr, prefix_len).map_err(admin_errno)
+            match family {
+                AF_INET if addr.len() == 4 => {
+                    let addr: [u8; 4] = addr.try_into().map_err(|_| EINVAL)?;
+                    let exists = crate::iface::get_addrs(admin.iface_name())
+                        .iter()
+                        .any(|(existing, prefix)| existing.0 == addr && *prefix == prefix_len);
+                    if hdr.msg_type == RTM_NEWADDR {
+                        validate_new_flags(exists, hdr.flags)?;
+                        admin.add_ipv4(addr, prefix_len).map_err(admin_errno)
+                    } else if !exists {
+                        Err(ENOENT)
+                    } else {
+                        admin.del_ipv4(addr, prefix_len).map_err(admin_errno)
+                    }
+                }
+                AF_INET6 if addr.len() == 16 => {
+                    let addr: [u8; 16] = addr.try_into().map_err(|_| EINVAL)?;
+                    let exists = crate::ipv6::addrs::list_iface(admin.iface_name())
+                        .iter()
+                        .any(|existing| existing.addr == addr && existing.prefix_len == prefix_len);
+                    if hdr.msg_type == RTM_NEWADDR {
+                        validate_new_flags(exists, hdr.flags)?;
+                        admin.add_ipv6(addr, prefix_len).map_err(admin_errno)
+                    } else if !exists {
+                        Err(ENOENT)
+                    } else {
+                        admin.del_ipv6(addr, prefix_len).map_err(admin_errno)
+                    }
+                }
+                _ => Err(EINVAL),
             }
         }
         RTM_NEWROUTE | RTM_DELROUTE => {
-            if request.len() < NLMSG_HDRLEN + 12 || request[NLMSG_HDRLEN] != AF_INET {
+            if request.len() < NLMSG_HDRLEN + 12 {
                 return Err(EINVAL);
             }
+            let family = request[NLMSG_HDRLEN];
             let prefix_len = request[NLMSG_HDRLEN + 1];
-            if prefix_len > 32 {
+            if (family == AF_INET && prefix_len > 32)
+                || (family == AF_INET6 && prefix_len > 128)
+                || !matches!(family, AF_INET | AF_INET6)
+            {
                 return Err(EINVAL);
             }
             let scope = match request[NLMSG_HDRLEN + 6] {
@@ -1008,6 +1029,49 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
             if iface_name != admin.iface_name() {
                 return Err(EPERM);
+            }
+            if family == AF_INET6 {
+                if table != crate::route::TABLE_MAIN {
+                    return Err(EOPNOTSUPP);
+                }
+                let dst = match find_attr(request, 12, RTA_DST) {
+                    Some(raw) if raw.len() == 16 => raw.try_into().map_err(|_| EINVAL)?,
+                    Some(_) => return Err(EINVAL),
+                    None if prefix_len == 0 => [0; 16],
+                    None => return Err(EINVAL),
+                };
+                let exists = crate::ipv6::route::list_all().iter().any(|route| {
+                    route.iface == admin.iface_name()
+                        && route.prefix == dst
+                        && route.prefix_len == prefix_len
+                });
+                if hdr.msg_type == RTM_DELROUTE {
+                    if !exists {
+                        return Err(ENOENT);
+                    }
+                    return admin.del_ipv6_route(dst, prefix_len).map_err(admin_errno);
+                }
+                validate_new_flags(exists, hdr.flags)?;
+                let gateway = match find_attr(request, 12, RTA_GATEWAY) {
+                    Some(raw) if raw.len() == 16 => Some(raw.try_into().map_err(|_| EINVAL)?),
+                    Some(_) => return Err(EINVAL),
+                    None => None,
+                };
+                let metric = match find_attr(request, 12, RTA_PRIORITY) {
+                    Some(raw) if raw.len() == 4 => {
+                        u32::from_ne_bytes(raw.try_into().map_err(|_| EINVAL)?)
+                    }
+                    Some(_) => return Err(EINVAL),
+                    None => 0,
+                };
+                return admin
+                    .add_ipv6_route(crate::AdminIpv6Route {
+                        dst,
+                        prefix_len,
+                        gateway,
+                        metric,
+                    })
+                    .map_err(admin_errno);
             }
             let dst = match find_attr(request, 12, RTA_DST) {
                 Some(raw) if raw.len() == 4 => raw.try_into().map_err(|_| EINVAL)?,
@@ -1360,12 +1424,19 @@ pub fn successful_mutation_notifications(
                 ) < 0
         });
         if !failed {
+            let family = datagram.get(offset + NLMSG_HDRLEN).copied().unwrap_or(0);
             let (msg_type, group) = match hdr.msg_type {
                 RTM_NEWLINK | RTM_SETLINK => (RTM_NEWLINK, 1),
                 RTM_DELLINK => (RTM_DELLINK, 1),
                 RTM_NEWNEIGH | RTM_DELNEIGH => (hdr.msg_type, 1u32 << (3 - 1)),
-                RTM_NEWADDR | RTM_DELADDR => (hdr.msg_type, 1u32 << (5 - 1)),
-                RTM_NEWROUTE | RTM_DELROUTE => (hdr.msg_type, 1u32 << (7 - 1)),
+                RTM_NEWADDR | RTM_DELADDR => {
+                    let group = if family == AF_INET6 { 9 } else { 5 };
+                    (hdr.msg_type, 1u32 << (group - 1))
+                }
+                RTM_NEWROUTE | RTM_DELROUTE => {
+                    let group = if family == AF_INET6 { 11 } else { 7 };
+                    (hdr.msg_type, 1u32 << (group - 1))
+                }
                 _ => {
                     offset += nlmsg_align(len);
                     continue;

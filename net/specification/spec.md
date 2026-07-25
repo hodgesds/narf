@@ -87,8 +87,12 @@ pub fn set_mtu (admin: &AdminHandle, mtu: u32) -> Result<(), AdminError>;
 pub fn set_mac (admin: &AdminHandle, mac: [u8; 6]) -> Result<(), AdminError>;
 pub fn add_ipv4(admin: &AdminHandle, addr: [u8; 4], prefix: u8) -> Result<(), AdminError>;
 pub fn del_ipv4(admin: &AdminHandle, addr: [u8; 4], prefix: u8) -> Result<(), AdminError>;
+pub fn add_ipv6(admin: &AdminHandle, addr: [u8; 16], prefix: u8) -> Result<(), AdminError>;
+pub fn del_ipv6(admin: &AdminHandle, addr: [u8; 16], prefix: u8) -> Result<(), AdminError>;
 pub fn add_ipv4_route(admin: &AdminHandle, route: Ipv4Route) -> Result<(), AdminError>;
 pub fn del_ipv4_route(admin: &AdminHandle, route: Ipv4RouteKey) -> Result<(), AdminError>;
+pub fn add_ipv6_route(admin: &AdminHandle, route: Ipv6Route) -> Result<(), AdminError>;
+pub fn del_ipv6_route(admin: &AdminHandle, route: Ipv6RouteKey) -> Result<(), AdminError>;
 pub fn set_neighbor(admin: &AdminHandle, neighbor: Neighbor) -> Result<(), AdminError>;
 pub fn del_neighbor(admin: &AdminHandle, key: NeighborKey) -> Result<(), AdminError>;
 pub fn stats   (iface: &Cap<NetIface, Read>) -> IfaceStats;
@@ -133,7 +137,7 @@ echo the request sequence, identify the kernel sender with port ID zero, carry
 `NLMSG_ERROR(-EOPNOTSUPP)`. Rtnetlink mutation requests are not an ambient
 administration path. A route socket must first be explicitly delegated an
 interface-bound `AdminHandle`; undelegated or cross-interface writes return
-`NLMSG_ERROR(-EPERM)`. `RTM_NEWLINK`/`RTM_SETLINK` and IPv4
+`NLMSG_ERROR(-EPERM)`. `RTM_NEWLINK`/`RTM_SETLINK` and IPv4 or IPv6
 `RTM_NEWADDR`/`RTM_DELADDR` plus `RTM_NEWROUTE`/`RTM_DELROUTE` invoke the
 typed operations in §3.3. `RTM_NEWNEIGH`/`RTM_DELNEIGH` update IPv4 ARP or
 IPv6 NDP state through the same interface-bound authority.
@@ -143,8 +147,9 @@ table. The Linux syscall surface never accepts raw admin-handle bytes.
 
 Successful mutations emit kernel-originated sequence-zero notifications to
 the Linux rtnetlink multicast group for the changed object (link, neighbor,
-IPv4 address, or IPv4 route). Only sockets subscribed through `nl_groups` or
-`NETLINK_ADD_MEMBERSHIP` receive them.
+IPv4/IPv6 address, or IPv4/IPv6 route). Address and route notifications use
+the family-specific IPv4 or IPv6 group. Only sockets subscribed through
+`nl_groups` or `NETLINK_ADD_MEMBERSHIP` receive them.
 
 Creation and replacement honor Linux `NLM_F_CREATE`, `NLM_F_EXCL`, and
 `NLM_F_REPLACE` semantics. Duplicate exclusive creates return `EEXIST`;

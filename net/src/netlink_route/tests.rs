@@ -733,6 +733,111 @@ fn delegated_admin_can_add_and_delete_ipv4_route() {
 }
 
 #[test]
+fn delegated_admin_can_add_and_delete_ipv6_address_and_route() {
+    fn discard(_: &[u8]) -> Result<(), ()> {
+        Ok(())
+    }
+
+    let name = "rtnl-v6-admin0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 6, 1], discard);
+    let ifindex = crate::iface::snapshot_all()
+        .iter()
+        .position(|iface| iface.name == name)
+        .unwrap() as u32
+        + 2;
+    let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
+    let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
+    let addr = [0x20, 1, 0x0d, 0xb8, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let prefix = [0x20, 1, 0x0d, 0xb8, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    let addr_request = |kind| {
+        let mut body = vec![AF_INET6, 64, 0, 0];
+        body.extend_from_slice(&ifindex.to_ne_bytes());
+        push_rtattr(&mut body, IFA_ADDRESS, &addr);
+        let flags = NLM_F_REQUEST
+            | NLM_F_ACK
+            | if kind == RTM_NEWADDR {
+                NLM_F_CREATE | NLM_F_EXCL
+            } else {
+                0
+            };
+        frame_message(kind, flags, 205, 1, &body)
+    };
+    let add_addr = build_replies_authorized(&addr_request(RTM_NEWADDR), Some(&admin)).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(
+            add_addr[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap()
+        ),
+        0
+    );
+    assert!(crate::ipv6::addrs::is_local_on(name, &addr));
+    let addr_events = successful_mutation_notifications(&addr_request(RTM_NEWADDR), &add_addr);
+    assert_eq!(addr_events.len(), 1);
+    assert_eq!(addr_events[0].0, 1u32 << (9 - 1));
+
+    let route_request = |kind| {
+        let mut body = vec![
+            AF_INET6,
+            64,
+            0,
+            0,
+            crate::route::TABLE_MAIN,
+            RTPROT_KERNEL,
+            0,
+            RTN_UNICAST,
+        ];
+        body.extend_from_slice(&0u32.to_ne_bytes());
+        push_rtattr(&mut body, RTA_DST, &prefix);
+        push_rtattr(&mut body, RTA_OIF, &ifindex.to_ne_bytes());
+        let flags = NLM_F_REQUEST
+            | NLM_F_ACK
+            | if kind == RTM_NEWROUTE {
+                NLM_F_CREATE | NLM_F_EXCL
+            } else {
+                0
+            };
+        frame_message(kind, flags, 206, 1, &body)
+    };
+    let add_route = build_replies_authorized(&route_request(RTM_NEWROUTE), Some(&admin)).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(
+            add_route[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap()
+        ),
+        0
+    );
+    assert!(crate::ipv6::route::list_all()
+        .iter()
+        .any(|route| { route.iface == name && route.prefix == prefix && route.prefix_len == 64 }));
+    let route_events = successful_mutation_notifications(&route_request(RTM_NEWROUTE), &add_route);
+    assert_eq!(route_events.len(), 1);
+    assert_eq!(route_events[0].0, 1u32 << (11 - 1));
+
+    let del_route = build_replies_authorized(&route_request(RTM_DELROUTE), Some(&admin)).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(
+            del_route[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap()
+        ),
+        0
+    );
+    let del_addr = build_replies_authorized(&addr_request(RTM_DELADDR), Some(&admin)).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(
+            del_addr[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap()
+        ),
+        0
+    );
+    assert!(!crate::ipv6::addrs::is_local_on(name, &addr));
+}
+
+#[test]
 fn delegated_admin_can_add_and_delete_ipv4_neighbor() {
     fn discard(_: &[u8]) -> Result<(), ()> {
         Ok(())

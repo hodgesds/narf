@@ -89,6 +89,14 @@ pub struct AdminIpv4Route {
     pub table: u8,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AdminIpv6Route {
+    pub dst: [u8; 16],
+    pub prefix_len: u8,
+    pub gateway: Option<[u8; 16]>,
+    pub metric: u32,
+}
+
 impl AdminHandle {
     pub(crate) fn new(cap: Cap<AdminCap, Invoke>, iface_name: String) -> Self {
         Self { cap, iface_name }
@@ -153,6 +161,36 @@ impl AdminHandle {
         Ok(())
     }
 
+    pub fn add_ipv6(&self, addr: [u8; 16], prefix_len: u8) -> Result<(), AdminError> {
+        self.check_live()?;
+        if prefix_len > 128 {
+            return Err(AdminError::InvalidPrefix);
+        }
+        if crate::iface::lookup(&self.iface_name).is_none() {
+            return Err(AdminError::NoIface);
+        }
+        crate::ipv6::addrs::add(crate::ipv6::addrs::Ipv6IfAddr {
+            iface: self.iface_name.clone(),
+            addr,
+            prefix_len,
+            state: crate::ipv6::addrs::AddrState::Preferred,
+            scope: crate::ipv6::addrs::scope_of(&addr),
+            preferred_deadline_ns: u64::MAX,
+            valid_deadline_ns: u64::MAX,
+            temporary: false,
+        });
+        Ok(())
+    }
+
+    pub fn del_ipv6(&self, addr: [u8; 16], prefix_len: u8) -> Result<(), AdminError> {
+        self.check_live()?;
+        if prefix_len > 128 {
+            return Err(AdminError::InvalidPrefix);
+        }
+        crate::ipv6::addrs::remove(&self.iface_name, &addr);
+        Ok(())
+    }
+
     pub fn add_ipv4_route(&self, route: AdminIpv4Route) -> Result<(), AdminError> {
         self.check_live()?;
         if route.prefix_len > 32 {
@@ -194,6 +232,34 @@ impl AdminHandle {
             &self.iface_name,
             table,
         );
+        Ok(())
+    }
+
+    pub fn add_ipv6_route(&self, route: AdminIpv6Route) -> Result<(), AdminError> {
+        self.check_live()?;
+        if route.prefix_len > 128 {
+            return Err(AdminError::InvalidPrefix);
+        }
+        if crate::iface::lookup(&self.iface_name).is_none() {
+            return Err(AdminError::NoIface);
+        }
+        crate::ipv6::route::add(crate::ipv6::route::Route {
+            prefix: route.dst,
+            prefix_len: route.prefix_len,
+            gateway: route.gateway,
+            iface: self.iface_name.clone(),
+            metric: route.metric,
+            valid_deadline_ns: 0,
+        });
+        Ok(())
+    }
+
+    pub fn del_ipv6_route(&self, dst: [u8; 16], prefix_len: u8) -> Result<(), AdminError> {
+        self.check_live()?;
+        if prefix_len > 128 {
+            return Err(AdminError::InvalidPrefix);
+        }
+        crate::ipv6::route::remove(&dst, prefix_len, &self.iface_name);
         Ok(())
     }
 
