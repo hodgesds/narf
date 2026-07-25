@@ -185,6 +185,31 @@ fn getneigh_dump_terminates() {
 }
 
 #[test]
+fn getrule_dump_has_linux_default_ipv4_rules() {
+    let msgs = build_dump(&req(RTM_GETRULE, 52, 9));
+    assert_eq!(msgs.len(), 4);
+    let expected = [
+        (crate::route::TABLE_LOCAL, 0u32),
+        (crate::route::TABLE_MAIN, 32_766u32),
+        (crate::route::TABLE_DEFAULT, 32_767u32),
+    ];
+    for (msg, (table, priority)) in msgs.iter().zip(expected) {
+        assert_eq!(hdr_of(msg).1, RTM_NEWRULE);
+        assert_eq!(msg[NLMSG_HDRLEN], AF_INET);
+        assert_eq!(msg[NLMSG_HDRLEN + 4], table);
+        assert_eq!(
+            find_rtattr(msg, 12, FRA_PRIORITY).as_deref(),
+            Some(&priority.to_ne_bytes()[..])
+        );
+        assert_eq!(
+            find_rtattr(msg, 12, FRA_TABLE).as_deref(),
+            Some(&(table as u32).to_ne_bytes()[..])
+        );
+    }
+    assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
+}
+
+#[test]
 fn unsupported_request_yields_eopnotsupp_error() {
     // RTM_GETLINK is 18; use a bogus type the responder doesn't handle.
     let bogus: u16 = 999;

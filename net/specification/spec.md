@@ -107,9 +107,10 @@ RX. Used by `verification/` to test the contract without hardware.
 ### 3.6 Linux rtnetlink compatibility
 
 `NETLINK_ROUTE` provides read-only Linux wire-compatible dumps for
-`RTM_GETLINK`, `RTM_GETADDR`, `RTM_GETROUTE`, and `RTM_GETNEIGH`. Replies
-expose the interface registry, configured IPv4 addresses, IPv4 FIB, and
-live IPv4 ARP plus IPv6 NDP neighbor caches respectively,
+`RTM_GETLINK`, `RTM_GETADDR`, `RTM_GETROUTE`, `RTM_GETNEIGH`, and
+`RTM_GETRULE`. Replies expose the interface registry, configured IPv4
+addresses, IPv4 FIB, live IPv4 ARP plus IPv6 NDP neighbor caches, and the
+canonical local/main/default IPv4 policy rules respectively,
 echo the request sequence, identify the kernel sender with port ID zero, carry
 `NLM_F_MULTI`, and terminate with `NLMSG_DONE`. Unsupported request types return
 `NLMSG_ERROR(-EOPNOTSUPP)`. Rtnetlink mutation requests are not an ambient

@@ -58,6 +58,8 @@ pub const RTM_NEWROUTE: u16 = 24;
 pub const RTM_GETROUTE: u16 = 26;
 pub const RTM_NEWNEIGH: u16 = 28;
 pub const RTM_GETNEIGH: u16 = 30;
+pub const RTM_NEWRULE: u16 = 32;
+pub const RTM_GETRULE: u16 = 34;
 
 // ── netlink flags (nlmsg_flags) ─────────────────────────────────────────
 
@@ -92,6 +94,9 @@ pub const RTA_TABLE: u16 = 15;
 pub const NDA_DST: u16 = 1;
 pub const NDA_LLADDR: u16 = 2;
 
+pub const FRA_PRIORITY: u16 = 6;
+pub const FRA_TABLE: u16 = 15;
+
 // ── interface flags (net_device_flags, if.h) ────────────────────────────
 
 pub const IFF_UP: u32 = 0x1;
@@ -119,6 +124,7 @@ pub const NUD_STALE: u16 = 0x04;
 pub const NUD_DELAY: u16 = 0x08;
 pub const NUD_PROBE: u16 = 0x10;
 pub const NTF_ROUTER: u8 = 0x80;
+pub const FR_ACT_TO_TBL: u8 = 1;
 
 /// `-EOPNOTSUPP` — the errno an unsupported dump request answers with,
 /// carried in the `NLMSG_ERROR` payload (negated, per netlink convention).
@@ -316,6 +322,21 @@ fn build_newneigh(neigh: &NeighInfo<'_>, seq: u32, pid: u32) -> Vec<u8> {
     frame_message(RTM_NEWNEIGH, NLM_F_MULTI, seq, pid, &body)
 }
 
+fn build_newrule(family: u8, table: u8, priority: u32, seq: u32, pid: u32) -> Vec<u8> {
+    // struct fib_rule_hdr: family, dst_len, src_len, tos, table,
+    // res1, res2, action, flags.
+    let mut body = Vec::new();
+    body.push(family);
+    body.extend_from_slice(&[0, 0, 0]);
+    body.push(table);
+    body.extend_from_slice(&[0, 0]);
+    body.push(FR_ACT_TO_TBL);
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    push_rtattr(&mut body, FRA_PRIORITY, &priority.to_ne_bytes());
+    push_rtattr(&mut body, FRA_TABLE, &(table as u32).to_ne_bytes());
+    frame_message(RTM_NEWRULE, NLM_F_MULTI, seq, pid, &body)
+}
+
 /// Build an `NLMSG_DONE` message (payload is a single i32 = 0). Terminates
 /// every dump so the caller stops reading.
 fn build_done(seq: u32, pid: u32) -> Vec<u8> {
@@ -500,6 +521,35 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
             }
             out.push(build_done(seq, pid));
         }
+        RTM_GETRULE => {
+            let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
+            if requested_family == 0 || requested_family == AF_INET {
+                // Linux installs these policy-routing rules by default:
+                // priority 0 → local, 32766 → main, 32767 → default.
+                out.push(build_newrule(
+                    AF_INET,
+                    crate::route::TABLE_LOCAL,
+                    0,
+                    seq,
+                    pid,
+                ));
+                out.push(build_newrule(
+                    AF_INET,
+                    crate::route::TABLE_MAIN,
+                    32_766,
+                    seq,
+                    pid,
+                ));
+                out.push(build_newrule(
+                    AF_INET,
+                    crate::route::TABLE_DEFAULT,
+                    32_767,
+                    seq,
+                    pid,
+                ));
+            }
+            out.push(build_done(seq, pid));
+        }
         _ => {
             out.push(build_error(EOPNOTSUPP, seq, pid, req));
         }
@@ -526,7 +576,7 @@ pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
         let request = &remaining[..msg_len];
         let supported = matches!(
             hdr.msg_type,
-            RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE | RTM_GETNEIGH
+            RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE | RTM_GETNEIGH | RTM_GETRULE
         );
         if supported && hdr.flags & NLM_F_ACK != 0 {
             replies.push(build_ack(hdr.seq, request));

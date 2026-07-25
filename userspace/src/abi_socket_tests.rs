@@ -1496,6 +1496,8 @@ const RTM_GETADDR: u16 = 22;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_GETROUTE: u16 = 26;
 const RTM_GETNEIGH: u16 = 30;
+const RTM_NEWRULE: u16 = 32;
+const RTM_GETRULE: u16 = 34;
 /// netlink control message types (netlink.h).
 const NLMSG_DONE: u16 = 3;
 const NLMSG_HDRLEN: usize = 16;
@@ -1837,6 +1839,34 @@ fn smoke_abi_netlink_route_getneigh_dump() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getneigh_dump);
+
+fn smoke_abi_netlink_route_getrule_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETRULE, 11);
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send(RTM_GETRULE) did not echo the request length");
+        }
+        for expected_priority in [0u32, 32_766, 32_767] {
+            let mut buf = [0u8; 512];
+            let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+            if n < (NLMSG_HDRLEN + 12) as i64 || nlmsg_type_of(&buf) != RTM_NEWRULE {
+                return Err("RTM_GETRULE did not return three RTM_NEWRULE entries");
+            }
+            if !window_contains(&buf[..n as usize], &expected_priority.to_ne_bytes()) {
+                return Err("RTM_NEWRULE priority was missing");
+            }
+        }
+        let mut done = [0u8; 64];
+        let n = netlink_recv(fd, &mut done).ok_or("done recv")?;
+        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&done) != NLMSG_DONE {
+            return Err("RTM_GETRULE did not terminate with NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getrule_dump);
 
 fn smoke_abi_netlink_uevent_recv() -> TestResult {
     with_setup(|| {
