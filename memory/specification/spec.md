@@ -106,6 +106,17 @@ pub fn online_node_mask() -> u64;
 pub fn online_node_count() -> usize;
 pub fn hotplug_node_for_phys(addr: PhysAddr) -> Option<usize>;
 
+/// Publish local HMAT coordinates and derive Linux-style memory tiers.
+pub fn set_node_performance(
+    node: usize,
+    bandwidth: u64,
+    latency: u64,
+) -> Result<(), ()>;
+pub fn node_tier(node: usize) -> Option<u8>;
+pub fn tier_nodes(tier: u8) -> u64;
+/// Closest allowed node in the nearest strictly slower tier.
+pub fn demotion_target(source: usize, allowed: u64) -> Option<usize>;
+
 /// Temporarily remove an eligible private resident leaf for NUMA sampling.
 pub unsafe fn protect_numa_hint_page(vaddr: VirtAddr) -> Result<bool, AddressSpaceError>;
 /// Consume the recorded hint before restoring or migrating its backing.
@@ -166,6 +177,14 @@ impl AddressSpace {
         &self,
         old_nodes: u64,
         new_nodes: u64,
+    ) -> Result<usize, AddressSpaceError>;
+
+    /// Migrate one private base page or complete huge leaf to the nearest
+    /// strictly slower memory tier within the caller's allowed-node mask.
+    pub unsafe fn demote_page(
+        &self,
+        va: VirtAddr,
+        allowed_nodes: u64,
     ) -> Result<usize, AddressSpaceError>;
 
     /// Audit or migrate resident pages in a virtual range to a node mask.

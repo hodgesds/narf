@@ -1467,6 +1467,20 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                             bandwidth,
                                         );
                                     }
+                                    let latency = narf_acpi::hmat_value(
+                                        narf_acpi::HmatLatBwKind::AccessLatency,
+                                        0,
+                                        node,
+                                        node,
+                                    )
+                                    .unwrap_or(0);
+                                    if bandwidth != 0 || latency != 0 {
+                                        let _ = narf_memory::set_node_performance(
+                                            node as usize,
+                                            bandwidth,
+                                            latency,
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => {

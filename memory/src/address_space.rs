@@ -179,6 +179,8 @@ pub enum AddressSpaceError {
     InvalidNode,
     /// The mapping borrows externally-owned backing and cannot be migrated.
     SharedMapping,
+    /// No online, allowed node exists in a strictly slower memory tier.
+    NoDemotionTarget,
 }
 
 /// Per-process address space. Stage-4 body: holds the region table +
@@ -2981,6 +2983,65 @@ impl AddressSpace {
         self.flush_region_broadcast(page_va, 1);
         crate::frame::free_frame(crate::frame::PhysFrame::new(old_phys));
         Ok(old_node)
+    }
+
+    /// Move one resident private page to the closest node in the next slower
+    /// memory tier.
+    ///
+    /// `allowed_nodes` is the caller's cpuset/mempolicy boundary. The source
+    /// node is resolved from the authoritative backing list, then
+    /// [`crate::numa_tier::demotion_target`] selects only a strictly lower
+    /// tier. The actual ownership transfer, copy, PTE replacement, rollback,
+    /// and TLB invalidation are delegated to [`Self::migrate_page_to_node`].
+    ///
+    /// # Safety
+    /// Same address-space root and mapping-lifetime requirements as
+    /// [`Self::migrate_page_to_node`].
+    pub unsafe fn demote_page(
+        &self,
+        vaddr: VirtAddr,
+        allowed_nodes: u64,
+    ) -> Result<usize, AddressSpaceError> {
+        let v = vaddr.as_u64();
+        let source = {
+            let huge = self.huge_regions.lock();
+            huge.iter().find_map(|region| {
+                let base = region.base.as_u64();
+                if v < base || v >= base.saturating_add(region.len) {
+                    return None;
+                }
+                let leaf_bytes = match region.size {
+                    crate::hugepage::HugeSize::M2 => crate::hugepage::HUGEPAGE_2M_BYTES,
+                    crate::hugepage::HugeSize::G1 => crate::hugepage::HUGEPAGE_1G_BYTES,
+                };
+                region
+                    .frames
+                    .get(((v - base) / leaf_bytes) as usize)
+                    .map(|frame| frame.node())
+            })
+        }
+        .or_else(|| {
+            let regions = self.regions.lock();
+            regions.iter().find_map(|region| {
+                let base = region.base.as_u64();
+                if v < base || v >= base.saturating_add(region.len) {
+                    return None;
+                }
+                let phys = *region.phys.get(((v - base) >> 12) as usize)?;
+                if phys.raw() == 0 {
+                    None
+                } else {
+                    // SAFETY: non-zero backing entries name live frames.
+                    Some(unsafe { crate::frame::narf_phys_node(phys.raw()) })
+                }
+            })
+        })
+        .ok_or(AddressSpaceError::Unmapped)?;
+
+        let target = crate::numa_tier::demotion_target(source, allowed_nodes)
+            .ok_or(AddressSpaceError::NoDemotionTarget)?;
+        // SAFETY: inherited from this method's contract.
+        unsafe { self.migrate_page_to_node(vaddr, target) }
     }
 
     /// Migrate the hardware huge leaf containing `vaddr`, if any.

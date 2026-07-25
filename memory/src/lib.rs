@@ -32,6 +32,7 @@ pub mod hugepage;
 pub mod kasan;
 pub mod kaslr;
 pub mod mempolicy;
+pub mod numa_tier;
 pub mod pager;
 pub mod per_domain_root;
 pub mod reclaim;
@@ -170,6 +171,7 @@ pub use mempolicy::{
     MPOL_DEFAULT, MPOL_INTERLEAVE, MPOL_LOCAL, MPOL_PREFERRED, MPOL_PREFERRED_MANY,
     MPOL_WEIGHTED_INTERLEAVE,
 };
+pub use numa_tier::{demotion_target, node_tier, set_node_performance, tier_nodes};
 pub use pager::{
     current_pager_name, install_pager, NoopPager, Pager, PagerAuthority, PagerError, SwapSlot,
     ZpoolPager,

@@ -46,3 +46,11 @@ argument = "Memory hotplug admits only aligned, non-overlapping host-acknowledge
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "virtio-mem preserves physical-frame ownership by ordering PLUG before allocator donation and allocator removal before UNPLUG, rolling either side back when the second step fails. No busy frame is reclaimed or exposed to the host, and dynamic node reporting exports aggregate state rather than physical addresses."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "HMAT memory tiers only constrain target selection: demotion requires a strictly slower online tier and intersects candidates with the caller-provided cpuset/mempolicy mask. Unknown firmware coordinates remain in the default top tier rather than silently weakening placement policy."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Tier demotion delegates to the existing private-page and complete-huge-leaf migration transaction, preserving ownership and permissions, rolling back failed leaf replacement, and completing cross-CPU TLB invalidation before returning old backing to the allocator."

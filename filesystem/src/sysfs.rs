@@ -115,6 +115,34 @@ fn numa_online_list() -> String {
     out
 }
 
+fn node_mask_list(mask: u64) -> String {
+    let mut out = String::new();
+    let mut node = 0usize;
+    let mut first = true;
+    while node < narf_memory::FRAME_MAX_NUMA_NODES {
+        if mask & (1u64 << node) == 0 {
+            node += 1;
+            continue;
+        }
+        let start = node;
+        while node + 1 < narf_memory::FRAME_MAX_NUMA_NODES && mask & (1u64 << (node + 1)) != 0 {
+            node += 1;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        if start == node {
+            out.push_str(&format!("{start}"));
+        } else {
+            out.push_str(&format!("{start}-{node}"));
+        }
+        node += 1;
+    }
+    out.push('\n');
+    out
+}
+
 #[inline]
 fn node_distance(from: u32, to: u32) -> u8 {
     // SAFETY: narf-frame provides the definition.
@@ -1136,6 +1164,20 @@ pub fn populate_numa_nodes() {
 
         kobject_add_attr(&kobj, "cpulist", move || node_cpulist_string(node));
         kobject_add_attr(&kobj, "cpumap", move || node_cpumap_string(node));
+    }
+
+    // Linux memory-tier bus: default DRAM's abstract distance maps to device
+    // id 4; each successively slower NARF tier occupies the next chunk.
+    let virtual_dir = get_or_create_child(&devices, "virtual");
+    let tier_bus = get_or_create_child(&virtual_dir, "memory_tiering");
+    for tier in 0..narf_memory::FRAME_MAX_NUMA_NODES as u8 {
+        if narf_memory::tier_nodes(tier) == 0 {
+            continue;
+        }
+        let tier_obj = get_or_create_child(&tier_bus, &format!("memory_tier{}", 4 + tier));
+        kobject_add_attr(&tier_obj, "nodelist", move || {
+            node_mask_list(narf_memory::tier_nodes(tier))
+        });
     }
 }
 
