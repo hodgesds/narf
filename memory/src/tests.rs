@@ -1548,6 +1548,33 @@ fn smoke_numa_allocation_stats_advance() -> TestResult {
 }
 kernel_test_in!("memory", smoke_numa_allocation_stats_advance);
 
+fn smoke_numa_node_total_is_stable() -> TestResult {
+    let total = crate::node_total(0);
+    if total == 0 {
+        return TestResult::Skip("node 0 managed-page total unavailable");
+    }
+    let free_before = crate::node_free(0);
+    let frame = match crate::alloc_frame_on_strict(0) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Skip("node 0 strict allocation unavailable"),
+    };
+    if crate::node_total(0) != total {
+        crate::free_frame(frame);
+        return TestResult::Fail("node total changed after allocation");
+    }
+    if crate::node_free(0) >= free_before {
+        crate::free_frame(frame);
+        return TestResult::Fail("node free count did not decrease");
+    }
+    crate::free_frame(frame);
+    if crate::node_total(0) == total {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("node total changed after free")
+    }
+}
+kernel_test_in!("memory", smoke_numa_node_total_is_stable);
+
 fn smoke_memory_address_space_materialize() -> TestResult {
     // Full flow: new_for_user allocates a fresh root, map_region
     // records a region, materialize walks the region and installs

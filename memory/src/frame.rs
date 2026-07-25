@@ -200,6 +200,10 @@ impl From<CapError> for FrameAllocError {
 #[derive(Debug)]
 pub struct FrameAllocator {
     zones: [BuddyZone; MAX_NUMA_NODES],
+    /// Managed base pages per node, frozen when topology rebalance
+    /// completes. Unlike the zone free counts this does not decrease on
+    /// allocation, so it is suitable for sysfs MemTotal reporting.
+    node_total_frames: [usize; MAX_NUMA_NODES],
     initialised: bool,
     total_frames: usize,
     reserved_frames: usize,
@@ -213,6 +217,7 @@ const NEW_ZONE: BuddyZone = BuddyZone::new();
 
 static ALLOC: IrqSafeSpinLock<FrameAllocator> = IrqSafeSpinLock::new(FrameAllocator {
     zones: [NEW_ZONE; MAX_NUMA_NODES],
+    node_total_frames: [0; MAX_NUMA_NODES],
     initialised: false,
     total_frames: 0,
     reserved_frames: 0,
@@ -275,6 +280,8 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
     guard.initialised = true;
     guard.total_frames = total;
     guard.reserved_frames = reserved;
+    guard.node_total_frames = [0; MAX_NUMA_NODES];
+    guard.node_total_frames[0] = guard.zones[0].free_frame_count();
     guard.numa_aware = false;
     // Opt the LIVE allocator's zones into frame-alloc-audit (no-op unless
     // the feature is set). Standalone unit-test `BuddyZone`s never call
@@ -476,6 +483,9 @@ pub fn rebalance_to_topology() {
             let phys = frame_no << PAGE_SHIFT;
             phys_to_node(phys) == target
         });
+    }
+    for node in 0..MAX_NUMA_NODES {
+        g.node_total_frames[node] = g.zones[node].free_frame_count();
     }
     g.numa_aware = true;
 }
@@ -1079,6 +1089,17 @@ pub fn node_free(node: usize) -> usize {
     }
     let g = ALLOC.lock();
     g.zones[node].free_frame_count()
+}
+
+/// Stable number of allocator-managed base pages assigned to `node`.
+///
+/// The snapshot is established at SRAT-driven rebalance, after early
+/// reserved/boot allocations have been removed from the buddy pool.
+pub fn node_total(node: usize) -> usize {
+    if node >= MAX_NUMA_NODES {
+        return 0;
+    }
+    ALLOC.lock().node_total_frames[node]
 }
 
 /// True once `rebalance_to_topology` has run.

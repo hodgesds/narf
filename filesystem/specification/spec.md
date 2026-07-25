@@ -104,6 +104,9 @@ explicit request with an empty intersection is rejected.
 
 `/proc/numastat` exposes live per-node allocation events supplied by
 `memory/`: hit, miss, foreign, interleave-hit, local, and other counters.
+`/sys/devices/system/node/nodeN/{meminfo,numastat,vmstat}` exposes stable
+managed totals, live free/used pages, and the corresponding node-local
+event counters.
 
 ### 3.4 Directory operations
 

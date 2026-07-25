@@ -97,10 +97,11 @@ pub use frame::alloc_frame_on_strict;
 pub use frame::{
     alloc_frame, alloc_frame_anywhere, alloc_frame_on, alloc_pages_on, current_frame_alloc_name,
     free_frame, free_pages, init_from_map, install_frame_alloc, is_numa_aware, node_free,
-    numa_node_stats, rebalance_to_topology, release_early_ceiling, reserve_for_slab_promotion,
-    stats as frame_stats, validate_no_overlap as frame_validate_no_overlap, BuddyFrameAlloc,
-    BumpFrameAlloc, FrameAlloc, FrameAllocError, FrameStats, MemAlloc, NumaNodeStats, PhysFrame,
-    UsableRegion, BUDDY_FRAME_ALLOC, MAX_NUMA_NODES as FRAME_MAX_NUMA_NODES, PAGE_SHIFT, PAGE_SIZE,
+    node_total, numa_node_stats, rebalance_to_topology, release_early_ceiling,
+    reserve_for_slab_promotion, stats as frame_stats,
+    validate_no_overlap as frame_validate_no_overlap, BuddyFrameAlloc, BumpFrameAlloc, FrameAlloc,
+    FrameAllocError, FrameStats, MemAlloc, NumaNodeStats, PhysFrame, UsableRegion,
+    BUDDY_FRAME_ALLOC, MAX_NUMA_NODES as FRAME_MAX_NUMA_NODES, PAGE_SHIFT, PAGE_SIZE,
 };
 pub use heap::BumpAllocator;
 pub use heap::{bootstrap_remaining, spill_stats as heap_spill_stats};

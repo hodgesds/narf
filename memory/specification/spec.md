@@ -81,6 +81,8 @@ pub fn mempolicy_clear();
 
 /// Monotonic Linux-compatible allocation-event snapshot for one NUMA node.
 pub fn numa_node_stats(node: usize) -> NumaNodeStats;
+/// Stable allocator-managed base-page total established at NUMA rebalance.
+pub fn node_total(node: usize) -> usize;
 
 impl AddressSpace {
     /// Replace one resident private page with equivalent backing from a
