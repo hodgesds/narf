@@ -93,6 +93,10 @@ from turning into a kernel-side memory-corruption primitive.
   address (Linux/U-Boot ABI).
 - Memory map + reserved regions from the FDT `/memory` and
   `/reserved-memory` nodes.
+- The early scan accepts FDT v17+, obtains the command line and Linux
+  initrd range from `/chosen`, and subtracts both `/memreserve/` and
+  static `/reserved-memory/*/reg` ranges before exposing usable RAM.
+  DTB and initrd storage are also excluded from the usable map.
 
 ## 6. Dependencies
 

@@ -634,6 +634,7 @@ dependencies = [
 name = "narf-boot"
 version = "0.0.0"
 dependencies = [
+ "narf-firmware-fdt",
  "narf-lib",
  "narf-memory",
 ]

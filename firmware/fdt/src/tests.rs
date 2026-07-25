@@ -61,13 +61,16 @@ fn build_blob(
         }
     }
 
-    for (node_name, props) in nodes {
-        s.extend_from_slice(&fdt::FDT_BEGIN_NODE.to_be_bytes());
-        s.extend_from_slice(node_name.as_bytes());
-        s.push(0);
-        // pad to 4
-        while s.len() % 4 != 0 {
+    for (node_path, props) in nodes {
+        let mut opened = 0;
+        for node_name in node_path.split('/') {
+            s.extend_from_slice(&fdt::FDT_BEGIN_NODE.to_be_bytes());
+            s.extend_from_slice(node_name.as_bytes());
             s.push(0);
+            while s.len() % 4 != 0 {
+                s.push(0);
+            }
+            opened += 1;
         }
 
         for (pname, pval) in *props {
@@ -81,7 +84,9 @@ fn build_blob(
             }
         }
 
-        s.extend_from_slice(&fdt::FDT_END_NODE.to_be_bytes());
+        for _ in 0..opened {
+            s.extend_from_slice(&fdt::FDT_END_NODE.to_be_bytes());
+        }
     }
 
     s.extend_from_slice(&fdt::FDT_END_NODE.to_be_bytes()); // close root
@@ -141,6 +146,26 @@ fn smoke_fdt_header_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_header_round_trip);
+
+fn smoke_fdt_header_rejects_incompatible_or_oob_layout() -> TestResult {
+    let blob = build_blob(0, &[], &[], &[]);
+    let mut old = blob.clone();
+    old[20..24].copy_from_slice(&16u32.to_be_bytes());
+    if fdt::parse_header(&old).is_some() {
+        return TestResult::Fail("accepted pre-v17 blob");
+    }
+    let mut oob = blob;
+    let beyond = (oob.len() as u32 + 4).to_be_bytes();
+    oob[36..40].copy_from_slice(&beyond);
+    if fdt::parse_header(&oob).is_some() {
+        return TestResult::Fail("accepted out-of-bounds structure block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "firmware/fdt",
+    smoke_fdt_header_rejects_incompatible_or_oob_layout
+);
 
 fn smoke_fdt_walk_minimal() -> TestResult {
     let nodes = &[("memory@0", &[("device_type", b"memory\0" as &[u8])][..])];
@@ -227,6 +252,57 @@ fn smoke_fdt_reservations() -> TestResult {
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_reservations);
 
+fn smoke_fdt_reserved_memory_static_ranges() -> TestResult {
+    let mut reg = Vec::new();
+    reg.extend_from_slice(&0x7800_0000u64.to_be_bytes());
+    reg.extend_from_slice(&0x0080_0000u32.to_be_bytes());
+    let nodes = &[(
+        "reserved-memory/framebuffer@78000000",
+        &[
+            ("reg", reg.as_slice()),
+            ("no-map", &[] as &[u8]),
+            ("compatible", b"shared-dma-pool\0" as &[u8]),
+        ][..],
+    )];
+    let blob = build_blob(0, &[], &[], nodes);
+    let mut out = [fdt::ReservedRegion::default(); 2];
+    let n = fdt::copy_reserved_memory_ranges(&blob, &mut out);
+    if n != 1
+        || out[0].addr != 0x7800_0000
+        || out[0].size != 0x0080_0000
+        || !out[0].no_map
+        || out[0].reusable
+    {
+        return TestResult::Fail("reserved-memory static range mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_reserved_memory_static_ranges);
+
+fn smoke_fdt_reserved_memory_rejects_conflicting_flags() -> TestResult {
+    let mut reg = Vec::new();
+    reg.extend_from_slice(&0x7900_0000u64.to_be_bytes());
+    reg.extend_from_slice(&0x0010_0000u32.to_be_bytes());
+    let nodes = &[(
+        "reserved-memory/bad@79000000",
+        &[
+            ("reg", reg.as_slice()),
+            ("no-map", &[] as &[u8]),
+            ("reusable", &[] as &[u8]),
+        ][..],
+    )];
+    let blob = build_blob(0, &[], &[], nodes);
+    let mut out = [fdt::ReservedRegion::default(); 1];
+    if fdt::copy_reserved_memory_ranges(&blob, &mut out) != 0 {
+        return TestResult::Fail("accepted no-map plus reusable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "firmware/fdt",
+    smoke_fdt_reserved_memory_rejects_conflicting_flags
+);
+
 fn smoke_fdt_cells_inheritance() -> TestResult {
     // Explicitly set 2/2 in root.
     let addr_cells = 2u32.to_be_bytes();
@@ -311,6 +387,100 @@ fn smoke_fdt_phandle_lookup() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_phandle_lookup);
+
+fn smoke_fdt_interrupts_extended_multiple_domains() -> TestResult {
+    let phandle_a = 7u32.to_be_bytes();
+    let cells_a = 2u32.to_be_bytes();
+    let phandle_b = 9u32.to_be_bytes();
+    let cells_b = 1u32.to_be_bytes();
+    let mut extended = Vec::new();
+    for cell in [7u32, 10, 8, 9, 218] {
+        extended.extend_from_slice(&cell.to_be_bytes());
+    }
+    let nodes = &[
+        (
+            "pic@1000",
+            &[
+                ("phandle", &phandle_a[..]),
+                ("#interrupt-cells", &cells_a[..]),
+                ("interrupt-controller", &[] as &[u8]),
+            ][..],
+        ),
+        (
+            "gic@2000",
+            &[
+                ("phandle", &phandle_b[..]),
+                ("#interrupt-cells", &cells_b[..]),
+                ("interrupt-controller", &[] as &[u8]),
+            ][..],
+        ),
+        (
+            "device@3000",
+            &[("interrupts-extended", extended.as_slice())][..],
+        ),
+    ];
+    let blob = build_blob(0, &[], &[], nodes);
+    let mut hits = 0;
+    fdt::walk_nodes(&blob, |path, props| {
+        if path.last_segment() != "device@3000" {
+            return;
+        }
+        fdt::for_each_interrupt(&blob, props, None, |parent, cells| {
+            match hits {
+                0 if parent == 7 && cells == [10, 8] => {}
+                1 if parent == 9 && cells == [218] => {}
+                _ => hits = 99,
+            }
+            hits += 1;
+        });
+    });
+    if hits != 2 {
+        return TestResult::Fail("interrupts-extended decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "firmware/fdt",
+    smoke_fdt_interrupts_extended_multiple_domains
+);
+
+fn smoke_fdt_interrupts_extended_precedes_legacy() -> TestResult {
+    let phandle = 3u32.to_be_bytes();
+    let cells = 1u32.to_be_bytes();
+    let mut extended = Vec::new();
+    extended.extend_from_slice(&3u32.to_be_bytes());
+    extended.extend_from_slice(&55u32.to_be_bytes());
+    let legacy = 99u32.to_be_bytes();
+    let nodes = &[
+        (
+            "intc",
+            &[("phandle", &phandle[..]), ("#interrupt-cells", &cells[..])][..],
+        ),
+        (
+            "device",
+            &[
+                ("interrupts-extended", extended.as_slice()),
+                ("interrupts", &legacy[..]),
+                ("interrupt-parent", &phandle[..]),
+            ][..],
+        ),
+    ];
+    let blob = build_blob(0, &[], &[], nodes);
+    let mut value = 0;
+    fdt::walk_nodes(&blob, |path, props| {
+        if path.last_segment() == "device" {
+            fdt::for_each_interrupt(&blob, props, None, |_parent, spec| value = spec[0]);
+        }
+    });
+    if value != 55 {
+        return TestResult::Fail("legacy interrupts overrode extended");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "firmware/fdt",
+    smoke_fdt_interrupts_extended_precedes_legacy
+);
 
 fn smoke_fdt_aliases_and_stdout() -> TestResult {
     let nodes = &[
