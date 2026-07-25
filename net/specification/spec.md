@@ -179,6 +179,8 @@ sequence numbers. `NLM_F_ACK` requests receive `NLMSG_ERROR` with error zero
 after successful handling, while malformed framing fails with `EINVAL`.
 `SIOCINQ`/`FIONREAD` reports the complete size of the next queued route or
 generic-netlink datagram without consuming it.
+`MSG_PEEK` copies the next queued route or generic-netlink datagram without
+advancing the queue.
 
 ## 4. Invariants & safety properties
 

@@ -164,6 +164,7 @@ pub const IP_MULTICAST_TTL: u32 = 33;
 /// `fcntl(F_SETFL, O_NONBLOCK)` bit. Used by the sys_fcntl path
 /// to flip per-fd nonblock state on a SocketFile.
 pub const O_NONBLOCK: u32 = 0o4000;
+pub const MSG_PEEK: u32 = 0x02;
 
 // ── Address shape ───────────────────────────────────────────────
 
@@ -1514,11 +1515,17 @@ impl SocketFile {
                 narf_net::readiness::notify(0);
                 SocketOpResult::Ok(sent)
             }
-            SocketOp::Recv { buf, flags: _ } => {
+            SocketOp::Recv { buf, flags } => {
                 let msg = {
                     let mut g = self.state.lock();
                     match &mut *g {
-                        SocketState::NetlinkRoute { replies } => replies.pop_front(),
+                        SocketState::NetlinkRoute { replies } => {
+                            if flags & MSG_PEEK != 0 {
+                                replies.front().cloned()
+                            } else {
+                                replies.pop_front()
+                            }
+                        }
                         _ => return SocketOpResult::Err(SockError::InvalidArg),
                     }
                 };
@@ -1565,11 +1572,17 @@ impl SocketFile {
                 narf_net::readiness::notify(0);
                 SocketOpResult::Ok(buf.len() as u64)
             }
-            SocketOp::Recv { buf, flags: _ } => {
+            SocketOp::Recv { buf, flags } => {
                 let message = {
                     let mut state = self.state.lock();
                     match &mut *state {
-                        SocketState::NetlinkGeneric { replies } => replies.pop_front(),
+                        SocketState::NetlinkGeneric { replies } => {
+                            if flags & MSG_PEEK != 0 {
+                                replies.front().cloned()
+                            } else {
+                                replies.pop_front()
+                            }
+                        }
                         _ => return SocketOpResult::Err(SockError::InvalidArg),
                     }
                 };

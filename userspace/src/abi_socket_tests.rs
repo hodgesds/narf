@@ -1554,9 +1554,13 @@ fn netlink_send(fd: u64, buf: &[u8]) -> Option<i64> {
 
 /// recvfrom(fd, buf, len, MSG_DONTWAIT, NULL, NULL).
 fn netlink_recv(fd: u64, buf: &mut [u8]) -> Option<i64> {
+    netlink_recv_flags(fd, buf, MSG_DONTWAIT)
+}
+
+fn netlink_recv_flags(fd: u64, buf: &mut [u8], flags: u64) -> Option<i64> {
     call(
         Syscall::SocketRecv.raw(),
-        a3(fd, buf.as_mut_ptr() as u64, buf.len() as u64, MSG_DONTWAIT),
+        a3(fd, buf.as_mut_ptr() as u64, buf.len() as u64, flags),
     )
 }
 
@@ -1612,6 +1616,32 @@ fn smoke_abi_netlink_route_siocinq() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_siocinq);
+
+fn smoke_abi_netlink_route_msg_peek() -> TestResult {
+    with_setup(|| {
+        const MSG_PEEK: u64 = 0x02;
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETLINK, 41);
+        if netlink_send(fd, &req).ok_or("route send")? != req.len() as i64 {
+            return Err("RTM_GETLINK send failed");
+        }
+        let queued = netlink_inq(fd)?;
+        let mut peeked = [0u8; 512];
+        let peek_n =
+            netlink_recv_flags(fd, &mut peeked, MSG_DONTWAIT | MSG_PEEK).ok_or("peek recv")?;
+        if peek_n != queued as i64 || netlink_inq(fd)? != queued {
+            return Err("MSG_PEEK consumed or resized the queued netlink datagram");
+        }
+        let mut consumed = [0u8; 512];
+        let recv_n = netlink_recv(fd, &mut consumed).ok_or("consume recv")?;
+        if recv_n != peek_n || consumed[..recv_n as usize] != peeked[..peek_n as usize] {
+            return Err("MSG_PEEK bytes differed from the consumed netlink datagram");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_msg_peek);
 
 fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
     with_setup(|| {
