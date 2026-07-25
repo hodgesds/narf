@@ -1,0 +1,117 @@
+name: Release packages
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing signed release tag
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq .object.sha)"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq .verification.verified)" = true
+          version="${RELEASE_TAG#v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  packages:
+    needs: [validate, kernel]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:stable
+            format: deb
+            install: apt-get update && apt-get install -y dpkg-dev python3
+          - image: ubuntu:latest
+            format: deb
+            install: apt-get update && apt-get install -y dpkg-dev python3
+          - image: fedora:latest
+            format: rpm
+            install: dnf install -y rpm-build python3
+          - image: archlinux:latest
+            format: arch
+            install: pacman -Syu --noconfirm base-devel python
+          - image: gentoo/stage3:latest
+            format: gentoo
+            install: emerge --sync && emerge dev-lang/python
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel
+          path: target/x86_64-unknown-none/release
+      - run: ${{ matrix.install }}
+      - env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: packaging/build-release.sh --version "$VERSION" --skip-build --formats "${{ matrix.format }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.format }}-${{ strategy.job-index }}
+          path: target/release-assets/${{ needs.validate.outputs.version }}
+
+  kernel:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - run: rustup component add rust-src llvm-tools-preview
+      - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask build --arch=x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel
+          path: target/x86_64-unknown-none/release/narf-frame
+
+  iso-test:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - run: sudo apt-get update && sudo apt-get install -y xorriso limine
+      - run: rustup component add rust-src llvm-tools-preview
+      - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask image --arch=x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iso-test-image
+          path: target/narf-x86_64.iso
+
+  publish:
+    needs: [validate, packages, iso-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: assets
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: gh release create "$RELEASE_TAG" --verify-tag --generate-notes assets/*
