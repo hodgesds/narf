@@ -3248,7 +3248,8 @@ const MPOL_PREFERRED_MANY: u32 = 5;
 const MPOL_WEIGHTED_INTERLEAVE: u32 = 6;
 const MPOL_F_RELATIVE_NODES: u32 = 1 << 14;
 const MPOL_F_STATIC_NODES: u32 = 1 << 15;
-const MPOL_MODE_FLAGS: u32 = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES;
+const MPOL_F_NUMA_BALANCING: u32 = 1 << 13;
+const MPOL_MODE_FLAGS: u32 = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES | MPOL_F_NUMA_BALANCING;
 
 // Online NUMA node count via a weak hook (userspace avoids a direct
 // narf-acpi dep to keep the kernel image under lld's orphan-placement
@@ -3337,6 +3338,40 @@ static INTERLEAVE_INDEX_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, u64>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+#[derive(Copy, Clone)]
+struct NumaBalanceState {
+    ticks: u16,
+    cursor: u64,
+}
+
+static NUMA_BALANCE_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, NumaBalanceState>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn ensure_numa_balance_state(task: u64) {
+    NUMA_BALANCE_TABLE
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(
+            task,
+            NumaBalanceState {
+                ticks: 255,
+                cursor: AddressSpace::USER_FIXED_FLOOR,
+            },
+        );
+}
+
+fn start_numa_balance_range(task: u64, cursor: u64) {
+    ensure_numa_balance_state(task);
+    if let Some(state) = NUMA_BALANCE_TABLE
+        .lock()
+        .as_mut()
+        .and_then(|states| states.get_mut(&task))
+    {
+        state.cursor = cursor & !0xFFF;
+    }
+}
+
 fn task_interleave_index(task: u64, advance: bool) -> u64 {
     let mut table = INTERLEAVE_INDEX_TABLE.lock();
     let index = table
@@ -3359,7 +3394,13 @@ fn mpol_policy_shape_valid(mode: u32, nodemask: u64) -> bool {
     if flags == (MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES) {
         return false;
     }
-    match mode & !MPOL_MODE_FLAGS {
+    let base = mode & !MPOL_MODE_FLAGS;
+    if flags & MPOL_F_NUMA_BALANCING != 0
+        && !matches!(base, narf_memory::MPOL_BIND | MPOL_PREFERRED_MANY)
+    {
+        return false;
+    }
+    match base {
         narf_memory::MPOL_DEFAULT | narf_memory::MPOL_LOCAL => nodemask == 0 && flags == 0,
         narf_memory::MPOL_PREFERRED => nodemask != 0 || flags == 0,
         narf_memory::MPOL_BIND
@@ -3367,6 +3408,96 @@ fn mpol_policy_shape_valid(mode: u32, nodemask: u64) -> bool {
         | MPOL_PREFERRED_MANY
         | MPOL_WEIGHTED_INTERLEAVE => nodemask != 0,
         _ => false,
+    }
+}
+
+/// Resolve a sampled NUMA hint fault. The backing remains owned while its
+/// leaf is absent; this either migrates it to the accessing CPU's allowed
+/// node or restores the original mapping.
+pub fn handle_numa_hint_fault(va: u64) -> bool {
+    let Some(as_ref) = active_user_as() else {
+        return false;
+    };
+    let page = VirtAddr::new(va & !0xFFF);
+    if !as_ref.take_numa_hint(page) {
+        return false;
+    }
+    let task = current_task_id();
+    let policy = resolve_policy(task, va);
+    let allowed = narf_scheduler::task_mems_allowed(task);
+    let targets = mpol_effective_nodemask(policy, allowed);
+    let local = numa_node_for_cpu(narf_lib::percpu::current_cpu() as u32) as usize;
+    if policy.mode & MPOL_F_NUMA_BALANCING != 0 && (targets >> local) & 1 != 0 {
+        // SAFETY: the sampled page belongs to the active address space and
+        // remains resident/owned while its leaf is temporarily absent.
+        let _ = unsafe { as_ref.migrate_page_to_node(page, local) };
+    }
+    // migrate_page_to_node's already-local fast path intentionally does not
+    // rewrite a leaf. Always remap, also providing rollback after ENOMEM.
+    // SAFETY: the hint record proves this active AS retains the page backing.
+    unsafe { as_ref.remap_page(page) }.is_ok()
+}
+
+/// Allocation-free periodic sampler called on timer return to user mode.
+/// One page is protected per 256 ticks and the scan cursor advances across
+/// VMAs, bounding both IRQ work and hint-fault frequency.
+pub fn numa_balance_tick() {
+    const SCAN_TICKS: u16 = 256;
+    const SEARCH_BUDGET: usize = 16;
+    let task = current_task_id();
+    let cursor = {
+        let mut table = NUMA_BALANCE_TABLE.lock();
+        let Some(state) = table.as_mut().and_then(|states| states.get_mut(&task)) else {
+            return;
+        };
+        state.ticks = state.ticks.saturating_add(1);
+        if state.ticks < SCAN_TICKS {
+            return;
+        }
+        state.ticks = 0;
+        state.cursor
+    };
+    let Some(as_ref) = active_user_as() else {
+        return;
+    };
+    let mut next = cursor;
+    for _ in 0..SEARCH_BUDGET {
+        let candidate = as_ref
+            .next_numa_hint_candidate(VirtAddr::new(next))
+            .or_else(|| {
+                as_ref.next_numa_hint_candidate(VirtAddr::new(AddressSpace::USER_FIXED_FLOOR))
+            });
+        let Some(candidate) = candidate else {
+            return;
+        };
+        next = candidate.as_u64().saturating_add(4096);
+        let policy = resolve_policy(task, candidate.as_u64());
+        if policy.mode & MPOL_F_NUMA_BALANCING == 0 {
+            continue;
+        }
+        // SAFETY: candidate was obtained from this live AS's resident table;
+        // the method revalidates it under the region lock.
+        if unsafe { as_ref.protect_numa_hint_page(candidate) }.unwrap_or(false) {
+            if let Some(state) = NUMA_BALANCE_TABLE
+                .lock()
+                .as_mut()
+                .and_then(|states| states.get_mut(&task))
+            {
+                state.cursor = next;
+            }
+            return;
+        }
+    }
+    if let Some(state) = NUMA_BALANCE_TABLE
+        .lock()
+        .as_mut()
+        .and_then(|states| states.get_mut(&task))
+    {
+        state.cursor = next;
+        // Continue the bounded walk on the next tick until it reaches an
+        // eligible policy range; the long interval begins only after a page
+        // has actually been sampled.
+        state.ticks = SCAN_TICKS - 1;
     }
 }
 
@@ -6055,6 +6186,9 @@ fn release_task_tables(tid: u64) {
         m.remove(&tid);
     }
     if let Some(m) = INTERLEAVE_INDEX_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = NUMA_BALANCE_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
     narf_scheduler::clear_task_mems_allowed(tid);

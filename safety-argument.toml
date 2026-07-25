@@ -34,3 +34,7 @@ argument = "HMAT automatic weighting publishes bounded allocation ratios through
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Moving interleave sequence ownership from CPU slots to task-scoped userspace-compat state changes only deterministic target selection. The active fault policy still intersects cpuset.mems before entering the allocator, and task teardown reclaims the sequence state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Automatic NUMA balancing samples only private, unlocked user leaves and retains ownership of every backing frame while the leaf is absent. Hint resolution intersects policy with cpuset.mems, serializes migration through the address-space region lock, completes cross-CPU TLB invalidation before freeing the source, and always restores a mapping after migration failure."

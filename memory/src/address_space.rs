@@ -140,6 +140,23 @@ pub struct NumaRegionSnapshot {
     pub node_pages: [u64; crate::frame::MAX_NUMA_NODES],
 }
 
+const MAX_NUMA_HINTS: usize = 64;
+
+#[derive(Debug)]
+struct NumaHints {
+    pages: [u64; MAX_NUMA_HINTS],
+    len: usize,
+}
+
+impl NumaHints {
+    const fn new() -> Self {
+        Self {
+            pages: [0; MAX_NUMA_HINTS],
+            len: 0,
+        }
+    }
+}
+
 fn release_failed_huge_region(
     region: HugeRegion,
     error: AddressSpaceError,
@@ -199,6 +216,9 @@ pub struct AddressSpace {
     /// measured to serialise the whole machine under fork/COW-heavy
     /// load (stress-ng --sigrt) whenever one vCPU was slow to ack.
     vm_shared: core::sync::atomic::AtomicBool,
+    /// Resident base pages temporarily made inaccessible by automatic NUMA
+    /// balancing. The next access is a NUMA hint fault, not demand paging.
+    numa_hints: IrqSafeSpinLock<NumaHints>,
 }
 
 impl AddressSpace {
@@ -256,7 +276,110 @@ impl AddressSpace {
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
+            numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
         }
+    }
+
+    /// Temporarily remove one private resident 4 KiB leaf so its next access
+    /// reports the accessing CPU's NUMA locality through a hint fault.
+    ///
+    /// Returns `Ok(false)` when the address is not an eligible resident base
+    /// page (hole, lazy page, shared/locked mapping, or already sampled).
+    ///
+    /// # Safety
+    /// `self.root` must be a live user page-table root and address-space
+    /// teardown must not race this operation.
+    pub unsafe fn protect_numa_hint_page(
+        &self,
+        vaddr: VirtAddr,
+    ) -> Result<bool, AddressSpaceError> {
+        let page = VirtAddr::new(vaddr.as_u64() & !0xFFF);
+        let regions = self.regions.lock();
+        let Some(region) = regions.iter().find(|region| {
+            let base = region.base.as_u64();
+            page.as_u64() >= base && page.as_u64() < base.saturating_add(region.len)
+        }) else {
+            return Ok(false);
+        };
+        if region.perms.contains(RegionPerms::SHARED) || region.perms.contains(RegionPerms::LOCKED)
+        {
+            return Ok(false);
+        }
+        let index = ((page.as_u64() - region.base.as_u64()) >> 12) as usize;
+        if region.phys.get(index).is_none_or(|phys| phys.raw() == 0) {
+            return Ok(false);
+        }
+        let mut hints = self.numa_hints.lock();
+        if hints.pages[..hints.len].contains(&page.as_u64()) || hints.len == MAX_NUMA_HINTS {
+            return Ok(false);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: page belongs to the live private region resolved above.
+            let removed = unsafe { crate::x86_64::paging::unmap_4kb_local(self.root, page) };
+            if removed.is_err() {
+                return Ok(false);
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: page belongs to the live private region resolved above.
+            let removed = unsafe { crate::aarch64::paging::unmap_4kb(self.root, page) };
+            if removed.is_err() {
+                return Ok(false);
+            }
+        }
+        let index = hints.len;
+        hints.pages[index] = page.as_u64();
+        hints.len += 1;
+        drop(hints);
+        drop(regions);
+        self.flush_region_broadcast(page, 1);
+        Ok(true)
+    }
+
+    /// Consume a recorded NUMA hint for `vaddr`.
+    ///
+    /// A true result gives the fault handler exclusive responsibility for
+    /// restoring or migrating the still-owned backing page.
+    pub fn take_numa_hint(&self, vaddr: VirtAddr) -> bool {
+        let page = VirtAddr::new(vaddr.as_u64() & !0xFFF);
+        let mut hints = self.numa_hints.lock();
+        let Some(index) = hints.pages[..hints.len]
+            .iter()
+            .position(|candidate| *candidate == page.as_u64())
+        else {
+            return false;
+        };
+        hints.len -= 1;
+        let last = hints.len;
+        hints.pages[index] = hints.pages[last];
+        hints.pages[last] = 0;
+        true
+    }
+
+    /// Find the first eligible resident base page at or after `start`.
+    /// This is allocation-free so a timer-return sampling hook can use it.
+    pub fn next_numa_hint_candidate(&self, start: VirtAddr) -> Option<VirtAddr> {
+        let start = start.as_u64() & !0xFFF;
+        let regions = self.regions.lock();
+        regions
+            .iter()
+            .filter(|region| {
+                !region.perms.contains(RegionPerms::SHARED)
+                    && !region.perms.contains(RegionPerms::LOCKED)
+                    && region.perms.prot_only().0 != 0
+            })
+            .flat_map(|region| {
+                region
+                    .phys
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, phys)| phys.raw() != 0)
+                    .map(|(index, _)| VirtAddr::new(region.base.as_u64() + (index as u64) * 4096))
+            })
+            .filter(|page| page.as_u64() >= start)
+            .min_by_key(|page| page.as_u64())
     }
 
     /// Mark this AS as shared by a `CLONE_VM` clone (thread creation).
@@ -391,6 +514,7 @@ impl AddressSpace {
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
+            numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
         })
     }
 
@@ -413,6 +537,7 @@ impl AddressSpace {
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
+            numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
         })
     }
 

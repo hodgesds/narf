@@ -89,6 +89,11 @@ pub fn interleave_auto() -> bool;
 pub fn set_interleave_auto(enabled: bool) -> Result<(), ()>;
 pub fn set_interleave_bandwidth(node: usize, bandwidth: u64) -> Result<(), ()>;
 
+/// Temporarily remove an eligible private resident leaf for NUMA sampling.
+pub unsafe fn protect_numa_hint_page(vaddr: VirtAddr) -> Result<bool, AddressSpaceError>;
+/// Consume the recorded hint before restoring or migrating its backing.
+pub fn take_numa_hint(vaddr: VirtAddr) -> bool;
+
 /// Monotonic Linux-compatible allocation-event snapshot for one NUMA node.
 pub fn numa_node_stats(node: usize) -> NumaNodeStats;
 /// Stable allocator-managed base-page total established at NUMA rebalance.

@@ -1785,6 +1785,7 @@ fn smoke_memory_as_drop_then_materialize() -> TestResult {
     drop(throwaway);
 
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    // SAFETY: test context has paging enabled and exclusively owns the AS.
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed (allocator drained?)"),
@@ -6750,6 +6751,56 @@ fn smoke_numa_migrate_page_preserves_contents() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_numa_migrate_page_preserves_contents);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_numa_hint_fault_round_trip() -> TestResult {
+    use crate::x86_64::paging;
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: test context has paging enabled and exclusively owns the AS.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(x) => x,
+        Err(_) => return TestResult::Skip("AS alloc failed"),
+    };
+    let va = VirtAddr::new(0x0000_4080_3010_0000);
+    let frame = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("frame allocation failed"),
+    };
+    let registered = a.map_region(Region {
+        base: va,
+        len: 4096,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![frame],
+    });
+    // SAFETY: a owns a fresh valid root and the registered frame.
+    let materialized = unsafe { a.materialize() };
+    if registered.is_err() || materialized.is_err() {
+        return TestResult::Fail("failed to materialize hint test page");
+    }
+    // SAFETY: this test exclusively owns the live address space.
+    if unsafe { a.protect_numa_hint_page(va) } != Ok(true) {
+        return TestResult::Fail("eligible page was not protected");
+    }
+    // SAFETY: read-only walk of the live root.
+    if unsafe { paging::translate(a.root, va) }.is_some() {
+        return TestResult::Fail("NUMA hint left the sampled PTE present");
+    }
+    if !a.take_numa_hint(va) {
+        return TestResult::Fail("sampled address was not recorded");
+    }
+    // SAFETY: the sampled backing remains owned by a's region.
+    if unsafe { a.remap_page(va) }.is_err() {
+        return TestResult::Fail("hint fault could not restore the leaf");
+    }
+    // SAFETY: read-only walk of the live root.
+    match unsafe { paging::translate(a.root, va) } {
+        Some(phys) if phys == frame => TestResult::Pass,
+        _ => TestResult::Fail("hint fault restored the wrong backing"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_numa_hint_fault_round_trip);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_mempolicy_allowed_mask_is_hard_boundary() -> TestResult {

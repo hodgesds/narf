@@ -58,7 +58,7 @@ pub struct TrapFrame {
 /// to acknowledge the IRQ, dispatches to the registered handler by
 /// INTID, then writes ICC_EOIR1_EL1 to release the priority.
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_aarch64_irq(_frame: &TrapFrame) {
+pub extern "C" fn rust_aarch64_irq(frame: &TrapFrame) {
     // SAFETY: we are in the IRQ handler by the vector-table contract.
     let iar = unsafe { sysreg::read_icc_iar1_el1() };
     let intid = (iar & 0x00FF_FFFF) as u32;
@@ -70,6 +70,9 @@ pub extern "C" fn rust_aarch64_irq(_frame: &TrapFrame) {
         }
         n if n == narf_interrupts::aarch64::TIMER_PPI => {
             narf_interrupts::aarch64::timer::on_timer_tick();
+            if (frame.spsr & 0xF) == 0 {
+                narf_userspace::handlers::numa_balance_tick();
+            }
             // Re-arm the timer for another round. Same value as the
             // initial programming — the Stage-2 period is controlled
             // by whoever called `start_timer` originally; for the
@@ -192,6 +195,9 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         // surfaces here; if the vaddr lands in a STACK_GUARD
         // region the trap routes into try_grow_stack instead.
         if is_translation_fault {
+            if narf_userspace::handlers::handle_numa_hint_fault(far) {
+                return;
+            }
             if let Some(as_arc) = narf_userspace::active_user_as() {
                 let v = narf_memory::VirtAddr::new(far);
                 // Publish the faulting task's NUMA mempolicy for `far`

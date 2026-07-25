@@ -77,6 +77,11 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
         return;
     }
     let task = current_task_id();
+    if mode & MPOL_F_NUMA_BALANCING != 0 {
+        start_numa_balance_range(task, addr);
+    } else {
+        ensure_numa_balance_state(task);
+    }
     let allowed = narf_scheduler::task_mems_allowed(task) & online_mask;
     if !mpol_initial_nodemask_valid(mode, nodemask, allowed) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL

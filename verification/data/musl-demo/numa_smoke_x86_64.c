@@ -162,6 +162,56 @@ int main(void) {
     for (int cpu = 0; cpu < 16; cpu++) CPU_SET(cpu, &all_cpus);
     sched_setaffinity(0, sizeof all_cpus, &all_cpus);
 
+    // MPOL_F_NUMA_BALANCING: fault on node 0, run the task on node 1, and
+    // keep touching the page until the periodic hint fault migrates it.
+    cpu_set_t cpu0;
+    CPU_ZERO(&cpu0);
+    CPU_SET(0, &cpu0);
+    unsigned long node0 = 1;
+    if (sched_setaffinity(0, sizeof cpu0, &cpu0) != 0 ||
+        syscall(SYS_set_mempolicy, 2, &node0, 64) != 0) {
+        w("numa-fail: balancing-set\n");
+        return 1;
+    }
+    volatile unsigned char *balanced =
+        mmap(0, 4096, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (balanced == MAP_FAILED) {
+        w("numa-fail: balancing-mmap\n");
+        return 1;
+    }
+    balanced[0] = 0x41;
+    syscall(SYS_set_mempolicy, 0, 0, 0);
+    if (syscall(SYS_mbind, (void *)balanced, 4096, (1 << 13) | 2,
+                &both_nodes, 64, 0) != 0) {
+        w("numa-fail: balancing-mbind\n");
+        return 1;
+    }
+    cpu_set_t cpu8;
+    CPU_ZERO(&cpu8);
+    CPU_SET(8, &cpu8);
+    if (sched_setaffinity(0, sizeof cpu8, &cpu8) != 0) {
+        w("numa-fail: balancing-affinity\n");
+        return 1;
+    }
+    void *balanced_pages[1] = { (void *)balanced };
+    int balanced_status[1] = { -1 };
+    for (unsigned long i = 0; i < 50000000UL; i++) {
+        balanced[0] ^= (unsigned char)i;
+        if ((i & 0x3ffff) == 0 &&
+            syscall(SYS_move_pages, 0, 1, balanced_pages, 0,
+                    balanced_status, 0) == 0 &&
+            balanced_status[0] == 1)
+            break;
+    }
+    if (balanced_status[0] != 1) {
+        w("numa-fail: balancing-migration\n");
+        return 1;
+    }
+    syscall(SYS_set_mempolicy, 0, 0, 0);
+    munmap((void *)balanced, 4096);
+    sched_setaffinity(0, sizeof all_cpus, &all_cpus);
+
     // QEMU publishes equal local HMAT bandwidth for both nodes. Re-enabling
     // auto mode must reduce those coordinates back to a 1:1 ratio.
     if (put("/sys/kernel/mm/mempolicy/weighted_interleave/auto", "true\n") ||

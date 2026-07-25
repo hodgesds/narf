@@ -63,5 +63,6 @@ pub(crate) fn sys_set_mempolicy(ctx: &mut dyn TrapContext) {
         .lock()
         .get_or_insert_with(alloc::collections::BTreeMap::new)
         .insert(task, 0);
+    ensure_numa_balance_state(task);
     ctx.set_return(SyscallReturn::ok(0));
 }

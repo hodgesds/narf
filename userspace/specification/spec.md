@@ -85,6 +85,12 @@ reduces them to bounded integer ratios, and is controlled by the sibling
 Ordinary and weighted interleave sequence positions are task-owned, survive
 CPU migration, and are reclaimed with the task; CPU-local allocator state
 does not determine a process's placement cycle.
+`MPOL_F_NUMA_BALANCING` is accepted only with `MPOL_BIND` or
+`MPOL_PREFERRED_MANY`. A bounded periodic scan protects one eligible base page
+per task every 256 running timer ticks. Its next access restores the mapping
+and, when the accessing CPU's node is inside the effective policy/cpuset mask,
+migrates the private page there. Shared, locked, lazy, and policy-ineligible
+pages are not sampled; allocation failure restores the original mapping.
 `mbind(MPOL_MF_MOVE)` immediately conforms resident private pages in the
 range, `MPOL_MF_STRICT` reports remaining misplacement as `EIO`, and
 `MPOL_MF_MOVE_ALL` requires authority NARF does not grant ambiently.
