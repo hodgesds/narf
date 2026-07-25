@@ -98,8 +98,11 @@ pub async fn set_phy_config(cap: &Cap<WirelessIface, Config>, cfg: PhyCfg) -> Re
 The wireless subsystem registers the `nl80211` generic-netlink family through
 the `net/` family registry. Read-only `GET_WIPHY` and `GET_INTERFACE` point and
 dump requests enumerate the canonical wireless-interface registry and emit
-Linux `NEW_WIPHY` / `NEW_INTERFACE` records. The family advertises only these
-implemented operations plus the `config` and `scan` multicast groups.
+Linux `NEW_WIPHY` / `NEW_INTERFACE` records. Wiphy records carry a nested
+`SUPPORTED_COMMANDS` list, and `GET_PROTOCOL_FEATURES` returns a zero bitmap
+instead of claiming optional split-dump behavior NARF does not implement.
+The family advertises only these implemented operations plus the `config` and
+`scan` multicast groups.
 Scan, association, key, and PHY mutations remain capability-gated native
 operations and are not accepted through ambient Linux netlink authority.
 

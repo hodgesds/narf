@@ -10,6 +10,7 @@ pub const NL80211_CMD_GET_WIPHY: u8 = 1;
 pub const NL80211_CMD_NEW_WIPHY: u8 = 3;
 pub const NL80211_CMD_GET_INTERFACE: u8 = 5;
 pub const NL80211_CMD_NEW_INTERFACE: u8 = 7;
+pub const NL80211_CMD_GET_PROTOCOL_FEATURES: u8 = 95;
 
 const NL80211_ATTR_WIPHY: u16 = 1;
 const NL80211_ATTR_WIPHY_NAME: u16 = 2;
@@ -18,6 +19,8 @@ const NL80211_ATTR_IFNAME: u16 = 4;
 const NL80211_ATTR_IFTYPE: u16 = 5;
 const NL80211_ATTR_MAC: u16 = 6;
 const NL80211_ATTR_SUPPORTED_IFTYPES: u16 = 32;
+const NL80211_ATTR_SUPPORTED_COMMANDS: u16 = 50;
+const NL80211_ATTR_PROTOCOL_FEATURES: u16 = 173;
 const NLA_F_NESTED: u16 = 1 << 15;
 const NL80211_IFTYPE_STATION: u32 = 2;
 const NL80211_IFTYPE_AP: u32 = 3;
@@ -103,6 +106,26 @@ fn wiphy_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
         NL80211_ATTR_SUPPORTED_IFTYPES | NLA_F_NESTED,
         &modes,
     );
+    let mut commands = Vec::new();
+    for (index, command) in [
+        NL80211_CMD_GET_WIPHY,
+        NL80211_CMD_GET_INTERFACE,
+        NL80211_CMD_GET_PROTOCOL_FEATURES,
+    ]
+    .iter()
+    .enumerate()
+    {
+        push_attr(
+            &mut commands,
+            index as u16 + 1,
+            &(*command as u32).to_ne_bytes(),
+        );
+    }
+    push_attr(
+        &mut attrs,
+        NL80211_ATTR_SUPPORTED_COMMANDS | NLA_F_NESTED,
+        &commands,
+    );
     attrs
 }
 
@@ -144,6 +167,23 @@ fn handle(command: u8, attrs: &[u8], dump: bool) -> Result<Vec<GenlReply>, i32> 
                 attrs: interface_attrs(index as u32, &iface.get_wireless_info()),
             })
             .collect(),
+        NL80211_CMD_GET_PROTOCOL_FEATURES => {
+            if dump {
+                return Err(EOPNOTSUPP);
+            }
+            let mut attrs = Vec::new();
+            // No optional protocol features are claimed: in particular,
+            // replies are not split across multiple wiphy records.
+            push_attr(
+                &mut attrs,
+                NL80211_ATTR_PROTOCOL_FEATURES,
+                &0u32.to_ne_bytes(),
+            );
+            alloc::vec![GenlReply {
+                command: NL80211_CMD_GET_PROTOCOL_FEATURES,
+                attrs,
+            }]
+        }
         _ => return Err(EOPNOTSUPP),
     };
     if !dump && replies.is_empty() {
@@ -161,6 +201,10 @@ const OPERATIONS: &[GenlOperation] = &[
     GenlOperation {
         command: NL80211_CMD_GET_INTERFACE,
         flags: GENL_CMD_CAP_DO | GENL_CMD_CAP_DUMP,
+    },
+    GenlOperation {
+        command: NL80211_CMD_GET_PROTOCOL_FEATURES,
+        flags: GENL_CMD_CAP_DO,
     },
 ];
 const GROUPS: &[GenlMulticastGroup] = &[
@@ -213,6 +257,21 @@ mod tests {
             u16::from_ne_bytes(window.try_into().unwrap())
                 == NL80211_ATTR_SUPPORTED_IFTYPES | NLA_F_NESTED
         }));
+        assert!(find_attr(&attrs, NL80211_ATTR_SUPPORTED_COMMANDS).is_some());
+    }
+
+    #[test]
+    fn protocol_features_reports_no_unimplemented_flags() {
+        let replies = handle(NL80211_CMD_GET_PROTOCOL_FEATURES, &[], false).unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            find_attr(&replies[0].attrs, NL80211_ATTR_PROTOCOL_FEATURES),
+            Some(&0u32.to_ne_bytes()[..])
+        );
+        assert_eq!(
+            handle(NL80211_CMD_GET_PROTOCOL_FEATURES, &[], true).unwrap_err(),
+            EOPNOTSUPP
+        );
     }
 
     #[test]
