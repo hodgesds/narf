@@ -1643,6 +1643,40 @@ fn smoke_abi_netlink_route_msg_peek() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_msg_peek);
 
+fn smoke_abi_netlink_route_msg_trunc() -> TestResult {
+    with_setup(|| {
+        const MSG_TRUNC: u64 = 0x20;
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETLINK, 42);
+
+        if netlink_send(fd, &req).ok_or("first route send")? != req.len() as i64 {
+            return Err("first RTM_GETLINK send failed");
+        }
+        let mut short = [0xA5u8; 8];
+        let copied = netlink_recv_flags(fd, &mut short, MSG_DONTWAIT).ok_or("short normal recv")?;
+        if copied != short.len() as i64 {
+            return Err("short netlink recv did not return copied length");
+        }
+
+        if netlink_send(fd, &req).ok_or("second route send")? != req.len() as i64 {
+            return Err("second RTM_GETLINK send failed");
+        }
+        let full = netlink_inq(fd)?;
+        let mut truncated = [0x5Au8; 8];
+        let returned = netlink_recv_flags(fd, &mut truncated, MSG_DONTWAIT | MSG_TRUNC)
+            .ok_or("MSG_TRUNC recv")?;
+        if returned != full as i64 || returned <= truncated.len() as i64 {
+            return Err("MSG_TRUNC did not return the full netlink datagram length");
+        }
+        if truncated == [0x5A; 8] {
+            return Err("MSG_TRUNC did not copy the available prefix");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_msg_trunc);
+
 fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;

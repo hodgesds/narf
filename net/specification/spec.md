@@ -181,6 +181,9 @@ after successful handling, while malformed framing fails with `EINVAL`.
 generic-netlink datagram without consuming it.
 `MSG_PEEK` copies the next queued route or generic-netlink datagram without
 advancing the queue.
+When a receive buffer is short, only its capacity is copied. `MSG_TRUNC`
+returns the complete datagram length; `recvmsg` also sets its output
+`msg_flags` to `MSG_TRUNC`.
 
 ## 4. Invariants & safety properties
 

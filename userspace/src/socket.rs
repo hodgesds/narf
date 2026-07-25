@@ -165,6 +165,7 @@ pub const IP_MULTICAST_TTL: u32 = 33;
 /// to flip per-fd nonblock state on a SocketFile.
 pub const O_NONBLOCK: u32 = 0o4000;
 pub const MSG_PEEK: u32 = 0x02;
+pub const MSG_TRUNC: u32 = 0x20;
 
 // ── Address shape ───────────────────────────────────────────────
 
@@ -300,6 +301,13 @@ pub enum SocketOpResult {
     },
     Received {
         n: usize,
+        peer: Option<SockAddr>,
+    },
+    /// Datagram exceeded the caller's buffer. `copied` bytes were written;
+    /// `full_len` is returned only when the call requested `MSG_TRUNC`.
+    ReceivedTruncated {
+        copied: usize,
+        full_len: usize,
         peer: Option<SockAddr>,
     },
     /// Result of GetSockName / GetPeerName.
@@ -1538,9 +1546,17 @@ impl SocketFile {
                             family: AF_NETLINK,
                             body: alloc::vec![0u8; 10],
                         };
-                        SocketOpResult::Received {
-                            n,
-                            peer: Some(peer),
+                        if n < bytes.len() {
+                            SocketOpResult::ReceivedTruncated {
+                                copied: n,
+                                full_len: bytes.len(),
+                                peer: Some(peer),
+                            }
+                        } else {
+                            SocketOpResult::Received {
+                                n,
+                                peer: Some(peer),
+                            }
                         }
                     }
                     None => SocketOpResult::Err(SockError::WouldBlock),
@@ -1590,9 +1606,15 @@ impl SocketFile {
                     Some(message) => {
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
-                        SocketOpResult::Received {
-                            n,
-                            peer: Some(Self::netlink_sockaddr(0, 0)),
+                        let peer = Some(Self::netlink_sockaddr(0, 0));
+                        if n < message.len() {
+                            SocketOpResult::ReceivedTruncated {
+                                copied: n,
+                                full_len: message.len(),
+                                peer,
+                            }
+                        } else {
+                            SocketOpResult::Received { n, peer }
                         }
                     }
                     None => SocketOpResult::Err(SockError::WouldBlock),
