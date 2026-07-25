@@ -33,9 +33,9 @@ over that authority; it is not a second PMU subsystem.
 | `perf stat -e cycles <cmd>` | counting event, enable-on-exec, target-exit stop, 24-byte read format | supported slice | The count window is bounded by successful exec and process exit; accounting within that window is system-global because exact target-task attribution is deferred. |
 | `perf stat -e cycles,instructions <cmd>` | independent fds, scaling times | supported slice | Hardware availability still bounds simultaneous events. |
 | `perf stat -e '{cycles,instructions}'` | event groups and group leader reads | supported slice | Members are linked to the leader; group reads and group lifecycle ioctls cover the non-multiplexed counting case. |
-| `perf stat -a` | per-CPU events and online CPU discovery | partial | CPU validation exists; counters are not pinned or migrated per CPU. |
-| `perf stat -p PID` | task-scoped accounting | partial | PID validation exists; accounting is not scheduler-switched with the target. |
-| `perf record` | overflow sampling, mmap metadata/data ring, poll wakeups | unsupported | Counting fds expose owned `perf_event_mmap_page` + data-ring backing, and shared mapping owners survive fd close/fork/munmap. No sample admission, record producer, poll wakeup, or PMI path exists yet. |
+| `perf stat -a` | per-CPU events and online CPU discovery | partial | Exact hardware counting is admitted only for the calling CPU on a uniprocessor boot; SMP/remote-CPU operation returns `EOPNOTSUPP`. |
+| `perf stat -p PID` | task-scoped accounting | unsupported | Returns `EOPNOTSUPP`; counters are not yet scheduler-switched with the target. |
+| `perf record` | overflow sampling, mmap metadata/data ring, poll wakeups | partial (x86_64) | x86 GP counters route real LVT-PC overflow IRQs into SAMPLE/LOST ring records and poll wakeups. Process metadata records and aarch64 PMUv3 overflow routing remain. |
 | `perf report` | perf.data parser, symbols, unwind | userspace-only after record | Kernel work is primarily `/proc`, build-id, and mmap metadata fidelity. |
 | `perf trace` | tracepoint PMU, tracefs event metadata | unsupported | NARF tracing rings are not yet projected as Linux tracepoints. |
 | `perf top` | sampling plus periodic display | unsupported | Blocked by the same ring/PMI work as `perf record`. |
@@ -93,8 +93,8 @@ Gaps:
    `TEST_perf_cli.sh`.
 2. Extend the minimal perf sysfs projection with only event aliases backed by
    the detected PMU.
-3. Add sampling atop the existing mmap backing: acquire/release indices,
-   `PERF_RECORD_SAMPLE`/`LOST`, poll wakeups, and overflow interrupt routing.
+3. Complete sampling portability: wire aarch64 PMUv3 overflow through GICv3
+   and add hardware/QEMU coverage for the x86 LVT-PC route.
 4. Add process metadata records (`COMM`, `MMAP2`, `FORK`, `EXIT`) and unwind
    prerequisites for `perf record/report`.
 5. Project selected NARF tracing events into tracepoint IDs and tracefs for

@@ -467,6 +467,20 @@ pub struct PmuCounter {
 /// Per-slot in-use bitmap (bit N = counter N is allocated).
 /// Supports up to 8 GP counters; extend the type for more.
 static COUNTER_ALLOC_MASK: AtomicU8 = AtomicU8::new(0);
+static SAMPLE_ARMED_MASK: AtomicU8 = AtomicU8::new(0);
+static SAMPLE_PERIODS: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+
+fn sample_preload(width: u8, period: u64) -> Result<u64, PmuError> {
+    if period == 0 || width == 0 || width >= 64 {
+        return Err(PmuError::UnsupportedEvent);
+    }
+    let modulus = 1u64 << width;
+    if period >= modulus {
+        return Err(PmuError::UnsupportedEvent);
+    }
+    Ok(modulus - period)
+}
 
 /// Allocate the next free counter slot and program it with `event`.
 ///
@@ -518,11 +532,113 @@ pub unsafe fn read(counter: &PmuCounter) -> u64 {
     }
 }
 
+/// Arm a live counter for interrupt-on-overflow sampling.
+///
+/// The counter is preloaded to `2^width - period` and its event-select
+/// APIC-interrupt bit is enabled. The caller must route LVT-PC before enabling
+/// the event.
+///
+/// # Safety
+/// CPL=0 and `counter` is a live allocation on the current CPU.
+pub unsafe fn arm_sampling(counter: &PmuCounter, period: u64) -> Result<(), PmuError> {
+    let backend = detect().ok_or(PmuError::NoPmu)?;
+    if backend.vendor != PmuVendor::Intel {
+        // AMD needs a vendor-specific overflow-status/ack path. Treating every
+        // armed slot as fired when LVT-PC runs would create false samples.
+        return Err(PmuError::UnsupportedEvent);
+    }
+    let preload = sample_preload(backend.counter_width, period)?;
+    let mut sel = event_to_evtsel(counter.event, counter.vendor)?;
+    sel.apic_int = true;
+    // SAFETY: caller owns this live slot on the current CPU.
+    unsafe {
+        match counter.vendor {
+            PmuVendor::Intel => {
+                write_general(counter.idx, preload);
+            }
+            PmuVendor::Amd => {
+                let _ = wrmsr_or_gp(amd_ctr_msr(counter.idx), preload);
+            }
+        }
+        program_counter(counter.idx, sel, counter.vendor);
+    }
+    SAMPLE_PERIODS[counter.idx as usize].store(period, Ordering::Release);
+    SAMPLE_ARMED_MASK.fetch_or(1 << counter.idx, Ordering::AcqRel);
+    Ok(())
+}
+
+/// Acknowledge and re-arm counters that caused the current PMI.
+///
+/// Returns a bitmask of sampled GP-counter slots. Only Intel is admitted until
+/// the AMD vendor-specific overflow-status and acknowledgement path exists.
+///
+/// # Safety
+/// CPL=0, called from the current CPU's LVT-PC interrupt handler.
+pub unsafe fn handle_sampling_overflow() -> u8 {
+    let Some(backend) = detect() else {
+        return 0;
+    };
+    let armed = SAMPLE_ARMED_MASK.load(Ordering::Acquire);
+    let fired = match backend.vendor {
+        PmuVendor::Intel => {
+            // SAFETY: architectural perfmon status MSR exists for this backend.
+            (unsafe { rdmsr(MSR_IA32_PERF_GLOBAL_STATUS) } as u8) & armed
+        }
+        PmuVendor::Amd => return 0,
+    };
+    if fired == 0 {
+        return 0;
+    }
+    let modulus = 1u64 << backend.counter_width;
+    for idx in 0..backend.n_counters.min(8) {
+        if fired & (1 << idx) == 0 {
+            continue;
+        }
+        let period = SAMPLE_PERIODS[idx as usize].load(Ordering::Acquire);
+        if period == 0 || period >= modulus {
+            continue;
+        }
+        match backend.vendor {
+            // SAFETY: idx is an armed live GP slot on this CPU.
+            PmuVendor::Intel => unsafe { write_general(idx, modulus - period) },
+            PmuVendor::Amd => {
+                let _ = wrmsr_or_gp(amd_ctr_msr(idx), modulus - period);
+            }
+        }
+    }
+    if backend.vendor == PmuVendor::Intel {
+        // SAFETY: clear exactly the GP overflow flags handled above.
+        unsafe { clear_overflow(fired as u32, 0) };
+    }
+    fired
+}
+
+/// Remove a counter from the PMI re-arm set before releasing it.
+pub fn disarm_sampling(counter: &PmuCounter) {
+    SAMPLE_ARMED_MASK.fetch_and(!(1 << counter.idx), Ordering::AcqRel);
+    SAMPLE_PERIODS[counter.idx as usize].store(0, Ordering::Release);
+}
+
+/// Disable interrupt generation for a sampled counter while retaining the
+/// allocation and normal counting configuration.
+///
+/// # Safety
+/// CPL=0 and `counter` is a live allocation on the current CPU.
+pub unsafe fn pause_sampling(counter: &PmuCounter) -> Result<(), PmuError> {
+    disarm_sampling(counter);
+    let mut sel = event_to_evtsel(counter.event, counter.vendor)?;
+    sel.apic_int = false;
+    // SAFETY: caller owns this live slot.
+    unsafe { program_counter(counter.idx, sel, counter.vendor) };
+    Ok(())
+}
+
 /// Disable and free a counter slot so it can be re-allocated.
 ///
 /// # Safety
 /// CPL = 0; `counter` must be a value from `alloc_counter`.
 pub unsafe fn release(counter: PmuCounter) {
+    disarm_sampling(&counter);
     // Write 0 to the event-select MSR to disable the counter.
     // wrmsr_or_gp is safe (probe-armed); no inner unsafe block needed.
     match counter.vendor {
@@ -564,11 +680,7 @@ fn event_to_evtsel(event: PmuEvent, vendor: PmuVendor) -> Result<PerfEvtSel, Pmu
             PerfEvtSel::os_usr_raw(0xC3, 0x00, true, true)
         }
         (PmuEvent::CacheMisses, PmuVendor::Amd) => amd_event::l1d_cache_misses(true, true),
-        (PmuEvent::LlcMisses, PmuVendor::Amd) => {
-            // AMD: LLC misses — use l2 miss (event 0x064, umask 0x08 for
-            // modified-miss on F17h per AMD Fam17h PPR §2.1.13).
-            PerfEvtSel::os_usr_raw(0x64, 0x08, true, true)
-        }
+        (PmuEvent::LlcMisses, PmuVendor::Amd) => return Err(PmuError::UnsupportedEvent),
         // Raw event: the caller supplies the pre-encoded value directly.
         (PmuEvent::Raw(v), _) => {
             return Ok(PerfEvtSel {
@@ -691,6 +803,18 @@ pub unsafe fn clear_overflow(general_mask: u32, fixed_mask: u8) {
 pub mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_pmu_sampling_preload_bounds() -> TestResult {
+        if sample_preload(48, 1000) != Ok((1u64 << 48) - 1000)
+            || sample_preload(48, 0) != Err(PmuError::UnsupportedEvent)
+            || sample_preload(48, 1u64 << 48) != Err(PmuError::UnsupportedEvent)
+            || sample_preload(64, 1) != Err(PmuError::UnsupportedEvent)
+        {
+            return TestResult::Fail("PMU sampling preload validation");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("arch/pmu", smoke_pmu_sampling_preload_bounds);
 
     // ── Test 1: Intel CPUID 0x0A decode ───────────────────────────
     //

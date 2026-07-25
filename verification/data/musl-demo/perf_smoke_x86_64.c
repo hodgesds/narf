@@ -5,6 +5,7 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <string.h>
+#include <errno.h>
 
 #define PERF_TYPE_HARDWARE 0
 #define PERF_COUNT_HW_CPU_CYCLES 0
@@ -61,7 +62,7 @@ int main() {
                        PERF_FORMAT_ID;
     attr.flags = 1; // disabled
 
-    long fd = perf_event_open(&attr, 0, -1, -1, 0);
+    long fd = perf_event_open(&attr, -1, 0, -1, 0);
     if (fd < 0) {
         printf("perf_smoke: ERROR - perf_event_open failed with %ld\n", fd);
         return 1;
@@ -105,19 +106,19 @@ int main() {
     printf("perf_smoke: cycles delta %llu\n", (unsigned long long)stat[0]);
     close(fd);
 
-    // Exercise a real two-member software event group.
+    // Exercise the event-group ABI with the exactly specified dummy event.
     struct perf_event_attr group_attr;
     memset(&group_attr, 0, sizeof(group_attr));
     group_attr.type = 1; // PERF_TYPE_SOFTWARE
     group_attr.size = sizeof(group_attr);
-    group_attr.config = 0; // PERF_COUNT_SW_CPU_CLOCK
+    group_attr.config = 9; // PERF_COUNT_SW_DUMMY
     group_attr.read_format = PERF_FORMAT_GROUP |
                              PERF_FORMAT_TOTAL_TIME_ENABLED |
                              PERF_FORMAT_TOTAL_TIME_RUNNING |
                              PERF_FORMAT_ID;
     group_attr.flags = 1; // disabled
     long group_fd = perf_event_open(&group_attr, 0, -1, -1, 0);
-    group_attr.config = 1; // PERF_COUNT_SW_TASK_CLOCK
+    group_attr.config = 9; // PERF_COUNT_SW_DUMMY
     long member_fd = perf_event_open(&group_attr, 0, -1, group_fd, 0);
     if (group_fd < 0 || member_fd < 0 ||
         ioctl(group_fd, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP) != 0 ||
@@ -133,7 +134,8 @@ int main() {
     uint64_t group_stat[7] = {0};
     if (read(group_fd, group_stat, sizeof(group_stat)) != sizeof(group_stat) ||
         group_stat[0] != 2 || group_stat[4] == 0 || group_stat[6] == 0 ||
-        group_stat[4] == group_stat[6]) {
+        group_stat[4] == group_stat[6] || group_stat[3] != 0 ||
+        group_stat[5] != 0) {
         printf("perf_smoke: ERROR - invalid group record\n");
         return 1;
     }
@@ -176,54 +178,27 @@ int main() {
     }
     uint64_t exec_after[4] = {0};
     if (read(exec_fd, exec_after, sizeof(exec_after)) != sizeof(exec_after) ||
-        exec_after[0] == 0 || exec_after[1] == 0) {
+        exec_after[0] != 0 || exec_after[1] == 0) {
         printf("perf_smoke: ERROR - enable_on_exec did not start\n");
         return 1;
     }
     close(exec_pipe[1]);
     close(exec_fd);
 
-    // Test custom software syscall counter
+    // Unsupported software events must fail instead of returning global,
+    // non-target-attributed approximations.
     struct perf_event_attr sw_attr;
     memset(&sw_attr, 0, sizeof(sw_attr));
     sw_attr.type = 1; // PERF_TYPE_SOFTWARE
     sw_attr.size = sizeof(sw_attr);
-    sw_attr.config = 12; // PERF_COUNT_SW_SYSCALLS (custom)
+    sw_attr.config = 12;
 
     long fd_sw = perf_event_open(&sw_attr, 0, -1, -1, 0);
-    if (fd_sw < 0) {
-        printf("perf_smoke: ERROR - perf_event_open (software) failed with %ld\n", fd_sw);
+    if (fd_sw != -1 || errno != EOPNOTSUPP) {
+        printf("perf_smoke: ERROR - unsupported software event was admitted\n");
         return 1;
     }
 
-    uint64_t s1;
-    if (read(fd_sw, &s1, sizeof(s1)) < 8) {
-        printf("perf_smoke: ERROR - software read failed\n");
-        close(fd_sw);
-        return 1;
-    }
-
-    // Trigger exactly 5 syscalls
-    for (int i = 0; i < 5; i++) {
-        getppid();
-    }
-
-    uint64_t s2;
-    if (read(fd_sw, &s2, sizeof(s2)) < 8) {
-        printf("perf_smoke: ERROR - software read failed\n");
-        close(fd_sw);
-        return 1;
-    }
-
-    if (s2 <= s1) {
-        printf("perf_smoke: ERROR - syscall counter did not increment: %llu -> %llu\n",
-               (unsigned long long)s1, (unsigned long long)s2);
-        close(fd_sw);
-        return 1;
-    }
-
-    printf("perf_smoke: OK - syscalls delta %llu\n", (unsigned long long)(s2 - s1));
     printf("perf_smoke: OK\n");
-    close(fd_sw);
     return 0;
 }

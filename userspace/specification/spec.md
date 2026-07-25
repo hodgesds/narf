@@ -162,17 +162,37 @@ observer stops task-targeted leader groups before the monitoring process reads
 their terminal values. This is a compatibility adapter over `observability/`
 PMU authority, not an independent counter subsystem.
 
-A shared mapping of a counting fd exposes one Linux-shaped
+A shared mapping of a perf fd exposes one Linux-shaped
 `perf_event_mmap_page` metadata page followed by a power-of-two data area.
 The metadata seqlock publishes the count and enabled/running times; `index`
 remains zero because direct userspace PMU reads are unavailable. The file
 owns all mapped frames, whose lifetime is retained by §3.2 even after fd
-close. No records are emitted into the data area yet.
+close.
 
-Sampling admission, scheduler-attribution, cgroup, filter, probe, and BPF
-features fail explicitly. The adapter must not synthesize plausible values
-for an unavailable hardware event. The audited command matrix and remaining
-gaps live in `observability/PERF_LINUX_COMPAT_AUDIT.md`.
+On x86_64, sampled hardware events arm the owned GP counter for
+interrupt-on-overflow and route LVT-PC through the normal IRQ dispatcher. The
+hard-IRQ handler acknowledges/reloads the counter and captures task, IP, time,
+and counter identity into a fixed per-CPU slot without allocation. Normal
+syscall context drains those slots into `PERF_RECORD_SAMPLE`/`LOST` records,
+advances `data_head` with release ordering, and wakes poll/epoll readers.
+Unsupported sample layouts and platforms without a routed PMU overflow IRQ
+fail explicitly; aarch64 sampling remains `EOPNOTSUPP` until PMUv3 overflow
+is wired through GICv3.
+
+Scheduler-attribution, cgroup, filter, probe, and BPF features fail explicitly.
+The adapter must not synthesize plausible values for an unavailable hardware
+event. The audited command matrix and remaining gaps live in
+`observability/PERF_LINUX_COMPAT_AUDIT.md`.
+
+Linux perf wire definitions are owned by the separate
+`narf-linux-perf-uapi` crate, transcribed through `PERF_ATTR_SIZE_VER9` from
+Linux `include/uapi/linux/perf_event.h`. Defining a UAPI value does not admit
+it: userspace accepts only implemented attribute bits and exact event
+backends. Software events are currently limited to `PERF_COUNT_SW_DUMMY`.
+Hardware events require x86_64, a real programmable PMU, and a uniprocessor
+per-CPU target matching the calling CPU; task-scoped and SMP hardware events
+return `EOPNOTSUPP` until scheduler context switching and remote-CPU PMU
+operations exist.
 
 ### 3.2 Shared file-mapping lifetime
 

@@ -623,7 +623,7 @@ extern "C" fn irq_dispatch_body(frame: *mut TrapFrame) {
     // SAFETY: `frame` is the live trap frame on the entry stack (shim contract).
     let frame = unsafe { &mut *frame };
     narf_lib::context::enter_trap_handler();
-    narf_interrupts::on_irq(frame.vector as u8);
+    narf_interrupts::on_irq_with_context(frame.vector as u8, frame.rip);
     // SAFETY: APIC is initialised before interrupts are enabled.
     unsafe {
         narf_interrupts::eoi();

@@ -4,25 +4,57 @@ use crate::syscall::{SyscallReturn, TrapContext};
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_linux_perf_uapi::{
+    PerfEventAttr, PERF_ATTR_FLAG_DISABLED, PERF_ATTR_FLAG_ENABLE_ON_EXEC, PERF_ATTR_SIZE_VER0,
+    PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_LL,
+    PERF_COUNT_HW_CACHE_MISSES, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_MISS,
+    PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_DUMMY, PERF_FORMAT_GROUP,
+    PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
+    PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_LOST, PERF_RECORD_SAMPLE, PERF_SAMPLE_CPU,
+    PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD,
+    PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, PERF_TYPE_HARDWARE,
+    PERF_TYPE_HW_CACHE, PERF_TYPE_RAW, PERF_TYPE_SOFTWARE,
+};
 
 static ACTIVE_PERF_EVENTS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 static PERF_EVENT_REGISTRY: IrqSafeSpinLock<Vec<Weak<PerfEventFile>>> =
     IrqSafeSpinLock::new(Vec::new());
+#[cfg(target_arch = "x86_64")]
+static PMI_VECTOR: IrqSafeSpinLock<Option<u8>> = IrqSafeSpinLock::new(None);
+const SAMPLE_CPU_SLOTS: usize = narf_lib::percpu::MAX_CPUS;
+static PENDING_SAMPLES: [PendingSample; SAMPLE_CPU_SLOTS] =
+    [const { PendingSample::new() }; SAMPLE_CPU_SLOTS];
+static PENDING_SAMPLE_LOST: AtomicU64 = AtomicU64::new(0);
 
-pub const PERF_ATTR_SIZE_VER0: u32 = 64;
-const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
-const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
-const PERF_FORMAT_ID: u64 = 1 << 2;
-const PERF_FORMAT_GROUP: u64 = 1 << 3;
-const PERF_FORMAT_LOST: u64 = 1 << 4;
+struct PendingSample {
+    state: AtomicU8,
+    task: AtomicU64,
+    ip: AtomicU64,
+    time: AtomicU64,
+    #[cfg(target_arch = "x86_64")]
+    counters: AtomicU8,
+}
+
+impl PendingSample {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            task: AtomicU64::new(0),
+            ip: AtomicU64::new(0),
+            time: AtomicU64::new(0),
+            #[cfg(target_arch = "x86_64")]
+            counters: AtomicU8::new(0),
+        }
+    }
+}
+
 const PERF_FORMAT_SUPPORTED: u64 = (1 << 5) - 1;
 
-const PERF_ATTR_DISABLED: u64 = 1 << 0;
-const PERF_ATTR_ENABLE_ON_EXEC: u64 = 1 << 12;
+const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED | PERF_ATTR_FLAG_ENABLE_ON_EXEC;
 
 const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
@@ -35,38 +67,21 @@ const PERF_MMAP_LOCK_OFFSET: usize = 8;
 const PERF_MMAP_OFFSET_OFFSET: usize = 16;
 const PERF_MMAP_TIME_ENABLED_OFFSET: usize = 24;
 const PERF_MMAP_TIME_RUNNING_OFFSET: usize = 32;
+const PERF_MMAP_DATA_HEAD_OFFSET: usize = 1024;
+const PERF_MMAP_DATA_TAIL_OFFSET: usize = 1032;
 const PERF_MMAP_DATA_OFFSET_OFFSET: usize = 1040;
 const PERF_MMAP_DATA_SIZE_OFFSET: usize = 1048;
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct perf_event_attr {
-    pub type_: u32,
-    pub size: u32,
-    pub config: u64,
-    pub sample_period_or_freq: u64,
-    pub sample_type: u64,
-    pub read_format: u64,
-    pub flags: u64,
-    pub wakeup_events_or_watermark: u32,
-    pub bp_type: u32,
-    pub bp_addr_or_config1: u64,
-    pub bp_len_or_config2: u64,
-    pub branch_sample_type: u64,
-    pub sample_regs_user: u64,
-    pub sample_stack_user: u32,
-    pub clockid: i32,
-    pub sample_regs_intr: u64,
-    pub aux_watermark: u32,
-    pub sample_max_stack: u16,
-    pub __reserved_2: u16,
-    pub aux_sample_size: u32,
-    pub __reserved_3: u32,
-    pub sig_data: u64,
-}
+const PERF_SAMPLE_SUPPORTED: u64 = PERF_SAMPLE_IP
+    | PERF_SAMPLE_TID
+    | PERF_SAMPLE_TIME
+    | PERF_SAMPLE_ID
+    | PERF_SAMPLE_CPU
+    | PERF_SAMPLE_PERIOD
+    | PERF_SAMPLE_STREAM_ID
+    | PERF_SAMPLE_IDENTIFIER;
 
 struct PerfEventFile {
-    attr: perf_event_attr,
+    attr: PerfEventAttr,
     id: u64,
     target_task: u64,
     target_pid: u64,
@@ -77,6 +92,9 @@ struct PerfEventFile {
     enabled_at_ns: AtomicU64,
     time_enabled_ns: AtomicU64,
     registered: AtomicBool,
+    sample_lost: AtomicU64,
+    #[cfg(target_arch = "x86_64")]
+    sample_period: u64,
     mmap_seq: AtomicU32,
     mmap: IrqSafeSpinLock<Option<PerfMmap>>,
     group_members: IrqSafeSpinLock<Vec<Weak<dyn FileOps>>>,
@@ -161,6 +179,40 @@ impl PerfMmap {
             .map(|frame| frame.start_address().raw())
             .collect()
     }
+
+    fn read_u64_acquire(&self, offset: usize) -> u64 {
+        // SAFETY: Linux perf metadata indices are naturally aligned u64
+        // locations shared atomically between kernel and userspace.
+        let atomic = unsafe {
+            &*((self.frames[0].start_address().raw() as usize + offset) as *const AtomicU64)
+        };
+        atomic.load(Ordering::Acquire)
+    }
+
+    fn write_u64_release(&self, offset: usize, value: u64) {
+        // SAFETY: same shared-index contract as read_u64_acquire.
+        let atomic = unsafe {
+            &*((self.frames[0].start_address().raw() as usize + offset) as *const AtomicU64)
+        };
+        atomic.store(value, Ordering::Release);
+    }
+
+    fn write_ring(&self, head: u64, bytes: &[u8]) {
+        let data_len = self.len - PERF_MMAP_PAGE_BYTES;
+        for (i, byte) in bytes.iter().copied().enumerate() {
+            let ring_offset = (head as usize + i) & (data_len - 1);
+            let page = 1 + ring_offset / PERF_MMAP_PAGE_BYTES;
+            let in_page = ring_offset % PERF_MMAP_PAGE_BYTES;
+            // SAFETY: page and in_page are bounded by the allocated data
+            // frames; the mapping lock gives this writer exclusive access.
+            unsafe {
+                core::ptr::write_volatile(
+                    (self.frames[page].start_address().raw() as usize + in_page) as *mut u8,
+                    byte,
+                );
+            }
+        }
+    }
 }
 
 impl Drop for PerfMmap {
@@ -192,37 +244,40 @@ impl PerfEventFile {
             return unsafe { narf_arch::x86_64::pmu::read(&counter) };
         }
 
-        match self.attr.type_ {
-            // PERF_TYPE_HARDWARE. Only values backed by a real counter reach this
-            // fallback on non-x86 targets; cycles/ref-cycles remain useful there.
-            0 => match self.attr.config {
-                0 | 9 => narf_time::now_cycles(),
-                _ => 0,
-            },
-            // PERF_TYPE_SOFTWARE
-            1 => match self.attr.config {
-                0 | 1 => narf_time::monotonic_ns(),
-                2 | 5 => narf_lib::perf::snapshot().page_faults,
-                3 => narf_lib::perf::snapshot().ctx,
-                9 => 0,
-                12 => narf_lib::perf::snapshot().syscalls,
-                _ => 0,
-            },
-            _ => 0,
-        }
+        // PERF_COUNT_SW_DUMMY is the only software event admitted until
+        // scheduler-owned, per-target software accounting exists. Its specified
+        // count is exactly zero.
+        0
     }
 
     fn enable(&self) {
         if !self.enabled.swap(true, Ordering::AcqRel) {
-            self.count_base.store(self.raw_count(), Ordering::Release);
-            self.enabled_at_ns
-                .store(narf_time::monotonic_ns(), Ordering::Release);
+            let raw = self.raw_count();
+            let now = narf_time::monotonic_ns();
+            self.count_base.store(raw, Ordering::Release);
+            self.enabled_at_ns.store(now, Ordering::Release);
+            #[cfg(target_arch = "x86_64")]
+            if self.sample_period != 0 {
+                if let Some(counter) = &self.pmu_counter {
+                    // SAFETY: this file owns the live counter.
+                    let _ = unsafe {
+                        narf_arch::x86_64::pmu::arm_sampling(counter, self.sample_period)
+                    };
+                }
+            }
         }
         self.publish_mmap_state();
     }
 
     fn disable(&self) {
         if self.enabled.swap(false, Ordering::AcqRel) {
+            #[cfg(target_arch = "x86_64")]
+            if self.sample_period != 0 {
+                if let Some(counter) = &self.pmu_counter {
+                    // SAFETY: this file owns the live counter.
+                    let _ = unsafe { narf_arch::x86_64::pmu::pause_sampling(counter) };
+                }
+            }
             let raw = self.raw_count();
             let base = self.count_base.load(Ordering::Acquire);
             self.count_accumulated
@@ -280,6 +335,88 @@ impl PerfEventFile {
         mapping.write_u32(PERF_MMAP_LOCK_OFFSET, sequence.wrapping_add(2));
     }
 
+    fn push_record(&self, record: &[u8]) -> bool {
+        let mapping = self.mmap.lock();
+        let Some(mapping) = mapping.as_ref() else {
+            return false;
+        };
+        let data_size = (mapping.len - PERF_MMAP_PAGE_BYTES) as u64;
+        let head = mapping.read_u64_acquire(PERF_MMAP_DATA_HEAD_OFFSET);
+        let tail = mapping.read_u64_acquire(PERF_MMAP_DATA_TAIL_OFFSET);
+        if head.wrapping_sub(tail) > data_size
+            || record.len() as u64 > data_size.saturating_sub(head.wrapping_sub(tail))
+        {
+            self.sample_lost.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        mapping.write_ring(head, record);
+        mapping.write_u64_release(
+            PERF_MMAP_DATA_HEAD_OFFSET,
+            head.wrapping_add(record.len() as u64),
+        );
+        true
+    }
+
+    fn sample_record(&self, ip: u64, pid: u32, tid: u32, now: u64) -> bool {
+        let sample_type = self.attr.sample_type;
+        let mut payload = Vec::with_capacity(80);
+        let push_u32 = |payload: &mut Vec<u8>, value: u32| {
+            payload.extend_from_slice(&value.to_ne_bytes());
+        };
+        let push_u64 = |payload: &mut Vec<u8>, value: u64| {
+            payload.extend_from_slice(&value.to_ne_bytes());
+        };
+        if sample_type & PERF_SAMPLE_IDENTIFIER != 0 {
+            push_u64(&mut payload, self.id);
+        }
+        if sample_type & PERF_SAMPLE_IP != 0 {
+            push_u64(&mut payload, ip);
+        }
+        if sample_type & PERF_SAMPLE_TID != 0 {
+            push_u32(&mut payload, pid);
+            push_u32(&mut payload, tid);
+        }
+        if sample_type & PERF_SAMPLE_TIME != 0 {
+            push_u64(&mut payload, now);
+        }
+        if sample_type & PERF_SAMPLE_ID != 0 {
+            push_u64(&mut payload, self.id);
+        }
+        if sample_type & PERF_SAMPLE_STREAM_ID != 0 {
+            push_u64(&mut payload, self.id);
+        }
+        if sample_type & PERF_SAMPLE_CPU != 0 {
+            push_u32(&mut payload, narf_lib::percpu::current_cpu() as u32);
+            push_u32(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_PERIOD != 0 {
+            push_u64(&mut payload, self.attr.sample_period_or_freq);
+        }
+        let lost = self.sample_lost.swap(0, Ordering::AcqRel);
+        if lost != 0 {
+            let mut record = Vec::with_capacity(24);
+            push_u32(&mut record, PERF_RECORD_LOST);
+            record.extend_from_slice(&0u16.to_ne_bytes());
+            record.extend_from_slice(&24u16.to_ne_bytes());
+            push_u64(&mut record, self.id);
+            push_u64(&mut record, lost);
+            if !self.push_record(&record) {
+                self.sample_lost.fetch_add(lost, Ordering::Relaxed);
+            }
+        }
+
+        let size = 8usize.saturating_add(payload.len());
+        let Ok(size) = u16::try_from(size) else {
+            return false;
+        };
+        let mut record = Vec::with_capacity(size as usize);
+        push_u32(&mut record, PERF_RECORD_SAMPLE);
+        record.extend_from_slice(&0u16.to_ne_bytes());
+        record.extend_from_slice(&size.to_ne_bytes());
+        record.extend_from_slice(&payload);
+        self.push_record(&record)
+    }
+
     fn member_files(&self) -> Vec<Arc<dyn FileOps>> {
         self.group_members
             .lock()
@@ -330,7 +467,7 @@ pub(crate) fn on_exec(task: u64) {
             return false;
         };
         if event.target_task == task
-            && event.attr.flags & PERF_ATTR_ENABLE_ON_EXEC != 0
+            && event.attr.flags & PERF_ATTR_FLAG_ENABLE_ON_EXEC != 0
             && event._group_leader.is_none()
         {
             let _ = event.for_group(PERF_IOC_FLAG_GROUP, PerfEventFile::enable);
@@ -351,6 +488,121 @@ pub(crate) fn on_process_exit(pid: u64, _tid: u64) {
         }
         true
     });
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
+    // SAFETY: this handler is installed only on LVT-PC and runs at CPL0.
+    let counters = unsafe { narf_arch::x86_64::pmu::handle_sampling_overflow() };
+    if counters == 0 {
+        return narf_interrupts::IrqStatus::None;
+    }
+    let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
+    let pending = &PENDING_SAMPLES[cpu];
+    if pending
+        .state
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        PENDING_SAMPLE_LOST.fetch_add(1, Ordering::Relaxed);
+        return narf_interrupts::IrqStatus::Handled;
+    }
+    pending
+        .task
+        .store(crate::handlers::current_task_id(), Ordering::Relaxed);
+    pending
+        .ip
+        .store(narf_interrupts::interrupted_ip(), Ordering::Relaxed);
+    pending
+        .time
+        .store(narf_time::monotonic_ns(), Ordering::Relaxed);
+    pending.counters.store(counters, Ordering::Relaxed);
+    pending.state.store(2, Ordering::Release);
+    // Wake a parked poll/epoll task so its syscall re-enters normal context
+    // and drains this allocation-free IRQ snapshot into the mmap ring.
+    narf_net::readiness::notify(0);
+    narf_interrupts::IrqStatus::Handled
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ensure_pmi_route() -> Result<(), ()> {
+    let mut slot = PMI_VECTOR.lock();
+    if slot.is_some() {
+        return Ok(());
+    }
+    let vector = narf_interrupts::vector::alloc().map_err(|_| ())?;
+    narf_interrupts::install_handler_named(vector, "perf-pmi", 0, pmi_handler);
+    // SAFETY: APIC bring-up precedes userspace and this programs only the
+    // current CPU's LVT-PC entry.
+    unsafe { narf_arch::x86_64::pmi::program_current_lvt_pc(vector, false) };
+    *slot = Some(vector);
+    Ok(())
+}
+
+/// Drain allocation-free PMI snapshots into userspace mmap rings from normal
+/// syscall context. The IRQ handler captures IP/task/time and rearms hardware;
+/// record encoding and readiness wakeups happen here where allocation is safe.
+pub(crate) fn drain_irq_samples() {
+    let mut notify = false;
+    let deferred_lost = PENDING_SAMPLE_LOST.swap(0, Ordering::AcqRel);
+    for pending in &PENDING_SAMPLES {
+        if pending
+            .state
+            .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            continue;
+        }
+        let task = pending.task.load(Ordering::Relaxed);
+        let ip = pending.ip.load(Ordering::Relaxed);
+        let now = pending.time.load(Ordering::Relaxed);
+        #[cfg(target_arch = "x86_64")]
+        let counters = pending.counters.load(Ordering::Relaxed);
+        {
+            let registry = PERF_EVENT_REGISTRY.lock();
+            for weak in registry.iter() {
+                let Some(event) = weak.upgrade() else {
+                    continue;
+                };
+                #[cfg(target_arch = "x86_64")]
+                let matches_counter = event
+                    .pmu_counter
+                    .is_some_and(|counter| counters & (1 << counter.idx) != 0);
+                #[cfg(not(target_arch = "x86_64"))]
+                let matches_counter = false;
+                if matches_counter
+                    && event.enabled.load(Ordering::Acquire)
+                    && event.target_task == task
+                {
+                    if deferred_lost != 0 {
+                        event
+                            .sample_lost
+                            .fetch_add(deferred_lost, Ordering::Relaxed);
+                    }
+                    let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
+                    notify |= event.sample_record(ip, pid, task as u32, now);
+                }
+            }
+        }
+        pending.state.store(0, Ordering::Release);
+    }
+    if notify {
+        narf_net::readiness::notify(0);
+    }
+}
+
+pub(crate) fn sample_from_irq_for_test(task: u64, ip: u64) {
+    let now = narf_time::monotonic_ns();
+    let registry = PERF_EVENT_REGISTRY.lock();
+    for weak in registry.iter() {
+        let Some(event) = weak.upgrade() else {
+            continue;
+        };
+        if event.enabled.load(Ordering::Acquire) && event.target_task == task {
+            let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
+            let _ = event.sample_record(ip, pid, task as u32, now);
+        }
+    }
 }
 
 impl Drop for PerfEventFile {
@@ -490,6 +742,24 @@ impl FileOps for PerfEventFile {
         Ok(frames)
     }
 
+    fn poll_readiness(&self) -> u32 {
+        let mapping = self.mmap.lock();
+        let Some(mapping) = mapping.as_ref() else {
+            return 0;
+        };
+        if mapping.read_u64_acquire(PERF_MMAP_DATA_HEAD_OFFSET)
+            != mapping.read_u64_acquire(PERF_MMAP_DATA_TAIL_OFFSET)
+        {
+            narf_filesystem::POLL_IN
+        } else {
+            0
+        }
+    }
+
+    fn readiness_notifies(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
@@ -520,7 +790,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    let mut attr = perf_event_attr::default();
+    let mut attr = PerfEventAttr::default();
 
     // We need to read the size first (u32 at offset 4).
     let mut size: u32 = 0;
@@ -547,21 +817,21 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     }
 
     // Read the attr structure
-    let to_read = core::cmp::min(size as usize, core::mem::size_of::<perf_event_attr>());
+    let to_read = core::cmp::min(size as usize, core::mem::size_of::<PerfEventAttr>());
 
-    // Since perf_event_attr has padding/not perfectly transparent, we read bytes
-    // SAFETY: `attr` is a live local `perf_event_attr`; we form a byte view spanning
+    // Since PerfEventAttr has padding/not perfectly transparent, we read bytes
+    // SAFETY: `attr` is a live local `PerfEventAttr`; we form a byte view spanning
     // exactly its `size_of` so the slice stays within the object. It is only used as
     // the destination of `copy_from_user` below, which writes at most `to_read` bytes.
     let attr_bytes = unsafe {
         core::slice::from_raw_parts_mut(
             &mut attr as *mut _ as *mut u8,
-            core::mem::size_of::<perf_event_attr>(),
+            core::mem::size_of::<PerfEventAttr>(),
         )
     };
 
     // SAFETY: `attr_bytes[..to_read]` is a sub-slice of the live `attr` byte view
-    // (`to_read <= size_of::<perf_event_attr>()`); `attr_ptr` is the non-null user
+    // (`to_read <= size_of::<PerfEventAttr>()`); `attr_ptr` is the non-null user
     // pointer. `copy_from_user` validates the user range and SMAP-brackets the read.
     if unsafe { copy_from_user(&mut attr_bytes[..to_read], attr_ptr) }.is_err() {
         ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
@@ -569,9 +839,9 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     }
 
     // If user passed a larger struct, the extra bytes must be zero
-    if size as usize > core::mem::size_of::<perf_event_attr>() {
+    if size as usize > core::mem::size_of::<PerfEventAttr>() {
         let mut extra_byte: u8 = 0;
-        for i in core::mem::size_of::<perf_event_attr>()..(size as usize) {
+        for i in core::mem::size_of::<PerfEventAttr>()..(size as usize) {
             let extra_slice = core::slice::from_mut(&mut extra_byte);
             // SAFETY: `extra_slice` is a 1-byte view of the live local `extra_byte`;
             // `attr_ptr + i` stays within the user-declared `size` window (i < size).
@@ -587,7 +857,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         }
     }
 
-    if attr.__reserved_2 != 0 || attr.__reserved_3 != 0 {
+    if attr.__reserved_2 != 0 || attr.__reserved_3 != 0 || attr.config3 != 0 || attr.config4 != 0 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
@@ -597,16 +867,24 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // Period/frequency sampling needs a perf mmap ring. Counting events may
-    // still set sample_type (current perf does so for identifiers), provided
-    // no sampling period/frequency was requested.
-    if attr.sample_period_or_freq != 0 {
+    // Every accepted attribute bit must have its Linux meaning. In particular,
+    // frequency mode needs a feedback controller and exclude/inherit/metadata
+    // bits need scheduler/process integration; ignoring them would fabricate
+    // compatibility.
+    if attr.flags & !PERF_ATTR_IMPLEMENTED != 0 {
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        return;
+    }
+
+    if attr.sample_period_or_freq != 0
+        && (attr.sample_type == 0 || attr.sample_type & !PERF_SAMPLE_SUPPORTED != 0)
+    {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
 
     if !is_supported_event(&attr) {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // ENOENT
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
 
@@ -639,6 +917,21 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
+    if pid == -1 && cpu == -1 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    if attr.type_ != PERF_TYPE_SOFTWARE
+        && (pid != -1
+            || cpu != narf_lib::percpu::current_cpu() as i32
+            || narf_lib::smp::online_count() != 1)
+    {
+        // Hardware counters are per-CPU. Until scheduler context switching
+        // and remote-CPU PMU calls exist, admitting a task event or an SMP
+        // event would count unrelated execution or access another CPU's MSRs.
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        return;
+    }
 
     let group_leader = if group_fd != -1 {
         let leader =
@@ -668,28 +961,34 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let pmu_counter = {
         let event_opt = match attr.type_ {
             // PERF_TYPE_HARDWARE
-            0 => match attr.config {
-                0 => Some(narf_arch::x86_64::pmu::PmuEvent::Cycles),
-                1 => Some(narf_arch::x86_64::pmu::PmuEvent::Instructions),
-                2 => Some(narf_arch::x86_64::pmu::PmuEvent::CacheMisses), // PERF_COUNT_HW_CACHE_REFERENCES (Intel uses LLC ref)
-                3 => Some(narf_arch::x86_64::pmu::PmuEvent::CacheMisses), // PERF_COUNT_HW_CACHE_MISSES
-                4 => Some(narf_arch::x86_64::pmu::PmuEvent::BranchInstructions),
-                5 => Some(narf_arch::x86_64::pmu::PmuEvent::BranchMisses),
-                9 => Some(narf_arch::x86_64::pmu::PmuEvent::Cycles), // PERF_COUNT_HW_REF_CPU_CYCLES
+            PERF_TYPE_HARDWARE => match attr.config {
+                PERF_COUNT_HW_CPU_CYCLES => Some(narf_arch::x86_64::pmu::PmuEvent::Cycles),
+                PERF_COUNT_HW_INSTRUCTIONS => Some(narf_arch::x86_64::pmu::PmuEvent::Instructions),
+                PERF_COUNT_HW_CACHE_MISSES => Some(narf_arch::x86_64::pmu::PmuEvent::LlcMisses),
+                PERF_COUNT_HW_BRANCH_INSTRUCTIONS => {
+                    Some(narf_arch::x86_64::pmu::PmuEvent::BranchInstructions)
+                }
+                PERF_COUNT_HW_BRANCH_MISSES => Some(narf_arch::x86_64::pmu::PmuEvent::BranchMisses),
                 _ => None,
             },
             // PERF_TYPE_HW_CACHE
-            3 => {
+            PERF_TYPE_HW_CACHE => {
                 let cache_id = attr.config & 0xFF;
+                let op_id = (attr.config >> 8) & 0xFF;
                 let result_id = (attr.config >> 16) & 0xFF;
-                match (cache_id, result_id) {
-                    (0, 1) => Some(narf_arch::x86_64::pmu::PmuEvent::CacheMisses), // L1D Miss
-                    (2, 1) => Some(narf_arch::x86_64::pmu::PmuEvent::LlcMisses),   // LLC Miss
+                match (cache_id, op_id, result_id) {
+                    (
+                        PERF_COUNT_HW_CACHE_LL,
+                        PERF_COUNT_HW_CACHE_OP_READ,
+                        PERF_COUNT_HW_CACHE_RESULT_MISS,
+                    ) => Some(narf_arch::x86_64::pmu::PmuEvent::LlcMisses),
                     _ => None,
                 }
             }
             // PERF_TYPE_RAW
-            4 => Some(narf_arch::x86_64::pmu::PmuEvent::Raw(attr.config)),
+            PERF_TYPE_RAW => Some(narf_arch::x86_64::pmu::PmuEvent::Raw(
+                attr.config | (1 << 16) | (1 << 17),
+            )),
             _ => None,
         };
 
@@ -697,14 +996,6 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             // SAFETY: alloc_counter programs PMU hardware registers, which requires CPL=0.
             match unsafe { narf_arch::x86_64::pmu::alloc_counter(event) } {
                 Ok(counter) => Some(counter),
-                // QEMU and early hardware without a programmable PMU can still
-                // expose the architectural cycle clock. Other hardware events
-                // must not silently degrade to fabricated values.
-                Err(narf_arch::x86_64::pmu::PmuError::NoPmu)
-                    if attr.type_ == 0 && matches!(attr.config, 0 | 9) =>
-                {
-                    None
-                }
                 Err(narf_arch::x86_64::pmu::PmuError::NoFreeCounter) => {
                     ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
                     return;
@@ -714,14 +1005,53 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                     return;
                 }
             }
-        } else {
+        } else if attr.type_ == PERF_TYPE_SOFTWARE {
             None
+        } else {
+            ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+            return;
         }
     };
 
     #[cfg(not(target_arch = "x86_64"))]
-    if attr.type_ != 1 && !(attr.type_ == 0 && matches!(attr.config, 0 | 9)) {
+    if attr.type_ != PERF_TYPE_SOFTWARE {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let sample_period = if attr.sample_period_or_freq != 0 {
+        let Some(counter) = pmu_counter.as_ref() else {
+            ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+            return;
+        };
+        let period = attr.sample_period_or_freq;
+        if ensure_pmi_route().is_err() {
+            // SAFETY: open still exclusively owns this allocation.
+            unsafe { narf_arch::x86_64::pmu::release(*counter) };
+            ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+            return;
+        }
+        // Validate the period and counter backend now. Keep the event paused
+        // until ENABLE/enable_on_exec establishes the requested time window.
+        // SAFETY: this open path owns the freshly allocated live counter.
+        let armed = unsafe { narf_arch::x86_64::pmu::arm_sampling(counter, period) };
+        if armed.is_err() {
+            // SAFETY: open still exclusively owns this allocation.
+            unsafe { narf_arch::x86_64::pmu::release(*counter) };
+            ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+            return;
+        }
+        // SAFETY: same live counter; restore non-interrupt counting state.
+        let _ = unsafe { narf_arch::x86_64::pmu::pause_sampling(counter) };
+        period
+    } else {
+        0
+    };
+
+    #[cfg(not(target_arch = "x86_64"))]
+    if attr.sample_period_or_freq != 0 {
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
         return;
     }
 
@@ -733,7 +1063,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let fd_num_opt = fd::with_table(task, |t| {
         // A group member is scheduled only through its leader even when its
         // own disabled bit is clear (the upstream CLI relies on this).
-        let initially_enabled = group_leader.is_none() && attr.flags & PERF_ATTR_DISABLED == 0;
+        let initially_enabled = group_leader.is_none() && attr.flags & PERF_ATTR_FLAG_DISABLED == 0;
         let file = Arc::new(PerfEventFile {
             attr,
             id: NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed),
@@ -746,6 +1076,9 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             enabled_at_ns: AtomicU64::new(0),
             time_enabled_ns: AtomicU64::new(0),
             registered: AtomicBool::new(false),
+            sample_lost: AtomicU64::new(0),
+            #[cfg(target_arch = "x86_64")]
+            sample_period,
             mmap_seq: AtomicU32::new(0),
             mmap: IrqSafeSpinLock::new(None),
             group_members: IrqSafeSpinLock::new(Vec::new()),
@@ -800,21 +1133,36 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     }
 }
 
-fn is_supported_event(attr: &perf_event_attr) -> bool {
+fn is_supported_event(attr: &PerfEventAttr) -> bool {
     match attr.type_ {
         // PERF_TYPE_HARDWARE
-        0 => matches!(attr.config, 0..=5 | 9),
+        #[cfg(target_arch = "x86_64")]
+        PERF_TYPE_HARDWARE => matches!(
+            attr.config,
+            PERF_COUNT_HW_CPU_CYCLES
+                | PERF_COUNT_HW_INSTRUCTIONS
+                | PERF_COUNT_HW_CACHE_MISSES
+                | PERF_COUNT_HW_BRANCH_INSTRUCTIONS
+                | PERF_COUNT_HW_BRANCH_MISSES
+        ),
         // PERF_TYPE_SOFTWARE
-        1 => matches!(attr.config, 0 | 1 | 2 | 3 | 5 | 9 | 12),
+        PERF_TYPE_SOFTWARE => attr.config == PERF_COUNT_SW_DUMMY,
         // PERF_TYPE_HW_CACHE (3)
-        3 => {
+        #[cfg(target_arch = "x86_64")]
+        PERF_TYPE_HW_CACHE => {
             let cache_id = attr.config & 0xFF;
             let op_id = (attr.config >> 8) & 0xFF;
             let result_id = (attr.config >> 16) & 0xFF;
-            matches!((cache_id, op_id, result_id), (0 | 2, 0, 1))
+            (cache_id, op_id, result_id)
+                == (
+                    PERF_COUNT_HW_CACHE_LL,
+                    PERF_COUNT_HW_CACHE_OP_READ,
+                    PERF_COUNT_HW_CACHE_RESULT_MISS,
+                )
         }
         // PERF_TYPE_RAW (4)
-        4 => true,
+        #[cfg(target_arch = "x86_64")]
+        PERF_TYPE_RAW => true,
         _ => false,
     }
 }

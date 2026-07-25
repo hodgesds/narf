@@ -6,7 +6,7 @@
 #![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
-use crate::perf_event::perf_event_attr;
+use narf_linux_perf_uapi::PerfEventAttr;
 
 const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
@@ -21,12 +21,12 @@ const EOPNOTSUPP: i64 = -95;
 
 fn smoke_abi_perf_event_open_validation() -> TestResult {
     with_setup(|| {
-        if core::mem::size_of::<perf_event_attr>() != 128
-            || core::mem::offset_of!(perf_event_attr, config) != 8
-            || core::mem::offset_of!(perf_event_attr, flags) != 40
-            || core::mem::offset_of!(perf_event_attr, sig_data) != 120
+        if core::mem::size_of::<PerfEventAttr>() != 144
+            || core::mem::offset_of!(PerfEventAttr, config) != 8
+            || core::mem::offset_of!(PerfEventAttr, flags) != 40
+            || core::mem::offset_of!(PerfEventAttr, sig_data) != 120
         {
-            return Err("perf_event_attr does not match Linux PERF_ATTR_SIZE_VER7 layout");
+            return Err("PerfEventAttr does not match Linux PERF_ATTR_SIZE_VER9 layout");
         }
 
         // Test 1: attr_ptr == 0 -> expect EFAULT (-14)
@@ -39,11 +39,11 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
 
         // Test 2: invalid CPU -> expect EINVAL (-22)
-        let attr = perf_event_attr {
-            type_: 0, // PERF_TYPE_HARDWARE
-            size: core::mem::size_of::<perf_event_attr>() as u32,
-            config: 0, // PERF_COUNT_HW_CPU_CYCLES
-            ..perf_event_attr::default()
+        let attr = PerfEventAttr {
+            type_: 1, // PERF_TYPE_SOFTWARE
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: 9, // PERF_COUNT_SW_DUMMY
+            ..PerfEventAttr::default()
         };
 
         match call(
@@ -72,26 +72,27 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             _ => return Err("perf_event_open(invalid group_fd) did not return EBADF"),
         }
 
-        // Test 5: invalid type/config -> expect ENOENT (-2)
-        let bad_attr = perf_event_attr {
+        // Test 5: unsupported type/config -> expect EOPNOTSUPP (-95)
+        let bad_attr = PerfEventAttr {
             type_: 9999, // invalid type
-            size: core::mem::size_of::<perf_event_attr>() as u32,
-            ..perf_event_attr::default()
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            ..PerfEventAttr::default()
         };
 
         match call(
             Syscall::PerfEventOpen.raw(),
             a3(&bad_attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
         ) {
-            Some(ENOENT) => {}
-            _ => return Err("perf_event_open(invalid type) did not return ENOENT"),
+            Some(EOPNOTSUPP) => {}
+            _ => return Err("perf_event_open(unsupported type) did not return EOPNOTSUPP"),
         }
 
         // aarch64 currently has only the cycle-counting backend. It must not
         // accept programmable events and return plausible-looking zeroes.
         #[cfg(target_arch = "aarch64")]
         {
-            let instructions_attr = perf_event_attr {
+            let instructions_attr = PerfEventAttr {
+                type_: 0,  // PERF_TYPE_HARDWARE
                 config: 1, // PERF_COUNT_HW_INSTRUCTIONS
                 ..attr
             };
@@ -107,7 +108,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 Some(EOPNOTSUPP) => {}
                 _ => return Err("aarch64 accepted an unimplemented programmable PMU event"),
             }
-            let raw_attr = perf_event_attr {
+            let raw_attr = PerfEventAttr {
                 type_: 4, // PERF_TYPE_RAW
                 config: 0x08,
                 ..attr
@@ -119,6 +120,41 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 Some(EOPNOTSUPP) => {}
                 _ => return Err("aarch64 accepted an unimplemented raw PMU event"),
             }
+        }
+
+        let approximate_sw_attr = PerfEventAttr {
+            type_: 1,
+            config: 0, // PERF_COUNT_SW_CPU_CLOCK needs per-target accounting
+            ..attr
+        };
+        match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &approximate_sw_attr as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(EOPNOTSUPP) => {}
+            _ => return Err("perf_event_open admitted an approximate software event"),
+        }
+
+        let ignored_attr_flag = PerfEventAttr {
+            flags: 1 << 5, // exclude_user
+            ..attr
+        };
+        match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &ignored_attr_flag as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(EOPNOTSUPP) => {}
+            _ => return Err("perf_event_open ignored an unimplemented attr flag"),
         }
 
         // Test 6: Unknown flags -> expect EINVAL (-22)
@@ -137,10 +173,11 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             _ => return Err("perf_event_open(unknown flags) did not return EINVAL"),
         }
 
-        // Sampling requires the mmap ring, which is deliberately outside the
-        // counting-only compatibility slice.
-        let sampling_attr = perf_event_attr {
+        // Unsupported sample payloads remain fail-closed even though the
+        // common perf-record layout is implemented.
+        let sampling_attr = PerfEventAttr {
             sample_period_or_freq: 1000,
+            sample_type: 1 << 3, // PERF_SAMPLE_ADDR is not implemented
             ..attr
         };
         match call(
@@ -153,7 +190,9 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             ),
         ) {
             Some(EOPNOTSUPP) => {}
-            _ => return Err("perf_event_open(sampling) did not return EOPNOTSUPP"),
+            _ => {
+                return Err("perf_event_open(unsupported sample layout) did not return EOPNOTSUPP")
+            }
         }
 
         // PERF_FLAG_PID_CGROUP cannot be approximated as a normal pid event.
@@ -211,11 +250,11 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
 
         // Test 10: Successful creation & read
-        let sw_attr = perf_event_attr {
+        let sw_attr = PerfEventAttr {
             type_: 1, // PERF_TYPE_SOFTWARE
-            size: core::mem::size_of::<perf_event_attr>() as u32,
-            config: 0, // PERF_COUNT_SW_CPU_CLOCK
-            ..perf_event_attr::default()
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: 9, // PERF_COUNT_SW_DUMMY
+            ..PerfEventAttr::default()
         };
 
         let fd = match call(
@@ -246,8 +285,8 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         ) {
             Some(8) => {
                 let val = u64::from_ne_bytes(valid_buf);
-                if val == 0 {
-                    return Err("read value from software CPU clock was 0");
+                if val != 0 {
+                    return Err("PERF_COUNT_SW_DUMMY did not return its specified zero count");
                 }
             }
             _ => return Err("read from perf fd into valid 8-byte buffer did not return 8"),
@@ -289,15 +328,15 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         let _ = call(Syscall::Close.raw(), a0(fd_cloexec as u64));
 
         // Test 13: perf-stat read format and the counting-control ioctls.
-        let stat_attr = perf_event_attr {
+        let stat_attr = PerfEventAttr {
             type_: 1,
-            size: core::mem::size_of::<perf_event_attr>() as u32,
-            config: 0, // PERF_COUNT_SW_CPU_CLOCK
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: 9, // PERF_COUNT_SW_DUMMY
             read_format: PERF_FORMAT_TOTAL_TIME_ENABLED
                 | PERF_FORMAT_TOTAL_TIME_RUNNING
                 | PERF_FORMAT_ID,
             flags: 1, // disabled
-            ..perf_event_attr::default()
+            ..PerfEventAttr::default()
         };
         let stat_fd = match call(
             Syscall::PerfEventOpen.raw(),
@@ -373,7 +412,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         let _ = call(Syscall::Close.raw(), a0(stat_fd as u64));
 
         // Test 14: enable_on_exec remains stopped until the target commits exec.
-        let exec_attr = perf_event_attr {
+        let exec_attr = PerfEventAttr {
             flags: 1 | (1 << 12), // disabled | enable_on_exec
             ..stat_attr
         };
@@ -438,7 +477,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         let _ = call(Syscall::Close.raw(), a0(exec_fd as u64));
 
         // Test 15: linked group wire shape and group-wide lifecycle ioctls.
-        let group_attr = perf_event_attr {
+        let group_attr = PerfEventAttr {
             read_format: PERF_FORMAT_GROUP
                 | PERF_FORMAT_TOTAL_TIME_ENABLED
                 | PERF_FORMAT_TOTAL_TIME_RUNNING
@@ -514,7 +553,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         let _ = call(Syscall::Close.raw(), a0(group_read_fd as u64));
 
         // Test 16: unknown read-format bits are rejected at open.
-        let bad_format_attr = perf_event_attr {
+        let bad_format_attr = PerfEventAttr {
             read_format: 1 << 63,
             ..sw_attr
         };
@@ -574,6 +613,77 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             return Err("perf mmap accepted an invalid layout or offset");
         }
         let _ = call(Syscall::Close.raw(), a0(mmap_fd as u64));
+
+        // Test 18: a due sample becomes a Linux PERF_RECORD_SAMPLE in the
+        // mmap data ring and makes the fd POLLIN-readable.
+        let sample_attr = PerfEventAttr {
+            type_: 1, // PERF_TYPE_SOFTWARE
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: 9, // PERF_COUNT_SW_DUMMY
+            sample_period_or_freq: 0,
+            sample_type: (1 << 0) // IP
+                | (1 << 1) // TID
+                | (1 << 2) // TIME
+                | (1 << 6) // ID
+                | (1 << 7) // CPU
+                | (1 << 8), // PERIOD
+            flags: 1, // disabled
+            ..PerfEventAttr::default()
+        };
+        let sample_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &sample_attr as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(f) if f >= 0 => f as u32,
+            _ => return Err("perf_event_open(sample event) failed"),
+        };
+        let sample_ops = crate::fd::with_table(FAKE_TASK, |t| {
+            t.get(sample_fd).map(|entry| entry.ops.clone())
+        })
+        .flatten()
+        .ok_or("perf sample fd was absent from the fd table")?;
+        let sample_frames = sample_ops
+            .mmap_frames(0, 3 * 4096)
+            .map_err(|_| "perf sample mmap failed")?;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(sample_fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+        ) != Some(0)
+        {
+            return Err("enabling sampled perf event failed");
+        }
+        crate::perf_event::sample_from_irq_for_test(
+            crate::handlers::current_task_id(),
+            0x1234_5678,
+        );
+        // SAFETY: sample_ops owns all three identity-mapped frames here.
+        let data_head =
+            unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
+        if data_head != 56 {
+            return Err("perf sample record has the wrong wire size");
+        }
+        // SAFETY: the first 56-byte record starts at the beginning of data page 0.
+        let record = unsafe {
+            core::slice::from_raw_parts(sample_frames[1] as *const u8, data_head as usize)
+        };
+        if u32::from_ne_bytes(record[0..4].try_into().unwrap()) != 9
+            || u16::from_ne_bytes(record[6..8].try_into().unwrap()) != 56
+            || u64::from_ne_bytes(record[8..16].try_into().unwrap()) != 0x1234_5678
+            || u64::from_ne_bytes(record[48..56].try_into().unwrap()) != 0
+        {
+            return Err("PERF_RECORD_SAMPLE wire layout is invalid");
+        }
+        if sample_ops.poll_readiness() & narf_filesystem::POLL_IN == 0
+            || !sample_ops.readiness_notifies()
+        {
+            return Err("sampled perf fd did not become POLLIN-readable");
+        }
+        let _ = call(Syscall::Close.raw(), a0(sample_fd as u64));
 
         Ok(())
     })

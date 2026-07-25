@@ -27,6 +27,8 @@ narf-scheduler    = { path = "../scheduler" }
 narf-time         = { path = "../time" }
 narf-initramfs    = { path = "../initramfs" }
 narf-input        = { path = "../input" }
+narf-interrupts   = { path = "../interrupts" }
+narf-linux-perf-uapi = { path = "../compat/linux-perf-uapi" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-modules      = { path = "../modules" }
 narf-power        = { path = "../power" }

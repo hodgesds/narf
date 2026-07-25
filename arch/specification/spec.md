@@ -80,6 +80,20 @@ pub unsafe fn speculation::configure_current_cpu(
 pub fn speculation::state(cpu: usize) -> speculation::State;
 
 #[cfg(target_arch = "x86_64")]
+pub unsafe fn pmu::arm_sampling(
+    counter: &pmu::PmuCounter,
+    period: u64,
+) -> Result<(), pmu::PmuError>;
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn pmu::handle_sampling_overflow() -> u8;
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn pmu::pause_sampling(
+    counter: &pmu::PmuCounter,
+) -> Result<(), pmu::PmuError>;
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn pmi::program_current_lvt_pc(vector: u8, masked: bool);
+
+#[cfg(target_arch = "x86_64")]
 pub mod amd_pstate {
     pub const MSR_AMD_CPPC_CAP1: u32 = 0xC001_02B0;
     pub const MSR_AMD_CPPC_ENABLE: u32 = 0xC001_02B1;

@@ -1,11 +1,11 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "6e7ecf10083ec035057bdce834a72bbe2bffae8df9383ed10eb06c78dd70944b"
+prompt_hash = "3b2617a17646b12c100ba0a5e08272c0bfdab03738c0dd62f31cd46d5f223466"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "Range conformance, BIND home-node selection, NUMA event accounting, huge-page allocator topology, and user huge-leaf ownership remain inside the existing memory-manager TCB and do not add a trusted subsystem or move the documented trust boundary."
+argument = "The frame edit only forwards the interrupted instruction pointer already present in its trap frame into the existing IRQ dispatcher; it adds no new TCB member or authority."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
@@ -70,3 +70,7 @@ argument = "Externally owned shared pages carry one registry reference per addre
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The memory-hotplug observer runs only after allocator donation/removal and topology-registry commit, with both locks released. It receives no physical-frame ownership and can only rebuild read-only sysfs topology; failed and busy transactions emit no notification. Offline ranges remain recorded solely as non-allocatable topology."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "PMI dispatch runs after the trap prologue has entered the Frame domain and only copies scalar task/IP/time values into kernel-owned per-CPU storage; it does not bypass capability checks or alter domain tags."

@@ -74,3 +74,24 @@ pub unsafe fn unmask_lvt_pc(lapic_base: usize) {
         write_volatile(lvt_addr(lapic_base), cur & !LVT_MASKED_BIT);
     }
 }
+
+/// Program LVT-PC for the current CPU, selecting the x2APIC MSR or xAPIC MMIO
+/// interface from IA32_APIC_BASE.
+///
+/// # Safety
+/// CPL=0 and the local APIC has been enabled by CPU bring-up.
+pub unsafe fn program_current_lvt_pc(vector: u8, masked: bool) {
+    const IA32_APIC_BASE: u32 = 0x1B;
+    const IA32_X2APIC_LVT_PC: u32 = 0x834;
+    // SAFETY: architectural APIC-base MSR is present on long-mode CPUs.
+    let base = unsafe { super::msr::rdmsr(IA32_APIC_BASE) };
+    if base & (1 << 10) != 0 {
+        let value = vector as u64 | if masked { LVT_MASKED_BIT as u64 } else { 0 };
+        // SAFETY: x2APIC mode makes the LVT-PC MSR available.
+        unsafe { super::msr::wrmsr(IA32_X2APIC_LVT_PC, value) };
+    } else {
+        let lapic = (base & 0x000f_ffff_f000) as usize;
+        // SAFETY: xAPIC MMIO base comes from IA32_APIC_BASE.
+        unsafe { program_lvt_pc(lapic, vector, false, masked) };
+    }
+}

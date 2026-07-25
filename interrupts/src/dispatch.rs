@@ -143,6 +143,9 @@ static DISPATCHING_VECTOR: [DispatchSlot; PERCPU_FIRES_MAX] = [const {
     }
 }; PERCPU_FIRES_MAX];
 
+static INTERRUPTED_IP: [AtomicU64; PERCPU_FIRES_MAX] =
+    [const { AtomicU64::new(0) }; PERCPU_FIRES_MAX];
+
 /// Panic with the standard same-vector re-entry message. Called
 /// when install_handler_named / remove_handler / clear_handler /
 /// set_waker / clear_waker is invoked from inside an on_irq
@@ -435,6 +438,13 @@ pub fn in_flight(vector: u8) -> u32 {
 /// no counters move, no handlers run, no wakers fire.
 #[inline]
 pub fn on_irq(vector: u8) {
+    on_irq_with_context(vector, 0);
+}
+
+/// Dispatch an IRQ while publishing the interrupted instruction pointer to
+/// handlers on this CPU. The value is valid only for the handler walk.
+#[inline]
+pub fn on_irq_with_context(vector: u8, interrupted_ip: u64) {
     let s = &SLOTS[vector as usize];
 
     // Soft mask check FIRST — gives `disable_irq` strict semantics.
@@ -450,6 +460,7 @@ pub fn on_irq(vector: u8) {
     // Per-CPU bump — current_cpu may return out-of-range during
     // very-early boot; clamp.
     let cpu = current_cpu_index();
+    INTERRUPTED_IP[cpu].store(interrupted_ip, Ordering::Release);
     s.per_cpu_fired[cpu].fetch_add(1, Ordering::Release);
 
     // Status-panel diag: bump the cross-vector total + record the
@@ -536,7 +547,15 @@ pub fn on_irq(vector: u8) {
 
     s.in_flight.fetch_sub(1, Ordering::AcqRel);
     narf_lib::context::clear_current_irq_vector();
+    INTERRUPTED_IP[cpu].store(0, Ordering::Release);
     narf_lib::context::exit_irq();
+}
+
+/// Instruction pointer interrupted by the IRQ currently dispatched on this
+/// CPU, or zero outside a contextual dispatch.
+#[inline]
+pub fn interrupted_ip() -> u64 {
+    INTERRUPTED_IP[current_cpu_index()].load(Ordering::Acquire)
 }
 
 #[inline]
