@@ -102,8 +102,7 @@ fn requested_name(request: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Handle one generic-netlink datagram.
-pub fn build_replies(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
     if request.len() < NLMSG_HDRLEN + 4 {
         return Err(());
     }
@@ -137,6 +136,34 @@ pub fn build_replies(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
         }
     }
     Ok(out)
+}
+
+/// Handle every aligned generic-netlink request in one datagram.
+pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+    let mut offset = 0usize;
+    let mut replies = Vec::new();
+    while offset < datagram.len() {
+        let remaining = &datagram[offset..];
+        if remaining.len() < NLMSG_HDRLEN {
+            return Err(());
+        }
+        let len = u32::from_ne_bytes(remaining[0..4].try_into().map_err(|_| ())?) as usize;
+        if len < NLMSG_HDRLEN + 4 || len > remaining.len() {
+            return Err(());
+        }
+        replies.extend(build_one(&remaining[..len])?);
+        let step = align(len);
+        if step > remaining.len() {
+            if len == remaining.len() {
+                offset = datagram.len();
+            } else {
+                return Err(());
+            }
+        } else {
+            offset += step;
+        }
+    }
+    Ok(replies)
 }
 
 #[cfg(test)]
@@ -186,5 +213,33 @@ mod tests {
             u16::from_ne_bytes(replies[1][4..6].try_into().unwrap()),
             NLMSG_DONE
         );
+    }
+
+    #[test]
+    fn batched_requests_preserve_sequences() {
+        let mut first = request(Some(b"nlctrl\0"), 1);
+        first[8..12].copy_from_slice(&101u32.to_ne_bytes());
+        first.resize(align(first.len()), 0);
+        let mut second = request(Some(b"nlctrl\0"), 1);
+        second[8..12].copy_from_slice(&202u32.to_ne_bytes());
+        first.extend_from_slice(&second);
+
+        let replies = build_replies(&first).unwrap();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(
+            u32::from_ne_bytes(replies[0][8..12].try_into().unwrap()),
+            101
+        );
+        assert_eq!(
+            u32::from_ne_bytes(replies[1][8..12].try_into().unwrap()),
+            202
+        );
+    }
+
+    #[test]
+    fn malformed_batch_length_is_rejected() {
+        let mut request = request(Some(b"nlctrl\0"), 1);
+        request[0..4].copy_from_slice(&15u32.to_ne_bytes());
+        assert!(build_replies(&request).is_err());
     }
 }

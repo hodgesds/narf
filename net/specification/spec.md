@@ -168,7 +168,9 @@ empty multipart dump terminated by `NLMSG_DONE`.
 
 `NETLINK_GENERIC` publishes the mandatory `nlctrl` control family.
 `CTRL_CMD_GETFAMILY` supports name lookup and dump enumeration with
-Linux-compatible attributes; unknown family names return `ENOENT`.
+Linux-compatible attributes; unknown family names return `ENOENT`. Multiple
+aligned control requests may be batched in one datagram and retain independent
+sequence numbers.
 
 AF_NETLINK sockets retain their bound `sockaddr_nl` port ID and group mask,
 support a connected kernel or userspace destination, auto-bind before the
