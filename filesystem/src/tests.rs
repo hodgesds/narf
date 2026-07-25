@@ -2909,23 +2909,7 @@ fn smoke_fs_fuse_background_delivery_is_bounded() -> TestResult {
 
     let conn = Arc::new(FuseConnection::new());
     let _fs = FuseFs::new("fuse-background", Arc::clone(&conn));
-    let id = alloc::format!("{}", conn.connection_id());
-    let node = crate::sysfs::get_root()
-        .get_child("fs")
-        .and_then(|fs| fs.get_child("fuse"))
-        .and_then(|fuse| fuse.get_child("connections"))
-        .and_then(|connections| connections.get_child(&id));
-    let Some(node) = node else {
-        return TestResult::Fail("FUSE background connection missing from sysfs");
-    };
-    if !matches!(node.attr_store("max_background", b"1\n"), Some(Ok(())))
-        || !matches!(
-            node.attr_store("congestion_threshold", b"2\n"),
-            Some(Ok(()))
-        )
-    {
-        return TestResult::Fail("FUSE background limits were not writable");
-    }
+    conn.__test_set_background_limits(1, 2);
 
     let body = pod_as_bytes(&FuseReleaseIn::default());
     for nodeid in 2..=4 {
@@ -4423,6 +4407,7 @@ fn smoke_fs_fuse_destroy_after_init() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_destroy_after_init);
 
+#[cfg(feature = "linux-compat")]
 fn smoke_fs_fuse_sysfs_connection_controls() -> TestResult {
     use crate::fuse_conn::DevFuse;
 
@@ -4470,6 +4455,7 @@ fn smoke_fs_fuse_sysfs_connection_controls() -> TestResult {
         _ => TestResult::Fail("FUSE sysfs abort did not disconnect"),
     }
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_fs_fuse_sysfs_connection_controls);
 
 /// Test-only unmount helper for the FUSE e2e mounts.
