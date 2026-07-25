@@ -98,6 +98,10 @@ pub enum FirmwareError {
     AuthorityRevoked,
     /// Build profile rejects unsigned blobs.
     UnsignedRejected,
+    /// Firmware name is empty, absolute, or contains a `..` component.
+    InvalidName,
+    /// A caller-provided destination cannot hold the firmware payload.
+    BufferTooSmall,
 }
 
 /// Read-only view of a loaded blob. Returned by `Cap::view()`.
@@ -177,7 +181,37 @@ pub fn open(
     if auth.check_live().is_err() {
         return Err(FirmwareError::AuthorityRevoked);
     }
+    validate_name(name)?;
     registry::open_blob(name)
+}
+
+/// Copy a firmware payload into caller-owned storage.
+///
+/// This is the NARF equivalent of Linux
+/// `request_firmware_into_buf()`: it avoids allocating another
+/// firmware-sized buffer at the request site and returns the number
+/// of payload bytes copied. The registry's verified DMA-coherent
+/// backing remains the authoritative cached copy.
+pub fn read_into(
+    name: &str,
+    auth: &Cap<FirmwareRegistry, Read>,
+    dst: &mut [u8],
+) -> Result<usize, FirmwareError> {
+    let cap = open(name, auth)?;
+    let view = view_of(&cap)?;
+    if dst.len() < view.bytes.len() {
+        return Err(FirmwareError::BufferTooSmall);
+    }
+    let len = view.bytes.len();
+    dst[..len].copy_from_slice(view.bytes);
+    Ok(len)
+}
+
+fn validate_name(name: &str) -> Result<(), FirmwareError> {
+    if name.is_empty() || name.starts_with('/') || name.split('/').any(|part| part == "..") {
+        return Err(FirmwareError::InvalidName);
+    }
+    Ok(())
 }
 
 /// Install (or replace) a blob. Cap-gated against
@@ -199,6 +233,7 @@ pub fn install(
     if auth.check_live().is_err() {
         return Err(FirmwareError::AuthorityRevoked);
     }
+    validate_name(name)?;
     registry::install_blob(name, bytes, BlobSource::HotInstall)
 }
 
@@ -354,6 +389,7 @@ pub fn __reset_trusted_loader_tasks() {
 /// Bypasses the cap gate (in-tree blobs are kernel-trusted by
 /// definition) but still runs signature verification.
 pub fn register_in_tree(name: &'static str, bytes: &[u8]) -> Result<(), FirmwareError> {
+    validate_name(name)?;
     registry::install_blob(name, bytes, BlobSource::InTree)
 }
 

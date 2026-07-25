@@ -148,6 +148,10 @@ pub enum FirmwareError {
     OutOfMemory,
     /// The registry authority cap was revoked.
     AuthorityRevoked,
+    /// Name is empty, absolute, or contains a `..` component.
+    InvalidName,
+    /// Caller-provided destination is smaller than the payload.
+    BufferTooSmall,
 }
 
 /// Read-only blob accessor. Returned by the cap's `view()` method.
@@ -183,6 +187,14 @@ pub fn open(
     auth: &Cap<FirmwareRegistry, Read>,
 ) -> Result<Cap<FirmwareBlob, Read>, FirmwareError>;
 
+/// Copy verified firmware into caller-owned storage. Equivalent in
+/// purpose to Linux `request_firmware_into_buf()`.
+pub fn read_into(
+    name: &str,
+    auth: &Cap<FirmwareRegistry, Read>,
+    dst: &mut [u8],
+) -> Result<usize, FirmwareError>;
+
 /// Cap method. Borrows the blob's view; the returned slice is
 /// valid until the cap is dropped or revoked.
 impl Cap<FirmwareBlob, Read> {
@@ -204,6 +216,11 @@ pub fn install(
 /// firmware-version report.
 pub fn snapshot() -> Vec<BlobIdentity>;
 ```
+
+Like Linux `request_firmware()`, lookup names may contain embedded
+`..` text (for example `foo..bin`) but must not contain a `..` path
+component. NARF additionally rejects empty and absolute names so a
+request cannot escape the registry namespace.
 
 ## 5. Discovery + load order — Linux hybrid model
 

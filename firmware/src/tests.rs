@@ -6,8 +6,8 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::registry::{__reset_for_test, install_blob};
 use crate::{
-    bootstrap_authority, install, open, register_in_tree, scan_initramfs, snapshot, source_for,
-    view_of, BlobSource, FirmwareError, BLOB_TRAILER_MAGIC,
+    bootstrap_authority, install, open, read_into, register_in_tree, scan_initramfs, snapshot,
+    source_for, view_of, BlobSource, FirmwareError, BLOB_TRAILER_MAGIC,
 };
 
 /// Build an unsigned firmware blob whose payload is the supplied
@@ -148,6 +148,120 @@ fn smoke_firmware_open_unknown_blob_returns_not_found() -> TestResult {
 kernel_test_in!(
     "firmware",
     smoke_firmware_open_unknown_blob_returns_not_found
+);
+
+fn smoke_firmware_rejects_linux_parent_components() -> TestResult {
+    let blob = build_unsigned_blob(b"x", None);
+    let (write, read) = bootstrap_authority();
+    for name in ["", "/absolute.bin", "vendor/../escape.bin", "../escape.bin"] {
+        if !matches!(open(name, &read), Err(FirmwareError::InvalidName)) {
+            return TestResult::Fail("open accepted invalid firmware name");
+        }
+        if install(name, &blob, &write) != Err(FirmwareError::InvalidName) {
+            return TestResult::Fail("install accepted invalid firmware name");
+        }
+    }
+    match open("vendor/foo..bin", &read) {
+        Err(FirmwareError::NotFound) => TestResult::Pass,
+        _ => TestResult::Fail("valid embedded-dot name rejected"),
+    }
+}
+kernel_test_in!("firmware", smoke_firmware_rejects_linux_parent_components);
+
+fn smoke_firmware_caps_keep_distinct_bindings() -> TestResult {
+    if !cfg!(feature = "firmware-allow-unsigned") {
+        return TestResult::Skip("firmware-allow-unsigned off");
+    }
+    __reset_for_test();
+    let (write, read) = bootstrap_authority();
+    let first = build_unsigned_blob(b"first payload", None);
+    let second = build_unsigned_blob(b"second payload", None);
+    if install("vendor/first.bin", &first, &write).is_err()
+        || install("vendor/second.bin", &second, &write).is_err()
+    {
+        return TestResult::Fail("install");
+    }
+    let first_cap = match open("vendor/first.bin", &read) {
+        Ok(cap) => cap,
+        Err(_) => return TestResult::Fail("open first"),
+    };
+    let second_cap = match open("vendor/second.bin", &read) {
+        Ok(cap) => cap,
+        Err(_) => return TestResult::Fail("open second"),
+    };
+    let first_view = match view_of(&first_cap) {
+        Ok(view) => view,
+        Err(_) => return TestResult::Fail("view first"),
+    };
+    let second_view = match view_of(&second_cap) {
+        Ok(view) => view,
+        Err(_) => return TestResult::Fail("view second"),
+    };
+    if first_view.name != "vendor/first.bin" || first_view.bytes != b"first payload" {
+        return TestResult::Fail("first cap resolved to another binding");
+    }
+    if second_view.name != "vendor/second.bin" || second_view.bytes != b"second payload" {
+        return TestResult::Fail("second cap resolved to another binding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware", smoke_firmware_caps_keep_distinct_bindings);
+
+fn smoke_firmware_open_cap_survives_replacement() -> TestResult {
+    if !cfg!(feature = "firmware-allow-unsigned") {
+        return TestResult::Skip("firmware-allow-unsigned off");
+    }
+    __reset_for_test();
+    let (write, read) = bootstrap_authority();
+    let old = build_unsigned_blob(b"old payload", None);
+    let new = build_unsigned_blob(b"new payload", None);
+    if install("vendor/replaced.bin", &old, &write).is_err() {
+        return TestResult::Fail("install old");
+    }
+    let old_cap = match open("vendor/replaced.bin", &read) {
+        Ok(cap) => cap,
+        Err(_) => return TestResult::Fail("open old"),
+    };
+    if install("vendor/replaced.bin", &new, &write).is_err() {
+        return TestResult::Fail("install new");
+    }
+    let new_cap = match open("vendor/replaced.bin", &read) {
+        Ok(cap) => cap,
+        Err(_) => return TestResult::Fail("open new"),
+    };
+    if view_of(&old_cap).map(|v| v.bytes) != Ok(b"old payload" as &[u8]) {
+        return TestResult::Fail("old cap changed after replacement");
+    }
+    if view_of(&new_cap).map(|v| v.bytes) != Ok(b"new payload" as &[u8]) {
+        return TestResult::Fail("new cap did not see replacement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware", smoke_firmware_open_cap_survives_replacement);
+
+fn smoke_firmware_read_into_matches_linux_buffer_request() -> TestResult {
+    if !cfg!(feature = "firmware-allow-unsigned") {
+        return TestResult::Skip("firmware-allow-unsigned off");
+    }
+    __reset_for_test();
+    let (write, read) = bootstrap_authority();
+    let blob = build_unsigned_blob(b"caller buffer", None);
+    if install("vendor/into.bin", &blob, &write).is_err() {
+        return TestResult::Fail("install");
+    }
+    let mut short = [0u8; 4];
+    if read_into("vendor/into.bin", &read, &mut short) != Err(FirmwareError::BufferTooSmall) {
+        return TestResult::Fail("short buffer accepted");
+    }
+    let mut dst = [0xAAu8; 32];
+    match read_into("vendor/into.bin", &read, &mut dst) {
+        Ok(13) if &dst[..13] == b"caller buffer" && dst[13] == 0xAA => TestResult::Pass,
+        _ => TestResult::Fail("caller-buffer request mismatch"),
+    }
+}
+kernel_test_in!(
+    "firmware",
+    smoke_firmware_read_into_matches_linux_buffer_request
 );
 
 fn smoke_firmware_unsigned_rejected_when_feature_off() -> TestResult {

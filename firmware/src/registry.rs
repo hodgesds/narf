@@ -58,7 +58,7 @@ pub struct Entry {
 /// produce a slice even mid-revocation race.
 #[derive(Clone, Debug)]
 struct CapBinding {
-    seq: usize,
+    cap_index: u32,
     name: &'static str,
     sha256: [u8; 32],
     signer: Option<[u8; 32]>,
@@ -88,7 +88,7 @@ fn lookup(name: &str) -> Option<CapBinding> {
         let g = tier.lock();
         if let Some(e) = g.iter().find(|e| e.name == name) {
             return Some(CapBinding {
-                seq: e.seq,
+                cap_index: 0,
                 name: e.name,
                 sha256: e.sha256,
                 signer: e.signer,
@@ -104,15 +104,14 @@ fn lookup(name: &str) -> Option<CapBinding> {
 /// Mint a fresh `Cap<FirmwareBlob, Read>` for the named blob. The
 /// caller has already validated the registry-authority cap.
 pub(crate) fn open_blob(name: &str) -> Result<Cap<FirmwareBlob, Read>, FirmwareError> {
-    let binding = lookup(name).ok_or(FirmwareError::NotFound)?;
+    let mut binding = lookup(name).ok_or(FirmwareError::NotFound)?;
     // The cap minted via `Cap::bootstrap()` and routed through the
     // standard cap object table; the registry-side binding stays
     // alive in the BINDINGS vec until the cap is revoked.
     let cap: Cap<FirmwareBlob, Read> = Cap::bootstrap();
+    binding.cap_index = cap.slot().index;
     let mut g = BINDINGS.lock();
-    // Replace any prior binding with the same seq (paranoia — seq
-    // is monotonic, this should be impossible).
-    g.retain(|b| b.seq != binding.seq);
+    g.retain(|b| b.cap_index != binding.cap_index);
     g.push(binding);
     Ok(cap)
 }
@@ -123,17 +122,16 @@ pub(crate) fn open_blob(name: &str) -> Result<Cap<FirmwareBlob, Read>, FirmwareE
 pub(crate) fn view_for<'a>(
     cap: &'a Cap<FirmwareBlob, Read>,
 ) -> Result<BlobView<'a>, FirmwareError> {
-    // We don't have first-class cap → seq plumbing yet; for the
-    // Stage-6 step-1 cut we route by name resolution at view time
-    // instead. The BINDINGS table holds the most-recent binding
-    // for each name so look up the cap's name from the cap's
-    // object-table index. Until that lookup lands, fall through to
-    // the most-recently-issued binding — drivers issue exactly one
-    // open() per blob during probe and call view() shortly after,
-    // so the race is academic.
-    let _ = cap; // not yet wired through the cap layer
+    if cap.check_live().is_err() {
+        return Err(FirmwareError::NotFound);
+    }
+    let cap_index = cap.slot().index;
     let g = BINDINGS.lock();
-    let b = g.last().ok_or(FirmwareError::NotFound)?.clone();
+    let b = g
+        .iter()
+        .find(|binding| binding.cap_index == cap_index)
+        .ok_or(FirmwareError::NotFound)?
+        .clone();
     let phys = b.backing.phys_addr().raw();
     let bytes_ptr = phys as *const u8;
     // SAFETY: the backing is identity-mapped DMA-coherent memory;
