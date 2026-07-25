@@ -2,9 +2,11 @@ use crate::fd::{self, FdEntry};
 use crate::handlers::{copy_from_user, copy_to_user, current_task_id};
 use crate::syscall::{SyscallReturn, TrapContext};
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
+use narf_lib::sync::IrqSafeSpinLock;
 
 static ACTIVE_PERF_EVENTS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -24,6 +26,7 @@ const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
 const PERF_EVENT_IOC_RESET: u32 = 0x2403;
 const PERF_EVENT_IOC_ID: u32 = 0x8008_2407;
+const PERF_IOC_FLAG_GROUP: usize = 1;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -62,6 +65,7 @@ struct PerfEventFile {
     enabled_at_ns: AtomicU64,
     time_enabled_ns: AtomicU64,
     registered: AtomicBool,
+    group_members: IrqSafeSpinLock<Vec<Weak<dyn FileOps>>>,
     #[cfg(target_arch = "x86_64")]
     pmu_counter: Option<narf_arch::x86_64::pmu::PmuCounter>,
 }
@@ -142,6 +146,36 @@ impl PerfEventFile {
         (value, time)
     }
 
+    fn member_files(&self) -> Vec<Arc<dyn FileOps>> {
+        self.group_members
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
+
+    fn add_group_member(&self, member: &Arc<dyn FileOps>) {
+        self.group_members.lock().push(Arc::downgrade(member));
+    }
+
+    fn for_group(&self, flags: usize, mut op: impl FnMut(&PerfEventFile)) -> Result<(), FsError> {
+        if flags & !PERF_IOC_FLAG_GROUP != 0 {
+            return Err(FsError::InvalidData);
+        }
+        op(self);
+        if flags & PERF_IOC_FLAG_GROUP != 0 {
+            for file in self.member_files() {
+                if let Some(event) = file
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<PerfEventFile>())
+                {
+                    op(event);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn push_word(buf: &mut [u8], cursor: &mut usize, value: u64) -> Result<(), FsError> {
         let end = cursor.saturating_add(8);
         let dst = buf.get_mut(*cursor..end).ok_or(FsError::InvalidData)?;
@@ -176,7 +210,8 @@ impl FileOps for PerfEventFile {
             let mut cursor = 0;
 
             if format & PERF_FORMAT_GROUP != 0 {
-                Self::push_word(buf, &mut cursor, 1)?;
+                let members = self.member_files();
+                Self::push_word(buf, &mut cursor, 1 + members.len() as u64)?;
                 if format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
                     Self::push_word(buf, &mut cursor, time_enabled)?;
                 }
@@ -184,6 +219,26 @@ impl FileOps for PerfEventFile {
                     Self::push_word(buf, &mut cursor, time_enabled)?;
                 }
                 Self::push_word(buf, &mut cursor, value)?;
+                if format & PERF_FORMAT_ID != 0 {
+                    Self::push_word(buf, &mut cursor, self.id)?;
+                }
+                if format & PERF_FORMAT_LOST != 0 {
+                    Self::push_word(buf, &mut cursor, 0)?;
+                }
+                for file in members {
+                    let event = file
+                        .as_any()
+                        .and_then(|any| any.downcast_ref::<PerfEventFile>())
+                        .ok_or(FsError::InvalidData)?;
+                    let (member_value, _) = event.snapshot();
+                    Self::push_word(buf, &mut cursor, member_value)?;
+                    if format & PERF_FORMAT_ID != 0 {
+                        Self::push_word(buf, &mut cursor, event.id)?;
+                    }
+                    if format & PERF_FORMAT_LOST != 0 {
+                        Self::push_word(buf, &mut cursor, 0)?;
+                    }
+                }
             } else {
                 Self::push_word(buf, &mut cursor, value)?;
                 if format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
@@ -192,12 +247,12 @@ impl FileOps for PerfEventFile {
                 if format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
                     Self::push_word(buf, &mut cursor, time_enabled)?;
                 }
-            }
-            if format & PERF_FORMAT_ID != 0 {
-                Self::push_word(buf, &mut cursor, self.id)?;
-            }
-            if format & PERF_FORMAT_LOST != 0 {
-                Self::push_word(buf, &mut cursor, 0)?;
+                if format & PERF_FORMAT_ID != 0 {
+                    Self::push_word(buf, &mut cursor, self.id)?;
+                }
+                if format & PERF_FORMAT_LOST != 0 {
+                    Self::push_word(buf, &mut cursor, 0)?;
+                }
             }
             Ok(cursor)
         })
@@ -222,15 +277,15 @@ impl FileOps for PerfEventFile {
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         match cmd {
             PERF_EVENT_IOC_ENABLE => {
-                self.enable();
+                self.for_group(arg, PerfEventFile::enable)?;
                 Ok(0)
             }
             PERF_EVENT_IOC_DISABLE => {
-                self.disable();
+                self.for_group(arg, PerfEventFile::disable)?;
                 Ok(0)
             }
             PERF_EVENT_IOC_RESET => {
-                self.reset();
+                self.for_group(arg, PerfEventFile::reset)?;
                 Ok(0)
             }
             PERF_EVENT_IOC_ID => {
@@ -242,6 +297,10 @@ impl FileOps for PerfEventFile {
             }
             _ => Err(FsError::Unsupported),
         }
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
     }
 }
 
@@ -372,18 +431,25 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    if group_fd != -1 {
-        let valid_group =
-            fd::with_table(task, |t| t.get(group_fd as u32).is_some()).unwrap_or(false);
-        if !valid_group {
+    let group_leader = if group_fd != -1 {
+        let leader = fd::with_table(task, |t| {
+            t.get(group_fd as u32).and_then(|entry| {
+                entry
+                    .ops
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<PerfEventFile>())
+                    .map(|_| Arc::clone(&entry.ops))
+            })
+        })
+        .flatten();
+        if leader.is_none() {
             ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
             return;
         }
-        // Group leaders can expose the single-event GROUP read shape, but
-        // linking member events is not implemented yet.
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
-        return;
-    }
+        leader
+    } else {
+        None
+    };
 
     // Try to allocate PMU counter if target_arch is x86_64
     #[cfg(target_arch = "x86_64")]
@@ -417,11 +483,35 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
 
         if let Some(event) = event_opt {
             // SAFETY: alloc_counter programs PMU hardware registers, which requires CPL=0.
-            unsafe { narf_arch::x86_64::pmu::alloc_counter(event).ok() }
+            match unsafe { narf_arch::x86_64::pmu::alloc_counter(event) } {
+                Ok(counter) => Some(counter),
+                // QEMU and early hardware without a programmable PMU can still
+                // expose the architectural cycle clock. Other hardware events
+                // must not silently degrade to fabricated values.
+                Err(narf_arch::x86_64::pmu::PmuError::NoPmu)
+                    if attr.type_ == 0 && matches!(attr.config, 0 | 9) =>
+                {
+                    None
+                }
+                Err(narf_arch::x86_64::pmu::PmuError::NoFreeCounter) => {
+                    ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
+                    return;
+                }
+                Err(_) => {
+                    ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+                    return;
+                }
+            }
         } else {
             None
         }
     };
+
+    #[cfg(not(target_arch = "x86_64"))]
+    if attr.type_ != 1 && !(attr.type_ == 0 && matches!(attr.config, 0 | 9)) {
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        return;
+    }
 
     // Allocate an fd
     let cloexec = (flags & 8) != 0; // PERF_FLAG_FD_CLOEXEC
@@ -440,14 +530,24 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             enabled_at_ns: AtomicU64::new(0),
             time_enabled_ns: AtomicU64::new(0),
             registered: AtomicBool::new(false),
+            group_members: IrqSafeSpinLock::new(Vec::new()),
             #[cfg(target_arch = "x86_64")]
             pmu_counter,
         });
         if initially_enabled {
             file.enable();
         }
+        let ops: Arc<dyn FileOps> = file.clone();
+        if let Some(leader) = &group_leader {
+            if let Some(event) = leader
+                .as_any()
+                .and_then(|any| any.downcast_ref::<PerfEventFile>())
+            {
+                event.add_group_member(&ops);
+            }
+        }
         let result = t.open(FdEntry {
-            ops: file.clone(),
+            ops,
             offset: 0,
             flags: install_flags,
             status_flags: 0,
@@ -483,15 +583,15 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
 fn is_supported_event(attr: &perf_event_attr) -> bool {
     match attr.type_ {
         // PERF_TYPE_HARDWARE
-        0 => matches!(attr.config, 0..=9),
+        0 => matches!(attr.config, 0..=5 | 9),
         // PERF_TYPE_SOFTWARE
-        1 => matches!(attr.config, 0..=12),
+        1 => matches!(attr.config, 0 | 1 | 2 | 3 | 5 | 9 | 12),
         // PERF_TYPE_HW_CACHE (3)
         3 => {
             let cache_id = attr.config & 0xFF;
             let op_id = (attr.config >> 8) & 0xFF;
             let result_id = (attr.config >> 16) & 0xFF;
-            cache_id <= 6 && op_id <= 2 && result_id <= 1
+            matches!((cache_id, op_id, result_id), (0 | 2, 0, 1))
         }
         // PERF_TYPE_RAW (4)
         4 => true,

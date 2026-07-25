@@ -10,10 +10,12 @@
 #define PERF_FORMAT_TOTAL_TIME_ENABLED (1ULL << 0)
 #define PERF_FORMAT_TOTAL_TIME_RUNNING (1ULL << 1)
 #define PERF_FORMAT_ID (1ULL << 2)
+#define PERF_FORMAT_GROUP (1ULL << 3)
 #define PERF_EVENT_IOC_ENABLE _IO('$', 0)
 #define PERF_EVENT_IOC_DISABLE _IO('$', 1)
 #define PERF_EVENT_IOC_RESET _IO('$', 3)
 #define PERF_EVENT_IOC_ID _IOR('$', 7, uint64_t *)
+#define PERF_IOC_FLAG_GROUP 1
 
 struct perf_event_attr {
     uint32_t type;
@@ -101,6 +103,41 @@ int main() {
     }
     printf("perf_smoke: cycles delta %llu\n", (unsigned long long)stat[0]);
     close(fd);
+
+    // Exercise a real two-member software event group.
+    struct perf_event_attr group_attr;
+    memset(&group_attr, 0, sizeof(group_attr));
+    group_attr.type = 1; // PERF_TYPE_SOFTWARE
+    group_attr.size = sizeof(group_attr);
+    group_attr.config = 0; // PERF_COUNT_SW_CPU_CLOCK
+    group_attr.read_format = PERF_FORMAT_GROUP |
+                             PERF_FORMAT_TOTAL_TIME_ENABLED |
+                             PERF_FORMAT_TOTAL_TIME_RUNNING |
+                             PERF_FORMAT_ID;
+    group_attr.flags = 1; // disabled
+    long group_fd = perf_event_open(&group_attr, 0, -1, -1, 0);
+    group_attr.config = 1; // PERF_COUNT_SW_TASK_CLOCK
+    long member_fd = perf_event_open(&group_attr, 0, -1, group_fd, 0);
+    if (group_fd < 0 || member_fd < 0 ||
+        ioctl(group_fd, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP) != 0 ||
+        ioctl(group_fd, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP) != 0) {
+        printf("perf_smoke: ERROR - event group setup failed\n");
+        return 1;
+    }
+    for (volatile int i = 0; i < 10000; i++) {}
+    if (ioctl(group_fd, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP) != 0) {
+        printf("perf_smoke: ERROR - event group disable failed\n");
+        return 1;
+    }
+    uint64_t group_stat[7] = {0};
+    if (read(group_fd, group_stat, sizeof(group_stat)) != sizeof(group_stat) ||
+        group_stat[0] != 2 || group_stat[4] == 0 || group_stat[6] == 0 ||
+        group_stat[4] == group_stat[6]) {
+        printf("perf_smoke: ERROR - invalid group record\n");
+        return 1;
+    }
+    close(member_fd);
+    close(group_fd);
 
     // Test custom software syscall counter
     struct perf_event_attr sw_attr;

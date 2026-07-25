@@ -829,6 +829,48 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_cpu_hex_mask_format);
 
+/// Linux perf discovers PMU type numbers and raw-event bitfields through
+/// `/sys/bus/event_source/devices`.
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_perf_event_sources() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::sysfs::populate_perf_event_sources();
+    let root = crate::sysfs::sysfs_root();
+    let devices = match root
+        .get_child("bus")
+        .and_then(|b| b.get_child("event_source"))
+        .and_then(|e| e.get_child("devices"))
+    {
+        Some(devices) => devices,
+        None => return TestResult::Fail("perf event-source devices directory missing"),
+    };
+    let cpu = match devices.get_child("cpu") {
+        Some(cpu) => cpu,
+        None => return TestResult::Fail("cpu PMU directory missing"),
+    };
+    if cpu.attr_show("type").as_deref() != Some("4\n")
+        || cpu.attr_show("cpumask").is_none()
+        || cpu
+            .get_child("format")
+            .and_then(|f| f.attr_show("event"))
+            .as_deref()
+            != Some("config:0-7\n")
+    {
+        return TestResult::Fail("cpu PMU discovery attributes invalid");
+    }
+    if devices
+        .get_child("software")
+        .and_then(|s| s.attr_show("type"))
+        .as_deref()
+        != Some("1\n")
+    {
+        return TestResult::Fail("software PMU type missing");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_perf_event_sources);
+
 // ── Test 14: THP `enabled` attr renders with [never] active ──────────
 
 /// `/sys/kernel/mm/transparent_hugepage/enabled` must contain

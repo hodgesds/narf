@@ -338,7 +338,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
         let _ = call(Syscall::Close.raw(), a0(stat_fd as u64));
 
-        // Test 14: group-format wire shape (nr, times, value, id).
+        // Test 14: linked group wire shape and group-wide lifecycle ioctls.
         let group_attr = perf_event_attr {
             read_format: PERF_FORMAT_GROUP
                 | PERF_FORMAT_TOTAL_TIME_ENABLED
@@ -358,7 +358,30 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             Some(f) if f >= 0 => f as u32,
             _ => return Err("perf_event_open(group-format event) failed"),
         };
-        let mut group_read = [0u64; 5];
+        let group_member_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &group_attr as *const _ as u64,
+                0,
+                -1i32 as u64,
+                group_read_fd as u64,
+            ),
+        ) {
+            Some(f) if f >= 0 => f as u32,
+            _ => return Err("perf_event_open(group member) failed"),
+        };
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(group_read_fd as u64, PERF_EVENT_IOC_RESET, 1),
+        ) != Some(0)
+            || call(
+                Syscall::Ioctl.raw(),
+                a2(group_read_fd as u64, PERF_EVENT_IOC_ENABLE, 1),
+            ) != Some(0)
+        {
+            return Err("group-wide RESET/ENABLE failed");
+        }
+        let mut group_read = [0u64; 7];
         match call(
             Syscall::Read.raw(),
             a2(
@@ -367,9 +390,21 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 core::mem::size_of_val(&group_read) as u64,
             ),
         ) {
-            Some(40) if group_read[0] == 1 && group_read[4] != 0 => {}
+            Some(56)
+                if group_read[0] == 2
+                    && group_read[4] != 0
+                    && group_read[6] != 0
+                    && group_read[4] != group_read[6] => {}
             _ => return Err("PERF_FORMAT_GROUP read layout is invalid"),
         }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(group_read_fd as u64, PERF_EVENT_IOC_DISABLE, 1),
+        ) != Some(0)
+        {
+            return Err("group-wide DISABLE failed");
+        }
+        let _ = call(Syscall::Close.raw(), a0(group_member_fd as u64));
         let _ = call(Syscall::Close.raw(), a0(group_read_fd as u64));
 
         // Test 15: unknown read-format bits are rejected at open.

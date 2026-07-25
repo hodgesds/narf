@@ -358,6 +358,14 @@ Linux UAPI field order and width. Malformed or short replies fail with
 `FsError::InvalidData`; a disconnected daemon fails pending requests
 without leaving callers parked indefinitely.
 
+### 3.9 Linux synthetic filesystem projections
+
+With `linux-compat`, sysfs exposes only interfaces backed by a NARF authority.
+The perf discovery projection is
+`/sys/bus/event_source/devices/{cpu,software}`: it publishes PMU type numbers,
+the online CPU mask, and the raw CPU PMU `format/*` bitfields. Model-specific
+event aliases must not be published until derived from the detected PMU.
+
 ## 4. Invariants & safety properties
 
 - **No ambient root.** A task that holds no `Cap<FileNode, _>` can

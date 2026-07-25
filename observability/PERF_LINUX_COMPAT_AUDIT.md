@@ -27,10 +27,10 @@ over that authority; it is not a second PMU subsystem.
 
 | `perf` surface | Required kernel ABI | NARF status | Notes |
 | --- | --- | --- | --- |
-| `perf --version`, help | ELF loader, libc, terminal | userspace-dependent | The upstream CLI still needs to be packaged in the initramfs. |
+| `perf --version`, help | ELF loader, libc, terminal | supported in Alpine rootfs | `REGEN_perf_rootfs.sh` packages Alpine's unmodified musl-linked perf and its shared-library closure. |
 | `perf stat -e cycles <cmd>` | counting event, enable-on-exec, 24-byte read format | supported slice | Counting is system-global during the window; exact target-task attribution is deferred. |
 | `perf stat -e cycles,instructions <cmd>` | independent fds, scaling times | supported slice | Hardware availability still bounds simultaneous events. |
-| `perf stat -e '{cycles,instructions}'` | event groups and group leader reads | partial | A single-event group read is ABI-correct; member linkage and group scheduling are not implemented. |
+| `perf stat -e '{cycles,instructions}'` | event groups and group leader reads | supported slice | Members are linked to the leader; group reads and group lifecycle ioctls cover the non-multiplexed counting case. |
 | `perf stat -a` | per-CPU events and online CPU discovery | partial | CPU validation exists; counters are not pinned or migrated per CPU. |
 | `perf stat -p PID` | task-scoped accounting | partial | PID validation exists; accounting is not scheduler-switched with the target. |
 | `perf record` | overflow sampling, mmap metadata/data ring, poll wakeups | unsupported | No `perf_event_mmap_page` producer or PMI-to-record path yet. |
@@ -62,8 +62,6 @@ Gaps:
   scheduler-attributed.
 - `enable_on_exec` currently enables when the event is installed. This gives
   the CLI a usable counting window but includes setup overhead.
-- Group members are not linked to their leader and `PERF_IOC_FLAG_GROUP`
-  has no group-wide effect.
 - Pinned/exclusive events, inheritance, output redirection, refresh,
   period changes, filters, SIGTRAP delivery, and namespace/cgroup modes are
   absent.
@@ -89,11 +87,11 @@ Gaps:
 
 ## Required implementation sequence
 
-1. Finish `perf stat`: task/CPU attribution, real group linkage, honest PMU
-   allocation failure, multiplex scaling, capability authorization, and a
-   packaged upstream CLI smoke.
-2. Add minimal perf sysfs: `cpu/type`, `software/type`, CPU masks, supported
-   `format/*`, and only aliases backed by the detected PMU.
+1. Finish `perf stat`: task/CPU attribution, multiplex scaling, and capability
+   authorization. The upstream CLI smoke is reproducible via
+   `TEST_perf_cli.sh`.
+2. Extend the minimal perf sysfs projection with only event aliases backed by
+   the detected PMU.
 3. Add sampling: pinned user pages, `perf_event_mmap_page`, data ring,
    acquire/release indices, `PERF_RECORD_SAMPLE`/`LOST`, poll wakeups, and
    overflow interrupt routing.
@@ -116,3 +114,8 @@ Every completed row requires:
   on physical hardware under `verification/specification/spec.md` section 8;
   no accuracy or overhead number may be claimed from QEMU or a single sample.
 
+Run the current upstream CLI gate as root:
+
+```sh
+verification/data/musl-demo/TEST_perf_cli.sh
+```

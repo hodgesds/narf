@@ -1474,6 +1474,34 @@ pub fn populate_cpu_devices() {
     }
 }
 
+/// Populate the Linux perf event-source discovery tree.
+///
+/// Only interfaces backed by the current compatibility adapter are exposed:
+/// the generic CPU raw-PMU type and software counters. Model-specific event
+/// aliases are deliberately omitted until they can be generated from the
+/// detected PMU rather than guessed.
+pub fn populate_perf_event_sources() {
+    let root = get_root();
+    let bus = get_or_create_child(&root, "bus");
+    let event_source = get_or_create_child(&bus, "event_source");
+    let devices = get_or_create_child(&event_source, "devices");
+
+    let cpu = get_or_create_child(&devices, "cpu");
+    kobject_add_attr(&cpu, "type", || "4\n".to_string());
+    let cpumask = cpu_range_string(smp::cpu_count().max(1));
+    kobject_add_attr(&cpu, "cpumask", move || cpumask.clone());
+    let format = get_or_create_child(&cpu, "format");
+    kobject_add_attr(&format, "event", || "config:0-7\n".to_string());
+    kobject_add_attr(&format, "umask", || "config:8-15\n".to_string());
+    kobject_add_attr(&format, "edge", || "config:18\n".to_string());
+    kobject_add_attr(&format, "any", || "config:21\n".to_string());
+    kobject_add_attr(&format, "inv", || "config:23\n".to_string());
+    kobject_add_attr(&format, "cmask", || "config:24-31\n".to_string());
+
+    let software = get_or_create_child(&devices, "software");
+    kobject_add_attr(&software, "type", || "1\n".to_string());
+}
+
 // ── Desktop/laptop device classes (LED / power_supply / thermal / hwmon) ──
 //
 // These four classes expose the static, plausible values a real laptop would
@@ -1733,6 +1761,7 @@ pub fn populate_all() {
     populate_numa_nodes();
     populate_weighted_interleave();
     populate_cpu_devices();
+    populate_perf_event_sources();
     // ── Desktop/laptop device classes (single merge-friendly block) ──
     // /sys/class/{leds,power_supply,thermal,hwmon,rtc} for udev / upower /
     // lm-sensors / GNOME / KDE enumeration and util-linux / hwclock /
