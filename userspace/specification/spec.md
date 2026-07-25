@@ -190,14 +190,23 @@ event's mapped ring while retaining loss accounting on the source event; the
 target must describe the same task and CPU context, and `-1` detaches it.
 On x86_64, `PERF_EVENT_IOC_PERIOD` synchronously validates and installs a new
 nonzero hardware sampling period while the event is disabled. Updating a live
-or remotely active event returns an error until a synchronous cross-CPU PMU
-control path exists; NARF does not defer the update and report false success.
+or remotely active x86_64 event returns an error until a synchronous cross-CPU
+PMU control path exists; NARF does not defer the update and report false
+success.
 On aarch64, fixed-period `PERF_COUNT_HW_CPU_CYCLES` sampling uses the
 architectural 64-bit cycle counter, a firmware-discovered level-sensitive
 PMUv3 PPI, and the same deferred mmap-ring producer. The end-to-end QEMU gate
 requires a real PMCCNTR overflow, GICv3 dispatch, PMOVS acknowledgement, and
-visible mmap sample. Frequency mode, programmable PMUv3 events, and live
-period updates remain explicit errors.
+visible mmap sample. Instructions, cache misses, branch instructions, branch
+misses, and raw architectural event numbers are admitted only when the
+corresponding PMCEID bit proves that the PMUv3 implementation supports them.
+Their programmable-counter overflows use the same PPI and deferred producer.
+Frequency mode adjusts the real next-overflow reload period from observed
+overflow timing. `PERF_EVENT_IOC_PERIOD` synchronously rearms an active
+current-CPU aarch64 counter or validates a disabled/switched-out event against
+a temporary real counter. A remotely active event returns an error until a
+synchronous IPI rendezvous exists. Sampling periods below 10,000 events return
+an error to prevent an interrupt storm.
 Successful `mmap(2)` commits emit `PERF_RECORD_MMAP` or `MMAP2` for executable
 and/or data VMAs selected by `mmap`, `mmap2`, and `mmap_data`. File mappings
 carry the fd's recorded path and stable filesystem inode; anonymous mappings

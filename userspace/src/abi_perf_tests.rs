@@ -20,7 +20,6 @@ const PERF_FORMAT_LOST: u64 = 1 << 4;
 const PERF_EVENT_IOC_ENABLE: u64 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u64 = 0x2401;
 const PERF_EVENT_IOC_RESET: u64 = 0x2403;
-#[cfg(target_arch = "x86_64")]
 const PERF_EVENT_IOC_PERIOD: u64 = 0x4008_2404;
 const PERF_EVENT_IOC_SET_OUTPUT: u64 = 0x2405;
 const PERF_EVENT_IOC_ID: u64 = 0x8008_2407;
@@ -1014,7 +1013,7 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
             type_: 0,
             size: core::mem::size_of::<PerfEventAttr>() as u32,
             config: 0,
-            sample_period_or_freq: 1_000,
+            sample_period_or_freq: 200_000,
             sample_type: 1,
             flags: 1,
             ..PerfEventAttr::default()
@@ -1040,6 +1039,18 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
         ) != Some(0)
         {
             return Err("PMUv3 enable failed");
+        }
+        let live_period = 100_000u64;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(
+                fd as u64,
+                PERF_EVENT_IOC_PERIOD,
+                &live_period as *const u64 as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("PMUv3 live period update failed");
         }
         if unsafe { narf_arch::aarch64::sysreg::read_pmcntenset_el0() } & (1 << 31) == 0 {
             return Err("PMUv3 cycle enable bit was not set by ioctl enable");
@@ -1086,7 +1097,7 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
             return Err("PMUv3 overflow pending without PPI dispatch");
         }
         let raw = unsafe { narf_arch::aarch64::sysreg::read_pmccntr_el0() };
-        let preload = 0u64.wrapping_sub(1_000);
+        let preload = 0u64.wrapping_sub(live_period);
         if raw == preload {
             return Err("PMUv3 cycle counter did not advance after enable");
         }
@@ -1098,3 +1109,132 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("syscall_abi", smoke_abi_perf_pmuv3_overflow_record);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_abi_perf_pmuv3_programmable_overflow_record() -> TestResult {
+    with_setup(|| {
+        let attr = PerfEventAttr {
+            type_: 4,     // PERF_TYPE_RAW
+            config: 0x11, // ARM PMUv3 CPU cycles
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            sample_period_or_freq: 100_000,
+            sample_type: 1,
+            flags: 1,
+            ..PerfEventAttr::default()
+        };
+        let fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("PMUv3 programmable event was not admitted"),
+        };
+        let ops = crate::fd::with_table(FAKE_TASK, |table| {
+            table.get(fd).map(|entry| entry.ops.clone())
+        })
+        .flatten()
+        .ok_or("PMUv3 programmable fd missing")?;
+        let frames = ops
+            .mmap_frames(0, 3 * 4096)
+            .map_err(|_| "PMUv3 programmable mmap failed")?;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+        ) != Some(0)
+        {
+            return Err("PMUv3 programmable enable failed");
+        }
+        struct IrqMaskRestore(bool);
+        impl Drop for IrqMaskRestore {
+            fn drop(&mut self) {
+                if self.0 {
+                    unsafe { narf_arch::disable_interrupts() };
+                }
+            }
+        }
+        let restore_mask = !narf_arch::interrupts_enabled();
+        if restore_mask {
+            unsafe { narf_arch::enable_interrupts() };
+        }
+        let _irq_mask_restore = IrqMaskRestore(restore_mask);
+        for _ in 0..200 {
+            for _ in 0..10_000 {
+                core::hint::black_box(());
+            }
+            crate::perf_event::drain_irq_samples();
+            if unsafe { core::ptr::read_volatile((frames[0] as usize + 1024) as *const u64) } != 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                return Ok(());
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Err("PMUv3 programmable overflow produced no mmap sample")
+    })
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_perf_pmuv3_programmable_overflow_record
+);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_abi_perf_pmuv3_frequency_record() -> TestResult {
+    with_setup(|| {
+        let attr = PerfEventAttr {
+            type_: 0,
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: 0,
+            sample_period_or_freq: 1_000,
+            sample_type: 1,
+            flags: 1 | (1 << 10),
+            ..PerfEventAttr::default()
+        };
+        let fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("PMUv3 frequency event was not admitted"),
+        };
+        let ops = crate::fd::with_table(FAKE_TASK, |table| {
+            table.get(fd).map(|entry| entry.ops.clone())
+        })
+        .flatten()
+        .ok_or("PMUv3 frequency fd missing")?;
+        let frames = ops
+            .mmap_frames(0, 3 * 4096)
+            .map_err(|_| "PMUv3 frequency mmap failed")?;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+        ) != Some(0)
+        {
+            return Err("PMUv3 frequency enable failed");
+        }
+        let restore_mask = !narf_arch::interrupts_enabled();
+        if restore_mask {
+            unsafe { narf_arch::enable_interrupts() };
+        }
+        for _ in 0..400 {
+            for _ in 0..10_000 {
+                core::hint::black_box(());
+            }
+            crate::perf_event::drain_irq_samples();
+            if unsafe { core::ptr::read_volatile((frames[0] as usize + 1024) as *const u64) } >= 32
+            {
+                if restore_mask {
+                    unsafe { narf_arch::disable_interrupts() };
+                }
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                return Ok(());
+            }
+        }
+        if restore_mask {
+            unsafe { narf_arch::disable_interrupts() };
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Err("PMUv3 frequency overflow produced no mmap sample")
+    })
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("syscall_abi", smoke_abi_perf_pmuv3_frequency_record);

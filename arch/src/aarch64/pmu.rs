@@ -10,8 +10,11 @@ use super::sysreg;
 
 const MAX_CPUS: usize = narf_lib::percpu::MAX_CPUS;
 const CYCLE_BIT: u64 = 1 << 31;
+const MIN_SAMPLE_PERIOD: u64 = 10_000;
 static ALLOCATED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 static PROGRAMMABLE_ALLOCATED: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static PROGRAMMABLE_PERIOD: [[AtomicU64; 31]; MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; 31] }; MAX_CPUS];
 static PERIOD: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static LAST_OVERFLOW_PERIOD: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
@@ -33,12 +36,17 @@ pub enum PmuError {
     NoFreeCounter,
     WrongCpu,
     InvalidPeriod,
+    UnsupportedEvent,
 }
 
 pub fn available() -> bool {
     // ID_AA64DFR0_EL1.PMUVer values 0 and 0xf mean absent/unimplemented.
     let version = ((unsafe { sysreg::read_id_aa64dfr0_el1() } >> 8) & 0xf) as u8;
     version != 0 && version != 0xf
+}
+
+pub const fn minimum_sample_period() -> u64 {
+    MIN_SAMPLE_PERIOD
 }
 
 /// Number of architectural programmable event counters implemented.
@@ -49,11 +57,22 @@ pub fn programmable_counter_count() -> u8 {
     (((unsafe { sysreg::read_pmcr_el0() } >> 11) & 0x1f) as u8).min(31)
 }
 
+pub fn event_supported(event: u16) -> bool {
+    match event {
+        0..=31 => (unsafe { sysreg::read_pmceid0_el0() } & (1u64 << event)) != 0,
+        32..=63 => (unsafe { sysreg::read_pmceid1_el0() } & (1u64 << (event - 32))) != 0,
+        _ => false,
+    }
+}
+
 /// Allocate and type one current-CPU programmable event counter.
 ///
 /// # Safety
 /// EL1, pinned to the current CPU until release.
 pub unsafe fn alloc_programmable(event: u16) -> Result<ProgrammableCounter, PmuError> {
+    if !event_supported(event) {
+        return Err(PmuError::UnsupportedEvent);
+    }
     let count = programmable_counter_count();
     if count == 0 {
         return Err(PmuError::NoPmu);
@@ -143,7 +162,7 @@ pub unsafe fn pause_programmable(counter: &ProgrammableCounter) -> Result<(), Pm
 /// `counter` is live and owned by the current CPU; its firmware PPI is routed.
 pub unsafe fn arm_programmable(counter: &ProgrammableCounter, period: u64) -> Result<(), PmuError> {
     check_programmable(counter)?;
-    if period == 0 || period > u32::MAX as u64 {
+    if !(MIN_SAMPLE_PERIOD..=u32::MAX as u64).contains(&period) {
         return Err(PmuError::InvalidPeriod);
     }
     let bit = 1u64 << counter.idx;
@@ -156,7 +175,50 @@ pub unsafe fn arm_programmable(counter: &ProgrammableCounter, period: u64) -> Re
         sysreg::write_pmintenset_el1(bit);
         sysreg::write_pmcntenset_el0(bit);
     }
+    PROGRAMMABLE_PERIOD[counter.cpu as usize][counter.idx as usize]
+        .store(period, Ordering::Release);
     Ok(())
+}
+
+/// Acknowledge and synchronously re-arm all owned programmable overflows.
+///
+/// Returns a physical-counter bitmap (bit N corresponds to PMEVCNTRN).
+///
+/// # Safety
+/// Called from the firmware-routed PMU PPI on the current CPU.
+pub unsafe fn handle_programmable_overflows() -> u32 {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= MAX_CPUS {
+        return 0;
+    }
+    let allocated = PROGRAMMABLE_ALLOCATED[cpu].load(Ordering::Acquire);
+    if allocated == 0 {
+        return 0;
+    }
+    let implemented = programmable_counter_count();
+    let implemented_mask = if implemented == 0 {
+        0
+    } else {
+        (1u32 << implemented) - 1
+    };
+    let pending = (unsafe { sysreg::read_pmovsclr_el0() } as u32) & implemented_mask & allocated;
+    for idx in 0..implemented {
+        let bit = 1u32 << idx;
+        if pending & bit == 0 {
+            continue;
+        }
+        let period = PROGRAMMABLE_PERIOD[cpu][idx as usize].load(Ordering::Acquire);
+        unsafe {
+            sysreg::write_pmcntenclr_el0(bit as u64);
+            sysreg::write_pmovsclr_el0(bit as u64);
+            if period != 0 {
+                select_programmable(idx);
+                sysreg::write_pmxevcntr_el0((0u32.wrapping_sub(period as u32)) as u64);
+                sysreg::write_pmcntenset_el0(bit as u64);
+            }
+        }
+    }
+    pending
 }
 
 /// Release a current-CPU programmable counter.
@@ -168,6 +230,7 @@ pub unsafe fn release_programmable(counter: ProgrammableCounter) -> Result<(), P
     unsafe { pause_programmable(&counter)? };
     PROGRAMMABLE_ALLOCATED[counter.cpu as usize]
         .fetch_and(!(1u32 << counter.idx), Ordering::Release);
+    PROGRAMMABLE_PERIOD[counter.cpu as usize][counter.idx as usize].store(0, Ordering::Release);
     Ok(())
 }
 
@@ -212,13 +275,23 @@ pub unsafe fn read(counter: &CycleCounter) -> Result<u64, PmuError> {
     Ok(unsafe { sysreg::read_pmccntr_el0() })
 }
 
+/// Enable cycle counting without overflow interrupts.
+///
+/// # Safety
+/// `counter` is live and owned by the current CPU.
+pub unsafe fn start(counter: &CycleCounter) -> Result<(), PmuError> {
+    check_cpu(counter)?;
+    unsafe { sysreg::write_pmcntenset_el0(CYCLE_BIT) };
+    Ok(())
+}
+
 /// Preload and arm interrupt-on-overflow sampling.
 ///
 /// # Safety
 /// `counter` is live and owned by the current CPU; its firmware PPI is routed.
 pub unsafe fn arm_sampling(counter: &CycleCounter, period: u64) -> Result<(), PmuError> {
     check_cpu(counter)?;
-    if period == 0 {
+    if period < MIN_SAMPLE_PERIOD {
         return Err(PmuError::InvalidPeriod);
     }
     let cpu = counter.cpu as usize;
@@ -275,6 +348,26 @@ pub fn last_overflow_period(cpu: usize) -> u64 {
     LAST_OVERFLOW_PERIOD
         .get(cpu)
         .map_or(0, |period| period.load(Ordering::Acquire))
+}
+
+pub fn programmable_period(cpu: usize, counter: usize) -> u64 {
+    PROGRAMMABLE_PERIOD
+        .get(cpu)
+        .and_then(|periods| periods.get(counter))
+        .map_or(0, |period| period.load(Ordering::Acquire))
+}
+
+pub fn update_sampling_period(counter: &CycleCounter, period: u64) {
+    if period != 0 {
+        PERIOD[counter.cpu as usize].store(period, Ordering::Release);
+    }
+}
+
+pub fn update_programmable_period(counter: &ProgrammableCounter, period: u64) {
+    if period != 0 && period <= u32::MAX as u64 {
+        PROGRAMMABLE_PERIOD[counter.cpu as usize][counter.idx as usize]
+            .store(period, Ordering::Release);
+    }
 }
 
 /// Release a current-CPU counter.
