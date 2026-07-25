@@ -1425,7 +1425,10 @@ impl SocketFile {
             SocketOp::Send { buf, .. } => {
                 self.ensure_netlink_portid();
                 let sent = buf.len() as u64;
-                let msgs = narf_net::netlink_route::build_dump(buf);
+                let msgs = match narf_net::netlink_route::build_replies(buf) {
+                    Ok(msgs) => msgs,
+                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                };
                 {
                     let mut g = self.state.lock();
                     match &mut *g {

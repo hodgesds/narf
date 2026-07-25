@@ -298,6 +298,10 @@ fn build_error(errno: i32, seq: u32, pid: u32, req: &[u8]) -> Vec<u8> {
     frame_message(NLMSG_ERROR, 0, seq, pid, &body)
 }
 
+fn build_ack(seq: u32, req: &[u8]) -> Vec<u8> {
+    build_error(0, seq, 0, req)
+}
+
 // ── dump entry point ────────────────────────────────────────────────────
 
 /// Enumerate the interfaces the dump should describe. Loopback is synthetic
@@ -416,6 +420,45 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
         }
     }
     out
+}
+
+/// Parse every aligned `nlmsghdr` in one netlink datagram and build a single
+/// ordered reply queue. Linux permits callers to batch multiple requests in
+/// one `sendmsg`; each request retains its own sequence number. Successful
+/// requests carrying `NLM_F_ACK` receive an `NLMSG_ERROR` with error zero
+/// after their dump. A malformed message length rejects the whole datagram.
+pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+    let mut offset = 0usize;
+    let mut replies = Vec::new();
+
+    while offset < datagram.len() {
+        let remaining = &datagram[offset..];
+        let hdr = parse_hdr(remaining).ok_or(())?;
+        let msg_len = hdr.len as usize;
+        if msg_len < NLMSG_HDRLEN || msg_len > remaining.len() {
+            return Err(());
+        }
+        let request = &remaining[..msg_len];
+        let supported = matches!(hdr.msg_type, RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE);
+        if supported && hdr.flags & NLM_F_ACK != 0 {
+            replies.push(build_ack(hdr.seq, request));
+        }
+        replies.extend(build_dump(request));
+
+        let step = nlmsg_align(msg_len);
+        if step > remaining.len() {
+            // An unpadded final message is valid only when its declared bytes
+            // exactly consume the datagram.
+            if msg_len == remaining.len() {
+                offset = datagram.len();
+            } else {
+                return Err(());
+            }
+        } else {
+            offset += step;
+        }
+    }
+    Ok(replies)
 }
 
 #[cfg(test)]

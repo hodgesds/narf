@@ -118,7 +118,10 @@ administration path; control-plane writes continue to require the typed
 AF_NETLINK sockets retain their bound `sockaddr_nl` port ID and group mask,
 support a connected kernel or userspace destination, auto-bind before the
 first send, and expose Linux `SOL_NETLINK` membership and feature-option
-round trips. Kernel-originated messages use port ID zero.
+round trips. Kernel-originated messages use port ID zero. A send may contain
+multiple `NLMSG_ALIGN`-framed requests; replies preserve request order and
+sequence numbers. `NLM_F_ACK` requests receive `NLMSG_ERROR` with error zero
+after successful handling, while malformed framing fails with `EINVAL`.
 
 ## 4. Invariants & safety properties
 

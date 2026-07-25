@@ -156,3 +156,37 @@ fn unsupported_request_yields_eopnotsupp_error() {
     ]);
     assert_eq!(err, -EOPNOTSUPP, "error payload carries -EOPNOTSUPP");
 }
+
+#[test]
+fn batched_requests_keep_sequence_and_ack_independent() {
+    let mut first = req(RTM_GETLINK, 101, 77);
+    first[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP | NLM_F_ACK).to_le_bytes());
+    let second = req(RTM_GETADDR, 202, 77);
+    first.extend_from_slice(&second);
+
+    let replies = build_replies(&first).expect("valid batched datagram");
+    assert!(replies.iter().any(|m| {
+        let h = parse_hdr(m).unwrap();
+        h.msg_type == RTM_NEWLINK && h.seq == 101
+    }));
+    assert!(replies.iter().any(|m| {
+        let h = parse_hdr(m).unwrap();
+        h.msg_type == NLMSG_ERROR
+            && h.seq == 101
+            && i32::from_le_bytes(m[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()) == 0
+    }));
+    assert!(replies.iter().any(|m| {
+        let h = parse_hdr(m).unwrap();
+        h.msg_type == RTM_NEWADDR && h.seq == 202
+    }));
+}
+
+#[test]
+fn malformed_batched_message_length_is_rejected() {
+    let mut message = req(RTM_GETLINK, 1, 0);
+    message[0..4].copy_from_slice(&15u32.to_le_bytes());
+    assert!(build_replies(&message).is_err());
+
+    message[0..4].copy_from_slice(&1024u32.to_le_bytes());
+    assert!(build_replies(&message).is_err());
+}
