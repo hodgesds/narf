@@ -499,8 +499,12 @@ jobs:
           if-no-files-found: ignore
 
   kernel-test:
-    name: kernel-test (x86_64)
+    name: kernel-test (${{ matrix.arch }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
     # The full in-kernel smoke suite (~5100 tests) runs in one QEMU boot
     # under TCG (no KVM on GHA), plus a cold build of the kernel +
     # verification crates and the phase-2 boot-smoke pass. Generous.
@@ -522,6 +526,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 \
+            qemu-system-arm \
             cpio \
             mtools \
             dosfstools \
@@ -533,6 +538,7 @@ jobs:
       # Ubuntu's QEMU 8.2 flakes the kernel-test suite on GHA ("QEMU exited
       # None" — silent abort/timeout, no crash dump); build a newer one.
       - name: Set up newer QEMU (past the 8.2 instability)
+        if: matrix.arch == 'x86_64'
         uses: ./.github/actions/setup-qemu
 
       - name: Cache cargo registry + git
@@ -548,8 +554,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: target-${{ runner.os }}-x86_64-kernel-test-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          restore-keys: target-${{ runner.os }}-x86_64-
+          key: target-${{ runner.os }}-${{ matrix.arch }}-kernel-test-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: target-${{ runner.os }}-${{ matrix.arch }}-
 
       # Phase 1 boots the kernel-test image and FAILS the job if any
       # smoke fails (the runner exit_kernel(1)s on failure; xtask test
@@ -568,7 +574,7 @@ jobs:
         env:
           XTASK_QEMU_TIMEOUT_SECS: "2400"
           XTASK_BOOT_SMOKE_TIMEOUT_SECS: "1200"
-        run: cargo xtask test --arch=x86_64 --features cgroup-all
+        run: cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all
 
   feature-matrix:
     name: feature-check / ${{ matrix.features }}
