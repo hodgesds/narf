@@ -106,6 +106,7 @@ pub struct FuseConnection {
     negotiated_flags: AtomicU64,
     max_write: AtomicU32,
     max_pages: AtomicU16,
+    syncfs_supported: AtomicBool,
 }
 
 impl core::fmt::Debug for FuseConnection {
@@ -141,6 +142,7 @@ impl FuseConnection {
             negotiated_flags: AtomicU64::new(0),
             max_write: AtomicU32::new(4096),
             max_pages: AtomicU16::new(32),
+            syncfs_supported: AtomicBool::new(true),
         }
     }
 
@@ -458,6 +460,32 @@ impl FuseConnection {
         match reply.error {
             0 => Ok(reply.body),
             e => Err(errno_to_fs_error(e)),
+        }
+    }
+
+    /// Linux treats the first `FUSE_SYNCFS` `-ENOSYS` reply as success and
+    /// suppresses the opcode for the rest of this connection.
+    pub(crate) async fn request_syncfs(self: &Arc<Self>) -> Result<(), FsError> {
+        if !self.syncfs_supported.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.is_connected() {
+            return Err(FsError::Unsupported);
+        }
+        let body = pod_as_bytes(&FuseSyncfsIn::default());
+        let unique = self.submit(FuseOpcode::Syncfs, FUSE_ROOT_ID, &body);
+        let reply = ReplyFuture {
+            conn: Arc::clone(self),
+            unique,
+        }
+        .await;
+        match reply.error {
+            0 => Ok(()),
+            -38 => {
+                self.syncfs_supported.store(false, Ordering::Release);
+                Ok(())
+            }
+            error => Err(errno_to_fs_error(error)),
         }
     }
 }
@@ -897,16 +925,7 @@ impl FileOps for FuseFile {
     }
 
     fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
-        Box::pin(async move {
-            self.conn
-                .request(
-                    FuseOpcode::Syncfs,
-                    FUSE_ROOT_ID,
-                    pod_as_bytes(&FuseSyncfsIn::default()),
-                )
-                .await
-                .map(|_| ())
-        })
+        Box::pin(async move { self.conn.request_syncfs().await })
     }
 
     fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
@@ -1358,16 +1377,7 @@ impl DirOps for FuseDir {
     }
 
     fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
-        Box::pin(async move {
-            self.conn
-                .request(
-                    FuseOpcode::Syncfs,
-                    FUSE_ROOT_ID,
-                    pod_as_bytes(&FuseSyncfsIn::default()),
-                )
-                .await
-                .map(|_| ())
-        })
+        Box::pin(async move { self.conn.request_syncfs().await })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {

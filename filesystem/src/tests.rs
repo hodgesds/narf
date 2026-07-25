@@ -2777,6 +2777,72 @@ fn smoke_fs_fuse_struct_sizes() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_struct_sizes);
 
+fn smoke_fs_fuse_syncfs_enosys_is_cached() -> TestResult {
+    use crate::fuse::{pod_from_bytes, FuseInHeader, FuseOpcode};
+    use crate::fuse_conn::FuseConnection;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    static REQUESTS: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+    REQUESTS.store(0, Ordering::Relaxed);
+    narf_scheduler::__reset_queues_for_test();
+
+    let conn = Arc::new(FuseConnection::new());
+    let daemon_conn = Arc::clone(&conn);
+    narf_scheduler::spawn(async move {
+        for _ in 0..1024 {
+            if let Some(request) = daemon_conn.dequeue_request() {
+                let Some(header) = pod_from_bytes::<FuseInHeader>(&request) else {
+                    OUTCOME.store(3, Ordering::Relaxed);
+                    return;
+                };
+                if header.opcode != FuseOpcode::Syncfs as u32 {
+                    OUTCOME.store(4, Ordering::Relaxed);
+                    return;
+                }
+                REQUESTS.fetch_add(1, Ordering::Relaxed);
+                let reply = fuse_reply(header.unique, -38, &[]);
+                let _ = daemon_conn.complete_reply(&reply);
+            } else if OUTCOME.load(Ordering::Relaxed) != 0 {
+                return;
+            } else {
+                narf_scheduler::yield_now().await;
+            }
+        }
+        OUTCOME.store(5, Ordering::Relaxed);
+    });
+
+    let client_conn = Arc::clone(&conn);
+    narf_scheduler::spawn(async move {
+        let result = client_conn.request_syncfs().await;
+        let cached = client_conn.request_syncfs().await;
+        OUTCOME.store(
+            if result.is_ok() && cached.is_ok() {
+                1
+            } else {
+                2
+            },
+            Ordering::Relaxed,
+        );
+    });
+    narf_scheduler::run_until_empty();
+
+    match (
+        OUTCOME.load(Ordering::Relaxed),
+        REQUESTS.load(Ordering::Relaxed),
+    ) {
+        (1, 1) if conn.dequeue_request().is_none() => TestResult::Pass,
+        (1, _) => TestResult::Fail("FUSE_SYNCFS ENOSYS was not cached"),
+        (2, _) => TestResult::Fail("FUSE_SYNCFS ENOSYS did not succeed"),
+        (3, _) => TestResult::Fail("FUSE_SYNCFS request header malformed"),
+        (4, _) => TestResult::Fail("unexpected opcode in syncfs fallback"),
+        _ => TestResult::Fail("FUSE_SYNCFS fallback tasks did not complete"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_syncfs_enosys_is_cached);
+
 fn smoke_fs_fuse_request_context() -> TestResult {
     use crate::fuse::{pod_from_bytes, FuseInHeader, FuseOpcode};
     use crate::fuse_conn::{

@@ -183,6 +183,8 @@ and releases the handle.
 `FileOps::syncfs` and `DirOps::syncfs` back Linux `syncfs(fd)`, which
 validates the descriptor and flushes its backing filesystem. FUSE sends
 `FUSE_SYNCFS` to the mount's root node with the Linux zeroed request body.
+If the daemon replies `ENOSYS`, that call succeeds and the connection
+suppresses subsequent `FUSE_SYNCFS` requests, matching Linux.
 
 `DirOps::rename_to` and `DirOps::link_to` express atomic operations
 between two directories of one filesystem. FUSE translates the target
