@@ -1661,6 +1661,54 @@ impl DirOps for FuseDir {
         })
     }
 
+    fn link_node<'a>(&'a self, name: &'a str, node: Arc<dyn FileOps>) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let source = node
+                .as_any()
+                .and_then(|any| any.downcast_ref::<FuseFile>())
+                .ok_or(FsError::Unsupported)?;
+            if !Arc::ptr_eq(&self.conn, &source.conn) {
+                return Err(FsError::Unsupported);
+            }
+            let reply = self
+                .named_request(
+                    FuseOpcode::Link,
+                    &pod_as_bytes(&FuseLinkIn {
+                        oldnodeid: source.attr.nodeid,
+                    }),
+                    &[name],
+                )
+                .await?;
+            let _: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(())
+        })
+    }
+
+    fn tmpfile<'a>(&'a self, mode: u32) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let body = pod_as_bytes(&FuseCreateIn {
+                flags: 2, // O_RDWR
+                mode: S_IFREG | (mode & 0o7777),
+                umask: 0,
+                open_flags: 0,
+            });
+            let reply = self
+                .conn
+                .request(FuseOpcode::Tmpfile, self.nodeid, body)
+                .await?;
+            let entry: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            let open_off = core::mem::size_of::<FuseEntryOut>();
+            let open: FuseOpenOut =
+                pod_from_bytes(reply.get(open_off..).ok_or(FsError::InvalidData)?)
+                    .ok_or(FsError::InvalidData)?;
+            Ok(self.file_from_entry(entry, Some(open.fh)))
+        })
+    }
+
+    fn supports_tmpfile(&self) -> bool {
+        true
+    }
+
     fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             let reply = self

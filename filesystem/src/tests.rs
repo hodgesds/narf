@@ -3247,10 +3247,17 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
             };
             Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
         }
-        // FUSE_CREATE (35): entry followed by open result.
-        35 => {
+        // FUSE_CREATE (35) / FUSE_TMPFILE (51): entry followed by open result.
+        35 | 51 => {
+            if opcode == 51 {
+                let input: FuseCreateIn = pod_from_bytes(body)?;
+                if hdr.nodeid != FUSE_ROOT_ID || input.flags != 2 || input.mode != (S_IFREG | 0o600)
+                {
+                    return Some(fuse_reply(unique, -22, &[]));
+                }
+            }
             let entry = FuseEntryOut {
-                nodeid: 4,
+                nodeid: if opcode == 51 { 6 } else { 4 },
                 generation: 1,
                 attr: file_attr,
                 ..Default::default()
@@ -3571,6 +3578,17 @@ fn smoke_fs_fuse_mutations() -> TestResult {
                 return;
             }
         };
+        let tmpfile = match root.tmpfile(0o600).await {
+            Ok(file) => file,
+            Err(_) => {
+                OUTCOME.store(6, Ordering::Relaxed);
+                return;
+            }
+        };
+        if root.link_node("published", tmpfile).await.is_err() {
+            OUTCOME.store(6, Ordering::Relaxed);
+            return;
+        }
         let large_write = alloc::vec![0x5a; 128 * 1024 + 17];
         if root.fsync(false).await.is_err()
             || root.fsync(true).await.is_err()
@@ -3682,6 +3700,7 @@ fn smoke_fs_fuse_mutations() -> TestResult {
         3 => TestResult::Fail("FUSE_CREATE failed"),
         4 => TestResult::Fail("FUSE file mutation failed"),
         5 => TestResult::Fail("FUSE namespace mutation failed"),
+        6 => TestResult::Fail("FUSE_TMPFILE materialisation failed"),
         _ => TestResult::Fail("FUSE mutation client never completed"),
     }
 }

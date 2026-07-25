@@ -1061,6 +1061,15 @@ pub trait DirOps: Send + Sync {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 
+    /// Create an unnamed regular inode owned by this filesystem.
+    ///
+    /// The returned node can later be materialised with [`DirOps::link_node`].
+    /// Filesystems which only support named creation retain the
+    /// `Unsupported` default.
+    fn tmpfile<'a>(&'a self, _mode: u32) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
     /// Whether this directory can hold an anonymous `O_TMPFILE` inode and
     /// later materialise it via [`DirOps::link_node`]. The open handler
     /// checks this before minting the nameless inode so a directory on a

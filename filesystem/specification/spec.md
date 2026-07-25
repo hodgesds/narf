@@ -190,6 +190,9 @@ replies by the non-zero `unique` identifier.
   write, flush, fsync/fdatasync, extended attributes, access checks,
   readlink, statfs, readdir, release,
   forget, and initialization.
+- Anonymous files use `FUSE_TMPFILE`; `linkat(AT_EMPTY_PATH)` materialises
+  them with `FUSE_LINK` on the same connection. Cross-filesystem
+  materialisation reports `EXDEV`.
 
 `FsInstance::statfs` is the asynchronous filesystem-capacity interface.
 Its `FsStat` result is translated to Linux `struct statfs`; FUSE mounts

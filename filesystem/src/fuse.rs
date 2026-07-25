@@ -62,6 +62,7 @@ pub enum FuseOpcode {
     Lseek = 46,
     CopyFileRange = 47,
     Syncfs = 50,
+    Tmpfile = 51,
 }
 
 /// Header prepended to every FUSE request. Matches the wire layout
