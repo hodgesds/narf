@@ -5028,6 +5028,22 @@ fn run_interactive_multi(
                 bail!("xtask musl-demo: {why} before login prompt");
             }
         }
+        // QEMU's emulated USB keyboard enumerates just after getty prints the
+        // login prompt. Do not type credentials while that late init path is
+        // still producing console traffic: password input is intentionally
+        // not echoed, so it cannot use the per-byte acknowledgement protocol
+        // below. The musl-demo machine always has this keyboard; keep the
+        // bounded fallback for alternate local QEMU configurations.
+        if needle == b"login: " {
+            if let Wait::Found(end) = wait_for(
+                cursor,
+                b"usb-hid: kbd attached",
+                false,
+                Duration::from_secs(10),
+            ) {
+                cursor = end;
+            }
+        }
         for &b in reply {
             if stdin.write_all(&[b]).is_err() {
                 let _ = child.kill();
@@ -5036,7 +5052,7 @@ fn run_interactive_multi(
                 bail!("xtask musl-demo: stdin write failed during login");
             }
             let _ = stdin.flush();
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
