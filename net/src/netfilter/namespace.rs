@@ -115,6 +115,12 @@ pub fn get(id: u64) -> Arc<NetfilterNamespace> {
         .clone()
 }
 
+pub(crate) fn remove(id: u64) {
+    if id != 0 {
+        NAMESPACES.lock().remove(&id);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn reset_all() {
     NAMESPACES.lock().clear();

@@ -62,6 +62,12 @@ fn arp_insert_local(net_ns_id: u64, ip: [u8; 4], mac: [u8; 6]) {
     m.insert((net_ns_id, ip), mac);
 }
 
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    if let Some(cache) = ARP_CACHE.lock().as_mut() {
+        cache.retain(|(namespace, _), _| *namespace != net_ns_id);
+    }
+}
+
 /// Public shim so `arp::arp_insert_from_rx` can populate the
 /// legacy BTreeMap cache without a circular dep.
 #[doc(hidden)]
@@ -276,7 +282,7 @@ fn handle_udp(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8],
     crate::udp_sock::deliver_in(net_ns_id, src_ip, dst_ip, datagram, ttl);
     // Legacy per-protocol consumers.
     if dst_port == 68 {
-        crate::dhcp::on_udp_in(src_ip, dst_ip, src_port, dst_port, payload);
+        crate::dhcp::on_udp_in_in(net_ns_id, src_ip, dst_ip, src_port, dst_port, payload);
     }
 }
 

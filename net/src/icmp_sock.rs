@@ -262,6 +262,15 @@ pub fn icmp_raw_close(sock: &Arc<IcmpRawSocket>) {
     RAW_SOCKETS.lock().retain(|s| !Arc::ptr_eq(s, sock));
 }
 
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    ECHO_SOCKETS
+        .lock()
+        .retain(|socket| socket.net_ns_id != net_ns_id);
+    RAW_SOCKETS
+        .lock()
+        .retain(|socket| socket.net_ns_id != net_ns_id);
+}
+
 /// Receive from a raw ICMP socket. Returns the next queued datagram.
 pub fn icmp_raw_recv(sock: &Arc<IcmpRawSocket>) -> Option<IcmpDatagram> {
     sock.rx_queue.lock().pop_front()

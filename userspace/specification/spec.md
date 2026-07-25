@@ -287,6 +287,14 @@ socket creator's network namespace. It rejects other netlink protocols,
 cross-namespace replay, revoked handles, and insufficient operation rights;
 no raw capability slot crosses the Linux socket ABI.
 
+AF_INET and AF_NETLINK sockets retain the creator's network-namespace object,
+not only its numeric id. Accepted sockets inherit that same object.
+Task exit removes the task-table reference, while namespace fds and sockets
+keep the namespace live; kernel network teardown runs only after the final
+reference closes. Per-namespace IPv4 loopback TCP/UDP delivery uses
+namespace-keyed endpoint tables, so identical loopback endpoints coexist and
+cannot exchange traffic across namespaces.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

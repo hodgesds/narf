@@ -246,6 +246,10 @@ interfaces and routes and traverses that namespace's `LOCAL_OUT` and
 Linux `/proc/net/{tcp,udp,raw,arp,route,dev,nf_conntrack}` snapshots resolve
 the calling task's network namespace and exclude objects owned by every other
 namespace.
+DHCP reply and DNS side channels are keyed by the ingress interface's network
+namespace. The final namespace reference reclaims its TCP, UDP, raw, ICMP,
+ARP-resolution, DHCP, route, and netfilter state; physical interfaces return
+to the initial namespace without retaining dead-namespace routes.
 
 `NETLINK_AUDIT` reports a disabled zeroed `audit_status` for `AUDIT_GET` and
 an empty completed `AUDIT_LIST_RULES` dump. `AUDIT_SET` returns `EPERM`

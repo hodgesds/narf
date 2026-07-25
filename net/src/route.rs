@@ -180,6 +180,12 @@ pub fn route_list_in(net_ns_id: u64) -> Vec<Route> {
         .collect()
 }
 
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    ROUTE_TABLE
+        .lock()
+        .retain(|route| route.net_ns_id != net_ns_id);
+}
+
 /// Re-home every route whose egress device is being moved to another network
 /// namespace. Called in the same interface-admin transaction as ownership.
 pub(crate) fn move_iface_routes(iface_name: &str, net_ns_id: u64) {

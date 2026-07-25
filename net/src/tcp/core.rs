@@ -633,6 +633,22 @@ pub fn remove_tcb(id: u32) {
     }
 }
 
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    let mut ids = Vec::new();
+    for shard in TCB_TABLE.iter() {
+        if let Some(table) = shard.lock().as_ref() {
+            ids.extend(
+                table
+                    .iter()
+                    .filter_map(|(id, tcb)| (tcb.lock().net_ns_id == net_ns_id).then_some(*id)),
+            );
+        }
+    }
+    for id in ids {
+        remove_tcb(id);
+    }
+}
+
 /// Test-only: drop every TCB.
 #[doc(hidden)]
 pub fn __reset_for_test() {

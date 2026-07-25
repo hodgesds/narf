@@ -222,11 +222,18 @@ fn install_procfs_net_hooks() {
 }
 
 #[cfg(feature = "linux-compat")]
+#[cfg(feature = "container")]
 fn current_net_ns_id() -> u64 {
     let task = narf_userspace::handlers::current_task_id();
     narf_userspace::namespaces::current_net_ns(task)
         .map(|namespace| namespace.id())
         .unwrap_or(0)
+}
+
+#[cfg(feature = "linux-compat")]
+#[cfg(not(feature = "container"))]
+fn current_net_ns_id() -> u64 {
+    0
 }
 
 #[cfg(feature = "linux-compat")]

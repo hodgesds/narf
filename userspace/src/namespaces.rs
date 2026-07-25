@@ -277,6 +277,12 @@ impl NetNamespace {
     }
 }
 
+impl Drop for NetNamespace {
+    fn drop(&mut self) {
+        narf_net::release_network_namespace(self.id);
+    }
+}
+
 // ── IPC namespace ────────────────────────────────────────────────
 
 /// Per-namespace SysV IPC + POSIX mqueue keyspace. Today this is
@@ -520,6 +526,23 @@ pub fn setns_ipc(task: u64, ns: Arc<IpcNamespace>) {
     let mut g = IPC_BY_TASK.lock();
     if let Some(map) = g.as_mut() {
         map.insert(task, ns);
+    }
+}
+
+/// Drop the task-owned references to namespaces. Namespace fds and sockets
+/// retain their own `Arc`, so final teardown occurs only after those close.
+pub fn release_task(task: u64) {
+    if let Some(map) = UTS_BY_TASK.lock().as_mut() {
+        map.remove(&task);
+    }
+    if let Some(map) = NET_BY_TASK.lock().as_mut() {
+        map.remove(&task);
+    }
+    if let Some(map) = IPC_BY_TASK.lock().as_mut() {
+        map.remove(&task);
+    }
+    if let Some(map) = USER_BY_TASK.lock().as_mut() {
+        map.remove(&task);
     }
 }
 

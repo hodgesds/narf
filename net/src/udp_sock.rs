@@ -454,6 +454,13 @@ pub fn udp_close(sock: &Arc<UdpSocket>) {
         .retain(|(p, s)| !(*p == port && Arc::ptr_eq(s, sock)));
 }
 
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    PORT_TABLE
+        .lock()
+        .entries
+        .retain(|(_, socket)| socket.net_ns_id != net_ns_id);
+}
+
 // ── RX dispatch ────────────────────────────────────────────────────
 //
 // Called from `tcp_stack::handle_udp` with the IPv4 header already

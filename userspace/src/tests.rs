@@ -18901,6 +18901,96 @@ fn smoke_net_ns_dual_bind_same_port() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("userspace", smoke_net_ns_dual_bind_same_port);
 
+#[cfg(feature = "container")]
+fn smoke_net_ns_loopback_delivery_and_final_teardown() -> TestResult {
+    use crate::socket::{SockAddr, SocketFile, SocketOp, SocketOpResult, AF_INET, SOCK_DGRAM};
+
+    crate::namespaces::__test_reset_all();
+    let task = 0xB000_0901;
+    crate::namespaces::unshare_net(task);
+    let namespace = crate::namespaces::current_net_ns(task).expect("namespace");
+    let namespace_id = namespace.id();
+    let receiver = SocketFile::with_protocol(AF_INET, SOCK_DGRAM, 0);
+    receiver.set_net_namespace(namespace.clone());
+    let sender = SocketFile::with_protocol(AF_INET, SOCK_DGRAM, 0);
+    sender.set_net_namespace(namespace.clone());
+    drop(namespace);
+
+    let port = 19001u16;
+    let loopback = u32::from_be_bytes([127, 0, 0, 1]);
+    let addr = SockAddr {
+        family: AF_INET,
+        body: [
+            port.to_be_bytes().as_slice(),
+            loopback.to_be_bytes().as_slice(),
+        ]
+        .concat(),
+    };
+    if !matches!(
+        receiver.dispatch_op(SocketOp::Bind { addr: addr.clone() }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("namespace loopback bind failed");
+    }
+    if !matches!(
+        sender.dispatch_op(SocketOp::Connect { addr: addr.clone() }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("namespace loopback connect failed");
+    }
+    if !matches!(
+        sender.dispatch_op(SocketOp::Send {
+            buf: b"namespace-loopback",
+            flags: 0,
+            addr: None,
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("namespace loopback send failed");
+    }
+    let mut received = [0u8; 32];
+    if !matches!(
+        receiver.dispatch_op(SocketOp::Recv {
+            buf: &mut received,
+            flags: 0,
+        }),
+        SocketOpResult::Received { n: 18, .. }
+    ) || &received[..18] != b"namespace-loopback"
+    {
+        return TestResult::Fail("namespace loopback payload was not delivered");
+    }
+
+    narf_net::route::route_add(narf_net::route::Route {
+        net_ns_id: namespace_id,
+        dst: narf_net::route::Ipv4Net {
+            addr: narf_net::ipv4::Ipv4Addr([198, 18, 0, 0]),
+            prefix_len: 15,
+        },
+        gateway: None,
+        iface: alloc::string::String::from("lo"),
+        src_hint: Some(narf_net::ipv4::Ipv4Addr([127, 0, 0, 1])),
+        metric: 0,
+        scope: narf_net::route::Scope::Host,
+        table: narf_net::route::TABLE_MAIN,
+    });
+    crate::namespaces::release_task(task);
+    if narf_net::route::route_list_in(namespace_id).is_empty() {
+        return TestResult::Fail("live socket did not retain namespace state");
+    }
+    receiver.unregister();
+    drop(receiver);
+    drop(sender);
+    if !narf_net::route::route_list_in(namespace_id).is_empty() {
+        return TestResult::Fail("final namespace reference did not reclaim routes");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "userspace",
+    smoke_net_ns_loopback_delivery_and_final_teardown
+);
+
 // ── uaccess: canonical-hole validation + fault-guarded user copy ────
 //
 // stress-ng --vma regression cluster. The old validate_user_range

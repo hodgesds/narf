@@ -140,6 +140,12 @@ pub fn raw_packet_close(sock: &Arc<RawPacketSocket>) {
     RAW_PKT_SOCKETS.lock().retain(|s| !Arc::ptr_eq(s, sock));
 }
 
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    RAW_PKT_SOCKETS
+        .lock()
+        .retain(|socket| socket.net_ns_id != net_ns_id);
+}
+
 /// Receive the next frame from a raw packet socket.
 pub fn raw_packet_recv(sock: &Arc<RawPacketSocket>) -> Option<RawFrame> {
     sock.rx_queue.lock().pop_front()

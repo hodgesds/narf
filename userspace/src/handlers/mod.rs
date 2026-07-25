@@ -6249,6 +6249,8 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
 //                             removed at reap (release_reaped_task),
 //   - fd table              — fd::detach (on_child_exit) owns it.
 fn release_task_tables(tid: u64) {
+    #[cfg(feature = "container")]
+    crate::namespaces::release_task(tid);
     // Signal state.
     if let Some(m) = SIGNAL_PENDING.lock().as_mut() {
         m.remove(&tid);

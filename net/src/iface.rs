@@ -271,6 +271,26 @@ pub(crate) fn set_net_ns(name: &str, net_ns_id: u64) -> bool {
     true
 }
 
+pub(crate) fn release_namespace(net_ns_id: u64) {
+    let names: Vec<String> = {
+        let mut interfaces = IFACES.lock();
+        let Some(entries) = interfaces.as_mut() else {
+            return;
+        };
+        entries
+            .iter_mut()
+            .filter(|entry| entry.net_ns_id == net_ns_id)
+            .map(|entry| {
+                entry.net_ns_id = 0;
+                entry.name.clone()
+            })
+            .collect()
+    };
+    for name in names {
+        crate::route::move_iface_routes(&name, 0);
+    }
+}
+
 /// Pick the egress iface for a destination IPv4 address by consulting
 /// the FIB and falling back to `primary()`. The returned snapshot is
 /// what TCP / UDP / ICMP send paths use to stamp the source MAC and

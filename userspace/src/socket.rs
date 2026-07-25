@@ -391,6 +391,8 @@ pub struct SocketFile {
     /// socket() time. Keys AF_INET bind tables and selects namespace-scoped
     /// netlink, routing, interface, and netfilter views.
     net_ns_id: core::sync::atomic::AtomicU64,
+    #[cfg(feature = "container")]
+    net_namespace: IrqSafeSpinLock<Option<Arc<crate::namespaces::NetNamespace>>>,
     /// Credentials of the process that owns this socket end. Stamped by
     /// `sys_socket`/`sys_socketpair` at creation; surfaced to the peer via
     /// `SO_PEERCRED` and to a `SO_PASSCRED` recvmsg via `SCM_CREDENTIALS`.
@@ -742,6 +744,8 @@ impl SocketFile {
             nonblock: AtomicBool::new(false),
             pending_error: IrqSafeSpinLock::new(None),
             net_ns_id: core::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "container")]
+            net_namespace: IrqSafeSpinLock::new(None),
             local_cred: IrqSafeSpinLock::new(Ucred::default()),
             peer_cred: IrqSafeSpinLock::new(Ucred::default()),
             passcred: AtomicBool::new(false),
@@ -1059,6 +1063,12 @@ impl SocketFile {
     pub fn set_net_ns_id(&self, id: u64) {
         self.net_ns_id
             .store(id, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "container")]
+    pub fn set_net_namespace(&self, namespace: Arc<crate::namespaces::NetNamespace>) {
+        self.set_net_ns_id(namespace.id());
+        *self.net_namespace.lock() = Some(namespace);
     }
 
     /// This socket's network-namespace id (0 = host/default).
@@ -3102,6 +3112,10 @@ impl SocketFile {
                     if let Ok(Some(child_id)) = narf_net::tcp_stack::accept(lid) {
                         let child = SocketFile::new(AF_INET, SOCK_STREAM);
                         child.set_net_ns_id(self.net_ns_id());
+                        #[cfg(feature = "container")]
+                        if let Some(namespace) = self.net_namespace.lock().clone() {
+                            child.set_net_namespace(namespace);
+                        }
                         {
                             let mut cs = child.state.lock();
                             *cs = SocketState::InetWired {

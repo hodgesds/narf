@@ -110,3 +110,7 @@ argument = "NetfilterAdmin copies share one capability-table object epoch; revok
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The procfs adapters read only the scheduler-published current task id, resolve its immutable network-namespace identity through userspace compatibility state, and request read-only aggregate snapshots. They neither dereference userspace memory nor modify capability, domain, frame, or scheduling state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Network namespace lifetime is retained by typed Arc ownership in tasks, namespace fds, and sockets. Final-reference teardown removes only state keyed by that immutable namespace id, returns physical interfaces to namespace zero after releasing registry locks, and does not alter memory domains, frame ownership, capability epochs, or scheduler state."
