@@ -40,6 +40,12 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         {
             return Err("perf multiplex cursor advanced without a task switch");
         }
+        if !crate::perf_event::multiplex_quantum_due_for_test(0, 1)
+            || crate::perf_event::multiplex_quantum_due_for_test(1, 1_000_000)
+            || !crate::perf_event::multiplex_quantum_due_for_test(1, 1_000_001)
+        {
+            return Err("perf multiplex timer quantum boundary is incorrect");
+        }
 
         #[cfg(target_arch = "x86_64")]
         {

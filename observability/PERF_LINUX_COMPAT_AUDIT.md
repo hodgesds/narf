@@ -81,9 +81,11 @@ Gaps:
   selects a different task, so unavailable events remain stopped and later
   receive a real slot rather than being estimated. Syscall/poll re-entry for
   the same task does not advance the multiplex epoch. Per-CPU events still
-  allocate eagerly and fail when no physical slot is available; timer-driven
-  rotation remains necessary both for system-wide oversubscription and for a
-  lone task to share counters without relying on competing runnable tasks.
+  allocate eagerly and fail when no physical slot is available. A 1 ms
+  user-mode timer quantum rotates oversubscribed task counting events even for
+  a lone runnable task. Sampling-event multiplexing still requires preserving
+  `period_left` across physical counter migration and remains unsupported
+  rather than restarting a fabricated full sampling period.
 - Raw PMU formats are architecture-specific: sysfs exposes the x86
   event/unit-mask controls or the aarch64 16-bit architectural event number.
   Model-specific event aliases must still be generated from the detected CPU

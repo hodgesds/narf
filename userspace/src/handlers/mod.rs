@@ -3568,6 +3568,11 @@ pub fn handle_numa_hint_fault(va: u64) -> bool {
 /// One page is protected per 256 ticks and the scan cursor advances across
 /// VMAs, bounding both IRQ work and hint-fault frequency.
 pub fn numa_balance_tick() {
+    // This is the existing cross-architecture user-mode timer hook. Keep perf
+    // multiplexing ahead of NUMA's optional per-task state lookup so tasks
+    // without automatic NUMA balancing still rotate oversubscribed counters.
+    crate::perf_event::on_multiplex_tick(current_task_id());
+
     const SCAN_TICKS: u16 = 256;
     const SEARCH_BUDGET: usize = 16;
     let task = current_task_id();

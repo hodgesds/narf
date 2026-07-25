@@ -35,10 +35,11 @@ static ACTIVE_PERF_EVENTS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 static PERF_EVENT_REGISTRY: IrqSafeSpinLock<Vec<Weak<PerfEventFile>>> =
     IrqSafeSpinLock::new(Vec::new());
-static PERF_ROTATION_CURSOR: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
 static PERF_LAST_SELECTED_TASK: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicU64::new(u64::MAX) }; narf_lib::percpu::MAX_CPUS];
+static PERF_LAST_MULTIPLEX_NS: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+const PERF_MULTIPLEX_QUANTUM_NS: u64 = 1_000_000;
 #[cfg(target_arch = "x86_64")]
 static PMI_VECTOR: IrqSafeSpinLock<Option<u8>> = IrqSafeSpinLock::new(None);
 #[cfg(target_arch = "x86_64")]
@@ -85,6 +86,15 @@ pub(crate) fn advance_rotation_cursor_for_test(
     cursor: usize,
 ) -> usize {
     advance_rotation_cursor(previous_task, task, cursor)
+}
+
+#[inline]
+fn multiplex_quantum_due(last_ns: u64, now_ns: u64) -> bool {
+    last_ns == 0 || now_ns.saturating_sub(last_ns) >= PERF_MULTIPLEX_QUANTUM_NS
+}
+
+pub(crate) fn multiplex_quantum_due_for_test(last_ns: u64, now_ns: u64) -> bool {
+    multiplex_quantum_due(last_ns, now_ns)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -543,6 +553,7 @@ struct PerfEventFile {
     time_enabled_ns: AtomicU64,
     running_at_ns: [AtomicU64; narf_lib::percpu::MAX_CPUS],
     time_running_ns: AtomicU64,
+    multiplex_cursor: AtomicUsize,
     registered: AtomicBool,
     sample_lost: AtomicU64,
     output_paused: AtomicBool,
@@ -1980,6 +1991,7 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
     // events than physical counters. Rotate across that eligible set only:
     // perf also opens software dummy/metadata events, and including those in
     // the cursor would starve hardware events at stable registry positions.
+    let mut anchor = None;
     let eligible = registry
         .iter()
         .filter_map(Weak::upgrade)
@@ -1987,6 +1999,11 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
             event.enabled.load(Ordering::Acquire)
                 && event.is_task_hardware_event()
                 && event.tracks_task(task)
+        })
+        .inspect(|event| {
+            if anchor.is_none() {
+                anchor = Some(event.clone());
+            }
         })
         .count();
     if eligible == 0 {
@@ -1996,10 +2013,17 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
     // syscall that returns to and immediately reselects the same task. That
     // boundary must stop the PMU so executor time is not charged, but it is not
     // a task/context switch and therefore must not advance the multiplex epoch.
-    let cursor = PERF_ROTATION_CURSOR[cpu].load(Ordering::Relaxed);
+    // The first live eligible event owns the task's cursor. Keeping it with an
+    // event rather than a CPU preserves rotation progress when the task
+    // migrates; the registry's stable creation order makes every CPU select the
+    // same anchor.
+    let anchor = anchor.expect("eligible perf event has an anchor");
+    let cursor = anchor.multiplex_cursor.load(Ordering::Relaxed);
     let next_cursor = advance_rotation_cursor(previous_task, task, cursor);
     if next_cursor != cursor {
-        PERF_ROTATION_CURSOR[cpu].store(next_cursor, Ordering::Relaxed);
+        anchor
+            .multiplex_cursor
+            .store(next_cursor, Ordering::Relaxed);
     }
     let start = next_cursor % eligible;
 
@@ -2015,6 +2039,96 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
                 || !event.is_task_hardware_event()
                 || !event.tracks_task(task)
             {
+                continue;
+            }
+            let selected = if pass == 0 {
+                ordinal >= start
+            } else {
+                ordinal < start
+            };
+            ordinal += 1;
+            if selected {
+                event.task_switch(cpu, true);
+            }
+        }
+    }
+}
+
+/// Rotate oversubscribed task counting events from the user-mode timer tick.
+///
+/// This is allocation-free and uses only IRQ-safe locks. Sampling events are
+/// deliberately excluded: rotating those requires preserving the hardware
+/// `period_left` state, and restarting a full period would fabricate sampling
+/// semantics.
+pub(crate) fn on_multiplex_tick(task: u64) {
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    let now = narf_time::monotonic_ns();
+    let last = PERF_LAST_MULTIPLEX_NS[cpu].load(Ordering::Relaxed);
+    if !multiplex_quantum_due(last, now)
+        || PERF_LAST_MULTIPLEX_NS[cpu]
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+
+    let mut registry = PERF_EVENT_REGISTRY.lock();
+    registry.retain(|weak| weak.strong_count() != 0);
+
+    let is_eligible = |event: &PerfEventFile| {
+        event.enabled.load(Ordering::Acquire)
+            && event.is_task_hardware_event()
+            && event.sample_period.load(Ordering::Acquire) == 0
+            && event.tracks_task(task)
+    };
+    let mut anchor = None;
+    let eligible = registry
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|event| is_eligible(event))
+        .inspect(|event| {
+            if anchor.is_none() {
+                anchor = Some(event.clone());
+            }
+        })
+        .count();
+    if eligible < 2 {
+        return;
+    }
+    let waiting = registry
+        .iter()
+        .filter_map(Weak::upgrade)
+        .any(|event| is_eligible(&event) && event.active_task_counters.lock()[cpu].is_none());
+    if !waiting {
+        return;
+    }
+
+    // Stop only counting events. Sampling counters keep their live preload
+    // until period-left migration is implemented.
+    for weak in registry.iter() {
+        if let Some(event) = weak.upgrade() {
+            if is_eligible(&event) {
+                event.task_switch(cpu, false);
+            }
+        }
+    }
+
+    let start = anchor
+        .expect("eligible perf event has an anchor")
+        .multiplex_cursor
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        % eligible;
+    for pass in 0..2 {
+        let mut ordinal = 0;
+        for weak in registry.iter() {
+            let Some(event) = weak.upgrade() else {
+                continue;
+            };
+            if !is_eligible(&event) {
                 continue;
             }
             let selected = if pass == 0 {
@@ -2807,6 +2921,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             time_enabled_ns: AtomicU64::new(0),
             running_at_ns: [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS],
             time_running_ns: AtomicU64::new(0),
+            multiplex_cursor: AtomicUsize::new(0),
             registered: AtomicBool::new(false),
             sample_lost: AtomicU64::new(0),
             output_paused: AtomicBool::new(false),
