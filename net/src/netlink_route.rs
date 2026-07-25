@@ -60,6 +60,8 @@ pub const RTM_NEWNEIGH: u16 = 28;
 pub const RTM_GETNEIGH: u16 = 30;
 pub const RTM_NEWRULE: u16 = 32;
 pub const RTM_GETRULE: u16 = 34;
+pub const RTM_NEWQDISC: u16 = 36;
+pub const RTM_GETQDISC: u16 = 38;
 
 // ── netlink flags (nlmsg_flags) ─────────────────────────────────────────
 
@@ -96,6 +98,9 @@ pub const NDA_LLADDR: u16 = 2;
 
 pub const FRA_PRIORITY: u16 = 6;
 pub const FRA_TABLE: u16 = 15;
+
+pub const TCA_KIND: u16 = 1;
+pub const TC_H_ROOT: u32 = 0xFFFF_FFFF;
 
 // ── interface flags (net_device_flags, if.h) ────────────────────────────
 
@@ -337,6 +342,21 @@ fn build_newrule(family: u8, table: u8, priority: u32, seq: u32, pid: u32) -> Ve
     frame_message(RTM_NEWRULE, NLM_F_MULTI, seq, pid, &body)
 }
 
+fn build_newqdisc(ifindex: u32, seq: u32, pid: u32) -> Vec<u8> {
+    // struct tcmsg: family(u8), pad1(u8), pad2(u16), ifindex(i32),
+    // handle(u32), parent(u32), info(u32).
+    let mut body = Vec::new();
+    body.push(0);
+    body.push(0);
+    body.extend_from_slice(&0u16.to_ne_bytes());
+    body.extend_from_slice(&(ifindex as i32).to_ne_bytes());
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    body.extend_from_slice(&TC_H_ROOT.to_ne_bytes());
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    push_rtattr(&mut body, TCA_KIND, b"noqueue\0");
+    frame_message(RTM_NEWQDISC, NLM_F_MULTI, seq, pid, &body)
+}
+
 /// Build an `NLMSG_DONE` message (payload is a single i32 = 0). Terminates
 /// every dump so the caller stops reading.
 fn build_done(seq: u32, pid: u32) -> Vec<u8> {
@@ -550,6 +570,13 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
             }
             out.push(build_done(seq, pid));
         }
+        RTM_GETQDISC => {
+            let (links, _addrs) = enumerate();
+            for link in links {
+                out.push(build_newqdisc(link.ifindex, seq, pid));
+            }
+            out.push(build_done(seq, pid));
+        }
         _ => {
             out.push(build_error(EOPNOTSUPP, seq, pid, req));
         }
@@ -576,7 +603,7 @@ pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
         let request = &remaining[..msg_len];
         let supported = matches!(
             hdr.msg_type,
-            RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE | RTM_GETNEIGH | RTM_GETRULE
+            RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE | RTM_GETNEIGH | RTM_GETRULE | RTM_GETQDISC
         );
         if supported && hdr.flags & NLM_F_ACK != 0 {
             replies.push(build_ack(hdr.seq, request));

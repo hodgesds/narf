@@ -1498,6 +1498,8 @@ const RTM_GETROUTE: u16 = 26;
 const RTM_GETNEIGH: u16 = 30;
 const RTM_NEWRULE: u16 = 32;
 const RTM_GETRULE: u16 = 34;
+const RTM_NEWQDISC: u16 = 36;
+const RTM_GETQDISC: u16 = 38;
 /// netlink control message types (netlink.h).
 const NLMSG_DONE: u16 = 3;
 const NLMSG_HDRLEN: usize = 16;
@@ -1867,6 +1869,39 @@ fn smoke_abi_netlink_route_getrule_dump() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getrule_dump);
+
+fn smoke_abi_netlink_route_getqdisc_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETQDISC, 12);
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send(RTM_GETQDISC) did not echo the request length");
+        }
+        let mut first = [0u8; 512];
+        let n = netlink_recv(fd, &mut first).ok_or("recv status")?;
+        if n < (NLMSG_HDRLEN + 20) as i64 || nlmsg_type_of(&first) != RTM_NEWQDISC {
+            return Err("RTM_GETQDISC did not return RTM_NEWQDISC");
+        }
+        if !window_contains(&first[..n as usize], b"noqueue\0") {
+            return Err("RTM_NEWQDISC did not identify noqueue");
+        }
+        let mut saw_done = false;
+        for _ in 0..32 {
+            let mut buf = [0u8; 512];
+            let n = netlink_recv(fd, &mut buf).ok_or("drain status")?;
+            if n >= NLMSG_HDRLEN as i64 && nlmsg_type_of(&buf) == NLMSG_DONE {
+                saw_done = true;
+                break;
+            }
+        }
+        if !saw_done {
+            return Err("RTM_GETQDISC did not terminate with NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getqdisc_dump);
 
 fn smoke_abi_netlink_uevent_recv() -> TestResult {
     with_setup(|| {

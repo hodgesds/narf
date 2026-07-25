@@ -210,6 +210,26 @@ fn getrule_dump_has_linux_default_ipv4_rules() {
 }
 
 #[test]
+fn getqdisc_reports_noqueue_for_loopback() {
+    let msgs = build_dump(&req(RTM_GETQDISC, 61, 4));
+    assert!(msgs.len() >= 2);
+    assert_eq!(hdr_of(&msgs[0]).1, RTM_NEWQDISC);
+    assert_eq!(
+        i32::from_ne_bytes(
+            msgs[0][NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8]
+                .try_into()
+                .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        find_rtattr(&msgs[0], 20, TCA_KIND).as_deref(),
+        Some(&b"noqueue\0"[..])
+    );
+    assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
+}
+
+#[test]
 fn unsupported_request_yields_eopnotsupp_error() {
     // RTM_GETLINK is 18; use a bogus type the responder doesn't handle.
     let bogus: u16 = 999;
