@@ -41,3 +41,6 @@ qemu.log
 # build.rs. All artefacts (source tarball, unpacked tree, built
 # ELF) live in `target/.../build/narf-busybox-*/out/` and are
 # covered by the `/target/` rule above. Nothing extra needed.
+.semcode.*
+.agents/
+.mcp.json

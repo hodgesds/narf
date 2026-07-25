@@ -305,6 +305,12 @@ assumption (concurrent-poll, sigreturn, TSS-race, RCU were all disproven
 this way). The SMP repro is the oracle: deterministic regressions fail
 the *same* test every run; flaky/heisenbug fails *vary* run-to-run.
 
+## Navigation & Tooling (For Agents)
+
+- **Use `semcode-mcp`** (`find_type`, `find_function`, `find_callers`) for precise, AST-aware lookups of Rust structs, enums, and call chains. It perfectly boundaries docstrings and definitions. *(Note: Requires `semcode` from `git@github.com:hodgesds/semcode.git` on branch `feature/rust-analyzer-integration` as it is not merged upstream yet).*
+- **Use terminal tools** (`awk`, `grep` via `run_command`) when extracting massive lists, counting occurrences, or filtering large blocks of code (like the 2,000-line `Syscall` enum) to avoid blowing out your token context window.
+- **Use `grep_search`** for broad keyword discovery across the repo when you don't know the exact symbol name.
+
 ## Quick commands (once `build/` lands)
 
 ```
