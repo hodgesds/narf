@@ -588,6 +588,9 @@ enum SocketState {
     /// best-effort openers (systemd PID 1's audit setup) get a usable fd and
     /// proceed instead of failing the socket open with EPERM.
     NetlinkSink,
+    /// `NETLINK_GENERIC` control-family socket. Requests to `nlctrl` queue
+    /// generic-netlink family discovery replies here.
+    NetlinkGeneric { replies: VecDeque<Vec<u8>> },
 }
 
 /// One enqueued UDP-style datagram. Owns the payload bytes (UDP
@@ -636,9 +639,13 @@ impl SocketFile {
             SocketState::NetlinkRoute {
                 replies: VecDeque::new(),
             }
+        } else if domain == AF_NETLINK && protocol == NETLINK_GENERIC {
+            SocketState::NetlinkGeneric {
+                replies: VecDeque::new(),
+            }
         } else if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
-            // Any AF_NETLINK protocol NARF does not model as route/uevent
-            // (NETLINK_AUDIT=9, NETLINK_NETFILTER=12, NETLINK_GENERIC=16, …) →
+            // Any AF_NETLINK protocol NARF does not model as route/generic/uevent
+            // (NETLINK_AUDIT=9, NETLINK_NETFILTER=12, …) →
             // a coherent no-op sink. systemd PID 1 opens NETLINK_AUDIT during
             // manager setup; a hard failure here surfaced to userspace as the
             // -1 sentinel (glibc errno=EPERM) → "Failed to open netlink,
@@ -1306,7 +1313,14 @@ impl FileOps for SocketFile {
                 }
                 bits
             }
-            // No-op sink (audit/generic/netfilter): always writable (sends are
+            SocketState::NetlinkGeneric { replies } => {
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !replies.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
+            // No-op sink (audit/netfilter/etc.): always writable (sends are
             // accepted + dropped), never readable (nothing is ever queued).
             SocketState::NetlinkSink => narf_filesystem::POLL_OUT,
         }
@@ -1402,6 +1416,9 @@ impl SocketFile {
             (AF_INET6, SOCK_STREAM) => self.dispatch_inet6_stream(op),
             (AF_BYPASS, SOCK_RAW) => self.dispatch_bypass(op),
             (AF_NETLINK, _) if self.protocol == NETLINK_ROUTE => self.dispatch_netlink_route(op),
+            (AF_NETLINK, _) if self.protocol == NETLINK_GENERIC => {
+                self.dispatch_netlink_generic(op)
+            }
             (AF_NETLINK, _) if self.protocol != NETLINK_KOBJECT_UEVENT => {
                 self.dispatch_netlink_sink(op)
             }
@@ -1464,6 +1481,52 @@ impl SocketFile {
                         SocketOpResult::Received {
                             n,
                             peer: Some(peer),
+                        }
+                    }
+                    None => SocketOpResult::Err(SockError::WouldBlock),
+                }
+            }
+            SocketOp::Shutdown { how: _ } => SocketOpResult::Ok(0),
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    fn dispatch_netlink_generic(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        match op {
+            SocketOp::Bind { addr } => self.bind_netlink(&addr),
+            SocketOp::Connect { addr } => self.connect_netlink(&addr),
+            SocketOp::Send { buf, .. } => {
+                self.ensure_netlink_portid();
+                let replies = match narf_net::netlink_generic::build_replies(buf) {
+                    Ok(replies) => replies,
+                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                let mut state = self.state.lock();
+                match &mut *state {
+                    SocketState::NetlinkGeneric { replies: queue } => {
+                        queue.extend(replies);
+                    }
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
+                }
+                drop(state);
+                narf_net::readiness::notify(0);
+                SocketOpResult::Ok(buf.len() as u64)
+            }
+            SocketOp::Recv { buf, flags: _ } => {
+                let message = {
+                    let mut state = self.state.lock();
+                    match &mut *state {
+                        SocketState::NetlinkGeneric { replies } => replies.pop_front(),
+                        _ => return SocketOpResult::Err(SockError::InvalidArg),
+                    }
+                };
+                match message {
+                    Some(message) => {
+                        let n = buf.len().min(message.len());
+                        buf[..n].copy_from_slice(&message[..n]);
+                        SocketOpResult::Received {
+                            n,
+                            peer: Some(Self::netlink_sockaddr(0, 0)),
                         }
                     }
                     None => SocketOpResult::Err(SockError::WouldBlock),

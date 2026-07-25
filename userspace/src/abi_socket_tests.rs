@@ -2008,8 +2008,6 @@ kernel_test_in!("syscall_abi", smoke_abi_netlink_audit_socket_open_bind_send);
 
 fn smoke_abi_netlink_generic_socket_open() -> TestResult {
     with_setup(|| {
-        // NETLINK_GENERIC (genetlink) is likewise backed by the sink: open +
-        // bind succeed so callers get a usable fd instead of EPERM.
         let fd = open_netlink(NETLINK_GENERIC)?;
         let (addr, alen) = netlink_sockaddr(0);
         if call(
@@ -2020,6 +2018,30 @@ fn smoke_abi_netlink_generic_socket_open() -> TestResult {
             != 0
         {
             return Err("bind(NETLINK_GENERIC) did not return 0");
+        }
+
+        // GENL_ID_CTRL / CTRL_CMD_GETFAMILY with
+        // CTRL_ATTR_FAMILY_NAME="nlctrl".
+        let mut req = [0u8; 32];
+        req[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        req[4..6].copy_from_slice(&16u16.to_ne_bytes());
+        req[6..8].copy_from_slice(&1u16.to_ne_bytes());
+        req[8..12].copy_from_slice(&91u32.to_ne_bytes());
+        req[16] = 3;
+        req[17] = 2;
+        req[20..22].copy_from_slice(&11u16.to_ne_bytes());
+        req[22..24].copy_from_slice(&2u16.to_ne_bytes());
+        req[24..31].copy_from_slice(b"nlctrl\0");
+        if netlink_send(fd, &req).ok_or("generic send status")? != req.len() as i64 {
+            return Err("CTRL_CMD_GETFAMILY send failed");
+        }
+        let mut reply = [0u8; 256];
+        let n = netlink_recv(fd, &mut reply).ok_or("generic recv status")?;
+        if n < 24 || nlmsg_type_of(&reply) != 16 {
+            return Err("generic netlink did not return GENL_ID_CTRL");
+        }
+        if !window_contains(&reply[..n as usize], b"nlctrl\0") {
+            return Err("generic netlink reply did not name nlctrl");
         }
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())

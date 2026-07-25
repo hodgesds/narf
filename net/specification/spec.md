@@ -126,6 +126,10 @@ Collection queries for absent optional state—traffic classes, filters,
 actions, address labels, multicast database entries, and nexthops—return an
 empty multipart dump terminated by `NLMSG_DONE`.
 
+`NETLINK_GENERIC` publishes the mandatory `nlctrl` control family.
+`CTRL_CMD_GETFAMILY` supports name lookup and dump enumeration with
+Linux-compatible attributes; unknown family names return `ENOENT`.
+
 AF_NETLINK sockets retain their bound `sockaddr_nl` port ID and group mask,
 support a connected kernel or userspace destination, auto-bind before the
 first send, and expose Linux `SOL_NETLINK` membership and feature-option
