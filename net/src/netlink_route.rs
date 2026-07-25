@@ -81,8 +81,17 @@ pub const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
 // ── IFLA_* link attribute types (if_link.h) ─────────────────────────────
 
 pub const IFLA_ADDRESS: u16 = 1;
+pub const IFLA_BROADCAST: u16 = 2;
 pub const IFLA_IFNAME: u16 = 3;
 pub const IFLA_MTU: u16 = 4;
+pub const IFLA_QDISC: u16 = 6;
+pub const IFLA_TXQLEN: u16 = 13;
+pub const IFLA_OPERSTATE: u16 = 16;
+pub const IFLA_LINKMODE: u16 = 17;
+pub const IFLA_STATS64: u16 = 23;
+pub const IFLA_GROUP: u16 = 27;
+pub const IFLA_CARRIER: u16 = 33;
+pub const IF_OPER_UP: u8 = 6;
 
 // ── IFA_* address attribute types (if_addr.h) ───────────────────────────
 
@@ -230,8 +239,19 @@ fn build_newlink(link: &LinkInfo, seq: u32, pid: u32) -> Vec<u8> {
     push_rtattr(&mut body, IFLA_IFNAME, &name_bytes);
     if !link.mac.is_empty() {
         push_rtattr(&mut body, IFLA_ADDRESS, &link.mac);
+        push_rtattr(&mut body, IFLA_BROADCAST, &[0xFF; 6]);
     }
     push_rtattr(&mut body, IFLA_MTU, &link.mtu.to_le_bytes());
+    push_rtattr(&mut body, IFLA_QDISC, b"noqueue\0");
+    push_rtattr(&mut body, IFLA_TXQLEN, &1000u32.to_ne_bytes());
+    push_rtattr(&mut body, IFLA_OPERSTATE, &[IF_OPER_UP]);
+    push_rtattr(&mut body, IFLA_LINKMODE, &[0]);
+    push_rtattr(&mut body, IFLA_GROUP, &0u32.to_ne_bytes());
+    push_rtattr(&mut body, IFLA_CARRIER, &[1]);
+    // struct rtnl_link_stats64. Centralized driver counters currently report
+    // zero, but supplying the complete native-endian shape lets Linux parsers
+    // consume `ip -s link` without treating the attribute as malformed.
+    push_rtattr(&mut body, IFLA_STATS64, &[0u8; 25 * 8]);
 
     frame_message(RTM_NEWLINK, NLM_F_MULTI, seq, pid, &body)
 }

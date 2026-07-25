@@ -75,6 +75,20 @@ fn getlink_dump_has_loopback_and_terminates() {
     // 16 bytes: family/pad/type(2)/index(4)/flags(4)/change(4).
     let name = find_rtattr(&msgs[0], 16, IFLA_IFNAME).expect("first link has IFLA_IFNAME");
     assert_eq!(&name, b"lo\0", "ifindex-1 link is the loopback");
+    assert_eq!(
+        find_rtattr(&msgs[0], 16, IFLA_OPERSTATE).as_deref(),
+        Some(&[IF_OPER_UP][..])
+    );
+    assert_eq!(
+        find_rtattr(&msgs[0], 16, IFLA_QDISC).as_deref(),
+        Some(&b"noqueue\0"[..])
+    );
+    assert_eq!(
+        find_rtattr(&msgs[0], 16, IFLA_STATS64)
+            .expect("link has IFLA_STATS64")
+            .len(),
+        25 * 8
+    );
 
     // Last message is NLMSG_DONE.
     let (_l, dtype, _f, dseq, _p) = hdr_of(msgs.last().unwrap());

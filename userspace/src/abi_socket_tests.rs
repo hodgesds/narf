@@ -1711,6 +1711,9 @@ fn smoke_abi_netlink_route_getlink_dump() -> TestResult {
         if !window_contains(&buf[..n], b"lo\0") {
             return Err("RTM_NEWLINK dump did not contain the `lo` interface name");
         }
+        if !window_contains(&buf[..n], b"noqueue\0") {
+            return Err("RTM_NEWLINK dump did not contain the qdisc");
+        }
         // Drain remaining links until NLMSG_DONE terminates the dump.
         let mut saw_done = false;
         for _ in 0..16 {

@@ -118,6 +118,10 @@ echo the request sequence, identify the kernel sender with port ID zero, carry
 administration path; control-plane writes continue to require the typed
 `Cap<NetIface, Admin>` operations in §3.3.
 
+Link dumps include Linux operational-state, carrier, qdisc, queue-length,
+broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero
+until a driver publishes them through the central interface registry.
+
 Collection queries for absent optional state—traffic classes, filters,
 actions, address labels, multicast database entries, and nexthops—return an
 empty multipart dump terminated by `NLMSG_DONE`.
