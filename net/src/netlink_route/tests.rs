@@ -376,6 +376,7 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
         ReplyOptions {
             ext_ack: true,
             cap_ack: true,
+            strict_check: false,
         },
     )
     .unwrap();
@@ -407,6 +408,41 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
     assert_eq!(event.flags, 0);
     assert_eq!(event.seq, 0);
     assert_eq!(event.pid, 0);
+}
+
+#[test]
+fn strict_check_rejects_short_dump_and_accepts_typed_request() {
+    let short = req(RTM_GETADDR, 120, 0);
+    let denied = build_replies_with_options(
+        &short,
+        None,
+        ReplyOptions {
+            strict_check: true,
+            ..ReplyOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(
+            denied[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap()
+        ),
+        -EINVAL
+    );
+
+    let body = [AF_INET, 0, 0, 0, 0, 0, 0, 0];
+    let typed = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 121, 0, &body);
+    let allowed = build_replies_with_options(
+        &typed,
+        None,
+        ReplyOptions {
+            strict_check: true,
+            ..ReplyOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(parse_hdr(&allowed[0]).unwrap().msg_type, RTM_NEWADDR);
 }
 
 #[test]

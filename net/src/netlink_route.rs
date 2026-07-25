@@ -943,6 +943,7 @@ pub fn build_replies_authorized(
 pub struct ReplyOptions {
     pub ext_ack: bool,
     pub cap_ack: bool,
+    pub strict_check: bool,
 }
 
 pub fn build_replies_with_options(
@@ -961,6 +962,13 @@ pub fn build_replies_with_options(
             return Err(());
         }
         let request = &remaining[..msg_len];
+        if options.strict_check {
+            if let Err(errno) = validate_strict_request(request, &hdr) {
+                replies.push(build_error(errno, hdr.seq, 0, request));
+                offset += nlmsg_align(msg_len);
+                continue;
+            }
+        }
         if is_mutation(hdr.msg_type) {
             match apply_mutation(request, admin) {
                 Ok(()) => {
@@ -1015,6 +1023,33 @@ pub fn build_replies_with_options(
         }
     }
     Ok(replies)
+}
+
+fn validate_strict_request(request: &[u8], hdr: &NlMsgHdr) -> Result<(), i32> {
+    if hdr.flags & NLM_F_REQUEST == 0 {
+        return Err(EINVAL);
+    }
+    let (fixed_len, families): (usize, &[u8]) = match hdr.msg_type {
+        RTM_GETLINK => (16, &[0]),
+        RTM_GETADDR => (8, &[0, AF_INET, AF_INET6]),
+        RTM_GETROUTE => (12, &[0, AF_INET]),
+        RTM_GETNEIGH => (12, &[0, AF_INET, AF_INET6]),
+        RTM_GETRULE => (12, &[0, AF_INET]),
+        RTM_GETQDISC | RTM_GETTCLASS | RTM_GETTFILTER => (20, &[0]),
+        RTM_GETACTION => (4, &[0]),
+        RTM_GETADDRLABEL => (12, &[0, AF_INET6]),
+        RTM_GETMDB => (8, &[0]),
+        RTM_GETNEXTHOP => (8, &[0, AF_INET]),
+        mutation if is_mutation(mutation) => return Ok(()),
+        _ => return Ok(()),
+    };
+    if hdr.flags & NLM_F_DUMP != NLM_F_DUMP || request.len() < NLMSG_HDRLEN + fixed_len {
+        return Err(EINVAL);
+    }
+    if !families.contains(&request[NLMSG_HDRLEN]) {
+        return Err(EINVAL);
+    }
+    Ok(())
 }
 
 fn cap_acknowledgement(message: &mut Vec<u8>) {
