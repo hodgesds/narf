@@ -218,6 +218,14 @@ non-multipart record, and report `ENOENT` when the canonical table has no
 match. Mutations and unsupported nfnetlink subsystems return `EOPNOTSUPP`;
 Linux netlink does not grant ambient filter/NAT authority.
 
+Every packet context and `NETLINK_NETFILTER` query carries an immutable
+network-namespace id (zero is the initial namespace). Rulesets, conntrack
+entries, and NAT mappings are stored independently for each id. Mutable
+operations require a live `Cap<NetfilterAdminCap, Invoke>` wrapped with the
+exact namespace id and explicit read/ruleset/conntrack/NAT operation rights;
+namespace membership, uid, and Linux ambient capability bits are not
+authority.
+
 `NETLINK_AUDIT` reports a disabled zeroed `audit_status` for `AUDIT_GET` and
 an empty completed `AUDIT_LIST_RULES` dump. `AUDIT_SET` returns `EPERM`
 because Linux uid and capability bits do not confer NARF audit authority.

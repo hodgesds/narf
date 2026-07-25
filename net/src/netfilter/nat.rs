@@ -180,28 +180,50 @@ impl Nat {
     }
 }
 
-/// Global NAT state.
 static NAT: Nat = Nat::new();
 
-/// Reference the global NAT.
-#[inline]
 pub fn nat() -> &'static Nat {
     &NAT
 }
 
 /// Public masquerade-add helper.
 pub fn nat_masquerade_add(iface: &str, net: [u8; 4], prefix: u8, iface_ip: [u8; 4]) {
-    NAT.masquerade_add(MasqRule {
+    nat_masquerade_add_in(0, iface, net, prefix, iface_ip);
+}
+
+pub fn nat_masquerade_add_in(
+    net_ns_id: u64,
+    iface: &str,
+    net: [u8; 4],
+    prefix: u8,
+    iface_ip: [u8; 4],
+) {
+    let rule = MasqRule {
         iface: iface.to_string(),
         net,
         prefix,
         iface_ip,
-    });
+    };
+    if net_ns_id == 0 {
+        NAT.masquerade_add(rule);
+    } else {
+        super::namespace::get(net_ns_id).nat.masquerade_add(rule);
+    }
 }
 
 /// Public masquerade-remove helper.
 pub fn nat_masquerade_remove(iface: &str) {
-    NAT.masquerade_remove(iface);
+    nat_masquerade_remove_in(0, iface);
+}
+
+pub fn nat_masquerade_remove_in(net_ns_id: u64, iface: &str) {
+    if net_ns_id == 0 {
+        NAT.masquerade_remove(iface);
+    } else {
+        super::namespace::get(net_ns_id)
+            .nat
+            .masquerade_remove(iface);
+    }
 }
 
 #[doc(hidden)]
@@ -385,12 +407,16 @@ pub fn snat_postrouting(ctx: &mut PktCtx<'_>) -> Verdict {
         Some(t) => t,
         None => return Verdict::Accept,
     };
-    let rule = match NAT.lookup_rule(ctx.iface_out, tuple.src_ip) {
+    let namespace = (ctx.net_ns_id != 0).then(|| super::namespace::get(ctx.net_ns_id));
+    let nat = namespace.as_ref().map_or(&NAT, |namespace| &namespace.nat);
+    let ct = namespace
+        .as_ref()
+        .map_or(conntrack::ct(), |namespace| &namespace.conntrack);
+    let rule = match nat.lookup_rule(ctx.iface_out, tuple.src_ip) {
         Some(r) => r,
         None => return Verdict::Accept,
     };
     // Find / create conntrack entry.
-    let ct = conntrack::ct();
     let now = narf_scheduler::narf_time::monotonic_ns();
     let entry = ct
         .lookup(&tuple)
@@ -399,18 +425,18 @@ pub fn snat_postrouting(ctx: &mut PktCtx<'_>) -> Verdict {
     ctx.conntrack_id = Some(id);
 
     // Already NAT'd? Reuse mapping.
-    if let Some((nat_ip, nat_port)) = NAT.lookup_ct(id) {
+    if let Some((nat_ip, nat_port)) = nat.lookup_ct(id) {
         rewrite_src_ip(ctx.packet_mut(), nat_ip);
         rewrite_src_port(ctx.packet_mut(), nat_port);
         return Verdict::Accept;
     }
 
     // Allocate a NAT port for this flow.
-    let nat_port = match NAT.allocate_port(rule.iface_ip, tuple.proto, tuple.src_port) {
+    let nat_port = match nat.allocate_port(rule.iface_ip, tuple.proto, tuple.src_port) {
         Some(p) => p,
         None => return Verdict::Drop, // port pressure
     };
-    NAT.insert_mapping(
+    nat.insert_mapping(
         id,
         rule.iface_ip,
         nat_port,
@@ -447,8 +473,10 @@ pub fn dnat_prerouting(ctx: &mut PktCtx<'_>) -> Verdict {
         Some(t) => t,
         None => return Verdict::Accept,
     };
+    let namespace = (ctx.net_ns_id != 0).then(|| super::namespace::get(ctx.net_ns_id));
+    let nat = namespace.as_ref().map_or(&NAT, |namespace| &namespace.nat);
     if let Some((orig_ip, orig_port)) =
-        NAT.lookup_ingress(tuple.dst_ip, tuple.dst_port, tuple.proto)
+        nat.lookup_ingress(tuple.dst_ip, tuple.dst_port, tuple.proto)
     {
         rewrite_dst_ip(ctx.packet_mut(), orig_ip);
         rewrite_dst_port(ctx.packet_mut(), orig_port);

@@ -284,11 +284,8 @@ impl Conntrack {
     }
 }
 
-/// Single global conntrack table.
 static CT: Conntrack = Conntrack::new(MAX_ENTRIES);
 
-/// Reference the global conntrack table.
-#[inline]
 pub fn ct() -> &'static Conntrack {
     &CT
 }
@@ -326,7 +323,19 @@ pub struct ConntrackSnapshot {
 
 /// Snapshot every tracked flow for `/proc/net/nf_conntrack`.
 pub fn snapshot() -> alloc::vec::Vec<ConntrackSnapshot> {
-    let by_id = CT.by_id.lock();
+    snapshot_in(0)
+}
+
+pub fn snapshot_in(net_ns_id: u64) -> alloc::vec::Vec<ConntrackSnapshot> {
+    if net_ns_id == 0 {
+        return snapshot_from(&CT);
+    }
+    let ns = super::namespace::get(net_ns_id);
+    snapshot_from(&ns.conntrack)
+}
+
+fn snapshot_from(table: &Conntrack) -> alloc::vec::Vec<ConntrackSnapshot> {
+    let by_id = table.by_id.lock();
     let mut out = alloc::vec::Vec::with_capacity(by_id.len());
     let now = narf_scheduler::narf_time::monotonic_ns();
     for entry in by_id.values() {
@@ -460,9 +469,13 @@ pub fn conntrack_hook(ctx: &mut PktCtx<'_>) -> Verdict {
         None => return Verdict::Accept,
     };
     let now = narf_scheduler::narf_time::monotonic_ns();
-    let entry = CT
+    let namespace = (ctx.net_ns_id != 0).then(|| super::namespace::get(ctx.net_ns_id));
+    let table = namespace
+        .as_ref()
+        .map_or(&CT, |namespace| &namespace.conntrack);
+    let entry = table
         .lookup(&tuple)
-        .unwrap_or_else(|| CT.insert_new(tuple, now));
+        .unwrap_or_else(|| table.insert_new(tuple, now));
     let id = entry.lock().id;
     ctx.conntrack_id = Some(id);
 

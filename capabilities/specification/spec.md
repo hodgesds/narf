@@ -108,6 +108,7 @@ pub enum CapKind {
     // Network
     NetIface             = 0x0020,
     StackInstall         = 0x0021,    // userspace stack daemon attach
+    NetfilterAdmin       = 0x0022,    // namespace-scoped firewall control
 
     // Filesystem
     FileNode             = 0x0030,

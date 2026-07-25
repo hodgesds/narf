@@ -429,6 +429,7 @@ pub struct SocketFile {
     /// Explicitly delegated NARF network-control authority. Never inferred
     /// from uid or Linux ambient capability bits.
     netlink_admin: IrqSafeSpinLock<Option<narf_net::AdminHandle>>,
+    netfilter_admin: IrqSafeSpinLock<Option<narf_net::netfilter::NetfilterAdminHandle>>,
     /// Userspace-to-userspace unicast datagrams, independent of each
     /// protocol's kernel reply queue so sender port IDs remain attributable.
     netlink_user_inbox: IrqSafeSpinLock<VecDeque<NetlinkUserPacket>>,
@@ -760,6 +761,7 @@ impl SocketFile {
             netlink_reply_groups: IrqSafeSpinLock::new(VecDeque::new()),
             netlink_last_recv_group: AtomicU32::new(0),
             netlink_admin: IrqSafeSpinLock::new(None),
+            netfilter_admin: IrqSafeSpinLock::new(None),
             netlink_user_inbox: IrqSafeSpinLock::new(VecDeque::new()),
         });
         if domain == AF_NETLINK {
@@ -774,6 +776,23 @@ impl SocketFile {
         }
         admin.check_live().map_err(|_| SockError::InvalidArg)?;
         *self.netlink_admin.lock() = Some(admin);
+        Ok(())
+    }
+
+    pub fn delegate_netfilter_admin(
+        &self,
+        admin: narf_net::netfilter::NetfilterAdminHandle,
+    ) -> Result<(), SockError> {
+        if self.domain != AF_NETLINK
+            || self.protocol != NETLINK_NETFILTER
+            || self.net_ns_id() != admin.net_ns_id()
+        {
+            return Err(SockError::InvalidArg);
+        }
+        admin
+            .check(narf_net::netfilter::NetfilterRights::READ)
+            .map_err(|_| SockError::InvalidArg)?;
+        *self.netfilter_admin.lock() = Some(admin);
         Ok(())
     }
 
@@ -1975,10 +1994,11 @@ impl SocketFile {
                     return result;
                 }
                 self.ensure_netlink_portid();
-                let replies = match narf_net::netlink_netfilter::build_replies(buf) {
-                    Ok(replies) => replies,
-                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
-                };
+                let replies =
+                    match narf_net::netlink_netfilter::build_replies_in(self.net_ns_id(), buf) {
+                        Ok(replies) => replies,
+                        Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                    };
                 let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {

@@ -7,6 +7,48 @@ extern crate alloc;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn smoke_netfilter_namespace_rulesets_are_isolated() -> TestResult {
+    use crate::netfilter::filter::nf_table_add_in;
+    use crate::netfilter::namespace::get;
+    use crate::netfilter::rules::Match;
+    use crate::netfilter::Verdict;
+
+    nf_table_add_in(0x4e_5341, "filter", "input", Match::any(), Verdict::Drop);
+    if get(0x4e_5341).filter.snapshot().len() != 1 {
+        return TestResult::Fail("rule missing from owning network namespace");
+    }
+    if !get(0x4e_5342).filter.snapshot().is_empty() {
+        return TestResult::Fail("ruleset leaked into a different network namespace");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/netfilter/namespace",
+    smoke_netfilter_namespace_rulesets_are_isolated
+);
+
+fn smoke_netfilter_authority_scope_rights_and_revocation() -> TestResult {
+    use crate::netfilter::{NetfilterAdminHandle, NetfilterAuthorityError, NetfilterRights};
+
+    let admin = NetfilterAdminHandle::mint(77, NetfilterRights::READ);
+    if admin.net_ns_id() != 77 || admin.check(NetfilterRights::READ).is_err() {
+        return TestResult::Fail("valid namespace read authority rejected");
+    }
+    if admin.check(NetfilterRights::RULESET) != Err(NetfilterAuthorityError::RightsTooWeak) {
+        return TestResult::Fail("rights attenuation was not enforced");
+    }
+    let copy = admin.clone();
+    admin.revoke();
+    if copy.check(NetfilterRights::READ) != Err(NetfilterAuthorityError::Revoked) {
+        return TestResult::Fail("revocation did not invalidate copied authority");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/netfilter/authority",
+    smoke_netfilter_authority_scope_rights_and_revocation
+);
+
 fn smoke_net_loopback_register() -> TestResult {
     use crate::{bootstrap_authority, register_loopback_named, registry, Loopback};
 

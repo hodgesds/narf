@@ -30,8 +30,13 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 pub mod conntrack;
 pub mod filter;
+pub mod namespace;
 pub mod nat;
 pub mod rules;
+
+pub use namespace::{
+    NetfilterAdminCap, NetfilterAdminHandle, NetfilterAuthorityError, NetfilterRights,
+};
 
 /// Hook point identifiers. Matches `enum nf_inet_hooks` in Linux
 /// `include/uapi/linux/netfilter.h:42-49`.
@@ -166,6 +171,9 @@ impl PktBuf<'_> {
 
 #[derive(Debug)]
 pub struct PktCtx<'a> {
+    /// Network namespace that owns this packet and all netfilter state used
+    /// while dispatching it. Zero denotes the initial namespace.
+    pub net_ns_id: u64,
     pub l3_proto: L3Proto,
     pub hook: HookPoint,
     /// Inbound interface name (PRE_ROUTING / LOCAL_IN / FORWARD).
@@ -192,6 +200,7 @@ impl<'a> PktCtx<'a> {
         packet: &'a mut [u8],
     ) -> Self {
         Self {
+            net_ns_id: 0,
             l3_proto: L3Proto::Ipv4,
             hook,
             iface_in,
@@ -213,6 +222,7 @@ impl<'a> PktCtx<'a> {
         packet: &'a [u8],
     ) -> Self {
         Self {
+            net_ns_id: 0,
             l3_proto: L3Proto::Ipv4,
             hook,
             iface_in,
@@ -220,6 +230,13 @@ impl<'a> PktCtx<'a> {
             packet: PktBuf::Ref(packet),
             conntrack_id: None,
         }
+    }
+
+    /// Bind this packet context to a network namespace.
+    #[inline]
+    pub fn with_net_ns(mut self, net_ns_id: u64) -> Self {
+        self.net_ns_id = net_ns_id;
+        self
     }
 
     /// Borrow the packet bytes (read-only). Zero-copy.

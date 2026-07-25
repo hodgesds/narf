@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "3b2617a17646b12c100ba0a5e08272c0bfdab03738c0dd62f31cd46d5f223466"
+prompt_hash = "2cbba0df0c488aa2884316f09ad9ee123a1afa676628eed9b1c85d61bf47d750"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -94,3 +94,15 @@ argument = "The aarch64 IRQ edit publishes only the interrupted ELR scalar throu
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The NUMA topology fallback is compiled only for hosted crate tests, where the narf-frame ACPI bridge is absent. Kernel targets still require the authoritative frame-provided hooks, so production frame placement, ownership, cpuset constraints, and domain assignment are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Adding NetfilterAdmin as a distinct stable capability kind keeps firewall authority in the existing capability-table TCB and does not expand the trusted subsystem set."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A netfilter control operation requires a live epoch-checked capability, sufficient explicit operation rights, and an exact immutable network-namespace-id match. No uid, Linux ambient capability bit, namespace membership, or raw userspace slot bypasses those checks."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L70"
+argument = "NetfilterAdmin copies share one capability-table object epoch; revoking one invalidates every copied handle at its next authority check while revealing only the already documented stale-cap revocation bit."

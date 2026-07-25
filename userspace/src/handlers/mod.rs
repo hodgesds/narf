@@ -12914,6 +12914,25 @@ pub fn delegate_stack_admin_to_route_socket(
     socket.delegate_netlink_admin(reply.admin.clone())
 }
 
+/// Transfer kernel-held namespace firewall authority to one of the calling
+/// task's NETLINK_NETFILTER sockets. Raw capability slots never cross the
+/// userspace ABI.
+pub fn delegate_netfilter_admin_to_socket(
+    fd: u32,
+    admin: narf_net::netfilter::NetfilterAdminHandle,
+) -> Result<(), crate::socket::SockError> {
+    let task = current_task_id();
+    let entry = fd::with_table(task, |table| table.get(fd).cloned())
+        .flatten()
+        .ok_or(crate::socket::SockError::BadFd)?;
+    let socket = entry
+        .ops
+        .as_any()
+        .and_then(|ops| ops.downcast_ref::<crate::socket::SocketFile>())
+        .ok_or(crate::socket::SockError::BadFd)?;
+    socket.delegate_netfilter_admin(admin)
+}
+
 // Side table to enable Arc<dyn FileOps> -> Arc<SocketFile> recovery.
 // `fd::FdEntry` stores Arc<dyn FileOps>; `dyn FileOps` is not
 // `Any`, so a downcast isn't possible. Stage-1: register the
