@@ -203,6 +203,16 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         narf_arch::aarch64::cpu::set_current_cpu(aff, logical_id as u32);
     }
 
+    // PSTATE.SSBS is per-CPU. Apply the protected policy before this AP
+    // becomes visible to the scheduler.
+    // SAFETY: EL1, IRQs masked, and this AP is not yet online.
+    let speculation_state = unsafe {
+        narf_arch::speculation::configure_current_cpu(narf_arch::speculation::Policy::Protected)
+    };
+    if speculation_state == narf_arch::speculation::State::Failed {
+        narf_arch::halt_forever();
+    }
+
     // 2. Install the EL1 vector table — APs share the BSP's table
     //    in .text but each CPU writes its own VBAR_EL1 to point at
     //    it.

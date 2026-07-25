@@ -28,7 +28,7 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::x86_64::cpuid::cpuid;
-use crate::x86_64::msr::{rdmsr, wrmsr_or_gp};
+use crate::x86_64::msr::{rdmsr_or_gp, wrmsr_or_gp};
 
 pub const MSR_IA32_SPEC_CTRL: u32 = 0x48;
 pub const MSR_IA32_PRED_CMD: u32 = 0x49;
@@ -40,6 +40,14 @@ pub const SPEC_CTRL_SSBD: u64 = 1 << 2;
 
 pub const PRED_CMD_IBPB: u64 = 1 << 0;
 pub const FLUSH_CMD_L1D: u64 = 1 << 0;
+
+/// Result of applying this module's baseline controls on one CPU.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ApplyResult {
+    Applied,
+    Unsupported,
+    Fault,
+}
 
 /// Bit-flag snapshot of available speculation-control features.
 #[derive(Copy, Clone, Debug, Default)]
@@ -94,8 +102,7 @@ pub unsafe fn read() -> u64 {
     if !features().ibrs && !features().stibp && !features().ssbd {
         return 0;
     }
-    // SAFETY: caller-asserted CPL=0; CPUID gate satisfied.
-    unsafe { rdmsr(MSR_IA32_SPEC_CTRL) }
+    rdmsr_or_gp(MSR_IA32_SPEC_CTRL).unwrap_or(0)
 }
 
 /// Set `IA32_SPEC_CTRL`. No-ops on hosts that don't support any
@@ -116,29 +123,64 @@ pub unsafe fn write(bits: u64) {
     let _ = wrmsr_or_gp(MSR_IA32_SPEC_CTRL, bits);
 }
 
+pub(crate) fn desired_value(
+    old: u64,
+    features: SpecCtrlFeatures,
+    enable: bool,
+) -> Option<(u64, u64)> {
+    let supported = (if features.ibrs { SPEC_CTRL_IBRS } else { 0 })
+        | (if features.stibp { SPEC_CTRL_STIBP } else { 0 })
+        | (if features.ssbd { SPEC_CTRL_SSBD } else { 0 });
+    if supported == 0 {
+        return None;
+    }
+    let new = if enable {
+        old | supported
+    } else {
+        old & !supported
+    };
+    Some((new, supported))
+}
+
+/// Enable or disable this module's baseline controls on the current CPU.
+///
+/// CPUID is deliberately probed locally instead of using [`features`]:
+/// hybrid and hot-plugged systems may expose a different supported subset
+/// on each logical CPU. Bits not owned by this module are preserved.
+///
+/// # Safety
+///
+/// CPL = 0 and the caller has serialised policy changes on this CPU.
+pub unsafe fn apply_default_controls(enable: bool) -> ApplyResult {
+    let local_features = SpecCtrlFeatures::probe();
+    if desired_value(0, local_features, enable).is_none() {
+        return ApplyResult::Unsupported;
+    }
+    let old = match rdmsr_or_gp(MSR_IA32_SPEC_CTRL) {
+        Ok(value) => value,
+        Err(_) => return ApplyResult::Fault,
+    };
+    let (new, supported) = match desired_value(old, local_features, enable) {
+        Some(values) => values,
+        None => return ApplyResult::Unsupported,
+    };
+    if wrmsr_or_gp(MSR_IA32_SPEC_CTRL, new).is_err() {
+        return ApplyResult::Fault;
+    }
+    match rdmsr_or_gp(MSR_IA32_SPEC_CTRL) {
+        Ok(observed) if observed & supported == new & supported => ApplyResult::Applied,
+        _ => ApplyResult::Fault,
+    }
+}
+
 /// Enable IBRS + STIBP + SSBD on this CPU (best-effort; only the
 /// subset reported by `features()` is set).
 ///
 /// # Safety
 /// CPL = 0.
 pub unsafe fn enable_default_mitigations() {
-    let f = features();
-    let mut bits = 0u64;
-    if f.ibrs {
-        bits |= SPEC_CTRL_IBRS;
-    }
-    if f.stibp {
-        bits |= SPEC_CTRL_STIBP;
-    }
-    if f.ssbd {
-        bits |= SPEC_CTRL_SSBD;
-    }
-    if bits != 0 {
-        // SAFETY: caller-asserted.
-        unsafe {
-            write(bits);
-        }
-    }
+    // SAFETY: inherited from this function's contract.
+    let _ = unsafe { apply_default_controls(true) };
 }
 
 /// Indirect-branch predictor barrier. Used at security

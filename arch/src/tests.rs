@@ -22,6 +22,87 @@ fn smoke_arch_backend() -> TestResult {
 }
 kernel_test_in!("arch", smoke_arch_backend);
 
+fn smoke_speculation_state_is_per_cpu() -> TestResult {
+    use crate::speculation::{state, State};
+    use narf_lib::percpu::MAX_CPUS;
+
+    if state(MAX_CPUS) != State::Failed {
+        return TestResult::Fail("out-of-range speculation state did not fail closed");
+    }
+    let cpu = crate::narf_arch_cpu_id();
+    let before = state(cpu);
+    if before == State::Unconfigured {
+        return TestResult::Fail("current CPU speculation policy was not configured at boot");
+    }
+
+    // A nested transition must fail without overwriting the completed state.
+    let guard = match crate::speculation::TransitionGuard::acquire(cpu) {
+        Some(guard) => guard,
+        None => return TestResult::Fail("could not acquire transition guard"),
+    };
+    // SAFETY: this deliberately exercises nested-call rejection; the inner
+    // call must return before touching hardware because `guard` owns the CPU.
+    let nested =
+        unsafe { crate::speculation::configure_current_cpu(crate::speculation::Policy::Protected) };
+    if nested != State::Failed || state(cpu) != before {
+        return TestResult::Fail("nested transition changed published CPU state");
+    }
+    drop(guard);
+
+    // An idempotent protected transition exercises the real MSR/sysreg path
+    // and must restore the caller's exact IRQ mask state.
+    let irq_before = crate::interrupts_enabled();
+    // SAFETY: kernel-test runs pinned on the current CPU; policy is only
+    // strengthened and the transition implementation masks ordinary IRQs.
+    let after =
+        unsafe { crate::speculation::configure_current_cpu(crate::speculation::Policy::Protected) };
+    if crate::interrupts_enabled() != irq_before {
+        return TestResult::Fail("speculation transition did not restore IRQ state");
+    }
+    if after == State::Failed || state(cpu) != after {
+        return TestResult::Fail("protected transition failed or was not published");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("arch/speculation", smoke_speculation_state_is_per_cpu);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_spec_ctrl_policy_mask_preserves_unowned_bits() -> TestResult {
+    use crate::x86_64::spec_ctrl::{
+        desired_value, SpecCtrlFeatures, SPEC_CTRL_IBRS, SPEC_CTRL_SSBD, SPEC_CTRL_STIBP,
+    };
+    let unowned = 1u64 << 40;
+    let features = SpecCtrlFeatures {
+        ibrs: true,
+        stibp: false,
+        ssbd: true,
+        l1d_flush: false,
+    };
+    let (enabled, supported) = match desired_value(unowned | SPEC_CTRL_STIBP, features, true) {
+        Some(values) => values,
+        None => return TestResult::Fail("supported policy unexpectedly returned None"),
+    };
+    if supported != SPEC_CTRL_IBRS | SPEC_CTRL_SSBD {
+        return TestResult::Fail("policy mask included an unsupported feature");
+    }
+    if enabled & unowned == 0 || enabled & SPEC_CTRL_STIBP == 0 {
+        return TestResult::Fail("enable policy clobbered a pre-existing bit");
+    }
+    let (disabled, _) = desired_value(enabled, features, false).unwrap();
+    if disabled & unowned == 0
+        || disabled & SPEC_CTRL_STIBP == 0
+        || disabled & (SPEC_CTRL_IBRS | SPEC_CTRL_SSBD) != 0
+    {
+        return TestResult::Fail("disable policy clobbered unsupported or unowned bits");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "arch/speculation",
+    smoke_spec_ctrl_policy_mask_preserves_unowned_bits
+);
+
 fn smoke_arch_percpu_basic() -> TestResult {
     use crate::percpu::{current_cpu_id, ThisCpu, MAX_CPUS};
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -82,6 +163,23 @@ fn smoke_arch_patch_word_roundtrip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("arch", smoke_arch_patch_word_roundtrip);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_aarch64_ssbs_readback() -> TestResult {
+    use crate::aarch64::ssbs;
+    if ssbs::caps() < 2 {
+        return TestResult::Skip("SSBS direct instructions unavailable");
+    }
+    // Boot configured the protected policy. This validates both corrected
+    // raw encodings and the architectural polarity (SSBS=0 is safe).
+    // SAFETY: EL1 and caps >= 2.
+    if !unsafe { ssbs::is_enabled() } {
+        return TestResult::Fail("PSTATE.SSBS was not enabled after protected boot policy");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/speculation", smoke_aarch64_ssbs_readback);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_aarch64_mte_l2() -> TestResult {
