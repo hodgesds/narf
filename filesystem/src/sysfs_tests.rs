@@ -872,6 +872,25 @@ fn smoke_sysfs_perf_event_sources() -> TestResult {
     {
         return TestResult::Fail("software PMU type missing");
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let events = match cpu.get_child("events") {
+            Some(events) => events,
+            None => return TestResult::Fail("aarch64 PMU events directory missing"),
+        };
+        for (name, event) in [
+            ("cycles", 0x11u16),
+            ("instructions", 0x08),
+            ("cache-misses", 0x03),
+            ("branch-instructions", 0x0c),
+            ("branch-misses", 0x10),
+        ] {
+            let advertised = events.attr_show(name).is_some();
+            if advertised != narf_arch::aarch64::pmu::event_supported(event) {
+                return TestResult::Fail("aarch64 PMU alias does not match PMCEID");
+            }
+        }
+    }
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]

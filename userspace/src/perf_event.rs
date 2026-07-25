@@ -1493,7 +1493,6 @@ pub(crate) fn event_tracks_task_for_test(fd_num: u32, task: u64) -> bool {
 
 /// Scheduler PMU context hook. Runs outside scheduler queue locks and brackets
 /// the matching task continuation on the current logical CPU.
-#[cfg(target_arch = "x86_64")]
 pub(crate) fn on_task_switch(task: u64, running: bool) {
     if !narf_lib::perf::enabled() {
         return;

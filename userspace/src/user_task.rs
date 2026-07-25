@@ -2656,6 +2656,7 @@ unsafe fn user_task_exit_hook(_uctx: *mut UserTaskCtx) -> ! {
 pub fn install_user_task_hooks() {
     install_yield_hook(user_task_yield_hook);
     install_exit_hook(user_task_exit_hook);
+    narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

@@ -28,14 +28,14 @@ over that authority; it is not a second PMU subsystem.
 | `perf` surface | Required kernel ABI | NARF status | Notes |
 | --- | --- | --- | --- |
 | `perf --version`, help | ELF loader, libc, terminal | supported in Alpine rootfs | `REGEN_perf_rootfs.sh` packages Alpine's unmodified musl-linked perf and its shared-library closure. |
-| `perf list software` | sysfs event-source discovery | supported slice | The upstream CLI discovers only software events implemented by the adapter. |
+| `perf list` | sysfs event-source discovery | supported slice | The upstream CLI discovers software events plus architecture-correct raw formats. On aarch64, generic hardware aliases are published only when PMCEID advertises the corresponding event. Model-specific aliases remain absent. |
 | `perf stat -- <cmd>` | default event selection and honest event admission | supported slice | Supported counters are measured; unavailable hardware events are reported as `<not supported>` rather than fabricated. |
 | `perf stat -e cycles <cmd>` | counting event, enable-on-exec, target-exit stop, 24-byte read format | supported slice | The count window is bounded by successful exec and process exit and scheduler switch hooks attribute the PMU counter only while the target runs. |
 | `perf stat -e cycles,instructions <cmd>` | independent fds, scaling times | supported slice | Hardware availability still bounds simultaneous events. |
 | `perf stat -e '{cycles,instructions}'` | event groups and group leader reads | supported slice | Members are linked to the leader; group reads and group lifecycle ioctls cover the non-multiplexed counting case. |
 | `perf stat -a` | per-CPU events and online CPU discovery | partial | Exact hardware counting is admitted only for the calling CPU on a uniprocessor boot; SMP/remote-CPU operation returns `EOPNOTSUPP`. |
-| `perf stat -p PID` | task-scoped accounting | supported slice (x86_64) | Scheduler switch hooks allocate the target's counter only on the CPU where it runs and fold counts across preemption and migration. |
-| `perf record` | overflow sampling, mmap metadata/data ring, poll wakeups | partial (x86_64 and aarch64 PMUv3) | Intel architectural PMU and AMD legacy/PerfMonV2 GP counters route real LVT-PC overflow IRQs into SAMPLE/LOST ring records; scheduler-attributed x86_64 task counters switch per-CPU PMU state across preemption and migration and inherit across process/thread clones; frequency mode adapts real reload periods from observed overflow timing. On aarch64, fixed cycle and PMCEID-advertised programmable events are verified end to end through counter preload, firmware-discovered level-sensitive PPI 23, GICv3 dispatch, PMOVS acknowledgement/reload, interrupted-ELR capture, deferred drain, and a visible mmap sample. Frequency mode adapts the real PMUv3 reload, and locally active events support synchronous live period updates; remotely active updates fail until an IPI rendezvous exists. Exec publishes exact program/interpreter PT_LOAD and stack VMAs, and later mmap/comm/fork/exit paths emit MMAP/MMAP2/COMM/FORK/EXIT with `sample_id_all` trailers. Ring overflow is reported through both `PERF_RECORD_LOST` and `PERF_FORMAT_LOST`; `PERF_EVENT_IOC_PAUSE_OUTPUT` suppresses production until resumed; `PERF_EVENT_IOC_SET_OUTPUT` redirects compatible events into a shared mapped ring. Hardware per-CPU events on SMP and aarch64 scheduler attribution remain. |
+| `perf stat -p PID` | task-scoped accounting | supported slice | Scheduler switch hooks allocate the target's architecture-specific counter only on the CPU where it runs and fold counts across preemption and migration on x86_64 and aarch64. |
+| `perf record` | overflow sampling, mmap metadata/data ring, poll wakeups | partial (x86_64 and aarch64 PMUv3) | Intel architectural PMU and AMD legacy/PerfMonV2 GP counters route real LVT-PC overflow IRQs into SAMPLE/LOST ring records; task counters switch architecture-specific per-CPU PMU state across preemption and migration and inherit across process/thread clones; frequency mode adapts real reload periods from observed overflow timing. On aarch64, fixed cycle and PMCEID-advertised programmable events are verified end to end through counter preload, firmware-discovered level-sensitive PPI 23, GICv3 dispatch, PMOVS acknowledgement/reload, interrupted-ELR capture, deferred drain, and a visible mmap sample. Frequency mode adapts the real PMUv3 reload, and locally active events support synchronous live period updates; remotely active updates fail until an IPI rendezvous exists. Exec publishes exact program/interpreter PT_LOAD and stack VMAs, and later mmap/comm/fork/exit paths emit MMAP/MMAP2/COMM/FORK/EXIT with `sample_id_all` trailers. Ring overflow is reported through both `PERF_RECORD_LOST` and `PERF_FORMAT_LOST`; `PERF_EVENT_IOC_PAUSE_OUTPUT` suppresses production until resumed; `PERF_EVENT_IOC_SET_OUTPUT` redirects compatible events into a shared mapped ring. Hardware per-CPU events on SMP and synchronous remote PMU control remain. |
 | `perf report` | perf.data parser, symbols, unwind | userspace-only after record | Kernel work is primarily `/proc`, build-id, and mmap metadata fidelity. |
 | `perf trace` | tracepoint PMU, tracefs event metadata | unsupported | NARF tracing rings are not yet projected as Linux tracepoints. |
 | `perf top` | sampling plus periodic display | unsupported | Blocked by the same ring/PMI work as `perf record`. |
@@ -93,11 +93,10 @@ Gaps:
 1. Finish `perf stat`: task/CPU attribution, multiplex scaling, and capability
    authorization. The upstream CLI smoke is reproducible via
    `TEST_perf_cli.sh`.
-2. Extend the minimal perf sysfs projection with only event aliases backed by
-   the detected PMU.
-3. Complete sampling portability: add aarch64 scheduler attribution and
-   cross-CPU PMU control; retain the real-overflow QEMU gate on both IRQ
-   backends.
+2. Extend the PMCEID-gated aarch64 aliases with model-specific aliases only
+   after CPU-aware PMU discovery exists; retain fail-closed admission.
+3. Complete sampling portability with synchronous cross-CPU PMU control;
+   retain the real-overflow QEMU gate on both IRQ backends.
 4. Add unwind and build-id prerequisites for `perf record/report`; initial
    ELF/interpreter/stack and post-exec `mmap(2)` MMAP/MMAP2 records are wired.
 5. Project selected NARF tracing events into tracepoint IDs and tracefs for

@@ -221,7 +221,7 @@ are not exposed.
 Unsupported sample layouts and platforms without a routed PMU overflow IRQ
 fail explicitly.
 
-Task-scoped x86_64 hardware events are scheduler-attributed: a switch hook
+Task-scoped x86_64 and aarch64 hardware events are scheduler-attributed: a switch hook
 allocates and programs a counter in the destination CPU's PMU bank immediately
 before entering the target continuation, then stops, folds, and releases it
 immediately after every yield or preemption. Migration therefore carries the

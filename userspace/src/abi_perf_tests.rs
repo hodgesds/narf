@@ -919,9 +919,12 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
 
         // Test 20: task-scoped hardware events own a real current-CPU PMU
         // context and report retired work instead of counting peer tasks.
-        #[cfg(target_arch = "x86_64")]
         {
-            if narf_arch::x86_64::pmu::detect().is_none() {
+            #[cfg(target_arch = "x86_64")]
+            let pmu_available = narf_arch::x86_64::pmu::detect().is_some();
+            #[cfg(target_arch = "aarch64")]
+            let pmu_available = narf_arch::aarch64::pmu::available();
+            if !pmu_available {
                 return Ok(());
             }
             let hardware_attr = PerfEventAttr {
@@ -956,8 +959,12 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             }
             let _ = call(Syscall::Close.raw(), a0(hardware_fd as u64));
 
+            #[cfg(target_arch = "x86_64")]
+            let initial_period = 1000;
+            #[cfg(target_arch = "aarch64")]
+            let initial_period = 100_000;
             let sampling_hardware_attr = PerfEventAttr {
-                sample_period_or_freq: 1000,
+                sample_period_or_freq: initial_period,
                 sample_type: 1, // PERF_SAMPLE_IP
                 flags: 1,       // disabled
                 ..hardware_attr
@@ -974,7 +981,10 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 Some(fd) if fd >= 0 => fd as u32,
                 _ => return Err("disabled hardware sampling event was not admitted"),
             };
+            #[cfg(target_arch = "x86_64")]
             let new_period = 4096u64;
+            #[cfg(target_arch = "aarch64")]
+            let new_period = 100_000u64;
             if call(
                 Syscall::Ioctl.raw(),
                 a2(

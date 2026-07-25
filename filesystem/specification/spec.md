@@ -365,8 +365,10 @@ The perf discovery projection is
 `/sys/bus/event_source/devices/{cpu,software}`: it publishes PMU type numbers,
 the online CPU mask, and architecture-correct raw CPU PMU `format/*` bitfields
 (x86 event/unit-mask controls or the aarch64 16-bit architectural event
-number). Model-specific event aliases must not be published until derived from
-the detected PMU.
+number). On aarch64, `events/*` publishes the architectural cycles,
+instructions, cache-miss, branch, and branch-miss aliases only when the
+corresponding PMCEID bit is set. Model-specific event aliases must not be
+published until derived from the detected PMU.
 
 ## 4. Invariants & safety properties
 

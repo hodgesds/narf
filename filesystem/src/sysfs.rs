@@ -1501,7 +1501,22 @@ pub fn populate_perf_event_sources() {
         kobject_add_attr(&format, "cmask", || "config:24-31\n".to_string());
     }
     #[cfg(target_arch = "aarch64")]
-    kobject_add_attr(&format, "event", || "config:0-15\n".to_string());
+    {
+        kobject_add_attr(&format, "event", || "config:0-15\n".to_string());
+        let events = get_or_create_child(&cpu, "events");
+        for (name, event) in [
+            ("cycles", 0x11u16),
+            ("instructions", 0x08),
+            ("cache-misses", 0x03),
+            ("branch-instructions", 0x0c),
+            ("branch-misses", 0x10),
+        ] {
+            if narf_arch::aarch64::pmu::event_supported(event) {
+                let encoding = alloc::format!("event=0x{event:x}\n");
+                kobject_add_attr(&events, name, move || encoding.clone());
+            }
+        }
+    }
 
     let software = get_or_create_child(&devices, "software");
     kobject_add_attr(&software, "type", || "1\n".to_string());
