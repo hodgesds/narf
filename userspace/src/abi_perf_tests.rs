@@ -338,7 +338,72 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
         let _ = call(Syscall::Close.raw(), a0(stat_fd as u64));
 
-        // Test 14: linked group wire shape and group-wide lifecycle ioctls.
+        // Test 14: enable_on_exec remains stopped until the target commits exec.
+        let exec_attr = perf_event_attr {
+            flags: 1 | (1 << 12), // disabled | enable_on_exec
+            ..stat_attr
+        };
+        let exec_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(&exec_attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+        ) {
+            Some(f) if f >= 0 => f as u32,
+            _ => return Err("perf_event_open(enable_on_exec) failed"),
+        };
+        let mut exec_before = [u64::MAX; 4];
+        let _ = call(
+            Syscall::Read.raw(),
+            a2(
+                exec_fd as u64,
+                exec_before.as_mut_ptr() as u64,
+                core::mem::size_of_val(&exec_before) as u64,
+            ),
+        );
+        if exec_before[0] != 0 || exec_before[1] != 0 {
+            return Err("enable_on_exec event started before exec");
+        }
+        crate::perf_event::on_exec(crate::handlers::current_task_id());
+        let mut exec_after = [0u64; 4];
+        let _ = call(
+            Syscall::Read.raw(),
+            a2(
+                exec_fd as u64,
+                exec_after.as_mut_ptr() as u64,
+                core::mem::size_of_val(&exec_after) as u64,
+            ),
+        );
+        if exec_after[1] == 0 {
+            return Err("enable_on_exec event did not start at exec commit");
+        }
+        let task = crate::handlers::current_task_id();
+        crate::perf_event::on_process_exit(
+            crate::handlers::task_to_pid_raw(task).unwrap_or(task),
+            task,
+        );
+        let mut exit_stopped_a = [0u64; 4];
+        let mut exit_stopped_b = [0u64; 4];
+        let _ = call(
+            Syscall::Read.raw(),
+            a2(
+                exec_fd as u64,
+                exit_stopped_a.as_mut_ptr() as u64,
+                core::mem::size_of_val(&exit_stopped_a) as u64,
+            ),
+        );
+        let _ = call(
+            Syscall::Read.raw(),
+            a2(
+                exec_fd as u64,
+                exit_stopped_b.as_mut_ptr() as u64,
+                core::mem::size_of_val(&exit_stopped_b) as u64,
+            ),
+        );
+        if exit_stopped_a != exit_stopped_b {
+            return Err("perf event continued after target process exit");
+        }
+        let _ = call(Syscall::Close.raw(), a0(exec_fd as u64));
+
+        // Test 15: linked group wire shape and group-wide lifecycle ioctls.
         let group_attr = perf_event_attr {
             read_format: PERF_FORMAT_GROUP
                 | PERF_FORMAT_TOTAL_TIME_ENABLED
@@ -358,6 +423,13 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             Some(f) if f >= 0 => f as u32,
             _ => return Err("perf_event_open(group-format event) failed"),
         };
+        match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(&group_attr as *const _ as u64, 0, 0, group_read_fd as u64),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("perf group accepted mismatched CPU target"),
+        }
         let group_member_fd = match call(
             Syscall::PerfEventOpen.raw(),
             a3(
@@ -407,7 +479,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         let _ = call(Syscall::Close.raw(), a0(group_member_fd as u64));
         let _ = call(Syscall::Close.raw(), a0(group_read_fd as u64));
 
-        // Test 15: unknown read-format bits are rejected at open.
+        // Test 16: unknown read-format bits are rejected at open.
         let bad_format_attr = perf_event_attr {
             read_format: 1 << 63,
             ..sw_attr

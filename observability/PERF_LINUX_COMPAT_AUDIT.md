@@ -28,7 +28,7 @@ over that authority; it is not a second PMU subsystem.
 | `perf` surface | Required kernel ABI | NARF status | Notes |
 | --- | --- | --- | --- |
 | `perf --version`, help | ELF loader, libc, terminal | supported in Alpine rootfs | `REGEN_perf_rootfs.sh` packages Alpine's unmodified musl-linked perf and its shared-library closure. |
-| `perf stat -e cycles <cmd>` | counting event, enable-on-exec, 24-byte read format | supported slice | Counting is system-global during the window; exact target-task attribution is deferred. |
+| `perf stat -e cycles <cmd>` | counting event, enable-on-exec, target-exit stop, 24-byte read format | supported slice | The count window is bounded by successful exec and process exit; accounting within that window is system-global because exact target-task attribution is deferred. |
 | `perf stat -e cycles,instructions <cmd>` | independent fds, scaling times | supported slice | Hardware availability still bounds simultaneous events. |
 | `perf stat -e '{cycles,instructions}'` | event groups and group leader reads | supported slice | Members are linked to the leader; group reads and group lifecycle ioctls cover the non-multiplexed counting case. |
 | `perf stat -a` | per-CPU events and online CPU discovery | partial | CPU validation exists; counters are not pinned or migrated per CPU. |
@@ -60,8 +60,6 @@ Gaps:
 
 - `pid == -1`/per-CPU and PID-target semantics are validated but not
   scheduler-attributed.
-- `enable_on_exec` currently enables when the event is installed. This gives
-  the CLI a usable counting window but includes setup overhead.
 - Pinned/exclusive events, inheritance, output redirection, refresh,
   period changes, filters, SIGTRAP delivery, and namespace/cgroup modes are
   absent.

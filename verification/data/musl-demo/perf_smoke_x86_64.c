@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <string.h>
 
 #define PERF_TYPE_HARDWARE 0
@@ -138,6 +139,49 @@ int main() {
     }
     close(member_fd);
     close(group_fd);
+
+    // Match the upstream perf process model: parent owns a disabled event
+    // targeting a child, and the child's successful exec enables it.
+    int exec_pipe[2];
+    if (pipe(exec_pipe) != 0) {
+        printf("perf_smoke: ERROR - exec test pipe failed\n");
+        return 1;
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        char byte;
+        close(exec_pipe[1]);
+        if (read(exec_pipe[0], &byte, 1) != 1)
+            _exit(2);
+        execl("/bin/hello_musl", "hello_musl", NULL);
+        _exit(3);
+    }
+    close(exec_pipe[0]);
+    struct perf_event_attr exec_attr = group_attr;
+    exec_attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED |
+                            PERF_FORMAT_TOTAL_TIME_RUNNING |
+                            PERF_FORMAT_ID;
+    exec_attr.flags = 1 | (1ULL << 12); // disabled | enable_on_exec
+    long exec_fd = perf_event_open(&exec_attr, child, -1, -1, 0);
+    uint64_t exec_before[4] = {~0ULL, ~0ULL, ~0ULL, ~0ULL};
+    if (exec_fd < 0 || read(exec_fd, exec_before, sizeof(exec_before)) !=
+                         sizeof(exec_before) ||
+        exec_before[0] != 0 || exec_before[1] != 0) {
+        printf("perf_smoke: ERROR - enable_on_exec started early\n");
+        return 1;
+    }
+    if (write(exec_pipe[1], "x", 1) != 1 || waitpid(child, NULL, 0) != child) {
+        printf("perf_smoke: ERROR - exec child failed\n");
+        return 1;
+    }
+    uint64_t exec_after[4] = {0};
+    if (read(exec_fd, exec_after, sizeof(exec_after)) != sizeof(exec_after) ||
+        exec_after[0] == 0 || exec_after[1] == 0) {
+        printf("perf_smoke: ERROR - enable_on_exec did not start\n");
+        return 1;
+    }
+    close(exec_pipe[1]);
+    close(exec_fd);
 
     // Test custom software syscall counter
     struct perf_event_attr sw_attr;

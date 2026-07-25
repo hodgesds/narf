@@ -10,6 +10,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 static ACTIVE_PERF_EVENTS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
+static PERF_EVENT_REGISTRY: IrqSafeSpinLock<Vec<Weak<PerfEventFile>>> =
+    IrqSafeSpinLock::new(Vec::new());
 
 pub const PERF_ATTR_SIZE_VER0: u32 = 64;
 const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
@@ -55,10 +57,12 @@ pub struct perf_event_attr {
     pub sig_data: u64,
 }
 
-#[derive(Debug)]
 struct PerfEventFile {
     attr: perf_event_attr,
     id: u64,
+    target_task: u64,
+    target_pid: u64,
+    target_cpu: i32,
     enabled: AtomicBool,
     count_base: AtomicU64,
     count_accumulated: AtomicU64,
@@ -66,8 +70,23 @@ struct PerfEventFile {
     time_enabled_ns: AtomicU64,
     registered: AtomicBool,
     group_members: IrqSafeSpinLock<Vec<Weak<dyn FileOps>>>,
+    // A member keeps its leader's open-file description alive. The leader
+    // holds only weak member links, so this cannot form a reference cycle.
+    _group_leader: Option<Arc<dyn FileOps>>,
     #[cfg(target_arch = "x86_64")]
     pmu_counter: Option<narf_arch::x86_64::pmu::PmuCounter>,
+}
+
+impl core::fmt::Debug for PerfEventFile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PerfEventFile")
+            .field("id", &self.id)
+            .field("target_task", &self.target_task)
+            .field("target_pid", &self.target_pid)
+            .field("target_cpu", &self.target_cpu)
+            .field("enabled", &self.enabled.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl PerfEventFile {
@@ -183,6 +202,40 @@ impl PerfEventFile {
         *cursor = end;
         Ok(())
     }
+}
+
+/// Apply Linux `enable_on_exec` at the point a task commits a new image.
+///
+/// Events are owned by the monitoring process but keyed by the target task,
+/// matching the way the upstream perf CLI opens events for its stopped child.
+pub(crate) fn on_exec(task: u64) {
+    let mut registry = PERF_EVENT_REGISTRY.lock();
+    registry.retain(|weak| {
+        let Some(event) = weak.upgrade() else {
+            return false;
+        };
+        if event.target_task == task
+            && event.attr.flags & PERF_ATTR_ENABLE_ON_EXEC != 0
+            && event._group_leader.is_none()
+        {
+            let _ = event.for_group(PERF_IOC_FLAG_GROUP, PerfEventFile::enable);
+        }
+        true
+    });
+}
+
+/// Stop task-targeted events when the target process becomes group-dead.
+pub(crate) fn on_process_exit(pid: u64, _tid: u64) {
+    let mut registry = PERF_EVENT_REGISTRY.lock();
+    registry.retain(|weak| {
+        let Some(event) = weak.upgrade() else {
+            return false;
+        };
+        if event.target_pid == pid && event._group_leader.is_none() {
+            let _ = event.for_group(PERF_IOC_FLAG_GROUP, PerfEventFile::disable);
+        }
+        true
+    });
 }
 
 impl Drop for PerfEventFile {
@@ -421,10 +474,28 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
 
     let task = current_task_id();
 
-    if pid > 0 && pid as u64 != task && crate::handlers::pid_to_task_raw(pid as u64).is_none() {
-        ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
-        return;
-    }
+    let target_task = if pid == 0 {
+        task
+    } else if pid > 0 {
+        match crate::handlers::pid_to_task_raw(pid as u64) {
+            Some(target) => target,
+            None if pid as u64 == task => task,
+            None => {
+                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                return;
+            }
+        }
+    } else {
+        // pid == -1 denotes a per-CPU event with no task target.
+        u64::MAX
+    };
+    let target_pid = if pid == 0 {
+        crate::handlers::task_to_pid_raw(task).unwrap_or(task)
+    } else if pid > 0 {
+        pid as u64
+    } else {
+        u64::MAX
+    };
 
     if cpu != -1 && (cpu < 0 || !narf_lib::smp::is_online(cpu as u32)) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
@@ -432,21 +503,24 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     }
 
     let group_leader = if group_fd != -1 {
-        let leader = fd::with_table(task, |t| {
-            t.get(group_fd as u32).and_then(|entry| {
-                entry
-                    .ops
-                    .as_any()
-                    .and_then(|any| any.downcast_ref::<PerfEventFile>())
-                    .map(|_| Arc::clone(&entry.ops))
-            })
-        })
-        .flatten();
-        if leader.is_none() {
+        let leader =
+            fd::with_table(task, |t| t.get(group_fd as u32).map(|e| Arc::clone(&e.ops))).flatten();
+        let Some(leader) = leader else {
             ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
             return;
+        };
+        let Some(leader_event) = leader
+            .as_any()
+            .and_then(|any| any.downcast_ref::<PerfEventFile>())
+        else {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+            return;
+        };
+        if leader_event.target_task != target_task || leader_event.target_cpu != cpu {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
         }
-        leader
+        Some(leader)
     } else {
         None
     };
@@ -519,11 +593,15 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
 
     let mut opened_file = None;
     let fd_num_opt = fd::with_table(task, |t| {
-        let initially_enabled =
-            attr.flags & PERF_ATTR_DISABLED == 0 || attr.flags & PERF_ATTR_ENABLE_ON_EXEC != 0;
+        // A group member is scheduled only through its leader even when its
+        // own disabled bit is clear (the upstream CLI relies on this).
+        let initially_enabled = group_leader.is_none() && attr.flags & PERF_ATTR_DISABLED == 0;
         let file = Arc::new(PerfEventFile {
             attr,
             id: NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed),
+            target_task,
+            target_pid,
+            target_cpu: cpu,
             enabled: AtomicBool::new(false),
             count_base: AtomicU64::new(0),
             count_accumulated: AtomicU64::new(0),
@@ -531,6 +609,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             time_enabled_ns: AtomicU64::new(0),
             registered: AtomicBool::new(false),
             group_members: IrqSafeSpinLock::new(Vec::new()),
+            _group_leader: group_leader.clone(),
             #[cfg(target_arch = "x86_64")]
             pmu_counter,
         });
@@ -561,6 +640,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         // owns another Arc, so this file remains alive after `opened_file` drops.
         if let Some(file) = opened_file {
             file.registered.store(true, Ordering::Release);
+            PERF_EVENT_REGISTRY.lock().push(Arc::downgrade(&file));
         }
         if ACTIVE_PERF_EVENTS.fetch_add(1, Ordering::Relaxed) == 0 {
             narf_lib::perf::set_enabled(true);

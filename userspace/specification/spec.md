@@ -155,8 +155,12 @@ With `linux-compat`, the slow syscall table exposes Linux
 Linux perf-event ABI: `read(2)` according to `attr.read_format` and
 `PERF_EVENT_IOC_{ENABLE,DISABLE,RESET,ID}`. Group members opened against a
 perf-event leader participate in group-format reads and group-flag lifecycle
-ioctls. This is a compatibility adapter over `observability/` PMU authority,
-not an independent counter subsystem.
+ioctls. `enable_on_exec` events are registered weakly by target task and the
+shared successful `execve`/`execveat` commit path activates the leader and all
+members; failed exec attempts do not activate them. The process group-dead
+observer stops task-targeted leader groups before the monitoring process reads
+their terminal values. This is a compatibility adapter over `observability/`
+PMU authority, not an independent counter subsystem.
 
 Unsupported sampling, scheduler-attribution, cgroup, filter, probe, and BPF
 features fail explicitly. The adapter must not synthesize plausible values
