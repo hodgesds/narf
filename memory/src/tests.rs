@@ -6526,9 +6526,10 @@ fn smoke_numa_migrate_page_preserves_contents() -> TestResult {
         return TestResult::Fail("failed to materialize migration test page");
     }
     let node1_free_before = crate::node_free(1);
-    // SAFETY: root/direct map are live and the region is private.
-    if unsafe { a.migrate_page_to_node(va, 1) } != Ok(0) {
-        return TestResult::Fail("node 0 -> node 1 migration failed");
+    // SAFETY: root/direct map are live, the range is fully mapped, and the
+    // region is private.
+    if unsafe { a.conform_range_to_nodes(va, 4096, 0b10, true) } != Ok(0) {
+        return TestResult::Fail("range node 0 -> node 1 migration failed");
     }
     // SAFETY: a.root remains valid and no concurrent mutation occurs.
     let Some(new_phys) = (unsafe { paging::translate(a.root, va) }) else {
@@ -6563,6 +6564,7 @@ fn smoke_mempolicy_allowed_mask_is_hard_boundary() -> TestResult {
         mode: crate::MPOL_DEFAULT,
         nodemask: 0,
         allowed: 0b10,
+        home_node: u32::MAX,
     };
     let frame = match crate::mempolicy::alloc_frame_with(policy, 0) {
         Ok(frame) => frame,

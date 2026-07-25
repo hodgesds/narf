@@ -5,12 +5,12 @@ prompt_hash = "6e7ecf10083ec035057bdce834a72bbe2bffae8df9383ed10eb06c78dd70944b"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "The cgroup memory-node constraint is carried by the existing scheduler and memory-manager TCB components and does not add a trusted subsystem or move the documented trust boundary."
+argument = "Range conformance and BIND home-node selection remain inside the existing memory-manager TCB and do not add a trusted subsystem or move the documented trust boundary."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "The allowed-node mask only narrows physical allocation placement. It does not alter mapping permissions, capability checks, domain tags, or domain rights."
+argument = "mbind migration reuses the reviewed private-page replacement primitive, preserving mapping permissions and domain ownership; the home node changes allocation ordering only."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
-argument = "Per-task allowed-node state is keyed by scheduler task identity and cleared on detach and exit. Fault-time publication remains per-CPU and is cleared immediately after demand allocation, preventing policy leakage between tasks."
+argument = "Range migration replaces authoritative backing and flushes peer TLBs before old frames are freed. Shared mappings are never moved without MOVE_ALL authority, which NARF rejects because it has no ambient CAP_SYS_NICE."

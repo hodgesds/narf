@@ -2403,6 +2403,109 @@ impl AddressSpace {
         Ok(failed)
     }
 
+    /// Check or migrate resident pages in `[start, start + len)` so their
+    /// backing lies in `target_nodes`.
+    ///
+    /// When `do_move` is false this is a placement audit and the return value
+    /// is the number of resident pages outside the mask. When true, private
+    /// pages are migrated round-robin across the target nodes and the return
+    /// value is the number that remain misplaced. A hole in the requested
+    /// virtual range returns [`AddressSpaceError::Unmapped`].
+    ///
+    /// # Safety
+    /// Same address-space and direct-map prerequisites as
+    /// [`Self::migrate_page_to_node`].
+    pub unsafe fn conform_range_to_nodes(
+        &self,
+        start: VirtAddr,
+        len: u64,
+        target_nodes: u64,
+        do_move: bool,
+    ) -> Result<usize, AddressSpaceError> {
+        if len == 0 || target_nodes == 0 {
+            return Err(AddressSpaceError::InvalidNode);
+        }
+        let begin = start.as_u64();
+        let end = begin
+            .checked_add(len)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        let destinations: Vec<usize> = (0..crate::frame::MAX_NUMA_NODES)
+            .filter(|node| (target_nodes >> node) & 1 != 0)
+            .collect();
+        if destinations.is_empty() {
+            return Err(AddressSpaceError::InvalidNode);
+        }
+
+        let (candidates, shared_misplaced) = {
+            let regions = self.regions.lock();
+            let mut coverage: Vec<(u64, u64)> = regions
+                .iter()
+                .filter_map(|region| {
+                    let lo = region.base.as_u64().max(begin);
+                    let hi = region.base.as_u64().saturating_add(region.len).min(end);
+                    (lo < hi).then_some((lo, hi))
+                })
+                .collect();
+            coverage.sort_by_key(|&(lo, _)| lo);
+            let mut cursor = begin;
+            for &(lo, hi) in &coverage {
+                if lo > cursor {
+                    return Err(AddressSpaceError::Unmapped);
+                }
+                cursor = cursor.max(hi);
+            }
+            if cursor < end {
+                return Err(AddressSpaceError::Unmapped);
+            }
+
+            let mut pages = Vec::new();
+            let mut shared = 0usize;
+            for region in regions.iter() {
+                let rbase = region.base.as_u64();
+                let rlimit = rbase.saturating_add(region.len);
+                let lo = begin.max(rbase);
+                let hi = end.min(rlimit);
+                if lo >= hi {
+                    continue;
+                }
+                let first = ((lo - rbase) >> 12) as usize;
+                let last = ((hi - rbase + 4095) >> 12) as usize;
+                for idx in first..last.min(region.phys.len()) {
+                    let phys = region.phys[idx];
+                    if phys.raw() == 0 {
+                        continue;
+                    }
+                    // SAFETY: narf-frame supplies the topology hook.
+                    let node = unsafe { crate::frame::narf_phys_node(phys.raw()) };
+                    if (target_nodes >> node) & 1 != 0 {
+                        continue;
+                    }
+                    if region.perms.contains(RegionPerms::SHARED) {
+                        shared += 1;
+                    } else {
+                        pages.push(VirtAddr::new(rbase + (idx as u64) * 4096));
+                    }
+                }
+            }
+            (pages, shared)
+        };
+
+        if !do_move {
+            return Ok(candidates.len() + shared_misplaced);
+        }
+        let mut failed = shared_misplaced;
+        for (idx, va) in candidates.into_iter().enumerate() {
+            // SAFETY: each VA came from this AS's locked backing snapshot and
+            // migrate_page_to_node revalidates it under the same region lock.
+            if unsafe { self.migrate_page_to_node(va, destinations[idx % destinations.len()]) }
+                .is_err()
+            {
+                failed += 1;
+            }
+        }
+        Ok(failed)
+    }
+
     /// Re-install the PTE for the page containing `vaddr` to
     /// reflect the region's current `phys[i]` + `perms`. Used by
     /// the page-fault handler after `cow_split_on_write` has

@@ -378,12 +378,19 @@ fn smoke_abi_mem_migrate_pages_empty_masks_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_mem_migrate_pages_empty_masks_neg);
 
 // ── SetMempolicyHomeNode (450) ───────────────────────────────────────
-// flags(arg3) must be 0 → else -EINVAL. Otherwise accepted with 0. No AS
-// needed.
+// The syscall updates an existing MPOL_BIND range; a range with no policy
+// returns -ENOENT.
 
 fn smoke_abi_mem_set_mempolicy_home_node_pos() -> TestResult {
     with_setup(|| {
-        // addr=0x1000, len=0x1000, home_node=0, flags=0.
+        let mask = 1u64;
+        if call(
+            Syscall::Mbind.raw(),
+            a3(0x1000, 0x1000, 2, &mask as *const u64 as u64),
+        ) != Some(0)
+        {
+            return Err("failed to install MPOL_BIND prerequisite");
+        }
         match call(
             Syscall::SetMempolicyHomeNode.raw(),
             a3(0x1000, 0x1000, 0, 0),
@@ -494,8 +501,11 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_get_mempolicy_default_query_neg);
 
 fn smoke_abi_mem_mbind_pos() -> TestResult {
     with_setup(|| {
-        // addr=0x1000 (aligned), len=0x1000, mode=MPOL_BIND(2), nodemask=0.
-        match call(Syscall::Mbind.raw(), a3(0x1000, 0x1000, 2, 0)) {
+        let mask = 1u64;
+        match call(
+            Syscall::Mbind.raw(),
+            a3(0x1000, 0x1000, 2, &mask as *const u64 as u64),
+        ) {
             Some(0) => Ok(()),
             Some(_) => Err("mbind with a valid aligned range should return 0"),
             None => Err("mbind returned non-Ok status"),
@@ -527,6 +537,45 @@ fn smoke_abi_mem_mbind_unaligned_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem_mbind_unaligned_neg);
+
+fn smoke_abi_mem_mbind_unknown_flags_neg() -> TestResult {
+    with_setup(|| {
+        let args = SyscallArgs {
+            arg0: 0x1000,
+            arg1: 0x1000,
+            arg2: 2,
+            arg5: 1 << 3,
+            ..Default::default()
+        };
+        match call(Syscall::Mbind.raw(), args) {
+            Some(v) if v == EINVAL => Ok(()),
+            Some(_) => Err("mbind with an unknown flag should be -EINVAL"),
+            None => Err("mbind(unknown flag) should be Ok(-EINVAL)"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_mbind_unknown_flags_neg);
+
+fn smoke_abi_mem_mbind_move_all_requires_privilege_neg() -> TestResult {
+    with_setup(|| {
+        let args = SyscallArgs {
+            arg0: 0x1000,
+            arg1: 0x1000,
+            arg2: 2,
+            arg5: 1 << 2,
+            ..Default::default()
+        };
+        match call(Syscall::Mbind.raw(), args) {
+            Some(v) if v == EPERM => Ok(()),
+            Some(_) => Err("mbind(MPOL_MF_MOVE_ALL) should require privilege"),
+            None => Err("mbind(MOVE_ALL) should be Ok(-EPERM)"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mbind_move_all_requires_privilege_neg
+);
 
 // ── Msync (26) ───────────────────────────────────────────────────────
 // addr misaligned → -EINVAL (before the AS lookup). Aligned + no mapping

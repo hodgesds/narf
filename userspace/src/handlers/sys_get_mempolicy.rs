@@ -33,27 +33,28 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    let (mode, nodemask) = if flags & MPOL_F_ADDR != 0 {
+    let policy = if flags & MPOL_F_ADDR != 0 {
         resolve_policy(task, addr)
     } else {
         MEMPOLICY_TABLE
             .lock()
             .as_ref()
             .and_then(|m| m.get(&task).copied())
-            .unwrap_or((0, 0)) // MPOL_DEFAULT
+            .unwrap_or(StoredPolicy::DEFAULT)
     };
 
     if mode_ptr != 0 {
         let out_word: i32 = if flags & MPOL_F_NODE != 0 && flags & MPOL_F_ADDR != 0 {
             // Report the node the page at `addr` would come from.
             let pol = narf_memory::Mempolicy {
-                mode: mode & !MPOL_MODE_FLAGS,
-                nodemask,
+                mode: policy.mode & !MPOL_MODE_FLAGS,
+                nodemask: policy.nodemask,
                 allowed: narf_scheduler::task_mems_allowed(task),
+                home_node: policy.home_node,
             };
             mempolicy_resolved_node(pol) as i32
         } else {
-            mode as i32
+            policy.mode as i32
         };
         // SAFETY: mode_ptr is the user int out-pointer; copy_to_user validates it.
         if unsafe { copy_to_user(mode_ptr, &out_word.to_le_bytes()) }.is_err() {
@@ -63,7 +64,7 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
     }
     if nodemask_ptr != 0 {
         // SAFETY: nodemask_ptr is the user unsigned-long array; copy_to_user validates it.
-        let _ = unsafe { copy_to_user(nodemask_ptr, &nodemask.to_le_bytes()) };
+        let _ = unsafe { copy_to_user(nodemask_ptr, &policy.nodemask.to_le_bytes()) };
     }
     ctx.set_return(SyscallReturn::ok(0));
 }

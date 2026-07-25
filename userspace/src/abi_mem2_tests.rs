@@ -82,7 +82,11 @@ kernel_test_in!(
 fn smoke_abi_mem2_set_mempolicy_flagged_mode_pos() -> TestResult {
     with_setup(|| {
         // 0x8000_0000 (MPOL_F_STATIC_NODES) | 3 (INTERLEAVE) → masked to 3 < MAX.
-        match call(Syscall::SetMempolicy.raw(), a1(0x8000_0003, 0)) {
+        let mask = 1u64;
+        match call(
+            Syscall::SetMempolicy.raw(),
+            a1(0x8000_0003, &mask as *const u64 as u64),
+        ) {
             Some(0) => Ok(()),
             Some(_) => Err("set_mempolicy(STATIC_NODES|INTERLEAVE) should return 0"),
             None => Err("set_mempolicy(flagged mode) returned non-Ok status"),
@@ -102,7 +106,12 @@ fn smoke_abi_mem2_get_mempolicy_mode_writeback_pos() -> TestResult {
     with_setup(|| {
         // Prime the per-task policy to MPOL_BIND(2) so the writeback is
         // observably non-zero (and distinct from the uninitialised case).
-        if call(Syscall::SetMempolicy.raw(), a1(2, 0)) != Some(0) {
+        let mask = 1u64;
+        if call(
+            Syscall::SetMempolicy.raw(),
+            a1(2, &mask as *const u64 as u64),
+        ) != Some(0)
+        {
             return Err("set_mempolicy precondition failed");
         }
         let mut mode_out = [0xFFu8; 4];

@@ -35,6 +35,9 @@
 #ifndef SYS_set_mempolicy_home_node
 #define SYS_set_mempolicy_home_node 450
 #endif
+#ifndef SYS_mbind
+#define SYS_mbind 237
+#endif
 
 static void w(const char *m) { write(1, m, strlen(m)); }
 
@@ -70,11 +73,14 @@ int main(void) {
     }
     if (status[0] != 0) { w("mem2-fail: move_pages-node\n"); return 1; }
 
-    // ── set_mempolicy_home_node / migrate_pages: accepted ──
+    // ── mbind migration / set_mempolicy_home_node / migrate_pages ──
+    unsigned long old_nodes = 1UL;
+    if (syscall(SYS_mbind, p, (size_t)4096, 2L, &old_nodes, 64L, 3L) != 0) {
+        w("mem2-fail: mbind-move-strict\n"); return 1;
+    }
     if (syscall(SYS_set_mempolicy_home_node, p, (size_t)4096, 0L, 0L) != 0) {
         w("mem2-fail: home_node\n"); return 1;
     }
-    unsigned long old_nodes = 1UL;
     unsigned long new_nodes = 1UL;
     if (syscall(SYS_migrate_pages, 0L, 64L, &old_nodes, &new_nodes) != 0) {
         w("mem2-fail: migrate_pages\n"); return 1;

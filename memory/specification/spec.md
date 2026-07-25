@@ -73,6 +73,8 @@ pub struct Mempolicy {
     pub nodemask: u64,
     /// Hard boundary supplied by cpuset.mems; allocation never spills out.
     pub allowed: u64,
+    /// MPOL_BIND distance anchor; u32::MAX selects the lowest masked node.
+    pub home_node: u32,
 }
 pub fn mempolicy_set(policy: Mempolicy);
 pub fn mempolicy_clear();
@@ -92,6 +94,15 @@ impl AddressSpace {
         &self,
         old_nodes: u64,
         new_nodes: u64,
+    ) -> Result<usize, AddressSpaceError>;
+
+    /// Audit or migrate resident pages in a virtual range to a node mask.
+    pub unsafe fn conform_range_to_nodes(
+        &self,
+        start: VirtAddr,
+        len: u64,
+        target_nodes: u64,
+        do_move: bool,
     ) -> Result<usize, AddressSpaceError>;
 }
 

@@ -1034,7 +1034,7 @@ pub(crate) unsafe fn narf_phys_node(addr: u64) -> usize {
 /// Clamps to a sane non-zero default (10 local / 20 remote) when the
 /// hook is the no-topology stub.
 #[inline]
-fn node_distance(from: usize, to: usize) -> u32 {
+pub(crate) fn node_distance(from: usize, to: usize) -> u32 {
     // SAFETY: narf-frame provides the `#[no_mangle]` definition.
     let d = unsafe { narf_node_distance(from as u32, to as u32) };
     if d == 0 {

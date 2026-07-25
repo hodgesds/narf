@@ -52,6 +52,10 @@ static ACTIVE: [AtomicU64; MAX_TRACKED_CPUS] =
 static ACTIVE_ALLOWED: [AtomicU64; MAX_TRACKED_CPUS] =
     [const { AtomicU64::new(u64::MAX) }; MAX_TRACKED_CPUS];
 
+/// Per-CPU BIND home node (`u32::MAX` means no override).
+static ACTIVE_HOME: [AtomicU32; MAX_TRACKED_CPUS] =
+    [const { AtomicU32::new(u32::MAX) }; MAX_TRACKED_CPUS];
+
 /// Per-CPU interleave rotor for `MPOL_INTERLEAVE`.
 static INTERLEAVE_NEXT: [AtomicU32; MAX_TRACKED_CPUS] =
     [const { AtomicU32::new(0) }; MAX_TRACKED_CPUS];
@@ -74,6 +78,8 @@ pub struct Mempolicy {
     pub nodemask: u64,
     /// Hard allocation boundary (for example `cpuset.mems.effective`).
     pub allowed: u64,
+    /// Distance anchor for MPOL_BIND (`u32::MAX` = lowest masked node).
+    pub home_node: u32,
 }
 
 impl Mempolicy {
@@ -81,6 +87,7 @@ impl Mempolicy {
         mode: MPOL_DEFAULT,
         nodemask: 0,
         allowed: u64::MAX,
+        home_node: u32::MAX,
     };
 
     fn pack(self) -> u64 {
@@ -95,6 +102,7 @@ impl Mempolicy {
             mode: (v >> 32) as u32,
             nodemask: v & 0xFFFF_FFFF,
             allowed: u64::MAX,
+            home_node: u32::MAX,
         }
     }
 }
@@ -103,6 +111,7 @@ impl Mempolicy {
 pub fn set_active(policy: Mempolicy) {
     let slot = cpu_slot();
     ACTIVE_ALLOWED[slot].store(policy.allowed, Ordering::Release);
+    ACTIVE_HOME[slot].store(policy.home_node, Ordering::Release);
     ACTIVE[slot].store(policy.pack(), Ordering::Release);
 }
 
@@ -111,6 +120,7 @@ pub fn clear_active() {
     let slot = cpu_slot();
     ACTIVE[slot].store(u64::MAX, Ordering::Release);
     ACTIVE_ALLOWED[slot].store(u64::MAX, Ordering::Release);
+    ACTIVE_HOME[slot].store(u32::MAX, Ordering::Release);
 }
 
 /// The current CPU's active policy (DEFAULT when none installed).
@@ -118,6 +128,7 @@ pub fn active() -> Mempolicy {
     let slot = cpu_slot();
     let mut policy = Mempolicy::unpack(ACTIVE[slot].load(Ordering::Acquire));
     policy.allowed = ACTIVE_ALLOWED[slot].load(Ordering::Acquire);
+    policy.home_node = ACTIVE_HOME[slot].load(Ordering::Acquire);
     policy
 }
 
@@ -169,7 +180,7 @@ pub fn alloc_frame_with(policy: Mempolicy, local: usize) -> Result<PhysFrame, Fr
         return Err(FrameAllocError::Exhausted);
     }
     match policy.mode {
-        MPOL_BIND => alloc_bind(policy.nodemask & allowed),
+        MPOL_BIND => alloc_bind(policy.nodemask & allowed, policy.home_node),
         MPOL_INTERLEAVE => {
             let mask = if policy.nodemask == 0 {
                 allowed
@@ -218,23 +229,41 @@ fn alloc_preferred_within(preferred: usize, allowed: u64) -> Result<PhysFrame, F
 
 /// MPOL_BIND: try only nodes set in `mask`, nearest-first by distance
 /// from the lowest masked node. Never spills outside the mask.
-fn alloc_bind(mask: u64) -> Result<PhysFrame, FrameAllocError> {
-    let Some(anchor) = first_node(mask) else {
+fn alloc_bind(mask: u64, home_node: u32) -> Result<PhysFrame, FrameAllocError> {
+    let Some(first) = first_node(mask) else {
         return frame::alloc_frame_anywhere();
     };
-    if (mask >> anchor) & 1 != 0 {
-        if let Ok(f) = frame::alloc_frame_on_strict(anchor) {
-            return Ok(f);
+    let anchor = if home_node == u32::MAX {
+        first
+    } else {
+        (home_node as usize).min(MAX_NUMA_NODES - 1)
+    };
+    let mut candidates = [0usize; MAX_NUMA_NODES];
+    let mut count = 0usize;
+    for node in 0..MAX_NUMA_NODES {
+        if (mask >> node) & 1 != 0 {
+            candidates[count] = node;
+            count += 1;
         }
     }
-    for bit in 0..MAX_NUMA_NODES {
-        if bit == anchor {
-            continue;
-        }
-        if (mask >> bit) & 1 != 0 {
-            if let Ok(f) = frame::alloc_frame_on_strict(bit) {
-                return Ok(f);
+    for i in 1..count {
+        let mut j = i;
+        while j > 0 {
+            let a = candidates[j - 1];
+            let b = candidates[j];
+            let da = frame::node_distance(anchor, a);
+            let db = frame::node_distance(anchor, b);
+            if db < da || (db == da && b < a) {
+                candidates.swap(j - 1, j);
+                j -= 1;
+            } else {
+                break;
             }
+        }
+    }
+    for &node in &candidates[..count] {
+        if let Ok(f) = frame::alloc_frame_on_strict(node) {
+            return Ok(f);
         }
     }
     Err(FrameAllocError::Exhausted)

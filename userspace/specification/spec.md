@@ -66,6 +66,11 @@ another node. `migrate_pages(2)` moves the caller's resident private pages
 between node masks. Fault-time `set_mempolicy(2)` and `mbind(2)` placement
 is intersected with the task's cgroup-v2 `cpuset.mems.effective` mask;
 `get_mempolicy(MPOL_F_MEMS_ALLOWED)` reports that effective constraint.
+`mbind(MPOL_MF_MOVE)` immediately conforms resident private pages in the
+range, `MPOL_MF_STRICT` reports remaining misplacement as `EIO`, and
+`MPOL_MF_MOVE_ALL` requires authority NARF does not grant ambiently.
+`set_mempolicy_home_node(2)` updates the distance anchor of existing
+MPOL_BIND ranges and returns `ENOENT` when no eligible policy overlaps.
 
 Bootstrap: every new process receives two ring pairs (submit + complete)
 for the kernel ABI plus a read-only config page with capability

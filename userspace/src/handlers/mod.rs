@@ -3254,6 +3254,7 @@ extern "Rust" {
     fn narf_numa_node_count() -> u32;
     fn narf_cpu_to_node(cpu: u32) -> u32;
     fn narf_phys_to_node(addr: u64) -> u32;
+    fn narf_node_distance(from: u32, to: u32) -> u32;
 }
 
 #[inline]
@@ -3298,8 +3299,22 @@ const MPOL_F_NODE: u32 = 1 << 0; // return the node id, not the mode
 const MPOL_F_ADDR: u32 = 1 << 1; // query the policy at `addr`
 const MPOL_F_MEMS_ALLOWED: u32 = 1 << 2; // return the allowed-nodes mask
 
-/// One stored policy: mode (with flags) + first-word nodemask.
-type StoredPolicy = (u32, u64);
+/// One stored policy: mode (with flags), first-word nodemask, and optional
+/// BIND distance anchor installed by set_mempolicy_home_node(2).
+#[derive(Copy, Clone)]
+struct StoredPolicy {
+    mode: u32,
+    nodemask: u64,
+    home_node: u32,
+}
+
+impl StoredPolicy {
+    const DEFAULT: Self = Self {
+        mode: 0,
+        nodemask: 0,
+        home_node: u32::MAX,
+    };
+}
 
 /// Per-task default policy (set_mempolicy).
 static MEMPOLICY_TABLE: narf_lib::sync::IrqSafeSpinLock<
@@ -3317,6 +3332,21 @@ fn mpol_mode_valid(mode: u32) -> bool {
     (mode & !MPOL_MODE_FLAGS) < MPOL_MAX
 }
 
+fn mpol_policy_shape_valid(mode: u32, nodemask: u64) -> bool {
+    const MPOL_F_STATIC_NODES: u32 = 1 << 31;
+    const MPOL_F_RELATIVE_NODES: u32 = 1 << 30;
+    let flags = mode & MPOL_MODE_FLAGS;
+    if flags == (MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES) {
+        return false;
+    }
+    match mode & !MPOL_MODE_FLAGS {
+        narf_memory::MPOL_DEFAULT | narf_memory::MPOL_LOCAL => nodemask == 0 && flags == 0,
+        narf_memory::MPOL_PREFERRED => nodemask != 0 || flags == 0,
+        narf_memory::MPOL_BIND | narf_memory::MPOL_INTERLEAVE => nodemask != 0,
+        _ => false,
+    }
+}
+
 /// Resolve the policy in force for `task` at user address `va`: a
 /// covering mbind range wins, else the task default, else DEFAULT.
 fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
@@ -3331,7 +3361,7 @@ fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
         .lock()
         .as_ref()
         .and_then(|m| m.get(&task).copied())
-        .unwrap_or((0, 0))
+        .unwrap_or(StoredPolicy::DEFAULT)
 }
 
 /// Publish the current task's mempolicy for the faulting address `va`
@@ -3341,11 +3371,12 @@ fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
 /// `clear_mempolicy_for_fault` afterward.
 pub fn publish_mempolicy_for_fault(va: u64) {
     let task = current_task_id();
-    let (mode, nodemask) = resolve_policy(task, va);
+    let policy = resolve_policy(task, va);
     narf_memory::mempolicy_set(narf_memory::Mempolicy {
-        mode: mode & !MPOL_MODE_FLAGS,
-        nodemask,
+        mode: policy.mode & !MPOL_MODE_FLAGS,
+        nodemask: policy.nodemask,
         allowed: narf_scheduler::task_mems_allowed(task),
+        home_node: policy.home_node,
     });
 }
 
@@ -3365,7 +3396,33 @@ fn mempolicy_resolved_node(pol: narf_memory::Mempolicy) -> u32 {
         allowed.trailing_zeros()
     };
     match pol.mode {
-        x if x == narf_memory::MPOL_BIND || x == narf_memory::MPOL_PREFERRED => {
+        x if x == narf_memory::MPOL_BIND => {
+            let preferred = pol.nodemask & allowed;
+            if preferred != 0 {
+                let anchor = if pol.home_node == u32::MAX {
+                    preferred.trailing_zeros()
+                } else {
+                    pol.home_node
+                };
+                let mut best = preferred.trailing_zeros();
+                let mut best_distance = u32::MAX;
+                for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
+                    if (preferred >> node) & 1 == 0 {
+                        continue;
+                    }
+                    // SAFETY: narf-frame provides the topology hook.
+                    let distance = unsafe { narf_node_distance(anchor, node) };
+                    if distance < best_distance || (distance == best_distance && node < best) {
+                        best = node;
+                        best_distance = distance;
+                    }
+                }
+                best
+            } else {
+                first_allowed
+            }
+        }
+        x if x == narf_memory::MPOL_PREFERRED => {
             let preferred = pol.nodemask & allowed;
             if preferred != 0 {
                 preferred.trailing_zeros()
