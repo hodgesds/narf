@@ -41,9 +41,10 @@ pub const AF_INET6: u16 = 10;
 /// Picks 45 because Linux's number is taken; carries our four-ring
 /// model rather than mmap'd shared pages.
 pub const AF_BYPASS: u16 = 45;
-/// Linux `AF_NETLINK`. We implement route + uevent as first-class protocols
-/// and back every other family (audit / generic / netfilter / …) with a
-/// coherent no-op sink so a `socket(AF_NETLINK, …)` never fails.
+/// Linux `AF_NETLINK`. Kernel-backed route, diagnostics, audit, netfilter,
+/// uevent, and generic protocols are implemented explicitly. Other protocol
+/// numbers retain user-to-user delivery but reject sends to an absent kernel
+/// endpoint with `ECONNREFUSED`.
 pub const AF_NETLINK: u16 = 16;
 /// `SOL_NETLINK` — the get/setsockopt level for netlink-specific options
 /// (NETLINK_ADD_MEMBERSHIP, NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK, …).
@@ -66,9 +67,7 @@ pub const NETLINK_ROUTE: u32 = 0;
 /// `NETLINK_SOCK_DIAG` — Linux socket-table diagnostics used by `ss`.
 /// IPv4 TCP and UDP dumps are sourced from the kernel stack snapshots.
 pub const NETLINK_SOCK_DIAG: u32 = 4;
-/// `NETLINK_AUDIT` — the kernel audit protocol. systemd PID 1's audit setup
-/// opens `socket(AF_NETLINK, SOCK_RAW, 9)`; we back it with the no-op sink
-/// (audit is disabled — messages are accepted and silently dropped).
+/// `NETLINK_AUDIT` — the kernel audit status and rule-enumeration protocol.
 pub const NETLINK_AUDIT: u32 = 9;
 /// `NETLINK_NETFILTER` — read-only nfnetlink conntrack dumps.
 pub const NETLINK_NETFILTER: u32 = 12;
@@ -77,8 +76,8 @@ pub const NETLINK_NETFILTER: u32 = 12;
 /// device-uevent messages off it; we bridge it to the kernel uevent ring.
 pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
 /// `NETLINK_GENERIC` (genetlink) — the family-multiplexing protocol used by
-/// nl80211, taskstats, thermal, etc. Backed by the sink. Note the numeric
-/// value coincides with `AF_NETLINK` (16); they occupy different arg slots.
+/// nl80211, taskstats, thermal, etc. Note the numeric value coincides with
+/// `AF_NETLINK` (16); they occupy different argument slots.
 pub const NETLINK_GENERIC: u32 = 16;
 
 /// `sockaddr_nl` body (the bytes after the 2-byte `nl_family`) identifying
@@ -695,12 +694,9 @@ impl SocketFile {
                 replies: VecDeque::new(),
             }
         } else if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
-            // Any AF_NETLINK protocol NARF does not model as route/generic/uevent
-            // (NETLINK_AUDIT=9, NETLINK_NETFILTER=12, …) →
-            // a coherent no-op sink. systemd PID 1 opens NETLINK_AUDIT during
-            // manager setup; a hard failure here surfaced to userspace as the
-            // -1 sentinel (glibc errno=EPERM) → "Failed to open netlink,
-            // ignoring: Operation not permitted". The sink returns a usable fd.
+            // Unregistered kernel protocol. The socket still participates in
+            // protocol-isolated user-to-user netlink; only kernel-directed
+            // requests are rejected.
             SocketState::NetlinkSink
         } else if domain == AF_NETLINK {
             // NETLINK_KOBJECT_UEVENT → the udev hotplug monitor. Wire the
@@ -2138,13 +2134,10 @@ impl SocketFile {
         }
     }
 
-    /// `AF_NETLINK` no-op sink for protocols NARF does not model
-    /// (NETLINK_AUDIT, NETLINK_GENERIC, NETLINK_NETFILTER, …). Every op that
-    /// systemd's best-effort netlink open performs succeeds so it gets a
-    /// usable fd: `bind`/`connect` return 0, `send` accepts and drops the
-    /// message (audit/netfilter disabled), `recv` reports empty (WouldBlock →
-    /// EAGAIN, exactly like a quiet socket). Returning a hard error here made
-    /// the socket open surface as EPERM ("Failed to open netlink, ignoring").
+    /// User-to-user transport for an AF_NETLINK protocol with no registered
+    /// kernel endpoint. Binding and port-ID delivery remain available, while
+    /// a request addressed to port ID zero reports `ECONNREFUSED` instead of
+    /// silently discarding control-plane data.
     fn dispatch_netlink_sink(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => self.bind_netlink(&addr),
@@ -2154,7 +2147,7 @@ impl SocketFile {
                     return result;
                 }
                 self.ensure_netlink_portid();
-                SocketOpResult::Ok(buf.len() as u64)
+                SocketOpResult::Err(SockError::ConnectionRefused)
             }
             SocketOp::Recv { .. } => SocketOpResult::Err(SockError::WouldBlock),
             SocketOp::Shutdown { how: _ } => SocketOpResult::Ok(0),
@@ -4204,6 +4197,22 @@ fn smoke_socket_ioctl_unknown_is_unsupported() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_socket_ioctl_unknown_is_unsupported
+);
+
+fn smoke_unregistered_netlink_kernel_send_is_refused() -> TestResult {
+    let sock = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, 31);
+    match sock.dispatch_op(SocketOp::Send {
+        buf: b"unsupported-kernel-request",
+        flags: 0,
+        addr: None,
+    }) {
+        SocketOpResult::Err(SockError::ConnectionRefused) => TestResult::Pass,
+        _ => TestResult::Fail("unregistered netlink kernel endpoint silently accepted a send"),
+    }
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_unregistered_netlink_kernel_send_is_refused
 );
 
 fn smoke_netlink_lists_high_membership_groups() -> TestResult {

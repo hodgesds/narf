@@ -236,7 +236,10 @@ multicast group of the datagram actually dequeued (zero for unicast replies).
 reports the sender's port ID through `recvfrom`; a missing destination returns
 `ECONNREFUSED`. Userspace multicast is rejected because NARF does not infer
 Linux ambient broadcast authority; kernel protocol notifications still fan out
-to subscribed sockets. Kernel-originated messages use port ID zero. A send may contain
+to subscribed sockets. A protocol with no registered kernel responder retains
+user-to-user port-ID delivery, but a send to kernel port ID zero returns
+`ECONNREFUSED` instead of silently discarding the request. Kernel-originated
+messages use port ID zero. A send may contain
 multiple `NLMSG_ALIGN`-framed requests; replies preserve request order and
 sequence numbers. `NLM_F_ACK` requests receive `NLMSG_ERROR` with error zero
 after successful handling, while malformed framing fails with `EINVAL`.
