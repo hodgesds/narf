@@ -9,6 +9,7 @@
 //
 // `cargo xtask run   --arch=x86_64 [--release]`  — cross-build + QEMU boot
 // `cargo xtask test  --arch=aarch64`             — boot + run kernel tests
+// `cargo xtask host-test`                        — fast host unit-test gate
 // `cargo xtask image --arch=x86_64 --bootloader=limine` — bootable ISO
 
 use std::io::{BufRead, BufReader};
@@ -28,6 +29,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Run the fast, hardware-independent unit-test suite on the host.
+    ///
+    /// This intentionally names an allowlist: crates that require the
+    /// kernel linker script, privileged instructions, or QEMU belong in
+    /// `xtask test`, not in this gate.
+    HostTest,
     /// Cross-compile the kernel.
     Build(BuildArgs),
     /// Cross-compile and boot under QEMU.
@@ -6924,6 +6931,7 @@ fn sha256_first_n(dev: &str, n: u64) -> Result<String> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::HostTest => host_test_cmd(),
         Cmd::Build(args) => {
             cargo_build(&args, &workspace_root()?)?;
             Ok(())
@@ -7005,4 +7013,31 @@ fn main() -> Result<()> {
             run_cmd(&args)
         }
     }
+}
+
+fn host_test_cmd() -> Result<()> {
+    let root = workspace_root()?;
+    let suites: &[(&str, &[&str])] = &[
+        (
+            "kernel workspace host-safe crates",
+            &["test", "-p", "narf-lib", "-p", "narf-hid"],
+        ),
+        (
+            "isolated login-core workspace",
+            &["test", "--manifest-path", "userspace/login-core/Cargo.toml"],
+        ),
+    ];
+
+    for (name, args) in suites {
+        eprintln!("host-test: {name}");
+        let status = Command::new("cargo")
+            .args(*args)
+            .current_dir(&root)
+            .status()
+            .with_context(|| format!("failed to launch {name}"))?;
+        if !status.success() {
+            bail!("{name} failed with {status}");
+        }
+    }
+    Ok(())
 }
