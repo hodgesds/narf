@@ -7,6 +7,7 @@
 use narf_memory::{PhysAddr, VirtAddr};
 
 use crate::info::{BootError, BootInfo, MemRegion, MemRegionKind, RawBootInfo};
+use narf_firmware_fdt::{Reservation, ReservedRegion};
 
 /// DTB magic per Devicetree Specification (big-endian on the wire).
 pub const DTB_MAGIC_BE: u32 = 0xd00d_feed;
@@ -14,9 +15,7 @@ pub const DTB_MAGIC_BE: u32 = 0xd00d_feed;
 /// QEMU `virt` machine's PL011 base MMIO address.
 pub const PL011_QEMU_VIRT: u64 = 0x0900_0000;
 
-/// Maximum number of memory regions we track pre-parse. FDT parsing is
-/// deferred to Wave 2; for Wave 1 we synthesise a single "all of RAM"
-/// region from platform knowledge.
+/// Maximum number of normalized memory regions handed to the framekernel.
 pub const MAX_MEM_REGIONS: usize = 16;
 
 static mut MEMORY_MAP: [MemRegion; MAX_MEM_REGIONS] = [MemRegion {
@@ -26,10 +25,10 @@ static mut MEMORY_MAP: [MemRegion; MAX_MEM_REGIONS] = [MemRegion {
 }; MAX_MEM_REGIONS];
 static mut MEMORY_MAP_LEN: usize = 0;
 
-static CMDLINE: &str = "";
+static mut CMDLINE_BYTES: [u8; 256] = [0; 256];
+static mut CMDLINE_LEN: usize = 0;
 
-/// Parse a U-Boot-style handoff. Wave 1 trusts QEMU `virt` defaults — the
-/// full FDT walker lands with `memory/` at a later wave.
+/// Parse a Linux-compatible U-Boot-style FDT handoff.
 ///
 /// Tolerates a null or bogus DTB pointer: when QEMU's `-kernel` path
 /// doesn't populate X0 with an FDT address (observed on ELF inputs
@@ -56,26 +55,6 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         }
     }
 
-    // Wave-1 placeholder: a single 128-MiB usable region starting at the
-    // standard virt-machine RAM base. Real FDT parsing in Wave 2 replaces
-    // this with the actual `/memory` node.
-    let region = MemRegion {
-        start: PhysAddr::new(0x4000_0000),
-        len: 0x0800_0000, // 128 MiB
-        kind: MemRegionKind::Usable,
-    };
-    // SAFETY: single-threaded boot path writes to the static buffer.
-    unsafe {
-        core::ptr::addr_of_mut!(MEMORY_MAP)
-            .cast::<MemRegion>()
-            .write(region);
-        core::ptr::addr_of_mut!(MEMORY_MAP_LEN).write(1);
-    }
-    // SAFETY: slice refers to the static we just wrote.
-    let regions = unsafe {
-        core::slice::from_raw_parts(core::ptr::addr_of!(MEMORY_MAP).cast::<MemRegion>(), 1)
-    };
-
     // Locate the DTB. The bootloader-provided pointer is the
     // canonical source, but QEMU's `-kernel <elf>` path doesn't set
     // up x0 = DTB the way the Linux Image format expects, so the
@@ -94,21 +73,116 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         unsafe { scan_for_dtb() }
     };
 
-    // FDT initramfs handoff: find `/chosen`, read
-    // `linux,initrd-start` + `linux,initrd-end` (u32 or u64).
-    // Returns `None` when no DTB was located, when no `/chosen`
-    // node exists, or when neither property is present.
-    let initramfs = match dtb_phys {
-        // SAFETY: dtb_phys came from the scan above + identity-
-        // mapped 256 MiB virt RAM range.
-        // SAFETY: Valid memory or trusted environment
-        Some(p) => unsafe { scan_initramfs_chosen(p.raw()) },
+    const MAX_DTB_SIZE: usize = 2 * 1024 * 1024;
+    let dtb = match dtb_phys {
+        // SAFETY: U-Boot places the DTB in identity-mapped RAM; the
+        // parser caps firmware's totalsize at MAX_DTB_SIZE.
+        Some(p) => unsafe { narf_firmware_fdt::discover(p.raw() as usize, MAX_DTB_SIZE) },
         None => None,
+    };
+
+    let initramfs = dtb
+        .and_then(narf_firmware_fdt::chosen_initrd_range)
+        .map(|r| MemRegion {
+            start: PhysAddr::new(r.addr),
+            len: r.size,
+            kind: MemRegionKind::Reserved,
+        });
+
+    let regions = if let Some(blob) = dtb {
+        // Linux-compatible early scan: obtain RAM from `/memory`, then
+        // subtract both reservation mechanisms plus the DTB and initrd.
+        let mut memory = [Reservation::default(); MAX_MEM_REGIONS];
+        let memory_len = narf_firmware_fdt::copy_memory_ranges(blob, &mut memory);
+        let mut reservations = [Reservation::default(); MAX_MEM_REGIONS * 2];
+        let mut reservation_len = narf_firmware_fdt::copy_reservations(blob, &mut reservations);
+        let mut reserved_nodes = [ReservedRegion::default(); MAX_MEM_REGIONS];
+        let reserved_len =
+            narf_firmware_fdt::copy_reserved_memory_ranges(blob, &mut reserved_nodes);
+        for node in reserved_nodes[..reserved_len].iter() {
+            if reservation_len < reservations.len() {
+                reservations[reservation_len] = Reservation {
+                    addr: node.addr,
+                    size: node.size,
+                };
+                reservation_len += 1;
+            }
+        }
+        if reservation_len < reservations.len() {
+            reservations[reservation_len] = Reservation {
+                addr: dtb_phys.expect("DTB slice requires physical address").raw(),
+                size: blob.len() as u64,
+            };
+            reservation_len += 1;
+        }
+        if let Some(initrd) = initramfs {
+            if reservation_len < reservations.len() {
+                reservations[reservation_len] = Reservation {
+                    addr: initrd.start.raw(),
+                    size: initrd.len,
+                };
+                reservation_len += 1;
+            }
+        }
+        // SAFETY: single-threaded boot path owns the static output.
+        unsafe {
+            normalize_memory_map(
+                &memory[..memory_len],
+                &reservations[..reservation_len],
+                &mut *core::ptr::addr_of_mut!(MEMORY_MAP),
+                &mut *core::ptr::addr_of_mut!(MEMORY_MAP_LEN),
+            );
+        }
+        // A present `/memory` node is not sufficient if firmware
+        // reservations consume every byte.
+        if memory_len == 0 || unsafe { *core::ptr::addr_of!(MEMORY_MAP_LEN) } == 0 {
+            return Err(BootError::NoUsableRam);
+        }
+        if let Some(args) = narf_firmware_fdt::chosen_bootargs(blob) {
+            let bytes = args.as_bytes();
+            // SAFETY: single-threaded boot initialization.
+            unsafe {
+                let dst = &mut *core::ptr::addr_of_mut!(CMDLINE_BYTES);
+                dst[..bytes.len()].copy_from_slice(bytes);
+                core::ptr::addr_of_mut!(CMDLINE_LEN).write(bytes.len());
+            }
+        }
+        // SAFETY: the static map was initialized immediately above.
+        unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::addr_of!(MEMORY_MAP).cast::<MemRegion>(),
+                *core::ptr::addr_of!(MEMORY_MAP_LEN),
+            )
+        }
+    } else {
+        // Preserve direct-QEMU fallback for ELF boots that provide no
+        // discoverable DTB.
+        // SAFETY: single-threaded boot owns the static map and the
+        // returned slice becomes immutable before secondary CPUs start.
+        unsafe {
+            core::ptr::addr_of_mut!(MEMORY_MAP)
+                .cast::<MemRegion>()
+                .write(MemRegion {
+                    start: PhysAddr::new(0x4000_0000),
+                    len: 0x0800_0000,
+                    kind: MemRegionKind::Usable,
+                });
+            core::ptr::addr_of_mut!(MEMORY_MAP_LEN).write(1);
+            core::slice::from_raw_parts(core::ptr::addr_of!(MEMORY_MAP).cast::<MemRegion>(), 1)
+        }
+    };
+    // SAFETY: initialized above and immutable after boot handoff.
+    let cmdline = unsafe {
+        let bytes = core::slice::from_raw_parts(
+            core::ptr::addr_of!(CMDLINE_BYTES).cast::<u8>(),
+            *core::ptr::addr_of!(CMDLINE_LEN),
+        );
+        core::str::from_utf8_unchecked(bytes)
     };
 
     Ok(BootInfo {
         memory_map: regions,
-        cmdline: CMDLINE,
+        cmdline,
         uart_phys: PhysAddr::new(PL011_QEMU_VIRT),
         // High-VA alias: TTBR1's hi_L1[0] (installed by boot.S)
         // maps PA 0x00000000-0x40000000 → VA 0xFFFFFF80_00000000
@@ -124,11 +198,78 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
     })
 }
 
+/// Subtract reserved intervals from FDT `/memory` ranges.
+///
+/// This produces a non-overlapping usable map like Linux memblock,
+/// bounded by the boot ABI's fixed region capacity.
+fn normalize_memory_map(
+    memory: &[Reservation],
+    reserved: &[Reservation],
+    out: &mut [MemRegion; MAX_MEM_REGIONS],
+    out_len: &mut usize,
+) {
+    *out_len = 0;
+    for range in memory {
+        let mut pieces = [Reservation::default(); MAX_MEM_REGIONS];
+        let mut piece_len = 1;
+        pieces[0] = *range;
+        for cut in reserved {
+            if cut.size == 0 {
+                continue;
+            }
+            let cut_end = cut.addr.saturating_add(cut.size);
+            let mut next = [Reservation::default(); MAX_MEM_REGIONS];
+            let mut next_len = 0;
+            for piece in pieces[..piece_len].iter() {
+                let end = piece.addr.saturating_add(piece.size);
+                if cut_end <= piece.addr || cut.addr >= end {
+                    if next_len < next.len() {
+                        next[next_len] = *piece;
+                        next_len += 1;
+                    }
+                    continue;
+                }
+                if cut.addr > piece.addr && next_len < next.len() {
+                    next[next_len] = Reservation {
+                        addr: piece.addr,
+                        size: cut.addr - piece.addr,
+                    };
+                    next_len += 1;
+                }
+                if cut_end < end && next_len < next.len() {
+                    next[next_len] = Reservation {
+                        addr: cut_end,
+                        size: end - cut_end,
+                    };
+                    next_len += 1;
+                }
+            }
+            pieces = next;
+            piece_len = next_len;
+        }
+        for piece in pieces[..piece_len].iter() {
+            if piece.size != 0 && *out_len < out.len() {
+                out[*out_len] = MemRegion {
+                    start: PhysAddr::new(piece.addr),
+                    len: piece.size,
+                    kind: MemRegionKind::Usable,
+                };
+                *out_len += 1;
+            }
+        }
+    }
+}
+
 /// FDT structure-block tokens (Devicetree Specification §5.4.1).
+#[allow(dead_code)]
 const FDT_BEGIN_NODE: u32 = 0x0000_0001;
+#[allow(dead_code)]
 const FDT_END_NODE: u32 = 0x0000_0002;
+#[allow(dead_code)]
 const FDT_PROP: u32 = 0x0000_0003;
+#[allow(dead_code)]
 const FDT_NOP: u32 = 0x0000_0004;
+#[allow(dead_code)]
 const FDT_END: u32 = 0x0000_0009;
 
 /// Find the `/chosen` node in the DTB at `dtb_phys`, read
@@ -139,6 +280,7 @@ const FDT_END: u32 = 0x0000_0009;
 /// # Safety
 /// `dtb_phys` must point at a 4-byte-aligned valid Devicetree
 /// blob whose `totalsize` covers the structure + strings blocks.
+#[allow(dead_code)]
 unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
     // Read header fields (all big-endian u32).
     let read_be32 = |off: u64| -> u32 {

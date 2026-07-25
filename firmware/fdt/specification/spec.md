@@ -67,6 +67,19 @@ pub struct Reservation {
 
 pub fn copy_reservations(blob: &[u8], out: &mut [Reservation]) -> usize;
 
+pub struct ReservedRegion {
+    pub addr: u64,
+    pub size: u64,
+    pub no_map: bool,
+    pub reusable: bool,
+}
+
+/// Decode static `reg` entries below `/reserved-memory`.
+pub fn copy_reserved_memory_ranges(
+    blob: &[u8],
+    out: &mut [ReservedRegion],
+) -> usize;
+
 /// Walk every node in the struct block, calling `f` once per
 /// node with its full path (e.g. `/cpus/cpu@0`) and a
 /// `PropIter` over its properties.
@@ -77,6 +90,7 @@ impl Path<'_> {
     pub fn matches(&self, path: &[&str]) -> bool;
     pub fn last_segment(&self) -> &str;
     pub fn depth(&self) -> u8;
+    pub fn segment(&self, index: usize) -> Option<&str>;
 }
 
 pub struct PropIter<'a> { /* opaque */ }
@@ -89,12 +103,25 @@ impl<'a> Iterator for PropIter<'a> {
 /// Look up `/chosen` and return `bootargs` as a `&str` if present.
 pub fn chosen_bootargs(blob: &[u8]) -> Option<&str>;
 
+/// Decode Linux's 32-bit or 64-bit initrd start/end properties.
+pub fn chosen_initrd_range(blob: &[u8]) -> Option<Reservation>;
+
 /// Return the `(base, size)` of every `/memory@*` `reg` cell.
 pub fn copy_memory_ranges(blob: &[u8], out: &mut [Reservation]) -> usize;
 
 /// Return the path of the node that `chosen.stdout-path` points
 /// at, copied into the caller's buffer (NUL-terminated).
 pub fn chosen_stdout_path(blob: &[u8], out: &mut [u8]) -> usize;
+
+/// Decode `interrupts-extended`, or legacy `interrupts` when no
+/// extended property exists. Extended entries may target different
+/// interrupt-controller phandles and therefore different cell widths.
+pub fn for_each_interrupt<F>(
+    blob: &[u8],
+    props: PropIter<'_>,
+    inherited_parent: Option<u32>,
+    f: F,
+) where F: FnMut(u32, &[u32]);
 ```
 
 ## 5. Test surface
@@ -106,11 +133,14 @@ pub fn chosen_stdout_path(blob: &[u8], out: &mut [u8]) -> usize;
 | `smoke_fdt_chosen_bootargs`        | `/chosen.bootargs` extracted as &str |
 | `smoke_fdt_memory_ranges`          | `/memory@N reg` decoded            |
 | `smoke_fdt_reservations`           | reserve-map decoded                |
+| `smoke_fdt_reserved_memory_static_ranges` | `/reserved-memory` static range + flags |
+| `smoke_fdt_interrupts_extended_multiple_domains` | mixed interrupt domains decoded |
 
 ## 6. Out of scope (v0.1)
 
 - `phandle` resolution (we surface raw `phandle` bytes; the
   consumer does the lookup).
-- `interrupts-extended` walker.
 - Overlay / fixup application.
 - Property-encoded-array helpers beyond `(u32_be, …)` decode.
+- Dynamic `/reserved-memory` allocation (`size` without `reg`);
+  allocation policy belongs to the boot allocator.

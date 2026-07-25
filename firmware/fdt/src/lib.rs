@@ -40,6 +40,17 @@ pub struct Reservation {
     pub size: u64,
 }
 
+/// One statically addressed `/reserved-memory` range.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReservedRegion {
+    pub addr: u64,
+    pub size: u64,
+    /// The OS must not create a standard virtual mapping for this range.
+    pub no_map: bool,
+    /// The range may be reclaimed when its owning driver is not using it.
+    pub reusable: bool,
+}
+
 mod tests;
 
 fn be_u32(b: &[u8], off: usize) -> Option<u32> {
@@ -88,10 +99,31 @@ pub fn parse_header(blob: &[u8]) -> Option<Header> {
     let size_dt_strings = be_u32(blob, 32)?;
     let size_dt_struct = be_u32(blob, 36)?;
 
-    // Validate that the provided slice is at least as large as the header claims,
-    // unless we are only validating the header itself (len == HEADER_LEN).
-    if blob.len() > HEADER_LEN && (totalsize as usize) > blob.len() {
+    if version < 17 || last_comp_version > 17 || totalsize < HEADER_LEN as u32 {
         return None;
+    }
+    // `discover()` first parses a header-only slice. Once the whole
+    // blob is available, validate every v17 block before any walker
+    // trusts offsets from firmware.
+    if blob.len() > HEADER_LEN {
+        let total = totalsize as usize;
+        let struct_start = off_dt_struct as usize;
+        let strings_start = off_dt_strings as usize;
+        let reserve_start = off_mem_rsvmap as usize;
+        let struct_end = struct_start.checked_add(size_dt_struct as usize)?;
+        let strings_end = strings_start.checked_add(size_dt_strings as usize)?;
+        if total > blob.len()
+            || struct_start % 4 != 0
+            || strings_start % 4 != 0
+            || reserve_start % 8 != 0
+            || struct_start < HEADER_LEN
+            || strings_start < HEADER_LEN
+            || reserve_start < HEADER_LEN
+            || struct_end > total
+            || strings_end > total
+        {
+            return None;
+        }
     }
 
     Some(Header {
@@ -173,6 +205,18 @@ impl<'a> Path<'a> {
         }
         let end = start + self.seg_lens[depth - 1] as usize;
         core::str::from_utf8(&self.slab[start..end]).unwrap_or("")
+    }
+
+    /// Return one zero-based path segment.
+    pub fn segment(&self, index: usize) -> Option<&'a str> {
+        if index >= self.seg_lens.len() {
+            return None;
+        }
+        let start = self.seg_lens[..index]
+            .iter()
+            .fold(0usize, |sum, len| sum + *len as usize);
+        let end = start + self.seg_lens[index] as usize;
+        core::str::from_utf8(&self.slab[start..end]).ok()
     }
 
     /// `path` is a slice of expected segment names —
@@ -439,6 +483,43 @@ pub fn chosen_bootargs(blob: &[u8]) -> Option<heapless_str::Bytes<256>> {
     found
 }
 
+/// Read Linux's `/chosen/linux,initrd-start` and
+/// `/chosen/linux,initrd-end` properties. Both 32-bit and 64-bit
+/// encodings are accepted, matching Linux's early FDT scanner.
+pub fn chosen_initrd_range(blob: &[u8]) -> Option<Reservation> {
+    fn read_addr(value: &[u8]) -> Option<u64> {
+        match value.len() {
+            4 => Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]) as u64),
+            8 => Some(u64::from_be_bytes([
+                value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+            ])),
+            _ => None,
+        }
+    }
+
+    let mut start = None;
+    let mut end = None;
+    walk_nodes(blob, |path, props| {
+        if !path.matches(&["chosen"]) {
+            return;
+        }
+        for (name, value) in props {
+            match name {
+                "linux,initrd-start" => start = read_addr(value),
+                "linux,initrd-end" => end = read_addr(value),
+                _ => {}
+            }
+        }
+    });
+    match (start, end) {
+        (Some(addr), Some(limit)) if limit > addr => Some(Reservation {
+            addr,
+            size: limit - addr,
+        }),
+        _ => None,
+    }
+}
+
 pub fn copy_memory_ranges(blob: &[u8], out: &mut [Reservation]) -> usize {
     let mut n_out = 0;
     walk_with_cells(blob, |path, props, parent_cells| {
@@ -465,6 +546,62 @@ pub fn copy_memory_ranges(blob: &[u8], out: &mut [Reservation]) -> usize {
                 }
                 off += stride;
             }
+        }
+    });
+    n_out
+}
+
+/// Copy statically addressed children of `/reserved-memory`.
+///
+/// Dynamic reservations described with `size` but no `reg` require
+/// boot-allocator policy and are intentionally not allocated by this
+/// pure parser. `reg` takes precedence when both are present, as
+/// required by the Devicetree specification.
+pub fn copy_reserved_memory_ranges(blob: &[u8], out: &mut [ReservedRegion]) -> usize {
+    let mut n_out = 0;
+    walk_with_cells(blob, |path, props, parent_cells| {
+        if path.depth() != 2 || path.segment(0) != Some("reserved-memory") {
+            return;
+        }
+        let snapshot = props;
+        if node_status(snapshot) != Status::Okay {
+            return;
+        }
+        let mut reg = None;
+        let mut no_map = false;
+        let mut reusable = false;
+        for (name, value) in props {
+            match name {
+                "reg" => reg = Some(value),
+                "no-map" => no_map = true,
+                "reusable" => reusable = true,
+                _ => {}
+            }
+        }
+        // The properties are mutually exclusive. Reject malformed
+        // firmware rather than guessing which memory semantics wins.
+        if no_map && reusable {
+            return;
+        }
+        let Some(value) = reg else {
+            return;
+        };
+        let stride = parent_cells.entry_bytes();
+        if stride == 0 {
+            return;
+        }
+        let mut off = 0;
+        while off + stride <= value.len() && n_out < out.len() {
+            if let Some((addr, size)) = parent_cells.read_one_reg(value, off) {
+                out[n_out] = ReservedRegion {
+                    addr,
+                    size,
+                    no_map,
+                    reusable,
+                };
+                n_out += 1;
+            }
+            off += stride;
         }
     });
     n_out
@@ -758,6 +895,90 @@ pub fn interrupt_cells_for(blob: &[u8], parent_phandle: u32) -> Option<u32> {
         }
     });
     out
+}
+
+/// Walk a device's interrupt specifiers.
+///
+/// `interrupts-extended` takes precedence over `interrupts`, matching
+/// Linux and DTSpec. For legacy `interrupts`, callers pass the
+/// inherited interrupt-parent phandle resolved while walking the
+/// node's ancestors.
+pub fn for_each_interrupt<F>(
+    blob: &[u8],
+    props: PropIter<'_>,
+    inherited_parent: Option<u32>,
+    mut f: F,
+) where
+    F: FnMut(u32, &[u32]),
+{
+    const MAX_INTERRUPT_CELLS: usize = 16;
+    let mut extended = None;
+    let mut legacy = None;
+    let mut explicit_parent = None;
+    for (name, value) in props {
+        match name {
+            "interrupts-extended" => extended = Some(value),
+            "interrupts" => legacy = Some(value),
+            "interrupt-parent" if value.len() >= 4 => {
+                explicit_parent =
+                    Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(value) = extended {
+        let mut off = 0;
+        while off + 4 <= value.len() {
+            let parent =
+                u32::from_be_bytes([value[off], value[off + 1], value[off + 2], value[off + 3]]);
+            off += 4;
+            let Some(count) = interrupt_cells_for(blob, parent).map(|n| n as usize) else {
+                return;
+            };
+            if count > MAX_INTERRUPT_CELLS || off + count * 4 > value.len() {
+                return;
+            }
+            let mut cells = [0u32; MAX_INTERRUPT_CELLS];
+            for (i, cell) in cells[..count].iter_mut().enumerate() {
+                let pos = off + i * 4;
+                *cell = u32::from_be_bytes([
+                    value[pos],
+                    value[pos + 1],
+                    value[pos + 2],
+                    value[pos + 3],
+                ]);
+            }
+            f(parent, &cells[..count]);
+            off += count * 4;
+        }
+        return;
+    }
+
+    let Some(parent) = explicit_parent.or(inherited_parent) else {
+        return;
+    };
+    let Some(count) = interrupt_cells_for(blob, parent).map(|n| n as usize) else {
+        return;
+    };
+    if count == 0 || count > MAX_INTERRUPT_CELLS {
+        return;
+    }
+    let Some(value) = legacy else {
+        return;
+    };
+    let stride = count * 4;
+    let mut off = 0;
+    while off + stride <= value.len() {
+        let mut cells = [0u32; MAX_INTERRUPT_CELLS];
+        for (i, cell) in cells[..count].iter_mut().enumerate() {
+            let pos = off + i * 4;
+            *cell =
+                u32::from_be_bytes([value[pos], value[pos + 1], value[pos + 2], value[pos + 3]]);
+        }
+        f(parent, &cells[..count]);
+        off += stride;
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────
