@@ -66,6 +66,8 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
                     encoded[..2].copy_from_slice(&peer.family.to_ne_bytes());
                     encoded[2..].copy_from_slice(&peer.body);
                     let copied = capacity.min(encoded.len());
+                    // SAFETY: the syscall boundary validates the caller's
+                    // writable sockaddr range through `copy_to_user`.
                     if copied > 0 && unsafe { copy_to_user(args.arg4, &encoded[..copied]) }.is_err()
                     {
                         ctx.set_return(fail);

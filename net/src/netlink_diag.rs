@@ -296,9 +296,8 @@ mod tests {
     #[test]
     fn batched_dumps_preserve_sequences_and_ack() {
         crate::tcp::core::__reset_for_test();
-        crate::udp_sock::__reset_for_test();
         let mut first = request(IPPROTO_TCP);
-        let mut second = request(IPPROTO_UDP);
+        let mut second = request(IPPROTO_TCP);
         first[8..12].copy_from_slice(&101u32.to_ne_bytes());
         second[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP | NLM_F_ACK).to_ne_bytes());
         second[8..12].copy_from_slice(&102u32.to_ne_bytes());

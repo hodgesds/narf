@@ -2628,7 +2628,7 @@ impl SocketFile {
                 let memberships = self.netlink_memberships.lock();
                 let words = memberships
                     .last()
-                    .map(|group| ((*group as usize) + 31) / 32)
+                    .map(|group| (*group as usize).div_ceil(32))
                     .unwrap_or(0);
                 let n = core::cmp::min(buf.len() / 4, words) * 4;
                 buf[..n].fill(0);
