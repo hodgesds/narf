@@ -196,6 +196,49 @@ impl AdminHandle {
         );
         Ok(())
     }
+
+    pub fn set_ipv4_neighbor(&self, ip: [u8; 4], mac: [u8; 6]) -> Result<(), AdminError> {
+        self.check_live()?;
+        if mac == [0; 6] || mac[0] & 1 != 0 {
+            return Err(AdminError::InvalidMac);
+        }
+        crate::arp::insert(&self.iface_name, ip, mac);
+        Ok(())
+    }
+
+    pub fn del_ipv4_neighbor(&self, ip: [u8; 4]) -> Result<(), AdminError> {
+        self.check_live()?;
+        crate::arp::remove(&self.iface_name, ip);
+        Ok(())
+    }
+
+    pub fn set_ipv6_neighbor(
+        &self,
+        ip: [u8; 16],
+        mac: Option<[u8; 6]>,
+        state: crate::ipv6::ndp::NeighState,
+        is_router: bool,
+    ) -> Result<(), AdminError> {
+        self.check_live()?;
+        if mac.is_some_and(|mac| mac == [0; 6] || mac[0] & 1 != 0) {
+            return Err(AdminError::InvalidMac);
+        }
+        crate::ipv6::ndp::neigh_upsert(crate::ipv6::ndp::Neigh {
+            iface: self.iface_name.clone(),
+            ip,
+            mac,
+            state,
+            is_router,
+            deadline_ns: 0,
+        });
+        Ok(())
+    }
+
+    pub fn del_ipv6_neighbor(&self, ip: [u8; 16]) -> Result<(), AdminError> {
+        self.check_live()?;
+        crate::ipv6::ndp::neigh_remove(&self.iface_name, &ip);
+        Ok(())
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

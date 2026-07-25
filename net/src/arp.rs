@@ -200,6 +200,22 @@ pub fn snapshot() -> Vec<(String, ArpEntry)> {
     out
 }
 
+/// Remove one IPv4 neighbor entry from a named interface.
+pub fn remove(iface_name: &str, ip: [u8; 4]) -> bool {
+    let mut g = ARP_CACHES.lock();
+    let Some(iface) = g.iter_mut().find(|iface| iface.name == iface_name) else {
+        return false;
+    };
+    let before = iface.cache.count;
+    for slot in &mut iface.cache.entries {
+        if slot.is_some_and(|entry| entry.ip == ip) {
+            *slot = None;
+        }
+    }
+    iface.cache.count = iface.cache.entries.iter().flatten().count();
+    iface.cache.count != before
+}
+
 /// Called from the RX path when an ARP reply arrives. Populates both
 /// this module's LRU cache and the legacy `tcp_stack` BTreeMap.
 pub fn arp_insert_from_rx(iface_name: &str, ip: [u8; 4], mac: [u8; 6]) {

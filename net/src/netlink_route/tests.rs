@@ -419,3 +419,52 @@ fn delegated_admin_can_add_and_delete_ipv4_route() {
         route.iface == name && route.dst.addr.0 == [198, 51, 100, 0] && route.dst.prefix_len == 24
     }));
 }
+
+#[test]
+fn delegated_admin_can_add_and_delete_ipv4_neighbor() {
+    fn discard(_: &[u8]) -> Result<(), ()> {
+        Ok(())
+    }
+
+    let name = "rtnl-neigh-admin0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 3, 1], discard);
+    let ifindex = crate::iface::snapshot_all()
+        .iter()
+        .position(|iface| iface.name == name)
+        .unwrap() as u32
+        + 2;
+    let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
+    let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
+
+    let neighbor_request = |kind| {
+        let mut body = vec![AF_INET, 0, 0, 0];
+        body.extend_from_slice(&(ifindex as i32).to_ne_bytes());
+        body.extend_from_slice(&NUD_REACHABLE.to_ne_bytes());
+        body.extend_from_slice(&[0, 0]);
+        push_rtattr(&mut body, NDA_DST, &[203, 0, 113, 9]);
+        push_rtattr(&mut body, NDA_LLADDR, &[0x02, 0, 0, 0, 3, 9]);
+        frame_message(kind, NLM_F_REQUEST | NLM_F_ACK, 106, 1, &body)
+    };
+
+    let add = build_replies_authorized(&neighbor_request(RTM_NEWNEIGH), Some(&admin)).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(add[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()),
+        0
+    );
+    assert!(crate::arp::snapshot().iter().any(|(iface, entry)| {
+        iface == name && entry.ip == [203, 0, 113, 9] && entry.mac == [0x02, 0, 0, 0, 3, 9]
+    }));
+
+    let delete = build_replies_authorized(&neighbor_request(RTM_DELNEIGH), Some(&admin)).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(
+            delete[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap()
+        ),
+        0
+    );
+    assert!(!crate::arp::snapshot()
+        .iter()
+        .any(|(iface, entry)| iface == name && entry.ip == [203, 0, 113, 9]));
+}

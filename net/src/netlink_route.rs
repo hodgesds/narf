@@ -61,6 +61,7 @@ pub const RTM_NEWROUTE: u16 = 24;
 pub const RTM_DELROUTE: u16 = 25;
 pub const RTM_GETROUTE: u16 = 26;
 pub const RTM_NEWNEIGH: u16 = 28;
+pub const RTM_DELNEIGH: u16 = 29;
 pub const RTM_GETNEIGH: u16 = 30;
 pub const RTM_NEWRULE: u16 = 32;
 pub const RTM_GETRULE: u16 = 34;
@@ -794,6 +795,60 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                 })
                 .map_err(admin_errno)
         }
+        RTM_NEWNEIGH | RTM_DELNEIGH => {
+            if request.len() < NLMSG_HDRLEN + 12 {
+                return Err(EINVAL);
+            }
+            let family = request[NLMSG_HDRLEN];
+            let ifindex = u32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
+            let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
+            if iface_name != admin.iface_name() {
+                return Err(EPERM);
+            }
+            let state = u16::from_ne_bytes(request[24..26].try_into().map_err(|_| EINVAL)?);
+            let flags = request[26];
+            let dst = find_attr(request, 12, NDA_DST).ok_or(EINVAL)?;
+            let mac = match find_attr(request, 12, NDA_LLADDR) {
+                Some(raw) if raw.len() == 6 => Some(raw.try_into().map_err(|_| EINVAL)?),
+                Some(_) => return Err(EINVAL),
+                None => None,
+            };
+            match (hdr.msg_type, family) {
+                (RTM_DELNEIGH, AF_INET) if dst.len() == 4 => admin
+                    .del_ipv4_neighbor(dst.try_into().map_err(|_| EINVAL)?)
+                    .map_err(admin_errno),
+                (RTM_NEWNEIGH, AF_INET) if dst.len() == 4 => admin
+                    .set_ipv4_neighbor(dst.try_into().map_err(|_| EINVAL)?, mac.ok_or(EINVAL)?)
+                    .map_err(admin_errno),
+                (RTM_DELNEIGH, AF_INET6) if dst.len() == 16 => admin
+                    .del_ipv6_neighbor(dst.try_into().map_err(|_| EINVAL)?)
+                    .map_err(admin_errno),
+                (RTM_NEWNEIGH, AF_INET6) if dst.len() == 16 => {
+                    let state = if state & NUD_REACHABLE != 0 {
+                        crate::ipv6::ndp::NeighState::Reachable
+                    } else if state & NUD_STALE != 0 {
+                        crate::ipv6::ndp::NeighState::Stale
+                    } else if state & NUD_DELAY != 0 {
+                        crate::ipv6::ndp::NeighState::Delay
+                    } else if state & NUD_PROBE != 0 {
+                        crate::ipv6::ndp::NeighState::Probe
+                    } else if state & NUD_INCOMPLETE != 0 {
+                        crate::ipv6::ndp::NeighState::Incomplete
+                    } else {
+                        return Err(EINVAL);
+                    };
+                    admin
+                        .set_ipv6_neighbor(
+                            dst.try_into().map_err(|_| EINVAL)?,
+                            mac,
+                            state,
+                            flags & NTF_ROUTER != 0,
+                        )
+                        .map_err(admin_errno)
+                }
+                _ => Err(EINVAL),
+            }
+        }
         RTM_DELLINK => Err(EOPNOTSUPP),
         _ => Err(EOPNOTSUPP),
     }
@@ -809,6 +864,8 @@ fn is_mutation(msg_type: u16) -> bool {
             | RTM_DELADDR
             | RTM_NEWROUTE
             | RTM_DELROUTE
+            | RTM_NEWNEIGH
+            | RTM_DELNEIGH
     )
 }
 
