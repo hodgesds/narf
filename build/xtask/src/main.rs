@@ -5070,21 +5070,35 @@ fn run_interactive_multi(
             expect
         );
         let pre = captured.lock().map(|g| g.len()).unwrap_or(cursor);
-        // Type the command byte-by-byte (the shell's line editor needs
-        // time to drain each char through the bounded input ring).
-        let mut typed = cmdline.as_bytes().to_vec();
-        typed.push(b'\n');
+        // Flow-control command entry through the shell's echoed line editor.
+        // Keep at most one unacknowledged byte in the serial/input-ring path:
+        // loaded TCG runners previously transposed adjacent bytes here
+        // (`sendfile_smoke` arrived as `sendfile_smkoe`). Waiting for each
+        // byte's echo adapts to guest load and proves ordered consumption.
         let mut wrote = true;
-        for &b in &typed {
+        let mut type_error = "stdin write failed";
+        let mut echo_cursor = pre;
+        for &b in cmdline.as_bytes() {
             if stdin.write_all(&[b]).is_err() {
                 wrote = false;
                 break;
             }
             let _ = stdin.flush();
-            std::thread::sleep(Duration::from_millis(5));
+            match wait_for(echo_cursor, core::slice::from_ref(&b), false, prompt_to) {
+                Wait::Found(end) => echo_cursor = end,
+                Wait::TimedOut | Wait::Died(_) => {
+                    wrote = false;
+                    type_error = "serial echo acknowledgement failed";
+                    break;
+                }
+            }
+        }
+        if wrote {
+            wrote = stdin.write_all(b"\n").is_ok();
+            let _ = stdin.flush();
         }
         if !wrote {
-            aborted = Some("stdin write failed".into());
+            aborted = Some(type_error.into());
             failed += 1;
             failed_cases.push((cmdline.to_string(), expect.to_string()));
             break;
