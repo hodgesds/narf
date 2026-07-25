@@ -12,6 +12,18 @@
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0x40000
+#endif
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
 
 static void w(const char *m) { write(1, m, strlen(m)); }
 
@@ -63,6 +75,37 @@ int main(void) {
     }
     if (!has(buf, "MemTotal")) { w("numa-fail: n0-meminfo\n"); return 1; }
     if (!has(buf, "MemFree")) { w("numa-fail: n0-memfree\n"); return 1; }
+
+    // Real hugetlb mapping smoke. The ordinary suite boots without a
+    // reservation and therefore legitimately gets ENOMEM; the dedicated
+    // NUMA run supplies `hugepages_2m=2` and exercises the hardware leaf.
+    unsigned char *hp = mmap(0, 2 * 1024 * 1024, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB |
+                             MAP_HUGE_2MB, -1, 0);
+    if (hp == MAP_FAILED) {
+        if (errno != ENOMEM) {
+            w("numa-fail: hugetlb-mmap\n");
+            return 1;
+        }
+    } else {
+        hp[0] = 0x5a;
+        hp[2 * 1024 * 1024 - 1] = 0xa5;
+        if (hp[0] != 0x5a || hp[2 * 1024 * 1024 - 1] != 0xa5) {
+            w("numa-fail: hugetlb-rw\n");
+            return 1;
+        }
+        void *pages[1] = { hp };
+        int status[1] = { -1 };
+        if (syscall(SYS_move_pages, 0, 1, pages, 0, status, 0) != 0 ||
+            status[0] < 0) {
+            w("numa-fail: hugetlb-placement\n");
+            return 1;
+        }
+        if (munmap(hp, 2 * 1024 * 1024) != 0) {
+            w("numa-fail: hugetlb-munmap\n");
+            return 1;
+        }
+    }
 
     w("numa-ok\n");
     return 0;

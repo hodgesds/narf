@@ -31,6 +31,7 @@ use alloc_crate::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::frame::{self, UsableRegion, MAX_NUMA_NODES};
+use crate::mempolicy::{Mempolicy, MPOL_BIND, MPOL_INTERLEAVE, MPOL_PREFERRED};
 
 /// 2 MiB hugepage size in bytes.
 pub const HUGEPAGE_2M_BYTES: u64 = 2 * 1024 * 1024;
@@ -210,6 +211,59 @@ pub fn alloc_hugepage_1g_on(node: usize) -> Result<HugeFrame, HugeAllocError> {
     alloc_hugepage_on(HugeSize::G1, node)
 }
 
+/// Allocate a hardware hugepage under the same NUMA policy semantics used by
+/// demand-paged base frames.
+pub fn alloc_hugepage_with(
+    size: HugeSize,
+    policy: Mempolicy,
+    local: usize,
+) -> Result<HugeFrame, HugeAllocError> {
+    let all_nodes = (1u64 << MAX_NUMA_NODES) - 1;
+    let allowed = policy.allowed & all_nodes;
+    if allowed == 0 {
+        return Err(HugeAllocError::Empty);
+    }
+    let requested = policy.nodemask & allowed;
+    let preferred = match policy.mode {
+        MPOL_BIND | MPOL_PREFERRED if requested != 0 => requested.trailing_zeros() as usize,
+        MPOL_INTERLEAVE if requested != 0 => crate::mempolicy::next_interleave_node(requested),
+        _ => local.min(MAX_NUMA_NODES - 1),
+    };
+    let candidates =
+        if policy.mode == MPOL_BIND || (policy.mode == MPOL_INTERLEAVE && requested != 0) {
+            requested
+        } else {
+            allowed
+        };
+    if candidates == 0 {
+        return Err(HugeAllocError::Empty);
+    }
+
+    let mut order = [0usize; MAX_NUMA_NODES];
+    let mut count = 0usize;
+    for node in 0..MAX_NUMA_NODES {
+        if (candidates >> node) & 1 != 0 {
+            order[count] = node;
+            count += 1;
+        }
+    }
+    order[..count].sort_unstable_by_key(|&node| (frame::node_distance(preferred, node), node));
+    if let Some(pos) = order[..count].iter().position(|&node| node == preferred) {
+        order[..count].swap(0, pos);
+    }
+    for &node in &order[..count] {
+        if let Ok(allocated) = alloc_hugepage_on(size, node) {
+            let pages = allocated.size_bytes() >> 12;
+            frame::account_numa_allocation(preferred, node, pages);
+            if policy.mode == MPOL_INTERLEAVE && node == preferred {
+                frame::account_interleave_hit(node, pages);
+            }
+            return Ok(allocated);
+        }
+    }
+    Err(HugeAllocError::Empty)
+}
+
 fn alloc_hugepage_local(size: HugeSize) -> Result<HugeFrame, HugeAllocError> {
     let local = frame::current_cpu_node();
     if let Ok(frame) = alloc_hugepage_on(size, local) {
@@ -233,7 +287,7 @@ fn alloc_hugepage_local(size: HugeSize) -> Result<HugeFrame, HugeAllocError> {
     Err(HugeAllocError::Empty)
 }
 
-fn alloc_hugepage_on(size: HugeSize, node: usize) -> Result<HugeFrame, HugeAllocError> {
+pub(crate) fn alloc_hugepage_on(size: HugeSize, node: usize) -> Result<HugeFrame, HugeAllocError> {
     if node >= MAX_NUMA_NODES {
         return Err(HugeAllocError::Empty);
     }

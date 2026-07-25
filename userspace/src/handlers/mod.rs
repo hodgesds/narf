@@ -27,7 +27,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+use narf_memory::{AddressSpace, HugeRegion, Region, RegionPerms, VirtAddr};
 
 use crate::{
     fd, RawFnHandler, SigDeliveryParams, Syscall, SyscallArgs, SyscallReturn, SyscallTable,

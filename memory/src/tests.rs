@@ -3267,8 +3267,8 @@ kernel_test_in!("memory/hugepage", smoke_hugepage_2m_reserve_alloc_free);
 
 fn smoke_hugepage_1g_reserve_picks_aligned_chunk() -> TestResult {
     use crate::frame::UsableRegion;
-    use crate::hugepage::{reserve_from_regions, stats, HUGEPAGE_1G_BYTES};
-    use crate::PhysAddr;
+    use crate::hugepage::{alloc_hugepage_1g_on, reserve_from_regions, stats, HUGEPAGE_1G_BYTES};
+    use crate::{AddressSpace, HugeRegion, PhysAddr, RegionPerms, VirtAddr};
 
     // Region whose start is mis-aligned: head is dropped, the one
     // 1 GiB-aligned chunk is taken, the tail stays for the buddy.
@@ -3299,14 +3299,130 @@ fn smoke_hugepage_1g_reserve_picks_aligned_chunk() -> TestResult {
         return TestResult::Fail("free_1g didn't grow by 1");
     }
 
-    // Teardown: drain the one we reserved so the pool returns to
-    // its prior state.
-    let _ = crate::hugepage::alloc_hugepage_1g();
+    // Install it as a real 1 GiB hardware leaf and verify translation keeps
+    // the within-block offset.
+    // SAFETY: topology lookup only; synthetic memory is not dereferenced.
+    let node = unsafe { crate::frame::narf_phys_node(excl_start) };
+    let frame = match alloc_hugepage_1g_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("strict 1G allocation failed"),
+    };
+    let phys = frame.phys();
+    // SAFETY: kernel test runs with paging live.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(aspace) => aspace,
+        Err(_) => {
+            crate::hugepage::free_hugepage(frame);
+            return TestResult::Fail("1G test address-space creation failed");
+        }
+    };
+    const USER_VA: u64 = 0x0000_5000_8000_0000;
+    // SAFETY: fresh owned root with aligned VA and frame.
+    if unsafe {
+        aspace.map_huge_region(HugeRegion {
+            base: VirtAddr::new(USER_VA),
+            len: HUGEPAGE_1G_BYTES,
+            perms: RegionPerms::READ,
+            size: crate::hugepage::HugeSize::G1,
+            frames: alloc::vec![frame],
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("hardware 1G mapping failed");
+    }
+    let probe = VirtAddr::new(USER_VA + 0x20_0000);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
+    let translated = unsafe { crate::x86_64::paging::translate(aspace.root, probe) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
+    let translated = unsafe { crate::aarch64::paging::translate(aspace.root, probe) };
+    if translated.map(PhysAddr::raw) != Some(phys + 0x20_0000) {
+        return TestResult::Fail("1G translation lost its block offset");
+    }
+    if aspace.unmap_huge_region(VirtAddr::new(USER_VA)).is_err() {
+        return TestResult::Fail("hardware 1G unmap failed");
+    }
+    // Teardown: drain the synthetic reservation so the pool returns to entry.
+    let _ = alloc_hugepage_1g_on(node);
     TestResult::Pass
 }
 kernel_test_in!(
     "memory/hugepage",
     smoke_hugepage_1g_reserve_picks_aligned_chunk
+);
+
+fn smoke_hugepage_2m_hardware_mapping_roundtrip() -> TestResult {
+    use crate::frame::UsableRegion;
+    use crate::hugepage::{
+        alloc_hugepage_2m_on, node_stats, reserve_from_regions, HUGEPAGE_2M_BYTES,
+    };
+    use crate::{AddressSpace, HugeRegion, PhysAddr, RegionPerms, VirtAddr};
+
+    const SYNTH_BASE: u64 = 0x20_0000_0000;
+    const USER_VA: u64 = 0x0000_5000_4000_0000;
+    let region = UsableRegion {
+        start: PhysAddr::new(SYNTH_BASE),
+        len: HUGEPAGE_2M_BYTES,
+    };
+    let excludes = reserve_from_regions(&[region], 1, 0);
+    if excludes.len() != 1 {
+        return TestResult::Fail("failed to reserve synthetic 2M mapping frame");
+    }
+    // SAFETY: topology lookup only; no synthetic memory is dereferenced.
+    let node = unsafe { crate::frame::narf_phys_node(excludes[0].0) };
+    let before_map = node_stats(node);
+    let frame = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("strict 2M allocation failed"),
+    };
+    let phys = frame.phys();
+    // SAFETY: kernel test runs with paging live.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(aspace) => aspace,
+        Err(_) => {
+            crate::hugepage::free_hugepage(frame);
+            return TestResult::Fail("user address-space creation failed");
+        }
+    };
+    // SAFETY: the fresh AS owns a live root; frame and VA are 2M-aligned.
+    if unsafe {
+        aspace.map_huge_region(HugeRegion {
+            base: VirtAddr::new(USER_VA),
+            len: HUGEPAGE_2M_BYTES,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            size: crate::hugepage::HugeSize::M2,
+            frames: alloc::vec![frame],
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("hardware 2M mapping failed");
+    }
+    let probe = VirtAddr::new(USER_VA + 0x1f000);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
+    let translated = unsafe { crate::x86_64::paging::translate(aspace.root, probe) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
+    let translated = unsafe { crate::aarch64::paging::translate(aspace.root, probe) };
+    if translated.map(PhysAddr::raw) != Some(phys + 0x1f000) {
+        return TestResult::Fail("huge-leaf translation lost its block offset");
+    }
+    if aspace.unmap_huge_region(VirtAddr::new(USER_VA)).is_err() {
+        return TestResult::Fail("hardware 2M unmap failed");
+    }
+    if node_stats(node).free_2m != before_map.free_2m {
+        return TestResult::Fail("huge frame did not return to its NUMA pool");
+    }
+    // Drain the synthetic reservation so sibling tests see their entry state.
+    let _ = alloc_hugepage_2m_on(node);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory/hugepage",
+    smoke_hugepage_2m_hardware_mapping_roundtrip
 );
 
 fn smoke_slab_steady_state_under_churn() -> TestResult {

@@ -162,6 +162,10 @@ fn interleave_pick(mask: u64) -> usize {
     0
 }
 
+pub(crate) fn next_interleave_node(mask: u64) -> usize {
+    interleave_pick(mask)
+}
+
 /// Allocate one frame honoring `policy`, with `local` as the faulting
 /// CPU's node (used by DEFAULT/LOCAL/PREFERRED-empty).
 ///

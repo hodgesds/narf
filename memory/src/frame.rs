@@ -99,7 +99,7 @@ pub fn numa_node_stats(node: usize) -> NumaNodeStats {
     }
 }
 
-fn account_numa_allocation(preferred: usize, actual: usize, pages: u64) {
+pub(crate) fn account_numa_allocation(preferred: usize, actual: usize, pages: u64) {
     let preferred = preferred.min(MAX_NUMA_NODES - 1);
     let actual = actual.min(MAX_NUMA_NODES - 1);
     if actual == preferred {

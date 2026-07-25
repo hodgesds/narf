@@ -95,10 +95,30 @@ pub fn alloc_hugepage_1g_on(node: usize) -> Result<HugeFrame, HugeAllocError>;
 // Exported from the `hugepage` module.
 pub fn node_stats(node: usize) -> HugeNodeStats;
 
+pub struct HugeRegion {
+    pub base: VirtAddr,
+    pub len: u64,
+    pub perms: RegionPerms,
+    pub size: HugeSize,
+    pub frames: Vec<HugeFrame>,
+}
+
 impl AddressSpace {
-    /// Replace one resident private page with equivalent backing from a
-    /// target NUMA node, preserving bytes and permissions and completing
-    /// the required cross-CPU TLB invalidation before releasing old backing.
+    /// Install real architecture huge/block leaves and take frame ownership.
+    pub unsafe fn map_huge_region(
+        &self,
+        region: HugeRegion,
+    ) -> Result<(), AddressSpaceError>;
+    /// Remove an exact huge mapping and return its backing to the pool.
+    pub fn unmap_huge_region(&self, base: VirtAddr)
+        -> Result<(), AddressSpaceError>;
+}
+
+impl AddressSpace {
+    /// Replace one resident private base page, or the complete hardware leaf
+    /// containing a huge-page address, with equivalent backing from a target
+    /// NUMA node, preserving bytes and permissions and completing the
+    /// required cross-CPU TLB invalidation before releasing old backing.
     pub unsafe fn migrate_page_to_node(
         &self,
         va: VirtAddr,

@@ -5,12 +5,12 @@ prompt_hash = "6e7ecf10083ec035057bdce834a72bbe2bffae8df9383ed10eb06c78dd70944b"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "Range conformance, BIND home-node selection, NUMA event accounting, and base/huge-page allocator topology remain inside the existing memory-manager TCB and do not add a trusted subsystem or move the documented trust boundary."
+argument = "Range conformance, BIND home-node selection, NUMA event accounting, huge-page allocator topology, and user huge-leaf ownership remain inside the existing memory-manager TCB and do not add a trusted subsystem or move the documented trust boundary."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "mbind migration reuses the reviewed private-page replacement primitive, preserving mapping permissions and domain ownership; huge-page node selection changes only which already-reserved physical frame is returned and cannot change domain assignment."
+argument = "Huge mappings validate virtual/physical alignment before installing architecture leaves, retain authoritative frame ownership in AddressSpace, invalidate translations before returning frames to the pool, and preserve W^X plus NUMA/cpuset selection without changing domain assignment."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
-argument = "Range migration replaces authoritative backing and flushes peer TLBs before old frames are freed. Shared mappings are never moved without MOVE_ALL authority, which NARF rejects because it has no ambient CAP_SYS_NICE."
+argument = "Range migration replaces authoritative base-page or complete huge-leaf backing and flushes peer TLBs before old frames return to the buddy or huge pool. Failed huge-leaf replacement restores the original mapping and retains its ownership. Shared mappings are never moved without MOVE_ALL authority, which NARF rejects because it has no ambient CAP_SYS_NICE."

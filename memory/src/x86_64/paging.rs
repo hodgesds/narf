@@ -653,6 +653,156 @@ fn pt_lock_for(pml4_phys: PhysAddr) -> &'static narf_lib::sync::IrqSafeSpinLock<
     &PT_LOCKS[((pml4_phys.raw() >> 12) as usize) & (PT_LOCK_SHARDS - 1)]
 }
 
+/// Map one naturally aligned 2 MiB user page.
+///
+/// The leaf is installed directly in the page-directory (PS=1), so this is
+/// a hardware huge-page mapping rather than 512 adjacent 4 KiB PTEs.
+///
+/// # Safety
+/// Same root/identity-map contract as [`map_4kb`].
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub unsafe fn map_2mb(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
+    const SIZE: u64 = 2 * 1024 * 1024;
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.raw() & (SIZE - 1) != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    if phys.raw() & (SIZE - 1) != 0 {
+        return Err(MapError::UnalignedPhys);
+    }
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    let idx = WalkIndices::from_virt(virt);
+    let mut table_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
+    if flags.contains(PtFlags::USER) {
+        table_flags |= PtFlags::USER;
+    }
+    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pdpt_phys = unsafe { ensure_next_table(&mut pml4.entries[idx.pml4], table_flags)? };
+    let pdpt = unsafe { &mut *pdpt_phys.as_mut_ptr::<PageTable>() };
+    if pdpt.entries[idx.pdpt].flags().contains(PtFlags::HUGE_PAGE) {
+        return Err(MapError::EncounteredHugePage);
+    }
+    let pd_phys = unsafe { ensure_next_table(&mut pdpt.entries[idx.pdpt], table_flags)? };
+    let pd = unsafe { &mut *pd_phys.as_mut_ptr::<PageTable>() };
+    if pd.entries[idx.pd].is_present() {
+        return Err(MapError::AlreadyMapped);
+    }
+    pd.entries[idx.pd] = PageTableEntry::new(phys, flags | PtFlags::PRESENT | PtFlags::HUGE_PAGE);
+    unsafe { invlpg(virt) };
+    Ok(())
+}
+
+/// Map one naturally aligned 1 GiB user page as a PDPT PS=1 leaf.
+///
+/// # Safety
+/// Same root/identity-map contract as [`map_4kb`].
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub unsafe fn map_1gb(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
+    const SIZE: u64 = 1024 * 1024 * 1024;
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.raw() & (SIZE - 1) != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    if phys.raw() & (SIZE - 1) != 0 {
+        return Err(MapError::UnalignedPhys);
+    }
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    let idx = WalkIndices::from_virt(virt);
+    let mut table_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
+    if flags.contains(PtFlags::USER) {
+        table_flags |= PtFlags::USER;
+    }
+    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pdpt_phys = unsafe { ensure_next_table(&mut pml4.entries[idx.pml4], table_flags)? };
+    let pdpt = unsafe { &mut *pdpt_phys.as_mut_ptr::<PageTable>() };
+    if pdpt.entries[idx.pdpt].is_present() {
+        return Err(MapError::AlreadyMapped);
+    }
+    pdpt.entries[idx.pdpt] =
+        PageTableEntry::new(phys, flags | PtFlags::PRESENT | PtFlags::HUGE_PAGE);
+    unsafe { invlpg(virt) };
+    Ok(())
+}
+
+/// Remove a 2 MiB PD leaf and return its physical base.
+///
+/// # Safety
+/// Same root/identity-map contract as [`unmap_4kb`].
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub unsafe fn unmap_2mb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
+    const SIZE: u64 = 2 * 1024 * 1024;
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.raw() & (SIZE - 1) != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    let idx = WalkIndices::from_virt(virt);
+    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4e = pml4.entries[idx.pml4];
+    if !pml4e.is_present() {
+        return Err(MapError::AlreadyMapped);
+    }
+    let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
+    let pdpte = pdpt.entries[idx.pdpt];
+    if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+        return Err(MapError::AlreadyMapped);
+    }
+    let pd = unsafe { &mut *pdpte.addr().as_mut_ptr::<PageTable>() };
+    let leaf = pd.entries[idx.pd];
+    if !leaf.is_present() || !leaf.flags().contains(PtFlags::HUGE_PAGE) {
+        return Err(MapError::AlreadyMapped);
+    }
+    pd.entries[idx.pd] = PageTableEntry::EMPTY;
+    unsafe { invlpg_global(virt) };
+    Ok(leaf.addr())
+}
+
+/// Remove a 1 GiB PDPT leaf and return its physical base.
+///
+/// # Safety
+/// Same root/identity-map contract as [`unmap_4kb`].
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub unsafe fn unmap_1gb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
+    const SIZE: u64 = 1024 * 1024 * 1024;
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.raw() & (SIZE - 1) != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    let idx = WalkIndices::from_virt(virt);
+    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4e = pml4.entries[idx.pml4];
+    if !pml4e.is_present() {
+        return Err(MapError::AlreadyMapped);
+    }
+    let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
+    let leaf = pdpt.entries[idx.pdpt];
+    if !leaf.is_present() || !leaf.flags().contains(PtFlags::HUGE_PAGE) {
+        return Err(MapError::AlreadyMapped);
+    }
+    pdpt.entries[idx.pdpt] = PageTableEntry::EMPTY;
+    unsafe { invlpg_global(virt) };
+    Ok(leaf.addr())
+}
+
 /// to point at `phys` with `flags | PRESENT`. `INVLPG`s the target
 /// address so subsequent accesses see the new mapping immediately.
 ///
@@ -1053,7 +1203,9 @@ pub unsafe fn translate(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>
         return None;
     }
     if e.flags().contains(PtFlags::HUGE_PAGE) {
-        return Some(e.addr());
+        return Some(PhysAddr::new(
+            e.addr().raw() + (virt.raw() & ((1 << 30) - 1)),
+        ));
     } // 1 GiB
       // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
@@ -1062,7 +1214,9 @@ pub unsafe fn translate(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>
         return None;
     }
     if e.flags().contains(PtFlags::HUGE_PAGE) {
-        return Some(e.addr());
+        return Some(PhysAddr::new(
+            e.addr().raw() + (virt.raw() & ((1 << 21) - 1)),
+        ));
     } // 2 MiB
       // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pt = unsafe { &*e.addr().as_ptr::<PageTable>() };
