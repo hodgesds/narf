@@ -74,7 +74,9 @@ int main(void) {
     if (syscall(SYS_set_mempolicy_home_node, p, (size_t)4096, 0L, 0L) != 0) {
         w("mem2-fail: home_node\n"); return 1;
     }
-    if (syscall(SYS_migrate_pages, 0L, 0L, (void *)0, (void *)0) != 0) {
+    unsigned long old_nodes = 1UL;
+    unsigned long new_nodes = 1UL;
+    if (syscall(SYS_migrate_pages, 0L, 64L, &old_nodes, &new_nodes) != 0) {
         w("mem2-fail: migrate_pages\n"); return 1;
     }
 

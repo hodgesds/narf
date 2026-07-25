@@ -122,6 +122,10 @@ pub enum AddressSpaceError {
     OutOfRange,
     AlignmentMismatch,
     Unmapped,
+    /// The requested NUMA node is outside the allocator's node table.
+    InvalidNode,
+    /// The mapping borrows externally-owned backing and cannot be migrated.
+    SharedMapping,
 }
 
 /// Per-process address space. Stage-4 body: holds the region table +
@@ -2214,6 +2218,189 @@ impl AddressSpace {
         g[region_idx].phys[page_idx] = new_phys;
         g[region_idx].perms = g[region_idx].perms | RegionPerms::WRITE;
         Ok(())
+    }
+
+    /// Move one resident, privately-owned 4 KiB page to `target_node`.
+    ///
+    /// The backing-list update and leaf-PTE replacement are serialized by
+    /// the region lock. The old frame is not released until the replacement
+    /// PTE is installed and any required cross-CPU TLB invalidation has
+    /// completed, so no CPU can retain access to a frame returned to the
+    /// buddy allocator.
+    ///
+    /// Returns the page's previous NUMA node. An already-local page succeeds
+    /// without copying. Lazy/unmapped pages return [`AddressSpaceError::Unmapped`];
+    /// externally-owned shared mappings return
+    /// [`AddressSpaceError::SharedMapping`].
+    ///
+    /// # Safety
+    /// The address-space root and direct-map/identity-map prerequisites are
+    /// the same as [`Self::remap_page`].
+    pub unsafe fn migrate_page_to_node(
+        &self,
+        vaddr: VirtAddr,
+        target_node: usize,
+    ) -> Result<usize, AddressSpaceError> {
+        if target_node >= crate::frame::MAX_NUMA_NODES || self.root.as_u64() == 0 {
+            return Err(AddressSpaceError::InvalidNode);
+        }
+        let page_va = VirtAddr::new(vaddr.as_u64() & !0xFFF);
+        let mut regions = self.regions.lock();
+        let v = page_va.as_u64();
+        let region = regions
+            .iter_mut()
+            .find(|r| {
+                let base = r.base.as_u64();
+                v >= base && v < base + r.len
+            })
+            .ok_or(AddressSpaceError::Unmapped)?;
+        if region.perms.contains(RegionPerms::SHARED) {
+            return Err(AddressSpaceError::SharedMapping);
+        }
+        let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+        let old_phys = region.phys[page_idx];
+        if old_phys.raw() == 0 {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        // SAFETY: narf-frame supplies the topology hook in kernel binaries.
+        let old_node = unsafe { crate::frame::narf_phys_node(old_phys.raw()) };
+        if old_node == target_node {
+            return Ok(old_node);
+        }
+
+        let new_frame = crate::frame::alloc_frame_on_strict(target_node)
+            .map_err(|_| AddressSpaceError::OutOfRange)?;
+        let new_phys = new_frame.start_address();
+        // SAFETY: both frames are live, distinct 4 KiB direct-map ranges.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                old_phys.kernel_ptr::<u8>(),
+                new_phys.kernel_mut_ptr::<u8>(),
+                crate::frame::PAGE_SIZE as usize,
+            );
+        }
+
+        // SAFETY: the live AS owns the page-table root; page_va and both
+        // physical frames were validated from its private region.
+        let map_result = unsafe {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use crate::x86_64::paging::{map_4kb, unmap_4kb_local, PtFlags};
+                let mut flags = PtFlags::USER;
+                if region.perms.contains(RegionPerms::WRITE) {
+                    flags |= PtFlags::WRITABLE;
+                }
+                if !region.perms.contains(RegionPerms::EXEC) {
+                    flags |= PtFlags::NO_EXEC;
+                }
+                let _ = unmap_4kb_local(self.root, page_va);
+                map_4kb(self.root, page_va, new_phys, flags)
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
+                let mut flags = PtFlags::AP_RW_EL1;
+                if !region.perms.contains(RegionPerms::EXEC) {
+                    flags = flags | PtFlags::UXN | PtFlags::PXN;
+                }
+                let _ = unmap_4kb(self.root, page_va);
+                map_4kb(self.root, page_va, new_phys, flags)
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                Err(crate::x86_64::paging::MapError::InvalidAddress)
+            }
+        };
+        if map_result.is_err() {
+            // Best-effort rollback: preserve the original mapping if the
+            // replacement leaf could not be installed.
+            #[cfg(target_arch = "x86_64")]
+            {
+                use crate::x86_64::paging::{map_4kb, PtFlags};
+                let mut flags = PtFlags::USER;
+                if region.perms.contains(RegionPerms::WRITE) {
+                    flags |= PtFlags::WRITABLE;
+                }
+                if !region.perms.contains(RegionPerms::EXEC) {
+                    flags |= PtFlags::NO_EXEC;
+                }
+                // SAFETY: same root/page/backing invariants as above.
+                let _ = unsafe { map_4kb(self.root, page_va, old_phys, flags) };
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                use crate::aarch64::paging::{map_4kb, PtFlags};
+                let mut flags = PtFlags::AP_RW_EL1;
+                if !region.perms.contains(RegionPerms::EXEC) {
+                    flags = flags | PtFlags::UXN | PtFlags::PXN;
+                }
+                // SAFETY: same root/page/backing invariants as above.
+                let _ = unsafe { map_4kb(self.root, page_va, old_phys, flags) };
+            }
+            crate::frame::free_frame(new_frame);
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        region.phys[page_idx] = new_phys;
+        drop(regions);
+
+        self.flush_region_broadcast(page_va, 1);
+        crate::frame::free_frame(crate::frame::PhysFrame::new(old_phys));
+        Ok(old_node)
+    }
+
+    /// Migrate all resident private pages whose current node is in
+    /// `old_nodes` onto `new_nodes`, distributing pages round-robin across
+    /// the destination mask. Returns the number of pages that could not be
+    /// moved, matching `migrate_pages(2)`'s success return convention.
+    ///
+    /// # Safety
+    /// Same address-space and direct-map prerequisites as
+    /// [`Self::migrate_page_to_node`].
+    pub unsafe fn migrate_pages_between(
+        &self,
+        old_nodes: u64,
+        new_nodes: u64,
+    ) -> Result<usize, AddressSpaceError> {
+        if old_nodes == 0 || new_nodes == 0 {
+            return Err(AddressSpaceError::InvalidNode);
+        }
+        let destinations: Vec<usize> = (0..crate::frame::MAX_NUMA_NODES)
+            .filter(|node| (new_nodes >> node) & 1 != 0)
+            .collect();
+        if destinations.is_empty() {
+            return Err(AddressSpaceError::InvalidNode);
+        }
+        let candidates: Vec<VirtAddr> = {
+            let regions = self.regions.lock();
+            let mut out = Vec::new();
+            for region in regions.iter() {
+                if region.perms.contains(RegionPerms::SHARED) {
+                    continue;
+                }
+                for (idx, phys) in region.phys.iter().enumerate() {
+                    if phys.raw() == 0 {
+                        continue;
+                    }
+                    // SAFETY: narf-frame supplies the topology hook.
+                    let node = unsafe { crate::frame::narf_phys_node(phys.raw()) };
+                    if (old_nodes >> node) & 1 != 0 {
+                        out.push(VirtAddr::new(region.base.as_u64() + (idx as u64) * 4096));
+                    }
+                }
+            }
+            out
+        };
+        let mut failed = 0usize;
+        for (idx, va) in candidates.into_iter().enumerate() {
+            // SAFETY: forwarded contract; each VA came from this AS's live
+            // backing list and migrate_page_to_node revalidates it under lock.
+            if unsafe { self.migrate_page_to_node(va, destinations[idx % destinations.len()]) }
+                .is_err()
+            {
+                failed += 1;
+            }
+        }
+        Ok(failed)
     }
 
     /// Re-install the PTE for the page containing `vaddr` to

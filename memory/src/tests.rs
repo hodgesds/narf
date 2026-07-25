@@ -6490,3 +6490,65 @@ fn smoke_demand_fault_heals_absent_leaf_pte() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_demand_fault_heals_absent_leaf_pte);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_numa_migrate_page_preserves_contents() -> TestResult {
+    use crate::x86_64::paging;
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    if !crate::is_numa_aware() || crate::node_free(1) == 0 {
+        return TestResult::Skip("requires two online NUMA memory nodes");
+    }
+    // SAFETY: test context; the AS is never activated concurrently.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(x) => x,
+        Err(_) => return TestResult::Skip("AS alloc failed"),
+    };
+    let va = VirtAddr::new(0x0000_4080_3000_0000);
+    let old = match crate::frame::alloc_frame_on_strict(0) {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("node 0 allocation failed"),
+    };
+    // SAFETY: the freshly allocated frame is live in the direct map.
+    unsafe { old.kernel_mut_ptr::<u64>().write(0x4E55_4D41_4D4F_5645) };
+    if a.map_region(Region {
+        base: va,
+        len: 4096,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![old],
+    })
+    .is_err()
+    {
+        return TestResult::Fail("failed to register migration test page");
+    }
+    // SAFETY: a owns a fresh valid root and the test runs without mutation.
+    if unsafe { a.materialize() }.is_err() {
+        return TestResult::Fail("failed to materialize migration test page");
+    }
+    let node1_free_before = crate::node_free(1);
+    // SAFETY: root/direct map are live and the region is private.
+    if unsafe { a.migrate_page_to_node(va, 1) } != Ok(0) {
+        return TestResult::Fail("node 0 -> node 1 migration failed");
+    }
+    // SAFETY: a.root remains valid and no concurrent mutation occurs.
+    let Some(new_phys) = (unsafe { paging::translate(a.root, va) }) else {
+        return TestResult::Fail("migrated PTE is absent");
+    };
+    // ACPI parser smokes deliberately reset the live SRAT table, while the
+    // buddy's boot-time NUMA partition remains authoritative. Verify strict
+    // zone consumption rather than consulting that mutable test fixture.
+    if crate::node_free(1) + 1 != node1_free_before {
+        return TestResult::Fail("migrated page did not land on node 1");
+    }
+    // SAFETY: translated physical frame remains owned by the AS.
+    if unsafe { new_phys.kernel_ptr::<u64>().read() } != 0x4E55_4D41_4D4F_5645 {
+        return TestResult::Fail("migration did not preserve page contents");
+    }
+    // The ACPI topology-reset smokes described above also make AS teardown
+    // unable to route this node-1 frame back to its boot-time zone. Leak this
+    // isolated test AS rather than polluting the allocator for later smokes.
+    core::mem::forget(a);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_numa_migrate_page_preserves_contents);

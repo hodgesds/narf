@@ -1020,6 +1020,16 @@ extern "Rust" {
     fn narf_node_distance(from: u32, to: u32) -> u32;
 }
 
+/// Resolve a physical address to an allocator NUMA-node index.
+///
+/// Kept crate-visible for address-space page migration; external consumers
+/// should use higher-level allocation and policy APIs.
+#[inline]
+pub(crate) unsafe fn narf_phys_node(addr: u64) -> usize {
+    // SAFETY: narf-frame provides the topology hook in kernel binaries.
+    unsafe { narf_phys_to_node(addr) as usize }.min(MAX_NUMA_NODES - 1)
+}
+
 /// Distance from node `from` to node `to`, via the weak ACPI hook.
 /// Clamps to a sane non-zero default (10 local / 20 remote) when the
 /// hook is the no-topology stub.

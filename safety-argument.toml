@@ -1,16 +1,16 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "0c79ac64af6ef07b1aa37efffada5205ea075c6acb882f73ddcfe1cc0a01cfe3"
+prompt_hash = "a9db3623ff8ec7dd1a0b50343afafd876a0d9007fc4302238549a8f3b3aac75f"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "The change is confined to x86 architectural extended-state policy and its tests; it neither adds a trusted subsystem nor moves the documented TCB boundary."
+argument = "NUMA migration is implemented inside the existing memory-manager TCB and does not add a trusted subsystem or move the documented trust boundary."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "Selecting a saveable XCR0 mask does not change capability checks, page-domain tags, PKRS state, or domain transitions. AVX state remains per task and cannot grant memory access."
+argument = "Migration replaces only a process's existing private backing frame. It preserves the original PTE permissions and region ownership, and does not alter capability checks, domain tags, or domain rights."
 
 [[invariants_preserved]]
-ref = "security-model/specification/spec.md#L67"
-argument = "The XSAVE image contains user arithmetic state only and remains separate from DomainSavedState; this change does not expose another task's PKRS history or broaden diagnostic access."
+ref = "security-model/specification/spec.md#L75"
+argument = "The old frame is released only after the authoritative backing entry and leaf PTE are replaced and cross-CPU TLB invalidation completes, preventing stale access to reallocated memory and introducing no new isolation exception."

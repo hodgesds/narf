@@ -363,20 +363,19 @@ fn smoke_abi_mem_move_pages_bad_count_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_mem_move_pages_bad_count_neg);
 
 // ── MigratePages (256) ───────────────────────────────────────────────
-// NARF is single-node for placement: always a no-op returning 0. No
-// reachable error arm, so only the success/no-op pin.
+// Null/empty node masks are invalid, matching Linux.
 
-fn smoke_abi_mem_migrate_pages_pos() -> TestResult {
+fn smoke_abi_mem_migrate_pages_empty_masks_neg() -> TestResult {
     with_setup(|| {
-        // (pid, maxnode, old_nodes, new_nodes) — all ignored; returns 0.
+        // (pid, maxnode, old_nodes, new_nodes) with maxnode=1 but no masks.
         match call(Syscall::MigratePages.raw(), a3(0, 1, 0, 0)) {
-            Some(0) => Ok(()),
-            Some(_) => Err("migrate_pages no-op should return 0"),
-            None => Err("migrate_pages returned non-Ok status"),
+            Some(v) if v == EINVAL => Ok(()),
+            Some(_) => Err("migrate_pages with null masks should be -EINVAL"),
+            None => Err("migrate_pages(EINVAL) should be Ok(-EINVAL)"),
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_mem_migrate_pages_pos);
+kernel_test_in!("syscall_abi", smoke_abi_mem_migrate_pages_empty_masks_neg);
 
 // ── SetMempolicyHomeNode (450) ───────────────────────────────────────
 // flags(arg3) must be 0 → else -EINVAL. Otherwise accepted with 0. No AS

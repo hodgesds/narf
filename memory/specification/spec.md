@@ -68,6 +68,24 @@ pub fn unmap(va: VirtAddr);
 pub fn assign_domain(region: VirtRange, domain: DomainId);
 pub fn set_domain_rights(domain: DomainId, rights: DomainRights); // PKRS write
 
+impl AddressSpace {
+    /// Replace one resident private page with equivalent backing from a
+    /// target NUMA node, preserving bytes and permissions and completing
+    /// the required cross-CPU TLB invalidation before releasing old backing.
+    pub unsafe fn migrate_page_to_node(
+        &self,
+        va: VirtAddr,
+        target_node: usize,
+    ) -> Result<usize, AddressSpaceError>;
+
+    /// Bulk form used by Linux migrate_pages(2); returns pages not moved.
+    pub unsafe fn migrate_pages_between(
+        &self,
+        old_nodes: u64,
+        new_nodes: u64,
+    ) -> Result<usize, AddressSpaceError>;
+}
+
 // --- Kernel heap (slab-style object allocator) ------------------------
 
 /// Slab API. Shape owes most to Bonwick SLAB (object caches with
