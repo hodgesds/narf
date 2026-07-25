@@ -37,6 +37,10 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// a fixed-array-backed scheme without renumbering callers.
 const PIPE_BUF_BYTES: usize = 65536;
 
+/// Linux `FIONREAD` / `TIOCINQ`: write the immediately readable byte
+/// count as an `int` through the ioctl argument pointer.
+const FIONREAD: u32 = 0x541B;
+
 /// Shared mutable state between the read+write halves: the byte
 /// queue plus a "writer dropped" flag. The `closed_*` flags let
 /// either half observe the peer-side close from the read/write
@@ -152,6 +156,19 @@ impl FileOps for PipeRead {
         }
     }
 
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, narf_filesystem::FsError> {
+        if cmd != FIONREAD {
+            return Err(narf_filesystem::FsError::Unsupported);
+        }
+        let bytes = (self.shared.queue.lock().len() as i32).to_le_bytes();
+        // SAFETY: `copy_to_user` validates the destination through the SMAP
+        // window; FIONREAD writes one Linux `int`.
+        if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        Ok(0)
+    }
+
     fn poll_readiness(&self) -> u32 {
         let mut mask = 0;
         let q = self.shared.queue.lock();
@@ -224,6 +241,21 @@ impl FileOps for PipeWrite {
             mode: Mode::FILE_RW,
             mtime_cycles: 0,
         }
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, narf_filesystem::FsError> {
+        if cmd != FIONREAD {
+            return Err(narf_filesystem::FsError::Unsupported);
+        }
+        let bytes = (self.shared.queue.lock().len() as i32).to_le_bytes();
+        // Linux accepts FIONREAD on either pipe end and reports the shared
+        // unread-byte count.
+        // SAFETY: `copy_to_user` validates the destination through the SMAP
+        // window; FIONREAD writes one Linux `int`.
+        if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        Ok(0)
     }
 
     fn poll_readiness(&self) -> u32 {

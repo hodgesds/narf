@@ -760,6 +760,19 @@ fn smoke_abi_proc_clone_neg() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_clone_neg);
 
+fn smoke_abi_proc_legacy_clone_pidfd_pointer() -> TestResult {
+    const CLONE_PIDFD: u64 = 0x1000;
+    const OUT_PTR: u64 = 0x1234_5678;
+    if crate::handlers::legacy_clone_pidfd_ptr(CLONE_PIDFD | 17, OUT_PTR) != OUT_PTR {
+        return TestResult::Fail("legacy clone dropped the CLONE_PIDFD output pointer");
+    }
+    if crate::handlers::legacy_clone_pidfd_ptr(17, OUT_PTR) != 0 {
+        return TestResult::Fail("legacy clone treated parent_tid as pidfd without CLONE_PIDFD");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_legacy_clone_pidfd_pointer);
+
 // ── clone3(2) — struct validation + no live address space ──
 
 fn smoke_abi_proc_clone3_badarg() -> TestResult {
