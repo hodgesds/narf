@@ -8992,21 +8992,31 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     }
     // Map the filesystem covering `path` to its Linux super-magic so callers
     // detect the fs type (elogind → CGROUP2_SUPER_MAGIC at /sys/fs/cgroup).
-    let fs_name = narf_filesystem::registry()
-        .resolve_absolute(path, |fs, _rel| alloc::string::String::from(fs.name()));
-    let f_type = match fs_name.as_deref() {
-        Some("cgroup2") | Some("cgroup") => CGROUP2_SUPER_MAGIC,
-        Some("sysfs") => SYSFS_MAGIC,
-        Some("procfs") | Some("proc") => PROC_SUPER_MAGIC,
-        Some(n) if n.starts_with("ext") => EXT2_SUPER_MAGIC,
-        Some(_) => TMPFS_MAGIC, // tmpfs / devtmpfs / shm / other memfs-backed
-        None => return false,   // no mount covers the path
+    let fs = match narf_filesystem::registry().fs_arc_at(path) {
+        Some(fs) => fs,
+        None => return false,
+    };
+    let f_type = match fs.name() {
+        "cgroup2" | "cgroup" => CGROUP2_SUPER_MAGIC,
+        "sysfs" => SYSFS_MAGIC,
+        "procfs" | "proc" => PROC_SUPER_MAGIC,
+        n if n.starts_with("ext") => EXT2_SUPER_MAGIC,
+        _ => TMPFS_MAGIC, // tmpfs / devtmpfs / shm / other memfs-backed
+    };
+    let fs_stat = match poll_blocking(fs.statfs()) {
+        Some(Ok(stat)) => stat,
+        _ => return false,
     };
     let stat = StatfsBuf {
         f_type,
-        f_bsize: 4096,
-        f_namelen: 255,
-        f_frsize: 4096,
+        f_bsize: u64::from(fs_stat.block_size),
+        f_blocks: fs_stat.blocks,
+        f_bfree: fs_stat.blocks_free,
+        f_bavail: fs_stat.blocks_available,
+        f_files: fs_stat.files,
+        f_ffree: fs_stat.files_free,
+        f_namelen: u64::from(fs_stat.name_len),
+        f_frsize: u64::from(fs_stat.fragment_size),
         ..Default::default()
     };
     // Copy the statfs struct to user space under the SMAP bracket.

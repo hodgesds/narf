@@ -216,6 +216,19 @@ pub struct Stat {
     pub mtime_cycles: u64,
 }
 
+/// Filesystem-wide capacity information returned by `statfs(2)`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsStat {
+    pub blocks: u64,
+    pub blocks_free: u64,
+    pub blocks_available: u64,
+    pub files: u64,
+    pub files_free: u64,
+    pub block_size: u32,
+    pub name_len: u32,
+    pub fragment_size: u32,
+}
+
 /// A file's ownership triplet for a POSIX access check.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FileOwner {
@@ -962,6 +975,19 @@ pub trait FsInstance: Send + Sync + 'static {
     /// Human-readable name (for logging + lookups). Must remain
     /// stable across the FS's lifetime.
     fn name(&self) -> &str;
+
+    /// Query filesystem-wide capacity. Synthetic filesystems retain the
+    /// conservative default used before this interface existed.
+    fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
+        Box::pin(async {
+            Ok(FsStat {
+                block_size: 4096,
+                name_len: 255,
+                fragment_size: 4096,
+                ..FsStat::default()
+            })
+        })
+    }
 }
 
 // ── Path resolution ────────────────────────────────────────────────

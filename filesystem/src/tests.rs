@@ -2828,11 +2828,16 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
         1 => {
             let name_len = body.iter().position(|&b| b == 0).unwrap_or(body.len());
             let name = core::str::from_utf8(&body[..name_len]).unwrap_or("");
-            if hdr.nodeid == FUSE_ROOT_ID && name == "hello" {
+            if hdr.nodeid == FUSE_ROOT_ID && (name == "hello" || name == "sym") {
+                let mut attr = file_attr;
+                if name == "sym" {
+                    attr.mode = S_IFLNK | 0o777;
+                    attr.size = 5;
+                }
                 let out = FuseEntryOut {
-                    nodeid: 2,
+                    nodeid: if name == "sym" { 5 } else { 2 },
                     generation: 1,
-                    attr: file_attr,
+                    attr,
                     ..Default::default()
                 };
                 Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
@@ -2873,6 +2878,25 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
                 &[][..]
             };
             Some(fuse_reply(unique, 0, slice))
+        }
+        // FUSE_READLINK (5): target bytes, with no trailing NUL.
+        5 => Some(fuse_reply(unique, 0, b"hello")),
+        // FUSE_STATFS (17): filesystem-wide capacity.
+        17 => {
+            let out = FuseStatfsOut {
+                st: FuseKstatfs {
+                    blocks: 1024,
+                    bfree: 512,
+                    bavail: 500,
+                    files: 100,
+                    ffree: 75,
+                    bsize: 4096,
+                    namelen: 255,
+                    frsize: 4096,
+                    ..Default::default()
+                },
+            };
+            Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
         }
         // FUSE_WRITE (16): report the requested payload size.
         16 => {
@@ -3119,6 +3143,72 @@ fn smoke_fs_fuse_readdir_getattr() -> TestResult {
     }
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_readdir_getattr);
+
+/// READLINK and STATFS use their dedicated Linux FUSE operations.
+fn smoke_fs_fuse_metadata_queries() -> TestResult {
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use crate::FsInstance;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+
+    let conn = Arc::new(FuseConnection::new());
+    let fs = Arc::new(FuseFs::new("fuse-meta", Arc::clone(&conn)));
+    narf_scheduler::__reset_queues_for_test();
+    spawn_fuse_daemon(Arc::clone(&conn), &OUTCOME);
+
+    narf_scheduler::spawn(async move {
+        if fs.init().await.is_err() {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        let link = match fs.root().lookup_async("sym").await {
+            Ok(link) => link,
+            Err(_) => {
+                OUTCOME.store(3, Ordering::Relaxed);
+                return;
+            }
+        };
+        let mut target = [0u8; 16];
+        if link.read(0, &mut target).await != Ok(5) || &target[..5] != b"hello" {
+            OUTCOME.store(4, Ordering::Relaxed);
+            return;
+        }
+        let stat = match fs.statfs().await {
+            Ok(stat) => stat,
+            Err(_) => {
+                OUTCOME.store(5, Ordering::Relaxed);
+                return;
+            }
+        };
+        if stat.blocks == 1024
+            && stat.blocks_free == 512
+            && stat.blocks_available == 500
+            && stat.files == 100
+            && stat.files_free == 75
+            && stat.block_size == 4096
+            && stat.name_len == 255
+        {
+            OUTCOME.store(1, Ordering::Relaxed);
+        } else {
+            OUTCOME.store(6, Ordering::Relaxed);
+        }
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("FUSE_INIT failed"),
+        3 => TestResult::Fail("FUSE symlink lookup failed"),
+        4 => TestResult::Fail("FUSE_READLINK returned wrong target"),
+        5 => TestResult::Fail("FUSE_STATFS failed"),
+        6 => TestResult::Fail("FUSE_STATFS returned wrong capacity"),
+        _ => TestResult::Fail("FUSE metadata client never completed"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_metadata_queries);
 
 /// Linux mutation operations traverse the real VFS trait surface and
 /// produce replies with the expected entry/open shapes.

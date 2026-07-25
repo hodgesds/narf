@@ -231,6 +231,29 @@ pub struct FuseWriteOut {
     pub padding: u32,
 }
 
+/// `struct fuse_kstatfs` nested in `struct fuse_statfs_out`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseKstatfs {
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub files: u64,
+    pub ffree: u64,
+    pub bsize: u32,
+    pub namelen: u32,
+    pub frsize: u32,
+    pub padding: u32,
+    pub spare: [u32; 6],
+}
+
+/// `struct fuse_statfs_out`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseStatfsOut {
+    pub st: FuseKstatfs,
+}
+
 /// `struct fuse_mknod_in` — MKNOD request body.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]

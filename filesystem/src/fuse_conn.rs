@@ -35,8 +35,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fuse::*;
 use crate::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat, POLL_IN,
-    POLL_OUT,
+    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, FsStat, Mode, Stat,
+    POLL_IN, POLL_OUT,
 };
 
 /// A completed reply from the daemon: the `error` field of the
@@ -505,6 +505,18 @@ impl FuseFile {
 impl FileOps for FuseFile {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
+            if self.attr.stat().mode.file_type == FileType::Symlink {
+                if offset != 0 {
+                    return Ok(0);
+                }
+                let data = self
+                    .conn
+                    .request(FuseOpcode::Readlink, self.attr.nodeid, Vec::new())
+                    .await?;
+                let n = core::cmp::min(buf.len(), data.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                return Ok(n);
+            }
             let fh = self.ensure_open().await?;
             let body = pod_as_bytes(&FuseReadIn {
                 fh,
@@ -1025,5 +1037,25 @@ impl FsInstance for FuseFs {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
+        Box::pin(async move {
+            let reply = self
+                .conn
+                .request(FuseOpcode::Statfs, FUSE_ROOT_ID, Vec::new())
+                .await?;
+            let out: FuseStatfsOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(FsStat {
+                blocks: out.st.blocks,
+                blocks_free: out.st.bfree,
+                blocks_available: out.st.bavail,
+                files: out.st.files,
+                files_free: out.st.ffree,
+                block_size: out.st.bsize,
+                name_len: out.st.namelen,
+                fragment_size: out.st.frsize,
+            })
+        })
     }
 }

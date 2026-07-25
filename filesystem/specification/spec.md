@@ -157,7 +157,12 @@ replies by the non-zero `unique` identifier.
   are distinct from regular-file `OPEN` and `RELEASE`.
 - The bridge supports lookup, getattr/setattr, create, mknod, mkdir,
   unlink, rmdir, same-directory rename/link, symlink, open, read,
-  write, readdir, release, forget, and initialization.
+  write, readlink, statfs, readdir, release, forget, and initialization.
+
+`FsInstance::statfs` is the asynchronous filesystem-capacity interface.
+Its `FsStat` result is translated to Linux `struct statfs`; FUSE mounts
+source those values from `FUSE_STATFS`, while other filesystems retain
+the conservative synthetic default.
 
 Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with
