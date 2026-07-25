@@ -6,7 +6,7 @@
 #![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
-use narf_linux_perf_uapi::PerfEventAttr;
+use narf_linux_perf_uapi::{PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_WATERMARK};
 
 const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
@@ -156,6 +156,29 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             Some(EOPNOTSUPP) => {}
             _ => return Err("perf_event_open ignored an unimplemented attr flag"),
         }
+
+        // perf record opens this per-CPU dummy event to consume BPF lifecycle
+        // sideband records. NARF has no BPF runtime, so its watermark-selected
+        // record domain is truthfully empty and the fd remains readable as a
+        // real zero-count software event.
+        let empty_bpf_sideband = PerfEventAttr {
+            flags: PERF_ATTR_FLAG_BPF_EVENT | PERF_ATTR_FLAG_WATERMARK,
+            wakeup_events_or_watermark: 1,
+            ..attr
+        };
+        let sideband_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &empty_bpf_sideband as *const _ as u64,
+                -1i32 as u64,
+                narf_lib::percpu::current_cpu() as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("perf_event_open rejected the empty BPF sideband event"),
+        };
+        let _ = call(Syscall::Close.raw(), a0(sideband_fd));
 
         // Test 6: Unknown flags -> expect EINVAL (-22)
         match call(
@@ -768,6 +791,46 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             return Err("perf metadata record payloads are invalid");
         }
         let _ = call(Syscall::Close.raw(), a0(metadata_fd as u64));
+
+        // Test 20: task-scoped hardware events own a real current-CPU PMU
+        // context and report retired work instead of counting peer tasks.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if narf_arch::x86_64::pmu::detect().is_none() {
+                return Ok(());
+            }
+            let hardware_attr = PerfEventAttr {
+                type_: 0, // PERF_TYPE_HARDWARE
+                size: core::mem::size_of::<PerfEventAttr>() as u32,
+                config: 0, // PERF_COUNT_HW_CPU_CYCLES
+                ..PerfEventAttr::default()
+            };
+            let hardware_fd = match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(
+                    &hardware_attr as *const _ as u64,
+                    0,
+                    -1i32 as u64,
+                    -1i32 as u64,
+                ),
+            ) {
+                Some(fd) if fd >= 0 => fd as u32,
+                _ => return Err("task-scoped hardware event was not admitted"),
+            };
+            for _ in 0..10_000 {
+                core::hint::black_box(());
+            }
+            let mut count = [0u8; 8];
+            if call(
+                Syscall::Read.raw(),
+                a2(hardware_fd as u64, count.as_mut_ptr() as u64, 8),
+            ) != Some(8)
+                || u64::from_ne_bytes(count) == 0
+            {
+                return Err("task-scoped hardware counter did not report real execution");
+            }
+            let _ = call(Syscall::Close.raw(), a0(hardware_fd as u64));
+        }
 
         Ok(())
     })

@@ -8,9 +8,10 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize
 use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_linux_perf_uapi::{
-    PerfEventAttr, PERF_ATTR_FLAG_COMM, PERF_ATTR_FLAG_COMM_EXEC, PERF_ATTR_FLAG_DISABLED,
-    PERF_ATTR_FLAG_ENABLE_ON_EXEC, PERF_ATTR_FLAG_MMAP, PERF_ATTR_FLAG_MMAP2,
-    PERF_ATTR_FLAG_MMAP_DATA, PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_TASK,
+    PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_COMM, PERF_ATTR_FLAG_COMM_EXEC,
+    PERF_ATTR_FLAG_DISABLED, PERF_ATTR_FLAG_ENABLE_ON_EXEC, PERF_ATTR_FLAG_EXCLUDE_GUEST,
+    PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP, PERF_ATTR_FLAG_MMAP2, PERF_ATTR_FLAG_MMAP_DATA,
+    PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK,
     PERF_ATTR_SIZE_VER0, PERF_COUNT_SW_DUMMY, PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST,
     PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM,
     PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC,
@@ -36,6 +37,9 @@ const SAMPLE_CPU_SLOTS: usize = narf_lib::percpu::MAX_CPUS;
 static PENDING_SAMPLES: [PendingSample; SAMPLE_CPU_SLOTS] =
     [const { PendingSample::new() }; SAMPLE_CPU_SLOTS];
 static PENDING_SAMPLE_LOST: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
+static ACTIVE_SAMPLE_IDS: [[AtomicU64; 8]; SAMPLE_CPU_SLOTS] =
+    [const { [const { AtomicU64::new(0) }; 8] }; SAMPLE_CPU_SLOTS];
 
 struct PendingSample {
     state: AtomicU8,
@@ -44,6 +48,8 @@ struct PendingSample {
     time: AtomicU64,
     #[cfg(target_arch = "x86_64")]
     counters: AtomicU8,
+    #[cfg(target_arch = "x86_64")]
+    event_ids: [AtomicU64; 8],
 }
 
 impl PendingSample {
@@ -55,6 +61,8 @@ impl PendingSample {
             time: AtomicU64::new(0),
             #[cfg(target_arch = "x86_64")]
             counters: AtomicU8::new(0),
+            #[cfg(target_arch = "x86_64")]
+            event_ids: [const { AtomicU64::new(0) }; 8],
         }
     }
 }
@@ -69,7 +77,13 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
     | PERF_ATTR_FLAG_COMM_EXEC
     | PERF_ATTR_FLAG_MMAP
     | PERF_ATTR_FLAG_MMAP_DATA
-    | PERF_ATTR_FLAG_MMAP2;
+    | PERF_ATTR_FLAG_MMAP2
+    // NARF does not execute nested guests and currently has no BPF VM or
+    // runtime kernel-symbol loader. These selectors therefore describe empty
+    // event domains, rather than requests whose records are being suppressed.
+    | PERF_ATTR_FLAG_EXCLUDE_GUEST
+    | PERF_ATTR_FLAG_KSYMBOL
+    | PERF_ATTR_FLAG_BPF_EVENT;
 
 const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
@@ -111,6 +125,11 @@ struct PerfEventFile {
     wakeup_pending: AtomicU32,
     #[cfg(target_arch = "x86_64")]
     sample_period: u64,
+    #[cfg(target_arch = "x86_64")]
+    pmu_event: Option<narf_arch::x86_64::pmu::PmuEvent>,
+    #[cfg(target_arch = "x86_64")]
+    active_task_counters:
+        IrqSafeSpinLock<[Option<narf_arch::x86_64::pmu::PmuCounter>; narf_lib::percpu::MAX_CPUS]>,
     mmap_seq: AtomicU32,
     mmap: IrqSafeSpinLock<Option<PerfMmap>>,
     group_members: IrqSafeSpinLock<Vec<Weak<dyn FileOps>>>,
@@ -259,11 +278,73 @@ impl PerfEventFile {
             // until Drop, which cannot run while this method borrows `self`.
             return unsafe { narf_arch::x86_64::pmu::read(&counter) };
         }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let cpu = narf_lib::percpu::current_cpu();
+            if let Some(counter) = self.active_task_counters.lock()[cpu] {
+                // SAFETY: this entry can only be populated while its target is
+                // executing on this CPU; syscall reads run in that continuation.
+                return unsafe { narf_arch::x86_64::pmu::read(&counter) };
+            }
+        }
 
         // PERF_COUNT_SW_DUMMY is the only software event admitted until
         // scheduler-owned, per-target software accounting exists. Its specified
         // count is exactly zero.
         0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn task_switch(&self, cpu: usize, running: bool) {
+        if self.target_task == u64::MAX || self.pmu_event.is_none() {
+            return;
+        }
+        let mut active = self.active_task_counters.lock();
+        if self.target_cpu >= 0 && cpu != self.target_cpu as usize {
+            return;
+        }
+        if running {
+            if active[cpu].is_some() || !self.enabled.load(Ordering::Acquire) {
+                return;
+            }
+            // SAFETY: the scheduler invokes this on the current logical CPU in
+            // executor context. The returned slot belongs to this CPU.
+            let Ok(counter) =
+                (unsafe { narf_arch::x86_64::pmu::alloc_counter(self.pmu_event.unwrap()) })
+            else {
+                return;
+            };
+            if self.sample_period != 0 {
+                // SAFETY: freshly allocated current-CPU counter.
+                if unsafe { narf_arch::x86_64::pmu::arm_sampling(&counter, self.sample_period) }
+                    .is_err()
+                {
+                    // SAFETY: same current-CPU allocation.
+                    unsafe { narf_arch::x86_64::pmu::release(counter) };
+                    return;
+                }
+                ACTIVE_SAMPLE_IDS[cpu][counter.idx as usize].store(self.id, Ordering::Release);
+            }
+            active[cpu] = Some(counter);
+        } else if let Some(counter) = active[cpu].take() {
+            if self.sample_period != 0 {
+                ACTIVE_SAMPLE_IDS[cpu][counter.idx as usize].store(0, Ordering::Release);
+                // SAFETY: current-CPU live allocation.
+                let _ = unsafe { narf_arch::x86_64::pmu::pause_sampling(&counter) };
+            }
+            // SAFETY: current-CPU live allocation.
+            let value = if self.sample_period == 0 {
+                // SAFETY: current-CPU live allocation.
+                unsafe { narf_arch::x86_64::pmu::read(&counter) }
+            } else {
+                // SAFETY: current-CPU sampled allocation.
+                unsafe { narf_arch::x86_64::pmu::sampling_residual(&counter, self.sample_period) }
+                    .unwrap_or(0)
+            };
+            self.count_accumulated.fetch_add(value, Ordering::AcqRel);
+            // SAFETY: current-CPU live allocation.
+            unsafe { narf_arch::x86_64::pmu::release(counter) };
+        }
     }
 
     fn enable(&self) {
@@ -281,12 +362,20 @@ impl PerfEventFile {
                     };
                 }
             }
+            #[cfg(target_arch = "x86_64")]
+            if self.target_task == crate::handlers::current_task_id() {
+                self.task_switch(narf_lib::percpu::current_cpu(), true);
+            }
         }
         self.publish_mmap_state();
     }
 
     fn disable(&self) {
         if self.enabled.swap(false, Ordering::AcqRel) {
+            #[cfg(target_arch = "x86_64")]
+            if self.target_task == crate::handlers::current_task_id() {
+                self.task_switch(narf_lib::percpu::current_cpu(), false);
+            }
             #[cfg(target_arch = "x86_64")]
             if self.sample_period != 0 {
                 if let Some(counter) = &self.pmu_counter {
@@ -816,6 +905,14 @@ fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
         .time
         .store(narf_time::monotonic_ns(), Ordering::Relaxed);
     pending.counters.store(counters, Ordering::Relaxed);
+    for (idx, event_id) in pending.event_ids.iter().enumerate() {
+        if counters & (1 << idx) != 0 {
+            event_id.store(
+                ACTIVE_SAMPLE_IDS[cpu][idx].load(Ordering::Acquire),
+                Ordering::Relaxed,
+            );
+        }
+    }
     pending.state.store(2, Ordering::Release);
     // Wake a parked poll/epoll task so its syscall re-enters normal context
     // and drains this allocation-free IRQ snapshot into the mmap ring.
@@ -864,7 +961,10 @@ pub(crate) fn drain_irq_samples() {
                     continue;
                 };
                 #[cfg(target_arch = "x86_64")]
-                let matches_counter = event
+                let matches_counter = (0..8).any(|idx| {
+                    counters & (1 << idx) != 0
+                        && pending.event_ids[idx].load(Ordering::Relaxed) == event.id
+                }) || event
                     .pmu_counter
                     .is_some_and(|counter| counters & (1 << counter.idx) != 0);
                 #[cfg(not(target_arch = "x86_64"))]
@@ -873,6 +973,10 @@ pub(crate) fn drain_irq_samples() {
                     && event.enabled.load(Ordering::Acquire)
                     && event.target_task == task
                 {
+                    #[cfg(target_arch = "x86_64")]
+                    event
+                        .count_accumulated
+                        .fetch_add(event.sample_period, Ordering::AcqRel);
                     if deferred_lost != 0 {
                         event
                             .sample_lost
@@ -904,8 +1008,37 @@ pub(crate) fn sample_from_irq_for_test(task: u64, ip: u64) {
     }
 }
 
+/// Scheduler PMU context hook. Runs outside scheduler queue locks and brackets
+/// the matching task continuation on the current logical CPU.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn on_task_switch(task: u64, running: bool) {
+    if !narf_lib::perf::enabled() {
+        return;
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    let mut registry = PERF_EVENT_REGISTRY.lock();
+    registry.retain(|weak| {
+        let Some(event) = weak.upgrade() else {
+            return false;
+        };
+        if event.target_task == task {
+            event.task_switch(cpu, running);
+        }
+        true
+    });
+}
+
 impl Drop for PerfEventFile {
     fn drop(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let cpu = narf_lib::percpu::current_cpu();
+            if let Some(counter) = self.active_task_counters.lock()[cpu].take() {
+                // SAFETY: a task can close its own event only while executing
+                // on this CPU; no other CPU can simultaneously run that task.
+                unsafe { narf_arch::x86_64::pmu::release(counter) };
+            }
+        }
         #[cfg(target_arch = "x86_64")]
         if let Some(counter) = self.pmu_counter {
             // SAFETY: releasing the counter we allocated.
@@ -1170,7 +1303,14 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     // frequency mode needs a feedback controller and exclude/inherit/metadata
     // bits need scheduler/process integration; ignoring them would fabricate
     // compatibility.
-    if attr.flags & !PERF_ATTR_IMPLEMENTED != 0 {
+    let unsupported_attr_flags = attr.flags & !PERF_ATTR_IMPLEMENTED;
+    let empty_bpf_sideband_dummy = attr.type_ == PERF_TYPE_SOFTWARE
+        && attr.config == PERF_COUNT_SW_DUMMY
+        && attr.flags & PERF_ATTR_FLAG_BPF_EVENT != 0
+        && attr.sample_period_or_freq == 0;
+    if unsupported_attr_flags != 0
+        && !(unsupported_attr_flags == PERF_ATTR_FLAG_WATERMARK && empty_bpf_sideband_dummy)
+    {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
@@ -1227,13 +1367,11 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         return;
     }
     if attr.type_ != PERF_TYPE_SOFTWARE
-        && (pid != -1
-            || cpu != narf_lib::percpu::current_cpu() as i32
-            || narf_lib::smp::online_count() != 1)
+        && pid == -1
+        && (cpu != narf_lib::percpu::current_cpu() as i32 || narf_lib::smp::online_count() != 1)
     {
-        // Hardware counters are per-CPU. Until scheduler context switching
-        // and remote-CPU PMU calls exist, admitting a task event or an SMP
-        // event would count unrelated execution or access another CPU's MSRs.
+        // A per-CPU event requires remote-CPU PMU calls on SMP. Task events are
+        // virtualized by the scheduler switch hook below.
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
@@ -1263,7 +1401,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
 
     // Try to allocate PMU counter if target_arch is x86_64
     #[cfg(target_arch = "x86_64")]
-    let pmu_counter = {
+    let (pmu_event, pmu_counter) = {
         let event_opt = match attr.type_ {
             // PERF_TYPE_HARDWARE
             PERF_TYPE_HARDWARE => match attr.config {
@@ -1298,20 +1436,40 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         };
 
         if let Some(event) = event_opt {
-            // SAFETY: alloc_counter programs PMU hardware registers, which requires CPL=0.
-            match unsafe { narf_arch::x86_64::pmu::alloc_counter(event) } {
-                Ok(counter) => Some(counter),
-                Err(narf_arch::x86_64::pmu::PmuError::NoFreeCounter) => {
-                    ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
-                    return;
-                }
-                Err(_) => {
-                    ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
-                    return;
+            if pid != -1 {
+                // Validate that this CPU exposes a real backend and mapping.
+                // The actual counter is allocated on each task switch-in.
+                // SAFETY: syscall context at CPL0 on the current CPU.
+                let probe = match unsafe { narf_arch::x86_64::pmu::alloc_counter(event) } {
+                    Ok(counter) => counter,
+                    Err(narf_arch::x86_64::pmu::PmuError::NoFreeCounter) => {
+                        ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
+                        return;
+                    }
+                    Err(_) => {
+                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        return;
+                    }
+                };
+                // SAFETY: release the current-CPU validation allocation.
+                unsafe { narf_arch::x86_64::pmu::release(probe) };
+                (Some(event), None)
+            } else {
+                // SAFETY: alloc_counter programs PMU hardware registers, which requires CPL=0.
+                match unsafe { narf_arch::x86_64::pmu::alloc_counter(event) } {
+                    Ok(counter) => (Some(event), Some(counter)),
+                    Err(narf_arch::x86_64::pmu::PmuError::NoFreeCounter) => {
+                        ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
+                        return;
+                    }
+                    Err(_) => {
+                        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+                        return;
+                    }
                 }
             }
         } else if attr.type_ == PERF_TYPE_SOFTWARE {
-            None
+            (None, None)
         } else {
             ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
             return;
@@ -1326,17 +1484,36 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
 
     #[cfg(target_arch = "x86_64")]
     let sample_period = if attr.sample_period_or_freq != 0 {
-        let Some(counter) = pmu_counter.as_ref() else {
+        if pmu_event.is_none() {
             ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
             return;
-        };
+        }
         let period = attr.sample_period_or_freq;
         if ensure_pmi_route().is_err() {
-            // SAFETY: open still exclusively owns this allocation.
-            unsafe { narf_arch::x86_64::pmu::release(*counter) };
+            if let Some(counter) = pmu_counter {
+                // SAFETY: open still exclusively owns this allocation.
+                unsafe { narf_arch::x86_64::pmu::release(counter) };
+            }
             ctx.set_return(SyscallReturn::ok((-95i64) as u64));
             return;
         }
+        let validation_counter;
+        let counter = if let Some(counter) = pmu_counter.as_ref() {
+            counter
+        } else {
+            // Task-scoped counters are allocated on switch-in, but validate
+            // overflow support and the requested period synchronously.
+            // SAFETY: syscall context at CPL0.
+            validation_counter =
+                match unsafe { narf_arch::x86_64::pmu::alloc_counter(pmu_event.unwrap()) } {
+                    Ok(counter) => counter,
+                    Err(_) => {
+                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        return;
+                    }
+                };
+            &validation_counter
+        };
         // Validate the period and counter backend now. Keep the event paused
         // until ENABLE/enable_on_exec establishes the requested time window.
         // SAFETY: this open path owns the freshly allocated live counter.
@@ -1349,6 +1526,10 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         }
         // SAFETY: same live counter; restore non-interrupt counting state.
         let _ = unsafe { narf_arch::x86_64::pmu::pause_sampling(counter) };
+        if pmu_counter.is_none() {
+            // SAFETY: task-scoped validation allocation on this CPU.
+            unsafe { narf_arch::x86_64::pmu::release(*counter) };
+        }
         period
     } else {
         0
@@ -1385,6 +1566,10 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             wakeup_pending: AtomicU32::new(0),
             #[cfg(target_arch = "x86_64")]
             sample_period,
+            #[cfg(target_arch = "x86_64")]
+            pmu_event,
+            #[cfg(target_arch = "x86_64")]
+            active_task_counters: IrqSafeSpinLock::new([None; narf_lib::percpu::MAX_CPUS]),
             mmap_seq: AtomicU32::new(0),
             mmap: IrqSafeSpinLock::new(None),
             group_members: IrqSafeSpinLock::new(Vec::new()),

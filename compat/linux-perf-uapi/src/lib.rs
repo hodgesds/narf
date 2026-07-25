@@ -100,8 +100,11 @@ pub const PERF_ATTR_FLAG_WATERMARK: u64 = 1 << 14;
 pub const PERF_ATTR_FLAG_PRECISE_IP_MASK: u64 = 3 << 15;
 pub const PERF_ATTR_FLAG_MMAP_DATA: u64 = 1 << 17;
 pub const PERF_ATTR_FLAG_SAMPLE_ID_ALL: u64 = 1 << 18;
+pub const PERF_ATTR_FLAG_EXCLUDE_GUEST: u64 = 1 << 20;
 pub const PERF_ATTR_FLAG_MMAP2: u64 = 1 << 23;
 pub const PERF_ATTR_FLAG_COMM_EXEC: u64 = 1 << 24;
+pub const PERF_ATTR_FLAG_KSYMBOL: u64 = 1 << 29;
+pub const PERF_ATTR_FLAG_BPF_EVENT: u64 = 1 << 30;
 
 pub const PERF_ATTR_SIZE_VER0: u32 = 64;
 pub const PERF_ATTR_SIZE_VER1: u32 = 72;

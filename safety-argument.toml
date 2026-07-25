@@ -74,3 +74,11 @@ argument = "The memory-hotplug observer runs only after allocator donation/remov
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "PMI dispatch runs after the trap prologue has entered the Frame domain and only copies scalar task/IP/time values into kernel-owned per-CPU storage; it does not bypass capability checks or alter domain tags."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The scheduler PMU hook receives only the already-published scalar TaskId and a run-state edge. It runs outside run-queue locks, grants no capability, and cannot select or resume a task."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "PMU switch-out disables and releases the current CPU's counter before executor code or a peer task runs. Per-CPU allocation prevents one logical CPU from programming or releasing another CPU's MSR bank during migration."

@@ -196,7 +196,21 @@ Unsupported sample layouts and platforms without a routed PMU overflow IRQ
 fail explicitly; aarch64 sampling remains `EOPNOTSUPP` until PMUv3 overflow
 is wired through GICv3.
 
-Scheduler-attribution, cgroup, filter, probe, and BPF features fail explicitly.
+Task-scoped x86_64 hardware events are scheduler-attributed: a switch hook
+allocates and programs a counter in the destination CPU's PMU bank immediately
+before entering the target continuation, then stops, folds, and releases it
+immediately after every yield or preemption. Migration therefore carries the
+accumulated value while never reusing an origin CPU's MSR identity. PMU slot
+allocation and sampling overflow state are per logical CPU. Per-CPU events on
+SMP still require remote-CPU PMU calls and fail explicitly.
+Cgroup, filter, probe, and BPF features fail explicitly.
+`exclude_guest` is accepted because NARF never executes nested guest context.
+The `ksymbol` and `bpf_event` record selectors are also accepted as empty
+domains: NARF has neither a runtime kernel-symbol loader nor a BPF VM, so no
+such lifecycle event can occur. A software-dummy event selecting only that
+empty BPF sideband domain may also request watermark wakeups: with no possible
+records, every watermark has the same observable empty-ring semantics. This
+does not suppress an implemented event.
 The adapter must not synthesize plausible values for an unavailable hardware
 event. The audited command matrix and remaining gaps live in
 `observability/PERF_LINUX_COMPAT_AUDIT.md`.
@@ -206,10 +220,9 @@ Linux perf wire definitions are owned by the separate
 Linux `include/uapi/linux/perf_event.h`. Defining a UAPI value does not admit
 it: userspace accepts only implemented attribute bits and exact event
 backends. Software events are currently limited to `PERF_COUNT_SW_DUMMY`.
-Hardware events require x86_64, a real programmable PMU, and a uniprocessor
-per-CPU target matching the calling CPU; task-scoped and SMP hardware events
-return `EOPNOTSUPP` until scheduler context switching and remote-CPU PMU
-operations exist.
+Hardware events require x86_64 and a real programmable PMU. Task-scoped events
+follow scheduler execution across CPUs; per-CPU events currently require a
+uniprocessor target matching the calling CPU.
 
 ### 3.2 Shared file-mapping lifetime
 

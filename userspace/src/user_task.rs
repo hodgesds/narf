@@ -1270,6 +1270,7 @@ pub fn install_user_task_hooks() {
     // the hook every own-stack task reports utime 0 (getrusage / times /
     // ps TIME / `time`'s user column, per the alpine probe).
     narf_scheduler::stackful::set_user_slice_account_hook(crate::handlers::account_user_cpu_ns);
+    narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
     // Per-task-own-stack model: flips a trap/syscall from a user task onto that
     // task's OWN kernel stack with preemption via a clean kernel_switch
     // (try_preempt_user), retiring the longjmp-out-of-trap-handler path.

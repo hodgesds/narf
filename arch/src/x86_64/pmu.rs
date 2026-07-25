@@ -25,7 +25,7 @@
 #![cfg(target_arch = "x86_64")]
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use crate::x86_64::cpuid::cpuid;
 use crate::x86_64::msr::{rdmsr, wrmsr_or_gp};
@@ -62,8 +62,18 @@ pub const MSR_IA32_PERF_GLOBAL_OVF_CTRL: u32 = 0x390;
 pub const MSR_F15H_PERF_CTL_BASE: u32 = 0xC001_0200;
 /// Base address of AMD F15h+ extended counter MSRs.
 pub const MSR_F15H_PERF_CTR_BASE: u32 = 0xC001_0201;
+/// AMD PerfMonV2 global overflow status/control bank.
+pub const MSR_AMD64_PERF_CNTR_GLOBAL_STATUS: u32 = 0xC000_0300;
+pub const MSR_AMD64_PERF_CNTR_GLOBAL_CTL: u32 = 0xC000_0301;
+pub const MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_CLR: u32 = 0xC000_0302;
 /// Number of GP counters on Family 17h/19h (CPUID ext 80000001 ECX:23).
 pub const AMD_F17H_NUM_GP_COUNTERS: u8 = 6;
+
+fn amd_perfmon_v2() -> bool {
+    // CPUID 0x80000022 EAX bit 0 enumerates PerfMonV2.
+    // SAFETY: the maximum extended leaf is checked first.
+    unsafe { cpuid(0x8000_0000, 0).0 >= 0x8000_0022 && cpuid(0x8000_0022, 0).0 & 1 != 0 }
+}
 
 /// Derive the AMD event-select MSR address for GP counter `idx`.
 ///
@@ -462,14 +472,18 @@ pub struct PmuCounter {
     pub event: PmuEvent,
     /// Vendor of the underlying backend (drives the MSR namespace).
     pub(crate) vendor: PmuVendor,
+    /// Logical CPU whose MSR bank owns this counter.
+    pub cpu: u16,
 }
 
 /// Per-slot in-use bitmap (bit N = counter N is allocated).
 /// Supports up to 8 GP counters; extend the type for more.
-static COUNTER_ALLOC_MASK: AtomicU8 = AtomicU8::new(0);
-static SAMPLE_ARMED_MASK: AtomicU8 = AtomicU8::new(0);
-static SAMPLE_PERIODS: [core::sync::atomic::AtomicU64; 8] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+static COUNTER_ALLOC_MASK: [AtomicU8; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU8::new(0) }; narf_lib::percpu::MAX_CPUS];
+static SAMPLE_ARMED_MASK: [AtomicU8; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU8::new(0) }; narf_lib::percpu::MAX_CPUS];
+static SAMPLE_PERIODS: [[AtomicU64; 8]; narf_lib::percpu::MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; 8] }; narf_lib::percpu::MAX_CPUS];
 
 fn sample_preload(width: u8, period: u64) -> Result<u64, PmuError> {
     if period == 0 || width == 0 || width >= 64 {
@@ -488,32 +502,53 @@ fn sample_preload(width: u8, period: u64) -> Result<u64, PmuError> {
 /// `Err(PmuError::NoFreeCounter)` when all slots are in use.
 ///
 /// # Safety
-/// Must be called at CPL = 0.  Not re-entrant from multiple CPUs
-/// (the allocation bitmap is global; use a per-CPU variant for SMP).
+/// Must be called at CPL = 0.
 pub unsafe fn alloc_counter(event: PmuEvent) -> Result<PmuCounter, PmuError> {
     let backend = detect().ok_or(PmuError::NoPmu)?;
-    // Find a free slot: lowest clear bit in the mask.
-    let mask = COUNTER_ALLOC_MASK.load(Ordering::Acquire);
-    let mut idx = None;
-    for i in 0..backend.n_counters {
-        if mask & (1 << i) == 0 {
-            idx = Some(i);
-            break;
+    let cpu = narf_lib::percpu::current_cpu();
+    let allocation = &COUNTER_ALLOC_MASK[cpu];
+    let idx = loop {
+        let mask = allocation.load(Ordering::Acquire);
+        let mut free = None;
+        for i in 0..backend.n_counters.min(8) {
+            if mask & (1 << i) == 0 {
+                free = Some(i);
+                break;
+            }
         }
-    }
-    let idx = idx.ok_or(PmuError::NoFreeCounter)?;
-    // Mark as allocated (single-CPU; no CAS needed at Stage 1).
-    COUNTER_ALLOC_MASK.fetch_or(1 << idx, Ordering::AcqRel);
+        let idx = free.ok_or(PmuError::NoFreeCounter)?;
+        if allocation
+            .compare_exchange_weak(mask, mask | (1 << idx), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break idx;
+        }
+    };
 
-    let sel = event_to_evtsel(event, backend.vendor)?;
+    let sel = match event_to_evtsel(event, backend.vendor) {
+        Ok(sel) => sel,
+        Err(error) => {
+            allocation.fetch_and(!(1 << idx), Ordering::AcqRel);
+            return Err(error);
+        }
+    };
     // Program the counter.
     // SAFETY: caller-asserted CPL=0; idx < n_counters verified above.
-    unsafe { program_counter(idx, sel, backend.vendor) };
+    unsafe {
+        match backend.vendor {
+            PmuVendor::Intel => write_general(idx, 0),
+            PmuVendor::Amd => {
+                let _ = wrmsr_or_gp(amd_ctr_msr(idx), 0);
+            }
+        }
+        program_counter(idx, sel, backend.vendor);
+    }
 
     Ok(PmuCounter {
         idx,
         event,
         vendor: backend.vendor,
+        cpu: cpu as u16,
     })
 }
 
@@ -532,6 +567,19 @@ pub unsafe fn read(counter: &PmuCounter) -> u64 {
     }
 }
 
+/// Events counted since the most recent sampling preload/reload.
+///
+/// # Safety
+/// Same current-CPU live-counter requirements as [`read`].
+pub unsafe fn sampling_residual(counter: &PmuCounter, period: u64) -> Result<u64, PmuError> {
+    let backend = detect().ok_or(PmuError::NoPmu)?;
+    let preload = sample_preload(backend.counter_width, period)?;
+    // SAFETY: forwarded caller contract.
+    let raw = unsafe { read(counter) };
+    let mask = (1u64 << backend.counter_width) - 1;
+    Ok(raw.wrapping_sub(preload) & mask)
+}
+
 /// Arm a live counter for interrupt-on-overflow sampling.
 ///
 /// The counter is preloaded to `2^width - period` and its event-select
@@ -541,12 +589,11 @@ pub unsafe fn read(counter: &PmuCounter) -> u64 {
 /// # Safety
 /// CPL=0 and `counter` is a live allocation on the current CPU.
 pub unsafe fn arm_sampling(counter: &PmuCounter, period: u64) -> Result<(), PmuError> {
-    let backend = detect().ok_or(PmuError::NoPmu)?;
-    if backend.vendor != PmuVendor::Intel {
-        // AMD needs a vendor-specific overflow-status/ack path. Treating every
-        // armed slot as fired when LVT-PC runs would create false samples.
+    let cpu = narf_lib::percpu::current_cpu();
+    if counter.cpu as usize != cpu {
         return Err(PmuError::UnsupportedEvent);
     }
+    let backend = detect().ok_or(PmuError::NoPmu)?;
     let preload = sample_preload(backend.counter_width, period)?;
     let mut sel = event_to_evtsel(counter.event, counter.vendor)?;
     sel.apic_int = true;
@@ -562,15 +609,16 @@ pub unsafe fn arm_sampling(counter: &PmuCounter, period: u64) -> Result<(), PmuE
         }
         program_counter(counter.idx, sel, counter.vendor);
     }
-    SAMPLE_PERIODS[counter.idx as usize].store(period, Ordering::Release);
-    SAMPLE_ARMED_MASK.fetch_or(1 << counter.idx, Ordering::AcqRel);
+    SAMPLE_PERIODS[cpu][counter.idx as usize].store(period, Ordering::Release);
+    SAMPLE_ARMED_MASK[cpu].fetch_or(1 << counter.idx, Ordering::AcqRel);
     Ok(())
 }
 
 /// Acknowledge and re-arm counters that caused the current PMI.
 ///
-/// Returns a bitmask of sampled GP-counter slots. Only Intel is admitted until
-/// the AMD vendor-specific overflow-status and acknowledgement path exists.
+/// Returns a bitmask of sampled GP-counter slots. Intel uses architectural
+/// GLOBAL_STATUS/OVF_CTRL; AMD uses PerfMonV2 Status/StatusClr when enumerated
+/// and the legacy counter-sign transition on earlier extended-core PMUs.
 ///
 /// # Safety
 /// CPL=0, called from the current CPU's LVT-PC interrupt handler.
@@ -578,13 +626,32 @@ pub unsafe fn handle_sampling_overflow() -> u8 {
     let Some(backend) = detect() else {
         return 0;
     };
-    let armed = SAMPLE_ARMED_MASK.load(Ordering::Acquire);
+    let cpu = narf_lib::percpu::current_cpu();
+    let armed = SAMPLE_ARMED_MASK[cpu].load(Ordering::Acquire);
     let fired = match backend.vendor {
         PmuVendor::Intel => {
             // SAFETY: architectural perfmon status MSR exists for this backend.
             (unsafe { rdmsr(MSR_IA32_PERF_GLOBAL_STATUS) } as u8) & armed
         }
-        PmuVendor::Amd => return 0,
+        PmuVendor::Amd if amd_perfmon_v2() => {
+            // SAFETY: PerfMonV2 enumerates the architectural AMD global bank.
+            (unsafe { rdmsr(MSR_AMD64_PERF_CNTR_GLOBAL_STATUS) } as u8) & armed
+        }
+        PmuVendor::Amd => {
+            // Legacy AMD PMUs expose overflow through the counter sign bit:
+            // a negative preload wraps into the non-negative half. This is the
+            // same predicate used by Linux before PerfMonV2.
+            let mut fired = 0;
+            let top = 1u64 << (backend.counter_width - 1);
+            for idx in 0..backend.n_counters.min(8) {
+                // SAFETY: idx is within the detected current-CPU PMC bank.
+                let value = unsafe { rdmsr(amd_ctr_msr(idx)) };
+                if armed & (1 << idx) != 0 && value & top == 0 {
+                    fired |= 1 << idx;
+                }
+            }
+            fired
+        }
     };
     if fired == 0 {
         return 0;
@@ -594,7 +661,7 @@ pub unsafe fn handle_sampling_overflow() -> u8 {
         if fired & (1 << idx) == 0 {
             continue;
         }
-        let period = SAMPLE_PERIODS[idx as usize].load(Ordering::Acquire);
+        let period = SAMPLE_PERIODS[cpu][idx as usize].load(Ordering::Acquire);
         if period == 0 || period >= modulus {
             continue;
         }
@@ -606,17 +673,27 @@ pub unsafe fn handle_sampling_overflow() -> u8 {
             }
         }
     }
-    if backend.vendor == PmuVendor::Intel {
-        // SAFETY: clear exactly the GP overflow flags handled above.
-        unsafe { clear_overflow(fired as u32, 0) };
+    match backend.vendor {
+        PmuVendor::Intel => {
+            // SAFETY: clear exactly the GP overflow flags handled above.
+            unsafe { clear_overflow(fired as u32, 0) };
+        }
+        PmuVendor::Amd if amd_perfmon_v2() => {
+            // PerfCntrGlobalStatus is read-only; StatusClr is W1C.
+            let _ = wrmsr_or_gp(MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_CLR, fired as u64);
+        }
+        PmuVendor::Amd => {}
     }
     fired
 }
 
 /// Remove a counter from the PMI re-arm set before releasing it.
 pub fn disarm_sampling(counter: &PmuCounter) {
-    SAMPLE_ARMED_MASK.fetch_and(!(1 << counter.idx), Ordering::AcqRel);
-    SAMPLE_PERIODS[counter.idx as usize].store(0, Ordering::Release);
+    let cpu = narf_lib::percpu::current_cpu();
+    if counter.cpu as usize == cpu {
+        SAMPLE_ARMED_MASK[cpu].fetch_and(!(1 << counter.idx), Ordering::AcqRel);
+        SAMPLE_PERIODS[cpu][counter.idx as usize].store(0, Ordering::Release);
+    }
 }
 
 /// Disable interrupt generation for a sampled counter while retaining the
@@ -638,6 +715,8 @@ pub unsafe fn pause_sampling(counter: &PmuCounter) -> Result<(), PmuError> {
 /// # Safety
 /// CPL = 0; `counter` must be a value from `alloc_counter`.
 pub unsafe fn release(counter: PmuCounter) {
+    let cpu = narf_lib::percpu::current_cpu();
+    debug_assert_eq!(counter.cpu as usize, cpu);
     disarm_sampling(&counter);
     // Write 0 to the event-select MSR to disable the counter.
     // wrmsr_or_gp is safe (probe-armed); no inner unsafe block needed.
@@ -646,11 +725,16 @@ pub unsafe fn release(counter: PmuCounter) {
             let _ = wrmsr_or_gp(MSR_IA32_PERFEVTSEL_BASE + counter.idx as u32, 0);
         }
         PmuVendor::Amd => {
+            if amd_perfmon_v2() {
+                // SAFETY: current-CPU PerfMonV2 global control bank.
+                let ctl = unsafe { rdmsr(MSR_AMD64_PERF_CNTR_GLOBAL_CTL) };
+                let _ = wrmsr_or_gp(MSR_AMD64_PERF_CNTR_GLOBAL_CTL, ctl & !(1 << counter.idx));
+            }
             let _ = wrmsr_or_gp(amd_ctl_msr(counter.idx), 0);
         }
     }
     // Clear allocation bit.
-    COUNTER_ALLOC_MASK.fetch_and(!(1 << counter.idx), Ordering::AcqRel);
+    COUNTER_ALLOC_MASK[cpu].fetch_and(!(1 << counter.idx), Ordering::AcqRel);
 }
 
 // ── Internal helpers ───────────────────────────────────────────────
@@ -711,6 +795,12 @@ unsafe fn program_counter(idx: u8, sel: PerfEvtSel, vendor: PmuVendor) {
         }
         PmuVendor::Amd => {
             let _ = wrmsr_or_gp(amd_ctl_msr(idx), encoded);
+            if amd_perfmon_v2() {
+                // PerfMonV2 gates each programmed PMC through GlobalCtl.
+                // SAFETY: the enumerated global-control MSR is current-CPU.
+                let ctl = unsafe { rdmsr(MSR_AMD64_PERF_CNTR_GLOBAL_CTL) };
+                let _ = wrmsr_or_gp(MSR_AMD64_PERF_CNTR_GLOBAL_CTL, ctl | (1 << idx));
+            }
         }
     }
 }
