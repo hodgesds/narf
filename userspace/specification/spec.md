@@ -167,6 +167,16 @@ features fail explicitly. The adapter must not synthesize plausible values
 for an unavailable hardware event. The audited command matrix and remaining
 gaps live in `observability/PERF_LINUX_COMPAT_AUDIT.md`.
 
+### 3.2 Shared file-mapping lifetime
+
+A successful file/device-backed `MAP_SHARED` mapping retains an
+`Arc<dyn FileOps>` independently of the descriptor table. Closing the fd does
+not invalidate mapped frames. The owner reference follows process
+fork/clone, mirrors `MAP_FIXED` region splitting, and is released by
+`munmap(2)` or process group-dead teardown. This registry lives in userspace
+compatibility code so address-space regions do not gain a filesystem
+dependency.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

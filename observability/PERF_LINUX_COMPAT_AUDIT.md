@@ -35,7 +35,7 @@ over that authority; it is not a second PMU subsystem.
 | `perf stat -e '{cycles,instructions}'` | event groups and group leader reads | supported slice | Members are linked to the leader; group reads and group lifecycle ioctls cover the non-multiplexed counting case. |
 | `perf stat -a` | per-CPU events and online CPU discovery | partial | CPU validation exists; counters are not pinned or migrated per CPU. |
 | `perf stat -p PID` | task-scoped accounting | partial | PID validation exists; accounting is not scheduler-switched with the target. |
-| `perf record` | overflow sampling, mmap metadata/data ring, poll wakeups | unsupported | No `perf_event_mmap_page` producer or PMI-to-record path yet. |
+| `perf record` | overflow sampling, mmap metadata/data ring, poll wakeups | unsupported | Shared mapping owners now survive fd close/fork/munmap correctly; no `perf_event_mmap_page` producer or PMI-to-record path exists yet. |
 | `perf report` | perf.data parser, symbols, unwind | userspace-only after record | Kernel work is primarily `/proc`, build-id, and mmap metadata fidelity. |
 | `perf trace` | tracepoint PMU, tracefs event metadata | unsupported | NARF tracing rings are not yet projected as Linux tracepoints. |
 | `perf top` | sampling plus periodic display | unsupported | Blocked by the same ring/PMI work as `perf record`. |

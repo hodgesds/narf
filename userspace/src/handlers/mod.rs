@@ -4888,6 +4888,15 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     if flags & CLONE_VFORK != 0 {
         vfork_wait_register(child_visible_pid, parent_pid);
     }
+    // Publish inherited mapping owners before the child becomes runnable.
+    // Otherwise an immediate child exit can race the late copy and leave an
+    // owner reference keyed to a process that has already been reaped.
+    if !share_thread {
+        crate::mapped_file::fork_process(
+            task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
+            child_visible_pid,
+        );
+    }
 
     // CLONE_PIDFD: mint the shared exit-state BEFORE the child is spawned.
     // `pidfd::notify_exit` only flips entries that already exist in the
@@ -5648,6 +5657,7 @@ pub fn wait_init() {
     crate::user_task::register_process_exit_observer(on_child_exit);
     #[cfg(feature = "linux-compat")]
     crate::user_task::register_process_exit_observer(crate::perf_event::on_process_exit);
+    crate::user_task::register_process_exit_observer(crate::mapped_file::process_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
     // Abnormal slot drops (budget kill / revoked cap) must run the same

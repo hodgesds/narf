@@ -121,6 +121,10 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // `notify_task_exited` passes `this.process.pid.raw()` (ProcessId), so the
     // key here must be ProcessId, not TaskId.
     parent_of_set(child_pid.raw(), parent_pid);
+    crate::mapped_file::fork_process(
+        task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
+        child_pid.raw(),
+    );
     let proc = crate::UserProcess {
         pid: child_pid,
         address_space: child_as.clone(),

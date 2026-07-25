@@ -86,7 +86,9 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         // any region it overlaps so the non-replaced pages survive — the
         // dynamic linker overlays DSO segments onto its whole-file mapping
         // this way, and the ELF-header page between them must stay mapped.
-        let _ = as_ref.punch_fixed(VirtAddr::new(hint), len);
+        if as_ref.punch_fixed(VirtAddr::new(hint), len).is_ok() {
+            crate::mapped_file::punch_current(hint, len);
+        }
         hint
     } else {
         as_ref.reserve_mmap_va_aligned(len, page_size)
@@ -216,6 +218,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     ctx.set_return(SyscallReturn::invalid_op());
                     return;
                 }
+                crate::mapped_file::register_current(base, len, ops);
                 ctx.set_return(SyscallReturn::ok(base));
                 return;
             }
