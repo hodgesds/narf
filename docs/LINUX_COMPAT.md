@@ -321,9 +321,9 @@ syscall dispatch and asserts an output token. The case list is authoritative:
 | **pthreads** (`hello_pthread`) | runs | clone(2) + TLS + futex-based `pthread_join`, CI |
 | **multi-DSO dynamic linking + dlopen** (`dso_smoke`, per-DSO TLS `tls_smoke`) | runs | CI |
 | **redis** (unmodified `redis-server`) | runs, serves off-box | `cargo xtask redis-smoke` / `redis-bench` (RESP SET/GET over virtio-net), CI `redis-smoke` |
-| **glibc, static-PIE** (Debian 13) | loads + executes | manual; ELF/auxv/TLS ready. Runs under KVM; historically gated on AVX-512/XSAVE on some hosts |
+| **glibc, static-PIE** (Debian 13) | loads + executes | manual; ELF/auxv/TLS ready. Runs under KVM; AVX/AVX-512 state is saved when enabled in XCR0 |
 | **glibc, dynamic** (Debian 13 + systemd libs) | runs under KVM | manual; landed with DT_RELR opt-in, COW-private vDSO, `clone(stack=0)` fork |
-| **stress-ng** (musl dyn-PIE via alpine-chroot) | runs | `chroot_run` / probe harness; boots near-native under KVM. AVX-512 EVEX still `#UD`s where CPUID leaf7 ⊄ XCR0 |
+| **stress-ng** (musl dyn-PIE via alpine-chroot) | runs | `chroot_run` / probe harness; boots near-native under KVM; vector ISA selection follows the enabled XCR0 mask |
 | **systemd 257** | **in progress** | `--version` prints rc=0; `--test` fully inits the manager, loads all units, computes the boot transaction (`cgroup-all` build). As PID 1 it boots and reaches early init. Remaining: readlink-EINVAL on unit symlinks, teardown `rm_rf`. See `notes`/memory `narf-systemd-bringup` |
 | **OCI container demo** (`oci_smoke`) | runs | `xtask musl-demo` default (chroot rootfs isolation); nightly `--features container` adds a real UTS namespace (`nightly-oci.yml`) |
 | **BusyBox chroot** (`chroot_run`) | runs | chroot into an alpine rootfs; `verification/data/musl-demo/chroot_run_x86_64` |
@@ -435,9 +435,6 @@ FUSE and virtio-fs/9p give a userspace-filesystem escape hatch.
 - New mount API (`fsopen`/`fsconfig`/`fsmount`) is present but thin; `mount`
   fstype breadth is the real systemd gate (mount propagation flags are no-ops).
 - systemd as PID 1 is **in progress** (reaches early init, not a full boot).
-- AVX-512 EVEX instructions `#UD` on some hosts where the XCR0 group isn't
-  enabled despite CPUID leaf7 advertising the feature (affects stress-ng /
-  some glibc builds).
 - Namespace breadth is partial and mostly gated behind `container`; abstract
   AF_UNIX / rtnetlink / udev-event firing are noted as systemd gates.
 - No distro packaging; build from source.

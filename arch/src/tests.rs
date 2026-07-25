@@ -2628,25 +2628,56 @@ fn smoke_arch_xsave_avx512_group_all_or_none() -> TestResult {
 kernel_test_in!("arch/xsave", smoke_arch_xsave_avx512_group_all_or_none);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_arch_xsave_default_policy_is_saveable() -> TestResult {
+    use crate::x86_64::xsave;
+
+    let supported = xsave::XSAVE_X87
+        | xsave::XSAVE_SSE
+        | xsave::XSAVE_AVX
+        | xsave::XSAVE_AVX512_GROUP
+        | xsave::XSAVE_PKRU
+        | xsave::XSAVE_AMX_GROUP;
+    let selected = xsave::default_xcr0_mask(supported);
+    if selected & xsave::XSAVE_AMX_GROUP != 0 {
+        return TestResult::Fail("default XCR0 policy selected opt-in AMX state");
+    }
+    if selected & xsave::XSAVE_AVX512_GROUP != xsave::XSAVE_AVX512_GROUP {
+        return TestResult::Fail("complete AVX-512 group was not selected");
+    }
+
+    let partial = xsave::default_xcr0_mask(
+        xsave::XSAVE_X87 | xsave::XSAVE_SSE | xsave::XSAVE_AVX | xsave::XSAVE_AVX512_OPMASK,
+    );
+    if partial & xsave::XSAVE_AVX512_GROUP != 0 {
+        return TestResult::Fail("partial AVX-512 group was selected");
+    }
+    let no_sse =
+        xsave::default_xcr0_mask(xsave::XSAVE_X87 | xsave::XSAVE_AVX | xsave::XSAVE_AVX512_GROUP);
+    if no_sse != xsave::XSAVE_X87 {
+        return TestResult::Fail("AVX selected without its SSE dependency");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/xsave", smoke_arch_xsave_default_policy_is_saveable);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_arch_xsave_area_size_covers_avx512() -> TestResult {
-    // The standard XSAVE area (leaf 0xD sub-leaf 0 ECX) must cover the legacy
-    // FXSAVE region (512) whenever XSAVE exists, and grow past ~2KiB once the
-    // AVX-512 group is enabled (opmask 64B + ZMM_Hi256 512B + Hi16_ZMM 1024B on
-    // top of the 512B legacy + 64B header + 256B YMM_Hi128).
+    // Size the task buffer against the boot-selected XCR0 mask, not leaf
+    // 0xD.0:ECX (which includes disabled opt-in state such as AMX tile data).
     use crate::x86_64::xsave;
     let c = xsave::caps();
     if c.xcr0_supported == 0 {
         return TestResult::Skip("no XSAVE support (FXSAVE fallback host)");
     }
-    if c.area_size_xcr0 < 512 {
-        return TestResult::Fail("XSAVE area smaller than the FXSAVE minimum");
+    // SAFETY: boot enabled CR4.OSXSAVE before running kernel tests.
+    let enabled = unsafe { xsave::read_xcr0() };
+    let bytes = xsave::area_size_for_mask(enabled);
+    if bytes > xsave::FPU_AREA_SIZE {
+        return TestResult::Fail("enabled XSAVE state exceeds FPU_AREA_SIZE");
     }
-    if c.avx512 && c.area_size_xcr0 < 2048 {
-        return TestResult::Fail("AVX-512 enabled but XSAVE area < 2KiB");
-    }
-    // The per-task FPU buffer must be large enough for the advertised area.
-    if (c.area_size_xcr0 as usize) > xsave::FPU_AREA_SIZE {
-        return TestResult::Fail("XSAVE area exceeds FPU_AREA_SIZE");
+    if enabled & xsave::XSAVE_AMX_GROUP != 0 {
+        return TestResult::Fail("AMX must not be enabled without opt-in save areas");
     }
     TestResult::Pass
 }
@@ -2667,22 +2698,16 @@ struct AlignedFpuArea([u8; crate::x86_64::xsave::FPU_AREA_SIZE]);
 /// with NON-default control words, and mark both components present in the
 /// header so a subsequent `XRSTOR` actually loads them.
 ///
-/// Two subtleties this encodes, both learned the hard way (the values used
-/// to be the *init* defaults 0x037F / 0x1F80 with a zeroed header, which
-/// made the round-trip test pass for the wrong reason on plain-XSAVE hosts
-/// and fail on XSAVEC ones):
+/// Two subtleties this encodes, both learned the hard way:
 ///
 ///  1. `XSTATE_BV` (header byte 512) must flag x87 (bit 0) + SSE (bit 1),
 ///     or `XRSTOR` restores those components to their INIT state and
 ///     ignores the seeded legacy words entirely.
-///  2. The seeded words must DIFFER from the architectural init state
-///     (FCW 0x037F, MXCSR 0x1F80). `XSAVEC` (used on AVX-512 hosts) applies
-///     the init optimization: a component in its init state is neither
-///     written to the legacy region nor flagged in `XSTATE_BV`. Only a
-///     non-init component round-trips real bytes on every save path.
+///  2. The seeded words differ from the architectural init state
+///     (FCW 0x037F, MXCSR 0x1F80), proving bytes were restored rather than
+///     coincidentally reset to the same value.
 ///
-/// `XCOMP_BV` (byte 520) stays 0 → standard (non-compacted) layout, which
-/// `XRSTOR` accepts regardless of whether the paired save later used XSAVEC.
+/// `XCOMP_BV` (byte 520) stays 0 → standard (non-compacted) layout.
 fn init_reset_fpu_area(a: &mut AlignedFpuArea) {
     a.0.fill(0);
     // FCW 0x007F: precision-control = single (init is 64-bit, 0x037F).
@@ -2699,11 +2724,8 @@ fn init_reset_fpu_area(a: &mut AlignedFpuArea) {
 fn smoke_arch_xsave_fpu_reset_round_trip() -> TestResult {
     // fpu_restore → fpu_save must round-trip the x87 FCW and SSE MXCSR through
     // the CPU register file. The seeded control words are deliberately NON-init
-    // (see `init_reset_fpu_area`) so the save cannot be elided by XSAVEC's init
-    // optimization — on an AVX-512 host `fpu_save` uses XSAVEC, and an init
-    // component would be neither written nor flagged, leaving the readback
-    // buffer's legacy bytes zero. A non-init component writes real bytes on
-    // every save path (FXSAVE / XSAVE / XSAVEC), so reading them back is valid.
+    // (see `init_reset_fpu_area`) so the save cannot merely reproduce the
+    // architectural reset values.
     //
     // Non-destructive: the caller's live FPU state is saved first and restored
     // last, so running this smoke never corrupts the surrounding task's
@@ -2747,21 +2769,77 @@ fn smoke_arch_xsave_fpu_reset_round_trip() -> TestResult {
 kernel_test_in!("arch/xsave", smoke_arch_xsave_fpu_reset_round_trip);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_arch_xsave_ymm_round_trip() -> TestResult {
+    use crate::x86_64::xsave;
+
+    // SAFETY: boot enabled CR4.OSXSAVE before running kernel tests.
+    let enabled = unsafe { xsave::read_xcr0() };
+    if enabled & xsave::XSAVE_AVX == 0 {
+        return TestResult::Skip("AVX not enabled on this host");
+    }
+
+    let mut live = AlignedFpuArea([0u8; xsave::FPU_AREA_SIZE]);
+    let mut image = AlignedFpuArea([0u8; xsave::FPU_AREA_SIZE]);
+    let expected = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff, 0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d,
+        0x1e, 0x0f,
+    ];
+    let mut observed = [0u8; 32];
+
+    // Save the caller, load a value spanning both XMM0 and YMM0's upper half,
+    // snapshot it, clobber the register, restore the snapshot, and read the
+    // full register back. FXSAVE-only task switching would lose bytes 16..31.
+    // SAFETY: both FPU areas satisfy the size/alignment contract; XCR0 enables
+    // AVX; vmovdqu permits unaligned byte-array operands.
+    unsafe {
+        xsave::fpu_save(live.0.as_mut_ptr());
+        core::arch::asm!(
+            "vmovdqu ymm0, [{src}]",
+            src = in(reg) expected.as_ptr(),
+            out("ymm0") _,
+            options(nostack, preserves_flags),
+        );
+        xsave::fpu_save(image.0.as_mut_ptr());
+        core::arch::asm!(
+            "vpxor ymm0, ymm0, ymm0",
+            out("ymm0") _,
+            options(nomem, nostack, preserves_flags),
+        );
+        xsave::fpu_restore(image.0.as_ptr());
+        core::arch::asm!(
+            "vmovdqu [{dst}], ymm0",
+            dst = in(reg) observed.as_mut_ptr(),
+            options(nostack, preserves_flags),
+        );
+        xsave::fpu_restore(live.0.as_ptr());
+    }
+
+    if observed != expected {
+        return TestResult::Fail("YMM state was not preserved by XSAVE/XRSTOR");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/xsave", smoke_arch_xsave_ymm_round_trip);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_arch_xsave_avx512_evex_no_ud() -> TestResult {
     // When the AVX-512 XCR0 group is enabled, an EVEX-encoded instruction must
     // execute without #UD. TCG hosts that lack AVX-512 report caps().avx512 ==
     // false and skip. Non-destructive: the live FPU is saved around the zmm
     // clobber and restored afterward.
     use crate::x86_64::xsave;
-    let c = xsave::caps();
-    if !c.avx512 {
+    // SAFETY: boot enabled CR4.OSXSAVE before running kernel tests.
+    let enabled = unsafe { xsave::read_xcr0() };
+    if enabled & xsave::XSAVE_AVX512_GROUP != xsave::XSAVE_AVX512_GROUP {
         return TestResult::Skip("AVX-512 not enabled on this host");
     }
 
     let mut live = AlignedFpuArea([0u8; xsave::FPU_AREA_SIZE]);
     // SAFETY: buffer sized/aligned; CR4.OSXSAVE set. `vpxorq zmm0,zmm0,zmm0`
     // is EVEX-encoded and would #UD if AVX-512 were not enabled in XCR0 — the
-    // caps().avx512 gate above guarantees it is. zmm0 is clobbered; the live
+    // XCR0 gate above guarantees it is. zmm0 is clobbered; the live
     // FPU is saved before and restored after so no surrounding state is lost.
     unsafe {
         xsave::fpu_save(live.0.as_mut_ptr());

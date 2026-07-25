@@ -11,6 +11,7 @@
 
 use crate::x86_64::cpuid::cpuid;
 use crate::x86_64::msr::{rdmsr, wrmsr_or_gp};
+use core::sync::atomic::{compiler_fence, Ordering};
 
 pub const MSR_IA32_XSS: u32 = 0x0DA0;
 
@@ -34,6 +35,13 @@ pub const XSAVE_AVX512_GROUP: u64 = XSAVE_AVX512_OPMASK | XSAVE_AVX512_ZMM_HI | 
 
 // AMX group: tilecfg + tiledata.
 pub const XSAVE_AMX_GROUP: u64 = XSAVE_AMX_TILECFG | XSAVE_AMX_TILEDATA;
+
+/// Components enabled for ordinary tasks at boot. AMX is deliberately
+/// excluded: its tile-data component is larger than the fixed per-task save
+/// area on current CPUs and Linux treats it as opt-in via
+/// `ARCH_REQ_XCOMP_PERM`, rather than enabling it for every process.
+pub const DEFAULT_USER_COMPONENTS: u64 =
+    XSAVE_X87 | XSAVE_SSE | XSAVE_AVX | XSAVE_AVX512_GROUP | XSAVE_PKRU;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct XsaveCaps {
@@ -93,7 +101,8 @@ pub fn caps() -> XsaveCaps {
 pub unsafe fn read_xcr0() -> u64 {
     let lo: u32;
     let hi: u32;
-    // SAFETY: caller-asserted.
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller asserts CR4.OSXSAVE is enabled.
     unsafe {
         core::arch::asm!(
             "xgetbv",
@@ -103,6 +112,7 @@ pub unsafe fn read_xcr0() -> u64 {
             options(nomem, nostack, preserves_flags),
         );
     }
+    compiler_fence(Ordering::SeqCst);
     ((hi as u64) << 32) | lo as u64
 }
 
@@ -114,7 +124,8 @@ pub unsafe fn read_xcr0() -> u64 {
 pub unsafe fn write_xcr0(v: u64) {
     let lo = v as u32;
     let hi = (v >> 32) as u32;
-    // SAFETY: caller-asserted.
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller asserts CR4.OSXSAVE is enabled and `v` is supported.
     unsafe {
         core::arch::asm!(
             "xsetbv",
@@ -124,6 +135,7 @@ pub unsafe fn write_xcr0(v: u64) {
             options(nomem, nostack, preserves_flags),
         );
     }
+    compiler_fence(Ordering::SeqCst);
 }
 
 /// Read `IA32_XSS`.
@@ -150,30 +162,68 @@ pub unsafe fn write_xss(v: u64) {
     let _ = wrmsr_or_gp(MSR_IA32_XSS, v & c.xss_supported);
 }
 
-/// Default boot policy: enable every "safe" user component the
-/// CPU advertises. AMX is included because the spec asserts the
-/// kernel's enable-once-then-inherit model — userspace doesn't
-/// need a separate ARCH_REQ_XCOMP_PERM dance.
+/// Return the default XCR0 mask for a supported-component bitmap.
+///
+/// AVX-512's three components are all-or-nothing. A malformed or virtualised
+/// CPUID bitmap exposing only part of the group must not produce an invalid
+/// XSETBV value.
+pub const fn default_xcr0_mask(supported: u64) -> u64 {
+    let mut mask = supported & DEFAULT_USER_COMPONENTS;
+    if mask & XSAVE_X87 == 0 {
+        return 0;
+    }
+    if mask & XSAVE_SSE == 0 {
+        mask &= !(XSAVE_AVX | XSAVE_AVX512_GROUP);
+    } else if mask & XSAVE_AVX == 0 || mask & XSAVE_AVX512_GROUP != XSAVE_AVX512_GROUP {
+        mask &= !XSAVE_AVX512_GROUP;
+    }
+    mask
+}
+
+/// Standard-format XSAVE bytes required for `mask`.
+///
+/// CPUID.(0Dh,n) gives the standard-format offset and size of component `n`.
+/// This must be computed for the *selected* mask: CPUID.(0Dh,0).ECX describes
+/// every supported user component and can therefore include an 8 KiB AMX
+/// tile-data area even when AMX is disabled in XCR0.
+pub fn area_size_for_mask(mask: u64) -> usize {
+    if mask == 0 {
+        return 0;
+    }
+    let mut bytes = 576usize; // 512-byte legacy region + 64-byte XSAVE header.
+    for component in 2..64 {
+        if mask & (1u64 << component) == 0 {
+            continue;
+        }
+        // SAFETY: CPUID is always legal; unsupported sub-leaves return zero.
+        let (size, offset, _, _) = unsafe { cpuid(0x0D, component as u32) };
+        bytes = bytes.max((offset as usize).saturating_add(size as usize));
+    }
+    bytes
+}
+
+/// Default boot policy: enable the ordinary user components that the CPU
+/// advertises and that NARF saves on every task switch. AMX remains disabled
+/// until an explicit per-process permission ABI and dynamically-sized save
+/// areas exist.
 ///
 /// # Safety
 /// CR4.OSXSAVE = 1.
 pub unsafe fn enable_default() {
     let c = caps();
-    let mut v = XSAVE_X87 | XSAVE_SSE;
-    if c.avx {
-        v |= XSAVE_AVX;
+    let mut v = default_xcr0_mask(c.xcr0_supported);
+    if area_size_for_mask(v) > FPU_AREA_SIZE {
+        // AVX-512 is optional and is the only default group large enough to
+        // push the image near the fixed-area limit. Preserve AVX/SSE rather
+        // than advertising state that task switching cannot save.
+        v &= !XSAVE_AVX512_GROUP;
     }
-    if c.avx512 {
-        v |= XSAVE_AVX512_GROUP;
+    if area_size_for_mask(v) > FPU_AREA_SIZE {
+        // Preserve the architectural x87/SSE baseline on an unusual virtual
+        // CPU with sparse component offsets. Software must observe XCR0
+        // before selecting AVX, just as on Linux.
+        v &= !(XSAVE_AVX | XSAVE_AVX512_GROUP | XSAVE_PKRU);
     }
-    if c.pkru {
-        v |= XSAVE_PKRU;
-    }
-    if c.amx {
-        v |= XSAVE_AMX_GROUP;
-    }
-    // Mask against actually-supported bits to be safe.
-    v &= c.xcr0_supported;
     // SAFETY: caller-asserted; v is supported subset.
     unsafe {
         write_xcr0(v);
@@ -254,11 +304,11 @@ pub unsafe fn xrstor(buf: *const u8, mask: u64) {
 // computation. `XSAVE`/`XRSTOR` with the boot-enabled `XCR0` mask covers the
 // full enabled state instead.
 
-/// Fixed per-task FPU save-area size. Must be ≥ the standard `XSAVE` area
-/// for the boot-enabled `XCR0` (CPUID leaf 0xD sub-leaf 0 ECX — ~2696 bytes
-/// for x87+SSE+AVX+AVX-512+PKRU) AND ≥ 512 for the `FXSAVE` fallback. 4096 is
-/// comfortably above any enabled-state area we advertise and keeps the area a
-/// single page-friendly, 64-byte-aligned block.
+/// Fixed per-task FPU save-area size. Must be at least the standard `XSAVE`
+/// area for the boot-selected XCR0 mask and at least 512 bytes for `FXSAVE`.
+/// Boot policy drops optional AVX-512 when the selected standard image would
+/// exceed this single-page, 64-byte-aligned block. AMX is never selected by
+/// default.
 pub const FPU_AREA_SIZE: usize = 4096;
 
 /// Boot-selected save mask. `0` ⇒ `XSAVE` unusable (no XSAVE CPU, or the area
@@ -266,13 +316,6 @@ pub const FPU_AREA_SIZE: usize = 4096;
 /// `XCR0` subset to `XSAVE`/`XRSTOR` (only the enabled components). Set once
 /// on the BSP at boot; the value is identical on every (homogeneous) CPU.
 static FPU_XSAVE_MASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// When [`FPU_XSAVE_MASK`] is non-zero, prefer `XSAVEC` (compacted) over plain
-/// `XSAVE` if the CPU advertises it. The compacted image is smaller and its
-/// `XCOMP_BV` bit-63 marker lets a single `XRSTOR` read either layout back, so
-/// this is safe to toggle without touching [`fpu_restore`]. Ignored in the
-/// `FXSAVE` fallback (mask == 0).
-static FPU_USE_XSAVEC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Decide the per-task FPU save method. Call ONCE at boot AFTER
 /// [`enable_default`] (which sets `XCR0`) and with `CR4.OSXSAVE` set. Selects
@@ -283,23 +326,17 @@ static FPU_USE_XSAVEC: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// # Safety
 /// `CR4.OSXSAVE = 1` (so `XGETBV` won't `#GP`).
 pub unsafe fn init_task_fpu() {
-    let c = caps();
-    if c.xcr0_supported != 0 && (c.area_size_xcr0 as usize) <= FPU_AREA_SIZE {
-        // Save/restore only the components actually enabled in XCR0.
-        // SAFETY: caller asserts CR4.OSXSAVE=1.
-        let mask = unsafe { read_xcr0() };
+    // Save/restore only the components actually enabled in XCR0.
+    // SAFETY: caller asserts CR4.OSXSAVE=1.
+    let mask = unsafe { read_xcr0() };
+    if mask != 0 && area_size_for_mask(mask) <= FPU_AREA_SIZE {
         FPU_XSAVE_MASK.store(mask, core::sync::atomic::Ordering::Release);
-        // Prefer the compacted format when available (smaller image; XRSTOR
-        // auto-detects it via XCOMP_BV bit 63).
-        FPU_USE_XSAVEC.store(c.xsavec, core::sync::atomic::Ordering::Release);
     }
 }
 
 /// Save the current CPU's FPU state into `buf` (≥ [`FPU_AREA_SIZE`] bytes,
-/// 64-byte aligned). Uses `XSAVEC` (compacted) when available, else plain
-/// `XSAVE`, when [`init_task_fpu`] selected an XSAVE mask; otherwise `FXSAVE`.
-/// [`fpu_restore`]'s `XRSTOR` auto-detects the compacted vs standard layout via
-/// the header's `XCOMP_BV` bit 63, so save and restore never disagree.
+/// 64-byte aligned). Uses standard-format `XSAVE` when [`init_task_fpu`]
+/// selected an XSAVE mask; otherwise `FXSAVE`.
 ///
 /// # Safety
 /// `buf` is a valid, correctly-sized, 64-byte-aligned FPU area.
@@ -307,14 +344,8 @@ pub unsafe fn init_task_fpu() {
 pub unsafe fn fpu_save(buf: *mut u8) {
     let mask = FPU_XSAVE_MASK.load(core::sync::atomic::Ordering::Acquire);
     if mask != 0 {
-        if FPU_USE_XSAVEC.load(core::sync::atomic::Ordering::Acquire) {
-            // SAFETY: xsavec advertised (else the flag is false); buf
-            // sized/aligned per caller; mask ⊆ enabled XCR0.
-            unsafe { xsavec(buf, mask) };
-        } else {
-            // SAFETY: buf sized/aligned per caller; mask ⊆ enabled XCR0.
-            unsafe { xsave(buf, mask) };
-        }
+        // SAFETY: buf sized/aligned per caller; mask ⊆ enabled XCR0.
+        unsafe { xsave(buf, mask) };
     } else {
         // SAFETY: buf ≥ 512 bytes, 16-byte aligned (64 ⊇ 16); CR4.OSFXSR set.
         unsafe {

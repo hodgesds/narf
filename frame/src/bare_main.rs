@@ -539,13 +539,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_arch::x86_64::xsave::init_task_fpu();
 
             let c = narf_arch::x86_64::xsave::caps();
+            let enabled = narf_arch::x86_64::xsave::read_xcr0();
             let _ = core::fmt::Write::write_fmt(
                 &mut console::Writer,
                 core::format_args!(
-                    "  xsave: xcr0_supp={:x} avx={} avx512={}\n",
+                    "  xsave: supported={:x} enabled={:x} avx={} avx512={}\n",
                     c.xcr0_supported,
-                    c.avx,
-                    c.avx512
+                    enabled,
+                    enabled & narf_arch::x86_64::xsave::XSAVE_AVX != 0,
+                    enabled & narf_arch::x86_64::xsave::XSAVE_AVX512_GROUP
+                        == narf_arch::x86_64::xsave::XSAVE_AVX512_GROUP
                 ),
             );
         }
