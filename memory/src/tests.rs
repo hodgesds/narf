@@ -1527,6 +1527,27 @@ fn smoke_frame_alloc_per_node_distribution() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_frame_alloc_per_node_distribution);
 
+fn smoke_numa_allocation_stats_advance() -> TestResult {
+    let before = crate::numa_node_stats(0);
+    let frame = match crate::alloc_frame_on_strict(0) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Skip("node 0 strict allocation unavailable"),
+    };
+    let after = crate::numa_node_stats(0);
+    crate::free_frame(frame);
+
+    if after.numa_hit != before.numa_hit.saturating_add(1) {
+        return TestResult::Fail("strict local allocation did not increment numa_hit");
+    }
+    let locality_before = before.local_node.saturating_add(before.other_node);
+    let locality_after = after.local_node.saturating_add(after.other_node);
+    if locality_after != locality_before.saturating_add(1) {
+        return TestResult::Fail("allocation did not increment a locality counter");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_numa_allocation_stats_advance);
+
 fn smoke_memory_address_space_materialize() -> TestResult {
     // Full flow: new_for_user allocates a fresh root, map_region
     // records a region, materialize walks the region and installs

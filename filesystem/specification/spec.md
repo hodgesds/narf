@@ -102,6 +102,9 @@ and is pushed into the scheduler's per-task allowed-node table on attach
 and every local policy update. Empty requests inherit the parent; an
 explicit request with an empty intersection is rejected.
 
+`/proc/numastat` exposes live per-node allocation events supplied by
+`memory/`: hit, miss, foreign, interleave-hit, local, and other counters.
+
 ### 3.4 Directory operations
 
 ```rust

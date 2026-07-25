@@ -188,11 +188,19 @@ pub fn alloc_frame_with(policy: Mempolicy, local: usize) -> Result<PhysFrame, Fr
                 policy.nodemask & allowed
             };
             let node = interleave_pick(mask);
-            if unconstrained {
+            let result = if unconstrained {
                 frame::alloc_frame_on(node)
             } else {
                 alloc_preferred_within(node, mask)
+            };
+            if let Ok(allocated) = result {
+                // SAFETY: the topology hook is provided by the kernel and
+                // allocation returned a valid physical frame.
+                if unsafe { frame::narf_phys_node(allocated.start_address().raw()) } == node {
+                    frame::account_interleave_hit(node, 1);
+                }
             }
+            result
         }
         MPOL_PREFERRED => {
             let preferred = policy.nodemask & allowed;
@@ -213,13 +221,13 @@ pub fn alloc_frame_with(policy: Mempolicy, local: usize) -> Result<PhysFrame, Fr
 /// nodes. Every attempt is strict so a cgroup hard boundary cannot spill.
 fn alloc_preferred_within(preferred: usize, allowed: u64) -> Result<PhysFrame, FrameAllocError> {
     if preferred < MAX_NUMA_NODES && (allowed >> preferred) & 1 != 0 {
-        if let Ok(frame) = frame::alloc_frame_on_strict(preferred) {
+        if let Ok(frame) = frame::alloc_frame_on_strict_for(preferred, preferred) {
             return Ok(frame);
         }
     }
     for node in 0..MAX_NUMA_NODES {
         if node != preferred && (allowed >> node) & 1 != 0 {
-            if let Ok(frame) = frame::alloc_frame_on_strict(node) {
+            if let Ok(frame) = frame::alloc_frame_on_strict_for(node, preferred) {
                 return Ok(frame);
             }
         }
@@ -261,8 +269,9 @@ fn alloc_bind(mask: u64, home_node: u32) -> Result<PhysFrame, FrameAllocError> {
             }
         }
     }
+    let preferred = candidates[0];
     for &node in &candidates[..count] {
-        if let Ok(f) = frame::alloc_frame_on_strict(node) {
+        if let Ok(f) = frame::alloc_frame_on_strict_for(node, preferred) {
             return Ok(f);
         }
     }

@@ -79,6 +79,9 @@ pub struct Mempolicy {
 pub fn mempolicy_set(policy: Mempolicy);
 pub fn mempolicy_clear();
 
+/// Monotonic Linux-compatible allocation-event snapshot for one NUMA node.
+pub fn numa_node_stats(node: usize) -> NumaNodeStats;
+
 impl AddressSpace {
     /// Replace one resident private page with equivalent backing from a
     /// target NUMA node, preserving bytes and permissions and completing

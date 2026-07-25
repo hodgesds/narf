@@ -41,6 +41,95 @@ pub const PAGE_SHIFT: u32 = 12;
 /// — kept independent so this crate doesn't pull in narf-acpi.
 pub const MAX_NUMA_NODES: usize = 16;
 
+/// Linux-compatible per-node NUMA allocation event counters.
+///
+/// Values count base pages, not allocation calls.  `numa_foreign` is
+/// attributed to the intended node; all other fields are attributed to
+/// the node that supplied the page.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct NumaNodeStats {
+    pub numa_hit: u64,
+    pub numa_miss: u64,
+    pub numa_foreign: u64,
+    pub interleave_hit: u64,
+    pub local_node: u64,
+    pub other_node: u64,
+}
+
+struct AtomicNumaNodeStats {
+    numa_hit: AtomicU64,
+    numa_miss: AtomicU64,
+    numa_foreign: AtomicU64,
+    interleave_hit: AtomicU64,
+    local_node: AtomicU64,
+    other_node: AtomicU64,
+}
+
+impl AtomicNumaNodeStats {
+    const fn new() -> Self {
+        Self {
+            numa_hit: AtomicU64::new(0),
+            numa_miss: AtomicU64::new(0),
+            numa_foreign: AtomicU64::new(0),
+            interleave_hit: AtomicU64::new(0),
+            local_node: AtomicU64::new(0),
+            other_node: AtomicU64::new(0),
+        }
+    }
+}
+
+static NUMA_STATS: [AtomicNumaNodeStats; MAX_NUMA_NODES] =
+    [const { AtomicNumaNodeStats::new() }; MAX_NUMA_NODES];
+
+/// Return a coherent-enough lock-free snapshot of one node's monotonic
+/// allocation counters. Individual fields may advance during the read.
+pub fn numa_node_stats(node: usize) -> NumaNodeStats {
+    let Some(s) = NUMA_STATS.get(node) else {
+        return NumaNodeStats::default();
+    };
+    NumaNodeStats {
+        numa_hit: s.numa_hit.load(Ordering::Relaxed),
+        numa_miss: s.numa_miss.load(Ordering::Relaxed),
+        numa_foreign: s.numa_foreign.load(Ordering::Relaxed),
+        interleave_hit: s.interleave_hit.load(Ordering::Relaxed),
+        local_node: s.local_node.load(Ordering::Relaxed),
+        other_node: s.other_node.load(Ordering::Relaxed),
+    }
+}
+
+fn account_numa_allocation(preferred: usize, actual: usize, pages: u64) {
+    let preferred = preferred.min(MAX_NUMA_NODES - 1);
+    let actual = actual.min(MAX_NUMA_NODES - 1);
+    if actual == preferred {
+        NUMA_STATS[actual]
+            .numa_hit
+            .fetch_add(pages, Ordering::Relaxed);
+    } else {
+        NUMA_STATS[actual]
+            .numa_miss
+            .fetch_add(pages, Ordering::Relaxed);
+        NUMA_STATS[preferred]
+            .numa_foreign
+            .fetch_add(pages, Ordering::Relaxed);
+    }
+    if actual == current_cpu_node().min(MAX_NUMA_NODES - 1) {
+        NUMA_STATS[actual]
+            .local_node
+            .fetch_add(pages, Ordering::Relaxed);
+    } else {
+        NUMA_STATS[actual]
+            .other_node
+            .fetch_add(pages, Ordering::Relaxed);
+    }
+}
+
+/// Record an interleave selection that was satisfied by its intended node.
+pub(crate) fn account_interleave_hit(node: usize, pages: u64) {
+    NUMA_STATS[node.min(MAX_NUMA_NODES - 1)]
+        .interleave_hit
+        .fetch_add(pages, Ordering::Relaxed);
+}
+
 /// A 4 KiB physical frame, identified by its starting physical address.
 ///
 /// The wrapper enforces page alignment at construction time and is
@@ -453,11 +542,21 @@ pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
 /// Used by `MPOL_BIND` enforcement, which must never spill outside
 /// the bound nodemask. Still applies the cgroup charge.
 pub fn alloc_frame_on_strict(node: usize) -> Result<PhysFrame, FrameAllocError> {
+    alloc_frame_on_strict_for(node, node)
+}
+
+/// Strict allocation from `node` while attributing hit/miss against
+/// `preferred`. Mempolicy uses this when a hard allowed mask requires
+/// explicit fallback attempts.
+pub(crate) fn alloc_frame_on_strict_for(
+    node: usize,
+    preferred: usize,
+) -> Result<PhysFrame, FrameAllocError> {
     #[cfg(feature = "cgroup")]
     if !crate::cgroup_charge::try_charge(PAGE_SIZE) {
         return Err(FrameAllocError::Exhausted);
     }
-    let r = buddy_alloc_frame_on_strict(node);
+    let r = buddy_alloc_frame_on_strict(node, preferred);
     #[cfg(feature = "cgroup")]
     if r.is_err() {
         crate::cgroup_charge::uncharge(PAGE_SIZE);
@@ -466,7 +565,10 @@ pub fn alloc_frame_on_strict(node: usize) -> Result<PhysFrame, FrameAllocError> 
 }
 
 /// Strict per-node buddy allocation: only `node`'s zone is consulted.
-fn buddy_alloc_frame_on_strict(node: usize) -> Result<PhysFrame, FrameAllocError> {
+fn buddy_alloc_frame_on_strict(
+    node: usize,
+    preferred: usize,
+) -> Result<PhysFrame, FrameAllocError> {
     let mut g = ALLOC.lock();
     if !g.initialised {
         return Err(FrameAllocError::Uninitialised);
@@ -478,7 +580,9 @@ fn buddy_alloc_frame_on_strict(node: usize) -> Result<PhysFrame, FrameAllocError
     } else {
         return Err(FrameAllocError::Exhausted);
     };
-    alloc_below_ceiling(&mut g.zones[zone]).ok_or(FrameAllocError::Exhausted)
+    let frame = alloc_below_ceiling(&mut g.zones[zone]).ok_or(FrameAllocError::Exhausted)?;
+    account_numa_allocation(preferred, zone, 1);
+    Ok(frame)
 }
 
 /// Core of `alloc_frame` / `alloc_frame_on` — does the cgroup charge +
@@ -535,11 +639,14 @@ fn buddy_alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
 
     if !g.numa_aware {
         // Pre-rebalance: everything's in zones[0].
-        return alloc_below_ceiling(&mut g.zones[0]).ok_or(FrameAllocError::Exhausted);
+        let frame = alloc_below_ceiling(&mut g.zones[0]).ok_or(FrameAllocError::Exhausted)?;
+        account_numa_allocation(node, 0, 1);
+        return Ok(frame);
     }
 
     let preferred = node.min(MAX_NUMA_NODES - 1);
     if let Some(f) = alloc_below_ceiling(&mut g.zones[preferred]) {
+        account_numa_allocation(preferred, preferred, 1);
         return Ok(f);
     }
 
@@ -551,6 +658,7 @@ fn buddy_alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
     let n = fallback_order(preferred, &mut order);
     for &i in &order[..n] {
         if let Some(f) = alloc_below_ceiling(&mut g.zones[i]) {
+            account_numa_allocation(preferred, i, 1);
             return Ok(f);
         }
     }
@@ -563,8 +671,10 @@ fn buddy_alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
     if !g.initialised {
         return Err(FrameAllocError::Uninitialised);
     }
-    for zone in g.zones.iter_mut() {
+    let preferred = current_cpu_node().min(MAX_NUMA_NODES - 1);
+    for (node, zone) in g.zones.iter_mut().enumerate() {
         if let Some(f) = alloc_below_ceiling(zone) {
+            account_numa_allocation(preferred, node, 1);
             return Ok(f);
         }
     }
@@ -610,16 +720,18 @@ fn alloc_pages_on_inner(node: usize, order: u8) -> Result<PhysFrame, FrameAllocE
         }
     };
     if let Some(no) = try_alloc(&mut g.zones[zone_idx]) {
+        account_numa_allocation(preferred, zone_idx, 1u64 << order);
         return Ok(buddy::frame_from_no(no));
     }
     if !g.numa_aware {
         return Err(FrameAllocError::Exhausted);
     }
     // Nearest-first cross-node fallback (see buddy_alloc_frame_on).
-    let mut order = [0usize; MAX_NUMA_NODES];
-    let n = fallback_order(preferred, &mut order);
-    for &i in &order[..n] {
+    let mut fallback_nodes = [0usize; MAX_NUMA_NODES];
+    let n = fallback_order(preferred, &mut fallback_nodes);
+    for &i in &fallback_nodes[..n] {
         if let Some(no) = try_alloc(&mut g.zones[i]) {
+            account_numa_allocation(preferred, i, 1u64 << order);
             return Ok(buddy::frame_from_no(no));
         }
     }

@@ -675,10 +675,8 @@ fn gen_buddyinfo() -> Vec<u8> {
 // ── /proc/numastat ───────────────────────────────────────────────────
 //
 // Linux: the global /proc/numastat mirrors per-node hit/miss/foreign
-// counters numactl reports. NARF doesn't track allocation-attribution
-// counters yet, so we emit a well-formed table keyed by the live NUMA
-// nodes (one column per online node) with zeroed counters. The column
-// header + row labels are the load-bearing shape userspace tools parse.
+// allocation counters numactl reports. The column header + row labels
+// are the load-bearing shape userspace tools parse.
 
 fn gen_numastat() -> Vec<u8> {
     let mut s = String::new();
@@ -692,17 +690,18 @@ fn gen_numastat() -> Vec<u8> {
         let _ = write!(s, "{:>16}", col);
     }
     let _ = writeln!(s);
-    for label in [
-        "numa_hit",
-        "numa_miss",
-        "numa_foreign",
-        "interleave_hit",
-        "local_node",
-        "other_node",
-    ] {
+    let rows: [(&str, fn(narf_memory::NumaNodeStats) -> u64); 6] = [
+        ("numa_hit", |v| v.numa_hit),
+        ("numa_miss", |v| v.numa_miss),
+        ("numa_foreign", |v| v.numa_foreign),
+        ("interleave_hit", |v| v.interleave_hit),
+        ("local_node", |v| v.local_node),
+        ("other_node", |v| v.other_node),
+    ];
+    for (label, value) in rows {
         let _ = write!(s, "{:<16}", label);
-        for _ in 0..nodes {
-            let _ = write!(s, "{:>16}", 0u64);
+        for node in 0..nodes {
+            let _ = write!(s, "{:>16}", value(narf_memory::numa_node_stats(node)));
         }
         let _ = writeln!(s);
     }
@@ -1097,6 +1096,42 @@ fn smoke_interrupts_header_matches_cpu_count() -> TestResult {
 kernel_test_in!(
     "filesystem/procfs/aggregate",
     smoke_interrupts_header_matches_cpu_count
+);
+
+/// /proc/numastat: standard rows are present and reflect live allocation
+/// events rather than a permanently zero-filled compatibility shell.
+fn smoke_numastat_has_live_counters() -> TestResult {
+    let body = gen_numastat();
+    let text = match String::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("numastat not utf-8"),
+    };
+    for label in [
+        "numa_hit",
+        "numa_miss",
+        "numa_foreign",
+        "interleave_hit",
+        "local_node",
+        "other_node",
+    ] {
+        if !text.lines().any(|line| line.starts_with(label)) {
+            return TestResult::Fail("numastat missing standard row");
+        }
+    }
+    let any_live = text
+        .lines()
+        .skip(1)
+        .flat_map(|line| line.split_ascii_whitespace().skip(1))
+        .any(|field| field.parse::<u64>().is_ok_and(|value| value != 0));
+    if any_live {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("numastat counters remained all zero after boot")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/aggregate",
+    smoke_numastat_has_live_counters
 );
 
 /// /proc/softirqs: all 10 standard type names are present.
