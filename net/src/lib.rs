@@ -59,7 +59,10 @@ pub mod ipv6;
 pub mod ipv6_stack;
 pub mod mqtt;
 pub mod netfilter;
+pub mod netlink_audit;
+pub mod netlink_diag;
 pub mod netlink_generic;
+pub mod netlink_netfilter;
 pub mod netlink_route;
 pub mod pkt;
 pub mod pkt_coap;
@@ -90,8 +93,8 @@ pub mod udp_sock;
 pub mod wireguard;
 pub mod ws;
 pub use stack::{
-    AdminCap, AdminError, AdminHandle, AdminIpv4Route, AttachError, StackAttach, StackAttachReply,
-    StackDaemon,
+    AdminCap, AdminError, AdminHandle, AdminIpv4Route, AdminIpv6Route, AttachError, StackAttach,
+    StackAttachReply, StackDaemon,
 };
 
 mod dhcp_dns_e2e_tests;

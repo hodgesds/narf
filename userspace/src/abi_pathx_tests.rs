@@ -760,6 +760,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_getdents64_neg);
 // d_name[]; }` wire format: the d_type byte lives at the LAST byte of
 // each record (buf[off + d_reclen - 1]), with a NUL after the name.
 
+#[cfg(target_arch = "x86_64")]
 fn smoke_abi_pathx_getdents_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("a", b"x"), ("b", b"y")], || {
         let dfd = open_fd(b"/p2\0")?;
@@ -798,8 +799,10 @@ fn smoke_abi_pathx_getdents_pos() -> TestResult {
         Ok(())
     })
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_pathx_getdents_pos);
 
+#[cfg(target_arch = "x86_64")]
 fn smoke_abi_pathx_getdents_neg() -> TestResult {
     with_setup(|| {
         let mut buf = [0u8; 256];
@@ -813,6 +816,7 @@ fn smoke_abi_pathx_getdents_neg() -> TestResult {
         }
     })
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_pathx_getdents_neg);
 
 // ── listdir (NARF-native path_ptr, path_len, cursor, out, out_len) ──

@@ -88,6 +88,7 @@ fn full_reset(iface_name: &'static str, local_ip: [u8; 4], gateway: [u8; 4]) {
     route::__reset_for_test();
     arp_cache::__reset_for_test();
     crate::ifaddr::__reset_for_test();
+    crate::bypass::__reset_for_test();
     TX_CAPTURE.lock().clear();
 
     // Register the synthetic NIC — `SendFn` captures frames.
@@ -1234,7 +1235,11 @@ fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
 
     full_reset(IFACE, LOCAL_IP, GW);
 
-    // Init conntrack hooks (idempotent — re-registration is safe per source).
+    // Netfilter tests share a global hook table and intentionally leave it in
+    // whatever state their assertion required. Reset both the table and
+    // conntrack entries here so this end-to-end smoke does not depend on test
+    // link order (which changes with feature selection).
+    crate::netfilter::__reset_all_for_test();
     crate::netfilter::conntrack::register_default_hooks();
 
     let _listen_id = match listen(LOCAL_IP, SERVER_PORT, 4) {

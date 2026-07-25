@@ -87,8 +87,12 @@ pub fn set_mtu (admin: &AdminHandle, mtu: u32) -> Result<(), AdminError>;
 pub fn set_mac (admin: &AdminHandle, mac: [u8; 6]) -> Result<(), AdminError>;
 pub fn add_ipv4(admin: &AdminHandle, addr: [u8; 4], prefix: u8) -> Result<(), AdminError>;
 pub fn del_ipv4(admin: &AdminHandle, addr: [u8; 4], prefix: u8) -> Result<(), AdminError>;
+pub fn add_ipv6(admin: &AdminHandle, addr: [u8; 16], prefix: u8) -> Result<(), AdminError>;
+pub fn del_ipv6(admin: &AdminHandle, addr: [u8; 16], prefix: u8) -> Result<(), AdminError>;
 pub fn add_ipv4_route(admin: &AdminHandle, route: Ipv4Route) -> Result<(), AdminError>;
 pub fn del_ipv4_route(admin: &AdminHandle, route: Ipv4RouteKey) -> Result<(), AdminError>;
+pub fn add_ipv6_route(admin: &AdminHandle, route: Ipv6Route) -> Result<(), AdminError>;
+pub fn del_ipv6_route(admin: &AdminHandle, route: Ipv6RouteKey) -> Result<(), AdminError>;
 pub fn set_neighbor(admin: &AdminHandle, neighbor: Neighbor) -> Result<(), AdminError>;
 pub fn del_neighbor(admin: &AdminHandle, key: NeighborKey) -> Result<(), AdminError>;
 pub fn stats   (iface: &Cap<NetIface, Read>) -> IfaceStats;
@@ -125,7 +129,7 @@ RX. Used by `verification/` to test the contract without hardware.
 `NETLINK_ROUTE` provides Linux wire-compatible dumps for
 `RTM_GETLINK`, `RTM_GETADDR`, `RTM_GETROUTE`, `RTM_GETNEIGH`, and
 `RTM_GETRULE`, plus `RTM_GETQDISC`. Replies expose the interface registry,
-configured IPv4 addresses, IPv4 FIB, live IPv4 ARP plus IPv6 NDP neighbor
+configured IPv4 and IPv6 addresses, both IP-version FIBs, live IPv4 ARP plus IPv6 NDP neighbor
 caches, the canonical local/main/default IPv4 policy rules, and each
 interface's direct-ring `noqueue` discipline respectively,
 echo the request sequence, identify the kernel sender with port ID zero, carry
@@ -133,7 +137,7 @@ echo the request sequence, identify the kernel sender with port ID zero, carry
 `NLMSG_ERROR(-EOPNOTSUPP)`. Rtnetlink mutation requests are not an ambient
 administration path. A route socket must first be explicitly delegated an
 interface-bound `AdminHandle`; undelegated or cross-interface writes return
-`NLMSG_ERROR(-EPERM)`. `RTM_NEWLINK`/`RTM_SETLINK` and IPv4
+`NLMSG_ERROR(-EPERM)`. `RTM_NEWLINK`/`RTM_SETLINK` and IPv4 or IPv6
 `RTM_NEWADDR`/`RTM_DELADDR` plus `RTM_NEWROUTE`/`RTM_DELROUTE` invoke the
 typed operations in §3.3. `RTM_NEWNEIGH`/`RTM_DELNEIGH` update IPv4 ARP or
 IPv6 NDP state through the same interface-bound authority.
@@ -143,8 +147,9 @@ table. The Linux syscall surface never accepts raw admin-handle bytes.
 
 Successful mutations emit kernel-originated sequence-zero notifications to
 the Linux rtnetlink multicast group for the changed object (link, neighbor,
-IPv4 address, or IPv4 route). Only sockets subscribed through `nl_groups` or
-`NETLINK_ADD_MEMBERSHIP` receive them.
+IPv4/IPv6 address, or IPv4/IPv6 route). Address and route notifications use
+the family-specific IPv4 or IPv6 group. Only sockets subscribed through
+`nl_groups` or `NETLINK_ADD_MEMBERSHIP` receive them.
 
 Creation and replacement honor Linux `NLM_F_CREATE`, `NLM_F_EXCL`, and
 `NLM_F_REPLACE` semantics. Duplicate exclusive creates return `EEXIST`;
@@ -166,8 +171,9 @@ Non-dump `RTM_GETROUTE` performs the forwarding table's longest-prefix
 lookup for `RTA_DST`, returning the selected route as one non-multipart reply
 or `ENETUNREACH`.
 Address dumps honor `ifa_family` and `ifa_index`; route dumps honor
-`rtm_family` and `rtm_table`. A valid filter with no matching objects returns
-an empty dump terminated by `NLMSG_DONE`.
+`rtm_family` and `rtm_table`; neighbor and qdisc dumps honor their interface
+index selectors. A valid filter with no matching objects returns an empty dump
+terminated by `NLMSG_DONE`.
 
 Link dumps include Linux operational-state, carrier, qdisc, queue-length,
 broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero
@@ -180,17 +186,60 @@ Link dumps merge the legacy IPv4 registry with the canonical driver-backed
 registry by interface name, so frame-ring-only drivers appear exactly once.
 
 `NETLINK_GENERIC` publishes the mandatory `nlctrl` control family.
-`CTRL_CMD_GETFAMILY` supports name lookup and dump enumeration with
-Linux-compatible attributes; unknown family names return `ENOENT`. Multiple
+`CTRL_CMD_GETFAMILY` supports name or numeric-ID lookup and dump enumeration
+with Linux-compatible family, supported-operation, and multicast-group
+attributes; unknown families return `ENOENT`. Multiple
 aligned control requests may be batched in one datagram and retain independent
 sequence numbers.
+Subsystems may register additional generic-netlink families by stable ID and
+name, with immutable operation/group descriptors and a request callback.
+Duplicate IDs or names are rejected. Family callbacks return attribute streams;
+the netlink core owns generic headers, multipart termination, acknowledgements,
+and sequence/sender fields.
 Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
 same capped echo and diagnostic-TLV rules as rtnetlink.
+
+`NETLINK_SOCK_DIAG` accepts Linux `SOCK_DIAG_BY_FAMILY` /
+`inet_diag_req_v2` dumps for IPv4 TCP and UDP. It filters by the requested
+Linux socket-state mask and emits `inet_diag_msg` records from the same
+snapshots that back `/proc/net/tcp` and `/proc/net/udp`, followed by
+`NLMSG_DONE`. Aligned requests may be batched, their sequences remain
+independent, and `NLM_F_ACK` adds a zero-error acknowledgement after a
+successful query. Messages without `NLM_F_REQUEST` return `EINVAL`.
+Unsupported address families and transport protocols return `EOPNOTSUPP`.
+
+`NETLINK_NETFILTER` accepts IPv4 conntrack `IPCTNL_MSG_CT_GET` dumps and
+emits Linux nfnetlink `IPCTNL_MSG_CT_NEW` records with original/reply tuples,
+status, timeout, and flow ID from the canonical conntrack table. Dumps end
+with `NLMSG_DONE`; aligned requests may be batched and `NLM_F_ACK` produces a
+zero-error acknowledgement after a successful query. Non-dump point queries
+select an entry by `CTA_ID` or complete `CTA_TUPLE_ORIG`, return a
+non-multipart record, and report `ENOENT` when the canonical table has no
+match. Mutations and unsupported nfnetlink subsystems return `EOPNOTSUPP`;
+Linux netlink does not grant ambient filter/NAT authority.
+
+`NETLINK_AUDIT` reports a disabled zeroed `audit_status` for `AUDIT_GET` and
+an empty completed `AUDIT_LIST_RULES` dump. `AUDIT_SET` returns `EPERM`
+because Linux uid and capability bits do not confer NARF audit authority.
 
 AF_NETLINK sockets retain their bound `sockaddr_nl` port ID and group mask,
 support a connected kernel or userspace destination, auto-bind before the
 first send, and expose Linux `SOL_NETLINK` membership and feature-option
-round trips. Kernel-originated messages use port ID zero. A send may contain
+round trips. Group membership is not limited to the legacy 32-bit
+`sockaddr_nl.nl_groups` mask; `NETLINK_ADD_MEMBERSHIP`,
+`NETLINK_DROP_MEMBERSHIP`, and `NETLINK_LIST_MEMBERSHIPS` retain and report
+the full group-number bitmap. Explicit port IDs are unique within each netlink protocol.
+When `NETLINK_PKTINFO` is enabled, `recvmsg` emits a `SOL_NETLINK` /
+`NETLINK_PKTINFO` control message whose `nl_pktinfo.group` identifies the
+multicast group of the datagram actually dequeued (zero for unicast replies).
+`sendto` or connected send to a live userspace port delivers one datagram and
+reports the sender's port ID through `recvfrom`; a missing destination returns
+`ECONNREFUSED`. Userspace multicast is rejected because NARF does not infer
+Linux ambient broadcast authority; kernel protocol notifications still fan out
+to subscribed sockets. A protocol with no registered kernel responder retains
+user-to-user port-ID delivery, but a send to kernel port ID zero returns
+`ECONNREFUSED` instead of silently discarding the request. Kernel-originated
+messages use port ID zero. A send may contain
 multiple `NLMSG_ALIGN`-framed requests; replies preserve request order and
 sequence numbers. `NLM_F_ACK` requests receive `NLMSG_ERROR` with error zero
 after successful handling, while malformed framing fails with `EINVAL`.
