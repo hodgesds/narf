@@ -177,6 +177,8 @@ round trips. Kernel-originated messages use port ID zero. A send may contain
 multiple `NLMSG_ALIGN`-framed requests; replies preserve request order and
 sequence numbers. `NLM_F_ACK` requests receive `NLMSG_ERROR` with error zero
 after successful handling, while malformed framing fails with `EINVAL`.
+`SIOCINQ`/`FIONREAD` reports the complete size of the next queued route or
+generic-netlink datagram without consuming it.
 
 ## 4. Invariants & safety properties
 

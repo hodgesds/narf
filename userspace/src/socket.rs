@@ -1383,6 +1383,9 @@ impl SocketFile {
             SocketState::UnixConnected { rx, .. }
             | SocketState::InetConnected { rx, .. }
             | SocketState::Inet6Connected { rx, .. } => rx.len(),
+            SocketState::NetlinkRoute { replies } | SocketState::NetlinkGeneric { replies } => {
+                replies.front().map(Vec::len).unwrap_or(0)
+            }
             _ => 0,
         }
     }

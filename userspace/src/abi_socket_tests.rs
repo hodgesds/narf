@@ -1488,6 +1488,7 @@ const NETLINK_KOBJECT_UEVENT: u64 = 15;
 const SOL_NETLINK: u64 = 270;
 const NETLINK_ADD_MEMBERSHIP: u64 = 1;
 const NETLINK_EXT_ACK: u64 = 11;
+const SIOCINQ: u64 = 0x541B;
 /// rtnetlink message types (rtnetlink.h).
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
@@ -1559,6 +1560,19 @@ fn netlink_recv(fd: u64, buf: &mut [u8]) -> Option<i64> {
     )
 }
 
+fn netlink_inq(fd: u64) -> Result<u32, &'static str> {
+    let mut bytes = 0u32;
+    let result = call(
+        Syscall::Ioctl.raw(),
+        a2(fd, SIOCINQ, (&mut bytes as *mut u32) as u64),
+    )
+    .ok_or("ioctl status")?;
+    if result != 0 {
+        return Err("SIOCINQ did not return success");
+    }
+    Ok(bytes)
+}
+
 fn smoke_abi_netlink_route_socket_bind() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
@@ -1576,6 +1590,28 @@ fn smoke_abi_netlink_route_socket_bind() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_socket_bind);
+
+fn smoke_abi_netlink_route_siocinq() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETLINK, 40);
+        if netlink_send(fd, &req).ok_or("route send")? != req.len() as i64 {
+            return Err("RTM_GETLINK send failed");
+        }
+        let queued = netlink_inq(fd)?;
+        if queued < NLMSG_HDRLEN as u32 {
+            return Err("SIOCINQ did not report the queued route datagram");
+        }
+        let mut reply = [0u8; 512];
+        let received = netlink_recv(fd, &mut reply).ok_or("route recv")?;
+        if received != queued as i64 {
+            return Err("SIOCINQ route size disagreed with recv length");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_siocinq);
 
 fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
     with_setup(|| {
@@ -2121,8 +2157,15 @@ fn smoke_abi_netlink_generic_socket_open() -> TestResult {
         if netlink_send(fd, &req).ok_or("generic send status")? != req.len() as i64 {
             return Err("CTRL_CMD_GETFAMILY send failed");
         }
+        let queued = netlink_inq(fd)?;
+        if queued < 24 {
+            return Err("SIOCINQ did not report the generic-netlink reply");
+        }
         let mut reply = [0u8; 256];
         let n = netlink_recv(fd, &mut reply).ok_or("generic recv status")?;
+        if n != queued as i64 {
+            return Err("SIOCINQ generic-netlink size disagreed with recv length");
+        }
         if n < 24 || nlmsg_type_of(&reply) != 16 {
             return Err("generic netlink did not return GENL_ID_CTRL");
         }
