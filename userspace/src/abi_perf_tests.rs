@@ -531,6 +531,50 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             _ => return Err("perf_event_open accepted unknown read_format bits"),
         }
 
+        // Test 17: counting fds expose Linux's metadata page and a
+        // power-of-two data area. The same open-file description owns one
+        // stable set of frames for the mapping's lifetime.
+        let mmap_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(&stat_attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+        ) {
+            Some(f) if f >= 0 => f as u32,
+            _ => return Err("perf_event_open(mmap event) failed"),
+        };
+        let mmap_ops =
+            crate::fd::with_table(FAKE_TASK, |t| t.get(mmap_fd).map(|entry| entry.ops.clone()))
+                .flatten()
+                .ok_or("perf mmap fd was absent from the fd table")?;
+        let frames = mmap_ops
+            .mmap_frames(0, 3 * 4096)
+            .map_err(|_| "valid perf mmap layout was rejected")?;
+        if frames.len() != 3 {
+            return Err("perf mmap returned the wrong number of frames");
+        }
+        // SAFETY: the perf file owns these live, identity-mapped physical
+        // frames until mmap_ops is dropped. Linux's u64 metadata fields are
+        // naturally aligned within the first page.
+        let read_meta = |offset: usize| unsafe {
+            core::ptr::read_volatile((frames[0] as usize + offset) as *const u64)
+        };
+        if read_meta(1040) != 4096 || read_meta(1048) != 8192 {
+            return Err("perf mmap data_offset/data_size metadata is invalid");
+        }
+        if read_meta(1024) != 0 || read_meta(1032) != 0 {
+            return Err("new perf mmap ring did not start empty");
+        }
+        let repeated = mmap_ops
+            .mmap_frames(0, 3 * 4096)
+            .map_err(|_| "repeated perf mmap was rejected")?;
+        if repeated != frames {
+            return Err("repeated perf mmap returned different backing frames");
+        }
+        if mmap_ops.mmap_frames(0, 4 * 4096).is_ok() || mmap_ops.mmap_frames(4096, 3 * 4096).is_ok()
+        {
+            return Err("perf mmap accepted an invalid layout or offset");
+        }
+        let _ = call(Syscall::Close.raw(), a0(mmap_fd as u64));
+
         Ok(())
     })
 }

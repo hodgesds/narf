@@ -4,7 +4,7 @@ use crate::syscall::{SyscallReturn, TrapContext};
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -29,6 +29,14 @@ const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
 const PERF_EVENT_IOC_RESET: u32 = 0x2403;
 const PERF_EVENT_IOC_ID: u32 = 0x8008_2407;
 const PERF_IOC_FLAG_GROUP: usize = 1;
+const PERF_MMAP_PAGE_BYTES: usize = 4096;
+const PERF_MMAP_MAX_DATA_PAGES: usize = 256;
+const PERF_MMAP_LOCK_OFFSET: usize = 8;
+const PERF_MMAP_OFFSET_OFFSET: usize = 16;
+const PERF_MMAP_TIME_ENABLED_OFFSET: usize = 24;
+const PERF_MMAP_TIME_RUNNING_OFFSET: usize = 32;
+const PERF_MMAP_DATA_OFFSET_OFFSET: usize = 1040;
+const PERF_MMAP_DATA_SIZE_OFFSET: usize = 1048;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -69,12 +77,98 @@ struct PerfEventFile {
     enabled_at_ns: AtomicU64,
     time_enabled_ns: AtomicU64,
     registered: AtomicBool,
+    mmap_seq: AtomicU32,
+    mmap: IrqSafeSpinLock<Option<PerfMmap>>,
     group_members: IrqSafeSpinLock<Vec<Weak<dyn FileOps>>>,
     // A member keeps its leader's open-file description alive. The leader
     // holds only weak member links, so this cannot form a reference cycle.
     _group_leader: Option<Arc<dyn FileOps>>,
     #[cfg(target_arch = "x86_64")]
     pmu_counter: Option<narf_arch::x86_64::pmu::PmuCounter>,
+}
+
+struct PerfMmap {
+    frames: Vec<narf_memory::PhysFrame>,
+    len: usize,
+}
+
+impl PerfMmap {
+    fn allocate(len: usize) -> Result<Self, FsError> {
+        let pages = len / PERF_MMAP_PAGE_BYTES;
+        let data_pages = pages.saturating_sub(1);
+        if len < PERF_MMAP_PAGE_BYTES * 2
+            || len % PERF_MMAP_PAGE_BYTES != 0
+            || !data_pages.is_power_of_two()
+            || data_pages > PERF_MMAP_MAX_DATA_PAGES
+        {
+            return Err(FsError::InvalidData);
+        }
+        let mut frames = Vec::with_capacity(pages);
+        while frames.len() < pages {
+            let frame = match narf_memory::alloc_frame() {
+                Ok(frame) => frame,
+                Err(_) => {
+                    for frame in frames.drain(..) {
+                        narf_memory::free_frame(frame);
+                    }
+                    return Err(FsError::NoSpace);
+                }
+            };
+            // SAFETY: `frame` is freshly allocated, owned here, and identity
+            // mapped for the full 4 KiB page.
+            unsafe {
+                core::ptr::write_bytes(
+                    frame.start_address().raw() as *mut u8,
+                    0,
+                    PERF_MMAP_PAGE_BYTES,
+                );
+            }
+            frames.push(frame);
+        }
+        let mapping = Self { frames, len };
+        mapping.write_u64(PERF_MMAP_DATA_OFFSET_OFFSET, PERF_MMAP_PAGE_BYTES as u64);
+        mapping.write_u64(
+            PERF_MMAP_DATA_SIZE_OFFSET,
+            (len - PERF_MMAP_PAGE_BYTES) as u64,
+        );
+        Ok(mapping)
+    }
+
+    fn write_u32(&self, offset: usize, value: u32) {
+        // SAFETY: the metadata frame is a live identity-mapped 4 KiB frame and
+        // every call site uses a naturally aligned in-page u32 field.
+        unsafe {
+            core::ptr::write_volatile(
+                (self.frames[0].start_address().raw() as usize + offset) as *mut u32,
+                value,
+            );
+        }
+    }
+
+    fn write_u64(&self, offset: usize, value: u64) {
+        // SAFETY: same as write_u32, for naturally aligned u64 fields.
+        unsafe {
+            core::ptr::write_volatile(
+                (self.frames[0].start_address().raw() as usize + offset) as *mut u64,
+                value,
+            );
+        }
+    }
+
+    fn raw_frames(&self) -> Vec<u64> {
+        self.frames
+            .iter()
+            .map(|frame| frame.start_address().raw())
+            .collect()
+    }
+}
+
+impl Drop for PerfMmap {
+    fn drop(&mut self) {
+        for frame in self.frames.drain(..) {
+            narf_memory::free_frame(frame);
+        }
+    }
 }
 
 impl core::fmt::Debug for PerfEventFile {
@@ -124,6 +218,7 @@ impl PerfEventFile {
             self.enabled_at_ns
                 .store(narf_time::monotonic_ns(), Ordering::Release);
         }
+        self.publish_mmap_state();
     }
 
     fn disable(&self) {
@@ -137,6 +232,7 @@ impl PerfEventFile {
             self.time_enabled_ns
                 .fetch_add(now.saturating_sub(since), Ordering::AcqRel);
         }
+        self.publish_mmap_state();
     }
 
     fn reset(&self) {
@@ -147,6 +243,7 @@ impl PerfEventFile {
             self.enabled_at_ns
                 .store(narf_time::monotonic_ns(), Ordering::Release);
         }
+        self.publish_mmap_state();
     }
 
     fn snapshot(&self) -> (u64, u64) {
@@ -163,6 +260,24 @@ impl PerfEventFile {
             );
         }
         (value, time)
+    }
+
+    fn publish_mmap_state(&self) {
+        let (value, time) = self.snapshot();
+        let mapping = self.mmap.lock();
+        let Some(mapping) = mapping.as_ref() else {
+            return;
+        };
+        let sequence = self.mmap_seq.fetch_add(2, Ordering::Relaxed);
+        mapping.write_u32(PERF_MMAP_LOCK_OFFSET, sequence.wrapping_add(1));
+        core::sync::atomic::compiler_fence(Ordering::Release);
+        // `index == 0` (the zeroed default) tells userspace that direct RDPMC
+        // is unavailable; Linux then treats `offset` as the count snapshot.
+        mapping.write_u64(PERF_MMAP_OFFSET_OFFSET, value);
+        mapping.write_u64(PERF_MMAP_TIME_ENABLED_OFFSET, time);
+        mapping.write_u64(PERF_MMAP_TIME_RUNNING_OFFSET, time);
+        core::sync::atomic::compiler_fence(Ordering::Release);
+        mapping.write_u32(PERF_MMAP_LOCK_OFFSET, sequence.wrapping_add(2));
     }
 
     fn member_files(&self) -> Vec<Arc<dyn FileOps>> {
@@ -350,6 +465,29 @@ impl FileOps for PerfEventFile {
             }
             _ => Err(FsError::Unsupported),
         }
+    }
+
+    fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        if offset != 0 {
+            return Err(FsError::InvalidData);
+        }
+
+        let frames = {
+            let mut slot = self.mmap.lock();
+            if let Some(mapping) = slot.as_ref() {
+                if mapping.len != len {
+                    return Err(FsError::InvalidData);
+                }
+                mapping.raw_frames()
+            } else {
+                let mapping = PerfMmap::allocate(len)?;
+                let frames = mapping.raw_frames();
+                *slot = Some(mapping);
+                frames
+            }
+        };
+        self.publish_mmap_state();
+        Ok(frames)
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {
@@ -608,6 +746,8 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             enabled_at_ns: AtomicU64::new(0),
             time_enabled_ns: AtomicU64::new(0),
             registered: AtomicBool::new(false),
+            mmap_seq: AtomicU32::new(0),
+            mmap: IrqSafeSpinLock::new(None),
             group_members: IrqSafeSpinLock::new(Vec::new()),
             _group_leader: group_leader.clone(),
             #[cfg(target_arch = "x86_64")]

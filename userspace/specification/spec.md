@@ -162,7 +162,14 @@ observer stops task-targeted leader groups before the monitoring process reads
 their terminal values. This is a compatibility adapter over `observability/`
 PMU authority, not an independent counter subsystem.
 
-Unsupported sampling, scheduler-attribution, cgroup, filter, probe, and BPF
+A shared mapping of a counting fd exposes one Linux-shaped
+`perf_event_mmap_page` metadata page followed by a power-of-two data area.
+The metadata seqlock publishes the count and enabled/running times; `index`
+remains zero because direct userspace PMU reads are unavailable. The file
+owns all mapped frames, whose lifetime is retained by §3.2 even after fd
+close. No records are emitted into the data area yet.
+
+Sampling admission, scheduler-attribution, cgroup, filter, probe, and BPF
 features fail explicitly. The adapter must not synthesize plausible values
 for an unavailable hardware event. The audited command matrix and remaining
 gaps live in `observability/PERF_LINUX_COMPAT_AUDIT.md`.
