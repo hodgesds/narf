@@ -188,6 +188,13 @@ sequence numbers.
 Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
 same capped echo and diagnostic-TLV rules as rtnetlink.
 
+`NETLINK_SOCK_DIAG` accepts Linux `SOCK_DIAG_BY_FAMILY` /
+`inet_diag_req_v2` dumps for IPv4 TCP and UDP. It filters by the requested
+Linux socket-state mask and emits `inet_diag_msg` records from the same
+snapshots that back `/proc/net/tcp` and `/proc/net/udp`, followed by
+`NLMSG_DONE`. Unsupported address families and transport protocols return
+`EOPNOTSUPP`.
+
 AF_NETLINK sockets retain their bound `sockaddr_nl` port ID and group mask,
 support a connected kernel or userspace destination, auto-bind before the
 first send, and expose Linux `SOL_NETLINK` membership and feature-option

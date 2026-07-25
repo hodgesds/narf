@@ -62,6 +62,9 @@ pub const NETLINK_GET_STRICT_CHK: u32 = 12;
 /// `socket(AF_NETLINK, SOCK_RAW, 0)` and send RTM_GETLINK/RTM_GETADDR dump
 /// requests; we answer them from `narf_net::netlink_route::build_dump`.
 pub const NETLINK_ROUTE: u32 = 0;
+/// `NETLINK_SOCK_DIAG` — Linux socket-table diagnostics used by `ss`.
+/// IPv4 TCP and UDP dumps are sourced from the kernel stack snapshots.
+pub const NETLINK_SOCK_DIAG: u32 = 4;
 /// `NETLINK_AUDIT` — the kernel audit protocol. systemd PID 1's audit setup
 /// opens `socket(AF_NETLINK, SOCK_RAW, 9)`; we back it with the no-op sink
 /// (audit is disabled — messages are accepted and silently dropped).
@@ -604,6 +607,8 @@ enum SocketState {
     /// `NETLINK_GENERIC` control-family socket. Requests to `nlctrl` queue
     /// generic-netlink family discovery replies here.
     NetlinkGeneric { replies: VecDeque<Vec<u8>> },
+    /// `NETLINK_SOCK_DIAG` response queue for `inet_diag_req_v2` dumps.
+    NetlinkSockDiag { replies: VecDeque<Vec<u8>> },
 }
 
 /// One enqueued UDP-style datagram. Owns the payload bytes (UDP
@@ -654,6 +659,10 @@ impl SocketFile {
             }
         } else if domain == AF_NETLINK && protocol == NETLINK_GENERIC {
             SocketState::NetlinkGeneric {
+                replies: VecDeque::new(),
+            }
+        } else if domain == AF_NETLINK && protocol == NETLINK_SOCK_DIAG {
+            SocketState::NetlinkSockDiag {
                 replies: VecDeque::new(),
             }
         } else if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
@@ -1376,6 +1385,13 @@ impl FileOps for SocketFile {
                 }
                 bits
             }
+            SocketState::NetlinkSockDiag { replies } => {
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !replies.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
             // No-op sink (audit/netfilter/etc.): always writable (sends are
             // accepted + dropped), never readable (nothing is ever queued).
             SocketState::NetlinkSink => narf_filesystem::POLL_OUT,
@@ -1401,7 +1417,9 @@ impl SocketFile {
             SocketState::UnixConnected { rx, .. }
             | SocketState::InetConnected { rx, .. }
             | SocketState::Inet6Connected { rx, .. } => rx.len(),
-            SocketState::NetlinkRoute { replies } | SocketState::NetlinkGeneric { replies } => {
+            SocketState::NetlinkRoute { replies }
+            | SocketState::NetlinkGeneric { replies }
+            | SocketState::NetlinkSockDiag { replies } => {
                 replies.front().map(Vec::len).unwrap_or(0)
             }
             _ => 0,
@@ -1477,6 +1495,9 @@ impl SocketFile {
             (AF_NETLINK, _) if self.protocol == NETLINK_ROUTE => self.dispatch_netlink_route(op),
             (AF_NETLINK, _) if self.protocol == NETLINK_GENERIC => {
                 self.dispatch_netlink_generic(op)
+            }
+            (AF_NETLINK, _) if self.protocol == NETLINK_SOCK_DIAG => {
+                self.dispatch_netlink_sock_diag(op)
             }
             (AF_NETLINK, _) if self.protocol != NETLINK_KOBJECT_UEVENT => {
                 self.dispatch_netlink_sink(op)
@@ -1608,6 +1629,62 @@ impl SocketFile {
                     let mut state = self.state.lock();
                     match &mut *state {
                         SocketState::NetlinkGeneric { replies } => {
+                            if flags & MSG_PEEK != 0 {
+                                replies.front().cloned()
+                            } else {
+                                replies.pop_front()
+                            }
+                        }
+                        _ => return SocketOpResult::Err(SockError::InvalidArg),
+                    }
+                };
+                match message {
+                    Some(message) => {
+                        let n = buf.len().min(message.len());
+                        buf[..n].copy_from_slice(&message[..n]);
+                        let peer = Some(Self::netlink_sockaddr(0, 0));
+                        if n < message.len() {
+                            SocketOpResult::ReceivedTruncated {
+                                copied: n,
+                                full_len: message.len(),
+                                peer,
+                            }
+                        } else {
+                            SocketOpResult::Received { n, peer }
+                        }
+                    }
+                    None => SocketOpResult::Err(SockError::WouldBlock),
+                }
+            }
+            SocketOp::Shutdown { how: _ } => SocketOpResult::Ok(0),
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    fn dispatch_netlink_sock_diag(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        match op {
+            SocketOp::Bind { addr } => self.bind_netlink(&addr),
+            SocketOp::Connect { addr } => self.connect_netlink(&addr),
+            SocketOp::Send { buf, .. } => {
+                self.ensure_netlink_portid();
+                let replies = match narf_net::netlink_diag::build_replies(buf) {
+                    Ok(replies) => replies,
+                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                let mut state = self.state.lock();
+                match &mut *state {
+                    SocketState::NetlinkSockDiag { replies: queue } => queue.extend(replies),
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
+                }
+                drop(state);
+                narf_net::readiness::notify(0);
+                SocketOpResult::Ok(buf.len() as u64)
+            }
+            SocketOp::Recv { buf, flags } => {
+                let message = {
+                    let mut state = self.state.lock();
+                    match &mut *state {
+                        SocketState::NetlinkSockDiag { replies } => {
                             if flags & MSG_PEEK != 0 {
                                 replies.front().cloned()
                             } else {

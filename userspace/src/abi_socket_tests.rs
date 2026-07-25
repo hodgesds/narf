@@ -2177,6 +2177,7 @@ kernel_test_in!("syscall_abi", smoke_abi_netlink_uevent_recv);
 // glibc as the -1 sentinel (errno EPERM) → "Failed to open netlink, ignoring:
 // Operation not permitted". These smokes pin the no-op sink behaviour.
 const NETLINK_AUDIT: u64 = 9;
+const NETLINK_SOCK_DIAG: u64 = 4;
 const NETLINK_GENERIC: u64 = 16;
 
 fn smoke_abi_netlink_audit_socket_open_bind_send() -> TestResult {
@@ -2343,6 +2344,61 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_netlink_generic_extended_capped_error
 );
+
+fn smoke_abi_netlink_sock_diag_tcp_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_SOCK_DIAG)?;
+        let (addr, alen) = netlink_sockaddr(0);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("sock_diag bind status")?
+            != 0
+        {
+            return Err("bind(NETLINK_SOCK_DIAG) failed");
+        }
+
+        // nlmsghdr + inet_diag_req_v2. Request every IPv4 TCP state.
+        let mut request = [0u8; 72];
+        request[0..4].copy_from_slice(&72u32.to_ne_bytes());
+        request[4..6].copy_from_slice(&20u16.to_ne_bytes()); // SOCK_DIAG_BY_FAMILY
+        request[6..8].copy_from_slice(&0x301u16.to_ne_bytes()); // REQUEST | DUMP
+        request[8..12].copy_from_slice(&314u32.to_ne_bytes());
+        request[16] = 2; // AF_INET
+        request[17] = 6; // IPPROTO_TCP
+        request[20..24].copy_from_slice(&u32::MAX.to_ne_bytes());
+        if netlink_send(fd, &request).ok_or("sock_diag send status")? != request.len() as i64 {
+            return Err("send(NETLINK_SOCK_DIAG) did not consume request");
+        }
+
+        let mut saw_done = false;
+        for _ in 0..256 {
+            let mut reply = [0u8; 256];
+            let n = netlink_recv(fd, &mut reply).ok_or("sock_diag recv status")?;
+            if n < 16 {
+                return Err("short NETLINK_SOCK_DIAG reply");
+            }
+            let kind = nlmsg_type_of(&reply);
+            if kind == 3 {
+                saw_done = true;
+                break;
+            }
+            if kind != 20 || n < 88 {
+                return Err("NETLINK_SOCK_DIAG returned a malformed inet_diag_msg");
+            }
+            if u32::from_ne_bytes(reply[8..12].try_into().unwrap_or([0; 4])) != 314 {
+                return Err("NETLINK_SOCK_DIAG did not preserve request sequence");
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        if !saw_done {
+            return Err("NETLINK_SOCK_DIAG dump omitted NLMSG_DONE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_sock_diag_tcp_dump);
 
 /// True iff `needle` appears as a contiguous byte window in `hay`.
 fn window_contains(hay: &[u8], needle: &[u8]) -> bool {
