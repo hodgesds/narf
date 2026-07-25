@@ -71,6 +71,9 @@ pub struct FuseConnection {
     connected: core::sync::atomic::AtomicBool,
     /// True once FUSE_INIT has completed successfully.
     initialized: core::sync::atomic::AtomicBool,
+    negotiated_minor: AtomicU32,
+    negotiated_flags: AtomicU64,
+    max_write: AtomicU32,
 }
 
 impl core::fmt::Debug for FuseConnection {
@@ -102,6 +105,9 @@ impl FuseConnection {
             next_unique: AtomicU64::new(1),
             connected: core::sync::atomic::AtomicBool::new(true),
             initialized: core::sync::atomic::AtomicBool::new(false),
+            negotiated_minor: AtomicU32::new(0),
+            negotiated_flags: AtomicU64::new(0),
+            max_write: AtomicU32::new(4096),
         }
     }
 
@@ -112,6 +118,18 @@ impl FuseConnection {
     /// True until the daemon closes its `/dev/fuse` fd.
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Acquire)
+    }
+
+    pub fn negotiated_minor(&self) -> u32 {
+        self.negotiated_minor.load(Ordering::Acquire)
+    }
+
+    pub fn negotiated_flags(&self) -> u64 {
+        self.negotiated_flags.load(Ordering::Acquire)
+    }
+
+    pub fn max_write(&self) -> u32 {
+        self.max_write.load(Ordering::Acquire)
     }
 
     /// Mark the connection dead (daemon closed `/dev/fuse`). Any in-flight
@@ -1434,11 +1452,32 @@ impl FuseFs {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead: 0,
-            flags: 0,
+            flags: FUSE_SUPPORTED_INIT_FLAGS,
+            flags2: 0,
+            unused: [0; 11],
         });
         // FUSE_INIT is addressed to nodeid 0.
         let reply = self.conn.request(FuseOpcode::Init, 0, body).await?;
-        let out: FuseInitOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+        if reply.len() < 8 || reply.len() > core::mem::size_of::<FuseInitOut>() {
+            return Err(FsError::InvalidData);
+        }
+        let mut padded = [0u8; core::mem::size_of::<FuseInitOut>()];
+        padded[..reply.len()].copy_from_slice(&reply);
+        let out: FuseInitOut = pod_from_bytes(&padded).ok_or(FsError::InvalidData)?;
+        if out.major != FUSE_KERNEL_VERSION || out.minor < 5 {
+            return Err(FsError::Unsupported);
+        }
+        let minor = core::cmp::min(out.minor, FUSE_KERNEL_MINOR_VERSION);
+        let flags = (out.flags & FUSE_SUPPORTED_INIT_FLAGS) as u64
+            | if out.flags & FuseInitFlag::InitExt as u32 != 0 {
+                (out.flags2 as u64) << 32
+            } else {
+                0
+            };
+        let max_write = core::cmp::max(out.max_write, 4096);
+        self.conn.negotiated_minor.store(minor, Ordering::Release);
+        self.conn.negotiated_flags.store(flags, Ordering::Release);
+        self.conn.max_write.store(max_write, Ordering::Release);
         self.conn.initialized.store(true, Ordering::Release);
         Ok(out)
     }

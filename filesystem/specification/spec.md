@@ -204,6 +204,13 @@ cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that
 registration so the next readiness query re-polls the daemon. Poll
 requests never leave ordinary reply slots behind.
 
+`FUSE_INIT` uses the Linux 64-byte extended request/reply layout. The
+client advertises only implemented protocol features, accepts compatible
+short legacy replies by zero-extending them, intersects daemon flags with
+that set, and records the negotiated minor version and write limit on the
+connection. Major versions other than 7 and protocol minors before 7.5
+are rejected.
+
 Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with
 `FsError::InvalidData`; a disconnected daemon fails pending requests

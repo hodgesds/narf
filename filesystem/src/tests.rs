@@ -2704,6 +2704,12 @@ fn smoke_fs_fuse_struct_sizes() -> TestResult {
     if size_of::<FuseOutHeader>() != 16 {
         return TestResult::Fail("fuse_out_header != 16");
     }
+    if size_of::<FuseInitIn>() != 64 {
+        return TestResult::Fail("fuse_init_in != 64");
+    }
+    if size_of::<FuseInitOut>() != 64 {
+        return TestResult::Fail("fuse_init_out != 64");
+    }
     if size_of::<FuseAttr>() != 88 {
         return TestResult::Fail("fuse_attr != 88");
     }
@@ -2811,16 +2817,22 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     match opcode {
         // FUSE_INIT (26): echo version + a plausible negotiated reply.
         26 => {
+            let init: FuseInitIn = pod_from_bytes(body)?;
             let out = FuseInitOut {
                 major: FUSE_KERNEL_VERSION,
                 minor: FUSE_KERNEL_MINOR_VERSION,
                 max_readahead: 0,
-                flags: 0,
+                flags: init.flags,
                 max_background: 0,
                 congestion_threshold: 0,
-                max_write: 4096,
+                max_write: 128 * 1024,
                 time_gran: 1,
-                _reserved: [0; 9],
+                max_pages: 32,
+                map_alignment: 0,
+                flags2: init.flags2,
+                max_stack_depth: 0,
+                request_timeout: 0,
+                unused: [0; 11],
             };
             Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
         }
@@ -3140,7 +3152,13 @@ fn smoke_fs_fuse_end_to_end() -> TestResult {
     let _ = unmount_for_test_fuse("/fuse_e2e");
 
     match OUTCOME.load(Ordering::Relaxed) {
-        1 => TestResult::Pass,
+        1 if conn.negotiated_minor() == crate::fuse::FUSE_KERNEL_MINOR_VERSION
+            && conn.max_write() == 128 * 1024
+            && conn.negotiated_flags() & crate::fuse::FuseInitFlag::PosixLocks as u64 != 0 =>
+        {
+            TestResult::Pass
+        }
+        1 => TestResult::Fail("FUSE_INIT limits or flags not negotiated"),
         2 => TestResult::Fail("FUSE_INIT handshake failed"),
         3 => TestResult::Fail("FUSE_LOOKUP hello failed"),
         4 => TestResult::Fail("FUSE_READ hello failed"),

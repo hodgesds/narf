@@ -95,6 +95,8 @@ pub struct FuseInitIn {
     pub minor: u32,
     pub max_readahead: u32,
     pub flags: u32,
+    pub flags2: u32,
+    pub unused: [u32; 11],
 }
 
 /// FUSE_INIT response body.
@@ -109,7 +111,12 @@ pub struct FuseInitOut {
     pub congestion_threshold: u16,
     pub max_write: u32,
     pub time_gran: u32,
-    pub _reserved: [u32; 9],
+    pub max_pages: u16,
+    pub map_alignment: u16,
+    pub flags2: u32,
+    pub max_stack_depth: u32,
+    pub request_timeout: u16,
+    pub unused: [u16; 11],
 }
 
 /// FUSE protocol version NARF negotiates. 7.36 covers everything
@@ -126,8 +133,25 @@ pub enum FuseInitFlag {
     PosixLocks = 1 << 1,
     FileOps = 1 << 2,
     AtomicOTrunc = 1 << 3,
+    BigWrites = 1 << 5,
+    FlockLocks = 1 << 10,
+    AsyncDio = 1 << 15,
     WritebackCache = 1 << 16,
+    ParallelDirops = 1 << 18,
+    MaxPages = 1 << 22,
+    SetxattrExt = 1 << 29,
+    InitExt = 1 << 30,
 }
+
+pub const FUSE_SUPPORTED_INIT_FLAGS: u32 = FuseInitFlag::AsyncRead as u32
+    | FuseInitFlag::PosixLocks as u32
+    | FuseInitFlag::BigWrites as u32
+    | FuseInitFlag::FlockLocks as u32
+    | FuseInitFlag::AsyncDio as u32
+    | FuseInitFlag::ParallelDirops as u32
+    | FuseInitFlag::MaxPages as u32
+    | FuseInitFlag::SetxattrExt as u32
+    | FuseInitFlag::InitExt as u32;
 
 // ── Additional wire structs (Linux include/uapi/linux/fuse.h) ─────────
 //
