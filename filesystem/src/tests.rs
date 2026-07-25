@@ -2913,6 +2913,9 @@ fn fuse_reply(unique: u64, error: i32, body: &[u8]) -> alloc::vec::Vec<u8> {
 /// filesystem with one regular file "hello" (nodeid 2, contents "world")
 /// directly under the root (nodeid 1). Returns the encoded reply, or
 /// `None` for an opcode it doesn't model (which fails the request).
+static FUSE_FSYNCDIR_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static FUSE_FSYNCDIR_FLAGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     use crate::fuse::*;
     let hdr: FuseInHeader = pod_from_bytes(req)?;
@@ -3201,8 +3204,14 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
             };
             Some(fuse_reply(unique, 0, &pod_as_bytes(&entry)))
         }
+        30 => {
+            let input: FuseFsyncIn = pod_from_bytes(body)?;
+            FUSE_FSYNCDIR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            FUSE_FSYNCDIR_FLAGS.fetch_or(input.fsync_flags, core::sync::atomic::Ordering::Relaxed);
+            Some(fuse_reply(unique, 0, &[]))
+        }
         // Namespace mutations, durability, and handle releases acknowledge empty.
-        10 | 11 | 12 | 18 | 20 | 25 | 29 | 30 | 45 => Some(fuse_reply(unique, 0, &[])),
+        10 | 11 | 12 | 18 | 20 | 25 | 29 | 45 => Some(fuse_reply(unique, 0, &[])),
         // FUSE_FORGET (2): has no reply; drop it.
         2 => None,
         // Anything else → -ENOSYS.
@@ -3462,6 +3471,8 @@ fn smoke_fs_fuse_mutations() -> TestResult {
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
     OUTCOME.store(0, Ordering::Relaxed);
+    FUSE_FSYNCDIR_COUNT.store(0, Ordering::Relaxed);
+    FUSE_FSYNCDIR_FLAGS.store(0, Ordering::Relaxed);
 
     let conn = Arc::new(FuseConnection::new());
     let fs = Arc::new(FuseFs::new("fuse-rw", Arc::clone(&conn)));
@@ -3482,7 +3493,9 @@ fn smoke_fs_fuse_mutations() -> TestResult {
             }
         };
         let large_write = alloc::vec![0x5a; 128 * 1024 + 17];
-        if file.write(0, b"payload").await != Ok(7)
+        if root.fsync(false).await.is_err()
+            || root.fsync(true).await.is_err()
+            || file.write(0, b"payload").await != Ok(7)
             || file.write(7, &large_write).await != Ok(large_write.len())
             || file.truncate(3).await.is_err()
             || file.set_perms(0o600).await.is_err()
@@ -3574,7 +3587,12 @@ fn smoke_fs_fuse_mutations() -> TestResult {
 
     narf_scheduler::run_until_empty();
     match OUTCOME.load(Ordering::Relaxed) {
-        1 => TestResult::Pass,
+        1 if FUSE_FSYNCDIR_COUNT.load(Ordering::Relaxed) == 2
+            && FUSE_FSYNCDIR_FLAGS.load(Ordering::Relaxed) == crate::fuse::FUSE_FSYNC_FDATASYNC =>
+        {
+            TestResult::Pass
+        }
+        1 => TestResult::Fail("FUSE_FSYNCDIR requests were not observed"),
         2 => TestResult::Fail("FUSE_INIT failed"),
         3 => TestResult::Fail("FUSE_CREATE failed"),
         4 => TestResult::Fail("FUSE file mutation failed"),

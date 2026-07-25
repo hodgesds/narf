@@ -1304,6 +1304,46 @@ impl DirOps for FuseDir {
         })
     }
 
+    fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let open_reply = self
+                .conn
+                .request(
+                    FuseOpcode::OpenDir,
+                    self.nodeid,
+                    pod_as_bytes(&FuseOpenIn::default()),
+                )
+                .await?;
+            let open: FuseOpenOut = pod_from_bytes(&open_reply).ok_or(FsError::InvalidData)?;
+            let sync_result = self
+                .conn
+                .request(
+                    FuseOpcode::FsyncDir,
+                    self.nodeid,
+                    pod_as_bytes(&FuseFsyncIn {
+                        fh: open.fh,
+                        fsync_flags: if data_only { FUSE_FSYNC_FDATASYNC } else { 0 },
+                        padding: 0,
+                    }),
+                )
+                .await
+                .map(|_| ());
+            let release_result = self
+                .conn
+                .request(
+                    FuseOpcode::ReleaseDir,
+                    self.nodeid,
+                    pod_as_bytes(&FuseReleaseIn {
+                        fh: open.fh,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map(|_| ());
+            sync_result.and(release_result)
+        })
+    }
+
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         // Names live in daemon replies (owned), not `&'static str`; readdir
         // goes through `enumerate_async`.

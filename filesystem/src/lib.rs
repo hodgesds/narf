@@ -937,6 +937,12 @@ pub trait DirOps: Send + Sync {
     /// filesystems ignore it); memfs stores it so `dir_mode` reflects it.
     fn set_dir_mode(&self, _perms: u16) {}
 
+    /// Commit directory entries and metadata (`data_only` models
+    /// `fdatasync(2)` on an open directory descriptor).
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     // ── Stage-4 r/w surface ──────────────────────────────────────
 
     /// Remove the file entry named `name` from this directory.

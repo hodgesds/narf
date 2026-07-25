@@ -125,6 +125,11 @@ pub trait Filesystem: Send + Sync {
     async fn write(&self, node: NodeId, offset: u64, buf: &[u8])     -> Result<usize, FsError>;
     /* … */
 }
+
+pub trait DirOps: Send + Sync {
+    async fn fsync(&self, data_only: bool) -> Result<(), FsError>;
+    /* … */
+}
 ```
 
 Filesystems run in their own PKS/MTE domain (Stage 4) and communicate
@@ -170,7 +175,10 @@ the conservative synthetic default.
 `FileOps::flush` runs on descriptor close and `FileOps::fsync` backs
 Linux `fsync(2)`/`fdatasync(2)`. FUSE files translate these to
 `FUSE_FLUSH` and `FUSE_FSYNC`; non-FUSE implementations default to
-success when they have no volatile backing state.
+success when they have no volatile backing state. Directory descriptors
+forward the same operation through `DirOps`; FUSE opens a directory
+handle, issues `FUSE_FSYNCDIR` with the data-only flag when requested,
+and releases the handle.
 
 `DirOps::rename_to` and `DirOps::link_to` express atomic operations
 between two directories of one filesystem. FUSE translates the target
