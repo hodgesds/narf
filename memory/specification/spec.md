@@ -73,7 +73,8 @@ pub struct Mempolicy {
     pub nodemask: u64,
     /// Hard boundary supplied by cpuset.mems; allocation never spills out.
     pub allowed: u64,
-    /// MPOL_BIND distance anchor; u32::MAX selects the lowest masked node.
+    /// MPOL_BIND/MPOL_PREFERRED_MANY distance anchor; u32::MAX selects
+    /// the policy's default anchor.
     pub home_node: u32,
 }
 pub fn mempolicy_set(policy: Mempolicy);

@@ -74,18 +74,18 @@ kernel_test_in!(
     smoke_abi_mem2_set_mempolicy_bind_nodemask_pos
 );
 
-// ── SetMempolicy (238) — top flag bits boundary ──────────────────────
-// `mpol_mode_valid` masks MPOL_MODE_FLAGS (0xc000_0000) before the range
-// check, so a mode carrying MPOL_F_STATIC_NODES with a low value still
+// ── SetMempolicy (238) — Linux UAPI mode-flag boundary ───────────────
+// `mpol_mode_valid` masks MPOL_MODE_FLAGS (bits 15 and 14) before the
+// range check, so a mode carrying MPOL_F_STATIC_NODES with a low value still
 // validates. mode = MPOL_F_STATIC_NODES | MPOL_INTERLEAVE(3) → valid.
 
 fn smoke_abi_mem2_set_mempolicy_flagged_mode_pos() -> TestResult {
     with_setup(|| {
-        // 0x8000_0000 (MPOL_F_STATIC_NODES) | 3 (INTERLEAVE) → masked to 3 < MAX.
+        // 0x8000 (MPOL_F_STATIC_NODES) | 3 (INTERLEAVE).
         let mask = 1u64;
         match call(
             Syscall::SetMempolicy.raw(),
-            a1(0x8000_0003, &mask as *const u64 as u64),
+            a1(0x8003, &mask as *const u64 as u64),
         ) {
             Some(0) => Ok(()),
             Some(_) => Err("set_mempolicy(STATIC_NODES|INTERLEAVE) should return 0"),
@@ -105,7 +105,7 @@ fn smoke_abi_mem2_relative_nodes_tracks_cpuset() -> TestResult {
         let mask = 1u64; // relative ordinal 0 => first allowed node => node 1
         let set = call(
             Syscall::SetMempolicy.raw(),
-            a1(0x4000_0003, &mask as *const u64 as u64),
+            a1(0x4003, &mask as *const u64 as u64),
         );
         let mut node = -1i32;
         let get = call(

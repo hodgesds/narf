@@ -3244,8 +3244,10 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
 // flags which we preserve in the stored value so get_mempolicy reflects
 // them, but they don't affect allocation steering.
 
-const MPOL_MAX: u32 = 5; // DEFAULT/PREFERRED/BIND/INTERLEAVE/LOCAL
-const MPOL_MODE_FLAGS: u32 = 0xc000_0000; // MPOL_F_STATIC_NODES | _RELATIVE_NODES
+const MPOL_PREFERRED_MANY: u32 = 5;
+const MPOL_F_RELATIVE_NODES: u32 = 1 << 14;
+const MPOL_F_STATIC_NODES: u32 = 1 << 15;
+const MPOL_MODE_FLAGS: u32 = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES;
 
 // Online NUMA node count via a weak hook (userspace avoids a direct
 // narf-acpi dep to keep the kernel image under lld's orphan-placement
@@ -3329,12 +3331,10 @@ static MBIND_TABLE: narf_lib::sync::IrqSafeSpinLock<
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn mpol_mode_valid(mode: u32) -> bool {
-    (mode & !MPOL_MODE_FLAGS) < MPOL_MAX
+    matches!(mode & !MPOL_MODE_FLAGS, 0..=MPOL_PREFERRED_MANY)
 }
 
 fn mpol_policy_shape_valid(mode: u32, nodemask: u64) -> bool {
-    const MPOL_F_STATIC_NODES: u32 = 1 << 31;
-    const MPOL_F_RELATIVE_NODES: u32 = 1 << 30;
     let flags = mode & MPOL_MODE_FLAGS;
     if flags == (MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES) {
         return false;
@@ -3342,7 +3342,9 @@ fn mpol_policy_shape_valid(mode: u32, nodemask: u64) -> bool {
     match mode & !MPOL_MODE_FLAGS {
         narf_memory::MPOL_DEFAULT | narf_memory::MPOL_LOCAL => nodemask == 0 && flags == 0,
         narf_memory::MPOL_PREFERRED => nodemask != 0 || flags == 0,
-        narf_memory::MPOL_BIND | narf_memory::MPOL_INTERLEAVE => nodemask != 0,
+        narf_memory::MPOL_BIND | narf_memory::MPOL_INTERLEAVE | MPOL_PREFERRED_MANY => {
+            nodemask != 0
+        }
         _ => false,
     }
 }
@@ -3354,7 +3356,6 @@ fn mpol_policy_shape_valid(mode: u32, nodemask: u64) -> bool {
 /// like Linux `nodes_fold` + `nodes_onto`. An empty result after a cpuset
 /// rebind falls back to the allowed set.
 fn mpol_effective_nodemask(policy: StoredPolicy, allowed: u64) -> u64 {
-    const MPOL_F_RELATIVE_NODES: u32 = 1 << 30;
     let allowed = allowed & ((1u64 << narf_memory::FRAME_MAX_NUMA_NODES) - 1);
     if allowed == 0 || policy.nodemask == 0 {
         return policy.nodemask & allowed;
@@ -3391,7 +3392,6 @@ fn mpol_effective_nodemask(policy: StoredPolicy, allowed: u64) -> u64 {
 }
 
 fn mpol_initial_nodemask_valid(mode: u32, nodemask: u64, allowed: u64) -> bool {
-    const MPOL_F_RELATIVE_NODES: u32 = 1 << 30;
     nodemask == 0 || mode & MPOL_F_RELATIVE_NODES != 0 || nodemask & allowed != 0
 }
 
@@ -3478,6 +3478,28 @@ fn mempolicy_resolved_node(pol: narf_memory::Mempolicy) -> u32 {
             } else {
                 first_allowed
             }
+        }
+        x if x == narf_memory::MPOL_PREFERRED_MANY => {
+            let preferred = pol.nodemask & allowed;
+            let anchor = if pol.home_node == u32::MAX {
+                narf_memory::frame::local_node() as u32
+            } else {
+                pol.home_node
+            };
+            let mut best = first_allowed;
+            let mut best_distance = u32::MAX;
+            for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
+                if (preferred >> node) & 1 == 0 {
+                    continue;
+                }
+                // SAFETY: narf-frame provides the topology hook.
+                let distance = unsafe { narf_node_distance(anchor, node) };
+                if distance < best_distance || (distance == best_distance && node < best) {
+                    best = node;
+                    best_distance = distance;
+                }
+            }
+            best
         }
         x if x == narf_memory::MPOL_INTERLEAVE => {
             let interleave = pol.nodemask & allowed;

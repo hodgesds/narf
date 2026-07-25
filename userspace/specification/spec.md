@@ -72,11 +72,15 @@ queries fault in valid lazy pages and report their actual SRAT node.
 `MPOL_F_STATIC_NODES` preserves physical node identities across cpuset
 changes; `MPOL_F_RELATIVE_NODES` maps user-mask ordinals into the current
 `cpuset.mems.effective` set and folds oversized ordinals as Linux does.
+Both use Linux UAPI bits 15 and 14. `MPOL_PREFERRED_MANY` chooses the
+nearest member of its preferred set by SLIT distance and falls back only
+after preferred nodes are exhausted.
 `mbind(MPOL_MF_MOVE)` immediately conforms resident private pages in the
 range, `MPOL_MF_STRICT` reports remaining misplacement as `EIO`, and
 `MPOL_MF_MOVE_ALL` requires authority NARF does not grant ambiently.
 `set_mempolicy_home_node(2)` updates the distance anchor of existing
-MPOL_BIND ranges and returns `ENOENT` when no eligible policy overlaps.
+MPOL_BIND or MPOL_PREFERRED_MANY ranges and returns `ENOENT` when no
+eligible policy overlaps.
 Anonymous private `mmap(MAP_HUGETLB)` supports Linux's default/explicit
 2 MiB and explicit 1 GiB encodings when boot-reserved backing is available.
 Mappings use hardware PD/PDPT leaves on x86_64 and L2/L1 block descriptors

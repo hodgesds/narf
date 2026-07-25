@@ -115,7 +115,7 @@ pub use heap_backend::{
 pub use mempolicy::{
     active as mempolicy_active, alloc_frame_policied, clear_active as mempolicy_clear,
     set_active as mempolicy_set, Mempolicy, MPOL_BIND, MPOL_DEFAULT, MPOL_INTERLEAVE, MPOL_LOCAL,
-    MPOL_PREFERRED,
+    MPOL_PREFERRED, MPOL_PREFERRED_MANY,
 };
 pub use pager::{
     current_pager_name, install_pager, NoopPager, Pager, PagerAuthority, PagerError, SwapSlot,

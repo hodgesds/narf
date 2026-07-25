@@ -18,3 +18,7 @@ argument = "Huge mappings validate virtual/physical alignment before installing 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "Explicit NUMA syscalls and cpuset.memory_migrate replace authoritative base-page or complete huge-leaf backing and flush peer TLBs before old frames return to the buddy or huge pool. Failed huge-leaf replacement restores the original mapping and retains its ownership. Shared mappings are never moved without MOVE_ALL authority, which NARF rejects because it has no ambient CAP_SYS_NICE."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Correcting Linux mempolicy flag values and adding PREFERRED_MANY only changes the order in which frames are requested from existing per-node allocators. The cpuset allowed mask remains a hard boundary, and frame ownership, domain assignment, and mapping authority are unchanged."

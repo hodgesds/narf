@@ -16,6 +16,8 @@
 //!   (then nearest-by-distance fallback, the allocator's default).
 //! - `MPOL_PREFERRED` → the first node in the nodemask (or local when
 //!   the mask is empty), with nearest-by-distance fallback.
+//! - `MPOL_PREFERRED_MANY` → the nearest node in the nodemask relative
+//!   to the policy home node (or faulting CPU), then allowed fallbacks.
 //! - `MPOL_BIND` → restrict strictly to the nodemask, nearest-first;
 //!   only nodes in the mask are tried.
 //! - `MPOL_INTERLEAVE` → round-robin across the nodemask, advancing a
@@ -38,6 +40,7 @@ pub const MPOL_PREFERRED: u32 = 1;
 pub const MPOL_BIND: u32 = 2;
 pub const MPOL_INTERLEAVE: u32 = 3;
 pub const MPOL_LOCAL: u32 = 4;
+pub const MPOL_PREFERRED_MANY: u32 = 5;
 
 /// Max CPUs whose active policy we track. A CPU index at or above this
 /// falls back to slot 0 (correctness-preserving).
@@ -215,10 +218,48 @@ pub fn alloc_frame_with(policy: Mempolicy, local: usize) -> Result<PhysFrame, Fr
                 alloc_preferred_within(node, allowed)
             }
         }
+        MPOL_PREFERRED_MANY => {
+            let preferred = policy.nodemask & allowed;
+            let anchor = if policy.home_node == u32::MAX {
+                local
+            } else {
+                policy.home_node as usize
+            };
+            alloc_preferred_many(preferred, allowed, anchor)
+        }
         // DEFAULT and LOCAL mean local-first, but never outside cpuset.mems.
         _ if unconstrained => frame::alloc_frame_on(local),
         _ => alloc_preferred_within(local, allowed),
     }
+}
+
+fn alloc_preferred_many(
+    preferred: u64,
+    allowed: u64,
+    anchor: usize,
+) -> Result<PhysFrame, FrameAllocError> {
+    let mut candidates = [0usize; MAX_NUMA_NODES];
+    let mut count = 0usize;
+    for node in 0..MAX_NUMA_NODES {
+        if (preferred >> node) & 1 != 0 {
+            candidates[count] = node;
+            count += 1;
+        }
+    }
+    candidates[..count].sort_unstable_by_key(|&node| (frame::node_distance(anchor, node), node));
+    for &node in &candidates[..count] {
+        if let Ok(frame) = frame::alloc_frame_on_strict_for(node, node) {
+            return Ok(frame);
+        }
+    }
+    for node in 0..MAX_NUMA_NODES {
+        if (allowed >> node) & 1 != 0 && (preferred >> node) & 1 == 0 {
+            if let Ok(frame) = frame::alloc_frame_on_strict_for(node, anchor) {
+                return Ok(frame);
+            }
+        }
+    }
+    Err(FrameAllocError::Exhausted)
 }
 
 /// Allocate on `preferred` when allowed, then try the remaining allowed

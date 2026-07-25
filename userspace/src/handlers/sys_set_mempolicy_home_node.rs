@@ -2,7 +2,8 @@
 use super::*;
 
 /// `set_mempolicy_home_node(addr, len, home_node, flags)` — update the
-/// distance anchor of existing MPOL_BIND policies overlapping the range.
+/// distance anchor of existing MPOL_BIND or MPOL_PREFERRED_MANY policies
+/// overlapping the range.
 pub(crate) fn sys_set_mempolicy_home_node(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     if a.arg3 != 0 || a.arg0 & 0xFFF != 0 || a.arg2 >= numa_node_count() as u64 {
@@ -36,7 +37,10 @@ pub(crate) fn sys_set_mempolicy_home_node(ctx: &mut dyn TrapContext) {
                 updated.push((start, range_len, policy));
                 continue;
             }
-            if (policy.mode & !MPOL_MODE_FLAGS) != narf_memory::MPOL_BIND {
+            if !matches!(
+                policy.mode & !MPOL_MODE_FLAGS,
+                narf_memory::MPOL_BIND | narf_memory::MPOL_PREFERRED_MANY
+            ) {
                 updated.push((start, range_len, policy));
                 updated.extend(iter);
                 *ranges = updated;

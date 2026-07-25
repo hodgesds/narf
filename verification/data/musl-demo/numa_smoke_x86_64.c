@@ -76,6 +76,33 @@ int main(void) {
     if (!has(buf, "MemTotal")) { w("numa-fail: n0-meminfo\n"); return 1; }
     if (!has(buf, "MemFree")) { w("numa-fail: n0-memfree\n"); return 1; }
 
+    // Linux UAPI bits 15/14 must be recognized, and PREFERRED_MANY must
+    // steer a fresh page to the sole preferred node.
+    unsigned long node1 = 2;
+    if (syscall(SYS_set_mempolicy, 0x8000 | 5, &node1, 64) != 0) {
+        w("numa-fail: preferred-many-set\n");
+        return 1;
+    }
+    unsigned char *preferred = mmap(0, 4096, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (preferred == MAP_FAILED) {
+        w("numa-fail: preferred-many-mmap\n");
+        return 1;
+    }
+    preferred[0] = 0x6e;
+    void *preferred_pages[1] = { preferred };
+    int preferred_status[1] = { -1 };
+    if (syscall(SYS_move_pages, 0, 1, preferred_pages, 0,
+                preferred_status, 0) != 0 || preferred_status[0] != 1) {
+        w("numa-fail: preferred-many-placement\n");
+        return 1;
+    }
+    if (syscall(SYS_set_mempolicy, 0, 0, 0) != 0) {
+        w("numa-fail: preferred-many-reset\n");
+        return 1;
+    }
+    munmap(preferred, 4096);
+
     // Real hugetlb mapping smoke. The ordinary suite boots without a
     // reservation and therefore legitimately gets ENOMEM; the dedicated
     // NUMA run supplies `hugepages_2m=2` and exercises the hardware leaf.

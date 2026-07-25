@@ -31,7 +31,9 @@ use alloc_crate::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::frame::{self, UsableRegion, MAX_NUMA_NODES};
-use crate::mempolicy::{Mempolicy, MPOL_BIND, MPOL_INTERLEAVE, MPOL_PREFERRED};
+use crate::mempolicy::{
+    Mempolicy, MPOL_BIND, MPOL_INTERLEAVE, MPOL_PREFERRED, MPOL_PREFERRED_MANY,
+};
 
 /// 2 MiB hugepage size in bytes.
 pub const HUGEPAGE_2M_BYTES: u64 = 2 * 1024 * 1024;
@@ -224,10 +226,16 @@ pub fn alloc_hugepage_with(
         return Err(HugeAllocError::Empty);
     }
     let requested = policy.nodemask & allowed;
+    let anchor = if policy.home_node == u32::MAX {
+        local.min(MAX_NUMA_NODES - 1)
+    } else {
+        policy.home_node as usize
+    };
     let preferred = match policy.mode {
         MPOL_BIND | MPOL_PREFERRED if requested != 0 => requested.trailing_zeros() as usize,
+        MPOL_PREFERRED_MANY if requested != 0 => anchor,
         MPOL_INTERLEAVE if requested != 0 => crate::mempolicy::next_interleave_node(requested),
-        _ => local.min(MAX_NUMA_NODES - 1),
+        _ => anchor,
     };
     let candidates =
         if policy.mode == MPOL_BIND || (policy.mode == MPOL_INTERLEAVE && requested != 0) {
@@ -247,7 +255,15 @@ pub fn alloc_hugepage_with(
             count += 1;
         }
     }
-    order[..count].sort_unstable_by_key(|&node| (frame::node_distance(preferred, node), node));
+    order[..count].sort_unstable_by_key(|&node| {
+        let preference_class =
+            u8::from(policy.mode == MPOL_PREFERRED_MANY && (requested >> node) & 1 == 0);
+        (
+            preference_class,
+            frame::node_distance(preferred, node),
+            node,
+        )
+    });
     if let Some(pos) = order[..count].iter().position(|&node| node == preferred) {
         order[..count].swap(0, pos);
     }

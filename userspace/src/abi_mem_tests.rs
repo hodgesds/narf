@@ -422,8 +422,8 @@ kernel_test_in!(
 );
 
 // ── SetMempolicy (238) ───────────────────────────────────────────────
-// arg0=mode, arg1=nodemask ptr. Valid modes are 0..MPOL_MAX(5) (with the
-// top flag bits masked). Stored in a per-task side table; success → 0.
+// arg0=mode, arg1=nodemask ptr. Implemented modes are DEFAULT through
+// PREFERRED_MANY (0..=5), with Linux UAPI mode flags masked.
 // No AS needed.
 
 fn smoke_abi_mem_set_mempolicy_pos() -> TestResult {
@@ -440,7 +440,7 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_set_mempolicy_pos);
 
 fn smoke_abi_mem_set_mempolicy_bad_mode_neg() -> TestResult {
     with_setup(|| {
-        // mode 9 >= MPOL_MAX(5) (and below the flag bits) → -EINVAL.
+        // mode 9 is not an implemented Linux policy → -EINVAL.
         match call(Syscall::SetMempolicy.raw(), a1(9, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             Some(_) => Err("set_mempolicy with an invalid mode should be -EINVAL"),
@@ -538,7 +538,7 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_mbind_pos);
 
 fn smoke_abi_mem_mbind_bad_mode_neg() -> TestResult {
     with_setup(|| {
-        // mode 9 >= MPOL_MAX(5) → -EINVAL (checked before the addr align).
+        // mode 9 is invalid (checked before the addr alignment).
         match call(Syscall::Mbind.raw(), a3(0x1000, 0x1000, 9, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             Some(_) => Err("mbind with an invalid mode should be -EINVAL"),
