@@ -90,9 +90,9 @@ fn encode_record(record: DiagRecord, seq: u32, multipart: bool) -> Vec<u8> {
     )
 }
 
-fn records(protocol: u8) -> Vec<DiagRecord> {
+fn records(net_ns_id: u64, protocol: u8) -> Vec<DiagRecord> {
     match protocol {
-        IPPROTO_TCP => crate::tcp::core::snapshot()
+        IPPROTO_TCP => crate::tcp::core::snapshot_in(net_ns_id)
             .into_iter()
             .map(|socket| DiagRecord {
                 state: socket.state_code,
@@ -105,7 +105,7 @@ fn records(protocol: u8) -> Vec<DiagRecord> {
                 retransmits: socket.retrnsmt,
             })
             .collect(),
-        IPPROTO_UDP => crate::udp_sock::snapshot()
+        IPPROTO_UDP => crate::udp_sock::snapshot_in(net_ns_id)
             .into_iter()
             .map(|socket| DiagRecord {
                 state: socket.state_code,
@@ -122,7 +122,7 @@ fn records(protocol: u8) -> Vec<DiagRecord> {
     }
 }
 
-fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+fn build_one(net_ns_id: u64, request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
     if request.len() < NLMSG_HDRLEN {
         return Err(());
     }
@@ -172,7 +172,7 @@ fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
         .try_into()
         .unwrap();
     let mut out = Vec::new();
-    for record in records(protocol) {
+    for record in records(net_ns_id, protocol) {
         let state_bit = 1u32.checked_shl(record.state as u32).unwrap_or(0);
         let state_matches = requested_states == 0 || requested_states & state_bit != 0;
         let id_matches = dump
@@ -204,6 +204,10 @@ fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
 
 /// Build ordered replies for every aligned `inet_diag_req_v2` message.
 pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+    build_replies_in(0, datagram)
+}
+
+pub fn build_replies_in(net_ns_id: u64, datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
     let mut offset = 0;
     let mut replies = Vec::new();
     while offset < datagram.len() {
@@ -215,7 +219,7 @@ pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
         if len < NLMSG_HDRLEN || len > remaining.len() {
             return Err(());
         }
-        replies.extend(build_one(&remaining[..len])?);
+        replies.extend(build_one(net_ns_id, &remaining[..len])?);
         let step = align(len);
         if step > remaining.len() {
             if len == remaining.len() {

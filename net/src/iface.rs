@@ -192,9 +192,16 @@ pub fn lookup(name: &str) -> Option<NetIfaceSnapshot> {
 /// different address (e.g. when a second NIC registered ahead of the
 /// configured one).
 pub fn for_local_addr(ip: [u8; 4]) -> Option<NetIfaceSnapshot> {
+    for_local_addr_in(0, ip)
+}
+
+/// Find an interface in `net_ns_id` that owns `ip`.
+pub fn for_local_addr_in(net_ns_id: u64, ip: [u8; 4]) -> Option<NetIfaceSnapshot> {
     let g = IFACES.lock();
     let v = g.as_ref()?;
-    let e = v.iter().find(|e| e.ipv4 == ip)?;
+    let e = v
+        .iter()
+        .find(|e| e.net_ns_id == net_ns_id && e.ipv4 == ip)?;
     Some(NetIfaceSnapshot {
         name: e.name.clone(),
         mac: e.mac,

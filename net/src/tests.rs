@@ -77,6 +77,63 @@ fn smoke_network_namespace_fib_isolation() -> TestResult {
 }
 kernel_test_in!("net/namespace", smoke_network_namespace_fib_isolation);
 
+fn smoke_network_namespace_transport_tables_are_isolated() -> TestResult {
+    use crate::tcp::state_machine::TcpState;
+    use crate::udp_sock::{SocketAddrV4, UdpOptions};
+
+    let tcp_id = crate::tcp::core::__install_test_tcb_in(
+        601,
+        [192, 0, 2, 1],
+        8080,
+        [192, 0, 2, 2],
+        40000,
+        TcpState::Established,
+    );
+    let tcp_id_b = crate::tcp::core::__install_test_tcb_in(
+        602,
+        [192, 0, 2, 1],
+        8080,
+        [192, 0, 2, 2],
+        40000,
+        TcpState::Established,
+    );
+    if crate::tcp::core::snapshot_in(601)
+        .iter()
+        .all(|socket| socket.local_port != 8080)
+    {
+        return TestResult::Fail("TCP TCB missing from owning namespace");
+    }
+    if crate::tcp::core::snapshot_in(602)
+        .iter()
+        .all(|socket| socket.local_port != 8080)
+    {
+        return TestResult::Fail("same TCP tuple in second namespace collided");
+    }
+
+    let address = SocketAddrV4::new([0, 0, 0, 0], 18080);
+    let udp_a = match crate::udp_sock::udp_bind_in(601, address, UdpOptions::default()) {
+        Ok(socket) => socket,
+        Err(_) => return TestResult::Fail("first namespace UDP bind failed"),
+    };
+    let udp_b = match crate::udp_sock::udp_bind_in(602, address, UdpOptions::default()) {
+        Ok(socket) => socket,
+        Err(_) => return TestResult::Fail("same UDP port in second namespace collided"),
+    };
+    if crate::udp_sock::snapshot_in(601).len() != 1 || crate::udp_sock::snapshot_in(602).len() != 1
+    {
+        return TestResult::Fail("UDP namespace snapshots are not isolated");
+    }
+    crate::udp_sock::udp_close(&udp_a);
+    crate::udp_sock::udp_close(&udp_b);
+    crate::tcp::core::remove_tcb(tcp_id);
+    crate::tcp::core::remove_tcb(tcp_id_b);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/namespace",
+    smoke_network_namespace_transport_tables_are_isolated
+);
+
 fn smoke_net_loopback_register() -> TestResult {
     use crate::{bootstrap_authority, register_loopback_named, registry, Loopback};
 

@@ -119,6 +119,7 @@ pub const TCP_CORK: i32 = 3;
 /// so the table and any caller share the same lock.
 pub struct Tcb {
     pub id: u32,
+    pub net_ns_id: u64,
     pub local_addr: [u8; 4],
     pub local_port: u16,
     pub remote_addr: [u8; 4],
@@ -235,10 +236,31 @@ pub struct Tcb {
 /// frame-emit function. Both are immutable for the life of the connection
 /// (the route to a fixed peer doesn't change), so they're resolved once and
 /// reused — keeping `ROUTE_TABLE`/`IFACES` off the per-segment TX path.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct CachedEgress {
+    pub name: Arc<str>,
     pub mac: [u8; 6],
     pub send: iface::SendFn,
+}
+
+fn emit_tcb_frame(
+    arc: &Arc<IrqSafeSpinLock<Tcb>>,
+    iface_name: &str,
+    send: iface::SendFn,
+    mut frame: Vec<u8>,
+) {
+    let net_ns_id = arc.lock().net_ns_id;
+    if frame.len() < crate::pkt::ETH_HDR_LEN {
+        return;
+    }
+    if crate::tcp_stack::nf_tx_filter_in(
+        net_ns_id,
+        iface_name,
+        &mut frame[crate::pkt::ETH_HDR_LEN..],
+    ) == crate::netfilter::Verdict::Accept
+    {
+        let _ = send(&frame);
+    }
 }
 
 impl core::fmt::Debug for Tcb {
@@ -269,6 +291,7 @@ impl Tcb {
     ) -> Self {
         Self {
             id,
+            net_ns_id: 0,
             local_addr,
             local_port,
             remote_addr,
@@ -327,6 +350,11 @@ impl Tcb {
         t.state = TcpState::Listen;
         t.backlog = backlog.max(1);
         t
+    }
+
+    pub fn with_net_ns(mut self, net_ns_id: u64) -> Self {
+        self.net_ns_id = net_ns_id;
+        self
     }
 
     /// Effective send window from RFC 9293 §3.10.7.4 — min of
@@ -404,11 +432,18 @@ const CONN_SHARDS: usize = 32;
 
 /// Connected-TCB key: (remote_ip, remote_port, local_ip, local_port),
 /// IPs packed big-endian. Uniquely identifies a non-LISTEN TCB.
-type ConnKey = (u32, u16, u32, u16);
+type ConnKey = (u64, u32, u16, u32, u16);
 
 #[inline]
-fn conn_key(remote: [u8; 4], remote_port: u16, local: [u8; 4], local_port: u16) -> ConnKey {
+fn conn_key(
+    net_ns_id: u64,
+    remote: [u8; 4],
+    remote_port: u16,
+    local: [u8; 4],
+    local_port: u16,
+) -> ConnKey {
     (
+        net_ns_id,
         u32::from_be_bytes(remote),
         remote_port,
         u32::from_be_bytes(local),
@@ -425,10 +460,12 @@ fn conn_shard(k: &ConnKey) -> usize {
             h = (h ^ b as u32).wrapping_mul(0x0100_0193);
         }
     };
-    mix(k.0);
-    mix(k.1 as u32);
-    mix(k.2);
-    mix(k.3 as u32);
+    mix(k.0 as u32);
+    mix((k.0 >> 32) as u32);
+    mix(k.1);
+    mix(k.2 as u32);
+    mix(k.3);
+    mix(k.4 as u32);
     (h as usize) & (CONN_SHARDS - 1)
 }
 
@@ -441,7 +478,7 @@ static CONN_INDEX: [IrqSafeSpinLock<Option<BTreeMap<ConnKey, Arc<IrqSafeSpinLock
 /// so a single lock is fine.
 #[allow(clippy::type_complexity)]
 static LISTEN_INDEX: IrqSafeSpinLock<
-    Option<BTreeMap<(u32, u16), alloc::vec::Vec<Arc<IrqSafeSpinLock<Tcb>>>>>,
+    Option<BTreeMap<(u64, u32, u16), alloc::vec::Vec<Arc<IrqSafeSpinLock<Tcb>>>>>,
 > = IrqSafeSpinLock::new(None);
 
 fn conn_index_insert(key: ConnKey, arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -461,8 +498,13 @@ fn conn_index_lookup(key: ConnKey) -> Option<Arc<IrqSafeSpinLock<Tcb>>> {
     g.as_ref().and_then(|m| m.get(&key).cloned())
 }
 
-fn listen_index_insert(local: [u8; 4], local_port: u16, arc: &Arc<IrqSafeSpinLock<Tcb>>) {
-    let key = (u32::from_be_bytes(local), local_port);
+fn listen_index_insert(
+    net_ns_id: u64,
+    local: [u8; 4],
+    local_port: u16,
+    arc: &Arc<IrqSafeSpinLock<Tcb>>,
+) {
+    let key = (net_ns_id, u32::from_be_bytes(local), local_port);
     let mut g = LISTEN_INDEX.lock();
     g.get_or_insert_with(BTreeMap::new)
         .entry(key)
@@ -470,8 +512,13 @@ fn listen_index_insert(local: [u8; 4], local_port: u16, arc: &Arc<IrqSafeSpinLoc
         .push(arc.clone());
 }
 
-fn listen_index_remove(local: [u8; 4], local_port: u16, arc: &Arc<IrqSafeSpinLock<Tcb>>) {
-    let key = (u32::from_be_bytes(local), local_port);
+fn listen_index_remove(
+    net_ns_id: u64,
+    local: [u8; 4],
+    local_port: u16,
+    arc: &Arc<IrqSafeSpinLock<Tcb>>,
+) {
+    let key = (net_ns_id, u32::from_be_bytes(local), local_port);
     let mut g = LISTEN_INDEX.lock();
     if let Some(m) = g.as_mut() {
         if let Some(v) = m.get_mut(&key) {
@@ -490,18 +537,22 @@ fn listen_index_remove(local: [u8; 4], local_port: u16, arc: &Arc<IrqSafeSpinLoc
 /// listener on the same port. Order is deterministic (concrete then
 /// wildcard, install order within each) so the SO_REUSEPORT flow-hash
 /// selection is stable across the SYN and accept-enqueue call sites.
-fn listen_index_group(dst: [u8; 4], port: u16) -> alloc::vec::Vec<Arc<IrqSafeSpinLock<Tcb>>> {
+fn listen_index_group(
+    net_ns_id: u64,
+    dst: [u8; 4],
+    port: u16,
+) -> alloc::vec::Vec<Arc<IrqSafeSpinLock<Tcb>>> {
     let mut out: alloc::vec::Vec<Arc<IrqSafeSpinLock<Tcb>>> = alloc::vec::Vec::new();
     let g = LISTEN_INDEX.lock();
     let m = match g.as_ref() {
         Some(m) => m,
         None => return out,
     };
-    if let Some(v) = m.get(&(u32::from_be_bytes(dst), port)) {
+    if let Some(v) = m.get(&(net_ns_id, u32::from_be_bytes(dst), port)) {
         out.extend(v.iter().cloned());
     }
     if dst != [0, 0, 0, 0] {
-        if let Some(v) = m.get(&(0u32, port)) {
+        if let Some(v) = m.get(&(net_ns_id, 0u32, port)) {
             out.extend(v.iter().cloned());
         }
     }
@@ -515,13 +566,14 @@ fn install_tcb(tcb: Tcb) -> (u32, Arc<IrqSafeSpinLock<Tcb>>) {
     let is_listen = tcb.state == TcpState::Listen;
     let conn_k = (!is_listen).then(|| {
         conn_key(
+            tcb.net_ns_id,
             tcb.remote_addr,
             tcb.remote_port,
             tcb.local_addr,
             tcb.local_port,
         )
     });
-    let listen_k = is_listen.then_some((tcb.local_addr, tcb.local_port));
+    let listen_k = is_listen.then_some((tcb.net_ns_id, tcb.local_addr, tcb.local_port));
     let arc = Arc::new(IrqSafeSpinLock::new(tcb));
     {
         let mut g = TCB_TABLE[tcb_shard(id)].lock();
@@ -532,8 +584,8 @@ fn install_tcb(tcb: Tcb) -> (u32, Arc<IrqSafeSpinLock<Tcb>>) {
     if let Some(k) = conn_k {
         conn_index_insert(k, &arc);
     }
-    if let Some((la, lp)) = listen_k {
-        listen_index_insert(la, lp, &arc);
+    if let Some((ns, la, lp)) = listen_k {
+        listen_index_insert(ns, la, lp, &arc);
     }
     (id, arc)
 }
@@ -558,9 +610,10 @@ pub fn remove_tcb(id: u32) {
     // (immutable) key. Read fields under the per-TCB lock, then DROP
     // that lock before touching the indexes (no nested locking).
     if let Some(arc) = lookup_tcb(id) {
-        let (is_listen, la, lp, ra, rp) = {
+        let (ns, is_listen, la, lp, ra, rp) = {
             let t = arc.lock();
             (
+                t.net_ns_id,
                 t.state == TcpState::Listen,
                 t.local_addr,
                 t.local_port,
@@ -569,9 +622,9 @@ pub fn remove_tcb(id: u32) {
             )
         };
         if is_listen {
-            listen_index_remove(la, lp, &arc);
+            listen_index_remove(ns, la, lp, &arc);
         } else {
-            conn_index_remove(conn_key(ra, rp, la, lp));
+            conn_index_remove(conn_key(ns, ra, rp, la, lp));
         }
     }
     let mut g = TCB_TABLE[tcb_shard(id)].lock();
@@ -625,6 +678,10 @@ pub struct TcbSnapshot {
 /// Snapshot every TCB in the table. Cheap: a few cycles per entry
 /// to copy 16 bytes plus the state byte.
 pub fn snapshot() -> alloc::vec::Vec<TcbSnapshot> {
+    snapshot_in(0)
+}
+
+pub fn snapshot_in(net_ns_id: u64) -> alloc::vec::Vec<TcbSnapshot> {
     let mut out = alloc::vec::Vec::new();
     for shard in TCB_TABLE.iter() {
         let g = shard.lock();
@@ -634,6 +691,9 @@ pub fn snapshot() -> alloc::vec::Vec<TcbSnapshot> {
         };
         for arc in m.values() {
             let t = arc.lock();
+            if t.net_ns_id != net_ns_id {
+                continue;
+            }
             out.push(TcbSnapshot {
                 local_addr: t.local_addr,
                 local_port: t.local_port,
@@ -673,8 +733,17 @@ fn tcp_state_code(s: TcpState) -> u8 {
 // ── Public API: listen / accept ─────────────────────────────────────
 
 pub fn listen(local_addr: [u8; 4], local_port: u16, backlog: usize) -> Result<u32, ()> {
+    listen_in(0, local_addr, local_port, backlog)
+}
+
+pub fn listen_in(
+    net_ns_id: u64,
+    local_addr: [u8; 4],
+    local_port: u16,
+    backlog: usize,
+) -> Result<u32, ()> {
     let id = fresh_tcb_id();
-    let tcb = Tcb::new_listener(id, local_addr, local_port, backlog);
+    let tcb = Tcb::new_listener(id, local_addr, local_port, backlog).with_net_ns(net_ns_id);
     let (id, _arc) = install_tcb(tcb);
     Ok(id)
 }
@@ -707,8 +776,12 @@ pub fn listen_has_pending(listen_id: u32) -> bool {
 // ── Public API: connect ─────────────────────────────────────────────
 
 pub fn connect(remote_addr: [u8; 4], remote_port: u16) -> Result<u32, ()> {
-    let iface = iface::for_dst(remote_addr).ok_or(())?;
-    let mac = crate::tcp_stack::arp_resolve(iface.gateway, 1000)?;
+    connect_in(0, remote_addr, remote_port)
+}
+
+pub fn connect_in(net_ns_id: u64, remote_addr: [u8; 4], remote_port: u16) -> Result<u32, ()> {
+    let iface = iface::for_dst_in(net_ns_id, remote_addr).ok_or(())?;
+    let mac = crate::tcp_stack::arp_resolve_in(net_ns_id, iface.gateway, 1000)?;
     let local_port = fresh_local_port();
     let id = fresh_tcb_id();
     let iss = compute_isn();
@@ -720,7 +793,8 @@ pub fn connect(remote_addr: [u8; 4], remote_port: u16) -> Result<u32, ()> {
         remote_port,
         mac,
         iss,
-    );
+    )
+    .with_net_ns(net_ns_id);
     tcb.state = TcpState::SynSent;
     let (id, arc) = install_tcb(tcb);
 
@@ -1013,8 +1087,11 @@ fn build_frame(
 }
 
 fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
-    let dst_for_iface = arc.lock().remote_addr;
-    let iface = match iface::for_dst(dst_for_iface) {
+    let (net_ns_id, dst_for_iface) = {
+        let t = arc.lock();
+        (t.net_ns_id, t.remote_addr)
+    };
+    let iface = match iface::for_dst_in(net_ns_id, dst_for_iface) {
         Some(i) => i,
         None => return,
     };
@@ -1077,7 +1154,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         opts,
         &[],
     );
-    let _ = (iface.send)(&frame);
+    emit_tcb_frame(arc, &iface.name, iface.send, frame);
     // Track SYN in the retransmit queue so a missed SYN-ACK
     // re-triggers retransmit.
     let mut t = arc.lock();
@@ -1088,8 +1165,11 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
 }
 
 fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
-    let dst_for_iface = arc.lock().remote_addr;
-    let iface = match iface::for_dst(dst_for_iface) {
+    let (net_ns_id, dst_for_iface) = {
+        let t = arc.lock();
+        (t.net_ns_id, t.remote_addr)
+    };
+    let iface = match iface::for_dst_in(net_ns_id, dst_for_iface) {
         Some(i) => i,
         None => return,
     };
@@ -1127,12 +1207,15 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         opt_bytes,
         &[],
     );
-    let _ = (iface.send)(&frame);
+    emit_tcb_frame(arc, &iface.name, iface.send, frame);
 }
 
 fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool) {
-    let dst_for_iface = arc.lock().remote_addr;
-    let iface = match iface::for_dst(dst_for_iface) {
+    let (net_ns_id, dst_for_iface) = {
+        let t = arc.lock();
+        (t.net_ns_id, t.remote_addr)
+    };
+    let iface = match iface::for_dst_in(net_ns_id, dst_for_iface) {
         Some(i) => i,
         None => return,
     };
@@ -1165,7 +1248,7 @@ fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool)
         Vec::new(),
         &[],
     );
-    let _ = (iface.send)(&frame);
+    emit_tcb_frame(arc, &iface.name, iface.send, frame);
 }
 
 /// Build & send one data segment carrying `payload` from sequence
@@ -1182,20 +1265,24 @@ fn send_data(
     // resolve `iface::for_dst` (global ROUTE_TABLE + IFACES locks) only on
     // the first segment, then reuse — keeping those locks off the hot path.
     let egress = {
-        let cached = arc.lock().egress;
+        let cached = arc.lock().egress.clone();
         match cached {
             Some(e) => e,
             None => {
-                let dst_for_iface = arc.lock().remote_addr;
-                let snap = match iface::for_dst(dst_for_iface) {
+                let (net_ns_id, dst_for_iface) = {
+                    let t = arc.lock();
+                    (t.net_ns_id, t.remote_addr)
+                };
+                let snap = match iface::for_dst_in(net_ns_id, dst_for_iface) {
                     Some(i) => i,
                     None => return,
                 };
                 let e = CachedEgress {
+                    name: Arc::from(snap.name),
                     mac: snap.mac,
                     send: snap.send,
                 };
-                arc.lock().egress = Some(e);
+                arc.lock().egress = Some(e.clone());
                 e
             }
         }
@@ -1232,7 +1319,7 @@ fn send_data(
         opt_bytes,
         payload,
     );
-    let _ = (egress.send)(&frame);
+    emit_tcb_frame(arc, egress.name.as_ref(), egress.send, frame);
     if record_retx {
         let mut t = arc.lock();
         let payload_len = payload.len() as u32;
@@ -1377,7 +1464,19 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     let payload_len = seg
         .len
         .saturating_sub(if seg.flags & FLAG_FIN != 0 { 1 } else { 0 });
-    let (payload, peer_mac, src_ip, dst_ip, src_port, dst_port, ack, window, opt_bytes, _flags) = {
+    let (
+        net_ns_id,
+        payload,
+        peer_mac,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        ack,
+        window,
+        opt_bytes,
+        _flags,
+    ) = {
         let t = arc.lock();
         let want = payload_len as usize;
         let mut payload = Vec::with_capacity(want);
@@ -1390,6 +1489,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
         let window = effective_advertised_window(&t);
         (
+            t.net_ns_id,
             payload,
             t.remote_mac,
             t.local_addr,
@@ -1402,7 +1502,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             seg.flags,
         )
     };
-    let iface = match iface::for_dst(dst_ip) {
+    let iface = match iface::for_dst_in(net_ns_id, dst_ip) {
         Some(i) => i,
         None => return,
     };
@@ -1410,7 +1510,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         iface.mac, peer_mac, src_ip, dst_ip, src_port, dst_port, seg.seq, ack, seg.flags, window,
         opt_bytes, &payload,
     );
-    let _ = (iface.send)(&frame);
+    emit_tcb_frame(arc, &iface.name, iface.send, frame);
     {
         let mut t = arc.lock();
         // Advance send-buf sent_offset by the payload length so
@@ -1444,8 +1544,11 @@ fn tick_persist(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
 }
 
 fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
-    let dst_for_iface = arc.lock().remote_addr;
-    let iface = match iface::for_dst(dst_for_iface) {
+    let (net_ns_id, dst_for_iface) = {
+        let t = arc.lock();
+        (t.net_ns_id, t.remote_addr)
+    };
+    let iface = match iface::for_dst_in(net_ns_id, dst_for_iface) {
         Some(i) => i,
         None => return,
     };
@@ -1492,7 +1595,7 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         opt_bytes,
         &[probe_byte],
     );
-    let _ = (iface.send)(&frame);
+    emit_tcb_frame(arc, &iface.name, iface.send, frame);
 }
 
 fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -1535,8 +1638,11 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         return;
     }
     // Send empty segment with seq = snd_una - 1 (RFC 9293 §3.8.4).
-    let dst_for_iface = arc.lock().remote_addr;
-    let iface = match iface::for_dst(dst_for_iface) {
+    let (net_ns_id, dst_for_iface) = {
+        let t = arc.lock();
+        (t.net_ns_id, t.remote_addr)
+    };
+    let iface = match iface::for_dst_in(net_ns_id, dst_for_iface) {
         Some(i) => i,
         None => return,
     };
@@ -1572,7 +1678,7 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         opt_bytes,
         &[],
     );
-    let _ = (iface.send)(&frame);
+    emit_tcb_frame(arc, &iface.name, iface.send, frame);
 }
 
 fn tick_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -1694,20 +1800,28 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
 /// Top-level dispatch from the RX path. Handles passive open
 /// (LISTEN → SYN-RECEIVED) and per-connection arrivals alike.
 pub fn handle_segment(src: [u8; 4], dst: [u8; 4], segment: &[u8]) {
+    handle_segment_in(0, src, dst, segment);
+}
+
+pub fn handle_segment_in(net_ns_id: u64, src: [u8; 4], dst: [u8; 4], segment: &[u8]) {
     let (hdr, _hdr_len) = match TcpHeader::decode(segment) {
         Ok(t) => t,
         Err(_) => return,
     };
     // Find a connected-TCB match first (O(1) sharded 4-tuple index, no
     // global lock); on miss, fall back to a matching LISTEN TCB.
-    if let Some(arc) = conn_index_lookup(conn_key(src, hdr.src_port, dst, hdr.dst_port)) {
+    if let Some(arc) = conn_index_lookup(conn_key(net_ns_id, src, hdr.src_port, dst, hdr.dst_port))
+    {
         process_in_state(&arc, src, dst, &hdr, segment);
         return;
     }
     // LISTEN bucket: any listener on (dst | 0.0.0.0, dst_port) drives the
     // passive open. The accept-enqueue (add_to_listener_accept_queue)
     // re-selects within the SO_REUSEPORT group by flow hash.
-    if let Some(listen_arc) = listen_index_group(dst, hdr.dst_port).into_iter().next() {
+    if let Some(listen_arc) = listen_index_group(net_ns_id, dst, hdr.dst_port)
+        .into_iter()
+        .next()
+    {
         accept_into_listen(&listen_arc, src, dst, &hdr, segment);
     }
 }
@@ -1732,11 +1846,11 @@ fn accept_into_listen(
     };
     let parsed = ParsedOptions::parse(opts_raw);
 
-    let backlog = {
+    let (backlog, net_ns_id) = {
         let l = listen_arc.lock();
-        l.backlog
+        (l.backlog, l.net_ns_id)
     };
-    let mac = match crate::tcp_stack::arp_resolve(src, 500) {
+    let mac = match crate::tcp_stack::arp_resolve_in(net_ns_id, src, 500) {
         Ok(m) => m,
         Err(_) => {
             // Without an ARP MAC we can't reply — just drop.
@@ -1745,7 +1859,8 @@ fn accept_into_listen(
     };
     let id = fresh_tcb_id();
     let iss = compute_isn();
-    let mut child = Tcb::new_active(id, dst, hdr.dst_port, src, hdr.src_port, mac, iss);
+    let mut child =
+        Tcb::new_active(id, dst, hdr.dst_port, src, hdr.src_port, mac, iss).with_net_ns(net_ns_id);
     child.state = TcpState::SynReceived;
     child.irs = hdr.sequence;
     child.rcv_nxt = hdr.sequence.wrapping_add(1);
@@ -1986,9 +2101,10 @@ fn reuseport_flow_hash(remote_addr: [u8; 4], remote_port: u16, local_port: u16) 
 /// Steer a completed passive-open onto a listener's accept queue and
 /// return that listener's TCB id (for the targeted accept-ready wake).
 fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) -> Option<u32> {
-    let (local_addr, local_port, remote_addr, remote_port, id) = {
+    let (net_ns_id, local_addr, local_port, remote_addr, remote_port, id) = {
         let t = arc.lock();
         (
+            t.net_ns_id,
             t.local_addr,
             t.local_port,
             t.remote_addr,
@@ -2001,7 +2117,7 @@ fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) -> Option<u32> 
     // with one listener per worker thread, each its own kernel TCB)
     // installs several distinct Listen TCBs on the same port. The index
     // returns them in a deterministic order for a stable listener set.
-    let group = listen_index_group(local_addr, local_port);
+    let group = listen_index_group(net_ns_id, local_addr, local_port);
     let listen_arc = match group.len() {
         0 => return None,
         // Single listener: the common, non-REUSEPORT case — no steering.
@@ -2252,6 +2368,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     // Retransmit segments at snd_una that aren't on the SACK
     // scoreboard. This is the RFC 6675 selective-retx path.
     let (
+        net_ns_id,
         seg_seq,
         seg_flags,
         payload,
@@ -2294,6 +2411,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
         let window = effective_advertised_window(&t);
         (
+            t.net_ns_id,
             oldest.seq,
             oldest.flags,
             payload,
@@ -2307,7 +2425,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             opts,
         )
     };
-    let iface = match iface::for_dst(dst_ip) {
+    let iface = match iface::for_dst_in(net_ns_id, dst_ip) {
         Some(i) => i,
         None => return,
     };
@@ -2315,7 +2433,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         iface.mac, peer_mac, src_ip, dst_ip, src_port, dst_port, seg_seq, ack, seg_flags, window,
         opt_bytes, &payload,
     );
-    let _ = (iface.send)(&frame);
+    emit_tcb_frame(arc, &iface.name, iface.send, frame);
     let mut t = arc.lock();
     // Mark the segment as retransmitted (Karn).
     if let Some(front) = t.retx_queue.front_mut() {
@@ -2422,6 +2540,18 @@ pub fn __install_test_tcb(
     remote_port: u16,
     state: TcpState,
 ) -> u32 {
+    __install_test_tcb_in(0, local_addr, local_port, remote_addr, remote_port, state)
+}
+
+#[doc(hidden)]
+pub fn __install_test_tcb_in(
+    net_ns_id: u64,
+    local_addr: [u8; 4],
+    local_port: u16,
+    remote_addr: [u8; 4],
+    remote_port: u16,
+    state: TcpState,
+) -> u32 {
     let id = fresh_tcb_id();
     let iss = 0x10000;
     let mut tcb = Tcb::new_active(
@@ -2432,7 +2562,8 @@ pub fn __install_test_tcb(
         remote_port,
         [0x52, 0x54, 0, 0, 0, 1],
         iss,
-    );
+    )
+    .with_net_ns(net_ns_id);
     tcb.state = state;
     tcb.snd_una = iss;
     tcb.snd_nxt = iss;
@@ -2484,7 +2615,23 @@ pub fn tick_all() {
 /// Mirrors `tcp_v4_err` (`net/ipv4/tcp_ipv4.c`); we don't currently
 /// distinguish hard vs. soft errors and just close the TCB.
 pub fn signal_icmp_error(remote_ip: [u8; 4], remote_port: u16, local_ip: [u8; 4], local_port: u16) {
-    let arc = conn_index_lookup(conn_key(remote_ip, remote_port, local_ip, local_port));
+    signal_icmp_error_in(0, remote_ip, remote_port, local_ip, local_port);
+}
+
+pub fn signal_icmp_error_in(
+    net_ns_id: u64,
+    remote_ip: [u8; 4],
+    remote_port: u16,
+    local_ip: [u8; 4],
+    local_port: u16,
+) {
+    let arc = conn_index_lookup(conn_key(
+        net_ns_id,
+        remote_ip,
+        remote_port,
+        local_ip,
+        local_port,
+    ));
     if let Some(arc) = arc {
         let mut t = arc.lock();
         t.drop_cause = Some(DropCause::PeerReset);

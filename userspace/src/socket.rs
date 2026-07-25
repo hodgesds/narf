@@ -1933,7 +1933,8 @@ impl SocketFile {
                     return result;
                 }
                 self.ensure_netlink_portid();
-                let replies = match narf_net::netlink_diag::build_replies(buf) {
+                let replies = match narf_net::netlink_diag::build_replies_in(self.net_ns_id(), buf)
+                {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
@@ -3055,9 +3056,12 @@ impl SocketFile {
                         // 127.x stays loopback-only (the INET_LISTENERS map).
                         if (addr >> 24) != 127 && listen_id.is_none() {
                             let a = addr.to_be_bytes();
-                            if let Ok(id) =
-                                narf_net::tcp_stack::listen(a, port, backlog.max(1) as usize)
-                            {
+                            if let Ok(id) = narf_net::tcp_stack::listen_in(
+                                self.net_ns_id(),
+                                a,
+                                port,
+                                backlog.max(1) as usize,
+                            ) {
                                 *listen_id = Some(id);
                                 // This task owns the listener — targeted
                                 // accept-ready wakes go only to it.
@@ -3093,6 +3097,7 @@ impl SocketFile {
                 if let Some(lid) = kernel_listen_id {
                     if let Ok(Some(child_id)) = narf_net::tcp_stack::accept(lid) {
                         let child = SocketFile::new(AF_INET, SOCK_STREAM);
+                        child.set_net_ns_id(self.net_ns_id());
                         {
                             let mut cs = child.state.lock();
                             *cs = SocketState::InetWired {
@@ -3157,7 +3162,8 @@ impl SocketFile {
                         let is_loopback = (ip >> 24) == 127;
                         if !is_loopback {
                             let ip_bytes = ip.to_be_bytes();
-                            match narf_net::tcp_stack::connect(ip_bytes, port) {
+                            match narf_net::tcp_stack::connect_in(self.net_ns_id(), ip_bytes, port)
+                            {
                                 Ok(tcb_id) => {
                                     let mut state = self.state.lock();
                                     if matches!(&*state, SocketState::Fresh) {

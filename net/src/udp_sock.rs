@@ -35,7 +35,6 @@ use crate::pkt::{
     ETH_HDR_LEN, IPV4_HDR_LEN, IP_PROTO_UDP,
 };
 use crate::pkt_udp::{UdpHeader, UDP_HDR_LEN};
-use crate::tcp_stack::arp_resolve;
 
 // ── Linux ephemeral range (32768-60999, net/ipv4/inet_connection_sock.c) ──
 // The userspace `ephemeral_port.rs` uses RFC 6056's 49152-65535 range.
@@ -136,6 +135,7 @@ pub struct SockError {
 
 #[derive(Debug)]
 pub struct UdpSocket {
+    pub net_ns_id: u64,
     pub local: SocketAddrV4,
     /// `Some` = connected mode; RX filters to this peer.
     pub peer: IrqSafeSpinLock<Option<SocketAddrV4>>,
@@ -146,8 +146,9 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
-    fn new(local: SocketAddrV4, options: UdpOptions) -> Self {
+    fn new(net_ns_id: u64, local: SocketAddrV4, options: UdpOptions) -> Self {
         Self {
+            net_ns_id,
             local,
             peer: IrqSafeSpinLock::new(None),
             rx_queue: IrqSafeSpinLock::new(VecDeque::new()),
@@ -185,7 +186,7 @@ impl PortTable {
         }
     }
 
-    fn alloc_ephemeral(&mut self) -> Option<u16> {
+    fn alloc_ephemeral(&mut self, net_ns_id: u64) -> Option<u16> {
         let start = self.ephemeral_cursor;
         loop {
             let port = self.ephemeral_cursor;
@@ -194,7 +195,11 @@ impl PortTable {
             } else {
                 self.ephemeral_cursor + 1
             };
-            if !self.entries.iter().any(|(p, _)| *p == port) {
+            if !self
+                .entries
+                .iter()
+                .any(|(p, socket)| *p == port && socket.net_ns_id == net_ns_id)
+            {
                 return Some(port);
             }
             if self.ephemeral_cursor == start {
@@ -235,18 +240,32 @@ pub enum UdpError {
 /// ephemeral port in 32768-60999 is allocated. Returns `Arc<UdpSocket>`.
 /// Mirrors Linux `udp_lib_get_port` (net/ipv4/udp.c:253+).
 pub fn udp_bind(local: SocketAddrV4, options: UdpOptions) -> Result<Arc<UdpSocket>, UdpError> {
+    udp_bind_in(0, local, options)
+}
+
+pub fn udp_bind_in(
+    net_ns_id: u64,
+    local: SocketAddrV4,
+    options: UdpOptions,
+) -> Result<Arc<UdpSocket>, UdpError> {
     let mut tbl = PORT_TABLE.lock();
     let port = if local.port == 0 {
-        tbl.alloc_ephemeral().ok_or(UdpError::NoEphemeral)?
+        tbl.alloc_ephemeral(net_ns_id)
+            .ok_or(UdpError::NoEphemeral)?
     } else {
         // Check for collision unless SO_REUSEPORT is set.
-        if !options.reuseport && tbl.entries.iter().any(|(p, _)| *p == local.port) {
+        if !options.reuseport
+            && tbl
+                .entries
+                .iter()
+                .any(|(p, socket)| *p == local.port && socket.net_ns_id == net_ns_id)
+        {
             return Err(UdpError::AddrInUse);
         }
         local.port
     };
     let bound = SocketAddrV4::new(local.ip, port);
-    let sock = Arc::new(UdpSocket::new(bound, options));
+    let sock = Arc::new(UdpSocket::new(net_ns_id, bound, options));
     tbl.entries.push((port, sock.clone()));
     Ok(sock)
 }
@@ -325,7 +344,7 @@ pub fn udp_send(
 
     // Wave-47: route by destination so flows on a non-primary iface
     // egress on the correct NIC (capture-iface smokes, multi-NIC hosts).
-    let iface = iface::for_dst(dst.ip).ok_or(UdpError::NoInterface)?;
+    let iface = iface::for_dst_in(sock.net_ns_id, dst.ip).ok_or(UdpError::NoInterface)?;
     let src_ip = iface.ipv4;
     let src_port = sock.local.port;
     let dst_ip = dst.ip;
@@ -335,7 +354,8 @@ pub fn udp_send(
     let dst_mac = if dst_ip == [255, 255, 255, 255] {
         [0xFF; 6]
     } else {
-        arp_resolve(dst_ip, 1000).map_err(|_| UdpError::NetworkUnreachable)?
+        crate::tcp_stack::arp_resolve_in(sock.net_ns_id, dst_ip, 1000)
+            .map_err(|_| UdpError::NetworkUnreachable)?
     };
 
     let udp_len = UDP_HDR_LEN + payload.len();
@@ -394,6 +414,11 @@ pub fn udp_send(
     };
     frame[udp_off + 6..udp_off + 8].copy_from_slice(&cs.to_be_bytes());
 
+    if crate::tcp_stack::nf_tx_filter_in(sock.net_ns_id, &iface.name, &mut frame[ETH_HDR_LEN..])
+        != crate::netfilter::Verdict::Accept
+    {
+        return Ok(payload.len());
+    }
     (iface.send)(&frame).map_err(|_| UdpError::NoInterface)?;
     Ok(payload.len())
 }
@@ -440,6 +465,10 @@ static RR_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// Deliver a received UDP datagram to matching socket(s).
 /// `datagram` is the raw UDP segment (header + payload, 8+ bytes).
 pub fn deliver(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
+    deliver_in(0, src_ip, dst_ip, datagram, ttl);
+}
+
+pub fn deliver_in(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
     if datagram.len() < UDP_HDR_LEN {
         return;
     }
@@ -459,7 +488,7 @@ pub fn deliver(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
         let tbl = PORT_TABLE.lock();
         tbl.entries
             .iter()
-            .filter(|(p, _)| *p == dst_port)
+            .filter(|(p, socket)| *p == dst_port && socket.net_ns_id == net_ns_id)
             .map(|(_, s)| s.clone())
             .collect()
     };
@@ -515,9 +544,17 @@ pub struct UdpSocketSnapshot {
 
 /// Snapshot every bound UDP socket. Cheap: a few fields per entry.
 pub fn snapshot() -> alloc::vec::Vec<UdpSocketSnapshot> {
+    snapshot_in(0)
+}
+
+pub fn snapshot_in(net_ns_id: u64) -> alloc::vec::Vec<UdpSocketSnapshot> {
     let tbl = PORT_TABLE.lock();
     let mut out = alloc::vec::Vec::with_capacity(tbl.entries.len());
-    for (_p, s) in tbl.entries.iter() {
+    for (_p, s) in tbl
+        .entries
+        .iter()
+        .filter(|(_, socket)| socket.net_ns_id == net_ns_id)
+    {
         let peer = *s.peer.lock();
         let (remote_addr, remote_port, state_code) = match peer {
             Some(p) => (p.ip, p.port, 0x01),

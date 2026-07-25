@@ -201,8 +201,8 @@ same capped echo and diagnostic-TLV rules as rtnetlink.
 
 `NETLINK_SOCK_DIAG` accepts Linux `SOCK_DIAG_BY_FAMILY` /
 `inet_diag_req_v2` dumps for IPv4 TCP and UDP. It filters by the requested
-Linux socket-state mask and emits `inet_diag_msg` records from the same
-snapshots that back `/proc/net/tcp` and `/proc/net/udp`, followed by
+Linux socket-state mask and emits `inet_diag_msg` records from
+namespace-scoped transport snapshots, followed by
 `NLMSG_DONE`. Aligned requests may be batched, their sequences remain
 independent, and `NLM_F_ACK` adds a zero-error acknowledgement after a
 successful query. Messages without `NLM_F_REQUEST` return `EINVAL`.
@@ -232,6 +232,12 @@ filtered lookup hides it from the source namespace and ingress packets inherit
 the destination namespace before AF_PACKET delivery and PRE_ROUTING. IPv4 FIB
 entries are keyed by namespace as well as destination/interface/table, so
 longest-prefix lookup cannot select another namespace's route.
+TCP connection/listener keys and UDP bind/delivery tables include the network
+namespace id; identical endpoint tuples may coexist across namespaces and
+accepted TCP children inherit their listener's namespace. The IPv4 ARP cache
+is namespace-scoped. TCP and UDP output resolves only namespace-owned
+interfaces and routes and traverses that namespace's `LOCAL_OUT` and
+`POST_ROUTING` netfilter hooks.
 
 `NETLINK_AUDIT` reports a disabled zeroed `audit_status` for `AUDIT_GET` and
 an empty completed `AUDIT_LIST_RULES` dump. `AUDIT_SET` returns `EPERM`
