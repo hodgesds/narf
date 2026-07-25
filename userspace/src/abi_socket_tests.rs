@@ -1500,6 +1500,7 @@ const RTM_NEWRULE: u16 = 32;
 const RTM_GETRULE: u16 = 34;
 const RTM_NEWQDISC: u16 = 36;
 const RTM_GETQDISC: u16 = 38;
+const RTM_GETTFILTER: u16 = 46;
 /// netlink control message types (netlink.h).
 const NLMSG_DONE: u16 = 3;
 const NLMSG_HDRLEN: usize = 16;
@@ -1902,6 +1903,24 @@ fn smoke_abi_netlink_route_getqdisc_dump() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getqdisc_dump);
+
+fn smoke_abi_netlink_empty_collection_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETTFILTER, 13);
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send(RTM_GETTFILTER) did not echo request length");
+        }
+        let mut buf = [0u8; 64];
+        let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&buf) != NLMSG_DONE {
+            return Err("empty RTM_GETTFILTER dump did not return NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_empty_collection_dump);
 
 fn smoke_abi_netlink_uevent_recv() -> TestResult {
     with_setup(|| {

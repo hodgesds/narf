@@ -62,6 +62,12 @@ pub const RTM_NEWRULE: u16 = 32;
 pub const RTM_GETRULE: u16 = 34;
 pub const RTM_NEWQDISC: u16 = 36;
 pub const RTM_GETQDISC: u16 = 38;
+pub const RTM_GETTCLASS: u16 = 42;
+pub const RTM_GETTFILTER: u16 = 46;
+pub const RTM_GETACTION: u16 = 50;
+pub const RTM_GETADDRLABEL: u16 = 74;
+pub const RTM_GETMDB: u16 = 86;
+pub const RTM_GETNEXTHOP: u16 = 106;
 
 // ── netlink flags (nlmsg_flags) ─────────────────────────────────────────
 
@@ -577,6 +583,10 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
             }
             out.push(build_done(seq, pid));
         }
+        RTM_GETTCLASS | RTM_GETTFILTER | RTM_GETACTION | RTM_GETADDRLABEL | RTM_GETMDB
+        | RTM_GETNEXTHOP => {
+            out.push(build_done(seq, pid));
+        }
         _ => {
             out.push(build_error(EOPNOTSUPP, seq, pid, req));
         }
@@ -603,7 +613,18 @@ pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
         let request = &remaining[..msg_len];
         let supported = matches!(
             hdr.msg_type,
-            RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE | RTM_GETNEIGH | RTM_GETRULE | RTM_GETQDISC
+            RTM_GETLINK
+                | RTM_GETADDR
+                | RTM_GETROUTE
+                | RTM_GETNEIGH
+                | RTM_GETRULE
+                | RTM_GETQDISC
+                | RTM_GETTCLASS
+                | RTM_GETTFILTER
+                | RTM_GETACTION
+                | RTM_GETADDRLABEL
+                | RTM_GETMDB
+                | RTM_GETNEXTHOP
         );
         if supported && hdr.flags & NLM_F_ACK != 0 {
             replies.push(build_ack(hdr.seq, request));

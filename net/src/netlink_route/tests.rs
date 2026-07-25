@@ -230,6 +230,24 @@ fn getqdisc_reports_noqueue_for_loopback() {
 }
 
 #[test]
+fn absent_optional_collections_return_empty_completed_dumps() {
+    for msg_type in [
+        RTM_GETTCLASS,
+        RTM_GETTFILTER,
+        RTM_GETACTION,
+        RTM_GETADDRLABEL,
+        RTM_GETMDB,
+        RTM_GETNEXTHOP,
+    ] {
+        let msgs = build_dump(&req(msg_type, msg_type as u32, 0));
+        assert_eq!(msgs.len(), 1, "type {msg_type} was not an empty dump");
+        let hdr = parse_hdr(&msgs[0]).unwrap();
+        assert_eq!(hdr.msg_type, NLMSG_DONE);
+        assert_eq!(hdr.seq, msg_type as u32);
+    }
+}
+
+#[test]
 fn unsupported_request_yields_eopnotsupp_error() {
     // RTM_GETLINK is 18; use a bogus type the responder doesn't handle.
     let bogus: u16 = 999;
