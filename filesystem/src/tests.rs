@@ -2902,6 +2902,63 @@ kernel_test_in!(
     smoke_fs_fuse_request_timeout_aborts_connection
 );
 
+fn smoke_fs_fuse_background_delivery_is_bounded() -> TestResult {
+    use crate::fuse::{pod_as_bytes, pod_from_bytes, FuseInHeader, FuseOpcode, FuseReleaseIn};
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use alloc::sync::Arc;
+
+    let conn = Arc::new(FuseConnection::new());
+    let _fs = FuseFs::new("fuse-background", Arc::clone(&conn));
+    let id = alloc::format!("{}", conn.connection_id());
+    let node = crate::sysfs::get_root()
+        .get_child("fs")
+        .and_then(|fs| fs.get_child("fuse"))
+        .and_then(|fuse| fuse.get_child("connections"))
+        .and_then(|connections| connections.get_child(&id));
+    let Some(node) = node else {
+        return TestResult::Fail("FUSE background connection missing from sysfs");
+    };
+    if !matches!(node.attr_store("max_background", b"1\n"), Some(Ok(())))
+        || !matches!(
+            node.attr_store("congestion_threshold", b"2\n"),
+            Some(Ok(()))
+        )
+    {
+        return TestResult::Fail("FUSE background limits were not writable");
+    }
+
+    let body = pod_as_bytes(&FuseReleaseIn::default());
+    for nodeid in 2..=4 {
+        conn.submit_background_noreply(FuseOpcode::Release, nodeid, &body);
+    }
+    if conn.background_requests() != 3 || !conn.is_congested() {
+        return TestResult::Fail("FUSE background accounting or congestion was wrong");
+    }
+
+    for remaining in (0..3).rev() {
+        let Some(request) = conn.dequeue_request() else {
+            return TestResult::Fail("FUSE background request was not promoted");
+        };
+        if conn.dequeue_request().is_some() {
+            return TestResult::Fail("FUSE exceeded max_background delivery");
+        }
+        let Some(header) = pod_from_bytes::<FuseInHeader>(&request) else {
+            return TestResult::Fail("FUSE background request header malformed");
+        };
+        let reply = fuse_reply(header.unique, 0, &[]);
+        if conn.complete_reply(&reply).is_none() || conn.background_requests() != remaining {
+            return TestResult::Fail("FUSE background completion accounting was wrong");
+        }
+    }
+
+    if conn.waiting_requests() == 0 && !conn.is_congested() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("FUSE background queue did not drain")
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_background_delivery_is_bounded);
+
 fn smoke_fs_fuse_request_context() -> TestResult {
     use crate::fuse::{pod_from_bytes, FuseInHeader, FuseOpcode};
     use crate::fuse_conn::{
@@ -3136,7 +3193,7 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
                 map_alignment: 0,
                 flags2: init.flags2,
                 max_stack_depth: 0,
-                request_timeout: 17,
+                request_timeout: 1,
                 unused: [0; 11],
             };
             Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
@@ -3610,7 +3667,7 @@ fn smoke_fs_fuse_end_to_end() -> TestResult {
         1 if conn.negotiated_minor() == crate::fuse::FUSE_KERNEL_MINOR_VERSION
             && conn.max_write() == 256 * 1024
             && conn.max_pages() == 32
-            && conn.request_timeout_secs() == 17
+            && conn.request_timeout_secs() == 15
             && conn.negotiated_flags() & crate::fuse::FuseInitFlag::PosixLocks as u64 != 0 =>
         {
             TestResult::Pass

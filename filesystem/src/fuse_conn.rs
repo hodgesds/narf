@@ -99,6 +99,8 @@ pub struct FuseConnection {
     connection_id: u64,
     sysfs_registered: AtomicBool,
     pending: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
+    background_deferred: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
+    background_active: IrqSafeSpinLock<BTreeSet<u64>>,
     replies: IrqSafeSpinLock<BTreeMap<u64, Option<FuseReply>>>,
     delivered: IrqSafeSpinLock<BTreeSet<u64>>,
     poll_requests: IrqSafeSpinLock<BTreeMap<u64, PendingPoll>>,
@@ -150,6 +152,8 @@ impl FuseConnection {
             connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
             sysfs_registered: AtomicBool::new(false),
             pending: IrqSafeSpinLock::new(VecDeque::new()),
+            background_deferred: IrqSafeSpinLock::new(VecDeque::new()),
+            background_active: IrqSafeSpinLock::new(BTreeSet::new()),
             replies: IrqSafeSpinLock::new(BTreeMap::new()),
             delivered: IrqSafeSpinLock::new(BTreeSet::new()),
             poll_requests: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -225,7 +229,18 @@ impl FuseConnection {
     }
 
     pub fn waiting_requests(&self) -> usize {
-        self.pending.lock().len() + self.delivered.lock().len()
+        self.pending.lock().len()
+            + self.delivered.lock().len()
+            + self.background_deferred.lock().len()
+    }
+
+    pub fn background_requests(&self) -> usize {
+        self.background_active.lock().len() + self.background_deferred.lock().len()
+    }
+
+    pub fn is_congested(&self) -> bool {
+        let threshold = self.congestion_threshold();
+        threshold != 0 && self.background_requests() >= threshold as usize
     }
 
     fn ensure_sysfs(self: &Arc<Self>) {
@@ -266,7 +281,7 @@ impl FuseConnection {
             move |data| {
                 let value = parse_connection_limit(data)?;
                 let conn = max_background_store.upgrade().ok_or(FsError::NotFound)?;
-                conn.max_background.store(value, Ordering::Release);
+                conn.set_max_background(value);
                 Ok(())
             },
         );
@@ -365,6 +380,8 @@ impl FuseConnection {
         }
         self.pending.lock().clear();
         self.delivered.lock().clear();
+        self.background_deferred.lock().clear();
+        self.background_active.lock().clear();
     }
 
     fn send_destroy(&self) {
@@ -422,6 +439,65 @@ impl FuseConnection {
         let mut msg = pod_as_bytes(&hdr);
         msg.extend_from_slice(body);
         self.pending.lock().push_back(msg);
+    }
+
+    /// Enqueue a reply-bearing operation whose caller cannot await it (for
+    /// example RELEASE from `Drop`). Delivery is bounded by max_background;
+    /// completion promotes the oldest deferred operation.
+    pub(crate) fn submit_background_noreply(&self, opcode: FuseOpcode, nodeid: u64, body: &[u8]) {
+        let unique = self.alloc_unique();
+        let total = core::mem::size_of::<FuseInHeader>() + body.len();
+        let context = request_context();
+        let hdr = FuseInHeader {
+            len: total as u32,
+            opcode: opcode as u32,
+            unique,
+            nodeid,
+            uid: context.uid,
+            gid: context.gid,
+            pid: context.pid,
+            _padding: 0,
+        };
+        let mut msg = pod_as_bytes(&hdr);
+        msg.extend_from_slice(body);
+
+        let mut active = self.background_active.lock();
+        if active.len() < self.max_background() as usize {
+            active.insert(unique);
+            self.pending.lock().push_back(msg);
+        } else {
+            self.background_deferred.lock().push_back(msg);
+        }
+    }
+
+    fn set_max_background(&self, value: u32) {
+        self.max_background.store(value, Ordering::Release);
+        self.promote_background();
+    }
+
+    fn promote_background(&self) {
+        let limit = self.max_background() as usize;
+        let mut active = self.background_active.lock();
+        let mut deferred = self.background_deferred.lock();
+        let mut pending = self.pending.lock();
+        while active.len() < limit {
+            let Some(request) = deferred.pop_front() else {
+                break;
+            };
+            let Some(header) = pod_from_bytes::<FuseInHeader>(&request) else {
+                continue;
+            };
+            active.insert(header.unique);
+            pending.push_back(request);
+        }
+    }
+
+    fn complete_background(&self, unique: u64) -> bool {
+        let removed = self.background_active.lock().remove(&unique);
+        if removed {
+            self.promote_background();
+        }
+        removed
     }
 
     fn cancel_request(&self, unique: u64) {
@@ -689,6 +765,10 @@ impl FuseConnection {
         }
         if hdr.error > 0 {
             return None;
+        }
+        if self.complete_background(hdr.unique) {
+            self.delivered.lock().remove(&hdr.unique);
+            return Some(claimed);
         }
         if let Some((kh, readiness, registered)) = self.poll_requests.lock().remove(&hdr.unique) {
             if hdr.error == 0 {
@@ -1760,7 +1840,7 @@ impl Drop for FuseFile {
                     lock_owner: 0,
                 });
                 self.conn
-                    .submit_noreply(FuseOpcode::Release, self.attr.nodeid, &body);
+                    .submit_background_noreply(FuseOpcode::Release, self.attr.nodeid, &body);
             }
         }
         // Never forget the root (nodeid 1) — Linux keeps it pinned.
@@ -2379,7 +2459,7 @@ impl FuseFs {
         if flags & FUSE_REQUEST_TIMEOUT != 0 && out.request_timeout != 0 {
             self.conn
                 .request_timeout_secs
-                .store(out.request_timeout, Ordering::Release);
+                .store(core::cmp::max(out.request_timeout, 15), Ordering::Release);
         }
         if minor >= 13 {
             if out.max_background != 0 {

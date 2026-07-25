@@ -203,14 +203,21 @@ parked callers with `ENOTCONN`. Writable `max_background` and
 FUSE_INIT 7.13 or newer. The directory is removed when the connection object
 is finally reclaimed.
 
+Reply-bearing operations submitted from non-awaitable teardown paths are
+tracked as background work. At most `max_background` such operations are
+visible to the daemon at once; completions promote deferred operations in FIFO
+order. `congestion_threshold` defines the connection's observable congestion
+state, and `waiting` includes deferred background work.
+
 NARF advertises Linux's `FUSE_NO_OPEN_SUPPORT` and
 `FUSE_NO_OPENDIR_SUPPORT` negotiation bits. An `ENOSYS` response to the first
 `OPEN` or `OPENDIR` is cached for the connection; subsequent file and
 directory operations use the implicit handle zero and omit the matching
 `RELEASE` or `RELEASEDIR` request.
 
-When `FUSE_REQUEST_TIMEOUT` is negotiated with a non-zero timeout, every
-subsequent request is deadline-bound using the monotonic timer wheel. An
+When `FUSE_REQUEST_TIMEOUT` is negotiated with a non-zero timeout, the value is
+clamped to Linux's 15-second minimum and every subsequent request is
+deadline-bound using the monotonic timer wheel. An
 expired queued or in-flight request aborts the entire connection, retires all
 queued transport work, and completes parked callers with a connection error,
 matching Linux's connection-level timeout behavior.
