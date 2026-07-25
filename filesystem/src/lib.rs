@@ -452,6 +452,16 @@ pub trait FileOps: Send + Sync {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 
+    /// Flush one open-file description's daemon-visible state.
+    fn flush<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Commit file data and metadata (`data_only` models fdatasync).
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// POSIX-2017 `poll(2)` readiness query. Returns the OR of
     /// the POLL_* bits below for the events currently satisfied
     /// on this file. The default returns `POLL_IN | POLL_OUT`

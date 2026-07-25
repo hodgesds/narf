@@ -37,10 +37,12 @@ pub enum FuseOpcode {
     Statfs = 17,
     Release = 18,
     Fsync = 20,
+    Flush = 25,
     Init = 26,
     OpenDir = 27,
     ReadDir = 28,
     ReleaseDir = 29,
+    FsyncDir = 30,
     Create = 35,
     Destroy = 38,
 }
@@ -332,6 +334,25 @@ pub struct FuseReleaseIn {
     pub release_flags: u32,
     pub lock_owner: u64,
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseFlushIn {
+    pub fh: u64,
+    pub unused: u32,
+    pub padding: u32,
+    pub lock_owner: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseFsyncIn {
+    pub fh: u64,
+    pub fsync_flags: u32,
+    pub padding: u32,
+}
+
+pub const FUSE_FSYNC_FDATASYNC: u32 = 1;
 
 /// `struct fuse_forget_in` — FORGET request body: the drop count for a
 /// nodeid the client no longer caches. 8 bytes.

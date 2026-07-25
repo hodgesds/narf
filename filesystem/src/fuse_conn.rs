@@ -625,6 +625,35 @@ impl FileOps for FuseFile {
             .stat())
         })
     }
+
+    fn flush<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let fh = self.ensure_open().await?;
+            let body = pod_as_bytes(&FuseFlushIn {
+                fh,
+                ..Default::default()
+            });
+            self.conn
+                .request(FuseOpcode::Flush, self.attr.nodeid, body)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let fh = self.ensure_open().await?;
+            let body = pod_as_bytes(&FuseFsyncIn {
+                fh,
+                fsync_flags: if data_only { FUSE_FSYNC_FDATASYNC } else { 0 },
+                padding: 0,
+            });
+            self.conn
+                .request(FuseOpcode::Fsync, self.attr.nodeid, body)
+                .await
+                .map(|_| ())
+        })
+    }
 }
 
 impl Drop for FuseFile {

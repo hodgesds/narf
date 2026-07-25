@@ -2966,8 +2966,8 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
             };
             Some(fuse_reply(unique, 0, &pod_as_bytes(&entry)))
         }
-        // Namespace mutations and handle releases acknowledge empty.
-        10 | 11 | 12 | 18 | 29 => Some(fuse_reply(unique, 0, &[])),
+        // Namespace mutations, durability, and handle releases acknowledge empty.
+        10 | 11 | 12 | 18 | 20 | 25 | 29 | 30 => Some(fuse_reply(unique, 0, &[])),
         // FUSE_FORGET (2): has no reply; drop it.
         2 => None,
         // Anything else → -ENOSYS.
@@ -3243,6 +3243,9 @@ fn smoke_fs_fuse_mutations() -> TestResult {
             || file.truncate(3).await.is_err()
             || file.set_perms(0o600).await.is_err()
             || file.set_owners(1000, 1000).await.is_err()
+            || file.flush().await.is_err()
+            || file.fsync(false).await.is_err()
+            || file.fsync(true).await.is_err()
         {
             OUTCOME.store(4, Ordering::Relaxed);
             return;

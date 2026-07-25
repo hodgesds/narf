@@ -9,6 +9,9 @@ pub(crate) fn sys_close(ctx: &mut dyn TrapContext) {
     // ancillary-data references, so they do not represent descriptor owners.
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
     if let Some(ops) = arc_ops.as_ref() {
+        // Linux invokes the filesystem flush hook for each closing file
+        // description. The descriptor is removed even if flushing fails.
+        let _ = poll_blocking(ops.flush());
         let has_duplicate = fd::with_table(task, |t| t.has_other_ops(fd, ops)).unwrap_or(false);
         if !has_duplicate {
             let raw = alloc::sync::Arc::as_ptr(ops) as *const ();
