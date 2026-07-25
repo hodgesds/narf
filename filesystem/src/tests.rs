@@ -2968,6 +2968,14 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
                 }),
             ))
         }
+        40 => Some(fuse_reply(
+            unique,
+            0,
+            &pod_as_bytes(&FusePollOut {
+                revents: crate::POLL_IN,
+                padding: 0,
+            }),
+        )),
         // FUSE_WRITE (16): report the requested payload size.
         16 => {
             let win: FuseWriteIn = pod_from_bytes(body)?;
@@ -3364,6 +3372,12 @@ fn smoke_fs_fuse_mutations() -> TestResult {
             || file.seek(4, 3).await != Ok(8)
             || file.copy_file_range_to(0, &*file, 8, 16, 0).await != Ok(16)
         {
+            OUTCOME.store(4, Ordering::Relaxed);
+            return;
+        }
+        let _ = file.poll_readiness();
+        narf_scheduler::yield_now().await;
+        if file.poll_readiness() != crate::POLL_IN {
             OUTCOME.store(4, Ordering::Relaxed);
             return;
         }

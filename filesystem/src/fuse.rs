@@ -54,6 +54,7 @@ pub enum FuseOpcode {
     Create = 35,
     Interrupt = 36,
     Destroy = 38,
+    Poll = 40,
     Fallocate = 43,
     Rename2 = 45,
     Lseek = 46,
@@ -472,6 +473,31 @@ pub struct FuseCopyFileRangeIn {
 pub struct FuseInterruptIn {
     pub unique: u64,
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FusePollIn {
+    pub fh: u64,
+    pub kh: u64,
+    pub flags: u32,
+    pub events: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FusePollOut {
+    pub revents: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseNotifyPollWakeupOut {
+    pub kh: u64,
+}
+
+pub const FUSE_POLL_SCHEDULE_NOTIFY: u32 = 1;
+pub const FUSE_NOTIFY_POLL: i32 = 1;
 
 /// `struct fuse_forget_in` — FORGET request body: the drop count for a
 /// nodeid the client no longer caches. 8 bytes.

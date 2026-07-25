@@ -29,7 +29,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -48,6 +48,9 @@ struct FuseReply {
     body: Vec<u8>,
 }
 
+type PollState = (Arc<AtomicU32>, Arc<AtomicBool>);
+type PendingPoll = (u64, Arc<AtomicU32>, Arc<AtomicBool>);
+
 /// Shared queue object connecting the kernel VFS to a userspace FUSE
 /// daemon. One is minted per `open("/dev/fuse")`.
 ///
@@ -62,6 +65,8 @@ pub struct FuseConnection {
     pending: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
     replies: IrqSafeSpinLock<BTreeMap<u64, Option<FuseReply>>>,
     delivered: IrqSafeSpinLock<BTreeSet<u64>>,
+    poll_requests: IrqSafeSpinLock<BTreeMap<u64, PendingPoll>>,
+    poll_handles: IrqSafeSpinLock<BTreeMap<u64, PollState>>,
     next_unique: AtomicU64,
     connected: core::sync::atomic::AtomicBool,
     /// True once FUSE_INIT has completed successfully.
@@ -90,6 +95,8 @@ impl FuseConnection {
             pending: IrqSafeSpinLock::new(VecDeque::new()),
             replies: IrqSafeSpinLock::new(BTreeMap::new()),
             delivered: IrqSafeSpinLock::new(BTreeSet::new()),
+            poll_requests: IrqSafeSpinLock::new(BTreeMap::new()),
+            poll_handles: IrqSafeSpinLock::new(BTreeMap::new()),
             // Linux starts `unique` at 1 and only ever uses even values in
             // some versions; any monotone non-zero sequence is spec-legal.
             next_unique: AtomicU64::new(1),
@@ -237,10 +244,30 @@ impl FuseConnection {
         // `len` counts the header + body; clamp to what was actually
         // supplied so a lying daemon can't make us read OOB.
         let claimed = hdr.len as usize;
-        if claimed < hdr_len || claimed > reply.len() || hdr.error > 0 || hdr.error < -4095 {
+        if claimed < hdr_len || claimed > reply.len() || hdr.error < -4095 {
             return None;
         }
         let body = reply[hdr_len..claimed].to_vec();
+        if hdr.unique == 0 && hdr.error == FUSE_NOTIFY_POLL {
+            let notify: FuseNotifyPollWakeupOut = pod_from_bytes(&body)?;
+            if let Some((_, registered)) = self.poll_handles.lock().get(&notify.kh).cloned() {
+                registered.store(false, Ordering::Release);
+            }
+            return Some(claimed);
+        }
+        if hdr.error > 0 {
+            return None;
+        }
+        if let Some((kh, readiness, registered)) = self.poll_requests.lock().remove(&hdr.unique) {
+            if hdr.error == 0 {
+                let out: FusePollOut = pod_from_bytes(&body)?;
+                readiness.store(out.revents, Ordering::Release);
+                self.poll_handles.lock().insert(kh, (readiness, registered));
+            }
+            self.replies.lock().remove(&hdr.unique);
+            self.delivered.lock().remove(&hdr.unique);
+            return Some(claimed);
+        }
         self.delivered.lock().remove(&hdr.unique);
         let mut g = self.replies.lock();
         match g.get_mut(&hdr.unique) {
@@ -491,6 +518,9 @@ pub struct FuseFile {
     /// Daemon file handle from FUSE_OPEN, if opened. Guarded because
     /// `open` happens lazily inside an async read.
     fh: IrqSafeSpinLock<Option<u64>>,
+    poll_kh: u64,
+    poll_registered: Arc<AtomicBool>,
+    readiness: Arc<AtomicU32>,
 }
 
 impl core::fmt::Debug for FuseFile {
@@ -911,6 +941,31 @@ impl FileOps for FuseFile {
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
+
+    fn poll_readiness(&self) -> u32 {
+        if !self.poll_registered.swap(true, Ordering::AcqRel) {
+            if let Some(fh) = *self.fh.lock() {
+                let body = pod_as_bytes(&FusePollIn {
+                    fh,
+                    kh: self.poll_kh,
+                    flags: FUSE_POLL_SCHEDULE_NOTIFY,
+                    events: POLL_IN | POLL_OUT,
+                });
+                let unique = self.conn.submit(FuseOpcode::Poll, self.attr.nodeid, &body);
+                self.conn.poll_requests.lock().insert(
+                    unique,
+                    (
+                        self.poll_kh,
+                        Arc::clone(&self.readiness),
+                        Arc::clone(&self.poll_registered),
+                    ),
+                );
+            } else {
+                self.poll_registered.store(false, Ordering::Release);
+            }
+        }
+        self.readiness.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for FuseFile {
@@ -956,6 +1011,7 @@ impl core::fmt::Debug for FuseDir {
 
 impl FuseDir {
     fn file_from_entry(&self, out: FuseEntryOut, fh: Option<u64>) -> Arc<dyn FileOps> {
+        let poll_kh = self.conn.alloc_unique();
         Arc::new(FuseFile {
             conn: Arc::clone(&self.conn),
             attr: NodeAttr {
@@ -966,6 +1022,9 @@ impl FuseDir {
                 gid: out.attr.gid,
             },
             fh: IrqSafeSpinLock::new(fh),
+            poll_kh,
+            poll_registered: Arc::new(AtomicBool::new(false)),
+            readiness: Arc::new(AtomicU32::new(POLL_IN | POLL_OUT)),
         }) as Arc<dyn FileOps>
     }
 
@@ -1034,10 +1093,14 @@ impl DirOps for FuseDir {
             if attr.file_type() == FileType::Dir {
                 return Err(FsError::InvalidPath);
             }
+            let poll_kh = self.conn.alloc_unique();
             Ok(Arc::new(FuseFile {
                 conn: Arc::clone(&self.conn),
                 attr,
                 fh: IrqSafeSpinLock::new(None),
+                poll_kh,
+                poll_registered: Arc::new(AtomicBool::new(false)),
+                readiness: Arc::new(AtomicU32::new(POLL_IN | POLL_OUT)),
             }) as Arc<dyn FileOps>)
         })
     }

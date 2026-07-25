@@ -199,6 +199,11 @@ SEEK_HOLE), and COPY_FILE_RANGE when both files share one connection;
 the syscall layer retains truncate/zero, generic seek, and buffered-copy
 fallbacks for filesystems that return `Unsupported`.
 
+FUSE file handles register `POLL` once with a stable kernel handle and
+cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that
+registration so the next readiness query re-polls the daemon. Poll
+requests never leave ordinary reply slots behind.
+
 Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with
 `FsError::InvalidData`; a disconnected daemon fails pending requests
