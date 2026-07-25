@@ -194,6 +194,12 @@ request with an empty body, retires registered passthrough backings, and
 does not retain an unobserved reply slot. Failed INIT and already-disconnected
 connections do not send DESTROY.
 
+Every `/dev/fuse` or direct `FuseFs` connection is represented at
+`/sys/fs/fuse/connections/<id>`. Its `waiting` attribute reports queued plus
+in-flight requests, and writing `abort` disconnects the daemon and completes
+parked callers with `ENOTCONN`. The directory is removed when the connection
+object is finally reclaimed.
+
 - An empty blocking read parks in the syscall layer; a non-blocking
   read reports `EAGAIN`.
 - A daemon buffer smaller than the next complete request reports

@@ -61,6 +61,7 @@ pub struct FuseRequestContext {
 pub type FuseRequestContextProvider = fn() -> FuseRequestContext;
 
 static REQUEST_CONTEXT_PROVIDER: AtomicUsize = AtomicUsize::new(0);
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn install_request_context_provider(provider: FuseRequestContextProvider) {
     REQUEST_CONTEXT_PROVIDER.store(provider as usize, Ordering::Release);
@@ -93,6 +94,8 @@ pub fn __test_reset_request_context_provider() {
 /// - `connected`: cleared when the daemon closes `/dev/fuse` so parked
 ///   callers can fail with `ENOTCONN`/`Unsupported` instead of hanging.
 pub struct FuseConnection {
+    connection_id: u64,
+    sysfs_registered: AtomicBool,
     pending: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
     replies: IrqSafeSpinLock<BTreeMap<u64, Option<FuseReply>>>,
     delivered: IrqSafeSpinLock<BTreeSet<u64>>,
@@ -137,6 +140,8 @@ impl Default for FuseConnection {
 impl FuseConnection {
     pub fn new() -> Self {
         FuseConnection {
+            connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+            sysfs_registered: AtomicBool::new(false),
             pending: IrqSafeSpinLock::new(VecDeque::new()),
             replies: IrqSafeSpinLock::new(BTreeMap::new()),
             delivered: IrqSafeSpinLock::new(BTreeSet::new()),
@@ -184,6 +189,40 @@ impl FuseConnection {
 
     pub fn max_pages(&self) -> u16 {
         self.max_pages.load(Ordering::Acquire)
+    }
+
+    pub fn connection_id(&self) -> u64 {
+        self.connection_id
+    }
+
+    pub fn waiting_requests(&self) -> usize {
+        self.pending.lock().len() + self.delivered.lock().len()
+    }
+
+    fn ensure_sysfs(self: &Arc<Self>) {
+        if self.sysfs_registered.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let root = crate::sysfs::get_root();
+        let fs = crate::sysfs::get_or_create_child(&root, "fs");
+        let fuse = crate::sysfs::get_or_create_child(&fs, "fuse");
+        let connections = crate::sysfs::get_or_create_child(&fuse, "connections");
+        let node =
+            crate::sysfs::Kobject::new_child(connections, alloc::format!("{}", self.connection_id));
+
+        let waiting = Arc::downgrade(self);
+        crate::sysfs::kobject_add_attr(&node, "waiting", move || {
+            waiting
+                .upgrade()
+                .map(|conn| alloc::format!("{}\n", conn.waiting_requests()))
+                .unwrap_or_else(|| "0\n".into())
+        });
+        let abort = Arc::downgrade(self);
+        crate::sysfs::kobject_add_writable_attr(&node, "abort", String::new, move |_data| {
+            let conn = abort.upgrade().ok_or(FsError::NotFound)?;
+            conn.disconnect();
+            Ok(())
+        });
     }
 
     fn is_fresh_endpoint(&self) -> bool {
@@ -754,9 +793,9 @@ impl DevFuse {
     /// caller's fd table; the mount path later recovers the connection via
     /// [`DevFuse::connection_of`].
     pub fn open_new() -> Arc<dyn FileOps> {
-        Arc::new(DevFuse {
-            conn: Arc::new(FuseConnection::new()),
-        })
+        let conn = Arc::new(FuseConnection::new());
+        conn.ensure_sysfs();
+        Arc::new(DevFuse { conn })
     }
 
     /// The connection this device fd owns.
@@ -2172,6 +2211,7 @@ impl FuseFs {
     /// mount's `fd=N`). The FUSE_INIT handshake must be driven separately
     /// via [`FuseFs::init`] before the FS is usable.
     pub fn new(name: impl Into<String>, conn: Arc<FuseConnection>) -> Self {
+        conn.ensure_sysfs();
         FuseFs {
             name: name.into(),
             conn,
@@ -2225,6 +2265,22 @@ impl FuseFs {
         self.conn.max_pages.store(max_pages, Ordering::Release);
         self.conn.initialized.store(true, Ordering::Release);
         Ok(out)
+    }
+}
+
+impl Drop for FuseConnection {
+    fn drop(&mut self) {
+        if !self.sysfs_registered.load(Ordering::Acquire) {
+            return;
+        }
+        let root = crate::sysfs::get_root();
+        if let Some(connections) = root
+            .get_child("fs")
+            .and_then(|fs| fs.get_child("fuse"))
+            .and_then(|fuse| fuse.get_child("connections"))
+        {
+            connections.remove_child(&alloc::format!("{}", self.connection_id));
+        }
     }
 }
 

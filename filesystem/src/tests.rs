@@ -4242,6 +4242,34 @@ fn smoke_fs_fuse_destroy_after_init() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_destroy_after_init);
 
+fn smoke_fs_fuse_sysfs_connection_controls() -> TestResult {
+    use crate::fuse_conn::DevFuse;
+
+    let dev = DevFuse::open_new();
+    let conn = DevFuse::connection_of(&dev).unwrap();
+    let id = alloc::format!("{}", conn.connection_id());
+    let root = crate::sysfs::get_root();
+    let node = root
+        .get_child("fs")
+        .and_then(|fs| fs.get_child("fuse"))
+        .and_then(|fuse| fuse.get_child("connections"))
+        .and_then(|connections| connections.get_child(&id));
+    let Some(node) = node else {
+        return TestResult::Fail("FUSE connection missing from sysfs");
+    };
+    if node.attr_show("waiting").as_deref() != Some("0\n") {
+        return TestResult::Fail("FUSE sysfs waiting count was not zero");
+    }
+    if !node.attr_is_writable("abort") {
+        return TestResult::Fail("FUSE sysfs abort was not writable");
+    }
+    match node.attr_store("abort", b"1\n") {
+        Some(Ok(())) if !conn.is_connected() => TestResult::Pass,
+        _ => TestResult::Fail("FUSE sysfs abort did not disconnect"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_sysfs_connection_controls);
+
 /// Test-only unmount helper for the FUSE e2e mounts.
 fn unmount_for_test_fuse(path: &str) -> Result<(), crate::FsError> {
     use narf_capabilities::Cap;
