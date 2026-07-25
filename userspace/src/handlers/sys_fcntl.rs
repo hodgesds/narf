@@ -1,6 +1,7 @@
 #[allow(unused_imports)]
 use super::*;
 
+#[cfg(feature = "linux-compat")]
 fn write_flock_to_user(ptr: u64, flock: &UFlock) -> Result<(), ()> {
     let mut bytes = alloc::vec![0u8; flock_size()];
     // SAFETY: `UFlock` is repr(C) and `bytes` has the architecture's
