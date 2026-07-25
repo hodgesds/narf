@@ -210,7 +210,10 @@ with `NLMSG_DONE`. Mutations and unsupported nfnetlink subsystems return
 AF_NETLINK sockets retain their bound `sockaddr_nl` port ID and group mask,
 support a connected kernel or userspace destination, auto-bind before the
 first send, and expose Linux `SOL_NETLINK` membership and feature-option
-round trips. Explicit port IDs are unique within each netlink protocol.
+round trips. Group membership is not limited to the legacy 32-bit
+`sockaddr_nl.nl_groups` mask; `NETLINK_ADD_MEMBERSHIP`,
+`NETLINK_DROP_MEMBERSHIP`, and `NETLINK_LIST_MEMBERSHIPS` retain and report
+the full group-number bitmap. Explicit port IDs are unique within each netlink protocol.
 `sendto` or connected send to a live userspace port delivers one datagram and
 reports the sender's port ID through `recvfrom`; a missing destination returns
 `ECONNREFUSED`. Userspace multicast is rejected because NARF does not infer

@@ -22,7 +22,7 @@
 //! everything below shares the SocketFile/FdEntry plumbing.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -54,6 +54,7 @@ pub const NETLINK_DROP_MEMBERSHIP: u32 = 2;
 pub const NETLINK_PKTINFO: u32 = 3;
 pub const NETLINK_BROADCAST_ERROR: u32 = 4;
 pub const NETLINK_NO_ENOBUFS: u32 = 5;
+pub const NETLINK_LIST_MEMBERSHIPS: u32 = 9;
 pub const NETLINK_CAP_ACK: u32 = 10;
 pub const NETLINK_EXT_ACK: u32 = 11;
 pub const NETLINK_GET_STRICT_CHK: u32 = 12;
@@ -401,6 +402,9 @@ pub struct SocketFile {
     /// unbound; an explicit bind with nl_pid=0 allocates a unique ID.
     netlink_portid: AtomicU32,
     netlink_groups: AtomicU32,
+    /// Full Linux multicast group-number membership. `sockaddr_nl.nl_groups`
+    /// mirrors groups 1..=32; SOL_NETLINK can address higher group numbers.
+    netlink_memberships: IrqSafeSpinLock<BTreeSet<u32>>,
     netlink_peer_portid: AtomicU32,
     netlink_peer_groups: AtomicU32,
     netlink_pktinfo: AtomicBool,
@@ -726,6 +730,7 @@ impl SocketFile {
             last_recv_cred: IrqSafeSpinLock::new(Ucred::default()),
             netlink_portid: AtomicU32::new(0),
             netlink_groups: AtomicU32::new(0),
+            netlink_memberships: IrqSafeSpinLock::new(BTreeSet::new()),
             netlink_peer_portid: AtomicU32::new(0),
             netlink_peer_groups: AtomicU32::new(0),
             netlink_pktinfo: AtomicBool::new(false),
@@ -851,6 +856,15 @@ impl SocketFile {
         };
         self.netlink_portid.store(portid, Ordering::Release);
         self.netlink_groups.store(groups, Ordering::Release);
+        {
+            let mut memberships = self.netlink_memberships.lock();
+            memberships.retain(|group| *group > 32);
+            for bit in 0..32 {
+                if groups & (1u32 << bit) != 0 {
+                    memberships.insert(bit + 1);
+                }
+            }
+        }
         SocketOpResult::Ok(0)
     }
 
@@ -2079,14 +2093,21 @@ impl SocketFile {
             let flag = value != 0;
             match name {
                 NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => {
-                    if !(1..=32).contains(&value) {
+                    if value == 0 {
                         return SocketOpResult::Err(SockError::InvalidArg);
                     }
-                    let bit = 1u32 << (value - 1);
                     if name == NETLINK_ADD_MEMBERSHIP {
-                        self.netlink_groups.fetch_or(bit, Ordering::AcqRel);
+                        self.netlink_memberships.lock().insert(value);
                     } else {
-                        self.netlink_groups.fetch_and(!bit, Ordering::AcqRel);
+                        self.netlink_memberships.lock().remove(&value);
+                    }
+                    if value <= 32 {
+                        let bit = 1u32 << (value - 1);
+                        if name == NETLINK_ADD_MEMBERSHIP {
+                            self.netlink_groups.fetch_or(bit, Ordering::AcqRel);
+                        } else {
+                            self.netlink_groups.fetch_and(!bit, Ordering::AcqRel);
+                        }
                     }
                 }
                 NETLINK_PKTINFO => self.netlink_pktinfo.store(flag, Ordering::Release),
@@ -2477,6 +2498,27 @@ impl SocketFile {
             }
             (SOL_NETLINK, NETLINK_GET_STRICT_CHK) => {
                 write_bool(buf, self.netlink_strict_check.load(Ordering::Acquire))
+            }
+            (SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS) => {
+                let memberships = self.netlink_memberships.lock();
+                let words = memberships
+                    .last()
+                    .map(|group| ((*group as usize) + 31) / 32)
+                    .unwrap_or(0);
+                let n = core::cmp::min(buf.len() / 4, words) * 4;
+                buf[..n].fill(0);
+                for group in memberships.iter().copied() {
+                    let word = (group as usize - 1) / 32;
+                    if word * 4 >= n {
+                        continue;
+                    }
+                    let offset = word * 4;
+                    let mut value =
+                        u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap_or([0; 4]));
+                    value |= 1u32 << ((group - 1) % 32);
+                    buf[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+                }
+                SocketOpResult::OptValue { n }
             }
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
@@ -4030,4 +4072,33 @@ fn smoke_socket_ioctl_unknown_is_unsupported() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_socket_ioctl_unknown_is_unsupported
+);
+
+fn smoke_netlink_lists_high_membership_groups() -> TestResult {
+    let sock = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+    for group in [2u32, 65] {
+        if !matches!(
+            sock.handle_setsockopt(SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group.to_ne_bytes()),
+            SocketOpResult::Ok(0)
+        ) {
+            return TestResult::Fail("NETLINK_ADD_MEMBERSHIP rejected a valid group");
+        }
+    }
+    let mut bitmap = [0u8; 12];
+    if !matches!(
+        sock.handle_getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, &mut bitmap),
+        SocketOpResult::OptValue { n: 12 }
+    ) {
+        return TestResult::Fail("NETLINK_LIST_MEMBERSHIPS returned the wrong size");
+    }
+    if u32::from_ne_bytes(bitmap[0..4].try_into().unwrap_or([0; 4])) != 0b10
+        || u32::from_ne_bytes(bitmap[8..12].try_into().unwrap_or([0; 4])) != 1
+    {
+        return TestResult::Fail("NETLINK_LIST_MEMBERSHIPS returned the wrong bitmap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_netlink_lists_high_membership_groups
 );
