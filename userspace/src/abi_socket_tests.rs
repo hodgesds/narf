@@ -1490,6 +1490,8 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETROUTE: u16 = 26;
 /// netlink control message types (netlink.h).
 const NLMSG_DONE: u16 = 3;
 const NLMSG_HDRLEN: usize = 16;
@@ -1673,6 +1675,45 @@ fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getaddr_dump);
+
+fn smoke_abi_netlink_route_getroute_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETROUTE, 9);
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send(RTM_GETROUTE) did not echo the request length");
+        }
+        let mut buf = [0u8; 512];
+        let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+        if n < (NLMSG_HDRLEN + 12) as i64 {
+            return Err("recv did not return a full RTM_NEWROUTE message");
+        }
+        if nlmsg_type_of(&buf) != RTM_NEWROUTE {
+            return Err("first route-dump message was not RTM_NEWROUTE");
+        }
+        if buf[NLMSG_HDRLEN] != AF_INET as u8 {
+            return Err("RTM_NEWROUTE rtm_family was not AF_INET");
+        }
+        let mut saw_done = false;
+        for _ in 0..32 {
+            let mut b2 = [0u8; 512];
+            let m = netlink_recv(fd, &mut b2).ok_or("drain recv status")?;
+            if m < NLMSG_HDRLEN as i64 {
+                break;
+            }
+            if nlmsg_type_of(&b2) == NLMSG_DONE {
+                saw_done = true;
+                break;
+            }
+        }
+        if !saw_done {
+            return Err("RTM_GETROUTE dump did not terminate with NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getroute_dump);
 
 fn smoke_abi_netlink_uevent_recv() -> TestResult {
     with_setup(|| {

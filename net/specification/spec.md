@@ -104,6 +104,17 @@ RX. Used by `verification/` to test the contract without hardware.
   cap-scoped domain); each has its own rings. The kernel does not
   multiplex among them.
 
+### 3.6 Linux rtnetlink compatibility
+
+`NETLINK_ROUTE` provides read-only Linux wire-compatible dumps for
+`RTM_GETLINK`, `RTM_GETADDR`, and `RTM_GETROUTE`. Replies expose the
+interface registry, configured IPv4 addresses, and IPv4 FIB respectively,
+echo the request sequence, identify the kernel sender with port ID zero, carry
+`NLM_F_MULTI`, and terminate with `NLMSG_DONE`. Unsupported request types return
+`NLMSG_ERROR(-EOPNOTSUPP)`. Rtnetlink mutation requests are not an ambient
+administration path; control-plane writes continue to require the typed
+`Cap<NetIface, Admin>` operations in §3.3.
+
 ## 4. Invariants & safety properties
 
 - A frame buffer is owned by exactly one holder at a time — either

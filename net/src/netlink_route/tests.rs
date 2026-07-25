@@ -64,7 +64,7 @@ fn getlink_dump_has_loopback_and_terminates() {
     let (_len, mtype, flags, seq, pid) = hdr_of(&msgs[0]);
     assert_eq!(mtype, RTM_NEWLINK);
     assert_eq!(seq, 42);
-    assert_eq!(pid, 1234);
+    assert_eq!(pid, 0, "reply sender is the kernel netlink endpoint");
     assert_ne!(
         flags & NLM_F_MULTI,
         0,
@@ -102,6 +102,42 @@ fn getaddr_dump_is_well_formed() {
 }
 
 #[test]
+fn getroute_dump_has_loopback_and_terminates() {
+    let msgs = build_dump(&req(RTM_GETROUTE, 19, 88));
+    assert!(msgs.len() >= 2, "expected >=1 NEWROUTE + a DONE");
+
+    let (_len, mtype, flags, seq, pid) = hdr_of(&msgs[0]);
+    assert_eq!(mtype, RTM_NEWROUTE);
+    assert_eq!(flags & NLM_F_MULTI, NLM_F_MULTI);
+    assert_eq!(seq, 19);
+    assert_eq!(pid, 0);
+
+    // struct rtmsg is 12 bytes. The always-present synthetic loopback route
+    // is AF_INET 127.0.0.0/8, local-table, host-scope, with oif=1.
+    assert_eq!(msgs[0][NLMSG_HDRLEN], AF_INET);
+    assert_eq!(msgs[0][NLMSG_HDRLEN + 1], 8);
+    assert_eq!(msgs[0][NLMSG_HDRLEN + 4], crate::route::TABLE_LOCAL);
+    assert_eq!(msgs[0][NLMSG_HDRLEN + 6], crate::route::Scope::Host as u8);
+    assert_eq!(msgs[0][NLMSG_HDRLEN + 7], RTN_LOCAL);
+    assert_eq!(
+        find_rtattr(&msgs[0], 12, RTA_DST).as_deref(),
+        Some(&[127, 0, 0, 0][..])
+    );
+    assert_eq!(
+        find_rtattr(&msgs[0], 12, RTA_OIF).as_deref(),
+        Some(&1u32.to_le_bytes()[..])
+    );
+    assert_eq!(
+        find_rtattr(&msgs[0], 12, RTA_PREFSRC).as_deref(),
+        Some(&[127, 0, 0, 1][..])
+    );
+
+    let (_l, dtype, _f, dseq, _p) = hdr_of(msgs.last().unwrap());
+    assert_eq!(dtype, NLMSG_DONE);
+    assert_eq!(dseq, 19);
+}
+
+#[test]
 fn unsupported_request_yields_eopnotsupp_error() {
     // RTM_GETLINK is 18; use a bogus type the responder doesn't handle.
     let bogus: u16 = 999;
@@ -110,7 +146,7 @@ fn unsupported_request_yields_eopnotsupp_error() {
     let (_len, mtype, _flags, seq, pid) = hdr_of(&msgs[0]);
     assert_eq!(mtype, NLMSG_ERROR);
     assert_eq!(seq, 8);
-    assert_eq!(pid, 55);
+    assert_eq!(pid, 0);
     // nlmsgerr.error is the first i32 of the payload: -EOPNOTSUPP.
     let err = i32::from_le_bytes([
         msgs[0][NLMSG_HDRLEN],

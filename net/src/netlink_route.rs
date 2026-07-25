@@ -2,20 +2,22 @@
 //!
 //! systemd-udevd and systemd-networkd (plus `ip link` / `ip addr`) open a
 //! `socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)` and send `RTM_GETLINK` /
-//! `RTM_GETADDR` dump requests to enumerate the machine's interfaces and
-//! their addresses. This module parses those request headers and builds the
-//! reply message stream describing NARF's interfaces: a synthetic loopback
-//! (`lo`, ifindex 1) plus every NIC in the `iface` registry.
+//! `RTM_GETADDR` / `RTM_GETROUTE` dump requests to enumerate the machine's
+//! interfaces, addresses, and IPv4 routes. This module parses those request
+//! headers and builds the reply message stream describing NARF's interfaces:
+//! a synthetic loopback (`lo`, ifindex 1) plus every NIC in the `iface`
+//! registry.
 //!
 //! Wire layout follows `include/uapi/linux/{netlink,rtnetlink,if_link,
 //! if_addr}.h`. Every message is `NLMSG_ALIGN`-padded and carries the
-//! request's `seq` and `pid` echoed back, so the requester's libnl / sd-netlink
-//! sequence tracking matches replies to requests. A dump terminates with an
-//! `NLMSG_DONE`; an unsupported request type answers `NLMSG_ERROR(-EOPNOTSUPP)`.
+//! request's `seq` echoed back and kernel sender port ID (`pid = 0`), so the
+//! requester's libnl / sd-netlink sequence and sender validation match Linux.
+//! A dump terminates with an `NLMSG_DONE`; an unsupported request type answers
+//! `NLMSG_ERROR(-EOPNOTSUPP)`.
 //!
-//! This is a DUMP responder only — it does not implement `RTM_NEWLINK` writes,
-//! neighbor tables, or route tables. Those degrade to `NLMSG_ERROR` so a
-//! caller sees a clean errno rather than a hang.
+//! This is a DUMP responder only — it does not implement rtnetlink writes or
+//! neighbor tables. Those degrade to `NLMSG_ERROR` so a caller sees a clean
+//! errno rather than a hang.
 
 extern crate alloc;
 
@@ -52,6 +54,8 @@ pub const RTM_NEWLINK: u16 = 16;
 pub const RTM_GETLINK: u16 = 18;
 pub const RTM_NEWADDR: u16 = 20;
 pub const RTM_GETADDR: u16 = 22;
+pub const RTM_NEWROUTE: u16 = 24;
+pub const RTM_GETROUTE: u16 = 26;
 
 // ── netlink flags (nlmsg_flags) ─────────────────────────────────────────
 
@@ -74,6 +78,15 @@ pub const IFA_ADDRESS: u16 = 1;
 pub const IFA_LOCAL: u16 = 2;
 pub const IFA_LABEL: u16 = 3;
 
+// ── RTA_* route attribute types (rtnetlink.h) ──────────────────────────
+
+pub const RTA_DST: u16 = 1;
+pub const RTA_OIF: u16 = 4;
+pub const RTA_GATEWAY: u16 = 5;
+pub const RTA_PRIORITY: u16 = 6;
+pub const RTA_PREFSRC: u16 = 7;
+pub const RTA_TABLE: u16 = 15;
+
 // ── interface flags (net_device_flags, if.h) ────────────────────────────
 
 pub const IFF_UP: u32 = 0x1;
@@ -90,6 +103,10 @@ pub const ARPHRD_LOOPBACK: u16 = 772;
 // ── address family (AF_INET) ────────────────────────────────────────────
 
 pub const AF_INET: u8 = 2;
+
+pub const RTPROT_KERNEL: u8 = 2;
+pub const RTN_UNICAST: u8 = 1;
+pub const RTN_LOCAL: u8 = 2;
 
 /// `-EOPNOTSUPP` — the errno an unsupported dump request answers with,
 /// carried in the `NLMSG_ERROR` payload (negated, per netlink convention).
@@ -222,6 +239,46 @@ fn build_newaddr(a: &AddrInfo, seq: u32, pid: u32) -> Vec<u8> {
     frame_message(RTM_NEWADDR, NLM_F_MULTI, seq, pid, &body)
 }
 
+/// Build one `RTM_NEWROUTE` message from the kernel FIB. Payload is
+/// `struct rtmsg` followed by the Linux route attributes relevant to IPv4
+/// consumers (`RTA_DST`, `RTA_OIF`, gateway, metric, and preferred source).
+fn build_newroute(route: &crate::route::Route, ifindex: u32, seq: u32, pid: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(AF_INET); // rtm_family
+    body.push(route.dst.prefix_len); // rtm_dst_len
+    body.push(0); // rtm_src_len
+    body.push(0); // rtm_tos
+    body.push(route.table); // rtm_table (all current table IDs fit in u8)
+    body.push(RTPROT_KERNEL); // rtm_protocol
+    body.push(route.scope as u8); // rtm_scope
+    body.push(if route.table == crate::route::TABLE_LOCAL {
+        RTN_LOCAL
+    } else {
+        RTN_UNICAST
+    }); // rtm_type
+    body.extend_from_slice(&0u32.to_le_bytes()); // rtm_flags
+
+    // Linux omits RTA_DST for the default route (/0).
+    if route.dst.prefix_len != 0 {
+        push_rtattr(&mut body, RTA_DST, &route.dst.addr.0);
+    }
+    push_rtattr(&mut body, RTA_OIF, &ifindex.to_le_bytes());
+    if let Some(gateway) = route.gateway {
+        push_rtattr(&mut body, RTA_GATEWAY, &gateway.0);
+    }
+    if route.metric != 0 {
+        push_rtattr(&mut body, RTA_PRIORITY, &route.metric.to_le_bytes());
+    }
+    if let Some(src) = route.src_hint {
+        push_rtattr(&mut body, RTA_PREFSRC, &src.0);
+    }
+    // Keep the full table ID available to parsers even though current IDs
+    // also fit in rtmsg.rtm_table.
+    push_rtattr(&mut body, RTA_TABLE, &(route.table as u32).to_le_bytes());
+
+    frame_message(RTM_NEWROUTE, NLM_F_MULTI, seq, pid, &body)
+}
+
 /// Build an `NLMSG_DONE` message (payload is a single i32 = 0). Terminates
 /// every dump so the caller stops reading.
 fn build_done(seq: u32, pid: u32) -> Vec<u8> {
@@ -305,7 +362,9 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
         None => return Vec::new(),
     };
     let seq = hdr.seq;
-    let pid = hdr.pid;
+    // Replies originate from the kernel netlink endpoint. Linux stamps
+    // nlmsg_pid=0; the requester's port ID is not echoed in reply headers.
+    let pid = 0;
     let mut out = Vec::new();
     match hdr.msg_type {
         RTM_GETLINK => {
@@ -319,6 +378,36 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
             let (_links, addrs) = enumerate();
             for a in &addrs {
                 out.push(build_newaddr(a, seq, pid));
+            }
+            out.push(build_done(seq, pid));
+        }
+        RTM_GETROUTE => {
+            let (links, _addrs) = enumerate();
+            let mut routes = crate::route::route_list();
+            // Link/address dumps always expose loopback. Mirror that invariant
+            // in route dumps even during early boot before net init installs
+            // the canonical loopback FIB entry.
+            if !routes
+                .iter()
+                .any(|r| r.iface == "lo" && r.dst.addr.0 == [127, 0, 0, 0] && r.dst.prefix_len == 8)
+            {
+                routes.push(crate::route::Route {
+                    dst: crate::route::Ipv4Net {
+                        addr: crate::ipv4::Ipv4Addr([127, 0, 0, 0]),
+                        prefix_len: 8,
+                    },
+                    gateway: None,
+                    iface: alloc::string::String::from("lo"),
+                    src_hint: Some(crate::ipv4::Ipv4Addr([127, 0, 0, 1])),
+                    metric: 0,
+                    scope: crate::route::Scope::Host,
+                    table: crate::route::TABLE_LOCAL,
+                });
+            }
+            for route in &routes {
+                if let Some(link) = links.iter().find(|link| link.name == route.iface) {
+                    out.push(build_newroute(route, link.ifindex, seq, pid));
+                }
             }
             out.push(build_done(seq, pid));
         }
