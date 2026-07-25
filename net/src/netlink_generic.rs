@@ -14,6 +14,8 @@ const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLM_F_MULTI: u16 = 2;
 const NLM_F_ACK: u16 = 4;
+const NLM_F_CAPPED: u16 = 0x100;
+const NLM_F_ACK_TLVS: u16 = 0x200;
 const NLM_F_DUMP: u16 = 0x300;
 
 pub const GENL_ID_CTRL: u16 = 0x10;
@@ -28,6 +30,7 @@ const CTRL_ATTR_HDRSIZE: u16 = 4;
 const CTRL_ATTR_MAXATTR: u16 = 5;
 const ENOENT: i32 = 2;
 const EOPNOTSUPP: i32 = 95;
+const NLMSGERR_ATTR_MSG: u16 = 1;
 
 fn align(len: usize) -> usize {
     (len + 3) & !3
@@ -57,9 +60,10 @@ fn frame(kind: u16, flags: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
 fn error(errno: i32, seq: u32, request: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&(-errno).to_ne_bytes());
-    let echoed = request.len().min(NLMSG_HDRLEN);
-    body.extend_from_slice(&request[..echoed]);
-    body.resize(4 + NLMSG_HDRLEN, 0);
+    body.extend_from_slice(request);
+    if request.len() < NLMSG_HDRLEN {
+        body.resize(4 + NLMSG_HDRLEN, 0);
+    }
     frame(NLMSG_ERROR, 0, seq, &body)
 }
 
@@ -140,6 +144,19 @@ fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
 
 /// Handle every aligned generic-netlink request in one datagram.
 pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+    build_replies_with_options(datagram, ReplyOptions::default())
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ReplyOptions {
+    pub ext_ack: bool,
+    pub cap_ack: bool,
+}
+
+pub fn build_replies_with_options(
+    datagram: &[u8],
+    options: ReplyOptions,
+) -> Result<Vec<Vec<u8>>, ()> {
     let mut offset = 0usize;
     let mut replies = Vec::new();
     while offset < datagram.len() {
@@ -163,7 +180,57 @@ pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
             offset += step;
         }
     }
+    for reply in &mut replies {
+        if options.cap_ack {
+            cap_acknowledgement(reply);
+        }
+        if options.ext_ack {
+            append_extended_ack(reply);
+        }
+    }
     Ok(replies)
+}
+
+fn cap_acknowledgement(message: &mut Vec<u8>) {
+    if message.len() < NLMSG_HDRLEN + 4 + NLMSG_HDRLEN {
+        return;
+    }
+    let kind = u16::from_ne_bytes(message[4..6].try_into().unwrap_or([0; 2]));
+    if kind != NLMSG_ERROR {
+        return;
+    }
+    let len = NLMSG_HDRLEN + 4 + NLMSG_HDRLEN;
+    message.truncate(len);
+    message[0..4].copy_from_slice(&(len as u32).to_ne_bytes());
+    let flags = u16::from_ne_bytes(message[6..8].try_into().unwrap_or([0; 2])) | NLM_F_CAPPED;
+    message[6..8].copy_from_slice(&flags.to_ne_bytes());
+}
+
+fn append_extended_ack(message: &mut Vec<u8>) {
+    if message.len() < NLMSG_HDRLEN + 4 {
+        return;
+    }
+    let kind = u16::from_ne_bytes(message[4..6].try_into().unwrap_or([0; 2]));
+    let errno = i32::from_ne_bytes(
+        message[NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
+    if kind != NLMSG_ERROR || errno >= 0 {
+        return;
+    }
+    let text: &[u8] = match -errno {
+        ENOENT => b"generic-netlink family does not exist\0",
+        EOPNOTSUPP => b"generic-netlink command not supported\0",
+        _ => b"generic-netlink request failed\0",
+    };
+    let declared = u32::from_ne_bytes(message[0..4].try_into().unwrap_or([0; 4])) as usize;
+    message.truncate(declared);
+    push_attr(message, NLMSGERR_ATTR_MSG, text);
+    let new_len = message.len() as u32;
+    message[0..4].copy_from_slice(&new_len.to_ne_bytes());
+    let flags = u16::from_ne_bytes(message[6..8].try_into().unwrap_or([0; 2])) | NLM_F_ACK_TLVS;
+    message[6..8].copy_from_slice(&flags.to_ne_bytes());
 }
 
 #[cfg(test)]
@@ -203,6 +270,25 @@ mod tests {
             ),
             -ENOENT
         );
+    }
+
+    #[test]
+    fn unknown_family_supports_capped_extended_ack() {
+        let request = request(Some(b"nl80211\0"), 1);
+        let replies = build_replies_with_options(
+            &request,
+            ReplyOptions {
+                ext_ack: true,
+                cap_ack: true,
+            },
+        )
+        .unwrap();
+        let flags = u16::from_ne_bytes(replies[0][6..8].try_into().unwrap());
+        assert_ne!(flags & NLM_F_CAPPED, 0);
+        assert_ne!(flags & NLM_F_ACK_TLVS, 0);
+        assert!(replies[0]
+            .windows(b"generic-netlink family does not exist\0".len())
+            .any(|window| window == b"generic-netlink family does not exist\0"));
     }
 
     #[test]

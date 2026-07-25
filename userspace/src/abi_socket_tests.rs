@@ -1577,6 +1577,26 @@ fn netlink_inq(fd: u64) -> Result<u32, &'static str> {
     Ok(bytes)
 }
 
+fn netlink_set_u32(fd: u64, option: u64, value: u32) -> Result<(), &'static str> {
+    let value = value.to_ne_bytes();
+    let result = call(
+        Syscall::SocketSetSockOpt.raw(),
+        SyscallArgs {
+            arg0: fd,
+            arg1: SOL_NETLINK,
+            arg2: option,
+            arg3: value.as_ptr() as u64,
+            arg4: value.len() as u64,
+            arg5: 0,
+        },
+    )
+    .ok_or("setsockopt status")?;
+    if result != 0 {
+        return Err("SOL_NETLINK setsockopt failed");
+    }
+    Ok(())
+}
+
 fn smoke_abi_netlink_route_socket_bind() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;
@@ -2279,6 +2299,50 @@ fn smoke_abi_netlink_generic_batched_requests() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_generic_batched_requests);
+
+fn smoke_abi_netlink_generic_extended_capped_error() -> TestResult {
+    with_setup(|| {
+        const NETLINK_CAP_ACK: u64 = 10;
+        let fd = open_netlink(NETLINK_GENERIC)?;
+        netlink_set_u32(fd, NETLINK_EXT_ACK, 1)?;
+        netlink_set_u32(fd, NETLINK_CAP_ACK, 1)?;
+
+        let mut request = [0u8; 32];
+        request[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        request[4..6].copy_from_slice(&16u16.to_ne_bytes());
+        request[6..8].copy_from_slice(&1u16.to_ne_bytes());
+        request[8..12].copy_from_slice(&94u32.to_ne_bytes());
+        request[16] = 3;
+        request[17] = 2;
+        request[20..22].copy_from_slice(&12u16.to_ne_bytes());
+        request[22..24].copy_from_slice(&2u16.to_ne_bytes());
+        request[24..32].copy_from_slice(b"nl80211\0");
+        if netlink_send(fd, &request).ok_or("generic error send")? != request.len() as i64 {
+            return Err("unknown generic family send failed");
+        }
+        let mut reply = [0u8; 256];
+        let n = netlink_recv(fd, &mut reply).ok_or("generic error recv")?;
+        if n < 36 || nlmsg_type_of(&reply) != 2 {
+            return Err("unknown generic family did not return NLMSG_ERROR");
+        }
+        let flags = u16::from_ne_bytes([reply[6], reply[7]]);
+        if flags & 0x100 == 0 || flags & 0x200 == 0 {
+            return Err("generic error omitted CAPPED or ACK_TLVS flags");
+        }
+        if !window_contains(
+            &reply[..n as usize],
+            b"generic-netlink family does not exist\0",
+        ) {
+            return Err("generic extended ACK diagnostic was missing");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_netlink_generic_extended_capped_error
+);
 
 /// True iff `needle` appears as a contiguous byte window in `hay`.
 fn window_contains(hay: &[u8], needle: &[u8]) -> bool {

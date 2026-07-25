@@ -171,6 +171,8 @@ empty multipart dump terminated by `NLMSG_DONE`.
 Linux-compatible attributes; unknown family names return `ENOENT`. Multiple
 aligned control requests may be batched in one datagram and retain independent
 sequence numbers.
+Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
+same capped echo and diagnostic-TLV rules as rtnetlink.
 
 AF_NETLINK sockets retain their bound `sockaddr_nl` port ID and group mask,
 support a connected kernel or userspace destination, auto-bind before the

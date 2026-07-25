@@ -1573,7 +1573,13 @@ impl SocketFile {
             SocketOp::Connect { addr } => self.connect_netlink(&addr),
             SocketOp::Send { buf, .. } => {
                 self.ensure_netlink_portid();
-                let replies = match narf_net::netlink_generic::build_replies(buf) {
+                let replies = match narf_net::netlink_generic::build_replies_with_options(
+                    buf,
+                    narf_net::netlink_generic::ReplyOptions {
+                        ext_ack: self.netlink_ext_ack.load(Ordering::Acquire),
+                        cap_ack: self.netlink_cap_ack.load(Ordering::Acquire),
+                    },
+                ) {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
