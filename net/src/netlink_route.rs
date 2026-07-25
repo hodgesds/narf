@@ -319,6 +319,33 @@ fn build_newaddr(a: &AddrInfo, seq: u32, pid: u32) -> Vec<u8> {
     frame_message(RTM_NEWADDR, NLM_F_MULTI, seq, pid, &body)
 }
 
+fn build_newaddr_v6(
+    addr: &crate::ipv6::addrs::Ipv6IfAddr,
+    ifindex: u32,
+    seq: u32,
+    pid: u32,
+) -> Vec<u8> {
+    use crate::ipv6::addrs::{AddrScope, AddrState};
+
+    let mut body = Vec::new();
+    body.push(AF_INET6);
+    body.push(addr.prefix_len);
+    let flags = match addr.state {
+        AddrState::Tentative => 0x40,
+        AddrState::Deprecated => 0x20,
+        AddrState::Preferred => 0x80,
+        AddrState::Invalid => 0,
+    };
+    body.push(flags);
+    body.push(match addr.scope {
+        AddrScope::Global | AddrScope::UniqueLocal => 0,
+        AddrScope::LinkLocal => 0x20,
+    });
+    body.extend_from_slice(&ifindex.to_ne_bytes());
+    push_rtattr(&mut body, IFA_ADDRESS, &addr.addr);
+    frame_message(RTM_NEWADDR, NLM_F_MULTI, seq, pid, &body)
+}
+
 /// Build one `RTM_NEWROUTE` message from the kernel FIB. Payload is
 /// `struct rtmsg` followed by the Linux route attributes relevant to IPv4
 /// consumers (`RTA_DST`, `RTA_OIF`, gateway, metric, and preferred source).
@@ -356,6 +383,39 @@ fn build_newroute(route: &crate::route::Route, ifindex: u32, seq: u32, pid: u32)
     // also fit in rtmsg.rtm_table.
     push_rtattr(&mut body, RTA_TABLE, &(route.table as u32).to_le_bytes());
 
+    frame_message(RTM_NEWROUTE, NLM_F_MULTI, seq, pid, &body)
+}
+
+fn build_newroute_v6(
+    route: &crate::ipv6::route::Route,
+    ifindex: u32,
+    seq: u32,
+    pid: u32,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(AF_INET6);
+    body.push(route.prefix_len);
+    body.extend_from_slice(&[0, 0]);
+    body.push(crate::route::TABLE_MAIN);
+    body.push(RTPROT_KERNEL);
+    body.push(0);
+    body.push(RTN_UNICAST);
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    if route.prefix_len != 0 {
+        push_rtattr(&mut body, RTA_DST, &route.prefix);
+    }
+    push_rtattr(&mut body, RTA_OIF, &ifindex.to_ne_bytes());
+    if let Some(gateway) = route.gateway {
+        push_rtattr(&mut body, RTA_GATEWAY, &gateway);
+    }
+    if route.metric != 0 {
+        push_rtattr(&mut body, RTA_PRIORITY, &route.metric.to_ne_bytes());
+    }
+    push_rtattr(
+        &mut body,
+        RTA_TABLE,
+        &(crate::route::TABLE_MAIN as u32).to_ne_bytes(),
+    );
     frame_message(RTM_NEWROUTE, NLM_F_MULTI, seq, pid, &body)
 }
 
@@ -587,6 +647,18 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
                     }
                 }
             }
+            if requested_family == 0 || requested_family == AF_INET6 {
+                for addr in crate::ipv6::addrs::list_all() {
+                    if addr.state == crate::ipv6::addrs::AddrState::Invalid {
+                        continue;
+                    }
+                    if let Some(ifindex) = ifindex_for_name(&addr.iface) {
+                        if requested_ifindex == 0 || requested_ifindex == ifindex {
+                            out.push(build_newaddr_v6(&addr, ifindex, seq, pid));
+                        }
+                    }
+                }
+            }
             out.push(build_done(seq, pid));
         }
         RTM_GETROUTE => {
@@ -625,6 +697,18 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
                         out.push(build_newroute(route, link.ifindex, seq, pid));
                     }
                 }
+                let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
+                let requested_table = req.get(NLMSG_HDRLEN + 4).copied().unwrap_or(0);
+                if requested_family == 0 || requested_family == AF_INET6 {
+                    for route in crate::ipv6::route::list_all() {
+                        if requested_table != 0 && requested_table != crate::route::TABLE_MAIN {
+                            continue;
+                        }
+                        if let Some(link) = links.iter().find(|link| link.name == route.iface) {
+                            out.push(build_newroute_v6(&route, link.ifindex, seq, pid));
+                        }
+                    }
+                }
                 out.push(build_done(seq, pid));
             } else {
                 if req.len() < NLMSG_HDRLEN + 12 || req[NLMSG_HDRLEN] != AF_INET {
@@ -656,9 +740,17 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
         RTM_GETNEIGH => {
             let (links, _addrs) = enumerate();
             let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
+            let requested_ifindex = req
+                .get(NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(i32::from_ne_bytes)
+                .unwrap_or(0);
             if requested_family == 0 || requested_family == AF_INET {
                 for (iface, entry) in crate::arp::snapshot() {
                     if let Some(link) = links.iter().find(|link| link.name == iface) {
+                        if requested_ifindex != 0 && requested_ifindex != link.ifindex as i32 {
+                            continue;
+                        }
                         out.push(build_newneigh(
                             &NeighInfo {
                                 family: AF_INET,
@@ -677,6 +769,9 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
             if requested_family == 0 || requested_family == AF_INET6 {
                 for entry in crate::ipv6::ndp::neigh_list() {
                     if let Some(link) = links.iter().find(|link| link.name == entry.iface) {
+                        if requested_ifindex != 0 && requested_ifindex != link.ifindex as i32 {
+                            continue;
+                        }
                         let state = match entry.state {
                             crate::ipv6::ndp::NeighState::Incomplete => NUD_INCOMPLETE,
                             crate::ipv6::ndp::NeighState::Reachable => NUD_REACHABLE,
@@ -732,7 +827,15 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
         }
         RTM_GETQDISC => {
             let (links, _addrs) = enumerate();
+            let requested_ifindex = req
+                .get(NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(i32::from_ne_bytes)
+                .unwrap_or(0);
             for link in links {
+                if requested_ifindex != 0 && requested_ifindex != link.ifindex as i32 {
+                    continue;
+                }
                 out.push(build_newqdisc(link.ifindex, seq, pid));
             }
             out.push(build_done(seq, pid));
@@ -1153,7 +1256,7 @@ fn validate_strict_request(request: &[u8], hdr: &NlMsgHdr) -> Result<(), i32> {
     let (fixed_len, families): (usize, &[u8]) = match hdr.msg_type {
         RTM_GETLINK => (16, &[0]),
         RTM_GETADDR => (8, &[0, AF_INET, AF_INET6]),
-        RTM_GETROUTE => (12, &[0, AF_INET]),
+        RTM_GETROUTE => (12, &[0, AF_INET, AF_INET6]),
         RTM_GETNEIGH => (12, &[0, AF_INET, AF_INET6]),
         RTM_GETRULE => (12, &[0, AF_INET]),
         RTM_GETQDISC | RTM_GETTCLASS | RTM_GETTFILTER => (20, &[0]),

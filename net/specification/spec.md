@@ -125,7 +125,7 @@ RX. Used by `verification/` to test the contract without hardware.
 `NETLINK_ROUTE` provides Linux wire-compatible dumps for
 `RTM_GETLINK`, `RTM_GETADDR`, `RTM_GETROUTE`, `RTM_GETNEIGH`, and
 `RTM_GETRULE`, plus `RTM_GETQDISC`. Replies expose the interface registry,
-configured IPv4 addresses, IPv4 FIB, live IPv4 ARP plus IPv6 NDP neighbor
+configured IPv4 and IPv6 addresses, both IP-version FIBs, live IPv4 ARP plus IPv6 NDP neighbor
 caches, the canonical local/main/default IPv4 policy rules, and each
 interface's direct-ring `noqueue` discipline respectively,
 echo the request sequence, identify the kernel sender with port ID zero, carry
@@ -166,8 +166,9 @@ Non-dump `RTM_GETROUTE` performs the forwarding table's longest-prefix
 lookup for `RTA_DST`, returning the selected route as one non-multipart reply
 or `ENETUNREACH`.
 Address dumps honor `ifa_family` and `ifa_index`; route dumps honor
-`rtm_family` and `rtm_table`. A valid filter with no matching objects returns
-an empty dump terminated by `NLMSG_DONE`.
+`rtm_family` and `rtm_table`; neighbor and qdisc dumps honor their interface
+index selectors. A valid filter with no matching objects returns an empty dump
+terminated by `NLMSG_DONE`.
 
 Link dumps include Linux operational-state, carrier, qdisc, queue-length,
 broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero

@@ -337,6 +337,66 @@ fn getneigh_dump_terminates() {
 }
 
 #[test]
+fn ipv6_address_message_uses_linux_ifaddr_layout() {
+    let addr = crate::ipv6::addrs::Ipv6IfAddr {
+        iface: "eth0".into(),
+        addr: [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        prefix_len: 64,
+        state: crate::ipv6::addrs::AddrState::Preferred,
+        scope: crate::ipv6::addrs::AddrScope::Global,
+        preferred_deadline_ns: u64::MAX,
+        valid_deadline_ns: u64::MAX,
+        temporary: false,
+    };
+    let msg = build_newaddr_v6(&addr, 7, 46, 0);
+    assert_eq!(hdr_of(&msg).1, RTM_NEWADDR);
+    assert_eq!(msg[NLMSG_HDRLEN], AF_INET6);
+    assert_eq!(msg[NLMSG_HDRLEN + 1], 64);
+    assert_eq!(msg[NLMSG_HDRLEN + 2], 0x80);
+    assert_eq!(
+        u32::from_ne_bytes(msg[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].try_into().unwrap()),
+        7
+    );
+    assert_eq!(
+        find_rtattr(&msg, 8, IFA_ADDRESS).as_deref(),
+        Some(&addr.addr[..])
+    );
+}
+
+#[test]
+fn ipv6_route_message_reports_gateway_and_oif() {
+    let route = crate::ipv6::route::Route {
+        prefix: [0; 16],
+        prefix_len: 0,
+        gateway: Some([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        iface: "eth0".into(),
+        metric: 100,
+        valid_deadline_ns: 0,
+    };
+    let msg = build_newroute_v6(&route, 7, 47, 0);
+    assert_eq!(hdr_of(&msg).1, RTM_NEWROUTE);
+    assert_eq!(msg[NLMSG_HDRLEN], AF_INET6);
+    assert_eq!(
+        find_rtattr(&msg, 12, RTA_OIF).as_deref(),
+        Some(&7u32.to_ne_bytes()[..])
+    );
+    assert_eq!(
+        find_rtattr(&msg, 12, RTA_GATEWAY).as_deref(),
+        route.gateway.as_ref().map(|gateway| &gateway[..])
+    );
+    assert!(find_rtattr(&msg, 12, RTA_DST).is_none());
+}
+
+#[test]
+fn getneigh_dump_honors_ifindex_filter() {
+    let mut request = req(RTM_GETNEIGH, 45, 12);
+    request[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].copy_from_slice(&99i32.to_ne_bytes());
+    let msgs = build_dump(&request);
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(hdr_of(&msgs[0]).1, NLMSG_DONE);
+}
+
+#[test]
 fn getrule_dump_has_linux_default_ipv4_rules() {
     let msgs = build_dump(&req(RTM_GETRULE, 52, 9));
     assert_eq!(msgs.len(), 4);
@@ -379,6 +439,15 @@ fn getqdisc_reports_noqueue_for_loopback() {
         Some(&b"noqueue\0"[..])
     );
     assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
+}
+
+#[test]
+fn getqdisc_dump_honors_ifindex_filter() {
+    let mut request = req(RTM_GETQDISC, 62, 20);
+    request[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].copy_from_slice(&99i32.to_ne_bytes());
+    let msgs = build_dump(&request);
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(hdr_of(&msgs[0]).1, NLMSG_DONE);
 }
 
 #[test]
