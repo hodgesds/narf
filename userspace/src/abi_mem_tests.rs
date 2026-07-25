@@ -465,7 +465,7 @@ fn smoke_abi_mem_get_mempolicy_mems_allowed_pos() -> TestResult {
         let args = SyscallArgs {
             arg0: 0,
             arg1: mask.as_mut_ptr() as u64,
-            arg2: 0,
+            arg2: 64,
             arg3: 0,
             arg4: 4,
             arg5: 0,
@@ -493,6 +493,28 @@ fn smoke_abi_mem_get_mempolicy_default_query_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem_get_mempolicy_default_query_neg);
+
+fn smoke_abi_mem_get_mempolicy_bad_flags_neg() -> TestResult {
+    with_setup(|| {
+        let unknown = call(
+            Syscall::GetMempolicy.raw(),
+            SyscallArgs { arg4: 8, ..a0(0) },
+        );
+        let conflicting = call(
+            Syscall::GetMempolicy.raw(),
+            SyscallArgs {
+                arg4: 4 | 2,
+                ..a0(0)
+            },
+        );
+        if unknown == Some(-22) && conflicting == Some(-22) {
+            Ok(())
+        } else {
+            Err("get_mempolicy should reject unknown/conflicting flags")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_get_mempolicy_bad_flags_neg);
 
 // ── Mbind (237) ──────────────────────────────────────────────────────
 // arg0=addr, arg1=len, arg2=mode, arg3=nodemask ptr. Invalid mode →

@@ -66,6 +66,9 @@ another node. `migrate_pages(2)` moves the caller's resident private pages
 between node masks. Fault-time `set_mempolicy(2)` and `mbind(2)` placement
 is intersected with the task's cgroup-v2 `cpuset.mems.effective` mask;
 `get_mempolicy(MPOL_F_MEMS_ALLOWED)` reports that effective constraint.
+`get_mempolicy(2)` rejects unknown/conflicting flags, undersized nodemask
+buffers, and addresses supplied without `MPOL_F_ADDR`; address+node
+queries fault in valid lazy pages and report their actual SRAT node.
 `mbind(MPOL_MF_MOVE)` immediately conforms resident private pages in the
 range, `MPOL_MF_STRICT` reports remaining misplacement as `EIO`, and
 `MPOL_MF_MOVE_ALL` requires authority NARF does not grant ambiently.

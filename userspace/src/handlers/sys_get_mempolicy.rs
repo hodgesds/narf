@@ -16,11 +16,27 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
     let addr = a.arg3;
     let flags = a.arg4 as u32;
     let task = current_task_id();
+    let valid_flags = MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED;
+    if flags & !valid_flags != 0
+        || (flags & MPOL_F_MEMS_ALLOWED != 0 && flags & (MPOL_F_NODE | MPOL_F_ADDR) != 0)
+        || (addr != 0 && flags & MPOL_F_ADDR == 0)
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let online_nodes = numa_node_count().min(64);
+    if nodemask_ptr != 0 && a.arg2 < online_nodes as u64 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
 
     if flags & MPOL_F_MEMS_ALLOWED != 0 {
         // Report the cgroup-constrained mask of nodes this task may use.
-        let n = numa_node_count().min(64);
-        let online: u64 = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let online: u64 = if online_nodes >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << online_nodes) - 1
+        };
         let allowed = narf_scheduler::task_mems_allowed(task) & online;
         if nodemask_ptr != 0 {
             // SAFETY: copy_to_user validates the user pointer/length.
@@ -32,6 +48,23 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
+
+    let as_ref = if flags & MPOL_F_ADDR != 0 {
+        let Some(as_ref) = current_address_space() else {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        };
+        let in_region = as_ref.regions_snapshot().iter().any(|region| {
+            addr >= region.base.as_u64() && addr < region.base.as_u64().saturating_add(region.len)
+        });
+        if !in_region {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+        Some(as_ref)
+    } else {
+        None
+    };
 
     let policy = if flags & MPOL_F_ADDR != 0 {
         resolve_policy(task, addr)
@@ -45,9 +78,34 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
 
     if mode_ptr != 0 {
         let out_word: i32 = if flags & MPOL_F_NODE != 0 && flags & MPOL_F_ADDR != 0 {
-            // Report the node the page at `addr` would come from.
+            let as_ref = as_ref.expect("MPOL_F_ADDR validated address space");
+            let phys = if let Some(phys) = mapped_phys(&as_ref, addr) {
+                Some(phys)
+            } else {
+                publish_mempolicy_for_fault(addr);
+                // SAFETY: `addr` belongs to a mapped region in the current
+                // live address space; this mirrors Linux lookup_node's GUP
+                // fault-in behavior.
+                let populated = unsafe { as_ref.demand_alloc_page(VirtAddr::new(addr)).is_ok() };
+                clear_mempolicy_for_fault();
+                if populated {
+                    mapped_phys(&as_ref, addr)
+                } else {
+                    None
+                }
+            };
+            let Some(phys) = phys else {
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                return;
+            };
+            numa_node_for_phys(phys) as i32
+        } else if flags & MPOL_F_NODE != 0 {
+            if (policy.mode & !MPOL_MODE_FLAGS) != narf_memory::MPOL_INTERLEAVE {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
             let pol = narf_memory::Mempolicy {
-                mode: policy.mode & !MPOL_MODE_FLAGS,
+                mode: narf_memory::MPOL_INTERLEAVE,
                 nodemask: policy.nodemask,
                 allowed: narf_scheduler::task_mems_allowed(task),
                 home_node: policy.home_node,

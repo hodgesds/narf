@@ -143,9 +143,9 @@ kernel_test_in!(
 );
 
 // ── GetMempolicy (239) — F_NODE|F_ADDR resolved-node writeback ───────
-// The deepest get_mempolicy branch: with MPOL_F_NODE|MPOL_F_ADDR the
-// out word is the resolved NUMA node (not the mode). NARF is single-node
-// for an unbound addr → node 0. Distinct from every abi_mem_tests case.
+// MPOL_F_NODE|MPOL_F_ADDR requires an address belonging to the current
+// address space. The ABI harness has no user AS, so Linux-compatible
+// behavior is EFAULT rather than predicting a placement node.
 
 fn smoke_abi_mem2_get_mempolicy_node_query_pos() -> TestResult {
     with_setup(|| {
@@ -160,18 +160,8 @@ fn smoke_abi_mem2_get_mempolicy_node_query_pos() -> TestResult {
             arg5: 0,
         };
         match call(Syscall::GetMempolicy.raw(), args) {
-            Some(0) => {
-                // The resolved node must be a real online-node index (the
-                // local node for an unbound addr). Pins the F_NODE|F_ADDR
-                // writeback path without coupling to a specific topology.
-                let node = i32::from_le_bytes(node_out);
-                if (0..64).contains(&node) {
-                    Ok(())
-                } else {
-                    Err("get_mempolicy(F_NODE|F_ADDR) should resolve a valid node id")
-                }
-            }
-            Some(_) => Err("get_mempolicy(F_NODE|F_ADDR) should return 0"),
+            Some(-14) => Ok(()),
+            Some(_) => Err("get_mempolicy(F_NODE|F_ADDR) should return EFAULT without an AS"),
             None => Err("get_mempolicy(F_NODE|F_ADDR) returned non-Ok status"),
         }
     })

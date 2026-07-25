@@ -690,7 +690,8 @@ fn gen_numastat() -> Vec<u8> {
         let _ = write!(s, "{:>16}", col);
     }
     let _ = writeln!(s);
-    let rows: [(&str, fn(narf_memory::NumaNodeStats) -> u64); 6] = [
+    type NumaStatValue = fn(narf_memory::NumaNodeStats) -> u64;
+    let rows: [(&str, NumaStatValue); 6] = [
         ("numa_hit", |v| v.numa_hit),
         ("numa_miss", |v| v.numa_miss),
         ("numa_foreign", |v| v.numa_foreign),
