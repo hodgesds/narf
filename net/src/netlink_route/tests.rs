@@ -98,6 +98,37 @@ fn getlink_dump_has_loopback_and_terminates() {
 }
 
 #[test]
+fn getlink_point_query_returns_one_non_multipart_link() {
+    let mut body = vec![0, 0];
+    body.extend_from_slice(&0u16.to_ne_bytes());
+    body.extend_from_slice(&1i32.to_ne_bytes());
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    let request = frame_message(RTM_GETLINK, NLM_F_REQUEST, 43, 7, &body);
+    let replies = build_dump(&request);
+    assert_eq!(replies.len(), 1);
+    let hdr = parse_hdr(&replies[0]).unwrap();
+    assert_eq!(hdr.msg_type, RTM_NEWLINK);
+    assert_eq!(hdr.flags & NLM_F_MULTI, 0);
+    assert_eq!(
+        find_rtattr(&replies[0], 16, IFLA_IFNAME).as_deref(),
+        Some(&b"lo\0"[..])
+    );
+
+    body[4..8].copy_from_slice(&999i32.to_ne_bytes());
+    let missing = frame_message(RTM_GETLINK, NLM_F_REQUEST, 44, 7, &body);
+    let replies = build_dump(&missing);
+    assert_eq!(
+        i32::from_ne_bytes(
+            replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap()
+        ),
+        -ENODEV
+    );
+}
+
+#[test]
 fn getaddr_dump_is_well_formed() {
     let msgs = build_dump(&req(RTM_GETADDR, 5, 77));
     assert!(msgs.len() >= 2, "expected >=1 NEWADDR + a DONE");

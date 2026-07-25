@@ -273,6 +273,13 @@ fn build_newlink(link: &LinkInfo, seq: u32, pid: u32) -> Vec<u8> {
     frame_message(RTM_NEWLINK, NLM_F_MULTI, seq, pid, &body)
 }
 
+fn clear_multipart(message: &mut [u8]) {
+    if message.len() >= NLMSG_HDRLEN {
+        let flags = u16::from_ne_bytes([message[6], message[7]]) & !NLM_F_MULTI;
+        message[6..8].copy_from_slice(&flags.to_ne_bytes());
+    }
+}
+
 /// Description of one address for the RTM_NEWADDR builder.
 struct AddrInfo {
     ifindex: u32,
@@ -497,10 +504,32 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
     match hdr.msg_type {
         RTM_GETLINK => {
             let (links, _addrs) = enumerate();
-            for l in &links {
-                out.push(build_newlink(l, seq, pid));
+            if hdr.flags & NLM_F_DUMP == NLM_F_DUMP {
+                for link in &links {
+                    out.push(build_newlink(link, seq, pid));
+                }
+                out.push(build_done(seq, pid));
+            } else {
+                if req.len() < NLMSG_HDRLEN + 16 {
+                    out.push(build_error(EINVAL, seq, pid, req));
+                    return out;
+                }
+                let ifindex = i32::from_ne_bytes(req[20..24].try_into().unwrap_or([0; 4]));
+                let requested_name = find_attr(req, 16, IFLA_IFNAME).and_then(|raw| {
+                    core::str::from_utf8(raw.strip_suffix(&[0]).unwrap_or(raw)).ok()
+                });
+                let selected = links.iter().find(|link| {
+                    (ifindex > 0 && link.ifindex == ifindex as u32)
+                        || requested_name.is_some_and(|name| link.name == name)
+                });
+                if let Some(link) = selected {
+                    let mut message = build_newlink(link, seq, pid);
+                    clear_multipart(&mut message);
+                    out.push(message);
+                } else {
+                    out.push(build_error(ENODEV, seq, pid, req));
+                }
             }
-            out.push(build_done(seq, pid));
         }
         RTM_GETADDR => {
             let (_links, addrs) = enumerate();
@@ -1043,7 +1072,7 @@ fn validate_strict_request(request: &[u8], hdr: &NlMsgHdr) -> Result<(), i32> {
         mutation if is_mutation(mutation) => return Ok(()),
         _ => return Ok(()),
     };
-    if hdr.flags & NLM_F_DUMP != NLM_F_DUMP || request.len() < NLMSG_HDRLEN + fixed_len {
+    if request.len() < NLMSG_HDRLEN + fixed_len {
         return Err(EINVAL);
     }
     if !families.contains(&request[NLMSG_HDRLEN]) {

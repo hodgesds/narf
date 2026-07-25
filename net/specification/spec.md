@@ -146,10 +146,11 @@ Without `NETLINK_CAP_ACK`, `nlmsgerr` echoes the complete offending request.
 With CAP_ACK enabled the echo is header-only and marked `NLM_F_CAPPED`; any
 extended-ACK attributes follow the capped request header.
 
-When `NETLINK_GET_STRICT_CHK` is enabled, dump requests must carry
-`NLM_F_REQUEST|NLM_F_DUMP`, the Linux fixed request structure for their
-message type, and a valid family selector. Malformed strict requests return
-`EINVAL`.
+When `NETLINK_GET_STRICT_CHK` is enabled, requests must carry
+`NLM_F_REQUEST`, the Linux fixed request structure for their message type,
+and a valid family selector. Malformed strict requests return `EINVAL`.
+Non-dump `RTM_GETLINK` resolves one interface by ifindex or `IFLA_IFNAME`,
+returning a non-multipart reply or `ENODEV`.
 
 Link dumps include Linux operational-state, carrier, qdisc, queue-length,
 broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero
