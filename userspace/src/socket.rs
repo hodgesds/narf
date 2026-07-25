@@ -49,6 +49,14 @@ pub const AF_NETLINK: u16 = 16;
 /// (NETLINK_ADD_MEMBERSHIP, NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK, …).
 /// sd-netlink sets a handful of these best-effort right after `socket()`.
 pub const SOL_NETLINK: u32 = 270;
+pub const NETLINK_ADD_MEMBERSHIP: u32 = 1;
+pub const NETLINK_DROP_MEMBERSHIP: u32 = 2;
+pub const NETLINK_PKTINFO: u32 = 3;
+pub const NETLINK_BROADCAST_ERROR: u32 = 4;
+pub const NETLINK_NO_ENOBUFS: u32 = 5;
+pub const NETLINK_CAP_ACK: u32 = 10;
+pub const NETLINK_EXT_ACK: u32 = 11;
+pub const NETLINK_GET_STRICT_CHK: u32 = 12;
 /// `NETLINK_ROUTE` (rtnetlink) — the interface/address/route dump protocol.
 /// systemd-udevd, systemd-networkd, and `ip link`/`ip addr` open
 /// `socket(AF_NETLINK, SOCK_RAW, 0)` and send RTM_GETLINK/RTM_GETADDR dump
@@ -377,7 +385,21 @@ pub struct SocketFile {
     /// A `SO_PASSCRED` recvmsg on a DGRAM socket reports THESE (per-message
     /// identity), whereas a stream recvmsg reports the fixed `peer_cred`.
     last_recv_cred: IrqSafeSpinLock<Ucred>,
+    /// AF_NETLINK local and connected peer addresses. Port ID zero means
+    /// unbound; an explicit bind with nl_pid=0 allocates a unique ID.
+    netlink_portid: AtomicU32,
+    netlink_groups: AtomicU32,
+    netlink_peer_portid: AtomicU32,
+    netlink_peer_groups: AtomicU32,
+    netlink_pktinfo: AtomicBool,
+    netlink_broadcast_error: AtomicBool,
+    netlink_no_enobufs: AtomicBool,
+    netlink_cap_ack: AtomicBool,
+    netlink_ext_ack: AtomicBool,
+    netlink_strict_check: AtomicBool,
 }
+
+static NEXT_NETLINK_PORTID: AtomicU32 = AtomicU32::new(1);
 
 /// Faithful per-socket storage for set/getsockopt values. Defaults
 /// match Linux's documented defaults. Fields that affect packet
@@ -658,7 +680,82 @@ impl SocketFile {
             peer_cred: IrqSafeSpinLock::new(Ucred::default()),
             passcred: AtomicBool::new(false),
             last_recv_cred: IrqSafeSpinLock::new(Ucred::default()),
+            netlink_portid: AtomicU32::new(0),
+            netlink_groups: AtomicU32::new(0),
+            netlink_peer_portid: AtomicU32::new(0),
+            netlink_peer_groups: AtomicU32::new(0),
+            netlink_pktinfo: AtomicBool::new(false),
+            netlink_broadcast_error: AtomicBool::new(false),
+            netlink_no_enobufs: AtomicBool::new(false),
+            netlink_cap_ack: AtomicBool::new(false),
+            netlink_ext_ack: AtomicBool::new(false),
+            netlink_strict_check: AtomicBool::new(false),
         })
+    }
+
+    fn netlink_addr(addr: &SockAddr) -> Option<(u32, u32)> {
+        if addr.family != AF_NETLINK || addr.body.len() < 10 {
+            return None;
+        }
+        let pid = u32::from_ne_bytes(addr.body[2..6].try_into().ok()?);
+        let groups = u32::from_ne_bytes(addr.body[6..10].try_into().ok()?);
+        Some((pid, groups))
+    }
+
+    fn netlink_sockaddr(portid: u32, groups: u32) -> SockAddr {
+        let mut body = alloc::vec![0u8; 10];
+        body[2..6].copy_from_slice(&portid.to_ne_bytes());
+        body[6..10].copy_from_slice(&groups.to_ne_bytes());
+        SockAddr {
+            family: AF_NETLINK,
+            body,
+        }
+    }
+
+    fn ensure_netlink_portid(&self) -> u32 {
+        let current = self.netlink_portid.load(Ordering::Acquire);
+        if current != 0 {
+            return current;
+        }
+        let allocated = NEXT_NETLINK_PORTID.fetch_add(1, Ordering::Relaxed).max(1);
+        match self.netlink_portid.compare_exchange(
+            0,
+            allocated,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => allocated,
+            Err(existing) => existing,
+        }
+    }
+
+    fn bind_netlink(&self, addr: &SockAddr) -> SocketOpResult {
+        let (requested, groups) = match Self::netlink_addr(addr) {
+            Some(v) => v,
+            None => return SocketOpResult::Err(SockError::InvalidArg),
+        };
+        if self.netlink_portid.load(Ordering::Acquire) != 0 {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        let portid = if requested == 0 {
+            NEXT_NETLINK_PORTID.fetch_add(1, Ordering::Relaxed).max(1)
+        } else {
+            requested
+        };
+        self.netlink_portid.store(portid, Ordering::Release);
+        self.netlink_groups.store(groups, Ordering::Release);
+        SocketOpResult::Ok(0)
+    }
+
+    fn connect_netlink(&self, addr: &SockAddr) -> SocketOpResult {
+        let (portid, groups) = match Self::netlink_addr(addr) {
+            Some(v) => v,
+            None => return SocketOpResult::Err(SockError::InvalidArg),
+        };
+        self.ensure_netlink_portid();
+        self.netlink_peer_portid.store(portid, Ordering::Release);
+        self.netlink_peer_groups.store(groups, Ordering::Release);
+        SocketOpResult::Ok(0)
     }
 
     /// Stamp this socket end's owning credentials (see `local_cred`).
@@ -1254,14 +1351,10 @@ impl SocketFile {
                 // up daemon". Synthesize sockaddr_nl body = nl_pad(2) +
                 // nl_pid(4, unique non-zero) + nl_groups(4).
                 if self.domain == AF_NETLINK {
-                    static NL_PID: AtomicU32 = AtomicU32::new(0);
-                    let pid = NL_PID.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                    let mut body = alloc::vec![0u8; 10];
-                    body[2..6].copy_from_slice(&pid.to_le_bytes());
-                    return SocketOpResult::Addr(SockAddr {
-                        family: AF_NETLINK,
-                        body,
-                    });
+                    return SocketOpResult::Addr(Self::netlink_sockaddr(
+                        self.netlink_portid.load(Ordering::Acquire),
+                        self.netlink_groups.load(Ordering::Acquire),
+                    ));
                 }
                 return match self.local_addr() {
                     Some(a) => SocketOpResult::Addr(a),
@@ -1281,6 +1374,12 @@ impl SocketFile {
                 };
             }
             SocketOp::GetPeerName => {
+                if self.domain == AF_NETLINK {
+                    return SocketOpResult::Addr(Self::netlink_sockaddr(
+                        self.netlink_peer_portid.load(Ordering::Acquire),
+                        self.netlink_peer_groups.load(Ordering::Acquire),
+                    ));
+                }
                 return match self.peer_addr() {
                     Some(a) => SocketOpResult::Addr(a),
                     None => SocketOpResult::Err(SockError::NotConnected),
@@ -1321,8 +1420,10 @@ impl SocketFile {
     fn dispatch_netlink_route(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             // bind(sockaddr_nl{family=16, pid, groups}) — accept any.
-            SocketOp::Bind { .. } => SocketOpResult::Ok(0),
+            SocketOp::Bind { addr } => self.bind_netlink(&addr),
+            SocketOp::Connect { addr } => self.connect_netlink(&addr),
             SocketOp::Send { buf, .. } => {
+                self.ensure_netlink_portid();
                 let sent = buf.len() as u64;
                 let msgs = narf_net::netlink_route::build_dump(buf);
                 {
@@ -1378,9 +1479,13 @@ impl SocketFile {
     fn dispatch_netlink(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             // bind(sockaddr_nl{family=16, pid, groups}) — accept any.
-            SocketOp::Bind { .. } => SocketOpResult::Ok(0),
+            SocketOp::Bind { addr } => self.bind_netlink(&addr),
+            SocketOp::Connect { addr } => self.connect_netlink(&addr),
             // udev clients never send on the monitor; accept + discard.
-            SocketOp::Send { buf, .. } => SocketOpResult::Ok(buf.len() as u64),
+            SocketOp::Send { buf, .. } => {
+                self.ensure_netlink_portid();
+                SocketOpResult::Ok(buf.len() as u64)
+            }
             SocketOp::Recv { buf, flags: _ } => {
                 let ev = {
                     let mut g = self.state.lock();
@@ -1425,9 +1530,12 @@ impl SocketFile {
     /// the socket open surface as EPERM ("Failed to open netlink, ignoring").
     fn dispatch_netlink_sink(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
-            SocketOp::Bind { .. } => SocketOpResult::Ok(0),
-            SocketOp::Connect { .. } => SocketOpResult::Ok(0),
-            SocketOp::Send { buf, .. } => SocketOpResult::Ok(buf.len() as u64),
+            SocketOp::Bind { addr } => self.bind_netlink(&addr),
+            SocketOp::Connect { addr } => self.connect_netlink(&addr),
+            SocketOp::Send { buf, .. } => {
+                self.ensure_netlink_portid();
+                SocketOpResult::Ok(buf.len() as u64)
+            }
             SocketOp::Recv { .. } => SocketOpResult::Err(SockError::WouldBlock),
             SocketOp::Shutdown { how: _ } => SocketOpResult::Ok(0),
             _ => SocketOpResult::Err(SockError::NotSupported),
@@ -1489,6 +1597,36 @@ impl SocketFile {
             }
             Ok(u32::from_ne_bytes([slot[0], slot[1], slot[2], slot[3]]))
         };
+        if level == SOL_NETLINK {
+            let value = match read_u32(value) {
+                Ok(v) => v,
+                Err(e) => return SocketOpResult::Err(e),
+            };
+            let flag = value != 0;
+            match name {
+                NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => {
+                    if !(1..=32).contains(&value) {
+                        return SocketOpResult::Err(SockError::InvalidArg);
+                    }
+                    let bit = 1u32 << (value - 1);
+                    if name == NETLINK_ADD_MEMBERSHIP {
+                        self.netlink_groups.fetch_or(bit, Ordering::AcqRel);
+                    } else {
+                        self.netlink_groups.fetch_and(!bit, Ordering::AcqRel);
+                    }
+                }
+                NETLINK_PKTINFO => self.netlink_pktinfo.store(flag, Ordering::Release),
+                NETLINK_BROADCAST_ERROR => {
+                    self.netlink_broadcast_error.store(flag, Ordering::Release)
+                }
+                NETLINK_NO_ENOBUFS => self.netlink_no_enobufs.store(flag, Ordering::Release),
+                NETLINK_CAP_ACK => self.netlink_cap_ack.store(flag, Ordering::Release),
+                NETLINK_EXT_ACK => self.netlink_ext_ack.store(flag, Ordering::Release),
+                NETLINK_GET_STRICT_CHK => self.netlink_strict_check.store(flag, Ordering::Release),
+                _ => return SocketOpResult::Err(SockError::NotSupported),
+            }
+            return SocketOpResult::Ok(0);
+        }
         // Kernel TCB pushdown: when the socket is bound to a real
         // narf_net::tcp_stack TCB, forward TCP-layer options through
         // the kernel API so the negotiation actually takes effect on
@@ -1848,11 +1986,24 @@ impl SocketFile {
             (IPPROTO_IP, IP_RECVTTL) => write_bool(buf, opts.ip_recvttl),
             (IPPROTO_IP, IP_MTU) => write_u32(buf, opts.ip_mtu),
             (IPPROTO_IP, IP_MULTICAST_TTL) => write_u32(buf, opts.ip_multicast_ttl),
-            // SOL_NETLINK options (NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK, …)
-            // are best-effort probes in sd-netlink; report the feature as off
-            // (0) rather than erroring, since an error becomes the -1 sentinel
-            // (glibc EPERM) and aborts the netlink open.
-            (SOL_NETLINK, _) => write_u32(buf, 0),
+            (SOL_NETLINK, NETLINK_PKTINFO) => {
+                write_bool(buf, self.netlink_pktinfo.load(Ordering::Acquire))
+            }
+            (SOL_NETLINK, NETLINK_BROADCAST_ERROR) => {
+                write_bool(buf, self.netlink_broadcast_error.load(Ordering::Acquire))
+            }
+            (SOL_NETLINK, NETLINK_NO_ENOBUFS) => {
+                write_bool(buf, self.netlink_no_enobufs.load(Ordering::Acquire))
+            }
+            (SOL_NETLINK, NETLINK_CAP_ACK) => {
+                write_bool(buf, self.netlink_cap_ack.load(Ordering::Acquire))
+            }
+            (SOL_NETLINK, NETLINK_EXT_ACK) => {
+                write_bool(buf, self.netlink_ext_ack.load(Ordering::Acquire))
+            }
+            (SOL_NETLINK, NETLINK_GET_STRICT_CHK) => {
+                write_bool(buf, self.netlink_strict_check.load(Ordering::Acquire))
+            }
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }

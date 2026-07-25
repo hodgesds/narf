@@ -1485,6 +1485,9 @@ const AF_NETLINK: u64 = 16;
 const SOCK_RAW: u64 = 3;
 const NETLINK_ROUTE: u64 = 0;
 const NETLINK_KOBJECT_UEVENT: u64 = 15;
+const SOL_NETLINK: u64 = 270;
+const NETLINK_ADD_MEMBERSHIP: u64 = 1;
+const NETLINK_EXT_ACK: u64 = 11;
 /// rtnetlink message types (rtnetlink.h).
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
@@ -1567,6 +1570,95 @@ fn smoke_abi_netlink_route_socket_bind() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_socket_bind);
+
+fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let (addr, alen) = netlink_sockaddr(0);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("netlink bind failed");
+        }
+
+        // Join group 2 via the Linux SOL_NETLINK membership API.
+        let group = 2u32.to_ne_bytes();
+        let r = call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_ADD_MEMBERSHIP,
+                arg3: group.as_ptr() as u64,
+                arg4: group.len() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("membership status")?;
+        if r != 0 {
+            return Err("NETLINK_ADD_MEMBERSHIP failed");
+        }
+
+        let mut local = [0u8; 12];
+        let mut local_len = (local.len() as u32).to_ne_bytes();
+        if call(
+            Syscall::SocketGetSockName.raw(),
+            a2(fd, local.as_mut_ptr() as u64, local_len.as_mut_ptr() as u64),
+        )
+        .ok_or("getsockname status")?
+            != 0
+        {
+            return Err("netlink getsockname failed");
+        }
+        let portid = u32::from_ne_bytes(local[4..8].try_into().unwrap());
+        let groups = u32::from_ne_bytes(local[8..12].try_into().unwrap());
+        if portid == 0 || groups != 0b10 {
+            return Err("netlink local port ID/groups did not round-trip");
+        }
+
+        let enabled = 1u32.to_ne_bytes();
+        call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_EXT_ACK,
+                arg3: enabled.as_ptr() as u64,
+                arg4: enabled.len() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("set NETLINK_EXT_ACK")?;
+        let mut out = [0u8; 4];
+        let mut out_len = 4u32.to_ne_bytes();
+        call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_EXT_ACK,
+                arg3: out.as_mut_ptr() as u64,
+                arg4: out_len.as_mut_ptr() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("get NETLINK_EXT_ACK")?;
+        if u32::from_ne_bytes(out) != 1 {
+            return Err("NETLINK_EXT_ACK did not round-trip");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_netlink_address_and_options_roundtrip
+);
 
 fn smoke_abi_netlink_uevent_socket_bind() -> TestResult {
     with_setup(|| {

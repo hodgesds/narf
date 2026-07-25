@@ -115,6 +115,11 @@ echo the request sequence, identify the kernel sender with port ID zero, carry
 administration path; control-plane writes continue to require the typed
 `Cap<NetIface, Admin>` operations in §3.3.
 
+AF_NETLINK sockets retain their bound `sockaddr_nl` port ID and group mask,
+support a connected kernel or userspace destination, auto-bind before the
+first send, and expose Linux `SOL_NETLINK` membership and feature-option
+round trips. Kernel-originated messages use port ID zero.
+
 ## 4. Invariants & safety properties
 
 - A frame buffer is owned by exactly one holder at a time — either
