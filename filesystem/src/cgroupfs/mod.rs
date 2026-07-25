@@ -329,13 +329,15 @@ fn cgroup_of(pid: u64) -> Arc<Cgroup> {
 }
 
 /// Pid of the process performing the current cgroupfs write, for the
-/// Linux "write 0 into cgroup.procs = move yourself" form. Resolved
-/// through procfs's current-pid hook (installed at boot); `None` when
-/// the hook is absent (pre-boot, or a build without linux-compat).
+/// Linux "write 0 into cgroup.procs = move yourself" form. cgroup membership
+/// is keyed by the OUTER ProcessId (every fork/attach path uses it), so this
+/// resolves through procfs's OUTER-pid hook — not `current_pid()`, which now
+/// returns the caller's namespace-local pid. `None` when the hook is absent
+/// (pre-boot, or a build without linux-compat).
 fn caller_pid() -> Option<u64> {
     #[cfg(feature = "linux-compat")]
     {
-        let pid = crate::procfs::current_pid();
+        let pid = crate::procfs::current_outer_pid();
         if pid != 0 {
             return Some(pid);
         }
@@ -749,9 +751,13 @@ fn render_core(cg: &Arc<Cgroup>, f: CoreFile) -> String {
         }
         CoreFile::Procs => {
             let mut s = String::new();
+            // Members are outer ProcessIds; report them in the READER's PID
+            // namespace and drop any not visible there (namespace isolation).
             for pid in cg.members.lock().iter() {
-                s.push_str(&pid.to_string());
-                s.push('\n');
+                if let Some(v) = crate::procfs::pid_report(*pid) {
+                    s.push_str(&v.to_string());
+                    s.push('\n');
+                }
             }
             s
         }
@@ -761,8 +767,10 @@ fn render_core(cg: &Arc<Cgroup>, f: CoreFile) -> String {
             let t = cg.threads.lock();
             if t.is_empty() {
                 for pid in cg.members.lock().iter() {
-                    s.push_str(&pid.to_string());
-                    s.push('\n');
+                    if let Some(v) = crate::procfs::pid_report(*pid) {
+                        s.push_str(&v.to_string());
+                        s.push('\n');
+                    }
                 }
             } else {
                 for tid in t.iter() {
@@ -805,6 +813,11 @@ fn store_core(cg: &Arc<Cgroup>, f: CoreFile, buf: &[u8]) -> Result<usize, FsErro
             // the form systemd's cg_attach uses to place PID 1.
             if pid == 0 {
                 pid = caller_pid().ok_or(FsError::InvalidData)?;
+            } else {
+                // An explicit pid is in the WRITER's PID namespace; translate to
+                // the outer ProcessId cgroup membership keys on. Invisible in
+                // the writer's namespace → reject (Linux ESRCH-ish).
+                pid = crate::procfs::pid_resolve(pid).ok_or(FsError::InvalidData)?;
             }
             place(pid, cg)?;
             Ok(buf.len())

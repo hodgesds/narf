@@ -15995,19 +15995,28 @@ fn smoke_pid_ns_inherit_assigns_child_inner_two() -> TestResult {
     crate::pid_ns::__test_reset();
     let parent_task: u64 = 0x1111;
     let parent_outer: u64 = 100;
+    // TaskId and ProcessId are distinct spaces — the child's namespace is
+    // keyed by its TaskId (what every self-lookup uses), while its inner pid
+    // is minted from its outer ProcessId. Using distinct values here pins the
+    // keying: a regression that stores the ns under the ProcessId again would
+    // make `self_inner_pid(child_task, …)` miss.
+    let child_task: u64 = 0x1112;
     let child_outer: u64 = 101;
 
     let ns = crate::pid_ns::unshare_pid_ns(parent_task, parent_outer);
     assert_eq!(ns.outer_to_inner(parent_outer), Some(1));
 
-    let child_inner = match crate::pid_ns::inherit_into_child(parent_task, child_outer) {
+    let child_inner = match crate::pid_ns::inherit_into_child(parent_task, child_task, child_outer)
+    {
         Some(i) => i,
         None => return TestResult::Fail("inherit_into_child returned None"),
     };
     if child_inner != 2 {
         return TestResult::Fail("child inner pid != 2");
     }
-    if crate::pid_ns::self_inner_pid(child_outer, child_outer) != 2 {
+    // getpid path: look the child's ns up by its TaskId, then translate its
+    // OUTER ProcessId through the ns → inner 2.
+    if crate::pid_ns::self_inner_pid(child_task, child_outer) != 2 {
         return TestResult::Fail("child self_inner_pid != 2");
     }
     if ns.inner_to_outer(2) != Some(child_outer) {
@@ -16018,6 +16027,237 @@ fn smoke_pid_ns_inherit_assigns_child_inner_two() -> TestResult {
 }
 #[cfg(feature = "container")]
 kernel_test_in!("userspace", smoke_pid_ns_inherit_assigns_child_inner_two);
+
+/// A grandchild inherits the namespace transitively: the child forked by an
+/// in-namespace parent must itself be a member (keyed by its TaskId) so that
+/// when IT forks, `ns_of(child_task)` resolves and the grandchild is bound.
+/// The earlier ProcessId-keyed store broke exactly this — a namespace died
+/// after one generation, so systemd's service subprocesses fell out of the
+/// pidns (see project_pidns_flow_model).
+#[cfg(feature = "container")]
+fn smoke_pid_ns_grandchild_inherits_namespace() -> TestResult {
+    crate::pid_ns::__test_reset();
+    let parent_task: u64 = 0xA000;
+    let parent_outer: u64 = 100;
+    let child_task: u64 = 0xA001;
+    let child_outer: u64 = 101;
+    let grand_task: u64 = 0xA002;
+    let grand_outer: u64 = 102;
+
+    let ns = crate::pid_ns::unshare_pid_ns(parent_task, parent_outer);
+    // parent → child (inner 2)
+    match crate::pid_ns::inherit_into_child(parent_task, child_task, child_outer) {
+        Some(2) => {}
+        _ => return TestResult::Fail("child inner pid != 2"),
+    }
+    // child → grandchild: MUST resolve the child's ns via its TaskId.
+    let grand_inner = match crate::pid_ns::inherit_into_child(child_task, grand_task, grand_outer) {
+        Some(i) => i,
+        None => {
+            return TestResult::Fail(
+                "grandchild not bound — child's namespace was unreachable by TaskId",
+            )
+        }
+    };
+    if grand_inner != 3 {
+        return TestResult::Fail("grandchild inner pid != 3");
+    }
+    if crate::pid_ns::self_inner_pid(grand_task, grand_outer) != 3 {
+        return TestResult::Fail("grandchild self_inner_pid != 3");
+    }
+    if ns.inner_to_outer(3) != Some(grand_outer) {
+        return TestResult::Fail("ns missing grandchild translation");
+    }
+    crate::pid_ns::__test_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_pid_ns_grandchild_inherits_namespace);
+
+/// `ns_visible_inner` filters + translates: a bound outer pid → its inner id;
+/// an outer pid NOT in the namespace → None (isolation); a root-namespace task
+/// (no entry) → the outer pid unchanged. Backs `/proc` enumeration and
+/// cgroup.procs listing.
+#[cfg(feature = "container")]
+fn smoke_pid_ns_visible_inner_filters() -> TestResult {
+    crate::pid_ns::__test_reset();
+    let (p_task, p_out, c_task, c_out) = (0xB000u64, 100u64, 0xB001u64, 101u64);
+    crate::pid_ns::unshare_pid_ns(p_task, p_out);
+    crate::pid_ns::inherit_into_child(p_task, c_task, c_out);
+
+    if crate::pid_ns::ns_visible_inner(p_task, p_out) != Some(1) {
+        return TestResult::Fail("parent not visible as inner 1");
+    }
+    if crate::pid_ns::ns_visible_inner(p_task, c_out) != Some(2) {
+        return TestResult::Fail("child not visible as inner 2");
+    }
+    if crate::pid_ns::ns_visible_inner(p_task, 999).is_some() {
+        return TestResult::Fail("out-of-namespace pid must be invisible (None)");
+    }
+    // A task with no namespace entry (root ns) sees every outer pid as itself.
+    if crate::pid_ns::ns_visible_inner(0xDEAD, c_out) != Some(c_out) {
+        return TestResult::Fail("root-ns task must see the outer pid unchanged");
+    }
+    crate::pid_ns::__test_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_pid_ns_visible_inner_filters);
+
+/// The REPORT (outer→inner, `self_inner_pid`) and ACCEPT (inner→outer,
+/// `resolve_inner_pid`) directions are exact inverses for a bound pid, and an
+/// unbound inner pid resolves to None. This is the round-trip the clone-return
+/// / wait-want_pid / kill-target translations rely on.
+#[cfg(feature = "container")]
+fn smoke_pid_ns_report_accept_roundtrip() -> TestResult {
+    crate::pid_ns::__test_reset();
+    let (p_task, p_out, c_task, c_out) = (0xB100u64, 100u64, 0xB101u64, 101u64);
+    crate::pid_ns::unshare_pid_ns(p_task, p_out);
+    crate::pid_ns::inherit_into_child(p_task, c_task, c_out);
+
+    // Child: outer 101 ↔ inner 2, both directions.
+    let inner = crate::pid_ns::self_inner_pid(c_task, c_out);
+    if inner != 2 {
+        return TestResult::Fail("child report (outer→inner) != 2");
+    }
+    if crate::pid_ns::resolve_inner_pid(c_task, inner) != Some(c_out) {
+        return TestResult::Fail("child accept (inner→outer) did not invert report");
+    }
+    // Parent: outer 100 ↔ inner 1.
+    if crate::pid_ns::self_inner_pid(p_task, p_out) != 1 {
+        return TestResult::Fail("parent report != 1");
+    }
+    if crate::pid_ns::resolve_inner_pid(p_task, 1) != Some(p_out) {
+        return TestResult::Fail("parent accept != outer");
+    }
+    // An inner pid nobody bound must not resolve (→ ESRCH/ECHILD upstream).
+    if crate::pid_ns::resolve_inner_pid(p_task, 999).is_some() {
+        return TestResult::Fail("unbound inner pid must resolve to None");
+    }
+    crate::pid_ns::__test_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_pid_ns_report_accept_roundtrip);
+
+/// THE "not our child" invariant: from a child's namespace, its parent's OUTER
+/// ProcessId renders as inner pid 1. This is exactly what `/proc/<child>/stat`
+/// PPid and the child's `getppid()` must report so systemd (pid 1 in its
+/// namespace) recognises the process it forked as its own child. Rendering the
+/// parent's outer pid here instead made every service log "Supervising process
+/// N which is not our child" (project_pidns_flow_model).
+#[cfg(feature = "container")]
+fn smoke_pid_ns_child_view_of_parent_is_pid_one() -> TestResult {
+    crate::pid_ns::__test_reset();
+    let (p_task, p_out, c_task, c_out) = (0xB200u64, 100u64, 0xB201u64, 101u64);
+    crate::pid_ns::unshare_pid_ns(p_task, p_out);
+    crate::pid_ns::inherit_into_child(p_task, c_task, c_out);
+
+    // report_pid_to(child, parent_outer) — the child (and any same-namespace
+    // reader, e.g. systemd) sees the parent as pid 1.
+    if crate::pid_ns::self_inner_pid(c_task, p_out) != 1 {
+        return TestResult::Fail("child's view of parent must be pid 1");
+    }
+    crate::pid_ns::__test_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_pid_ns_child_view_of_parent_is_pid_one);
+
+/// Exit cleanup: `release_outer` frees the dying task's inner slot for reuse so
+/// a recycled outer pid doesn't inherit a stale inner id. `on_child_exit` keys
+/// this by the TaskId (ns lookup) but frees by the ProcessId (the outer↔inner
+/// binding); this pins the binding half.
+#[cfg(feature = "container")]
+fn smoke_pid_ns_release_frees_inner_slot() -> TestResult {
+    crate::pid_ns::__test_reset();
+    let (p_task, p_out) = (0xB300u64, 100u64);
+    let ns = crate::pid_ns::unshare_pid_ns(p_task, p_out);
+    crate::pid_ns::inherit_into_child(p_task, 0xB301, 101); // inner 2
+    if ns.outer_to_inner(101) != Some(2) {
+        return TestResult::Fail("child not bound as inner 2");
+    }
+    ns.release_outer(101);
+    if ns.outer_to_inner(101).is_some() {
+        return TestResult::Fail("release_outer did not drop the binding");
+    }
+    // The freed inner 2 is reused by the next bind (lowest-free).
+    if ns.bind_outer(102) != 2 {
+        return TestResult::Fail("released inner slot 2 was not reused");
+    }
+    crate::pid_ns::__test_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_pid_ns_release_frees_inner_slot);
+
+/// Root-namespace fast path: a task with no `TASK_PID_NS` entry observes
+/// outer == inner in every direction. This is the invariant that keeps the
+/// non-container / root-namespace behaviour bit-identical after the fix.
+#[cfg(feature = "container")]
+fn smoke_pid_ns_root_task_is_identity() -> TestResult {
+    crate::pid_ns::__test_reset();
+    let t = 0xB400u64;
+    if crate::pid_ns::self_inner_pid(t, 555) != 555 {
+        return TestResult::Fail("root report must be identity");
+    }
+    if crate::pid_ns::resolve_inner_pid(t, 555) != Some(555) {
+        return TestResult::Fail("root accept must be identity");
+    }
+    if crate::pid_ns::ns_visible_inner(t, 555) != Some(555) {
+        return TestResult::Fail("root visibility must be identity");
+    }
+    crate::pid_ns::__test_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_pid_ns_root_task_is_identity);
+
+/// A per-pid `/proc` hook is handed the outer ProcessId, but per-task state
+/// (the fd table, comm, argv, cwd, …) is keyed by TaskId — the hook MUST
+/// resolve ProcessId→TaskId via `proc_pid_to_tid`. Regression this pins:
+/// `proc_fd_list` keyed straight on the ProcessId returned an empty fd set, so
+/// `/proc/self/fd/N` was unresolvable and systemd's
+/// `execve("/proc/self/fd/N")` executor spawn EBADF'd, stalling the whole boot
+/// (project_pidns_flow_model). Not namespace-gated: the ProcessId≠TaskId split
+/// exists in every build.
+fn smoke_proc_fd_hook_resolves_processid_to_taskid() -> TestResult {
+    let tid = 0x0FD5_C001u64;
+    let pid = 0x0FD5_C0DEu64; // a DISTINCT ProcessId
+
+    crate::handlers::register_pid_task_mapping(pid, tid);
+
+    // proc_pid_to_tid maps the ProcessId to its TaskId; an unmapped pid is
+    // identity (a bare tid / thread id resolves to itself).
+    if crate::handlers::proc_pid_to_tid(pid) != tid {
+        return TestResult::Fail("proc_pid_to_tid did not map ProcessId→TaskId");
+    }
+    if crate::handlers::proc_pid_to_tid(0x0FD5_BEEF) != 0x0FD5_BEEF {
+        return TestResult::Fail("proc_pid_to_tid must be identity for an unmapped pid");
+    }
+
+    // Open an fd in the TASK's fd table (fresh tables seed stdio at 0,1,2, so
+    // the first open lands at fd 3).
+    let fd = match crate::fd::with_table(tid, |t| {
+        t.open(crate::fd::FdEntry {
+            ops: narf_filesystem::memfs::new_anon_file(),
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        })
+    }) {
+        Some(f) => f,
+        None => return TestResult::Fail("with_table open failed"),
+    };
+
+    // The hook is handed the ProcessId and must enumerate the TASK's fds.
+    // Keyed on the raw ProcessId this returns empty — the executor-spawn bug.
+    if !crate::handlers::proc_fd_list(pid).contains(&fd) {
+        return TestResult::Fail("proc_fd_list(ProcessId) did not resolve to the task's fd table");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_proc_fd_hook_resolves_processid_to_taskid);
 
 /// Outside-the-namespace caller (root NS) can still target a task
 /// inside a child namespace by its outer pid. The resolve_inner_pid

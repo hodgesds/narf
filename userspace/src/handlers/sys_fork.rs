@@ -198,24 +198,46 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // the child. Tasks in the root namespace skip the rebind (no
     // translation needed) but inherit_into_child returns None
     // silently in that case.
+    // fork(2)'s return value to the parent must be the child's pid in the
+    // PARENT's namespace, and it must agree with what the child's own getpid()
+    // reports (now that `inherit_into_child` keys the child's ns by TaskId, the
+    // child self-reports its INNER pid). Root-namespace parents keep the outer
+    // ProcessId (inherit_into_child returns None). These two facts are coupled:
+    // changing only one re-opens the mismatch (see project_pidns_flow_model).
+    #[cfg(feature = "container")]
+    let mut child_ns_pid = child_pid.raw();
     #[cfg(feature = "container")]
     {
-        let _ = crate::pid_ns::inherit_into_child(parent_pid, child_pid.raw());
+        if let Some(inner) =
+            crate::pid_ns::inherit_into_child(parent_pid, child_tid.raw(), child_pid.raw())
+        {
+            child_ns_pid = inner;
+        }
         mount_ns_inherit(parent_pid, child_tid.raw());
         // UTS / NET / IPC / User namespaces share the parent's Arc.
         crate::namespaces::inherit_into_child(parent_pid, child_tid.raw());
     }
-    // A forked child joins its parent's cgroup. Keyed by ProcessId
-    // (cgroup membership is per-process in v2), matching cgroup.procs.
+    // A forked child joins its parent's cgroup. cgroup membership is keyed by
+    // ProcessId (per-process in v2), so the parent must be looked up by its
+    // ProcessId — passing the raw TaskId missed every parent's cgroup and
+    // dumped forked children into the ROOT cgroup, so systemd never saw a
+    // service's subprocesses in its unit cgroup (project_pidns_flow_model).
     #[cfg(feature = "cgroup")]
-    narf_filesystem::cgroupfs::fork_inherit(parent_pid, child_pid.raw());
+    narf_filesystem::cgroupfs::fork_inherit(
+        task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
+        child_pid.raw(),
+    );
     // Inherit the parent's cgroup-namespace root (if any).
     #[cfg(all(feature = "cgroup", feature = "container"))]
     narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_pid.raw());
     // Parent-of bookkeeping was published above, BEFORE the spawn, to close
     // the SMP TRACEME race (see the comment at the `parent_of_set` call site).
-    // Return the child's user-visible ProcessId (POSIX fork(2)
-    // contract). The parent's waitpid() call passes this same
-    // value back to us as `want_pid`.
+    // Return the child's pid in the parent's namespace (POSIX fork(2)
+    // contract). The parent's waitpid() passes this same value back as
+    // `want_pid`, which sys_wait4 translates back to the outer ProcessId before
+    // matching PENDING_EXITS. Root-namespace parents see the outer pid.
+    #[cfg(feature = "container")]
+    ctx.set_return(SyscallReturn::ok(child_ns_pid));
+    #[cfg(not(feature = "container"))]
     ctx.set_return(SyscallReturn::ok(child_pid.raw()));
 }

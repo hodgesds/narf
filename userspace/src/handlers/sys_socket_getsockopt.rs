@@ -42,6 +42,17 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
     });
     match result {
         crate::socket::SocketOpResult::OptValue { n } => {
+            // SO_PEERCRED reports `struct ucred { pid, uid, gid }` with the
+            // peer's OUTER ProcessId (stamped at connect/accept). Translate the
+            // pid field into the READER's PID namespace view before handing it
+            // back — dbus-broker et al. compare it against pids they hold.
+            // Identity in the root namespace.
+            const SOL_SOCKET: u32 = 1;
+            if level == SOL_SOCKET && name == crate::socket::SO_PEERCRED && n >= 4 {
+                let outer = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+                let visible = report_pid_to(current_task_id(), outer) as u32;
+                buf[0..4].copy_from_slice(&visible.to_ne_bytes());
+            }
             // Write value + updated optlen back to user under SMAP bracket.
             // SAFETY: val_ptr from userspace; AS active.
             let _ = unsafe { copy_to_user(val_ptr, &buf[..n]) };

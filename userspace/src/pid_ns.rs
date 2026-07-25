@@ -174,10 +174,22 @@ pub fn clear_ns(task: u64) {
 /// a new process inside whatever PID namespace the parent already
 /// belonged to). Returns the child's inner pid in the namespace, or
 /// None if the parent was in the root namespace (no rebind needed).
-pub fn inherit_into_child(parent_task: u64, child_outer_pid: u64) -> Option<u64> {
+///
+/// `child_task` is the child's **TaskId** — the key `TASK_PID_NS` is looked
+/// up by everywhere else (`ns_of` in `self_inner_pid`/`resolve_inner_pid`,
+/// which `getpid`/`kill`/`getppid`/`/proc` all funnel through, plus
+/// `unshare_pid_ns`/`setns`). Keying the store by the child's ProcessId
+/// instead (as an earlier version did) left the child's namespace unreachable
+/// from every TaskId-based self-lookup, so a forked child reported its OUTER
+/// pid and — fatally — when the child itself forked, `ns_of(child_task)`
+/// returned None and the grandchild fell out of the namespace entirely.
+/// `child_outer_pid` (the ProcessId) is still what `bind_outer` maps to an
+/// inner pid — the namespace's outer↔inner tables are ProcessId-space; only
+/// the *lookup key* is the TaskId.
+pub fn inherit_into_child(parent_task: u64, child_task: u64, child_outer_pid: u64) -> Option<u64> {
     let ns = ns_of(parent_task)?;
     let inner = ns.bind_outer(child_outer_pid);
-    set_ns(child_outer_pid, ns);
+    set_ns(child_task, ns);
     Some(inner)
 }
 
@@ -205,6 +217,19 @@ pub fn attach_to_ns(task: u64, outer_pid: u64, ns: Arc<PidNamespace>) -> u64 {
     let inner = ns.bind_outer(outer_pid);
     set_ns(task, ns);
     inner
+}
+
+/// Is `outer` visible to `task`, and if so, what inner pid does `task` see?
+/// `Some(inner)` when the outer pid is bound in `task`'s namespace (or `task`
+/// is in the root namespace — everything is visible as its outer pid);
+/// `None` when `task` is namespaced and the outer pid is not a member of that
+/// namespace (a process in a sibling/parent namespace it must not see). Drives
+/// `/proc` enumeration so a namespaced reader lists only its own namespace.
+pub fn ns_visible_inner(task: u64, outer: u64) -> Option<u64> {
+    match ns_of(task) {
+        Some(ns) => ns.outer_to_inner(outer),
+        None => Some(outer),
+    }
 }
 
 /// Translate `task`'s outer pid through whichever namespace it

@@ -4588,7 +4588,12 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
                 }
             }
             if !placed {
-                narf_filesystem::cgroupfs::fork_inherit(parent_pid, child_visible_pid);
+                // cgroup membership is keyed by ProcessId — look the parent up
+                // by its ProcessId, not the raw TaskId (see sys_fork).
+                narf_filesystem::cgroupfs::fork_inherit(
+                    task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
+                    child_visible_pid,
+                );
             }
         }
         // cgroup-namespace inheritance, and CLONE_NEWCGROUP → the child
@@ -4666,12 +4671,27 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // process — shares the parent's namespaces (Linux copy_*ns), unless
     // clone3 requested a fresh one via CLONE_NEW*. The per-task NS
     // tables are keyed per task id; threads share the process's ns.
+    //
+    // `child_ns_pid` is the value clone(2) hands back to the PARENT: the
+    // child's pid in the parent's namespace, which must agree with the child's
+    // own getpid() (see project_pidns_flow_model — these are coupled). Defaults
+    // to the outer ProcessId; the fork-inherit below fills in the inner pid
+    // when the parent is namespaced.
+    #[cfg(feature = "container")]
+    let mut child_ns_pid = child_visible_pid;
     #[cfg(feature = "container")]
     {
         let child = child_tid.raw();
         // PID + mount namespaces (only meaningful for a new process).
         if !share_thread {
-            let _ = crate::pid_ns::inherit_into_child(parent_pid, child_visible_pid);
+            // Binds the child into the parent's pid namespace (keyed by the
+            // child's TaskId) and yields the inner pid the parent should see;
+            // None in the root namespace leaves the outer pid unchanged.
+            if let Some(inner) =
+                crate::pid_ns::inherit_into_child(parent_pid, child, child_visible_pid)
+            {
+                child_ns_pid = inner;
+            }
             mount_ns_inherit(parent_pid, child);
             const CLONE_NEWNS: u64 = 0x00020000;
             const CLONE_NEWPID: u64 = 0x20000000;
@@ -4783,7 +4803,16 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // futex on clear_child_tid instead — so nothing to publish for it.
 
     // Return: parent sees child TID (== visible-pid for !THREAD,
-    // == TaskId.raw() for THREAD where TID and PID diverge).
+    // == TaskId.raw() for THREAD where TID and PID diverge). For a new
+    // process the pid is translated into the parent's namespace
+    // (`child_ns_pid`); in the root namespace that equals the outer pid.
+    #[cfg(feature = "container")]
+    let ret_val = if share_thread {
+        child_tid.raw()
+    } else {
+        child_ns_pid
+    };
+    #[cfg(not(feature = "container"))]
     let ret_val = if share_thread {
         child_tid.raw()
     } else {
@@ -5428,15 +5457,20 @@ pub(crate) fn finish_wait_child(status_ptr: u64, is_waitid: bool, reaped: i64, s
     // reap routes (the UserTaskFuture poll and own_stack_wait_child), so
     // the staged pointer + the child's exit-time snapshot meet here.
     // Both are consumed unconditionally so nothing goes stale.
-    let rusage_ptr = take_wait_rusage_ptr(current_task_id());
+    let parent = current_task_id();
+    let rusage_ptr = take_wait_rusage_ptr(parent);
+    // `reaped` is the outer ProcessId — keep it for the ProcessId-keyed rusage
+    // snapshot, but report the child in the PARENT's namespace view to
+    // userspace (si_pid / wait4 rax).
     let snap = take_exit_rusage(reaped as u64);
+    let reaped_visible = report_pid_to(parent, reaped as u64) as i64;
     if rusage_ptr != 0 {
         let (ns, kb) = snap.unwrap_or((0, 0));
         write_rusage_utime(rusage_ptr, ns, kb);
     }
     if status_ptr != 0 {
         if is_waitid {
-            let si = encode_waitid_siginfo(reaped, status);
+            let si = encode_waitid_siginfo(reaped_visible, status);
             // SAFETY: `status_ptr` is the user `siginfo_t*` (non-zero);
             // copy_to_user range-validates the 128-byte write.
             let _ = unsafe { copy_to_user(status_ptr, &si) };
@@ -5449,7 +5483,7 @@ pub(crate) fn finish_wait_child(status_ptr: u64, is_waitid: bool, reaped: i64, s
     if is_waitid {
         0
     } else {
-        reaped as u64
+        reaped_visible as u64
     }
 }
 
@@ -6392,13 +6426,67 @@ fn on_thread_exit(_pid: u64, tid: u64) {
     }
 }
 
+/// Translate an outer ProcessId into `observer_task`'s PID-namespace view for
+/// REPORTING to userspace — clone/fork/wait return values, `si_pid`, getppid,
+/// `/proc/<pid>/stat` PPid, pidfd fdinfo, cgroup.procs, SO_PEERCRED. Identity
+/// in the root namespace (and, cheaply, in non-`container` builds where the
+/// namespace tables are never populated). Centralises the `cfg` gate so the
+/// dozens of reporting sites stay uncluttered and can't drift apart.
+#[inline]
+pub(crate) fn report_pid_to(observer_task: u64, outer: u64) -> u64 {
+    #[cfg(feature = "container")]
+    {
+        crate::pid_ns::self_inner_pid(observer_task, outer)
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = observer_task;
+        outer
+    }
+}
+
+/// Translate a pid ARRIVING from userspace (wait `want_pid`, kill/tgkill
+/// target, pidfd_open arg) from `caller_task`'s namespace view into the outer
+/// ProcessId the kernel keys on. `None` means the inner pid is not bound in the
+/// caller's namespace (→ ESRCH/ECHILD). Identity (`Some(inner)`) in the root
+/// namespace / non-`container` builds.
+#[inline]
+pub(crate) fn accept_pid_from(caller_task: u64, inner: u64) -> Option<u64> {
+    #[cfg(feature = "container")]
+    {
+        crate::pid_ns::resolve_inner_pid(caller_task, inner)
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = caller_task;
+        Some(inner)
+    }
+}
+
+/// Resolve an outer ProcessId — the identity `ProcPidDir` and every per-pid
+/// `/proc` hook are handed — to the scheduler TaskId that TaskId-keyed per-task
+/// state (fd table, comm, argv, exe, cwd, root, environ/auxv) is stored under.
+/// Identity when `pid` is not a registered process id (already a TaskId, a
+/// thread tid, or a bare number). ProcessId-keyed tables (PARENT_OF,
+/// thread-group counts, brk) use the ProcessId directly and must NOT go through
+/// this. Mirrors the `tid = pid_to_task_raw(pid)` step in `proc_task_info`.
+#[inline]
+pub(crate) fn proc_pid_to_tid(pid: u64) -> u64 {
+    pid_to_task_raw(pid).unwrap_or(pid)
+}
+
 /// PROCESS-scoped exit observer: per-`pid` reap that runs EXACTLY ONCE,
 /// on the group's last thread (`group_dead`). Notifies pidfd watchers,
 /// releases the PID namespace slot, and hands the process to its parent
 /// (wait4 reap entry + SIGCHLD + waker) — or, if orphaned, releases the
 /// task and returns the PID. Running this per thread double-freed the
 /// PID pool and the parent's reap queue (the OCI teardown #UD).
-fn on_child_exit(child_pid: u64, _child_tid: u64) {
+fn on_child_exit(child_pid: u64, child_tid: u64) {
+    // `child_tid` only feeds the PID-namespace cleanup below, which is
+    // container-gated; keep the parameter (the exit-observer signature is
+    // fixed) but discard it in non-container builds.
+    #[cfg(not(feature = "container"))]
+    let _ = child_tid;
     #[cfg(feature = "linux-compat")]
     crate::ptrace::release_process(child_pid);
 
@@ -6408,16 +6496,16 @@ fn on_child_exit(child_pid: u64, _child_tid: u64) {
 
     // Wave-67: release the dying task from its PID namespace's
     // inner-pid table so a recycled outer pid doesn't inherit the
-    // dead task's inner slot. Mount-namespace entries are keyed on
-    // the scheduler TaskId, not the outer pid, so we leave them
-    // alone here — they get cleaned up implicitly when the scheduler
-    // tears the task down.
+    // dead task's inner slot. `TASK_PID_NS` is keyed by TaskId (see
+    // `inherit_into_child`), so the lookup + clear use `child_tid`; the
+    // inner↔outer binding inside the namespace is ProcessId-space, so
+    // `release_outer` takes the ProcessId (`child_pid`).
     #[cfg(feature = "container")]
     {
-        if let Some(ns) = crate::pid_ns::ns_of(child_pid) {
+        if let Some(ns) = crate::pid_ns::ns_of(child_tid) {
             ns.release_outer(child_pid);
         }
-        crate::pid_ns::clear_ns(child_pid);
+        crate::pid_ns::clear_ns(child_tid);
     }
 
     let parent = match get_wait_recipient(child_pid) {
@@ -7288,8 +7376,10 @@ static HOSTNAME: narf_lib::sync::IrqSafeSpinLock<alloc::string::String> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::string::String::new());
 
 /// Global NIS/UTS domain name (set_domainname / read by uname). Empty
-/// by default (Linux reports "(none)"); the container UTS-namespace
-/// path overrides per-task when that feature is on.
+/// by default (Linux reports "(none)"). Only the non-container path uses this
+/// flat global — with the `container` feature both setdomainname and uname go
+/// through the per-task `current_uts_ns`, so the static is dead there.
+#[cfg(not(feature = "container"))]
 static DOMAINNAME: narf_lib::sync::IrqSafeSpinLock<alloc::string::String> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::string::String::new());
 
@@ -9926,14 +10016,15 @@ pub fn set_proc_exe(pid: u64, path: &str) {
 
 /// `/proc/[pid]/exe` hook — None until the task has exec'd.
 pub fn proc_exe_path(pid: u64) -> Option<alloc::string::String> {
+    let tid = proc_pid_to_tid(pid);
     let g = PROC_EXE.lock();
-    g.as_ref().and_then(|m| m.get(&pid).cloned())
+    g.as_ref().and_then(|m| m.get(&tid).cloned())
 }
 
 /// `/proc/[pid]/cwd` hook — `cwd_of` defaults to `/` for a task that
 /// never chdir'd, which is also the Linux boot-task answer.
 pub fn proc_cwd_path(pid: u64) -> Option<alloc::string::String> {
-    Some(cwd_of(pid))
+    Some(cwd_of(proc_pid_to_tid(pid)))
 }
 
 /// `/proc/[pid]/root` hook — the chroot prefix, or None (procfs falls
@@ -9942,8 +10033,9 @@ pub fn proc_cwd_path(pid: u64) -> Option<alloc::string::String> {
 pub fn proc_root_path(pid: u64) -> Option<alloc::string::String> {
     #[cfg(feature = "linux-compat")]
     {
+        let tid = proc_pid_to_tid(pid);
         let g = ROOT_DIR_TABLE.lock();
-        g.as_ref().and_then(|m| m.get(&pid).cloned())
+        g.as_ref().and_then(|m| m.get(&tid).cloned())
     }
     #[cfg(not(feature = "linux-compat"))]
     {
@@ -9985,9 +10077,10 @@ pub fn set_proc_comm(pid: u64, name: &str) {
 /// against `pid`. Used by `/proc/[pid]/cmdline` and by the execve
 /// smoke tests to verify the post-load argv publish step.
 pub fn proc_argv_of(pid: u64) -> alloc::vec::Vec<u8> {
+    let tid = proc_pid_to_tid(pid);
     let g = PROC_ARGV.lock();
     g.as_ref()
-        .and_then(|m| m.get(&pid).cloned())
+        .and_then(|m| m.get(&tid).cloned())
         .unwrap_or_default()
 }
 
@@ -9995,8 +10088,9 @@ pub fn proc_argv_of(pid: u64) -> alloc::vec::Vec<u8> {
 /// by `/proc/[pid]/comm` and by the execve smoke tests to confirm
 /// the comm-from-argv[0]-basename step ran.
 pub fn proc_comm_of(pid: u64) -> Option<alloc::string::String> {
+    let tid = proc_pid_to_tid(pid);
     let g = PROC_COMM.lock();
-    g.as_ref().and_then(|m| m.get(&pid).cloned())
+    g.as_ref().and_then(|m| m.get(&tid).cloned())
 }
 
 // ── /proc/[pid]/comm writable hook ─────────────────────────────
@@ -10004,7 +10098,9 @@ pub fn proc_comm_of(pid: u64) -> Option<alloc::string::String> {
 /// Update comm from a procfs write. Linux ref: `comm_write` in
 /// `fs/proc/base.c`. Truncates to 15 chars; returns `Ok(())`.
 pub fn proc_set_comm(pid: u64, name: &str) -> Result<(), narf_filesystem::FsError> {
-    set_proc_comm(pid, name);
+    // PROC_COMM is TaskId-keyed (see proc_comm_of); write under the TaskId so a
+    // subsequent /proc/<pid>/comm read matches.
+    set_proc_comm(proc_pid_to_tid(pid), name);
     Ok(())
 }
 
@@ -10037,7 +10133,8 @@ pub fn proc_oom_score_of(pid: u64) -> i32 {
     // RSS is approximated as the task's VMA pages. NARF tracks
     // VMAs but not resident pages yet — use vma_count as a proxy.
     let rss_pages = {
-        let task = narf_scheduler::address_space_of(narf_scheduler::TaskId(pid));
+        // Address spaces are keyed by TaskId; resolve the outer ProcessId first.
+        let task = narf_scheduler::address_space_of(narf_scheduler::TaskId(proc_pid_to_tid(pid)));
         task.map(|as_arc| {
             let regions = as_arc.regions_snapshot();
             regions.iter().map(|r| (r.len / 4096).max(1)).sum::<u64>()
@@ -10076,17 +10173,74 @@ pub fn proc_set_coredump_filter(pid: u64, bits: u32) -> Result<(), narf_filesyst
     Ok(())
 }
 
-/// /proc/self pid hook — returns the current task id.
+/// /proc/self readlink hook — the calling process's pid in ITS OWN namespace
+/// view (== `getpid()`), so `readlink(/proc/self)` yields a number the caller
+/// can re-open. (Was the raw TaskId, a third number space that matched neither
+/// getpid nor the /proc path numbers.)
 pub fn proc_current_pid() -> u64 {
-    current_task_id()
+    let task = current_task_id();
+    let outer = task_to_pid_raw(task).unwrap_or(task);
+    report_pid_to(task, outer)
 }
 
-/// /proc enumerator — returns every live task id.
+/// /proc/self + /proc/thread-self DIRECTORY-resolution hook — the caller's
+/// OUTER ProcessId. `ProcPidDir` keys on the outer pid (that is what every
+/// per-pid `/proc` renderer expects), so the "self" magic dirs resolve to the
+/// same space the numeric `/proc/<N>` resolver produces.
+pub fn proc_current_outer_pid() -> u64 {
+    let task = current_task_id();
+    task_to_pid_raw(task).unwrap_or(task)
+}
+
+/// `/proc/<N>` numeric-resolution hook. `N` is a pid in the READER's PID
+/// namespace; return the outer ProcessId the kernel keys on, or `None` when
+/// the reader is namespaced and `N` names no process in its namespace (so
+/// `/proc/<N>` is invisible — namespace isolation). Identity in the root
+/// namespace, where every ProcessId (and, via the caller's identity fallback,
+/// every TaskId) resolves to itself.
+pub fn proc_pid_resolve(reader_view_pid: u64) -> Option<u64> {
+    accept_pid_from(current_task_id(), reader_view_pid)
+}
+
+/// Translate an outer ProcessId into the CURRENT reader's namespace view for
+/// listing surfaces (cgroup.procs), returning `None` when the process is not
+/// visible in the reader's namespace so the caller drops it. Identity in the
+/// root namespace / non-`container` builds.
+pub fn proc_pid_report(outer: u64) -> Option<u64> {
+    #[cfg(feature = "container")]
+    {
+        crate::pid_ns::ns_visible_inner(current_task_id(), outer)
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        Some(outer)
+    }
+}
+
+/// /proc enumerator — every live PROCESS (thread-group leader, keyed in
+/// `PID_TO_TASK` by its outer ProcessId) that is visible in the READER's PID
+/// namespace, reported as the reader's inner pid. A namespaced reader sees
+/// only its own namespace; the root namespace sees every process by its outer
+/// pid. (Was every raw TaskId — threads included, un-namespaced.)
 pub fn proc_list_pids() -> alloc::vec::Vec<u64> {
-    narf_scheduler::all_task_ids()
-        .into_iter()
-        .map(|t| t.0)
-        .collect()
+    let reader = current_task_id();
+    let outers: alloc::vec::Vec<u64> = PID_TO_TASK
+        .lock()
+        .as_ref()
+        .map(|m| m.keys().copied().collect())
+        .unwrap_or_default();
+    #[cfg(feature = "container")]
+    {
+        outers
+            .into_iter()
+            .filter_map(|outer| crate::pid_ns::ns_visible_inner(reader, outer))
+            .collect()
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = reader;
+        outers
+    }
 }
 
 /// /proc/[pid]/* metadata accessor.
@@ -10098,6 +10252,13 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     // fail that check while it's the very task asking. Treat any
     // pid that matches the caller OR a queued task as live.
     let current = current_task_id();
+    // `pid` is the outer ProcessId: the procfs `/proc/<N>` resolver already
+    // translated the reader's namespace-local path number into the outer pid
+    // (see `proc_pid_resolve`), so every kernel-state lookup below keys on it
+    // directly and no hook double-translates. The reported pid field is
+    // rendered back into the READER's namespace view (`visible_pid`); identity
+    // in the root namespace.
+    let visible_pid = report_pid_to(current, pid);
     // Visible PID → scheduler TaskId. NARF allocates process ids and
     // scheduler task ids from separate spaces (a process's pid is NOT its
     // tid), so every liveness / address-space probe below goes through the
@@ -10140,11 +10301,11 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     if !live {
         return None;
     }
-    // brk top — pull from the per-task BRK_TABLE. May be 0 if the
-    // task hasn't called brk yet.
+    // brk top — pull from the per-task BRK_TABLE, which (like fd/cwd/comm) is
+    // keyed by TaskId, so use `tid`, not the outer ProcessId `pid`.
     let brk_top = {
         let g = BRK_TABLE.lock();
-        g.as_ref().and_then(|m| m.get(&pid).copied()).unwrap_or(0)
+        g.as_ref().and_then(|m| m.get(&tid).copied()).unwrap_or(0)
     };
     // Stack top — the exclusive high end of the user-stack region.
     // Stage-1 just reports the standard fixed top.
@@ -10212,20 +10373,27 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     // keys on the visible pid. USER_HZ = 100 → 10ms per tick.
     const NS_PER_TICK: u64 = 10_000_000;
     Some(ProcTaskInfo {
-        pid,
+        // Report the pid the reader asked for (its namespace view), not the
+        // outer ProcessId — stat field 1 must echo /proc/<N>.
+        pid: visible_pid,
         comm,
         state: if zombie { 'Z' } else { 'R' },
         brk_top,
         stack_top,
         cmdline,
         vmas,
-        // PARENT_OF values are parent TaskIds — translate to the visible
-        // pid exactly like sys_getppid, or ps shows raw tids (or 0).
+        // PARENT_OF values are parent TaskIds — translate to the parent's
+        // outer ProcessId, then into the READER's namespace view. This is the
+        // field systemd's `pidref_is_my_child` compares against its own
+        // getpid()==1: rendering it in outer space made every service log
+        // "Supervising process N which is not our child" (project_pidns_flow_model).
         ppid: parent_of_get(pid)
-            .map(|t| task_to_pid_raw(t).unwrap_or(t))
+            .map(|t| report_pid_to(current, task_to_pid_raw(t).unwrap_or(t)))
             .unwrap_or(0),
-        pgrp: read_pgid(tid),
-        session: read_sid(tid),
+        // pgrp/session are held in TaskId space; render them in the reader's
+        // visible-pid + namespace view (same boundary getpgid()/getsid() use).
+        pgrp: pgid_to_user(read_pgid(tid)),
+        session: pgid_to_user(read_sid(tid)),
         utime_ticks: cpu_time_ns_of(tid) / NS_PER_TICK,
         stime_ticks: kern_time_ns_of(tid) / NS_PER_TICK,
         starttime_ticks: task_start_ns(tid) / NS_PER_TICK,
@@ -10253,10 +10421,13 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
 /// Return the full rlimit table for `pid` as `[(cur, max); 16]`.
 /// Indices follow RLIMIT_* numbering (0=CPU, 3=STACK, 7=NOFILE, …).
 pub fn rlimits_of(pid: u64) -> [(u64, u64); 16] {
+    // RLIMIT_TABLE is keyed by TaskId (prlimit's self form stores under
+    // current_task_id()); resolve the outer ProcessId → TaskId.
+    let tid = proc_pid_to_tid(pid);
     let row = {
         let g = RLIMIT_TABLE.lock();
         g.as_ref()
-            .and_then(|m| m.get(&pid).copied())
+            .and_then(|m| m.get(&tid).copied())
             .unwrap_or_else(default_rlimits)
     };
     let mut out = [(0u64, 0u64); 16];
@@ -10268,24 +10439,27 @@ pub fn rlimits_of(pid: u64) -> [(u64, u64); 16] {
 
 /// Return the nice value for `pid`. Default 0.
 pub fn nice_of(pid: u64) -> i32 {
-    read_nice(pid)
+    // NICE_TABLE is keyed by TaskId (read_nice's param is a task id).
+    read_nice(proc_pid_to_tid(pid))
 }
 
 /// Return the environ block for `pid` (NUL-separated key=value bytes).
 /// Returns empty Vec when no environ has been recorded.
 pub fn proc_environ_of(pid: u64) -> alloc::vec::Vec<u8> {
+    let tid = proc_pid_to_tid(pid);
     let g = PROC_ENVIRON.lock();
     g.as_ref()
-        .and_then(|m| m.get(&pid).cloned())
+        .and_then(|m| m.get(&tid).cloned())
         .unwrap_or_default()
 }
 
 /// Return the packed ELF auxv bytes for `pid`.  Each entry is two
 /// little-endian u64s (key, value).  AT_NULL (0, 0) terminates.
 pub fn proc_auxv_of(pid: u64) -> alloc::vec::Vec<u8> {
+    let tid = proc_pid_to_tid(pid);
     let g = PROC_AUXV.lock();
     g.as_ref()
-        .and_then(|m| m.get(&pid).cloned())
+        .and_then(|m| m.get(&tid).cloned())
         .unwrap_or_else(|| alloc::vec![0u8; 16])
 }
 
@@ -10323,7 +10497,7 @@ pub fn set_proc_auxv_pairs(pid: u64, aux: &[(u64, u64)]) {
 /// enumeration. Keyed the same way as [`fd_path_of`] so a per-fd lookup
 /// and the directory listing agree.
 pub fn proc_fd_list(pid: u64) -> alloc::vec::Vec<u32> {
-    crate::fd::open_fds(pid)
+    crate::fd::open_fds(proc_pid_to_tid(pid))
 }
 
 /// `Some(target_pid)` iff fd `n` of `pid` is a pidfd — backs the
@@ -10333,20 +10507,33 @@ pub fn proc_fd_list(pid: u64) -> alloc::vec::Vec<u32> {
 /// pidfs/PIDFD_GET_INFO is unavailable; without it every service spawn
 /// fails ENOTTY.
 pub fn proc_fd_pidfd_pid(pid: u64, n: u32) -> Option<u64> {
-    crate::fd::with_table(pid, |t| t.get(n).and_then(|e| e.ops.pidfd_target_pid())).flatten()
+    // `pid` is the outer ProcessId of the /proc/<pid> owner; the fd table is
+    // keyed by TaskId, so resolve pid→tid first (proc_pid_to_tid). The stored
+    // pidfd target is an outer ProcessId; the fdinfo `Pid:` line is the
+    // target's pid in the READER's namespace (Linux fs/pidfs.c) so systemd's
+    // pidfd_get_pid() fallback sees a number consistent with the pid it holds.
+    let tid = proc_pid_to_tid(pid);
+    crate::fd::with_table(tid, |t| t.get(n).and_then(|e| e.ops.pidfd_target_pid()))
+        .flatten()
+        .map(|outer| report_pid_to(current_task_id(), outer))
 }
 
 pub fn fd_path_of(pid: u64, n: u32) -> Option<alloc::string::String> {
+    // `pid` is the outer ProcessId; the fd/path tables key on TaskId, so
+    // resolve pid→tid. Getting this wrong made /proc/self/fd/<n> unresolvable —
+    // systemd execs its executor via `execve("/proc/self/fd/N")`, so an empty
+    // resolution turned every service spawn into EBADF (project_pidns_flow_model).
+    let tid = proc_pid_to_tid(pid);
     // Preferred: the real backing path recorded at open() time (the same
     // fd→path table inotify/landlock use). This is what /proc/<pid>/fd/<n>
     // readlinks to — musl's realpath() opens O_PATH then readlinks here.
     // Report it chroot-relative so a chrooted process (e.g. udev in a
     // distro chroot) can re-open the link target in its own namespace.
     #[cfg(feature = "linux-compat")]
-    if let Some(p) = crate::mqueue::fd_path(pid, n) {
-        return Some(strip_chroot_prefix(pid, &p));
+    if let Some(p) = crate::mqueue::fd_path(tid, n) {
+        return Some(strip_chroot_prefix(tid, &p));
     }
-    crate::fd::with_table(pid, |t| {
+    crate::fd::with_table(tid, |t| {
         let entry = t.get(n)?;
         // Use the type_name as a fallback for fds with no path (pipes,
         // sockets, eventfd, …) until FileOps grows a path() method.

@@ -18,7 +18,11 @@ pub(crate) fn sys_getppid(ctx: &mut dyn TrapContext) {
     let ppid = if parent_task == 0 {
         0
     } else {
-        task_to_pid_raw(parent_task).unwrap_or(parent_task)
+        let outer = task_to_pid_raw(parent_task).unwrap_or(parent_task);
+        // Report the parent in the CALLER's namespace view — a service's
+        // getppid() must see systemd as pid 1, not systemd's outer ProcessId.
+        // Identity in the root namespace.
+        report_pid_to(me, outer)
     };
     ctx.set_return(SyscallReturn::ok(ppid));
 }

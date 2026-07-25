@@ -29,7 +29,12 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // process groups are real (same simplification as wait4).
     let want_pid: i64 = match idtype {
         P_ALL => -1,
-        P_PID => id,
+        // `id` is a pid in the caller's namespace; the reap machinery keys on
+        // the outer ProcessId. Unbound inner pid → keep as-is (matches nothing
+        // → the caller's own child set decides ECHILD). Identity in root ns.
+        P_PID => accept_pid_from(current_task_id(), id as u64)
+            .map(|o| o as i64)
+            .unwrap_or(id),
         P_PGID => -1,
         // P_PIDFD: `id` is a pidfd; wait on its target process. The error
         // shape is LOAD-BEARING: glibc's `__clone_pidfd_supported()` probes
@@ -104,7 +109,8 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     };
     if let Some((child_pid, status)) = reaped {
         if infop != 0 {
-            let si = encode_waitid_siginfo(child_pid as i64, status);
+            // Report the child in the caller's namespace view (si_pid).
+            let si = encode_waitid_siginfo(report_pid_to(parent, child_pid) as i64, status);
             // SAFETY: `infop` is the user `siginfo_t*` (non-zero); copy_to_user
             // range-validates the 128-byte write.
             let _ = unsafe { copy_to_user(infop, &si) };

@@ -115,16 +115,44 @@ pub struct ProcVma {
 type CurrentPidFn = fn() -> u64;
 type ListPidsFn = fn() -> Vec<u64>;
 type TaskInfoFn = fn(u64) -> Option<ProcTaskInfo>;
+/// Returns the caller's OUTER ProcessId — the space `ProcPidDir` keys on — for
+/// resolving the `/proc/self` + `/proc/thread-self` magic directories.
+type CurrentOuterPidFn = fn() -> u64;
+/// Translate a reader-namespace `/proc/<N>` path number to the outer ProcessId
+/// the kernel keys on, or `None` when `N` names no process visible in the
+/// reader's PID namespace. Identity in the root namespace.
+type PidResolveFn = fn(u64) -> Option<u64>;
+/// Translate an outer ProcessId into the CURRENT reader's namespace view, or
+/// `None` when the process is not visible in the reader's namespace (used to
+/// filter + translate cgroup.procs listings). Identity in the root namespace.
+type PidReportFn = fn(u64) -> Option<u64>;
 
 static CURRENT_PID_HOOK: AtomicUsize = AtomicUsize::new(0);
 static LIST_PIDS_HOOK: AtomicUsize = AtomicUsize::new(0);
 static TASK_INFO_HOOK: AtomicUsize = AtomicUsize::new(0);
+static CURRENT_OUTER_PID_HOOK: AtomicUsize = AtomicUsize::new(0);
+static PID_RESOLVE_HOOK: AtomicUsize = AtomicUsize::new(0);
+static PID_REPORT_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Wire the kernel-side accessors. Called once from boot init.
 pub fn install_proc_hooks(current: CurrentPidFn, list: ListPidsFn, info: TaskInfoFn) {
     CURRENT_PID_HOOK.store(current as usize, Ordering::Release);
     LIST_PIDS_HOOK.store(list as usize, Ordering::Release);
     TASK_INFO_HOOK.store(info as usize, Ordering::Release);
+}
+
+/// Wire the PID-namespace translation hooks (separate call so older callers of
+/// `install_proc_hooks` keep compiling). Both are identity in the root
+/// namespace; a build without them installed falls back to treating path
+/// numbers as outer ProcessIds (the pre-namespace behaviour).
+pub fn install_proc_pidns_hooks(
+    current_outer: CurrentOuterPidFn,
+    resolve: PidResolveFn,
+    report: PidReportFn,
+) {
+    CURRENT_OUTER_PID_HOOK.store(current_outer as usize, Ordering::Release);
+    PID_RESOLVE_HOOK.store(resolve as usize, Ordering::Release);
+    PID_REPORT_HOOK.store(report as usize, Ordering::Release);
 }
 
 pub(crate) fn current_pid() -> u64 {
@@ -135,6 +163,44 @@ pub(crate) fn current_pid() -> u64 {
     // SAFETY: v was stored by install_proc_hooks as a CurrentPidFn fn-pointer; non-zero confirms it.
     let f: CurrentPidFn = unsafe { core::mem::transmute(v) };
     f()
+}
+
+/// The caller's outer ProcessId (for `/proc/self` dir resolution). Falls back
+/// to `current_pid()` when the hook isn't installed (root-namespace-equivalent).
+pub(crate) fn current_outer_pid() -> u64 {
+    let v = CURRENT_OUTER_PID_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return current_pid();
+    }
+    // SAFETY: v was stored by install_proc_pidns_hooks as a CurrentOuterPidFn fn-pointer.
+    let f: CurrentOuterPidFn = unsafe { core::mem::transmute(v) };
+    f()
+}
+
+/// Resolve a `/proc/<N>` path number (reader-namespace) to the outer ProcessId,
+/// or `None` if invisible in the reader's namespace. Falls back to identity
+/// (`Some(n)`) when the hook isn't installed.
+pub(crate) fn pid_resolve(n: u64) -> Option<u64> {
+    let v = PID_RESOLVE_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return Some(n);
+    }
+    // SAFETY: v was stored by install_proc_pidns_hooks as a PidResolveFn fn-pointer.
+    let f: PidResolveFn = unsafe { core::mem::transmute(v) };
+    f(n)
+}
+
+/// Translate an outer ProcessId into the current reader's namespace view, or
+/// `None` if the process is invisible there. Falls back to identity (`Some(n)`)
+/// when the hook isn't installed. Backs cgroup.procs listing translation.
+pub(crate) fn pid_report(n: u64) -> Option<u64> {
+    let v = PID_REPORT_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return Some(n);
+    }
+    // SAFETY: v was stored by install_proc_pidns_hooks as a PidReportFn fn-pointer.
+    let f: PidReportFn = unsafe { core::mem::transmute(v) };
+    f(n)
 }
 
 fn list_pids() -> Vec<u64> {
@@ -1477,10 +1543,14 @@ impl DirOps for ProcRoot {
                 // Numeric pid → directory marker (lookup-as-file).
                 // resolve_async needs lookup_async to return a
                 // FileOps that stat()s as Dir before it'll call
-                // lookup_dir_async for the descent.
-                if let Ok(pid) = name.parse::<u64>() {
-                    if task_info(pid).is_some() {
-                        return Some(Arc::new(ProcDirMarker));
+                // lookup_dir_async for the descent. `name` is a pid in the
+                // READER's namespace; resolve it to the outer ProcessId (None →
+                // not visible in the reader's namespace → no such entry).
+                if let Ok(n) = name.parse::<u64>() {
+                    if let Some(pid) = pid_resolve(n) {
+                        if task_info(pid).is_some() {
+                            return Some(Arc::new(ProcDirMarker));
+                        }
                     }
                 }
                 None
@@ -1493,16 +1563,17 @@ impl DirOps for ProcRoot {
             return Some(Arc::new(pressure::ProcPressureDir));
         }
         if name == "self" {
-            // /proc/self resolves to the calling task's pid each
-            // time; we materialise a fresh ProcPidDir bound to it.
-            let pid = current_pid();
+            // /proc/self resolves to the calling task's pid each time. ProcPidDir
+            // keys on the OUTER ProcessId (the space every per-pid renderer
+            // expects), so use the outer-pid hook, not the namespace-local one.
+            let pid = current_outer_pid();
             return Some(Arc::new(ProcPidDir { pid }));
         }
         if name == "thread-self" {
             // /proc/thread-self → <pid>/task/<tid>; tid == pid in NARF.
             // Descending gives a ProcTaskTidDir that exposes `comm` etc.
             // Linux ref: `proc_thread_self_get_link` (fs/proc/self.c:80).
-            let pid = current_pid();
+            let pid = current_outer_pid();
             return pid_ext::ProcTaskDir { pid }.lookup_dir(&pid.to_string());
         }
         // Registry-backed subdirectory (e.g. "net").
@@ -1512,10 +1583,14 @@ impl DirOps for ProcRoot {
                 path_components: alloc::vec![String::from(name)],
             }));
         }
-        // Numeric name → per-pid dir. Validate the pid is live.
-        if let Ok(pid) = name.parse::<u64>() {
-            if task_info(pid).is_some() {
-                return Some(Arc::new(ProcPidDir { pid }));
+        // Numeric name → per-pid dir. `name` is a pid in the reader's
+        // namespace; translate to the outer ProcessId (None → not visible) and
+        // validate liveness before materialising the dir keyed on the outer id.
+        if let Ok(n) = name.parse::<u64>() {
+            if let Some(pid) = pid_resolve(n) {
+                if task_info(pid).is_some() {
+                    return Some(Arc::new(ProcPidDir { pid }));
+                }
             }
         }
         None

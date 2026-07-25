@@ -3,13 +3,26 @@ use super::*;
 
 pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let want_pid = args.arg0 as i64;
+    let mut want_pid = args.arg0 as i64;
     let status_ptr = args.arg1;
     let options = args.arg2 as u32;
     let rusage_ptr = args.arg3; // filled with the reaped child's CPU time
     const WNOHANG: u32 = 1;
 
     let parent = current_task_id();
+
+    // A specific `want_pid` arrives in the caller's PID-namespace view; the
+    // reap machinery (PENDING_EXITS) is keyed by the outer ProcessId, so
+    // translate inner→outer up front. All downstream matching — including the
+    // want_pid stored for the blocking path — then works in outer space, and
+    // finish_wait_child / the return sites translate the reaped pid back to the
+    // caller's view. Identity in the root namespace; an unbound inner pid stays
+    // as-is → matches no child → ECHILD (Linux-ish).
+    if want_pid > 0 {
+        if let Some(outer) = accept_pid_from(parent, want_pid as u64) {
+            want_pid = outer as i64;
+        }
+    }
 
     // Try-reap closure: pops the matching (child_pid, status)
     // from the parent's queue if any. Returns Some on success.
@@ -45,7 +58,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
             // and SMAP-brackets the 4-byte write.
             let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
         }
-        ctx.set_return(SyscallReturn::ok(child));
+        ctx.set_return(SyscallReturn::ok(report_pid_to(parent, child)));
         return;
     }
 
@@ -76,7 +89,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
         // it's no longer a child (otherwise the ECHILD check below stays
         // blind to the reap and the parent blocks forever).
         parent_of_remove(reaped);
-        ctx.set_return(SyscallReturn::ok(reaped));
+        ctx.set_return(SyscallReturn::ok(report_pid_to(parent, reaped)));
         return;
     }
 
@@ -180,7 +193,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
                 // SAFETY: Valid memory or trusted environment
                 let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
             }
-            ctx.set_return(SyscallReturn::ok(child));
+            ctx.set_return(SyscallReturn::ok(report_pid_to(parent, child)));
         }
         // Use u64::MAX as the "error" sentinel since 0 is the
         // legitimate WNOHANG-with-no-exited-child return value

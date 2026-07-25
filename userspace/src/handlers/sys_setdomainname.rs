@@ -21,15 +21,20 @@ pub(crate) fn sys_setdomainname(ctx: &mut dyn TrapContext) {
     // fall through to the global domainname slot (mirrors sethostname).
     #[cfg(feature = "container")]
     {
+        // Write to the SAME UTS namespace `uname(2)` reads back
+        // (`current_uts_ns` — the task's own ns, or the global one when it has
+        // none). Using `uts_ns_of` here instead silently dropped the write to
+        // the flat `DOMAINNAME` static for any task without an explicit UTS ns,
+        // while uname kept reading `global_uts()` → the two never agreed.
         let task = current_task_id();
-        if let Some(ns) = crate::namespaces::uts_ns_of(task) {
-            ns.set_domainname(&s);
-            ctx.set_return(SyscallReturn::ok(0));
-            return;
-        }
+        crate::namespaces::current_uts_ns(task).set_domainname(&s);
+        ctx.set_return(SyscallReturn::ok(0));
     }
-    let mut g = DOMAINNAME.lock();
-    g.clear();
-    g.push_str(&s);
-    ctx.set_return(SyscallReturn::ok(0));
+    #[cfg(not(feature = "container"))]
+    {
+        let mut g = DOMAINNAME.lock();
+        g.clear();
+        g.push_str(&s);
+        ctx.set_return(SyscallReturn::ok(0));
+    }
 }

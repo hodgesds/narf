@@ -206,11 +206,15 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // coredump_mask@64 coredump_signal@68 supported_mask@72.
             let mut info = [0u8; 80];
             info[0..8].copy_from_slice(&(PIDFD_INFO_PID | PIDFD_INFO_CREDS).to_ne_bytes());
-            let pid32 = target as u32;
+            // Report pid/tgid/ppid in the CALLER's PID namespace view (the
+            // process issuing the ioctl) — `target` and the parent are outer
+            // ProcessIds. Identity in the root namespace.
+            let caller = current_task_id();
+            let pid32 = report_pid_to(caller, target) as u32;
             info[16..20].copy_from_slice(&pid32.to_ne_bytes()); // pid
             info[20..24].copy_from_slice(&pid32.to_ne_bytes()); // tgid
             let ppid = parent_of_get(target)
-                .map(|p| task_to_pid_raw(p).unwrap_or(p) as u32)
+                .map(|p| report_pid_to(caller, task_to_pid_raw(p).unwrap_or(p)) as u32)
                 .unwrap_or(0);
             info[24..28].copy_from_slice(&ppid.to_ne_bytes());
             let cred_task = pid_to_task_raw(target).unwrap_or(target);

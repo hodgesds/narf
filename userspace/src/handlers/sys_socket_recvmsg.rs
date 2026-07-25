@@ -90,7 +90,16 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                 // learn which service reported READY=1.
                 let recv_fds = sock.unix_take_recv_fds();
                 let cred = if sock.passcred() {
-                    Some(sock.recvmsg_cred())
+                    // The stored sender cred carries the sender's OUTER
+                    // ProcessId; deliver it in the RECEIVER's PID-namespace view
+                    // so it matches the pid the receiver knows. This is
+                    // load-bearing for sd_notify: PID 1 rejects a READY=1
+                    // datagram whose SCM_CREDENTIALS pid != the service MainPID,
+                    // and MainPID is now the child's in-namespace pid (see the
+                    // clone-return translation). Identity in the root namespace.
+                    let mut c = sock.recvmsg_cred();
+                    c.pid = report_pid_to(current_task_id(), c.pid as u64) as u32;
+                    Some(c)
                 } else {
                     None
                 };
