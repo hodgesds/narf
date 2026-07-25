@@ -212,8 +212,11 @@ Unsupported address families and transport protocols return `EOPNOTSUPP`.
 emits Linux nfnetlink `IPCTNL_MSG_CT_NEW` records with original/reply tuples,
 status, timeout, and flow ID from the canonical conntrack table. Dumps end
 with `NLMSG_DONE`; aligned requests may be batched and `NLM_F_ACK` produces a
-zero-error acknowledgement after a successful dump. Mutations and unsupported nfnetlink subsystems return
-`EOPNOTSUPP`; Linux netlink does not grant ambient filter/NAT authority.
+zero-error acknowledgement after a successful query. Non-dump point queries
+select an entry by `CTA_ID` or complete `CTA_TUPLE_ORIG`, return a
+non-multipart record, and report `ENOENT` when the canonical table has no
+match. Mutations and unsupported nfnetlink subsystems return `EOPNOTSUPP`;
+Linux netlink does not grant ambient filter/NAT authority.
 
 `NETLINK_AUDIT` reports a disabled zeroed `audit_status` for `AUDIT_GET` and
 an empty completed `AUDIT_LIST_RULES` dump. `AUDIT_SET` returns `EPERM`

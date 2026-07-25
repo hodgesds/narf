@@ -36,7 +36,9 @@ const IPS_SEEN_REPLY: u32 = 1 << 1;
 const IPS_ASSURED: u32 = 1 << 2;
 const IPS_CONFIRMED: u32 = 1 << 3;
 const EINVAL: i32 = 22;
+const ENOENT: i32 = 2;
 const EOPNOTSUPP: i32 = 95;
+const NLA_TYPE_MASK: u16 = !(3 << 14);
 
 fn align(len: usize) -> usize {
     (len + 3) & !3
@@ -84,7 +86,11 @@ fn tuple(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, proto_num: u8) -> V
     out
 }
 
-fn encode_entry(entry: &crate::netfilter::conntrack::ConntrackSnapshot, seq: u32) -> Vec<u8> {
+fn encode_entry(
+    entry: &crate::netfilter::conntrack::ConntrackSnapshot,
+    seq: u32,
+    multipart: bool,
+) -> Vec<u8> {
     let mut body = alloc::vec![AF_INET, 0, 0, 0]; // struct nfgenmsg
     let original = tuple(
         entry.orig_src,
@@ -114,10 +120,45 @@ fn encode_entry(entry: &crate::netfilter::conntrack::ConntrackSnapshot, seq: u32
     push_attr(&mut body, CTA_ID, &(entry.id as u32).to_be_bytes());
     frame(
         (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_NEW,
-        NLM_F_MULTI,
+        if multipart { NLM_F_MULTI } else { 0 },
         seq,
         &body,
     )
+}
+
+fn find_attr(attrs: &[u8], requested_kind: u16) -> Option<&[u8]> {
+    let mut offset = 0;
+    while offset + 4 <= attrs.len() {
+        let len = u16::from_ne_bytes(attrs[offset..offset + 2].try_into().ok()?) as usize;
+        let kind =
+            u16::from_ne_bytes(attrs[offset + 2..offset + 4].try_into().ok()?) & NLA_TYPE_MASK;
+        if len < 4 || offset + len > attrs.len() {
+            return None;
+        }
+        if kind == requested_kind {
+            return Some(&attrs[offset + 4..offset + len]);
+        }
+        offset += align(len);
+    }
+    None
+}
+
+fn requested_tuple(attrs: &[u8]) -> Option<crate::netfilter::Tuple> {
+    let tuple = find_attr(attrs, CTA_TUPLE_ORIG)?;
+    let ip = find_attr(tuple, CTA_TUPLE_IP)?;
+    let proto = find_attr(tuple, CTA_TUPLE_PROTO)?;
+    let src_ip = find_attr(ip, CTA_IP_V4_SRC)?.try_into().ok()?;
+    let dst_ip = find_attr(ip, CTA_IP_V4_DST)?.try_into().ok()?;
+    let proto_num = *find_attr(proto, CTA_PROTO_NUM)?.first()?;
+    let src_port = u16::from_be_bytes(find_attr(proto, CTA_PROTO_SRC_PORT)?.try_into().ok()?);
+    let dst_port = u16::from_be_bytes(find_attr(proto, CTA_PROTO_DST_PORT)?.try_into().ok()?);
+    Some(crate::netfilter::Tuple {
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        proto: proto_num,
+    })
 }
 
 fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
@@ -141,14 +182,39 @@ fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
     if request.len() < NLMSG_HDRLEN + 4 || request[NLMSG_HDRLEN] != AF_INET {
         return Ok(alloc::vec![error(EINVAL, seq, request)]);
     }
-    if flags & NLM_F_DUMP != NLM_F_DUMP {
-        return Ok(alloc::vec![error(EOPNOTSUPP, seq, request)]);
-    }
-    let mut out = crate::netfilter::conntrack::snapshot()
-        .iter()
-        .map(|entry| encode_entry(entry, seq))
-        .collect::<Vec<_>>();
-    out.push(frame(NLMSG_DONE, NLM_F_MULTI, seq, &0i32.to_ne_bytes()));
+    let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
+    let snapshot = crate::netfilter::conntrack::snapshot();
+    let mut out = if dump {
+        let mut replies = snapshot
+            .iter()
+            .map(|entry| encode_entry(entry, seq, true))
+            .collect::<Vec<_>>();
+        replies.push(frame(NLMSG_DONE, NLM_F_MULTI, seq, &0i32.to_ne_bytes()));
+        replies
+    } else {
+        let attrs = &request[NLMSG_HDRLEN + 4..];
+        let requested_id = find_attr(attrs, CTA_ID)
+            .filter(|raw| raw.len() == 4)
+            .map(|raw| u32::from_be_bytes(raw.try_into().unwrap_or([0; 4])) as u64);
+        let requested_tuple = requested_tuple(attrs);
+        if requested_id.is_none() && requested_tuple.is_none() {
+            return Ok(alloc::vec![error(EINVAL, seq, request)]);
+        }
+        let found = snapshot.iter().find(|entry| {
+            requested_id == Some(entry.id)
+                || requested_tuple.is_some_and(|tuple| {
+                    tuple.src_ip == entry.orig_src
+                        && tuple.dst_ip == entry.orig_dst
+                        && tuple.src_port == entry.orig_sport
+                        && tuple.dst_port == entry.orig_dport
+                        && tuple.proto == entry.l4proto_num
+                })
+        });
+        match found {
+            Some(entry) => alloc::vec![encode_entry(entry, seq, false)],
+            None => alloc::vec![error(ENOENT, seq, request)],
+        }
+    };
     if flags & NLM_F_ACK != 0 {
         out.push(error(0, seq, request));
     }
@@ -250,6 +316,67 @@ mod tests {
                     .unwrap()
             ),
             0
+        );
+    }
+
+    #[test]
+    fn point_query_finds_canonical_tuple_and_omits_multi_flag() {
+        crate::netfilter::conntrack::__reset_for_test();
+        let tracked = crate::netfilter::Tuple {
+            src_ip: [192, 0, 2, 1],
+            dst_ip: [198, 51, 100, 2],
+            src_port: 4242,
+            dst_port: 443,
+            proto: 6,
+        };
+        crate::netfilter::conntrack::ct().insert_new(tracked, 0);
+
+        let mut body = alloc::vec![AF_INET, 0, 0, 0];
+        let attrs = tuple(
+            tracked.src_ip,
+            tracked.dst_ip,
+            tracked.src_port,
+            tracked.dst_port,
+            tracked.proto,
+        );
+        push_attr(&mut body, CTA_TUPLE_ORIG | NLA_F_NESTED, &attrs);
+        let query = frame(
+            (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_GET,
+            NLM_F_REQUEST,
+            77,
+            &body,
+        );
+        let replies = build_replies(&query).unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            u16::from_ne_bytes(replies[0][4..6].try_into().unwrap()),
+            (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_NEW
+        );
+        assert_eq!(
+            u16::from_ne_bytes(replies[0][6..8].try_into().unwrap()) & NLM_F_MULTI,
+            0
+        );
+    }
+
+    #[test]
+    fn missing_point_query_returns_enoent() {
+        crate::netfilter::conntrack::__reset_for_test();
+        let mut body = alloc::vec![AF_INET, 0, 0, 0];
+        push_attr(&mut body, CTA_ID, &99u32.to_be_bytes());
+        let query = frame(
+            (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_GET,
+            NLM_F_REQUEST,
+            78,
+            &body,
+        );
+        let replies = build_replies(&query).unwrap();
+        assert_eq!(
+            i32::from_ne_bytes(
+                replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            -ENOENT
         );
     }
 }
