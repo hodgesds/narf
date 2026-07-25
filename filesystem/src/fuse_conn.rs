@@ -25,7 +25,7 @@
 //! [`FuseConnection`].
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -61,6 +61,7 @@ struct FuseReply {
 pub struct FuseConnection {
     pending: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
     replies: IrqSafeSpinLock<BTreeMap<u64, Option<FuseReply>>>,
+    delivered: IrqSafeSpinLock<BTreeSet<u64>>,
     next_unique: AtomicU64,
     connected: core::sync::atomic::AtomicBool,
     /// True once FUSE_INIT has completed successfully.
@@ -88,6 +89,7 @@ impl FuseConnection {
         FuseConnection {
             pending: IrqSafeSpinLock::new(VecDeque::new()),
             replies: IrqSafeSpinLock::new(BTreeMap::new()),
+            delivered: IrqSafeSpinLock::new(BTreeSet::new()),
             // Linux starts `unique` at 1 and only ever uses even values in
             // some versions; any monotone non-zero sequence is spec-legal.
             next_unique: AtomicU64::new(1),
@@ -164,16 +166,34 @@ impl FuseConnection {
 
     fn cancel_request(&self, unique: u64) {
         self.replies.lock().remove(&unique);
+        let mut removed_pending = false;
         self.pending.lock().retain(|request| {
-            pod_from_bytes::<FuseInHeader>(request)
+            let keep = pod_from_bytes::<FuseInHeader>(request)
                 .map(|header| header.unique != unique)
-                .unwrap_or(false)
+                .unwrap_or(false);
+            removed_pending |= !keep;
+            keep
         });
+        if !removed_pending && self.delivered.lock().remove(&unique) && self.is_connected() {
+            self.submit_noreply(
+                FuseOpcode::Interrupt,
+                0,
+                &pod_as_bytes(&FuseInterruptIn { unique }),
+            );
+        }
     }
 
     /// Daemon side: dequeue the next request bytes, if any. Non-blocking.
     pub fn dequeue_request(&self) -> Option<Vec<u8>> {
-        self.pending.lock().pop_front()
+        let request = self.pending.lock().pop_front()?;
+        if let Some(header) = pod_from_bytes::<FuseInHeader>(&request) {
+            if header.opcode != FuseOpcode::Interrupt as u32
+                && header.opcode != FuseOpcode::Forget as u32
+            {
+                self.delivered.lock().insert(header.unique);
+            }
+        }
+        Some(request)
     }
 
     /// Copy one complete request into a daemon buffer.
@@ -190,7 +210,15 @@ impl FuseConnection {
         }
         let n = req.len();
         buf[..n].copy_from_slice(req);
-        pending.pop_front();
+        let request = pending.pop_front().expect("front request exists");
+        drop(pending);
+        if let Some(header) = pod_from_bytes::<FuseInHeader>(&request) {
+            if header.opcode != FuseOpcode::Interrupt as u32
+                && header.opcode != FuseOpcode::Forget as u32
+            {
+                self.delivered.lock().insert(header.unique);
+            }
+        }
         Ok(Some(n))
     }
 
@@ -213,6 +241,7 @@ impl FuseConnection {
             return None;
         }
         let body = reply[hdr_len..claimed].to_vec();
+        self.delivered.lock().remove(&hdr.unique);
         let mut g = self.replies.lock();
         match g.get_mut(&hdr.unique) {
             Some(slot @ None) => {

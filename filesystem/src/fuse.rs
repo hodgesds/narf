@@ -52,6 +52,7 @@ pub enum FuseOpcode {
     Setlkw = 33,
     Access = 34,
     Create = 35,
+    Interrupt = 36,
     Destroy = 38,
     Fallocate = 43,
     Rename2 = 45,
@@ -464,6 +465,12 @@ pub struct FuseCopyFileRangeIn {
     pub off_out: u64,
     pub len: u64,
     pub flags: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseInterruptIn {
+    pub unique: u64,
 }
 
 /// `struct fuse_forget_in` — FORGET request body: the drop count for a

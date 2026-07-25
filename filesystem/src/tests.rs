@@ -3468,6 +3468,61 @@ fn smoke_fs_fuse_short_read_preserves_request() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_short_read_preserves_request);
 
+/// Cancelling an operation already read by the daemon emits FUSE_INTERRUPT
+/// naming the original request unique ID.
+fn smoke_fs_fuse_delivered_cancel_interrupts() -> TestResult {
+    use crate::fuse::{pod_from_bytes, FuseInHeader, FuseInterruptIn, FuseOpcode};
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VT)
+    }
+    fn noop(_: *const ()) {}
+    static VT: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+
+    let conn = Arc::new(FuseConnection::new());
+    let fs = FuseFs::new("fuse-cancel", Arc::clone(&conn));
+    let mut future = alloc::boxed::Box::pin(fs.init());
+    // SAFETY: the static vtable never dereferences its null data pointer.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+    let mut cx = Context::from_waker(&waker);
+    if !matches!(Pin::new(&mut future).poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("FUSE_INIT unexpectedly completed without daemon");
+    }
+    let original = match conn.dequeue_request() {
+        Some(request) => request,
+        None => return TestResult::Fail("FUSE_INIT was not queued"),
+    };
+    let original_header: FuseInHeader = match pod_from_bytes(&original) {
+        Some(header) => header,
+        None => return TestResult::Fail("FUSE_INIT header malformed"),
+    };
+    drop(future);
+    let interrupt = match conn.dequeue_request() {
+        Some(request) => request,
+        None => return TestResult::Fail("delivered cancellation did not queue interrupt"),
+    };
+    let header: FuseInHeader = match pod_from_bytes(&interrupt) {
+        Some(header) => header,
+        None => return TestResult::Fail("FUSE_INTERRUPT header malformed"),
+    };
+    let body = &interrupt[core::mem::size_of::<FuseInHeader>()..];
+    let input: FuseInterruptIn = match pod_from_bytes(body) {
+        Some(input) => input,
+        None => return TestResult::Fail("FUSE_INTERRUPT body malformed"),
+    };
+    if header.opcode == FuseOpcode::Interrupt as u32 && input.unique == original_header.unique {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("FUSE_INTERRUPT named wrong request")
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_delivered_cancel_interrupts);
+
 /// `/dev/fuse` device wiring: opening the node yields a DevFuse whose
 /// connection is recoverable (the mount path's `fd=N` → connection step).
 fn smoke_fs_fuse_dev_node() -> TestResult {

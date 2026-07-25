@@ -151,8 +151,9 @@ replies by the non-zero `unique` identifier.
   read reports `EAGAIN`.
 - A daemon buffer smaller than the next complete request reports
   `EINVAL` without consuming or truncating that request.
-- Dropping a pending VFS future removes its reply slot; late replies
-  are ignored rather than retained.
+- Dropping an unsent VFS future removes its queued request and reply
+  slot. Dropping a request already delivered to the daemon queues
+  `FUSE_INTERRUPT` naming the original unique ID; late replies are ignored.
 - Directory traffic uses `OPENDIR`, `READDIR`, and `RELEASEDIR`, which
   are distinct from regular-file `OPEN` and `RELEASE`.
 - The bridge supports lookup, getattr/setattr, create, mknod, mkdir,
