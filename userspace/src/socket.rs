@@ -397,6 +397,9 @@ pub struct SocketFile {
     netlink_cap_ack: AtomicBool,
     netlink_ext_ack: AtomicBool,
     netlink_strict_check: AtomicBool,
+    /// Explicitly delegated NARF network-control authority. Never inferred
+    /// from uid or Linux ambient capability bits.
+    netlink_admin: IrqSafeSpinLock<Option<narf_net::AdminHandle>>,
 }
 
 static NEXT_NETLINK_PORTID: AtomicU32 = AtomicU32::new(1);
@@ -697,7 +700,17 @@ impl SocketFile {
             netlink_cap_ack: AtomicBool::new(false),
             netlink_ext_ack: AtomicBool::new(false),
             netlink_strict_check: AtomicBool::new(false),
+            netlink_admin: IrqSafeSpinLock::new(None),
         })
+    }
+
+    pub fn delegate_netlink_admin(&self, admin: narf_net::AdminHandle) -> Result<(), SockError> {
+        if self.domain != AF_NETLINK || self.protocol != NETLINK_ROUTE {
+            return Err(SockError::InvalidArg);
+        }
+        admin.check_live().map_err(|_| SockError::InvalidArg)?;
+        *self.netlink_admin.lock() = Some(admin);
+        Ok(())
     }
 
     fn netlink_addr(addr: &SockAddr) -> Option<(u32, u32)> {
@@ -1442,10 +1455,12 @@ impl SocketFile {
             SocketOp::Send { buf, .. } => {
                 self.ensure_netlink_portid();
                 let sent = buf.len() as u64;
-                let msgs = match narf_net::netlink_route::build_replies(buf) {
-                    Ok(msgs) => msgs,
-                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
-                };
+                let admin = self.netlink_admin.lock().clone();
+                let msgs =
+                    match narf_net::netlink_route::build_replies_authorized(buf, admin.as_ref()) {
+                        Ok(msgs) => msgs,
+                        Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                    };
                 {
                     let mut g = self.state.lock();
                     match &mut *g {

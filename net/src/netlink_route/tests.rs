@@ -314,3 +314,51 @@ fn malformed_batched_message_length_is_rejected() {
     message[0..4].copy_from_slice(&1024u32.to_le_bytes());
     assert!(build_replies(&message).is_err());
 }
+
+#[test]
+fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
+    fn discard(_: &[u8]) -> Result<(), ()> {
+        Ok(())
+    }
+
+    let name = "rtnl-admin-test0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 1, 1], discard);
+    let ifindex = crate::iface::snapshot_all()
+        .iter()
+        .position(|iface| iface.name == name)
+        .unwrap() as u32
+        + 2;
+
+    let mut body = Vec::new();
+    body.push(0);
+    body.push(0);
+    body.extend_from_slice(&0u16.to_ne_bytes());
+    body.extend_from_slice(&(ifindex as i32).to_ne_bytes());
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    push_rtattr(&mut body, IFLA_MTU, &9000u32.to_ne_bytes());
+    let request = frame_message(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 99, 42, &body);
+
+    let denied = build_replies(&request).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(
+            denied[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap()
+        ),
+        -EPERM
+    );
+
+    let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
+    let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
+    let allowed = build_replies_authorized(&request, Some(&admin)).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(
+            allowed[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap()
+        ),
+        0
+    );
+    assert_eq!(crate::iface::lookup(name).unwrap().mtu, 9000);
+}

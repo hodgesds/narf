@@ -110,7 +110,7 @@ RX. Used by `verification/` to test the contract without hardware.
 
 ### 3.6 Linux rtnetlink compatibility
 
-`NETLINK_ROUTE` provides read-only Linux wire-compatible dumps for
+`NETLINK_ROUTE` provides Linux wire-compatible dumps for
 `RTM_GETLINK`, `RTM_GETADDR`, `RTM_GETROUTE`, `RTM_GETNEIGH`, and
 `RTM_GETRULE`, plus `RTM_GETQDISC`. Replies expose the interface registry,
 configured IPv4 addresses, IPv4 FIB, live IPv4 ARP plus IPv6 NDP neighbor
@@ -119,8 +119,10 @@ interface's direct-ring `noqueue` discipline respectively,
 echo the request sequence, identify the kernel sender with port ID zero, carry
 `NLM_F_MULTI`, and terminate with `NLMSG_DONE`. Unsupported request types return
 `NLMSG_ERROR(-EOPNOTSUPP)`. Rtnetlink mutation requests are not an ambient
-administration path; control-plane writes continue to require the typed
-`Cap<NetIface, Admin>` operations in §3.3.
+administration path. A route socket must first be explicitly delegated an
+interface-bound `AdminHandle`; undelegated or cross-interface writes return
+`NLMSG_ERROR(-EPERM)`. `RTM_NEWLINK`/`RTM_SETLINK` and IPv4
+`RTM_NEWADDR`/`RTM_DELADDR` invoke the typed operations in §3.3.
 
 Link dumps include Linux operational-state, carrier, qdisc, queue-length,
 broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero

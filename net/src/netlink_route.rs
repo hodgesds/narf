@@ -51,8 +51,11 @@ pub const NLMSG_ERROR: u16 = 2;
 pub const NLMSG_DONE: u16 = 3;
 
 pub const RTM_NEWLINK: u16 = 16;
+pub const RTM_DELLINK: u16 = 17;
 pub const RTM_GETLINK: u16 = 18;
+pub const RTM_SETLINK: u16 = 19;
 pub const RTM_NEWADDR: u16 = 20;
+pub const RTM_DELADDR: u16 = 21;
 pub const RTM_GETADDR: u16 = 22;
 pub const RTM_NEWROUTE: u16 = 24;
 pub const RTM_GETROUTE: u16 = 26;
@@ -149,6 +152,9 @@ pub const FR_ACT_TO_TBL: u8 = 1;
 /// `-EOPNOTSUPP` — the errno an unsupported dump request answers with,
 /// carried in the `NLMSG_ERROR` payload (negated, per netlink convention).
 pub const EOPNOTSUPP: i32 = 95;
+pub const EPERM: i32 = 1;
+pub const ENODEV: i32 = 19;
+pub const EINVAL: i32 = 22;
 
 // ── parsed request header ───────────────────────────────────────────────
 
@@ -616,12 +622,129 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+fn find_attr(request: &[u8], fixed_len: usize, kind: u16) -> Option<&[u8]> {
+    let mut offset = NLMSG_HDRLEN + fixed_len;
+    while offset + 4 <= request.len() {
+        let len = u16::from_ne_bytes(request[offset..offset + 2].try_into().ok()?) as usize;
+        let attr_kind = u16::from_ne_bytes(request[offset + 2..offset + 4].try_into().ok()?);
+        if len < 4 || offset + len > request.len() {
+            return None;
+        }
+        if attr_kind == kind {
+            return Some(&request[offset + 4..offset + len]);
+        }
+        offset += rta_align(len);
+    }
+    None
+}
+
+fn iface_name_for_index(ifindex: u32) -> Option<alloc::string::String> {
+    if ifindex == 1 {
+        return Some(alloc::string::String::from("lo"));
+    }
+    crate::iface::snapshot_all()
+        .into_iter()
+        .nth(ifindex.checked_sub(2)? as usize)
+        .map(|iface| iface.name)
+}
+
+fn admin_errno(error: crate::AdminError) -> i32 {
+    match error {
+        crate::AdminError::AuthorityRevoked => EPERM,
+        crate::AdminError::NoIface => ENODEV,
+        crate::AdminError::InvalidMtu
+        | crate::AdminError::InvalidMac
+        | crate::AdminError::InvalidPrefix => EINVAL,
+    }
+}
+
+fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<(), i32> {
+    let hdr = parse_hdr(request).ok_or(EINVAL)?;
+    let admin = admin.ok_or(EPERM)?;
+    match hdr.msg_type {
+        RTM_NEWLINK | RTM_SETLINK => {
+            if request.len() < NLMSG_HDRLEN + 16 {
+                return Err(EINVAL);
+            }
+            let ifindex = i32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
+            if ifindex <= 0 {
+                return Err(EINVAL);
+            }
+            let iface_name = iface_name_for_index(ifindex as u32).ok_or(ENODEV)?;
+            if iface_name != admin.iface_name() {
+                return Err(EPERM);
+            }
+            let flags = u32::from_ne_bytes(request[24..28].try_into().map_err(|_| EINVAL)?);
+            let change = u32::from_ne_bytes(request[28..32].try_into().map_err(|_| EINVAL)?);
+            if change & IFF_UP != 0 {
+                admin.set_link(flags & IFF_UP != 0).map_err(admin_errno)?;
+            }
+            if let Some(mtu) = find_attr(request, 16, IFLA_MTU) {
+                if mtu.len() != 4 {
+                    return Err(EINVAL);
+                }
+                admin
+                    .set_mtu(u32::from_ne_bytes(mtu.try_into().map_err(|_| EINVAL)?))
+                    .map_err(admin_errno)?;
+            }
+            if let Some(mac) = find_attr(request, 16, IFLA_ADDRESS) {
+                if mac.len() != 6 {
+                    return Err(EINVAL);
+                }
+                admin
+                    .set_mac(mac.try_into().map_err(|_| EINVAL)?)
+                    .map_err(admin_errno)?;
+            }
+            Ok(())
+        }
+        RTM_NEWADDR | RTM_DELADDR => {
+            if request.len() < NLMSG_HDRLEN + 8 || request[NLMSG_HDRLEN] != AF_INET {
+                return Err(EINVAL);
+            }
+            let prefix_len = request[NLMSG_HDRLEN + 1];
+            let ifindex = u32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
+            let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
+            if iface_name != admin.iface_name() {
+                return Err(EPERM);
+            }
+            let addr = find_attr(request, 8, IFA_LOCAL)
+                .or_else(|| find_attr(request, 8, IFA_ADDRESS))
+                .ok_or(EINVAL)?;
+            if addr.len() != 4 {
+                return Err(EINVAL);
+            }
+            let addr: [u8; 4] = addr.try_into().map_err(|_| EINVAL)?;
+            if hdr.msg_type == RTM_NEWADDR {
+                admin.add_ipv4(addr, prefix_len).map_err(admin_errno)
+            } else {
+                admin.del_ipv4(addr, prefix_len).map_err(admin_errno)
+            }
+        }
+        RTM_DELLINK => Err(EOPNOTSUPP),
+        _ => Err(EOPNOTSUPP),
+    }
+}
+
+fn is_mutation(msg_type: u16) -> bool {
+    matches!(
+        msg_type,
+        RTM_NEWLINK | RTM_DELLINK | RTM_SETLINK | RTM_NEWADDR | RTM_DELADDR
+    )
+}
+
 /// Parse every aligned `nlmsghdr` in one netlink datagram and build a single
 /// ordered reply queue. Linux permits callers to batch multiple requests in
 /// one `sendmsg`; each request retains its own sequence number. Successful
 /// requests carrying `NLM_F_ACK` receive an `NLMSG_ERROR` with error zero
 /// after their dump. A malformed message length rejects the whole datagram.
 pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+    build_replies_authorized(datagram, None)
+}
+
+pub fn build_replies_authorized(
+    datagram: &[u8],
+    admin: Option<&crate::AdminHandle>,
+) -> Result<Vec<Vec<u8>>, ()> {
     let mut offset = 0usize;
     let mut replies = Vec::new();
 
@@ -633,6 +756,18 @@ pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
             return Err(());
         }
         let request = &remaining[..msg_len];
+        if is_mutation(hdr.msg_type) {
+            match apply_mutation(request, admin) {
+                Ok(()) => {
+                    if hdr.flags & NLM_F_ACK != 0 {
+                        replies.push(build_ack(hdr.seq, request));
+                    }
+                }
+                Err(errno) => replies.push(build_error(errno, hdr.seq, 0, request)),
+            }
+            offset += nlmsg_align(msg_len);
+            continue;
+        }
         let supported = matches!(
             hdr.msg_type,
             RTM_GETLINK
