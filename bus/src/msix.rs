@@ -262,11 +262,7 @@ impl MsixTable {
         }
 
         let (msg_addr, msg_data) = msi_message(target_apic_id, irq_vector);
-        let msg_addr_lo = msg_addr as u32;
-        let msg_addr_hi = (msg_addr >> 32) as u32;
-
-        // Vector control bit 0 = mask. Clear to unmask the entry.
-        let vec_ctrl: u32 = 0;
+        let words = msix_entry_words(target_apic_id, irq_vector);
 
         let entry_off = self.table_offset as u64 + (vector_idx as u64) * 16;
         // SAFETY: entry_off + 16 <= bar.size by spec — table_offset
@@ -274,10 +270,10 @@ impl MsixTable {
         // returned `region.len` as the BAR size.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            region.write32(entry_off, msg_addr_lo);
-            region.write32(entry_off + 4, msg_addr_hi);
-            region.write32(entry_off + 8, msg_data);
-            region.write32(entry_off + 12, vec_ctrl);
+            region.write32(entry_off, words[0]);
+            region.write32(entry_off + 4, words[1]);
+            region.write32(entry_off + 8, words[2]);
+            region.write32(entry_off + 12, words[3]);
         }
 
         Ok(MsixVector {
@@ -520,6 +516,21 @@ fn msi_message(target: u32, vector_or_event: u8) -> (u64, u32) {
         let _ = (target, vector_or_event);
         (0, 0)
     }
+}
+
+/// Encode one 16-byte MSI-X table entry without performing MMIO.
+///
+/// Kept public-but-hidden so kernel smokes can validate block programming
+/// without rewriting a live device's table behind its active driver.
+#[doc(hidden)]
+pub fn msix_entry_words(target: u32, vector_or_event: u8) -> [u32; 4] {
+    let (address, data) = msi_message(target, vector_or_event);
+    [
+        address as u32,
+        (address >> 32) as u32,
+        data,
+        0, // vector-control bit 0 clear: unmasked
+    ]
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
