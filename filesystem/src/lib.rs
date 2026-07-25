@@ -470,6 +470,11 @@ pub trait FileOps: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    /// Commit all dirty state belonging to this file's filesystem.
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn set_xattr<'a>(&'a self, _name: &'a str, _value: &'a [u8], _flags: u32) -> FsFuture<'a, ()> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
@@ -940,6 +945,11 @@ pub trait DirOps: Send + Sync {
     /// Commit directory entries and metadata (`data_only` models
     /// `fdatasync(2)` on an open directory descriptor).
     fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Commit all dirty state belonging to this directory's filesystem.
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
 

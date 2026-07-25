@@ -896,6 +896,19 @@ impl FileOps for FuseFile {
         })
     }
 
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.conn
+                .request(
+                    FuseOpcode::Syncfs,
+                    FUSE_ROOT_ID,
+                    pod_as_bytes(&FuseSyncfsIn::default()),
+                )
+                .await
+                .map(|_| ())
+        })
+    }
+
     fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let mut body = pod_as_bytes(&FuseSetxattrIn {
@@ -1341,6 +1354,19 @@ impl DirOps for FuseDir {
                 .await
                 .map(|_| ());
             sync_result.and(release_result)
+        })
+    }
+
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.conn
+                .request(
+                    FuseOpcode::Syncfs,
+                    FUSE_ROOT_ID,
+                    pod_as_bytes(&FuseSyncfsIn::default()),
+                )
+                .await
+                .map(|_| ())
         })
     }
 

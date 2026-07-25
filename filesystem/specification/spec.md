@@ -128,6 +128,7 @@ pub trait Filesystem: Send + Sync {
 
 pub trait DirOps: Send + Sync {
     async fn fsync(&self, data_only: bool) -> Result<(), FsError>;
+    async fn syncfs(&self) -> Result<(), FsError>;
     /* … */
 }
 ```
@@ -179,6 +180,9 @@ success when they have no volatile backing state. Directory descriptors
 forward the same operation through `DirOps`; FUSE opens a directory
 handle, issues `FUSE_FSYNCDIR` with the data-only flag when requested,
 and releases the handle.
+`FileOps::syncfs` and `DirOps::syncfs` back Linux `syncfs(fd)`, which
+validates the descriptor and flushes its backing filesystem. FUSE sends
+`FUSE_SYNCFS` to the mount's root node with the Linux zeroed request body.
 
 `DirOps::rename_to` and `DirOps::link_to` express atomic operations
 between two directories of one filesystem. FUSE translates the target

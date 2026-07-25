@@ -2770,6 +2770,9 @@ fn smoke_fs_fuse_struct_sizes() -> TestResult {
     if size_of::<FuseForgetOne>() != 16 || size_of::<FuseBatchForgetIn>() != 8 {
         return TestResult::Fail("fuse batch-forget layouts drifted");
     }
+    if size_of::<FuseSyncfsIn>() != 8 {
+        return TestResult::Fail("fuse_syncfs_in != 8");
+    }
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_struct_sizes);
@@ -2915,6 +2918,7 @@ fn fuse_reply(unique: u64, error: i32, body: &[u8]) -> alloc::vec::Vec<u8> {
 /// `None` for an opcode it doesn't model (which fails the request).
 static FUSE_FSYNCDIR_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 static FUSE_FSYNCDIR_FLAGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FUSE_SYNCFS_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     use crate::fuse::*;
@@ -3210,6 +3214,14 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
             FUSE_FSYNCDIR_FLAGS.fetch_or(input.fsync_flags, core::sync::atomic::Ordering::Relaxed);
             Some(fuse_reply(unique, 0, &[]))
         }
+        50 => {
+            let input: FuseSyncfsIn = pod_from_bytes(body)?;
+            if hdr.nodeid != FUSE_ROOT_ID || input.padding != 0 {
+                return Some(fuse_reply(unique, -22, &[]));
+            }
+            FUSE_SYNCFS_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Some(fuse_reply(unique, 0, &[]))
+        }
         // Namespace mutations, durability, and handle releases acknowledge empty.
         10 | 11 | 12 | 18 | 20 | 25 | 29 | 45 => Some(fuse_reply(unique, 0, &[])),
         // FUSE_FORGET (2): has no reply; drop it.
@@ -3473,6 +3485,7 @@ fn smoke_fs_fuse_mutations() -> TestResult {
     OUTCOME.store(0, Ordering::Relaxed);
     FUSE_FSYNCDIR_COUNT.store(0, Ordering::Relaxed);
     FUSE_FSYNCDIR_FLAGS.store(0, Ordering::Relaxed);
+    FUSE_SYNCFS_COUNT.store(0, Ordering::Relaxed);
 
     let conn = Arc::new(FuseConnection::new());
     let fs = Arc::new(FuseFs::new("fuse-rw", Arc::clone(&conn)));
@@ -3495,7 +3508,9 @@ fn smoke_fs_fuse_mutations() -> TestResult {
         let large_write = alloc::vec![0x5a; 128 * 1024 + 17];
         if root.fsync(false).await.is_err()
             || root.fsync(true).await.is_err()
+            || root.syncfs().await.is_err()
             || file.write(0, b"payload").await != Ok(7)
+            || file.syncfs().await.is_err()
             || file.write(7, &large_write).await != Ok(large_write.len())
             || file.truncate(3).await.is_err()
             || file.set_perms(0o600).await.is_err()
@@ -3590,7 +3605,11 @@ fn smoke_fs_fuse_mutations() -> TestResult {
         1 if FUSE_FSYNCDIR_COUNT.load(Ordering::Relaxed) == 2
             && FUSE_FSYNCDIR_FLAGS.load(Ordering::Relaxed) == crate::fuse::FUSE_FSYNC_FDATASYNC =>
         {
-            TestResult::Pass
+            if FUSE_SYNCFS_COUNT.load(Ordering::Relaxed) == 2 {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("FUSE_SYNCFS requests were not observed")
+            }
         }
         1 => TestResult::Fail("FUSE_FSYNCDIR requests were not observed"),
         2 => TestResult::Fail("FUSE_INIT failed"),

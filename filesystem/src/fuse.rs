@@ -61,6 +61,7 @@ pub enum FuseOpcode {
     Rename2 = 45,
     Lseek = 46,
     CopyFileRange = 47,
+    Syncfs = 50,
 }
 
 /// Header prepended to every FUSE request. Matches the wire layout
@@ -496,6 +497,13 @@ pub struct FuseCopyFileRangeIn {
     pub off_out: u64,
     pub len: u64,
     pub flags: u64,
+}
+
+/// `struct fuse_syncfs_in`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseSyncfsIn {
+    pub padding: u64,
 }
 
 #[repr(C)]
