@@ -180,8 +180,9 @@ Link dumps merge the legacy IPv4 registry with the canonical driver-backed
 registry by interface name, so frame-ring-only drivers appear exactly once.
 
 `NETLINK_GENERIC` publishes the mandatory `nlctrl` control family.
-`CTRL_CMD_GETFAMILY` supports name lookup and dump enumeration with
-Linux-compatible attributes; unknown family names return `ENOENT`. Multiple
+`CTRL_CMD_GETFAMILY` supports name or numeric-ID lookup and dump enumeration
+with Linux-compatible family, supported-operation, and multicast-group
+attributes; unknown families return `ENOENT`. Multiple
 aligned control requests may be batched in one datagram and retain independent
 sequence numbers.
 Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the

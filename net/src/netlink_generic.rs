@@ -28,6 +28,16 @@ const CTRL_ATTR_FAMILY_NAME: u16 = 2;
 const CTRL_ATTR_VERSION: u16 = 3;
 const CTRL_ATTR_HDRSIZE: u16 = 4;
 const CTRL_ATTR_MAXATTR: u16 = 5;
+const CTRL_ATTR_OPS: u16 = 6;
+const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
+const CTRL_ATTR_OP_ID: u16 = 1;
+const CTRL_ATTR_OP_FLAGS: u16 = 2;
+const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
+const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
+const NLA_F_NESTED: u16 = 1 << 15;
+const GENL_CMD_CAP_DO: u32 = 1 << 1;
+const GENL_CMD_CAP_DUMP: u32 = 1 << 2;
+const CTRL_MCAST_GRP_NOTIFY: u32 = 16;
 const ENOENT: i32 = 2;
 const EOPNOTSUPP: i32 = 95;
 const NLMSGERR_ATTR_MSG: u16 = 1;
@@ -82,6 +92,37 @@ fn family(seq: u32, multipart: bool) -> Vec<u8> {
         CTRL_ATTR_MAXATTR,
         &(CTRL_ATTR_MAXATTR as u32).to_ne_bytes(),
     );
+
+    // CTRL_ATTR_OPS is an array of nested operation descriptions. nlctrl
+    // exposes GETFAMILY as both a point query and a dump operation.
+    let mut operation = Vec::new();
+    push_attr(
+        &mut operation,
+        CTRL_ATTR_OP_ID,
+        &(CTRL_CMD_GETFAMILY as u32).to_ne_bytes(),
+    );
+    push_attr(
+        &mut operation,
+        CTRL_ATTR_OP_FLAGS,
+        &(GENL_CMD_CAP_DO | GENL_CMD_CAP_DUMP).to_ne_bytes(),
+    );
+    let mut operations = Vec::new();
+    push_attr(&mut operations, 1 | NLA_F_NESTED, &operation);
+    push_attr(&mut body, CTRL_ATTR_OPS | NLA_F_NESTED, &operations);
+
+    // Linux's control family publishes the "notify" group used for family
+    // registration/removal notifications. NARF's family set is static today,
+    // but advertising the group is required for a faithful family descriptor.
+    let mut group = Vec::new();
+    push_attr(&mut group, CTRL_ATTR_MCAST_GRP_NAME, b"notify\0");
+    push_attr(
+        &mut group,
+        CTRL_ATTR_MCAST_GRP_ID,
+        &CTRL_MCAST_GRP_NOTIFY.to_ne_bytes(),
+    );
+    let mut groups = Vec::new();
+    push_attr(&mut groups, 1 | NLA_F_NESTED, &group);
+    push_attr(&mut body, CTRL_ATTR_MCAST_GROUPS | NLA_F_NESTED, &groups);
     frame(
         GENL_ID_CTRL,
         if multipart { NLM_F_MULTI } else { 0 },
@@ -90,7 +131,7 @@ fn family(seq: u32, multipart: bool) -> Vec<u8> {
     )
 }
 
-fn requested_name(request: &[u8]) -> Option<&[u8]> {
+fn requested_attr(request: &[u8], requested_kind: u16) -> Option<&[u8]> {
     let mut off = NLMSG_HDRLEN + 4;
     while off + 4 <= request.len() {
         let len = u16::from_ne_bytes(request[off..off + 2].try_into().ok()?) as usize;
@@ -98,7 +139,7 @@ fn requested_name(request: &[u8]) -> Option<&[u8]> {
         if len < 4 || off + len > request.len() {
             return None;
         }
-        if kind == CTRL_ATTR_FAMILY_NAME {
+        if kind == requested_kind {
             return Some(&request[off + 4..off + len]);
         }
         off += align(len);
@@ -132,8 +173,13 @@ fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
         out.push(family(seq, true));
         out.push(frame(NLMSG_DONE, NLM_F_MULTI, seq, &0i32.to_ne_bytes()));
     } else {
-        let name = requested_name(request).unwrap_or_default();
-        if name == b"nlctrl" || name == b"nlctrl\0" {
+        let name = requested_attr(request, CTRL_ATTR_FAMILY_NAME);
+        let family_id = requested_attr(request, CTRL_ATTR_FAMILY_ID)
+            .filter(|raw| raw.len() == 2)
+            .map(|raw| u16::from_ne_bytes(raw.try_into().unwrap_or([0; 2])));
+        if name.is_some_and(|name| name == b"nlctrl" || name == b"nlctrl\0")
+            || family_id == Some(GENL_ID_CTRL)
+        {
             out.push(family(seq, false));
         } else {
             out.push(error(ENOENT, seq, request));
@@ -270,6 +316,44 @@ mod tests {
             ),
             -ENOENT
         );
+    }
+
+    #[test]
+    fn resolves_control_family_by_id() {
+        let mut body = vec![CTRL_CMD_GETFAMILY, CTRL_VERSION, 0, 0];
+        push_attr(&mut body, CTRL_ATTR_FAMILY_ID, &GENL_ID_CTRL.to_ne_bytes());
+        let request = frame(GENL_ID_CTRL, 1, 78, &body);
+        let replies = build_replies(&request).unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            u16::from_ne_bytes(replies[0][4..6].try_into().unwrap()),
+            GENL_ID_CTRL
+        );
+        assert!(replies[0].windows(7).any(|window| window == b"nlctrl\0"));
+    }
+
+    #[test]
+    fn family_description_advertises_ops_and_notify_group() {
+        let replies = build_replies(&request(Some(b"nlctrl\0"), 1)).unwrap();
+        let reply = &replies[0];
+        assert!(reply.windows(7).any(|window| window == b"notify\0"));
+
+        let attrs = &reply[NLMSG_HDRLEN + 4..];
+        let mut off = 0;
+        let mut saw_ops = false;
+        let mut saw_groups = false;
+        while off + 4 <= attrs.len() {
+            let len = u16::from_ne_bytes(attrs[off..off + 2].try_into().unwrap()) as usize;
+            if len < 4 || off + len > attrs.len() {
+                break;
+            }
+            let kind = u16::from_ne_bytes(attrs[off + 2..off + 4].try_into().unwrap());
+            saw_ops |= kind == CTRL_ATTR_OPS | NLA_F_NESTED;
+            saw_groups |= kind == CTRL_ATTR_MCAST_GROUPS | NLA_F_NESTED;
+            off += align(len);
+        }
+        assert!(saw_ops);
+        assert!(saw_groups);
     }
 
     #[test]
