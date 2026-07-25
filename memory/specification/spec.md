@@ -83,6 +83,8 @@ pub fn mempolicy_clear();
 pub fn numa_node_stats(node: usize) -> NumaNodeStats;
 /// Stable allocator-managed base-page total established at NUMA rebalance.
 pub fn node_total(node: usize) -> usize;
+/// Free-block counts for buddy orders 0 through 10.
+pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT];
 
 impl AddressSpace {
     /// Replace one resident private page with equivalent backing from a

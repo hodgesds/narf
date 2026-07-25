@@ -5,7 +5,7 @@ prompt_hash = "6e7ecf10083ec035057bdce834a72bbe2bffae8df9383ed10eb06c78dd70944b"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "Range conformance, BIND home-node selection, NUMA event accounting, and the immutable managed-page snapshot remain inside the existing memory-manager TCB and do not add a trusted subsystem or move the documented trust boundary."
+argument = "Range conformance, BIND home-node selection, NUMA event accounting, and read-only managed-page/buddy snapshots remain inside the existing memory-manager TCB and do not add a trusted subsystem or move the documented trust boundary."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"

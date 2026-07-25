@@ -107,6 +107,8 @@ explicit request with an empty intersection is rejected.
 `/sys/devices/system/node/nodeN/{meminfo,numastat,vmstat}` exposes stable
 managed totals, live free/used pages, and the corresponding node-local
 event counters.
+`/proc/buddyinfo` reports live per-order free-block counts, while
+`/proc/zoneinfo` uses stable per-node managed totals and live NUMA events.
 
 ### 3.4 Directory operations
 

@@ -40,6 +40,8 @@ pub const PAGE_SHIFT: u32 = 12;
 /// Maximum NUMA nodes we track. Mirrors `narf_acpi::MAX_NUMA_NODES`
 /// — kept independent so this crate doesn't pull in narf-acpi.
 pub const MAX_NUMA_NODES: usize = 16;
+/// Number of buddy orders exposed by `/proc/buddyinfo` (orders 0..=10).
+pub const BUDDY_ORDER_COUNT: usize = MAX_ORDER as usize + 1;
 
 /// Linux-compatible per-node NUMA allocation event counters.
 ///
@@ -1100,6 +1102,19 @@ pub fn node_total(node: usize) -> usize {
         return 0;
     }
     ALLOC.lock().node_total_frames[node]
+}
+
+/// Snapshot the number of free buddy blocks at every order for `node`.
+pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT] {
+    let mut counts = [0usize; BUDDY_ORDER_COUNT];
+    if node >= MAX_NUMA_NODES {
+        return counts;
+    }
+    let g = ALLOC.lock();
+    for (order, count) in counts.iter_mut().enumerate() {
+        *count = g.zones[node].free_block_count(order as u8);
+    }
+    counts
 }
 
 /// True once `rebalance_to_topology` has run.

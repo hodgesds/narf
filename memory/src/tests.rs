@@ -1575,6 +1575,26 @@ fn smoke_numa_node_total_is_stable() -> TestResult {
 }
 kernel_test_in!("memory", smoke_numa_node_total_is_stable);
 
+fn smoke_numa_buddy_order_snapshot_sums_to_free() -> TestResult {
+    for node in 0..crate::FRAME_MAX_NUMA_NODES {
+        let total = crate::node_total(node);
+        if total == 0 {
+            continue;
+        }
+        let reconstructed = crate::node_free_blocks(node)
+            .iter()
+            .enumerate()
+            .fold(0usize, |sum, (order, blocks)| {
+                sum.saturating_add(blocks.saturating_mul(1usize << order))
+            });
+        if reconstructed != crate::node_free(node) {
+            return TestResult::Fail("buddy order counts do not sum to node_free");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_numa_buddy_order_snapshot_sums_to_free);
+
 fn smoke_memory_address_space_materialize() -> TestResult {
     // Full flow: new_for_user allocates a fresh root, map_region
     // records a region, materialize walks the region and installs
