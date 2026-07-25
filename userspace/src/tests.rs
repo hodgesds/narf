@@ -15123,6 +15123,10 @@ fn smoke_echo_hello_world_end_to_end() -> TestResult {
 
     narf_input::init_global_ring(256);
     narf_input::__reset_global_ring_for_test();
+    // Earlier console tests deliberately select raw mode. The shared line
+    // discipline outlives their fd tables, so make this cooked-line test
+    // independent of registration/execution order.
+    narf_filesystem::console_tty::__test_reset_cooked();
     fd::__test_reset();
     fd::init();
     install_task_id_lookup(task_lookup);
