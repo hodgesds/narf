@@ -30,7 +30,7 @@ extern crate alloc as alloc_crate;
 use alloc_crate::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::frame::UsableRegion;
+use crate::frame::{self, UsableRegion, MAX_NUMA_NODES};
 
 /// 2 MiB hugepage size in bytes.
 pub const HUGEPAGE_2M_BYTES: u64 = 2 * 1024 * 1024;
@@ -72,6 +72,13 @@ impl HugeFrame {
             HugeSize::M2 => HUGEPAGE_2M_BYTES,
             HugeSize::G1 => HUGEPAGE_1G_BYTES,
         }
+    }
+
+    /// SRAT proximity node containing this hugepage.
+    #[inline]
+    pub fn node(&self) -> usize {
+        // SAFETY: the frame was carved from a usable physical-memory region.
+        unsafe { frame::narf_phys_node(self.phys) }
     }
 }
 
@@ -181,27 +188,68 @@ pub fn reserve_from_regions(
 /// Returns `Err(Empty)` if the pool is exhausted — does NOT fall
 /// back to coalescing buddy blocks.
 pub fn alloc_hugepage_2m() -> Result<HugeFrame, HugeAllocError> {
-    POOL.lock()
-        .free_2m
-        .pop()
-        .map(|phys| HugeFrame {
-            phys,
-            size: HugeSize::M2,
-        })
-        .ok_or(HugeAllocError::Empty)
+    alloc_hugepage_local(HugeSize::M2)
 }
 
 /// Allocate one 1 GiB hugepage from the boot-reserved pool.
 /// Returns `Err(Empty)` if the pool is exhausted.
 pub fn alloc_hugepage_1g() -> Result<HugeFrame, HugeAllocError> {
-    POOL.lock()
-        .free_1g
-        .pop()
-        .map(|phys| HugeFrame {
-            phys,
-            size: HugeSize::G1,
-        })
-        .ok_or(HugeAllocError::Empty)
+    alloc_hugepage_local(HugeSize::G1)
+}
+
+/// Allocate a 2 MiB hugepage strictly from `node`.
+///
+/// Unlike the local-first convenience allocator, this never spills to
+/// another node. It is the primitive used by NUMA memory-policy callers.
+pub fn alloc_hugepage_2m_on(node: usize) -> Result<HugeFrame, HugeAllocError> {
+    alloc_hugepage_on(HugeSize::M2, node)
+}
+
+/// Allocate a 1 GiB hugepage strictly from `node`.
+pub fn alloc_hugepage_1g_on(node: usize) -> Result<HugeFrame, HugeAllocError> {
+    alloc_hugepage_on(HugeSize::G1, node)
+}
+
+fn alloc_hugepage_local(size: HugeSize) -> Result<HugeFrame, HugeAllocError> {
+    let local = frame::current_cpu_node();
+    if let Ok(frame) = alloc_hugepage_on(size, local) {
+        return Ok(frame);
+    }
+
+    let mut candidates = [0usize; MAX_NUMA_NODES];
+    let mut count = 0usize;
+    for node in 0..MAX_NUMA_NODES {
+        if node != local {
+            candidates[count] = node;
+            count += 1;
+        }
+    }
+    candidates[..count].sort_unstable_by_key(|&node| (frame::node_distance(local, node), node));
+    for &node in &candidates[..count] {
+        if let Ok(frame) = alloc_hugepage_on(size, node) {
+            return Ok(frame);
+        }
+    }
+    Err(HugeAllocError::Empty)
+}
+
+fn alloc_hugepage_on(size: HugeSize, node: usize) -> Result<HugeFrame, HugeAllocError> {
+    if node >= MAX_NUMA_NODES {
+        return Err(HugeAllocError::Empty);
+    }
+    let mut pool = POOL.lock();
+    let free = match size {
+        HugeSize::M2 => &mut pool.free_2m,
+        HugeSize::G1 => &mut pool.free_1g,
+    };
+    let Some(index) = free.iter().rposition(|&phys| {
+        // SAFETY: every pool entry was carved from a usable region.
+        unsafe { frame::narf_phys_node(phys) == node }
+    }) else {
+        return Err(HugeAllocError::Empty);
+    };
+    let phys = free.swap_remove(index);
+    Ok(HugeFrame { phys, size })
 }
 
 /// Return a hugepage to the pool. Caller asserts the frame came
@@ -223,6 +271,13 @@ pub struct HugeStats {
     pub free_1g: usize,
 }
 
+/// Per-node free hugepage counts.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HugeNodeStats {
+    pub free_2m: usize,
+    pub free_1g: usize,
+}
+
 /// Snapshot of pool state. Lock-acquiring; do not call from IRQ.
 pub fn stats() -> HugeStats {
     let pool = POOL.lock();
@@ -231,5 +286,34 @@ pub fn stats() -> HugeStats {
         reserved_1g: pool.reserved_1g,
         free_2m: pool.free_2m.len(),
         free_1g: pool.free_1g.len(),
+    }
+}
+
+/// Snapshot the free hugepages physically located on `node`.
+pub fn node_stats(node: usize) -> HugeNodeStats {
+    if node >= MAX_NUMA_NODES {
+        return HugeNodeStats {
+            free_2m: 0,
+            free_1g: 0,
+        };
+    }
+    let pool = POOL.lock();
+    HugeNodeStats {
+        free_2m: pool
+            .free_2m
+            .iter()
+            .filter(|&&phys| {
+                // SAFETY: every pool entry was carved from usable memory.
+                unsafe { frame::narf_phys_node(phys) == node }
+            })
+            .count(),
+        free_1g: pool
+            .free_1g
+            .iter()
+            .filter(|&&phys| {
+                // SAFETY: every pool entry was carved from usable memory.
+                unsafe { frame::narf_phys_node(phys) == node }
+            })
+            .count(),
     }
 }

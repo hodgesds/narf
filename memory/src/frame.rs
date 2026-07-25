@@ -1240,7 +1240,7 @@ fn phys_to_node(addr: u64) -> usize {
 }
 
 #[inline]
-fn current_cpu_node() -> usize {
+pub(crate) fn current_cpu_node() -> usize {
     let cpu = narf_lib::percpu::current_cpu() as u32;
     // SAFETY: narf-frame provides the `#[no_mangle]` definition.
     let n = unsafe { narf_cpu_to_node(cpu) } as usize;

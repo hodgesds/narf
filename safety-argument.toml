@@ -5,11 +5,11 @@ prompt_hash = "6e7ecf10083ec035057bdce834a72bbe2bffae8df9383ed10eb06c78dd70944b"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "Range conformance, BIND home-node selection, NUMA event accounting, and read-only managed-page/buddy snapshots remain inside the existing memory-manager TCB and do not add a trusted subsystem or move the documented trust boundary."
+argument = "Range conformance, BIND home-node selection, NUMA event accounting, and base/huge-page allocator topology remain inside the existing memory-manager TCB and do not add a trusted subsystem or move the documented trust boundary."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "mbind migration reuses the reviewed private-page replacement primitive, preserving mapping permissions and domain ownership; home-node selection and lock-free event counters observe allocation placement without changing domain assignment."
+argument = "mbind migration reuses the reviewed private-page replacement primitive, preserving mapping permissions and domain ownership; huge-page node selection changes only which already-reserved physical frame is returned and cannot change domain assignment."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"

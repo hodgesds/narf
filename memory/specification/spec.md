@@ -86,6 +86,15 @@ pub fn node_total(node: usize) -> usize;
 /// Free-block counts for buddy orders 0 through 10.
 pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT];
 
+/// Hugepage allocation is local-first with SLIT-ordered fallback.
+pub fn alloc_hugepage_2m() -> Result<HugeFrame, HugeAllocError>;
+pub fn alloc_hugepage_1g() -> Result<HugeFrame, HugeAllocError>;
+/// Strict node-selection primitives used by NUMA policy consumers.
+pub fn alloc_hugepage_2m_on(node: usize) -> Result<HugeFrame, HugeAllocError>;
+pub fn alloc_hugepage_1g_on(node: usize) -> Result<HugeFrame, HugeAllocError>;
+// Exported from the `hugepage` module.
+pub fn node_stats(node: usize) -> HugeNodeStats;
+
 impl AddressSpace {
     /// Replace one resident private page with equivalent backing from a
     /// target NUMA node, preserving bytes and permissions and completing

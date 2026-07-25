@@ -3181,8 +3181,8 @@ kernel_test_in!("memory", smoke_memory_remap_page_picks_up_perms_and_phys);
 fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
     use crate::frame::UsableRegion;
     use crate::hugepage::{
-        alloc_hugepage_2m, free_hugepage, reserve_from_regions, stats, HugeAllocError,
-        HUGEPAGE_2M_BYTES,
+        alloc_hugepage_2m, alloc_hugepage_2m_on, free_hugepage, node_stats, reserve_from_regions,
+        stats, HugeAllocError, HUGEPAGE_2M_BYTES,
     };
     use crate::PhysAddr;
 
@@ -3203,29 +3203,39 @@ fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
     if excludes.len() != PAGES {
         return TestResult::Fail("reserve_from_regions returned wrong exclude count");
     }
+    // SAFETY: the exclude is a synthetic physical address used only for
+    // topology lookup; the test never dereferences it.
+    let target_node = unsafe { crate::frame::narf_phys_node(excludes[0].0) };
+    let node_after_reserve = node_stats(target_node);
     let after_reserve = stats();
     if after_reserve.free_2m - before.free_2m != PAGES {
         return TestResult::Fail("free_2m didn't grow by reserve count");
     }
+    if node_after_reserve.free_2m < PAGES {
+        return TestResult::Fail("per-node free_2m omitted reserved pages");
+    }
 
-    // Drain exactly PAGES new allocations.
+    // Drain exactly PAGES new allocations through the strict-node API.
     let mut allocated = alloc::vec::Vec::new();
     for _ in 0..PAGES {
-        match alloc_hugepage_2m() {
+        match alloc_hugepage_2m_on(target_node) {
             Ok(f) => {
                 if f.phys() & (HUGEPAGE_2M_BYTES - 1) != 0 {
-                    return TestResult::Fail("alloc_hugepage_2m returned unaligned phys");
+                    return TestResult::Fail("alloc_hugepage_2m_on returned unaligned phys");
+                }
+                if f.node() != target_node {
+                    return TestResult::Fail("strict hugepage allocation returned wrong node");
                 }
                 allocated.push(f);
             }
-            Err(_) => return TestResult::Fail("alloc_hugepage_2m exhausted before PAGES"),
+            Err(_) => return TestResult::Fail("strict hugepage allocation exhausted before PAGES"),
         }
     }
 
     // Free one back, alloc one — roundtrip works.
     let returned = allocated.pop().unwrap();
     free_hugepage(returned);
-    match alloc_hugepage_2m() {
+    match alloc_hugepage_2m_on(target_node) {
         Ok(f) => allocated.push(f),
         Err(_) => return TestResult::Fail("alloc after free returned Empty"),
     }
