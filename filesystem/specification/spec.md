@@ -140,6 +140,30 @@ with `filesystem/` core via Narf-Ring.
 - Cache eviction: LRU-ish with a "recently used" second chance;
   explicit pressure hook from `memory/`.
 
+### 3.8 Linux FUSE compatibility
+
+`FuseConnection` implements the Linux FUSE 7.36 message transport used
+by `/dev/fuse` and `virtiofs`. Each open of `/dev/fuse` owns one
+connection; reads return exactly one complete request and writes match
+replies by the non-zero `unique` identifier.
+
+- An empty blocking read parks in the syscall layer; a non-blocking
+  read reports `EAGAIN`.
+- A daemon buffer smaller than the next complete request reports
+  `EINVAL` without consuming or truncating that request.
+- Dropping a pending VFS future removes its reply slot; late replies
+  are ignored rather than retained.
+- Directory traffic uses `OPENDIR`, `READDIR`, and `RELEASEDIR`, which
+  are distinct from regular-file `OPEN` and `RELEASE`.
+- The bridge supports lookup, getattr/setattr, create, mknod, mkdir,
+  unlink, rmdir, same-directory rename/link, symlink, open, read,
+  write, readdir, release, forget, and initialization.
+
+Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
+Linux UAPI field order and width. Malformed or short replies fail with
+`FsError::InvalidData`; a disconnected daemon fails pending requests
+without leaving callers parked indefinitely.
+
 ## 4. Invariants & safety properties
 
 - **No ambient root.** A task that holds no `Cap<FileNode, _>` can

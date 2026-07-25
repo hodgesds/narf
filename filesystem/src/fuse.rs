@@ -38,8 +38,11 @@ pub enum FuseOpcode {
     Release = 18,
     Fsync = 20,
     Init = 26,
-    Destroy = 38,
+    OpenDir = 27,
     ReadDir = 28,
+    ReleaseDir = 29,
+    Create = 35,
+    Destroy = 38,
 }
 
 /// Header prepended to every FUSE request. Matches the wire layout
@@ -228,6 +231,75 @@ pub struct FuseWriteOut {
     pub padding: u32,
 }
 
+/// `struct fuse_mknod_in` — MKNOD request body.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseMknodIn {
+    pub mode: u32,
+    pub rdev: u32,
+    pub umask: u32,
+    pub padding: u32,
+}
+
+/// `struct fuse_mkdir_in` — MKDIR request body.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseMkdirIn {
+    pub mode: u32,
+    pub umask: u32,
+}
+
+/// `struct fuse_rename_in` — RENAME request prefix.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseRenameIn {
+    pub newdir: u64,
+}
+
+/// `struct fuse_link_in` — LINK request prefix.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseLinkIn {
+    pub oldnodeid: u64,
+}
+
+/// `struct fuse_create_in` — CREATE request prefix.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseCreateIn {
+    pub flags: u32,
+    pub mode: u32,
+    pub umask: u32,
+    pub open_flags: u32,
+}
+
+/// `struct fuse_setattr_in` — SETATTR request body.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseSetattrIn {
+    pub valid: u32,
+    pub padding: u32,
+    pub fh: u64,
+    pub size: u64,
+    pub lock_owner: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub atimensec: u32,
+    pub mtimensec: u32,
+    pub ctimensec: u32,
+    pub mode: u32,
+    pub unused4: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub unused5: u32,
+}
+
+pub const FATTR_MODE: u32 = 1 << 0;
+pub const FATTR_UID: u32 = 1 << 1;
+pub const FATTR_GID: u32 = 1 << 2;
+pub const FATTR_SIZE: u32 = 1 << 3;
+
 /// `struct fuse_release_in` — RELEASE / RELEASEDIR request body. 24 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -277,8 +349,11 @@ pub const FUSE_ROOT_ID: u64 = 1;
 // recover the [`FileType`].
 pub const S_IFMT: u32 = 0o170_000;
 pub const S_IFDIR: u32 = 0o040_000;
+pub const S_IFCHR: u32 = 0o020_000;
+pub const S_IFIFO: u32 = 0o010_000;
 pub const S_IFREG: u32 = 0o100_000;
 pub const S_IFLNK: u32 = 0o120_000;
+pub const S_IFSOCK: u32 = 0o140_000;
 
 // ── Small (de)serialization helpers ───────────────────────────────────
 //

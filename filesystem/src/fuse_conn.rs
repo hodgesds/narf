@@ -143,9 +143,55 @@ impl FuseConnection {
         unique
     }
 
+    /// Enqueue an operation whose reply will not be awaited.
+    fn submit_noreply(&self, opcode: FuseOpcode, nodeid: u64, body: &[u8]) {
+        let unique = self.alloc_unique();
+        let total = core::mem::size_of::<FuseInHeader>() + body.len();
+        let hdr = FuseInHeader {
+            len: total as u32,
+            opcode: opcode as u32,
+            unique,
+            nodeid,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            _padding: 0,
+        };
+        let mut msg = pod_as_bytes(&hdr);
+        msg.extend_from_slice(body);
+        self.pending.lock().push_back(msg);
+    }
+
+    fn cancel_request(&self, unique: u64) {
+        self.replies.lock().remove(&unique);
+        self.pending.lock().retain(|request| {
+            pod_from_bytes::<FuseInHeader>(request)
+                .map(|header| header.unique != unique)
+                .unwrap_or(false)
+        });
+    }
+
     /// Daemon side: dequeue the next request bytes, if any. Non-blocking.
     pub fn dequeue_request(&self) -> Option<Vec<u8>> {
         self.pending.lock().pop_front()
+    }
+
+    /// Copy one complete request into a daemon buffer.
+    ///
+    /// Linux leaves an oversized request queued and returns `EINVAL`
+    /// when the daemon's read buffer is too small.
+    fn read_request(&self, buf: &mut [u8]) -> Result<Option<usize>, FsError> {
+        let mut pending = self.pending.lock();
+        let Some(req) = pending.front() else {
+            return Ok(None);
+        };
+        if buf.len() < req.len() {
+            return Err(FsError::InvalidData);
+        }
+        let n = req.len();
+        buf[..n].copy_from_slice(req);
+        pending.pop_front();
+        Ok(Some(n))
     }
 
     /// True when a request is queued for the daemon to read.
@@ -163,7 +209,7 @@ impl FuseConnection {
         // `len` counts the header + body; clamp to what was actually
         // supplied so a lying daemon can't make us read OOB.
         let claimed = hdr.len as usize;
-        if claimed < hdr_len || claimed > reply.len() {
+        if claimed < hdr_len || claimed > reply.len() || hdr.error > 0 || hdr.error < -4095 {
             return None;
         }
         let body = reply[hdr_len..claimed].to_vec();
@@ -226,6 +272,15 @@ struct ReplyFuture {
     unique: u64,
 }
 
+impl Drop for ReplyFuture {
+    fn drop(&mut self) {
+        // A cancelled VFS future must not leave an unreachable reply
+        // slot or unsent request behind. A late daemon reply is safely
+        // treated as unknown.
+        self.conn.cancel_request(self.unique);
+    }
+}
+
 impl core::future::Future for ReplyFuture {
     type Output = FuseReply;
 
@@ -258,11 +313,15 @@ const ENOTCONN: u32 = 107;
 /// Translate a FUSE `-errno` reply into an [`FsError`].
 fn errno_to_fs_error(neg_errno: i32) -> FsError {
     match -neg_errno {
-        2 => FsError::NotFound,          // ENOENT
-        13 => FsError::PermissionDenied, // EACCES
-        22 => FsError::InvalidData,      // EINVAL
-        28 => FsError::NoSpace,          // ENOSPC
-        30 => FsError::ReadOnly,         // EROFS
+        1 => FsError::PermissionDenied,       // EPERM
+        2 => FsError::NotFound,               // ENOENT
+        13 => FsError::PermissionDenied,      // EACCES
+        16 | 17 | 39 => FsError::Busy,        // EBUSY / EEXIST / ENOTEMPTY
+        20 | 21 | 36 => FsError::InvalidPath, // ENOTDIR / EISDIR / ENAMETOOLONG
+        22 => FsError::InvalidData,           // EINVAL
+        28 => FsError::NoSpace,               // ENOSPC
+        30 => FsError::ReadOnly,              // EROFS
+        95 => FsError::Unsupported,           // EOPNOTSUPP
         _ => FsError::Unsupported,
     }
 }
@@ -303,18 +362,12 @@ impl DevFuse {
 }
 
 impl FileOps for DevFuse {
-    /// Daemon read: hand back the next queued request. If nothing is
-    /// queued, return 0 (the daemon polls; a real blocking daemon parks on
-    /// `poll_readiness`). A short user buffer truncates the request, which
-    /// a conformant daemon avoids by supplying `max_write`-sized buffers.
+    /// Daemon read: hand back exactly one complete queued request.
+    /// The syscall layer parks blocking reads while the queue is empty.
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            match self.conn.dequeue_request() {
-                Some(req) => {
-                    let n = core::cmp::min(buf.len(), req.len());
-                    buf[..n].copy_from_slice(&req[..n]);
-                    Ok(n)
-                }
+            match self.conn.read_request(buf)? {
+                Some(n) => Ok(n),
                 None => Ok(0),
             }
         })
@@ -371,6 +424,8 @@ struct NodeAttr {
     nodeid: u64,
     size: u64,
     mode: u32,
+    uid: u32,
+    gid: u32,
 }
 
 impl NodeAttr {
@@ -379,7 +434,9 @@ impl NodeAttr {
             S_IFDIR => FileType::Dir,
             S_IFLNK => FileType::Symlink,
             S_IFREG => FileType::File,
-            _ => FileType::File,
+            S_IFIFO => FileType::Fifo,
+            S_IFSOCK => FileType::Socket,
+            _ => FileType::Special,
         }
     }
 
@@ -433,6 +490,15 @@ impl FuseFile {
         let out: FuseOpenOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
         *self.fh.lock() = Some(out.fh);
         Ok(out.fh)
+    }
+
+    async fn setattr(&self, input: FuseSetattrIn) -> Result<(), FsError> {
+        let reply = self
+            .conn
+            .request(FuseOpcode::Setattr, self.attr.nodeid, pod_as_bytes(&input))
+            .await?;
+        let _: FuseAttrOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+        Ok(())
     }
 }
 
@@ -490,6 +556,44 @@ impl FileOps for FuseFile {
         self.attr.nodeid
     }
 
+    fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.setattr(FuseSetattrIn {
+                valid: FATTR_SIZE,
+                size: len,
+                ..Default::default()
+            })
+            .await
+        })
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        (self.attr.uid, self.attr.gid)
+    }
+
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.setattr(FuseSetattrIn {
+                valid: FATTR_UID | FATTR_GID,
+                uid,
+                gid,
+                ..Default::default()
+            })
+            .await
+        })
+    }
+
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.setattr(FuseSetattrIn {
+                valid: FATTR_MODE,
+                mode: (self.attr.mode & S_IFMT) | u32::from(perms),
+                ..Default::default()
+            })
+            .await
+        })
+    }
+
     fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
         Box::pin(async move {
             // Refresh via FUSE_GETATTR so size reflects daemon-side writes.
@@ -503,6 +607,8 @@ impl FileOps for FuseFile {
                 nodeid: self.attr.nodeid,
                 size: out.attr.size,
                 mode: out.attr.mode,
+                uid: out.attr.uid,
+                gid: out.attr.gid,
             }
             .stat())
         })
@@ -525,13 +631,13 @@ impl Drop for FuseFile {
                 lock_owner: 0,
             });
             self.conn
-                .submit(FuseOpcode::Release, self.attr.nodeid, &body);
+                .submit_noreply(FuseOpcode::Release, self.attr.nodeid, &body);
         }
         // Never forget the root (nodeid 1) — Linux keeps it pinned.
         if self.attr.nodeid != FUSE_ROOT_ID {
             let body = pod_as_bytes(&FuseForgetIn { nlookup: 1 });
             self.conn
-                .submit(FuseOpcode::Forget, self.attr.nodeid, &body);
+                .submit_noreply(FuseOpcode::Forget, self.attr.nodeid, &body);
         }
     }
 }
@@ -551,6 +657,46 @@ impl core::fmt::Debug for FuseDir {
 }
 
 impl FuseDir {
+    fn file_from_entry(&self, out: FuseEntryOut, fh: Option<u64>) -> Arc<dyn FileOps> {
+        Arc::new(FuseFile {
+            conn: Arc::clone(&self.conn),
+            attr: NodeAttr {
+                nodeid: out.nodeid,
+                size: out.attr.size,
+                mode: out.attr.mode,
+                uid: out.attr.uid,
+                gid: out.attr.gid,
+            },
+            fh: IrqSafeSpinLock::new(fh),
+        }) as Arc<dyn FileOps>
+    }
+
+    fn dir_from_entry(&self, out: FuseEntryOut) -> Arc<dyn DirOps> {
+        Arc::new(FuseDir {
+            conn: Arc::clone(&self.conn),
+            nodeid: out.nodeid,
+        }) as Arc<dyn DirOps>
+    }
+
+    async fn named_request(
+        &self,
+        opcode: FuseOpcode,
+        prefix: &[u8],
+        names: &[&str],
+    ) -> Result<Vec<u8>, FsError> {
+        let name_bytes: usize = names.iter().map(|name| name.len() + 1).sum();
+        let mut body = Vec::with_capacity(prefix.len() + name_bytes);
+        body.extend_from_slice(prefix);
+        for name in names {
+            if name.as_bytes().contains(&0) {
+                return Err(FsError::InvalidPath);
+            }
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
+        }
+        self.conn.request(opcode, self.nodeid, body).await
+    }
+
     /// FUSE_LOOKUP: resolve `name` under this directory into a
     /// [`NodeAttr`].
     async fn lookup_attr(&self, name: &str) -> Result<NodeAttr, FsError> {
@@ -567,11 +713,17 @@ impl FuseDir {
             nodeid: out.nodeid,
             size: out.attr.size,
             mode: out.attr.mode,
+            uid: out.attr.uid,
+            gid: out.attr.gid,
         })
     }
 }
 
 impl DirOps for FuseDir {
+    fn ino(&self) -> u64 {
+        self.nodeid
+    }
+
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         // Synchronous lookup can't drive the async transport; callers use
         // `lookup_async`. Returning None here forces the async path.
@@ -629,7 +781,7 @@ impl DirOps for FuseDir {
             });
             let oreply = self
                 .conn
-                .request(FuseOpcode::Open, self.nodeid, openbody)
+                .request(FuseOpcode::OpenDir, self.nodeid, openbody)
                 .await?;
             let oout: FuseOpenOut = pod_from_bytes(&oreply).ok_or(FsError::InvalidData)?;
             let fh = oout.fh;
@@ -688,10 +840,127 @@ impl DirOps for FuseDir {
             });
             let _ = self
                 .conn
-                .request(FuseOpcode::Release, self.nodeid, rel)
+                .request(FuseOpcode::ReleaseDir, self.nodeid, rel)
                 .await;
 
             Ok(out.into_iter().skip(cursor).take(max).collect())
+        })
+    }
+
+    fn create<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let prefix = pod_as_bytes(&FuseCreateIn {
+                flags: 2, // O_RDWR
+                mode: S_IFREG | 0o644,
+                umask: 0,
+                open_flags: 0,
+            });
+            let reply = self
+                .named_request(FuseOpcode::Create, &prefix, &[name])
+                .await?;
+            let entry: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            let open_off = core::mem::size_of::<FuseEntryOut>();
+            let open: FuseOpenOut =
+                pod_from_bytes(reply.get(open_off..).ok_or(FsError::InvalidData)?)
+                    .ok_or(FsError::InvalidData)?;
+            Ok(self.file_from_entry(entry, Some(open.fh)))
+        })
+    }
+
+    fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move {
+            let prefix = pod_as_bytes(&FuseMkdirIn {
+                mode: S_IFDIR | 0o755,
+                umask: 0,
+            });
+            let reply = self
+                .named_request(FuseOpcode::Mkdir, &prefix, &[name])
+                .await?;
+            let entry: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            if entry.attr.mode & S_IFMT != S_IFDIR {
+                return Err(FsError::InvalidData);
+            }
+            Ok(self.dir_from_entry(entry))
+        })
+    }
+
+    fn mknod<'a>(
+        &'a self,
+        name: &'a str,
+        file_type: FileType,
+        rdev: u64,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let type_bits = match file_type {
+                FileType::File => S_IFREG,
+                FileType::Symlink => S_IFLNK,
+                FileType::Special => S_IFCHR,
+                FileType::Socket => S_IFSOCK,
+                FileType::Fifo => S_IFIFO,
+                FileType::Dir => return Err(FsError::InvalidData),
+            };
+            let prefix = pod_as_bytes(&FuseMknodIn {
+                mode: type_bits | 0o644,
+                rdev: rdev as u32,
+                umask: 0,
+                padding: 0,
+            });
+            let reply = self
+                .named_request(FuseOpcode::Mknod, &prefix, &[name])
+                .await?;
+            let entry: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(self.file_from_entry(entry, None))
+        })
+    }
+
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.named_request(FuseOpcode::Unlink, &[], &[name])
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.named_request(FuseOpcode::Rmdir, &[], &[name])
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let prefix = pod_as_bytes(&FuseRenameIn {
+                newdir: self.nodeid,
+            });
+            self.named_request(FuseOpcode::Rename, &prefix, &[old_name, new_name])
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn link<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let old = self.lookup_attr(old_name).await?;
+            let prefix = pod_as_bytes(&FuseLinkIn {
+                oldnodeid: old.nodeid,
+            });
+            let reply = self
+                .named_request(FuseOpcode::Link, &prefix, &[new_name])
+                .await?;
+            let _: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(())
+        })
+    }
+
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let reply = self
+                .named_request(FuseOpcode::Symlink, &[], &[name, target])
+                .await?;
+            let entry: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(self.file_from_entry(entry, None))
         })
     }
 }
