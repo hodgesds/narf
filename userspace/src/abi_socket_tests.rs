@@ -1495,6 +1495,7 @@ const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_GETROUTE: u16 = 26;
+const RTM_GETNEIGH: u16 = 30;
 /// netlink control message types (netlink.h).
 const NLMSG_DONE: u16 = 3;
 const NLMSG_HDRLEN: usize = 16;
@@ -1806,6 +1807,36 @@ fn smoke_abi_netlink_route_getroute_dump() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getroute_dump);
+
+fn smoke_abi_netlink_route_getneigh_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETNEIGH, 10);
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send(RTM_GETNEIGH) did not echo the request length");
+        }
+        // An empty neighbor cache is valid; it must still complete rather
+        // than leaving Linux tooling blocked forever.
+        let mut saw_done = false;
+        for _ in 0..32 {
+            let mut buf = [0u8; 512];
+            let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+            if n < NLMSG_HDRLEN as i64 {
+                break;
+            }
+            if nlmsg_type_of(&buf) == NLMSG_DONE {
+                saw_done = true;
+                break;
+            }
+        }
+        if !saw_done {
+            return Err("RTM_GETNEIGH dump did not terminate with NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getneigh_dump);
 
 fn smoke_abi_netlink_uevent_recv() -> TestResult {
     with_setup(|| {

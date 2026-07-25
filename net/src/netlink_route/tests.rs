@@ -138,6 +138,53 @@ fn getroute_dump_has_loopback_and_terminates() {
 }
 
 #[test]
+fn newneigh_wire_layout_carries_ipv4_destination_and_mac() {
+    let msg = build_newneigh(
+        &NeighInfo {
+            family: AF_INET,
+            dst: &[192, 0, 2, 1],
+            mac: Some([0x02, 0, 0, 0, 0, 1]),
+            ifindex: 3,
+            state: NUD_STALE,
+            flags: 0,
+        },
+        31,
+        0,
+    );
+    let (_len, mtype, flags, seq, pid) = hdr_of(&msg);
+    assert_eq!(mtype, RTM_NEWNEIGH);
+    assert_eq!(flags, NLM_F_MULTI);
+    assert_eq!(seq, 31);
+    assert_eq!(pid, 0);
+    assert_eq!(msg[NLMSG_HDRLEN], AF_INET);
+    assert_eq!(
+        i32::from_ne_bytes(msg[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].try_into().unwrap()),
+        3
+    );
+    assert_eq!(
+        u16::from_ne_bytes(msg[NLMSG_HDRLEN + 8..NLMSG_HDRLEN + 10].try_into().unwrap()),
+        NUD_STALE
+    );
+    assert_eq!(
+        find_rtattr(&msg, 12, NDA_DST).as_deref(),
+        Some(&[192, 0, 2, 1][..])
+    );
+    assert_eq!(
+        find_rtattr(&msg, 12, NDA_LLADDR).as_deref(),
+        Some(&[0x02, 0, 0, 0, 0, 1][..])
+    );
+}
+
+#[test]
+fn getneigh_dump_terminates() {
+    let msgs = build_dump(&req(RTM_GETNEIGH, 44, 12));
+    assert_eq!(hdr_of(msgs.last().unwrap()).1, NLMSG_DONE);
+    assert!(msgs
+        .iter()
+        .all(|msg| matches!(hdr_of(msg).1, RTM_NEWNEIGH | NLMSG_DONE)));
+}
+
+#[test]
 fn unsupported_request_yields_eopnotsupp_error() {
     // RTM_GETLINK is 18; use a bogus type the responder doesn't handle.
     let bogus: u16 = 999;

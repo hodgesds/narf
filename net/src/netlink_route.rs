@@ -56,6 +56,8 @@ pub const RTM_NEWADDR: u16 = 20;
 pub const RTM_GETADDR: u16 = 22;
 pub const RTM_NEWROUTE: u16 = 24;
 pub const RTM_GETROUTE: u16 = 26;
+pub const RTM_NEWNEIGH: u16 = 28;
+pub const RTM_GETNEIGH: u16 = 30;
 
 // ── netlink flags (nlmsg_flags) ─────────────────────────────────────────
 
@@ -87,6 +89,9 @@ pub const RTA_PRIORITY: u16 = 6;
 pub const RTA_PREFSRC: u16 = 7;
 pub const RTA_TABLE: u16 = 15;
 
+pub const NDA_DST: u16 = 1;
+pub const NDA_LLADDR: u16 = 2;
+
 // ── interface flags (net_device_flags, if.h) ────────────────────────────
 
 pub const IFF_UP: u32 = 0x1;
@@ -103,10 +108,17 @@ pub const ARPHRD_LOOPBACK: u16 = 772;
 // ── address family (AF_INET) ────────────────────────────────────────────
 
 pub const AF_INET: u8 = 2;
+pub const AF_INET6: u8 = 10;
 
 pub const RTPROT_KERNEL: u8 = 2;
 pub const RTN_UNICAST: u8 = 1;
 pub const RTN_LOCAL: u8 = 2;
+pub const NUD_INCOMPLETE: u16 = 0x01;
+pub const NUD_REACHABLE: u16 = 0x02;
+pub const NUD_STALE: u16 = 0x04;
+pub const NUD_DELAY: u16 = 0x08;
+pub const NUD_PROBE: u16 = 0x10;
+pub const NTF_ROUTER: u8 = 0x80;
 
 /// `-EOPNOTSUPP` — the errno an unsupported dump request answers with,
 /// carried in the `NLMSG_ERROR` payload (negated, per netlink convention).
@@ -279,6 +291,31 @@ fn build_newroute(route: &crate::route::Route, ifindex: u32, seq: u32, pid: u32)
     frame_message(RTM_NEWROUTE, NLM_F_MULTI, seq, pid, &body)
 }
 
+struct NeighInfo<'a> {
+    family: u8,
+    dst: &'a [u8],
+    mac: Option<[u8; 6]>,
+    ifindex: u32,
+    state: u16,
+    flags: u8,
+}
+
+fn build_newneigh(neigh: &NeighInfo<'_>, seq: u32, pid: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(neigh.family);
+    body.push(0);
+    body.extend_from_slice(&0u16.to_ne_bytes());
+    body.extend_from_slice(&(neigh.ifindex as i32).to_ne_bytes());
+    body.extend_from_slice(&neigh.state.to_ne_bytes());
+    body.push(neigh.flags);
+    body.push(0);
+    push_rtattr(&mut body, NDA_DST, neigh.dst);
+    if let Some(mac) = neigh.mac {
+        push_rtattr(&mut body, NDA_LLADDR, &mac);
+    }
+    frame_message(RTM_NEWNEIGH, NLM_F_MULTI, seq, pid, &body)
+}
+
 /// Build an `NLMSG_DONE` message (payload is a single i32 = 0). Terminates
 /// every dump so the caller stops reading.
 fn build_done(seq: u32, pid: u32) -> Vec<u8> {
@@ -415,6 +452,54 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
             }
             out.push(build_done(seq, pid));
         }
+        RTM_GETNEIGH => {
+            let (links, _addrs) = enumerate();
+            let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
+            if requested_family == 0 || requested_family == AF_INET {
+                for (iface, entry) in crate::arp::snapshot() {
+                    if let Some(link) = links.iter().find(|link| link.name == iface) {
+                        out.push(build_newneigh(
+                            &NeighInfo {
+                                family: AF_INET,
+                                dst: &entry.ip,
+                                mac: Some(entry.mac),
+                                ifindex: link.ifindex,
+                                state: NUD_REACHABLE,
+                                flags: 0,
+                            },
+                            seq,
+                            pid,
+                        ));
+                    }
+                }
+            }
+            if requested_family == 0 || requested_family == AF_INET6 {
+                for entry in crate::ipv6::ndp::neigh_list() {
+                    if let Some(link) = links.iter().find(|link| link.name == entry.iface) {
+                        let state = match entry.state {
+                            crate::ipv6::ndp::NeighState::Incomplete => NUD_INCOMPLETE,
+                            crate::ipv6::ndp::NeighState::Reachable => NUD_REACHABLE,
+                            crate::ipv6::ndp::NeighState::Stale => NUD_STALE,
+                            crate::ipv6::ndp::NeighState::Delay => NUD_DELAY,
+                            crate::ipv6::ndp::NeighState::Probe => NUD_PROBE,
+                        };
+                        out.push(build_newneigh(
+                            &NeighInfo {
+                                family: AF_INET6,
+                                dst: &entry.ip,
+                                mac: entry.mac,
+                                ifindex: link.ifindex,
+                                state,
+                                flags: if entry.is_router { NTF_ROUTER } else { 0 },
+                            },
+                            seq,
+                            pid,
+                        ));
+                    }
+                }
+            }
+            out.push(build_done(seq, pid));
+        }
         _ => {
             out.push(build_error(EOPNOTSUPP, seq, pid, req));
         }
@@ -439,7 +524,10 @@ pub fn build_replies(datagram: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
             return Err(());
         }
         let request = &remaining[..msg_len];
-        let supported = matches!(hdr.msg_type, RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE);
+        let supported = matches!(
+            hdr.msg_type,
+            RTM_GETLINK | RTM_GETADDR | RTM_GETROUTE | RTM_GETNEIGH
+        );
         if supported && hdr.flags & NLM_F_ACK != 0 {
             replies.push(build_ack(hdr.seq, request));
         }
