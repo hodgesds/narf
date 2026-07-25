@@ -185,6 +185,9 @@ atomically suppresses record commits while leaving the event enabled, and
 resuming makes subsequent records visible again. Ring-capacity failures
 increment the event's loss counter; reads selecting `PERF_FORMAT_LOST` return
 that real counter for each standalone or grouped event rather than a constant.
+`PERF_EVENT_IOC_SET_OUTPUT` redirects records to another compatible perf
+event's mapped ring while retaining loss accounting on the source event; the
+target must describe the same task and CPU context, and `-1` detaches it.
 Successful `mmap(2)` commits emit `PERF_RECORD_MMAP` or `MMAP2` for executable
 and/or data VMAs selected by `mmap`, `mmap2`, and `mmap_data`. File mappings
 carry the fd's recorded path and stable filesystem inode; anonymous mappings

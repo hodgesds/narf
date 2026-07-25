@@ -20,6 +20,7 @@ const PERF_FORMAT_LOST: u64 = 1 << 4;
 const PERF_EVENT_IOC_ENABLE: u64 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u64 = 0x2401;
 const PERF_EVENT_IOC_RESET: u64 = 0x2403;
+const PERF_EVENT_IOC_SET_OUTPUT: u64 = 0x2405;
 const PERF_EVENT_IOC_ID: u64 = 0x8008_2407;
 const PERF_EVENT_IOC_PAUSE_OUTPUT: u64 = 0x4004_2409;
 const EOPNOTSUPP: i64 = -95;
@@ -768,6 +769,50 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         {
             return Err("sampled perf fd did not become POLLIN-readable");
         }
+        let redirect_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &sample_attr as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(f) if f >= 0 => f as u32,
+            _ => return Err("perf_event_open(redirect event) failed"),
+        };
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(
+                redirect_fd as u64,
+                PERF_EVENT_IOC_SET_OUTPUT,
+                sample_fd as u64,
+            ),
+        ) != Some(0)
+            || call(
+                Syscall::Ioctl.raw(),
+                a2(redirect_fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+            ) != Some(0)
+        {
+            return Err("redirecting perf output failed");
+        }
+        crate::perf_event::sample_from_irq_for_test(sample_parent, 0x8765_4321);
+        // Both the target event and redirected event commit a 56-byte sample
+        // to the target ring; the redirected event has no mmap of its own.
+        // SAFETY: sample_ops owns the mapped metadata frame.
+        let redirected_head =
+            unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
+        if redirected_head != data_head + 112 {
+            return Err("PERF_EVENT_IOC_SET_OUTPUT did not share the target ring");
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(redirect_fd as u64, PERF_EVENT_IOC_SET_OUTPUT, u64::MAX),
+        ) != Some(0)
+        {
+            return Err("detaching redirected perf output failed");
+        }
+        let _ = call(Syscall::Close.raw(), a0(redirect_fd as u64));
         for _ in 0..200 {
             crate::perf_event::sample_from_irq_for_test(88, 0x1234_5678);
         }

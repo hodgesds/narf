@@ -110,6 +110,7 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
 const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
 const PERF_EVENT_IOC_RESET: u32 = 0x2403;
+const PERF_EVENT_IOC_SET_OUTPUT: u32 = 0x2405;
 const PERF_EVENT_IOC_ID: u32 = 0x8008_2407;
 const PERF_EVENT_IOC_PAUSE_OUTPUT: u32 = 0x4004_2409;
 const PERF_IOC_FLAG_GROUP: usize = 1;
@@ -163,6 +164,7 @@ struct PerfEventFile {
         IrqSafeSpinLock<[Option<narf_arch::x86_64::pmu::PmuCounter>; narf_lib::percpu::MAX_CPUS]>,
     mmap_seq: AtomicU32,
     mmap: IrqSafeSpinLock<Option<PerfMmap>>,
+    output_target: IrqSafeSpinLock<Option<Arc<dyn FileOps>>>,
     group_members: IrqSafeSpinLock<Vec<Weak<dyn FileOps>>>,
     // A member keeps its leader's open-file description alive. The leader
     // holds only weak member links, so this cannot form a reference cycle.
@@ -174,6 +176,14 @@ struct PerfEventFile {
 struct PerfMmap {
     frames: Vec<narf_memory::PhysFrame>,
     len: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordPush {
+    Committed,
+    Suppressed,
+    Full,
+    Unmapped,
 }
 
 impl PerfMmap {
@@ -484,13 +494,13 @@ impl PerfEventFile {
         mapping.write_u32(PERF_MMAP_LOCK_OFFSET, sequence.wrapping_add(2));
     }
 
-    fn push_record(&self, record: &[u8]) -> bool {
+    fn push_record_here(&self, record: &[u8]) -> RecordPush {
         if self.output_paused.load(Ordering::Acquire) {
-            return false;
+            return RecordPush::Suppressed;
         }
         let mapping = self.mmap.lock();
         let Some(mapping) = mapping.as_ref() else {
-            return false;
+            return RecordPush::Unmapped;
         };
         let data_size = (mapping.len - PERF_MMAP_PAGE_BYTES) as u64;
         let head = mapping.read_u64_acquire(PERF_MMAP_DATA_HEAD_OFFSET);
@@ -498,8 +508,7 @@ impl PerfEventFile {
         if head.wrapping_sub(tail) > data_size
             || record.len() as u64 > data_size.saturating_sub(head.wrapping_sub(tail))
         {
-            self.sample_lost.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return RecordPush::Full;
         }
         mapping.write_ring(head, record);
         mapping.write_u64_release(
@@ -517,7 +526,23 @@ impl PerfEventFile {
             self.wakeup_pending.store(0, Ordering::Release);
             narf_net::readiness::notify(0);
         }
-        true
+        RecordPush::Committed
+    }
+
+    fn push_record(&self, record: &[u8]) -> bool {
+        let target = self.output_target.lock().clone();
+        let result = if let Some(target) = target {
+            target
+                .as_any()
+                .and_then(|any| any.downcast_ref::<PerfEventFile>())
+                .map_or(RecordPush::Unmapped, |event| event.push_record_here(record))
+        } else {
+            self.push_record_here(record)
+        };
+        if result == RecordPush::Full {
+            self.sample_lost.fetch_add(1, Ordering::Relaxed);
+        }
+        result == RecordPush::Committed
     }
 
     fn sample_record(&self, ip: u64, pid: u32, tid: u32, now: u64) -> bool {
@@ -1267,6 +1292,31 @@ impl FileOps for PerfEventFile {
                 self.for_group(arg, PerfEventFile::reset)?;
                 Ok(0)
             }
+            PERF_EVENT_IOC_SET_OUTPUT => {
+                if arg == usize::MAX || arg == u32::MAX as usize {
+                    *self.output_target.lock() = None;
+                    return Ok(0);
+                }
+                let target = fd::with_table(current_task_id(), |table| {
+                    table.get(arg as u32).map(|entry| Arc::clone(&entry.ops))
+                })
+                .flatten()
+                .ok_or(FsError::InvalidData)?;
+                let target_event = target
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<PerfEventFile>())
+                    .ok_or(FsError::InvalidData)?;
+                if target_event.id == self.id
+                    || target_event.target_task != self.target_task
+                    || target_event.target_cpu != self.target_cpu
+                    || target_event.mmap.lock().is_none()
+                    || target_event.output_target.lock().is_some()
+                {
+                    return Err(FsError::InvalidData);
+                }
+                *self.output_target.lock() = Some(target);
+                Ok(0)
+            }
             PERF_EVENT_IOC_ID => {
                 // SAFETY: ioctl's user pointer is validated and SMAP-bracketed by
                 // copy_to_user; a bad pointer is reported as InvalidData/EINVAL.
@@ -1732,6 +1782,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             active_task_counters: IrqSafeSpinLock::new([None; narf_lib::percpu::MAX_CPUS]),
             mmap_seq: AtomicU32::new(0),
             mmap: IrqSafeSpinLock::new(None),
+            output_target: IrqSafeSpinLock::new(None),
             group_members: IrqSafeSpinLock::new(Vec::new()),
             _group_leader: group_leader.clone(),
             #[cfg(target_arch = "x86_64")]
