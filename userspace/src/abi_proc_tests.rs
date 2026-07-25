@@ -491,6 +491,45 @@ fn smoke_abi_proc_pidfd_open_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_open_neg);
 
+#[cfg(feature = "container")]
+fn smoke_abi_proc_pidfd_open_translates_inner_pid() -> TestResult {
+    with_setup(|| {
+        const CALLER_OUTER: u64 = 10_000;
+        const CHILD_TASK: u64 = 20_001;
+        const CHILD_OUTER: u64 = 10_001;
+
+        crate::pid_ns::__test_reset();
+        crate::pid_ns::unshare_pid_ns(FAKE_TASK, CALLER_OUTER);
+        let inner =
+            crate::pid_ns::inherit_into_child(FAKE_TASK, CHILD_TASK, CHILD_OUTER).unwrap_or(0);
+        crate::handlers::register_pid_task_mapping(CHILD_OUTER, CHILD_TASK);
+
+        let fd = match call(Syscall::PidfdOpen.raw(), a1(inner, 0)) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => {
+                crate::pid_ns::__test_reset();
+                return Err("pidfd_open(inner pid) did not return a valid fd");
+            }
+        };
+        let target = crate::fd::with_table(FAKE_TASK, |t| {
+            t.get(fd).and_then(|entry| entry.ops.pidfd_target_pid())
+        })
+        .flatten();
+        crate::pid_ns::__test_reset();
+
+        if target == Some(CHILD_OUTER) {
+            Ok(())
+        } else {
+            Err("pidfd_open did not translate inner pid to outer ProcessId")
+        }
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_pidfd_open_translates_inner_pid
+);
+
 // ── pidfd_send_signal(2) — deliver via a pidfd ──
 
 fn smoke_abi_proc_pidfd_send_signal_pos() -> TestResult {

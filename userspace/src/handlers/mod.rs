@@ -3784,15 +3784,22 @@ pub(crate) fn terminate_current_task(
     core_dumped: bool,
 ) {
     let pid = task_to_pid_raw(task).unwrap_or(task);
-    use core::fmt::Write;
-    let _ = writeln!(
-        narf_console::Writer,
-        "terminate_current_task: pid={} signum={} core_dumped={} ip={:x}",
-        pid,
-        signum,
-        core_dumped,
-        ctx.rip()
-    );
+    #[cfg(feature = "syscall-trace")]
+    let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
+    #[cfg(feature = "syscall-trace")]
+    {
+        use core::fmt::Write;
+        let _ = writeln!(
+            narf_console::Writer,
+            "[process-exit] kind=signal tid={} pid={} comm={} signal={} core_dumped={} ip={:x}",
+            task,
+            pid,
+            comm,
+            signum,
+            core_dumped,
+            ctx.rip()
+        );
+    }
     stage_pending_termination(pid, encode_signaled_status(signum, core_dumped));
     // Robust-futex owner-died walk — must run HERE, in the dying task's
     // own trap context (its user AS is still active for the user-memory
@@ -5753,6 +5760,19 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
         // would strand every self-lookup it makes afterwards.
         if let Some(t) = crate::task::task_get(tid) {
             if t.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE {
+                // A zombie remains addressable by its PID in every namespace
+                // until wait4/waitid reaps it. Releasing this binding in
+                // on_child_exit made systemd's later waitid(P_PID, inner_pid)
+                // unable to translate the inner PID to `child_pid`, so the
+                // queued exit was never consumed. Drop the namespace slot at
+                // the same reap boundary as PID_TO_TASK/TASK_TO_PID.
+                #[cfg(feature = "container")]
+                {
+                    if let Some(ns) = crate::pid_ns::ns_of(tid) {
+                        ns.release_outer(child_pid);
+                    }
+                    crate::pid_ns::clear_ns(tid);
+                }
                 crate::task::release_task(tid);
                 // Reap-time pid↔tid unbinding. PIDs are recycled
                 // (lowest-free), so a surviving PID_TO_TASK row would
@@ -6477,15 +6497,13 @@ pub(crate) fn proc_pid_to_tid(pid: u64) -> u64 {
 
 /// PROCESS-scoped exit observer: per-`pid` reap that runs EXACTLY ONCE,
 /// on the group's last thread (`group_dead`). Notifies pidfd watchers,
-/// releases the PID namespace slot, and hands the process to its parent
+/// and hands the zombie process to its parent
 /// (wait4 reap entry + SIGCHLD + waker) — or, if orphaned, releases the
 /// task and returns the PID. Running this per thread double-freed the
 /// PID pool and the parent's reap queue (the OCI teardown #UD).
 fn on_child_exit(child_pid: u64, child_tid: u64) {
-    // `child_tid` only feeds the PID-namespace cleanup below, which is
-    // container-gated; keep the parameter (the exit-observer signature is
-    // fixed) but discard it in non-container builds.
-    #[cfg(not(feature = "container"))]
+    // Namespace and pid↔task cleanup is deferred to release_reaped_task so a
+    // zombie's inner PID remains resolvable until wait4/waitid consumes it.
     let _ = child_tid;
     #[cfg(feature = "linux-compat")]
     crate::ptrace::release_process(child_pid);
@@ -6493,20 +6511,6 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // Wave-61: notify any pidfd_open()'d watchers that the target
     // exited, regardless of whether a parent reaps it.
     crate::pidfd::notify_exit(child_pid);
-
-    // Wave-67: release the dying task from its PID namespace's
-    // inner-pid table so a recycled outer pid doesn't inherit the
-    // dead task's inner slot. `TASK_PID_NS` is keyed by TaskId (see
-    // `inherit_into_child`), so the lookup + clear use `child_tid`; the
-    // inner↔outer binding inside the namespace is ProcessId-space, so
-    // `release_outer` takes the ProcessId (`child_pid`).
-    #[cfg(feature = "container")]
-    {
-        if let Some(ns) = crate::pid_ns::ns_of(child_tid) {
-            ns.release_outer(child_pid);
-        }
-        crate::pid_ns::clear_ns(child_tid);
-    }
 
     let parent = match get_wait_recipient(child_pid) {
         Some(p) => p,
@@ -6542,6 +6546,19 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
             *slot |= sig_bit(SIGCHLD);
         }
     }
+    // A parent may be parked in epoll_wait on its signalfd rather than in
+    // wait4. Publishing SIGCHLD without firing the signal waker leaves that
+    // task asleep indefinitely: the earlier pidfd readiness notification can
+    // race before SIGNAL_PENDING is set, so its re-scan observes neither
+    // source. Wake after the pending bit is visible, matching every other
+    // signal-delivery path.
+    wake_signal(parent);
+    // signalfd exposes blocked pending signals through poll/epoll readiness.
+    // `pidfd::notify_exit` ran before SIGCHLD was published, so its readiness
+    // wake can legitimately re-scan too early and re-park. Notify again after
+    // the bit is visible so an epoll waiter observes either its pidfd or
+    // signalfd as ready.
+    narf_net::readiness::notify(0);
     // (3) Wake any parent task parked in a blocking wait4.  The waker
     // was stored by `UserTaskFuture::poll` when it found the pending-
     // exits queue empty.  Now that we've pushed an entry, fire the waker

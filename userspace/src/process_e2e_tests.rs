@@ -2154,7 +2154,9 @@ fn smoke_wave37_on_child_exit_fires_wake() -> TestResult {
 
     // Build a tiny waker backed by an AtomicBool flag.
     static WOKE: AtomicBool = AtomicBool::new(false);
+    static SIGNAL_WOKE: AtomicBool = AtomicBool::new(false);
     WOKE.store(false, Ord::Relaxed);
+    SIGNAL_WOKE.store(false, Ord::Relaxed);
 
     unsafe fn clone_raw(_: *const ()) -> RawWaker {
         RawWaker::new(core::ptr::null(), &VTAB)
@@ -2166,8 +2168,23 @@ fn smoke_wave37_on_child_exit_fires_wake() -> TestResult {
         WOKE.store(true, Ord::Release);
     }
     unsafe fn drop_raw(_: *const ()) {}
+    unsafe fn signal_clone_raw(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &SIGNAL_VTAB)
+    }
+    unsafe fn signal_wake_raw(_: *const ()) {
+        SIGNAL_WOKE.store(true, Ord::Release);
+    }
+    unsafe fn signal_wake_by_ref_raw(_: *const ()) {
+        SIGNAL_WOKE.store(true, Ord::Release);
+    }
     static VTAB: RawWakerVTable =
         RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
+    static SIGNAL_VTAB: RawWakerVTable = RawWakerVTable::new(
+        signal_clone_raw,
+        signal_wake_raw,
+        signal_wake_by_ref_raw,
+        drop_raw,
+    );
 
     // SAFETY: `VTAB`'s clone/wake/wake_by_ref/drop fns honor the
     // `RawWaker` contract — they ignore the null data pointer and only
@@ -2175,6 +2192,12 @@ fn smoke_wave37_on_child_exit_fires_wake() -> TestResult {
     // SAFETY: Valid memory or trusted environment
     let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) };
     crate::user_task::register_wait_child_waker(PARENT, waker);
+    // A service manager normally sleeps in epoll_wait/signalfd, which uses
+    // the signal-waker registry rather than the blocking-wait4 registry.
+    // SAFETY: SIGNAL_VTAB has the same sound static-flag-only RawWaker shape
+    // as VTAB above and ignores its null data pointer.
+    let signal_waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &SIGNAL_VTAB)) };
+    crate::handlers::register_signal_waker(PARENT, signal_waker);
 
     // Fire child exit — this should call wake_wait_child(PARENT)
     // which consumes the waker we stored and calls w.wake().
@@ -2183,6 +2206,10 @@ fn smoke_wave37_on_child_exit_fires_wake() -> TestResult {
     if !WOKE.load(Ord::Acquire) {
         teardown_process_state();
         return TestResult::Fail("on_child_exit did not call wake_wait_child");
+    }
+    if !SIGNAL_WOKE.load(Ord::Acquire) {
+        teardown_process_state();
+        return TestResult::Fail("on_child_exit did not wake SIGCHLD waiter");
     }
 
     teardown_process_state();

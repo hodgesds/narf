@@ -725,6 +725,26 @@ fn parse_max(text: &str) -> Result<Option<u64>, FsError> {
     }
 }
 
+#[cfg(feature = "linux-compat")]
+fn report_pid(pid: u64) -> Option<u64> {
+    crate::procfs::pid_report(pid)
+}
+
+#[cfg(not(feature = "linux-compat"))]
+fn report_pid(pid: u64) -> Option<u64> {
+    Some(pid)
+}
+
+#[cfg(feature = "linux-compat")]
+fn resolve_pid(pid: u64) -> Option<u64> {
+    crate::procfs::pid_resolve(pid)
+}
+
+#[cfg(not(feature = "linux-compat"))]
+fn resolve_pid(pid: u64) -> Option<u64> {
+    Some(pid)
+}
+
 fn render_core(cg: &Arc<Cgroup>, f: CoreFile) -> String {
     match f {
         CoreFile::Controllers => {
@@ -754,7 +774,7 @@ fn render_core(cg: &Arc<Cgroup>, f: CoreFile) -> String {
             // Members are outer ProcessIds; report them in the READER's PID
             // namespace and drop any not visible there (namespace isolation).
             for pid in cg.members.lock().iter() {
-                if let Some(v) = crate::procfs::pid_report(*pid) {
+                if let Some(v) = report_pid(*pid) {
                     s.push_str(&v.to_string());
                     s.push('\n');
                 }
@@ -767,7 +787,7 @@ fn render_core(cg: &Arc<Cgroup>, f: CoreFile) -> String {
             let t = cg.threads.lock();
             if t.is_empty() {
                 for pid in cg.members.lock().iter() {
-                    if let Some(v) = crate::procfs::pid_report(*pid) {
+                    if let Some(v) = report_pid(*pid) {
                         s.push_str(&v.to_string());
                         s.push('\n');
                     }
@@ -817,7 +837,7 @@ fn store_core(cg: &Arc<Cgroup>, f: CoreFile, buf: &[u8]) -> Result<usize, FsErro
                 // An explicit pid is in the WRITER's PID namespace; translate to
                 // the outer ProcessId cgroup membership keys on. Invisible in
                 // the writer's namespace → reject (Linux ESRCH-ish).
-                pid = crate::procfs::pid_resolve(pid).ok_or(FsError::InvalidData)?;
+                pid = resolve_pid(pid).ok_or(FsError::InvalidData)?;
             }
             place(pid, cg)?;
             Ok(buf.len())

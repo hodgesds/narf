@@ -6,6 +6,20 @@ pub(crate) fn sys_exit_task(ctx: &mut dyn TrapContext) {
     let wstatus = (exit_code & 0xff) << 8;
     let tid = current_task_id();
     let pid = task_to_pid_raw(tid).unwrap_or(tid);
+    #[cfg(feature = "syscall-trace")]
+    {
+        use core::fmt::Write;
+        let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
+        let _ = writeln!(
+            narf_console::Writer,
+            "[process-exit] kind=exit tid={} pid={} comm={} code={} wstatus={}",
+            tid,
+            pid,
+            comm,
+            exit_code & 0xff,
+            wstatus
+        );
+    }
     stage_pending_termination(pid, wstatus as i32);
     // Robust-futex owner-died walk — in-task context, before teardown
     // (see terminate_current_task).
