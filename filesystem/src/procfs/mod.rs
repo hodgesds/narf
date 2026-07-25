@@ -193,6 +193,7 @@ pub(crate) fn pid_resolve(n: u64) -> Option<u64> {
 /// Translate an outer ProcessId into the current reader's namespace view, or
 /// `None` if the process is invisible there. Falls back to identity (`Some(n)`)
 /// when the hook isn't installed. Backs cgroup.procs listing translation.
+#[cfg(feature = "cgroup")]
 pub(crate) fn pid_report(n: u64) -> Option<u64> {
     let v = PID_REPORT_HOOK.load(Ordering::Acquire);
     if v == 0 {
