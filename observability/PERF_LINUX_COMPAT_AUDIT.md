@@ -28,6 +28,8 @@ over that authority; it is not a second PMU subsystem.
 | `perf` surface | Required kernel ABI | NARF status | Notes |
 | --- | --- | --- | --- |
 | `perf --version`, help | ELF loader, libc, terminal | supported in Alpine rootfs | `REGEN_perf_rootfs.sh` packages Alpine's unmodified musl-linked perf and its shared-library closure. |
+| `perf list software` | sysfs event-source discovery | supported slice | The upstream CLI discovers only software events implemented by the adapter. |
+| `perf stat -- <cmd>` | default event selection and honest event admission | supported slice | Supported counters are measured; unavailable hardware events are reported as `<not supported>` rather than fabricated. |
 | `perf stat -e cycles <cmd>` | counting event, enable-on-exec, target-exit stop, 24-byte read format | supported slice | The count window is bounded by successful exec and process exit; accounting within that window is system-global because exact target-task attribution is deferred. |
 | `perf stat -e cycles,instructions <cmd>` | independent fds, scaling times | supported slice | Hardware availability still bounds simultaneous events. |
 | `perf stat -e '{cycles,instructions}'` | event groups and group leader reads | supported slice | Members are linked to the leader; group reads and group lifecycle ioctls cover the non-multiplexed counting case. |
