@@ -4261,3 +4261,40 @@ fn smoke_pmuv3_cycle_counter_round_trip() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/pmu", smoke_pmuv3_cycle_counter_round_trip);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_pmuv3_programmable_counter_round_trip() -> TestResult {
+    use crate::aarch64::pmu;
+    if pmu::programmable_counter_count() == 0 {
+        return TestResult::Skip("PMUv3 programmable counters not exposed");
+    }
+    // ARMv8 architectural event 0x11 counts CPU cycles through a
+    // programmable slot, independently validating PMSELR/PMXEVTYPER and
+    // PMXEVCNTR rather than reusing the dedicated cycle counter.
+    let counter = match unsafe { pmu::alloc_programmable(0x11) } {
+        Ok(counter) => counter,
+        Err(_) => return TestResult::Fail("PMUv3 programmable allocation failed"),
+    };
+    if unsafe { pmu::start_programmable(&counter) }.is_err() {
+        return TestResult::Fail("PMUv3 programmable start failed");
+    }
+    let before = unsafe { pmu::read_programmable(&counter) }.unwrap_or(0);
+    for _ in 0..1_000 {
+        core::hint::black_box(());
+    }
+    let after = unsafe { pmu::read_programmable(&counter) }.unwrap_or(before);
+    if after <= before {
+        return TestResult::Fail("PMUv3 programmable cycle event did not advance");
+    }
+    if unsafe { pmu::arm_programmable(&counter, 10_000) }.is_err()
+        || unsafe { pmu::pause_programmable(&counter) }.is_err()
+    {
+        return TestResult::Fail("PMUv3 programmable sampling arm/pause failed");
+    }
+    if unsafe { pmu::release_programmable(counter) }.is_err() {
+        return TestResult::Fail("PMUv3 programmable release failed");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/pmu", smoke_pmuv3_programmable_counter_round_trip);

@@ -110,6 +110,33 @@ pub unsafe fn pmu::handle_sampling_overflow() -> bool;
 pub unsafe fn pmu::pause_sampling(
     counter: &pmu::CycleCounter,
 ) -> Result<(), pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub fn pmu::programmable_counter_count() -> u8;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::alloc_programmable(
+    event: u16,
+) -> Result<pmu::ProgrammableCounter, pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::read_programmable(
+    counter: &pmu::ProgrammableCounter,
+) -> Result<u64, pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::start_programmable(
+    counter: &pmu::ProgrammableCounter,
+) -> Result<(), pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::arm_programmable(
+    counter: &pmu::ProgrammableCounter,
+    period: u64,
+) -> Result<(), pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::pause_programmable(
+    counter: &pmu::ProgrammableCounter,
+) -> Result<(), pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::release_programmable(
+    counter: pmu::ProgrammableCounter,
+) -> Result<(), pmu::PmuError>;
 
 #[cfg(target_arch = "x86_64")]
 pub mod amd_pstate {
