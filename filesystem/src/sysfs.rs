@@ -277,6 +277,17 @@ impl Kobject {
             .cloned()
     }
 
+    /// Remove a direct child by name. Dynamic kernel subsystems use this
+    /// when their backing object is finally reclaimed.
+    pub fn remove_child(&self, name: &str) -> bool {
+        let mut children = self.children.lock();
+        let Some(index) = children.iter().position(|child| child.name == name) else {
+            return false;
+        };
+        children.swap_remove(index);
+        true
+    }
+
     /// Add (or replace) a symlink child `name` pointing at `target`.
     /// `target` is stored verbatim (relative or absolute); `readlink`
     /// returns it as-is, which is all udev needs (it basenames the result).

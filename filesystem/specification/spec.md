@@ -176,6 +176,52 @@ by `/dev/fuse` and `virtiofs`. Each open of `/dev/fuse` owns one
 connection; reads return exactly one complete request and writes match
 replies by the non-zero `unique` identifier.
 
+`FUSE_DEV_IOC_CLONE` replaces a fresh `/dev/fuse` endpoint with another
+daemon endpoint on the source fd's connection. Cloned endpoints share
+request and reply queues, and closing one endpoint leaves the connection
+live until the final daemon endpoint closes.
+
+When `FUSE_PASSTHROUGH` is negotiated, `FUSE_DEV_IOC_BACKING_OPEN` and
+`FUSE_DEV_IOC_BACKING_CLOSE` manage connection-scoped backing-file IDs.
+An `OPEN` or `CREATE` reply carrying `FOPEN_PASSTHROUGH` and a live
+`backing_id` routes file reads and writes directly to that backing file;
+metadata and lifecycle operations remain on the FUSE connection. Unknown
+IDs, non-zero backing-map flags/padding, and passthrough without successful
+capability negotiation are rejected.
+
+Dropping an initialized `FuseFs` sends exactly one forced `FUSE_DESTROY`
+request with an empty body, retires registered passthrough backings, and
+does not retain an unobserved reply slot. Failed INIT and already-disconnected
+connections do not send DESTROY.
+
+Every `/dev/fuse` or direct `FuseFs` connection is represented at
+`/sys/fs/fuse/connections/<id>`. Its `waiting` attribute reports queued plus
+in-flight requests, and writing `abort` disconnects the daemon and completes
+parked callers with `ENOTCONN`. Writable `max_background` and
+`congestion_threshold` attributes use Linux's defaults of 12 and 9, accept
+16-bit unsigned limits, and reflect non-zero daemon values negotiated in
+FUSE_INIT 7.13 or newer. The directory is removed when the connection object
+is finally reclaimed.
+
+Reply-bearing operations submitted from non-awaitable teardown paths are
+tracked as background work. At most `max_background` such operations are
+visible to the daemon at once; completions promote deferred operations in FIFO
+order. `congestion_threshold` defines the connection's observable congestion
+state, and `waiting` includes deferred background work.
+
+NARF advertises Linux's `FUSE_NO_OPEN_SUPPORT` and
+`FUSE_NO_OPENDIR_SUPPORT` negotiation bits. An `ENOSYS` response to the first
+`OPEN` or `OPENDIR` is cached for the connection; subsequent file and
+directory operations use the implicit handle zero and omit the matching
+`RELEASE` or `RELEASEDIR` request.
+
+When `FUSE_REQUEST_TIMEOUT` is negotiated with a non-zero timeout, the value is
+clamped to Linux's 15-second minimum and every subsequent request is
+deadline-bound using the monotonic timer wheel. An
+expired queued or in-flight request aborts the entire connection, retires all
+queued transport work, and completes parked callers with a connection error,
+matching Linux's connection-level timeout behavior.
+
 - An empty blocking read parks in the syscall layer; a non-blocking
   read reports `EAGAIN`.
 - A daemon buffer smaller than the next complete request reports
@@ -190,6 +236,9 @@ replies by the non-zero `unique` identifier.
   write, flush, fsync/fdatasync, extended attributes, access checks,
   readlink, statfs, readdir, release,
   forget, and initialization.
+- Anonymous files use `FUSE_TMPFILE`; `linkat(AT_EMPTY_PATH)` materialises
+  them with `FUSE_LINK` on the same connection. Cross-filesystem
+  materialisation reports `EXDEV`.
 
 `FsInstance::statfs` is the asynchronous filesystem-capacity interface.
 Its `FsStat` result is translated to Linux `struct statfs`; FUSE mounts
@@ -236,17 +285,35 @@ SEEK_HOLE), and COPY_FILE_RANGE when both files share one connection;
 the syscall layer retains truncate/zero, generic seek, and buffered-copy
 fallbacks for filesystems that return `Unsupported`.
 
+`FileOps::ioctl_async` carries Linux `_IOC`-described input and output
+buffers to remote filesystems. FUSE maps it to restricted `FUSE_IOCTL`,
+copies no more than the encoded `_IOC_SIZE`, rejects oversized replies,
+and rejects `FUSE_IOCTL_RETRY`; daemon-selected retry iovecs are reserved
+for the separately privileged CUSE unrestricted-ioctl contract.
+
 FUSE file handles register `POLL` once with a stable kernel handle and
 cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that
 registration so the next readiness query re-polls the daemon. Poll
 requests never leave ordinary reply slots behind.
 
-`FUSE_INIT` uses the Linux 64-byte extended request/reply layout. The
+`FUSE_INIT` uses the Linux 7.45 64-byte extended request/reply layout. The
 client advertises only implemented protocol features, accepts compatible
 short legacy replies by zero-extending them, intersects daemon flags with
 that set, and records the negotiated minor version and write limit on the
 connection. Major versions other than 7 and protocol minors before 7.5
-are rejected.
+are rejected. A failed, malformed, disconnected, or timed-out INIT aborts
+the mount instead of publishing a partially initialized filesystem.
+Protocol 7.45 peers use `FUSE_COPY_FILE_RANGE_64` so successful copies
+can report byte counts beyond `u32`; older peers retain the original
+reply shape.
+`FileOps::statx_async` preserves the daemon's `FUSE_STATX` mask, birth
+time, attributes, ownership, device numbers, and nanosecond timestamps;
+malformed timestamps are rejected.
+`FileOps::bmap` forwards logical-block translation through `FUSE_BMAP`.
+`setup_mapping` and `remove_mappings` implement virtiofs DAX window
+management through `FUSE_SETUPMAPPING` and batched `FUSE_REMOVEMAPPING`;
+requests must be 4 KiB aligned, use only READ/WRITE flags, and respect
+Linux's one-page removal-entry limit.
 FUSE writes are split into requests no larger than the negotiated
 `max_write`; each request advances the file offset, an oversized daemon
 reply is rejected as invalid data, and a short reply ends the write with
@@ -265,6 +332,10 @@ Daemon `INVAL_INODE`, `INVAL_ENTRY`, and `DELETE` notifications are
 wire-validated and accepted. They require no cache mutation while the
 FUSE bridge remains uncached; adding inode, dentry, or page caching must
 attach the corresponding invalidation before enabling that cache.
+`STORE` retains daemon-provided ranges per connection and `RETRIEVE`
+answers with a one-way `FUSE_NOTIFY_REPLY` carrying the matching bytes.
+`RESEND`, `INC_EPOCH`, and `PRUNE` are wire-validated; epoch changes are
+tracked and prune drops the requested number of retained ranges.
 
 When the daemon negotiates `DO_READDIRPLUS`, directory enumeration uses
 `READDIRPLUS`, validates each combined entry/dirent record, and emits an

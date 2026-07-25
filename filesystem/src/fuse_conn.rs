@@ -35,8 +35,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fuse::*;
 use crate::{
-    DirEntry, DirOps, FileLock, FileOps, FileType, FsError, FsFuture, FsInstance, FsStat, Mode,
-    Stat, POLL_IN, POLL_OUT,
+    DirEntry, DirOps, FileLock, FileOps, FileType, FsError, FsFuture, FsInstance, FsIoctlReply,
+    FsMappingRange, FsStat, FsStatx, FsStatxTimestamp, Mode, Stat, POLL_IN, POLL_OUT,
 };
 
 /// A completed reply from the daemon: the `error` field of the
@@ -61,6 +61,10 @@ pub struct FuseRequestContext {
 pub type FuseRequestContextProvider = fn() -> FuseRequestContext;
 
 static REQUEST_CONTEXT_PROVIDER: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "linux-compat")]
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+const FUSE_DEFAULT_MAX_BACKGROUND: u32 = 12;
+const FUSE_DEFAULT_CONGESTION_THRESHOLD: u32 = FUSE_DEFAULT_MAX_BACKGROUND * 3 / 4;
 
 pub fn install_request_context_provider(provider: FuseRequestContextProvider) {
     REQUEST_CONTEXT_PROVIDER.store(provider as usize, Ordering::Release);
@@ -93,20 +97,40 @@ pub fn __test_reset_request_context_provider() {
 /// - `connected`: cleared when the daemon closes `/dev/fuse` so parked
 ///   callers can fail with `ENOTCONN`/`Unsupported` instead of hanging.
 pub struct FuseConnection {
+    #[cfg(feature = "linux-compat")]
+    connection_id: u64,
+    #[cfg(feature = "linux-compat")]
+    sysfs_registered: AtomicBool,
     pending: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
+    background_deferred: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
+    background_active: IrqSafeSpinLock<BTreeSet<u64>>,
     replies: IrqSafeSpinLock<BTreeMap<u64, Option<FuseReply>>>,
     delivered: IrqSafeSpinLock<BTreeSet<u64>>,
     poll_requests: IrqSafeSpinLock<BTreeMap<u64, PendingPoll>>,
     poll_handles: IrqSafeSpinLock<BTreeMap<u64, PollState>>,
     next_unique: AtomicU64,
     connected: core::sync::atomic::AtomicBool,
+    destroyed: AtomicBool,
+    /// Number of distinct `/dev/fuse` daemon endpoints attached to this
+    /// connection. `dup()` shares one endpoint; FUSE_DEV_IOC_CLONE creates
+    /// another and the connection dies only when the last endpoint closes.
+    daemon_endpoints: AtomicUsize,
     /// True once FUSE_INIT has completed successfully.
     initialized: core::sync::atomic::AtomicBool,
     negotiated_minor: AtomicU32,
     negotiated_flags: AtomicU64,
     max_write: AtomicU32,
     max_pages: AtomicU16,
+    max_background: AtomicU32,
+    congestion_threshold: AtomicU32,
+    request_timeout_secs: AtomicU16,
+    no_open: AtomicBool,
+    no_opendir: AtomicBool,
     syncfs_supported: AtomicBool,
+    next_backing_id: AtomicU32,
+    backing_files: IrqSafeSpinLock<BTreeMap<i32, Arc<dyn FileOps>>>,
+    notify_cache: IrqSafeSpinLock<BTreeMap<(u64, u64), Vec<u8>>>,
+    notify_epoch: AtomicU64,
 }
 
 impl core::fmt::Debug for FuseConnection {
@@ -128,7 +152,13 @@ impl Default for FuseConnection {
 impl FuseConnection {
     pub fn new() -> Self {
         FuseConnection {
+            #[cfg(feature = "linux-compat")]
+            connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+            #[cfg(feature = "linux-compat")]
+            sysfs_registered: AtomicBool::new(false),
             pending: IrqSafeSpinLock::new(VecDeque::new()),
+            background_deferred: IrqSafeSpinLock::new(VecDeque::new()),
+            background_active: IrqSafeSpinLock::new(BTreeSet::new()),
             replies: IrqSafeSpinLock::new(BTreeMap::new()),
             delivered: IrqSafeSpinLock::new(BTreeSet::new()),
             poll_requests: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -137,12 +167,23 @@ impl FuseConnection {
             // some versions; any monotone non-zero sequence is spec-legal.
             next_unique: AtomicU64::new(1),
             connected: core::sync::atomic::AtomicBool::new(true),
+            destroyed: AtomicBool::new(false),
+            daemon_endpoints: AtomicUsize::new(1),
             initialized: core::sync::atomic::AtomicBool::new(false),
             negotiated_minor: AtomicU32::new(0),
             negotiated_flags: AtomicU64::new(0),
             max_write: AtomicU32::new(4096),
             max_pages: AtomicU16::new(32),
+            max_background: AtomicU32::new(FUSE_DEFAULT_MAX_BACKGROUND),
+            congestion_threshold: AtomicU32::new(FUSE_DEFAULT_CONGESTION_THRESHOLD),
+            request_timeout_secs: AtomicU16::new(0),
+            no_open: AtomicBool::new(false),
+            no_opendir: AtomicBool::new(false),
             syncfs_supported: AtomicBool::new(true),
+            next_backing_id: AtomicU32::new(1),
+            backing_files: IrqSafeSpinLock::new(BTreeMap::new()),
+            notify_cache: IrqSafeSpinLock::new(BTreeMap::new()),
+            notify_epoch: AtomicU64::new(0),
         }
     }
 
@@ -171,6 +212,177 @@ impl FuseConnection {
         self.max_pages.load(Ordering::Acquire)
     }
 
+    pub fn max_background(&self) -> u32 {
+        self.max_background.load(Ordering::Acquire)
+    }
+
+    pub fn congestion_threshold(&self) -> u32 {
+        self.congestion_threshold.load(Ordering::Acquire)
+    }
+
+    pub fn request_timeout_secs(&self) -> u16 {
+        self.request_timeout_secs.load(Ordering::Acquire)
+    }
+
+    #[doc(hidden)]
+    pub fn __test_set_request_timeout_secs(&self, seconds: u16) {
+        self.request_timeout_secs.store(seconds, Ordering::Release);
+    }
+
+    #[doc(hidden)]
+    pub fn __test_set_background_limits(&self, max_background: u32, congestion_threshold: u32) {
+        self.congestion_threshold
+            .store(congestion_threshold, Ordering::Release);
+        self.set_max_background(max_background);
+    }
+
+    #[cfg(feature = "linux-compat")]
+    pub fn connection_id(&self) -> u64 {
+        self.connection_id
+    }
+
+    pub fn waiting_requests(&self) -> usize {
+        self.pending.lock().len()
+            + self.delivered.lock().len()
+            + self.background_deferred.lock().len()
+    }
+
+    pub fn background_requests(&self) -> usize {
+        self.background_active.lock().len() + self.background_deferred.lock().len()
+    }
+
+    pub fn is_congested(&self) -> bool {
+        let threshold = self.congestion_threshold();
+        threshold != 0 && self.background_requests() >= threshold as usize
+    }
+
+    #[cfg(feature = "linux-compat")]
+    fn ensure_sysfs(self: &Arc<Self>) {
+        if self.sysfs_registered.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let root = crate::sysfs::get_root();
+        let fs = crate::sysfs::get_or_create_child(&root, "fs");
+        let fuse = crate::sysfs::get_or_create_child(&fs, "fuse");
+        let connections = crate::sysfs::get_or_create_child(&fuse, "connections");
+        let node =
+            crate::sysfs::Kobject::new_child(connections, alloc::format!("{}", self.connection_id));
+
+        let waiting = Arc::downgrade(self);
+        crate::sysfs::kobject_add_attr(&node, "waiting", move || {
+            waiting
+                .upgrade()
+                .map(|conn| alloc::format!("{}\n", conn.waiting_requests()))
+                .unwrap_or_else(|| "0\n".into())
+        });
+        let abort = Arc::downgrade(self);
+        crate::sysfs::kobject_add_writable_attr(&node, "abort", String::new, move |_data| {
+            let conn = abort.upgrade().ok_or(FsError::NotFound)?;
+            conn.disconnect();
+            Ok(())
+        });
+        let max_background_show = Arc::downgrade(self);
+        let max_background_store = Arc::downgrade(self);
+        crate::sysfs::kobject_add_writable_attr(
+            &node,
+            "max_background",
+            move || {
+                max_background_show
+                    .upgrade()
+                    .map(|conn| alloc::format!("{}\n", conn.max_background()))
+                    .unwrap_or_else(|| "0\n".into())
+            },
+            move |data| {
+                let value = parse_connection_limit(data)?;
+                let conn = max_background_store.upgrade().ok_or(FsError::NotFound)?;
+                conn.set_max_background(value);
+                Ok(())
+            },
+        );
+        let congestion_show = Arc::downgrade(self);
+        let congestion_store = Arc::downgrade(self);
+        crate::sysfs::kobject_add_writable_attr(
+            &node,
+            "congestion_threshold",
+            move || {
+                congestion_show
+                    .upgrade()
+                    .map(|conn| alloc::format!("{}\n", conn.congestion_threshold()))
+                    .unwrap_or_else(|| "0\n".into())
+            },
+            move |data| {
+                let value = parse_connection_limit(data)?;
+                let conn = congestion_store.upgrade().ok_or(FsError::NotFound)?;
+                conn.congestion_threshold.store(value, Ordering::Release);
+                Ok(())
+            },
+        );
+    }
+
+    #[cfg(not(feature = "linux-compat"))]
+    fn ensure_sysfs(self: &Arc<Self>) {
+        let _ = self;
+    }
+
+    fn is_fresh_endpoint(&self) -> bool {
+        self.daemon_endpoints.load(Ordering::Acquire) == 1
+            && !self.initialized.load(Ordering::Acquire)
+            && self.pending.lock().is_empty()
+            && self.replies.lock().is_empty()
+    }
+
+    fn add_daemon_endpoint(&self) {
+        self.daemon_endpoints.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn remove_daemon_endpoint(&self) {
+        if self.daemon_endpoints.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.disconnect();
+        }
+    }
+
+    pub fn register_backing(&self, file: Arc<dyn FileOps>) -> Result<i32, FsError> {
+        if self.negotiated_flags() & FUSE_PASSTHROUGH == 0 {
+            return Err(FsError::Unsupported);
+        }
+        let id = self.next_backing_id.fetch_add(1, Ordering::AcqRel);
+        if id == 0 || id > i32::MAX as u32 {
+            return Err(FsError::NoSpace);
+        }
+        self.backing_files.lock().insert(id as i32, file);
+        Ok(id as i32)
+    }
+
+    pub fn unregister_backing(&self, id: i32) -> Result<(), FsError> {
+        if id <= 0 {
+            return Err(FsError::InvalidData);
+        }
+        self.backing_files
+            .lock()
+            .remove(&id)
+            .map(|_| ())
+            .ok_or(FsError::InvalidData)
+    }
+
+    fn backing(&self, id: i32) -> Option<Arc<dyn FileOps>> {
+        self.backing_files.lock().get(&id).cloned()
+    }
+
+    pub(crate) fn backing_for_open(
+        &self,
+        reply: &FuseOpenOut,
+    ) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+        if reply.open_flags & FOPEN_PASSTHROUGH == 0 {
+            return Ok(None);
+        }
+        if self.negotiated_flags() & FUSE_PASSTHROUGH == 0 {
+            return Err(FsError::InvalidData);
+        }
+        self.backing(reply.padding as i32)
+            .map(Some)
+            .ok_or(FsError::InvalidData)
+    }
+
     /// Mark the connection dead (daemon closed `/dev/fuse`). Any in-flight
     /// requests are failed so parked callers unwind.
     pub fn disconnect(&self) {
@@ -185,6 +397,24 @@ impl FuseConnection {
                 });
             }
         }
+        self.pending.lock().clear();
+        self.delivered.lock().clear();
+        self.background_deferred.lock().clear();
+        self.background_active.lock().clear();
+    }
+
+    fn send_destroy(&self) {
+        if !self.initialized.load(Ordering::Acquire)
+            || !self.is_connected()
+            || self.destroyed.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        // DESTROY is forced during teardown in Linux. There is no caller
+        // left to await it here; unknown late replies are deliberately
+        // consumed by complete_reply, so no reply slot is leaked.
+        self.submit_noreply(FuseOpcode::Destroy, 0, &[]);
+        self.backing_files.lock().clear();
     }
 
     /// Encode `fuse_in_header` + `body` for `opcode`/`nodeid`, enqueue it,
@@ -230,6 +460,65 @@ impl FuseConnection {
         self.pending.lock().push_back(msg);
     }
 
+    /// Enqueue a reply-bearing operation whose caller cannot await it (for
+    /// example RELEASE from `Drop`). Delivery is bounded by max_background;
+    /// completion promotes the oldest deferred operation.
+    pub(crate) fn submit_background_noreply(&self, opcode: FuseOpcode, nodeid: u64, body: &[u8]) {
+        let unique = self.alloc_unique();
+        let total = core::mem::size_of::<FuseInHeader>() + body.len();
+        let context = request_context();
+        let hdr = FuseInHeader {
+            len: total as u32,
+            opcode: opcode as u32,
+            unique,
+            nodeid,
+            uid: context.uid,
+            gid: context.gid,
+            pid: context.pid,
+            _padding: 0,
+        };
+        let mut msg = pod_as_bytes(&hdr);
+        msg.extend_from_slice(body);
+
+        let mut active = self.background_active.lock();
+        if active.len() < self.max_background() as usize {
+            active.insert(unique);
+            self.pending.lock().push_back(msg);
+        } else {
+            self.background_deferred.lock().push_back(msg);
+        }
+    }
+
+    fn set_max_background(&self, value: u32) {
+        self.max_background.store(value, Ordering::Release);
+        self.promote_background();
+    }
+
+    fn promote_background(&self) {
+        let limit = self.max_background() as usize;
+        let mut active = self.background_active.lock();
+        let mut deferred = self.background_deferred.lock();
+        let mut pending = self.pending.lock();
+        while active.len() < limit {
+            let Some(request) = deferred.pop_front() else {
+                break;
+            };
+            let Some(header) = pod_from_bytes::<FuseInHeader>(&request) else {
+                continue;
+            };
+            active.insert(header.unique);
+            pending.push_back(request);
+        }
+    }
+
+    fn complete_background(&self, unique: u64) -> bool {
+        let removed = self.background_active.lock().remove(&unique);
+        if removed {
+            self.promote_background();
+        }
+        removed
+    }
+
     fn cancel_request(&self, unique: u64) {
         self.replies.lock().remove(&unique);
         let mut removed_pending = false;
@@ -256,6 +545,7 @@ impl FuseConnection {
             if header.opcode != FuseOpcode::Interrupt as u32
                 && header.opcode != FuseOpcode::Forget as u32
                 && header.opcode != FuseOpcode::BatchForget as u32
+                && header.opcode != FuseOpcode::NotifyReply as u32
             {
                 self.delivered.lock().insert(header.unique);
             }
@@ -354,6 +644,32 @@ impl FuseConnection {
         !self.pending.lock().is_empty()
     }
 
+    fn enqueue_notify_reply(&self, unique: u64, nodeid: u64, offset: u64, data: &[u8]) {
+        let context = request_context();
+        let input = FuseNotifyRetrieveIn {
+            offset,
+            size: data.len() as u32,
+            ..Default::default()
+        };
+        let len = core::mem::size_of::<FuseInHeader>()
+            + core::mem::size_of::<FuseNotifyRetrieveIn>()
+            + data.len();
+        let header = FuseInHeader {
+            len: len as u32,
+            opcode: FuseOpcode::NotifyReply as u32,
+            unique,
+            nodeid,
+            uid: context.uid,
+            gid: context.gid,
+            pid: context.pid,
+            _padding: 0,
+        };
+        let mut request = pod_as_bytes(&header);
+        request.extend_from_slice(&pod_as_bytes(&input));
+        request.extend_from_slice(data);
+        self.pending.lock().push_back(request);
+    }
+
     /// Daemon side: complete the request identified by the reply's
     /// `fuse_out_header.unique`. `reply` is the full daemon write
     /// (`fuse_out_header` + body). Returns the number of bytes consumed on
@@ -397,12 +713,81 @@ impl FuseConnection {
                         && body.len()
                             == core::mem::size_of::<FuseNotifyDeleteOut>() + notify.namelen as usize
                 }
+                FUSE_NOTIFY_STORE => {
+                    let notify: FuseNotifyStoreOut = pod_from_bytes(&body)?;
+                    let header_len = core::mem::size_of::<FuseNotifyStoreOut>();
+                    let valid = notify.nodeid != 0
+                        && notify.padding == 0
+                        && body.len() == header_len + notify.size as usize;
+                    if valid {
+                        self.notify_cache
+                            .lock()
+                            .insert((notify.nodeid, notify.offset), body[header_len..].to_vec());
+                    }
+                    valid
+                }
+                FUSE_NOTIFY_RETRIEVE => {
+                    let notify: FuseNotifyRetrieveOut = pod_from_bytes(&body)?;
+                    if notify.notify_unique == 0
+                        || notify.nodeid == 0
+                        || notify.padding != 0
+                        || body.len() != core::mem::size_of::<FuseNotifyRetrieveOut>()
+                    {
+                        false
+                    } else {
+                        let data = self
+                            .notify_cache
+                            .lock()
+                            .get(&(notify.nodeid, notify.offset))
+                            .cloned()
+                            .unwrap_or_default();
+                        let size = core::cmp::min(data.len(), notify.size as usize);
+                        self.enqueue_notify_reply(
+                            notify.notify_unique,
+                            notify.nodeid,
+                            notify.offset,
+                            &data[..size],
+                        );
+                        true
+                    }
+                }
+                FUSE_NOTIFY_RESEND => body.is_empty(),
+                FUSE_NOTIFY_INC_EPOCH => {
+                    if body.is_empty() {
+                        self.notify_epoch.fetch_add(1, Ordering::AcqRel);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                FUSE_NOTIFY_PRUNE => {
+                    let notify: FuseNotifyPruneOut = pod_from_bytes(&body)?;
+                    if body.len() != core::mem::size_of::<FuseNotifyPruneOut>()
+                        || notify.padding != 0
+                        || notify.spare != 0
+                    {
+                        false
+                    } else {
+                        let mut cache = self.notify_cache.lock();
+                        for _ in 0..notify.count {
+                            let Some(key) = cache.keys().next().copied() else {
+                                break;
+                            };
+                            cache.remove(&key);
+                        }
+                        true
+                    }
+                }
                 _ => false,
             };
             return valid.then_some(claimed);
         }
         if hdr.error > 0 {
             return None;
+        }
+        if self.complete_background(hdr.unique) {
+            self.delivered.lock().remove(&hdr.unique);
+            return Some(claimed);
         }
         if let Some((kh, readiness, registered)) = self.poll_requests.lock().remove(&hdr.unique) {
             if hdr.error == 0 {
@@ -452,11 +837,7 @@ impl FuseConnection {
             return Err(FsError::Unsupported);
         }
         let unique = self.submit(opcode, nodeid, &body);
-        let reply = ReplyFuture {
-            conn: Arc::clone(self),
-            unique,
-        }
-        .await;
+        let reply = self.await_reply(unique).await?;
         match reply.error {
             0 => Ok(reply.body),
             e => Err(errno_to_fs_error(e)),
@@ -474,11 +855,7 @@ impl FuseConnection {
         }
         let body = pod_as_bytes(&FuseSyncfsIn::default());
         let unique = self.submit(FuseOpcode::Syncfs, FUSE_ROOT_ID, &body);
-        let reply = ReplyFuture {
-            conn: Arc::clone(self),
-            unique,
-        }
-        .await;
+        let reply = self.await_reply(unique).await?;
         match reply.error {
             0 => Ok(()),
             -38 => {
@@ -488,6 +865,40 @@ impl FuseConnection {
             error => Err(errno_to_fs_error(error)),
         }
     }
+
+    async fn await_reply(self: &Arc<Self>, unique: u64) -> Result<FuseReply, FsError> {
+        let future = ReplyFuture {
+            conn: Arc::clone(self),
+            unique,
+        };
+        let timeout_secs = self.request_timeout_secs();
+        if timeout_secs == 0 {
+            return Ok(future.await);
+        }
+        let deadline = narf_time::Deadline::after_ms(u64::from(timeout_secs) * 1_000);
+        match narf_time::timeout(deadline, future).await {
+            Ok(reply) => Ok(reply),
+            Err(_) => {
+                // Linux aborts the entire connection when any queued or
+                // in-flight request exceeds the negotiated server timeout.
+                self.disconnect();
+                Err(FsError::Unsupported)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "linux-compat")]
+fn parse_connection_limit(data: &[u8]) -> Result<u32, FsError> {
+    let value = core::str::from_utf8(data)
+        .map_err(|_| FsError::InvalidData)?
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| FsError::InvalidData)?;
+    if value > u16::MAX as u32 {
+        return Err(FsError::InvalidData);
+    }
+    Ok(value)
 }
 
 /// Future that parks a VFS caller until its FUSE reply lands. Each poll
@@ -565,13 +976,18 @@ pub struct DevFuse {
 }
 
 impl DevFuse {
+    /// Linux UAPI `_IOR(229, 0, uint32_t)`.
+    pub const DEV_IOC_CLONE: u32 = 0x8004_e500;
+    pub const DEV_IOC_BACKING_OPEN: u32 = 0x4010_e501;
+    pub const DEV_IOC_BACKING_CLOSE: u32 = 0x4004_e502;
+
     /// Mint a new `/dev/fuse` connection. Returned as a `FileOps` for the
     /// caller's fd table; the mount path later recovers the connection via
     /// [`DevFuse::connection_of`].
     pub fn open_new() -> Arc<dyn FileOps> {
-        Arc::new(DevFuse {
-            conn: Arc::new(FuseConnection::new()),
-        })
+        let conn = Arc::new(FuseConnection::new());
+        conn.ensure_sysfs();
+        Arc::new(DevFuse { conn })
     }
 
     /// The connection this device fd owns.
@@ -586,6 +1002,36 @@ impl DevFuse {
         ops.as_any()
             .and_then(|a| a.downcast_ref::<DevFuse>())
             .map(|d| d.connection())
+    }
+
+    /// Build a second daemon endpoint for `source` to replace the fresh
+    /// `/dev/fuse` endpoint in `target`. The syscall layer owns the actual
+    /// fd-table replacement because the ioctl argument names another fd.
+    pub fn clone_endpoint(
+        target: &Arc<dyn FileOps>,
+        source: &Arc<dyn FileOps>,
+    ) -> Result<Arc<dyn FileOps>, FsError> {
+        let target = target
+            .as_any()
+            .and_then(|a| a.downcast_ref::<DevFuse>())
+            .ok_or(FsError::InvalidData)?;
+        let source = source
+            .as_any()
+            .and_then(|a| a.downcast_ref::<DevFuse>())
+            .ok_or(FsError::InvalidData)?;
+        if !target.conn.is_fresh_endpoint() || Arc::ptr_eq(&target.conn, &source.conn) {
+            return Err(FsError::InvalidData);
+        }
+        source.conn.add_daemon_endpoint();
+        Ok(Arc::new(DevFuse {
+            conn: Arc::clone(&source.conn),
+        }))
+    }
+}
+
+impl Drop for DevFuse {
+    fn drop(&mut self) {
+        self.conn.remove_daemon_endpoint();
     }
 }
 
@@ -690,6 +1136,7 @@ pub struct FuseFile {
     /// Daemon file handle from FUSE_OPEN, if opened. Guarded because
     /// `open` happens lazily inside an async read.
     fh: IrqSafeSpinLock<Option<u64>>,
+    passthrough: IrqSafeSpinLock<Option<Arc<dyn FileOps>>>,
     poll_kh: u64,
     poll_registered: Arc<AtomicBool>,
     readiness: Arc<AtomicU32>,
@@ -709,16 +1156,32 @@ impl FuseFile {
         if let Some(fh) = *self.fh.lock() {
             return Ok(fh);
         }
+        if self.conn.no_open.load(Ordering::Acquire) {
+            *self.fh.lock() = Some(0);
+            return Ok(0);
+        }
         // FUSE_OPEN: O_RDONLY (0). The daemon returns a file handle.
         let body = pod_as_bytes(&FuseOpenIn {
             flags: 0,
             open_flags: 0,
         });
-        let reply = self
+        let reply = match self
             .conn
             .request(FuseOpcode::Open, self.attr.nodeid, body)
-            .await?;
+            .await
+        {
+            Ok(reply) => reply,
+            Err(FsError::Unsupported) => {
+                self.conn.no_open.store(true, Ordering::Release);
+                *self.fh.lock() = Some(0);
+                return Ok(0);
+            }
+            Err(error) => return Err(error),
+        };
         let out: FuseOpenOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+        if let Some(backing) = self.conn.backing_for_open(&out)? {
+            *self.passthrough.lock() = Some(backing);
+        }
         *self.fh.lock() = Some(out.fh);
         Ok(out.fh)
     }
@@ -752,6 +1215,10 @@ impl FileOps for FuseFile {
                 return Ok(0);
             }
             let fh = self.ensure_open().await?;
+            let backing = { self.passthrough.lock().clone() };
+            if let Some(backing) = backing {
+                return backing.read(offset, buf).await;
+            }
             let max_read = usize::from(self.conn.max_pages()) * 4096;
             let mut read = 0usize;
             while read < buf.len() {
@@ -792,6 +1259,10 @@ impl FileOps for FuseFile {
                 return Ok(0);
             }
             let fh = self.ensure_open().await?;
+            let backing = { self.passthrough.lock().clone() };
+            if let Some(backing) = backing {
+                return backing.write(offset, buf).await;
+            }
             let page_limit = usize::from(self.conn.max_pages()) * 4096;
             let max_write = core::cmp::min(self.conn.max_write() as usize, page_limit);
             let mut written = 0usize;
@@ -892,6 +1363,57 @@ impl FileOps for FuseFile {
                 gid: out.attr.gid,
             }
             .stat())
+        })
+    }
+
+    fn statx_async<'a>(&'a self, flags: u32, mask: u32) -> FsFuture<'a, FsStatx> {
+        Box::pin(async move {
+            let fh = self.ensure_open().await?;
+            let reply = self
+                .conn
+                .request(
+                    FuseOpcode::Statx,
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseStatxIn {
+                        getattr_flags: 1, // FUSE_GETATTR_FH
+                        reserved: 0,
+                        fh,
+                        sx_flags: flags,
+                        sx_mask: mask,
+                    }),
+                )
+                .await?;
+            let out: FuseStatxOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            let ts = |time: FuseSxTime| {
+                if time.tv_nsec >= 1_000_000_000 {
+                    return Err(FsError::InvalidData);
+                }
+                Ok(FsStatxTimestamp {
+                    seconds: time.tv_sec,
+                    nanoseconds: time.tv_nsec,
+                })
+            };
+            Ok(FsStatx {
+                mask: out.stat.mask,
+                block_size: out.stat.blksize,
+                attributes: out.stat.attributes,
+                attributes_mask: out.stat.attributes_mask,
+                nlink: out.stat.nlink,
+                uid: out.stat.uid,
+                gid: out.stat.gid,
+                mode: out.stat.mode,
+                ino: out.stat.ino,
+                size: out.stat.size,
+                blocks: out.stat.blocks,
+                atime: ts(out.stat.atime)?,
+                btime: ts(out.stat.btime)?,
+                ctime: ts(out.stat.ctime)?,
+                mtime: ts(out.stat.mtime)?,
+                rdev_major: out.stat.rdev_major,
+                rdev_minor: out.stat.rdev_minor,
+                dev_major: out.stat.dev_major,
+                dev_minor: out.stat.dev_minor,
+            })
         })
     }
 
@@ -1131,10 +1653,15 @@ impl FileOps for FuseFile {
             }
             let fh_in = self.ensure_open().await?;
             let fh_out = target.ensure_open().await?;
+            let opcode = if self.conn.negotiated_minor() >= 45 {
+                FuseOpcode::CopyFileRange64
+            } else {
+                FuseOpcode::CopyFileRange
+            };
             let reply = self
                 .conn
                 .request(
-                    FuseOpcode::CopyFileRange,
+                    opcode,
                     self.attr.nodeid,
                     pod_as_bytes(&FuseCopyFileRangeIn {
                         fh_in,
@@ -1147,8 +1674,142 @@ impl FileOps for FuseFile {
                     }),
                 )
                 .await?;
-            let out: FuseWriteOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
-            Ok(u64::from(out.size))
+            if opcode == FuseOpcode::CopyFileRange64 {
+                let out: FuseCopyFileRangeOut =
+                    pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+                Ok(out.bytes_copied)
+            } else {
+                let out: FuseWriteOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+                Ok(u64::from(out.size))
+            }
+        })
+    }
+
+    fn ioctl_async<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        input: &'a [u8],
+        out_size: usize,
+    ) -> FsFuture<'a, FsIoctlReply> {
+        Box::pin(async move {
+            let fh = self.ensure_open().await?;
+            let in_size = u32::try_from(input.len()).map_err(|_| FsError::InvalidData)?;
+            let out_size_u32 = u32::try_from(out_size).map_err(|_| FsError::InvalidData)?;
+            let mut body = pod_as_bytes(&FuseIoctlIn {
+                fh,
+                flags: 0,
+                cmd,
+                arg,
+                in_size,
+                out_size: out_size_u32,
+            });
+            body.extend_from_slice(input);
+            let reply = self
+                .conn
+                .request(FuseOpcode::Ioctl, self.attr.nodeid, body)
+                .await?;
+            let out: FuseIoctlOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            if out.flags & FUSE_IOCTL_RETRY != 0 {
+                // Linux forbids daemon-selected retry iovecs for ordinary
+                // FUSE mounts. They are available only to unrestricted CUSE
+                // ioctls, which use a separate transport contract.
+                return Err(FsError::InvalidData);
+            }
+            if out.in_iovs != 0 || out.out_iovs != 0 {
+                return Err(FsError::InvalidData);
+            }
+            let data = reply
+                .get(core::mem::size_of::<FuseIoctlOut>()..)
+                .ok_or(FsError::InvalidData)?;
+            if data.len() > out_size {
+                return Err(FsError::InvalidData);
+            }
+            Ok(FsIoctlReply {
+                result: out.result,
+                output: data.to_vec(),
+            })
+        })
+    }
+
+    fn bmap<'a>(&'a self, block: u64, block_size: u32) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            if block_size == 0 || !block_size.is_power_of_two() {
+                return Err(FsError::InvalidData);
+            }
+            let reply = self
+                .conn
+                .request(
+                    FuseOpcode::Bmap,
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseBmapIn {
+                        block,
+                        blocksize: block_size,
+                        padding: 0,
+                    }),
+                )
+                .await?;
+            let out: FuseBmapOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(out.block)
+        })
+    }
+
+    fn setup_mapping<'a>(
+        &'a self,
+        file_offset: u64,
+        len: u64,
+        flags: u64,
+        memory_offset: u64,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if len == 0
+                || file_offset % 4096 != 0
+                || len % 4096 != 0
+                || memory_offset % 4096 != 0
+                || flags == 0
+                || flags & !(FUSE_SETUPMAPPING_FLAG_READ | FUSE_SETUPMAPPING_FLAG_WRITE) != 0
+            {
+                return Err(FsError::InvalidData);
+            }
+            let fh = self.ensure_open().await?;
+            self.conn
+                .request(
+                    FuseOpcode::SetupMapping,
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseSetupMappingIn {
+                        fh,
+                        file_offset,
+                        len,
+                        flags,
+                        memory_offset,
+                    }),
+                )
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn remove_mappings<'a>(&'a self, ranges: &'a [FsMappingRange]) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if ranges.is_empty() || ranges.len() > FUSE_REMOVEMAPPING_MAX_ENTRY {
+                return Err(FsError::InvalidData);
+            }
+            let mut body = pod_as_bytes(&FuseRemoveMappingIn {
+                count: ranges.len() as u32,
+            });
+            for range in ranges {
+                if range.len == 0 || range.memory_offset % 4096 != 0 || range.len % 4096 != 0 {
+                    return Err(FsError::InvalidData);
+                }
+                body.extend_from_slice(&pod_as_bytes(&FuseRemoveMappingOne {
+                    memory_offset: range.memory_offset,
+                    len: range.len,
+                }));
+            }
+            self.conn
+                .request(FuseOpcode::RemoveMapping, self.attr.nodeid, body)
+                .await
+                .map(|_| ())
         })
     }
 
@@ -1190,15 +1851,17 @@ impl Drop for FuseFile {
         if !self.conn.is_connected() {
             return;
         }
-        if let Some(fh) = *self.fh.lock() {
-            let body = pod_as_bytes(&FuseReleaseIn {
-                fh,
-                flags: 0,
-                release_flags: 0,
-                lock_owner: 0,
-            });
-            self.conn
-                .submit_noreply(FuseOpcode::Release, self.attr.nodeid, &body);
+        if !self.conn.no_open.load(Ordering::Acquire) {
+            if let Some(fh) = *self.fh.lock() {
+                let body = pod_as_bytes(&FuseReleaseIn {
+                    fh,
+                    flags: 0,
+                    release_flags: 0,
+                    lock_owner: 0,
+                });
+                self.conn
+                    .submit_background_noreply(FuseOpcode::Release, self.attr.nodeid, &body);
+            }
         }
         // Never forget the root (nodeid 1) — Linux keeps it pinned.
         if self.attr.nodeid != FUSE_ROOT_ID {
@@ -1224,9 +1887,59 @@ impl core::fmt::Debug for FuseDir {
 }
 
 impl FuseDir {
-    fn file_from_entry(&self, out: FuseEntryOut, fh: Option<u64>) -> Arc<dyn FileOps> {
+    async fn open_handle(&self) -> Result<Option<u64>, FsError> {
+        if self.conn.no_opendir.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match self
+            .conn
+            .request(
+                FuseOpcode::OpenDir,
+                self.nodeid,
+                pod_as_bytes(&FuseOpenIn::default()),
+            )
+            .await
+        {
+            Ok(reply) => {
+                let open: FuseOpenOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+                Ok(Some(open.fh))
+            }
+            Err(FsError::Unsupported) => {
+                self.conn.no_opendir.store(true, Ordering::Release);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn release_handle(&self, fh: Option<u64>) -> Result<(), FsError> {
+        let Some(fh) = fh else {
+            return Ok(());
+        };
+        self.conn
+            .request(
+                FuseOpcode::ReleaseDir,
+                self.nodeid,
+                pod_as_bytes(&FuseReleaseIn {
+                    fh,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    fn file_from_entry(
+        &self,
+        out: FuseEntryOut,
+        open: Option<FuseOpenOut>,
+    ) -> Result<Arc<dyn FileOps>, FsError> {
         let poll_kh = self.conn.alloc_unique();
-        Arc::new(FuseFile {
+        let passthrough = match open.as_ref() {
+            Some(reply) => self.conn.backing_for_open(reply)?,
+            None => None,
+        };
+        Ok(Arc::new(FuseFile {
             conn: Arc::clone(&self.conn),
             attr: NodeAttr {
                 nodeid: out.nodeid,
@@ -1235,11 +1948,12 @@ impl FuseDir {
                 uid: out.attr.uid,
                 gid: out.attr.gid,
             },
-            fh: IrqSafeSpinLock::new(fh),
+            fh: IrqSafeSpinLock::new(open.map(|reply| reply.fh)),
+            passthrough: IrqSafeSpinLock::new(passthrough),
             poll_kh,
             poll_registered: Arc::new(AtomicBool::new(false)),
             readiness: Arc::new(AtomicU32::new(POLL_IN | POLL_OUT)),
-        }) as Arc<dyn FileOps>
+        }) as Arc<dyn FileOps>)
     }
 
     fn dir_from_entry(&self, out: FuseEntryOut) -> Arc<dyn DirOps> {
@@ -1312,6 +2026,7 @@ impl DirOps for FuseDir {
                 conn: Arc::clone(&self.conn),
                 attr,
                 fh: IrqSafeSpinLock::new(None),
+                passthrough: IrqSafeSpinLock::new(None),
                 poll_kh,
                 poll_registered: Arc::new(AtomicBool::new(false)),
                 readiness: Arc::new(AtomicU32::new(POLL_IN | POLL_OUT)),
@@ -1338,40 +2053,21 @@ impl DirOps for FuseDir {
 
     fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            let open_reply = self
-                .conn
-                .request(
-                    FuseOpcode::OpenDir,
-                    self.nodeid,
-                    pod_as_bytes(&FuseOpenIn::default()),
-                )
-                .await?;
-            let open: FuseOpenOut = pod_from_bytes(&open_reply).ok_or(FsError::InvalidData)?;
+            let handle = self.open_handle().await?;
             let sync_result = self
                 .conn
                 .request(
                     FuseOpcode::FsyncDir,
                     self.nodeid,
                     pod_as_bytes(&FuseFsyncIn {
-                        fh: open.fh,
+                        fh: handle.unwrap_or(0),
                         fsync_flags: if data_only { FUSE_FSYNC_FDATASYNC } else { 0 },
                         padding: 0,
                     }),
                 )
                 .await
                 .map(|_| ());
-            let release_result = self
-                .conn
-                .request(
-                    FuseOpcode::ReleaseDir,
-                    self.nodeid,
-                    pod_as_bytes(&FuseReleaseIn {
-                        fh: open.fh,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map(|_| ());
+            let release_result = self.release_handle(handle).await;
             sync_result.and(release_result)
         })
     }
@@ -1394,16 +2090,8 @@ impl DirOps for FuseDir {
         Box::pin(async move {
             // FUSE_READDIR needs a directory `fh` from FUSE_OPENDIR. We
             // (re)open per enumerate — cheap and stateless for the client.
-            let openbody = pod_as_bytes(&FuseOpenIn {
-                flags: 0,
-                open_flags: 0,
-            });
-            let oreply = self
-                .conn
-                .request(FuseOpcode::OpenDir, self.nodeid, openbody)
-                .await?;
-            let oout: FuseOpenOut = pod_from_bytes(&oreply).ok_or(FsError::InvalidData)?;
-            let fh = oout.fh;
+            let handle = self.open_handle().await?;
+            let fh = handle.unwrap_or(0);
 
             let plus = self.conn.negotiated_flags() & FuseInitFlag::DoReaddirplus as u64 != 0;
             let readbody = pod_as_bytes(&FuseReadIn {
@@ -1475,16 +2163,7 @@ impl DirOps for FuseDir {
             }
 
             // Release the directory handle.
-            let rel = pod_as_bytes(&FuseReleaseIn {
-                fh,
-                flags: 0,
-                release_flags: 0,
-                lock_owner: 0,
-            });
-            let _ = self
-                .conn
-                .request(FuseOpcode::ReleaseDir, self.nodeid, rel)
-                .await;
+            let _ = self.release_handle(handle).await;
 
             Ok(out.into_iter().skip(cursor).take(max).collect())
         })
@@ -1506,7 +2185,7 @@ impl DirOps for FuseDir {
             let open: FuseOpenOut =
                 pod_from_bytes(reply.get(open_off..).ok_or(FsError::InvalidData)?)
                     .ok_or(FsError::InvalidData)?;
-            Ok(self.file_from_entry(entry, Some(open.fh)))
+            self.file_from_entry(entry, Some(open))
         })
     }
 
@@ -1552,7 +2231,7 @@ impl DirOps for FuseDir {
                 .named_request(FuseOpcode::Mknod, &prefix, &[name])
                 .await?;
             let entry: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
-            Ok(self.file_from_entry(entry, None))
+            self.file_from_entry(entry, None)
         })
     }
 
@@ -1661,13 +2340,61 @@ impl DirOps for FuseDir {
         })
     }
 
+    fn link_node<'a>(&'a self, name: &'a str, node: Arc<dyn FileOps>) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let source = node
+                .as_any()
+                .and_then(|any| any.downcast_ref::<FuseFile>())
+                .ok_or(FsError::Unsupported)?;
+            if !Arc::ptr_eq(&self.conn, &source.conn) {
+                return Err(FsError::Unsupported);
+            }
+            let reply = self
+                .named_request(
+                    FuseOpcode::Link,
+                    &pod_as_bytes(&FuseLinkIn {
+                        oldnodeid: source.attr.nodeid,
+                    }),
+                    &[name],
+                )
+                .await?;
+            let _: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(())
+        })
+    }
+
+    fn tmpfile<'a>(&'a self, mode: u32) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let body = pod_as_bytes(&FuseCreateIn {
+                flags: 2, // O_RDWR
+                mode: S_IFREG | (mode & 0o7777),
+                umask: 0,
+                open_flags: 0,
+            });
+            let reply = self
+                .conn
+                .request(FuseOpcode::Tmpfile, self.nodeid, body)
+                .await?;
+            let entry: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            let open_off = core::mem::size_of::<FuseEntryOut>();
+            let open: FuseOpenOut =
+                pod_from_bytes(reply.get(open_off..).ok_or(FsError::InvalidData)?)
+                    .ok_or(FsError::InvalidData)?;
+            self.file_from_entry(entry, Some(open))
+        })
+    }
+
+    fn supports_tmpfile(&self) -> bool {
+        true
+    }
+
     fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             let reply = self
                 .named_request(FuseOpcode::Symlink, &[], &[name, target])
                 .await?;
             let entry: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
-            Ok(self.file_from_entry(entry, None))
+            self.file_from_entry(entry, None)
         })
     }
 
@@ -1697,6 +2424,7 @@ impl FuseFs {
     /// mount's `fd=N`). The FUSE_INIT handshake must be driven separately
     /// via [`FuseFs::init`] before the FS is usable.
     pub fn new(name: impl Into<String>, conn: Arc<FuseConnection>) -> Self {
+        conn.ensure_sysfs();
         FuseFs {
             name: name.into(),
             conn,
@@ -1716,8 +2444,8 @@ impl FuseFs {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead: 0,
-            flags: FUSE_SUPPORTED_INIT_FLAGS,
-            flags2: 0,
+            flags: FUSE_SUPPORTED_INIT_FLAGS as u32,
+            flags2: (FUSE_SUPPORTED_INIT_FLAGS >> 32) as u32,
             unused: [0; 11],
         });
         // FUSE_INIT is addressed to nodeid 0.
@@ -1732,9 +2460,9 @@ impl FuseFs {
             return Err(FsError::Unsupported);
         }
         let minor = core::cmp::min(out.minor, FUSE_KERNEL_MINOR_VERSION);
-        let flags = (out.flags & FUSE_SUPPORTED_INIT_FLAGS) as u64
+        let flags = (u64::from(out.flags) & FUSE_SUPPORTED_INIT_FLAGS)
             | if out.flags & FuseInitFlag::InitExt as u32 != 0 {
-                (out.flags2 as u64) << 32
+                ((out.flags2 as u64) << 32) & FUSE_SUPPORTED_INIT_FLAGS
             } else {
                 0
             };
@@ -1748,8 +2476,50 @@ impl FuseFs {
         self.conn.negotiated_flags.store(flags, Ordering::Release);
         self.conn.max_write.store(max_write, Ordering::Release);
         self.conn.max_pages.store(max_pages, Ordering::Release);
+        if flags & FUSE_REQUEST_TIMEOUT != 0 && out.request_timeout != 0 {
+            self.conn
+                .request_timeout_secs
+                .store(core::cmp::max(out.request_timeout, 15), Ordering::Release);
+        }
+        if minor >= 13 {
+            if out.max_background != 0 {
+                self.conn
+                    .max_background
+                    .store(u32::from(out.max_background), Ordering::Release);
+            }
+            if out.congestion_threshold != 0 {
+                self.conn
+                    .congestion_threshold
+                    .store(u32::from(out.congestion_threshold), Ordering::Release);
+            }
+        }
         self.conn.initialized.store(true, Ordering::Release);
         Ok(out)
+    }
+}
+
+impl Drop for FuseConnection {
+    fn drop(&mut self) {
+        #[cfg(feature = "linux-compat")]
+        {
+            if !self.sysfs_registered.load(Ordering::Acquire) {
+                return;
+            }
+            let root = crate::sysfs::get_root();
+            if let Some(connections) = root
+                .get_child("fs")
+                .and_then(|fs| fs.get_child("fuse"))
+                .and_then(|fuse| fuse.get_child("connections"))
+            {
+                connections.remove_child(&alloc::format!("{}", self.connection_id));
+            }
+        }
+    }
+}
+
+impl Drop for FuseFs {
+    fn drop(&mut self) {
+        self.conn.send_destroy();
     }
 }
 

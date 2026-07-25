@@ -225,7 +225,14 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         };
         let subtype = fstype.strip_prefix("fuse.").unwrap_or("fuse");
         let fs = alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseFs::new(subtype, conn));
-        let _ = poll_blocking(fs.init());
+        // A mount is not usable until FUSE_INIT has negotiated a compatible
+        // protocol. Do not publish a half-initialized filesystem when the
+        // daemon rejects INIT, sends a malformed reply, disconnects, or never
+        // replies before the bounded synchronous bridge expires.
+        if !matches!(poll_blocking(fs.init()), Some(Ok(_))) {
+            ctx.set_return(fail);
+            return;
+        }
         let fs_dyn: alloc::sync::Arc<dyn narf_filesystem::FsInstance> = fs;
         return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs_dyn) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),

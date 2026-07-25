@@ -237,6 +237,12 @@ pub struct FileLock {
     pub pid: u32,
 }
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsMappingRange {
+    pub memory_offset: u64,
+    pub len: u64,
+}
+
 /// A file's ownership triplet for a POSIX access check.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FileOwner {
@@ -373,6 +379,43 @@ impl From<CapError> for FsError {
 /// Future returned by every async file/dir op.
 pub type FsFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, FsError>> + Send + 'a>>;
 
+/// Result of an asynchronous filesystem-backed ioctl.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsIoctlReply {
+    pub result: i32,
+    pub output: Vec<u8>,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsStatxTimestamp {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+
+/// Rich Linux statx metadata supplied by filesystems which preserve it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsStatx {
+    pub mask: u32,
+    pub block_size: u32,
+    pub attributes: u64,
+    pub attributes_mask: u64,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u16,
+    pub ino: u64,
+    pub size: u64,
+    pub blocks: u64,
+    pub atime: FsStatxTimestamp,
+    pub btime: FsStatxTimestamp,
+    pub ctime: FsStatxTimestamp,
+    pub mtime: FsStatxTimestamp,
+    pub rdev_major: u32,
+    pub rdev_minor: u32,
+    pub dev_major: u32,
+    pub dev_minor: u32,
+}
+
 // ── Directory entry ────────────────────────────────────────────────
 
 /// One entry returned by `DirOps::iter`. Stage 3 keeps the name as
@@ -433,6 +476,10 @@ pub trait FileOps: Send + Sync {
     /// Asynchronous stat — required for disk-backed or remote FS.
     fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
         Box::pin(async move { Ok(self.stat()) })
+    }
+
+    fn statx_async<'a>(&'a self, _flags: u32, _mask: u32) -> FsFuture<'a, FsStatx> {
+        Box::pin(async { Err(FsError::Unsupported) })
     }
 
     /// Resize the file to exactly `len` bytes. Growing zero-fills;
@@ -523,6 +570,24 @@ pub trait FileOps: Send + Sync {
         Box::pin(async { Err(FsError::Unsupported) })
     }
 
+    fn bmap<'a>(&'a self, _block: u64, _block_size: u32) -> FsFuture<'a, u64> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn setup_mapping<'a>(
+        &'a self,
+        _file_offset: u64,
+        _len: u64,
+        _flags: u64,
+        _memory_offset: u64,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn remove_mappings<'a>(&'a self, _ranges: &'a [FsMappingRange]) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
     /// POSIX-2017 `poll(2)` readiness query. Returns the OR of
     /// the POLL_* bits below for the events currently satisfied
     /// on this file. The default returns `POLL_IN | POLL_OUT`
@@ -588,6 +653,21 @@ pub trait FileOps: Send + Sync {
     /// `include/linux/fs.h::file_operations.unlocked_ioctl`.
     fn ioctl(&self, _cmd: u32, _arg: usize) -> Result<u64, FsError> {
         Err(FsError::Unsupported)
+    }
+
+    /// Asynchronous ioctl transport for remote filesystems such as FUSE.
+    ///
+    /// `input` and `out_size` are derived from Linux `_IOC_DIR/_IOC_SIZE`;
+    /// `arg` is retained in the FUSE request for daemon compatibility but is
+    /// never dereferenced by the filesystem layer.
+    fn ioctl_async<'a>(
+        &'a self,
+        _cmd: u32,
+        _arg: u64,
+        _input: &'a [u8],
+        _out_size: usize,
+    ) -> FsFuture<'a, FsIoctlReply> {
+        Box::pin(async { Err(FsError::Unsupported) })
     }
 
     /// `mmap(2)` device backing. For a `MAP_SHARED` mapping of this
@@ -1058,6 +1138,15 @@ pub trait DirOps: Send + Sync {
     /// override it to insert the node into its directory map. `Busy` if
     /// `name` already exists (linkat never replaces an existing name).
     fn link_node<'a>(&'a self, _name: &'a str, _node: Arc<dyn FileOps>) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Create an unnamed regular inode owned by this filesystem.
+    ///
+    /// The returned node can later be materialised with [`DirOps::link_node`].
+    /// Filesystems which only support named creation retain the
+    /// `Unsupported` default.
+    fn tmpfile<'a>(&'a self, _mode: u32) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 

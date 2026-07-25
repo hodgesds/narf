@@ -878,7 +878,18 @@ fn open_impl(
     if flags & O_TMPFILE_BIT != 0 && mnt_len == 0 {
         match resolve_dir_absolute(path) {
             Some(dir) if dir.supports_tmpfile() => {
-                let node = narf_filesystem::new_anon_memfile();
+                let node = match poll_blocking(dir.tmpfile(0o600)) {
+                    Some(Ok(node)) => node,
+                    Some(Err(narf_filesystem::FsError::Unsupported)) => {
+                        // memfs predates the generic tmpfile hook and can
+                        // safely accept the anonymous in-memory node.
+                        narf_filesystem::new_anon_memfile()
+                    }
+                    _ => {
+                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        return;
+                    }
+                };
                 let new_fd = fd::with_table(task, |t| {
                     t.open(crate::fd::FdEntry {
                         ops: node,
