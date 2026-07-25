@@ -2934,6 +2934,18 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
         }
         // FUSE_ACCESS.
         34 => Some(fuse_reply(unique, 0, &[])),
+        // FUSE_GETLK reports unlocked; SETLK/SETLKW acknowledge.
+        31 => Some(fuse_reply(
+            unique,
+            0,
+            &pod_as_bytes(&FuseLkOut {
+                lk: FuseFileLock {
+                    type_: 2, // F_UNLCK
+                    ..Default::default()
+                },
+            }),
+        )),
+        32 | 33 => Some(fuse_reply(unique, 0, &[])),
         // FUSE_WRITE (16): report the requested payload size.
         16 => {
             let win: FuseWriteIn = pod_from_bytes(body)?;
@@ -3287,6 +3299,45 @@ fn smoke_fs_fuse_mutations() -> TestResult {
             || file.list_xattr().await != Ok(b"user.foo\0".to_vec())
             || file.remove_xattr("user.foo").await.is_err()
             || file.access(6).await.is_err()
+            || file
+                .set_lock(
+                    7,
+                    crate::FileLock {
+                        start: 0,
+                        end: 99,
+                        type_: 1,
+                        pid: 7,
+                    },
+                    false,
+                )
+                .await
+                .is_err()
+            || file
+                .set_lock(
+                    7,
+                    crate::FileLock {
+                        start: 0,
+                        end: 99,
+                        type_: 1,
+                        pid: 7,
+                    },
+                    true,
+                )
+                .await
+                .is_err()
+            || file
+                .get_lock(
+                    7,
+                    crate::FileLock {
+                        start: 0,
+                        end: 99,
+                        type_: 1,
+                        pid: 7,
+                    },
+                )
+                .await
+                .map(|lock| lock.type_)
+                != Ok(2)
         {
             OUTCOME.store(4, Ordering::Relaxed);
             return;

@@ -35,8 +35,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fuse::*;
 use crate::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, FsStat, Mode, Stat,
-    POLL_IN, POLL_OUT,
+    DirEntry, DirOps, FileLock, FileOps, FileType, FsError, FsFuture, FsInstance, FsStat, Mode,
+    Stat, POLL_IN, POLL_OUT,
 };
 
 /// A completed reply from the daemon: the `error` field of the
@@ -316,7 +316,7 @@ fn errno_to_fs_error(neg_errno: i32) -> FsError {
         1 => FsError::PermissionDenied,       // EPERM
         2 => FsError::NotFound,               // ENOENT
         13 => FsError::PermissionDenied,      // EACCES
-        16 | 17 | 39 => FsError::Busy,        // EBUSY / EEXIST / ENOTEMPTY
+        11 | 16 | 17 | 39 => FsError::Busy,   // EAGAIN / EBUSY / EEXIST / ENOTEMPTY
         20 | 21 | 36 => FsError::InvalidPath, // ENOTDIR / EISDIR / ENAMETOOLONG
         22 => FsError::InvalidData,           // EINVAL
         28 => FsError::NoSpace,               // ENOSPC
@@ -734,6 +734,65 @@ impl FileOps for FuseFile {
                     FuseOpcode::Access,
                     self.attr.nodeid,
                     pod_as_bytes(&FuseAccessIn { mask, padding: 0 }),
+                )
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn get_lock<'a>(&'a self, owner: u64, lock: FileLock) -> FsFuture<'a, FileLock> {
+        Box::pin(async move {
+            let fh = self.ensure_open().await?;
+            let reply = self
+                .conn
+                .request(
+                    FuseOpcode::Getlk,
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseLkIn {
+                        fh,
+                        owner,
+                        lk: FuseFileLock {
+                            start: lock.start,
+                            end: lock.end,
+                            type_: lock.type_,
+                            pid: lock.pid,
+                        },
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+            let out: FuseLkOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(FileLock {
+                start: out.lk.start,
+                end: out.lk.end,
+                type_: out.lk.type_,
+                pid: out.lk.pid,
+            })
+        })
+    }
+
+    fn set_lock<'a>(&'a self, owner: u64, lock: FileLock, wait: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let fh = self.ensure_open().await?;
+            self.conn
+                .request(
+                    if wait {
+                        FuseOpcode::Setlkw
+                    } else {
+                        FuseOpcode::Setlk
+                    },
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseLkIn {
+                        fh,
+                        owner,
+                        lk: FuseFileLock {
+                            start: lock.start,
+                            end: lock.end,
+                            type_: lock.type_,
+                            pid: lock.pid,
+                        },
+                        ..Default::default()
+                    }),
                 )
                 .await
                 .map(|_| ())

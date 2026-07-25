@@ -187,6 +187,11 @@ perform daemon-side authorization. FUSE translates it to `FUSE_ACCESS`;
 the syscall layer falls back to the inode owner/mode check only when the
 filesystem reports that native access checks are unsupported.
 
+`FileOps::get_lock` and `FileOps::set_lock` carry inclusive byte ranges,
+lock owner IDs, type, and blocking intent. FUSE maps these to GETLK,
+SETLK, and SETLKW with the daemon file handle; local filesystems retain
+the kernel advisory-lock table fallback.
+
 Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with
 `FsError::InvalidData`; a disconnected daemon fails pending requests

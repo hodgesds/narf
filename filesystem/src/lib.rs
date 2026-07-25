@@ -229,6 +229,14 @@ pub struct FsStat {
     pub fragment_size: u32,
 }
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileLock {
+    pub start: u64,
+    pub end: u64,
+    pub type_: u32,
+    pub pid: u32,
+}
+
 /// A file's ownership triplet for a POSIX access check.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FileOwner {
@@ -480,6 +488,14 @@ pub trait FileOps: Send + Sync {
 
     /// Ask the backing filesystem to authorize Linux R_OK/W_OK/X_OK bits.
     fn access<'a>(&'a self, _mask: u32) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn get_lock<'a>(&'a self, _owner: u64, _lock: FileLock) -> FsFuture<'a, FileLock> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn set_lock<'a>(&'a self, _owner: u64, _lock: FileLock, _wait: bool) -> FsFuture<'a, ()> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
 

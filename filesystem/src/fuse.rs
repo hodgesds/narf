@@ -47,6 +47,9 @@ pub enum FuseOpcode {
     ReadDir = 28,
     ReleaseDir = 29,
     FsyncDir = 30,
+    Getlk = 31,
+    Setlk = 32,
+    Setlkw = 33,
     Access = 34,
     Create = 35,
     Destroy = 38,
@@ -396,6 +399,31 @@ pub struct FuseGetxattrOut {
 pub struct FuseAccessIn {
     pub mask: u32,
     pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FuseFileLock {
+    pub start: u64,
+    pub end: u64,
+    pub type_: u32,
+    pub pid: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseLkIn {
+    pub fh: u64,
+    pub owner: u64,
+    pub lk: FuseFileLock,
+    pub lk_flags: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseLkOut {
+    pub lk: FuseFileLock,
 }
 
 /// `struct fuse_forget_in` — FORGET request body: the drop count for a
