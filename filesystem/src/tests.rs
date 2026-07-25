@@ -2946,6 +2946,28 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
             }),
         )),
         32 | 33 => Some(fuse_reply(unique, 0, &[])),
+        43 => Some(fuse_reply(unique, 0, &[])),
+        46 => {
+            let input: FuseLseekIn = pod_from_bytes(body)?;
+            Some(fuse_reply(
+                unique,
+                0,
+                &pod_as_bytes(&FuseLseekOut {
+                    offset: input.offset + 4,
+                }),
+            ))
+        }
+        47 => {
+            let input: FuseCopyFileRangeIn = pod_from_bytes(body)?;
+            Some(fuse_reply(
+                unique,
+                0,
+                &pod_as_bytes(&FuseWriteOut {
+                    size: input.len as u32,
+                    padding: 0,
+                }),
+            ))
+        }
         // FUSE_WRITE (16): report the requested payload size.
         16 => {
             let win: FuseWriteIn = pod_from_bytes(body)?;
@@ -3338,6 +3360,9 @@ fn smoke_fs_fuse_mutations() -> TestResult {
                 .await
                 .map(|lock| lock.type_)
                 != Ok(2)
+            || file.fallocate(0, 0, 4096).await.is_err()
+            || file.seek(4, 3).await != Ok(8)
+            || file.copy_file_range_to(0, &*file, 8, 16, 0).await != Ok(16)
         {
             OUTCOME.store(4, Ordering::Relaxed);
             return;

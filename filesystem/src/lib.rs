@@ -499,6 +499,25 @@ pub trait FileOps: Send + Sync {
         Box::pin(async { Err(FsError::Unsupported) })
     }
 
+    fn fallocate<'a>(&'a self, _mode: u32, _offset: u64, _len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn seek<'a>(&'a self, _offset: u64, _whence: u32) -> FsFuture<'a, u64> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn copy_file_range_to<'a>(
+        &'a self,
+        _off_in: u64,
+        _out: &'a dyn FileOps,
+        _off_out: u64,
+        _len: u64,
+        _flags: u64,
+    ) -> FsFuture<'a, u64> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
     /// POSIX-2017 `poll(2)` readiness query. Returns the OR of
     /// the POLL_* bits below for the events currently satisfied
     /// on this file. The default returns `POLL_IN | POLL_OUT`

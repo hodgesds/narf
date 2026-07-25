@@ -798,6 +798,90 @@ impl FileOps for FuseFile {
                 .map(|_| ())
         })
     }
+
+    fn fallocate<'a>(&'a self, mode: u32, offset: u64, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let fh = self.ensure_open().await?;
+            self.conn
+                .request(
+                    FuseOpcode::Fallocate,
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseFallocateIn {
+                        fh,
+                        offset,
+                        length: len,
+                        mode,
+                        padding: 0,
+                    }),
+                )
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn seek<'a>(&'a self, offset: u64, whence: u32) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            let fh = self.ensure_open().await?;
+            let reply = self
+                .conn
+                .request(
+                    FuseOpcode::Lseek,
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseLseekIn {
+                        fh,
+                        offset,
+                        whence,
+                        padding: 0,
+                    }),
+                )
+                .await?;
+            let out: FuseLseekOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(out.offset)
+        })
+    }
+
+    fn copy_file_range_to<'a>(
+        &'a self,
+        off_in: u64,
+        out: &'a dyn FileOps,
+        off_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            let target = out
+                .as_any()
+                .and_then(|any| any.downcast_ref::<FuseFile>())
+                .ok_or(FsError::Unsupported)?;
+            if !Arc::ptr_eq(&self.conn, &target.conn) {
+                return Err(FsError::Unsupported);
+            }
+            let fh_in = self.ensure_open().await?;
+            let fh_out = target.ensure_open().await?;
+            let reply = self
+                .conn
+                .request(
+                    FuseOpcode::CopyFileRange,
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseCopyFileRangeIn {
+                        fh_in,
+                        off_in,
+                        nodeid_out: target.attr.nodeid,
+                        fh_out,
+                        off_out,
+                        len,
+                        flags,
+                    }),
+                )
+                .await?;
+            let out: FuseWriteOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(u64::from(out.size))
+        })
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
 }
 
 impl Drop for FuseFile {

@@ -53,7 +53,10 @@ pub enum FuseOpcode {
     Access = 34,
     Create = 35,
     Destroy = 38,
+    Fallocate = 43,
     Rename2 = 45,
+    Lseek = 46,
+    CopyFileRange = 47,
 }
 
 /// Header prepended to every FUSE request. Matches the wire layout
@@ -424,6 +427,43 @@ pub struct FuseLkIn {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct FuseLkOut {
     pub lk: FuseFileLock,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseFallocateIn {
+    pub fh: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub mode: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseLseekIn {
+    pub fh: u64,
+    pub offset: u64,
+    pub whence: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseLseekOut {
+    pub offset: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseCopyFileRangeIn {
+    pub fh_in: u64,
+    pub off_in: u64,
+    pub nodeid_out: u64,
+    pub fh_out: u64,
+    pub off_out: u64,
+    pub len: u64,
+    pub flags: u64,
 }
 
 /// `struct fuse_forget_in` — FORGET request body: the drop count for a

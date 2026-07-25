@@ -11,26 +11,51 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
     // result → -EINVAL (was a blanket InvalidOp).
     let ebadf = SyscallReturn::ok((-9i64) as u64);
     let einval = SyscallReturn::ok((-22i64) as u64);
-    let outcome = fd::with_table(task, |t| {
-        let entry = match t.get_mut(fd) {
-            Some(e) => e,
-            None => return Some(ebadf),
-        };
+    let resolved = fd::with_table(task, |t| t.get(fd).map(|e| (e.ops.clone(), e.offset)));
+    let (ops, current) = match resolved {
+        Some(Some(v)) => v,
+        _ => {
+            ctx.set_return(ebadf);
+            return;
+        }
+    };
+    const SEEK_DATA: u64 = 3;
+    const SEEK_HOLE: u64 = 4;
+    if offset >= 0 && (whence == SEEK_DATA || whence == SEEK_HOLE) {
+        match poll_blocking(ops.seek(offset as u64, whence as u32)) {
+            Some(Ok(new_off)) => {
+                let _ = fd::with_table(task, |t| t.get_mut(fd).map(|entry| entry.offset = new_off));
+                ctx.set_return(SyscallReturn::ok(new_off));
+                return;
+            }
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+            _ => {
+                ctx.set_return(einval);
+                return;
+            }
+        }
+    }
+    let outcome = {
         let base = match whence {
             SEEK_SET => 0i64,
-            SEEK_CUR => entry.offset as i64,
-            SEEK_END => entry.ops.stat().size as i64,
-            _ => return Some(einval),
+            SEEK_CUR => current as i64,
+            SEEK_END => ops.stat().size as i64,
+            _ => {
+                ctx.set_return(einval);
+                return;
+            }
         };
         let new_off = match base.checked_add(offset) {
             Some(v) if v >= 0 => v,
-            _ => return Some(einval),
+            _ => {
+                ctx.set_return(einval);
+                return;
+            }
         };
-        entry.offset = new_off as u64;
-        Some(SyscallReturn::ok(new_off as u64))
-    });
-    match outcome {
-        Some(Some(r)) => ctx.set_return(r),
-        _ => ctx.set_return(ebadf),
-    }
+        let _ = fd::with_table(task, |t| {
+            t.get_mut(fd).map(|entry| entry.offset = new_off as u64)
+        });
+        SyscallReturn::ok(new_off as u64)
+    };
+    ctx.set_return(outcome);
 }

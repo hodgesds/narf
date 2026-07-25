@@ -18,6 +18,11 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
         let ops = entry.ops.clone();
+        match poll_blocking(ops.fallocate(mode as u32, offset, len)) {
+            Some(Ok(())) => return Some(true),
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+            _ => return Some(false),
+        }
         let cur_size = ops.stat().size;
         // Always ensure size >= offset + len. truncate handles
         // grow + zero-fill.

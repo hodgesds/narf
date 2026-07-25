@@ -57,6 +57,29 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
         }
     };
 
+    match poll_blocking(in_ops.copy_file_range_to(cur_in, &*out_ops, cur_out, len as u64, flags)) {
+        Some(Ok(n)) => {
+            cur_in = cur_in.saturating_add(n);
+            cur_out = cur_out.saturating_add(n);
+            update_copy_offsets(
+                task,
+                fd_in,
+                off_in_ptr,
+                cur_in,
+                fd_out,
+                off_out_ptr,
+                cur_out,
+            );
+            ctx.set_return(SyscallReturn::ok(n));
+            return;
+        }
+        Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+            return;
+        }
+    }
+
     let mut chunk = [0u8; 4096];
     let mut copied = 0usize;
     while copied < len {
@@ -84,6 +107,28 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     // A NULL offset pointer means the copy consumed the fd's own file
     // offset, so advance it; a non-NULL pointer leaves the cursor alone
     // and gets the advanced value written back instead.
+    update_copy_offsets(
+        task,
+        fd_in,
+        off_in_ptr,
+        cur_in,
+        fd_out,
+        off_out_ptr,
+        cur_out,
+    );
+
+    ctx.set_return(SyscallReturn::ok(copied as u64));
+}
+
+fn update_copy_offsets(
+    task: u64,
+    fd_in: u32,
+    off_in_ptr: u64,
+    cur_in: u64,
+    fd_out: u32,
+    off_out_ptr: u64,
+    cur_out: u64,
+) {
     let _ = fd::with_table(task, |t| {
         if off_in_ptr == 0 {
             if let Some(e) = t.get_mut(fd_in) {
@@ -103,6 +148,4 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     if off_out_ptr != 0 {
         write_user_u64(off_out_ptr, cur_out);
     }
-
-    ctx.set_return(SyscallReturn::ok(copied as u64));
 }

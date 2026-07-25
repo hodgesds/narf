@@ -192,6 +192,12 @@ lock owner IDs, type, and blocking intent. FUSE maps these to GETLK,
 SETLK, and SETLKW with the daemon file handle; local filesystems retain
 the kernel advisory-lock table fallback.
 
+`FileOps::fallocate`, `seek`, and `copy_file_range_to` expose native
+range operations. FUSE maps these to FALLOCATE, LSEEK (for SEEK_DATA /
+SEEK_HOLE), and COPY_FILE_RANGE when both files share one connection;
+the syscall layer retains truncate/zero, generic seek, and buffered-copy
+fallbacks for filesystems that return `Unsupported`.
+
 Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with
 `FsError::InvalidData`; a disconnected daemon fails pending requests
