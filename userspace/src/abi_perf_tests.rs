@@ -87,6 +87,40 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             _ => return Err("perf_event_open(invalid type) did not return ENOENT"),
         }
 
+        // aarch64 currently has only the cycle-counting backend. It must not
+        // accept programmable events and return plausible-looking zeroes.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let instructions_attr = perf_event_attr {
+                config: 1, // PERF_COUNT_HW_INSTRUCTIONS
+                ..attr
+            };
+            match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(
+                    &instructions_attr as *const _ as u64,
+                    0,
+                    -1i32 as u64,
+                    -1i32 as u64,
+                ),
+            ) {
+                Some(EOPNOTSUPP) => {}
+                _ => return Err("aarch64 accepted an unimplemented programmable PMU event"),
+            }
+            let raw_attr = perf_event_attr {
+                type_: 4, // PERF_TYPE_RAW
+                config: 0x08,
+                ..attr
+            };
+            match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(&raw_attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+            ) {
+                Some(EOPNOTSUPP) => {}
+                _ => return Err("aarch64 accepted an unimplemented raw PMU event"),
+            }
+        }
+
         // Test 6: Unknown flags -> expect EINVAL (-22)
         match call(
             Syscall::PerfEventOpen.raw(),

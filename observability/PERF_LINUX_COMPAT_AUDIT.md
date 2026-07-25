@@ -78,9 +78,10 @@ Gaps:
 - `time_enabled` and `time_running` are currently equal. That is correct only
   while no multiplexing occurs. Counter multiplexing must report the actual
   running interval before more events than hardware slots can be accepted.
-- x86 raw encodings are model-specific. Sysfs PMU format/event aliases must be
-  generated from the detected CPU before the CLI can safely use symbolic raw
-  aliases.
+- Raw PMU formats are architecture-specific: sysfs exposes the x86
+  event/unit-mask controls or the aarch64 16-bit architectural event number.
+  Model-specific event aliases must still be generated from the detected CPU
+  before the CLI can safely use symbolic raw aliases.
 - aarch64 has architectural cycle access in observability but does not yet
   provide the programmable-event backend needed for instructions/cache/branch
   events through this adapter.

@@ -848,13 +848,19 @@ fn smoke_sysfs_perf_event_sources() -> TestResult {
         Some(cpu) => cpu,
         None => return TestResult::Fail("cpu PMU directory missing"),
     };
+    let format = match cpu.get_child("format") {
+        Some(format) => format,
+        None => return TestResult::Fail("cpu PMU format directory missing"),
+    };
+    #[cfg(target_arch = "x86_64")]
+    let format_valid = format.attr_show("event").as_deref() == Some("config:0-7\n")
+        && format.attr_show("umask").as_deref() == Some("config:8-15\n");
+    #[cfg(target_arch = "aarch64")]
+    let format_valid = format.attr_show("event").as_deref() == Some("config:0-15\n")
+        && format.attr_show("umask").is_none();
     if cpu.attr_show("type").as_deref() != Some("4\n")
         || cpu.attr_show("cpumask").is_none()
-        || cpu
-            .get_child("format")
-            .and_then(|f| f.attr_show("event"))
-            .as_deref()
-            != Some("config:0-7\n")
+        || !format_valid
     {
         return TestResult::Fail("cpu PMU discovery attributes invalid");
     }

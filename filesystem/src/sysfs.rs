@@ -1491,12 +1491,17 @@ pub fn populate_perf_event_sources() {
     let cpumask = cpu_range_string(smp::cpu_count().max(1));
     kobject_add_attr(&cpu, "cpumask", move || cpumask.clone());
     let format = get_or_create_child(&cpu, "format");
-    kobject_add_attr(&format, "event", || "config:0-7\n".to_string());
-    kobject_add_attr(&format, "umask", || "config:8-15\n".to_string());
-    kobject_add_attr(&format, "edge", || "config:18\n".to_string());
-    kobject_add_attr(&format, "any", || "config:21\n".to_string());
-    kobject_add_attr(&format, "inv", || "config:23\n".to_string());
-    kobject_add_attr(&format, "cmask", || "config:24-31\n".to_string());
+    #[cfg(target_arch = "x86_64")]
+    {
+        kobject_add_attr(&format, "event", || "config:0-7\n".to_string());
+        kobject_add_attr(&format, "umask", || "config:8-15\n".to_string());
+        kobject_add_attr(&format, "edge", || "config:18\n".to_string());
+        kobject_add_attr(&format, "any", || "config:21\n".to_string());
+        kobject_add_attr(&format, "inv", || "config:23\n".to_string());
+        kobject_add_attr(&format, "cmask", || "config:24-31\n".to_string());
+    }
+    #[cfg(target_arch = "aarch64")]
+    kobject_add_attr(&format, "event", || "config:0-15\n".to_string());
 
     let software = get_or_create_child(&devices, "software");
     kobject_add_attr(&software, "type", || "1\n".to_string());
