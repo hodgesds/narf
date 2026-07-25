@@ -727,6 +727,11 @@ impl SocketFile {
         Ok(())
     }
 
+    #[doc(hidden)]
+    pub fn __test_has_netlink_admin(&self) -> bool {
+        self.netlink_admin.lock().is_some()
+    }
+
     fn broadcast_netlink_route(group: u32, message: &[u8]) {
         let mut sockets = NETLINK_SOCKETS.lock();
         sockets.retain(|weak| {
@@ -1159,6 +1164,10 @@ pub fn parse_sockaddr_in(addr: &SockAddr) -> Option<(u32, u16)> {
 }
 
 impl FileOps for SocketFile {
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             // POSIX `read` on a socket == `recv` with flags=0.

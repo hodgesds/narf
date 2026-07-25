@@ -18874,3 +18874,89 @@ fn smoke_uaccess_guarded_copy_faults_to_efault() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_uaccess_guarded_copy_faults_to_efault);
+fn smoke_stack_admin_delegates_only_to_current_route_socket() -> TestResult {
+    use narf_capabilities::{Cap, Invoke};
+    use narf_net::{StackAttach, StackDaemon};
+
+    const TASK: u64 = 0x4E45_544C;
+    fn task_lookup() -> u64 {
+        TASK
+    }
+
+    let iface_name = "lo.userspace-admin-delegate";
+    narf_scheduler::__reset_queues_for_test();
+    narf_net::bypass::__reset_for_test();
+    if narf_net::registry()
+        .with_interface(iface_name, |_| ())
+        .is_none()
+    {
+        let authority = narf_net::bootstrap_authority();
+        if narf_net::register_loopback_named(&authority, iface_name).is_err() {
+            return TestResult::Fail("failed to register delegation test interface");
+        }
+    }
+    let iface = narf_net::registry()
+        .with_handle(iface_name, |handle| *handle)
+        .expect("registered interface handle");
+    let request = StackAttach {
+        iface,
+        daemon: Cap::<StackDaemon, Invoke>::bootstrap(),
+    };
+    let umem = match narf_net::bypass::Umem::register(8192, 2048) {
+        Ok(umem) => umem,
+        Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
+    };
+    let parts = narf_net::bypass::XdpSocket::create(umem);
+    let reply = match narf_net::stack::attach_registered(&request, parts.socket) {
+        Ok(reply) => reply,
+        Err(_) => return TestResult::Fail("registered stack attach failed"),
+    };
+
+    crate::install_task_id_lookup(task_lookup);
+    crate::fd::__test_reset();
+    crate::fd::init();
+    let route = crate::socket::SocketFile::with_protocol(
+        crate::socket::AF_NETLINK,
+        crate::socket::SOCK_RAW,
+        crate::socket::NETLINK_ROUTE,
+    );
+    let inet = crate::socket::SocketFile::new(crate::socket::AF_INET, crate::socket::SOCK_DGRAM);
+    let (route_fd, inet_fd) = crate::fd::with_table(TASK, |table| {
+        let route_fd = table.open(crate::fd::FdEntry {
+            ops: route.clone(),
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        });
+        let inet_fd = table.open(crate::fd::FdEntry {
+            ops: inet,
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        });
+        (route_fd, inet_fd)
+    })
+    .expect("current task fd table");
+
+    if crate::delegate_stack_admin_to_route_socket(inet_fd, &reply)
+        != Err(crate::socket::SockError::InvalidArg)
+    {
+        return TestResult::Fail("admin delegated to a non-route socket");
+    }
+    if crate::delegate_stack_admin_to_route_socket(route_fd, &reply).is_err() {
+        return TestResult::Fail("route-socket admin delegation failed");
+    }
+    if !route.__test_has_netlink_admin() {
+        return TestResult::Fail("route socket did not retain delegated admin");
+    }
+    if crate::delegate_stack_admin_to_route_socket(route_fd + 1000, &reply)
+        != Err(crate::socket::SockError::BadFd)
+    {
+        return TestResult::Fail("delegation escaped the current task fd table");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/netlink",
+    smoke_stack_admin_delegates_only_to_current_route_socket
+);

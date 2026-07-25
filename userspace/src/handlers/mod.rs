@@ -12382,6 +12382,28 @@ fn current_socket(fd: u32) -> Option<alloc::sync::Arc<crate::socket::SocketFile>
         })
 }
 
+/// Install the kernel-held admin authority returned by a successful stack
+/// attach onto one of the calling task's route-netlink sockets.
+///
+/// This is deliberately an internal launcher/attach bridge, not a Linux
+/// syscall: no raw capability representation crosses userspace, and fd lookup
+/// is confined to the current task's table.
+pub fn delegate_stack_admin_to_route_socket(
+    fd: u32,
+    reply: &narf_net::StackAttachReply,
+) -> Result<(), crate::socket::SockError> {
+    let task = current_task_id();
+    let entry = fd::with_table(task, |table| table.get(fd).cloned())
+        .flatten()
+        .ok_or(crate::socket::SockError::BadFd)?;
+    let socket = entry
+        .ops
+        .as_any()
+        .and_then(|ops| ops.downcast_ref::<crate::socket::SocketFile>())
+        .ok_or(crate::socket::SockError::BadFd)?;
+    socket.delegate_netlink_admin(reply.admin.clone())
+}
+
 // Side table to enable Arc<dyn FileOps> -> Arc<SocketFile> recovery.
 // `fd::FdEntry` stores Arc<dyn FileOps>; `dyn FileOps` is not
 // `Any`, so a downcast isn't possible. Stage-1: register the
