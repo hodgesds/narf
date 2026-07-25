@@ -10,12 +10,29 @@ if [ ! -e /dev/kvm ]; then
     exit 0
 fi
 
-XTASK_QEMU_NO_BALLOON=1 \
-NARF_QEMU_MEM_MB=2048 \
-XTASK_QEMU_ACCEL=kvm \
-NARF_QEMU_CPU=host \
-XTASK_RI_PROMPT_TIMEOUT_SECS=180 \
-XTASK_RI_ECHO_TIMEOUT_SECS=300 \
-cargo xtask run-interactive \
-    --cmd "busybox chroot /mnt /bin/sh -c 'perf record -e cycles -- /bin/busybox dd if=/dev/zero of=/dev/null bs=1048576 count=1024; perf report --stdio'" \
-    --expect "# Samples:"
+run_record() {
+    mode=$1
+    record_marker=$2
+    XTASK_QEMU_NO_BALLOON=1 \
+    NARF_QEMU_MEM_MB=2048 \
+    XTASK_QEMU_ACCEL=kvm \
+    NARF_QEMU_CPU=host \
+    XTASK_RI_PROMPT_TIMEOUT_SECS=180 \
+    XTASK_RI_ECHO_TIMEOUT_SECS=300 \
+    cargo xtask run-interactive \
+        --cmd "busybox chroot /mnt sh -c 'rm -f perf.data; perf record ${mode} -e cycles -- busybox dd if=/dev/zero of=/dev/null bs=1M count=128; echo ${record_marker}'" \
+        --expect "$record_marker"
+
+    XTASK_QEMU_NO_BALLOON=1 \
+    NARF_QEMU_MEM_MB=2048 \
+    XTASK_QEMU_ACCEL=kvm \
+    NARF_QEMU_CPU=host \
+    XTASK_RI_PROMPT_TIMEOUT_SECS=180 \
+    XTASK_RI_ECHO_TIMEOUT_SECS=300 \
+    cargo xtask run-interactive \
+        --cmd "busybox chroot /mnt sh -c 'PERF_PAGER=cat perf report --stdio >/dev/null 2>&1 && echo ROK'" \
+        --expect "ROK"
+}
+
+run_record "-c 100000" "PROK"
+run_record "-F 1000" "FROK"

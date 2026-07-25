@@ -121,3 +121,11 @@ Run the current upstream CLI gate as root:
 ```sh
 verification/data/musl-demo/TEST_perf_cli.sh
 ```
+
+On an x86_64 host with KVM PMU passthrough, the record gate validates both
+fixed-period and frequency mode and requires `perf report --stdio` to parse
+the resulting file:
+
+```sh
+verification/data/musl-demo/TEST_perf_record_kvm.sh
+```
