@@ -59,6 +59,7 @@ pub mod ipv6;
 pub mod ipv6_stack;
 pub mod mqtt;
 pub mod netfilter;
+pub mod netlink_generic;
 pub mod netlink_route;
 pub mod pkt;
 pub mod pkt_coap;
@@ -88,7 +89,10 @@ pub mod tls;
 pub mod udp_sock;
 pub mod wireguard;
 pub mod ws;
-pub use stack::{AdminCap, AttachError, StackAttach, StackAttachReply, StackDaemon};
+pub use stack::{
+    AdminCap, AdminError, AdminHandle, AdminIpv4Route, AttachError, StackAttach, StackAttachReply,
+    StackDaemon,
+};
 
 mod dhcp_dns_e2e_tests;
 mod e2e_tests;
@@ -97,6 +101,7 @@ mod tcp_timer_e2e_tests;
 mod tests;
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -328,6 +333,18 @@ struct Entry {
     handle: Cap<NetIface, Write>,
 }
 
+/// Owned control-plane view of a driver-backed interface.
+///
+/// Frame-ring endpoints remain in the registry; inventory consumers receive
+/// only immutable identity and link metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceSnapshot {
+    pub name: String,
+    pub mac: [u8; 6],
+    pub mtu: u32,
+    pub link_up: bool,
+}
+
 impl fmt::Debug for Entry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Entry")
@@ -411,6 +428,32 @@ impl Registry {
         q.iter()
             .find(|e| e.iface.name() == name)
             .map(|e| f(&e.handle))
+    }
+
+    /// Run `f` against the exact interface named by a presented registry
+    /// handle. A live handle minted for another entry does not match.
+    pub fn with_interface_for_handle<R, F>(&self, handle: &Cap<NetIface, Write>, f: F) -> Option<R>
+    where
+        F: FnOnce(&dyn Interface) -> R,
+    {
+        let q = self.inner.lock();
+        q.iter()
+            .find(|entry| entry.handle.slot() == handle.slot())
+            .map(|entry| f(&*entry.iface))
+    }
+
+    /// Snapshot every driver-backed interface without exposing its frame rings.
+    pub fn snapshots(&self) -> Vec<InterfaceSnapshot> {
+        self.inner
+            .lock()
+            .iter()
+            .map(|entry| InterfaceSnapshot {
+                name: String::from(entry.iface.name()),
+                mac: entry.iface.mac(),
+                mtu: entry.iface.mtu(),
+                link_up: entry.iface.link_up(),
+            })
+            .collect()
     }
 }
 

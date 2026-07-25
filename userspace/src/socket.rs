@@ -24,7 +24,7 @@
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -49,6 +49,14 @@ pub const AF_NETLINK: u16 = 16;
 /// (NETLINK_ADD_MEMBERSHIP, NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK, …).
 /// sd-netlink sets a handful of these best-effort right after `socket()`.
 pub const SOL_NETLINK: u32 = 270;
+pub const NETLINK_ADD_MEMBERSHIP: u32 = 1;
+pub const NETLINK_DROP_MEMBERSHIP: u32 = 2;
+pub const NETLINK_PKTINFO: u32 = 3;
+pub const NETLINK_BROADCAST_ERROR: u32 = 4;
+pub const NETLINK_NO_ENOBUFS: u32 = 5;
+pub const NETLINK_CAP_ACK: u32 = 10;
+pub const NETLINK_EXT_ACK: u32 = 11;
+pub const NETLINK_GET_STRICT_CHK: u32 = 12;
 /// `NETLINK_ROUTE` (rtnetlink) — the interface/address/route dump protocol.
 /// systemd-udevd, systemd-networkd, and `ip link`/`ip addr` open
 /// `socket(AF_NETLINK, SOCK_RAW, 0)` and send RTM_GETLINK/RTM_GETADDR dump
@@ -156,6 +164,8 @@ pub const IP_MULTICAST_TTL: u32 = 33;
 /// `fcntl(F_SETFL, O_NONBLOCK)` bit. Used by the sys_fcntl path
 /// to flip per-fd nonblock state on a SocketFile.
 pub const O_NONBLOCK: u32 = 0o4000;
+pub const MSG_PEEK: u32 = 0x02;
+pub const MSG_TRUNC: u32 = 0x20;
 
 // ── Address shape ───────────────────────────────────────────────
 
@@ -293,6 +303,13 @@ pub enum SocketOpResult {
         n: usize,
         peer: Option<SockAddr>,
     },
+    /// Datagram exceeded the caller's buffer. `copied` bytes were written;
+    /// `full_len` is returned only when the call requested `MSG_TRUNC`.
+    ReceivedTruncated {
+        copied: usize,
+        full_len: usize,
+        peer: Option<SockAddr>,
+    },
     /// Result of GetSockName / GetPeerName.
     Addr(SockAddr),
     /// Result of GetSockOpt — bytes written into the user-supplied
@@ -377,7 +394,25 @@ pub struct SocketFile {
     /// A `SO_PASSCRED` recvmsg on a DGRAM socket reports THESE (per-message
     /// identity), whereas a stream recvmsg reports the fixed `peer_cred`.
     last_recv_cred: IrqSafeSpinLock<Ucred>,
+    /// AF_NETLINK local and connected peer addresses. Port ID zero means
+    /// unbound; an explicit bind with nl_pid=0 allocates a unique ID.
+    netlink_portid: AtomicU32,
+    netlink_groups: AtomicU32,
+    netlink_peer_portid: AtomicU32,
+    netlink_peer_groups: AtomicU32,
+    netlink_pktinfo: AtomicBool,
+    netlink_broadcast_error: AtomicBool,
+    netlink_no_enobufs: AtomicBool,
+    netlink_cap_ack: AtomicBool,
+    netlink_ext_ack: AtomicBool,
+    netlink_strict_check: AtomicBool,
+    /// Explicitly delegated NARF network-control authority. Never inferred
+    /// from uid or Linux ambient capability bits.
+    netlink_admin: IrqSafeSpinLock<Option<narf_net::AdminHandle>>,
 }
+
+static NEXT_NETLINK_PORTID: AtomicU32 = AtomicU32::new(1);
+static NETLINK_SOCKETS: IrqSafeSpinLock<Vec<Weak<SocketFile>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Faithful per-socket storage for set/getsockopt values. Defaults
 /// match Linux's documented defaults. Fields that affect packet
@@ -566,6 +601,9 @@ enum SocketState {
     /// best-effort openers (systemd PID 1's audit setup) get a usable fd and
     /// proceed instead of failing the socket open with EPERM.
     NetlinkSink,
+    /// `NETLINK_GENERIC` control-family socket. Requests to `nlctrl` queue
+    /// generic-netlink family discovery replies here.
+    NetlinkGeneric { replies: VecDeque<Vec<u8>> },
 }
 
 /// One enqueued UDP-style datagram. Owns the payload bytes (UDP
@@ -614,9 +652,13 @@ impl SocketFile {
             SocketState::NetlinkRoute {
                 replies: VecDeque::new(),
             }
+        } else if domain == AF_NETLINK && protocol == NETLINK_GENERIC {
+            SocketState::NetlinkGeneric {
+                replies: VecDeque::new(),
+            }
         } else if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
-            // Any AF_NETLINK protocol NARF does not model as route/uevent
-            // (NETLINK_AUDIT=9, NETLINK_NETFILTER=12, NETLINK_GENERIC=16, …) →
+            // Any AF_NETLINK protocol NARF does not model as route/generic/uevent
+            // (NETLINK_AUDIT=9, NETLINK_NETFILTER=12, …) →
             // a coherent no-op sink. systemd PID 1 opens NETLINK_AUDIT during
             // manager setup; a hard failure here surfaced to userspace as the
             // -1 sentinel (glibc errno=EPERM) → "Failed to open netlink,
@@ -645,7 +687,7 @@ impl SocketFile {
         } else {
             SocketState::Fresh
         };
-        Arc::new(Self {
+        let socket = Arc::new(Self {
             domain,
             kind,
             protocol,
@@ -658,7 +700,121 @@ impl SocketFile {
             peer_cred: IrqSafeSpinLock::new(Ucred::default()),
             passcred: AtomicBool::new(false),
             last_recv_cred: IrqSafeSpinLock::new(Ucred::default()),
-        })
+            netlink_portid: AtomicU32::new(0),
+            netlink_groups: AtomicU32::new(0),
+            netlink_peer_portid: AtomicU32::new(0),
+            netlink_peer_groups: AtomicU32::new(0),
+            netlink_pktinfo: AtomicBool::new(false),
+            netlink_broadcast_error: AtomicBool::new(false),
+            netlink_no_enobufs: AtomicBool::new(false),
+            netlink_cap_ack: AtomicBool::new(false),
+            netlink_ext_ack: AtomicBool::new(false),
+            netlink_strict_check: AtomicBool::new(false),
+            netlink_admin: IrqSafeSpinLock::new(None),
+        });
+        if domain == AF_NETLINK {
+            NETLINK_SOCKETS.lock().push(Arc::downgrade(&socket));
+        }
+        socket
+    }
+
+    pub fn delegate_netlink_admin(&self, admin: narf_net::AdminHandle) -> Result<(), SockError> {
+        if self.domain != AF_NETLINK || self.protocol != NETLINK_ROUTE {
+            return Err(SockError::InvalidArg);
+        }
+        admin.check_live().map_err(|_| SockError::InvalidArg)?;
+        *self.netlink_admin.lock() = Some(admin);
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn __test_has_netlink_admin(&self) -> bool {
+        self.netlink_admin.lock().is_some()
+    }
+
+    fn broadcast_netlink_route(group: u32, message: &[u8]) {
+        let mut sockets = NETLINK_SOCKETS.lock();
+        sockets.retain(|weak| {
+            let Some(socket) = weak.upgrade() else {
+                return false;
+            };
+            if socket.protocol != NETLINK_ROUTE
+                || socket.netlink_groups.load(Ordering::Acquire) & group == 0
+            {
+                return true;
+            }
+            if let SocketState::NetlinkRoute { replies } = &mut *socket.state.lock() {
+                replies.push_back(message.to_vec());
+            }
+            true
+        });
+        drop(sockets);
+        narf_net::readiness::notify(0);
+    }
+
+    fn netlink_addr(addr: &SockAddr) -> Option<(u32, u32)> {
+        if addr.family != AF_NETLINK || addr.body.len() < 10 {
+            return None;
+        }
+        let pid = u32::from_ne_bytes(addr.body[2..6].try_into().ok()?);
+        let groups = u32::from_ne_bytes(addr.body[6..10].try_into().ok()?);
+        Some((pid, groups))
+    }
+
+    fn netlink_sockaddr(portid: u32, groups: u32) -> SockAddr {
+        let mut body = alloc::vec![0u8; 10];
+        body[2..6].copy_from_slice(&portid.to_ne_bytes());
+        body[6..10].copy_from_slice(&groups.to_ne_bytes());
+        SockAddr {
+            family: AF_NETLINK,
+            body,
+        }
+    }
+
+    fn ensure_netlink_portid(&self) -> u32 {
+        let current = self.netlink_portid.load(Ordering::Acquire);
+        if current != 0 {
+            return current;
+        }
+        let allocated = NEXT_NETLINK_PORTID.fetch_add(1, Ordering::Relaxed).max(1);
+        match self.netlink_portid.compare_exchange(
+            0,
+            allocated,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => allocated,
+            Err(existing) => existing,
+        }
+    }
+
+    fn bind_netlink(&self, addr: &SockAddr) -> SocketOpResult {
+        let (requested, groups) = match Self::netlink_addr(addr) {
+            Some(v) => v,
+            None => return SocketOpResult::Err(SockError::InvalidArg),
+        };
+        if self.netlink_portid.load(Ordering::Acquire) != 0 {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        let portid = if requested == 0 {
+            NEXT_NETLINK_PORTID.fetch_add(1, Ordering::Relaxed).max(1)
+        } else {
+            requested
+        };
+        self.netlink_portid.store(portid, Ordering::Release);
+        self.netlink_groups.store(groups, Ordering::Release);
+        SocketOpResult::Ok(0)
+    }
+
+    fn connect_netlink(&self, addr: &SockAddr) -> SocketOpResult {
+        let (portid, groups) = match Self::netlink_addr(addr) {
+            Some(v) => v,
+            None => return SocketOpResult::Err(SockError::InvalidArg),
+        };
+        self.ensure_netlink_portid();
+        self.netlink_peer_portid.store(portid, Ordering::Release);
+        self.netlink_peer_groups.store(groups, Ordering::Release);
+        SocketOpResult::Ok(0)
     }
 
     /// Stamp this socket end's owning credentials (see `local_cred`).
@@ -1008,6 +1164,10 @@ pub fn parse_sockaddr_in(addr: &SockAddr) -> Option<(u32, u16)> {
 }
 
 impl FileOps for SocketFile {
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             // POSIX `read` on a socket == `recv` with flags=0.
@@ -1209,7 +1369,14 @@ impl FileOps for SocketFile {
                 }
                 bits
             }
-            // No-op sink (audit/generic/netfilter): always writable (sends are
+            SocketState::NetlinkGeneric { replies } => {
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !replies.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
+            // No-op sink (audit/netfilter/etc.): always writable (sends are
             // accepted + dropped), never readable (nothing is ever queued).
             SocketState::NetlinkSink => narf_filesystem::POLL_OUT,
         }
@@ -1234,6 +1401,9 @@ impl SocketFile {
             SocketState::UnixConnected { rx, .. }
             | SocketState::InetConnected { rx, .. }
             | SocketState::Inet6Connected { rx, .. } => rx.len(),
+            SocketState::NetlinkRoute { replies } | SocketState::NetlinkGeneric { replies } => {
+                replies.front().map(Vec::len).unwrap_or(0)
+            }
             _ => 0,
         }
     }
@@ -1254,14 +1424,10 @@ impl SocketFile {
                 // up daemon". Synthesize sockaddr_nl body = nl_pad(2) +
                 // nl_pid(4, unique non-zero) + nl_groups(4).
                 if self.domain == AF_NETLINK {
-                    static NL_PID: AtomicU32 = AtomicU32::new(0);
-                    let pid = NL_PID.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                    let mut body = alloc::vec![0u8; 10];
-                    body[2..6].copy_from_slice(&pid.to_le_bytes());
-                    return SocketOpResult::Addr(SockAddr {
-                        family: AF_NETLINK,
-                        body,
-                    });
+                    return SocketOpResult::Addr(Self::netlink_sockaddr(
+                        self.netlink_portid.load(Ordering::Acquire),
+                        self.netlink_groups.load(Ordering::Acquire),
+                    ));
                 }
                 return match self.local_addr() {
                     Some(a) => SocketOpResult::Addr(a),
@@ -1281,6 +1447,12 @@ impl SocketFile {
                 };
             }
             SocketOp::GetPeerName => {
+                if self.domain == AF_NETLINK {
+                    return SocketOpResult::Addr(Self::netlink_sockaddr(
+                        self.netlink_peer_portid.load(Ordering::Acquire),
+                        self.netlink_peer_groups.load(Ordering::Acquire),
+                    ));
+                }
                 return match self.peer_addr() {
                     Some(a) => SocketOpResult::Addr(a),
                     None => SocketOpResult::Err(SockError::NotConnected),
@@ -1303,6 +1475,9 @@ impl SocketFile {
             (AF_INET6, SOCK_STREAM) => self.dispatch_inet6_stream(op),
             (AF_BYPASS, SOCK_RAW) => self.dispatch_bypass(op),
             (AF_NETLINK, _) if self.protocol == NETLINK_ROUTE => self.dispatch_netlink_route(op),
+            (AF_NETLINK, _) if self.protocol == NETLINK_GENERIC => {
+                self.dispatch_netlink_generic(op)
+            }
             (AF_NETLINK, _) if self.protocol != NETLINK_KOBJECT_UEVENT => {
                 self.dispatch_netlink_sink(op)
             }
@@ -1321,30 +1496,53 @@ impl SocketFile {
     fn dispatch_netlink_route(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             // bind(sockaddr_nl{family=16, pid, groups}) — accept any.
-            SocketOp::Bind { .. } => SocketOpResult::Ok(0),
+            SocketOp::Bind { addr } => self.bind_netlink(&addr),
+            SocketOp::Connect { addr } => self.connect_netlink(&addr),
             SocketOp::Send { buf, .. } => {
+                self.ensure_netlink_portid();
                 let sent = buf.len() as u64;
-                let msgs = narf_net::netlink_route::build_dump(buf);
+                let admin = self.netlink_admin.lock().clone();
+                let msgs = match narf_net::netlink_route::build_replies_with_options(
+                    buf,
+                    admin.as_ref(),
+                    narf_net::netlink_route::ReplyOptions {
+                        ext_ack: self.netlink_ext_ack.load(Ordering::Acquire),
+                        cap_ack: self.netlink_cap_ack.load(Ordering::Acquire),
+                        strict_check: self.netlink_strict_check.load(Ordering::Acquire),
+                    },
+                ) {
+                    Ok(msgs) => msgs,
+                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                let notifications =
+                    narf_net::netlink_route::successful_mutation_notifications(buf, &msgs);
                 {
                     let mut g = self.state.lock();
                     match &mut *g {
                         SocketState::NetlinkRoute { replies } => {
-                            for m in msgs {
-                                replies.push_back(m);
-                            }
+                            replies.extend(msgs);
                         }
                         _ => return SocketOpResult::Err(SockError::InvalidArg),
                     }
+                }
+                for (group, message) in notifications {
+                    Self::broadcast_netlink_route(group, &message);
                 }
                 // Wake a reader parked in poll/epoll on the reply queue.
                 narf_net::readiness::notify(0);
                 SocketOpResult::Ok(sent)
             }
-            SocketOp::Recv { buf, flags: _ } => {
+            SocketOp::Recv { buf, flags } => {
                 let msg = {
                     let mut g = self.state.lock();
                     match &mut *g {
-                        SocketState::NetlinkRoute { replies } => replies.pop_front(),
+                        SocketState::NetlinkRoute { replies } => {
+                            if flags & MSG_PEEK != 0 {
+                                replies.front().cloned()
+                            } else {
+                                replies.pop_front()
+                            }
+                        }
                         _ => return SocketOpResult::Err(SockError::InvalidArg),
                     }
                 };
@@ -1357,9 +1555,81 @@ impl SocketFile {
                             family: AF_NETLINK,
                             body: alloc::vec![0u8; 10],
                         };
-                        SocketOpResult::Received {
-                            n,
-                            peer: Some(peer),
+                        if n < bytes.len() {
+                            SocketOpResult::ReceivedTruncated {
+                                copied: n,
+                                full_len: bytes.len(),
+                                peer: Some(peer),
+                            }
+                        } else {
+                            SocketOpResult::Received {
+                                n,
+                                peer: Some(peer),
+                            }
+                        }
+                    }
+                    None => SocketOpResult::Err(SockError::WouldBlock),
+                }
+            }
+            SocketOp::Shutdown { how: _ } => SocketOpResult::Ok(0),
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    fn dispatch_netlink_generic(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        match op {
+            SocketOp::Bind { addr } => self.bind_netlink(&addr),
+            SocketOp::Connect { addr } => self.connect_netlink(&addr),
+            SocketOp::Send { buf, .. } => {
+                self.ensure_netlink_portid();
+                let replies = match narf_net::netlink_generic::build_replies_with_options(
+                    buf,
+                    narf_net::netlink_generic::ReplyOptions {
+                        ext_ack: self.netlink_ext_ack.load(Ordering::Acquire),
+                        cap_ack: self.netlink_cap_ack.load(Ordering::Acquire),
+                    },
+                ) {
+                    Ok(replies) => replies,
+                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                let mut state = self.state.lock();
+                match &mut *state {
+                    SocketState::NetlinkGeneric { replies: queue } => {
+                        queue.extend(replies);
+                    }
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
+                }
+                drop(state);
+                narf_net::readiness::notify(0);
+                SocketOpResult::Ok(buf.len() as u64)
+            }
+            SocketOp::Recv { buf, flags } => {
+                let message = {
+                    let mut state = self.state.lock();
+                    match &mut *state {
+                        SocketState::NetlinkGeneric { replies } => {
+                            if flags & MSG_PEEK != 0 {
+                                replies.front().cloned()
+                            } else {
+                                replies.pop_front()
+                            }
+                        }
+                        _ => return SocketOpResult::Err(SockError::InvalidArg),
+                    }
+                };
+                match message {
+                    Some(message) => {
+                        let n = buf.len().min(message.len());
+                        buf[..n].copy_from_slice(&message[..n]);
+                        let peer = Some(Self::netlink_sockaddr(0, 0));
+                        if n < message.len() {
+                            SocketOpResult::ReceivedTruncated {
+                                copied: n,
+                                full_len: message.len(),
+                                peer,
+                            }
+                        } else {
+                            SocketOpResult::Received { n, peer }
                         }
                     }
                     None => SocketOpResult::Err(SockError::WouldBlock),
@@ -1378,9 +1648,13 @@ impl SocketFile {
     fn dispatch_netlink(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             // bind(sockaddr_nl{family=16, pid, groups}) — accept any.
-            SocketOp::Bind { .. } => SocketOpResult::Ok(0),
+            SocketOp::Bind { addr } => self.bind_netlink(&addr),
+            SocketOp::Connect { addr } => self.connect_netlink(&addr),
             // udev clients never send on the monitor; accept + discard.
-            SocketOp::Send { buf, .. } => SocketOpResult::Ok(buf.len() as u64),
+            SocketOp::Send { buf, .. } => {
+                self.ensure_netlink_portid();
+                SocketOpResult::Ok(buf.len() as u64)
+            }
             SocketOp::Recv { buf, flags: _ } => {
                 let ev = {
                     let mut g = self.state.lock();
@@ -1425,9 +1699,12 @@ impl SocketFile {
     /// the socket open surface as EPERM ("Failed to open netlink, ignoring").
     fn dispatch_netlink_sink(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
-            SocketOp::Bind { .. } => SocketOpResult::Ok(0),
-            SocketOp::Connect { .. } => SocketOpResult::Ok(0),
-            SocketOp::Send { buf, .. } => SocketOpResult::Ok(buf.len() as u64),
+            SocketOp::Bind { addr } => self.bind_netlink(&addr),
+            SocketOp::Connect { addr } => self.connect_netlink(&addr),
+            SocketOp::Send { buf, .. } => {
+                self.ensure_netlink_portid();
+                SocketOpResult::Ok(buf.len() as u64)
+            }
             SocketOp::Recv { .. } => SocketOpResult::Err(SockError::WouldBlock),
             SocketOp::Shutdown { how: _ } => SocketOpResult::Ok(0),
             _ => SocketOpResult::Err(SockError::NotSupported),
@@ -1489,6 +1766,36 @@ impl SocketFile {
             }
             Ok(u32::from_ne_bytes([slot[0], slot[1], slot[2], slot[3]]))
         };
+        if level == SOL_NETLINK {
+            let value = match read_u32(value) {
+                Ok(v) => v,
+                Err(e) => return SocketOpResult::Err(e),
+            };
+            let flag = value != 0;
+            match name {
+                NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => {
+                    if !(1..=32).contains(&value) {
+                        return SocketOpResult::Err(SockError::InvalidArg);
+                    }
+                    let bit = 1u32 << (value - 1);
+                    if name == NETLINK_ADD_MEMBERSHIP {
+                        self.netlink_groups.fetch_or(bit, Ordering::AcqRel);
+                    } else {
+                        self.netlink_groups.fetch_and(!bit, Ordering::AcqRel);
+                    }
+                }
+                NETLINK_PKTINFO => self.netlink_pktinfo.store(flag, Ordering::Release),
+                NETLINK_BROADCAST_ERROR => {
+                    self.netlink_broadcast_error.store(flag, Ordering::Release)
+                }
+                NETLINK_NO_ENOBUFS => self.netlink_no_enobufs.store(flag, Ordering::Release),
+                NETLINK_CAP_ACK => self.netlink_cap_ack.store(flag, Ordering::Release),
+                NETLINK_EXT_ACK => self.netlink_ext_ack.store(flag, Ordering::Release),
+                NETLINK_GET_STRICT_CHK => self.netlink_strict_check.store(flag, Ordering::Release),
+                _ => return SocketOpResult::Err(SockError::NotSupported),
+            }
+            return SocketOpResult::Ok(0);
+        }
         // Kernel TCB pushdown: when the socket is bound to a real
         // narf_net::tcp_stack TCB, forward TCP-layer options through
         // the kernel API so the negotiation actually takes effect on
@@ -1848,11 +2155,24 @@ impl SocketFile {
             (IPPROTO_IP, IP_RECVTTL) => write_bool(buf, opts.ip_recvttl),
             (IPPROTO_IP, IP_MTU) => write_u32(buf, opts.ip_mtu),
             (IPPROTO_IP, IP_MULTICAST_TTL) => write_u32(buf, opts.ip_multicast_ttl),
-            // SOL_NETLINK options (NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK, …)
-            // are best-effort probes in sd-netlink; report the feature as off
-            // (0) rather than erroring, since an error becomes the -1 sentinel
-            // (glibc EPERM) and aborts the netlink open.
-            (SOL_NETLINK, _) => write_u32(buf, 0),
+            (SOL_NETLINK, NETLINK_PKTINFO) => {
+                write_bool(buf, self.netlink_pktinfo.load(Ordering::Acquire))
+            }
+            (SOL_NETLINK, NETLINK_BROADCAST_ERROR) => {
+                write_bool(buf, self.netlink_broadcast_error.load(Ordering::Acquire))
+            }
+            (SOL_NETLINK, NETLINK_NO_ENOBUFS) => {
+                write_bool(buf, self.netlink_no_enobufs.load(Ordering::Acquire))
+            }
+            (SOL_NETLINK, NETLINK_CAP_ACK) => {
+                write_bool(buf, self.netlink_cap_ack.load(Ordering::Acquire))
+            }
+            (SOL_NETLINK, NETLINK_EXT_ACK) => {
+                write_bool(buf, self.netlink_ext_ack.load(Ordering::Acquire))
+            }
+            (SOL_NETLINK, NETLINK_GET_STRICT_CHK) => {
+                write_bool(buf, self.netlink_strict_check.load(Ordering::Acquire))
+            }
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }

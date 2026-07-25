@@ -36,6 +36,31 @@ fn smoke_net_loopback_register() -> TestResult {
             if !link {
                 return TestResult::Fail("loopback link not up");
             }
+            let snapshots = registry().snapshots();
+            let Some(snapshot) = snapshots
+                .iter()
+                .find(|snapshot| snapshot.name == "lo.smoke-register")
+            else {
+                return TestResult::Fail("driver-backed interface missing from snapshot");
+            };
+            if snapshot.mac != mac || snapshot.mtu != mtu || snapshot.link_up != link {
+                return TestResult::Fail("driver-backed snapshot metadata mismatch");
+            }
+
+            let request = [
+                16, 0, 0, 0, // nlmsg_len
+                18, 0, // RTM_GETLINK
+                1, 3, // NLM_F_REQUEST | NLM_F_DUMP
+                1, 0, 0, 0, // sequence
+                0, 0, 0, 0, // port id
+            ];
+            let replies = crate::netlink_route::build_dump(&request);
+            if !replies
+                .iter()
+                .any(|reply| reply.windows(18).any(|w| w == b"lo.smoke-register\0"))
+            {
+                return TestResult::Fail("rtnetlink omitted driver-backed interface");
+            }
             TestResult::Pass
         }
         None => TestResult::Fail("registered interface not found by name"),
@@ -5590,31 +5615,33 @@ fn smoke_bypass_daemon_attach_succeeds() -> TestResult {
     use crate::{NetIface, StackAttach, StackDaemon};
     use narf_capabilities::{Cap, Invoke, Write};
 
-    let iface_cap: Cap<NetIface, Write> = Cap::bootstrap();
+    let iface_cap = crate::registry()
+        .with_handle("lo.bypass-attach", |handle| *handle)
+        .expect("registered interface handle");
     let daemon_cap: Cap<StackDaemon, Invoke> = Cap::bootstrap();
     let req = StackAttach {
         iface: iface_cap,
         daemon: daemon_cap,
     };
-    use crate::{Frame, RX_RING_N, TX_RING_N};
-    use alloc::string::ToString;
-    let (tx_prod, _tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
-    let (_rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
-    let stub = crate::virtio_net::VirtioNet::new(
-        "lo.bypass-attach".to_string(),
-        [0; 6],
-        1500,
-        true,
-        tx_prod,
-        rx_cons,
-    );
     let umem = match crate::bypass::Umem::register(8192, 2048) {
         Ok(u) => u,
         Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
     };
     let parts = crate::bypass::XdpSocket::create(umem);
     let socket = parts.socket.clone();
-    match crate::stack::attach(&req, &stub, socket) {
+
+    let forged_req = StackAttach {
+        iface: Cap::<NetIface, Write>::bootstrap(),
+        daemon: daemon_cap,
+    };
+    if !matches!(
+        crate::stack::attach_registered(&forged_req, socket.clone()),
+        Err(crate::AttachError::IfaceMismatch)
+    ) {
+        return TestResult::Fail("unregistered interface handle was accepted");
+    }
+
+    match crate::stack::attach_registered(&req, socket) {
         Ok(reply) => {
             if !reply.admin.is_live() {
                 return TestResult::Fail("admin cap should be live");
@@ -5628,6 +5655,37 @@ fn smoke_bypass_daemon_attach_succeeds() -> TestResult {
     }
 }
 kernel_test_in!("net/bypass", smoke_bypass_daemon_attach_succeeds);
+
+fn smoke_admin_handle_is_interface_bound() -> TestResult {
+    fn discard(_: &[u8]) -> Result<(), ()> {
+        Ok(())
+    }
+
+    let name = "admin-control-test0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 0, 1], discard);
+    let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
+    let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
+    if admin.iface_name() != name {
+        return TestResult::Fail("admin handle lost its interface binding");
+    }
+    if admin.set_link(false).is_err()
+        || admin.set_mtu(9000).is_err()
+        || admin.set_mac([0x02, 0, 0, 0, 0, 2]).is_err()
+    {
+        return TestResult::Fail("authorized interface mutation failed");
+    }
+    let Some(snapshot) = crate::iface::lookup(name) else {
+        return TestResult::Fail("controlled interface disappeared");
+    };
+    if snapshot.link_up || snapshot.mtu != 9000 || snapshot.mac != [0x02, 0, 0, 0, 0, 2] {
+        return TestResult::Fail("admin mutations did not update interface state");
+    }
+    if admin.set_mtu(67) != Err(crate::AdminError::InvalidMtu) {
+        return TestResult::Fail("invalid MTU was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/control", smoke_admin_handle_is_interface_bound);
 
 fn smoke_bypass_daemon_attach_twice_fails() -> TestResult {
     crate::bypass::__reset_for_test();

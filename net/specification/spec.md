@@ -55,6 +55,10 @@ pub fn open(id: IfaceId, rights: IfaceRights, cap: &Cap<IfaceRegistry, Bind>)
     -> Cap<NetIface, _>;
 ```
 
+The capability-gated interface registry is the canonical hardware inventory
+for the control plane. Compatibility views include every driver-backed entry,
+even when an interface has not also joined the legacy kernel IPv4 data path.
+
 ### 3.2 Frame rings
 
 ```rust
@@ -77,14 +81,22 @@ pub fn tx_ring(iface: &Cap<NetIface, Tx>, queue: u16) -> Ring<Frame>;
 ### 3.3 Control-plane operations
 
 ```rust
-pub fn set_link(iface: &Cap<NetIface, Admin>, up: bool) -> impl Future<Output=()>;
-pub fn set_mtu (iface: &Cap<NetIface, Admin>, mtu: u16) -> impl Future<Output=()>;
-pub fn set_mac (iface: &Cap<NetIface, Admin>, mac: [u8; 6]) -> impl Future<Output=()>;
+pub struct AdminHandle { /* revocable AdminCap + bound interface identity */ }
+pub fn set_link(admin: &AdminHandle, up: bool) -> Result<(), AdminError>;
+pub fn set_mtu (admin: &AdminHandle, mtu: u32) -> Result<(), AdminError>;
+pub fn set_mac (admin: &AdminHandle, mac: [u8; 6]) -> Result<(), AdminError>;
+pub fn add_ipv4(admin: &AdminHandle, addr: [u8; 4], prefix: u8) -> Result<(), AdminError>;
+pub fn del_ipv4(admin: &AdminHandle, addr: [u8; 4], prefix: u8) -> Result<(), AdminError>;
+pub fn add_ipv4_route(admin: &AdminHandle, route: Ipv4Route) -> Result<(), AdminError>;
+pub fn del_ipv4_route(admin: &AdminHandle, route: Ipv4RouteKey) -> Result<(), AdminError>;
+pub fn set_neighbor(admin: &AdminHandle, neighbor: Neighbor) -> Result<(), AdminError>;
+pub fn del_neighbor(admin: &AdminHandle, key: NeighborKey) -> Result<(), AdminError>;
 pub fn stats   (iface: &Cap<NetIface, Read>) -> IfaceStats;
 ```
 
-Admin is deliberately separate from Rx/Tx: a stack daemon needs
-Rx+Tx but usually not Admin.
+Admin is deliberately separate from Rx/Tx: a stack daemon needs Rx+Tx but
+usually not Admin. `AdminHandle` binds the revocable authority to exactly one
+interface; every operation checks current cap validity before mutation.
 
 ### 3.4 Loopback
 
@@ -98,11 +110,97 @@ RX. Used by `verification/` to test the contract without hardware.
   at boot by a maintainer's policy).
 - On attach, the daemon binds one or more interfaces and claims its
   rings.
+- The presented `Cap<NetIface, Write>` must exactly match the handle retained
+  beside that interface in the canonical driver registry. A live cap minted
+  for another or unregistered object is rejected before classifier state
+  changes.
 - Rings from hardware go **directly** into the daemon's Narf-Rings
   — the kernel does not interpose.
 - Multiple stacks can coexist (one per interface, or one per
   cap-scoped domain); each has its own rings. The kernel does not
   multiplex among them.
+
+### 3.6 Linux rtnetlink compatibility
+
+`NETLINK_ROUTE` provides Linux wire-compatible dumps for
+`RTM_GETLINK`, `RTM_GETADDR`, `RTM_GETROUTE`, `RTM_GETNEIGH`, and
+`RTM_GETRULE`, plus `RTM_GETQDISC`. Replies expose the interface registry,
+configured IPv4 addresses, IPv4 FIB, live IPv4 ARP plus IPv6 NDP neighbor
+caches, the canonical local/main/default IPv4 policy rules, and each
+interface's direct-ring `noqueue` discipline respectively,
+echo the request sequence, identify the kernel sender with port ID zero, carry
+`NLM_F_MULTI`, and terminate with `NLMSG_DONE`. Unsupported request types return
+`NLMSG_ERROR(-EOPNOTSUPP)`. Rtnetlink mutation requests are not an ambient
+administration path. A route socket must first be explicitly delegated an
+interface-bound `AdminHandle`; undelegated or cross-interface writes return
+`NLMSG_ERROR(-EPERM)`. `RTM_NEWLINK`/`RTM_SETLINK` and IPv4
+`RTM_NEWADDR`/`RTM_DELADDR` plus `RTM_NEWROUTE`/`RTM_DELROUTE` invoke the
+typed operations in §3.3. `RTM_NEWNEIGH`/`RTM_DELNEIGH` update IPv4 ARP or
+IPv6 NDP state through the same interface-bound authority.
+The stack-daemon launcher performs delegation as a kernel-held transfer from a
+successful `StackAttachReply` to a route socket in the attaching task's fd
+table. The Linux syscall surface never accepts raw admin-handle bytes.
+
+Successful mutations emit kernel-originated sequence-zero notifications to
+the Linux rtnetlink multicast group for the changed object (link, neighbor,
+IPv4 address, or IPv4 route). Only sockets subscribed through `nl_groups` or
+`NETLINK_ADD_MEMBERSHIP` receive them.
+
+Creation and replacement honor Linux `NLM_F_CREATE`, `NLM_F_EXCL`, and
+`NLM_F_REPLACE` semantics. Duplicate exclusive creates return `EEXIST`;
+replacement or deletion of missing state returns `ENOENT`.
+
+When `NETLINK_EXT_ACK` is enabled, failed requests carry
+`NLM_F_ACK_TLVS` and a `NLMSGERR_ATTR_MSG` diagnostic describing the rejected
+authority, object-state, interface, validation, or support condition.
+Without `NETLINK_CAP_ACK`, `nlmsgerr` echoes the complete offending request.
+With CAP_ACK enabled the echo is header-only and marked `NLM_F_CAPPED`; any
+extended-ACK attributes follow the capped request header.
+
+When `NETLINK_GET_STRICT_CHK` is enabled, requests must carry
+`NLM_F_REQUEST`, the Linux fixed request structure for their message type,
+and a valid family selector. Malformed strict requests return `EINVAL`.
+Non-dump `RTM_GETLINK` resolves one interface by ifindex or `IFLA_IFNAME`,
+returning a non-multipart reply or `ENODEV`.
+Non-dump `RTM_GETROUTE` performs the forwarding table's longest-prefix
+lookup for `RTA_DST`, returning the selected route as one non-multipart reply
+or `ENETUNREACH`.
+Address dumps honor `ifa_family` and `ifa_index`; route dumps honor
+`rtm_family` and `rtm_table`. A valid filter with no matching objects returns
+an empty dump terminated by `NLMSG_DONE`.
+
+Link dumps include Linux operational-state, carrier, qdisc, queue-length,
+broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero
+until a driver publishes them through the central interface registry.
+
+Collection queries for absent optional state—traffic classes, filters,
+actions, address labels, multicast database entries, and nexthops—return an
+empty multipart dump terminated by `NLMSG_DONE`.
+Link dumps merge the legacy IPv4 registry with the canonical driver-backed
+registry by interface name, so frame-ring-only drivers appear exactly once.
+
+`NETLINK_GENERIC` publishes the mandatory `nlctrl` control family.
+`CTRL_CMD_GETFAMILY` supports name lookup and dump enumeration with
+Linux-compatible attributes; unknown family names return `ENOENT`. Multiple
+aligned control requests may be batched in one datagram and retain independent
+sequence numbers.
+Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
+same capped echo and diagnostic-TLV rules as rtnetlink.
+
+AF_NETLINK sockets retain their bound `sockaddr_nl` port ID and group mask,
+support a connected kernel or userspace destination, auto-bind before the
+first send, and expose Linux `SOL_NETLINK` membership and feature-option
+round trips. Kernel-originated messages use port ID zero. A send may contain
+multiple `NLMSG_ALIGN`-framed requests; replies preserve request order and
+sequence numbers. `NLM_F_ACK` requests receive `NLMSG_ERROR` with error zero
+after successful handling, while malformed framing fails with `EINVAL`.
+`SIOCINQ`/`FIONREAD` reports the complete size of the next queued route or
+generic-netlink datagram without consuming it.
+`MSG_PEEK` copies the next queued route or generic-netlink datagram without
+advancing the queue.
+When a receive buffer is short, only its capacity is copied. `MSG_TRUNC`
+returns the complete datagram length; `recvmsg` also sets its output
+`msg_flags` to `MSG_TRUNC`.
 
 ## 4. Invariants & safety properties
 

@@ -1485,11 +1485,23 @@ const AF_NETLINK: u64 = 16;
 const SOCK_RAW: u64 = 3;
 const NETLINK_ROUTE: u64 = 0;
 const NETLINK_KOBJECT_UEVENT: u64 = 15;
+const SOL_NETLINK: u64 = 270;
+const NETLINK_ADD_MEMBERSHIP: u64 = 1;
+const NETLINK_EXT_ACK: u64 = 11;
+const SIOCINQ: u64 = 0x541B;
 /// rtnetlink message types (rtnetlink.h).
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETROUTE: u16 = 26;
+const RTM_GETNEIGH: u16 = 30;
+const RTM_NEWRULE: u16 = 32;
+const RTM_GETRULE: u16 = 34;
+const RTM_NEWQDISC: u16 = 36;
+const RTM_GETQDISC: u16 = 38;
+const RTM_GETTFILTER: u16 = 46;
 /// netlink control message types (netlink.h).
 const NLMSG_DONE: u16 = 3;
 const NLMSG_HDRLEN: usize = 16;
@@ -1542,10 +1554,47 @@ fn netlink_send(fd: u64, buf: &[u8]) -> Option<i64> {
 
 /// recvfrom(fd, buf, len, MSG_DONTWAIT, NULL, NULL).
 fn netlink_recv(fd: u64, buf: &mut [u8]) -> Option<i64> {
+    netlink_recv_flags(fd, buf, MSG_DONTWAIT)
+}
+
+fn netlink_recv_flags(fd: u64, buf: &mut [u8], flags: u64) -> Option<i64> {
     call(
         Syscall::SocketRecv.raw(),
-        a3(fd, buf.as_mut_ptr() as u64, buf.len() as u64, MSG_DONTWAIT),
+        a3(fd, buf.as_mut_ptr() as u64, buf.len() as u64, flags),
     )
+}
+
+fn netlink_inq(fd: u64) -> Result<u32, &'static str> {
+    let mut bytes = 0u32;
+    let result = call(
+        Syscall::Ioctl.raw(),
+        a2(fd, SIOCINQ, (&mut bytes as *mut u32) as u64),
+    )
+    .ok_or("ioctl status")?;
+    if result != 0 {
+        return Err("SIOCINQ did not return success");
+    }
+    Ok(bytes)
+}
+
+fn netlink_set_u32(fd: u64, option: u64, value: u32) -> Result<(), &'static str> {
+    let value = value.to_ne_bytes();
+    let result = call(
+        Syscall::SocketSetSockOpt.raw(),
+        SyscallArgs {
+            arg0: fd,
+            arg1: SOL_NETLINK,
+            arg2: option,
+            arg3: value.as_ptr() as u64,
+            arg4: value.len() as u64,
+            arg5: 0,
+        },
+    )
+    .ok_or("setsockopt status")?;
+    if result != 0 {
+        return Err("SOL_NETLINK setsockopt failed");
+    }
+    Ok(())
 }
 
 fn smoke_abi_netlink_route_socket_bind() -> TestResult {
@@ -1565,6 +1614,177 @@ fn smoke_abi_netlink_route_socket_bind() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_socket_bind);
+
+fn smoke_abi_netlink_route_siocinq() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETLINK, 40);
+        if netlink_send(fd, &req).ok_or("route send")? != req.len() as i64 {
+            return Err("RTM_GETLINK send failed");
+        }
+        let queued = netlink_inq(fd)?;
+        if queued < NLMSG_HDRLEN as u32 {
+            return Err("SIOCINQ did not report the queued route datagram");
+        }
+        let mut reply = [0u8; 512];
+        let received = netlink_recv(fd, &mut reply).ok_or("route recv")?;
+        if received != queued as i64 {
+            return Err("SIOCINQ route size disagreed with recv length");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_siocinq);
+
+fn smoke_abi_netlink_route_msg_peek() -> TestResult {
+    with_setup(|| {
+        const MSG_PEEK: u64 = 0x02;
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETLINK, 41);
+        if netlink_send(fd, &req).ok_or("route send")? != req.len() as i64 {
+            return Err("RTM_GETLINK send failed");
+        }
+        let queued = netlink_inq(fd)?;
+        let mut peeked = [0u8; 512];
+        let peek_n =
+            netlink_recv_flags(fd, &mut peeked, MSG_DONTWAIT | MSG_PEEK).ok_or("peek recv")?;
+        if peek_n != queued as i64 || netlink_inq(fd)? != queued {
+            return Err("MSG_PEEK consumed or resized the queued netlink datagram");
+        }
+        let mut consumed = [0u8; 512];
+        let recv_n = netlink_recv(fd, &mut consumed).ok_or("consume recv")?;
+        if recv_n != peek_n || consumed[..recv_n as usize] != peeked[..peek_n as usize] {
+            return Err("MSG_PEEK bytes differed from the consumed netlink datagram");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_msg_peek);
+
+fn smoke_abi_netlink_route_msg_trunc() -> TestResult {
+    with_setup(|| {
+        const MSG_TRUNC: u64 = 0x20;
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETLINK, 42);
+
+        if netlink_send(fd, &req).ok_or("first route send")? != req.len() as i64 {
+            return Err("first RTM_GETLINK send failed");
+        }
+        let mut short = [0xA5u8; 8];
+        let copied = netlink_recv_flags(fd, &mut short, MSG_DONTWAIT).ok_or("short normal recv")?;
+        if copied != short.len() as i64 {
+            return Err("short netlink recv did not return copied length");
+        }
+
+        if netlink_send(fd, &req).ok_or("second route send")? != req.len() as i64 {
+            return Err("second RTM_GETLINK send failed");
+        }
+        let full = netlink_inq(fd)?;
+        let mut truncated = [0x5Au8; 8];
+        let returned = netlink_recv_flags(fd, &mut truncated, MSG_DONTWAIT | MSG_TRUNC)
+            .ok_or("MSG_TRUNC recv")?;
+        if returned != full as i64 || returned <= truncated.len() as i64 {
+            return Err("MSG_TRUNC did not return the full netlink datagram length");
+        }
+        if truncated == [0x5A; 8] {
+            return Err("MSG_TRUNC did not copy the available prefix");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_msg_trunc);
+
+fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let (addr, alen) = netlink_sockaddr(0);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("netlink bind failed");
+        }
+
+        // Join group 2 via the Linux SOL_NETLINK membership API.
+        let group = 2u32.to_ne_bytes();
+        let r = call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_ADD_MEMBERSHIP,
+                arg3: group.as_ptr() as u64,
+                arg4: group.len() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("membership status")?;
+        if r != 0 {
+            return Err("NETLINK_ADD_MEMBERSHIP failed");
+        }
+
+        let mut local = [0u8; 12];
+        let mut local_len = (local.len() as u32).to_ne_bytes();
+        if call(
+            Syscall::SocketGetSockName.raw(),
+            a2(fd, local.as_mut_ptr() as u64, local_len.as_mut_ptr() as u64),
+        )
+        .ok_or("getsockname status")?
+            != 0
+        {
+            return Err("netlink getsockname failed");
+        }
+        let portid = u32::from_ne_bytes(local[4..8].try_into().unwrap());
+        let groups = u32::from_ne_bytes(local[8..12].try_into().unwrap());
+        if portid == 0 || groups != 0b10 {
+            return Err("netlink local port ID/groups did not round-trip");
+        }
+
+        let enabled = 1u32.to_ne_bytes();
+        call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_EXT_ACK,
+                arg3: enabled.as_ptr() as u64,
+                arg4: enabled.len() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("set NETLINK_EXT_ACK")?;
+        let mut out = [0u8; 4];
+        let mut out_len = 4u32.to_ne_bytes();
+        call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_EXT_ACK,
+                arg3: out.as_mut_ptr() as u64,
+                arg4: out_len.as_mut_ptr() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("get NETLINK_EXT_ACK")?;
+        if u32::from_ne_bytes(out) != 1 {
+            return Err("NETLINK_EXT_ACK did not round-trip");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_netlink_address_and_options_roundtrip
+);
 
 fn smoke_abi_netlink_uevent_socket_bind() -> TestResult {
     with_setup(|| {
@@ -1610,6 +1830,9 @@ fn smoke_abi_netlink_route_getlink_dump() -> TestResult {
         // The loopback link carries an IFLA_IFNAME rtattr with "lo".
         if !window_contains(&buf[..n], b"lo\0") {
             return Err("RTM_NEWLINK dump did not contain the `lo` interface name");
+        }
+        if !window_contains(&buf[..n], b"noqueue\0") {
+            return Err("RTM_NEWLINK dump did not contain the qdisc");
         }
         // Drain remaining links until NLMSG_DONE terminates the dump.
         let mut saw_done = false;
@@ -1673,6 +1896,240 @@ fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getaddr_dump);
+
+fn smoke_abi_netlink_route_getaddr_family_filter() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let mut req = [0u8; 24];
+        req[0..4].copy_from_slice(&24u32.to_ne_bytes());
+        req[4..6].copy_from_slice(&RTM_GETADDR.to_ne_bytes());
+        req[6..8].copy_from_slice(&NLM_F_REQUEST_DUMP.to_ne_bytes());
+        req[8..12].copy_from_slice(&15u32.to_ne_bytes());
+        req[16] = 10; // AF_INET6; NARF currently publishes no IPv6 addresses.
+        if netlink_send(fd, &req).ok_or("filtered addr send")? != req.len() as i64 {
+            return Err("filtered RTM_GETADDR send failed");
+        }
+        let mut reply = [0u8; 64];
+        let n = netlink_recv(fd, &mut reply).ok_or("filtered addr recv")?;
+        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&reply) != NLMSG_DONE {
+            return Err("empty filtered address dump did not return NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getaddr_family_filter);
+
+fn smoke_abi_netlink_route_getroute_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETROUTE, 9);
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send(RTM_GETROUTE) did not echo the request length");
+        }
+        let mut buf = [0u8; 512];
+        let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+        if n < (NLMSG_HDRLEN + 12) as i64 {
+            return Err("recv did not return a full RTM_NEWROUTE message");
+        }
+        if nlmsg_type_of(&buf) != RTM_NEWROUTE {
+            return Err("first route-dump message was not RTM_NEWROUTE");
+        }
+        if buf[NLMSG_HDRLEN] != AF_INET as u8 {
+            return Err("RTM_NEWROUTE rtm_family was not AF_INET");
+        }
+        let mut saw_done = false;
+        for _ in 0..32 {
+            let mut b2 = [0u8; 512];
+            let m = netlink_recv(fd, &mut b2).ok_or("drain recv status")?;
+            if m < NLMSG_HDRLEN as i64 {
+                break;
+            }
+            if nlmsg_type_of(&b2) == NLMSG_DONE {
+                saw_done = true;
+                break;
+            }
+        }
+        if !saw_done {
+            return Err("RTM_GETROUTE dump did not terminate with NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getroute_dump);
+
+fn smoke_abi_netlink_route_point_lookup() -> TestResult {
+    with_setup(|| {
+        fn discard(_: &[u8]) -> Result<(), ()> {
+            Ok(())
+        }
+
+        let iface = "abi-rtnl-route0";
+        narf_net::iface::register(iface, [0x02, 0, 0, 0, 5, 1], discard);
+        narf_net::route::route_add(narf_net::route::Route {
+            dst: narf_net::route::Ipv4Net {
+                addr: narf_net::ipv4::Ipv4Addr([198, 19, 7, 0]),
+                prefix_len: 24,
+            },
+            gateway: Some(narf_net::ipv4::Ipv4Addr([192, 0, 2, 1])),
+            iface: alloc::string::String::from(iface),
+            src_hint: None,
+            metric: 0,
+            scope: narf_net::route::Scope::Universe,
+            table: narf_net::route::TABLE_MAIN,
+        });
+
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let mut req = [0u8; 36];
+        req[0..4].copy_from_slice(&36u32.to_ne_bytes());
+        req[4..6].copy_from_slice(&RTM_GETROUTE.to_ne_bytes());
+        req[6..8].copy_from_slice(&1u16.to_ne_bytes());
+        req[8..12].copy_from_slice(&14u32.to_ne_bytes());
+        req[16] = AF_INET as u8;
+        req[17] = 32;
+        req[20] = narf_net::route::TABLE_MAIN;
+        // RTA_DST { len=8, type=1, address=198.19.7.42 }.
+        req[28..30].copy_from_slice(&8u16.to_ne_bytes());
+        req[30..32].copy_from_slice(&1u16.to_ne_bytes());
+        req[32..36].copy_from_slice(&[198, 19, 7, 42]);
+        if netlink_send(fd, &req).ok_or("route point send")? != req.len() as i64 {
+            return Err("RTM_GETROUTE point send failed");
+        }
+        let mut reply = [0u8; 512];
+        let n = netlink_recv(fd, &mut reply).ok_or("route point recv")?;
+        if n < (NLMSG_HDRLEN + 12) as i64 || nlmsg_type_of(&reply) != RTM_NEWROUTE {
+            return Err("RTM_GETROUTE point lookup did not return RTM_NEWROUTE");
+        }
+        let flags = u16::from_ne_bytes([reply[6], reply[7]]);
+        if flags & 2 != 0 || reply[NLMSG_HDRLEN + 1] != 24 {
+            return Err("route point reply was multipart or selected the wrong prefix");
+        }
+        if !window_contains(&reply[..n as usize], &[192, 0, 2, 1]) {
+            return Err("route point reply omitted the selected gateway");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        narf_net::route::route_delete(
+            narf_net::route::Ipv4Net {
+                addr: narf_net::ipv4::Ipv4Addr([198, 19, 7, 0]),
+                prefix_len: 24,
+            },
+            iface,
+            narf_net::route::TABLE_MAIN,
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_point_lookup);
+
+fn smoke_abi_netlink_route_getneigh_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETNEIGH, 10);
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send(RTM_GETNEIGH) did not echo the request length");
+        }
+        // An empty neighbor cache is valid; it must still complete rather
+        // than leaving Linux tooling blocked forever.
+        let mut saw_done = false;
+        for _ in 0..32 {
+            let mut buf = [0u8; 512];
+            let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+            if n < NLMSG_HDRLEN as i64 {
+                break;
+            }
+            if nlmsg_type_of(&buf) == NLMSG_DONE {
+                saw_done = true;
+                break;
+            }
+        }
+        if !saw_done {
+            return Err("RTM_GETNEIGH dump did not terminate with NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getneigh_dump);
+
+fn smoke_abi_netlink_route_getrule_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETRULE, 11);
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send(RTM_GETRULE) did not echo the request length");
+        }
+        for expected_priority in [0u32, 32_766, 32_767] {
+            let mut buf = [0u8; 512];
+            let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+            if n < (NLMSG_HDRLEN + 12) as i64 || nlmsg_type_of(&buf) != RTM_NEWRULE {
+                return Err("RTM_GETRULE did not return three RTM_NEWRULE entries");
+            }
+            if !window_contains(&buf[..n as usize], &expected_priority.to_ne_bytes()) {
+                return Err("RTM_NEWRULE priority was missing");
+            }
+        }
+        let mut done = [0u8; 64];
+        let n = netlink_recv(fd, &mut done).ok_or("done recv")?;
+        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&done) != NLMSG_DONE {
+            return Err("RTM_GETRULE did not terminate with NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getrule_dump);
+
+fn smoke_abi_netlink_route_getqdisc_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETQDISC, 12);
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send(RTM_GETQDISC) did not echo the request length");
+        }
+        let mut first = [0u8; 512];
+        let n = netlink_recv(fd, &mut first).ok_or("recv status")?;
+        if n < (NLMSG_HDRLEN + 20) as i64 || nlmsg_type_of(&first) != RTM_NEWQDISC {
+            return Err("RTM_GETQDISC did not return RTM_NEWQDISC");
+        }
+        if !window_contains(&first[..n as usize], b"noqueue\0") {
+            return Err("RTM_NEWQDISC did not identify noqueue");
+        }
+        let mut saw_done = false;
+        for _ in 0..32 {
+            let mut buf = [0u8; 512];
+            let n = netlink_recv(fd, &mut buf).ok_or("drain status")?;
+            if n >= NLMSG_HDRLEN as i64 && nlmsg_type_of(&buf) == NLMSG_DONE {
+                saw_done = true;
+                break;
+            }
+        }
+        if !saw_done {
+            return Err("RTM_GETQDISC did not terminate with NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getqdisc_dump);
+
+fn smoke_abi_netlink_empty_collection_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETTFILTER, 13);
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send(RTM_GETTFILTER) did not echo request length");
+        }
+        let mut buf = [0u8; 64];
+        let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&buf) != NLMSG_DONE {
+            return Err("empty RTM_GETTFILTER dump did not return NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_empty_collection_dump);
 
 fn smoke_abi_netlink_uevent_recv() -> TestResult {
     with_setup(|| {
@@ -1757,8 +2214,6 @@ kernel_test_in!("syscall_abi", smoke_abi_netlink_audit_socket_open_bind_send);
 
 fn smoke_abi_netlink_generic_socket_open() -> TestResult {
     with_setup(|| {
-        // NETLINK_GENERIC (genetlink) is likewise backed by the sink: open +
-        // bind succeed so callers get a usable fd instead of EPERM.
         let fd = open_netlink(NETLINK_GENERIC)?;
         let (addr, alen) = netlink_sockaddr(0);
         if call(
@@ -1770,11 +2225,124 @@ fn smoke_abi_netlink_generic_socket_open() -> TestResult {
         {
             return Err("bind(NETLINK_GENERIC) did not return 0");
         }
+
+        // GENL_ID_CTRL / CTRL_CMD_GETFAMILY with
+        // CTRL_ATTR_FAMILY_NAME="nlctrl".
+        let mut req = [0u8; 32];
+        req[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        req[4..6].copy_from_slice(&16u16.to_ne_bytes());
+        req[6..8].copy_from_slice(&1u16.to_ne_bytes());
+        req[8..12].copy_from_slice(&91u32.to_ne_bytes());
+        req[16] = 3;
+        req[17] = 2;
+        req[20..22].copy_from_slice(&11u16.to_ne_bytes());
+        req[22..24].copy_from_slice(&2u16.to_ne_bytes());
+        req[24..31].copy_from_slice(b"nlctrl\0");
+        if netlink_send(fd, &req).ok_or("generic send status")? != req.len() as i64 {
+            return Err("CTRL_CMD_GETFAMILY send failed");
+        }
+        let queued = netlink_inq(fd)?;
+        if queued < 24 {
+            return Err("SIOCINQ did not report the generic-netlink reply");
+        }
+        let mut reply = [0u8; 256];
+        let n = netlink_recv(fd, &mut reply).ok_or("generic recv status")?;
+        if n != queued as i64 {
+            return Err("SIOCINQ generic-netlink size disagreed with recv length");
+        }
+        if n < 24 || nlmsg_type_of(&reply) != 16 {
+            return Err("generic netlink did not return GENL_ID_CTRL");
+        }
+        if !window_contains(&reply[..n as usize], b"nlctrl\0") {
+            return Err("generic netlink reply did not name nlctrl");
+        }
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_generic_socket_open);
+
+fn smoke_abi_netlink_generic_batched_requests() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_GENERIC)?;
+        let mut one = [0u8; 32];
+        one[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        one[4..6].copy_from_slice(&16u16.to_ne_bytes());
+        one[6..8].copy_from_slice(&1u16.to_ne_bytes());
+        one[16] = 3;
+        one[17] = 2;
+        one[20..22].copy_from_slice(&11u16.to_ne_bytes());
+        one[22..24].copy_from_slice(&2u16.to_ne_bytes());
+        one[24..31].copy_from_slice(b"nlctrl\0");
+        let mut batch = [0u8; 64];
+        one[8..12].copy_from_slice(&92u32.to_ne_bytes());
+        batch[..32].copy_from_slice(&one);
+        one[8..12].copy_from_slice(&93u32.to_ne_bytes());
+        batch[32..].copy_from_slice(&one);
+
+        if netlink_send(fd, &batch).ok_or("generic batch send")? != batch.len() as i64 {
+            return Err("batched generic-netlink send failed");
+        }
+        for expected_seq in [92u32, 93] {
+            let mut reply = [0u8; 256];
+            let n = netlink_recv(fd, &mut reply).ok_or("generic batch recv")?;
+            if n < 24 || nlmsg_type_of(&reply) != 16 {
+                return Err("batched generic-netlink reply was malformed");
+            }
+            let seq = u32::from_ne_bytes(reply[8..12].try_into().unwrap());
+            if seq != expected_seq {
+                return Err("batched generic-netlink sequence was not preserved");
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_generic_batched_requests);
+
+fn smoke_abi_netlink_generic_extended_capped_error() -> TestResult {
+    with_setup(|| {
+        const NETLINK_CAP_ACK: u64 = 10;
+        let fd = open_netlink(NETLINK_GENERIC)?;
+        netlink_set_u32(fd, NETLINK_EXT_ACK, 1)?;
+        netlink_set_u32(fd, NETLINK_CAP_ACK, 1)?;
+
+        let mut request = [0u8; 32];
+        request[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        request[4..6].copy_from_slice(&16u16.to_ne_bytes());
+        request[6..8].copy_from_slice(&1u16.to_ne_bytes());
+        request[8..12].copy_from_slice(&94u32.to_ne_bytes());
+        request[16] = 3;
+        request[17] = 2;
+        request[20..22].copy_from_slice(&12u16.to_ne_bytes());
+        request[22..24].copy_from_slice(&2u16.to_ne_bytes());
+        request[24..32].copy_from_slice(b"nl80211\0");
+        if netlink_send(fd, &request).ok_or("generic error send")? != request.len() as i64 {
+            return Err("unknown generic family send failed");
+        }
+        let mut reply = [0u8; 256];
+        let n = netlink_recv(fd, &mut reply).ok_or("generic error recv")?;
+        if n < 36 || nlmsg_type_of(&reply) != 2 {
+            return Err("unknown generic family did not return NLMSG_ERROR");
+        }
+        let flags = u16::from_ne_bytes([reply[6], reply[7]]);
+        if flags & 0x100 == 0 || flags & 0x200 == 0 {
+            return Err("generic error omitted CAPPED or ACK_TLVS flags");
+        }
+        if !window_contains(
+            &reply[..n as usize],
+            b"generic-netlink family does not exist\0",
+        ) {
+            return Err("generic extended ACK diagnostic was missing");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_netlink_generic_extended_capped_error
+);
 
 /// True iff `needle` appears as a contiguous byte window in `hay`.
 fn window_contains(hay: &[u8], needle: &[u8]) -> bool {

@@ -41,6 +41,13 @@ includes one `Cap<RingPair, Alloc>` as a pre-granted capability.
 **Maximum ring pairs per process: 64 (default; system-wide tunable).**
 Exhaustion fails subsequent allocations with `Err(RingPairBudget)`.
 
+The stack-daemon launcher keeps `StackAttachReply::admin` in kernel memory and
+may bind it to an `AF_NETLINK`/`NETLINK_ROUTE` fd owned by the current task.
+The fd is resolved through that task's table and the typed `SocketFile`; no raw
+`AdminHandle` or capability slot is accepted through the Linux syscall ABI.
+A public native cap-bearing operation remains unavailable until submissions
+are validated against a real per-task capability table.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

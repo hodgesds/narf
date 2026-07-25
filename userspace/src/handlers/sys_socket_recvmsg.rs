@@ -40,6 +40,17 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
         buf: &mut staging,
         flags,
     });
+    let (result, truncated_full_len) = match result {
+        crate::socket::SocketOpResult::ReceivedTruncated {
+            copied,
+            full_len,
+            peer,
+        } => (
+            crate::socket::SocketOpResult::Received { n: copied, peer },
+            Some(full_len),
+        ),
+        other => (other, None),
+    };
     match result {
         crate::socket::SocketOpResult::Received { n, peer } => {
             // Scatter into iovec destinations under SMAP bracket.
@@ -116,9 +127,21 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
             // (a lone 0x71 byte) and the bus dropped it → no KDE session bus.
             // We deliver the whole datagram/stream chunk and never truncate
             // ancillary data here, so the correct value is 0.
-            write_user_u32(msg_ptr + 48, 0);
+            write_user_u32(
+                msg_ptr + 48,
+                if truncated_full_len.is_some() {
+                    crate::socket::MSG_TRUNC
+                } else {
+                    0
+                },
+            );
 
-            ctx.set_return(SyscallReturn::ok(n as u64));
+            let returned = if flags & crate::socket::MSG_TRUNC != 0 {
+                truncated_full_len.unwrap_or(n)
+            } else {
+                n
+            };
+            ctx.set_return(SyscallReturn::ok(returned as u64));
         }
         // Map the real socket error to its errno. A non-blocking recv with no
         // data must report EAGAIN, not the bare -1 sentinel (which musl maps to

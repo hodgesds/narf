@@ -38,6 +38,17 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
         buf: &mut buf,
         flags,
     });
+    let (result, truncated_full_len) = match result {
+        crate::socket::SocketOpResult::ReceivedTruncated {
+            copied,
+            full_len,
+            peer,
+        } => (
+            crate::socket::SocketOpResult::Received { n: copied, peer },
+            Some(full_len),
+        ),
+        other => (other, None),
+    };
     match result {
         crate::socket::SocketOpResult::Received { n, .. } => {
             // Copy received bytes back to user under SMAP bracket.
@@ -46,7 +57,12 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
                 ctx.set_return(fail);
                 return;
             }
-            ctx.set_return(SyscallReturn::ok(n as u64));
+            let returned = if flags & crate::socket::MSG_TRUNC != 0 {
+                truncated_full_len.unwrap_or(n)
+            } else {
+                n
+            };
+            ctx.set_return(SyscallReturn::ok(returned as u64));
         }
         crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) if nonblock => {
             ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));

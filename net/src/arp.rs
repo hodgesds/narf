@@ -187,6 +187,35 @@ pub fn insert(iface_name: &str, ip: [u8; 4], mac: [u8; 6]) {
     });
 }
 
+/// Snapshot every live IPv4 neighbor entry with its owning interface.
+/// Cloning keeps rtnetlink serialization outside the cache lock.
+pub fn snapshot() -> Vec<(String, ArpEntry)> {
+    let g = ARP_CACHES.lock();
+    let mut out = Vec::new();
+    for iface in g.iter() {
+        for entry in iface.cache.entries.iter().flatten() {
+            out.push((iface.name.clone(), *entry));
+        }
+    }
+    out
+}
+
+/// Remove one IPv4 neighbor entry from a named interface.
+pub fn remove(iface_name: &str, ip: [u8; 4]) -> bool {
+    let mut g = ARP_CACHES.lock();
+    let Some(iface) = g.iter_mut().find(|iface| iface.name == iface_name) else {
+        return false;
+    };
+    let before = iface.cache.count;
+    for slot in &mut iface.cache.entries {
+        if slot.is_some_and(|entry| entry.ip == ip) {
+            *slot = None;
+        }
+    }
+    iface.cache.count = iface.cache.entries.iter().flatten().count();
+    iface.cache.count != before
+}
+
 /// Called from the RX path when an ARP reply arrives. Populates both
 /// this module's LRU cache and the legacy `tcp_stack` BTreeMap.
 pub fn arp_insert_from_rx(iface_name: &str, ip: [u8; 4], mac: [u8; 6]) {
