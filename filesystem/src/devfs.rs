@@ -894,9 +894,10 @@ impl FileOps for DevConsole {
     #[cfg(feature = "linux-compat")]
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, crate::FsError> {
         use crate::devfs_pty::{
-            read_user_i32, read_user_termios, read_user_winsize, write_user_i32,
-            write_user_termios, write_user_winsize, WireWinsize, FIONREAD, KDGETMODE, KDGKBMODE,
-            KDSIGACCEPT, KDSKBMODE, TCFLSH, TCGETS, TCSBRK, TCSETS, TCSETSF, TCSETSW, TCXONC,
+            read_user_i32, read_user_termios, read_user_termios2, read_user_winsize,
+            write_user_i32, write_user_termios, write_user_termios2, write_user_winsize,
+            WireWinsize, FIONREAD, KDGETMODE, KDGKBMODE, KDSIGACCEPT, KDSKBMODE, TCFLSH, TCGETS,
+            TCGETS2, TCSBRK, TCSETS, TCSETS2, TCSETSF, TCSETSF2, TCSETSW, TCSETSW2, TCXONC,
             TIOCGPGRP, TIOCGSID, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
             VT_ACTIVATE, VT_GETMODE, VT_GETSTATE, VT_OPENQRY, VT_WAITACTIVE,
         };
@@ -914,6 +915,18 @@ impl FileOps for DevConsole {
             TCSETS | TCSETSW | TCSETSF => {
                 // SAFETY: `arg` is the validated user `struct termios *`.
                 let raw = unsafe { read_user_termios(arg)? };
+                crate::console_tty::set_termios(raw);
+                Ok(0)
+            }
+            TCGETS2 => {
+                let raw = crate::console_tty::termios();
+                // SAFETY: `arg` is the validated user `struct termios2 *`.
+                unsafe { write_user_termios2(arg, &raw)? };
+                Ok(0)
+            }
+            TCSETS2 | TCSETSW2 | TCSETSF2 => {
+                // SAFETY: `arg` is the validated user `struct termios2 *`.
+                let raw = unsafe { read_user_termios2(arg)? };
                 crate::console_tty::set_termios(raw);
                 Ok(0)
             }

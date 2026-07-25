@@ -360,6 +360,60 @@ unsafe fn write_user_termios(uptr: u64, src: [u8; 60]) -> Result<(), FsError> {
     Ok(())
 }
 
+/// Kernel `struct termios2` length: the 36-byte `termios` + `c_ispeed`/
+/// `c_ospeed`. glibc's `tcgetattr`/`tcsetattr` use TCGETS2/TCSETS2 on Linux.
+const KERNEL_TERMIOS2_LEN: usize = 44;
+/// Fixed baud reported in TCGETS2's `c_ispeed`/`c_ospeed` for the virtual
+/// console (no real line rate); tcgetattr only needs a consistent value.
+const TERMIOS2_BAUD: u32 = 38400;
+
+/// SMAP-safe read of a kernel `struct termios2` (44 bytes); keep the 36-byte
+/// `termios` part in NARF's 60-byte internal buffer (speeds are meaningless
+/// for a virtual console).
+unsafe fn read_user_termios2(uptr: u64) -> Result<[u8; 60], FsError> {
+    if uptr == 0 || crate::handlers::validate_user_range(uptr, KERNEL_TERMIOS2_LEN).is_err() {
+        return Err(FsError::InvalidData);
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: range-validated; with_user_access brackets SMAP.
+    let k = unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::read_unaligned(uptr as *const [u8; KERNEL_TERMIOS_LEN])
+        })
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: range-validated; no SMAP off x86_64.
+    let k = unsafe { core::ptr::read_unaligned(uptr as *const [u8; KERNEL_TERMIOS_LEN]) };
+    let mut out = [0u8; 60];
+    out[..KERNEL_TERMIOS_LEN].copy_from_slice(&k);
+    Ok(out)
+}
+
+/// SMAP-safe write of a kernel `struct termios2` (44 bytes): the 36-byte
+/// `termios` (first 36 bytes of the internal buffer) + `c_ispeed`/`c_ospeed`.
+unsafe fn write_user_termios2(uptr: u64, src: [u8; 60]) -> Result<(), FsError> {
+    if uptr == 0 || crate::handlers::validate_user_range(uptr, KERNEL_TERMIOS2_LEN).is_err() {
+        return Err(FsError::InvalidData);
+    }
+    let mut k = [0u8; KERNEL_TERMIOS2_LEN];
+    k[..KERNEL_TERMIOS_LEN].copy_from_slice(&src[..KERNEL_TERMIOS_LEN]);
+    k[36..40].copy_from_slice(&TERMIOS2_BAUD.to_ne_bytes());
+    k[40..44].copy_from_slice(&TERMIOS2_BAUD.to_ne_bytes());
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: range-validated; with_user_access brackets SMAP.
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::write_unaligned(uptr as *mut [u8; KERNEL_TERMIOS2_LEN], k)
+        });
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: range-validated; no SMAP off x86_64.
+    unsafe {
+        core::ptr::write_unaligned(uptr as *mut [u8; KERNEL_TERMIOS2_LEN], k);
+    }
+    Ok(())
+}
+
 /// The boot console behind fd 0/1/2. Stateless: the console is a
 /// singleton, so its terminal attributes (termios, winsize) and job-
 /// control foreground pgrp all live in `narf_filesystem::console_tty`,
@@ -407,6 +461,14 @@ pub const TCSETS: u32 = 0x5402;
 pub const TCSETSW: u32 = 0x5403;
 /// `ioctl(fd, TCSETSF, &termios)` — set terminal attributes (drain + flush).
 pub const TCSETSF: u32 = 0x5404;
+/// `ioctl(fd, TCGETS2, &termios2)` — modern glibc `tcgetattr` uses this,
+/// NOT TCGETS. Without it `isatty`/`tcgetattr` on fd 0/1/2 fails and systemd
+/// disables console logging (see the DevConsole note).
+pub const TCGETS2: u32 = 0x802c542a;
+/// `ioctl(fd, TCSETS2/TCSETSW2/TCSETSF2, &termios2)` — glibc `tcsetattr`.
+pub const TCSETS2: u32 = 0x402c542b;
+pub const TCSETSW2: u32 = 0x402c542c;
+pub const TCSETSF2: u32 = 0x402c542d;
 /// `ioctl(fd, TIOCSCTTY, 0)` — make this the caller's controlling tty.
 pub const TIOCSCTTY: u32 = 0x540E;
 /// `ioctl(fd, TIOCNOTTY, 0)` — give up this controlling tty. `login`
@@ -608,6 +670,18 @@ impl FileOps for ConsoleFile {
                 // and /dev/console alike.
                 // SAFETY: `arg` is the validated user `struct termios *`.
                 let raw = unsafe { read_user_termios(arg as u64)? };
+                narf_filesystem::console_tty::set_termios(raw);
+                Ok(0)
+            }
+            TCGETS2 => {
+                let raw = narf_filesystem::console_tty::termios();
+                // SAFETY: `arg` is the user `struct termios2 *` from ioctl.
+                unsafe { write_user_termios2(arg as u64, raw)? };
+                Ok(0)
+            }
+            TCSETS2 | TCSETSW2 | TCSETSF2 => {
+                // SAFETY: `arg` is the validated user `struct termios2 *`.
+                let raw = unsafe { read_user_termios2(arg as u64)? };
                 narf_filesystem::console_tty::set_termios(raw);
                 Ok(0)
             }

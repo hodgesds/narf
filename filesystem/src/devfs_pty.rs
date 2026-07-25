@@ -83,6 +83,19 @@ pub const TCSETS: u32 = 0x5402;
 pub const TCSETSW: u32 = 0x5403;
 /// `ioctl(fd, TCSETSF, &termios)` — set terminal attributes (drain + flush).
 pub const TCSETSF: u32 = 0x5404;
+/// `ioctl(fd, TCGETS2, &termios2)` — get terminal attributes (termios2 form,
+/// 44 bytes: kernel `termios` + `c_ispeed`/`c_ospeed`). Modern glibc's
+/// `tcgetattr()` issues TCGETS2, NOT TCGETS — so a device that only answers
+/// TCGETS makes glibc's `tcgetattr()` (and therefore `isatty()`-adjacent
+/// terminal probes) fail with ENOTTY. systemd concludes `/dev/console` is not
+/// a terminal and silently disables console logging; getty/login also break.
+pub const TCGETS2: u32 = 0x802c542a;
+/// `ioctl(fd, TCSETS2, &termios2)` — set terminal attributes (immediate).
+pub const TCSETS2: u32 = 0x402c542b;
+/// `ioctl(fd, TCSETSW2, &termios2)` — set terminal attributes (drain output).
+pub const TCSETSW2: u32 = 0x402c542c;
+/// `ioctl(fd, TCSETSF2, &termios2)` — set terminal attributes (drain + flush).
+pub const TCSETSF2: u32 = 0x402c542d;
 /// `ioctl(fd, FIONREAD, &i32)` — bytes immediately readable.
 pub const FIONREAD: u32 = 0x541B;
 /// `ioctl(fd, TIOCNOTTY, 0)` — give up the controlling terminal.
@@ -196,6 +209,16 @@ pub const TERMIOS_WIRE_LEN: usize = 60;
 /// in glibc's isatty during systemd's open_terminal). The first 36 bytes of
 /// the 60-byte image are exactly the kernel struct (speeds live at 52+).
 pub const KERNEL_TERMIOS_LEN: usize = 36;
+
+/// The KERNEL-ABI `struct termios2` is 44 bytes: the 36-byte kernel `termios`
+/// followed by `c_ispeed` (u32) and `c_ospeed` (u32). TCGETS2/TCSETS2 exchange
+/// exactly this. glibc's `tcgetattr`/`tcsetattr` use termios2 on Linux.
+pub const KERNEL_TERMIOS2_LEN: usize = 44;
+
+/// A plausible fixed baud (38400) reported in the `c_ispeed`/`c_ospeed`
+/// fields of a TCGETS2 reply for a virtual console/PTY (which has no real
+/// line rate). tcgetattr only needs a self-consistent value.
+const TERMIOS2_BAUD: u32 = 38400;
 
 // `c_lflag` bits we honour (asm-generic termbits).
 const L_ISIG: u32 = 0x0000_0001;
@@ -714,6 +737,79 @@ pub(crate) unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_
     Ok(out)
 }
 
+/// TCGETS2: write a 44-byte `struct termios2` — the 36-byte kernel `termios`
+/// (first 36 bytes of our internal image) plus `c_ispeed`/`c_ospeed`.
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+pub(crate) unsafe fn write_user_termios2(
+    uptr: usize,
+    src: &[u8; TERMIOS_WIRE_LEN],
+) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let mut k = [0u8; KERNEL_TERMIOS2_LEN];
+    k[..KERNEL_TERMIOS_LEN].copy_from_slice(&src[..KERNEL_TERMIOS_LEN]);
+    k[36..40].copy_from_slice(&TERMIOS2_BAUD.to_ne_bytes());
+    k[40..44].copy_from_slice(&TERMIOS2_BAUD.to_ne_bytes());
+    // SAFETY: caller guarantees uptr is a valid user pointer; with_user_access
+    // brackets SMAP and write_unaligned emits inline stores.
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::write_unaligned(uptr as *mut [u8; KERNEL_TERMIOS2_LEN], k);
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+pub(crate) unsafe fn write_user_termios2(
+    uptr: usize,
+    src: &[u8; TERMIOS_WIRE_LEN],
+) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let mut k = [0u8; KERNEL_TERMIOS2_LEN];
+    k[..KERNEL_TERMIOS_LEN].copy_from_slice(&src[..KERNEL_TERMIOS_LEN]);
+    k[36..40].copy_from_slice(&TERMIOS2_BAUD.to_ne_bytes());
+    k[40..44].copy_from_slice(&TERMIOS2_BAUD.to_ne_bytes());
+    // SAFETY: caller guarantees uptr is a valid user pointer; non-overlapping.
+    unsafe { core::ptr::copy_nonoverlapping(k.as_ptr(), uptr as *mut u8, KERNEL_TERMIOS2_LEN) };
+    Ok(())
+}
+
+/// TCSETS2: read a 44-byte `struct termios2`; keep the 36-byte `termios` part
+/// (the `c_ispeed`/`c_ospeed` speeds are meaningless for a virtual console).
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+pub(crate) unsafe fn read_user_termios2(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    // SAFETY: caller guarantees uptr is a valid user pointer; with_user_access
+    // brackets SMAP and read_unaligned emits inline loads.
+    let k = unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::read_unaligned(uptr as *const [u8; KERNEL_TERMIOS_LEN])
+        })
+    };
+    let mut out = [0u8; TERMIOS_WIRE_LEN];
+    out[..KERNEL_TERMIOS_LEN].copy_from_slice(&k);
+    Ok(out)
+}
+
+#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+pub(crate) unsafe fn read_user_termios2(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let mut out = [0u8; TERMIOS_WIRE_LEN];
+    // SAFETY: caller guarantees uptr is a valid user pointer; non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(uptr as *const u8, out.as_mut_ptr(), KERNEL_TERMIOS_LEN)
+    };
+    Ok(out)
+}
+
 // ── PtyMaster FileOps ─────────────────────────────────────────────────────────
 
 /// `/dev/ptmx` open result — the master half of a PTY pair.
@@ -892,6 +988,18 @@ impl FileOps for PtyMaster {
                 self.pty.termios.lock().raw = raw;
                 Ok(0)
             }
+            TCGETS2 => {
+                let t = *self.pty.termios.lock();
+                // SAFETY: arg is a validated user `struct termios2 *`.
+                unsafe { write_user_termios2(arg, &t.raw)? };
+                Ok(0)
+            }
+            TCSETS2 | TCSETSW2 | TCSETSF2 => {
+                // SAFETY: arg is a validated user `struct termios2 *`.
+                let raw = unsafe { read_user_termios2(arg)? };
+                self.pty.termios.lock().raw = raw;
+                Ok(0)
+            }
             FIONREAD => {
                 // Bytes the master can read = bytes slave has written.
                 let n = self.pty.slave_tx_to_master.len() as i32;
@@ -1063,6 +1171,18 @@ impl FileOps for PtySlave {
             TCSETS | TCSETSW | TCSETSF => {
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let raw = unsafe { read_user_termios(arg)? };
+                self.pty.termios.lock().raw = raw;
+                Ok(0)
+            }
+            TCGETS2 => {
+                let t = *self.pty.termios.lock();
+                // SAFETY: arg is a validated user `struct termios2 *`.
+                unsafe { write_user_termios2(arg, &t.raw)? };
+                Ok(0)
+            }
+            TCSETS2 | TCSETSW2 | TCSETSF2 => {
+                // SAFETY: arg is a validated user `struct termios2 *`.
+                let raw = unsafe { read_user_termios2(arg)? };
                 self.pty.termios.lock().raw = raw;
                 Ok(0)
             }
