@@ -45,6 +45,8 @@ pub struct RawFrame {
 /// matches `protocol` (or all frames if `protocol == ETH_P_ALL`).
 #[derive(Debug)]
 pub struct RawPacketSocket {
+    /// Network namespace whose interfaces this socket may observe.
+    pub net_ns_id: u64,
     /// `ETH_P_ALL` or a specific ethertype (network byte order on wire,
     /// stored in host byte order here for comparison convenience).
     pub protocol: u16,
@@ -57,8 +59,9 @@ pub struct RawPacketSocket {
 }
 
 impl RawPacketSocket {
-    fn new(protocol: u16, ifindex: u32) -> Self {
+    fn new(net_ns_id: u64, protocol: u16, ifindex: u32) -> Self {
         Self {
+            net_ns_id,
             protocol,
             ifindex,
             rx_queue: IrqSafeSpinLock::new(VecDeque::new()),
@@ -91,9 +94,14 @@ pub struct RawSocketSnapshot {
 
 /// Snapshot every raw packet socket. Cheap: only a few fields.
 pub fn snapshot() -> Vec<RawSocketSnapshot> {
+    snapshot_in(0)
+}
+
+pub fn snapshot_in(net_ns_id: u64) -> Vec<RawSocketSnapshot> {
     let socks = RAW_PKT_SOCKETS.lock();
     socks
         .iter()
+        .filter(|s| s.net_ns_id == net_ns_id)
         .map(|s| RawSocketSnapshot {
             local_addr: [0u8; 4],
             local_port: 0,
@@ -118,7 +126,11 @@ pub fn snapshot() -> Vec<RawSocketSnapshot> {
 ///   (e.g. `ETHERTYPE_IPV4 = 0x0800`) to filter.
 /// - `ifindex`: 0 = any interface, non-zero = only from that interface.
 pub fn raw_packet_open(protocol: u16, ifindex: u32) -> Arc<RawPacketSocket> {
-    let sock = Arc::new(RawPacketSocket::new(protocol, ifindex));
+    raw_packet_open_in(0, protocol, ifindex)
+}
+
+pub fn raw_packet_open_in(net_ns_id: u64, protocol: u16, ifindex: u32) -> Arc<RawPacketSocket> {
+    let sock = Arc::new(RawPacketSocket::new(net_ns_id, protocol, ifindex));
     RAW_PKT_SOCKETS.lock().push(sock.clone());
     sock
 }
@@ -126,6 +138,12 @@ pub fn raw_packet_open(protocol: u16, ifindex: u32) -> Arc<RawPacketSocket> {
 /// Close a raw packet socket.
 pub fn raw_packet_close(sock: &Arc<RawPacketSocket>) {
     RAW_PKT_SOCKETS.lock().retain(|s| !Arc::ptr_eq(s, sock));
+}
+
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    RAW_PKT_SOCKETS
+        .lock()
+        .retain(|socket| socket.net_ns_id != net_ns_id);
 }
 
 /// Receive the next frame from a raw packet socket.
@@ -162,6 +180,10 @@ pub fn raw_packet_set_depth(sock: &Arc<RawPacketSocket>, depth: usize) {
 /// Deliver a raw Ethernet frame to all matching raw packet sockets.
 /// `ifindex` is the receiving interface's index (1 for primary).
 pub fn raw_pkt_deliver(frame: &[u8], ifindex: u32) {
+    raw_pkt_deliver_in(0, frame, ifindex);
+}
+
+pub fn raw_pkt_deliver_in(net_ns_id: u64, frame: &[u8], ifindex: u32) {
     if frame.len() < ETH_HDR_LEN {
         return;
     }
@@ -172,6 +194,9 @@ pub fn raw_pkt_deliver(frame: &[u8], ifindex: u32) {
     let sockets: Vec<Arc<RawPacketSocket>> = RAW_PKT_SOCKETS.lock().clone();
 
     for sock in sockets {
+        if sock.net_ns_id != net_ns_id {
+            continue;
+        }
         // Interface filter.
         if sock.ifindex != 0 && sock.ifindex != ifindex {
             continue;

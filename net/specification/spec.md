@@ -201,8 +201,8 @@ same capped echo and diagnostic-TLV rules as rtnetlink.
 
 `NETLINK_SOCK_DIAG` accepts Linux `SOCK_DIAG_BY_FAMILY` /
 `inet_diag_req_v2` dumps for IPv4 TCP and UDP. It filters by the requested
-Linux socket-state mask and emits `inet_diag_msg` records from the same
-snapshots that back `/proc/net/tcp` and `/proc/net/udp`, followed by
+Linux socket-state mask and emits `inet_diag_msg` records from
+namespace-scoped transport snapshots, followed by
 `NLMSG_DONE`. Aligned requests may be batched, their sequences remain
 independent, and `NLM_F_ACK` adds a zero-error acknowledgement after a
 successful query. Messages without `NLM_F_REQUEST` return `EINVAL`.
@@ -215,8 +215,41 @@ with `NLMSG_DONE`; aligned requests may be batched and `NLM_F_ACK` produces a
 zero-error acknowledgement after a successful query. Non-dump point queries
 select an entry by `CTA_ID` or complete `CTA_TUPLE_ORIG`, return a
 non-multipart record, and report `ENOENT` when the canonical table has no
-match. Mutations and unsupported nfnetlink subsystems return `EOPNOTSUPP`;
-Linux netlink does not grant ambient filter/NAT authority.
+match. Creating or deleting nftables tables and empty chains requires a
+delegated namespace-matched `NetfilterAdminHandle` with ruleset rights;
+missing, revoked, cross-namespace, or rights-attenuated authority returns
+`EPERM`, and deleting a non-empty object returns `EBUSY`. Rule-expression and
+conntrack mutations plus unsupported nfnetlink subsystems return
+`EOPNOTSUPP`; Linux netlink does not grant ambient filter/NAT authority.
+
+Every packet context and `NETLINK_NETFILTER` query carries an immutable
+network-namespace id (zero is the initial namespace). Rulesets, conntrack
+entries, and NAT mappings are stored independently for each id. Mutable
+operations require a live `Cap<NetfilterAdminCap, Invoke>` wrapped with the
+exact namespace id and explicit read/ruleset/conntrack/NAT operation rights;
+namespace membership, uid, and Linux ambient capability bits are not
+authority.
+
+Physical interfaces carry one owning network-namespace id. Moving an
+interface requires its live interface-bound `AdminHandle`; afterward namespace
+filtered lookup hides it from the source namespace and ingress packets inherit
+the destination namespace before AF_PACKET delivery and PRE_ROUTING. IPv4 FIB
+entries are keyed by namespace as well as destination/interface/table, so
+longest-prefix lookup cannot select another namespace's route.
+TCP connection/listener keys and UDP bind/delivery tables include the network
+namespace id; identical endpoint tuples may coexist across namespaces and
+accepted TCP children inherit their listener's namespace. The IPv4 ARP cache
+is namespace-scoped. ICMP echo and raw delivery, plus ICMP-originated TCP/UDP
+errors, are restricted to the receiving namespace. TCP, UDP, and ICMP output resolves only namespace-owned
+interfaces and routes and traverses that namespace's `LOCAL_OUT` and
+`POST_ROUTING` netfilter hooks.
+Linux `/proc/net/{tcp,udp,raw,arp,route,dev,nf_conntrack}` snapshots resolve
+the calling task's network namespace and exclude objects owned by every other
+namespace.
+DHCP reply and DNS side channels are keyed by the ingress interface's network
+namespace. The final namespace reference reclaims its TCP, UDP, raw, ICMP,
+ARP-resolution, DHCP, route, and netfilter state; physical interfaces return
+to the initial namespace without retaining dead-namespace routes.
 
 `NETLINK_AUDIT` reports a disabled zeroed `audit_status` for `AUDIT_GET` and
 an empty completed `AUDIT_LIST_RULES` dump. `AUDIT_SET` returns `EPERM`

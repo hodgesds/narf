@@ -388,10 +388,11 @@ pub struct SocketFile {
     pending_error: IrqSafeSpinLock<Option<SockError>>,
     /// Network-namespace id this socket belongs to (0 = host/default
     /// netns). Stamped by `sys_socket` from the creator's net-ns at
-    /// socket() time. Used ONLY to key the AF_INET bind/port tables so
-    /// two processes in different net-ns can both bind the same
-    /// (addr, port); the per-packet NIC path is untouched.
+    /// socket() time. Keys AF_INET bind tables and selects namespace-scoped
+    /// netlink, routing, interface, and netfilter views.
     net_ns_id: core::sync::atomic::AtomicU64,
+    #[cfg(feature = "container")]
+    net_namespace: IrqSafeSpinLock<Option<Arc<crate::namespaces::NetNamespace>>>,
     /// Credentials of the process that owns this socket end. Stamped by
     /// `sys_socket`/`sys_socketpair` at creation; surfaced to the peer via
     /// `SO_PEERCRED` and to a `SO_PASSCRED` recvmsg via `SCM_CREDENTIALS`.
@@ -429,6 +430,7 @@ pub struct SocketFile {
     /// Explicitly delegated NARF network-control authority. Never inferred
     /// from uid or Linux ambient capability bits.
     netlink_admin: IrqSafeSpinLock<Option<narf_net::AdminHandle>>,
+    netfilter_admin: IrqSafeSpinLock<Option<narf_net::netfilter::NetfilterAdminHandle>>,
     /// Userspace-to-userspace unicast datagrams, independent of each
     /// protocol's kernel reply queue so sender port IDs remain attributable.
     netlink_user_inbox: IrqSafeSpinLock<VecDeque<NetlinkUserPacket>>,
@@ -742,6 +744,8 @@ impl SocketFile {
             nonblock: AtomicBool::new(false),
             pending_error: IrqSafeSpinLock::new(None),
             net_ns_id: core::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "container")]
+            net_namespace: IrqSafeSpinLock::new(None),
             local_cred: IrqSafeSpinLock::new(Ucred::default()),
             peer_cred: IrqSafeSpinLock::new(Ucred::default()),
             passcred: AtomicBool::new(false),
@@ -760,6 +764,7 @@ impl SocketFile {
             netlink_reply_groups: IrqSafeSpinLock::new(VecDeque::new()),
             netlink_last_recv_group: AtomicU32::new(0),
             netlink_admin: IrqSafeSpinLock::new(None),
+            netfilter_admin: IrqSafeSpinLock::new(None),
             netlink_user_inbox: IrqSafeSpinLock::new(VecDeque::new()),
         });
         if domain == AF_NETLINK {
@@ -773,7 +778,27 @@ impl SocketFile {
             return Err(SockError::InvalidArg);
         }
         admin.check_live().map_err(|_| SockError::InvalidArg)?;
+        if admin.net_ns_id().map_err(|_| SockError::InvalidArg)? != self.net_ns_id() {
+            return Err(SockError::InvalidArg);
+        }
         *self.netlink_admin.lock() = Some(admin);
+        Ok(())
+    }
+
+    pub fn delegate_netfilter_admin(
+        &self,
+        admin: narf_net::netfilter::NetfilterAdminHandle,
+    ) -> Result<(), SockError> {
+        if self.domain != AF_NETLINK
+            || self.protocol != NETLINK_NETFILTER
+            || self.net_ns_id() != admin.net_ns_id()
+        {
+            return Err(SockError::InvalidArg);
+        }
+        admin
+            .check(narf_net::netfilter::NetfilterRights::READ)
+            .map_err(|_| SockError::InvalidArg)?;
+        *self.netfilter_admin.lock() = Some(admin);
         Ok(())
     }
 
@@ -1038,6 +1063,12 @@ impl SocketFile {
     pub fn set_net_ns_id(&self, id: u64) {
         self.net_ns_id
             .store(id, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "container")]
+    pub fn set_net_namespace(&self, namespace: Arc<crate::namespaces::NetNamespace>) {
+        self.set_net_ns_id(namespace.id());
+        *self.net_namespace.lock() = Some(namespace);
     }
 
     /// This socket's network-namespace id (0 = host/default).
@@ -1755,7 +1786,8 @@ impl SocketFile {
                 self.ensure_netlink_portid();
                 let sent = buf.len() as u64;
                 let admin = self.netlink_admin.lock().clone();
-                let msgs = match narf_net::netlink_route::build_replies_with_options(
+                let msgs = match narf_net::netlink_route::build_replies_with_options_in(
+                    self.net_ns_id(),
                     buf,
                     admin.as_ref(),
                     narf_net::netlink_route::ReplyOptions {
@@ -1911,7 +1943,8 @@ impl SocketFile {
                     return result;
                 }
                 self.ensure_netlink_portid();
-                let replies = match narf_net::netlink_diag::build_replies(buf) {
+                let replies = match narf_net::netlink_diag::build_replies_in(self.net_ns_id(), buf)
+                {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
@@ -1975,7 +2008,12 @@ impl SocketFile {
                     return result;
                 }
                 self.ensure_netlink_portid();
-                let replies = match narf_net::netlink_netfilter::build_replies(buf) {
+                let admin = self.netfilter_admin.lock().clone();
+                let replies = match narf_net::netlink_netfilter::build_replies_authorized(
+                    self.net_ns_id(),
+                    buf,
+                    admin.as_ref(),
+                ) {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
@@ -3032,9 +3070,12 @@ impl SocketFile {
                         // 127.x stays loopback-only (the INET_LISTENERS map).
                         if (addr >> 24) != 127 && listen_id.is_none() {
                             let a = addr.to_be_bytes();
-                            if let Ok(id) =
-                                narf_net::tcp_stack::listen(a, port, backlog.max(1) as usize)
-                            {
+                            if let Ok(id) = narf_net::tcp_stack::listen_in(
+                                self.net_ns_id(),
+                                a,
+                                port,
+                                backlog.max(1) as usize,
+                            ) {
                                 *listen_id = Some(id);
                                 // This task owns the listener — targeted
                                 // accept-ready wakes go only to it.
@@ -3070,6 +3111,11 @@ impl SocketFile {
                 if let Some(lid) = kernel_listen_id {
                     if let Ok(Some(child_id)) = narf_net::tcp_stack::accept(lid) {
                         let child = SocketFile::new(AF_INET, SOCK_STREAM);
+                        child.set_net_ns_id(self.net_ns_id());
+                        #[cfg(feature = "container")]
+                        if let Some(namespace) = self.net_namespace.lock().clone() {
+                            child.set_net_namespace(namespace);
+                        }
                         {
                             let mut cs = child.state.lock();
                             *cs = SocketState::InetWired {
@@ -3134,7 +3180,8 @@ impl SocketFile {
                         let is_loopback = (ip >> 24) == 127;
                         if !is_loopback {
                             let ip_bytes = ip.to_be_bytes();
-                            match narf_net::tcp_stack::connect(ip_bytes, port) {
+                            match narf_net::tcp_stack::connect_in(self.net_ns_id(), ip_bytes, port)
+                            {
                                 Ok(tcb_id) => {
                                     let mut state = self.state.lock();
                                     if matches!(&*state, SocketState::Fresh) {

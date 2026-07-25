@@ -7,6 +7,186 @@ extern crate alloc;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn smoke_netfilter_namespace_rulesets_are_isolated() -> TestResult {
+    use crate::netfilter::filter::nf_table_add_in;
+    use crate::netfilter::namespace::get;
+    use crate::netfilter::rules::Match;
+    use crate::netfilter::Verdict;
+
+    nf_table_add_in(0x4e_5341, "filter", "input", Match::any(), Verdict::Drop);
+    if get(0x4e_5341).filter.snapshot().len() != 1 {
+        return TestResult::Fail("rule missing from owning network namespace");
+    }
+    if !get(0x4e_5342).filter.snapshot().is_empty() {
+        return TestResult::Fail("ruleset leaked into a different network namespace");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/netfilter/namespace",
+    smoke_netfilter_namespace_rulesets_are_isolated
+);
+
+fn smoke_netfilter_authority_scope_rights_and_revocation() -> TestResult {
+    use crate::netfilter::{NetfilterAdminHandle, NetfilterAuthorityError, NetfilterRights};
+
+    let admin = NetfilterAdminHandle::mint(77, NetfilterRights::READ);
+    if admin.net_ns_id() != 77 || admin.check(NetfilterRights::READ).is_err() {
+        return TestResult::Fail("valid namespace read authority rejected");
+    }
+    if admin.check(NetfilterRights::RULESET) != Err(NetfilterAuthorityError::RightsTooWeak) {
+        return TestResult::Fail("rights attenuation was not enforced");
+    }
+    let copy = admin.clone();
+    admin.revoke();
+    if copy.check(NetfilterRights::READ) != Err(NetfilterAuthorityError::Revoked) {
+        return TestResult::Fail("revocation did not invalidate copied authority");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/netfilter/authority",
+    smoke_netfilter_authority_scope_rights_and_revocation
+);
+
+fn smoke_netfilter_nft_table_mutation_requires_authority() -> TestResult {
+    use crate::netfilter::{NetfilterAdminHandle, NetfilterRights};
+
+    let mut body = alloc::vec![2u8, 0, 0, 0];
+    let name = b"filter\0";
+    let attr_len = (4 + name.len()) as u16;
+    body.extend_from_slice(&attr_len.to_ne_bytes());
+    body.extend_from_slice(&1u16.to_ne_bytes());
+    body.extend_from_slice(name);
+    body.resize((body.len() + 3) & !3, 0);
+    let message_len = 16 + body.len();
+    let mut request = alloc::vec::Vec::new();
+    request.extend_from_slice(&(message_len as u32).to_ne_bytes());
+    request.extend_from_slice(&(10u16 << 8).to_ne_bytes());
+    request.extend_from_slice(&(1u16 | 4u16).to_ne_bytes());
+    request.extend_from_slice(&901u32.to_ne_bytes());
+    request.extend_from_slice(&0u32.to_ne_bytes());
+    request.extend_from_slice(&body);
+
+    let denied =
+        crate::netlink_netfilter::build_replies_in(901, &request).expect("valid nft request");
+    if i32::from_ne_bytes(denied[0][16..20].try_into().unwrap()) != -1 {
+        return TestResult::Fail("unauthorized nft mutation was not denied");
+    }
+    let admin = NetfilterAdminHandle::mint(901, NetfilterRights::RULESET);
+    let allowed = crate::netlink_netfilter::build_replies_authorized(901, &request, Some(&admin))
+        .expect("authorized nft request");
+    if i32::from_ne_bytes(allowed[0][16..20].try_into().unwrap()) != 0 {
+        return TestResult::Fail("authorized nft mutation failed");
+    }
+    if crate::netfilter::namespace::get(901)
+        .filter
+        .snapshot()
+        .iter()
+        .all(|table| table.name != "filter")
+    {
+        return TestResult::Fail("authorized nft table was not installed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/netfilter/authority",
+    smoke_netfilter_nft_table_mutation_requires_authority
+);
+
+fn smoke_network_namespace_fib_isolation() -> TestResult {
+    use crate::ipv4::Ipv4Addr;
+    use crate::route::{Ipv4Net, Route, Scope, TABLE_MAIN};
+
+    crate::route::route_add(Route {
+        net_ns_id: 501,
+        dst: Ipv4Net {
+            addr: Ipv4Addr([203, 0, 113, 0]),
+            prefix_len: 24,
+        },
+        gateway: None,
+        iface: alloc::string::String::from("ns501-test"),
+        src_hint: Some(Ipv4Addr([203, 0, 113, 1])),
+        metric: 0,
+        scope: Scope::Link,
+        table: TABLE_MAIN,
+    });
+    let dst = Ipv4Addr([203, 0, 113, 9]);
+    if crate::route::route_lookup_raw_in(501, dst).is_none() {
+        return TestResult::Fail("owning namespace could not resolve its route");
+    }
+    if crate::route::route_lookup_raw_in(502, dst).is_some() {
+        return TestResult::Fail("route leaked into another network namespace");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/namespace", smoke_network_namespace_fib_isolation);
+
+fn smoke_network_namespace_transport_tables_are_isolated() -> TestResult {
+    use crate::tcp::state_machine::TcpState;
+    use crate::udp_sock::{SocketAddrV4, UdpOptions};
+
+    let tcp_id = crate::tcp::core::__install_test_tcb_in(
+        601,
+        [192, 0, 2, 1],
+        8080,
+        [192, 0, 2, 2],
+        40000,
+        TcpState::Established,
+    );
+    let tcp_id_b = crate::tcp::core::__install_test_tcb_in(
+        602,
+        [192, 0, 2, 1],
+        8080,
+        [192, 0, 2, 2],
+        40000,
+        TcpState::Established,
+    );
+    if crate::tcp::core::snapshot_in(601)
+        .iter()
+        .all(|socket| socket.local_port != 8080)
+    {
+        return TestResult::Fail("TCP TCB missing from owning namespace");
+    }
+    if crate::tcp::core::snapshot_in(602)
+        .iter()
+        .all(|socket| socket.local_port != 8080)
+    {
+        return TestResult::Fail("same TCP tuple in second namespace collided");
+    }
+
+    let address = SocketAddrV4::new([0, 0, 0, 0], 18080);
+    let udp_a = match crate::udp_sock::udp_bind_in(601, address, UdpOptions::default()) {
+        Ok(socket) => socket,
+        Err(_) => return TestResult::Fail("first namespace UDP bind failed"),
+    };
+    let udp_b = match crate::udp_sock::udp_bind_in(602, address, UdpOptions::default()) {
+        Ok(socket) => socket,
+        Err(_) => return TestResult::Fail("same UDP port in second namespace collided"),
+    };
+    if crate::udp_sock::snapshot_in(601).len() != 1 || crate::udp_sock::snapshot_in(602).len() != 1
+    {
+        return TestResult::Fail("UDP namespace snapshots are not isolated");
+    }
+    let raw_a = crate::raw_sock::raw_packet_open_in(601, crate::raw_sock::ETH_P_ALL, 0);
+    let raw_b = crate::raw_sock::raw_packet_open_in(602, crate::raw_sock::ETH_P_ALL, 0);
+    if crate::raw_sock::snapshot_in(601).len() != 1 || crate::raw_sock::snapshot_in(602).len() != 1
+    {
+        return TestResult::Fail("raw socket namespace snapshots are not isolated");
+    }
+    crate::raw_sock::raw_packet_close(&raw_a);
+    crate::raw_sock::raw_packet_close(&raw_b);
+    crate::udp_sock::udp_close(&udp_a);
+    crate::udp_sock::udp_close(&udp_b);
+    crate::tcp::core::remove_tcb(tcp_id);
+    crate::tcp::core::remove_tcb(tcp_id_b);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/namespace",
+    smoke_network_namespace_transport_tables_are_isolated
+);
+
 fn smoke_net_loopback_register() -> TestResult {
     use crate::{bootstrap_authority, register_loopback_named, registry, Loopback};
 
@@ -5671,12 +5851,19 @@ fn smoke_admin_handle_is_interface_bound() -> TestResult {
     if admin.set_link(false).is_err()
         || admin.set_mtu(9000).is_err()
         || admin.set_mac([0x02, 0, 0, 0, 0, 2]).is_err()
+        || admin.move_to_net_ns(91).is_err()
     {
         return TestResult::Fail("authorized interface mutation failed");
     }
     let Some(snapshot) = crate::iface::lookup(name) else {
         return TestResult::Fail("controlled interface disappeared");
     };
+    if snapshot.net_ns_id != 91
+        || crate::iface::lookup_in(91, name).is_none()
+        || crate::iface::lookup_in(0, name).is_some()
+    {
+        return TestResult::Fail("interface move did not change namespace visibility");
+    }
     if snapshot.link_up || snapshot.mtu != 9000 || snapshot.mac != [0x02, 0, 0, 0, 0, 2] {
         return TestResult::Fail("admin mutations did not update interface state");
     }
@@ -5965,6 +6152,7 @@ fn smoke_route_lpm_specific_wins() -> TestResult {
 
     // /32 > /24 > /0
     route_add(Route {
+        net_ns_id: 0,
         dst: Ipv4Net {
             addr: Ipv4Addr([0, 0, 0, 0]),
             prefix_len: 0,
@@ -5977,6 +6165,7 @@ fn smoke_route_lpm_specific_wins() -> TestResult {
         table: TABLE_MAIN,
     });
     route_add(Route {
+        net_ns_id: 0,
         dst: Ipv4Net {
             addr: Ipv4Addr([192, 168, 1, 0]),
             prefix_len: 24,
@@ -5989,6 +6178,7 @@ fn smoke_route_lpm_specific_wins() -> TestResult {
         table: TABLE_MAIN,
     });
     route_add(Route {
+        net_ns_id: 0,
         dst: Ipv4Net {
             addr: Ipv4Addr([192, 168, 1, 1]),
             prefix_len: 32,
@@ -6027,6 +6217,7 @@ fn smoke_route_default_fallback() -> TestResult {
 
     __reset_for_test();
     route_add(Route {
+        net_ns_id: 0,
         dst: Ipv4Net {
             addr: Ipv4Addr([0, 0, 0, 0]),
             prefix_len: 0,
@@ -6125,6 +6316,7 @@ fn smoke_src_selection_via_gateway() -> TestResult {
     ifaddr_reset();
     iface_add_addr("eth0", Ipv4Addr([192, 168, 1, 10]), 24);
     route_add(Route {
+        net_ns_id: 0,
         dst: Ipv4Net {
             addr: Ipv4Addr([0, 0, 0, 0]),
             prefix_len: 0,

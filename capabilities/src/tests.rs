@@ -35,6 +35,7 @@ fn smoke_cap_kind_registry() -> TestResult {
         ("BusDevice", CapKind::BusDevice, 0x0001),
         ("BlockDevice", CapKind::BlockDevice, 0x0010),
         ("NetIface", CapKind::NetIface, 0x0020),
+        ("NetfilterAdmin", CapKind::NetfilterAdmin, 0x0022),
         ("FileNode", CapKind::FileNode, 0x0030),
         ("Ring", CapKind::Ring, 0x0040),
         ("Domain", CapKind::Domain, 0x0050),

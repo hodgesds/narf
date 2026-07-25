@@ -2101,6 +2101,7 @@ fn smoke_abi_netlink_route_point_lookup() -> TestResult {
         let iface = "abi-rtnl-route0";
         narf_net::iface::register(iface, [0x02, 0, 0, 0, 5, 1], discard);
         narf_net::route::route_add(narf_net::route::Route {
+            net_ns_id: 0,
             dst: narf_net::route::Ipv4Net {
                 addr: narf_net::ipv4::Ipv4Addr([198, 19, 7, 0]),
                 prefix_len: 24,

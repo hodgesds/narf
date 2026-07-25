@@ -6249,6 +6249,8 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
 //                             removed at reap (release_reaped_task),
 //   - fd table              — fd::detach (on_child_exit) owns it.
 fn release_task_tables(tid: u64) {
+    #[cfg(feature = "container")]
+    crate::namespaces::release_task(tid);
     // Signal state.
     if let Some(m) = SIGNAL_PENDING.lock().as_mut() {
         m.remove(&tid);
@@ -12912,6 +12914,25 @@ pub fn delegate_stack_admin_to_route_socket(
         .and_then(|ops| ops.downcast_ref::<crate::socket::SocketFile>())
         .ok_or(crate::socket::SockError::BadFd)?;
     socket.delegate_netlink_admin(reply.admin.clone())
+}
+
+/// Transfer kernel-held namespace firewall authority to one of the calling
+/// task's NETLINK_NETFILTER sockets. Raw capability slots never cross the
+/// userspace ABI.
+pub fn delegate_netfilter_admin_to_socket(
+    fd: u32,
+    admin: narf_net::netfilter::NetfilterAdminHandle,
+) -> Result<(), crate::socket::SockError> {
+    let task = current_task_id();
+    let entry = fd::with_table(task, |table| table.get(fd).cloned())
+        .flatten()
+        .ok_or(crate::socket::SockError::BadFd)?;
+    let socket = entry
+        .ops
+        .as_any()
+        .and_then(|ops| ops.downcast_ref::<crate::socket::SocketFile>())
+        .ok_or(crate::socket::SockError::BadFd)?;
+    socket.delegate_netfilter_admin(admin)
 }
 
 // Side table to enable Arc<dyn FileOps> -> Arc<SocketFile> recovery.

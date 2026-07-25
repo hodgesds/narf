@@ -504,6 +504,10 @@ fn build_ack(seq: u32, req: &[u8]) -> Vec<u8> {
 /// (ifindex 1); registered NICs follow at ifindex 2, 3, … in registration
 /// order. Returned as `(link, addrs)` so both dumps share one enumeration.
 fn enumerate() -> (Vec<LinkInfo>, Vec<AddrInfo>) {
+    enumerate_in(0)
+}
+
+fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
     let mut links = Vec::new();
     let mut addrs = Vec::new();
 
@@ -526,7 +530,11 @@ fn enumerate() -> (Vec<LinkInfo>, Vec<AddrInfo>) {
 
     // Legacy L3 interfaces come first because their registration order already
     // defines the Linux-visible ifindex used by the IPv4 stack.
-    for (i, nic) in crate::iface::snapshot_all().into_iter().enumerate() {
+    for (i, nic) in crate::iface::snapshot_all()
+        .into_iter()
+        .filter(|nic| nic.net_ns_id == net_ns_id)
+        .enumerate()
+    {
         let ifindex = (i as u32) + 2;
         links.push(LinkInfo {
             ifindex,
@@ -593,6 +601,10 @@ fn enumerate() -> (Vec<LinkInfo>, Vec<AddrInfo>) {
 /// `RTM_GETADDR` → an `RTM_NEWADDR` per address; both end with `NLMSG_DONE`.
 /// Any other request type → a single `NLMSG_ERROR(-EOPNOTSUPP)`.
 pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
+    build_dump_in(0, req)
+}
+
+pub fn build_dump_in(net_ns_id: u64, req: &[u8]) -> Vec<Vec<u8>> {
     let hdr = match parse_hdr(req) {
         Some(h) => h,
         None => return Vec::new(),
@@ -604,7 +616,7 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     match hdr.msg_type {
         RTM_GETLINK => {
-            let (links, _addrs) = enumerate();
+            let (links, _addrs) = enumerate_in(net_ns_id);
             if hdr.flags & NLM_F_DUMP == NLM_F_DUMP {
                 for link in &links {
                     out.push(build_newlink(link, seq, pid));
@@ -633,7 +645,7 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
             }
         }
         RTM_GETADDR => {
-            let (_links, addrs) = enumerate();
+            let (_links, addrs) = enumerate_in(net_ns_id);
             let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
             let requested_ifindex = req
                 .get(NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8)
@@ -662,9 +674,9 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
             out.push(build_done(seq, pid));
         }
         RTM_GETROUTE => {
-            let (links, _addrs) = enumerate();
+            let (links, _addrs) = enumerate_in(net_ns_id);
             if hdr.flags & NLM_F_DUMP == NLM_F_DUMP {
-                let mut routes = crate::route::route_list();
+                let mut routes = crate::route::route_list_in(net_ns_id);
                 // Link/address dumps always expose loopback. Mirror that invariant
                 // in route dumps even during early boot before net init installs
                 // the canonical loopback FIB entry.
@@ -672,6 +684,7 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
                     r.iface == "lo" && r.dst.addr.0 == [127, 0, 0, 0] && r.dst.prefix_len == 8
                 }) {
                     routes.push(crate::route::Route {
+                        net_ns_id,
                         dst: crate::route::Ipv4Net {
                             addr: crate::ipv4::Ipv4Addr([127, 0, 0, 0]),
                             prefix_len: 8,
@@ -724,7 +737,7 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
                     return out;
                 }
                 let dst = crate::ipv4::Ipv4Addr(dst.try_into().unwrap_or([0; 4]));
-                if let Some(route) = crate::route::route_lookup_raw(dst) {
+                if let Some(route) = crate::route::route_lookup_raw_in(net_ns_id, dst) {
                     if let Some(link) = links.iter().find(|link| link.name == route.iface) {
                         let mut message = build_newroute(&route, link.ifindex, seq, pid);
                         clear_multipart(&mut message);
@@ -738,7 +751,7 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
             }
         }
         RTM_GETNEIGH => {
-            let (links, _addrs) = enumerate();
+            let (links, _addrs) = enumerate_in(net_ns_id);
             let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
             let requested_ifindex = req
                 .get(NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8)
@@ -826,7 +839,7 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
             out.push(build_done(seq, pid));
         }
         RTM_GETQDISC => {
-            let (links, _addrs) = enumerate();
+            let (links, _addrs) = enumerate_in(net_ns_id);
             let requested_ifindex = req
                 .get(NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8)
                 .and_then(|bytes| bytes.try_into().ok())
@@ -1239,6 +1252,16 @@ pub fn build_replies_with_options(
     admin: Option<&crate::AdminHandle>,
     options: ReplyOptions,
 ) -> Result<Vec<Vec<u8>>, ()> {
+    build_replies_with_options_in(0, datagram, admin, options)
+}
+
+pub fn build_replies_with_options_in(
+    net_ns_id: u64,
+    datagram: &[u8],
+    admin: Option<&crate::AdminHandle>,
+    options: ReplyOptions,
+) -> Result<Vec<Vec<u8>>, ()> {
+    let admin = admin.filter(|admin| admin.net_ns_id() == Ok(net_ns_id));
     let mut offset = 0usize;
     let mut replies = Vec::new();
 
@@ -1287,7 +1310,7 @@ pub fn build_replies_with_options(
         if supported && hdr.flags & NLM_F_ACK != 0 {
             replies.push(build_ack(hdr.seq, request));
         }
-        replies.extend(build_dump(request));
+        replies.extend(build_dump_in(net_ns_id, request));
 
         let step = nlmsg_align(msg_len);
         if step > remaining.len() {

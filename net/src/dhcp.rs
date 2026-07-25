@@ -40,6 +40,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -102,7 +103,8 @@ struct ParsedReply {
     lease_secs: u32,
 }
 
-static LATEST_REPLY: IrqSafeSpinLock<Option<ParsedReply>> = IrqSafeSpinLock::new(None);
+static LATEST_REPLY: IrqSafeSpinLock<BTreeMap<u64, ParsedReply>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
 
 /// Monotonic xid source — distinguishes our discover/request from
 /// any other clients sharing the segment.
@@ -118,6 +120,17 @@ fn next_xid() -> u32 {
 /// `dst_port == 68` arrives. Parses the DHCP payload and caches it
 /// for `acquire` to pick up.
 pub fn on_udp_in(_src_ip: [u8; 4], _dst_ip: [u8; 4], src_port: u16, dst_port: u16, payload: &[u8]) {
+    on_udp_in_in(0, _src_ip, _dst_ip, src_port, dst_port, payload);
+}
+
+pub fn on_udp_in_in(
+    net_ns_id: u64,
+    _src_ip: [u8; 4],
+    _dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) {
     if src_port != DHCP_SERVER_PORT || dst_port != DHCP_CLIENT_PORT {
         return;
     }
@@ -161,25 +174,27 @@ pub fn on_udp_in(_src_ip: [u8; 4], _dst_ip: [u8; 4], src_port: u16, dst_port: u1
             _ => {}
         }
     }
-    *LATEST_REPLY.lock() = Some(ParsedReply {
-        xid: hdr.xid,
-        msg_type,
-        yiaddr: hdr.yiaddr,
-        server,
-        netmask,
-        gateway,
-        dns,
-        dns_count,
-        lease_secs,
-    });
+    LATEST_REPLY.lock().insert(
+        net_ns_id,
+        ParsedReply {
+            xid: hdr.xid,
+            msg_type,
+            yiaddr: hdr.yiaddr,
+            server,
+            netmask,
+            gateway,
+            dns,
+            dns_count,
+            lease_secs,
+        },
+    );
 }
 
-fn take_matching_reply(want_xid: u32, want_msg_type: u8) -> Option<ParsedReply> {
+fn take_matching_reply(net_ns_id: u64, want_xid: u32, want_msg_type: u8) -> Option<ParsedReply> {
     let mut g = LATEST_REPLY.lock();
-    let r = g.as_ref()?.clone();
+    let r = g.get(&net_ns_id)?.clone();
     if r.xid == want_xid && r.msg_type == want_msg_type {
-        *g = None;
-        Some(r)
+        g.remove(&net_ns_id)
     } else {
         None
     }
@@ -236,10 +251,11 @@ fn wrap_broadcast_frame(src_mac: [u8; 6], src_ip: [u8; 4], dhcp_payload: &[u8]) 
 /// inner loop used by both.
 pub fn acquire(iface_name: &str, timeout_ms: u64) -> Result<DhcpLease, ()> {
     let snap = iface::lookup(iface_name).ok_or(())?;
+    let net_ns_id = snap.net_ns_id;
     let xid = next_xid();
 
     // Clear any stale reply cached from a previous run.
-    *LATEST_REPLY.lock() = None;
+    LATEST_REPLY.lock().remove(&net_ns_id);
 
     // ── DISCOVER ─────────────────────────────────────────────────
     let discover_dhcp = build_discover(xid, snap.mac);
@@ -253,7 +269,7 @@ pub fn acquire(iface_name: &str, timeout_ms: u64) -> Result<DhcpLease, ()> {
     let _ = narf_scheduler::responsive_spin_until(
         || {
             while iface::drain_pump() {}
-            if let Some(r) = take_matching_reply(xid, DHCPOFFER) {
+            if let Some(r) = take_matching_reply(net_ns_id, xid, DHCPOFFER) {
                 offer = Some(r);
                 return true;
             }
@@ -273,7 +289,7 @@ pub fn acquire(iface_name: &str, timeout_ms: u64) -> Result<DhcpLease, ()> {
     let _ = narf_scheduler::responsive_spin_until(
         || {
             while iface::drain_pump() {}
-            if let Some(r) = take_matching_reply(xid, DHCPACK) {
+            if let Some(r) = take_matching_reply(net_ns_id, xid, DHCPACK) {
                 ack = Some(r);
                 return true;
             }
@@ -292,9 +308,9 @@ pub fn acquire(iface_name: &str, timeout_ms: u64) -> Result<DhcpLease, ()> {
 
     // Populate the DNS side-channel so dhcp_acquire can read it.
     {
-        let mut g = LATEST_DNS.lock();
-        g.0 = ack.dns;
-        g.1 = ack.dns_count;
+        LATEST_DNS
+            .lock()
+            .insert(net_ns_id, (ack.dns, ack.dns_count));
     }
 
     Ok(DhcpLease {
@@ -312,7 +328,13 @@ pub fn acquire(iface_name: &str, timeout_ms: u64) -> Result<DhcpLease, ()> {
 // We stash the DNS array here (populated from the ACK's option 6)
 // so `dhcp_acquire` can read it after `acquire` returns.
 
-static LATEST_DNS: IrqSafeSpinLock<([[u8; 4]; 3], u8)> = IrqSafeSpinLock::new(([[0u8; 4]; 3], 0));
+type DnsReply = ([[u8; 4]; 3], u8);
+static LATEST_DNS: IrqSafeSpinLock<BTreeMap<u64, DnsReply>> = IrqSafeSpinLock::new(BTreeMap::new());
+
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    LATEST_REPLY.lock().remove(&net_ns_id);
+    LATEST_DNS.lock().remove(&net_ns_id);
+}
 
 // ── Public API ────────────────────────────────────────────────────
 
@@ -360,20 +382,22 @@ pub enum DhcpError {
 /// budget is `DHCP_MAX_ATTEMPTS × DHCP_PER_ATTEMPT_MS`.
 pub fn dhcp_acquire(iface_name: &str, _timeout_ms: u32) -> Result<Lease, DhcpError> {
     let snap = iface::lookup(iface_name).ok_or(DhcpError::NoIface)?;
+    let net_ns_id = snap.net_ns_id;
 
     for _attempt in 0..DHCP_MAX_ATTEMPTS {
         // Reset DNS side-channel before each attempt.
         {
-            let mut g = LATEST_DNS.lock();
-            g.0 = [[0u8; 4]; 3];
-            g.1 = 0;
+            LATEST_DNS.lock().insert(net_ns_id, ([[0u8; 4]; 3], 0));
         }
 
         if let Ok(raw) = acquire(iface_name, DHCP_PER_ATTEMPT_MS) {
             // Read the DNS side-channel written by `acquire`.
             let (dns_raw, dns_count) = {
-                let g = LATEST_DNS.lock();
-                (g.0, g.1)
+                LATEST_DNS
+                    .lock()
+                    .get(&net_ns_id)
+                    .copied()
+                    .unwrap_or(([[0u8; 4]; 3], 0))
             };
 
             let mut dns_vec: Vec<Ipv4Addr> = Vec::new();
@@ -432,6 +456,7 @@ pub fn dhcp_acquire(iface_name: &str, _timeout_ms: u32) -> Result<Lease, DhcpErr
 /// confused by a stale broadcast from the previous one.
 #[doc(hidden)]
 pub fn __reset_for_test() {
-    *LATEST_REPLY.lock() = None;
+    LATEST_REPLY.lock().clear();
+    LATEST_DNS.lock().clear();
     let _ = pkt::ETH_HDR_LEN; // silence unused-import warning
 }

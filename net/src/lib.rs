@@ -44,6 +44,23 @@
 
 extern crate alloc;
 
+/// Reclaim kernel networking state after the final reference to a non-initial
+/// network namespace disappears.
+pub fn release_network_namespace(net_ns_id: u64) {
+    if net_ns_id == 0 {
+        return;
+    }
+    tcp::core::remove_namespace(net_ns_id);
+    udp_sock::remove_namespace(net_ns_id);
+    raw_sock::remove_namespace(net_ns_id);
+    icmp_sock::remove_namespace(net_ns_id);
+    tcp_stack::remove_namespace(net_ns_id);
+    dhcp::remove_namespace(net_ns_id);
+    route::remove_namespace(net_ns_id);
+    netfilter::namespace::remove(net_ns_id);
+    iface::release_namespace(net_ns_id);
+}
+
 pub mod arp;
 pub mod arp_cache;
 pub mod bypass;

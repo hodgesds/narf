@@ -38,33 +38,41 @@ use crate::pkt::{
 };
 
 pub use crate::tcp::core::{
-    accept, close, connect, getsockopt_cong, getsockopt_int, listen, listen_has_pending,
-    lookup_tcb, readable, recv, remove_tcb, send, setsockopt_int, setsockopt_str, shutdown,
-    tick_retransmit, Tcb, TCP_CONGESTION, TCP_CORK, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE,
-    TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY, TCP_QUICKACK, TCP_USER_TIMEOUT,
+    accept, close, connect, connect_in, getsockopt_cong, getsockopt_int, listen,
+    listen_has_pending, listen_in, lookup_tcb, readable, recv, remove_tcb, send, setsockopt_int,
+    setsockopt_str, shutdown, tick_retransmit, Tcb, TCP_CONGESTION, TCP_CORK, TCP_KEEPALIVE,
+    TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY, TCP_QUICKACK,
+    TCP_USER_TIMEOUT,
 };
 pub use crate::tcp::state_machine::{DropCause, Shutdown, TcpState};
 
 // ── ARP legacy cache (kept for compat with non-TCP callers) ─────
 
-static ARP_CACHE: IrqSafeSpinLock<Option<BTreeMap<[u8; 4], [u8; 6]>>> = IrqSafeSpinLock::new(None);
+type ArpCache = BTreeMap<(u64, [u8; 4]), [u8; 6]>;
+static ARP_CACHE: IrqSafeSpinLock<Option<ArpCache>> = IrqSafeSpinLock::new(None);
 
-fn arp_lookup_local(ip: [u8; 4]) -> Option<[u8; 6]> {
+fn arp_lookup_local(net_ns_id: u64, ip: [u8; 4]) -> Option<[u8; 6]> {
     let g = ARP_CACHE.lock();
-    g.as_ref().and_then(|m| m.get(&ip).copied())
+    g.as_ref().and_then(|m| m.get(&(net_ns_id, ip)).copied())
 }
 
-fn arp_insert_local(ip: [u8; 4], mac: [u8; 6]) {
+fn arp_insert_local(net_ns_id: u64, ip: [u8; 4], mac: [u8; 6]) {
     let mut g = ARP_CACHE.lock();
     let m = g.get_or_insert_with(BTreeMap::new);
-    m.insert(ip, mac);
+    m.insert((net_ns_id, ip), mac);
+}
+
+pub(crate) fn remove_namespace(net_ns_id: u64) {
+    if let Some(cache) = ARP_CACHE.lock().as_mut() {
+        cache.retain(|(namespace, _), _| *namespace != net_ns_id);
+    }
 }
 
 /// Public shim so `arp::arp_insert_from_rx` can populate the
 /// legacy BTreeMap cache without a circular dep.
 #[doc(hidden)]
 pub fn __arp_insert_legacy(ip: [u8; 4], mac: [u8; 6]) {
-    arp_insert_local(ip, mac);
+    arp_insert_local(0, ip, mac);
 }
 
 /// Send an ARP request for `target_ip` via the iface that owns the
@@ -72,7 +80,11 @@ pub fn __arp_insert_legacy(ip: [u8; 4], mac: [u8; 6]) {
 /// primary, which on multi-NIC / capture-iface setups missed the
 /// subnet that actually contains the target.
 pub fn send_arp_request(target_ip: [u8; 4]) -> Result<(), ()> {
-    let iface = iface::for_dst(target_ip).ok_or(())?;
+    send_arp_request_in(0, target_ip)
+}
+
+pub fn send_arp_request_in(net_ns_id: u64, target_ip: [u8; 4]) -> Result<(), ()> {
+    let iface = iface::for_dst_in(net_ns_id, target_ip).ok_or(())?;
     let mut frame = [0u8; 60];
     let n = pkt::build_arp_request(&mut frame, iface.mac, iface.ipv4, target_ip).ok_or(())?;
     (iface.send)(&frame[..n])
@@ -81,19 +93,23 @@ pub fn send_arp_request(target_ip: [u8; 4]) -> Result<(), ()> {
 /// Resolve `ip` to a MAC: cache → ARP-request → busy-wait for reply.
 /// Returns the MAC on success, `Err(())` on timeout.
 pub fn arp_resolve(ip: [u8; 4], timeout_ms: u64) -> Result<[u8; 6], ()> {
-    if let Some(m) = arp_lookup_local(ip) {
+    arp_resolve_in(0, ip, timeout_ms)
+}
+
+pub fn arp_resolve_in(net_ns_id: u64, ip: [u8; 4], timeout_ms: u64) -> Result<[u8; 6], ()> {
+    if let Some(m) = arp_lookup_local(net_ns_id, ip) {
         return Ok(m);
     }
-    let _ = send_arp_request(ip);
+    let _ = send_arp_request_in(net_ns_id, ip);
     let deadline = narf_time::Deadline::after_ns(timeout_ms.saturating_mul(1_000_000));
     let _ = narf_scheduler::responsive_spin_until(
         || {
             while iface::drain_pump() {}
-            arp_lookup_local(ip).is_some()
+            arp_lookup_local(net_ns_id, ip).is_some()
         },
         deadline,
     );
-    arp_lookup_local(ip).ok_or(())
+    arp_lookup_local(net_ns_id, ip).ok_or(())
 }
 
 // ── RX dispatch ─────────────────────────────────────────────────
@@ -120,8 +136,11 @@ pub fn rx_handler(iface_name: &str, frame: &[u8]) {
     // Linux ref: linux/net/core/dev.c::netif_receive_skb_core
     // installs the XDP/AF_XDP hook ahead of the protocol-stack
     // dispatch; same shape.
-    let bypass_iface = iface::primary()
-        .map(|s| s.name)
+    let ingress = _iface_name.and_then(iface::lookup);
+    let net_ns_id = ingress.as_ref().map_or(0, |entry| entry.net_ns_id);
+    let bypass_iface = ingress
+        .as_ref()
+        .map(|entry| entry.name.clone())
         .unwrap_or_else(|| alloc::string::String::from("eth0"));
     match crate::bypass::classifier::classify(&bypass_iface, frame) {
         crate::bypass::classifier::Verdict::Consumed => return,
@@ -130,14 +149,16 @@ pub fn rx_handler(iface_name: &str, frame: &[u8]) {
     }
 
     // AF_PACKET raw sockets see every frame before L3 dispatch.
-    crate::raw_sock::raw_pkt_deliver(frame, 1);
+    crate::raw_sock::raw_pkt_deliver_in(net_ns_id, frame, 1);
     let (eth, body) = match parse_eth_header(frame) {
         Some(t) => t,
         None => return,
     };
     match eth.ethertype {
-        ETHERTYPE_ARP => handle_arp_on(body, _iface_name),
-        ETHERTYPE_IPV4 => handle_ipv4(body),
+        ETHERTYPE_ARP => handle_arp_on_in(body, net_ns_id, _iface_name),
+        ETHERTYPE_IPV4 => {
+            handle_ipv4(body, net_ns_id, _iface_name.unwrap_or(""));
+        }
         _ => {}
     }
 }
@@ -148,11 +169,15 @@ pub fn rx_handler(iface_name: &str, frame: &[u8]) {
 /// iface1 doesn't populate iface2's cache.
 /// Ref: Linux `arp_rcv()` in `net/ipv4/arp.c`.
 pub fn handle_arp_on(body: &[u8], iface_name: Option<&str>) {
+    handle_arp_on_in(body, 0, iface_name);
+}
+
+pub fn handle_arp_on_in(body: &[u8], net_ns_id: u64, iface_name: Option<&str>) {
     let arp = match parse_arp(body) {
         Some(a) => a,
         None => return,
     };
-    arp_insert_local(arp.spa, arp.sha);
+    arp_insert_local(net_ns_id, arp.spa, arp.sha);
     // Per-iface cache: record on the ingress interface if known.
     if let Some(name) = iface_name {
         arp_cache::insert(name, arp.spa, arp.sha);
@@ -173,10 +198,11 @@ pub fn handle_arp_on(body: &[u8], iface_name: Option<&str>) {
         // owns the address, then `primary`.
         let snap = iface_name
             .and_then(iface::lookup)
-            .filter(|s| s.ipv4 == arp.tpa)
-            .or_else(|| iface::for_local_addr(arp.tpa))
+            .filter(|s| s.net_ns_id == net_ns_id && s.ipv4 == arp.tpa)
+            .or_else(|| iface::for_local_addr_in(net_ns_id, arp.tpa))
             .or_else(|| iface_name.and_then(iface::lookup))
-            .or_else(iface::primary);
+            .filter(|s| s.net_ns_id == net_ns_id)
+            .or_else(|| iface::primary_in(net_ns_id));
         let iface = match snap {
             Some(i) => i,
             None => return,
@@ -191,7 +217,7 @@ pub fn handle_arp_on(body: &[u8], iface_name: Option<&str>) {
     let _ = ARP_OP_REPLY;
 }
 
-fn handle_ipv4(body: &[u8]) {
+fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
     // ── Netfilter PRE_ROUTING + LOCAL_IN dispatch ──
     //
     // The hooks only READ the packet (conntrack parses the tuple, filter
@@ -210,10 +236,11 @@ fn handle_ipv4(body: &[u8]) {
     }
     let mut ctx = crate::netfilter::PktCtx::new_ipv4_ref(
         crate::netfilter::HookPoint::PreRouting,
-        "",
+        iface_in,
         "",
         body,
-    );
+    )
+    .with_net_ns(net_ns_id);
     if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
         return;
     }
@@ -230,14 +257,16 @@ fn handle_ipv4(body: &[u8]) {
     // TTL is at byte offset 8 in the raw IPv4 header.
     let ttl = if body.len() >= 9 { body[8] } else { 64 };
     match ip.protocol {
-        IP_PROTO_TCP => crate::tcp::core::handle_segment(ip.src_ip, ip.dst_ip, payload),
-        IP_PROTO_UDP => handle_udp(ip.src_ip, ip.dst_ip, payload, ttl),
-        IP_PROTO_ICMP => crate::icmp_sock::on_icmp_rx(ip.src_ip, ip.dst_ip, payload),
+        IP_PROTO_TCP => {
+            crate::tcp::core::handle_segment_in(net_ns_id, ip.src_ip, ip.dst_ip, payload)
+        }
+        IP_PROTO_UDP => handle_udp(net_ns_id, ip.src_ip, ip.dst_ip, payload, ttl),
+        IP_PROTO_ICMP => crate::icmp_sock::on_icmp_rx_in(net_ns_id, ip.src_ip, ip.dst_ip, payload),
         _ => {}
     }
 }
 
-fn handle_udp(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
+fn handle_udp(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
     if datagram.len() < 8 {
         return;
     }
@@ -250,10 +279,10 @@ fn handle_udp(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
     }
     let payload = &datagram[8..end];
     // Deliver to registered UDP sockets (udp_sock layer).
-    crate::udp_sock::deliver(src_ip, dst_ip, datagram, ttl);
+    crate::udp_sock::deliver_in(net_ns_id, src_ip, dst_ip, datagram, ttl);
     // Legacy per-protocol consumers.
     if dst_port == 68 {
-        crate::dhcp::on_udp_in(src_ip, dst_ip, src_port, dst_port, payload);
+        crate::dhcp::on_udp_in_in(net_ns_id, src_ip, dst_ip, src_port, dst_port, payload);
     }
 }
 
@@ -272,6 +301,22 @@ pub fn signal_icmp_error(
     remote_port: u16,
 ) {
     crate::tcp::core::signal_icmp_error(remote_addr, remote_port, local_addr, local_port);
+}
+
+pub fn signal_icmp_error_in(
+    net_ns_id: u64,
+    local_addr: [u8; 4],
+    local_port: u16,
+    remote_addr: [u8; 4],
+    remote_port: u16,
+) {
+    crate::tcp::core::signal_icmp_error_in(
+        net_ns_id,
+        remote_addr,
+        remote_port,
+        local_addr,
+        local_port,
+    );
 }
 
 // ── Periodic timer tick ─────────────────────────────────────────
@@ -320,13 +365,22 @@ pub const TCP_MTU: usize = 1500;
 /// Matches the Linux outbound flow `__ip_local_out()` →
 /// `ip_output()` in `net/ipv4/ip_output.c`.
 pub fn nf_tx_filter(iface_out: &str, ipv4_packet: &mut [u8]) -> crate::netfilter::Verdict {
+    nf_tx_filter_in(0, iface_out, ipv4_packet)
+}
+
+pub fn nf_tx_filter_in(
+    net_ns_id: u64,
+    iface_out: &str,
+    ipv4_packet: &mut [u8],
+) -> crate::netfilter::Verdict {
     {
         let mut ctx = crate::netfilter::PktCtx::new_ipv4(
             crate::netfilter::HookPoint::LocalOut,
             "",
             iface_out,
             ipv4_packet,
-        );
+        )
+        .with_net_ns(net_ns_id);
         let v = crate::netfilter::nf_dispatch(&mut ctx);
         if v != crate::netfilter::Verdict::Accept {
             return v;
@@ -337,6 +391,7 @@ pub fn nf_tx_filter(iface_out: &str, ipv4_packet: &mut [u8]) -> crate::netfilter
         "",
         iface_out,
         ipv4_packet,
-    );
+    )
+    .with_net_ns(net_ns_id);
     crate::netfilter::nf_dispatch(&mut ctx)
 }

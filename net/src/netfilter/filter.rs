@@ -20,6 +20,13 @@ use narf_lib::sync::IrqSafeSpinLock;
 use super::rules::{Chain, Match, Rule, Table};
 use super::{conntrack, parse_tuple_ipv4, HookPoint, PktCtx, Verdict};
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RulesetError {
+    AlreadyExists,
+    NotFound,
+    NotEmpty,
+}
+
 /// Builtin filter table — the single global rule store. Stage-3 only
 /// implements one table; nftables-style multi-table support is a
 /// straightforward extension.
@@ -66,6 +73,67 @@ impl Filter {
         });
     }
 
+    pub fn create_table(&self, name: &str) -> Result<(), RulesetError> {
+        let mut tables = self.inner.lock();
+        if tables.iter().any(|table| table.name == name) {
+            return Err(RulesetError::AlreadyExists);
+        }
+        tables.push(Table::new(name.to_string()));
+        Ok(())
+    }
+
+    pub fn delete_table(&self, name: &str) -> Result<(), RulesetError> {
+        let mut tables = self.inner.lock();
+        let index = tables
+            .iter()
+            .position(|table| table.name == name)
+            .ok_or(RulesetError::NotFound)?;
+        if !tables[index].chains.is_empty() {
+            return Err(RulesetError::NotEmpty);
+        }
+        tables.remove(index);
+        Ok(())
+    }
+
+    pub fn create_chain(&self, table: &str, chain: &str) -> Result<(), RulesetError> {
+        let mut tables = self.inner.lock();
+        let table = tables
+            .iter_mut()
+            .find(|candidate| candidate.name == table)
+            .ok_or(RulesetError::NotFound)?;
+        if table.chains.iter().any(|candidate| candidate.name == chain) {
+            return Err(RulesetError::AlreadyExists);
+        }
+        let hook = match chain {
+            "prerouting" => HookPoint::PreRouting,
+            "input" => HookPoint::LocalIn,
+            "forward" => HookPoint::Forward,
+            "output" => HookPoint::LocalOut,
+            "postrouting" => HookPoint::PostRouting,
+            _ => HookPoint::LocalIn,
+        };
+        table.chains.push(Chain::new(chain.to_string(), hook));
+        Ok(())
+    }
+
+    pub fn delete_chain(&self, table: &str, chain: &str) -> Result<(), RulesetError> {
+        let mut tables = self.inner.lock();
+        let table = tables
+            .iter_mut()
+            .find(|candidate| candidate.name == table)
+            .ok_or(RulesetError::NotFound)?;
+        let index = table
+            .chains
+            .iter()
+            .position(|candidate| candidate.name == chain)
+            .ok_or(RulesetError::NotFound)?;
+        if !table.chains[index].rules.is_empty() {
+            return Err(RulesetError::NotEmpty);
+        }
+        table.chains.remove(index);
+        Ok(())
+    }
+
     /// Set a chain's default policy.
     pub fn set_policy(&self, table: &str, chain: &str, v: Verdict) {
         self.table_mut(table, |t| {
@@ -89,6 +157,13 @@ impl Filter {
         out
     }
 
+    /// Consistent ruleset snapshot for read-only nfnetlink enumeration.
+    /// Cloning under the one store lock prevents userspace from observing a
+    /// table/chain/rule mixture from different updates.
+    pub fn snapshot(&self) -> Vec<Table> {
+        self.inner.lock().clone()
+    }
+
     /// Reset to empty. Test-only.
     #[doc(hidden)]
     pub fn __reset_for_test(&self) {
@@ -98,8 +173,6 @@ impl Filter {
 
 static FILTER: Filter = Filter::new();
 
-/// Reference the global filter.
-#[inline]
 pub fn filter() -> &'static Filter {
     &FILTER
 }
@@ -111,12 +184,32 @@ pub fn __reset_for_test() {
 
 /// Add a rule to `table`/`chain`. Auto-creates both if absent.
 pub fn nf_table_add(table: &str, chain: &str, m: Match, verdict: Verdict) {
-    FILTER.add(table, chain, Rule { m, verdict });
+    nf_table_add_in(0, table, chain, m, verdict);
+}
+
+pub fn nf_table_add_in(net_ns_id: u64, table: &str, chain: &str, m: Match, verdict: Verdict) {
+    if net_ns_id == 0 {
+        FILTER.add(table, chain, Rule { m, verdict });
+    } else {
+        super::namespace::get(net_ns_id)
+            .filter
+            .add(table, chain, Rule { m, verdict });
+    }
 }
 
 /// Set the default policy on `table`/`chain`.
 pub fn nf_table_set_policy(table: &str, chain: &str, v: Verdict) {
-    FILTER.set_policy(table, chain, v);
+    nf_table_set_policy_in(0, table, chain, v);
+}
+
+pub fn nf_table_set_policy_in(net_ns_id: u64, table: &str, chain: &str, v: Verdict) {
+    if net_ns_id == 0 {
+        FILTER.set_policy(table, chain, v);
+    } else {
+        super::namespace::get(net_ns_id)
+            .filter
+            .set_policy(table, chain, v);
+    }
 }
 
 // ── Hooks ───────────────────────────────────────────────────────────
@@ -127,14 +220,23 @@ fn filter_for(hook: HookPoint, ctx: &mut PktCtx<'_>) -> Verdict {
         None => return Verdict::Accept,
     };
     let ct_state = ctx.conntrack_id.and_then(|id| {
-        let ct = conntrack::ct();
-        let map = ct.lookup(&tuple);
+        let map = if ctx.net_ns_id == 0 {
+            conntrack::ct().lookup(&tuple)
+        } else {
+            super::namespace::get(ctx.net_ns_id)
+                .conntrack
+                .lookup(&tuple)
+        };
         map.map(|e| e.lock().state).or_else(|| {
             let _ = id;
             None
         })
     });
-    let chains = FILTER.chains_at(hook);
+    let chains = if ctx.net_ns_id == 0 {
+        FILTER.chains_at(hook)
+    } else {
+        super::namespace::get(ctx.net_ns_id).filter.chains_at(hook)
+    };
     if chains.is_empty() {
         return Verdict::Accept;
     }

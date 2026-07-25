@@ -38,7 +38,7 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
     {
         let t = current_task_id();
         if let Some(ns) = crate::namespaces::current_net_ns(t) {
-            sock.set_net_ns_id(ns.id());
+            sock.set_net_namespace(ns);
         }
     }
     socket_arc_register(&sock);

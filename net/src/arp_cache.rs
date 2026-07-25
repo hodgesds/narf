@@ -299,9 +299,20 @@ pub struct ArpSnapshot {
 
 /// Snapshot every entry across all per-iface caches.
 pub fn snapshot() -> Vec<ArpSnapshot> {
+    snapshot_in(0)
+}
+
+pub fn snapshot_in(net_ns_id: u64) -> Vec<ArpSnapshot> {
+    let interface_names: Vec<String> = crate::iface::snapshot_all_in(net_ns_id)
+        .into_iter()
+        .map(|interface| interface.name)
+        .collect();
     let g = CACHES.lock();
     let mut out = Vec::new();
-    for cache in g.iter() {
+    for cache in g
+        .iter()
+        .filter(|cache| interface_names.iter().any(|name| name == &cache.name))
+    {
         for (ip, e) in cache.entries.iter() {
             let flags = match e.state {
                 ArpState::Reachable | ArpState::Stale | ArpState::Probe => 0x02,

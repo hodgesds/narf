@@ -397,6 +397,7 @@ pub enum CapKind {
     // Network
     NetIface = 0x0020,
     StackInstall = 0x0021,
+    NetfilterAdmin = 0x0022,
 
     // Filesystem
     FileNode = 0x0030,
@@ -544,6 +545,7 @@ const KIND_NAMES: &[(&str, CapKind)] = &[
     ("Namespace", CapKind::Namespace),
     ("NetIface", CapKind::NetIface),
     ("StackInstall", CapKind::StackInstall),
+    ("NetfilterAdmin", CapKind::NetfilterAdmin),
     ("FileNode", CapKind::FileNode),
     ("DirNode", CapKind::DirNode),
     ("MountPoint", CapKind::MountPoint),
