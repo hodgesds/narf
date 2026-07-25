@@ -175,6 +175,12 @@ hard-IRQ handler acknowledges/reloads the counter and captures task, IP, time,
 and counter identity into a fixed per-CPU slot without allocation. Normal
 syscall context drains those slots into `PERF_RECORD_SAMPLE`/`LOST` records,
 advances `data_head` with release ordering, and wakes poll/epoll readers.
+Committed exec, comm-change, fork/clone-process, and process-exit paths emit
+Linux `PERF_RECORD_COMM`, `FORK`, and `EXIT` records when their corresponding
+attribute bits are selected. Variable records are eight-byte aligned;
+`sample_id_all` appends the selected TID/TIME/ID/STREAM_ID/CPU/IDENTIFIER
+identity fields in Linux order. `wakeup_events` counts committed records and
+wakes readers at the requested threshold.
 Unsupported sample layouts and platforms without a routed PMU overflow IRQ
 fail explicitly; aarch64 sampling remains `EOPNOTSUPP` until PMUv3 overflow
 is wired through GICv3.

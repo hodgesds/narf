@@ -8,9 +8,11 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize
 use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_linux_perf_uapi::{
-    PerfEventAttr, PERF_ATTR_FLAG_DISABLED, PERF_ATTR_FLAG_ENABLE_ON_EXEC, PERF_ATTR_SIZE_VER0,
-    PERF_COUNT_SW_DUMMY, PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST,
-    PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_LOST,
+    PerfEventAttr, PERF_ATTR_FLAG_COMM, PERF_ATTR_FLAG_COMM_EXEC, PERF_ATTR_FLAG_DISABLED,
+    PERF_ATTR_FLAG_ENABLE_ON_EXEC, PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_TASK,
+    PERF_ATTR_SIZE_VER0, PERF_COUNT_SW_DUMMY, PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST,
+    PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM,
+    PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC,
     PERF_RECORD_SAMPLE, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
     PERF_SAMPLE_PERIOD, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
     PERF_TYPE_SOFTWARE,
@@ -58,7 +60,12 @@ impl PendingSample {
 
 const PERF_FORMAT_SUPPORTED: u64 = (1 << 5) - 1;
 
-const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED | PERF_ATTR_FLAG_ENABLE_ON_EXEC;
+const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
+    | PERF_ATTR_FLAG_ENABLE_ON_EXEC
+    | PERF_ATTR_FLAG_COMM
+    | PERF_ATTR_FLAG_TASK
+    | PERF_ATTR_FLAG_SAMPLE_ID_ALL
+    | PERF_ATTR_FLAG_COMM_EXEC;
 
 const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
@@ -97,6 +104,7 @@ struct PerfEventFile {
     time_enabled_ns: AtomicU64,
     registered: AtomicBool,
     sample_lost: AtomicU64,
+    wakeup_pending: AtomicU32,
     #[cfg(target_arch = "x86_64")]
     sample_period: u64,
     mmap_seq: AtomicU32,
@@ -358,6 +366,17 @@ impl PerfEventFile {
             PERF_MMAP_DATA_HEAD_OFFSET,
             head.wrapping_add(record.len() as u64),
         );
+        let threshold = self.attr.wakeup_events_or_watermark;
+        if threshold != 0
+            && self
+                .wakeup_pending
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1)
+                >= threshold
+        {
+            self.wakeup_pending.store(0, Ordering::Release);
+            narf_net::readiness::notify(0);
+        }
         true
     }
 
@@ -421,6 +440,77 @@ impl PerfEventFile {
         self.push_record(&record)
     }
 
+    fn append_sample_id(&self, record: &mut Vec<u8>, pid: u32, tid: u32, now: u64) {
+        if self.attr.flags & PERF_ATTR_FLAG_SAMPLE_ID_ALL == 0 {
+            return;
+        }
+        if self.attr.sample_type & PERF_SAMPLE_TID != 0 {
+            record.extend_from_slice(&pid.to_ne_bytes());
+            record.extend_from_slice(&tid.to_ne_bytes());
+        }
+        if self.attr.sample_type & PERF_SAMPLE_TIME != 0 {
+            record.extend_from_slice(&now.to_ne_bytes());
+        }
+        if self.attr.sample_type & PERF_SAMPLE_ID != 0 {
+            record.extend_from_slice(&self.id.to_ne_bytes());
+        }
+        if self.attr.sample_type & PERF_SAMPLE_STREAM_ID != 0 {
+            record.extend_from_slice(&self.id.to_ne_bytes());
+        }
+        if self.attr.sample_type & PERF_SAMPLE_CPU != 0 {
+            record.extend_from_slice(&(narf_lib::percpu::current_cpu() as u32).to_ne_bytes());
+            record.extend_from_slice(&0u32.to_ne_bytes());
+        }
+        if self.attr.sample_type & PERF_SAMPLE_IDENTIFIER != 0 {
+            record.extend_from_slice(&self.id.to_ne_bytes());
+        }
+    }
+
+    fn finish_record(record: &mut [u8], misc: u16) -> bool {
+        let Ok(size) = u16::try_from(record.len()) else {
+            return false;
+        };
+        record[4..6].copy_from_slice(&misc.to_ne_bytes());
+        record[6..8].copy_from_slice(&size.to_ne_bytes());
+        true
+    }
+
+    fn comm_record(&self, pid: u32, tid: u32, comm: &str, exec: bool) -> bool {
+        let mut record = Vec::with_capacity(64);
+        record.extend_from_slice(&PERF_RECORD_COMM.to_ne_bytes());
+        record.extend_from_slice(&0u16.to_ne_bytes());
+        record.extend_from_slice(&0u16.to_ne_bytes());
+        record.extend_from_slice(&pid.to_ne_bytes());
+        record.extend_from_slice(&tid.to_ne_bytes());
+        record.extend_from_slice(comm.as_bytes());
+        record.push(0);
+        while record.len() & 7 != 0 {
+            record.push(0);
+        }
+        self.append_sample_id(&mut record, pid, tid, narf_time::monotonic_ns());
+        let misc = if exec && self.attr.flags & PERF_ATTR_FLAG_COMM_EXEC != 0 {
+            PERF_RECORD_MISC_COMM_EXEC
+        } else {
+            0
+        };
+        Self::finish_record(&mut record, misc) && self.push_record(&record)
+    }
+
+    fn task_record(&self, record_type: u32, pid: u32, ppid: u32, tid: u32, ptid: u32) -> bool {
+        let now = narf_time::monotonic_ns();
+        let mut record = Vec::with_capacity(64);
+        record.extend_from_slice(&record_type.to_ne_bytes());
+        record.extend_from_slice(&0u16.to_ne_bytes());
+        record.extend_from_slice(&0u16.to_ne_bytes());
+        record.extend_from_slice(&pid.to_ne_bytes());
+        record.extend_from_slice(&ppid.to_ne_bytes());
+        record.extend_from_slice(&tid.to_ne_bytes());
+        record.extend_from_slice(&ptid.to_ne_bytes());
+        record.extend_from_slice(&now.to_ne_bytes());
+        self.append_sample_id(&mut record, pid, tid, now);
+        Self::finish_record(&mut record, 0) && self.push_record(&record)
+    }
+
     fn member_files(&self) -> Vec<Arc<dyn FileOps>> {
         self.group_members
             .lock()
@@ -465,6 +555,8 @@ impl PerfEventFile {
 /// Events are owned by the monitoring process but keyed by the target task,
 /// matching the way the upstream perf CLI opens events for its stopped child.
 pub(crate) fn on_exec(task: u64) {
+    let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
+    let comm = crate::handlers::proc_comm_of(task);
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| {
         let Some(event) = weak.upgrade() else {
@@ -476,19 +568,69 @@ pub(crate) fn on_exec(task: u64) {
         {
             let _ = event.for_group(PERF_IOC_FLAG_GROUP, PerfEventFile::enable);
         }
+        if event.target_task == task && event.attr.flags & PERF_ATTR_FLAG_COMM != 0 {
+            if let Some(comm) = comm.as_deref() {
+                let _ = event.comm_record(pid as u32, task as u32, comm, true);
+            }
+        }
         true
     });
 }
 
-/// Stop task-targeted events when the target process becomes group-dead.
-pub(crate) fn on_process_exit(pid: u64, _tid: u64) {
+pub(crate) fn on_comm(task: u64, comm: &str) {
+    let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| {
         let Some(event) = weak.upgrade() else {
             return false;
         };
-        if event.target_pid == pid && event._group_leader.is_none() {
-            let _ = event.for_group(PERF_IOC_FLAG_GROUP, PerfEventFile::disable);
+        if event.target_task == task && event.attr.flags & PERF_ATTR_FLAG_COMM != 0 {
+            let _ = event.comm_record(pid as u32, task as u32, comm, false);
+        }
+        true
+    });
+}
+
+pub(crate) fn on_fork(parent_pid: u64, child_pid: u64, parent_tid: u64, child_tid: u64) {
+    let mut registry = PERF_EVENT_REGISTRY.lock();
+    registry.retain(|weak| {
+        let Some(event) = weak.upgrade() else {
+            return false;
+        };
+        if event.target_pid == parent_pid && event.attr.flags & PERF_ATTR_FLAG_TASK != 0 {
+            let _ = event.task_record(
+                PERF_RECORD_FORK,
+                child_pid as u32,
+                parent_pid as u32,
+                child_tid as u32,
+                parent_tid as u32,
+            );
+        }
+        true
+    });
+}
+
+/// Stop task-targeted events when the target process becomes group-dead.
+pub(crate) fn on_process_exit(pid: u64, tid: u64) {
+    let parent_pid = crate::handlers::parent_of_get(pid).unwrap_or(0);
+    let mut registry = PERF_EVENT_REGISTRY.lock();
+    registry.retain(|weak| {
+        let Some(event) = weak.upgrade() else {
+            return false;
+        };
+        if event.target_pid == pid {
+            if event.attr.flags & PERF_ATTR_FLAG_TASK != 0 {
+                let _ = event.task_record(
+                    PERF_RECORD_EXIT,
+                    pid as u32,
+                    parent_pid as u32,
+                    tid as u32,
+                    parent_pid as u32,
+                );
+            }
+            if event._group_leader.is_none() {
+                let _ = event.for_group(PERF_IOC_FLAG_GROUP, PerfEventFile::disable);
+            }
         }
         true
     });
@@ -886,6 +1028,12 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
+    if attr.flags & PERF_ATTR_FLAG_SAMPLE_ID_ALL != 0
+        && attr.sample_type & !PERF_SAMPLE_SUPPORTED != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        return;
+    }
 
     if !is_supported_event(&attr) {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
@@ -1081,6 +1229,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             time_enabled_ns: AtomicU64::new(0),
             registered: AtomicBool::new(false),
             sample_lost: AtomicU64::new(0),
+            wakeup_pending: AtomicU32::new(0),
             #[cfg(target_arch = "x86_64")]
             sample_period,
             mmap_seq: AtomicU32::new(0),

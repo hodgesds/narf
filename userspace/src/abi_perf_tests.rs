@@ -685,6 +685,74 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
         let _ = call(Syscall::Close.raw(), a0(sample_fd as u64));
 
+        // Test 19: real lifecycle callbacks encode COMM/FORK/EXIT records,
+        // including the requested sample_id_all identity trailer.
+        let metadata_attr = PerfEventAttr {
+            type_: 1,
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: 9, // PERF_COUNT_SW_DUMMY
+            sample_type: (1 << 1) // TID
+                | (1 << 2) // TIME
+                | (1 << 6) // ID
+                | (1 << 7) // CPU
+                | (1 << 16), // IDENTIFIER
+            flags: (1 << 9) // comm
+                | (1 << 13) // task
+                | (1 << 18), // sample_id_all
+            ..PerfEventAttr::default()
+        };
+        let metadata_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &metadata_attr as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(f) if f >= 0 => f as u32,
+            _ => return Err("perf_event_open(metadata event) failed"),
+        };
+        let metadata_ops = crate::fd::with_table(FAKE_TASK, |t| {
+            t.get(metadata_fd).map(|entry| entry.ops.clone())
+        })
+        .flatten()
+        .ok_or("perf metadata fd was absent from the fd table")?;
+        let metadata_frames = metadata_ops
+            .mmap_frames(0, 3 * 4096)
+            .map_err(|_| "perf metadata mmap failed")?;
+        let task = crate::handlers::current_task_id();
+        let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
+        crate::perf_event::on_comm(task, "worker");
+        crate::perf_event::on_fork(pid, 77, task, 88);
+        crate::perf_event::on_process_exit(pid, task);
+        // SAFETY: metadata_ops owns these identity-mapped frames.
+        let metadata_head =
+            unsafe { core::ptr::read_volatile((metadata_frames[0] as usize + 1024) as *const u64) };
+        if metadata_head != 208 {
+            return Err("perf lifecycle records have the wrong combined wire size");
+        }
+        // SAFETY: all three records fit contiguously in the first data page.
+        let records = unsafe {
+            core::slice::from_raw_parts(metadata_frames[1] as *const u8, metadata_head as usize)
+        };
+        let header = |offset: usize| {
+            (
+                u32::from_ne_bytes(records[offset..offset + 4].try_into().unwrap()),
+                u16::from_ne_bytes(records[offset + 6..offset + 8].try_into().unwrap()),
+            )
+        };
+        if header(0) != (3, 64) || header(64) != (7, 72) || header(136) != (4, 72) {
+            return Err("PERF_RECORD_COMM/FORK/EXIT wire headers are invalid");
+        }
+        if &records[16..23] != b"worker\0"
+            || u32::from_ne_bytes(records[72..76].try_into().unwrap()) != 77
+            || u32::from_ne_bytes(records[80..84].try_into().unwrap()) != 88
+        {
+            return Err("perf lifecycle record payloads are invalid");
+        }
+        let _ = call(Syscall::Close.raw(), a0(metadata_fd as u64));
+
         Ok(())
     })
 }

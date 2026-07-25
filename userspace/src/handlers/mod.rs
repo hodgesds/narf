@@ -5226,6 +5226,14 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // to close the SMP TRACEME race (see the comment at that call site). A
     // thread (CLONE_THREAD) is not waitpid-reapable; pthread_join uses the
     // futex on clear_child_tid instead — so nothing to publish for it.
+    if !share_thread {
+        crate::perf_event::on_fork(
+            task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
+            child_visible_pid,
+            parent_pid,
+            child_tid.raw(),
+        );
+    }
 
     // Return: parent sees child TID (== visible-pid for !THREAD,
     // == TaskId.raw() for THREAD where TID and PID diverge). For a new
@@ -5654,9 +5662,9 @@ pub fn wait_init() {
     // orphaned. Gated on `group_dead` so a multi-threaded exit_group
     // reaps the pid exactly once (was per-thread → double `release_pid`,
     // the OCI teardown #UD).
-    crate::user_task::register_process_exit_observer(on_child_exit);
     #[cfg(feature = "linux-compat")]
     crate::user_task::register_process_exit_observer(crate::perf_event::on_process_exit);
+    crate::user_task::register_process_exit_observer(on_child_exit);
     crate::user_task::register_process_exit_observer(crate::mapped_file::process_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
@@ -8807,12 +8815,6 @@ fn do_execve_resolved(
     // clear_child_tid tracking is a linux-compat-only path.
     #[cfg(feature = "linux-compat")]
     let _ = take_clear_child_tid(task);
-    // Commit perf `enable_on_exec` only after the new image has loaded
-    // successfully. The event normally belongs to the monitoring parent and
-    // targets this task, so perf_event maintains a weak target registry rather
-    // than looking only in this task's fd table.
-    #[cfg(feature = "linux-compat")]
-    crate::perf_event::on_exec(task);
     // FD_CLOEXEC sweep: close every fd marked close-on-exec (Linux
     // does this in the exec path). Without it, O_CLOEXEC fds leak
     // across exec — an fd-table leak that is also a sandbox-escape
@@ -8826,6 +8828,10 @@ fn do_execve_resolved(
         let basename = first.rsplit('/').next().unwrap_or(first);
         set_proc_comm(task, basename);
     }
+    // Commit perf enable_on_exec and PERF_RECORD_COMM only after both the new
+    // image and its Linux comm name have been published.
+    #[cfg(feature = "linux-compat")]
+    crate::perf_event::on_exec(task);
     // /proc/[pid]/exe: `cur_path` survived the shebang loop, so it names
     // the binary actually being mapped (the interpreter for scripts).
     set_proc_exe(task, &cur_path);

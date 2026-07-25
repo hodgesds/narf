@@ -129,6 +129,7 @@ pub const PERF_RECORD_LOST_SAMPLES: u32 = 13;
 pub const PERF_RECORD_MISC_CPUMODE_MASK: u16 = 7;
 pub const PERF_RECORD_MISC_KERNEL: u16 = 1;
 pub const PERF_RECORD_MISC_USER: u16 = 2;
+pub const PERF_RECORD_MISC_COMM_EXEC: u16 = 1 << 13;
 pub const PERF_RECORD_MISC_EXACT_IP: u16 = 1 << 14;
 
 #[repr(C)]
