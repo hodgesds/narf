@@ -50,12 +50,31 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
         other => (other, None),
     };
     match result {
-        crate::socket::SocketOpResult::Received { n, .. } => {
+        crate::socket::SocketOpResult::Received { n, peer } => {
             // Copy received bytes back to user under SMAP bracket.
             // SAFETY: ptr validated above; AS still active.
             if unsafe { copy_to_user(buf_ptr, &buf[..n]) }.is_err() {
                 ctx.set_return(fail);
                 return;
+            }
+            // recvfrom source-address output: arg4 points to sockaddr storage,
+            // arg5 points to its in/out socklen_t. Plain recv passes both zero.
+            if args.arg4 != 0 && args.arg5 != 0 {
+                if let Some(peer) = peer {
+                    let capacity = read_user_u32(args.arg5) as usize;
+                    let mut encoded = alloc::vec![0u8; 2 + peer.body.len()];
+                    encoded[..2].copy_from_slice(&peer.family.to_ne_bytes());
+                    encoded[2..].copy_from_slice(&peer.body);
+                    let copied = capacity.min(encoded.len());
+                    if copied > 0 && unsafe { copy_to_user(args.arg4, &encoded[..copied]) }.is_err()
+                    {
+                        ctx.set_return(fail);
+                        return;
+                    }
+                    write_user_u32(args.arg5, encoded.len() as u32);
+                } else {
+                    write_user_u32(args.arg5, 0);
+                }
             }
             let returned = if flags & crate::socket::MSG_TRUNC != 0 {
                 truncated_full_len.unwrap_or(n)

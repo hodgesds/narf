@@ -200,10 +200,21 @@ snapshots that back `/proc/net/tcp` and `/proc/net/udp`, followed by
 `NLMSG_DONE`. Unsupported address families and transport protocols return
 `EOPNOTSUPP`.
 
+`NETLINK_NETFILTER` accepts IPv4 conntrack `IPCTNL_MSG_CT_GET` dumps and
+emits Linux nfnetlink `IPCTNL_MSG_CT_NEW` records with original/reply tuples,
+status, timeout, and flow ID from the canonical conntrack table. Dumps end
+with `NLMSG_DONE`. Mutations and unsupported nfnetlink subsystems return
+`EOPNOTSUPP`; Linux netlink does not grant ambient filter/NAT authority.
+
 AF_NETLINK sockets retain their bound `sockaddr_nl` port ID and group mask,
 support a connected kernel or userspace destination, auto-bind before the
 first send, and expose Linux `SOL_NETLINK` membership and feature-option
-round trips. Kernel-originated messages use port ID zero. A send may contain
+round trips. Explicit port IDs are unique within each netlink protocol.
+`sendto` or connected send to a live userspace port delivers one datagram and
+reports the sender's port ID through `recvfrom`; a missing destination returns
+`ECONNREFUSED`. Userspace multicast is rejected because NARF does not infer
+Linux ambient broadcast authority; kernel protocol notifications still fan out
+to subscribed sockets. Kernel-originated messages use port ID zero. A send may contain
 multiple `NLMSG_ALIGN`-framed requests; replies preserve request order and
 sequence numbers. `NLM_F_ACK` requests receive `NLMSG_ERROR` with error zero
 after successful handling, while malformed framing fails with `EINVAL`.

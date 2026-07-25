@@ -103,6 +103,7 @@ pub const IFLA_STATS64: u16 = 23;
 pub const IFLA_GROUP: u16 = 27;
 pub const IFLA_CARRIER: u16 = 33;
 pub const IF_OPER_UP: u8 = 6;
+pub const IF_OPER_DOWN: u8 = 2;
 
 // ── IFA_* address attribute types (if_addr.h) ───────────────────────────
 
@@ -262,10 +263,15 @@ fn build_newlink(link: &LinkInfo, seq: u32, pid: u32) -> Vec<u8> {
     push_rtattr(&mut body, IFLA_MTU, &link.mtu.to_le_bytes());
     push_rtattr(&mut body, IFLA_QDISC, b"noqueue\0");
     push_rtattr(&mut body, IFLA_TXQLEN, &1000u32.to_ne_bytes());
-    push_rtattr(&mut body, IFLA_OPERSTATE, &[IF_OPER_UP]);
+    let running = link.flags & IFF_RUNNING != 0;
+    push_rtattr(
+        &mut body,
+        IFLA_OPERSTATE,
+        &[if running { IF_OPER_UP } else { IF_OPER_DOWN }],
+    );
     push_rtattr(&mut body, IFLA_LINKMODE, &[0]);
     push_rtattr(&mut body, IFLA_GROUP, &0u32.to_ne_bytes());
-    push_rtattr(&mut body, IFLA_CARRIER, &[1]);
+    push_rtattr(&mut body, IFLA_CARRIER, &[u8::from(running)]);
     // struct rtnl_link_stats64. Centralized driver counters currently report
     // zero, but supplying the complete native-endian shape lets Linux parsers
     // consume `ip -s link` without treating the attribute as malformed.
@@ -472,9 +478,22 @@ fn enumerate() -> (Vec<LinkInfo>, Vec<AddrInfo>) {
             mac: nic.mac.to_vec(),
             mtu: nic.mtu,
         });
-        // Report the iface's configured IPv4 (skip the 0.0.0.0 placeholder
-        // an unconfigured iface carries — an addr dump shouldn't list it).
-        if nic.ipv4 != [0, 0, 0, 0] {
+        let configured = crate::iface::get_addrs(&nic.name);
+        for (address, prefix_len) in &configured {
+            if address.0 == [0, 0, 0, 0] {
+                continue;
+            }
+            addrs.push(AddrInfo {
+                ifindex,
+                prefix_len: *prefix_len,
+                addr: address.0,
+                label: nic.name.clone(),
+            });
+        }
+        // Preserve the boot-time primary address for legacy drivers that have
+        // not yet mirrored it into the multi-address registry.
+        if nic.ipv4 != [0, 0, 0, 0] && !configured.iter().any(|(address, _)| address.0 == nic.ipv4)
+        {
             addrs.push(AddrInfo {
                 ifindex,
                 prefix_len: 24,
@@ -751,6 +770,15 @@ fn iface_name_for_index(ifindex: u32) -> Option<alloc::string::String> {
         .into_iter()
         .find(|iface| iface.ifindex == ifindex)
         .map(|iface| iface.name)
+}
+
+/// Resolve a name to the same ifindex exposed by RTM_GETLINK.
+pub fn ifindex_for_name(name: &str) -> Option<u32> {
+    enumerate()
+        .0
+        .into_iter()
+        .find(|iface| iface.name == name)
+        .map(|iface| iface.ifindex)
 }
 
 fn admin_errno(error: crate::AdminError) -> i32 {

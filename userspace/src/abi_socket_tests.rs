@@ -1527,6 +1527,13 @@ fn netlink_sockaddr(groups: u32) -> ([u8; 12], u64) {
     (buf, 12)
 }
 
+fn netlink_sockaddr_port(portid: u32) -> ([u8; 12], u64) {
+    let mut buf = [0u8; 12];
+    buf[0..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
+    buf[4..8].copy_from_slice(&portid.to_ne_bytes());
+    (buf, 12)
+}
+
 /// Build a `struct nlmsghdr` dump request: len(16) type flags(REQUEST|DUMP)
 /// seq pid.
 fn nlmsg_request(msg_type: u16, seq: u32) -> [u8; NLMSG_HDRLEN] {
@@ -2152,6 +2159,16 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
             alloc::string::String::from("/devices/abi-netlink-test"),
             alloc::string::String::from("net"),
         );
+        let queued = netlink_inq(fd)? as i64;
+        if queued <= 4 {
+            return Err("SIOCINQ did not report the pending uevent");
+        }
+        let mut short = [0u8; 4];
+        let peeked = netlink_recv_flags(fd, &mut short, MSG_DONTWAIT | 0x02 | 0x20)
+            .ok_or("uevent MSG_PEEK|MSG_TRUNC status")?;
+        if peeked != queued {
+            return Err("uevent MSG_TRUNC did not return the complete datagram length");
+        }
         // recv the event; the netlink wire text begins "add@<devpath>".
         let mut buf = [0u8; 512];
         let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
@@ -2178,6 +2195,7 @@ kernel_test_in!("syscall_abi", smoke_abi_netlink_uevent_recv);
 // Operation not permitted". These smokes pin the no-op sink behaviour.
 const NETLINK_AUDIT: u64 = 9;
 const NETLINK_SOCK_DIAG: u64 = 4;
+const NETLINK_NETFILTER: u64 = 12;
 const NETLINK_GENERIC: u64 = 16;
 
 fn smoke_abi_netlink_audit_socket_open_bind_send() -> TestResult {
@@ -2426,6 +2444,139 @@ fn smoke_abi_netlink_sock_diag_tcp_dump() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_sock_diag_tcp_dump);
+
+fn smoke_abi_netlink_conntrack_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_NETFILTER)?;
+        let (addr, alen) = netlink_sockaddr(0);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("netfilter bind status")?
+            != 0
+        {
+            return Err("bind(NETLINK_NETFILTER) failed");
+        }
+        let mut request = [0u8; 20];
+        request[0..4].copy_from_slice(&20u32.to_ne_bytes());
+        request[4..6].copy_from_slice(&0x0101u16.to_ne_bytes());
+        request[6..8].copy_from_slice(&0x301u16.to_ne_bytes());
+        request[8..12].copy_from_slice(&411u32.to_ne_bytes());
+        request[16] = 2; // AF_INET nfgenmsg
+        if netlink_send(fd, &request).ok_or("conntrack send status")? != request.len() as i64 {
+            return Err("conntrack dump request was not consumed");
+        }
+        let mut saw_done = false;
+        for _ in 0..4097 {
+            let mut reply = [0u8; 512];
+            let n = netlink_recv(fd, &mut reply).ok_or("conntrack recv status")?;
+            if n < 16 {
+                return Err("short conntrack netlink reply");
+            }
+            let kind = nlmsg_type_of(&reply);
+            if kind == 3 {
+                saw_done = true;
+                break;
+            }
+            if kind != 0x0100 || n < 20 {
+                return Err("malformed conntrack dump record");
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        if !saw_done {
+            return Err("conntrack dump omitted NLMSG_DONE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_conntrack_dump);
+
+fn smoke_abi_netlink_userspace_unicast_and_unique_portid() -> TestResult {
+    with_setup(|| {
+        let sender = open_netlink(NETLINK_AUDIT)?;
+        let receiver = open_netlink(NETLINK_AUDIT)?;
+        let duplicate = open_netlink(NETLINK_AUDIT)?;
+        let (sender_addr, sender_len) = netlink_sockaddr_port(70_001);
+        let (receiver_addr, receiver_len) = netlink_sockaddr_port(70_002);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(sender, sender_addr.as_ptr() as u64, sender_len),
+        )
+        .ok_or("sender bind status")?
+            != 0
+            || call(
+                Syscall::SocketBind.raw(),
+                a2(receiver, receiver_addr.as_ptr() as u64, receiver_len),
+            )
+            .ok_or("receiver bind status")?
+                != 0
+        {
+            return Err("explicit netlink port bind failed");
+        }
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(duplicate, sender_addr.as_ptr() as u64, sender_len),
+        )
+        .ok_or("duplicate bind status")?
+            >= 0
+        {
+            return Err("duplicate netlink port ID was accepted");
+        }
+
+        let payload = b"user-netlink";
+        let mut send_args = a3(sender, payload.as_ptr() as u64, payload.len() as u64, 0);
+        send_args.arg4 = receiver_addr.as_ptr() as u64;
+        send_args.arg5 = receiver_len;
+        if call(Syscall::SocketSend.raw(), send_args).ok_or("user sendto status")?
+            != payload.len() as i64
+        {
+            return Err("userspace netlink sendto failed");
+        }
+
+        let mut received = [0u8; 32];
+        let mut peer = [0u8; 12];
+        let mut peer_len = peer.len() as u32;
+        let mut recv_args = a3(
+            receiver,
+            received.as_mut_ptr() as u64,
+            received.len() as u64,
+            MSG_DONTWAIT,
+        );
+        recv_args.arg4 = peer.as_mut_ptr() as u64;
+        recv_args.arg5 = (&mut peer_len as *mut u32) as u64;
+        let n = call(Syscall::SocketRecv.raw(), recv_args).ok_or("user recvfrom status")?;
+        if n != payload.len() as i64 || &received[..payload.len()] != payload {
+            return Err("userspace netlink payload did not round-trip");
+        }
+        if u32::from_ne_bytes(peer[4..8].try_into().unwrap_or([0; 4])) != 70_001 {
+            return Err("userspace netlink sender port ID was not reported");
+        }
+
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(sender, receiver_addr.as_ptr() as u64, receiver_len),
+        )
+        .ok_or("netlink connect status")?
+            != 0
+            || netlink_send(sender, b"connected").ok_or("connected send status")? != 9
+        {
+            return Err("connected userspace netlink send failed");
+        }
+        let n = netlink_recv(receiver, &mut received).ok_or("connected recv status")?;
+        if n != 9 || &received[..9] != b"connected" {
+            return Err("connected userspace netlink payload did not arrive");
+        }
+        for fd in [sender, receiver, duplicate] {
+            let _ = call(Syscall::Close.raw(), a0(fd));
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_netlink_userspace_unicast_and_unique_portid
+);
 
 /// True iff `needle` appears as a contiguous byte window in `hay`.
 fn window_contains(hay: &[u8], needle: &[u8]) -> bool {

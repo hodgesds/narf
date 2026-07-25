@@ -305,6 +305,7 @@ pub fn __reset_for_test() {
 /// the global table lock.
 #[derive(Clone, Debug)]
 pub struct ConntrackSnapshot {
+    pub id: u64,
     pub l3proto: &'static str,
     pub l3proto_num: u8,
     pub l4proto: &'static str,
@@ -353,6 +354,7 @@ pub fn snapshot() -> alloc::vec::Vec<ConntrackSnapshot> {
         };
         let timeout = (e.expires_at_ns.saturating_sub(now) / 1_000_000_000) as u32;
         out.push(ConntrackSnapshot {
+            id: e.id,
             l3proto: "ipv4",
             l3proto_num: 2,
             l4proto: l4_name,

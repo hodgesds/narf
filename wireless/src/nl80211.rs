@@ -65,7 +65,8 @@ fn find_attr(attrs: &[u8], requested_kind: u16) -> Option<&[u8]> {
 fn interface_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
     let mut attrs = Vec::new();
     push_attr(&mut attrs, NL80211_ATTR_WIPHY, &index.to_ne_bytes());
-    push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &(index + 1).to_ne_bytes());
+    let ifindex = narf_net::netlink_route::ifindex_for_name(&info.base_name).unwrap_or(0);
+    push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
     named_attr(&mut attrs, NL80211_ATTR_IFNAME, &info.base_name);
     push_attr(
         &mut attrs,
@@ -79,7 +80,11 @@ fn interface_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
 fn wiphy_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
     let mut attrs = Vec::new();
     push_attr(&mut attrs, NL80211_ATTR_WIPHY, &index.to_ne_bytes());
-    named_attr(&mut attrs, NL80211_ATTR_WIPHY_NAME, &info.base_name);
+    named_attr(
+        &mut attrs,
+        NL80211_ATTR_WIPHY_NAME,
+        &alloc::format!("phy{index}"),
+    );
     let mut modes = Vec::new();
     if info.modes.contains(crate::iface::WirelessModes::STATION) {
         push_attr(&mut modes, NL80211_IFTYPE_STATION as u16, &[]);
@@ -107,13 +112,12 @@ fn handle(command: u8, attrs: &[u8], dump: bool) -> Result<Vec<GenlReply>, i32> 
         NL80211_CMD_GET_WIPHY => interfaces
             .iter()
             .enumerate()
-            .filter(|(index, iface)| {
+            .filter(|(index, _iface)| {
                 dump || find_attr(attrs, NL80211_ATTR_WIPHY).is_some_and(|raw| {
                     raw.len() == 4
                         && u32::from_ne_bytes(raw.try_into().unwrap_or([0; 4])) == *index as u32
                 }) || find_attr(attrs, NL80211_ATTR_WIPHY_NAME).is_some_and(|raw| {
-                    raw.strip_suffix(&[0]).unwrap_or(raw)
-                        == iface.get_wireless_info().base_name.as_bytes()
+                    raw.strip_suffix(&[0]).unwrap_or(raw) == alloc::format!("phy{index}").as_bytes()
                 })
             })
             .map(|(index, iface)| GenlReply {
@@ -124,10 +128,12 @@ fn handle(command: u8, attrs: &[u8], dump: bool) -> Result<Vec<GenlReply>, i32> 
         NL80211_CMD_GET_INTERFACE => interfaces
             .iter()
             .enumerate()
-            .filter(|(index, iface)| {
+            .filter(|(_index, iface)| {
                 dump || find_attr(attrs, NL80211_ATTR_IFINDEX).is_some_and(|raw| {
                     raw.len() == 4
-                        && u32::from_ne_bytes(raw.try_into().unwrap_or([0; 4])) == *index as u32 + 1
+                        && narf_net::netlink_route::ifindex_for_name(
+                            &iface.get_wireless_info().base_name,
+                        ) == Some(u32::from_ne_bytes(raw.try_into().unwrap_or([0; 4])))
                 }) || find_attr(attrs, NL80211_ATTR_IFNAME).is_some_and(|raw| {
                     raw.strip_suffix(&[0]).unwrap_or(raw)
                         == iface.get_wireless_info().base_name.as_bytes()
@@ -199,7 +205,7 @@ mod tests {
             },
         };
         let attrs = wiphy_attrs(4, &info);
-        assert!(attrs.windows(10).any(|window| window == b"wlan-test\0"));
+        assert!(attrs.windows(5).any(|window| window == b"phy4\0"));
         assert!(attrs
             .windows(info.base_mac.len())
             .any(|window| window == info.base_mac));

@@ -36,10 +36,12 @@ const CTRL_ATTR_OP_FLAGS: u16 = 2;
 const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
 const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
 const NLA_F_NESTED: u16 = 1 << 15;
+const NLA_TYPE_MASK: u16 = !(3 << 14);
 const GENL_CMD_CAP_DO: u32 = 1 << 1;
 const GENL_CMD_CAP_DUMP: u32 = 1 << 2;
 const CTRL_MCAST_GRP_NOTIFY: u32 = 16;
 const ENOENT: i32 = 2;
+const EINVAL: i32 = 22;
 const EOPNOTSUPP: i32 = 95;
 const NLMSGERR_ATTR_MSG: u16 = 1;
 
@@ -217,7 +219,7 @@ fn requested_attr(request: &[u8], requested_kind: u16) -> Option<&[u8]> {
     let mut off = NLMSG_HDRLEN + 4;
     while off + 4 <= request.len() {
         let len = u16::from_ne_bytes(request[off..off + 2].try_into().ok()?) as usize;
-        let kind = u16::from_ne_bytes(request[off + 2..off + 4].try_into().ok()?);
+        let kind = u16::from_ne_bytes(request[off + 2..off + 4].try_into().ok()?) & NLA_TYPE_MASK;
         if len < 4 || off + len > request.len() {
             return None;
         }
@@ -283,9 +285,6 @@ fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
 
     let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
     let mut out = Vec::new();
-    if flags & NLM_F_ACK != 0 {
-        out.push(error(0, seq, request));
-    }
     if dump {
         out.push(family_description(&CONTROL_FAMILY, seq, true));
         for family in FAMILIES.lock().iter() {
@@ -307,6 +306,10 @@ fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
                     })
             })
             .copied();
+        if name.is_none() && family_id.is_none() {
+            out.push(error(EINVAL, seq, request));
+            return Ok(out);
+        }
         if name.is_some_and(|name| name == b"nlctrl" || name == b"nlctrl\0")
             || family_id == Some(GENL_ID_CTRL)
         {
@@ -316,6 +319,13 @@ fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
         } else {
             out.push(error(ENOENT, seq, request));
         }
+    }
+    if flags & NLM_F_ACK != 0
+        && !out
+            .iter()
+            .any(|message| message.get(4..6) == Some(&NLMSG_ERROR.to_ne_bytes()))
+    {
+        out.push(error(0, seq, request));
     }
     Ok(out)
 }
@@ -404,6 +414,7 @@ fn append_extended_ack(message: &mut Vec<u8>) {
     };
     let declared = u32::from_ne_bytes(message[0..4].try_into().unwrap_or([0; 4])) as usize;
     message.truncate(declared);
+    message.resize(align(message.len()), 0);
     push_attr(message, NLMSGERR_ATTR_MSG, text);
     let new_len = message.len() as u32;
     message[0..4].copy_from_slice(&new_len.to_ne_bytes());

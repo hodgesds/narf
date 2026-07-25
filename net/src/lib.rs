@@ -61,6 +61,7 @@ pub mod mqtt;
 pub mod netfilter;
 pub mod netlink_diag;
 pub mod netlink_generic;
+pub mod netlink_netfilter;
 pub mod netlink_route;
 pub mod pkt;
 pub mod pkt_coap;
