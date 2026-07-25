@@ -29,7 +29,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -105,6 +105,7 @@ pub struct FuseConnection {
     negotiated_minor: AtomicU32,
     negotiated_flags: AtomicU64,
     max_write: AtomicU32,
+    max_pages: AtomicU16,
 }
 
 impl core::fmt::Debug for FuseConnection {
@@ -139,6 +140,7 @@ impl FuseConnection {
             negotiated_minor: AtomicU32::new(0),
             negotiated_flags: AtomicU64::new(0),
             max_write: AtomicU32::new(4096),
+            max_pages: AtomicU16::new(32),
         }
     }
 
@@ -161,6 +163,10 @@ impl FuseConnection {
 
     pub fn max_write(&self) -> u32 {
         self.max_write.load(Ordering::Acquire)
+    }
+
+    pub fn max_pages(&self) -> u16 {
+        self.max_pages.load(Ordering::Acquire)
     }
 
     /// Mark the connection dead (daemon closed `/dev/fuse`). Any in-flight
@@ -714,23 +720,41 @@ impl FileOps for FuseFile {
                 buf[..n].copy_from_slice(&data[..n]);
                 return Ok(n);
             }
+            if buf.is_empty() {
+                return Ok(0);
+            }
             let fh = self.ensure_open().await?;
-            let body = pod_as_bytes(&FuseReadIn {
-                fh,
-                offset,
-                size: buf.len() as u32,
-                read_flags: 0,
-                lock_owner: 0,
-                flags: 0,
-                padding: 0,
-            });
-            let data = self
-                .conn
-                .request(FuseOpcode::Read, self.attr.nodeid, body)
-                .await?;
-            let n = core::cmp::min(buf.len(), data.len());
-            buf[..n].copy_from_slice(&data[..n]);
-            Ok(n)
+            let max_read = usize::from(self.conn.max_pages()) * 4096;
+            let mut read = 0usize;
+            while read < buf.len() {
+                let chunk_len = core::cmp::min(buf.len() - read, max_read);
+                let chunk_offset = offset
+                    .checked_add(read as u64)
+                    .ok_or(FsError::InvalidData)?;
+                let body = pod_as_bytes(&FuseReadIn {
+                    fh,
+                    offset: chunk_offset,
+                    size: chunk_len as u32,
+                    read_flags: 0,
+                    lock_owner: 0,
+                    flags: 0,
+                    padding: 0,
+                });
+                let data = self
+                    .conn
+                    .request(FuseOpcode::Read, self.attr.nodeid, body)
+                    .await?;
+                if data.len() > chunk_len {
+                    return Err(FsError::InvalidData);
+                }
+                let chunk_read = data.len();
+                buf[read..read + chunk_read].copy_from_slice(&data);
+                read += chunk_read;
+                if chunk_read < chunk_len {
+                    break;
+                }
+            }
+            Ok(read)
         })
     }
 
@@ -740,7 +764,8 @@ impl FileOps for FuseFile {
                 return Ok(0);
             }
             let fh = self.ensure_open().await?;
-            let max_write = self.conn.max_write() as usize;
+            let page_limit = usize::from(self.conn.max_pages()) * 4096;
+            let max_write = core::cmp::min(self.conn.max_write() as usize, page_limit);
             let mut written = 0usize;
             while written < buf.len() {
                 let chunk_len = core::cmp::min(buf.len() - written, max_write);
@@ -1638,9 +1663,15 @@ impl FuseFs {
                 0
             };
         let max_write = core::cmp::max(out.max_write, 4096);
+        let max_pages = if flags & FuseInitFlag::MaxPages as u64 != 0 {
+            core::cmp::max(out.max_pages, 1)
+        } else {
+            32
+        };
         self.conn.negotiated_minor.store(minor, Ordering::Release);
         self.conn.negotiated_flags.store(flags, Ordering::Release);
         self.conn.max_write.store(max_write, Ordering::Release);
+        self.conn.max_pages.store(max_pages, Ordering::Release);
         self.conn.initialized.store(true, Ordering::Release);
         Ok(out)
     }

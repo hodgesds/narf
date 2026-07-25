@@ -214,6 +214,10 @@ FUSE writes are split into requests no larger than the negotiated
 `max_write`; each request advances the file offset, an oversized daemon
 reply is rejected as invalid data, and a short reply ends the write with
 the accumulated byte count.
+When `FUSE_MAX_PAGES` is negotiated, reads and writes are also bounded by
+the daemon's `max_pages` in 4 KiB pages. Large reads advance their offset
+across requests, stop on a short reply, and reject replies larger than
+the requested chunk.
 
 Every request header is stamped with the calling task's translated
 filesystem uid/gid and visible process id through a boot-installed

@@ -2952,7 +2952,7 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
                 flags: init.flags,
                 max_background: 0,
                 congestion_threshold: 0,
-                max_write: 128 * 1024,
+                max_write: 256 * 1024,
                 time_gran: 1,
                 max_pages: 32,
                 map_alignment: 0,
@@ -3008,6 +3008,9 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
         // FUSE_READ (15): return the file bytes at the requested range.
         15 => {
             let rin: FuseReadIn = pod_from_bytes(body)?;
+            if rin.size > 128 * 1024 {
+                return Some(fuse_reply(unique, -22, &[]));
+            }
             let contents = b"world";
             let off = rin.offset as usize;
             let end = core::cmp::min(contents.len(), off + rin.size as usize);
@@ -3273,7 +3276,7 @@ fn smoke_fs_fuse_end_to_end() -> TestResult {
                 return;
             }
         };
-        let mut buf = [0u8; 16];
+        let mut buf = alloc::vec![0u8; 128 * 1024 + 17];
         let n = match file.read(0, &mut buf).await {
             Ok(n) => n,
             Err(_) => {
@@ -3295,7 +3298,8 @@ fn smoke_fs_fuse_end_to_end() -> TestResult {
 
     match OUTCOME.load(Ordering::Relaxed) {
         1 if conn.negotiated_minor() == crate::fuse::FUSE_KERNEL_MINOR_VERSION
-            && conn.max_write() == 128 * 1024
+            && conn.max_write() == 256 * 1024
+            && conn.max_pages() == 32
             && conn.negotiated_flags() & crate::fuse::FuseInitFlag::PosixLocks as u64 != 0 =>
         {
             TestResult::Pass
