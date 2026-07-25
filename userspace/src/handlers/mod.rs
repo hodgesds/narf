@@ -718,120 +718,6 @@ pub fn shared_rings_for(task: u64) -> Option<SharedRingPair> {
 /// table so revoke + transfer work.
 static NEXT_CAP_ID: AtomicU64 = AtomicU64::new(0x4000_0000);
 
-fn sys_bootstrap(ctx: &mut dyn TrapContext) {
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let task = current_task_id();
-
-    // Allocate a phys frame, zero it, install at a fresh user vaddr
-    // (mmap-cursor-style — same scheme `sys_mmap` uses).
-    let phys = match narf_memory::alloc_frame() {
-        Ok(f) => f.start_address(),
-        Err(_) => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    // SAFETY: identity-mapped low 4 GiB; phys is page-aligned.
-    unsafe {
-        core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
-    }
-    let user_vaddr = MMAP_CURSOR.fetch_add(0x1000, Ordering::Relaxed);
-
-    if as_ref
-        .map_region(Region {
-            base: VirtAddr::new(user_vaddr),
-            len: 0x1000,
-            // Stage-4 first cut: writable. Future revision flips the
-            // page to R-only after the kernel populates it; the user
-            // ring builders read from it but don't write.
-            perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![phys],
-        })
-        .is_err()
-    {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // SAFETY: `as_ref` is the calling task's freshly-built AddressSpace with a
-    // valid root and the region just registered via `map_region`; materialize
-    // only installs PTEs for those recorded regions.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { as_ref.materialize() }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-
-    // Mint the SQ + CQ ring pair. Kernel-side halves go into
-    // BOOTSTRAP_TABLE keyed by task id; user-side halves are
-    // tagged with newly-allocated cap-slot ids and stored beside
-    // them so the dispatcher knows who to talk to.
-    let (sq_prod, sq_drain) = submission_channel::<64>();
-    let (cq_prod, cq_drain) = completion_channel::<64>();
-    let sq_cap_id = NEXT_CAP_ID.fetch_add(1, Ordering::Relaxed);
-    let cq_cap_id = NEXT_CAP_ID.fetch_add(1, Ordering::Relaxed);
-
-    // Mint the user-mappable SharedRing pair. Two phys frames; both
-    // mapped into the user AS at successive vaddrs after the config
-    // page so the user runtime can build SharedProducer/Consumer
-    // halves directly against the shared backing.
-    // SAFETY: `as_ref` is the calling task's valid AddressSpace; `mint_shared_ring_pair`
-    // allocates fresh frames, maps them into it, and materializes them under that AS.
-    // SAFETY: Valid memory or trusted environment
-    let shared = match unsafe { mint_shared_ring_pair(&as_ref) } {
-        Ok(s) => s,
-        Err(()) => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-
-    let entry = PerTaskBootstrap {
-        kernel: TaskRings { sq_drain, cq_prod },
-        user: UserRingEnds { sq_prod, cq_drain },
-        shared: Some(shared),
-        sq_cap_id,
-        cq_cap_id,
-    };
-    {
-        let mut g = BOOTSTRAP_TABLE.lock();
-        let map = match g.as_mut() {
-            Some(m) => m,
-            None => {
-                ctx.set_return(SyscallReturn::invalid_op());
-                return;
-            }
-        };
-        // Replace any prior bootstrap state for this task.
-        map.insert(task, entry);
-    }
-
-    // Write the header. Capslot ids land in `sq_cap`/`cq_cap` so
-    // the user runtime can name the rings.
-    // SAFETY: identity-mapped low 4 GiB; aligned u64 + u32 stores.
-    unsafe {
-        let header = phys.raw() as *mut BootstrapHeader;
-        (*header).magic = ABI_BOOTSTRAP_MAGIC;
-        (*header).version = ABI_BOOTSTRAP_VERSION;
-        (*header).task_id = task;
-        (*header).sq_cap = sq_cap_id;
-        (*header).cq_cap = cq_cap_id;
-        (*header).sq_depth = BOOTSTRAP_RING_DEPTH as u32;
-        (*header).cq_depth = BOOTSTRAP_RING_DEPTH as u32;
-        (*header).shared_sq_vaddr = shared.sq_user_vaddr;
-        (*header).shared_cq_vaddr = shared.cq_user_vaddr;
-        (*header).shared_depth = BOOTSTRAP_SHARED_RING_DEPTH as u32;
-        (*header)._pad = 0;
-    }
-
-    ctx.set_return(SyscallReturn::ok(user_vaddr));
-}
-
 /// Allocate two phys pages, init a SharedRing in each, map both
 /// into `as_ref` at successive vaddrs from the MMAP cursor, and
 /// return the kernel-side phys + user vaddr handles.
@@ -899,28 +785,6 @@ unsafe fn mint_shared_ring_pair(
 /// `O_CREAT` — create the file if missing. Bit 6 to match Linux's
 /// numeric convention so a libc consumer's `<fcntl.h>` lines up.
 pub const O_CREAT: u64 = 0o100;
-
-fn sys_open(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let path_ptr = args.arg0;
-    let path_len = args.arg1 as usize;
-    let mnt_ptr = args.arg2;
-    let mnt_len = args.arg3 as usize;
-    let flags = args.arg4;
-    // Copy path from userspace into kernel buffer under SMAP bracket.
-    // Use the *raw* copy (no chroot) — `open_impl`'s `resolve_cwd_path` is the
-    // single point that re-roots under the task's chroot. Using the
-    // chroot-applying `copy_user_path` here would compose the chroot
-    // prefix twice (e.g. `/init` → `/jail/jail/init`).
-    let path_owned_raw = match copy_user_path_raw(path_ptr, path_len) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok(!0u64));
-            return;
-        }
-    };
-    open_impl(ctx, path_owned_raw, flags, mnt_ptr, mnt_len);
-}
 
 /// Shared open path. Resolves `path_owned_raw` (relative paths against the
 /// task cwd + chroot in the absolute-mount form) and installs the fd. Split
@@ -1481,562 +1345,13 @@ fn fifo_park_or_finish(ctx: &mut dyn TrapContext, fd: u32) {
     ctx.set_return(SyscallReturn::ok(fd as u64));
 }
 
-/// Linux ABI variant of `open(2)`: `int open(const char *pathname,
-/// int flags, mode_t mode)`. Forwards to [`sys_open`] after
-/// measuring the path length via [`copy_user_cstr`] (musl's open
-/// call passes flags in arg1, not the NARF-native path_len).
-fn sys_open_linux(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let path_uptr = args.arg0;
-    let flags = args.arg1;
-    let _mode = args.arg2;
-    let fail = SyscallReturn::ok(!0u64);
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    let proxy_args = SyscallArgs {
-        arg0: path_uptr,
-        arg1: path_str.len() as u64,
-        arg2: 0,
-        arg3: 0,
-        arg4: flags,
-        arg5: 0,
-    };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_open(&mut proxy);
-}
-
 // ── Write — arg0=fd, arg1=buf, arg2=len ────────────────────────────
 //
 // fd 1 / fd 2: console (stdout/stderr) — direct path so user code
 // without an explicit Open of stdio still works.
 // Other fds: routed through the per-task fd table.
 
-fn sys_write(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let ptr = args.arg1;
-    let len = args.arg2 as usize;
-    if len == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    // Copy the user buffer into a kernel-owned allocation first so
-    // FileOps::write never touches a user page directly — SMAP would
-    // fault any kernel-mode dereference of a user-accessible page
-    // outside an explicit STAC/CLAC window.
-    // Validate length *before* allocating so an oversized len returns
-    // EINVAL rather than OOMing the kernel heap.
-    // SAFETY: single-threaded syscall; AS is still active.
-    let kbuf = match unsafe { copy_from_user_vec(ptr, len) } {
-        Ok(b) => b,
-        Err(e) => {
-            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-            return;
-        }
-    };
-
-    let task = current_task_id();
-
-    // Job control: a background process writing its controlling tty with
-    // TOSTOP set is stopped (SIGTTOU) before the write happens.
-    #[cfg(feature = "linux-compat")]
-    if let Some(ret) = tty_background_access(task, fd, true) {
-        ctx.set_return(SyscallReturn::ok(ret as u64));
-        return;
-    }
-
-    // EBADF: fd not open. Checked before the general write path so a
-    // closed/bad fd is distinct from a write rejection (e.g. sealed memfd),
-    // which stays in the `_` → InvalidOp arm. Special fds returned above.
-    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-        return;
-    }
-    // Snapshot ops + offset and drop the fd-table lock before calling into
-    // FileOps — same rule as `sys_read`: a write whose FileOps consults the
-    // fd table would otherwise re-enter the non-reentrant table lock and
-    // spin forever with interrupts masked.
-    let snapshot = fd::with_table(task, |t| {
-        let e = t.get(fd)?;
-        Some((e.ops.clone(), e.offset, e.status_flags))
-    });
-    let (ops, off, status_flags) = match snapshot {
-        Some(Some(v)) => v,
-        _ => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-            return;
-        }
-    };
-    let nonblock = status_flags & crate::fd::O_NONBLOCK != 0;
-    // Closure error channel: `Err(true)` ⇒ broken pipe (raise SIGPIPE +
-    // return -EPIPE), `Err(false)` ⇒ generic write failure / bad fd.
-    let outcome = Some({
-        let res =
-            poll_blocking(ops.write(off, &kbuf)).unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
-        match res {
-            Ok(written) => {
-                let _ = fd::with_table(task, |t| {
-                    if let Some(e) = t.get_mut(fd) {
-                        e.offset = off.saturating_add(written as u64);
-                    }
-                });
-                Ok(written)
-            }
-            // A write to a FIFO / pipe with no remaining readers: SIGPIPE + EPIPE.
-            Err(narf_filesystem::FsError::BrokenPipe) => Err(true),
-            Err(_) => Err(false),
-        }
-    });
-    // A write that made no progress on a full pipe (reader still open) must
-    // BLOCK, not hand userspace a spurious 0. O_NONBLOCK → -EAGAIN; blocking →
-    // park ~1ms and RE-EXECUTE (mirrors the empty-pipe read block).
-    if let Some(Ok(0)) = outcome {
-        if ops.write_should_block() {
-            if nonblock {
-                ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
-                return;
-            }
-            if let (Some(uctx), Some(hook)) = (
-                crate::user_task::current_user_task(),
-                crate::user_task::yield_hook(),
-            ) {
-                let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-                // Rewind past the 2-byte `syscall`/`int 0x80` so re-entry re-runs
-                // this write with its original args.
-                let resume_rip = ctx.rip().wrapping_sub(2);
-                ctx.set_rip(resume_rip);
-                // SAFETY: `uctx` is the live per-task UserTaskCtx; we hold the
-                // only reference while setting the park deadline + saving the
-                // RIP-rewound state before the yield hook hands off the task.
-                unsafe {
-                    let uc = &*uctx;
-                    uc.sleep_deadline_ns
-                        .store(dl, core::sync::atomic::Ordering::Release);
-                    uc.futex_uaddr
-                        .store(0, core::sync::atomic::Ordering::Release);
-                    uc.net_io_wait
-                        .store(true, core::sync::atomic::Ordering::Release);
-                    uc.epoll_park_gen.store(
-                        narf_net::readiness::generation(),
-                        core::sync::atomic::Ordering::Release,
-                    );
-                    ctx.save_user_state(uc.state.get() as *mut u8);
-                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                    if narf_scheduler::stackful::user_own_stack_enabled() {
-                        own_stack_block(ctx);
-                        return;
-                    }
-                    hook(uctx);
-                }
-                // unreachable — hook() longjmps to the executor
-            }
-            // No executor (kernel-test context): fall back to a 0-byte write.
-            ctx.set_return(SyscallReturn::ok(0));
-            return;
-        }
-    }
-    match outcome {
-        Some(Ok(n)) => {
-            // inotify: a successful write is IN_MODIFY on the fd's file.
-            #[cfg(feature = "linux-compat")]
-            crate::mqueue::notify_modify_fd(task, fd);
-            ctx.set_return(SyscallReturn::ok(n as u64));
-        }
-        // Broken pipe: POSIX raises SIGPIPE on the writer (default action
-        // terminates unless it's caught/ignored) AND the write returns -EPIPE.
-        Some(Err(true)) => {
-            raise_signal_pending(task, 13); // SIGPIPE
-            ctx.set_return(SyscallReturn::ok((-32i64) as u64)); // -EPIPE
-        }
-        // TODO(linux-gap): bad fd should be -EBADF, but this `_` also catches
-        // write rejections (e.g. sealed memfd → -EPERM) — needs a split.
-        _ => ctx.set_return(SyscallReturn::invalid_op()),
-    }
-}
-
-/// Linux `writev(fd, iov, iovcnt)`. Walks the user `iovec[]` and
-/// writes each non-empty slice to `fd` in order, returning the
-/// total byte count. Reuses `sys_write`'s per-slice copy-in +
-/// FileOps path so behaviour matches a sequence of `write()`
-/// calls. musl's `__stdio_write` flushes via this syscall.
-fn sys_writev(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let iov_ptr = args.arg1;
-    let iovcnt = args.arg2 as usize;
-
-    // Reasonable upper bound on the iovec count — Linux's
-    // `IOV_MAX` is 1024. Reject larger to avoid trusting an
-    // attacker-controlled length.
-    const IOV_MAX: usize = 1024;
-    if iovcnt > IOV_MAX {
-        ctx.set_return(SyscallReturn::ok((-(22i64)) as u64)); // -EINVAL
-        return;
-    }
-
-    // Copy the iovec array in. `struct iovec` is
-    // `{ void *iov_base; size_t iov_len; }` — 16 bytes per entry.
-    let iov_bytes = iovcnt.saturating_mul(16);
-    // SAFETY: single-threaded syscall; AS is still active.
-    let iov_buf = match unsafe { copy_from_user_vec(iov_ptr, iov_bytes) } {
-        Ok(b) => b,
-        Err(e) => {
-            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-            return;
-        }
-    };
-
-    let task = current_task_id();
-    let mut total: usize = 0;
-    for i in 0..iovcnt {
-        let off = i * 16;
-        let base = u64::from_le_bytes(iov_buf[off..off + 8].try_into().unwrap_or([0; 8]));
-        let len =
-            u64::from_le_bytes(iov_buf[off + 8..off + 16].try_into().unwrap_or([0; 8])) as usize;
-        if len == 0 {
-            continue;
-        }
-        // SAFETY: single-threaded syscall; AS is still active.
-        let kbuf = match unsafe { copy_from_user_vec(base, len) } {
-            Ok(b) => b,
-            Err(e) => {
-                if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-                    return;
-                }
-                break;
-            }
-        };
-        let outcome = fd::with_table(task, |t| {
-            let entry = t.get_mut(fd).ok_or(())?;
-            let cur_off = entry.offset;
-            let res = poll_blocking(entry.ops.write(cur_off, &kbuf))
-                .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
-            match res {
-                Ok(written) => {
-                    entry.offset = cur_off.saturating_add(written as u64);
-                    Ok(written)
-                }
-                Err(_) => Err(()),
-            }
-        });
-        match outcome {
-            Some(Ok(n)) => {
-                total = total.saturating_add(n);
-                if n < kbuf.len() {
-                    break;
-                }
-            }
-            _ => {
-                if total == 0 {
-                    ctx.set_return(SyscallReturn::invalid_op());
-                    return;
-                }
-                break;
-            }
-        }
-    }
-    ctx.set_return(SyscallReturn::ok(total as u64));
-}
-
 // ── Read — arg0=fd, arg1=buf, arg2=len ─────────────────────────────
-
-fn sys_read(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let ptr = args.arg1;
-    let len = args.arg2 as usize;
-    if len == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    // Validate the destination pointer before allocating the kernel
-    // staging buffer — EFAULT early rather than after the FileOps call.
-    if let Err(e) = validate_user_range(ptr, len) {
-        ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-        return;
-    }
-    // Job control: a background process reading its controlling tty is
-    // stopped (SIGTTIN) before the read runs — and before it is recorded
-    // as the foreground reader below.
-    #[cfg(feature = "linux-compat")]
-    if let Some(ret) = tty_background_access(current_task_id(), fd, false) {
-        ctx.set_return(SyscallReturn::ok(ret as u64));
-        return;
-    }
-    // Track the foreground task: any read syscall counts as "this
-    // task is currently consuming console input." When the input
-    // ring later observes ^C, this is the task SIGINT goes to.
-    note_console_reader(current_task_id());
-
-    // Read into a kernel-owned buffer; copy back with SMAP bracket
-    // after the FileOps call, so FileOps never touches user memory.
-    let mut kbuf = alloc::vec![0u8; len];
-    let task = current_task_id();
-
-    // fanotify groups deliver fixed-size metadata records, each carrying a
-    // freshly-opened fd to the affected object. Installing that fd needs
-    // the fd-table lock — which the `with_table` block below holds across
-    // ops.read — so fanotify reads are handled here, before any lock is
-    // taken, to avoid a re-entrant deadlock.
-    #[cfg(feature = "linux-compat")]
-    if crate::mqueue::fanotify_active() {
-        if let Some(gid) = crate::mqueue::fanotify_instance_of(task, fd) {
-            let n = fanotify_read_into(task, gid, &mut kbuf);
-            // SAFETY: ptr validated above; AS still active.
-            match unsafe { copy_to_user(ptr, &kbuf[..n]) } {
-                Ok(()) => ctx.set_return(SyscallReturn::ok(n as u64)),
-                Err(e) => ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64)),
-            }
-            return;
-        }
-    }
-
-    // EBADF: fd not open. Checked before the general read path so a
-    // closed/bad fd is distinct from a read I/O error (which keeps the
-    // `_` → InvalidOp arm). Special fds (console/fanotify) returned above.
-    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-        return;
-    }
-    // Snapshot the fd's ops + offset, then DROP the fd-table lock before
-    // calling into FileOps.
-    //
-    // Holding it across `ops.read` self-deadlocks on any file whose read
-    // consults the fd table: `/proc/<pid>/fdinfo/<n>` and `/proc/<pid>/fd/<n>`
-    // render via `fd_path_of`, which re-enters `fd::with_table` on the SAME
-    // task's table — and the table lock is a non-reentrant IrqSafeSpinLock,
-    // so the CPU spins forever with interrupts masked. dbus-daemon does
-    // exactly this (`pidfd_open` then read `/proc/self/fdinfo/<n>`), which
-    // wedged the session bus and with it every KDE Plasma startup. Same
-    // lesson as the nested-epoll fix: never call FileOps under the fd-table
-    // lock.
-    //
-    // The offset is re-taken and advanced after the read. Two threads
-    // sharing one fd can now interleave there; Linux serialises that case
-    // with f_pos_lock, which NARF doesn't model yet.
-    let snapshot = fd::with_table(task, |t| {
-        let e = t.get(fd)?;
-        Some((e.ops.clone(), e.offset, e.status_flags))
-    });
-    let (ops, off, status_flags) = match snapshot {
-        Some(Some(v)) => v,
-        _ => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-            return;
-        }
-    };
-    let advance = |n: usize| {
-        let _ = fd::with_table(task, |t| {
-            if let Some(e) = t.get_mut(fd) {
-                e.offset = off.saturating_add(n as u64);
-            }
-        });
-    };
-    // Closure error channel: `Err(true)` ⇒ return EAGAIN, `Err(false)` ⇒
-    // invalid-op sentinel (bad fd / read error).
-    let outcome = Some((|| {
-        let entry = &ops;
-        let nonblock = status_flags & crate::fd::O_NONBLOCK != 0;
-        // evdev device nodes (`nonblock_read_eagain`) provide EAGAIN-on-empty
-        // semantics UNCONDITIONALLY — independent of the fd's O_NONBLOCK bit.
-        //
-        // Why not gate on `nonblock`: libinput/libevdev consume evdev nodes with
-        // a drain-to-EAGAIN loop and are structurally incompatible with a
-        // BLOCKING evdev fd (the sync loop never terminates; the post-epoll read
-        // must not stall the single-threaded dispatch). Their fds SHOULD be
-        // O_NONBLOCK, but when weston opens an input device through libseat/seatd
-        // the fd arrives over SCM_RIGHTS, and NARF installs received fds with
-        // status_flags = 0 (O_NONBLOCK is dropped — it lives per-FdEntry, not on
-        // the shared FileOps). The old `nonblock &&` gate then sent that fd down
-        // the `poll_blocking` path, which busy-spins the empty-ring read future
-        // ~4M times and finally returns Err(ReadOnly) → read() reports EIO →
-        // libinput treats the read error as device-removal and `EPOLL_CTL_DEL`s
-        // the device, so the pointer goes dead. Surfacing EAGAIN here (what an
-        // evdev node is *for*) fixes that and matches how these devices are used.
-        if entry.nonblock_read_eagain() {
-            return match poll_once(entry.read(off, &mut kbuf)) {
-                Some(Ok(n)) if n > 0 => {
-                    advance(n);
-                    Ok((n, false, false))
-                }
-                // Empty / would-block ⇒ EAGAIN.
-                Some(Ok(_)) | None => Err(true),
-                Some(Err(_)) => Err(false),
-            };
-        }
-        let res = poll_blocking(entry.read(off, &mut kbuf))
-            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
-        match res {
-            Ok(n) => {
-                // A NON-BLOCKING read that finds an empty-but-open stream
-                // (socket/pipe) must report EAGAIN, not a bare 0 — the caller
-                // would mis-read that 0 as EOF. `read_should_block()` is true
-                // exactly when the stream is open-but-empty (a real peer-close
-                // makes it false, so a genuine EOF still returns 0). GLib's
-                // GSocket/GDBus runs its own poll loop over O_NONBLOCK fds and
-                // treats `read()==0` as a peer hangup; the spurious EOF during
-                // the dbus EXTERNAL auth line-read ("Unexpected lack of content
-                // trying to read a line") killed the KDE session bus. musl's
-                // stdio/recv wrappers likewise expect EAGAIN, never a phantom 0.
-                if n == 0 && nonblock && entry.read_should_block() {
-                    return Err(true); // EAGAIN
-                }
-                // Block decision: a 0-byte read on a pipe/socket whose writer is
-                // still open must wait for data (POSIX), not return a
-                // spurious EOF — unless the fd is O_NONBLOCK (handled above).
-                let should_block = n == 0 && !nonblock && entry.read_should_block();
-                // Console fds park on the input waker (serial/keyboard IRQ)
-                // instead of the 1ms re-poll, so an interactive shell truly
-                // sleeps on `read(stdin)` rather than busy-polling.
-                let input_block = n == 0 && !nonblock && entry.block_on_input();
-                advance(n);
-                Ok((n, should_block, input_block))
-            }
-            Err(_) => Err(false),
-        }
-    })());
-    match outcome {
-        Some(Ok((0, _, true))) => {
-            // Empty console input ring: park on the input waker (woken by
-            // the serial/keyboard IRQ via push_global → BYTE_RING_WAKER →
-            // deferred_wake) and RE-EXECUTE the read on resume (rewind RIP,
-            // no return value). The poll routine registers cx.waker() once
-            // `console_read_pending` is set and parks with NO wake-by-ref,
-            // so the task truly idles until a keystroke — no busy-poll.
-            if let (Some(uctx), Some(hook)) = (
-                crate::user_task::current_user_task(),
-                crate::user_task::yield_hook(),
-            ) {
-                let resume_rip = ctx.rip().wrapping_sub(2);
-                ctx.set_rip(resume_rip);
-                // SAFETY: `uctx` is the live per-task UserTaskCtx from
-                // current_user_task(); we hold the only reference while
-                // setting the flag + saving the RIP-rewound CPU state before
-                // the yield hook hands the task to the executor.
-                unsafe {
-                    let uc = &*uctx;
-                    uc.console_read_pending
-                        .store(true, core::sync::atomic::Ordering::Release);
-                    ctx.save_user_state(uc.state.get() as *mut u8);
-                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                    if narf_scheduler::stackful::user_own_stack_enabled() {
-                        own_stack_block(ctx);
-                        return;
-                    }
-                    hook(uctx);
-                }
-                // unreachable — hook() longjmps to the executor
-            }
-            // No executor (kernel-test context): fall back to a 0 read.
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        Some(Ok((0, true, _))) => {
-            // Empty pipe, writer still open: park ~1ms and RE-EXECUTE the
-            // read on resume (rewind RIP, leave the syscall number in
-            // place — do NOT set a return value) so the read blocks until
-            // data arrives or the last writer closes (which now happens
-            // via fd::detach on the writer's exit), rather than handing
-            // userspace a 0 it would mis-read as end-of-file.
-            if let (Some(uctx), Some(hook)) = (
-                crate::user_task::current_user_task(),
-                crate::user_task::yield_hook(),
-            ) {
-                let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-                // Rewind past the 2-byte `syscall`/`int 0x80` instruction so
-                // re-entry re-runs this syscall with its original args.
-                let resume_rip = ctx.rip().wrapping_sub(2);
-                ctx.set_rip(resume_rip);
-                // SAFETY: `uctx` is the live per-task UserTaskCtx from
-                // current_user_task(); we hold the only reference while
-                // setting the deadline + saving the (RIP-rewound) CPU state
-                // before the yield hook hands the task to the executor.
-                unsafe {
-                    let uc = &*uctx;
-                    uc.sleep_deadline_ns
-                        .store(dl, core::sync::atomic::Ordering::Release);
-                    // Park on NET-I/O READINESS so a peer's `write` → `notify(0)`
-                    // wakes this blocking `read()` PROMPTLY, with the ~1ms
-                    // deadline as a mere backstop — mirroring `recv`/`accept`.
-                    // Without net_io_wait a blocking POSIX `read()` on an empty
-                    // AF_UNIX socket only re-polled off the 1ms timer wheel (no
-                    // io-waiter, no lost-wake gen guard), so under own-stack
-                    // cooperative scheduling with other busy tasks the reply sat
-                    // unread past the client's deadline — a real asymmetry vs
-                    // `recv`, and a likely cause of flaky D-Bus round-trips (Qt/
-                    // libdbus read the bus socket via read()). Snapshot the
-                    // readiness generation for the check→park lost-wake guard;
-                    // clear a stale futex_uaddr so this can't mis-route into the
-                    // futex branch. Harmless for pipes (no notify → the 1ms
-                    // backstop still fires exactly as before).
-                    uc.futex_uaddr
-                        .store(0, core::sync::atomic::Ordering::Release);
-                    uc.net_io_wait
-                        .store(true, core::sync::atomic::Ordering::Release);
-                    uc.epoll_park_gen.store(
-                        narf_net::readiness::generation(),
-                        core::sync::atomic::Ordering::Release,
-                    );
-                    ctx.save_user_state(uc.state.get() as *mut u8);
-                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                    if narf_scheduler::stackful::user_own_stack_enabled() {
-                        own_stack_block(ctx);
-                        return;
-                    }
-                    hook(uctx);
-                }
-                // unreachable — hook() longjmps to the executor
-            }
-            // No executor (kernel-test context): fall back to a 0 read.
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        Some(Ok((n, _, _))) => {
-            // SAFETY: ptr validated above; AS still active.
-            if let Err(e) = unsafe { copy_to_user(ptr, &kbuf[..n]) } {
-                ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-            } else {
-                ctx.set_return(SyscallReturn::ok(n as u64));
-            }
-        }
-        // Non-blocking read with nothing ready → EAGAIN (errno 11).
-        Some(Err(true)) => {
-            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
-        }
-        // TODO(linux-gap): bad fd should be -EBADF, but this `_` also
-        // catches read I/O errors — needs surgical bad-fd-vs-error split.
-        _ => ctx.set_return(SyscallReturn::invalid_op()),
-    }
-}
 
 /// Drain a fanotify group's queued events into `buf` as
 /// `struct fanotify_event_metadata` records, opening a fresh fd to each
@@ -2098,220 +1413,6 @@ fn fanotify_open_object(task: u64, abs: &str) -> i32 {
 #[cfg(feature = "linux-compat")]
 const NARF_HANDLE_TYPE: i32 = 0x4e41; // "NA"
 
-/// `name_to_handle_at(dirfd, pathname, handle, mount_id, flags)`.
-#[cfg(feature = "linux-compat")]
-fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = 22;
-    const ENOENT: i64 = 2;
-    const EFAULT: i64 = 14;
-    const EOVERFLOW: i64 = 75;
-    const AT_EMPTY_PATH: u64 = 0x1000;
-    let a = *ctx.args();
-    let raw = copy_user_cstr(a.arg1, 4096).unwrap_or_default();
-    // AT_EMPTY_PATH form: name_to_handle_at(fd, "", &handle, &mnt_id,
-    // AT_EMPTY_PATH) requests a handle for the fd itself. Callers such as
-    // systemd's cg_fd_get_cgroupid read this to obtain a cgroup's id — an
-    // 8-byte f_handle whose value is a stable per-object identifier. Return
-    // an exactly-8-byte handle: the fd's inode if the backing FS exposes one,
-    // else a stable hash of the fd's path.
-    if raw.is_empty() {
-        if a.arg4 & AT_EMPTY_PATH == 0 {
-            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-            return;
-        }
-        let task = current_task_id();
-        let dirfd = a.arg0 as u32;
-        let id: Option<u64> = fd::with_table(task, |t| t.get(dirfd).map(|e| e.ops.ino()))
-            .flatten()
-            .filter(|&i| i != 0)
-            .or_else(|| {
-                fd_path_of(task, dirfd).map(|p| {
-                    // FNV-1a over the fd's backing path — stable per object.
-                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-                    for b in p.as_bytes() {
-                        h ^= *b as u64;
-                        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-                    }
-                    h
-                })
-            });
-        let id = match id {
-            Some(i) => i,
-            None => {
-                ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
-                return;
-            }
-        };
-        // handle->handle_bytes capacity check (first u32 of the caller's buf).
-        let mut cap = [0u8; 4];
-        // SAFETY: copy_from_user validates the 4-byte read.
-        if unsafe { copy_from_user(&mut cap, a.arg2) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-            return;
-        }
-        if (u32::from_ne_bytes(cap) as usize) < 8 {
-            // SAFETY: copy_to_user validates the 4-byte destination.
-            let _ = unsafe { copy_to_user(a.arg2, &8u32.to_ne_bytes()) };
-            ctx.set_return(SyscallReturn::ok((-EOVERFLOW) as u64));
-            return;
-        }
-        let mut hdr = [0u8; 8];
-        hdr[0..4].copy_from_slice(&8u32.to_ne_bytes());
-        hdr[4..8].copy_from_slice(&NARF_HANDLE_TYPE.to_ne_bytes());
-        // SAFETY: copy_to_user validates the 8-byte header destination.
-        let h1 = unsafe { copy_to_user(a.arg2, &hdr) };
-        // SAFETY: copy_to_user validates the 8-byte id destination.
-        let h2 = unsafe { copy_to_user(a.arg2 + 8, &id.to_ne_bytes()) };
-        if h1.is_err() || h2.is_err() {
-            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-            return;
-        }
-        if a.arg3 != 0 {
-            // SAFETY: copy_to_user validates the 4-byte destination.
-            let _ = unsafe { copy_to_user(a.arg3, &0i32.to_ne_bytes()) };
-        }
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    // Honour a real directory fd (same shape as sys_readlinkat/sys_statx):
-    // resolve a relative path against the directory backing `dirfd`.
-    // systemd's chase() calls name_to_handle_at(parent_dir_fd, name, ...)
-    // per component to compute mount ids; resolving against the cwd
-    // instead ENOENT'd exec_setup_credentials' mount-ns child (journald
-    // 243/EXIT_CREDENTIALS).
-    let dirfd_i = a.arg0 as i32;
-    const AT_FDCWD_I32: i32 = -100;
-    let raw = if raw.starts_with('/') || dirfd_i == AT_FDCWD_I32 || dirfd_i < 0 {
-        raw
-    } else {
-        match fd_path_of(current_task_id(), dirfd_i as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
-            }
-            _ => raw,
-        }
-    };
-    let path = apply_chroot(&raw);
-    // Dir-aware resolution (files, directories, mount roots and mount
-    // ancestors alike), carrying the object's stable inode. A dir-only
-    // node — e.g. a cgroup directory, whose children exist purely as
-    // `lookup_dir` targets — has no FileOps shape, so a file-shape
-    // resolve alone reports ENOENT for exactly the paths systemd's
-    // cg_path_get_cgroupid asks about (/sys/fs/cgroup/.../<svc>.service).
-    let path_ino = match stat_ino_path_dir_aware(&path) {
-        Some((_, ino, _)) => ino,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
-            return;
-        }
-    };
-    // handle->handle_bytes (the caller's f_handle capacity) is the first u32.
-    let mut cap = [0u8; 4];
-    // SAFETY: copy_from_user validates the 4-byte read.
-    if unsafe { copy_from_user(&mut cap, a.arg2) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-        return;
-    }
-    let cap = u32::from_ne_bytes(cap) as usize;
-    // Inode-form handle: a caller advertising an exactly-8-byte f_handle
-    // (e.g. systemd's cg_path_get_cgroupid, which reads a cgroup's id from a
-    // single u64) expects the object's id, as Linux returns. Resolve the
-    // path's inode and emit an 8-byte handle. Larger capacities keep the
-    // path-carrying handle form that open_by_handle_at round-trips.
-    if cap == 8 {
-        let mut hdr = [0u8; 8];
-        hdr[0..4].copy_from_slice(&8u32.to_ne_bytes());
-        hdr[4..8].copy_from_slice(&NARF_HANDLE_TYPE.to_ne_bytes());
-        // SAFETY: copy_to_user validates the 8-byte header destination.
-        let h1 = unsafe { copy_to_user(a.arg2, &hdr) };
-        // SAFETY: copy_to_user validates the 8-byte id destination.
-        let h2 = unsafe { copy_to_user(a.arg2 + 8, &path_ino.to_ne_bytes()) };
-        if h1.is_err() || h2.is_err() {
-            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-            return;
-        }
-        if a.arg3 != 0 {
-            // SAFETY: copy_to_user validates the 4-byte destination.
-            let _ = unsafe { copy_to_user(a.arg3, &0i32.to_ne_bytes()) };
-        }
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    let needed = path.len();
-    if cap < needed {
-        // Report the required size and fail — the caller retries bigger.
-        // SAFETY: copy_to_user validates the 4-byte destination.
-        let _ = unsafe { copy_to_user(a.arg2, &(needed as u32).to_ne_bytes()) };
-        ctx.set_return(SyscallReturn::ok((-EOVERFLOW) as u64));
-        return;
-    }
-    // Write the 8-byte header { handle_bytes, handle_type } then the path.
-    let mut hdr = [0u8; 8];
-    hdr[0..4].copy_from_slice(&(needed as u32).to_ne_bytes());
-    hdr[4..8].copy_from_slice(&NARF_HANDLE_TYPE.to_ne_bytes());
-    // SAFETY: copy_to_user validates the 8-byte header destination.
-    let h1 = unsafe { copy_to_user(a.arg2, &hdr) };
-    // SAFETY: copy_to_user validates the path destination range.
-    let h2 = unsafe { copy_to_user(a.arg2 + 8, path.as_bytes()) };
-    if h1.is_err() || h2.is_err() {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-        return;
-    }
-    // mount_id (arg3) — one filesystem namespace, so report 0.
-    if a.arg3 != 0 {
-        // SAFETY: copy_to_user validates the 4-byte destination.
-        let _ = unsafe { copy_to_user(a.arg3, &0i32.to_ne_bytes()) };
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `open_by_handle_at(mount_fd, handle, flags)`.
-#[cfg(feature = "linux-compat")]
-fn sys_open_by_handle_at(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = 22;
-    const ESTALE: i64 = 116;
-    const EFAULT: i64 = 14;
-    let a = *ctx.args();
-    // mount_fd (arg0) is ignored (single namespace; AT_FDCWD also accepted).
-    let mut hdr = [0u8; 8];
-    // SAFETY: copy_from_user validates the 8-byte header read.
-    if unsafe { copy_from_user(&mut hdr, a.arg1) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-        return;
-    }
-    let hbytes = u32::from_ne_bytes(hdr[0..4].try_into().unwrap()) as usize;
-    let htype = i32::from_ne_bytes(hdr[4..8].try_into().unwrap());
-    if htype != NARF_HANDLE_TYPE {
-        ctx.set_return(SyscallReturn::ok((-ESTALE) as u64));
-        return;
-    }
-    if hbytes == 0 || hbytes > 4096 {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-        return;
-    }
-    // SAFETY: copy_from_user_vec validates the f_handle range.
-    let path_bytes = match unsafe { copy_from_user_vec(a.arg1 + 8, hbytes) } {
-        Ok(b) => b,
-        Err(_) => {
-            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-            return;
-        }
-    };
-    let path = match alloc::string::String::from_utf8(path_bytes) {
-        Ok(s) => s,
-        Err(_) => {
-            ctx.set_return(SyscallReturn::ok((-ESTALE) as u64));
-            return;
-        }
-    };
-    let fd = fanotify_open_object(current_task_id(), &path);
-    if fd < 0 {
-        ctx.set_return(SyscallReturn::ok((-ESTALE) as u64));
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(fd as u64));
-}
-
 // ── Dup family + fcntl ─────────────────────────────────────────────
 //
 // Stage-4 round 2: the dup'd fd is a *clone* of the source FdEntry —
@@ -2323,102 +1424,6 @@ fn sys_open_by_handle_at(ctx: &mut dyn TrapContext) {
 // (relibc's `dup` is used to redirect stdio post-fork, not to share
 // a cursor) and is documented here so the Stage-5 OFD work can lift
 // the offset into a separate Arc without touching the syscall ABI.
-
-fn sys_dup(ctx: &mut dyn TrapContext) {
-    let oldfd = ctx.args().arg0 as u32;
-    let task = current_task_id();
-    let outcome = fd::with_table(task, |t| {
-        let entry = t.get(oldfd)?;
-        // Clone the Arc + reset offset; keep flags clear (fcntl/dup3
-        // can stamp FD_CLOEXEC after).
-        let clone = crate::fd::FdEntry {
-            ops: entry.ops.clone(),
-            offset: 0,
-            flags: 0,
-            status_flags: 0,
-        };
-        Some(t.open(clone))
-    });
-    match outcome {
-        Some(Some(new_fd)) => ctx.set_return(SyscallReturn::ok(new_fd as u64)),
-        _ => ctx.set_return(SyscallReturn::invalid_op()),
-    }
-}
-
-fn sys_dup2(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let oldfd = args.arg0 as u32;
-    let newfd = args.arg1 as u32;
-    if oldfd == newfd {
-        // POSIX: dup2(fd, fd) is a no-op + returns fd as long as fd
-        // is a valid open fd. Verify validity before short-circuiting.
-        let task = current_task_id();
-        let valid = fd::with_table(task, |t| t.get(oldfd).is_some()).unwrap_or(false);
-        if valid {
-            ctx.set_return(SyscallReturn::ok(newfd as u64));
-        } else {
-            // dup2 with an invalid oldfd → -EBADF (was InvalidOp).
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64));
-        }
-        return;
-    }
-    let task = current_task_id();
-    let outcome = fd::with_table(task, |t| {
-        let entry = t.get(oldfd)?;
-        let clone = crate::fd::FdEntry {
-            ops: entry.ops.clone(),
-            offset: 0,
-            flags: 0,
-            status_flags: 0,
-        };
-        // Replace whatever sat at `newfd` (POSIX: silently close).
-        t.set(newfd, clone);
-        Some(())
-    });
-    match outcome {
-        Some(Some(())) => ctx.set_return(SyscallReturn::ok(newfd as u64)),
-        // oldfd not open → -EBADF (was InvalidOp).
-        _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
-    }
-}
-
-fn sys_dup3(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let oldfd = args.arg0 as u32;
-    let newfd = args.arg1 as u32;
-    let flags = args.arg2 as u32;
-    // Linux dup3: differ from dup2 by failing on oldfd == newfd. The
-    // call exists to atomically install FD_CLOEXEC, which only makes
-    // sense when actually duplicating to a different slot.
-    if oldfd == newfd {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let task = current_task_id();
-    let outcome = fd::with_table(task, |t| {
-        let entry = t.get(oldfd)?;
-        let clone = crate::fd::FdEntry {
-            ops: entry.ops.clone(),
-            offset: 0,
-            // Set FD_CLOEXEC when the caller passes O_CLOEXEC (stock
-            // glibc/musl, bit 0x80000) OR the bare FD_CLOEXEC bit
-            // (narf-libc). Either way the slot bit is FD_CLOEXEC.
-            flags: if flags & (crate::fd::O_CLOEXEC | crate::fd::FD_CLOEXEC) != 0 {
-                crate::fd::FD_CLOEXEC
-            } else {
-                0
-            },
-            status_flags: 0,
-        };
-        t.set(newfd, clone);
-        Some(())
-    });
-    match outcome {
-        Some(Some(())) => ctx.set_return(SyscallReturn::ok(newfd as u64)),
-        // oldfd not open → -EBADF (was InvalidOp).
-        _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
-    }
-}
 
 // ── fcntl command constants (Linux numbering) ──────────────────────
 const F_DUPFD: u64 = 0;
@@ -2476,310 +1481,6 @@ fn clear_flock_routing() {
     }
 }
 
-fn sys_fcntl(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let cmd = args.arg1;
-    let arg = args.arg2;
-    let task = current_task_id();
-
-    // F_SETFL on a socket: mirror O_NONBLOCK into the SocketFile so
-    // recv/send/accept/connect see the flag.
-    if cmd == F_SETFL {
-        if let Some(sock) = current_socket(fd) {
-            sock.set_nonblock((arg as u32) & crate::socket::O_NONBLOCK != 0);
-        }
-    }
-
-    // F_DUPFD / F_DUPFD_CLOEXEC: dup oldfd into the lowest free slot
-    // >= arg. Linux returns the new fd. CLOEXEC variant stamps
-    // FD_CLOEXEC atomically.
-    #[cfg(feature = "linux-compat")]
-    {
-        if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
-            let min_fd = arg as u32;
-            let cloexec = cmd == F_DUPFD_CLOEXEC;
-            let outcome = fd::with_table(task, |t| {
-                let entry = t.get(fd)?;
-                let clone = crate::fd::FdEntry {
-                    ops: entry.ops.clone(),
-                    offset: 0,
-                    flags: if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
-                    status_flags: entry.status_flags,
-                };
-                Some(t.open_at_least(clone, min_fd))
-            });
-            match outcome {
-                Some(Some(new_fd)) => ctx.set_return(SyscallReturn::ok(new_fd as u64)),
-                // F_DUPFD on a fd that isn't open → -EBADF (was InvalidOp).
-                _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
-            }
-            return;
-        }
-    }
-
-    // F_GETLK / F_SETLK / F_SETLKW: advisory POSIX locking. Gated
-    // under linux-compat because the wire `struct flock` layout +
-    // BTreeMap lock table only matter for Linux ABI consumers.
-    #[cfg(feature = "linux-compat")]
-    {
-        if cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW {
-            // Resolve the open-file identity from the fd table.
-            let ops_key = fd::with_table(task, |t| {
-                t.get(fd)
-                    .map(|e| alloc::sync::Arc::as_ptr(&e.ops) as *const () as usize)
-            });
-            let key = match ops_key {
-                Some(Some(k)) => k,
-                _ => {
-                    ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
-                    return;
-                }
-            };
-            // Pull the `struct flock` from user memory.
-            let mut bytes = alloc::vec![0u8; flock_size()];
-            // SAFETY: `arg` is the user `struct flock` pointer; copy_from_user
-            // range-validates it and SMAP-brackets the read into the sized `bytes`.
-            // SAFETY: Valid memory or trusted environment
-            if unsafe { copy_from_user(&mut bytes, arg) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
-                return;
-            }
-            // SAFETY: `bytes` holds exactly `flock_size()` validated bytes and
-            // `tmp` is a default-initialized UFlock with at least that many bytes;
-            // the copy reinterprets the wire layout into the repr(C) struct.
-            // SAFETY: Valid memory or trusted environment
-            let uf: UFlock = unsafe {
-                let mut tmp = UFlock::default();
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    &mut tmp as *mut _ as *mut u8,
-                    flock_size(),
-                );
-                tmp
-            };
-            // Only SEEK_SET (l_whence = 0) is supported on the wire
-            // path. Other whence values would need the current offset
-            // / file size, which is OFD-tier work.
-            if uf.l_whence != 0 {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-                return;
-            }
-            let req = crate::fd::locks::Lock {
-                owner: task,
-                ty: uf.l_type,
-                start: uf.l_start,
-                len: uf.l_len,
-            };
-            if cmd == F_GETLK {
-                let blocker = crate::fd::locks::probe(key, req);
-                let mut out = uf;
-                match blocker {
-                    None => out.l_type = crate::fd::locks::F_UNLCK,
-                    Some(b) => {
-                        out.l_type = b.ty;
-                        out.l_start = b.start;
-                        out.l_len = b.len;
-                        out.l_pid = b.owner as i32;
-                    }
-                }
-                let mut obytes = alloc::vec![0u8; flock_size()];
-                // SAFETY: `out` is a repr(C) UFlock; `obytes` is sized to
-                // `flock_size()`, so serializing the struct's bytes into it is in-bounds.
-                // SAFETY: Valid memory or trusted environment
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        &out as *const _ as *const u8,
-                        obytes.as_mut_ptr(),
-                        flock_size(),
-                    );
-                }
-                // SAFETY: `arg` is the user `struct flock` pointer; copy_to_user
-                // range-validates it and SMAP-brackets the write of `obytes`.
-                // SAFETY: Valid memory or trusted environment
-                if unsafe { copy_to_user(arg, &obytes) }.is_err() {
-                    ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
-                    return;
-                }
-                ctx.set_return(SyscallReturn::ok(0));
-                return;
-            }
-            // F_SETLK / F_SETLKW.
-            match crate::fd::locks::try_set(key, req) {
-                Ok(()) => {
-                    // A re-executed SETLKW arrives here with the uctx
-                    // routing still set — clear it so a later unrelated
-                    // park can't spuriously register on the flock queue.
-                    clear_flock_routing();
-                    if uf.l_type == crate::fd::locks::F_UNLCK {
-                        // A range was released — wake every parked
-                        // F_SETLKW waiter on this file so it retries NOW
-                        // instead of riding out its 1 ms backstop. Fired
-                        // after the waiter lock drops (drain collects).
-                        for (tid, w) in crate::fd::locks::drain_waiters(key) {
-                            wake_one(tid, w);
-                        }
-                    } else {
-                        // Acquire (possibly a re-executed SETLKW that just
-                        // won): retire any waiter entry left from the park.
-                        crate::fd::locks::drop_waiter(key, task);
-                    }
-                    ctx.set_return(SyscallReturn::ok(0));
-                }
-                Err(_) if cmd == F_SETLKW => {
-                    // Blocking acquire. Linux F_SETLKW is signal-
-                    // interruptible (EINTR) — check before parking so a
-                    // pending signal breaks the wait instead of being
-                    // starved by the retry loop.
-                    if is_signal_pending(task) {
-                        crate::fd::locks::drop_waiter(key, task);
-                        clear_flock_routing();
-                        ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
-                        return;
-                    }
-                    // Park ~1ms with RIP rewound so the WHOLE fcntl
-                    // re-executes on resume and retries try_set — the
-                    // same re-execute shape as the blocking console
-                    // read; the holder's unlock (or exit — see
-                    // `locks::release_owner` in the exit sweep) makes a
-                    // later retry succeed. No executor wired (the
-                    // kernel-test harness) → degrade to the
-                    // non-blocking EAGAIN answer, like flock's
-                    // no-executor tail.
-                    if let (Some(uctx), Some(hook)) = (
-                        crate::user_task::current_user_task(),
-                        crate::user_task::yield_hook(),
-                    ) {
-                        let resume_rip = ctx.rip().wrapping_sub(2);
-                        ctx.set_rip(resume_rip);
-                        let dl =
-                            narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-                        // SAFETY: `uctx` is the live per-task UserTaskCtx from
-                        // current_user_task(); we hold the only reference while
-                        // setting the deadline and saving the RIP-rewound CPU
-                        // state before the yield hook hands the task over.
-                        // SAFETY: Valid memory or trusted environment
-                        unsafe {
-                            let uc = &*uctx;
-                            // Clear a stale futex_uaddr so the park can't
-                            // mis-route into the futex branch (same guard
-                            // as the blocking pipe-read park).
-                            uc.futex_uaddr
-                                .store(0, core::sync::atomic::Ordering::Release);
-                            // Route the park to the lock key's waiter queue
-                            // (park_should_block registers the waker there),
-                            // so the holder's unlock wakes us immediately.
-                            uc.flock_key
-                                .store(key, core::sync::atomic::Ordering::Release);
-                            uc.sleep_deadline_ns
-                                .store(dl, core::sync::atomic::Ordering::Release);
-                            ctx.save_user_state(uc.state.get() as *mut u8);
-                            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                            if narf_scheduler::stackful::user_own_stack_enabled() {
-                                own_stack_block(ctx);
-                                return;
-                            }
-                            hook(uctx);
-                        }
-                        // unreachable when parked
-                    }
-                    crate::fd::locks::drop_waiter(key, task);
-                    clear_flock_routing();
-                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
-                }
-                Err(_) => {
-                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
-                }
-            }
-            return;
-        }
-    }
-
-    // Wave-70: memfd seals. Route F_ADD_SEALS / F_GET_SEALS before
-    // the generic fd-table lookup so the seal word lives on the
-    // concrete MemFdFile rather than as a per-fd flag.
-    #[cfg(feature = "linux-compat")]
-    {
-        if cmd == F_ADD_SEALS {
-            if let Some(mfd) = memfd_arc_from_fd(task, fd) {
-                let r = match mfd.add_seals(arg as u32) {
-                    Ok(()) => SyscallReturn::ok(0),
-                    Err(()) => SyscallReturn::ok((-1i64) as u64),
-                };
-                ctx.set_return(r);
-                return;
-            }
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-        if cmd == F_GET_SEALS {
-            if let Some(mfd) = memfd_arc_from_fd(task, fd) {
-                ctx.set_return(SyscallReturn::ok(mfd.seals() as u64));
-                return;
-            }
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    }
-
-    // Resolve any socket-side flag BEFORE entering the fd-table
-    // closure — `current_socket` itself locks the table, which would
-    // re-enter and deadlock if called from inside `with_table`.
-    let sock_nb = current_socket(fd).map(|s| s.is_nonblock());
-
-    let outcome = fd::with_table(task, |t| {
-        let entry = t.get_mut(fd)?;
-        Some(match cmd {
-            F_GETFD => SyscallReturn::ok(entry.flags as u64),
-            F_SETFD => {
-                entry.flags = arg as u32;
-                SyscallReturn::ok(0)
-            }
-            // F_GETFL: report the per-fd status_flags. Socket
-            // O_NONBLOCK overrides the bit if the SocketFile carries
-            // its own nonblock toggle (kept in sync via F_SETFL).
-            F_GETFL => {
-                let mut v = entry.status_flags as u64;
-                if let Some(nb) = sock_nb {
-                    if nb {
-                        v |= crate::socket::O_NONBLOCK as u64;
-                    } else {
-                        v &= !(crate::socket::O_NONBLOCK as u64);
-                    }
-                }
-                SyscallReturn::ok(v)
-            }
-            // F_SETFL: only the settable subset (O_NONBLOCK | O_APPEND
-            // | O_DIRECT) is honoured. Access-mode bits are ignored.
-            F_SETFL => {
-                #[cfg(feature = "linux-compat")]
-                let mask = crate::fd::O_SETFL_MASK;
-                #[cfg(not(feature = "linux-compat"))]
-                let mask = 0o4000u32; // O_NONBLOCK only.
-                let new = (arg as u32) & mask;
-                entry.status_flags = (entry.status_flags & !mask) | new;
-                SyscallReturn::ok(0)
-            }
-            // F_GETPIPE_SZ (1032) / F_SETPIPE_SZ (1031): report the pipe buffer
-            // capacity. NARF's pipe is a fixed-size ring, so F_SETPIPE_SZ can't
-            // grow it — return the current capacity (Linux rounds the request
-            // to a page/power-of-two anyway). EINVAL for a non-pipe fd, matching
-            // Linux. stress-ng's pipe stressor queries F_GETPIPE_SZ to size its
-            // I/O buffer; without this it fell back to a 4 KiB write + a stale
-            // errno on the first full-pipe short write.
-            1032 | 1031 => match entry.ops.pipe_capacity() {
-                Some(cap) => SyscallReturn::ok(cap as u64),
-                None => SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64),
-            },
-            _ => SyscallReturn::invalid_op(),
-        })
-    });
-    match outcome {
-        Some(Some(r)) => ctx.set_return(r),
-        _ => ctx.set_return(SyscallReturn::invalid_op()),
-    }
-}
-
 // ── ioctl(2) ───────────────────────────────────────────────────────
 //
 // Generic ioctl dispatcher. `cmd` is the Linux-shaped `_IOC` encoded
@@ -2797,262 +1498,6 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
 const ENOTTY: u64 = 25;
 /// Linux EBADF value (9).
 const EBADF: u64 = 9;
-
-fn sys_ioctl(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let cmd = args.arg1 as u32;
-    let arg = args.arg2 as usize;
-    let task = current_task_id();
-    // Clone the Arc out of the fd table so we drop the table lock
-    // before invoking the FileOps::ioctl body (which may take
-    // device-internal locks of its own).
-    let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone()));
-    let ops = match ops {
-        Some(Some(o)) => o,
-        _ => {
-            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
-            return;
-        }
-    };
-    // Wave-76 special-case: TIOCGPTPEER allocates a fresh slave fd in
-    // the caller's table. The fd-allocation side lives here (not in the
-    // filesystem crate), so we hijack the dispatch before delegating.
-    #[cfg(feature = "linux-compat")]
-    if cmd == narf_filesystem::devfs_pty::TIOCGPTPEER {
-        let idx = match ops.as_pty_master_index() {
-            Some(i) => i,
-            None => {
-                // Not a master fd — ENOTTY (Linux semantics).
-                ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
-                return;
-            }
-        };
-        let slave = match narf_filesystem::devfs_pty::pts_open_peer(idx) {
-            Some(Ok(s)) => s,
-            Some(Err(())) => {
-                // EIO: slave still locked.
-                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
-                return;
-            }
-            None => {
-                ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
-                return;
-            }
-        };
-        let ops_dyn: Arc<dyn narf_filesystem::FileOps> = slave;
-        let new_fd = fd::with_table(task, |t| {
-            t.open(fd::FdEntry {
-                ops: ops_dyn,
-                offset: 0,
-                // `arg` carries open(2) flags from glibc (O_RDWR | O_NOCTTY |
-                // O_CLOEXEC). We mirror the CLOEXEC bit; the rest are no-ops.
-                flags: if (arg as u32) & 0o2000000 != 0 { 1 } else { 0 },
-                status_flags: arg as u32,
-            })
-        });
-        match new_fd {
-            Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
-            None => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),
-        }
-        return;
-    }
-    // DRM_IOCTL_PRIME_HANDLE_TO_FD (_IOWR('d'=0x64, 0x2d, drm_prime_handle)):
-    // export a GEM handle on a DRM card as a fresh mmap-able dma-buf fd. Like
-    // TIOCGPTPEER, the fd-allocation side must live HERE (the syscall layer
-    // owns the fd table); the gpu driver only supplies the buffer FileOps via
-    // the registered PRIME hook. Mesa GBM's gbm_bo_get_fd relies on this to
-    // CPU-mmap the kwin QPainter swapchain buffer — without it kwin logged
-    // "drmPrimeHandleToFD() failed: Not a tty" and could not render.
-    if (cmd & 0xFF) == 0x2d && ((cmd >> 8) & 0xFF) == 0x64 {
-        if let Some(card_idx) = ops.as_drm_card_index() {
-            // struct drm_prime_handle { u32 handle; u32 flags; s32 fd; }
-            let handle = read_user_u32(arg as u64);
-            let dmabuf = match narf_filesystem::drm_prime_export(card_idx, handle) {
-                Some(o) => o,
-                None => {
-                    const ENOENT: i64 = 2;
-                    ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
-                    return;
-                }
-            };
-            // DRM passes DRM_CLOEXEC (0x1) / DRM_RDWR (0x2) in `flags`.
-            let prime_flags = read_user_u32(arg as u64 + 4);
-            let new_fd = fd::with_table(task, |t| {
-                t.open(fd::FdEntry {
-                    ops: dmabuf,
-                    offset: 0,
-                    flags: if prime_flags & 0x1 != 0 { 1 } else { 0 }, // CLOEXEC
-                    status_flags: 0,
-                })
-            });
-            match new_fd {
-                Some(f) => {
-                    write_user_u32(arg as u64 + 8, f); // drm_prime_handle.fd
-                    ctx.set_return(SyscallReturn::ok(0));
-                }
-                None => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),
-            }
-            return;
-        }
-    }
-    // DRM_IOCTL_PRIME_FD_TO_HANDLE (_IOWR('d'=0x64, 0x2e, drm_prime_handle)):
-    // re-import a PRIME dma-buf fd back to a GEM handle on this card — the
-    // partner of HANDLE_TO_FD. A compositor exports its render buffer, then
-    // imports it to build a scannable KMS framebuffer. Without it kwin logged
-    // "drmPrimeFDToHandle() failed" → "Failed to create dumb framebuffer" →
-    // "Applying output config failed!".
-    if (cmd & 0xFF) == 0x2e && ((cmd >> 8) & 0xFF) == 0x64 && ops.as_drm_card_index().is_some() {
-        // struct drm_prime_handle { u32 handle; u32 flags; s32 fd; }
-        let dmabuf_fd = read_user_u32(arg as u64 + 8);
-        let buf_ops = fd::with_table(task, |t| t.get(dmabuf_fd).map(|e| e.ops.clone())).flatten();
-        match buf_ops.and_then(|o| o.as_prime_gem_handle()) {
-            Some(h) => {
-                write_user_u32(arg as u64, h); // drm_prime_handle.handle
-                ctx.set_return(SyscallReturn::ok(0));
-            }
-            None => {
-                const EINVAL: i64 = 22;
-                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-            }
-        }
-        return;
-    }
-    // PIDFD_GET_*_NAMESPACE (_IO(0xFF, 1..=10)): mint an fd on the pidfd
-    // target's namespace of the requested flavour (Linux 6.13 pidfs
-    // ioctls; `fs/pidfs.c::pidfd_ioctl`). systemd 258's
-    // `pidref_namespace_open_by_type()` tries this FIRST; on ENOTTY it
-    // falls back to opening `/proc/<pid>/ns/<flavour>`, and when THAT
-    // ENOENTs with /proc mounted it maps the miss to -ENOPKG — an errno
-    // its callers treat as a hard error. Concretely: the service
-    // executor's `is_idmapping_supported()` probe (setup_exec_directory,
-    // RuntimeDirectory=) calls `userns_acquire()` → this ioctl; without
-    // it every service with RuntimeDirectory= exits 233/RUNTIME_DIRECTORY
-    // ("journald/logind/udevd failed with result 'exit-code'"). The fd
-    // returned here is a real `NsFd`, so a later `setns(2)` on it works
-    // (sys_setns downcasts via as_any).
-    #[cfg(feature = "container")]
-    if (0xff01..=0xff0a).contains(&cmd) {
-        if let Some(target) = ops.pidfd_target_pid() {
-            use crate::namespaces::NsFlavour;
-            let flavour = match cmd & 0xFF {
-                1 => Some(NsFlavour::Cgroup),
-                2 => Some(NsFlavour::Ipc),
-                3 => Some(NsFlavour::Mnt),
-                4 => Some(NsFlavour::Net),
-                // 5 = PID ns, 6 = PID-for-children: NARF tracks one
-                // per-task pid-ns, serve it for both.
-                5 | 6 => Some(NsFlavour::Pid),
-                9 => Some(NsFlavour::User),
-                10 => Some(NsFlavour::Uts),
-                // 7/8 = time namespaces — not modelled; fall through to
-                // the generic ENOTTY arm below (Linux pre-6.13 shape).
-                _ => None,
-            };
-            let target_task = pid_to_task_raw(target).unwrap_or(target);
-            if let Some(nsfd) = flavour.and_then(|f| {
-                // Mount-ns fds are minted at the handlers layer (the
-                // mount-ns table lives here, not in `namespaces`).
-                if matches!(f, NsFlavour::Mnt) {
-                    None
-                } else {
-                    crate::namespaces::ns_fd_for(target_task, f)
-                }
-            }) {
-                let ops_dyn: Arc<dyn narf_filesystem::FileOps> = nsfd;
-                // Linux mints these O_CLOEXEC (pidfs open_namespace).
-                let new_fd = fd::with_table(task, |t| {
-                    t.open(fd::FdEntry {
-                        ops: ops_dyn,
-                        offset: 0,
-                        flags: crate::fd::FD_CLOEXEC,
-                        status_flags: 0,
-                    })
-                });
-                match new_fd {
-                    Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
-                    None => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),
-                }
-                return;
-            }
-        }
-        // Not a pidfd / unmodelled flavour: fall through → generic
-        // ENOTTY, which systemd tolerates (pre-pidfs kernel shape).
-    }
-    // PIDFD_GET_INFO (_IOWR(0xFF, 11, struct pidfd_info)): resolve a pidfd
-    // to its target's pid/creds. systemd 258's `pidfd_get_pid()` tries this
-    // ioctl FIRST (kernel 6.13+ path) after `pidfd_spawn`, to turn the
-    // clone3-minted pidfd into a PidRef; on failure it falls back to parsing
-    // `/proc/self/fdinfo/<n>` (which NARF doesn't render a "Pid:" line for).
-    // Matched on magic+nr+direction with ANY size so binaries built against
-    // older/newer uapi headers (the size is baked into the cmd) all land here.
-    // Linux ref: `fs/pidfs.c::pidfd_info` + `include/uapi/linux/pidfd.h`.
-    if (cmd & 0xFF) == 11 && ((cmd >> 8) & 0xFF) == 0xFF && (cmd >> 30) == 0x3 {
-        if let Some(target) = ops.pidfd_target_pid() {
-            let user_size = ((cmd >> 16) & 0x3FFF) as usize;
-            const PIDFD_INFO_SIZE_VER0: usize = 64;
-            if user_size < PIDFD_INFO_SIZE_VER0 {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-                return;
-            }
-            const PIDFD_INFO_PID: u64 = 1 << 0;
-            const PIDFD_INFO_CREDS: u64 = 1 << 1;
-            // struct pidfd_info (uapi VER2, 80 bytes): mask@0 cgroupid@8
-            // pid@16 tgid@20 ppid@24 ruid@28 rgid@32 euid@36 egid@40
-            // suid@44 sgid@48 fsuid@52 fsgid@56 exit_code@60
-            // coredump_mask@64 coredump_signal@68 supported_mask@72.
-            let mut info = [0u8; 80];
-            info[0..8].copy_from_slice(&(PIDFD_INFO_PID | PIDFD_INFO_CREDS).to_ne_bytes());
-            let pid32 = target as u32;
-            info[16..20].copy_from_slice(&pid32.to_ne_bytes()); // pid
-            info[20..24].copy_from_slice(&pid32.to_ne_bytes()); // tgid
-            let ppid = parent_of_get(target)
-                .map(|p| task_to_pid_raw(p).unwrap_or(p) as u32)
-                .unwrap_or(0);
-            info[24..28].copy_from_slice(&ppid.to_ne_bytes());
-            let cred_task = pid_to_task_raw(target).unwrap_or(target);
-            let ug = read_uidgid(cred_task);
-            info[28..32].copy_from_slice(&ug.uid.to_ne_bytes()); // ruid
-            info[32..36].copy_from_slice(&ug.gid.to_ne_bytes()); // rgid
-            info[36..40].copy_from_slice(&ug.euid.to_ne_bytes()); // euid
-            info[40..44].copy_from_slice(&ug.egid.to_ne_bytes()); // egid
-            info[44..48].copy_from_slice(&ug.euid.to_ne_bytes()); // suid (= euid)
-            info[48..52].copy_from_slice(&ug.egid.to_ne_bytes()); // sgid (= egid)
-            info[52..56].copy_from_slice(&ug.fsuid.to_ne_bytes());
-            info[56..60].copy_from_slice(&ug.fsgid.to_ne_bytes());
-            let n = core::cmp::min(user_size, info.len());
-            // SAFETY: `arg` is the user struct pointer for an _IOWR ioctl;
-            // copy_to_user range-validates and SMAP-brackets the write of
-            // min(user-declared size, our struct) bytes.
-            // SAFETY: Valid memory or trusted environment
-            if unsafe { copy_to_user(arg as u64, &info[..n]) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-                return;
-            }
-            ctx.set_return(SyscallReturn::ok(0));
-            return;
-        }
-        // Not a pidfd: fall through — Linux returns ENOTTY via the
-        // default file_operations dispatch, which the generic arm below
-        // reproduces (FsError::Unsupported → ENOTTY).
-    }
-    match ops.ioctl(cmd, arg) {
-        Ok(rc) => ctx.set_return(SyscallReturn::ok(rc)),
-        Err(narf_filesystem::FsError::Unsupported) => {
-            ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
-        }
-        Err(narf_filesystem::FsError::PermissionDenied) => {
-            // EACCES = 13
-            ctx.set_return(SyscallReturn::ok((-13i64) as u64));
-        }
-        Err(narf_filesystem::FsError::InvalidData) | Err(narf_filesystem::FsError::InvalidPath) => {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-        }
-        Err(_) => {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-        }
-    }
-}
 
 // ── Stat / Fstat ───────────────────────────────────────────────────
 //
@@ -3096,134 +1541,11 @@ impl StatBuf {
     }
 }
 
-fn sys_stat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux ABI: `int stat(const char *pathname, struct stat *statbuf)`.
-    // Two args, path is NUL-terminated. (NARF-native callers used
-    // the explicit-length triplet (path_ptr, path_len, out_ptr); we
-    // cut over to the Linux shape so musl-built binaries can do PATH
-    // search via stat — busybox sh's pipeline children stat their
-    // way through `:`-separated $PATH looking for the binary, and
-    // an EINVAL/EPERM return there masquerades as "Operation not
-    // permitted", silently failing every `cat`/`tr`/`head` etc.)
-    let path_ptr = args.arg0;
-    let out_ptr = args.arg1 as *mut StatBuf;
-    // POSIX-shaped failure sentinel. The user-runtime asm wrapper
-    // observes only the `value` register, so we mirror libc and
-    // return -1 on failure to disambiguate from a 0-valued success.
-    // Without this the success ok(0) and the invalid_op rax=0 are
-    // indistinguishable at the user side.
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out_ptr.is_null() {
-        ctx.set_return(fail);
-        return;
-    }
-    let path_owned = match copy_user_cstr(path_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let path_owned = apply_chroot(&path_owned);
-    let path: &str = &path_owned;
-    let ops = narf_filesystem::registry()
-        .resolve_absolute(path, |fs, rel| {
-            narf_filesystem::resolve(fs.root(), rel).ok()
-        })
-        .flatten();
-    let ops = match ops {
-        Some(o) => o,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let stat = StatBuf::from_stat(ops.stat());
-    // Copy stat struct into user memory under the SMAP bracket.
-    // SAFETY: stat is a plain-old-data repr(C) struct; transmuting
-    // to bytes is sound.
-    // SAFETY: Valid memory or trusted environment
-    let stat_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            &stat as *const StatBuf as *const u8,
-            core::mem::size_of::<StatBuf>(),
-        )
-    };
-    // SAFETY: `out_ptr` is the user StatBuf pointer (null-checked above);
-    // copy_to_user range-validates it and SMAP-brackets the write of `stat_bytes`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out_ptr as u64, stat_bytes) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-fn sys_fstat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let out_ptr = args.arg1 as *mut StatBuf;
-    // See sys_stat for the failure-sentinel rationale.
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out_ptr.is_null() {
-        ctx.set_return(fail);
-        return;
-    }
-    let task = current_task_id();
-    let stat = fd::with_table(task, |t| {
-        t.get(fd).map(|e| StatBuf::from_stat(e.ops.stat()))
-    });
-    let stat = match stat {
-        Some(Some(s)) => s,
-        _ => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // SAFETY: same contract as sys_stat above.
-    let stat_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            &stat as *const StatBuf as *const u8,
-            core::mem::size_of::<StatBuf>(),
-        )
-    };
-    // SAFETY: `out_ptr` is the user StatBuf pointer (null-checked above);
-    // copy_to_user range-validates it and SMAP-brackets the write of `stat_bytes`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out_ptr as u64, stat_bytes) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 // ── Ftruncate — arg0=fd, arg1=len ──────────────────────────────────
 //
 // Resize the file backing `fd` to exactly `len` bytes. Routes
 // through `FileOps::truncate` — read-only filesystems return
 // `Unsupported`, which we surface as the wire `-1` sentinel.
-
-fn sys_ftruncate(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let len = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let task = current_task_id();
-    let outcome = fd::with_table(task, |t| {
-        let entry = t.get(fd)?;
-        Some(poll_blocking(entry.ops.truncate(len)))
-    });
-    match outcome {
-        Some(Some(Some(Ok(())))) => {
-            // inotify: truncate changes file content → IN_MODIFY.
-            #[cfg(feature = "linux-compat")]
-            crate::mqueue::notify_modify_fd(task, fd);
-            ctx.set_return(SyscallReturn::ok(0))
-        }
-        _ => ctx.set_return(fail),
-    }
-}
 
 // ── Pread / Pwrite — positional I/O without per-fd offset ─────────
 //
@@ -3231,90 +1553,6 @@ fn sys_ftruncate(ctx: &mut dyn TrapContext) {
 // sys_read / sys_write handlers walk through the per-fd cursor on
 // top. pread / pwrite skip the cursor mutation — POSIX guarantees
 // the per-fd offset is unchanged after these calls.
-
-fn sys_pread64(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let ptr = args.arg1;
-    let len = args.arg2 as usize;
-    let offset = args.arg3;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if len == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    if let Err(e) = validate_user_range(ptr, len) {
-        ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-        return;
-    }
-    let task = current_task_id();
-    // Bad fd → -EBADF, checked explicitly so it stays distinct from the
-    // -1 read-error path in the `_` arm below (a blanket change would
-    // mis-map genuine read failures).
-    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
-        return;
-    }
-    let mut kbuf = alloc::vec![0u8; len];
-    let outcome = fd::with_table(task, |t| {
-        let entry = t.get(fd)?;
-        let ops = entry.ops.clone();
-        let res = poll_blocking(ops.read(offset, &mut kbuf))
-            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
-        res.ok()
-    });
-    match outcome {
-        Some(Some(n)) => {
-            // SAFETY: ptr validated above; AS still active.
-            if let Err(e) = unsafe { copy_to_user(ptr, &kbuf[..n]) } {
-                ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-            } else {
-                ctx.set_return(SyscallReturn::ok(n as u64));
-            }
-        }
-        _ => ctx.set_return(fail),
-    }
-}
-
-fn sys_pwrite64(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let ptr = args.arg1;
-    let len = args.arg2 as usize;
-    let offset = args.arg3;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if len == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    // Validate length before allocating — reject oversized len with EINVAL
-    // rather than OOMing the kernel heap.
-    // SAFETY: single-threaded syscall; AS active.
-    let kbuf = match unsafe { copy_from_user_vec(ptr, len) } {
-        Ok(b) => b,
-        Err(e) => {
-            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-            return;
-        }
-    };
-    let task = current_task_id();
-    // Bad fd → -EBADF, checked explicitly so write errors keep the -1 path.
-    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
-        return;
-    }
-    let outcome = fd::with_table(task, |t| {
-        let entry = t.get(fd)?;
-        let ops = entry.ops.clone();
-        let res = poll_blocking(ops.write(offset, &kbuf))
-            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
-        res.ok()
-    });
-    match outcome {
-        Some(Some(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        _ => ctx.set_return(fail),
-    }
-}
 
 // ── Fallocate — preallocate file space ─────────────────────────────
 //
@@ -3328,58 +1566,6 @@ fn sys_pwrite64(ctx: &mut dyn TrapContext) {
 // doesn't exercise them.
 
 const FALLOC_FL_ZERO_RANGE: u64 = 0x10;
-
-fn sys_fallocate(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let mode = args.arg1;
-    let offset = args.arg2;
-    let len = args.arg3;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-
-    if mode != 0 && mode != FALLOC_FL_ZERO_RANGE {
-        ctx.set_return(fail);
-        return;
-    }
-    let target_end = offset.saturating_add(len);
-    let task = current_task_id();
-    let outcome = fd::with_table(task, |t| {
-        let entry = t.get(fd)?;
-        let ops = entry.ops.clone();
-        let cur_size = ops.stat().size;
-        // Always ensure size >= offset + len. truncate handles
-        // grow + zero-fill.
-        if target_end > cur_size
-            && poll_blocking(ops.truncate(target_end))
-                .and_then(|r| r.ok())
-                .is_none()
-        {
-            return Some(false);
-        }
-        if mode == FALLOC_FL_ZERO_RANGE && len > 0 && offset < cur_size {
-            // Zero existing bytes in [offset, min(target_end, old size)].
-            // We do this in 4-KiB chunks of zeros via a fresh write.
-            let zero_end = core::cmp::min(target_end, cur_size);
-            let mut cur = offset;
-            let chunk = [0u8; 4096];
-            while cur < zero_end {
-                let span = core::cmp::min(zero_end - cur, chunk.len() as u64) as usize;
-                let n = poll_blocking(ops.write(cur, &chunk[..span]))
-                    .and_then(|r| r.ok())
-                    .unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                cur += n as u64;
-            }
-        }
-        Some(true)
-    });
-    match outcome {
-        Some(Some(true)) => ctx.set_return(SyscallReturn::ok(0)),
-        _ => ctx.set_return(fail),
-    }
-}
 
 // ── CopyFileRange — chunked file→file copy ─────────────────────────
 //
@@ -3403,151 +1589,12 @@ fn sys_fallocate(ctx: &mut dyn TrapContext) {
 // which dropped the first byte, sent the copy to stdin's device, and
 // never advanced either offset — so `cat` looped forever.
 
-fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd_in = args.arg0 as u32;
-    let off_in_ptr = args.arg1;
-    let fd_out = args.arg2 as u32;
-    let off_out_ptr = args.arg3;
-    let len = args.arg4 as usize;
-    let flags = args.arg5;
-    const EBADF: i64 = -9;
-    const EINVAL: i64 = -22;
-
-    if flags != 0 {
-        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
-        return;
-    }
-    if len == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    // Fault the offset words in before any copying happens, so a bad
-    // pointer is EFAULT rather than a half-completed copy.
-    for p in [off_in_ptr, off_out_ptr] {
-        if p != 0 {
-            if let Err(e) = validate_user_range(p, 8) {
-                ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-                return;
-            }
-        }
-    }
-
-    // Resolve both ops + their starting offsets up-front so we
-    // don't hold the fd table lock across the FsFuture polls.
-    let task = current_task_id();
-    let resolved = fd::with_table(task, |t| {
-        let in_e = t.get(fd_in)?;
-        let in_off = if off_in_ptr == 0 {
-            in_e.offset
-        } else {
-            read_user_u64(off_in_ptr)
-        };
-        let out_e = t.get(fd_out)?;
-        let out_off = if off_out_ptr == 0 {
-            out_e.offset
-        } else {
-            read_user_u64(off_out_ptr)
-        };
-        Some((in_e.ops.clone(), in_off, out_e.ops.clone(), out_off))
-    });
-    let (in_ops, mut cur_in, out_ops, mut cur_out) = match resolved {
-        Some(Some(t)) => t,
-        _ => {
-            ctx.set_return(SyscallReturn::ok(EBADF as u64));
-            return;
-        }
-    };
-
-    let mut chunk = [0u8; 4096];
-    let mut copied = 0usize;
-    while copied < len {
-        let span = core::cmp::min(len - copied, chunk.len());
-        let read_n = poll_blocking(in_ops.read(cur_in, &mut chunk[..span]))
-            .and_then(|r| r.ok())
-            .unwrap_or(0);
-        if read_n == 0 {
-            break;
-        }
-        let write_n = poll_blocking(out_ops.write(cur_out, &chunk[..read_n]))
-            .and_then(|r| r.ok())
-            .unwrap_or(0);
-        if write_n == 0 {
-            break;
-        }
-        copied += write_n;
-        cur_in += write_n as u64;
-        cur_out += write_n as u64;
-        if write_n < read_n {
-            break;
-        }
-    }
-
-    // A NULL offset pointer means the copy consumed the fd's own file
-    // offset, so advance it; a non-NULL pointer leaves the cursor alone
-    // and gets the advanced value written back instead.
-    let _ = fd::with_table(task, |t| {
-        if off_in_ptr == 0 {
-            if let Some(e) = t.get_mut(fd_in) {
-                e.offset = cur_in;
-            }
-        }
-        if off_out_ptr == 0 {
-            if let Some(e) = t.get_mut(fd_out) {
-                e.offset = cur_out;
-            }
-        }
-        Some(())
-    });
-    if off_in_ptr != 0 {
-        write_user_u64(off_in_ptr, cur_in);
-    }
-    if off_out_ptr != 0 {
-        write_user_u64(off_out_ptr, cur_out);
-    }
-
-    ctx.set_return(SyscallReturn::ok(copied as u64));
-}
-
 // ── Truncate — path-based file resize ──────────────────────────────
 //
 // Linux truncate(2). Equivalent to open + ftruncate + close in one
 // syscall. Resolves the absolute path to a FileOps and calls
 // `truncate(len)` directly — no fd-table involvement. Routes to the
 // same trait method that backs SYS_FTRUNCATE.
-
-fn sys_truncate(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux: truncate(const char *path, off_t length). arg0 = NUL-terminated
-    // path, arg1 = new length. (Was NARF-native (path_ptr, path_len, size).)
-    let ptr = args.arg0;
-    let new_size = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let path = match copy_user_cstr(ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let ops = narf_filesystem::registry()
-        .resolve_absolute(&path, |fs, rel| {
-            narf_filesystem::resolve(fs.root(), rel).ok()
-        })
-        .flatten();
-    match ops {
-        Some(o) => match poll_blocking(o.truncate(new_size)) {
-            Some(Ok(())) => {
-                // inotify: truncate changes file content → IN_MODIFY.
-                #[cfg(feature = "linux-compat")]
-                crate::mqueue::notify_modify_path(&path);
-                ctx.set_return(SyscallReturn::ok(0))
-            }
-            _ => ctx.set_return(fail),
-        },
-        None => ctx.set_return(fail),
-    }
-}
 
 // ── unlinkat / mkdirat / renameat — *at-keyed FS mutation ─────────
 //
@@ -3558,138 +1605,6 @@ fn sys_truncate(ctx: &mut dyn TrapContext) {
 // unlinkat honours AT_REMOVEDIR (0x200) — when set, route to rmdir.
 
 const AT_REMOVEDIR: u64 = 0x200;
-
-fn sys_unlinkat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux ABI: `int unlinkat(int dirfd, const char *pathname,
-    // int flags)`. arg2 is flags, not path_len.
-    let _dirfd = args.arg0;
-    let path_uptr = args.arg1;
-    let flags = args.arg2;
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    let proxy_args = SyscallArgs {
-        arg0: path_uptr,
-        arg1: path_str.len() as u64,
-        arg2: 0,
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
-    };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    if (flags & AT_REMOVEDIR) != 0 {
-        sys_rmdir(&mut proxy);
-    } else {
-        sys_unlink(&mut proxy);
-    }
-}
-
-fn sys_mkdirat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux ABI: `int mkdirat(int dirfd, const char *pathname,
-    // mode_t mode)`. arg2 is mode, not path_len.
-    let _dirfd = args.arg0;
-    let path_uptr = args.arg1;
-    let mode = args.arg2;
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    let proxy_args = SyscallArgs {
-        arg0: path_uptr,
-        arg1: path_str.len() as u64,
-        arg2: mode,
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
-    };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_mkdir(&mut proxy);
-}
-
-/// Linux `mknodat(dirfd, pathname, mode, dev)` (and `mknod`, which musl
-/// routes through mknodat with AT_FDCWD). Creates a filesystem node.
-///
-/// NARF has no FIFO / socket / character / block node types, so every
-/// non-directory node is created as a regular file. That's enough for the
-/// callers that matter: elogind/systemd create a per-session `.ref` FIFO
-/// (and `/run/systemd/inaccessible/{reg,fifo,sock,chr,blk}` sandbox nodes)
-/// and only need the node to EXIST and be openable — without it, elogind's
-/// `CreateSession` fails with EINVAL and no logind session is ever created
-/// (which a Wayland compositor needs to TakeDevice the GPU). A `S_IFDIR`
-/// request is routed to the directory-create path for correctness.
-fn sys_mknodat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // mknodat(dirfd, path, mode, dev): path=arg1, mode=arg2, dev=arg3.
-    let ret = mknod_common(args.arg1, args.arg2, args.arg3);
-    ctx.set_return(ret);
-}
-
-/// Linux `mknod(path, mode, dev)` — x86_64 syscall 133. musl's `mknod()`
-/// routes here (not through mknodat). path=arg0, mode=arg1, dev=arg2.
-fn sys_mknod(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let ret = mknod_common(args.arg0, args.arg1, args.arg2);
-    ctx.set_return(ret);
-}
 
 /// Shared node-creation used by both `mknod` and `mknodat`. `S_IFDIR` creates
 /// a directory; `S_IFCHR`/`S_IFBLK` create a device node via the directory's
@@ -3813,227 +1728,12 @@ pub(crate) fn create_unix_socket_node(path: &str) {
     }
 }
 
-fn sys_renameat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let _old_dirfd = args.arg0;
-    // Linux ABI: `int renameat(int olddirfd, const char *oldpath,
-    // int newdirfd, const char *newpath)`. Two cstrs, no lengths.
-    let old_uptr = args.arg1;
-    let _new_dirfd = args.arg2;
-    let new_uptr = args.arg3;
-    let old_str = match copy_user_cstr(old_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    let new_str = match copy_user_cstr(new_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    // sys_rename is Linux-shaped: arg0 = old path ptr, arg1 = new path ptr
-    // (both NUL-terminated). It was previously NARF-native
-    // (old_ptr, old_len, new_ptr, new_len) and this reshape still passed
-    // the lengths — so sys_rename read `old_len` as the new-path pointer
-    // and every renameat(2) failed. Pass the two NUL-terminated pointers.
-    let _ = (old_str, new_str); // validated above; sys_rename re-reads via the ptrs
-    let proxy_args = SyscallArgs {
-        arg0: old_uptr,
-        arg1: new_uptr,
-        ..Default::default()
-    };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_rename(&mut proxy);
-}
-
-/// `renameat2(olddirfd, old, newdirfd, new, flags)` — rename with
-/// RENAME_NOREPLACE (fail if the destination exists). RENAME_EXCHANGE
-/// and RENAME_WHITEOUT aren't supported (EINVAL). dirfds are treated
-/// as AT_FDCWD — paths must be absolute, matching `sys_rename`.
-fn sys_renameat2(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let old_uptr = args.arg1;
-    let new_uptr = args.arg3;
-    let flags = args.arg4 as u32;
-    const RENAME_NOREPLACE: u32 = 1;
-    // A bare -1 lands in glibc's [-4095,-1] errno window as EPERM, which
-    // reads as a permission problem; return real errnos instead.
-    let efault = SyscallReturn::ok((-14i64) as u64);
-    let einval = SyscallReturn::ok((-22i64) as u64);
-    if flags & !RENAME_NOREPLACE != 0 {
-        ctx.set_return(einval);
-        return;
-    }
-    let old_path = match copy_user_cstr(old_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
-            return;
-        }
-    };
-    let new_path = match copy_user_cstr(new_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
-            return;
-        }
-    };
-    // glibc implements plain `rename(2)` on top of renameat2, so this is
-    // the path a distro's libc actually takes — it has to resolve
-    // relative paths against the cwd exactly like `sys_rename` does.
-    let task = current_task_id();
-    let old_path = resolve_cwd_path(task, &old_path);
-    let new_path = resolve_cwd_path(task, &new_path);
-    let old_split = match old_path.rfind('/') {
-        Some(i) => i,
-        None => {
-            ctx.set_return(einval);
-            return;
-        }
-    };
-    let new_split = match new_path.rfind('/') {
-        Some(i) => i,
-        None => {
-            ctx.set_return(einval);
-            return;
-        }
-    };
-    let new_leaf = &new_path[new_split + 1..];
-    if flags & RENAME_NOREPLACE != 0 {
-        let exists = narf_filesystem::registry()
-            .resolve_parent_absolute(&new_path, |_fs, parent, leaf| parent.lookup(leaf).is_some())
-            .unwrap_or(false);
-        if exists {
-            ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
-            return;
-        }
-    }
-    // Different parent directories: a move within one mount, not
-    // automatically EXDEV. See `cross_dir_rename`.
-    if old_path[..old_split] != new_path[..new_split] {
-        ctx.set_return(SyscallReturn::ok(cross_dir_rename(&old_path, &new_path)));
-        return;
-    }
-    let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(&old_path, |_fs, parent, old_leaf| {
-            poll_blocking(parent.rename(old_leaf, new_leaf))
-        });
-    match outcome {
-        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
-        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
-    }
-}
-
 // ── symlinkat / readlinkat — *at-keyed symlink ops ─────────────────
 //
 // Both forward via Reshape proxies. dirfd ignored; path args are
 // absolute. The symlink handler reads (target_ptr, target_len,
 // link_ptr, link_len) from arg0..=arg3; readlink reads
 // (path_ptr, path_len, buf_ptr, buf_len) from arg0..=arg3.
-
-fn sys_symlinkat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux: symlinkat(const char *target, int newdirfd, const char *linkpath).
-    // arg0 = target (NUL-term), arg1 = newdirfd, arg2 = linkpath (NUL-term).
-    // (Was NARF-native (target_ptr, target_len, dirfd, link_ptr, link_len).)
-    let target_ptr = args.arg0;
-    let _dirfd = args.arg1;
-    let link_ptr = args.arg2;
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    // sys_symlink is now Linux-shaped: arg0 = target ptr, arg1 = linkpath ptr.
-    let proxy_args = SyscallArgs {
-        arg0: target_ptr,
-        arg1: link_ptr,
-        ..Default::default()
-    };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_symlink(&mut proxy);
-}
-
-fn sys_readlinkat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux ABI: `ssize_t readlinkat(int dirfd, const char *path,
-    // char *buf, size_t bufsiz)`.
-    let dirfd = args.arg0 as i64;
-    let path_uptr = args.arg1;
-    let buf_ptr = args.arg2 as *mut u8;
-    let buf_len = args.arg3 as usize;
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    // Honour a real directory fd (see sys_openat): resolve a relative path
-    // against the directory backing `dirfd`. chase_symlinks readlinkat()s a
-    // component relative to its parent-dir fd.
-    const AT_FDCWD: i64 = -100;
-    let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
-        path_str
-    } else {
-        match fd_path_of(current_task_id(), dirfd as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), path_str)
-            }
-            _ => path_str,
-        }
-    };
-    readlink_impl(ctx, effective, buf_ptr, buf_len);
-}
 
 // ── access / chmod / chown — legacy entry points ───────────────────
 //
@@ -4044,173 +1744,12 @@ fn sys_readlinkat(ctx: &mut dyn TrapContext) {
 // `sys_fchmodat_or_fchownat` body, which already enforces the
 // "path must be absolute, mode/uid/gid bits ignored" contract.
 
-fn sys_access_chmod_chown(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux ABI for the three legacy entries:
-    //   access(path, mode)      — arg1 = mode
-    //   chmod(path, mode)       — arg1 = mode
-    //   chown(path, uid, gid)   — arg1 = uid, arg2 = gid
-    // All take an absolute path as a NUL-terminated cstr; the body
-    // forwards to `sys_fchmodat_or_fchownat` which only enforces
-    // the structural "path must be absolute" contract — we drop
-    // the mode/uid/gid in the proxy so the underlying path-len
-    // shape lines up.
-    let path_uptr = args.arg0;
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            // Unreadable user path pointer → EFAULT, not a bare -1 → EPERM.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
-            return;
-        }
-    };
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    let proxy_args = SyscallArgs {
-        arg0: (-100i64) as u64, // dirfd = AT_FDCWD (legacy access/chmod/chown).
-        arg1: path_uptr,
-        arg2: path_str.len() as u64,
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
-    };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_fchmodat_or_fchownat(&mut proxy);
-}
-
-/// Legacy `chmod(path, mode)`. Reshaped into the `fchmodat(AT_FDCWD,
-/// path, mode, 0)` argument order and forwarded to [`sys_fchmodat`], so
-/// a `chmod` PERSISTS the mode (file: `FileOps::set_perms`; directory:
-/// `DirOps::set_dir_mode`) and a later `stat` reflects it. musl builds
-/// its `chmod(3)` on top of `fchmodat`, but a program (or a NARF-native
-/// caller) that issues the bare `chmod(2)` number must round-trip the
-/// mode too — systemd-tmpfiles `z`/`Z` (file) and `d`/`D` (dir) lines
-/// chmod a path and then stat it to confirm. The accept-and-ignore
-/// `sys_access_chmod_chown` proxy (still used by `access`/`chown`) drops
-/// the mode, so `chmod` gets its own entry point.
-fn sys_chmod(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Legacy ABI: chmod(path, mode) — arg0 = path ptr, arg1 = mode.
-    // sys_fchmodat reads arg1 = path ptr, arg2 = mode, arg0 = dirfd.
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    let proxy_args = SyscallArgs {
-        arg0: (-100i64) as u64, // dirfd = AT_FDCWD (legacy chmod).
-        arg1: args.arg0,        // path ptr.
-        arg2: args.arg1,        // mode.
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
-    };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_fchmodat(&mut proxy);
-}
-
 // ── newfstatat — *at-keyed stat ────────────────────────────────────
 //
 // Linux newfstatat(dirfd, path, statbuf, flags). Same dirfd-
 // ignored / path-must-be-absolute simplification. Re-shape args
 // to the SYS_STAT signature (path_ptr, path_len, stat_out) and
 // reuse sys_stat's body.
-
-fn sys_newfstatat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux ABI: `int fstatat(int dirfd, const char *pathname,
-    // struct stat *statbuf, int flags)`. arg2 is statbuf, not
-    // path_len.
-    let _dirfd = args.arg0;
-    let path_uptr = args.arg1;
-    let stat_out = args.arg2;
-    let _flags = args.arg3;
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    let proxy_args = SyscallArgs {
-        arg0: path_uptr,
-        arg1: path_str.len() as u64,
-        arg2: stat_out,
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
-    };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_stat(&mut proxy);
-}
 
 // ── statx — Linux statx(2) wire-shape ─────────────────────────────
 //
@@ -4385,21 +1924,6 @@ fn linux_stat_from_fs(
 // Linux-ABI sys_stat: writes a 144-byte `struct stat`. Same path-
 // resolution as the NARF-shape sys_stat, only the wire layout
 // changes.
-#[cfg(feature = "linux-compat")]
-fn sys_stat_linux(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux ABI: `int stat(const char *pathname, struct stat *statbuf)`.
-    // Plain stat always follows a trailing symlink.
-    stat_linux_common(ctx, args.arg0, args.arg1, true);
-}
-
-#[cfg(feature = "linux-compat")]
-fn sys_lstat_linux(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux ABI: `int lstat(const char *pathname, struct stat *statbuf)`.
-    // lstat is stat-that-does-not-follow: describe the symlink itself.
-    stat_linux_common(ctx, args.arg0, args.arg1, false);
-}
 
 /// Shared body for the Linux path-stat family. `follow_final` selects
 /// whether a trailing symlink is followed (plain `stat`/`fstatat`) or
@@ -4471,289 +1995,7 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-#[cfg(feature = "linux-compat")]
-fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let out_ptr = args.arg1 as *mut linux_compat::Stat;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out_ptr.is_null() {
-        ctx.set_return(fail);
-        return;
-    }
-    let task = current_task_id();
-    let stat = fd::with_table(task, |t| {
-        t.get(fd)
-            .map(|e| (e.ops.stat(), e.ops.owners(), e.ops.rdev(), e.ops.ino()))
-    });
-    let (s, (uid, gid), rdev, ino) = match stat {
-        Some(Some(tuple)) => tuple,
-        _ => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let out = linux_stat_from_fs(s, uid, gid, rdev, ino);
-    // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
-    // and borrows it for the duration of the copy below.
-    // SAFETY: Valid memory or trusted environment
-    let bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            &out as *const linux_compat::Stat as *const u8,
-            core::mem::size_of::<linux_compat::Stat>(),
-        )
-    };
-    // SAFETY: `out_ptr` is the user Stat pointer (null-checked above);
-    // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 // newfstatat under linux-compat: reshape args then delegate.
-#[cfg(feature = "linux-compat")]
-fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux ABI: `int fstatat(int dirfd, const char *pathname,
-    // struct stat *statbuf, int flags)`.
-    let dirfd = args.arg0 as i32;
-    let path_uptr = args.arg1;
-    let stat_out = args.arg2;
-    let flags = args.arg3 as u32;
-
-    // AT_EMPTY_PATH + empty path → describe `dirfd` itself. This is how modern
-    // glibc implements `fstat(fd, buf)`: `newfstatat(fd, "", buf,
-    // AT_EMPTY_PATH)`. Without this, the empty path falls through to path
-    // resolution and yields a garbage/ENOENT stat, so `fstat` on any open fd
-    // reports a non-regular mode — which makes systemd's `read_full_virtual_file`
-    // reject every sysfs `uevent` with EBADF and libudev resolve no devices
-    // (kwin then gets no GPU). sys_statx already handles this; mirror it.
-    let empty = (flags & linux_compat::AT_EMPTY_PATH) != 0 && {
-        let mut first = [0u8; 1];
-        // SAFETY: `path_uptr` is the user path pointer; copy_from_user
-        // range-validates it and SMAP-brackets the 1-byte read into `first`.
-        unsafe { copy_from_user(&mut first, path_uptr) }.is_ok() && first[0] == 0
-    };
-    if empty {
-        let out_ptr = stat_out as *mut linux_compat::Stat;
-        let fail = SyscallReturn::ok((-1i64) as u64);
-        if out_ptr.is_null() || dirfd < 0 {
-            ctx.set_return(fail);
-            return;
-        }
-        let task = current_task_id();
-        let stat = fd::with_table(task, |t| {
-            t.get(dirfd as u32)
-                .map(|e| (e.ops.stat(), e.ops.owners(), e.ops.rdev(), e.ops.ino()))
-        });
-        let (s, (uid, gid), rdev, ino) = match stat {
-            Some(Some(tuple)) => tuple,
-            _ => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
-        let out = linux_stat_from_fs(s, uid, gid, rdev, ino);
-        // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size.
-        let bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(
-                &out as *const linux_compat::Stat as *const u8,
-                core::mem::size_of::<linux_compat::Stat>(),
-            )
-        };
-        // SAFETY: `out_ptr` null-checked above; copy_to_user range-validates it.
-        if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
-            ctx.set_return(fail);
-            return;
-        }
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    // AT_SYMLINK_NOFOLLOW (lstat's shape via fstatat) means "describe the
-    // symlink itself" — don't follow the final component. Without it,
-    // fstatat follows like plain stat.
-    let follow_final = flags & linux_compat::AT_SYMLINK_NOFOLLOW == 0;
-    stat_linux_common(ctx, path_uptr, stat_out, follow_final);
-}
-
-#[cfg(feature = "linux-compat")]
-fn sys_statx(ctx: &mut dyn TrapContext) {
-    use linux_compat::*;
-    let args = *ctx.args();
-    // Linux ABI: `int statx(int dirfd, const char *path, int flags,
-    // unsigned int mask, struct statx *buf)`. arg2/3/4/5 shift left
-    // by one slot now that arg2 is `flags` (not the old NARF-native
-    // `path_len`).
-    let dirfd = args.arg0 as i32;
-    let path_uptr = args.arg1;
-    let flags = args.arg2 as u32;
-    let mask = args.arg3 as u32;
-    let out_ptr = args.arg4 as *mut Statx;
-    let _ = mask;
-
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out_ptr.is_null() {
-        ctx.set_return(fail);
-        return;
-    }
-
-    // AT_EMPTY_PATH + empty path string → operate on dirfd directly.
-    // We can detect "empty path" cheaply by reading just the first
-    // byte; if it's NUL, no need to call copy_user_cstr.
-    let mut first = [0u8; 1];
-    // SAFETY: `path_uptr` is the user path pointer; copy_from_user range-validates
-    // it and SMAP-brackets the 1-byte read into `first`.
-    let empty = (flags & AT_EMPTY_PATH) != 0
-        // SAFETY: Valid memory or trusted environment
-        && unsafe { copy_from_user(&mut first, path_uptr) }.is_ok()
-        && first[0] == 0;
-
-    // Resolve to a FileOps. Three cases:
-    //   1. empty + dirfd >= 0       → look up fd
-    //   2. path absolute            → registry walk (dirfd ignored
-    //                                  beyond requiring AT_FDCWD or
-    //                                  a real fd; NARF has no per-
-    //                                  task cwd so non-AT_FDCWD
-    //                                  relative paths fail)
-    //   3. otherwise                → fail
-    let fs_stat = if empty {
-        if dirfd < 0 {
-            ctx.set_return(fail);
-            return;
-        }
-        let task = current_task_id();
-        fd::with_table(task, |t| {
-            t.get(dirfd as u32)
-                .map(|e| (e.ops.stat(), e.ops.ino(), e.ops.rdev()))
-        })
-        .flatten()
-    } else {
-        let raw = match copy_user_cstr(path_uptr, 4096) {
-            Some(s) => s,
-            None => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
-        // Honour a real directory fd (same shape as sys_readlinkat):
-        // resolve a relative path against the directory backing `dirfd`.
-        // systemd's chase() walks a path one component at a time via
-        // statx(parent_dir_fd, name, AT_SYMLINK_NOFOLLOW|AT_EMPTY_PATH,
-        // STATX_TYPE); without this branch every such lookup resolved
-        // against the CWD instead and ENOENT'd (exec_setup_credentials'
-        // mount-ns child → journald 243/EXIT_CREDENTIALS).
-        const AT_FDCWD_I32: i32 = -100;
-        let effective = if raw.starts_with('/') || dirfd == AT_FDCWD_I32 || dirfd < 0 {
-            raw
-        } else {
-            match fd_path_of(current_task_id(), dirfd as u32) {
-                Some(dir) if dir.starts_with('/') => {
-                    alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
-                }
-                _ => raw,
-            }
-        };
-        // resolve_cwd_path resolves against the cwd AND re-roots under
-        // the task's chroot — applying apply_chroot again double-composes.
-        let path_owned = resolve_cwd_path(current_task_id(), &effective);
-        // AT_SYMLINK_NOFOLLOW → describe the symlink itself (S_IFLNK),
-        // not its target; otherwise follow like plain stat.
-        let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
-        stat_ino_path_dir_aware_ext(&path_owned, follow_final)
-    };
-
-    let (s, ino, rdev) = match fs_stat {
-        Some(triple) => triple,
-        None => {
-            // File doesn't exist — report ENOENT, not the bare -1 sentinel
-            // (which musl maps to EPERM). Callers that probe for a path's
-            // existence (e.g. libwayland's wl_socket_lock, which only
-            // proceeds when stat() of the socket path returns ENOENT) need
-            // the real errno.
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
-            return;
-        }
-    };
-    // dev_t (small encoding (major<<8)|minor) → statx major/minor fields.
-    let (rdev_major, rdev_minor) = (((rdev >> 8) & 0xfff) as u32, (rdev & 0xff) as u32);
-
-    let ftype_bits: u16 = match s.mode.file_type {
-        narf_filesystem::FileType::File => 0o100000,
-        narf_filesystem::FileType::Dir => 0o040000,
-        narf_filesystem::FileType::Symlink => 0o120000,
-        narf_filesystem::FileType::Special => 0o020000,
-        narf_filesystem::FileType::Socket => 0o140000,
-        narf_filesystem::FileType::Fifo => 0o010000,
-    };
-    let mode_word: u16 = ftype_bits | (s.mode.perms & 0o7777);
-
-    // mtime: monotonic cycles → ns via the wall-clock calibration.
-    // Wall-clock per inode isn't tracked, so this surfaces a
-    // stable monotonic ordering, not a real wall time.
-    let cpns = narf_time::cycles_per_ns().max(1) as u64;
-    let mtime_ns = s.mtime_cycles / cpns;
-    let mtime = StatxTimestamp {
-        tv_sec: (mtime_ns / 1_000_000_000) as i64,
-        tv_nsec: (mtime_ns % 1_000_000_000) as u32,
-        __reserved: 0,
-    };
-
-    // Honour the request mask but only advertise what we filled.
-    // STATX_BASIC_STATS = type|mode|nlink|uid|gid|atime|mtime|
-    // ctime|ino|size|blocks. We fill type/mode/nlink/ino/size/
-    // blocks/mtime/ctime; uid/gid/atime aren't tracked.
-    let filled = STATX_TYPE
-        | STATX_MODE
-        | STATX_NLINK
-        | STATX_INO
-        | STATX_SIZE
-        | STATX_BLOCKS
-        | STATX_MTIME
-        | STATX_CTIME;
-    let out = Statx {
-        stx_blksize: 4096,
-        stx_mode: mode_word,
-        stx_size: s.size,
-        stx_blocks: s.blocks,
-        stx_mtime: mtime,
-        stx_ctime: mtime,
-        stx_ino: if ino != 0 {
-            ino
-        } else {
-            (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff
-        },
-        stx_nlink: 1,
-        stx_rdev_major: rdev_major,
-        stx_rdev_minor: rdev_minor,
-        stx_mask: filled
-            & if mask == 0 {
-                filled
-            } else {
-                mask | STATX_BASIC_STATS & filled
-            },
-        ..Default::default()
-    };
-
-    // SAFETY: Statx is repr(C) POD; bytes are valid for read.
-    let bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            &out as *const Statx as *const u8,
-            core::mem::size_of::<Statx>(),
-        )
-    };
-    // SAFETY: `out_ptr` is the user statx buffer (null-checked above);
-    // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
 
 // ── openat — *at-keyed open ────────────────────────────────────────
 //
@@ -4764,88 +2006,6 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
 // and routes through the existing sys_open handler so the open
 // path is identical.
 
-fn sys_openat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux ABI: `int openat(int dirfd, const char *pathname,
-    // int flags, mode_t mode)`. Two-arg path-as-cstr.
-    // (Previously arg2 was a NARF-native path_len, which made
-    // musl's `openat(AT_FDCWD, "...", O_RDONLY, 0)` hit our
-    // handler with arg2 = O_RDONLY = 0 → zero-length path →
-    // EINVAL on every open. See [[project_narf_native_vs_linux_abis]].)
-    let dirfd = args.arg0 as i64;
-    let path_uptr = args.arg1;
-    let flags = args.arg2;
-    let _mode = args.arg3;
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok(!0u64));
-            return;
-        }
-    };
-    // Honour a real directory fd: `openat(dirfd, relpath)` resolves `relpath`
-    // against the directory backing `dirfd`. Absolute paths and AT_FDCWD
-    // resolve as before. sd-device's `chase_symlinks` (behind libudev and
-    // elogind's seat-device enumeration) walks a path with one `openat` per
-    // component against parent-directory fds; ignoring `dirfd` made every
-    // such lookup fail ("Failed to chase symlinks in …") → no DRM card ever
-    // attached to a seat. `fd_path_of` returns the dir's chroot-relative path,
-    // so joining a relative component and letting `open_impl` re-apply the
-    // chroot keeps a chrooted process (e.g. elogind under /mnt) resolving in
-    // its own namespace.
-    const AT_FDCWD: i64 = -100;
-    let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
-        path_str
-    } else {
-        match fd_path_of(current_task_id(), dirfd as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), path_str)
-            }
-            // Unknown / non-directory fd → best-effort cwd-relative resolve.
-            _ => path_str,
-        }
-    };
-    // Resolve the `/proc/self/fd/N` (and `/proc/<pid>/fd/N`) magic symlink:
-    // opening it reopens the target of fd N. systemd's `fd_reopen` opens an
-    // O_PATH handle through `/proc/self/fd/N` to obtain a *readable* fd — and
-    // sd-device (libudev) does exactly this for every sysfs `uevent` file: it
-    // opens `uevent` O_PATH, verifies the filesystem, then reopens via
-    // `/proc/self/fd/N` to read it. Without this the reopen ENOENTs, the uevent
-    // read fails EBADF, libudev resolves no devices, and a chrooted compositor
-    // (kwin) never finds `/dev/dri/card0`. Linux ref: procfs fd magic symlinks
-    // (fs/proc/fd.c) + `fd_reopen` (systemd src/basic/fd-util.c).
-    if let Some(n) = parse_proc_self_fd(&effective) {
-        let task = current_task_id();
-        // Prefer reopening the fd's real backing path with the caller's flags.
-        if let Some(p) = fd_path_of(task, n).filter(|p| p.starts_with('/')) {
-            open_impl(ctx, p, flags, 0, 0);
-            return;
-        }
-        // Pathless fd (memfd, pipe, socket, eventfd) → share its FileOps in a
-        // fresh fd, mirroring Linux reopening the same inode/description.
-        let dup = fd::with_table(task, |t| t.get(n).map(|e| e.ops.clone())).flatten();
-        if let Some(ops) = dup {
-            let sf = (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK);
-            let new_fd = fd::with_table(task, |t| {
-                t.open(crate::fd::FdEntry {
-                    ops,
-                    offset: 0,
-                    flags: 0,
-                    status_flags: sf,
-                })
-            });
-            ctx.set_return(SyscallReturn::ok(
-                new_fd.map(|nf| nf as u64).unwrap_or((-1i64) as u64),
-            ));
-            return;
-        }
-        // Stale/unknown fd → ENOENT, as Linux does for a dangling fd symlink.
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64));
-        return;
-    }
-    open_impl(ctx, effective, flags, 0, 0);
-}
-
 // ── fchmodat / fchownat — *at-keyed mode/owner ─────────────────────
 //
 // NARF doesn't support directory fds, so the dirfd arg is
@@ -4854,132 +2014,12 @@ fn sys_openat(ctx: &mut dyn TrapContext) {
 // enforce). Relative paths are rejected with -1 to keep the
 // consumer's error-checking honest.
 
-fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let dirfd = args.arg0 as i64;
-    let path_uptr = args.arg1;
-    // access(2) semantics: a missing path is ENOENT, not the -1 sentinel
-    // (which musl maps to EPERM). sd-device (libudev/elogind) keys
-    // `errno == ENOENT` when validating a /sys/devices/<...> node's
-    // `uevent`, so the wrong errno makes it reject the whole device.
-    let missing = SyscallReturn::ok((-2i64) as u64); // -ENOENT
-                                                     // Linux ABI: faccessat/fchmodat/fchownat take a NUL-terminated path
-                                                     // in arg1 — arg2 is mode/owner, NOT a length. (Reading arg2 as a
-                                                     // length truncated the path to mode-many bytes: `access("/dev/shm/
-                                                     // nums", R_OK)` opened "/dev/s" and failed, breaking busybox grep.)
-    let raw = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    // Honour a real directory fd for relative paths (mirrors `sys_openat`).
-    // `faccessat(dirfd, "uevent", F_OK)` is how sd-device probes whether a
-    // `/sys/devices/<...>` node is a real device; ignoring `dirfd` resolved
-    // "uevent" against the CWD (always missing) → EPERM → every input/evdev
-    // `TakeDevice` failed even though the node exists. `fd_path_of` returns
-    // the dir's chroot-relative path; `stat_path_dir_aware` re-applies the
-    // chroot, so a chrooted process (elogind under /mnt) resolves in its
-    // own namespace. See the twin fix in `sys_openat`.
-    const AT_FDCWD: i64 = -100;
-    let effective = if raw.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
-        raw
-    } else {
-        match fd_path_of(current_task_id(), dirfd as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
-            }
-            // Unknown / non-directory fd → best-effort cwd-relative resolve.
-            _ => raw,
-        }
-    };
-    let path = resolve_cwd_path(current_task_id(), &effective);
-    // Existence check over files AND directories. mode/uid/gid are
-    // structural-only state NARF doesn't enforce, so report success iff
-    // the path exists (covers access(2) F_OK and grants R/W/X).
-    if stat_path_dir_aware(&path).is_some() {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(missing);
-    }
-}
-
-/// `fchmodat(dirfd, path, mode, flags)` / `fchmodat2(..., flags)`.
-/// Split from `sys_fchmodat_or_fchownat` because a chmod's `arg2` is a
-/// MODE (a chown's is a uid) — and a directory's mode is observable via
-/// `stat`, which dbus/systemd read to reject a group/other-writable
-/// `XDG_RUNTIME_DIR`. So `chmod 0700` on a tmpfs dir must actually take.
-/// musl implements `chmod(2)` as `fchmodat(AT_FDCWD, path, mode, 0)`, so
-/// every libc chmod lands here. Files keep the accept-and-ignore
-/// behaviour (NARF has no per-file mode enforcement).
-fn sys_fchmodat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let path_uptr = args.arg1;
-    let raw = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            // Unreadable user path pointer → EFAULT, not a bare -1 → EPERM.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
-            return;
-        }
-    };
-    let path = resolve_cwd_path(current_task_id(), &raw);
-    if let Some(dir) = resolve_dir_absolute(&path) {
-        dir.set_dir_mode((args.arg2 as u32 & 0o7777) as u16);
-        // inotify: a mode change is IN_ATTRIB on the affected directory.
-        #[cfg(feature = "linux-compat")]
-        crate::mqueue::notify_attrib(&path, true);
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    // A regular file: persist the mode through FileOps::set_perms so a later
-    // stat reflects it (systemd-tmpfiles `z`/`Z` lines chmod files and then
-    // verify the mode took). Fall back to accept-and-ignore for synthetic
-    // filesystems whose nodes don't hold perms.
-    let file = narf_filesystem::registry().resolve_absolute(&path, |fs, rel| {
-        narf_filesystem::resolve(fs.root(), rel).ok()
-    });
-    if let Some(Some(file)) = file {
-        let _ = poll_blocking(file.set_perms((args.arg2 as u32 & 0o777) as u16));
-        // inotify: IN_ATTRIB for a chmod on an existing file.
-        #[cfg(feature = "linux-compat")]
-        crate::mqueue::notify_attrib(&path, false);
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    if stat_path_dir_aware(&path).is_some() {
-        // inotify: IN_ATTRIB for a chmod on an existing node (synthetic fs).
-        #[cfg(feature = "linux-compat")]
-        crate::mqueue::notify_attrib(&path, false);
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        // Nothing at this path → ENOENT (was a bare -1 → EPERM).
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64));
-    }
-}
-
 // ── fchmod / fchown — accept-and-ignore on known fd ───────────────
 //
 // NARF has no per-file permission bits or owner; the kernel
 // surface exists so consumers (tar, cp, install) can round-trip
 // the values without breaking. Both succeed for any open fd, fail
 // (-1) for a closed/unknown fd.
-
-fn sys_fchmod_or_fchown(ctx: &mut dyn TrapContext) {
-    let fd = ctx.args().arg0 as u32;
-    let task = current_task_id();
-    let known = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
-    if known {
-        // inotify: fchmod/fchown is IN_ATTRIB on the fd's file, if watched.
-        #[cfg(feature = "linux-compat")]
-        crate::mqueue::notify_attrib_fd(task, fd);
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        // fd isn't open → -EBADF (was the -1 sentinel musl maps to EPERM).
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
-    }
-}
 
 // ── memfd_create — anonymous in-memory file ────────────────────────
 //
@@ -4989,58 +2029,6 @@ fn sys_fchmod_or_fchown(ctx: &mut dyn TrapContext) {
 // introspection; we don't preserve it in NARF today (no
 // /proc-style listing). Real consumers (sandboxes, IPC, tmpfile)
 // rely on the surface alone.
-
-fn sys_memfd_create(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let _name_ptr = args.arg0;
-    // Linux memfd_create(2) ABI: (const char *name, unsigned int flags) —
-    // flags in arg1. The kernel ignores the (NUL-terminated) name. Reading
-    // flags from arg2 (an old NARF-native 3-arg shape) dropped MFD_ALLOW_SEALING
-    // for every musl caller (foot/kwin put flags in rsi=arg1), so F_ADD_SEALS
-    // then returned -EPERM and Wayland SHM-buffer sealing failed.
-    let _flags = args.arg1 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let task = current_task_id();
-    #[cfg(feature = "linux-compat")]
-    {
-        let mfd = crate::linux_compat::MemFdFile::new(_flags);
-        memfd_arc_register(&mfd);
-        let cloexec = (_flags & crate::linux_compat::MFD_CLOEXEC) != 0;
-        let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
-        let fd = fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
-                ops: mfd,
-                offset: 0,
-                flags: install_flags,
-                // Linux memfd_create(2) always returns an O_RDWR fd. glibc/musl
-                // fdopen(fd, "w+") reads F_GETFL and rejects the fd with EINVAL if
-                // the access mode isn't read+write (systemd's serialization memfd).
-                status_flags: crate::fd::O_RDWR,
-            })
-        });
-        match fd {
-            Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            None => ctx.set_return(fail),
-        }
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        let ops = narf_filesystem::new_anon_memfile();
-        let fd = fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
-                ops,
-                offset: 0,
-                flags: 0,
-                // Linux memfd_create(2) always returns an O_RDWR fd (see above).
-                status_flags: crate::fd::O_RDWR,
-            })
-        });
-        match fd {
-            Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            None => ctx.set_return(fail),
-        }
-    }
-}
 
 // ── Wave-70 MemFdFile side table ───────────────────────────────────
 #[cfg(feature = "linux-compat")]
@@ -5074,68 +2062,12 @@ pub(crate) fn memfd_arc_from_fd(
 // checks fsync sees a sane return, and -1 for an unknown fd so
 // the contract still distinguishes "valid handle" from "stale".
 
-fn sys_fsync(ctx: &mut dyn TrapContext) {
-    let fd = ctx.args().arg0 as u32;
-    let task = current_task_id();
-    let known = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
-    if known {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        // fd isn't open → -EBADF (was the -1 sentinel musl maps to EPERM).
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
-    }
-}
-
 // ── Pipe ────────────────────────────────────────────────────────────
 //
 // Allocates a fresh `PipeRead`/`PipeWrite` pair, installs them into
 // the calling task's fd table at the next two free slots, then
 // writes the two i32 fds back to the user-supplied output pointer
 // in `[read, write]` order (matching POSIX `int pipefd[2]`).
-
-fn sys_pipe(ctx: &mut dyn TrapContext) {
-    let out_ptr = ctx.args().arg0;
-    if out_ptr == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let (rd, wr) = crate::pipe::pipe_pair();
-    let task = current_task_id();
-    let fds = fd::with_table(task, |t| {
-        let r = t.open(crate::fd::FdEntry {
-            ops: rd as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
-            offset: 0,
-            flags: 0,
-            status_flags: 0,
-        });
-        let w = t.open(crate::fd::FdEntry {
-            ops: wr as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
-            offset: 0,
-            flags: 0,
-            status_flags: 0,
-        });
-        (r, w)
-    });
-    let (r, w) = match fds {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    // Write two i32 fds to user buffer under the SMAP bracket.
-    let mut buf = [0u8; 8];
-    buf[..4].copy_from_slice(&(r as i32).to_ne_bytes());
-    buf[4..].copy_from_slice(&(w as i32).to_ne_bytes());
-    // SAFETY: `out_ptr` is the user fd-pair buffer; copy_to_user range-validates
-    // it and SMAP-brackets the write of the 8-byte `buf`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
 
 // ── Pipe2 — pipe + atomic flag set ─────────────────────────────────
 //
@@ -5146,59 +2078,6 @@ fn sys_pipe(ctx: &mut dyn TrapContext) {
 // blocking model to toggle).
 
 const O_CLOEXEC_BIT: u64 = 0x80000;
-
-fn sys_pipe2(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let out_ptr = args.arg0;
-    let flags = args.arg1;
-    if out_ptr == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let want_cloexec = (flags & O_CLOEXEC_BIT) != 0;
-    let install_flags = if want_cloexec {
-        crate::fd::FD_CLOEXEC
-    } else {
-        0
-    };
-
-    let (rd, wr) = crate::pipe::pipe_pair();
-    let task = current_task_id();
-    let fds = fd::with_table(task, |t| {
-        let r = t.open(crate::fd::FdEntry {
-            ops: rd as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
-            offset: 0,
-            flags: install_flags,
-            status_flags: 0,
-        });
-        let w = t.open(crate::fd::FdEntry {
-            ops: wr as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
-            offset: 0,
-            flags: install_flags,
-            status_flags: 0,
-        });
-        (r, w)
-    });
-    let (r, w) = match fds {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    // Write two i32 fds to user buffer under the SMAP bracket.
-    let mut buf = [0u8; 8];
-    buf[..4].copy_from_slice(&(r as i32).to_ne_bytes());
-    buf[4..].copy_from_slice(&(w as i32).to_ne_bytes());
-    // SAFETY: `out_ptr` is the user fd-pair buffer; copy_to_user range-validates
-    // it and SMAP-brackets the write of the 8-byte `buf`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
 
 // ── Lseek — arg0=fd, arg1=offset(i64), arg2=whence ─────────────────
 //
@@ -5211,40 +2090,6 @@ const SEEK_SET: u64 = 0;
 const SEEK_CUR: u64 = 1;
 const SEEK_END: u64 = 2;
 
-fn sys_lseek(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let offset = args.arg1 as i64;
-    let whence = args.arg2;
-    let task = current_task_id();
-    // Linux errno: bad fd → -EBADF; bad whence / negative or overflowing
-    // result → -EINVAL (was a blanket InvalidOp).
-    let ebadf = SyscallReturn::ok((-9i64) as u64);
-    let einval = SyscallReturn::ok((-22i64) as u64);
-    let outcome = fd::with_table(task, |t| {
-        let entry = match t.get_mut(fd) {
-            Some(e) => e,
-            None => return Some(ebadf),
-        };
-        let base = match whence {
-            SEEK_SET => 0i64,
-            SEEK_CUR => entry.offset as i64,
-            SEEK_END => entry.ops.stat().size as i64,
-            _ => return Some(einval),
-        };
-        let new_off = match base.checked_add(offset) {
-            Some(v) if v >= 0 => v,
-            _ => return Some(einval),
-        };
-        entry.offset = new_off as u64;
-        Some(SyscallReturn::ok(new_off as u64))
-    });
-    match outcome {
-        Some(Some(r)) => ctx.set_return(r),
-        _ => ctx.set_return(ebadf),
-    }
-}
-
 // ── Unlink — arg0=path_ptr, arg1=path_len ──────────────────────────
 //
 // Splits the absolute path at the last `/`, walks the parent dir via
@@ -5252,51 +2097,6 @@ fn sys_lseek(ctx: &mut dyn TrapContext) {
 // FSes that haven't overridden the trait default surface
 // `FsError::Unsupported`, which we translate to `InvalidOp` on the
 // wire (no errno channel today).
-
-fn sys_unlink(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let ptr = args.arg0;
-    // POSIX-shaped failure sentinel. The kernel's syscall ABI carries
-    // a separate `status` field but the user-runtime asm wrapper only
-    // observes the `value` register; we mirror libc and return -1 on
-    // failure so the caller can distinguish from a success return of 0.
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let path = match copy_user_cstr(ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let path = resolve_cwd_path(current_task_id(), &path);
-    // If this path is a live bound AF_UNIX socket, release its address so
-    // it can be re-bound (Linux frees the address when the socket inode is
-    // unlinked — dbus/wayland unlink a stale socket before re-binding).
-    let was_socket = crate::socket::unbind_path(&path);
-    let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(&path, |_fs, parent, leaf| {
-            poll_blocking(parent.unlink(leaf))
-        });
-    match outcome {
-        Some(Some(Ok(()))) => {
-            #[cfg(feature = "linux-compat")]
-            crate::mqueue::notify_delete(&path, false);
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        // The address was freed even if no filesystem node backed the path
-        // (e.g. the bind's fs couldn't hold a socket inode) — still success.
-        _ if was_socket => ctx.set_return(SyscallReturn::ok(0)),
-        // The filesystem resolved the parent but reported an error. Map the
-        // common shapes to their Linux errno so a caller can tell an absent
-        // name (ENOENT) from a permission or type error — a bare -1 → musl
-        // EPERM otherwise (systemd's `rm` of a missing /run path would then
-        // look like a spurious permission failure).
-        Some(Some(Err(e))) => ctx.set_return(SyscallReturn::ok(unlink_errno(e))),
-        // The parent path/filesystem didn't resolve at all → the target
-        // can't exist. Linux returns ENOENT when a path component is absent.
-        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
-    }
-}
 
 /// Map an `FsError` from a delete-family op to the Linux errno userspace
 /// expects. `NotFound` → ENOENT (the missing-name case), a directory
@@ -5410,127 +2210,6 @@ pub(crate) fn resolve_parent_dir_async(
     Some((dir, alloc::string::String::from(leaf)))
 }
 
-fn sys_mkdir(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let ptr = args.arg0;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let path = match copy_user_cstr(ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let path = resolve_cwd_path(current_task_id(), &path);
-    // Normalise trailing slashes; `mkdir("/")` (or any path that resolves
-    // to the root) always already exists.
-    let path_ref: &str = {
-        let t = path.trim_end_matches('/');
-        if t.is_empty() {
-            "/"
-        } else {
-            t
-        }
-    };
-    // busybox `mkdir -p` walks each path component, relying on Linux
-    // errnos: EEXIST for components that already exist (e.g. `/` and
-    // `/run` before `/run/udev`) and ENOENT to trigger recursion on a
-    // missing parent. A bare -1 → musl EPERM aborts the whole -p chain.
-    if path_ref == "/" {
-        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST (root)
-        return;
-    }
-    // A path that already resolves to a directory exists → EEXIST, matching
-    // Linux. This mount-aware check catches a mount root whose parent fs does
-    // not expose it as a child entry (e.g. the cgroup2 mount at
-    // /sys/fs/cgroup, whose parent /sys/fs is sysfs): the parent-lookup
-    // existence check below can't see a mounted-over entry, so mkdir would
-    // otherwise try to create it in the parent fs and fail.
-    //
-    // The second arm treats a path that is an ANCESTOR of an existing
-    // mountpoint as an existing directory. In NARF's flat mount model a
-    // mount registered at /sys/fs/cgroup has no real intermediate /sys/fs
-    // node in sysfs, so `mkdir("/sys/fs")` would try to create it on the
-    // read-only sysfs and return a bare -1. systemd's cg_create walks the
-    // cgroup hierarchy root via mkdir_parents (mkdir /sys, /sys/fs, …) and
-    // treats EEXIST as success; a -1 (→ EPERM) at any component aborts every
-    // service's cgroup setup ("Failed to create cgroup /: Operation not
-    // permitted").
-    if resolve_dir_absolute(path_ref).is_some() || path_is_mount_ancestor(path_ref) {
-        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST
-        return;
-    }
-    let (parent, leaf) = match resolve_parent_dir_async(path_ref) {
-        Some(p) => p,
-        None => {
-            // Parent directory doesn't exist.
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
-            return;
-        }
-    };
-    // FsError has no AlreadyExists variant (ext2 maps conflicts to
-    // InvalidPath), so detect an existing leaf explicitly for EEXIST.
-    let exists = poll_blocking(parent.lookup_async(&leaf))
-        .map(|r| r.is_ok())
-        .unwrap_or(false)
-        || poll_blocking(parent.lookup_dir_async(&leaf))
-            .map(|r| r.is_ok())
-            .unwrap_or(false);
-    if exists {
-        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST
-        return;
-    }
-    match poll_blocking(parent.mkdir(&leaf)) {
-        Some(Ok(_)) => {
-            #[cfg(feature = "linux-compat")]
-            crate::mqueue::notify_create(&path, true);
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        // A racing create of the same leaf → EEXIST (matches the exists check
-        // above); a read-only backing fs → EROFS; anything else keeps a
-        // precise errno rather than a bare -1 → EPERM (which aborts busybox
-        // `mkdir -p` and systemd's cgroup/hierarchy setup).
-        Some(Err(narf_filesystem::FsError::Busy)) => {
-            ctx.set_return(SyscallReturn::ok((-17i64) as u64)) // -EEXIST
-        }
-        Some(Err(narf_filesystem::FsError::ReadOnly)) => {
-            ctx.set_return(SyscallReturn::ok((-30i64) as u64)) // -EROFS
-        }
-        _ => ctx.set_return(SyscallReturn::ok((-1i64) as u64)), // -EPERM (fs refused)
-    }
-}
-
-fn sys_rmdir(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let ptr = args.arg0;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let path = match copy_user_cstr(ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let path = resolve_cwd_path(current_task_id(), &path);
-    let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(&path, |_fs, parent, leaf| poll_blocking(parent.rmdir(leaf)));
-    match outcome {
-        Some(Some(Ok(()))) => {
-            #[cfg(feature = "linux-compat")]
-            crate::mqueue::notify_delete(&path, true);
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        // The parent filesystem resolved but rmdir reported an error — map it
-        // to the precise Linux errno (ENOENT / ENOTEMPTY / ENOTDIR / …) so a
-        // bare -1 → EPERM never surfaces (that aborted systemd's mount-
-        // teardown rmdir of /run/systemd/propagate/<unit>).
-        Some(Some(Err(e))) => ctx.set_return(SyscallReturn::ok(rmdir_errno(e))),
-        // The parent path/filesystem didn't resolve, or the async poll never
-        // completed → the target directory can't exist. Linux: ENOENT.
-        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
-    }
-}
-
 /// Move `old_abs` to `new_abs` when the two live in DIFFERENT parent
 /// directories. Returns the raw syscall value: `0` on success, or a
 /// negative errno.
@@ -5592,81 +2271,6 @@ fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
     res.unwrap_or(EXDEV) as u64
 }
 
-fn sys_rename(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let old_ptr = args.arg0;
-    let new_ptr = args.arg1;
-    // An unreadable user path pointer is EFAULT, not a bare -1 → EPERM.
-    let efault = SyscallReturn::ok((-14i64) as u64);
-    let old_path = match copy_user_cstr(old_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
-            return;
-        }
-    };
-    let new_path = match copy_user_cstr(new_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
-            return;
-        }
-    };
-    let task = current_task_id();
-    let old_path = resolve_cwd_path(task, &old_path);
-    let new_path = resolve_cwd_path(task, &new_path);
-    // Both paths must split into the same parent directory — cross-
-    // directory rename isn't supported by the DirOps surface today
-    // (would need a registry-aware version that locks both parents).
-    // A relative path with no slash is a malformed absolute path here → EINVAL.
-    let old_split = match old_path.rfind('/') {
-        Some(i) => i,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
-            return;
-        }
-    };
-    let new_split = match new_path.rfind('/') {
-        Some(i) => i,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
-            return;
-        }
-    };
-    if old_path[..old_split] != new_path[..new_split] {
-        // Different parent directories. That is only EXDEV when the two
-        // parents are on different MOUNTS — within one filesystem Linux
-        // moves the name, and real software depends on it: Qt's
-        // QSaveFile (so every KDE/KConfig/KSycoca write) stages into a
-        // temp file and renames it onto the target, and when the staging
-        // file lands in a different directory a blanket EXDEV surfaces to
-        // the user as "Invalid cross-device link" / "Disk full?" and the
-        // config or cache is never written.
-        ctx.set_return(SyscallReturn::ok(cross_dir_rename(&old_path, &new_path)));
-        return;
-    }
-    let new_leaf = &new_path[new_split + 1..];
-    let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(&old_path, |_fs, parent, old_leaf| {
-            poll_blocking(parent.rename(old_leaf, new_leaf))
-        });
-    match outcome {
-        Some(Some(Ok(()))) => {
-            // inotify: paired IN_MOVED_FROM/IN_MOVED_TO sharing a cookie.
-            #[cfg(feature = "linux-compat")]
-            crate::mqueue::notify_moved(&old_path, &new_path);
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        // Parent resolved but rename failed → precise errno (ENOENT for a
-        // missing source, …) instead of a bare -1 → EPERM. systemd renames
-        // /run/systemd/propagate/<unit> dirs during mount teardown and a
-        // spurious EPERM there aborts the unit.
-        Some(Some(Err(e))) => ctx.set_return(SyscallReturn::ok(rename_errno(e))),
-        // Parent path/filesystem didn't resolve → source can't exist: ENOENT.
-        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
-    }
-}
-
 // ── link / linkat — hard links ─────────────────────────────────────
 //
 // Same-parent only, mirroring sys_rename's restriction (the DirOps
@@ -5714,20 +2318,6 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
     }
 }
 
-/// `link(oldpath, newpath)` — legacy x86_64 86; aarch64 has linkat only.
-fn sys_link(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let (Some(old_raw), Some(new_raw)) = (
-        copy_user_cstr(args.arg0, 4096),
-        copy_user_cstr(args.arg1, 4096),
-    ) else {
-        ctx.set_return(fail);
-        return;
-    };
-    link_impl(ctx, &old_raw, &new_raw);
-}
-
 /// Materialise the anonymous inode held by `src_fd` at the absolute path
 /// `new_path`, i.e. give an `O_TMPFILE` inode its first name. The fd keeps
 /// its own reference; the new name aliases the same inode via the target
@@ -5766,102 +2356,6 @@ fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
     }
 }
 
-/// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)` — x86_64 265,
-/// aarch64 37. Relative paths resolve against their directory fd's
-/// recorded open path (same prepend as sys_readlinkat); AT_FDCWD /
-/// absolute paths take the cwd route inside `link_impl`.
-/// AT_SYMLINK_FOLLOW is accepted and ignored for the path form — NARF's
-/// `DirOps::link` links the symlink entry itself, the no-flags default.
-///
-/// Two `O_TMPFILE` materialisation forms are handled specially (they name
-/// an inode by its open fd, not by a source path):
-///   - `AT_EMPTY_PATH` + empty oldpath: olddirfd IS the O_TMPFILE fd.
-///   - `AT_SYMLINK_FOLLOW` + oldpath = `/proc/self/fd/N`: N names the fd.
-///
-/// Both file the fd's anonymous inode into newpath via `link_node`.
-fn sys_linkat(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let (Some(old_raw), Some(new_raw)) = (
-        copy_user_cstr(args.arg1, 4096),
-        copy_user_cstr(args.arg3, 4096),
-    ) else {
-        ctx.set_return(fail);
-        return;
-    };
-    const AT_FDCWD: i64 = -100;
-    const AT_EMPTY_PATH: u64 = 0x1000;
-    let flags = args.arg4;
-    let task = current_task_id();
-    let with_dirfd = |dirfd: i64, path: alloc::string::String| -> alloc::string::String {
-        if path.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
-            return path;
-        }
-        match fd_path_of(task, dirfd as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), path)
-            }
-            _ => path,
-        }
-    };
-    let new_eff = with_dirfd(args.arg2 as i64, new_raw);
-
-    // O_TMPFILE materialisation, form 1: AT_EMPTY_PATH + empty oldpath →
-    // olddirfd is the O_TMPFILE fd whose anonymous inode gets named.
-    if flags & AT_EMPTY_PATH != 0 && old_raw.is_empty() {
-        let src_fd = args.arg0 as i64;
-        if src_fd < 0 {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-            return;
-        }
-        let new_abs = resolve_cwd_path(task, &new_eff);
-        let r = link_fd_node_impl(task, src_fd as u32, &new_abs);
-        ctx.set_return(SyscallReturn::ok(r as u64));
-        return;
-    }
-
-    // O_TMPFILE materialisation, form 2: oldpath = /proc/self/fd/N (or
-    // /proc/<pid>/fd/N) — the anonymous inode is named by that magic
-    // symlink. Only take this route when N names a live PATHLESS fd (an
-    // O_TMPFILE / memfd node); a /proc/self/fd/N that points at a real
-    // named file falls through to the ordinary path-based hard link.
-    let old_eff = with_dirfd(args.arg0 as i64, old_raw);
-    if let Some(src_fd) = parse_proc_self_fd(&old_eff) {
-        // `linkat(…, "/proc/self/fd/N", …, AT_SYMLINK_FOLLOW)` means "give
-        // the object this fd refers to another name", so linking the fd's
-        // NODE is the direct answer — for an anonymous O_TMPFILE inode and
-        // for an already-named file alike. Qt's QSaveFile (every
-        // KDE/KConfig/KSycoca database write) materialises its O_TMPFILE
-        // inode with exactly this call.
-        //
-        // The previous guard tried to detect an "anonymous" fd first and
-        // only then take this route, which was wrong twice over: it asked
-        // `fd_path_of(..).is_none()`, and that helper synthesises an
-        // `anon_inode:[TypeName]` placeholder rather than ever answering
-        // None — so the branch was dead and every such call fell through
-        // to the path-based hard link, where `/proc/self/fd/N` and the
-        // target sit in different directories and the answer was EXDEV
-        // ("Invalid cross-device link", database never written). Worse,
-        // `fd_path_of` can hand back a STALE path for a recycled fd
-        // number, so any predicate built on it is unreliable.
-        //
-        // Instead: take the node route whenever the fd is live, and fall
-        // back to the ordinary path-based link only if this filesystem
-        // can't adopt a foreign node (-EOPNOTSUPP from `link_node`).
-        if fd::with_table(task, |t| t.get(src_fd).is_some()).unwrap_or(false) {
-            const EOPNOTSUPP: i64 = -95;
-            let new_abs = resolve_cwd_path(task, &new_eff);
-            let r = link_fd_node_impl(task, src_fd, &new_abs);
-            if r != EOPNOTSUPP {
-                ctx.set_return(SyscallReturn::ok(r as u64));
-                return;
-            }
-        }
-    }
-
-    link_impl(ctx, &old_eff, &new_eff);
-}
-
 // ── Readlink / Symlink — MemFs-backed symlink read + create ───────
 //
 // MemFs grew an `Entry::Symlink(MemSymlink)` variant: the symlink
@@ -5871,24 +2365,6 @@ fn sys_linkat(ctx: &mut dyn TrapContext) {
 // symlink installs the entry. Both operate over absolute paths via
 // the registry's resolve_parent_absolute helper, mirroring the shape
 // of sys_unlink / sys_mkdir / sys_rmdir.
-
-fn sys_readlink(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux ABI: `ssize_t readlink(const char *pathname, char *buf,
-    // size_t bufsiz)`. arg1 is buf, arg2 is bufsiz. The previous
-    // NARF-native shape used arg1 as path_len.
-    let path_ptr = args.arg0;
-    let buf_ptr = args.arg1 as *mut u8;
-    let buf_len = args.arg2 as usize;
-    let raw = match copy_user_cstr(path_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    readlink_impl(ctx, raw, buf_ptr, buf_len);
-}
 
 /// Shared readlink path. Split out of `sys_readlink` so `sys_readlinkat` can
 /// prepend a directory-fd's path: sd-device's `chase_symlinks` readlinkat()s
@@ -5974,56 +2450,6 @@ fn readlink_impl(
     ctx.set_return(SyscallReturn::ok(n as u64));
 }
 
-fn sys_symlink(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux: symlink(const char *target, const char *linkpath). arg0 = target
-    // (NUL-term), arg1 = linkpath (NUL-term). (Was NARF-native (target_ptr,
-    // target_len, link_ptr, link_len).)
-    let target_ptr = args.arg0;
-    let link_ptr = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let target_str = match copy_user_cstr(target_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let link_path = match copy_user_cstr(link_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // Resolve the link location against the cwd (the symlink *target*
-    // stays verbatim — symlink targets may legitimately be relative).
-    let link_path = resolve_cwd_path(current_task_id(), &link_path);
-    let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(&link_path, |_fs, parent, leaf| {
-            poll_blocking(parent.symlink(leaf, &target_str))
-        });
-    match outcome {
-        Some(Some(Ok(_))) => {
-            // inotify: a new symlink is IN_CREATE on the link path.
-            #[cfg(feature = "linux-compat")]
-            crate::mqueue::notify_create(&link_path, false);
-            ctx.set_return(SyscallReturn::ok(0))
-        }
-        // An existing link name is EEXIST — systemd-tmpfiles creates symlinks
-        // and treats EEXIST as "already present" (idempotent). A read-only
-        // backing fs is EROFS. Never a bare -1 → EPERM.
-        Some(Some(Err(narf_filesystem::FsError::Busy))) => {
-            ctx.set_return(SyscallReturn::ok((-17i64) as u64)) // -EEXIST
-        }
-        Some(Some(Err(narf_filesystem::FsError::ReadOnly))) => {
-            ctx.set_return(SyscallReturn::ok((-30i64) as u64)) // -EROFS
-        }
-        // Parent path/filesystem didn't resolve → a component is missing.
-        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
-    }
-}
-
 // ── Listdir — arg0=path, arg1=path_len, arg2=cursor,
 //             arg3=out_buf, arg4=out_buf_len ────────────────────────
 //
@@ -6046,103 +2472,6 @@ fn sys_symlink(ctx: &mut dyn TrapContext) {
 // Returning the FileType as the second u32 lets the libc fill in
 // `dirent.d_type` directly without a follow-on stat.
 
-fn sys_listdir(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let path_ptr = args.arg0;
-    let path_len = args.arg1 as usize;
-    let cursor = args.arg2 as usize;
-    let out_ptr = args.arg3 as *mut u8;
-    let out_len = args.arg4 as usize;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-
-    if out_ptr.is_null() {
-        ctx.set_return(fail);
-        return;
-    }
-    if out_len < 8 {
-        // Need room for at least the header.
-        ctx.set_return(fail);
-        return;
-    }
-    let path = match copy_user_path(path_ptr, path_len) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-
-    // Resolve to a DirOps. Empty path or root → use the FS root
-    // directly; otherwise descend through `lookup_dir_async` so
-    // disk-backed FSes (FAT, ext2) that only implement the async side
-    // can serve subdirectory walks.
-    let entries = narf_filesystem::registry()
-        .resolve_absolute(&path, |fs, rel| {
-            let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
-                fs.root()
-            } else {
-                // Walk segment by segment via the async lookup so
-                // disk-backed FSes (FAT, ext2) resolve correctly.
-                let mut cur = fs.root();
-                for seg in rel.split('/').filter(|s| !s.is_empty()) {
-                    cur = poll_blocking(cur.lookup_dir_async(seg)).and_then(|r| r.ok())?;
-                }
-                cur
-            };
-            // Use enumerate_async so disk-backed FSes (FAT, ext2) that
-            // return Vec::new() from the sync enumerate() still work.
-            // poll_blocking drives the future to completion via the
-            // same internally-polled NVMe/virtio-blk driver path that
-            // sys_open and sys_read already rely on.
-            poll_blocking(dir.enumerate_async(cursor, 1)).and_then(|r| r.ok())
-        })
-        .flatten();
-
-    let entries = match entries {
-        Some(v) => v,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    if entries.is_empty() {
-        // End of directory.
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    let (name, ftype) = &entries[0];
-    let name_bytes = name.as_bytes();
-    let total = 8 + name_bytes.len();
-    if total > out_len {
-        ctx.set_return(fail);
-        return;
-    }
-    // Encode FileType to the wire ordinal: 0=File, 1=Dir, 2=Symlink,
-    // 3=Special, 4=Socket, 5=Fifo.
-    let ftype_wire: u32 = match ftype {
-        narf_filesystem::FileType::File => 0,
-        narf_filesystem::FileType::Dir => 1,
-        narf_filesystem::FileType::Symlink => 2,
-        narf_filesystem::FileType::Special => 3,
-        narf_filesystem::FileType::Socket => 4,
-        narf_filesystem::FileType::Fifo => 5,
-    };
-    // Build the 8-byte header in kernel memory, then copy the whole
-    // record (header + name) into user space under the SMAP bracket.
-    let mut record = alloc::vec![0u8; total];
-    record[..4].copy_from_slice(&(name_bytes.len() as u32).to_ne_bytes());
-    record[4..8].copy_from_slice(&ftype_wire.to_ne_bytes());
-    record[8..].copy_from_slice(name_bytes);
-    // SAFETY: `out_ptr` is the user dirent buffer (null-checked, `total <= out_len`);
-    // copy_to_user range-validates it and SMAP-brackets the write of `record`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out_ptr as u64, &record) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(total as u64));
-}
-
 // ── Getdents64 — fd-based batched directory read (linux_dirent64) ──
 //
 // Linux ABI: `getdents64(unsigned int fd, void *dirp, unsigned int
@@ -6162,136 +2491,6 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
 // Continues writing entries until either the directory is
 // exhausted or the next record won't fit. Returns the total
 // bytes written; 0 on end-of-directory.
-
-fn sys_getdents64(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let out_ptr = args.arg1 as *mut u8;
-    let out_len = args.arg2 as usize;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-
-    if out_ptr.is_null() || out_len < 32 {
-        ctx.set_return(fail);
-        return;
-    }
-    let task = current_task_id();
-
-    // EBADF: the fd isn't open at all (distinct from "open but not a dir").
-    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-        return;
-    }
-    // Pull the DirOps + current cursor off the fd. `as_dir()` is `Some`
-    // only for a DirFdFile (an opened directory); the fd exists (checked
-    // above) so a `None` here means it's a non-directory → -ENOTDIR.
-    // The fd-table lock is released before we touch the FS
-    // (enumerate_async), per the no-reentrancy rule.
-    let dir_and_cursor = fd::with_table(task, |t| {
-        t.get(fd)
-            .and_then(|e| e.ops.as_dir().map(|d| (d, e.offset as usize)))
-    })
-    .flatten();
-    let (dir, mut cursor) = match dir_and_cursor {
-        Some(x) => x,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // -ENOTDIR
-            return;
-        }
-    };
-
-    let mut written = 0usize;
-    // iter()-only DirOps — the procfs trees (/proc root, /proc/<pid>,
-    // fd/, task/, ns/) — keep the Unsupported default for
-    // enumerate_async. Bridge them through the sync iterator, or ps/
-    // top/ls see an EMPTY /proc (opens worked, listing didn't: the
-    // alpine-probe "no process info in /proc" failure). Snapshot the
-    // remainder ONCE per getdents call: iter() rebuilds (and, for
-    // ProcRoot, Box::leaks names on) every invocation, so a per-entry
-    // re-iter would cost O(entries²) and multiply that leak by the
-    // directory size on every ps/top refresh.
-    let mut iter_snapshot: Option<
-        alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>,
-    > = None;
-    let mut snapshot_pos = 0usize;
-    loop {
-        let batch: Option<alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>> =
-            if let Some(snap) = iter_snapshot.as_ref() {
-                let e = snap.get(snapshot_pos).cloned();
-                snapshot_pos += 1;
-                Some(e.into_iter().collect())
-            } else {
-                match poll_blocking(dir.enumerate_async(cursor, 1)) {
-                    Some(Ok(v)) => Some(v),
-                    Some(Err(narf_filesystem::FsError::Unsupported)) => {
-                        let snap: alloc::vec::Vec<_> = dir
-                            .iter()
-                            .skip(cursor)
-                            .map(|e| (alloc::string::String::from(e.name), e.file_type))
-                            .collect();
-                        let first = snap.first().cloned();
-                        iter_snapshot = Some(snap);
-                        snapshot_pos = 1;
-                        Some(first.into_iter().collect())
-                    }
-                    _ => None,
-                }
-            };
-        let mut entries = match batch {
-            Some(v) if !v.is_empty() => v,
-            _ => break,
-        };
-        let (name, ftype) = entries.pop().unwrap();
-        let name_bytes = name.as_bytes();
-        // 19-byte fixed header + name + NUL, padded up to 8 bytes.
-        let raw_len = 19 + name_bytes.len() + 1;
-        let reclen = (raw_len + 7) & !7;
-        if written + reclen > out_len {
-            // Record won't fit — stop here without advancing the
-            // cursor for this entry. Linux returns whatever fit.
-            break;
-        }
-        let next_cursor = cursor + 1;
-        let dt = match ftype {
-            narf_filesystem::FileType::File => 8,     // DT_REG
-            narf_filesystem::FileType::Dir => 4,      // DT_DIR
-            narf_filesystem::FileType::Symlink => 10, // DT_LNK
-            narf_filesystem::FileType::Special => 2,  // DT_CHR
-            narf_filesystem::FileType::Socket => 12,  // DT_SOCK
-            narf_filesystem::FileType::Fifo => 1,     // DT_FIFO
-        };
-        // Build the dirent record in kernel memory, then copy it into
-        // user space under the SMAP bracket.
-        let mut rec = alloc::vec![0u8; reclen];
-        rec[..8].copy_from_slice(&(next_cursor as u64).to_ne_bytes()); // d_ino
-        rec[8..16].copy_from_slice(&(next_cursor as u64).to_ne_bytes()); // d_off
-        rec[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes()); // d_reclen
-        rec[18] = dt; // d_type
-        rec[19..19 + name_bytes.len()].copy_from_slice(name_bytes); // d_name
-                                                                    // NUL terminator + zero-padding through end already zeroed by vec init.
-                                                                    // SAFETY: `out_ptr` is the user buffer base; `written < out_len` so the
-                                                                    // offset stays inside the user-supplied region. Forms a user vaddr only.
-                                                                    // SAFETY: Valid memory or trusted environment
-        let dest = unsafe { out_ptr.add(written) } as u64;
-        // SAFETY: `dest` is in-bounds of the user buffer (checked above); copy_to_user
-        // range-validates it and SMAP-brackets the write of the `reclen`-byte `rec`.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_to_user(dest, &rec) }.is_err() {
-            break;
-        }
-        written += reclen;
-        cursor = next_cursor;
-    }
-
-    // Persist the advanced cursor so the next getdents64 on this fd
-    // resumes where we stopped (mid-directory if the buffer filled).
-    fd::with_table(task, |t| {
-        if let Some(e) = t.get_mut(fd) {
-            e.offset = cursor as u64;
-        }
-    });
-
-    ctx.set_return(SyscallReturn::ok(written as u64));
-}
 
 // ── Getdents — legacy fd-based directory read (linux_dirent) ───────
 //
@@ -6317,142 +2516,8 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
 // rounds up `18 (header) + name_len + 1 (NUL) + 1 (d_type)` to 8.
 //
 // EBADF / ENOTDIR / return-bytes semantics match sys_getdents64.
-fn sys_getdents(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let out_ptr = args.arg1 as *mut u8;
-    let out_len = args.arg2 as usize;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-
-    if out_ptr.is_null() || out_len < 32 {
-        ctx.set_return(fail);
-        return;
-    }
-    let task = current_task_id();
-
-    // EBADF: the fd isn't open at all (distinct from "open but not a dir").
-    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-        return;
-    }
-    // Pull the DirOps + current cursor off the fd. `as_dir()` is `Some`
-    // only for a DirFdFile (an opened directory); the fd exists (checked
-    // above) so a `None` here means it's a non-directory → -ENOTDIR.
-    // The fd-table lock is released before we touch the FS
-    // (enumerate_async), per the no-reentrancy rule.
-    let dir_and_cursor = fd::with_table(task, |t| {
-        t.get(fd)
-            .and_then(|e| e.ops.as_dir().map(|d| (d, e.offset as usize)))
-    })
-    .flatten();
-    let (dir, mut cursor) = match dir_and_cursor {
-        Some(x) => x,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // -ENOTDIR
-            return;
-        }
-    };
-
-    let mut written = 0usize;
-    loop {
-        let mut entries = match poll_blocking(dir.enumerate_async(cursor, 1)).and_then(|r| r.ok()) {
-            Some(v) if !v.is_empty() => v,
-            _ => break,
-        };
-        let (name, ftype) = entries.pop().unwrap();
-        let name_bytes = name.as_bytes();
-        // 18-byte fixed header + name + NUL + d_type byte, padded to 8.
-        let raw_len = 18 + name_bytes.len() + 2;
-        let reclen = (raw_len + 7) & !7;
-        if written + reclen > out_len {
-            // Record won't fit — stop here without advancing the
-            // cursor for this entry. Linux returns whatever fit.
-            break;
-        }
-        let next_cursor = cursor + 1;
-        let dt = match ftype {
-            narf_filesystem::FileType::File => 8,     // DT_REG
-            narf_filesystem::FileType::Dir => 4,      // DT_DIR
-            narf_filesystem::FileType::Symlink => 10, // DT_LNK
-            narf_filesystem::FileType::Special => 2,  // DT_CHR
-            narf_filesystem::FileType::Socket => 12,  // DT_SOCK
-            narf_filesystem::FileType::Fifo => 1,     // DT_FIFO
-        };
-        // Build the legacy dirent record in kernel memory, then copy it
-        // into user space under the SMAP bracket.
-        let mut rec = alloc::vec![0u8; reclen];
-        rec[..8].copy_from_slice(&(next_cursor as u64).to_ne_bytes()); // d_ino
-        rec[8..16].copy_from_slice(&(next_cursor as u64).to_ne_bytes()); // d_off
-        rec[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes()); // d_reclen
-        rec[18..18 + name_bytes.len()].copy_from_slice(name_bytes); // d_name
-                                                                    // NUL after the name + interior zero-pad already zeroed by vec init.
-        rec[reclen - 1] = dt; // legacy d_type: last byte of the record
-                              // SAFETY: `out_ptr` is the user buffer base; `written < out_len` so the
-                              // offset stays inside the user-supplied region. Forms a user vaddr only.
-                              // SAFETY: Valid memory or trusted environment
-        let dest = unsafe { out_ptr.add(written) } as u64;
-        // SAFETY: `dest` is in-bounds of the user buffer (checked above); copy_to_user
-        // range-validates it and SMAP-brackets the write of the `reclen`-byte `rec`.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_to_user(dest, &rec) }.is_err() {
-            break;
-        }
-        written += reclen;
-        cursor = next_cursor;
-    }
-
-    // Persist the advanced cursor so the next getdents on this fd
-    // resumes where we stopped (mid-directory if the buffer filled).
-    fd::with_table(task, |t| {
-        if let Some(e) = t.get_mut(fd) {
-            e.offset = cursor as u64;
-        }
-    });
-
-    ctx.set_return(SyscallReturn::ok(written as u64));
-}
 
 // ── Close — arg0=fd ────────────────────────────────────────────────
-
-fn sys_close(ctx: &mut dyn TrapContext) {
-    let fd = ctx.args().arg0 as u32;
-    let task = current_task_id();
-    // Before removing the fd, peek the FileOps Arc; if it's a
-    // SocketFile, run its unregister hook so a bound listener
-    // releases its path slot for re-use.
-    let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
-    if let Some(ops) = arc_ops {
-        let raw = alloc::sync::Arc::as_ptr(&ops) as *const ();
-        if let Some(sock) = socket_arc_lookup(raw) {
-            // Release a bound listener's path slot (no-op for a connected /
-            // socketpair socket). We deliberately do NOT remove the SOCKET_ARCS
-            // resolver entry here: it holds a `Weak` (see socket_arc_register)
-            // that self-invalidates only when the LAST fd to the SocketFile
-            // drops. A socketpair end passed to a forked child (weston's
-            // helper-launch: socketpair → fork → parent closes the child's end)
-            // is closed in the parent while the child still holds its inherited
-            // fd to the same SocketFile — removing the entry on this close is
-            // exactly what made the child's sendmsg/recvmsg unresolvable and
-            // broke the libwayland handshake with EPERM.
-            sock.unregister();
-        }
-    }
-    // inotify: IN_CLOSE_WRITE for the file (before we drop its path),
-    // then forget the fd → path mapping.
-    #[cfg(feature = "linux-compat")]
-    {
-        crate::mqueue::notify_close_fd(task, fd);
-        crate::mqueue::forget_fd_path(task, fd);
-    }
-    let ok = fd::with_table(task, |t| t.close(fd)).unwrap_or(false);
-    if ok {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        // POSIX/Linux: close(2) on a fd that isn't open returns -EBADF.
-        // (Was the generic InvalidOp, which musl can't map to an errno.)
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-    }
-}
 
 // ── Mmap — arg0=hint, arg1=len, arg2=flags ─────────────────────────
 
@@ -6493,353 +2558,6 @@ fn perms_of_prot(prot: u32) -> RegionPerms {
         p = RegionPerms::READ;
     }
     p
-}
-
-/// Read `len` bytes of an fd starting at `offset` into a fresh buffer,
-/// zero-padding past EOF (the BSS tail of a file-backed segment).
-fn sys_mmap(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let hint = args.arg0;
-    let len = ((args.arg1 + 0xFFF) & !0xFFFu64).max(0x1000);
-    // Standard 6-arg mmap ABI: arg2 prot, arg3 flags, arg4 fd, arg5 offset.
-    // narf_user_runtime::mmap issues this same shape for NARF-native
-    // anonymous maps (prot=RW, fd=-1), so the kernel decodes one layout.
-    let prot = args.arg2 as u32;
-    let flags = args.arg3 as u32;
-    let fd = args.arg4 as i64 as i32;
-    let offset = args.arg5;
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-
-    const MAP_FIXED: u32 = 0x10;
-    const MAP_ANONYMOUS: u32 = 0x20;
-    let pages = (len >> 12) as usize;
-    let perms = perms_of_prot(prot);
-
-    // Base selection. MAP_FIXED uses `hint` and REPLACES any overlapping
-    // mappings (POSIX semantics) — the dynamic linker reserves a DSO range
-    // PROT_NONE then MAP_FIXED-maps each segment over it. Otherwise bump the
-    // per-AS mmap cursor.
-    let base = if flags & MAP_FIXED != 0 {
-        if hint == 0 || hint & 0xFFF != 0 {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-        // The fixed hint is fully user-controlled — bound it to the
-        // user-mappable window [USER_FIXED_FLOOR, USER_HALF_END) before
-        // touching the region table. Above the ceiling the VA is
-        // non-canonical / kernel-half (x86_64 map_4kb returns
-        // NonCanonical — pre-check, materialize() PANICKED on it, which
-        // is how stress-ng --mmapfixed wedged the whole VM: it walks
-        // MAP_FIXED|MAP_SHARED hints down from 1 << 63). Below the
-        // floor lies PML4[0], the kernel low-identity window every user
-        // PML4 shares — mapping there would plant user PTEs in
-        // kernel-shared page tables (visible to every process) or trip
-        // its huge pages. Linux answers an out-of-range MAP_FIXED addr
-        // with -ENOMEM; do the same.
-        let fixed_ok = hint
-            .checked_add(len)
-            .map(|end| hint >= AddressSpace::USER_FIXED_FLOOR && end <= AddressSpace::USER_HALF_END)
-            .unwrap_or(false);
-        if !fixed_ok {
-            const ENOMEM: i64 = 12;
-            ctx.set_return(SyscallReturn::ok((-ENOMEM) as u64));
-            return;
-        }
-        // Punch out exactly [hint, hint+len), splitting (not destroying)
-        // any region it overlaps so the non-replaced pages survive — the
-        // dynamic linker overlays DSO segments onto its whole-file mapping
-        // this way, and the ELF-header page between them must stay mapped.
-        let _ = as_ref.punch_fixed(VirtAddr::new(hint), len);
-        hint
-    } else {
-        as_ref.reserve_mmap_va(len)
-    };
-    // reserve_mmap_va returns 0 when the no-hint mmap arena is exhausted
-    // (the bump cursor would cross MMAP_WINDOW_TOP into the stack reserve).
-    // Fail closed with -ENOMEM rather than mapping at a bogus base.
-    // (MAP_FIXED takes the `hint` arm above, which is non-zero.)
-    if base == 0 {
-        const ENOMEM: i64 = 12;
-        ctx.set_return(SyscallReturn::ok((-ENOMEM) as u64));
-        return;
-    }
-
-    const MAP_SHARED: u32 = 0x01;
-    // Device-backed shared mapping — the keystone for graphics. A
-    // `/dev/fb0` framebuffer (or a DRM dumb buffer) returns the
-    // physical frames of its scanout buffer from `FileOps::mmap_frames`;
-    // we alias (borrow) those frames into the caller's AS so userspace
-    // gets a direct CPU-drawable pointer. RegionPerms::SHARED keeps the
-    // teardown paths from `free_frame`-ing device-owned frames on
-    // munmap/exit — same borrowed-frame contract as `sys_shmem_map` /
-    // `sys_fb_ring_map`. A device that doesn't support mmap returns
-    // Unsupported and we fall through to the regular file path.
-    if fd >= 0 && flags & MAP_SHARED != 0 {
-        let task = current_task_id();
-        let ops = fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
-        if let Some(ops) = ops {
-            // On Err (unsupported, or any device error) we fall through to the
-            // regular file-backed path below, unchanged from before.
-            if let Ok(frames) = ops.mmap_frames(offset, len as usize) {
-                if frames.len() != pages {
-                    const EINVAL: i64 = 22;
-                    ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-                    return;
-                }
-                let phys: alloc::vec::Vec<narf_memory::PhysAddr> = frames
-                    .iter()
-                    .map(|&p| narf_memory::PhysAddr::new(p))
-                    .collect();
-                if as_ref
-                    .map_region(Region {
-                        base: VirtAddr::new(base),
-                        len,
-                        perms: perms | RegionPerms::SHARED,
-                        phys,
-                    })
-                    .is_err()
-                {
-                    ctx.set_return(SyscallReturn::invalid_op());
-                    return;
-                }
-                // SAFETY: `as_ref` is the calling task's AddressSpace (valid
-                // root); the region was just registered via map_region, so
-                // materialize installs only its PTEs over borrowed frames.
-                if unsafe { as_ref.materialize() }.is_err() {
-                    // Roll back so the failed region can't poison later
-                    // materialize() calls (SHARED → PTE-clear only, the
-                    // device keeps its frames).
-                    let _ = as_ref.unmap_region(VirtAddr::new(base));
-                    ctx.set_return(SyscallReturn::invalid_op());
-                    return;
-                }
-                ctx.set_return(SyscallReturn::ok(base));
-                return;
-            }
-        }
-    }
-
-    // Anonymous MAP_SHARED — Linux makes this a refcounted anonymous shared
-    // object that survives fork: parent and child map the SAME frames and see
-    // each other's writes. NARF backs it with the narf-shmem frame registry
-    // (reached via the syscall vtable, exactly like System V shmat): the frames
-    // are zeroed, registry-owned (reaped by the shmem process-exit observer),
-    // and RegionPerms::SHARED makes `clone_for_fork` ALIAS them into the child
-    // rather than COW-splitting a private copy the parent never sees. Without
-    // this a child's writes — e.g. stress-ng's shared bogo-op counters, which
-    // live in a MAP_SHARED|MAP_ANONYMOUS page mmap'd before each worker fork —
-    // vanish from the parent's view (every counter reads back 0). Degrades to
-    // the private-anonymous path below if the registry is unavailable or the
-    // segment exceeds the per-handle cap (1 MiB); never a hard failure.
-    if flags & MAP_SHARED != 0 && (flags & MAP_ANONYMOUS != 0 || fd < 0) {
-        if let Some(v) = shmem_vtable() {
-            let handle = (v.create)(current_task_id(), len);
-            if handle != 0 {
-                let mut frames_raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-                if (v.frames)(handle, &mut frames_raw) && frames_raw.len() == pages {
-                    let phys: alloc::vec::Vec<narf_memory::PhysAddr> = frames_raw
-                        .into_iter()
-                        .map(narf_memory::PhysAddr::new)
-                        .collect();
-                    if as_ref
-                        .map_region(Region {
-                            base: VirtAddr::new(base),
-                            len,
-                            perms: perms | RegionPerms::SHARED,
-                            phys,
-                        })
-                        .is_ok()
-                    {
-                        // SAFETY: `as_ref` is the calling task's AddressSpace
-                        // (valid root); the region was just registered, so
-                        // materialize installs only its PTEs over the registry
-                        // frames.
-                        if unsafe { as_ref.materialize() }.is_ok() {
-                            ctx.set_return(SyscallReturn::ok(base));
-                            return;
-                        }
-                        // Mapped but materialize failed (e.g. the fixed hint
-                        // hits a kernel huge page): ROLL BACK. Leaving the
-                        // region registered poisons the AS — every later
-                        // materialize() re-walks it, hits the same error, and
-                        // every subsequent mmap in the process fails. The
-                        // region is SHARED so unmap_region only clears PTEs
-                        // (frames stay registry-owned), then destroy reaps
-                        // the now-unreferenced segment.
-                        let _ = as_ref.unmap_region(VirtAddr::new(base));
-                        (v.destroy)(handle);
-                        ctx.set_return(SyscallReturn::invalid_op());
-                        return;
-                    }
-                }
-                // Not mapped (frames lookup / page-count mismatch / map_region
-                // failed) — no region references the frames, so reap the
-                // just-created segment now, then fall through to private anon.
-                (v.destroy)(handle);
-            }
-        }
-        // Registry unavailable or create failed: degrade to private anonymous.
-    }
-
-    let anonymous = flags & MAP_ANONYMOUS != 0 || fd < 0;
-    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = if anonymous {
-        // Lazy-back: phys[i] == 0; the #PF handler demand-allocates + zeros
-        // each page on first access.
-        alloc::vec![narf_memory::PhysAddr::new(0); pages]
-    } else {
-        // File-backed MAP_PRIVATE: stream the file's [offset, offset+len)
-        // bytes straight into per-page private frames (zero past EOF),
-        // reading ONE page at a time. Slurping the whole region into a single
-        // intermediate Vec OOMs the kernel for big DSOs: ld-musl mmaps Mesa's
-        // libgallium (~40 MiB) and libLLVM (~161 MiB) in a single call, and a
-        // lone 40 MiB+ allocation fails even with GiBs of guest RAM. Per-page
-        // frames are a scatter list, so no large contiguous allocation is
-        // needed.
-        let len_bytes = len as usize;
-        let ops = match fd::with_table(current_task_id(), |t| {
-            t.get(fd as u32).map(|e| e.ops.clone())
-        })
-        .flatten()
-        {
-            Some(o) => o,
-            None => {
-                ctx.set_return(SyscallReturn::invalid_op());
-                return;
-            }
-        };
-        let mut frames = alloc::vec::Vec::with_capacity(pages);
-        for i in 0..pages {
-            let frame = match narf_memory::alloc_frame() {
-                Ok(f) => f.start_address(),
-                Err(_) => {
-                    ctx.set_return(SyscallReturn::invalid_op());
-                    return;
-                }
-            };
-            let off = i * 4096;
-            let want = core::cmp::min(4096, len_bytes - off);
-            // SAFETY: freshly-allocated identity-mapped frame; zero the whole
-            // page first so any tail past `want` (and past EOF) reads as zero.
-            unsafe {
-                core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
-            }
-            // SAFETY: `frame` is identity-mapped in the low 4 GiB and `want`
-            // is <= 4096, so the slice stays within the page.
-            let dst = unsafe { core::slice::from_raw_parts_mut(frame.raw() as *mut u8, want) };
-            let mut done = 0usize;
-            while done < want {
-                // Poll each read to COMPLETION, keeping the one future alive for
-                // the whole wait (`poll_io_to_completion`, huge backstop) — never
-                // drop it mid-request. The old code used `poll_blocking` (a small
-                // 4M budget) and treated its timeout (`None`) as EOF, silently
-                // zero-filling the page tail under a concurrent-execve storm (KDE
-                // launching dozens of procs): that truncated a mmap'd DSO — it
-                // lopped a libdbus `.rodata` string "/org/freedesktop/DBus" → "/",
-                // so every forked dbus client sent a malformed Hello, killing the
-                // session bus and stalling Plasma. Dropping a read future mid-DMA
-                // ALSO left an in-flight virtio-blk request writing into a scratch
-                // buffer that had been returned to the pool and reused → garbage.
-                // Holding the future to completion fixes both: the scratch buffer
-                // is released only after its DMA finishes.
-                match poll_io_to_completion(
-                    ops.read(offset + off as u64 + done as u64, &mut dst[done..]),
-                ) {
-                    Some(Ok(0)) | None => break, // real EOF (or wedged device) — rest stays zero
-                    Some(Ok(n)) => done += n,
-                    Some(Err(_)) => break, // read error — rest stays zero
-                }
-            }
-            frames.push(frame);
-        }
-        frames
-    };
-
-    if as_ref
-        .map_region(Region {
-            base: VirtAddr::new(base),
-            len,
-            perms,
-            phys: phys_list,
-        })
-        .is_err()
-    {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the region
-    // was just registered via `map_region`, so materialize installs only its PTEs.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { as_ref.materialize() }.is_err() {
-        // Roll the region back — leaving it registered poisons every
-        // later materialize() in this AS (each re-walks the region,
-        // hits the same map error, and the whole mmap surface goes
-        // dark for the process). unmap_region frees any file-read
-        // frames via the region's own phys list.
-        let _ = as_ref.unmap_region(VirtAddr::new(base));
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-
-    ctx.set_return(SyscallReturn::ok(base));
-}
-
-/// `mremap(old_addr, old_len, new_len, flags, new_addr)` — resize an
-/// existing anonymous mapping. NARF implements the in-place grow path:
-/// the region keeps its frames at `old_addr` and the grown tail is
-/// lazily backed (demand-paged) like a fresh mmap, so contents are
-/// preserved with no copy. Shrink / no-op returns `old_addr`
-/// unchanged; a grow that would collide with another region returns
-/// `-ENOMEM` (we don't relocate even with MREMAP_MAYMOVE today), and
-/// `MREMAP_FIXED` — an explicit move to a caller-chosen address — is
-/// refused with `-ENOMEM` up front rather than "succeeding" in place.
-fn sys_mremap(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let old_addr = args.arg0;
-    let old_len = (args.arg1 + 0xFFF) & !0xFFFu64;
-    let new_len = (args.arg2 + 0xFFF) & !0xFFFu64;
-    let flags = args.arg3 as u32;
-    const MREMAP_MAYMOVE: u32 = 1;
-    const MREMAP_FIXED: u32 = 2;
-    const MREMAP_DONTUNMAP: u32 = 4;
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    if old_addr & 0xFFF != 0
-        || new_len == 0
-        || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
-    {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    // MREMAP_FIXED asks for relocation to arg4's exact address —
-    // which we don't implement. Fail with -ENOMEM (the Linux "cannot
-    // move" answer) instead of returning old_addr as a fake success:
-    // a caller believing the move happened would touch the requested
-    // new address and SEGV (stress-ng --mmapfixed hammers exactly
-    // this shape with arbitrary 64-bit targets).
-    if flags & MREMAP_FIXED != 0 {
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
-        return;
-    }
-    if new_len <= old_len {
-        // Shrink / unchanged — keep the mapping where it is.
-        ctx.set_return(SyscallReturn::ok(old_addr));
-        return;
-    }
-    match as_ref.grow_region(VirtAddr::new(old_addr), new_len) {
-        Ok(()) => ctx.set_return(SyscallReturn::ok(old_addr)),
-        Err(_) => ctx.set_return(SyscallReturn::ok((-12i64) as u64)), // ENOMEM
-    }
 }
 
 /// `sendfile(out_fd, in_fd, off*, count)` — copy up to `count` bytes
@@ -6916,284 +2634,6 @@ fn copy_fd_to_fd(
         let _ = unsafe { copy_to_user(in_off_ptr, &in_off.to_ne_bytes()) };
     }
     Some(total)
-}
-
-/// `sendfile(out_fd, in_fd, off*, count)` — copy bytes between fds in
-/// the kernel. See `copy_fd_to_fd`.
-fn sys_sendfile(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let task = current_task_id();
-    let in_fd = a.arg1 as u32;
-    // Linux: the sendfile(2) input fd must support mmap. A non-seekable
-    // stream (pipe/socket) is rejected with EINVAL — and that rejection is
-    // load-bearing: the copy core below treats a transient empty read on a
-    // still-open pipe as EOF, so a pipe source would silently truncate to 0.
-    // EINVAL makes callers (busybox `cat`) fall back to a read()/write() loop
-    // that parks correctly on the empty-but-open pipe.
-    let in_is_stream = fd::with_table(task, |t| t.get(in_fd).map(|e| e.ops.is_stream()));
-    if let Some(Some(true)) = in_is_stream {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
-        return;
-    }
-    match copy_fd_to_fd(task, in_fd, a.arg0 as u32, a.arg2, a.arg3 as usize) {
-        Some(total) => ctx.set_return(SyscallReturn::ok(total as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
-    }
-}
-
-/// `splice(fd_in, off_in*, fd_out, off_out*, len, flags)` — move data
-/// between two fds (at least one a pipe) without a userspace copy.
-/// NARF reuses the sendfile copy core; `off_out` (only meaningful for
-/// a seekable out_fd) is not honoured — pipes pass NULL.
-fn sys_splice(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let task = current_task_id();
-    match copy_fd_to_fd(task, a.arg0 as u32, a.arg2 as u32, a.arg1, a.arg4 as usize) {
-        Some(total) => ctx.set_return(SyscallReturn::ok(total as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
-    }
-}
-
-/// `sysinfo(struct sysinfo*)` — fill the uptime (from the monotonic
-/// clock) and RAM totals (from the frame allocator). Swap, loads, and
-/// the high-memory fields stay zero; mem_unit is 1 (bytes).
-fn sys_sysinfo(ctx: &mut dyn TrapContext) {
-    let buf = ctx.args().arg0;
-    if buf == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-        return;
-    }
-    let uptime_secs = (narf_scheduler::narf_time::monotonic_ns() / 1_000_000_000) as i64;
-    let stats = narf_memory::frame_stats();
-    let total_bytes = (stats.total as u64).saturating_mul(4096);
-    let free_bytes = (stats.free as u64).saturating_mul(4096);
-    // struct sysinfo (LP64): uptime@0, loads@8/16/24, totalram@32,
-    // freeram@40, sharedram@48, bufferram@56, totalswap@64, freeswap@72,
-    // procs@80(u16), totalhigh@88, freehigh@96, mem_unit@104(u32). 112
-    // bytes covers through mem_unit; the remaining __reserved stays as
-    // the caller left it.
-    let mut si = [0u8; 112];
-    si[0..8].copy_from_slice(&uptime_secs.to_ne_bytes());
-    // loads[3]: same EWMA /proc/loadavg renders, in the SI_LOAD_SHIFT=16
-    // fixed point — busybox uptime reads sysinfo(2), not the proc file,
-    // and previously showed a flat 0.00. procfs (and its EWMA) only
-    // exists under linux-compat; other builds keep zeroed loads.
-    #[cfg(feature = "linux-compat")]
-    {
-        let (l1, l5, l15) = narf_filesystem::procfs::loadavg_sysinfo_fixed16();
-        si[8..16].copy_from_slice(&l1.to_ne_bytes());
-        si[16..24].copy_from_slice(&l5.to_ne_bytes());
-        si[24..32].copy_from_slice(&l15.to_ne_bytes());
-    }
-    si[32..40].copy_from_slice(&total_bytes.to_ne_bytes());
-    si[40..48].copy_from_slice(&free_bytes.to_ne_bytes());
-    let procs = narf_scheduler::all_task_ids().len().min(u16::MAX as usize) as u16;
-    si[80..82].copy_from_slice(&procs.to_ne_bytes()); // procs
-    si[104..108].copy_from_slice(&1u32.to_ne_bytes()); // mem_unit = 1 byte
-                                                       // SAFETY: `buf` is the user `struct sysinfo*` (non-zero); copy_to_user
-                                                       // range-validates the 112-byte write.
-    if unsafe { copy_to_user(buf, &si) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `membarrier(cmd, flags, cpu_id)` — process-wide memory barrier.
-/// QUERY (0) returns the supported-command bitmask; the actual barrier
-/// commands are no-ops on the cooperative single-CPU kernel (loads and
-/// stores are already globally ordered when a task is in flight).
-fn sys_membarrier(ctx: &mut dyn TrapContext) {
-    let cmd = ctx.args().arg0 as u32;
-    const QUERY: u32 = 0;
-    const GLOBAL: u32 = 1 << 0;
-    const GLOBAL_EXPEDITED: u32 = 1 << 1;
-    const REGISTER_GLOBAL_EXPEDITED: u32 = 1 << 2;
-    const PRIVATE_EXPEDITED: u32 = 1 << 3;
-    const REGISTER_PRIVATE_EXPEDITED: u32 = 1 << 4;
-    let supported = GLOBAL
-        | GLOBAL_EXPEDITED
-        | REGISTER_GLOBAL_EXPEDITED
-        | PRIVATE_EXPEDITED
-        | REGISTER_PRIVATE_EXPEDITED;
-    let r: u64 = if cmd == QUERY {
-        supported as u64
-    } else if cmd & supported == cmd && cmd.is_power_of_two() {
-        0 // barrier / registration is a no-op here
-    } else {
-        (-22i64) as u64 // EINVAL
-    };
-    ctx.set_return(SyscallReturn::ok(r));
-}
-
-/// `close_range(first, last, flags)` — close every open fd in the
-/// inclusive range, or mark them FD_CLOEXEC with CLOSE_RANGE_CLOEXEC.
-fn sys_close_range(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let first = a.arg0 as u32;
-    let last = a.arg1 as u32;
-    let flags = a.arg2 as u32;
-    const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
-    const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
-    if first > last || flags & !(CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let cloexec = flags & CLOSE_RANGE_CLOEXEC != 0;
-    let task = current_task_id();
-    fd::with_table(task, |t| t.close_range(first, last, cloexec));
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `sched_getscheduler(pid)` — NARF runs one cooperative policy,
-/// reported as SCHED_OTHER (0).
-fn sys_sched_getscheduler(_ctx: &mut dyn TrapContext) {
-    _ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `sched_setscheduler(pid, policy, param)` — accept any of the
-/// standard policy numbers (the cooperative scheduler doesn't
-/// distinguish them); reject unknown ones with EINVAL.
-fn sys_sched_setscheduler(ctx: &mut dyn TrapContext) {
-    let policy = ctx.args().arg1 as i32;
-    // SCHED_OTHER=0, FIFO=1, RR=2, BATCH=3, IDLE=5.
-    if matches!(policy, 0 | 1 | 2 | 3 | 5) {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-    }
-}
-
-/// `sched_rr_get_interval(pid, timespec*)` — the cooperative policy
-/// has no round-robin quantum, so report `{0, 0}`.
-fn sys_sched_rr_get_interval(ctx: &mut dyn TrapContext) {
-    let buf = ctx.args().arg1;
-    if buf != 0 {
-        let kbuf = [0u8; 16]; // tv_sec = 0, tv_nsec = 0
-                              // SAFETY: `buf` is the user `timespec*` (non-zero); copy_to_user
-                              // range-validates the 16-byte write.
-        if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `msync(addr, len, flags)` — anonymous mappings have nothing to
-/// write back; just validate the range starts inside a mapping.
-fn sys_msync(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let addr = a.arg0;
-    if addr & 0xFFF != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let mapped = current_address_space()
-        .map(|as_ref| as_ref.lookup(VirtAddr::new(addr)).is_some())
-        .unwrap_or(false);
-    if mapped {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
-    }
-}
-
-/// `mincore(addr, len, vec)` — write one residency byte per page into
-/// `vec` (bit 0 set when the page is backed by a frame). Returns
-/// ENOMEM if any page in the range is unmapped.
-fn sys_mincore(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let addr = a.arg0;
-    let len = a.arg1 as usize;
-    let vec_ptr = a.arg2;
-    if addr & 0xFFF != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let as_ref = match current_address_space() {
-        Some(x) => x,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let pages = len.div_ceil(4096);
-    let mut out = alloc::vec![0u8; pages];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let va = VirtAddr::new(addr + (i as u64) * 4096);
-        match as_ref.lookup(va) {
-            Some(region) => {
-                let idx = ((va.as_u64() - region.base.as_u64()) >> 12) as usize;
-                let resident = region.phys.get(idx).map(|p| p.raw() != 0).unwrap_or(false);
-                *slot = resident as u8;
-            }
-            None => {
-                ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
-                return;
-            }
-        }
-    }
-    // SAFETY: `vec_ptr` is the user residency-vector pointer; copy_to_user
-    // range-validates the `pages`-byte write.
-    if unsafe { copy_to_user(vec_ptr, &out) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `sync()` — flush all filesystems. NARF's in-memory FSes have no
-/// write-back, so this is a no-op.
-fn sys_sync(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `syncfs(fd)` — flush the filesystem backing `fd`. No-op (see sync).
-fn sys_syncfs(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `personality(persona)` — NARF only implements the default Linux
-/// execution domain (PER_LINUX = 0); report it and ignore changes.
-fn sys_personality(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `fadvise64(fd, offset, len, advice)` — access-pattern hint. NARF's
-/// in-memory FSes ignore it; accept for a valid fd, EBADF otherwise.
-fn sys_fadvise64(ctx: &mut dyn TrapContext) {
-    let fd = ctx.args().arg0 as u32;
-    let task = current_task_id();
-    let valid = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
-    if valid {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
-    }
-}
-
-/// `mlock2(addr, len, flags)` — like mlock with the MLOCK_ONFAULT
-/// flag. NARF force-backs the range either way, so the flag is
-/// accepted but doesn't change behaviour.
-fn sys_mlock2(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    const MLOCK_ONFAULT: u32 = 1;
-    if a.arg2 as u32 & !MLOCK_ONFAULT != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let as_ref = match current_address_space() {
-        Some(x) => x,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    match as_ref.mlock_range(VirtAddr::new(a.arg0), a.arg1) {
-        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
-    }
 }
 
 /// Per-task robust-futex list head (`set_robust_list` / `get_robust_list`).
@@ -7345,50 +2785,6 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
     }
 }
 
-/// `set_robust_list(head, len)` — register the calling thread's robust
-/// futex list head.
-fn sys_set_robust_list(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let task = current_task_id();
-    let mut g = ROBUST_LIST_TABLE.lock();
-    let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    m.insert(task, (a.arg0, a.arg1));
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `get_robust_list(pid, head_ptr, len_ptr)` — read back the robust
-/// futex list head registered for `pid` (0 = the caller).
-fn sys_get_robust_list(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let head_out = a.arg1;
-    let len_out = a.arg2;
-    let task = if a.arg0 == 0 {
-        current_task_id()
-    } else {
-        a.arg0
-    };
-    let (head, len) = {
-        let g = ROBUST_LIST_TABLE.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&task).copied())
-            .unwrap_or((0, 0))
-    };
-    if head_out != 0 {
-        // SAFETY: `head_out` is the user `void**` out-pointer; copy_to_user
-        // range-validates the 8-byte write.
-        if unsafe { copy_to_user(head_out, &head.to_ne_bytes()) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-            return;
-        }
-    }
-    if len_out != 0 {
-        // SAFETY: `len_out` is the user `size_t*` out-pointer; copy_to_user
-        // range-validates the 8-byte write.
-        let _ = unsafe { copy_to_user(len_out, &len.to_ne_bytes()) };
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 // ── capget / capset ──────────────────────────────────────────────────
 //
 // Linux capability sets, stored per-task as three 64-bit masks
@@ -7418,128 +2814,6 @@ fn cap_ndata(version: u32) -> Option<usize> {
         CAP_VERSION_2 | CAP_VERSION_3 => Some(2),
         _ => None,
     }
-}
-
-/// `capget(hdrp, datap)` — read a task's capability sets.
-fn sys_capget(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let hdrp = a.arg0;
-    let datap = a.arg1;
-    if hdrp == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-        return;
-    }
-    let mut hdr = [0u8; 8];
-    // SAFETY: hdrp checked non-zero; copy_from_user range-validates the read.
-    if unsafe { copy_from_user(&mut hdr, hdrp) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-        return;
-    }
-    let version = u32::from_le_bytes(hdr[..4].try_into().unwrap());
-    let pid = i32::from_le_bytes(hdr[4..].try_into().unwrap());
-    let ndata = match cap_ndata(version) {
-        Some(n) => n,
-        None => {
-            // Linux rewrites the header to the preferred version and
-            // returns EINVAL so the caller can retry.
-            hdr[..4].copy_from_slice(&CAP_VERSION_3.to_le_bytes());
-            // SAFETY: hdrp validated by the read above; same 8-byte range.
-            let _ = unsafe { copy_to_user(hdrp, &hdr) };
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-            return;
-        }
-    };
-    // datap == NULL is a version probe — succeed without writing data.
-    if datap == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    let task = if pid == 0 {
-        current_task_id()
-    } else {
-        pid as u64
-    };
-    let caps = {
-        let g = CAP_TABLE.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&task).copied())
-            .unwrap_or([0; 3])
-    };
-    let mut out = alloc::vec![0u8; ndata * 12];
-    for (field, &val) in caps.iter().enumerate() {
-        // data[0] carries the low 32 bits; data[1] (v2/v3) the high.
-        out[field * 4..field * 4 + 4].copy_from_slice(&(val as u32).to_le_bytes());
-        if ndata == 2 {
-            let hi = (val >> 32) as u32;
-            out[12 + field * 4..12 + field * 4 + 4].copy_from_slice(&hi.to_le_bytes());
-        }
-    }
-    // SAFETY: datap checked non-zero; copy_to_user range-validates the write.
-    if unsafe { copy_to_user(datap, &out) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `capset(hdrp, datap)` — set a task's capability sets.
-fn sys_capset(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let hdrp = a.arg0;
-    let datap = a.arg1;
-    if hdrp == 0 || datap == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-        return;
-    }
-    let mut hdr = [0u8; 8];
-    // SAFETY: hdrp checked non-zero; copy_from_user range-validates the read.
-    if unsafe { copy_from_user(&mut hdr, hdrp) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-        return;
-    }
-    let version = u32::from_le_bytes(hdr[..4].try_into().unwrap());
-    let pid = i32::from_le_bytes(hdr[4..].try_into().unwrap());
-    let ndata = match cap_ndata(version) {
-        Some(n) => n,
-        None => {
-            hdr[..4].copy_from_slice(&CAP_VERSION_3.to_le_bytes());
-            // SAFETY: hdrp validated by the read above; same 8-byte range.
-            let _ = unsafe { copy_to_user(hdrp, &hdr) };
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-            return;
-        }
-    };
-    // capset only operates on the calling thread (pid 0 or self).
-    let task = current_task_id();
-    if pid != 0 && pid as u64 != task {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM-ish
-        return;
-    }
-    // SAFETY: datap checked non-zero above; copy_from_user_vec range-validates
-    // the read before copying within the SMAP window.
-    let buf = match unsafe { copy_from_user_vec(datap, ndata * 12) } {
-        Ok(b) => b,
-        Err(_) => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-            return;
-        }
-    };
-    let mut caps = [0u64; 3];
-    for (field, slot) in caps.iter_mut().enumerate() {
-        let lo = u32::from_le_bytes(buf[field * 4..field * 4 + 4].try_into().unwrap()) as u64;
-        let hi = if ndata == 2 {
-            u32::from_le_bytes(buf[12 + field * 4..12 + field * 4 + 4].try_into().unwrap()) as u64
-        } else {
-            0
-        };
-        *slot = lo | (hi << 32);
-    }
-    {
-        let mut g = CAP_TABLE.lock();
-        let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-        m.insert(task, caps);
-    }
-    ctx.set_return(SyscallReturn::ok(0));
 }
 
 // ── setxattr / getxattr / listxattr ──────────────────────────────────
@@ -7710,121 +2984,6 @@ fn xattr_remove_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     }
 }
 
-/// `setxattr(path, name, value, size, flags)`.
-fn sys_setxattr(ctx: &mut dyn TrapContext) {
-    match xattr_user_path(ctx.args().arg0) {
-        Some(p) => xattr_set_core(p, ctx),
-        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
-    }
-}
-
-/// `getxattr(path, name, value, size)`.
-fn sys_getxattr(ctx: &mut dyn TrapContext) {
-    match xattr_user_path(ctx.args().arg0) {
-        Some(p) => xattr_get_core(p, ctx),
-        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
-    }
-}
-
-/// `listxattr(path, list, size)`.
-fn sys_listxattr(ctx: &mut dyn TrapContext) {
-    match xattr_user_path(ctx.args().arg0) {
-        Some(p) => xattr_list_core(p, ctx),
-        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
-    }
-}
-
-/// `removexattr(path, name)`.
-fn sys_removexattr(ctx: &mut dyn TrapContext) {
-    match xattr_user_path(ctx.args().arg0) {
-        Some(p) => xattr_remove_core(p, ctx),
-        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
-    }
-}
-
-/// `fsetxattr(fd, name, value, size, flags)`.
-fn sys_fsetxattr(ctx: &mut dyn TrapContext) {
-    match xattr_fd_key(ctx.args().arg0 as u32) {
-        Some(p) => xattr_set_core(p, ctx),
-        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
-    }
-}
-
-/// `fgetxattr(fd, name, value, size)`.
-fn sys_fgetxattr(ctx: &mut dyn TrapContext) {
-    match xattr_fd_key(ctx.args().arg0 as u32) {
-        Some(p) => xattr_get_core(p, ctx),
-        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
-    }
-}
-
-/// `flistxattr(fd, list, size)`.
-fn sys_flistxattr(ctx: &mut dyn TrapContext) {
-    match xattr_fd_key(ctx.args().arg0 as u32) {
-        Some(p) => xattr_list_core(p, ctx),
-        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
-    }
-}
-
-/// `fremovexattr(fd, name)`.
-fn sys_fremovexattr(ctx: &mut dyn TrapContext) {
-    match xattr_fd_key(ctx.args().arg0 as u32) {
-        Some(p) => xattr_remove_core(p, ctx),
-        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
-    }
-}
-
-/// `creat(path, mode)` — equivalent to
-/// `open(path, O_CREAT|O_WRONLY|O_TRUNC, mode)`. Reshapes into `sys_open`'s
-/// `(path_ptr, path_len, mnt_ptr, mnt_len, flags)` ABI, mirroring sys_openat.
-fn sys_creat(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let path_uptr = a.arg0;
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok(!0u64));
-            return;
-        }
-    };
-    const O_CREAT_WRONLY_TRUNC: u64 = 0o100 | 0o1 | 0o1000;
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    let proxy_args = SyscallArgs {
-        arg0: path_uptr,
-        arg1: path_str.len() as u64,
-        arg2: 0,
-        arg3: 0,
-        arg4: O_CREAT_WRONLY_TRUNC,
-        arg5: 0,
-    };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_open(&mut proxy);
-}
-
 // ── utime / utimes / futimesat / utimensat — real mtime updates ─────
 //
 // Backed by `FileOps::set_times` (wall-ns since epoch; MemFs stores and
@@ -7867,40 +3026,6 @@ fn set_path_times(path: &str, atime_ns: Option<u64>, mtime_ns: Option<u64>) -> i
     }
 }
 
-/// `utime(path, utimbuf*)` — x86_64 132. `utimbuf { actime, modtime }`
-/// in SECONDS; NULL times = both now.
-fn sys_utime(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let raw = match copy_user_cstr(a.arg0, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
-            return;
-        }
-    };
-    let (at, mt) = if a.arg1 == 0 {
-        let now = wall_now_ns();
-        (now, now)
-    } else {
-        let mut buf = [0u8; 16];
-        // SAFETY: non-zero user utimbuf pointer; copy_from_user
-        // range-validates and SMAP-brackets the 16-byte read.
-        if unsafe { copy_from_user(&mut buf, a.arg1) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
-            return;
-        }
-        let actime = i64::from_ne_bytes(buf[..8].try_into().unwrap());
-        let modtime = i64::from_ne_bytes(buf[8..].try_into().unwrap());
-        (
-            (actime.max(0) as u64).saturating_mul(1_000_000_000),
-            (modtime.max(0) as u64).saturating_mul(1_000_000_000),
-        )
-    };
-    let path = resolve_cwd_path(current_task_id(), &raw);
-    let r = set_path_times(&path, Some(at), Some(mt));
-    ctx.set_return(SyscallReturn::ok(r as u64));
-}
-
 /// Shared utimes body: `timeval[2]` (sec + USEC) at `tv_ptr`, NULL =
 /// both now. Used by utimes(235) and futimesat(261).
 fn utimes_common(ctx: &mut dyn TrapContext, raw_path: &str, tv_ptr: u64) {
@@ -7927,167 +3052,6 @@ fn utimes_common(ctx: &mut dyn TrapContext, raw_path: &str, tv_ptr: u64) {
     ctx.set_return(SyscallReturn::ok(r as u64));
 }
 
-/// `utimes(path, timeval[2])` — x86_64 235.
-fn sys_utimes(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let raw = match copy_user_cstr(a.arg0, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
-            return;
-        }
-    };
-    utimes_common(ctx, &raw, a.arg1);
-}
-
-/// `futimesat(dirfd, path, timeval[2])` — x86_64 261 (legacy; glibc's
-/// pre-utimensat compat path). Relative paths resolve against the
-/// dirfd's recorded open path, same prepend as sys_readlinkat/linkat.
-fn sys_futimesat(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let raw = match copy_user_cstr(a.arg1, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
-            return;
-        }
-    };
-    const AT_FDCWD: i64 = -100;
-    let dirfd = a.arg0 as i64;
-    let eff = if raw.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
-        raw
-    } else {
-        match fd_path_of(current_task_id(), dirfd as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
-            }
-            _ => raw,
-        }
-    };
-    utimes_common(ctx, &eff, a.arg2);
-}
-
-/// `utimensat(dirfd, path, timespec[2], flags)` — the modern entry musl
-/// routes utime/utimes/futimens through. `times` NULL = both now;
-/// tv_nsec may be UTIME_NOW / UTIME_OMIT per slot. `path` NULL is the
-/// futimens form: operate on `dirfd` itself through the fd table.
-fn sys_utimensat(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    const UTIME_NOW: i64 = 0x3FFF_FFFF;
-    const UTIME_OMIT: i64 = 0x3FFF_FFFE;
-
-    // Decode the two timespec slots into Option<ns> (None = OMIT).
-    let (at, mt) = if a.arg2 == 0 {
-        let now = wall_now_ns();
-        (Some(now), Some(now))
-    } else {
-        let mut buf = [0u8; 32];
-        // SAFETY: non-zero user timespec[2] pointer; copy_from_user
-        // range-validates and SMAP-brackets the 32-byte read.
-        if unsafe { copy_from_user(&mut buf, a.arg2) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
-            return;
-        }
-        let slot = |o: usize| -> Result<Option<u64>, ()> {
-            let sec = i64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
-            let nsec = i64::from_ne_bytes(buf[o + 8..o + 16].try_into().unwrap());
-            match nsec {
-                UTIME_OMIT => Ok(None),
-                UTIME_NOW => Ok(Some(wall_now_ns())),
-                n if (0..1_000_000_000).contains(&n) => Ok(Some(
-                    (sec.max(0) as u64).saturating_mul(1_000_000_000) + n as u64,
-                )),
-                _ => Err(()), // Linux: EINVAL for an out-of-range tv_nsec
-            }
-        };
-        match (slot(0), slot(16)) {
-            (Ok(at), Ok(mt)) => (at, mt),
-            _ => {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
-                return;
-            }
-        }
-    };
-
-    let task = current_task_id();
-    if a.arg1 == 0 {
-        // futimens(fd) form — set times through the open fd's FileOps.
-        let fd = a.arg0 as u32;
-        let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
-        match ops {
-            Some(o) => {
-                // set_times is lenient — unsupported FileOps → 0.
-                let _ = o.set_times(at, mt);
-                // inotify: a timestamp change is IN_ATTRIB on the fd's file.
-                #[cfg(feature = "linux-compat")]
-                crate::mqueue::notify_attrib_fd(task, fd);
-                ctx.set_return(SyscallReturn::ok(0));
-            }
-            None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // -EBADF
-        }
-        return;
-    }
-
-    let raw = match copy_user_cstr(a.arg1, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
-            return;
-        }
-    };
-    // Relative path against a real directory fd (AT_FDCWD / absolute
-    // pass through) — same prepend as sys_readlinkat / sys_linkat.
-    const AT_FDCWD: i64 = -100;
-    let dirfd = a.arg0 as i64;
-    let eff = if raw.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
-        raw
-    } else {
-        match fd_path_of(task, dirfd as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
-            }
-            _ => raw,
-        }
-    };
-    let path = resolve_cwd_path(task, &eff);
-    let r = set_path_times(&path, at, mt);
-    // inotify: a successful timestamp change is IN_ATTRIB on the path.
-    #[cfg(feature = "linux-compat")]
-    if r == 0 {
-        let is_dir = resolve_dir_absolute(&path).is_some();
-        crate::mqueue::notify_attrib(&path, is_dir);
-    }
-    ctx.set_return(SyscallReturn::ok(r as u64));
-}
-
-/// `readahead(fd, offset, count)` — page-cache populate hint. NARF's
-/// in-memory FSes need no readahead; accept for a valid fd, EBADF
-/// otherwise.
-fn sys_readahead(ctx: &mut dyn TrapContext) {
-    let fd = ctx.args().arg0 as u32;
-    let task = current_task_id();
-    let valid = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
-    if valid {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
-    }
-}
-
-/// `sync_file_range(fd, offset, nbytes, flags)` — flush a file range to
-/// disk. NARF's in-memory FSes are always coherent; accept for a valid
-/// fd, EBADF otherwise.
-fn sys_sync_file_range(ctx: &mut dyn TrapContext) {
-    let fd = ctx.args().arg0 as u32;
-    let task = current_task_id();
-    let valid = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
-    if valid {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
-    }
-}
-
 // ── pkey_alloc / pkey_free / pkey_mprotect ───────────────────────────
 //
 // Memory-protection keys. NARF tracks an allocation bitmap per task
@@ -8108,92 +3072,6 @@ static PKEY_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<alloc::collections::BT
 /// per-task global.
 pub fn pkey_init() {
     *PKEY_TABLE.lock() = None;
-}
-
-/// `pkey_alloc(flags, access_rights)` — allocate the lowest free key.
-fn sys_pkey_alloc(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    // Linux defines no flags; any non-zero value is EINVAL.
-    if a.arg0 != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let task = current_task_id();
-    let mut g = PKEY_TABLE.lock();
-    let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    let bits = m.entry(task).or_insert(0);
-    for k in 1..16u32 {
-        if *bits & (1 << k) == 0 {
-            *bits |= 1 << k;
-            ctx.set_return(SyscallReturn::ok(k as u64));
-            return;
-        }
-    }
-    ctx.set_return(SyscallReturn::ok((-28i64) as u64)); // ENOSPC
-}
-
-/// `pkey_free(pkey)`.
-fn sys_pkey_free(ctx: &mut dyn TrapContext) {
-    let key = ctx.args().arg0;
-    if key == 0 || key >= 16 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let task = current_task_id();
-    let mut g = PKEY_TABLE.lock();
-    let allocated = g
-        .as_mut()
-        .and_then(|m| m.get_mut(&task))
-        .map(|bits| {
-            if *bits & (1 << key) != 0 {
-                *bits &= !(1u16 << key);
-                true
-            } else {
-                false
-            }
-        })
-        .unwrap_or(false);
-    if allocated {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-    }
-}
-
-/// `pkey_mprotect(addr, len, prot, pkey)` — mprotect tagging a range
-/// with `pkey`. The key must be -1 (none), 0 (default), or an allocated
-/// key; the prot change is applied via the shared mprotect core.
-fn sys_pkey_mprotect(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let pkey = a.arg3 as i64;
-    if pkey != -1 && pkey != 0 {
-        if !(0..16).contains(&pkey) {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-            return;
-        }
-        let task = current_task_id();
-        let allocated = PKEY_TABLE
-            .lock()
-            .as_ref()
-            .and_then(|m| m.get(&task).copied())
-            .map(|bits| bits & (1 << pkey) != 0)
-            .unwrap_or(false);
-        if !allocated {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-            return;
-        }
-    }
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    match mprotect_core(&as_ref, VirtAddr::new(a.arg0), a.arg1, a.arg2 as u32) {
-        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(()) => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
-    }
 }
 
 // ── process_vm_readv / process_vm_writev ─────────────────────────────
@@ -8342,14 +3220,6 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
     ctx.set_return(SyscallReturn::ok(off as u64));
 }
 
-fn sys_process_vm_readv(ctx: &mut dyn TrapContext) {
-    process_vm_transfer(ctx, false);
-}
-
-fn sys_process_vm_writev(ctx: &mut dyn TrapContext) {
-    process_vm_transfer(ctx, true);
-}
-
 // ── NUMA memory policy: set_mempolicy / get_mempolicy / mbind ─────────
 //
 // Memory policy is *enforced*: the per-task default policy and per-range
@@ -8437,88 +3307,6 @@ pub fn clear_mempolicy_for_fault() {
     narf_memory::mempolicy_clear();
 }
 
-/// `set_mempolicy(mode, nodemask, maxnode)`.
-fn sys_set_mempolicy(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let mode = a.arg0 as u32;
-    if !mpol_mode_valid(mode) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let nodemask = if a.arg1 != 0 {
-        read_user_u64(a.arg1)
-    } else {
-        0
-    };
-    let task = current_task_id();
-    let mut g = MEMPOLICY_TABLE.lock();
-    g.get_or_insert_with(alloc::collections::BTreeMap::new)
-        .insert(task, (mode, nodemask));
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `get_mempolicy(mode, nodemask, maxnode, addr, flags)` — report the
-/// policy in force. Honors the query flags:
-/// - `MPOL_F_ADDR`: report the policy covering `addr` (an mbind range,
-///   else the task default).
-/// - `MPOL_F_NODE` (with `MPOL_F_ADDR`): write the node the page at
-///   `addr` would allocate from into `*mode`.
-/// - `MPOL_F_MEMS_ALLOWED`: write the set of allowed nodes into the
-///   nodemask (all online nodes here).
-fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let mode_ptr = a.arg0;
-    let nodemask_ptr = a.arg1;
-    let addr = a.arg3;
-    let flags = a.arg4 as u32;
-    let task = current_task_id();
-
-    if flags & MPOL_F_MEMS_ALLOWED != 0 {
-        // Report the mask of nodes this task may use: every online node.
-        let n = numa_node_count().min(64);
-        let allowed: u64 = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
-        if nodemask_ptr != 0 {
-            // SAFETY: copy_to_user validates the user pointer/length.
-            let _ = unsafe { copy_to_user(nodemask_ptr, &allowed.to_le_bytes()) };
-        }
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    let (mode, nodemask) = if flags & MPOL_F_ADDR != 0 {
-        resolve_policy(task, addr)
-    } else {
-        MEMPOLICY_TABLE
-            .lock()
-            .as_ref()
-            .and_then(|m| m.get(&task).copied())
-            .unwrap_or((0, 0)) // MPOL_DEFAULT
-    };
-
-    if mode_ptr != 0 {
-        let out_word: i32 = if flags & MPOL_F_NODE != 0 && flags & MPOL_F_ADDR != 0 {
-            // Report the node the page at `addr` would come from.
-            let pol = narf_memory::Mempolicy {
-                mode: mode & !MPOL_MODE_FLAGS,
-                nodemask,
-            };
-            mempolicy_resolved_node(pol) as i32
-        } else {
-            mode as i32
-        };
-        // SAFETY: mode_ptr is the user int out-pointer; copy_to_user validates it.
-        if unsafe { copy_to_user(mode_ptr, &out_word.to_le_bytes()) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-            return;
-        }
-    }
-    if nodemask_ptr != 0 {
-        // SAFETY: nodemask_ptr is the user unsigned-long array; copy_to_user validates it.
-        let _ = unsafe { copy_to_user(nodemask_ptr, &nodemask.to_le_bytes()) };
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 /// The node a fresh page under `pol` would be allocated from (used by
 /// get_mempolicy's MPOL_F_NODE|MPOL_F_ADDR query). Mirrors the
 /// allocator's preference resolution without actually allocating.
@@ -8543,43 +3331,6 @@ fn mempolicy_resolved_node(pol: narf_memory::Mempolicy) -> u32 {
     }
 }
 
-/// `mbind(addr, len, mode, nodemask, maxnode, flags)` — bind a range to
-/// a NUMA policy. Stored per (task, range); the fault path consults it
-/// via `resolve_policy` so the binding is enforced on demand-fault.
-fn sys_mbind(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let addr = a.arg0;
-    let len = a.arg1;
-    let mode = a.arg2 as u32;
-    if !mpol_mode_valid(mode) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let nodemask = if a.arg3 != 0 {
-        read_user_u64(a.arg3)
-    } else {
-        0
-    };
-    // Page-align the range like Linux (addr must be page-aligned;
-    // EINVAL otherwise).
-    if addr & 0xFFF != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let task = current_task_id();
-    let mut g = MBIND_TABLE.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    let ranges = map.entry(task).or_default();
-    // Drop any existing exact-overlap entry, then insert; a fresh mbind
-    // over the same start replaces the old policy.
-    ranges.retain(|&(s, _, _)| s != addr);
-    if (mode & !MPOL_MODE_FLAGS) != 0 {
-        // MPOL_DEFAULT removes the range binding (Linux semantics).
-        ranges.push((addr, len, (mode, nodemask)));
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 // ── sched_setattr / sched_getattr ────────────────────────────────────
 //
 // Extended scheduling attributes. NARF's scheduler doesn't honour the
@@ -8592,71 +3343,6 @@ const SCHED_ATTR_SIZE: usize = 48;
 static SCHED_ATTR_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, [u8; SCHED_ATTR_SIZE]>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
-
-/// `sched_setattr(pid, attr, flags)`.
-fn sys_sched_setattr(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let attr_ptr = a.arg1;
-    if a.arg2 != 0 || attr_ptr == 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    // The first u32 is the caller-declared struct size.
-    let size = read_user_u32(attr_ptr) as usize;
-    if size < SCHED_ATTR_SIZE {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL / E2BIG
-        return;
-    }
-    let to_read = size.min(SCHED_ATTR_SIZE);
-    // SAFETY: attr_ptr is non-zero; copy_from_user_vec range-validates the read.
-    let bytes = match unsafe { copy_from_user_vec(attr_ptr, to_read) } {
-        Ok(b) => b,
-        Err(_) => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-            return;
-        }
-    };
-    let mut buf = [0u8; SCHED_ATTR_SIZE];
-    buf[..to_read].copy_from_slice(&bytes);
-    let pid = a.arg0;
-    let task = if pid == 0 { current_task_id() } else { pid };
-    SCHED_ATTR_TABLE
-        .lock()
-        .get_or_insert_with(alloc::collections::BTreeMap::new)
-        .insert(task, buf);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `sched_getattr(pid, attr, size, flags)`.
-fn sys_sched_getattr(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let attr_ptr = a.arg1;
-    let size = a.arg2 as usize;
-    if a.arg3 != 0 || attr_ptr == 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    if size < SCHED_ATTR_SIZE {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL (buffer too small)
-        return;
-    }
-    let pid = a.arg0;
-    let task = if pid == 0 { current_task_id() } else { pid };
-    let mut buf = SCHED_ATTR_TABLE
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or([0u8; SCHED_ATTR_SIZE]);
-    // The kernel always reports the actual struct size in the first word.
-    buf[0..4].copy_from_slice(&(SCHED_ATTR_SIZE as u32).to_le_bytes());
-    // SAFETY: attr_ptr is non-zero and size >= SCHED_ATTR_SIZE; copy_to_user
-    // validates and SMAP-brackets the write.
-    if unsafe { copy_to_user(attr_ptr, &buf) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
 
 // ── adjtimex / clock_adjtime ─────────────────────────────────────────
 //
@@ -8703,227 +3389,7 @@ fn adjtimex_core(timex_ptr: u64) -> i64 {
     TIME_OK as i64
 }
 
-/// `adjtimex(timex)`.
-fn sys_adjtimex(ctx: &mut dyn TrapContext) {
-    let r = adjtimex_core(ctx.args().arg0);
-    ctx.set_return(SyscallReturn::ok(r as u64));
-}
-
-/// `clock_adjtime(clockid, timex)` — per-clock adjtimex. Only the
-/// settable system clocks are accepted.
-fn sys_clock_adjtime(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let clockid = a.arg0;
-    // CLOCK_REALTIME(0)/MONOTONIC(1)/BOOTTIME(7)/TAI(11) are accepted.
-    match clockid {
-        0 | 1 | 7 | 11 => {}
-        _ => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-            return;
-        }
-    }
-    let r = adjtimex_core(a.arg1);
-    ctx.set_return(SyscallReturn::ok(r as u64));
-}
-
 // ── pidfd_getfd / kcmp ───────────────────────────────────────────────
-
-/// `pidfd_getfd(pidfd, targetfd, flags)` — clone an fd out of the
-/// process referenced by `pidfd` into the caller's fd table. Since an
-/// `FdEntry` holds an `Arc<dyn FileOps>`, the clone shares the same open
-/// file description, exactly like Linux.
-fn sys_pidfd_getfd(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let pidfd = a.arg0 as u32;
-    let targetfd = a.arg1 as u32;
-    if a.arg2 != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let task = current_task_id();
-    let target_pid = match fd::with_table(task, |t| {
-        t.get(pidfd).and_then(|e| e.ops.pidfd_target_pid())
-    })
-    .flatten()
-    {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF (not a pidfd)
-            return;
-        }
-    };
-    let target_tid = if target_pid == task {
-        task
-    } else {
-        match pid_to_task_raw(target_pid) {
-            Some(t) => t,
-            None => {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
-                return;
-            }
-        }
-    };
-    let entry = fd::with_table(target_tid, |t| t.get(targetfd).cloned()).flatten();
-    let entry = match entry {
-        Some(e) => e,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
-            return;
-        }
-    };
-    match fd::with_table(task, |t| t.open(entry)) {
-        Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
-    }
-}
-
-/// `kcmp(pid1, pid2, type, idx1, idx2)` — compare whether two processes
-/// share a kernel resource. Returns 0 (equal), 1/2 (a kernel-pointer
-/// ordering), or a negative errno. NARF compares address-space identity
-/// for KCMP_VM and otherwise orders by task id.
-fn sys_kcmp(ctx: &mut dyn TrapContext) {
-    const KCMP_VM: u64 = 1;
-    const KCMP_TYPES: u64 = 8;
-    let a = *ctx.args();
-    let kind = a.arg2;
-    if kind >= KCMP_TYPES {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let me = current_task_id();
-    let resolve = |pid: u64| -> Option<u64> {
-        if pid == me {
-            Some(me)
-        } else {
-            pid_to_task_raw(pid)
-        }
-    };
-    let (t1, t2) = match (resolve(a.arg0), resolve(a.arg1)) {
-        (Some(x), Some(y)) => (x, y),
-        _ => {
-            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
-            return;
-        }
-    };
-    if t1 == t2 {
-        // The same task shares every resource with itself.
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    let result: u64 = if kind == KCMP_VM {
-        let a1 = narf_scheduler::address_space_of(narf_scheduler::TaskId(t1));
-        let a2 = narf_scheduler::address_space_of(narf_scheduler::TaskId(t2));
-        match (a1, a2) {
-            (Some(x), Some(y)) if Arc::ptr_eq(&x, &y) => 0,
-            _ => {
-                if t1 < t2 {
-                    1
-                } else {
-                    2
-                }
-            }
-        }
-    } else if t1 < t2 {
-        1
-    } else {
-        2
-    };
-    ctx.set_return(SyscallReturn::ok(result));
-}
-
-/// `pidfd_send_signal(pidfd, sig, info, flags)` — deliver `sig` to the
-/// process referenced by `pidfd` (resolved via the FileOps hook),
-/// reusing the same pending-signal queue as `kill(2)`.
-fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let pidfd = a.arg0 as u32;
-    let signum = a.arg1 as u32;
-    if signum > 64 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let task = current_task_id();
-    let pid = fd::with_table(task, |t| {
-        t.get(pidfd).and_then(|e| e.ops.pidfd_target_pid())
-    })
-    .flatten();
-    let pid = match pid {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
-            return;
-        }
-    };
-    // sig 0 is an existence/permission probe — don't queue anything.
-    if signum == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    // SIGNAL_PENDING is keyed by TaskId; translate pid → tid.
-    let mut target = pid;
-    if let Some(tid) = pid_to_task_raw(target) {
-        target = tid;
-    }
-    signal_stopcont_interaction(target, signum);
-    {
-        let mut g = SIGNAL_PENDING.lock();
-        match g.as_mut() {
-            Some(map) => *map.entry(target).or_insert(0) |= sig_bit(signum),
-            None => {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-                return;
-            }
-        }
-    }
-    wake_signal(target);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `openat2(dirfd, path, open_how*, size)` — openat with the
-/// extensible `open_how { u64 flags; u64 mode; u64 resolve; }` struct.
-/// Reads `flags` from the struct and routes through the openat/open
-/// path; `mode` and `resolve` are accepted but not enforced.
-fn sys_openat2(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let path_uptr = args.arg1;
-    let how_ptr = args.arg2;
-    let size = args.arg3 as usize;
-    let fail = SyscallReturn::ok(!0u64);
-    if how_ptr == 0 || size < 24 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    // SAFETY: `how_ptr` is the user `struct open_how*`; copy_from_user_vec
-    // range-validates the 24-byte read.
-    let how = match unsafe { copy_from_user_vec(how_ptr, 24) } {
-        Ok(b) => b,
-        Err(_) => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let flags = u64::from_ne_bytes(how[0..8].try_into().unwrap());
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let proxy_args = SyscallArgs {
-        arg0: path_uptr,
-        arg1: path_str.len() as u64,
-        arg2: 0,
-        arg3: 0,
-        arg4: flags,
-        arg5: 0,
-    };
-    let mut proxy = ReshapeArgs {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_open(&mut proxy);
-}
 
 /// Minimal `TrapContext` proxy that overrides the argument tuple and
 /// forwards everything else to the inner context (reshape-and-delegate
@@ -8982,74 +3448,6 @@ impl TrapContext for CaptureCtx<'_> {
 /// bytes on LP64 (msghdr is 56); msg_len sits at offset 56.
 const MMSGHDR_SZ: u64 = 64;
 const MMSGHDR_MSGLEN_OFF: u64 = 56;
-
-/// `sendmmsg(fd, mmsghdr*, vlen, flags)` — send up to `vlen` messages,
-/// writing each message's transmitted byte count into its `msg_len`.
-/// Stops at the first failing message; returns the count sent.
-fn sys_socket_sendmmsg(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let fd = a.arg0;
-    let mmsg_ptr = a.arg1;
-    let vlen = a.arg2 as usize;
-    let flags = a.arg3;
-    let mut sent = 0usize;
-    for i in 0..vlen {
-        let hdr_ptr = mmsg_ptr + (i as u64) * MMSGHDR_SZ;
-        let mut cap = CaptureCtx {
-            inner: ctx,
-            args: SyscallArgs {
-                arg0: fd,
-                arg1: hdr_ptr,
-                arg2: flags,
-                arg3: 0,
-                arg4: 0,
-                arg5: 0,
-            },
-            ret_value: 0,
-        };
-        sys_socket_sendmsg(&mut cap);
-        if (cap.ret_value as i64) < 0 {
-            break;
-        }
-        write_user_u32(hdr_ptr + MMSGHDR_MSGLEN_OFF, cap.ret_value as u32);
-        sent += 1;
-    }
-    ctx.set_return(SyscallReturn::ok(sent as u64));
-}
-
-/// `recvmmsg(fd, mmsghdr*, vlen, flags, timeout)` — receive up to
-/// `vlen` messages, writing each received length into its `msg_len`.
-/// Stops when a recv would block; returns the count received.
-fn sys_socket_recvmmsg(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let fd = a.arg0;
-    let mmsg_ptr = a.arg1;
-    let vlen = a.arg2 as usize;
-    let flags = a.arg3;
-    let mut recvd = 0usize;
-    for i in 0..vlen {
-        let hdr_ptr = mmsg_ptr + (i as u64) * MMSGHDR_SZ;
-        let mut cap = CaptureCtx {
-            inner: ctx,
-            args: SyscallArgs {
-                arg0: fd,
-                arg1: hdr_ptr,
-                arg2: flags,
-                arg3: 0,
-                arg4: 0,
-                arg5: 0,
-            },
-            ret_value: 0,
-        };
-        sys_socket_recvmsg(&mut cap);
-        if (cap.ret_value as i64) < 0 {
-            break; // would block — no more messages ready
-        }
-        write_user_u32(hdr_ptr + MMSGHDR_MSGLEN_OFF, cap.ret_value as u32);
-        recvd += 1;
-    }
-    ctx.set_return(SyscallReturn::ok(recvd as u64));
-}
 
 /// Shared core for `preadv(2)` / `pwritev(2)` — vectored I/O at an
 /// explicit offset that does NOT advance the fd's own offset.
@@ -9149,194 +3547,6 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool) {
     ctx.set_return(SyscallReturn::ok(total as u64));
 }
 
-/// `preadv(fd, iov, iovcnt, offset)` — positioned vectored read.
-fn sys_preadv(ctx: &mut dyn TrapContext) {
-    preadv_pwritev(ctx, false);
-}
-
-/// `pwritev(fd, iov, iovcnt, offset)` — positioned vectored write.
-fn sys_pwritev(ctx: &mut dyn TrapContext) {
-    preadv_pwritev(ctx, true);
-}
-
-/// `readv(fd, iov, iovcnt)` — vectored read at the current file offset,
-/// advancing it (the position-tracking counterpart to `writev`).
-fn sys_readv(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let iov_ptr = args.arg1;
-    let iovcnt = args.arg2 as usize;
-    const IOV_MAX: usize = 1024;
-    if iovcnt > IOV_MAX {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    // SAFETY: single-threaded syscall; AS active. Validates the iovec array.
-    let iov_buf = match unsafe { copy_from_user_vec(iov_ptr, iovcnt.saturating_mul(16)) } {
-        Ok(b) => b,
-        Err(e) => {
-            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-            return;
-        }
-    };
-    let task = current_task_id();
-    let mut total: usize = 0;
-    for i in 0..iovcnt {
-        let o = i * 16;
-        let base = u64::from_le_bytes(iov_buf[o..o + 8].try_into().unwrap_or([0; 8]));
-        let len = u64::from_le_bytes(iov_buf[o + 8..o + 16].try_into().unwrap_or([0; 8])) as usize;
-        if len == 0 {
-            continue;
-        }
-        let mut kbuf = alloc::vec![0u8; len];
-        let outcome = fd::with_table(task, |t| {
-            let entry = t.get_mut(fd).ok_or(())?;
-            let cur = entry.offset;
-            let res = poll_blocking(entry.ops.read(cur, &mut kbuf)).unwrap_or(Ok(0));
-            match res {
-                Ok(n) => {
-                    entry.offset = cur.saturating_add(n as u64);
-                    Ok(n)
-                }
-                Err(_) => Err(()),
-            }
-        });
-        match outcome {
-            Some(Ok(n)) => {
-                // SAFETY: `base` is the user iovec destination; copy_to_user
-                // validates the `n`-byte write.
-                let _ = unsafe { copy_to_user(base, &kbuf[..n]) };
-                total = total.saturating_add(n);
-                if n < len {
-                    break; // short read / EOF
-                }
-            }
-            _ => {
-                if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-                    return;
-                }
-                break;
-            }
-        }
-    }
-    ctx.set_return(SyscallReturn::ok(total as u64));
-}
-
-/// `preadv2(fd, iov, iovcnt, pos_l, pos_h, flags)` — positioned vectored
-/// read with a flags word. On LP64 `pos_h` is zero and the offset is
-/// `pos_l` (arg3), so the core matches `preadv`; the RWF_* flags (arg5)
-/// are accepted but not specially honoured.
-fn sys_preadv2(ctx: &mut dyn TrapContext) {
-    preadv_pwritev(ctx, false);
-}
-
-/// `pwritev2(fd, iov, iovcnt, pos_l, pos_h, flags)` — positioned vectored
-/// write with a flags word. See `sys_preadv2`.
-fn sys_pwritev2(ctx: &mut dyn TrapContext) {
-    preadv_pwritev(ctx, true);
-}
-
-/// `tee(fd_in, fd_out, len, flags)` — copy up to `len` bytes from one
-/// pipe to another WITHOUT consuming the input. `fd_in` must be a pipe
-/// read end (peekable); `fd_out` receives the duplicated bytes.
-fn sys_tee(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let fd_in = a.arg0 as u32;
-    let fd_out = a.arg1 as u32;
-    let len = a.arg2 as usize;
-    let task = current_task_id();
-    let peeked =
-        fd::with_table(task, |t| t.get(fd_in).and_then(|e| e.ops.pipe_peek(len))).flatten();
-    let data = match peeked {
-        Some(d) => d,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL (not a pipe read end)
-            return;
-        }
-    };
-    if data.is_empty() {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    let w = fd::with_table(task, |t| {
-        let entry = t.get_mut(fd_out).ok_or(())?;
-        poll_blocking(entry.ops.write(0, &data))
-            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
-            .map_err(|_| ())
-    });
-    match w {
-        Some(Ok(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
-    }
-}
-
-/// `vmsplice(fd, iov, nr_segs, flags)` — gather user memory described by
-/// `iov` into the pipe referenced by `fd` (the write-to-pipe direction,
-/// which is the common use). Flags (arg3) are accepted but unused.
-fn sys_vmsplice(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let fd = a.arg0 as u32;
-    let iov_ptr = a.arg1;
-    let nr = a.arg2 as usize;
-    const IOV_MAX: usize = 1024;
-    if nr > IOV_MAX {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    // SAFETY: single-threaded syscall; AS active. Validates the iovec array.
-    let iov_buf = match unsafe { copy_from_user_vec(iov_ptr, nr.saturating_mul(16)) } {
-        Ok(b) => b,
-        Err(e) => {
-            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-            return;
-        }
-    };
-    let task = current_task_id();
-    let mut total: usize = 0;
-    for i in 0..nr {
-        let o = i * 16;
-        let base = u64::from_le_bytes(iov_buf[o..o + 8].try_into().unwrap_or([0; 8]));
-        let len = u64::from_le_bytes(iov_buf[o + 8..o + 16].try_into().unwrap_or([0; 8])) as usize;
-        if len == 0 {
-            continue;
-        }
-        // SAFETY: `base` is a user VA; copy_from_user_vec validates it.
-        let kbuf = match unsafe { copy_from_user_vec(base, len) } {
-            Ok(b) => b,
-            Err(_) => {
-                if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-                    return;
-                }
-                break;
-            }
-        };
-        let w = fd::with_table(task, |t| {
-            let entry = t.get_mut(fd).ok_or(())?;
-            poll_blocking(entry.ops.write(0, &kbuf))
-                .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
-                .map_err(|_| ())
-        });
-        match w {
-            Some(Ok(n)) => {
-                total = total.saturating_add(n);
-                if n < len {
-                    break;
-                }
-            }
-            _ => {
-                if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-                    return;
-                }
-                break;
-            }
-        }
-    }
-    ctx.set_return(SyscallReturn::ok(total as u64));
-}
-
 // ── FB syscalls ────────────────────────────────────────────────────
 //
 // Five syscalls (Connect/Info/RingMap/FlushWait/Disconnect) form the
@@ -9406,150 +3616,6 @@ fn fb_vtable() -> Option<&'static FbSyscallVtable> {
     } else {
         // SAFETY: install_fb_syscall_vtable requires a 'static input.
         Some(unsafe { &*p })
-    }
-}
-
-fn sys_fb_connect(ctx: &mut dyn TrapContext) {
-    let scanout_id = ctx.args().arg0;
-    let v = match fb_vtable() {
-        Some(v) => v,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let pid = current_task_id();
-    let h = (v.connect)(pid, scanout_id);
-    if h == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-    } else {
-        // First active FB-handle takes ownership of the framebuffer
-        // away from the kernel-side FB console so kernel prints
-        // don't paint glyphs over the user's pixels. Last
-        // disconnect restores it. Serial / UART output is
-        // unaffected — Console::Writer fans out to the FB only
-        // through the optional hook this swaps.
-        fb_console_owner::on_connect();
-        ctx.set_return(SyscallReturn::ok(h));
-    }
-}
-
-fn sys_fb_info(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let handle = args.arg0;
-    let user_p = args.arg1;
-    let v = match fb_vtable() {
-        Some(v) => v,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let mut out = [0u32; 6];
-    if !(v.info)(handle, &mut out) {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // Write 6 u32s into the user pointer under the SMAP bracket.
-    if user_p == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // Serialise the 6 u32s into a 24-byte kernel buffer, then copy_to_user.
-    let mut kbuf = [0u8; 24];
-    for (i, &w) in out.iter().enumerate() {
-        kbuf[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
-    }
-    // SAFETY: `user_p` is the user info buffer (non-zero, checked above);
-    // copy_to_user range-validates it and SMAP-brackets the write of the 24-byte `kbuf`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(user_p, &kbuf) }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-fn sys_fb_ring_map(ctx: &mut dyn TrapContext) {
-    let handle = ctx.args().arg0;
-    let v = match fb_vtable() {
-        Some(v) => v,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let phys = (v.ring_map)(handle);
-    if phys == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let len = 4096u64;
-    let base = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
-    if as_ref
-        .map_region(Region {
-            base: VirtAddr::new(base),
-            len,
-            // SHARED: `phys` is the framebuffer subsystem's ring-buffer
-            // frame, owned externally and never allocated by this AS.
-            // Without SHARED the teardown paths would `free_frame` this
-            // borrowed frame on munmap/exit and return it to the buddy —
-            // the same double-free class as `sys_shmem_map`.
-            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
-            phys: alloc::vec![narf_memory::PhysAddr::new(phys)],
-        })
-        .is_err()
-    {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the region
-    // was just registered via `map_region`, so materialize installs only its PTEs.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { as_ref.materialize() }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(base));
-}
-
-fn sys_fb_flush_wait(ctx: &mut dyn TrapContext) {
-    let handle = ctx.args().arg0;
-    let v = match fb_vtable() {
-        Some(v) => v,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let drained = (v.flush_wait)(handle);
-    ctx.set_return(SyscallReturn::ok(drained));
-}
-
-fn sys_fb_disconnect(ctx: &mut dyn TrapContext) {
-    let handle = ctx.args().arg0;
-    let v = match fb_vtable() {
-        Some(v) => v,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    if (v.disconnect)(handle) {
-        // Pair with on_connect: when the last live handle goes
-        // away, restore the kernel FB console hook so subsequent
-        // kernel prints render to screen again.
-        fb_console_owner::on_disconnect();
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(SyscallReturn::invalid_op());
     }
 }
 
@@ -9638,118 +3704,6 @@ fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
     }
 }
 
-fn sys_shmem_create(ctx: &mut dyn TrapContext) {
-    let len = ctx.args().arg0;
-    let v = match shmem_vtable() {
-        Some(v) => v,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let pid = current_task_id();
-    let h = (v.create)(pid, len);
-    if h == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-    } else {
-        ctx.set_return(SyscallReturn::ok(h));
-    }
-}
-
-fn sys_shmem_map(ctx: &mut dyn TrapContext) {
-    let handle = ctx.args().arg0;
-    let v = match shmem_vtable() {
-        Some(v) => v,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    // Cross-pid auth: the calling task must own this region. The
-    // future cross-process sharing path adds an explicit grant /
-    // attach syscall; today, foreign maps are rejected outright.
-    let pid = current_task_id();
-    if (v.pid_of)(handle) != pid {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let len = (v.len_of)(handle);
-    if len == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let mut frames_raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    if !(v.frames)(handle, &mut frames_raw) {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = frames_raw
-        .into_iter()
-        .map(narf_memory::PhysAddr::new)
-        .collect();
-    let base = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
-    if as_ref
-        .map_region(Region {
-            base: VirtAddr::new(base),
-            len,
-            // SHARED is load-bearing, not advisory: `phys_list` is the
-            // shmem registry's persistent backing frames (allocated once
-            // by `narf_shmem::create`, owned by the registry for the
-            // segment's life — `destroy` never frees them). Without the
-            // SHARED flag the AS teardown paths (`unmap_region_pages` /
-            // `unmap_free_page` / `Drop` / `madvise_dontneed`, which all
-            // special-case SHARED) treat these BORROWED frames as
-            // AS-owned and `free_frame` them on munmap/exit — returning a
-            // live, registry-owned (and not COW-refcounted) frame to the
-            // buddy, which re-hands it out as a page-table page → the
-            // cross-AS "marginal-buddy" double-free. The SysV `sys_shmat`
-            // twin already sets SHARED for the identical frames.
-            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
-            phys: phys_list,
-        })
-        .is_err()
-    {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the region
-    // was just registered via `map_region`, so materialize installs only its PTEs.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { as_ref.materialize() }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(base));
-}
-
-fn sys_shmem_destroy(ctx: &mut dyn TrapContext) {
-    let handle = ctx.args().arg0;
-    let v = match shmem_vtable() {
-        Some(v) => v,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let pid = current_task_id();
-    if (v.pid_of)(handle) != pid {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    if (v.destroy)(handle) {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(SyscallReturn::invalid_op());
-    }
-}
-
 // ── FirmwareInstall — arg0=name_ptr, arg1=name_len,
 //                       arg2=bytes_ptr, arg3=bytes_len ──────────────
 //
@@ -9764,344 +3718,9 @@ fn sys_shmem_destroy(ctx: &mut dyn TrapContext) {
 // without `firmware-allow-unsigned` reject anything that isn't
 // signed by a trusted firmware signer).
 
-fn sys_firmware_install(ctx: &mut dyn TrapContext) {
-    // Privilege gate: pull the calling task's per-task firmware-
-    // registry authority cap. Tasks granted authority via
-    // `narf_firmware::grant_firmware_authority(pid)` hold a
-    // live `Cap<FirmwareRegistry, Write>` here; tasks without
-    // authority (or whose cap was revoked) see no entry and the
-    // syscall fails.
-    //
-    // The trailer signature check inside `firmware::sys_install`
-    // remains the second line of defense; this gate is the first.
-    let pid = current_task_id();
-    let auth = match narf_firmware::firmware_authority_of(pid) {
-        Some(c) => c,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-
-    let args = *ctx.args();
-    let name_ptr = args.arg0;
-    let name_len = args.arg1 as usize;
-    let bytes_ptr = args.arg2;
-    let bytes_len = args.arg3 as usize;
-    if name_len == 0 || bytes_len == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // Cap the staging size so a userspace task can't ask the
-    // kernel to copy gigabytes through the syscall path. 16 MiB
-    // is well above any real firmware blob (QCNFA765 AMSS is
-    // ~5 MiB) and below the limit that would force the registry
-    // into a multi-page IOMMU-backed allocation Stage-7 owns.
-    const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
-    if bytes_len > MAX_BLOB_BYTES {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // Copy name from user memory under SMAP bracket, then validate UTF-8.
-    // The copy_user_path helper handles null/canonical checks.
-    let name_str = match copy_user_path(name_ptr, name_len) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    // Leak the name into 'static memory. The registry stores it
-    // by reference; on hot-replace the prior 'static name string
-    // is dropped from the registry but stays leaked. Acceptable
-    // because firmware-install events are rare (vendor updates,
-    // not per-frame).
-    let leaked: &'static str = alloc::boxed::Box::leak(name_str.into_boxed_str());
-
-    // Copy firmware bytes from user memory into a kernel-owned Vec
-    // under the SMAP bracket before passing into sys_install.
-    let mut kbuf = alloc::vec![0u8; bytes_len];
-    // SAFETY: `bytes_ptr` is the user blob pointer; copy_from_user range-validates
-    // it and SMAP-brackets the read of `bytes_len` (<= MAX_BLOB_BYTES) bytes into `kbuf`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_from_user(&mut kbuf, bytes_ptr) }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // sys_install takes a raw pointer + len; feed it our kernel copy.
-    // SAFETY: `kbuf.as_ptr()`/`bytes_len` describe the kernel-owned Vec just filled
-    // above, valid and readable for `bytes_len` bytes for the duration of the call.
-    // SAFETY: Valid memory or trusted environment
-    let r = unsafe { narf_firmware::sys_install(leaked, kbuf.as_ptr(), bytes_len, &auth) };
-    match r {
-        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
-    }
-}
-
 // ── Munmap — arg0=base ─────────────────────────────────────────────
 
-fn sys_munmap(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let base = VirtAddr::new(args.arg0);
-    match as_ref.unmap_region(base) {
-        Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
-    }
-}
-
-/// `mprotect(base, len, prot)` — change permissions on every
-/// region in the calling task's AS that intersects `[base,
-/// base + len)`. Walks the region table, mutates `Region.perms`,
-/// then re-installs the affected pages' PTEs with the new flag
-/// set via `AddressSpace::change_perms_range`.
-///
-/// `prot` follows the POSIX bit layout we pin in `narf-libc`:
-///   - bit 0 = PROT_READ
-///   - bit 1 = PROT_WRITE
-///   - bit 2 = PROT_EXEC
-///
-/// Returns Ok(0) on success, InvalidOp on bad AS or no
-/// intersecting regions.
-/// `mlock(addr, len)` — force-back lazy pages + set LOCKED flag.
-/// arg0 = base, arg1 = len. Ok(0) on success, InvalidOp on
-/// failure (no region intersects, OOM, AS lookup failed).
-fn sys_mlock(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    match as_ref.mlock_range(VirtAddr::new(args.arg0), args.arg1) {
-        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
-    }
-}
-
-/// `munlock(addr, len)` — clear LOCKED flag (frames stay backed
-/// since no swap exists yet to reclaim them). arg0 = base,
-/// arg1 = len. Ok(0) on success, InvalidOp if no region
-/// intersects.
-fn sys_munlock(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    match as_ref.munlock_range(VirtAddr::new(args.arg0), args.arg1) {
-        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
-    }
-}
-
 // ── Batch 18: address-space-wide locking, secret memory, NUMA ────────
-
-/// `mlockall(flags)` — lock the whole address space. NARF force-backs a
-/// locked range; MCL_CURRENT pins every existing region. MCL_FUTURE /
-/// MCL_ONFAULT are accepted but not separately enforced (there is no
-/// lazy-eviction path to guard against).
-fn sys_mlockall(ctx: &mut dyn TrapContext) {
-    const MCL_CURRENT: u64 = 1;
-    const MCL_FUTURE: u64 = 2;
-    const MCL_ONFAULT: u64 = 4;
-    let flags = ctx.args().arg0;
-    if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    if flags & MCL_CURRENT != 0 {
-        for r in as_ref.regions_snapshot() {
-            let _ = as_ref.mlock_range(r.base, r.len);
-        }
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `munlockall()` — clear the LOCKED flag on every region.
-fn sys_munlockall(ctx: &mut dyn TrapContext) {
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    for r in as_ref.regions_snapshot() {
-        let _ = as_ref.munlock_range(r.base, r.len);
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `memfd_secret(flags)` — an anonymous fd-backed memory object. Linux
-/// also unmaps the pages from the kernel's direct map; NARF has no such
-/// map to hide them from, so it reuses the memfd backing. Only
-/// FD_CLOEXEC is honoured.
-fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
-    let flags = ctx.args().arg0 as u32;
-    let task = current_task_id();
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    #[cfg(feature = "linux-compat")]
-    {
-        let mfd = crate::linux_compat::MemFdFile::new(0);
-        memfd_arc_register(&mfd);
-        // FD_CLOEXEC shares MFD_CLOEXEC's bit value (1).
-        let cloexec = (flags & crate::linux_compat::MFD_CLOEXEC) != 0;
-        let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
-        let fd = fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
-                ops: mfd,
-                offset: 0,
-                flags: install_flags,
-                // memfd_secret(2), like memfd_create(2), returns an O_RDWR fd.
-                status_flags: crate::fd::O_RDWR,
-            })
-        });
-        match fd {
-            Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            None => ctx.set_return(fail),
-        }
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        let _ = flags;
-        let ops = narf_filesystem::new_anon_memfile();
-        match fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
-                ops,
-                offset: 0,
-                flags: 0,
-                // memfd_secret(2), like memfd_create(2), returns an O_RDWR fd.
-                status_flags: crate::fd::O_RDWR,
-            })
-        }) {
-            Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            None => ctx.set_return(fail),
-        }
-    }
-}
-
-/// `process_madvise(pidfd, iov, iovcnt, advice, flags)` — apply `advice`
-/// to ranges in a target process's address space. NARF supports the
-/// caller's own AS (the common self-advise use); a foreign AS returns
-/// EPERM. Returns the number of bytes advised.
-fn sys_process_madvise(ctx: &mut dyn TrapContext) {
-    const MADV_DONTNEED: i32 = 4;
-    const MADV_FREE: i32 = 8;
-    let a = *ctx.args();
-    let pidfd = a.arg0 as u32;
-    let iovcnt = a.arg2 as usize;
-    let advice = a.arg3 as i32;
-    if iovcnt > 1024 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let task = current_task_id();
-    let target_pid = match fd::with_table(task, |t| {
-        t.get(pidfd).and_then(|e| e.ops.pidfd_target_pid())
-    })
-    .flatten()
-    {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
-            return;
-        }
-    };
-    // The pidfd was opened on getpid() = the VISIBLE ProcessId, so a self
-    // pidfd's target_pid is the visible pid, not the raw TaskId — accept either
-    // as "self" (otherwise a self-directed process_madvise wrongly EPERMs, seen
-    // as mem2_smoke `mem2-fail: process_madvise`).
-    let self_pid = task_to_pid_raw(task).unwrap_or(task);
-    if target_pid != task && target_pid != self_pid {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM (foreign AS)
-        return;
-    }
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let iov = match read_iovecs(a.arg1, iovcnt) {
-        Some(v) => v,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-            return;
-        }
-    };
-    let mut total: u64 = 0;
-    for (base, len) in iov {
-        if advice == MADV_DONTNEED || advice == MADV_FREE {
-            let _ = as_ref.madvise_dontneed(VirtAddr::new(base), len);
-        }
-        total = total.saturating_add(len);
-    }
-    ctx.set_return(SyscallReturn::ok(total));
-}
-
-/// `move_pages(pid, count, pages, nodes, status, flags)` — query or move
-/// pages across NUMA nodes. NARF places everything on node 0, so a status
-/// query (or a move) reports node 0 for every page.
-fn sys_move_pages(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let count = a.arg1 as usize;
-    let status_ptr = a.arg4;
-    if count > (1 << 20) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    if status_ptr != 0 && count != 0 {
-        // i32 zeros => node 0 for each page.
-        let zeros = alloc::vec![0u8; count * 4];
-        // SAFETY: status_ptr is the user int[count] out-array; copy_to_user
-        // range-validates the write.
-        if unsafe { copy_to_user(status_ptr, &zeros) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-            return;
-        }
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `set_mempolicy_home_node(addr, len, home_node, flags)` — set a range's
-/// home NUMA node. Accepted (no per-range home binding yet); flags must
-/// be 0.
-fn sys_set_mempolicy_home_node(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    if a.arg3 != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `migrate_pages(pid, maxnode, old_nodes, new_nodes)` — migrate a
-/// process's pages between node sets. NARF is effectively single-node for
-/// placement, so this is a no-op: 0 pages could not be migrated.
-fn sys_migrate_pages(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(0));
-}
 
 /// Shared core for `mprotect(2)` and `pkey_mprotect(2)`: translate the
 /// POSIX `prot` bits to `RegionPerms` and apply them to `[base, base+len)`.
@@ -10137,71 +3756,6 @@ fn mprotect_core(
     #[cfg(not(feature = "linux-compat"))]
     {
         as_ref.change_perms_range(base, len, perms).map_err(|_| ())
-    }
-}
-
-fn sys_mprotect(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let base = VirtAddr::new(args.arg0);
-    match mprotect_core(&as_ref, base, args.arg1, args.arg2 as u32) {
-        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(()) => ctx.set_return(SyscallReturn::invalid_op()),
-    }
-}
-
-/// `madvise(addr, len, advice)` — Linux syscall 28. The kernel honours
-/// MADV_DONTNEED (4) and MADV_FREE (8) as "release backing frames; next
-/// access reads zero." Every other advice value returns Ok(0) — `madvise`
-/// is a hint, not a contract, so silently accepting unknown advice values
-/// matches Linux's behaviour for callers that probe by value.
-///
-/// `arg0` = base, `arg1` = len, `arg2` = advice.
-///
-/// Returns `Ok(0)` on success or no-op-advice; `InvalidOp` if no region
-/// intersects the range (Linux returns ENOMEM in that case — libc maps
-/// our InvalidOp to ENOMEM).
-#[cfg(feature = "linux-compat")]
-fn sys_madvise(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let base = VirtAddr::new(args.arg0);
-    let len = args.arg1;
-    let advice = args.arg2 as i32;
-
-    // MADV_DONTNEED (4) and MADV_FREE (8) — Linux's two "release this
-    // memory" hints. NARF collapses them to the same shape because we
-    // don't have a swap / page-aging path to differentiate the
-    // eager-release (DONTNEED) from lazy-reclaim (FREE) semantics; both
-    // end up with "next access reads zero", which is what callers need.
-    const MADV_DONTNEED: i32 = 4;
-    const MADV_FREE: i32 = 8;
-
-    match advice {
-        MADV_DONTNEED | MADV_FREE => match as_ref.madvise_dontneed(base, len) {
-            Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
-        },
-        // Other advice values (MADV_NORMAL, MADV_RANDOM, MADV_WILLNEED,
-        // MADV_SEQUENTIAL, MADV_HUGEPAGE, MADV_NOHUGEPAGE, MADV_DONTFORK,
-        // MADV_DOFORK, MADV_REMOVE, MADV_DONTDUMP, MADV_DODUMP, …) —
-        // accept and ignore. `madvise` is a hint; the contract is that
-        // the kernel does its best and the program runs correctly either
-        // way. Returning success here matches Linux's behaviour for
-        // architectures that don't implement a given advice.
-        _ => ctx.set_return(SyscallReturn::ok(0)),
     }
 }
 
@@ -10346,72 +3900,6 @@ pub(crate) fn zap_thread_group(tid: u64, pid: u64) {
     }
 }
 
-fn sys_exit_group(ctx: &mut dyn TrapContext) {
-    let tid = current_task_id();
-    let pid = task_to_pid_raw(tid).unwrap_or(tid);
-    zap_thread_group(tid, pid);
-    sys_exit_task(ctx);
-}
-
-fn sys_exit_task(ctx: &mut dyn TrapContext) {
-    let exit_code = ctx.args().arg0 as u32;
-    let wstatus = (exit_code & 0xff) << 8;
-    let tid = current_task_id();
-    let pid = task_to_pid_raw(tid).unwrap_or(tid);
-    stage_pending_termination(pid, wstatus as i32);
-    // Robust-futex owner-died walk — in-task context, before teardown
-    // (see terminate_current_task).
-    robust_list_exit_walk(tid);
-    // wait4 rusage snapshot — must run here, while OUR address space is
-    // still the active one (see EXIT_RUSAGE).
-    record_exit_rusage(tid, pid);
-
-    // Polling-future path: if a UserTaskCtx is installed AND an
-    // exit hook is registered, save the user state, mark the
-    // reason, and tail-call the hook — which longjmps back into
-    // the polling routine.
-    if let (Some(uctx), Some(hook)) = (
-        crate::user_task::current_user_task(),
-        crate::user_task::exit_hook(),
-    ) {
-        // SAFETY: uctx is valid for as long as the polling routine
-        // (its caller, on the same CPU) holds it pinned. We're
-        // about to never return.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            let uc = &*uctx;
-            ctx.save_user_state(uc.state.get() as *mut u8);
-            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_EXITED;
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                // own-stack: the poll's EXIT_REASON_EXITED trap-back half is
-                // dead — run its exit bookkeeping here before diverging: flip
-                // the refcounted task to ZOMBIE (resolvable until reaped) and
-                // fan out exit observers (`on_child_exit` drains wstatus +
-                // WAKES a wait4-parked parent — without it the parent hangs
-                // forever).
-                crate::task::mark_zombie(tid);
-                crate::user_task::notify_task_exited(pid, tid);
-                narf_scheduler::stackful::exit_current_stackful();
-            }
-            hook(uctx);
-        }
-        // unreachable
-    }
-
-    // Legacy redirect-to-landing path (testbin runner uses this).
-    let rip = EXIT_LANDING_RIP.load(Ordering::Acquire);
-    let rsp = EXIT_LANDING_RSP.load(Ordering::Acquire);
-    if rip == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    if !ctx.redirect_to_kernel(rip, rsp) {
-        // Arch doesn't support redirect; best we can do is mark Ok.
-        ctx.set_return(SyscallReturn::ok(0));
-    }
-    // Redirect succeeded → frame rewritten, `iretq` lands in kernel.
-}
-
 fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32) -> bool {
     let task = current_task_id();
     let pending = {
@@ -10431,40 +3919,6 @@ fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32)
 }
 
 // ── Yield — cooperative scheduler hand-back ────────────────────────
-
-fn sys_yield(ctx: &mut dyn TrapContext) {
-    if maybe_deliver_signal_before_yield(ctx, Syscall::Yield.raw()) {
-        return;
-    }
-
-    // Polling-future path mirroring sys_exit_task.
-    if let (Some(uctx), Some(hook)) = (
-        crate::user_task::current_user_task(),
-        crate::user_task::yield_hook(),
-    ) {
-        // SAFETY: same contract as sys_exit_task's hook path.
-        unsafe {
-            let uc = &*uctx;
-            ctx.save_user_state(uc.state.get() as *mut u8);
-            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                own_stack_block(ctx);
-                return;
-            }
-            hook(uctx);
-        }
-        // unreachable
-    }
-
-    // No polling executor wired yet — but a user task that yields
-    // is asking for "let other work run." Drive the same pumps
-    // sys_sleep does so the FB drain (and any other registered
-    // background work) makes progress on yields. Without this, a
-    // user-mode busy-wait pattern (e.g., retry-on-RingFull) spins
-    // forever because nothing else runs.
-    sleep_pumps::run();
-    ctx.set_return(SyscallReturn::ok(0));
-}
 
 // ── restart_syscall — kernel-injected syscall continuation ─────────
 //
@@ -10496,55 +3950,6 @@ fn sys_yield(ctx: &mut dyn TrapContext) {
 // (so a libc that emits it, or a trace replay, sees the canonical
 // result) without inventing a restart-block subsystem that NARF's
 // RIP-rewind model does not need.
-fn sys_restart_syscall(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
-}
-
-fn sys_pause(ctx: &mut dyn TrapContext) {
-    if maybe_deliver_signal_before_yield(ctx, Syscall::Pause.raw()) {
-        return;
-    }
-
-    if let (Some(uctx), Some(hook)) = (
-        crate::user_task::current_user_task(),
-        crate::user_task::yield_hook(),
-    ) {
-        // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
-        // we hold the only reference while storing the deadline and saving CPU state
-        // into `uc.state`, and the yield hook hands the task to the executor.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            let uc = &*uctx;
-            // Block forever by setting deadline to u64::MAX.
-            // Any signal delivery will wake the task via wake_signal().
-            // Bake EINTR into the saved frame so that when the poll loop
-            // breaks the park on a pending signal and re-enters user mode,
-            // pause(2) returns -EINTR; the next pause re-issue delivers it.
-            ctx.set_return(SyscallReturn::ok((-4i64) as u64));
-            uc.sleep_deadline_ns
-                .store(u64::MAX, core::sync::atomic::Ordering::Release);
-            ctx.save_user_state(uc.state.get() as *mut u8);
-            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                own_stack_block(ctx);
-                return;
-            }
-            hook(uctx);
-        }
-        // unreachable
-    }
-
-    // Fallback: no polling executor is wired (kernel-test contexts),
-    // so there is nothing to park on. Pump any ready async work once
-    // in case a signal is about to become deliverable, retry delivery,
-    // then surface EINTR rather than spinning forever — a real task
-    // always takes the yield-hook path above and never reaches here.
-    narf_scheduler::sleep_pumps::run();
-    if maybe_deliver_signal_before_yield(ctx, Syscall::Pause.raw()) {
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-}
 
 // ── RingKick — drain the shared SQ, post completions to the CQ ────
 //
@@ -10552,141 +3957,7 @@ fn sys_pause(ctx: &mut dyn TrapContext) {
 // User code submits + calls `RingKick` + spins on the CQ until the
 // real wake side-channel lands.
 
-fn sys_ring_kick(ctx: &mut dyn TrapContext) {
-    use narf_abi::{FileOpArgs, FileOpKind, NarfStatus, OpCode, SharedConsumer, SharedProducer};
-
-    type SqRing = SharedRing<Submission, BOOTSTRAP_SHARED_RING_DEPTH>;
-    type CqRing = SharedRing<Completion, BOOTSTRAP_SHARED_RING_DEPTH>;
-
-    let task = current_task_id();
-    let pair = match shared_rings_for(task) {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-
-    // SAFETY: per-task BOOTSTRAP_TABLE owns the phys backings; only
-    // one ring-kick can run at a time per task because it executes
-    // synchronously inside this task's syscall trap.
-    // SAFETY: Valid memory or trusted environment
-    let mut sq = unsafe {
-        SharedConsumer::<Submission, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
-            pair.sq_phys.raw() as *mut SqRing
-        )
-    };
-    // SAFETY: `pair.cq_phys` is the CQ frame this task owns in BOOTSTRAP_TABLE,
-    // initialized as a CqRing by `mint_shared_ring_pair`; identity-mapped and
-    // accessed only from this synchronous trap, so the producer has exclusive use.
-    // SAFETY: Valid memory or trusted environment
-    let mut cq = unsafe {
-        SharedProducer::<Completion, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
-            pair.cq_phys.raw() as *mut CqRing
-        )
-    };
-
-    let mut processed: u64 = 0;
-    while let Ok(sub) = sq.try_recv() {
-        let tag = sub.tag();
-        let completion = match sub.op {
-            OpCode::Noop => Completion::ok(tag),
-            OpCode::OpenFile
-            | OpCode::Read
-            | OpCode::Write
-            | OpCode::Close
-            | OpCode::Mmap
-            | OpCode::Munmap => {
-                let kind = match sub.op {
-                    OpCode::OpenFile => FileOpKind::Open,
-                    OpCode::Read => FileOpKind::Read,
-                    OpCode::Write => FileOpKind::Write,
-                    OpCode::Close => FileOpKind::Close,
-                    OpCode::Mmap => FileOpKind::Mmap,
-                    OpCode::Munmap => FileOpKind::Munmap,
-                    _ => unreachable!(),
-                };
-                let args = FileOpArgs {
-                    a0: sub.inline[0],
-                    a1: sub.inline[1],
-                    a2: sub.inline[2],
-                    a3: sub.inline[3],
-                    a4: sub.inline[4],
-                    a5: sub.inline[5],
-                };
-                let r = abi_file_op_bridge(kind, &args, &narf_abi::CancelCtx::detached());
-                let status = if r.status == 0 {
-                    NarfStatus::Ok
-                } else {
-                    NarfStatus::InvalidOp
-                };
-                let mut result = [0u64; 6];
-                result[0] = r.value;
-                Completion::with(tag, status, result)
-            }
-            _ => Completion::with(tag, NarfStatus::InvalidOp, [0; 6]),
-        };
-        let _ = cq.try_send(completion);
-        processed = processed.saturating_add(1);
-    }
-
-    ctx.set_return(SyscallReturn::ok(processed));
-}
-
 // ── GetPid / GetPpid — POSIX-shaped task-id surface ────────────────
-
-fn sys_getpid(ctx: &mut dyn TrapContext) {
-    let task = current_task_id();
-    #[cfg(feature = "container")]
-    {
-        // Wave-67 — translate the outer pid through whichever PID
-        // namespace the task belongs to. Root-namespace tasks fall
-        // through to the legacy outer == inner path.
-        let outer = task_to_pid_raw(task).unwrap_or(task);
-        let inner = crate::pid_ns::self_inner_pid(task, outer);
-        ctx.set_return(SyscallReturn::ok(inner));
-    }
-    // Non-container: return the VISIBLE ProcessId, NOT the raw scheduler
-    // TaskId. fork()'s return value + waitpid() both speak ProcessId and POSIX
-    // requires getpid() to agree (a forked child's getpid() must equal the pid
-    // its parent holds). The pgid/sid/tty boundary helpers translate to/from
-    // this same visible-pid space. Identity fallback for tasks with no
-    // registered pid (early init / kernel-spawned).
-    #[cfg(not(feature = "container"))]
-    ctx.set_return(SyscallReturn::ok(task_to_pid_raw(task).unwrap_or(task)));
-}
-
-fn sys_getppid(ctx: &mut dyn TrapContext) {
-    let me = current_task_id();
-    // `parent_of` is keyed by the child's VISIBLE pid (ProcessId), which a
-    // process fork mints separately from the TaskId (`alloc_pid()` vs the
-    // scheduler's TaskId — see `sys_clone`/`sys_fork`, which both
-    // `parent_of_set(child_visible_pid, ...)`). Looking up by the raw TaskId
-    // missed every forked child, so getppid() returned 0. Translate
-    // TaskId → visible pid first (identity when no mapping exists), the same
-    // way `sys_getpid` resolves the visible pid.
-    let me_pid = task_to_pid_raw(me).unwrap_or(me);
-    // `parent_of` stores the parent's TaskId (current_task_id() at fork);
-    // translate it to the parent's VISIBLE pid so getppid() agrees with the
-    // parent's own getpid() (identity when unregistered).
-    let parent_task = parent_of_get(me_pid).unwrap_or(0);
-    let ppid = if parent_task == 0 {
-        0
-    } else {
-        task_to_pid_raw(parent_task).unwrap_or(parent_task)
-    };
-    ctx.set_return(SyscallReturn::ok(ppid));
-}
-
-fn sys_gettid(ctx: &mut dyn TrapContext) {
-    // Returns the scheduler's TaskId for the currently-polling
-    // task. With `sys_clone` wired (Syscall::Clone = 56), threads
-    // in the same address space observe distinct tids here even
-    // though they share `getpid` (when process-group bookkeeping
-    // lands; today gettid==getpid since both go through the same
-    // task_id_lookup, but `clone` already produces distinct tids).
-    ctx.set_return(SyscallReturn::ok(current_task_id()));
-}
 
 // ── clone3(2) + set_tid_address — pthread bring-up surface ─────────
 //
@@ -10977,98 +4248,6 @@ struct CloneArgs {
 #[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_ARGS_MIN: usize = core::mem::size_of::<CloneArgs>();
-
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-fn sys_clone3(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let uargs = args.arg0;
-    let size = args.arg1 as usize;
-    #[cfg(feature = "syscall-trace")]
-    narf_console::write_str(&alloc::format!(
-        "[CLONE3 uargs={:#x} size={}]\n",
-        uargs,
-        size
-    ));
-    if uargs == 0 || size < 8 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-
-    // Copy in just what we honour. Larger user structs (Linux has
-    // grown the struct several times) are read as a prefix; smaller
-    // ones (unlikely — the minimum Linux ever shipped was 64 bytes)
-    // would be rejected above on the 8-byte floor.
-    let copy_len = core::cmp::min(size, CLONE_ARGS_MIN);
-    let mut raw = [0u8; CLONE_ARGS_MIN];
-    // SAFETY: `uargs` is the user clone_args pointer (non-zero, checked above);
-    // copy_from_user range-validates it and SMAP-brackets the read of `copy_len`
-    // (<= CLONE_ARGS_MIN) bytes into the `raw` prefix.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_from_user(&mut raw[..copy_len], uargs) }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // SAFETY: `CloneArgs` is `#[repr(C)]` of u64s; any bit pattern
-    // is a valid `CloneArgs`. `raw` has the same size + alignment
-    // (u8 array can be transmuted to a struct-of-u64 because we
-    // only read it).
-    // SAFETY: Valid memory or trusted environment
-    let ca: CloneArgs = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const CloneArgs) };
-    #[cfg(feature = "syscall-trace")]
-    narf_console::write_str(&alloc::format!(
-        "[CLONE3 flags={:#x} pidfd_ptr={:#x} cgroup_fd={} stack={:#x}+{:#x}]\n",
-        ca.flags,
-        ca.pidfd,
-        ca.cgroup,
-        ca.stack,
-        ca.stack_size
-    ));
-    do_clone3(ctx, ca);
-}
-
-/// Linux `clone(2)` — same semantics as `clone3(2)` but the
-/// arguments are passed in registers (x86_64 syscall ABI:
-/// flags, stack-TOP, ptid, tls, ctid) instead of via a
-/// `clone_args` user struct. musl's `__clone` x86_64 asm wrapper
-/// uses this entry, including for `pthread_create`. The
-/// passed-in `stack` is the **top** of the new thread's stack;
-/// `clone3` instead takes a `(base, size)` pair. We synthesize a
-/// `CloneArgs` with `stack_size = 0` so `do_clone3`'s
-/// `rsp = stack + stack_size` arithmetic recovers the original
-/// top.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-fn sys_clone(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let ca = CloneArgs {
-        flags: args.arg0,
-        stack: args.arg1,
-        // Linux's clone() takes the stack TOP directly; encode as
-        // (top, size=0) so `rsp = stack + stack_size` lands at the
-        // top, matching the clone3 path.
-        stack_size: 0,
-        parent_tid: args.arg2,
-        // x86_64 clone(2) syscall ABI: arg3 = ctid, arg4 = tls.
-        // (Only x86_32 — CONFIG_CLONE_BACKWARDS — flips these.)
-        // musl's `__clone` x86_64 asm matches the default order:
-        //     mov %r9, %r8        ; tls  -> syscall arg4 (r8)
-        //     mov 8(%rsp), %r10   ; ctid -> syscall arg3 (r10)
-        // We previously had these swapped (tls=arg3, ctid=arg4),
-        // which made `pthread_create` set the child's FS_BASE to
-        // `&__thread_list_lock` (in libc.so .bss, where ctid
-        // pointed) instead of the real per-thread TP. The worker
-        // then #PFed on `mov %fs:0,%rbx; movzbl 0x40(%rbx),%r11d`
-        // because `%fs:0` read the lock word (`0x10`-ish), not
-        // the self-pointer the TCB layout promises.
-        tls: args.arg4,
-        child_tid: args.arg3,
-        pidfd: 0,
-        exit_signal: 0,
-        set_tid: 0,
-        set_tid_size: 0,
-        cgroup: 0,
-    };
-    do_clone3(ctx, ca);
-}
 
 // ── CLONE_VFORK: parent suspended until the child execs or exits ──────
 //
@@ -11653,33 +4832,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     }
 }
 
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
-fn sys_clone3(ctx: &mut dyn TrapContext) {
-    // aarch64 / other arches: depends on x86_64-only user_task
-    // pipeline. Will land alongside the EL0 user-task bring-up.
-    ctx.set_return(SyscallReturn::invalid_op());
-}
-
-/// Linux `clone(2)` — same semantics as `clone3(2)` but the
-/// arguments are passed in registers. Falls back to InvalidOp
-/// on non-x86_64 / non-linux-compat builds.
-#[cfg(any(not(feature = "linux-compat"), not(target_arch = "x86_64")))]
-fn sys_clone(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::invalid_op());
-}
-
-#[cfg(feature = "linux-compat")]
-fn sys_set_tid_address(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let tidptr = args.arg0;
-    let me = current_task_id();
-    // Per Linux: set_tid_address records the pointer regardless
-    // of value; passing 0 effectively disables clear_child_tid.
-    set_clear_child_tid(me, tidptr);
-    // Return the caller's TID.
-    ctx.set_return(SyscallReturn::ok(me));
-}
-
 // ── arch_prctl(2) — x86_64 thread-pointer install ──────────────────
 //
 // musl's `__init_libc` calls `arch_prctl(ARCH_SET_FS, tls_self_ptr)`
@@ -11699,95 +4851,6 @@ fn sys_set_tid_address(ctx: &mut dyn TrapContext) {
 // FS_BASE clobbered. For a short-lived binary (hello_musl) this
 // isn't observable; a longer-running one needs a per-task slot the
 // poll path consults — wired alongside thread support.
-
-#[cfg(target_arch = "x86_64")]
-fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
-    const ARCH_SET_GS: u64 = 0x1001;
-    const ARCH_SET_FS: u64 = 0x1002;
-    const ARCH_GET_FS: u64 = 0x1003;
-    const ARCH_GET_GS: u64 = 0x1004;
-    const EINVAL: i64 = 22;
-    const EFAULT: i64 = 14;
-
-    let args = *ctx.args();
-    let code = args.arg0;
-    let addr = args.arg1;
-
-    match code {
-        ARCH_SET_FS => {
-            // SAFETY: `addr` is treated as an opaque u64 the user
-            // owns — the MSR write is unconditional at CPL=0 and
-            // any canonical-vaddr invariant is the user task's
-            // responsibility (Linux behaves the same way).
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                narf_scheduler::set_user_fs_base(addr);
-            }
-            // Publish to the own-stack kernel_switch resume slot too: a
-            // park/preempt resumes WITHOUT re-running `UserTaskFuture::poll`, so
-            // `poll_to_yield` reloads FS_BASE from the per-task slot — it must
-            // reflect this arch_prctl, else the next resume reverts to the stale
-            // published value and the task's TLS reads fault.
-            #[cfg(target_arch = "x86_64")]
-            narf_scheduler::stackful::set_current_user_fs_base(addr);
-            // Publish to the polling-future override so a
-            // subsequent timer-driven re-poll restores THIS
-            // FS_BASE, not the load-time synthetic-TLS value
-            // from `process.fs_base`.
-            if let Some(uctx) = crate::user_task::current_user_task() {
-                // SAFETY: pending_fs_base is an AtomicU64 owned by
-                // the live UserTaskCtx pinned for the duration of
-                // this syscall.
-                // SAFETY: Valid memory or trusted environment
-                unsafe {
-                    (*uctx)
-                        .pending_fs_base
-                        .store(addr, core::sync::atomic::Ordering::Release);
-                }
-            }
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        ARCH_GET_FS => {
-            // Read the live FS_BASE, copy it as a u64 to `addr`.
-            let fs_base: u64;
-            // SAFETY: `rdmsr` reads MSR `ecx`=IA32_FS_BASE into edx:eax; the MSR is
-            // architectural and readable at CPL0. Operands name the ABI registers and
-            // the instruction has no memory side effects.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                use core::arch::asm;
-                let lo: u32;
-                let hi: u32;
-                const IA32_FS_BASE: u32 = 0xC000_0100;
-                asm!(
-                    "rdmsr",
-                    in("ecx") IA32_FS_BASE,
-                    out("eax") lo,
-                    out("edx") hi,
-                    options(nostack, preserves_flags),
-                );
-                fs_base = (lo as u64) | ((hi as u64) << 32);
-            }
-            let buf = fs_base.to_le_bytes();
-            // SAFETY: `addr` is the user-supplied destination; copy_to_user
-            // range-validates it and SMAP-brackets the 8-byte write of `buf`.
-            // SAFETY: Valid memory or trusted environment
-            if unsafe { copy_to_user(addr, &buf) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-                return;
-            }
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        ARCH_SET_GS | ARCH_GET_GS => {
-            // Not yet wired; GS is reserved for the kernel
-            // per-CPU pointer via swapgs.
-            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-        }
-        _ => {
-            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-        }
-    }
-}
 
 // ── fork(2) — duplicate-process counterpart to sys_clone ───────────
 //
@@ -11815,225 +4878,6 @@ fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
 // `remap_page` to allocate a private frame, memcpy the bytes,
 // and restore WRITE on the faulting AS. Large brk heaps no
 // longer pay an up-front memcpy at fork time.
-
-fn sys_fork(ctx: &mut dyn TrapContext) {
-    let parent_as = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-
-    // Fork-bomb guard: refuse before the COW copy when we're at the live
-    // user-task cap. POSIX: fork(2) returns EAGAIN when RLIMIT_NPROC would be
-    // exceeded. Without this an uncapped fork loop floods the per-CPU ready
-    // queues + kernel heap (and, under SMP, every core + the shootdown path).
-    if !narf_scheduler::user_nproc_available() {
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
-        return;
-    }
-
-    // SAFETY: clone_for_fork's contract — paging is live; the
-    // frame allocator was initialised at boot.
-    // SAFETY: Valid memory or trusted environment
-    let child_as = match unsafe { parent_as.clone_for_fork() } {
-        Ok(a) => a,
-        Err(_) => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    // SAFETY: child AS just constructed; no concurrent writers.
-    if unsafe { child_as.materialize() }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // Re-materialise the parent's PTEs. `clone_for_fork` stripped
-    // WRITE from every region's metadata but the parent's live page
-    // tables still carry the old WRITE-set PTEs. Without this, the
-    // parent continues writing to the shared physical frames without
-    // triggering a COW fault, silently corrupting the child's copy.
-    // SMP note: this only invlpg's the local CPU, but every user-task
-    // resume reloads CR3 via `activate()` (flushing the non-global
-    // user TLB), so a migrated parent re-derives RO PTEs and faults
-    // into COW correctly on its next write.
-    // SAFETY: identity map live; root valid; may be called while
-    // the parent AS is the active CR3 — invlpg per page keeps the
-    // TLB coherent.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { parent_as.as_ref().rematerialize() }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let child_as = alloc::sync::Arc::new(child_as);
-
-    // Snapshot the parent's trap frame BEFORE we set the parent's
-    // own return value below. The snapshot captures the syscall-
-    // return register (rax on x86_64, x0+x1 on aarch64) holding
-    // whatever the user code passed at trap entry; we mutate the
-    // child's copy to 0 so the child reads "0" from its resumed
-    // syscall — POSIX semantics.
-    //
-    // On x86_64 the `int 0x80` trap path's save_user_state writes
-    // a fully-populated UserState; the child's first poll calls
-    // `enter_user_mode_resume` and lands at the parent's
-    // post-syscall RIP. On aarch64 save_user_state populates the
-    // analogous UserState (PC = ELR_EL1, SP = SP_EL0, x[0..=30] +
-    // SPSR), but `UserTaskFuture::resume_with` on aarch64 is
-    // currently a no-op pending the EL0 polling pipeline — the
-    // saved state is captured for forward-compat but not yet
-    // restored. Test contexts whose synthetic TrapContext can't
-    // save user state (the trait default returns false) fall back
-    // to `UserTaskFuture::new` against the parent's load-time
-    // (entry, stack_top).
-    let child_state: Option<crate::user_task::UserState> = {
-        use core::mem::MaybeUninit;
-        let mut s = MaybeUninit::<crate::user_task::UserState>::zeroed();
-        // SAFETY: the destination is `size_of::<UserState>()` bytes
-        // of zeroed stack — the trait's contract.
-        // SAFETY: Valid memory or trusted environment
-        let ok = unsafe { ctx.save_user_state(s.as_mut_ptr() as *mut u8) };
-        if ok {
-            // SAFETY: save_user_state returned true → it wrote a
-            // valid UserState into `s`.
-            // SAFETY: Valid memory or trusted environment
-            let mut snap = unsafe { s.assume_init() };
-            // Rewrite the syscall-return register(s) for the
-            // child. Per-arch since UserState's field names
-            // differ.
-            #[cfg(target_arch = "x86_64")]
-            {
-                snap.rax = 0;
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                // aarch64 set_return writes value→x0, status→x1.
-                // Child sees SyscallReturn::ok(0) ⇒ x0=0, x1=0.
-                snap.x[0] = 0;
-                snap.x[1] = 0;
-            }
-            Some(snap)
-        } else {
-            None
-        }
-    };
-
-    let parent_pid = current_task_id();
-    let child_pid = crate::alloc_pid();
-    // Parent-of bookkeeping MUST be published BEFORE the child is spawned:
-    // `spawn_user_process*` makes the child immediately runnable, and under SMP
-    // it can begin executing on ANOTHER CPU before this handler finishes. A
-    // child that runs `ptrace(PTRACE_TRACEME)` in that window reads this same
-    // PARENT_OF map (`parent_of_get` in the TRACEME handler) — if the row is not
-    // yet present it returns EINVAL and registers no tracer, so the child's
-    // `raise(SIGSTOP)` degrades to a plain job-control stop that a PLAIN (non-
-    // WUNTRACED) waitpid never reaps → the tracer's wait hangs (the SMP
-    // strace_smoke flake). Publishing it here, before the spawn, closes the
-    // race (was previously set only after all the inheritance work below, well
-    // past the point the spawned child could already be running). Keyed by the
-    // child's ProcessId so `on_child_exit(child_pid)` can resolve the parent —
-    // `notify_task_exited` passes `this.process.pid.raw()` (ProcessId), so the
-    // key here must be ProcessId, not TaskId.
-    parent_of_set(child_pid.raw(), parent_pid);
-    let proc = crate::UserProcess {
-        pid: child_pid,
-        address_space: child_as.clone(),
-        // entry / stack_top are NOT consulted when we resume the
-        // child via UserTaskFuture::resume_with — the saved state
-        // carries the real (rip, rsp). They're left at zero
-        // sentinels so a subsequent `Initial`-path poll (e.g. on
-        // an arch without save_user_state) is obviously broken.
-        entry: crate::EntryPoint(narf_memory::VirtAddr::new(0)),
-        stack_top: narf_memory::VirtAddr::new(0),
-        fs_base: {
-            // SAFETY: `rdmsr` reads MSR `ecx`=IA32_FS_BASE into edx:eax; the MSR is
-            // architectural and readable at CPL0. Operands name the ABI registers and
-            // the instruction has no memory side effects.
-            #[cfg(target_arch = "x86_64")]
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                use core::arch::asm;
-                let lo: u32;
-                let hi: u32;
-                const IA32_FS_BASE: u32 = 0xC000_0100;
-                asm!(
-                    "rdmsr",
-                    in("ecx") IA32_FS_BASE,
-                    out("eax") lo,
-                    out("edx") hi,
-                    options(nostack, preserves_flags),
-                );
-                let v = (lo as u64) | ((hi as u64) << 32);
-                if v == 0 {
-                    None
-                } else {
-                    Some(v)
-                }
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            None
-        },
-        entry_arg: None,
-    };
-
-    let child_tid = match child_state {
-        Some(state) => crate::user_task::spawn_user_process_resume(
-            proc,
-            state,
-            narf_scheduler::TaskSpec::user_task(),
-        ),
-        // Fallback if save_user_state didn't fire (test contexts
-        // with synthetic TrapContexts whose stub returns false).
-        None => crate::user_task::spawn_user_process(proc, narf_scheduler::TaskSpec::user_task()),
-    };
-    // Record the explicit ProcessId ↔ TaskId binding.  Must happen
-    // before any code that crosses the ID-space boundary.
-    register_pid_task_mapping(child_pid.raw(), child_tid.raw());
-    // POSIX inheritance — fd / cwd / brk / sigaction handlers are
-    // copied; pending signals reset (handled by sigaction_fork
-    // not touching the pending bitmap).
-    crate::fd::fork(parent_pid, child_tid.raw());
-    cwd_fork(parent_pid, child_tid.raw());
-    // chroot inheritance (see do_clone3) — child inherits the parent's root.
-    #[cfg(feature = "linux-compat")]
-    root_dir_fork(parent_pid, child_tid.raw());
-    uidgid_fork(parent_pid, child_tid.raw());
-    brk_fork(parent_pid, child_tid.raw());
-    sigaction_fork(parent_pid, child_tid.raw());
-    signal_mask_fork(parent_pid, child_tid.raw());
-    // POSIX: inherit the parent's process group, session, and controlling
-    // terminal. pgid inheritance keeps a forked foreground job in the
-    // terminal's foreground pgrp (no spurious SIGTTIN on its first read).
-    pgid_fork(parent_pid, child_tid.raw());
-    sid_fork(parent_pid, child_tid.raw());
-    #[cfg(feature = "linux-compat")]
-    ctty_fork(parent_pid, child_tid.raw());
-    // Wave-67 — propagate the parent's PID + mount namespaces into
-    // the child. Tasks in the root namespace skip the rebind (no
-    // translation needed) but inherit_into_child returns None
-    // silently in that case.
-    #[cfg(feature = "container")]
-    {
-        let _ = crate::pid_ns::inherit_into_child(parent_pid, child_pid.raw());
-        mount_ns_inherit(parent_pid, child_tid.raw());
-        // UTS / NET / IPC / User namespaces share the parent's Arc.
-        crate::namespaces::inherit_into_child(parent_pid, child_tid.raw());
-    }
-    // A forked child joins its parent's cgroup. Keyed by ProcessId
-    // (cgroup membership is per-process in v2), matching cgroup.procs.
-    #[cfg(feature = "cgroup")]
-    narf_filesystem::cgroupfs::fork_inherit(parent_pid, child_pid.raw());
-    // Inherit the parent's cgroup-namespace root (if any).
-    #[cfg(all(feature = "cgroup", feature = "container"))]
-    narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_pid.raw());
-    // Parent-of bookkeeping was published above, BEFORE the spawn, to close
-    // the SMP TRACEME race (see the comment at the `parent_of_set` call site).
-    // Return the child's user-visible ProcessId (POSIX fork(2)
-    // contract). The parent's waitpid() call passes this same
-    // value back to us as `want_pid`.
-    ctx.set_return(SyscallReturn::ok(child_pid.raw()));
-}
 
 // ── waitpid / wait4 — parent observes child exit status ────────────
 //
@@ -12793,183 +5637,6 @@ fn encode_waitid_siginfo(child_pid: i64, wstatus: i32) -> [u8; 128] {
     si[16..20].copy_from_slice(&(child_pid as i32).to_ne_bytes());
     si[24..28].copy_from_slice(&code_status.to_ne_bytes());
     si
-}
-
-/// `waitid(idtype, id, infop, options, rusage)` — wait for a child and
-/// report its state via a `siginfo_t`. Reuses the wait4 reap machinery;
-/// the blocking path is driven by `UserTaskCtx::wait_child_is_waitid`
-/// so the poll routine writes a siginfo and returns 0.
-fn sys_waitid(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let idtype = args.arg0 as u32;
-    let id = args.arg1 as i64;
-    let infop = args.arg2;
-    let options = args.arg3 as u32;
-    let rusage_ptr = args.arg4; // Linux waitid's 5th arg — glibc's wait4 shim uses it
-    const P_ALL: u32 = 0;
-    const P_PID: u32 = 1;
-    const P_PGID: u32 = 2;
-    const P_PIDFD: u32 = 3;
-    const WNOHANG: u32 = 1;
-    // WNOWAIT: report a waitable child WITHOUT reaping it — the zombie
-    // (and its /proc/<pid> entry) stays in place for a later real wait.
-    // systemd's manager_dispatch_sigchld peeks waitid(P_ALL, WEXITED|
-    // WNOHANG|WNOWAIT) precisely so it can still read /proc/$PID (the
-    // "is this my child" PPid check) before reaping with waitid(P_PID).
-    const WNOWAIT: u32 = 0x0100_0000;
-
-    // Translate (idtype, id) to the wait4-style want_pid: P_ALL → -1
-    // (any child), P_PID → the pid. P_PGID collapses to -1 until
-    // process groups are real (same simplification as wait4).
-    let want_pid: i64 = match idtype {
-        P_ALL => -1,
-        P_PID => id,
-        P_PGID => -1,
-        // P_PIDFD: `id` is a pidfd; wait on its target process. The error
-        // shape is LOAD-BEARING: glibc's `__clone_pidfd_supported()` probes
-        // `waitid(P_PIDFD, INT_MAX, NULL, WEXITED|WNOHANG)` and requires
-        // -EBADF from a P_PIDFD-aware kernel. Returning -EINVAL (the old
-        // unknown-idtype arm) made glibc cache "no pidfd support", so
-        // `pidfd_spawn` — systemd 258's ONLY service-executor spawn path —
-        // returned ENOSYS without ever issuing clone3: every unit failed
-        // with "Failed to spawn executor: Function not implemented".
-        // Linux ref: `kernel/exit.c::kernel_waitid` → `pidfd_get_pid`.
-        P_PIDFD => {
-            let target = if (0..=u32::MAX as i64).contains(&id) {
-                fd::with_table(current_task_id(), |t| {
-                    t.get(id as u32).and_then(|e| e.ops.pidfd_target_pid())
-                })
-                .flatten()
-            } else {
-                None
-            };
-            match target {
-                Some(p) => p as i64,
-                // Bad fd, or an fd that isn't a pidfd: EBADF (Linux).
-                None => {
-                    ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
-                    return;
-                }
-            }
-        }
-        _ => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-            return;
-        }
-    };
-
-    let parent = current_task_id();
-
-    // Job-control stop/continue FIRST (WUNTRACED/WCONTINUED) — a state
-    // change is reported before the child's later exit, in order, matching
-    // Linux. Only matches when the option + a queued report are present, so
-    // a plain wait falls through to the exit reap. No PID release.
-    if let Some((child_pid, status)) = reap_stopcont(parent, want_pid, options) {
-        if infop != 0 {
-            let si = encode_waitid_siginfo(child_pid as i64, status);
-            // SAFETY: `infop` non-zero; copy_to_user range-validates the write.
-            let _ = unsafe { copy_to_user(infop, &si) };
-        }
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    // Real exit reap (releases the child PID) — unless WNOWAIT, which
-    // only PEEKS the entry: the child stays queued (and its Task/pid
-    // tables intact) so a later wait4/waitid can still reap it.
-    let peek = options & WNOWAIT != 0;
-    let reaped = {
-        let mut g = PENDING_EXITS.lock();
-        g.as_mut().and_then(|m| {
-            let q = m.get_mut(&parent)?;
-            let idx = if want_pid > 0 {
-                q.iter().position(|&(p, _)| p == want_pid as u64)?
-            } else if q.is_empty() {
-                return None;
-            } else {
-                0
-            };
-            if peek {
-                Some(q[idx])
-            } else {
-                Some(q.remove(idx))
-            }
-        })
-    };
-    if let Some((child_pid, status)) = reaped {
-        if infop != 0 {
-            let si = encode_waitid_siginfo(child_pid as i64, status);
-            // SAFETY: `infop` is the user `siginfo_t*` (non-zero); copy_to_user
-            // range-validates the 128-byte write.
-            let _ = unsafe { copy_to_user(infop, &si) };
-        }
-        if peek {
-            // WNOWAIT: status reported, nothing consumed. Accounting,
-            // rusage and the pid/task release all belong to the eventual
-            // real reap.
-            ctx.set_return(SyscallReturn::ok(0));
-            return;
-        }
-        // Charge the child's CPU to the parent (this path skipped the
-        // fold wait4 does — RUSAGE_CHILDREN never saw waitid-reaped
-        // children) and fill the 5th-arg rusage like wait4.
-        let child_cpu_ns = account_reaped_child(parent, child_pid);
-        let snap = take_exit_rusage(child_pid);
-        if rusage_ptr != 0 {
-            let (ns, kb) = snap.unwrap_or((child_cpu_ns, 0));
-            write_rusage_utime(rusage_ptr, ns, kb);
-        }
-        release_reaped_task(child_pid);
-        crate::release_pid(crate::ProcessId(child_pid));
-        // Reaped — drop the parent record so wait4's ECHILD check is accurate.
-        parent_of_remove(child_pid);
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    if options & WNOHANG != 0 {
-        // No child ready: POSIX leaves infop's si_signo as 0 (the
-        // caller pre-zeros it). Return success.
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    // Blocking: park via the shared wait machinery with the waitid
-    // flag set so the poll routine writes a siginfo + returns 0.
-    if let (Some(uctx), Some(hook)) = (
-        crate::user_task::current_user_task(),
-        crate::user_task::yield_hook(),
-    ) {
-        // SAFETY: `uctx` is the live per-task UserTaskCtx; we hold the
-        // only reference while staging the wait state and saving CPU
-        // state before the yield hook hands the task to the executor.
-        unsafe {
-            let uc = &*uctx;
-            // Stage waitid's own 5th-arg rusage pointer (also
-            // invalidates any stale wait4 slot).
-            set_wait_rusage_ptr(current_task_id(), rusage_ptr);
-            uc.wait_child_is_waitid
-                .store(true, core::sync::atomic::Ordering::Release);
-            uc.wait_child_want_pid
-                .store(want_pid, core::sync::atomic::Ordering::Release);
-            uc.wait_child_status_ptr
-                .store(infop, core::sync::atomic::Ordering::Release);
-            uc.wait_child_options
-                .store(options, core::sync::atomic::Ordering::Release);
-            uc.wait_child_pending
-                .store(true, core::sync::atomic::Ordering::Release);
-            ctx.save_user_state(uc.state.get() as *mut u8);
-            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                own_stack_block(ctx);
-                return;
-            }
-            hook(uctx);
-        }
-    }
-    // Fallback (no polling future, e.g. kernel-test context): report no
-    // child rather than spin.
-    ctx.set_return(SyscallReturn::ok(0));
 }
 
 /// Test hook: directly register a parent-of relationship without going
@@ -13791,194 +6458,6 @@ fn on_child_exit(child_pid: u64, _child_tid: u64) {
     crate::user_task::wake_wait_child(parent);
 }
 
-fn sys_wait4(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let want_pid = args.arg0 as i64;
-    let status_ptr = args.arg1;
-    let options = args.arg2 as u32;
-    let rusage_ptr = args.arg3; // filled with the reaped child's CPU time
-    const WNOHANG: u32 = 1;
-
-    let parent = current_task_id();
-
-    // Try-reap closure: pops the matching (child_pid, status)
-    // from the parent's queue if any. Returns Some on success.
-    let try_reap = |parent: u64, want: i64| -> Option<(u64, i32)> {
-        let mut g = PENDING_EXITS.lock();
-        let m = g.as_mut()?;
-        let q = m.get_mut(&parent)?;
-        let idx = if want > 0 {
-            // Specific child.
-            q.iter().position(|&(p, _)| p == want as u64)?
-        } else {
-            // Any child (including pid == 0 / pid < -1 we
-            // collapse to -1 for simplicity — no per-pgid wait
-            // until process groups are real).
-            if q.is_empty() {
-                return None;
-            }
-            0
-        };
-        Some(q.remove(idx))
-    };
-
-    // Job-control stop/continue FIRST (WUNTRACED/WCONTINUED). A state
-    // change is reported before the child's later exit, in order, matching
-    // Linux — so `waitpid(WCONTINUED)` after `kill(SIGCONT)` sees the
-    // continue even if the child has already run to exit. Only matches when
-    // the option + a queued report are present; a plain wait falls straight
-    // through to the exit reap. Does NOT release the PID — child lives (or
-    // its exit stays queued for the next wait).
-    if let Some((child, status)) = reap_stopcont(parent, want_pid, options) {
-        if status_ptr != 0 {
-            // SAFETY: `status_ptr` non-zero; copy_to_user range-validates
-            // and SMAP-brackets the 4-byte write.
-            let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
-        }
-        ctx.set_return(SyscallReturn::ok(child));
-        return;
-    }
-
-    if let Some((reaped, status)) = try_reap(parent, want_pid) {
-        if status_ptr != 0 {
-            // Write i32 status under the SMAP bracket.
-            // SAFETY: `status_ptr` is the user wstatus pointer (non-zero, checked);
-            // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
-            // SAFETY: Valid memory or trusted environment
-            let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
-        }
-        // Charge the reaped child's CPU time to the parent's children
-        // accumulator (RUSAGE_CHILDREN / tms.cutime) and, if the caller
-        // passed a `struct rusage*`, fill ru_utime with it.
-        let child_cpu_ns = account_reaped_child(parent, reaped);
-        // Consume the child's exit-time snapshot even when the caller
-        // passed no rusage* — the entry must not outlive the reap.
-        let snap = take_exit_rusage(reaped);
-        if rusage_ptr != 0 {
-            let (ns, kb) = snap.unwrap_or((child_cpu_ns, 0));
-            write_rusage_utime(rusage_ptr, ns, kb);
-        }
-        // Reaped — release the refcounted Task, then return the PID to
-        // the free pool.
-        release_reaped_task(reaped);
-        crate::release_pid(crate::ProcessId(reaped));
-        // The child is gone — drop its parent record so a later wait4 sees
-        // it's no longer a child (otherwise the ECHILD check below stays
-        // blind to the reap and the parent blocks forever).
-        parent_of_remove(reaped);
-        ctx.set_return(SyscallReturn::ok(reaped));
-        return;
-    }
-
-    // No matching exit was queued. If the caller has no remaining child that
-    // could ever satisfy this wait, return ECHILD instead of blocking — Linux
-    // semantics. Without this, a parent that has already reaped its last child
-    // blocks forever (observed: stress-ng's parent `wait4(-1)` hanging after
-    // its only worker exited, so the whole run never completes).
-    if !has_living_child(parent, want_pid) {
-        const ECHILD: i64 = 10;
-        ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
-        return;
-    }
-
-    if options & WNOHANG != 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    // Blocking wait — cooperative yield to the scheduler.
-    //
-    // Previous implementation was a busy-spin that prevented the
-    // child task from ever being scheduled (the child's UserTaskFuture
-    // was on the ready queue but the parent's spin loop never returned
-    // to the executor).
-    //
-    // New implementation mirrors `sys_futex` / `sys_sleep`:
-    //   1. Set wait_child_pending + args on the current UserTaskCtx.
-    //   2. Save user state (RAX will be overwritten by the poll
-    //      routine once a reap succeeds).
-    //   3. Longjmp back to the executor via the yield hook.
-    //
-    // `UserTaskFuture::poll` sees `wait_child_pending = true` and
-    // tries to reap.  If the queue is empty it stores `cx.waker()`
-    // (so `on_child_exit` can fire it) and returns `Poll::Pending`.
-    // The child gets scheduled, exits, `on_child_exit` wakes the
-    // parent, and the parent is re-polled; this time the reap
-    // succeeds and the result is written into the saved RAX.
-    //
-    // Fallback: if no polling future is installed (test context),
-    // the code falls through to the spin below.
-    if let (Some(uctx), Some(hook)) = (
-        crate::user_task::current_user_task(),
-        crate::user_task::yield_hook(),
-    ) {
-        // SAFETY: uctx is valid for the lifetime of the polling
-        // routine which holds it pinned; we're about to longjmp.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            let uc = &*uctx;
-            // Stage the rusage out-pointer for finish_wait_child (it
-            // runs as this task on the reap side — see WAIT_RUSAGE_PTR).
-            set_wait_rusage_ptr(parent, rusage_ptr);
-            uc.wait_child_pending
-                .store(true, core::sync::atomic::Ordering::Release);
-            uc.wait_child_want_pid
-                .store(want_pid, core::sync::atomic::Ordering::Release);
-            uc.wait_child_status_ptr
-                .store(status_ptr, core::sync::atomic::Ordering::Release);
-            // wait4 writes a wstatus int, not a waitid siginfo.
-            uc.wait_child_is_waitid
-                .store(false, core::sync::atomic::Ordering::Release);
-            // Carry WUNTRACED/WCONTINUED so the poll-loop reap check
-            // can also collect job-control stop/continue notifications.
-            uc.wait_child_options
-                .store(options, core::sync::atomic::Ordering::Release);
-            // Save user-mode register state.  The RAX written here
-            // is a placeholder; UserTaskFuture::poll overwrites it
-            // with the reaped child pid before re-entering user mode.
-            ctx.save_user_state(uc.state.get() as *mut u8);
-            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                own_stack_block(ctx);
-                return;
-            }
-            hook(uctx);
-        }
-        // unreachable — hook() never returns
-    }
-
-    // Test/no-future fallback: synchronous busy-poll (same as
-    // before, kept for tests that use StubCtx without a real
-    // UserTaskFuture / yield hook).  Cap at 60 s.
-    let deadline = narf_time::Deadline::after_ms(60_000);
-    let mut reaped = None;
-    while !deadline.expired() {
-        if let Some(entry) = try_reap(parent, want_pid) {
-            reaped = Some(entry);
-            break;
-        }
-        narf_scheduler::sleep_pumps::run();
-        for _ in 0..100_000 {
-            core::hint::spin_loop();
-        }
-    }
-    match reaped {
-        Some((child, status)) => {
-            if status_ptr != 0 {
-                // SAFETY: `status_ptr` is the user wstatus pointer (non-zero, checked);
-                // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
-                // SAFETY: Valid memory or trusted environment
-                let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
-            }
-            ctx.set_return(SyscallReturn::ok(child));
-        }
-        // Use u64::MAX as the "error" sentinel since 0 is the
-        // legitimate WNOHANG-with-no-exited-child return value
-        // (so we can't reuse `invalid_op` whose rax = 0).
-        None => ctx.set_return(SyscallReturn::ok(u64::MAX)),
-    }
-}
-
 // ── Per-task pgid table ────────────────────────────────────────────
 //
 // POSIX setpgid / getpgid manage process-group ids. NARF doesn't
@@ -14090,46 +6569,6 @@ pub fn current_task_pgid() -> u64 {
     read_pgid(me)
 }
 
-fn sys_getpgid(ctx: &mut dyn TrapContext) {
-    let pid = ctx.args().arg0;
-    // arg0 is a *visible* pid (0 = self); the table is task-id-keyed.
-    let target = if pid == 0 {
-        current_task_id()
-    } else {
-        pgid_from_user(pid)
-    };
-    ctx.set_return(SyscallReturn::ok(pgid_to_user(read_pgid(target))));
-}
-
-fn sys_setpgid(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let pid = args.arg0;
-    let pgid = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    // arg0/arg1 are *visible* pids (0 = self / pgid-of-self); the
-    // PGID_TABLE is keyed by and stores task ids, so translate in.
-    let target = if pid == 0 {
-        current_task_id()
-    } else {
-        pgid_from_user(pid)
-    };
-    let value = if pgid == 0 {
-        target
-    } else {
-        pgid_from_user(pgid)
-    };
-    let mut g = PGID_TABLE.lock();
-    let m = match g.as_mut() {
-        Some(m) => m,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    m.insert(target, value);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 // ── Per-task session-id table ──────────────────────────────────────
 //
 // POSIX setsid creates a new session with the caller as the
@@ -14183,55 +6622,6 @@ pub fn sid_fork(parent: u64, child: u64) {
     if let Some(m) = SID_TABLE.lock().as_mut() {
         m.insert(child, sid);
     }
-}
-
-fn sys_getsid(ctx: &mut dyn TrapContext) {
-    let pid = ctx.args().arg0;
-    let target = if pid == 0 { current_task_id() } else { pid };
-    ctx.set_return(SyscallReturn::ok(read_sid(target)));
-}
-
-fn sys_setsid(ctx: &mut dyn TrapContext) {
-    let task = current_task_id();
-    // POSIX: setsid(2) makes the caller a new session leader,
-    // pgid = sid = pid. Record both tables together.
-    {
-        let mut g = SID_TABLE.lock();
-        if let Some(m) = g.as_mut() {
-            m.insert(task, task);
-        }
-    }
-    {
-        let mut g = PGID_TABLE.lock();
-        if let Some(m) = g.as_mut() {
-            m.insert(task, task);
-        }
-    }
-    // Wave-76: a new session leader has no controlling tty until it
-    // opens a tty without O_NOCTTY (or calls TIOCSCTTY). Mark the slot
-    // DETACHED (not absent) — absent means "the boot-console default", so
-    // a leader that detached must be distinguishable from one that never
-    // touched its ctty. The next TIOCSCTTY installs a real one.
-    #[cfg(feature = "linux-compat")]
-    {
-        let mut g = CTTY_TABLE.lock();
-        if let Some(m) = g.as_mut() {
-            m.insert(task, CTTY_DETACHED);
-        }
-    }
-    // setsid(2) returns the new session id = the caller's pid, in the
-    // visible-pid space userspace sees.
-    ctx.set_return(SyscallReturn::ok(pgid_to_user(task)));
-}
-
-/// `vhangup(2)`: simulate a controlling-terminal hangup. On Linux this
-/// revokes every *other* process's open of the terminal (used by
-/// `/bin/login` and getty to drop a prior session's grip before taking
-/// over the tty). NARF drives a singleton console with no per-open revoke
-/// path, so there is nothing to tear down — the caller keeps its own open
-/// fds. Return 0 so login proceeds instead of aborting on a bare -1.
-fn sys_vhangup(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(0));
 }
 
 // ── Per-task controlling-tty table (Wave-76) ───────────────────────
@@ -14510,144 +6900,6 @@ fn write_uidgid<F: FnOnce(&mut UidGid)>(task: u64, f: F) -> bool {
     true
 }
 
-fn sys_getuid(ctx: &mut dyn TrapContext) {
-    let task = current_task_id();
-    ctx.set_return(SyscallReturn::ok(read_uidgid(task).uid as u64));
-}
-
-fn sys_getgid(ctx: &mut dyn TrapContext) {
-    let task = current_task_id();
-    ctx.set_return(SyscallReturn::ok(read_uidgid(task).gid as u64));
-}
-
-fn sys_setuid(ctx: &mut dyn TrapContext) {
-    let task = current_task_id();
-    let uid = ctx.args().arg0 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    // In a non-root user-ns, setuid is only allowed to an id mapped in
-    // the ns (Linux EINVAL otherwise). The host root-ns is unrestricted.
-    #[cfg(feature = "container")]
-    {
-        let uns = crate::namespaces::current_user_ns(task);
-        if !uns.is_initial() && !uns.uid_is_mapped(uid) {
-            ctx.set_return(fail);
-            return;
-        }
-    }
-    // A (notionally privileged) setuid sets real, effective, and fs uids.
-    if write_uidgid(task, |e| {
-        e.uid = uid;
-        e.euid = uid;
-        e.fsuid = uid;
-    }) {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(fail);
-    }
-}
-
-fn sys_setgid(ctx: &mut dyn TrapContext) {
-    let task = current_task_id();
-    let gid = ctx.args().arg0 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    #[cfg(feature = "container")]
-    {
-        let uns = crate::namespaces::current_user_ns(task);
-        if !uns.is_initial() && !uns.gid_is_mapped(gid) {
-            ctx.set_return(fail);
-            return;
-        }
-    }
-    if write_uidgid(task, |e| {
-        e.gid = gid;
-        e.egid = gid;
-        e.fsgid = gid;
-    }) {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(fail);
-    }
-}
-
-fn sys_geteuid(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(
-        read_uidgid(current_task_id()).euid as u64,
-    ));
-}
-
-fn sys_getegid(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(
-        read_uidgid(current_task_id()).egid as u64,
-    ));
-}
-
-/// `getpgrp()` — the calling process's process-group id (legacy; takes
-/// no argument, so it always targets self).
-fn sys_getpgrp(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(pgid_to_user(
-        read_pgid(current_task_id()),
-    )));
-}
-
-/// `setreuid(ruid, euid)` — set the real and/or effective uid; `-1`
-/// leaves a field unchanged. The fs uid follows the new effective uid.
-fn sys_setreuid(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let ruid = a.arg0 as u32;
-    let euid = a.arg1 as u32;
-    let ok = write_uidgid(current_task_id(), |e| {
-        if ruid != u32::MAX {
-            e.uid = ruid;
-        }
-        if euid != u32::MAX {
-            e.euid = euid;
-            e.fsuid = euid;
-        }
-    });
-    ctx.set_return(SyscallReturn::ok(if ok { 0 } else { (-1i64) as u64 }));
-}
-
-/// `setregid(rgid, egid)`.
-fn sys_setregid(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let rgid = a.arg0 as u32;
-    let egid = a.arg1 as u32;
-    let ok = write_uidgid(current_task_id(), |e| {
-        if rgid != u32::MAX {
-            e.gid = rgid;
-        }
-        if egid != u32::MAX {
-            e.egid = egid;
-            e.fsgid = egid;
-        }
-    });
-    ctx.set_return(SyscallReturn::ok(if ok { 0 } else { (-1i64) as u64 }));
-}
-
-/// `setfsuid(fsuid)` — set the filesystem uid and return the PREVIOUS
-/// one. Always "succeeds" (the return is the old fsuid, never an errno),
-/// matching Linux. `-1` queries without changing.
-fn sys_setfsuid(ctx: &mut dyn TrapContext) {
-    let task = current_task_id();
-    let new = ctx.args().arg0 as u32;
-    let old = read_uidgid(task).fsuid;
-    if new != u32::MAX {
-        let _ = write_uidgid(task, |e| e.fsuid = new);
-    }
-    ctx.set_return(SyscallReturn::ok(old as u64));
-}
-
-/// `setfsgid(fsgid)` — set the filesystem gid, return the previous one.
-fn sys_setfsgid(ctx: &mut dyn TrapContext) {
-    let task = current_task_id();
-    let new = ctx.args().arg0 as u32;
-    let old = read_uidgid(task).fsgid;
-    if new != u32::MAX {
-        let _ = write_uidgid(task, |e| e.fsgid = new);
-    }
-    ctx.set_return(SyscallReturn::ok(old as u64));
-}
-
 /// Write `val` into each of the (up to three) user `u32` out-pointers
 /// `p0/p1/p2`, skipping NULLs. Returns 0 on success, -1 (EFAULT shape)
 /// if any copy_to_user fails. Shared by getresuid / getresgid.
@@ -14663,88 +6915,6 @@ fn write_res_ids(ctx: &mut dyn TrapContext, p0: u64, p1: u64, p2: u64, val: u32)
             }
         }
     }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `getresuid(ruid, euid, suid)` — NARF tracks a single uid, returned
-/// as all three id slots.
-fn sys_getresuid(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let uid = read_uidgid(current_task_id()).uid;
-    write_res_ids(ctx, a.arg0, a.arg1, a.arg2, uid);
-}
-
-/// `getresgid(rgid, egid, sgid)` — mirror of getresuid for the gid.
-fn sys_getresgid(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let gid = read_uidgid(current_task_id()).gid;
-    write_res_ids(ctx, a.arg0, a.arg1, a.arg2, gid);
-}
-
-/// `setresuid(ruid, euid, suid)` — collapse onto NARF's single uid.
-/// A `(uid_t)-1` slot means "leave unchanged"; we adopt the effective
-/// uid (or the real uid if effective is -1).
-fn sys_setresuid(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let new = if a.arg1 as u32 != u32::MAX {
-        Some(a.arg1 as u32)
-    } else if a.arg0 as u32 != u32::MAX {
-        Some(a.arg0 as u32)
-    } else {
-        None
-    };
-    if let Some(u) = new {
-        // arg1 is the requested euid; set real+effective+fs coherently so
-        // a later geteuid/setfsuid sees the change.
-        let euid = if a.arg1 as u32 != u32::MAX {
-            a.arg1 as u32
-        } else {
-            u
-        };
-        let _ = write_uidgid(current_task_id(), |e| {
-            e.uid = u;
-            e.euid = euid;
-            e.fsuid = euid;
-        });
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `setresgid(rgid, egid, sgid)` — mirror of setresuid for the gid.
-fn sys_setresgid(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let new = if a.arg1 as u32 != u32::MAX {
-        Some(a.arg1 as u32)
-    } else if a.arg0 as u32 != u32::MAX {
-        Some(a.arg0 as u32)
-    } else {
-        None
-    };
-    if let Some(g) = new {
-        let egid = if a.arg1 as u32 != u32::MAX {
-            a.arg1 as u32
-        } else {
-            g
-        };
-        let _ = write_uidgid(current_task_id(), |e| {
-            e.gid = g;
-            e.egid = egid;
-            e.fsgid = egid;
-        });
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `getgroups(size, list)` — NARF carries no supplementary groups, so
-/// the count is always 0 (whether querying the count with size==0 or
-/// filling the list).
-fn sys_getgroups(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `setgroups(size, list)` — accepted; NARF does not track a
-/// supplementary group list, so this is structural-only.
-fn sys_setgroups(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -14838,120 +7008,6 @@ fn write_rlimit(task: u64, resource: usize, val: RLimitPair) -> bool {
     let row = m.entry(task).or_insert_with(default_rlimits);
     row[resource] = val;
     true
-}
-
-fn sys_getrlimit(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let resource = args.arg0 as usize;
-    let out_ptr = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out_ptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    let task = current_task_id();
-    let pair = match read_rlimit(task, resource) {
-        Some(p) => p,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // Write two u64s to user buffer under the SMAP bracket.
-    let mut buf = [0u8; 16];
-    buf[..8].copy_from_slice(&pair.cur.to_ne_bytes());
-    buf[8..].copy_from_slice(&pair.max.to_ne_bytes());
-    // SAFETY: `out_ptr` is the user rlimit buffer; copy_to_user range-validates
-    // it and SMAP-brackets the write of the 16-byte `buf`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-fn sys_setrlimit(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let resource = args.arg0 as usize;
-    let in_ptr = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if in_ptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // Read two u64s from user buffer under the SMAP bracket.
-    let mut buf = [0u8; 16];
-    // SAFETY: `in_ptr` is the user rlimit pointer (non-zero, checked above);
-    // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_from_user(&mut buf, in_ptr) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    let cur = u64::from_ne_bytes(buf[..8].try_into().unwrap());
-    let max = u64::from_ne_bytes(buf[8..].try_into().unwrap());
-    let task = current_task_id();
-    if write_rlimit(task, resource, RLimitPair { cur, max }) {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(fail);
-    }
-}
-
-fn sys_prlimit64(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let pid = args.arg0;
-    let resource = args.arg1 as usize;
-    let new_ptr = args.arg2;
-    let old_ptr = args.arg3;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    // pid = 0 means "self"; non-zero pids are routed to that task
-    // unconditionally (no permission check today — capabilities
-    // would gate cross-task rlimit mutation in a real model).
-    let task = if pid == 0 { current_task_id() } else { pid };
-
-    // Validate resource bound up-front so the read+write is atomic
-    // from the user's perspective.
-    if resource >= RLIMIT_COUNT {
-        ctx.set_return(fail);
-        return;
-    }
-
-    // Snapshot prior so we can write `*old` *after* the update.
-    let prior = read_rlimit(task, resource).unwrap_or_default();
-
-    if new_ptr != 0 {
-        // Read two u64s from user buffer under the SMAP bracket.
-        let mut buf = [0u8; 16];
-        // SAFETY: `new_ptr` is the user new-rlimit pointer (non-zero, checked);
-        // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_from_user(&mut buf, new_ptr) }.is_err() {
-            ctx.set_return(fail);
-            return;
-        }
-        let cur = u64::from_ne_bytes(buf[..8].try_into().unwrap());
-        let max = u64::from_ne_bytes(buf[8..].try_into().unwrap());
-        if !write_rlimit(task, resource, RLimitPair { cur, max }) {
-            ctx.set_return(fail);
-            return;
-        }
-    }
-    if old_ptr != 0 {
-        // Write two u64s to user buffer under the SMAP bracket.
-        let mut buf = [0u8; 16];
-        buf[..8].copy_from_slice(&prior.cur.to_ne_bytes());
-        buf[8..].copy_from_slice(&prior.max.to_ne_bytes());
-        // SAFETY: `old_ptr` is the user old-rlimit pointer (non-zero, checked);
-        // copy_to_user range-validates it and SMAP-brackets the 16-byte write.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_to_user(old_ptr, &buf) }.is_err() {
-            ctx.set_return(fail);
-            return;
-        }
-    }
-    ctx.set_return(SyscallReturn::ok(0));
 }
 
 // ── prctl — per-task settings switchboard ──────────────────────────
@@ -15064,193 +7120,6 @@ fn modify_prctl<F: FnOnce(&mut PrctlState)>(task: u64, f: F) -> bool {
     true
 }
 
-fn sys_prctl(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let op = args.arg0;
-    let arg_a = args.arg1;
-    let arg_b = args.arg2;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let task = current_task_id();
-
-    match op {
-        PR_SET_NAME => {
-            // arg_a is a pointer to a NUL-terminated or 16-byte
-            // bounded user buffer. Copy at most TASK_COMM_LEN bytes
-            // under the SMAP bracket, then find the NUL.
-            if arg_a == 0 {
-                ctx.set_return(fail);
-                return;
-            }
-            let mut raw = [0u8; TASK_COMM_LEN];
-            // copy_from_user validates range; copy up to TASK_COMM_LEN bytes.
-            // SAFETY: `arg_a` is the user name pointer (non-zero, checked above);
-            // copy_from_user range-validates it and SMAP-brackets the read into `raw`.
-            // SAFETY: Valid memory or trusted environment
-            let _ = unsafe { copy_from_user(&mut raw, arg_a) };
-            // Trim at first NUL.
-            let nul_pos = raw.iter().position(|&b| b == 0).unwrap_or(TASK_COMM_LEN);
-            let mut name = [0u8; TASK_COMM_LEN];
-            name[..nul_pos].copy_from_slice(&raw[..nul_pos]);
-            if !modify_prctl(task, |s| s.name = name) {
-                ctx.set_return(fail);
-                return;
-            }
-            // Mirror into PROC_COMM so /proc/[pid]/comm reflects the new name.
-            if let Ok(s) = core::str::from_utf8(&name[..nul_pos]) {
-                set_proc_comm(task, s);
-            }
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        PR_GET_NAME => {
-            if arg_a == 0 {
-                ctx.set_return(fail);
-                return;
-            }
-            let s = read_prctl(task);
-            // Copy the 16-byte name buffer to user space under the SMAP bracket.
-            // SAFETY: `arg_a` is the user name buffer (non-zero, checked above);
-            // copy_to_user range-validates it and SMAP-brackets the write of `s.name`.
-            // SAFETY: Valid memory or trusted environment
-            if unsafe { copy_to_user(arg_a, &s.name) }.is_err() {
-                ctx.set_return(fail);
-                return;
-            }
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        PR_SET_PDEATHSIG => {
-            // arg is the signal number; 0 clears. Same 1..=64 range as
-            // every send path (SIGRTMAX=64 included).
-            if arg_a > 64 {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-                return;
-            }
-            modify_prctl(task, |s| s.pdeathsig = arg_a as u32);
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        PR_GET_PDEATHSIG => {
-            // Writes an int through the arg2 pointer (Linux ABI).
-            if arg_a == 0 {
-                ctx.set_return(fail);
-                return;
-            }
-            let sig = read_prctl(task).pdeathsig as i32;
-            // SAFETY: `arg_a` is the user int pointer (non-zero, checked);
-            // copy_to_user range-validates and SMAP-brackets the 4-byte write.
-            // SAFETY: Valid memory or trusted environment
-            if unsafe { copy_to_user(arg_a, &sig.to_ne_bytes()) }.is_err() {
-                ctx.set_return(fail);
-                return;
-            }
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        PR_SET_CHILD_SUBREAPER => {
-            modify_prctl(task, |s| s.child_subreaper = arg_a != 0);
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        PR_GET_CHILD_SUBREAPER => {
-            if arg_a == 0 {
-                ctx.set_return(fail);
-                return;
-            }
-            let v = read_prctl(task).child_subreaper as i32;
-            // SAFETY: `arg_a` is the user int pointer (non-zero, checked);
-            // copy_to_user range-validates and SMAP-brackets the 4-byte write.
-            // SAFETY: Valid memory or trusted environment
-            if unsafe { copy_to_user(arg_a, &v.to_ne_bytes()) }.is_err() {
-                ctx.set_return(fail);
-                return;
-            }
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        PR_SET_DUMPABLE => {
-            modify_prctl(task, |s| s.dumpable = arg_a != 0);
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        PR_GET_DUMPABLE => {
-            let s = read_prctl(task);
-            ctx.set_return(SyscallReturn::ok(s.dumpable as u64));
-        }
-        PR_SET_NO_NEW_PRIVS => {
-            modify_prctl(task, |s| s.no_new_privs = arg_a != 0);
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        PR_GET_NO_NEW_PRIVS => {
-            let s = read_prctl(task);
-            ctx.set_return(SyscallReturn::ok(s.no_new_privs as u64));
-        }
-        PR_CAP_AMBIENT => {
-            // arg_a selects the sub-operation; arg_b is the capability
-            // number for RAISE / LOWER / IS_SET (unused by CLEAR_ALL,
-            // which Linux requires to be called with cap==0).
-            match arg_a {
-                PR_CAP_AMBIENT_CLEAR_ALL => {
-                    if arg_b != 0 {
-                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-                        return;
-                    }
-                    modify_prctl(task, |s| s.ambient_caps = 0);
-                    ctx.set_return(SyscallReturn::ok(0));
-                }
-                PR_CAP_AMBIENT_RAISE | PR_CAP_AMBIENT_LOWER | PR_CAP_AMBIENT_IS_SET => {
-                    if arg_b > CAP_LAST_CAP {
-                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-                        return;
-                    }
-                    let bit = 1u64 << arg_b;
-                    match arg_a {
-                        PR_CAP_AMBIENT_RAISE => {
-                            modify_prctl(task, |s| s.ambient_caps |= bit);
-                            ctx.set_return(SyscallReturn::ok(0));
-                        }
-                        PR_CAP_AMBIENT_LOWER => {
-                            modify_prctl(task, |s| s.ambient_caps &= !bit);
-                            ctx.set_return(SyscallReturn::ok(0));
-                        }
-                        // IS_SET: 1 if raised, 0 otherwise.
-                        _ => {
-                            let set = read_prctl(task).ambient_caps & bit != 0;
-                            ctx.set_return(SyscallReturn::ok(set as u64));
-                        }
-                    }
-                }
-                _ => ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)),
-            }
-        }
-        PR_CAPBSET_READ => {
-            if arg_a > CAP_LAST_CAP {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-            } else {
-                // Every valid cap is "in the bounding set" — NARF doesn't
-                // model one.
-                ctx.set_return(SyscallReturn::ok(1));
-            }
-        }
-        PR_CAPBSET_DROP => {
-            if arg_a > CAP_LAST_CAP {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-            } else {
-                // Accept-and-ignore: nothing to drop from.
-                ctx.set_return(SyscallReturn::ok(0));
-            }
-        }
-        PR_GET_SECUREBITS => {
-            let s = read_prctl(task);
-            ctx.set_return(SyscallReturn::ok(s.securebits));
-        }
-        PR_SET_SECUREBITS => {
-            // Stored-not-enforced; Linux validates against known SECBIT
-            // bits (mask 0xFF covers SECBIT_* incl. the _LOCKED bits).
-            if arg_a & !0xFF != 0 {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-            } else {
-                modify_prctl(task, |s| s.securebits = arg_a);
-                ctx.set_return(SyscallReturn::ok(0));
-            }
-        }
-        _ => ctx.set_return(fail),
-    }
-}
-
 // ── sched_get_priority_max / min + getparam / setparam ────────────
 //
 // Linux exposes a small policy-shaped surface: each scheduling
@@ -15284,22 +7153,6 @@ fn priority_min_for_policy(policy: u64) -> Option<i64> {
     }
 }
 
-fn sys_sched_get_priority_max(ctx: &mut dyn TrapContext) {
-    let policy = ctx.args().arg0;
-    match priority_max_for_policy(policy) {
-        Some(p) => ctx.set_return(SyscallReturn::ok(p as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
-    }
-}
-
-fn sys_sched_get_priority_min(ctx: &mut dyn TrapContext) {
-    let policy = ctx.args().arg0;
-    match priority_min_for_policy(policy) {
-        Some(p) => ctx.set_return(SyscallReturn::ok(p as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
-    }
-}
-
 // Per-task sched_param slot. Single i32 (sched_priority).
 static SCHED_PARAM_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -15313,61 +7166,6 @@ pub fn __test_sched_param_reset() {
     *SCHED_PARAM_TABLE.lock() = Some(BTreeMap::new());
 }
 
-fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let pid = args.arg0;
-    let out = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    let task = if pid == 0 { current_task_id() } else { pid };
-    let g = SCHED_PARAM_TABLE.lock();
-    let val = g.as_ref().and_then(|m| m.get(&task).copied()).unwrap_or(0);
-    // Write one i32 to user space under the SMAP bracket.
-    // SAFETY: `out` is the user sched_param pointer (non-zero, checked above);
-    // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out, &val.to_ne_bytes()) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let pid = args.arg0;
-    let inp = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if inp == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // Read one i32 from user space under the SMAP bracket.
-    let mut buf = [0u8; 4];
-    // SAFETY: `inp` is the user sched_param pointer (non-zero, checked above);
-    // copy_from_user range-validates it and SMAP-brackets the 4-byte read.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_from_user(&mut buf, inp) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    let val = i32::from_ne_bytes(buf);
-    let task = if pid == 0 { current_task_id() } else { pid };
-    let mut g = SCHED_PARAM_TABLE.lock();
-    let m = match g.as_mut() {
-        Some(m) => m,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    m.insert(task, val);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 // ── Sched_get/setaffinity — CPU bitmap ─────────────────────────────
 //
 // NARF user mode is single-CPU; the affinity bitmap is structural
@@ -15376,88 +7174,12 @@ fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
 // pinning to perform). Surface exists so pthread / libnuma
 // probes succeed at startup.
 
-fn sys_sched_getaffinity(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let _pid = args.arg0;
-    let size = args.arg1 as usize;
-    let out = args.arg2;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out == 0 || size == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // Linux requires `size` be a multiple of sizeof(unsigned long)
-    // (8 on x86_64). Round down for the actual write but reject
-    // truly tiny requests so a caller's `cpu_set_t` matches.
-    if size < 8 {
-        ctx.set_return(fail);
-        return;
-    }
-    let bytes = size & !7; // round to 8
-                           // Validate the destination range before allocating — an oversized size
-                           // would otherwise OOM the kernel heap before copy_to_user fires.
-    if validate_user_range(out, bytes).is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    // Build the affinity bitmap in kernel memory (CPU 0 set, rest zero),
-    // then copy to user space under the SMAP bracket.
-    let mut kbuf = alloc::vec![0u8; bytes];
-    kbuf[0] = 0x01; // CPU 0 set
-                    // SAFETY: `out`+`bytes` were validated by validate_user_range above; copy_to_user
-                    // re-validates and SMAP-brackets the write of the `bytes`-long `kbuf`.
-                    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out, &kbuf) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(bytes as u64));
-}
-
-fn sys_sched_setaffinity(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let _pid = args.arg0;
-    let size = args.arg1 as usize;
-    let buf = args.arg2;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if buf == 0 || size == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // Validate the user pointer range but discard the value — we don't pin.
-    if validate_user_range(buf, size.min(8)).is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 // ── Getcpu — current CPU + NUMA node query ─────────────────────────
 //
 // Linux getcpu(2): real CPU + NUMA node lookup. NARF user mode is
 // single-CPU and single-node today — both return 0 — but library
 // code (libnuma, RT performance probes) queries this at startup
 // and the entry must exist.
-
-fn sys_getcpu(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let cpu_ptr = args.arg0;
-    let node_ptr = args.arg1;
-    // Write CPU=0, node=0 under the SMAP bracket.
-    if cpu_ptr != 0 {
-        // SAFETY: `cpu_ptr` is the user cpu out-pointer (non-zero, checked);
-        // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
-        // SAFETY: Valid memory or trusted environment
-        let _ = unsafe { copy_to_user(cpu_ptr, &0u32.to_ne_bytes()) };
-    }
-    if node_ptr != 0 {
-        // SAFETY: `node_ptr` is the user node out-pointer (non-zero, checked);
-        // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
-        // SAFETY: Valid memory or trusted environment
-        let _ = unsafe { copy_to_user(node_ptr, &0u32.to_ne_bytes()) };
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
 
 // ── Per-task umask ──────────────────────────────────────────────────
 //
@@ -15481,23 +7203,6 @@ pub fn __test_umask_reset() {
 }
 
 const UMASK_DEFAULT: u32 = 0o022;
-
-fn sys_umask(ctx: &mut dyn TrapContext) {
-    let new_mask = (ctx.args().arg0 as u32) & 0o777;
-    let task = current_task_id();
-    let mut g = UMASK_TABLE.lock();
-    let m = match g.as_mut() {
-        Some(m) => m,
-        None => {
-            // Treat lack of init as default-mask — return that
-            // and accept the new mask going forward.
-            ctx.set_return(SyscallReturn::ok(UMASK_DEFAULT as u64));
-            return;
-        }
-    };
-    let prior = m.insert(task, new_mask).unwrap_or(UMASK_DEFAULT);
-    ctx.set_return(SyscallReturn::ok(prior as u64));
-}
 
 // ── Per-task nice / priority table ─────────────────────────────────
 //
@@ -15537,43 +7242,6 @@ fn write_nice(task: u64, prio: i32) -> bool {
     true
 }
 
-fn sys_getpriority(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let which = args.arg0 as i64;
-    let _who = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if which != PRIO_PROCESS_VAL {
-        ctx.set_return(fail);
-        return;
-    }
-    let task = current_task_id();
-    let nice = read_nice(task);
-    // Linux convention: getpriority returns the value pre-shifted
-    // by +20 so a -20..=19 nice maps to 0..=39 on the wire — the
-    // user-side libc subtracts 20 to recover the signed value.
-    // Errors then surface as the wire -1 distinct from a value of 19.
-    let shifted = (nice + 20) as u64;
-    ctx.set_return(SyscallReturn::ok(shifted));
-}
-
-fn sys_setpriority(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let which = args.arg0 as i64;
-    let _who = args.arg1;
-    let prio = args.arg2 as i64;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if which != PRIO_PROCESS_VAL || !(-20..=19).contains(&prio) {
-        ctx.set_return(fail);
-        return;
-    }
-    let task = current_task_id();
-    if write_nice(task, prio as i32) {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(fail);
-    }
-}
-
 // ── Times — POSIX process CPU times ───────────────────────────────
 //
 // times(2) writes a `struct tms { utime, stime, cutime, cstime }`
@@ -15590,44 +7258,6 @@ fn sys_setpriority(ctx: &mut dyn TrapContext) {
 
 const CLK_TCK_HZ: u64 = 100;
 
-fn sys_times(ctx: &mut dyn TrapContext) {
-    let out_ptr = ctx.args().arg0;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    // times() RETURNS elapsed wall-clock in ticks (uptime since an
-    // arbitrary epoch) — that part was always right. The `tms` FIELDS,
-    // however, must carry this task's real CPU time, not uptime.
-    let ns_per_tick: u64 = 1_000_000_000 / CLK_TCK_HZ;
-    let uptime_ticks: i64 = (narf_scheduler::narf_time::monotonic_ns() / ns_per_tick) as i64;
-    let task = current_task_id();
-    let utime_ticks: i64 = (cpu_time_ns_of(task)
-        .saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns())
-        / ns_per_tick) as i64;
-    let stime_ticks: i64 = (kern_time_ns_of(task) / ns_per_tick) as i64;
-    let cutime_ticks: i64 = (child_cpu_time_ns_of(task) / ns_per_tick) as i64;
-    if out_ptr != 0 {
-        // Build the tms struct (four i64s: utime, stime, cutime, cstime)
-        // in kernel memory, then copy to user under the SMAP bracket.
-        // stime = in-syscall time (kernel_syscall_entry's bracket);
-        // cstime stays 0 (the children fold is one aggregate number).
-        let mut kbuf = [0u8; 32];
-        kbuf[..8].copy_from_slice(&utime_ticks.to_ne_bytes()); // utime
-        kbuf[8..16].copy_from_slice(&stime_ticks.to_ne_bytes()); // stime
-        kbuf[16..24].copy_from_slice(&cutime_ticks.to_ne_bytes()); // cutime
-                                                                   // SAFETY: `out_ptr` is the user `struct tms` pointer (non-zero, checked);
-                                                                   // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
-                                                                   // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_to_user(out_ptr, &kbuf) }.is_err() {
-            ctx.set_return(fail);
-            return;
-        }
-    }
-    if uptime_ticks < 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(uptime_ticks as u64));
-}
-
 // ── Getrusage — populate the glibc rusage struct ──────────────────
 //
 // Linux's `struct rusage` is 16 fields after the leading two
@@ -15639,65 +7269,6 @@ fn sys_times(ctx: &mut dyn TrapContext) {
 const RUSAGE_TIMEVAL_FIELDS: usize = 4; // ru_utime + ru_stime
 const RUSAGE_TAIL_FIELDS: usize = 14; // ru_maxrss .. ru_nivcsw
 const RUSAGE_TOTAL_I64S: usize = RUSAGE_TIMEVAL_FIELDS + RUSAGE_TAIL_FIELDS;
-
-fn sys_getrusage(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let who = args.arg0 as i64;
-    let out = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // RUSAGE_SELF (0) → this task's own CPU time; RUSAGE_CHILDREN (-1) →
-    // accumulated reaped-children CPU time. (Previously this returned
-    // monotonic uptime for every `who`, so every process looked like it
-    // had burned the whole machine's wall-clock as user time.)
-    const RUSAGE_CHILDREN: i64 = -1;
-    let task = current_task_id();
-    let ns: u64 = if who == RUSAGE_CHILDREN {
-        child_cpu_time_ns_of(task)
-    } else {
-        // Folded slices + the in-flight one (own-stack folds only at
-        // yield-out, so a busy task's own reads would otherwise lag).
-        cpu_time_ns_of(task).saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns())
-    };
-    let utime_sec = (ns / 1_000_000_000) as i64;
-    let utime_usec = ((ns % 1_000_000_000) / 1_000) as i64;
-    // ru_maxrss: the caller's own VM footprint for RUSAGE_SELF; 0 for
-    // RUSAGE_CHILDREN (no accumulated per-child peak — wait4 reports
-    // each child's footprint at reap instead).
-    let maxrss_kb: i64 = if who == RUSAGE_CHILDREN {
-        0
-    } else {
-        (task_vm_bytes(task) / 1024) as i64
-    };
-    // Build the rusage struct (RUSAGE_TOTAL_I64S i64s) in kernel
-    // memory, then copy to user under the SMAP bracket.
-    let mut kbuf = [0u8; RUSAGE_TOTAL_I64S * 8];
-    kbuf[..8].copy_from_slice(&utime_sec.to_ne_bytes()); // ru_utime.tv_sec
-    kbuf[8..16].copy_from_slice(&utime_usec.to_ne_bytes()); // ru_utime.tv_usec
-                                                            // ru_stime: in-syscall time (RUSAGE_SELF; the children aggregate is
-                                                            // utime-only — TASK_CHILD_CPU_NS folds one number).
-    let stime_ns: u64 = if who == RUSAGE_CHILDREN {
-        0
-    } else {
-        kern_time_ns_of(task)
-    };
-    let stime_sec = (stime_ns / 1_000_000_000) as i64;
-    let stime_usec = ((stime_ns % 1_000_000_000) / 1_000) as i64;
-    kbuf[16..24].copy_from_slice(&stime_sec.to_ne_bytes()); // ru_stime.tv_sec
-    kbuf[24..32].copy_from_slice(&stime_usec.to_ne_bytes()); // ru_stime.tv_usec
-    kbuf[32..40].copy_from_slice(&maxrss_kb.to_ne_bytes()); // ru_maxrss (KB)
-                                                            // SAFETY: `out` is the user `struct rusage` pointer (non-zero, checked above);
-                                                            // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
-                                                            // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out, &kbuf) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
 
 // ── Hostname (kernel-wide) ─────────────────────────────────────────
 //
@@ -15736,84 +7307,6 @@ pub fn __test_hostname_reset() {
     g.push_str("narf");
 }
 
-fn sys_gethostname(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let buf = args.arg0;
-    let len = args.arg1 as usize;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if buf == 0 || len == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // Wave-72: per-task UTS namespace wins when present.
-    #[cfg(feature = "container")]
-    let host_owned: Option<alloc::string::String> = {
-        let task = current_task_id();
-        crate::namespaces::uts_ns_of(task).map(|ns| ns.hostname())
-    };
-    #[cfg(not(feature = "container"))]
-    let host_owned: Option<alloc::string::String> = None;
-
-    let g_fallback;
-    let bytes: &[u8] = if let Some(ref s) = host_owned {
-        s.as_bytes()
-    } else {
-        g_fallback = HOSTNAME.lock();
-        g_fallback.as_bytes()
-    };
-    if bytes.len() + 1 > len {
-        ctx.set_return(fail);
-        return;
-    }
-    // Build NUL-terminated output in kernel memory, then copy_to_user.
-    let mut kbuf = alloc::vec![0u8; bytes.len() + 1];
-    kbuf[..bytes.len()].copy_from_slice(bytes);
-    // kbuf[bytes.len()] is already 0 (NUL).
-    let n = bytes.len();
-    drop(host_owned);
-    // SAFETY: `buf` is the user hostname buffer (non-zero, checked above; `kbuf`
-    // fits in `len`); copy_to_user range-validates it and SMAP-brackets the write.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(n as u64));
-}
-
-fn sys_sethostname(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let buf = args.arg0;
-    let len = args.arg1 as usize;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if len == 0 || len > HOSTNAME_MAX {
-        ctx.set_return(fail);
-        return;
-    }
-    let s = match copy_user_path(buf, len) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // Wave-72: if caller has an explicit UTS NS, write there; else fall
-    // through to the global hostname slot.
-    #[cfg(feature = "container")]
-    {
-        let task = current_task_id();
-        if let Some(ns) = crate::namespaces::uts_ns_of(task) {
-            ns.set_hostname(&s);
-            ctx.set_return(SyscallReturn::ok(0));
-            return;
-        }
-    }
-    let mut g = HOSTNAME.lock();
-    g.clear();
-    g.push_str(&s);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 // ── Wave-72 — uname(2), setdomainname(2), SysV IPC get-by-key ─────
 //
 // `struct utsname` is six 65-byte fixed-length fields (NUL-terminated)
@@ -15829,91 +7322,6 @@ fn pack_utsname_field(dst: &mut [u8], src: &str) {
     // remaining bytes already zeroed by caller
 }
 
-fn sys_uname(ctx: &mut dyn TrapContext) {
-    let buf = ctx.args().arg0;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if buf == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // Per-task UTS namespace lives behind the `container` feature.
-    // Without it the hostname / domainname are flat global strings.
-    #[cfg(feature = "container")]
-    let (hostname, domainname) = {
-        let task = current_task_id();
-        let ns = crate::namespaces::current_uts_ns(task);
-        (ns.hostname(), ns.domainname())
-    };
-    #[cfg(not(feature = "container"))]
-    let (hostname, domainname): (alloc::string::String, alloc::string::String) =
-        (HOSTNAME.lock().clone(), DOMAINNAME.lock().clone());
-    let mut kbuf = alloc::vec![0u8; UTSNAME_STRUCT_LEN];
-    let mut off = 0usize;
-    // sysname / nodename / release / version / machine / domainname.
-    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "NARF");
-    off += UTSNAME_FIELD_LEN;
-    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], &hostname);
-    off += UTSNAME_FIELD_LEN;
-    // `release` must parse as a modern kernel version: software (systemd,
-    // glibc, ...) gates features on `uname -r >= X.Y`. systemd warns and
-    // disables features below 5.4. Report a 6.x base with a narf suffix.
-    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "6.1.0-narf");
-    off += UTSNAME_FIELD_LEN;
-    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "#1 SMP NARF");
-    off += UTSNAME_FIELD_LEN;
-    #[cfg(target_arch = "x86_64")]
-    let machine = "x86_64";
-    #[cfg(target_arch = "aarch64")]
-    let machine = "aarch64";
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    let machine = "unknown";
-    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], machine);
-    off += UTSNAME_FIELD_LEN;
-    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], &domainname);
-    let _ = off;
-    // SAFETY: `buf` is the user `struct utsname` pointer (non-zero, checked above);
-    // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-fn sys_setdomainname(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let buf = args.arg0;
-    let len = args.arg1 as usize;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if len == 0 || len > HOSTNAME_MAX {
-        ctx.set_return(fail);
-        return;
-    }
-    let s = match copy_user_path(buf, len) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // If the caller has an explicit UTS namespace, write there; else
-    // fall through to the global domainname slot (mirrors sethostname).
-    #[cfg(feature = "container")]
-    {
-        let task = current_task_id();
-        if let Some(ns) = crate::namespaces::uts_ns_of(task) {
-            ns.set_domainname(&s);
-            ctx.set_return(SyscallReturn::ok(0));
-            return;
-        }
-    }
-    let mut g = DOMAINNAME.lock();
-    g.clear();
-    g.push_str(&s);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 #[cfg(feature = "container")]
 fn current_or_default_ipc_ns(task: u64) -> alloc::sync::Arc<crate::namespaces::IpcNamespace> {
     if let Some(ns) = crate::namespaces::current_ipc_ns(task) {
@@ -15924,30 +7332,6 @@ fn current_or_default_ipc_ns(task: u64) -> alloc::sync::Arc<crate::namespaces::I
     // shape Linux uses (every task is always in some IPC NS).
     crate::namespaces::unshare_ipc(task);
     crate::namespaces::current_ipc_ns(task).expect("unshare_ipc just installed an entry")
-}
-
-#[cfg(feature = "container")]
-fn sys_shmget(ctx: &mut dyn TrapContext) {
-    let key = ctx.args().arg0 as u32;
-    let task = current_task_id();
-    let ns = current_or_default_ipc_ns(task);
-    ctx.set_return(SyscallReturn::ok(ns.shmget(key) as u64));
-}
-
-#[cfg(all(feature = "container", not(feature = "linux-compat")))]
-fn sys_semget(ctx: &mut dyn TrapContext) {
-    let key = ctx.args().arg0 as u32;
-    let task = current_task_id();
-    let ns = current_or_default_ipc_ns(task);
-    ctx.set_return(SyscallReturn::ok(ns.semget(key) as u64));
-}
-
-#[cfg(all(feature = "container", not(feature = "linux-compat")))]
-fn sys_msgget(ctx: &mut dyn TrapContext) {
-    let key = ctx.args().arg0 as u32;
-    let task = current_task_id();
-    let ns = current_or_default_ipc_ns(task);
-    ctx.set_return(SyscallReturn::ok(ns.msgget(key) as u64));
 }
 
 // ── System V shared memory (linux-compat) ────────────────────────────
@@ -15984,198 +7368,7 @@ const IPC_64: u64 = 0x100;
 #[cfg(feature = "linux-compat")]
 const SHM_RDONLY: u64 = 0o10000;
 
-/// `shmget(key, size, shmflg)` — create or look up a shared segment with
-/// real frame backing.
-#[cfg(feature = "linux-compat")]
-fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let key = a.arg0 as u32;
-    let size = a.arg1;
-    let flg = a.arg2;
-    let mut g = SHM_SEGMENTS.lock();
-    let segs = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    if key != 0 {
-        if let Some((id, _)) = segs.iter().find(|(_, s)| s.key == key) {
-            let id = *id;
-            if flg & IPC_CREAT != 0 && flg & IPC_EXCL != 0 {
-                ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
-                return;
-            }
-            ctx.set_return(SyscallReturn::ok(id));
-            return;
-        }
-        if flg & IPC_CREAT == 0 {
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // ENOENT
-            return;
-        }
-    }
-    let v = match shmem_vtable() {
-        Some(v) => v,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let handle = (v.create)(current_task_id(), size);
-    if handle == 0 {
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
-        return;
-    }
-    let shmid = SHM_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    segs.insert(
-        shmid,
-        ShmSegment {
-            handle,
-            key,
-            len: size,
-        },
-    );
-    ctx.set_return(SyscallReturn::ok(shmid));
-}
-
-/// `shmat(shmid, shmaddr, shmflg)` — map the segment's frames into the AS.
-#[cfg(feature = "linux-compat")]
-fn sys_shmat(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let shmid = a.arg0;
-    let flg = a.arg2;
-    let (handle, len) = {
-        let g = SHM_SEGMENTS.lock();
-        match g.as_ref().and_then(|m| m.get(&shmid)) {
-            Some(s) => (s.handle, s.len),
-            None => {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-                return;
-            }
-        }
-    };
-    let v = match shmem_vtable() {
-        Some(v) => v,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let mut frames_raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    if !(v.frames)(handle, &mut frames_raw) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = frames_raw
-        .into_iter()
-        .map(narf_memory::PhysAddr::new)
-        .collect();
-    // SHARED marks the frames as borrowed (narf-shmem owns them), so a
-    // second shmat of the same segment may alias them and neither unmap
-    // nor AS-drop frees them.
-    let mut perms = RegionPerms::READ | RegionPerms::SHARED;
-    if flg & SHM_RDONLY == 0 {
-        perms = perms | RegionPerms::WRITE;
-    }
-    let base = as_ref.reserve_mmap_va(len);
-    if base == 0 {
-        // mmap arena exhausted (cursor at MMAP_WINDOW_TOP) — fail closed.
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
-        return;
-    }
-    if as_ref
-        .map_region(Region {
-            base: VirtAddr::new(base),
-            len,
-            perms,
-            phys: phys_list,
-        })
-        .is_err()
-    {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the
-    // region was just registered, so materialize installs only its PTEs.
-    if unsafe { as_ref.materialize() }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(base));
-}
-
-/// `shmdt(shmaddr)` — detach (unmap) a previously-attached segment.
-#[cfg(feature = "linux-compat")]
-fn sys_shmdt(ctx: &mut dyn TrapContext) {
-    let addr = ctx.args().arg0;
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    match as_ref.unmap_region(VirtAddr::new(addr)) {
-        Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(_) => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
-    }
-}
-
-/// `shmctl(shmid, cmd, buf)`. IPC_RMID destroys the segment; IPC_STAT
-/// reports the segment size; others are accepted.
-#[cfg(feature = "linux-compat")]
-fn sys_shmctl(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let shmid = a.arg0;
-    let cmd = a.arg1 & !IPC_64;
-    match cmd {
-        IPC_RMID => {
-            let removed = {
-                let mut g = SHM_SEGMENTS.lock();
-                g.as_mut().and_then(|m| m.remove(&shmid))
-            };
-            match removed {
-                Some(seg) => {
-                    if let Some(v) = shmem_vtable() {
-                        (v.destroy)(seg.handle);
-                    }
-                    ctx.set_return(SyscallReturn::ok(0));
-                }
-                None => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
-            }
-        }
-        2 => {
-            // IPC_STAT: report shm_segsz. On x86_64 the kernel's
-            // shmid64_ds places shm_segsz right after struct ipc64_perm
-            // (48 bytes). We fill just the size; the rest stays
-            // caller-zeroed.
-            let len = {
-                let g = SHM_SEGMENTS.lock();
-                g.as_ref().and_then(|m| m.get(&shmid)).map(|s| s.len)
-            };
-            match len {
-                Some(len) if a.arg2 != 0 => {
-                    // SAFETY: a.arg2 is the user struct shmid_ds*; copy_to_user
-                    // validates the 8-byte shm_segsz write at offset 48.
-                    let _ = unsafe { copy_to_user(a.arg2.wrapping_add(48), &len.to_le_bytes()) };
-                    ctx.set_return(SyscallReturn::ok(0));
-                }
-                Some(_) => ctx.set_return(SyscallReturn::ok(0)),
-                None => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
-            }
-        }
-        _ => ctx.set_return(SyscallReturn::ok(0)),
-    }
-}
-
 // ── Yield / Sleep — Ok ─────────────────────────────────────────────
-
-#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
-fn sys_noop_ok(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(0));
-}
 
 // ── Sleep ─────────────────────────────────────────────────────────
 //
@@ -16379,106 +7572,6 @@ fn next_random_u32() -> u32 {
     s = (s.wrapping_mul(48271)) % 0x7FFF_FFFF;
     GETRANDOM_STATE.store(s, Ordering::Relaxed);
     s as u32
-}
-
-fn sys_getrandom(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let ptr = args.arg0;
-    let len = args.arg1 as usize;
-    let _flags = args.arg2; // accepted-and-ignored
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if ptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    if len == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    if len > MAX_USER_COPY {
-        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-        return;
-    }
-    // Generate random bytes into a kernel buffer, then copy to user
-    // space under the SMAP bracket.
-    let mut kbuf = alloc::vec![0u8; len];
-    let mut i = 0usize;
-    while i + 4 <= len {
-        let v = next_random_u32();
-        kbuf[i] = (v & 0xFF) as u8;
-        kbuf[i + 1] = ((v >> 8) & 0xFF) as u8;
-        kbuf[i + 2] = ((v >> 16) & 0xFF) as u8;
-        kbuf[i + 3] = ((v >> 24) & 0xFF) as u8;
-        i += 4;
-    }
-    if i < len {
-        let v = next_random_u32();
-        let mut shift = 0u32;
-        while i < len {
-            kbuf[i] = ((v >> shift) & 0xFF) as u8;
-            i += 1;
-            shift += 8;
-        }
-    }
-    // SAFETY: `ptr` is the user buffer (non-zero, `len <= MAX_USER_COPY`, both
-    // checked above); copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(ptr, &kbuf) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(len as u64));
-}
-
-fn sys_sleep(ctx: &mut dyn TrapContext) {
-    let ns = ctx.args().arg0;
-    if ns == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    let start = narf_scheduler::narf_time::monotonic_ns();
-    // Saturating add: u64 overflow on `start + ns` is structurally
-    // impossible at realistic clock rates, but the saturate keeps
-    // the deadline tight against pathological inputs.
-    let deadline = start.saturating_add(ns);
-
-    // Polling-future path: stash the deadline on the current
-    // UserTaskCtx, bake the eventual return value (Ok(0)) into the
-    // saved RAX so the user reads it on resume, save the user
-    // state, then longjmp back via the yield hook. The next
-    // `UserTaskFuture::poll` consults the deadline and parks the
-    // task without re-entering user mode until it expires.
-    if let (Some(uctx), Some(hook)) = (
-        crate::user_task::current_user_task(),
-        crate::user_task::yield_hook(),
-    ) {
-        ctx.set_return(SyscallReturn::ok(0));
-        // SAFETY: uctx is valid for the lifetime of the polling
-        // routine (its caller, on the same CPU) which holds it
-        // pinned. We're about to never return.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            let uc = &*uctx;
-            uc.sleep_deadline_ns
-                .store(deadline, core::sync::atomic::Ordering::Release);
-            ctx.save_user_state(uc.state.get() as *mut u8);
-            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                own_stack_block(ctx);
-                return;
-            }
-            hook(uctx);
-        }
-        // unreachable
-    }
-
-    // Fallback busy-wait (no polling future installed — test
-    // trampolines, sub-polling test harnesses, etc.).
-    while narf_scheduler::narf_time::monotonic_ns() < deadline {
-        sleep_pumps::run();
-        core::hint::spin_loop();
-    }
-    ctx.set_return(SyscallReturn::ok(0));
 }
 
 /// Registry of "background-work" callbacks that run inside the
@@ -16816,125 +7909,6 @@ pub fn __test_open_dir_fd(task: u64, path: &str) -> Option<u32> {
     })
 }
 
-fn sys_chdir(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let ptr = args.arg0;
-    // Linux ABI: `int chdir(const char *path)` — a single NUL-terminated
-    // path, no length arg. (Previously this read arg1 as a NARF-native
-    // length, so musl/busybox's chdir(path) hit us with garbage in arg1
-    // and failed every cd. Same fix as openat — see
-    // [[narf-mmap-no-file-backed]] / the *at ABI cutover.)
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let path = match copy_user_cstr(ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let task = current_task_id();
-    // Validate against the chroot-resolved path, but STORE the user
-    // view — chroot is applied exactly once, at resolution time (see
-    // resolve_cwd_path_user).
-    let user_abs = resolve_cwd_path_user(task, &path);
-    let abs = resolve_cwd_path(task, &path);
-    // Reject cd into a path that isn't a directory (ENOENT/ENOTDIR).
-    if resolve_dir_absolute(&abs).is_none() {
-        ctx.set_return(fail);
-        return;
-    }
-    let mut g = CWD_TABLE.lock();
-    let map = match g.as_mut() {
-        Some(m) => m,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    map.insert(task, user_abs);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `fchdir(fd)` — x86_64 81, aarch64 50. Chdir to the directory a fd
-/// was opened on: glibc's fts/nftw walkers (`rm -r`, `find`) and the
-/// save-cwd/restore-cwd idiom depend on it. The fd's open path comes
-/// from the same fd→path record `/proc/[pid]/fd` readlinks
-/// (chroot-stripped user view), then the tail is exactly sys_chdir:
-/// resolve, verify it names a directory, install.
-fn sys_fchdir(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let task = current_task_id();
-    let path = match fd_path_of(task, fd) {
-        // fd_path_of falls back to a type_name for pathless fds
-        // (pipes, sockets, …) — those never start with '/' and are
-        // ENOTDIR, same as Linux fchdir on a non-directory fd.
-        Some(p) if p.starts_with('/') => p,
-        Some(_) => {
-            ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // ENOTDIR
-            return;
-        }
-        None => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
-            return;
-        }
-    };
-    // Validate chroot-resolved; store the USER view (chroot applies
-    // exactly once at resolution — see resolve_cwd_path_user).
-    let user_abs = resolve_cwd_path_user(task, &path);
-    let abs = resolve_cwd_path(task, &path);
-    if resolve_dir_absolute(&abs).is_none() {
-        ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // ENOTDIR
-        return;
-    }
-    let mut g = CWD_TABLE.lock();
-    match g.as_mut() {
-        Some(m) => {
-            m.insert(task, user_abs);
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
-    }
-}
-
-fn sys_getcwd(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let buf = args.arg0 as *mut u8;
-    let len = args.arg1 as usize;
-    if buf.is_null() || len == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let task = current_task_id();
-    let cwd = {
-        let g = CWD_TABLE.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&task).cloned())
-            .unwrap_or_else(|| alloc::string::String::from("/"))
-    };
-    // Need cwd.len() + 1 bytes (string + NUL terminator). POSIX
-    // getcwd(3) returns ERANGE here; the syscall shape doesn't
-    // surface errno yet so we fold both "no buf" and "buf too
-    // small" into InvalidOp. A libc shim is expected to translate.
-    let needed = cwd.len() + 1;
-    if len < needed {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // Build NUL-terminated cwd in kernel memory, then copy_to_user.
-    let mut kbuf = alloc::vec![0u8; cwd.len() + 1];
-    kbuf[..cwd.len()].copy_from_slice(cwd.as_bytes());
-    // kbuf[cwd.len()] is already 0 (NUL).
-    // SAFETY: `buf` is the user cwd buffer (non-null, `len >= needed`, both checked);
-    // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(buf as u64, &kbuf) }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(cwd.len() as u64));
-}
-
 // ── Brk — per-task heap break ──────────────────────────────────────
 //
 // POSIX `brk(2)` shape: arg0 carries the requested new break, or 0
@@ -17057,33 +8031,6 @@ pub fn __test_brk_reset() {
 // brk top, working directory, sigaction handlers (SIG_IGN +
 // SIG_DFL stay as-is; user-installed handlers reset to SIG_DFL
 // per POSIX §8.5.4 — we don't enforce that yet, future fix).
-
-fn sys_execve(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // Linux ABI: `int execve(const char *pathname, char *const argv[],
-    // char *const envp[])`. Register mapping on x86_64:
-    //   rdi = pathname (NUL-terminated C string)
-    //   rsi = argv     (NULL-terminated array of `char *`)
-    //   rdx = envp     (NULL-terminated array of `char *`)
-    let path_uptr = args.arg0;
-    let argv_uptr = args.arg1;
-    let envp_uptr = args.arg2;
-
-    if path_uptr == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-
-    // Step 1: copy the pathname from user memory under SMAP.
-    let path_owned = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    do_execve_resolved(ctx, path_owned, argv_uptr, envp_uptr, None);
-}
 
 /// Shared execve body: `path_owned` is the already-resolved (kernel-side)
 /// pathname of the image; `argv_uptr`/`envp_uptr` are the user vectors.
@@ -17437,71 +8384,6 @@ impl<'a> TrapContext for ArgReshape<'a> {
     }
 }
 
-/// `execveat(dirfd, path, argv, envp, flags)` — execve relative to a
-/// dirfd. NARF resolves absolute paths (and AT_FDCWD) only, so the dirfd
-/// and flags are dropped and the call is forwarded to `sys_execve` with
-/// the `(path, argv, envp)` layout it expects.
-fn sys_execveat(ctx: &mut dyn TrapContext) {
-    // Linux: execveat(dirfd, path, argv, envp, flags).
-    let a = *ctx.args();
-    let dirfd = a.arg0 as i32;
-    // A NULL path POINTER is invalid (fexecve passes a valid pointer to an
-    // empty string, never NULL). Empty-string handling is below.
-    if a.arg1 == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let path_str = copy_user_cstr(a.arg1, 4096).unwrap_or_default();
-    let path_empty = path_str.is_empty();
-    const AT_EMPTY_PATH: u64 = 0x1000;
-    let task = current_task_id();
-
-    // Resolve the image path:
-    //   - empty path + AT_EMPTY_PATH → the binary the dirfd itself refers to
-    //     (fexecve(3): open the executable, then execveat(fd,"",…,AT_EMPTY_PATH).
-    //     systemd 257 spawns its sd-executor and every service exactly this way).
-    //   - absolute path → used as-is (dirfd ignored, like Linux).
-    //   - relative path → resolved against the dirfd's recorded open path.
-    let resolved: Option<alloc::string::String> = if path_str.is_empty() {
-        if (a.arg4 & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
-            fd_path_of(task, dirfd as u32)
-        } else {
-            None
-        }
-    } else if path_str.starts_with('/') {
-        Some(path_str)
-    } else if dirfd >= 0 {
-        fd_path_of(task, dirfd as u32).map(|mut d| {
-            if !d.ends_with('/') {
-                d.push('/');
-            }
-            d.push_str(&path_str);
-            d
-        })
-    } else {
-        // AT_FDCWD (or no dir): treat as a plain (cwd-relative) execve path.
-        Some(path_str)
-    };
-
-    if let Some(p) = resolved {
-        do_execve_resolved(ctx, p, a.arg2, a.arg3, None);
-        return;
-    }
-
-    // No filesystem path for the fd. For an AT_EMPTY_PATH fexecve this is the
-    // memfd case (systemd seals its sd-executor into a memfd and fexecve's it):
-    // read the ELF straight out of the fd's FileOps and exec those bytes.
-    if path_empty && (a.arg4 & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
-        if let Some(bytes) = read_fd_image(task, dirfd as u32) {
-            let label = alloc::format!("/proc/self/fd/{}", dirfd);
-            do_execve_resolved(ctx, label, a.arg2, a.arg3, Some(bytes));
-            return;
-        }
-    }
-    // Bad dirfd / unreadable fd — ENOENT.
-    ctx.set_return(SyscallReturn::ok((-2i64) as u64));
-}
-
 /// Parse `/proc/self/fd/<N>` or `/proc/<pid>/fd/<N>` → the fd number `N`.
 /// These are the magic symlinks glibc's fexecve / systemd's spawn execve.
 pub(crate) fn parse_proc_self_fd(path: &str) -> Option<u32> {
@@ -17546,43 +8428,6 @@ fn read_fd_image(task: u64, fd: u32) -> Option<alloc::vec::Vec<u8>> {
     } else {
         Some(buf)
     }
-}
-
-/// `faccessat2(dirfd, path, mode, flags)` / `fchmodat2(dirfd, path, mode,
-/// flags)` — both reshape the Linux NUL-terminated `path` into the NARF
-/// `(dirfd, path_ptr, path_len)` shape and forward to the shared
-/// existence-checking handler (mode/flags are accepted but not enforced).
-fn sys_at2_reshape(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let path_len = match copy_user_cstr(a.arg1, 4096) {
-        Some(s) => s.len(),
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    let proxy_args = SyscallArgs {
-        arg0: a.arg0, // dirfd
-        arg1: a.arg1, // path ptr
-        arg2: path_len as u64,
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
-    };
-    let mut proxy = ArgReshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_fchmodat_or_fchownat(&mut proxy);
-}
-
-/// `rseq(rseq, len, flags, sig)` — register/unregister a restartable-
-/// sequence area. NARF is a cooperative single-CPU kernel with no
-/// preemption mid-sequence, so there is nothing to restart; accept the
-/// registration (glibc registers rseq at thread start and expects
-/// success or a clean ENOSYS).
-fn sys_rseq(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(0));
 }
 
 /// Parse a NUL-separated user-supplied string pack into a Vec of
@@ -17973,354 +8818,11 @@ const MS_SHARED: u64 = 1 << 20;
 const MS_PROPAGATION: u64 = MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED;
 const MS_RELATIME: u64 = 1 << 21;
 
-fn sys_mount(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // errno replies (negated-long convention). Every failure carries a
-    // specific errno (a bare -1 would map to EPERM), matching Linux mount(2).
-    let einval = SyscallReturn::ok((-22i64) as u64); // EINVAL — bad argument
-    let enodev = SyscallReturn::ok((-19i64) as u64); // ENODEV — unknown fstype
-    let ebusy = SyscallReturn::ok((-16i64) as u64); // EBUSY — target in use
-    let enoent = SyscallReturn::ok((-2i64) as u64); // ENOENT — missing source
-    let efault = SyscallReturn::ok((-14i64) as u64); // EFAULT — bad user pointer
-                                                     // A copy-in failure means an unreadable user pointer → EFAULT.
-    let fail = efault;
-
-    // Linux `mount(2)`: (const char *source, const char *target,
-    // const char *filesystemtype, unsigned long mountflags, const void *data).
-    // All strings are NUL-terminated; there are NO explicit length args.
-    //   arg0 = source, arg1 = target, arg2 = fstype, arg3 = flags, arg4 = data.
-    // This handler previously used a NARF-native (ptr, len, ...) shape with
-    // fstype_len/flags packed into arg5 — so a musl-built caller's Linux-ABI
-    // call was mis-parsed (arg1 read as a length, etc.) and returned EPERM.
-    // That silently broke every real mount: elogind's per-user tmpfs at
-    // /run/user/0 failed → CreateSession failed → no logind session for kwin.
-    let source = copy_user_cstr(args.arg0, 4096).unwrap_or_default();
-    let target_raw = match copy_user_cstr(args.arg1, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // fstype may be NULL for MS_REMOUNT / MS_BIND / MS_MOVE.
-    let fstype = if args.arg2 == 0 {
-        alloc::string::String::new()
-    } else {
-        copy_user_cstr(args.arg2, 256).unwrap_or_default()
-    };
-    let flags = args.arg3;
-    // arg4 = fs-specific `data` (e.g. tmpfs "mode=0700,size=…"); accepted but
-    // not parsed — NARF's MemFs has no per-mount options yet.
-
-    // Propagation-only change (MS_SLAVE/MS_SHARED/MS_PRIVATE/MS_UNBINDABLE,
-    // optionally |MS_REC): change the propagation type of the mount at
-    // `target` and nothing else. NARF has no propagation model, so this is a
-    // no-op success. Gated to "a propagation bit is set and no fstype / bind /
-    // move / remount work is requested" so a legitimate mount that also passes
-    // a propagation bit still falls through to the real dispatch below. Handled
-    // BEFORE bind/tmpfs/API dispatch because these calls carry a NULL source
-    // and NULL fstype (see the MS_PROPAGATION comment).
-    if (flags & MS_PROPAGATION) != 0
-        && (flags & (MS_BIND | MS_MOVE | MS_REMOUNT)) == 0
-        && (fstype.is_empty() || fstype == "none")
-    {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    // Resolve target under the calling task's chroot.
-    let target = apply_chroot(target_raw.as_str());
-    // Resolve source under chroot too when it's a path (bind / tmpfs
-    // source-as-label is harmless to pass through; block-device names
-    // don't start with `/` so apply_chroot is a no-op).
-    let source_resolved = if source.starts_with('/') {
-        apply_chroot(source.as_str())
-    } else {
-        source.clone()
-    };
-    // Silence-the-warning swallow for option bits we accept but
-    // don't yet act on; they're documented above.
-    let _ =
-        flags & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_REMOUNT | MS_REC | MS_RELATIME);
-
-    // Idempotent pseudo-filesystem mount. An init system mounts the API
-    // filesystems (/proc, /sys, /dev, /run, ...) unconditionally at startup,
-    // and NARF's Stage::Late `mnt-dev-bind` already binds procfs/sysfs/devfs
-    // + tmpfs /run,/tmp into the chroot before PID 1 runs. NARF has no mount
-    // stacking, so a re-mount of an already-provided pseudo-fs target reports
-    // success (matching Linux, which stacks and succeeds) rather than
-    // erroring. Scoped to the fstypes `mount_api::build_fs` recognizes (the
-    // in-memory / synthetic filesystems) so bind / block-device mounts keep
-    // their real handling (a bind onto an existing path is a distinct op).
-    // The fstype→backend dispatch lives in the linux-compat-only mount_api;
-    // the mount(2) syscall itself is only wired under linux-compat, so the
-    // non-linux-compat build just needs this to compile (no pseudo-fs there).
-    #[cfg(feature = "linux-compat")]
-    let is_pseudo_fs = crate::mount_api::build_fs(fstype.as_str()).is_some();
-    #[cfg(not(feature = "linux-compat"))]
-    let is_pseudo_fs = false;
-    if is_pseudo_fs
-        && narf_filesystem::registry()
-            .list()
-            .iter()
-            .any(|m| m == &target)
-    {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    let auth = narf_filesystem::bootstrap_mount_authority();
-    let domain = narf_lib::id::DomainId::DRIVER_0;
-
-    // Wave-71: MS_BIND or fstype=="bind" → bind mount. `source` is
-    // an absolute path; `target` is the new path. No block device.
-    if fstype == "bind" || (flags & MS_BIND) != 0 {
-        return match narf_filesystem::registry().bind_mount(
-            &auth,
-            source_resolved.as_str(),
-            target.as_str(),
-        ) {
-            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(narf_filesystem::FsError::NotFound) => ctx.set_return(enoent),
-            Err(narf_filesystem::FsError::Busy) => ctx.set_return(ebusy),
-            Err(_) => ctx.set_return(einval),
-        };
-    }
-
-    // Pseudo / in-memory filesystems: tmpfs, proc, sysfs, devtmpfs, cgroup2,
-    // devpts, mqueue, securityfs, debugfs, … The shared dispatch
-    // (mount_api::build_fs) returns a real backend where NARF has one
-    // (proc/sysfs/cgroup2 are global singletons whose content attaches at the
-    // caller's target, e.g. a chroot's /proc or /sys/fs/cgroup) and a minimal
-    // empty directory for the rest; only a genuinely unknown fstype returns
-    // None. This is the same dispatch the new mount API (fsopen → fsconfig)
-    // uses, so both entry points recognize identical filesystems. Block-device
-    // fstypes (fat/vfat/ext…) fall through below because build_fs can't
-    // synthesize them without a device.
-    #[cfg(feature = "linux-compat")]
-    if let Some(fs) = crate::mount_api::build_fs(fstype.as_str()) {
-        return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
-            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-            // Something is already mounted at this path. systemd re-mounts the
-            // API filesystems (proc/sys/…) that boot already provided; treat an
-            // existing mount at the same path as success so those units pass.
-            Err(narf_filesystem::FsError::Busy) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(einval),
-        };
-    }
-
-    // overlayfs (union mount). Linux passes the layer paths in the mount(2)
-    // `data` string (lowerdir=/a:/b,upperdir=/u,workdir=/w). NARF's mount ABI
-    // has no register left for a `data` pointer, so the options string is
-    // accepted via `source` instead (the conventional overlay source is the
-    // information-free literal "overlay"). `workdir` is parsed but ignored —
-    // copy-up/whiteout ops act directly on the upper dir.
-    if fstype == "overlay" || fstype == "overlayfs" {
-        let opts = source.as_str();
-        let mut lowerdirs: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
-        let mut upperdir: Option<&str> = None;
-        for kv in opts.split(',') {
-            let kv = kv.trim();
-            if let Some(v) = kv.strip_prefix("lowerdir=") {
-                // Colon-separated, highest-priority first (Linux order).
-                lowerdirs = v.split(':').filter(|s| !s.is_empty()).collect();
-            } else if let Some(v) = kv.strip_prefix("upperdir=") {
-                upperdir = Some(v);
-            } else if kv.starts_with("workdir=") {
-                // Accepted-and-ignored (documented above).
-            }
-        }
-        let upper_path = match upperdir {
-            Some(p) => apply_chroot(p),
-            None => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
-        let upper = match resolve_dir_absolute(upper_path.as_str()) {
-            Some(d) => d,
-            None => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
-        let mut lowers: alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::DirOps>> =
-            alloc::vec::Vec::new();
-        for lp in &lowerdirs {
-            let abs = apply_chroot(lp);
-            match resolve_dir_absolute(abs.as_str()) {
-                Some(d) => lowers.push(d),
-                None => {
-                    ctx.set_return(fail);
-                    return;
-                }
-            }
-        }
-        let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
-            alloc::sync::Arc::new(narf_filesystem::OverlayFs::new("overlay", upper, lowers));
-        return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
-            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(fail),
-        };
-    }
-
-    // FUSE mounts: `fstype == "fuse"` or `"fuse.<subtype>"`. Options carry
-    // `fd=N` naming the open `/dev/fuse` connection (passed via `source`
-    // since NARF's mount ABI has no `data` register). Parse fd, recover the
-    // connection, build a FuseFs, drive FUSE_INIT. Linux: fuse_fill_super.
-    if fstype == "fuse" || fstype.starts_with("fuse.") {
-        let fd_opt = source
-            .split(',')
-            .find_map(|kv| kv.strip_prefix("fd="))
-            .and_then(|v| v.trim().parse::<u32>().ok());
-        let fd = match fd_opt {
-            Some(fd) => fd,
-            None => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
-        let task = current_task_id();
-        let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone()));
-        let conn = match ops {
-            Some(Some(o)) => match narf_filesystem::fuse_conn::DevFuse::connection_of(&o) {
-                Some(c) => c,
-                None => {
-                    ctx.set_return(fail);
-                    return;
-                }
-            },
-            _ => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
-        let subtype = fstype.strip_prefix("fuse.").unwrap_or("fuse");
-        let fs = alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseFs::new(subtype, conn));
-        let _ = poll_blocking(fs.init());
-        let fs_dyn: alloc::sync::Arc<dyn narf_filesystem::FsInstance> = fs;
-        return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs_dyn) {
-            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(fail),
-        };
-    }
-
-    // Extensibility fallback: an out-of-tree crate may have registered a
-    // constructor for this fstype via `register_fstype`. Built-in arms above
-    // keep priority; consulted only for otherwise-unknown types, before the
-    // block-device fallthrough. Options are passed via source/data.
-    if let Some(builder) = narf_filesystem::lookup_fstype(fstype.as_str()) {
-        return match builder(source_resolved.as_str(), source_resolved.as_str()) {
-            Ok(fs) => match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
-                Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-                Err(_) => ctx.set_return(fail),
-            },
-            Err(_) => ctx.set_return(fail),
-        };
-    }
-
-    // Block-device-backed mounts: resolve `source` as a registered
-    // block-device name. Strip a leading "/dev/" so callers can
-    // pass either form.
-    let dev_name = source.strip_prefix("/dev/").unwrap_or(source.as_str());
-    let entry = match narf_block::block_devices()
-        .into_iter()
-        .find(|e| e.name == dev_name)
-    {
-        Some(e) => e,
-        None => {
-            // No backend, no register_fstype builder, and no such device: a
-            // known block fstype with a missing device is ENOENT; a genuinely
-            // unknown fstype is ENODEV (matching Linux, never a bare -1).
-            match fstype.as_str() {
-                "fat" | "vfat" | "fat16" | "fat32" | "ext2" | "ext3" | "ext4" | "xfs" | "btrfs"
-                | "iso9660" | "9p" | "virtiofs" => ctx.set_return(enoent),
-                _ => ctx.set_return(enodev),
-            }
-            return;
-        }
-    };
-
-    let result = match fstype.as_str() {
-        "fat" | "vfat" | "fat16" | "fat32" => {
-            let dev = narf_block::SyncBlock::new(entry.dev.clone());
-            let fut = narf_drivers_fs_fat::mount_fat(&auth, target.as_str(), dev, domain);
-            poll_blocking(fut)
-        }
-        _ => {
-            // A registered device but an unrecognized fstype for it.
-            ctx.set_return(enodev);
-            return;
-        }
-    };
-
-    match result {
-        Some(Ok(_handle)) => ctx.set_return(SyscallReturn::ok(0)),
-        _ => ctx.set_return(einval),
-    }
-}
-
 // Wave-71: Linux MNT_* flags for umount2(2).
 const MNT_FORCE: u64 = 1 << 0;
 const MNT_DETACH: u64 = 1 << 1;
 const MNT_EXPIRE: u64 = 1 << 2;
 const UMOUNT_NOFOLLOW: u64 = 1 << 3;
-
-fn sys_umount2(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fail = SyscallReturn::ok(!0u64);
-    // Linux `umount2(2)`: (const char *target, int flags). `target` is a
-    // NUL-terminated path; there is no length arg. (Was NARF-native
-    // (ptr, len, flags), which mis-read a musl caller's flags as the length.)
-    let target_raw = match copy_user_cstr(args.arg0, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let target = apply_chroot(target_raw.as_str());
-    let flags = args.arg1;
-    // We accept MNT_FORCE / MNT_DETACH / MNT_EXPIRE / UMOUNT_NOFOLLOW
-    // but the registry doesn't yet track in-flight refs against a
-    // mount, so the pop-by-path is unconditional. The flag word is
-    // recorded for diagnostic symmetry only.
-    let _ = flags & (MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW);
-
-    // Protect the core API pseudo-filesystems from destructive unmount.
-    // NARF has no mount stacking: /proc, /sys, /dev (and cgroup2) are single
-    // shared instances that the chroot's Stage::Late `mnt-dev-bind` provides
-    // and everything depends on. Because NARF mounts these idempotently (see
-    // sys_mount), the balancing umount of one is also a no-op: report success
-    // but keep the singleton mounted. tmpfs / bind / real mounts unmount as
-    // normal.
-    let protected = narf_filesystem::registry()
-        .list_with_names()
-        .into_iter()
-        .any(|(path, name)| {
-            path == target
-                && matches!(
-                    name.as_str(),
-                    "procfs" | "sysfs" | "devfs" | "cgroup2" | "cgroupfs"
-                )
-        });
-    if protected {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    let auth = narf_filesystem::bootstrap_mount_authority();
-    // SAFETY: bootstrapping a Write cap is the same TCB-trusted op
-    // the registry uses internally to mint the per-mount handle.
-    let handle: narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write> =
-        narf_capabilities::Cap::<narf_filesystem::MountPoint, narf_capabilities::Write>::bootstrap(
-        );
-    let _ = auth;
-    match narf_filesystem::registry().unmount(&handle, target.as_str()) {
-        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(_) => ctx.set_return(fail),
-    }
-}
 
 /// Linux x86_64 `struct statfs` (fs/statfs). The FIRST field is `f_type`,
 /// the filesystem super-magic — programs like elogind statfs a path and check
@@ -18384,26 +8886,6 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     // SAFETY: `buf_ptr` is the user statfs buffer (non-zero, checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
     unsafe { copy_to_user(buf_ptr, &bytes) }.is_ok()
-}
-
-fn sys_statfs(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fail = SyscallReturn::ok(!0u64);
-    // Linux: statfs(const char *path, struct statfs *buf). arg0 = NUL-term
-    // path, arg1 = buf. (Was NARF-native (path_ptr, path_len, buf).)
-    let path = match copy_user_cstr(args.arg0, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let buf_ptr = args.arg1;
-    if fill_statfs_for_path(&path, buf_ptr) {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(fail);
-    }
 }
 
 // Per-task mount namespace table. Entries appear here when a task
@@ -18561,96 +9043,6 @@ pub fn proc_ns_idmap_write(
         .map_err(|_| narf_filesystem::FsError::InvalidData)
 }
 
-fn sys_unshare(ctx: &mut dyn TrapContext) {
-    let flags = ctx.args().arg0;
-    const CLONE_NEWNS: u64 = 0x00020000;
-    #[cfg(feature = "container")]
-    const CLONE_NEWPID: u64 = 0x20000000;
-
-    let mut any = false;
-
-    if flags & CLONE_NEWNS != 0 {
-        task_mount_ns_init();
-        let task = current_task_id();
-        let snap = narf_filesystem::MountNamespace::snapshot_global();
-        let mut g = TASK_MOUNT_NS.lock();
-        if let Some(m) = g.as_mut() {
-            m.insert(task, snap);
-            any = true;
-        } else {
-            ctx.set_return(SyscallReturn::ok(!0u64));
-            return;
-        }
-    }
-
-    #[cfg(feature = "container")]
-    if flags & CLONE_NEWPID != 0 {
-        let task = current_task_id();
-        // The task's outer pid is what the root-namespace fork
-        // recorded. If no mapping is present, fall back to the task
-        // id itself — it's a kernel-spawned task with implicit
-        // outer == inner already.
-        let outer = task_to_pid_raw(task).unwrap_or(task);
-        let _ns = crate::pid_ns::unshare_pid_ns(task, outer);
-        any = true;
-    }
-
-    // Wave-72 — UTS / NET / IPC namespaces.
-    #[cfg(feature = "container")]
-    {
-        let task = current_task_id();
-        // CLONE_NEWUSER must be applied FIRST: Linux makes the caller
-        // uid 0 inside the new user-ns and (in a real cap model) grants
-        // a full cap set, which is what authorises the other unshares.
-        // We record the creator's HOST uid as the ns owner, then set
-        // the caller's in-ns uid/gid to 0 so it is root *inside*.
-        if flags & crate::namespaces::CLONE_NEWUSER != 0 {
-            let host_uid = read_uidgid(task).euid;
-            let _ns = crate::namespaces::unshare_user(task, host_uid);
-            // The caller becomes uid 0 inside the new namespace.
-            let _ = write_uidgid(task, |e| {
-                e.uid = 0;
-                e.gid = 0;
-                e.euid = 0;
-                e.egid = 0;
-                e.fsuid = 0;
-                e.fsgid = 0;
-            });
-            any = true;
-        }
-        if flags & crate::namespaces::CLONE_NEWUTS != 0 {
-            crate::namespaces::unshare_uts(task);
-            any = true;
-        }
-        if flags & crate::namespaces::CLONE_NEWNET != 0 {
-            crate::namespaces::unshare_net(task);
-            any = true;
-        }
-        if flags & crate::namespaces::CLONE_NEWIPC != 0 {
-            crate::namespaces::unshare_ipc(task);
-            any = true;
-        }
-    }
-
-    // CLONE_NEWCGROUP — pin the calling process's current cgroup as its
-    // cgroup-namespace root so /proc/self/cgroup renders relative to it.
-    #[cfg(all(feature = "cgroup", feature = "container"))]
-    {
-        const CLONE_NEWCGROUP: u64 = 0x0200_0000;
-        if flags & CLONE_NEWCGROUP != 0 {
-            let task = current_task_id();
-            let pid = task_to_pid_raw(task).unwrap_or(task);
-            narf_filesystem::cgroupfs::unshare_cgroup_ns(pid);
-            any = true;
-        }
-    }
-
-    // Honour the no-op path (no NS bits set) as success — Linux unshare
-    // returns 0 with flags=0.
-    let _ = any;
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 // ── Wave-67: setns(target, nstype) ─────────────────────────────────
 //
 // Linux setns takes a fd referring to /proc/[pid]/ns/<type>. NARF
@@ -18659,150 +9051,6 @@ fn sys_unshare(ctx: &mut dyn TrapContext) {
 // whose namespace family we want to join. Once /proc/[pid]/ns/* is
 // plumbed, we'll add an inner branch that resolves the fd via the
 // fd table.
-
-fn sys_setns(ctx: &mut dyn TrapContext) {
-    #[cfg(feature = "container")]
-    {
-        let args = *ctx.args();
-        let target = args.arg0;
-        let nstype = args.arg1;
-        const CLONE_NEWNS: u64 = 0x00020000;
-        const CLONE_NEWPID: u64 = 0x20000000;
-        let caller = current_task_id();
-        let mut any = false;
-
-        // ── fd-based setns (Linux primary path) ──────────────────
-        //
-        // arg0 is normally an fd opened from /proc/<pid>/ns/<flavour>.
-        // If it resolves to an `NsFd` in the caller's fd table, install
-        // the held namespace and return. The held `Arc` keeps the ns
-        // alive even after its originator exited.
-        if let Some(held) = crate::fd::with_table(caller, |t| {
-            t.get(target as u32).and_then(|e| {
-                e.ops
-                    .as_any()
-                    .and_then(|a| a.downcast_ref::<crate::namespaces::NsFd>())
-                    .map(|nsfd| nsfd.held().clone())
-            })
-        })
-        .flatten()
-        {
-            let outer = task_to_pid_raw(caller).unwrap_or(caller);
-            // Mount-ns is held but installed through the handlers' mount
-            // table, not the namespaces module.
-            if let crate::namespaces::HeldNs::Mnt(mnt) = &held {
-                if nstype == 0 || nstype & CLONE_NEWNS != 0 {
-                    install_mount_namespace(caller, mnt.clone());
-                    ctx.set_return(SyscallReturn::ok(0));
-                    return;
-                }
-                ctx.set_return(SyscallReturn::ok(!0u64));
-                return;
-            }
-            if crate::namespaces::install_held_ns(caller, outer, &held, nstype) {
-                ctx.set_return(SyscallReturn::ok(0));
-            } else {
-                ctx.set_return(SyscallReturn::ok(!0u64));
-            }
-            return;
-        }
-
-        // ── Legacy NARF TaskId path (kept for existing tests) ─────
-        //
-        // Resolve target: prefer outer-pid lookup, fall back to
-        // treating `target` as an outer TaskId directly.
-        let target_task = pid_to_task_raw(target).unwrap_or(target);
-
-        if nstype & CLONE_NEWPID != 0 {
-            match crate::pid_ns::ns_of(target_task) {
-                Some(ns) => {
-                    let outer = task_to_pid_raw(caller).unwrap_or(caller);
-                    let _ = crate::pid_ns::attach_to_ns(caller, outer, ns);
-                    any = true;
-                }
-                None => {
-                    ctx.set_return(SyscallReturn::ok(!0u64));
-                    return;
-                }
-            }
-        }
-
-        if nstype & CLONE_NEWNS != 0 {
-            match mount_namespace_of(target_task) {
-                Some(ns) => {
-                    install_mount_namespace(caller, ns);
-                    any = true;
-                }
-                None => {
-                    ctx.set_return(SyscallReturn::ok(!0u64));
-                    return;
-                }
-            }
-        }
-
-        // Wave-72 — UTS / NET / IPC. Target must have an explicit
-        // per-task NS of the requested flavour; otherwise EINVAL.
-        if nstype & crate::namespaces::CLONE_NEWUTS != 0 {
-            match crate::namespaces::uts_ns_of(target_task) {
-                Some(ns) => {
-                    crate::namespaces::setns_uts(caller, ns);
-                    any = true;
-                }
-                None => {
-                    ctx.set_return(SyscallReturn::ok(!0u64));
-                    return;
-                }
-            }
-        }
-        if nstype & crate::namespaces::CLONE_NEWNET != 0 {
-            match crate::namespaces::net_ns_of(target_task) {
-                Some(ns) => {
-                    crate::namespaces::setns_net(caller, ns);
-                    any = true;
-                }
-                None => {
-                    ctx.set_return(SyscallReturn::ok(!0u64));
-                    return;
-                }
-            }
-        }
-        if nstype & crate::namespaces::CLONE_NEWIPC != 0 {
-            match crate::namespaces::ipc_ns_of(target_task) {
-                Some(ns) => {
-                    crate::namespaces::setns_ipc(caller, ns);
-                    any = true;
-                }
-                None => {
-                    ctx.set_return(SyscallReturn::ok(!0u64));
-                    return;
-                }
-            }
-        }
-        if nstype & crate::namespaces::CLONE_NEWUSER != 0 {
-            match crate::namespaces::user_ns_of(target_task) {
-                Some(ns) => {
-                    crate::namespaces::setns_user(caller, ns);
-                    any = true;
-                }
-                None => {
-                    ctx.set_return(SyscallReturn::ok(!0u64));
-                    return;
-                }
-            }
-        }
-
-        if !any {
-            // No supported nstype bits — Linux returns EINVAL.
-            ctx.set_return(SyscallReturn::ok(!0u64));
-            return;
-        }
-        ctx.set_return(SyscallReturn::ok(0));
-    }
-    #[cfg(not(feature = "container"))]
-    {
-        ctx.set_return(SyscallReturn::ok(!0u64));
-    }
-}
 
 // ── Wave-71: Per-task chroot table ────────────────────────────────
 //
@@ -18889,49 +9137,6 @@ pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
 }
 
 // ── Wave-71: chroot(2) ────────────────────────────────────────────
-#[cfg(feature = "linux-compat")]
-fn sys_chroot(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    // Linux `chroot(const char *path)` passes a single NUL-terminated
-    // path in arg0 — there is no length argument. (The earlier
-    // `copy_user_path_raw(arg0, arg1)` form misread arg1 as a length,
-    // which is garbage for a real Linux binary, so every chroot from
-    // unmodified userspace failed with -1.)
-    let raw = match copy_user_cstr(args.arg0, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    if !raw.starts_with('/') {
-        ctx.set_return(fail);
-        return;
-    }
-    // Compose against any existing chroot (nested chroot resolves
-    // under the current root before installation).
-    let resolved = apply_chroot(&raw);
-    // Verify resolved exists as a directory under the global
-    // registry — match Linux semantics: chroot fails if target
-    // doesn't exist. We treat a covering mount as sufficient.
-    let covered = narf_filesystem::registry()
-        .resolve_absolute(&resolved, |_fs, _rel| true)
-        .unwrap_or(false);
-    if !covered {
-        ctx.set_return(fail);
-        return;
-    }
-    root_dir_init_if_needed();
-    let task = current_task_id();
-    let mut g = ROOT_DIR_TABLE.lock();
-    if let Some(m) = g.as_mut() {
-        m.insert(task, resolved);
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(fail);
-    }
-}
 
 // ── Wave-71: pivot_root(2) ────────────────────────────────────────
 //
@@ -18940,61 +9145,6 @@ fn sys_chroot(ctx: &mut dyn TrapContext) {
 // becomes the new `/`. NARF approximation: register `put_old`
 // (resolved under the new root) as a bind mount of the previous
 // root path, then install the new chroot.
-#[cfg(all(feature = "linux-compat", feature = "container"))]
-fn sys_pivot_root(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let new_root = match copy_user_path_raw(args.arg0, args.arg1 as usize) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let put_old = match copy_user_path_raw(args.arg2, args.arg3 as usize) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    if !new_root.starts_with('/') || !put_old.starts_with('/') {
-        ctx.set_return(fail);
-        return;
-    }
-    // Resolve under the current chroot.
-    let new_root_resolved = apply_chroot(&new_root);
-    let put_old_resolved = apply_chroot(&put_old);
-    // Snapshot the prior root for bind-mounting.
-    let task = current_task_id();
-    let prior_root = {
-        let g = ROOT_DIR_TABLE.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&task).cloned())
-            .unwrap_or_else(|| alloc::string::String::from("/"))
-    };
-    // new_root must exist under the prior root.
-    let new_root_ok = narf_filesystem::registry()
-        .resolve_absolute(&new_root_resolved, |_fs, _rel| true)
-        .unwrap_or(false);
-    if !new_root_ok {
-        ctx.set_return(fail);
-        return;
-    }
-    // Bind-mount prior_root at put_old_resolved so the old root is
-    // still reachable from inside the new root.
-    let auth = narf_filesystem::bootstrap_mount_authority();
-    let _ = narf_filesystem::registry().bind_mount(&auth, &prior_root, &put_old_resolved);
-    // Install the new root.
-    root_dir_init_if_needed();
-    let mut g = ROOT_DIR_TABLE.lock();
-    if let Some(m) = g.as_mut() {
-        m.insert(task, new_root_resolved);
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(fail);
-    }
-}
 
 // ── Wave-71 test hooks ────────────────────────────────────────────
 //
@@ -19004,195 +9154,8 @@ fn sys_pivot_root(ctx: &mut dyn TrapContext) {
 // the entire `sys_*` family.
 
 #[doc(hidden)]
-pub fn sys_mount_for_test(ctx: &mut dyn TrapContext) {
-    sys_mount(ctx);
-}
-
-#[doc(hidden)]
-pub fn sys_umount2_for_test(ctx: &mut dyn TrapContext) {
-    sys_umount2(ctx);
-}
-
-#[cfg(feature = "linux-compat")]
-#[doc(hidden)]
-pub fn sys_chroot_for_test(ctx: &mut dyn TrapContext) {
-    sys_chroot(ctx);
-}
-
-#[cfg(all(feature = "linux-compat", feature = "container"))]
-#[doc(hidden)]
-pub fn sys_pivot_root_for_test(ctx: &mut dyn TrapContext) {
-    sys_pivot_root(ctx);
-}
-
-#[doc(hidden)]
 pub fn apply_chroot_for_test(p: &str) -> alloc::string::String {
     apply_chroot(p)
-}
-
-fn sys_fstatfs(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fail = SyscallReturn::ok(!0u64);
-    let fd = args.arg0 as u32;
-    let buf_ptr = args.arg1;
-    // Report the statfs of the filesystem backing THIS fd (not a synthetic
-    // "/"). The per-fd backing path recorded at open() maps back to its mount,
-    // whose super-magic `fill_statfs_for_path` derives. sd-device's
-    // `fd_is_fs_type(fd, SYSFS_MAGIC)` fstatfs()es an opened /sys/... device
-    // node and rejects it ("outside of sysfs") unless f_type == SYSFS_MAGIC —
-    // so a synthetic "/" answer (ext2/tmpfs magic) broke every udev device
-    // lookup. Fall back to "/" for fds with no path (pipes, sockets, eventfd).
-    let path = fd_path_of(current_task_id(), fd)
-        .filter(|p| p.starts_with('/'))
-        .unwrap_or_else(|| alloc::string::String::from("/"));
-    if fill_statfs_for_path(&path, buf_ptr) {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(fail);
-    }
-}
-
-fn sys_brk(ctx: &mut dyn TrapContext) {
-    let new_break = ctx.args().arg0;
-    let task = current_task_id();
-
-    // Snapshot the current break (initialising the slot on first call).
-    let cur = {
-        let mut g = BRK_TABLE.lock();
-        let map = match g.as_mut() {
-            Some(m) => m,
-            None => {
-                ctx.set_return(SyscallReturn::ok(0));
-                return;
-            }
-        };
-        *map.entry(task).or_insert(BRK_DEFAULT_BASE)
-    };
-
-    // Query path: arg0 == 0 just returns the current break.
-    if new_break == 0 {
-        ctx.set_return(SyscallReturn::ok(cur));
-        return;
-    }
-
-    // Ceiling: never let the heap climb past the arena top (which keeps it
-    // below the interpreter bias and the anonymous mmap window). A request
-    // above the ceiling fails per POSIX brk's contract — return the unchanged
-    // break so glibc/musl fall back to mmap.
-    if new_break > BRK_ARENA_TOP {
-        ctx.set_return(SyscallReturn::ok(cur));
-        return;
-    }
-
-    // Shrink path: walk the per-grow-call brk regions (each one
-    // base ≥ BRK_DEFAULT_BASE) and unmap any whose base falls
-    // entirely within [new_break_aligned, cur_aligned). Each
-    // unmap_region call walks PTEs + free_frame's the underlying
-    // physical pages so frames return to the allocator. A grow
-    // region whose base sits BELOW new_break but extends past it
-    // is left intact — partial unmapping would need a region-
-    // split primitive; documented limitation, slight over-keep
-    // bounded by the grow chunk size (one page on the smallest
-    // grow, larger when the user calls brk(big_jump)).
-    if new_break < cur {
-        if let Some(as_ref) = current_address_space() {
-            let new_aligned = (new_break + 0xFFF) & !0xFFFu64;
-            let mut bases_to_unmap: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-            for r in as_ref.regions_snapshot().iter() {
-                let rb = r.base.as_u64();
-                // Brk-grow regions live in `[BRK_DEFAULT_BASE, cur)`
-                // — bounded above by the OLD break. Without the
-                // `rb < cur` upper bound, any region above
-                // `BRK_DEFAULT_BASE` matches and gets unmapped,
-                // which on a fresh process (where cur ==
-                // BRK_DEFAULT_BASE) silently nukes the user stack
-                // at 0x7FFF_FFFC_0000 the next time the caller
-                // does `brk(small_value)`. ld-musl's
-                // `__init_libc` does exactly that early in init.
-                if rb >= BRK_DEFAULT_BASE && rb < cur && rb >= new_aligned {
-                    bases_to_unmap.push(rb);
-                }
-            }
-            for b in bases_to_unmap {
-                let _ = as_ref.unmap_region(VirtAddr::new(b));
-            }
-        }
-        BRK_TABLE
-            .lock()
-            .as_mut()
-            .expect("brk_init")
-            .insert(task, new_break);
-        ctx.set_return(SyscallReturn::ok(new_break));
-        return;
-    }
-
-    // Grow path: allocate frames + install a SINGLE Region for
-    // the whole new range (was one Region per page pre-fix —
-    // bookkeeping bloated linearly with heap size and the shrink
-    // path had to iterate page-by-page). On failure roll the
-    // break back to `cur` (POSIX brk failure contract).
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::ok(cur));
-            return;
-        }
-    };
-    let cur_aligned = (cur + 0xFFF) & !0xFFFu64;
-    let new_aligned = (new_break + 0xFFF) & !0xFFFu64;
-    let pages = (new_aligned - cur_aligned) >> 12;
-    if pages == 0 {
-        // Within-page grow — just record the new break, no PTE work.
-        BRK_TABLE
-            .lock()
-            .as_mut()
-            .expect("brk_init")
-            .insert(task, new_break);
-        ctx.set_return(SyscallReturn::ok(new_break));
-        return;
-    }
-    let mut phys_list: alloc::vec::Vec<narf_memory::PhysAddr> =
-        alloc::vec::Vec::with_capacity(pages as usize);
-    for _ in 0..pages {
-        let phys = match narf_memory::alloc_frame() {
-            Ok(f) => f.start_address(),
-            Err(_) => {
-                ctx.set_return(SyscallReturn::ok(cur));
-                return;
-            }
-        };
-        // SAFETY: identity-mapped low 4 GiB; phys is page-aligned.
-        unsafe {
-            core::ptr::write_bytes(phys.raw() as *mut u8, 0, 0x1000);
-        }
-        phys_list.push(phys);
-    }
-    if as_ref
-        .map_region(Region {
-            base: VirtAddr::new(cur_aligned),
-            len: pages * 0x1000,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: phys_list,
-        })
-        .is_err()
-    {
-        ctx.set_return(SyscallReturn::ok(cur));
-        return;
-    }
-    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the brk
-    // region was just registered via `map_region`, so materialize installs only its PTEs.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { as_ref.materialize() }.is_err() {
-        ctx.set_return(SyscallReturn::ok(cur));
-        return;
-    }
-
-    BRK_TABLE
-        .lock()
-        .as_mut()
-        .expect("brk_init")
-        .insert(task, new_break);
-    ctx.set_return(SyscallReturn::ok(new_break));
 }
 
 // ── ClockGetTime — write timespec to user buffer ──────────────────
@@ -19222,190 +9185,6 @@ const CLOCK_MONOTONIC: u64 = 1;
 const CLOCK_MONOTONIC_RAW: u64 = 4;
 const CLOCK_BOOTTIME: u64 = 7;
 
-fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let id = args.arg0;
-    let buf = args.arg1;
-    if buf == 0 || buf & 0x7 != 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let (sec, nsec) = match id {
-        CLOCK_REALTIME => {
-            let w = narf_scheduler::narf_time::now_wall();
-            (w.secs, w.nanos as i64)
-        }
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME => {
-            let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
-            ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
-        }
-        _ => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    // Write the timespec (two i64s: tv_sec, tv_nsec) under the SMAP bracket.
-    let mut kbuf = [0u8; 16];
-    kbuf[..8].copy_from_slice(&sec.to_ne_bytes());
-    kbuf[8..].copy_from_slice(&nsec.to_ne_bytes());
-    // SAFETY: `buf` is the user timespec pointer (non-zero and 8-aligned, checked above);
-    // copy_to_user range-validates it and SMAP-brackets the 16-byte write.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `clock_getres(clock_id, *timespec)` — report the resolution of a
-/// supported clock. NARF's monotonic/wall clocks are nanosecond-
-/// granular, so we report `{0, 1}`. `timespec` may be NULL (the call
-/// then just validates the clock id).
-fn sys_clock_getres(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let id = args.arg0;
-    let buf = args.arg1;
-    if !matches!(
-        id,
-        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME
-    ) {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    if buf != 0 {
-        let mut kbuf = [0u8; 16];
-        // tv_sec = 0, tv_nsec = 1 (1 ns resolution).
-        kbuf[8..16].copy_from_slice(&1i64.to_ne_bytes());
-        // SAFETY: `buf` is the user `timespec*` (non-zero); copy_to_user
-        // range-validates the 16-byte write.
-        if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `sys_clock_settime(clock_id, *timespec)` — set CLOCK_REALTIME
-/// by computing the wall-offset from the requested (sec, nsec) and
-/// the current monotonic. Other clock_ids return -1.
-fn sys_clock_settime(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let id = args.arg0;
-    let ts = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if ts == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    if id != CLOCK_REALTIME {
-        // CLOCK_MONOTONIC and friends are not settable.
-        ctx.set_return(fail);
-        return;
-    }
-    // Read the timespec (two i64s) from user space under the SMAP bracket.
-    let mut kbuf = [0u8; 16];
-    // SAFETY: `ts` is the user timespec pointer (non-zero, checked above);
-    // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_from_user(&mut kbuf, ts) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    let sec = i64::from_ne_bytes(kbuf[..8].try_into().unwrap());
-    let nsec = i64::from_ne_bytes(kbuf[8..].try_into().unwrap());
-    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
-        ctx.set_return(fail);
-        return;
-    }
-    let target_ns = (sec as i128) * 1_000_000_000 + (nsec as i128);
-    let mono_ns = narf_scheduler::narf_time::monotonic_ns() as i128;
-    let offset_ns = (target_ns - mono_ns) as i64;
-    narf_scheduler::narf_time::set_wall_offset_uncapped(offset_ns);
-    // Republish the offset to the vDSO vvar so __vdso_clock_gettime
-    // (CLOCK_REALTIME) tracks the new wall time without a syscall.
-    crate::vdso::update_wall_offset(offset_ns);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `gettimeofday(timeval*, timezone*)` — get wall-clock time as
-/// `{ tv_sec: i64, tv_usec: i64 }` in seconds + microseconds (not ns).
-/// Converts from monotonic + wall-offset. Returns 0 on success.
-fn sys_gettimeofday(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let tv_ptr = args.arg0;
-    // arg1 (timezone*) is ignored per Linux spec.
-    if tv_ptr != 0 {
-        // Write { tv_sec: i64, tv_usec: i64 } = 16 bytes.
-        let wall = narf_scheduler::narf_time::now_wall();
-        let sec = wall.secs;
-        let usec = (wall.nanos / 1_000) as i64; // ns → µs (not nanoseconds!)
-        let mut kbuf = [0u8; 16];
-        kbuf[..8].copy_from_slice(&sec.to_ne_bytes());
-        kbuf[8..].copy_from_slice(&usec.to_ne_bytes());
-        // SAFETY: `tv_ptr` is the user timeval pointer (non-zero, checked above);
-        // copy_to_user range-validates it and SMAP-brackets the 16-byte write.
-        if unsafe { copy_to_user(tv_ptr, &kbuf) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `settimeofday(timeval*, timezone*)` — set wall-clock time from
-/// `{ tv_sec: i64, tv_usec: i64 }`. arg0 may be null (no-op).
-/// Returns 0 on success.
-fn sys_settimeofday(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let tv_ptr = args.arg0;
-    // arg1 (timezone*) is ignored per Linux spec.
-    if tv_ptr == 0 {
-        // Null pointer → no-op, return success.
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    // Read the timeval (two i64s) from user space.
-    let mut kbuf = [0u8; 16];
-    // SAFETY: `tv_ptr` is the user timeval pointer (non-zero, checked above);
-    // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
-    if unsafe { copy_from_user(&mut kbuf, tv_ptr) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-        return;
-    }
-    let sec = i64::from_ne_bytes(kbuf[..8].try_into().unwrap());
-    let usec = i64::from_ne_bytes(kbuf[8..].try_into().unwrap());
-    // Validate: tv_usec must be in [0, 1_000_000).
-    if sec < 0 || !(0..1_000_000).contains(&usec) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-        return;
-    }
-    // Convert µs → ns and set wall clock.
-    let nsec = usec * 1_000; // µs → ns
-    let target_ns = (sec as i128) * 1_000_000_000 + (nsec as i128);
-    let mono_ns = narf_scheduler::narf_time::monotonic_ns() as i128;
-    let offset_ns = (target_ns - mono_ns) as i64;
-    narf_scheduler::narf_time::set_wall_offset_uncapped(offset_ns);
-    crate::vdso::update_wall_offset(offset_ns);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `time(time_t*)` — get wall-clock seconds. Returns seconds since epoch;
-/// if arg0 is non-null, also store it there. Returns the seconds.
-fn sys_time(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let time_ptr = args.arg0;
-    let wall = narf_scheduler::narf_time::now_wall();
-    let sec = wall.secs;
-    if time_ptr != 0 {
-        // SAFETY: `time_ptr` is the user time_t* pointer (non-zero, checked above);
-        // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
-        let _ = unsafe { copy_to_user(time_ptr, &sec.to_ne_bytes()) };
-    }
-    ctx.set_return(SyscallReturn::ok(sec as u64));
-}
-
 // ── I/O Priority (ioprio_set / ioprio_get) ─────────────────────────
 //
 // Store I/O priority per (which, who) tuple. ioprio_get returns the
@@ -19413,35 +9192,6 @@ fn sys_time(ctx: &mut dyn TrapContext) {
 
 static IOPRIO_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<(i32, u64), u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
-
-/// `ioprio_set(which, who, ioprio)` — set I/O priority.
-/// arg0 = which, arg1 = who (pid), arg2 = ioprio.
-/// Returns 0 on success.
-fn sys_ioprio_set(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let which = args.arg0 as i32;
-    let who = args.arg1;
-    let ioprio = args.arg2 as u32;
-    let mut g = IOPRIO_TABLE.lock();
-    let m = g.get_or_insert_with(BTreeMap::new);
-    m.insert((which, who), ioprio);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `ioprio_get(which, who)` — get I/O priority.
-/// arg0 = which, arg1 = who (pid).
-/// Returns stored priority or Linux default (IOPRIO_CLASS_BE=2 << 13) | 4.
-fn sys_ioprio_get(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let which = args.arg0 as i32;
-    let who = args.arg1;
-    let g = IOPRIO_TABLE.lock();
-    let result = g
-        .as_ref()
-        .and_then(|m| m.get(&(which, who)).copied())
-        .unwrap_or((2u32 << 13) | 4); // IOPRIO_CLASS_BE=2 (bits 13-15), prio=4
-    ctx.set_return(SyscallReturn::ok(result as u64));
-}
 
 // ── Signal delivery: pending + mask + delivery hook ────────────────
 //
@@ -21004,148 +10754,6 @@ fn signal_target_exists(tid: u64) -> bool {
         .is_some_and(|m| m.contains_key(&tid))
 }
 
-fn sys_kill(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let spec = args.arg0 as i64;
-    let signum = args.arg1 as u32;
-    let einval = SyscallReturn::ok((-22i64) as u64);
-    let esrch = SyscallReturn::ok((-3i64) as u64);
-    // Linux _NSIG = 64; NARF's bit-N bitmap represents 1..=63 (see
-    // SIGNAL_PENDING) — signal 64 (SIGRTMAX) is rejected like an
-    // out-of-range signal.
-    if signum > 64 {
-        ctx.set_return(einval);
-        return;
-    }
-
-    // Linux kill(2) target forms:
-    //   pid > 0   → that process
-    //   pid == 0  → every process in the CALLER's process group
-    //   pid == -1 → every process the caller may signal (except init)
-    //   pid < -1  → every process in process group -pid
-    let delivered = match spec {
-        1.. => {
-            #[allow(unused_mut)]
-            let mut target = spec as u64;
-            // Wave-67 — translate the user-supplied pid (interpreted as
-            // in-namespace per Linux semantics) to the outer pid the
-            // delivery path is keyed on.
-            #[cfg(feature = "container")]
-            {
-                let caller = current_task_id();
-                match crate::pid_ns::resolve_inner_pid(caller, target) {
-                    Some(outer) => target = outer,
-                    None => {
-                        ctx.set_return(esrch);
-                        return;
-                    }
-                }
-            }
-            // Existence check FIRST so `kill(pid, 0)` (the POSIX
-            // liveness probe) reports ESRCH for a vanished target and
-            // queues NOTHING for a live one.
-            let target_tid = pid_to_task_raw(target).unwrap_or(target);
-            let exists = signal_target_exists(target_tid);
-            if !exists {
-                false
-            } else if signum == 0 {
-                true
-            } else if pid_to_task_raw(target).is_some() {
-                kill_process(target, signum)
-            } else {
-                // Raw-tid fallback (boot-init spawned tasks).
-                signal_stopcont_interaction(target, signum);
-                raise_signal_pending(target, signum);
-                wake_signal(target);
-                true
-            }
-        }
-        0 => {
-            let pgrp = read_pgid(current_task_id());
-            if pgrp == 0 {
-                false
-            } else if signum == 0 {
-                true
-            } else {
-                deliver_signal_to_pgrp(pgrp, signum)
-            }
-        }
-        -1 => {
-            // Broadcast: every process with a registered pid except
-            // init (pid 1) and the caller itself, per Linux.
-            let self_tid = current_task_id();
-            let targets: alloc::vec::Vec<(u64, u64)> = {
-                let g = PID_TO_TASK.lock();
-                g.as_ref()
-                    .map(|m| {
-                        m.iter()
-                            .filter(|&(&p, &t)| p != 1 && t != self_tid)
-                            .map(|(&p, &t)| (p, t))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            let mut any = false;
-            for (p, _t) in targets {
-                if signum == 0 {
-                    any = true;
-                } else {
-                    any |= kill_process(p, signum);
-                }
-            }
-            any
-        }
-        _ => {
-            let pgrp = (-spec) as u64;
-            if signum == 0 {
-                pgrp != 0
-            } else {
-                deliver_signal_to_pgrp(pgrp, signum)
-            }
-        }
-    };
-
-    ctx.set_return(if delivered {
-        SyscallReturn::ok(0)
-    } else {
-        esrch
-    });
-}
-
-/// `rt_sigqueueinfo(pid, sig, info)` — queue `sig` to `pid`. NARF's
-/// pending-signal model is a per-task bitmask, so the accompanying
-/// `siginfo_t` payload isn't preserved, but the signal is delivered
-/// exactly like `kill(2)`/`tkill(2)`.
-fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let sig = a.arg1 as u32;
-    if sig > 64 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let target = pid_to_task_raw(a.arg0).unwrap_or(a.arg0);
-    // ESRCH for a vanished target (Linux rt_sigqueueinfo(2)).
-    if !signal_target_exists(target) {
-        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
-        return;
-    }
-    if !capture_queued_siginfo(target, sig, a.arg2) {
-        // Target's queued-signal budget exhausted (RLIMIT_SIGPENDING
-        // analogue): deliver nothing, tell the sender to back off.
-        ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
-        return;
-    }
-    raise_signal_pending(target, sig); // ORs the pending bit + wakes
-                                       // Producer/consumer back-pressure: the target is falling behind —
-                                       // yield this sender at syscall exit so the consumer(s) drain (see
-                                       // SIGQUEUE_BACKPRESSURE_DEPTH).
-    #[cfg(target_arch = "x86_64")]
-    if sigqueue_depth(target) > SIGQUEUE_BACKPRESSURE_DEPTH {
-        narf_scheduler::stackful::request_syscall_backpressure_yield();
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 /// Copy `si_code` (offset 8), `si_pid` (offset 16) and `si_value` (the
 /// sigval union, offset 24) out of a user `siginfo_t` and stash them for
 /// delivery / sigtimedwait / signalfd. Returns `false` only when the
@@ -21168,36 +10776,6 @@ fn capture_queued_siginfo(target: u64, sig: u32, info_ptr: u64) -> bool {
         return store_sigqueue_info(target, sig, si_code, si_value, si_pid);
     }
     true
-}
-
-/// `rt_tgsigqueueinfo(tgid, tid, sig, info)` — queue `sig` to thread
-/// `tid`. Same pending-bitmask delivery as `rt_sigqueueinfo`.
-fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let sig = a.arg2 as u32;
-    if sig > 64 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let target = pid_to_task_raw(a.arg1).unwrap_or(a.arg1);
-    // ESRCH for a vanished target + tgid consistency (see sys_tgkill).
-    if !signal_target_exists(target)
-        || (a.arg0 != 0 && task_to_pid_raw(target).unwrap_or(target) != a.arg0)
-    {
-        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
-        return;
-    }
-    if !capture_queued_siginfo(target, sig, a.arg3) {
-        ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN (see rt_sigqueueinfo)
-        return;
-    }
-    raise_signal_pending(target, sig);
-    // Back-pressure — see sys_rt_sigqueueinfo.
-    #[cfg(target_arch = "x86_64")]
-    if sigqueue_depth(target) > SIGQUEUE_BACKPRESSURE_DEPTH {
-        narf_scheduler::stackful::request_syscall_backpressure_yield();
-    }
-    ctx.set_return(SyscallReturn::ok(0));
 }
 
 // ── futex — minimal scaffold ────────────────────────────────────────
@@ -21605,193 +11183,6 @@ pub fn futex_wake_waiters_for_test(uaddr: u64, n: u32) -> usize {
     futex_wake_waiters(uaddr, n)
 }
 
-fn sys_futex(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let uaddr = args.arg0;
-    let op = args.arg1 & FUTEX_OP_MASK;
-    let val = args.arg2 as u32;
-    // KNOWN ABI DIVERGENCE: Linux futex(2)'s 4th argument is a `struct
-    // timespec *`, but this handler consumes it as a raw nanosecond count —
-    // a stack-allocated timespec pointer (~0x7ffc_xxxx_xxxx) becomes a
-    // ~39-hour relative timeout, i.e. every real timed FUTEX_WAIT is
-    // effectively untimed and relies on the futex wake / signal wake alone.
-    // (Observed directly in the stress-ng --futex SMP strand: the child's
-    // "5 µs" wait parked with sleep_deadline_ns ≈ now + 0x7ffc_c8dd_03bd.)
-    // Harmless for musl's dominant untimed waits (timeout == NULL == 0) and
-    // for waiters that are reliably woken, and NARF's park already treats
-    // the deadline only as a backstop — but timed waits never ETIMEDOUT on
-    // schedule. Fixing this means copy_from_user of the timespec (+ the
-    // WAIT_BITSET absolute-clock variant) and updating the NARF-native
-    // callers that pass raw ns; tracked as follow-up, deliberately not
-    // folded into the signal-interruptible-park fix.
-    let timeout_ns = args.arg3; // 0 = no timeout
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    // Start each futex op from clean park state so a stale `futex_uaddr` left
-    // by a prior wait (e.g. a wake that cleared only the deadline) can't make
-    // the poll routine re-register on the old word.
-    if let Some(uctx) = crate::user_task::current_user_task() {
-        // SAFETY: uctx is live for this trap; atomic field.
-        unsafe {
-            (*uctx).futex_uaddr.store(0, Ordering::Release);
-        }
-    }
-    // FUTEX_WAIT_BITSET behaves like FUTEX_WAIT for NARF's per-uaddr wait
-    // queue (the bitmask only narrows WHICH wakes match; a superset wake is
-    // safe and musl/glibc pass MATCH_ANY). The bitset timeout is ABSOLUTE in
-    // Linux, but NARF's wait path uses the deadline only as a lost-wake
-    // backstop (the real wake is the futex wake), so the relative/absolute
-    // distinction doesn't affect correctness here.
-    let op = if op == FUTEX_WAIT_BITSET {
-        FUTEX_WAIT
-    } else if op == FUTEX_WAKE_BITSET {
-        FUTEX_WAKE
-    } else {
-        op
-    };
-    match op {
-        FUTEX_WAKE_OP => {
-            let r = futex_wake_op(uaddr, val, args.arg3 as u32, args.arg4, args.arg5 as u32);
-            ctx.set_return(SyscallReturn::ok(r as u64));
-        }
-        FUTEX_WAIT => {
-            // REAL blocking futex. Sample *uaddr; if it already differs from
-            // `val`, the wait condition no longer holds — return 0 (caller's
-            // fast path observes the change). Else register on the per-uaddr
-            // wait queue and PARK until a `FUTEX_WAKE` on this word fires our
-            // waker (or, with a timeout, until it expires) — NOT a fixed
-            // nanosleep. The poll routine (`UserTaskFuture::poll`) does the
-            // actual waker registration (it owns `cx.waker()`); here we just
-            // publish the uaddr + a wake-counter snapshot for its lost-wakeup
-            // guard and hand control back via the yield hook. On resume the
-            // user reads RAX=0 and musl's recheck loop re-evaluates the word.
-            //
-            // Null uaddr: no wait queue — immediate (POSIX-permitted) spurious
-            // wake so wake-path smokes run without a backing mapping.
-            if uaddr == 0 {
-                ctx.set_return(SyscallReturn::ok(0));
-                return;
-            }
-            // Seqlock read: sample the wake generation BEFORE reading `*uaddr`
-            // (see `futex_wait_seqlock_read` — sampling after the read loses a
-            // racing FUTEX_WAKE and deadlocks a contended mutex/condvar on SMP).
-            let (gen, current) = match futex_wait_seqlock_read(uaddr, || {
-                let mut buf4 = [0u8; 4];
-                // SAFETY: `uaddr` is the user futex word pointer (non-zero, checked
-                // above); copy_from_user range-validates it + SMAP-brackets the read.
-                if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
-                    Some(u32::from_ne_bytes(buf4))
-                } else {
-                    None
-                }
-            }) {
-                Some(x) => x,
-                None => {
-                    ctx.set_return(fail);
-                    return;
-                }
-            };
-            if current != val {
-                ctx.set_return(SyscallReturn::ok(0));
-                return;
-            }
-            // Deadline: a real timeout when one was supplied (wakes at the
-            // timeout OR on a FUTEX_WAKE, whichever first), else infinite
-            // (`u64::MAX`) — the poll routine parks on the timer wheel with a
-            // one-tick fallback as a lost-wake safety net, but the primary
-            // wake is the registered futex waker.
-            let deadline = if timeout_ns == 0 {
-                u64::MAX
-            } else {
-                narf_scheduler::narf_time::monotonic_ns().saturating_add(timeout_ns)
-            };
-            if let (Some(uctx), Some(hook)) = (
-                crate::user_task::current_user_task(),
-                crate::user_task::yield_hook(),
-            ) {
-                ctx.set_return(SyscallReturn::ok(0));
-                // SAFETY: uctx is live for the trap round-trip.
-                unsafe {
-                    let uc = &*uctx;
-                    uc.futex_park_gen.store(gen, Ordering::Release);
-                    // Expected word value — the park loop re-validates the
-                    // word against this on every backstop re-check, so a
-                    // word rewritten WITHOUT a wake (requeue handoffs,
-                    // robust-owner death) unparks instead of stranding.
-                    uc.futex_val.store(val, Ordering::Release);
-                    uc.futex_uaddr.store(uaddr, Ordering::Release);
-                    uc.sleep_deadline_ns.store(deadline, Ordering::Release);
-                    ctx.save_user_state(uc.state.get() as *mut u8);
-                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                    if narf_scheduler::stackful::user_own_stack_enabled() {
-                        own_stack_block(ctx);
-                        return;
-                    }
-                    hook(uctx);
-                }
-                // unreachable
-            }
-            // Test/no-future fallback: synchronous success.
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        FUTEX_WAKE => {
-            // Bump the per-uaddr generation FIRST (the poll routine's
-            // lost-wakeup guard reads it), THEN fire up to `val` parked
-            // waiters' wakers. Returns the number actually woken (Linux
-            // contract). A waiter not yet registered when we fire is caught
-            // by the gen guard on its next poll.
-            futex_bump_counter(uaddr);
-            let woken = futex_wake_waiters(uaddr, val);
-            ctx.set_return(SyscallReturn::ok(woken as u64));
-        }
-        FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
-            // futex(uaddr, REQUEUE, nr_wake, nr_requeue, uaddr2[, val3]):
-            // wake up to `val` waiters on uaddr, move up to `arg3` more
-            // onto uaddr2. CMP_REQUEUE first requires `*uaddr == val3`
-            // (-EAGAIN otherwise; Linux futex(2)). Linux returns the count
-            // WOKEN for REQUEUE, woken + requeued for CMP_REQUEUE.
-            const EAGAIN: i64 = 11;
-            const EFAULT: i64 = 14;
-            let uaddr2 = args.arg4;
-            if uaddr2 == 0 {
-                ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-                return;
-            }
-            if op == FUTEX_CMP_REQUEUE {
-                match futex_read_user_word(uaddr) {
-                    Some(cur) if cur == args.arg5 as u32 => {}
-                    Some(_) => {
-                        ctx.set_return(SyscallReturn::ok((-EAGAIN) as u64));
-                        return;
-                    }
-                    None => {
-                        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-                        return;
-                    }
-                }
-            }
-            // Sample the destination word for the movers' park-loop word
-            // re-validation: a requeued waiter now waits for *uaddr2 to
-            // change (the mutex handoff), so its expected value must be
-            // the destination word as of the requeue. The requeuing
-            // caller shares the movers' address space (futexes requeue
-            // within one process), so reading it here resolves correctly.
-            // An unreadable destination keeps expected at the sampled 0 —
-            // the movers' next backstop re-check then proceeds to
-            // userspace and re-evaluates there (spurious, never lost).
-            let new_val = futex_read_user_word(uaddr2).unwrap_or(0);
-            let (woken, moved) =
-                futex_requeue_waiters(uaddr, uaddr2, val, args.arg3 as u32, new_val);
-            let r = if op == FUTEX_CMP_REQUEUE {
-                woken + moved
-            } else {
-                woken
-            };
-            ctx.set_return(SyscallReturn::ok(r as u64));
-        }
-        _ => ctx.set_return(fail),
-    }
-}
-
 /// Shared FUTEX_WAIT core for both the classic `futex(2)` FUTEX_WAIT op
 /// and the futex2 `futex_wait(2)` syscall. Implements the same real
 /// cooperative wait NARF's pthreads already rely on:
@@ -21886,235 +11277,9 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
 /// still fires promptly through the per-uaddr wait queue well before the cap.
 const FUTEX2_PARK_CAP_NS: u64 = 50_000_000; // 50 ms
 
-/// Linux futex2 `futex_wait(uaddr, val, mask, flags, timeout, clockid)`
-/// (x86_64=455, aarch64=455). The futex2 split of the classic FUTEX_WAIT
-/// op: same wait word, value-checked, but carries an explicit `mask` and
-/// a `flags` word selecting the access size (FUTEX2_SIZE_U32, the only
-/// width NARF parks on). `timeout` is an absolute `timespec*`; the
-/// cooperative park is bounded (see `FUTEX2_PARK_CAP_NS`), so we don't
-/// decode it precisely.
-fn sys_futex_wait(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    futex_wait_core(ctx, args.arg0, args.arg1 as u32, FUTEX2_PARK_CAP_NS);
-}
-
-/// Linux futex2 `futex_wake(uaddr, mask, nr, flags)` (x86_64=454,
-/// aarch64=454). Bumps the per-uaddr wake counter — every cooperative
-/// waiter parked on this word observes the bump on its next poll and
-/// re-arms — and reports the number of waiters released. NARF keeps no
-/// per-task wait ownership (the counter is the queue), so we report the
-/// `nr` the caller asked to wake, which the pthread fast paths treat as
-/// "≤ nr released".
-fn sys_futex_wake(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let uaddr = args.arg0;
-    let nr = args.arg2;
-    if uaddr == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    // Bump the gen counter AND fire up to `nr` parked waiters on the real
-    // queue (futex2 and classic futex share the same words / queue).
-    futex_bump_counter(uaddr);
-    let _ = futex_wake_waiters(uaddr, nr as u32);
-    ctx.set_return(SyscallReturn::ok(nr))
-}
-
-/// Linux futex2 `futex_requeue(waiters, flags, nr_wake, nr_requeue)`
-/// (x86_64=456, aarch64=456). `waiters` points at two `futex_waitv`
-/// entries: `[0]` the source word to wake, `[1]` the destination to
-/// requeue onto. Under the counter model there is no per-task queue to
-/// splice, so we wake the source (bump its counter); parked waiters
-/// re-arm and re-evaluate against the destination word themselves.
-/// Reports `nr_wake` released.
-fn sys_futex_requeue(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let waiters = args.arg0;
-    let nr_wake = args.arg2;
-    if waiters != 0 {
-        // struct futex_waitv { u64 val; u64 uaddr; u32 flags; u32 _r; } — 24B.
-        let mut entry = [0u8; 24];
-        // SAFETY: copy_from_user validates the 24-byte source range.
-        if unsafe { copy_from_user(&mut entry, waiters) }.is_ok() {
-            let src = u64::from_ne_bytes(entry[8..16].try_into().unwrap());
-            if src != 0 {
-                futex_bump_counter(src);
-                let _ = futex_wake_waiters(src, nr_wake as u32);
-            }
-        }
-    }
-    ctx.set_return(SyscallReturn::ok(nr_wake));
-}
-
-/// Linux futex2 `futex_waitv(waiters, nr_futexes, flags, timeout,
-/// clockid)` (x86_64=449, aarch64=449). Wait on several futexes at once,
-/// returning the index of the first one whose value already differs from
-/// its expected `val` (Linux's "this futex is the one that was woken").
-/// If every word still matches, bounded-park like `futex_wait` and report
-/// index 0 on resume — the libc recheck loop re-arms across all words.
-fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = 22;
-    let args = *ctx.args();
-    let waiters = args.arg0;
-    let nr = args.arg1 as usize;
-    // Linux caps futex_waitv at 128 entries; reject obviously bad shapes.
-    if waiters == 0 || nr == 0 || nr > 128 {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-        return;
-    }
-    let mut park_uaddr = 0u64;
-    for i in 0..nr {
-        let mut entry = [0u8; 24];
-        let at = waiters + (i as u64) * 24;
-        // SAFETY: each 24-byte entry range is validated by copy_from_user.
-        if unsafe { copy_from_user(&mut entry, at) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-            return;
-        }
-        let val = u64::from_ne_bytes(entry[0..8].try_into().unwrap());
-        let uaddr = u64::from_ne_bytes(entry[8..16].try_into().unwrap());
-        if uaddr == 0 {
-            continue;
-        }
-        let current = read_user_u32(uaddr) as u64;
-        if current != (val & 0xffff_ffff) {
-            // This word already moved — report it as the woken futex.
-            ctx.set_return(SyscallReturn::ok(i as u64));
-            return;
-        }
-        if park_uaddr == 0 {
-            park_uaddr = uaddr;
-        }
-    }
-    // Every word still matches: park on the first real word (bounded, like
-    // futex_wait), then resume as a spurious wake of index 0 (the caller
-    // re-checks all of them).
-    futex_wait_core(
-        ctx,
-        park_uaddr,
-        read_user_u32(park_uaddr),
-        FUTEX2_PARK_CAP_NS,
-    );
-}
-
-/// Linux tgkill(2): like kill but with an explicit (tgid, tid)
-/// pair. NARF is single-threaded per process — we forward tid as
-/// the kill target and ignore tgid (the disambiguation it provides
-/// will matter once threading lands).
-fn sys_tgkill(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let tgid = args.arg0;
-    let tid = args.arg1;
-    let signum = args.arg2 as u32;
-    let esrch = SyscallReturn::ok((-3i64) as u64);
-    if signum > 64 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    // ESRCH for a dead/never-existed tid — no more phantom pending
-    // bits on arbitrary numeric keys.
-    if !signal_target_exists(tid) {
-        ctx.set_return(esrch);
-        return;
-    }
-    // The (tgid, tid) consistency check is tgkill's whole point over
-    // tkill: it prevents a recycled tid in ANOTHER process from
-    // absorbing the signal. Our tids never recycle, but the check is
-    // still Linux-visible semantics (musl relies on ESRCH here).
-    if tgid != 0 && task_to_pid_raw(tid).unwrap_or(tid) != tgid {
-        ctx.set_return(esrch);
-        return;
-    }
-    // Null signal: existence/permission probe only — queue nothing (see sys_kill).
-    if signum == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    signal_stopcont_interaction(tid, signum);
-    raise_signal_pending(tid, signum);
-    wake_signal(tid);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 const SIG_BLOCK: u32 = 0;
 const SIG_UNBLOCK: u32 = 1;
 const SIG_SETMASK: u32 = 2;
-
-fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let how = args.arg0 as u32;
-    let set_ptr = args.arg1;
-    let old_ptr = args.arg2;
-    let sigsetsize = args.arg3 as usize;
-
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if sigsetsize != 8 {
-        ctx.set_return(fail);
-        return;
-    }
-
-    let task = current_task_id();
-
-    if old_ptr != 0 {
-        let mask = SIGNAL_MASK
-            .lock()
-            .as_ref()
-            .and_then(|m| m.get(&task).copied())
-            .unwrap_or(0);
-        // NARF's internal mask layout is bit N-1 = signal N — identical to a
-        // userspace `sigset_t` — so the mask copies out verbatim.
-        let user_mask = mask;
-        // SAFETY: `old_ptr` is the user old-sigmask pointer (non-zero, checked);
-        // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_to_user(old_ptr, &user_mask.to_ne_bytes()) }.is_err() {
-            ctx.set_return(fail);
-            return;
-        }
-    }
-
-    if set_ptr != 0 {
-        let mut buf = [0u8; 8];
-        // SAFETY: `set_ptr` is the user new-sigmask pointer (non-zero, checked);
-        // copy_from_user range-validates it and SMAP-brackets the 8-byte read.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_from_user(&mut buf, set_ptr) }.is_err() {
-            ctx.set_return(fail);
-            return;
-        }
-        // Userspace `sigset_t` bit N-1 == signal N == NARF's internal layout
-        // (see SIGNAL_PENDING), so the new mask installs verbatim.
-        let set = u64::from_ne_bytes(buf);
-        let mut g = SIGNAL_MASK.lock();
-        let map = match g.as_mut() {
-            Some(m) => m,
-            None => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
-        let slot = map.entry(task).or_insert(0);
-        match how {
-            SIG_BLOCK => *slot |= set,
-            SIG_UNBLOCK => *slot &= !set,
-            SIG_SETMASK => *slot = set,
-            _ => {
-                ctx.set_return(fail);
-                return;
-            }
-        }
-        // Linux strips SIGKILL/SIGSTOP from every installed mask —
-        // a task must never be able to block its own fatal kill.
-        *slot &= !UNBLOCKABLE_MASK;
-        drop(g);
-        // An explicit mask install means the user retook control of the
-        // mask — drop any suspend-saved record a signal-less (aborted)
-        // rt_sigsuspend left behind, so a much-later delivery can't
-        // "restore" a stale pre-suspend mask over this one.
-        let _ = take_suspend_saved_mask(task);
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
 
 // ── Phase-2 signal gap-fills ────────────────────────────────────────
 //
@@ -22168,198 +11333,6 @@ pub fn sigaltstack_of(task: u64) -> SigAltStack {
         })
 }
 
-/// `sigaltstack(ss, old_ss)` — Linux `sigaltstack(2)`.
-///
-/// `arg0 = ss_in_ptr` (may be 0 — query-only),
-/// `arg1 = ss_out_ptr` (may be 0 — install-only).
-/// Each `stack_t` is the Linux shape:
-///   `{ void *ss_sp; int ss_flags; size_t ss_size }` →
-///   `[u64 sp][u32 flags][u32 pad][u64 size]` = 24 bytes.
-/// Returns 0 on success, -1 on rejection (size < MIN_SIGSTKSZ,
-/// unknown flag bits, or both pointers 0 and no current entry).
-fn sys_sigaltstack(ctx: &mut dyn TrapContext) {
-    sigaltstack_table_init();
-    let args = *ctx.args();
-    let ss_in = args.arg0;
-    let ss_out = args.arg1;
-    let task = current_task_id();
-
-    let current = sigaltstack_of(task);
-
-    // Write the prior entry to *ss_out first (Linux semantics:
-    // even if the *ss_in install fails, the query result is the
-    // pre-install state).
-    if ss_out != 0 {
-        let mut buf = [0u8; 24];
-        buf[0..8].copy_from_slice(&current.sp.to_ne_bytes());
-        buf[8..12].copy_from_slice(&current.flags.to_ne_bytes());
-        buf[12..16].copy_from_slice(&0u32.to_ne_bytes());
-        buf[16..24].copy_from_slice(&current.size.to_ne_bytes());
-        // SAFETY: `ss_out` is the user old `stack_t` pointer (non-zero, checked);
-        // copy_to_user range-validates it and SMAP-brackets the 24-byte write.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_to_user(ss_out, &buf) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    }
-
-    if ss_in != 0 {
-        let mut buf = [0u8; 24];
-        // SAFETY: `ss_in` is the user new `stack_t` pointer (non-zero, checked);
-        // copy_from_user range-validates it and SMAP-brackets the 24-byte read.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_from_user(&mut buf, ss_in) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-        let sp = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
-        let flags = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
-        let size = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
-        // Validate: flags must be a subset of {SS_DISABLE, SS_ONSTACK},
-        // and if not SS_DISABLE the size must meet MIN_SIGSTKSZ.
-        if (flags & !(SS_DISABLE | SS_ONSTACK)) != 0 {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-        if (flags & SS_DISABLE) == 0 && size < MIN_SIGSTKSZ {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-        let mut g = SIG_ALTSTACK.lock();
-        if let Some(map) = g.as_mut() {
-            map.insert(task, SigAltStack { sp, flags, size });
-        }
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `tkill(tid, sig)` — thread-targeted signal delivery. NARF is
-/// single-thread-per-process until clone3 lands, so tkill is a
-/// thin wrapper over the same SIGNAL_PENDING table that `kill`
-/// uses, addressed by tid instead of pid.
-fn sys_tkill(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let tid = args.arg0;
-    let signum = args.arg1 as u32;
-    if signum > 64 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    // ESRCH for a dead/never-existed tid (Linux tkill(2)).
-    if !signal_target_exists(tid) {
-        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
-        return;
-    }
-    // Null signal: existence/permission probe only — queue nothing (see sys_kill).
-    if signum == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    signal_stopcont_interaction(tid, signum);
-    raise_signal_pending(tid, signum);
-    wake_signal(tid);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `ptrace(request, pid, addr, data)`
-/// Currently a stub returning ENOSYS (-38) since the GDB stub
-/// (observability) is not fully wired to the userspace process
-/// table yet.
-fn sys_ptrace(ctx: &mut dyn TrapContext) {
-    #[cfg(feature = "linux-compat")]
-    {
-        crate::ptrace::sys_ptrace(ctx);
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        ctx.set_return(SyscallReturn::ok((-38i64) as u64));
-    }
-}
-
-/// `rt_sigpending(set_out, sigsetsize)` — Linux `rt_sigpending(2)`.
-/// Write the (pending & mask) set to `*set_out` so the caller sees
-/// which signals were delivered while blocked.
-///
-/// arg0 = set out ptr (writable u64 — sigset_t is 8 bytes on
-/// glibc x86_64 / aarch64).  arg1 = sigsetsize (must be 8).
-fn sys_rt_sigpending(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let set_out = args.arg0;
-    let sigsetsize = args.arg1;
-    if sigsetsize != 8 || set_out == 0 {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-        return;
-    }
-    let task = current_task_id();
-    let pending = signal_pending_of(task);
-    let mask = signal_mask_of(task);
-    // NARF's pending layout == userspace sigset_t (both bit N-1), so the
-    // set copies out verbatim — through the SMAP bracket (a raw
-    // write_unaligned to the user pointer #PF's under SMAP).
-    let user_bits = pending & mask;
-    // SAFETY: set_out != 0 checked above; copy_to_user range-validates and
-    // SMAP-brackets the 8-byte write.
-    if unsafe { copy_to_user(set_out, &user_bits.to_ne_bytes()) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-/// `rt_sigsuspend(set, sigsetsize)` — Linux `rt_sigsuspend(2)`.
-/// Atomically swap the signal mask to `set`, wait for one signal
-/// outside the new mask to be delivered, then restore the prior
-/// mask. Always returns -1 (after delivery); errno = EINTR per
-/// POSIX.
-///
-/// The wait itself is `sys_pause`'s park (u64::MAX deadline, broken by
-/// `is_signal_pending` + `wake_signal`), which truly blocks under an
-/// executor and degrades to a one-shot -1 in the kernel-test harness.
-/// The prior mask is recorded in `SUSPEND_SAVED_MASK` so the
-/// interrupting handler's `sys_sigreturn` restores the PRE-SUSPEND mask
-/// instead of re-installing the temporary wait mask (Linux
-/// TIF_RESTORE_SIGMASK — see `default_signal_delivery_restricted`).
-///
-/// arg0 = set in ptr, arg1 = sigsetsize (must be 8).
-fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let set_uptr = args.arg0;
-    let sigsetsize = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-
-    if sigsetsize != 8 || set_uptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-
-    let mut buf = [0u8; 8];
-    // SAFETY: `set_uptr` is the user sigset pointer (non-zero, sigsetsize==8, both
-    // checked above); copy_from_user range-validates it and SMAP-brackets the 8-byte read.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_from_user(&mut buf, set_uptr) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    // Userspace `sigset_t` bit N-1 == signal N == NARF's internal layout
-    // (see SIGNAL_PENDING), so the suspend mask installs verbatim.
-    // SIGKILL/SIGSTOP can never be blocked, in a suspend mask either.
-    let mask = u64::from_ne_bytes(buf) & !UNBLOCKABLE_MASK;
-    let task = current_task_id();
-
-    // Temporarily install the new mask, remembering the prior one so the
-    // interrupting delivery's sigreturn restores IT (not the temp mask).
-    {
-        let mut g = SIGNAL_MASK.lock();
-        let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-        let prior = map.insert(task, mask).unwrap_or(0);
-        set_suspend_saved_mask(task, prior);
-    }
-
-    // Pause until signal.
-    sys_pause(ctx);
-}
-
 /// Atomically consume the LOWEST pending signal in `set` for `task`:
 /// clear its bit under the `SIGNAL_PENDING` lock and return the signum,
 /// or `None` when nothing in `set` is pending. The single-lock
@@ -22376,231 +11349,6 @@ fn sigwait_consume(task: u64, set: u64) -> Option<u32> {
     let signum = sig_from_bit(candidates);
     *slot &= !(sig_bit(signum));
     Some(signum)
-}
-
-/// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — Linux
-/// `rt_sigtimedwait(2)`. Synchronously wait for one of the signals in
-/// `set` to become pending for the calling task, consume it WITHOUT
-/// running its handler, and return its signum (+ its `siginfo_t` payload
-/// through `info`). The `set` intersection deliberately ignores the block
-/// mask: callers block the waited signals first (sigwaitinfo(2)) and this
-/// wait dequeues them anyway — that IS the calling convention.
-///
-/// Blocking model: when nothing in `set` is pending, PARK — route the
-/// park through `uctx.sigwait_set` (exactly like `flock_key` /
-/// `futex_uaddr` route theirs), rewind RIP so the syscall RE-EXECUTES on
-/// wake, and let `park_should_block` / `UserTaskFuture::poll` register
-/// this task in `SIGNAL_WAKERS` so any raise path's `wake_signal` fires
-/// it promptly (the ~1-tick wheel deadline is only the lost-wake
-/// backstop). This is what lets stress-ng --sigrt's round-trip work: the
-/// peer parks in sigwaitinfo until the sibling's sigqueue arrives,
-/// instead of the old one-shot -1 return that deadlocked the pair.
-///
-/// Returns:
-///   - the signum, when a signal in `set` was consumed (each queued RT
-///     instance is an independent delivery — see `SIGQUEUE_INFO`),
-///   - -EINTR, when a deliverable signal OUTSIDE `set` is pending (its
-///     handler runs via the return-to-user hook),
-///   - -EAGAIN, when the (finite) timeout expired — persisted across
-///     re-executions in `blocking_deadline_ns`, same as poll/epoll,
-///   - -EINVAL for a malformed timespec, -1 for the legacy bad-input
-///     shape (sigsetsize != 8 / NULL set) the ABI tests pin.
-///
-/// arg0 = set ptr (in), arg1 = info ptr (out, may be 0),
-/// arg2 = timeout timespec ptr (may be 0 = block indefinitely),
-/// arg3 = sigsetsize (must be 8).
-fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let set_in = args.arg0;
-    let info_out = args.arg1;
-    let timeout_in = args.arg2;
-    let sigsetsize = args.arg3;
-    if sigsetsize != 8 || set_in == 0 {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-        return;
-    }
-    // Read the user sigset through the SMAP-bracketed helper (a raw
-    // read_unaligned here #PF'd under SMAP — kernel read of a user page —
-    // the moment stress-ng --sigrt actually reached rt_sigtimedwait). The
-    // set is already in NARF's bit-N-1 layout (== userspace sigset_t), so
-    // it intersects `pending` directly with no shift.
-    let mut set_buf = [0u8; 8];
-    // SAFETY: set_in != 0 + sigsetsize == 8 checked above; copy_from_user
-    // range-validates and SMAP-brackets the 8-byte read.
-    if unsafe { copy_from_user(&mut set_buf, set_in) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-        return;
-    }
-    let set = u64::from_ne_bytes(set_buf);
-    let task = current_task_id();
-    let uctx_opt = crate::user_task::current_user_task();
-
-    // Arm the STICKY waiter reservation for this set — it survives the
-    // return-to-user gap between consecutive sigtimedwaits so a queued
-    // backlog (including stress-ng --sigrt's graceful-shutdown sival=0
-    // marker) can only be consumed HERE, never leak to a handler in the
-    // processing window. Released by any non-sigwait park (see
-    // `UserTaskCtx::sigwait_reserve`).
-    if let Some(u) = uctx_opt {
-        // SIGKILL(9)/SIGSTOP(19) can never be handler-delivered anyway and
-        // must never be maskable from their eager paths — strip them.
-        let reserve = set & !(1u64 << 8) & !(1u64 << 18);
-        // SAFETY: the in-flight task's poller-pinned UserTaskCtx; atomic only.
-        unsafe { (*u).sigwait_reserve.store(reserve, Ordering::Release) };
-    }
-
-    // Every return path below must tear the park routing down: the
-    // sigwait routing + the persisted timeout deadline + the waker
-    // registration (a stale SIGNAL_WAKERS entry only costs one spurious
-    // re-poll, but a stale `sigwait_set`/`blocking_deadline_ns` would
-    // mis-route the task's NEXT unrelated park / inherit a dead deadline).
-    let clear_routing = |uctx_opt: Option<*mut crate::user_task::UserTaskCtx>| {
-        if let Some(u) = uctx_opt {
-            // SAFETY: the in-flight task's poller-pinned UserTaskCtx;
-            // atomics only.
-            unsafe {
-                (*u).sigwait_set.store(0, Ordering::Release);
-                (*u).sigwait_interrupted.store(false, Ordering::Release);
-                (*u).blocking_deadline_ns.store(0, Ordering::Release);
-            }
-        }
-        drop_signal_waker(task);
-    };
-
-    // A signal in `set` is pending → consume ONE instance and return it.
-    if let Some(signum) = sigwait_consume(task, set) {
-        // Attach the oldest queued payload (rt_sigqueueinfo/sigqueue), and
-        // re-arm the bit when more instances remain queued behind it.
-        let queued = take_sigqueue_info(task, signum);
-        rearm_pending_if_queued(task, signum);
-        clear_routing(uctx_opt);
-        if info_out != 0 {
-            // Build the 128-byte siginfo_t in kernel memory, then copy it
-            // out through the SMAP bracket. si_signo/si_errno/si_code are
-            // the union-discriminating prefix; si_pid (offset 16) + si_value
-            // (the sigval union, offset 24) carry the queued sender payload
-            // (stress-ng --sigrt's child replies to si_pid). Rest stays zero.
-            let mut si = [0u8; 128];
-            let (si_code, si_value, si_pid) = queued.unwrap_or((0, 0, 0)); // SI_USER shape
-            si[..4].copy_from_slice(&(signum as i32).to_ne_bytes()); // si_signo
-            si[8..12].copy_from_slice(&si_code.to_ne_bytes()); // si_code
-            si[16..20].copy_from_slice(&si_pid.to_ne_bytes()); // si_pid
-            si[24..32].copy_from_slice(&si_value.to_ne_bytes()); // si_value
-                                                                 // SAFETY: info_out != 0; copy_to_user range-validates + SMAP-brackets.
-            let _ = unsafe { copy_to_user(info_out, &si) };
-        }
-        ctx.set_return(SyscallReturn::ok(signum as u64));
-        return;
-    }
-
-    // A deliverable signal OUTSIDE `set` interrupts the wait: return
-    // -EINTR and let the return-to-user hook run its handler (Linux
-    // rt_sigtimedwait(2) — never auto-restarted, see
-    // `is_restartable_syscall`).
-    if (signal_pending_of(task) & !signal_mask_of(task) & !set) != 0 {
-        clear_routing(uctx_opt);
-        ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
-        return;
-    }
-
-    // A prior park was interrupted by an out-of-set signal that has ALREADY
-    // been delivered (its handler ran on the resume's return-to-user, so
-    // the pending check above reads 0). The delivery path flagged it —
-    // honour the -EINTR now instead of re-parking forever. This is the
-    // stress-ng --sigrt fix: SIGALRM breaks the sigwaitinfo loop.
-    if let Some(u) = uctx_opt {
-        // SAFETY: the in-flight task's poller-pinned UserTaskCtx; atomics only.
-        if unsafe { (*u).sigwait_interrupted.load(Ordering::Acquire) } {
-            clear_routing(uctx_opt);
-            ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
-            return;
-        }
-    }
-
-    // Timeout. NULL → block indefinitely (u64::MAX park). A finite
-    // timespec maps to an absolute wheel deadline persisted in
-    // `blocking_deadline_ns` — the RIP-rewind re-executions must detect
-    // expiry instead of re-arming now+timeout forever (the scheduler
-    // clears `sleep_deadline_ns` on every wake; see poll/epoll).
-    let mut deadline = u64::MAX;
-    if timeout_in != 0 {
-        let mut ts = [0u8; 16];
-        // SAFETY: timeout_in != 0; copy_from_user range-validates and
-        // SMAP-brackets the 16-byte timespec read.
-        if unsafe { copy_from_user(&mut ts, timeout_in) }.is_err() {
-            clear_routing(uctx_opt);
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
-            return;
-        }
-        let sec = i64::from_ne_bytes(ts[..8].try_into().unwrap());
-        let nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
-        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
-            clear_routing(uctx_opt);
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
-            return;
-        }
-        let dur_ns = (sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(nsec as u64);
-        if dur_ns == 0 {
-            // {0,0} = pure poll; nothing was pending above.
-            clear_routing(uctx_opt);
-            ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
-            return;
-        }
-        if let Some(u) = uctx_opt {
-            // SAFETY: as in clear_routing — atomics on the live uctx.
-            let persisted = unsafe { (*u).blocking_deadline_ns.load(Ordering::Acquire) };
-            deadline = if persisted != 0 {
-                persisted
-            } else {
-                let d = narf_scheduler::narf_time::monotonic_ns().saturating_add(dur_ns);
-                // SAFETY: as above.
-                unsafe { (*u).blocking_deadline_ns.store(d, Ordering::Release) };
-                d
-            };
-            if narf_scheduler::narf_time::monotonic_ns() >= deadline {
-                clear_routing(uctx_opt);
-                ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
-                return;
-            }
-        }
-    }
-
-    // Park until a signal (or the deadline). Same shape as the blocking
-    // F_SETLKW: rewind RIP over the 2-byte syscall so the WHOLE
-    // rt_sigtimedwait re-executes on wake and re-runs the consume above.
-    if let (Some(uctx), Some(hook)) = (uctx_opt, crate::user_task::yield_hook()) {
-        ctx.set_rip(ctx.rip().wrapping_sub(2));
-        // SAFETY: `uctx` is the live per-task UserTaskCtx from
-        // current_user_task(); we hold the only reference while setting the
-        // park routing and saving the RIP-rewound CPU state before the
-        // yield hook / own-stack switch hands the task over.
-        unsafe {
-            let uc = &*uctx;
-            // Clear stale routings so the park can't mis-register on the
-            // futex / flock / io queues (same guard as the F_SETLKW park).
-            uc.futex_uaddr.store(0, Ordering::Release);
-            uc.flock_key.store(0, core::sync::atomic::Ordering::Release);
-            uc.net_io_wait.store(false, Ordering::Release);
-            uc.sigwait_set.store(set, Ordering::Release);
-            uc.sleep_deadline_ns.store(deadline, Ordering::Release);
-            ctx.save_user_state(uc.state.get() as *mut u8);
-            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                own_stack_block(ctx);
-                return;
-            }
-            hook(uctx);
-        }
-        // unreachable when parked
-    }
-
-    // No executor wired (the in-kernel test harness): there is nothing to
-    // park on — degrade to the historical one-shot -1 answer the ABI
-    // tests pin, exactly like pause's no-executor tail.
-    clear_routing(uctx_opt);
-    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
 }
 
 // Function-pointer hook: arch trap dispatcher invokes this on
@@ -23403,42 +12151,6 @@ pub fn sigaction_lookup_full(task: u64, signum: usize) -> Option<SigAction> {
     slot
 }
 
-fn sys_sigreturn(ctx: &mut dyn TrapContext) {
-    // arg0 = SigContext vaddr (from libc trampoline, originally
-    // delivered in RSI by deliver_signal). The trampoline keeps it
-    // alive across the user's signal-handler call.
-    let mut sc_vaddr = ctx.args().arg0;
-
-    // Linux rt_sigreturn (#15 on x86_64) takes no argument — the
-    // restorer trampoline that calls it leaves arbitrary garbage in
-    // RDI, so we can't trust arg0. When the last delivered frame used
-    // the restorer-based rt_sigframe layout, resolve it from the user
-    // RSP (which points at the frame after the handler's `ret` popped
-    // the restorer return address). NARF's own libc trampoline instead
-    // forwards the SigContext vaddr in arg0.
-    let task = current_task_id();
-    if sigreturn_use_rsp(task) || sc_vaddr == 0 {
-        sc_vaddr = ctx.user_rsp();
-    }
-
-    // Pass the authoritative frame layout the kernel recorded at delivery so the
-    // arch code reads RIP/regs from the correct offsets instead of guessing from
-    // user memory (which could pull a selector field into RIP → #UD).
-    let is_rt = sigreturn_is_rt(task);
-    if !ctx.perform_sigreturn(sc_vaddr, is_rt) {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    // POSIX: restore the signal mask that was in effect before the handler ran,
-    // undoing the auto-block of the delivered signal. Only the async delivery
-    // path records a saved mask; a `None` (e.g. a sync-fault handler return)
-    // leaves the mask untouched. Without this the delivered signal stays blocked
-    // forever and a second occurrence is never taken.
-    if let Some(saved) = take_sigreturn_saved_mask(task) {
-        let _ = set_signal_mask_for_task(task, saved);
-    }
-}
-
 // ── Sockets — POSIX shims over the SocketOp dispatcher ───────────
 //
 // Both POSIX-shaped syscalls (sys_socket / sys_bind / ...) and the
@@ -23519,225 +12231,6 @@ fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
     let family = u16::from_le_bytes([buf[0], buf[1]]);
     let body = buf[2..].to_vec();
     Some(crate::socket::SockAddr { family, body })
-}
-
-fn sys_socket(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let domain = args.arg0 as u16;
-    // The type argument carries optional SOCK_CLOEXEC / SOCK_NONBLOCK flags
-    // ORed onto the base type; strip them before categorising the socket
-    // (libwayland creates sockets as SOCK_STREAM|SOCK_CLOEXEC, which an
-    // unmasked compare reads as an unknown type → bind() fails).
-    const SOCK_CLOEXEC: u32 = 0x8_0000;
-    const SOCK_NONBLOCK: u32 = 0x800;
-    let raw_kind = args.arg1 as u32;
-    let sock_cloexec = (raw_kind & SOCK_CLOEXEC) != 0;
-    let sock_nonblock = (raw_kind & SOCK_NONBLOCK) != 0;
-    let kind = raw_kind & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
-    let proto = args.arg2 as u32;
-    // Reject unknown families up front (EAFNOSUPPORT shape).
-    if !matches!(
-        domain,
-        crate::socket::AF_UNIX
-            | crate::socket::AF_INET
-            | crate::socket::AF_INET6
-            | crate::socket::AF_BYPASS
-            | crate::socket::AF_NETLINK
-    ) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-        return;
-    }
-    let sock = crate::socket::SocketFile::with_protocol(domain, kind, proto);
-    // Stamp the creator's credentials so SO_PEERCRED / SCM_CREDENTIALS on
-    // the peer end report this process's real (pid, uid, gid).
-    sock.set_local_cred(current_ucred());
-    // Net-namespace scoping: stamp the creator's net-ns id so the
-    // AF_INET bind/port tables are keyed per-ns (two processes in
-    // different net-ns can both bind the same addr:port). 0 = host ns.
-    #[cfg(feature = "container")]
-    {
-        let t = current_task_id();
-        if let Some(ns) = crate::namespaces::current_net_ns(t) {
-            sock.set_net_ns_id(ns.id());
-        }
-    }
-    socket_arc_register(&sock);
-    let task = current_task_id();
-    let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
-            ops: sock.clone(),
-            offset: 0,
-            flags: if sock_cloexec {
-                crate::fd::FD_CLOEXEC
-            } else {
-                0
-            },
-            status_flags: if sock_nonblock { 0x800 } else { 0 }, // O_NONBLOCK
-        })
-    }) {
-        Some(n) => n,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    ctx.set_return(SyscallReturn::ok(new_fd as u64));
-}
-
-/// `socketpair(domain, type, protocol, int sv[2])` — create a
-/// connected pair of AF_UNIX SOCK_STREAM sockets and write the two
-/// fds into the user `sv[2]` out-array. The `type` argument may carry
-/// SOCK_CLOEXEC / SOCK_NONBLOCK flag bits, which apply to both ends.
-fn sys_socketpair(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let domain = args.arg0 as u16;
-    let raw_type = args.arg1 as u32;
-    let _protocol = args.arg2 as u32;
-    let sv_ptr = args.arg3;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    // Peel the SOCK_CLOEXEC / SOCK_NONBLOCK flag bits off the type.
-    let kind = raw_type & !(crate::fd::O_CLOEXEC | crate::fd::O_NONBLOCK);
-    let cloexec = raw_type & crate::fd::O_CLOEXEC != 0;
-    let nonblock = raw_type & crate::fd::O_NONBLOCK != 0;
-    // Linux only implements socketpair(2) for AF_UNIX/AF_LOCAL; other
-    // families return EOPNOTSUPP. We back STREAM, SEQPACKET and DGRAM with
-    // the same connected AF_UNIX pair — systemd-udev creates a
-    // SOCK_DGRAM/SOCK_SEQPACKET worker-IPC pair at startup and self-frames
-    // its messages, so byte-stream delivery is sufficient.
-    let kind_ok = matches!(
-        kind,
-        crate::socket::SOCK_STREAM | crate::socket::SOCK_SEQPACKET | crate::socket::SOCK_DGRAM
-    );
-    if domain != crate::socket::AF_UNIX || !kind_ok {
-        ctx.set_return(fail);
-        return;
-    }
-    let (a, b) = crate::socket::SocketFile::unix_stream_pair();
-    if nonblock {
-        a.set_nonblock(true);
-        b.set_nonblock(true);
-    }
-    // Both ends belong to this process; each end's SO_PEERCRED reports the
-    // other's owning identity (same process here).
-    let cred = current_ucred();
-    a.set_local_cred(cred);
-    b.set_local_cred(cred);
-    crate::socket::SocketFile::cross_peer_creds(&a, &b);
-    socket_arc_register(&a);
-    socket_arc_register(&b);
-    let fd_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
-    let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
-    let task = current_task_id();
-    let mk = |ops: alloc::sync::Arc<crate::socket::SocketFile>| {
-        fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
-                ops,
-                offset: 0,
-                flags: fd_flags,
-                status_flags,
-            })
-        })
-    };
-    let fd_a = match mk(a) {
-        Some(n) => n,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let fd_b = match mk(b) {
-        Some(n) => n,
-        None => {
-            let _ = fd::with_table(task, |t| t.close(fd_a));
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // Write sv[2] = [fd_a, fd_b] as two native-endian i32.
-    let mut buf = [0u8; 8];
-    buf[0..4].copy_from_slice(&(fd_a as i32).to_ne_bytes());
-    buf[4..8].copy_from_slice(&(fd_b as i32).to_ne_bytes());
-    // SAFETY: `sv_ptr` is the user `int sv[2]` out-pointer; copy_to_user
-    // range-validates the 8-byte destination before writing.
-    if unsafe { copy_to_user(sv_ptr, &buf) }.is_err() {
-        let _ = fd::with_table(task, |t| {
-            t.close(fd_a);
-            t.close(fd_b)
-        });
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-fn sys_socket_bind(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let addr_ptr = args.arg1;
-    let addr_len = args.arg2;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let addr = match copy_user_addr(addr_ptr, addr_len) {
-        Some(a) => a,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // A pathname AF_UNIX bind materialises a real S_IFSOCK inode in Linux.
-    // Grab the path before the op consumes `addr` (family is checked in the
-    // op; AF_UNIX bodies are the sun_path bytes).
-    let unix_path: Option<alloc::string::String> = if addr.family == crate::socket::AF_UNIX {
-        core::str::from_utf8(&addr.body)
-            .ok()
-            .map(|s| alloc::string::String::from(s.trim_end_matches('\0')))
-    } else {
-        None
-    };
-    match sock.dispatch_op(crate::socket::SocketOp::Bind { addr }) {
-        crate::socket::SocketOpResult::Ok(_) => {
-            if let Some(p) = unix_path {
-                create_unix_socket_node(&p);
-            }
-            ctx.set_return(SyscallReturn::ok(0))
-        }
-        _ => ctx.set_return(fail),
-    }
-}
-
-fn sys_socket_listen(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let backlog = args.arg1 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    match sock.dispatch_op(crate::socket::SocketOp::Listen { backlog }) {
-        crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
-        _ => ctx.set_return(fail),
-    }
-}
-
-fn sys_socket_accept(ctx: &mut dyn TrapContext) {
-    accept_common(ctx, 0);
-}
-
-/// `accept4(2)` — accept(2) plus SOCK_CLOEXEC / SOCK_NONBLOCK on the
-/// returned fd. arg3 carries the flags.
-fn sys_socket_accept4(ctx: &mut dyn TrapContext) {
-    let flags = ctx.args().arg3 as u32;
-    accept_common(ctx, flags);
 }
 
 fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
@@ -23854,437 +12347,6 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             // No executor (kernel-test context): surface EAGAIN.
             ctx.set_return(SyscallReturn::ok((-11i64) as u64));
         }
-        crate::socket::SocketOpResult::Err(e) => {
-            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
-        }
-        _ => ctx.set_return(fail),
-    }
-}
-
-fn sys_socket_connect(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let addr_ptr = args.arg1;
-    let addr_len = args.arg2;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let addr = match copy_user_addr(addr_ptr, addr_len) {
-        Some(a) => a,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    match sock.dispatch_op(crate::socket::SocketOp::Connect { addr }) {
-        crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
-        crate::socket::SocketOpResult::Err(e) => {
-            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
-        }
-        _ => ctx.set_return(fail),
-    }
-}
-
-fn sys_socket_send(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let buf_ptr = args.arg1;
-    let buf_len = args.arg2 as usize;
-    let flags = args.arg3 as u32;
-    // arg4 / arg5: sendto's destination address (NULL/0 for
-    // connected stream sockets, non-NULL for connectionless
-    // datagram sends).
-    let addr_ptr = args.arg4;
-    let addr_len = args.arg5;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // Copy user send buffer into kernel memory under the SMAP bracket.
-    // Validate length before allocating — reject oversized len with EINVAL.
-    let buf = if buf_len > 0 {
-        // SAFETY: AS active; SMAP bracket inside copy_from_user_vec.
-        match unsafe { copy_from_user_vec(buf_ptr, buf_len) } {
-            Ok(b) => b,
-            Err(_) => {
-                ctx.set_return(fail);
-                return;
-            }
-        }
-    } else {
-        alloc::vec::Vec::new()
-    };
-    let dest = if addr_ptr != 0 && addr_len >= 2 {
-        copy_user_addr(addr_ptr, addr_len)
-    } else {
-        None
-    };
-    match sock.dispatch_op(crate::socket::SocketOp::Send {
-        buf: &buf,
-        flags,
-        addr: dest,
-    }) {
-        crate::socket::SocketOpResult::Ok(n) => ctx.set_return(SyscallReturn::ok(n)),
-        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
-            // Yield + retry from libc.
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        // Surface the real errno (ECONNREFUSED for a datagram to a missing
-        // name, ENOTCONN, EINVAL, …) rather than a bare -1/EPERM.
-        crate::socket::SocketOpResult::Err(e) => {
-            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
-        }
-        // Send never yields Accepted/Received/Addr; keep the match total.
-        _ => ctx.set_return(fail),
-    }
-}
-
-fn sys_socket_recv(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let buf_ptr = args.arg1;
-    let buf_len = args.arg2 as usize;
-    let flags = args.arg3 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // Validate destination range before issuing the Recv op.
-    if buf_len > 0 && validate_user_range(buf_ptr, buf_len).is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    // A recv is non-blocking if the fd is O_NONBLOCK or the call carries
-    // MSG_DONTWAIT (0x40). Such a recv must return EAGAIN the instant the ring
-    // is empty-but-open — NEVER park. GLib's GSocket does exactly non-blocking
-    // recv() + its own poll loop; parking here stalls its dbus auth handshake,
-    // and the old "set 0 then yield" path could even surface a spurious 0 (EOF).
-    const MSG_DONTWAIT: u32 = 0x40;
-    let nonblock = (flags & MSG_DONTWAIT) != 0
-        || fd::with_table(current_task_id(), |t| {
-            t.get(fd)
-                .map(|e| e.status_flags & crate::fd::O_NONBLOCK != 0)
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    let mut buf = alloc::vec![0u8; buf_len];
-    let result = sock.dispatch_op(crate::socket::SocketOp::Recv {
-        buf: &mut buf,
-        flags,
-    });
-    match result {
-        crate::socket::SocketOpResult::Received { n, .. } => {
-            // Copy received bytes back to user under SMAP bracket.
-            // SAFETY: ptr validated above; AS still active.
-            if unsafe { copy_to_user(buf_ptr, &buf[..n]) }.is_err() {
-                ctx.set_return(fail);
-                return;
-            }
-            ctx.set_return(SyscallReturn::ok(n as u64));
-        }
-        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) if nonblock => {
-            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
-        }
-        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
-            // Yield ~1ms; libc loops.
-            if let (Some(uctx), Some(hook)) = (
-                crate::user_task::current_user_task(),
-                crate::user_task::yield_hook(),
-            ) {
-                ctx.set_return(SyscallReturn::ok(0));
-                let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-                // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
-                // we hold the only reference while setting the deadline and saving CPU state
-                // into `uc.state` before the yield hook hands the task to the executor.
-                // SAFETY: Valid memory or trusted environment
-                unsafe {
-                    let uc = &*uctx;
-                    uc.sleep_deadline_ns.store(deadline, Ordering::Release);
-                    // Park on NET-I/O READINESS (the TCP stack `readiness::notify`s
-                    // the listener when a connection becomes accept-ready, and a
-                    // socket when data arrives) with the ~1ms deadline as a mere
-                    // backstop. Without net_io_wait the park only re-polled every
-                    // ~1ms off the timer wheel — and under own-stack cooperative
-                    // scheduling with other busy tasks (redis bg threads) that
-                    // wheel service is delayed enough that the connection/data
-                    // sits ACK'd-but-unread past the client's deadline (net-smoke
-                    // echo flake). Snapshot the readiness generation for the
-                    // check→park lost-wake guard (park_should_block re-executes if
-                    // it moved). Clear a stale `futex_uaddr` so this can't be
-                    // mis-routed into the futex branch.
-                    uc.futex_uaddr.store(0, Ordering::Release);
-                    uc.net_io_wait.store(true, Ordering::Release);
-                    uc.epoll_park_gen
-                        .store(narf_net::readiness::generation(), Ordering::Release);
-                    ctx.save_user_state(uc.state.get() as *mut u8);
-                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                    if narf_scheduler::stackful::user_own_stack_enabled() {
-                        own_stack_block(ctx);
-                        return;
-                    }
-                    hook(uctx);
-                }
-            }
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        _ => ctx.set_return(fail),
-    }
-}
-
-fn sys_socket_shutdown(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let how = args.arg1 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    match sock.dispatch_op(crate::socket::SocketOp::Shutdown { how }) {
-        crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
-        _ => ctx.set_return(fail),
-    }
-}
-
-/// `getsockopt(fd, level, optname, opt_val_out, opt_len_inout)`.
-/// Linux ref: net/socket.c:SYSCALL_DEFINE5(getsockopt, ...).
-fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let level = args.arg1 as u32;
-    let name = args.arg2 as u32;
-    let val_ptr = args.arg3;
-    let len_ptr = args.arg4;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // Read the in/out length field via SMAP bracket.
-    let in_len = if len_ptr != 0 {
-        read_user_u32(len_ptr) as usize
-    } else {
-        0
-    };
-    if val_ptr == 0 || in_len == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // Validate the output range before allocating — prevents OOM from a
-    // user-supplied in_len larger than MAX_USER_COPY.
-    if validate_user_range(val_ptr, in_len).is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    let mut buf = alloc::vec![0u8; in_len];
-    let result = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
-        level,
-        name,
-        buf: &mut buf,
-    });
-    match result {
-        crate::socket::SocketOpResult::OptValue { n } => {
-            // Write value + updated optlen back to user under SMAP bracket.
-            // SAFETY: val_ptr from userspace; AS active.
-            let _ = unsafe { copy_to_user(val_ptr, &buf[..n]) };
-            write_user_u32(len_ptr, n as u32);
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        _ => ctx.set_return(fail),
-    }
-}
-
-/// `setsockopt(fd, level, optname, opt_val, opt_len)`.
-/// Linux ref: net/socket.c:SYSCALL_DEFINE5(setsockopt, ...).
-fn sys_socket_setsockopt(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let level = args.arg1 as u32;
-    let name = args.arg2 as u32;
-    let val_ptr = args.arg3;
-    let val_len = args.arg4 as usize;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    if val_ptr == 0 || val_len == 0 || val_len > 256 {
-        ctx.set_return(fail);
-        return;
-    }
-    let mut buf = alloc::vec![0u8; val_len];
-    // SAFETY: AS active; SMAP bracket inside copy_from_user.
-    if unsafe { copy_from_user(&mut buf, val_ptr) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    match sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
-        level,
-        name,
-        value: &buf,
-    }) {
-        crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
-        _ => ctx.set_return(fail),
-    }
-}
-
-/// `getsockname(fd, addr_out, addrlen_inout)`. Writes the
-/// `sockaddr` shape per family. Linux net/socket.c:SYSCALL_DEFINE3.
-fn sys_socket_getsockname(ctx: &mut dyn TrapContext) {
-    sys_socket_get_addr(ctx, false);
-}
-
-/// `getpeername(fd, addr_out, addrlen_inout)`.
-fn sys_socket_getpeername(ctx: &mut dyn TrapContext) {
-    sys_socket_get_addr(ctx, true);
-}
-
-fn sys_socket_get_addr(ctx: &mut dyn TrapContext, peer: bool) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let addr_ptr = args.arg1;
-    let len_ptr = args.arg2;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let op = if peer {
-        crate::socket::SocketOp::GetPeerName
-    } else {
-        crate::socket::SocketOp::GetSockName
-    };
-    let result = sock.dispatch_op(op);
-    match result {
-        crate::socket::SocketOpResult::Addr(addr) => {
-            // Read in length (caller-supplied capacity) via SMAP bracket.
-            let in_len = if len_ptr != 0 {
-                read_user_u32(len_ptr) as usize
-            } else {
-                0
-            };
-            // Pack as: family(u16) + body.
-            let total = 2 + addr.body.len();
-            let n = core::cmp::min(in_len, total);
-            if addr_ptr != 0 && n >= 2 {
-                let mut out = alloc::vec![0u8; n];
-                let fam_bytes = addr.family.to_le_bytes();
-                out[0] = fam_bytes[0];
-                out[1] = fam_bytes[1];
-                let body_n = n - 2;
-                out[2..2 + body_n].copy_from_slice(&addr.body[..body_n]);
-                // SAFETY: addr_ptr is a user VA; SMAP bracket inside copy_to_user.
-                let _ = unsafe { copy_to_user(addr_ptr, &out) };
-            }
-            if len_ptr != 0 {
-                write_user_u32(len_ptr, total as u32);
-            }
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        _ => ctx.set_return(fail),
-    }
-}
-
-/// `sendmsg(fd, msghdr, flags)`. We squash the iovec into a single
-/// allocation, call the dispatcher's Send, and report the count.
-fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let msg_ptr = args.arg1;
-    let flags = args.arg2 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    if msg_ptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // struct msghdr { void *name; u32 namelen; struct iovec *iov;
-    //                 usize iovlen; void *ctrl; usize ctrllen; int flags; }
-    // Layout matches Linux x86_64 64-bit.
-    // read_user_u64/u32 now use copy_from_user internally (SMAP bracket).
-    let name_ptr = read_user_u64(msg_ptr);
-    let name_len = read_user_u32(msg_ptr + 8);
-    let iov_ptr = read_user_u64(msg_ptr + 16);
-    let iov_len = read_user_u64(msg_ptr + 24) as usize;
-    // Reassemble into a flat kernel buffer under SMAP bracket.
-    // Cap total to MAX_USER_COPY so a user-crafted iovec cannot OOM the heap.
-    let mut total = alloc::vec::Vec::new();
-    for i in 0..iov_len {
-        let base = iov_ptr + (i as u64) * 16;
-        let p = read_user_u64(base);
-        let l = read_user_u64(base + 8) as usize;
-        if p == 0 || l == 0 {
-            continue;
-        }
-        if total.len().saturating_add(l) > MAX_USER_COPY {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-            return;
-        }
-        let old_len = total.len();
-        total.resize(old_len + l, 0u8);
-        // SAFETY: SMAP bracket inside copy_from_user; p is a user VA.
-        let _ = unsafe { copy_from_user(&mut total[old_len..], p) };
-    }
-    let dest = if name_ptr != 0 && name_len >= 2 {
-        copy_user_addr(name_ptr, name_len as u64)
-    } else {
-        None
-    };
-
-    // SCM_RIGHTS fd-passing: parse msg_control for an SOL_SOCKET/SCM_RIGHTS
-    // ancillary message and resolve each int fd to its file object. AF_UNIX
-    // (Wayland) ships shm/dma-buf fds this way.
-    let ctrl_ptr = read_user_u64(msg_ptr + 32);
-    let ctrl_len = read_user_u64(msg_ptr + 40) as usize;
-    let passed_fds = parse_scm_rights_fds(ctrl_ptr, ctrl_len);
-    if !passed_fds.is_empty() {
-        // fd-carrying send → AF_UNIX stream path.
-        return match sock.unix_sendmsg(&total, passed_fds) {
-            Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            Err(e) => ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64)),
-        };
-    }
-
-    match sock.dispatch_op(crate::socket::SocketOp::Send {
-        buf: &total,
-        flags,
-        addr: dest,
-    }) {
-        crate::socket::SocketOpResult::Ok(n) => ctx.set_return(SyscallReturn::ok(n)),
-        // Map the real socket error to its errno (EAGAIN/ENOTCONN/EPIPE/…)
-        // instead of the bare -1 sentinel (which musl reads as EPERM and
-        // libwayland treats as a fatal connection error).
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
@@ -24453,127 +12515,6 @@ fn install_recv_ancillary(
     let _ = unsafe { copy_to_user(msg_ptr + 40, &(ctrl.len() as u64).to_le_bytes()) };
 }
 
-/// `recvmsg(fd, msghdr, flags)`. Reverse of sendmsg.
-fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let msg_ptr = args.arg1;
-    let flags = args.arg2 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    if msg_ptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // read_user_u64/u32 use SMAP bracket internally.
-    let name_ptr = read_user_u64(msg_ptr);
-    let name_len_ptr = msg_ptr + 8; // namelen lives at offset 8
-    let iov_ptr = read_user_u64(msg_ptr + 16);
-    let iov_len = read_user_u64(msg_ptr + 24) as usize;
-    // Total capacity from iovecs. Cap at MAX_USER_COPY to prevent OOM
-    // from a user-crafted iovec with a giant per-slot length.
-    let mut total_cap = 0usize;
-    for i in 0..iov_len {
-        let base = iov_ptr + (i as u64) * 16;
-        total_cap = total_cap.saturating_add(read_user_u64(base + 8) as usize);
-    }
-    if total_cap > MAX_USER_COPY {
-        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-        return;
-    }
-    let mut staging = alloc::vec![0u8; total_cap];
-    let result = sock.dispatch_op(crate::socket::SocketOp::Recv {
-        buf: &mut staging,
-        flags,
-    });
-    match result {
-        crate::socket::SocketOpResult::Received { n, peer } => {
-            // Scatter into iovec destinations under SMAP bracket.
-            let mut copied = 0;
-            for i in 0..iov_len {
-                if copied >= n {
-                    break;
-                }
-                let base = iov_ptr + (i as u64) * 16;
-                let p = read_user_u64(base);
-                let l = read_user_u64(base + 8) as usize;
-                let take = core::cmp::min(l, n - copied);
-                // SAFETY: p is a user VA; SMAP bracket inside copy_to_user.
-                let _ = unsafe { copy_to_user(p, &staging[copied..copied + take]) };
-                copied += take;
-            }
-            // Write peer sockaddr if requested.
-            if let (Some(peer), true) = (peer, name_ptr != 0) {
-                let mut peer_buf = alloc::vec![0u8; 2 + peer.body.len()];
-                let fam_bytes = peer.family.to_le_bytes();
-                peer_buf[0] = fam_bytes[0];
-                peer_buf[1] = fam_bytes[1];
-                peer_buf[2..].copy_from_slice(&peer.body);
-                // SAFETY: name_ptr is a user VA.
-                let _ = unsafe { copy_to_user(name_ptr, &peer_buf) };
-                write_user_u32(name_len_ptr, (peer.body.len() + 2) as u32);
-            } else {
-                // No source address (connected socket): `msg_namelen` is a kernel
-                // OUTPUT field and must be set to 0, not left holding the caller's
-                // input buffer size — otherwise a peer-address-reading recvmsg
-                // parses garbage from an untouched name buffer.
-                write_user_u32(name_len_ptr, 0);
-            }
-
-            if sock.domain == crate::socket::AF_NETLINK {
-                // Netlink uevent: attach SCM_CREDENTIALS naming the KERNEL as
-                // sender (pid/uid/gid = 0). systemd's libudev sets SO_PASSCRED
-                // and silently drops any uevent whose recvmsg carries no
-                // sender credentials with uid 0 — so this is required for
-                // udevd / `udevadm monitor` to accept our broadcasts.
-                install_netlink_creds(msg_ptr);
-            } else {
-                // SCM_RIGHTS: install any passed file objects into this task's
-                // fd table and report the new fd numbers in an SOL_SOCKET/
-                // SCM_RIGHTS control message. When SO_PASSCRED is set, also
-                // attach an SCM_CREDENTIALS cmsg naming the message sender —
-                // sd_notify's PID 1 reads $NOTIFY_SOCKET with SO_PASSCRED to
-                // learn which service reported READY=1.
-                let recv_fds = sock.unix_take_recv_fds();
-                let cred = if sock.passcred() {
-                    Some(sock.recvmsg_cred())
-                } else {
-                    None
-                };
-                install_recv_ancillary(msg_ptr, recv_fds, cred);
-            }
-
-            // `msg_flags` (msghdr offset 48) is a kernel OUTPUT field — Linux
-            // always sets it on return (0, or MSG_TRUNC/MSG_CTRUNC/MSG_EOR).
-            // NARF left it untouched, so it held whatever the caller's stack
-            // had. libdbus's `_dbus_read_socket_with_unix_fds` checks
-            // `msg_flags & MSG_CTRUNC` and, if set, treats it as a SERIOUS error
-            // ("lost fds") — corrupting the connection right after the Hello
-            // reply, so the next message it marshalled/sent came out garbage
-            // (a lone 0x71 byte) and the bus dropped it → no KDE session bus.
-            // We deliver the whole datagram/stream chunk and never truncate
-            // ancillary data here, so the correct value is 0.
-            write_user_u32(msg_ptr + 48, 0);
-
-            ctx.set_return(SyscallReturn::ok(n as u64));
-        }
-        // Map the real socket error to its errno. A non-blocking recv with no
-        // data must report EAGAIN, not the bare -1 sentinel (which musl maps to
-        // EPERM); libwayland's connection reader treats anything but EAGAIN as a
-        // fatal "failed to process Wayland connection".
-        crate::socket::SocketOpResult::Err(e) => {
-            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
-        }
-        _ => ctx.set_return(fail),
-    }
-}
-
 #[inline]
 fn read_user_u32(ptr: u64) -> u32 {
     let mut b = [0u8; 4];
@@ -24622,62 +12563,6 @@ fn write_user_u16(ptr: u64, val: u16) {
     // range-validates it and SMAP-brackets the 2-byte write.
     // SAFETY: Valid memory or trusted environment
     let _ = unsafe { copy_to_user(ptr, &b) };
-}
-
-fn sys_sock_register_buf(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let ptr = args.arg0;
-    let len = args.arg1;
-    let task = current_task_id();
-    match crate::socket::register_user_buffer(task, ptr, len) {
-        Some(id) => ctx.set_return(SyscallReturn::ok(id as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
-    }
-}
-
-fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let buf_id = args.arg1 as u32;
-    let off = args.arg2;
-    let len = args.arg3;
-    let _flags = args.arg4 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let task = current_task_id();
-    let (vaddr, slice_len) = match crate::socket::registered_buffer_slice(task, buf_id, off, len) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // "Zero-copy" in the NARF sense: copy once under SMAP bracket into
-    // a kernel staging buffer, then hand to the socket dispatcher.
-    // A real NIC TX path will map this as a DMA descriptor instead —
-    // that upgrade lands when the NIC driver does; for now the
-    // AF_UNIX/loopback path requires a kernel-owned buffer.
-    let n_bytes = slice_len as usize;
-    let mut kbuf = alloc::vec![0u8; n_bytes];
-    // SAFETY: vaddr is a pinned user VA from a registered buffer.
-    if unsafe { copy_from_user(&mut kbuf, vaddr) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    match sock.dispatch_op(crate::socket::SocketOp::Send {
-        buf: &kbuf,
-        flags: 0,
-        addr: None,
-    }) {
-        crate::socket::SocketOpResult::Ok(n) => ctx.set_return(SyscallReturn::ok(n)),
-        _ => ctx.set_return(fail),
-    }
 }
 
 // ── flock(2) — advisory file locking ────────────────────────────
@@ -24738,111 +12623,6 @@ fn flock_try(file_ptr: usize, op: u32, task: u64) -> Result<(), ()> {
         return Err(());
     }
     Err(())
-}
-
-/// `reboot(magic1, magic2, cmd, arg)` — Linux reboot(2). The magic
-/// pair guards against a stray syscall with garbage args landing on
-/// the power-off path (Linux's rationale exactly). No capability
-/// check — everything runs root today, matching the rest of the
-/// surface. RESTART goes through narf-power's FADT/CF9 reset,
-/// POWER_OFF and HALT both enter ACPI S5 (NARF has no "halted but
-/// powered" CPU parking state worth distinguishing). The
-/// Ctrl-Alt-Del toggles are accepted no-ops.
-fn sys_reboot(ctx: &mut dyn TrapContext) {
-    const LINUX_REBOOT_MAGIC1: u64 = 0xfee1_dead;
-    const MAGIC2: u64 = 672_274_793; // 0x28121969
-    const MAGIC2A: u64 = 0x0512_1996;
-    const MAGIC2B: u64 = 0x1604_1998;
-    const MAGIC2C: u64 = 0x2011_2000;
-    const CMD_RESTART: u64 = 0x0123_4567;
-    const CMD_HALT: u64 = 0xcdef_0123;
-    const CMD_POWER_OFF: u64 = 0x4321_fedc;
-    const CMD_CAD_ON: u64 = 0x89ab_cdef;
-    const CMD_CAD_OFF: u64 = 0;
-
-    let a = *ctx.args();
-    // Linux truncates the magics to 32 bits before comparing (glibc
-    // sign-extends LINUX_REBOOT_MAGIC1 through the int prototype).
-    let magic1 = a.arg0 as u32 as u64;
-    let magic2 = a.arg1 as u32 as u64;
-    if magic1 != LINUX_REBOOT_MAGIC1 || !matches!(magic2, MAGIC2 | MAGIC2A | MAGIC2B | MAGIC2C) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    match a.arg2 as u32 as u64 {
-        CMD_CAD_ON | CMD_CAD_OFF => ctx.set_return(SyscallReturn::ok(0)),
-        CMD_RESTART => {
-            use core::fmt::Write;
-            let _ = writeln!(narf_console::Writer, "reboot: Restarting system");
-            narf_power::system::reboot();
-        }
-        CMD_POWER_OFF | CMD_HALT => {
-            use core::fmt::Write;
-            let _ = writeln!(narf_console::Writer, "reboot: Power down");
-            narf_power::system::power_off();
-        }
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)),
-    }
-}
-
-fn sys_flock(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let op = args.arg1 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let task = current_task_id();
-    let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
-    let arc_ops = match arc_ops {
-        Some(a) => a,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let file_ptr = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let nonblock = op & LOCK_NB != 0;
-    // The blocking path retries by parking via the yield hook and
-    // re-executing the syscall on resume (a longjmp clippy can't see),
-    // so every visible path through the body returns/diverges — hence
-    // `never_loop`. The `loop` keeps the retry intent explicit.
-    #[allow(clippy::never_loop)]
-    loop {
-        if flock_try(file_ptr, op, task).is_ok() {
-            ctx.set_return(SyscallReturn::ok(0));
-            return;
-        }
-        if nonblock {
-            ctx.set_return(fail);
-            return;
-        }
-        // Yield ~1ms then retry. Same shape as sys_futex's wait
-        // loop — the unlock side bumps the table; we just re-poll.
-        if let (Some(uctx), Some(hook)) = (
-            crate::user_task::current_user_task(),
-            crate::user_task::yield_hook(),
-        ) {
-            ctx.set_return(fail);
-            let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-            // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
-            // we hold the only reference while setting the deadline and saving CPU state
-            // into `uc.state` before the yield hook hands the task to the executor.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                let uc = &*uctx;
-                uc.sleep_deadline_ns.store(dl, Ordering::Release);
-                ctx.save_user_state(uc.state.get() as *mut u8);
-                *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                if narf_scheduler::stackful::user_own_stack_enabled() {
-                    own_stack_block(ctx);
-                    return;
-                }
-                hook(uctx);
-            }
-            // unreachable
-        }
-        ctx.set_return(fail);
-        return;
-    }
 }
 
 // ── Terminal attributes (termios) ───────────────────────────────
@@ -24953,407 +12733,11 @@ pub fn maybe_deliver_signal_for_input(byte: u8) -> bool {
     true
 }
 
-fn sys_tcgetattr(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let _fd = args.arg0;
-    let out = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    let task = current_task_id();
-    let t = termios_of_task(task);
-    // Copy KTermios struct to user space under the SMAP bracket.
-    // SAFETY: KTermios is repr(C) of POD ints + byte arrays (no padding-sensitive or
-    // niche fields); transmuting it to `[u8; size_of::<KTermios>()]` is a 1:1 byte view.
-    // SAFETY: Valid memory or trusted environment
-    let bytes: [u8; core::mem::size_of::<KTermios>()] = unsafe { core::mem::transmute(t) };
-    // SAFETY: `out` is the user termios pointer (non-zero, checked above);
-    // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out, &bytes) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-fn sys_tcsetattr(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let _fd = args.arg0;
-    let _action = args.arg1;
-    let in_ptr = args.arg2;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if in_ptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    let task = current_task_id();
-    let mut bytes = [0u8; core::mem::size_of::<KTermios>()];
-    // SAFETY: `in_ptr` is the user termios pointer (non-zero, checked above);
-    // copy_from_user range-validates it and SMAP-brackets the read into `bytes`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_from_user(&mut bytes, in_ptr) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    // SAFETY: `bytes` is `size_of::<KTermios>()` bytes; KTermios is repr(C) of POD
-    // ints + byte arrays, so any bit pattern is a valid value — transmute is a 1:1 view.
-    // SAFETY: Valid memory or trusted environment
-    let t: KTermios = unsafe { core::mem::transmute(bytes) };
-    set_termios_of_task(task, t);
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
 // ── I/O multiplexing — poll / epoll / eventfd / timerfd / signalfd ──
-
-/// poll(2) entry: walk a user-supplied array of pollfd, OR each
-/// fd's poll_readiness against the requested events, write revents,
-/// return number of ready fds. Yield + re-poll on no-progress
-/// when timeout != 0.
-fn sys_poll(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let pollfds_ptr = args.arg0;
-    let n = args.arg1 as usize;
-    let timeout_ms = args.arg2 as i64;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if n > 1024 {
-        ctx.set_return(fail);
-        return;
-    }
-    if n == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    if pollfds_ptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // Each pollfd is [fd: i32 (4 B), events: i16 (2 B), revents: i16 (2 B)] = 8 B.
-    const PF_LEN: usize = 8;
-    let total = n * PF_LEN;
-    // Pull the user buffer into a kernel scratch under SMAP bracket.
-    let mut user_buf = alloc::vec![0u8; total];
-    // SAFETY: pollfds_ptr is a user VA; AS active; SMAP bracket inside.
-    if unsafe { copy_from_user(&mut user_buf, pollfds_ptr) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    let task = current_task_id();
-    // Absolute timeout deadline. `sys_poll` parks in ~1ms chunks and
-    // RE-EXECUTES the whole syscall on each wake, so the deadline must be
-    // PERSISTED across re-executions — recomputing `now + timeout_ms` every
-    // chunk would push the deadline 1ms into the future forever and a
-    // pure-timeout poll (nothing ever ready) would never expire. Stash it in
-    // `blocking_deadline_ns` (which the scheduler never clears) on the first
-    // entry and reuse it thereafter; cleared on every return below.
-    let deadline_ns = if timeout_ms < 0 {
-        None
-    } else if let Some(uctx) = crate::user_task::current_user_task() {
-        // SAFETY: `uctx` is the live per-task UserTaskCtx for this trap.
-        let persisted = unsafe { (*uctx).blocking_deadline_ns.load(Ordering::Acquire) };
-        let d = if persisted != 0 {
-            persisted
-        } else {
-            let d = narf_scheduler::narf_time::monotonic_ns()
-                .saturating_add((timeout_ms as u64).saturating_mul(1_000_000));
-            // Only a finite, non-zero timeout needs to survive re-execution; a
-            // `timeout_ms == 0` poll returns immediately below before parking.
-            if timeout_ms > 0 {
-                // SAFETY: as above.
-                unsafe { (*uctx).blocking_deadline_ns.store(d, Ordering::Release) };
-            }
-            d
-        };
-        Some(d)
-    } else {
-        let now = narf_scheduler::narf_time::monotonic_ns();
-        Some(now.saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
-    };
-    loop {
-        let mut ready = 0u64;
-        for i in 0..n {
-            let off = i * PF_LEN;
-            let fd_raw = i32::from_le_bytes([
-                user_buf[off],
-                user_buf[off + 1],
-                user_buf[off + 2],
-                user_buf[off + 3],
-            ]);
-            let events = u16::from_le_bytes([user_buf[off + 4], user_buf[off + 5]]) as u32;
-            let revents = if fd_raw < 0 {
-                0
-            } else {
-                let fd = fd_raw as u32;
-                // Clone the FileOps out from under the fd-table lock before
-                // polling: a nested-epoll fd's poll_readiness re-enters
-                // `fd::with_table`, which would deadlock the non-reentrant
-                // fd-table lock if held across the call (see epoll.rs
-                // `poll_fd_readiness`).
-                let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
-                match ops.map(|o| o.poll_readiness()) {
-                    Some(r) => (r & events) as u16,
-                    None => narf_filesystem::POLL_NVAL as u16,
-                }
-            };
-            user_buf[off + 6..off + 8].copy_from_slice(&revents.to_le_bytes());
-            if revents != 0 {
-                ready += 1;
-            }
-        }
-        if ready > 0 || timeout_ms == 0 {
-            // Copy revents back to user under SMAP bracket.
-            // SAFETY: pollfds_ptr validated above; AS active.
-            let _ = unsafe { copy_to_user(pollfds_ptr, &user_buf) };
-            if let Some(uctx) = crate::user_task::current_user_task() {
-                // SAFETY: live per-task ctx; clear the in-flight poll deadline.
-                unsafe { (*uctx).blocking_deadline_ns.store(0, Ordering::Release) };
-            }
-            ctx.set_return(SyscallReturn::ok(ready));
-            return;
-        }
-        if let Some(deadline) = deadline_ns {
-            let now = narf_scheduler::narf_time::monotonic_ns();
-            if now >= deadline {
-                // Timeout — write back zero revents and return 0.
-                // SAFETY: `pollfds_ptr` was validated earlier in this handler and the
-                // AS is still active; copy_to_user re-validates and SMAP-brackets the write.
-                // SAFETY: Valid memory or trusted environment
-                let _ = unsafe { copy_to_user(pollfds_ptr, &user_buf) };
-                if let Some(uctx) = crate::user_task::current_user_task() {
-                    // SAFETY: live per-task ctx; clear the in-flight poll deadline.
-                    unsafe { (*uctx).blocking_deadline_ns.store(0, Ordering::Release) };
-                }
-                ctx.set_return(SyscallReturn::ok(0));
-                return;
-            }
-        }
-        // Yield ~1ms, then re-walk.
-        if let (Some(uctx), Some(hook)) = (
-            crate::user_task::current_user_task(),
-            crate::user_task::yield_hook(),
-        ) {
-            // Stash partial revents back to user; the longjmp
-            // doesn't return through us so they'd be lost.
-            // BUT we're going to loop, not exit — only write back
-            // after the loop finds something ready or times out.
-            // No-op write; real write happens on the success path.
-            ctx.set_return(SyscallReturn::ok(0));
-            let park = 1_000_000u64;
-            let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(park);
-            // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
-            // we hold the only reference while setting the deadline and saving CPU state
-            // into `uc.state` before the yield hook hands the task to the executor.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                let uc = &*uctx;
-                uc.sleep_deadline_ns.store(dl, Ordering::Release);
-                ctx.save_user_state(uc.state.get() as *mut u8);
-                *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                if narf_scheduler::stackful::user_own_stack_enabled() {
-                    own_stack_block(ctx);
-                    return;
-                }
-                hook(uctx);
-            }
-            // unreachable
-        }
-        // Test fallback: just spin briefly.
-        let chunk_end = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-        while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
-            sleep_pumps::run();
-            core::hint::spin_loop();
-        }
-    }
-}
-
-fn sys_epoll_create(ctx: &mut dyn TrapContext) {
-    let _flags = ctx.args().arg0;
-    let ep = crate::io_mux::EpollFile::new();
-    epoll_arc_register(&ep);
-    let task = current_task_id();
-    let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
-            ops: ep,
-            offset: 0,
-            flags: 0,
-            status_flags: 0,
-        })
-    }) {
-        Some(n) => n,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    ctx.set_return(SyscallReturn::ok(new_fd as u64));
-}
 
 const EPOLL_CTL_ADD: u32 = 1;
 const EPOLL_CTL_DEL: u32 = 2;
 const EPOLL_CTL_MOD: u32 = 3;
-
-fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let epfd = args.arg0 as u32;
-    let op = args.arg1 as u32;
-    let fd = args.arg2 as i32;
-    let event_ptr = args.arg3 as *const u8;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let task = current_task_id();
-    let ep_arc = match epoll_arc_from_fd(task, epfd) {
-        Some(e) => e,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    if op == EPOLL_CTL_DEL {
-        ep_arc.ctl_del(fd);
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    // ADD / MOD need to read the event struct (events: u32 + data: u64 = 12 B).
-    if event_ptr.is_null() {
-        ctx.set_return(fail);
-        return;
-    }
-    let mut kbuf = [0u8; 12];
-    // SAFETY: `event_ptr` is the user epoll_event pointer (non-null, checked above);
-    // copy_from_user range-validates it and SMAP-brackets the 12-byte read.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_from_user(&mut kbuf, event_ptr as u64) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    let entry = crate::io_mux::EpollEntry {
-        events: u32::from_le_bytes(kbuf[..4].try_into().unwrap()),
-        user_data: u64::from_le_bytes(kbuf[4..].try_into().unwrap()),
-    };
-    match op {
-        EPOLL_CTL_ADD => ep_arc.ctl_add(fd, entry),
-        EPOLL_CTL_MOD => ep_arc.ctl_mod(fd, entry),
-        _ => {
-            ctx.set_return(fail);
-            return;
-        }
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let epfd = args.arg0 as u32;
-    let events_out = args.arg1;
-    let max = args.arg2 as usize;
-    let timeout_ms = args.arg3 as i64;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let task = current_task_id();
-    let ep_arc = match epoll_arc_from_fd(task, epfd) {
-        Some(e) => e,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let deadline_ns = if timeout_ms < 0 {
-        None
-    } else {
-        let now = narf_scheduler::narf_time::monotonic_ns();
-        Some(now.saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
-    };
-    loop {
-        let snap = ep_arc.snapshot();
-        let mut written = 0;
-        for (fd, entry) in snap.iter() {
-            if written >= max {
-                break;
-            }
-            let fd_u = if *fd < 0 {
-                continue;
-            } else {
-                *fd as u32
-            };
-            // Clone the FileOps out before polling so a nested-epoll fd can't
-            // re-enter (and deadlock) the non-reentrant fd-table lock.
-            let ops = fd::with_table(task, |t| t.get(fd_u).map(|e| e.ops.clone())).flatten();
-            let readiness = ops.map(|o| o.poll_readiness()).unwrap_or(0);
-            let active = readiness & entry.events;
-            if active != 0 {
-                let off = (written * 12) as u64;
-                let mut rec = [0u8; 12];
-                rec[..4].copy_from_slice(&active.to_le_bytes());
-                rec[4..].copy_from_slice(&entry.user_data.to_le_bytes());
-                // SAFETY: `events_out + off` is the user epoll_event slot for this entry
-                // (`written < max`); copy_to_user range-validates it and SMAP-brackets the
-                // 12-byte write.
-                // SAFETY: Valid memory or trusted environment
-                if unsafe { copy_to_user(events_out + off, &rec) }.is_err() {
-                    break;
-                }
-                written += 1;
-            }
-        }
-        if written > 0 || timeout_ms == 0 {
-            ctx.set_return(SyscallReturn::ok(written as u64));
-            return;
-        }
-        if let Some(dl) = deadline_ns {
-            if narf_scheduler::narf_time::monotonic_ns() >= dl {
-                ctx.set_return(SyscallReturn::ok(0));
-                return;
-            }
-        }
-        // Park until a watched fd becomes ready (or a ~1ms backstop tick).
-        if let (Some(uctx), Some(hook)) = (
-            crate::user_task::current_user_task(),
-            crate::user_task::yield_hook(),
-        ) {
-            ctx.set_return(SyscallReturn::ok(0));
-            let park = 1_000_000u64;
-            let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(park);
-            // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
-            // we hold the only reference while setting the deadline and saving CPU state
-            // into `uc.state` before the yield hook hands the task to the executor.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                let uc = &*uctx;
-                uc.sleep_deadline_ns.store(dl, Ordering::Release);
-                // Park on NET-I/O READINESS, not just the ~1ms timer-wheel
-                // backstop. A socket/pipe/eventfd transition fires
-                // `readiness::notify`, which wakes a registered net-I/O waiter
-                // PROMPTLY; without this an epoll_wait park re-polled only off
-                // the wheel, and under own-stack cooperative scheduling with
-                // other busy tasks (a heavy Wayland client like a Qt6 app) that
-                // wheel service is delayed enough that the readable fd sits
-                // unserviced for many hundreds of ms per hop — so a compositor
-                // idle in epoll_wait(-1) took tens of seconds to serve a new
-                // client's first request (weston never composited kcalc). The
-                // accept/poll parks already do this; epoll_wait was the gap.
-                // Snapshot the readiness generation for the check→park lost-wake
-                // guard (park_should_block re-executes if it advanced). Clear a
-                // stale futex_uaddr so this can't be mis-routed to the futex arm.
-                uc.futex_uaddr.store(0, Ordering::Release);
-                uc.net_io_wait.store(true, Ordering::Release);
-                uc.epoll_park_gen
-                    .store(narf_net::readiness::generation(), Ordering::Release);
-                ctx.save_user_state(uc.state.get() as *mut u8);
-                *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                if narf_scheduler::stackful::user_own_stack_enabled() {
-                    own_stack_block(ctx);
-                    return;
-                }
-                hook(uctx);
-            }
-        }
-        let chunk_end = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-        while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
-            sleep_pumps::run();
-            core::hint::spin_loop();
-        }
-    }
-}
 
 // EpollFile recovery from FdEntry — same shape as the SocketFile
 // side table since Arc<dyn FileOps> can't be downcast generically.
@@ -25375,165 +12759,10 @@ fn epoll_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mu
     g.as_ref()?.get(&raw).cloned()
 }
 
-fn sys_eventfd(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let initval = args.arg0;
-    let flags = args.arg1 as u32;
-    let efd = crate::io_mux::EventFd::new(initval, flags);
-    let task = current_task_id();
-    let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
-            ops: efd,
-            offset: 0,
-            flags: 0,
-            status_flags: 0,
-        })
-    }) {
-        Some(n) => n,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    ctx.set_return(SyscallReturn::ok(new_fd as u64));
-}
-
 // Wave-61: pidfd_open(pid, flags) → fd that signals POLLIN on exit.
 // Linux x86_64 number 434. flags is currently ignored — PIDFD_NONBLOCK
 // (0x0800) is the only documented bit and our pidfd reads return
 // immediately anyway.
-fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let pid_raw = args.arg0;
-    let _flags = args.arg1 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if pid_raw == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // Pid is alive if it has a registered PID→TaskId mapping. A
-    // missing mapping means the pid was never minted or its task has
-    // already torn down — treat as zombie (immediately readable).
-    let alive = pid_to_task_raw(pid_raw).is_some();
-    let state = crate::pidfd::mint_for(pid_raw, alive);
-    let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
-        alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(state));
-    let task = current_task_id();
-    let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
-            ops: file,
-            offset: 0,
-            flags: 0,
-            status_flags: 0,
-        })
-    }) {
-        Some(n) => n,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    ctx.set_return(SyscallReturn::ok(new_fd as u64));
-}
-
-fn sys_timerfd_create(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let flags = args.arg1 as u32;
-    let cloexec = (flags & 0x80000) != 0;
-    let nonblock = (flags & 0o4000) != 0;
-    let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
-    let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
-
-    let tfd = crate::io_mux::TimerFd::new();
-    timerfd_arc_register(&tfd);
-    let task = current_task_id();
-    let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
-            ops: tfd,
-            offset: 0,
-            flags: install_flags,
-            status_flags,
-        })
-    }) {
-        Some(n) => n,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    ctx.set_return(SyscallReturn::ok(new_fd as u64));
-}
-
-fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let flags = args.arg1 as u32;
-    let new_value_ptr = args.arg2;
-    let old_value_ptr = args.arg3;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let task = current_task_id();
-    if new_value_ptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    // itimerspec is { interval: timespec, value: timespec } where
-    // timespec = { tv_sec: i64, tv_nsec: i64 } = 16 B. Total 32 B.
-    let mut buf = [0u8; 32];
-    // SAFETY: `new_value_ptr` is the user itimerspec pointer (non-zero, checked above);
-    // copy_from_user range-validates it and SMAP-brackets the 32-byte read.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_from_user(&mut buf, new_value_ptr) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    let interval_sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let interval_ns = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let value_sec = i64::from_le_bytes(buf[16..24].try_into().unwrap());
-    let value_ns = i64::from_le_bytes(buf[24..32].try_into().unwrap());
-    let interval_total = (interval_sec as u64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(interval_ns as u64);
-    let value_total = (value_sec as u64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(value_ns as u64);
-    let now = narf_scheduler::narf_time::monotonic_ns();
-    let next_fire = if value_total == 0 {
-        0
-    } else if (flags & 1) != 0 {
-        value_total // TFD_TIMER_ABSTIME
-    } else {
-        now.saturating_add(value_total)
-    };
-    let tfd = match timerfd_arc_from_fd(task, fd) {
-        Some(t) => t,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-
-    let (rem_ns, int_ns) = tfd.current();
-    if old_value_ptr != 0 {
-        let mut buf = [0u8; 32];
-        let interval_sec = (int_ns / 1_000_000_000) as i64;
-        let interval_nsec = (int_ns % 1_000_000_000) as i64;
-        let value_sec = (rem_ns / 1_000_000_000) as i64;
-        let value_nsec = (rem_ns % 1_000_000_000) as i64;
-        buf[0..8].copy_from_slice(&interval_sec.to_le_bytes());
-        buf[8..16].copy_from_slice(&interval_nsec.to_le_bytes());
-        buf[16..24].copy_from_slice(&value_sec.to_le_bytes());
-        buf[24..32].copy_from_slice(&value_nsec.to_le_bytes());
-        // SAFETY: copy_to_user range-validates `old_value_ptr` and SMAP-brackets
-        // the write of the 32-byte itimerspec `buf`.
-        if unsafe { copy_to_user(old_value_ptr, &buf) }.is_err() {
-            ctx.set_return(fail);
-            return;
-        }
-    }
-
-    tfd.arm(next_fire, interval_total);
-    ctx.set_return(SyscallReturn::ok(0));
-}
 
 // Wave-64: `timerfd_gettime(fd, &curr_value)` — snapshot the
 // currently-armed timer. Writes `itimerspec` (16 B interval +
@@ -25543,45 +12772,6 @@ fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
 //
 // Linux ref: `fs/timerfd.c`:SYSCALL_DEFINE2(timerfd_gettime, …)
 // (GPL-2.0-or-later, kernel.org).
-#[cfg(feature = "linux-compat")]
-fn sys_timerfd_gettime(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let out_ptr = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let task = current_task_id();
-    if out_ptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    let tfd = match timerfd_arc_from_fd(task, fd) {
-        Some(t) => t,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let (value_remaining_ns, interval_ns) = tfd.current();
-    // itimerspec = { interval: timespec, value: timespec },
-    // timespec = { tv_sec: i64, tv_nsec: i64 }.
-    let mut buf = [0u8; 32];
-    let interval_sec = (interval_ns / 1_000_000_000) as i64;
-    let interval_nsec = (interval_ns % 1_000_000_000) as i64;
-    let value_sec = (value_remaining_ns / 1_000_000_000) as i64;
-    let value_nsec = (value_remaining_ns % 1_000_000_000) as i64;
-    buf[0..8].copy_from_slice(&interval_sec.to_le_bytes());
-    buf[8..16].copy_from_slice(&interval_nsec.to_le_bytes());
-    buf[16..24].copy_from_slice(&value_sec.to_le_bytes());
-    buf[24..32].copy_from_slice(&value_nsec.to_le_bytes());
-    // SAFETY: `out_ptr` is the user itimerspec pointer (non-zero, checked above);
-    // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
 
 static TIMERFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::io_mux::TimerFd>>>,
@@ -25599,98 +12789,6 @@ fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
     let g = TIMERFD_ARCS.lock();
     g.as_ref()?.get(&raw).cloned()
-}
-
-fn sys_signalfd(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    // `fd` is an int: sign-extend from 32 bits so a -1 passed as 0xffffffff
-    // (glibc's signalfd(-1, ...)) is recognised as "create new" rather than
-    // a bogus positive fd 0xffffffff. (`args.arg0 as i64` would read +4G.)
-    let fd_arg = args.arg0 as i32 as i64; // -1 = create new; else replace mask
-    let mask_ptr = args.arg1;
-    let _sizemask = args.arg2;
-    let flags = args.arg3 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let mut mask: u64 = 0;
-    if mask_ptr != 0 {
-        let mut bytes = [0u8; 8];
-        // SAFETY: `mask_ptr` is the user sigset pointer (non-zero, checked above);
-        // copy_from_user range-validates it and SMAP-brackets the 8-byte read.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_from_user(&mut bytes, mask_ptr) }.is_ok() {
-            // A userspace sigset_t puts signal N at bit N-1 — identical to
-            // NARF's SIGNAL_PENDING layout — so the signalfd mask lines up
-            // with the pending bits it is intersected against verbatim.
-            mask = u64::from_le_bytes(bytes);
-        }
-    }
-    let task = current_task_id();
-
-    // Wave-70: prefer the new linux-compat SignalFdFile; replace mask
-    // path uses its `set_mask`. Fall back to legacy SignalFd on a non-
-    // linux-compat build (skip the side-table register, mint legacy).
-    #[cfg(feature = "linux-compat")]
-    {
-        if fd_arg >= 0 {
-            // Replace mask on existing signalfd.
-            let target = fd_arg as u32;
-            if let Some(sf) = signalfd_arc_from_fd(task, target) {
-                sf.set_mask(mask);
-                ctx.set_return(SyscallReturn::ok(target as u64));
-                return;
-            }
-            ctx.set_return(fail);
-            return;
-        }
-        let sfd = crate::linux_compat::SignalFdFile::new(mask, task);
-        signalfd_arc_register(&sfd);
-        let cloexec = (flags & crate::linux_compat::SFD_CLOEXEC) != 0;
-        let nonblock = (flags & crate::linux_compat::SFD_NONBLOCK) != 0;
-        let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
-        let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
-        let new_fd = match fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
-                ops: sfd,
-                offset: 0,
-                flags: install_flags,
-                status_flags,
-            })
-        }) {
-            Some(n) => n,
-            None => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
-        ctx.set_return(SyscallReturn::ok(new_fd as u64));
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        let _ = fd_arg;
-        let sfd = crate::io_mux::SignalFd::new(mask, task);
-        // `crate::linux_compat` only exists under that feature; use the raw
-        // signalfd4 flag bits here (SFD_CLOEXEC == O_CLOEXEC == 0x80000,
-        // SFD_NONBLOCK == O_NONBLOCK == 0o4000) so this branch builds without it.
-        let cloexec = (flags & 0x80000) != 0;
-        let nonblock = (flags & 0o4000) != 0;
-        let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
-        let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
-        let new_fd = match fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
-                ops: sfd,
-                offset: 0,
-                flags: install_flags,
-                status_flags,
-            })
-        }) {
-            Some(n) => n,
-            None => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
-        ctx.set_return(SyscallReturn::ok(new_fd as u64));
-    }
 }
 
 // ── Wave-70 SignalFdFile side table ────────────────────────────────
@@ -25721,143 +12819,6 @@ pub(crate) fn signalfd_arc_from_fd(
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
     let g = SIGNALFD_ARCS.lock();
     g.as_ref()?.get(&raw).cloned()
-}
-
-/// `sigaction(signum, handler, old_out_ptr, flags)` —
-/// NARF-shaped sigaction surface (a Linux `rt_sigaction` is a
-/// 4-arg `(sig, act, oact, sigsetsize)` over a `struct sigaction`;
-/// we flatten the struct into registers for fewer copies).
-///
-/// arg0 = signum,
-/// arg1 = handler vaddr (0 = clear),
-/// arg2 = old_out_ptr (optional, may be 0; receives prior handler
-///        vaddr — 8 bytes — for Linux's `oldact->sa_handler`),
-/// arg3 = `sa_flags` (SA_*). Honoured: SA_SIGINFO, SA_RESTART,
-///        SA_ONSTACK, SA_NODEFER, SA_RESETHAND. Unknown bits stored
-///        but no action taken.
-///
-/// Older 3-arg callers (arg3 = 0) get flags = 0 as before — the
-/// new arg slot is back-compatible.
-fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let signum = args.arg0 as usize;
-    let act_ptr = args.arg1;
-    let oact_ptr = args.arg2;
-    let sigsetsize = args.arg3 as usize;
-
-    let fail = SyscallReturn::ok((-1i64) as u64); // -EPERM (legacy shape)
-    let einval = SyscallReturn::ok((-22i64) as u64);
-    if signum >= NSIG || sigsetsize != 8 {
-        ctx.set_return(einval);
-        return;
-    }
-    // Linux: SIGKILL and SIGSTOP cannot be caught, ignored, or have
-    // their action changed at all when `act` is non-NULL.
-    if act_ptr != 0 && (signum == 9 || signum == 19) {
-        ctx.set_return(einval);
-        return;
-    }
-
-    let task = current_task_id();
-    let h = match sighand_of(task) {
-        Some(h) => h,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-
-    // Read out the PRIOR action first so oldact reflects the
-    // pre-change state even when act also updates it.
-    let prior = h.lock()[signum];
-    if oact_ptr != 0 {
-        // Linux `struct sigaction`: sa_handler(8) sa_flags(8)
-        // sa_restorer(8) sa_mask(8). sa_mask isn't modelled per-action;
-        // report empty.
-        let mut out = [0u8; 32];
-        if let Some(a) = prior {
-            out[0..8].copy_from_slice(&a.handler.to_ne_bytes());
-            out[8..16].copy_from_slice(&u64::from(a.flags).to_ne_bytes());
-            out[16..24].copy_from_slice(&a.restorer.to_ne_bytes());
-        }
-        // SAFETY: `oact_ptr` is the user oldact pointer (non-zero, checked);
-        // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
-        if unsafe { copy_to_user(oact_ptr, &out) }.is_err() {
-            ctx.set_return(fail);
-            return;
-        }
-    }
-
-    if act_ptr != 0 {
-        let mut buf = [0u8; 32]; // sa_handler(8) + sa_flags(8) + sa_restorer(8) + sa_mask(8)
-                                 // SAFETY: `act_ptr` is the user sigaction pointer (non-zero, checked above);
-                                 // copy_from_user range-validates it and SMAP-brackets the 32-byte read.
-                                 // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_from_user(&mut buf, act_ptr) }.is_err() {
-            ctx.set_return(fail);
-            return;
-        }
-        let handler = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
-        let flags = u64::from_ne_bytes(buf[8..16].try_into().unwrap()) as u32;
-        let restorer = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
-
-        h.lock()[signum] = if handler == 0 {
-            None
-        } else {
-            Some(SigAction {
-                handler,
-                restorer,
-                flags,
-            })
-        };
-    }
-    ctx.set_return(SyscallReturn::ok(0));
-}
-
-fn sys_sigaction(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let signum = args.arg0 as usize;
-    let new_handler = args.arg1;
-    let old_out = args.arg2;
-    let flags = args.arg3 as u32;
-    if signum >= NSIG {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let task = current_task_id();
-
-    let prior = {
-        let h = match sighand_of(task) {
-            Some(h) => h,
-            None => {
-                ctx.set_return(SyscallReturn::invalid_op());
-                return;
-            }
-        };
-        let mut slots = h.lock();
-        let prior = slots[signum];
-        slots[signum] = if new_handler == 0 {
-            None
-        } else {
-            Some(SigAction {
-                handler: new_handler,
-                restorer: 0,
-                flags,
-            })
-        };
-        prior
-    };
-
-    if old_out != 0 {
-        // Write the prior handler address to user space under the SMAP bracket.
-        let val = prior.map(|a| a.handler).unwrap_or(0);
-        // SAFETY: `old_out` is the user old-handler pointer (non-zero, checked above);
-        // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
-        // SAFETY: Valid memory or trusted environment
-        let _ = unsafe { copy_to_user(old_out, &val.to_ne_bytes()) };
-    }
-
-    ctx.set_return(SyscallReturn::ok(0));
 }
 
 // ── Installer ──────────────────────────────────────────────────────
@@ -25965,27 +12926,6 @@ pub fn spawn_dispatcher_for(task_id: u64) -> Option<narf_scheduler::TaskId> {
 // by name. All three accept user pointers; we copy the image into
 // kernel space before parsing so the user can't race the parser.
 
-fn sys_init_module(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let ptr = args.arg0 as *const u8;
-    let len = args.arg1 as usize;
-    // arg2 = params_ptr — parsed/used by `narf_modules::loader` once
-    // the param string parser lands. Phase 1 ignores user-supplied
-    // params; modules read static `.narf_kparams` from their ELF.
-    if ptr.is_null() || len == 0 || len > (1 << 28) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
-        return;
-    }
-    // SAFETY: caller pointer in the active AS; bounds-checked by len.
-    let bytes_user = unsafe { core::slice::from_raw_parts(ptr, len) };
-    // Copy to kernel heap so the user can't mutate the buffer during
-    // parsing.
-    let owned: alloc::vec::Vec<u8> = bytes_user.to_vec();
-    ctx.set_return(SyscallReturn::ok(init_module_result(
-        narf_modules::syscalls::sys_init_module(&owned),
-    )));
-}
-
 /// Map a module-loader outcome to a Linux return value. A foreign
 /// image (a real Linux `.ko`, or anything lacking NARF's module
 /// contract) becomes a success no-op: NARF is monolithic, so the
@@ -26002,63 +12942,6 @@ fn init_module_result(
         Ok(_) => 0,
         Err(e) if e.is_foreign_image() => 0,
         Err(e) => (e.to_errno() as i64) as u64,
-    }
-}
-
-fn sys_finit_module(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    // arg1 = params_ptr, arg2 = flags — both ignored in Phase 1.
-    // Read the file via the fd table.
-    let task = current_task_id();
-    let outcome = fd::with_table(task, |t| {
-        let entry = t.get_mut(fd).ok_or(())?;
-        let mut accum = alloc::vec::Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let off = entry.offset;
-            let n = poll_blocking(entry.ops.read(off, &mut buf))
-                .and_then(|r| r.ok())
-                .unwrap_or(0);
-            if n == 0 {
-                break;
-            }
-            accum.extend_from_slice(&buf[..n]);
-            entry.offset = off + n as u64;
-            if accum.len() > (1 << 28) {
-                return Err(());
-            }
-        }
-        Ok(accum)
-    });
-    match outcome {
-        Some(Ok(bytes)) => ctx.set_return(SyscallReturn::ok(init_module_result(
-            narf_modules::syscalls::sys_finit_module(&bytes),
-        ))),
-        _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
-    }
-}
-
-fn sys_delete_module(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let name_ptr = args.arg0 as *const u8;
-    let name_len = args.arg1 as usize;
-    if name_ptr.is_null() || name_len == 0 || name_len > 256 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
-        return;
-    }
-    // SAFETY: caller pointer in the active AS; bounds-checked.
-    let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
-    let name = match core::str::from_utf8(name_bytes) {
-        Ok(s) => s,
-        Err(_) => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
-            return;
-        }
-    };
-    match narf_modules::syscalls::sys_delete_module(name) {
-        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(e) => ctx.set_return(SyscallReturn::ok((e.to_errno() as i64) as u64)),
     }
 }
 
@@ -27759,3 +14642,779 @@ mod aio {
         ctx.set_return(SyscallReturn::ok(count as u64));
     }
 }
+
+// ── per-syscall handlers (auto-split from handlers.rs) ──
+#[path = "sys_access_chmod_chown.rs"]
+mod handler_sys_access_chmod_chown;
+#[path = "sys_adjtimex.rs"]
+mod handler_sys_adjtimex;
+#[path = "sys_arch_prctl.rs"]
+mod handler_sys_arch_prctl;
+#[path = "sys_at2_reshape.rs"]
+mod handler_sys_at2_reshape;
+#[path = "sys_bootstrap.rs"]
+mod handler_sys_bootstrap;
+#[path = "sys_brk.rs"]
+mod handler_sys_brk;
+#[path = "sys_capget.rs"]
+mod handler_sys_capget;
+#[path = "sys_capset.rs"]
+mod handler_sys_capset;
+#[path = "sys_chdir.rs"]
+mod handler_sys_chdir;
+#[path = "sys_chmod.rs"]
+mod handler_sys_chmod;
+#[path = "sys_chroot.rs"]
+mod handler_sys_chroot;
+#[path = "sys_chroot_for_test.rs"]
+mod handler_sys_chroot_for_test;
+#[path = "sys_clock_adjtime.rs"]
+mod handler_sys_clock_adjtime;
+#[path = "sys_clock_getres.rs"]
+mod handler_sys_clock_getres;
+#[path = "sys_clock_gettime.rs"]
+mod handler_sys_clock_gettime;
+#[path = "sys_clock_settime.rs"]
+mod handler_sys_clock_settime;
+#[path = "sys_clone.rs"]
+mod handler_sys_clone;
+#[path = "sys_clone3.rs"]
+mod handler_sys_clone3;
+#[path = "sys_close.rs"]
+mod handler_sys_close;
+#[path = "sys_close_range.rs"]
+mod handler_sys_close_range;
+#[path = "sys_copy_file_range.rs"]
+mod handler_sys_copy_file_range;
+#[path = "sys_creat.rs"]
+mod handler_sys_creat;
+#[path = "sys_delete_module.rs"]
+mod handler_sys_delete_module;
+#[path = "sys_dup.rs"]
+mod handler_sys_dup;
+#[path = "sys_dup2.rs"]
+mod handler_sys_dup2;
+#[path = "sys_dup3.rs"]
+mod handler_sys_dup3;
+#[path = "sys_epoll_create.rs"]
+mod handler_sys_epoll_create;
+#[path = "sys_epoll_ctl.rs"]
+mod handler_sys_epoll_ctl;
+#[path = "sys_epoll_wait.rs"]
+mod handler_sys_epoll_wait;
+#[path = "sys_eventfd.rs"]
+mod handler_sys_eventfd;
+#[path = "sys_execve.rs"]
+mod handler_sys_execve;
+#[path = "sys_execveat.rs"]
+mod handler_sys_execveat;
+#[path = "sys_exit_group.rs"]
+mod handler_sys_exit_group;
+#[path = "sys_exit_task.rs"]
+mod handler_sys_exit_task;
+#[path = "sys_fadvise64.rs"]
+mod handler_sys_fadvise64;
+#[path = "sys_fallocate.rs"]
+mod handler_sys_fallocate;
+#[path = "sys_fb_connect.rs"]
+mod handler_sys_fb_connect;
+#[path = "sys_fb_disconnect.rs"]
+mod handler_sys_fb_disconnect;
+#[path = "sys_fb_flush_wait.rs"]
+mod handler_sys_fb_flush_wait;
+#[path = "sys_fb_info.rs"]
+mod handler_sys_fb_info;
+#[path = "sys_fb_ring_map.rs"]
+mod handler_sys_fb_ring_map;
+#[path = "sys_fchdir.rs"]
+mod handler_sys_fchdir;
+#[path = "sys_fchmod_or_fchown.rs"]
+mod handler_sys_fchmod_or_fchown;
+#[path = "sys_fchmodat.rs"]
+mod handler_sys_fchmodat;
+#[path = "sys_fchmodat_or_fchownat.rs"]
+mod handler_sys_fchmodat_or_fchownat;
+#[path = "sys_fcntl.rs"]
+mod handler_sys_fcntl;
+#[path = "sys_fgetxattr.rs"]
+mod handler_sys_fgetxattr;
+#[path = "sys_finit_module.rs"]
+mod handler_sys_finit_module;
+#[path = "sys_firmware_install.rs"]
+mod handler_sys_firmware_install;
+#[path = "sys_flistxattr.rs"]
+mod handler_sys_flistxattr;
+#[path = "sys_flock.rs"]
+mod handler_sys_flock;
+#[path = "sys_fork.rs"]
+mod handler_sys_fork;
+#[path = "sys_fremovexattr.rs"]
+mod handler_sys_fremovexattr;
+#[path = "sys_fsetxattr.rs"]
+mod handler_sys_fsetxattr;
+#[path = "sys_fstat.rs"]
+mod handler_sys_fstat;
+#[path = "sys_fstat_linux.rs"]
+mod handler_sys_fstat_linux;
+#[path = "sys_fstatfs.rs"]
+mod handler_sys_fstatfs;
+#[path = "sys_fsync.rs"]
+mod handler_sys_fsync;
+#[path = "sys_ftruncate.rs"]
+mod handler_sys_ftruncate;
+#[path = "sys_futex.rs"]
+mod handler_sys_futex;
+#[path = "sys_futex_requeue.rs"]
+mod handler_sys_futex_requeue;
+#[path = "sys_futex_wait.rs"]
+mod handler_sys_futex_wait;
+#[path = "sys_futex_waitv.rs"]
+mod handler_sys_futex_waitv;
+#[path = "sys_futex_wake.rs"]
+mod handler_sys_futex_wake;
+#[path = "sys_futimesat.rs"]
+mod handler_sys_futimesat;
+#[path = "sys_get_mempolicy.rs"]
+mod handler_sys_get_mempolicy;
+#[path = "sys_get_robust_list.rs"]
+mod handler_sys_get_robust_list;
+#[path = "sys_getcpu.rs"]
+mod handler_sys_getcpu;
+#[path = "sys_getcwd.rs"]
+mod handler_sys_getcwd;
+#[path = "sys_getdents.rs"]
+mod handler_sys_getdents;
+#[path = "sys_getdents64.rs"]
+mod handler_sys_getdents64;
+#[path = "sys_getegid.rs"]
+mod handler_sys_getegid;
+#[path = "sys_geteuid.rs"]
+mod handler_sys_geteuid;
+#[path = "sys_getgid.rs"]
+mod handler_sys_getgid;
+#[path = "sys_getgroups.rs"]
+mod handler_sys_getgroups;
+#[path = "sys_gethostname.rs"]
+mod handler_sys_gethostname;
+#[path = "sys_getpgid.rs"]
+mod handler_sys_getpgid;
+#[path = "sys_getpgrp.rs"]
+mod handler_sys_getpgrp;
+#[path = "sys_getpid.rs"]
+mod handler_sys_getpid;
+#[path = "sys_getppid.rs"]
+mod handler_sys_getppid;
+#[path = "sys_getpriority.rs"]
+mod handler_sys_getpriority;
+#[path = "sys_getrandom.rs"]
+mod handler_sys_getrandom;
+#[path = "sys_getresgid.rs"]
+mod handler_sys_getresgid;
+#[path = "sys_getresuid.rs"]
+mod handler_sys_getresuid;
+#[path = "sys_getrlimit.rs"]
+mod handler_sys_getrlimit;
+#[path = "sys_getrusage.rs"]
+mod handler_sys_getrusage;
+#[path = "sys_getsid.rs"]
+mod handler_sys_getsid;
+#[path = "sys_gettid.rs"]
+mod handler_sys_gettid;
+#[path = "sys_gettimeofday.rs"]
+mod handler_sys_gettimeofday;
+#[path = "sys_getuid.rs"]
+mod handler_sys_getuid;
+#[path = "sys_getxattr.rs"]
+mod handler_sys_getxattr;
+#[path = "sys_init_module.rs"]
+mod handler_sys_init_module;
+#[path = "sys_ioctl.rs"]
+mod handler_sys_ioctl;
+#[path = "sys_ioprio_get.rs"]
+mod handler_sys_ioprio_get;
+#[path = "sys_ioprio_set.rs"]
+mod handler_sys_ioprio_set;
+#[path = "sys_kcmp.rs"]
+mod handler_sys_kcmp;
+#[path = "sys_kill.rs"]
+mod handler_sys_kill;
+#[path = "sys_link.rs"]
+mod handler_sys_link;
+#[path = "sys_linkat.rs"]
+mod handler_sys_linkat;
+#[path = "sys_listdir.rs"]
+mod handler_sys_listdir;
+#[path = "sys_listxattr.rs"]
+mod handler_sys_listxattr;
+#[path = "sys_lseek.rs"]
+mod handler_sys_lseek;
+#[path = "sys_lstat_linux.rs"]
+mod handler_sys_lstat_linux;
+#[path = "sys_madvise.rs"]
+mod handler_sys_madvise;
+#[path = "sys_mbind.rs"]
+mod handler_sys_mbind;
+#[path = "sys_membarrier.rs"]
+mod handler_sys_membarrier;
+#[path = "sys_memfd_create.rs"]
+mod handler_sys_memfd_create;
+#[path = "sys_memfd_secret.rs"]
+mod handler_sys_memfd_secret;
+#[path = "sys_migrate_pages.rs"]
+mod handler_sys_migrate_pages;
+#[path = "sys_mincore.rs"]
+mod handler_sys_mincore;
+#[path = "sys_mkdir.rs"]
+mod handler_sys_mkdir;
+#[path = "sys_mkdirat.rs"]
+mod handler_sys_mkdirat;
+#[path = "sys_mknod.rs"]
+mod handler_sys_mknod;
+#[path = "sys_mknodat.rs"]
+mod handler_sys_mknodat;
+#[path = "sys_mlock.rs"]
+mod handler_sys_mlock;
+#[path = "sys_mlock2.rs"]
+mod handler_sys_mlock2;
+#[path = "sys_mlockall.rs"]
+mod handler_sys_mlockall;
+#[path = "sys_mmap.rs"]
+mod handler_sys_mmap;
+#[path = "sys_mount.rs"]
+mod handler_sys_mount;
+#[path = "sys_mount_for_test.rs"]
+mod handler_sys_mount_for_test;
+#[path = "sys_move_pages.rs"]
+mod handler_sys_move_pages;
+#[path = "sys_mprotect.rs"]
+mod handler_sys_mprotect;
+#[path = "sys_mremap.rs"]
+mod handler_sys_mremap;
+#[path = "sys_msgget.rs"]
+mod handler_sys_msgget;
+#[path = "sys_msync.rs"]
+mod handler_sys_msync;
+#[path = "sys_munlock.rs"]
+mod handler_sys_munlock;
+#[path = "sys_munlockall.rs"]
+mod handler_sys_munlockall;
+#[path = "sys_munmap.rs"]
+mod handler_sys_munmap;
+#[path = "sys_name_to_handle_at.rs"]
+mod handler_sys_name_to_handle_at;
+#[path = "sys_newfstatat.rs"]
+mod handler_sys_newfstatat;
+#[path = "sys_newfstatat_linux.rs"]
+mod handler_sys_newfstatat_linux;
+#[path = "sys_noop_ok.rs"]
+mod handler_sys_noop_ok;
+#[path = "sys_open.rs"]
+mod handler_sys_open;
+#[path = "sys_open_by_handle_at.rs"]
+mod handler_sys_open_by_handle_at;
+#[path = "sys_open_linux.rs"]
+mod handler_sys_open_linux;
+#[path = "sys_openat.rs"]
+mod handler_sys_openat;
+#[path = "sys_openat2.rs"]
+mod handler_sys_openat2;
+#[path = "sys_pause.rs"]
+mod handler_sys_pause;
+#[path = "sys_personality.rs"]
+mod handler_sys_personality;
+#[path = "sys_pidfd_getfd.rs"]
+mod handler_sys_pidfd_getfd;
+#[path = "sys_pidfd_open.rs"]
+mod handler_sys_pidfd_open;
+#[path = "sys_pidfd_send_signal.rs"]
+mod handler_sys_pidfd_send_signal;
+#[path = "sys_pipe.rs"]
+mod handler_sys_pipe;
+#[path = "sys_pipe2.rs"]
+mod handler_sys_pipe2;
+#[path = "sys_pivot_root.rs"]
+mod handler_sys_pivot_root;
+#[path = "sys_pivot_root_for_test.rs"]
+mod handler_sys_pivot_root_for_test;
+#[path = "sys_pkey_alloc.rs"]
+mod handler_sys_pkey_alloc;
+#[path = "sys_pkey_free.rs"]
+mod handler_sys_pkey_free;
+#[path = "sys_pkey_mprotect.rs"]
+mod handler_sys_pkey_mprotect;
+#[path = "sys_poll.rs"]
+mod handler_sys_poll;
+#[path = "sys_prctl.rs"]
+mod handler_sys_prctl;
+#[path = "sys_pread64.rs"]
+mod handler_sys_pread64;
+#[path = "sys_preadv.rs"]
+mod handler_sys_preadv;
+#[path = "sys_preadv2.rs"]
+mod handler_sys_preadv2;
+#[path = "sys_prlimit64.rs"]
+mod handler_sys_prlimit64;
+#[path = "sys_process_madvise.rs"]
+mod handler_sys_process_madvise;
+#[path = "sys_process_vm_readv.rs"]
+mod handler_sys_process_vm_readv;
+#[path = "sys_process_vm_writev.rs"]
+mod handler_sys_process_vm_writev;
+#[path = "sys_ptrace.rs"]
+mod handler_sys_ptrace;
+#[path = "sys_pwrite64.rs"]
+mod handler_sys_pwrite64;
+#[path = "sys_pwritev.rs"]
+mod handler_sys_pwritev;
+#[path = "sys_pwritev2.rs"]
+mod handler_sys_pwritev2;
+#[path = "sys_read.rs"]
+mod handler_sys_read;
+#[path = "sys_readahead.rs"]
+mod handler_sys_readahead;
+#[path = "sys_readlink.rs"]
+mod handler_sys_readlink;
+#[path = "sys_readlinkat.rs"]
+mod handler_sys_readlinkat;
+#[path = "sys_readv.rs"]
+mod handler_sys_readv;
+#[path = "sys_reboot.rs"]
+mod handler_sys_reboot;
+#[path = "sys_removexattr.rs"]
+mod handler_sys_removexattr;
+#[path = "sys_rename.rs"]
+mod handler_sys_rename;
+#[path = "sys_renameat.rs"]
+mod handler_sys_renameat;
+#[path = "sys_renameat2.rs"]
+mod handler_sys_renameat2;
+#[path = "sys_restart_syscall.rs"]
+mod handler_sys_restart_syscall;
+#[path = "sys_ring_kick.rs"]
+mod handler_sys_ring_kick;
+#[path = "sys_rmdir.rs"]
+mod handler_sys_rmdir;
+#[path = "sys_rseq.rs"]
+mod handler_sys_rseq;
+#[path = "sys_rt_sigaction.rs"]
+mod handler_sys_rt_sigaction;
+#[path = "sys_rt_sigpending.rs"]
+mod handler_sys_rt_sigpending;
+#[path = "sys_rt_sigqueueinfo.rs"]
+mod handler_sys_rt_sigqueueinfo;
+#[path = "sys_rt_sigsuspend.rs"]
+mod handler_sys_rt_sigsuspend;
+#[path = "sys_rt_sigtimedwait.rs"]
+mod handler_sys_rt_sigtimedwait;
+#[path = "sys_rt_tgsigqueueinfo.rs"]
+mod handler_sys_rt_tgsigqueueinfo;
+#[path = "sys_sched_get_priority_max.rs"]
+mod handler_sys_sched_get_priority_max;
+#[path = "sys_sched_get_priority_min.rs"]
+mod handler_sys_sched_get_priority_min;
+#[path = "sys_sched_getaffinity.rs"]
+mod handler_sys_sched_getaffinity;
+#[path = "sys_sched_getattr.rs"]
+mod handler_sys_sched_getattr;
+#[path = "sys_sched_getparam.rs"]
+mod handler_sys_sched_getparam;
+#[path = "sys_sched_getscheduler.rs"]
+mod handler_sys_sched_getscheduler;
+#[path = "sys_sched_rr_get_interval.rs"]
+mod handler_sys_sched_rr_get_interval;
+#[path = "sys_sched_setaffinity.rs"]
+mod handler_sys_sched_setaffinity;
+#[path = "sys_sched_setattr.rs"]
+mod handler_sys_sched_setattr;
+#[path = "sys_sched_setparam.rs"]
+mod handler_sys_sched_setparam;
+#[path = "sys_sched_setscheduler.rs"]
+mod handler_sys_sched_setscheduler;
+#[path = "sys_semget.rs"]
+mod handler_sys_semget;
+#[path = "sys_sendfile.rs"]
+mod handler_sys_sendfile;
+#[path = "sys_set_mempolicy.rs"]
+mod handler_sys_set_mempolicy;
+#[path = "sys_set_mempolicy_home_node.rs"]
+mod handler_sys_set_mempolicy_home_node;
+#[path = "sys_set_robust_list.rs"]
+mod handler_sys_set_robust_list;
+#[path = "sys_set_tid_address.rs"]
+mod handler_sys_set_tid_address;
+#[path = "sys_setdomainname.rs"]
+mod handler_sys_setdomainname;
+#[path = "sys_setfsgid.rs"]
+mod handler_sys_setfsgid;
+#[path = "sys_setfsuid.rs"]
+mod handler_sys_setfsuid;
+#[path = "sys_setgid.rs"]
+mod handler_sys_setgid;
+#[path = "sys_setgroups.rs"]
+mod handler_sys_setgroups;
+#[path = "sys_sethostname.rs"]
+mod handler_sys_sethostname;
+#[path = "sys_setns.rs"]
+mod handler_sys_setns;
+#[path = "sys_setpgid.rs"]
+mod handler_sys_setpgid;
+#[path = "sys_setpriority.rs"]
+mod handler_sys_setpriority;
+#[path = "sys_setregid.rs"]
+mod handler_sys_setregid;
+#[path = "sys_setresgid.rs"]
+mod handler_sys_setresgid;
+#[path = "sys_setresuid.rs"]
+mod handler_sys_setresuid;
+#[path = "sys_setreuid.rs"]
+mod handler_sys_setreuid;
+#[path = "sys_setrlimit.rs"]
+mod handler_sys_setrlimit;
+#[path = "sys_setsid.rs"]
+mod handler_sys_setsid;
+#[path = "sys_settimeofday.rs"]
+mod handler_sys_settimeofday;
+#[path = "sys_setuid.rs"]
+mod handler_sys_setuid;
+#[path = "sys_setxattr.rs"]
+mod handler_sys_setxattr;
+#[path = "sys_shmat.rs"]
+mod handler_sys_shmat;
+#[path = "sys_shmctl.rs"]
+mod handler_sys_shmctl;
+#[path = "sys_shmdt.rs"]
+mod handler_sys_shmdt;
+#[path = "sys_shmem_create.rs"]
+mod handler_sys_shmem_create;
+#[path = "sys_shmem_destroy.rs"]
+mod handler_sys_shmem_destroy;
+#[path = "sys_shmem_map.rs"]
+mod handler_sys_shmem_map;
+#[path = "sys_shmget.rs"]
+mod handler_sys_shmget;
+#[path = "sys_shmget_compat.rs"]
+mod handler_sys_shmget_compat;
+#[path = "sys_sigaction.rs"]
+mod handler_sys_sigaction;
+#[path = "sys_sigaltstack.rs"]
+mod handler_sys_sigaltstack;
+#[path = "sys_signalfd.rs"]
+mod handler_sys_signalfd;
+#[path = "sys_sigprocmask.rs"]
+mod handler_sys_sigprocmask;
+#[path = "sys_sigreturn.rs"]
+mod handler_sys_sigreturn;
+#[path = "sys_sleep.rs"]
+mod handler_sys_sleep;
+#[path = "sys_sock_register_buf.rs"]
+mod handler_sys_sock_register_buf;
+#[path = "sys_sock_send_zc.rs"]
+mod handler_sys_sock_send_zc;
+#[path = "sys_socket.rs"]
+mod handler_sys_socket;
+#[path = "sys_socket_accept.rs"]
+mod handler_sys_socket_accept;
+#[path = "sys_socket_accept4.rs"]
+mod handler_sys_socket_accept4;
+#[path = "sys_socket_bind.rs"]
+mod handler_sys_socket_bind;
+#[path = "sys_socket_connect.rs"]
+mod handler_sys_socket_connect;
+#[path = "sys_socket_get_addr.rs"]
+mod handler_sys_socket_get_addr;
+#[path = "sys_socket_getpeername.rs"]
+mod handler_sys_socket_getpeername;
+#[path = "sys_socket_getsockname.rs"]
+mod handler_sys_socket_getsockname;
+#[path = "sys_socket_getsockopt.rs"]
+mod handler_sys_socket_getsockopt;
+#[path = "sys_socket_listen.rs"]
+mod handler_sys_socket_listen;
+#[path = "sys_socket_recv.rs"]
+mod handler_sys_socket_recv;
+#[path = "sys_socket_recvmmsg.rs"]
+mod handler_sys_socket_recvmmsg;
+#[path = "sys_socket_recvmsg.rs"]
+mod handler_sys_socket_recvmsg;
+#[path = "sys_socket_send.rs"]
+mod handler_sys_socket_send;
+#[path = "sys_socket_sendmmsg.rs"]
+mod handler_sys_socket_sendmmsg;
+#[path = "sys_socket_sendmsg.rs"]
+mod handler_sys_socket_sendmsg;
+#[path = "sys_socket_setsockopt.rs"]
+mod handler_sys_socket_setsockopt;
+#[path = "sys_socket_shutdown.rs"]
+mod handler_sys_socket_shutdown;
+#[path = "sys_socketpair.rs"]
+mod handler_sys_socketpair;
+#[path = "sys_splice.rs"]
+mod handler_sys_splice;
+#[path = "sys_stat.rs"]
+mod handler_sys_stat;
+#[path = "sys_stat_linux.rs"]
+mod handler_sys_stat_linux;
+#[path = "sys_statfs.rs"]
+mod handler_sys_statfs;
+#[path = "sys_statx.rs"]
+mod handler_sys_statx;
+#[path = "sys_symlink.rs"]
+mod handler_sys_symlink;
+#[path = "sys_symlinkat.rs"]
+mod handler_sys_symlinkat;
+#[path = "sys_sync.rs"]
+mod handler_sys_sync;
+#[path = "sys_sync_file_range.rs"]
+mod handler_sys_sync_file_range;
+#[path = "sys_syncfs.rs"]
+mod handler_sys_syncfs;
+#[path = "sys_sysinfo.rs"]
+mod handler_sys_sysinfo;
+#[path = "sys_tcgetattr.rs"]
+mod handler_sys_tcgetattr;
+#[path = "sys_tcsetattr.rs"]
+mod handler_sys_tcsetattr;
+#[path = "sys_tee.rs"]
+mod handler_sys_tee;
+#[path = "sys_tgkill.rs"]
+mod handler_sys_tgkill;
+#[path = "sys_time.rs"]
+mod handler_sys_time;
+#[path = "sys_timerfd_create.rs"]
+mod handler_sys_timerfd_create;
+#[path = "sys_timerfd_gettime.rs"]
+mod handler_sys_timerfd_gettime;
+#[path = "sys_timerfd_settime.rs"]
+mod handler_sys_timerfd_settime;
+#[path = "sys_times.rs"]
+mod handler_sys_times;
+#[path = "sys_tkill.rs"]
+mod handler_sys_tkill;
+#[path = "sys_truncate.rs"]
+mod handler_sys_truncate;
+#[path = "sys_umask.rs"]
+mod handler_sys_umask;
+#[path = "sys_umount2.rs"]
+mod handler_sys_umount2;
+#[path = "sys_umount2_for_test.rs"]
+mod handler_sys_umount2_for_test;
+#[path = "sys_uname.rs"]
+mod handler_sys_uname;
+#[path = "sys_unlink.rs"]
+mod handler_sys_unlink;
+#[path = "sys_unlinkat.rs"]
+mod handler_sys_unlinkat;
+#[path = "sys_unshare.rs"]
+mod handler_sys_unshare;
+#[path = "sys_utime.rs"]
+mod handler_sys_utime;
+#[path = "sys_utimensat.rs"]
+mod handler_sys_utimensat;
+#[path = "sys_utimes.rs"]
+mod handler_sys_utimes;
+#[path = "sys_vhangup.rs"]
+mod handler_sys_vhangup;
+#[path = "sys_vmsplice.rs"]
+mod handler_sys_vmsplice;
+#[path = "sys_wait4.rs"]
+mod handler_sys_wait4;
+#[path = "sys_waitid.rs"]
+mod handler_sys_waitid;
+#[path = "sys_write.rs"]
+mod handler_sys_write;
+#[path = "sys_writev.rs"]
+mod handler_sys_writev;
+#[path = "sys_yield.rs"]
+mod handler_sys_yield;
+
+#[allow(unused_imports)]
+pub(crate) use handler_sys_arch_prctl::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_chroot::*;
+#[allow(unused_imports)]
+pub use handler_sys_chroot_for_test::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_clone::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_clone3::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_fstat_linux::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_lstat_linux::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_madvise::*;
+#[allow(unused_imports)]
+pub use handler_sys_mount_for_test::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_msgget::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_name_to_handle_at::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_newfstatat_linux::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_open_by_handle_at::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_pivot_root::*;
+#[allow(unused_imports)]
+pub use handler_sys_pivot_root_for_test::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_semget::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_set_tid_address::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_shmat::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_shmctl::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_shmdt::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_shmget::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_shmget_compat::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_stat_linux::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_statx::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_timerfd_gettime::*;
+#[allow(unused_imports)]
+pub use handler_sys_umount2_for_test::*;
+#[allow(unused_imports)]
+pub(crate) use {
+    handler_sys_access_chmod_chown::sys_access_chmod_chown, handler_sys_adjtimex::sys_adjtimex,
+    handler_sys_at2_reshape::sys_at2_reshape, handler_sys_bootstrap::sys_bootstrap,
+    handler_sys_brk::sys_brk, handler_sys_capget::sys_capget, handler_sys_capset::sys_capset,
+    handler_sys_chdir::sys_chdir, handler_sys_chmod::sys_chmod,
+    handler_sys_clock_adjtime::sys_clock_adjtime, handler_sys_clock_getres::sys_clock_getres,
+    handler_sys_clock_gettime::sys_clock_gettime, handler_sys_clock_settime::sys_clock_settime,
+    handler_sys_close::sys_close, handler_sys_close_range::sys_close_range,
+    handler_sys_copy_file_range::sys_copy_file_range, handler_sys_creat::sys_creat,
+    handler_sys_delete_module::sys_delete_module, handler_sys_dup::sys_dup,
+    handler_sys_dup2::sys_dup2, handler_sys_dup3::sys_dup3,
+    handler_sys_epoll_create::sys_epoll_create, handler_sys_epoll_ctl::sys_epoll_ctl,
+    handler_sys_epoll_wait::sys_epoll_wait, handler_sys_eventfd::sys_eventfd,
+    handler_sys_execve::sys_execve, handler_sys_execveat::sys_execveat,
+    handler_sys_exit_group::sys_exit_group, handler_sys_exit_task::sys_exit_task,
+    handler_sys_fadvise64::sys_fadvise64, handler_sys_fallocate::sys_fallocate,
+    handler_sys_fb_connect::sys_fb_connect, handler_sys_fb_disconnect::sys_fb_disconnect,
+    handler_sys_fb_flush_wait::sys_fb_flush_wait, handler_sys_fb_info::sys_fb_info,
+    handler_sys_fb_ring_map::sys_fb_ring_map, handler_sys_fchdir::sys_fchdir,
+    handler_sys_fchmod_or_fchown::sys_fchmod_or_fchown, handler_sys_fchmodat::sys_fchmodat,
+    handler_sys_fchmodat_or_fchownat::sys_fchmodat_or_fchownat, handler_sys_fcntl::sys_fcntl,
+    handler_sys_fgetxattr::sys_fgetxattr, handler_sys_finit_module::sys_finit_module,
+    handler_sys_firmware_install::sys_firmware_install, handler_sys_flistxattr::sys_flistxattr,
+    handler_sys_flock::sys_flock, handler_sys_fork::sys_fork,
+    handler_sys_fremovexattr::sys_fremovexattr, handler_sys_fsetxattr::sys_fsetxattr,
+    handler_sys_fstat::sys_fstat, handler_sys_fstatfs::sys_fstatfs, handler_sys_fsync::sys_fsync,
+    handler_sys_ftruncate::sys_ftruncate, handler_sys_futex::sys_futex,
+    handler_sys_futex_requeue::sys_futex_requeue, handler_sys_futex_wait::sys_futex_wait,
+    handler_sys_futex_waitv::sys_futex_waitv, handler_sys_futex_wake::sys_futex_wake,
+    handler_sys_futimesat::sys_futimesat, handler_sys_get_mempolicy::sys_get_mempolicy,
+    handler_sys_get_robust_list::sys_get_robust_list, handler_sys_getcpu::sys_getcpu,
+    handler_sys_getcwd::sys_getcwd, handler_sys_getdents::sys_getdents,
+    handler_sys_getdents64::sys_getdents64, handler_sys_getegid::sys_getegid,
+    handler_sys_geteuid::sys_geteuid, handler_sys_getgid::sys_getgid,
+    handler_sys_getgroups::sys_getgroups, handler_sys_gethostname::sys_gethostname,
+    handler_sys_getpgid::sys_getpgid, handler_sys_getpgrp::sys_getpgrp,
+    handler_sys_getpid::sys_getpid, handler_sys_getppid::sys_getppid,
+    handler_sys_getpriority::sys_getpriority, handler_sys_getrandom::sys_getrandom,
+    handler_sys_getresgid::sys_getresgid, handler_sys_getresuid::sys_getresuid,
+    handler_sys_getrlimit::sys_getrlimit, handler_sys_getrusage::sys_getrusage,
+    handler_sys_getsid::sys_getsid, handler_sys_gettid::sys_gettid,
+    handler_sys_gettimeofday::sys_gettimeofday, handler_sys_getuid::sys_getuid,
+    handler_sys_getxattr::sys_getxattr, handler_sys_init_module::sys_init_module,
+    handler_sys_ioctl::sys_ioctl, handler_sys_ioprio_get::sys_ioprio_get,
+    handler_sys_ioprio_set::sys_ioprio_set, handler_sys_kcmp::sys_kcmp, handler_sys_kill::sys_kill,
+    handler_sys_link::sys_link, handler_sys_linkat::sys_linkat, handler_sys_listdir::sys_listdir,
+    handler_sys_listxattr::sys_listxattr, handler_sys_lseek::sys_lseek,
+    handler_sys_mbind::sys_mbind, handler_sys_membarrier::sys_membarrier,
+    handler_sys_memfd_create::sys_memfd_create, handler_sys_memfd_secret::sys_memfd_secret,
+    handler_sys_migrate_pages::sys_migrate_pages, handler_sys_mincore::sys_mincore,
+    handler_sys_mkdir::sys_mkdir, handler_sys_mkdirat::sys_mkdirat, handler_sys_mknod::sys_mknod,
+    handler_sys_mknodat::sys_mknodat, handler_sys_mlock::sys_mlock, handler_sys_mlock2::sys_mlock2,
+    handler_sys_mlockall::sys_mlockall, handler_sys_mmap::sys_mmap, handler_sys_mount::sys_mount,
+    handler_sys_move_pages::sys_move_pages, handler_sys_mprotect::sys_mprotect,
+    handler_sys_mremap::sys_mremap, handler_sys_msync::sys_msync, handler_sys_munlock::sys_munlock,
+    handler_sys_munlockall::sys_munlockall, handler_sys_munmap::sys_munmap,
+    handler_sys_newfstatat::sys_newfstatat, handler_sys_noop_ok::sys_noop_ok,
+    handler_sys_open::sys_open, handler_sys_open_linux::sys_open_linux,
+    handler_sys_openat::sys_openat, handler_sys_openat2::sys_openat2, handler_sys_pause::sys_pause,
+    handler_sys_personality::sys_personality, handler_sys_pidfd_getfd::sys_pidfd_getfd,
+    handler_sys_pidfd_open::sys_pidfd_open, handler_sys_pidfd_send_signal::sys_pidfd_send_signal,
+    handler_sys_pipe::sys_pipe, handler_sys_pipe2::sys_pipe2,
+    handler_sys_pkey_alloc::sys_pkey_alloc, handler_sys_pkey_free::sys_pkey_free,
+    handler_sys_pkey_mprotect::sys_pkey_mprotect, handler_sys_poll::sys_poll,
+    handler_sys_prctl::sys_prctl, handler_sys_pread64::sys_pread64, handler_sys_preadv::sys_preadv,
+    handler_sys_preadv2::sys_preadv2, handler_sys_prlimit64::sys_prlimit64,
+    handler_sys_process_madvise::sys_process_madvise,
+    handler_sys_process_vm_readv::sys_process_vm_readv,
+    handler_sys_process_vm_writev::sys_process_vm_writev, handler_sys_ptrace::sys_ptrace,
+    handler_sys_pwrite64::sys_pwrite64, handler_sys_pwritev::sys_pwritev,
+    handler_sys_pwritev2::sys_pwritev2, handler_sys_read::sys_read,
+    handler_sys_readahead::sys_readahead, handler_sys_readlink::sys_readlink,
+    handler_sys_readlinkat::sys_readlinkat, handler_sys_readv::sys_readv,
+    handler_sys_reboot::sys_reboot, handler_sys_removexattr::sys_removexattr,
+    handler_sys_rename::sys_rename, handler_sys_renameat::sys_renameat,
+    handler_sys_renameat2::sys_renameat2, handler_sys_restart_syscall::sys_restart_syscall,
+    handler_sys_ring_kick::sys_ring_kick, handler_sys_rmdir::sys_rmdir, handler_sys_rseq::sys_rseq,
+    handler_sys_rt_sigaction::sys_rt_sigaction, handler_sys_rt_sigpending::sys_rt_sigpending,
+    handler_sys_rt_sigqueueinfo::sys_rt_sigqueueinfo, handler_sys_rt_sigsuspend::sys_rt_sigsuspend,
+    handler_sys_rt_sigtimedwait::sys_rt_sigtimedwait,
+    handler_sys_rt_tgsigqueueinfo::sys_rt_tgsigqueueinfo,
+    handler_sys_sched_get_priority_max::sys_sched_get_priority_max,
+    handler_sys_sched_get_priority_min::sys_sched_get_priority_min,
+    handler_sys_sched_getaffinity::sys_sched_getaffinity,
+    handler_sys_sched_getattr::sys_sched_getattr, handler_sys_sched_getparam::sys_sched_getparam,
+    handler_sys_sched_getscheduler::sys_sched_getscheduler,
+    handler_sys_sched_rr_get_interval::sys_sched_rr_get_interval,
+    handler_sys_sched_setaffinity::sys_sched_setaffinity,
+    handler_sys_sched_setattr::sys_sched_setattr, handler_sys_sched_setparam::sys_sched_setparam,
+    handler_sys_sched_setscheduler::sys_sched_setscheduler, handler_sys_sendfile::sys_sendfile,
+    handler_sys_set_mempolicy::sys_set_mempolicy,
+    handler_sys_set_mempolicy_home_node::sys_set_mempolicy_home_node,
+    handler_sys_set_robust_list::sys_set_robust_list, handler_sys_setdomainname::sys_setdomainname,
+    handler_sys_setfsgid::sys_setfsgid, handler_sys_setfsuid::sys_setfsuid,
+    handler_sys_setgid::sys_setgid, handler_sys_setgroups::sys_setgroups,
+    handler_sys_sethostname::sys_sethostname, handler_sys_setns::sys_setns,
+    handler_sys_setpgid::sys_setpgid, handler_sys_setpriority::sys_setpriority,
+    handler_sys_setregid::sys_setregid, handler_sys_setresgid::sys_setresgid,
+    handler_sys_setresuid::sys_setresuid, handler_sys_setreuid::sys_setreuid,
+    handler_sys_setrlimit::sys_setrlimit, handler_sys_setsid::sys_setsid,
+    handler_sys_settimeofday::sys_settimeofday, handler_sys_setuid::sys_setuid,
+    handler_sys_setxattr::sys_setxattr, handler_sys_shmem_create::sys_shmem_create,
+    handler_sys_shmem_destroy::sys_shmem_destroy, handler_sys_shmem_map::sys_shmem_map,
+    handler_sys_sigaction::sys_sigaction, handler_sys_sigaltstack::sys_sigaltstack,
+    handler_sys_signalfd::sys_signalfd, handler_sys_sigprocmask::sys_sigprocmask,
+    handler_sys_sigreturn::sys_sigreturn, handler_sys_sleep::sys_sleep,
+    handler_sys_sock_register_buf::sys_sock_register_buf,
+    handler_sys_sock_send_zc::sys_sock_send_zc, handler_sys_socket::sys_socket,
+    handler_sys_socket_accept::sys_socket_accept, handler_sys_socket_accept4::sys_socket_accept4,
+    handler_sys_socket_bind::sys_socket_bind, handler_sys_socket_connect::sys_socket_connect,
+    handler_sys_socket_get_addr::sys_socket_get_addr,
+    handler_sys_socket_getpeername::sys_socket_getpeername,
+    handler_sys_socket_getsockname::sys_socket_getsockname,
+    handler_sys_socket_getsockopt::sys_socket_getsockopt,
+    handler_sys_socket_listen::sys_socket_listen, handler_sys_socket_recv::sys_socket_recv,
+    handler_sys_socket_recvmmsg::sys_socket_recvmmsg,
+    handler_sys_socket_recvmsg::sys_socket_recvmsg, handler_sys_socket_send::sys_socket_send,
+    handler_sys_socket_sendmmsg::sys_socket_sendmmsg,
+    handler_sys_socket_sendmsg::sys_socket_sendmsg,
+    handler_sys_socket_setsockopt::sys_socket_setsockopt,
+    handler_sys_socket_shutdown::sys_socket_shutdown, handler_sys_socketpair::sys_socketpair,
+    handler_sys_splice::sys_splice, handler_sys_stat::sys_stat, handler_sys_statfs::sys_statfs,
+    handler_sys_symlink::sys_symlink, handler_sys_symlinkat::sys_symlinkat,
+    handler_sys_sync::sys_sync, handler_sys_sync_file_range::sys_sync_file_range,
+    handler_sys_syncfs::sys_syncfs, handler_sys_sysinfo::sys_sysinfo,
+    handler_sys_tcgetattr::sys_tcgetattr, handler_sys_tcsetattr::sys_tcsetattr,
+    handler_sys_tee::sys_tee, handler_sys_tgkill::sys_tgkill, handler_sys_time::sys_time,
+    handler_sys_timerfd_create::sys_timerfd_create,
+    handler_sys_timerfd_settime::sys_timerfd_settime, handler_sys_times::sys_times,
+    handler_sys_tkill::sys_tkill, handler_sys_truncate::sys_truncate, handler_sys_umask::sys_umask,
+    handler_sys_umount2::sys_umount2, handler_sys_uname::sys_uname, handler_sys_unlink::sys_unlink,
+    handler_sys_unlinkat::sys_unlinkat, handler_sys_unshare::sys_unshare,
+    handler_sys_utime::sys_utime, handler_sys_utimensat::sys_utimensat,
+    handler_sys_utimes::sys_utimes, handler_sys_vhangup::sys_vhangup,
+    handler_sys_vmsplice::sys_vmsplice, handler_sys_wait4::sys_wait4,
+    handler_sys_waitid::sys_waitid, handler_sys_write::sys_write, handler_sys_writev::sys_writev,
+    handler_sys_yield::sys_yield,
+};

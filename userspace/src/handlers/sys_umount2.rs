@@ -1,0 +1,58 @@
+#[allow(unused_imports)]
+use super::*;
+
+pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fail = SyscallReturn::ok(!0u64);
+    // Linux `umount2(2)`: (const char *target, int flags). `target` is a
+    // NUL-terminated path; there is no length arg. (Was NARF-native
+    // (ptr, len, flags), which mis-read a musl caller's flags as the length.)
+    let target_raw = match copy_user_cstr(args.arg0, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let target = apply_chroot(target_raw.as_str());
+    let flags = args.arg1;
+    // We accept MNT_FORCE / MNT_DETACH / MNT_EXPIRE / UMOUNT_NOFOLLOW
+    // but the registry doesn't yet track in-flight refs against a
+    // mount, so the pop-by-path is unconditional. The flag word is
+    // recorded for diagnostic symmetry only.
+    let _ = flags & (MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW);
+
+    // Protect the core API pseudo-filesystems from destructive unmount.
+    // NARF has no mount stacking: /proc, /sys, /dev (and cgroup2) are single
+    // shared instances that the chroot's Stage::Late `mnt-dev-bind` provides
+    // and everything depends on. Because NARF mounts these idempotently (see
+    // sys_mount), the balancing umount of one is also a no-op: report success
+    // but keep the singleton mounted. tmpfs / bind / real mounts unmount as
+    // normal.
+    let protected = narf_filesystem::registry()
+        .list_with_names()
+        .into_iter()
+        .any(|(path, name)| {
+            path == target
+                && matches!(
+                    name.as_str(),
+                    "procfs" | "sysfs" | "devfs" | "cgroup2" | "cgroupfs"
+                )
+        });
+    if protected {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    // SAFETY: bootstrapping a Write cap is the same TCB-trusted op
+    // the registry uses internally to mint the per-mount handle.
+    let handle: narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write> =
+        narf_capabilities::Cap::<narf_filesystem::MountPoint, narf_capabilities::Write>::bootstrap(
+        );
+    let _ = auth;
+    match narf_filesystem::registry().unmount(&handle, target.as_str()) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(_) => ctx.set_return(fail),
+    }
+}
