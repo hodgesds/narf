@@ -45,6 +45,7 @@ pub enum FuseOpcode {
     FsyncDir = 30,
     Create = 35,
     Destroy = 38,
+    Rename2 = 45,
 }
 
 /// Header prepended to every FUSE request. Matches the wire layout
@@ -279,6 +280,14 @@ pub struct FuseMkdirIn {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct FuseRenameIn {
     pub newdir: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseRename2In {
+    pub newdir: u64,
+    pub flags: u32,
+    pub padding: u32,
 }
 
 /// `struct fuse_link_in` — LINK request prefix.

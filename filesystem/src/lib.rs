@@ -939,6 +939,17 @@ pub trait DirOps: Send + Sync {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 
+    /// Atomically rename into `new_dir`. `flags` uses Linux RENAME_* bits.
+    fn rename_to<'a>(
+        &'a self,
+        _old_name: &'a str,
+        _new_dir: &'a dyn DirOps,
+        _new_name: &'a str,
+        _flags: u32,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
     /// Hard-link the entry `old_name` under `new_name` within this
     /// directory, aliasing the same backing node. Same-parent only —
     /// the same restriction `rename` carries, for the same reason (a
@@ -947,6 +958,21 @@ pub trait DirOps: Send + Sync {
     /// (POSIX: `link(2)` on such an fs → EPERM).
     fn link<'a>(&'a self, _old_name: &'a str, _new_name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Hard-link a source entry into a potentially different directory.
+    fn link_to<'a>(
+        &'a self,
+        _old_name: &'a str,
+        _new_dir: &'a dyn DirOps,
+        _new_name: &'a str,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Downcast hook for filesystem-specific multi-directory operations.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        None
     }
 
     /// Link an already-existing file node into this directory under

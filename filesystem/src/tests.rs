@@ -2967,7 +2967,7 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
             Some(fuse_reply(unique, 0, &pod_as_bytes(&entry)))
         }
         // Namespace mutations, durability, and handle releases acknowledge empty.
-        10 | 11 | 12 | 18 | 20 | 25 | 29 | 30 => Some(fuse_reply(unique, 0, &[])),
+        10 | 11 | 12 | 18 | 20 | 25 | 29 | 30 | 45 => Some(fuse_reply(unique, 0, &[])),
         // FUSE_FORGET (2): has no reply; drop it.
         2 => None,
         // Anything else → -ENOSYS.
@@ -3250,10 +3250,21 @@ fn smoke_fs_fuse_mutations() -> TestResult {
             OUTCOME.store(4, Ordering::Relaxed);
             return;
         }
-        if root.mkdir("dir").await.is_err()
-            || root.mknod("fifo", FileType::Fifo, 0).await.is_err()
+        let dir = match root.mkdir("dir").await {
+            Ok(dir) => dir,
+            Err(_) => {
+                OUTCOME.store(5, Ordering::Relaxed);
+                return;
+            }
+        };
+        if root.mknod("fifo", FileType::Fifo, 0).await.is_err()
             || root.symlink("sym", "new").await.is_err()
             || root.link("hello", "hard").await.is_err()
+            || root.link_to("hello", &*dir, "cross-hard").await.is_err()
+            || root
+                .rename_to("new", &*dir, "cross-renamed", 1)
+                .await
+                .is_err()
             || root.rename("new", "renamed").await.is_err()
             || root.unlink("renamed").await.is_err()
             || root.rmdir("dir").await.is_err()

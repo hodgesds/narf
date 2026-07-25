@@ -981,6 +981,44 @@ impl DirOps for FuseDir {
         })
     }
 
+    fn rename_to<'a>(
+        &'a self,
+        old_name: &'a str,
+        new_dir: &'a dyn DirOps,
+        new_name: &'a str,
+        flags: u32,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let target = new_dir
+                .as_any()
+                .and_then(|any| any.downcast_ref::<FuseDir>())
+                .ok_or(FsError::Unsupported)?;
+            if !Arc::ptr_eq(&self.conn, &target.conn) {
+                return Err(FsError::Unsupported);
+            }
+            let (opcode, prefix) = if flags == 0 {
+                (
+                    FuseOpcode::Rename,
+                    pod_as_bytes(&FuseRenameIn {
+                        newdir: target.nodeid,
+                    }),
+                )
+            } else {
+                (
+                    FuseOpcode::Rename2,
+                    pod_as_bytes(&FuseRename2In {
+                        newdir: target.nodeid,
+                        flags,
+                        padding: 0,
+                    }),
+                )
+            };
+            self.named_request(opcode, &prefix, &[old_name, new_name])
+                .await
+                .map(|_| ())
+        })
+    }
+
     fn link<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let old = self.lookup_attr(old_name).await?;
@@ -988,6 +1026,32 @@ impl DirOps for FuseDir {
                 oldnodeid: old.nodeid,
             });
             let reply = self
+                .named_request(FuseOpcode::Link, &prefix, &[new_name])
+                .await?;
+            let _: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(())
+        })
+    }
+
+    fn link_to<'a>(
+        &'a self,
+        old_name: &'a str,
+        new_dir: &'a dyn DirOps,
+        new_name: &'a str,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let target = new_dir
+                .as_any()
+                .and_then(|any| any.downcast_ref::<FuseDir>())
+                .ok_or(FsError::Unsupported)?;
+            if !Arc::ptr_eq(&self.conn, &target.conn) {
+                return Err(FsError::Unsupported);
+            }
+            let old = self.lookup_attr(old_name).await?;
+            let prefix = pod_as_bytes(&FuseLinkIn {
+                oldnodeid: old.nodeid,
+            });
+            let reply = target
                 .named_request(FuseOpcode::Link, &prefix, &[new_name])
                 .await?;
             let _: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
@@ -1003,6 +1067,10 @@ impl DirOps for FuseDir {
             let entry: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
             Ok(self.file_from_entry(entry, None))
         })
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
     }
 }
 

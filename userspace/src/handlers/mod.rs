@@ -2246,6 +2246,11 @@ fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
         old_abs,
         new_abs,
         |_fs, old_dir, old_leaf, new_dir, new_leaf| {
+            match poll_blocking(old_dir.rename_to(old_leaf, &*new_dir, new_leaf, 0)) {
+                Some(Ok(())) => return 0,
+                Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+                Some(Err(e)) => return rename_errno(e) as i64,
+            }
             // Directories would need a DirOps-shaped `link_node` the
             // trait doesn't have yet; report EXDEV so callers fall back
             // to a recursive copy rather than silently doing nothing.
@@ -2286,11 +2291,8 @@ fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
 
 // ── link / linkat — hard links ─────────────────────────────────────
 //
-// Same-parent only, mirroring sys_rename's restriction (the DirOps
-// surface has no registry-aware two-parent lock). A cross-directory
-// link surfaces as -EXDEV, which every `ln`/libc caller already
-// handles (it is the normal cross-filesystem answer on Linux, and
-// cp/install fall back to a copy on it).
+// Cross-parent links are routed through `DirOps::link_to` when both
+// parents belong to one filesystem; different mounts return EXDEV.
 
 /// Shared body: both paths already read from user memory, still raw
 /// (cwd-relative allowed). Resolves, enforces same-parent, calls the
@@ -2305,7 +2307,27 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         return;
     };
     if old_path[..old_split] != new_path[..new_split] {
-        ctx.set_return(SyscallReturn::ok((-18i64) as u64)); // EXDEV
+        let outcome = narf_filesystem::registry().resolve_two_parents_absolute(
+            &old_path,
+            &new_path,
+            |_fs, old_dir, old_leaf, new_dir, new_leaf| {
+                poll_blocking(old_dir.link_to(old_leaf, &*new_dir, new_leaf))
+            },
+        );
+        match outcome {
+            Some(Some(Ok(()))) => {
+                #[cfg(feature = "linux-compat")]
+                crate::mqueue::notify_create(&new_path, false);
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+            Some(Some(Err(narf_filesystem::FsError::NotFound))) => {
+                ctx.set_return(SyscallReturn::ok((-2i64) as u64))
+            }
+            Some(Some(Err(narf_filesystem::FsError::Busy))) => {
+                ctx.set_return(SyscallReturn::ok((-17i64) as u64))
+            }
+            _ => ctx.set_return(SyscallReturn::ok((-18i64) as u64)),
+        }
         return;
     }
     let new_leaf = alloc::string::String::from(&new_path[new_split + 1..]);

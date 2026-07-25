@@ -156,7 +156,7 @@ replies by the non-zero `unique` identifier.
 - Directory traffic uses `OPENDIR`, `READDIR`, and `RELEASEDIR`, which
   are distinct from regular-file `OPEN` and `RELEASE`.
 - The bridge supports lookup, getattr/setattr, create, mknod, mkdir,
-  unlink, rmdir, same-directory rename/link, symlink, open, read,
+  unlink, rmdir, same- and cross-directory rename/link, symlink, open, read,
   write, flush, fsync/fdatasync, readlink, statfs, readdir, release,
   forget, and initialization.
 
@@ -169,6 +169,12 @@ the conservative synthetic default.
 Linux `fsync(2)`/`fdatasync(2)`. FUSE files translate these to
 `FUSE_FLUSH` and `FUSE_FSYNC`; non-FUSE implementations default to
 success when they have no volatile backing state.
+
+`DirOps::rename_to` and `DirOps::link_to` express atomic operations
+between two directories of one filesystem. FUSE translates the target
+directory inode into `fuse_rename_in.newdir` / the `FUSE_LINK` request
+node and uses `FUSE_RENAME2` when Linux `RENAME_*` flags are present.
+Operations spanning distinct connections or mounts report `EXDEV`.
 
 Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with
