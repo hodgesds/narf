@@ -7134,6 +7134,8 @@ const PR_SET_NO_NEW_PRIVS: u64 = 38;
 const PR_GET_NO_NEW_PRIVS: u64 = 39;
 const PR_SET_PDEATHSIG: u64 = 1;
 const PR_GET_PDEATHSIG: u64 = 2;
+const PR_GET_KEEPCAPS: u64 = 7;
+const PR_SET_KEEPCAPS: u64 = 8;
 const PR_SET_CHILD_SUBREAPER: u64 = 36;
 const PR_GET_CHILD_SUBREAPER: u64 = 37;
 // PR_CAP_AMBIENT reads/mutates the per-task ambient capability set. The
@@ -7174,6 +7176,10 @@ struct PrctlState {
     /// PR_SET_CHILD_SUBREAPER: this task volunteers to absorb the
     /// orphans of its descendants (instead of them going unreaped).
     child_subreaper: bool,
+    /// Linux capability-retention compatibility state. NARF authority is
+    /// capability-object based, so this round-trips for consumers such as
+    /// dbus-broker but does not grant or retain NARF capabilities.
+    keep_caps: bool,
     /// Ambient capability set as a bitmask (bit N ⇒ capability N raised).
     ambient_caps: u64,
     /// PR_SET_SECUREBITS value. Stored-not-enforced (NARF's privilege
@@ -7193,6 +7199,7 @@ impl Default for PrctlState {
             no_new_privs: false,
             pdeathsig: 0,
             child_subreaper: false,
+            keep_caps: false,
             ambient_caps: 0, // empty ambient set at exec, per Linux
             securebits: 0,   // SECBIT_* all clear, per Linux default
         }

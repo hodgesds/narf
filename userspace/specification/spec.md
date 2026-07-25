@@ -31,6 +31,17 @@ pub fn spawn_process(elf: &Elf, caps: CapBundle) -> Cap<Process, Own>;
 pub fn exec_into(proc: &Process, arg0: &str, argv: &[&str], env: &[&str]);
 ```
 
+The Linux-compatibility syscall surface includes stored `prctl(2)` process
+state required by service managers and brokers. Capability-shaped controls
+such as `PR_SET_KEEPCAPS` round-trip according to the Linux ABI but do not mint
+or retain NARF capabilities; authority remains capability-object based.
+Likewise, `SO_PEERSEC`, `SO_PEERGROUPS`, and `SO_PEERPIDFD` report
+`ENOPROTOOPT` while NARF has no Linux Security Module label provider,
+socket-stamped supplementary group list, or retained peer pidfd; the
+compatibility layer never fabricates security identity.
+AF_UNIX stream clients may bind a local pathname or abstract address before
+`connect(2)`; binding does not put the socket into listening state.
+
 Bootstrap: every new process receives two ring pairs (submit + complete)
 for the kernel ABI plus a read-only config page with capability
 handles to its parent-granted services. Additional ring pairs for

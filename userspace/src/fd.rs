@@ -159,6 +159,21 @@ impl FdTable {
         }
     }
 
+    /// Whether another descriptor in this table refers to the same open file.
+    pub fn has_other_ops(
+        &self,
+        fd: u32,
+        ops: &alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    ) -> bool {
+        self.slots.iter().enumerate().any(|(index, slot)| {
+            index != fd as usize
+                && slot
+                    .as_ref()
+                    .map(|entry| alloc::sync::Arc::ptr_eq(&entry.ops, ops))
+                    .unwrap_or(false)
+        })
+    }
+
     /// `close_range(first, last, flags)` — close every open fd in the
     /// inclusive range `[first, last]`. With `cloexec` set
     /// (CLOSE_RANGE_CLOEXEC) the fds are marked FD_CLOEXEC instead of

@@ -213,6 +213,27 @@ fn smoke_abi_proc_prctl_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_prctl_neg);
 
+fn smoke_abi_proc_prctl_keepcaps_roundtrip() -> TestResult {
+    with_setup(|| {
+        const PR_GET_KEEPCAPS: u64 = 7;
+        const PR_SET_KEEPCAPS: u64 = 8;
+
+        match call(Syscall::Prctl.raw(), a1(PR_SET_KEEPCAPS, 1)) {
+            Some(0) => {}
+            _ => return Err("PR_SET_KEEPCAPS(1) did not return 0"),
+        }
+        match call(Syscall::Prctl.raw(), a0(PR_GET_KEEPCAPS)) {
+            Some(1) => {}
+            _ => return Err("PR_GET_KEEPCAPS did not read back 1"),
+        }
+        match call(Syscall::Prctl.raw(), a1(PR_SET_KEEPCAPS, 2)) {
+            Some(-22) => Ok(()),
+            _ => Err("PR_SET_KEEPCAPS accepted a non-boolean value"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_prctl_keepcaps_roundtrip);
+
 // ── prctl(PR_CAP_AMBIENT) — ambient capability set round-trip ──
 
 fn smoke_abi_proc_prctl_cap_ambient() -> TestResult {
