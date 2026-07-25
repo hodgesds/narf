@@ -77,14 +77,18 @@ pub fn tx_ring(iface: &Cap<NetIface, Tx>, queue: u16) -> Ring<Frame>;
 ### 3.3 Control-plane operations
 
 ```rust
-pub fn set_link(iface: &Cap<NetIface, Admin>, up: bool) -> impl Future<Output=()>;
-pub fn set_mtu (iface: &Cap<NetIface, Admin>, mtu: u16) -> impl Future<Output=()>;
-pub fn set_mac (iface: &Cap<NetIface, Admin>, mac: [u8; 6]) -> impl Future<Output=()>;
+pub struct AdminHandle { /* revocable AdminCap + bound interface identity */ }
+pub fn set_link(admin: &AdminHandle, up: bool) -> Result<(), AdminError>;
+pub fn set_mtu (admin: &AdminHandle, mtu: u32) -> Result<(), AdminError>;
+pub fn set_mac (admin: &AdminHandle, mac: [u8; 6]) -> Result<(), AdminError>;
+pub fn add_ipv4(admin: &AdminHandle, addr: [u8; 4], prefix: u8) -> Result<(), AdminError>;
+pub fn del_ipv4(admin: &AdminHandle, addr: [u8; 4], prefix: u8) -> Result<(), AdminError>;
 pub fn stats   (iface: &Cap<NetIface, Read>) -> IfaceStats;
 ```
 
-Admin is deliberately separate from Rx/Tx: a stack daemon needs
-Rx+Tx but usually not Admin.
+Admin is deliberately separate from Rx/Tx: a stack daemon needs Rx+Tx but
+usually not Admin. `AdminHandle` binds the revocable authority to exactly one
+interface; every operation checks current cap validity before mutation.
 
 ### 3.4 Loopback
 

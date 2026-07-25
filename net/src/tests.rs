@@ -5629,6 +5629,37 @@ fn smoke_bypass_daemon_attach_succeeds() -> TestResult {
 }
 kernel_test_in!("net/bypass", smoke_bypass_daemon_attach_succeeds);
 
+fn smoke_admin_handle_is_interface_bound() -> TestResult {
+    fn discard(_: &[u8]) -> Result<(), ()> {
+        Ok(())
+    }
+
+    let name = "admin-control-test0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 0, 1], discard);
+    let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
+    let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
+    if admin.iface_name() != name {
+        return TestResult::Fail("admin handle lost its interface binding");
+    }
+    if admin.set_link(false).is_err()
+        || admin.set_mtu(9000).is_err()
+        || admin.set_mac([0x02, 0, 0, 0, 0, 2]).is_err()
+    {
+        return TestResult::Fail("authorized interface mutation failed");
+    }
+    let Some(snapshot) = crate::iface::lookup(name) else {
+        return TestResult::Fail("controlled interface disappeared");
+    };
+    if snapshot.link_up || snapshot.mtu != 9000 || snapshot.mac != [0x02, 0, 0, 0, 0, 2] {
+        return TestResult::Fail("admin mutations did not update interface state");
+    }
+    if admin.set_mtu(67) != Err(crate::AdminError::InvalidMtu) {
+        return TestResult::Fail("invalid MTU was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/control", smoke_admin_handle_is_interface_bound);
+
 fn smoke_bypass_daemon_attach_twice_fails() -> TestResult {
     crate::bypass::__reset_for_test();
     bypass_register_loopback_for_test("lo.bypass-twice");

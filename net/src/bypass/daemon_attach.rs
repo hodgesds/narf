@@ -31,7 +31,7 @@ use alloc::sync::Arc;
 
 use narf_capabilities::{Cap, Invoke};
 
-use crate::stack::{AttachError, StackAttach, StackAttachReply};
+use crate::stack::{AdminHandle, AttachError, StackAttach, StackAttachReply};
 use crate::{AdminCap, Interface};
 
 use super::classifier;
@@ -92,11 +92,13 @@ pub fn attach(
         .map_err(|_| AttachError::InterfaceBusy)?;
     let admin = Cap::<AdminCap, Invoke>::bootstrap();
     g.push(AttachRecord {
-        iface_name,
+        iface_name: iface_name.clone(),
         socket,
         admin,
     });
-    Ok(StackAttachReply { admin })
+    Ok(StackAttachReply {
+        admin: AdminHandle::new(admin, iface_name),
+    })
 }
 
 /// Detach the daemon currently bound to `iface_name`. Returns `true`

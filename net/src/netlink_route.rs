@@ -437,11 +437,13 @@ fn enumerate() -> (Vec<LinkInfo>, Vec<AddrInfo>) {
         let ifindex = (i as u32) + 2;
         links.push(LinkInfo {
             ifindex,
-            flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST,
+            flags: IFF_BROADCAST
+                | IFF_MULTICAST
+                | if nic.link_up { IFF_UP | IFF_RUNNING } else { 0 },
             arphrd: ARPHRD_ETHER,
             name: nic.name.clone(),
             mac: nic.mac.to_vec(),
-            mtu: 1500,
+            mtu: nic.mtu,
         });
         // Report the iface's configured IPv4 (skip the 0.0.0.0 placeholder
         // an unconfigured iface carries — an addr dump shouldn't list it).

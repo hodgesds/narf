@@ -89,7 +89,9 @@ pub mod tls;
 pub mod udp_sock;
 pub mod wireguard;
 pub mod ws;
-pub use stack::{AdminCap, AttachError, StackAttach, StackAttachReply, StackDaemon};
+pub use stack::{
+    AdminCap, AdminError, AdminHandle, AttachError, StackAttach, StackAttachReply, StackDaemon,
+};
 
 mod dhcp_dns_e2e_tests;
 mod e2e_tests;

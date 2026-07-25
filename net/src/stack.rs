@@ -22,6 +22,7 @@
 //! dispatch wiring; this module lets every consumer agree on the
 //! wire shape.
 
+use alloc::string::String;
 use alloc::sync::Arc;
 
 use narf_capabilities::{Cap, CapKind, CapType, Invoke, Write};
@@ -63,9 +64,92 @@ impl CapType for StackDaemon {
 /// Reply the kernel sends back to a successful `StackAttach`.
 /// Carries the admin authority the daemon holds for the rest of
 /// the interface's lifetime.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct StackAttachReply {
-    pub admin: Cap<AdminCap, Invoke>,
+    pub admin: AdminHandle,
+}
+
+/// Per-interface administrative authority. The interface name is inseparable
+/// from the revocable cap, preventing a valid cap for one NIC from being
+/// replayed against another NIC's control plane.
+#[derive(Clone, Debug)]
+pub struct AdminHandle {
+    cap: Cap<AdminCap, Invoke>,
+    iface_name: String,
+}
+
+impl AdminHandle {
+    pub(crate) fn new(cap: Cap<AdminCap, Invoke>, iface_name: String) -> Self {
+        Self { cap, iface_name }
+    }
+
+    pub fn iface_name(&self) -> &str {
+        &self.iface_name
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.cap.is_live()
+    }
+
+    pub fn check_live(&self) -> Result<(), AdminError> {
+        self.cap
+            .check_live()
+            .map_err(|_| AdminError::AuthorityRevoked)
+    }
+
+    pub fn set_link(&self, up: bool) -> Result<(), AdminError> {
+        self.check_live()?;
+        crate::iface::set_link_state(&self.iface_name, up)
+            .then_some(())
+            .ok_or(AdminError::NoIface)
+    }
+
+    pub fn set_mtu(&self, mtu: u32) -> Result<(), AdminError> {
+        self.check_live()?;
+        if !(68..=65_535).contains(&mtu) {
+            return Err(AdminError::InvalidMtu);
+        }
+        crate::iface::set_mtu(&self.iface_name, mtu)
+            .then_some(())
+            .ok_or(AdminError::NoIface)
+    }
+
+    pub fn set_mac(&self, mac: [u8; 6]) -> Result<(), AdminError> {
+        self.check_live()?;
+        if mac[0] & 1 != 0 || mac == [0; 6] {
+            return Err(AdminError::InvalidMac);
+        }
+        crate::iface::set_mac(&self.iface_name, mac)
+            .then_some(())
+            .ok_or(AdminError::NoIface)
+    }
+
+    pub fn add_ipv4(&self, addr: [u8; 4], prefix_len: u8) -> Result<(), AdminError> {
+        self.check_live()?;
+        if prefix_len > 32 {
+            return Err(AdminError::InvalidPrefix);
+        }
+        crate::iface::add_addr(&self.iface_name, addr, prefix_len);
+        Ok(())
+    }
+
+    pub fn del_ipv4(&self, addr: [u8; 4], prefix_len: u8) -> Result<(), AdminError> {
+        self.check_live()?;
+        if prefix_len > 32 {
+            return Err(AdminError::InvalidPrefix);
+        }
+        crate::iface::del_addr(&self.iface_name, addr, prefix_len);
+        Ok(())
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AdminError {
+    AuthorityRevoked,
+    NoIface,
+    InvalidMtu,
+    InvalidMac,
+    InvalidPrefix,
 }
 
 /// Errors that can surface during attach.

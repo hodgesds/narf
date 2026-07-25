@@ -27,6 +27,8 @@ pub struct NetIfaceEntry {
     pub ipv4: [u8; 4],
     /// Default gateway. Used for any non-on-link destination.
     pub gateway: [u8; 4],
+    pub mtu: u32,
+    pub link_up: bool,
 }
 
 static IFACES: IrqSafeSpinLock<Option<Vec<NetIfaceEntry>>> = IrqSafeSpinLock::new(None);
@@ -51,6 +53,8 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) {
         send,
         ipv4: QEMU_DEFAULT_IP,
         gateway: QEMU_DEFAULT_GW,
+        mtu: 1500,
+        link_up: true,
     });
 }
 
@@ -133,6 +137,8 @@ pub fn snapshot_all() -> Vec<NetIfaceSnapshot> {
             send: e.send,
             ipv4: e.ipv4,
             gateway: e.gateway,
+            mtu: e.mtu,
+            link_up: e.link_up,
         })
         .collect()
 }
@@ -149,6 +155,8 @@ pub fn primary() -> Option<NetIfaceSnapshot> {
         send: e.send,
         ipv4: e.ipv4,
         gateway: e.gateway,
+        mtu: e.mtu,
+        link_up: e.link_up,
     })
 }
 
@@ -166,6 +174,8 @@ pub fn lookup(name: &str) -> Option<NetIfaceSnapshot> {
         send: e.send,
         ipv4: e.ipv4,
         gateway: e.gateway,
+        mtu: e.mtu,
+        link_up: e.link_up,
     })
 }
 
@@ -185,6 +195,8 @@ pub fn for_local_addr(ip: [u8; 4]) -> Option<NetIfaceSnapshot> {
         send: e.send,
         ipv4: e.ipv4,
         gateway: e.gateway,
+        mtu: e.mtu,
+        link_up: e.link_up,
     })
 }
 
@@ -231,6 +243,44 @@ pub struct NetIfaceSnapshot {
     pub send: SendFn,
     pub ipv4: [u8; 4],
     pub gateway: [u8; 4],
+    pub mtu: u32,
+    pub link_up: bool,
+}
+
+pub fn set_link_state(name: &str, up: bool) -> bool {
+    let mut g = IFACES.lock();
+    let Some(entry) = g
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|iface| iface.name == name))
+    else {
+        return false;
+    };
+    entry.link_up = up;
+    true
+}
+
+pub fn set_mtu(name: &str, mtu: u32) -> bool {
+    let mut g = IFACES.lock();
+    let Some(entry) = g
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|iface| iface.name == name))
+    else {
+        return false;
+    };
+    entry.mtu = mtu;
+    true
+}
+
+pub fn set_mac(name: &str, mac: [u8; 6]) -> bool {
+    let mut g = IFACES.lock();
+    let Some(entry) = g
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|iface| iface.name == name))
+    else {
+        return false;
+    };
+    entry.mac = mac;
+    true
 }
 
 /// Replace the IPv4 / gateway pair on the primary iface (boot-time
