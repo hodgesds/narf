@@ -104,6 +104,7 @@ impl Drop for PipeRead {
         // there are no readers left and the writer should observe
         // EOF on its side.
         self.shared.reader_closed.store(true, Ordering::Release);
+        narf_net::readiness::notify(0);
     }
 }
 
@@ -112,6 +113,7 @@ impl Drop for PipeWrite {
         // Same Arc-counted reasoning as PipeRead::drop — only flips
         // when every writer fd has been closed.
         self.shared.writer_closed.store(true, Ordering::Release);
+        narf_net::readiness::notify(0);
     }
 }
 
@@ -178,6 +180,10 @@ impl FileOps for PipeRead {
         mask
     }
 
+    fn readiness_notifies(&self) -> bool {
+        true
+    }
+
     fn read_should_block(&self) -> bool {
         // Block (retry the read) unless we are TRULY at EOF: the queue is empty
         // AND the writer has gone. Reporting "don't block" merely because the
@@ -230,6 +236,10 @@ impl FileOps for PipeWrite {
             for &b in buf.iter().take(n) {
                 q.push_back(b);
             }
+            drop(q);
+            if n != 0 {
+                narf_net::readiness::notify(0);
+            }
             Ok(n)
         })
     }
@@ -265,6 +275,10 @@ impl FileOps for PipeWrite {
             mask |= narf_filesystem::POLL_OUT;
         }
         mask
+    }
+
+    fn readiness_notifies(&self) -> bool {
+        true
     }
 
     fn write_should_block(&self) -> bool {

@@ -3291,6 +3291,14 @@ fn boot_userspace_init() {
     // calls would just visit the same queue position twice.
     fn scheduler_step_pump() {
         use core::sync::atomic::{AtomicBool, Ordering};
+        // Never poll the executor recursively from inside an active task poll.
+        // Polled sync I/O calls `sleep_pumps::run()` while holding its driver
+        // lock; a nested user task can enter the same driver and spin forever
+        // on that lock (observed during startplasma DSO fault-in). The normal
+        // per-CPU executor loop already advances peers at the next yield.
+        if narf_scheduler::current_task_id().raw() != 0 {
+            return;
+        }
         // Per-CPU "currently inside scheduler_step_pump" flag.
         // SMP scaling: BSP only for now (boot-init runs on the
         // BSP); when AP-side run_forever loops also call into

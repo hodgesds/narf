@@ -831,6 +831,15 @@ fn open_impl(
     // than the generic `invalid_op` shape.
     let fail = SyscallReturn::ok(!0u64);
     let task = current_task_id();
+    // Linux open/openat reject an empty pathname with ENOENT. Do this before
+    // cwd normalization: `resolve_cwd_path(task, "")` otherwise collapses to
+    // the cwd itself and accidentally opens a directory. dbus-broker probes an
+    // optional empty path this way; opening cwd produced a regular fd that it
+    // added to epoll, yielding an infinite readable-at-EOF loop.
+    if path_owned_raw.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     // Resolve relative paths against the task's cwd and collapse
     // `.`/`..` (absolute-mount form only; the explicit-mount form below
     // keeps its already-relative-to-the-mount path). This is what makes

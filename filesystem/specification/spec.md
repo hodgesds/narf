@@ -83,10 +83,16 @@ pub fn write(f: &FileCap, offset: u64, buf: &[u8])             -> impl Future<Ou
 pub fn fsync(f: &FileCap)                                      -> impl Future<Output = ()>;
 pub fn stat (n: &Cap<NodeRef, Stat>)                           -> impl Future<Output = NodeStat>;
 pub fn truncate(f: &FileCap, len: u64)                         -> impl Future<Output = ()>;
+pub trait FileOps {
+    fn poll_readiness(&self) -> u32;
+    fn poll_readiness_at(&self, offset: u64) -> u32;
+}
 ```
 
 All operations submit through `abi/` rings when crossing the
 kernel↔user boundary; kernel-internal callers invoke directly.
+`poll_readiness_at` defaults to `poll_readiness`; offset-sensitive device
+descriptions such as `/dev/kmsg` override it so EOF is not reported readable.
 
 ### 3.4 Directory operations
 

@@ -84,8 +84,9 @@ pub(crate) fn sys_poll(ctx: &mut dyn TrapContext) {
                 // `fd::with_table`, which would deadlock the non-reentrant
                 // fd-table lock if held across the call (see epoll.rs
                 // `poll_fd_readiness`).
-                let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
-                match ops.map(|o| o.poll_readiness()) {
+                let file = fd::with_table(task, |t| t.get(fd).map(|e| (e.ops.clone(), e.offset)))
+                    .flatten();
+                match file.map(|(o, offset)| o.poll_readiness_at(offset)) {
                     Some(r) => (r & events) as u16,
                     None => narf_filesystem::POLL_NVAL as u16,
                 }

@@ -991,6 +991,16 @@ pub(crate) fn next_arm_target(
     }
 }
 
+#[inline]
+pub(crate) const fn should_rearm_tsc_deadline(
+    now: u64,
+    armed: u64,
+    target: u64,
+    coalesce_slack: u64,
+) -> bool {
+    armed <= now || armed.saturating_sub(target) > coalesce_slack
+}
+
 /// Reprogram the LAPIC TSC-deadline one-shot to `deadline_cycles` IFF it is
 /// earlier than what's currently armed (mirrors hrtimer_reprogram). Called
 /// from the timer-wheel arm-callback when a new (possibly sub-tick) deadline
@@ -1030,13 +1040,14 @@ pub fn arm_tsc_deadline_if_earlier(deadline_cycles: u64) {
     } else {
         deadline_cycles
     };
-    // Reprogram only when the new target is earlier than the currently-armed
-    // deadline by more than the coalescing slack. `saturating_sub` yields 0
-    // when `target` is at or after the armed value (don't reprogram for a
-    // later deadline), and the full gap when nothing is armed (TSC_ARMED ==
-    // u64::MAX), so the first arm always programs. See COALESCE_SLACK_CYCLES.
+    // Reprogram when the software mirror is already expired (the hardware
+    // one-shot is then unarmed), or when the new target is earlier than the
+    // live deadline by more than the coalescing slack. The expired case is
+    // load-bearing for the idle backstop: treating a stale past `TSC_ARMED`
+    // value as "earlier" suppresses the future backstop and lets a CPU HLT
+    // forever with an awake task queued.
     let armed = TSC_ARMED[cpu].load(Ordering::Relaxed);
-    if armed.saturating_sub(target) > COALESCE_SLACK_CYCLES {
+    if should_rearm_tsc_deadline(now, armed, target, COALESCE_SLACK_CYCLES) {
         TSC_ARMED[cpu].store(target, Ordering::Relaxed);
         // SAFETY: TSC-deadline MSR writable (period != 0 gate above);
         // MFENCE mirrors Linux weak_wrmsr_fence (see on_timer_tick).

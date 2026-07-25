@@ -1826,6 +1826,26 @@ kernel_test_in!(
     smoke_next_arm_target_within_min_delta_floored
 );
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_tsc_deadline_rearms_after_expiry() -> TestResult {
+    use crate::x86_64::apic::should_rearm_tsc_deadline;
+
+    let now = 10_000;
+    let target = 12_000;
+    let slack = 100;
+    if should_rearm_tsc_deadline(now, 9_000, target, slack)
+        && should_rearm_tsc_deadline(now, now, target, slack)
+        && !should_rearm_tsc_deadline(now, 11_000, target, slack)
+        && should_rearm_tsc_deadline(now, 15_000, target, slack)
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("TSC deadline stale/live re-arm decision is incorrect")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/timer", smoke_tsc_deadline_rearms_after_expiry);
+
 #[cfg(not(target_arch = "x86_64"))]
 fn smoke_next_arm_target_wheel_earlier_than_periodic() -> TestResult {
     TestResult::Skip("next_arm_target is x86_64-specific (LAPIC TSC-deadline)")

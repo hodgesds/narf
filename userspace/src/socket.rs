@@ -3781,7 +3781,7 @@ impl SocketFile {
         }
     }
 
-    fn do_recv(&self, buf: &mut [u8], _flags: u32) -> Result<(usize, Option<SockAddr>), SockError> {
+    fn do_recv(&self, buf: &mut [u8], flags: u32) -> Result<(usize, Option<SockAddr>), SockError> {
         let state = self.state.lock();
         if let SocketState::InetWired { tcb_id, .. } = &*state {
             let id = *tcb_id;
@@ -3798,7 +3798,11 @@ impl SocketFile {
             | SocketState::Inet6Connected { rx, .. } => rx,
             _ => return Err(SockError::NotConnected),
         };
-        let n = rx.read(buf);
+        let n = if flags & MSG_PEEK != 0 {
+            rx.peek(buf)
+        } else {
+            rx.read(buf)
+        };
         if n == 0 && !buf.is_empty() && !rx.is_closed() {
             Err(SockError::WouldBlock)
         } else {
@@ -3968,6 +3972,16 @@ impl RingBuf {
         }
         g.head = (g.head + n) % RING_CAP;
         g.len -= n;
+        n
+    }
+
+    /// Copy immediately readable bytes without advancing the stream head.
+    fn peek(&self, dst: &mut [u8]) -> usize {
+        let g = self.inner.lock();
+        let n = core::cmp::min(dst.len(), g.len);
+        for (i, slot) in dst.iter_mut().enumerate().take(n) {
+            *slot = g.buf[(g.head + i) % RING_CAP];
+        }
         n
     }
 

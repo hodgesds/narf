@@ -121,8 +121,12 @@ fn poll_fd_readiness(task_id: u64, fd: i32) -> u32 {
     if fd < 0 {
         return 0;
     }
-    let ops = fd::with_table(task_id, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
-    ops.map(|o| o.poll_readiness()).unwrap_or(0)
+    let file = fd::with_table(task_id, |t| {
+        t.get(fd as u32).map(|e| (e.ops.clone(), e.offset))
+    })
+    .flatten();
+    file.map(|(o, offset)| o.poll_readiness_at(offset))
+        .unwrap_or(0)
 }
 
 impl EpollInstance {
@@ -191,6 +195,12 @@ impl EpollInstance {
         };
 
         let mut results = Vec::new();
+        // Preserve the masks from the lock-free poll pass for the state
+        // write-back below. Re-polling while holding `self.inner` recursively
+        // enters nested epoll instances and permits cross-instance lock-order
+        // inversions under concurrent event-loop updates.
+        let mut observed = Vec::new();
+        let mut delivered_fds = Vec::new();
         for (fd, item) in &snapshot {
             // Disarmed EPOLLONESHOT items (events bitmask zeroed below)
             // are skipped immediately.
@@ -202,6 +212,7 @@ impl EpollInstance {
             // Query current readiness — polled outside the fd-table lock so a
             // nested-epoll child can't deadlock on it (see poll_fd_readiness).
             let cur_mask: u32 = poll_fd_readiness(task_id, *fd);
+            observed.push((*fd, cur_mask));
 
             // Only report events the caller asked for.
             let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
@@ -224,22 +235,20 @@ impl EpollInstance {
             }
 
             results.push((ready, item.data));
+            delivered_fds.push(*fd);
         }
 
-        // Write back updated last_mask; disarm EPOLLONESHOT items.
+        // Write back the masks observed above; never invoke FileOps callbacks
+        // while holding this instance's non-reentrant spin lock.
         {
             let mut g = self.inner.lock();
-            for (fd, item_snap) in &snapshot {
-                if let Some(item) = g.interest.get_mut(fd) {
-                    let cur_mask: u32 = poll_fd_readiness(task_id, *fd);
+            for (fd, cur_mask) in observed {
+                if let Some(item) = g.interest.get_mut(&fd) {
                     item.last_mask = cur_mask;
 
-                    if (item_snap.events & EPOLLONESHOT) != 0 {
-                        let delivered = results.iter().any(|(_, d)| *d == item.data);
-                        if delivered {
-                            // Clear all event-interest bits; keep flags.
-                            item.events &= EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE;
-                        }
+                    if (item.events & EPOLLONESHOT) != 0 && delivered_fds.contains(&fd) {
+                        // Clear all event-interest bits; keep flags.
+                        item.events &= EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE;
                     }
                 }
             }
@@ -567,8 +576,8 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
             // EP_MAX_NESTS. Linux returns ELOOP; this file's error
             // convention is a bare -1 (LINUX-GAP: no per-errno codes).
             if tfd >= 0 {
-                if let Some(tops) = epoll_ops(task, tfd as u32) {
-                    if let Some(target) = as_epoll(&tops) {
+                if let Some(target_ops) = epoll_ops(task, tfd as u32) {
+                    if let Some(target) = as_epoll(&target_ops) {
                         if core::ptr::eq(target, instance)
                             || epoll_reaches(task, target, instance, 1)
                         {

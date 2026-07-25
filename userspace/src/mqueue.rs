@@ -527,6 +527,10 @@ fn serialize_event(wd: i32, mask: u32, cookie: u32, name: &str) -> Vec<u8> {
 fn fs_notify(abs_path: &str, mask: u32, is_dir: bool) {
     inotify_dispatch(abs_path, mask, is_dir);
     fanotify_dispatch(abs_path, mask as u64);
+    // Filesystem event fds participate in poll/epoll. Publishing after both
+    // queues are updated avoids a check-before-park waiter sleeping until the
+    // periodic backstop despite an event already being available.
+    narf_net::readiness::notify(0);
 }
 
 /// inotify half of [`fs_notify`]: for every instance, every watch whose
@@ -676,6 +680,7 @@ pub(crate) fn notify_moved(from: &str, to: &str) {
     // fanotify sees the same move as two events on the affected objects.
     fanotify_dispatch(from, IN_MOVED_FROM as u64);
     fanotify_dispatch(to, IN_MOVED_TO as u64);
+    narf_net::readiness::notify(0);
 }
 
 struct InotifyFile {
@@ -935,6 +940,31 @@ struct FanotifyFile {
 }
 
 impl FileOps for FanotifyFile {
+    fn poll_readiness(&self) -> u32 {
+        let has_events = with_fanotify(|m| {
+            m.get(&self.id)
+                .map(|group| !group.events.is_empty())
+                .unwrap_or(false)
+        });
+        if has_events {
+            narf_filesystem::POLL_IN
+        } else {
+            0
+        }
+    }
+
+    fn read_should_block(&self) -> bool {
+        with_fanotify(|m| {
+            m.get(&self.id)
+                .map(|group| group.events.is_empty())
+                .unwrap_or(false)
+        })
+    }
+
+    fn nonblock_read_eagain(&self) -> bool {
+        true
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         // fanotify delivery installs an fd per event, which needs the
         // fd-table lock — and the generic sys_read holds that lock across

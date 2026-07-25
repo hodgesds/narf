@@ -8286,12 +8286,34 @@ fn smoke_userspace_pipe_read_should_block_on_open_writer() -> TestResult {
     // mirroring what `fd::detach` does when a writer task exits.
     use narf_filesystem::FileOps;
     let (r, w) = crate::pipe::pipe_pair();
+    if !r.readiness_notifies() || !w.readiness_notifies() {
+        return TestResult::Fail("pipe endpoints must advertise readiness notifications");
+    }
     // Empty buffer + writer open → should block.
     if !r.read_should_block() {
         return TestResult::Fail("empty pipe with open writer should block");
     }
+    let before_write = narf_net::readiness::generation();
+    let wr = crate::handlers::poll_blocking(w.write(0, b"x"));
+    if !matches!(wr, Some(Ok(1))) {
+        return TestResult::Fail("pipe readiness test write failed");
+    }
+    if narf_net::readiness::generation() <= before_write {
+        return TestResult::Fail("pipe write did not notify readiness waiters");
+    }
+    let mut byte = [0u8; 1];
+    if !matches!(
+        crate::handlers::poll_blocking(r.read(0, &mut byte)),
+        Some(Ok(1))
+    ) {
+        return TestResult::Fail("pipe readiness test read failed");
+    }
     // Last writer closes → EOF; a read must NOT block (returns 0).
+    let before_close = narf_net::readiness::generation();
     drop(w);
+    if narf_net::readiness::generation() <= before_close {
+        return TestResult::Fail("pipe writer close did not notify readiness waiters");
+    }
     if r.read_should_block() {
         return TestResult::Fail("closed writer should not block (EOF expected)");
     }
@@ -13524,6 +13546,51 @@ fn smoke_socket_inet_udp_connected_filter() -> TestResult {
     }
 }
 kernel_test_in!("userspace", smoke_socket_inet_udp_connected_filter);
+
+/// MSG_PEEK on an AF_UNIX stream must not consume the bytes inspected.
+fn smoke_socket_unix_stream_msg_peek_preserves_data() -> TestResult {
+    let (sender, receiver) = crate::socket::SocketFile::unix_stream_pair();
+    let payload = b"dbus-header";
+    if !matches!(
+        sender.dispatch_op(crate::socket::SocketOp::Send {
+            buf: payload,
+            flags: 0,
+            addr: None,
+        }),
+        crate::socket::SocketOpResult::Ok(n) if n == payload.len() as u64
+    ) {
+        return TestResult::Fail("AF_UNIX stream setup send failed");
+    }
+
+    let mut peeked = [0u8; 4];
+    if !matches!(
+        receiver.dispatch_op(crate::socket::SocketOp::Recv {
+            buf: &mut peeked,
+            flags: crate::socket::MSG_PEEK,
+        }),
+        crate::socket::SocketOpResult::Received { n: 4, .. }
+    ) || &peeked != b"dbus"
+    {
+        return TestResult::Fail("MSG_PEEK returned the wrong prefix");
+    }
+
+    let mut received = [0u8; 11];
+    match receiver.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut received,
+        flags: 0,
+    }) {
+        crate::socket::SocketOpResult::Received { n, .. }
+            if n == payload.len() && &received[..n] == payload =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("MSG_PEEK consumed AF_UNIX stream bytes"),
+    }
+}
+kernel_test_in!(
+    "userspace",
+    smoke_socket_unix_stream_msg_peek_preserves_data
+);
 
 /// AF_INET SOCK_RAW with IPPROTO_ICMP: send + recv round-trip.
 fn smoke_socket_inet_raw_icmp_loopback() -> TestResult {

@@ -295,3 +295,26 @@ debugfs -R 'cat /narf-start.sh' "$IMG"     # verify
 `project_pidns_flow_model` (the model + the TaskId-keying trap),
 `project_systemd_boots_on_narf` (harness), `feedback_get_data_first`,
 `feedback_tests_are_the_value`. Read these first.
+
+### Semcode-first troubleshooting workflow
+
+Before adding or running new tracing for a kernel/userspace bring-up failure:
+
+1. Read the relevant subsystem specifications and identify the invariants and
+   state owners involved.
+2. Use semcode's `find_function`, `find_callers`, `find_calls`, and
+   `find_callchain` to map the complete path from syscall/event entry through
+   state mutation, readiness/wakeup delivery, error propagation, and cleanup.
+   Include every subsystem boundary and all alternate exit paths.
+3. Correlate that static path with existing logs, ELF addresses, symbols, and
+   on-disk inputs. Enumerate competing hypotheses and state the exact unanswered
+   question for each one.
+4. Only then add the narrowest possible trace that distinguishes those
+   hypotheses. Prefer fatal-path or per-event flight-recorder diagnostics over
+   hot-path logging, especially for SMP-sensitive failures.
+5. If evidence changes the suspected subsystem boundary, repeat the semcode
+   call-path analysis before expanding the trace.
+
+This is the default order of operations for future Fedora/systemd/Plasma
+debugging. Broad syscall or hot-path tracing is a last resort, not the first
+diagnostic step.

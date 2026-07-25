@@ -72,11 +72,16 @@ impl<T> Atomic<T> {
 pub fn pin() -> ReadGuard<'static>;        // QSBR / epoch variant
 pub fn defer_drop<T>(owned: Owned<T>, g: &ReadGuard);
 pub fn sync() -> impl Future<Output = ()>; // wait one grace period
+pub fn stalled_cpu_mask(now_ns: u64, threshold_ns: u64) -> u64;
 ```
 
 `'g` ties `Shared<'g, T>` to the guard; the borrow checker forbids
 keeping it past `drop(g)`. UAF is a compile error for well-typed
 consumers.
+
+`stalled_cpu_mask` is an allocation-free watchdog snapshot. Bit `N` is set
+when active CPU `N` has not reported a QSBR quiescent boundary within the
+requested interval; inactive CPUs are omitted.
 
 ### 3.2 Variant selection
 

@@ -64,20 +64,20 @@ pub fn do_poll(task_id: u64, fds: &mut [PollFd], timeout_ms: i64) -> usize {
         // deadlocks the task — libinput/libwayland nest event loops, so a
         // `poll()` over an inner-epoll fd would otherwise hang. Mirrors
         // `poll_fd_readiness` / `EpollInstance::poll_readiness`.
-        let ops: Vec<Option<Arc<dyn FileOps>>> = fd::with_table(task_id, |t| {
+        let files: Vec<Option<(Arc<dyn FileOps>, u64)>> = fd::with_table(task_id, |t| {
             fds.iter()
                 .map(|item| {
                     if item.fd < 0 {
                         None
                     } else {
-                        t.get(item.fd as u32).map(|e| e.ops.clone())
+                        t.get(item.fd as u32).map(|e| (e.ops.clone(), e.offset))
                     }
                 })
                 .collect()
         })
         .unwrap_or_default();
         let mut n_ready = 0usize;
-        for (item, slot) in fds.iter_mut().zip(ops.iter()) {
+        for (item, slot) in fds.iter_mut().zip(files.iter()) {
             if item.fd < 0 {
                 // POSIX: negative fd → ignored, revents = 0.
                 item.revents = 0;
@@ -89,8 +89,8 @@ pub fn do_poll(task_id: u64, fds: &mut [PollFd], timeout_ms: i64) -> usize {
                     item.revents = POLL_NVAL as u16;
                     n_ready += 1;
                 }
-                Some(o) => {
-                    let mask = o.poll_readiness();
+                Some((o, offset)) => {
+                    let mask = o.poll_readiness_at(*offset);
                     // OR in ERR/HUP/NVAL so they're always returned
                     // even if the caller didn't ask for them (POSIX).
                     let always = (POLL_ERR | POLL_HUP | POLL_NVAL) as u16;
@@ -292,20 +292,20 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
 fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
     // Snapshot ops under the lock, poll OUTSIDE it — a nested epoll fd's
     // `poll_readiness` re-enters the fd-table lock (see `do_poll`).
-    let ops: Vec<Option<Arc<dyn FileOps>>> = fd::with_table(task_id, |t| {
+    let files: Vec<Option<(Arc<dyn FileOps>, u64)>> = fd::with_table(task_id, |t| {
         fds.iter()
             .map(|item| {
                 if item.fd < 0 {
                     None
                 } else {
-                    t.get(item.fd as u32).map(|e| e.ops.clone())
+                    t.get(item.fd as u32).map(|e| (e.ops.clone(), e.offset))
                 }
             })
             .collect()
     })
     .unwrap_or_default();
     let mut n_ready = 0usize;
-    for (item, slot) in fds.iter_mut().zip(ops.iter()) {
+    for (item, slot) in fds.iter_mut().zip(files.iter()) {
         if item.fd < 0 {
             item.revents = 0;
             continue;
@@ -315,8 +315,8 @@ fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
                 item.revents = POLL_NVAL as u16;
                 n_ready += 1;
             }
-            Some(o) => {
-                let mask = o.poll_readiness();
+            Some((o, offset)) => {
+                let mask = o.poll_readiness_at(*offset);
                 let always = (POLL_ERR | POLL_HUP | POLL_NVAL) as u16;
                 let ready = (mask as u16) & (item.events | always);
                 item.revents = ready;
