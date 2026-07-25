@@ -608,6 +608,7 @@ pub fn init_per_task_state() {
     sid_init();
     wait_init();
     pkey_init();
+    narf_filesystem::fuse_conn::install_request_context_provider(fuse_request_context);
     #[cfg(feature = "linux-compat")]
     {
         ctty_init();
@@ -7085,6 +7086,16 @@ fn current_accessor(task: u64) -> narf_filesystem::Accessor {
     narf_filesystem::Accessor {
         uid: acc.fsuid,
         gid: acc.fsgid,
+    }
+}
+
+fn fuse_request_context() -> narf_filesystem::fuse_conn::FuseRequestContext {
+    let task = current_task_id();
+    let accessor = current_accessor(task);
+    narf_filesystem::fuse_conn::FuseRequestContext {
+        uid: accessor.uid,
+        gid: accessor.gid,
+        pid: task_to_pid_raw(task).unwrap_or(task) as u32,
     }
 }
 

@@ -2768,6 +2768,38 @@ fn smoke_fs_fuse_struct_sizes() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_struct_sizes);
 
+fn smoke_fs_fuse_request_context() -> TestResult {
+    use crate::fuse::{pod_from_bytes, FuseInHeader, FuseOpcode};
+    use crate::fuse_conn::{
+        install_request_context_provider, FuseConnection, FuseRequestContext,
+        __test_reset_request_context_provider,
+    };
+
+    fn context() -> FuseRequestContext {
+        FuseRequestContext {
+            uid: 1001,
+            gid: 1002,
+            pid: 1003,
+        }
+    }
+
+    install_request_context_provider(context);
+    let conn = FuseConnection::new();
+    conn.submit_noreply(FuseOpcode::Forget, 1, &[]);
+    let request = conn.dequeue_request();
+    __test_reset_request_context_provider();
+
+    let Some(header) = request.as_deref().and_then(pod_from_bytes::<FuseInHeader>) else {
+        return TestResult::Fail("FUSE request header missing");
+    };
+    if (header.uid, header.gid, header.pid) == (1001, 1002, 1003) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("FUSE request context not propagated")
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_request_context);
+
 /// Encode a `fuse_out_header` + `body` reply for `unique`.
 fn fuse_reply(unique: u64, error: i32, body: &[u8]) -> alloc::vec::Vec<u8> {
     use crate::fuse::*;

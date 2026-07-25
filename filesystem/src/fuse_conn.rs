@@ -29,7 +29,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -50,6 +50,37 @@ struct FuseReply {
 
 type PollState = (Arc<AtomicU32>, Arc<AtomicBool>);
 type PendingPoll = (u64, Arc<AtomicU32>, Arc<AtomicBool>);
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FuseRequestContext {
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: u32,
+}
+
+pub type FuseRequestContextProvider = fn() -> FuseRequestContext;
+
+static REQUEST_CONTEXT_PROVIDER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn install_request_context_provider(provider: FuseRequestContextProvider) {
+    REQUEST_CONTEXT_PROVIDER.store(provider as usize, Ordering::Release);
+}
+
+fn request_context() -> FuseRequestContext {
+    let raw = REQUEST_CONTEXT_PROVIDER.load(Ordering::Acquire);
+    if raw == 0 {
+        return FuseRequestContext::default();
+    }
+    // SAFETY: the only writer accepts exactly a FuseRequestContextProvider,
+    // and the slot is never interpreted as another function-pointer type.
+    let provider: FuseRequestContextProvider = unsafe { core::mem::transmute(raw) };
+    provider()
+}
+
+#[doc(hidden)]
+pub fn __test_reset_request_context_provider() {
+    REQUEST_CONTEXT_PROVIDER.store(0, Ordering::Release);
+}
 
 /// Shared queue object connecting the kernel VFS to a userspace FUSE
 /// daemon. One is minted per `open("/dev/fuse")`.
@@ -153,14 +184,15 @@ impl FuseConnection {
     fn submit(&self, opcode: FuseOpcode, nodeid: u64, body: &[u8]) -> u64 {
         let unique = self.alloc_unique();
         let total = core::mem::size_of::<FuseInHeader>() + body.len();
+        let context = request_context();
         let hdr = FuseInHeader {
             len: total as u32,
             opcode: opcode as u32,
             unique,
             nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
+            uid: context.uid,
+            gid: context.gid,
+            pid: context.pid,
             _padding: 0,
         };
         let mut msg = pod_as_bytes(&hdr);
@@ -171,17 +203,18 @@ impl FuseConnection {
     }
 
     /// Enqueue an operation whose reply will not be awaited.
-    fn submit_noreply(&self, opcode: FuseOpcode, nodeid: u64, body: &[u8]) {
+    pub(crate) fn submit_noreply(&self, opcode: FuseOpcode, nodeid: u64, body: &[u8]) {
         let unique = self.alloc_unique();
         let total = core::mem::size_of::<FuseInHeader>() + body.len();
+        let context = request_context();
         let hdr = FuseInHeader {
             len: total as u32,
             opcode: opcode as u32,
             unique,
             nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
+            uid: context.uid,
+            gid: context.gid,
+            pid: context.pid,
             _padding: 0,
         };
         let mut msg = pod_as_bytes(&hdr);

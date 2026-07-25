@@ -211,6 +211,11 @@ that set, and records the negotiated minor version and write limit on the
 connection. Major versions other than 7 and protocol minors before 7.5
 are rejected.
 
+Every request header is stamped with the calling task's translated
+filesystem uid/gid and visible process id through a boot-installed
+request-context provider. Kernel-only callers retain the zero-valued
+fallback when no userspace provider is installed.
+
 Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with
 `FsError::InvalidData`; a disconnected daemon fails pending requests
