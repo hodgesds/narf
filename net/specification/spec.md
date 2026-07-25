@@ -219,6 +219,9 @@ round trips. Group membership is not limited to the legacy 32-bit
 `sockaddr_nl.nl_groups` mask; `NETLINK_ADD_MEMBERSHIP`,
 `NETLINK_DROP_MEMBERSHIP`, and `NETLINK_LIST_MEMBERSHIPS` retain and report
 the full group-number bitmap. Explicit port IDs are unique within each netlink protocol.
+When `NETLINK_PKTINFO` is enabled, `recvmsg` emits a `SOL_NETLINK` /
+`NETLINK_PKTINFO` control message whose `nl_pktinfo.group` identifies the
+multicast group of the datagram actually dequeued (zero for unicast replies).
 `sendto` or connected send to a live userspace port delivers one datagram and
 reports the sender's port ID through `recvfrom`; a missing destination returns
 `ECONNREFUSED`. Userspace multicast is rejected because NARF does not infer

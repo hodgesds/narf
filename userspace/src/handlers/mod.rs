@@ -12633,33 +12633,44 @@ fn parse_scm_rights_fds(
     out
 }
 
-/// Write an `SOL_SOCKET` / `SCM_CREDENTIALS` control message into
-/// `msg_control` naming the KERNEL as the message sender
-/// (`struct ucred { pid=0, uid=0, gid=0 }`). Required for netlink uevent
-/// recvmsg: systemd's libudev sets `SO_PASSCRED` and rejects any uevent
-/// whose recvmsg lacks credentials with uid 0. `msg_controllen` is set to
-/// the bytes written, or 0 when the user control buffer is absent/too small.
-fn install_netlink_creds(msg_ptr: u64) {
+/// Install kernel-sender credentials and, when requested through
+/// `NETLINK_PKTINFO`, the multicast group associated with this datagram.
+fn install_netlink_ancillary(msg_ptr: u64, pktinfo_group: Option<u32>) {
     const SOL_SOCKET: i32 = 1;
     const SCM_CREDENTIALS: i32 = 2;
+    const SOL_NETLINK: i32 = 270;
+    const NETLINK_PKTINFO: i32 = 3;
     let ctrl_ptr = read_user_u64(msg_ptr + 32);
     let ctrl_len = read_user_u64(msg_ptr + 40) as usize;
-    // cmsghdr(16) + struct ucred{pid,uid,gid}(12).
-    let cmsg_len = 16 + 12usize;
-    if ctrl_ptr == 0 || ctrl_len < cmsg_len {
+    let mut ctrl = alloc::vec::Vec::new();
+    let push_cmsg = |ctrl: &mut alloc::vec::Vec<u8>, level: i32, kind: i32, payload: &[u8]| {
+        let len = 16 + payload.len();
+        ctrl.extend_from_slice(&(len as u64).to_le_bytes());
+        ctrl.extend_from_slice(&level.to_le_bytes());
+        ctrl.extend_from_slice(&kind.to_le_bytes());
+        ctrl.extend_from_slice(payload);
+        while ctrl.len() % 8 != 0 {
+            ctrl.push(0);
+        }
+    };
+    push_cmsg(&mut ctrl, SOL_SOCKET, SCM_CREDENTIALS, &[0u8; 12]);
+    if let Some(group) = pktinfo_group {
+        push_cmsg(
+            &mut ctrl,
+            SOL_NETLINK,
+            NETLINK_PKTINFO,
+            &group.to_ne_bytes(),
+        );
+    }
+    if ctrl_ptr == 0 || ctrl_len < ctrl.len() {
         // SAFETY: 8-byte write to msg_controllen; copy_to_user range-checks + SMAP.
         let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
         return;
     }
-    let mut cmsg = alloc::vec![0u8; cmsg_len];
-    cmsg[0..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
-    cmsg[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
-    cmsg[12..16].copy_from_slice(&SCM_CREDENTIALS.to_le_bytes());
-    // struct ucred { pid=0, uid=0, gid=0 } — bytes 16..28 already zero.
     // SAFETY: ctrl_ptr is the user msg_control buffer, len-checked above.
-    let _ = unsafe { copy_to_user(ctrl_ptr, &cmsg) };
+    let _ = unsafe { copy_to_user(ctrl_ptr, &ctrl) };
     // SAFETY: 8-byte write to msg_controllen at msg_ptr+40.
-    let _ = unsafe { copy_to_user(msg_ptr + 40, &(cmsg_len as u64).to_le_bytes()) };
+    let _ = unsafe { copy_to_user(msg_ptr + 40, &(ctrl.len() as u64).to_le_bytes()) };
 }
 
 /// Install received AF_UNIX ancillary data into the calling task's

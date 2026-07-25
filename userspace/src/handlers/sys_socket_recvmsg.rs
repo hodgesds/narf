@@ -91,7 +91,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                 // and silently drops any uevent whose recvmsg carries no
                 // sender credentials with uid 0 — so this is required for
                 // udevd / `udevadm monitor` to accept our broadcasts.
-                install_netlink_creds(msg_ptr);
+                install_netlink_ancillary(msg_ptr, sock.netlink_pktinfo());
             } else {
                 // SCM_RIGHTS: install any passed file objects into this task's
                 // fd table and report the new fd numbers in an SOL_SOCKET/

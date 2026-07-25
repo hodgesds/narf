@@ -413,6 +413,11 @@ pub struct SocketFile {
     netlink_cap_ack: AtomicBool,
     netlink_ext_ack: AtomicBool,
     netlink_strict_check: AtomicBool,
+    /// Multicast group associated with each kernel-originated queued
+    /// datagram. Kept parallel to the protocol-specific reply queue so
+    /// NETLINK_PKTINFO can report the group of the datagram actually read.
+    netlink_reply_groups: IrqSafeSpinLock<VecDeque<u32>>,
+    netlink_last_recv_group: AtomicU32,
     /// Explicitly delegated NARF network-control authority. Never inferred
     /// from uid or Linux ambient capability bits.
     netlink_admin: IrqSafeSpinLock<Option<narf_net::AdminHandle>>,
@@ -744,6 +749,8 @@ impl SocketFile {
             netlink_cap_ack: AtomicBool::new(false),
             netlink_ext_ack: AtomicBool::new(false),
             netlink_strict_check: AtomicBool::new(false),
+            netlink_reply_groups: IrqSafeSpinLock::new(VecDeque::new()),
+            netlink_last_recv_group: AtomicU32::new(0),
             netlink_admin: IrqSafeSpinLock::new(None),
             netlink_user_inbox: IrqSafeSpinLock::new(VecDeque::new()),
         });
@@ -780,6 +787,10 @@ impl SocketFile {
             }
             if let SocketState::NetlinkRoute { replies } = &mut *socket.state.lock() {
                 replies.push_back(message.to_vec());
+                socket
+                    .netlink_reply_groups
+                    .lock()
+                    .push_back(group.trailing_zeros() + 1);
             }
             true
         });
@@ -927,6 +938,7 @@ impl SocketFile {
         }?;
         let n = buf.len().min(packet.payload.len());
         buf[..n].copy_from_slice(&packet.payload[..n]);
+        self.netlink_last_recv_group.store(0, Ordering::Release);
         let peer = Some(Self::netlink_sockaddr(packet.sender_portid, 0));
         Some(if n < packet.payload.len() {
             SocketOpResult::ReceivedTruncated {
@@ -937,6 +949,33 @@ impl SocketFile {
         } else {
             SocketOpResult::Received { n, peer }
         })
+    }
+
+    fn queue_netlink_reply_groups(&self, count: usize) {
+        self.netlink_reply_groups
+            .lock()
+            .extend(core::iter::repeat_n(0, count));
+    }
+
+    fn record_queued_netlink_group(&self, flags: u32) {
+        let group = {
+            let mut groups = self.netlink_reply_groups.lock();
+            if flags & MSG_PEEK != 0 {
+                groups.front().copied()
+            } else {
+                groups.pop_front()
+            }
+        }
+        .unwrap_or(0);
+        self.netlink_last_recv_group.store(group, Ordering::Release);
+    }
+
+    pub fn netlink_pktinfo(&self) -> Option<u32> {
+        if self.domain == AF_NETLINK && self.netlink_pktinfo.load(Ordering::Acquire) {
+            Some(self.netlink_last_recv_group.load(Ordering::Acquire))
+        } else {
+            None
+        }
     }
 
     fn connect_netlink(&self, addr: &SockAddr) -> SocketOpResult {
@@ -1706,11 +1745,13 @@ impl SocketFile {
                 };
                 let notifications =
                     narf_net::netlink_route::successful_mutation_notifications(buf, &msgs);
+                let reply_count = msgs.len();
                 {
                     let mut g = self.state.lock();
                     match &mut *g {
                         SocketState::NetlinkRoute { replies } => {
                             replies.extend(msgs);
+                            self.queue_netlink_reply_groups(reply_count);
                         }
                         _ => return SocketOpResult::Err(SockError::InvalidArg),
                     }
@@ -1738,6 +1779,7 @@ impl SocketFile {
                 };
                 match msg {
                     Some(bytes) => {
+                        self.record_queued_netlink_group(flags);
                         let n = core::cmp::min(buf.len(), bytes.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
                         // Sender is the kernel: sockaddr_nl{family, pid=0, groups=0}.
@@ -1785,10 +1827,12 @@ impl SocketFile {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {
                     SocketState::NetlinkGeneric { replies: queue } => {
                         queue.extend(replies);
+                        self.queue_netlink_reply_groups(reply_count);
                     }
                     _ => return SocketOpResult::Err(SockError::InvalidArg),
                 }
@@ -1812,6 +1856,7 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
+                        self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
                         let peer = Some(Self::netlink_sockaddr(0, 0));
@@ -1846,9 +1891,13 @@ impl SocketFile {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {
-                    SocketState::NetlinkSockDiag { replies: queue } => queue.extend(replies),
+                    SocketState::NetlinkSockDiag { replies: queue } => {
+                        queue.extend(replies);
+                        self.queue_netlink_reply_groups(reply_count);
+                    }
                     _ => return SocketOpResult::Err(SockError::InvalidArg),
                 }
                 drop(state);
@@ -1871,6 +1920,7 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
+                        self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
                         let peer = Some(Self::netlink_sockaddr(0, 0));
@@ -1905,9 +1955,13 @@ impl SocketFile {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {
-                    SocketState::NetlinkNetfilter { replies: queue } => queue.extend(replies),
+                    SocketState::NetlinkNetfilter { replies: queue } => {
+                        queue.extend(replies);
+                        self.queue_netlink_reply_groups(reply_count);
+                    }
                     _ => return SocketOpResult::Err(SockError::InvalidArg),
                 }
                 drop(state);
@@ -1930,6 +1984,7 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
+                        self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
                         let peer = Some(Self::netlink_sockaddr(0, 0));
@@ -1964,9 +2019,13 @@ impl SocketFile {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {
-                    SocketState::NetlinkAudit { replies: queue } => queue.extend(replies),
+                    SocketState::NetlinkAudit { replies: queue } => {
+                        queue.extend(replies);
+                        self.queue_netlink_reply_groups(reply_count);
+                    }
                     _ => return SocketOpResult::Err(SockError::InvalidArg),
                 }
                 drop(state);
@@ -1989,6 +2048,7 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
+                        self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
                         let peer = Some(Self::netlink_sockaddr(0, 0));
@@ -2044,6 +2104,7 @@ impl SocketFile {
                 };
                 match ev {
                     Some(env) => {
+                        self.netlink_last_recv_group.store(1, Ordering::Release);
                         // Kernel netlink uevent wire format (NUL-separated,
                         // `action@devpath` header) so libudev/udevd parse it.
                         let bytes = env.to_netlink_bytes();
@@ -4172,4 +4233,37 @@ fn smoke_netlink_lists_high_membership_groups() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_netlink_lists_high_membership_groups
+);
+
+fn smoke_netlink_pktinfo_tracks_received_multicast_group() -> TestResult {
+    let sock = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    let group = 5u32;
+    if !matches!(
+        sock.handle_setsockopt(SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group.to_ne_bytes()),
+        SocketOpResult::Ok(0)
+    ) || !matches!(
+        sock.handle_setsockopt(SOL_NETLINK, NETLINK_PKTINFO, &1u32.to_ne_bytes()),
+        SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("failed to configure netlink pktinfo smoke");
+    }
+    SocketFile::broadcast_netlink_route(1 << (group - 1), b"route-event");
+    let mut buf = [0u8; 32];
+    if !matches!(
+        sock.dispatch_op(SocketOp::Recv {
+            buf: &mut buf,
+            flags: 0
+        }),
+        SocketOpResult::Received { n: 11, .. }
+    ) {
+        return TestResult::Fail("route multicast datagram was not received");
+    }
+    if sock.netlink_pktinfo() != Some(group) {
+        return TestResult::Fail("NETLINK_PKTINFO did not report received multicast group");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_netlink_pktinfo_tracks_received_multicast_group
 );
