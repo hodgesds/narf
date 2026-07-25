@@ -89,12 +89,23 @@ pub mod amd_pstate {
 
     pub fn read_caps() -> Option<Result<CppcCaps, MsrFault>>;
     pub fn read_status() -> Option<Result<u8, MsrFault>>;
-    pub fn amd_pstate_request(
+pub fn amd_pstate_request(
         min_perf: u8,
         max_perf: u8,
         desired_perf: u8,
         epp: u8,
     ) -> Option<Result<(), MsrFault>>;
+}
+
+#[cfg(target_arch = "x86_64")]
+pub mod xsave {
+    /// Selects x87/SSE/AVX/AVX-512/PKRU dependencies as complete groups;
+    /// deliberately excludes opt-in AMX state.
+    pub const fn default_xcr0_mask(supported: u64) -> u64;
+
+    /// Standard-format bytes required by exactly `mask`, derived from
+    /// CPUID.(0Dh,n) component offsets rather than the all-supported size.
+    pub fn area_size_for_mask(mask: u64) -> usize;
 }
 ```
 

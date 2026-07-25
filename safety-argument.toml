@@ -1,16 +1,16 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "9fbae33625038b0fb808841b4cd198e42c1dfc508c211e94d1f8937952c47e08"
+prompt_hash = "0c79ac64af6ef07b1aa37efffada5205ea075c6acb882f73ddcfe1cc0a01cfe3"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "The new policy primitive is implemented in arch/ and invoked by frame/; the existing TCB membership and trust boundary are unchanged."
+argument = "The change is confined to x86 architectural extended-state policy and its tests; it neither adds a trusted subsystem nor moves the documented TCB boundary."
 
 [[invariants_preserved]]
-ref = "security-model/specification/spec.md#L248"
-argument = "The implementation applies CPU-wide baseline controls and does not insert fences or predictor barriers at ordinary PKS/MTE domain transitions, preserving the documented exclusion of in-kernel domain boundaries."
+ref = "security-model/specification/spec.md#L42"
+argument = "Selecting a saveable XCR0 mask does not change capability checks, page-domain tags, PKRS state, or domain transitions. AVX state remains per task and cannot grant memory access."
 
 [[invariants_preserved]]
-ref = "security-model/specification/spec.md#L276"
-argument = "Every BSP and AP applies and verifies its own protected baseline before becoming scheduler-visible, strengthening the documented kernel-user mitigation boundary without relying on a boot-global feature cache."
+ref = "security-model/specification/spec.md#L67"
+argument = "The XSAVE image contains user arithmetic state only and remains separate from DomainSavedState; this change does not expose another task's PKRS history or broaden diagnostic access."

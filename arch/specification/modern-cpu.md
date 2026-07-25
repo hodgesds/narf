@@ -139,13 +139,19 @@ NARF's default XCR0:
     bit 0 (x87) | bit 1 (SSE) | bit 2 (AVX, if supported)
                 | bit 5..7 (AVX-512, if supported)
                 | bit 9 (PKRU, if PKU enabled)
-                | bit 17..18 (AMX, if supported)
 ```
 
-AMX additionally requires permission via the
-`arch_prctl(ARCH_REQ_XCOMP_PERM, ...)` flow on Linux; the
-NARF kernel-hosted equivalent is to set the bit in XCR0 once at
-boot — userspace inherits via the standard XSAVE area layout.
+The selected standard-format XSAVE image must fit the fixed per-task
+`FPU_AREA_SIZE`. If AVX-512 would exceed it, bits 5–7 remain clear while
+AVX/SSE stay enabled. The size is computed from CPUID(0x0D, n) for the
+selected components, not CPUID(0x0D, 0).ECX, because ECX includes every
+supported component even when it is disabled.
+
+AMX requires opt-in permission via `arch_prctl(ARCH_REQ_XCOMP_PERM, ...)` on
+Linux and its tile-data state exceeds NARF's fixed per-task save area on
+current CPUs. NARF therefore leaves bits 17–18 clear until it has an
+equivalent permission ABI and dynamically-sized task state. User software
+must check XCR0, as it does on Linux, before issuing AMX instructions.
 
 ### 2.4 API
 
@@ -165,6 +171,8 @@ pub struct XsaveCaps {
 }
 
 pub fn caps() -> XsaveCaps;
+pub const fn default_xcr0_mask(supported: u64) -> u64;
+pub fn area_size_for_mask(mask: u64) -> usize;
 pub unsafe fn read_xcr0() -> u64;
 pub unsafe fn write_xcr0(v: u64);
 pub unsafe fn read_xss() -> u64;
