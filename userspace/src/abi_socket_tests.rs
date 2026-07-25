@@ -1777,6 +1777,29 @@ fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getaddr_dump);
 
+fn smoke_abi_netlink_route_getaddr_family_filter() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let mut req = [0u8; 24];
+        req[0..4].copy_from_slice(&24u32.to_ne_bytes());
+        req[4..6].copy_from_slice(&RTM_GETADDR.to_ne_bytes());
+        req[6..8].copy_from_slice(&NLM_F_REQUEST_DUMP.to_ne_bytes());
+        req[8..12].copy_from_slice(&15u32.to_ne_bytes());
+        req[16] = 10; // AF_INET6; NARF currently publishes no IPv6 addresses.
+        if netlink_send(fd, &req).ok_or("filtered addr send")? != req.len() as i64 {
+            return Err("filtered RTM_GETADDR send failed");
+        }
+        let mut reply = [0u8; 64];
+        let n = netlink_recv(fd, &mut reply).ok_or("filtered addr recv")?;
+        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&reply) != NLMSG_DONE {
+            return Err("empty filtered address dump did not return NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getaddr_family_filter);
+
 fn smoke_abi_netlink_route_getroute_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;

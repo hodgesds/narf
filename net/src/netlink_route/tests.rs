@@ -148,6 +148,23 @@ fn getaddr_dump_is_well_formed() {
 }
 
 #[test]
+fn getaddr_dump_honors_family_and_ifindex_filters() {
+    let mut body = [0u8; 8];
+    body[0] = AF_INET6;
+    let ipv6 = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 6, 0, &body);
+    let replies = build_dump(&ipv6);
+    assert_eq!(replies.len(), 1);
+    assert_eq!(parse_hdr(&replies[0]).unwrap().msg_type, NLMSG_DONE);
+
+    body[0] = AF_INET;
+    body[4..8].copy_from_slice(&999u32.to_ne_bytes());
+    let missing_index = frame_message(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 7, 0, &body);
+    let replies = build_dump(&missing_index);
+    assert_eq!(replies.len(), 1);
+    assert_eq!(parse_hdr(&replies[0]).unwrap().msg_type, NLMSG_DONE);
+}
+
+#[test]
 fn getroute_dump_has_loopback_and_terminates() {
     let msgs = build_dump(&req(RTM_GETROUTE, 19, 88));
     assert!(msgs.len() >= 2, "expected >=1 NEWROUTE + a DONE");
@@ -253,6 +270,23 @@ fn getroute_point_query_uses_longest_prefix_match() {
         name,
         crate::route::TABLE_MAIN,
     );
+}
+
+#[test]
+fn getroute_dump_honors_table_filter() {
+    let mut body = [0u8; 12];
+    body[0] = AF_INET;
+    body[4] = crate::route::TABLE_MAIN;
+    let request = frame_message(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 63, 0, &body);
+    let replies = build_dump(&request);
+    assert_eq!(
+        parse_hdr(replies.last().unwrap()).unwrap().msg_type,
+        NLMSG_DONE
+    );
+    for reply in &replies[..replies.len() - 1] {
+        assert_eq!(parse_hdr(reply).unwrap().msg_type, RTM_NEWROUTE);
+        assert_eq!(reply[NLMSG_HDRLEN + 4], crate::route::TABLE_MAIN);
+    }
 }
 
 #[test]

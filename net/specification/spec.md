@@ -154,6 +154,9 @@ returning a non-multipart reply or `ENODEV`.
 Non-dump `RTM_GETROUTE` performs the forwarding table's longest-prefix
 lookup for `RTA_DST`, returning the selected route as one non-multipart reply
 or `ENETUNREACH`.
+Address dumps honor `ifa_family` and `ifa_index`; route dumps honor
+`rtm_family` and `rtm_table`. A valid filter with no matching objects returns
+an empty dump terminated by `NLMSG_DONE`.
 
 Link dumps include Linux operational-state, carrier, qdisc, queue-length,
 broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero

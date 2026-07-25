@@ -534,8 +534,18 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
         }
         RTM_GETADDR => {
             let (_links, addrs) = enumerate();
-            for a in &addrs {
-                out.push(build_newaddr(a, seq, pid));
+            let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
+            let requested_ifindex = req
+                .get(NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8)
+                .and_then(|raw| raw.try_into().ok())
+                .map(u32::from_ne_bytes)
+                .unwrap_or(0);
+            if requested_family == 0 || requested_family == AF_INET {
+                for addr in &addrs {
+                    if requested_ifindex == 0 || requested_ifindex == addr.ifindex {
+                        out.push(build_newaddr(addr, seq, pid));
+                    }
+                }
             }
             out.push(build_done(seq, pid));
         }
@@ -563,6 +573,14 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
                     });
                 }
                 for route in &routes {
+                    let requested_family = req.get(NLMSG_HDRLEN).copied().unwrap_or(0);
+                    let requested_table = req.get(NLMSG_HDRLEN + 4).copied().unwrap_or(0);
+                    if requested_family != 0 && requested_family != AF_INET {
+                        continue;
+                    }
+                    if requested_table != 0 && requested_table != route.table {
+                        continue;
+                    }
                     if let Some(link) = links.iter().find(|link| link.name == route.iface) {
                         out.push(build_newroute(route, link.ifindex, seq, pid));
                     }
