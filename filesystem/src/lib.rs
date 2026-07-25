@@ -373,6 +373,13 @@ impl From<CapError> for FsError {
 /// Future returned by every async file/dir op.
 pub type FsFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, FsError>> + Send + 'a>>;
 
+/// Result of an asynchronous filesystem-backed ioctl.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsIoctlReply {
+    pub result: i32,
+    pub output: Vec<u8>,
+}
+
 // ── Directory entry ────────────────────────────────────────────────
 
 /// One entry returned by `DirOps::iter`. Stage 3 keeps the name as
@@ -588,6 +595,21 @@ pub trait FileOps: Send + Sync {
     /// `include/linux/fs.h::file_operations.unlocked_ioctl`.
     fn ioctl(&self, _cmd: u32, _arg: usize) -> Result<u64, FsError> {
         Err(FsError::Unsupported)
+    }
+
+    /// Asynchronous ioctl transport for remote filesystems such as FUSE.
+    ///
+    /// `input` and `out_size` are derived from Linux `_IOC_DIR/_IOC_SIZE`;
+    /// `arg` is retained in the FUSE request for daemon compatibility but is
+    /// never dereferenced by the filesystem layer.
+    fn ioctl_async<'a>(
+        &'a self,
+        _cmd: u32,
+        _arg: u64,
+        _input: &'a [u8],
+        _out_size: usize,
+    ) -> FsFuture<'a, FsIoctlReply> {
+        Box::pin(async { Err(FsError::Unsupported) })
     }
 
     /// `mmap(2)` device backing. For a `MAP_SHARED` mapping of this

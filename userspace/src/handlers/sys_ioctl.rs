@@ -246,7 +246,43 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     match ops.ioctl(cmd, arg) {
         Ok(rc) => ctx.set_return(SyscallReturn::ok(rc)),
         Err(narf_filesystem::FsError::Unsupported) => {
-            ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+            // Linux restricted FUSE ioctls derive their transfer buffers
+            // solely from the command's _IOC direction and size fields.
+            const IOC_WRITE: u32 = 1;
+            const IOC_READ: u32 = 2;
+            let dir = cmd >> 30;
+            let size = ((cmd >> 16) & 0x3fff) as usize;
+            let mut input = alloc::vec::Vec::new();
+            if dir & IOC_WRITE != 0 && size != 0 {
+                input.resize(size, 0);
+                // SAFETY: the encoded ioctl input size bounds the copy and
+                // copy_from_user validates the entire user range.
+                if unsafe { copy_from_user(&mut input, arg as u64) }.is_err() {
+                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                    return;
+                }
+            }
+            let out_size = if dir & IOC_READ != 0 { size } else { 0 };
+            match poll_blocking(ops.ioctl_async(cmd, arg as u64, &input, out_size)) {
+                Some(Ok(reply)) => {
+                    if !reply.output.is_empty() {
+                        // SAFETY: output length was bounded by _IOC_SIZE in
+                        // the filesystem layer; copy_to_user validates arg.
+                        if unsafe { copy_to_user(arg as u64, &reply.output) }.is_err() {
+                            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                            return;
+                        }
+                    }
+                    ctx.set_return(SyscallReturn::ok((reply.result as i64) as u64));
+                }
+                Some(Err(narf_filesystem::FsError::Unsupported)) => {
+                    ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                }
+                Some(Err(narf_filesystem::FsError::PermissionDenied)) => {
+                    ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+                }
+                _ => ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)),
+            }
         }
         Err(narf_filesystem::FsError::PermissionDenied) => {
             // EACCES = 13

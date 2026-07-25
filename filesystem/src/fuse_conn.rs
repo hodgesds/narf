@@ -35,8 +35,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fuse::*;
 use crate::{
-    DirEntry, DirOps, FileLock, FileOps, FileType, FsError, FsFuture, FsInstance, FsStat, Mode,
-    Stat, POLL_IN, POLL_OUT,
+    DirEntry, DirOps, FileLock, FileOps, FileType, FsError, FsFuture, FsInstance, FsIoctlReply,
+    FsStat, Mode, Stat, POLL_IN, POLL_OUT,
 };
 
 /// A completed reply from the daemon: the `error` field of the
@@ -1149,6 +1149,53 @@ impl FileOps for FuseFile {
                 .await?;
             let out: FuseWriteOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
             Ok(u64::from(out.size))
+        })
+    }
+
+    fn ioctl_async<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        input: &'a [u8],
+        out_size: usize,
+    ) -> FsFuture<'a, FsIoctlReply> {
+        Box::pin(async move {
+            let fh = self.ensure_open().await?;
+            let in_size = u32::try_from(input.len()).map_err(|_| FsError::InvalidData)?;
+            let out_size_u32 = u32::try_from(out_size).map_err(|_| FsError::InvalidData)?;
+            let mut body = pod_as_bytes(&FuseIoctlIn {
+                fh,
+                flags: 0,
+                cmd,
+                arg,
+                in_size,
+                out_size: out_size_u32,
+            });
+            body.extend_from_slice(input);
+            let reply = self
+                .conn
+                .request(FuseOpcode::Ioctl, self.attr.nodeid, body)
+                .await?;
+            let out: FuseIoctlOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            if out.flags & FUSE_IOCTL_RETRY != 0 {
+                // Linux forbids daemon-selected retry iovecs for ordinary
+                // FUSE mounts. They are available only to unrestricted CUSE
+                // ioctls, which use a separate transport contract.
+                return Err(FsError::InvalidData);
+            }
+            if out.in_iovs != 0 || out.out_iovs != 0 {
+                return Err(FsError::InvalidData);
+            }
+            let data = reply
+                .get(core::mem::size_of::<FuseIoctlOut>()..)
+                .ok_or(FsError::InvalidData)?;
+            if data.len() > out_size {
+                return Err(FsError::InvalidData);
+            }
+            Ok(FsIoctlReply {
+                result: out.result,
+                output: data.to_vec(),
+            })
         })
     }
 

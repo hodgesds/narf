@@ -239,6 +239,12 @@ SEEK_HOLE), and COPY_FILE_RANGE when both files share one connection;
 the syscall layer retains truncate/zero, generic seek, and buffered-copy
 fallbacks for filesystems that return `Unsupported`.
 
+`FileOps::ioctl_async` carries Linux `_IOC`-described input and output
+buffers to remote filesystems. FUSE maps it to restricted `FUSE_IOCTL`,
+copies no more than the encoded `_IOC_SIZE`, rejects oversized replies,
+and rejects `FUSE_IOCTL_RETRY`; daemon-selected retry iovecs are reserved
+for the separately privileged CUSE unrestricted-ioctl contract.
+
 FUSE file handles register `POLL` once with a stable kernel handle and
 cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that
 registration so the next readiness query re-polls the daemon. Poll

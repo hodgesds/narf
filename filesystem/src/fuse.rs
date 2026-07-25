@@ -54,6 +54,7 @@ pub enum FuseOpcode {
     Create = 35,
     Interrupt = 36,
     Destroy = 38,
+    Ioctl = 39,
     Poll = 40,
     BatchForget = 42,
     Fallocate = 43,
@@ -528,6 +529,40 @@ pub struct FusePollOut {
     pub revents: u32,
     pub padding: u32,
 }
+
+/// `struct fuse_ioctl_in` — one restricted file/directory ioctl request.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseIoctlIn {
+    pub fh: u64,
+    pub flags: u32,
+    pub cmd: u32,
+    pub arg: u64,
+    pub in_size: u32,
+    pub out_size: u32,
+}
+
+/// `struct fuse_ioctl_iovec` — daemon-selected buffer for unrestricted
+/// retry. Ordinary FUSE mounts use restricted ioctls and reject retry.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseIoctlIovec {
+    pub base: u64,
+    pub len: u64,
+}
+
+/// `struct fuse_ioctl_out` — ioctl return code and optional retry metadata.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseIoctlOut {
+    pub result: i32,
+    pub flags: u32,
+    pub in_iovs: u32,
+    pub out_iovs: u32,
+}
+
+pub const FUSE_IOCTL_RETRY: u32 = 1 << 2;
+pub const FUSE_IOCTL_MAX_IOV: u32 = 256;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
