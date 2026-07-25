@@ -56,6 +56,7 @@ pub enum FuseOpcode {
     Destroy = 38,
     Ioctl = 39,
     Poll = 40,
+    NotifyReply = 41,
     BatchForget = 42,
     Fallocate = 43,
     ReadDirPlus = 44,
@@ -659,11 +660,54 @@ pub struct FuseNotifyDeleteOut {
     pub padding: u32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseNotifyStoreOut {
+    pub nodeid: u64,
+    pub offset: u64,
+    pub size: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseNotifyRetrieveOut {
+    pub notify_unique: u64,
+    pub nodeid: u64,
+    pub offset: u64,
+    pub size: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseNotifyRetrieveIn {
+    pub dummy1: u64,
+    pub offset: u64,
+    pub size: u32,
+    pub dummy2: u32,
+    pub dummy3: u64,
+    pub dummy4: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseNotifyPruneOut {
+    pub count: u32,
+    pub padding: u32,
+    pub spare: u64,
+}
+
 pub const FUSE_POLL_SCHEDULE_NOTIFY: u32 = 1;
 pub const FUSE_NOTIFY_POLL: i32 = 1;
 pub const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
 pub const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
+pub const FUSE_NOTIFY_STORE: i32 = 4;
+pub const FUSE_NOTIFY_RETRIEVE: i32 = 5;
 pub const FUSE_NOTIFY_DELETE: i32 = 6;
+pub const FUSE_NOTIFY_RESEND: i32 = 7;
+pub const FUSE_NOTIFY_INC_EPOCH: i32 = 8;
+pub const FUSE_NOTIFY_PRUNE: i32 = 9;
 
 /// `struct fuse_forget_in` — FORGET request body: the drop count for a
 /// nodeid the client no longer caches. 8 bytes.

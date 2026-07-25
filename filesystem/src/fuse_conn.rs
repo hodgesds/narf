@@ -107,6 +107,8 @@ pub struct FuseConnection {
     max_write: AtomicU32,
     max_pages: AtomicU16,
     syncfs_supported: AtomicBool,
+    notify_cache: IrqSafeSpinLock<BTreeMap<(u64, u64), Vec<u8>>>,
+    notify_epoch: AtomicU64,
 }
 
 impl core::fmt::Debug for FuseConnection {
@@ -143,6 +145,8 @@ impl FuseConnection {
             max_write: AtomicU32::new(4096),
             max_pages: AtomicU16::new(32),
             syncfs_supported: AtomicBool::new(true),
+            notify_cache: IrqSafeSpinLock::new(BTreeMap::new()),
+            notify_epoch: AtomicU64::new(0),
         }
     }
 
@@ -256,6 +260,7 @@ impl FuseConnection {
             if header.opcode != FuseOpcode::Interrupt as u32
                 && header.opcode != FuseOpcode::Forget as u32
                 && header.opcode != FuseOpcode::BatchForget as u32
+                && header.opcode != FuseOpcode::NotifyReply as u32
             {
                 self.delivered.lock().insert(header.unique);
             }
@@ -354,6 +359,32 @@ impl FuseConnection {
         !self.pending.lock().is_empty()
     }
 
+    fn enqueue_notify_reply(&self, unique: u64, nodeid: u64, offset: u64, data: &[u8]) {
+        let context = request_context();
+        let input = FuseNotifyRetrieveIn {
+            offset,
+            size: data.len() as u32,
+            ..Default::default()
+        };
+        let len = core::mem::size_of::<FuseInHeader>()
+            + core::mem::size_of::<FuseNotifyRetrieveIn>()
+            + data.len();
+        let header = FuseInHeader {
+            len: len as u32,
+            opcode: FuseOpcode::NotifyReply as u32,
+            unique,
+            nodeid,
+            uid: context.uid,
+            gid: context.gid,
+            pid: context.pid,
+            _padding: 0,
+        };
+        let mut request = pod_as_bytes(&header);
+        request.extend_from_slice(&pod_as_bytes(&input));
+        request.extend_from_slice(data);
+        self.pending.lock().push_back(request);
+    }
+
     /// Daemon side: complete the request identified by the reply's
     /// `fuse_out_header.unique`. `reply` is the full daemon write
     /// (`fuse_out_header` + body). Returns the number of bytes consumed on
@@ -396,6 +427,71 @@ impl FuseConnection {
                         && notify.namelen != 0
                         && body.len()
                             == core::mem::size_of::<FuseNotifyDeleteOut>() + notify.namelen as usize
+                }
+                FUSE_NOTIFY_STORE => {
+                    let notify: FuseNotifyStoreOut = pod_from_bytes(&body)?;
+                    let header_len = core::mem::size_of::<FuseNotifyStoreOut>();
+                    let valid = notify.nodeid != 0
+                        && notify.padding == 0
+                        && body.len() == header_len + notify.size as usize;
+                    if valid {
+                        self.notify_cache
+                            .lock()
+                            .insert((notify.nodeid, notify.offset), body[header_len..].to_vec());
+                    }
+                    valid
+                }
+                FUSE_NOTIFY_RETRIEVE => {
+                    let notify: FuseNotifyRetrieveOut = pod_from_bytes(&body)?;
+                    if notify.notify_unique == 0
+                        || notify.nodeid == 0
+                        || notify.padding != 0
+                        || body.len() != core::mem::size_of::<FuseNotifyRetrieveOut>()
+                    {
+                        false
+                    } else {
+                        let data = self
+                            .notify_cache
+                            .lock()
+                            .get(&(notify.nodeid, notify.offset))
+                            .cloned()
+                            .unwrap_or_default();
+                        let size = core::cmp::min(data.len(), notify.size as usize);
+                        self.enqueue_notify_reply(
+                            notify.notify_unique,
+                            notify.nodeid,
+                            notify.offset,
+                            &data[..size],
+                        );
+                        true
+                    }
+                }
+                FUSE_NOTIFY_RESEND => body.is_empty(),
+                FUSE_NOTIFY_INC_EPOCH => {
+                    if body.is_empty() {
+                        self.notify_epoch.fetch_add(1, Ordering::AcqRel);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                FUSE_NOTIFY_PRUNE => {
+                    let notify: FuseNotifyPruneOut = pod_from_bytes(&body)?;
+                    if body.len() != core::mem::size_of::<FuseNotifyPruneOut>()
+                        || notify.padding != 0
+                        || notify.spare != 0
+                    {
+                        false
+                    } else {
+                        let mut cache = self.notify_cache.lock();
+                        for _ in 0..notify.count {
+                            let Some(key) = cache.keys().next().copied() else {
+                                break;
+                            };
+                            cache.remove(&key);
+                        }
+                        true
+                    }
                 }
                 _ => false,
             };

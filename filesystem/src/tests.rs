@@ -2920,12 +2920,53 @@ fn smoke_fs_fuse_cache_notifications() -> TestResult {
     });
     delete_body.extend_from_slice(b"hello");
     let delete = fuse_reply(0, FUSE_NOTIFY_DELETE, &delete_body);
+    let mut store_body = pod_as_bytes(&FuseNotifyStoreOut {
+        nodeid: 3,
+        offset: 8,
+        size: 4,
+        padding: 0,
+    });
+    store_body.extend_from_slice(b"data");
+    let store = fuse_reply(0, FUSE_NOTIFY_STORE, &store_body);
+    let retrieve = fuse_reply(
+        0,
+        FUSE_NOTIFY_RETRIEVE,
+        &pod_as_bytes(&FuseNotifyRetrieveOut {
+            notify_unique: 77,
+            nodeid: 3,
+            offset: 8,
+            size: 4,
+            padding: 0,
+        }),
+    );
 
     if conn.complete_reply(&inode) != Some(inode.len())
         || conn.complete_reply(&entry) != Some(entry.len())
         || conn.complete_reply(&delete) != Some(delete.len())
+        || conn.complete_reply(&store) != Some(store.len())
+        || conn.complete_reply(&retrieve) != Some(retrieve.len())
     {
         return TestResult::Fail("valid FUSE cache notification rejected");
+    }
+    let Some(reply) = conn.dequeue_request() else {
+        return TestResult::Fail("FUSE_RETRIEVE did not queue NOTIFY_REPLY");
+    };
+    let Some(header) = pod_from_bytes::<FuseInHeader>(&reply) else {
+        return TestResult::Fail("NOTIFY_REPLY header malformed");
+    };
+    let input_off = core::mem::size_of::<FuseInHeader>();
+    let Some(input) = pod_from_bytes::<FuseNotifyRetrieveIn>(&reply[input_off..]) else {
+        return TestResult::Fail("NOTIFY_REPLY body malformed");
+    };
+    let data_off = input_off + core::mem::size_of::<FuseNotifyRetrieveIn>();
+    if header.opcode != FuseOpcode::NotifyReply as u32
+        || header.unique != 77
+        || header.nodeid != 3
+        || input.offset != 8
+        || input.size != 4
+        || reply.get(data_off..) != Some(&b"data"[..])
+    {
+        return TestResult::Fail("NOTIFY_REPLY did not return stored bytes");
     }
     entry_body.pop();
     let malformed = fuse_reply(0, FUSE_NOTIFY_INVAL_ENTRY, &entry_body);

@@ -280,6 +280,10 @@ Daemon `INVAL_INODE`, `INVAL_ENTRY`, and `DELETE` notifications are
 wire-validated and accepted. They require no cache mutation while the
 FUSE bridge remains uncached; adding inode, dentry, or page caching must
 attach the corresponding invalidation before enabling that cache.
+`STORE` retains daemon-provided ranges per connection and `RETRIEVE`
+answers with a one-way `FUSE_NOTIFY_REPLY` carrying the matching bytes.
+`RESEND`, `INC_EPOCH`, and `PRUNE` are wire-validated; epoch changes are
+tracked and prune drops the requested number of retained ranges.
 
 When the daemon negotiates `DO_READDIRPLUS`, directory enumeration uses
 `READDIRPLUS`, validates each combined entry/dirent record, and emits an
