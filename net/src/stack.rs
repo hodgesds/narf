@@ -110,6 +110,16 @@ impl AdminHandle {
         self.cap.is_live()
     }
 
+    pub fn net_ns_id(&self) -> Result<u64, AdminError> {
+        self.check_live()?;
+        if let Some(iface) = crate::iface::lookup(&self.iface_name) {
+            return Ok(iface.net_ns_id);
+        }
+        crate::registry()
+            .with_interface(&self.iface_name, |_| 0)
+            .ok_or(AdminError::NoIface)
+    }
+
     pub fn check_live(&self) -> Result<(), AdminError> {
         self.cap
             .check_live()
@@ -119,6 +129,15 @@ impl AdminHandle {
     pub fn set_link(&self, up: bool) -> Result<(), AdminError> {
         self.check_live()?;
         crate::iface::set_link_state(&self.iface_name, up)
+            .then_some(())
+            .ok_or(AdminError::NoIface)
+    }
+
+    /// Transfer this interface to a network namespace. The interface-bound
+    /// capability is checked immediately before changing ownership.
+    pub fn move_to_net_ns(&self, net_ns_id: u64) -> Result<(), AdminError> {
+        self.check_live()?;
+        crate::iface::set_net_ns(&self.iface_name, net_ns_id)
             .then_some(())
             .ok_or(AdminError::NoIface)
     }
@@ -196,10 +215,9 @@ impl AdminHandle {
         if route.prefix_len > 32 {
             return Err(AdminError::InvalidPrefix);
         }
-        if crate::iface::lookup(&self.iface_name).is_none() {
-            return Err(AdminError::NoIface);
-        }
+        let iface = crate::iface::lookup(&self.iface_name).ok_or(AdminError::NoIface)?;
         crate::route::route_add(crate::route::Route {
+            net_ns_id: iface.net_ns_id,
             dst: crate::route::Ipv4Net {
                 addr: crate::ipv4::Ipv4Addr(route.dst),
                 prefix_len: route.prefix_len,

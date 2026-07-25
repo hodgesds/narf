@@ -7,12 +7,9 @@
 //!     hostname + domainname; uname(2) and {get,set}hostname
 //!     read/write namespace-local fields.
 //!   * `NetNamespace`  — CLONE_NEWNET (0x40000000). Per-ns iface
-//!     table seeded with a synthetic `lo`. The global
-//!     `net::iface::*` registry remains the default view; only
-//!     tasks that have called unshare(CLONE_NEWNET) consult the
-//!     per-ns list. The deep refactor that threads NS through
-//!     every iface call site is deferred; today we install the
-//!     storage and an opt-in lookup.
+//!     identity seeded with a synthetic `lo`. Physical interfaces,
+//!     IPv4 FIB entries, netfilter state, rtnetlink views, and raw
+//!     ingress delivery are selected by that identity.
 //!   * `IpcNamespace`  — CLONE_NEWIPC (0x08000000). Per-ns SysV
 //!     IPC keyspace (shmget/semget/msgget) and POSIX mqueue keys.
 //!     The subsystems are themselves stubbed in NARF, so this
@@ -210,12 +207,9 @@ impl UtsNamespace {
 
 // ── Net namespace ────────────────────────────────────────────────
 
-/// Per-namespace interface view. The global `narf_net::iface`
-/// registry remains the default; only tasks that have
-/// `unshare(CLONE_NEWNET)`'d consult this table. The deep refactor
-/// that threads NS through every `iface::send`/`iface::lookup` call
-/// site is deferred — the storage lands here so the syscall surface
-/// is observable.
+/// Per-namespace interface view. Physical device ownership is authoritative
+/// in `narf_net::iface`; this object owns the synthetic loopback description
+/// and stable namespace identity used by sockets and network control planes.
 #[derive(Debug)]
 pub struct NetNamespace {
     id: NsId,

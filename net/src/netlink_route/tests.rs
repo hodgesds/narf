@@ -218,6 +218,7 @@ fn getroute_point_query_uses_longest_prefix_match() {
         ([198, 18, 7, 0], 24, [192, 0, 2, 24]),
     ] {
         crate::route::route_add(crate::route::Route {
+            net_ns_id: 0,
             dst: crate::route::Ipv4Net {
                 addr: crate::ipv4::Ipv4Addr(network),
                 prefix_len: prefix,

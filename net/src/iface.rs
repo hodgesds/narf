@@ -29,6 +29,8 @@ pub struct NetIfaceEntry {
     pub gateway: [u8; 4],
     pub mtu: u32,
     pub link_up: bool,
+    /// Owning network namespace. Zero is the initial namespace.
+    pub net_ns_id: u64,
 }
 
 static IFACES: IrqSafeSpinLock<Option<Vec<NetIfaceEntry>>> = IrqSafeSpinLock::new(None);
@@ -55,6 +57,7 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) {
         gateway: QEMU_DEFAULT_GW,
         mtu: 1500,
         link_up: true,
+        net_ns_id: 0,
     });
 }
 
@@ -139,6 +142,7 @@ pub fn snapshot_all() -> Vec<NetIfaceSnapshot> {
             gateway: e.gateway,
             mtu: e.mtu,
             link_up: e.link_up,
+            net_ns_id: e.net_ns_id,
         })
         .collect()
 }
@@ -157,6 +161,7 @@ pub fn primary() -> Option<NetIfaceSnapshot> {
         gateway: e.gateway,
         mtu: e.mtu,
         link_up: e.link_up,
+        net_ns_id: e.net_ns_id,
     })
 }
 
@@ -176,6 +181,7 @@ pub fn lookup(name: &str) -> Option<NetIfaceSnapshot> {
         gateway: e.gateway,
         mtu: e.mtu,
         link_up: e.link_up,
+        net_ns_id: e.net_ns_id,
     })
 }
 
@@ -197,6 +203,7 @@ pub fn for_local_addr(ip: [u8; 4]) -> Option<NetIfaceSnapshot> {
         gateway: e.gateway,
         mtu: e.mtu,
         link_up: e.link_up,
+        net_ns_id: e.net_ns_id,
     })
 }
 
@@ -212,18 +219,57 @@ pub fn send(frame: &[u8]) -> Result<(), ()> {
     send_fn(frame)
 }
 
+/// First interface visible in `net_ns_id`.
+pub fn primary_in(net_ns_id: u64) -> Option<NetIfaceSnapshot> {
+    let g = IFACES.lock();
+    let entry = g
+        .as_ref()?
+        .iter()
+        .find(|entry| entry.net_ns_id == net_ns_id)?;
+    Some(snapshot(entry))
+}
+
+/// Look up an interface only when it belongs to `net_ns_id`.
+pub fn lookup_in(net_ns_id: u64, name: &str) -> Option<NetIfaceSnapshot> {
+    let g = IFACES.lock();
+    let entry = g
+        .as_ref()?
+        .iter()
+        .find(|entry| entry.net_ns_id == net_ns_id && entry.name == name)?;
+    Some(snapshot(entry))
+}
+
+/// Move an interface between network namespaces. Callers must gate this with
+/// the interface's live `AdminHandle`; this primitive only changes ownership.
+pub(crate) fn set_net_ns(name: &str, net_ns_id: u64) -> bool {
+    let mut g = IFACES.lock();
+    let Some(entry) = g
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
+    else {
+        return false;
+    };
+    entry.net_ns_id = net_ns_id;
+    crate::route::move_iface_routes(name, net_ns_id);
+    true
+}
+
 /// Pick the egress iface for a destination IPv4 address by consulting
 /// the FIB and falling back to `primary()`. The returned snapshot is
 /// what TCP / UDP / ICMP send paths use to stamp the source MAC and
 /// dispatch the frame so each flow exits on the correct NIC instead
 /// of always the first-registered one.
 pub fn for_dst(dst: [u8; 4]) -> Option<NetIfaceSnapshot> {
-    if let Some(r) = crate::route::route_lookup(crate::ipv4::Ipv4Addr(dst)) {
-        if let Some(s) = lookup(&r.iface) {
+    for_dst_in(0, dst)
+}
+
+pub fn for_dst_in(net_ns_id: u64, dst: [u8; 4]) -> Option<NetIfaceSnapshot> {
+    if let Some(r) = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(dst)) {
+        if let Some(s) = lookup_in(net_ns_id, &r.iface) {
             return Some(s);
         }
     }
-    primary()
+    primary_in(net_ns_id)
 }
 
 /// Send a complete Ethernet frame through the iface chosen by
@@ -245,6 +291,20 @@ pub struct NetIfaceSnapshot {
     pub gateway: [u8; 4],
     pub mtu: u32,
     pub link_up: bool,
+    pub net_ns_id: u64,
+}
+
+fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
+    NetIfaceSnapshot {
+        name: entry.name.clone(),
+        mac: entry.mac,
+        send: entry.send,
+        ipv4: entry.ipv4,
+        gateway: entry.gateway,
+        mtu: entry.mtu,
+        link_up: entry.link_up,
+        net_ns_id: entry.net_ns_id,
+    }
 }
 
 pub fn set_link_state(name: &str, up: bool) -> bool {
@@ -341,6 +401,7 @@ pub fn set_gateway(iface_name: &str, gateway: [u8; 4]) {
     use crate::ipv4::Ipv4Addr;
     use crate::route::{Ipv4Net, Route, Scope, TABLE_MAIN};
     crate::route::route_add(Route {
+        net_ns_id: lookup(iface_name).map_or(0, |iface| iface.net_ns_id),
         dst: Ipv4Net {
             addr: Ipv4Addr([0, 0, 0, 0]),
             prefix_len: 0,

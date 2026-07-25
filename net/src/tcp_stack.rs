@@ -120,8 +120,11 @@ pub fn rx_handler(iface_name: &str, frame: &[u8]) {
     // Linux ref: linux/net/core/dev.c::netif_receive_skb_core
     // installs the XDP/AF_XDP hook ahead of the protocol-stack
     // dispatch; same shape.
-    let bypass_iface = iface::primary()
-        .map(|s| s.name)
+    let ingress = _iface_name.and_then(iface::lookup);
+    let net_ns_id = ingress.as_ref().map_or(0, |entry| entry.net_ns_id);
+    let bypass_iface = ingress
+        .as_ref()
+        .map(|entry| entry.name.clone())
         .unwrap_or_else(|| alloc::string::String::from("eth0"));
     match crate::bypass::classifier::classify(&bypass_iface, frame) {
         crate::bypass::classifier::Verdict::Consumed => return,
@@ -130,14 +133,16 @@ pub fn rx_handler(iface_name: &str, frame: &[u8]) {
     }
 
     // AF_PACKET raw sockets see every frame before L3 dispatch.
-    crate::raw_sock::raw_pkt_deliver(frame, 1);
+    crate::raw_sock::raw_pkt_deliver_in(net_ns_id, frame, 1);
     let (eth, body) = match parse_eth_header(frame) {
         Some(t) => t,
         None => return,
     };
     match eth.ethertype {
         ETHERTYPE_ARP => handle_arp_on(body, _iface_name),
-        ETHERTYPE_IPV4 => handle_ipv4(body),
+        ETHERTYPE_IPV4 => {
+            handle_ipv4(body, net_ns_id, _iface_name.unwrap_or(""));
+        }
         _ => {}
     }
 }
@@ -191,7 +196,7 @@ pub fn handle_arp_on(body: &[u8], iface_name: Option<&str>) {
     let _ = ARP_OP_REPLY;
 }
 
-fn handle_ipv4(body: &[u8]) {
+fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
     // ── Netfilter PRE_ROUTING + LOCAL_IN dispatch ──
     //
     // The hooks only READ the packet (conntrack parses the tuple, filter
@@ -210,10 +215,11 @@ fn handle_ipv4(body: &[u8]) {
     }
     let mut ctx = crate::netfilter::PktCtx::new_ipv4_ref(
         crate::netfilter::HookPoint::PreRouting,
-        "",
+        iface_in,
         "",
         body,
-    );
+    )
+    .with_net_ns(net_ns_id);
     if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
         return;
     }

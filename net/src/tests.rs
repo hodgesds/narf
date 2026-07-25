@@ -49,6 +49,34 @@ kernel_test_in!(
     smoke_netfilter_authority_scope_rights_and_revocation
 );
 
+fn smoke_network_namespace_fib_isolation() -> TestResult {
+    use crate::ipv4::Ipv4Addr;
+    use crate::route::{Ipv4Net, Route, Scope, TABLE_MAIN};
+
+    crate::route::route_add(Route {
+        net_ns_id: 501,
+        dst: Ipv4Net {
+            addr: Ipv4Addr([203, 0, 113, 0]),
+            prefix_len: 24,
+        },
+        gateway: None,
+        iface: alloc::string::String::from("ns501-test"),
+        src_hint: Some(Ipv4Addr([203, 0, 113, 1])),
+        metric: 0,
+        scope: Scope::Link,
+        table: TABLE_MAIN,
+    });
+    let dst = Ipv4Addr([203, 0, 113, 9]);
+    if crate::route::route_lookup_raw_in(501, dst).is_none() {
+        return TestResult::Fail("owning namespace could not resolve its route");
+    }
+    if crate::route::route_lookup_raw_in(502, dst).is_some() {
+        return TestResult::Fail("route leaked into another network namespace");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/namespace", smoke_network_namespace_fib_isolation);
+
 fn smoke_net_loopback_register() -> TestResult {
     use crate::{bootstrap_authority, register_loopback_named, registry, Loopback};
 
@@ -5713,12 +5741,19 @@ fn smoke_admin_handle_is_interface_bound() -> TestResult {
     if admin.set_link(false).is_err()
         || admin.set_mtu(9000).is_err()
         || admin.set_mac([0x02, 0, 0, 0, 0, 2]).is_err()
+        || admin.move_to_net_ns(91).is_err()
     {
         return TestResult::Fail("authorized interface mutation failed");
     }
     let Some(snapshot) = crate::iface::lookup(name) else {
         return TestResult::Fail("controlled interface disappeared");
     };
+    if snapshot.net_ns_id != 91
+        || crate::iface::lookup_in(91, name).is_none()
+        || crate::iface::lookup_in(0, name).is_some()
+    {
+        return TestResult::Fail("interface move did not change namespace visibility");
+    }
     if snapshot.link_up || snapshot.mtu != 9000 || snapshot.mac != [0x02, 0, 0, 0, 0, 2] {
         return TestResult::Fail("admin mutations did not update interface state");
     }
@@ -6007,6 +6042,7 @@ fn smoke_route_lpm_specific_wins() -> TestResult {
 
     // /32 > /24 > /0
     route_add(Route {
+        net_ns_id: 0,
         dst: Ipv4Net {
             addr: Ipv4Addr([0, 0, 0, 0]),
             prefix_len: 0,
@@ -6019,6 +6055,7 @@ fn smoke_route_lpm_specific_wins() -> TestResult {
         table: TABLE_MAIN,
     });
     route_add(Route {
+        net_ns_id: 0,
         dst: Ipv4Net {
             addr: Ipv4Addr([192, 168, 1, 0]),
             prefix_len: 24,
@@ -6031,6 +6068,7 @@ fn smoke_route_lpm_specific_wins() -> TestResult {
         table: TABLE_MAIN,
     });
     route_add(Route {
+        net_ns_id: 0,
         dst: Ipv4Net {
             addr: Ipv4Addr([192, 168, 1, 1]),
             prefix_len: 32,
@@ -6069,6 +6107,7 @@ fn smoke_route_default_fallback() -> TestResult {
 
     __reset_for_test();
     route_add(Route {
+        net_ns_id: 0,
         dst: Ipv4Net {
             addr: Ipv4Addr([0, 0, 0, 0]),
             prefix_len: 0,
@@ -6167,6 +6206,7 @@ fn smoke_src_selection_via_gateway() -> TestResult {
     ifaddr_reset();
     iface_add_addr("eth0", Ipv4Addr([192, 168, 1, 10]), 24);
     route_add(Route {
+        net_ns_id: 0,
         dst: Ipv4Net {
             addr: Ipv4Addr([0, 0, 0, 0]),
             prefix_len: 0,

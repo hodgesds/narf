@@ -226,6 +226,13 @@ exact namespace id and explicit read/ruleset/conntrack/NAT operation rights;
 namespace membership, uid, and Linux ambient capability bits are not
 authority.
 
+Physical interfaces carry one owning network-namespace id. Moving an
+interface requires its live interface-bound `AdminHandle`; afterward namespace
+filtered lookup hides it from the source namespace and ingress packets inherit
+the destination namespace before AF_PACKET delivery and PRE_ROUTING. IPv4 FIB
+entries are keyed by namespace as well as destination/interface/table, so
+longest-prefix lookup cannot select another namespace's route.
+
 `NETLINK_AUDIT` reports a disabled zeroed `audit_status` for `AUDIT_GET` and
 an empty completed `AUDIT_LIST_RULES` dump. `AUDIT_SET` returns `EPERM`
 because Linux uid and capability bits do not confer NARF audit authority.

@@ -87,6 +87,8 @@ pub const TABLE_DEFAULT: u8 = 253;
 /// A single routing table entry.
 #[derive(Clone, Debug)]
 pub struct Route {
+    /// Network namespace that owns this FIB entry.
+    pub net_ns_id: u64,
     /// Destination network (address + prefix length).
     pub dst: Ipv4Net,
     /// Next-hop router. `None` means the destination is directly connected
@@ -134,7 +136,12 @@ static ROUTE_TABLE: IrqSafeSpinLock<Vec<Route>> = IrqSafeSpinLock::new(Vec::new(
 pub fn route_add(route: Route) {
     let mut g = ROUTE_TABLE.lock();
     // Hard cutover: remove any exact-match (dst, iface, table).
-    g.retain(|r| !(r.dst == route.dst && r.iface == route.iface && r.table == route.table));
+    g.retain(|r| {
+        !(r.net_ns_id == route.net_ns_id
+            && r.dst == route.dst
+            && r.iface == route.iface
+            && r.table == route.table)
+    });
     g.push(route);
     // Sort: longest prefix first; break ties by metric ascending.
     g.sort_by(|a, b| {
@@ -147,18 +154,39 @@ pub fn route_add(route: Route) {
 
 /// Delete the first route whose (dst, iface, table) matches.
 pub fn route_delete(dst: Ipv4Net, iface_name: &str, table: u8) {
+    route_delete_in(0, dst, iface_name, table);
+}
+
+pub fn route_delete_in(net_ns_id: u64, dst: Ipv4Net, iface_name: &str, table: u8) {
     let mut g = ROUTE_TABLE.lock();
-    if let Some(pos) = g
-        .iter()
-        .position(|r| r.dst == dst && r.iface == iface_name && r.table == table)
-    {
+    if let Some(pos) = g.iter().position(|r| {
+        r.net_ns_id == net_ns_id && r.dst == dst && r.iface == iface_name && r.table == table
+    }) {
         g.remove(pos);
     }
 }
 
 /// Snapshot of all routes (cheapest debug / test tool).
 pub fn route_list() -> Vec<Route> {
-    ROUTE_TABLE.lock().clone()
+    route_list_in(0)
+}
+
+pub fn route_list_in(net_ns_id: u64) -> Vec<Route> {
+    ROUTE_TABLE
+        .lock()
+        .iter()
+        .filter(|route| route.net_ns_id == net_ns_id)
+        .cloned()
+        .collect()
+}
+
+/// Re-home every route whose egress device is being moved to another network
+/// namespace. Called in the same interface-admin transaction as ownership.
+pub(crate) fn move_iface_routes(iface_name: &str, net_ns_id: u64) {
+    let mut routes = ROUTE_TABLE.lock();
+    for route in routes.iter_mut().filter(|route| route.iface == iface_name) {
+        route.net_ns_id = net_ns_id;
+    }
 }
 
 /// Snapshot of one route in the form `/proc/net/route` expects.
@@ -181,9 +209,13 @@ pub struct RouteSnapshot {
 
 /// Snapshot the routing table in `/proc/net/route` row shape.
 pub fn snapshot() -> Vec<RouteSnapshot> {
+    snapshot_in(0)
+}
+
+pub fn snapshot_in(net_ns_id: u64) -> Vec<RouteSnapshot> {
     let g = ROUTE_TABLE.lock();
-    let mut out = Vec::with_capacity(g.len());
-    for r in g.iter() {
+    let mut out = Vec::new();
+    for r in g.iter().filter(|route| route.net_ns_id == net_ns_id) {
         // RTF_UP is always set; RTF_GATEWAY when a gateway exists.
         let mut flags: u16 = 0x0001;
         if r.gateway.is_some() {
@@ -217,8 +249,14 @@ pub fn snapshot() -> Vec<RouteSnapshot> {
 /// Ref: Linux `fib_table_lookup()` in `net/ipv4/fib_trie.c` — same
 /// semantics, much simpler implementation.
 pub fn route_lookup_raw(ip: Ipv4Addr) -> Option<Route> {
+    route_lookup_raw_in(0, ip)
+}
+
+pub fn route_lookup_raw_in(net_ns_id: u64, ip: Ipv4Addr) -> Option<Route> {
     let g = ROUTE_TABLE.lock();
-    g.iter().find(|r| r.dst.contains(ip)).cloned()
+    g.iter()
+        .find(|r| r.net_ns_id == net_ns_id && r.dst.contains(ip))
+        .cloned()
 }
 
 /// Full lookup: returns a `RouteResult` with the egress iface, nexthop
@@ -229,7 +267,11 @@ pub fn route_lookup_raw(ip: Ipv4Addr) -> Option<Route> {
 /// 2. An address on the egress iface that covers the nexthop / dst.
 /// 3. The first address on the egress iface.
 pub fn route_lookup(dst: Ipv4Addr) -> Option<RouteResult> {
-    let route = route_lookup_raw(dst)?;
+    route_lookup_in(0, dst)
+}
+
+pub fn route_lookup_in(net_ns_id: u64, dst: Ipv4Addr) -> Option<RouteResult> {
+    let route = route_lookup_raw_in(net_ns_id, dst)?;
     let nexthop = route.gateway.unwrap_or(dst);
     let src = choose_src(&route, nexthop, dst);
     Some(RouteResult {
@@ -263,6 +305,7 @@ pub fn install_connected_route(iface_name: &str, addr: Ipv4Addr, prefix_len: u8)
         prefix_len,
     };
     route_add(Route {
+        net_ns_id: crate::iface::lookup(iface_name).map_or(0, |iface| iface.net_ns_id),
         dst,
         gateway: None, // direct delivery
         iface: String::from(iface_name),
@@ -289,6 +332,7 @@ pub fn remove_connected_route(iface_name: &str, addr: Ipv4Addr, prefix_len: u8) 
 /// network init after the loopback interface is registered. Idempotent.
 pub fn install_loopback_route() {
     route_add(Route {
+        net_ns_id: 0,
         dst: Ipv4Net {
             addr: Ipv4Addr([127, 0, 0, 0]),
             prefix_len: 8,

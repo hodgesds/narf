@@ -388,9 +388,8 @@ pub struct SocketFile {
     pending_error: IrqSafeSpinLock<Option<SockError>>,
     /// Network-namespace id this socket belongs to (0 = host/default
     /// netns). Stamped by `sys_socket` from the creator's net-ns at
-    /// socket() time. Used ONLY to key the AF_INET bind/port tables so
-    /// two processes in different net-ns can both bind the same
-    /// (addr, port); the per-packet NIC path is untouched.
+    /// socket() time. Keys AF_INET bind tables and selects namespace-scoped
+    /// netlink, routing, interface, and netfilter views.
     net_ns_id: core::sync::atomic::AtomicU64,
     /// Credentials of the process that owns this socket end. Stamped by
     /// `sys_socket`/`sys_socketpair` at creation; surfaced to the peer via
@@ -775,6 +774,9 @@ impl SocketFile {
             return Err(SockError::InvalidArg);
         }
         admin.check_live().map_err(|_| SockError::InvalidArg)?;
+        if admin.net_ns_id().map_err(|_| SockError::InvalidArg)? != self.net_ns_id() {
+            return Err(SockError::InvalidArg);
+        }
         *self.netlink_admin.lock() = Some(admin);
         Ok(())
     }
@@ -1774,7 +1776,8 @@ impl SocketFile {
                 self.ensure_netlink_portid();
                 let sent = buf.len() as u64;
                 let admin = self.netlink_admin.lock().clone();
-                let msgs = match narf_net::netlink_route::build_replies_with_options(
+                let msgs = match narf_net::netlink_route::build_replies_with_options_in(
+                    self.net_ns_id(),
                     buf,
                     admin.as_ref(),
                     narf_net::netlink_route::ReplyOptions {
