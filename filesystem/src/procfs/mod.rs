@@ -110,6 +110,14 @@ pub struct ProcVma {
     /// Optional Linux-style label (`[heap]`, `[stack]`, `[vdso]`).
     /// Empty for anonymous mappings.
     pub label: &'static str,
+    /// Linux MPOL_* mode and effective node mask for numa_maps.
+    pub numa_policy: u32,
+    pub numa_nodemask: u64,
+    /// Resident 4 KiB page equivalents by node.
+    pub numa_node_pages: [u64; 16],
+    pub resident_pages: u64,
+    /// Hardware translation leaf size.
+    pub kernel_page_kb: u64,
 }
 
 type CurrentPidFn = fn() -> u64;
@@ -963,6 +971,7 @@ enum PidField {
     Status,
     Cmdline,
     Maps,
+    NumaMaps,
     Comm,
 }
 
@@ -994,6 +1003,7 @@ impl FileOps for ProcPidFile {
                 PidField::Status => render_status(&info),
                 PidField::Cmdline => return slice_read(&info.cmdline, offset, buf),
                 PidField::Maps => render_maps(&info),
+                PidField::NumaMaps => render_numa_maps(&info),
                 PidField::Comm => format!("{}\n", info.comm),
             };
             slice_read(body.as_bytes(), offset, buf)
@@ -1116,6 +1126,7 @@ impl DirOps for ProcPidDir {
             "status" => PidField::Status,
             "cmdline" => PidField::Cmdline,
             "maps" => PidField::Maps,
+            "numa_maps" => PidField::NumaMaps,
             "comm" => PidField::Comm,
             _ => {
                 return pid_ext::lookup_pid_ext(self.pid, name)
@@ -1155,6 +1166,10 @@ impl DirOps for ProcPidDir {
                 },
                 DirEntry {
                     name: "maps",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "numa_maps",
                     file_type: FileType::File,
                 },
                 DirEntry {
@@ -2252,6 +2267,58 @@ fn render_maps(info: &ProcTaskInfo) -> String {
     s
 }
 
+fn render_numa_maps(info: &ProcTaskInfo) -> String {
+    let mut s = String::new();
+    for v in &info.vmas {
+        let policy = match v.numa_policy & 0x0fff {
+            0 => "default",
+            1 => "prefer",
+            2 => "bind",
+            3 => "interleave",
+            4 => "local",
+            _ => "default",
+        };
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{:x} {policy}", v.start));
+        if matches!(v.numa_policy & 0x0fff, 1..=3) && v.numa_nodemask != 0 {
+            let _ = core::fmt::Write::write_fmt(
+                &mut s,
+                format_args!(":{}", format_node_list(v.numa_nodemask)),
+            );
+        }
+        if !v.label.is_empty() {
+            let label = v.label.trim_matches(['[', ']']);
+            let _ = core::fmt::Write::write_fmt(&mut s, format_args!(" {label}"));
+        } else if v.resident_pages != 0 {
+            let _ = core::fmt::Write::write_fmt(&mut s, format_args!(" anon={}", v.resident_pages));
+        }
+        for (node, pages) in v.numa_node_pages.iter().copied().enumerate() {
+            if pages != 0 {
+                let _ = core::fmt::Write::write_fmt(&mut s, format_args!(" N{node}={pages}"));
+            }
+        }
+        let _ = core::fmt::Write::write_fmt(
+            &mut s,
+            format_args!(" kernelpagesize_kB={}\n", v.kernel_page_kb),
+        );
+    }
+    s
+}
+
+fn format_node_list(mut mask: u64) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    while mask != 0 {
+        let node = mask.trailing_zeros();
+        mask &= !(1u64 << node);
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{node}"));
+    }
+    out
+}
+
 // ── Framework smokes ────────────────────────────────────────────
 
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -2554,6 +2621,11 @@ fn smoke_pid_stat_real_fields() -> TestResult {
             executable: false,
             shared: false,
             label: "",
+            numa_policy: 2,
+            numa_nodemask: 0b11,
+            numa_node_pages: [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            resident_pages: 2,
+            kernel_page_kb: 4,
         }],
         ppid: 2,
         pgrp: 3,
@@ -2580,6 +2652,13 @@ fn smoke_pid_stat_real_fields() -> TestResult {
     }
     if f[21] != "6" || f[22] != "8192" || f[23] != "2" {
         return TestResult::Fail("starttime/vsize/rss must land in fields 22-24");
+    }
+    let numa = render_numa_maps(&info);
+    if !numa.contains("1000 bind:0,1")
+        || !numa.contains("N0=2")
+        || !numa.contains("kernelpagesize_kB=4")
+    {
+        return TestResult::Fail("numa_maps residency/policy fields wrong");
     }
     TestResult::Pass
 }

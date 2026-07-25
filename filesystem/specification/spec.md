@@ -108,6 +108,9 @@ nodes; shared mappings remain unmoved without explicit MOVE_ALL authority.
 
 `/proc/numastat` exposes live per-node allocation events supplied by
 `memory/`: hit, miss, foreign, interleave-hit, local, and other counters.
+`/proc/<pid>/numa_maps` reports each registered base-page or hardware
+huge-page region's effective policy, resident base-page equivalents grouped
+by SRAT node, and actual translation-leaf size.
 `/sys/devices/system/node/nodeN/{meminfo,numastat,vmstat}` exposes stable
 managed totals, live free/used pages, and the corresponding node-local
 event counters.

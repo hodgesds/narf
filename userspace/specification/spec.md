@@ -88,6 +88,9 @@ returns backing to its per-node pool, and `fork` eagerly copies private huge
 mappings on their original nodes. File-backed hugetlbfs and shared huge
 mappings fail explicitly because NARF has no hugetlbfs or shared-huge refcount
 contract.
+The procfs task snapshot includes both base-page and hardware huge-page
+regions with effective policy and per-node residency for
+`/proc/<pid>/numa_maps`.
 
 Bootstrap: every new process receives two ring pairs (submit + complete)
 for the kernel ABI plus a read-only config page with capability

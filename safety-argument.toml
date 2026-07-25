@@ -9,6 +9,10 @@ argument = "Range conformance, BIND home-node selection, NUMA event accounting, 
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
+argument = "NUMA procfs reporting copies only virtual metadata and aggregate node counts while the address-space region locks are held; it never exports physical addresses, clones HugeFrame ownership, or changes mapping/domain rights."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
 argument = "Huge mappings validate virtual/physical alignment before installing architecture leaves, retain authoritative frame ownership in AddressSpace, invalidate translations before returning frames to the pool, and preserve W^X plus NUMA/cpuset selection without changing domain assignment."
 
 [[invariants_preserved]]

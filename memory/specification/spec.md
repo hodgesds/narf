@@ -114,6 +114,8 @@ impl AddressSpace {
         -> Result<(), AddressSpaceError>;
     /// Test membership across both base-page and hardware huge-page regions.
     pub fn contains_address(&self, vaddr: VirtAddr) -> bool;
+    /// Non-owning per-region resident-page counts grouped by SRAT node.
+    pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot>;
 }
 
 impl AddressSpace {

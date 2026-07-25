@@ -101,6 +101,12 @@ int main(void) {
             w("numa-fail: hugetlb-placement\n");
             return 1;
         }
+        char maps[8192];
+        if (slurp("/proc/self/numa_maps", maps, sizeof maps) <= 0 ||
+            !has(maps, "kernelpagesize_kB=2048")) {
+            w("numa-fail: hugetlb-numa-maps\n");
+            return 1;
+        }
         if (munmap(hp, 2 * 1024 * 1024) != 0) {
             w("numa-fail: hugetlb-munmap\n");
             return 1;

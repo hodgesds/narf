@@ -51,7 +51,9 @@ pub mod zpool;
 
 mod tests;
 
-pub use address_space::{AddressSpace, AddressSpaceError, HugeRegion, Region, RegionPerms};
+pub use address_space::{
+    AddressSpace, AddressSpaceError, HugeRegion, NumaRegionSnapshot, Region, RegionPerms,
+};
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

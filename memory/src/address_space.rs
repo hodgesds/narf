@@ -126,6 +126,20 @@ pub struct HugeRegion {
     pub frames: Vec<crate::hugepage::HugeFrame>,
 }
 
+/// Non-owning NUMA residency summary for one registered virtual region.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct NumaRegionSnapshot {
+    pub base: VirtAddr,
+    pub len: u64,
+    pub perms: RegionPerms,
+    /// Hardware leaf size in KiB (4, 2048, or 1048576).
+    pub kernel_page_kb: u64,
+    /// Resident base-page equivalents, excluding lazy/unbacked slots.
+    pub resident_pages: u64,
+    /// Resident base-page equivalents per SRAT node.
+    pub node_pages: [u64; crate::frame::MAX_NUMA_NODES],
+}
+
 fn release_failed_huge_region(
     region: HugeRegion,
     error: AddressSpaceError,
@@ -1121,6 +1135,64 @@ impl AddressSpace {
             let base = region.base.as_u64();
             v >= base && v < base.saturating_add(region.len)
         })
+    }
+
+    /// Snapshot region-level NUMA residency without cloning or transferring
+    /// ownership of any physical backing.
+    pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot> {
+        let mut out = Vec::new();
+        {
+            let huge = self.huge_regions.lock();
+            out.reserve(huge.len());
+            for region in huge.iter() {
+                let page_bytes = match region.size {
+                    crate::hugepage::HugeSize::M2 => crate::hugepage::HUGEPAGE_2M_BYTES,
+                    crate::hugepage::HugeSize::G1 => crate::hugepage::HUGEPAGE_1G_BYTES,
+                };
+                let pages_per_leaf = page_bytes >> 12;
+                let mut node_pages = [0u64; crate::frame::MAX_NUMA_NODES];
+                for frame in &region.frames {
+                    let node = frame.node();
+                    node_pages[node] = node_pages[node].saturating_add(pages_per_leaf);
+                }
+                out.push(NumaRegionSnapshot {
+                    base: region.base,
+                    len: region.len,
+                    perms: region.perms,
+                    kernel_page_kb: page_bytes >> 10,
+                    resident_pages: region.frames.len() as u64 * pages_per_leaf,
+                    node_pages,
+                });
+            }
+        }
+        {
+            let regions = self.regions.lock();
+            out.reserve(regions.len());
+            for region in regions.iter() {
+                let mut node_pages = [0u64; crate::frame::MAX_NUMA_NODES];
+                let mut resident_pages = 0u64;
+                for phys in &region.phys {
+                    if phys.raw() == 0 {
+                        continue;
+                    }
+                    // SAFETY: a non-zero Region backing slot denotes a live
+                    // physical frame owned or borrowed by this address space.
+                    let node = unsafe { crate::frame::narf_phys_node(phys.raw()) };
+                    node_pages[node] = node_pages[node].saturating_add(1);
+                    resident_pages += 1;
+                }
+                out.push(NumaRegionSnapshot {
+                    base: region.base,
+                    len: region.len,
+                    perms: region.perms,
+                    kernel_page_kb: 4,
+                    resident_pages,
+                    node_pages,
+                });
+            }
+        }
+        out.sort_by_key(|region| region.base.as_u64());
+        out
     }
 
     /// Demand-paging entry point — called from the user-mode #PF

@@ -10537,10 +10537,13 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
             }
         })
     {
-        for r in as_arc.regions_snapshot() {
+        for r in as_arc.numa_regions_snapshot() {
             let base = r.base.as_u64();
             let end = base + r.len;
             let prot = r.perms.prot_only();
+            let policy = resolve_policy(tid, base);
+            let effective_nodemask =
+                mpol_effective_nodemask(policy, narf_scheduler::task_mems_allowed(tid));
             let label: &'static str = if base == crate::process::DEFAULT_USER_STACK_BASE {
                 "[stack]"
             } else if base == 0x8000_0000_0000_u64
@@ -10562,6 +10565,11 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
                 // SHARED bit. Feeds maps' s/p column + statm's shared.
                 shared: r.perms.contains(RegionPerms::SHARED),
                 label,
+                numa_policy: policy.mode,
+                numa_nodemask: effective_nodemask,
+                numa_node_pages: r.node_pages,
+                resident_pages: r.resident_pages,
+                kernel_page_kb: r.kernel_page_kb,
             });
         }
     }
