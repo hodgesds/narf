@@ -228,6 +228,7 @@ kernel-test  = [
     "narf-bluetooth/kernel-test",
     "narf-edid/kernel-test",
     "narf-efi/kernel-test",
+    "narf-boot/kernel-test",
     "narf-hid/kernel-test",
     "narf-pinctrl/kernel-test",
     "narf-usbpd/kernel-test",

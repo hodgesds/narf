@@ -24,7 +24,7 @@
 
 use narf_memory::PhysAddr;
 
-use crate::info::{FramebufferInfo, MemRegion, MemRegionKind};
+use crate::info::{BootError, FramebufferInfo, MemRegion, MemRegionKind};
 
 /// Magic the bootloader places in EAX when launching us via the
 /// multiboot2 protocol.
@@ -128,9 +128,13 @@ impl Iterator for TagIter {
 /// # Safety
 /// - `info_ptr` must point at a valid multiboot2 info struct.
 /// - `out` must be writable for `out_cap` `MemRegion` entries.
-pub unsafe fn parse_memory_map(info_ptr: usize, out: *mut MemRegion, out_cap: usize) -> usize {
+pub unsafe fn parse_memory_map(
+    info_ptr: usize,
+    out: *mut MemRegion,
+    out_cap: usize,
+) -> Result<usize, BootError> {
     if out_cap == 0 {
-        return 0;
+        return Err(BootError::MalformedBootInfo);
     }
     // SAFETY: caller contract.
     for (ty, size, payload) in unsafe { TagIter::new(info_ptr) } {
@@ -141,12 +145,18 @@ pub unsafe fn parse_memory_map(info_ptr: usize, out: *mut MemRegion, out_cap: us
         // then iterate entries up to (size - 16) / entry_size.
         // SAFETY: Valid memory or trusted environment
         let prefix = unsafe { ((payload - 8) as *const MmapTagPrefix).read_unaligned() };
-        if prefix.entry_size as usize == 0 {
-            return 0;
+        if (prefix.entry_size as usize) < core::mem::size_of::<MmapEntry>() || size < 16 {
+            return Err(BootError::MalformedBootInfo);
         }
         let body = payload + 8; // skip entry_size + entry_version
         let body_len = (size as usize).saturating_sub(16);
-        let n = (body_len / prefix.entry_size as usize).min(out_cap);
+        if body_len % prefix.entry_size as usize != 0 {
+            return Err(BootError::MalformedBootInfo);
+        }
+        let n = body_len / prefix.entry_size as usize;
+        if n > out_cap {
+            return Err(BootError::MemoryMapTooLarge);
+        }
         for i in 0..n {
             let entry_ptr = body + i * prefix.entry_size as usize;
             // SAFETY: bounds-checked.
@@ -166,9 +176,9 @@ pub unsafe fn parse_memory_map(info_ptr: usize, out: *mut MemRegion, out_cap: us
                 });
             }
         }
-        return n;
+        return Ok(n);
     }
-    0
+    Err(BootError::MalformedBootInfo)
 }
 
 /// Return the RSDP physical address. Prefers the ACPI v2+ tag (15)

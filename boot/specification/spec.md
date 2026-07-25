@@ -26,7 +26,11 @@ reach the hand-off (that's `frame/`), paging after hand-off (`memory/`).
 ## 3. Public interface
 
 ```rust
-pub struct RawBootInfo;       // bootloader-supplied, untrusted
+#[repr(C)]
+pub struct RawBootInfo {      // bootloader-supplied, untrusted
+    pub magic: u64,
+    pub payload: PhysAddr,
+}
 
 pub struct BootInfo {         // post-validation, trusted
     pub memory_map: &'static [MemRegion],
@@ -37,22 +41,34 @@ pub struct BootInfo {         // post-validation, trusted
     pub uart_virt: VirtAddr,  // for console::remap_to_virtual (set by memory/ during MMU bringup)
 }
 
-pub fn validate_boot_info(raw: &RawBootInfo) -> Result<BootInfo, BootError>;
+pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError>;
+pub fn validate_memory_map(map: &[MemRegion]) -> Result<(), BootError>;
 #[no_mangle] pub extern "C" fn _start() -> !; // per-arch entry
 ```
 
-**`validate_boot_info` checks (binding):**
+**Handoff validation checks (binding):**
 
-1. No overlapping memory-map regions.
-2. At least one usable RAM region ≥ 1 MiB (a smaller RAM-only system
+1. Every retained memory-map region is non-empty, its end address does
+   not overflow, and no two retained regions overlap.
+2. The bootloader's advertised map must fit the architecture's bounded
+   early-boot storage. Overflow is rejected, never silently truncated.
+3. At least one usable RAM region ≥ 1 MiB (a smaller RAM-only system
    cannot boot NARF).
-3. RSDP pointer, if present, falls within a firmware-reserved region
-   in the memory map.
-4. DTB pointer, if present, has valid magic (`0xD00DFEED`) and a
+4. An RSDP pointer is accepted only from a protocol-defined field:
+   PVH's `rsdp_paddr` or a bounded Multiboot2 ACPI tag. The ACPI
+   subsystem validates the RSDP signature, length, and checksum before
+   following any child table.
+5. A DTB pointer, if present, has valid magic (`0xD00DFEED`) and a
    sane total size (≤ 2 MiB).
-5. Memory map regions are page-aligned.
-6. Reserved regions cover the kernel's own image and the bootloader's
-   reserved areas — overlap with usable RAM is rejected.
+6. FDT `/memreserve/`, `/reserved-memory`, DTB storage, and initramfs
+   storage are subtracted before usable RAM is exposed.
+7. The kernel image is excluded independently using linker-provided
+   physical bounds when `frame/` initializes the allocator. This is
+   necessary for PVH/E820 maps, which legitimately describe the
+   loaded kernel's containing RAM range as usable.
+
+Raw PC firmware maps need not be page-aligned. Allocators round usable
+range starts up and ends down before issuing frames.
 
 A failed validation panics in `boot/` *before* any subsystem
 consumes the data; this prevents a malicious or buggy bootloader

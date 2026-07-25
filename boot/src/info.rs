@@ -3,7 +3,7 @@
 use narf_memory::{PhysAddr, VirtAddr};
 
 /// A single region in the firmware memory map.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MemRegion {
     pub start: PhysAddr,
     pub len: u64,
@@ -89,14 +89,106 @@ pub struct FramebufferInfo {
     pub bpp: u8,
 }
 
-/// Errors from `validate_boot_info`. Stage 1 raises `BadMagic` and
-/// `NoUsableRam`; the rest are scaffolding for later checks.
-#[derive(Copy, Clone, Debug)]
+/// Errors from bootloader handoff parsing and validation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BootError {
     BadMagic,
     NoUsableRam,
+    EmptyRegion,
     OverlappingRegions,
     BadDtbMagic,
-    MisalignedRegion,
-    KernelOverlapsUsable,
+    AddressOverflow,
+    MemoryMapTooLarge,
+    MalformedBootInfo,
+}
+
+/// Validate the normalized memory map before any allocator consumes it.
+///
+/// Firmware maps are not required to describe every reserved hole, but
+/// entries that are present must be non-empty, non-wrapping, and mutually
+/// disjoint. Allocation code rounds usable ranges to page boundaries.
+pub fn validate_memory_map(regions: &[MemRegion]) -> Result<(), BootError> {
+    let mut any_usable = false;
+    for (i, region) in regions.iter().enumerate() {
+        if region.len == 0 {
+            return Err(BootError::EmptyRegion);
+        }
+        let end = region
+            .start
+            .raw()
+            .checked_add(region.len)
+            .ok_or(BootError::AddressOverflow)?;
+        any_usable |= region.kind == MemRegionKind::Usable && region.len >= 1024 * 1024;
+
+        for other in &regions[..i] {
+            let other_end = other
+                .start
+                .raw()
+                .checked_add(other.len)
+                .ok_or(BootError::AddressOverflow)?;
+            if region.start.raw() < other_end && other.start.raw() < end {
+                return Err(BootError::OverlappingRegions);
+            }
+        }
+    }
+    if !any_usable {
+        return Err(BootError::NoUsableRam);
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn region(start: u64, len: u64, kind: MemRegionKind) -> MemRegion {
+        MemRegion {
+            start: PhysAddr::new(start),
+            len,
+            kind,
+        }
+    }
+
+    fn smoke_validates_disjoint_firmware_map() -> TestResult {
+        let map = [
+            region(0, 0x10_0000, MemRegionKind::Reserved),
+            region(0x10_0000, 0x40_0000, MemRegionKind::Usable),
+        ];
+        if validate_memory_map(&map) == Ok(()) {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("valid disjoint firmware map rejected")
+        }
+    }
+    kernel_test_in!("boot/info", smoke_validates_disjoint_firmware_map);
+
+    fn smoke_rejects_invalid_firmware_maps() -> TestResult {
+        let overlap = [
+            region(0x10_0000, 0x20_0000, MemRegionKind::Usable),
+            region(0x20_0000, 0x10_0000, MemRegionKind::Reserved),
+        ];
+        if validate_memory_map(&overlap) != Err(BootError::OverlappingRegions) {
+            return TestResult::Fail("overlapping firmware map accepted");
+        }
+        if validate_memory_map(&[region(0, 0, MemRegionKind::Reserved)])
+            != Err(BootError::EmptyRegion)
+        {
+            return TestResult::Fail("empty firmware region accepted");
+        }
+        if validate_memory_map(&[
+            region(0, 0x10_0000, MemRegionKind::Usable),
+            region(u64::MAX - 1, 4, MemRegionKind::Reserved),
+        ]) != Err(BootError::AddressOverflow)
+        {
+            return TestResult::Fail("wrapping firmware region accepted");
+        }
+        if validate_memory_map(&[region(0, 0x80_000, MemRegionKind::Usable)])
+            != Err(BootError::NoUsableRam)
+        {
+            return TestResult::Fail("tiny-only usable map accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("boot/info", smoke_rejects_invalid_firmware_maps);
 }

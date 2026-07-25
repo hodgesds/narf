@@ -6,7 +6,9 @@
 
 use narf_memory::{PhysAddr, VirtAddr};
 
-use crate::info::{BootError, BootInfo, MemRegion, MemRegionKind, RawBootInfo};
+use crate::info::{
+    validate_memory_map, BootError, BootInfo, MemRegion, MemRegionKind, RawBootInfo,
+};
 use narf_firmware_fdt::{Reservation, ReservedRegion};
 
 /// DTB magic per Devicetree Specification (big-endian on the wire).
@@ -25,7 +27,8 @@ static mut MEMORY_MAP: [MemRegion; MAX_MEM_REGIONS] = [MemRegion {
 }; MAX_MEM_REGIONS];
 static mut MEMORY_MAP_LEN: usize = 0;
 
-static mut CMDLINE_BYTES: [u8; 256] = [0; 256];
+const CMDLINE_CAP: usize = 256;
+static mut CMDLINE_BYTES: [u8; CMDLINE_CAP] = [0; CMDLINE_CAP];
 static mut CMDLINE_LEN: usize = 0;
 
 /// Parse a Linux-compatible U-Boot-style FDT handoff.
@@ -100,29 +103,32 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         let reserved_len =
             narf_firmware_fdt::copy_reserved_memory_ranges(blob, &mut reserved_nodes);
         for node in reserved_nodes[..reserved_len].iter() {
-            if reservation_len < reservations.len() {
-                reservations[reservation_len] = Reservation {
-                    addr: node.addr,
-                    size: node.size,
-                };
-                reservation_len += 1;
+            if reservation_len == reservations.len() {
+                return Err(BootError::MemoryMapTooLarge);
             }
-        }
-        if reservation_len < reservations.len() {
             reservations[reservation_len] = Reservation {
-                addr: dtb_phys.expect("DTB slice requires physical address").raw(),
-                size: blob.len() as u64,
+                addr: node.addr,
+                size: node.size,
             };
             reservation_len += 1;
         }
+        if reservation_len == reservations.len() {
+            return Err(BootError::MemoryMapTooLarge);
+        }
+        reservations[reservation_len] = Reservation {
+            addr: dtb_phys.expect("DTB slice requires physical address").raw(),
+            size: blob.len() as u64,
+        };
+        reservation_len += 1;
         if let Some(initrd) = initramfs {
-            if reservation_len < reservations.len() {
-                reservations[reservation_len] = Reservation {
-                    addr: initrd.start.raw(),
-                    size: initrd.len,
-                };
-                reservation_len += 1;
+            if reservation_len == reservations.len() {
+                return Err(BootError::MemoryMapTooLarge);
             }
+            reservations[reservation_len] = Reservation {
+                addr: initrd.start.raw(),
+                size: initrd.len,
+            };
+            reservation_len += 1;
         }
         // SAFETY: single-threaded boot path owns the static output.
         unsafe {
@@ -131,7 +137,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
                 &reservations[..reservation_len],
                 &mut *core::ptr::addr_of_mut!(MEMORY_MAP),
                 &mut *core::ptr::addr_of_mut!(MEMORY_MAP_LEN),
-            );
+            )?;
         }
         // A present `/memory` node is not sufficient if firmware
         // reservations consume every byte.
@@ -141,11 +147,12 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         }
         if let Some(args) = narf_firmware_fdt::chosen_bootargs(blob) {
             let bytes = args.as_bytes();
+            let len = bytes.len().min(CMDLINE_CAP - 1);
             // SAFETY: single-threaded boot initialization.
             unsafe {
                 let dst = &mut *core::ptr::addr_of_mut!(CMDLINE_BYTES);
-                dst[..bytes.len()].copy_from_slice(bytes);
-                core::ptr::addr_of_mut!(CMDLINE_LEN).write(bytes.len());
+                dst[..len].copy_from_slice(&bytes[..len]);
+                core::ptr::addr_of_mut!(CMDLINE_LEN).write(len);
             }
         }
         // SAFETY: the static map was initialized immediately above.
@@ -181,6 +188,8 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         core::str::from_utf8_unchecked(bytes)
     };
 
+    validate_memory_map(regions)?;
+
     Ok(BootInfo {
         memory_map: regions,
         cmdline,
@@ -208,7 +217,7 @@ fn normalize_memory_map(
     reserved: &[Reservation],
     out: &mut [MemRegion; MAX_MEM_REGIONS],
     out_len: &mut usize,
-) {
+) -> Result<(), BootError> {
     *out_len = 0;
     for range in memory {
         let mut pieces = [Reservation::default(); MAX_MEM_REGIONS];
@@ -218,26 +227,39 @@ fn normalize_memory_map(
             if cut.size == 0 {
                 continue;
             }
-            let cut_end = cut.addr.saturating_add(cut.size);
+            let cut_end = cut
+                .addr
+                .checked_add(cut.size)
+                .ok_or(BootError::AddressOverflow)?;
             let mut next = [Reservation::default(); MAX_MEM_REGIONS];
             let mut next_len = 0;
             for piece in pieces[..piece_len].iter() {
-                let end = piece.addr.saturating_add(piece.size);
+                let end = piece
+                    .addr
+                    .checked_add(piece.size)
+                    .ok_or(BootError::AddressOverflow)?;
                 if cut_end <= piece.addr || cut.addr >= end {
-                    if next_len < next.len() {
-                        next[next_len] = *piece;
-                        next_len += 1;
+                    if next_len == next.len() {
+                        return Err(BootError::MemoryMapTooLarge);
                     }
+                    next[next_len] = *piece;
+                    next_len += 1;
                     continue;
                 }
-                if cut.addr > piece.addr && next_len < next.len() {
+                if cut.addr > piece.addr {
+                    if next_len == next.len() {
+                        return Err(BootError::MemoryMapTooLarge);
+                    }
                     next[next_len] = Reservation {
                         addr: piece.addr,
                         size: cut.addr - piece.addr,
                     };
                     next_len += 1;
                 }
-                if cut_end < end && next_len < next.len() {
+                if cut_end < end {
+                    if next_len == next.len() {
+                        return Err(BootError::MemoryMapTooLarge);
+                    }
                     next[next_len] = Reservation {
                         addr: cut_end,
                         size: end - cut_end,
@@ -249,7 +271,10 @@ fn normalize_memory_map(
             piece_len = next_len;
         }
         for piece in pieces[..piece_len].iter() {
-            if piece.size != 0 && *out_len < out.len() {
+            if piece.size != 0 {
+                if *out_len == out.len() {
+                    return Err(BootError::MemoryMapTooLarge);
+                }
                 out[*out_len] = MemRegion {
                     start: PhysAddr::new(piece.addr),
                     len: piece.size,
@@ -259,6 +284,7 @@ fn normalize_memory_map(
             }
         }
     }
+    Ok(())
 }
 
 /// FDT structure-block tokens (Devicetree Specification §5.4.1).

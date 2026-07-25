@@ -635,6 +635,7 @@ name = "narf-boot"
 version = "0.0.0"
 dependencies = [
  "narf-firmware-fdt",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
 ]

@@ -5,7 +5,9 @@ pub mod pvh;
 
 use narf_memory::{PhysAddr, VirtAddr};
 
-use crate::info::{BootError, BootInfo, MemRegion, MemRegionKind, RawBootInfo};
+use crate::info::{
+    validate_memory_map, BootError, BootInfo, MemRegion, MemRegionKind, RawBootInfo,
+};
 
 /// Default 16550A COM1 port on PC-compatible platforms.
 pub const UART_DEFAULT_PORT: u16 = 0x3F8;
@@ -99,7 +101,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
                 MAX_MEM_REGIONS,
             ),
         }
-    };
+    }?;
 
     // SAFETY: `count` is the return value from the parser; we write to the
     // accompanying `MEMORY_MAP_LEN` under single-threaded boot conditions.
@@ -108,17 +110,11 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         core::ptr::addr_of_mut!(MEMORY_MAP_LEN).write(count);
     }
 
-    // Minimum Wave-1 validation: at least one Usable region with ≥ 1 MiB.
     // SAFETY: MEMORY_MAP[..count] was initialised by the parser above.
     let regions = unsafe {
         core::slice::from_raw_parts(core::ptr::addr_of!(MEMORY_MAP).cast::<MemRegion>(), count)
     };
-    let any_usable = regions
-        .iter()
-        .any(|r| r.kind == MemRegionKind::Usable && r.len >= 1024 * 1024);
-    if !any_usable {
-        return Err(BootError::NoUsableRam);
-    }
+    validate_memory_map(regions)?;
 
     // SAFETY: payload validated above by the protocol probe.
     let rsdp = unsafe {

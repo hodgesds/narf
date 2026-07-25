@@ -5,6 +5,10 @@ prompt_hash = "3b2617a17646b12c100ba0a5e08272c0bfdab03738c0dd62f31cd46d5f223466"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change forwards the existing kernel-test feature to narf-boot so validation smokes enter the distributed test slice. It adds no production code, authority, memory access, domain transition, or trusted subsystem; release builds leave the feature disabled."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
 argument = "The frame edit only forwards the interrupted instruction pointer already present in its trap frame into the existing IRQ dispatcher; it adds no new TCB member or authority."
 
 [[invariants_preserved]]
