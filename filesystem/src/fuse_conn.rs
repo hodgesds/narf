@@ -62,6 +62,8 @@ pub type FuseRequestContextProvider = fn() -> FuseRequestContext;
 
 static REQUEST_CONTEXT_PROVIDER: AtomicUsize = AtomicUsize::new(0);
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+const FUSE_DEFAULT_MAX_BACKGROUND: u32 = 12;
+const FUSE_DEFAULT_CONGESTION_THRESHOLD: u32 = FUSE_DEFAULT_MAX_BACKGROUND * 3 / 4;
 
 pub fn install_request_context_provider(provider: FuseRequestContextProvider) {
     REQUEST_CONTEXT_PROVIDER.store(provider as usize, Ordering::Release);
@@ -114,6 +116,8 @@ pub struct FuseConnection {
     negotiated_flags: AtomicU64,
     max_write: AtomicU32,
     max_pages: AtomicU16,
+    max_background: AtomicU32,
+    congestion_threshold: AtomicU32,
     syncfs_supported: AtomicBool,
     next_backing_id: AtomicU32,
     backing_files: IrqSafeSpinLock<BTreeMap<i32, Arc<dyn FileOps>>>,
@@ -158,6 +162,8 @@ impl FuseConnection {
             negotiated_flags: AtomicU64::new(0),
             max_write: AtomicU32::new(4096),
             max_pages: AtomicU16::new(32),
+            max_background: AtomicU32::new(FUSE_DEFAULT_MAX_BACKGROUND),
+            congestion_threshold: AtomicU32::new(FUSE_DEFAULT_CONGESTION_THRESHOLD),
             syncfs_supported: AtomicBool::new(true),
             next_backing_id: AtomicU32::new(1),
             backing_files: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -189,6 +195,14 @@ impl FuseConnection {
 
     pub fn max_pages(&self) -> u16 {
         self.max_pages.load(Ordering::Acquire)
+    }
+
+    pub fn max_background(&self) -> u32 {
+        self.max_background.load(Ordering::Acquire)
+    }
+
+    pub fn congestion_threshold(&self) -> u32 {
+        self.congestion_threshold.load(Ordering::Acquire)
     }
 
     pub fn connection_id(&self) -> u64 {
@@ -223,6 +237,42 @@ impl FuseConnection {
             conn.disconnect();
             Ok(())
         });
+        let max_background_show = Arc::downgrade(self);
+        let max_background_store = Arc::downgrade(self);
+        crate::sysfs::kobject_add_writable_attr(
+            &node,
+            "max_background",
+            move || {
+                max_background_show
+                    .upgrade()
+                    .map(|conn| alloc::format!("{}\n", conn.max_background()))
+                    .unwrap_or_else(|| "0\n".into())
+            },
+            move |data| {
+                let value = parse_connection_limit(data)?;
+                let conn = max_background_store.upgrade().ok_or(FsError::NotFound)?;
+                conn.max_background.store(value, Ordering::Release);
+                Ok(())
+            },
+        );
+        let congestion_show = Arc::downgrade(self);
+        let congestion_store = Arc::downgrade(self);
+        crate::sysfs::kobject_add_writable_attr(
+            &node,
+            "congestion_threshold",
+            move || {
+                congestion_show
+                    .upgrade()
+                    .map(|conn| alloc::format!("{}\n", conn.congestion_threshold()))
+                    .unwrap_or_else(|| "0\n".into())
+            },
+            move |data| {
+                let value = parse_connection_limit(data)?;
+                let conn = congestion_store.upgrade().ok_or(FsError::NotFound)?;
+                conn.congestion_threshold.store(value, Ordering::Release);
+                Ok(())
+            },
+        );
     }
 
     fn is_fresh_endpoint(&self) -> bool {
@@ -707,6 +757,18 @@ impl FuseConnection {
             error => Err(errno_to_fs_error(error)),
         }
     }
+}
+
+fn parse_connection_limit(data: &[u8]) -> Result<u32, FsError> {
+    let value = core::str::from_utf8(data)
+        .map_err(|_| FsError::InvalidData)?
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| FsError::InvalidData)?;
+    if value > u16::MAX as u32 {
+        return Err(FsError::InvalidData);
+    }
+    Ok(value)
 }
 
 /// Future that parks a VFS caller until its FUSE reply lands. Each poll
@@ -2263,6 +2325,18 @@ impl FuseFs {
         self.conn.negotiated_flags.store(flags, Ordering::Release);
         self.conn.max_write.store(max_write, Ordering::Release);
         self.conn.max_pages.store(max_pages, Ordering::Release);
+        if minor >= 13 {
+            if out.max_background != 0 {
+                self.conn
+                    .max_background
+                    .store(u32::from(out.max_background), Ordering::Release);
+            }
+            if out.congestion_threshold != 0 {
+                self.conn
+                    .congestion_threshold
+                    .store(u32::from(out.congestion_threshold), Ordering::Release);
+            }
+        }
         self.conn.initialized.store(true, Ordering::Release);
         Ok(out)
     }

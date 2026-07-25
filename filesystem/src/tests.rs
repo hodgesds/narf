@@ -4263,6 +4263,27 @@ fn smoke_fs_fuse_sysfs_connection_controls() -> TestResult {
     if !node.attr_is_writable("abort") {
         return TestResult::Fail("FUSE sysfs abort was not writable");
     }
+    if node.attr_show("max_background").as_deref() != Some("12\n")
+        || node.attr_show("congestion_threshold").as_deref() != Some("9\n")
+    {
+        return TestResult::Fail("FUSE sysfs limits did not use Linux defaults");
+    }
+    if !matches!(node.attr_store("max_background", b"64\n"), Some(Ok(())))
+        || !matches!(
+            node.attr_store("congestion_threshold", b"48\n"),
+            Some(Ok(()))
+        )
+        || conn.max_background() != 64
+        || conn.congestion_threshold() != 48
+    {
+        return TestResult::Fail("FUSE sysfs limits were not writable");
+    }
+    if !matches!(
+        node.attr_store("max_background", b"65536\n"),
+        Some(Err(crate::FsError::InvalidData))
+    ) {
+        return TestResult::Fail("FUSE sysfs accepted an out-of-range limit");
+    }
     match node.attr_store("abort", b"1\n") {
         Some(Ok(())) if !conn.is_connected() => TestResult::Pass,
         _ => TestResult::Fail("FUSE sysfs abort did not disconnect"),

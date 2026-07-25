@@ -197,8 +197,11 @@ connections do not send DESTROY.
 Every `/dev/fuse` or direct `FuseFs` connection is represented at
 `/sys/fs/fuse/connections/<id>`. Its `waiting` attribute reports queued plus
 in-flight requests, and writing `abort` disconnects the daemon and completes
-parked callers with `ENOTCONN`. The directory is removed when the connection
-object is finally reclaimed.
+parked callers with `ENOTCONN`. Writable `max_background` and
+`congestion_threshold` attributes use Linux's defaults of 12 and 9, accept
+16-bit unsigned limits, and reflect non-zero daemon values negotiated in
+FUSE_INIT 7.13 or newer. The directory is removed when the connection object
+is finally reclaimed.
 
 - An empty blocking read parks in the syscall layer; a non-blocking
   read reports `EAGAIN`.
