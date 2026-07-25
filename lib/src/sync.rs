@@ -362,9 +362,10 @@ impl<T: ?Sized> Drop for IrqSafeSpinLockGuard<'_, T> {
 /// Opaque saved IRQ state — the value stashed by `irq_save_disable`
 /// and consumed by `irq_restore`.
 #[derive(Copy, Clone, Debug)]
+#[cfg_attr(test, allow(dead_code))]
 pub struct IrqSavedState(u64);
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(test), target_arch = "x86_64"))]
 #[inline(always)]
 unsafe fn irq_save_disable() -> IrqSavedState {
     let rflags: u64;
@@ -386,7 +387,7 @@ unsafe fn irq_save_disable() -> IrqSavedState {
     IrqSavedState(rflags)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(test), target_arch = "x86_64"))]
 #[inline(always)]
 unsafe fn irq_restore(saved: IrqSavedState) {
     // If the caller had IRQs enabled (bit 9 = IF), re-enable. We avoid
@@ -404,7 +405,7 @@ unsafe fn irq_restore(saved: IrqSavedState) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(test), target_arch = "aarch64"))]
 #[inline(always)]
 unsafe fn irq_save_disable() -> IrqSavedState {
     let daif: u64;
@@ -423,7 +424,7 @@ unsafe fn irq_save_disable() -> IrqSavedState {
     IrqSavedState(daif)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(test), target_arch = "aarch64"))]
 #[inline(always)]
 unsafe fn irq_restore(saved: IrqSavedState) {
     // If the caller had IRQs enabled (DAIF.I clear), unmask. We
@@ -437,13 +438,13 @@ unsafe fn irq_restore(saved: IrqSavedState) {
     }
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[inline(always)]
 unsafe fn irq_save_disable() -> IrqSavedState {
     IrqSavedState(0)
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[inline(always)]
 unsafe fn irq_restore(_: IrqSavedState) {}
 

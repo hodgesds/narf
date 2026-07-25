@@ -89,22 +89,30 @@ impl<T: Copy> core::fmt::Debug for PerCpu<T> {
 // (arch depends on lib), so we call out to a weakly-linked hook that
 // narf-arch fills in. Stage-2 default returns 0 (BSP). Stage-3 AP
 // bring-up replaces this with a real per-CPU-ID read.
+#[cfg(not(test))]
 extern "Rust" {
     fn narf_arch_cpu_id() -> usize;
 }
 
 #[inline]
 fn narf_arch_cpu_id_hook() -> usize {
-    // SAFETY: `narf_arch_cpu_id` is provided by narf-arch via
-    // `#[no_mangle]`; every binary that links narf-arch has it. It's
-    // a pure read of a CPU-identifying register (Stage 2: returns 0).
-    // SAFETY: Valid memory or trusted environment
-    let id = unsafe { narf_arch_cpu_id() };
-    debug_assert!(id < MAX_CPUS, "CPU id out of PerCpu range");
-    if id < MAX_CPUS {
-        id
-    } else {
+    #[cfg(test)]
+    {
         0
+    }
+    #[cfg(not(test))]
+    {
+        // SAFETY: `narf_arch_cpu_id` is provided by narf-arch via
+        // `#[no_mangle]`; every binary that links narf-arch has it. It's
+        // a pure read of a CPU-identifying register (Stage 2: returns 0).
+        // SAFETY: Valid memory or trusted environment
+        let id = unsafe { narf_arch_cpu_id() };
+        debug_assert!(id < MAX_CPUS, "CPU id out of PerCpu range");
+        if id < MAX_CPUS {
+            id
+        } else {
+            0
+        }
     }
 }
 
@@ -114,6 +122,23 @@ fn narf_arch_cpu_id_hook() -> usize {
 #[inline]
 pub fn current_cpu() -> usize {
     narf_arch_cpu_id_hook()
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn host_cpu_id_defaults_to_boot_cpu() {
+        assert_eq!(current_cpu(), 0);
+    }
+
+    #[test]
+    fn this_cpu_selects_boot_cpu_cell() {
+        let cells = PerCpu::new(17u32);
+        assert_eq!(*cells.this_cpu(), 17);
+        assert_eq!(cells.iter().count(), MAX_CPUS);
+    }
 }
 
 // ── hybrid-CPU topology registry ──────────────────────────────────
