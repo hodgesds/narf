@@ -4,6 +4,37 @@
 > `arch/specification/security-hardening.md` with the next-tier
 > hardening surfaces for both arches.
 
+This spec also defines the cross-architecture, per-CPU **baseline**
+speculation policy in `arch::speculation`. The protected boot default maps to
+IBRS + STIBP + SSBD on x86_64 and PSTATE.SSBS on aarch64, limited to controls
+advertised and accepted by each logical CPU. Unlike a boot-global switch, the
+API can later be invoked by a pinned IPI/rendezvous on one selected CPU.
+Unsupported hardware degrades explicitly; an advertised control whose
+privileged write or read-back fails is `State::Failed` and fails CPU bring-up.
+
+`State::Protected` means the controls represented by this baseline were
+verified, **not** that every speculative-execution vulnerability is mitigated.
+On x86 without enhanced IBRS, vendor guidance requires rewriting IBRS after a
+less-privileged→more-privileged predictor transition; NARF does not yet have
+that entry-stub hook or a retpoline build. IBPB between mutually untrusted
+same-privilege tasks, RSB filling/PBRSB, BHI, Spectre-v1 gadget hardening,
+MDS/TAA buffer clearing, and L1TF policy remain separate work. The status
+surface must not report those protections based on this baseline alone.
+
+The transition masks ordinary IRQs and restores the entry mask exactly. This
+prevents an IRQ handler from crossing a boundary mid-transition, while the
+per-CPU atomic exclusion flag rejects recursive/NMI attempts. NMI/SError itself
+cannot be masked and must tolerate either completed hardware policy. State is
+published only after the hardware read-back. Disabling is an unsafe primitive:
+the policy layer must prove the CPU is pinned, non-preemptible, authorised, and
+quiescent from boundaries that require protection.
+
+A future syscall/cgroup controller belongs above this HAL. It resolves policy
+to a CPU set, pins or drains affected tasks, accounts for SMT siblings, then
+runs `configure_current_cpu` through an IPI rendezvous on each target. It must
+roll back already-changed CPUs if any target returns `Failed`, and it must not
+expose the raw unsafe `Disabled` primitive directly to userspace.
+
 This spec covers six facilities:
 
   * **PAC** (aarch64) — Pointer Authentication: signed return
@@ -108,21 +139,31 @@ lives where the page-table builder is.
 |-------|-----------------------------------------|
 | 0     | not present                             |
 | 1     | SSBS supported (PSTATE.SSBS controllable)|
-| 2     | + MSR `SSBS` instruction                 |
+| 2     | + direct `MSR`/`MRS SSBS` instructions        |
 
 ### 3.2 Runtime control
 
-`PSTATE.SSBS` is bit 12 of PSTATE; setting it instructs the CPU
-to forbid speculative store-bypass. v8.5+ provides `MSR SSBS, #0/#1`
+`PSTATE.SSBS` is bit 12 of PSTATE. Its polarity is inverted relative
+to x86 SSBD: **0 forbids** potentially exploitable speculative store bypass;
+1 permits it. v8.5+ provides `MSR SSBS, #0/#1`
 or via `MSR SCTLR_EL1.DSSBS`.
 
 ### 3.3 API
 
 ```rust
 pub fn caps() -> u8;        // raw ID_AA64PFR1_EL1.SSBS field
-pub unsafe fn enable();     // sets PSTATE.SSBS
-pub unsafe fn disable();    // clears PSTATE.SSBS
+pub unsafe fn enable();     // clears PSTATE.SSBS; then ISB
+pub unsafe fn disable();    // sets PSTATE.SSBS; then ISB
+pub unsafe fn is_enabled() -> bool; // true when PSTATE.SSBS == 0; caps() >= 2
 ```
+
+### 3.4 Primary references
+
+- [Arm A-profile register reference: SSBS](https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/SSBS--Speculative-Store-Bypass-Safe)
+- [Arm cache-speculation kernel mitigation detail](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Security%20update%2010%20September%2018/Kernel_Mitigations_Detail_v1.7.pdf)
+- [Intel speculative-execution side-channel mitigations](https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/technical-documentation/speculative-execution-side-channel-mitigations.html)
+- [Linux Spectre mitigation/status model](https://www.kernel.org/doc/html/v6.12/admin-guide/hw-vuln/spectre.html)
+- [Linux per-task speculation-control API](https://docs.kernel.org/userspace-api/spec_ctrl.html)
 
 ## 4. Intel LAM
 

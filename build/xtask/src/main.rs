@@ -2286,7 +2286,10 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
     const GUI_FRESH_BOOT: &[(&str, &str)] = &[
         ("mini_compositor", "px=00c0ffee"),
         ("wl_2proc", "2proc-ok 1280x800 px=00c0ffee"),
-        ("wl_multi", "b=00bada55"),
+        (
+            "busybox sh -c 'wl_multi && echo wl-multi-ok'",
+            "wl-multi-ok",
+        ),
         ("wl_xdg", "xdg-ok 1280x800 px=00c0ffee"),
         ("wl_input", "input-ok 1280x800 key=30"),
         ("wl_kms", "kms-ok 1280x800 px=00c0ffee flip=1"),
@@ -5025,6 +5028,22 @@ fn run_interactive_multi(
                 bail!("xtask musl-demo: {why} before login prompt");
             }
         }
+        // QEMU's emulated USB keyboard enumerates just after getty prints the
+        // login prompt. Do not type credentials while that late init path is
+        // still producing console traffic: password input is intentionally
+        // not echoed, so it cannot use the per-byte acknowledgement protocol
+        // below. The musl-demo machine always has this keyboard; keep the
+        // bounded fallback for alternate local QEMU configurations.
+        if needle == b"login: " {
+            if let Wait::Found(end) = wait_for(
+                cursor,
+                b"usb-hid: kbd attached",
+                false,
+                Duration::from_secs(10),
+            ) {
+                cursor = end;
+            }
+        }
         for &b in reply {
             if stdin.write_all(&[b]).is_err() {
                 let _ = child.kill();
@@ -5033,7 +5052,7 @@ fn run_interactive_multi(
                 bail!("xtask musl-demo: stdin write failed during login");
             }
             let _ = stdin.flush();
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -5067,21 +5086,35 @@ fn run_interactive_multi(
             expect
         );
         let pre = captured.lock().map(|g| g.len()).unwrap_or(cursor);
-        // Type the command byte-by-byte (the shell's line editor needs
-        // time to drain each char through the bounded input ring).
-        let mut typed = cmdline.as_bytes().to_vec();
-        typed.push(b'\n');
+        // Flow-control command entry through the shell's echoed line editor.
+        // Keep at most one unacknowledged byte in the serial/input-ring path:
+        // loaded TCG runners previously transposed adjacent bytes here
+        // (`sendfile_smoke` arrived as `sendfile_smkoe`). Waiting for each
+        // byte's echo adapts to guest load and proves ordered consumption.
         let mut wrote = true;
-        for &b in &typed {
+        let mut type_error = "stdin write failed";
+        let mut echo_cursor = pre;
+        for &b in cmdline.as_bytes() {
             if stdin.write_all(&[b]).is_err() {
                 wrote = false;
                 break;
             }
             let _ = stdin.flush();
-            std::thread::sleep(Duration::from_millis(5));
+            match wait_for(echo_cursor, core::slice::from_ref(&b), false, prompt_to) {
+                Wait::Found(end) => echo_cursor = end,
+                Wait::TimedOut | Wait::Died(_) => {
+                    wrote = false;
+                    type_error = "serial echo acknowledgement failed";
+                    break;
+                }
+            }
+        }
+        if wrote {
+            wrote = stdin.write_all(b"\n").is_ok();
+            let _ = stdin.flush();
         }
         if !wrote {
-            aborted = Some("stdin write failed".into());
+            aborted = Some(type_error.into());
             failed += 1;
             failed_cases.push((cmdline.to_string(), expect.to_string()));
             break;

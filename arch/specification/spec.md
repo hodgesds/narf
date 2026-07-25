@@ -67,6 +67,17 @@ pub trait DomainPrimitive {
 }
 
 pub enum DomainBackend { Pks, Mte }
+
+/// Current-CPU speculative-execution policy. Remote changes require an
+/// IPI/rendezvous that executes this function on the target CPU.
+pub enum speculation::Policy { Disabled, Protected }
+pub enum speculation::State {
+    Unconfigured, Disabled, Protected, Unsupported, Failed,
+}
+pub unsafe fn speculation::configure_current_cpu(
+    policy: speculation::Policy,
+) -> speculation::State;
+pub fn speculation::state(cpu: usize) -> speculation::State;
 ```
 
 ## 4. Invariants & safety properties
@@ -82,6 +93,13 @@ pub enum DomainBackend { Pks, Mte }
   `BACKEND == Pks` via `#[cfg(target_arch = "x86_64")]` or provide a
   fallback that accepts the MTE discipline cost. Treating the two as
   symmetric is a bug, not a simplification.
+- **Speculation policy is current-CPU scoped.** A transition masks and
+  restores ordinary IRQ delivery, rejects nested transitions, updates only
+  the executing CPU's hardware state, and publishes observable state only
+  after write/read-back completion. Callers must pin/non-preempt the CPU;
+  remote policy changes require a rendezvous. NMI/SError handlers must be
+  correct under either the old or new policy. Disabling additionally requires
+  policy authorisation and quiescence from protected-boundary entry.
 - **All domain / TLB / cache / MSR intrinsics are wrapped with
   `compiler_fence(SeqCst)` before and after the `asm!`.** Under fat
   LTO (see `build/` §4) the `"memory"` clobber alone is not enough

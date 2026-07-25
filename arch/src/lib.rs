@@ -11,6 +11,7 @@
 
 pub mod mmio;
 pub mod percpu;
+pub mod speculation;
 
 mod tests;
 

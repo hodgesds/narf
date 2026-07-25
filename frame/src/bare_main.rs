@@ -471,6 +471,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         }
     }
 
+    // Apply the protected boot policy on the BSP itself. The API is
+    // current-CPU scoped so future per-core policy changes cannot silently
+    // weaken siblings. APs repeat this before becoming scheduler-visible.
+    // SAFETY: privileged boot context; no untrusted task can run yet.
+    let speculation_state = unsafe {
+        narf_arch::speculation::configure_current_cpu(narf_arch::speculation::Policy::Protected)
+    };
+    assert!(
+        speculation_state != narf_arch::speculation::State::Failed,
+        "speculation-control transition failed on BSP"
+    );
+
     // PaX-style security init — runs before any user-mode entry and
     // before the first task spawn. Order is sensitive: SMEP/SMAP both
     // depend on CR4 being writable (CPL=0, post-paging), KPTI detect
@@ -542,10 +554,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         let pti = kpti::detect();
         let _ = writeln!(
             console::Writer,
-            "  hardening: SMEP={} SMAP={} KPTI={:?}",
+            "  hardening: SMEP={} SMAP={} KPTI={:?} SPEC={:?}",
             smep::is_enabled(),
             smap::is_enabled(),
             pti,
+            speculation_state,
         );
 
         // Initialise the global stack canary from RDRAND/RDSEED.

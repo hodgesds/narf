@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use core::arch::asm;
+use core::sync::atomic::{compiler_fence, Ordering};
 
 fn id_aa64pfr1() -> u64 {
     let v: u64;
@@ -31,31 +32,54 @@ pub fn caps() -> u8 {
     ((id_aa64pfr1() >> 4) & 0xF) as u8
 }
 
-/// Set PSTATE.SSBS — forbid speculative store-bypass on this CPU.
+/// Enable the mitigation by clearing PSTATE.SSBS.
+///
+/// Arm's polarity is intentionally counterintuitive: SSBS=0 forbids
+/// exploitable speculative store bypass; SSBS=1 permits it.
 ///
 /// Uses `.inst` raw encoding so the assembler doesn't need
 /// `+ssbs` target-feature awareness. Per Arm ARM C5.2.18,
 /// `MSR SSBS, #imm` encodes as
-///   `0xD500_419F | ((imm & 0xF) << 8)`
-/// for the imm-form.
+///   `0xD503_403F | ((imm & 1) << 8)`
+/// for the immediate form.
 ///
 /// # Safety
 /// EL1; SSBS supported (`caps() >= 2` for the immediate-form
 /// MSR instruction).
 pub unsafe fn enable() {
-    // SAFETY: caller-asserted EL1; raw encoding for `MSR SSBS, #1`.
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller-asserted EL1; raw encoding for `MSR SSBS, #0`.
+    // ISB is conservative coverage for cores affected by stale-SSBS errata.
     unsafe {
-        asm!(".inst 0xD500419F", options(nostack, preserves_flags));
+        asm!(".inst 0xD503403F", "isb", options(nostack, preserves_flags));
     }
+    compiler_fence(Ordering::SeqCst);
 }
 
-/// Clear PSTATE.SSBS.
+/// Disable the mitigation by setting PSTATE.SSBS (permit bypass).
 ///
 /// # Safety
 /// Same as `enable`.
 pub unsafe fn disable() {
-    // SAFETY: caller-asserted; raw encoding for `MSR SSBS, #0`.
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller-asserted; raw encoding for `MSR SSBS, #1`.
     unsafe {
-        asm!(".inst 0xD500409F", options(nostack, preserves_flags));
+        asm!(".inst 0xD503413F", "isb", options(nostack, preserves_flags));
     }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Read PSTATE.SSBS through the architectural SSBS system register.
+///
+/// # Safety
+/// EL1; `caps() >= 2`.
+pub unsafe fn is_enabled() -> bool {
+    let raw: u64;
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller-asserted; raw encoding for `MRS X0, SSBS`.
+    unsafe {
+        asm!(".inst 0xD53B42C0", lateout("x0") raw, options(nostack, preserves_flags));
+    }
+    compiler_fence(Ordering::SeqCst);
+    raw & 1 == 0
 }

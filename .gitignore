@@ -43,4 +43,5 @@ qemu.log
 # covered by the `/target/` rule above. Nothing extra needed.
 .semcode.*
 .agents/
+.codex/
 .mcp.json

@@ -195,6 +195,16 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         let _ = narf_arch::x86_64::errata::apply_for_current_cpu();
     }
 
+    // Speculation controls are per-CPU state. Apply the protected policy
+    // here before this AP can run scheduler work.
+    // SAFETY: CPL0, IRQs masked, and this AP is not yet online.
+    let speculation_state = unsafe {
+        narf_arch::speculation::configure_current_cpu(narf_arch::speculation::Policy::Protected)
+    };
+    if speculation_state == narf_arch::speculation::State::Failed {
+        narf_arch::halt_forever();
+    }
+
     // 2a. Per-CPU user-mode entry setup (only when user-task SMP is
     //     built — otherwise APs run kernel tasks only and need none of
     //     it, and skipping it avoids the per-AP GDT/TSS heap blocks

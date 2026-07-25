@@ -16,8 +16,17 @@
 #include <unistd.h>
 #include <signal.h>
 #include <string.h>
+#include <errno.h>
 
 static void w(const char *m) { write(1, m, strlen(m)); }
+
+static pid_t waitpid_nointr(pid_t pid, int *status) {
+    pid_t r;
+    do {
+        r = waitpid(pid, status, 0);
+    } while (r < 0 && errno == EINTR);
+    return r;
+}
 
 #ifndef PTRACE_O_TRACESYSGOOD
 #define PTRACE_O_TRACESYSGOOD 1
@@ -27,7 +36,10 @@ static void w(const char *m) { write(1, m, strlen(m)); }
 int main(void) {
     pid_t c = fork();
     if (c == 0) {
-        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        if (ptrace(PTRACE_TRACEME, 0, 0, 0) != 0) {
+            w("strace-fail: PTRACE_TRACEME request failed\n");
+            _exit(1);
+        }
         raise(SIGSTOP);
         getpid();
         getpid();
@@ -36,7 +48,7 @@ int main(void) {
 
     int st;
     // Plain waitpid (options = 0): a ptrace-stop must be reported anyway.
-    if (waitpid(c, &st, 0) != c || !WIFSTOPPED(st) || WSTOPSIG(st) != SIGSTOP) {
+    if (waitpid_nointr(c, &st) != c || !WIFSTOPPED(st) || WSTOPSIG(st) != SIGSTOP) {
         w("strace-fail: initial SIGSTOP stop not reported to plain waitpid\n");
         return 1;
     }
@@ -49,7 +61,7 @@ int main(void) {
             w("strace-fail: PTRACE_SYSCALL request failed\n");
             return 1;
         }
-        if (waitpid(c, &st, 0) != c) {
+        if (waitpid_nointr(c, &st) != c) {
             w("strace-fail: waitpid\n");
             return 1;
         }
