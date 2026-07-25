@@ -1107,6 +1107,22 @@ impl AddressSpace {
         self.regions.lock().len() + self.huge_regions.lock().len()
     }
 
+    /// Return whether `vaddr` belongs to a registered base-page or hardware
+    /// huge-page region.
+    pub fn contains_address(&self, vaddr: VirtAddr) -> bool {
+        let v = vaddr.as_u64();
+        if self.huge_regions.lock().iter().any(|region| {
+            let base = region.base.as_u64();
+            v >= base && v < base.saturating_add(region.len)
+        }) {
+            return true;
+        }
+        self.regions.lock().iter().any(|region| {
+            let base = region.base.as_u64();
+            v >= base && v < base.saturating_add(region.len)
+        })
+    }
+
     /// Demand-paging entry point — called from the user-mode #PF
     /// handler when CR2 (x86_64) / FAR_EL1 (aarch64) lands inside
     /// a known region whose `phys[i]` is the zero sentinel

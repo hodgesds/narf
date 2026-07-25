@@ -3341,6 +3341,9 @@ fn smoke_hugepage_1g_reserve_picks_aligned_chunk() -> TestResult {
     if translated.map(PhysAddr::raw) != Some(phys + 0x20_0000) {
         return TestResult::Fail("1G translation lost its block offset");
     }
+    if !aspace.contains_address(VirtAddr::new(USER_VA + HUGEPAGE_1G_BYTES - 1)) {
+        return TestResult::Fail("huge mapping absent from address-space membership");
+    }
     if aspace.unmap_huge_region(VirtAddr::new(USER_VA)).is_err() {
         return TestResult::Fail("hardware 1G unmap failed");
     }

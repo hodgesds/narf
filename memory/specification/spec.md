@@ -112,6 +112,8 @@ impl AddressSpace {
     /// Remove an exact huge mapping and return its backing to the pool.
     pub fn unmap_huge_region(&self, base: VirtAddr)
         -> Result<(), AddressSpaceError>;
+    /// Test membership across both base-page and hardware huge-page regions.
+    pub fn contains_address(&self, vaddr: VirtAddr) -> bool;
 }
 
 impl AddressSpace {

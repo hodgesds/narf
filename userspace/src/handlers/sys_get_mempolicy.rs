@@ -54,10 +54,7 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
             return;
         };
-        let in_region = as_ref.regions_snapshot().iter().any(|region| {
-            addr >= region.base.as_u64() && addr < region.base.as_u64().saturating_add(region.len)
-        });
-        if !in_region {
+        if !as_ref.contains_address(VirtAddr::new(addr)) {
             ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
             return;
         }
