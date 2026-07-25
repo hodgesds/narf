@@ -68,6 +68,15 @@ pub fn unmap(va: VirtAddr);
 pub fn assign_domain(region: VirtRange, domain: DomainId);
 pub fn set_domain_rights(domain: DomainId, rights: DomainRights); // PKRS write
 
+pub struct Mempolicy {
+    pub mode: u32,
+    pub nodemask: u64,
+    /// Hard boundary supplied by cpuset.mems; allocation never spills out.
+    pub allowed: u64,
+}
+pub fn mempolicy_set(policy: Mempolicy);
+pub fn mempolicy_clear();
+
 impl AddressSpace {
     /// Replace one resident private page with equivalent backing from a
     /// target NUMA node, preserving bytes and permissions and completing

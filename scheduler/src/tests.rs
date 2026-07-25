@@ -2322,3 +2322,21 @@ fn smoke_pluggable_steal_strategy() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_pluggable_steal_strategy);
+
+fn smoke_task_numa_allowed_mask_roundtrip() -> TestResult {
+    const TASK: u64 = 0x4e55_4d41;
+    crate::clear_task_mems_allowed(TASK);
+    if crate::task_mems_allowed(TASK) != u64::MAX {
+        return TestResult::Fail("unstored task NUMA mask was constrained");
+    }
+    crate::set_task_mems_allowed(TASK, 0b10);
+    if crate::task_mems_allowed(TASK) != 0b10 {
+        return TestResult::Fail("task NUMA mask did not round-trip");
+    }
+    crate::clear_task_mems_allowed(TASK);
+    if crate::task_mems_allowed(TASK) != u64::MAX {
+        return TestResult::Fail("cleared task NUMA mask remained constrained");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_task_numa_allowed_mask_roundtrip);

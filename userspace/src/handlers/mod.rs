@@ -3345,6 +3345,7 @@ pub fn publish_mempolicy_for_fault(va: u64) {
     narf_memory::mempolicy_set(narf_memory::Mempolicy {
         mode: mode & !MPOL_MODE_FLAGS,
         nodemask,
+        allowed: narf_scheduler::task_mems_allowed(task),
     });
 }
 
@@ -3357,23 +3358,38 @@ pub fn clear_mempolicy_for_fault() {
 /// get_mempolicy's MPOL_F_NODE|MPOL_F_ADDR query). Mirrors the
 /// allocator's preference resolution without actually allocating.
 fn mempolicy_resolved_node(pol: narf_memory::Mempolicy) -> u32 {
+    let allowed = pol.allowed & ((1u64 << narf_memory::FRAME_MAX_NUMA_NODES) - 1);
+    let first_allowed = if allowed == 0 {
+        0
+    } else {
+        allowed.trailing_zeros()
+    };
     match pol.mode {
         x if x == narf_memory::MPOL_BIND || x == narf_memory::MPOL_PREFERRED => {
-            if pol.nodemask != 0 {
-                pol.nodemask.trailing_zeros()
+            let preferred = pol.nodemask & allowed;
+            if preferred != 0 {
+                preferred.trailing_zeros()
             } else {
-                narf_memory::frame::local_node() as u32
+                first_allowed
             }
         }
         x if x == narf_memory::MPOL_INTERLEAVE => {
-            if pol.nodemask != 0 {
-                pol.nodemask.trailing_zeros()
+            let interleave = pol.nodemask & allowed;
+            if interleave != 0 {
+                interleave.trailing_zeros()
             } else {
-                0
+                first_allowed
             }
         }
         // DEFAULT / LOCAL
-        _ => narf_memory::frame::local_node() as u32,
+        _ => {
+            let local = narf_memory::frame::local_node() as u32;
+            if (allowed >> local) & 1 != 0 {
+                local
+            } else {
+                first_allowed
+            }
+        }
     }
 }
 
@@ -5966,6 +5982,7 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = MBIND_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
+    narf_scheduler::clear_task_mems_allowed(tid);
     if let Some(m) = PKEY_TABLE.lock().as_mut() {
         m.remove(&tid);
     }

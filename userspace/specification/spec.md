@@ -60,12 +60,12 @@ writing its descriptor through the overloaded `parent_tid` pointer argument.
 
 Linux NUMA compatibility reports live topology rather than a structural
 single-node stub: `getcpu(2)` returns the current logical CPU and its
-SRAT proximity node, while query-form `move_pages(2)` walks the caller's
-page tables and reports the physical page's SRAT node (or per-page
-`-ENOENT` when it is not resident). Page-migration forms require an
-atomic address-space backing-frame replacement and must return an error
-until that operation is available; they must never claim a successful
-move without changing placement.
+SRAT proximity node, while `move_pages(2)` walks the caller's page tables,
+reports physical placement, and can replace resident private backing on
+another node. `migrate_pages(2)` moves the caller's resident private pages
+between node masks. Fault-time `set_mempolicy(2)` and `mbind(2)` placement
+is intersected with the task's cgroup-v2 `cpuset.mems.effective` mask;
+`get_mempolicy(MPOL_F_MEMS_ALLOWED)` reports that effective constraint.
 
 Bootstrap: every new process receives two ring pairs (submit + complete)
 for the kernel ABI plus a read-only config page with capability

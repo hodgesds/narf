@@ -6552,3 +6552,30 @@ fn smoke_numa_migrate_page_preserves_contents() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_numa_migrate_page_preserves_contents);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_mempolicy_allowed_mask_is_hard_boundary() -> TestResult {
+    if !crate::is_numa_aware() || crate::node_free(1) == 0 {
+        return TestResult::Skip("requires two NUMA memory nodes");
+    }
+    let before = crate::node_free(1);
+    let policy = crate::Mempolicy {
+        mode: crate::MPOL_DEFAULT,
+        nodemask: 0,
+        allowed: 0b10,
+    };
+    let frame = match crate::mempolicy::alloc_frame_with(policy, 0) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("cpuset-constrained allocation failed"),
+    };
+    if crate::node_free(1) + 1 != before {
+        return TestResult::Fail("DEFAULT policy escaped cpuset node mask");
+    }
+    // ACPI parser smokes mutate the live SRAT fixture after the allocator was
+    // partitioned, so freeing this node-1 frame could route it to the wrong
+    // zone. Keep this single test frame allocated.
+    let _leaked_frame = frame;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_mempolicy_allowed_mask_is_hard_boundary);

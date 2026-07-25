@@ -7,7 +7,8 @@
 //! not merely round-tripped.
 //!
 //! ## Model
-//! The policy in force for a fault is a small value (mode + nodemask)
+//! The policy in force for a fault is a small value (mode + nodemask +
+//! hard allowed-node mask)
 //! published to a **per-CPU active slot** by the page-fault path right
 //! before it demand-allocates. The allocator then resolves:
 //!
@@ -47,6 +48,10 @@ const MAX_TRACKED_CPUS: usize = 256;
 static ACTIVE: [AtomicU64; MAX_TRACKED_CPUS] =
     [const { AtomicU64::new(u64::MAX) }; MAX_TRACKED_CPUS];
 
+/// Per-CPU hard node constraint, normally supplied by `cpuset.mems`.
+static ACTIVE_ALLOWED: [AtomicU64; MAX_TRACKED_CPUS] =
+    [const { AtomicU64::new(u64::MAX) }; MAX_TRACKED_CPUS];
+
 /// Per-CPU interleave rotor for `MPOL_INTERLEAVE`.
 static INTERLEAVE_NEXT: [AtomicU32; MAX_TRACKED_CPUS] =
     [const { AtomicU32::new(0) }; MAX_TRACKED_CPUS];
@@ -67,12 +72,15 @@ fn cpu_slot() -> usize {
 pub struct Mempolicy {
     pub mode: u32,
     pub nodemask: u64,
+    /// Hard allocation boundary (for example `cpuset.mems.effective`).
+    pub allowed: u64,
 }
 
 impl Mempolicy {
     pub const DEFAULT: Self = Self {
         mode: MPOL_DEFAULT,
         nodemask: 0,
+        allowed: u64::MAX,
     };
 
     fn pack(self) -> u64 {
@@ -86,23 +94,31 @@ impl Mempolicy {
         Self {
             mode: (v >> 32) as u32,
             nodemask: v & 0xFFFF_FFFF,
+            allowed: u64::MAX,
         }
     }
 }
 
 /// Publish `policy` as the active mempolicy for the current CPU.
 pub fn set_active(policy: Mempolicy) {
-    ACTIVE[cpu_slot()].store(policy.pack(), Ordering::Release);
+    let slot = cpu_slot();
+    ACTIVE_ALLOWED[slot].store(policy.allowed, Ordering::Release);
+    ACTIVE[slot].store(policy.pack(), Ordering::Release);
 }
 
 /// Reset the current CPU's active policy to `MPOL_DEFAULT`.
 pub fn clear_active() {
-    ACTIVE[cpu_slot()].store(u64::MAX, Ordering::Release);
+    let slot = cpu_slot();
+    ACTIVE[slot].store(u64::MAX, Ordering::Release);
+    ACTIVE_ALLOWED[slot].store(u64::MAX, Ordering::Release);
 }
 
 /// The current CPU's active policy (DEFAULT when none installed).
 pub fn active() -> Mempolicy {
-    Mempolicy::unpack(ACTIVE[cpu_slot()].load(Ordering::Acquire))
+    let slot = cpu_slot();
+    let mut policy = Mempolicy::unpack(ACTIVE[slot].load(Ordering::Acquire));
+    policy.allowed = ACTIVE_ALLOWED[slot].load(Ordering::Acquire);
+    policy
 }
 
 /// Lowest set node index in `mask`, or `None` for an empty mask.
@@ -138,25 +154,66 @@ fn interleave_pick(mask: u64) -> usize {
 /// Allocate one frame honoring `policy`, with `local` as the faulting
 /// CPU's node (used by DEFAULT/LOCAL/PREFERRED-empty).
 ///
-/// MPOL_BIND is the only *restrictive* mode: it confines the
-/// allocation to the nodemask and fails if every masked node is
-/// exhausted. The other modes are *preferences* — they pick a starting
-/// node and let the allocator's nearest-by-distance fallback spill
-/// over, exactly like Linux.
+/// `policy.allowed` is always a hard boundary. MPOL_BIND further narrows
+/// it to the policy nodemask; the other modes choose their preferred order
+/// within the allowed set.
 pub fn alloc_frame_with(policy: Mempolicy, local: usize) -> Result<PhysFrame, FrameAllocError> {
+    let unconstrained = policy.allowed == u64::MAX;
+    let all_nodes = if MAX_NUMA_NODES == 64 {
+        u64::MAX
+    } else {
+        (1u64 << MAX_NUMA_NODES) - 1
+    };
+    let allowed = policy.allowed & all_nodes;
+    if allowed == 0 {
+        return Err(FrameAllocError::Exhausted);
+    }
     match policy.mode {
-        MPOL_BIND => alloc_bind(policy.nodemask),
+        MPOL_BIND => alloc_bind(policy.nodemask & allowed),
         MPOL_INTERLEAVE => {
-            let node = interleave_pick(policy.nodemask);
-            frame::alloc_frame_on(node)
+            let mask = if policy.nodemask == 0 {
+                allowed
+            } else {
+                policy.nodemask & allowed
+            };
+            let node = interleave_pick(mask);
+            if unconstrained {
+                frame::alloc_frame_on(node)
+            } else {
+                alloc_preferred_within(node, mask)
+            }
         }
         MPOL_PREFERRED => {
-            let node = first_node(policy.nodemask).unwrap_or(local);
-            frame::alloc_frame_on(node)
+            let preferred = policy.nodemask & allowed;
+            let node = first_node(preferred).unwrap_or(local);
+            if unconstrained {
+                frame::alloc_frame_on(node)
+            } else {
+                alloc_preferred_within(node, allowed)
+            }
         }
-        // DEFAULT and LOCAL both mean "local node, then nearest".
-        _ => frame::alloc_frame_on(local),
+        // DEFAULT and LOCAL mean local-first, but never outside cpuset.mems.
+        _ if unconstrained => frame::alloc_frame_on(local),
+        _ => alloc_preferred_within(local, allowed),
     }
+}
+
+/// Allocate on `preferred` when allowed, then try the remaining allowed
+/// nodes. Every attempt is strict so a cgroup hard boundary cannot spill.
+fn alloc_preferred_within(preferred: usize, allowed: u64) -> Result<PhysFrame, FrameAllocError> {
+    if preferred < MAX_NUMA_NODES && (allowed >> preferred) & 1 != 0 {
+        if let Ok(frame) = frame::alloc_frame_on_strict(preferred) {
+            return Ok(frame);
+        }
+    }
+    for node in 0..MAX_NUMA_NODES {
+        if node != preferred && (allowed >> node) & 1 != 0 {
+            if let Ok(frame) = frame::alloc_frame_on_strict(node) {
+                return Ok(frame);
+            }
+        }
+    }
+    Err(FrameAllocError::Exhausted)
 }
 
 /// MPOL_BIND: try only nodes set in `mask`, nearest-first by distance

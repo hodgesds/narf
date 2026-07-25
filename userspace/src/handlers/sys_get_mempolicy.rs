@@ -18,12 +18,16 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
 
     if flags & MPOL_F_MEMS_ALLOWED != 0 {
-        // Report the mask of nodes this task may use: every online node.
+        // Report the cgroup-constrained mask of nodes this task may use.
         let n = numa_node_count().min(64);
-        let allowed: u64 = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let online: u64 = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let allowed = narf_scheduler::task_mems_allowed(task) & online;
         if nodemask_ptr != 0 {
             // SAFETY: copy_to_user validates the user pointer/length.
-            let _ = unsafe { copy_to_user(nodemask_ptr, &allowed.to_le_bytes()) };
+            if unsafe { copy_to_user(nodemask_ptr, &allowed.to_le_bytes()) }.is_err() {
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                return;
+            }
         }
         ctx.set_return(SyscallReturn::ok(0));
         return;
@@ -45,6 +49,7 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
             let pol = narf_memory::Mempolicy {
                 mode: mode & !MPOL_MODE_FLAGS,
                 nodemask,
+                allowed: narf_scheduler::task_mems_allowed(task),
             };
             mempolicy_resolved_node(pol) as i32
         } else {

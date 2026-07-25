@@ -2001,6 +2001,7 @@ fn smoke_numa_mempolicy_bind_steers_alloc() -> TestResult {
     mempolicy_set(Mempolicy {
         mode: MPOL_BIND,
         nodemask: 0b10,
+        allowed: u64::MAX,
     });
     let f = match narf_memory::alloc_frame_policied(0) {
         Ok(f) => f,

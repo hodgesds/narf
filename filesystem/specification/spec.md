@@ -94,6 +94,14 @@ kernel↔user boundary; kernel-internal callers invoke directly.
 `poll_readiness_at` defaults to `poll_readiness`; offset-sensitive device
 descriptions such as `/dev/kmsg` override it so EOF is not reported readable.
 
+### 3.3.1 cgroup-v2 cpuset placement
+
+`cpuset.cpus.effective` is pushed into scheduler CPU affinity.
+`cpuset.mems.effective` is the parent-effective/requested intersection
+and is pushed into the scheduler's per-task allowed-node table on attach
+and every local policy update. Empty requests inherit the parent; an
+explicit request with an empty intersection is rejected.
+
 ### 3.4 Directory operations
 
 ```rust
