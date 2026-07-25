@@ -78,6 +78,17 @@ pub struct AdminHandle {
     iface_name: String,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AdminIpv4Route {
+    pub dst: [u8; 4],
+    pub prefix_len: u8,
+    pub gateway: Option<[u8; 4]>,
+    pub preferred_src: Option<[u8; 4]>,
+    pub metric: u32,
+    pub scope: crate::route::Scope,
+    pub table: u8,
+}
+
 impl AdminHandle {
     pub(crate) fn new(cap: Cap<AdminCap, Invoke>, iface_name: String) -> Self {
         Self { cap, iface_name }
@@ -139,6 +150,50 @@ impl AdminHandle {
             return Err(AdminError::InvalidPrefix);
         }
         crate::iface::del_addr(&self.iface_name, addr, prefix_len);
+        Ok(())
+    }
+
+    pub fn add_ipv4_route(&self, route: AdminIpv4Route) -> Result<(), AdminError> {
+        self.check_live()?;
+        if route.prefix_len > 32 {
+            return Err(AdminError::InvalidPrefix);
+        }
+        if crate::iface::lookup(&self.iface_name).is_none() {
+            return Err(AdminError::NoIface);
+        }
+        crate::route::route_add(crate::route::Route {
+            dst: crate::route::Ipv4Net {
+                addr: crate::ipv4::Ipv4Addr(route.dst),
+                prefix_len: route.prefix_len,
+            },
+            gateway: route.gateway.map(crate::ipv4::Ipv4Addr),
+            iface: self.iface_name.clone(),
+            src_hint: route.preferred_src.map(crate::ipv4::Ipv4Addr),
+            metric: route.metric,
+            scope: route.scope,
+            table: route.table,
+        });
+        Ok(())
+    }
+
+    pub fn del_ipv4_route(
+        &self,
+        dst: [u8; 4],
+        prefix_len: u8,
+        table: u8,
+    ) -> Result<(), AdminError> {
+        self.check_live()?;
+        if prefix_len > 32 {
+            return Err(AdminError::InvalidPrefix);
+        }
+        crate::route::route_delete(
+            crate::route::Ipv4Net {
+                addr: crate::ipv4::Ipv4Addr(dst),
+                prefix_len,
+            },
+            &self.iface_name,
+            table,
+        );
         Ok(())
     }
 }

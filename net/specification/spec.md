@@ -83,6 +83,8 @@ pub fn set_mtu (admin: &AdminHandle, mtu: u32) -> Result<(), AdminError>;
 pub fn set_mac (admin: &AdminHandle, mac: [u8; 6]) -> Result<(), AdminError>;
 pub fn add_ipv4(admin: &AdminHandle, addr: [u8; 4], prefix: u8) -> Result<(), AdminError>;
 pub fn del_ipv4(admin: &AdminHandle, addr: [u8; 4], prefix: u8) -> Result<(), AdminError>;
+pub fn add_ipv4_route(admin: &AdminHandle, route: Ipv4Route) -> Result<(), AdminError>;
+pub fn del_ipv4_route(admin: &AdminHandle, route: Ipv4RouteKey) -> Result<(), AdminError>;
 pub fn stats   (iface: &Cap<NetIface, Read>) -> IfaceStats;
 ```
 
@@ -122,7 +124,8 @@ echo the request sequence, identify the kernel sender with port ID zero, carry
 administration path. A route socket must first be explicitly delegated an
 interface-bound `AdminHandle`; undelegated or cross-interface writes return
 `NLMSG_ERROR(-EPERM)`. `RTM_NEWLINK`/`RTM_SETLINK` and IPv4
-`RTM_NEWADDR`/`RTM_DELADDR` invoke the typed operations in §3.3.
+`RTM_NEWADDR`/`RTM_DELADDR` plus `RTM_NEWROUTE`/`RTM_DELROUTE` invoke the
+typed operations in §3.3.
 
 Link dumps include Linux operational-state, carrier, qdisc, queue-length,
 broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero

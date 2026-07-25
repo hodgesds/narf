@@ -58,6 +58,7 @@ pub const RTM_NEWADDR: u16 = 20;
 pub const RTM_DELADDR: u16 = 21;
 pub const RTM_GETADDR: u16 = 22;
 pub const RTM_NEWROUTE: u16 = 24;
+pub const RTM_DELROUTE: u16 = 25;
 pub const RTM_GETROUTE: u16 = 26;
 pub const RTM_NEWNEIGH: u16 = 28;
 pub const RTM_GETNEIGH: u16 = 30;
@@ -720,6 +721,79 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                 admin.del_ipv4(addr, prefix_len).map_err(admin_errno)
             }
         }
+        RTM_NEWROUTE | RTM_DELROUTE => {
+            if request.len() < NLMSG_HDRLEN + 12 || request[NLMSG_HDRLEN] != AF_INET {
+                return Err(EINVAL);
+            }
+            let prefix_len = request[NLMSG_HDRLEN + 1];
+            if prefix_len > 32 {
+                return Err(EINVAL);
+            }
+            let scope = match request[NLMSG_HDRLEN + 6] {
+                0 => crate::route::Scope::Universe,
+                253 => crate::route::Scope::Link,
+                254 => crate::route::Scope::Host,
+                _ => return Err(EINVAL),
+            };
+            let table = if let Some(raw) = find_attr(request, 12, RTA_TABLE) {
+                if raw.len() != 4 {
+                    return Err(EINVAL);
+                }
+                u32::from_ne_bytes(raw.try_into().map_err(|_| EINVAL)?)
+                    .try_into()
+                    .map_err(|_| EINVAL)?
+            } else {
+                request[NLMSG_HDRLEN + 4]
+            };
+            let oif = find_attr(request, 12, RTA_OIF).ok_or(EINVAL)?;
+            if oif.len() != 4 {
+                return Err(EINVAL);
+            }
+            let ifindex = u32::from_ne_bytes(oif.try_into().map_err(|_| EINVAL)?);
+            let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
+            if iface_name != admin.iface_name() {
+                return Err(EPERM);
+            }
+            let dst = match find_attr(request, 12, RTA_DST) {
+                Some(raw) if raw.len() == 4 => raw.try_into().map_err(|_| EINVAL)?,
+                Some(_) => return Err(EINVAL),
+                None if prefix_len == 0 => [0; 4],
+                None => return Err(EINVAL),
+            };
+            if hdr.msg_type == RTM_DELROUTE {
+                return admin
+                    .del_ipv4_route(dst, prefix_len, table)
+                    .map_err(admin_errno);
+            }
+            let gateway = match find_attr(request, 12, RTA_GATEWAY) {
+                Some(raw) if raw.len() == 4 => Some(raw.try_into().map_err(|_| EINVAL)?),
+                Some(_) => return Err(EINVAL),
+                None => None,
+            };
+            let preferred_src = match find_attr(request, 12, RTA_PREFSRC) {
+                Some(raw) if raw.len() == 4 => Some(raw.try_into().map_err(|_| EINVAL)?),
+                Some(_) => return Err(EINVAL),
+                None => None,
+            };
+            let metric = match find_attr(request, 12, RTA_PRIORITY) {
+                Some(raw) if raw.len() == 4 => {
+                    u32::from_ne_bytes(raw.try_into().map_err(|_| EINVAL)?)
+                }
+                Some(_) => return Err(EINVAL),
+                None => 0,
+            };
+            admin
+                .add_ipv4_route(crate::AdminIpv4Route {
+                    dst,
+                    prefix_len,
+                    gateway,
+                    preferred_src,
+                    metric,
+                    scope,
+                    table,
+                })
+                .map_err(admin_errno)
+        }
         RTM_DELLINK => Err(EOPNOTSUPP),
         _ => Err(EOPNOTSUPP),
     }
@@ -728,7 +802,13 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
 fn is_mutation(msg_type: u16) -> bool {
     matches!(
         msg_type,
-        RTM_NEWLINK | RTM_DELLINK | RTM_SETLINK | RTM_NEWADDR | RTM_DELADDR
+        RTM_NEWLINK
+            | RTM_DELLINK
+            | RTM_SETLINK
+            | RTM_NEWADDR
+            | RTM_DELADDR
+            | RTM_NEWROUTE
+            | RTM_DELROUTE
     )
 }
 

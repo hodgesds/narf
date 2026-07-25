@@ -2,6 +2,7 @@
 
 use super::*;
 extern crate alloc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// Build a `struct nlmsghdr` request buffer: len is filled to header size,
@@ -361,4 +362,60 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
         0
     );
     assert_eq!(crate::iface::lookup(name).unwrap().mtu, 9000);
+}
+
+#[test]
+fn delegated_admin_can_add_and_delete_ipv4_route() {
+    fn discard(_: &[u8]) -> Result<(), ()> {
+        Ok(())
+    }
+
+    let name = "rtnl-route-admin0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 2, 1], discard);
+    let ifindex = crate::iface::snapshot_all()
+        .iter()
+        .position(|iface| iface.name == name)
+        .unwrap() as u32
+        + 2;
+    let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
+    let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
+
+    let route_request = |kind| {
+        let mut body = vec![
+            AF_INET,
+            24,
+            0,
+            0,
+            crate::route::TABLE_MAIN,
+            RTPROT_KERNEL,
+            crate::route::Scope::Link as u8,
+            RTN_UNICAST,
+        ];
+        body.extend_from_slice(&0u32.to_ne_bytes());
+        push_rtattr(&mut body, RTA_DST, &[198, 51, 100, 0]);
+        push_rtattr(&mut body, RTA_OIF, &ifindex.to_ne_bytes());
+        frame_message(kind, NLM_F_REQUEST | NLM_F_ACK, 105, 1, &body)
+    };
+
+    let add = build_replies_authorized(&route_request(RTM_NEWROUTE), Some(&admin)).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(add[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()),
+        0
+    );
+    assert!(crate::route::route_list().iter().any(|route| {
+        route.iface == name && route.dst.addr.0 == [198, 51, 100, 0] && route.dst.prefix_len == 24
+    }));
+
+    let delete = build_replies_authorized(&route_request(RTM_DELROUTE), Some(&admin)).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(
+            delete[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap()
+        ),
+        0
+    );
+    assert!(!crate::route::route_list().iter().any(|route| {
+        route.iface == name && route.dst.addr.0 == [198, 51, 100, 0] && route.dst.prefix_len == 24
+    }));
 }
