@@ -142,6 +142,49 @@ pub fn ptrace_init() {
     *PTRACE_STATE.lock() = Some(PtraceRegistry::default());
 }
 
+/// Retire every ptrace row owned by an exiting process.
+///
+/// PIDs are recycled, so leaving a dead tracee in `tracers` makes the next
+/// owner of that PID look already traced and turns PTRACE_TRACEME into EPERM.
+/// If the exiting process was itself a tracer, detach and wake its tracees so
+/// they do not remain parked forever.
+pub(crate) fn release_process(pid: u64) {
+    let detached = {
+        let mut g = PTRACE_STATE.lock();
+        let Some(r) = g.as_mut() else {
+            return;
+        };
+
+        r.tracers.remove(&pid);
+        r.stopped.remove(&pid);
+        r.stop_signal.remove(&pid);
+        r.signal_bypass.remove(&pid);
+        r.syscall_stop.remove(&pid);
+        r.options.remove(&pid);
+        r.orig_rax.remove(&pid);
+
+        let tracees: alloc::vec::Vec<u64> = r
+            .tracers
+            .iter()
+            .filter_map(|(&tracee, &tracer)| (tracer == pid).then_some(tracee))
+            .collect();
+        for tracee in &tracees {
+            r.tracers.remove(tracee);
+            r.stopped.remove(tracee);
+            r.stop_signal.remove(tracee);
+            r.signal_bypass.remove(tracee);
+            r.syscall_stop.remove(tracee);
+            r.options.remove(tracee);
+            r.orig_rax.remove(tracee);
+        }
+        tracees
+    };
+
+    for tracee in detached {
+        crate::handlers::wake_signal(pid_to_tid(tracee));
+    }
+}
+
 pub fn get_task_tracer(child_pid: u64) -> Option<u64> {
     let g = PTRACE_STATE.lock();
     g.as_ref()?.tracers.get(&child_pid).copied()

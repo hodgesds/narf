@@ -6399,6 +6399,9 @@ fn on_thread_exit(_pid: u64, tid: u64) {
 /// task and returns the PID. Running this per thread double-freed the
 /// PID pool and the parent's reap queue (the OCI teardown #UD).
 fn on_child_exit(child_pid: u64, _child_tid: u64) {
+    #[cfg(feature = "linux-compat")]
+    crate::ptrace::release_process(child_pid);
+
     // Wave-61: notify any pidfd_open()'d watchers that the target
     // exited, regardless of whether a parent reaps it.
     crate::pidfd::notify_exit(child_pid);
