@@ -105,7 +105,10 @@ pub fn kernel_ram_range_mapped(start: PhysAddr, len: u64) -> bool;
 pub fn online_node_mask() -> u64;
 pub fn online_node_count() -> usize;
 pub fn hotplug_node_for_phys(addr: PhysAddr) -> Option<usize>;
+/// Post-commit observer invoked with no allocator/hotplug lock held.
+pub fn install_memory_hotplug_hook(hook: fn());
 pub const MEMORY_BLOCK_SIZE: u64;
+/// Includes previously discovered offline blocks so memoryN identity persists.
 pub fn memory_blocks() -> Vec<MemoryBlock>;
 
 /// Publish local HMAT coordinates and derive Linux-style memory tiers.

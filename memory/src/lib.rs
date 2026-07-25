@@ -101,14 +101,14 @@ pub use frame::alloc_frame_on_strict;
 pub use frame::{
     alloc_frame, alloc_frame_anywhere, alloc_frame_on, alloc_pages_on, current_frame_alloc_name,
     free_frame, free_pages, hotplug_node_for_phys, init_from_map, install_frame_alloc,
-    is_numa_aware, memory_blocks, node_for_phys, node_free, node_free_blocks, node_total,
-    numa_node_stats, offline_memory_range, online_memory_range, online_node_count,
-    online_node_mask, rebalance_to_topology, release_early_ceiling, reserve_for_slab_promotion,
-    stats as frame_stats, validate_no_overlap as frame_validate_no_overlap, BuddyFrameAlloc,
-    BumpFrameAlloc, FrameAlloc, FrameAllocError, FrameStats, MemAlloc, MemoryBlock,
-    MemoryHotplugError, NumaNodeStats, PhysFrame, UsableRegion, BUDDY_FRAME_ALLOC,
-    BUDDY_ORDER_COUNT, MAX_NUMA_NODES as FRAME_MAX_NUMA_NODES, MEMORY_BLOCK_SIZE, PAGE_SHIFT,
-    PAGE_SIZE,
+    install_memory_hotplug_hook, is_numa_aware, memory_blocks, node_for_phys, node_free,
+    node_free_blocks, node_total, numa_node_stats, offline_memory_range, online_memory_range,
+    online_node_count, online_node_mask, rebalance_to_topology, release_early_ceiling,
+    reserve_for_slab_promotion, stats as frame_stats,
+    validate_no_overlap as frame_validate_no_overlap, BuddyFrameAlloc, BumpFrameAlloc, FrameAlloc,
+    FrameAllocError, FrameStats, MemAlloc, MemoryBlock, MemoryHotplugError, NumaNodeStats,
+    PhysFrame, UsableRegion, BUDDY_FRAME_ALLOC, BUDDY_ORDER_COUNT,
+    MAX_NUMA_NODES as FRAME_MAX_NUMA_NODES, MEMORY_BLOCK_SIZE, PAGE_SHIFT, PAGE_SIZE,
 };
 
 /// Whether the complete physical range is reachable through the kernel's

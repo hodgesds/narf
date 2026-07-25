@@ -123,6 +123,13 @@ regions with effective policy and per-node residency for
 Sysfs exposes Linux memory blocks under `/sys/devices/system/memory/memoryN`
 and each block's `nodeN/memoryN` membership from allocator RAM ranges
 classified by SRAT; CPU topology is never used to infer memory membership.
+Runtime hotplug creates newly discovered `memoryN` objects after allocator
+commit. Offline blocks retain their identity and node membership, while
+`state` and `online` query live topology across offline/online cycles.
+Only CPU- or memory-bearing `nodeN` directories are instantiated; unused
+architectural slots remain advertised through `possible` without appearing as
+phantom nodes to Linux perf's directory-based topology reader. Membership is a
+Linux-compatible `nodeN/memoryM -> ../../memory/memoryM` symlink.
 
 Bootstrap: every new process receives two ring pairs (submit + complete)
 for the kernel ABI plus a read-only config page with capability

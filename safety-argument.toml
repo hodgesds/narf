@@ -66,3 +66,7 @@ argument = "Memory-block membership is derived from authoritative boot and hotpl
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "Externally owned shared pages carry one registry reference per address-space alias. Handle removal prevents new aliases but defers frame reuse until every mapped alias has torn down its leaf and completed cross-CPU TLB invalidation; mapping, unmapping, MAP_FIXED replacement, fork aliasing, and migration use one shared transaction order."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The memory-hotplug observer runs only after allocator donation/removal and topology-registry commit, with both locks released. It receives no physical-frame ownership and can only rebuild read-only sysfs topology; failed and busy transactions emit no notification. Offline ranges remain recorded solely as non-allocatable topology."

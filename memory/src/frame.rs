@@ -23,7 +23,7 @@
 //! `#[no_mangle]` definitions calling into narf-acpi at boot.
 
 use core::fmt;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
@@ -231,11 +231,31 @@ struct HotplugRange {
     start: u64,
     len: u64,
     node: usize,
+    online: bool,
 }
 
 static HOTPLUG_RANGES: IrqSafeSpinLock<Vec<HotplugRange>> = IrqSafeSpinLock::new(Vec::new());
 static BOOT_MEMORY_RANGES: IrqSafeSpinLock<Vec<(u64, u64)>> = IrqSafeSpinLock::new(Vec::new());
 static ONLINE_NODE_MASK: AtomicU64 = AtomicU64::new(1);
+static MEMORY_HOTPLUG_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install a post-commit observer for memory-block topology changes.
+///
+/// The callback runs after allocator and hotplug-registry locks are released,
+/// so it may safely query [`memory_blocks`]. Installation is expected once
+/// during sysfs initialisation.
+pub fn install_memory_hotplug_hook(hook: fn()) {
+    MEMORY_HOTPLUG_HOOK.store(hook as usize, Ordering::Release);
+}
+
+fn notify_memory_hotplug() {
+    let raw = MEMORY_HOTPLUG_HOOK.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: only `install_memory_hotplug_hook` stores a function pointer.
+        let hook: fn() = unsafe { core::mem::transmute(raw) };
+        hook();
+    }
+}
 
 /// Linux-compatible logical memory-block size. Linux's generic default is
 /// 128 MiB; keeping this fixed makes block ids stable across hotplug events.
@@ -564,33 +584,62 @@ pub unsafe fn online_memory_range(
     }
     let mut ranges = HOTPLUG_RANGES.lock();
     let end = start.raw() + len;
-    if ranges
+    let existing = ranges
         .iter()
-        .any(|range| range.start < end && start.raw() < range.start + range.len)
-    {
-        return Err(MemoryHotplugError::Overlap);
-    }
-    ranges.push(HotplugRange {
-        start: start.raw(),
-        len,
-        node,
-    });
+        .position(|range| range.start < end && start.raw() < range.start + range.len);
+    let reused = if let Some(index) = existing {
+        let range = ranges[index];
+        if range.start != start.raw() || range.len != len || range.node != node || range.online {
+            return Err(MemoryHotplugError::Overlap);
+        }
+        ranges[index].online = true;
+        true
+    } else {
+        ranges.push(HotplugRange {
+            start: start.raw(),
+            len,
+            node,
+            online: true,
+        });
+        false
+    };
 
     let first_frame = start.raw() >> PAGE_SHIFT;
     let frame_count = len >> PAGE_SHIFT;
     let mut allocator = ALLOC.lock();
     if !allocator.initialised {
-        ranges.pop();
+        if reused {
+            if let Some(range) = ranges
+                .iter_mut()
+                .find(|range| range.start == start.raw() && range.len == len)
+            {
+                range.online = false;
+            }
+        } else {
+            ranges.pop();
+        }
         return Err(MemoryHotplugError::Uninitialised);
     }
     if !allocator.zones[node].can_donate_without_growth(first_frame, frame_count) {
-        ranges.pop();
+        if reused {
+            if let Some(range) = ranges
+                .iter_mut()
+                .find(|range| range.start == start.raw() && range.len == len)
+            {
+                range.online = false;
+            }
+        } else {
+            ranges.pop();
+        }
         return Err(MemoryHotplugError::MetadataCapacity);
     }
     allocator.zones[node].donate(first_frame, frame_count);
     allocator.node_total_frames[node] += frame_count as usize;
     allocator.total_frames += frame_count as usize;
     ONLINE_NODE_MASK.fetch_or(1u64 << node, Ordering::AcqRel);
+    drop(allocator);
+    drop(ranges);
+    notify_memory_hotplug();
     Ok(())
 }
 
@@ -604,7 +653,7 @@ pub fn offline_memory_range(start: PhysAddr, len: u64) -> Result<usize, MemoryHo
     let mut ranges = HOTPLUG_RANGES.lock();
     let Some(index) = ranges
         .iter()
-        .position(|range| range.start == start.raw() && range.len == len)
+        .position(|range| range.start == start.raw() && range.len == len && range.online)
     else {
         return Err(MemoryHotplugError::NotOnline);
     };
@@ -617,10 +666,13 @@ pub fn offline_memory_range(start: PhysAddr, len: u64) -> Result<usize, MemoryHo
     }
     allocator.node_total_frames[range.node] -= frame_count as usize;
     allocator.total_frames -= frame_count as usize;
-    ranges.swap_remove(index);
+    ranges[index].online = false;
     if allocator.node_total_frames[range.node] == 0 {
         ONLINE_NODE_MASK.fetch_and(!(1u64 << range.node), Ordering::AcqRel);
     }
+    drop(allocator);
+    drop(ranges);
+    notify_memory_hotplug();
     Ok(range.node)
 }
 
@@ -1405,8 +1457,12 @@ pub fn hotplug_node_for_phys(addr: u64) -> Option<usize> {
 pub fn memory_blocks() -> Vec<MemoryBlock> {
     let boot = BOOT_MEMORY_RANGES.lock().clone();
     let hotplug = HOTPLUG_RANGES.lock().clone();
+    memory_blocks_from_ranges(&boot, &hotplug)
+}
+
+fn memory_blocks_from_ranges(boot: &[(u64, u64)], hotplug: &[HotplugRange]) -> Vec<MemoryBlock> {
     let mut ids = Vec::new();
-    for &(start, len) in &boot {
+    for &(start, len) in boot {
         let first = start / MEMORY_BLOCK_SIZE;
         let last = start.saturating_add(len).saturating_sub(1) / MEMORY_BLOCK_SIZE;
         for id in first..=last {
@@ -1415,7 +1471,7 @@ pub fn memory_blocks() -> Vec<MemoryBlock> {
             }
         }
     }
-    for range in &hotplug {
+    for range in hotplug {
         let first = range.start / MEMORY_BLOCK_SIZE;
         let last = range.start.saturating_add(range.len).saturating_sub(1) / MEMORY_BLOCK_SIZE;
         for id in first..=last {
@@ -1440,20 +1496,60 @@ pub fn memory_blocks() -> Vec<MemoryBlock> {
                 }))
                 .min()
                 .unwrap_or(start);
+            let node = hotplug
+                .iter()
+                .find(|range| {
+                    start < range.start + range.len && range.start < start + MEMORY_BLOCK_SIZE
+                })
+                .map(|range| range.node)
+                .unwrap_or_else(|| phys_to_node(sample));
             MemoryBlock {
                 id,
                 start,
-                node: phys_to_node(sample),
+                node,
                 online: boot
                     .iter()
                     .any(|&(base, len)| start < base + len && base < start + MEMORY_BLOCK_SIZE)
                     || hotplug.iter().any(|range| {
-                        start < range.start + range.len && range.start < start + MEMORY_BLOCK_SIZE
+                        range.online
+                            && start < range.start + range.len
+                            && range.start < start + MEMORY_BLOCK_SIZE
                     }),
             }
         })
         .collect()
 }
+
+fn smoke_memory_blocks_persist_offline_topology() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+
+    let base = 8 * MEMORY_BLOCK_SIZE;
+    let ranges = [
+        HotplugRange {
+            start: base,
+            len: MEMORY_BLOCK_SIZE / 2,
+            node: 3,
+            online: false,
+        },
+        HotplugRange {
+            start: base + MEMORY_BLOCK_SIZE,
+            len: MEMORY_BLOCK_SIZE,
+            node: 4,
+            online: true,
+        },
+    ];
+    let blocks = memory_blocks_from_ranges(&[], &ranges);
+    let offline = blocks.iter().find(|block| block.id == 8);
+    let online = blocks.iter().find(|block| block.id == 9);
+    if offline.is_none_or(|block| block.online || block.node != 3)
+        || online.is_none_or(|block| !block.online || block.node != 4)
+    {
+        TestResult::Fail("offline identity or live state was not preserved")
+    } else {
+        TestResult::Pass
+    }
+}
+narf_kernel_test::kernel_test_in!("memory/numa", smoke_memory_blocks_persist_offline_topology);
 
 #[inline]
 pub(crate) fn current_cpu_node() -> usize {
