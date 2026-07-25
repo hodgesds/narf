@@ -114,14 +114,21 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         let task = current_task_id();
         let stored = resolve_policy(task, base);
         let allowed = narf_scheduler::task_mems_allowed(task);
-        let policy = narf_memory::Mempolicy {
+        let mut policy = narf_memory::Mempolicy {
             mode: stored.mode & !MPOL_MODE_FLAGS,
             nodemask: mpol_effective_nodemask(stored, allowed),
             allowed,
             home_node: stored.home_node,
+            interleave_index: 0,
         };
         let mut frames = alloc::vec::Vec::with_capacity((len / page_size) as usize);
         for _ in 0..(len / page_size) {
+            if matches!(
+                policy.mode,
+                narf_memory::MPOL_INTERLEAVE | narf_memory::MPOL_WEIGHTED_INTERLEAVE
+            ) {
+                policy.interleave_index = task_interleave_index(task, true);
+            }
             let frame = match narf_memory::hugepage::alloc_hugepage_with(
                 size,
                 policy,

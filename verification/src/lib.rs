@@ -2003,6 +2003,7 @@ fn smoke_numa_mempolicy_bind_steers_alloc() -> TestResult {
         nodemask: 0b10,
         allowed: u64::MAX,
         home_node: u32::MAX,
+        interleave_index: 0,
     });
     let f = match narf_memory::alloc_frame_policied(0) {
         Ok(f) => f,

@@ -3330,6 +3330,26 @@ static MBIND_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<(u64, u64, StoredPolicy)>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Linux keeps `il_prev`/`il_weight` in task state. NARF stores the equivalent
+/// monotonically increasing sequence position by task ID so CPU migration
+/// cannot restart or duplicate an interleave cycle.
+static INTERLEAVE_INDEX_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, u64>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn task_interleave_index(task: u64, advance: bool) -> u64 {
+    let mut table = INTERLEAVE_INDEX_TABLE.lock();
+    let index = table
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .entry(task)
+        .or_insert(0);
+    let current = *index;
+    if advance {
+        *index = index.wrapping_add(1);
+    }
+    current
+}
+
 fn mpol_mode_valid(mode: u32) -> bool {
     matches!(mode & !MPOL_MODE_FLAGS, 0..=MPOL_WEIGHTED_INTERLEAVE)
 }
@@ -3422,11 +3442,21 @@ pub fn publish_mempolicy_for_fault(va: u64) {
     let task = current_task_id();
     let policy = resolve_policy(task, va);
     let allowed = narf_scheduler::task_mems_allowed(task);
+    let mode = policy.mode & !MPOL_MODE_FLAGS;
+    let interleave_index = if matches!(
+        mode,
+        narf_memory::MPOL_INTERLEAVE | narf_memory::MPOL_WEIGHTED_INTERLEAVE
+    ) {
+        task_interleave_index(task, true)
+    } else {
+        0
+    };
     narf_memory::mempolicy_set(narf_memory::Mempolicy {
-        mode: policy.mode & !MPOL_MODE_FLAGS,
+        mode,
         nodemask: mpol_effective_nodemask(policy, allowed),
         allowed,
         home_node: policy.home_node,
+        interleave_index,
     });
 }
 
@@ -6022,6 +6052,9 @@ fn release_task_tables(tid: u64) {
         m.remove(&tid);
     }
     if let Some(m) = MBIND_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = INTERLEAVE_INDEX_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
     narf_scheduler::clear_task_mems_allowed(tid);

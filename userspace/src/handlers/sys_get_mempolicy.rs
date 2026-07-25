@@ -106,9 +106,10 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
                 return;
             }
             let mask = mpol_effective_nodemask(policy, narf_scheduler::task_mems_allowed(task));
-            narf_memory::peek_interleave_node(
+            narf_memory::interleave_node_at(
                 mask,
                 policy_mode == narf_memory::MPOL_WEIGHTED_INTERLEAVE,
+                task_interleave_index(task, false),
             ) as i32
         } else {
             policy.mode as i32

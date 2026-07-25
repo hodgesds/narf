@@ -235,9 +235,11 @@ pub fn alloc_hugepage_with(
     let preferred = match policy.mode {
         MPOL_BIND | MPOL_PREFERRED if requested != 0 => requested.trailing_zeros() as usize,
         MPOL_PREFERRED_MANY if requested != 0 => anchor,
-        MPOL_INTERLEAVE if requested != 0 => crate::mempolicy::next_interleave_node(requested),
+        MPOL_INTERLEAVE if requested != 0 => {
+            crate::mempolicy::next_interleave_node(requested, policy.interleave_index)
+        }
         MPOL_WEIGHTED_INTERLEAVE if requested != 0 => {
-            crate::mempolicy::next_weighted_interleave_node(requested)
+            crate::mempolicy::next_weighted_interleave_node(requested, policy.interleave_index)
         }
         _ => anchor,
     };

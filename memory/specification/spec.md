@@ -76,13 +76,15 @@ pub struct Mempolicy {
     /// MPOL_BIND/MPOL_PREFERRED_MANY distance anchor; u32::MAX selects
     /// the policy's default anchor.
     pub home_node: u32,
+    /// Task-owned sequence position for interleave policies.
+    pub interleave_index: u64,
 }
 pub fn mempolicy_set(policy: Mempolicy);
 pub fn mempolicy_clear();
 /// Global Linux MPOL_WEIGHTED_INTERLEAVE ratios (valid weights 1..=255).
 pub fn interleave_weight(node: usize) -> Option<u8>;
 pub fn set_interleave_weight(node: usize, weight: u8) -> Result<(), ()>;
-pub fn peek_interleave_node(mask: u64, weighted: bool) -> usize;
+pub fn interleave_node_at(mask: u64, weighted: bool, index: u64) -> usize;
 pub fn interleave_auto() -> bool;
 pub fn set_interleave_auto(enabled: bool) -> Result<(), ()>;
 pub fn set_interleave_bandwidth(node: usize, bandwidth: u64) -> Result<(), ()>;

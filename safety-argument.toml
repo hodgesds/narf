@@ -30,3 +30,7 @@ argument = "Weighted interleave changes only target-node selection before existi
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "HMAT automatic weighting publishes bounded allocation ratios through atomics under a configuration lock. Firmware coordinates cannot expand a task's cpuset policy mask or grant mapping/domain authority, and missing coordinates fail rather than fabricating topology."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Moving interleave sequence ownership from CPU slots to task-scoped userspace-compat state changes only deterministic target selection. The active fault policy still intersects cpuset.mems before entering the allocator, and task teardown reclaims the sequence state."

@@ -59,5 +59,9 @@ pub(crate) fn sys_set_mempolicy(ctx: &mut dyn TrapContext) {
                 home_node: u32::MAX,
             },
         );
+    INTERLEAVE_INDEX_TABLE
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(task, 0);
     ctx.set_return(SyscallReturn::ok(0));
 }

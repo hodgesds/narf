@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sched.h>
 
 #ifndef MAP_HUGETLB
 #define MAP_HUGETLB 0x40000
@@ -137,6 +138,13 @@ int main(void) {
     void *weighted_pages[4];
     int weighted_status[4] = { -1, -1, -1, -1 };
     for (int i = 0; i < 4; i++) {
+        cpu_set_t affinity;
+        CPU_ZERO(&affinity);
+        CPU_SET((i & 1) ? 8 : 0, &affinity);
+        if (sched_setaffinity(0, sizeof affinity, &affinity) != 0) {
+            w("numa-fail: weighted-affinity\n");
+            return 1;
+        }
         weighted_pages[i] = weighted + i * 4096;
         weighted[i * 4096] = (unsigned char)i;
     }
@@ -149,6 +157,10 @@ int main(void) {
     }
     syscall(SYS_set_mempolicy, 0, 0, 0);
     munmap(weighted, 4 * 4096);
+    cpu_set_t all_cpus;
+    CPU_ZERO(&all_cpus);
+    for (int cpu = 0; cpu < 16; cpu++) CPU_SET(cpu, &all_cpus);
+    sched_setaffinity(0, sizeof all_cpus, &all_cpus);
 
     // QEMU publishes equal local HMAT bandwidth for both nodes. Re-enabling
     // auto mode must reduce those coordinates back to a 1:1 ratio.

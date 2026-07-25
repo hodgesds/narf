@@ -6762,6 +6762,7 @@ fn smoke_mempolicy_allowed_mask_is_hard_boundary() -> TestResult {
         nodemask: 0,
         allowed: 0b10,
         home_node: u32::MAX,
+        interleave_index: 0,
     };
     let frame = match crate::mempolicy::alloc_frame_with(policy, 0) {
         Ok(frame) => frame,

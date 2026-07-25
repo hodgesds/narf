@@ -82,6 +82,9 @@ the policy mask with `cpuset.mems`. Weights are configured through Linux's
 Automatic mode consumes real local-node HMAT access-bandwidth coordinates,
 reduces them to bounded integer ratios, and is controlled by the sibling
 `auto` attribute. A manual node-weight write disables automatic mode.
+Ordinary and weighted interleave sequence positions are task-owned, survive
+CPU migration, and are reclaimed with the task; CPU-local allocator state
+does not determine a process's placement cycle.
 `mbind(MPOL_MF_MOVE)` immediately conforms resident private pages in the
 range, `MPOL_MF_STRICT` reports remaining misplacement as `EIO`, and
 `MPOL_MF_MOVE_ALL` requires authority NARF does not grant ambiently.
