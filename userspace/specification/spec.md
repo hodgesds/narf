@@ -101,6 +101,11 @@ eligible policy overlaps.
 every live address-space alias under one rollback-capable transaction and
 committing the shared-object backing last. Device/DMA shared mappings remain
 non-migratable without an owner-specific quiesce protocol.
+Removing a shared-memory handle rejects new attachments immediately but keeps
+each already-mapped backing page registered and movable until its final
+address-space alias is unmapped. Alias release occurs only after leaf teardown
+and cross-CPU TLB invalidation; the final release returns the frame to the
+allocator.
 Anonymous private `mmap(MAP_HUGETLB)` supports Linux's default/explicit
 2 MiB and explicit 1 GiB encodings when boot-reserved backing is available.
 Mappings use hardware PD/PDPT leaves on x86_64 and L2/L1 block descriptors

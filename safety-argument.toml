@@ -62,3 +62,7 @@ argument = "Shared-memory migration serializes alias creation with replacement, 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Memory-block membership is derived from authoritative boot and hotplug physical RAM ranges classified by SRAT proximity, never inferred from CPU placement or fabricated for absent memory."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Externally owned shared pages carry one registry reference per address-space alias. Handle removal prevents new aliases but defers frame reuse until every mapped alias has torn down its leaf and completed cross-CPU TLB invalidation; mapping, unmapping, MAP_FIXED replacement, fork aliasing, and migration use one shared transaction order."

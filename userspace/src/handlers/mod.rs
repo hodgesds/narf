@@ -3960,6 +3960,8 @@ pub struct ShmemSyscallVtable {
     pub owns_frame: fn(phys: u64) -> bool,
     /// Atomically replace one registry backing entry after all aliases moved.
     pub replace_frame: fn(old_phys: u64, new_phys: u64) -> bool,
+    pub retain_frame: fn(phys: u64),
+    pub release_frame: fn(phys: u64),
 }
 
 impl core::fmt::Debug for ShmemSyscallVtable {
@@ -3985,6 +3987,18 @@ fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
     } else {
         // SAFETY: install_shmem_syscall_vtable requires a 'static input.
         Some(unsafe { &*p })
+    }
+}
+
+pub fn retain_external_shared_frame(phys: u64) {
+    if let Some(vtable) = shmem_vtable() {
+        (vtable.retain_frame)(phys);
+    }
+}
+
+pub fn release_external_shared_frame(phys: u64) {
+    if let Some(vtable) = shmem_vtable() {
+        (vtable.release_frame)(phys);
     }
 }
 

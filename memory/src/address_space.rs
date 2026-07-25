@@ -23,6 +23,28 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// The closure must not await or enter code that can recursively map SHARED
 /// memory.
 static SHARED_MAPPING_TRANSACTION: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
+type SharedFrameHooks = (fn(u64), fn(u64));
+static SHARED_FRAME_HOOKS: IrqSafeSpinLock<Option<SharedFrameHooks>> = IrqSafeSpinLock::new(None);
+
+pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64)) {
+    *SHARED_FRAME_HOOKS.lock() = Some((retain, release));
+}
+
+fn retain_shared_frames(region: &Region) {
+    if let Some((retain, _)) = *SHARED_FRAME_HOOKS.lock() {
+        for phys in region.phys.iter().filter(|phys| phys.raw() != 0) {
+            retain(phys.raw());
+        }
+    }
+}
+
+fn release_shared_phys(phys: PhysAddr) {
+    if phys.raw() != 0 {
+        if let Some((_, release)) = *SHARED_FRAME_HOOKS.lock() {
+            release(phys.raw());
+        }
+    }
+}
 
 pub fn with_shared_mapping_transaction<R>(f: impl FnOnce() -> R) -> R {
     let _guard = SHARED_MAPPING_TRANSACTION.lock();
@@ -633,6 +655,9 @@ impl AddressSpace {
             }
         }
         let (rb, rl) = (region.base.as_u64(), region.len);
+        if region.perms.contains(RegionPerms::SHARED) {
+            retain_shared_frames(&region);
+        }
         regions.push(region);
         drop(regions);
         // Keep the mmap-allocation cursor past anything mapped into the
@@ -1039,6 +1064,7 @@ impl AddressSpace {
     /// (below) which calls into the same primitive for every
     /// surviving region plus the page-table pages themselves.
     pub fn unmap_region(&self, base: VirtAddr) -> Result<Region, AddressSpaceError> {
+        let _shared_transaction = SHARED_MAPPING_TRANSACTION.lock();
         let region = {
             let mut regions = self.regions.lock();
             let idx = regions
@@ -1087,6 +1113,7 @@ impl AddressSpace {
     /// individual segments — the non-overlaid pages (e.g. the ELF header)
     /// must survive.
     pub fn punch_fixed(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
+        let _shared_transaction = SHARED_MAPPING_TRANSACTION.lock();
         if base.as_u64() & 0xFFF != 0 || len & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
@@ -1197,6 +1224,8 @@ impl AddressSpace {
                                 to_free.push(*p);
                             }
                         }
+                    } else if let Some(p) = old.phys.get(pg) {
+                        release_shared_phys(*p);
                     }
                 }
                 // Prefix [rb, lo) keeps its frames + already-installed PTEs.
@@ -1366,6 +1395,9 @@ impl AddressSpace {
     fn free_region_frames(&self, region: &Region) {
         use crate::frame::{free_frame, PhysFrame};
         if region.perms.contains(RegionPerms::SHARED) {
+            for phys in &region.phys {
+                release_shared_phys(*phys);
+            }
             return;
         }
         let pages = (region.len + 0xFFF) >> 12;
@@ -3734,6 +3766,7 @@ impl Drop for AddressSpace {
     /// entries on x86_64 are not freed — only the user half
     /// (entries 0..=255) and the PML4 frame itself.
     fn drop(&mut self) {
+        let _shared_transaction = SHARED_MAPPING_TRANSACTION.lock();
         let huge_regions = core::mem::take(&mut *self.huge_regions.lock());
         for region in huge_regions {
             let page_size = match region.size {

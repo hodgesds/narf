@@ -3311,6 +3311,10 @@ fn boot_userspace_init() {
         narf_scheduler::address_space_of(id)
     });
     install_all_address_spaces_lookup(narf_scheduler::all_address_spaces);
+    narf_memory::install_shared_frame_hooks(
+        narf_userspace::retain_external_shared_frame,
+        narf_userspace::release_external_shared_frame,
+    );
     // Make `gettid` (and any handler that calls
     // `current_task_id`) report the scheduler's TaskId rather
     // than 0. Required for `sys_clone` to be observable from user

@@ -163,6 +163,12 @@ impl AddressSpace {
     pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot>;
 }
 
+/// Install the external shared-page owner's per-alias lifetime hooks.
+/// Every SHARED map retains each non-zero backing frame; unmap, MAP_FIXED
+/// replacement, and address-space teardown release only after the
+/// corresponding translations have been invalidated.
+pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64));
+
 impl AddressSpace {
     /// Replace one resident private base page, or the complete hardware leaf
     /// containing a huge-page address, with equivalent backing from a target
