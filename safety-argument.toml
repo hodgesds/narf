@@ -26,3 +26,7 @@ argument = "Correcting Linux mempolicy flag values and adding PREFERRED_MANY onl
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Weighted interleave changes only target-node selection before existing owned frame and huge-frame allocation. The policy mask remains intersected with cpuset.mems, weights cannot be zero, and no mapping, ownership, domain-rights, or authority checks are bypassed."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "HMAT automatic weighting publishes bounded allocation ratios through atomics under a configuration lock. Firmware coordinates cannot expand a task's cpuset policy mask or grant mapping/domain authority, and missing coordinates fail rather than fabricating topology."

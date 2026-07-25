@@ -79,6 +79,9 @@ after preferred nodes are exhausted.
 allocations according to the global per-node weights, while still intersecting
 the policy mask with `cpuset.mems`. Weights are configured through Linux's
 `/sys/kernel/mm/mempolicy/weighted_interleave/nodeN` ABI.
+Automatic mode consumes real local-node HMAT access-bandwidth coordinates,
+reduces them to bounded integer ratios, and is controlled by the sibling
+`auto` attribute. A manual node-weight write disables automatic mode.
 `mbind(MPOL_MF_MOVE)` immediately conforms resident private pages in the
 range, `MPOL_MF_STRICT` reports remaining misplacement as `EIO`, and
 `MPOL_MF_MOVE_ALL` requires authority NARF does not grant ambiently.

@@ -30,7 +30,7 @@
 //! that never sets a policy leaves the slot at `MPOL_DEFAULT`, which
 //! reproduces today's local-first behavior exactly.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::frame::{self, FrameAllocError, PhysFrame, MAX_NUMA_NODES};
 
@@ -68,6 +68,16 @@ static INTERLEAVE_NEXT: [AtomicU32; MAX_TRACKED_CPUS] =
 /// zero; the sysfs ABI accepts the inclusive range 1..=255.
 static INTERLEAVE_WEIGHTS: [AtomicU8; MAX_NUMA_NODES] =
     [const { AtomicU8::new(1) }; MAX_NUMA_NODES];
+
+/// HMAT-derived node bandwidth values used by automatic weighting.
+static INTERLEAVE_BANDWIDTH: [AtomicU64; MAX_NUMA_NODES] =
+    [const { AtomicU64::new(0) }; MAX_NUMA_NODES];
+
+/// Linux defaults weighted interleave to automatic mode.
+static INTERLEAVE_AUTO: AtomicBool = AtomicBool::new(true);
+
+static INTERLEAVE_CONFIG_LOCK: narf_lib::sync::IrqSafeSpinLock<()> =
+    narf_lib::sync::IrqSafeSpinLock::new(());
 
 /// Per-CPU position within the expanded weighted schedule.
 static WEIGHTED_INTERLEAVE_NEXT: [AtomicU32; MAX_TRACKED_CPUS] =
@@ -194,8 +204,88 @@ pub fn set_interleave_weight(node: usize, weight: u8) -> Result<(), ()> {
     let Some(slot) = INTERLEAVE_WEIGHTS.get(node) else {
         return Err(());
     };
+    let _guard = INTERLEAVE_CONFIG_LOCK.lock();
     slot.store(weight, Ordering::Release);
+    INTERLEAVE_AUTO.store(false, Ordering::Release);
     Ok(())
+}
+
+/// Whether HMAT-derived automatic weighting is enabled.
+pub fn interleave_auto() -> bool {
+    INTERLEAVE_AUTO.load(Ordering::Acquire)
+}
+
+/// Publish a node's real HMAT bandwidth coordinate. Zero means unknown.
+pub fn set_interleave_bandwidth(node: usize, bandwidth: u64) -> Result<(), ()> {
+    let Some(slot) = INTERLEAVE_BANDWIDTH.get(node) else {
+        return Err(());
+    };
+    let _guard = INTERLEAVE_CONFIG_LOCK.lock();
+    slot.store(bandwidth, Ordering::Release);
+    if interleave_auto() {
+        recompute_auto_weights()?;
+    }
+    Ok(())
+}
+
+/// Enable or disable HMAT-derived weights. Enabling fails when no node has
+/// a usable bandwidth coordinate; disabling preserves the current weights.
+pub fn set_interleave_auto(enabled: bool) -> Result<(), ()> {
+    let _guard = INTERLEAVE_CONFIG_LOCK.lock();
+    if enabled {
+        recompute_auto_weights()?;
+    }
+    INTERLEAVE_AUTO.store(enabled, Ordering::Release);
+    Ok(())
+}
+
+fn recompute_auto_weights() -> Result<(), ()> {
+    const WEIGHTINESS: u64 = 32;
+    let mut bandwidth = [0u64; MAX_NUMA_NODES];
+    let mut sum = 0u64;
+    for (node, value) in INTERLEAVE_BANDWIDTH.iter().enumerate() {
+        bandwidth[node] = value.load(Ordering::Acquire);
+        sum = sum.saturating_add(bandwidth[node]);
+    }
+    if sum == 0 {
+        return Err(());
+    }
+
+    let mut weights = [1u8; MAX_NUMA_NODES];
+    let mut gcd = 0u8;
+    for node in 0..MAX_NUMA_NODES {
+        if bandwidth[node] == 0 {
+            continue;
+        }
+        let scaled = WEIGHTINESS.saturating_mul(bandwidth[node]);
+        let weight = scaled.checked_div(sum).unwrap_or(0).clamp(1, 255) as u8;
+        weights[node] = weight;
+        gcd = if gcd == 0 {
+            weight
+        } else {
+            gcd_u8(gcd, weight)
+        };
+    }
+    if gcd > 1 {
+        for node in 0..MAX_NUMA_NODES {
+            if bandwidth[node] != 0 {
+                weights[node] /= gcd;
+            }
+        }
+    }
+    for (slot, weight) in INTERLEAVE_WEIGHTS.iter().zip(weights) {
+        slot.store(weight, Ordering::Release);
+    }
+    Ok(())
+}
+
+fn gcd_u8(mut a: u8, mut b: u8) -> u8 {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a
 }
 
 fn weighted_interleave_pick(mask: u64) -> usize {

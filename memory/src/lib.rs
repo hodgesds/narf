@@ -114,9 +114,10 @@ pub use heap_backend::{
 };
 pub use mempolicy::{
     active as mempolicy_active, alloc_frame_policied, clear_active as mempolicy_clear,
-    interleave_weight, peek_interleave_node, set_active as mempolicy_set, set_interleave_weight,
-    Mempolicy, MPOL_BIND, MPOL_DEFAULT, MPOL_INTERLEAVE, MPOL_LOCAL, MPOL_PREFERRED,
-    MPOL_PREFERRED_MANY, MPOL_WEIGHTED_INTERLEAVE,
+    interleave_auto, interleave_weight, peek_interleave_node, set_active as mempolicy_set,
+    set_interleave_auto, set_interleave_bandwidth, set_interleave_weight, Mempolicy, MPOL_BIND,
+    MPOL_DEFAULT, MPOL_INTERLEAVE, MPOL_LOCAL, MPOL_PREFERRED, MPOL_PREFERRED_MANY,
+    MPOL_WEIGHTED_INTERLEAVE,
 };
 pub use pager::{
     current_pager_name, install_pager, NoopPager, Pager, PagerAuthority, PagerError, SwapSlot,

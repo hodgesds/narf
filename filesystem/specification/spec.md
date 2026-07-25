@@ -117,6 +117,9 @@ event counters.
 `/sys/kernel/mm/mempolicy/weighted_interleave/nodeN` exposes writable
 decimal weights in Linux's inclusive range 1..=255. Changes affect new
 `MPOL_WEIGHTED_INTERLEAVE` allocations and never migrate existing pages.
+The sibling `auto` attribute accepts Linux boolean strings; enabling it
+recomputes weights from parsed HMAT bandwidth and fails if no usable
+bandwidth coordinates exist. Writing `nodeN` selects manual mode.
 `/proc/buddyinfo` reports live per-order free-block counts, while
 `/proc/zoneinfo` uses stable per-node managed totals and live NUMA events.
 

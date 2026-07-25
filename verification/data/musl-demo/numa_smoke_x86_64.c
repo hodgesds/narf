@@ -118,6 +118,11 @@ int main(void) {
         w("numa-fail: weighted-sysfs\n");
         return 1;
     }
+    if (slurp("/sys/kernel/mm/mempolicy/weighted_interleave/auto",
+              buf, sizeof buf) <= 0 || !starts(buf, "false")) {
+        w("numa-fail: weighted-manual-mode\n");
+        return 1;
+    }
     unsigned long both_nodes = 3;
     if (syscall(SYS_set_mempolicy, 6, &both_nodes, 64) != 0) {
         w("numa-fail: weighted-set\n");
@@ -144,6 +149,17 @@ int main(void) {
     }
     syscall(SYS_set_mempolicy, 0, 0, 0);
     munmap(weighted, 4 * 4096);
+
+    // QEMU publishes equal local HMAT bandwidth for both nodes. Re-enabling
+    // auto mode must reduce those coordinates back to a 1:1 ratio.
+    if (put("/sys/kernel/mm/mempolicy/weighted_interleave/auto", "true\n") ||
+        slurp("/sys/kernel/mm/mempolicy/weighted_interleave/node0",
+              buf, sizeof buf) <= 0 || !starts(buf, "1") ||
+        slurp("/sys/kernel/mm/mempolicy/weighted_interleave/node1",
+              buf, sizeof buf) <= 0 || !starts(buf, "1")) {
+        w("numa-fail: weighted-auto\n");
+        return 1;
+    }
 
     // Real hugetlb mapping smoke. The ordinary suite boots without a
     // reservation and therefore legitimately gets ENOMEM; the dedicated

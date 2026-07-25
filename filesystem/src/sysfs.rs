@@ -1128,6 +1128,31 @@ pub fn populate_weighted_interleave() {
     let weighted = get_or_create_child(&mempolicy, "weighted_interleave");
     let count = (numa_node_count() as usize).clamp(1, NODE_ATTRS.len());
 
+    kobject_add_writable_attr(
+        &weighted,
+        "auto",
+        || format!("{}\n", narf_memory::interleave_auto()),
+        |data| {
+            let text = core::str::from_utf8(data)
+                .map_err(|_| crate::FsError::InvalidData)?
+                .trim();
+            let enabled = if ["1", "y", "yes", "true", "on"]
+                .iter()
+                .any(|value| text.eq_ignore_ascii_case(value))
+            {
+                true
+            } else if ["0", "n", "no", "false", "off"]
+                .iter()
+                .any(|value| text.eq_ignore_ascii_case(value))
+            {
+                false
+            } else {
+                return Err(crate::FsError::InvalidData);
+            };
+            narf_memory::set_interleave_auto(enabled).map_err(|_| crate::FsError::InvalidData)
+        },
+    );
+
     for (node, &name) in NODE_ATTRS[..count].iter().enumerate() {
         kobject_add_writable_attr(
             &weighted,
@@ -1999,6 +2024,7 @@ fn smoke_sysfs_weighted_interleave_controls() -> TestResult {
     };
     if weighted.attr_store("node0", b"7\n") != Some(Ok(()))
         || weighted.attr_show("node0").as_deref() != Some("7\n")
+        || weighted.attr_show("auto").as_deref() != Some("false\n")
     {
         return TestResult::Fail("weighted_interleave node weight did not round-trip");
     }

@@ -83,6 +83,9 @@ pub fn mempolicy_clear();
 pub fn interleave_weight(node: usize) -> Option<u8>;
 pub fn set_interleave_weight(node: usize, weight: u8) -> Result<(), ()>;
 pub fn peek_interleave_node(mask: u64, weighted: bool) -> usize;
+pub fn interleave_auto() -> bool;
+pub fn set_interleave_auto(enabled: bool) -> Result<(), ()>;
+pub fn set_interleave_bandwidth(node: usize, bandwidth: u64) -> Result<(), ()>;
 
 /// Monotonic Linux-compatible allocation-event snapshot for one NUMA node.
 pub fn numa_node_stats(node: usize) -> NumaNodeStats;

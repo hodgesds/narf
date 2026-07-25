@@ -1434,6 +1434,38 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             Ok(n) => {
                                 let _ =
                                     writeln!(console::Writer, "  acpi: HMAT parsed, {} entries", n);
+                                for node in 0..narf_acpi::numa_node_count()
+                                    .min(narf_memory::FRAME_MAX_NUMA_NODES as u32)
+                                {
+                                    let bandwidth = narf_acpi::hmat_value(
+                                        narf_acpi::HmatLatBwKind::AccessBandwidth,
+                                        0,
+                                        node,
+                                        node,
+                                    )
+                                    .or_else(|| {
+                                        let read = narf_acpi::hmat_value(
+                                            narf_acpi::HmatLatBwKind::ReadBandwidth,
+                                            0,
+                                            node,
+                                            node,
+                                        )?;
+                                        let write = narf_acpi::hmat_value(
+                                            narf_acpi::HmatLatBwKind::WriteBandwidth,
+                                            0,
+                                            node,
+                                            node,
+                                        )?;
+                                        Some(read.min(write))
+                                    })
+                                    .unwrap_or(0);
+                                    if bandwidth != 0 {
+                                        let _ = narf_memory::set_interleave_bandwidth(
+                                            node as usize,
+                                            bandwidth,
+                                        );
+                                    }
+                                }
                             }
                             Err(e) => {
                                 let _ = writeln!(
