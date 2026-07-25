@@ -478,6 +478,11 @@ pub trait FileOps: Send + Sync {
         Box::pin(async { Err(FsError::Unsupported) })
     }
 
+    /// Ask the backing filesystem to authorize Linux R_OK/W_OK/X_OK bits.
+    fn access<'a>(&'a self, _mask: u32) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
     /// POSIX-2017 `poll(2)` readiness query. Returns the OR of
     /// the POLL_* bits below for the events currently satisfied
     /// on this file. The default returns `POLL_IN | POLL_OUT`

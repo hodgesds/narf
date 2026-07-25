@@ -2932,6 +2932,8 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
                 Some(fuse_reply(unique, 0, b"user.foo\0"))
             }
         }
+        // FUSE_ACCESS.
+        34 => Some(fuse_reply(unique, 0, &[])),
         // FUSE_WRITE (16): report the requested payload size.
         16 => {
             let win: FuseWriteIn = pod_from_bytes(body)?;
@@ -3284,6 +3286,7 @@ fn smoke_fs_fuse_mutations() -> TestResult {
             || file.get_xattr("user.foo").await != Ok(b"bar".to_vec())
             || file.list_xattr().await != Ok(b"user.foo\0".to_vec())
             || file.remove_xattr("user.foo").await.is_err()
+            || file.access(6).await.is_err()
         {
             OUTCOME.store(4, Ordering::Relaxed);
             return;

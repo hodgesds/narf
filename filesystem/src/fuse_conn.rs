@@ -726,6 +726,19 @@ impl FileOps for FuseFile {
                 .map(|_| ())
         })
     }
+
+    fn access<'a>(&'a self, mask: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.conn
+                .request(
+                    FuseOpcode::Access,
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseAccessIn { mask, padding: 0 }),
+                )
+                .await
+                .map(|_| ())
+        })
+    }
 }
 
 impl Drop for FuseFile {

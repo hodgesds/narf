@@ -157,7 +157,8 @@ replies by the non-zero `unique` identifier.
   are distinct from regular-file `OPEN` and `RELEASE`.
 - The bridge supports lookup, getattr/setattr, create, mknod, mkdir,
   unlink, rmdir, same- and cross-directory rename/link, symlink, open, read,
-  write, flush, fsync/fdatasync, extended attributes, readlink, statfs, readdir, release,
+  write, flush, fsync/fdatasync, extended attributes, access checks,
+  readlink, statfs, readdir, release,
   forget, and initialization.
 
 `FsInstance::statfs` is the asynchronous filesystem-capacity interface.
@@ -180,6 +181,11 @@ Operations spanning distinct connections or mounts report `EXDEV`.
 FUSE uses the Linux two-request size-probe convention for GETXATTR and
 LISTXATTR and preserves XATTR_CREATE/XATTR_REPLACE flags. Filesystems
 without native xattrs retain the userspace side-table fallback.
+
+`FileOps::access` carries Linux R_OK/W_OK/X_OK bits to filesystems that
+perform daemon-side authorization. FUSE translates it to `FUSE_ACCESS`;
+the syscall layer falls back to the inode owner/mode check only when the
+filesystem reports that native access checks are unsupported.
 
 Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with

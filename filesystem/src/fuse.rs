@@ -47,6 +47,7 @@ pub enum FuseOpcode {
     ReadDir = 28,
     ReleaseDir = 29,
     FsyncDir = 30,
+    Access = 34,
     Create = 35,
     Destroy = 38,
     Rename2 = 45,
@@ -387,6 +388,13 @@ pub struct FuseGetxattrIn {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct FuseGetxattrOut {
     pub size: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseAccessIn {
+    pub mask: u32,
     pub padding: u32,
 }
 

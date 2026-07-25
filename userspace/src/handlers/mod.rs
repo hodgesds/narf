@@ -13405,7 +13405,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(
         Syscall::Faccessat2,
         "faccessat2",
-        RawFnHandler(sys_at2_reshape),
+        RawFnHandler(sys_faccessat),
     );
     table.install_raw(
         Syscall::Fchmodat2,
@@ -14122,11 +14122,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "fchownat",
         RawFnHandler(sys_fchmodat_or_fchownat),
     );
-    table.install_raw(
-        Syscall::Faccessat,
-        "faccessat",
-        RawFnHandler(sys_fchmodat_or_fchownat),
-    );
+    table.install_raw(Syscall::Faccessat, "faccessat", RawFnHandler(sys_faccessat));
     table.install_raw(Syscall::Openat, "openat", RawFnHandler(sys_openat));
     #[cfg(not(feature = "linux-compat"))]
     table.install_raw(
@@ -14153,11 +14149,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "readlinkat",
         RawFnHandler(sys_readlinkat),
     );
-    table.install_raw(
-        Syscall::Access,
-        "access",
-        RawFnHandler(sys_access_chmod_chown),
-    );
+    table.install_raw(Syscall::Access, "access", RawFnHandler(sys_access));
     table.install_raw(Syscall::Chmod, "chmod", RawFnHandler(sys_chmod));
     table.install_raw(
         Syscall::Chown,
@@ -15673,7 +15665,7 @@ pub(crate) use handler_sys_timerfd_gettime::*;
 pub use handler_sys_umount2_for_test::*;
 #[allow(unused_imports)]
 pub(crate) use {
-    handler_sys_access_chmod_chown::sys_access_chmod_chown,
+    handler_sys_access_chmod_chown::{sys_access, sys_access_chmod_chown, sys_faccessat},
     handler_sys_adjtimex::sys_adjtimex,
     handler_sys_at2_reshape::sys_at2_reshape,
     handler_sys_bootstrap::sys_bootstrap,
