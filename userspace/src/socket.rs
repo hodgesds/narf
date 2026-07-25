@@ -1998,11 +1998,15 @@ impl SocketFile {
                     return result;
                 }
                 self.ensure_netlink_portid();
-                let replies =
-                    match narf_net::netlink_netfilter::build_replies_in(self.net_ns_id(), buf) {
-                        Ok(replies) => replies,
-                        Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
-                    };
+                let admin = self.netfilter_admin.lock().clone();
+                let replies = match narf_net::netlink_netfilter::build_replies_authorized(
+                    self.net_ns_id(),
+                    buf,
+                    admin.as_ref(),
+                ) {
+                    Ok(replies) => replies,
+                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                };
                 let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {

@@ -20,6 +20,13 @@ use narf_lib::sync::IrqSafeSpinLock;
 use super::rules::{Chain, Match, Rule, Table};
 use super::{conntrack, parse_tuple_ipv4, HookPoint, PktCtx, Verdict};
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RulesetError {
+    AlreadyExists,
+    NotFound,
+    NotEmpty,
+}
+
 /// Builtin filter table — the single global rule store. Stage-3 only
 /// implements one table; nftables-style multi-table support is a
 /// straightforward extension.
@@ -64,6 +71,67 @@ impl Filter {
             let c = t.chain(chain);
             c.append(rule);
         });
+    }
+
+    pub fn create_table(&self, name: &str) -> Result<(), RulesetError> {
+        let mut tables = self.inner.lock();
+        if tables.iter().any(|table| table.name == name) {
+            return Err(RulesetError::AlreadyExists);
+        }
+        tables.push(Table::new(name.to_string()));
+        Ok(())
+    }
+
+    pub fn delete_table(&self, name: &str) -> Result<(), RulesetError> {
+        let mut tables = self.inner.lock();
+        let index = tables
+            .iter()
+            .position(|table| table.name == name)
+            .ok_or(RulesetError::NotFound)?;
+        if !tables[index].chains.is_empty() {
+            return Err(RulesetError::NotEmpty);
+        }
+        tables.remove(index);
+        Ok(())
+    }
+
+    pub fn create_chain(&self, table: &str, chain: &str) -> Result<(), RulesetError> {
+        let mut tables = self.inner.lock();
+        let table = tables
+            .iter_mut()
+            .find(|candidate| candidate.name == table)
+            .ok_or(RulesetError::NotFound)?;
+        if table.chains.iter().any(|candidate| candidate.name == chain) {
+            return Err(RulesetError::AlreadyExists);
+        }
+        let hook = match chain {
+            "prerouting" => HookPoint::PreRouting,
+            "input" => HookPoint::LocalIn,
+            "forward" => HookPoint::Forward,
+            "output" => HookPoint::LocalOut,
+            "postrouting" => HookPoint::PostRouting,
+            _ => HookPoint::LocalIn,
+        };
+        table.chains.push(Chain::new(chain.to_string(), hook));
+        Ok(())
+    }
+
+    pub fn delete_chain(&self, table: &str, chain: &str) -> Result<(), RulesetError> {
+        let mut tables = self.inner.lock();
+        let table = tables
+            .iter_mut()
+            .find(|candidate| candidate.name == table)
+            .ok_or(RulesetError::NotFound)?;
+        let index = table
+            .chains
+            .iter()
+            .position(|candidate| candidate.name == chain)
+            .ok_or(RulesetError::NotFound)?;
+        if !table.chains[index].rules.is_empty() {
+            return Err(RulesetError::NotEmpty);
+        }
+        table.chains.remove(index);
+        Ok(())
     }
 
     /// Set a chain's default policy.

@@ -215,8 +215,12 @@ with `NLMSG_DONE`; aligned requests may be batched and `NLM_F_ACK` produces a
 zero-error acknowledgement after a successful query. Non-dump point queries
 select an entry by `CTA_ID` or complete `CTA_TUPLE_ORIG`, return a
 non-multipart record, and report `ENOENT` when the canonical table has no
-match. Mutations and unsupported nfnetlink subsystems return `EOPNOTSUPP`;
-Linux netlink does not grant ambient filter/NAT authority.
+match. Creating or deleting nftables tables and empty chains requires a
+delegated namespace-matched `NetfilterAdminHandle` with ruleset rights;
+missing, revoked, cross-namespace, or rights-attenuated authority returns
+`EPERM`, and deleting a non-empty object returns `EBUSY`. Rule-expression and
+conntrack mutations plus unsupported nfnetlink subsystems return
+`EOPNOTSUPP`; Linux netlink does not grant ambient filter/NAT authority.
 
 Every packet context and `NETLINK_NETFILTER` query carries an immutable
 network-namespace id (zero is the initial namespace). Rulesets, conntrack

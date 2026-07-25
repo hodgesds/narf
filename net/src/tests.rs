@@ -49,6 +49,51 @@ kernel_test_in!(
     smoke_netfilter_authority_scope_rights_and_revocation
 );
 
+fn smoke_netfilter_nft_table_mutation_requires_authority() -> TestResult {
+    use crate::netfilter::{NetfilterAdminHandle, NetfilterRights};
+
+    let mut body = alloc::vec![2u8, 0, 0, 0];
+    let name = b"filter\0";
+    let attr_len = (4 + name.len()) as u16;
+    body.extend_from_slice(&attr_len.to_ne_bytes());
+    body.extend_from_slice(&1u16.to_ne_bytes());
+    body.extend_from_slice(name);
+    body.resize((body.len() + 3) & !3, 0);
+    let message_len = 16 + body.len();
+    let mut request = alloc::vec::Vec::new();
+    request.extend_from_slice(&(message_len as u32).to_ne_bytes());
+    request.extend_from_slice(&(10u16 << 8).to_ne_bytes());
+    request.extend_from_slice(&(1u16 | 4u16).to_ne_bytes());
+    request.extend_from_slice(&901u32.to_ne_bytes());
+    request.extend_from_slice(&0u32.to_ne_bytes());
+    request.extend_from_slice(&body);
+
+    let denied =
+        crate::netlink_netfilter::build_replies_in(901, &request).expect("valid nft request");
+    if i32::from_ne_bytes(denied[0][16..20].try_into().unwrap()) != -1 {
+        return TestResult::Fail("unauthorized nft mutation was not denied");
+    }
+    let admin = NetfilterAdminHandle::mint(901, NetfilterRights::RULESET);
+    let allowed = crate::netlink_netfilter::build_replies_authorized(901, &request, Some(&admin))
+        .expect("authorized nft request");
+    if i32::from_ne_bytes(allowed[0][16..20].try_into().unwrap()) != 0 {
+        return TestResult::Fail("authorized nft mutation failed");
+    }
+    if crate::netfilter::namespace::get(901)
+        .filter
+        .snapshot()
+        .iter()
+        .all(|table| table.name != "filter")
+    {
+        return TestResult::Fail("authorized nft table was not installed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/netfilter/authority",
+    smoke_netfilter_nft_table_mutation_requires_authority
+);
+
 fn smoke_network_namespace_fib_isolation() -> TestResult {
     use crate::ipv4::Ipv4Addr;
     use crate::route::{Ipv4Net, Route, Scope, TABLE_MAIN};
