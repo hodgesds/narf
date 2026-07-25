@@ -22,3 +22,51 @@ argument = "Explicit NUMA syscalls and cpuset.memory_migrate replace authoritati
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Correcting Linux mempolicy flag values and adding PREFERRED_MANY only changes the order in which frames are requested from existing per-node allocators. The cpuset allowed mask remains a hard boundary, and frame ownership, domain assignment, and mapping authority are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Weighted interleave changes only target-node selection before existing owned frame and huge-frame allocation. The policy mask remains intersected with cpuset.mems, weights cannot be zero, and no mapping, ownership, domain-rights, or authority checks are bypassed."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "HMAT automatic weighting publishes bounded allocation ratios through atomics under a configuration lock. Firmware coordinates cannot expand a task's cpuset policy mask or grant mapping/domain authority, and missing coordinates fail rather than fabricating topology."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Moving interleave sequence ownership from CPU slots to task-scoped userspace-compat state changes only deterministic target selection. The active fault policy still intersects cpuset.mems before entering the allocator, and task teardown reclaims the sequence state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Automatic NUMA balancing samples only private, unlocked user leaves and retains ownership of every backing frame while the leaf is absent. Hint resolution intersects policy with cpuset.mems, serializes migration through the address-space region lock, completes cross-CPU TLB invalidation before freeing the source, and always restores a mapping after migration failure."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Memory hotplug admits only aligned, non-overlapping host-acknowledged RAM already covered by the active kernel linear map. Online donation cannot grow allocator metadata under the frame lock; offline is an exact-range, all-free transaction whose failed validation leaves buddy lists and per-node accounting unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "virtio-mem preserves physical-frame ownership by ordering PLUG before allocator donation and allocator removal before UNPLUG, rolling either side back when the second step fails. No busy frame is reclaimed or exposed to the host, and dynamic node reporting exports aggregate state rather than physical addresses."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "HMAT memory tiers only constrain target selection: demotion requires a strictly slower online tier and intersects candidates with the caller-provided cpuset/mempolicy mask. Unknown firmware coordinates remain in the default top tier rather than silently weakening placement policy."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Tier demotion delegates to the existing private-page and complete-huge-leaf migration transaction, preserving ownership and permissions, rolling back failed leaf replacement, and completing cross-CPU TLB invalidation before returning old backing to the allocator."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Shared-memory migration serializes alias creation with replacement, retains both frames through all address-space updates, rolls back every changed alias before failure returns, commits registry ownership only after all PTEs change, broadcasts TLB invalidations, and frees the source only after commit. Device/DMA mappings are rejected."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Memory-block membership is derived from authoritative boot and hotplug physical RAM ranges classified by SRAT proximity, never inferred from CPU placement or fabricated for absent memory."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Externally owned shared pages carry one registry reference per address-space alias. Handle removal prevents new aliases but defers frame reuse until every mapped alias has torn down its leaf and completed cross-CPU TLB invalidation; mapping, unmapping, MAP_FIXED replacement, fork aliasing, and migration use one shared transaction order."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The memory-hotplug observer runs only after allocator donation/removal and topology-registry commit, with both locks released. It receives no physical-frame ownership and can only rebuild read-only sysfs topology; failed and busy transactions emit no notification. Offline ranges remain recorded solely as non-allocatable topology."

@@ -75,12 +75,37 @@ changes; `MPOL_F_RELATIVE_NODES` maps user-mask ordinals into the current
 Both use Linux UAPI bits 15 and 14. `MPOL_PREFERRED_MANY` chooses the
 nearest member of its preferred set by SLIT distance and falls back only
 after preferred nodes are exhausted.
+`MPOL_WEIGHTED_INTERLEAVE` distributes new base-page and hardware-huge-page
+allocations according to the global per-node weights, while still intersecting
+the policy mask with `cpuset.mems`. Weights are configured through Linux's
+`/sys/kernel/mm/mempolicy/weighted_interleave/nodeN` ABI.
+Automatic mode consumes real local-node HMAT access-bandwidth coordinates,
+reduces them to bounded integer ratios, and is controlled by the sibling
+`auto` attribute. A manual node-weight write disables automatic mode.
+Ordinary and weighted interleave sequence positions are task-owned, survive
+CPU migration, and are reclaimed with the task; CPU-local allocator state
+does not determine a process's placement cycle.
+`MPOL_F_NUMA_BALANCING` is accepted only with `MPOL_BIND` or
+`MPOL_PREFERRED_MANY`. A bounded periodic scan protects one eligible base page
+per task every 256 running timer ticks. Its next access restores the mapping
+and, when the accessing CPU's node is inside the effective policy/cpuset mask,
+migrates the private page there. Shared, locked, lazy, and policy-ineligible
+pages are not sampled; allocation failure restores the original mapping.
 `mbind(MPOL_MF_MOVE)` immediately conforms resident private pages in the
 range, `MPOL_MF_STRICT` reports remaining misplacement as `EIO`, and
 `MPOL_MF_MOVE_ALL` requires authority NARF does not grant ambiently.
 `set_mempolicy_home_node(2)` updates the distance anchor of existing
 MPOL_BIND or MPOL_PREFERRED_MANY ranges and returns `ENOENT` when no
 eligible policy overlaps.
+`move_pages(2)` migrates registry-owned shared-memory base pages by replacing
+every live address-space alias under one rollback-capable transaction and
+committing the shared-object backing last. Device/DMA shared mappings remain
+non-migratable without an owner-specific quiesce protocol.
+Removing a shared-memory handle rejects new attachments immediately but keeps
+each already-mapped backing page registered and movable until its final
+address-space alias is unmapped. Alias release occurs only after leaf teardown
+and cross-CPU TLB invalidation; the final release returns the frame to the
+allocator.
 Anonymous private `mmap(MAP_HUGETLB)` supports Linux's default/explicit
 2 MiB and explicit 1 GiB encodings when boot-reserved backing is available.
 Mappings use hardware PD/PDPT leaves on x86_64 and L2/L1 block descriptors
@@ -95,6 +120,16 @@ contract.
 The procfs task snapshot includes both base-page and hardware huge-page
 regions with effective policy and per-node residency for
 `/proc/<pid>/numa_maps`.
+Sysfs exposes Linux memory blocks under `/sys/devices/system/memory/memoryN`
+and each block's `nodeN/memoryN` membership from allocator RAM ranges
+classified by SRAT; CPU topology is never used to infer memory membership.
+Runtime hotplug creates newly discovered `memoryN` objects after allocator
+commit. Offline blocks retain their identity and node membership, while
+`state` and `online` query live topology across offline/online cycles.
+Only CPU- or memory-bearing `nodeN` directories are instantiated; unused
+architectural slots remain advertised through `possible` without appearing as
+phantom nodes to Linux perf's directory-based topology reader. Membership is a
+Linux-compatible `nodeN/memoryM -> ../../memory/memoryM` symlink.
 
 Bootstrap: every new process receives two ring pairs (submit + complete)
 for the kernel ABI plus a read-only config page with capability

@@ -812,6 +812,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             // starve the pump's wake, hanging the sleeper.
             if (frame.cs & 3) == 3 {
                 narf_userspace::handlers::timer_tick_raise_due_signals();
+                narf_userspace::handlers::numa_balance_tick();
             }
         }
         // Full Linux-style signal delivery on the timer-IRQ return to user.
@@ -918,6 +919,9 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         // the existing diagnostic still fires for genuine bugs.
         let p_clear = (ec & PF_P) == 0;
         if p_clear && (from_user || cr2_in_user_half) {
+            if from_user && narf_userspace::handlers::handle_numa_hint_fault(cr2) {
+                return;
+            }
             if let Some(as_arc) = narf_userspace::active_user_as() {
                 let v = narf_memory::VirtAddr::new(cr2);
                 // Publish the faulting task's NUMA mempolicy for `cr2`

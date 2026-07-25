@@ -75,7 +75,9 @@ mod secure_boot;
 // `narf-frame` is the only crate that links both.
 #[unsafe(no_mangle)]
 pub fn narf_phys_to_node(addr: u64) -> u32 {
-    narf_acpi::memory_node(addr).unwrap_or(0)
+    narf_memory::hotplug_node_for_phys(addr)
+        .map(|node| node as u32)
+        .unwrap_or_else(|| narf_acpi::memory_node(addr).unwrap_or(0))
 }
 #[unsafe(no_mangle)]
 pub fn narf_cpu_to_node(cpu: u32) -> u32 {
@@ -90,7 +92,7 @@ pub fn narf_node_distance(from: u32, to: u32) -> u32 {
 /// direct narf-acpi dep). Always >= 1.
 #[unsafe(no_mangle)]
 pub fn narf_numa_node_count() -> u32 {
-    narf_acpi::numa_node_count()
+    narf_acpi::numa_node_count().max(narf_memory::online_node_count())
 }
 /// CPU → NUMA node, returning `u32::MAX` when the CPU has no SRAT
 /// proximity entry (so sysfs cpulist can distinguish "node 0" from
@@ -1434,6 +1436,52 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             Ok(n) => {
                                 let _ =
                                     writeln!(console::Writer, "  acpi: HMAT parsed, {} entries", n);
+                                for node in 0..narf_acpi::numa_node_count()
+                                    .min(narf_memory::FRAME_MAX_NUMA_NODES as u32)
+                                {
+                                    let bandwidth = narf_acpi::hmat_value(
+                                        narf_acpi::HmatLatBwKind::AccessBandwidth,
+                                        0,
+                                        node,
+                                        node,
+                                    )
+                                    .or_else(|| {
+                                        let read = narf_acpi::hmat_value(
+                                            narf_acpi::HmatLatBwKind::ReadBandwidth,
+                                            0,
+                                            node,
+                                            node,
+                                        )?;
+                                        let write = narf_acpi::hmat_value(
+                                            narf_acpi::HmatLatBwKind::WriteBandwidth,
+                                            0,
+                                            node,
+                                            node,
+                                        )?;
+                                        Some(read.min(write))
+                                    })
+                                    .unwrap_or(0);
+                                    if bandwidth != 0 {
+                                        let _ = narf_memory::set_interleave_bandwidth(
+                                            node as usize,
+                                            bandwidth,
+                                        );
+                                    }
+                                    let latency = narf_acpi::hmat_value(
+                                        narf_acpi::HmatLatBwKind::AccessLatency,
+                                        0,
+                                        node,
+                                        node,
+                                    )
+                                    .unwrap_or(0);
+                                    if bandwidth != 0 || latency != 0 {
+                                        let _ = narf_memory::set_node_performance(
+                                            node as usize,
+                                            bandwidth,
+                                            latency,
+                                        );
+                                    }
+                                }
                             }
                             Err(e) => {
                                 let _ = writeln!(
@@ -3207,9 +3255,10 @@ fn run_async_demo() -> ! {
 fn boot_userspace_init() {
     use core::fmt::Write as _;
     use narf_userspace::{
-        bootstrap_init, brk_init, cwd_init, install_address_space_lookup, install_core_syscalls,
-        install_global, install_task_id_lookup, install_user_task_hooks, load_user_process_with,
-        sigaction_init, signal_init, SyscallTable,
+        bootstrap_init, brk_init, cwd_init, install_address_space_lookup,
+        install_all_address_spaces_lookup, install_core_syscalls, install_global,
+        install_task_id_lookup, install_user_task_hooks, load_user_process_with, sigaction_init,
+        signal_init, SyscallTable,
     };
 
     let bytes = narf_verification::NARF_INIT_ELF;
@@ -3261,6 +3310,11 @@ fn boot_userspace_init() {
         let id = narf_scheduler::current_task_id();
         narf_scheduler::address_space_of(id)
     });
+    install_all_address_spaces_lookup(narf_scheduler::all_address_spaces);
+    narf_memory::install_shared_frame_hooks(
+        narf_userspace::retain_external_shared_frame,
+        narf_userspace::release_external_shared_frame,
+    );
     // Make `gettid` (and any handler that calls
     // `current_task_id`) report the scheduler's TaskId rather
     // than 0. Required for `sys_clone` to be observable from user

@@ -1182,6 +1182,33 @@ pub fn all_task_ids() -> alloc::vec::Vec<TaskId> {
     out
 }
 
+/// Snapshot every distinct live user address space, including tasks currently
+/// being polled and therefore temporarily absent from the ready queues.
+pub fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
+    let mut out: alloc::vec::Vec<Arc<AddressSpace>> = alloc::vec::Vec::new();
+    let mut push_unique = |candidate: Arc<AddressSpace>| {
+        if !out.iter().any(|existing| Arc::ptr_eq(existing, &candidate)) {
+            out.push(candidate);
+        }
+    };
+    for q in READY.iter() {
+        let g = q.lock();
+        if let Some(ref dq) = *g {
+            for slot in dq.iter() {
+                if let Some(ref addr_space) = slot.addr_space {
+                    push_unique(addr_space.clone());
+                }
+            }
+        }
+    }
+    for slot in ACTIVE_USER_AS.iter() {
+        if let Some(addr_space) = slot.lock().clone() {
+            push_unique(addr_space);
+        }
+    }
+    out
+}
+
 /// Replace the address space attached to `id`. Returns the
 /// previous Arc so the caller can decide what to do with it
 /// (e.g. drop immediately to free the old AS's frames + page-

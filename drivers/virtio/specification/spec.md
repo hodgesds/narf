@@ -20,7 +20,9 @@ blk/net/console/rng.
 - `io/` can allocate DMA buffers bound to this driver's IOMMU context.
 - `interrupts/` can register an MSI/MSI-X or UIPI handler.
 - `ipc/` provides Narf-Rings as the transport to whoever consumes block /
-  network / console bytes.
+  network / console bytes. The virtio-mem class owns queue-0
+  PLUG/UNPLUG/STATE transactions and continuously converges allocator-online
+  blocks to the generation-stable `requested_size`.
 
 ## 3. Public interface
 
@@ -48,6 +50,10 @@ Internal modules: `transport_pci`, `transport_mmio`, `queue_split`,
 - Feature negotiation always terminates; unknown bits are cleared.
 - Virtqueue descriptor rings are validated on every wake (bounds,
   generation, indirect depth cap).
+- A virtio-mem block enters the frame allocator only after host PLUG/STATE
+  acknowledgement and kernel-linear-map validation. Unplug first proves the
+  exact block free; device rejection transactionally restores it. Busy blocks
+  remain online and are never force-reclaimed.
 
 ## 5. Architecture notes
 

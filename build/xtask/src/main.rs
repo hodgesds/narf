@@ -462,6 +462,14 @@ impl Arch {
                     .filter(|&m| m >= 2 && m % 2 == 0)
                     .unwrap_or(1024);
                 let node_mem_mb = mem_mb / 2;
+                // Optional virtio-mem region used by the NUMA memory-hotplug
+                // smoke. The backend is address-space capacity, not initial
+                // RAM; half starts plugged so both online and later host
+                // resize operations have room to move.
+                let virtio_mem_mb = std::env::var("NARF_QEMU_VIRTIO_MEM_MB")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .filter(|m| *m >= 4 && *m % 2 == 0);
                 let mut args = vec![
                     "-machine".into(),
                     if smp.is_some() {
@@ -480,7 +488,15 @@ impl Arch {
                     // multi-queue / virtio-snd) then crashes QEMU host-side
                     // when a node is pressured. CI raises NARF_QEMU_MEM_MB
                     // for headroom; locally the default keeps boot fast.
-                    format!("{mem_mb}M"),
+                    virtio_mem_mb.map_or_else(
+                        || format!("{mem_mb}M"),
+                        |hotplug| {
+                            format!(
+                                "{mem_mb}M,slots=2,maxmem={}M",
+                                mem_mb.saturating_add(hotplug)
+                            )
+                        },
+                    ),
                 ];
                 // Optional accel override. Unset ⇒ QEMU auto-selects
                 // (KVM when /dev/kvm exists, else single-threaded TCG).
@@ -527,6 +543,18 @@ impl Arch {
                     "-numa".into(),    "dist,src=0,dst=1,val=20".into(),
                     "-numa".into(),    "dist,src=1,dst=0,val=20".into(),
                     "-numa".into(),    "dist,src=1,dst=1,val=10".into(),
+                    ]);
+                }
+                if let Some(hotplug) = virtio_mem_mb {
+                    args.extend_from_slice(&[
+                        "-object".into(),
+                        format!("memory-backend-ram,id=narf-vmem0,size={hotplug}M"),
+                        "-device".into(),
+                        format!(
+                            "virtio-mem-pci,id=narf-vmem0,memdev=narf-vmem0,node={},requested-size={}M,block-size=2M,disable-legacy=on,disable-modern=off",
+                            if smp.is_none() { 1 } else { 0 },
+                            hotplug / 2,
+                        ),
                     ]);
                 }
                 args.extend_from_slice(&[

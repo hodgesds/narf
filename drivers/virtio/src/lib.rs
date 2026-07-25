@@ -131,6 +131,13 @@ pub fn register_initcalls() {
         spawn_input_pump_task();
         InitResult::Ok
     });
+    narf_init::register(Stage::Late, "virtio-mem-config-pump", || {
+        if !mem_pci::is_probed() {
+            return InitResult::NotPresent;
+        }
+        mem_pci::spawn_config_pump();
+        InitResult::Ok
+    });
 }
 
 /// Spawn one drain task per bound `VirtioInputPci`. Each task awaits

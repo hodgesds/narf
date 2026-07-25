@@ -56,7 +56,12 @@ pub struct Entry {
     pub handle: u64,
     pub pid: u64,
     pub frames: Vec<u64>, // phys addrs, page-sized
+    /// Number of live user mappings for each backing frame.
+    pub refs: Vec<u32>,
     pub len: u64,
+    /// IPC_RMID/process exit has removed the public handle. Existing
+    /// mappings remain valid until their final per-page reference drops.
+    pub removed: bool,
 }
 
 impl core::fmt::Debug for Entry {
@@ -66,6 +71,7 @@ impl core::fmt::Debug for Entry {
             .field("pid", &self.pid)
             .field("len", &self.len)
             .field("frames", &self.frames.len())
+            .field("removed", &self.removed)
             .finish_non_exhaustive()
     }
 }
@@ -89,9 +95,9 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
         let frame = match narf_memory::alloc_frame() {
             Ok(f) => f,
             Err(_) => {
-                // Roll back: the frames we already grabbed leak
-                // until the frame allocator gets a free path
-                // (matches fb registry's no-op detach today).
+                for phys in frames {
+                    narf_memory::free_frame(narf_memory::PhysFrame::new(PhysAddr::new(phys)));
+                }
                 return Err(ShmemError::OutOfMemory);
             }
         };
@@ -109,7 +115,9 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
         handle,
         pid,
         frames,
+        refs: alloc::vec![0; pages],
         len: len_pg,
+        removed: false,
     });
     Ok(handle)
 }
@@ -120,7 +128,7 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
 /// bad handle or out-of-range offset.
 pub fn phys_at(handle: u64, byte_offset: u64) -> Option<u64> {
     let g = REGISTRY.lock();
-    let e = g.iter().find(|e| e.handle == handle)?;
+    let e = g.iter().find(|e| e.handle == handle && !e.removed)?;
     if byte_offset >= e.len {
         return None;
     }
@@ -152,7 +160,7 @@ pub struct SgEntry {
 /// - `(frame1, 7000 - 3996 = 3004)`
 pub fn sg_iter(handle: u64, byte_offset: u64, byte_len: u64) -> Option<SgIter> {
     let g = REGISTRY.lock();
-    let e = g.iter().find(|e| e.handle == handle)?;
+    let e = g.iter().find(|e| e.handle == handle && !e.removed)?;
     let end = byte_offset.checked_add(byte_len)?;
     if end > e.len {
         return None;
@@ -197,7 +205,7 @@ impl Iterator for SgIter {
 /// that installs the user-VA mapping.
 pub fn frames_of(handle: u64) -> Option<Vec<PhysAddr>> {
     let g = REGISTRY.lock();
-    let e = g.iter().find(|e| e.handle == handle)?;
+    let e = g.iter().find(|e| e.handle == handle && !e.removed)?;
     Some(e.frames.iter().copied().map(PhysAddr::new).collect())
 }
 
@@ -206,7 +214,7 @@ pub fn len_of(handle: u64) -> Option<u64> {
     REGISTRY
         .lock()
         .iter()
-        .find(|e| e.handle == handle)
+        .find(|e| e.handle == handle && !e.removed)
         .map(|e| e.len)
 }
 
@@ -215,40 +223,95 @@ pub fn pid_of(handle: u64) -> Option<u64> {
     REGISTRY
         .lock()
         .iter()
-        .find(|e| e.handle == handle)
+        .find(|e| e.handle == handle && !e.removed)
         .map(|e| e.pid)
 }
 
-/// Tear down a region. The backing frames stay leaked until the
-/// frame allocator grows a free path (matches the fb registry's
-/// today). Returns `true` on success.
+fn free_phys_frames(frames: Vec<u64>) {
+    for phys in frames {
+        narf_memory::free_frame(narf_memory::PhysFrame::new(PhysAddr::new(phys)));
+    }
+}
+
+/// Reclaim unreferenced pages of a removed entry. Returns frames that must be
+/// freed after the registry lock is released.
+fn reap_removed_entry(registry: &mut Vec<Entry>, idx: usize) -> Vec<u64> {
+    let mut reclaim = Vec::new();
+    if !registry[idx].removed {
+        return reclaim;
+    }
+    for page in 0..registry[idx].frames.len() {
+        if registry[idx].frames[page] != 0 && registry[idx].refs[page] == 0 {
+            reclaim.push(core::mem::take(&mut registry[idx].frames[page]));
+        }
+    }
+    if registry[idx].frames.iter().all(|phys| *phys == 0) {
+        registry.remove(idx);
+    }
+    reclaim
+}
+
+/// Remove a region's public handle. Unmapped pages are reclaimed immediately;
+/// pages in existing mappings remain alive until their last alias disappears.
 pub fn destroy(handle: u64) -> bool {
     let mut g = REGISTRY.lock();
-    if let Some(idx) = g.iter().position(|e| e.handle == handle) {
-        g.remove(idx);
-        true
-    } else {
-        false
-    }
+    let Some(idx) = g.iter().position(|e| e.handle == handle && !e.removed) else {
+        return false;
+    };
+    g[idx].removed = true;
+    let reclaim = reap_removed_entry(&mut g, idx);
+    drop(g);
+    free_phys_frames(reclaim);
+    true
 }
 
 /// Destroy every region owned by `pid`. Called from the process-
 /// exit observer wired in `register_initcalls`.
 pub fn destroy_all_for_pid(pid: u64) -> u32 {
     let mut g = REGISTRY.lock();
-    let before = g.len();
-    g.retain(|e| e.pid != pid);
-    (before - g.len()) as u32
+    let mut removed = 0u32;
+    let mut reclaim = Vec::new();
+    let mut idx = 0;
+    while idx < g.len() {
+        if g[idx].pid == pid && !g[idx].removed {
+            let handle = g[idx].handle;
+            g[idx].removed = true;
+            removed += 1;
+            reclaim.extend(reap_removed_entry(&mut g, idx));
+            // `reap_removed_entry` swap-shifts the following entry into this
+            // slot when no aliases remain. Revisit that replacement instead
+            // of advancing past it.
+            if g.get(idx).is_none_or(|entry| entry.handle != handle) {
+                continue;
+            }
+        }
+        idx += 1;
+    }
+    drop(g);
+    free_phys_frames(reclaim);
+    removed
 }
 
 /// Number of live regions — for diagnostics + tests.
 pub fn count() -> usize {
-    REGISTRY.lock().len()
+    REGISTRY
+        .lock()
+        .iter()
+        .filter(|entry| !entry.removed)
+        .count()
 }
 
 #[doc(hidden)]
 pub fn __reset_for_test() {
-    REGISTRY.lock().clear();
+    let frames = {
+        let mut registry = REGISTRY.lock();
+        core::mem::take(&mut *registry)
+            .into_iter()
+            .flat_map(|entry| entry.frames)
+            .filter(|phys| *phys != 0)
+            .collect()
+    };
+    free_phys_frames(frames);
     NEXT_HANDLE.store(1, Ordering::Relaxed);
 }
 
@@ -265,8 +328,68 @@ pub fn syscall_vtable() -> &'static narf_userspace::handlers::ShmemSyscallVtable
         frames: vt_frames,
         destroy: vt_destroy,
         pid_of: vt_pid_of,
+        owns_frame: vt_owns_frame,
+        replace_frame: vt_replace_frame,
+        retain_frame: vt_retain_frame,
+        release_frame: vt_release_frame,
     };
     &V
+}
+
+fn vt_retain_frame(phys: u64) {
+    let mut registry = REGISTRY.lock();
+    if let Some((entry, page)) = registry.iter_mut().find_map(|entry| {
+        entry
+            .frames
+            .iter()
+            .position(|candidate| *candidate == phys)
+            .map(|page| (entry, page))
+    }) {
+        entry.refs[page] = entry.refs[page]
+            .checked_add(1)
+            .expect("shmem mapping reference overflow");
+    }
+}
+
+fn vt_release_frame(phys: u64) {
+    let mut registry = REGISTRY.lock();
+    let Some((idx, page)) = registry.iter().enumerate().find_map(|(idx, entry)| {
+        entry
+            .frames
+            .iter()
+            .position(|candidate| *candidate == phys)
+            .map(|page| (idx, page))
+    }) else {
+        return;
+    };
+    assert!(
+        registry[idx].refs[page] > 0,
+        "shmem mapping reference underflow"
+    );
+    registry[idx].refs[page] -= 1;
+    let reclaim = reap_removed_entry(&mut registry, idx);
+    drop(registry);
+    free_phys_frames(reclaim);
+}
+
+fn vt_owns_frame(phys: u64) -> bool {
+    REGISTRY
+        .lock()
+        .iter()
+        .any(|entry| entry.frames.contains(&phys))
+}
+
+fn vt_replace_frame(old_phys: u64, new_phys: u64) -> bool {
+    let mut registry = REGISTRY.lock();
+    let Some(slot) = registry
+        .iter_mut()
+        .flat_map(|entry| entry.frames.iter_mut())
+        .find(|phys| **phys == old_phys)
+    else {
+        return false;
+    };
+    *slot = new_phys;
+    true
 }
 
 fn vt_create(pid: u64, len: u64) -> u64 {

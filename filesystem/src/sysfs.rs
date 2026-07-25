@@ -83,6 +83,66 @@ fn numa_node_count() -> u32 {
     n.max(1)
 }
 
+fn numa_online_list() -> String {
+    let mask = narf_memory::online_node_mask();
+    let mut out = String::new();
+    let mut node = 0u32;
+    let mut first = true;
+    while node < narf_memory::FRAME_MAX_NUMA_NODES as u32 {
+        if (mask >> node) & 1 == 0 {
+            node += 1;
+            continue;
+        }
+        let start = node;
+        while node + 1 < narf_memory::FRAME_MAX_NUMA_NODES as u32 && (mask >> (node + 1)) & 1 != 0 {
+            node += 1;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        if start == node {
+            out.push_str(&format!("{start}"));
+        } else {
+            out.push_str(&format!("{start}-{node}"));
+        }
+        node += 1;
+    }
+    if first {
+        out.push('0');
+    }
+    out.push('\n');
+    out
+}
+
+fn node_mask_list(mask: u64) -> String {
+    let mut out = String::new();
+    let mut node = 0usize;
+    let mut first = true;
+    while node < narf_memory::FRAME_MAX_NUMA_NODES {
+        if mask & (1u64 << node) == 0 {
+            node += 1;
+            continue;
+        }
+        let start = node;
+        while node + 1 < narf_memory::FRAME_MAX_NUMA_NODES && mask & (1u64 << (node + 1)) != 0 {
+            node += 1;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        if start == node {
+            out.push_str(&format!("{start}"));
+        } else {
+            out.push_str(&format!("{start}-{node}"));
+        }
+        node += 1;
+    }
+    out.push('\n');
+    out
+}
+
 #[inline]
 fn node_distance(from: u32, to: u32) -> u8 {
     // SAFETY: narf-frame provides the definition.
@@ -1028,99 +1088,228 @@ pub fn populate_numa_nodes() {
     let devices = get_or_create_child(&root, "devices");
     let system = get_or_create_child(&devices, "system");
     let node_dir = get_or_create_child(&system, "node");
+    let memory_dir = get_or_create_child(&system, "memory");
+    kobject_add_attr(&memory_dir, "block_size_bytes", || {
+        format!("{:x}\n", narf_memory::MEMORY_BLOCK_SIZE)
+    });
 
-    let n = numa_node_count().max(1);
+    // Online membership is live: allocator hotplug updates are immediately
+    // visible without rebuilding sysfs. All architectural slots are possible.
+    kobject_add_attr(&node_dir, "online", numa_online_list);
+    kobject_add_attr(&node_dir, "possible", || {
+        format!("0-{}\n", narf_memory::FRAME_MAX_NUMA_NODES - 1)
+    });
+    kobject_add_attr(&node_dir, "has_normal_memory", numa_online_list);
 
-    // /sys/devices/system/node/online and /possible: "0" or "0-N".
-    let range = if n <= 1 {
-        "0\n".to_string()
-    } else {
-        format!("0-{}\n", n - 1)
-    };
-    let online = range.clone();
-    let possible = range.clone();
-    kobject_add_attr(&node_dir, "online", move || online.clone());
-    kobject_add_attr(&node_dir, "possible", move || possible.clone());
-    kobject_add_attr(&node_dir, "has_normal_memory", move || range.clone());
+    let present = narf_memory::online_node_mask();
+    for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
+        if present & (1u64 << node) != 0 || node_cpulist_string(node) != "\n" {
+            populate_numa_node(&node_dir, node);
+        }
+    }
 
-    for node in 0..n {
-        let name = format!("node{}", node);
-        let kobj = get_or_create_child(&node_dir, &name);
+    narf_memory::install_memory_hotplug_hook(refresh_memory_blocks);
+    refresh_memory_blocks();
 
-        // distance: SLIT row, space-separated, newline-terminated.
-        kobject_add_attr(&kobj, "distance", move || {
-            let cols = numa_node_count().max(1);
-            let mut s = String::new();
-            for to in 0..cols {
-                if to > 0 {
-                    s.push(' ');
-                }
-                s.push_str(&format!("{}", node_distance(node, to)));
+    // Linux memory-tier bus: default DRAM's abstract distance maps to device
+    // id 4; each successively slower NARF tier occupies the next chunk.
+    let virtual_dir = get_or_create_child(&devices, "virtual");
+    let tier_bus = get_or_create_child(&virtual_dir, "memory_tiering");
+    for tier in 0..narf_memory::FRAME_MAX_NUMA_NODES as u8 {
+        if narf_memory::tier_nodes(tier) == 0 {
+            continue;
+        }
+        let tier_obj = get_or_create_child(&tier_bus, &format!("memory_tier{}", 4 + tier));
+        kobject_add_attr(&tier_obj, "nodelist", move || {
+            node_mask_list(narf_memory::tier_nodes(tier))
+        });
+    }
+}
+
+fn populate_numa_node(node_dir: &Arc<Kobject>, node: u32) -> Arc<Kobject> {
+    let name = format!("node{}", node);
+    let kobj = get_or_create_child(node_dir, &name);
+
+    kobject_add_attr(&kobj, "distance", move || {
+        let online = narf_memory::online_node_mask();
+        let online_cols = if online == 0 {
+            1
+        } else {
+            u64::BITS - online.leading_zeros()
+        };
+        let cols = numa_node_count().max(online_cols).max(node + 1);
+        let mut s = String::new();
+        for to in 0..cols {
+            if to > 0 {
+                s.push(' ');
             }
-            s.push('\n');
-            s
-        });
+            s.push_str(&format!("{}", node_distance(node, to)));
+        }
+        s.push('\n');
+        s
+    });
 
-        // meminfo: per-node MemTotal / MemFree from the buddy.
-        let node_idx = node as usize;
-        kobject_add_attr(&kobj, "meminfo", move || {
-            let total_pages = narf_memory::node_total(node_idx);
-            let free_pages = narf_memory::node_free(node_idx).min(total_pages);
-            let used_pages = total_pages.saturating_sub(free_pages);
-            let total_kb = (total_pages as u64) * 4;
-            let free_kb = (free_pages as u64) * 4;
-            let used_kb = (used_pages as u64) * 4;
-            format!(
-                "Node {n} MemTotal:       {tot} kB\n\
-                 Node {n} MemFree:        {free} kB\n\
-                 Node {n} MemUsed:        {used} kB\n",
-                n = node_idx,
-                tot = total_kb,
-                free = free_kb,
-                used = used_kb,
-            )
-        });
+    let node_idx = node as usize;
+    kobject_add_attr(&kobj, "meminfo", move || {
+        let total_pages = narf_memory::node_total(node_idx);
+        let free_pages = narf_memory::node_free(node_idx).min(total_pages);
+        let used_pages = total_pages.saturating_sub(free_pages);
+        format!(
+            "Node {n} MemTotal:       {tot} kB\n\
+             Node {n} MemFree:        {free} kB\n\
+             Node {n} MemUsed:        {used} kB\n",
+            n = node_idx,
+            tot = (total_pages as u64) * 4,
+            free = (free_pages as u64) * 4,
+            used = (used_pages as u64) * 4,
+        )
+    });
 
-        kobject_add_attr(&kobj, "numastat", move || {
-            let v = narf_memory::numa_node_stats(node_idx);
-            format!(
-                "numa_hit {}\n\
-                 numa_miss {}\n\
-                 numa_foreign {}\n\
-                 interleave_hit {}\n\
-                 local_node {}\n\
-                 other_node {}\n",
-                v.numa_hit,
-                v.numa_miss,
-                v.numa_foreign,
-                v.interleave_hit,
-                v.local_node,
-                v.other_node,
-            )
-        });
+    kobject_add_attr(&kobj, "numastat", move || {
+        let v = narf_memory::numa_node_stats(node_idx);
+        format!(
+            "numa_hit {}\n\
+             numa_miss {}\n\
+             numa_foreign {}\n\
+             interleave_hit {}\n\
+             local_node {}\n\
+             other_node {}\n",
+            v.numa_hit, v.numa_miss, v.numa_foreign, v.interleave_hit, v.local_node, v.other_node,
+        )
+    });
 
-        kobject_add_attr(&kobj, "vmstat", move || {
-            let v = narf_memory::numa_node_stats(node_idx);
-            format!(
-                "nr_free_pages {}\n\
-                 numa_hit {}\n\
-                 numa_miss {}\n\
-                 numa_foreign {}\n\
-                 numa_interleave {}\n\
-                 numa_local {}\n\
-                 numa_other {}\n",
-                narf_memory::node_free(node_idx),
-                v.numa_hit,
-                v.numa_miss,
-                v.numa_foreign,
-                v.interleave_hit,
-                v.local_node,
-                v.other_node,
-            )
-        });
+    kobject_add_attr(&kobj, "vmstat", move || {
+        let v = narf_memory::numa_node_stats(node_idx);
+        format!(
+            "nr_free_pages {}\n\
+             numa_hit {}\n\
+             numa_miss {}\n\
+             numa_foreign {}\n\
+             numa_interleave {}\n\
+             numa_local {}\n\
+             numa_other {}\n",
+            narf_memory::node_free(node_idx),
+            v.numa_hit,
+            v.numa_miss,
+            v.numa_foreign,
+            v.interleave_hit,
+            v.local_node,
+            v.other_node,
+        )
+    });
 
-        kobject_add_attr(&kobj, "cpulist", move || node_cpulist_string(node));
-        kobject_add_attr(&kobj, "cpumap", move || node_cpumap_string(node));
+    kobject_add_attr(&kobj, "cpulist", move || node_cpulist_string(node));
+    kobject_add_attr(&kobj, "cpumap", move || node_cpumap_string(node));
+    kobj
+}
+
+/// Add or refresh Linux memory-block objects after a committed allocator
+/// hotplug transition. Kobjects persist while offline, matching Linux's
+/// memory-block identity; their state closures query the live topology.
+pub fn refresh_memory_blocks() {
+    let root = get_root();
+    let devices = get_or_create_child(&root, "devices");
+    let system = get_or_create_child(&devices, "system");
+    let node_dir = get_or_create_child(&system, "node");
+    let memory_dir = get_or_create_child(&system, "memory");
+
+    // Membership comes from authoritative physical boot/hotplug ranges
+    // classified through SRAT or the hotplug transaction, never CPU topology.
+    for block in narf_memory::memory_blocks() {
+        let name = format!("memory{}", block.id);
+        let memory = get_or_create_child(&memory_dir, &name);
+        let block_id = block.id;
+        let start = block.start;
+        kobject_add_attr(&memory, "phys_index", move || {
+            format!("{:x}\n", start / narf_memory::MEMORY_BLOCK_SIZE)
+        });
+        kobject_add_attr(&memory, "state", move || {
+            if memory_block_online(block_id) {
+                "online\n".into()
+            } else {
+                "offline\n".into()
+            }
+        });
+        kobject_add_attr(&memory, "online", move || {
+            if memory_block_online(block_id) {
+                "1\n".into()
+            } else {
+                "0\n".into()
+            }
+        });
+        kobject_add_attr(&memory, "removable", || "0\n".into());
+        kobject_add_attr(&memory, "valid_zones", || "Normal\n".into());
+
+        let node = populate_numa_node(&node_dir, block.node as u32);
+        // Linux exposes node membership as `nodeN/memoryM` symlinks. perf's
+        // build_mem_topology() enumerates these directory entries and treats
+        // their numeric suffixes as the physical memory-block bitmap.
+        node.add_symlink(name.clone(), format!("../../memory/{}", name));
+    }
+}
+
+fn memory_block_online(id: u64) -> bool {
+    narf_memory::memory_blocks()
+        .into_iter()
+        .find(|block| block.id == id)
+        .is_some_and(|block| block.online)
+}
+
+/// Populate Linux's manual weighted-interleave controls under
+/// `/sys/kernel/mm/mempolicy/weighted_interleave/nodeN`.
+pub fn populate_weighted_interleave() {
+    const NODE_ATTRS: [&str; 16] = [
+        "node0", "node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8", "node9",
+        "node10", "node11", "node12", "node13", "node14", "node15",
+    ];
+
+    let root = get_root();
+    let kernel = get_or_create_child(&root, "kernel");
+    let mm = get_or_create_child(&kernel, "mm");
+    let mempolicy = get_or_create_child(&mm, "mempolicy");
+    let weighted = get_or_create_child(&mempolicy, "weighted_interleave");
+    let count = narf_memory::FRAME_MAX_NUMA_NODES.min(NODE_ATTRS.len());
+
+    kobject_add_writable_attr(
+        &weighted,
+        "auto",
+        || format!("{}\n", narf_memory::interleave_auto()),
+        |data| {
+            let text = core::str::from_utf8(data)
+                .map_err(|_| crate::FsError::InvalidData)?
+                .trim();
+            let enabled = if ["1", "y", "yes", "true", "on"]
+                .iter()
+                .any(|value| text.eq_ignore_ascii_case(value))
+            {
+                true
+            } else if ["0", "n", "no", "false", "off"]
+                .iter()
+                .any(|value| text.eq_ignore_ascii_case(value))
+            {
+                false
+            } else {
+                return Err(crate::FsError::InvalidData);
+            };
+            narf_memory::set_interleave_auto(enabled).map_err(|_| crate::FsError::InvalidData)
+        },
+    );
+
+    for (node, &name) in NODE_ATTRS[..count].iter().enumerate() {
+        kobject_add_writable_attr(
+            &weighted,
+            name,
+            move || format!("{}\n", narf_memory::interleave_weight(node).unwrap_or(1)),
+            move |data| {
+                let text = core::str::from_utf8(data).map_err(|_| crate::FsError::InvalidData)?;
+                let weight = text
+                    .trim()
+                    .parse::<u8>()
+                    .map_err(|_| crate::FsError::InvalidData)?;
+                narf_memory::set_interleave_weight(node, weight)
+                    .map_err(|_| crate::FsError::InvalidData)
+            },
+        );
     }
 }
 
@@ -1542,6 +1731,7 @@ pub fn populate_all() {
     populate_input_class();
     populate_kernel_dir();
     populate_numa_nodes();
+    populate_weighted_interleave();
     populate_cpu_devices();
     // ── Desktop/laptop device classes (single merge-friendly block) ──
     // /sys/class/{leds,power_supply,thermal,hwmon,rtc} for udev / upower /
@@ -1928,6 +2118,13 @@ fn smoke_sysfs_numa_node_live_files() -> TestResult {
     let Some(node0) = nodes.get_child("node0") else {
         return TestResult::Fail("sysfs node0 missing");
     };
+    for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
+        let present = narf_memory::online_node_mask() & (1u64 << node) != 0
+            || node_cpulist_string(node) != "\n";
+        if nodes.get_child(&format!("node{}", node)).is_some() != present {
+            return TestResult::Fail("perf-visible node directory is phantom or missing");
+        }
+    }
     let Some(meminfo) = node0.attr_show("meminfo") else {
         return TestResult::Fail("node0 meminfo missing");
     };
@@ -1955,13 +2152,64 @@ fn smoke_sysfs_numa_node_live_files() -> TestResult {
     let Some(vmstat) = node0.attr_show("vmstat") else {
         return TestResult::Fail("node0 vmstat missing");
     };
-    if vmstat.contains("nr_free_pages ") {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("node0 vmstat nr_free_pages missing")
+    if !vmstat.contains("nr_free_pages ") {
+        return TestResult::Fail("node0 vmstat nr_free_pages missing");
     }
+    let Some(member) = node0
+        .symlink_names()
+        .into_iter()
+        .find(|name| name.starts_with("memory"))
+    else {
+        return TestResult::Fail("node0 has no perf-compatible memoryN membership");
+    };
+    let expected = format!("../../memory/{}", member);
+    if node0.get_symlink(&member).as_deref() != Some(expected.as_str()) {
+        return TestResult::Fail("node0 memoryN membership target is not Linux-compatible");
+    }
+    let Some(memory) = system
+        .get_child("memory")
+        .and_then(|root| root.get_child(&member))
+    else {
+        return TestResult::Fail("memoryN membership has no block object");
+    };
+    if !matches!(
+        memory.attr_show("state").as_deref(),
+        Some("online\n" | "offline\n")
+    ) {
+        return TestResult::Fail("memoryN live state missing");
+    }
+    TestResult::Pass
 }
 kernel_test_in!("filesystem/sysfs", smoke_sysfs_numa_node_live_files);
+
+fn smoke_sysfs_weighted_interleave_controls() -> TestResult {
+    populate_weighted_interleave();
+    let root = get_root();
+    let Some(weighted) = root
+        .get_child("kernel")
+        .and_then(|k| k.get_child("mm"))
+        .and_then(|mm| mm.get_child("mempolicy"))
+        .and_then(|mp| mp.get_child("weighted_interleave"))
+    else {
+        return TestResult::Fail("weighted_interleave sysfs directory missing");
+    };
+    if weighted.attr_store("node0", b"7\n") != Some(Ok(()))
+        || weighted.attr_show("node0").as_deref() != Some("7\n")
+        || weighted.attr_show("auto").as_deref() != Some("false\n")
+    {
+        return TestResult::Fail("weighted_interleave node weight did not round-trip");
+    }
+    if !matches!(
+        weighted.attr_store("node0", b"0\n"),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("weighted_interleave accepted zero weight");
+    }
+    // Restore the global default so test order cannot affect allocation smokes.
+    let _ = weighted.attr_store("node0", b"1\n");
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/sysfs", smoke_sysfs_weighted_interleave_controls);
 
 // ── Reset helper for tests ────────────────────────────────────────────
 

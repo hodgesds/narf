@@ -19,6 +19,38 @@ use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+/// Serializes creation and replacement of externally-owned shared aliases.
+/// The closure must not await or enter code that can recursively map SHARED
+/// memory.
+static SHARED_MAPPING_TRANSACTION: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
+type SharedFrameHooks = (fn(u64), fn(u64));
+static SHARED_FRAME_HOOKS: IrqSafeSpinLock<Option<SharedFrameHooks>> = IrqSafeSpinLock::new(None);
+
+pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64)) {
+    *SHARED_FRAME_HOOKS.lock() = Some((retain, release));
+}
+
+fn retain_shared_frames(region: &Region) {
+    if let Some((retain, _)) = *SHARED_FRAME_HOOKS.lock() {
+        for phys in region.phys.iter().filter(|phys| phys.raw() != 0) {
+            retain(phys.raw());
+        }
+    }
+}
+
+fn release_shared_phys(phys: PhysAddr) {
+    if phys.raw() != 0 {
+        if let Some((_, release)) = *SHARED_FRAME_HOOKS.lock() {
+            release(phys.raw());
+        }
+    }
+}
+
+pub fn with_shared_mapping_transaction<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = SHARED_MAPPING_TRANSACTION.lock();
+    f()
+}
+
 use crate::addr::{PhysAddr, VirtAddr};
 
 /// Region permission flags. Mirrors ELF `PF_*` so the loader doesn't
@@ -140,6 +172,23 @@ pub struct NumaRegionSnapshot {
     pub node_pages: [u64; crate::frame::MAX_NUMA_NODES],
 }
 
+const MAX_NUMA_HINTS: usize = 64;
+
+#[derive(Debug)]
+struct NumaHints {
+    pages: [u64; MAX_NUMA_HINTS],
+    len: usize,
+}
+
+impl NumaHints {
+    const fn new() -> Self {
+        Self {
+            pages: [0; MAX_NUMA_HINTS],
+            len: 0,
+        }
+    }
+}
+
 fn release_failed_huge_region(
     region: HugeRegion,
     error: AddressSpaceError,
@@ -162,6 +211,8 @@ pub enum AddressSpaceError {
     InvalidNode,
     /// The mapping borrows externally-owned backing and cannot be migrated.
     SharedMapping,
+    /// No online, allowed node exists in a strictly slower memory tier.
+    NoDemotionTarget,
 }
 
 /// Per-process address space. Stage-4 body: holds the region table +
@@ -199,6 +250,9 @@ pub struct AddressSpace {
     /// measured to serialise the whole machine under fork/COW-heavy
     /// load (stress-ng --sigrt) whenever one vCPU was slow to ack.
     vm_shared: core::sync::atomic::AtomicBool,
+    /// Resident base pages temporarily made inaccessible by automatic NUMA
+    /// balancing. The next access is a NUMA hint fault, not demand paging.
+    numa_hints: IrqSafeSpinLock<NumaHints>,
 }
 
 impl AddressSpace {
@@ -256,7 +310,110 @@ impl AddressSpace {
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
+            numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
         }
+    }
+
+    /// Temporarily remove one private resident 4 KiB leaf so its next access
+    /// reports the accessing CPU's NUMA locality through a hint fault.
+    ///
+    /// Returns `Ok(false)` when the address is not an eligible resident base
+    /// page (hole, lazy page, shared/locked mapping, or already sampled).
+    ///
+    /// # Safety
+    /// `self.root` must be a live user page-table root and address-space
+    /// teardown must not race this operation.
+    pub unsafe fn protect_numa_hint_page(
+        &self,
+        vaddr: VirtAddr,
+    ) -> Result<bool, AddressSpaceError> {
+        let page = VirtAddr::new(vaddr.as_u64() & !0xFFF);
+        let regions = self.regions.lock();
+        let Some(region) = regions.iter().find(|region| {
+            let base = region.base.as_u64();
+            page.as_u64() >= base && page.as_u64() < base.saturating_add(region.len)
+        }) else {
+            return Ok(false);
+        };
+        if region.perms.contains(RegionPerms::SHARED) || region.perms.contains(RegionPerms::LOCKED)
+        {
+            return Ok(false);
+        }
+        let index = ((page.as_u64() - region.base.as_u64()) >> 12) as usize;
+        if region.phys.get(index).is_none_or(|phys| phys.raw() == 0) {
+            return Ok(false);
+        }
+        let mut hints = self.numa_hints.lock();
+        if hints.pages[..hints.len].contains(&page.as_u64()) || hints.len == MAX_NUMA_HINTS {
+            return Ok(false);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: page belongs to the live private region resolved above.
+            let removed = unsafe { crate::x86_64::paging::unmap_4kb_local(self.root, page) };
+            if removed.is_err() {
+                return Ok(false);
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: page belongs to the live private region resolved above.
+            let removed = unsafe { crate::aarch64::paging::unmap_4kb(self.root, page) };
+            if removed.is_err() {
+                return Ok(false);
+            }
+        }
+        let index = hints.len;
+        hints.pages[index] = page.as_u64();
+        hints.len += 1;
+        drop(hints);
+        drop(regions);
+        self.flush_region_broadcast(page, 1);
+        Ok(true)
+    }
+
+    /// Consume a recorded NUMA hint for `vaddr`.
+    ///
+    /// A true result gives the fault handler exclusive responsibility for
+    /// restoring or migrating the still-owned backing page.
+    pub fn take_numa_hint(&self, vaddr: VirtAddr) -> bool {
+        let page = VirtAddr::new(vaddr.as_u64() & !0xFFF);
+        let mut hints = self.numa_hints.lock();
+        let Some(index) = hints.pages[..hints.len]
+            .iter()
+            .position(|candidate| *candidate == page.as_u64())
+        else {
+            return false;
+        };
+        hints.len -= 1;
+        let last = hints.len;
+        hints.pages[index] = hints.pages[last];
+        hints.pages[last] = 0;
+        true
+    }
+
+    /// Find the first eligible resident base page at or after `start`.
+    /// This is allocation-free so a timer-return sampling hook can use it.
+    pub fn next_numa_hint_candidate(&self, start: VirtAddr) -> Option<VirtAddr> {
+        let start = start.as_u64() & !0xFFF;
+        let regions = self.regions.lock();
+        regions
+            .iter()
+            .filter(|region| {
+                !region.perms.contains(RegionPerms::SHARED)
+                    && !region.perms.contains(RegionPerms::LOCKED)
+                    && region.perms.prot_only().0 != 0
+            })
+            .flat_map(|region| {
+                region
+                    .phys
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, phys)| phys.raw() != 0)
+                    .map(|(index, _)| VirtAddr::new(region.base.as_u64() + (index as u64) * 4096))
+            })
+            .filter(|page| page.as_u64() >= start)
+            .min_by_key(|page| page.as_u64())
     }
 
     /// Mark this AS as shared by a `CLONE_VM` clone (thread creation).
@@ -391,6 +548,7 @@ impl AddressSpace {
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
+            numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
         })
     }
 
@@ -413,6 +571,7 @@ impl AddressSpace {
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
+            numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
         })
     }
 
@@ -425,6 +584,14 @@ impl AddressSpace {
     /// NOT program the page table — that lives in `arch/`. Checks
     /// for overlap with existing regions and 4 KiB alignment.
     pub fn map_region(&self, region: Region) -> Result<(), AddressSpaceError> {
+        let _shared_guard = region
+            .perms
+            .contains(RegionPerms::SHARED)
+            .then(|| SHARED_MAPPING_TRANSACTION.lock());
+        self.map_region_inner(region)
+    }
+
+    fn map_region_inner(&self, region: Region) -> Result<(), AddressSpaceError> {
         if region.base.as_u64() & 0xFFF != 0 || region.len & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
@@ -488,12 +655,140 @@ impl AddressSpace {
             }
         }
         let (rb, rl) = (region.base.as_u64(), region.len);
+        if region.perms.contains(RegionPerms::SHARED) {
+            retain_shared_frames(&region);
+        }
         regions.push(region);
         drop(regions);
         // Keep the mmap-allocation cursor past anything mapped into the
         // mmap range so a later `reserve_mmap_va` can't collide with it.
         self.bump_mmap_cursor_past(rb, rl);
         Ok(())
+    }
+
+    /// Register a SHARED region while the caller already holds
+    /// [`with_shared_mapping_transaction`].
+    ///
+    /// # Safety
+    /// The caller must hold that transaction across acquisition of the
+    /// external owner's frame snapshot and this call.
+    pub unsafe fn map_shared_region_locked(&self, region: Region) -> Result<(), AddressSpaceError> {
+        if !region.perms.contains(RegionPerms::SHARED) {
+            return Err(AddressSpaceError::SharedMapping);
+        }
+        self.map_region_inner(region)
+    }
+
+    /// Replace every base-page alias of one externally-owned shared frame in
+    /// this address space without freeing either frame.
+    ///
+    /// Callers must hold [`with_shared_mapping_transaction`] across the
+    /// complete cross-address-space update and backing-owner commit.
+    ///
+    /// Returns the number of aliases replaced.
+    ///
+    /// # Safety
+    /// `old_phys` and `new_phys` must be live page-aligned frames, and the
+    /// caller must roll all previously updated address spaces back if this
+    /// operation fails.
+    pub unsafe fn replace_shared_frame(
+        &self,
+        old_phys: PhysAddr,
+        new_phys: PhysAddr,
+    ) -> Result<usize, AddressSpaceError> {
+        let mut regions = self.regions.lock();
+        let aliases: Vec<(usize, usize, VirtAddr, RegionPerms)> = regions
+            .iter()
+            .enumerate()
+            .flat_map(|(region_idx, region)| {
+                region
+                    .phys
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, phys)| {
+                        region.perms.contains(RegionPerms::SHARED) && **phys == old_phys
+                    })
+                    .map(move |(page_idx, _)| {
+                        (
+                            region_idx,
+                            page_idx,
+                            VirtAddr::new(region.base.as_u64() + page_idx as u64 * 4096),
+                            region.perms,
+                        )
+                    })
+            })
+            .collect();
+
+        let mut replaced = 0usize;
+        for &(region_idx, page_idx, page_va, perms) in &aliases {
+            // SAFETY: the caller guarantees a live root and both physical
+            // frames; each alias was revalidated under the region lock.
+            let result = unsafe {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use crate::x86_64::paging::{map_4kb, unmap_4kb_local, PtFlags};
+                    let mut flags = PtFlags::USER;
+                    if perms.contains(RegionPerms::WRITE) {
+                        flags |= PtFlags::WRITABLE;
+                    }
+                    if !perms.contains(RegionPerms::EXEC) {
+                        flags |= PtFlags::NO_EXEC;
+                    }
+                    let _ = unmap_4kb_local(self.root, page_va);
+                    map_4kb(self.root, page_va, new_phys, flags)
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
+                    let mut flags = PtFlags::AP_RW_EL1;
+                    if !perms.contains(RegionPerms::EXEC) {
+                        flags = flags | PtFlags::UXN | PtFlags::PXN;
+                    }
+                    let _ = unmap_4kb(self.root, page_va);
+                    map_4kb(self.root, page_va, new_phys, flags)
+                }
+            };
+            if result.is_err() {
+                for &(rollback_region, rollback_page, rollback_va, rollback_perms) in
+                    aliases[..replaced].iter().rev()
+                {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use crate::x86_64::paging::{map_4kb, unmap_4kb_local, PtFlags};
+                        let mut flags = PtFlags::USER;
+                        if rollback_perms.contains(RegionPerms::WRITE) {
+                            flags |= PtFlags::WRITABLE;
+                        }
+                        if !rollback_perms.contains(RegionPerms::EXEC) {
+                            flags |= PtFlags::NO_EXEC;
+                        }
+                        // SAFETY: exact inverse replacement under the same
+                        // root/frame lifetime contract.
+                        unsafe {
+                            let _ = unmap_4kb_local(self.root, rollback_va);
+                            let _ = map_4kb(self.root, rollback_va, old_phys, flags);
+                        }
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
+                        let mut flags = PtFlags::AP_RW_EL1;
+                        if !rollback_perms.contains(RegionPerms::EXEC) {
+                            flags = flags | PtFlags::UXN | PtFlags::PXN;
+                        }
+                        let _ = unsafe { unmap_4kb(self.root, rollback_va) };
+                        let _ = unsafe { map_4kb(self.root, rollback_va, old_phys, flags) };
+                    }
+                    regions[rollback_region].phys[rollback_page] = old_phys;
+                    self.flush_region_broadcast(rollback_va, 1);
+                }
+                return Err(AddressSpaceError::NotImplemented);
+            }
+            regions[region_idx].phys[page_idx] = new_phys;
+            self.flush_region_broadcast(page_va, 1);
+            replaced += 1;
+        }
+        Ok(replaced)
     }
 
     /// Install an owned hardware huge-page region and transfer ownership of
@@ -769,6 +1064,7 @@ impl AddressSpace {
     /// (below) which calls into the same primitive for every
     /// surviving region plus the page-table pages themselves.
     pub fn unmap_region(&self, base: VirtAddr) -> Result<Region, AddressSpaceError> {
+        let _shared_transaction = SHARED_MAPPING_TRANSACTION.lock();
         let region = {
             let mut regions = self.regions.lock();
             let idx = regions
@@ -817,6 +1113,7 @@ impl AddressSpace {
     /// individual segments — the non-overlaid pages (e.g. the ELF header)
     /// must survive.
     pub fn punch_fixed(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
+        let _shared_transaction = SHARED_MAPPING_TRANSACTION.lock();
         if base.as_u64() & 0xFFF != 0 || len & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
@@ -927,6 +1224,8 @@ impl AddressSpace {
                                 to_free.push(*p);
                             }
                         }
+                    } else if let Some(p) = old.phys.get(pg) {
+                        release_shared_phys(*p);
                     }
                 }
                 // Prefix [rb, lo) keeps its frames + already-installed PTEs.
@@ -1096,6 +1395,9 @@ impl AddressSpace {
     fn free_region_frames(&self, region: &Region) {
         use crate::frame::{free_frame, PhysFrame};
         if region.perms.contains(RegionPerms::SHARED) {
+            for phys in &region.phys {
+                release_shared_phys(*phys);
+            }
             return;
         }
         let pages = (region.len + 0xFFF) >> 12;
@@ -2533,6 +2835,9 @@ impl AddressSpace {
     ///   WRITE) before either is re-activated.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError> {
+        // Exclude shared-page migration until the child has a complete alias
+        // table. The child is not scheduler-visible during construction.
+        let _shared_guard = SHARED_MAPPING_TRANSACTION.lock();
         // SAFETY: caller's contract — paging is live.
         let child = unsafe { Self::new_for_user() }?;
 
@@ -2583,7 +2888,7 @@ impl AddressSpace {
         // (post-strip) — same vaddr base, same phys list, same
         // (now WRITE-stripped) perms.
         for r in parent_regions.into_iter() {
-            child.map_region(r)?;
+            child.map_region_inner(r)?;
         }
 
         // Private hugetlb mappings are copied eagerly. The hugepage pool has
@@ -2856,6 +3161,65 @@ impl AddressSpace {
         self.flush_region_broadcast(page_va, 1);
         crate::frame::free_frame(crate::frame::PhysFrame::new(old_phys));
         Ok(old_node)
+    }
+
+    /// Move one resident private page to the closest node in the next slower
+    /// memory tier.
+    ///
+    /// `allowed_nodes` is the caller's cpuset/mempolicy boundary. The source
+    /// node is resolved from the authoritative backing list, then
+    /// [`crate::numa_tier::demotion_target`] selects only a strictly lower
+    /// tier. The actual ownership transfer, copy, PTE replacement, rollback,
+    /// and TLB invalidation are delegated to [`Self::migrate_page_to_node`].
+    ///
+    /// # Safety
+    /// Same address-space root and mapping-lifetime requirements as
+    /// [`Self::migrate_page_to_node`].
+    pub unsafe fn demote_page(
+        &self,
+        vaddr: VirtAddr,
+        allowed_nodes: u64,
+    ) -> Result<usize, AddressSpaceError> {
+        let v = vaddr.as_u64();
+        let source = {
+            let huge = self.huge_regions.lock();
+            huge.iter().find_map(|region| {
+                let base = region.base.as_u64();
+                if v < base || v >= base.saturating_add(region.len) {
+                    return None;
+                }
+                let leaf_bytes = match region.size {
+                    crate::hugepage::HugeSize::M2 => crate::hugepage::HUGEPAGE_2M_BYTES,
+                    crate::hugepage::HugeSize::G1 => crate::hugepage::HUGEPAGE_1G_BYTES,
+                };
+                region
+                    .frames
+                    .get(((v - base) / leaf_bytes) as usize)
+                    .map(|frame| frame.node())
+            })
+        }
+        .or_else(|| {
+            let regions = self.regions.lock();
+            regions.iter().find_map(|region| {
+                let base = region.base.as_u64();
+                if v < base || v >= base.saturating_add(region.len) {
+                    return None;
+                }
+                let phys = *region.phys.get(((v - base) >> 12) as usize)?;
+                if phys.raw() == 0 {
+                    None
+                } else {
+                    // SAFETY: non-zero backing entries name live frames.
+                    Some(unsafe { crate::frame::narf_phys_node(phys.raw()) })
+                }
+            })
+        })
+        .ok_or(AddressSpaceError::Unmapped)?;
+
+        let target = crate::numa_tier::demotion_target(source, allowed_nodes)
+            .ok_or(AddressSpaceError::NoDemotionTarget)?;
+        // SAFETY: inherited from this method's contract.
+        unsafe { self.migrate_page_to_node(vaddr, target) }
     }
 
     /// Migrate the hardware huge leaf containing `vaddr`, if any.
@@ -3402,6 +3766,7 @@ impl Drop for AddressSpace {
     /// entries on x86_64 are not freed — only the user half
     /// (entries 0..=255) and the PML4 frame itself.
     fn drop(&mut self) {
+        let _shared_transaction = SHARED_MAPPING_TRANSACTION.lock();
         let huge_regions = core::mem::take(&mut *self.huge_regions.lock());
         for region in huge_regions {
             let page_size = match region.size {

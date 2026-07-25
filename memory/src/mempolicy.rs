@@ -30,7 +30,7 @@
 //! that never sets a policy leaves the slot at `MPOL_DEFAULT`, which
 //! reproduces today's local-first behavior exactly.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::frame::{self, FrameAllocError, PhysFrame, MAX_NUMA_NODES};
 
@@ -41,6 +41,7 @@ pub const MPOL_BIND: u32 = 2;
 pub const MPOL_INTERLEAVE: u32 = 3;
 pub const MPOL_LOCAL: u32 = 4;
 pub const MPOL_PREFERRED_MANY: u32 = 5;
+pub const MPOL_WEIGHTED_INTERLEAVE: u32 = 6;
 
 /// Max CPUs whose active policy we track. A CPU index at or above this
 /// falls back to slot 0 (correctness-preserving).
@@ -59,9 +60,24 @@ static ACTIVE_ALLOWED: [AtomicU64; MAX_TRACKED_CPUS] =
 static ACTIVE_HOME: [AtomicU32; MAX_TRACKED_CPUS] =
     [const { AtomicU32::new(u32::MAX) }; MAX_TRACKED_CPUS];
 
-/// Per-CPU interleave rotor for `MPOL_INTERLEAVE`.
-static INTERLEAVE_NEXT: [AtomicU32; MAX_TRACKED_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_TRACKED_CPUS];
+/// Linux-compatible global weighted-interleave ratios. A weight is never
+/// zero; the sysfs ABI accepts the inclusive range 1..=255.
+static INTERLEAVE_WEIGHTS: [AtomicU8; MAX_NUMA_NODES] =
+    [const { AtomicU8::new(1) }; MAX_NUMA_NODES];
+
+/// HMAT-derived node bandwidth values used by automatic weighting.
+static INTERLEAVE_BANDWIDTH: [AtomicU64; MAX_NUMA_NODES] =
+    [const { AtomicU64::new(0) }; MAX_NUMA_NODES];
+
+/// Linux defaults weighted interleave to automatic mode.
+static INTERLEAVE_AUTO: AtomicBool = AtomicBool::new(true);
+
+static INTERLEAVE_CONFIG_LOCK: narf_lib::sync::IrqSafeSpinLock<()> =
+    narf_lib::sync::IrqSafeSpinLock::new(());
+
+/// Task-owned interleave sequence position published for the active fault.
+static ACTIVE_INTERLEAVE_INDEX: [AtomicU64; MAX_TRACKED_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_TRACKED_CPUS];
 
 #[inline]
 fn cpu_slot() -> usize {
@@ -83,6 +99,8 @@ pub struct Mempolicy {
     pub allowed: u64,
     /// Distance anchor for MPOL_BIND (`u32::MAX` = lowest masked node).
     pub home_node: u32,
+    /// Task-owned sequence position for ordinary and weighted interleave.
+    pub interleave_index: u64,
 }
 
 impl Mempolicy {
@@ -91,6 +109,7 @@ impl Mempolicy {
         nodemask: 0,
         allowed: u64::MAX,
         home_node: u32::MAX,
+        interleave_index: 0,
     };
 
     fn pack(self) -> u64 {
@@ -106,6 +125,7 @@ impl Mempolicy {
             nodemask: v & 0xFFFF_FFFF,
             allowed: u64::MAX,
             home_node: u32::MAX,
+            interleave_index: 0,
         }
     }
 }
@@ -115,6 +135,7 @@ pub fn set_active(policy: Mempolicy) {
     let slot = cpu_slot();
     ACTIVE_ALLOWED[slot].store(policy.allowed, Ordering::Release);
     ACTIVE_HOME[slot].store(policy.home_node, Ordering::Release);
+    ACTIVE_INTERLEAVE_INDEX[slot].store(policy.interleave_index, Ordering::Release);
     ACTIVE[slot].store(policy.pack(), Ordering::Release);
 }
 
@@ -124,6 +145,7 @@ pub fn clear_active() {
     ACTIVE[slot].store(u64::MAX, Ordering::Release);
     ACTIVE_ALLOWED[slot].store(u64::MAX, Ordering::Release);
     ACTIVE_HOME[slot].store(u32::MAX, Ordering::Release);
+    ACTIVE_INTERLEAVE_INDEX[slot].store(0, Ordering::Release);
 }
 
 /// The current CPU's active policy (DEFAULT when none installed).
@@ -132,6 +154,7 @@ pub fn active() -> Mempolicy {
     let mut policy = Mempolicy::unpack(ACTIVE[slot].load(Ordering::Acquire));
     policy.allowed = ACTIVE_ALLOWED[slot].load(Ordering::Acquire);
     policy.home_node = ACTIVE_HOME[slot].load(Ordering::Acquire);
+    policy.interleave_index = ACTIVE_INTERLEAVE_INDEX[slot].load(Ordering::Acquire);
     policy
 }
 
@@ -144,19 +167,17 @@ fn first_node(mask: u64) -> Option<usize> {
     }
 }
 
-/// Pick the next interleave target from `mask` for this CPU, advancing
-/// the rotor. Falls back to node 0 for an empty mask.
-fn interleave_pick(mask: u64) -> usize {
+/// Resolve an ordinary interleave sequence position.
+fn interleave_pick(mask: u64, index: u64) -> usize {
     if mask == 0 {
         return 0;
     }
     let popcount = mask.count_ones();
-    let slot = cpu_slot();
-    let idx = INTERLEAVE_NEXT[slot].fetch_add(1, Ordering::Relaxed) % popcount;
+    let idx = index % popcount as u64;
     let mut seen = 0u32;
     for bit in 0..MAX_NUMA_NODES as u32 {
         if (mask >> bit) & 1 != 0 {
-            if seen == idx {
+            if seen as u64 == idx {
                 return bit as usize;
             }
             seen += 1;
@@ -165,8 +186,173 @@ fn interleave_pick(mask: u64) -> usize {
     0
 }
 
-pub(crate) fn next_interleave_node(mask: u64) -> usize {
-    interleave_pick(mask)
+pub(crate) fn next_interleave_node(mask: u64, index: u64) -> usize {
+    interleave_pick(mask, index)
+}
+
+/// Return the configured global weighted-interleave weight for `node`.
+pub fn interleave_weight(node: usize) -> Option<u8> {
+    INTERLEAVE_WEIGHTS
+        .get(node)
+        .map(|weight| weight.load(Ordering::Acquire))
+}
+
+/// Set one node's global weighted-interleave weight.
+pub fn set_interleave_weight(node: usize, weight: u8) -> Result<(), ()> {
+    if weight == 0 {
+        return Err(());
+    }
+    let Some(slot) = INTERLEAVE_WEIGHTS.get(node) else {
+        return Err(());
+    };
+    let _guard = INTERLEAVE_CONFIG_LOCK.lock();
+    slot.store(weight, Ordering::Release);
+    INTERLEAVE_AUTO.store(false, Ordering::Release);
+    Ok(())
+}
+
+/// Whether HMAT-derived automatic weighting is enabled.
+pub fn interleave_auto() -> bool {
+    INTERLEAVE_AUTO.load(Ordering::Acquire)
+}
+
+/// Publish a node's real HMAT bandwidth coordinate. Zero means unknown.
+pub fn set_interleave_bandwidth(node: usize, bandwidth: u64) -> Result<(), ()> {
+    let Some(slot) = INTERLEAVE_BANDWIDTH.get(node) else {
+        return Err(());
+    };
+    let _guard = INTERLEAVE_CONFIG_LOCK.lock();
+    slot.store(bandwidth, Ordering::Release);
+    if interleave_auto() {
+        recompute_auto_weights()?;
+    }
+    Ok(())
+}
+
+/// Enable or disable HMAT-derived weights. Enabling fails when no node has
+/// a usable bandwidth coordinate; disabling preserves the current weights.
+pub fn set_interleave_auto(enabled: bool) -> Result<(), ()> {
+    let _guard = INTERLEAVE_CONFIG_LOCK.lock();
+    if enabled {
+        recompute_auto_weights()?;
+    }
+    INTERLEAVE_AUTO.store(enabled, Ordering::Release);
+    Ok(())
+}
+
+fn recompute_auto_weights() -> Result<(), ()> {
+    const WEIGHTINESS: u64 = 32;
+    let mut bandwidth = [0u64; MAX_NUMA_NODES];
+    let mut sum = 0u64;
+    for (node, value) in INTERLEAVE_BANDWIDTH.iter().enumerate() {
+        bandwidth[node] = value.load(Ordering::Acquire);
+        sum = sum.saturating_add(bandwidth[node]);
+    }
+    if sum == 0 {
+        return Err(());
+    }
+
+    let mut weights = [1u8; MAX_NUMA_NODES];
+    let mut gcd = 0u8;
+    for node in 0..MAX_NUMA_NODES {
+        if bandwidth[node] == 0 {
+            continue;
+        }
+        let scaled = WEIGHTINESS.saturating_mul(bandwidth[node]);
+        let weight = scaled.checked_div(sum).unwrap_or(0).clamp(1, 255) as u8;
+        weights[node] = weight;
+        gcd = if gcd == 0 {
+            weight
+        } else {
+            gcd_u8(gcd, weight)
+        };
+    }
+    if gcd > 1 {
+        for node in 0..MAX_NUMA_NODES {
+            if bandwidth[node] != 0 {
+                weights[node] /= gcd;
+            }
+        }
+    }
+    for (slot, weight) in INTERLEAVE_WEIGHTS.iter().zip(weights) {
+        slot.store(weight, Ordering::Release);
+    }
+    Ok(())
+}
+
+fn gcd_u8(mut a: u8, mut b: u8) -> u8 {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a
+}
+
+fn weighted_interleave_pick(mask: u64, index: u64) -> usize {
+    let mut total = 0u32;
+    for (node, weight) in INTERLEAVE_WEIGHTS.iter().enumerate() {
+        if (mask >> node) & 1 != 0 {
+            total += weight.load(Ordering::Acquire) as u32;
+        }
+    }
+    if total == 0 {
+        return 0;
+    }
+    let mut target = (index % total as u64) as u32;
+    for (node, weight) in INTERLEAVE_WEIGHTS.iter().enumerate() {
+        if (mask >> node) & 1 == 0 {
+            continue;
+        }
+        let weight = weight.load(Ordering::Acquire) as u32;
+        if target < weight {
+            return node;
+        }
+        target -= weight;
+    }
+    mask.trailing_zeros() as usize
+}
+
+pub(crate) fn next_weighted_interleave_node(mask: u64, index: u64) -> usize {
+    weighted_interleave_pick(mask, index)
+}
+
+/// Resolve a task-owned interleave sequence position without mutation.
+pub fn interleave_node_at(mask: u64, weighted: bool, index: u64) -> usize {
+    if mask == 0 {
+        return 0;
+    }
+    if !weighted {
+        let idx = index % mask.count_ones() as u64;
+        let mut seen = 0u32;
+        for node in 0..MAX_NUMA_NODES {
+            if (mask >> node) & 1 != 0 {
+                if seen as u64 == idx {
+                    return node;
+                }
+                seen += 1;
+            }
+        }
+        return mask.trailing_zeros() as usize;
+    }
+    let total: u32 = INTERLEAVE_WEIGHTS
+        .iter()
+        .enumerate()
+        .filter(|(node, _)| (mask >> node) & 1 != 0)
+        .map(|(_, weight)| weight.load(Ordering::Acquire) as u32)
+        .sum();
+    let mut target = (index % total as u64) as u32;
+    for (node, weight) in INTERLEAVE_WEIGHTS.iter().enumerate() {
+        if (mask >> node) & 1 == 0 {
+            continue;
+        }
+        let weight = weight.load(Ordering::Acquire) as u32;
+        if target < weight {
+            return node;
+        }
+        target -= weight;
+    }
+    mask.trailing_zeros() as usize
 }
 
 /// Allocate one frame honoring `policy`, with `local` as the faulting
@@ -188,13 +374,17 @@ pub fn alloc_frame_with(policy: Mempolicy, local: usize) -> Result<PhysFrame, Fr
     }
     match policy.mode {
         MPOL_BIND => alloc_bind(policy.nodemask & allowed, policy.home_node),
-        MPOL_INTERLEAVE => {
+        MPOL_INTERLEAVE | MPOL_WEIGHTED_INTERLEAVE => {
             let mask = if policy.nodemask == 0 {
                 allowed
             } else {
                 policy.nodemask & allowed
             };
-            let node = interleave_pick(mask);
+            let node = if policy.mode == MPOL_WEIGHTED_INTERLEAVE {
+                weighted_interleave_pick(mask, policy.interleave_index)
+            } else {
+                interleave_pick(mask, policy.interleave_index)
+            };
             let result = if unconstrained {
                 frame::alloc_frame_on(node)
             } else {

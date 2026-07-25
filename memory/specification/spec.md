@@ -76,9 +76,56 @@ pub struct Mempolicy {
     /// MPOL_BIND/MPOL_PREFERRED_MANY distance anchor; u32::MAX selects
     /// the policy's default anchor.
     pub home_node: u32,
+    /// Task-owned sequence position for interleave policies.
+    pub interleave_index: u64,
 }
 pub fn mempolicy_set(policy: Mempolicy);
 pub fn mempolicy_clear();
+/// Global Linux MPOL_WEIGHTED_INTERLEAVE ratios (valid weights 1..=255).
+pub fn interleave_weight(node: usize) -> Option<u8>;
+pub fn set_interleave_weight(node: usize, weight: u8) -> Result<(), ()>;
+pub fn interleave_node_at(mask: u64, weighted: bool, index: u64) -> usize;
+pub fn interleave_auto() -> bool;
+pub fn set_interleave_auto(enabled: bool) -> Result<(), ()>;
+pub fn set_interleave_bandwidth(node: usize, bandwidth: u64) -> Result<(), ()>;
+
+/// Runtime memory-hotplug admission. The caller proves the range is real,
+/// kernel-mapped RAM that does not overlap boot-reserved or MMIO storage.
+pub unsafe fn online_memory_range(
+    start: PhysAddr,
+    len: u64,
+    node: usize,
+) -> Result<(), MemoryHotplugError>;
+/// Remove an exact previously-hotplugged range only when every frame is free.
+pub fn offline_memory_range(
+    start: PhysAddr,
+    len: u64,
+) -> Result<usize, MemoryHotplugError>;
+pub fn kernel_ram_range_mapped(start: PhysAddr, len: u64) -> bool;
+pub fn online_node_mask() -> u64;
+pub fn online_node_count() -> usize;
+pub fn hotplug_node_for_phys(addr: PhysAddr) -> Option<usize>;
+/// Post-commit observer invoked with no allocator/hotplug lock held.
+pub fn install_memory_hotplug_hook(hook: fn());
+pub const MEMORY_BLOCK_SIZE: u64;
+/// Includes previously discovered offline blocks so memoryN identity persists.
+pub fn memory_blocks() -> Vec<MemoryBlock>;
+
+/// Publish local HMAT coordinates and derive Linux-style memory tiers.
+pub fn set_node_performance(
+    node: usize,
+    bandwidth: u64,
+    latency: u64,
+) -> Result<(), ()>;
+pub fn node_tier(node: usize) -> Option<u8>;
+pub fn tier_nodes(tier: u8) -> u64;
+/// Closest allowed node in the nearest strictly slower tier.
+pub fn demotion_target(source: usize, allowed: u64) -> Option<usize>;
+
+/// Temporarily remove an eligible private resident leaf for NUMA sampling.
+pub unsafe fn protect_numa_hint_page(vaddr: VirtAddr) -> Result<bool, AddressSpaceError>;
+/// Consume the recorded hint before restoring or migrating its backing.
+pub fn take_numa_hint(vaddr: VirtAddr) -> bool;
 
 /// Monotonic Linux-compatible allocation-event snapshot for one NUMA node.
 pub fn numa_node_stats(node: usize) -> NumaNodeStats;
@@ -119,6 +166,12 @@ impl AddressSpace {
     pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot>;
 }
 
+/// Install the external shared-page owner's per-alias lifetime hooks.
+/// Every SHARED map retains each non-zero backing frame; unmap, MAP_FIXED
+/// replacement, and address-space teardown release only after the
+/// corresponding translations have been invalidated.
+pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64));
+
 impl AddressSpace {
     /// Replace one resident private base page, or the complete hardware leaf
     /// containing a huge-page address, with equivalent backing from a target
@@ -135,6 +188,22 @@ impl AddressSpace {
         &self,
         old_nodes: u64,
         new_nodes: u64,
+    ) -> Result<usize, AddressSpaceError>;
+
+    /// Migrate one private base page or complete huge leaf to the nearest
+    /// strictly slower memory tier within the caller's allowed-node mask.
+    pub unsafe fn demote_page(
+        &self,
+        va: VirtAddr,
+        allowed_nodes: u64,
+    ) -> Result<usize, AddressSpaceError>;
+
+    /// Replace all aliases of one externally-owned shared base page in this
+    /// address space without releasing either frame.
+    pub unsafe fn replace_shared_frame(
+        &self,
+        old: PhysAddr,
+        new: PhysAddr,
     ) -> Result<usize, AddressSpaceError>;
 
     /// Audit or migrate resident pages in a virtual range to a node mask.
@@ -208,6 +277,11 @@ x86_64 is rejected at runtime.
 - `PhysFrame` is `!Copy`; dropping it returns to the allocator (Rust
   ownership = leak safety for physical memory).
 - Buddy allocator's free lists are per-NUMA-node once NUMA is introduced.
+- Runtime memory online is transactional: overlapping/unmapped ranges are
+  rejected before donation, and allocator metadata may not grow while the
+  frame lock is held. Offline succeeds only for an exact registered range
+  whose complete buddy extent is free; a failed removal leaves every free
+  list and node counter unchanged.
 - **A `PhysFrame` returned by `alloc_frame()` is always tagged to
   `DomainId::FRAME` (domain 0) at the point of return.** The caller
   must invoke `assign_domain` before mapping into a non-Frame domain.

@@ -2276,10 +2276,12 @@ fn render_numa_maps(info: &ProcTaskInfo) -> String {
             2 => "bind",
             3 => "interleave",
             4 => "local",
+            5 => "prefer (many)",
+            6 => "weighted interleave",
             _ => "default",
         };
         let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{:x} {policy}", v.start));
-        if matches!(v.numa_policy & 0x0fff, 1..=3) && v.numa_nodemask != 0 {
+        if matches!(v.numa_policy & 0x0fff, 1..=3 | 5..=6) && v.numa_nodemask != 0 {
             let _ = core::fmt::Write::write_fmt(
                 &mut s,
                 format_args!(":{}", format_node_list(v.numa_nodemask)),

@@ -79,6 +79,35 @@ fn smoke_shmem_create_destroy_round_trip() -> TestResult {
 }
 kernel_test_in!("shmem", smoke_shmem_create_destroy_round_trip);
 
+fn smoke_shmem_removed_handle_waits_for_last_mapping() -> TestResult {
+    use crate::{__reset_for_test, count, create, destroy, frames_of, len_of, syscall_vtable};
+    __reset_for_test();
+    let handle = create(9002, 4096).expect("create");
+    let phys = frames_of(handle).expect("frames")[0].raw();
+    let vtable = syscall_vtable();
+
+    // Model one AddressSpace SHARED alias. IPC_RMID removes the name and
+    // rejects new attachments, but the mapped page must remain movable and
+    // backed until that alias is torn down.
+    (vtable.retain_frame)(phys);
+    if !destroy(handle) {
+        return TestResult::Fail("destroy");
+    }
+    if count() != 0 || len_of(handle).is_some() || frames_of(handle).is_some() {
+        return TestResult::Fail("removed handle remained publicly visible");
+    }
+    if !(vtable.owns_frame)(phys) {
+        return TestResult::Fail("mapped page reclaimed before final alias");
+    }
+    (vtable.release_frame)(phys);
+    if (vtable.owns_frame)(phys) {
+        return TestResult::Fail("page survived final alias release");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("shmem", smoke_shmem_removed_handle_waits_for_last_mapping);
+
 fn smoke_shmem_sg_iter_walks_pages() -> TestResult {
     use crate::{__reset_for_test, create, sg_iter, SgEntry};
     __reset_for_test();

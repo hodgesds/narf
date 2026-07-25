@@ -33,6 +33,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::frame::{self, UsableRegion, MAX_NUMA_NODES};
 use crate::mempolicy::{
     Mempolicy, MPOL_BIND, MPOL_INTERLEAVE, MPOL_PREFERRED, MPOL_PREFERRED_MANY,
+    MPOL_WEIGHTED_INTERLEAVE,
 };
 
 /// 2 MiB hugepage size in bytes.
@@ -234,15 +235,21 @@ pub fn alloc_hugepage_with(
     let preferred = match policy.mode {
         MPOL_BIND | MPOL_PREFERRED if requested != 0 => requested.trailing_zeros() as usize,
         MPOL_PREFERRED_MANY if requested != 0 => anchor,
-        MPOL_INTERLEAVE if requested != 0 => crate::mempolicy::next_interleave_node(requested),
+        MPOL_INTERLEAVE if requested != 0 => {
+            crate::mempolicy::next_interleave_node(requested, policy.interleave_index)
+        }
+        MPOL_WEIGHTED_INTERLEAVE if requested != 0 => {
+            crate::mempolicy::next_weighted_interleave_node(requested, policy.interleave_index)
+        }
         _ => anchor,
     };
-    let candidates =
-        if policy.mode == MPOL_BIND || (policy.mode == MPOL_INTERLEAVE && requested != 0) {
-            requested
-        } else {
-            allowed
-        };
+    let candidates = if policy.mode == MPOL_BIND
+        || (matches!(policy.mode, MPOL_INTERLEAVE | MPOL_WEIGHTED_INTERLEAVE) && requested != 0)
+    {
+        requested
+    } else {
+        allowed
+    };
     if candidates == 0 {
         return Err(HugeAllocError::Empty);
     }
@@ -271,7 +278,9 @@ pub fn alloc_hugepage_with(
         if let Ok(allocated) = alloc_hugepage_on(size, node) {
             let pages = allocated.size_bytes() >> 12;
             frame::account_numa_allocation(preferred, node, pages);
-            if policy.mode == MPOL_INTERLEAVE && node == preferred {
+            if matches!(policy.mode, MPOL_INTERLEAVE | MPOL_WEIGHTED_INTERLEAVE)
+                && node == preferred
+            {
                 frame::account_interleave_hit(node, pages);
             }
             return Ok(allocated);

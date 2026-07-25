@@ -370,8 +370,11 @@ pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Opti
 // `install_address_space_lookup`.
 
 type AsLookupFn = fn() -> Option<Arc<AddressSpace>>;
+type AllAsLookupFn = fn() -> alloc::vec::Vec<Arc<AddressSpace>>;
 
 static AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AsLookupFn>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+static ALL_AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AllAsLookupFn>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Install the function that resolves "what's the currently-
@@ -382,6 +385,18 @@ static AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AsLookupFn>> =
 /// handlers return `InvalidOp`.
 pub fn install_address_space_lookup(lookup: AsLookupFn) {
     *AS_LOOKUP.lock() = Some(lookup);
+}
+
+/// Install the scheduler bridge used by shared-page migration to snapshot all
+/// live aliases without introducing a userspace↔scheduler crate cycle.
+pub fn install_all_address_spaces_lookup(lookup: AllAsLookupFn) {
+    *ALL_AS_LOOKUP.lock() = Some(lookup);
+}
+
+fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
+    (*ALL_AS_LOOKUP.lock())
+        .map(|lookup| lookup())
+        .unwrap_or_default()
 }
 
 /// Snapshot the currently-installed AS lookup (for save/restore around a
@@ -3356,9 +3371,11 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
 // them, but they don't affect allocation steering.
 
 const MPOL_PREFERRED_MANY: u32 = 5;
+const MPOL_WEIGHTED_INTERLEAVE: u32 = 6;
 const MPOL_F_RELATIVE_NODES: u32 = 1 << 14;
 const MPOL_F_STATIC_NODES: u32 = 1 << 15;
-const MPOL_MODE_FLAGS: u32 = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES;
+const MPOL_F_NUMA_BALANCING: u32 = 1 << 13;
+const MPOL_MODE_FLAGS: u32 = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES | MPOL_F_NUMA_BALANCING;
 
 // Online NUMA node count via a weak hook (userspace avoids a direct
 // narf-acpi dep to keep the kernel image under lld's orphan-placement
@@ -3367,7 +3384,6 @@ extern "Rust" {
     fn narf_numa_node_count() -> u32;
     fn narf_cpu_to_node(cpu: u32) -> u32;
     fn narf_phys_to_node(addr: u64) -> u32;
-    fn narf_node_distance(from: u32, to: u32) -> u32;
 }
 
 #[inline]
@@ -3441,8 +3457,62 @@ static MBIND_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<(u64, u64, StoredPolicy)>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Linux keeps `il_prev`/`il_weight` in task state. NARF stores the equivalent
+/// monotonically increasing sequence position by task ID so CPU migration
+/// cannot restart or duplicate an interleave cycle.
+static INTERLEAVE_INDEX_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, u64>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[derive(Copy, Clone)]
+struct NumaBalanceState {
+    ticks: u16,
+    cursor: u64,
+}
+
+static NUMA_BALANCE_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, NumaBalanceState>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn ensure_numa_balance_state(task: u64) {
+    NUMA_BALANCE_TABLE
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(
+            task,
+            NumaBalanceState {
+                ticks: 255,
+                cursor: AddressSpace::USER_FIXED_FLOOR,
+            },
+        );
+}
+
+fn start_numa_balance_range(task: u64, cursor: u64) {
+    ensure_numa_balance_state(task);
+    if let Some(state) = NUMA_BALANCE_TABLE
+        .lock()
+        .as_mut()
+        .and_then(|states| states.get_mut(&task))
+    {
+        state.cursor = cursor & !0xFFF;
+    }
+}
+
+fn task_interleave_index(task: u64, advance: bool) -> u64 {
+    let mut table = INTERLEAVE_INDEX_TABLE.lock();
+    let index = table
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .entry(task)
+        .or_insert(0);
+    let current = *index;
+    if advance {
+        *index = index.wrapping_add(1);
+    }
+    current
+}
+
 fn mpol_mode_valid(mode: u32) -> bool {
-    matches!(mode & !MPOL_MODE_FLAGS, 0..=MPOL_PREFERRED_MANY)
+    matches!(mode & !MPOL_MODE_FLAGS, 0..=MPOL_WEIGHTED_INTERLEAVE)
 }
 
 fn mpol_policy_shape_valid(mode: u32, nodemask: u64) -> bool {
@@ -3450,13 +3520,110 @@ fn mpol_policy_shape_valid(mode: u32, nodemask: u64) -> bool {
     if flags == (MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES) {
         return false;
     }
-    match mode & !MPOL_MODE_FLAGS {
+    let base = mode & !MPOL_MODE_FLAGS;
+    if flags & MPOL_F_NUMA_BALANCING != 0
+        && !matches!(base, narf_memory::MPOL_BIND | MPOL_PREFERRED_MANY)
+    {
+        return false;
+    }
+    match base {
         narf_memory::MPOL_DEFAULT | narf_memory::MPOL_LOCAL => nodemask == 0 && flags == 0,
         narf_memory::MPOL_PREFERRED => nodemask != 0 || flags == 0,
-        narf_memory::MPOL_BIND | narf_memory::MPOL_INTERLEAVE | MPOL_PREFERRED_MANY => {
-            nodemask != 0
-        }
+        narf_memory::MPOL_BIND
+        | narf_memory::MPOL_INTERLEAVE
+        | MPOL_PREFERRED_MANY
+        | MPOL_WEIGHTED_INTERLEAVE => nodemask != 0,
         _ => false,
+    }
+}
+
+/// Resolve a sampled NUMA hint fault. The backing remains owned while its
+/// leaf is absent; this either migrates it to the accessing CPU's allowed
+/// node or restores the original mapping.
+pub fn handle_numa_hint_fault(va: u64) -> bool {
+    let Some(as_ref) = active_user_as() else {
+        return false;
+    };
+    let page = VirtAddr::new(va & !0xFFF);
+    if !as_ref.take_numa_hint(page) {
+        return false;
+    }
+    let task = current_task_id();
+    let policy = resolve_policy(task, va);
+    let allowed = narf_scheduler::task_mems_allowed(task);
+    let targets = mpol_effective_nodemask(policy, allowed);
+    let local = numa_node_for_cpu(narf_lib::percpu::current_cpu() as u32) as usize;
+    if policy.mode & MPOL_F_NUMA_BALANCING != 0 && (targets >> local) & 1 != 0 {
+        // SAFETY: the sampled page belongs to the active address space and
+        // remains resident/owned while its leaf is temporarily absent.
+        let _ = unsafe { as_ref.migrate_page_to_node(page, local) };
+    }
+    // migrate_page_to_node's already-local fast path intentionally does not
+    // rewrite a leaf. Always remap, also providing rollback after ENOMEM.
+    // SAFETY: the hint record proves this active AS retains the page backing.
+    unsafe { as_ref.remap_page(page) }.is_ok()
+}
+
+/// Allocation-free periodic sampler called on timer return to user mode.
+/// One page is protected per 256 ticks and the scan cursor advances across
+/// VMAs, bounding both IRQ work and hint-fault frequency.
+pub fn numa_balance_tick() {
+    const SCAN_TICKS: u16 = 256;
+    const SEARCH_BUDGET: usize = 16;
+    let task = current_task_id();
+    let cursor = {
+        let mut table = NUMA_BALANCE_TABLE.lock();
+        let Some(state) = table.as_mut().and_then(|states| states.get_mut(&task)) else {
+            return;
+        };
+        state.ticks = state.ticks.saturating_add(1);
+        if state.ticks < SCAN_TICKS {
+            return;
+        }
+        state.ticks = 0;
+        state.cursor
+    };
+    let Some(as_ref) = active_user_as() else {
+        return;
+    };
+    let mut next = cursor;
+    for _ in 0..SEARCH_BUDGET {
+        let candidate = as_ref
+            .next_numa_hint_candidate(VirtAddr::new(next))
+            .or_else(|| {
+                as_ref.next_numa_hint_candidate(VirtAddr::new(AddressSpace::USER_FIXED_FLOOR))
+            });
+        let Some(candidate) = candidate else {
+            return;
+        };
+        next = candidate.as_u64().saturating_add(4096);
+        let policy = resolve_policy(task, candidate.as_u64());
+        if policy.mode & MPOL_F_NUMA_BALANCING == 0 {
+            continue;
+        }
+        // SAFETY: candidate was obtained from this live AS's resident table;
+        // the method revalidates it under the region lock.
+        if unsafe { as_ref.protect_numa_hint_page(candidate) }.unwrap_or(false) {
+            if let Some(state) = NUMA_BALANCE_TABLE
+                .lock()
+                .as_mut()
+                .and_then(|states| states.get_mut(&task))
+            {
+                state.cursor = next;
+            }
+            return;
+        }
+    }
+    if let Some(state) = NUMA_BALANCE_TABLE
+        .lock()
+        .as_mut()
+        .and_then(|states| states.get_mut(&task))
+    {
+        state.cursor = next;
+        // Continue the bounded walk on the next tick until it reaches an
+        // eligible policy range; the long interval begins only after a page
+        // has actually been sampled.
+        state.ticks = SCAN_TICKS - 1;
     }
 }
 
@@ -3532,104 +3699,27 @@ pub fn publish_mempolicy_for_fault(va: u64) {
     let task = current_task_id();
     let policy = resolve_policy(task, va);
     let allowed = narf_scheduler::task_mems_allowed(task);
+    let mode = policy.mode & !MPOL_MODE_FLAGS;
+    let interleave_index = if matches!(
+        mode,
+        narf_memory::MPOL_INTERLEAVE | narf_memory::MPOL_WEIGHTED_INTERLEAVE
+    ) {
+        task_interleave_index(task, true)
+    } else {
+        0
+    };
     narf_memory::mempolicy_set(narf_memory::Mempolicy {
-        mode: policy.mode & !MPOL_MODE_FLAGS,
+        mode,
         nodemask: mpol_effective_nodemask(policy, allowed),
         allowed,
         home_node: policy.home_node,
+        interleave_index,
     });
 }
 
 /// Clear the per-CPU active mempolicy after a fault is serviced.
 pub fn clear_mempolicy_for_fault() {
     narf_memory::mempolicy_clear();
-}
-
-/// The node a fresh page under `pol` would be allocated from (used by
-/// get_mempolicy's MPOL_F_NODE|MPOL_F_ADDR query). Mirrors the
-/// allocator's preference resolution without actually allocating.
-fn mempolicy_resolved_node(pol: narf_memory::Mempolicy) -> u32 {
-    let allowed = pol.allowed & ((1u64 << narf_memory::FRAME_MAX_NUMA_NODES) - 1);
-    let first_allowed = if allowed == 0 {
-        0
-    } else {
-        allowed.trailing_zeros()
-    };
-    match pol.mode {
-        x if x == narf_memory::MPOL_BIND => {
-            let preferred = pol.nodemask & allowed;
-            if preferred != 0 {
-                let anchor = if pol.home_node == u32::MAX {
-                    preferred.trailing_zeros()
-                } else {
-                    pol.home_node
-                };
-                let mut best = preferred.trailing_zeros();
-                let mut best_distance = u32::MAX;
-                for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
-                    if (preferred >> node) & 1 == 0 {
-                        continue;
-                    }
-                    // SAFETY: narf-frame provides the topology hook.
-                    let distance = unsafe { narf_node_distance(anchor, node) };
-                    if distance < best_distance || (distance == best_distance && node < best) {
-                        best = node;
-                        best_distance = distance;
-                    }
-                }
-                best
-            } else {
-                first_allowed
-            }
-        }
-        x if x == narf_memory::MPOL_PREFERRED => {
-            let preferred = pol.nodemask & allowed;
-            if preferred != 0 {
-                preferred.trailing_zeros()
-            } else {
-                first_allowed
-            }
-        }
-        x if x == narf_memory::MPOL_PREFERRED_MANY => {
-            let preferred = pol.nodemask & allowed;
-            let anchor = if pol.home_node == u32::MAX {
-                narf_memory::frame::local_node() as u32
-            } else {
-                pol.home_node
-            };
-            let mut best = first_allowed;
-            let mut best_distance = u32::MAX;
-            for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
-                if (preferred >> node) & 1 == 0 {
-                    continue;
-                }
-                // SAFETY: narf-frame provides the topology hook.
-                let distance = unsafe { narf_node_distance(anchor, node) };
-                if distance < best_distance || (distance == best_distance && node < best) {
-                    best = node;
-                    best_distance = distance;
-                }
-            }
-            best
-        }
-        x if x == narf_memory::MPOL_INTERLEAVE => {
-            let interleave = pol.nodemask & allowed;
-            if interleave != 0 {
-                interleave.trailing_zeros()
-            } else {
-                first_allowed
-            }
-        }
-        // DEFAULT / LOCAL
-        _ => {
-            let local = narf_memory::frame::local_node() as u32;
-            if (allowed >> local) & 1 != 0 {
-                local
-            } else {
-                first_allowed
-            }
-        }
-    }
 }
 
 // ── sched_setattr / sched_getattr ────────────────────────────────────
@@ -3977,6 +4067,12 @@ pub struct ShmemSyscallVtable {
     pub frames: fn(handle: u64, out: &mut alloc::vec::Vec<u64>) -> bool,
     pub destroy: fn(handle: u64) -> bool,
     pub pid_of: fn(handle: u64) -> u64,
+    /// True only for registry-owned movable RAM, never device/DMA mappings.
+    pub owns_frame: fn(phys: u64) -> bool,
+    /// Atomically replace one registry backing entry after all aliases moved.
+    pub replace_frame: fn(old_phys: u64, new_phys: u64) -> bool,
+    pub retain_frame: fn(phys: u64),
+    pub release_frame: fn(phys: u64),
 }
 
 impl core::fmt::Debug for ShmemSyscallVtable {
@@ -4002,6 +4098,18 @@ fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
     } else {
         // SAFETY: install_shmem_syscall_vtable requires a 'static input.
         Some(unsafe { &*p })
+    }
+}
+
+pub fn retain_external_shared_frame(phys: u64) {
+    if let Some(vtable) = shmem_vtable() {
+        (vtable.retain_frame)(phys);
+    }
+}
+
+pub fn release_external_shared_frame(phys: u64) {
+    if let Some(vtable) = shmem_vtable() {
+        (vtable.release_frame)(phys);
     }
 }
 
@@ -6219,6 +6327,12 @@ fn release_task_tables(tid: u64) {
         m.remove(&tid);
     }
     if let Some(m) = MBIND_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = INTERLEAVE_INDEX_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = NUMA_BALANCE_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
     narf_scheduler::clear_task_mems_allowed(tid);

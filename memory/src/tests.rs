@@ -1785,6 +1785,7 @@ fn smoke_memory_as_drop_then_materialize() -> TestResult {
     drop(throwaway);
 
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    // SAFETY: test context has paging enabled and exclusively owns the AS.
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed (allocator drained?)"),
@@ -6757,6 +6758,56 @@ fn smoke_numa_migrate_page_preserves_contents() -> TestResult {
 kernel_test_in!("memory", smoke_numa_migrate_page_preserves_contents);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_numa_hint_fault_round_trip() -> TestResult {
+    use crate::x86_64::paging;
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: test context has paging enabled and exclusively owns the AS.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(x) => x,
+        Err(_) => return TestResult::Skip("AS alloc failed"),
+    };
+    let va = VirtAddr::new(0x0000_4080_3010_0000);
+    let frame = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("frame allocation failed"),
+    };
+    let registered = a.map_region(Region {
+        base: va,
+        len: 4096,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![frame],
+    });
+    // SAFETY: a owns a fresh valid root and the registered frame.
+    let materialized = unsafe { a.materialize() };
+    if registered.is_err() || materialized.is_err() {
+        return TestResult::Fail("failed to materialize hint test page");
+    }
+    // SAFETY: this test exclusively owns the live address space.
+    if unsafe { a.protect_numa_hint_page(va) } != Ok(true) {
+        return TestResult::Fail("eligible page was not protected");
+    }
+    // SAFETY: read-only walk of the live root.
+    if unsafe { paging::translate(a.root, va) }.is_some() {
+        return TestResult::Fail("NUMA hint left the sampled PTE present");
+    }
+    if !a.take_numa_hint(va) {
+        return TestResult::Fail("sampled address was not recorded");
+    }
+    // SAFETY: the sampled backing remains owned by a's region.
+    if unsafe { a.remap_page(va) }.is_err() {
+        return TestResult::Fail("hint fault could not restore the leaf");
+    }
+    // SAFETY: read-only walk of the live root.
+    match unsafe { paging::translate(a.root, va) } {
+        Some(phys) if phys == frame => TestResult::Pass,
+        _ => TestResult::Fail("hint fault restored the wrong backing"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_numa_hint_fault_round_trip);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_mempolicy_allowed_mask_is_hard_boundary() -> TestResult {
     if !crate::is_numa_aware() || crate::node_free(1) == 0 {
         return TestResult::Skip("requires two NUMA memory nodes");
@@ -6767,6 +6818,7 @@ fn smoke_mempolicy_allowed_mask_is_hard_boundary() -> TestResult {
         nodemask: 0,
         allowed: 0b10,
         home_node: u32::MAX,
+        interleave_index: 0,
     };
     let frame = match crate::mempolicy::alloc_frame_with(policy, 0) {
         Ok(frame) => frame,
@@ -6783,3 +6835,68 @@ fn smoke_mempolicy_allowed_mask_is_hard_boundary() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_mempolicy_allowed_mask_is_hard_boundary);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_shared_frame_replacement_updates_all_aliases() -> TestResult {
+    use crate::x86_64::paging;
+    use crate::{AddressSpace, PhysFrame, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: test context has paging enabled and owns both fresh roots.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(aspace) => aspace,
+        Err(_) => return TestResult::Skip("first AS allocation failed"),
+    };
+    // SAFETY: same as above.
+    let b = match unsafe { AddressSpace::new_for_user() } {
+        Ok(aspace) => aspace,
+        Err(_) => return TestResult::Skip("second AS allocation failed"),
+    };
+    let old = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("source allocation failed"),
+    };
+    let new = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("target allocation failed"),
+    };
+    let va_a = VirtAddr::new(0x0000_4090_0000_0000);
+    let va_b = VirtAddr::new(0x0000_4091_0000_0000);
+    for (aspace, va) in [(&a, va_a), (&b, va_b)] {
+        aspace
+            .map_region(Region {
+                base: va,
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+                phys: alloc::vec![old],
+            })
+            .expect("register shared alias");
+        // SAFETY: fresh valid root and registered live frame.
+        unsafe { aspace.materialize() }.expect("materialize shared alias");
+    }
+    let replaced = crate::with_shared_mapping_transaction(|| {
+        // SAFETY: both frames and roots remain live for the transaction.
+        let left = unsafe { a.replace_shared_frame(old, new) };
+        // SAFETY: same transaction and lifetime proof.
+        let right = unsafe { b.replace_shared_frame(old, new) };
+        (left, right)
+    });
+    // SAFETY: read-only walks of live page-table roots.
+    let translated = unsafe {
+        (
+            paging::translate(a.root, va_a),
+            paging::translate(b.root, va_b),
+        )
+    };
+    drop(a);
+    drop(b);
+    crate::free_frame(PhysFrame::new(old));
+    crate::free_frame(PhysFrame::new(new));
+    match (replaced, translated) {
+        ((Ok(1), Ok(1)), (Some(left), Some(right))) if left == new && right == new => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("shared aliases did not move together"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_shared_frame_replacement_updates_all_aliases);

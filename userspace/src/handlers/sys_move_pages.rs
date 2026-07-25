@@ -1,6 +1,72 @@
 #[allow(unused_imports)]
 use super::*;
 
+fn migrate_registry_shared_page(
+    current: &Arc<AddressSpace>,
+    va: u64,
+    target: usize,
+) -> Result<(), narf_memory::AddressSpaceError> {
+    let vtable = shmem_vtable().ok_or(narf_memory::AddressSpaceError::SharedMapping)?;
+
+    narf_memory::with_shared_mapping_transaction(|| {
+        let old_phys = mapped_phys(current, va).ok_or(narf_memory::AddressSpaceError::Unmapped)?;
+        if !(vtable.owns_frame)(old_phys) {
+            // Device/DMA frames require their owner's quiesce/remap protocol.
+            return Err(narf_memory::AddressSpaceError::SharedMapping);
+        }
+        let old = narf_memory::PhysAddr::new(old_phys);
+        if numa_node_for_phys(old_phys) as usize == target {
+            return Ok(());
+        }
+        let new_frame = narf_memory::alloc_frame_on_strict(target)
+            .map_err(|_| narf_memory::AddressSpaceError::OutOfRange)?;
+        let new = new_frame.start_address();
+        // SAFETY: owner validation and copy are serialized with replacement;
+        // new is a distinct owned frame.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                old.kernel_ptr::<u8>(),
+                new.kernel_mut_ptr::<u8>(),
+                narf_memory::PAGE_SIZE as usize,
+            );
+        }
+        let mut spaces = all_address_spaces();
+        if !spaces
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, current))
+        {
+            spaces.push(current.clone());
+        }
+        let mut changed: alloc::vec::Vec<Arc<AddressSpace>> = alloc::vec::Vec::new();
+        for address_space in spaces {
+            // SAFETY: the transaction lock excludes new shared aliases and
+            // both frames remain live until owner commit.
+            match unsafe { address_space.replace_shared_frame(old, new) } {
+                Ok(0) => {}
+                Ok(_) => changed.push(address_space),
+                Err(error) => {
+                    for prior in changed.iter().rev() {
+                        // SAFETY: exact inverse while both frames remain live.
+                        let _ = unsafe { prior.replace_shared_frame(new, old) };
+                    }
+                    narf_memory::free_frame(new_frame);
+                    return Err(error);
+                }
+            }
+        }
+        if !(vtable.replace_frame)(old_phys, new.raw()) {
+            for prior in changed.iter().rev() {
+                // SAFETY: registry rejected commit; restore every alias.
+                let _ = unsafe { prior.replace_shared_frame(new, old) };
+            }
+            narf_memory::free_frame(new_frame);
+            return Err(narf_memory::AddressSpaceError::SharedMapping);
+        }
+        narf_memory::free_frame(narf_memory::PhysFrame::new(old));
+        Ok(())
+    })
+}
+
 /// `move_pages(pid, count, pages, nodes, status, flags)` — query or move
 /// pages across NUMA nodes. A null `nodes` array is the Linux query form:
 /// each status entry reports the SRAT node backing that virtual page.
@@ -78,8 +144,13 @@ pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
                         -2 // ENOENT
                     }
                     Err(narf_memory::AddressSpaceError::SharedMapping) => {
-                        not_moved += 1;
-                        -13 // EACCES
+                        match migrate_registry_shared_page(&as_ref, va, target as usize) {
+                            Ok(()) => target,
+                            Err(_) => {
+                                not_moved += 1;
+                                -13 // EACCES for device/non-registry shared pages.
+                            }
+                        }
                     }
                     Err(narf_memory::AddressSpaceError::InvalidNode) => {
                         not_moved += 1;
