@@ -736,24 +736,43 @@ impl FileOps for FuseFile {
 
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
+            if buf.is_empty() {
+                return Ok(0);
+            }
             let fh = self.ensure_open().await?;
-            let header = FuseWriteIn {
-                fh,
-                offset,
-                size: buf.len() as u32,
-                write_flags: 0,
-                lock_owner: 0,
-                flags: 0,
-                padding: 0,
-            };
-            let mut body = pod_as_bytes(&header);
-            body.extend_from_slice(buf);
-            let reply = self
-                .conn
-                .request(FuseOpcode::Write, self.attr.nodeid, body)
-                .await?;
-            let out: FuseWriteOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
-            Ok(out.size as usize)
+            let max_write = self.conn.max_write() as usize;
+            let mut written = 0usize;
+            while written < buf.len() {
+                let chunk_len = core::cmp::min(buf.len() - written, max_write);
+                let chunk_offset = offset
+                    .checked_add(written as u64)
+                    .ok_or(FsError::InvalidData)?;
+                let header = FuseWriteIn {
+                    fh,
+                    offset: chunk_offset,
+                    size: chunk_len as u32,
+                    write_flags: 0,
+                    lock_owner: 0,
+                    flags: 0,
+                    padding: 0,
+                };
+                let mut body = pod_as_bytes(&header);
+                body.extend_from_slice(&buf[written..written + chunk_len]);
+                let reply = self
+                    .conn
+                    .request(FuseOpcode::Write, self.attr.nodeid, body)
+                    .await?;
+                let out: FuseWriteOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+                let chunk_written = out.size as usize;
+                if chunk_written > chunk_len {
+                    return Err(FsError::InvalidData);
+                }
+                written += chunk_written;
+                if chunk_written < chunk_len {
+                    break;
+                }
+            }
+            Ok(written)
         })
     }
 

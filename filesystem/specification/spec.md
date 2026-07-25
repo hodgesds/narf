@@ -210,6 +210,10 @@ short legacy replies by zero-extending them, intersects daemon flags with
 that set, and records the negotiated minor version and write limit on the
 connection. Major versions other than 7 and protocol minors before 7.5
 are rejected.
+FUSE writes are split into requests no larger than the negotiated
+`max_write`; each request advances the file offset, an oversized daemon
+reply is rejected as invalid data, and a short reply ends the write with
+the accumulated byte count.
 
 Every request header is stamped with the calling task's translated
 filesystem uid/gid and visible process id through a boot-installed

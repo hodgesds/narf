@@ -3118,6 +3118,9 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
         // FUSE_WRITE (16): report the requested payload size.
         16 => {
             let win: FuseWriteIn = pod_from_bytes(body)?;
+            if win.size > 128 * 1024 {
+                return Some(fuse_reply(unique, -22, &[]));
+            }
             let out = FuseWriteOut {
                 size: win.size,
                 padding: 0,
@@ -3474,7 +3477,9 @@ fn smoke_fs_fuse_mutations() -> TestResult {
                 return;
             }
         };
+        let large_write = alloc::vec![0x5a; 128 * 1024 + 17];
         if file.write(0, b"payload").await != Ok(7)
+            || file.write(7, &large_write).await != Ok(large_write.len())
             || file.truncate(3).await.is_err()
             || file.set_perms(0o600).await.is_err()
             || file.set_owners(1000, 1000).await.is_err()
