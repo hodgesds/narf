@@ -118,6 +118,8 @@ pub struct FuseConnection {
     max_pages: AtomicU16,
     max_background: AtomicU32,
     congestion_threshold: AtomicU32,
+    no_open: AtomicBool,
+    no_opendir: AtomicBool,
     syncfs_supported: AtomicBool,
     next_backing_id: AtomicU32,
     backing_files: IrqSafeSpinLock<BTreeMap<i32, Arc<dyn FileOps>>>,
@@ -164,6 +166,8 @@ impl FuseConnection {
             max_pages: AtomicU16::new(32),
             max_background: AtomicU32::new(FUSE_DEFAULT_MAX_BACKGROUND),
             congestion_threshold: AtomicU32::new(FUSE_DEFAULT_CONGESTION_THRESHOLD),
+            no_open: AtomicBool::new(false),
+            no_opendir: AtomicBool::new(false),
             syncfs_supported: AtomicBool::new(true),
             next_backing_id: AtomicU32::new(1),
             backing_files: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -1026,15 +1030,28 @@ impl FuseFile {
         if let Some(fh) = *self.fh.lock() {
             return Ok(fh);
         }
+        if self.conn.no_open.load(Ordering::Acquire) {
+            *self.fh.lock() = Some(0);
+            return Ok(0);
+        }
         // FUSE_OPEN: O_RDONLY (0). The daemon returns a file handle.
         let body = pod_as_bytes(&FuseOpenIn {
             flags: 0,
             open_flags: 0,
         });
-        let reply = self
+        let reply = match self
             .conn
             .request(FuseOpcode::Open, self.attr.nodeid, body)
-            .await?;
+            .await
+        {
+            Ok(reply) => reply,
+            Err(FsError::Unsupported) => {
+                self.conn.no_open.store(true, Ordering::Release);
+                *self.fh.lock() = Some(0);
+                return Ok(0);
+            }
+            Err(error) => return Err(error),
+        };
         let out: FuseOpenOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
         if let Some(backing) = self.conn.backing_for_open(&out)? {
             *self.passthrough.lock() = Some(backing);
@@ -1708,15 +1725,17 @@ impl Drop for FuseFile {
         if !self.conn.is_connected() {
             return;
         }
-        if let Some(fh) = *self.fh.lock() {
-            let body = pod_as_bytes(&FuseReleaseIn {
-                fh,
-                flags: 0,
-                release_flags: 0,
-                lock_owner: 0,
-            });
-            self.conn
-                .submit_noreply(FuseOpcode::Release, self.attr.nodeid, &body);
+        if !self.conn.no_open.load(Ordering::Acquire) {
+            if let Some(fh) = *self.fh.lock() {
+                let body = pod_as_bytes(&FuseReleaseIn {
+                    fh,
+                    flags: 0,
+                    release_flags: 0,
+                    lock_owner: 0,
+                });
+                self.conn
+                    .submit_noreply(FuseOpcode::Release, self.attr.nodeid, &body);
+            }
         }
         // Never forget the root (nodeid 1) — Linux keeps it pinned.
         if self.attr.nodeid != FUSE_ROOT_ID {
@@ -1742,6 +1761,48 @@ impl core::fmt::Debug for FuseDir {
 }
 
 impl FuseDir {
+    async fn open_handle(&self) -> Result<Option<u64>, FsError> {
+        if self.conn.no_opendir.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match self
+            .conn
+            .request(
+                FuseOpcode::OpenDir,
+                self.nodeid,
+                pod_as_bytes(&FuseOpenIn::default()),
+            )
+            .await
+        {
+            Ok(reply) => {
+                let open: FuseOpenOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+                Ok(Some(open.fh))
+            }
+            Err(FsError::Unsupported) => {
+                self.conn.no_opendir.store(true, Ordering::Release);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn release_handle(&self, fh: Option<u64>) -> Result<(), FsError> {
+        let Some(fh) = fh else {
+            return Ok(());
+        };
+        self.conn
+            .request(
+                FuseOpcode::ReleaseDir,
+                self.nodeid,
+                pod_as_bytes(&FuseReleaseIn {
+                    fh,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map(|_| ())
+    }
+
     fn file_from_entry(
         &self,
         out: FuseEntryOut,
@@ -1866,40 +1927,21 @@ impl DirOps for FuseDir {
 
     fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            let open_reply = self
-                .conn
-                .request(
-                    FuseOpcode::OpenDir,
-                    self.nodeid,
-                    pod_as_bytes(&FuseOpenIn::default()),
-                )
-                .await?;
-            let open: FuseOpenOut = pod_from_bytes(&open_reply).ok_or(FsError::InvalidData)?;
+            let handle = self.open_handle().await?;
             let sync_result = self
                 .conn
                 .request(
                     FuseOpcode::FsyncDir,
                     self.nodeid,
                     pod_as_bytes(&FuseFsyncIn {
-                        fh: open.fh,
+                        fh: handle.unwrap_or(0),
                         fsync_flags: if data_only { FUSE_FSYNC_FDATASYNC } else { 0 },
                         padding: 0,
                     }),
                 )
                 .await
                 .map(|_| ());
-            let release_result = self
-                .conn
-                .request(
-                    FuseOpcode::ReleaseDir,
-                    self.nodeid,
-                    pod_as_bytes(&FuseReleaseIn {
-                        fh: open.fh,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map(|_| ());
+            let release_result = self.release_handle(handle).await;
             sync_result.and(release_result)
         })
     }
@@ -1922,16 +1964,8 @@ impl DirOps for FuseDir {
         Box::pin(async move {
             // FUSE_READDIR needs a directory `fh` from FUSE_OPENDIR. We
             // (re)open per enumerate — cheap and stateless for the client.
-            let openbody = pod_as_bytes(&FuseOpenIn {
-                flags: 0,
-                open_flags: 0,
-            });
-            let oreply = self
-                .conn
-                .request(FuseOpcode::OpenDir, self.nodeid, openbody)
-                .await?;
-            let oout: FuseOpenOut = pod_from_bytes(&oreply).ok_or(FsError::InvalidData)?;
-            let fh = oout.fh;
+            let handle = self.open_handle().await?;
+            let fh = handle.unwrap_or(0);
 
             let plus = self.conn.negotiated_flags() & FuseInitFlag::DoReaddirplus as u64 != 0;
             let readbody = pod_as_bytes(&FuseReadIn {
@@ -2003,16 +2037,7 @@ impl DirOps for FuseDir {
             }
 
             // Release the directory handle.
-            let rel = pod_as_bytes(&FuseReleaseIn {
-                fh,
-                flags: 0,
-                release_flags: 0,
-                lock_owner: 0,
-            });
-            let _ = self
-                .conn
-                .request(FuseOpcode::ReleaseDir, self.nodeid, rel)
-                .await;
+            let _ = self.release_handle(handle).await;
 
             Ok(out.into_iter().skip(cursor).take(max).collect())
         })

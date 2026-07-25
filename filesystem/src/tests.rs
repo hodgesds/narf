@@ -3050,6 +3050,11 @@ fn fuse_reply(unique: u64, error: i32, body: &[u8]) -> alloc::vec::Vec<u8> {
 static FUSE_FSYNCDIR_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 static FUSE_FSYNCDIR_FLAGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static FUSE_SYNCFS_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static FUSE_OPEN_ENOSYS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static FUSE_OPEN_ENOSYS_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static FUSE_OPENDIR_ENOSYS_COUNT: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
 
 fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     use crate::fuse::*;
@@ -3136,6 +3141,14 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
         }
         // FUSE_OPEN (14) / FUSE_OPENDIR (27): hand back a fixed handle.
         14 | 27 => {
+            if FUSE_OPEN_ENOSYS.load(core::sync::atomic::Ordering::Relaxed) {
+                if opcode == 14 {
+                    FUSE_OPEN_ENOSYS_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                } else {
+                    FUSE_OPENDIR_ENOSYS_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                return Some(fuse_reply(unique, -38, &[]));
+            }
             let out = FuseOpenOut {
                 fh: 0x42,
                 open_flags: 0,
@@ -3575,6 +3588,81 @@ fn smoke_fs_fuse_end_to_end() -> TestResult {
     }
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_end_to_end);
+
+fn smoke_fs_fuse_caches_no_open_support() -> TestResult {
+    use crate::fuse::{FuseInitFlag, FUSE_SUPPORTED_INIT_FLAGS};
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use crate::FsInstance;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+    FUSE_OPEN_ENOSYS.store(true, Ordering::Relaxed);
+    FUSE_OPEN_ENOSYS_COUNT.store(0, Ordering::Relaxed);
+    FUSE_OPENDIR_ENOSYS_COUNT.store(0, Ordering::Relaxed);
+
+    if FUSE_SUPPORTED_INIT_FLAGS & FuseInitFlag::NoOpenSupport as u64 == 0
+        || FUSE_SUPPORTED_INIT_FLAGS & FuseInitFlag::NoOpenDirSupport as u64 == 0
+    {
+        FUSE_OPEN_ENOSYS.store(false, Ordering::Relaxed);
+        return TestResult::Fail("FUSE_INIT did not advertise no-open support");
+    }
+
+    let conn = Arc::new(FuseConnection::new());
+    let fs = Arc::new(FuseFs::new("fuse-no-open", Arc::clone(&conn)));
+    narf_scheduler::__reset_queues_for_test();
+    spawn_fuse_daemon(Arc::clone(&conn), &OUTCOME);
+
+    let client = Arc::clone(&fs);
+    narf_scheduler::spawn(async move {
+        if client.init().await.is_err() {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        let root = client.root();
+        for _ in 0..2 {
+            let Ok(file) = root.lookup_async("hello").await else {
+                OUTCOME.store(3, Ordering::Relaxed);
+                return;
+            };
+            let mut buf = [0u8; 5];
+            if !matches!(file.read(0, &mut buf).await, Ok(5)) || &buf != b"world" {
+                OUTCOME.store(4, Ordering::Relaxed);
+                return;
+            }
+        }
+        for _ in 0..2 {
+            let Ok(entries) = root.enumerate_async(0, 8).await else {
+                OUTCOME.store(5, Ordering::Relaxed);
+                return;
+            };
+            if entries.len() != 1 || entries[0].0 != "hello" {
+                OUTCOME.store(6, Ordering::Relaxed);
+                return;
+            }
+        }
+        OUTCOME.store(1, Ordering::Relaxed);
+    });
+    narf_scheduler::run_until_empty();
+    FUSE_OPEN_ENOSYS.store(false, Ordering::Relaxed);
+
+    match (
+        OUTCOME.load(Ordering::Relaxed),
+        FUSE_OPEN_ENOSYS_COUNT.load(Ordering::Relaxed),
+        FUSE_OPENDIR_ENOSYS_COUNT.load(Ordering::Relaxed),
+    ) {
+        (1, 1, 1) => TestResult::Pass,
+        (1, _, _) => TestResult::Fail("FUSE did not cache ENOSYS for OPEN/OPENDIR"),
+        (2, _, _) => TestResult::Fail("FUSE_INIT failed in no-open test"),
+        (3, _, _) => TestResult::Fail("FUSE_LOOKUP failed in no-open test"),
+        (4, _, _) => TestResult::Fail("implicit fh=0 file read failed"),
+        (5, _, _) => TestResult::Fail("implicit fh=0 readdir failed"),
+        (6, _, _) => TestResult::Fail("no-open readdir returned wrong entries"),
+        _ => TestResult::Fail("no-open client task did not finish"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_caches_no_open_support);
 
 /// Readdir + getattr through the FUSE bridge.
 fn smoke_fs_fuse_readdir_getattr() -> TestResult {

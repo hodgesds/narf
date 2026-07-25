@@ -203,6 +203,12 @@ parked callers with `ENOTCONN`. Writable `max_background` and
 FUSE_INIT 7.13 or newer. The directory is removed when the connection object
 is finally reclaimed.
 
+NARF advertises Linux's `FUSE_NO_OPEN_SUPPORT` and
+`FUSE_NO_OPENDIR_SUPPORT` negotiation bits. An `ENOSYS` response to the first
+`OPEN` or `OPENDIR` is cached for the connection; subsequent file and
+directory operations use the implicit handle zero and omit the matching
+`RELEASE` or `RELEASEDIR` request.
+
 - An empty blocking read parks in the syscall layer; a non-blocking
   read reports `EAGAIN`.
 - A daemon buffer smaller than the next complete request reports

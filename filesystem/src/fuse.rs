@@ -150,8 +150,10 @@ pub enum FuseInitFlag {
     ReaddirplusAuto = 1 << 14,
     AsyncDio = 1 << 15,
     WritebackCache = 1 << 16,
+    NoOpenSupport = 1 << 17,
     ParallelDirops = 1 << 18,
     MaxPages = 1 << 22,
+    NoOpenDirSupport = 1 << 24,
     SetxattrExt = 1 << 29,
     InitExt = 1 << 30,
 }
@@ -166,8 +168,10 @@ pub const FUSE_SUPPORTED_INIT_FLAGS: u64 = FuseInitFlag::AsyncRead as u64
     | FuseInitFlag::DoReaddirplus as u64
     | FuseInitFlag::ReaddirplusAuto as u64
     | FuseInitFlag::AsyncDio as u64
+    | FuseInitFlag::NoOpenSupport as u64
     | FuseInitFlag::ParallelDirops as u64
     | FuseInitFlag::MaxPages as u64
+    | FuseInitFlag::NoOpenDirSupport as u64
     | FuseInitFlag::SetxattrExt as u64
     | FuseInitFlag::InitExt as u64
     | FUSE_PASSTHROUGH
