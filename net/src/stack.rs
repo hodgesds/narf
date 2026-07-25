@@ -18,9 +18,9 @@
 //!   authority to set link state / MTU / MAC on the attached
 //!   interface.
 //!
-//! Real attach handling happens in a future `abi/` opcode +
-//! dispatch wiring; this module lets every consumer agree on the
-//! wire shape.
+//! The public attach path resolves the presented interface cap against the
+//! driver registry before binding the daemon. A future userspace ABI opcode
+//! still needs per-task cap-table resolution before it can expose this path.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -255,6 +255,8 @@ pub enum AdminError {
 pub enum AttachError {
     DaemonCapRevoked,
     IfaceCapRevoked,
+    /// The interface cap is live but was not minted for a registered entry.
+    IfaceMismatch,
     InterfaceBusy,
 }
 
@@ -275,4 +277,18 @@ pub fn attach(
     socket: Arc<XdpSocket>,
 ) -> Result<StackAttachReply, AttachError> {
     crate::bypass::daemon_attach::attach(req, iface_object, socket)
+}
+
+/// Attach using the canonical driver registry. The presented interface cap
+/// must be the exact handle retained beside the selected interface object.
+pub fn attach_registered(
+    req: &StackAttach,
+    socket: Arc<XdpSocket>,
+) -> Result<StackAttachReply, AttachError> {
+    req.iface
+        .check_live()
+        .map_err(|_| AttachError::IfaceCapRevoked)?;
+    crate::registry()
+        .with_interface_for_handle(&req.iface, |iface| attach(req, iface, socket))
+        .ok_or(AttachError::IfaceMismatch)?
 }

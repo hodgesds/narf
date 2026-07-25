@@ -430,6 +430,18 @@ impl Registry {
             .map(|e| f(&e.handle))
     }
 
+    /// Run `f` against the exact interface named by a presented registry
+    /// handle. A live handle minted for another entry does not match.
+    pub fn with_interface_for_handle<R, F>(&self, handle: &Cap<NetIface, Write>, f: F) -> Option<R>
+    where
+        F: FnOnce(&dyn Interface) -> R,
+    {
+        let q = self.inner.lock();
+        q.iter()
+            .find(|entry| entry.handle.slot() == handle.slot())
+            .map(|entry| f(&*entry.iface))
+    }
+
     /// Snapshot every driver-backed interface without exposing its frame rings.
     pub fn snapshots(&self) -> Vec<InterfaceSnapshot> {
         self.inner

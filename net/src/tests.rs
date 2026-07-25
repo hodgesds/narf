@@ -5615,31 +5615,33 @@ fn smoke_bypass_daemon_attach_succeeds() -> TestResult {
     use crate::{NetIface, StackAttach, StackDaemon};
     use narf_capabilities::{Cap, Invoke, Write};
 
-    let iface_cap: Cap<NetIface, Write> = Cap::bootstrap();
+    let iface_cap = crate::registry()
+        .with_handle("lo.bypass-attach", |handle| *handle)
+        .expect("registered interface handle");
     let daemon_cap: Cap<StackDaemon, Invoke> = Cap::bootstrap();
     let req = StackAttach {
         iface: iface_cap,
         daemon: daemon_cap,
     };
-    use crate::{Frame, RX_RING_N, TX_RING_N};
-    use alloc::string::ToString;
-    let (tx_prod, _tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
-    let (_rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
-    let stub = crate::virtio_net::VirtioNet::new(
-        "lo.bypass-attach".to_string(),
-        [0; 6],
-        1500,
-        true,
-        tx_prod,
-        rx_cons,
-    );
     let umem = match crate::bypass::Umem::register(8192, 2048) {
         Ok(u) => u,
         Err(_) => return TestResult::Skip("Umem::register NoMemory (no DMA in test env)"),
     };
     let parts = crate::bypass::XdpSocket::create(umem);
     let socket = parts.socket.clone();
-    match crate::stack::attach(&req, &stub, socket) {
+
+    let forged_req = StackAttach {
+        iface: Cap::<NetIface, Write>::bootstrap(),
+        daemon: daemon_cap,
+    };
+    if !matches!(
+        crate::stack::attach_registered(&forged_req, socket.clone()),
+        Err(crate::AttachError::IfaceMismatch)
+    ) {
+        return TestResult::Fail("unregistered interface handle was accepted");
+    }
+
+    match crate::stack::attach_registered(&req, socket) {
         Ok(reply) => {
             if !reply.admin.is_live() {
                 return TestResult::Fail("admin cap should be live");

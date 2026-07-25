@@ -110,6 +110,10 @@ RX. Used by `verification/` to test the contract without hardware.
   at boot by a maintainer's policy).
 - On attach, the daemon binds one or more interfaces and claims its
   rings.
+- The presented `Cap<NetIface, Write>` must exactly match the handle retained
+  beside that interface in the canonical driver registry. A live cap minted
+  for another or unregistered object is rejected before classifier state
+  changes.
 - Rings from hardware go **directly** into the daemon's Narf-Rings
   — the kernel does not interpose.
 - Multiple stacks can coexist (one per interface, or one per
