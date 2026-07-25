@@ -472,6 +472,22 @@ fn arm_idle_backstop_ms(ms: u64) {
 /// IPI is sent but doesn't wake it (delivery/handler issue).
 static RESCHED_SENT: AtomicU64 = AtomicU64::new(0);
 static RESCHED_SKIP: AtomicU64 = AtomicU64::new(0);
+static FORWARD_PROGRESS: AtomicU64 = AtomicU64::new(0);
+
+/// Publish a completed unit of kernel work to fatal-path watchdogs.
+///
+/// Long operations can legitimately remain inside one syscall for seconds
+/// (for example, faulting a desktop's DSOs from a block device). Callers mark
+/// bounded completions so watchdogs distinguish that work from a true stall.
+#[inline]
+pub fn note_forward_progress() {
+    FORWARD_PROGRESS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Monotonic completed-work counter used by fatal-path watchdogs.
+pub fn forward_progress_count() -> u64 {
+    FORWARD_PROGRESS.load(Ordering::Relaxed)
+}
 
 /// `(resched_ipis_sent, cross_core_wakes_skipped_not_halted)`.
 pub fn dbg_resched_counts() -> (u64, u64) {
@@ -1887,6 +1903,18 @@ fn idle_wait_inner(next_deadline: Option<u64>) {
     narf_time::busy_wait_cycles(slice);
 }
 
+/// Mark a between-polls CPU inactive before the scheduler's internal
+/// parked-queue halt.
+///
+/// `run_until_empty` may retain sleeping slots in its local queue and wait
+/// here indefinitely, so it does not necessarily return to `run_forever`'s
+/// outer `report_idle` call. Leaving the last active QSBR timestamp published
+/// while halted makes the RCU watchdog diagnose an idle CPU as stalled.
+#[inline]
+fn report_parked_queue_idle() {
+    narf_rcu::report_idle();
+}
+
 pub fn run_until_empty() {
     let cpu = narf_lib::percpu::current_cpu();
     let cpu = if cpu < narf_lib::percpu::MAX_CPUS {
@@ -2476,6 +2504,12 @@ pub fn run_until_empty() {
                 }
             }
             let next_deadline = narf_time::timer_wheel::next_deadline_cycles();
+            // We are between task polls and hold no RCU read guard. This halt
+            // can be indefinite when the queue contains only parked slots, so
+            // remove this CPU from the active QSBR census before publishing
+            // CPU_HALTED. The next completed poll re-adopts the live epoch via
+            // report_quiescent().
+            report_parked_queue_idle();
             // Publish "this CPU is about to halt" so a concurrent cross-core
             // waker sends us a reschedule IPI instead of leaving the awake
             // bit to wake us at the next timer tick. Dekker ordering: store
@@ -3047,6 +3081,7 @@ pub mod sleep_pumps {
 pub fn responsive_spin<F: FnMut() -> bool>(mut done: F, max_iters: u32) -> bool {
     for i in 0..max_iters {
         if done() {
+            note_forward_progress();
             return true;
         }
         if i & 0xFFF == 0 {
@@ -3075,6 +3110,7 @@ pub fn responsive_spin_until<F: FnMut() -> bool>(
     let mut i: u32 = 0;
     loop {
         if done() {
+            note_forward_progress();
             return true;
         }
         if deadline.expired() {

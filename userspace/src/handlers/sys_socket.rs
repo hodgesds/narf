@@ -31,6 +31,7 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
     // Stamp the creator's credentials so SO_PEERCRED / SCM_CREDENTIALS on
     // the peer end report this process's real (pid, uid, gid).
     sock.set_local_cred(current_ucred());
+    sock.set_local_groups(current_groups());
     // Net-namespace scoping: stamp the creator's net-ns id so the
     // AF_INET bind/port tables are keyed per-ns (two processes in
     // different net-ns can both bind the same addr:port). 0 = host ns.

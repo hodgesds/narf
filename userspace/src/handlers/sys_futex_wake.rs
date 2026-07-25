@@ -18,7 +18,8 @@ pub(crate) fn sys_futex_wake(ctx: &mut dyn TrapContext) {
     }
     // Bump the gen counter AND fire up to `nr` parked waiters on the real
     // queue (futex2 and classic futex share the same words / queue).
-    futex_bump_counter(uaddr);
-    let _ = futex_wake_waiters(uaddr, nr as u32);
+    let key = futex_key(futex_namespace((args.arg3 & FUTEX_PRIVATE) != 0), uaddr);
+    futex_bump_counter_key(key);
+    let _ = futex_wake_waiters_key(key, nr as u32);
     ctx.set_return(SyscallReturn::ok(nr))
 }

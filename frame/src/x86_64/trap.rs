@@ -90,6 +90,7 @@ mod stall_wd {
     // Stall detector state (checked on whichever CPU happens to tick).
     static LAST_CHECK_CYCLES: AtomicU64 = AtomicU64::new(0);
     static LAST_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+    static LAST_PROGRESS: AtomicU64 = AtomicU64::new(0);
     static HIGH_WATER: AtomicU64 = AtomicU64::new(0);
     static FLAT_WINDOWS: AtomicU64 = AtomicU64::new(0);
     static DUMPED: AtomicBool = AtomicBool::new(false);
@@ -134,6 +135,19 @@ mod stall_wd {
         }
         let sc = narf_lib::perf::snapshot().syscalls;
         let prev = LAST_SYSCALLS.swap(sc, Ordering::Relaxed);
+        let progress = narf_scheduler::forward_progress_count();
+        let previous_progress = LAST_PROGRESS.swap(progress, Ordering::Relaxed);
+        // A flat progress counter while every task is parked is legitimate
+        // system idle, not a scheduler stall. In particular, this tick may
+        // itself fire timer-wheel work while the interrupted CPU still has
+        // CPU_HALTED published; counting the preceding idle windows and then
+        // panicking here prevents the executor from polling that fresh work.
+        //
+        // Require runnable work to remain stranded across the full sequence
+        // of flat windows. This still catches a real lost wake
+        // (halted + awake remains true), but gives a task made runnable by
+        // this interrupt a chance to run after the trap returns.
+        let runnable = narf_scheduler::runnable_task_count();
         // `HIGH_WATER` reused as a monotonic WINDOW COUNTER here.
         let wc = HIGH_WATER.fetch_add(1, Ordering::Relaxed) + 1;
         let delta = sc.wrapping_sub(prev);
@@ -158,7 +172,7 @@ mod stall_wd {
         // wedge whose exact rate varies (2k-30k). A healthy run completes
         // (and qemu exits) well before the window count matters, so this
         // only ever fires on a genuine wedge.
-        if wc > 20 && delta < 50_000 {
+        if wc > 20 && delta < 50_000 && progress == previous_progress && runnable > 0 {
             let flats = FLAT_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
             if flats >= 3 && !DUMPED.swap(true, Ordering::Relaxed) {
                 dump(sc);
@@ -181,7 +195,8 @@ mod stall_wd {
         let (ipi_sent, ipi_skip) = narf_scheduler::dbg_resched_counts();
         let _ = writeln!(
             TrapWriter,
-            "STALL-WD: scheduler stalled (syscalls flat at {sc}); reporter_cpu={reporter}; resched_ipi_sent={ipi_sent} resched_skip_not_halted={ipi_skip}; per-CPU state:"
+            "STALL-WD: scheduler stalled (syscalls={sc}, progress={}); reporter_cpu={reporter}; resched_ipi_sent={ipi_sent} resched_skip_not_halted={ipi_skip}; per-CPU state:",
+            narf_scheduler::forward_progress_count()
         );
         for cpu in 0..MAXC {
             if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
@@ -192,6 +207,7 @@ mod stall_wd {
             let cpl = LAST_CPL[cpu].load(Ordering::Relaxed);
             let task = LAST_TASK[cpu].load(Ordering::Relaxed);
             let stage = LAST_STAGE[cpu].load(Ordering::Relaxed);
+            let contended_lock = narf_lib::sync::contended_irq_lock(cpu);
             let verdict = if cpu == reporter {
                 "REPORTING"
             } else if locked {
@@ -207,7 +223,7 @@ mod stall_wd {
             };
             let _ = writeln!(
                 TrapWriter,
-                "STALL-WD cpu={cpu} depth={depth} awake={awake} halted={halted} locked={locked} task={task} stage={stage} cpl={cpl} rip={rip:#x} -> {verdict}"
+                "STALL-WD cpu={cpu} ready_depth={depth} awake={awake} halted={halted} queue_locked={locked} task={task} stage={stage} cpl={cpl} rip={rip:#x} contended_irq_lock={contended_lock:#x} -> {verdict}"
             );
         }
         // Wheel + per-task park states: shows a task parked with an expired
@@ -223,11 +239,26 @@ mod stall_wd {
             narf_scheduler::narf_time::timer_wheel::occupied(),
             nd
         );
-        for (tid, pid, st, dl, fu, parked) in narf_userspace::task::dbg_park_snapshot() {
-            let sig = narf_userspace::handlers::signal_pending_bits(tid);
+        if let Some((sector, head, avail, last_used, device_used, free, status)) =
+            narf_drivers_virtio::blk_pci::stalled_queue_snapshot()
+        {
             let _ = writeln!(
                 TrapWriter,
-                "STALL-WD task tid={tid} pid={pid} st={st} dl={dl} dl_expired={} futex={fu:#x} parked={parked} sigpend={sig:#x}",
+                "STALL-WD virtio-blk: sector={sector} head={head} avail={avail} last_used={last_used} device_used={device_used} free={free} status={status:#x}"
+            );
+        }
+        for (tid, pid, st, dl, fu, fns, fgen, fval, netio, waitchild, flock, parked) in
+            narf_userspace::task::dbg_park_snapshot()
+        {
+            let sig = narf_userspace::handlers::signal_pending_bits(tid);
+            let (live_gen, futex_waiters) = if fu != 0 {
+                narf_userspace::handlers::dbg_futex_state(fns, fu)
+            } else {
+                (0, 0)
+            };
+            let _ = writeln!(
+                TrapWriter,
+                "STALL-WD task tid={tid} pid={pid} st={st} dl={dl} dl_expired={} futex={fu:#x} futex_ns={fns:#x} futex_gen={fgen}/{live_gen} futex_waiters={futex_waiters} futex_val={fval:#x} netio={netio} waitchild={waitchild} flock={flock:#x} parked={parked} sigpend={sig:#x}",
                 dl != 0 && dl != u64::MAX && now_ns > dl
             );
         }

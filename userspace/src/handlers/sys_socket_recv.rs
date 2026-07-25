@@ -51,9 +51,17 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
     };
     match result {
         crate::socket::SocketOpResult::Received { n, peer } => {
+            // recv()/recvfrom() cannot return ancillary data. Consume and
+            // drop any rights/credentials attached to this record so a later
+            // recvmsg cannot steal them from the wrong message.
+            drop(sock.unix_take_recv_fds());
+            let _ = sock.recvmsg_cred();
             // Copy received bytes back to user under SMAP bracket.
             // SAFETY: ptr validated above; AS still active.
-            if unsafe { copy_to_user(buf_ptr, &buf[..n]) }.is_err() {
+            // Linux permits recv(fd, NULL, 0, MSG_PEEK|MSG_TRUNC) as a
+            // datagram-length probe. Do not validate/copy a zero-byte range:
+            // a null pointer is valid when no payload bytes are requested.
+            if n > 0 && unsafe { copy_to_user(buf_ptr, &buf[..n]) }.is_err() {
                 ctx.set_return(fail);
                 return;
             }

@@ -71,6 +71,10 @@ impl<T> IrqSafeSpinLock<T> {
     pub fn lock(&self) -> SpinLockGuard<'_, T, IrqsDisabled>;
 }
 
+/// Fatal-path diagnostic: the IrqSafeSpinLock address on which a CPU is
+/// spinning, or zero when no throttled contention is active.
+pub fn contended_irq_lock(cpu: usize) -> usize;
+
 pub struct Mutex<T>(…);                    // async; await-safe, uses scheduler waker
 pub struct RwLock<T>(…);                   // async; prefer RCU where applicable
 pub struct SeqLock<T: Copy>(…);            // T: Copy is load-bearing — see §4

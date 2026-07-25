@@ -7801,6 +7801,65 @@ fn smoke_userspace_futex_park_word_revalidation() -> TestResult {
     }
     TestResult::Pass
 }
+
+fn smoke_userspace_private_futex_namespaces_isolate_same_uaddr() -> TestResult {
+    use crate::handlers::{__test_futex_register_waiter_scoped, __test_futex_wake_scoped};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn scoped_counting_waker(counter: Arc<AtomicU32>) -> Waker {
+        unsafe fn clone_raw(d: *const ()) -> RawWaker {
+            // SAFETY: `d` was produced by `Arc::into_raw` below; this
+            // temporary reconstruction is balanced by converting it back.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            let cloned = arc.clone();
+            let _ = Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTAB)
+        }
+        unsafe fn wake_raw(d: *const ()) {
+            // SAFETY: `d` owns one strong reference transferred by the
+            // RawWaker contract, which this consuming wake releases.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe fn wake_ref_raw(d: *const ()) {
+            // SAFETY: the RawWaker retains a live strong reference for the
+            // duration of this non-consuming wake.
+            unsafe { (*(d as *const AtomicU32)).fetch_add(1, Ordering::AcqRel) };
+        }
+        unsafe fn drop_raw(d: *const ()) {
+            // SAFETY: `d` owns the strong reference transferred into the
+            // RawWaker and drop is called exactly once for that reference.
+            unsafe { drop(Arc::<AtomicU32>::from_raw(d as *const AtomicU32)) };
+        }
+        static VTAB: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_ref_raw, drop_raw);
+        // SAFETY: the vtable consistently treats `d` as an Arc<AtomicU32>
+        // raw pointer and follows RawWaker ownership rules.
+        unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(counter) as *const (), &VTAB)) }
+    }
+
+    const UADDR: u64 = 0x7fff_ffff_f450;
+    let a = Arc::new(AtomicU32::new(0));
+    let b = Arc::new(AtomicU32::new(0));
+    __test_futex_register_waiter_scoped(0xA, UADDR, 41, scoped_counting_waker(a.clone()));
+    __test_futex_register_waiter_scoped(0xB, UADDR, 42, scoped_counting_waker(b.clone()));
+
+    if __test_futex_wake_scoped(0xA, UADDR, 1) != 1 {
+        return TestResult::Fail("private futex wake did not find same-AS waiter");
+    }
+    if a.load(Ordering::Acquire) != 1 || b.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("private futex wake crossed address-space namespace");
+    }
+    let _ = __test_futex_wake_scoped(0xB, UADDR, 1);
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "userspace/futex",
+    smoke_userspace_private_futex_namespaces_isolate_same_uaddr
+);
 kernel_test_in!("userspace", smoke_userspace_futex_park_word_revalidation);
 
 /// A blocking park's lost-wake fallback timer must fire a ~10 ms backstop for
@@ -11935,6 +11994,70 @@ fn call(syscall: Syscall, args: SyscallArgs) -> SyscallReturn {
     ctx.ret.unwrap_or(SyscallReturn::invalid_op())
 }
 
+/// Connected Unix SEQPACKET pairs preserve one record per send.
+fn smoke_unix_seqpacket_socketpair_preserves_records() -> TestResult {
+    setup_poll_test();
+    let mut sv = [0i32; 2];
+    let pair = call(
+        Syscall::SocketPair,
+        SyscallArgs {
+            arg0: crate::socket::AF_UNIX as u64,
+            arg1: crate::socket::SOCK_SEQPACKET as u64,
+            arg3: sv.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if pair.value != 0 {
+        return TestResult::Fail("SOCK_SEQPACKET socketpair failed");
+    }
+    for payload in [&b"first"[..], &b"second"[..]] {
+        let sent = call(
+            Syscall::SocketSend,
+            SyscallArgs {
+                arg0: sv[0] as u64,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                ..SyscallArgs::default()
+            },
+        );
+        if sent.value != payload.len() as u64 {
+            return TestResult::Fail("SEQPACKET send failed");
+        }
+    }
+    let mut out = [0u8; 16];
+    let first = call(
+        Syscall::SocketRecv,
+        SyscallArgs {
+            arg0: sv[1] as u64,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: out.len() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if first.value != 5 || &out[..5] != b"first" {
+        return TestResult::Fail("first SEQPACKET record was coalesced");
+    }
+    out.fill(0);
+    let second = call(
+        Syscall::SocketRecv,
+        SyscallArgs {
+            arg0: sv[1] as u64,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: out.len() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if second.value != 6 || &out[..6] != b"second" {
+        return TestResult::Fail("second SEQPACKET record was not preserved");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_unix_seqpacket_socketpair_preserves_records
+);
+
 // ── Poll tests (≥ 6) ─────────────────────────────────────────────────
 
 /// poll: 1 fd, 0 timeout, data ready → returns 1
@@ -12319,6 +12442,273 @@ fn smoke_epoll_ctl_add_then_del() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_epoll_ctl_add_then_del);
 
+/// An epoll registration is tied to the watched open file, not whatever
+/// object later reuses the same descriptor number.
+fn smoke_epoll_fd_reuse_does_not_alias_stale_interest() -> TestResult {
+    let task = setup_poll_test();
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
+    let watched = install_ready_file(task, 0);
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+    ev[4..12].copy_from_slice(&0xA11A5_u64.to_ne_bytes());
+    let added = call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: watched as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if added.value != 0 {
+        return TestResult::Fail("initial epoll_ctl ADD failed");
+    }
+    crate::fd::with_table(task, |t| t.close(watched));
+    let reused = install_ready_file(task, narf_filesystem::POLL_IN);
+    if reused != watched {
+        return TestResult::Fail("test did not reuse the closed fd slot");
+    }
+
+    let mut out = [0u8; 12];
+    let stale = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if stale.value != 0 {
+        return TestResult::Fail("stale epoll item aliased a reused fd");
+    }
+
+    let readded = call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: reused as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if readded.value != 0 {
+        return TestResult::Fail("dead epoll item prevented ADD of reused fd");
+    }
+    let ready = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if ready.value != 1 {
+        return TestResult::Fail("re-added reused fd was not reported ready");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_fd_reuse_does_not_alias_stale_interest
+);
+
+/// Closing the descriptor used for ADD does not kill the watch while a dup
+/// still retains the same open file description.
+fn smoke_epoll_watch_survives_original_close_with_dup() -> TestResult {
+    let task = setup_poll_test();
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
+    let watched = install_ready_file(task, narf_filesystem::POLL_IN);
+    let dup = crate::fd::with_table(task, |t| {
+        let entry = t.get(watched).cloned();
+        entry.map(|entry| t.open(entry))
+    })
+    .flatten();
+    if dup.is_none() {
+        return TestResult::Fail("failed to duplicate watched fd");
+    }
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+    ev[4..12].copy_from_slice(&0xD09_u64.to_ne_bytes());
+    if call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: watched as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("epoll_ctl ADD failed");
+    }
+    crate::fd::with_table(task, |t| t.close(watched));
+    let mut out = [0u8; 12];
+    let r = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if r.value != 1 {
+        return TestResult::Fail("dup did not retain watched open file");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_watch_survives_original_close_with_dup
+);
+
+/// EPOLLERR and EPOLLHUP are returned regardless of the requested mask.
+fn smoke_epoll_hup_is_reported_without_explicit_interest() -> TestResult {
+    let task = setup_poll_test();
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
+    let watched = install_ready_file(task, narf_filesystem::POLL_HUP);
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+    call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: watched as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    let mut out = [0u8; 12];
+    let r = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    let events = u32::from_ne_bytes(out[..4].try_into().unwrap_or([0; 4]));
+    if r.value != 1 || events & crate::epoll::EPOLLHUP == 0 {
+        return TestResult::Fail("implicit EPOLLHUP was not delivered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_hup_is_reported_without_explicit_interest
+);
+
+/// A peer shutdown must wake epoll and report readable EOF plus implicit HUP,
+/// even when the registration requested only EPOLLIN.
+fn smoke_epoll_socket_shutdown_reports_in_and_hup() -> TestResult {
+    setup_poll_test();
+
+    let mut sv = [0i32; 2];
+    if call(
+        Syscall::SocketPair,
+        SyscallArgs {
+            arg0: crate::socket::AF_UNIX as u64,
+            arg1: crate::socket::SOCK_STREAM as u64,
+            arg3: sv.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("socketpair failed");
+    }
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+    if call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: sv[1] as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("epoll add failed");
+    }
+
+    let mut out = [0u8; 12];
+    if call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("open empty peer unexpectedly readable");
+    }
+    if call(
+        Syscall::SocketShutdown,
+        SyscallArgs {
+            arg0: sv[0] as u64,
+            arg1: crate::socket::SHUT_RDWR as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("peer shutdown failed");
+    }
+    if call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 1
+    {
+        return TestResult::Fail("peer shutdown was not epoll-ready");
+    }
+    let events = u32::from_ne_bytes(out[..4].try_into().unwrap_or([0; 4]));
+    if events & (crate::epoll::EPOLLIN | crate::epoll::EPOLLHUP)
+        != crate::epoll::EPOLLIN | crate::epoll::EPOLLHUP
+    {
+        return TestResult::Fail("peer shutdown omitted EPOLLIN or implicit EPOLLHUP");
+    }
+
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_socket_shutdown_reports_in_and_hup);
+
 /// epoll_wait: 0 timeout, no ready items → returns 0
 fn smoke_epoll_wait_no_ready_returns_zero() -> TestResult {
     let task = setup_poll_test();
@@ -12495,6 +12885,486 @@ fn smoke_epoll_epollet_edge_triggered() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_epoll_epollet_edge_triggered);
+
+/// EPOLLET must retain an enqueue edge that occurs after a drain but before
+/// the next epoll_wait samples the socket.
+fn smoke_epoll_epollet_dgram_drain_refill_before_wait() -> TestResult {
+    setup_poll_test();
+
+    let mut sv = [0i32; 2];
+    let pair = call(
+        Syscall::SocketPair,
+        SyscallArgs {
+            arg0: crate::socket::AF_UNIX as u64,
+            arg1: crate::socket::SOCK_DGRAM as u64,
+            arg3: sv.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if pair.value != 0 {
+        return TestResult::Fail("EPOLLET dgram socketpair failed");
+    }
+
+    let epfd = call(
+        Syscall::EpollCreate,
+        SyscallArgs {
+            arg0: 0,
+            ..SyscallArgs::default()
+        },
+    )
+    .value as u32;
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&(crate::epoll::EPOLLIN | crate::epoll::EPOLLET).to_ne_bytes());
+    ev[4..12].copy_from_slice(&0xD6A6u64.to_ne_bytes());
+    let add = call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: sv[1] as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if add.value != 0 {
+        return TestResult::Fail("EPOLLET dgram add failed");
+    }
+
+    let mut out_ev = [0u8; 12];
+    for byte in [b'a', b'b'] {
+        let sent = call(
+            Syscall::SocketSend,
+            SyscallArgs {
+                arg0: sv[0] as u64,
+                arg1: (&byte as *const u8) as u64,
+                arg2: 1,
+                ..SyscallArgs::default()
+            },
+        );
+        if sent.value != 1 {
+            return TestResult::Fail("EPOLLET dgram send failed");
+        }
+        let ready = call(
+            Syscall::EpollWait,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: out_ev.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                ..SyscallArgs::default()
+            },
+        );
+        if ready.value != 1 {
+            return TestResult::Fail("EPOLLET lost drain/refill edge");
+        }
+        let mut received = 0u8;
+        let recv = call(
+            Syscall::SocketRecv,
+            SyscallArgs {
+                arg0: sv[1] as u64,
+                arg1: (&mut received as *mut u8) as u64,
+                arg2: 1,
+                ..SyscallArgs::default()
+            },
+        );
+        if recv.value != 1 || received != byte {
+            return TestResult::Fail("EPOLLET dgram drain failed");
+        }
+        // The second send happens immediately on the next loop iteration,
+        // before any empty-state epoll scan can clear last_mask.
+    }
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_epollet_dgram_drain_refill_before_wait
+);
+
+/// Consuming readable data must not manufacture a new EPOLLOUT edge when
+/// the stream was writable before and after the read.
+fn smoke_epoll_epollet_read_does_not_retrigger_writable() -> TestResult {
+    setup_poll_test();
+
+    let mut sv = [0i32; 2];
+    if call(
+        Syscall::SocketPair,
+        SyscallArgs {
+            arg0: crate::socket::AF_UNIX as u64,
+            arg1: crate::socket::SOCK_STREAM as u64,
+            arg3: sv.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("EPOLLET stream socketpair failed");
+    }
+
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(
+        &(crate::epoll::EPOLLIN | crate::epoll::EPOLLOUT | crate::epoll::EPOLLET).to_ne_bytes(),
+    );
+    if call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: sv[1] as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("EPOLLET stream add failed");
+    }
+
+    let mut out_ev = [0u8; 12];
+    let wait = |out: &mut [u8; 12]| {
+        call(
+            Syscall::EpollWait,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: out.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                ..SyscallArgs::default()
+            },
+        )
+    };
+    if wait(&mut out_ev).value != 1 {
+        return TestResult::Fail("EPOLLET initial writable edge missing");
+    }
+
+    let byte = b'x';
+    if call(
+        Syscall::SocketSend,
+        SyscallArgs {
+            arg0: sv[0] as u64,
+            arg1: (&byte as *const u8) as u64,
+            arg2: 1,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 1
+        || wait(&mut out_ev).value != 1
+    {
+        return TestResult::Fail("EPOLLET readable edge missing");
+    }
+
+    let mut received = 0u8;
+    if call(
+        Syscall::SocketRecv,
+        SyscallArgs {
+            arg0: sv[1] as u64,
+            arg1: (&mut received as *mut u8) as u64,
+            arg2: 1,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 1
+        || received != byte
+    {
+        return TestResult::Fail("EPOLLET stream drain failed");
+    }
+    if wait(&mut out_ev).value != 0 {
+        return TestResult::Fail("EPOLLET read retriggered unchanged writability");
+    }
+
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_epollet_read_does_not_retrigger_writable
+);
+
+/// Data that arrives and is fully drained between epoll scans changes only
+/// the readable-edge token. It must not be misreported as a new EPOLLOUT edge
+/// just because the socket remains writable.
+fn smoke_epoll_epollet_hidden_read_edge_does_not_retrigger_out() -> TestResult {
+    setup_poll_test();
+
+    let mut sv = [0i32; 2];
+    if call(
+        Syscall::SocketPair,
+        SyscallArgs {
+            arg0: crate::socket::AF_UNIX as u64,
+            arg1: crate::socket::SOCK_STREAM as u64,
+            arg3: sv.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("EPOLLET stream socketpair failed");
+    }
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(
+        &(crate::epoll::EPOLLIN | crate::epoll::EPOLLOUT | crate::epoll::EPOLLET).to_ne_bytes(),
+    );
+    if call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: sv[1] as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("EPOLLET stream add failed");
+    }
+
+    let mut out = [0u8; 12];
+    let wait = |out: &mut [u8; 12]| {
+        call(
+            Syscall::EpollWait,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: out.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                ..SyscallArgs::default()
+            },
+        )
+    };
+    if wait(&mut out).value != 1 {
+        return TestResult::Fail("initial writable edge missing");
+    }
+
+    let byte = b'x';
+    if call(
+        Syscall::SocketSend,
+        SyscallArgs {
+            arg0: sv[0] as u64,
+            arg1: (&byte as *const u8) as u64,
+            arg2: 1,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 1
+    {
+        return TestResult::Fail("send failed");
+    }
+    let mut received = 0u8;
+    if call(
+        Syscall::SocketRecv,
+        SyscallArgs {
+            arg0: sv[1] as u64,
+            arg1: (&mut received as *mut u8) as u64,
+            arg2: 1,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 1
+    {
+        return TestResult::Fail("drain failed");
+    }
+    if wait(&mut out).value != 0 {
+        return TestResult::Fail("hidden readable edge manufactured EPOLLOUT");
+    }
+
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_epollet_hidden_read_edge_does_not_retrigger_out
+);
+
+/// Adding more bytes to an already-readable stream must not manufacture a
+/// second EPOLLIN edge. The consumer has already been told to drain to
+/// EAGAIN.
+fn smoke_epoll_epollet_write_does_not_retrigger_readable() -> TestResult {
+    setup_poll_test();
+
+    let mut sv = [0i32; 2];
+    if call(
+        Syscall::SocketPair,
+        SyscallArgs {
+            arg0: crate::socket::AF_UNIX as u64,
+            arg1: crate::socket::SOCK_STREAM as u64,
+            arg3: sv.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("EPOLLET stream socketpair failed");
+    }
+
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&(crate::epoll::EPOLLIN | crate::epoll::EPOLLET).to_ne_bytes());
+    if call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: sv[1] as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("EPOLLET stream add failed");
+    }
+
+    let mut out_ev = [0u8; 12];
+    let wait = |out: &mut [u8; 12]| {
+        call(
+            Syscall::EpollWait,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: out.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                ..SyscallArgs::default()
+            },
+        )
+    };
+    for (index, byte) in [b'a', b'b'].into_iter().enumerate() {
+        if call(
+            Syscall::SocketSend,
+            SyscallArgs {
+                arg0: sv[0] as u64,
+                arg1: (&byte as *const u8) as u64,
+                arg2: 1,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+            != 1
+        {
+            return TestResult::Fail("EPOLLET stream send failed");
+        }
+        let ready = wait(&mut out_ev).value;
+        if (index == 0 && ready != 1) || (index == 1 && ready != 0) {
+            return TestResult::Fail("EPOLLET retriggered unchanged readability");
+        }
+    }
+
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_epollet_write_does_not_retrigger_readable
+);
+
+/// A full stream is not writable; consuming one byte must publish exactly one
+/// EPOLLOUT edge for the full-to-space transition.
+fn smoke_epoll_epollet_full_to_space_writable_edge() -> TestResult {
+    setup_poll_test();
+
+    let mut sv = [0i32; 2];
+    if call(
+        Syscall::SocketPair,
+        SyscallArgs {
+            arg0: crate::socket::AF_UNIX as u64,
+            arg1: crate::socket::SOCK_STREAM as u64,
+            arg3: sv.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("EPOLLET stream socketpair failed");
+    }
+
+    let payload = alloc::vec![0x5au8; 64 * 1024];
+    if call(
+        Syscall::SocketSend,
+        SyscallArgs {
+            arg0: sv[0] as u64,
+            arg1: payload.as_ptr() as u64,
+            arg2: payload.len() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != payload.len() as u64
+    {
+        return TestResult::Fail("failed to fill stream ring");
+    }
+
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&(crate::epoll::EPOLLOUT | crate::epoll::EPOLLET).to_ne_bytes());
+    if call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: sv[0] as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("EPOLLET stream add failed");
+    }
+
+    let mut out_ev = [0u8; 12];
+    let wait = |out: &mut [u8; 12]| {
+        call(
+            Syscall::EpollWait,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: out.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                ..SyscallArgs::default()
+            },
+        )
+    };
+    if wait(&mut out_ev).value != 0 {
+        return TestResult::Fail("full stream was reported writable");
+    }
+
+    let mut byte = 0u8;
+    if call(
+        Syscall::SocketRecv,
+        SyscallArgs {
+            arg0: sv[1] as u64,
+            arg1: (&mut byte as *mut u8) as u64,
+            arg2: 1,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 1
+    {
+        return TestResult::Fail("failed to make stream writable");
+    }
+    if wait(&mut out_ev).value != 1 || wait(&mut out_ev).value != 0 {
+        return TestResult::Fail("full-to-space transition did not publish one edge");
+    }
+
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_epollet_full_to_space_writable_edge);
 
 /// EPOLLONESHOT: fires once; re-arm via MOD; fires again
 fn smoke_epoll_oneshot_fires_once_rearm_fires_again() -> TestResult {
@@ -13325,6 +14195,111 @@ fn smoke_wave64_epoll_watches_eventfd() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_wave64_epoll_watches_eventfd);
+
+/// EPOLLET must observe an eventfd drain/refill transition even when no epoll
+/// scan occurs while the counter is zero. Both scans then see POLLIN, so the
+/// provider's readable transition token is the only evidence of the new edge.
+#[cfg(feature = "linux-compat")]
+fn smoke_epoll_epollet_eventfd_hidden_refill_edge() -> TestResult {
+    setup_poll_test();
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
+    let efd = call(
+        Syscall::Eventfd,
+        SyscallArgs {
+            arg0: 0,
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
+    )
+    .value as u32;
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&(crate::epoll::EPOLLIN | crate::epoll::EPOLLET).to_ne_bytes());
+    if call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: efd as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("EPOLLET eventfd add failed");
+    }
+
+    let wait = |out: &mut [u8; 12]| {
+        call(
+            Syscall::EpollWait,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: out.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                ..SyscallArgs::default()
+            },
+        )
+    };
+    let one = 1u64.to_ne_bytes();
+    let mut out = [0u8; 12];
+    if call(
+        Syscall::Write,
+        SyscallArgs {
+            arg0: efd as u64,
+            arg1: one.as_ptr() as u64,
+            arg2: 8,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 8
+        || wait(&mut out).value != 1
+    {
+        return TestResult::Fail("initial eventfd edge was not delivered");
+    }
+
+    let mut drained = [0u8; 8];
+    if call(
+        Syscall::Read,
+        SyscallArgs {
+            arg0: efd as u64,
+            arg1: drained.as_mut_ptr() as u64,
+            arg2: 8,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 8
+    {
+        return TestResult::Fail("eventfd drain failed");
+    }
+    // Refill before another epoll scan observes the zero-counter state.
+    if call(
+        Syscall::Write,
+        SyscallArgs {
+            arg0: efd as u64,
+            arg1: one.as_ptr() as u64,
+            arg2: 8,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 8
+        || wait(&mut out).value != 1
+    {
+        return TestResult::Fail("EPOLLET lost hidden eventfd refill edge");
+    }
+    if wait(&mut out).value != 0 {
+        return TestResult::Fail("eventfd refill edge was delivered more than once");
+    }
+
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_epoll_epollet_eventfd_hidden_refill_edge);
 
 // ── AF_INET socket smokes ────────────────────────────────────────────
 //
@@ -16615,9 +17590,9 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
         }
     };
 
-    // ADD signalfd with EPOLLIN=1.
+    // ADD signalfd with EPOLLIN|EPOLLET.
     let mut ev = [0u8; 12];
-    ev[..4].copy_from_slice(&1u32.to_le_bytes());
+    ev[..4].copy_from_slice(&(1u32 | (1u32 << 31)).to_le_bytes());
     ev[4..].copy_from_slice(&0xC0FFEEu64.to_le_bytes());
     let mut ctx = FakeCtx {
         args: SyscallArgs {
@@ -16659,6 +17634,40 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
 
     let user_data = u64::from_le_bytes(events[4..12].try_into().unwrap());
 
+    // Drain the signal and raise the same signal again before another epoll
+    // scan observes the empty pending set. The per-task signal generation
+    // must preserve this hidden refill edge.
+    let mut siginfo = [0u8; 128];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: sfd as u64,
+            arg1: siginfo.as_mut_ptr() as u64,
+            arg2: siginfo.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 128) {
+        return TestResult::Fail("failed to drain signalfd before hidden refill");
+    }
+    crate::handlers::raise_signal_pending(0, 12);
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: epfd as u64,
+            arg1: events.as_mut_ptr() as u64,
+            arg2: 4,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::EpollWait.raw(), &mut ctx);
+    let refill_ready = matches!(
+        ctx.ret,
+        Some(r) if r.status == SyscallReturn::OK && r.value == 1
+    );
+
     __test_signal_reset();
     crate::fd::__test_reset();
     __test_clear_global();
@@ -16668,6 +17677,9 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
     }
     if user_data != 0xC0FFEE {
         return TestResult::Fail("epoll_wait user_data not echoed");
+    }
+    if !refill_ready {
+        return TestResult::Fail("EPOLLET lost hidden signalfd refill edge");
     }
     TestResult::Pass
 }

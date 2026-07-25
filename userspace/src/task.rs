@@ -111,9 +111,25 @@ pub fn task_get(tid: u64) -> Option<Arc<Task>> {
 
 /// Diagnostic snapshot for the stall watchdog: one entry per registered
 /// task — `(tid, pid, state, sleep_deadline_ns, futex_uaddr,
-/// parked_in_syscall)`. Clones the Arcs out under the lock, reads the
+/// futex_namespace, futex_park_gen, futex_val, net_io_wait,
+/// wait_child_pending, flock_key, parked_in_syscall)`. Clones the Arcs out
+/// under the lock, reads the
 /// atomics lock-free after.
-pub fn dbg_park_snapshot() -> alloc::vec::Vec<(u64, u64, u32, u64, u64, bool)> {
+#[allow(clippy::type_complexity)]
+pub fn dbg_park_snapshot() -> alloc::vec::Vec<(
+    u64,
+    u64,
+    u32,
+    u64,
+    u64,
+    u64,
+    u64,
+    u32,
+    bool,
+    bool,
+    usize,
+    bool,
+)> {
     let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
     tasks
         .iter()
@@ -124,6 +140,12 @@ pub fn dbg_park_snapshot() -> alloc::vec::Vec<(u64, u64, u32, u64, u64, bool)> {
                 t.state.load(Ordering::Relaxed),
                 t.uctx.sleep_deadline_ns.load(Ordering::Relaxed),
                 t.uctx.futex_uaddr.load(Ordering::Relaxed),
+                t.uctx.futex_namespace.load(Ordering::Relaxed),
+                t.uctx.futex_park_gen.load(Ordering::Relaxed),
+                t.uctx.futex_val.load(Ordering::Relaxed),
+                t.uctx.net_io_wait.load(Ordering::Relaxed),
+                t.uctx.wait_child_pending.load(Ordering::Relaxed),
+                t.uctx.flock_key.load(Ordering::Relaxed),
                 t.uctx.parked_in_syscall.load(Ordering::Relaxed),
             )
         })

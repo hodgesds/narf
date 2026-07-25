@@ -5,7 +5,7 @@
 //! itself with `bus::register_pci_driver` for vendor 0x1AF4, device
 //! 0x1041 (modern virtio-blk).
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
@@ -47,6 +47,34 @@ pub const MAX_READ_SECTORS: u16 = 8;
 
 /// virtio-blk completion status.
 pub const VIRTIO_BLK_S_OK: u8 = 0;
+
+// Written only after a request has already failed to complete for one second,
+// then read by the feature-gated fatal stall watchdog. Keeping diagnostics off
+// the normal submit/poll path avoids perturbing timing-sensitive failures.
+static STALLED_QUEUE_STATE: AtomicU64 = AtomicU64::new(0);
+static STALLED_REQUEST: AtomicU64 = AtomicU64::new(0);
+
+/// Last virtio-blk timeout snapshot for the fatal stall watchdog.
+///
+/// Returns `(sector, head, avail_idx, last_used_idx, device_used_idx,
+/// num_free, status)`, or `None` if no request has crossed the one-second
+/// threshold.
+pub fn stalled_queue_snapshot() -> Option<(u64, u16, u16, u16, u16, u16, u8)> {
+    let state = STALLED_QUEUE_STATE.load(Ordering::Acquire);
+    if state == 0 {
+        return None;
+    }
+    let request = STALLED_REQUEST.load(Ordering::Relaxed);
+    Some((
+        request >> 16,
+        request as u16,
+        (state >> 48) as u16,
+        (state >> 32) as u16,
+        (state >> 16) as u16,
+        state as u16,
+        (request >> 8) as u8,
+    ))
+}
 
 /// virtio-blk request header (VirtIO 1.2 §5.2.6).
 #[repr(C)]
@@ -393,6 +421,28 @@ impl VirtioBlkPci {
             if completed || q_err {
                 break completed;
             }
+            let (avail, last_used, device_used, free) = {
+                let g = self.queue.lock();
+                g.as_ref()
+                    .map(Virtqueue::diagnostic_snapshot)
+                    .unwrap_or((0, 0, 0, 0))
+            };
+            // SAFETY: `status_phys` is the live DMA status byte allocated for
+            // this request; the descriptor chain remains owned until the
+            // device completes it, so the byte is valid for this diagnostic
+            // volatile read.
+            let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
+            STALLED_REQUEST.store(
+                (sector << 16) | ((status as u64) << 8) | head as u64,
+                Ordering::Relaxed,
+            );
+            STALLED_QUEUE_STATE.store(
+                ((avail as u64) << 48)
+                    | ((last_used as u64) << 32)
+                    | ((device_used as u64) << 16)
+                    | free as u64,
+                Ordering::Release,
+            );
         };
         if q_err {
             return Err(VirtioPciError::NoQueues);

@@ -55,7 +55,7 @@ fn smoke_abi_socket_socket_open_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_socket_open_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_socket_open_pos);
 
 fn smoke_abi_socket_socket_open_neg() -> TestResult {
     with_setup(|| {
@@ -70,7 +70,7 @@ fn smoke_abi_socket_socket_open_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_socket_open_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_socket_open_neg);
 
 // ───────────────────────────── SocketBind ─────────────────────────────
 
@@ -86,7 +86,7 @@ fn smoke_abi_socket_bind_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_bind_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_bind_pos);
 
 fn smoke_abi_socket_bind_neg() -> TestResult {
     with_setup(|| {
@@ -101,7 +101,7 @@ fn smoke_abi_socket_bind_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_bind_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_bind_neg);
 
 // ──────────────────────────── SocketListen ────────────────────────────
 
@@ -121,7 +121,7 @@ fn smoke_abi_socket_listen_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_listen_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_listen_pos);
 
 fn smoke_abi_socket_listen_neg() -> TestResult {
     with_setup(|| {
@@ -136,7 +136,7 @@ fn smoke_abi_socket_listen_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_listen_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_listen_neg);
 
 // ──────────────────────────── SocketConnect ───────────────────────────
 
@@ -162,7 +162,7 @@ fn smoke_abi_socket_connect_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_connect_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_connect_pos);
 
 fn smoke_abi_socket_bound_client_connects() -> TestResult {
     with_setup(|| {
@@ -199,7 +199,7 @@ fn smoke_abi_socket_bound_client_connects() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_bound_client_connects);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_bound_client_connects);
 
 fn smoke_abi_socket_connect_neg() -> TestResult {
     with_setup(|| {
@@ -216,7 +216,7 @@ fn smoke_abi_socket_connect_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_connect_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_connect_neg);
 
 // ───────────────────────────── SocketAccept ───────────────────────────
 
@@ -231,7 +231,7 @@ fn smoke_abi_socket_accept_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_accept_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_accept_neg);
 
 fn smoke_abi_socket_accept_empty_eagain() -> TestResult {
     with_setup(|| {
@@ -256,7 +256,7 @@ fn smoke_abi_socket_accept_empty_eagain() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_accept_empty_eagain);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_accept_empty_eagain);
 
 // ──────────────────────────── SocketAccept4 ───────────────────────────
 
@@ -271,7 +271,7 @@ fn smoke_abi_socket_accept4_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_accept4_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_accept4_neg);
 
 fn smoke_abi_socket_accept4_empty_eagain() -> TestResult {
     with_setup(|| {
@@ -293,7 +293,7 @@ fn smoke_abi_socket_accept4_empty_eagain() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_accept4_empty_eagain);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_accept4_empty_eagain);
 
 // ───────────────────────────── SocketPair ─────────────────────────────
 
@@ -315,7 +315,7 @@ fn smoke_abi_socket_pair_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_pair_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_pair_pos);
 
 fn smoke_abi_socket_pair_neg() -> TestResult {
     with_setup(|| {
@@ -331,7 +331,7 @@ fn smoke_abi_socket_pair_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_pair_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_pair_neg);
 
 // ───────────────────────────── SocketSend ─────────────────────────────
 
@@ -356,7 +356,7 @@ fn smoke_abi_socket_send_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_send_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_send_pos);
 
 fn smoke_abi_socket_send_neg() -> TestResult {
     with_setup(|| {
@@ -374,7 +374,7 @@ fn smoke_abi_socket_send_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_send_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_send_neg);
 
 // ───────────────────────────── SocketRecv ─────────────────────────────
 
@@ -390,6 +390,7 @@ fn smoke_abi_socket_recv_pos() -> TestResult {
         }
         let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
         let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+
         let payload = b"abcd";
         let send = Syscall::SocketSend.raw();
         if call(
@@ -414,7 +415,7 @@ fn smoke_abi_socket_recv_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_recv_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recv_pos);
 
 fn smoke_abi_socket_recv_neg() -> TestResult {
     with_setup(|| {
@@ -432,7 +433,7 @@ fn smoke_abi_socket_recv_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_recv_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recv_neg);
 
 // ── Non-blocking empty-but-open stream must EAGAIN, never a phantom 0 ──
 // Regression for the AF_UNIX read/recv spurious-EOF bug: a non-blocking read
@@ -468,7 +469,10 @@ fn smoke_abi_socket_read_nonblock_empty_eagain() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_read_nonblock_empty_eagain);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_read_nonblock_empty_eagain
+);
 
 fn smoke_abi_socket_recv_dontwait_empty_eagain() -> TestResult {
     with_setup(|| {
@@ -493,7 +497,10 @@ fn smoke_abi_socket_recv_dontwait_empty_eagain() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_recv_dontwait_empty_eagain);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_recv_dontwait_empty_eagain
+);
 
 fn smoke_abi_socket_read_nonblock_then_data() -> TestResult {
     with_setup(|| {
@@ -524,7 +531,10 @@ fn smoke_abi_socket_read_nonblock_then_data() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_read_nonblock_then_data);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_read_nonblock_then_data
+);
 
 fn smoke_abi_socket_read_eof_after_peer_shutdown() -> TestResult {
     with_setup(|| {
@@ -532,8 +542,12 @@ fn smoke_abi_socket_read_eof_after_peer_shutdown() -> TestResult {
         // the fix distinguishes empty-open (EAGAIN) from closed (EOF).
         let (fd0, fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
         let shutdown = Syscall::SocketShutdown.raw();
+        let generation = narf_net::readiness::generation();
         if call(shutdown, a1(fd0, SHUT_RDWR)).ok_or("shutdown status")? != 0 {
             return Err("shutdown(fd0) failed");
+        }
+        if narf_net::readiness::generation() <= generation {
+            return Err("shutdown did not publish a readiness wake");
         }
         let mut rbuf = [0u8; 16];
         let read = Syscall::Read.raw();
@@ -545,7 +559,10 @@ fn smoke_abi_socket_read_eof_after_peer_shutdown() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_read_eof_after_peer_shutdown);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_read_eof_after_peer_shutdown
+);
 
 // ─────────────────────────── SocketShutdown ───────────────────────────
 
@@ -568,7 +585,7 @@ fn smoke_abi_socket_shutdown_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_shutdown_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_shutdown_pos);
 
 fn smoke_abi_socket_shutdown_neg() -> TestResult {
     with_setup(|| {
@@ -581,7 +598,7 @@ fn smoke_abi_socket_shutdown_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_shutdown_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_shutdown_neg);
 
 // ──────────────────────────── SocketGetSockOpt ────────────────────────
 
@@ -615,7 +632,7 @@ fn smoke_abi_socket_getsockopt_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_getsockopt_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getsockopt_pos);
 
 fn smoke_abi_socket_getsockopt_neg() -> TestResult {
     with_setup(|| {
@@ -638,7 +655,7 @@ fn smoke_abi_socket_getsockopt_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_getsockopt_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getsockopt_neg);
 
 fn smoke_abi_socket_getsockopt_peersec_without_lsm() -> TestResult {
     with_setup(|| {
@@ -661,36 +678,82 @@ fn smoke_abi_socket_getsockopt_peersec_without_lsm() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/socket",
     smoke_abi_socket_getsockopt_peersec_without_lsm
 );
 
-fn smoke_abi_socket_getsockopt_peergroups_unavailable() -> TestResult {
+fn smoke_abi_socket_getsockopt_peergroups() -> TestResult {
     with_setup(|| {
         const SO_PEERGROUPS: u64 = 59;
-        const SO_PEERPIDFD: u64 = 77;
-        let fd = open_unix_stream()?;
+        let groups = [12u32, 34, 56];
+        if call(
+            Syscall::Setgroups.raw(),
+            a1(groups.len() as u64, groups.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setgroups setup failed");
+        }
+        let mut sv = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd = i32::from_ne_bytes(sv[0..4].try_into().unwrap()) as u64;
         let mut val = [0u8; 64];
-        for option in [SO_PEERGROUPS, SO_PEERPIDFD] {
-            let mut optlen = (val.len() as u32).to_ne_bytes();
-            let args = SyscallArgs {
-                arg0: fd,
-                arg1: SOL_SOCKET,
-                arg2: option,
-                arg3: val.as_mut_ptr() as u64,
-                arg4: optlen.as_mut_ptr() as u64,
-                ..Default::default()
-            };
-            if call(Syscall::SocketGetSockOpt.raw(), args) != Some(-92) {
-                return Err("unavailable Unix peer metadata did not return ENOPROTOOPT");
-            }
+        let mut optlen = (val.len() as u32).to_ne_bytes();
+        let args = SyscallArgs {
+            arg0: fd,
+            arg1: SOL_SOCKET,
+            arg2: SO_PEERGROUPS,
+            arg3: val.as_mut_ptr() as u64,
+            arg4: optlen.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::SocketGetSockOpt.raw(), args) != Some(0) {
+            return Err("SO_PEERGROUPS failed");
+        }
+        if u32::from_ne_bytes(optlen) != 12 {
+            return Err("SO_PEERGROUPS returned wrong length");
+        }
+        let returned = [
+            u32::from_ne_bytes(val[0..4].try_into().unwrap()),
+            u32::from_ne_bytes(val[4..8].try_into().unwrap()),
+            u32::from_ne_bytes(val[8..12].try_into().unwrap()),
+        ];
+        if returned != groups {
+            return Err("SO_PEERGROUPS returned wrong gids");
         }
         Ok(())
     })
 }
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getsockopt_peergroups);
+
+fn smoke_abi_socket_getsockopt_peerpidfd_unavailable() -> TestResult {
+    with_setup(|| {
+        const SO_PEERPIDFD: u64 = 77;
+        let fd = open_unix_stream()?;
+        let mut val = [0u8; 8];
+        let mut optlen = (val.len() as u32).to_ne_bytes();
+        let args = SyscallArgs {
+            arg0: fd,
+            arg1: SOL_SOCKET,
+            arg2: SO_PEERPIDFD,
+            arg3: val.as_mut_ptr() as u64,
+            arg4: optlen.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::SocketGetSockOpt.raw(), args) {
+            Some(-92) => Ok(()),
+            _ => Err("SO_PEERPIDFD without retained pidfd did not return ENOPROTOOPT"),
+        }
+    })
+}
 kernel_test_in!(
-    "syscall_abi",
-    smoke_abi_socket_getsockopt_peergroups_unavailable
+    "syscall_abi/socket",
+    smoke_abi_socket_getsockopt_peerpidfd_unavailable
 );
 
 // getsockopt(SO_ACCEPTCONN) is the gate systemd's is_socket_internal() (behind
@@ -724,7 +787,10 @@ fn smoke_abi_socket_acceptconn_not_listening() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_acceptconn_not_listening);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_acceptconn_not_listening
+);
 
 fn smoke_abi_socket_acceptconn_listening() -> TestResult {
     with_setup(|| {
@@ -762,7 +828,7 @@ fn smoke_abi_socket_acceptconn_listening() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_acceptconn_listening);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_acceptconn_listening);
 
 // A socket fd must `fstat` as S_IFSOCK (0o140000), not a char device. systemd's
 // is_socket_internal() rejects any fd whose st_mode fails S_ISSOCK before it
@@ -786,7 +852,7 @@ fn smoke_abi_socket_fstat_is_sock() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_fstat_is_sock);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_fstat_is_sock);
 
 // ──────────────────────────── SocketSetSockOpt ────────────────────────
 
@@ -811,7 +877,7 @@ fn smoke_abi_socket_setsockopt_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_setsockopt_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_setsockopt_pos);
 
 fn smoke_abi_socket_setsockopt_neg() -> TestResult {
     with_setup(|| {
@@ -835,7 +901,7 @@ fn smoke_abi_socket_setsockopt_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_setsockopt_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_setsockopt_neg);
 
 // ─────────────────────────── SocketGetSockName ────────────────────────
 
@@ -875,7 +941,7 @@ fn smoke_abi_socket_getsockname_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_getsockname_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getsockname_pos);
 
 fn smoke_abi_socket_getsockname_neg() -> TestResult {
     with_setup(|| {
@@ -894,9 +960,48 @@ fn smoke_abi_socket_getsockname_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_getsockname_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getsockname_neg);
 
 // ─────────────────────────── SocketGetPeerName ────────────────────────
+
+fn smoke_abi_socket_getpeername_socketpair_pos() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        let pair = Syscall::SocketPair.raw();
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+
+        // An unnamed AF_UNIX peer is encoded as sa_family alone.  Keep the
+        // caller capacity at one byte to also pin Linux's truncation rule:
+        // copy only the available prefix, but report the full length.
+        let mut out = [0xa5u8; 1];
+        let mut outlen = 1u32.to_ne_bytes();
+        let n = Syscall::SocketGetPeerName.raw();
+        let r = call(
+            n,
+            a2(fd0, out.as_mut_ptr() as u64, outlen.as_mut_ptr() as u64),
+        )
+        .ok_or("status not Ok")?;
+        if r != 0 {
+            return Err("getpeername() on an unnamed socketpair failed");
+        }
+        if out[0] != (AF_UNIX as u16).to_le_bytes()[0] {
+            return Err("getpeername() did not copy the available address prefix");
+        }
+        if u32::from_ne_bytes(outlen) != 2 {
+            return Err("getpeername() did not report the full unnamed address length");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_getpeername_socketpair_pos
+);
 
 fn smoke_abi_socket_getpeername_neg_badfd() -> TestResult {
     with_setup(|| {
@@ -915,14 +1020,12 @@ fn smoke_abi_socket_getpeername_neg_badfd() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_getpeername_neg_badfd);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getpeername_neg_badfd);
 
 fn smoke_abi_socket_getpeername_neg_unconnected() -> TestResult {
     with_setup(|| {
-        // A fresh (or connected AF_UNIX stream) socket has no peer_addr()
-        // entry → GetPeerName → NotConnected → -1. NARF never reports a
-        // peer name for AF_UNIX stream sockets, so the success path is
-        // unreachable from this harness; pin the unconnected error instead.
+        // A fresh socket has no peer_addr() entry:
+        // GetPeerName → NotConnected → -1.
         let fd = open_unix_stream()?;
         let mut out = [0u8; 16];
         let mut outlen = (out.len() as u32).to_ne_bytes();
@@ -939,7 +1042,10 @@ fn smoke_abi_socket_getpeername_neg_unconnected() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_getpeername_neg_unconnected);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_getpeername_neg_unconnected
+);
 
 // ───────────────────────────── SocketSendMsg ──────────────────────────
 
@@ -974,7 +1080,7 @@ fn smoke_abi_socket_sendmsg_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_sendmsg_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sendmsg_pos);
 
 fn smoke_abi_socket_sendmsg_neg() -> TestResult {
     with_setup(|| {
@@ -989,7 +1095,7 @@ fn smoke_abi_socket_sendmsg_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_sendmsg_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sendmsg_neg);
 
 // ───────────────────────────── SocketRecvMsg ──────────────────────────
 
@@ -1035,7 +1141,7 @@ fn smoke_abi_socket_recvmsg_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_recvmsg_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recvmsg_pos);
 
 fn smoke_abi_socket_recvmsg_neg() -> TestResult {
     with_setup(|| {
@@ -1050,7 +1156,7 @@ fn smoke_abi_socket_recvmsg_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_recvmsg_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recvmsg_neg);
 
 // ─────────────────────────── SockRegisterBuf ──────────────────────────
 
@@ -1067,7 +1173,7 @@ fn smoke_abi_socket_sock_register_buf_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_sock_register_buf_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_register_buf_pos);
 
 fn smoke_abi_socket_sock_register_buf_neg() -> TestResult {
     with_setup(|| {
@@ -1080,7 +1186,7 @@ fn smoke_abi_socket_sock_register_buf_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_sock_register_buf_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_register_buf_neg);
 
 // ───────────────────────────── SockSendZc ─────────────────────────────
 
@@ -1112,7 +1218,7 @@ fn smoke_abi_socket_sock_send_zc_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_sock_send_zc_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_send_zc_pos);
 
 fn smoke_abi_socket_sock_send_zc_neg() -> TestResult {
     with_setup(|| {
@@ -1126,7 +1232,7 @@ fn smoke_abi_socket_sock_send_zc_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_sock_send_zc_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_send_zc_neg);
 
 // ─────────────────── AF_UNIX abstract namespace ───────────────────
 
@@ -1199,7 +1305,10 @@ fn smoke_abi_socket_abstract_dgram_roundtrip() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_abstract_dgram_roundtrip);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_abstract_dgram_roundtrip
+);
 
 /// connect()/sendto to an unbound abstract name is ECONNREFUSED (-111),
 /// never the bare -1 sentinel.
@@ -1223,7 +1332,10 @@ fn smoke_abi_socket_abstract_dgram_refused() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_abstract_dgram_refused);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_abstract_dgram_refused
+);
 
 /// A second bind to a live abstract name is EADDRINUSE (-98 via the
 /// dispatcher's AddrInUse → the handler's -1 sentinel is NOT used here
@@ -1248,7 +1360,7 @@ fn smoke_abi_socket_abstract_stream_inuse() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_abstract_stream_inuse);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_abstract_stream_inuse);
 
 /// Autobind: bind with `addrlen == sizeof(sa_family_t)` (2) assigns a
 /// fresh abstract name; getsockname reports a usable abstract address
@@ -1287,7 +1399,7 @@ fn smoke_abi_socket_autobind() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_autobind);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_autobind);
 
 // ─────────────────── SO_PASSCRED / SO_PEERCRED / SCM ───────────────────
 
@@ -1335,7 +1447,7 @@ fn smoke_abi_socket_so_peercred() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_so_peercred);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_so_peercred);
 
 /// SO_PASSCRED round-trips through set/getsockopt.
 fn smoke_abi_socket_so_passcred_roundtrip() -> TestResult {
@@ -1378,7 +1490,7 @@ fn smoke_abi_socket_so_passcred_roundtrip() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_so_passcred_roundtrip);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_so_passcred_roundtrip);
 
 /// SO_PASSCRED + recvmsg attaches an SCM_CREDENTIALS control message
 /// naming the sender. Send over a socketpair, then recvmsg the other end
@@ -1464,7 +1576,10 @@ fn smoke_abi_socket_recvmsg_scm_credentials() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_recvmsg_scm_credentials);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_recvmsg_scm_credentials
+);
 
 /// SCM_RIGHTS: sendmsg an fd over one socketpair half, recvmsg the other
 /// half, and confirm a NEW fd (different number, usable) was installed.
@@ -1482,6 +1597,18 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
         }
         let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
         let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+
+        // Queue ordinary stream bytes before the fd-bearing message. Rights
+        // must remain attached to the latter's first byte rather than being
+        // stolen by the first receive.
+        let prefix = b"plain";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(fd0, prefix.as_ptr() as u64, prefix.len() as u64, 0),
+        ) != Some(prefix.len() as i64)
+        {
+            return Err("ordinary prefix send failed");
+        }
 
         // The fd we pass: a second, independent socketpair end.
         let mut sv2 = [0u8; 8];
@@ -1520,6 +1647,21 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
         .ok_or("sendmsg status")?;
         if sent != payload.len() as i64 {
             return Err("sendmsg(SCM_RIGHTS) did not return the payload byte count");
+        }
+
+        let mut prefix_out = [0u8; 5];
+        if call(
+            Syscall::SocketRecv.raw(),
+            a3(
+                fd1,
+                prefix_out.as_mut_ptr() as u64,
+                prefix_out.len() as u64,
+                0,
+            ),
+        ) != Some(prefix.len() as i64)
+            || &prefix_out != prefix
+        {
+            return Err("ordinary prefix receive failed");
         }
 
         // recvmsg the other half with a control buffer.
@@ -1564,7 +1706,7 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_scm_rights_fd_passing);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_scm_rights_fd_passing);
 
 /// Closing a duplicated listener fd must not unbind the listener while the
 /// original fd remains open (dbus-broker receives its listener this way).
@@ -1597,7 +1739,7 @@ fn smoke_abi_socket_dup_listener_close_keeps_binding() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/socket",
     smoke_abi_socket_dup_listener_close_keeps_binding
 );
 
@@ -1746,7 +1888,7 @@ fn smoke_abi_netlink_route_socket_bind() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_socket_bind);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_socket_bind);
 
 fn smoke_abi_netlink_route_siocinq() -> TestResult {
     with_setup(|| {
@@ -1768,7 +1910,7 @@ fn smoke_abi_netlink_route_siocinq() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_siocinq);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_siocinq);
 
 fn smoke_abi_netlink_route_msg_peek() -> TestResult {
     with_setup(|| {
@@ -1794,7 +1936,7 @@ fn smoke_abi_netlink_route_msg_peek() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_msg_peek);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_msg_peek);
 
 fn smoke_abi_netlink_route_msg_trunc() -> TestResult {
     with_setup(|| {
@@ -1828,7 +1970,7 @@ fn smoke_abi_netlink_route_msg_trunc() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_msg_trunc);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_msg_trunc);
 
 fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
     with_setup(|| {
@@ -1915,7 +2057,7 @@ fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/socket",
     smoke_abi_netlink_address_and_options_roundtrip
 );
 
@@ -1936,7 +2078,7 @@ fn smoke_abi_netlink_uevent_socket_bind() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_uevent_socket_bind);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_uevent_socket_bind);
 
 fn smoke_abi_netlink_route_getlink_dump() -> TestResult {
     with_setup(|| {
@@ -1987,7 +2129,7 @@ fn smoke_abi_netlink_route_getlink_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getlink_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getlink_dump);
 
 fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
     with_setup(|| {
@@ -2028,7 +2170,7 @@ fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getaddr_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getaddr_dump);
 
 fn smoke_abi_netlink_route_getaddr_family_filter() -> TestResult {
     with_setup(|| {
@@ -2051,7 +2193,10 @@ fn smoke_abi_netlink_route_getaddr_family_filter() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getaddr_family_filter);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_getaddr_family_filter
+);
 
 fn smoke_abi_netlink_route_getroute_dump() -> TestResult {
     with_setup(|| {
@@ -2090,7 +2235,7 @@ fn smoke_abi_netlink_route_getroute_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getroute_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getroute_dump);
 
 fn smoke_abi_netlink_route_point_lookup() -> TestResult {
     with_setup(|| {
@@ -2154,7 +2299,7 @@ fn smoke_abi_netlink_route_point_lookup() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_point_lookup);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_point_lookup);
 
 fn smoke_abi_netlink_route_getneigh_dump() -> TestResult {
     with_setup(|| {
@@ -2184,7 +2329,7 @@ fn smoke_abi_netlink_route_getneigh_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getneigh_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getneigh_dump);
 
 fn smoke_abi_netlink_route_getrule_dump() -> TestResult {
     with_setup(|| {
@@ -2212,7 +2357,7 @@ fn smoke_abi_netlink_route_getrule_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getrule_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getrule_dump);
 
 fn smoke_abi_netlink_route_getqdisc_dump() -> TestResult {
     with_setup(|| {
@@ -2245,7 +2390,7 @@ fn smoke_abi_netlink_route_getqdisc_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getqdisc_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getqdisc_dump);
 
 fn smoke_abi_netlink_empty_collection_dump() -> TestResult {
     with_setup(|| {
@@ -2263,7 +2408,10 @@ fn smoke_abi_netlink_empty_collection_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_empty_collection_dump);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_empty_collection_dump
+);
 
 fn smoke_abi_netlink_uevent_recv() -> TestResult {
     with_setup(|| {
@@ -2290,6 +2438,21 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
         if queued <= 4 {
             return Err("SIOCINQ did not report the pending uevent");
         }
+        let sized = call(
+            Syscall::SocketRecv.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: 0,
+                arg2: 0,
+                arg3: MSG_DONTWAIT | 0x02 | 0x20,
+                arg4: 0,
+                arg5: 0,
+            },
+        )
+        .ok_or("zero-length uevent MSG_PEEK|MSG_TRUNC status")?;
+        if sized != queued {
+            return Err("zero-length uevent probe did not return complete datagram length");
+        }
         let mut short = [0u8; 4];
         let peeked = netlink_recv_flags(fd, &mut short, MSG_DONTWAIT | 0x02 | 0x20)
             .ok_or("uevent MSG_PEEK|MSG_TRUNC status")?;
@@ -2313,7 +2476,7 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_uevent_recv);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_uevent_recv);
 
 // systemd PID 1's audit setup opens `socket(AF_NETLINK, SOCK_RAW, 9)`.
 // Status queries return a disabled audit_status; configuration remains denied
@@ -2352,7 +2515,10 @@ fn smoke_abi_netlink_audit_socket_open_bind_send() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_audit_socket_open_bind_send);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_audit_socket_open_bind_send
+);
 
 fn smoke_abi_netlink_generic_socket_open() -> TestResult {
     with_setup(|| {
@@ -2429,7 +2595,7 @@ fn smoke_abi_netlink_generic_socket_open() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_generic_socket_open);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_generic_socket_open);
 
 fn smoke_abi_netlink_generic_batched_requests() -> TestResult {
     with_setup(|| {
@@ -2467,7 +2633,10 @@ fn smoke_abi_netlink_generic_batched_requests() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_generic_batched_requests);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_generic_batched_requests
+);
 
 fn smoke_abi_netlink_generic_extended_capped_error() -> TestResult {
     with_setup(|| {
@@ -2509,7 +2678,7 @@ fn smoke_abi_netlink_generic_extended_capped_error() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/socket",
     smoke_abi_netlink_generic_extended_capped_error
 );
 
@@ -2566,7 +2735,7 @@ fn smoke_abi_netlink_sock_diag_tcp_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_sock_diag_tcp_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_sock_diag_tcp_dump);
 
 fn smoke_abi_netlink_conntrack_dump() -> TestResult {
     with_setup(|| {
@@ -2613,7 +2782,7 @@ fn smoke_abi_netlink_conntrack_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_conntrack_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_conntrack_dump);
 
 fn smoke_abi_netlink_userspace_unicast_and_unique_portid() -> TestResult {
     with_setup(|| {
@@ -2697,7 +2866,7 @@ fn smoke_abi_netlink_userspace_unicast_and_unique_portid() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/socket",
     smoke_abi_netlink_userspace_unicast_and_unique_portid
 );
 

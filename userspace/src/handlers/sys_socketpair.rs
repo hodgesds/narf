@@ -17,10 +17,8 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
     let cloexec = raw_type & crate::fd::O_CLOEXEC != 0;
     let nonblock = raw_type & crate::fd::O_NONBLOCK != 0;
     // Linux only implements socketpair(2) for AF_UNIX/AF_LOCAL; other
-    // families return EOPNOTSUPP. We back STREAM, SEQPACKET and DGRAM with
-    // the same connected AF_UNIX pair — systemd-udev creates a
-    // SOCK_DGRAM/SOCK_SEQPACKET worker-IPC pair at startup and self-frames
-    // its messages, so byte-stream delivery is sufficient.
+    // families return EOPNOTSUPP. STREAM uses byte-stream delivery;
+    // SEQPACKET and DGRAM retain one record per send.
     let kind_ok = matches!(
         kind,
         crate::socket::SOCK_STREAM | crate::socket::SOCK_SEQPACKET | crate::socket::SOCK_DGRAM
@@ -29,7 +27,7 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
-    let (a, b) = crate::socket::SocketFile::unix_stream_pair();
+    let (a, b) = crate::socket::SocketFile::unix_pair(kind);
     if nonblock {
         a.set_nonblock(true);
         b.set_nonblock(true);
@@ -37,8 +35,11 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
     // Both ends belong to this process; each end's SO_PEERCRED reports the
     // other's owning identity (same process here).
     let cred = current_ucred();
+    let groups = current_groups();
     a.set_local_cred(cred);
     b.set_local_cred(cred);
+    a.set_local_groups(groups.clone());
+    b.set_local_groups(groups);
     crate::socket::SocketFile::cross_peer_creds(&a, &b);
     socket_arc_register(&a);
     socket_arc_register(&b);

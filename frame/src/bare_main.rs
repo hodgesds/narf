@@ -2901,7 +2901,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
     #[cfg(feature = "kernel-test")]
     {
-        narf_verification::run_all_and_exit();
+        let selected = narf_boot::cmdline()
+            .split_ascii_whitespace()
+            .find_map(|arg| arg.strip_prefix("test_subsystem="));
+        match selected {
+            Some(subsystem) if !subsystem.is_empty() => {
+                narf_verification::run_subsystem_and_exit(subsystem)
+            }
+            _ => narf_verification::run_all_and_exit(),
+        }
     }
 
     // Boot-smoke: real init flow + clean ACPI/isa-debug-exit shutdown.

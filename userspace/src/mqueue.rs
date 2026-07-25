@@ -447,6 +447,17 @@ struct InotifyState {
     events: VecDeque<Vec<u8>>,
     /// Monotonic cookie source for pairing IN_MOVED_FROM/IN_MOVED_TO.
     next_cookie: u32,
+    /// Empty-to-nonempty generation used by edge-triggered epoll.
+    readable_token: u64,
+}
+
+impl InotifyState {
+    fn enqueue(&mut self, event: Vec<u8>) {
+        if self.events.is_empty() {
+            self.readable_token = self.readable_token.wrapping_add(1);
+        }
+        self.events.push_back(event);
+    }
 }
 
 static INOTIFY: IrqSafeSpinLock<Option<BTreeMap<u64, InotifyState>>> = IrqSafeSpinLock::new(None);
@@ -567,8 +578,7 @@ fn inotify_dispatch(abs_path: &str, mask: u32, is_dir: bool) {
                 .collect();
             for (wd, _, use_base) in matched {
                 let name = if use_base { base } else { "" };
-                st.events
-                    .push_back(serialize_event(wd, full_mask, cookie, name));
+                st.enqueue(serialize_event(wd, full_mask, cookie, name));
             }
         }
     });
@@ -652,8 +662,7 @@ pub(crate) fn notify_moved(from: &str, to: &str) {
                 .collect();
             for (wd, use_base) in from_hits {
                 let name = if use_base { fb } else { "" };
-                st.events
-                    .push_back(serialize_event(wd, IN_MOVED_FROM, cookie, name));
+                st.enqueue(serialize_event(wd, IN_MOVED_FROM, cookie, name));
             }
             let to_hits: Vec<(i32, bool)> = st
                 .watches
@@ -672,8 +681,7 @@ pub(crate) fn notify_moved(from: &str, to: &str) {
                 .collect();
             for (wd, use_base) in to_hits {
                 let name = if use_base { tb } else { "" };
-                st.events
-                    .push_back(serialize_event(wd, IN_MOVED_TO, cookie, name));
+                st.enqueue(serialize_event(wd, IN_MOVED_TO, cookie, name));
             }
         }
     });
@@ -792,6 +800,7 @@ fn inotify_init_common(ctx: &mut dyn TrapContext, flags: u64) {
                 watches: BTreeMap::new(),
                 events: VecDeque::new(),
                 next_cookie: 0,
+                readable_token: 0,
             },
         )
     });
@@ -951,6 +960,13 @@ impl FileOps for FanotifyFile {
         } else {
             0
         }
+    }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        (
+            with_inotify(|m| m.get(&self.id).map(|s| s.readable_token).unwrap_or(0)),
+            0,
+        )
     }
 
     fn read_should_block(&self) -> bool {

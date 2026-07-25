@@ -7,7 +7,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use core::sync::atomic::Ordering;
@@ -82,15 +82,41 @@ fn write_epoll_event(ptr: u64, events: u32, data: u64) -> Result<(), ()> {
 
 // ── EpollItem — per-fd interest record ──────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct EpollItem {
     fd: i32,
+    /// Weak reference to the open file description captured by
+    /// `EPOLL_CTL_ADD`. A strong reference would keep a socket alive after
+    /// its final descriptor closes and suppress EOF/HUP; a bare fd number
+    /// aliases an unrelated file when the slot is reused.
+    file: Weak<dyn FileOps>,
+    /// Readiness providers that use the file position consult the offset
+    /// captured with this registration. Socket/event sources ignore it.
+    offset: u64,
     /// User-requested interest bits.
     events: u32,
     /// Opaque user data echoed back in every event notification.
     data: u64,
     /// Last readiness mask observed — for EPOLLET edge detection.
     last_mask: u32,
+    /// Source-local state token observed with `last_mask`. This closes the
+    /// drain→new-data→epoll_wait race where the readiness mask is `POLL_IN`
+    /// both before and after a real edge.
+    last_token: (u64, u64),
+}
+
+impl core::fmt::Debug for EpollItem {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EpollItem")
+            .field("fd", &self.fd)
+            .field("file_live", &self.file.strong_count().ne(&0))
+            .field("offset", &self.offset)
+            .field("events", &self.events)
+            .field("data", &self.data)
+            .field("last_mask", &self.last_mask)
+            .field("last_token", &self.last_token)
+            .finish()
+    }
 }
 
 // ── EpollInstance — the core object ──────────────────────────────────
@@ -117,16 +143,19 @@ struct EpollInner {
 /// nests event loops (an inner `wl_event_loop`'s epoll fd is an event source
 /// in the outer loop), so a Wayland compositor blocks on its very first
 /// `epoll_wait` with no wakeup, ever. Polling outside the lock fixes it.
-fn poll_fd_readiness(task_id: u64, fd: i32) -> u32 {
-    if fd < 0 {
-        return 0;
-    }
-    let file = fd::with_table(task_id, |t| {
-        t.get(fd as u32).map(|e| (e.ops.clone(), e.offset))
-    })
-    .flatten();
-    file.map(|(o, offset)| o.poll_readiness_at(offset))
+fn poll_item_readiness(item: &EpollItem) -> u32 {
+    item.file
+        .upgrade()
+        .map(|o| o.poll_readiness_at(item.offset))
         .unwrap_or(0)
+}
+
+/// Provider tokens are directional: tuple element 0 represents readable
+/// transitions and element 1 writable transitions. A hidden read edge must
+/// not manufacture an EPOLLOUT delivery merely because OUT remains level-ready.
+fn token_changed_for_ready(ready: u32, current: (u64, u64), prior: (u64, u64)) -> bool {
+    (ready & EPOLLIN != 0 && current.0 != prior.0)
+        || (ready & EPOLLOUT != 0 && current.1 != prior.1)
 }
 
 impl EpollInstance {
@@ -139,27 +168,48 @@ impl EpollInstance {
     }
 
     /// `EPOLL_CTL_ADD` logic.
-    fn ctl_add(&self, fd: i32, events: u32, data: u64) -> bool {
+    fn ctl_add(
+        &self,
+        fd: i32,
+        file: &Arc<dyn FileOps>,
+        offset: u64,
+        events: u32,
+        data: u64,
+    ) -> bool {
         let mut g = self.inner.lock();
-        if g.interest.contains_key(&fd) {
-            return false; // EEXIST
+        if let Some(existing) = g.interest.get(&fd) {
+            if existing.file.upgrade().is_some() {
+                return false; // EEXIST
+            }
+            // Linux removes an epoll interest when the watched open file's
+            // last descriptor closes. Lazily reap the equivalent dead Weak
+            // entry so a subsequently reused fd number can be added.
+            g.interest.remove(&fd);
         }
         g.interest.insert(
             fd,
             EpollItem {
                 fd,
+                file: Arc::downgrade(file),
+                offset,
                 events,
                 data,
                 last_mask: 0,
+                last_token: (0, 0),
             },
         );
         true
     }
 
     /// `EPOLL_CTL_DEL` logic.
-    fn ctl_del(&self, fd: i32, owner_id: u64) -> bool {
+    fn ctl_del(&self, fd: i32, file: &Arc<dyn FileOps>, owner_id: u64) -> bool {
         let mut g = self.inner.lock();
-        let removed = g.interest.remove(&fd).is_some();
+        let matches = g
+            .interest
+            .get(&fd)
+            .and_then(|item| item.file.upgrade())
+            .is_some_and(|watched| Arc::ptr_eq(&watched, file));
+        let removed = matches && g.interest.remove(&fd).is_some();
         if removed {
             exclusive_release(fd, owner_id);
         }
@@ -167,9 +217,16 @@ impl EpollInstance {
     }
 
     /// `EPOLL_CTL_MOD` logic.
-    fn ctl_mod(&self, fd: i32, events: u32, data: u64) -> bool {
+    fn ctl_mod(&self, fd: i32, file: &Arc<dyn FileOps>, events: u32, data: u64) -> bool {
         let mut g = self.inner.lock();
         if let Some(item) = g.interest.get_mut(&fd) {
+            let same_file = item
+                .file
+                .upgrade()
+                .is_some_and(|watched| Arc::ptr_eq(&watched, file));
+            if !same_file {
+                return false;
+            }
             item.events = events;
             item.data = data;
             true
@@ -211,12 +268,24 @@ impl EpollInstance {
             }
             // Query current readiness — polled outside the fd-table lock so a
             // nested-epoll child can't deadlock on it (see poll_fd_readiness).
-            let cur_mask: u32 = poll_fd_readiness(task_id, *fd);
-            observed.push((*fd, cur_mask));
-
+            // Snapshot the source token before readiness. If I/O races this
+            // poll, the token remains pending for the re-poll forced by the
+            // global readiness-generation park guard.
+            let cur_token = item
+                .file
+                .upgrade()
+                .map(|o| o.poll_edge_token())
+                .unwrap_or((0, 0));
+            let cur_mask: u32 = poll_item_readiness(item);
+            observed.push((*fd, cur_mask, cur_token));
             // Only report events the caller asked for.
             let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
-            let ready = cur_mask & want;
+            // Linux always reports ERR/HUP even when the caller omitted them
+            // from the interest mask. D-Bus and other event loops commonly
+            // request only EPOLLIN|EPOLLOUT and rely on this rule to classify
+            // a disconnected transport instead of treating it as ordinary
+            // readable data.
+            let ready = cur_mask & (want | EPOLLERR | EPOLLHUP);
             if ready == 0 {
                 continue;
             }
@@ -224,7 +293,7 @@ impl EpollInstance {
             // EPOLLET: only report on rising edge.
             if (item.events & EPOLLET) != 0 {
                 let new_bits = ready & !item.last_mask;
-                if new_bits == 0 {
+                if new_bits == 0 && !token_changed_for_ready(ready, cur_token, item.last_token) {
                     continue;
                 }
             }
@@ -242,9 +311,10 @@ impl EpollInstance {
         // while holding this instance's non-reentrant spin lock.
         {
             let mut g = self.inner.lock();
-            for (fd, cur_mask) in observed {
+            for (fd, cur_mask, cur_token) in observed {
                 if let Some(item) = g.interest.get_mut(&fd) {
                     item.last_mask = cur_mask;
+                    item.last_token = cur_token;
 
                     if (item.events & EPOLLONESHOT) != 0 && delivered_fds.contains(&fd) {
                         // Clear all event-interest bits; keep flags.
@@ -265,20 +335,11 @@ impl EpollInstance {
     /// timerfd expiries don't fire a readiness *notify*, so without this a
     /// timerfd armed in an epoll set with an infinite timeout would never
     /// wake the waiter (it parks forever) — the dead-repaint-loop failure.
-    fn nearest_poll_deadline(&self, task_id: u64) -> Option<u64> {
-        let fds: Vec<i32> = self.inner.lock().interest.keys().copied().collect();
+    fn nearest_poll_deadline(&self, _task_id: u64) -> Option<u64> {
+        let items: Vec<EpollItem> = self.inner.lock().interest.values().cloned().collect();
         let mut earliest: Option<u64> = None;
-        for fd in fds {
-            if fd < 0 {
-                continue;
-            }
-            // Snapshot the ops under the fd-table lock, query the
-            // deadline OUTSIDE it — a nested epoll child's
-            // `poll_deadline` re-enters `fd::with_table` (same
-            // re-entrancy as `poll_fd_readiness`).
-            let ops =
-                fd::with_table(task_id, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
-            if let Some(d) = ops.and_then(|o| o.poll_deadline()) {
+        for item in items {
+            if let Some(d) = item.file.upgrade().and_then(|o| o.poll_deadline()) {
                 earliest = Some(earliest.map_or(d, |e| e.min(d)));
             }
         }
@@ -320,31 +381,38 @@ impl FileOps for EpollInstance {
         // `EpollInstance::poll_readiness`), so holding any lock across
         // it risks the same re-entrant deadlock the outer epoll path
         // hit. See `poll_fd_readiness`.
-        let snapshot: Vec<(i32, u32, u32)> = {
+        let snapshot: Vec<EpollItem> = {
             let g = self.inner.lock();
-            g.interest
-                .values()
-                .map(|it| (it.fd, it.events, it.last_mask))
-                .collect()
+            g.interest.values().cloned().collect()
         };
-        let task = current_task_id();
-        for (fd, events, last_mask) in snapshot {
+        for item in snapshot {
+            let events = item.events;
+            let last_mask = item.last_mask;
+            let last_token = item.last_token;
             // Disarmed EPOLLONESHOT items deliver nothing.
             if (events & EPOLLONESHOT) != 0
                 && (events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) == 0
             {
                 continue;
             }
-            let cur = poll_fd_readiness(task, fd);
+            let cur_token = item
+                .file
+                .upgrade()
+                .map(|o| o.poll_edge_token())
+                .unwrap_or((0, 0));
+            let cur = poll_item_readiness(&item);
             let want = events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
-            let ready = cur & want;
+            let ready = cur & (want | EPOLLERR | EPOLLHUP);
             if ready == 0 {
                 continue;
             }
             // EPOLLET: readable only on a rising edge, same as
             // `collect_ready`. (The EPOLLEXCLUSIVE claim is deliberately
             // NOT mirrored — a readiness QUERY must not claim the fd.)
-            if (events & EPOLLET) != 0 && (ready & !last_mask) == 0 {
+            if (events & EPOLLET) != 0
+                && (ready & !last_mask) == 0
+                && !token_changed_for_ready(ready, cur_token, last_token)
+            {
                 continue;
             }
             return narf_filesystem::POLL_IN;
@@ -448,7 +516,7 @@ impl Drop for NestGuard {
 /// leaves. Snapshots each interest set so no epoll lock is held across
 /// the recursive step.
 fn epoll_reaches(
-    task: u64,
+    _task: u64,
     from: &EpollInstance,
     needle: *const EpollInstance,
     depth: u32,
@@ -456,18 +524,15 @@ fn epoll_reaches(
     if depth >= EP_MAX_NESTS {
         return true;
     }
-    let fds: Vec<i32> = from.inner.lock().interest.keys().copied().collect();
-    for fd in fds {
-        if fd < 0 {
-            continue;
-        }
-        let Some(ops) = epoll_ops(task, fd as u32) else {
+    let items: Vec<EpollItem> = from.inner.lock().interest.values().cloned().collect();
+    for item in items {
+        let Some(ops) = item.file.upgrade() else {
             continue;
         };
         let Some(child) = as_epoll(&ops) else {
             continue;
         };
-        if core::ptr::eq(child, needle) || epoll_reaches(task, child, needle, depth + 1) {
+        if core::ptr::eq(child, needle) || epoll_reaches(_task, child, needle, depth + 1) {
             return true;
         }
     }
@@ -555,6 +620,22 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let target = if tfd >= 0 {
+        fd::with_table(task, |t| {
+            t.get(tfd as u32)
+                .map(|entry| (entry.ops.clone(), entry.offset))
+        })
+        .flatten()
+    } else {
+        None
+    };
+    let (target_ops, target_offset) = match target {
+        Some(target) => target,
+        None => {
+            ctx.set_return(fail); // EBADF
+            return;
+        }
+    };
 
     match op {
         EPOLL_CTL_ADD => {
@@ -575,19 +656,13 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
             // unbounded kernel recursion) or nest epolls deeper than
             // EP_MAX_NESTS. Linux returns ELOOP; this file's error
             // convention is a bare -1 (LINUX-GAP: no per-errno codes).
-            if tfd >= 0 {
-                if let Some(target_ops) = epoll_ops(task, tfd as u32) {
-                    if let Some(target) = as_epoll(&target_ops) {
-                        if core::ptr::eq(target, instance)
-                            || epoll_reaches(task, target, instance, 1)
-                        {
-                            ctx.set_return(fail);
-                            return;
-                        }
-                    }
+            if let Some(target) = as_epoll(&target_ops) {
+                if core::ptr::eq(target, instance) || epoll_reaches(task, target, instance, 1) {
+                    ctx.set_return(fail);
+                    return;
                 }
             }
-            if instance.ctl_add(tfd, events, data) {
+            if instance.ctl_add(tfd, &target_ops, target_offset, events, data) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
                 ctx.set_return(fail); // EEXIST
@@ -605,14 +680,14 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
-            if instance.ctl_mod(tfd, events, data) {
+            if instance.ctl_mod(tfd, &target_ops, events, data) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
                 ctx.set_return(fail); // ENOENT
             }
         }
         EPOLL_CTL_DEL => {
-            if instance.ctl_del(tfd, task) {
+            if instance.ctl_del(tfd, &target_ops, task) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
                 ctx.set_return(fail); // ENOENT

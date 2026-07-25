@@ -605,6 +605,18 @@ pub trait FileOps: Send + Sync {
         self.poll_readiness()
     }
 
+    /// Monotonic source-local tokens for edge-triggered readiness.
+    ///
+    /// A readiness provider that can transition away from and back to the
+    /// same readiness mask between two polls should advance one of these
+    /// tokens on every state-changing I/O operation. Epoll uses the tokens
+    /// to distinguish a new edge from a continuously-ready file. The default
+    /// is stable for providers whose readiness is adequately represented by
+    /// the current mask alone.
+    fn poll_edge_token(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
     /// Absolute monotonic-ns instant at which this file will *next*
     /// become readable purely on its own timed schedule, if any.
     ///

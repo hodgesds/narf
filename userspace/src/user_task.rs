@@ -114,6 +114,11 @@ pub struct UserTaskCtx {
     /// `FUTEX_WAKE` on that word wakes this task PROMPTLY (a real blocking
     /// futex, not the old fixed ~1ms nanosleep park). Mirrors `net_io_wait`.
     pub futex_uaddr: AtomicU64,
+    /// Address-space namespace for `FUTEX_PRIVATE` queue lookup. Zero denotes
+    /// a process-shared futex; non-zero is the shared `Arc<AddressSpace>`
+    /// identity, so CLONE_VM threads match while unrelated processes using
+    /// the same virtual address cannot consume each other's wakes.
+    pub futex_namespace: AtomicU64,
     /// Snapshot of the per-uaddr `FUTEX_WAKE` counter taken by `sys_futex`
     /// just before it parks. The poll routine re-reads the live counter after
     /// registering the waker; if it advanced, a wake landed in the
@@ -320,6 +325,7 @@ impl UserTaskCtx {
             net_io_wait: AtomicBool::new(false),
             epoll_park_gen: AtomicU64::new(0),
             futex_uaddr: AtomicU64::new(0),
+            futex_namespace: AtomicU64::new(0),
             futex_park_gen: AtomicU64::new(0),
             futex_val: AtomicU32::new(0),
             pending_exec: AtomicPtr::new(core::ptr::null_mut()),
@@ -639,17 +645,20 @@ fn park_should_block(
             // on the new word with the retargeted gen/val snapshots.
             let fu = uc.futex_uaddr.load(Ordering::Acquire);
             if fu != 0 {
-                crate::handlers::futex_register_waiter(fu, task_id, waker.clone());
+                let key =
+                    crate::handlers::futex_key(uc.futex_namespace.load(Ordering::Acquire), fu);
+                crate::handlers::futex_register_waiter_key(key, task_id, waker.clone());
                 let stay = crate::handlers::futex_park_should_stay(
-                    crate::handlers::futex_gen(fu),
+                    crate::handlers::futex_gen_key(key),
                     uc.futex_park_gen.load(Ordering::Acquire),
                     crate::handlers::futex_read_user_word(fu),
                     uc.futex_val.load(Ordering::Acquire),
                 );
                 if !stay {
-                    crate::handlers::futex_drop_waiter(fu, task_id);
+                    crate::handlers::futex_drop_waiter_key(key, task_id);
                     uc.sleep_deadline_ns.store(0, Ordering::Release);
                     uc.futex_uaddr.store(0, Ordering::Release);
+                    uc.futex_namespace.store(0, Ordering::Release);
                     return false; // wake landed / word changed → re-execute (musl re-checks)
                 }
             }
@@ -734,6 +743,7 @@ fn park_should_block(
         uc.sleep_deadline_ns.store(0, Ordering::Release);
         uc.net_io_wait.store(false, Ordering::Release);
         uc.futex_uaddr.store(0, Ordering::Release);
+        uc.futex_namespace.store(0, Ordering::Release);
         // The waiter-queue entry (if any) is dropped by the re-executed
         // fcntl's exit paths, which know the key; just clear the routing.
         uc.flock_key.store(0, Ordering::Release);

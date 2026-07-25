@@ -29,13 +29,12 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
         return;
     }
     // Optional Unix-peer metadata needs a typed "protocol option unavailable"
-    // result. Callers such as dbus-broker use that to disable label policy or
-    // fall back to NSS for supplementary groups. The generic unknown-option
-    // sentinel is -1 (EPERM to libc) and is treated as fatal.
+    // result. The generic unknown-option sentinel is -1 (EPERM to libc) and is
+    // treated as fatal.
     if level == crate::socket::SOL_SOCKET
         && matches!(
             name,
-            crate::socket::SO_PEERSEC | crate::socket::SO_PEERGROUPS | crate::socket::SO_PEERPIDFD
+            crate::socket::SO_PEERSEC | crate::socket::SO_PEERPIDFD
         )
     {
         const ENOPROTOOPT: i64 = 92;
@@ -62,16 +61,43 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
             // back — dbus-broker et al. compare it against pids they hold.
             // Identity in the root namespace.
             const SOL_SOCKET: u32 = 1;
-            if level == SOL_SOCKET && name == crate::socket::SO_PEERCRED && n >= 4 {
-                let outer = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
-                let visible = report_pid_to(current_task_id(), outer) as u32;
-                buf[0..4].copy_from_slice(&visible.to_ne_bytes());
+            if level == SOL_SOCKET && name == crate::socket::SO_PEERCRED && n >= 12 {
+                let cred = report_ucred_to(
+                    current_task_id(),
+                    crate::socket::Ucred {
+                        pid: u32::from_ne_bytes(buf[0..4].try_into().unwrap()),
+                        uid: u32::from_ne_bytes(buf[4..8].try_into().unwrap()),
+                        gid: u32::from_ne_bytes(buf[8..12].try_into().unwrap()),
+                    },
+                );
+                buf[0..4].copy_from_slice(&cred.pid.to_ne_bytes());
+                buf[4..8].copy_from_slice(&cred.uid.to_ne_bytes());
+                buf[8..12].copy_from_slice(&cred.gid.to_ne_bytes());
+            }
+            if level == SOL_SOCKET && name == crate::socket::SO_PEERGROUPS {
+                let raw: alloc::vec::Vec<u32> = buf[..n]
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                let groups = report_groups_to(current_task_id(), &raw);
+                let translated_n = groups.len() * 4;
+                for (slot, gid) in buf[..translated_n].chunks_exact_mut(4).zip(groups) {
+                    slot.copy_from_slice(&gid.to_ne_bytes());
+                }
+                write_user_u32(len_ptr, translated_n as u32);
+                // SAFETY: val_ptr was range-validated above.
+                let _ = unsafe { copy_to_user(val_ptr, &buf[..translated_n]) };
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
             }
             // Write value + updated optlen back to user under SMAP bracket.
             // SAFETY: val_ptr from userspace; AS active.
             let _ = unsafe { copy_to_user(val_ptr, &buf[..n]) };
             write_user_u32(len_ptr, n as u32);
             ctx.set_return(SyscallReturn::ok(0));
+        }
+        crate::socket::SocketOpResult::Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
         _ => ctx.set_return(fail),
     }

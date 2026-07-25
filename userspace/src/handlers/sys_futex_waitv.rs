@@ -18,6 +18,7 @@ pub(crate) fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
         return;
     }
     let mut park_uaddr = 0u64;
+    let mut park_namespace = 0u64;
     for i in 0..nr {
         let mut entry = [0u8; 24];
         let at = waiters + (i as u64) * 24;
@@ -39,6 +40,8 @@ pub(crate) fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
         }
         if park_uaddr == 0 {
             park_uaddr = uaddr;
+            let entry_flags = u32::from_ne_bytes(entry[16..20].try_into().unwrap()) as u64;
+            park_namespace = futex_namespace((entry_flags & FUTEX_PRIVATE) != 0);
         }
     }
     // Every word still matches: park on the first real word (bounded, like
@@ -46,6 +49,7 @@ pub(crate) fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
     // re-checks all of them).
     futex_wait_core(
         ctx,
+        park_namespace,
         park_uaddr,
         read_user_u32(park_uaddr),
         FUTEX2_PARK_CAP_NS,

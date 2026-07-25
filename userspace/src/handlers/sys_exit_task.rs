@@ -7,7 +7,7 @@ pub(crate) fn sys_exit_task(ctx: &mut dyn TrapContext) {
     let tid = current_task_id();
     let pid = task_to_pid_raw(tid).unwrap_or(tid);
     #[cfg(feature = "syscall-trace")]
-    {
+    if crate::syscall::syscall_trace_target_task() {
         use core::fmt::Write;
         let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
         let _ = writeln!(

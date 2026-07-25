@@ -40,6 +40,8 @@ pub fn clear_task_mems_allowed(task: u64);
 /// Distinct live user address spaces, including currently-polled tasks.
 pub fn all_address_spaces() -> Vec<Arc<AddressSpace>>;
 pub fn set_user_perf_switch_hook(hook: fn(task: u64, running: bool));
+pub fn note_forward_progress();          // bounded completion heartbeat
+pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
 ```
 
 Executor internals: per-CPU queues + global stealing pool; each task
@@ -51,6 +53,10 @@ The optional userspace PMU hook brackets every stackful continuation in
 executor context after run-queue locks have been released. `running=true`
 precedes the switch into the task and `running=false` follows every switch
 back, including preemption and migration.
+The progress counter advances when bounded synchronous waits complete, so a
+long syscall with continuing I/O is not misclassified as a scheduler stall.
+Ordinary background task polls deliberately do not advance it: scheduler churn
+must not hide a foreground task that has stopped making useful progress.
 
 ### 3.2 CPU topology
 

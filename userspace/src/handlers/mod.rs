@@ -4200,10 +4200,9 @@ pub(crate) fn terminate_current_task(
 ) {
     let pid = task_to_pid_raw(task).unwrap_or(task);
     #[cfg(feature = "syscall-trace")]
-    let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
-    #[cfg(feature = "syscall-trace")]
-    {
+    if crate::syscall::syscall_trace_target_task() {
         use core::fmt::Write;
+        let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
         let _ = writeln!(
             narf_console::Writer,
             "[process-exit] kind=signal tid={} pid={} comm={} signal={} core_dumped={} ip={:x}",
@@ -6308,6 +6307,9 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = UIDGID_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
+    if let Some(m) = GROUPS_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
     if let Some(m) = CAP_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
@@ -7345,17 +7347,21 @@ struct UidGid {
 
 static UIDGID_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, UidGid>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+static GROUPS_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, alloc::vec::Vec<u32>>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Initialise the per-task uid/gid registry. Call once at boot
 /// before any user task issues `setuid` / `getuid`.
 pub fn uidgid_init() {
     *UIDGID_TABLE.lock() = Some(BTreeMap::new());
+    *GROUPS_TABLE.lock() = Some(BTreeMap::new());
 }
 
 /// Reset the registry — test hook.
 #[doc(hidden)]
 pub fn __test_uidgid_reset() {
     *UIDGID_TABLE.lock() = Some(BTreeMap::new());
+    *GROUPS_TABLE.lock() = Some(BTreeMap::new());
 }
 
 /// Set a task's (fsuid, fsgid) — test hook for the DAC security smoke.
@@ -7384,11 +7390,80 @@ fn read_uidgid(task: u64) -> UidGid {
 pub fn current_ucred() -> crate::socket::Ucred {
     let task = current_task_id();
     let ids = read_uidgid(task);
+    #[cfg(feature = "container")]
+    let (uid, gid) = {
+        let ns = crate::namespaces::current_user_ns(task);
+        if ns.is_initial() {
+            (ids.euid, ids.egid)
+        } else {
+            (
+                ns.translate_uid_to_host(ids.euid),
+                ns.translate_gid_to_host(ids.egid),
+            )
+        }
+    };
+    #[cfg(not(feature = "container"))]
+    let (uid, gid) = (ids.euid, ids.egid);
     crate::socket::Ucred {
         pid: task_to_pid_raw(task).unwrap_or(task) as u32,
-        uid: ids.euid,
-        gid: ids.egid,
+        uid,
+        gid,
     }
+}
+
+/// Calling task's supplementary groups in host-absolute form, suitable for
+/// capture in a Unix socket peer-credential snapshot.
+pub fn current_groups() -> alloc::vec::Vec<u32> {
+    let task = current_task_id();
+    let groups = read_groups(task);
+    #[cfg(feature = "container")]
+    {
+        let ns = crate::namespaces::current_user_ns(task);
+        if !ns.is_initial() {
+            return groups
+                .into_iter()
+                .map(|gid| ns.translate_gid_to_host(gid))
+                .collect();
+        }
+    }
+    groups
+}
+
+/// Translate host-absolute supplementary groups into the reader's user
+/// namespace. Groups not mapped into that namespace are omitted, matching
+/// Linux's peer-group visibility rules without aliasing them to overflow IDs.
+pub fn report_groups_to(_reader: u64, groups: &[u32]) -> alloc::vec::Vec<u32> {
+    #[cfg(feature = "container")]
+    {
+        let ns = crate::namespaces::current_user_ns(_reader);
+        if !ns.is_initial() {
+            return groups
+                .iter()
+                .filter_map(|gid| ns.translate_gid_from_host(*gid))
+                .collect();
+        }
+    }
+    groups.to_vec()
+}
+
+/// Translate host-absolute socket credentials into `reader`'s PID and user
+/// namespace views. Unmapped uid/gid values surface as the Linux overflow id
+/// instead of aliasing a privileged in-namespace identity.
+pub fn report_ucred_to(reader: u64, mut cred: crate::socket::Ucred) -> crate::socket::Ucred {
+    cred.pid = report_pid_to(reader, cred.pid as u64) as u32;
+    #[cfg(feature = "container")]
+    {
+        let ns = crate::namespaces::current_user_ns(reader);
+        if !ns.is_initial() {
+            cred.uid = ns
+                .translate_uid_from_host(cred.uid)
+                .unwrap_or(crate::namespaces::OVERFLOW_ID);
+            cred.gid = ns
+                .translate_gid_from_host(cred.gid)
+                .unwrap_or(crate::namespaces::OVERFLOW_ID);
+        }
+    }
+    cred
 }
 
 /// SECURITY-CRITICAL single funnel for every filesystem `Accessor`.
@@ -7455,6 +7530,34 @@ pub fn uidgid_fork(parent: u64, child: u64) {
             map.insert(child, v);
         }
     }
+    drop(g);
+    let mut groups = GROUPS_TABLE.lock();
+    if let Some(map) = groups.as_mut() {
+        if let Some(v) = map.get(&parent).cloned() {
+            map.insert(child, v);
+        }
+    }
+}
+
+pub(crate) fn read_groups(task: u64) -> alloc::vec::Vec<u32> {
+    GROUPS_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).cloned())
+        .unwrap_or_default()
+}
+
+pub(crate) fn write_groups(task: u64, groups: alloc::vec::Vec<u32>) -> bool {
+    let mut table = GROUPS_TABLE.lock();
+    let Some(map) = table.as_mut() else {
+        return false;
+    };
+    if groups.is_empty() {
+        map.remove(&task);
+    } else {
+        map.insert(task, groups);
+    }
+    true
 }
 
 fn write_uidgid<F: FnOnce(&mut UidGid)>(task: u64, f: F) -> bool {
@@ -8652,7 +8755,7 @@ fn do_execve_resolved(
     let path: &str = &path_owned;
 
     #[cfg(feature = "syscall-trace")]
-    {
+    if crate::syscall::syscall_trace_target_task() {
         use core::fmt::Write as _;
         let _ = writeln!(narf_console::Writer, "EXECVE path={}", path);
     }
@@ -9840,6 +9943,8 @@ pub(crate) fn sig_from_bit(bits: u64) -> u32 {
 
 pub(crate) static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+static SIGNAL_READABLE_GEN: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 // ── Per-task CPU-time accounting (getrusage / times) ────────────────
 //
@@ -10396,6 +10501,7 @@ fn take_suspend_saved_mask(task: u64) -> Option<u64> {
 /// Pair with `sigaction_init` at boot.
 pub fn signal_init() {
     *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
+    *SIGNAL_READABLE_GEN.lock() = Some(BTreeMap::new());
     *SIGNAL_MASK.lock() = Some(BTreeMap::new());
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
 }
@@ -10404,6 +10510,7 @@ pub fn signal_init() {
 #[doc(hidden)]
 pub fn __test_signal_reset() {
     *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
+    *SIGNAL_READABLE_GEN.lock() = Some(BTreeMap::new());
     *SIGNAL_MASK.lock() = Some(BTreeMap::new());
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
     *SIGQUEUE_INFO.lock() = Some(BTreeMap::new());
@@ -10413,6 +10520,14 @@ pub fn __test_signal_reset() {
 /// Diagnostic: peek the pending bitmap for `task`.
 pub fn signal_pending_of(task: u64) -> u64 {
     SIGNAL_PENDING
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0)
+}
+
+pub fn signal_readable_generation(task: u64) -> u64 {
+    SIGNAL_READABLE_GEN
         .lock()
         .as_ref()
         .and_then(|m| m.get(&task).copied())
@@ -10596,6 +10711,13 @@ pub fn proc_argv_of(pid: u64) -> alloc::vec::Vec<u8> {
 /// the comm-from-argv[0]-basename step ran.
 pub fn proc_comm_of(pid: u64) -> Option<alloc::string::String> {
     let tid = proc_pid_to_tid(pid);
+    proc_comm_of_task(tid)
+}
+
+/// Read the comm table by scheduler task id. Diagnostic filters run before
+/// translating to a user-visible PID and must not feed a TaskId through
+/// `proc_pid_to_tid` a second time.
+pub fn proc_comm_of_task(tid: u64) -> Option<alloc::string::String> {
     let g = PROC_COMM.lock();
     g.as_ref().and_then(|m| m.get(&tid).cloned())
 }
@@ -11112,8 +11234,17 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
         None => return,
     };
     let slot = map.entry(task).or_insert(0);
+    let was_empty = *slot == 0;
     *slot |= sig_bit(signum);
     drop(g);
+    if was_empty {
+        let mut gens = SIGNAL_READABLE_GEN.lock();
+        let generation = gens
+            .get_or_insert_with(BTreeMap::new)
+            .entry(task)
+            .or_insert(0);
+        *generation = generation.wrapping_add(1);
+    }
     // Wake the task if it is parked (sleep/pause) so an asynchronously
     // raised signal — e.g. SIGALRM from an interval timer — is taken
     // promptly rather than only at the next self-driven re-poll.
@@ -11235,7 +11366,18 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
     let mut g = SIGNAL_PENDING.lock();
     if let Some(map) = g.as_mut() {
         if let Some(slot) = map.get_mut(&task) {
+            let was_empty = *slot == 0;
             *slot |= sig_bit(signum);
+            if was_empty {
+                drop(g);
+                let mut gens = SIGNAL_READABLE_GEN.lock();
+                let generation = gens
+                    .get_or_insert_with(BTreeMap::new)
+                    .entry(task)
+                    .or_insert(0);
+                *generation = generation.wrapping_add(1);
+                return true;
+            }
             return true;
         }
     }
@@ -11544,7 +11686,14 @@ const FUTEX_OP_MASK: u64 = !(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
 /// Perform `FUTEX_WAKE_OP` (Linux `kernel/futex/core.c::futex_wake_op`).
 /// `nr_wake`/`nr_wake2` = arg2/arg3, `uaddr2` = arg4, `encoded_op` = arg5.
 /// Returns the syscall result (total woken, or a negative errno).
-fn futex_wake_op(uaddr: u64, nr_wake: u32, nr_wake2: u32, uaddr2: u64, encoded_op: u32) -> i64 {
+fn futex_wake_op(
+    namespace: u64,
+    uaddr: u64,
+    nr_wake: u32,
+    nr_wake2: u32,
+    uaddr2: u64,
+    encoded_op: u32,
+) -> i64 {
     const EFAULT: i64 = 14;
     if uaddr2 == 0 {
         return -EFAULT;
@@ -11581,8 +11730,9 @@ fn futex_wake_op(uaddr: u64, nr_wake: u32, nr_wake2: u32, uaddr2: u64, encoded_o
         return -EFAULT;
     }
     // Wake `nr_wake` on uaddr unconditionally.
-    futex_bump_counter(uaddr);
-    let mut woken = futex_wake_waiters(uaddr, nr_wake) as i64;
+    let key = futex_key(namespace, uaddr);
+    futex_bump_counter_key(key);
+    let mut woken = futex_wake_waiters_key(key, nr_wake) as i64;
     // Conditionally wake `nr_wake2` on uaddr2 if (oldval CMP cmparg).
     let ov = oldval as i32;
     let cond = match cmp {
@@ -11595,8 +11745,9 @@ fn futex_wake_op(uaddr: u64, nr_wake: u32, nr_wake2: u32, uaddr2: u64, encoded_o
         _ => return -22,   // EINVAL
     };
     if cond {
-        futex_bump_counter(uaddr2);
-        woken += futex_wake_waiters(uaddr2, nr_wake2) as i64;
+        let key2 = futex_key(namespace, uaddr2);
+        futex_bump_counter_key(key2);
+        woken += futex_wake_waiters_key(key2, nr_wake2) as i64;
     }
     woken
 }
@@ -11607,8 +11758,30 @@ fn futex_wake_op(uaddr: u64, nr_wake: u32, nr_wake2: u32, uaddr2: u64, encoded_o
 /// "queue + dequeue" — Linux models them as "tagged wakeup events",
 /// and the counter gives us that without per-task ownership, which
 /// keeps the implementation lock-free except for the table mutation.
+#[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct FutexKey {
+    namespace: u64,
+    uaddr: u64,
+}
+
+#[inline]
+pub(crate) fn futex_key(namespace: u64, uaddr: u64) -> FutexKey {
+    FutexKey { namespace, uaddr }
+}
+
+/// Namespace for a futex operation. Private futexes are scoped to the live
+/// AddressSpace Arc; CLONE_VM threads share it, unrelated processes do not.
+fn futex_namespace(private: bool) -> u64 {
+    if !private {
+        return 0;
+    }
+    current_address_space()
+        .map(|space| alloc::sync::Arc::as_ptr(&space) as usize as u64)
+        .unwrap_or(0)
+}
+
 static FUTEX_WAKE_COUNTERS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, u64>>,
+    Option<alloc::collections::BTreeMap<FutexKey, u64>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn futex_table_init() {
@@ -11618,19 +11791,27 @@ fn futex_table_init() {
     }
 }
 
-fn futex_wake_counter(uaddr: u64) -> u64 {
+fn futex_wake_counter_key(key: FutexKey) -> u64 {
     futex_table_init();
     let g = FUTEX_WAKE_COUNTERS.lock();
-    g.as_ref().and_then(|m| m.get(&uaddr).copied()).unwrap_or(0)
+    g.as_ref().and_then(|m| m.get(&key).copied()).unwrap_or(0)
 }
 
-fn futex_bump_counter(uaddr: u64) {
+pub(crate) fn futex_bump_counter_key(key: FutexKey) {
     futex_table_init();
     let mut g = FUTEX_WAKE_COUNTERS.lock();
     if let Some(m) = g.as_mut() {
-        let slot = m.entry(uaddr).or_insert(0);
+        let slot = m.entry(key).or_insert(0);
         *slot = slot.wrapping_add(1);
     }
+}
+
+fn futex_wake_counter(uaddr: u64) -> u64 {
+    futex_wake_counter_key(futex_key(0, uaddr))
+}
+
+fn futex_bump_counter(uaddr: u64) {
+    futex_bump_counter_key(futex_key(0, uaddr));
 }
 
 /// Live per-uaddr `FUTEX_WAKE` generation. The user-task poll routine
@@ -11639,6 +11820,11 @@ fn futex_bump_counter(uaddr: u64) {
 /// (lost-wakeup guard). Public mirror of `futex_wake_counter`.
 pub fn futex_gen(uaddr: u64) -> u64 {
     futex_wake_counter(uaddr)
+}
+
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(crate) fn futex_gen_key(key: FutexKey) -> u64 {
+    futex_wake_counter_key(key)
 }
 
 /// `FUTEX_WAIT` seqlock read: sample the per-uaddr wake generation FIRST,
@@ -11658,7 +11844,14 @@ pub(crate) fn futex_wait_seqlock_read(
     uaddr: u64,
     read_word: impl FnOnce() -> Option<u32>,
 ) -> Option<(u64, u32)> {
-    let gen = futex_wake_counter(uaddr);
+    futex_wait_seqlock_read_key(futex_key(0, uaddr), read_word)
+}
+
+pub(crate) fn futex_wait_seqlock_read_key(
+    key: FutexKey,
+    read_word: impl FnOnce() -> Option<u32>,
+) -> Option<(u64, u32)> {
+    let gen = futex_wake_counter_key(key);
     let current = read_word()?;
     Some((gen, current))
 }
@@ -11680,26 +11873,39 @@ pub fn __test_futex_bump_counter(uaddr: u64) {
 /// overwrites its own slot (bounded) and `futex_drop_waiter` can remove it.
 #[allow(clippy::type_complexity)]
 static FUTEX_WAITERS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, alloc::collections::BTreeMap<u64, core::task::Waker>>>,
+    Option<
+        alloc::collections::BTreeMap<
+            FutexKey,
+            alloc::collections::BTreeMap<u64, core::task::Waker>,
+        >,
+    >,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Register `task_id`'s waker as parked on futex word `uaddr`. Called from
 /// the user-task poll routine while a task blocks in `FUTEX_WAIT`.
 pub fn futex_register_waiter(uaddr: u64, task_id: u64, waker: core::task::Waker) {
+    futex_register_waiter_key(futex_key(0, uaddr), task_id, waker);
+}
+
+pub(crate) fn futex_register_waiter_key(key: FutexKey, task_id: u64, waker: core::task::Waker) {
     let mut g = FUTEX_WAITERS.lock();
     let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    m.entry(uaddr).or_default().insert(task_id, waker);
+    m.entry(key).or_default().insert(task_id, waker);
 }
 
 /// Remove `task_id`'s futex waker on `uaddr` without firing it (the task
 /// woke for another reason — lost-wakeup re-poll, timeout, or exit).
 pub fn futex_drop_waiter(uaddr: u64, task_id: u64) {
+    futex_drop_waiter_key(futex_key(0, uaddr), task_id);
+}
+
+pub(crate) fn futex_drop_waiter_key(key: FutexKey, task_id: u64) {
     let mut g = FUTEX_WAITERS.lock();
     if let Some(m) = g.as_mut() {
-        if let Some(set) = m.get_mut(&uaddr) {
+        if let Some(set) = m.get_mut(&key) {
             set.remove(&task_id);
             if set.is_empty() {
-                m.remove(&uaddr);
+                m.remove(&key);
             }
         }
     }
@@ -11711,12 +11917,16 @@ pub fn futex_drop_waiter(uaddr: u64, task_id: u64) {
 /// clears each woken task's finite sleep deadline so its re-poll falls
 /// through to re-enter user mode (where musl re-checks the futex word).
 fn futex_wake_waiters(uaddr: u64, n: u32) -> usize {
+    futex_wake_waiters_key(futex_key(0, uaddr), n)
+}
+
+pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
     let drained: alloc::vec::Vec<(u64, core::task::Waker)> = {
         let mut g = FUTEX_WAITERS.lock();
         let Some(m) = g.as_mut() else {
             return 0;
         };
-        let Some(set) = m.get_mut(&uaddr) else {
+        let Some(set) = m.get_mut(&key) else {
             return 0;
         };
         // BTreeMap has no pop; collect the first `n` keys then remove them.
@@ -11728,7 +11938,7 @@ fn futex_wake_waiters(uaddr: u64, n: u32) -> usize {
             }
         }
         if set.is_empty() {
-            m.remove(&uaddr);
+            m.remove(&key);
         }
         out
     };
@@ -11765,21 +11975,39 @@ fn futex_requeue_waiters(
     n_move: u32,
     new_val: u32,
 ) -> (usize, usize) {
+    futex_requeue_waiters_keyed(
+        futex_key(0, uaddr),
+        futex_key(0, uaddr2),
+        uaddr2,
+        n_wake,
+        n_move,
+        new_val,
+    )
+}
+
+fn futex_requeue_waiters_keyed(
+    key: FutexKey,
+    key2: FutexKey,
+    uaddr2: u64,
+    n_wake: u32,
+    n_move: u32,
+    new_val: u32,
+) -> (usize, usize) {
     // Wake side first, exactly like FUTEX_WAKE: bump the source generation
     // (so a waiter racing its park registration re-checks), then pop + fire.
-    futex_bump_counter(uaddr);
-    let woken = futex_wake_waiters(uaddr, n_wake);
+    futex_bump_counter_key(key);
+    let woken = futex_wake_waiters_key(key, n_wake);
     if n_move == 0 {
         return (woken, 0);
     }
     // Destination-generation snapshot BEFORE the queue move (see above).
-    let gen2 = futex_wake_counter(uaddr2);
+    let gen2 = futex_wake_counter_key(key2);
     let moved: alloc::vec::Vec<u64> = {
         let mut g = FUTEX_WAITERS.lock();
         let Some(m) = g.as_mut() else {
             return (woken, 0);
         };
-        let Some(set) = m.get_mut(&uaddr) else {
+        let Some(set) = m.get_mut(&key) else {
             return (woken, 0);
         };
         let take: alloc::vec::Vec<u64> = set.keys().take(n_move as usize).copied().collect();
@@ -11791,9 +12019,9 @@ fn futex_requeue_waiters(
             }
         }
         if set.is_empty() {
-            m.remove(&uaddr);
+            m.remove(&key);
         }
-        let dst = m.entry(uaddr2).or_default();
+        let dst = m.entry(key2).or_default();
         let mut tids = alloc::vec::Vec::with_capacity(movers.len());
         for (tid, w) in movers {
             dst.insert(tid, w);
@@ -11808,6 +12036,7 @@ fn futex_requeue_waiters(
             uc.futex_park_gen.store(gen2, Ordering::Release);
             uc.futex_val.store(new_val, Ordering::Release);
             uc.futex_uaddr.store(uaddr2, Ordering::Release);
+            uc.futex_namespace.store(key2.namespace, Ordering::Release);
         });
     }
     (woken, moved.len())
@@ -11876,8 +12105,37 @@ pub fn __test_futex_requeue(uaddr: u64, uaddr2: u64, n_wake: u32, n_move: u32) -
 pub fn __test_futex_waiter_count(uaddr: u64) -> usize {
     let g = FUTEX_WAITERS.lock();
     g.as_ref()
-        .and_then(|m| m.get(&uaddr).map(|s| s.len()))
+        .and_then(|m| m.get(&futex_key(0, uaddr)).map(|s| s.len()))
         .unwrap_or(0)
+}
+
+#[doc(hidden)]
+pub fn __test_futex_register_waiter_scoped(
+    namespace: u64,
+    uaddr: u64,
+    task_id: u64,
+    waker: core::task::Waker,
+) {
+    futex_register_waiter_key(futex_key(namespace, uaddr), task_id, waker);
+}
+
+#[doc(hidden)]
+pub fn __test_futex_wake_scoped(namespace: u64, uaddr: u64, n: u32) -> usize {
+    let key = futex_key(namespace, uaddr);
+    futex_bump_counter_key(key);
+    futex_wake_waiters_key(key, n)
+}
+
+/// Fatal-path futex snapshot: `(live_generation, registered_waiters)`.
+pub fn dbg_futex_state(namespace: u64, uaddr: u64) -> (u64, usize) {
+    let key = futex_key(namespace, uaddr);
+    let generation = futex_wake_counter_key(key);
+    let waiters = FUTEX_WAITERS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&key).map(|set| set.len()))
+        .unwrap_or(0);
+    (generation, waiters)
 }
 
 /// Test-only FUTEX_WAKE equivalent (gen bump + pop-and-fire), so tests can
@@ -11904,7 +12162,13 @@ pub fn futex_wake_waiters_for_test(uaddr: u64, n: u32) -> usize {
 ///
 /// `uaddr == 0` is treated as an immediate (POSIX-permitted) spurious
 /// wake so wake-path smokes can run without a backing mapping.
-fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns: u64) {
+fn futex_wait_core(
+    ctx: &mut dyn TrapContext,
+    namespace: u64,
+    uaddr: u64,
+    val: u32,
+    park_cap_ns: u64,
+) {
     const EAGAIN: i64 = 11;
     const EFAULT: i64 = 14;
     if uaddr == 0 {
@@ -11914,7 +12178,8 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
     // Seqlock read: sample the wake generation BEFORE reading `*uaddr` (see
     // `futex_wait_seqlock_read` — sampling after the read loses a racing
     // FUTEX_WAKE and deadlocks a contended mutex/condvar under SMP).
-    let (gen, current) = match futex_wait_seqlock_read(uaddr, || {
+    let key = futex_key(namespace, uaddr);
+    let (gen, current) = match futex_wait_seqlock_read_key(key, || {
         let mut buf4 = [0u8; 4];
         // SAFETY: copy_from_user range-validates `uaddr` + SMAP-brackets the read.
         if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
@@ -11955,6 +12220,7 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
             // Park-loop word re-validation snapshot (see sys_futex).
             uc.futex_val.store(val, Ordering::Release);
             uc.futex_uaddr.store(uaddr, Ordering::Release);
+            uc.futex_namespace.store(namespace, Ordering::Release);
             uc.sleep_deadline_ns.store(deadline, Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
@@ -13126,18 +13392,24 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
 fn parse_scm_rights_fds(
     ctrl_ptr: u64,
     ctrl_len: usize,
-) -> alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
+) -> Result<alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>>, i64> {
     const SOL_SOCKET: i32 = 1;
     const SCM_RIGHTS: i32 = 1;
     // struct cmsghdr { u64 cmsg_len; i32 cmsg_level; i32 cmsg_type; } = 16 B.
     let mut out = alloc::vec::Vec::new();
-    if ctrl_ptr == 0 || !(16..=MAX_USER_COPY).contains(&ctrl_len) {
-        return out;
+    if ctrl_len == 0 {
+        return Ok(out);
+    }
+    if ctrl_ptr == 0 {
+        return Err(14); // EFAULT
+    }
+    if !(16..=MAX_USER_COPY).contains(&ctrl_len) {
+        return Err(22); // EINVAL
     }
     let mut ctrl = alloc::vec![0u8; ctrl_len];
     // SAFETY: ctrl sized to ctrl_len; copy_from_user range-validates + SMAP.
     if unsafe { copy_from_user(&mut ctrl, ctrl_ptr) }.is_err() {
-        return out;
+        return Err(14); // EFAULT
     }
     let task = current_task_id();
     // Walk cmsg records (8-byte aligned).
@@ -13147,7 +13419,7 @@ fn parse_scm_rights_fds(
         let level = i32::from_le_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
         let ctype = i32::from_le_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
         if cmsg_len < 16 || off + cmsg_len > ctrl_len {
-            break;
+            return Err(22); // EINVAL
         }
         if level == SOL_SOCKET && ctype == SCM_RIGHTS {
             let nfds = (cmsg_len - 16) / 4;
@@ -13155,19 +13427,20 @@ fn parse_scm_rights_fds(
                 let fpos = off + 16 + i * 4;
                 let fd = i32::from_le_bytes(ctrl[fpos..fpos + 4].try_into().unwrap());
                 if fd < 0 {
-                    continue;
+                    return Err(9); // EBADF
                 }
-                if let Some(ops) =
+                let Some(ops) =
                     fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten()
-                {
-                    out.push(ops);
-                }
+                else {
+                    return Err(9); // EBADF: send no payload or partial rights
+                };
+                out.push(ops);
             }
         }
         // Advance to the next cmsg (CMSG_ALIGN to 8 bytes).
         off += (cmsg_len + 7) & !7;
     }
-    out
+    Ok(out)
 }
 
 /// Install kernel-sender credentials and, when requested through
@@ -13220,7 +13493,8 @@ fn install_recv_ancillary(
     msg_ptr: u64,
     fds: alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
     cred: Option<crate::socket::Ucred>,
-) {
+    cloexec: bool,
+) -> bool {
     const SOL_SOCKET: i32 = 1;
     const SCM_RIGHTS: i32 = 1;
     const SCM_CREDENTIALS: i32 = 2;
@@ -13232,21 +13506,31 @@ fn install_recv_ancillary(
         // `copy_to_user` range-validates the user address and SMAP-brackets the
         // write, so a bad pointer returns Err rather than faulting the kernel.
         let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
-        return;
+        return false;
     }
-    // Install each received file object at a fresh fd (SCM_RIGHTS semantics:
-    // the fds are consumed even if the control buffer can't report them).
+    // Only install descriptors that fit in the caller's control buffer.
+    // Installing an fd whose number cannot be reported leaks an unreachable
+    // slot in the receiver. Linux instead closes truncated SCM_RIGHTS entries.
+    let control_capacity = if ctrl_ptr == 0 { 0 } else { ctrl_len };
+    let mut max_rights = control_capacity.saturating_sub(16) / 4;
+    while max_rights > 0 && ((16 + max_rights * 4 + 7) & !7) > control_capacity {
+        max_rights -= 1;
+    }
+    let rights_to_install = core::cmp::min(fds.len(), max_rights);
+    let mut truncated = rights_to_install < fds.len();
     let task = current_task_id();
     let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
-    for ops in fds {
+    for ops in fds.into_iter().take(rights_to_install) {
         let entry = fd::FdEntry {
             ops,
             offset: 0,
-            flags: 0,
+            flags: if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
             status_flags: 0,
         };
         if let Some(newfd) = fd::with_table(task, |t| t.open(entry)) {
             new_fds.push(newfd as i32);
+        } else {
+            truncated = true;
         }
     }
     // Build the control buffer: each cmsg is cmsghdr(16) + data, padded to
@@ -13277,19 +13561,24 @@ fn install_recv_ancillary(
         data[0..4].copy_from_slice(&c.pid.to_le_bytes());
         data[4..8].copy_from_slice(&c.uid.to_le_bytes());
         data[8..12].copy_from_slice(&c.gid.to_le_bytes());
-        push_cmsg(&mut ctrl, SCM_CREDENTIALS, &data);
+        // SCM_RIGHTS precedes SCM_CREDENTIALS. If the latter does not fit,
+        // omit it and report MSG_CTRUNC while retaining any rights that did.
+        if ctrl.len().saturating_add(32) <= control_capacity {
+            push_cmsg(&mut ctrl, SCM_CREDENTIALS, &data);
+        } else {
+            truncated = true;
+        }
     }
-    if ctrl_ptr == 0 || ctrl_len < ctrl.len() {
-        // No room for the control data — any fds are still installed but the
-        // numbers can't be reported (Linux would set MSG_CTRUNC here).
+    if ctrl_ptr == 0 {
         // SAFETY: 8-byte write to `msg_controllen` at `msg_ptr + 40`.
         let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
-        return;
+        return true;
     }
     // SAFETY: ctrl_ptr is the user msg_control buffer, len-checked above.
     let _ = unsafe { copy_to_user(ctrl_ptr, &ctrl) };
     // SAFETY: 8-byte write to `msg_controllen` at `msg_ptr + 40`.
     let _ = unsafe { copy_to_user(msg_ptr + 40, &(ctrl.len() as u64).to_le_bytes()) };
+    truncated
 }
 
 #[inline]

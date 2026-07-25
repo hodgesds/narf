@@ -4,6 +4,8 @@ use super::*;
 pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let uaddr = args.arg0;
+    let namespace = futex_namespace((args.arg1 & FUTEX_PRIVATE) != 0);
+    let key = futex_key(namespace, uaddr);
     let op = args.arg1 & FUTEX_OP_MASK;
     let val = args.arg2 as u32;
     // KNOWN ABI DIVERGENCE: Linux futex(2)'s 4th argument is a `struct
@@ -29,6 +31,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
         // SAFETY: uctx is live for this trap; atomic field.
         unsafe {
             (*uctx).futex_uaddr.store(0, Ordering::Release);
+            (*uctx).futex_namespace.store(0, Ordering::Release);
         }
     }
     // FUTEX_WAIT_BITSET behaves like FUTEX_WAIT for NARF's per-uaddr wait
@@ -46,7 +49,14 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     };
     match op {
         FUTEX_WAKE_OP => {
-            let r = futex_wake_op(uaddr, val, args.arg3 as u32, args.arg4, args.arg5 as u32);
+            let r = futex_wake_op(
+                namespace,
+                uaddr,
+                val,
+                args.arg3 as u32,
+                args.arg4,
+                args.arg5 as u32,
+            );
             ctx.set_return(SyscallReturn::ok(r as u64));
         }
         FUTEX_WAIT => {
@@ -70,7 +80,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // Seqlock read: sample the wake generation BEFORE reading `*uaddr`
             // (see `futex_wait_seqlock_read` — sampling after the read loses a
             // racing FUTEX_WAKE and deadlocks a contended mutex/condvar on SMP).
-            let (gen, current) = match futex_wait_seqlock_read(uaddr, || {
+            let (gen, current) = match futex_wait_seqlock_read_key(key, || {
                 let mut buf4 = [0u8; 4];
                 // SAFETY: `uaddr` is the user futex word pointer (non-zero, checked
                 // above); copy_from_user range-validates it + SMAP-brackets the read.
@@ -87,7 +97,11 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
                 }
             };
             if current != val {
-                ctx.set_return(SyscallReturn::ok(0));
+                // Linux FUTEX_WAIT rejects a stale expected value with
+                // EAGAIN. Returning success here makes pthread state machines
+                // treat a wait that never happened as an actual wake, which
+                // can lose the subsequent handoff.
+                ctx.set_return(SyscallReturn::ok((-11i64) as u64));
                 return;
             }
             // Deadline: a real timeout when one was supplied (wakes at the
@@ -115,6 +129,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
                     // robust-owner death) unparks instead of stranding.
                     uc.futex_val.store(val, Ordering::Release);
                     uc.futex_uaddr.store(uaddr, Ordering::Release);
+                    uc.futex_namespace.store(namespace, Ordering::Release);
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
@@ -135,8 +150,8 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // waiters' wakers. Returns the number actually woken (Linux
             // contract). A waiter not yet registered when we fire is caught
             // by the gen guard on its next poll.
-            futex_bump_counter(uaddr);
-            let woken = futex_wake_waiters(uaddr, val);
+            futex_bump_counter_key(key);
+            let woken = futex_wake_waiters_key(key, val);
             ctx.set_return(SyscallReturn::ok(woken as u64));
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
@@ -175,8 +190,14 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // the movers' next backstop re-check then proceeds to
             // userspace and re-evaluates there (spurious, never lost).
             let new_val = futex_read_user_word(uaddr2).unwrap_or(0);
-            let (woken, moved) =
-                futex_requeue_waiters(uaddr, uaddr2, val, args.arg3 as u32, new_val);
+            let (woken, moved) = futex_requeue_waiters_keyed(
+                key,
+                futex_key(namespace, uaddr2),
+                uaddr2,
+                val,
+                args.arg3 as u32,
+                new_val,
+            );
             let r = if op == FUTEX_CMP_REQUEUE {
                 woken + moved
             } else {

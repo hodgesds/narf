@@ -10,5 +10,11 @@ use super::*;
 /// decode it precisely.
 pub(crate) fn sys_futex_wait(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    futex_wait_core(ctx, args.arg0, args.arg1 as u32, FUTEX2_PARK_CAP_NS);
+    futex_wait_core(
+        ctx,
+        futex_namespace((args.arg3 & FUTEX_PRIVATE) != 0),
+        args.arg0,
+        args.arg1 as u32,
+        FUTEX2_PARK_CAP_NS,
+    );
 }

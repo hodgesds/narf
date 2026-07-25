@@ -86,6 +86,7 @@ pub fn truncate(f: &FileCap, len: u64)                         -> impl Future<Ou
 pub trait FileOps {
     fn poll_readiness(&self) -> u32;
     fn poll_readiness_at(&self, offset: u64) -> u32;
+    fn poll_edge_token(&self) -> (u64, u64);
 }
 ```
 
@@ -93,6 +94,13 @@ All operations submit through `abi/` rings when crossing the
 kernel↔user boundary; kernel-internal callers invoke directly.
 `poll_readiness_at` defaults to `poll_readiness`; offset-sensitive device
 descriptions such as `/dev/kmsg` override it so EOF is not reported readable.
+`poll_edge_token` defaults to `(0, 0)`; stateful readiness providers advance
+one component whenever an edge-relevant source changes so `EPOLLET` cannot
+lose a drain/refill transition between readiness scans.
+
+The devtmpfs-compatible root accepts runtime symlink creation and removal.
+This includes journald's `/dev/log -> /run/systemd/journal/dev-log` alias;
+static device aliases retain precedence over dynamic names.
 
 ### 3.3.1 cgroup-v2 cpuset placement
 
