@@ -627,14 +627,29 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_waitid_wnohang_no_child);
 
 fn smoke_abi_proc_waitid_neg() -> TestResult {
     with_setup(|| {
-        // An unrecognised idtype (3) → EINVAL.
-        match call(Syscall::Waitid.raw(), a3(3, 0, 0, 0)) {
+        // An unrecognised idtype → EINVAL. idtype 3 is P_PIDFD (a *valid*
+        // idtype since Linux 5.4), so 4 is the first genuinely-unknown value.
+        match call(Syscall::Waitid.raw(), a3(4, 0, 0, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("waitid with a bad idtype did not return -EINVAL"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_waitid_neg);
+
+fn smoke_abi_proc_waitid_pidfd_badfd() -> TestResult {
+    with_setup(|| {
+        // idtype 3 = P_PIDFD is a *valid* idtype; `id` is a pidfd. A pidfd
+        // that names no open fd → EBADF (not EINVAL). glibc's
+        // __clone_pidfd_supported() probes exactly this and requires EBADF
+        // to enable pidfd_spawn (systemd 258's only service-exec path).
+        match call(Syscall::Waitid.raw(), a3(3, 0x7fff_ffff, 0, 0)) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("waitid(P_PIDFD, bad fd) did not return -EBADF"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_waitid_pidfd_badfd);
 
 // ── fork(2) / vfork(2) — no live address space in the harness ──
 
