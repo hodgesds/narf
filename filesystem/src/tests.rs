@@ -2767,6 +2767,9 @@ fn smoke_fs_fuse_struct_sizes() -> TestResult {
     if size_of::<FuseDirentPlus>() != 152 {
         return TestResult::Fail("fuse_direntplus header != 152");
     }
+    if size_of::<FuseForgetOne>() != 16 || size_of::<FuseBatchForgetIn>() != 8 {
+        return TestResult::Fail("fuse batch-forget layouts drifted");
+    }
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_struct_sizes);
@@ -2788,7 +2791,7 @@ fn smoke_fs_fuse_request_context() -> TestResult {
 
     install_request_context_provider(context);
     let conn = FuseConnection::new();
-    conn.submit_noreply(FuseOpcode::Forget, 1, &[]);
+    conn.submit_noreply(FuseOpcode::Destroy, 0, &[]);
     let request = conn.dequeue_request();
     __test_reset_request_context_provider();
 
@@ -2848,6 +2851,49 @@ fn smoke_fs_fuse_cache_notifications() -> TestResult {
     }
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_cache_notifications);
+
+fn smoke_fs_fuse_batches_forgets() -> TestResult {
+    use crate::fuse::*;
+    use crate::fuse_conn::FuseConnection;
+
+    let conn = FuseConnection::new();
+    conn.submit_noreply(
+        FuseOpcode::Forget,
+        11,
+        &pod_as_bytes(&FuseForgetIn { nlookup: 2 }),
+    );
+    conn.submit_noreply(
+        FuseOpcode::Forget,
+        12,
+        &pod_as_bytes(&FuseForgetIn { nlookup: 3 }),
+    );
+    let Some(request) = conn.dequeue_request() else {
+        return TestResult::Fail("batched forget missing");
+    };
+    let Some(header) = pod_from_bytes::<FuseInHeader>(&request) else {
+        return TestResult::Fail("batched forget header malformed");
+    };
+    let offset = core::mem::size_of::<FuseInHeader>();
+    let Some(batch) = pod_from_bytes::<FuseBatchForgetIn>(&request[offset..]) else {
+        return TestResult::Fail("batched forget body malformed");
+    };
+    let entries = offset + core::mem::size_of::<FuseBatchForgetIn>();
+    let first = pod_from_bytes::<FuseForgetOne>(&request[entries..]);
+    let second = pod_from_bytes::<FuseForgetOne>(
+        &request[entries + core::mem::size_of::<FuseForgetOne>()..],
+    );
+    if header.opcode == FuseOpcode::BatchForget as u32
+        && batch.count == 2
+        && first.map(|entry| (entry.nodeid, entry.nlookup)) == Some((11, 2))
+        && second.map(|entry| (entry.nodeid, entry.nlookup)) == Some((12, 3))
+        && conn.dequeue_request().is_none()
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("forget requests not coalesced")
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_batches_forgets);
 
 /// Encode a `fuse_out_header` + `body` reply for `unique`.
 fn fuse_reply(unique: u64, error: i32, body: &[u8]) -> alloc::vec::Vec<u8> {

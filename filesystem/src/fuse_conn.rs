@@ -243,10 +243,11 @@ impl FuseConnection {
 
     /// Daemon side: dequeue the next request bytes, if any. Non-blocking.
     pub fn dequeue_request(&self) -> Option<Vec<u8>> {
-        let request = self.pending.lock().pop_front()?;
+        let request = self.take_pending_request(usize::MAX).ok()??;
         if let Some(header) = pod_from_bytes::<FuseInHeader>(&request) {
             if header.opcode != FuseOpcode::Interrupt as u32
                 && header.opcode != FuseOpcode::Forget as u32
+                && header.opcode != FuseOpcode::BatchForget as u32
             {
                 self.delivered.lock().insert(header.unique);
             }
@@ -254,25 +255,85 @@ impl FuseConnection {
         Some(request)
     }
 
+    fn take_pending_request(&self, max_len: usize) -> Result<Option<Vec<u8>>, FsError> {
+        let mut pending = self.pending.lock();
+        let Some(front) = pending.front() else {
+            return Ok(None);
+        };
+        let header: FuseInHeader = pod_from_bytes(front).ok_or(FsError::InvalidData)?;
+        if header.opcode != FuseOpcode::Forget as u32 {
+            if front.len() > max_len {
+                return Err(FsError::InvalidData);
+            }
+            return Ok(pending.pop_front());
+        }
+
+        let fixed =
+            core::mem::size_of::<FuseInHeader>() + core::mem::size_of::<FuseBatchForgetIn>();
+        if max_len < fixed + core::mem::size_of::<FuseForgetOne>() {
+            return Err(FsError::InvalidData);
+        }
+        let max_entries = (max_len - fixed) / core::mem::size_of::<FuseForgetOne>();
+        let mut entries = Vec::new();
+        let mut index = 0;
+        while index < pending.len() && entries.len() < max_entries {
+            let request = &pending[index];
+            let Some(candidate) = pod_from_bytes::<FuseInHeader>(request) else {
+                index += 1;
+                continue;
+            };
+            if candidate.opcode != FuseOpcode::Forget as u32 {
+                index += 1;
+                continue;
+            }
+            let body_offset = core::mem::size_of::<FuseInHeader>();
+            let forget: FuseForgetIn =
+                pod_from_bytes(&request[body_offset..]).ok_or(FsError::InvalidData)?;
+            entries.push(FuseForgetOne {
+                nodeid: candidate.nodeid,
+                nlookup: forget.nlookup,
+            });
+            pending.remove(index);
+        }
+        if entries.is_empty() {
+            return Err(FsError::InvalidData);
+        }
+        let batch = FuseBatchForgetIn {
+            count: entries.len() as u32,
+            dummy: 0,
+        };
+        let total = fixed + entries.len() * core::mem::size_of::<FuseForgetOne>();
+        let mut request = pod_as_bytes(&FuseInHeader {
+            len: total as u32,
+            opcode: FuseOpcode::BatchForget as u32,
+            unique: header.unique,
+            nodeid: 0,
+            uid: header.uid,
+            gid: header.gid,
+            pid: header.pid,
+            _padding: 0,
+        });
+        request.extend_from_slice(&pod_as_bytes(&batch));
+        for entry in entries {
+            request.extend_from_slice(&pod_as_bytes(&entry));
+        }
+        Ok(Some(request))
+    }
+
     /// Copy one complete request into a daemon buffer.
     ///
     /// Linux leaves an oversized request queued and returns `EINVAL`
     /// when the daemon's read buffer is too small.
     fn read_request(&self, buf: &mut [u8]) -> Result<Option<usize>, FsError> {
-        let mut pending = self.pending.lock();
-        let Some(req) = pending.front() else {
+        let Some(request) = self.take_pending_request(buf.len())? else {
             return Ok(None);
         };
-        if buf.len() < req.len() {
-            return Err(FsError::InvalidData);
-        }
-        let n = req.len();
-        buf[..n].copy_from_slice(req);
-        let request = pending.pop_front().expect("front request exists");
-        drop(pending);
+        let n = request.len();
+        buf[..n].copy_from_slice(&request);
         if let Some(header) = pod_from_bytes::<FuseInHeader>(&request) {
             if header.opcode != FuseOpcode::Interrupt as u32
                 && header.opcode != FuseOpcode::Forget as u32
+                && header.opcode != FuseOpcode::BatchForget as u32
             {
                 self.delivered.lock().insert(header.unique);
             }

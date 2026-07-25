@@ -55,6 +55,7 @@ pub enum FuseOpcode {
     Interrupt = 36,
     Destroy = 38,
     Poll = 40,
+    BatchForget = 42,
     Fallocate = 43,
     ReadDirPlus = 44,
     Rename2 = 45,
@@ -562,6 +563,20 @@ pub const FUSE_NOTIFY_DELETE: i32 = 6;
 #[derive(Copy, Clone, Debug, Default)]
 pub struct FuseForgetIn {
     pub nlookup: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseForgetOne {
+    pub nodeid: u64,
+    pub nlookup: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseBatchForgetIn {
+    pub count: u32,
+    pub dummy: u32,
 }
 
 /// `struct fuse_dirent` header — one READDIR entry. The variable-length

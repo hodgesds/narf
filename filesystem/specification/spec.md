@@ -226,6 +226,11 @@ When the daemon negotiates `DO_READDIRPLUS`, directory enumeration uses
 immediate `FORGET` for the otherwise-uncached lookup reference. Daemons
 without the capability continue to receive ordinary `READDIR`.
 
+Pending inode lookup releases are coalesced into Linux `BATCH_FORGET`
+messages when the daemon reads its queue. Coalescing respects the daemon
+buffer size, preserves each `(nodeid, nlookup)` pair, and never creates a
+reply slot because forget operations are one-way.
+
 Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with
 `FsError::InvalidData`; a disconnected daemon fails pending requests
