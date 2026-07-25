@@ -100,6 +100,7 @@ pub struct FuseConnection {
     poll_handles: IrqSafeSpinLock<BTreeMap<u64, PollState>>,
     next_unique: AtomicU64,
     connected: core::sync::atomic::AtomicBool,
+    destroyed: AtomicBool,
     /// Number of distinct `/dev/fuse` daemon endpoints attached to this
     /// connection. `dup()` shares one endpoint; FUSE_DEV_IOC_CLONE creates
     /// another and the connection dies only when the last endpoint closes.
@@ -145,6 +146,7 @@ impl FuseConnection {
             // some versions; any monotone non-zero sequence is spec-legal.
             next_unique: AtomicU64::new(1),
             connected: core::sync::atomic::AtomicBool::new(true),
+            destroyed: AtomicBool::new(false),
             daemon_endpoints: AtomicUsize::new(1),
             initialized: core::sync::atomic::AtomicBool::new(false),
             negotiated_minor: AtomicU32::new(0),
@@ -257,6 +259,20 @@ impl FuseConnection {
                 });
             }
         }
+    }
+
+    fn send_destroy(&self) {
+        if !self.initialized.load(Ordering::Acquire)
+            || !self.is_connected()
+            || self.destroyed.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        // DESTROY is forced during teardown in Linux. There is no caller
+        // left to await it here; unknown late replies are deliberately
+        // consumed by complete_reply, so no reply slot is leaked.
+        self.submit_noreply(FuseOpcode::Destroy, 0, &[]);
+        self.backing_files.lock().clear();
     }
 
     /// Encode `fuse_in_header` + `body` for `opcode`/`nodeid`, enqueue it,
@@ -2209,6 +2225,12 @@ impl FuseFs {
         self.conn.max_pages.store(max_pages, Ordering::Release);
         self.conn.initialized.store(true, Ordering::Release);
         Ok(out)
+    }
+}
+
+impl Drop for FuseFs {
+    fn drop(&mut self) {
+        self.conn.send_destroy();
     }
 }
 

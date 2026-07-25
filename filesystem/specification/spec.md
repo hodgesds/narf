@@ -189,6 +189,11 @@ metadata and lifecycle operations remain on the FUSE connection. Unknown
 IDs, non-zero backing-map flags/padding, and passthrough without successful
 capability negotiation are rejected.
 
+Dropping an initialized `FuseFs` sends exactly one forced `FUSE_DESTROY`
+request with an empty body, retires registered passthrough backings, and
+does not retain an unobserved reply slot. Failed INIT and already-disconnected
+connections do not send DESTROY.
+
 - An empty blocking read parks in the syscall layer; a non-blocking
   read reports `EAGAIN`.
 - A daemon buffer smaller than the next complete request reports

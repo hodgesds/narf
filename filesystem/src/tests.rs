@@ -4181,6 +4181,67 @@ fn smoke_fs_fuse_passthrough_backing_registry() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_passthrough_backing_registry);
 
+fn smoke_fs_fuse_destroy_after_init() -> TestResult {
+    use crate::fuse::{pod_from_bytes, FuseInHeader, FuseOpcode};
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+    let conn = Arc::new(FuseConnection::new());
+    let fs = Arc::new(FuseFs::new("fuse-destroy", Arc::clone(&conn)));
+    narf_scheduler::__reset_queues_for_test();
+
+    let daemon_conn = Arc::clone(&conn);
+    narf_scheduler::spawn(async move {
+        for _ in 0..100_000usize {
+            if let Some(request) = daemon_conn.dequeue_request() {
+                let Some(header) = pod_from_bytes::<FuseInHeader>(&request) else {
+                    OUTCOME.store(2, Ordering::Relaxed);
+                    return;
+                };
+                if header.opcode == FuseOpcode::Init as u32 {
+                    let Some(reply) = fuse_daemon_answer(&request) else {
+                        OUTCOME.store(3, Ordering::Relaxed);
+                        return;
+                    };
+                    let _ = daemon_conn.complete_reply(&reply);
+                } else if header.opcode == FuseOpcode::Destroy as u32
+                    && header.nodeid == 0
+                    && request.len() == core::mem::size_of::<FuseInHeader>()
+                {
+                    OUTCOME.store(1, Ordering::Relaxed);
+                    return;
+                } else {
+                    OUTCOME.store(4, Ordering::Relaxed);
+                    return;
+                }
+            }
+            narf_scheduler::yield_now().await;
+        }
+    });
+
+    narf_scheduler::spawn(async move {
+        if fs.init().await.is_err() {
+            OUTCOME.store(5, Ordering::Relaxed);
+            return;
+        }
+        drop(fs);
+    });
+    narf_scheduler::run_until_empty();
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("FUSE teardown request header malformed"),
+        3 => TestResult::Fail("FUSE_INIT reply construction failed"),
+        4 => TestResult::Fail("unexpected request before FUSE_DESTROY"),
+        5 => TestResult::Fail("FUSE_INIT failed"),
+        _ => TestResult::Fail("FUSE_DESTROY was not delivered"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_destroy_after_init);
+
 /// Test-only unmount helper for the FUSE e2e mounts.
 fn unmount_for_test_fuse(path: &str) -> Result<(), crate::FsError> {
     use narf_capabilities::Cap;
