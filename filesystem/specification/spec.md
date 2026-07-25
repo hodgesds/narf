@@ -260,7 +260,8 @@ client advertises only implemented protocol features, accepts compatible
 short legacy replies by zero-extending them, intersects daemon flags with
 that set, and records the negotiated minor version and write limit on the
 connection. Major versions other than 7 and protocol minors before 7.5
-are rejected.
+are rejected. A failed, malformed, disconnected, or timed-out INIT aborts
+the mount instead of publishing a partially initialized filesystem.
 Protocol 7.45 peers use `FUSE_COPY_FILE_RANGE_64` so successful copies
 can report byte counts beyond `u32`; older peers retain the original
 reply shape.
