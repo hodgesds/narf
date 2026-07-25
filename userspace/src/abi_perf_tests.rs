@@ -469,7 +469,11 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             Some(32) => {}
             _ => return Err("perf stat-format read did not return four u64 words"),
         }
-        if stat_read[2] == 0 || stat_read[3] != id {
+        if stat_read[1] == 0
+            || stat_read[2] == 0
+            || stat_read[2] > stat_read[1]
+            || stat_read[3] != id
+        {
             return Err("perf stat-format time/id fields are invalid");
         }
         if call(

@@ -75,9 +75,10 @@ Gaps:
   implemented software event. Returning cycle-derived estimates for cache,
   branch, or stalled-cycle events is incompatible and invalid for performance
   claims.
-- `time_enabled` and `time_running` are currently equal. That is correct only
-  while no multiplexing occurs. Counter multiplexing must report the actual
-  running interval before more events than hardware slots can be accepted.
+- `time_enabled` measures the complete enabled interval while `time_running`
+  measures only intervals in which a hardware event owns a real PMU slot.
+  Counter multiplexing must rotate ownership and preserve those independently
+  accumulated intervals before more events than hardware slots can be accepted.
 - Raw PMU formats are architecture-specific: sysfs exposes the x86
   event/unit-mask controls or the aarch64 16-bit architectural event number.
   Model-specific event aliases must still be generated from the detected CPU

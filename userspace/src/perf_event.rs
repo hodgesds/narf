@@ -510,6 +510,8 @@ struct PerfEventFile {
     count_accumulated: AtomicU64,
     enabled_at_ns: AtomicU64,
     time_enabled_ns: AtomicU64,
+    running_at_ns: [AtomicU64; narf_lib::percpu::MAX_CPUS],
+    time_running_ns: AtomicU64,
     registered: AtomicBool,
     sample_lost: AtomicU64,
     output_paused: AtomicBool,
@@ -681,6 +683,33 @@ impl core::fmt::Debug for PerfEventFile {
 }
 
 impl PerfEventFile {
+    fn is_task_hardware_event(&self) -> bool {
+        self.attr.type_ != PERF_TYPE_SOFTWARE && self.target_task != u64::MAX
+    }
+
+    fn start_running_at(&self, cpu: usize, now: u64) {
+        let _ = self.running_at_ns[cpu].compare_exchange(
+            0,
+            now.max(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn start_running(&self, cpu: usize) {
+        self.start_running_at(cpu, narf_time::monotonic_ns());
+    }
+
+    fn stop_running(&self, cpu: usize) {
+        let since = self.running_at_ns[cpu].swap(0, Ordering::AcqRel);
+        if since != 0 {
+            self.time_running_ns.fetch_add(
+                narf_time::monotonic_ns().saturating_sub(since),
+                Ordering::AcqRel,
+            );
+        }
+    }
+
     fn tracks_task(&self, task: u64) -> bool {
         self.target_task == task || self.inherited_tasks.lock().contains(&task)
     }
@@ -786,6 +815,7 @@ impl PerfEventFile {
                 ACTIVE_SAMPLE_IDS[cpu][counter.idx as usize].store(self.id, Ordering::Release);
             }
             active[cpu] = Some(counter);
+            self.start_running(cpu);
         } else if let Some(counter) = active[cpu].take() {
             let sample_period = self.sample_period.load(Ordering::Acquire);
             if sample_period != 0 {
@@ -805,6 +835,7 @@ impl PerfEventFile {
             self.count_accumulated.fetch_add(value, Ordering::AcqRel);
             // SAFETY: current-CPU live allocation.
             unsafe { narf_arch::x86_64::pmu::release(counter) };
+            self.stop_running(cpu);
         }
     }
 
@@ -843,6 +874,7 @@ impl PerfEventFile {
                 return;
             }
             active[cpu] = Some(counter);
+            self.start_running(cpu);
         } else if let Some(counter) = active[cpu].take() {
             ACTIVE_SAMPLE_IDS[cpu][counter.sample_slot()].store(0, Ordering::Release);
             // SAFETY: switch-out runs on the CPU owning this active counter.
@@ -852,6 +884,7 @@ impl PerfEventFile {
             self.count_accumulated.fetch_add(value, Ordering::AcqRel);
             // SAFETY: the paused counter remains owned on this CPU.
             let _ = unsafe { counter.release() };
+            self.stop_running(cpu);
         }
     }
 
@@ -861,6 +894,14 @@ impl PerfEventFile {
             let now = narf_time::monotonic_ns();
             self.count_base.store(raw, Ordering::Release);
             self.enabled_at_ns.store(now, Ordering::Release);
+            if !self.is_task_hardware_event() {
+                let cpu = if self.target_cpu >= 0 {
+                    self.target_cpu as usize
+                } else {
+                    narf_lib::percpu::current_cpu()
+                };
+                self.start_running_at(cpu, now);
+            }
             self.last_sample_ns.store(0, Ordering::Release);
             #[cfg(target_arch = "x86_64")]
             {
@@ -925,6 +966,14 @@ impl PerfEventFile {
             let since = self.enabled_at_ns.load(Ordering::Acquire);
             self.time_enabled_ns
                 .fetch_add(now.saturating_sub(since), Ordering::AcqRel);
+            if !self.is_task_hardware_event() {
+                let cpu = if self.target_cpu >= 0 {
+                    self.target_cpu as usize
+                } else {
+                    narf_lib::percpu::current_cpu()
+                };
+                self.stop_running(cpu);
+            }
         }
         self.publish_mmap_state();
     }
@@ -1020,32 +1069,44 @@ impl PerfEventFile {
     fn reset(&self) {
         self.count_accumulated.store(0, Ordering::Release);
         self.time_enabled_ns.store(0, Ordering::Release);
+        self.time_running_ns.store(0, Ordering::Release);
         if self.enabled.load(Ordering::Acquire) {
+            let now = narf_time::monotonic_ns();
             self.count_base.store(self.raw_count(), Ordering::Release);
-            self.enabled_at_ns
-                .store(narf_time::monotonic_ns(), Ordering::Release);
+            self.enabled_at_ns.store(now, Ordering::Release);
+            for running_at in &self.running_at_ns {
+                if running_at.load(Ordering::Acquire) != 0 {
+                    running_at.store(now.max(1), Ordering::Release);
+                }
+            }
         }
         self.publish_mmap_state();
     }
 
-    fn snapshot(&self) -> (u64, u64) {
+    fn snapshot(&self) -> (u64, u64, u64) {
         let mut value = self.count_accumulated.load(Ordering::Acquire);
-        let mut time = self.time_enabled_ns.load(Ordering::Acquire);
+        let mut time_enabled = self.time_enabled_ns.load(Ordering::Acquire);
+        let mut time_running = self.time_running_ns.load(Ordering::Acquire);
+        let now = narf_time::monotonic_ns();
         if self.enabled.load(Ordering::Acquire) {
             value = value.wrapping_add(
                 self.raw_count()
                     .wrapping_sub(self.count_base.load(Ordering::Acquire)),
             );
-            time = time.saturating_add(
-                narf_time::monotonic_ns()
-                    .saturating_sub(self.enabled_at_ns.load(Ordering::Acquire)),
-            );
+            time_enabled = time_enabled
+                .saturating_add(now.saturating_sub(self.enabled_at_ns.load(Ordering::Acquire)));
         }
-        (value, time)
+        for running_at in &self.running_at_ns {
+            let running_since = running_at.load(Ordering::Acquire);
+            if running_since != 0 {
+                time_running = time_running.saturating_add(now.saturating_sub(running_since));
+            }
+        }
+        (value, time_enabled, time_running.min(time_enabled))
     }
 
     fn publish_mmap_state(&self) {
-        let (value, time) = self.snapshot();
+        let (value, time_enabled, time_running) = self.snapshot();
         let mapping = self.mmap.lock();
         let Some(mapping) = mapping.as_ref() else {
             return;
@@ -1056,8 +1117,8 @@ impl PerfEventFile {
         // `index == 0` (the zeroed default) tells userspace that direct RDPMC
         // is unavailable; Linux then treats `offset` as the count snapshot.
         mapping.write_u64(PERF_MMAP_OFFSET_OFFSET, value);
-        mapping.write_u64(PERF_MMAP_TIME_ENABLED_OFFSET, time);
-        mapping.write_u64(PERF_MMAP_TIME_RUNNING_OFFSET, time);
+        mapping.write_u64(PERF_MMAP_TIME_ENABLED_OFFSET, time_enabled);
+        mapping.write_u64(PERF_MMAP_TIME_RUNNING_OFFSET, time_running);
         core::sync::atomic::compiler_fence(Ordering::Release);
         mapping.write_u32(PERF_MMAP_LOCK_OFFSET, sequence.wrapping_add(2));
     }
@@ -1959,7 +2020,7 @@ impl Drop for PerfEventFile {
 impl FileOps for PerfEventFile {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            let (value, time_enabled) = self.snapshot();
+            let (value, time_enabled, time_running) = self.snapshot();
             let format = self.attr.read_format;
             let mut cursor = 0;
 
@@ -1970,7 +2031,7 @@ impl FileOps for PerfEventFile {
                     Self::push_word(buf, &mut cursor, time_enabled)?;
                 }
                 if format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
-                    Self::push_word(buf, &mut cursor, time_enabled)?;
+                    Self::push_word(buf, &mut cursor, time_running)?;
                 }
                 Self::push_word(buf, &mut cursor, value)?;
                 if format & PERF_FORMAT_ID != 0 {
@@ -1984,7 +2045,7 @@ impl FileOps for PerfEventFile {
                         .as_any()
                         .and_then(|any| any.downcast_ref::<PerfEventFile>())
                         .ok_or(FsError::InvalidData)?;
-                    let (member_value, _) = event.snapshot();
+                    let (member_value, _, _) = event.snapshot();
                     Self::push_word(buf, &mut cursor, member_value)?;
                     if format & PERF_FORMAT_ID != 0 {
                         Self::push_word(buf, &mut cursor, event.id)?;
@@ -2003,7 +2064,7 @@ impl FileOps for PerfEventFile {
                     Self::push_word(buf, &mut cursor, time_enabled)?;
                 }
                 if format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
-                    Self::push_word(buf, &mut cursor, time_enabled)?;
+                    Self::push_word(buf, &mut cursor, time_running)?;
                 }
                 if format & PERF_FORMAT_ID != 0 {
                     Self::push_word(buf, &mut cursor, self.id)?;
@@ -2650,6 +2711,8 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             count_accumulated: AtomicU64::new(0),
             enabled_at_ns: AtomicU64::new(0),
             time_enabled_ns: AtomicU64::new(0),
+            running_at_ns: [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS],
+            time_running_ns: AtomicU64::new(0),
             registered: AtomicBool::new(false),
             sample_lost: AtomicU64::new(0),
             output_paused: AtomicBool::new(false),
