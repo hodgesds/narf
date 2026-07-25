@@ -135,6 +135,10 @@ the Linux rtnetlink multicast group for the changed object (link, neighbor,
 IPv4 address, or IPv4 route). Only sockets subscribed through `nl_groups` or
 `NETLINK_ADD_MEMBERSHIP` receive them.
 
+Creation and replacement honor Linux `NLM_F_CREATE`, `NLM_F_EXCL`, and
+`NLM_F_REPLACE` semantics. Duplicate exclusive creates return `EEXIST`;
+replacement or deletion of missing state returns `ENOENT`.
+
 Link dumps include Linux operational-state, carrier, qdisc, queue-length,
 broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero
 until a driver publishes them through the central interface registry.

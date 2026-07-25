@@ -79,6 +79,10 @@ pub const RTM_GETNEXTHOP: u16 = 106;
 pub const NLM_F_REQUEST: u16 = 0x01;
 pub const NLM_F_MULTI: u16 = 0x02;
 pub const NLM_F_ACK: u16 = 0x04;
+pub const NLM_F_REPLACE: u16 = 0x100;
+pub const NLM_F_EXCL: u16 = 0x200;
+pub const NLM_F_CREATE: u16 = 0x400;
+pub const NLM_F_APPEND: u16 = 0x800;
 pub const NLM_F_ROOT: u16 = 0x100;
 pub const NLM_F_MATCH: u16 = 0x200;
 pub const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
@@ -155,6 +159,8 @@ pub const FR_ACT_TO_TBL: u8 = 1;
 /// carried in the `NLMSG_ERROR` payload (negated, per netlink convention).
 pub const EOPNOTSUPP: i32 = 95;
 pub const EPERM: i32 = 1;
+pub const ENOENT: i32 = 2;
+pub const EEXIST: i32 = 17;
 pub const ENODEV: i32 = 19;
 pub const EINVAL: i32 = 22;
 
@@ -660,6 +666,20 @@ fn admin_errno(error: crate::AdminError) -> i32 {
     }
 }
 
+fn validate_new_flags(exists: bool, flags: u16) -> Result<(), i32> {
+    if exists {
+        if flags & NLM_F_EXCL != 0 || flags & NLM_F_REPLACE == 0 {
+            Err(EEXIST)
+        } else {
+            Ok(())
+        }
+    } else if flags & NLM_F_CREATE != 0 {
+        Ok(())
+    } else {
+        Err(ENOENT)
+    }
+}
+
 fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<(), i32> {
     let hdr = parse_hdr(request).ok_or(EINVAL)?;
     let admin = admin.ok_or(EPERM)?;
@@ -716,8 +736,14 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                 return Err(EINVAL);
             }
             let addr: [u8; 4] = addr.try_into().map_err(|_| EINVAL)?;
+            let exists = crate::iface::get_addrs(admin.iface_name())
+                .iter()
+                .any(|(existing, prefix)| existing.0 == addr && *prefix == prefix_len);
             if hdr.msg_type == RTM_NEWADDR {
+                validate_new_flags(exists, hdr.flags)?;
                 admin.add_ipv4(addr, prefix_len).map_err(admin_errno)
+            } else if !exists {
+                Err(ENOENT)
             } else {
                 admin.del_ipv4(addr, prefix_len).map_err(admin_errno)
             }
@@ -761,11 +787,21 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                 None if prefix_len == 0 => [0; 4],
                 None => return Err(EINVAL),
             };
+            let exists = crate::route::route_list().iter().any(|route| {
+                route.iface == admin.iface_name()
+                    && route.dst.addr.0 == dst
+                    && route.dst.prefix_len == prefix_len
+                    && route.table == table
+            });
             if hdr.msg_type == RTM_DELROUTE {
+                if !exists {
+                    return Err(ENOENT);
+                }
                 return admin
                     .del_ipv4_route(dst, prefix_len, table)
                     .map_err(admin_errno);
             }
+            validate_new_flags(exists, hdr.flags)?;
             let gateway = match find_attr(request, 12, RTA_GATEWAY) {
                 Some(raw) if raw.len() == 4 => Some(raw.try_into().map_err(|_| EINVAL)?),
                 Some(_) => return Err(EINVAL),
@@ -813,6 +849,20 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                 Some(_) => return Err(EINVAL),
                 None => None,
             };
+            let exists = match family {
+                AF_INET if dst.len() == 4 => crate::arp::snapshot()
+                    .iter()
+                    .any(|(iface, entry)| iface == admin.iface_name() && entry.ip == dst),
+                AF_INET6 if dst.len() == 16 => crate::ipv6::ndp::neigh_list()
+                    .iter()
+                    .any(|entry| entry.iface == admin.iface_name() && entry.ip == dst),
+                _ => return Err(EINVAL),
+            };
+            if hdr.msg_type == RTM_NEWNEIGH {
+                validate_new_flags(exists, hdr.flags)?;
+            } else if !exists {
+                return Err(ENOENT);
+            }
             match (hdr.msg_type, family) {
                 (RTM_DELNEIGH, AF_INET) if dst.len() == 4 => admin
                     .del_ipv4_neighbor(dst.try_into().map_err(|_| EINVAL)?)

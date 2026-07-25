@@ -402,7 +402,14 @@ fn delegated_admin_can_add_and_delete_ipv4_route() {
         body.extend_from_slice(&0u32.to_ne_bytes());
         push_rtattr(&mut body, RTA_DST, &[198, 51, 100, 0]);
         push_rtattr(&mut body, RTA_OIF, &ifindex.to_ne_bytes());
-        frame_message(kind, NLM_F_REQUEST | NLM_F_ACK, 105, 1, &body)
+        let flags = NLM_F_REQUEST
+            | NLM_F_ACK
+            | if kind == RTM_NEWROUTE {
+                NLM_F_CREATE | NLM_F_EXCL
+            } else {
+                0
+            };
+        frame_message(kind, flags, 105, 1, &body)
     };
 
     let add = build_replies_authorized(&route_request(RTM_NEWROUTE), Some(&admin)).unwrap();
@@ -413,6 +420,15 @@ fn delegated_admin_can_add_and_delete_ipv4_route() {
     assert!(crate::route::route_list().iter().any(|route| {
         route.iface == name && route.dst.addr.0 == [198, 51, 100, 0] && route.dst.prefix_len == 24
     }));
+    let duplicate = build_replies_authorized(&route_request(RTM_NEWROUTE), Some(&admin)).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(
+            duplicate[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap()
+        ),
+        -EEXIST
+    );
 
     let delete = build_replies_authorized(&route_request(RTM_DELROUTE), Some(&admin)).unwrap();
     assert_eq!(
@@ -426,6 +442,15 @@ fn delegated_admin_can_add_and_delete_ipv4_route() {
     assert!(!crate::route::route_list().iter().any(|route| {
         route.iface == name && route.dst.addr.0 == [198, 51, 100, 0] && route.dst.prefix_len == 24
     }));
+    let missing = build_replies_authorized(&route_request(RTM_DELROUTE), Some(&admin)).unwrap();
+    assert_eq!(
+        i32::from_ne_bytes(
+            missing[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap()
+        ),
+        -ENOENT
+    );
 }
 
 #[test]
@@ -451,7 +476,14 @@ fn delegated_admin_can_add_and_delete_ipv4_neighbor() {
         body.extend_from_slice(&[0, 0]);
         push_rtattr(&mut body, NDA_DST, &[203, 0, 113, 9]);
         push_rtattr(&mut body, NDA_LLADDR, &[0x02, 0, 0, 0, 3, 9]);
-        frame_message(kind, NLM_F_REQUEST | NLM_F_ACK, 106, 1, &body)
+        let flags = NLM_F_REQUEST
+            | NLM_F_ACK
+            | if kind == RTM_NEWNEIGH {
+                NLM_F_CREATE | NLM_F_EXCL
+            } else {
+                0
+            };
+        frame_message(kind, flags, 106, 1, &body)
     };
 
     let add = build_replies_authorized(&neighbor_request(RTM_NEWNEIGH), Some(&admin)).unwrap();
