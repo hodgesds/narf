@@ -2800,6 +2800,52 @@ fn smoke_fs_fuse_request_context() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_request_context);
 
+fn smoke_fs_fuse_cache_notifications() -> TestResult {
+    use crate::fuse::*;
+    use crate::fuse_conn::FuseConnection;
+
+    let conn = FuseConnection::new();
+    let inode = fuse_reply(
+        0,
+        FUSE_NOTIFY_INVAL_INODE,
+        &pod_as_bytes(&FuseNotifyInvalInodeOut {
+            ino: 2,
+            offset: 0,
+            len: -1,
+        }),
+    );
+    let mut entry_body = pod_as_bytes(&FuseNotifyInvalEntryOut {
+        parent: FUSE_ROOT_ID,
+        namelen: 5,
+        flags: 0,
+    });
+    entry_body.extend_from_slice(b"hello");
+    let entry = fuse_reply(0, FUSE_NOTIFY_INVAL_ENTRY, &entry_body);
+    let mut delete_body = pod_as_bytes(&FuseNotifyDeleteOut {
+        parent: FUSE_ROOT_ID,
+        child: 2,
+        namelen: 5,
+        padding: 0,
+    });
+    delete_body.extend_from_slice(b"hello");
+    let delete = fuse_reply(0, FUSE_NOTIFY_DELETE, &delete_body);
+
+    if conn.complete_reply(&inode) != Some(inode.len())
+        || conn.complete_reply(&entry) != Some(entry.len())
+        || conn.complete_reply(&delete) != Some(delete.len())
+    {
+        return TestResult::Fail("valid FUSE cache notification rejected");
+    }
+    entry_body.pop();
+    let malformed = fuse_reply(0, FUSE_NOTIFY_INVAL_ENTRY, &entry_body);
+    if conn.complete_reply(&malformed).is_some() {
+        TestResult::Fail("short FUSE cache notification accepted")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_cache_notifications);
+
 /// Encode a `fuse_out_header` + `body` reply for `unique`.
 fn fuse_reply(unique: u64, error: i32, body: &[u8]) -> alloc::vec::Vec<u8> {
     use crate::fuse::*;

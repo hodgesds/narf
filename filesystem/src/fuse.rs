@@ -520,8 +520,36 @@ pub struct FuseNotifyPollWakeupOut {
     pub kh: u64,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseNotifyInvalInodeOut {
+    pub ino: u64,
+    pub offset: i64,
+    pub len: i64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseNotifyInvalEntryOut {
+    pub parent: u64,
+    pub namelen: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseNotifyDeleteOut {
+    pub parent: u64,
+    pub child: u64,
+    pub namelen: u32,
+    pub padding: u32,
+}
+
 pub const FUSE_POLL_SCHEDULE_NOTIFY: u32 = 1;
 pub const FUSE_NOTIFY_POLL: i32 = 1;
+pub const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
+pub const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
+pub const FUSE_NOTIFY_DELETE: i32 = 6;
 
 /// `struct fuse_forget_in` — FORGET request body: the drop count for a
 /// nodeid the client no longer caches. 8 bytes.

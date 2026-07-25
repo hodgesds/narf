@@ -306,6 +306,32 @@ impl FuseConnection {
             }
             return Some(claimed);
         }
+        if hdr.unique == 0 {
+            let valid = match hdr.error {
+                FUSE_NOTIFY_INVAL_INODE => {
+                    let notify: FuseNotifyInvalInodeOut = pod_from_bytes(&body)?;
+                    notify.ino != 0 && body.len() == core::mem::size_of::<FuseNotifyInvalInodeOut>()
+                }
+                FUSE_NOTIFY_INVAL_ENTRY => {
+                    let notify: FuseNotifyInvalEntryOut = pod_from_bytes(&body)?;
+                    notify.parent != 0
+                        && notify.namelen != 0
+                        && body.len()
+                            == core::mem::size_of::<FuseNotifyInvalEntryOut>()
+                                + notify.namelen as usize
+                }
+                FUSE_NOTIFY_DELETE => {
+                    let notify: FuseNotifyDeleteOut = pod_from_bytes(&body)?;
+                    notify.parent != 0
+                        && notify.child != 0
+                        && notify.namelen != 0
+                        && body.len()
+                            == core::mem::size_of::<FuseNotifyDeleteOut>() + notify.namelen as usize
+                }
+                _ => false,
+            };
+            return valid.then_some(claimed);
+        }
         if hdr.error > 0 {
             return None;
         }

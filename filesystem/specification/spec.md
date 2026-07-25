@@ -216,6 +216,11 @@ filesystem uid/gid and visible process id through a boot-installed
 request-context provider. Kernel-only callers retain the zero-valued
 fallback when no userspace provider is installed.
 
+Daemon `INVAL_INODE`, `INVAL_ENTRY`, and `DELETE` notifications are
+wire-validated and accepted. They require no cache mutation while the
+FUSE bridge remains uncached; adding inode, dentry, or page caching must
+attach the corresponding invalidation before enabling that cache.
+
 Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with
 `FsError::InvalidData`; a disconnected daemon fails pending requests
