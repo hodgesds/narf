@@ -2286,7 +2286,10 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
     const GUI_FRESH_BOOT: &[(&str, &str)] = &[
         ("mini_compositor", "px=00c0ffee"),
         ("wl_2proc", "2proc-ok 1280x800 px=00c0ffee"),
-        ("wl_multi", "b=00bada55"),
+        (
+            "busybox sh -c 'wl_multi && echo wl-multi-ok'",
+            "wl-multi-ok",
+        ),
         ("wl_xdg", "xdg-ok 1280x800 px=00c0ffee"),
         ("wl_input", "input-ok 1280x800 key=30"),
         ("wl_kms", "kms-ok 1280x800 px=00c0ffee flip=1"),
