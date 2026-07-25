@@ -34,7 +34,7 @@
 
 use narf_memory::PhysAddr;
 
-use crate::info::{MemRegion, MemRegionKind};
+use crate::info::{BootError, MemRegion, MemRegionKind};
 
 /// Magic at offset 0 of a `hvm_start_info` struct.
 pub const MAGIC: u32 = 0x336e_c578;
@@ -180,13 +180,21 @@ struct HvmModlistEntry {
 /// # Safety
 /// - `info_ptr` must point at a valid `hvm_start_info`.
 /// - `out` must be writable for `out_cap` `MemRegion` entries.
-pub unsafe fn parse_memory_map(info_ptr: usize, out: *mut MemRegion, out_cap: usize) -> usize {
+pub unsafe fn parse_memory_map(
+    info_ptr: usize,
+    out: *mut MemRegion,
+    out_cap: usize,
+) -> Result<usize, BootError> {
     // SAFETY: caller guarantees a valid hvm_start_info at info_ptr.
     let hdr = unsafe { (info_ptr as *const HvmStartInfo).read_unaligned() };
-    if hdr.magic != MAGIC || out_cap == 0 {
-        return 0;
+    if hdr.magic != MAGIC || out_cap == 0 || hdr.memmap_paddr == 0 {
+        return Err(BootError::MalformedBootInfo);
     }
-    let count = (hdr.memmap_entries as usize).min(out_cap);
+    let advertised = hdr.memmap_entries as usize;
+    if advertised > out_cap {
+        return Err(BootError::MemoryMapTooLarge);
+    }
+    let count = advertised;
     let base = hdr.memmap_paddr as usize;
 
     for i in 0..count {
@@ -210,5 +218,5 @@ pub unsafe fn parse_memory_map(info_ptr: usize, out: *mut MemRegion, out_cap: us
             });
         }
     }
-    count
+    Ok(count)
 }

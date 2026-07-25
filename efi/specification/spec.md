@@ -25,12 +25,16 @@ No GPL / Linux source consulted.
   EFI_CERT_X509_GUID, EFI_CERT_SHA256_GUID}`.
 - `system_table::{TableHeader, signature::*, crc32_ieee,
   decode_configuration_table}`.
+- `runtime::{install, is_available, get_time, get_variable,
+  set_variable, reset_system}` provides the validated dispatch surface.
+  It is currently dormant in production: no supported boot path preserves
+  and installs the runtime-services table plus its memory descriptors.
 
 ## Out of scope
 
-- Indirect-call dispatch through the live RT-services function-
-  pointer table — that's arch-specific glue (page-table pinning,
-  EFI calling convention, error-status decoding) that lives in
-  `arch/`.
+- `SetVirtualAddressMap` and architecture page-table pinning for EFI
+  runtime code/data. Enabling the dispatch surface requires a boot-ABI
+  extension carrying the final EFI memory map without violating the
+  aarch64 Linux `x0 = dtb` entry contract.
 - BootServices — not callable post-`ExitBootServices`, not used by
   the kernel.

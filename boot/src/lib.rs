@@ -1,17 +1,15 @@
 //! narf-boot — bootloader handoff.
 //!
 //! Spec: `boot/specification/spec.md`. Stage 1 ships the BootInfo types and
-//! a Wave-1 handoff minimum: parse enough of the bootloader's payload to
-//! expose the UART physical base and a usable RAM window, then hand to
-//! `frame/`. Full `validate_boot_info` (all 6 checks) lands as consumers
-//! appear — Wave 1's single check is "pointer is non-null and inside an
-//! identity-mapped region."
+//! a bounded handoff parser: reject malformed or oversized memory maps,
+//! validate non-overlap and address arithmetic, preserve protocol-owned
+//! firmware pointers, and hand normalized data to `frame/`.
 //!
 //! **Deviation from spec §5 noted:** the spec pins Limine as the sole
 //! Stage-1 bootloader on x86_64, but `cargo xtask run` targets QEMU's
 //! `-kernel` path which supports multiboot2 natively. Stage 1 uses
-//! multiboot2; Limine integration is a future-Limine-CI task that has no
-//! visible behaviour difference at the `frame::init_bsp` hand-off.
+//! multiboot2; Limine's UEFI application converts its firmware handoff to
+//! that same protocol, and the OVMF path is exercised by `xtask iso-boot`.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -25,7 +23,7 @@ pub mod x86_64;
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 
-pub use info::{BootError, BootInfo, MemRegion, MemRegionKind, RawBootInfo};
+pub use info::{validate_memory_map, BootError, BootInfo, MemRegion, MemRegionKind, RawBootInfo};
 
 /// Bootloader-supplied kernel command-line as a `&'static str`.
 /// Empty before the per-arch `parse_raw` runs, or when the loader

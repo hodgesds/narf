@@ -23,6 +23,12 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 
 - `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot.
 - `cargo xtask test --arch=aarch64` — boot + run kernel tests.
+- `cargo xtask iso-boot --arch=x86_64` — build the removable-media
+  image, boot it through OVMF + Limine's `BOOTX64.EFI`, and require
+  the real-init clean-exit marker with no kernel panic.
+- `cargo xtask iso-boot --arch=aarch64` — build a FAT ESP containing
+  `EFI/BOOT/BOOTAA64.EFI`, boot it through AAVMF, and require the same
+  clean-exit marker.
 - `cargo xtask host-test` — run the fast host unit-test allowlist.
   Only hardware-independent crates belong here; privileged, linker-script,
   and device integration coverage remains under `xtask test`.
@@ -77,9 +83,11 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 - Bootloader: Limine by default; multiboot2 supported.
 
 ### aarch64
-- Target: `aarch64-unknown-none-softfloat` (no SIMD in kernel).
+- Kernel target: `aarch64-unknown-none`; EFI loader target:
+  `aarch64-unknown-uefi`.
 - Linker script places kernel per platform (QEMU virt at `0x4008_0000`).
-- Bootloader: U-Boot / EFI stub; devicetree consumed by `boot/`.
+- Bootloader: U-Boot/direct FDT or the AA64 removable-media EFI loader;
+  devicetree consumed by `boot/`.
 
 ## 6. Dependencies
 

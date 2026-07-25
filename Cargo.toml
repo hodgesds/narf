@@ -119,6 +119,7 @@ members = [
 # Scrt1.o `_start` if cargo tries to build them for the host —
 # so they must NOT be workspace members.
 exclude = [
+    "build/uefi-loader",
     "userspace/testbin",
     "userspace/init",
     "userspace/shell",

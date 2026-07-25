@@ -94,13 +94,35 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref_name }}
-      - run: sudo apt-get update && sudo apt-get install -y xorriso limine
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xorriso ovmf qemu-efi-aarch64 \
+            qemu-system-x86 qemu-system-arm \
+            cpio mtools dosfstools e2fsprogs
+      - name: Install Limine
+        uses: ./.github/actions/setup-limine
       - run: rustup component add rust-src llvm-tools-preview
+      # Exercise the removable-media path through OVMF first. This
+      # verification build has boot-smoke enabled and must emit its
+      # serial success marker before exiting through isa-debug-exit.
+      - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask iso-boot --arch=x86_64
+      - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask iso-boot --arch=aarch64
+      # Rebuild without boot-smoke so the published image keeps running.
       - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask image --arch=x86_64
+      - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask image --arch=aarch64
+      - run: |
+          cd target
+          sha256sum narf-x86_64.iso > narf-x86_64.iso.sha256
+          sha256sum narf-aarch64-uefi.img > narf-aarch64-uefi.img.sha256
       - uses: actions/upload-artifact@v4
         with:
-          name: iso-test-image
-          path: target/narf-x86_64.iso
+          name: release-iso
+          path: |
+            target/narf-x86_64.iso
+            target/narf-x86_64.iso.sha256
+            target/narf-aarch64-uefi.img
+            target/narf-aarch64-uefi.img.sha256
 
   publish:
     needs: [validate, packages, iso-test]
@@ -111,6 +133,10 @@ jobs:
           pattern: package-*
           path: assets
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-iso
+          path: assets
       - env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}

@@ -1,0 +1,31 @@
+name: "Set up Limine"
+description: "Install the pinned Limine binary release used to build boot media"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Fetch Limine binary release
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # ubuntu-latest does not provide a `limine` apt package. Fetch the
+        # upstream binary-release commit directly so CI and release builds use
+        # the same reviewed bootloader rather than a moving distribution build.
+        readonly limine_commit=c53e92b039b82650d9d63dfcd6894e4dedd097e8
+        readonly limine_dir="${RUNNER_TEMP}/limine-${limine_commit}"
+
+        if [[ ! -f "${limine_dir}/BOOTX64.EFI" ]]; then
+          rm -rf "${limine_dir}"
+          git init --quiet "${limine_dir}"
+          git -C "${limine_dir}" remote add origin \
+            https://github.com/limine-bootloader/limine.git
+          git -C "${limine_dir}" fetch --quiet --depth=1 origin "${limine_commit}"
+          git -C "${limine_dir}" checkout --quiet --detach FETCH_HEAD
+        fi
+
+        for file in BOOTX64.EFI limine-bios.sys limine-bios-cd.bin limine-uefi-cd.bin; do
+          test -f "${limine_dir}/${file}"
+        done
+
+        echo "LIMINE_PATH=${limine_dir}" >> "${GITHUB_ENV}"
