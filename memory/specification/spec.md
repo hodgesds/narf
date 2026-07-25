@@ -79,6 +79,10 @@ pub struct Mempolicy {
 }
 pub fn mempolicy_set(policy: Mempolicy);
 pub fn mempolicy_clear();
+/// Global Linux MPOL_WEIGHTED_INTERLEAVE ratios (valid weights 1..=255).
+pub fn interleave_weight(node: usize) -> Option<u8>;
+pub fn set_interleave_weight(node: usize, weight: u8) -> Result<(), ()>;
+pub fn peek_interleave_node(mask: u64, weighted: bool) -> usize;
 
 /// Monotonic Linux-compatible allocation-event snapshot for one NUMA node.
 pub fn numa_node_stats(node: usize) -> NumaNodeStats;

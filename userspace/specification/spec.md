@@ -75,6 +75,10 @@ changes; `MPOL_F_RELATIVE_NODES` maps user-mask ordinals into the current
 Both use Linux UAPI bits 15 and 14. `MPOL_PREFERRED_MANY` chooses the
 nearest member of its preferred set by SLIT distance and falls back only
 after preferred nodes are exhausted.
+`MPOL_WEIGHTED_INTERLEAVE` distributes new base-page and hardware-huge-page
+allocations according to the global per-node weights, while still intersecting
+the policy mask with `cpuset.mems`. Weights are configured through Linux's
+`/sys/kernel/mm/mempolicy/weighted_interleave/nodeN` ABI.
 `mbind(MPOL_MF_MOVE)` immediately conforms resident private pages in the
 range, `MPOL_MF_STRICT` reports remaining misplacement as `EIO`, and
 `MPOL_MF_MOVE_ALL` requires authority NARF does not grant ambiently.

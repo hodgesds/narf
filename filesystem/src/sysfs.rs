@@ -1113,6 +1113,39 @@ pub fn populate_numa_nodes() {
     }
 }
 
+/// Populate Linux's manual weighted-interleave controls under
+/// `/sys/kernel/mm/mempolicy/weighted_interleave/nodeN`.
+pub fn populate_weighted_interleave() {
+    const NODE_ATTRS: [&str; 16] = [
+        "node0", "node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8", "node9",
+        "node10", "node11", "node12", "node13", "node14", "node15",
+    ];
+
+    let root = get_root();
+    let kernel = get_or_create_child(&root, "kernel");
+    let mm = get_or_create_child(&kernel, "mm");
+    let mempolicy = get_or_create_child(&mm, "mempolicy");
+    let weighted = get_or_create_child(&mempolicy, "weighted_interleave");
+    let count = (numa_node_count() as usize).clamp(1, NODE_ATTRS.len());
+
+    for (node, &name) in NODE_ATTRS[..count].iter().enumerate() {
+        kobject_add_writable_attr(
+            &weighted,
+            name,
+            move || format!("{}\n", narf_memory::interleave_weight(node).unwrap_or(1)),
+            move |data| {
+                let text = core::str::from_utf8(data).map_err(|_| crate::FsError::InvalidData)?;
+                let weight = text
+                    .trim()
+                    .parse::<u8>()
+                    .map_err(|_| crate::FsError::InvalidData)?;
+                narf_memory::set_interleave_weight(node, weight)
+                    .map_err(|_| crate::FsError::InvalidData)
+            },
+        );
+    }
+}
+
 // ── CPU topology helpers ──────────────────────────────────────────────
 
 /// Build a Linux-style CPU range string for a contiguous range [0, n).
@@ -1531,6 +1564,7 @@ pub fn populate_all() {
     populate_input_class();
     populate_kernel_dir();
     populate_numa_nodes();
+    populate_weighted_interleave();
     populate_cpu_devices();
     // ── Desktop/laptop device classes (single merge-friendly block) ──
     // /sys/class/{leds,power_supply,thermal,hwmon,rtc} for udev / upower /
@@ -1951,6 +1985,34 @@ fn smoke_sysfs_numa_node_live_files() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/sysfs", smoke_sysfs_numa_node_live_files);
+
+fn smoke_sysfs_weighted_interleave_controls() -> TestResult {
+    populate_weighted_interleave();
+    let root = get_root();
+    let Some(weighted) = root
+        .get_child("kernel")
+        .and_then(|k| k.get_child("mm"))
+        .and_then(|mm| mm.get_child("mempolicy"))
+        .and_then(|mp| mp.get_child("weighted_interleave"))
+    else {
+        return TestResult::Fail("weighted_interleave sysfs directory missing");
+    };
+    if weighted.attr_store("node0", b"7\n") != Some(Ok(()))
+        || weighted.attr_show("node0").as_deref() != Some("7\n")
+    {
+        return TestResult::Fail("weighted_interleave node weight did not round-trip");
+    }
+    if !matches!(
+        weighted.attr_store("node0", b"0\n"),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("weighted_interleave accepted zero weight");
+    }
+    // Restore the global default so test order cannot affect allocation smokes.
+    let _ = weighted.attr_store("node0", b"1\n");
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/sysfs", smoke_sysfs_weighted_interleave_controls);
 
 // ── Reset helper for tests ────────────────────────────────────────────
 

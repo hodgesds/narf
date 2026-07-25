@@ -44,6 +44,15 @@ static int starts(const char *hay, const char *pfx) {
 
 static int has(const char *hay, const char *needle) { return strstr(hay, needle) != 0; }
 
+static int put(const char *path, const char *value) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    int len = strlen(value);
+    int n = write(fd, value, len);
+    close(fd);
+    return n == len ? 0 : -1;
+}
+
 int main(void) {
     char buf[1024];
 
@@ -102,6 +111,39 @@ int main(void) {
         return 1;
     }
     munmap(preferred, 4096);
+
+    // Manual weighted interleave must produce the configured 1:3 cycle.
+    if (put("/sys/kernel/mm/mempolicy/weighted_interleave/node0", "1\n") ||
+        put("/sys/kernel/mm/mempolicy/weighted_interleave/node1", "3\n")) {
+        w("numa-fail: weighted-sysfs\n");
+        return 1;
+    }
+    unsigned long both_nodes = 3;
+    if (syscall(SYS_set_mempolicy, 6, &both_nodes, 64) != 0) {
+        w("numa-fail: weighted-set\n");
+        return 1;
+    }
+    unsigned char *weighted = mmap(0, 4 * 4096, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (weighted == MAP_FAILED) {
+        w("numa-fail: weighted-mmap\n");
+        return 1;
+    }
+    void *weighted_pages[4];
+    int weighted_status[4] = { -1, -1, -1, -1 };
+    for (int i = 0; i < 4; i++) {
+        weighted_pages[i] = weighted + i * 4096;
+        weighted[i * 4096] = (unsigned char)i;
+    }
+    if (syscall(SYS_move_pages, 0, 4, weighted_pages, 0,
+                weighted_status, 0) != 0 ||
+        weighted_status[0] != 0 || weighted_status[1] != 1 ||
+        weighted_status[2] != 1 || weighted_status[3] != 1) {
+        w("numa-fail: weighted-placement\n");
+        return 1;
+    }
+    syscall(SYS_set_mempolicy, 0, 0, 0);
+    munmap(weighted, 4 * 4096);
 
     // Real hugetlb mapping smoke. The ordinary suite boots without a
     // reservation and therefore legitimately gets ENOMEM; the dedicated

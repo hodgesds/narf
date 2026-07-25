@@ -3245,6 +3245,7 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
 // them, but they don't affect allocation steering.
 
 const MPOL_PREFERRED_MANY: u32 = 5;
+const MPOL_WEIGHTED_INTERLEAVE: u32 = 6;
 const MPOL_F_RELATIVE_NODES: u32 = 1 << 14;
 const MPOL_F_STATIC_NODES: u32 = 1 << 15;
 const MPOL_MODE_FLAGS: u32 = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES;
@@ -3256,7 +3257,6 @@ extern "Rust" {
     fn narf_numa_node_count() -> u32;
     fn narf_cpu_to_node(cpu: u32) -> u32;
     fn narf_phys_to_node(addr: u64) -> u32;
-    fn narf_node_distance(from: u32, to: u32) -> u32;
 }
 
 #[inline]
@@ -3331,7 +3331,7 @@ static MBIND_TABLE: narf_lib::sync::IrqSafeSpinLock<
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn mpol_mode_valid(mode: u32) -> bool {
-    matches!(mode & !MPOL_MODE_FLAGS, 0..=MPOL_PREFERRED_MANY)
+    matches!(mode & !MPOL_MODE_FLAGS, 0..=MPOL_WEIGHTED_INTERLEAVE)
 }
 
 fn mpol_policy_shape_valid(mode: u32, nodemask: u64) -> bool {
@@ -3342,9 +3342,10 @@ fn mpol_policy_shape_valid(mode: u32, nodemask: u64) -> bool {
     match mode & !MPOL_MODE_FLAGS {
         narf_memory::MPOL_DEFAULT | narf_memory::MPOL_LOCAL => nodemask == 0 && flags == 0,
         narf_memory::MPOL_PREFERRED => nodemask != 0 || flags == 0,
-        narf_memory::MPOL_BIND | narf_memory::MPOL_INTERLEAVE | MPOL_PREFERRED_MANY => {
-            nodemask != 0
-        }
+        narf_memory::MPOL_BIND
+        | narf_memory::MPOL_INTERLEAVE
+        | MPOL_PREFERRED_MANY
+        | MPOL_WEIGHTED_INTERLEAVE => nodemask != 0,
         _ => false,
     }
 }
@@ -3432,93 +3433,6 @@ pub fn publish_mempolicy_for_fault(va: u64) {
 /// Clear the per-CPU active mempolicy after a fault is serviced.
 pub fn clear_mempolicy_for_fault() {
     narf_memory::mempolicy_clear();
-}
-
-/// The node a fresh page under `pol` would be allocated from (used by
-/// get_mempolicy's MPOL_F_NODE|MPOL_F_ADDR query). Mirrors the
-/// allocator's preference resolution without actually allocating.
-fn mempolicy_resolved_node(pol: narf_memory::Mempolicy) -> u32 {
-    let allowed = pol.allowed & ((1u64 << narf_memory::FRAME_MAX_NUMA_NODES) - 1);
-    let first_allowed = if allowed == 0 {
-        0
-    } else {
-        allowed.trailing_zeros()
-    };
-    match pol.mode {
-        x if x == narf_memory::MPOL_BIND => {
-            let preferred = pol.nodemask & allowed;
-            if preferred != 0 {
-                let anchor = if pol.home_node == u32::MAX {
-                    preferred.trailing_zeros()
-                } else {
-                    pol.home_node
-                };
-                let mut best = preferred.trailing_zeros();
-                let mut best_distance = u32::MAX;
-                for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
-                    if (preferred >> node) & 1 == 0 {
-                        continue;
-                    }
-                    // SAFETY: narf-frame provides the topology hook.
-                    let distance = unsafe { narf_node_distance(anchor, node) };
-                    if distance < best_distance || (distance == best_distance && node < best) {
-                        best = node;
-                        best_distance = distance;
-                    }
-                }
-                best
-            } else {
-                first_allowed
-            }
-        }
-        x if x == narf_memory::MPOL_PREFERRED => {
-            let preferred = pol.nodemask & allowed;
-            if preferred != 0 {
-                preferred.trailing_zeros()
-            } else {
-                first_allowed
-            }
-        }
-        x if x == narf_memory::MPOL_PREFERRED_MANY => {
-            let preferred = pol.nodemask & allowed;
-            let anchor = if pol.home_node == u32::MAX {
-                narf_memory::frame::local_node() as u32
-            } else {
-                pol.home_node
-            };
-            let mut best = first_allowed;
-            let mut best_distance = u32::MAX;
-            for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
-                if (preferred >> node) & 1 == 0 {
-                    continue;
-                }
-                // SAFETY: narf-frame provides the topology hook.
-                let distance = unsafe { narf_node_distance(anchor, node) };
-                if distance < best_distance || (distance == best_distance && node < best) {
-                    best = node;
-                    best_distance = distance;
-                }
-            }
-            best
-        }
-        x if x == narf_memory::MPOL_INTERLEAVE => {
-            let interleave = pol.nodemask & allowed;
-            if interleave != 0 {
-                interleave.trailing_zeros()
-            } else {
-                first_allowed
-            }
-        }
-        // DEFAULT / LOCAL
-        _ => {
-            let local = narf_memory::frame::local_node() as u32;
-            if (allowed >> local) & 1 != 0 {
-                local
-            } else {
-                first_allowed
-            }
-        }
-    }
 }
 
 // ── sched_setattr / sched_getattr ────────────────────────────────────

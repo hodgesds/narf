@@ -114,6 +114,9 @@ by SRAT node, and actual translation-leaf size.
 `/sys/devices/system/node/nodeN/{meminfo,numastat,vmstat}` exposes stable
 managed totals, live free/used pages, and the corresponding node-local
 event counters.
+`/sys/kernel/mm/mempolicy/weighted_interleave/nodeN` exposes writable
+decimal weights in Linux's inclusive range 1..=255. Changes affect new
+`MPOL_WEIGHTED_INTERLEAVE` allocations and never migrate existing pages.
 `/proc/buddyinfo` reports live per-order free-block counts, while
 `/proc/zoneinfo` uses stable per-node managed totals and live NUMA events.
 

@@ -97,17 +97,19 @@ pub(crate) fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
             };
             numa_node_for_phys(phys) as i32
         } else if flags & MPOL_F_NODE != 0 {
-            if (policy.mode & !MPOL_MODE_FLAGS) != narf_memory::MPOL_INTERLEAVE {
+            let policy_mode = policy.mode & !MPOL_MODE_FLAGS;
+            if !matches!(
+                policy_mode,
+                narf_memory::MPOL_INTERLEAVE | narf_memory::MPOL_WEIGHTED_INTERLEAVE
+            ) {
                 ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
                 return;
             }
-            let pol = narf_memory::Mempolicy {
-                mode: narf_memory::MPOL_INTERLEAVE,
-                nodemask: mpol_effective_nodemask(policy, narf_scheduler::task_mems_allowed(task)),
-                allowed: narf_scheduler::task_mems_allowed(task),
-                home_node: policy.home_node,
-            };
-            mempolicy_resolved_node(pol) as i32
+            let mask = mpol_effective_nodemask(policy, narf_scheduler::task_mems_allowed(task));
+            narf_memory::peek_interleave_node(
+                mask,
+                policy_mode == narf_memory::MPOL_WEIGHTED_INTERLEAVE,
+            ) as i32
         } else {
             policy.mode as i32
         };

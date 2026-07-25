@@ -30,7 +30,7 @@
 //! that never sets a policy leaves the slot at `MPOL_DEFAULT`, which
 //! reproduces today's local-first behavior exactly.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::frame::{self, FrameAllocError, PhysFrame, MAX_NUMA_NODES};
 
@@ -41,6 +41,7 @@ pub const MPOL_BIND: u32 = 2;
 pub const MPOL_INTERLEAVE: u32 = 3;
 pub const MPOL_LOCAL: u32 = 4;
 pub const MPOL_PREFERRED_MANY: u32 = 5;
+pub const MPOL_WEIGHTED_INTERLEAVE: u32 = 6;
 
 /// Max CPUs whose active policy we track. A CPU index at or above this
 /// falls back to slot 0 (correctness-preserving).
@@ -61,6 +62,15 @@ static ACTIVE_HOME: [AtomicU32; MAX_TRACKED_CPUS] =
 
 /// Per-CPU interleave rotor for `MPOL_INTERLEAVE`.
 static INTERLEAVE_NEXT: [AtomicU32; MAX_TRACKED_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_TRACKED_CPUS];
+
+/// Linux-compatible global weighted-interleave ratios. A weight is never
+/// zero; the sysfs ABI accepts the inclusive range 1..=255.
+static INTERLEAVE_WEIGHTS: [AtomicU8; MAX_NUMA_NODES] =
+    [const { AtomicU8::new(1) }; MAX_NUMA_NODES];
+
+/// Per-CPU position within the expanded weighted schedule.
+static WEIGHTED_INTERLEAVE_NEXT: [AtomicU32; MAX_TRACKED_CPUS] =
     [const { AtomicU32::new(0) }; MAX_TRACKED_CPUS];
 
 #[inline]
@@ -169,6 +179,93 @@ pub(crate) fn next_interleave_node(mask: u64) -> usize {
     interleave_pick(mask)
 }
 
+/// Return the configured global weighted-interleave weight for `node`.
+pub fn interleave_weight(node: usize) -> Option<u8> {
+    INTERLEAVE_WEIGHTS
+        .get(node)
+        .map(|weight| weight.load(Ordering::Acquire))
+}
+
+/// Set one node's global weighted-interleave weight.
+pub fn set_interleave_weight(node: usize, weight: u8) -> Result<(), ()> {
+    if weight == 0 {
+        return Err(());
+    }
+    let Some(slot) = INTERLEAVE_WEIGHTS.get(node) else {
+        return Err(());
+    };
+    slot.store(weight, Ordering::Release);
+    Ok(())
+}
+
+fn weighted_interleave_pick(mask: u64) -> usize {
+    let mut total = 0u32;
+    for (node, weight) in INTERLEAVE_WEIGHTS.iter().enumerate() {
+        if (mask >> node) & 1 != 0 {
+            total += weight.load(Ordering::Acquire) as u32;
+        }
+    }
+    if total == 0 {
+        return 0;
+    }
+    let slot = cpu_slot();
+    let mut target = WEIGHTED_INTERLEAVE_NEXT[slot].fetch_add(1, Ordering::Relaxed) % total;
+    for (node, weight) in INTERLEAVE_WEIGHTS.iter().enumerate() {
+        if (mask >> node) & 1 == 0 {
+            continue;
+        }
+        let weight = weight.load(Ordering::Acquire) as u32;
+        if target < weight {
+            return node;
+        }
+        target -= weight;
+    }
+    mask.trailing_zeros() as usize
+}
+
+pub(crate) fn next_weighted_interleave_node(mask: u64) -> usize {
+    weighted_interleave_pick(mask)
+}
+
+/// Inspect the next interleave target without advancing its schedule.
+pub fn peek_interleave_node(mask: u64, weighted: bool) -> usize {
+    if mask == 0 {
+        return 0;
+    }
+    let slot = cpu_slot();
+    if !weighted {
+        let idx = INTERLEAVE_NEXT[slot].load(Ordering::Relaxed) % mask.count_ones();
+        let mut seen = 0u32;
+        for node in 0..MAX_NUMA_NODES {
+            if (mask >> node) & 1 != 0 {
+                if seen == idx {
+                    return node;
+                }
+                seen += 1;
+            }
+        }
+        return mask.trailing_zeros() as usize;
+    }
+    let total: u32 = INTERLEAVE_WEIGHTS
+        .iter()
+        .enumerate()
+        .filter(|(node, _)| (mask >> node) & 1 != 0)
+        .map(|(_, weight)| weight.load(Ordering::Acquire) as u32)
+        .sum();
+    let mut target = WEIGHTED_INTERLEAVE_NEXT[slot].load(Ordering::Relaxed) % total;
+    for (node, weight) in INTERLEAVE_WEIGHTS.iter().enumerate() {
+        if (mask >> node) & 1 == 0 {
+            continue;
+        }
+        let weight = weight.load(Ordering::Acquire) as u32;
+        if target < weight {
+            return node;
+        }
+        target -= weight;
+    }
+    mask.trailing_zeros() as usize
+}
+
 /// Allocate one frame honoring `policy`, with `local` as the faulting
 /// CPU's node (used by DEFAULT/LOCAL/PREFERRED-empty).
 ///
@@ -188,13 +285,17 @@ pub fn alloc_frame_with(policy: Mempolicy, local: usize) -> Result<PhysFrame, Fr
     }
     match policy.mode {
         MPOL_BIND => alloc_bind(policy.nodemask & allowed, policy.home_node),
-        MPOL_INTERLEAVE => {
+        MPOL_INTERLEAVE | MPOL_WEIGHTED_INTERLEAVE => {
             let mask = if policy.nodemask == 0 {
                 allowed
             } else {
                 policy.nodemask & allowed
             };
-            let node = interleave_pick(mask);
+            let node = if policy.mode == MPOL_WEIGHTED_INTERLEAVE {
+                weighted_interleave_pick(mask)
+            } else {
+                interleave_pick(mask)
+            };
             let result = if unconstrained {
                 frame::alloc_frame_on(node)
             } else {
