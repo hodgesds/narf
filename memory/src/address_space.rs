@@ -19,6 +19,16 @@ use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+/// Serializes creation and replacement of externally-owned shared aliases.
+/// The closure must not await or enter code that can recursively map SHARED
+/// memory.
+static SHARED_MAPPING_TRANSACTION: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
+
+pub fn with_shared_mapping_transaction<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = SHARED_MAPPING_TRANSACTION.lock();
+    f()
+}
+
 use crate::addr::{PhysAddr, VirtAddr};
 
 /// Region permission flags. Mirrors ELF `PF_*` so the loader doesn't
@@ -552,6 +562,14 @@ impl AddressSpace {
     /// NOT program the page table — that lives in `arch/`. Checks
     /// for overlap with existing regions and 4 KiB alignment.
     pub fn map_region(&self, region: Region) -> Result<(), AddressSpaceError> {
+        let _shared_guard = region
+            .perms
+            .contains(RegionPerms::SHARED)
+            .then(|| SHARED_MAPPING_TRANSACTION.lock());
+        self.map_region_inner(region)
+    }
+
+    fn map_region_inner(&self, region: Region) -> Result<(), AddressSpaceError> {
         if region.base.as_u64() & 0xFFF != 0 || region.len & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
@@ -621,6 +639,131 @@ impl AddressSpace {
         // mmap range so a later `reserve_mmap_va` can't collide with it.
         self.bump_mmap_cursor_past(rb, rl);
         Ok(())
+    }
+
+    /// Register a SHARED region while the caller already holds
+    /// [`with_shared_mapping_transaction`].
+    ///
+    /// # Safety
+    /// The caller must hold that transaction across acquisition of the
+    /// external owner's frame snapshot and this call.
+    pub unsafe fn map_shared_region_locked(&self, region: Region) -> Result<(), AddressSpaceError> {
+        if !region.perms.contains(RegionPerms::SHARED) {
+            return Err(AddressSpaceError::SharedMapping);
+        }
+        self.map_region_inner(region)
+    }
+
+    /// Replace every base-page alias of one externally-owned shared frame in
+    /// this address space without freeing either frame.
+    ///
+    /// Callers must hold [`with_shared_mapping_transaction`] across the
+    /// complete cross-address-space update and backing-owner commit.
+    ///
+    /// Returns the number of aliases replaced.
+    ///
+    /// # Safety
+    /// `old_phys` and `new_phys` must be live page-aligned frames, and the
+    /// caller must roll all previously updated address spaces back if this
+    /// operation fails.
+    pub unsafe fn replace_shared_frame(
+        &self,
+        old_phys: PhysAddr,
+        new_phys: PhysAddr,
+    ) -> Result<usize, AddressSpaceError> {
+        let mut regions = self.regions.lock();
+        let aliases: Vec<(usize, usize, VirtAddr, RegionPerms)> = regions
+            .iter()
+            .enumerate()
+            .flat_map(|(region_idx, region)| {
+                region
+                    .phys
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, phys)| {
+                        region.perms.contains(RegionPerms::SHARED) && **phys == old_phys
+                    })
+                    .map(move |(page_idx, _)| {
+                        (
+                            region_idx,
+                            page_idx,
+                            VirtAddr::new(region.base.as_u64() + page_idx as u64 * 4096),
+                            region.perms,
+                        )
+                    })
+            })
+            .collect();
+
+        let mut replaced = 0usize;
+        for &(region_idx, page_idx, page_va, perms) in &aliases {
+            // SAFETY: the caller guarantees a live root and both physical
+            // frames; each alias was revalidated under the region lock.
+            let result = unsafe {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use crate::x86_64::paging::{map_4kb, unmap_4kb_local, PtFlags};
+                    let mut flags = PtFlags::USER;
+                    if perms.contains(RegionPerms::WRITE) {
+                        flags |= PtFlags::WRITABLE;
+                    }
+                    if !perms.contains(RegionPerms::EXEC) {
+                        flags |= PtFlags::NO_EXEC;
+                    }
+                    let _ = unmap_4kb_local(self.root, page_va);
+                    map_4kb(self.root, page_va, new_phys, flags)
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
+                    let mut flags = PtFlags::AP_RW_EL1;
+                    if !perms.contains(RegionPerms::EXEC) {
+                        flags = flags | PtFlags::UXN | PtFlags::PXN;
+                    }
+                    let _ = unmap_4kb(self.root, page_va);
+                    map_4kb(self.root, page_va, new_phys, flags)
+                }
+            };
+            if result.is_err() {
+                for &(rollback_region, rollback_page, rollback_va, rollback_perms) in
+                    aliases[..replaced].iter().rev()
+                {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use crate::x86_64::paging::{map_4kb, unmap_4kb_local, PtFlags};
+                        let mut flags = PtFlags::USER;
+                        if rollback_perms.contains(RegionPerms::WRITE) {
+                            flags |= PtFlags::WRITABLE;
+                        }
+                        if !rollback_perms.contains(RegionPerms::EXEC) {
+                            flags |= PtFlags::NO_EXEC;
+                        }
+                        // SAFETY: exact inverse replacement under the same
+                        // root/frame lifetime contract.
+                        unsafe {
+                            let _ = unmap_4kb_local(self.root, rollback_va);
+                            let _ = map_4kb(self.root, rollback_va, old_phys, flags);
+                        }
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
+                        let mut flags = PtFlags::AP_RW_EL1;
+                        if !rollback_perms.contains(RegionPerms::EXEC) {
+                            flags = flags | PtFlags::UXN | PtFlags::PXN;
+                        }
+                        let _ = unsafe { unmap_4kb(self.root, rollback_va) };
+                        let _ = unsafe { map_4kb(self.root, rollback_va, old_phys, flags) };
+                    }
+                    regions[rollback_region].phys[rollback_page] = old_phys;
+                    self.flush_region_broadcast(rollback_va, 1);
+                }
+                return Err(AddressSpaceError::NotImplemented);
+            }
+            regions[region_idx].phys[page_idx] = new_phys;
+            self.flush_region_broadcast(page_va, 1);
+            replaced += 1;
+        }
+        Ok(replaced)
     }
 
     /// Install an owned hardware huge-page region and transfer ownership of
@@ -2660,6 +2803,9 @@ impl AddressSpace {
     ///   WRITE) before either is re-activated.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError> {
+        // Exclude shared-page migration until the child has a complete alias
+        // table. The child is not scheduler-visible during construction.
+        let _shared_guard = SHARED_MAPPING_TRANSACTION.lock();
         // SAFETY: caller's contract — paging is live.
         let child = unsafe { Self::new_for_user() }?;
 
@@ -2710,7 +2856,7 @@ impl AddressSpace {
         // (post-strip) — same vaddr base, same phys list, same
         // (now WRITE-stripped) perms.
         for r in parent_regions.into_iter() {
-            child.map_region(r)?;
+            child.map_region_inner(r)?;
         }
 
         // Private hugetlb mappings are copied eagerly. The hugepage pool has

@@ -37,6 +37,8 @@ pub fn donate_to(task: TaskId) -> impl Future<Output=()>; // direct context tran
 pub fn set_task_mems_allowed(task: u64, mask: u64);
 pub fn task_mems_allowed(task: u64) -> u64;
 pub fn clear_task_mems_allowed(task: u64);
+/// Distinct live user address spaces, including currently-polled tasks.
+pub fn all_address_spaces() -> Vec<Arc<AddressSpace>>;
 ```
 
 Executor internals: per-CPU queues + global stealing pool; each task

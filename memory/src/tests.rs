@@ -6830,3 +6830,68 @@ fn smoke_mempolicy_allowed_mask_is_hard_boundary() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_mempolicy_allowed_mask_is_hard_boundary);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_shared_frame_replacement_updates_all_aliases() -> TestResult {
+    use crate::x86_64::paging;
+    use crate::{AddressSpace, PhysFrame, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: test context has paging enabled and owns both fresh roots.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(aspace) => aspace,
+        Err(_) => return TestResult::Skip("first AS allocation failed"),
+    };
+    // SAFETY: same as above.
+    let b = match unsafe { AddressSpace::new_for_user() } {
+        Ok(aspace) => aspace,
+        Err(_) => return TestResult::Skip("second AS allocation failed"),
+    };
+    let old = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("source allocation failed"),
+    };
+    let new = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("target allocation failed"),
+    };
+    let va_a = VirtAddr::new(0x0000_4090_0000_0000);
+    let va_b = VirtAddr::new(0x0000_4091_0000_0000);
+    for (aspace, va) in [(&a, va_a), (&b, va_b)] {
+        aspace
+            .map_region(Region {
+                base: va,
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+                phys: alloc::vec![old],
+            })
+            .expect("register shared alias");
+        // SAFETY: fresh valid root and registered live frame.
+        unsafe { aspace.materialize() }.expect("materialize shared alias");
+    }
+    let replaced = crate::with_shared_mapping_transaction(|| {
+        // SAFETY: both frames and roots remain live for the transaction.
+        let left = unsafe { a.replace_shared_frame(old, new) };
+        // SAFETY: same transaction and lifetime proof.
+        let right = unsafe { b.replace_shared_frame(old, new) };
+        (left, right)
+    });
+    // SAFETY: read-only walks of live page-table roots.
+    let translated = unsafe {
+        (
+            paging::translate(a.root, va_a),
+            paging::translate(b.root, va_b),
+        )
+    };
+    drop(a);
+    drop(b);
+    crate::free_frame(PhysFrame::new(old));
+    crate::free_frame(PhysFrame::new(new));
+    match (replaced, translated) {
+        ((Ok(1), Ok(1)), (Some(left), Some(right))) if left == new && right == new => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("shared aliases did not move together"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_shared_frame_replacement_updates_all_aliases);

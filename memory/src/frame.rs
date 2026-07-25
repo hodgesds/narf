@@ -234,7 +234,20 @@ struct HotplugRange {
 }
 
 static HOTPLUG_RANGES: IrqSafeSpinLock<Vec<HotplugRange>> = IrqSafeSpinLock::new(Vec::new());
+static BOOT_MEMORY_RANGES: IrqSafeSpinLock<Vec<(u64, u64)>> = IrqSafeSpinLock::new(Vec::new());
 static ONLINE_NODE_MASK: AtomicU64 = AtomicU64::new(1);
+
+/// Linux-compatible logical memory-block size. Linux's generic default is
+/// 128 MiB; keeping this fixed makes block ids stable across hotplug events.
+pub const MEMORY_BLOCK_SIZE: u64 = 128 * 1024 * 1024;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MemoryBlock {
+    pub id: u64,
+    pub start: u64,
+    pub node: usize,
+    pub online: bool,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MemoryHotplugError {
@@ -270,6 +283,15 @@ pub struct UsableRegion {
 ///   violating this hands out bogus frames that will fault on first
 ///   touch.
 pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
+    {
+        let mut ranges = BOOT_MEMORY_RANGES.lock();
+        ranges.clear();
+        ranges.extend(usable.iter().filter_map(|region| {
+            let start = region.start.raw() & !(PAGE_SIZE - 1);
+            let end = region.start.raw().checked_add(region.len)?;
+            (start < end).then_some((start, end - start))
+        }));
+    }
     let mut total = 0usize;
     let mut reserved = 0usize;
     let mut guard = ALLOC.lock();
@@ -1375,6 +1397,62 @@ pub fn hotplug_node_for_phys(addr: u64) -> Option<usize> {
         .iter()
         .find(|range| addr >= range.start && addr < range.start + range.len)
         .map(|range| range.node)
+}
+
+/// Snapshot Linux-style logical memory blocks from authoritative boot RAM and
+/// currently-online hotplug ranges. A block is listed once even when adjacent
+/// firmware ranges overlap it.
+pub fn memory_blocks() -> Vec<MemoryBlock> {
+    let boot = BOOT_MEMORY_RANGES.lock().clone();
+    let hotplug = HOTPLUG_RANGES.lock().clone();
+    let mut ids = Vec::new();
+    for &(start, len) in &boot {
+        let first = start / MEMORY_BLOCK_SIZE;
+        let last = start.saturating_add(len).saturating_sub(1) / MEMORY_BLOCK_SIZE;
+        for id in first..=last {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    for range in &hotplug {
+        let first = range.start / MEMORY_BLOCK_SIZE;
+        let last = range.start.saturating_add(range.len).saturating_sub(1) / MEMORY_BLOCK_SIZE;
+        for id in first..=last {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.into_iter()
+        .map(|id| {
+            let start = id * MEMORY_BLOCK_SIZE;
+            let sample = boot
+                .iter()
+                .filter_map(|&(base, len)| {
+                    (start < base + len && base < start + MEMORY_BLOCK_SIZE)
+                        .then_some(start.max(base))
+                })
+                .chain(hotplug.iter().filter_map(|range| {
+                    (start < range.start + range.len && range.start < start + MEMORY_BLOCK_SIZE)
+                        .then_some(start.max(range.start))
+                }))
+                .min()
+                .unwrap_or(start);
+            MemoryBlock {
+                id,
+                start,
+                node: phys_to_node(sample),
+                online: boot
+                    .iter()
+                    .any(|&(base, len)| start < base + len && base < start + MEMORY_BLOCK_SIZE)
+                    || hotplug.iter().any(|range| {
+                        start < range.start + range.len && range.start < start + MEMORY_BLOCK_SIZE
+                    }),
+            }
+        })
+        .collect()
 }
 
 #[inline]

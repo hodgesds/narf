@@ -238,42 +238,47 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         if let Some(v) = shmem_vtable() {
             let handle = (v.create)(current_task_id(), len);
             if handle != 0 {
-                let mut frames_raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-                if (v.frames)(handle, &mut frames_raw) && frames_raw.len() == pages {
-                    let phys: alloc::vec::Vec<narf_memory::PhysAddr> = frames_raw
+                let mapped = narf_memory::with_shared_mapping_transaction(|| {
+                    let mut frames_raw = alloc::vec::Vec::new();
+                    if !(v.frames)(handle, &mut frames_raw) || frames_raw.len() != pages {
+                        return Err(narf_memory::AddressSpaceError::Unmapped);
+                    }
+                    let phys = frames_raw
                         .into_iter()
                         .map(narf_memory::PhysAddr::new)
                         .collect();
-                    if as_ref
-                        .map_region(Region {
+                    // SAFETY: registry snapshot and alias insertion share one
+                    // transaction.
+                    unsafe {
+                        as_ref.map_shared_region_locked(Region {
                             base: VirtAddr::new(base),
                             len,
                             perms: perms | RegionPerms::SHARED,
                             phys,
                         })
-                        .is_ok()
-                    {
-                        // SAFETY: `as_ref` is the calling task's AddressSpace
-                        // (valid root); the region was just registered, so
-                        // materialize installs only its PTEs over the registry
-                        // frames.
-                        if unsafe { as_ref.materialize() }.is_ok() {
-                            ctx.set_return(SyscallReturn::ok(base));
-                            return;
-                        }
-                        // Mapped but materialize failed (e.g. the fixed hint
-                        // hits a kernel huge page): ROLL BACK. Leaving the
-                        // region registered poisons the AS — every later
-                        // materialize() re-walks it, hits the same error, and
-                        // every subsequent mmap in the process fails. The
-                        // region is SHARED so unmap_region only clears PTEs
-                        // (frames stay registry-owned), then destroy reaps
-                        // the now-unreferenced segment.
-                        let _ = as_ref.unmap_region(VirtAddr::new(base));
-                        (v.destroy)(handle);
-                        ctx.set_return(SyscallReturn::invalid_op());
+                    }
+                });
+                if mapped.is_ok() {
+                    // SAFETY: `as_ref` is the calling task's AddressSpace
+                    // (valid root); the region was just registered, so
+                    // materialize installs only its PTEs over the registry
+                    // frames.
+                    if unsafe { as_ref.materialize() }.is_ok() {
+                        ctx.set_return(SyscallReturn::ok(base));
                         return;
                     }
+                    // Mapped but materialize failed (e.g. the fixed hint
+                    // hits a kernel huge page): ROLL BACK. Leaving the
+                    // region registered poisons the AS — every later
+                    // materialize() re-walks it, hits the same error, and
+                    // every subsequent mmap in the process fails. The
+                    // region is SHARED so unmap_region only clears PTEs
+                    // (frames stay registry-owned), then destroy reaps
+                    // the now-unreferenced segment.
+                    let _ = as_ref.unmap_region(VirtAddr::new(base));
+                    (v.destroy)(handle);
+                    ctx.set_return(SyscallReturn::invalid_op());
+                    return;
                 }
                 // Not mapped (frames lookup / page-count mismatch / map_region
                 // failed) — no region references the frames, so reap the

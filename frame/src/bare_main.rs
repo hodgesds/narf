@@ -3255,9 +3255,10 @@ fn run_async_demo() -> ! {
 fn boot_userspace_init() {
     use core::fmt::Write as _;
     use narf_userspace::{
-        bootstrap_init, brk_init, cwd_init, install_address_space_lookup, install_core_syscalls,
-        install_global, install_task_id_lookup, install_user_task_hooks, load_user_process_with,
-        sigaction_init, signal_init, SyscallTable,
+        bootstrap_init, brk_init, cwd_init, install_address_space_lookup,
+        install_all_address_spaces_lookup, install_core_syscalls, install_global,
+        install_task_id_lookup, install_user_task_hooks, load_user_process_with, sigaction_init,
+        signal_init, SyscallTable,
     };
 
     let bytes = narf_verification::NARF_INIT_ELF;
@@ -3309,6 +3310,7 @@ fn boot_userspace_init() {
         let id = narf_scheduler::current_task_id();
         narf_scheduler::address_space_of(id)
     });
+    install_all_address_spaces_lookup(narf_scheduler::all_address_spaces);
     // Make `gettid` (and any handler that calls
     // `current_task_id`) report the scheduler's TaskId rather
     // than 0. Required for `sys_clone` to be observable from user

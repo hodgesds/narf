@@ -105,6 +105,8 @@ pub fn kernel_ram_range_mapped(start: PhysAddr, len: u64) -> bool;
 pub fn online_node_mask() -> u64;
 pub fn online_node_count() -> usize;
 pub fn hotplug_node_for_phys(addr: PhysAddr) -> Option<usize>;
+pub const MEMORY_BLOCK_SIZE: u64;
+pub fn memory_blocks() -> Vec<MemoryBlock>;
 
 /// Publish local HMAT coordinates and derive Linux-style memory tiers.
 pub fn set_node_performance(
@@ -185,6 +187,14 @@ impl AddressSpace {
         &self,
         va: VirtAddr,
         allowed_nodes: u64,
+    ) -> Result<usize, AddressSpaceError>;
+
+    /// Replace all aliases of one externally-owned shared base page in this
+    /// address space without releasing either frame.
+    pub unsafe fn replace_shared_frame(
+        &self,
+        old: PhysAddr,
+        new: PhysAddr,
     ) -> Result<usize, AddressSpaceError>;
 
     /// Audit or migrate resident pages in a virtual range to a node mask.

@@ -265,8 +265,30 @@ pub fn syscall_vtable() -> &'static narf_userspace::handlers::ShmemSyscallVtable
         frames: vt_frames,
         destroy: vt_destroy,
         pid_of: vt_pid_of,
+        owns_frame: vt_owns_frame,
+        replace_frame: vt_replace_frame,
     };
     &V
+}
+
+fn vt_owns_frame(phys: u64) -> bool {
+    REGISTRY
+        .lock()
+        .iter()
+        .any(|entry| entry.frames.contains(&phys))
+}
+
+fn vt_replace_frame(old_phys: u64, new_phys: u64) -> bool {
+    let mut registry = REGISTRY.lock();
+    let Some(slot) = registry
+        .iter_mut()
+        .flat_map(|entry| entry.frames.iter_mut())
+        .find(|phys| **phys == old_phys)
+    else {
+        return false;
+    };
+    *slot = new_phys;
+    true
 }
 
 fn vt_create(pid: u64, len: u64) -> u64 {

@@ -1077,6 +1077,10 @@ pub fn populate_numa_nodes() {
     let devices = get_or_create_child(&root, "devices");
     let system = get_or_create_child(&devices, "system");
     let node_dir = get_or_create_child(&system, "node");
+    let memory_dir = get_or_create_child(&system, "memory");
+    kobject_add_attr(&memory_dir, "block_size_bytes", || {
+        format!("{:x}\n", narf_memory::MEMORY_BLOCK_SIZE)
+    });
 
     // Online membership is live: allocator hotplug updates are immediately
     // visible without rebuilding sysfs. All architectural slots are possible.
@@ -1164,6 +1168,38 @@ pub fn populate_numa_nodes() {
 
         kobject_add_attr(&kobj, "cpulist", move || node_cpulist_string(node));
         kobject_add_attr(&kobj, "cpumap", move || node_cpumap_string(node));
+    }
+
+    // Linux memory-block ABI and node membership. Membership comes from the
+    // allocator's physical boot/hotplug ranges classified through SRAT, never
+    // from CPU topology.
+    for block in narf_memory::memory_blocks() {
+        let name = format!("memory{}", block.id);
+        let memory = get_or_create_child(&memory_dir, &name);
+        let start = block.start;
+        kobject_add_attr(&memory, "phys_index", move || {
+            format!("{:x}\n", start / narf_memory::MEMORY_BLOCK_SIZE)
+        });
+        let online = block.online;
+        kobject_add_attr(&memory, "state", move || {
+            if online {
+                "online\n".into()
+            } else {
+                "offline\n".into()
+            }
+        });
+        kobject_add_attr(&memory, "online", move || {
+            if online {
+                "1\n".into()
+            } else {
+                "0\n".into()
+            }
+        });
+        kobject_add_attr(&memory, "removable", || "0\n".into());
+        kobject_add_attr(&memory, "valid_zones", || "Normal\n".into());
+
+        let node = get_or_create_child(&node_dir, &format!("node{}", block.node));
+        let _membership = get_or_create_child(&node, &name);
     }
 
     // Linux memory-tier bus: default DRAM's abstract distance maps to device

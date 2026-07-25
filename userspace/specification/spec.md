@@ -97,6 +97,10 @@ range, `MPOL_MF_STRICT` reports remaining misplacement as `EIO`, and
 `set_mempolicy_home_node(2)` updates the distance anchor of existing
 MPOL_BIND or MPOL_PREFERRED_MANY ranges and returns `ENOENT` when no
 eligible policy overlaps.
+`move_pages(2)` migrates registry-owned shared-memory base pages by replacing
+every live address-space alias under one rollback-capable transaction and
+committing the shared-object backing last. Device/DMA shared mappings remain
+non-migratable without an owner-specific quiesce protocol.
 Anonymous private `mmap(MAP_HUGETLB)` supports Linux's default/explicit
 2 MiB and explicit 1 GiB encodings when boot-reserved backing is available.
 Mappings use hardware PD/PDPT leaves on x86_64 and L2/L1 block descriptors
@@ -111,6 +115,9 @@ contract.
 The procfs task snapshot includes both base-page and hardware huge-page
 regions with effective policy and per-node residency for
 `/proc/<pid>/numa_maps`.
+Sysfs exposes Linux memory blocks under `/sys/devices/system/memory/memoryN`
+and each block's `nodeN/memoryN` membership from allocator RAM ranges
+classified by SRAT; CPU topology is never used to infer memory membership.
 
 Bootstrap: every new process receives two ring pairs (submit + complete)
 for the kernel ABI plus a read-only config page with capability

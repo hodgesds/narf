@@ -24,11 +24,6 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let mut frames_raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    if !(v.frames)(handle, &mut frames_raw) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
     let as_ref = match current_address_space() {
         Some(a) => a,
         None => {
@@ -36,10 +31,6 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = frames_raw
-        .into_iter()
-        .map(narf_memory::PhysAddr::new)
-        .collect();
     // SHARED marks the frames as borrowed (narf-shmem owns them), so a
     // second shmat of the same segment may alias them and neither unmap
     // nor AS-drop frees them.
@@ -53,15 +44,26 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
         return;
     }
-    if as_ref
-        .map_region(Region {
-            base: VirtAddr::new(base),
-            len,
-            perms,
-            phys: phys_list,
-        })
-        .is_err()
-    {
+    let mapped = narf_memory::with_shared_mapping_transaction(|| {
+        let mut frames_raw = alloc::vec::Vec::new();
+        if !(v.frames)(handle, &mut frames_raw) {
+            return Err(narf_memory::AddressSpaceError::Unmapped);
+        }
+        let phys_list = frames_raw
+            .into_iter()
+            .map(narf_memory::PhysAddr::new)
+            .collect();
+        // SAFETY: registry snapshot and alias insertion share one transaction.
+        unsafe {
+            as_ref.map_shared_region_locked(Region {
+                base: VirtAddr::new(base),
+                len,
+                perms,
+                phys: phys_list,
+            })
+        }
+    });
+    if mapped.is_err() {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }

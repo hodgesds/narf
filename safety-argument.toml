@@ -54,3 +54,11 @@ argument = "HMAT memory tiers only constrain target selection: demotion requires
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "Tier demotion delegates to the existing private-page and complete-huge-leaf migration transaction, preserving ownership and permissions, rolling back failed leaf replacement, and completing cross-CPU TLB invalidation before returning old backing to the allocator."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Shared-memory migration serializes alias creation with replacement, retains both frames through all address-space updates, rolls back every changed alias before failure returns, commits registry ownership only after all PTEs change, broadcasts TLB invalidations, and frees the source only after commit. Device/DMA mappings are rejected."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Memory-block membership is derived from authoritative boot and hotplug physical RAM ranges classified by SRAT proximity, never inferred from CPU placement or fabricated for absent memory."

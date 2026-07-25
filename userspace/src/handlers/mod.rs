@@ -370,8 +370,11 @@ pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Opti
 // `install_address_space_lookup`.
 
 type AsLookupFn = fn() -> Option<Arc<AddressSpace>>;
+type AllAsLookupFn = fn() -> alloc::vec::Vec<Arc<AddressSpace>>;
 
 static AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AsLookupFn>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+static ALL_AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AllAsLookupFn>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Install the function that resolves "what's the currently-
@@ -382,6 +385,18 @@ static AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AsLookupFn>> =
 /// handlers return `InvalidOp`.
 pub fn install_address_space_lookup(lookup: AsLookupFn) {
     *AS_LOOKUP.lock() = Some(lookup);
+}
+
+/// Install the scheduler bridge used by shared-page migration to snapshot all
+/// live aliases without introducing a userspace↔scheduler crate cycle.
+pub fn install_all_address_spaces_lookup(lookup: AllAsLookupFn) {
+    *ALL_AS_LOOKUP.lock() = Some(lookup);
+}
+
+fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
+    (*ALL_AS_LOOKUP.lock())
+        .map(|lookup| lookup())
+        .unwrap_or_default()
 }
 
 /// Snapshot the currently-installed AS lookup (for save/restore around a
@@ -3941,6 +3956,10 @@ pub struct ShmemSyscallVtable {
     pub frames: fn(handle: u64, out: &mut alloc::vec::Vec<u64>) -> bool,
     pub destroy: fn(handle: u64) -> bool,
     pub pid_of: fn(handle: u64) -> u64,
+    /// True only for registry-owned movable RAM, never device/DMA mappings.
+    pub owns_frame: fn(phys: u64) -> bool,
+    /// Atomically replace one registry backing entry after all aliases moved.
+    pub replace_frame: fn(old_phys: u64, new_phys: u64) -> bool,
 }
 
 impl core::fmt::Debug for ShmemSyscallVtable {
