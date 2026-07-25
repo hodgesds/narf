@@ -165,6 +165,7 @@ pub const ENOENT: i32 = 2;
 pub const EEXIST: i32 = 17;
 pub const ENODEV: i32 = 19;
 pub const EINVAL: i32 = 22;
+pub const ENETUNREACH: i32 = 101;
 pub const NLMSGERR_ATTR_MSG: u16 = 1;
 
 // ── parsed request header ───────────────────────────────────────────────
@@ -540,33 +541,59 @@ pub fn build_dump(req: &[u8]) -> Vec<Vec<u8>> {
         }
         RTM_GETROUTE => {
             let (links, _addrs) = enumerate();
-            let mut routes = crate::route::route_list();
-            // Link/address dumps always expose loopback. Mirror that invariant
-            // in route dumps even during early boot before net init installs
-            // the canonical loopback FIB entry.
-            if !routes
-                .iter()
-                .any(|r| r.iface == "lo" && r.dst.addr.0 == [127, 0, 0, 0] && r.dst.prefix_len == 8)
-            {
-                routes.push(crate::route::Route {
-                    dst: crate::route::Ipv4Net {
-                        addr: crate::ipv4::Ipv4Addr([127, 0, 0, 0]),
-                        prefix_len: 8,
-                    },
-                    gateway: None,
-                    iface: alloc::string::String::from("lo"),
-                    src_hint: Some(crate::ipv4::Ipv4Addr([127, 0, 0, 1])),
-                    metric: 0,
-                    scope: crate::route::Scope::Host,
-                    table: crate::route::TABLE_LOCAL,
-                });
-            }
-            for route in &routes {
-                if let Some(link) = links.iter().find(|link| link.name == route.iface) {
-                    out.push(build_newroute(route, link.ifindex, seq, pid));
+            if hdr.flags & NLM_F_DUMP == NLM_F_DUMP {
+                let mut routes = crate::route::route_list();
+                // Link/address dumps always expose loopback. Mirror that invariant
+                // in route dumps even during early boot before net init installs
+                // the canonical loopback FIB entry.
+                if !routes.iter().any(|r| {
+                    r.iface == "lo" && r.dst.addr.0 == [127, 0, 0, 0] && r.dst.prefix_len == 8
+                }) {
+                    routes.push(crate::route::Route {
+                        dst: crate::route::Ipv4Net {
+                            addr: crate::ipv4::Ipv4Addr([127, 0, 0, 0]),
+                            prefix_len: 8,
+                        },
+                        gateway: None,
+                        iface: alloc::string::String::from("lo"),
+                        src_hint: Some(crate::ipv4::Ipv4Addr([127, 0, 0, 1])),
+                        metric: 0,
+                        scope: crate::route::Scope::Host,
+                        table: crate::route::TABLE_LOCAL,
+                    });
+                }
+                for route in &routes {
+                    if let Some(link) = links.iter().find(|link| link.name == route.iface) {
+                        out.push(build_newroute(route, link.ifindex, seq, pid));
+                    }
+                }
+                out.push(build_done(seq, pid));
+            } else {
+                if req.len() < NLMSG_HDRLEN + 12 || req[NLMSG_HDRLEN] != AF_INET {
+                    out.push(build_error(EINVAL, seq, pid, req));
+                    return out;
+                }
+                let Some(dst) = find_attr(req, 12, RTA_DST) else {
+                    out.push(build_error(EINVAL, seq, pid, req));
+                    return out;
+                };
+                if dst.len() != 4 {
+                    out.push(build_error(EINVAL, seq, pid, req));
+                    return out;
+                }
+                let dst = crate::ipv4::Ipv4Addr(dst.try_into().unwrap_or([0; 4]));
+                if let Some(route) = crate::route::route_lookup_raw(dst) {
+                    if let Some(link) = links.iter().find(|link| link.name == route.iface) {
+                        let mut message = build_newroute(&route, link.ifindex, seq, pid);
+                        clear_multipart(&mut message);
+                        out.push(message);
+                    } else {
+                        out.push(build_error(ENODEV, seq, pid, req));
+                    }
+                } else {
+                    out.push(build_error(ENETUNREACH, seq, pid, req));
                 }
             }
-            out.push(build_done(seq, pid));
         }
         RTM_GETNEIGH => {
             let (links, _addrs) = enumerate();

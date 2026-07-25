@@ -184,6 +184,78 @@ fn getroute_dump_has_loopback_and_terminates() {
 }
 
 #[test]
+fn getroute_point_query_uses_longest_prefix_match() {
+    fn discard(_: &[u8]) -> Result<(), ()> {
+        Ok(())
+    }
+
+    let name = "rtnl-route-query0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 4, 1], discard);
+    let ifindex = crate::iface::snapshot_all()
+        .iter()
+        .position(|iface| iface.name == name)
+        .unwrap() as u32
+        + 2;
+    for (network, prefix, gateway) in [
+        ([198, 18, 0, 0], 16, [192, 0, 2, 16]),
+        ([198, 18, 7, 0], 24, [192, 0, 2, 24]),
+    ] {
+        crate::route::route_add(crate::route::Route {
+            dst: crate::route::Ipv4Net {
+                addr: crate::ipv4::Ipv4Addr(network),
+                prefix_len: prefix,
+            },
+            gateway: Some(crate::ipv4::Ipv4Addr(gateway)),
+            iface: alloc::string::String::from(name),
+            src_hint: None,
+            metric: 0,
+            scope: crate::route::Scope::Universe,
+            table: crate::route::TABLE_MAIN,
+        });
+    }
+
+    let mut body = vec![AF_INET, 32, 0, 0, crate::route::TABLE_MAIN, 0, 0, 0];
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    push_rtattr(&mut body, RTA_DST, &[198, 18, 7, 99]);
+    let request = frame_message(RTM_GETROUTE, NLM_F_REQUEST, 62, 8, &body);
+    let replies = build_dump(&request);
+    assert_eq!(replies.len(), 1);
+    let hdr = parse_hdr(&replies[0]).unwrap();
+    assert_eq!(hdr.msg_type, RTM_NEWROUTE);
+    assert_eq!(hdr.flags & NLM_F_MULTI, 0);
+    assert_eq!(replies[0][NLMSG_HDRLEN + 1], 24);
+    assert_eq!(
+        find_rtattr(&replies[0], 12, RTA_DST).as_deref(),
+        Some(&[198, 18, 7, 0][..])
+    );
+    assert_eq!(
+        find_rtattr(&replies[0], 12, RTA_GATEWAY).as_deref(),
+        Some(&[192, 0, 2, 24][..])
+    );
+    assert_eq!(
+        find_rtattr(&replies[0], 12, RTA_OIF).as_deref(),
+        Some(&ifindex.to_ne_bytes()[..])
+    );
+
+    crate::route::route_delete(
+        crate::route::Ipv4Net {
+            addr: crate::ipv4::Ipv4Addr([198, 18, 0, 0]),
+            prefix_len: 16,
+        },
+        name,
+        crate::route::TABLE_MAIN,
+    );
+    crate::route::route_delete(
+        crate::route::Ipv4Net {
+            addr: crate::ipv4::Ipv4Addr([198, 18, 7, 0]),
+            prefix_len: 24,
+        },
+        name,
+        crate::route::TABLE_MAIN,
+    );
+}
+
+#[test]
 fn newneigh_wire_layout_carries_ipv4_destination_and_mac() {
     let msg = build_newneigh(
         &NeighInfo {

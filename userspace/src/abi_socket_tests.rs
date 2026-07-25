@@ -1816,6 +1816,69 @@ fn smoke_abi_netlink_route_getroute_dump() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getroute_dump);
 
+fn smoke_abi_netlink_route_point_lookup() -> TestResult {
+    with_setup(|| {
+        fn discard(_: &[u8]) -> Result<(), ()> {
+            Ok(())
+        }
+
+        let iface = "abi-rtnl-route0";
+        narf_net::iface::register(iface, [0x02, 0, 0, 0, 5, 1], discard);
+        narf_net::route::route_add(narf_net::route::Route {
+            dst: narf_net::route::Ipv4Net {
+                addr: narf_net::ipv4::Ipv4Addr([198, 19, 7, 0]),
+                prefix_len: 24,
+            },
+            gateway: Some(narf_net::ipv4::Ipv4Addr([192, 0, 2, 1])),
+            iface: alloc::string::String::from(iface),
+            src_hint: None,
+            metric: 0,
+            scope: narf_net::route::Scope::Universe,
+            table: narf_net::route::TABLE_MAIN,
+        });
+
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let mut req = [0u8; 36];
+        req[0..4].copy_from_slice(&36u32.to_ne_bytes());
+        req[4..6].copy_from_slice(&RTM_GETROUTE.to_ne_bytes());
+        req[6..8].copy_from_slice(&1u16.to_ne_bytes());
+        req[8..12].copy_from_slice(&14u32.to_ne_bytes());
+        req[16] = AF_INET as u8;
+        req[17] = 32;
+        req[20] = narf_net::route::TABLE_MAIN;
+        // RTA_DST { len=8, type=1, address=198.19.7.42 }.
+        req[28..30].copy_from_slice(&8u16.to_ne_bytes());
+        req[30..32].copy_from_slice(&1u16.to_ne_bytes());
+        req[32..36].copy_from_slice(&[198, 19, 7, 42]);
+        if netlink_send(fd, &req).ok_or("route point send")? != req.len() as i64 {
+            return Err("RTM_GETROUTE point send failed");
+        }
+        let mut reply = [0u8; 512];
+        let n = netlink_recv(fd, &mut reply).ok_or("route point recv")?;
+        if n < (NLMSG_HDRLEN + 12) as i64 || nlmsg_type_of(&reply) != RTM_NEWROUTE {
+            return Err("RTM_GETROUTE point lookup did not return RTM_NEWROUTE");
+        }
+        let flags = u16::from_ne_bytes([reply[6], reply[7]]);
+        if flags & 2 != 0 || reply[NLMSG_HDRLEN + 1] != 24 {
+            return Err("route point reply was multipart or selected the wrong prefix");
+        }
+        if !window_contains(&reply[..n as usize], &[192, 0, 2, 1]) {
+            return Err("route point reply omitted the selected gateway");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        narf_net::route::route_delete(
+            narf_net::route::Ipv4Net {
+                addr: narf_net::ipv4::Ipv4Addr([198, 19, 7, 0]),
+                prefix_len: 24,
+            },
+            iface,
+            narf_net::route::TABLE_MAIN,
+        );
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_point_lookup);
+
 fn smoke_abi_netlink_route_getneigh_dump() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;

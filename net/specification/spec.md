@@ -151,6 +151,9 @@ When `NETLINK_GET_STRICT_CHK` is enabled, requests must carry
 and a valid family selector. Malformed strict requests return `EINVAL`.
 Non-dump `RTM_GETLINK` resolves one interface by ifindex or `IFLA_IFNAME`,
 returning a non-multipart reply or `ENODEV`.
+Non-dump `RTM_GETROUTE` performs the forwarding table's longest-prefix
+lookup for `RTA_DST`, returning the selected route as one non-multipart reply
+or `ENETUNREACH`.
 
 Link dumps include Linux operational-state, carrier, qdisc, queue-length,
 broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero
