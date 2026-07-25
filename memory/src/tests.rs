@@ -4946,7 +4946,12 @@ fn smoke_memory_unmap_region_cycle_no_leak() -> TestResult {
             };
             phys_list.push(f.start_address());
         }
-        let vbase = 0x0000_0080_0900_0000u64 + (cycle as u64) * 0x10_0000;
+        // Keep every cycle in the same 2 MiB leaf page table.  Empty
+        // intermediate tables are intentionally retained until the
+        // AddressSpace is dropped, so crossing a 2 MiB boundary here
+        // would charge an additional table frame against a test that
+        // is specifically measuring whether DATA frames are returned.
+        let vbase = 0x0000_0080_0900_0000u64 + (cycle as u64) * 0x10_000;
         a.map_region(Region {
             base: VirtAddr::new(vbase),
             len: (pages as u64) * 0x1000,
