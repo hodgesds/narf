@@ -148,6 +148,12 @@ pub trait Filesystem: Send + Sync {
     async fn write(&self, node: NodeId, offset: u64, buf: &[u8])     -> Result<usize, FsError>;
     /* … */
 }
+
+pub trait DirOps: Send + Sync {
+    async fn fsync(&self, data_only: bool) -> Result<(), FsError>;
+    async fn syncfs(&self) -> Result<(), FsError>;
+    /* … */
+}
 ```
 
 Filesystems run in their own PKS/MTE domain (Stage 4) and communicate
@@ -162,6 +168,118 @@ with `filesystem/` core via Narf-Ring.
   already caches.
 - Cache eviction: LRU-ish with a "recently used" second chance;
   explicit pressure hook from `memory/`.
+
+### 3.8 Linux FUSE compatibility
+
+`FuseConnection` implements the Linux FUSE 7.36 message transport used
+by `/dev/fuse` and `virtiofs`. Each open of `/dev/fuse` owns one
+connection; reads return exactly one complete request and writes match
+replies by the non-zero `unique` identifier.
+
+- An empty blocking read parks in the syscall layer; a non-blocking
+  read reports `EAGAIN`.
+- A daemon buffer smaller than the next complete request reports
+  `EINVAL` without consuming or truncating that request.
+- Dropping an unsent VFS future removes its queued request and reply
+  slot. Dropping a request already delivered to the daemon queues
+  `FUSE_INTERRUPT` naming the original unique ID; late replies are ignored.
+- Directory traffic uses `OPENDIR`, `READDIR`, and `RELEASEDIR`, which
+  are distinct from regular-file `OPEN` and `RELEASE`.
+- The bridge supports lookup, getattr/setattr, create, mknod, mkdir,
+  unlink, rmdir, same- and cross-directory rename/link, symlink, open, read,
+  write, flush, fsync/fdatasync, extended attributes, access checks,
+  readlink, statfs, readdir, release,
+  forget, and initialization.
+
+`FsInstance::statfs` is the asynchronous filesystem-capacity interface.
+Its `FsStat` result is translated to Linux `struct statfs`; FUSE mounts
+source those values from `FUSE_STATFS`, while other filesystems retain
+the conservative synthetic default.
+
+`FileOps::flush` runs on descriptor close and `FileOps::fsync` backs
+Linux `fsync(2)`/`fdatasync(2)`. FUSE files translate these to
+`FUSE_FLUSH` and `FUSE_FSYNC`; non-FUSE implementations default to
+success when they have no volatile backing state. Directory descriptors
+forward the same operation through `DirOps`; FUSE opens a directory
+handle, issues `FUSE_FSYNCDIR` with the data-only flag when requested,
+and releases the handle.
+`FileOps::syncfs` and `DirOps::syncfs` back Linux `syncfs(fd)`, which
+validates the descriptor and flushes its backing filesystem. FUSE sends
+`FUSE_SYNCFS` to the mount's root node with the Linux zeroed request body.
+If the daemon replies `ENOSYS`, that call succeeds and the connection
+suppresses subsequent `FUSE_SYNCFS` requests, matching Linux.
+
+`DirOps::rename_to` and `DirOps::link_to` express atomic operations
+between two directories of one filesystem. FUSE translates the target
+directory inode into `fuse_rename_in.newdir` / the `FUSE_LINK` request
+node and uses `FUSE_RENAME2` when Linux `RENAME_*` flags are present.
+Operations spanning distinct connections or mounts report `EXDEV`.
+
+`FileOps` exposes set/get/list/remove extended-attribute operations.
+FUSE uses the Linux two-request size-probe convention for GETXATTR and
+LISTXATTR and preserves XATTR_CREATE/XATTR_REPLACE flags. Filesystems
+without native xattrs retain the userspace side-table fallback.
+
+`FileOps::access` carries Linux R_OK/W_OK/X_OK bits to filesystems that
+perform daemon-side authorization. FUSE translates it to `FUSE_ACCESS`;
+the syscall layer falls back to the inode owner/mode check only when the
+filesystem reports that native access checks are unsupported.
+
+`FileOps::get_lock` and `FileOps::set_lock` carry inclusive byte ranges,
+lock owner IDs, type, and blocking intent. FUSE maps these to GETLK,
+SETLK, and SETLKW with the daemon file handle; local filesystems retain
+the kernel advisory-lock table fallback.
+
+`FileOps::fallocate`, `seek`, and `copy_file_range_to` expose native
+range operations. FUSE maps these to FALLOCATE, LSEEK (for SEEK_DATA /
+SEEK_HOLE), and COPY_FILE_RANGE when both files share one connection;
+the syscall layer retains truncate/zero, generic seek, and buffered-copy
+fallbacks for filesystems that return `Unsupported`.
+
+FUSE file handles register `POLL` once with a stable kernel handle and
+cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that
+registration so the next readiness query re-polls the daemon. Poll
+requests never leave ordinary reply slots behind.
+
+`FUSE_INIT` uses the Linux 64-byte extended request/reply layout. The
+client advertises only implemented protocol features, accepts compatible
+short legacy replies by zero-extending them, intersects daemon flags with
+that set, and records the negotiated minor version and write limit on the
+connection. Major versions other than 7 and protocol minors before 7.5
+are rejected.
+FUSE writes are split into requests no larger than the negotiated
+`max_write`; each request advances the file offset, an oversized daemon
+reply is rejected as invalid data, and a short reply ends the write with
+the accumulated byte count.
+When `FUSE_MAX_PAGES` is negotiated, reads and writes are also bounded by
+the daemon's `max_pages` in 4 KiB pages. Large reads advance their offset
+across requests, stop on a short reply, and reject replies larger than
+the requested chunk.
+
+Every request header is stamped with the calling task's translated
+filesystem uid/gid and visible process id through a boot-installed
+request-context provider. Kernel-only callers retain the zero-valued
+fallback when no userspace provider is installed.
+
+Daemon `INVAL_INODE`, `INVAL_ENTRY`, and `DELETE` notifications are
+wire-validated and accepted. They require no cache mutation while the
+FUSE bridge remains uncached; adding inode, dentry, or page caching must
+attach the corresponding invalidation before enabling that cache.
+
+When the daemon negotiates `DO_READDIRPLUS`, directory enumeration uses
+`READDIRPLUS`, validates each combined entry/dirent record, and emits an
+immediate `FORGET` for the otherwise-uncached lookup reference. Daemons
+without the capability continue to receive ordinary `READDIR`.
+
+Pending inode lookup releases are coalesced into Linux `BATCH_FORGET`
+messages when the daemon reads its queue. Coalescing respects the daemon
+buffer size, preserves each `(nodeid, nlookup)` pair, and never creates a
+reply slot because forget operations are one-way.
+
+Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
+Linux UAPI field order and width. Malformed or short replies fail with
+`FsError::InvalidData`; a disconnected daemon fails pending requests
+without leaving callers parked indefinitely.
 
 ## 4. Invariants & safety properties
 

@@ -2704,6 +2704,12 @@ fn smoke_fs_fuse_struct_sizes() -> TestResult {
     if size_of::<FuseOutHeader>() != 16 {
         return TestResult::Fail("fuse_out_header != 16");
     }
+    if size_of::<FuseInitIn>() != 64 {
+        return TestResult::Fail("fuse_init_in != 64");
+    }
+    if size_of::<FuseInitOut>() != 64 {
+        return TestResult::Fail("fuse_init_out != 64");
+    }
     if size_of::<FuseAttr>() != 88 {
         return TestResult::Fail("fuse_attr != 88");
     }
@@ -2731,6 +2737,24 @@ fn smoke_fs_fuse_struct_sizes() -> TestResult {
     if size_of::<FuseWriteOut>() != 8 {
         return TestResult::Fail("fuse_write_out != 8");
     }
+    if size_of::<FuseMknodIn>() != 16 {
+        return TestResult::Fail("fuse_mknod_in != 16");
+    }
+    if size_of::<FuseMkdirIn>() != 8 {
+        return TestResult::Fail("fuse_mkdir_in != 8");
+    }
+    if size_of::<FuseRenameIn>() != 8 {
+        return TestResult::Fail("fuse_rename_in != 8");
+    }
+    if size_of::<FuseLinkIn>() != 8 {
+        return TestResult::Fail("fuse_link_in != 8");
+    }
+    if size_of::<FuseCreateIn>() != 16 {
+        return TestResult::Fail("fuse_create_in != 16");
+    }
+    if size_of::<FuseSetattrIn>() != 88 {
+        return TestResult::Fail("fuse_setattr_in != 88");
+    }
     if size_of::<FuseReleaseIn>() != 24 {
         return TestResult::Fail("fuse_release_in != 24");
     }
@@ -2740,9 +2764,205 @@ fn smoke_fs_fuse_struct_sizes() -> TestResult {
     if size_of::<FuseDirent>() != 24 {
         return TestResult::Fail("fuse_dirent header != 24");
     }
+    if size_of::<FuseDirentPlus>() != 152 {
+        return TestResult::Fail("fuse_direntplus header != 152");
+    }
+    if size_of::<FuseForgetOne>() != 16 || size_of::<FuseBatchForgetIn>() != 8 {
+        return TestResult::Fail("fuse batch-forget layouts drifted");
+    }
+    if size_of::<FuseSyncfsIn>() != 8 {
+        return TestResult::Fail("fuse_syncfs_in != 8");
+    }
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_struct_sizes);
+
+fn smoke_fs_fuse_syncfs_enosys_is_cached() -> TestResult {
+    use crate::fuse::{pod_from_bytes, FuseInHeader, FuseOpcode};
+    use crate::fuse_conn::FuseConnection;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    static REQUESTS: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+    REQUESTS.store(0, Ordering::Relaxed);
+    narf_scheduler::__reset_queues_for_test();
+
+    let conn = Arc::new(FuseConnection::new());
+    let daemon_conn = Arc::clone(&conn);
+    narf_scheduler::spawn(async move {
+        for _ in 0..1024 {
+            if let Some(request) = daemon_conn.dequeue_request() {
+                let Some(header) = pod_from_bytes::<FuseInHeader>(&request) else {
+                    OUTCOME.store(3, Ordering::Relaxed);
+                    return;
+                };
+                if header.opcode != FuseOpcode::Syncfs as u32 {
+                    OUTCOME.store(4, Ordering::Relaxed);
+                    return;
+                }
+                REQUESTS.fetch_add(1, Ordering::Relaxed);
+                let reply = fuse_reply(header.unique, -38, &[]);
+                let _ = daemon_conn.complete_reply(&reply);
+            } else if OUTCOME.load(Ordering::Relaxed) != 0 {
+                return;
+            } else {
+                narf_scheduler::yield_now().await;
+            }
+        }
+        OUTCOME.store(5, Ordering::Relaxed);
+    });
+
+    let client_conn = Arc::clone(&conn);
+    narf_scheduler::spawn(async move {
+        let result = client_conn.request_syncfs().await;
+        let cached = client_conn.request_syncfs().await;
+        OUTCOME.store(
+            if result.is_ok() && cached.is_ok() {
+                1
+            } else {
+                2
+            },
+            Ordering::Relaxed,
+        );
+    });
+    narf_scheduler::run_until_empty();
+
+    match (
+        OUTCOME.load(Ordering::Relaxed),
+        REQUESTS.load(Ordering::Relaxed),
+    ) {
+        (1, 1) if conn.dequeue_request().is_none() => TestResult::Pass,
+        (1, _) => TestResult::Fail("FUSE_SYNCFS ENOSYS was not cached"),
+        (2, _) => TestResult::Fail("FUSE_SYNCFS ENOSYS did not succeed"),
+        (3, _) => TestResult::Fail("FUSE_SYNCFS request header malformed"),
+        (4, _) => TestResult::Fail("unexpected opcode in syncfs fallback"),
+        _ => TestResult::Fail("FUSE_SYNCFS fallback tasks did not complete"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_syncfs_enosys_is_cached);
+
+fn smoke_fs_fuse_request_context() -> TestResult {
+    use crate::fuse::{pod_from_bytes, FuseInHeader, FuseOpcode};
+    use crate::fuse_conn::{
+        install_request_context_provider, FuseConnection, FuseRequestContext,
+        __test_reset_request_context_provider,
+    };
+
+    fn context() -> FuseRequestContext {
+        FuseRequestContext {
+            uid: 1001,
+            gid: 1002,
+            pid: 1003,
+        }
+    }
+
+    install_request_context_provider(context);
+    let conn = FuseConnection::new();
+    conn.submit_noreply(FuseOpcode::Destroy, 0, &[]);
+    let request = conn.dequeue_request();
+    __test_reset_request_context_provider();
+
+    let Some(header) = request.as_deref().and_then(pod_from_bytes::<FuseInHeader>) else {
+        return TestResult::Fail("FUSE request header missing");
+    };
+    if (header.uid, header.gid, header.pid) == (1001, 1002, 1003) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("FUSE request context not propagated")
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_request_context);
+
+fn smoke_fs_fuse_cache_notifications() -> TestResult {
+    use crate::fuse::*;
+    use crate::fuse_conn::FuseConnection;
+
+    let conn = FuseConnection::new();
+    let inode = fuse_reply(
+        0,
+        FUSE_NOTIFY_INVAL_INODE,
+        &pod_as_bytes(&FuseNotifyInvalInodeOut {
+            ino: 2,
+            offset: 0,
+            len: -1,
+        }),
+    );
+    let mut entry_body = pod_as_bytes(&FuseNotifyInvalEntryOut {
+        parent: FUSE_ROOT_ID,
+        namelen: 5,
+        flags: 0,
+    });
+    entry_body.extend_from_slice(b"hello");
+    let entry = fuse_reply(0, FUSE_NOTIFY_INVAL_ENTRY, &entry_body);
+    let mut delete_body = pod_as_bytes(&FuseNotifyDeleteOut {
+        parent: FUSE_ROOT_ID,
+        child: 2,
+        namelen: 5,
+        padding: 0,
+    });
+    delete_body.extend_from_slice(b"hello");
+    let delete = fuse_reply(0, FUSE_NOTIFY_DELETE, &delete_body);
+
+    if conn.complete_reply(&inode) != Some(inode.len())
+        || conn.complete_reply(&entry) != Some(entry.len())
+        || conn.complete_reply(&delete) != Some(delete.len())
+    {
+        return TestResult::Fail("valid FUSE cache notification rejected");
+    }
+    entry_body.pop();
+    let malformed = fuse_reply(0, FUSE_NOTIFY_INVAL_ENTRY, &entry_body);
+    if conn.complete_reply(&malformed).is_some() {
+        TestResult::Fail("short FUSE cache notification accepted")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_cache_notifications);
+
+fn smoke_fs_fuse_batches_forgets() -> TestResult {
+    use crate::fuse::*;
+    use crate::fuse_conn::FuseConnection;
+
+    let conn = FuseConnection::new();
+    conn.submit_noreply(
+        FuseOpcode::Forget,
+        11,
+        &pod_as_bytes(&FuseForgetIn { nlookup: 2 }),
+    );
+    conn.submit_noreply(
+        FuseOpcode::Forget,
+        12,
+        &pod_as_bytes(&FuseForgetIn { nlookup: 3 }),
+    );
+    let Some(request) = conn.dequeue_request() else {
+        return TestResult::Fail("batched forget missing");
+    };
+    let Some(header) = pod_from_bytes::<FuseInHeader>(&request) else {
+        return TestResult::Fail("batched forget header malformed");
+    };
+    let offset = core::mem::size_of::<FuseInHeader>();
+    let Some(batch) = pod_from_bytes::<FuseBatchForgetIn>(&request[offset..]) else {
+        return TestResult::Fail("batched forget body malformed");
+    };
+    let entries = offset + core::mem::size_of::<FuseBatchForgetIn>();
+    let first = pod_from_bytes::<FuseForgetOne>(&request[entries..]);
+    let second = pod_from_bytes::<FuseForgetOne>(
+        &request[entries + core::mem::size_of::<FuseForgetOne>()..],
+    );
+    if header.opcode == FuseOpcode::BatchForget as u32
+        && batch.count == 2
+        && first.map(|entry| (entry.nodeid, entry.nlookup)) == Some((11, 2))
+        && second.map(|entry| (entry.nodeid, entry.nlookup)) == Some((12, 3))
+        && conn.dequeue_request().is_none()
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("forget requests not coalesced")
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_batches_forgets);
 
 /// Encode a `fuse_out_header` + `body` reply for `unique`.
 fn fuse_reply(unique: u64, error: i32, body: &[u8]) -> alloc::vec::Vec<u8> {
@@ -2762,6 +2982,10 @@ fn fuse_reply(unique: u64, error: i32, body: &[u8]) -> alloc::vec::Vec<u8> {
 /// filesystem with one regular file "hello" (nodeid 2, contents "world")
 /// directly under the root (nodeid 1). Returns the encoded reply, or
 /// `None` for an opcode it doesn't model (which fails the request).
+static FUSE_FSYNCDIR_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static FUSE_FSYNCDIR_FLAGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FUSE_SYNCFS_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     use crate::fuse::*;
     let hdr: FuseInHeader = pod_from_bytes(req)?;
@@ -2793,16 +3017,22 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     match opcode {
         // FUSE_INIT (26): echo version + a plausible negotiated reply.
         26 => {
+            let init: FuseInitIn = pod_from_bytes(body)?;
             let out = FuseInitOut {
                 major: FUSE_KERNEL_VERSION,
                 minor: FUSE_KERNEL_MINOR_VERSION,
                 max_readahead: 0,
-                flags: 0,
+                flags: init.flags,
                 max_background: 0,
                 congestion_threshold: 0,
-                max_write: 4096,
+                max_write: 256 * 1024,
                 time_gran: 1,
-                _reserved: [0; 9],
+                max_pages: 32,
+                map_alignment: 0,
+                flags2: init.flags2,
+                max_stack_depth: 0,
+                request_timeout: 0,
+                unused: [0; 11],
             };
             Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
         }
@@ -2810,11 +3040,16 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
         1 => {
             let name_len = body.iter().position(|&b| b == 0).unwrap_or(body.len());
             let name = core::str::from_utf8(&body[..name_len]).unwrap_or("");
-            if hdr.nodeid == FUSE_ROOT_ID && name == "hello" {
+            if hdr.nodeid == FUSE_ROOT_ID && (name == "hello" || name == "sym") {
+                let mut attr = file_attr;
+                if name == "sym" {
+                    attr.mode = S_IFLNK | 0o777;
+                    attr.size = 5;
+                }
                 let out = FuseEntryOut {
-                    nodeid: 2,
+                    nodeid: if name == "sym" { 5 } else { 2 },
                     generation: 1,
-                    attr: file_attr,
+                    attr,
                     ..Default::default()
                 };
                 Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
@@ -2834,8 +3069,8 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
             };
             Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
         }
-        // FUSE_OPEN (14) / FUSE_OPENDIR: hand back a fixed file handle.
-        14 => {
+        // FUSE_OPEN (14) / FUSE_OPENDIR (27): hand back a fixed handle.
+        14 | 27 => {
             let out = FuseOpenOut {
                 fh: 0x42,
                 open_flags: 0,
@@ -2846,6 +3081,9 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
         // FUSE_READ (15): return the file bytes at the requested range.
         15 => {
             let rin: FuseReadIn = pod_from_bytes(body)?;
+            if rin.size > 128 * 1024 {
+                return Some(fuse_reply(unique, -22, &[]));
+            }
             let contents = b"world";
             let off = rin.offset as usize;
             let end = core::cmp::min(contents.len(), off + rin.size as usize);
@@ -2856,8 +3094,117 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
             };
             Some(fuse_reply(unique, 0, slice))
         }
-        // FUSE_READDIR (28): one entry, "hello".
-        28 => {
+        // FUSE_READLINK (5): target bytes, with no trailing NUL.
+        5 => Some(fuse_reply(unique, 0, b"hello")),
+        // FUSE_STATFS (17): filesystem-wide capacity.
+        17 => {
+            let out = FuseStatfsOut {
+                st: FuseKstatfs {
+                    blocks: 1024,
+                    bfree: 512,
+                    bavail: 500,
+                    files: 100,
+                    ffree: 75,
+                    bsize: 4096,
+                    namelen: 255,
+                    frsize: 4096,
+                    ..Default::default()
+                },
+            };
+            Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
+        }
+        // FUSE_SETXATTR / REMOVEXATTR.
+        21 | 24 => Some(fuse_reply(unique, 0, &[])),
+        // FUSE_GETXATTR: size probe then value.
+        22 => {
+            let input: FuseGetxattrIn = pod_from_bytes(body)?;
+            if input.size == 0 {
+                Some(fuse_reply(
+                    unique,
+                    0,
+                    &pod_as_bytes(&FuseGetxattrOut {
+                        size: 3,
+                        padding: 0,
+                    }),
+                ))
+            } else {
+                Some(fuse_reply(unique, 0, b"bar"))
+            }
+        }
+        // FUSE_LISTXATTR: size probe then NUL-separated names.
+        23 => {
+            let input: FuseGetxattrIn = pod_from_bytes(body)?;
+            if input.size == 0 {
+                Some(fuse_reply(
+                    unique,
+                    0,
+                    &pod_as_bytes(&FuseGetxattrOut {
+                        size: 9,
+                        padding: 0,
+                    }),
+                ))
+            } else {
+                Some(fuse_reply(unique, 0, b"user.foo\0"))
+            }
+        }
+        // FUSE_ACCESS.
+        34 => Some(fuse_reply(unique, 0, &[])),
+        // FUSE_GETLK reports unlocked; SETLK/SETLKW acknowledge.
+        31 => Some(fuse_reply(
+            unique,
+            0,
+            &pod_as_bytes(&FuseLkOut {
+                lk: FuseFileLock {
+                    type_: 2, // F_UNLCK
+                    ..Default::default()
+                },
+            }),
+        )),
+        32 | 33 => Some(fuse_reply(unique, 0, &[])),
+        43 => Some(fuse_reply(unique, 0, &[])),
+        46 => {
+            let input: FuseLseekIn = pod_from_bytes(body)?;
+            Some(fuse_reply(
+                unique,
+                0,
+                &pod_as_bytes(&FuseLseekOut {
+                    offset: input.offset + 4,
+                }),
+            ))
+        }
+        47 => {
+            let input: FuseCopyFileRangeIn = pod_from_bytes(body)?;
+            Some(fuse_reply(
+                unique,
+                0,
+                &pod_as_bytes(&FuseWriteOut {
+                    size: input.len as u32,
+                    padding: 0,
+                }),
+            ))
+        }
+        40 => Some(fuse_reply(
+            unique,
+            0,
+            &pod_as_bytes(&FusePollOut {
+                revents: crate::POLL_IN,
+                padding: 0,
+            }),
+        )),
+        // FUSE_WRITE (16): report the requested payload size.
+        16 => {
+            let win: FuseWriteIn = pod_from_bytes(body)?;
+            if win.size > 128 * 1024 {
+                return Some(fuse_reply(unique, -22, &[]));
+            }
+            let out = FuseWriteOut {
+                size: win.size,
+                padding: 0,
+            };
+            Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
+        }
+        // FUSE_READDIR / FUSE_READDIRPLUS: one entry, "hello".
+        28 | 44 => {
             let mut out = alloc::vec::Vec::new();
             let de = FuseDirent {
                 ino: 2,
@@ -2865,15 +3212,84 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
                 namelen: 5,
                 type_: 8, // DT_REG
             };
-            out.extend_from_slice(&pod_as_bytes(&de));
+            if opcode == 44 {
+                out.extend_from_slice(&pod_as_bytes(&FuseDirentPlus {
+                    entry_out: FuseEntryOut {
+                        nodeid: 2,
+                        generation: 1,
+                        attr: file_attr,
+                        ..Default::default()
+                    },
+                    dirent: de,
+                }));
+            } else {
+                out.extend_from_slice(&pod_as_bytes(&de));
+            }
             out.extend_from_slice(b"hello");
             while out.len() % FUSE_DIRENT_ALIGN != 0 {
                 out.push(0);
             }
             Some(fuse_reply(unique, 0, &out))
         }
-        // FUSE_RELEASE (18): ack with empty body.
-        18 => Some(fuse_reply(unique, 0, &[])),
+        // FUSE_SETATTR (4): return refreshed attributes.
+        4 => {
+            let input: FuseSetattrIn = pod_from_bytes(body)?;
+            let mut attr = file_attr;
+            if input.valid & FATTR_SIZE != 0 {
+                attr.size = input.size;
+            }
+            if input.valid & FATTR_MODE != 0 {
+                attr.mode = input.mode;
+            }
+            let out = FuseAttrOut {
+                attr,
+                ..Default::default()
+            };
+            Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
+        }
+        // FUSE_CREATE (35): entry followed by open result.
+        35 => {
+            let entry = FuseEntryOut {
+                nodeid: 4,
+                generation: 1,
+                attr: file_attr,
+                ..Default::default()
+            };
+            let open = FuseOpenOut {
+                fh: 0x44,
+                ..Default::default()
+            };
+            let mut out = pod_as_bytes(&entry);
+            out.extend_from_slice(&pod_as_bytes(&open));
+            Some(fuse_reply(unique, 0, &out))
+        }
+        // FUSE_MKNOD / MKDIR / SYMLINK / LINK return an entry.
+        6 | 8 | 9 | 13 => {
+            let is_dir = opcode == 9;
+            let entry = FuseEntryOut {
+                nodeid: if is_dir { 3 } else { 4 },
+                generation: 1,
+                attr: if is_dir { dir_attr } else { file_attr },
+                ..Default::default()
+            };
+            Some(fuse_reply(unique, 0, &pod_as_bytes(&entry)))
+        }
+        30 => {
+            let input: FuseFsyncIn = pod_from_bytes(body)?;
+            FUSE_FSYNCDIR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            FUSE_FSYNCDIR_FLAGS.fetch_or(input.fsync_flags, core::sync::atomic::Ordering::Relaxed);
+            Some(fuse_reply(unique, 0, &[]))
+        }
+        50 => {
+            let input: FuseSyncfsIn = pod_from_bytes(body)?;
+            if hdr.nodeid != FUSE_ROOT_ID || input.padding != 0 {
+                return Some(fuse_reply(unique, -22, &[]));
+            }
+            FUSE_SYNCFS_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Some(fuse_reply(unique, 0, &[]))
+        }
+        // Namespace mutations, durability, and handle releases acknowledge empty.
+        10 | 11 | 12 | 18 | 20 | 25 | 29 | 45 => Some(fuse_reply(unique, 0, &[])),
         // FUSE_FORGET (2): has no reply; drop it.
         2 => None,
         // Anything else → -ENOSYS.
@@ -2947,7 +3363,7 @@ fn smoke_fs_fuse_end_to_end() -> TestResult {
                 return;
             }
         };
-        let mut buf = [0u8; 16];
+        let mut buf = alloc::vec![0u8; 128 * 1024 + 17];
         let n = match file.read(0, &mut buf).await {
             Ok(n) => n,
             Err(_) => {
@@ -2968,7 +3384,14 @@ fn smoke_fs_fuse_end_to_end() -> TestResult {
     let _ = unmount_for_test_fuse("/fuse_e2e");
 
     match OUTCOME.load(Ordering::Relaxed) {
-        1 => TestResult::Pass,
+        1 if conn.negotiated_minor() == crate::fuse::FUSE_KERNEL_MINOR_VERSION
+            && conn.max_write() == 256 * 1024
+            && conn.max_pages() == 32
+            && conn.negotiated_flags() & crate::fuse::FuseInitFlag::PosixLocks as u64 != 0 =>
+        {
+            TestResult::Pass
+        }
+        1 => TestResult::Fail("FUSE_INIT limits or flags not negotiated"),
         2 => TestResult::Fail("FUSE_INIT handshake failed"),
         3 => TestResult::Fail("FUSE_LOOKUP hello failed"),
         4 => TestResult::Fail("FUSE_READ hello failed"),
@@ -3049,6 +3472,339 @@ fn smoke_fs_fuse_readdir_getattr() -> TestResult {
     }
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_readdir_getattr);
+
+/// READLINK and STATFS use their dedicated Linux FUSE operations.
+fn smoke_fs_fuse_metadata_queries() -> TestResult {
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use crate::FsInstance;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+
+    let conn = Arc::new(FuseConnection::new());
+    let fs = Arc::new(FuseFs::new("fuse-meta", Arc::clone(&conn)));
+    narf_scheduler::__reset_queues_for_test();
+    spawn_fuse_daemon(Arc::clone(&conn), &OUTCOME);
+
+    narf_scheduler::spawn(async move {
+        if fs.init().await.is_err() {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        let link = match fs.root().lookup_async("sym").await {
+            Ok(link) => link,
+            Err(_) => {
+                OUTCOME.store(3, Ordering::Relaxed);
+                return;
+            }
+        };
+        let mut target = [0u8; 16];
+        if link.read(0, &mut target).await != Ok(5) || &target[..5] != b"hello" {
+            OUTCOME.store(4, Ordering::Relaxed);
+            return;
+        }
+        let stat = match fs.statfs().await {
+            Ok(stat) => stat,
+            Err(_) => {
+                OUTCOME.store(5, Ordering::Relaxed);
+                return;
+            }
+        };
+        if stat.blocks == 1024
+            && stat.blocks_free == 512
+            && stat.blocks_available == 500
+            && stat.files == 100
+            && stat.files_free == 75
+            && stat.block_size == 4096
+            && stat.name_len == 255
+        {
+            OUTCOME.store(1, Ordering::Relaxed);
+        } else {
+            OUTCOME.store(6, Ordering::Relaxed);
+        }
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("FUSE_INIT failed"),
+        3 => TestResult::Fail("FUSE symlink lookup failed"),
+        4 => TestResult::Fail("FUSE_READLINK returned wrong target"),
+        5 => TestResult::Fail("FUSE_STATFS failed"),
+        6 => TestResult::Fail("FUSE_STATFS returned wrong capacity"),
+        _ => TestResult::Fail("FUSE metadata client never completed"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_metadata_queries);
+
+/// Linux mutation operations traverse the real VFS trait surface and
+/// produce replies with the expected entry/open shapes.
+fn smoke_fs_fuse_mutations() -> TestResult {
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use crate::{FileType, FsInstance};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+    FUSE_FSYNCDIR_COUNT.store(0, Ordering::Relaxed);
+    FUSE_FSYNCDIR_FLAGS.store(0, Ordering::Relaxed);
+    FUSE_SYNCFS_COUNT.store(0, Ordering::Relaxed);
+
+    let conn = Arc::new(FuseConnection::new());
+    let fs = Arc::new(FuseFs::new("fuse-rw", Arc::clone(&conn)));
+    narf_scheduler::__reset_queues_for_test();
+    spawn_fuse_daemon(Arc::clone(&conn), &OUTCOME);
+
+    narf_scheduler::spawn(async move {
+        if fs.init().await.is_err() {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        let root = fs.root();
+        let file = match root.create("new").await {
+            Ok(file) => file,
+            Err(_) => {
+                OUTCOME.store(3, Ordering::Relaxed);
+                return;
+            }
+        };
+        let large_write = alloc::vec![0x5a; 128 * 1024 + 17];
+        if root.fsync(false).await.is_err()
+            || root.fsync(true).await.is_err()
+            || root.syncfs().await.is_err()
+            || file.write(0, b"payload").await != Ok(7)
+            || file.syncfs().await.is_err()
+            || file.write(7, &large_write).await != Ok(large_write.len())
+            || file.truncate(3).await.is_err()
+            || file.set_perms(0o600).await.is_err()
+            || file.set_owners(1000, 1000).await.is_err()
+            || file.flush().await.is_err()
+            || file.fsync(false).await.is_err()
+            || file.fsync(true).await.is_err()
+            || file.set_xattr("user.foo", b"bar", 0).await.is_err()
+            || file.get_xattr("user.foo").await != Ok(b"bar".to_vec())
+            || file.list_xattr().await != Ok(b"user.foo\0".to_vec())
+            || file.remove_xattr("user.foo").await.is_err()
+            || file.access(6).await.is_err()
+            || file
+                .set_lock(
+                    7,
+                    crate::FileLock {
+                        start: 0,
+                        end: 99,
+                        type_: 1,
+                        pid: 7,
+                    },
+                    false,
+                )
+                .await
+                .is_err()
+            || file
+                .set_lock(
+                    7,
+                    crate::FileLock {
+                        start: 0,
+                        end: 99,
+                        type_: 1,
+                        pid: 7,
+                    },
+                    true,
+                )
+                .await
+                .is_err()
+            || file
+                .get_lock(
+                    7,
+                    crate::FileLock {
+                        start: 0,
+                        end: 99,
+                        type_: 1,
+                        pid: 7,
+                    },
+                )
+                .await
+                .map(|lock| lock.type_)
+                != Ok(2)
+            || file.fallocate(0, 0, 4096).await.is_err()
+            || file.seek(4, 3).await != Ok(8)
+            || file.copy_file_range_to(0, &*file, 8, 16, 0).await != Ok(16)
+        {
+            OUTCOME.store(4, Ordering::Relaxed);
+            return;
+        }
+        let _ = file.poll_readiness();
+        narf_scheduler::yield_now().await;
+        if file.poll_readiness() != crate::POLL_IN {
+            OUTCOME.store(4, Ordering::Relaxed);
+            return;
+        }
+        let dir = match root.mkdir("dir").await {
+            Ok(dir) => dir,
+            Err(_) => {
+                OUTCOME.store(5, Ordering::Relaxed);
+                return;
+            }
+        };
+        if root.mknod("fifo", FileType::Fifo, 0).await.is_err()
+            || root.symlink("sym", "new").await.is_err()
+            || root.link("hello", "hard").await.is_err()
+            || root.link_to("hello", &*dir, "cross-hard").await.is_err()
+            || root
+                .rename_to("new", &*dir, "cross-renamed", 1)
+                .await
+                .is_err()
+            || root.rename("new", "renamed").await.is_err()
+            || root.unlink("renamed").await.is_err()
+            || root.rmdir("dir").await.is_err()
+        {
+            OUTCOME.store(5, Ordering::Relaxed);
+            return;
+        }
+        OUTCOME.store(1, Ordering::Relaxed);
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 if FUSE_FSYNCDIR_COUNT.load(Ordering::Relaxed) == 2
+            && FUSE_FSYNCDIR_FLAGS.load(Ordering::Relaxed) == crate::fuse::FUSE_FSYNC_FDATASYNC =>
+        {
+            if FUSE_SYNCFS_COUNT.load(Ordering::Relaxed) == 2 {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("FUSE_SYNCFS requests were not observed")
+            }
+        }
+        1 => TestResult::Fail("FUSE_FSYNCDIR requests were not observed"),
+        2 => TestResult::Fail("FUSE_INIT failed"),
+        3 => TestResult::Fail("FUSE_CREATE failed"),
+        4 => TestResult::Fail("FUSE file mutation failed"),
+        5 => TestResult::Fail("FUSE namespace mutation failed"),
+        _ => TestResult::Fail("FUSE mutation client never completed"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_mutations);
+
+/// A too-small `/dev/fuse` daemon buffer returns EINVAL-shaped
+/// `InvalidData` without consuming or truncating the queued request.
+fn smoke_fs_fuse_short_read_preserves_request() -> TestResult {
+    use crate::fuse_conn::{DevFuse, FuseFs};
+    use crate::{FileOps, FsError};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+
+    let dev: Arc<dyn FileOps> = DevFuse::open_new();
+    let conn = DevFuse::connection_of(&dev).unwrap();
+    let fs = Arc::new(FuseFs::new("fuse-short", Arc::clone(&conn)));
+    narf_scheduler::__reset_queues_for_test();
+
+    let daemon_dev = Arc::clone(&dev);
+    let daemon_conn = Arc::clone(&conn);
+    narf_scheduler::spawn(async move {
+        while !daemon_conn.has_request() {
+            narf_scheduler::yield_now().await;
+        }
+        let mut short = [0u8; 1];
+        if daemon_dev.read(0, &mut short).await != Err(FsError::InvalidData)
+            || !daemon_conn.has_request()
+        {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        let mut full = [0u8; 512];
+        let n = match daemon_dev.read(0, &mut full).await {
+            Ok(n) => n,
+            Err(_) => {
+                OUTCOME.store(3, Ordering::Relaxed);
+                return;
+            }
+        };
+        let Some(reply) = fuse_daemon_answer(&full[..n]) else {
+            OUTCOME.store(4, Ordering::Relaxed);
+            return;
+        };
+        let _ = daemon_conn.complete_reply(&reply);
+    });
+
+    narf_scheduler::spawn(async move {
+        if fs.init().await.is_ok() {
+            OUTCOME.store(1, Ordering::Relaxed);
+        } else {
+            OUTCOME.store(5, Ordering::Relaxed);
+        }
+    });
+    narf_scheduler::run_until_empty();
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("short read consumed or accepted request"),
+        3 => TestResult::Fail("full retry failed"),
+        4 => TestResult::Fail("preserved request was malformed"),
+        5 => TestResult::Fail("FUSE_INIT retry failed"),
+        _ => TestResult::Fail("short-read tasks never completed"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_short_read_preserves_request);
+
+/// Cancelling an operation already read by the daemon emits FUSE_INTERRUPT
+/// naming the original request unique ID.
+fn smoke_fs_fuse_delivered_cancel_interrupts() -> TestResult {
+    use crate::fuse::{pod_from_bytes, FuseInHeader, FuseInterruptIn, FuseOpcode};
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VT)
+    }
+    fn noop(_: *const ()) {}
+    static VT: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+
+    let conn = Arc::new(FuseConnection::new());
+    let fs = FuseFs::new("fuse-cancel", Arc::clone(&conn));
+    let mut future = alloc::boxed::Box::pin(fs.init());
+    // SAFETY: the static vtable never dereferences its null data pointer.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+    let mut cx = Context::from_waker(&waker);
+    if !matches!(Pin::new(&mut future).poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("FUSE_INIT unexpectedly completed without daemon");
+    }
+    let original = match conn.dequeue_request() {
+        Some(request) => request,
+        None => return TestResult::Fail("FUSE_INIT was not queued"),
+    };
+    let original_header: FuseInHeader = match pod_from_bytes(&original) {
+        Some(header) => header,
+        None => return TestResult::Fail("FUSE_INIT header malformed"),
+    };
+    drop(future);
+    let interrupt = match conn.dequeue_request() {
+        Some(request) => request,
+        None => return TestResult::Fail("delivered cancellation did not queue interrupt"),
+    };
+    let header: FuseInHeader = match pod_from_bytes(&interrupt) {
+        Some(header) => header,
+        None => return TestResult::Fail("FUSE_INTERRUPT header malformed"),
+    };
+    let body = &interrupt[core::mem::size_of::<FuseInHeader>()..];
+    let input: FuseInterruptIn = match pod_from_bytes(body) {
+        Some(input) => input,
+        None => return TestResult::Fail("FUSE_INTERRUPT body malformed"),
+    };
+    if header.opcode == FuseOpcode::Interrupt as u32 && input.unique == original_header.unique {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("FUSE_INTERRUPT named wrong request")
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_delivered_cancel_interrupts);
 
 /// `/dev/fuse` device wiring: opening the node yields a DevFuse whose
 /// connection is recoverable (the mount path's `fd=N` → connection step).

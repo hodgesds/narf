@@ -677,8 +677,8 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_sync_file_range_neg);
 
 // ── sync / syncfs ──────────────────────────────────────────────────
 //
-// Both are unconditional no-op success stubs. There is no error path
-// (sync takes no args; syncfs ignores its fd), so only a positive test.
+// `sync` has no error path; `syncfs` validates and flushes its fd's
+// backing filesystem.
 
 fn smoke_abi_fdio_sync_pos() -> TestResult {
     with_setup(|| match call(Syscall::Sync.raw(), a0(0)) {
@@ -690,11 +690,12 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_sync_pos);
 
 fn smoke_abi_fdio_syncfs_pos() -> TestResult {
     with_setup(|| {
-        // syncfs ignores its fd argument and always returns 0 — even a
-        // bogus fd succeeds (NARF FSes have no write-back).
-        match call(Syscall::Syncfs.raw(), a0(9999)) {
-            Some(0) => Ok(()),
-            _ => Err("syncfs did not return 0"),
+        match (
+            call(Syscall::Syncfs.raw(), a0(0)),
+            call(Syscall::Syncfs.raw(), a0(9999)),
+        ) {
+            (Some(0), Some(-9)) => Ok(()),
+            _ => Err("syncfs did not flush a valid fd or reject a bad fd"),
         }
     })
 }

@@ -608,6 +608,7 @@ pub fn init_per_task_state() {
     sid_init();
     wait_init();
     pkey_init();
+    narf_filesystem::fuse_conn::install_request_context_provider(fuse_request_context);
     #[cfg(feature = "linux-compat")]
     {
         ctty_init();
@@ -2246,6 +2247,11 @@ fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
         old_abs,
         new_abs,
         |_fs, old_dir, old_leaf, new_dir, new_leaf| {
+            match poll_blocking(old_dir.rename_to(old_leaf, &*new_dir, new_leaf, 0)) {
+                Some(Ok(())) => return 0,
+                Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+                Some(Err(e)) => return rename_errno(e) as i64,
+            }
             // Directories would need a DirOps-shaped `link_node` the
             // trait doesn't have yet; report EXDEV so callers fall back
             // to a recursive copy rather than silently doing nothing.
@@ -2286,11 +2292,8 @@ fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
 
 // ── link / linkat — hard links ─────────────────────────────────────
 //
-// Same-parent only, mirroring sys_rename's restriction (the DirOps
-// surface has no registry-aware two-parent lock). A cross-directory
-// link surfaces as -EXDEV, which every `ln`/libc caller already
-// handles (it is the normal cross-filesystem answer on Linux, and
-// cp/install fall back to a copy on it).
+// Cross-parent links are routed through `DirOps::link_to` when both
+// parents belong to one filesystem; different mounts return EXDEV.
 
 /// Shared body: both paths already read from user memory, still raw
 /// (cwd-relative allowed). Resolves, enforces same-parent, calls the
@@ -2305,7 +2308,27 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         return;
     };
     if old_path[..old_split] != new_path[..new_split] {
-        ctx.set_return(SyscallReturn::ok((-18i64) as u64)); // EXDEV
+        let outcome = narf_filesystem::registry().resolve_two_parents_absolute(
+            &old_path,
+            &new_path,
+            |_fs, old_dir, old_leaf, new_dir, new_leaf| {
+                poll_blocking(old_dir.link_to(old_leaf, &*new_dir, new_leaf))
+            },
+        );
+        match outcome {
+            Some(Some(Ok(()))) => {
+                #[cfg(feature = "linux-compat")]
+                crate::mqueue::notify_create(&new_path, false);
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+            Some(Some(Err(narf_filesystem::FsError::NotFound))) => {
+                ctx.set_return(SyscallReturn::ok((-2i64) as u64))
+            }
+            Some(Some(Err(narf_filesystem::FsError::Busy))) => {
+                ctx.set_return(SyscallReturn::ok((-17i64) as u64))
+            }
+            _ => ctx.set_return(SyscallReturn::ok((-18i64) as u64)),
+        }
         return;
     }
     let new_leaf = alloc::string::String::from(&new_path[new_split + 1..]);
@@ -2865,6 +2888,16 @@ fn xattr_fd_key(fd: u32) -> Option<alloc::string::String> {
     fd_path_of(current_task_id(), fd)
 }
 
+fn xattr_file(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
+    let (root, rel) = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
+        (fs.root(), alloc::string::String::from(rel))
+    })?;
+    match poll_blocking(narf_filesystem::resolve_async_nofollow(root, &rel)) {
+        Some(Ok(file)) => Some(file),
+        _ => None,
+    }
+}
+
 /// `setxattr` / `lsetxattr` / `fsetxattr` core (name/value/size/flags at
 /// arg1..arg4; the key path is resolved by the caller).
 fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
@@ -2890,6 +2923,27 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
         }
     };
     let flags = a.arg4;
+    if let Some(file) = xattr_file(&path) {
+        match poll_blocking(file.set_xattr(&name, &value, flags as u32)) {
+            Some(Ok(())) => {
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+            Some(Err(narf_filesystem::FsError::Busy)) => {
+                ctx.set_return(SyscallReturn::ok((-17i64) as u64));
+                return;
+            }
+            Some(Err(narf_filesystem::FsError::NotFound)) => {
+                ctx.set_return(SyscallReturn::ok((-61i64) as u64));
+                return;
+            }
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                return;
+            }
+        }
+    }
     let key = (path, name);
     let mut g = XATTR_TABLE.lock();
     let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
@@ -2918,6 +2972,22 @@ fn xattr_get_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
         }
     };
     let size = a.arg3 as usize;
+    if let Some(file) = xattr_file(&path) {
+        match poll_blocking(file.get_xattr(&name)) {
+            Some(Ok(value)) => {
+                return xattr_copy_value(ctx, a.arg2, size, &value);
+            }
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+            Some(Err(narf_filesystem::FsError::NotFound)) => {
+                ctx.set_return(SyscallReturn::ok((-61i64) as u64));
+                return;
+            }
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                return;
+            }
+        }
+    }
     let value = {
         let g = XATTR_TABLE.lock();
         match g.as_ref().and_then(|m| m.get(&(path, name)).cloned()) {
@@ -2928,26 +2998,39 @@ fn xattr_get_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
             }
         }
     };
+    xattr_copy_value(ctx, a.arg2, size, &value);
+}
+
+fn xattr_copy_value(ctx: &mut dyn TrapContext, ptr: u64, size: usize, value: &[u8]) {
     if size == 0 {
         ctx.set_return(SyscallReturn::ok(value.len() as u64));
-        return;
-    }
-    if size < value.len() {
-        ctx.set_return(SyscallReturn::ok((-34i64) as u64)); // ERANGE
-        return;
-    }
-    // SAFETY: a.arg2 is the user buffer; copy_to_user range-validates the write.
-    if unsafe { copy_to_user(a.arg2, &value) }.is_err() {
+    } else if size < value.len() {
+        ctx.set_return(SyscallReturn::ok((-34i64) as u64));
+    // SAFETY: `ptr` is the caller's output buffer; `copy_to_user`
+    // range-validates and SMAP-brackets the write.
+    } else if unsafe { copy_to_user(ptr, value) }.is_err() {
         ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-        return;
+    } else {
+        ctx.set_return(SyscallReturn::ok(value.len() as u64));
     }
-    ctx.set_return(SyscallReturn::ok(value.len() as u64));
 }
 
 /// `listxattr` / `llistxattr` / `flistxattr` core (list at arg1, size at arg2).
 fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let size = a.arg2 as usize;
+    if let Some(file) = xattr_file(&path) {
+        match poll_blocking(file.list_xattr()) {
+            Some(Ok(names)) => {
+                return xattr_copy_value(ctx, a.arg1, size, &names);
+            }
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                return;
+            }
+        }
+    }
     let mut names: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     {
         let g = XATTR_TABLE.lock();
@@ -2986,6 +3069,23 @@ fn xattr_remove_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    if let Some(file) = xattr_file(&path) {
+        match poll_blocking(file.remove_xattr(&name)) {
+            Some(Ok(())) => {
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+            Some(Err(narf_filesystem::FsError::NotFound)) => {
+                ctx.set_return(SyscallReturn::ok((-61i64) as u64));
+                return;
+            }
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                return;
+            }
+        }
+    }
     let removed = {
         let mut g = XATTR_TABLE.lock();
         g.as_mut().map(|m| m.remove(&(path, name)).is_some())
@@ -7167,6 +7267,16 @@ fn current_accessor(task: u64) -> narf_filesystem::Accessor {
     }
 }
 
+fn fuse_request_context() -> narf_filesystem::fuse_conn::FuseRequestContext {
+    let task = current_task_id();
+    let accessor = current_accessor(task);
+    narf_filesystem::fuse_conn::FuseRequestContext {
+        uid: accessor.uid,
+        gid: accessor.gid,
+        pid: task_to_pid_raw(task).unwrap_or(task) as u32,
+    }
+}
+
 /// Test-only window onto the DAC funnel so the security smoke can
 /// assert the exact host-id translation `sys_open` would use.
 #[cfg(feature = "container")]
@@ -8190,6 +8300,12 @@ impl narf_filesystem::FileOps for DirFdFile {
     fn as_dir(&self) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
         Some(self.dir.clone())
     }
+    fn fsync<'a>(&'a self, data_only: bool) -> narf_filesystem::FsFuture<'a, ()> {
+        self.dir.fsync(data_only)
+    }
+    fn syncfs<'a>(&'a self) -> narf_filesystem::FsFuture<'a, ()> {
+        self.dir.syncfs()
+    }
     /// A directory fd has no readable/writable stream (read/write are
     /// EISDIR; enumeration is getdents64). Report NOT ready so a poll/epoll
     /// consumer never spuriously wakes on it — the always-ready FileOps
@@ -9170,21 +9286,31 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     }
     // Map the filesystem covering `path` to its Linux super-magic so callers
     // detect the fs type (elogind → CGROUP2_SUPER_MAGIC at /sys/fs/cgroup).
-    let fs_name = narf_filesystem::registry()
-        .resolve_absolute(path, |fs, _rel| alloc::string::String::from(fs.name()));
-    let f_type = match fs_name.as_deref() {
-        Some("cgroup2") | Some("cgroup") => CGROUP2_SUPER_MAGIC,
-        Some("sysfs") => SYSFS_MAGIC,
-        Some("procfs") | Some("proc") => PROC_SUPER_MAGIC,
-        Some(n) if n.starts_with("ext") => EXT2_SUPER_MAGIC,
-        Some(_) => TMPFS_MAGIC, // tmpfs / devtmpfs / shm / other memfs-backed
-        None => return false,   // no mount covers the path
+    let fs = match narf_filesystem::registry().fs_arc_at(path) {
+        Some(fs) => fs,
+        None => return false,
+    };
+    let f_type = match fs.name() {
+        "cgroup2" | "cgroup" => CGROUP2_SUPER_MAGIC,
+        "sysfs" => SYSFS_MAGIC,
+        "procfs" | "proc" => PROC_SUPER_MAGIC,
+        n if n.starts_with("ext") => EXT2_SUPER_MAGIC,
+        _ => TMPFS_MAGIC, // tmpfs / devtmpfs / shm / other memfs-backed
+    };
+    let fs_stat = match poll_blocking(fs.statfs()) {
+        Some(Ok(stat)) => stat,
+        _ => return false,
     };
     let stat = StatfsBuf {
         f_type,
-        f_bsize: 4096,
-        f_namelen: 255,
-        f_frsize: 4096,
+        f_bsize: u64::from(fs_stat.block_size),
+        f_blocks: fs_stat.blocks,
+        f_bfree: fs_stat.blocks_free,
+        f_bavail: fs_stat.blocks_available,
+        f_files: fs_stat.files,
+        f_ffree: fs_stat.files_free,
+        f_namelen: u64::from(fs_stat.name_len),
+        f_frsize: u64::from(fs_stat.fragment_size),
         ..Default::default()
     };
     // Copy the statfs struct to user space under the SMAP bracket.
@@ -13482,7 +13608,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(
         Syscall::Faccessat2,
         "faccessat2",
-        RawFnHandler(sys_at2_reshape),
+        RawFnHandler(sys_faccessat),
     );
     table.install_raw(
         Syscall::Fchmodat2,
@@ -14170,8 +14296,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Pread64, "pread64", RawFnHandler(sys_pread64));
     table.install_raw(Syscall::Pwrite64, "pwrite64", RawFnHandler(sys_pwrite64));
     table.install_raw(Syscall::Fsync, "fsync", RawFnHandler(sys_fsync));
-    // Fdatasync shares fsync's body — both are structural no-ops.
-    table.install_raw(Syscall::Fdatasync, "fdatasync", RawFnHandler(sys_fsync));
+    table.install_raw(Syscall::Fdatasync, "fdatasync", RawFnHandler(sys_fdatasync));
     table.install_raw(Syscall::Pipe2, "pipe2", RawFnHandler(sys_pipe2));
     table.install_raw(Syscall::Fallocate, "fallocate", RawFnHandler(sys_fallocate));
     table.install_raw(
@@ -14200,11 +14325,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "fchownat",
         RawFnHandler(sys_fchmodat_or_fchownat),
     );
-    table.install_raw(
-        Syscall::Faccessat,
-        "faccessat",
-        RawFnHandler(sys_fchmodat_or_fchownat),
-    );
+    table.install_raw(Syscall::Faccessat, "faccessat", RawFnHandler(sys_faccessat));
     table.install_raw(Syscall::Openat, "openat", RawFnHandler(sys_openat));
     #[cfg(not(feature = "linux-compat"))]
     table.install_raw(
@@ -14231,11 +14352,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "readlinkat",
         RawFnHandler(sys_readlinkat),
     );
-    table.install_raw(
-        Syscall::Access,
-        "access",
-        RawFnHandler(sys_access_chmod_chown),
-    );
+    table.install_raw(Syscall::Access, "access", RawFnHandler(sys_access));
     table.install_raw(Syscall::Chmod, "chmod", RawFnHandler(sys_chmod));
     table.install_raw(
         Syscall::Chown,
@@ -15751,140 +15868,269 @@ pub(crate) use handler_sys_timerfd_gettime::*;
 pub use handler_sys_umount2_for_test::*;
 #[allow(unused_imports)]
 pub(crate) use {
-    handler_sys_access_chmod_chown::sys_access_chmod_chown, handler_sys_adjtimex::sys_adjtimex,
-    handler_sys_at2_reshape::sys_at2_reshape, handler_sys_bootstrap::sys_bootstrap,
-    handler_sys_brk::sys_brk, handler_sys_capget::sys_capget, handler_sys_capset::sys_capset,
-    handler_sys_chdir::sys_chdir, handler_sys_chmod::sys_chmod,
-    handler_sys_clock_adjtime::sys_clock_adjtime, handler_sys_clock_getres::sys_clock_getres,
-    handler_sys_clock_gettime::sys_clock_gettime, handler_sys_clock_settime::sys_clock_settime,
-    handler_sys_close::sys_close, handler_sys_close_range::sys_close_range,
-    handler_sys_copy_file_range::sys_copy_file_range, handler_sys_creat::sys_creat,
-    handler_sys_delete_module::sys_delete_module, handler_sys_dup::sys_dup,
-    handler_sys_dup2::sys_dup2, handler_sys_dup3::sys_dup3,
-    handler_sys_epoll_create::sys_epoll_create, handler_sys_epoll_ctl::sys_epoll_ctl,
-    handler_sys_epoll_wait::sys_epoll_wait, handler_sys_eventfd::sys_eventfd,
-    handler_sys_execve::sys_execve, handler_sys_execveat::sys_execveat,
-    handler_sys_exit_group::sys_exit_group, handler_sys_exit_task::sys_exit_task,
-    handler_sys_fadvise64::sys_fadvise64, handler_sys_fallocate::sys_fallocate,
-    handler_sys_fb_connect::sys_fb_connect, handler_sys_fb_disconnect::sys_fb_disconnect,
-    handler_sys_fb_flush_wait::sys_fb_flush_wait, handler_sys_fb_info::sys_fb_info,
-    handler_sys_fb_ring_map::sys_fb_ring_map, handler_sys_fchdir::sys_fchdir,
-    handler_sys_fchmod_or_fchown::sys_fchmod_or_fchown, handler_sys_fchmodat::sys_fchmodat,
-    handler_sys_fchmodat_or_fchownat::sys_fchmodat_or_fchownat, handler_sys_fcntl::sys_fcntl,
-    handler_sys_fgetxattr::sys_fgetxattr, handler_sys_finit_module::sys_finit_module,
-    handler_sys_firmware_install::sys_firmware_install, handler_sys_flistxattr::sys_flistxattr,
-    handler_sys_flock::sys_flock, handler_sys_fork::sys_fork,
-    handler_sys_fremovexattr::sys_fremovexattr, handler_sys_fsetxattr::sys_fsetxattr,
-    handler_sys_fstat::sys_fstat, handler_sys_fstatfs::sys_fstatfs, handler_sys_fsync::sys_fsync,
-    handler_sys_ftruncate::sys_ftruncate, handler_sys_futex::sys_futex,
-    handler_sys_futex_requeue::sys_futex_requeue, handler_sys_futex_wait::sys_futex_wait,
-    handler_sys_futex_waitv::sys_futex_waitv, handler_sys_futex_wake::sys_futex_wake,
-    handler_sys_futimesat::sys_futimesat, handler_sys_get_mempolicy::sys_get_mempolicy,
-    handler_sys_get_robust_list::sys_get_robust_list, handler_sys_getcpu::sys_getcpu,
-    handler_sys_getcwd::sys_getcwd, handler_sys_getdents::sys_getdents,
-    handler_sys_getdents64::sys_getdents64, handler_sys_getegid::sys_getegid,
-    handler_sys_geteuid::sys_geteuid, handler_sys_getgid::sys_getgid,
-    handler_sys_getgroups::sys_getgroups, handler_sys_gethostname::sys_gethostname,
-    handler_sys_getpgid::sys_getpgid, handler_sys_getpgrp::sys_getpgrp,
-    handler_sys_getpid::sys_getpid, handler_sys_getppid::sys_getppid,
-    handler_sys_getpriority::sys_getpriority, handler_sys_getrandom::sys_getrandom,
-    handler_sys_getresgid::sys_getresgid, handler_sys_getresuid::sys_getresuid,
-    handler_sys_getrlimit::sys_getrlimit, handler_sys_getrusage::sys_getrusage,
-    handler_sys_getsid::sys_getsid, handler_sys_gettid::sys_gettid,
-    handler_sys_gettimeofday::sys_gettimeofday, handler_sys_getuid::sys_getuid,
-    handler_sys_getxattr::sys_getxattr, handler_sys_init_module::sys_init_module,
-    handler_sys_ioctl::sys_ioctl, handler_sys_ioprio_get::sys_ioprio_get,
-    handler_sys_ioprio_set::sys_ioprio_set, handler_sys_kcmp::sys_kcmp, handler_sys_kill::sys_kill,
-    handler_sys_link::sys_link, handler_sys_linkat::sys_linkat, handler_sys_listdir::sys_listdir,
-    handler_sys_listxattr::sys_listxattr, handler_sys_lseek::sys_lseek,
-    handler_sys_mbind::sys_mbind, handler_sys_membarrier::sys_membarrier,
-    handler_sys_memfd_create::sys_memfd_create, handler_sys_memfd_secret::sys_memfd_secret,
-    handler_sys_migrate_pages::sys_migrate_pages, handler_sys_mincore::sys_mincore,
-    handler_sys_mkdir::sys_mkdir, handler_sys_mkdirat::sys_mkdirat, handler_sys_mknod::sys_mknod,
-    handler_sys_mknodat::sys_mknodat, handler_sys_mlock::sys_mlock, handler_sys_mlock2::sys_mlock2,
-    handler_sys_mlockall::sys_mlockall, handler_sys_mmap::sys_mmap, handler_sys_mount::sys_mount,
-    handler_sys_move_pages::sys_move_pages, handler_sys_mprotect::sys_mprotect,
-    handler_sys_mremap::sys_mremap, handler_sys_msync::sys_msync, handler_sys_munlock::sys_munlock,
-    handler_sys_munlockall::sys_munlockall, handler_sys_munmap::sys_munmap,
-    handler_sys_newfstatat::sys_newfstatat, handler_sys_noop_ok::sys_noop_ok,
-    handler_sys_open::sys_open, handler_sys_open_linux::sys_open_linux,
-    handler_sys_openat::sys_openat, handler_sys_openat2::sys_openat2, handler_sys_pause::sys_pause,
-    handler_sys_personality::sys_personality, handler_sys_pidfd_getfd::sys_pidfd_getfd,
-    handler_sys_pidfd_open::sys_pidfd_open, handler_sys_pidfd_send_signal::sys_pidfd_send_signal,
-    handler_sys_pipe::sys_pipe, handler_sys_pipe2::sys_pipe2,
-    handler_sys_pkey_alloc::sys_pkey_alloc, handler_sys_pkey_free::sys_pkey_free,
-    handler_sys_pkey_mprotect::sys_pkey_mprotect, handler_sys_poll::sys_poll,
-    handler_sys_prctl::sys_prctl, handler_sys_pread64::sys_pread64, handler_sys_preadv::sys_preadv,
-    handler_sys_preadv2::sys_preadv2, handler_sys_prlimit64::sys_prlimit64,
+    handler_sys_access_chmod_chown::{sys_access, sys_access_chmod_chown, sys_faccessat},
+    handler_sys_adjtimex::sys_adjtimex,
+    handler_sys_at2_reshape::sys_at2_reshape,
+    handler_sys_bootstrap::sys_bootstrap,
+    handler_sys_brk::sys_brk,
+    handler_sys_capget::sys_capget,
+    handler_sys_capset::sys_capset,
+    handler_sys_chdir::sys_chdir,
+    handler_sys_chmod::sys_chmod,
+    handler_sys_clock_adjtime::sys_clock_adjtime,
+    handler_sys_clock_getres::sys_clock_getres,
+    handler_sys_clock_gettime::sys_clock_gettime,
+    handler_sys_clock_settime::sys_clock_settime,
+    handler_sys_close::sys_close,
+    handler_sys_close_range::sys_close_range,
+    handler_sys_copy_file_range::sys_copy_file_range,
+    handler_sys_creat::sys_creat,
+    handler_sys_delete_module::sys_delete_module,
+    handler_sys_dup::sys_dup,
+    handler_sys_dup2::sys_dup2,
+    handler_sys_dup3::sys_dup3,
+    handler_sys_epoll_create::sys_epoll_create,
+    handler_sys_epoll_ctl::sys_epoll_ctl,
+    handler_sys_epoll_wait::sys_epoll_wait,
+    handler_sys_eventfd::sys_eventfd,
+    handler_sys_execve::sys_execve,
+    handler_sys_execveat::sys_execveat,
+    handler_sys_exit_group::sys_exit_group,
+    handler_sys_exit_task::sys_exit_task,
+    handler_sys_fadvise64::sys_fadvise64,
+    handler_sys_fallocate::sys_fallocate,
+    handler_sys_fb_connect::sys_fb_connect,
+    handler_sys_fb_disconnect::sys_fb_disconnect,
+    handler_sys_fb_flush_wait::sys_fb_flush_wait,
+    handler_sys_fb_info::sys_fb_info,
+    handler_sys_fb_ring_map::sys_fb_ring_map,
+    handler_sys_fchdir::sys_fchdir,
+    handler_sys_fchmod_or_fchown::sys_fchmod_or_fchown,
+    handler_sys_fchmodat::sys_fchmodat,
+    handler_sys_fchmodat_or_fchownat::sys_fchmodat_or_fchownat,
+    handler_sys_fcntl::sys_fcntl,
+    handler_sys_fgetxattr::sys_fgetxattr,
+    handler_sys_finit_module::sys_finit_module,
+    handler_sys_firmware_install::sys_firmware_install,
+    handler_sys_flistxattr::sys_flistxattr,
+    handler_sys_flock::sys_flock,
+    handler_sys_fork::sys_fork,
+    handler_sys_fremovexattr::sys_fremovexattr,
+    handler_sys_fsetxattr::sys_fsetxattr,
+    handler_sys_fstat::sys_fstat,
+    handler_sys_fstatfs::sys_fstatfs,
+    handler_sys_fsync::{sys_fdatasync, sys_fsync},
+    handler_sys_ftruncate::sys_ftruncate,
+    handler_sys_futex::sys_futex,
+    handler_sys_futex_requeue::sys_futex_requeue,
+    handler_sys_futex_wait::sys_futex_wait,
+    handler_sys_futex_waitv::sys_futex_waitv,
+    handler_sys_futex_wake::sys_futex_wake,
+    handler_sys_futimesat::sys_futimesat,
+    handler_sys_get_mempolicy::sys_get_mempolicy,
+    handler_sys_get_robust_list::sys_get_robust_list,
+    handler_sys_getcpu::sys_getcpu,
+    handler_sys_getcwd::sys_getcwd,
+    handler_sys_getdents::sys_getdents,
+    handler_sys_getdents64::sys_getdents64,
+    handler_sys_getegid::sys_getegid,
+    handler_sys_geteuid::sys_geteuid,
+    handler_sys_getgid::sys_getgid,
+    handler_sys_getgroups::sys_getgroups,
+    handler_sys_gethostname::sys_gethostname,
+    handler_sys_getpgid::sys_getpgid,
+    handler_sys_getpgrp::sys_getpgrp,
+    handler_sys_getpid::sys_getpid,
+    handler_sys_getppid::sys_getppid,
+    handler_sys_getpriority::sys_getpriority,
+    handler_sys_getrandom::sys_getrandom,
+    handler_sys_getresgid::sys_getresgid,
+    handler_sys_getresuid::sys_getresuid,
+    handler_sys_getrlimit::sys_getrlimit,
+    handler_sys_getrusage::sys_getrusage,
+    handler_sys_getsid::sys_getsid,
+    handler_sys_gettid::sys_gettid,
+    handler_sys_gettimeofday::sys_gettimeofday,
+    handler_sys_getuid::sys_getuid,
+    handler_sys_getxattr::sys_getxattr,
+    handler_sys_init_module::sys_init_module,
+    handler_sys_ioctl::sys_ioctl,
+    handler_sys_ioprio_get::sys_ioprio_get,
+    handler_sys_ioprio_set::sys_ioprio_set,
+    handler_sys_kcmp::sys_kcmp,
+    handler_sys_kill::sys_kill,
+    handler_sys_link::sys_link,
+    handler_sys_linkat::sys_linkat,
+    handler_sys_listdir::sys_listdir,
+    handler_sys_listxattr::sys_listxattr,
+    handler_sys_lseek::sys_lseek,
+    handler_sys_mbind::sys_mbind,
+    handler_sys_membarrier::sys_membarrier,
+    handler_sys_memfd_create::sys_memfd_create,
+    handler_sys_memfd_secret::sys_memfd_secret,
+    handler_sys_migrate_pages::sys_migrate_pages,
+    handler_sys_mincore::sys_mincore,
+    handler_sys_mkdir::sys_mkdir,
+    handler_sys_mkdirat::sys_mkdirat,
+    handler_sys_mknod::sys_mknod,
+    handler_sys_mknodat::sys_mknodat,
+    handler_sys_mlock::sys_mlock,
+    handler_sys_mlock2::sys_mlock2,
+    handler_sys_mlockall::sys_mlockall,
+    handler_sys_mmap::sys_mmap,
+    handler_sys_mount::sys_mount,
+    handler_sys_move_pages::sys_move_pages,
+    handler_sys_mprotect::sys_mprotect,
+    handler_sys_mremap::sys_mremap,
+    handler_sys_msync::sys_msync,
+    handler_sys_munlock::sys_munlock,
+    handler_sys_munlockall::sys_munlockall,
+    handler_sys_munmap::sys_munmap,
+    handler_sys_newfstatat::sys_newfstatat,
+    handler_sys_noop_ok::sys_noop_ok,
+    handler_sys_open::sys_open,
+    handler_sys_open_linux::sys_open_linux,
+    handler_sys_openat::sys_openat,
+    handler_sys_openat2::sys_openat2,
+    handler_sys_pause::sys_pause,
+    handler_sys_personality::sys_personality,
+    handler_sys_pidfd_getfd::sys_pidfd_getfd,
+    handler_sys_pidfd_open::sys_pidfd_open,
+    handler_sys_pidfd_send_signal::sys_pidfd_send_signal,
+    handler_sys_pipe::sys_pipe,
+    handler_sys_pipe2::sys_pipe2,
+    handler_sys_pkey_alloc::sys_pkey_alloc,
+    handler_sys_pkey_free::sys_pkey_free,
+    handler_sys_pkey_mprotect::sys_pkey_mprotect,
+    handler_sys_poll::sys_poll,
+    handler_sys_prctl::sys_prctl,
+    handler_sys_pread64::sys_pread64,
+    handler_sys_preadv::sys_preadv,
+    handler_sys_preadv2::sys_preadv2,
+    handler_sys_prlimit64::sys_prlimit64,
     handler_sys_process_madvise::sys_process_madvise,
     handler_sys_process_vm_readv::sys_process_vm_readv,
-    handler_sys_process_vm_writev::sys_process_vm_writev, handler_sys_ptrace::sys_ptrace,
-    handler_sys_pwrite64::sys_pwrite64, handler_sys_pwritev::sys_pwritev,
-    handler_sys_pwritev2::sys_pwritev2, handler_sys_read::sys_read,
-    handler_sys_readahead::sys_readahead, handler_sys_readlink::sys_readlink,
-    handler_sys_readlinkat::sys_readlinkat, handler_sys_readv::sys_readv,
-    handler_sys_reboot::sys_reboot, handler_sys_removexattr::sys_removexattr,
-    handler_sys_rename::sys_rename, handler_sys_renameat::sys_renameat,
-    handler_sys_renameat2::sys_renameat2, handler_sys_restart_syscall::sys_restart_syscall,
-    handler_sys_ring_kick::sys_ring_kick, handler_sys_rmdir::sys_rmdir, handler_sys_rseq::sys_rseq,
-    handler_sys_rt_sigaction::sys_rt_sigaction, handler_sys_rt_sigpending::sys_rt_sigpending,
-    handler_sys_rt_sigqueueinfo::sys_rt_sigqueueinfo, handler_sys_rt_sigsuspend::sys_rt_sigsuspend,
+    handler_sys_process_vm_writev::sys_process_vm_writev,
+    handler_sys_ptrace::sys_ptrace,
+    handler_sys_pwrite64::sys_pwrite64,
+    handler_sys_pwritev::sys_pwritev,
+    handler_sys_pwritev2::sys_pwritev2,
+    handler_sys_read::sys_read,
+    handler_sys_readahead::sys_readahead,
+    handler_sys_readlink::sys_readlink,
+    handler_sys_readlinkat::sys_readlinkat,
+    handler_sys_readv::sys_readv,
+    handler_sys_reboot::sys_reboot,
+    handler_sys_removexattr::sys_removexattr,
+    handler_sys_rename::sys_rename,
+    handler_sys_renameat::sys_renameat,
+    handler_sys_renameat2::sys_renameat2,
+    handler_sys_restart_syscall::sys_restart_syscall,
+    handler_sys_ring_kick::sys_ring_kick,
+    handler_sys_rmdir::sys_rmdir,
+    handler_sys_rseq::sys_rseq,
+    handler_sys_rt_sigaction::sys_rt_sigaction,
+    handler_sys_rt_sigpending::sys_rt_sigpending,
+    handler_sys_rt_sigqueueinfo::sys_rt_sigqueueinfo,
+    handler_sys_rt_sigsuspend::sys_rt_sigsuspend,
     handler_sys_rt_sigtimedwait::sys_rt_sigtimedwait,
     handler_sys_rt_tgsigqueueinfo::sys_rt_tgsigqueueinfo,
     handler_sys_sched_get_priority_max::sys_sched_get_priority_max,
     handler_sys_sched_get_priority_min::sys_sched_get_priority_min,
     handler_sys_sched_getaffinity::sys_sched_getaffinity,
-    handler_sys_sched_getattr::sys_sched_getattr, handler_sys_sched_getparam::sys_sched_getparam,
+    handler_sys_sched_getattr::sys_sched_getattr,
+    handler_sys_sched_getparam::sys_sched_getparam,
     handler_sys_sched_getscheduler::sys_sched_getscheduler,
     handler_sys_sched_rr_get_interval::sys_sched_rr_get_interval,
     handler_sys_sched_setaffinity::sys_sched_setaffinity,
-    handler_sys_sched_setattr::sys_sched_setattr, handler_sys_sched_setparam::sys_sched_setparam,
-    handler_sys_sched_setscheduler::sys_sched_setscheduler, handler_sys_sendfile::sys_sendfile,
+    handler_sys_sched_setattr::sys_sched_setattr,
+    handler_sys_sched_setparam::sys_sched_setparam,
+    handler_sys_sched_setscheduler::sys_sched_setscheduler,
+    handler_sys_sendfile::sys_sendfile,
     handler_sys_set_mempolicy::sys_set_mempolicy,
     handler_sys_set_mempolicy_home_node::sys_set_mempolicy_home_node,
-    handler_sys_set_robust_list::sys_set_robust_list, handler_sys_setdomainname::sys_setdomainname,
-    handler_sys_setfsgid::sys_setfsgid, handler_sys_setfsuid::sys_setfsuid,
-    handler_sys_setgid::sys_setgid, handler_sys_setgroups::sys_setgroups,
-    handler_sys_sethostname::sys_sethostname, handler_sys_setns::sys_setns,
-    handler_sys_setpgid::sys_setpgid, handler_sys_setpriority::sys_setpriority,
-    handler_sys_setregid::sys_setregid, handler_sys_setresgid::sys_setresgid,
-    handler_sys_setresuid::sys_setresuid, handler_sys_setreuid::sys_setreuid,
-    handler_sys_setrlimit::sys_setrlimit, handler_sys_setsid::sys_setsid,
-    handler_sys_settimeofday::sys_settimeofday, handler_sys_setuid::sys_setuid,
-    handler_sys_setxattr::sys_setxattr, handler_sys_shmem_create::sys_shmem_create,
-    handler_sys_shmem_destroy::sys_shmem_destroy, handler_sys_shmem_map::sys_shmem_map,
-    handler_sys_sigaction::sys_sigaction, handler_sys_sigaltstack::sys_sigaltstack,
-    handler_sys_signalfd::sys_signalfd, handler_sys_sigprocmask::sys_sigprocmask,
-    handler_sys_sigreturn::sys_sigreturn, handler_sys_sleep::sys_sleep,
+    handler_sys_set_robust_list::sys_set_robust_list,
+    handler_sys_setdomainname::sys_setdomainname,
+    handler_sys_setfsgid::sys_setfsgid,
+    handler_sys_setfsuid::sys_setfsuid,
+    handler_sys_setgid::sys_setgid,
+    handler_sys_setgroups::sys_setgroups,
+    handler_sys_sethostname::sys_sethostname,
+    handler_sys_setns::sys_setns,
+    handler_sys_setpgid::sys_setpgid,
+    handler_sys_setpriority::sys_setpriority,
+    handler_sys_setregid::sys_setregid,
+    handler_sys_setresgid::sys_setresgid,
+    handler_sys_setresuid::sys_setresuid,
+    handler_sys_setreuid::sys_setreuid,
+    handler_sys_setrlimit::sys_setrlimit,
+    handler_sys_setsid::sys_setsid,
+    handler_sys_settimeofday::sys_settimeofday,
+    handler_sys_setuid::sys_setuid,
+    handler_sys_setxattr::sys_setxattr,
+    handler_sys_shmem_create::sys_shmem_create,
+    handler_sys_shmem_destroy::sys_shmem_destroy,
+    handler_sys_shmem_map::sys_shmem_map,
+    handler_sys_sigaction::sys_sigaction,
+    handler_sys_sigaltstack::sys_sigaltstack,
+    handler_sys_signalfd::sys_signalfd,
+    handler_sys_sigprocmask::sys_sigprocmask,
+    handler_sys_sigreturn::sys_sigreturn,
+    handler_sys_sleep::sys_sleep,
     handler_sys_sock_register_buf::sys_sock_register_buf,
-    handler_sys_sock_send_zc::sys_sock_send_zc, handler_sys_socket::sys_socket,
-    handler_sys_socket_accept::sys_socket_accept, handler_sys_socket_accept4::sys_socket_accept4,
-    handler_sys_socket_bind::sys_socket_bind, handler_sys_socket_connect::sys_socket_connect,
+    handler_sys_sock_send_zc::sys_sock_send_zc,
+    handler_sys_socket::sys_socket,
+    handler_sys_socket_accept::sys_socket_accept,
+    handler_sys_socket_accept4::sys_socket_accept4,
+    handler_sys_socket_bind::sys_socket_bind,
+    handler_sys_socket_connect::sys_socket_connect,
     handler_sys_socket_get_addr::sys_socket_get_addr,
     handler_sys_socket_getpeername::sys_socket_getpeername,
     handler_sys_socket_getsockname::sys_socket_getsockname,
     handler_sys_socket_getsockopt::sys_socket_getsockopt,
-    handler_sys_socket_listen::sys_socket_listen, handler_sys_socket_recv::sys_socket_recv,
+    handler_sys_socket_listen::sys_socket_listen,
+    handler_sys_socket_recv::sys_socket_recv,
     handler_sys_socket_recvmmsg::sys_socket_recvmmsg,
-    handler_sys_socket_recvmsg::sys_socket_recvmsg, handler_sys_socket_send::sys_socket_send,
+    handler_sys_socket_recvmsg::sys_socket_recvmsg,
+    handler_sys_socket_send::sys_socket_send,
     handler_sys_socket_sendmmsg::sys_socket_sendmmsg,
     handler_sys_socket_sendmsg::sys_socket_sendmsg,
     handler_sys_socket_setsockopt::sys_socket_setsockopt,
-    handler_sys_socket_shutdown::sys_socket_shutdown, handler_sys_socketpair::sys_socketpair,
-    handler_sys_splice::sys_splice, handler_sys_stat::sys_stat, handler_sys_statfs::sys_statfs,
-    handler_sys_symlink::sys_symlink, handler_sys_symlinkat::sys_symlinkat,
-    handler_sys_sync::sys_sync, handler_sys_sync_file_range::sys_sync_file_range,
-    handler_sys_syncfs::sys_syncfs, handler_sys_sysinfo::sys_sysinfo,
-    handler_sys_tcgetattr::sys_tcgetattr, handler_sys_tcsetattr::sys_tcsetattr,
-    handler_sys_tee::sys_tee, handler_sys_tgkill::sys_tgkill, handler_sys_time::sys_time,
+    handler_sys_socket_shutdown::sys_socket_shutdown,
+    handler_sys_socketpair::sys_socketpair,
+    handler_sys_splice::sys_splice,
+    handler_sys_stat::sys_stat,
+    handler_sys_statfs::sys_statfs,
+    handler_sys_symlink::sys_symlink,
+    handler_sys_symlinkat::sys_symlinkat,
+    handler_sys_sync::sys_sync,
+    handler_sys_sync_file_range::sys_sync_file_range,
+    handler_sys_syncfs::sys_syncfs,
+    handler_sys_sysinfo::sys_sysinfo,
+    handler_sys_tcgetattr::sys_tcgetattr,
+    handler_sys_tcsetattr::sys_tcsetattr,
+    handler_sys_tee::sys_tee,
+    handler_sys_tgkill::sys_tgkill,
+    handler_sys_time::sys_time,
     handler_sys_timerfd_create::sys_timerfd_create,
-    handler_sys_timerfd_settime::sys_timerfd_settime, handler_sys_times::sys_times,
-    handler_sys_tkill::sys_tkill, handler_sys_truncate::sys_truncate, handler_sys_umask::sys_umask,
-    handler_sys_umount2::sys_umount2, handler_sys_uname::sys_uname, handler_sys_unlink::sys_unlink,
-    handler_sys_unlinkat::sys_unlinkat, handler_sys_unshare::sys_unshare,
-    handler_sys_utime::sys_utime, handler_sys_utimensat::sys_utimensat,
-    handler_sys_utimes::sys_utimes, handler_sys_vhangup::sys_vhangup,
-    handler_sys_vmsplice::sys_vmsplice, handler_sys_wait4::sys_wait4,
-    handler_sys_waitid::sys_waitid, handler_sys_write::sys_write, handler_sys_writev::sys_writev,
+    handler_sys_timerfd_settime::sys_timerfd_settime,
+    handler_sys_times::sys_times,
+    handler_sys_tkill::sys_tkill,
+    handler_sys_truncate::sys_truncate,
+    handler_sys_umask::sys_umask,
+    handler_sys_umount2::sys_umount2,
+    handler_sys_uname::sys_uname,
+    handler_sys_unlink::sys_unlink,
+    handler_sys_unlinkat::sys_unlinkat,
+    handler_sys_unshare::sys_unshare,
+    handler_sys_utime::sys_utime,
+    handler_sys_utimensat::sys_utimensat,
+    handler_sys_utimes::sys_utimes,
+    handler_sys_vhangup::sys_vhangup,
+    handler_sys_vmsplice::sys_vmsplice,
+    handler_sys_wait4::sys_wait4,
+    handler_sys_waitid::sys_waitid,
+    handler_sys_write::sys_write,
+    handler_sys_writev::sys_writev,
     handler_sys_yield::sys_yield,
 };

@@ -216,6 +216,27 @@ pub struct Stat {
     pub mtime_cycles: u64,
 }
 
+/// Filesystem-wide capacity information returned by `statfs(2)`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsStat {
+    pub blocks: u64,
+    pub blocks_free: u64,
+    pub blocks_available: u64,
+    pub files: u64,
+    pub files_free: u64,
+    pub block_size: u32,
+    pub name_len: u32,
+    pub fragment_size: u32,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileLock {
+    pub start: u64,
+    pub end: u64,
+    pub type_: u32,
+    pub pid: u32,
+}
+
 /// A file's ownership triplet for a POSIX access check.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FileOwner {
@@ -437,6 +458,69 @@ pub trait FileOps: Send + Sync {
     /// returns Unsupported; FSes that persist mode bits override.
     fn set_perms<'a>(&'a self, _perms: u16) -> FsFuture<'a, ()> {
         Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Flush one open-file description's daemon-visible state.
+    fn flush<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Commit file data and metadata (`data_only` models fdatasync).
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Commit all dirty state belonging to this file's filesystem.
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_xattr<'a>(&'a self, _name: &'a str, _value: &'a [u8], _flags: u32) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn get_xattr<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn remove_xattr<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    /// Ask the backing filesystem to authorize Linux R_OK/W_OK/X_OK bits.
+    fn access<'a>(&'a self, _mask: u32) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn get_lock<'a>(&'a self, _owner: u64, _lock: FileLock) -> FsFuture<'a, FileLock> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn set_lock<'a>(&'a self, _owner: u64, _lock: FileLock, _wait: bool) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn fallocate<'a>(&'a self, _mode: u32, _offset: u64, _len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn seek<'a>(&'a self, _offset: u64, _whence: u32) -> FsFuture<'a, u64> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn copy_file_range_to<'a>(
+        &'a self,
+        _off_in: u64,
+        _out: &'a dyn FileOps,
+        _off_out: u64,
+        _len: u64,
+        _flags: u64,
+    ) -> FsFuture<'a, u64> {
+        Box::pin(async { Err(FsError::Unsupported) })
     }
 
     /// POSIX-2017 `poll(2)` readiness query. Returns the OR of
@@ -858,6 +942,17 @@ pub trait DirOps: Send + Sync {
     /// filesystems ignore it); memfs stores it so `dir_mode` reflects it.
     fn set_dir_mode(&self, _perms: u16) {}
 
+    /// Commit directory entries and metadata (`data_only` models
+    /// `fdatasync(2)` on an open directory descriptor).
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Commit all dirty state belonging to this directory's filesystem.
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     // ── Stage-4 r/w surface ──────────────────────────────────────
 
     /// Remove the file entry named `name` from this directory.
@@ -916,6 +1011,17 @@ pub trait DirOps: Send + Sync {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 
+    /// Atomically rename into `new_dir`. `flags` uses Linux RENAME_* bits.
+    fn rename_to<'a>(
+        &'a self,
+        _old_name: &'a str,
+        _new_dir: &'a dyn DirOps,
+        _new_name: &'a str,
+        _flags: u32,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
     /// Hard-link the entry `old_name` under `new_name` within this
     /// directory, aliasing the same backing node. Same-parent only —
     /// the same restriction `rename` carries, for the same reason (a
@@ -924,6 +1030,21 @@ pub trait DirOps: Send + Sync {
     /// (POSIX: `link(2)` on such an fs → EPERM).
     fn link<'a>(&'a self, _old_name: &'a str, _new_name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Hard-link a source entry into a potentially different directory.
+    fn link_to<'a>(
+        &'a self,
+        _old_name: &'a str,
+        _new_dir: &'a dyn DirOps,
+        _new_name: &'a str,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Downcast hook for filesystem-specific multi-directory operations.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        None
     }
 
     /// Link an already-existing file node into this directory under
@@ -962,6 +1083,19 @@ pub trait FsInstance: Send + Sync + 'static {
     /// Human-readable name (for logging + lookups). Must remain
     /// stable across the FS's lifetime.
     fn name(&self) -> &str;
+
+    /// Query filesystem-wide capacity. Synthetic filesystems retain the
+    /// conservative default used before this interface existed.
+    fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
+        Box::pin(async {
+            Ok(FsStat {
+                block_size: 4096,
+                name_len: 255,
+                fragment_size: 4096,
+                ..FsStat::default()
+            })
+        })
+    }
 }
 
 // ── Path resolution ────────────────────────────────────────────────

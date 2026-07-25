@@ -37,9 +37,31 @@ pub enum FuseOpcode {
     Statfs = 17,
     Release = 18,
     Fsync = 20,
+    Setxattr = 21,
+    Getxattr = 22,
+    Listxattr = 23,
+    Removexattr = 24,
+    Flush = 25,
     Init = 26,
-    Destroy = 38,
+    OpenDir = 27,
     ReadDir = 28,
+    ReleaseDir = 29,
+    FsyncDir = 30,
+    Getlk = 31,
+    Setlk = 32,
+    Setlkw = 33,
+    Access = 34,
+    Create = 35,
+    Interrupt = 36,
+    Destroy = 38,
+    Poll = 40,
+    BatchForget = 42,
+    Fallocate = 43,
+    ReadDirPlus = 44,
+    Rename2 = 45,
+    Lseek = 46,
+    CopyFileRange = 47,
+    Syncfs = 50,
 }
 
 /// Header prepended to every FUSE request. Matches the wire layout
@@ -76,6 +98,8 @@ pub struct FuseInitIn {
     pub minor: u32,
     pub max_readahead: u32,
     pub flags: u32,
+    pub flags2: u32,
+    pub unused: [u32; 11],
 }
 
 /// FUSE_INIT response body.
@@ -90,7 +114,12 @@ pub struct FuseInitOut {
     pub congestion_threshold: u16,
     pub max_write: u32,
     pub time_gran: u32,
-    pub _reserved: [u32; 9],
+    pub max_pages: u16,
+    pub map_alignment: u16,
+    pub flags2: u32,
+    pub max_stack_depth: u32,
+    pub request_timeout: u16,
+    pub unused: [u16; 11],
 }
 
 /// FUSE protocol version NARF negotiates. 7.36 covers everything
@@ -107,8 +136,29 @@ pub enum FuseInitFlag {
     PosixLocks = 1 << 1,
     FileOps = 1 << 2,
     AtomicOTrunc = 1 << 3,
+    BigWrites = 1 << 5,
+    FlockLocks = 1 << 10,
+    DoReaddirplus = 1 << 13,
+    ReaddirplusAuto = 1 << 14,
+    AsyncDio = 1 << 15,
     WritebackCache = 1 << 16,
+    ParallelDirops = 1 << 18,
+    MaxPages = 1 << 22,
+    SetxattrExt = 1 << 29,
+    InitExt = 1 << 30,
 }
+
+pub const FUSE_SUPPORTED_INIT_FLAGS: u32 = FuseInitFlag::AsyncRead as u32
+    | FuseInitFlag::PosixLocks as u32
+    | FuseInitFlag::BigWrites as u32
+    | FuseInitFlag::FlockLocks as u32
+    | FuseInitFlag::DoReaddirplus as u32
+    | FuseInitFlag::ReaddirplusAuto as u32
+    | FuseInitFlag::AsyncDio as u32
+    | FuseInitFlag::ParallelDirops as u32
+    | FuseInitFlag::MaxPages as u32
+    | FuseInitFlag::SetxattrExt as u32
+    | FuseInitFlag::InitExt as u32;
 
 // ── Additional wire structs (Linux include/uapi/linux/fuse.h) ─────────
 //
@@ -228,6 +278,106 @@ pub struct FuseWriteOut {
     pub padding: u32,
 }
 
+/// `struct fuse_kstatfs` nested in `struct fuse_statfs_out`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseKstatfs {
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub files: u64,
+    pub ffree: u64,
+    pub bsize: u32,
+    pub namelen: u32,
+    pub frsize: u32,
+    pub padding: u32,
+    pub spare: [u32; 6],
+}
+
+/// `struct fuse_statfs_out`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseStatfsOut {
+    pub st: FuseKstatfs,
+}
+
+/// `struct fuse_mknod_in` — MKNOD request body.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseMknodIn {
+    pub mode: u32,
+    pub rdev: u32,
+    pub umask: u32,
+    pub padding: u32,
+}
+
+/// `struct fuse_mkdir_in` — MKDIR request body.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseMkdirIn {
+    pub mode: u32,
+    pub umask: u32,
+}
+
+/// `struct fuse_rename_in` — RENAME request prefix.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseRenameIn {
+    pub newdir: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseRename2In {
+    pub newdir: u64,
+    pub flags: u32,
+    pub padding: u32,
+}
+
+/// `struct fuse_link_in` — LINK request prefix.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseLinkIn {
+    pub oldnodeid: u64,
+}
+
+/// `struct fuse_create_in` — CREATE request prefix.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseCreateIn {
+    pub flags: u32,
+    pub mode: u32,
+    pub umask: u32,
+    pub open_flags: u32,
+}
+
+/// `struct fuse_setattr_in` — SETATTR request body.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseSetattrIn {
+    pub valid: u32,
+    pub padding: u32,
+    pub fh: u64,
+    pub size: u64,
+    pub lock_owner: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub atimensec: u32,
+    pub mtimensec: u32,
+    pub ctimensec: u32,
+    pub mode: u32,
+    pub unused4: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub unused5: u32,
+}
+
+pub const FATTR_MODE: u32 = 1 << 0;
+pub const FATTR_UID: u32 = 1 << 1;
+pub const FATTR_GID: u32 = 1 << 2;
+pub const FATTR_SIZE: u32 = 1 << 3;
+
 /// `struct fuse_release_in` — RELEASE / RELEASEDIR request body. 24 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -238,12 +388,203 @@ pub struct FuseReleaseIn {
     pub lock_owner: u64,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseFlushIn {
+    pub fh: u64,
+    pub unused: u32,
+    pub padding: u32,
+    pub lock_owner: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseFsyncIn {
+    pub fh: u64,
+    pub fsync_flags: u32,
+    pub padding: u32,
+}
+
+pub const FUSE_FSYNC_FDATASYNC: u32 = 1;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseSetxattrIn {
+    pub size: u32,
+    pub flags: u32,
+    pub setxattr_flags: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseGetxattrIn {
+    pub size: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseGetxattrOut {
+    pub size: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseAccessIn {
+    pub mask: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FuseFileLock {
+    pub start: u64,
+    pub end: u64,
+    pub type_: u32,
+    pub pid: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseLkIn {
+    pub fh: u64,
+    pub owner: u64,
+    pub lk: FuseFileLock,
+    pub lk_flags: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseLkOut {
+    pub lk: FuseFileLock,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseFallocateIn {
+    pub fh: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub mode: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseLseekIn {
+    pub fh: u64,
+    pub offset: u64,
+    pub whence: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseLseekOut {
+    pub offset: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseCopyFileRangeIn {
+    pub fh_in: u64,
+    pub off_in: u64,
+    pub nodeid_out: u64,
+    pub fh_out: u64,
+    pub off_out: u64,
+    pub len: u64,
+    pub flags: u64,
+}
+
+/// `struct fuse_syncfs_in`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseSyncfsIn {
+    pub padding: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseInterruptIn {
+    pub unique: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FusePollIn {
+    pub fh: u64,
+    pub kh: u64,
+    pub flags: u32,
+    pub events: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FusePollOut {
+    pub revents: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseNotifyPollWakeupOut {
+    pub kh: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseNotifyInvalInodeOut {
+    pub ino: u64,
+    pub offset: i64,
+    pub len: i64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseNotifyInvalEntryOut {
+    pub parent: u64,
+    pub namelen: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseNotifyDeleteOut {
+    pub parent: u64,
+    pub child: u64,
+    pub namelen: u32,
+    pub padding: u32,
+}
+
+pub const FUSE_POLL_SCHEDULE_NOTIFY: u32 = 1;
+pub const FUSE_NOTIFY_POLL: i32 = 1;
+pub const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
+pub const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
+pub const FUSE_NOTIFY_DELETE: i32 = 6;
+
 /// `struct fuse_forget_in` — FORGET request body: the drop count for a
 /// nodeid the client no longer caches. 8 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct FuseForgetIn {
     pub nlookup: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseForgetOne {
+    pub nodeid: u64,
+    pub nlookup: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseBatchForgetIn {
+    pub count: u32,
+    pub dummy: u32,
 }
 
 /// `struct fuse_dirent` header — one READDIR entry. The variable-length
@@ -257,6 +598,15 @@ pub struct FuseDirent {
     pub namelen: u32,
     pub type_: u32,
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseDirentPlus {
+    pub entry_out: FuseEntryOut,
+    pub dirent: FuseDirent,
+}
+
+pub const FUSE_DIRENTPLUS_HEADER_LEN: usize = core::mem::size_of::<FuseDirentPlus>();
 
 /// Fixed size of the `fuse_dirent` header (name bytes follow).
 pub const FUSE_DIRENT_HEADER_LEN: usize = core::mem::size_of::<FuseDirent>();
@@ -277,8 +627,11 @@ pub const FUSE_ROOT_ID: u64 = 1;
 // recover the [`FileType`].
 pub const S_IFMT: u32 = 0o170_000;
 pub const S_IFDIR: u32 = 0o040_000;
+pub const S_IFCHR: u32 = 0o020_000;
+pub const S_IFIFO: u32 = 0o010_000;
 pub const S_IFREG: u32 = 0o100_000;
 pub const S_IFLNK: u32 = 0o120_000;
+pub const S_IFSOCK: u32 = 0o140_000;
 
 // ── Small (de)serialization helpers ───────────────────────────────────
 //

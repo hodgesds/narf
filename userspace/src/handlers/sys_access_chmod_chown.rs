@@ -1,6 +1,91 @@
 #[allow(unused_imports)]
 use super::*;
 
+pub(crate) fn sys_access(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let mode = args.arg1 as u32;
+    if mode & !7 != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        return;
+    }
+    let raw = match copy_user_cstr(args.arg0, 4096) {
+        Some(path) => path,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            return;
+        }
+    };
+    let path = resolve_cwd_path(current_task_id(), &raw);
+    access_path(ctx, &path, mode);
+}
+
+pub(crate) fn sys_faccessat(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let mode = args.arg2 as u32;
+    if mode & !7 != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        return;
+    }
+    let raw = match copy_user_cstr(args.arg1, 4096) {
+        Some(path) => path,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            return;
+        }
+    };
+    const AT_FDCWD: i64 = -100;
+    let dirfd = args.arg0 as i64;
+    let effective = if raw.starts_with('/') || dirfd == AT_FDCWD {
+        raw
+    } else if dirfd >= 0 {
+        match fd_path_of(current_task_id(), dirfd as u32) {
+            Some(base) => alloc::format!("{}/{}", base.trim_end_matches('/'), raw),
+            None => {
+                ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+                return;
+            }
+        }
+    } else {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        return;
+    };
+    let path = resolve_cwd_path(current_task_id(), &effective);
+    access_path(ctx, &path, mode);
+}
+
+fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
+    let Some(file) = xattr_file(path) else {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+        return;
+    };
+    match poll_blocking(file.access(mode)) {
+        Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Err(narf_filesystem::FsError::PermissionDenied)) => {
+            ctx.set_return(SyscallReturn::ok((-13i64) as u64))
+        }
+        Some(Err(narf_filesystem::FsError::Unsupported)) | None => {
+            let st = file.stat();
+            let (uid, gid) = file.owners();
+            let request = narf_filesystem::AccessRequest {
+                read: mode & 4 != 0,
+                write: mode & 2 != 0,
+                exec: mode & 1 != 0,
+            };
+            let allowed = narf_filesystem::posix_access_ok(
+                narf_filesystem::FileOwner {
+                    uid,
+                    gid,
+                    perms: st.mode.perms,
+                },
+                current_accessor(current_task_id()),
+                request,
+            );
+            ctx.set_return(SyscallReturn::ok(if allowed { 0 } else { (-13i64) as u64 }));
+        }
+        _ => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
+    }
+}
+
 pub(crate) fn sys_access_chmod_chown(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux ABI for the three legacy entries:

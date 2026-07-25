@@ -1,6 +1,22 @@
 #[allow(unused_imports)]
 use super::*;
 
+#[cfg(feature = "linux-compat")]
+fn write_flock_to_user(ptr: u64, flock: &UFlock) -> Result<(), ()> {
+    let mut bytes = alloc::vec![0u8; flock_size()];
+    // SAFETY: `UFlock` is repr(C) and `bytes` has the architecture's
+    // exported flock size.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            flock as *const _ as *const u8,
+            bytes.as_mut_ptr(),
+            flock_size(),
+        );
+    }
+    // SAFETY: the syscall supplied `ptr`; copy_to_user validates the range.
+    unsafe { copy_to_user(ptr, &bytes) }.map_err(|_| ())
+}
+
 pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
@@ -51,11 +67,15 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         if cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW {
             // Resolve the open-file identity from the fd table.
             let ops_key = fd::with_table(task, |t| {
-                t.get(fd)
-                    .map(|e| alloc::sync::Arc::as_ptr(&e.ops) as *const () as usize)
+                t.get(fd).map(|e| {
+                    (
+                        e.ops.clone(),
+                        alloc::sync::Arc::as_ptr(&e.ops) as *const () as usize,
+                    )
+                })
             });
-            let key = match ops_key {
-                Some(Some(k)) => k,
+            let (ops, key) = match ops_key {
+                Some(Some(v)) => v,
                 _ => {
                     ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
                     return;
@@ -96,7 +116,54 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 start: uf.l_start,
                 len: uf.l_len,
             };
+            let (lock_start, end) = if uf.l_len == 0 {
+                (uf.l_start, u64::MAX)
+            } else if uf.l_len > 0 {
+                (
+                    uf.l_start,
+                    (uf.l_start as u64).saturating_add(uf.l_len as u64 - 1),
+                )
+            } else {
+                (
+                    uf.l_start.saturating_add(uf.l_len),
+                    (uf.l_start as u64).saturating_sub(1),
+                )
+            };
+            if lock_start < 0 {
+                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                return;
+            }
+            let native = narf_filesystem::FileLock {
+                start: lock_start as u64,
+                end,
+                type_: uf.l_type as u32,
+                pid: task as u32,
+            };
             if cmd == F_GETLK {
+                match poll_blocking(ops.get_lock(task, native)) {
+                    Some(Ok(lock)) => {
+                        let mut out = uf;
+                        out.l_type = lock.type_ as i16;
+                        out.l_start = lock.start as i64;
+                        out.l_len = if lock.end == u64::MAX {
+                            0
+                        } else {
+                            lock.end.saturating_sub(lock.start).saturating_add(1) as i64
+                        };
+                        out.l_pid = lock.pid as i32;
+                        if write_flock_to_user(arg, &out).is_err() {
+                            ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+                        } else {
+                            ctx.set_return(SyscallReturn::ok(0));
+                        }
+                        return;
+                    }
+                    Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+                    _ => {
+                        ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                        return;
+                    }
+                }
                 let blocker = crate::fd::locks::probe(key, req);
                 let mut out = uf;
                 match blocker {
@@ -108,21 +175,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                         out.l_pid = b.owner as i32;
                     }
                 }
-                let mut obytes = alloc::vec![0u8; flock_size()];
-                // SAFETY: `out` is a repr(C) UFlock; `obytes` is sized to
-                // `flock_size()`, so serializing the struct's bytes into it is in-bounds.
-                // SAFETY: Valid memory or trusted environment
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        &out as *const _ as *const u8,
-                        obytes.as_mut_ptr(),
-                        flock_size(),
-                    );
-                }
-                // SAFETY: `arg` is the user `struct flock` pointer; copy_to_user
-                // range-validates it and SMAP-brackets the write of `obytes`.
-                // SAFETY: Valid memory or trusted environment
-                if unsafe { copy_to_user(arg, &obytes) }.is_err() {
+                if write_flock_to_user(arg, &out).is_err() {
                     ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
                     return;
                 }
@@ -130,6 +183,21 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 return;
             }
             // F_SETLK / F_SETLKW.
+            match poll_blocking(ops.set_lock(task, native, cmd == F_SETLKW)) {
+                Some(Ok(())) => {
+                    ctx.set_return(SyscallReturn::ok(0));
+                    return;
+                }
+                Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+                Some(Err(narf_filesystem::FsError::Busy)) => {
+                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    return;
+                }
+                _ => {
+                    ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                    return;
+                }
+            }
             match crate::fd::locks::try_set(key, req) {
                 Ok(()) => {
                     // A re-executed SETLKW arrives here with the uctx
