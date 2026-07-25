@@ -55,6 +55,10 @@ pub fn open(id: IfaceId, rights: IfaceRights, cap: &Cap<IfaceRegistry, Bind>)
     -> Cap<NetIface, _>;
 ```
 
+The capability-gated interface registry is the canonical hardware inventory
+for the control plane. Compatibility views include every driver-backed entry,
+even when an interface has not also joined the legacy kernel IPv4 data path.
+
 ### 3.2 Frame rings
 
 ```rust
@@ -165,6 +169,8 @@ until a driver publishes them through the central interface registry.
 Collection queries for absent optional state—traffic classes, filters,
 actions, address labels, multicast database entries, and nexthops—return an
 empty multipart dump terminated by `NLMSG_DONE`.
+Link dumps merge the legacy IPv4 registry with the canonical driver-backed
+registry by interface name, so frame-ring-only drivers appear exactly once.
 
 `NETLINK_GENERIC` publishes the mandatory `nlctrl` control family.
 `CTRL_CMD_GETFAMILY` supports name lookup and dump enumeration with

@@ -458,7 +458,8 @@ fn enumerate() -> (Vec<LinkInfo>, Vec<AddrInfo>) {
         label: alloc::string::String::from("lo"),
     });
 
-    // Each registered NIC: ARPHRD_ETHER, MTU 1500, its MAC + IPv4.
+    // Legacy L3 interfaces come first because their registration order already
+    // defines the Linux-visible ifindex used by the IPv4 stack.
     for (i, nic) in crate::iface::snapshot_all().into_iter().enumerate() {
         let ifindex = (i as u32) + 2;
         links.push(LinkInfo {
@@ -481,6 +482,26 @@ fn enumerate() -> (Vec<LinkInfo>, Vec<AddrInfo>) {
                 label: nic.name.clone(),
             });
         }
+    }
+
+    // Most hardware drivers register only in the capability-gated frame-ring
+    // registry. Include names not represented by the legacy L3 registry so
+    // every probed NIC is visible to the control plane exactly once.
+    for nic in crate::registry().snapshots() {
+        if links.iter().any(|link| link.name == nic.name) {
+            continue;
+        }
+        let ifindex = links.len() as u32 + 1;
+        links.push(LinkInfo {
+            ifindex,
+            flags: IFF_BROADCAST
+                | IFF_MULTICAST
+                | if nic.link_up { IFF_UP | IFF_RUNNING } else { 0 },
+            arphrd: ARPHRD_ETHER,
+            name: nic.name,
+            mac: nic.mac.to_vec(),
+            mtu: nic.mtu,
+        });
     }
 
     (links, addrs)
@@ -725,12 +746,10 @@ fn find_attr(request: &[u8], fixed_len: usize, kind: u16) -> Option<&[u8]> {
 }
 
 fn iface_name_for_index(ifindex: u32) -> Option<alloc::string::String> {
-    if ifindex == 1 {
-        return Some(alloc::string::String::from("lo"));
-    }
-    crate::iface::snapshot_all()
+    enumerate()
+        .0
         .into_iter()
-        .nth(ifindex.checked_sub(2)? as usize)
+        .find(|iface| iface.ifindex == ifindex)
         .map(|iface| iface.name)
 }
 

@@ -101,6 +101,7 @@ mod tcp_timer_e2e_tests;
 mod tests;
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -332,6 +333,18 @@ struct Entry {
     handle: Cap<NetIface, Write>,
 }
 
+/// Owned control-plane view of a driver-backed interface.
+///
+/// Frame-ring endpoints remain in the registry; inventory consumers receive
+/// only immutable identity and link metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceSnapshot {
+    pub name: String,
+    pub mac: [u8; 6],
+    pub mtu: u32,
+    pub link_up: bool,
+}
+
 impl fmt::Debug for Entry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Entry")
@@ -415,6 +428,20 @@ impl Registry {
         q.iter()
             .find(|e| e.iface.name() == name)
             .map(|e| f(&e.handle))
+    }
+
+    /// Snapshot every driver-backed interface without exposing its frame rings.
+    pub fn snapshots(&self) -> Vec<InterfaceSnapshot> {
+        self.inner
+            .lock()
+            .iter()
+            .map(|entry| InterfaceSnapshot {
+                name: String::from(entry.iface.name()),
+                mac: entry.iface.mac(),
+                mtu: entry.iface.mtu(),
+                link_up: entry.iface.link_up(),
+            })
+            .collect()
     }
 }
 

@@ -36,6 +36,31 @@ fn smoke_net_loopback_register() -> TestResult {
             if !link {
                 return TestResult::Fail("loopback link not up");
             }
+            let snapshots = registry().snapshots();
+            let Some(snapshot) = snapshots
+                .iter()
+                .find(|snapshot| snapshot.name == "lo.smoke-register")
+            else {
+                return TestResult::Fail("driver-backed interface missing from snapshot");
+            };
+            if snapshot.mac != mac || snapshot.mtu != mtu || snapshot.link_up != link {
+                return TestResult::Fail("driver-backed snapshot metadata mismatch");
+            }
+
+            let request = [
+                16, 0, 0, 0, // nlmsg_len
+                18, 0, // RTM_GETLINK
+                1, 3, // NLM_F_REQUEST | NLM_F_DUMP
+                1, 0, 0, 0, // sequence
+                0, 0, 0, 0, // port id
+            ];
+            let replies = crate::netlink_route::build_dump(&request);
+            if !replies
+                .iter()
+                .any(|reply| reply.windows(18).any(|w| w == b"lo.smoke-register\0"))
+            {
+                return TestResult::Fail("rtnetlink omitted driver-backed interface");
+            }
             TestResult::Pass
         }
         None => TestResult::Fail("registered interface not found by name"),
