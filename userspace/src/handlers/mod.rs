@@ -5223,18 +5223,20 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         set_clear_child_tid_with_as(child_tid.raw(), ca.child_tid, child_as_root);
     }
 
-    // Parent-of bookkeeping for wait4 was published above, BEFORE the spawn,
-    // to close the SMP TRACEME race (see the comment at that call site). A
-    // thread (CLONE_THREAD) is not waitpid-reapable; pthread_join uses the
-    // futex on clear_child_tid instead — so nothing to publish for it.
-    if !share_thread {
-        crate::perf_event::on_fork(
-            task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
-            child_visible_pid,
-            parent_pid,
-            child_tid.raw(),
-        );
-    }
+    // Parent-of bookkeeping for wait4 was published above, BEFORE the spawn.
+    // Threads are not waitpid-reapable, but perf inheritance still observes
+    // them as tasks in the parent's process.
+    let parent_visible_pid = task_to_pid_raw(parent_pid).unwrap_or(parent_pid);
+    crate::perf_event::on_fork(
+        parent_visible_pid,
+        if share_thread {
+            parent_visible_pid
+        } else {
+            child_visible_pid
+        },
+        parent_pid,
+        child_tid.raw(),
+    );
 
     // Return: parent sees child TID (== visible-pid for !THREAD,
     // == TaskId.raw() for THREAD where TID and PID diverge). For a new
@@ -5658,6 +5660,8 @@ pub fn wait_init() {
     // `pid`, so they're independent of ordering.
     crate::user_task::register_thread_exit_observer(on_thread_exit);
     crate::user_task::register_thread_exit_observer(task_tables_exit_observer);
+    #[cfg(feature = "linux-compat")]
+    crate::user_task::register_thread_exit_observer(crate::perf_event::on_thread_exit);
     // PROCESS-scoped (last thread of the group only): hand the process
     // to its parent (wait4 reap + SIGCHLD + waker) or auto-release if
     // orphaned. Gated on `group_dead` so a multi-threaded exit_group

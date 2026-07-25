@@ -91,6 +91,10 @@ pub unsafe fn pmu::pause_sampling(
     counter: &pmu::PmuCounter,
 ) -> Result<(), pmu::PmuError>;
 #[cfg(target_arch = "x86_64")]
+pub fn pmu::update_sampling_period(counter: &pmu::PmuCounter, period: u64);
+#[cfg(target_arch = "x86_64")]
+pub fn pmu::last_overflow_period(cpu: usize, counter: usize) -> u64;
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn pmi::program_current_lvt_pc(vector: u8, masked: bool);
 
 #[cfg(target_arch = "x86_64")]

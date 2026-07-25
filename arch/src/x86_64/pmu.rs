@@ -484,6 +484,10 @@ static SAMPLE_ARMED_MASK: [AtomicU8; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicU8::new(0) }; narf_lib::percpu::MAX_CPUS];
 static SAMPLE_PERIODS: [[AtomicU64; 8]; narf_lib::percpu::MAX_CPUS] =
     [const { [const { AtomicU64::new(0) }; 8] }; narf_lib::percpu::MAX_CPUS];
+static SAMPLE_LOADED_PERIODS: [[AtomicU64; 8]; narf_lib::percpu::MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; 8] }; narf_lib::percpu::MAX_CPUS];
+static SAMPLE_OVERFLOW_PERIODS: [[AtomicU64; 8]; narf_lib::percpu::MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; 8] }; narf_lib::percpu::MAX_CPUS];
 
 fn sample_preload(width: u8, period: u64) -> Result<u64, PmuError> {
     if period == 0 || width == 0 || width >= 64 {
@@ -573,6 +577,9 @@ pub unsafe fn read(counter: &PmuCounter) -> u64 {
 /// Same current-CPU live-counter requirements as [`read`].
 pub unsafe fn sampling_residual(counter: &PmuCounter, period: u64) -> Result<u64, PmuError> {
     let backend = detect().ok_or(PmuError::NoPmu)?;
+    let loaded =
+        SAMPLE_LOADED_PERIODS[counter.cpu as usize][counter.idx as usize].load(Ordering::Acquire);
+    let period = if loaded == 0 { period } else { loaded };
     let preload = sample_preload(backend.counter_width, period)?;
     // SAFETY: forwarded caller contract.
     let raw = unsafe { read(counter) };
@@ -610,8 +617,34 @@ pub unsafe fn arm_sampling(counter: &PmuCounter, period: u64) -> Result<(), PmuE
         program_counter(counter.idx, sel, counter.vendor);
     }
     SAMPLE_PERIODS[cpu][counter.idx as usize].store(period, Ordering::Release);
+    SAMPLE_LOADED_PERIODS[cpu][counter.idx as usize].store(period, Ordering::Release);
     SAMPLE_ARMED_MASK[cpu].fetch_or(1 << counter.idx, Ordering::AcqRel);
     Ok(())
+}
+
+/// Change the reload period used after the next overflow of an armed counter.
+///
+/// This only updates the per-CPU IRQ handoff state, so it is safe to call from
+/// normal context even when the owning task has migrated away from that CPU.
+/// The current reload remains in effect until the next overflow.
+pub fn update_sampling_period(counter: &PmuCounter, period: u64) {
+    let cpu = counter.cpu as usize;
+    let idx = counter.idx as usize;
+    if period != 0
+        && cpu < narf_lib::percpu::MAX_CPUS
+        && idx < SAMPLE_PERIODS[cpu].len()
+        && SAMPLE_ARMED_MASK[cpu].load(Ordering::Acquire) & (1 << counter.idx) != 0
+    {
+        SAMPLE_PERIODS[cpu][idx].store(period, Ordering::Release);
+    }
+}
+
+/// Period that produced the most recently acknowledged overflow for a slot.
+pub fn last_overflow_period(cpu: usize, idx: usize) -> u64 {
+    SAMPLE_OVERFLOW_PERIODS
+        .get(cpu)
+        .and_then(|slots| slots.get(idx))
+        .map_or(0, |period| period.load(Ordering::Acquire))
 }
 
 /// Acknowledge and re-arm counters that caused the current PMI.
@@ -661,6 +694,10 @@ pub unsafe fn handle_sampling_overflow() -> u8 {
         if fired & (1 << idx) == 0 {
             continue;
         }
+        SAMPLE_OVERFLOW_PERIODS[cpu][idx as usize].store(
+            SAMPLE_LOADED_PERIODS[cpu][idx as usize].load(Ordering::Acquire),
+            Ordering::Release,
+        );
         let period = SAMPLE_PERIODS[cpu][idx as usize].load(Ordering::Acquire);
         if period == 0 || period >= modulus {
             continue;
@@ -672,6 +709,7 @@ pub unsafe fn handle_sampling_overflow() -> u8 {
                 let _ = wrmsr_or_gp(amd_ctr_msr(idx), modulus - period);
             }
         }
+        SAMPLE_LOADED_PERIODS[cpu][idx as usize].store(period, Ordering::Release);
     }
     match backend.vendor {
         PmuVendor::Intel => {
@@ -693,6 +731,8 @@ pub fn disarm_sampling(counter: &PmuCounter) {
     if counter.cpu as usize == cpu {
         SAMPLE_ARMED_MASK[cpu].fetch_and(!(1 << counter.idx), Ordering::AcqRel);
         SAMPLE_PERIODS[cpu][counter.idx as usize].store(0, Ordering::Release);
+        SAMPLE_LOADED_PERIODS[cpu][counter.idx as usize].store(0, Ordering::Release);
+        SAMPLE_OVERFLOW_PERIODS[cpu][counter.idx as usize].store(0, Ordering::Release);
     }
 }
 

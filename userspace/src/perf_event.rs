@@ -10,14 +10,15 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_linux_perf_uapi::{
     PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_COMM, PERF_ATTR_FLAG_COMM_EXEC,
     PERF_ATTR_FLAG_DISABLED, PERF_ATTR_FLAG_ENABLE_ON_EXEC, PERF_ATTR_FLAG_EXCLUDE_GUEST,
-    PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP, PERF_ATTR_FLAG_MMAP2, PERF_ATTR_FLAG_MMAP_DATA,
-    PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK,
-    PERF_ATTR_SIZE_VER0, PERF_COUNT_SW_DUMMY, PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST,
-    PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM,
-    PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC,
-    PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP, PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE,
-    PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD,
-    PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, PERF_TYPE_SOFTWARE,
+    PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT, PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP,
+    PERF_ATTR_FLAG_MMAP2, PERF_ATTR_FLAG_MMAP_DATA, PERF_ATTR_FLAG_SAMPLE_ID_ALL,
+    PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK, PERF_ATTR_SIZE_VER0, PERF_COUNT_SW_DUMMY,
+    PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
+    PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK,
+    PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP,
+    PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER,
+    PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+    PERF_TYPE_SOFTWARE,
 };
 #[cfg(target_arch = "x86_64")]
 use narf_linux_perf_uapi::{
@@ -33,6 +34,8 @@ static PERF_EVENT_REGISTRY: IrqSafeSpinLock<Vec<Weak<PerfEventFile>>> =
     IrqSafeSpinLock::new(Vec::new());
 #[cfg(target_arch = "x86_64")]
 static PMI_VECTOR: IrqSafeSpinLock<Option<u8>> = IrqSafeSpinLock::new(None);
+#[cfg(target_arch = "x86_64")]
+static PMI_ROUTED_CPUS: AtomicU64 = AtomicU64::new(0);
 const SAMPLE_CPU_SLOTS: usize = narf_lib::percpu::MAX_CPUS;
 static PENDING_SAMPLES: [PendingSample; SAMPLE_CPU_SLOTS] =
     [const { PendingSample::new() }; SAMPLE_CPU_SLOTS];
@@ -40,6 +43,23 @@ static PENDING_SAMPLE_LOST: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_arch = "x86_64")]
 static ACTIVE_SAMPLE_IDS: [[AtomicU64; 8]; SAMPLE_CPU_SLOTS] =
     [const { [const { AtomicU64::new(0) }; 8] }; SAMPLE_CPU_SLOTS];
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn frequency_period(current: u64, frequency: u64, elapsed_ns: u64) -> u64 {
+    let current = current.max(1);
+    let target_ns = 1_000_000_000u64
+        .checked_div(frequency.max(1))
+        .unwrap_or(1)
+        .max(1);
+    let calculated = (current as u128)
+        .saturating_mul(target_ns as u128)
+        .checked_div(elapsed_ns.max(1) as u128)
+        .unwrap_or(1)
+        .min(u64::MAX as u128) as u64;
+    calculated
+        .clamp((current / 4).max(1), current.saturating_mul(4))
+        .max(1)
+}
 
 struct PendingSample {
     state: AtomicU8,
@@ -78,6 +98,8 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
     | PERF_ATTR_FLAG_MMAP
     | PERF_ATTR_FLAG_MMAP_DATA
     | PERF_ATTR_FLAG_MMAP2
+    | PERF_ATTR_FLAG_FREQ
+    | PERF_ATTR_FLAG_INHERIT
     // NARF does not execute nested guests and currently has no BPF VM or
     // runtime kernel-symbol loader. These selectors therefore describe empty
     // event domains, rather than requests whose records are being suppressed.
@@ -115,6 +137,7 @@ struct PerfEventFile {
     target_task: u64,
     target_pid: u64,
     target_cpu: i32,
+    inherited_tasks: IrqSafeSpinLock<Vec<u64>>,
     enabled: AtomicBool,
     count_base: AtomicU64,
     count_accumulated: AtomicU64,
@@ -124,7 +147,13 @@ struct PerfEventFile {
     sample_lost: AtomicU64,
     wakeup_pending: AtomicU32,
     #[cfg(target_arch = "x86_64")]
-    sample_period: u64,
+    sample_period: AtomicU64,
+    #[cfg(target_arch = "x86_64")]
+    last_sample_period: AtomicU64,
+    #[cfg(target_arch = "x86_64")]
+    sample_frequency: u64,
+    #[cfg(target_arch = "x86_64")]
+    last_sample_ns: AtomicU64,
     #[cfg(target_arch = "x86_64")]
     pmu_event: Option<narf_arch::x86_64::pmu::PmuEvent>,
     #[cfg(target_arch = "x86_64")]
@@ -271,6 +300,10 @@ impl core::fmt::Debug for PerfEventFile {
 }
 
 impl PerfEventFile {
+    fn tracks_task(&self, task: u64) -> bool {
+        self.target_task == task || self.inherited_tasks.lock().contains(&task)
+    }
+
     fn raw_count(&self) -> u64 {
         #[cfg(target_arch = "x86_64")]
         if let Some(counter) = self.pmu_counter {
@@ -314,10 +347,15 @@ impl PerfEventFile {
             else {
                 return;
             };
-            if self.sample_period != 0 {
+            let sample_period = self.sample_period.load(Ordering::Acquire);
+            if sample_period != 0 {
+                if ensure_pmi_route().is_err() {
+                    // SAFETY: same current-CPU allocation.
+                    unsafe { narf_arch::x86_64::pmu::release(counter) };
+                    return;
+                }
                 // SAFETY: freshly allocated current-CPU counter.
-                if unsafe { narf_arch::x86_64::pmu::arm_sampling(&counter, self.sample_period) }
-                    .is_err()
+                if unsafe { narf_arch::x86_64::pmu::arm_sampling(&counter, sample_period) }.is_err()
                 {
                     // SAFETY: same current-CPU allocation.
                     unsafe { narf_arch::x86_64::pmu::release(counter) };
@@ -327,18 +365,19 @@ impl PerfEventFile {
             }
             active[cpu] = Some(counter);
         } else if let Some(counter) = active[cpu].take() {
-            if self.sample_period != 0 {
+            let sample_period = self.sample_period.load(Ordering::Acquire);
+            if sample_period != 0 {
                 ACTIVE_SAMPLE_IDS[cpu][counter.idx as usize].store(0, Ordering::Release);
                 // SAFETY: current-CPU live allocation.
                 let _ = unsafe { narf_arch::x86_64::pmu::pause_sampling(&counter) };
             }
             // SAFETY: current-CPU live allocation.
-            let value = if self.sample_period == 0 {
+            let value = if sample_period == 0 {
                 // SAFETY: current-CPU live allocation.
                 unsafe { narf_arch::x86_64::pmu::read(&counter) }
             } else {
                 // SAFETY: current-CPU sampled allocation.
-                unsafe { narf_arch::x86_64::pmu::sampling_residual(&counter, self.sample_period) }
+                unsafe { narf_arch::x86_64::pmu::sampling_residual(&counter, sample_period) }
                     .unwrap_or(0)
             };
             self.count_accumulated.fetch_add(value, Ordering::AcqRel);
@@ -354,16 +393,19 @@ impl PerfEventFile {
             self.count_base.store(raw, Ordering::Release);
             self.enabled_at_ns.store(now, Ordering::Release);
             #[cfg(target_arch = "x86_64")]
-            if self.sample_period != 0 {
-                if let Some(counter) = &self.pmu_counter {
-                    // SAFETY: this file owns the live counter.
-                    let _ = unsafe {
-                        narf_arch::x86_64::pmu::arm_sampling(counter, self.sample_period)
-                    };
+            {
+                self.last_sample_ns.store(0, Ordering::Release);
+                let sample_period = self.sample_period.load(Ordering::Acquire);
+                if sample_period != 0 {
+                    if let Some(counter) = &self.pmu_counter {
+                        // SAFETY: this file owns the live counter.
+                        let _ =
+                            unsafe { narf_arch::x86_64::pmu::arm_sampling(counter, sample_period) };
+                    }
                 }
             }
             #[cfg(target_arch = "x86_64")]
-            if self.target_task == crate::handlers::current_task_id() {
+            if self.tracks_task(crate::handlers::current_task_id()) {
                 self.task_switch(narf_lib::percpu::current_cpu(), true);
             }
         }
@@ -373,11 +415,11 @@ impl PerfEventFile {
     fn disable(&self) {
         if self.enabled.swap(false, Ordering::AcqRel) {
             #[cfg(target_arch = "x86_64")]
-            if self.target_task == crate::handlers::current_task_id() {
+            if self.tracks_task(crate::handlers::current_task_id()) {
                 self.task_switch(narf_lib::percpu::current_cpu(), false);
             }
             #[cfg(target_arch = "x86_64")]
-            if self.sample_period != 0 {
+            if self.sample_period.load(Ordering::Acquire) != 0 {
                 if let Some(counter) = &self.pmu_counter {
                     // SAFETY: this file owns the live counter.
                     let _ = unsafe { narf_arch::x86_64::pmu::pause_sampling(counter) };
@@ -506,6 +548,12 @@ impl PerfEventFile {
             push_u32(&mut payload, 0);
         }
         if sample_type & PERF_SAMPLE_PERIOD != 0 {
+            #[cfg(target_arch = "x86_64")]
+            push_u64(
+                &mut payload,
+                self.last_sample_period.load(Ordering::Acquire),
+            );
+            #[cfg(not(target_arch = "x86_64"))]
             push_u64(&mut payload, self.attr.sample_period_or_freq);
         }
         let lost = self.sample_lost.swap(0, Ordering::AcqRel);
@@ -531,6 +579,30 @@ impl PerfEventFile {
         record.extend_from_slice(&size.to_ne_bytes());
         record.extend_from_slice(&payload);
         self.push_record(&record)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn adjust_frequency_period(&self, now: u64) {
+        if self.sample_frequency == 0 {
+            return;
+        }
+        let previous = self.last_sample_ns.swap(now, Ordering::AcqRel);
+        if previous == 0 {
+            return;
+        }
+        let elapsed = now.saturating_sub(previous).max(1);
+        let current = self.sample_period.load(Ordering::Acquire).max(1);
+        // Linux derives the next hardware period from observed event count
+        // over elapsed time. Bound each correction to 4x so scheduler jitter
+        // or a delayed drain cannot collapse the period into an IRQ storm.
+        let next = frequency_period(current, self.sample_frequency, elapsed);
+        self.sample_period.store(next, Ordering::Release);
+        if let Some(counter) = &self.pmu_counter {
+            narf_arch::x86_64::pmu::update_sampling_period(counter, next);
+        }
+        for counter in self.active_task_counters.lock().iter().flatten() {
+            narf_arch::x86_64::pmu::update_sampling_period(counter, next);
+        }
     }
 
     fn append_sample_id(&self, record: &mut Vec<u8>, pid: u32, tid: u32, now: u64) {
@@ -739,13 +811,13 @@ pub(crate) fn on_exec(task: u64, mappings: &[crate::process::LoadedMapping], pro
         let Some(event) = weak.upgrade() else {
             return false;
         };
-        if event.target_task == task
+        if event.tracks_task(task)
             && event.attr.flags & PERF_ATTR_FLAG_ENABLE_ON_EXEC != 0
             && event._group_leader.is_none()
         {
             let _ = event.for_group(PERF_IOC_FLAG_GROUP, PerfEventFile::enable);
         }
-        if event.target_task == task {
+        if event.tracks_task(task) {
             for (loaded, filename, ino) in &resolved {
                 let mapping = PerfMapping {
                     pid: pid as u32,
@@ -761,7 +833,7 @@ pub(crate) fn on_exec(task: u64, mappings: &[crate::process::LoadedMapping], pro
                 let _ = event.mmap_record(&mapping);
             }
         }
-        if event.target_task == task && event.attr.flags & PERF_ATTR_FLAG_COMM != 0 {
+        if event.tracks_task(task) && event.attr.flags & PERF_ATTR_FLAG_COMM != 0 {
             if let Some(comm) = comm.as_deref() {
                 let _ = event.comm_record(pid as u32, task as u32, comm, true);
             }
@@ -777,7 +849,7 @@ pub(crate) fn on_comm(task: u64, comm: &str) {
         let Some(event) = weak.upgrade() else {
             return false;
         };
-        if event.target_task == task && event.attr.flags & PERF_ATTR_FLAG_COMM != 0 {
+        if event.tracks_task(task) && event.attr.flags & PERF_ATTR_FLAG_COMM != 0 {
             let _ = event.comm_record(pid as u32, task as u32, comm, false);
         }
         true
@@ -826,7 +898,7 @@ pub(crate) fn on_mmap(task: u64, fd: i32, addr: u64, len: u64, pgoff: u64, prot:
         let Some(event) = weak.upgrade() else {
             return false;
         };
-        if event.target_pid == pid {
+        if event.tracks_task(task) {
             let _ = event.mmap_record(&mapping);
         }
         true
@@ -839,7 +911,14 @@ pub(crate) fn on_fork(parent_pid: u64, child_pid: u64, parent_tid: u64, child_ti
         let Some(event) = weak.upgrade() else {
             return false;
         };
-        if event.target_pid == parent_pid && event.attr.flags & PERF_ATTR_FLAG_TASK != 0 {
+        let inherits_parent = event.tracks_task(parent_tid);
+        if inherits_parent && event.attr.flags & PERF_ATTR_FLAG_INHERIT != 0 {
+            let mut inherited = event.inherited_tasks.lock();
+            if !inherited.contains(&child_tid) {
+                inherited.push(child_tid);
+            }
+        }
+        if inherits_parent && event.attr.flags & PERF_ATTR_FLAG_TASK != 0 {
             let _ = event.task_record(
                 PERF_RECORD_FORK,
                 child_pid as u32,
@@ -874,6 +953,17 @@ pub(crate) fn on_process_exit(pid: u64, tid: u64) {
                 let _ = event.for_group(PERF_IOC_FLAG_GROUP, PerfEventFile::disable);
             }
         }
+        true
+    });
+}
+
+pub(crate) fn on_thread_exit(_pid: u64, tid: u64) {
+    let mut registry = PERF_EVENT_REGISTRY.lock();
+    registry.retain(|weak| {
+        let Some(event) = weak.upgrade() else {
+            return false;
+        };
+        event.inherited_tasks.lock().retain(|task| *task != tid);
         true
     });
 }
@@ -923,15 +1013,23 @@ fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
 #[cfg(target_arch = "x86_64")]
 fn ensure_pmi_route() -> Result<(), ()> {
     let mut slot = PMI_VECTOR.lock();
-    if slot.is_some() {
+    let vector = if let Some(vector) = *slot {
+        vector
+    } else {
+        let vector = narf_interrupts::vector::alloc().map_err(|_| ())?;
+        narf_interrupts::install_handler_named(vector, "perf-pmi", 0, pmi_handler);
+        *slot = Some(vector);
+        vector
+    };
+    drop(slot);
+    let cpu = narf_lib::percpu::current_cpu();
+    let cpu_bit = 1u64.checked_shl(cpu as u32).ok_or(())?;
+    if PMI_ROUTED_CPUS.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit != 0 {
         return Ok(());
     }
-    let vector = narf_interrupts::vector::alloc().map_err(|_| ())?;
-    narf_interrupts::install_handler_named(vector, "perf-pmi", 0, pmi_handler);
     // SAFETY: APIC bring-up precedes userspace and this programs only the
     // current CPU's LVT-PC entry.
     unsafe { narf_arch::x86_64::pmi::program_current_lvt_pc(vector, false) };
-    *slot = Some(vector);
     Ok(())
 }
 
@@ -941,7 +1039,7 @@ fn ensure_pmi_route() -> Result<(), ()> {
 pub(crate) fn drain_irq_samples() {
     let mut notify = false;
     let deferred_lost = PENDING_SAMPLE_LOST.swap(0, Ordering::AcqRel);
-    for pending in &PENDING_SAMPLES {
+    for (_source_cpu, pending) in PENDING_SAMPLES.iter().enumerate() {
         if pending
             .state
             .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
@@ -961,22 +1059,28 @@ pub(crate) fn drain_irq_samples() {
                     continue;
                 };
                 #[cfg(target_arch = "x86_64")]
-                let matches_counter = (0..8).any(|idx| {
+                let matched_counter = (0..8).find(|&idx| {
                     counters & (1 << idx) != 0
-                        && pending.event_ids[idx].load(Ordering::Relaxed) == event.id
-                }) || event
-                    .pmu_counter
-                    .is_some_and(|counter| counters & (1 << counter.idx) != 0);
+                        && (pending.event_ids[idx].load(Ordering::Relaxed) == event.id
+                            || event
+                                .pmu_counter
+                                .is_some_and(|counter| counter.idx as usize == idx))
+                });
                 #[cfg(not(target_arch = "x86_64"))]
-                let matches_counter = false;
-                if matches_counter
-                    && event.enabled.load(Ordering::Acquire)
-                    && event.target_task == task
-                {
+                let matched_counter: Option<usize> = None;
+                if let Some(_matched_counter) = matched_counter {
+                    if !event.enabled.load(Ordering::Acquire) || !event.tracks_task(task) {
+                        continue;
+                    }
                     #[cfg(target_arch = "x86_64")]
-                    event
-                        .count_accumulated
-                        .fetch_add(event.sample_period, Ordering::AcqRel);
+                    {
+                        let period = narf_arch::x86_64::pmu::last_overflow_period(
+                            _source_cpu,
+                            _matched_counter,
+                        );
+                        event.last_sample_period.store(period, Ordering::Release);
+                        event.count_accumulated.fetch_add(period, Ordering::AcqRel);
+                    }
                     if deferred_lost != 0 {
                         event
                             .sample_lost
@@ -984,6 +1088,8 @@ pub(crate) fn drain_irq_samples() {
                     }
                     let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
                     notify |= event.sample_record(ip, pid, task as u32, now);
+                    #[cfg(target_arch = "x86_64")]
+                    event.adjust_frequency_period(now);
                 }
             }
         }
@@ -1001,11 +1107,23 @@ pub(crate) fn sample_from_irq_for_test(task: u64, ip: u64) {
         let Some(event) = weak.upgrade() else {
             continue;
         };
-        if event.enabled.load(Ordering::Acquire) && event.target_task == task {
+        if event.enabled.load(Ordering::Acquire) && event.tracks_task(task) {
             let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
             let _ = event.sample_record(ip, pid, task as u32, now);
         }
     }
+}
+
+pub(crate) fn event_tracks_task_for_test(fd_num: u32, task: u64) -> bool {
+    let owner = crate::handlers::current_task_id();
+    fd::with_table(owner, |table| {
+        table
+            .get(fd_num)
+            .and_then(|entry| entry.ops.as_any())
+            .and_then(|any| any.downcast_ref::<PerfEventFile>())
+            .is_some_and(|event| event.tracks_task(task))
+    })
+    .unwrap_or(false)
 }
 
 /// Scheduler PMU context hook. Runs outside scheduler queue locks and brackets
@@ -1021,7 +1139,7 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
         let Some(event) = weak.upgrade() else {
             return false;
         };
-        if event.target_task == task {
+        if event.tracks_task(task) {
             event.task_switch(cpu, running);
         }
         true
@@ -1321,6 +1439,12 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
+    if attr.flags & PERF_ATTR_FLAG_FREQ != 0
+        && (attr.sample_period_or_freq == 0 || attr.sample_period_or_freq > 1_000_000)
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
     if attr.flags & PERF_ATTR_FLAG_SAMPLE_ID_ALL != 0
         && attr.sample_type & !PERF_SAMPLE_SUPPORTED != 0
     {
@@ -1488,7 +1612,15 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
             return;
         }
-        let period = attr.sample_period_or_freq;
+        let period = if attr.flags & PERF_ATTR_FLAG_FREQ != 0 {
+            narf_arch::x86_64::tsc::frequency_hz()
+                .max(1_000_000_000)
+                .checked_div(attr.sample_period_or_freq)
+                .unwrap_or(1)
+                .max(1)
+        } else {
+            attr.sample_period_or_freq
+        };
         if ensure_pmi_route().is_err() {
             if let Some(counter) = pmu_counter {
                 // SAFETY: open still exclusively owns this allocation.
@@ -1556,6 +1688,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             target_task,
             target_pid,
             target_cpu: cpu,
+            inherited_tasks: IrqSafeSpinLock::new(Vec::new()),
             enabled: AtomicBool::new(false),
             count_base: AtomicU64::new(0),
             count_accumulated: AtomicU64::new(0),
@@ -1565,7 +1698,17 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             sample_lost: AtomicU64::new(0),
             wakeup_pending: AtomicU32::new(0),
             #[cfg(target_arch = "x86_64")]
-            sample_period,
+            sample_period: AtomicU64::new(sample_period),
+            #[cfg(target_arch = "x86_64")]
+            last_sample_period: AtomicU64::new(sample_period),
+            #[cfg(target_arch = "x86_64")]
+            sample_frequency: if attr.flags & PERF_ATTR_FLAG_FREQ != 0 {
+                attr.sample_period_or_freq
+            } else {
+                0
+            },
+            #[cfg(target_arch = "x86_64")]
+            last_sample_ns: AtomicU64::new(0),
             #[cfg(target_arch = "x86_64")]
             pmu_event,
             #[cfg(target_arch = "x86_64")]

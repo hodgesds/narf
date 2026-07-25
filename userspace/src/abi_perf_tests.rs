@@ -6,7 +6,10 @@
 #![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
-use narf_linux_perf_uapi::{PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_WATERMARK};
+use narf_linux_perf_uapi::{
+    PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT,
+    PERF_ATTR_FLAG_WATERMARK,
+};
 
 const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
@@ -21,6 +24,15 @@ const EOPNOTSUPP: i64 = -95;
 
 fn smoke_abi_perf_event_open_validation() -> TestResult {
     with_setup(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::perf_event::frequency_period(20_000, 100_000, 10_000) != 20_000
+                || crate::perf_event::frequency_period(20_000, 100_000, 40_000) != 5_000
+                || crate::perf_event::frequency_period(20_000, 100_000, 2_500) != 80_000
+            {
+                return Err("perf frequency controller ratio or slew bounds are wrong");
+            }
+        }
         if core::mem::size_of::<PerfEventAttr>() != 144
             || core::mem::offset_of!(PerfEventAttr, config) != 8
             || core::mem::offset_of!(PerfEventAttr, flags) != 40
@@ -155,6 +167,23 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         ) {
             Some(EOPNOTSUPP) => {}
             _ => return Err("perf_event_open ignored an unimplemented attr flag"),
+        }
+
+        let zero_frequency = PerfEventAttr {
+            flags: PERF_ATTR_FLAG_FREQ,
+            ..attr
+        };
+        match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &zero_frequency as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("perf_event_open accepted zero frequency mode"),
         }
 
         // perf record opens this per-CPU dummy event to consume BPF lifecycle
@@ -650,7 +679,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 | (1 << 6) // ID
                 | (1 << 7) // CPU
                 | (1 << 8), // PERIOD
-            flags: 1, // disabled
+            flags: 1 | PERF_ATTR_FLAG_INHERIT, // disabled + inherit
             ..PerfEventAttr::default()
         };
         let sample_fd = match call(
@@ -680,13 +709,23 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         {
             return Err("enabling sampled perf event failed");
         }
-        crate::perf_event::sample_from_irq_for_test(
-            crate::handlers::current_task_id(),
-            0x1234_5678,
-        );
+        let sample_parent = FAKE_TASK;
+        if !crate::perf_event::event_tracks_task_for_test(sample_fd, sample_parent) {
+            return Err("perf event did not retain its opening task");
+        }
+        let sample_pid = crate::handlers::task_to_pid_raw(sample_parent).unwrap_or(sample_parent);
+        crate::perf_event::on_fork(sample_pid, 77, sample_parent, 88);
+        if !crate::perf_event::event_tracks_task_for_test(sample_fd, 88) {
+            return Err("perf inherit did not attach the child task");
+        }
+        crate::perf_event::sample_from_irq_for_test(88, 0x1234_5678);
+        crate::perf_event::on_thread_exit(77, 88);
         // SAFETY: sample_ops owns all three identity-mapped frames here.
         let data_head =
             unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
+        if data_head == 0 {
+            return Err("inherited perf event did not sample its child task");
+        }
         if data_head != 56 {
             return Err("perf sample record has the wrong wire size");
         }

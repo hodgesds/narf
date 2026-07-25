@@ -201,8 +201,18 @@ allocates and programs a counter in the destination CPU's PMU bank immediately
 before entering the target continuation, then stops, folds, and releases it
 immediately after every yield or preemption. Migration therefore carries the
 accumulated value while never reusing an origin CPU's MSR identity. PMU slot
-allocation and sampling overflow state are per logical CPU. Per-CPU events on
-SMP still require remote-CPU PMU calls and fail explicitly.
+allocation, sampling overflow state, and LVT-PC routing are per logical CPU;
+the switch-in path installs the shared PMI vector in each destination CPU
+before arming its first sampled counter. `inherit` extends
+that task set at every process or thread clone and removes the child at its
+thread-exit callback; concurrently running descendants therefore receive
+independent per-CPU slots whose counts feed the original event. Frequency mode
+starts from the calibrated TSC-rate estimate and, after each real overflow,
+adjusts the following reload period from observed elapsed time toward
+`sample_freq`; each correction is bounded to fourfold to prevent a delayed
+drain from creating an interrupt storm. `PERF_SAMPLE_PERIOD` reports the period
+that caused that overflow, not the next adaptive period. Per-CPU events on SMP
+still require remote-CPU PMU calls and fail explicitly.
 Cgroup, filter, probe, and BPF features fail explicitly.
 `exclude_guest` is accepted because NARF never executes nested guest context.
 The `ksymbol` and `bpf_event` record selectors are also accepted as empty
