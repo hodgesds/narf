@@ -110,6 +110,7 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
 const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
 const PERF_EVENT_IOC_RESET: u32 = 0x2403;
+const PERF_EVENT_IOC_PERIOD: u32 = 0x4008_2404;
 const PERF_EVENT_IOC_SET_OUTPUT: u32 = 0x2405;
 const PERF_EVENT_IOC_ID: u32 = 0x8008_2407;
 const PERF_EVENT_IOC_PAUSE_OUTPUT: u32 = 0x4004_2409;
@@ -447,6 +448,50 @@ impl PerfEventFile {
                 .fetch_add(now.saturating_sub(since), Ordering::AcqRel);
         }
         self.publish_mmap_state();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_sample_period(&self, period: u64) -> Result<(), FsError> {
+        if period == 0 {
+            return Err(FsError::InvalidData);
+        }
+        if self.enabled.load(Ordering::Acquire)
+            || self.pmu_event.is_none()
+            || self.sample_period.load(Ordering::Acquire) == 0
+            || self.active_task_counters.lock().iter().any(Option::is_some)
+        {
+            return Err(FsError::Unsupported);
+        }
+
+        if let Some(counter) = self.pmu_counter.as_ref() {
+            // SAFETY: admitted per-CPU events own a current-CPU counter and
+            // this event is disabled, so validating the preload is synchronous.
+            unsafe { narf_arch::x86_64::pmu::arm_sampling(counter, period) }
+                .map_err(|_| FsError::InvalidData)?;
+            // SAFETY: same owned current-CPU counter; leave it disabled.
+            unsafe { narf_arch::x86_64::pmu::pause_sampling(counter) }
+                .map_err(|_| FsError::InvalidData)?;
+        } else {
+            // Task events allocate counters at switch-in. Allocate a temporary
+            // current-CPU slot to validate the backend's real width/preload.
+            // SAFETY: ioctl runs at CPL0 on the current CPU.
+            let counter = unsafe {
+                narf_arch::x86_64::pmu::alloc_counter(self.pmu_event.unwrap())
+                    .map_err(|_| FsError::Unsupported)?
+            };
+            // SAFETY: the temporary slot is live and current-CPU-owned.
+            let armed = unsafe { narf_arch::x86_64::pmu::arm_sampling(&counter, period) };
+            if armed.is_ok() {
+                // SAFETY: same temporary live counter.
+                let _ = unsafe { narf_arch::x86_64::pmu::pause_sampling(&counter) };
+            }
+            // SAFETY: same temporary live counter.
+            unsafe { narf_arch::x86_64::pmu::release(counter) };
+            armed.map_err(|_| FsError::InvalidData)?;
+        }
+        self.sample_period.store(period, Ordering::Release);
+        self.last_sample_period.store(period, Ordering::Release);
+        Ok(())
     }
 
     fn reset(&self) {
@@ -1291,6 +1336,23 @@ impl FileOps for PerfEventFile {
             PERF_EVENT_IOC_RESET => {
                 self.for_group(arg, PerfEventFile::reset)?;
                 Ok(0)
+            }
+            PERF_EVENT_IOC_PERIOD => {
+                let mut bytes = [0u8; 8];
+                // SAFETY: copy_from_user validates and SMAP-brackets the
+                // caller-provided pointer to Linux's u64 period argument.
+                unsafe { copy_from_user(&mut bytes, arg as u64) }
+                    .map_err(|_| FsError::InvalidData)?;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    self.set_sample_period(u64::from_ne_bytes(bytes))?;
+                    Ok(0)
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    let _ = bytes;
+                    Err(FsError::Unsupported)
+                }
             }
             PERF_EVENT_IOC_SET_OUTPUT => {
                 if arg == usize::MAX || arg == u32::MAX as usize {

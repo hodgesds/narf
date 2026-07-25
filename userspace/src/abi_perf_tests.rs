@@ -20,6 +20,8 @@ const PERF_FORMAT_LOST: u64 = 1 << 4;
 const PERF_EVENT_IOC_ENABLE: u64 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u64 = 0x2401;
 const PERF_EVENT_IOC_RESET: u64 = 0x2403;
+#[cfg(target_arch = "x86_64")]
+const PERF_EVENT_IOC_PERIOD: u64 = 0x4008_2404;
 const PERF_EVENT_IOC_SET_OUTPUT: u64 = 0x2405;
 const PERF_EVENT_IOC_ID: u64 = 0x8008_2407;
 const PERF_EVENT_IOC_PAUSE_OUTPUT: u64 = 0x4004_2409;
@@ -954,6 +956,50 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 return Err("task-scoped hardware counter did not report real execution");
             }
             let _ = call(Syscall::Close.raw(), a0(hardware_fd as u64));
+
+            let sampling_hardware_attr = PerfEventAttr {
+                sample_period_or_freq: 1000,
+                sample_type: 1, // PERF_SAMPLE_IP
+                flags: 1,       // disabled
+                ..hardware_attr
+            };
+            let period_fd = match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(
+                    &sampling_hardware_attr as *const _ as u64,
+                    0,
+                    -1i32 as u64,
+                    -1i32 as u64,
+                ),
+            ) {
+                Some(fd) if fd >= 0 => fd as u32,
+                _ => return Err("disabled hardware sampling event was not admitted"),
+            };
+            let new_period = 4096u64;
+            if call(
+                Syscall::Ioctl.raw(),
+                a2(
+                    period_fd as u64,
+                    PERF_EVENT_IOC_PERIOD,
+                    &new_period as *const u64 as u64,
+                ),
+            ) != Some(0)
+            {
+                return Err("PERF_EVENT_IOC_PERIOD rejected an exact disabled update");
+            }
+            let zero_period = 0u64;
+            if call(
+                Syscall::Ioctl.raw(),
+                a2(
+                    period_fd as u64,
+                    PERF_EVENT_IOC_PERIOD,
+                    &zero_period as *const u64 as u64,
+                ),
+            ) != Some(EINVAL)
+            {
+                return Err("PERF_EVENT_IOC_PERIOD accepted a zero period");
+            }
+            let _ = call(Syscall::Close.raw(), a0(period_fd as u64));
         }
 
         Ok(())

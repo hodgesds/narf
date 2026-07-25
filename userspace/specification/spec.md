@@ -188,6 +188,10 @@ that real counter for each standalone or grouped event rather than a constant.
 `PERF_EVENT_IOC_SET_OUTPUT` redirects records to another compatible perf
 event's mapped ring while retaining loss accounting on the source event; the
 target must describe the same task and CPU context, and `-1` detaches it.
+On x86_64, `PERF_EVENT_IOC_PERIOD` synchronously validates and installs a new
+nonzero hardware sampling period while the event is disabled. Updating a live
+or remotely active event returns an error until a synchronous cross-CPU PMU
+control path exists; NARF does not defer the update and report false success.
 Successful `mmap(2)` commits emit `PERF_RECORD_MMAP` or `MMAP2` for executable
 and/or data VMAs selected by `mmap`, `mmap2`, and `mmap_data`. File mappings
 carry the fd's recorded path and stable filesystem inode; anonymous mappings
