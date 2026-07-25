@@ -4230,3 +4230,79 @@ fn smoke_mte_tag_round_trip() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/mte", smoke_mte_tag_round_trip);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_pmuv3_cycle_counter_round_trip() -> TestResult {
+    use crate::aarch64::pmu;
+    if !pmu::available() {
+        return TestResult::Skip("PMUv3 not exposed by this CPU");
+    }
+    // SAFETY: kernel smoke runs at EL1 and remains on its current CPU.
+    let counter = match unsafe { pmu::alloc_cycle_counter() } {
+        Ok(counter) => counter,
+        Err(_) => return TestResult::Fail("PMUv3 cycle counter allocation failed"),
+    };
+    // SAFETY: the counter remains live and current-CPU-owned.
+    if unsafe { pmu::read(&counter) }.is_err() {
+        return TestResult::Fail("PMUv3 cycle counter read failed");
+    }
+    // SAFETY: same live current-CPU counter. This validates that preload and
+    // interrupt control registers are accessible without claiming delivery.
+    let arm_failed = unsafe { pmu::arm_sampling(&counter, 100_000) }.is_err();
+    // SAFETY: same live current-CPU counter remains owned by this smoke.
+    let pause_failed = unsafe { pmu::pause_sampling(&counter) }.is_err();
+    if arm_failed || pause_failed {
+        return TestResult::Fail("PMUv3 sampling arm/pause failed");
+    }
+    // SAFETY: same live current-CPU counter.
+    if unsafe { pmu::release(counter) }.is_err() {
+        return TestResult::Fail("PMUv3 cycle counter release failed");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/pmu", smoke_pmuv3_cycle_counter_round_trip);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_pmuv3_programmable_counter_round_trip() -> TestResult {
+    use crate::aarch64::pmu;
+    if pmu::programmable_counter_count() == 0 {
+        return TestResult::Skip("PMUv3 programmable counters not exposed");
+    }
+    // ARMv8 architectural event 0x11 counts CPU cycles through a
+    // programmable slot, independently validating PMSELR/PMXEVTYPER and
+    // PMXEVCNTR rather than reusing the dedicated cycle counter.
+    // SAFETY: kernel smoke runs at EL1 and remains on its current CPU.
+    let counter = match unsafe { pmu::alloc_programmable(0x11) } {
+        Ok(counter) => counter,
+        Err(_) => return TestResult::Fail("PMUv3 programmable allocation failed"),
+    };
+    // SAFETY: the counter remains live and current-CPU-owned.
+    if unsafe { pmu::start_programmable(&counter) }.is_err() {
+        return TestResult::Fail("PMUv3 programmable start failed");
+    }
+    // SAFETY: the counter remains live and current-CPU-owned.
+    let before = unsafe { pmu::read_programmable(&counter) }.unwrap_or(0);
+    for _ in 0..1_000 {
+        core::hint::black_box(());
+    }
+    // SAFETY: the counter remains live and current-CPU-owned.
+    let after = unsafe { pmu::read_programmable(&counter) }.unwrap_or(before);
+    if after <= before {
+        return TestResult::Fail("PMUv3 programmable cycle event did not advance");
+    }
+    // SAFETY: same live current-CPU counter; the smoke only validates register access.
+    let arm_failed = unsafe { pmu::arm_programmable(&counter, 10_000) }.is_err();
+    // SAFETY: same live current-CPU counter remains owned by this smoke.
+    let pause_failed = unsafe { pmu::pause_programmable(&counter) }.is_err();
+    if arm_failed || pause_failed {
+        return TestResult::Fail("PMUv3 programmable sampling arm/pause failed");
+    }
+    // SAFETY: the counter remains live and current-CPU-owned.
+    if unsafe { pmu::release_programmable(counter) }.is_err() {
+        return TestResult::Fail("PMUv3 programmable release failed");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/pmu", smoke_pmuv3_programmable_counter_round_trip);

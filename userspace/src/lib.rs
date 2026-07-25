@@ -59,6 +59,7 @@ pub mod landlock;
 pub mod loader;
 #[cfg(feature = "linux-compat")]
 pub mod lsm;
+mod mapped_file;
 #[cfg(feature = "linux-compat")]
 pub mod mount_api;
 #[cfg(feature = "linux-compat")]

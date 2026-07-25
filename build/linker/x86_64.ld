@@ -61,6 +61,10 @@ SECTIONS
     .rodata : AT(ADDR(.rodata) - KERNEL_VIRT_BASE) ALIGN(4K) {
         __rodata_start = .;
         *(.rodata .rodata.*)
+        . = ALIGN(4);
+        __build_id_note_start = .;
+        KEEP(*(.note.gnu.build-id))
+        __build_id_note_end = .;
         . = ALIGN(8);
         __narf_probes_start = .;
         KEEP(*(.note.narf.probes))
@@ -108,7 +112,6 @@ SECTIONS
 
     /DISCARD/ : {
         *(.eh_frame*)
-        *(.note.gnu.build-id)
         *(.comment)
         *(.dynamic)
         *(.interp)

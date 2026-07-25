@@ -21,6 +21,7 @@ pub mod numa;
 pub mod nv2;
 pub mod pac;
 pub mod pie;
+pub mod pmu;
 pub mod psci;
 pub mod rme;
 pub mod rndr;

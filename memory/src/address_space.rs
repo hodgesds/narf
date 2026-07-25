@@ -776,7 +776,11 @@ impl AddressSpace {
                         if !rollback_perms.contains(RegionPerms::EXEC) {
                             flags = flags | PtFlags::UXN | PtFlags::PXN;
                         }
+                        // SAFETY: rollback owns both the address-space root and
+                        // old frame; this removes only the failed replacement leaf.
                         let _ = unsafe { unmap_4kb(self.root, rollback_va) };
+                        // SAFETY: restores the original owned frame and permissions
+                        // at the same leaf before the old translation is flushed.
                         let _ = unsafe { map_4kb(self.root, rollback_va, old_phys, flags) };
                     }
                     regions[rollback_region].phys[rollback_page] = old_phys;

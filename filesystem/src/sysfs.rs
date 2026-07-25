@@ -74,6 +74,8 @@ extern "Rust" {
     fn narf_numa_node_count() -> u32;
     fn narf_node_distance(from: u32, to: u32) -> u32;
     fn narf_cpu_node_opt(cpu: u32) -> u32;
+    static __build_id_note_start: u8;
+    static __build_id_note_end: u8;
 }
 
 #[inline]
@@ -168,6 +170,33 @@ fn cpu_node(cpu: u32) -> Option<u32> {
     } else {
         Some(n)
     }
+}
+
+/// Effective CPU membership for Linux's node sysfs ABI.
+///
+/// Firmware-less single-node machines still have every online CPU in node 0
+/// on Linux. Preserve `None` on multi-node systems, where guessing would
+/// fabricate proximity.
+#[inline]
+fn sysfs_cpu_node(cpu: u32) -> Option<u32> {
+    cpu_node(cpu).or_else(|| (numa_node_count() == 1).then_some(0))
+}
+
+/// Read the linker-generated GNU build-ID note exactly as Linux exposes it
+/// through `/sys/kernel/notes`.
+fn kernel_notes_read(offset: usize, buf: &mut [u8]) -> usize {
+    let start = core::ptr::addr_of!(__build_id_note_start) as usize;
+    let end = core::ptr::addr_of!(__build_id_note_end) as usize;
+    let len = end.saturating_sub(start);
+    if offset >= len {
+        return 0;
+    }
+    let count = buf.len().min(len - offset);
+    // SAFETY: the linker symbols delimit the retained, immutable
+    // `.note.gnu.build-id` bytes inside the kernel's mapped rodata.
+    let source = unsafe { core::slice::from_raw_parts((start + offset) as *const u8, count) };
+    buf[..count].copy_from_slice(source);
+    count
 }
 
 // ── Attr function types ───────────────────────────────────────────────
@@ -1002,6 +1031,7 @@ pub fn populate_kernel_dir() {
     let root = get_root();
     let kernel = get_or_create_child(&root, "kernel");
     kobject_add_attr(&kernel, "uevent_seqnum", crate::uevent::gen_uevent_seqnum);
+    kobject_add_bin_attr(&kernel, "notes", kernel_notes_read);
 
     // /sys/kernel/mm/transparent_hugepage/ — THP policy knobs.
     // NARF implements no huge-page promotion; `[never]` is permanently active.
@@ -1022,7 +1052,7 @@ pub fn populate_kernel_dir() {
 fn node_cpumap_string(node: u32) -> String {
     let mut mask: u128 = 0;
     for cpu in 0..128u32 {
-        if cpu_node(cpu) == Some(node) {
+        if sysfs_cpu_node(cpu) == Some(node) {
             mask |= 1u128 << cpu;
         }
     }
@@ -1040,7 +1070,7 @@ fn node_cpumap_string(node: u32) -> String {
 fn node_cpulist_string(node: u32) -> String {
     let mut cpus: Vec<u32> = Vec::new();
     for cpu in 0..256u32 {
-        if cpu_node(cpu) == Some(node) {
+        if sysfs_cpu_node(cpu) == Some(node) {
             cpus.push(cpu);
         }
     }
@@ -1200,6 +1230,17 @@ fn populate_numa_node(node_dir: &Arc<Kobject>, node: u32) -> Arc<Kobject> {
 
     kobject_add_attr(&kobj, "cpulist", move || node_cpulist_string(node));
     kobject_add_attr(&kobj, "cpumap", move || node_cpumap_string(node));
+
+    // Linux exposes reciprocal CPU/node membership links.  perf does not
+    // derive its live cpu->node map from `cpulist`: cpu__setup_cpunode_map()
+    // walks nodeN and accepts only DT_LNK entries named cpuM.
+    let cpu_count = smp::cpu_count().max(1);
+    for cpu in 0..cpu_count {
+        if sysfs_cpu_node(cpu) == Some(node) {
+            let cpu_name = format!("cpu{}", cpu);
+            kobj.add_symlink(cpu_name.clone(), format!("../../cpu/{cpu_name}"));
+        }
+    }
     kobj
 }
 
@@ -1424,6 +1465,14 @@ pub fn populate_cpu_devices() {
         let cpu_name = format!("cpu{}", cpu);
         let cpu_kobj = get_or_create_child(&cpu_dir, &cpu_name);
 
+        if let Some(node) = sysfs_cpu_node(cpu) {
+            // Match Linux's cpuN/nodeM backlink.  The node-side cpuN link is
+            // installed by populate_numa_node() and is the one consumed by
+            // perf stat --per-node.
+            let node_name = format!("node{}", node);
+            cpu_kobj.add_symlink(node_name.clone(), format!("../../node/{node_name}"));
+        }
+
         // `online` — read-only "1".  Linux omits it for cpu0 (the boot CPU
         // is always online and has no hotplug sysfs interface).
         // Linux ref: `drivers/base/cpu.c` `register_cpu(hotpluggable=false)`
@@ -1472,6 +1521,54 @@ pub fn populate_cpu_devices() {
             kobject_add_attr(&topo, "package_cpus_list", move || l.clone());
         }
     }
+}
+
+/// Populate the Linux perf event-source discovery tree.
+///
+/// Only interfaces backed by the current compatibility adapter are exposed:
+/// the generic CPU raw-PMU type and software counters. Model-specific event
+/// aliases are deliberately omitted until they can be generated from the
+/// detected PMU rather than guessed.
+pub fn populate_perf_event_sources() {
+    let root = get_root();
+    let bus = get_or_create_child(&root, "bus");
+    let event_source = get_or_create_child(&bus, "event_source");
+    let devices = get_or_create_child(&event_source, "devices");
+
+    let cpu = get_or_create_child(&devices, "cpu");
+    kobject_add_attr(&cpu, "type", || "4\n".to_string());
+    let cpumask = cpu_range_string(smp::cpu_count().max(1));
+    kobject_add_attr(&cpu, "cpumask", move || cpumask.clone());
+    let format = get_or_create_child(&cpu, "format");
+    #[cfg(target_arch = "x86_64")]
+    {
+        kobject_add_attr(&format, "event", || "config:0-7\n".to_string());
+        kobject_add_attr(&format, "umask", || "config:8-15\n".to_string());
+        kobject_add_attr(&format, "edge", || "config:18\n".to_string());
+        kobject_add_attr(&format, "any", || "config:21\n".to_string());
+        kobject_add_attr(&format, "inv", || "config:23\n".to_string());
+        kobject_add_attr(&format, "cmask", || "config:24-31\n".to_string());
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        kobject_add_attr(&format, "event", || "config:0-15\n".to_string());
+        let events = get_or_create_child(&cpu, "events");
+        for (name, event) in [
+            ("cycles", 0x11u16),
+            ("instructions", 0x08),
+            ("cache-misses", 0x03),
+            ("branch-instructions", 0x0c),
+            ("branch-misses", 0x10),
+        ] {
+            if narf_arch::aarch64::pmu::event_supported(event) {
+                let encoding = alloc::format!("event=0x{event:x}\n");
+                kobject_add_attr(&events, name, move || encoding.clone());
+            }
+        }
+    }
+
+    let software = get_or_create_child(&devices, "software");
+    kobject_add_attr(&software, "type", || "1\n".to_string());
 }
 
 // ── Desktop/laptop device classes (LED / power_supply / thermal / hwmon) ──
@@ -1733,6 +1830,7 @@ pub fn populate_all() {
     populate_numa_nodes();
     populate_weighted_interleave();
     populate_cpu_devices();
+    populate_perf_event_sources();
     // ── Desktop/laptop device classes (single merge-friendly block) ──
     // /sys/class/{leds,power_supply,thermal,hwmon,rtc} for udev / upower /
     // lm-sensors / GNOME / KDE enumeration and util-linux / hwclock /
@@ -2155,6 +2253,17 @@ fn smoke_sysfs_numa_node_live_files() -> TestResult {
     if !vmstat.contains("nr_free_pages ") {
         return TestResult::Fail("node0 vmstat nr_free_pages missing");
     }
+    let Some(cpu_member) = node0
+        .symlink_names()
+        .into_iter()
+        .find(|name| name.starts_with("cpu"))
+    else {
+        return TestResult::Fail("node0 has no perf-compatible cpuN membership");
+    };
+    let expected_cpu = format!("../../cpu/{}", cpu_member);
+    if node0.get_symlink(&cpu_member).as_deref() != Some(expected_cpu.as_str()) {
+        return TestResult::Fail("node0 cpuN membership target is not Linux-compatible");
+    }
     let Some(member) = node0
         .symlink_names()
         .into_iter()
@@ -2210,6 +2319,35 @@ fn smoke_sysfs_weighted_interleave_controls() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/sysfs", smoke_sysfs_weighted_interleave_controls);
+
+fn smoke_sysfs_kernel_notes_has_gnu_build_id() -> TestResult {
+    populate_kernel_dir();
+    let Some(kernel) = get_root().get_child("kernel") else {
+        return TestResult::Fail("sysfs kernel directory missing");
+    };
+    let mut note = [0u8; 64];
+    let Some(read) = kernel.bin_attr_read("notes", 0, &mut note) else {
+        return TestResult::Fail("sysfs kernel notes missing");
+    };
+    if read < 16 {
+        return TestResult::Fail("kernel build-id note is truncated");
+    }
+    let namesz = u32::from_ne_bytes(note[0..4].try_into().unwrap());
+    let descsz = u32::from_ne_bytes(note[4..8].try_into().unwrap());
+    let note_type = u32::from_ne_bytes(note[8..12].try_into().unwrap());
+    if namesz != 4 || descsz == 0 || note_type != 3 || &note[12..16] != b"GNU\0" {
+        return TestResult::Fail("kernel notes lacks a valid GNU build-id");
+    }
+    let mut tail = [0u8; 8];
+    if kernel.bin_attr_read("notes", read, &mut tail) != Some(0) {
+        return TestResult::Fail("kernel notes EOF is not stable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/sysfs",
+    smoke_sysfs_kernel_notes_has_gnu_build_id
+);
 
 // ── Reset helper for tests ────────────────────────────────────────────
 

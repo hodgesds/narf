@@ -829,6 +829,73 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_cpu_hex_mask_format);
 
+/// Linux perf discovers PMU type numbers and raw-event bitfields through
+/// `/sys/bus/event_source/devices`.
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_perf_event_sources() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::sysfs::populate_perf_event_sources();
+    let root = crate::sysfs::sysfs_root();
+    let devices = match root
+        .get_child("bus")
+        .and_then(|b| b.get_child("event_source"))
+        .and_then(|e| e.get_child("devices"))
+    {
+        Some(devices) => devices,
+        None => return TestResult::Fail("perf event-source devices directory missing"),
+    };
+    let cpu = match devices.get_child("cpu") {
+        Some(cpu) => cpu,
+        None => return TestResult::Fail("cpu PMU directory missing"),
+    };
+    let format = match cpu.get_child("format") {
+        Some(format) => format,
+        None => return TestResult::Fail("cpu PMU format directory missing"),
+    };
+    #[cfg(target_arch = "x86_64")]
+    let format_valid = format.attr_show("event").as_deref() == Some("config:0-7\n")
+        && format.attr_show("umask").as_deref() == Some("config:8-15\n");
+    #[cfg(target_arch = "aarch64")]
+    let format_valid = format.attr_show("event").as_deref() == Some("config:0-15\n")
+        && format.attr_show("umask").is_none();
+    if cpu.attr_show("type").as_deref() != Some("4\n")
+        || cpu.attr_show("cpumask").is_none()
+        || !format_valid
+    {
+        return TestResult::Fail("cpu PMU discovery attributes invalid");
+    }
+    if devices
+        .get_child("software")
+        .and_then(|s| s.attr_show("type"))
+        .as_deref()
+        != Some("1\n")
+    {
+        return TestResult::Fail("software PMU type missing");
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let events = match cpu.get_child("events") {
+            Some(events) => events,
+            None => return TestResult::Fail("aarch64 PMU events directory missing"),
+        };
+        for (name, event) in [
+            ("cycles", 0x11u16),
+            ("instructions", 0x08),
+            ("cache-misses", 0x03),
+            ("branch-instructions", 0x0c),
+            ("branch-misses", 0x10),
+        ] {
+            let advertised = events.attr_show(name).is_some();
+            if advertised != narf_arch::aarch64::pmu::event_supported(event) {
+                return TestResult::Fail("aarch64 PMU alias does not match PMCEID");
+            }
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_perf_event_sources);
+
 // ── Test 14: THP `enabled` attr renders with [never] active ──────────
 
 /// `/sys/kernel/mm/transparent_hugepage/enabled` must contain

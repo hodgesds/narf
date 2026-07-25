@@ -113,13 +113,21 @@ huge-page region's effective policy, resident base-page equivalents grouped
 by SRAT node, and actual translation-leaf size.
 `/sys/devices/system/node/nodeN/{meminfo,numastat,vmstat}` exposes stable
 managed totals, live free/used pages, and the corresponding node-local
-event counters.
+event counters. Each node directory exposes Linux-compatible `cpuM` symlinks,
+with reciprocal `cpuM/nodeN` links under `/sys/devices/system/cpu`; consumers
+such as `perf stat --per-node` use the symlink type and name to construct the
+CPU-to-node aggregation map. If firmware supplies no CPU-affinity table and
+exactly one node exists, all online CPUs belong to node 0; multi-node systems
+never infer missing proximity.
 `/sys/kernel/mm/mempolicy/weighted_interleave/nodeN` exposes writable
 decimal weights in Linux's inclusive range 1..=255. Changes affect new
 `MPOL_WEIGHTED_INTERLEAVE` allocations and never migrate existing pages.
 The sibling `auto` attribute accepts Linux boolean strings; enabling it
 recomputes weights from parsed HMAT bandwidth and fails if no usable
 bandwidth coordinates exist. Writing `nodeN` selects manual mode.
+`/sys/kernel/notes` is a binary sysfs attribute containing the exact
+linker-retained GNU build-ID note for the running NARF kernel. Linux perf
+uses this note to identify kernel samples in persisted `perf.data`.
 `/proc/buddyinfo` reports live per-order free-block counts, while
 `/proc/zoneinfo` uses stable per-node managed totals and live NUMA events.
 
@@ -357,6 +365,18 @@ Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with
 `FsError::InvalidData`; a disconnected daemon fails pending requests
 without leaving callers parked indefinitely.
+
+### 3.9 Linux synthetic filesystem projections
+
+With `linux-compat`, sysfs exposes only interfaces backed by a NARF authority.
+The perf discovery projection is
+`/sys/bus/event_source/devices/{cpu,software}`: it publishes PMU type numbers,
+the online CPU mask, and architecture-correct raw CPU PMU `format/*` bitfields
+(x86 event/unit-mask controls or the aarch64 16-bit architectural event
+number). On aarch64, `events/*` publishes the architectural cycles,
+instructions, cache-miss, branch, and branch-miss aliases only when the
+corresponding PMCEID bit is set. Model-specific event aliases must not be
+published until derived from the detected PMU.
 
 ## 4. Invariants & safety properties
 

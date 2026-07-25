@@ -86,7 +86,9 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         // any region it overlaps so the non-replaced pages survive — the
         // dynamic linker overlays DSO segments onto its whole-file mapping
         // this way, and the ELF-header page between them must stay mapped.
-        let _ = as_ref.punch_fixed(VirtAddr::new(hint), len);
+        if as_ref.punch_fixed(VirtAddr::new(hint), len).is_ok() {
+            crate::mapped_file::punch_current(hint, len);
+        }
         hint
     } else {
         as_ref.reserve_mmap_va_aligned(len, page_size)
@@ -216,6 +218,9 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     ctx.set_return(SyscallReturn::invalid_op());
                     return;
                 }
+                crate::mapped_file::register_current(base, len, ops);
+                #[cfg(feature = "linux-compat")]
+                crate::perf_event::on_mmap(current_task_id(), fd, base, len, offset, prot, flags);
                 ctx.set_return(SyscallReturn::ok(base));
                 return;
             }
@@ -264,6 +269,16 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     // materialize installs only its PTEs over the registry
                     // frames.
                     if unsafe { as_ref.materialize() }.is_ok() {
+                        #[cfg(feature = "linux-compat")]
+                        crate::perf_event::on_mmap(
+                            current_task_id(),
+                            -1,
+                            base,
+                            len,
+                            0,
+                            prot,
+                            flags,
+                        );
                         ctx.set_return(SyscallReturn::ok(base));
                         return;
                     }
@@ -388,5 +403,15 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    #[cfg(feature = "linux-compat")]
+    crate::perf_event::on_mmap(
+        current_task_id(),
+        if anonymous { -1 } else { fd },
+        base,
+        len,
+        if anonymous { 0 } else { offset },
+        prot,
+        flags,
+    );
     ctx.set_return(SyscallReturn::ok(base));
 }

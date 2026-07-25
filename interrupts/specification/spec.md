@@ -30,7 +30,14 @@ pub enum IrqTarget {
 }
 pub fn end_of_interrupt(n: IrqNum);
 pub fn trigger_sw(n: IrqNum, target_cpu: CpuId);
+
+#[cfg(target_arch = "aarch64")]
+pub fn gic::configure_pmu_ppi(intid: u32) -> Result<(), ()>;
 ```
+
+The PMU route accepts only private INTIDs 16–31, enables the current CPU's
+redistributor immediately, and is inherited by subsequent per-CPU GIC
+initialisation. Its input must come from firmware discovery.
 
 ## 4. Invariants & safety properties
 
@@ -122,7 +129,11 @@ pattern.
 ### 8.2 IRQ delivery + dispatch
 
 The in-kernel trap entry (`frame/`) calls
-`narf_interrupts::on_irq(vector)` followed by `eoi()`. `on_irq`:
+`narf_interrupts::on_irq_with_context(vector, interrupted_ip)` followed by
+`eoi()`. Synthetic/test callers may use `on_irq(vector)`, which supplies a
+zero IP. A synchronous handler can read the contextual value through
+`interrupted_ip()` only during its handler walk. Dispatch otherwise preserves
+the `on_irq` contract:
 
 ```rust
 pub fn on_irq(vector: u8) {

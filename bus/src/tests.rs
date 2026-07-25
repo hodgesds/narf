@@ -77,6 +77,20 @@ fn smoke_bus_pcie_dtb_aarch64() -> TestResult {
 kernel_test_in!("bus", smoke_bus_pcie_dtb_aarch64);
 
 #[cfg(target_arch = "aarch64")]
+fn smoke_bus_discovers_pmu_ppi_from_dtb() -> TestResult {
+    use narf_memory::PhysAddr;
+    // SAFETY: xtask installs QEMU virt's live DTB at this identity-mapped
+    // address. The PMUv3 node describes PPI number 7, hence INTID 23.
+    match unsafe { crate::aarch64::discover_pmu_ppi(PhysAddr::new(0x4F00_0000)) } {
+        Some(23) => TestResult::Pass,
+        Some(_) => TestResult::Fail("PMUv3 node resolved to an unexpected PPI"),
+        None => TestResult::Fail("PMUv3 PPI was not discovered from the DTB"),
+    }
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("bus", smoke_bus_discovers_pmu_ppi_from_dtb);
+
+#[cfg(target_arch = "aarch64")]
 fn smoke_bus_enumerates_virtio_mmio() -> TestResult {
     // QEMU `virt` exposes 32 virtio-mmio transport slots at
     // 0x0a00_0000 (stride 0x200). We don't have easy access to the

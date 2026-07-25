@@ -121,6 +121,10 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // `notify_task_exited` passes `this.process.pid.raw()` (ProcessId), so the
     // key here must be ProcessId, not TaskId.
     parent_of_set(child_pid.raw(), parent_pid);
+    crate::mapped_file::fork_process(
+        task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
+        child_pid.raw(),
+    );
     let proc = crate::UserProcess {
         pid: child_pid,
         address_space: child_as.clone(),
@@ -160,6 +164,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
             None
         },
         entry_arg: None,
+        loaded_mappings: alloc::vec::Vec::new(),
     };
 
     let child_tid = match child_state {
@@ -230,6 +235,13 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // Inherit the parent's cgroup-namespace root (if any).
     #[cfg(all(feature = "cgroup", feature = "container"))]
     narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_pid.raw());
+    #[cfg(feature = "linux-compat")]
+    crate::perf_event::on_fork(
+        task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
+        child_pid.raw(),
+        parent_pid,
+        child_tid.raw(),
+    );
     // Parent-of bookkeeping was published above, BEFORE the spawn, to close
     // the SMP TRACEME race (see the comment at the `parent_of_set` call site).
     // Return the child's pid in the parent's namespace (POSIX fork(2)

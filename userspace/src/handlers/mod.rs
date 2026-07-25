@@ -4888,6 +4888,15 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     if flags & CLONE_VFORK != 0 {
         vfork_wait_register(child_visible_pid, parent_pid);
     }
+    // Publish inherited mapping owners before the child becomes runnable.
+    // Otherwise an immediate child exit can race the late copy and leave an
+    // owner reference keyed to a process that has already been reaped.
+    if !share_thread {
+        crate::mapped_file::fork_process(
+            task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
+            child_visible_pid,
+        );
+    }
 
     // CLONE_PIDFD: mint the shared exit-state BEFORE the child is spawned.
     // `pidfd::notify_exit` only flips entries that already exist in the
@@ -4934,6 +4943,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
             }
         },
         entry_arg: None,
+        loaded_mappings: alloc::vec::Vec::new(),
     };
     let _ = DEFAULT_USER_STACK_BYTES;
 
@@ -5213,10 +5223,20 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         set_clear_child_tid_with_as(child_tid.raw(), ca.child_tid, child_as_root);
     }
 
-    // Parent-of bookkeeping for wait4 was published above, BEFORE the spawn,
-    // to close the SMP TRACEME race (see the comment at that call site). A
-    // thread (CLONE_THREAD) is not waitpid-reapable; pthread_join uses the
-    // futex on clear_child_tid instead — so nothing to publish for it.
+    // Parent-of bookkeeping for wait4 was published above, BEFORE the spawn.
+    // Threads are not waitpid-reapable, but perf inheritance still observes
+    // them as tasks in the parent's process.
+    let parent_visible_pid = task_to_pid_raw(parent_pid).unwrap_or(parent_pid);
+    crate::perf_event::on_fork(
+        parent_visible_pid,
+        if share_thread {
+            parent_visible_pid
+        } else {
+            child_visible_pid
+        },
+        parent_pid,
+        child_tid.raw(),
+    );
 
     // Return: parent sees child TID (== visible-pid for !THREAD,
     // == TaskId.raw() for THREAD where TID and PID diverge). For a new
@@ -5640,12 +5660,17 @@ pub fn wait_init() {
     // `pid`, so they're independent of ordering.
     crate::user_task::register_thread_exit_observer(on_thread_exit);
     crate::user_task::register_thread_exit_observer(task_tables_exit_observer);
+    #[cfg(feature = "linux-compat")]
+    crate::user_task::register_thread_exit_observer(crate::perf_event::on_thread_exit);
     // PROCESS-scoped (last thread of the group only): hand the process
     // to its parent (wait4 reap + SIGCHLD + waker) or auto-release if
     // orphaned. Gated on `group_dead` so a multi-threaded exit_group
     // reaps the pid exactly once (was per-thread → double `release_pid`,
     // the OCI teardown #UD).
+    #[cfg(feature = "linux-compat")]
+    crate::user_task::register_process_exit_observer(crate::perf_event::on_process_exit);
     crate::user_task::register_process_exit_observer(on_child_exit);
+    crate::user_task::register_process_exit_observer(crate::mapped_file::process_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
     // Abnormal slot drops (budget kill / revoked cap) must run the same
@@ -8808,6 +8833,10 @@ fn do_execve_resolved(
         let basename = first.rsplit('/').next().unwrap_or(first);
         set_proc_comm(task, basename);
     }
+    // Commit perf enable_on_exec and PERF_RECORD_COMM only after both the new
+    // image and its Linux comm name have been published.
+    #[cfg(feature = "linux-compat")]
+    crate::perf_event::on_exec(task, &new_proc.loaded_mappings, &cur_path);
     // /proc/[pid]/exe: `cur_path` survived the shebang loop, so it names
     // the binary actually being mapped (the interpreter for scripts).
     set_proc_exe(task, &cur_path);

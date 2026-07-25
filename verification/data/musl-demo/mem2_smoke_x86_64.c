@@ -65,13 +65,15 @@ int main(void) {
     if (p == MAP_FAILED) { w("mem2-fail: mmap\n"); return 1; }
     p[0] = 1; // fault it in
 
-    // ── move_pages: status query reports node 0 ──
+    // ── move_pages: status query reports the actual online SRAT node ──
     void *pages[1] = { p };
     int status[1] = { -1 };
     if (syscall(SYS_move_pages, 0L, 1L, pages, (void *)0, status, 0L) != 0) {
         w("mem2-fail: move_pages\n"); return 1;
     }
-    if (status[0] != 0) { w("mem2-fail: move_pages-node\n"); return 1; }
+    if (status[0] < 0 || status[0] >= 64) {
+        w("mem2-fail: move_pages-node\n"); return 1;
+    }
 
     // ── mbind migration / set_mempolicy_home_node / migrate_pages ──
     unsigned long old_nodes = 1UL;

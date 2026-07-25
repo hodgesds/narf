@@ -129,6 +129,96 @@ pub unsafe fn enumerate(dtb: Option<PhysAddr>) -> Vec<BusDevice> {
     out
 }
 
+/// Discover the firmware-described Arm PMUv3 private interrupt.
+///
+/// The GIC binding encodes a PPI as `<1, ppi-number, flags>` and the
+/// architectural INTID is `16 + ppi-number`. There is deliberately no
+/// QEMU fallback: the PMU PPI is implementation-defined and sampling must
+/// remain unavailable when firmware does not describe it.
+///
+/// # Safety
+/// `dtb` must point at a live, identity-mapped flattened Devicetree blob.
+pub unsafe fn discover_pmu_ppi(dtb: PhysAddr) -> Option<u32> {
+    let base = dtb.raw() as *const u8;
+    if base.is_null() {
+        return None;
+    }
+    // SAFETY: caller promises a readable FDT header.
+    let hdr = unsafe { read_header(base) }?;
+    let struct_start = hdr.off_dt_struct as usize;
+    let struct_len = hdr.size_dt_struct as usize;
+    // SAFETY: validated FDT header and caller-owned live blob.
+    let s = unsafe { core::slice::from_raw_parts(base.add(struct_start), struct_len) };
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    let mut compatible = [false; 64];
+    let mut ppi = [None; 64];
+
+    while cursor + 4 <= s.len() {
+        let tok = be32(&s[cursor..cursor + 4]);
+        cursor += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                let name_start = cursor;
+                let mut end = name_start;
+                while end < s.len() && s[end] != 0 {
+                    end += 1;
+                }
+                if end == s.len() || depth == compatible.len() {
+                    return None;
+                }
+                cursor = name_start + (((end - name_start) + 1 + 3) & !3);
+                compatible[depth] = false;
+                ppi[depth] = None;
+                depth += 1;
+            }
+            FDT_PROP => {
+                if depth == 0 || cursor + 8 > s.len() {
+                    return None;
+                }
+                let plen = be32(&s[cursor..cursor + 4]) as usize;
+                let nameoff = be32(&s[cursor + 4..cursor + 8]) as usize;
+                cursor += 8;
+                let padded = (plen + 3) & !3;
+                if cursor + padded > s.len() {
+                    return None;
+                }
+                let data = &s[cursor..cursor + plen];
+                cursor += padded;
+                // SAFETY: name offset is bounds-checked by fdt_string.
+                match unsafe { fdt_string(base, &hdr, nameoff) } {
+                    Some(b"compatible") => {
+                        compatible[depth - 1] = data
+                            .split(|byte| *byte == 0)
+                            .any(|value| value == b"arm,armv8-pmuv3");
+                    }
+                    Some(b"interrupts") if plen >= 12 => {
+                        let interrupt_type = be32(&data[0..4]);
+                        let number = be32(&data[4..8]);
+                        if interrupt_type == 1 && number < 16 {
+                            ppi[depth - 1] = Some(16 + number);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if compatible[depth] {
+                    return ppi[depth];
+                }
+            }
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// QEMU `virt` PCIe ECAM base. The host bridge's MMCFG region lives
 /// at `0x3F00_0000` and is 16 MiB wide (i.e. 16 buses). Used by a
 /// future DTB-driven ECAM enable path; bare reads abort today

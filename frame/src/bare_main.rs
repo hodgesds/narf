@@ -1917,6 +1917,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     n_pcie,
                     n_mmio
                 );
+                if let Some(dtb) = info.dtb_phys {
+                    // SAFETY: the bus walker already validated this live,
+                    // identity-mapped firmware blob.
+                    if let Some(ppi) = unsafe { narf_bus::aarch64::discover_pmu_ppi(dtb) } {
+                        if narf_interrupts::aarch64::gic::configure_pmu_ppi(ppi).is_ok() {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  pmu: firmware-routed PPI {} enabled",
+                                ppi
+                            );
+                        }
+                    }
+                }
 
                 // PCIe BAR self-allocator. NARF on QEMU virt boots
                 // via `-kernel` without firmware, so PCIe BARs come

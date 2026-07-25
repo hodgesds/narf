@@ -16,7 +16,10 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
         .map(|_| ())
         .or_else(|_| as_ref.unmap_huge_region(base))
     {
-        Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+        Ok(_) => {
+            crate::mapped_file::unmap_current(base.as_u64());
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }

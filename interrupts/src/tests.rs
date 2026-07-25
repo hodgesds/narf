@@ -584,6 +584,32 @@ const SCRATCH_VEC_HANDLER_CLEAR: u8 = 113;
 const SCRATCH_VEC_HANDLER_ORDER: u8 = 114;
 const SCRATCH_VEC_BASELINE: u8 = 115;
 const SCRATCH_VEC_DROP_CLEARS: u8 = 116;
+const SCRATCH_VEC_CONTEXT: u8 = 117;
+
+fn smoke_dispatch_publishes_interrupted_ip_during_handler() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    fn handler(_cookie: u64) -> crate::IrqStatus {
+        SEEN.store(crate::interrupted_ip(), Ordering::Release);
+        crate::IrqStatus::Handled
+    }
+
+    SEEN.store(0, Ordering::Relaxed);
+    crate::install_handler_named(SCRATCH_VEC_CONTEXT, "context-test", 0, handler);
+    crate::on_irq_with_context(SCRATCH_VEC_CONTEXT, 0x1234_5678_9abc_def0);
+    crate::dispatch::clear_handler(SCRATCH_VEC_CONTEXT);
+    if SEEN.load(Ordering::Acquire) != 0x1234_5678_9abc_def0 {
+        return TestResult::Fail("handler did not observe interrupted IP");
+    }
+    if crate::interrupted_ip() != 0 {
+        return TestResult::Fail("interrupted IP remained published after dispatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "interrupts",
+    smoke_dispatch_publishes_interrupted_ip_during_handler
+);
 
 fn smoke_dispatch_sync_handler_runs_on_on_irq() -> TestResult {
     // `install(v, h)` + `on_irq(v)` fires the synchronous handler.

@@ -218,12 +218,34 @@ pub fn user_own_stack_enabled() -> bool {
 // the crate boundary. Installed by `narf_userspace` at boot. `0` = not wired.
 static USER_FPU_SAVE_HOOK: AtomicUsize = AtomicUsize::new(0);
 static USER_FPU_RESTORE_HOOK: AtomicUsize = AtomicUsize::new(0);
+static USER_PERF_SWITCH_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Wire the user-FPU save/restore hooks (userspace installs FXSAVE/FXRSTOR of
 /// the running user task's FPU area).
 pub fn set_user_fpu_hooks(save: fn(), restore: fn()) {
     USER_FPU_SAVE_HOOK.store(save as usize, Ordering::Release);
     USER_FPU_RESTORE_HOOK.store(restore as usize, Ordering::Release);
+}
+
+/// Install the userspace-owned task PMU context-switch hook.
+///
+/// The hook runs in executor context, with no scheduler queue lock held,
+/// immediately before (`running = true`) and after (`running = false`) the
+/// stackful continuation executes. This makes hardware counters follow a task
+/// across preemption and CPU migration without counting executor or peer-task
+/// work.
+pub fn set_user_perf_switch_hook(hook: fn(u64, bool)) {
+    USER_PERF_SWITCH_HOOK.store(hook as usize, Ordering::Release);
+}
+
+#[inline]
+fn user_perf_switch(task: u64, running: bool) {
+    let hook = USER_PERF_SWITCH_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_user_perf_switch_hook` writes this slot.
+        let hook: fn(u64, bool) = unsafe { core::mem::transmute(hook) };
+        hook(task, running);
+    }
 }
 
 /// Publish the CURRENT stackful task's user-FPU (FXSAVE) area. Called by the
@@ -801,9 +823,12 @@ impl KernelTask {
         // is sound and leaves the source intact.
         let prev_exec = unsafe { core::ptr::read(exec_ctx as *const KernelContext) };
         guard_switch_into("poll_to_yield:self.ctx", &self.ctx);
+        let perf_task = crate::current_task_id().raw();
+        user_perf_switch(perf_task, true);
         // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         // ── We are resumed here when the task yields back ──
+        user_perf_switch(perf_task, false);
         // Restore the EXEC_CTX slot contents that were live before this poll, so
         // a nested poll leaves the OUTER task's saved continuation intact (see
         // the snapshot comment above).

@@ -148,6 +148,139 @@ The fd is resolved through that task's table and the typed `SocketFile`; no raw
 A public native cap-bearing operation remains unavailable until submissions
 are validated against a real per-task capability table.
 
+### 3.1 Linux perf-event compatibility
+
+With `linux-compat`, the slow syscall table exposes Linux
+`perf_event_open(2)`. The returned fd implements the counting subset of the
+Linux perf-event ABI: `read(2)` according to `attr.read_format` and
+`PERF_EVENT_IOC_{ENABLE,DISABLE,RESET,ID}`. Group members opened against a
+perf-event leader participate in group-format reads and group-flag lifecycle
+ioctls. `enable_on_exec` events are registered weakly by target task and the
+shared successful `execve`/`execveat` commit path activates the leader and all
+members; failed exec attempts do not activate them. The process group-dead
+observer stops task-targeted leader groups before the monitoring process reads
+their terminal values. This is a compatibility adapter over `observability/`
+PMU authority, not an independent counter subsystem.
+
+`PERF_COUNT_SW_CPU_CLOCK` is admitted only with `exclude_kernel`, where the
+scheduler's per-CPU user-continuation brackets provide an exact accumulated
+user-time clock. Requests for an all-context per-CPU clock remain unsupported
+until kernel/executor time is accounted per CPU. `PERF_COUNT_SW_TASK_CLOCK`
+uses the existing per-task user and syscall CPU-time ledgers.
+
+A shared mapping of a perf fd exposes one Linux-shaped
+`perf_event_mmap_page` metadata page followed by a power-of-two data area.
+The metadata seqlock publishes the count and enabled/running times; `index`
+remains zero because direct userspace PMU reads are unavailable. The file
+owns all mapped frames, whose lifetime is retained by §3.2 even after fd
+close.
+
+On x86_64, sampled hardware events arm the owned GP counter for
+interrupt-on-overflow and route LVT-PC through the normal IRQ dispatcher. The
+hard-IRQ handler acknowledges/reloads the counter and captures task, IP, time,
+and counter identity into a fixed per-CPU slot without allocation. Normal
+syscall context drains those slots into `PERF_RECORD_SAMPLE`/`LOST` records,
+advances `data_head` with release ordering, and wakes poll/epoll readers.
+Committed exec, comm-change, fork/clone-process, and process-exit paths emit
+Linux `PERF_RECORD_COMM`, `FORK`, and `EXIT` records when their corresponding
+attribute bits are selected. Variable records are eight-byte aligned;
+`sample_id_all` appends the selected TID/TIME/ID/STREAM_ID/CPU/IDENTIFIER
+identity fields in Linux order. `wakeup_events` counts committed records and
+wakes readers at the requested threshold. `PERF_EVENT_IOC_PAUSE_OUTPUT`
+atomically suppresses record commits while leaving the event enabled, and
+resuming makes subsequent records visible again. Ring-capacity failures
+increment the event's loss counter; reads selecting `PERF_FORMAT_LOST` return
+that real counter for each standalone or grouped event rather than a constant.
+`PERF_EVENT_IOC_SET_OUTPUT` redirects records to another compatible perf
+event's mapped ring while retaining loss accounting on the source event; the
+target must describe the same task and CPU context, and `-1` detaches it.
+`PERF_EVENT_IOC_REFRESH` is accepted only for non-inherited sampling events.
+Its argument adds real-overflow credits and enables the event; each hardware
+overflow consumes one credit, and consuming the last credit synchronously
+stops the PMU event and exposes `POLLHUP`. A later refresh clears the terminal
+readiness and adds a new budget. A zero argument retains Linux's effectively
+unlimited behavior.
+On x86_64, `PERF_EVENT_IOC_PERIOD` synchronously validates and installs a new
+nonzero hardware sampling period while the event is disabled. Updating a live
+or remotely active x86_64 event returns an error until a synchronous cross-CPU
+PMU control path exists; NARF does not defer the update and report false
+success.
+On aarch64, fixed-period `PERF_COUNT_HW_CPU_CYCLES` sampling uses the
+architectural 64-bit cycle counter, a firmware-discovered level-sensitive
+PMUv3 PPI, and the same deferred mmap-ring producer. The end-to-end QEMU gate
+requires a real PMCCNTR overflow, GICv3 dispatch, PMOVS acknowledgement, and
+visible mmap sample. Instructions, cache misses, branch instructions, branch
+misses, and raw architectural event numbers are admitted only when the
+corresponding PMCEID bit proves that the PMUv3 implementation supports them.
+Their programmable-counter overflows use the same PPI and deferred producer.
+Frequency mode adjusts the real next-overflow reload period from observed
+overflow timing. `PERF_EVENT_IOC_PERIOD` synchronously rearms an active
+current-CPU aarch64 counter or validates a disabled/switched-out event against
+a temporary real counter. A remotely active event returns an error until a
+synchronous IPI rendezvous exists. Sampling periods below 10,000 events return
+an error to prevent an interrupt storm.
+Successful `mmap(2)` commits emit `PERF_RECORD_MMAP` or `MMAP2` for executable
+and/or data VMAs selected by `mmap`, `mmap2`, and `mmap_data`. File mappings
+carry the fd's recorded path and stable filesystem inode; anonymous mappings
+are named `//anon`. MMAP2 reports the actual single NARF VFS device namespace
+as 0:0 and generation zero because the VFS does not yet version inode
+identities. Request-only controls such as `MAP_FIXED` are not leaked as VMA
+flags. The ELF loader retains the exact committed PT_LOAD address, rounded
+length, file offset, protection, and PIE/interpreter bias until the shared
+exec commit emits initial program and interpreter records. The committed
+main-stack VMA is emitted as `[stack]`; guard and kernel-private TLS mappings
+are not exposed.
+Unsupported sample layouts and platforms without a routed PMU overflow IRQ
+fail explicitly.
+
+Task-scoped x86_64 and aarch64 hardware events are scheduler-attributed: a switch hook
+allocates and programs a counter in the destination CPU's PMU bank immediately
+before entering the target continuation, then stops, folds, and releases it
+immediately after every yield or preemption. Migration therefore carries the
+accumulated value while never reusing an origin CPU's MSR identity. PMU slot
+allocation, sampling overflow state, and LVT-PC routing are per logical CPU;
+the switch-in path installs the shared PMI vector in each destination CPU
+before arming its first sampled counter. `inherit` extends
+that task set at every process or thread clone and removes the child at its
+thread-exit callback; concurrently running descendants therefore receive
+independent per-CPU slots whose counts feed the original event. Frequency mode
+starts from the calibrated TSC-rate estimate and, after each real overflow,
+adjusts the following reload period from observed elapsed time toward
+`sample_freq`; each correction is bounded to fourfold to prevent a delayed
+drain from creating an interrupt storm. `PERF_SAMPLE_PERIOD` reports the period
+that caused that overflow, not the next adaptive period. Per-CPU events on SMP
+still require remote-CPU PMU calls and fail explicitly.
+Cgroup, filter, probe, and BPF features fail explicitly.
+`exclude_guest` is accepted because NARF never executes nested guest context.
+The `ksymbol` and `bpf_event` record selectors are also accepted as empty
+domains: NARF has neither a runtime kernel-symbol loader nor a BPF VM, so no
+such lifecycle event can occur. A software-dummy event selecting only that
+empty BPF sideband domain may also request watermark wakeups: with no possible
+records, every watermark has the same observable empty-ring semantics. This
+does not suppress an implemented event.
+The adapter must not synthesize plausible values for an unavailable hardware
+event. The audited command matrix and remaining gaps live in
+`observability/PERF_LINUX_COMPAT_AUDIT.md`.
+
+Linux perf wire definitions are owned by the separate
+`narf-linux-perf-uapi` crate, transcribed through `PERF_ATTR_SIZE_VER9` from
+Linux `include/uapi/linux/perf_event.h`. Defining a UAPI value does not admit
+it: userspace accepts only implemented attribute bits and exact event
+backends. Software events are currently limited to `PERF_COUNT_SW_DUMMY`.
+Hardware events require x86_64 and a real programmable PMU. Task-scoped events
+follow scheduler execution across CPUs; per-CPU events currently require a
+uniprocessor target matching the calling CPU.
+
+### 3.2 Shared file-mapping lifetime
+
+A successful file/device-backed `MAP_SHARED` mapping retains an
+`Arc<dyn FileOps>` independently of the descriptor table. Closing the fd does
+not invalidate mapped frames. The owner reference follows process
+fork/clone, mirrors `MAP_FIXED` region splitting, and is released by
+`munmap(2)` or process group-dead teardown. This registry lives in userspace
+compatibility code so address-space regions do not gain a filesystem
+dependency.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

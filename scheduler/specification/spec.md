@@ -39,6 +39,7 @@ pub fn task_mems_allowed(task: u64) -> u64;
 pub fn clear_task_mems_allowed(task: u64);
 /// Distinct live user address spaces, including currently-polled tasks.
 pub fn all_address_spaces() -> Vec<Arc<AddressSpace>>;
+pub fn set_user_perf_switch_hook(hook: fn(task: u64, running: bool));
 ```
 
 Executor internals: per-CPU queues + global stealing pool; each task
@@ -46,6 +47,10 @@ carries `DomainId` so the executor switches domain before polling.
 The per-task NUMA mask is the task-identity seam for cgroup-v2
 `cpuset.mems`; the page-fault policy resolver treats it as a hard
 allocation boundary and removes it when the task exits or detaches.
+The optional userspace PMU hook brackets every stackful continuation in
+executor context after run-queue locks have been released. `running=true`
+precedes the switch into the task and `running=false` follows every switch
+back, including preemption and migration.
 
 ### 3.2 CPU topology
 
@@ -145,6 +150,9 @@ pub fn cpu_take_offline(id: CpuId, cap: &Cap<CpuLifecycle, Manage>) -> impl Futu
   it sees either the old CPU or a new CPU; never a torn migration.
 - Resource-budget accounting is never racy: a task that exceeds its
   budget cannot cause a refund to another task.
+- A task-scoped PMU event is active only between its matching switch-in and
+  switch-out hook calls. The hook must stop and fold the current CPU's counter
+  before the executor or another task runs.
 - **PKRS / TCF save/restore is the scheduler's responsibility.** On
   every preemption the executor calls
   `memory::save_domain_state(&mut task.domain_saved)` before touching

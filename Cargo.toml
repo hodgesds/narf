@@ -78,6 +78,7 @@ members = [
     "pinctrl",
     "shmem",
     "compat/relibc",
+    "compat/linux-perf-uapi",
     "compat/win",
     "compat/win-rt",
     "firmware",

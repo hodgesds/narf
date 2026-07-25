@@ -7,6 +7,67 @@
 use core::arch::asm;
 use core::sync::atomic::{compiler_fence, Ordering};
 
+macro_rules! pmu_read {
+    ($name:ident, $reg:literal) => {
+        #[doc = concat!("Read `", $reg, "` for the current CPU.")]
+        ///
+        /// # Safety
+        /// Requires EL1 and an implemented PMUv3 system-register interface.
+        #[inline]
+        pub unsafe fn $name() -> u64 {
+            compiler_fence(Ordering::SeqCst);
+            let value: u64;
+            // SAFETY: caller establishes EL1 + PMUv3 presence.
+            unsafe {
+                asm!(concat!("mrs {value}, ", $reg), value = out(reg) value,
+                    options(nostack, preserves_flags));
+            }
+            compiler_fence(Ordering::SeqCst);
+            value
+        }
+    };
+}
+
+macro_rules! pmu_write {
+    ($name:ident, $reg:literal) => {
+        #[doc = concat!("Write `", $reg, "` for the current CPU.")]
+        ///
+        /// # Safety
+        /// Requires EL1 and an implemented PMUv3 system-register interface.
+        #[inline]
+        pub unsafe fn $name(value: u64) {
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: caller establishes EL1 + PMUv3 presence.
+            unsafe {
+                asm!(concat!("msr ", $reg, ", {value}"), "isb", value = in(reg) value,
+                    options(nostack, preserves_flags));
+            }
+            compiler_fence(Ordering::SeqCst);
+        }
+    };
+}
+
+pmu_read!(read_id_aa64dfr0_el1, "id_aa64dfr0_el1");
+pmu_read!(read_pmcr_el0, "pmcr_el0");
+pmu_read!(read_pmccntr_el0, "pmccntr_el0");
+pmu_read!(read_pmovsclr_el0, "pmovsclr_el0");
+pmu_read!(read_pmcntenset_el0, "pmcntenset_el0");
+pmu_read!(read_pmintenset_el1, "pmintenset_el1");
+pmu_read!(read_pmxevcntr_el0, "pmxevcntr_el0");
+pmu_read!(read_pmceid0_el0, "pmceid0_el0");
+pmu_read!(read_pmceid1_el0, "pmceid1_el0");
+pmu_write!(write_pmcr_el0, "pmcr_el0");
+pmu_write!(write_pmccntr_el0, "pmccntr_el0");
+pmu_write!(write_pmccfiltr_el0, "pmccfiltr_el0");
+pmu_write!(write_pmselr_el0, "pmselr_el0");
+pmu_write!(write_pmxevtyper_el0, "pmxevtyper_el0");
+pmu_write!(write_pmxevcntr_el0, "pmxevcntr_el0");
+pmu_write!(write_pmcntenset_el0, "pmcntenset_el0");
+pmu_write!(write_pmcntenclr_el0, "pmcntenclr_el0");
+pmu_write!(write_pmintenset_el1, "pmintenset_el1");
+pmu_write!(write_pmintenclr_el1, "pmintenclr_el1");
+pmu_write!(write_pmovsclr_el0, "pmovsclr_el0");
+
 /// Write `VBAR_EL1` — the EL1 exception vector table base address.
 /// Takes effect immediately; subsequent exceptions dispatch through
 /// `addr`.

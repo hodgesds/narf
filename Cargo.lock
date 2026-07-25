@@ -1760,6 +1760,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-linux-perf-uapi"
+version = "0.0.0"
+
+[[package]]
 name = "narf-memory"
 version = "0.0.0"
 dependencies = [
@@ -1988,8 +1992,10 @@ dependencies = [
  "narf-firmware",
  "narf-initramfs",
  "narf-input",
+ "narf-interrupts",
  "narf-kernel-test",
  "narf-lib",
+ "narf-linux-perf-uapi",
  "narf-memory",
  "narf-modules",
  "narf-net",
