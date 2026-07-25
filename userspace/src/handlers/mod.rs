@@ -9296,10 +9296,14 @@ pub fn apply_chroot_for_test(p: &str) -> alloc::string::String {
 
 const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
+const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
 // Wave-73: CLOCK_MONOTONIC_RAW skips NTP slew (we have no NTP, so
 // RAW == MONOTONIC for now). CLOCK_BOOTTIME counts wall time across
 // suspend (no suspend support → same as MONOTONIC).
 const CLOCK_MONOTONIC_RAW: u64 = 4;
+const CLOCK_REALTIME_COARSE: u64 = 5;
+const CLOCK_MONOTONIC_COARSE: u64 = 6;
 const CLOCK_BOOTTIME: u64 = 7;
 
 // ── I/O Priority (ioprio_set / ioprio_get) ─────────────────────────
@@ -12079,6 +12083,8 @@ pub fn default_sync_signal_delivery(
             // desktop app maps (kwin, Qt, Mesa, glibc/musl, ...).
             {
                 use core::fmt::Write;
+                let pid = task_to_pid_raw(task).unwrap_or(task);
+                let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
                 let cause = match vector {
                     6 => "#UD",
                     13 => "#GP",
@@ -12089,8 +12095,10 @@ pub fn default_sync_signal_delivery(
                 };
                 let _ = writeln!(
                     narf_console::Writer,
-                    "fatal-fault: task={} sig={} {} vec={} faultva={:x} rip={:x}",
+                    "fatal-fault: task={} pid={} comm={} sig={} {} vec={} faultva={:x} rip={:x}",
                     task,
+                    pid,
+                    comm,
                     signum,
                     cause,
                     vector,
@@ -12108,7 +12116,19 @@ pub fn default_sync_signal_delivery(
                 // land in an executable window — the ld-musl interp bias
                 // (0x4000_0000_0000) or the mmap DSO arena (0x4080_.. up).
                 let rsp = ctx.user_rsp();
-                for i in 0..32u64 {
+                let _ = writeln!(narf_console::Writer, "  user-rsp={:x}", rsp);
+                if let Some(info) = proc_task_info(pid) {
+                    for vma in info.vmas.iter().filter(|vma| vma.executable) {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "  exec-vma={:016x}-{:016x} {}",
+                            vma.start,
+                            vma.end,
+                            vma.label
+                        );
+                    }
+                }
+                for i in 0..96u64 {
                     let mut w = [0u8; 8];
                     // SAFETY: copy_from_user range-validates the source VA and
                     // SMAP-brackets the read; a bad slot just errors out.
@@ -12116,9 +12136,10 @@ pub fn default_sync_signal_delivery(
                         break;
                     }
                     let v = u64::from_le_bytes(w);
-                    if (0x0000_4000_0000_0000..0x0000_7F00_0000_0000).contains(&v) {
-                        let _ = writeln!(narf_console::Writer, "  stk[{}]={:x}", i, v);
-                    }
+                    // Fatal-path-only raw dump: selector-shaped corruption
+                    // often lands outside executable windows, and filtering
+                    // those words discards the evidence needed to localize it.
+                    let _ = writeln!(narf_console::Writer, "  stk[{}]={:016x}", i, v);
                 }
             }
             match default_signal_action(signum) {

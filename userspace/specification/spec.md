@@ -41,6 +41,9 @@ socket-stamped supplementary group list, or retained peer pidfd; the
 compatibility layer never fabricates security identity.
 AF_UNIX stream clients may bind a local pathname or abstract address before
 `connect(2)`; binding does not put the socket into listening state.
+`clock_gettime(2)` accepts realtime/monotonic coarse clocks and process/thread
+CPU clocks. Coarse clocks currently use the precise source; CPU clocks use the
+calling task's accumulated user and kernel accounting.
 
 Bootstrap: every new process receives two ring pairs (submit + complete)
 for the kernel ABI plus a read-only config page with capability

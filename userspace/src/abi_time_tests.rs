@@ -6,6 +6,10 @@ use crate::abi_test_support::*;
 // constants in handlers.rs / posix_timer.rs).
 const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
+const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+const CLOCK_REALTIME_COARSE: u64 = 5;
+const CLOCK_MONOTONIC_COARSE: u64 = 6;
 
 // ── sysinfo(buf) ──────────────────────────────────────────────────────
 // buf==0 → ok(-EFAULT); a valid 112-byte buffer → ok(0).
@@ -229,6 +233,30 @@ fn smoke_abi_time_clock_gettime_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_clock_gettime_pos);
+
+fn smoke_abi_time_clock_gettime_cpu_and_coarse_clocks() -> TestResult {
+    with_setup(|| {
+        for id in [
+            CLOCK_PROCESS_CPUTIME_ID,
+            CLOCK_THREAD_CPUTIME_ID,
+            CLOCK_REALTIME_COARSE,
+            CLOCK_MONOTONIC_COARSE,
+        ] {
+            let mut ts = [0u64; 2];
+            if call(Syscall::ClockGetTime.raw(), a1(id, ts.as_mut_ptr() as u64)) != Some(0) {
+                return Err("clock_gettime compatibility clock failed");
+            }
+            if ts[1] >= 1_000_000_000 {
+                return Err("clock_gettime returned invalid tv_nsec");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_clock_gettime_cpu_and_coarse_clocks
+);
 
 fn smoke_abi_time_clock_gettime_neg() -> TestResult {
     with_setup(|| {

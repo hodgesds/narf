@@ -10,12 +10,23 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
         return;
     }
     let (sec, nsec) = match id {
-        CLOCK_REALTIME => {
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => {
             let w = narf_scheduler::narf_time::now_wall();
             (w.secs, w.nanos as i64)
         }
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME => {
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
             let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
+            ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
+        }
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
+            // Stage-4 processes are single-threaded in the common path, so
+            // both clocks use the calling task's existing user+kernel
+            // accounting. Include the active slice, which has not yet been
+            // folded into TASK_CPU_NS.
+            let task = current_task_id();
+            let ns = cpu_time_ns_of(task)
+                .saturating_add(kern_time_ns_of(task))
+                .saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
             ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
         }
         _ => {
