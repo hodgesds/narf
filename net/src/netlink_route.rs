@@ -79,6 +79,7 @@ pub const RTM_GETNEXTHOP: u16 = 106;
 pub const NLM_F_REQUEST: u16 = 0x01;
 pub const NLM_F_MULTI: u16 = 0x02;
 pub const NLM_F_ACK: u16 = 0x04;
+pub const NLM_F_ACK_TLVS: u16 = 0x200;
 pub const NLM_F_REPLACE: u16 = 0x100;
 pub const NLM_F_EXCL: u16 = 0x200;
 pub const NLM_F_CREATE: u16 = 0x400;
@@ -163,6 +164,7 @@ pub const ENOENT: i32 = 2;
 pub const EEXIST: i32 = 17;
 pub const ENODEV: i32 = 19;
 pub const EINVAL: i32 = 22;
+pub const NLMSGERR_ATTR_MSG: u16 = 1;
 
 // ── parsed request header ───────────────────────────────────────────────
 
@@ -932,6 +934,19 @@ pub fn build_replies_authorized(
     datagram: &[u8],
     admin: Option<&crate::AdminHandle>,
 ) -> Result<Vec<Vec<u8>>, ()> {
+    build_replies_with_options(datagram, admin, ReplyOptions::default())
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ReplyOptions {
+    pub ext_ack: bool,
+}
+
+pub fn build_replies_with_options(
+    datagram: &[u8],
+    admin: Option<&crate::AdminHandle>,
+    options: ReplyOptions,
+) -> Result<Vec<Vec<u8>>, ()> {
     let mut offset = 0usize;
     let mut replies = Vec::new();
 
@@ -988,7 +1003,48 @@ pub fn build_replies_authorized(
             offset += step;
         }
     }
+    if options.ext_ack {
+        for reply in &mut replies {
+            append_extended_ack(reply);
+        }
+    }
     Ok(replies)
+}
+
+fn append_extended_ack(message: &mut Vec<u8>) {
+    let Some(hdr) = parse_hdr(message) else {
+        return;
+    };
+    if hdr.msg_type != NLMSG_ERROR || message.len() < NLMSG_HDRLEN + 4 {
+        return;
+    }
+    let errno = i32::from_ne_bytes(
+        message[NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
+    if errno >= 0 {
+        return;
+    }
+    let text: &[u8] = match -errno {
+        EPERM => b"interface admin capability required\0",
+        ENOENT => b"requested network object does not exist\0",
+        EEXIST => b"network object already exists\0",
+        ENODEV => b"network interface does not exist\0",
+        EINVAL => b"invalid rtnetlink request\0",
+        EOPNOTSUPP => b"rtnetlink operation not supported\0",
+        _ => b"rtnetlink operation failed\0",
+    };
+    let declared_len = hdr.len as usize;
+    if declared_len > message.len() {
+        return;
+    }
+    message.truncate(declared_len);
+    push_rtattr(message, NLMSGERR_ATTR_MSG, text);
+    let new_len = message.len() as u32;
+    message[0..4].copy_from_slice(&new_len.to_ne_bytes());
+    let flags = hdr.flags | NLM_F_ACK_TLVS;
+    message[6..8].copy_from_slice(&flags.to_ne_bytes());
 }
 
 /// Build kernel-originated multicast notifications for mutations that

@@ -139,6 +139,10 @@ Creation and replacement honor Linux `NLM_F_CREATE`, `NLM_F_EXCL`, and
 `NLM_F_REPLACE` semantics. Duplicate exclusive creates return `EEXIST`;
 replacement or deletion of missing state returns `ENOENT`.
 
+When `NETLINK_EXT_ACK` is enabled, failed requests carry
+`NLM_F_ACK_TLVS` and a `NLMSGERR_ATTR_MSG` diagnostic describing the rejected
+authority, object-state, interface, validation, or support condition.
+
 Link dumps include Linux operational-state, carrier, qdisc, queue-length,
 broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero
 until a driver publishes them through the central interface registry.

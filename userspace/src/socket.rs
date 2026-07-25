@@ -1481,11 +1481,16 @@ impl SocketFile {
                 self.ensure_netlink_portid();
                 let sent = buf.len() as u64;
                 let admin = self.netlink_admin.lock().clone();
-                let msgs =
-                    match narf_net::netlink_route::build_replies_authorized(buf, admin.as_ref()) {
-                        Ok(msgs) => msgs,
-                        Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
-                    };
+                let msgs = match narf_net::netlink_route::build_replies_with_options(
+                    buf,
+                    admin.as_ref(),
+                    narf_net::netlink_route::ReplyOptions {
+                        ext_ack: self.netlink_ext_ack.load(Ordering::Acquire),
+                    },
+                ) {
+                    Ok(msgs) => msgs,
+                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                };
                 let notifications =
                     narf_net::netlink_route::successful_mutation_notifications(buf, &msgs);
                 {

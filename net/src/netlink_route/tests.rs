@@ -349,6 +349,14 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
         ),
         -EPERM
     );
+    let ext_denied =
+        build_replies_with_options(&request, None, ReplyOptions { ext_ack: true }).unwrap();
+    let ext_hdr = parse_hdr(&ext_denied[0]).unwrap();
+    assert_ne!(ext_hdr.flags & NLM_F_ACK_TLVS, 0);
+    assert_eq!(
+        find_rtattr(&ext_denied[0], 20, NLMSGERR_ATTR_MSG).as_deref(),
+        Some(&b"interface admin capability required\0"[..])
+    );
 
     let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
     let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
