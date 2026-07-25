@@ -5,14 +5,19 @@ use super::*;
 pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let new_root = match copy_user_path_raw(args.arg0, args.arg1 as usize) {
+    // Linux ABI: pivot_root(const char *new_root, const char *put_old).
+    // Both arguments are NUL-terminated strings; there are no explicit
+    // lengths. The old NARF-native four-argument decoder retained the
+    // terminator in the stored root and consumed the put_old pointer as a
+    // length, so successful calls installed a path such as "/new_root\0".
+    let new_root = match copy_user_cstr(args.arg0, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
     };
-    let put_old = match copy_user_path_raw(args.arg2, args.arg3 as usize) {
+    let put_old = match copy_user_cstr(args.arg1, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);

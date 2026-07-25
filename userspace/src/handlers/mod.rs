@@ -1026,6 +1026,7 @@ fn open_impl(
     // creation, route through the parent directory's `create()`. The
     // explicit-mount form is rare on the create path and not yet
     // wired; absolute paths are the supported entry.
+    #[cfg(feature = "linux-compat")]
     let mut created = false;
     let ops = match ops {
         Some(o) => o,
@@ -1036,7 +1037,10 @@ fn open_impl(
                 .map(|(parent, leaf)| poll_blocking(parent.create(&leaf)))
             {
                 Some(Some(Ok(o))) => {
-                    created = true;
+                    #[cfg(feature = "linux-compat")]
+                    {
+                        created = true;
+                    }
                     o
                 }
                 _ => {
@@ -4022,7 +4026,7 @@ const CLONE_VFORK: u64 = 0x0000_4000;
 /// table (the child does not inherit it — Linux allocates it after
 /// `copy_files`), number written through `clone_args.pidfd`. glibc's
 /// `pidfd_spawn` — the ONLY executor-spawn path systemd 258 uses — sets it.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(feature = "linux-compat")]
 const CLONE_PIDFD: u64 = 0x0000_1000;
 /// `CLONE_CLEAR_SIGHAND` (clone3-only): the child starts with every signal
 /// disposition SIG_DFL instead of a copy of the parent's table. glibc's
@@ -12126,15 +12130,18 @@ pub fn default_sync_signal_delivery(
                 // (0x4000_0000_0000) or the mmap DSO arena (0x4080_.. up).
                 let rsp = ctx.user_rsp();
                 let _ = writeln!(narf_console::Writer, "  user-rsp={:x}", rsp);
-                if let Some(info) = proc_task_info(pid) {
-                    for vma in info.vmas.iter().filter(|vma| vma.executable) {
-                        let _ = writeln!(
-                            narf_console::Writer,
-                            "  exec-vma={:016x}-{:016x} {}",
-                            vma.start,
-                            vma.end,
-                            vma.label
-                        );
+                #[cfg(feature = "linux-compat")]
+                {
+                    if let Some(info) = proc_task_info(pid) {
+                        for vma in info.vmas.iter().filter(|vma| vma.executable) {
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "  exec-vma={:016x}-{:016x} {}",
+                                vma.start,
+                                vma.end,
+                                vma.label
+                            );
+                        }
                     }
                 }
                 for i in 0..96u64 {

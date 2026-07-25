@@ -45,3 +45,4 @@ qemu.log
 .agents/
 .codex/
 .mcp.json
+systemd_ctx.md

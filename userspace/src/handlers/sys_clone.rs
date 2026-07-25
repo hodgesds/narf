@@ -5,7 +5,7 @@ use super::*;
 /// `CLONE_PIDFD` it is the pidfd output pointer (and Linux rejects combining
 /// that flag with `CLONE_PARENT_SETTID`). Keep this conversion separate so the
 /// register ABI cannot silently drop the pointer while adapting to clone3.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(feature = "linux-compat")]
 pub(crate) fn legacy_clone_pidfd_ptr(flags: u64, parent_tid: u64) -> u64 {
     if flags & CLONE_PIDFD != 0 {
         parent_tid
