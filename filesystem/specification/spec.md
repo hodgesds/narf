@@ -101,6 +101,10 @@ descriptions such as `/dev/kmsg` override it so EOF is not reported readable.
 and is pushed into the scheduler's per-task allowed-node table on attach
 and every local policy update. Empty requests inherit the parent; an
 explicit request with an empty intersection is rejected.
+`cpuset.memory_migrate` accepts `0` or `1`. When enabled, attach and
+effective-memory-mask changes migrate each member address space's resident
+private base pages and complete hardware huge leaves away from disallowed
+nodes; shared mappings remain unmoved without explicit MOVE_ALL authority.
 
 `/proc/numastat` exposes live per-node allocation events supplied by
 `memory/`: hit, miss, foreign, interleave-hit, local, and other counters.

@@ -13,4 +13,4 @@ argument = "Huge mappings validate virtual/physical alignment before installing 
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
-argument = "Range migration replaces authoritative base-page or complete huge-leaf backing and flushes peer TLBs before old frames return to the buddy or huge pool. Failed huge-leaf replacement restores the original mapping and retains its ownership. Shared mappings are never moved without MOVE_ALL authority, which NARF rejects because it has no ambient CAP_SYS_NICE."
+argument = "Explicit NUMA syscalls and cpuset.memory_migrate replace authoritative base-page or complete huge-leaf backing and flush peer TLBs before old frames return to the buddy or huge pool. Failed huge-leaf replacement restores the original mapping and retains its ownership. Shared mappings are never moved without MOVE_ALL authority, which NARF rejects because it has no ambient CAP_SYS_NICE."
