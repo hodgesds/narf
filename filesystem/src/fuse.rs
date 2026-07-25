@@ -156,7 +156,9 @@ pub enum FuseInitFlag {
     InitExt = 1 << 30,
 }
 
+pub const FUSE_PASSTHROUGH: u64 = 1 << 37;
 pub const FUSE_REQUEST_TIMEOUT: u64 = 1 << 42;
+pub const FOPEN_PASSTHROUGH: u32 = 1 << 7;
 pub const FUSE_SUPPORTED_INIT_FLAGS: u64 = FuseInitFlag::AsyncRead as u64
     | FuseInitFlag::PosixLocks as u64
     | FuseInitFlag::BigWrites as u64
@@ -168,6 +170,7 @@ pub const FUSE_SUPPORTED_INIT_FLAGS: u64 = FuseInitFlag::AsyncRead as u64
     | FuseInitFlag::MaxPages as u64
     | FuseInitFlag::SetxattrExt as u64
     | FuseInitFlag::InitExt as u64
+    | FUSE_PASSTHROUGH
     | FUSE_REQUEST_TIMEOUT;
 
 // ── Additional wire structs (Linux include/uapi/linux/fuse.h) ─────────

@@ -111,6 +111,8 @@ pub struct FuseConnection {
     max_write: AtomicU32,
     max_pages: AtomicU16,
     syncfs_supported: AtomicBool,
+    next_backing_id: AtomicU32,
+    backing_files: IrqSafeSpinLock<BTreeMap<i32, Arc<dyn FileOps>>>,
     notify_cache: IrqSafeSpinLock<BTreeMap<(u64, u64), Vec<u8>>>,
     notify_epoch: AtomicU64,
 }
@@ -150,6 +152,8 @@ impl FuseConnection {
             max_write: AtomicU32::new(4096),
             max_pages: AtomicU16::new(32),
             syncfs_supported: AtomicBool::new(true),
+            next_backing_id: AtomicU32::new(1),
+            backing_files: IrqSafeSpinLock::new(BTreeMap::new()),
             notify_cache: IrqSafeSpinLock::new(BTreeMap::new()),
             notify_epoch: AtomicU64::new(0),
         }
@@ -195,6 +199,48 @@ impl FuseConnection {
         if self.daemon_endpoints.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.disconnect();
         }
+    }
+
+    pub fn register_backing(&self, file: Arc<dyn FileOps>) -> Result<i32, FsError> {
+        if self.negotiated_flags() & FUSE_PASSTHROUGH == 0 {
+            return Err(FsError::Unsupported);
+        }
+        let id = self.next_backing_id.fetch_add(1, Ordering::AcqRel);
+        if id == 0 || id > i32::MAX as u32 {
+            return Err(FsError::NoSpace);
+        }
+        self.backing_files.lock().insert(id as i32, file);
+        Ok(id as i32)
+    }
+
+    pub fn unregister_backing(&self, id: i32) -> Result<(), FsError> {
+        if id <= 0 {
+            return Err(FsError::InvalidData);
+        }
+        self.backing_files
+            .lock()
+            .remove(&id)
+            .map(|_| ())
+            .ok_or(FsError::InvalidData)
+    }
+
+    fn backing(&self, id: i32) -> Option<Arc<dyn FileOps>> {
+        self.backing_files.lock().get(&id).cloned()
+    }
+
+    pub(crate) fn backing_for_open(
+        &self,
+        reply: &FuseOpenOut,
+    ) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+        if reply.open_flags & FOPEN_PASSTHROUGH == 0 {
+            return Ok(None);
+        }
+        if self.negotiated_flags() & FUSE_PASSTHROUGH == 0 {
+            return Err(FsError::InvalidData);
+        }
+        self.backing(reply.padding as i32)
+            .map(Some)
+            .ok_or(FsError::InvalidData)
     }
 
     /// Mark the connection dead (daemon closed `/dev/fuse`). Any in-flight
@@ -685,6 +731,8 @@ pub struct DevFuse {
 impl DevFuse {
     /// Linux UAPI `_IOR(229, 0, uint32_t)`.
     pub const DEV_IOC_CLONE: u32 = 0x8004_e500;
+    pub const DEV_IOC_BACKING_OPEN: u32 = 0x4010_e501;
+    pub const DEV_IOC_BACKING_CLOSE: u32 = 0x4004_e502;
 
     /// Mint a new `/dev/fuse` connection. Returned as a `FileOps` for the
     /// caller's fd table; the mount path later recovers the connection via
@@ -841,6 +889,7 @@ pub struct FuseFile {
     /// Daemon file handle from FUSE_OPEN, if opened. Guarded because
     /// `open` happens lazily inside an async read.
     fh: IrqSafeSpinLock<Option<u64>>,
+    passthrough: IrqSafeSpinLock<Option<Arc<dyn FileOps>>>,
     poll_kh: u64,
     poll_registered: Arc<AtomicBool>,
     readiness: Arc<AtomicU32>,
@@ -870,6 +919,9 @@ impl FuseFile {
             .request(FuseOpcode::Open, self.attr.nodeid, body)
             .await?;
         let out: FuseOpenOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+        if let Some(backing) = self.conn.backing_for_open(&out)? {
+            *self.passthrough.lock() = Some(backing);
+        }
         *self.fh.lock() = Some(out.fh);
         Ok(out.fh)
     }
@@ -903,6 +955,10 @@ impl FileOps for FuseFile {
                 return Ok(0);
             }
             let fh = self.ensure_open().await?;
+            let backing = { self.passthrough.lock().clone() };
+            if let Some(backing) = backing {
+                return backing.read(offset, buf).await;
+            }
             let max_read = usize::from(self.conn.max_pages()) * 4096;
             let mut read = 0usize;
             while read < buf.len() {
@@ -943,6 +999,10 @@ impl FileOps for FuseFile {
                 return Ok(0);
             }
             let fh = self.ensure_open().await?;
+            let backing = { self.passthrough.lock().clone() };
+            if let Some(backing) = backing {
+                return backing.write(offset, buf).await;
+            }
             let page_limit = usize::from(self.conn.max_pages()) * 4096;
             let max_write = core::cmp::min(self.conn.max_write() as usize, page_limit);
             let mut written = 0usize;
@@ -1565,9 +1625,17 @@ impl core::fmt::Debug for FuseDir {
 }
 
 impl FuseDir {
-    fn file_from_entry(&self, out: FuseEntryOut, fh: Option<u64>) -> Arc<dyn FileOps> {
+    fn file_from_entry(
+        &self,
+        out: FuseEntryOut,
+        open: Option<FuseOpenOut>,
+    ) -> Result<Arc<dyn FileOps>, FsError> {
         let poll_kh = self.conn.alloc_unique();
-        Arc::new(FuseFile {
+        let passthrough = match open.as_ref() {
+            Some(reply) => self.conn.backing_for_open(reply)?,
+            None => None,
+        };
+        Ok(Arc::new(FuseFile {
             conn: Arc::clone(&self.conn),
             attr: NodeAttr {
                 nodeid: out.nodeid,
@@ -1576,11 +1644,12 @@ impl FuseDir {
                 uid: out.attr.uid,
                 gid: out.attr.gid,
             },
-            fh: IrqSafeSpinLock::new(fh),
+            fh: IrqSafeSpinLock::new(open.map(|reply| reply.fh)),
+            passthrough: IrqSafeSpinLock::new(passthrough),
             poll_kh,
             poll_registered: Arc::new(AtomicBool::new(false)),
             readiness: Arc::new(AtomicU32::new(POLL_IN | POLL_OUT)),
-        }) as Arc<dyn FileOps>
+        }) as Arc<dyn FileOps>)
     }
 
     fn dir_from_entry(&self, out: FuseEntryOut) -> Arc<dyn DirOps> {
@@ -1653,6 +1722,7 @@ impl DirOps for FuseDir {
                 conn: Arc::clone(&self.conn),
                 attr,
                 fh: IrqSafeSpinLock::new(None),
+                passthrough: IrqSafeSpinLock::new(None),
                 poll_kh,
                 poll_registered: Arc::new(AtomicBool::new(false)),
                 readiness: Arc::new(AtomicU32::new(POLL_IN | POLL_OUT)),
@@ -1847,7 +1917,7 @@ impl DirOps for FuseDir {
             let open: FuseOpenOut =
                 pod_from_bytes(reply.get(open_off..).ok_or(FsError::InvalidData)?)
                     .ok_or(FsError::InvalidData)?;
-            Ok(self.file_from_entry(entry, Some(open.fh)))
+            self.file_from_entry(entry, Some(open))
         })
     }
 
@@ -1893,7 +1963,7 @@ impl DirOps for FuseDir {
                 .named_request(FuseOpcode::Mknod, &prefix, &[name])
                 .await?;
             let entry: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
-            Ok(self.file_from_entry(entry, None))
+            self.file_from_entry(entry, None)
         })
     }
 
@@ -2042,7 +2112,7 @@ impl DirOps for FuseDir {
             let open: FuseOpenOut =
                 pod_from_bytes(reply.get(open_off..).ok_or(FsError::InvalidData)?)
                     .ok_or(FsError::InvalidData)?;
-            Ok(self.file_from_entry(entry, Some(open.fh)))
+            self.file_from_entry(entry, Some(open))
         })
     }
 
@@ -2056,7 +2126,7 @@ impl DirOps for FuseDir {
                 .named_request(FuseOpcode::Symlink, &[], &[name, target])
                 .await?;
             let entry: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
-            Ok(self.file_from_entry(entry, None))
+            self.file_from_entry(entry, None)
         })
     }
 

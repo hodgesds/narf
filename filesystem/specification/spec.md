@@ -181,6 +181,14 @@ daemon endpoint on the source fd's connection. Cloned endpoints share
 request and reply queues, and closing one endpoint leaves the connection
 live until the final daemon endpoint closes.
 
+When `FUSE_PASSTHROUGH` is negotiated, `FUSE_DEV_IOC_BACKING_OPEN` and
+`FUSE_DEV_IOC_BACKING_CLOSE` manage connection-scoped backing-file IDs.
+An `OPEN` or `CREATE` reply carrying `FOPEN_PASSTHROUGH` and a live
+`backing_id` routes file reads and writes directly to that backing file;
+metadata and lifecycle operations remain on the FUSE connection. Unknown
+IDs, non-zero backing-map flags/padding, and passthrough without successful
+capability negotiation are rejected.
+
 - An empty blocking read parks in the syscall layer; a non-blocking
   read reports `EAGAIN`.
 - A daemon buffer smaller than the next complete request reports

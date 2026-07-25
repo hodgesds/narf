@@ -4092,6 +4092,95 @@ fn smoke_fs_fuse_dev_clone_endpoint() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_dev_clone_endpoint);
 
+fn smoke_fs_fuse_passthrough_backing_registry() -> TestResult {
+    use crate::fuse::{FuseOpenOut, FOPEN_PASSTHROUGH};
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use crate::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    #[derive(Debug)]
+    struct Backing;
+    impl FileOps for Backing {
+        fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async move { Ok(buf.len()) })
+        }
+
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::File,
+                    perms: 0o600,
+                },
+                mtime_cycles: 0,
+            }
+        }
+    }
+
+    static DONE: AtomicU8 = AtomicU8::new(0);
+    DONE.store(0, Ordering::Relaxed);
+    let conn = Arc::new(FuseConnection::new());
+    let fs = Arc::new(FuseFs::new("fuse-passthrough", Arc::clone(&conn)));
+    narf_scheduler::__reset_queues_for_test();
+    spawn_fuse_daemon(Arc::clone(&conn), &DONE);
+
+    let client_conn = Arc::clone(&conn);
+    narf_scheduler::spawn(async move {
+        if fs.init().await.is_err() {
+            DONE.store(2, Ordering::Relaxed);
+            return;
+        }
+        let backing: Arc<dyn FileOps> = Arc::new(Backing);
+        let id = match client_conn.register_backing(Arc::clone(&backing)) {
+            Ok(id) => id,
+            Err(_) => {
+                DONE.store(3, Ordering::Relaxed);
+                return;
+            }
+        };
+        let open = FuseOpenOut {
+            fh: 9,
+            open_flags: FOPEN_PASSTHROUGH,
+            padding: id as u32,
+        };
+        match client_conn.backing_for_open(&open) {
+            Ok(Some(found)) if Arc::ptr_eq(&found, &backing) => {}
+            _ => {
+                DONE.store(4, Ordering::Relaxed);
+                return;
+            }
+        }
+        if client_conn.unregister_backing(id).is_err()
+            || !matches!(
+                client_conn.backing_for_open(&open),
+                Err(FsError::InvalidData)
+            )
+        {
+            DONE.store(5, Ordering::Relaxed);
+            return;
+        }
+        DONE.store(1, Ordering::Relaxed);
+    });
+    narf_scheduler::run_until_empty();
+
+    match DONE.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("FUSE_INIT failed"),
+        3 => TestResult::Fail("passthrough backing registration failed"),
+        4 => TestResult::Fail("FOPEN_PASSTHROUGH did not resolve backing id"),
+        5 => TestResult::Fail("passthrough backing close did not invalidate id"),
+        _ => TestResult::Fail("passthrough backing tasks never completed"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_passthrough_backing_registry);
+
 /// Test-only unmount helper for the FUSE e2e mounts.
 fn unmount_for_test_fuse(path: &str) -> Result<(), crate::FsError> {
     use narf_capabilities::Cap;
