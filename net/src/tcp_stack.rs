@@ -255,7 +255,7 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
             crate::tcp::core::handle_segment_in(net_ns_id, ip.src_ip, ip.dst_ip, payload)
         }
         IP_PROTO_UDP => handle_udp(net_ns_id, ip.src_ip, ip.dst_ip, payload, ttl),
-        IP_PROTO_ICMP => crate::icmp_sock::on_icmp_rx(ip.src_ip, ip.dst_ip, payload),
+        IP_PROTO_ICMP => crate::icmp_sock::on_icmp_rx_in(net_ns_id, ip.src_ip, ip.dst_ip, payload),
         _ => {}
     }
 }
@@ -295,6 +295,22 @@ pub fn signal_icmp_error(
     remote_port: u16,
 ) {
     crate::tcp::core::signal_icmp_error(remote_addr, remote_port, local_addr, local_port);
+}
+
+pub fn signal_icmp_error_in(
+    net_ns_id: u64,
+    local_addr: [u8; 4],
+    local_port: u16,
+    remote_addr: [u8; 4],
+    remote_port: u16,
+) {
+    crate::tcp::core::signal_icmp_error_in(
+        net_ns_id,
+        remote_addr,
+        remote_port,
+        local_addr,
+        local_port,
+    );
 }
 
 // ── Periodic timer tick ─────────────────────────────────────────

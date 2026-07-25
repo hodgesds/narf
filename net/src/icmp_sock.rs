@@ -41,8 +41,8 @@ use crate::pkt::{
     IP_PROTO_TCP, IP_PROTO_UDP,
 };
 use crate::pkt_icmp_extra::{ICMP_DEST_UNREACHABLE, ICMP_TIME_EXCEEDED};
-use crate::tcp_stack::arp_resolve;
-use crate::udp_sock::{deliver_icmp_error, SockError};
+use crate::tcp_stack::{arp_resolve_in, nf_tx_filter_in};
+use crate::udp_sock::{deliver_icmp_error_in, SockError};
 
 // ── Global echo-ID counter ─────────────────────────────────────────
 //
@@ -86,13 +86,15 @@ pub(crate) struct PendingEcho {
 #[derive(Debug)]
 pub struct IcmpEchoSocket {
     pub identifier: u16,
+    pub net_ns_id: u64,
     pending: IrqSafeSpinLock<VecDeque<PendingEcho>>,
 }
 
 impl IcmpEchoSocket {
-    fn new(id: u16) -> Self {
+    fn new(net_ns_id: u64, id: u16) -> Self {
         Self {
             identifier: id,
+            net_ns_id,
             pending: IrqSafeSpinLock::new(VecDeque::new()),
         }
     }
@@ -112,13 +114,15 @@ pub enum IcmpFilter {
 /// An ICMP raw socket receives every ICMP packet that matches its filter.
 #[derive(Debug)]
 pub struct IcmpRawSocket {
+    pub net_ns_id: u64,
     pub filter: IcmpFilter,
     pub rx_queue: IrqSafeSpinLock<VecDeque<IcmpDatagram>>,
 }
 
 impl IcmpRawSocket {
-    fn new(filter: IcmpFilter) -> Self {
+    fn new(net_ns_id: u64, filter: IcmpFilter) -> Self {
         Self {
+            net_ns_id,
             filter,
             rx_queue: IrqSafeSpinLock::new(VecDeque::new()),
         }
@@ -137,8 +141,12 @@ static RAW_SOCKETS: IrqSafeSpinLock<Vec<Arc<IcmpRawSocket>>> = IrqSafeSpinLock::
 /// identifier (to correlate replies). Mirrors Linux `ping_init_sock`
 /// (net/ipv4/ping.c:143).
 pub fn icmp_echo_open() -> Arc<IcmpEchoSocket> {
+    icmp_echo_open_in(0)
+}
+
+pub fn icmp_echo_open_in(net_ns_id: u64) -> Arc<IcmpEchoSocket> {
     let id = NEXT_ECHO_ID.fetch_add(1, Ordering::Relaxed);
-    let sock = Arc::new(IcmpEchoSocket::new(id));
+    let sock = Arc::new(IcmpEchoSocket::new(net_ns_id, id));
     ECHO_SOCKETS.lock().push(sock.clone());
     sock
 }
@@ -160,11 +168,11 @@ pub fn icmp_echo_send(
     payload: &[u8],
 ) -> Result<(), IcmpError2> {
     // Wave-47: route by destination, not boot-time primary.
-    let iface = iface::for_dst(target).ok_or(IcmpError2::NoInterface)?;
+    let iface = iface::for_dst_in(sock.net_ns_id, target).ok_or(IcmpError2::NoInterface)?;
     let dst_mac = if target == [255, 255, 255, 255] {
         [0xFF; 6]
     } else {
-        arp_resolve(target, 1000).map_err(|_| IcmpError2::NetworkUnreachable)?
+        arp_resolve_in(sock.net_ns_id, target, 1000).map_err(|_| IcmpError2::NetworkUnreachable)?
     };
 
     // Build: Eth + IPv4 + ICMP echo request.
@@ -198,6 +206,11 @@ pub fn icmp_echo_send(
 
     let sent_ns = narf_scheduler::narf_time::monotonic_ns();
 
+    if nf_tx_filter_in(sock.net_ns_id, &iface.name, &mut frame[ETH_HDR_LEN..])
+        != crate::netfilter::Verdict::Accept
+    {
+        return Ok(());
+    }
     (iface.send)(&frame).map_err(|_| IcmpError2::NoInterface)?;
 
     // Record the pending echo.
@@ -235,7 +248,11 @@ pub fn icmp_echo_drain(sock: &Arc<IcmpEchoSocket>) {
 /// Open a raw ICMP socket. Receives all ICMP frames matching `filter`.
 /// Mirrors Linux `raw_init_sk` (net/ipv4/raw.c) approach.
 pub fn icmp_raw_open(filter: IcmpFilter) -> Arc<IcmpRawSocket> {
-    let sock = Arc::new(IcmpRawSocket::new(filter));
+    icmp_raw_open_in(0, filter)
+}
+
+pub fn icmp_raw_open_in(net_ns_id: u64, filter: IcmpFilter) -> Arc<IcmpRawSocket> {
+    let sock = Arc::new(IcmpRawSocket::new(net_ns_id, filter));
     RAW_SOCKETS.lock().push(sock.clone());
     sock
 }
@@ -267,6 +284,10 @@ pub enum IcmpError2 {
 ///
 /// Mirrors Linux `icmp_rcv` (net/ipv4/icmp.c:1067).
 pub fn on_icmp_rx(src_ip: [u8; 4], dst_ip: [u8; 4], icmp_body: &[u8]) {
+    on_icmp_rx_in(0, src_ip, dst_ip, icmp_body);
+}
+
+pub fn on_icmp_rx_in(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_body: &[u8]) {
     if icmp_body.len() < 4 {
         return;
     }
@@ -281,24 +302,24 @@ pub fn on_icmp_rx(src_ip: [u8; 4], dst_ip: [u8; 4], icmp_body: &[u8]) {
     match icmp_type {
         ICMP_ECHO_REQUEST => {
             // Answer ping requests addressed to us.
-            handle_echo_request(src_ip, dst_ip, icmp_body);
+            handle_echo_request(net_ns_id, src_ip, dst_ip, icmp_body);
         }
         ICMP_ECHO_REPLY => {
             // Deliver to waiting echo sockets.
-            handle_echo_reply(src_ip, icmp_body);
+            handle_echo_reply(net_ns_id, src_ip, icmp_body);
         }
         ICMP_DEST_UNREACHABLE | ICMP_TIME_EXCEEDED => {
             // Route the error back to the originating socket.
-            deliver_error(src_ip, icmp_type, icmp_code, icmp_body);
+            deliver_error_in(net_ns_id, src_ip, icmp_type, icmp_code, icmp_body);
         }
         _ => {}
     }
 
     // Feed all raw ICMP sockets.
-    deliver_to_raw(src_ip, icmp_type, icmp_code, icmp_body);
+    deliver_to_raw(net_ns_id, src_ip, icmp_type, icmp_code, icmp_body);
 }
 
-fn handle_echo_request(src_ip: [u8; 4], _dst_ip: [u8; 4], icmp_body: &[u8]) {
+fn handle_echo_request(net_ns_id: u64, src_ip: [u8; 4], _dst_ip: [u8; 4], icmp_body: &[u8]) {
     if icmp_body.len() < 8 {
         return;
     }
@@ -307,11 +328,11 @@ fn handle_echo_request(src_ip: [u8; 4], _dst_ip: [u8; 4], icmp_body: &[u8]) {
     let payload = &icmp_body[8..];
 
     // Wave-47: reply via the iface that owns the route to the requester.
-    let iface = match iface::for_dst(src_ip) {
+    let iface = match iface::for_dst_in(net_ns_id, src_ip) {
         Some(i) => i,
         None => return,
     };
-    let dst_mac = match arp_resolve(src_ip, 1000) {
+    let dst_mac = match arp_resolve_in(net_ns_id, src_ip, 1000) {
         Ok(m) => m,
         Err(_) => return,
     };
@@ -344,10 +365,14 @@ fn handle_echo_request(src_ip: [u8; 4], _dst_ip: [u8; 4], icmp_body: &[u8]) {
     let cs = ip_checksum(&frame[icmp_off..icmp_off + icmp_len]);
     frame[icmp_off + 2..icmp_off + 4].copy_from_slice(&cs.to_be_bytes());
 
-    let _ = (iface.send)(&frame);
+    if nf_tx_filter_in(net_ns_id, &iface.name, &mut frame[ETH_HDR_LEN..])
+        == crate::netfilter::Verdict::Accept
+    {
+        let _ = (iface.send)(&frame);
+    }
 }
 
-fn handle_echo_reply(_src_ip: [u8; 4], icmp_body: &[u8]) {
+fn handle_echo_reply(net_ns_id: u64, _src_ip: [u8; 4], icmp_body: &[u8]) {
     if icmp_body.len() < 8 {
         return;
     }
@@ -358,7 +383,7 @@ fn handle_echo_reply(_src_ip: [u8; 4], icmp_body: &[u8]) {
 
     let sockets = ECHO_SOCKETS.lock().clone();
     for sock in sockets {
-        if sock.identifier == identifier {
+        if sock.net_ns_id == net_ns_id && sock.identifier == identifier {
             let mut q = sock.pending.lock();
             for entry in q.iter_mut() {
                 if entry.seq == seq && entry.reply.is_none() {
@@ -379,6 +404,16 @@ fn handle_echo_reply(_src_ip: [u8; 4], icmp_body: &[u8]) {
 /// Mirrors Linux `icmp_err` → `udp_err` (net/ipv4/udp.c:633) and
 /// `tcp_v4_err` (net/ipv4/tcp_ipv4.c:483).
 pub fn deliver_error(from_ip: [u8; 4], icmp_type: u8, icmp_code: u8, icmp_body: &[u8]) {
+    deliver_error_in(0, from_ip, icmp_type, icmp_code, icmp_body);
+}
+
+pub fn deliver_error_in(
+    net_ns_id: u64,
+    from_ip: [u8; 4],
+    icmp_type: u8,
+    icmp_code: u8,
+    icmp_body: &[u8],
+) {
     // ICMP error body: [type code csum(2) rest(4) origIP+8bytes…]
     // The original IP header starts at offset 8.
     if icmp_body.len() < 8 + IPV4_HDR_LEN + 8 {
@@ -403,11 +438,12 @@ pub fn deliver_error(from_ip: [u8; 4], icmp_type: u8, icmp_code: u8, icmp_body: 
     match orig_ip.protocol {
         IP_PROTO_UDP => {
             // Deliver to the UDP socket that sent the triggering datagram.
-            deliver_icmp_error(orig_ip.src_ip, orig_src_port, err);
+            deliver_icmp_error_in(net_ns_id, orig_ip.src_ip, orig_src_port, err);
         }
         IP_PROTO_TCP => {
             // Signal the TCP connection.
-            crate::tcp_stack::signal_icmp_error(
+            crate::tcp_stack::signal_icmp_error_in(
+                net_ns_id,
                 orig_ip.src_ip,
                 orig_src_port,
                 orig_ip.dst_ip,
@@ -418,7 +454,7 @@ pub fn deliver_error(from_ip: [u8; 4], icmp_type: u8, icmp_code: u8, icmp_body: 
     }
 }
 
-fn deliver_to_raw(src_ip: [u8; 4], icmp_type: u8, icmp_code: u8, icmp_body: &[u8]) {
+fn deliver_to_raw(net_ns_id: u64, src_ip: [u8; 4], icmp_type: u8, icmp_code: u8, icmp_body: &[u8]) {
     let dg = IcmpDatagram {
         src: src_ip,
         icmp_type,
@@ -426,7 +462,7 @@ fn deliver_to_raw(src_ip: [u8; 4], icmp_type: u8, icmp_code: u8, icmp_body: &[u8
         payload: icmp_body[4..].to_vec(), // skip type/code/checksum/rest
     };
     let sockets = RAW_SOCKETS.lock().clone();
-    for sock in sockets {
+    for sock in sockets.into_iter().filter(|s| s.net_ns_id == net_ns_id) {
         let matches = match sock.filter {
             IcmpFilter::Any => true,
             IcmpFilter::SrcIp(ip) => ip == src_ip,
@@ -474,7 +510,7 @@ fn smoke_icmp_echo_send_recv_reply() -> TestResult {
     icmp_body[2] = (cs >> 8) as u8;
     icmp_body[3] = (cs & 0xFF) as u8;
 
-    handle_echo_reply([10, 0, 0, 1], &icmp_body);
+    handle_echo_reply(0, [10, 0, 0, 1], &icmp_body);
 
     let result = icmp_echo_poll_reply(&sock, seq);
     icmp_echo_close(&sock);
@@ -505,7 +541,7 @@ fn smoke_icmp_raw_receives_any() -> TestResult {
     icmp_body[2] = (cs >> 8) as u8;
     icmp_body[3] = (cs & 0xFF) as u8;
 
-    deliver_to_raw([10, 0, 0, 5], ICMP_ECHO_REQUEST, 0, &icmp_body);
+    deliver_to_raw(0, [10, 0, 0, 5], ICMP_ECHO_REQUEST, 0, &icmp_body);
 
     let dg = icmp_raw_recv(&sock);
     icmp_raw_close(&sock);
@@ -521,6 +557,27 @@ fn smoke_icmp_raw_receives_any() -> TestResult {
     }
 }
 kernel_test_in!("net/icmp", smoke_icmp_raw_receives_any);
+
+fn smoke_icmp_raw_network_namespace_isolation() -> TestResult {
+    let own = icmp_raw_open_in(701, IcmpFilter::Any);
+    let other = icmp_raw_open_in(702, IcmpFilter::Any);
+    let body = [ICMP_TIME_EXCEEDED, 0, 0, 0];
+
+    deliver_to_raw(701, [198, 51, 100, 1], ICMP_TIME_EXCEEDED, 0, &body);
+    let own_received = icmp_raw_recv(&own).is_some();
+    let leaked = icmp_raw_recv(&other).is_some();
+    icmp_raw_close(&own);
+    icmp_raw_close(&other);
+
+    if !own_received {
+        return TestResult::Fail("ICMP missing from owning network namespace");
+    }
+    if leaked {
+        return TestResult::Fail("ICMP leaked into another network namespace");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/namespace", smoke_icmp_raw_network_namespace_isolation);
 
 fn smoke_icmp_dest_unreach_delivered_to_udp_socket() -> TestResult {
     use crate::udp_sock::{udp_bind, udp_close, udp_err_recv, SocketAddrV4, UdpOptions};
@@ -648,11 +705,11 @@ fn smoke_icmp_raw_filter_rejects_wrong_source() -> TestResult {
 
     // Deliver from the wrong source — must be dropped.
     let wrong = build_icmp(99);
-    deliver_to_raw(other_src, ICMP_ECHO_REQUEST, 0, &wrong);
+    deliver_to_raw(0, other_src, ICMP_ECHO_REQUEST, 0, &wrong);
 
     // Deliver from the wanted source — must be accepted.
     let right = build_icmp(42);
-    deliver_to_raw(wanted_src, ICMP_ECHO_REQUEST, 0, &right);
+    deliver_to_raw(0, wanted_src, ICMP_ECHO_REQUEST, 0, &right);
 
     let pkt1 = icmp_raw_recv(&sock);
     let pkt2 = icmp_raw_recv(&sock);

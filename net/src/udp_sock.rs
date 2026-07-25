@@ -578,11 +578,22 @@ pub fn snapshot_in(net_ns_id: u64) -> alloc::vec::Vec<UdpSocketSnapshot> {
 /// matches the embedded original-datagram header.
 /// Called from `icmp_sock::deliver_error`.
 pub fn deliver_icmp_error(orig_src_ip: [u8; 4], orig_src_port: u16, err: SockError) {
+    deliver_icmp_error_in(0, orig_src_ip, orig_src_port, err);
+}
+
+pub fn deliver_icmp_error_in(
+    net_ns_id: u64,
+    orig_src_ip: [u8; 4],
+    orig_src_port: u16,
+    err: SockError,
+) {
     let candidates: Vec<Arc<UdpSocket>> = {
         let tbl = PORT_TABLE.lock();
         tbl.entries
             .iter()
-            .filter(|(p, s)| *p == orig_src_port && s.local.ip == orig_src_ip)
+            .filter(|(p, s)| {
+                *p == orig_src_port && s.net_ns_id == net_ns_id && s.local.ip == orig_src_ip
+            })
             .map(|(_, s)| s.clone())
             .collect()
     };

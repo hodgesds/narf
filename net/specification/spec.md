@@ -235,7 +235,8 @@ longest-prefix lookup cannot select another namespace's route.
 TCP connection/listener keys and UDP bind/delivery tables include the network
 namespace id; identical endpoint tuples may coexist across namespaces and
 accepted TCP children inherit their listener's namespace. The IPv4 ARP cache
-is namespace-scoped. TCP and UDP output resolves only namespace-owned
+is namespace-scoped. ICMP echo and raw delivery, plus ICMP-originated TCP/UDP
+errors, are restricted to the receiving namespace. TCP, UDP, and ICMP output resolves only namespace-owned
 interfaces and routes and traverses that namespace's `LOCAL_OUT` and
 `POST_ROUTING` netfilter hooks.
 
