@@ -194,6 +194,12 @@ that real counter for each standalone or grouped event rather than a constant.
 `PERF_EVENT_IOC_SET_OUTPUT` redirects records to another compatible perf
 event's mapped ring while retaining loss accounting on the source event; the
 target must describe the same task and CPU context, and `-1` detaches it.
+`PERF_EVENT_IOC_REFRESH` is accepted only for non-inherited sampling events.
+Its argument adds real-overflow credits and enables the event; each hardware
+overflow consumes one credit, and consuming the last credit synchronously
+stops the PMU event and exposes `POLLHUP`. A later refresh clears the terminal
+readiness and adds a new budget. A zero argument retains Linux's effectively
+unlimited behavior.
 On x86_64, `PERF_EVENT_IOC_PERIOD` synchronously validates and installs a new
 nonzero hardware sampling period while the event is disabled. Updating a live
 or remotely active x86_64 event returns an error until a synchronous cross-CPU

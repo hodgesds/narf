@@ -19,6 +19,7 @@ const PERF_FORMAT_LOST: u64 = 1 << 4;
 
 const PERF_EVENT_IOC_ENABLE: u64 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u64 = 0x2401;
+const PERF_EVENT_IOC_REFRESH: u64 = 0x2402;
 const PERF_EVENT_IOC_RESET: u64 = 0x2403;
 const PERF_EVENT_IOC_PERIOD: u64 = 0x4008_2404;
 const PERF_EVENT_IOC_SET_OUTPUT: u64 = 0x2405;
@@ -1042,7 +1043,53 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             {
                 return Err("PERF_EVENT_IOC_PERIOD accepted a zero period");
             }
+
+            if call(
+                Syscall::Ioctl.raw(),
+                a2(period_fd as u64, PERF_EVENT_IOC_REFRESH, 2),
+            ) != Some(0)
+                || crate::perf_event::event_refresh_state_for_test(period_fd)
+                    != Some((true, 2, false))
+            {
+                return Err("PERF_EVENT_IOC_REFRESH did not arm two overflows");
+            }
+            let task = crate::handlers::current_task_id();
+            crate::perf_event::sample_from_irq_for_test(task, 0x1111);
+            if crate::perf_event::event_refresh_state_for_test(period_fd) != Some((true, 1, false))
+            {
+                return Err("first refreshed overflow did not consume one credit");
+            }
+            crate::perf_event::sample_from_irq_for_test(task, 0x2222);
+            if crate::perf_event::event_refresh_state_for_test(period_fd) != Some((false, 0, true))
+            {
+                return Err("last refreshed overflow did not stop with HUP");
+            }
             let _ = call(Syscall::Close.raw(), a0(period_fd as u64));
+
+            let inherited_sampling_attr = PerfEventAttr {
+                flags: 1 | PERF_ATTR_FLAG_INHERIT,
+                ..sampling_hardware_attr
+            };
+            let inherited_fd = match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(
+                    &inherited_sampling_attr as *const _ as u64,
+                    0,
+                    -1i32 as u64,
+                    -1i32 as u64,
+                ),
+            ) {
+                Some(fd) if fd >= 0 => fd as u32,
+                _ => return Err("inherited sampling event was not admitted"),
+            };
+            if call(
+                Syscall::Ioctl.raw(),
+                a2(inherited_fd as u64, PERF_EVENT_IOC_REFRESH, 1),
+            ) != Some(EINVAL)
+            {
+                return Err("PERF_EVENT_IOC_REFRESH accepted an inherited event");
+            }
+            let _ = call(Syscall::Close.raw(), a0(inherited_fd as u64));
         }
 
         Ok(())
@@ -1079,10 +1126,10 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
             .map_err(|_| "PMUv3 mmap failed")?;
         if call(
             Syscall::Ioctl.raw(),
-            a2(fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+            a2(fd as u64, PERF_EVENT_IOC_REFRESH, 1),
         ) != Some(0)
         {
-            return Err("PMUv3 enable failed");
+            return Err("PMUv3 one-overflow refresh failed");
         }
         let live_period = 100_000u64;
         if call(
@@ -1124,6 +1171,12 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
             crate::perf_event::drain_irq_samples();
             // SAFETY: ops owns this mapped metadata frame.
             if unsafe { core::ptr::read_volatile((frames[0] as usize + 1024) as *const u64) } != 0 {
+                if crate::perf_event::event_refresh_state_for_test(fd) != Some((false, 0, true)) {
+                    return Err("real PMUv3 overflow did not exhaust refresh budget");
+                }
+                if unsafe { narf_arch::aarch64::sysreg::read_pmcntenset_el0() } & (1 << 31) != 0 {
+                    return Err("refresh exhaustion left PMUv3 cycle counter enabled");
+                }
                 let _ = call(Syscall::Close.raw(), a0(fd as u64));
                 return Ok(());
             }

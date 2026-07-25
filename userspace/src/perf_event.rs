@@ -207,6 +207,7 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
 
 const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
+const PERF_EVENT_IOC_REFRESH: u32 = 0x2402;
 const PERF_EVENT_IOC_RESET: u32 = 0x2403;
 const PERF_EVENT_IOC_PERIOD: u32 = 0x4008_2404;
 const PERF_EVENT_IOC_SET_OUTPUT: u32 = 0x2405;
@@ -247,6 +248,8 @@ struct PerfEventFile {
     registered: AtomicBool,
     sample_lost: AtomicU64,
     output_paused: AtomicBool,
+    refresh_hup: AtomicBool,
+    refresh_limit: AtomicU32,
     wakeup_pending: AtomicU32,
     sample_period: AtomicU64,
     last_sample_period: AtomicU64,
@@ -890,6 +893,28 @@ impl PerfEventFile {
         self.push_record(&record)
     }
 
+    /// Consume one genuine sampling overflow from an ioctl refresh budget.
+    fn consume_refresh(&self) -> bool {
+        let mut limit = self.refresh_limit.load(Ordering::Acquire);
+        while limit != 0 {
+            match self.refresh_limit.compare_exchange_weak(
+                limit,
+                limit - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) if limit == 1 => {
+                    self.disable();
+                    self.refresh_hup.store(true, Ordering::Release);
+                    return true;
+                }
+                Ok(_) => return false,
+                Err(observed) => limit = observed,
+            }
+        }
+        false
+    }
+
     fn adjust_frequency_period(&self, now: u64) {
         if self.sample_frequency == 0 {
             return;
@@ -1483,6 +1508,7 @@ pub(crate) fn drain_irq_samples() {
                     let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
                     notify |= event.sample_record(ip, pid, task as u32, now);
                     event.adjust_frequency_period(now);
+                    notify |= event.consume_refresh();
                 }
             }
         }
@@ -1503,6 +1529,9 @@ pub(crate) fn sample_from_irq_for_test(task: u64, ip: u64) {
         if event.enabled.load(Ordering::Acquire) && event.tracks_task(task) {
             let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
             let _ = event.sample_record(ip, pid, task as u32, now);
+            if event.consume_refresh() {
+                narf_net::readiness::notify(0);
+            }
         }
     }
 }
@@ -1517,6 +1546,24 @@ pub(crate) fn event_tracks_task_for_test(fd_num: u32, task: u64) -> bool {
             .is_some_and(|event| event.tracks_task(task))
     })
     .unwrap_or(false)
+}
+
+pub(crate) fn event_refresh_state_for_test(fd_num: u32) -> Option<(bool, u32, bool)> {
+    let owner = crate::handlers::current_task_id();
+    fd::with_table(owner, |table| {
+        table
+            .get(fd_num)
+            .and_then(|entry| entry.ops.as_any())
+            .and_then(|any| any.downcast_ref::<PerfEventFile>())
+            .map(|event| {
+                (
+                    event.enabled.load(Ordering::Acquire),
+                    event.refresh_limit.load(Ordering::Acquire),
+                    event.refresh_hup.load(Ordering::Acquire),
+                )
+            })
+    })
+    .flatten()
 }
 
 /// Scheduler PMU context hook. Runs outside scheduler queue locks and brackets
@@ -1709,6 +1756,17 @@ impl FileOps for PerfEventFile {
                 self.for_group(arg, PerfEventFile::disable)?;
                 Ok(0)
             }
+            PERF_EVENT_IOC_REFRESH => {
+                if self.attr.flags & PERF_ATTR_FLAG_INHERIT != 0
+                    || self.sample_period.load(Ordering::Acquire) == 0
+                {
+                    return Err(FsError::InvalidData);
+                }
+                self.refresh_limit.fetch_add(arg as u32, Ordering::AcqRel);
+                self.refresh_hup.store(false, Ordering::Release);
+                self.enable();
+                Ok(0)
+            }
             PERF_EVENT_IOC_RESET => {
                 self.for_group(arg, PerfEventFile::reset)?;
                 Ok(0)
@@ -1802,17 +1860,18 @@ impl FileOps for PerfEventFile {
     }
 
     fn poll_readiness(&self) -> u32 {
+        let mut readiness =
+            u32::from(self.refresh_hup.load(Ordering::Acquire)) * narf_filesystem::POLL_HUP;
         let mapping = self.mmap.lock();
         let Some(mapping) = mapping.as_ref() else {
-            return 0;
+            return readiness;
         };
         if mapping.read_u64_acquire(PERF_MMAP_DATA_HEAD_OFFSET)
             != mapping.read_u64_acquire(PERF_MMAP_DATA_TAIL_OFFSET)
         {
-            narf_filesystem::POLL_IN
-        } else {
-            0
+            readiness |= narf_filesystem::POLL_IN;
         }
+        readiness
     }
 
     fn readiness_notifies(&self) -> bool {
@@ -2281,6 +2340,8 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             registered: AtomicBool::new(false),
             sample_lost: AtomicU64::new(0),
             output_paused: AtomicBool::new(false),
+            refresh_hup: AtomicBool::new(false),
+            refresh_limit: AtomicU32::new(0),
             wakeup_pending: AtomicU32::new(0),
             sample_period: AtomicU64::new(sample_period),
             last_sample_period: AtomicU64::new(sample_period),
