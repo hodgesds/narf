@@ -1587,6 +1587,7 @@ dependencies = [
  "narf-pmbus",
  "narf-power",
  "narf-pwm",
+ "narf-rcu",
  "narf-scheduler",
  "narf-scmi",
  "narf-security",

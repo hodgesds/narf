@@ -31,6 +31,33 @@ pub fn spawn_process(elf: &Elf, caps: CapBundle) -> Cap<Process, Own>;
 pub fn exec_into(proc: &Process, arg0: &str, argv: &[&str], env: &[&str]);
 ```
 
+The Linux-compatibility syscall surface includes stored `prctl(2)` process
+state required by service managers and brokers. Capability-shaped controls
+such as `PR_SET_KEEPCAPS` round-trip according to the Linux ABI but do not mint
+or retain NARF capabilities; authority remains capability-object based.
+Likewise, `SO_PEERSEC`, `SO_PEERGROUPS`, and `SO_PEERPIDFD` report
+`ENOPROTOOPT` while NARF has no Linux Security Module label provider,
+socket-stamped supplementary group list, or retained peer pidfd; the
+compatibility layer never fabricates security identity.
+AF_UNIX stream clients may bind a local pathname or abstract address before
+`connect(2)`; binding does not put the socket into listening state. Connected
+stream receive operations honor `MSG_PEEK` without consuming queued bytes.
+Epoll readiness callbacks run without holding the parent epoll instance lock,
+including during edge-state write-back for nested epoll sets.
+Poll and epoll pass the file-description offset to offset-sensitive readiness
+providers; `/dev/kmsg` is readable only while unread snapshot bytes remain.
+`open(2)`/`openat(2)` reject an empty pathname with `ENOENT` before cwd
+normalization; an empty path never aliases the current directory.
+`clock_gettime(2)` accepts realtime/monotonic coarse clocks and process/thread
+CPU clocks. Coarse clocks currently use the precise source; CPU clocks use the
+calling task's accumulated user and kernel accounting.
+Anonymous pipes implement `FIONREAD` on both ends and report the shared
+immediately-readable byte count. Writes and final endpoint closure publish a
+readiness notification so parked `poll`/`epoll` waiters wake without unrelated
+system activity.
+Legacy `clone(2)` honors `CLONE_PIDFD` by installing a pidfd in the parent and
+writing its descriptor through the overloaded `parent_tid` pointer argument.
+
 Bootstrap: every new process receives two ring pairs (submit + complete)
 for the kernel ABI plus a read-only config page with capability
 handles to its parent-granted services. Additional ring pairs for

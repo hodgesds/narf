@@ -1,6 +1,19 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Legacy `clone(2)` overloads its `parent_tid` register argument: with
+/// `CLONE_PIDFD` it is the pidfd output pointer (and Linux rejects combining
+/// that flag with `CLONE_PARENT_SETTID`). Keep this conversion separate so the
+/// register ABI cannot silently drop the pointer while adapting to clone3.
+#[cfg(feature = "linux-compat")]
+pub(crate) fn legacy_clone_pidfd_ptr(flags: u64, parent_tid: u64) -> u64 {
+    if flags & CLONE_PIDFD != 0 {
+        parent_tid
+    } else {
+        0
+    }
+}
+
 /// Linux `clone(2)` — same semantics as `clone3(2)` but the
 /// arguments are passed in registers (x86_64 syscall ABI:
 /// flags, stack-TOP, ptid, tls, ctid) instead of via a
@@ -36,7 +49,7 @@ pub(crate) fn sys_clone(ctx: &mut dyn TrapContext) {
         // the self-pointer the TCB layout promises.
         tls: args.arg4,
         child_tid: args.arg3,
-        pidfd: 0,
+        pidfd: legacy_clone_pidfd_ptr(args.arg0, args.arg2),
         exit_signal: 0,
         set_tid: 0,
         set_tid_size: 0,

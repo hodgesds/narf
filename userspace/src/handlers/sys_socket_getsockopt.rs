@@ -28,6 +28,20 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
+    // Optional Unix-peer metadata needs a typed "protocol option unavailable"
+    // result. Callers such as dbus-broker use that to disable label policy or
+    // fall back to NSS for supplementary groups. The generic unknown-option
+    // sentinel is -1 (EPERM to libc) and is treated as fatal.
+    if level == crate::socket::SOL_SOCKET
+        && matches!(
+            name,
+            crate::socket::SO_PEERSEC | crate::socket::SO_PEERGROUPS | crate::socket::SO_PEERPIDFD
+        )
+    {
+        const ENOPROTOOPT: i64 = 92;
+        ctx.set_return(SyscallReturn::ok((-ENOPROTOOPT) as u64));
+        return;
+    }
     // Validate the output range before allocating — prevents OOM from a
     // user-supplied in_len larger than MAX_USER_COPY.
     if validate_user_range(val_ptr, in_len).is_err() {

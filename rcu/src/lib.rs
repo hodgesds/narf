@@ -344,6 +344,13 @@ pub fn report_quiescent() {
     qsbr::report_quiescent();
 }
 
+/// Lock-free watchdog snapshot of active CPUs that have not crossed a QSBR
+/// quiescent boundary within `threshold_ns`.
+#[inline]
+pub fn stalled_cpu_mask(now_ns: u64, threshold_ns: u64) -> u64 {
+    qsbr::stalled_cpu_mask(now_ns, threshold_ns)
+}
+
 /// Executor maintenance hook: open the next grace period when this CPU
 /// holds deferred objects that the current epoch can never release. See
 /// [`qsbr::advance_epoch_if_pending`]. Called once per executor round;

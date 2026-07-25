@@ -41,6 +41,21 @@ fn smoke_abi_path_openat_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_openat_neg);
 
+fn smoke_abi_path_openat_empty_is_enoent() -> TestResult {
+    setup();
+    let path = b"\0";
+    let result = match call(
+        Syscall::Openat.raw(),
+        a3(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0),
+    ) {
+        Some(-2) => TestResult::Pass,
+        _ => TestResult::Fail("openat with an empty pathname must return -ENOENT"),
+    };
+    teardown();
+    result
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_openat_empty_is_enoent);
+
 // ── openat with a real directory fd (dirfd-relative resolution) ──
 //
 // sd-device's chase_symlinks walks a path one openat() per component against

@@ -648,9 +648,12 @@ impl AddressSpace {
         }
         if self.root.as_u64() != 0 {
             for p in to_free {
-                if crate::frame::__pagetable_is_registered(p.raw()) {
-                    continue;
-                }
+                // `to_free` comes exclusively from `Region.phys`, whose
+                // backing lists contain data frames only (same invariant as
+                // `free_region_frames` below). A page-table frame cannot
+                // appear here, so consulting the 16K-slot PT registry for
+                // every punched page is both redundant and pathologically
+                // expensive under Plasma's MAP_FIXED churn.
                 crate::frame::free_frame(crate::frame::PhysFrame::new(p));
             }
         }
@@ -1707,9 +1710,10 @@ impl AddressSpace {
         }
         if self.root.as_u64() != 0 {
             for p in to_release {
-                if crate::frame::__pagetable_is_registered(p.raw()) {
-                    continue;
-                }
+                // `to_release` is sourced only from `Region.phys`; page-table
+                // frames are never stored there. Keep madvise(DONTNEED)
+                // proportional to the advised pages instead of scanning the
+                // global 16K-entry PT registry once per page.
                 // `free_frame` consults the COW refcount table, so a frame
                 // still shared with another AS stays live until its last
                 // owner releases it.

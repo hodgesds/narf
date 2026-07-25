@@ -17,6 +17,7 @@ const SHUT_RDWR: u64 = 2;
 /// SCM control-message types (SOL_SOCKET level).
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
+const F_DUPFD_CLOEXEC: u64 = 1030;
 
 // A clearly-invalid fd that no freshly-created table will ever hand out.
 const BAD_FD: u64 = 4096;
@@ -162,6 +163,43 @@ fn smoke_abi_socket_connect_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_socket_connect_pos);
+
+fn smoke_abi_socket_bound_client_connects() -> TestResult {
+    with_setup(|| {
+        let srv = open_unix_stream()?;
+        let (server_addr, server_len) = unix_sockaddr(b"/abi-bound-connect-server");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv, server_addr.as_ptr() as u64, server_len),
+        )
+        .ok_or("server bind status")?
+            != 0
+            || call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0
+        {
+            return Err("bound-client test could not create listener");
+        }
+
+        let cli = open_unix_stream()?;
+        let (client_addr, client_len) = unix_sockaddr(b"\0abi-bound-connect-client");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(cli, client_addr.as_ptr() as u64, client_len),
+        )
+        .ok_or("client bind status")?
+            != 0
+        {
+            return Err("client bind failed");
+        }
+        match call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, server_addr.as_ptr() as u64, server_len),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("connect() rejected a locally bound Unix client socket"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_bound_client_connects);
 
 fn smoke_abi_socket_connect_neg() -> TestResult {
     with_setup(|| {
@@ -601,6 +639,59 @@ fn smoke_abi_socket_getsockopt_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_socket_getsockopt_neg);
+
+fn smoke_abi_socket_getsockopt_peersec_without_lsm() -> TestResult {
+    with_setup(|| {
+        const SO_PEERSEC: u64 = 31;
+        let fd = open_unix_stream()?;
+        let mut val = [0u8; 64];
+        let mut optlen = (val.len() as u32).to_ne_bytes();
+        let args = SyscallArgs {
+            arg0: fd,
+            arg1: SOL_SOCKET,
+            arg2: SO_PEERSEC,
+            arg3: val.as_mut_ptr() as u64,
+            arg4: optlen.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::SocketGetSockOpt.raw(), args) {
+            Some(-92) => Ok(()),
+            _ => Err("SO_PEERSEC without an LSM did not return ENOPROTOOPT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_socket_getsockopt_peersec_without_lsm
+);
+
+fn smoke_abi_socket_getsockopt_peergroups_unavailable() -> TestResult {
+    with_setup(|| {
+        const SO_PEERGROUPS: u64 = 59;
+        const SO_PEERPIDFD: u64 = 77;
+        let fd = open_unix_stream()?;
+        let mut val = [0u8; 64];
+        for option in [SO_PEERGROUPS, SO_PEERPIDFD] {
+            let mut optlen = (val.len() as u32).to_ne_bytes();
+            let args = SyscallArgs {
+                arg0: fd,
+                arg1: SOL_SOCKET,
+                arg2: option,
+                arg3: val.as_mut_ptr() as u64,
+                arg4: optlen.as_mut_ptr() as u64,
+                ..Default::default()
+            };
+            if call(Syscall::SocketGetSockOpt.raw(), args) != Some(-92) {
+                return Err("unavailable Unix peer metadata did not return ENOPROTOOPT");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_socket_getsockopt_peergroups_unavailable
+);
 
 // getsockopt(SO_ACCEPTCONN) is the gate systemd's is_socket_internal() (behind
 // sd_is_socket, which decides whether sd-bus negotiates SCM_RIGHTS fd-passing)
@@ -1474,6 +1565,41 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_socket_scm_rights_fd_passing);
+
+/// Closing a duplicated listener fd must not unbind the listener while the
+/// original fd remains open (dbus-broker receives its listener this way).
+fn smoke_abi_socket_dup_listener_close_keeps_binding() -> TestResult {
+    with_setup(|| {
+        let listener = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-dup-listener");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(listener, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+            || call(Syscall::SocketListen.raw(), a1(listener, 16)) != Some(0)
+        {
+            return Err("listener setup failed");
+        }
+        let duplicate =
+            call(Syscall::Fcntl.raw(), a2(listener, F_DUPFD_CLOEXEC, 20)).ok_or("fcntl status")?;
+        if duplicate < 0 || call(Syscall::Close.raw(), a0(duplicate as u64)) != Some(0) {
+            return Err("listener duplicate/close failed");
+        }
+        let client = open_unix_stream()?;
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(client, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("closing duplicate unbound the live listener");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_socket_dup_listener_close_keeps_binding
+);
 
 // ───────────────────────────── AF_NETLINK ─────────────────────────────
 //

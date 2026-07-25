@@ -274,6 +274,15 @@ impl FileOps for DevZero {
 struct DevKmsg;
 
 impl FileOps for DevKmsg {
+    fn poll_readiness_at(&self, offset: u64) -> u32 {
+        let readable = (offset as usize) < narf_console::klog::snapshot().len();
+        if readable {
+            crate::POLL_IN | crate::POLL_OUT
+        } else {
+            crate::POLL_OUT
+        }
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let snap = narf_console::klog::snapshot();
         let off = offset as usize;

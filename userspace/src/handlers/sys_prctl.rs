@@ -80,6 +80,17 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             }
             ctx.set_return(SyscallReturn::ok(0));
         }
+        PR_SET_KEEPCAPS => {
+            if arg_a > 1 {
+                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                return;
+            }
+            modify_prctl(task, |s| s.keep_caps = arg_a != 0);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        PR_GET_KEEPCAPS => {
+            ctx.set_return(SyscallReturn::ok(read_prctl(task).keep_caps as u64));
+        }
         PR_SET_CHILD_SUBREAPER => {
             modify_prctl(task, |s| s.child_subreaper = arg_a != 0);
             ctx.set_return(SyscallReturn::ok(0));

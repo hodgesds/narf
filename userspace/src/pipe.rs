@@ -37,6 +37,10 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// a fixed-array-backed scheme without renumbering callers.
 const PIPE_BUF_BYTES: usize = 65536;
 
+/// Linux `FIONREAD` / `TIOCINQ`: write the immediately readable byte
+/// count as an `int` through the ioctl argument pointer.
+const FIONREAD: u32 = 0x541B;
+
 /// Shared mutable state between the read+write halves: the byte
 /// queue plus a "writer dropped" flag. The `closed_*` flags let
 /// either half observe the peer-side close from the read/write
@@ -100,6 +104,7 @@ impl Drop for PipeRead {
         // there are no readers left and the writer should observe
         // EOF on its side.
         self.shared.reader_closed.store(true, Ordering::Release);
+        narf_net::readiness::notify(0);
     }
 }
 
@@ -108,6 +113,7 @@ impl Drop for PipeWrite {
         // Same Arc-counted reasoning as PipeRead::drop — only flips
         // when every writer fd has been closed.
         self.shared.writer_closed.store(true, Ordering::Release);
+        narf_net::readiness::notify(0);
     }
 }
 
@@ -152,6 +158,19 @@ impl FileOps for PipeRead {
         }
     }
 
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, narf_filesystem::FsError> {
+        if cmd != FIONREAD {
+            return Err(narf_filesystem::FsError::Unsupported);
+        }
+        let bytes = (self.shared.queue.lock().len() as i32).to_le_bytes();
+        // SAFETY: `copy_to_user` validates the destination through the SMAP
+        // window; FIONREAD writes one Linux `int`.
+        if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        Ok(0)
+    }
+
     fn poll_readiness(&self) -> u32 {
         let mut mask = 0;
         let q = self.shared.queue.lock();
@@ -159,6 +178,10 @@ impl FileOps for PipeRead {
             mask |= narf_filesystem::POLL_IN;
         }
         mask
+    }
+
+    fn readiness_notifies(&self) -> bool {
+        true
     }
 
     fn read_should_block(&self) -> bool {
@@ -213,6 +236,10 @@ impl FileOps for PipeWrite {
             for &b in buf.iter().take(n) {
                 q.push_back(b);
             }
+            drop(q);
+            if n != 0 {
+                narf_net::readiness::notify(0);
+            }
             Ok(n)
         })
     }
@@ -226,6 +253,21 @@ impl FileOps for PipeWrite {
         }
     }
 
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, narf_filesystem::FsError> {
+        if cmd != FIONREAD {
+            return Err(narf_filesystem::FsError::Unsupported);
+        }
+        let bytes = (self.shared.queue.lock().len() as i32).to_le_bytes();
+        // Linux accepts FIONREAD on either pipe end and reports the shared
+        // unread-byte count.
+        // SAFETY: `copy_to_user` validates the destination through the SMAP
+        // window; FIONREAD writes one Linux `int`.
+        if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        Ok(0)
+    }
+
     fn poll_readiness(&self) -> u32 {
         let mut mask = 0;
         let q = self.shared.queue.lock();
@@ -233,6 +275,10 @@ impl FileOps for PipeWrite {
             mask |= narf_filesystem::POLL_OUT;
         }
         mask
+    }
+
+    fn readiness_notifies(&self) -> bool {
+        true
     }
 
     fn write_should_block(&self) -> bool {

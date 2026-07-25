@@ -49,6 +49,9 @@ struct CpuCell {
     active_readers: AtomicUsize,
     /// Latest global epoch this CPU has reported quiescence for.
     last_quiescent: AtomicU64,
+    /// Monotonic timestamp of the latest quiescent report. Zero denotes an
+    /// inactive CPU and is ignored by stall detection.
+    last_quiescent_ns: AtomicU64,
     /// Deferred-drop bucket — written only from this CPU.
     bucket: UnsafeCell<DeferBucket>,
 }
@@ -62,6 +65,7 @@ impl CpuCell {
     const NEW: Self = Self {
         active_readers: AtomicUsize::new(0),
         last_quiescent: AtomicU64::new(u64::MAX),
+        last_quiescent_ns: AtomicU64::new(0),
         bucket: UnsafeCell::new(DeferBucket::new()),
     };
 }
@@ -160,7 +164,25 @@ pub fn report_quiescent() {
     if prev == u64::MAX || now > prev {
         cell.last_quiescent.store(now, Ordering::Release);
     }
+    cell.last_quiescent_ns
+        .store(narf_time::monotonic_ns(), Ordering::Release);
     drain_local_bucket(cell);
+}
+
+/// Return a bitmask of active CPUs whose latest QSBR quiescent report is at
+/// least `threshold_ns` old. Inactive CPUs (timestamp zero) are omitted.
+///
+/// This is allocation-free and lock-free so a timer/fatal watchdog can query
+/// it even when the stalled CPU holds an unrelated kernel lock.
+pub fn stalled_cpu_mask(now_ns: u64, threshold_ns: u64) -> u64 {
+    let mut mask = 0u64;
+    for (cpu, cell) in CPUS.iter().enumerate().take(64) {
+        let last = cell.last_quiescent_ns.load(Ordering::Acquire);
+        if last != 0 && now_ns.saturating_sub(last) >= threshold_ns {
+            mask |= 1u64 << cpu;
+        }
+    }
+    mask
 }
 
 /// Open the next grace period if this CPU's defer bucket holds entries
@@ -208,6 +230,7 @@ pub fn report_idle() {
     }
     drain_local_bucket(cell);
     cell.last_quiescent.store(u64::MAX, Ordering::Release);
+    cell.last_quiescent_ns.store(0, Ordering::Release);
 }
 
 // ── Deferred-drop enqueue / drain ───────────────────────────────────

@@ -713,6 +713,34 @@ fn smoke_abi_fdio_pipe_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_pos);
 
+fn smoke_abi_fdio_pipe_fionread() -> TestResult {
+    with_setup(|| {
+        const FIONREAD: u64 = 0x541B;
+        let (rd, wr) = make_pipe()?;
+        let payload = b"plasma";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("pipe write failed");
+        }
+        let mut available = 0i32;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(rd as u64, FIONREAD, (&mut available as *mut i32) as u64),
+        ) != Some(0)
+        {
+            return Err("FIONREAD on pipe failed");
+        }
+        if available != payload.len() as i32 {
+            return Err("FIONREAD reported the wrong pipe byte count");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_fionread);
+
 fn smoke_abi_fdio_pipe_neg() -> TestResult {
     with_setup(|| {
         // null out-pointer → InvalidOp.

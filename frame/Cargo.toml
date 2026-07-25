@@ -88,6 +88,7 @@ narf-firmware-fdt    = { path = "../firmware/fdt" }
 narf-initramfs       = { path = "../initramfs" }
 narf-power           = { path = "../power" }
 narf-observability   = { path = "../observability" }
+narf-rcu             = { path = "../rcu" }
 narf-filesystem      = { path = "../filesystem" }
 narf-userspace       = { path = "../userspace" }
 narf-user-runtime    = { path = "../user-runtime" }
@@ -99,7 +100,8 @@ narf-verification    = { path = "../verification", optional = true }
 # counters + hardware PMU) every ~3000 timer ticks. Counters are always on;
 # this just enables the periodic serial dump. Off by default.
 perf-dump = []
-# stall-watchdog: arm the scheduler-stall watchdog (frame/x86_64/trap.rs).
+# stall-watchdog: arm the scheduler-stall watchdog. It emits a detailed
+# per-CPU/task dump and then panics when forward progress remains stalled.
 # Detects a global forward-progress stall (the intermittent SMP wedge) and
 # dumps per-CPU scheduler state once for classification. Off by default.
 stall-watchdog = []

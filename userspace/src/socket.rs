@@ -144,8 +144,17 @@ pub const SO_PASSCRED: u32 = 16;
 pub const SO_PEERCRED: u32 = 17;
 pub const SO_BINDTODEVICE: u32 = 25;
 pub const SO_ACCEPTCONN: u32 = 30;
+/// Linux Security Module peer label. NARF has no LSM label namespace, so
+/// getsockopt reports ENOPROTOOPT rather than fabricating an authority label.
+pub const SO_PEERSEC: u32 = 31;
 pub const SO_PROTOCOL: u32 = 38;
 pub const SO_DOMAIN: u32 = 39;
+/// Supplementary groups captured from a Unix peer. NARF does not yet stamp
+/// this metadata onto sockets, so getsockopt reports ENOPROTOOPT.
+pub const SO_PEERGROUPS: u32 = 59;
+/// pidfd naming the Unix peer. Socket peer credentials currently carry a PID
+/// value but not a retained pidfd object, so getsockopt reports ENOPROTOOPT.
+pub const SO_PEERPIDFD: u32 = 77;
 
 pub const TCP_NODELAY: u32 = 1;
 pub const TCP_MAXSEG: u32 = 2;
@@ -496,10 +505,11 @@ impl Default for SockOptions {
 enum SocketState {
     /// Freshly-created, no bind/connect yet.
     Fresh,
-    /// AF_UNIX bound listener at the named address (pathname or abstract).
+    /// AF_UNIX socket with a local address but not listening or connected.
+    UnixBound { addr: UnixAddr },
+    /// AF_UNIX listening socket at the named address (pathname or abstract).
     UnixListener {
         addr: UnixAddr,
-        backlog: u32,
         /// Connections that have been initiated by `connect()` but
         /// haven't yet been picked up by `accept()`. The other
         /// half of each pair is given to the connecter.
@@ -512,6 +522,8 @@ enum SocketState {
         tx: Arc<RingBuf>,
         /// Bytes the local end RECEIVES (peer writes).
         rx: Arc<RingBuf>,
+        /// Local address retained when a client binds before connect().
+        local_addr: Option<UnixAddr>,
     },
     /// AF_INET SOCK_STREAM bound listener at (addr, port). The
     /// `pending` queue + `INET_LISTENERS` map serve loopback
@@ -1046,10 +1058,12 @@ impl SocketFile {
         *a.state.lock() = SocketState::UnixConnected {
             tx: a_to_b.clone(),
             rx: b_to_a.clone(),
+            local_addr: None,
         };
         *b.state.lock() = SocketState::UnixConnected {
             tx: b_to_a,
             rx: a_to_b,
+            local_addr: None,
         };
         (a, b)
     }
@@ -1113,7 +1127,16 @@ impl SocketFile {
                 ..
             } => Some(make_sockaddr_in(*local_addr, *local_port)),
             SocketState::InetRaw { local_addr, .. } => Some(make_sockaddr_in(*local_addr, 0)),
-            SocketState::UnixListener { addr, .. } => Some(SockAddr {
+            SocketState::UnixBound { addr } | SocketState::UnixListener { addr, .. } => {
+                Some(SockAddr {
+                    family: AF_UNIX,
+                    body: addr.to_body(),
+                })
+            }
+            SocketState::UnixConnected {
+                local_addr: Some(addr),
+                ..
+            } => Some(SockAddr {
                 family: AF_UNIX,
                 body: addr.to_body(),
             }),
@@ -1186,7 +1209,12 @@ impl SocketFile {
         let reg = {
             let state = self.state.lock();
             match &*state {
-                SocketState::UnixListener { addr, .. } => match addr {
+                SocketState::UnixBound { addr }
+                | SocketState::UnixListener { addr, .. }
+                | SocketState::UnixConnected {
+                    local_addr: Some(addr),
+                    ..
+                } => match addr {
                     UnixAddr::Path(p) => Reg::Unix(p.clone()),
                     UnixAddr::Abstract(n) => Reg::AbstractStream(n.clone()),
                     UnixAddr::Unnamed => Reg::None,
@@ -1441,7 +1469,7 @@ impl FileOps for SocketFile {
         }
         let state = self.state.lock();
         match &*state {
-            SocketState::Fresh => 0,
+            SocketState::Fresh | SocketState::UnixBound { .. } => 0,
             // An AF_INET listener is accept-ready (POLL_IN) when its
             // loopback `pending` queue OR — for a wired (off-box) listen
             // — the kernel-stack accept-queue has a completed connection.
@@ -1468,7 +1496,7 @@ impl FileOps for SocketFile {
                     narf_filesystem::POLL_IN
                 }
             }
-            SocketState::UnixConnected { rx, tx }
+            SocketState::UnixConnected { rx, tx, .. }
             | SocketState::InetConnected { rx, tx, .. }
             | SocketState::Inet6Connected { rx, tx, .. } => {
                 let mut bits = 0;
@@ -2791,34 +2819,29 @@ impl SocketFile {
                     reg.get_or_insert_with(BTreeMap::new)
                         .insert(n.clone(), self.clone());
                 }
-                *state = SocketState::UnixListener {
-                    addr: uaddr,
-                    backlog: 0,
-                    pending: VecDeque::new(),
-                };
+                *state = SocketState::UnixBound { addr: uaddr };
                 SocketOpResult::Ok(0)
             }
-            SocketOp::Listen { backlog } => {
+            SocketOp::Listen { backlog: _ } => {
                 let mut state = self.state.lock();
-                match &mut *state {
-                    SocketState::UnixListener {
-                        addr, backlog: b, ..
-                    } => {
-                        *b = backlog;
-                        // Pathname listeners insert into LISTENERS here (bind
-                        // only recorded the path). Abstract listeners already
-                        // registered at bind(), so this is a no-op for them.
-                        if let UnixAddr::Path(p) = addr {
-                            let p = p.clone();
-                            drop(state);
-                            let mut listeners = LISTENERS.lock();
-                            let map = listeners.get_or_insert_with(BTreeMap::new);
-                            map.insert(p, self.clone());
-                        }
-                        SocketOpResult::Ok(0)
-                    }
-                    _ => SocketOpResult::Err(SockError::InvalidArg),
+                let addr = match &*state {
+                    SocketState::UnixBound { addr } => addr.clone(),
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                *state = SocketState::UnixListener {
+                    addr: addr.clone(),
+                    pending: VecDeque::new(),
+                };
+                // Pathname listeners insert into LISTENERS here. Abstract
+                // addresses were reserved in bind(), so this is a no-op.
+                if let UnixAddr::Path(p) = addr {
+                    drop(state);
+                    LISTENERS
+                        .lock()
+                        .get_or_insert_with(BTreeMap::new)
+                        .insert(p, self.clone());
                 }
+                SocketOpResult::Ok(0)
             }
             SocketOp::Accept => {
                 // Pop from the pending queue. Caller (sys_accept)
@@ -2870,6 +2893,7 @@ impl SocketFile {
                     *srv_state = SocketState::UnixConnected {
                         tx: b_to_a.clone(),
                         rx: a_to_b.clone(),
+                        local_addr: None,
                     };
                 }
                 // Credentials: the accepted server end owns the listener's
@@ -2900,10 +2924,15 @@ impl SocketFile {
                 // Configure our (client) end.
                 let mut state = self.state.lock();
                 match &*state {
-                    SocketState::Fresh => {
+                    SocketState::Fresh | SocketState::UnixBound { .. } => {
+                        let local_addr = match &*state {
+                            SocketState::UnixBound { addr } => Some(addr.clone()),
+                            _ => None,
+                        };
                         *state = SocketState::UnixConnected {
                             tx: a_to_b,
                             rx: b_to_a,
+                            local_addr,
                         };
                         drop(state);
                         self.set_peer_cred(listener_cred);
@@ -2927,7 +2956,7 @@ impl SocketFile {
             SocketOp::Shutdown { how } => {
                 let state = self.state.lock();
                 match &*state {
-                    SocketState::UnixConnected { tx, rx } => {
+                    SocketState::UnixConnected { tx, rx, .. } => {
                         if how == SHUT_WR || how == SHUT_RDWR {
                             tx.close();
                         }
@@ -3752,7 +3781,7 @@ impl SocketFile {
         }
     }
 
-    fn do_recv(&self, buf: &mut [u8], _flags: u32) -> Result<(usize, Option<SockAddr>), SockError> {
+    fn do_recv(&self, buf: &mut [u8], flags: u32) -> Result<(usize, Option<SockAddr>), SockError> {
         let state = self.state.lock();
         if let SocketState::InetWired { tcb_id, .. } = &*state {
             let id = *tcb_id;
@@ -3769,7 +3798,11 @@ impl SocketFile {
             | SocketState::Inet6Connected { rx, .. } => rx,
             _ => return Err(SockError::NotConnected),
         };
-        let n = rx.read(buf);
+        let n = if flags & MSG_PEEK != 0 {
+            rx.peek(buf)
+        } else {
+            rx.read(buf)
+        };
         if n == 0 && !buf.is_empty() && !rx.is_closed() {
             Err(SockError::WouldBlock)
         } else {
@@ -3939,6 +3972,16 @@ impl RingBuf {
         }
         g.head = (g.head + n) % RING_CAP;
         g.len -= n;
+        n
+    }
+
+    /// Copy immediately readable bytes without advancing the stream head.
+    fn peek(&self, dst: &mut [u8]) -> usize {
+        let g = self.inner.lock();
+        let n = core::cmp::min(dst.len(), g.len);
+        for (i, slot) in dst.iter_mut().enumerate().take(n) {
+            *slot = g.buf[(g.head + i) % RING_CAP];
+        }
         n
     }
 

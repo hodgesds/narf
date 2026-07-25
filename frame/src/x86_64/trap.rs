@@ -70,7 +70,8 @@ fn ensure_user_range_writable(lo: u64, hi: u64) -> bool {
 /// spinning-not-polling (data-path/lock); `locked` ⇒ stuck in the queue
 /// lock. Self-latches after one dump. Cheap (a few atomics per tick); the
 /// dump only ever runs once, from IRQ context, via the same TrapWriter the
-/// perf dump uses.
+/// perf dump uses, then panics so CI cannot silently time out after a
+/// diagnosed stall.
 ///
 /// Off by default — build with `--features stall-watchdog` to arm it for
 /// an SMP-wedge investigation (a few atomics per tick; dumps once).
@@ -84,6 +85,8 @@ mod stall_wd {
     // Last interrupted RIP / CPL per CPU, recorded every tick.
     static LAST_RIP: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
     static LAST_CPL: [AtomicU8; MAXC] = [const { AtomicU8::new(0) }; MAXC];
+    static LAST_TASK: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+    static LAST_STAGE: [AtomicU8; MAXC] = [const { AtomicU8::new(0) }; MAXC];
     // Stall detector state (checked on whichever CPU happens to tick).
     static LAST_CHECK_CYCLES: AtomicU64 = AtomicU64::new(0);
     static LAST_SYSCALLS: AtomicU64 = AtomicU64::new(0);
@@ -98,8 +101,10 @@ mod stall_wd {
     pub fn tick(cs: u64, rip: u64) {
         let cpu = narf_lib::percpu::current_cpu();
         if cpu < MAXC {
+            LAST_STAGE[cpu].store(1, Ordering::Relaxed);
             LAST_RIP[cpu].store(rip, Ordering::Relaxed);
             LAST_CPL[cpu].store((cs & 3) as u8, Ordering::Relaxed);
+            LAST_TASK[cpu].store(narf_scheduler::current_task_id().raw(), Ordering::Relaxed);
         }
         if DUMPED.load(Ordering::Relaxed) {
             return;
@@ -132,6 +137,17 @@ mod stall_wd {
         // `HIGH_WATER` reused as a monotonic WINDOW COUNTER here.
         let wc = HIGH_WATER.fetch_add(1, Ordering::Relaxed) + 1;
         let delta = sc.wrapping_sub(prev);
+        const RCU_CRITICAL_NS: u64 = 1_000_000_000;
+        let rcu_stalled =
+            narf_rcu::stalled_cpu_mask(narf_scheduler::narf_time::monotonic_ns(), RCU_CRITICAL_NS);
+        if rcu_stalled != 0 && !DUMPED.swap(true, Ordering::Relaxed) {
+            let _ = writeln!(
+                TrapWriter,
+                "STALL-WD: RCU quiescent-state timeout mask={rcu_stalled:#x}"
+            );
+            dump(sc);
+            panic!("STALL-WD: RCU quiescent-state timeout");
+        }
         // Wedge signature: past boot (window 20 ≈ 20 s uptime) and the
         // syscall RATE collapses far below healthy. A healthy 200-conn run
         // does ~150-200k syscalls/window; the partial wedge limps at ~2k
@@ -146,17 +162,26 @@ mod stall_wd {
             let flats = FLAT_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
             if flats >= 3 && !DUMPED.swap(true, Ordering::Relaxed) {
                 dump(sc);
+                panic!("STALL-WD: scheduler forward progress stopped");
             }
         } else {
             FLAT_WINDOWS.store(0, Ordering::Relaxed);
         }
     }
 
+    pub fn stage(value: u8) {
+        let cpu = narf_lib::percpu::current_cpu();
+        if cpu < MAXC {
+            LAST_STAGE[cpu].store(value, Ordering::Relaxed);
+        }
+    }
+
     fn dump(sc: u64) {
+        let reporter = narf_lib::percpu::current_cpu();
         let (ipi_sent, ipi_skip) = narf_scheduler::dbg_resched_counts();
         let _ = writeln!(
             TrapWriter,
-            "STALL-WD: scheduler stalled (syscalls flat at {sc}); resched_ipi_sent={ipi_sent} resched_skip_not_halted={ipi_skip}; per-CPU state:"
+            "STALL-WD: scheduler stalled (syscalls flat at {sc}); reporter_cpu={reporter}; resched_ipi_sent={ipi_sent} resched_skip_not_halted={ipi_skip}; per-CPU state:"
         );
         for cpu in 0..MAXC {
             if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
@@ -165,7 +190,11 @@ mod stall_wd {
             let (depth, awake, halted, locked) = narf_scheduler::dbg_cpu_stall(cpu);
             let rip = LAST_RIP[cpu].load(Ordering::Relaxed);
             let cpl = LAST_CPL[cpu].load(Ordering::Relaxed);
-            let verdict = if locked {
+            let task = LAST_TASK[cpu].load(Ordering::Relaxed);
+            let stage = LAST_STAGE[cpu].load(Ordering::Relaxed);
+            let verdict = if cpu == reporter {
+                "REPORTING"
+            } else if locked {
                 "LOCK-HELD"
             } else if halted && awake > 0 {
                 "LOST-WAKEUP"
@@ -178,7 +207,7 @@ mod stall_wd {
             };
             let _ = writeln!(
                 TrapWriter,
-                "STALL-WD cpu={cpu} depth={depth} awake={awake} halted={halted} locked={locked} cpl={cpl} rip={rip:#x} -> {verdict}"
+                "STALL-WD cpu={cpu} depth={depth} awake={awake} halted={halted} locked={locked} task={task} stage={stage} cpl={cpl} rip={rip:#x} -> {verdict}"
             );
         }
         // Wheel + per-task park states: shows a task parked with an expired
@@ -736,6 +765,10 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         unsafe {
             run_irq_dispatch_on_stack(frame as *mut TrapFrame);
         }
+        #[cfg(feature = "stall-watchdog")]
+        if is_tick {
+            stall_wd::stage(2);
+        }
         if is_tick {
             // Preemption hook for stackful kernel tasks. Runs AFTER
             // EOI so that yielding to the executor doesn't leave
@@ -756,9 +789,13 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             // re-declared TrapFrame (asserted below).
             // SAFETY: Valid memory or trusted environment
             unsafe {
+                #[cfg(feature = "stall-watchdog")]
+                stall_wd::stage(3);
                 let sched_frame_ptr =
                     frame as *mut TrapFrame as *mut narf_scheduler::stackful::TrapFrame;
                 narf_scheduler::stackful::try_preempt(&mut *sched_frame_ptr);
+                #[cfg(feature = "stall-watchdog")]
+                stall_wd::stage(4);
             }
             // (a) Raise any timer-driven signal whose deadline has passed
             // for the currently-running task (e.g. SIGALRM from

@@ -449,6 +449,13 @@ pub trait FileOps: Send + Sync {
         POLL_IN | POLL_OUT
     }
 
+    /// Readiness query for file descriptions whose current offset affects
+    /// whether a read would block. The default preserves the ordinary
+    /// object-wide readiness contract; offset-sensitive devices override it.
+    fn poll_readiness_at(&self, _offset: u64) -> u32 {
+        self.poll_readiness()
+    }
+
     /// Absolute monotonic-ns instant at which this file will *next*
     /// become readable purely on its own timed schedule, if any.
     ///

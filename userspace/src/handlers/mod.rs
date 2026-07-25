@@ -831,6 +831,15 @@ fn open_impl(
     // than the generic `invalid_op` shape.
     let fail = SyscallReturn::ok(!0u64);
     let task = current_task_id();
+    // Linux open/openat reject an empty pathname with ENOENT. Do this before
+    // cwd normalization: `resolve_cwd_path(task, "")` otherwise collapses to
+    // the cwd itself and accidentally opens a directory. dbus-broker probes an
+    // optional empty path this way; opening cwd produced a regular fd that it
+    // added to epoll, yielding an infinite readable-at-EOF loop.
+    if path_owned_raw.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     // Resolve relative paths against the task's cwd and collapse
     // `.`/`..` (absolute-mount form only; the explicit-mount form below
     // keeps its already-relative-to-the-mount path). This is what makes
@@ -1017,6 +1026,7 @@ fn open_impl(
     // creation, route through the parent directory's `create()`. The
     // explicit-mount form is rare on the create path and not yet
     // wired; absolute paths are the supported entry.
+    #[cfg(feature = "linux-compat")]
     let mut created = false;
     let ops = match ops {
         Some(o) => o,
@@ -1027,7 +1037,10 @@ fn open_impl(
                 .map(|(parent, leaf)| poll_blocking(parent.create(&leaf)))
             {
                 Some(Some(Ok(o))) => {
-                    created = true;
+                    #[cfg(feature = "linux-compat")]
+                    {
+                        created = true;
+                    }
                     o
                 }
                 _ => {
@@ -4013,7 +4026,7 @@ const CLONE_VFORK: u64 = 0x0000_4000;
 /// table (the child does not inherit it — Linux allocates it after
 /// `copy_files`), number written through `clone_args.pidfd`. glibc's
 /// `pidfd_spawn` — the ONLY executor-spawn path systemd 258 uses — sets it.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(feature = "linux-compat")]
 const CLONE_PIDFD: u64 = 0x0000_1000;
 /// `CLONE_CLEAR_SIGHAND` (clone3-only): the child starts with every signal
 /// disposition SIG_DFL instead of a copy of the parent's table. glibc's
@@ -7134,6 +7147,8 @@ const PR_SET_NO_NEW_PRIVS: u64 = 38;
 const PR_GET_NO_NEW_PRIVS: u64 = 39;
 const PR_SET_PDEATHSIG: u64 = 1;
 const PR_GET_PDEATHSIG: u64 = 2;
+const PR_GET_KEEPCAPS: u64 = 7;
+const PR_SET_KEEPCAPS: u64 = 8;
 const PR_SET_CHILD_SUBREAPER: u64 = 36;
 const PR_GET_CHILD_SUBREAPER: u64 = 37;
 // PR_CAP_AMBIENT reads/mutates the per-task ambient capability set. The
@@ -7174,6 +7189,10 @@ struct PrctlState {
     /// PR_SET_CHILD_SUBREAPER: this task volunteers to absorb the
     /// orphans of its descendants (instead of them going unreaped).
     child_subreaper: bool,
+    /// Linux capability-retention compatibility state. NARF authority is
+    /// capability-object based, so this round-trips for consumers such as
+    /// dbus-broker but does not grant or retain NARF capabilities.
+    keep_caps: bool,
     /// Ambient capability set as a bitmask (bit N ⇒ capability N raised).
     ambient_caps: u64,
     /// PR_SET_SECUREBITS value. Stored-not-enforced (NARF's privilege
@@ -7193,6 +7212,7 @@ impl Default for PrctlState {
             no_new_privs: false,
             pdeathsig: 0,
             child_subreaper: false,
+            keep_caps: false,
             ambient_caps: 0, // empty ambient set at exec, per Linux
             securebits: 0,   // SECBIT_* all clear, per Linux default
         }
@@ -9289,10 +9309,14 @@ pub fn apply_chroot_for_test(p: &str) -> alloc::string::String {
 
 const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
+const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
 // Wave-73: CLOCK_MONOTONIC_RAW skips NTP slew (we have no NTP, so
 // RAW == MONOTONIC for now). CLOCK_BOOTTIME counts wall time across
 // suspend (no suspend support → same as MONOTONIC).
 const CLOCK_MONOTONIC_RAW: u64 = 4;
+const CLOCK_REALTIME_COARSE: u64 = 5;
+const CLOCK_MONOTONIC_COARSE: u64 = 6;
 const CLOCK_BOOTTIME: u64 = 7;
 
 // ── I/O Priority (ioprio_set / ioprio_get) ─────────────────────────
@@ -12072,6 +12096,8 @@ pub fn default_sync_signal_delivery(
             // desktop app maps (kwin, Qt, Mesa, glibc/musl, ...).
             {
                 use core::fmt::Write;
+                let pid = task_to_pid_raw(task).unwrap_or(task);
+                let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
                 let cause = match vector {
                     6 => "#UD",
                     13 => "#GP",
@@ -12082,8 +12108,10 @@ pub fn default_sync_signal_delivery(
                 };
                 let _ = writeln!(
                     narf_console::Writer,
-                    "fatal-fault: task={} sig={} {} vec={} faultva={:x} rip={:x}",
+                    "fatal-fault: task={} pid={} comm={} sig={} {} vec={} faultva={:x} rip={:x}",
                     task,
+                    pid,
+                    comm,
                     signum,
                     cause,
                     vector,
@@ -12101,7 +12129,22 @@ pub fn default_sync_signal_delivery(
                 // land in an executable window — the ld-musl interp bias
                 // (0x4000_0000_0000) or the mmap DSO arena (0x4080_.. up).
                 let rsp = ctx.user_rsp();
-                for i in 0..32u64 {
+                let _ = writeln!(narf_console::Writer, "  user-rsp={:x}", rsp);
+                #[cfg(feature = "linux-compat")]
+                {
+                    if let Some(info) = proc_task_info(pid) {
+                        for vma in info.vmas.iter().filter(|vma| vma.executable) {
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "  exec-vma={:016x}-{:016x} {}",
+                                vma.start,
+                                vma.end,
+                                vma.label
+                            );
+                        }
+                    }
+                }
+                for i in 0..96u64 {
                     let mut w = [0u8; 8];
                     // SAFETY: copy_from_user range-validates the source VA and
                     // SMAP-brackets the read; a bad slot just errors out.
@@ -12109,9 +12152,10 @@ pub fn default_sync_signal_delivery(
                         break;
                     }
                     let v = u64::from_le_bytes(w);
-                    if (0x0000_4000_0000_0000..0x0000_7F00_0000_0000).contains(&v) {
-                        let _ = writeln!(narf_console::Writer, "  stk[{}]={:x}", i, v);
-                    }
+                    // Fatal-path-only raw dump: selector-shaped corruption
+                    // often lands outside executable windows, and filtering
+                    // those words discards the evidence needed to localize it.
+                    let _ = writeln!(narf_console::Writer, "  stk[{}]={:016x}", i, v);
                 }
             }
             match default_signal_action(signum) {

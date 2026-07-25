@@ -100,9 +100,9 @@ fn path_args(path: &[u8]) -> SyscallArgs {
 fn pivot_args(new_root: &[u8], put_old: &[u8]) -> SyscallArgs {
     SyscallArgs {
         arg0: new_root.as_ptr() as u64,
-        arg1: new_root.len() as u64,
-        arg2: put_old.as_ptr() as u64,
-        arg3: put_old.len() as u64,
+        arg1: put_old.as_ptr() as u64,
+        arg2: 0,
+        arg3: 0,
         arg4: 0,
         arg5: 0,
     }

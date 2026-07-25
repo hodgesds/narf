@@ -39,7 +39,11 @@ pub const VIRTIO_BLK_T_OUT: u32 = 1;
 /// size of one contiguous coherent payload (order-4 buddy block). Bounds
 /// how much `read_sectors` transfers per submit; a fallback drops to 8
 /// sectors if the 64 KiB contiguous DMA buffer can't be allocated.
-pub const MAX_READ_SECTORS: u16 = 128;
+/// Maximum sectors in one synchronous request. Keep the payload within one
+/// 4 KiB DMA page until multi-page virtio-blk transfers have a completion
+/// integration test; the 64 KiB experiment could leave QEMU without a used
+/// entry during Fedora's large DSO reads.
+pub const MAX_READ_SECTORS: u16 = 8;
 
 /// virtio-blk completion status.
 pub const VIRTIO_BLK_S_OK: u8 = 0;
@@ -362,28 +366,38 @@ impl VirtioBlkPci {
         // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive
         // during the IDENTIFY-style probe completion wait.
         let mut q_err = false;
-        let done = narf_scheduler::responsive_spin_until(
-            || {
-                let elem = {
-                    let mut g = self.queue.lock();
-                    match g.as_mut() {
-                        Some(q) => q.poll_used(),
-                        None => {
-                            q_err = true;
-                            return true;
+        // A submitted DMA request owns `payload` and its descriptor chain
+        // until the device publishes a terminal used-ring entry. Returning on
+        // an arbitrary timeout used to drop `payload` while the device could
+        // still write to it and leaked the three descriptors permanently.
+        // Reusing an abandoned chain can exhaust or corrupt the queue. Keep
+        // pumping in bounded wall-clock slices, but do not abandon an
+        // in-flight request.
+        let done = loop {
+            let completed = narf_scheduler::responsive_spin_until(
+                || {
+                    let elem = {
+                        let mut g = self.queue.lock();
+                        match g.as_mut() {
+                            Some(q) => q.poll_used(),
+                            None => {
+                                q_err = true;
+                                return true;
+                            }
                         }
-                    }
-                };
-                matches!(elem, Some((id, _)) if id == head as u32)
-            },
-            narf_time::Deadline::after_ms(1_000),
-        );
+                    };
+                    matches!(elem, Some((id, _)) if id == head as u32)
+                },
+                narf_time::Deadline::after_ms(1_000),
+            );
+            if completed || q_err {
+                break completed;
+            }
+        };
         if q_err {
             return Err(VirtioPciError::NoQueues);
         }
-        if !done {
-            return Err(VirtioPciError::QueueTooSmall);
-        }
+        debug_assert!(done);
         // SAFETY: identity-mapped DMA.
         let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
         if status != VIRTIO_BLK_S_OK {
@@ -478,28 +492,35 @@ impl VirtioBlkPci {
         // Poll the used ring for our completion. responsive_spin_until
         // ticks sleep_pumps so cursor/FB stay alive on slow I/O.
         let mut q_err = false;
-        let done = narf_scheduler::responsive_spin_until(
-            || {
-                let elem = {
-                    let mut g = self.queue.lock();
-                    match g.as_mut() {
-                        Some(q) => q.poll_used(),
-                        None => {
-                            q_err = true;
-                            return true;
+        // The DMA payload and descriptor chain remain device-owned until a
+        // used-ring entry arrives. A timeout is not a terminal completion:
+        // dropping the payload and leaking the chain here eventually exhausted
+        // the queue while Plasma streamed its DSOs.
+        let done = loop {
+            let completed = narf_scheduler::responsive_spin_until(
+                || {
+                    let elem = {
+                        let mut g = self.queue.lock();
+                        match g.as_mut() {
+                            Some(q) => q.poll_used(),
+                            None => {
+                                q_err = true;
+                                return true;
+                            }
                         }
-                    }
-                };
-                matches!(elem, Some((id, _)) if id == head as u32)
-            },
-            narf_time::Deadline::after_ms(1_000),
-        );
+                    };
+                    matches!(elem, Some((id, _)) if id == head as u32)
+                },
+                narf_time::Deadline::after_ms(1_000),
+            );
+            if completed || q_err {
+                break completed;
+            }
+        };
         if q_err {
             return Err(VirtioPciError::NoQueues);
         }
-        if !done {
-            return Err(VirtioPciError::QueueTooSmall);
-        }
+        debug_assert!(done);
 
         // Read the status byte; non-zero means I/O error.
         // SAFETY: identity-mapped DMA.
@@ -534,8 +555,8 @@ impl VirtioBlkPci {
 
     /// Read `count` contiguous 512-byte sectors from `sector` in ONE virtio
     /// request — a single submit→poll round-trip instead of one per sector.
-    /// `count` is clamped to 1..=8 (the 4 KiB DMA scratch page holds 8
-    /// sectors); `out` must be at least `count*512` bytes. This is the batched
+    /// `count` is clamped to 1..=8 (one 4 KiB DMA page holds 8 sectors);
+    /// `out` must be at least `count*512` bytes. This is the batched
     /// counterpart to `read_sector`: a sequential file read (ext2 streaming a
     /// DSO) pays ~1/8 the `responsive_spin_until` round-trips.
     pub fn read_sectors(
@@ -544,11 +565,10 @@ impl VirtioBlkPci {
         count: u16,
         out: &mut [u8],
     ) -> Result<(), VirtioPciError> {
-        // Up to MAX_READ_SECTORS (64 KiB) per virtio round-trip. The payload
-        // is a single physically-contiguous coherent buffer (alloc_coherent
-        // now spans multiple pages), covered by one data descriptor — so a
-        // large sequential read (mmap'ing a Mesa/Qt6 DSO) pays one submit per
-        // 64 KiB instead of one per 4 KiB.
+        // Keep each transfer within one DMA page. Multi-page coherent buffers
+        // are supported by the allocator, but virtio-blk completion for larger
+        // descriptors needs its own QEMU integration gate before this path can
+        // safely raise the ceiling.
         let count = count.clamp(1, MAX_READ_SECTORS);
         let bytes = count as usize * 512;
         if out.len() < bytes {
@@ -616,28 +636,33 @@ impl VirtioBlkPci {
         }
 
         let mut q_err = false;
-        let done = narf_scheduler::responsive_spin_until(
-            || {
-                let elem = {
-                    let mut g = self.queue.lock();
-                    match g.as_mut() {
-                        Some(q) => q.poll_used(),
-                        None => {
-                            q_err = true;
-                            return true;
+        // The DMA payload and descriptor chain remain device-owned until a
+        // used-ring entry arrives. A timeout is not a terminal completion.
+        let done = loop {
+            let completed = narf_scheduler::responsive_spin_until(
+                || {
+                    let elem = {
+                        let mut g = self.queue.lock();
+                        match g.as_mut() {
+                            Some(q) => q.poll_used(),
+                            None => {
+                                q_err = true;
+                                return true;
+                            }
                         }
-                    }
-                };
-                matches!(elem, Some((id, _)) if id == head as u32)
-            },
-            narf_time::Deadline::after_ms(1_000),
-        );
+                    };
+                    matches!(elem, Some((id, _)) if id == head as u32)
+                },
+                narf_time::Deadline::after_ms(1_000),
+            );
+            if completed || q_err {
+                break completed;
+            }
+        };
         if q_err {
             return Err(VirtioPciError::NoQueues);
         }
-        if !done {
-            return Err(VirtioPciError::QueueTooSmall);
-        }
+        debug_assert!(done);
 
         // SAFETY: identity-mapped DMA.
         let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
@@ -1130,10 +1155,7 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         }
         let g = CONTROLLER.lock();
         let dev = g.as_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        // Batch up to MAX_READ_SECTORS (64 KiB) per virtio round-trip. If the
-        // large contiguous DMA buffer can't be allocated (fragmentation), fall
-        // back to an 8-sector (4 KiB) request, which always fits an order-0
-        // page — correctness first, speed when memory allows.
+        // Batch one 4 KiB page per virtio round-trip.
         let mut done: u16 = 0;
         while done < n_blocks {
             let want = core::cmp::min(MAX_READ_SECTORS, n_blocks - done);
