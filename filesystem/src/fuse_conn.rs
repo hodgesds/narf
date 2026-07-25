@@ -36,7 +36,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::fuse::*;
 use crate::{
     DirEntry, DirOps, FileLock, FileOps, FileType, FsError, FsFuture, FsInstance, FsIoctlReply,
-    FsStat, Mode, Stat, POLL_IN, POLL_OUT,
+    FsStat, FsStatx, FsStatxTimestamp, Mode, Stat, POLL_IN, POLL_OUT,
 };
 
 /// A completed reply from the daemon: the `error` field of the
@@ -895,6 +895,57 @@ impl FileOps for FuseFile {
         })
     }
 
+    fn statx_async<'a>(&'a self, flags: u32, mask: u32) -> FsFuture<'a, FsStatx> {
+        Box::pin(async move {
+            let fh = self.ensure_open().await?;
+            let reply = self
+                .conn
+                .request(
+                    FuseOpcode::Statx,
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseStatxIn {
+                        getattr_flags: 1, // FUSE_GETATTR_FH
+                        reserved: 0,
+                        fh,
+                        sx_flags: flags,
+                        sx_mask: mask,
+                    }),
+                )
+                .await?;
+            let out: FuseStatxOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            let ts = |time: FuseSxTime| {
+                if time.tv_nsec >= 1_000_000_000 {
+                    return Err(FsError::InvalidData);
+                }
+                Ok(FsStatxTimestamp {
+                    seconds: time.tv_sec,
+                    nanoseconds: time.tv_nsec,
+                })
+            };
+            Ok(FsStatx {
+                mask: out.stat.mask,
+                block_size: out.stat.blksize,
+                attributes: out.stat.attributes,
+                attributes_mask: out.stat.attributes_mask,
+                nlink: out.stat.nlink,
+                uid: out.stat.uid,
+                gid: out.stat.gid,
+                mode: out.stat.mode,
+                ino: out.stat.ino,
+                size: out.stat.size,
+                blocks: out.stat.blocks,
+                atime: ts(out.stat.atime)?,
+                btime: ts(out.stat.btime)?,
+                ctime: ts(out.stat.ctime)?,
+                mtime: ts(out.stat.mtime)?,
+                rdev_major: out.stat.rdev_major,
+                rdev_minor: out.stat.rdev_minor,
+                dev_major: out.stat.dev_major,
+                dev_minor: out.stat.dev_minor,
+            })
+        })
+    }
+
     fn flush<'a>(&'a self) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let fh = self.ensure_open().await?;
@@ -1131,10 +1182,15 @@ impl FileOps for FuseFile {
             }
             let fh_in = self.ensure_open().await?;
             let fh_out = target.ensure_open().await?;
+            let opcode = if self.conn.negotiated_minor() >= 45 {
+                FuseOpcode::CopyFileRange64
+            } else {
+                FuseOpcode::CopyFileRange
+            };
             let reply = self
                 .conn
                 .request(
-                    FuseOpcode::CopyFileRange,
+                    opcode,
                     self.attr.nodeid,
                     pod_as_bytes(&FuseCopyFileRangeIn {
                         fh_in,
@@ -1147,8 +1203,14 @@ impl FileOps for FuseFile {
                     }),
                 )
                 .await?;
-            let out: FuseWriteOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
-            Ok(u64::from(out.size))
+            if opcode == FuseOpcode::CopyFileRange64 {
+                let out: FuseCopyFileRangeOut =
+                    pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+                Ok(out.bytes_copied)
+            } else {
+                let out: FuseWriteOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+                Ok(u64::from(out.size))
+            }
         })
     }
 
@@ -1811,8 +1873,8 @@ impl FuseFs {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead: 0,
-            flags: FUSE_SUPPORTED_INIT_FLAGS,
-            flags2: 0,
+            flags: FUSE_SUPPORTED_INIT_FLAGS as u32,
+            flags2: (FUSE_SUPPORTED_INIT_FLAGS >> 32) as u32,
             unused: [0; 11],
         });
         // FUSE_INIT is addressed to nodeid 0.
@@ -1827,9 +1889,9 @@ impl FuseFs {
             return Err(FsError::Unsupported);
         }
         let minor = core::cmp::min(out.minor, FUSE_KERNEL_MINOR_VERSION);
-        let flags = (out.flags & FUSE_SUPPORTED_INIT_FLAGS) as u64
+        let flags = (u64::from(out.flags) & FUSE_SUPPORTED_INIT_FLAGS)
             | if out.flags & FuseInitFlag::InitExt as u32 != 0 {
-                (out.flags2 as u64) << 32
+                ((out.flags2 as u64) << 32) & FUSE_SUPPORTED_INIT_FLAGS
             } else {
                 0
             };

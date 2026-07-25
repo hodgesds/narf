@@ -64,6 +64,8 @@ pub enum FuseOpcode {
     CopyFileRange = 47,
     Syncfs = 50,
     Tmpfile = 51,
+    Statx = 52,
+    CopyFileRange64 = 53,
 }
 
 /// Header prepended to every FUSE request. Matches the wire layout
@@ -127,7 +129,7 @@ pub struct FuseInitOut {
 /// FUSE protocol version NARF negotiates. 7.36 covers everything
 /// Linux virtiofsd speaks that we care about.
 pub const FUSE_KERNEL_VERSION: u32 = 7;
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 36;
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 45;
 
 /// FUSE_INIT flags we request: writeback cache, posix locks, async
 /// read. Values match the Linux FUSE UAPI.
@@ -150,17 +152,19 @@ pub enum FuseInitFlag {
     InitExt = 1 << 30,
 }
 
-pub const FUSE_SUPPORTED_INIT_FLAGS: u32 = FuseInitFlag::AsyncRead as u32
-    | FuseInitFlag::PosixLocks as u32
-    | FuseInitFlag::BigWrites as u32
-    | FuseInitFlag::FlockLocks as u32
-    | FuseInitFlag::DoReaddirplus as u32
-    | FuseInitFlag::ReaddirplusAuto as u32
-    | FuseInitFlag::AsyncDio as u32
-    | FuseInitFlag::ParallelDirops as u32
-    | FuseInitFlag::MaxPages as u32
-    | FuseInitFlag::SetxattrExt as u32
-    | FuseInitFlag::InitExt as u32;
+pub const FUSE_REQUEST_TIMEOUT: u64 = 1 << 42;
+pub const FUSE_SUPPORTED_INIT_FLAGS: u64 = FuseInitFlag::AsyncRead as u64
+    | FuseInitFlag::PosixLocks as u64
+    | FuseInitFlag::BigWrites as u64
+    | FuseInitFlag::FlockLocks as u64
+    | FuseInitFlag::DoReaddirplus as u64
+    | FuseInitFlag::ReaddirplusAuto as u64
+    | FuseInitFlag::AsyncDio as u64
+    | FuseInitFlag::ParallelDirops as u64
+    | FuseInitFlag::MaxPages as u64
+    | FuseInitFlag::SetxattrExt as u64
+    | FuseInitFlag::InitExt as u64
+    | FUSE_REQUEST_TIMEOUT;
 
 // ── Additional wire structs (Linux include/uapi/linux/fuse.h) ─────────
 //
@@ -499,6 +503,66 @@ pub struct FuseCopyFileRangeIn {
     pub off_out: u64,
     pub len: u64,
     pub flags: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseCopyFileRangeOut {
+    pub bytes_copied: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseSxTime {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    pub reserved: i32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseStatx {
+    pub mask: u32,
+    pub blksize: u32,
+    pub attributes: u64,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u16,
+    pub spare0: [u16; 1],
+    pub ino: u64,
+    pub size: u64,
+    pub blocks: u64,
+    pub attributes_mask: u64,
+    pub atime: FuseSxTime,
+    pub btime: FuseSxTime,
+    pub ctime: FuseSxTime,
+    pub mtime: FuseSxTime,
+    pub rdev_major: u32,
+    pub rdev_minor: u32,
+    pub dev_major: u32,
+    pub dev_minor: u32,
+    pub spare2: [u64; 14],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseStatxIn {
+    pub getattr_flags: u32,
+    pub reserved: u32,
+    pub fh: u64,
+    pub sx_flags: u32,
+    pub sx_mask: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseStatxOut {
+    pub attr_valid: u64,
+    pub attr_valid_nsec: u32,
+    pub flags: u32,
+    pub spare: [u64; 2],
+    pub stat: FuseStatx,
 }
 
 /// `struct fuse_syncfs_in`.

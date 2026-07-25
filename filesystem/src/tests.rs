@@ -192,7 +192,7 @@ fn smoke_fs_fuse_opcode_constants() -> TestResult {
     if FuseOpcode::Ioctl as u32 != 39 || FuseOpcode::Tmpfile as u32 != 51 {
         return TestResult::Fail("newer FuseOpcode values drifted from UAPI");
     }
-    if FUSE_KERNEL_VERSION != 7 || FUSE_KERNEL_MINOR_VERSION != 36 {
+    if FUSE_KERNEL_VERSION != 7 || FUSE_KERNEL_MINOR_VERSION != 45 {
         return TestResult::Fail("FUSE protocol version mismatch");
     }
     TestResult::Pass
@@ -2782,6 +2782,13 @@ fn smoke_fs_fuse_struct_sizes() -> TestResult {
     {
         return TestResult::Fail("FUSE ioctl wire layouts drifted");
     }
+    if size_of::<FuseStatxIn>() != 24
+        || size_of::<FuseStatx>() != 256
+        || size_of::<FuseStatxOut>() != 288
+        || size_of::<FuseCopyFileRangeOut>() != 8
+    {
+        return TestResult::Fail("FUSE 7.45 wire layouts drifted");
+    }
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_struct_sizes);
@@ -3181,14 +3188,54 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
                 }),
             ))
         }
-        47 => {
+        47 | 53 => {
             let input: FuseCopyFileRangeIn = pod_from_bytes(body)?;
+            if opcode == 53 {
+                Some(fuse_reply(
+                    unique,
+                    0,
+                    &pod_as_bytes(&FuseCopyFileRangeOut {
+                        bytes_copied: input.len,
+                    }),
+                ))
+            } else {
+                Some(fuse_reply(
+                    unique,
+                    0,
+                    &pod_as_bytes(&FuseWriteOut {
+                        size: input.len as u32,
+                        padding: 0,
+                    }),
+                ))
+            }
+        }
+        52 => {
+            let input: FuseStatxIn = pod_from_bytes(body)?;
+            if input.getattr_flags != 1 || input.fh != 0x44 || input.sx_mask != 0x0fff {
+                return Some(fuse_reply(unique, -22, &[]));
+            }
             Some(fuse_reply(
                 unique,
                 0,
-                &pod_as_bytes(&FuseWriteOut {
-                    size: input.len as u32,
-                    padding: 0,
+                &pod_as_bytes(&FuseStatxOut {
+                    stat: FuseStatx {
+                        mask: 0x0fff,
+                        blksize: 4096,
+                        nlink: 1,
+                        uid: 1000,
+                        gid: 1000,
+                        mode: (S_IFREG | 0o600) as u16,
+                        ino: 4,
+                        size: 5,
+                        blocks: 1,
+                        btime: FuseSxTime {
+                            tv_sec: 123,
+                            tv_nsec: 456,
+                            reserved: 0,
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
                 }),
             ))
         }
@@ -3699,6 +3746,11 @@ fn smoke_fs_fuse_mutations() -> TestResult {
                 .ioctl_async(0xc004_7802, 0x1234, &[1, 2, 3, 4], 4)
                 .await
                 != Err(crate::FsError::InvalidData)
+            || file
+                .statx_async(0, 0x0fff)
+                .await
+                .map(|stat| (stat.mask, stat.ino, stat.btime.seconds))
+                != Ok((0x0fff, 4, 123))
         {
             OUTCOME.store(4, Ordering::Relaxed);
             return;

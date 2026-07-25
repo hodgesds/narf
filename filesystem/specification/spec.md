@@ -250,12 +250,18 @@ cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that
 registration so the next readiness query re-polls the daemon. Poll
 requests never leave ordinary reply slots behind.
 
-`FUSE_INIT` uses the Linux 64-byte extended request/reply layout. The
+`FUSE_INIT` uses the Linux 7.45 64-byte extended request/reply layout. The
 client advertises only implemented protocol features, accepts compatible
 short legacy replies by zero-extending them, intersects daemon flags with
 that set, and records the negotiated minor version and write limit on the
 connection. Major versions other than 7 and protocol minors before 7.5
 are rejected.
+Protocol 7.45 peers use `FUSE_COPY_FILE_RANGE_64` so successful copies
+can report byte counts beyond `u32`; older peers retain the original
+reply shape.
+`FileOps::statx_async` preserves the daemon's `FUSE_STATX` mask, birth
+time, attributes, ownership, device numbers, and nanosecond timestamps;
+malformed timestamps are rejected.
 FUSE writes are split into requests no larger than the negotiated
 `max_write`; each request advances the file offset, an oversized daemon
 reply is rejected as invalid data, and a short reply ends the write with

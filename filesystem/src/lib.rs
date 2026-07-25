@@ -380,6 +380,36 @@ pub struct FsIoctlReply {
     pub output: Vec<u8>,
 }
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsStatxTimestamp {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+
+/// Rich Linux statx metadata supplied by filesystems which preserve it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsStatx {
+    pub mask: u32,
+    pub block_size: u32,
+    pub attributes: u64,
+    pub attributes_mask: u64,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u16,
+    pub ino: u64,
+    pub size: u64,
+    pub blocks: u64,
+    pub atime: FsStatxTimestamp,
+    pub btime: FsStatxTimestamp,
+    pub ctime: FsStatxTimestamp,
+    pub mtime: FsStatxTimestamp,
+    pub rdev_major: u32,
+    pub rdev_minor: u32,
+    pub dev_major: u32,
+    pub dev_minor: u32,
+}
+
 // ── Directory entry ────────────────────────────────────────────────
 
 /// One entry returned by `DirOps::iter`. Stage 3 keeps the name as
@@ -440,6 +470,10 @@ pub trait FileOps: Send + Sync {
     /// Asynchronous stat — required for disk-backed or remote FS.
     fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
         Box::pin(async move { Ok(self.stat()) })
+    }
+
+    fn statx_async<'a>(&'a self, _flags: u32, _mask: u32) -> FsFuture<'a, FsStatx> {
+        Box::pin(async { Err(FsError::Unsupported) })
     }
 
     /// Resize the file to exactly `len` bytes. Growing zero-fills;
