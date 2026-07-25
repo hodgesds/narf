@@ -2,12 +2,12 @@
 set -eu
 
 boot_dir=${NARF_BOOT_DIR:-/boot}
-for kernel in "$boot_dir"/narf-frame-*; do
+for kernel in "$boot_dir"/narf-kernel-*; do
     [ -f "$kernel" ] || continue
-    version=${kernel##*/narf-frame-}
+    version=${kernel##*/narf-kernel-}
     cat <<EOF
 menuentry 'NARF $version' --class narf --class os {
-    multiboot2 /narf-frame-$version
+    multiboot2 /narf-kernel-$version
 }
 EOF
 done

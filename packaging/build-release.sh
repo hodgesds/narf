@@ -57,7 +57,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 stage=$work/stage
 mkdir -p "$stage/boot" "$stage/etc/grub.d" "$stage/usr/share/doc/narf"
-install -m 0644 "$kernel" "$stage/boot/narf-frame-$version"
+install -m 0644 "$kernel" "$stage/boot/narf-kernel-$version"
 install -m 0755 packaging/42_narf "$stage/etc/grub.d/42_narf"
 install -m 0644 LICENSE README.md "$stage/usr/share/doc/narf/"
 install -m 0644 packaging/README.md "$stage/usr/share/doc/narf/PACKAGING.md"
@@ -140,7 +140,7 @@ mkdir -p %{buildroot}
 cp -a boot etc usr %{buildroot}/
 
 %files
-/boot/narf-frame-$version
+/boot/narf-kernel-$version
 /etc/grub.d/42_narf
 /usr/share/doc/narf/
 

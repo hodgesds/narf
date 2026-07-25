@@ -1,7 +1,7 @@
 # NARF release packaging
 
 `build-release.sh` turns the canonical kernel ELF into installable
-distribution packages. Packages install `/boot/narf-frame-<version>` and a
+distribution packages. Packages install `/boot/narf-kernel-<version>` and a
 GRUB generator at `/etc/grub.d/42_narf`. The generator uses GRUB's
 `multiboot2` command, matching the header already emitted by
 `frame/src/x86_64/boot.S`.

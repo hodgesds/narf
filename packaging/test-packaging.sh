@@ -21,7 +21,7 @@ test -f "$tmp/out/gentoo/sys-kernel/narf-kernel/narf-kernel-0.0.0-test.1.ebuild"
 test -f "$tmp/out/release-manifest.json"
 (cd "$tmp/out" && sha256sum -c SHA256SUMS)
 tar -tzf "$tmp/out/narf-0.0.0-test.1-x86_64.tar.gz" |
-    grep -q './boot/narf-frame-0.0.0-test.1'
+    grep -F './boot/narf-kernel-0.0.0-test.1' >/dev/null
 
 if [[ -f $tmp/created ]]; then
     while IFS= read -r path; do rm -f "$path"; done <"$tmp/created"
