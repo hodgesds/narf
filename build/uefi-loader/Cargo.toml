@@ -1,0 +1,18 @@
+[package]
+name = "narf-uefi-loader"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+uefi = { version = "0.39", features = ["alloc"] }
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "0.39", features = ["alloc", "global_allocator"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = "symbols"

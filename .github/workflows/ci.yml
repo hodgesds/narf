@@ -107,6 +107,18 @@ jobs:
             --features boot-smoke,cgroup-all \
             -- -D warnings
 
+      - name: aarch64 UEFI loader tests + clippy
+        if: matrix.arch == 'aarch64'
+        run: |
+          cargo test --manifest-path build/uefi-loader/Cargo.toml
+          cargo clippy --manifest-path build/uefi-loader/Cargo.toml \
+            --tests -- -D warnings
+          cargo clippy --manifest-path build/uefi-loader/Cargo.toml \
+            --target aarch64-unknown-uefi --release \
+            -Zbuild-std=core,compiler_builtins,alloc \
+            -Zbuild-std-features=compiler-builtins-mem \
+            -- -D warnings
+
   boot-smoke:
     name: boot-smoke / ${{ matrix.arch }}
     runs-on: ubuntu-latest
@@ -135,6 +147,7 @@ jobs:
             dosfstools \
             e2fsprogs \
             ovmf \
+            qemu-efi-aarch64 \
             xorriso \
             limine
 
@@ -157,9 +170,8 @@ jobs:
       - name: cargo xtask boot-smoke
         run: cargo xtask boot-smoke --arch=${{ matrix.arch }}
 
-      - name: cargo xtask iso-boot (OVMF UEFI)
-        if: matrix.arch == 'x86_64'
-        run: cargo xtask iso-boot --arch=x86_64
+      - name: cargo xtask iso-boot (firmware UEFI)
+        run: cargo xtask iso-boot --arch=${{ matrix.arch }}
 
   musl-demo:
     name: musl-demo (x86_64)

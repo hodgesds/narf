@@ -94,7 +94,7 @@ For the full per-feature landing log and live driver portfolio see
 
 **Prerequisites:** Rust nightly (pinned in `rust-toolchain.toml`),
 `qemu-system-x86_64` + `qemu-system-aarch64`, `xorriso`, `mtools`,
-`ovmf` for the ISO + UEFI path.
+`ovmf` + `qemu-efi-aarch64` for the x86_64 and aarch64 UEFI paths.
 
 ```sh
 # Boot the async demo under QEMU
@@ -121,6 +121,9 @@ cargo xtask net-smoke --arch=x86_64
 
 # Boot via Limine ISO + OVMF UEFI and require a clean boot marker
 cargo xtask iso-boot --arch=x86_64 --release
+
+# Boot the AA64 fallback loader + ESP under AAVMF
+cargo xtask iso-boot --arch=aarch64 --release
 
 # Build the ISO without booting
 cargo xtask image --arch=x86_64 --release
@@ -246,7 +249,7 @@ reading list), and `research/summaries/` (distilled primary sources).
 | Arch | Status |
 |---|---|
 | **x86_64** | First-class. Limine multiboot2 path; UEFI removable-media boot is tested through OVMF with Secure Boot disabled. |
-| **aarch64** | First-class. Boots under `qemu-system-aarch64 -M virt`. Generic Timer + GICv3 + PSCI. |
+| **aarch64** | First-class. Linux-compatible FDT entry via direct boot or the removable-media `BOOTAA64.EFI` loader; AAVMF-gated in CI. Generic Timer + GICv3 + PSCI. |
 
 Real-hardware bring-up targets: AMD Zen2 Renoir (Vega8 / DCN 2.0) and
 AMD Phoenix HawkPoint1 (RDNA3.5 / DCN 3.5).

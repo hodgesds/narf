@@ -10,7 +10,7 @@
 // `cargo xtask run   --arch=x86_64 [--release]`  — cross-build + QEMU boot
 // `cargo xtask test  --arch=aarch64`             — boot + run kernel tests
 // `cargo xtask host-test`                        — fast host unit-test gate
-// `cargo xtask image --arch=x86_64 --bootloader=limine` — bootable ISO
+// `cargo xtask image --arch=<arch>`              — bootable UEFI media
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -106,9 +106,7 @@ enum Cmd {
     MuslDemo(BuildArgs),
     /// Produce a bootable image.
     Image(BuildArgs),
-    /// Build the bootable Limine ISO and boot it under QEMU + OVMF.
-    /// Equivalent to `xtask image` followed by the matching
-    /// `qemu-system-x86_64 -bios OVMF.fd -cdrom <iso> ...` invocation.
+    /// Build removable media and boot it under OVMF/AAVMF UEFI.
     IsoBoot(BuildArgs),
     /// Boot under QEMU with a graphical display + the user-mode
     /// testbin running.
@@ -5693,11 +5691,9 @@ fn pack_firmware_cmd(args: &PackFirmwareArgs) -> Result<()> {
 ///     `$LIMINE_PATH`, `/usr/share/limine/`, or `vendor/limine/`.
 ///   - `limine` binary (optional, only needed for BIOS install).
 fn image_cmd(args: &BuildArgs) -> Result<()> {
-    if !matches!(args.arch, Arch::X86_64) {
-        bail!(
-            "xtask image: arch {:?} not yet supported (x86_64 only)",
-            args.arch.triple()
-        );
+    if matches!(args.arch, Arch::Aarch64) {
+        build_aarch64_uefi_image(args)?;
+        return Ok(());
     }
     let root = workspace_root()?;
     let out_dir = cargo_build(args, &root)?;
@@ -6013,11 +6009,8 @@ interface_resolution: 1024x768
 /// that lets the kernel exercise the UEFI handoff path end-to-end
 /// (the same path real consumer hardware takes).
 fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
-    if !matches!(args.arch, Arch::X86_64) {
-        bail!(
-            "xtask iso-boot: arch {:?} not yet supported (x86_64 only)",
-            args.arch.triple()
-        );
+    if matches!(args.arch, Arch::Aarch64) {
+        return aarch64_uefi_boot_cmd(args);
     }
     let mut args = args.clone();
     ensure_feature(&mut args.features, "boot-smoke");
@@ -6207,6 +6200,210 @@ fn ovmf_code_path() -> PathBuf {
         }
     }
     PathBuf::from("OVMF_CODE.fd")
+}
+
+fn aavmf_code_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("AAVMF_CODE") {
+        return PathBuf::from(path);
+    }
+    for cand in [
+        "/usr/share/AAVMF/AAVMF_CODE.fd",
+        "/usr/share/AAVMF/AAVMF_CODE.ms.fd",
+        "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+        "/usr/share/edk2/aarch64/QEMU_EFI.fd",
+        "/usr/share/edk2-armvirt/aarch64/QEMU_EFI.fd",
+    ] {
+        let path = PathBuf::from(cand);
+        if path.is_file() {
+            return path;
+        }
+    }
+    PathBuf::from("AAVMF_CODE.fd")
+}
+
+/// Build a removable FAT image with the standard AA64 fallback loader.
+fn build_aarch64_uefi_image(args: &BuildArgs) -> Result<PathBuf> {
+    let root = workspace_root()?;
+    let out_dir = cargo_build(args, &root)?;
+    let kernel = out_dir.join(&args.package);
+    if !kernel.is_file() {
+        bail!("expected kernel binary at {}", kernel.display());
+    }
+
+    let loader_manifest = root.join("build/uefi-loader/Cargo.toml");
+    let loader_target = root.join("target/uefi-loader");
+    let mut cargo = Command::new("cargo");
+    cargo
+        .args([
+            "build",
+            "--manifest-path",
+            loader_manifest
+                .to_str()
+                .ok_or_else(|| anyhow!("non-UTF-8 UEFI loader path"))?,
+            "--target",
+            "aarch64-unknown-uefi",
+            "--release",
+            "-Zbuild-std=core,compiler_builtins,alloc",
+            "-Zbuild-std-features=compiler-builtins-mem",
+        ])
+        .env("CARGO_TARGET_DIR", &loader_target)
+        .current_dir(&root);
+    let status = cargo.status().context("building aarch64 UEFI loader")?;
+    if !status.success() {
+        bail!("aarch64 UEFI loader build failed with {status}");
+    }
+    let loader = loader_target.join("aarch64-unknown-uefi/release/narf-uefi-loader.efi");
+    if !loader.is_file() {
+        bail!("expected UEFI loader at {}", loader.display());
+    }
+
+    // The linked kernel keeps DWARF for crash symbolization, but firmware only
+    // needs its ELF program headers and loadable segments. Stage a stripped
+    // copy so a debug build does not turn a ~21 MiB payload into a ~230 MiB ESP.
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let sysroot_output = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .context("locating Rust sysroot for llvm-objcopy")?;
+    if !sysroot_output.status.success() {
+        bail!("rustc --print sysroot failed");
+    }
+    let sysroot = PathBuf::from(String::from_utf8(sysroot_output.stdout)?.trim());
+    let rustlib = sysroot.join("lib/rustlib");
+    let objcopy = std::fs::read_dir(&rustlib)
+        .with_context(|| format!("reading {}", rustlib.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path().join("bin/llvm-objcopy"))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            anyhow!(
+                "llvm-objcopy not found under {}; install llvm-tools-preview",
+                rustlib.display()
+            )
+        })?;
+    let staged_kernel = root.join("target/narf-frame-aarch64.efi-elf");
+    run_checked(
+        Command::new(objcopy)
+            .arg("--strip-debug")
+            .arg(&kernel)
+            .arg(&staged_kernel),
+        "stripping aarch64 kernel debug sections for the ESP",
+    )?;
+
+    for tool in ["mformat", "mmd", "mcopy"] {
+        if which(tool).is_none() {
+            bail!("`{tool}` is required for the aarch64 UEFI image; install mtools");
+        }
+    }
+    let image = root.join("target/narf-aarch64-uefi.img");
+    let _ = std::fs::remove_file(&image);
+    let file =
+        std::fs::File::create(&image).with_context(|| format!("creating {}", image.display()))?;
+    file.set_len(256 * 1024 * 1024)
+        .with_context(|| format!("sizing {}", image.display()))?;
+
+    run_checked(
+        Command::new("mformat").args(["-i", image.to_str().unwrap(), "-F", "::"]),
+        "formatting aarch64 EFI system partition",
+    )?;
+    run_checked(
+        Command::new("mmd").args([
+            "-i",
+            image.to_str().unwrap(),
+            "::/EFI",
+            "::/EFI/BOOT",
+            "::/boot",
+        ]),
+        "creating EFI system partition directories",
+    )?;
+    run_checked(
+        Command::new("mcopy").args([
+            "-i",
+            image.to_str().unwrap(),
+            loader.to_str().unwrap(),
+            "::/EFI/BOOT/BOOTAA64.EFI",
+        ]),
+        "copying BOOTAA64.EFI",
+    )?;
+    run_checked(
+        Command::new("mcopy").args([
+            "-i",
+            image.to_str().unwrap(),
+            staged_kernel.to_str().unwrap(),
+            "::/boot/narf-frame",
+        ]),
+        "copying aarch64 kernel",
+    )?;
+    println!("xtask image: wrote {}", image.display());
+    Ok(image)
+}
+
+fn run_checked(command: &mut Command, operation: &str) -> Result<()> {
+    let status = command
+        .status()
+        .with_context(|| format!("failed while {operation}"))?;
+    if !status.success() {
+        bail!("{operation} failed with {status}");
+    }
+    Ok(())
+}
+
+fn aarch64_uefi_boot_cmd(args: &BuildArgs) -> Result<()> {
+    let mut args = args.clone();
+    ensure_feature(&mut args.features, "boot-smoke");
+    let image = build_aarch64_uefi_image(&args)?;
+    let firmware = aavmf_code_path();
+    if !firmware.is_file() {
+        bail!(
+            "AAVMF firmware not found at {}; install `qemu-efi-aarch64` \
+             (Debian/Ubuntu) or set AAVMF_CODE",
+            firmware.display()
+        );
+    }
+
+    let mut command = Command::new("qemu-system-aarch64");
+    command
+        .args([
+            "-machine",
+            "virt,gic-version=3,mte=on,highmem-ecam=off",
+            "-cpu",
+            "max",
+            "-smp",
+            "2",
+            "-m",
+            "512M",
+            "-bios",
+        ])
+        .arg(&firmware)
+        .args(["-drive"])
+        .arg(format!(
+            "if=none,id=esp,format=raw,readonly=on,file={}",
+            image.display()
+        ))
+        .args([
+            "-device",
+            "virtio-blk-pci,drive=esp,disable-legacy=on,disable-modern=off",
+            "-serial",
+            "stdio",
+            "-display",
+            "none",
+            "-no-reboot",
+            "-semihosting",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    println!(
+        "xtask iso-boot: launching qemu-system-aarch64 with ESP {}",
+        image.display()
+    );
+    let child = command
+        .spawn()
+        .context("failed to spawn qemu-system-aarch64")?;
+    let timeout = std::env::var("XTASK_BOOT_SMOKE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(120);
+    wait_for_boot_smoke(child, "aarch64-uefi-smoke", timeout, Arch::Aarch64)
 }
 
 /// Burn the NARF ISO to a USB stick reliably:

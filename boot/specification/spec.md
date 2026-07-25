@@ -102,9 +102,11 @@ from turning into a kernel-side memory-corruption primitive.
 - Memory map from Limine features; ACPI RSDP via Limine feature.
 
 ### aarch64
-- **U-Boot FDT entry is the sole Stage 1 boot path.** EFI stub support
-  is Stage 4. QEMU `virt` natively provides FDT; EFI adds a UEFI
-  runtime dependency that Stage 1 CI does not need.
+- Direct Linux/U-Boot FDT entry and the `BOOTAA64.EFI` removable-media
+  loader are supported. The loader obtains the standard EFI DTB
+  configuration table, validates and loads the kernel ELF64 `PT_LOAD`
+  segments at their physical addresses, exits Boot Services, and enters
+  the same Linux-compatible ABI.
 - Entry: physical address `0x4008_0000`, MMU off, X0 = DTB physical
   address (Linux/U-Boot ABI).
 - Memory map + reserved regions from the FDT `/memory` and
@@ -141,8 +143,9 @@ producing the same `RawBootInfo` shape that `frame/` consumes.
 - **multiboot2** stays as a CI fallback because QEMU's
   `-kernel` direct-load path is multiboot2; this lets us boot
   fresh kernels in xtask without re-imaging.
-- **UEFI-stub** on aarch64 is the SystemReady-compliant path;
-  on QEMU `virt` we fall back to `-kernel` direct entry.
+- **UEFI loader** on aarch64 is the SystemReady-compatible removable
+  media path and is boot-gated with AAVMF; `-kernel` direct entry
+  remains the fast functional-test path.
 
 The three loaders converge on `RawBootInfo` before any
 NARF-specific code runs; downstream subsystems see only the
