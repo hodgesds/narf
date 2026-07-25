@@ -2898,6 +2898,40 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
             };
             Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
         }
+        // FUSE_SETXATTR / REMOVEXATTR.
+        21 | 24 => Some(fuse_reply(unique, 0, &[])),
+        // FUSE_GETXATTR: size probe then value.
+        22 => {
+            let input: FuseGetxattrIn = pod_from_bytes(body)?;
+            if input.size == 0 {
+                Some(fuse_reply(
+                    unique,
+                    0,
+                    &pod_as_bytes(&FuseGetxattrOut {
+                        size: 3,
+                        padding: 0,
+                    }),
+                ))
+            } else {
+                Some(fuse_reply(unique, 0, b"bar"))
+            }
+        }
+        // FUSE_LISTXATTR: size probe then NUL-separated names.
+        23 => {
+            let input: FuseGetxattrIn = pod_from_bytes(body)?;
+            if input.size == 0 {
+                Some(fuse_reply(
+                    unique,
+                    0,
+                    &pod_as_bytes(&FuseGetxattrOut {
+                        size: 9,
+                        padding: 0,
+                    }),
+                ))
+            } else {
+                Some(fuse_reply(unique, 0, b"user.foo\0"))
+            }
+        }
         // FUSE_WRITE (16): report the requested payload size.
         16 => {
             let win: FuseWriteIn = pod_from_bytes(body)?;
@@ -3246,6 +3280,10 @@ fn smoke_fs_fuse_mutations() -> TestResult {
             || file.flush().await.is_err()
             || file.fsync(false).await.is_err()
             || file.fsync(true).await.is_err()
+            || file.set_xattr("user.foo", b"bar", 0).await.is_err()
+            || file.get_xattr("user.foo").await != Ok(b"bar".to_vec())
+            || file.list_xattr().await != Ok(b"user.foo\0".to_vec())
+            || file.remove_xattr("user.foo").await.is_err()
         {
             OUTCOME.store(4, Ordering::Relaxed);
             return;

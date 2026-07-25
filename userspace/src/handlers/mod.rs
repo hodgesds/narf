@@ -2887,6 +2887,16 @@ fn xattr_fd_key(fd: u32) -> Option<alloc::string::String> {
     fd_path_of(current_task_id(), fd)
 }
 
+fn xattr_file(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
+    let (root, rel) = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
+        (fs.root(), alloc::string::String::from(rel))
+    })?;
+    match poll_blocking(narf_filesystem::resolve_async_nofollow(root, &rel)) {
+        Some(Ok(file)) => Some(file),
+        _ => None,
+    }
+}
+
 /// `setxattr` / `lsetxattr` / `fsetxattr` core (name/value/size/flags at
 /// arg1..arg4; the key path is resolved by the caller).
 fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
@@ -2912,6 +2922,27 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
         }
     };
     let flags = a.arg4;
+    if let Some(file) = xattr_file(&path) {
+        match poll_blocking(file.set_xattr(&name, &value, flags as u32)) {
+            Some(Ok(())) => {
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+            Some(Err(narf_filesystem::FsError::Busy)) => {
+                ctx.set_return(SyscallReturn::ok((-17i64) as u64));
+                return;
+            }
+            Some(Err(narf_filesystem::FsError::NotFound)) => {
+                ctx.set_return(SyscallReturn::ok((-61i64) as u64));
+                return;
+            }
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                return;
+            }
+        }
+    }
     let key = (path, name);
     let mut g = XATTR_TABLE.lock();
     let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
@@ -2940,6 +2971,22 @@ fn xattr_get_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
         }
     };
     let size = a.arg3 as usize;
+    if let Some(file) = xattr_file(&path) {
+        match poll_blocking(file.get_xattr(&name)) {
+            Some(Ok(value)) => {
+                return xattr_copy_value(ctx, a.arg2, size, &value);
+            }
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+            Some(Err(narf_filesystem::FsError::NotFound)) => {
+                ctx.set_return(SyscallReturn::ok((-61i64) as u64));
+                return;
+            }
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                return;
+            }
+        }
+    }
     let value = {
         let g = XATTR_TABLE.lock();
         match g.as_ref().and_then(|m| m.get(&(path, name)).cloned()) {
@@ -2950,26 +2997,39 @@ fn xattr_get_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
             }
         }
     };
+    xattr_copy_value(ctx, a.arg2, size, &value);
+}
+
+fn xattr_copy_value(ctx: &mut dyn TrapContext, ptr: u64, size: usize, value: &[u8]) {
     if size == 0 {
         ctx.set_return(SyscallReturn::ok(value.len() as u64));
-        return;
-    }
-    if size < value.len() {
-        ctx.set_return(SyscallReturn::ok((-34i64) as u64)); // ERANGE
-        return;
-    }
-    // SAFETY: a.arg2 is the user buffer; copy_to_user range-validates the write.
-    if unsafe { copy_to_user(a.arg2, &value) }.is_err() {
+    } else if size < value.len() {
+        ctx.set_return(SyscallReturn::ok((-34i64) as u64));
+    // SAFETY: `ptr` is the caller's output buffer; `copy_to_user`
+    // range-validates and SMAP-brackets the write.
+    } else if unsafe { copy_to_user(ptr, value) }.is_err() {
         ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-        return;
+    } else {
+        ctx.set_return(SyscallReturn::ok(value.len() as u64));
     }
-    ctx.set_return(SyscallReturn::ok(value.len() as u64));
 }
 
 /// `listxattr` / `llistxattr` / `flistxattr` core (list at arg1, size at arg2).
 fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let size = a.arg2 as usize;
+    if let Some(file) = xattr_file(&path) {
+        match poll_blocking(file.list_xattr()) {
+            Some(Ok(names)) => {
+                return xattr_copy_value(ctx, a.arg1, size, &names);
+            }
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                return;
+            }
+        }
+    }
     let mut names: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     {
         let g = XATTR_TABLE.lock();
@@ -3008,6 +3068,23 @@ fn xattr_remove_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    if let Some(file) = xattr_file(&path) {
+        match poll_blocking(file.remove_xattr(&name)) {
+            Some(Ok(())) => {
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
+            Some(Err(narf_filesystem::FsError::NotFound)) => {
+                ctx.set_return(SyscallReturn::ok((-61i64) as u64));
+                return;
+            }
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                return;
+            }
+        }
+    }
     let removed = {
         let mut g = XATTR_TABLE.lock();
         g.as_mut().map(|m| m.remove(&(path, name)).is_some())

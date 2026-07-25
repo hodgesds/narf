@@ -157,7 +157,7 @@ replies by the non-zero `unique` identifier.
   are distinct from regular-file `OPEN` and `RELEASE`.
 - The bridge supports lookup, getattr/setattr, create, mknod, mkdir,
   unlink, rmdir, same- and cross-directory rename/link, symlink, open, read,
-  write, flush, fsync/fdatasync, readlink, statfs, readdir, release,
+  write, flush, fsync/fdatasync, extended attributes, readlink, statfs, readdir, release,
   forget, and initialization.
 
 `FsInstance::statfs` is the asynchronous filesystem-capacity interface.
@@ -175,6 +175,11 @@ between two directories of one filesystem. FUSE translates the target
 directory inode into `fuse_rename_in.newdir` / the `FUSE_LINK` request
 node and uses `FUSE_RENAME2` when Linux `RENAME_*` flags are present.
 Operations spanning distinct connections or mounts report `EXDEV`.
+
+`FileOps` exposes set/get/list/remove extended-attribute operations.
+FUSE uses the Linux two-request size-probe convention for GETXATTR and
+LISTXATTR and preserves XATTR_CREATE/XATTR_REPLACE flags. Filesystems
+without native xattrs retain the userspace side-table fallback.
 
 Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with

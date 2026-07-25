@@ -654,6 +654,78 @@ impl FileOps for FuseFile {
                 .map(|_| ())
         })
     }
+
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let mut body = pod_as_bytes(&FuseSetxattrIn {
+                size: value.len() as u32,
+                flags,
+                ..Default::default()
+            });
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
+            body.extend_from_slice(value);
+            self.conn
+                .request(FuseOpcode::Setxattr, self.attr.nodeid, body)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            let probe = pod_as_bytes(&FuseGetxattrIn::default());
+            let mut probe = probe;
+            probe.extend_from_slice(name.as_bytes());
+            probe.push(0);
+            let size_reply = self
+                .conn
+                .request(FuseOpcode::Getxattr, self.attr.nodeid, probe)
+                .await?;
+            let size: FuseGetxattrOut = pod_from_bytes(&size_reply).ok_or(FsError::InvalidData)?;
+            let mut body = pod_as_bytes(&FuseGetxattrIn {
+                size: size.size,
+                padding: 0,
+            });
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
+            self.conn
+                .request(FuseOpcode::Getxattr, self.attr.nodeid, body)
+                .await
+        })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            let probe = pod_as_bytes(&FuseGetxattrIn::default());
+            let size_reply = self
+                .conn
+                .request(FuseOpcode::Listxattr, self.attr.nodeid, probe)
+                .await?;
+            let size: FuseGetxattrOut = pod_from_bytes(&size_reply).ok_or(FsError::InvalidData)?;
+            self.conn
+                .request(
+                    FuseOpcode::Listxattr,
+                    self.attr.nodeid,
+                    pod_as_bytes(&FuseGetxattrIn {
+                        size: size.size,
+                        padding: 0,
+                    }),
+                )
+                .await
+        })
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let mut body = name.as_bytes().to_vec();
+            body.push(0);
+            self.conn
+                .request(FuseOpcode::Removexattr, self.attr.nodeid, body)
+                .await
+                .map(|_| ())
+        })
+    }
 }
 
 impl Drop for FuseFile {

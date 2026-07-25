@@ -462,6 +462,22 @@ pub trait FileOps: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    fn set_xattr<'a>(&'a self, _name: &'a str, _value: &'a [u8], _flags: u32) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn get_xattr<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn remove_xattr<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
     /// POSIX-2017 `poll(2)` readiness query. Returns the OR of
     /// the POLL_* bits below for the events currently satisfied
     /// on this file. The default returns `POLL_IN | POLL_OUT`
