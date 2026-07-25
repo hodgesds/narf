@@ -23,6 +23,9 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 
 - `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot.
 - `cargo xtask test --arch=aarch64` — boot + run kernel tests.
+- `cargo xtask iso-boot --arch=x86_64` — build the removable-media
+  image, boot it through OVMF + Limine's `BOOTX64.EFI`, and require
+  the real-init clean-exit marker with no kernel panic.
 - `cargo xtask host-test` — run the fast host unit-test allowlist.
   Only hardware-independent crates belong here; privileged, linker-script,
   and device integration coverage remains under `xtask test`.

@@ -6,8 +6,15 @@ GRUB generator at `/etc/grub.d/42_narf`. The generator uses GRUB's
 `multiboot2` command, matching the header already emitted by
 `frame/src/x86_64/boot.S`.
 
-The ISO and its external initramfs are not packaged; they remain test artifacts
-produced by `xtask image`. The installed kernel uses its built-in userspace.
+The release workflow also publishes `narf-x86_64.iso` and its SHA-256
+sidecar after booting the same image layout through OVMF. Distribution
+packages do not embed that ISO or its external initramfs; the installed
+kernel uses its built-in userspace.
+
+The ISO uses the standard removable-media path
+`EFI/BOOT/BOOTX64.EFI` through Limine. It currently requires Secure
+Boot to be disabled; signed-loader/shim enrollment is not part of the
+release process yet.
 
 Supported outputs:
 
@@ -45,6 +52,7 @@ may pass `--create` to create the signed `v0.5.0` tag locally, then push it
 after review. The tool never pushes and AI agents must never create or sign a
 release tag.
 
-The GitHub release workflow validates an existing signed `v*` tag and builds
-packages in distribution containers. It uploads artifacts to the GitHub
-release only after all packaging jobs succeed.
+The GitHub release workflow validates an existing signed `v*` tag,
+boots the ISO through OVMF, rebuilds the publishable non-smoke ISO,
+and builds packages in distribution containers. It uploads the ISO,
+its checksum, and packages only after all jobs succeed.

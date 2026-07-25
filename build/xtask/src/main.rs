@@ -1750,14 +1750,31 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
     let mut cmd = Command::new(qemu);
     cmd.args(args.arch.qemu_args(&kernel, &args.display, args.hw_profile));
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    cmd.stderr(Stdio::inherit());
 
     println!("xtask boot-smoke: launching {} {}", qemu, kernel.display());
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
 
+    let secs = std::env::var("XTASK_BOOT_SMOKE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(90);
+    wait_for_boot_smoke(child, "boot-smoke", secs, args.arch)
+}
+
+/// Validate a QEMU boot that was built with the `boot-smoke` feature.
+///
+/// The reader is joined only after QEMU has exited (or has been killed);
+/// joining it while a timed-out QEMU still owns the pipe would deadlock.
+fn wait_for_boot_smoke(
+    mut child: std::process::Child,
+    label: &'static str,
+    timeout_secs: u64,
+    arch: Arch,
+) -> Result<()> {
     // Panic markers — any one of these in stdout triggers failure
     // even if QEMU then exits cleanly.
     let panic_markers: &[&str] = &[
@@ -1769,54 +1786,55 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
         "unsafe precondition",
     ];
 
-    let secs = std::env::var("XTASK_BOOT_SMOKE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(90);
-
-    // Stream stdout to terminal and accumulate any panic markers.
+    // Stream stdout to terminal and accumulate panic/success markers.
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| anyhow!("qemu child has no stdout"))?;
-    let reader_handle = std::thread::spawn(move || -> Option<String> {
+    let reader_handle = std::thread::spawn(move || -> (Option<String>, bool) {
         let reader = BufReader::new(stdout);
         let mut panic_line = None;
+        let mut clean_exit_seen = false;
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
                 Err(_) => break,
             };
             println!("{line}");
+            clean_exit_seen |= line.contains("boot-smoke: clean exit");
             if panic_line.is_none() && panic_markers.iter().any(|m| line.contains(m)) {
                 panic_line = Some(line);
             }
         }
-        panic_line
+        (panic_line, clean_exit_seen)
     });
 
     // Wait for QEMU to exit naturally (kernel calls exit_kernel),
     // OR force-kill on timeout.
-    let exit = child.wait_timeout(Duration::from_secs(secs))?;
-    let panic_line = reader_handle.join().ok().flatten();
-
+    let exit = child.wait_timeout(Duration::from_secs(timeout_secs))?;
+    let timed_out = exit.is_none();
     let status = match exit {
         Some(s) => s,
         None => {
             child.kill()?;
-            child.wait()?;
-            if let Some(p) = panic_line {
-                bail!("xtask boot-smoke: panic before clean exit — '{}'", p);
-            }
-            bail!(
-                "xtask boot-smoke: kernel did not call exit_kernel within {}s — possible hang in real init flow",
-                secs
-            );
+            child.wait()?
         }
     };
+    let (panic_line, clean_exit_seen) = reader_handle
+        .join()
+        .map_err(|_| anyhow!("xtask {label}: serial-reader thread panicked"))?;
 
     if let Some(p) = panic_line {
-        bail!("xtask boot-smoke: kernel panic during boot — '{}'", p);
+        bail!("xtask {label}: kernel panic during boot — '{}'", p);
+    }
+    if timed_out {
+        bail!(
+            "xtask {label}: kernel did not call exit_kernel within {}s — possible boot hang",
+            timeout_secs
+        );
+    }
+    if !clean_exit_seen {
+        bail!("xtask {label}: QEMU exited without the kernel clean-exit marker");
     }
     // Clean-exit status is arch-dependent:
     //  * x86_64 uses `isa-debug-exit` (port I/O), which encodes
@@ -1825,19 +1843,19 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
     //  * aarch64 has no `isa-debug-exit`; the kernel shuts down via
     //    PSCI or semihosting `SYS_EXIT`, and QEMU exits naturally
     //    with status 0.
-    let expected = match args.arch {
+    let expected = match arch {
         Arch::X86_64 => Some(1),
         Arch::Aarch64 => Some(0),
     };
     if status.code() != expected {
         bail!(
-            "xtask boot-smoke: QEMU exited with non-success status {:?} (expected {:?} on {})",
+            "xtask {label}: QEMU exited with non-success status {:?} (expected {:?} on {})",
             status.code(),
             expected,
-            args.arch.triple(),
+            arch.triple(),
         );
     }
-    println!("xtask boot-smoke: kernel cleanly exited, no panic markers");
+    println!("xtask {label}: kernel cleanly exited, no panic markers");
     Ok(())
 }
 
@@ -6001,7 +6019,9 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
             args.arch.triple()
         );
     }
-    image_cmd(args)?;
+    let mut args = args.clone();
+    ensure_feature(&mut args.features, "boot-smoke");
+    image_cmd(&args)?;
 
     let root = workspace_root()?;
     let iso = root.join("target").join("narf-x86_64.iso");
@@ -6087,6 +6107,10 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
     cmd.arg("-serial").arg("stdio");
     cmd.arg("-display").arg(display);
     cmd.arg("-no-reboot");
+    cmd.arg("-device")
+        .arg("isa-debug-exit,iobase=0xf4,iosize=0x04");
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::inherit());
     // USB input — xHCI + boot-protocol keyboard + absolute-pointing
     // tablet. Q35's PS/2 IRQ delivery is flaky under non-default
     // CPU models (e.g. XTASK_CPU=EPYC-Rome doesn't reliably fire
@@ -6121,22 +6145,12 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
         iso.display()
     );
 
-    let mut child = cmd.spawn().context("failed to spawn qemu-system-x86_64")?;
-    let secs = std::env::var("XTASK_QEMU_TIMEOUT_SECS")
+    let child = cmd.spawn().context("failed to spawn qemu-system-x86_64")?;
+    let secs = std::env::var("XTASK_BOOT_SMOKE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(120);
-    match child.wait_timeout(Duration::from_secs(secs))? {
-        Some(status) => {
-            println!("xtask iso-boot: qemu exited with {status}");
-        }
-        None => {
-            child.kill()?;
-            child.wait()?;
-            bail!("xtask iso-boot: qemu timed out after {secs}s");
-        }
-    }
-    Ok(())
+    wait_for_boot_smoke(child, "uefi-smoke", secs, Arch::X86_64)
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
@@ -6173,6 +6187,9 @@ fn locate_limine() -> Option<PathBuf> {
 }
 
 fn ovmf_code_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("OVMF_CODE") {
+        return PathBuf::from(path);
+    }
     for cand in [
         // Arch (edk2-ovmf >= 202311). The 4m variant ships with the
         // newer x64 image; the legacy `OVMF_CODE.fd` was renamed.
@@ -6182,6 +6199,7 @@ fn ovmf_code_path() -> PathBuf {
         "/usr/share/edk2/x64/OVMF_CODE.fd",
         "/usr/share/ovmf/x64/OVMF.fd",
         "/usr/share/OVMF/OVMF_CODE.fd",
+        "/usr/share/edk2/OvmfX64/OVMF_CODE.fd",
     ] {
         let pb = PathBuf::from(cand);
         if pb.is_file() {

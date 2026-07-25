@@ -119,7 +119,7 @@ cargo xtask run-interactive --arch=x86_64 --cmd "oci_smoke" --expect "oci-smoke-
 # line over virtio-net (kernel TCP server path + blocking accept).
 cargo xtask net-smoke --arch=x86_64
 
-# Boot via Limine ISO + OVMF UEFI (closer to real-hardware boot path)
+# Boot via Limine ISO + OVMF UEFI and require a clean boot marker
 cargo xtask iso-boot --arch=x86_64 --release
 
 # Build the ISO without booting
@@ -245,7 +245,7 @@ reading list), and `research/summaries/` (distilled primary sources).
 
 | Arch | Status |
 |---|---|
-| **x86_64** | First-class. Limine multiboot2 boot path; UEFI + OVMF supported. |
+| **x86_64** | First-class. Limine multiboot2 path; UEFI removable-media boot is tested through OVMF with Secure Boot disabled. |
 | **aarch64** | First-class. Boots under `qemu-system-aarch64 -M virt`. Generic Timer + GICv3 + PSCI. |
 
 Real-hardware bring-up targets: AMD Zen2 Renoir (Vega8 / DCN 2.0) and

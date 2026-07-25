@@ -134,7 +134,9 @@ jobs:
             mtools \
             dosfstools \
             e2fsprogs \
-            ovmf
+            ovmf \
+            xorriso \
+            limine
 
       - name: Cache cargo registry + git
         uses: actions/cache@v4
@@ -154,6 +156,10 @@ jobs:
 
       - name: cargo xtask boot-smoke
         run: cargo xtask boot-smoke --arch=${{ matrix.arch }}
+
+      - name: cargo xtask iso-boot (OVMF UEFI)
+        if: matrix.arch == 'x86_64'
+        run: cargo xtask iso-boot --arch=x86_64
 
   musl-demo:
     name: musl-demo (x86_64)
