@@ -56,6 +56,16 @@ pub const DEFAULT_USER_STACK_TOP: u64 = 0x0000_7FFF_FFFE_0000;
 /// Stage-4 refinement will let the loader pick per-process.
 pub const DEFAULT_USER_STACK_BASE: u64 = DEFAULT_USER_STACK_TOP - DEFAULT_USER_STACK_RESERVED;
 
+#[derive(Clone, Debug)]
+pub struct LoadedMapping {
+    pub addr: u64,
+    pub len: u64,
+    pub pgoff: u64,
+    pub prot: u32,
+    /// `None` identifies the main program; exec owns its resolved path.
+    pub filename: Option<alloc::string::String>,
+}
+
 /// Everything the kernel holds about a loaded-but-not-yet-running
 /// user process.
 #[derive(Debug)]
@@ -80,6 +90,8 @@ pub struct UserProcess {
     /// is in the trap frame's RDI at first iretq (= 0 for fresh
     /// tasks), preserving the historical no-arg behaviour.
     pub entry_arg: Option<u64>,
+    /// Exact PT_LOAD and stack VMAs committed by the loader.
+    pub loaded_mappings: alloc::vec::Vec<LoadedMapping>,
 }
 
 /// Errors from `load_user_process`.
@@ -190,6 +202,35 @@ pub unsafe fn load_user_process_with(
         crate::ExecKind::Elf64Dyn => PROGRAM_DYN_BASE,
         _ => 0,
     };
+    let segment_mapping =
+        |seg: &crate::Segment, bias: u64, filename: Option<alloc::string::String>| {
+            let vaddr = seg.vaddr.wrapping_add(bias);
+            let mut prot = 0;
+            if seg.flags.contains(crate::SegmentFlags::READ) {
+                prot |= 1;
+            }
+            if seg.flags.contains(crate::SegmentFlags::WRITE) {
+                prot |= 2;
+            }
+            if seg.flags.contains(crate::SegmentFlags::EXEC) {
+                prot |= 4;
+            }
+            LoadedMapping {
+                addr: vaddr & !0xfff,
+                len: ((vaddr & 0xfff)
+                    .saturating_add(seg.mem_size)
+                    .saturating_add(0xfff))
+                    & !0xfff,
+                pgoff: seg.file_off & !0xfff,
+                prot,
+                filename,
+            }
+        };
+    let mut loaded_mappings: alloc::vec::Vec<LoadedMapping> = image
+        .segments
+        .iter()
+        .map(|seg| segment_mapping(seg, program_bias, None))
+        .collect();
     // Static-PIE binaries (no interpreter, but PT_DYNAMIC is present)
     // use rcrt1.o from musl to self-relocate using AT_PHDR. The kernel
     // must NOT apply relocations itself, otherwise R_X86_64_RELATIVE
@@ -245,6 +286,9 @@ pub unsafe fn load_user_process_with(
             // typically an ET_DYN object with its own .rela.dyn that
             // needs the INTERP_BIAS applied as the load offset.
             let interp_image = crate::parse_elf(interp_bytes).map_err(LoadBytesError::Elf)?;
+            loaded_mappings.extend(interp_image.segments.iter().map(|seg| {
+                segment_mapping(seg, INTERP_BIAS, Some(alloc::string::String::from(name)))
+            }));
             if !interp_image.dynamic.is_empty() {
                 // SAFETY: the interp's segments were just mapped + materialized
                 // at INTERP_BIAS above, so its PT_DYNAMIC relocation sites are
@@ -321,6 +365,17 @@ pub unsafe fn load_user_process_with(
             phys: stack_phys_list,
         })
         .map_err(|_| ProcessLoadError::StackMapFailed)?;
+    loaded_mappings.push(LoadedMapping {
+        addr: DEFAULT_USER_STACK_BASE,
+        len: DEFAULT_USER_STACK_RESERVED,
+        pgoff: 0,
+        prot: if stack_perms.contains(RegionPerms::EXEC) {
+            7
+        } else {
+            3
+        },
+        filename: Some(alloc::string::String::from("[stack]")),
+    });
 
     // Stack guard: a single STACK_GUARD region one page BELOW
     // the stack base. Carries no POSIX prot bits so materialize()
@@ -552,6 +607,7 @@ pub unsafe fn load_user_process_with(
         stack_top: VirtAddr::new(rsp),
         fs_base,
         entry_arg: None,
+        loaded_mappings,
     })
 }
 

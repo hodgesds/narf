@@ -619,9 +619,32 @@ struct PerfMapping<'a> {
 ///
 /// Events are owned by the monitoring process but keyed by the target task,
 /// matching the way the upstream perf CLI opens events for its stopped child.
-pub(crate) fn on_exec(task: u64) {
+pub(crate) fn on_exec(task: u64, mappings: &[crate::process::LoadedMapping], program_path: &str) {
     let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
     let comm = crate::handlers::proc_comm_of(task);
+    let resolved: Vec<(&crate::process::LoadedMapping, &str, u64)> = mappings
+        .iter()
+        .map(|mapping| {
+            let filename = mapping.filename.as_deref().unwrap_or(program_path);
+            let ino = if filename.starts_with('[') {
+                0
+            } else {
+                let path = crate::handlers::apply_chroot(filename);
+                narf_filesystem::registry()
+                    .resolve_absolute(&path, |fs, rel| {
+                        crate::handlers::poll_blocking(narf_filesystem::resolve_async(
+                            fs.root(),
+                            rel,
+                        ))
+                    })
+                    .and_then(|result| result)
+                    .and_then(Result::ok)
+                    .map(|ops| ops.ino())
+                    .unwrap_or(0)
+            };
+            (mapping, filename, ino)
+        })
+        .collect();
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| {
         let Some(event) = weak.upgrade() else {
@@ -632,6 +655,22 @@ pub(crate) fn on_exec(task: u64) {
             && event._group_leader.is_none()
         {
             let _ = event.for_group(PERF_IOC_FLAG_GROUP, PerfEventFile::enable);
+        }
+        if event.target_task == task {
+            for (loaded, filename, ino) in &resolved {
+                let mapping = PerfMapping {
+                    pid: pid as u32,
+                    tid: task as u32,
+                    addr: loaded.addr,
+                    len: loaded.len,
+                    pgoff: loaded.pgoff,
+                    ino: *ino,
+                    prot: loaded.prot,
+                    flags: 2, // loader VMAs are MAP_PRIVATE
+                    filename,
+                };
+                let _ = event.mmap_record(&mapping);
+            }
         }
         if event.target_task == task && event.attr.flags & PERF_ATTR_FLAG_COMM != 0 {
             if let Some(comm) = comm.as_deref() {

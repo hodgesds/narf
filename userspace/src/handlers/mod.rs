@@ -4943,6 +4943,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
             }
         },
         entry_arg: None,
+        loaded_mappings: alloc::vec::Vec::new(),
     };
     let _ = DEFAULT_USER_STACK_BYTES;
 
@@ -8831,7 +8832,7 @@ fn do_execve_resolved(
     // Commit perf enable_on_exec and PERF_RECORD_COMM only after both the new
     // image and its Linux comm name have been published.
     #[cfg(feature = "linux-compat")]
-    crate::perf_event::on_exec(task);
+    crate::perf_event::on_exec(task, &new_proc.loaded_mappings, &cur_path);
     // /proc/[pid]/exe: `cur_path` survived the shebang loop, so it names
     // the binary actually being mapped (the interpreter for scripts).
     set_proc_exe(task, &cur_path);

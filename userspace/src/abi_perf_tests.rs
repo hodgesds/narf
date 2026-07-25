@@ -435,7 +435,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         if exec_before[0] != 0 || exec_before[1] != 0 {
             return Err("enable_on_exec event started before exec");
         }
-        crate::perf_event::on_exec(crate::handlers::current_task_id());
+        crate::perf_event::on_exec(crate::handlers::current_task_id(), &[], "/test");
         let mut exec_after = [0u64; 4];
         let _ = call(
             Syscall::Read.raw(),

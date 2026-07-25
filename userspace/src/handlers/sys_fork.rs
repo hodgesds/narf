@@ -164,6 +164,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
             None
         },
         entry_arg: None,
+        loaded_mappings: alloc::vec::Vec::new(),
     };
 
     let child_tid = match child_state {

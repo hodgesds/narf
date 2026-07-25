@@ -187,7 +187,11 @@ carry the fd's recorded path and stable filesystem inode; anonymous mappings
 are named `//anon`. MMAP2 reports the actual single NARF VFS device namespace
 as 0:0 and generation zero because the VFS does not yet version inode
 identities. Request-only controls such as `MAP_FIXED` are not leaked as VMA
-flags. Initial ELF-loader mappings still require a separate exec-image walk.
+flags. The ELF loader retains the exact committed PT_LOAD address, rounded
+length, file offset, protection, and PIE/interpreter bias until the shared
+exec commit emits initial program and interpreter records. The committed
+main-stack VMA is emitted as `[stack]`; guard and kernel-private TLS mappings
+are not exposed.
 Unsupported sample layouts and platforms without a routed PMU overflow IRQ
 fail explicitly; aarch64 sampling remains `EOPNOTSUPP` until PMUv3 overflow
 is wired through GICv3.

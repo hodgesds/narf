@@ -3876,6 +3876,26 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
     if proc.address_space.region_count() != expected_regions {
         return TestResult::Fail("unexpected region count after PT_INTERP load");
     }
+    if proc.loaded_mappings.len() != 4 {
+        return TestResult::Fail("loader did not retain every perf-visible VMA");
+    }
+    let code = &proc.loaded_mappings[0];
+    let data = &proc.loaded_mappings[1];
+    let interp = &proc.loaded_mappings[2];
+    let stack = &proc.loaded_mappings[3];
+    if (code.addr, code.len, code.pgoff, code.prot, &code.filename)
+        != (PROG_CODE_VA, 0x1000, 0x1000, 5, &None)
+        || (data.addr, data.len, data.pgoff, data.prot, &data.filename)
+            != (PROG_DATA_VA, 0x1000, 0x2000, 3, &None)
+        || (interp.addr, interp.len, interp.pgoff, interp.prot)
+            != (INTERP_CODE_VA + INTERP_BIAS, 0x1000, 0x1000, 5)
+        || interp.filename.as_deref() != Some("ld-narf")
+        || stack.addr != crate::process::DEFAULT_USER_STACK_BASE
+        || stack.len != crate::process::DEFAULT_USER_STACK_RESERVED
+        || stack.filename.as_deref() != Some("[stack]")
+    {
+        return TestResult::Fail("retained loader VMA metadata is not exact");
+    }
 
     // Both program and interpreter pages must be materialised.
     // SAFETY: `proc.address_space.root` is the live loader-built root, identity-
