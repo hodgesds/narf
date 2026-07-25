@@ -737,11 +737,7 @@ fn smoke_abi_path_link_pos() -> TestResult {
     with_memfs("/p", "p", &[("old", b"hi")], || {
         let old = b"/p/old\0";
         let new = b"/p/new\0";
-        if call(
-            Syscall::Link.raw(),
-            a1(old.as_ptr() as u64, new.as_ptr() as u64),
-        ) != Some(0)
-        {
+        if call_link(old.as_ptr() as u64, new.as_ptr() as u64) != Some(0) {
             return Err("link(old, new) should return 0");
         }
         // The new name must open and read the SAME bytes — the alias
@@ -768,30 +764,18 @@ fn smoke_abi_path_link_neg() -> TestResult {
         let missing = b"/p/ghost\0";
         let new = b"/p/n1\0";
         // Missing source → -ENOENT.
-        if call(
-            Syscall::Link.raw(),
-            a1(missing.as_ptr() as u64, new.as_ptr() as u64),
-        ) != Some(-2)
-        {
+        if call_link(missing.as_ptr() as u64, new.as_ptr() as u64) != Some(-2) {
             return Err("link(missing, ..) should return -ENOENT");
         }
         // Existing destination → -EEXIST (link never replaces).
         let old = b"/p/old\0";
         let taken = b"/p/taken\0";
-        if call(
-            Syscall::Link.raw(),
-            a1(old.as_ptr() as u64, taken.as_ptr() as u64),
-        ) != Some(-17)
-        {
+        if call_link(old.as_ptr() as u64, taken.as_ptr() as u64) != Some(-17) {
             return Err("link(.., existing) should return -EEXIST");
         }
         // Cross-directory → -EXDEV (same-parent restriction, like rename).
         let elsewhere = b"/q/new\0";
-        if call(
-            Syscall::Link.raw(),
-            a1(old.as_ptr() as u64, elsewhere.as_ptr() as u64),
-        ) != Some(-18)
-        {
+        if call_link(old.as_ptr() as u64, elsewhere.as_ptr() as u64) != Some(-18) {
             return Err("cross-directory link should return -EXDEV");
         }
         Ok(())

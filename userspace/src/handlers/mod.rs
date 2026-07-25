@@ -2657,12 +2657,12 @@ fn user_page_present(as_ref: &AddressSpace, uaddr: u64) -> bool {
     unsafe { narf_memory::x86_64::paging::translate(as_ref.root, VirtAddr::new(uaddr)).is_some() }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
 fn user_page_present(as_ref: &AddressSpace, uaddr: u64) -> bool {
-    // aarch64 `paging::translate` isn't wired at this tier (same story as
-    // the loader's `user_vaddr_to_kernel_ptr`); userspace is a stub on
-    // aarch64 regardless, so fall back to region membership.
-    as_ref.lookup(VirtAddr::new(uaddr)).is_some()
+    // SAFETY: same invariant as the x86_64 walk above. The aarch64 walker
+    // follows valid table descriptors from the live TTBR0 root and returns
+    // None for lazy/PROT_NONE regions with no leaf descriptor.
+    unsafe { narf_memory::aarch64::paging::translate(as_ref.root, VirtAddr::new(uaddr)).is_some() }
 }
 
 /// Exit-time robust-futex walk (Linux `exit_robust_list`). Runs in the

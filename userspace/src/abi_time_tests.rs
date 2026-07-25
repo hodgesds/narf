@@ -759,6 +759,7 @@ kernel_test_in!("syscall_abi", smoke_abi_time_settimeofday_null);
 // ── time(time_t*) ────────────────────────────────────────────────────────
 // Returns seconds; if arg0 non-null, also stores there.
 
+#[cfg(target_arch = "x86_64")]
 fn smoke_abi_time_time_pos() -> TestResult {
     with_setup(|| {
         let mut time_buf = [0i64; 1];
@@ -775,8 +776,10 @@ fn smoke_abi_time_time_pos() -> TestResult {
         Ok(())
     })
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_time_time_pos);
 
+#[cfg(target_arch = "x86_64")]
 fn smoke_abi_time_time_null() -> TestResult {
     with_setup(|| {
         // NULL pointer is allowed; just return seconds.
@@ -787,6 +790,7 @@ fn smoke_abi_time_time_null() -> TestResult {
         Ok(())
     })
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_time_time_null);
 
 // ── ioprio_set / ioprio_get ──────────────────────────────────────────────

@@ -747,12 +747,7 @@ fn smoke_abi_async_inotify_fire_create() -> TestResult {
         let (ifd, wd) = watch(b"/ino\0", IN_CREATE)?;
         // open(O_CREAT) a new child → the notify_create hook fires.
         let path = b"/ino/newf\0";
-        if call(
-            Syscall::OpenFile.raw(),
-            a1(path.as_ptr() as u64, O_CREAT | O_WRONLY),
-        )
-        .is_none()
-        {
+        if call_open(path.as_ptr() as u64, O_CREAT | O_WRONLY).is_none() {
             return Err("create open failed");
         }
         let evs = read_events(ifd);
@@ -770,7 +765,7 @@ fn smoke_abi_async_inotify_fire_modify() -> TestResult {
         let (ifd, wd) = watch(b"/ino/f\0", IN_MODIFY)?;
         // Open the file for writing and write → notify_modify_fd fires.
         let path = b"/ino/f\0";
-        let fd = match call(Syscall::OpenFile.raw(), a1(path.as_ptr() as u64, O_WRONLY)) {
+        let fd = match call_open(path.as_ptr() as u64, O_WRONLY) {
             Some(fd) if fd >= 0 => fd as u64,
             _ => return Err("open for write failed"),
         };
@@ -792,7 +787,7 @@ fn smoke_abi_async_inotify_fire_delete() -> TestResult {
     with_memfs("/ino", "ino", &[("gone", b"x")], || {
         let (ifd, wd) = watch(b"/ino\0", IN_DELETE)?;
         let path = b"/ino/gone\0";
-        if call(Syscall::Unlink.raw(), a0(path.as_ptr() as u64)).unwrap_or(-1) < 0 {
+        if call_unlink(path.as_ptr() as u64).unwrap_or(-1) < 0 {
             return Err("unlink failed");
         }
         let evs = read_events(ifd);
@@ -811,13 +806,7 @@ fn smoke_abi_async_inotify_fire_rename() -> TestResult {
         let (ifd, wd) = watch(b"/ino\0", IN_MOVED_FROM | IN_MOVED_TO)?;
         let old = b"/ino/old\0";
         let new = b"/ino/new\0";
-        if call(
-            Syscall::Rename.raw(),
-            a1(old.as_ptr() as u64, new.as_ptr() as u64),
-        )
-        .unwrap_or(-1)
-            < 0
-        {
+        if call_rename(old.as_ptr() as u64, new.as_ptr() as u64).unwrap_or(-1) < 0 {
             return Err("rename failed");
         }
         let evs = read_events(ifd);
@@ -855,12 +844,7 @@ fn smoke_abi_async_inotify_poll_readiness() -> TestResult {
         }
         // Queue an event, then poll must report 1 ready with POLLIN set.
         let path = b"/ino/x\0";
-        if call(
-            Syscall::OpenFile.raw(),
-            a1(path.as_ptr() as u64, O_CREAT | O_WRONLY),
-        )
-        .is_none()
-        {
+        if call_open(path.as_ptr() as u64, O_CREAT | O_WRONLY).is_none() {
             return Err("create open failed");
         }
         pfd[6..8].copy_from_slice(&0u16.to_ne_bytes()); // clear revents

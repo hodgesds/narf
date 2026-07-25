@@ -477,6 +477,26 @@ pub fn call_unlink(path_ptr: u64) -> Option<i64> {
     }
 }
 
+pub fn call_link(old_ptr: u64, new_ptr: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Link.raw(), a1(old_ptr, new_ptr))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Linkat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c,
+                arg1: old_ptr,
+                arg2: 0xffffffffffffff9c,
+                arg3: new_ptr,
+                ..Default::default()
+            },
+        )
+    }
+}
+
 pub fn call_rename(old_ptr: u64, new_ptr: u64) -> Option<i64> {
     #[cfg(target_arch = "x86_64")]
     {
