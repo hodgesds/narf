@@ -5712,8 +5712,8 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     let limine_dir = locate_limine().ok_or_else(|| {
         anyhow!(
             "Limine support files not found. Install via `pacman -S limine` \
-             (Arch) or `apt install limine` (Debian/Ubuntu), or set \
-             $LIMINE_PATH to a directory containing BOOTX64.EFI + \
+             (Arch), fetch an upstream Limine binary release, or set \
+             $LIMINE_PATH to its directory containing BOOTX64.EFI + \
              limine-bios.sys + limine-bios-cd.bin."
         )
     })?;

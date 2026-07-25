@@ -97,9 +97,11 @@ jobs:
       - run: |
           sudo apt-get update
           sudo apt-get install -y \
-            xorriso limine ovmf qemu-efi-aarch64 \
+            xorriso ovmf qemu-efi-aarch64 \
             qemu-system-x86 qemu-system-arm \
             cpio mtools dosfstools e2fsprogs
+      - name: Install Limine
+        uses: ./.github/actions/setup-limine
       - run: rustup component add rust-src llvm-tools-preview
       # Exercise the removable-media path through OVMF first. This
       # verification build has boot-smoke enabled and must emit its

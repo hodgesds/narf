@@ -148,8 +148,10 @@ jobs:
             e2fsprogs \
             ovmf \
             qemu-efi-aarch64 \
-            xorriso \
-            limine
+            xorriso
+
+      - name: Install Limine
+        uses: ./.github/actions/setup-limine
 
       - name: Cache cargo registry + git
         uses: actions/cache@v4
