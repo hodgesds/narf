@@ -207,6 +207,10 @@ status, timeout, and flow ID from the canonical conntrack table. Dumps end
 with `NLMSG_DONE`. Mutations and unsupported nfnetlink subsystems return
 `EOPNOTSUPP`; Linux netlink does not grant ambient filter/NAT authority.
 
+`NETLINK_AUDIT` reports a disabled zeroed `audit_status` for `AUDIT_GET` and
+an empty completed `AUDIT_LIST_RULES` dump. `AUDIT_SET` returns `EPERM`
+because Linux uid and capability bits do not confer NARF audit authority.
+
 AF_NETLINK sockets retain their bound `sockaddr_nl` port ID and group mask,
 support a connected kernel or userspace destination, auto-bind before the
 first send, and expose Linux `SOL_NETLINK` membership and feature-option

@@ -2188,11 +2188,9 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_uevent_recv);
 
-// systemd PID 1's audit setup opens `socket(AF_NETLINK, SOCK_RAW, 9)`. NARF
-// does not model audit/generic/netfilter netlink, but MUST still hand back a
-// usable fd whose bind/send no-op succeed — a socket-open failure surfaced to
-// glibc as the -1 sentinel (errno EPERM) → "Failed to open netlink, ignoring:
-// Operation not permitted". These smokes pin the no-op sink behaviour.
+// systemd PID 1's audit setup opens `socket(AF_NETLINK, SOCK_RAW, 9)`.
+// Status queries return a disabled audit_status; configuration remains denied
+// without native NARF authority.
 const NETLINK_AUDIT: u64 = 9;
 const NETLINK_SOCK_DIAG: u64 = 4;
 const NETLINK_NETFILTER: u64 = 12;
@@ -2213,17 +2211,15 @@ fn smoke_abi_netlink_audit_socket_open_bind_send() -> TestResult {
         {
             return Err("bind(NETLINK_AUDIT) did not return 0");
         }
-        // A best-effort audit message send is accepted (and dropped): the
-        // return echoes the byte count, matching a quiet-but-open socket.
-        let msg = nlmsg_request(0, 1);
+        const AUDIT_GET: u16 = 1000;
+        let msg = nlmsg_request(AUDIT_GET, 1);
         if netlink_send(fd, &msg).ok_or("send status")? != msg.len() as i64 {
             return Err("send(NETLINK_AUDIT) did not accept the message");
         }
-        // recv on the empty sink is non-blocking EAGAIN (no reply queued).
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 80];
         let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
-        if n > 0 {
-            return Err("NETLINK_AUDIT sink unexpectedly returned data");
+        if n < 60 || nlmsg_type_of(&buf) != AUDIT_GET {
+            return Err("NETLINK_AUDIT did not return audit_status");
         }
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())

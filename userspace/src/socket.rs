@@ -604,13 +604,14 @@ enum SocketState {
     /// `recv` dequeues one message per call (the kernel dumps stream over
     /// netlink as one datagram per message, terminated by NLMSG_DONE).
     NetlinkRoute { replies: VecDeque<Vec<u8>> },
-    /// `AF_NETLINK` for a protocol NARF does not model (NETLINK_AUDIT,
-    /// NETLINK_GENERIC, NETLINK_NETFILTER, …). A coherent no-op sink: `bind`,
+    /// `AF_NETLINK` for a protocol NARF does not model. A coherent no-op sink: `bind`,
     /// `connect`, and `send` succeed (messages are dropped — audit/netfilter
     /// are disabled), `recv` reports empty (WouldBlock). This lets
     /// best-effort openers (systemd PID 1's audit setup) get a usable fd and
     /// proceed instead of failing the socket open with EPERM.
     NetlinkSink,
+    /// `NETLINK_AUDIT` status and rule-enumeration response queue.
+    NetlinkAudit { replies: VecDeque<Vec<u8>> },
     /// `NETLINK_GENERIC` control-family socket. Requests to `nlctrl` queue
     /// generic-netlink family discovery replies here.
     NetlinkGeneric { replies: VecDeque<Vec<u8>> },
@@ -682,6 +683,10 @@ impl SocketFile {
             }
         } else if domain == AF_NETLINK && protocol == NETLINK_NETFILTER {
             SocketState::NetlinkNetfilter {
+                replies: VecDeque::new(),
+            }
+        } else if domain == AF_NETLINK && protocol == NETLINK_AUDIT {
+            SocketState::NetlinkAudit {
                 replies: VecDeque::new(),
             }
         } else if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
@@ -1521,6 +1526,13 @@ impl FileOps for SocketFile {
                 }
                 bits
             }
+            SocketState::NetlinkAudit { replies } => {
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !replies.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
             // No-op sink (audit/netfilter/etc.): always writable (sends are
             // accepted + dropped), never readable (nothing is ever queued).
             SocketState::NetlinkSink => narf_filesystem::POLL_OUT,
@@ -1554,9 +1566,8 @@ impl SocketFile {
             SocketState::NetlinkRoute { replies }
             | SocketState::NetlinkGeneric { replies }
             | SocketState::NetlinkSockDiag { replies }
-            | SocketState::NetlinkNetfilter { replies } => {
-                replies.front().map(Vec::len).unwrap_or(0)
-            }
+            | SocketState::NetlinkNetfilter { replies }
+            | SocketState::NetlinkAudit { replies } => replies.front().map(Vec::len).unwrap_or(0),
             SocketState::NetlinkUevent { reader } => reader
                 .peek(1)
                 .into_iter()
@@ -1653,6 +1664,7 @@ impl SocketFile {
             (AF_NETLINK, _) if self.protocol == NETLINK_NETFILTER => {
                 self.dispatch_netlink_netfilter(op)
             }
+            (AF_NETLINK, _) if self.protocol == NETLINK_AUDIT => self.dispatch_netlink_audit(op),
             (AF_NETLINK, _) if self.protocol != NETLINK_KOBJECT_UEVENT => {
                 self.dispatch_netlink_sink(op)
             }
@@ -1907,6 +1919,65 @@ impl SocketFile {
                     let mut state = self.state.lock();
                     match &mut *state {
                         SocketState::NetlinkNetfilter { replies } => {
+                            if flags & MSG_PEEK != 0 {
+                                replies.front().cloned()
+                            } else {
+                                replies.pop_front()
+                            }
+                        }
+                        _ => return SocketOpResult::Err(SockError::InvalidArg),
+                    }
+                };
+                match message {
+                    Some(message) => {
+                        let n = buf.len().min(message.len());
+                        buf[..n].copy_from_slice(&message[..n]);
+                        let peer = Some(Self::netlink_sockaddr(0, 0));
+                        if n < message.len() {
+                            SocketOpResult::ReceivedTruncated {
+                                copied: n,
+                                full_len: message.len(),
+                                peer,
+                            }
+                        } else {
+                            SocketOpResult::Received { n, peer }
+                        }
+                    }
+                    None => SocketOpResult::Err(SockError::WouldBlock),
+                }
+            }
+            SocketOp::Shutdown { how: _ } => SocketOpResult::Ok(0),
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    fn dispatch_netlink_audit(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        match op {
+            SocketOp::Bind { addr } => self.bind_netlink(&addr),
+            SocketOp::Connect { addr } => self.connect_netlink(&addr),
+            SocketOp::Send { buf, addr, .. } => {
+                if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
+                    return result;
+                }
+                self.ensure_netlink_portid();
+                let replies = match narf_net::netlink_audit::build_replies(buf) {
+                    Ok(replies) => replies,
+                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                let mut state = self.state.lock();
+                match &mut *state {
+                    SocketState::NetlinkAudit { replies: queue } => queue.extend(replies),
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
+                }
+                drop(state);
+                narf_net::readiness::notify(0);
+                SocketOpResult::Ok(buf.len() as u64)
+            }
+            SocketOp::Recv { buf, flags } => {
+                let message = {
+                    let mut state = self.state.lock();
+                    match &mut *state {
+                        SocketState::NetlinkAudit { replies } => {
                             if flags & MSG_PEEK != 0 {
                                 replies.front().cloned()
                             } else {
