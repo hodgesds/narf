@@ -39,7 +39,7 @@ macro_rules! pmu_write {
             compiler_fence(Ordering::SeqCst);
             // SAFETY: caller establishes EL1 + PMUv3 presence.
             unsafe {
-                asm!(concat!("msr ", $reg, ", {value}"), value = in(reg) value,
+                asm!(concat!("msr ", $reg, ", {value}"), "isb", value = in(reg) value,
                     options(nostack, preserves_flags));
             }
             compiler_fence(Ordering::SeqCst);
@@ -51,6 +51,8 @@ pmu_read!(read_id_aa64dfr0_el1, "id_aa64dfr0_el1");
 pmu_read!(read_pmcr_el0, "pmcr_el0");
 pmu_read!(read_pmccntr_el0, "pmccntr_el0");
 pmu_read!(read_pmovsclr_el0, "pmovsclr_el0");
+pmu_read!(read_pmcntenset_el0, "pmcntenset_el0");
+pmu_read!(read_pmintenset_el1, "pmintenset_el1");
 pmu_write!(write_pmcr_el0, "pmcr_el0");
 pmu_write!(write_pmccntr_el0, "pmccntr_el0");
 pmu_write!(write_pmccfiltr_el0, "pmccfiltr_el0");

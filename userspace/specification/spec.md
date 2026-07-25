@@ -192,11 +192,12 @@ On x86_64, `PERF_EVENT_IOC_PERIOD` synchronously validates and installs a new
 nonzero hardware sampling period while the event is disabled. Updating a live
 or remotely active event returns an error until a synchronous cross-CPU PMU
 control path exists; NARF does not defer the update and report false success.
-The aarch64 PMUv3 HAL provides architectural cycle-counter preload, overflow
-acknowledgement, and reload primitives, but `perf_event_open` continues to
-return an error for hardware events until the firmware-routed PPI produces a
-verified mmap sample. Frequency mode and programmable PMUv3 events likewise
-remain errors.
+On aarch64, fixed-period `PERF_COUNT_HW_CPU_CYCLES` sampling uses the
+architectural 64-bit cycle counter, a firmware-discovered level-sensitive
+PMUv3 PPI, and the same deferred mmap-ring producer. The end-to-end QEMU gate
+requires a real PMCCNTR overflow, GICv3 dispatch, PMOVS acknowledgement, and
+visible mmap sample. Frequency mode, programmable PMUv3 events, and live
+period updates remain explicit errors.
 Successful `mmap(2)` commits emit `PERF_RECORD_MMAP` or `MMAP2` for executable
 and/or data VMAs selected by `mmap`, `mmap2`, and `mmap_data`. File mappings
 carry the fd's recorded path and stable filesystem inode; anonymous mappings
@@ -209,8 +210,7 @@ exec commit emits initial program and interpreter records. The committed
 main-stack VMA is emitted as `[stack]`; guard and kernel-private TLS mappings
 are not exposed.
 Unsupported sample layouts and platforms without a routed PMU overflow IRQ
-fail explicitly; aarch64 sampling remains `EOPNOTSUPP` until PMUv3 overflow
-is wired through GICv3.
+fail explicitly.
 
 Task-scoped x86_64 hardware events are scheduler-attributed: a switch hook
 allocates and programs a counter in the destination CPU's PMU bank immediately

@@ -335,16 +335,6 @@ impl PerfEventFile {
             }
         }
         #[cfg(target_arch = "aarch64")]
-        {
-            let cpu = narf_lib::percpu::current_cpu();
-            if let Some(counter) = self.active_task_counters.lock()[cpu].take() {
-                let _ = unsafe { narf_arch::aarch64::pmu::release(counter) };
-            }
-            if let Some(counter) = self.pmu_counter {
-                let _ = unsafe { narf_arch::aarch64::pmu::release(counter) };
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
         if let Some(counter) = self.pmu_counter {
             return unsafe { narf_arch::aarch64::pmu::read(&counter) }.unwrap_or(0);
         }
@@ -1367,6 +1357,19 @@ impl Drop for PerfEventFile {
                 narf_arch::x86_64::pmu::release(counter);
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let cpu = narf_lib::percpu::current_cpu();
+            if let Some(counter) = self.active_task_counters.lock()[cpu].take() {
+                // SAFETY: a task can close its own event only while executing
+                // on this CPU; no other CPU can simultaneously run that task.
+                let _ = unsafe { narf_arch::aarch64::pmu::release(counter) };
+            }
+            if let Some(counter) = self.pmu_counter {
+                // SAFETY: releasing the cycle counter allocated by this file.
+                let _ = unsafe { narf_arch::aarch64::pmu::release(counter) };
+            }
+        }
         if self.registered.load(Ordering::Acquire)
             && ACTIVE_PERF_EVENTS.fetch_sub(1, Ordering::Relaxed) == 1
         {
@@ -2109,6 +2112,8 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
                 | PERF_COUNT_HW_BRANCH_INSTRUCTIONS
                 | PERF_COUNT_HW_BRANCH_MISSES
         ),
+        #[cfg(target_arch = "aarch64")]
+        PERF_TYPE_HARDWARE => attr.config == PERF_COUNT_HW_CPU_CYCLES,
         // PERF_TYPE_SOFTWARE
         PERF_TYPE_SOFTWARE => attr.config == PERF_COUNT_SW_DUMMY,
         // PERF_TYPE_HW_CACHE (3)

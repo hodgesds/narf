@@ -137,25 +137,6 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 Some(EOPNOTSUPP) => {}
                 _ => return Err("aarch64 accepted an unimplemented raw PMU event"),
             }
-            let cycles_sample_attr = PerfEventAttr {
-                type_: 0,
-                config: 0,
-                sample_period_or_freq: 100_000,
-                sample_type: 1,
-                ..attr
-            };
-            match call(
-                Syscall::PerfEventOpen.raw(),
-                a3(
-                    &cycles_sample_attr as *const _ as u64,
-                    0,
-                    -1i32 as u64,
-                    -1i32 as u64,
-                ),
-            ) {
-                Some(EOPNOTSUPP) => {}
-                _ => return Err("aarch64 admitted cycles sampling before PPI delivery passed"),
-            }
         }
 
         let approximate_sw_attr = PerfEventAttr {
@@ -1025,3 +1006,95 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_perf_event_open_validation);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
+    with_setup(|| {
+        let attr = PerfEventAttr {
+            type_: 0,
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: 0,
+            sample_period_or_freq: 1_000,
+            sample_type: 1,
+            flags: 1,
+            ..PerfEventAttr::default()
+        };
+        let fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("PMUv3 cycles event was not admitted"),
+        };
+        let ops = crate::fd::with_table(FAKE_TASK, |table| {
+            table.get(fd).map(|entry| entry.ops.clone())
+        })
+        .flatten()
+        .ok_or("PMUv3 fd missing")?;
+        let frames = ops
+            .mmap_frames(0, 3 * 4096)
+            .map_err(|_| "PMUv3 mmap failed")?;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+        ) != Some(0)
+        {
+            return Err("PMUv3 enable failed");
+        }
+        if unsafe { narf_arch::aarch64::sysreg::read_pmcntenset_el0() } & (1 << 31) == 0 {
+            return Err("PMUv3 cycle enable bit was not set by ioctl enable");
+        }
+        struct IrqMaskRestore(bool);
+        impl Drop for IrqMaskRestore {
+            fn drop(&mut self) {
+                if self.0 {
+                    // SAFETY: restore the kernel-test harness's masked entry
+                    // state after the real PPI delivery window.
+                    unsafe { narf_arch::disable_interrupts() };
+                }
+            }
+        }
+        let restore_mask = !narf_arch::interrupts_enabled();
+        if restore_mask {
+            // SAFETY: the PMUv3 overflow PPI is configured and armed above;
+            // this opens a real IRQ-delivery window for the synchronous
+            // kernel-test harness, which normally runs with DAIF.I set.
+            unsafe { narf_arch::enable_interrupts() };
+        }
+        let _irq_mask_restore = IrqMaskRestore(restore_mask);
+        for _ in 0..200 {
+            for _ in 0..10_000 {
+                core::hint::black_box(());
+            }
+            crate::perf_event::drain_irq_samples();
+            // SAFETY: ops owns this mapped metadata frame.
+            if unsafe { core::ptr::read_volatile((frames[0] as usize + 1024) as *const u64) } != 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                return Ok(());
+            }
+        }
+        if narf_interrupts::fire_count(23) != 0 {
+            return Err("PMUv3 PPI dispatched without a drained sample");
+        }
+        if unsafe { narf_arch::aarch64::sysreg::read_pmcntenset_el0() } & (1 << 31) == 0 {
+            return Err("PMUv3 cycle enable bit did not remain set");
+        }
+        if unsafe { narf_arch::aarch64::sysreg::read_pmintenset_el1() } & (1 << 31) == 0 {
+            return Err("PMUv3 interrupt enable bit did not remain set");
+        }
+        if unsafe { narf_arch::aarch64::sysreg::read_pmovsclr_el0() } & (1 << 31) != 0 {
+            return Err("PMUv3 overflow pending without PPI dispatch");
+        }
+        let raw = unsafe { narf_arch::aarch64::sysreg::read_pmccntr_el0() };
+        let preload = 0u64.wrapping_sub(1_000);
+        if raw == preload {
+            return Err("PMUv3 cycle counter did not advance after enable");
+        }
+        if raw > preload {
+            return Err("PMUv3 cycle counter advanced but did not reach overflow");
+        }
+        Err("PMUv3 overflow produced no mmap sample")
+    })
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("syscall_abi", smoke_abi_perf_pmuv3_overflow_record);

@@ -36,6 +36,7 @@ const GICR_SGI_OFF: usize = 0x1_0000;
 const GICR_IGROUPR0_OFF: usize = GICR_SGI_OFF + 0x0080;
 const GICR_ISENABLER0_OFF: usize = GICR_SGI_OFF + 0x0100;
 const GICR_IPRIORITYR0_OFF: usize = GICR_SGI_OFF + 0x0400;
+const GICR_ICFGR1_OFF: usize = GICR_SGI_OFF + 0x0C04;
 static PMU_PPI: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Install the firmware-discovered PMU PPI and enable it on this CPU.
@@ -173,6 +174,12 @@ unsafe fn enable_private_irq(cpu_index: u32, intid: u32) {
     // SAFETY: caller executes for this CPU's live redistributor and intid was
     // validated as an SGI/PPI-bank interrupt.
     unsafe {
+        // PMUv3 overflow is a level-sensitive PPI. PPI trigger state is
+        // implementation-defined at reset, so explicitly clear the edge bit
+        // before enabling instead of relying on QEMU or firmware defaults.
+        let cfg_shift = (intid - 16) * 2;
+        let cfg = (gicr + GICR_ICFGR1_OFF) as *mut u32;
+        write_u32(cfg, read_u32(cfg) & !(0b10 << cfg_shift));
         let prio = (gicr + GICR_IPRIORITYR0_OFF + intid as usize) as *mut u8;
         core::ptr::write_volatile(prio, 0xA0);
         write_u32((gicr + GICR_ISENABLER0_OFF) as *mut u32, 1u32 << intid);
