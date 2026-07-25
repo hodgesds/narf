@@ -219,6 +219,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     return;
                 }
                 crate::mapped_file::register_current(base, len, ops);
+                #[cfg(feature = "linux-compat")]
                 crate::perf_event::on_mmap(current_task_id(), fd, base, len, offset, prot, flags);
                 ctx.set_return(SyscallReturn::ok(base));
                 return;
@@ -268,6 +269,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     // materialize installs only its PTEs over the registry
                     // frames.
                     if unsafe { as_ref.materialize() }.is_ok() {
+                        #[cfg(feature = "linux-compat")]
                         crate::perf_event::on_mmap(
                             current_task_id(),
                             -1,
@@ -401,6 +403,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    #[cfg(feature = "linux-compat")]
     crate::perf_event::on_mmap(
         current_task_id(),
         if anonymous { -1 } else { fd },

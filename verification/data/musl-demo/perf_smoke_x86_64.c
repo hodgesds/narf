@@ -62,10 +62,21 @@ int main() {
                        PERF_FORMAT_ID;
     attr.flags = 1; // disabled
 
-    long fd = perf_event_open(&attr, -1, 0, -1, 0);
+    // Exercise the scheduler-virtualized current-task backend. Per-CPU
+    // hardware events on an SMP guest intentionally return EOPNOTSUPP until
+    // NARF has synchronous remote-CPU PMU rendezvous support.
+    long fd = perf_event_open(&attr, 0, -1, -1, 0);
     if (fd < 0) {
-        printf("perf_smoke: ERROR - perf_event_open failed with %ld\n", fd);
-        return 1;
+        if (errno != EOPNOTSUPP) {
+            printf("perf_smoke: ERROR - perf_event_open failed with %ld errno %d\n",
+                   fd, errno);
+            return 1;
+        }
+        // The CI qemu64 CPU does not advertise a hardware PMU. Requiring a
+        // fabricated count here would defeat the backend contract: verify the
+        // honest error and continue with the architecture-independent ABI.
+        printf("perf_smoke: hardware PMU unavailable (EOPNOTSUPP)\n");
+        goto software_abi;
     }
 
     uint64_t id = 0;
@@ -106,6 +117,8 @@ int main() {
     printf("perf_smoke: cycles delta %llu\n", (unsigned long long)stat[0]);
     close(fd);
 
+software_abi:
+    ;
     // Exercise the event-group ABI with the exactly specified dummy event.
     struct perf_event_attr group_attr;
     memset(&group_attr, 0, sizeof(group_attr));

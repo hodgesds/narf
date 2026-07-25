@@ -235,6 +235,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // Inherit the parent's cgroup-namespace root (if any).
     #[cfg(all(feature = "cgroup", feature = "container"))]
     narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_pid.raw());
+    #[cfg(feature = "linux-compat")]
     crate::perf_event::on_fork(
         task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
         child_pid.raw(),

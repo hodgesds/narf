@@ -4048,6 +4048,7 @@ impl SyscallTable {
 
     pub fn dispatch_ctx_versioned(&self, variant: Syscall, version: u8, ctx: &mut dyn TrapContext) {
         narf_lib::perf::syscall();
+        #[cfg(feature = "linux-compat")]
         crate::perf_event::drain_irq_samples();
         if version != 0 {
             if let Some((_, _, handler)) = self

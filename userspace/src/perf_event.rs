@@ -68,9 +68,11 @@ impl AarchPmuEvent {
     unsafe fn allocate(self) -> Result<AarchCounter, narf_arch::aarch64::pmu::PmuError> {
         match self {
             Self::Cycle => {
+                // SAFETY: caller guarantees EL1 execution pinned to this CPU.
                 unsafe { narf_arch::aarch64::pmu::alloc_cycle_counter() }.map(AarchCounter::Cycle)
             }
             Self::Programmable(event) => {
+                // SAFETY: caller guarantees EL1 execution pinned to this CPU.
                 unsafe { narf_arch::aarch64::pmu::alloc_programmable(event) }
                     .map(AarchCounter::Programmable)
             }
@@ -89,7 +91,9 @@ impl AarchCounter {
 
     unsafe fn read(self) -> Result<u64, narf_arch::aarch64::pmu::PmuError> {
         match self {
+            // SAFETY: caller guarantees this counter remains live and current-CPU-owned.
             Self::Cycle(counter) => unsafe { narf_arch::aarch64::pmu::read(&counter) },
+            // SAFETY: caller guarantees this counter remains live and current-CPU-owned.
             Self::Programmable(counter) => unsafe {
                 narf_arch::aarch64::pmu::read_programmable(&counter)
             },
@@ -98,9 +102,11 @@ impl AarchCounter {
 
     unsafe fn arm(self, period: u64) -> Result<(), narf_arch::aarch64::pmu::PmuError> {
         match self {
+            // SAFETY: caller guarantees ownership and a routed current-CPU PMU PPI.
             Self::Cycle(counter) => unsafe {
                 narf_arch::aarch64::pmu::arm_sampling(&counter, period)
             },
+            // SAFETY: caller guarantees ownership and a routed current-CPU PMU PPI.
             Self::Programmable(counter) => unsafe {
                 narf_arch::aarch64::pmu::arm_programmable(&counter, period)
             },
@@ -109,7 +115,9 @@ impl AarchCounter {
 
     unsafe fn start(self) -> Result<(), narf_arch::aarch64::pmu::PmuError> {
         match self {
+            // SAFETY: caller guarantees this counter remains live and current-CPU-owned.
             Self::Cycle(counter) => unsafe { narf_arch::aarch64::pmu::start(&counter) },
+            // SAFETY: caller guarantees this counter remains live and current-CPU-owned.
             Self::Programmable(counter) => unsafe {
                 narf_arch::aarch64::pmu::start_programmable(&counter)
             },
@@ -118,7 +126,9 @@ impl AarchCounter {
 
     unsafe fn pause(self) -> Result<(), narf_arch::aarch64::pmu::PmuError> {
         match self {
+            // SAFETY: caller guarantees this counter remains live and current-CPU-owned.
             Self::Cycle(counter) => unsafe { narf_arch::aarch64::pmu::pause_sampling(&counter) },
+            // SAFETY: caller guarantees this counter remains live and current-CPU-owned.
             Self::Programmable(counter) => unsafe {
                 narf_arch::aarch64::pmu::pause_programmable(&counter)
             },
@@ -127,7 +137,9 @@ impl AarchCounter {
 
     unsafe fn release(self) -> Result<(), narf_arch::aarch64::pmu::PmuError> {
         match self {
+            // SAFETY: caller guarantees this counter remains live and current-CPU-owned.
             Self::Cycle(counter) => unsafe { narf_arch::aarch64::pmu::release(counter) },
+            // SAFETY: caller guarantees this counter remains live and current-CPU-owned.
             Self::Programmable(counter) => unsafe {
                 narf_arch::aarch64::pmu::release_programmable(counter)
             },
@@ -459,12 +471,14 @@ impl PerfEventFile {
         }
         #[cfg(target_arch = "aarch64")]
         if let Some(counter) = self.pmu_counter {
+            // SAFETY: this file owns the live current-CPU counter until Drop.
             return unsafe { counter.read() }.unwrap_or(0);
         }
         #[cfg(target_arch = "aarch64")]
         {
             let cpu = narf_lib::percpu::current_cpu();
             if let Some(counter) = self.active_task_counters.lock()[cpu] {
+                // SAFETY: scheduler switch-in allocated this counter on this CPU.
                 return unsafe { counter.read() }.unwrap_or(0);
             }
         }
@@ -547,26 +561,36 @@ impl PerfEventFile {
             if active[cpu].is_some() || !self.enabled.load(Ordering::Acquire) {
                 return;
             }
+            // SAFETY: scheduler invokes this hook on the current CPU at EL1.
             let Ok(counter) = (unsafe { self.pmu_event.unwrap().allocate() }) else {
                 return;
             };
             let period = self.sample_period.load(Ordering::Acquire);
             if period != 0 {
-                if ensure_pmi_route().is_err() || unsafe { counter.arm(period) }.is_err() {
+                let route_failed = ensure_pmi_route().is_err();
+                // SAFETY: freshly allocated current-CPU counter and routed PPI.
+                let arm_failed = unsafe { counter.arm(period) }.is_err();
+                if route_failed || arm_failed {
+                    // SAFETY: the fresh allocation is still owned on this CPU.
                     let _ = unsafe { counter.release() };
                     return;
                 }
                 ACTIVE_SAMPLE_IDS[cpu][counter.sample_slot()].store(self.id, Ordering::Release);
+            // SAFETY: freshly allocated current-CPU counter.
             } else if unsafe { counter.start() }.is_err() {
+                // SAFETY: the fresh allocation is still owned on this CPU.
                 let _ = unsafe { counter.release() };
                 return;
             }
             active[cpu] = Some(counter);
         } else if let Some(counter) = active[cpu].take() {
             ACTIVE_SAMPLE_IDS[cpu][counter.sample_slot()].store(0, Ordering::Release);
+            // SAFETY: switch-out runs on the CPU owning this active counter.
             let _ = unsafe { counter.pause() };
+            // SAFETY: the paused counter remains owned on this CPU.
             let value = unsafe { counter.read() }.unwrap_or(0);
             self.count_accumulated.fetch_add(value, Ordering::AcqRel);
+            // SAFETY: the paused counter remains owned on this CPU.
             let _ = unsafe { counter.release() };
         }
     }
@@ -599,8 +623,10 @@ impl PerfEventFile {
                 let period = self.sample_period.load(Ordering::Acquire);
                 if let Some(counter) = self.pmu_counter.as_ref() {
                     if period != 0 {
+                        // SAFETY: this per-CPU file owns the current-CPU counter.
                         let _ = unsafe { (*counter).arm(period) };
                     } else {
+                        // SAFETY: this per-CPU file owns the current-CPU counter.
                         let _ = unsafe { (*counter).start() };
                     }
                 }
@@ -631,6 +657,7 @@ impl PerfEventFile {
             }
             #[cfg(target_arch = "aarch64")]
             if let Some(counter) = self.pmu_counter.as_ref() {
+                // SAFETY: this per-CPU file owns the current-CPU counter.
                 let _ = unsafe { (*counter).pause() };
             }
             let raw = self.raw_count();
@@ -719,12 +746,16 @@ impl PerfEventFile {
         } else {
             // Disabled or switched-out task event: validate the real backend
             // synchronously with a temporary current-CPU allocation.
+            // SAFETY: ioctl executes at EL1 on the current CPU.
             let counter =
                 unsafe { self.pmu_event.unwrap().allocate() }.map_err(|_| FsError::Unsupported)?;
+            // SAFETY: freshly allocated current-CPU counter and routed PPI.
             let armed = unsafe { counter.arm(period) };
             if armed.is_ok() {
+                // SAFETY: same live current-CPU temporary counter.
                 let _ = unsafe { counter.pause() };
             }
+            // SAFETY: same live current-CPU temporary counter.
             let _ = unsafe { counter.release() };
             armed.map_err(|_| FsError::InvalidData)?;
         }
@@ -1359,7 +1390,9 @@ fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
 
 #[cfg(target_arch = "aarch64")]
 fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
+    // SAFETY: this handler is invoked by the firmware-routed current-CPU PMU PPI.
     let cycle = unsafe { narf_arch::aarch64::pmu::handle_sampling_overflow() };
+    // SAFETY: same current-CPU PMU interrupt context.
     let programmable = unsafe { narf_arch::aarch64::pmu::handle_programmable_overflows() };
     let mut counters = u8::from(cycle);
     for idx in 0..7 {
@@ -2171,6 +2204,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     #[cfg(target_arch = "aarch64")]
     let (pmu_event, pmu_counter) = if let Some(event) = aarch_pmu_event(&attr) {
         if pid != -1 {
+            // SAFETY: syscall runs at EL1 on the current CPU; probe is released below.
             let probe = match unsafe { event.allocate() } {
                 Ok(counter) => counter,
                 Err(narf_arch::aarch64::pmu::PmuError::NoFreeCounter) => {
@@ -2182,9 +2216,11 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
+            // SAFETY: probe remains live and current-CPU-owned.
             let _ = unsafe { probe.release() };
             (Some(event), None)
         } else {
+            // SAFETY: syscall runs at EL1 on the current CPU.
             match unsafe { event.allocate() } {
                 Ok(counter) => (Some(event), Some(counter)),
                 Err(narf_arch::aarch64::pmu::PmuError::NoFreeCounter) => {
@@ -2269,6 +2305,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let sample_period = if attr.sample_period_or_freq != 0 {
         if pmu_event.is_none() || ensure_pmi_route().is_err() {
             if let Some(counter) = pmu_counter {
+                // SAFETY: open still exclusively owns this current-CPU allocation.
                 let _ = unsafe { counter.release() };
             }
             ctx.set_return(SyscallReturn::ok((-95i64) as u64));
@@ -2278,6 +2315,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         let counter = if let Some(counter) = pmu_counter.as_ref() {
             counter
         } else {
+            // SAFETY: syscall runs at EL1 on the current CPU.
             validation = match unsafe { pmu_event.unwrap().allocate() } {
                 Ok(counter) => counter,
                 Err(_) => {
@@ -2300,15 +2338,20 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         } else {
             attr.sample_period_or_freq
         };
-        if counter.sample_slot() >= 8 || unsafe { (*counter).arm(period) }.is_err() {
+        // SAFETY: open owns this current-CPU counter and the PMU PPI is routed.
+        let arm_failed = unsafe { (*counter).arm(period) }.is_err();
+        if counter.sample_slot() >= 8 || arm_failed {
             if pmu_counter.is_none() {
+                // SAFETY: validation counter remains live and current-CPU-owned.
                 let _ = unsafe { (*counter).release() };
             }
             ctx.set_return(SyscallReturn::ok((-95i64) as u64));
             return;
         }
+        // SAFETY: the live current-CPU counter remains owned by this open path.
         let _ = unsafe { (*counter).pause() };
         if pmu_counter.is_none() {
+            // SAFETY: validation counter remains live and current-CPU-owned.
             let _ = unsafe { (*counter).release() };
         }
         period

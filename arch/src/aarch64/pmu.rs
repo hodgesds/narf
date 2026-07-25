@@ -41,6 +41,7 @@ pub enum PmuError {
 
 pub fn available() -> bool {
     // ID_AA64DFR0_EL1.PMUVer values 0 and 0xf mean absent/unimplemented.
+    // SAFETY: ID_AA64DFR0_EL1 is an EL1 feature-identification register.
     let version = ((unsafe { sysreg::read_id_aa64dfr0_el1() } >> 8) & 0xf) as u8;
     version != 0 && version != 0xf
 }
@@ -54,12 +55,15 @@ pub fn programmable_counter_count() -> u8 {
     if !available() {
         return 0;
     }
+    // SAFETY: availability above proves an implemented EL1 PMUv3 interface.
     (((unsafe { sysreg::read_pmcr_el0() } >> 11) & 0x1f) as u8).min(31)
 }
 
 pub fn event_supported(event: u16) -> bool {
     match event {
+        // SAFETY: PMCEID registers are read-only PMUv3 discovery registers.
         0..=31 => (unsafe { sysreg::read_pmceid0_el0() } & (1u64 << event)) != 0,
+        // SAFETY: PMCEID registers are read-only PMUv3 discovery registers.
         32..=63 => (unsafe { sysreg::read_pmceid1_el0() } & (1u64 << (event - 32))) != 0,
         _ => false,
     }
@@ -128,6 +132,7 @@ pub unsafe fn read_programmable(counter: &ProgrammableCounter) -> Result<u64, Pm
     // SAFETY: validated current-CPU ownership; PMSELR is synchronized by the
     // typed write wrapper before PMXEVCNTR is read.
     unsafe { select_programmable(counter.idx) };
+    // SAFETY: the selected programmable counter is live and current-CPU-owned.
     Ok(unsafe { sysreg::read_pmxevcntr_el0() } & u32::MAX as u64)
 }
 
@@ -137,6 +142,7 @@ pub unsafe fn read_programmable(counter: &ProgrammableCounter) -> Result<u64, Pm
 /// `counter` is live and owned by the current CPU.
 pub unsafe fn start_programmable(counter: &ProgrammableCounter) -> Result<(), PmuError> {
     check_programmable(counter)?;
+    // SAFETY: validation above proves exclusive current-CPU counter ownership.
     unsafe { sysreg::write_pmcntenset_el0(1u64 << counter.idx) };
     Ok(())
 }
@@ -148,6 +154,7 @@ pub unsafe fn start_programmable(counter: &ProgrammableCounter) -> Result<(), Pm
 pub unsafe fn pause_programmable(counter: &ProgrammableCounter) -> Result<(), PmuError> {
     check_programmable(counter)?;
     let bit = 1u64 << counter.idx;
+    // SAFETY: validation above proves exclusive current-CPU counter ownership.
     unsafe {
         sysreg::write_pmcntenclr_el0(bit);
         sysreg::write_pmintenclr_el1(bit);
@@ -166,6 +173,8 @@ pub unsafe fn arm_programmable(counter: &ProgrammableCounter, period: u64) -> Re
         return Err(PmuError::InvalidPeriod);
     }
     let bit = 1u64 << counter.idx;
+    // SAFETY: validation and the caller contract establish current-CPU
+    // ownership and a routed PMU interrupt.
     unsafe {
         sysreg::write_pmcntenclr_el0(bit);
         sysreg::write_pmintenclr_el1(bit);
@@ -201,6 +210,7 @@ pub unsafe fn handle_programmable_overflows() -> u32 {
     } else {
         (1u32 << implemented) - 1
     };
+    // SAFETY: the caller is the current CPU's routed PMU interrupt handler.
     let pending = (unsafe { sysreg::read_pmovsclr_el0() } as u32) & implemented_mask & allocated;
     for idx in 0..implemented {
         let bit = 1u32 << idx;
@@ -208,6 +218,7 @@ pub unsafe fn handle_programmable_overflows() -> u32 {
             continue;
         }
         let period = PROGRAMMABLE_PERIOD[cpu][idx as usize].load(Ordering::Acquire);
+        // SAFETY: `pending` is restricted to counters allocated on this CPU.
         unsafe {
             sysreg::write_pmcntenclr_el0(bit as u64);
             sysreg::write_pmovsclr_el0(bit as u64);
@@ -227,6 +238,7 @@ pub unsafe fn handle_programmable_overflows() -> u32 {
 /// `counter` is live and owned by the current CPU.
 pub unsafe fn release_programmable(counter: ProgrammableCounter) -> Result<(), PmuError> {
     check_programmable(&counter)?;
+    // SAFETY: validation above proves the counter is live and current-CPU-owned.
     unsafe { pause_programmable(&counter)? };
     PROGRAMMABLE_ALLOCATED[counter.cpu as usize]
         .fetch_and(!(1u32 << counter.idx), Ordering::Release);
@@ -281,6 +293,7 @@ pub unsafe fn read(counter: &CycleCounter) -> Result<u64, PmuError> {
 /// `counter` is live and owned by the current CPU.
 pub unsafe fn start(counter: &CycleCounter) -> Result<(), PmuError> {
     check_cpu(counter)?;
+    // SAFETY: validation above proves exclusive current-CPU cycle-counter ownership.
     unsafe { sysreg::write_pmcntenset_el0(CYCLE_BIT) };
     Ok(())
 }
@@ -329,7 +342,11 @@ pub unsafe fn pause_sampling(counter: &CycleCounter) -> Result<(), PmuError> {
 /// Called from the firmware-routed PMU PPI on the current CPU.
 pub unsafe fn handle_sampling_overflow() -> bool {
     let cpu = narf_lib::percpu::current_cpu();
-    if cpu >= MAX_CPUS || unsafe { sysreg::read_pmovsclr_el0() } & CYCLE_BIT == 0 {
+    if cpu >= MAX_CPUS {
+        return false;
+    }
+    // SAFETY: the caller is the current CPU's routed PMU interrupt handler.
+    if unsafe { sysreg::read_pmovsclr_el0() } & CYCLE_BIT == 0 {
         return false;
     }
     let period = PERIOD[cpu].load(Ordering::Acquire);
@@ -393,6 +410,7 @@ fn check_cpu(counter: &CycleCounter) -> Result<(), PmuError> {
 }
 
 unsafe fn select_programmable(idx: u8) {
+    // SAFETY: caller guarantees `idx` names an implemented current-CPU counter.
     unsafe { sysreg::write_pmselr_el0(idx as u64) };
 }
 

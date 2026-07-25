@@ -1143,6 +1143,7 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
         {
             return Err("PMUv3 live period update failed");
         }
+        // SAFETY: kernel test executes at EL1 and owns the PMUv3 cycle counter.
         if unsafe { narf_arch::aarch64::sysreg::read_pmcntenset_el0() } & (1 << 31) == 0 {
             return Err("PMUv3 cycle enable bit was not set by ioctl enable");
         }
@@ -1174,6 +1175,7 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
                 if crate::perf_event::event_refresh_state_for_test(fd) != Some((false, 0, true)) {
                     return Err("real PMUv3 overflow did not exhaust refresh budget");
                 }
+                // SAFETY: kernel test executes at EL1 and still owns the counter.
                 if unsafe { narf_arch::aarch64::sysreg::read_pmcntenset_el0() } & (1 << 31) != 0 {
                     return Err("refresh exhaustion left PMUv3 cycle counter enabled");
                 }
@@ -1184,15 +1186,19 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
         if narf_interrupts::fire_count(23) != 0 {
             return Err("PMUv3 PPI dispatched without a drained sample");
         }
+        // SAFETY: kernel test executes at EL1 and owns the PMUv3 cycle counter.
         if unsafe { narf_arch::aarch64::sysreg::read_pmcntenset_el0() } & (1 << 31) == 0 {
             return Err("PMUv3 cycle enable bit did not remain set");
         }
+        // SAFETY: kernel test executes at EL1 and owns the PMUv3 cycle counter.
         if unsafe { narf_arch::aarch64::sysreg::read_pmintenset_el1() } & (1 << 31) == 0 {
             return Err("PMUv3 interrupt enable bit did not remain set");
         }
+        // SAFETY: kernel test executes at EL1 and owns the PMUv3 cycle counter.
         if unsafe { narf_arch::aarch64::sysreg::read_pmovsclr_el0() } & (1 << 31) != 0 {
             return Err("PMUv3 overflow pending without PPI dispatch");
         }
+        // SAFETY: kernel test executes at EL1 and owns the PMUv3 cycle counter.
         let raw = unsafe { narf_arch::aarch64::sysreg::read_pmccntr_el0() };
         let preload = 0u64.wrapping_sub(live_period);
         if raw == preload {
@@ -1245,12 +1251,14 @@ fn smoke_abi_perf_pmuv3_programmable_overflow_record() -> TestResult {
         impl Drop for IrqMaskRestore {
             fn drop(&mut self) {
                 if self.0 {
+                    // SAFETY: restore the kernel-test harness's masked entry state.
                     unsafe { narf_arch::disable_interrupts() };
                 }
             }
         }
         let restore_mask = !narf_arch::interrupts_enabled();
         if restore_mask {
+            // SAFETY: the test has routed and armed the PMU PPI above.
             unsafe { narf_arch::enable_interrupts() };
         }
         let _irq_mask_restore = IrqMaskRestore(restore_mask);
@@ -1259,6 +1267,7 @@ fn smoke_abi_perf_pmuv3_programmable_overflow_record() -> TestResult {
                 core::hint::black_box(());
             }
             crate::perf_event::drain_irq_samples();
+            // SAFETY: ops owns this mapped metadata frame for the test duration.
             if unsafe { core::ptr::read_volatile((frames[0] as usize + 1024) as *const u64) } != 0 {
                 let _ = call(Syscall::Close.raw(), a0(fd as u64));
                 return Ok(());
@@ -1310,6 +1319,7 @@ fn smoke_abi_perf_pmuv3_frequency_record() -> TestResult {
         }
         let restore_mask = !narf_arch::interrupts_enabled();
         if restore_mask {
+            // SAFETY: the test has routed and armed the PMU PPI above.
             unsafe { narf_arch::enable_interrupts() };
         }
         for _ in 0..400 {
@@ -1317,9 +1327,11 @@ fn smoke_abi_perf_pmuv3_frequency_record() -> TestResult {
                 core::hint::black_box(());
             }
             crate::perf_event::drain_irq_samples();
+            // SAFETY: ops owns this mapped metadata frame for the test duration.
             if unsafe { core::ptr::read_volatile((frames[0] as usize + 1024) as *const u64) } >= 32
             {
                 if restore_mask {
+                    // SAFETY: restore the kernel-test harness's masked entry state.
                     unsafe { narf_arch::disable_interrupts() };
                 }
                 let _ = call(Syscall::Close.raw(), a0(fd as u64));
@@ -1327,6 +1339,7 @@ fn smoke_abi_perf_pmuv3_frequency_record() -> TestResult {
             }
         }
         if restore_mask {
+            // SAFETY: restore the kernel-test harness's masked entry state.
             unsafe { narf_arch::disable_interrupts() };
         }
         let _ = call(Syscall::Close.raw(), a0(fd as u64));
