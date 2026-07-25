@@ -35,7 +35,7 @@ over that authority; it is not a second PMU subsystem.
 | `perf stat -e '{cycles,instructions}'` | event groups and group leader reads | supported slice | Members are linked to the leader; group reads and group lifecycle ioctls cover the non-multiplexed counting case. |
 | `perf stat -a` | per-CPU events and online CPU discovery | partial | Exact hardware counting is admitted only for the calling CPU on a uniprocessor boot; SMP/remote-CPU operation returns `EOPNOTSUPP`. |
 | `perf stat -p PID` | task-scoped accounting | unsupported | Returns `EOPNOTSUPP`; counters are not yet scheduler-switched with the target. |
-| `perf record` | overflow sampling, mmap metadata/data ring, poll wakeups | partial (x86_64) | x86 GP counters route real LVT-PC overflow IRQs into SAMPLE/LOST ring records; committed comm/exec/fork/exit paths emit COMM/FORK/EXIT with `sample_id_all` trailers. MMAP2, task PMU context switching, frequency feedback, SMP, and aarch64 PMUv3 overflow routing remain. |
+| `perf record` | overflow sampling, mmap metadata/data ring, poll wakeups | partial (x86_64) | x86 GP counters route real LVT-PC overflow IRQs into SAMPLE/LOST ring records; committed mmap/comm/exec/fork/exit paths emit MMAP/MMAP2/COMM/FORK/EXIT with `sample_id_all` trailers. Initial ELF mappings, task PMU context switching, frequency feedback, SMP, and aarch64 PMUv3 overflow routing remain. |
 | `perf report` | perf.data parser, symbols, unwind | userspace-only after record | Kernel work is primarily `/proc`, build-id, and mmap metadata fidelity. |
 | `perf trace` | tracepoint PMU, tracefs event metadata | unsupported | NARF tracing rings are not yet projected as Linux tracepoints. |
 | `perf top` | sampling plus periodic display | unsupported | Blocked by the same ring/PMI work as `perf record`. |
@@ -95,8 +95,8 @@ Gaps:
    the detected PMU.
 3. Complete sampling portability: wire aarch64 PMUv3 overflow through GICv3
    and add hardware/QEMU coverage for the x86 LVT-PC route.
-4. Add `MMAP2` process metadata and unwind prerequisites for
-   `perf record/report`.
+4. Emit initial ELF/interpreter mappings at exec and add unwind prerequisites
+   for `perf record/report`; post-exec `mmap(2)` MMAP/MMAP2 records are wired.
 5. Project selected NARF tracing events into tracepoint IDs and tracefs for
    `perf trace`; add probes and BPF only after their capability and safety
    model is reviewed.

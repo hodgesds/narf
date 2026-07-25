@@ -698,7 +698,9 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 | (1 << 16), // IDENTIFIER
             flags: (1 << 9) // comm
                 | (1 << 13) // task
-                | (1 << 18), // sample_id_all
+                | (1 << 18) // sample_id_all
+                | (1 << 17) // mmap_data
+                | (1 << 23), // mmap2 (also covers executable mappings)
             ..PerfEventAttr::default()
         };
         let metadata_fd = match call(
@@ -723,14 +725,16 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             .map_err(|_| "perf metadata mmap failed")?;
         let task = crate::handlers::current_task_id();
         let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
+        crate::perf_event::on_mmap(task, -1, 0x4000_0000, 0x2000, 0, 5, 0x22);
+        crate::perf_event::on_mmap(task, -1, 0x5000_0000, 0x3000, 0, 3, 0x21);
         crate::perf_event::on_comm(task, "worker");
         crate::perf_event::on_fork(pid, 77, task, 88);
         crate::perf_event::on_process_exit(pid, task);
         // SAFETY: metadata_ops owns these identity-mapped frames.
         let metadata_head =
             unsafe { core::ptr::read_volatile((metadata_frames[0] as usize + 1024) as *const u64) };
-        if metadata_head != 208 {
-            return Err("perf lifecycle records have the wrong combined wire size");
+        if metadata_head != 448 {
+            return Err("perf metadata records have the wrong combined wire size");
         }
         // SAFETY: all three records fit contiguously in the first data page.
         let records = unsafe {
@@ -742,14 +746,26 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 u16::from_ne_bytes(records[offset + 6..offset + 8].try_into().unwrap()),
             )
         };
-        if header(0) != (3, 64) || header(64) != (7, 72) || header(136) != (4, 72) {
-            return Err("PERF_RECORD_COMM/FORK/EXIT wire headers are invalid");
-        }
-        if &records[16..23] != b"worker\0"
-            || u32::from_ne_bytes(records[72..76].try_into().unwrap()) != 77
-            || u32::from_ne_bytes(records[80..84].try_into().unwrap()) != 88
+        if header(0) != (10, 120)
+            || header(120) != (10, 120)
+            || header(240) != (3, 64)
+            || header(304) != (7, 72)
+            || header(376) != (4, 72)
         {
-            return Err("perf lifecycle record payloads are invalid");
+            return Err("perf MMAP2/COMM/FORK/EXIT wire headers are invalid");
+        }
+        if u64::from_ne_bytes(records[16..24].try_into().unwrap()) != 0x4000_0000
+            || u32::from_ne_bytes(records[64..68].try_into().unwrap()) != 5
+            || u32::from_ne_bytes(records[68..72].try_into().unwrap()) != 2
+            || &records[72..79] != b"//anon\0"
+            || u16::from_ne_bytes(records[124..126].try_into().unwrap()) != (1 << 13)
+            || u32::from_ne_bytes(records[184..188].try_into().unwrap()) != 3
+            || u32::from_ne_bytes(records[188..192].try_into().unwrap()) != 1
+            || &records[256..263] != b"worker\0"
+            || u32::from_ne_bytes(records[312..316].try_into().unwrap()) != 77
+            || u32::from_ne_bytes(records[320..324].try_into().unwrap()) != 88
+        {
+            return Err("perf metadata record payloads are invalid");
         }
         let _ = call(Syscall::Close.raw(), a0(metadata_fd as u64));
 

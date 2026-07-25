@@ -181,6 +181,13 @@ attribute bits are selected. Variable records are eight-byte aligned;
 `sample_id_all` appends the selected TID/TIME/ID/STREAM_ID/CPU/IDENTIFIER
 identity fields in Linux order. `wakeup_events` counts committed records and
 wakes readers at the requested threshold.
+Successful `mmap(2)` commits emit `PERF_RECORD_MMAP` or `MMAP2` for executable
+and/or data VMAs selected by `mmap`, `mmap2`, and `mmap_data`. File mappings
+carry the fd's recorded path and stable filesystem inode; anonymous mappings
+are named `//anon`. MMAP2 reports the actual single NARF VFS device namespace
+as 0:0 and generation zero because the VFS does not yet version inode
+identities. Request-only controls such as `MAP_FIXED` are not leaked as VMA
+flags. Initial ELF-loader mappings still require a separate exec-image walk.
 Unsupported sample layouts and platforms without a routed PMU overflow IRQ
 fail explicitly; aarch64 sampling remains `EOPNOTSUPP` until PMUv3 overflow
 is wired through GICv3.

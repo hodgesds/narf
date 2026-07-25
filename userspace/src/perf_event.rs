@@ -9,13 +9,14 @@ use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_linux_perf_uapi::{
     PerfEventAttr, PERF_ATTR_FLAG_COMM, PERF_ATTR_FLAG_COMM_EXEC, PERF_ATTR_FLAG_DISABLED,
-    PERF_ATTR_FLAG_ENABLE_ON_EXEC, PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_TASK,
+    PERF_ATTR_FLAG_ENABLE_ON_EXEC, PERF_ATTR_FLAG_MMAP, PERF_ATTR_FLAG_MMAP2,
+    PERF_ATTR_FLAG_MMAP_DATA, PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_TASK,
     PERF_ATTR_SIZE_VER0, PERF_COUNT_SW_DUMMY, PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST,
     PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM,
     PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC,
-    PERF_RECORD_SAMPLE, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
-    PERF_SAMPLE_PERIOD, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
-    PERF_TYPE_SOFTWARE,
+    PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP, PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE,
+    PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD,
+    PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, PERF_TYPE_SOFTWARE,
 };
 #[cfg(target_arch = "x86_64")]
 use narf_linux_perf_uapi::{
@@ -65,7 +66,10 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
     | PERF_ATTR_FLAG_COMM
     | PERF_ATTR_FLAG_TASK
     | PERF_ATTR_FLAG_SAMPLE_ID_ALL
-    | PERF_ATTR_FLAG_COMM_EXEC;
+    | PERF_ATTR_FLAG_COMM_EXEC
+    | PERF_ATTR_FLAG_MMAP
+    | PERF_ATTR_FLAG_MMAP_DATA
+    | PERF_ATTR_FLAG_MMAP2;
 
 const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
@@ -511,6 +515,55 @@ impl PerfEventFile {
         Self::finish_record(&mut record, 0) && self.push_record(&record)
     }
 
+    fn mmap_record(&self, mapping: &PerfMapping<'_>) -> bool {
+        let executable = mapping.prot & 4 != 0;
+        if (executable && self.attr.flags & (PERF_ATTR_FLAG_MMAP | PERF_ATTR_FLAG_MMAP2) == 0)
+            || (!executable && self.attr.flags & PERF_ATTR_FLAG_MMAP_DATA == 0)
+        {
+            return false;
+        }
+
+        let mmap2 = self.attr.flags & PERF_ATTR_FLAG_MMAP2 != 0;
+        let record_type = if mmap2 {
+            PERF_RECORD_MMAP2
+        } else {
+            PERF_RECORD_MMAP
+        };
+        let now = narf_time::monotonic_ns();
+        let mut record = Vec::with_capacity(96);
+        record.extend_from_slice(&record_type.to_ne_bytes());
+        record.extend_from_slice(&0u16.to_ne_bytes());
+        record.extend_from_slice(&0u16.to_ne_bytes());
+        record.extend_from_slice(&mapping.pid.to_ne_bytes());
+        record.extend_from_slice(&mapping.tid.to_ne_bytes());
+        record.extend_from_slice(&mapping.addr.to_ne_bytes());
+        record.extend_from_slice(&mapping.len.to_ne_bytes());
+        record.extend_from_slice(&mapping.pgoff.to_ne_bytes());
+        if mmap2 {
+            // NARF currently has one VFS device namespace (dev 0:0) and no
+            // inode-generation counter. `ino` is the backing FileOps' stable
+            // filesystem identity, or zero for an anonymous/synthetic map.
+            record.extend_from_slice(&0u32.to_ne_bytes());
+            record.extend_from_slice(&0u32.to_ne_bytes());
+            record.extend_from_slice(&mapping.ino.to_ne_bytes());
+            record.extend_from_slice(&0u64.to_ne_bytes());
+            record.extend_from_slice(&mapping.prot.to_ne_bytes());
+            record.extend_from_slice(&mapping.flags.to_ne_bytes());
+        }
+        record.extend_from_slice(mapping.filename.as_bytes());
+        record.push(0);
+        while record.len() & 7 != 0 {
+            record.push(0);
+        }
+        self.append_sample_id(&mut record, mapping.pid, mapping.tid, now);
+        let misc = if executable {
+            0
+        } else {
+            PERF_RECORD_MISC_MMAP_DATA
+        };
+        Self::finish_record(&mut record, misc) && self.push_record(&record)
+    }
+
     fn member_files(&self) -> Vec<Arc<dyn FileOps>> {
         self.group_members
             .lock()
@@ -550,6 +603,18 @@ impl PerfEventFile {
     }
 }
 
+struct PerfMapping<'a> {
+    pid: u32,
+    tid: u32,
+    addr: u64,
+    len: u64,
+    pgoff: u64,
+    ino: u64,
+    prot: u32,
+    flags: u32,
+    filename: &'a str,
+}
+
 /// Apply Linux `enable_on_exec` at the point a task commits a new image.
 ///
 /// Events are owned by the monitoring process but keyed by the target task,
@@ -586,6 +651,55 @@ pub(crate) fn on_comm(task: u64, comm: &str) {
         };
         if event.target_task == task && event.attr.flags & PERF_ATTR_FLAG_COMM != 0 {
             let _ = event.comm_record(pid as u32, task as u32, comm, false);
+        }
+        true
+    });
+}
+
+/// Publish a mapping only after its PTE materialization has committed.
+pub(crate) fn on_mmap(task: u64, fd: i32, addr: u64, len: u64, pgoff: u64, prot: u32, flags: u32) {
+    const MAP_SHARED: u32 = 0x01;
+    const MAP_PRIVATE: u32 = 0x02;
+    let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
+    let file = if fd >= 0 {
+        fd::with_table(task, |table| {
+            table
+                .get(fd as u32)
+                .map(|entry| (entry.ops.ino(), crate::mqueue::fd_path(task, fd as u32)))
+        })
+        .flatten()
+    } else {
+        None
+    };
+    let (ino, filename) = match file {
+        Some((ino, Some(path))) => (ino, path),
+        Some((ino, None)) => (ino, alloc::string::String::from("//unknown")),
+        None => (0, alloc::string::String::from("//anon")),
+    };
+    let mapping = PerfMapping {
+        pid: pid as u32,
+        tid: task as u32,
+        addr,
+        len,
+        pgoff,
+        ino,
+        prot,
+        // Linux records VMA semantics, not transient mmap request controls
+        // such as MAP_FIXED or MAP_ANONYMOUS.
+        flags: if flags & MAP_SHARED != 0 {
+            MAP_SHARED
+        } else {
+            MAP_PRIVATE
+        },
+        filename: &filename,
+    };
+    let mut registry = PERF_EVENT_REGISTRY.lock();
+    registry.retain(|weak| {
+        let Some(event) = weak.upgrade() else {
+            return false;
+        };
+        if event.target_pid == pid {
+            let _ = event.mmap_record(&mapping);
         }
         true
     });
