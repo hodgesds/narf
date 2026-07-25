@@ -180,7 +180,11 @@ Linux `PERF_RECORD_COMM`, `FORK`, and `EXIT` records when their corresponding
 attribute bits are selected. Variable records are eight-byte aligned;
 `sample_id_all` appends the selected TID/TIME/ID/STREAM_ID/CPU/IDENTIFIER
 identity fields in Linux order. `wakeup_events` counts committed records and
-wakes readers at the requested threshold.
+wakes readers at the requested threshold. `PERF_EVENT_IOC_PAUSE_OUTPUT`
+atomically suppresses record commits while leaving the event enabled, and
+resuming makes subsequent records visible again. Ring-capacity failures
+increment the event's loss counter; reads selecting `PERF_FORMAT_LOST` return
+that real counter for each standalone or grouped event rather than a constant.
 Successful `mmap(2)` commits emit `PERF_RECORD_MMAP` or `MMAP2` for executable
 and/or data VMAs selected by `mmap`, `mmap2`, and `mmap_data`. File mappings
 carry the fd's recorded path and stable filesystem inode; anonymous mappings

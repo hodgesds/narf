@@ -111,6 +111,7 @@ const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
 const PERF_EVENT_IOC_RESET: u32 = 0x2403;
 const PERF_EVENT_IOC_ID: u32 = 0x8008_2407;
+const PERF_EVENT_IOC_PAUSE_OUTPUT: u32 = 0x4004_2409;
 const PERF_IOC_FLAG_GROUP: usize = 1;
 const PERF_MMAP_PAGE_BYTES: usize = 4096;
 const PERF_MMAP_MAX_DATA_PAGES: usize = 256;
@@ -145,6 +146,7 @@ struct PerfEventFile {
     time_enabled_ns: AtomicU64,
     registered: AtomicBool,
     sample_lost: AtomicU64,
+    output_paused: AtomicBool,
     wakeup_pending: AtomicU32,
     #[cfg(target_arch = "x86_64")]
     sample_period: AtomicU64,
@@ -483,6 +485,9 @@ impl PerfEventFile {
     }
 
     fn push_record(&self, record: &[u8]) -> bool {
+        if self.output_paused.load(Ordering::Acquire) {
+            return false;
+        }
         let mapping = self.mmap.lock();
         let Some(mapping) = mapping.as_ref() else {
             return false;
@@ -1193,7 +1198,7 @@ impl FileOps for PerfEventFile {
                     Self::push_word(buf, &mut cursor, self.id)?;
                 }
                 if format & PERF_FORMAT_LOST != 0 {
-                    Self::push_word(buf, &mut cursor, 0)?;
+                    Self::push_word(buf, &mut cursor, self.sample_lost.load(Ordering::Acquire))?;
                 }
                 for file in members {
                     let event = file
@@ -1206,7 +1211,11 @@ impl FileOps for PerfEventFile {
                         Self::push_word(buf, &mut cursor, event.id)?;
                     }
                     if format & PERF_FORMAT_LOST != 0 {
-                        Self::push_word(buf, &mut cursor, 0)?;
+                        Self::push_word(
+                            buf,
+                            &mut cursor,
+                            event.sample_lost.load(Ordering::Acquire),
+                        )?;
                     }
                 }
             } else {
@@ -1221,7 +1230,7 @@ impl FileOps for PerfEventFile {
                     Self::push_word(buf, &mut cursor, self.id)?;
                 }
                 if format & PERF_FORMAT_LOST != 0 {
-                    Self::push_word(buf, &mut cursor, 0)?;
+                    Self::push_word(buf, &mut cursor, self.sample_lost.load(Ordering::Acquire))?;
                 }
             }
             Ok(cursor)
@@ -1263,6 +1272,13 @@ impl FileOps for PerfEventFile {
                 // copy_to_user; a bad pointer is reported as InvalidData/EINVAL.
                 unsafe { copy_to_user(arg as u64, &self.id.to_ne_bytes()) }
                     .map_err(|_| FsError::InvalidData)?;
+                Ok(0)
+            }
+            PERF_EVENT_IOC_PAUSE_OUTPUT => {
+                if self.mmap.lock().is_none() {
+                    return Err(FsError::InvalidData);
+                }
+                self.output_paused.store(arg != 0, Ordering::Release);
                 Ok(0)
             }
             _ => Err(FsError::Unsupported),
@@ -1696,6 +1712,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             time_enabled_ns: AtomicU64::new(0),
             registered: AtomicBool::new(false),
             sample_lost: AtomicU64::new(0),
+            output_paused: AtomicBool::new(false),
             wakeup_pending: AtomicU32::new(0),
             #[cfg(target_arch = "x86_64")]
             sample_period: AtomicU64::new(sample_period),

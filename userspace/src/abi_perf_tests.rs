@@ -15,11 +15,13 @@ const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
 const PERF_FORMAT_ID: u64 = 1 << 2;
 const PERF_FORMAT_GROUP: u64 = 1 << 3;
+const PERF_FORMAT_LOST: u64 = 1 << 4;
 
 const PERF_EVENT_IOC_ENABLE: u64 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u64 = 0x2401;
 const PERF_EVENT_IOC_RESET: u64 = 0x2403;
 const PERF_EVENT_IOC_ID: u64 = 0x8008_2407;
+const PERF_EVENT_IOC_PAUSE_OUTPUT: u64 = 0x4004_2409;
 const EOPNOTSUPP: i64 = -95;
 
 fn smoke_abi_perf_event_open_validation() -> TestResult {
@@ -679,6 +681,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 | (1 << 6) // ID
                 | (1 << 7) // CPU
                 | (1 << 8), // PERIOD
+            read_format: PERF_FORMAT_LOST,
             flags: 1 | PERF_ATTR_FLAG_INHERIT, // disabled + inherit
             ..PerfEventAttr::default()
         };
@@ -718,8 +721,28 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         if !crate::perf_event::event_tracks_task_for_test(sample_fd, 88) {
             return Err("perf inherit did not attach the child task");
         }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(sample_fd as u64, PERF_EVENT_IOC_PAUSE_OUTPUT, 1),
+        ) != Some(0)
+        {
+            return Err("pausing perf output failed");
+        }
+        crate::perf_event::sample_from_irq_for_test(88, 0xDEAD_BEEF);
+        // SAFETY: sample_ops owns the metadata frame.
+        if unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) }
+            != 0
+        {
+            return Err("paused perf output still committed a record");
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(sample_fd as u64, PERF_EVENT_IOC_PAUSE_OUTPUT, 0),
+        ) != Some(0)
+        {
+            return Err("resuming perf output failed");
+        }
         crate::perf_event::sample_from_irq_for_test(88, 0x1234_5678);
-        crate::perf_event::on_thread_exit(77, 88);
         // SAFETY: sample_ops owns all three identity-mapped frames here.
         let data_head =
             unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
@@ -745,6 +768,23 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         {
             return Err("sampled perf fd did not become POLLIN-readable");
         }
+        for _ in 0..200 {
+            crate::perf_event::sample_from_irq_for_test(88, 0x1234_5678);
+        }
+        let mut lost_read = [0u8; 16];
+        if call(
+            Syscall::Read.raw(),
+            a2(
+                sample_fd as u64,
+                lost_read.as_mut_ptr() as u64,
+                lost_read.len() as u64,
+            ),
+        ) != Some(16)
+            || u64::from_ne_bytes(lost_read[8..16].try_into().unwrap()) == 0
+        {
+            return Err("PERF_FORMAT_LOST did not report ring drops");
+        }
+        crate::perf_event::on_thread_exit(77, 88);
         let _ = call(Syscall::Close.raw(), a0(sample_fd as u64));
 
         // Test 19: real lifecycle callbacks encode COMM/FORK/EXIT records,
