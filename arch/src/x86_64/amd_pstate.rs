@@ -17,13 +17,14 @@
 //!
 //! ```text
 //!   0xC001_02B0   MSR_AMD_CPPC_CAP1     read-only — performance bounds
-//!   0xC001_02B1   MSR_AMD_CPPC_REQ      read/write — request register
+//!   0xC001_02B1   MSR_AMD_CPPC_ENABLE   read/write — master enable
 //!   0xC001_02B2   MSR_AMD_CPPC_CAP2     read-only — guaranteed perf
-//!   0xC001_02B3   MSR_AMD_CPPC_STATUS   read-only — currently delivered
+//!   0xC001_02B3   MSR_AMD_CPPC_REQ      read/write — request register
+//!   0xC001_02B4   MSR_AMD_CPPC_STATUS   read-only — currently delivered
 //! ```
 //!
 //! The CPPC enable bit is in the "passive-mode" `MSR_AMD_CPPC_ENABLE`
-//! at `0xC001_0295` — `narf_power::cppc` owns that path. This module
+//! at `0xC001_02B1` — `narf_power::cppc` owns that path. This module
 //! is the "active-mode" amd-pstate driver: it assumes CPPC was
 //! enabled elsewhere (or via firmware) and programs the request
 //! register directly.
@@ -61,10 +62,10 @@ use crate::x86_64::msr::{rdmsr_or_gp, wrmsr_or_gp, MsrFault};
 /// `amd_get_lowest_perf`):
 ///
 /// ```text
-///   bits[7:0]    highest_perf            (peak boost)
-///   bits[15:8]   nominal_perf            (long-term guaranteed)
-///   bits[23:16]  lowest_nonlinear_perf   (knee of power curve)
-///   bits[31:24]  lowest_perf             (slowest stable)
+///   bits[7:0]    lowest_perf             (slowest stable)
+///   bits[15:8]   lowest_nonlinear_perf   (knee of power curve)
+///   bits[23:16]  nominal_perf            (long-term guaranteed)
+///   bits[31:24]  highest_perf            (peak boost)
 /// ```
 pub const MSR_AMD_CPPC_CAP1: u32 = 0xC001_02B0;
 
@@ -74,12 +75,13 @@ pub const MSR_AMD_CPPC_CAP1: u32 = 0xC001_02B0;
 /// Layout (Linux `amd-pstate.c` `amd_pstate_update_perf`):
 ///
 /// ```text
-///   bits[7:0]    min_perf
-///   bits[15:8]   max_perf
+///   bits[7:0]    max_perf
+///   bits[15:8]   min_perf
 ///   bits[23:16]  des_perf  (desired, 0 = autonomous)
 ///   bits[31:24]  epp       (energy-performance preference)
 /// ```
-pub const MSR_AMD_CPPC_REQ: u32 = 0xC001_02B1;
+pub const MSR_AMD_CPPC_ENABLE: u32 = 0xC001_02B1;
+pub const MSR_AMD_CPPC_REQ: u32 = 0xC001_02B3;
 
 /// CPPC capability register #2 — guaranteed performance (mirrors
 /// what `_CPC` would report under ACPI passive mode). Read-only.
@@ -87,7 +89,7 @@ pub const MSR_AMD_CPPC_CAP2: u32 = 0xC001_02B2;
 
 /// CPPC status register — bits[7:0] hold the currently-delivered
 /// performance value. Sampled live from the firmware governor.
-pub const MSR_AMD_CPPC_STATUS: u32 = 0xC001_02B3;
+pub const MSR_AMD_CPPC_STATUS: u32 = 0xC001_02B4;
 
 /// Package thermal status MSR — bits[22:16] hold the digital
 /// temperature reading (degrees below Tjmax). Architectural on AMD
@@ -104,8 +106,8 @@ pub const MSR_PKG_THERM_STATUS: u32 = 0x0000_01B1;
 /// stops the userspace governor speaks.
 pub mod epp {
     pub const PERFORMANCE: u8 = 0x00;
-    pub const BALANCE_PERFORMANCE: u8 = 0x40;
-    pub const BALANCE_POWER: u8 = 0x80;
+    pub const BALANCE_PERFORMANCE: u8 = 0x80;
+    pub const BALANCE_POWER: u8 = 0xBF;
     pub const POWER: u8 = 0xFF;
 }
 
@@ -175,10 +177,10 @@ impl CppcCaps {
     /// AMD Renoir PPR §1.5.
     pub const fn from_raw(v: u64) -> Self {
         Self {
-            highest_perf: (v & 0xFF) as u8,
-            nominal_perf: ((v >> 8) & 0xFF) as u8,
-            lowest_nonlinear_perf: ((v >> 16) & 0xFF) as u8,
-            lowest_perf: ((v >> 24) & 0xFF) as u8,
+            lowest_perf: (v & 0xFF) as u8,
+            lowest_nonlinear_perf: ((v >> 8) & 0xFF) as u8,
+            nominal_perf: ((v >> 16) & 0xFF) as u8,
+            highest_perf: ((v >> 24) & 0xFF) as u8,
         }
     }
 }
@@ -210,7 +212,7 @@ pub fn read_status() -> Option<Result<u8, MsrFault>> {
 /// `amd_pstate_update_perf` packing.
 #[inline]
 pub const fn build_request(min_perf: u8, max_perf: u8, des_perf: u8, epp: u8) -> u64 {
-    (min_perf as u64) | ((max_perf as u64) << 8) | ((des_perf as u64) << 16) | ((epp as u64) << 24)
+    (max_perf as u64) | ((min_perf as u64) << 8) | ((des_perf as u64) << 16) | ((epp as u64) << 24)
 }
 
 /// Decode a 64-bit `MSR_AMD_CPPC_REQ` value back into its four
@@ -219,8 +221,8 @@ pub const fn build_request(min_perf: u8, max_perf: u8, des_perf: u8, epp: u8) ->
 #[inline]
 pub const fn decode_request(v: u64) -> (u8, u8, u8, u8) {
     (
-        (v & 0xFF) as u8,
         ((v >> 8) & 0xFF) as u8,
+        (v & 0xFF) as u8,
         ((v >> 16) & 0xFF) as u8,
         ((v >> 24) & 0xFF) as u8,
     )
@@ -305,7 +307,7 @@ pub enum BootInitOutcome {
 ///     decides how aggressively it's taken.
 ///   * `des_perf` = `nominal_perf` — long-term target; with EPP
 ///     balanced the governor sits here under typical load.
-///   * `epp` = `BALANCE_PERFORMANCE` — anchor 0x40.
+///   * `epp` = `BALANCE_PERFORMANCE` — Linux-compatible anchor 0x80.
 ///
 /// No `unsafe` because the MSR accesses use the probe-armed
 /// variants; a firmware lock surfaces as `Cap1Gp` / `ReqGp` rather

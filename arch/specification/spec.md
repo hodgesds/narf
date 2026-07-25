@@ -78,6 +78,24 @@ pub unsafe fn speculation::configure_current_cpu(
     policy: speculation::Policy,
 ) -> speculation::State;
 pub fn speculation::state(cpu: usize) -> speculation::State;
+
+#[cfg(target_arch = "x86_64")]
+pub mod amd_pstate {
+    pub const MSR_AMD_CPPC_CAP1: u32 = 0xC001_02B0;
+    pub const MSR_AMD_CPPC_ENABLE: u32 = 0xC001_02B1;
+    pub const MSR_AMD_CPPC_CAP2: u32 = 0xC001_02B2;
+    pub const MSR_AMD_CPPC_REQ: u32 = 0xC001_02B3;
+    pub const MSR_AMD_CPPC_STATUS: u32 = 0xC001_02B4;
+
+    pub fn read_caps() -> Option<Result<CppcCaps, MsrFault>>;
+    pub fn read_status() -> Option<Result<u8, MsrFault>>;
+    pub fn amd_pstate_request(
+        min_perf: u8,
+        max_perf: u8,
+        desired_perf: u8,
+        epp: u8,
+    ) -> Option<Result<(), MsrFault>>;
+}
 ```
 
 ## 4. Invariants & safety properties

@@ -1,4 +1,4 @@
-//! AMD CPPC (Collaborative Processor Performance Control) — clean-room.
+//! AMD CPPC (Collaborative Processor Performance Control).
 //!
 //! ## Sources (public only)
 //!
@@ -10,8 +10,8 @@
 //!   _CPC capability table. The MSRs here are the AMD-specific
 //!   instantiation of the CPPC abstract registers ACPI defines.
 //!   <https://uefi.org/specs/ACPI/>
-//!
-//! No GPL / Linux source consulted.
+//! - Linux `arch/x86/include/asm/msr-index.h` — cross-check for the
+//!   architectural MSR numbers and request masks.
 //!
 //! ## What this is
 //!
@@ -24,11 +24,11 @@
 extern crate alloc;
 
 /// AMD CPPC MSR addresses (AMD64 APM §17 + AMD PPR for Zen 2+).
-pub const MSR_AMD_CPPC_CAP1: u32 = 0xC001_0294;
-pub const MSR_AMD_CPPC_ENABLE: u32 = 0xC001_0295;
-pub const MSR_AMD_CPPC_CAP2: u32 = 0xC001_0296;
-pub const MSR_AMD_CPPC_REQ: u32 = 0xC001_0297;
-pub const MSR_AMD_CPPC_STATUS: u32 = 0xC001_0298;
+pub const MSR_AMD_CPPC_CAP1: u32 = 0xC001_02B0;
+pub const MSR_AMD_CPPC_ENABLE: u32 = 0xC001_02B1;
+pub const MSR_AMD_CPPC_CAP2: u32 = 0xC001_02B2;
+pub const MSR_AMD_CPPC_REQ: u32 = 0xC001_02B3;
+pub const MSR_AMD_CPPC_STATUS: u32 = 0xC001_02B4;
 
 /// `MSR_AMD_CPPC_CAP1` decoder (read-only).
 ///
@@ -81,8 +81,8 @@ impl Cap2 {
 /// `MSR_AMD_CPPC_REQ` request register layout.
 ///
 /// ```text
-///   bits[7:0]    Min Performance — floor the FW must honour.
-///   bits[15:8]   Max Performance — ceiling.
+///   bits[7:0]    Max Performance — ceiling.
+///   bits[15:8]   Min Performance — floor the FW must honour.
 ///   bits[23:16]  Desired Performance — non-binding hint;
 ///                  takes effect when MinPerf == 0 == MaxPerf.
 ///   bits[31:24]  Energy Performance Preference (0..255).
@@ -93,17 +93,17 @@ pub struct Request(pub u64);
 impl Request {
     pub fn build(min_perf: u8, max_perf: u8, desired_perf: u8, epp: u8) -> Self {
         Self(
-            (min_perf as u64)
-                | ((max_perf as u64) << 8)
+            (max_perf as u64)
+                | ((min_perf as u64) << 8)
                 | ((desired_perf as u64) << 16)
                 | ((epp as u64) << 24),
         )
     }
     pub fn min_perf(self) -> u8 {
-        (self.0 & 0xFF) as u8
+        ((self.0 >> 8) & 0xFF) as u8
     }
     pub fn max_perf(self) -> u8 {
-        ((self.0 >> 8) & 0xFF) as u8
+        (self.0 & 0xFF) as u8
     }
     pub fn desired_perf(self) -> u8 {
         ((self.0 >> 16) & 0xFF) as u8
@@ -132,8 +132,8 @@ pub const ENABLE_BIT: u64 = 1 << 0;
 /// are the well-known anchors.
 pub mod epp {
     pub const PERFORMANCE: u8 = 0x00;
-    pub const BALANCED_PERFORMANCE: u8 = 0x40;
-    pub const BALANCED_POWER: u8 = 0x80;
+    pub const BALANCED_PERFORMANCE: u8 = 0x80;
+    pub const BALANCED_POWER: u8 = 0xBF;
     pub const POWERSAVE: u8 = 0xFF;
 }
 
@@ -145,7 +145,7 @@ mod x86 {
 
     /// AMD APM Vol 2 §17 / PPR: `CPUID(0x8000_0008).EBX[27] = CPPC`.
     /// Set when the core implements the CPPC MSRs at
-    /// 0xC001_0294..0xC001_0298. Distinct from the legacy HwPstate
+    /// 0xC001_02B0..0xC001_02B4. Distinct from the legacy HwPstate
     /// bit (`CPUID(0x8000_0007).EDX[7]`) — Zen2+ parts typically
     /// expose both, in which case we prefer CPPC for finer-grained
     /// EPP control.

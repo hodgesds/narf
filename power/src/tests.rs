@@ -964,9 +964,24 @@ kernel_test_in!("power/psci", smoke_psci_status_decode);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_cppc_request_round_trip() -> TestResult {
-    use crate::cppc::{epp, Request};
+    use crate::cppc::{
+        epp, Request, MSR_AMD_CPPC_CAP1, MSR_AMD_CPPC_ENABLE, MSR_AMD_CPPC_REQ, MSR_AMD_CPPC_STATUS,
+    };
+
+    if (
+        MSR_AMD_CPPC_CAP1,
+        MSR_AMD_CPPC_ENABLE,
+        MSR_AMD_CPPC_REQ,
+        MSR_AMD_CPPC_STATUS,
+    ) != (0xC001_02B0, 0xC001_02B1, 0xC001_02B3, 0xC001_02B4)
+    {
+        return TestResult::Fail("MSR map");
+    }
 
     let r = Request::build(50, 200, 150, epp::BALANCED_PERFORMANCE);
+    if r.0 != (200 | (50 << 8) | (150 << 16) | ((epp::BALANCED_PERFORMANCE as u64) << 24)) {
+        return TestResult::Fail("request wire layout");
+    }
 
     if r.min_perf() != 50 || r.max_perf() != 200 || r.desired_perf() != 150 {
         return TestResult::Fail("perf fields");

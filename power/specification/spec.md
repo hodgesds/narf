@@ -80,6 +80,11 @@ pub fn set_cpu_governor(g: impl Governor);
 pub fn current_opp(cpu: CpuId) -> Opp;
 pub fn request_min_freq(cpu: CpuId, khz: u32, cap: &Cap<FreqHint, Set>);
 
+pub enum Policy { Performance, Balanced, Powersave, Userspace }
+pub fn set_policy_current(policy: Policy) -> Result<(), CpuFreqError>;
+pub fn set_epp_current(epp: u8) -> Result<(), CpuFreqError>;
+pub fn current_perf(cpu: CpuId) -> Option<PerfState>;
+
 pub trait Governor {
     fn tick(&mut self, load: LoadSnapshot) -> Opp;
     fn name(&self) -> &'static str;
@@ -88,6 +93,16 @@ pub trait Governor {
 
 Built-in governors: `Performance`, `Powersave`, `EnergyAware`
 (scheduler-informed). Pluggability is opt-in via `Cap<Governor, Install>`.
+
+On x86_64, `Balanced` is the default schedutil-style policy over Intel
+HWP or AMD CPPC. One hard-pinned worker per online CPU samples that CPU's
+scheduler run queue every 100 ms and writes only that CPU's request MSR.
+The syscall bridge rejects remote-CPU policy/EPP writes until an IPI
+rendezvous path can execute the operation on the named CPU.
+`Performance` requests highest with a nominal floor and EPP 0;
+`Powersave` caps max at nominal with EPP 255; `Userspace` leaves desired performance autonomous
+while accepting explicit range/EPP control. CPPC performance values are
+unitless 0..=255 hints, not frequencies.
 
 ### 3.3 Suspend / resume
 
@@ -163,6 +178,12 @@ driver implementation.
 - Thermal emergency shutdown is idempotent and signal-safe.
 - DVFS changes are bounded: no transition takes longer than its
   declared `transition_latency`.
+- Per-CPU HWP/CPPC registers are enabled, read, and written only while
+  executing on their owning CPU. A BSP loop must never impersonate remote
+  CPUs; remote updates require a pinned worker or CPU rendezvous.
+- Firmware capability tuples must satisfy
+  `lowest <= nominal <= highest` and `highest != 0` before any request is
+  programmed. Invalid tuples disable the backend on that CPU.
 - Monotonic time never goes backwards across suspend/resume.
   Wall time jumps forward by the measured suspend duration.
 - Per-driver `suspend` must be callable from the runtime or

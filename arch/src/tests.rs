@@ -2956,7 +2956,7 @@ fn smoke_amd_pstate_request_pack_roundtrip() -> TestResult {
     // Linux amd-pstate's `amd_pstate_update_perf` packing.
     use crate::x86_64::amd_pstate::{build_request, decode_request};
     let v = build_request(0x10, 0xC0, 0x80, 0x40);
-    if v != ((0x10u64) | (0xC0u64 << 8) | (0x80u64 << 16) | (0x40u64 << 24)) {
+    if v != ((0xC0u64) | (0x10u64 << 8) | (0x80u64 << 16) | (0x40u64 << 24)) {
         return TestResult::Fail("build_request packing mismatch");
     }
     let (min, max, des, epp) = decode_request(v);
@@ -2980,7 +2980,7 @@ fn smoke_amd_pstate_caps_decode() -> TestResult {
     // PPR §1.5 layout. Runs everywhere — no MSR access.
     use crate::x86_64::amd_pstate::CppcCaps;
     // highest=0xC0, nominal=0x80, lowest_nonlinear=0x20, lowest=0x10.
-    let raw: u64 = 0x10 << 24 | 0x20 << 16 | 0x80 << 8 | 0xC0;
+    let raw: u64 = 0xC0 << 24 | 0x80 << 16 | 0x20 << 8 | 0x10;
     let c = CppcCaps::from_raw(raw);
     if c.highest_perf != 0xC0 {
         return TestResult::Fail("highest_perf decode wrong");

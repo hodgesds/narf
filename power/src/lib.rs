@@ -312,7 +312,10 @@ pub fn register_initcalls() {
     // `Err(RequestGp)` instead of wedging boot.
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Late, "cpufreq-init", || match cpufreq::enable() {
-        Ok(()) => InitResult::Ok,
+        Ok(()) => {
+            cpufreq::start_workers();
+            InitResult::Ok
+        }
         Err(cpufreq::CpuFreqError::NoBackend) => InitResult::NotPresent,
         Err(_) => InitResult::Ok,
     });

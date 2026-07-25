@@ -18,8 +18,8 @@
 //!      `IA32_HWP_REQUEST` (MSR 0x774). Linux: `intel_pstate.c`
 //!      `intel_pstate_update_pstate`.
 //!   2. **`Backend::AmdCppc`** — CPUID(0x8000_0008).EBX[27].
-//!      `MSR_AMD_CPPC_CAP1` (0xC001_0294) +
-//!      `MSR_AMD_CPPC_REQ` (0xC001_0297). Linux:
+//!      `MSR_AMD_CPPC_CAP1` (0xC001_02B0) +
+//!      `MSR_AMD_CPPC_REQ` (0xC001_02B3). Linux:
 //!      `amd_pstate.c` `amd_pstate_update_perf` /
 //!      `amd_pstate.c::shmem_set_epp`.
 //!   3. **`Backend::AcpiPss`** — fallback for older parts without
@@ -34,19 +34,17 @@
 //! ## Governor algorithm
 //!
 //! Schedutil-style: every tick the governor reads a per-CPU
-//! utilisation proxy ([`utilization_permille`]) and computes
+//! scheduler-demand proxy and computes
 //!
 //! ```text
 //!   target_perf = min_perf + (util * (max_perf - min_perf)) / 1000
 //! ```
 //!
-//! NARF has no runqueue-time signal yet (the scheduler is still
-//! cooperative-async), so the utilisation proxy is the per-CPU
-//! timer-IRQ fire-count delta over the sample interval. A busy CPU
-//! takes more timer IRQs because it doesn't sit in `halt_until_irq`;
-//! an idle CPU's fire count rolls only with the LAPIC tick. The
-//! ratio (current_delta / target_delta) maps 0..1000 permille where
-//! target_delta is calibrated to the configured tick rate.
+//! NARF does not yet account PELT-style run time, so the proxy is
+//! deliberately conservative: an empty local ready queue maps to
+//! zero demand and any queued runnable task maps to full demand.
+//! This avoids the old timer-IRQ proxy, which could not distinguish
+//! an idle CPU woken by the periodic tick from a busy CPU.
 //!
 //! Hysteresis is a simple one-shot guard: a recompute that lands
 //! within `HYSTERESIS_BAND` of the previously-written value is
@@ -74,17 +72,18 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use narf_arch::x86_64::cpuid::cpuid;
 use narf_arch::x86_64::msr::{rdmsr_or_gp, wrmsr_or_gp};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::cppc::{
-    epp as cppc_epp, Cap1 as CppcCap1, Request as CppcRequest, MSR_AMD_CPPC_CAP1, MSR_AMD_CPPC_REQ,
+    epp as cppc_epp, Cap1 as CppcCap1, Request as CppcRequest, ENABLE_BIT, MSR_AMD_CPPC_CAP1,
+    MSR_AMD_CPPC_ENABLE, MSR_AMD_CPPC_REQ,
 };
 use crate::hwp::HwpCapabilities;
-use crate::pstate::{MSR_IA32_HWP_CAPABILITIES, MSR_IA32_HWP_REQUEST};
+use crate::pstate::{MSR_IA32_HWP_CAPABILITIES, MSR_IA32_HWP_REQUEST, MSR_IA32_PM_ENABLE};
 
 // ── Public types ───────────────────────────────────────────────────
 
@@ -101,6 +100,20 @@ pub enum Backend {
     None,
 }
 
+/// Linux-compatible policy modes layered over HWP/CPPC.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Policy {
+    /// Request highest performance with a nominal floor.
+    Performance,
+    /// Scale across the full hardware range from scheduler load.
+    #[default]
+    Balanced,
+    /// Scale only up to nominal performance with an energy-biased EPP.
+    Powersave,
+    /// Leave desired performance autonomous; explicit range/EPP controls win.
+    Userspace,
+}
+
 /// Errors from the governor entry points. Mirrors the pattern in
 /// `pstate.rs::InitOutcome`: distinguish "we didn't try" from "we
 /// tried and the MSR `#GP`'d / the table was missing" so callers
@@ -111,6 +124,8 @@ pub enum CpuFreqError {
     NoBackend,
     /// HWP / CPPC capabilities MSR read `#GP`'d (BIOS lock).
     CapabilitiesGp,
+    /// Enabling HWP / CPPC on the owning CPU `#GP`'d.
+    EnableGp,
     /// Programming the request MSR `#GP`'d.
     RequestGp,
     /// `_PSS` table is missing or malformed.
@@ -119,6 +134,8 @@ pub enum CpuFreqError {
     NotEnabled,
     /// Requested CPU id is out of range for the online topology.
     NoSuchCpu,
+    /// Firmware returned a zero or inverted performance range.
+    InvalidCapabilities,
 }
 
 /// Per-CPU performance snapshot exposed by [`current_perf()`].
@@ -139,6 +156,10 @@ pub struct PerfState {
     /// Some backends don't expose a status MSR here; in that case
     /// the field mirrors `desired`.
     pub current: u8,
+    /// Energy-performance preference last programmed for this CPU.
+    pub epp: u8,
+    /// Active software policy.
+    pub policy: Policy,
 }
 
 // ── State ──────────────────────────────────────────────────────────
@@ -156,29 +177,37 @@ static ENABLED: AtomicU8 = AtomicU8::new(0);
 /// `fire_count_on_cpu` indexing stays array-bounded.
 #[derive(Clone, Copy, Default, Debug)]
 struct PerCpu {
-    /// `fire_count_on_cpu(VECTOR_TIMER, cpu)` at the previous tick.
-    last_timer_fires: u64,
     /// Last `desired_perf` byte we wrote, for hysteresis.
     last_desired: u8,
-    /// Window floor / ceiling cached from the capabilities read so
-    /// we don't re-decode the MSR on every tick.
+    /// Hardware capability bounds cached on the owning CPU.
+    hw_min_perf: u8,
+    nominal_perf: u8,
+    hw_max_perf: u8,
+    /// Active policy request.
     min_perf: u8,
     max_perf: u8,
+    epp: u8,
+    policy: Policy,
 }
 
 const MAX_CPUS: usize = 64;
 static PERCPU: IrqSafeSpinLock<[PerCpu; MAX_CPUS]> = IrqSafeSpinLock::new(
     [PerCpu {
-        last_timer_fires: 0,
         last_desired: 0,
+        hw_min_perf: 0,
+        nominal_perf: 0,
+        hw_max_perf: 0,
         min_perf: 0,
         max_perf: 0,
+        epp: cppc_epp::BALANCED_PERFORMANCE,
+        policy: Policy::Balanced,
     }; MAX_CPUS],
 );
 
 /// Monotonic tick counter — incremented by [`tick()`] for
 /// diagnostics.
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+static WORKERS_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Hysteresis band: skip a re-write when the target sits within
 /// this many perf units of the last value. Cheap MSR-write
@@ -189,13 +218,6 @@ const HYSTERESIS_BAND: u8 = 4;
 /// slower than the 1 kHz LAPIC tick so the timer-IRQ count delta
 /// is large enough (~100 ticks at 1 kHz) to be a useful signal.
 pub const TICK_INTERVAL_MS: u32 = 100;
-
-/// Expected timer fires per sample interval at full activity. The
-/// LAPIC tick runs at ~1 kHz so `(1000 * TICK_INTERVAL_MS) / 1000`
-/// fires is the upper bound; idle CPUs see fewer because the
-/// scheduler enters `halt_until_irq` between ticks. Saturating-mul
-/// avoids overflow if the constant is bumped to multi-second.
-const FULL_LOAD_TARGET_FIRES: u64 = 100;
 
 // ── Public API ─────────────────────────────────────────────────────
 
@@ -219,13 +241,43 @@ pub fn backend() -> Backend {
 pub fn enable() -> Result<(), CpuFreqError> {
     let b = backend();
     match b {
-        Backend::IntelHwp => seed_intel_hwp()?,
-        Backend::AmdCppc => seed_amd_cppc()?,
+        Backend::IntelHwp => seed_intel_hwp_current()?,
+        Backend::AmdCppc => seed_amd_cppc_current()?,
         Backend::AcpiPss => seed_acpi_pss()?,
         Backend::None => return Err(CpuFreqError::NoBackend),
     }
     ENABLED.store(1, Ordering::Release);
     Ok(())
+}
+
+/// Start one periodic governor worker on every online CPU. Each worker
+/// is hard-pinned because HWP and CPPC request/status MSRs are per-CPU.
+/// Calling this more than once is harmless.
+pub fn start_workers() {
+    if WORKERS_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let cpus = narf_lib::smp::cpu_count() as usize;
+    for cpu in 0..cpus.min(MAX_CPUS) {
+        if !narf_lib::smp::is_online(cpu as u32) {
+            continue;
+        }
+        let mut spec = narf_scheduler::TaskSpec::unthrottled();
+        spec.affinity =
+            narf_scheduler::Affinity::pinned(narf_scheduler::affinity::CpuId(cpu as u32));
+        narf_scheduler::spawn_with_spec(worker(cpu), spec);
+    }
+}
+
+async fn worker(cpu: usize) {
+    if seed_current_cpu(cpu).is_err() {
+        return;
+    }
+    loop {
+        let deadline = narf_time::Deadline::after_ms(TICK_INTERVAL_MS as u64);
+        narf_time::SleepUntil::new(deadline.as_instant()).await;
+        let _ = tick_cpu(cpu);
+    }
 }
 
 /// Disable the governor without un-programming any hardware state.
@@ -250,27 +302,29 @@ pub fn current_perf(cpu: u32) -> Option<PerfState> {
     if s.min_perf == 0 && s.max_perf == 0 {
         return None;
     }
-    // `current` mirrors `desired` until a status MSR is wired in
-    // — Intel exposes `IA32_HWP_STATUS` (0x777) bits[7:0] for the
-    // delivered perf and AMD exposes `MSR_AMD_CPPC_STATUS`
-    // (0xC0010298) bits[7:0]; surfacing those is a later patch
-    // because the governor uses the same value for its own
-    // bookkeeping.
     Some(PerfState {
         min: s.min_perf,
         max: s.max_perf,
         desired: s.last_desired,
-        current: s.last_desired,
+        // Neither HWP nor amd-pstate provides an architectural
+        // instantaneous-performance byte. APERF/MPERF telemetry is
+        // the honest source, so zero means "not sampled here".
+        current: 0,
+        epp: s.epp,
+        policy: s.policy,
     })
 }
 
-/// One-shot governor tick. Reads per-CPU utilisation, computes
-/// target_perf, applies hysteresis, writes the backend MSR.
+/// One-shot governor tick for the executing CPU.
 ///
-/// Returns the number of CPUs whose `desired_perf` was updated.
-/// Caller wires this to a periodic source (the `time/` wheel, an
-/// idle-IRQ pump, or a kernel async task — choice deferred).
+/// Returns one when its request changed and zero when hysteresis suppressed
+/// the write. The hardware access is deliberately local: per-CPU MSRs must
+/// never be written in a loop from the BSP.
 pub fn tick() -> Result<u32, CpuFreqError> {
+    tick_cpu(narf_lib::percpu::current_cpu())
+}
+
+fn tick_cpu(cpu: usize) -> Result<u32, CpuFreqError> {
     if ENABLED.load(Ordering::Acquire) == 0 {
         return Err(CpuFreqError::NotEnabled);
     }
@@ -278,40 +332,104 @@ pub fn tick() -> Result<u32, CpuFreqError> {
     if matches!(b, Backend::None) {
         return Err(CpuFreqError::NoBackend);
     }
-    TICK_COUNT.fetch_add(1, Ordering::AcqRel);
-    let cpus = narf_lib::smp::cpu_count() as usize;
-    let mut updates = 0u32;
-    for cpu in 0..cpus.min(MAX_CPUS) {
-        if !narf_lib::smp::is_online(cpu as u32) {
-            continue;
-        }
-        let util = sample_utilization(cpu);
-        let (min, max, prev) = {
-            let pc = PERCPU.lock();
-            let s = pc[cpu];
-            (s.min_perf, s.max_perf, s.last_desired)
-        };
-        if min == 0 && max == 0 {
-            // CPU not yet seeded (capabilities MSR `#GP`'d there).
-            continue;
-        }
-        let target = target_perf(util, min, max);
-        // Hysteresis: skip the write if we land inside the band.
-        if prev != 0 && target.abs_diff(prev) <= HYSTERESIS_BAND {
-            continue;
-        }
-        if write_desired(b, target).is_ok() {
-            let mut pc = PERCPU.lock();
-            pc[cpu].last_desired = target;
-            updates += 1;
-        }
+    if cpu >= MAX_CPUS || cpu != narf_lib::percpu::current_cpu() {
+        return Err(CpuFreqError::NoSuchCpu);
     }
-    Ok(updates)
+    TICK_COUNT.fetch_add(1, Ordering::AcqRel);
+    let util = sample_utilization(cpu);
+    let (min, max, prev, policy) = {
+        let pc = PERCPU.lock();
+        let s = pc[cpu];
+        (s.min_perf, s.max_perf, s.last_desired, s.policy)
+    };
+    if min == 0 && max == 0 {
+        return Err(CpuFreqError::NoSuchCpu);
+    }
+    let target = match policy {
+        Policy::Performance => max,
+        Policy::Balanced | Policy::Powersave => target_perf(util, min, max),
+        Policy::Userspace => 0,
+    };
+    if prev != 0 && target.abs_diff(prev) <= HYSTERESIS_BAND {
+        return Ok(0);
+    }
+    write_desired(b, cpu, target)?;
+    {
+        let mut pc = PERCPU.lock();
+        pc[cpu].last_desired = target;
+    }
+    Ok(1)
 }
 
 /// Cumulative governor-tick count. Mostly for tests + diagnostics.
 pub fn tick_count() -> u64 {
     TICK_COUNT.load(Ordering::Acquire)
+}
+
+/// Change the policy on the executing CPU and apply it immediately.
+pub fn set_policy_current(policy: Policy) -> Result<(), CpuFreqError> {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= MAX_CPUS {
+        return Err(CpuFreqError::NoSuchCpu);
+    }
+    {
+        let mut pc = PERCPU.lock();
+        let s = &mut pc[cpu];
+        if s.hw_max_perf == 0 {
+            return Err(CpuFreqError::NotEnabled);
+        }
+        apply_policy_to_slot(s, policy);
+        // Force the next tick to write the new policy even when its
+        // desired byte happens to fall inside the hysteresis band.
+        s.last_desired = 0;
+    }
+    tick_cpu(cpu).map(|_| ())
+}
+
+fn apply_policy_to_slot(s: &mut PerCpu, policy: Policy) {
+    s.policy = policy;
+    match policy {
+        Policy::Performance => {
+            // Linux amd-pstate uses nominal rather than highest as
+            // the performance-policy floor: min=max=highest can
+            // throttle on package-power-limited systems.
+            s.min_perf = s.nominal_perf;
+            s.max_perf = s.hw_max_perf;
+            s.epp = cppc_epp::PERFORMANCE;
+        }
+        Policy::Balanced => {
+            s.min_perf = s.hw_min_perf;
+            s.max_perf = s.hw_max_perf;
+            s.epp = cppc_epp::BALANCED_PERFORMANCE;
+        }
+        Policy::Powersave => {
+            s.min_perf = s.hw_min_perf;
+            s.max_perf = s.nominal_perf;
+            s.epp = cppc_epp::POWERSAVE;
+        }
+        Policy::Userspace => {
+            s.min_perf = s.hw_min_perf;
+            s.max_perf = s.hw_max_perf;
+        }
+    }
+}
+
+/// Set EPP on the executing CPU without changing its range.
+pub fn set_epp_current(epp: u8) -> Result<(), CpuFreqError> {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= MAX_CPUS {
+        return Err(CpuFreqError::NoSuchCpu);
+    }
+    let desired = {
+        let mut pc = PERCPU.lock();
+        let s = &mut pc[cpu];
+        if s.hw_max_perf == 0 {
+            return Err(CpuFreqError::NotEnabled);
+        }
+        s.epp = epp;
+        s.last_desired
+    };
+    write_desired(backend(), cpu, desired)
 }
 
 // ── Backend detection ──────────────────────────────────────────────
@@ -394,18 +512,40 @@ fn vendor_amd() -> bool {
 
 // ── Backend seeding ────────────────────────────────────────────────
 
-fn seed_intel_hwp() -> Result<(), CpuFreqError> {
+fn seed_intel_hwp_current() -> Result<(), CpuFreqError> {
+    wrmsr_or_gp(MSR_IA32_PM_ENABLE, 1).map_err(|_| CpuFreqError::EnableGp)?;
     let raw = rdmsr_or_gp(MSR_IA32_HWP_CAPABILITIES).map_err(|_| CpuFreqError::CapabilitiesGp)?;
     let caps = HwpCapabilities::decode(raw);
-    seed_window(caps.lowest_perf, caps.highest_perf);
+    validate_window(caps.lowest_perf, caps.guaranteed_perf, caps.highest_perf)?;
+    seed_current_window(caps.lowest_perf, caps.guaranteed_perf, caps.highest_perf);
     Ok(())
 }
 
-fn seed_amd_cppc() -> Result<(), CpuFreqError> {
+fn seed_amd_cppc_current() -> Result<(), CpuFreqError> {
+    wrmsr_or_gp(MSR_AMD_CPPC_ENABLE, ENABLE_BIT).map_err(|_| CpuFreqError::EnableGp)?;
     let raw = rdmsr_or_gp(MSR_AMD_CPPC_CAP1).map_err(|_| CpuFreqError::CapabilitiesGp)?;
     let caps = CppcCap1(raw);
-    seed_window(caps.lowest_perf(), caps.highest_perf());
+    validate_window(caps.lowest_perf(), caps.nominal_perf(), caps.highest_perf())?;
+    seed_current_window(caps.lowest_perf(), caps.nominal_perf(), caps.highest_perf());
     Ok(())
+}
+
+fn seed_current_cpu(cpu: usize) -> Result<(), CpuFreqError> {
+    if cpu >= MAX_CPUS || cpu != narf_lib::percpu::current_cpu() {
+        return Err(CpuFreqError::NoSuchCpu);
+    }
+    match backend() {
+        Backend::IntelHwp => seed_intel_hwp_current(),
+        Backend::AmdCppc => seed_amd_cppc_current(),
+        Backend::AcpiPss => {
+            if PERCPU.lock()[cpu].max_perf == 0 {
+                seed_acpi_pss()
+            } else {
+                Ok(())
+            }
+        }
+        Backend::None => Err(CpuFreqError::NoBackend),
+    }
 }
 
 fn seed_acpi_pss() -> Result<(), CpuFreqError> {
@@ -423,7 +563,7 @@ fn seed_acpi_pss() -> Result<(), CpuFreqError> {
             // per ACPI 6.5 §8.4.4.2. Map the highest entry to 255
             // and the lowest to 1 on the unitless scale so the
             // schedutil-style mapping continues to work.
-            seed_window(1, 255);
+            seed_all_windows(1, 128, 255);
             return Ok(());
         }
     }
@@ -448,48 +588,63 @@ fn read_pss_package(path: &str) -> Option<narf_aml::Value> {
     None
 }
 
-fn seed_window(lowest: u8, highest: u8) {
+fn seed_current_window(lowest: u8, nominal: u8, highest: u8) {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    let mut pc = PERCPU.lock();
+    seed_slot(&mut pc[cpu], lowest, nominal, highest);
+}
+
+fn seed_all_windows(lowest: u8, nominal: u8, highest: u8) {
     let cpus = narf_lib::smp::cpu_count() as usize;
     let mut pc = PERCPU.lock();
     for cpu in 0..cpus.min(MAX_CPUS) {
-        pc[cpu].min_perf = lowest;
-        pc[cpu].max_perf = highest;
-        pc[cpu].last_desired = 0;
-        pc[cpu].last_timer_fires = 0;
+        seed_slot(&mut pc[cpu], lowest, nominal, highest);
     }
+}
+
+fn seed_slot(slot: &mut PerCpu, lowest: u8, nominal: u8, highest: u8) {
+    slot.hw_min_perf = lowest;
+    slot.nominal_perf = nominal;
+    slot.hw_max_perf = highest;
+    slot.min_perf = lowest;
+    slot.max_perf = highest;
+    slot.last_desired = 0;
+    slot.epp = cppc_epp::BALANCED_PERFORMANCE;
+    slot.policy = Policy::Balanced;
+}
+
+fn validate_window(lowest: u8, nominal: u8, highest: u8) -> Result<(), CpuFreqError> {
+    if highest == 0 || lowest > nominal || nominal > highest {
+        return Err(CpuFreqError::InvalidCapabilities);
+    }
+    Ok(())
 }
 
 // ── Utilisation sampling ───────────────────────────────────────────
 
-/// Per-CPU utilisation proxy on the unitless 0..=1000 (permille)
-/// scale. Uses the timer-IRQ fire-count delta as a proxy: a busy
-/// CPU stays out of `halt_until_irq` so it takes the full per-tick
-/// rate; an idle CPU enters halt and sees only the LAPIC's wake
-/// IRQs.
-///
-/// Updates the per-CPU `last_timer_fires` cursor so the next call
-/// returns the delta over `TICK_INTERVAL_MS`.
+/// Per-CPU scheduler-load proxy on the unitless 0..=1000 scale.
+/// The worker itself has been popped from the ready queue while it
+/// executes, so zero means idle and any queued workload means the
+/// CPU has demand to serve.
 fn sample_utilization(cpu: usize) -> u16 {
-    let now = narf_interrupts::fire_count_on_cpu(narf_interrupts::VECTOR_TIMER, cpu);
-    let prev = {
-        let mut pc = PERCPU.lock();
-        core::mem::replace(&mut pc[cpu].last_timer_fires, now)
-    };
-    let delta = now.saturating_sub(prev);
-    util_permille_from_delta(delta, FULL_LOAD_TARGET_FIRES)
+    let runnable = narf_scheduler::cpu_queue_depths()
+        .into_iter()
+        .find(|(id, _)| *id as usize == cpu)
+        .map(|(_, depth)| depth)
+        .unwrap_or(0);
+    util_permille_from_runnable(runnable)
 }
 
-/// Pure helper: map `(delta, full_load)` into a permille (0..=1000)
-/// scale. `delta >= full_load` saturates at 1000.
+/// Pure helper mapping ready-queue depth into a bounded load signal.
 #[inline]
-pub fn util_permille_from_delta(delta: u64, full_load: u64) -> u16 {
-    if full_load == 0 {
-        return 0;
+pub const fn util_permille_from_runnable(runnable: usize) -> u16 {
+    match runnable {
+        0 => 0,
+        _ => 1000,
     }
-    if delta >= full_load {
-        return 1000;
-    }
-    ((delta * 1000) / full_load) as u16
 }
 
 /// Pure helper: linear interp of a utilisation permille into a
@@ -514,34 +669,33 @@ pub fn target_perf(util_permille: u16, min: u8, max: u8) -> u8 {
 /// `max` come from the cached window so the request is consistent
 /// across ticks. Returns `Err(RequestGp)` if the MSR write
 /// `#GP`'d (BIOS lock on the request MSR).
-fn write_desired(b: Backend, desired: u8) -> Result<(), CpuFreqError> {
+fn write_desired(b: Backend, cpu: usize, desired: u8) -> Result<(), CpuFreqError> {
+    if cpu != narf_lib::percpu::current_cpu() {
+        return Err(CpuFreqError::NoSuchCpu);
+    }
     match b {
-        Backend::IntelHwp => write_desired_hwp(desired),
-        Backend::AmdCppc => write_desired_cppc(desired),
+        Backend::IntelHwp => write_desired_hwp(cpu, desired),
+        Backend::AmdCppc => write_desired_cppc(cpu, desired),
         Backend::AcpiPss => write_desired_pss(desired),
         Backend::None => Err(CpuFreqError::NoBackend),
     }
 }
 
-fn write_desired_hwp(desired: u8) -> Result<(), CpuFreqError> {
+fn write_desired_hwp(cpu: usize, desired: u8) -> Result<(), CpuFreqError> {
     let pc = PERCPU.lock();
-    let (min, max) = (pc[0].min_perf, pc[0].max_perf);
+    let (min, max, epp) = (pc[cpu].min_perf, pc[cpu].max_perf, pc[cpu].epp);
     drop(pc);
-    // Build `IA32_HWP_REQUEST` with (min, max, desired, EPP). EPP
-    // stays at the balanced midpoint Linux + the bring-up code in
-    // `hwp.rs` picked. Per-CPU EPP knob is deferred.
-    let req = (min as u64)
-        | ((max as u64) << 8)
-        | ((desired as u64) << 16)
-        | ((crate::hwp::EPP_BALANCED_PERFORMANCE as u64) << 24);
+    // Build `IA32_HWP_REQUEST` with the policy's current
+    // (min, max, desired, EPP) tuple.
+    let req = (min as u64) | ((max as u64) << 8) | ((desired as u64) << 16) | ((epp as u64) << 24);
     wrmsr_or_gp(MSR_IA32_HWP_REQUEST, req).map_err(|_| CpuFreqError::RequestGp)
 }
 
-fn write_desired_cppc(desired: u8) -> Result<(), CpuFreqError> {
+fn write_desired_cppc(cpu: usize, desired: u8) -> Result<(), CpuFreqError> {
     let pc = PERCPU.lock();
-    let (min, max) = (pc[0].min_perf, pc[0].max_perf);
+    let (min, max, epp) = (pc[cpu].min_perf, pc[cpu].max_perf, pc[cpu].epp);
     drop(pc);
-    let req = CppcRequest::build(min, max, desired, cppc_epp::BALANCED_PERFORMANCE);
+    let req = CppcRequest::build(min, max, desired, epp);
     wrmsr_or_gp(MSR_AMD_CPPC_REQ, req.0).map_err(|_| CpuFreqError::RequestGp)
 }
 
@@ -638,6 +792,7 @@ fn decode_backend(raw: u8) -> Backend {
 pub fn __reset_for_test() {
     BACKEND_RAW.store(0xFF, Ordering::Release);
     ENABLED.store(0, Ordering::Release);
+    WORKERS_STARTED.store(false, Ordering::Release);
     TICK_COUNT.store(0, Ordering::Release);
     let mut pc = PERCPU.lock();
     for slot in pc.iter_mut() {
@@ -701,10 +856,10 @@ mod smoke_tests {
     }
     kernel_test_in!("power/cpufreq", smoke_cpufreq_hwp_field_decode);
 
-    /// AMD CPPC `MSR_AMD_CPPC_REQ` (0xC0010297) decoder.
+    /// AMD CPPC `MSR_AMD_CPPC_REQ` (0xC00102B3) decoder.
     /// Layout per AMD APM Vol 2 §17:
-    ///   bits[7:0]   = min_perf
-    ///   bits[15:8]  = max_perf
+    ///   bits[7:0]   = max_perf
+    ///   bits[15:8]  = min_perf
     ///   bits[23:16] = desired_perf
     ///   bits[31:24] = EPP
     fn smoke_cpufreq_cppc_field_decode() -> TestResult {
@@ -840,25 +995,51 @@ mod smoke_tests {
         if target_perf(500, 220, 200) != 220 {
             return TestResult::Fail("degenerate inverted");
         }
-        // util_permille_from_delta sanity.
-        if util_permille_from_delta(0, 100) != 0 {
-            return TestResult::Fail("delta=0");
+        // Scheduler ready-depth mapping sanity.
+        if util_permille_from_runnable(0) != 0 {
+            return TestResult::Fail("runnable=0");
         }
-        if util_permille_from_delta(50, 100) != 500 {
-            return TestResult::Fail("delta=50%");
+        if util_permille_from_runnable(1) != 1000 {
+            return TestResult::Fail("runnable=1");
         }
-        if util_permille_from_delta(100, 100) != 1000 {
-            return TestResult::Fail("delta=full");
+        if util_permille_from_runnable(2) != 1000 {
+            return TestResult::Fail("runnable=2");
         }
-        if util_permille_from_delta(9999, 100) != 1000 {
-            return TestResult::Fail("delta saturates");
-        }
-        if util_permille_from_delta(50, 0) != 0 {
-            return TestResult::Fail("full_load=0 guard");
+        if util_permille_from_runnable(9999) != 1000 {
+            return TestResult::Fail("runnable saturates");
         }
         TestResult::Pass
     }
     kernel_test_in!("power/cpufreq", smoke_cpufreq_target_perf_interp);
+
+    fn smoke_cpufreq_policy_windows() -> TestResult {
+        let mut slot = PerCpu::default();
+        seed_slot(&mut slot, 20, 100, 200);
+
+        apply_policy_to_slot(&mut slot, Policy::Performance);
+        if (slot.min_perf, slot.max_perf, slot.epp) != (100, 200, cppc_epp::PERFORMANCE) {
+            return TestResult::Fail("performance policy");
+        }
+
+        apply_policy_to_slot(&mut slot, Policy::Powersave);
+        if (slot.min_perf, slot.max_perf, slot.epp) != (20, 100, cppc_epp::POWERSAVE) {
+            return TestResult::Fail("powersave policy");
+        }
+
+        apply_policy_to_slot(&mut slot, Policy::Balanced);
+        if (slot.min_perf, slot.max_perf, slot.epp) != (20, 200, cppc_epp::BALANCED_PERFORMANCE) {
+            return TestResult::Fail("balanced policy");
+        }
+
+        if validate_window(20, 100, 200).is_err()
+            || validate_window(20, 10, 200) != Err(CpuFreqError::InvalidCapabilities)
+            || validate_window(20, 100, 0) != Err(CpuFreqError::InvalidCapabilities)
+        {
+            return TestResult::Fail("capability validation");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("power/cpufreq", smoke_cpufreq_policy_windows);
 
     /// Backend priority resolution: HWP > CPPC > _PSS > None when
     /// multiple are supported. Detection is CPUID-driven and we

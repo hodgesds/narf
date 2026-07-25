@@ -216,9 +216,9 @@ pub struct LatencyToken(pub u64);
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Governor {
-    /// Performance: max EPP, min == max == highest_perf.
+    /// Performance: EPP 0, nominal floor, highest target and ceiling.
     Performance = 0,
-    /// Balanced (default): EPP = 0x40, range = lowest..=highest.
+    /// Balanced (default): EPP = 0x80, range = lowest..=highest.
     Balanced = 1,
     /// Powersave: EPP = 0xFF, range = lowest..=nominal.
     Powersave = 2,
@@ -281,7 +281,7 @@ fn detect_caps() -> PowerCaps {
 fn detect_caps_live() -> PowerCaps {
     use crate::pstate::Mechanism;
     PowerCaps {
-        has_dvfs: !matches!(crate::pstate::detect(), Mechanism::None),
+        has_dvfs: crate::cppc::supported() || !matches!(crate::pstate::detect(), Mechanism::None),
         has_rapl: crate::rapl::is_supported(),
     }
 }
@@ -424,6 +424,13 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
             if !detect_caps().has_dvfs {
                 return unsupported();
             }
+            // HWP/CPPC request MSRs are per-CPU. Until the syscall
+            // bridge can execute a closure through an IPI, never
+            // acknowledge a remote write that would actually land
+            // on the calling CPU.
+            if cpu != current_cpu {
+                return unsupported();
+            }
             apply_epp(cpu, args.a1 as u8);
             CpuOpReturn {
                 status: STATUS_OK,
@@ -445,6 +452,9 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
                 }
             };
             if !detect_caps().has_dvfs {
+                return unsupported();
+            }
+            if cpu != current_cpu {
                 return unsupported();
             }
             apply_governor(cpu, gov);
@@ -534,10 +544,19 @@ fn read_topology() -> CpuTopology {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn read_perf_state(cpu: u64) -> PerfState {
+    crate::cpufreq::current_perf(cpu as u32)
+        .map(|state| PerfState {
+            delivered_perf: state.current,
+            epp: state.epp,
+            ..PerfState::default()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 fn read_perf_state(_cpu: u64) -> PerfState {
-    // Stage-1: return zeroed state until the per-CPU MSR pump
-    // is wired through arch::msr. Userspace uses non-zero
-    // delivered_perf as a "capability live" probe.
     PerfState::default()
 }
 
@@ -590,10 +609,31 @@ fn apply_freq_range(_cpu: u64, min_khz: u32, max_khz: u32) -> (u32, u32) {
     (min_khz, max_khz)
 }
 
-fn apply_epp(_cpu: u64, _epp: u8) {
-    // Stage-1: no-op, see above.
+#[cfg(target_arch = "x86_64")]
+fn apply_epp(cpu: u64, epp: u8) {
+    if crate::cpufreq::current_perf(cpu as u32).is_some() {
+        let _ = crate::cpufreq::set_epp_current(epp);
+    }
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+fn apply_epp(_cpu: u64, _epp: u8) {}
+
+#[cfg(target_arch = "x86_64")]
+fn apply_governor(cpu: u64, gov: Governor) {
+    if crate::cpufreq::current_perf(cpu as u32).is_none() {
+        return;
+    }
+    let policy = match gov {
+        Governor::Performance => crate::cpufreq::Policy::Performance,
+        Governor::Balanced => crate::cpufreq::Policy::Balanced,
+        Governor::Powersave => crate::cpufreq::Policy::Powersave,
+        Governor::Userspace => crate::cpufreq::Policy::Userspace,
+    };
+    let _ = crate::cpufreq::set_policy_current(policy);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 fn apply_governor(_cpu: u64, _gov: Governor) {}
 
 // ── Concrete handlers — Phase 4 ──────────────────────────────────
