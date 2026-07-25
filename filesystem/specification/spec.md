@@ -209,6 +209,12 @@ NARF advertises Linux's `FUSE_NO_OPEN_SUPPORT` and
 directory operations use the implicit handle zero and omit the matching
 `RELEASE` or `RELEASEDIR` request.
 
+When `FUSE_REQUEST_TIMEOUT` is negotiated with a non-zero timeout, every
+subsequent request is deadline-bound using the monotonic timer wheel. An
+expired queued or in-flight request aborts the entire connection, retires all
+queued transport work, and completes parked callers with a connection error,
+matching Linux's connection-level timeout behavior.
+
 - An empty blocking read parks in the syscall layer; a non-blocking
   read reports `EAGAIN`.
 - A daemon buffer smaller than the next complete request reports

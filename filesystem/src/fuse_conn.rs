@@ -118,6 +118,7 @@ pub struct FuseConnection {
     max_pages: AtomicU16,
     max_background: AtomicU32,
     congestion_threshold: AtomicU32,
+    request_timeout_secs: AtomicU16,
     no_open: AtomicBool,
     no_opendir: AtomicBool,
     syncfs_supported: AtomicBool,
@@ -166,6 +167,7 @@ impl FuseConnection {
             max_pages: AtomicU16::new(32),
             max_background: AtomicU32::new(FUSE_DEFAULT_MAX_BACKGROUND),
             congestion_threshold: AtomicU32::new(FUSE_DEFAULT_CONGESTION_THRESHOLD),
+            request_timeout_secs: AtomicU16::new(0),
             no_open: AtomicBool::new(false),
             no_opendir: AtomicBool::new(false),
             syncfs_supported: AtomicBool::new(true),
@@ -207,6 +209,15 @@ impl FuseConnection {
 
     pub fn congestion_threshold(&self) -> u32 {
         self.congestion_threshold.load(Ordering::Acquire)
+    }
+
+    pub fn request_timeout_secs(&self) -> u16 {
+        self.request_timeout_secs.load(Ordering::Acquire)
+    }
+
+    #[doc(hidden)]
+    pub fn __test_set_request_timeout_secs(&self, seconds: u16) {
+        self.request_timeout_secs.store(seconds, Ordering::Release);
     }
 
     pub fn connection_id(&self) -> u64 {
@@ -352,6 +363,8 @@ impl FuseConnection {
                 });
             }
         }
+        self.pending.lock().clear();
+        self.delivered.lock().clear();
     }
 
     fn send_destroy(&self) {
@@ -725,11 +738,7 @@ impl FuseConnection {
             return Err(FsError::Unsupported);
         }
         let unique = self.submit(opcode, nodeid, &body);
-        let reply = ReplyFuture {
-            conn: Arc::clone(self),
-            unique,
-        }
-        .await;
+        let reply = self.await_reply(unique).await?;
         match reply.error {
             0 => Ok(reply.body),
             e => Err(errno_to_fs_error(e)),
@@ -747,11 +756,7 @@ impl FuseConnection {
         }
         let body = pod_as_bytes(&FuseSyncfsIn::default());
         let unique = self.submit(FuseOpcode::Syncfs, FUSE_ROOT_ID, &body);
-        let reply = ReplyFuture {
-            conn: Arc::clone(self),
-            unique,
-        }
-        .await;
+        let reply = self.await_reply(unique).await?;
         match reply.error {
             0 => Ok(()),
             -38 => {
@@ -759,6 +764,27 @@ impl FuseConnection {
                 Ok(())
             }
             error => Err(errno_to_fs_error(error)),
+        }
+    }
+
+    async fn await_reply(self: &Arc<Self>, unique: u64) -> Result<FuseReply, FsError> {
+        let future = ReplyFuture {
+            conn: Arc::clone(self),
+            unique,
+        };
+        let timeout_secs = self.request_timeout_secs();
+        if timeout_secs == 0 {
+            return Ok(future.await);
+        }
+        let deadline = narf_time::Deadline::after_ms(u64::from(timeout_secs) * 1_000);
+        match narf_time::timeout(deadline, future).await {
+            Ok(reply) => Ok(reply),
+            Err(_) => {
+                // Linux aborts the entire connection when any queued or
+                // in-flight request exceeds the negotiated server timeout.
+                self.disconnect();
+                Err(FsError::Unsupported)
+            }
         }
     }
 }
@@ -2350,6 +2376,11 @@ impl FuseFs {
         self.conn.negotiated_flags.store(flags, Ordering::Release);
         self.conn.max_write.store(max_write, Ordering::Release);
         self.conn.max_pages.store(max_pages, Ordering::Release);
+        if flags & FUSE_REQUEST_TIMEOUT != 0 && out.request_timeout != 0 {
+            self.conn
+                .request_timeout_secs
+                .store(out.request_timeout, Ordering::Release);
+        }
         if minor >= 13 {
             if out.max_background != 0 {
                 self.conn

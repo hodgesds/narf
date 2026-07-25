@@ -2867,6 +2867,41 @@ fn smoke_fs_fuse_syncfs_enosys_is_cached() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_syncfs_enosys_is_cached);
 
+fn smoke_fs_fuse_request_timeout_aborts_connection() -> TestResult {
+    use crate::fuse_conn::FuseConnection;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+    let conn = Arc::new(FuseConnection::new());
+    conn.__test_set_request_timeout_secs(1);
+    narf_scheduler::__reset_queues_for_test();
+    let client = Arc::clone(&conn);
+    narf_scheduler::spawn(async move {
+        OUTCOME.store(
+            if client.request_syncfs().await.is_err() && !client.is_connected() {
+                1
+            } else {
+                2
+            },
+            Ordering::Relaxed,
+        );
+    });
+    narf_scheduler::run_until_empty();
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 if conn.waiting_requests() == 0 => TestResult::Pass,
+        1 => TestResult::Fail("timed-out FUSE request was not retired"),
+        2 => TestResult::Fail("FUSE request timeout did not abort connection"),
+        _ => TestResult::Fail("FUSE request timeout task did not complete"),
+    }
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_fs_fuse_request_timeout_aborts_connection
+);
+
 fn smoke_fs_fuse_request_context() -> TestResult {
     use crate::fuse::{pod_from_bytes, FuseInHeader, FuseOpcode};
     use crate::fuse_conn::{
@@ -3101,7 +3136,7 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
                 map_alignment: 0,
                 flags2: init.flags2,
                 max_stack_depth: 0,
-                request_timeout: 0,
+                request_timeout: 17,
                 unused: [0; 11],
             };
             Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
@@ -3575,6 +3610,7 @@ fn smoke_fs_fuse_end_to_end() -> TestResult {
         1 if conn.negotiated_minor() == crate::fuse::FUSE_KERNEL_MINOR_VERSION
             && conn.max_write() == 256 * 1024
             && conn.max_pages() == 32
+            && conn.request_timeout_secs() == 17
             && conn.negotiated_flags() & crate::fuse::FuseInitFlag::PosixLocks as u64 != 0 =>
         {
             TestResult::Pass
