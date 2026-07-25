@@ -446,6 +446,105 @@ impl BuddyZone {
         }
     }
 
+    /// Whether donating this range can use the already-reserved free-list
+    /// capacity. Runtime hotplug must not grow a `Vec` while the global frame
+    /// lock is held because the slab allocator recurses into that lock.
+    pub fn can_donate_without_growth(&self, first_frame: u64, frame_count: u64) -> bool {
+        let mut needed = [0usize; NUM_ORDERS];
+        let mut start = first_frame;
+        let end = first_frame.saturating_add(frame_count);
+        while start < end {
+            let mut order = MAX_ORDER;
+            while order > 0 {
+                let block_frames = order_frames(order);
+                if (start & (block_frames - 1)) == 0 && start + block_frames <= end {
+                    break;
+                }
+                order -= 1;
+            }
+            needed[order as usize] += 1;
+            start += order_frames(order);
+        }
+        needed.iter().enumerate().all(|(order, need)| {
+            self.free_lists[order].len().saturating_add(*need) <= self.free_lists[order].capacity()
+        })
+    }
+
+    /// Remove a fully-free frame range from this zone.
+    ///
+    /// Returns false without mutation if any frame is allocated. Free blocks
+    /// crossing a range boundary are split in place; only outside fragments
+    /// are returned to the lists.
+    pub fn remove_free_range(&mut self, first_frame: u64, frame_count: u64) -> bool {
+        if frame_count == 0 {
+            return false;
+        }
+        let end = first_frame.saturating_add(frame_count);
+        if end <= first_frame {
+            return false;
+        }
+        let mut covered = 0u64;
+        for (order, list) in self.free_lists.iter().enumerate() {
+            let span = order_frames(order as u8);
+            for &block in list {
+                let overlap_lo = block.max(first_frame);
+                let overlap_hi = block.saturating_add(span).min(end);
+                if overlap_lo < overlap_hi {
+                    covered = covered.saturating_add(overlap_hi - overlap_lo);
+                }
+            }
+        }
+        if covered != frame_count {
+            return false;
+        }
+
+        for order in (0..NUM_ORDERS).rev() {
+            let span = order_frames(order as u8);
+            let mut index = 0;
+            while index < self.free_lists[order].len() {
+                let block = self.free_lists[order][index];
+                let block_end = block + span;
+                if block >= end || block_end <= first_frame {
+                    index += 1;
+                    continue;
+                }
+                self.free_lists[order].swap_remove(index);
+                Self::retain_outside_range(
+                    &mut self.free_lists,
+                    block,
+                    order as u8,
+                    first_frame,
+                    end,
+                );
+            }
+        }
+        self.free_frames -= frame_count as usize;
+        self.total_frames -= frame_count as usize;
+        true
+    }
+
+    fn retain_outside_range(
+        lists: &mut [Vec<u64>; NUM_ORDERS],
+        block: u64,
+        order: u8,
+        remove_lo: u64,
+        remove_hi: u64,
+    ) {
+        let end = block + order_frames(order);
+        if block >= remove_lo && end <= remove_hi {
+            return;
+        }
+        if end <= remove_lo || block >= remove_hi {
+            lists[order as usize].push(block);
+            return;
+        }
+        debug_assert!(order > 0);
+        let child_order = order - 1;
+        let half = order_frames(child_order);
+        Self::retain_outside_range(lists, block, child_order, remove_lo, remove_hi);
+        Self::retain_outside_range(lists, block + half, child_order, remove_lo, remove_hi);
+    }
+
     /// Allocate a block of `order` frames. Splits a higher-order
     /// block if necessary; pushes the unused half back to the
     /// next-lower order's list. Returns `None` on exhaustion.
@@ -695,6 +794,32 @@ mod tests {
         assert_eq!(order_bytes(0), 4096);
         assert_eq!(order_bytes(1), 8192);
         assert_eq!(order_bytes(10), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn remove_free_range_splits_boundary_blocks() {
+        let mut zone = BuddyZone::new();
+        zone.donate(0x1000, 16);
+        assert!(zone.remove_free_range(0x1004, 4));
+        assert_eq!(zone.total_frame_count(), 12);
+        assert_eq!(zone.free_frame_count(), 12);
+        for _ in 0..12 {
+            let frame = zone.alloc(0).expect("outside frame");
+            assert!(!(0x1004..0x1008).contains(&frame));
+        }
+        assert!(zone.alloc(0).is_none());
+    }
+
+    #[test]
+    fn remove_free_range_rejects_allocated_frame_without_mutation() {
+        let mut zone = BuddyZone::new();
+        zone.donate(0x2000, 8);
+        let allocated = zone.alloc(0).expect("allocation");
+        assert!(!zone.remove_free_range(0x2000, 8));
+        assert_eq!(zone.total_frame_count(), 8);
+        assert_eq!(zone.free_frame_count(), 7);
+        zone.free(allocated, 0);
+        assert!(zone.remove_free_range(0x2000, 8));
     }
 
     #[test]

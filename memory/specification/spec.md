@@ -89,6 +89,23 @@ pub fn interleave_auto() -> bool;
 pub fn set_interleave_auto(enabled: bool) -> Result<(), ()>;
 pub fn set_interleave_bandwidth(node: usize, bandwidth: u64) -> Result<(), ()>;
 
+/// Runtime memory-hotplug admission. The caller proves the range is real,
+/// kernel-mapped RAM that does not overlap boot-reserved or MMIO storage.
+pub unsafe fn online_memory_range(
+    start: PhysAddr,
+    len: u64,
+    node: usize,
+) -> Result<(), MemoryHotplugError>;
+/// Remove an exact previously-hotplugged range only when every frame is free.
+pub fn offline_memory_range(
+    start: PhysAddr,
+    len: u64,
+) -> Result<usize, MemoryHotplugError>;
+pub fn kernel_ram_range_mapped(start: PhysAddr, len: u64) -> bool;
+pub fn online_node_mask() -> u64;
+pub fn online_node_count() -> usize;
+pub fn hotplug_node_for_phys(addr: PhysAddr) -> Option<usize>;
+
 /// Temporarily remove an eligible private resident leaf for NUMA sampling.
 pub unsafe fn protect_numa_hint_page(vaddr: VirtAddr) -> Result<bool, AddressSpaceError>;
 /// Consume the recorded hint before restoring or migrating its backing.
@@ -222,6 +239,11 @@ x86_64 is rejected at runtime.
 - `PhysFrame` is `!Copy`; dropping it returns to the allocator (Rust
   ownership = leak safety for physical memory).
 - Buddy allocator's free lists are per-NUMA-node once NUMA is introduced.
+- Runtime memory online is transactional: overlapping/unmapped ranges are
+  rejected before donation, and allocator metadata may not grow while the
+  frame lock is held. Offline succeeds only for an exact registered range
+  whose complete buddy extent is free; a failed removal leaves every free
+  list and node counter unchanged.
 - **A `PhysFrame` returned by `alloc_frame()` is always tagged to
   `DomainId::FRAME` (domain 0) at the point of return.** The caller
   must invoke `assign_domain` before mapping into a non-Frame domain.

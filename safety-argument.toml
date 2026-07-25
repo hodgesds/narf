@@ -38,3 +38,11 @@ argument = "Moving interleave sequence ownership from CPU slots to task-scoped u
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Automatic NUMA balancing samples only private, unlocked user leaves and retains ownership of every backing frame while the leaf is absent. Hint resolution intersects policy with cpuset.mems, serializes migration through the address-space region lock, completes cross-CPU TLB invalidation before freeing the source, and always restores a mapping after migration failure."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Memory hotplug admits only aligned, non-overlapping host-acknowledged RAM already covered by the active kernel linear map. Online donation cannot grow allocator metadata under the frame lock; offline is an exact-range, all-free transaction whose failed validation leaves buddy lists and per-node accounting unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "virtio-mem preserves physical-frame ownership by ordering PLUG before allocator donation and allocator removal before UNPLUG, rolling either side back when the second step fails. No busy frame is reclaimed or exposed to the host, and dynamic node reporting exports aggregate state rather than physical addresses."

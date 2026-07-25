@@ -83,6 +83,38 @@ fn numa_node_count() -> u32 {
     n.max(1)
 }
 
+fn numa_online_list() -> String {
+    let mask = narf_memory::online_node_mask();
+    let mut out = String::new();
+    let mut node = 0u32;
+    let mut first = true;
+    while node < narf_memory::FRAME_MAX_NUMA_NODES as u32 {
+        if (mask >> node) & 1 == 0 {
+            node += 1;
+            continue;
+        }
+        let start = node;
+        while node + 1 < narf_memory::FRAME_MAX_NUMA_NODES as u32 && (mask >> (node + 1)) & 1 != 0 {
+            node += 1;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        if start == node {
+            out.push_str(&format!("{start}"));
+        } else {
+            out.push_str(&format!("{start}-{node}"));
+        }
+        node += 1;
+    }
+    if first {
+        out.push('0');
+    }
+    out.push('\n');
+    out
+}
+
 #[inline]
 fn node_distance(from: u32, to: u32) -> u8 {
     // SAFETY: narf-frame provides the definition.
@@ -1018,21 +1050,15 @@ pub fn populate_numa_nodes() {
     let system = get_or_create_child(&devices, "system");
     let node_dir = get_or_create_child(&system, "node");
 
-    let n = numa_node_count().max(1);
+    // Online membership is live: allocator hotplug updates are immediately
+    // visible without rebuilding sysfs. All architectural slots are possible.
+    kobject_add_attr(&node_dir, "online", numa_online_list);
+    kobject_add_attr(&node_dir, "possible", || {
+        format!("0-{}\n", narf_memory::FRAME_MAX_NUMA_NODES - 1)
+    });
+    kobject_add_attr(&node_dir, "has_normal_memory", numa_online_list);
 
-    // /sys/devices/system/node/online and /possible: "0" or "0-N".
-    let range = if n <= 1 {
-        "0\n".to_string()
-    } else {
-        format!("0-{}\n", n - 1)
-    };
-    let online = range.clone();
-    let possible = range.clone();
-    kobject_add_attr(&node_dir, "online", move || online.clone());
-    kobject_add_attr(&node_dir, "possible", move || possible.clone());
-    kobject_add_attr(&node_dir, "has_normal_memory", move || range.clone());
-
-    for node in 0..n {
+    for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
         let name = format!("node{}", node);
         let kobj = get_or_create_child(&node_dir, &name);
 
@@ -1126,7 +1152,7 @@ pub fn populate_weighted_interleave() {
     let mm = get_or_create_child(&kernel, "mm");
     let mempolicy = get_or_create_child(&mm, "mempolicy");
     let weighted = get_or_create_child(&mempolicy, "weighted_interleave");
-    let count = (numa_node_count() as usize).clamp(1, NODE_ATTRS.len());
+    let count = narf_memory::FRAME_MAX_NUMA_NODES.min(NODE_ATTRS.len());
 
     kobject_add_writable_attr(
         &weighted,

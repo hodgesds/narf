@@ -75,7 +75,9 @@ mod secure_boot;
 // `narf-frame` is the only crate that links both.
 #[unsafe(no_mangle)]
 pub fn narf_phys_to_node(addr: u64) -> u32 {
-    narf_acpi::memory_node(addr).unwrap_or(0)
+    narf_memory::hotplug_node_for_phys(addr)
+        .map(|node| node as u32)
+        .unwrap_or_else(|| narf_acpi::memory_node(addr).unwrap_or(0))
 }
 #[unsafe(no_mangle)]
 pub fn narf_cpu_to_node(cpu: u32) -> u32 {
@@ -90,7 +92,7 @@ pub fn narf_node_distance(from: u32, to: u32) -> u32 {
 /// direct narf-acpi dep). Always >= 1.
 #[unsafe(no_mangle)]
 pub fn narf_numa_node_count() -> u32 {
-    narf_acpi::numa_node_count()
+    narf_acpi::numa_node_count().max(narf_memory::online_node_count())
 }
 /// CPU → NUMA node, returning `u32::MAX` when the CPU has no SRAT
 /// proximity entry (so sysfs cpulist can distinguish "node 0" from

@@ -226,6 +226,27 @@ static ALLOC: IrqSafeSpinLock<FrameAllocator> = IrqSafeSpinLock::new(FrameAlloca
     numa_aware: false,
 });
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct HotplugRange {
+    start: u64,
+    len: u64,
+    node: usize,
+}
+
+static HOTPLUG_RANGES: IrqSafeSpinLock<Vec<HotplugRange>> = IrqSafeSpinLock::new(Vec::new());
+static ONLINE_NODE_MASK: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MemoryHotplugError {
+    Uninitialised,
+    InvalidRange,
+    InvalidNode,
+    Overlap,
+    MetadataCapacity,
+    Busy,
+    NotOnline,
+}
+
 /// A subset of the bootloader memory map: just what the allocator needs.
 /// Consumers typically pass `BootInfo::memory_map` via `narf_boot`.
 #[derive(Copy, Clone, Debug)]
@@ -489,7 +510,109 @@ pub fn rebalance_to_topology() {
     for node in 0..MAX_NUMA_NODES {
         g.node_total_frames[node] = g.zones[node].free_frame_count();
     }
+    let mut online = 0u64;
+    for node in 0..MAX_NUMA_NODES {
+        if g.node_total_frames[node] != 0 {
+            online |= 1u64 << node;
+        }
+    }
+    ONLINE_NODE_MASK.store(online.max(1), Ordering::Release);
     g.numa_aware = true;
+}
+
+/// Dynamically add a real, kernel-addressable RAM range to one NUMA node.
+///
+/// # Safety
+/// The caller must prove the range is RAM, is mapped in the kernel direct
+/// map, and does not overlap boot RAM, MMIO, or any previously managed range.
+pub unsafe fn online_memory_range(
+    start: PhysAddr,
+    len: u64,
+    node: usize,
+) -> Result<(), MemoryHotplugError> {
+    if node >= MAX_NUMA_NODES {
+        return Err(MemoryHotplugError::InvalidNode);
+    }
+    if len == 0
+        || start.raw() & (PAGE_SIZE - 1) != 0
+        || len & (PAGE_SIZE - 1) != 0
+        || start.raw().checked_add(len).is_none()
+    {
+        return Err(MemoryHotplugError::InvalidRange);
+    }
+    let mut ranges = HOTPLUG_RANGES.lock();
+    let end = start.raw() + len;
+    if ranges
+        .iter()
+        .any(|range| range.start < end && start.raw() < range.start + range.len)
+    {
+        return Err(MemoryHotplugError::Overlap);
+    }
+    ranges.push(HotplugRange {
+        start: start.raw(),
+        len,
+        node,
+    });
+
+    let first_frame = start.raw() >> PAGE_SHIFT;
+    let frame_count = len >> PAGE_SHIFT;
+    let mut allocator = ALLOC.lock();
+    if !allocator.initialised {
+        ranges.pop();
+        return Err(MemoryHotplugError::Uninitialised);
+    }
+    if !allocator.zones[node].can_donate_without_growth(first_frame, frame_count) {
+        ranges.pop();
+        return Err(MemoryHotplugError::MetadataCapacity);
+    }
+    allocator.zones[node].donate(first_frame, frame_count);
+    allocator.node_total_frames[node] += frame_count as usize;
+    allocator.total_frames += frame_count as usize;
+    ONLINE_NODE_MASK.fetch_or(1u64 << node, Ordering::AcqRel);
+    Ok(())
+}
+
+/// Remove an exact hotplug range after proving every frame is free.
+///
+/// A busy range is left online and returns [`MemoryHotplugError::Busy`].
+pub fn offline_memory_range(start: PhysAddr, len: u64) -> Result<usize, MemoryHotplugError> {
+    if len == 0 || start.raw() & (PAGE_SIZE - 1) != 0 || len & (PAGE_SIZE - 1) != 0 {
+        return Err(MemoryHotplugError::InvalidRange);
+    }
+    let mut ranges = HOTPLUG_RANGES.lock();
+    let Some(index) = ranges
+        .iter()
+        .position(|range| range.start == start.raw() && range.len == len)
+    else {
+        return Err(MemoryHotplugError::NotOnline);
+    };
+    let range = ranges[index];
+    let first_frame = start.raw() >> PAGE_SHIFT;
+    let frame_count = len >> PAGE_SHIFT;
+    let mut allocator = ALLOC.lock();
+    if !allocator.zones[range.node].remove_free_range(first_frame, frame_count) {
+        return Err(MemoryHotplugError::Busy);
+    }
+    allocator.node_total_frames[range.node] -= frame_count as usize;
+    allocator.total_frames -= frame_count as usize;
+    ranges.swap_remove(index);
+    if allocator.node_total_frames[range.node] == 0 {
+        ONLINE_NODE_MASK.fetch_and(!(1u64 << range.node), Ordering::AcqRel);
+    }
+    Ok(range.node)
+}
+
+pub fn online_node_mask() -> u64 {
+    ONLINE_NODE_MASK.load(Ordering::Acquire)
+}
+
+pub fn online_node_count() -> u32 {
+    let mask = online_node_mask();
+    if mask == 0 {
+        1
+    } else {
+        64 - mask.leading_zeros()
+    }
 }
 
 /// Allocate one 4 KiB frame. NUMA-aware: prefers the current CPU's
@@ -1230,6 +1353,9 @@ fn fallback_order(preferred: usize, out: &mut [usize; MAX_NUMA_NODES]) -> usize 
 
 #[inline]
 fn phys_to_node(addr: u64) -> usize {
+    if let Some(node) = hotplug_node_for_phys(addr) {
+        return node;
+    }
     // SAFETY: narf-frame provides the `#[no_mangle]` definition.
     let n = unsafe { narf_phys_to_node(addr) } as usize;
     if n < MAX_NUMA_NODES {
@@ -1237,6 +1363,18 @@ fn phys_to_node(addr: u64) -> usize {
     } else {
         0
     }
+}
+
+pub fn node_for_phys(addr: u64) -> usize {
+    phys_to_node(addr)
+}
+
+pub fn hotplug_node_for_phys(addr: u64) -> Option<usize> {
+    HOTPLUG_RANGES
+        .lock()
+        .iter()
+        .find(|range| addr >= range.start && addr < range.start + range.len)
+        .map(|range| range.node)
 }
 
 #[inline]
