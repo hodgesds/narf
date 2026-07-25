@@ -8,6 +8,7 @@
 //! PPI (INTID 30) can deliver IRQs. SMP AP bring-up + SPI (shared
 //! peripheral interrupt) routing are later waves.
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use narf_arch::aarch64::mmio::{read_u32, write_u32};
 use narf_arch::aarch64::sysreg;
 
@@ -35,6 +36,29 @@ const GICR_SGI_OFF: usize = 0x1_0000;
 const GICR_IGROUPR0_OFF: usize = GICR_SGI_OFF + 0x0080;
 const GICR_ISENABLER0_OFF: usize = GICR_SGI_OFF + 0x0100;
 const GICR_IPRIORITYR0_OFF: usize = GICR_SGI_OFF + 0x0400;
+static PMU_PPI: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Install the firmware-discovered PMU PPI and enable it on this CPU.
+///
+/// APs subsequently enable the same PPI from `init_per_cpu`. The caller must
+/// not substitute a platform default when firmware discovery fails.
+pub fn configure_pmu_ppi(intid: u32) -> Result<(), ()> {
+    if !(16..32).contains(&intid) {
+        return Err(());
+    }
+    PMU_PPI.store(intid, Ordering::Release);
+    // SAFETY: this only touches the current CPU's already-initialised
+    // redistributor; the BSP calls it after init_bsp.
+    unsafe { enable_private_irq(narf_lib::percpu::current_cpu() as u32, intid) };
+    Ok(())
+}
+
+pub fn pmu_ppi() -> Option<u32> {
+    match PMU_PPI.load(Ordering::Acquire) {
+        u32::MAX => None,
+        intid => Some(intid),
+    }
+}
 
 /// Initialise the BSP CPU's GICv3 view + enable Group 1 IRQs.
 ///
@@ -137,5 +161,20 @@ unsafe fn init_per_cpu(cpu_index: u32) {
         // Enable timer PPI + all SGIs.
         let mask = (1u32 << super::TIMER_PPI) | 0x0000_FFFF;
         write_u32((gicr + GICR_ISENABLER0_OFF) as *mut u32, mask);
+    }
+    if let Some(intid) = pmu_ppi() {
+        // SAFETY: same current-CPU redistributor initialisation window.
+        unsafe { enable_private_irq(cpu_index, intid) };
+    }
+}
+
+unsafe fn enable_private_irq(cpu_index: u32, intid: u32) {
+    let gicr = gicr_base(cpu_index);
+    // SAFETY: caller executes for this CPU's live redistributor and intid was
+    // validated as an SGI/PPI-bank interrupt.
+    unsafe {
+        let prio = (gicr + GICR_IPRIORITYR0_OFF + intid as usize) as *mut u8;
+        core::ptr::write_volatile(prio, 0xA0);
+        write_u32((gicr + GICR_ISENABLER0_OFF) as *mut u32, 1u32 << intid);
     }
 }

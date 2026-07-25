@@ -30,7 +30,14 @@ pub enum IrqTarget {
 }
 pub fn end_of_interrupt(n: IrqNum);
 pub fn trigger_sw(n: IrqNum, target_cpu: CpuId);
+
+#[cfg(target_arch = "aarch64")]
+pub fn gic::configure_pmu_ppi(intid: u32) -> Result<(), ()>;
 ```
+
+The PMU route accepts only private INTIDs 16–31, enables the current CPU's
+redistributor immediately, and is inherited by subsequent per-CPU GIC
+initialisation. Its input must come from firmware discovery.
 
 ## 4. Invariants & safety properties
 

@@ -82,3 +82,7 @@ argument = "The scheduler PMU hook receives only the already-published scalar Ta
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "PMU switch-out disables and releases the current CPU's counter before executor code or a peer task runs. Per-CPU allocation prevents one logical CPU from programming or releasing another CPU's MSR bank during migration."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The aarch64 boot edit passes only a firmware-validated private interrupt number from the bus parser to the GIC. The GIC rejects non-PPI INTIDs, applies the route only to each CPU's own redistributor, and grants no capability or cross-domain memory access."

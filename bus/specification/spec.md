@@ -74,7 +74,14 @@ pub fn devices() -> impl Iterator<Item = &'static DeviceInfo>;
 pub fn snapshot() -> &'static [DeviceInfo];
 
 pub fn watch() -> impl Stream<Item = BusEvent>;       // hot-plug arrivals / removals
+
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn discover_pmu_ppi(dtb: PhysAddr) -> Option<u32>;
 ```
+
+`discover_pmu_ppi` accepts only an `arm,armv8-pmuv3` node with a GIC
+three-cell PPI interrupt specifier and returns its architectural INTID. It has
+no platform-default fallback because the PMU interrupt is implementation-defined.
 
 ### 3.3 Device capability
 
