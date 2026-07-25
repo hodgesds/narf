@@ -30,6 +30,9 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 - `packaging/build-release.sh --version X.Y.Z` — wrap the canonical
   Multiboot2 kernel ELF in native distribution packages and emit a
   checksummed release manifest.
+- Kernel ELFs on both architectures carry a deterministic SHA-1 GNU build-ID;
+  linker symbols `__build_id_note_start` and `__build_id_note_end` delimit the
+  retained note for `/sys/kernel/notes`.
 - Workspace: single Cargo workspace so Global LTO spans everything.
 
 ## 4. Invariants & safety properties

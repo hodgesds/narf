@@ -36,7 +36,7 @@ over that authority; it is not a second PMU subsystem.
 | `perf stat -a` | per-CPU events and online CPU discovery | partial | Exact hardware counting is admitted only for the calling CPU on a uniprocessor boot; SMP/remote-CPU operation returns `EOPNOTSUPP`. |
 | `perf stat -p PID` | task-scoped accounting | supported slice | Scheduler switch hooks allocate the target's architecture-specific counter only on the CPU where it runs and fold counts across preemption and migration on x86_64 and aarch64. |
 | `perf record` | overflow sampling, mmap metadata/data ring, poll wakeups | partial (x86_64 and aarch64 PMUv3) | Intel architectural PMU and AMD legacy/PerfMonV2 GP counters route real LVT-PC overflow IRQs into SAMPLE/LOST ring records; task counters switch architecture-specific per-CPU PMU state across preemption and migration and inherit across process/thread clones; frequency mode adapts real reload periods from observed overflow timing. On aarch64, fixed cycle and PMCEID-advertised programmable events are verified end to end through counter preload, firmware-discovered level-sensitive PPI 23, GICv3 dispatch, PMOVS acknowledgement/reload, interrupted-ELR capture, deferred drain, and a visible mmap sample. Frequency mode adapts the real PMUv3 reload, and locally active events support synchronous live period updates; remotely active updates fail until an IPI rendezvous exists. Exec publishes exact program/interpreter PT_LOAD and stack VMAs, and later mmap/comm/fork/exit paths emit MMAP/MMAP2/COMM/FORK/EXIT with `sample_id_all` trailers. Ring overflow is reported through both `PERF_RECORD_LOST` and `PERF_FORMAT_LOST`; `PERF_EVENT_IOC_PAUSE_OUTPUT` suppresses production until resumed; `PERF_EVENT_IOC_SET_OUTPUT` redirects compatible events into a shared mapped ring. Hardware per-CPU events on SMP and synchronous remote PMU control remain. |
-| `perf report` | perf.data parser, symbols, unwind | userspace-only after record | Kernel work is primarily `/proc`, build-id, and mmap metadata fidelity. |
+| `perf report` | perf.data parser, symbols, unwind | userspace-only after record | Kernel ELFs now carry deterministic SHA-1 build IDs and expose the exact GNU note at `/sys/kernel/notes`. Full kernel DSO attribution still requires real kallsyms/relocation metadata; an unmodified record of the no-build-ID BusyBox workload therefore honestly omits `HEADER_BUILD_ID` instead of inventing one. Memory and hybrid topology metadata also remain absent pending authoritative topology interfaces. |
 | `perf trace` | tracepoint PMU, tracefs event metadata | unsupported | NARF tracing rings are not yet projected as Linux tracepoints. |
 | `perf top` | sampling plus periodic display | unsupported | Blocked by the same ring/PMI work as `perf record`. |
 | probes (`kprobe`, `uprobe`) | probe PMUs, tracefs dynamic events | unsupported | Must be capability-gated when added. |
@@ -97,7 +97,10 @@ Gaps:
 3. Complete sampling portability with synchronous cross-CPU PMU control;
    retain the real-overflow QEMU gate on both IRQ backends.
 4. Add unwind and build-id prerequisites for `perf record/report`; initial
-   ELF/interpreter/stack and post-exec `mmap(2)` MMAP/MMAP2 records are wired.
+   ELF/interpreter/stack and post-exec `mmap(2)` MMAP/MMAP2 records are wired,
+   and the real kernel GNU build-ID note is published. Kernel symbol and
+   relocation metadata remain before perf can associate sampled kernel IPs
+   with that ID.
 5. Project selected NARF tracing events into tracepoint IDs and tracefs for
    `perf trace`; add probes and BPF only after their capability and safety
    model is reviewed.

@@ -38,6 +38,7 @@ rustflags = [
     "-C", "code-model=kernel",
     "-C", "link-arg=-Tbuild/linker/x86_64.ld",
     "-C", "link-arg=--gc-sections",
+    "-C", "link-arg=--build-id=sha1",
     "-Z", "plt=no",
     # curve25519: same as poly1305.
     "--cfg", "curve25519_dalek_backend=\"serial\"",
@@ -63,6 +64,7 @@ rustflags = [
     "-C", "target-feature=+lse",
     "-C", "link-arg=-Tbuild/linker/aarch64.ld",
     "-C", "link-arg=--gc-sections",
+    "-C", "link-arg=--build-id=sha1",
 ]
 
 # ─── Alias shortcuts ───────────────────────────────────────────────

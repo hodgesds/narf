@@ -120,6 +120,9 @@ decimal weights in Linux's inclusive range 1..=255. Changes affect new
 The sibling `auto` attribute accepts Linux boolean strings; enabling it
 recomputes weights from parsed HMAT bandwidth and fails if no usable
 bandwidth coordinates exist. Writing `nodeN` selects manual mode.
+`/sys/kernel/notes` is a binary sysfs attribute containing the exact
+linker-retained GNU build-ID note for the running NARF kernel. Linux perf
+uses this note to identify kernel samples in persisted `perf.data`.
 `/proc/buddyinfo` reports live per-order free-block counts, while
 `/proc/zoneinfo` uses stable per-node managed totals and live NUMA events.
 

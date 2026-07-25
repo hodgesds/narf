@@ -1570,6 +1570,8 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
             "link-arg=-Tbuild/linker/x86_64.ld",
             "-C",
             "link-arg=--gc-sections",
+            "-C",
+            "link-arg=--build-id=sha1",
             "-Z",
             "plt=no",
             "--cfg",

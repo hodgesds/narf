@@ -74,6 +74,8 @@ extern "Rust" {
     fn narf_numa_node_count() -> u32;
     fn narf_node_distance(from: u32, to: u32) -> u32;
     fn narf_cpu_node_opt(cpu: u32) -> u32;
+    static __build_id_note_start: u8;
+    static __build_id_note_end: u8;
 }
 
 #[inline]
@@ -168,6 +170,23 @@ fn cpu_node(cpu: u32) -> Option<u32> {
     } else {
         Some(n)
     }
+}
+
+/// Read the linker-generated GNU build-ID note exactly as Linux exposes it
+/// through `/sys/kernel/notes`.
+fn kernel_notes_read(offset: usize, buf: &mut [u8]) -> usize {
+    let start = core::ptr::addr_of!(__build_id_note_start) as usize;
+    let end = core::ptr::addr_of!(__build_id_note_end) as usize;
+    let len = end.saturating_sub(start);
+    if offset >= len {
+        return 0;
+    }
+    let count = buf.len().min(len - offset);
+    // SAFETY: the linker symbols delimit the retained, immutable
+    // `.note.gnu.build-id` bytes inside the kernel's mapped rodata.
+    let source = unsafe { core::slice::from_raw_parts((start + offset) as *const u8, count) };
+    buf[..count].copy_from_slice(source);
+    count
 }
 
 // ── Attr function types ───────────────────────────────────────────────
@@ -1002,6 +1021,7 @@ pub fn populate_kernel_dir() {
     let root = get_root();
     let kernel = get_or_create_child(&root, "kernel");
     kobject_add_attr(&kernel, "uevent_seqnum", crate::uevent::gen_uevent_seqnum);
+    kobject_add_bin_attr(&kernel, "notes", kernel_notes_read);
 
     // /sys/kernel/mm/transparent_hugepage/ — THP policy knobs.
     // NARF implements no huge-page promotion; `[never]` is permanently active.
@@ -2259,6 +2279,35 @@ fn smoke_sysfs_weighted_interleave_controls() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/sysfs", smoke_sysfs_weighted_interleave_controls);
+
+fn smoke_sysfs_kernel_notes_has_gnu_build_id() -> TestResult {
+    populate_kernel_dir();
+    let Some(kernel) = get_root().get_child("kernel") else {
+        return TestResult::Fail("sysfs kernel directory missing");
+    };
+    let mut note = [0u8; 64];
+    let Some(read) = kernel.bin_attr_read("notes", 0, &mut note) else {
+        return TestResult::Fail("sysfs kernel notes missing");
+    };
+    if read < 16 {
+        return TestResult::Fail("kernel build-id note is truncated");
+    }
+    let namesz = u32::from_ne_bytes(note[0..4].try_into().unwrap());
+    let descsz = u32::from_ne_bytes(note[4..8].try_into().unwrap());
+    let note_type = u32::from_ne_bytes(note[8..12].try_into().unwrap());
+    if namesz != 4 || descsz == 0 || note_type != 3 || &note[12..16] != b"GNU\0" {
+        return TestResult::Fail("kernel notes lacks a valid GNU build-id");
+    }
+    let mut tail = [0u8; 8];
+    if kernel.bin_attr_read("notes", read, &mut tail) != Some(0) {
+        return TestResult::Fail("kernel notes EOF is not stable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/sysfs",
+    smoke_sysfs_kernel_notes_has_gnu_build_id
+);
 
 // ── Reset helper for tests ────────────────────────────────────────────
 
