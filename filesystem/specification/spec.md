@@ -176,6 +176,11 @@ by `/dev/fuse` and `virtiofs`. Each open of `/dev/fuse` owns one
 connection; reads return exactly one complete request and writes match
 replies by the non-zero `unique` identifier.
 
+`FUSE_DEV_IOC_CLONE` replaces a fresh `/dev/fuse` endpoint with another
+daemon endpoint on the source fd's connection. Cloned endpoints share
+request and reply queues, and closing one endpoint leaves the connection
+live until the final daemon endpoint closes.
+
 - An empty blocking read parks in the syscall layer; a non-blocking
   read reports `EAGAIN`.
 - A daemon buffer smaller than the next complete request reports

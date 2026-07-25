@@ -18,6 +18,47 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // FUSE_DEV_IOC_CLONE attaches this freshly opened `/dev/fuse` fd to
+    // the connection named by the u32 source fd at `arg`. Linux implements
+    // this in fs/fuse/dev.c because it must inspect and replace fd-private
+    // state; keep the same split here rather than exposing fd tables to VFS.
+    if cmd == narf_filesystem::fuse_conn::DevFuse::DEV_IOC_CLONE {
+        let mut oldfd_bytes = [0u8; core::mem::size_of::<u32>()];
+        // SAFETY: copy_from_user validates the user range and performs the
+        // architecture's required user-access bracketing.
+        if unsafe { copy_from_user(&mut oldfd_bytes, arg as u64) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+        let oldfd = u32::from_ne_bytes(oldfd_bytes);
+        let source = fd::with_table(task, |t| t.get(oldfd).map(|e| e.ops.clone())).flatten();
+        let Some(source) = source else {
+            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            return;
+        };
+        let cloned = match narf_filesystem::fuse_conn::DevFuse::clone_endpoint(&ops, &source) {
+            Ok(cloned) => cloned,
+            Err(_) => {
+                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                return;
+            }
+        };
+        let replaced = fd::with_table(task, |t| {
+            let Some(entry) = t.get_mut(fd) else {
+                return false;
+            };
+            entry.ops = cloned;
+            entry.offset = 0;
+            true
+        })
+        .unwrap_or(false);
+        ctx.set_return(SyscallReturn::ok(if replaced {
+            0
+        } else {
+            (-(EBADF as i64)) as u64
+        }));
+        return;
+    }
     // Wave-76 special-case: TIOCGPTPEER allocates a fresh slave fd in
     // the caller's table. The fd-allocation side lives here (not in the
     // filesystem crate), so we hijack the dispatch before delegating.

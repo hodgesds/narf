@@ -100,6 +100,10 @@ pub struct FuseConnection {
     poll_handles: IrqSafeSpinLock<BTreeMap<u64, PollState>>,
     next_unique: AtomicU64,
     connected: core::sync::atomic::AtomicBool,
+    /// Number of distinct `/dev/fuse` daemon endpoints attached to this
+    /// connection. `dup()` shares one endpoint; FUSE_DEV_IOC_CLONE creates
+    /// another and the connection dies only when the last endpoint closes.
+    daemon_endpoints: AtomicUsize,
     /// True once FUSE_INIT has completed successfully.
     initialized: core::sync::atomic::AtomicBool,
     negotiated_minor: AtomicU32,
@@ -139,6 +143,7 @@ impl FuseConnection {
             // some versions; any monotone non-zero sequence is spec-legal.
             next_unique: AtomicU64::new(1),
             connected: core::sync::atomic::AtomicBool::new(true),
+            daemon_endpoints: AtomicUsize::new(1),
             initialized: core::sync::atomic::AtomicBool::new(false),
             negotiated_minor: AtomicU32::new(0),
             negotiated_flags: AtomicU64::new(0),
@@ -173,6 +178,23 @@ impl FuseConnection {
 
     pub fn max_pages(&self) -> u16 {
         self.max_pages.load(Ordering::Acquire)
+    }
+
+    fn is_fresh_endpoint(&self) -> bool {
+        self.daemon_endpoints.load(Ordering::Acquire) == 1
+            && !self.initialized.load(Ordering::Acquire)
+            && self.pending.lock().is_empty()
+            && self.replies.lock().is_empty()
+    }
+
+    fn add_daemon_endpoint(&self) {
+        self.daemon_endpoints.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn remove_daemon_endpoint(&self) {
+        if self.daemon_endpoints.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.disconnect();
+        }
     }
 
     /// Mark the connection dead (daemon closed `/dev/fuse`). Any in-flight
@@ -661,6 +683,9 @@ pub struct DevFuse {
 }
 
 impl DevFuse {
+    /// Linux UAPI `_IOR(229, 0, uint32_t)`.
+    pub const DEV_IOC_CLONE: u32 = 0x8004_e500;
+
     /// Mint a new `/dev/fuse` connection. Returned as a `FileOps` for the
     /// caller's fd table; the mount path later recovers the connection via
     /// [`DevFuse::connection_of`].
@@ -682,6 +707,36 @@ impl DevFuse {
         ops.as_any()
             .and_then(|a| a.downcast_ref::<DevFuse>())
             .map(|d| d.connection())
+    }
+
+    /// Build a second daemon endpoint for `source` to replace the fresh
+    /// `/dev/fuse` endpoint in `target`. The syscall layer owns the actual
+    /// fd-table replacement because the ioctl argument names another fd.
+    pub fn clone_endpoint(
+        target: &Arc<dyn FileOps>,
+        source: &Arc<dyn FileOps>,
+    ) -> Result<Arc<dyn FileOps>, FsError> {
+        let target = target
+            .as_any()
+            .and_then(|a| a.downcast_ref::<DevFuse>())
+            .ok_or(FsError::InvalidData)?;
+        let source = source
+            .as_any()
+            .and_then(|a| a.downcast_ref::<DevFuse>())
+            .ok_or(FsError::InvalidData)?;
+        if !target.conn.is_fresh_endpoint() || Arc::ptr_eq(&target.conn, &source.conn) {
+            return Err(FsError::InvalidData);
+        }
+        source.conn.add_daemon_endpoint();
+        Ok(Arc::new(DevFuse {
+            conn: Arc::clone(&source.conn),
+        }))
+    }
+}
+
+impl Drop for DevFuse {
+    fn drop(&mut self) {
+        self.conn.remove_daemon_endpoint();
     }
 }
 

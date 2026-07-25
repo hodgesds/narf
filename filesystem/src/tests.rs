@@ -4053,6 +4053,45 @@ fn smoke_fs_fuse_dev_node() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_dev_node);
 
+fn smoke_fs_fuse_dev_clone_endpoint() -> TestResult {
+    use crate::fuse_conn::DevFuse;
+    use crate::FileOps;
+    use alloc::sync::Arc;
+
+    let source: Arc<dyn FileOps> = DevFuse::open_new();
+    let target: Arc<dyn FileOps> = DevFuse::open_new();
+    let source_conn = DevFuse::connection_of(&source).unwrap();
+    let target_conn = DevFuse::connection_of(&target).unwrap();
+    let cloned = match DevFuse::clone_endpoint(&target, &source) {
+        Ok(cloned) => cloned,
+        Err(_) => return TestResult::Fail("fresh FUSE endpoint clone failed"),
+    };
+    let cloned_conn = DevFuse::connection_of(&cloned).unwrap();
+    if !Arc::ptr_eq(&source_conn, &cloned_conn) {
+        return TestResult::Fail("cloned endpoint did not share source connection");
+    }
+    if Arc::ptr_eq(&target_conn, &cloned_conn) {
+        return TestResult::Fail("clone retained the target's fresh connection");
+    }
+    drop(target);
+    if target_conn.is_connected() {
+        return TestResult::Fail("replaced fresh connection was not retired");
+    }
+    if DevFuse::clone_endpoint(&cloned, &source).is_ok() {
+        return TestResult::Fail("already attached endpoint cloned twice");
+    }
+    drop(source);
+    if !cloned_conn.is_connected() {
+        return TestResult::Fail("closing one endpoint disconnected its clone");
+    }
+    drop(cloned);
+    if cloned_conn.is_connected() {
+        return TestResult::Fail("last endpoint close left connection live");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_dev_clone_endpoint);
+
 /// Test-only unmount helper for the FUSE e2e mounts.
 fn unmount_for_test_fuse(path: &str) -> Result<(), crate::FsError> {
     use narf_capabilities::Cap;
