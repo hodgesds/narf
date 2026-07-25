@@ -58,6 +58,44 @@ system activity.
 Legacy `clone(2)` honors `CLONE_PIDFD` by installing a pidfd in the parent and
 writing its descriptor through the overloaded `parent_tid` pointer argument.
 
+Linux NUMA compatibility reports live topology rather than a structural
+single-node stub: `getcpu(2)` returns the current logical CPU and its
+SRAT proximity node, while `move_pages(2)` walks the caller's page tables,
+reports physical placement, and can replace resident private backing on
+another node. `migrate_pages(2)` moves the caller's resident private pages
+between node masks. Fault-time `set_mempolicy(2)` and `mbind(2)` placement
+is intersected with the task's cgroup-v2 `cpuset.mems.effective` mask;
+`get_mempolicy(MPOL_F_MEMS_ALLOWED)` reports that effective constraint.
+`get_mempolicy(2)` rejects unknown/conflicting flags, undersized nodemask
+buffers, and addresses supplied without `MPOL_F_ADDR`; address+node
+queries fault in valid lazy pages and report their actual SRAT node.
+`MPOL_F_STATIC_NODES` preserves physical node identities across cpuset
+changes; `MPOL_F_RELATIVE_NODES` maps user-mask ordinals into the current
+`cpuset.mems.effective` set and folds oversized ordinals as Linux does.
+Both use Linux UAPI bits 15 and 14. `MPOL_PREFERRED_MANY` chooses the
+nearest member of its preferred set by SLIT distance and falls back only
+after preferred nodes are exhausted.
+`mbind(MPOL_MF_MOVE)` immediately conforms resident private pages in the
+range, `MPOL_MF_STRICT` reports remaining misplacement as `EIO`, and
+`MPOL_MF_MOVE_ALL` requires authority NARF does not grant ambiently.
+`set_mempolicy_home_node(2)` updates the distance anchor of existing
+MPOL_BIND or MPOL_PREFERRED_MANY ranges and returns `ENOENT` when no
+eligible policy overlaps.
+Anonymous private `mmap(MAP_HUGETLB)` supports Linux's default/explicit
+2 MiB and explicit 1 GiB encodings when boot-reserved backing is available.
+Mappings use hardware PD/PDPT leaves on x86_64 and L2/L1 block descriptors
+on aarch64; allocation honors the effective task/range mempolicy and
+`cpuset.mems`; `move_pages`, `migrate_pages`, and `mbind(MPOL_MF_MOVE)`
+migrate complete hardware leaves between per-node pools while preserving
+contents; `mprotect` operates at the selected hugepage granularity, `munmap`
+returns backing to its per-node pool, and `fork` eagerly copies private huge
+mappings on their original nodes. File-backed hugetlbfs and shared huge
+mappings fail explicitly because NARF has no hugetlbfs or shared-huge refcount
+contract.
+The procfs task snapshot includes both base-page and hardware huge-page
+regions with effective policy and per-node residency for
+`/proc/<pid>/numa_maps`.
+
 Bootstrap: every new process receives two ring pairs (submit + complete)
 for the kernel ABI plus a read-only config page with capability
 handles to its parent-granted services. Additional ring pairs for

@@ -70,6 +70,7 @@ pub mod budget;
 pub mod cgroup;
 pub mod cpu_lifecycle;
 pub mod donation;
+pub mod numa;
 pub mod policy;
 pub mod priority;
 pub mod stackful;
@@ -92,6 +93,7 @@ pub use donation::{
     current_donation_policy_name, install_donation_policy, BackQueueDonation, Donation,
     DonationError, DonationPolicy, EnqueueDonee, HeadQueueDonation,
 };
+pub use numa::{clear_task_mems_allowed, set_task_mems_allowed, task_mems_allowed, ALL_NUMA_NODES};
 pub use policy::{
     current_scheduler_name, install_scheduler, FifoScheduler, PriorityScheduler, RunQueue,
     SchedPolicy, Scheduler, SchedulerError, TaskHandle, TaskMeta,

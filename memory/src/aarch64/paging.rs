@@ -30,7 +30,9 @@ impl PtFlags {
 
     /// Access Permissions: 00=RW EL1, 01=RW EL1/EL0, 10=RO EL1, 11=RO EL1/EL0.
     pub const AP_RW_EL1: Self = Self(0b00 << 6);
+    pub const AP_RW_EL0: Self = Self(0b01 << 6);
     pub const AP_RO_EL1: Self = Self(0b10 << 6);
+    pub const AP_RO_EL0: Self = Self(0b11 << 6);
 
     /// Shareability: 10=Outer, 11=Inner.
     pub const SH_INNER: Self = Self(0b11 << 8);
@@ -410,6 +412,139 @@ unsafe fn ensure_next_table(entry: &mut PageTableEntry) -> Result<PhysAddr, MapE
     Ok(next)
 }
 
+/// Map one naturally aligned 2 MiB L2 block.
+///
+/// # Safety
+/// Same root/identity-map contract as [`map_4kb`].
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub unsafe fn map_2mb(
+    root: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
+    const SIZE: u64 = 2 * 1024 * 1024;
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.as_u64() & (SIZE - 1) != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    if phys.raw() & (SIZE - 1) != 0 {
+        return Err(MapError::UnalignedPhys);
+    }
+    let idx = WalkIndices::from_virt(virt);
+    let l0 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
+    let l1_phys = unsafe { ensure_next_table(&mut l0.entries[idx.l0])? };
+    let l1 = unsafe { &mut *l1_phys.kernel_mut_ptr::<PageTable>() };
+    let l2_phys = unsafe { ensure_next_table(&mut l1.entries[idx.l1])? };
+    let l2 = unsafe { &mut *l2_phys.kernel_mut_ptr::<PageTable>() };
+    if l2.entries[idx.l2].is_valid() {
+        return Err(MapError::AlreadyMapped);
+    }
+    let base = PtFlags::VALID | PtFlags::AF | PtFlags::SH_INNER | PtFlags::ATTR_NORMAL;
+    l2.entries[idx.l2] = PageTableEntry::new(phys, base | flags);
+    unsafe { tlb_invalidate_vae1(virt) };
+    Ok(())
+}
+
+/// Map one naturally aligned 1 GiB L1 block.
+///
+/// # Safety
+/// Same root/identity-map contract as [`map_4kb`].
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub unsafe fn map_1gb(
+    root: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
+    const SIZE: u64 = 1024 * 1024 * 1024;
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.as_u64() & (SIZE - 1) != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    if phys.raw() & (SIZE - 1) != 0 {
+        return Err(MapError::UnalignedPhys);
+    }
+    let idx = WalkIndices::from_virt(virt);
+    let l0 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
+    let l1_phys = unsafe { ensure_next_table(&mut l0.entries[idx.l0])? };
+    let l1 = unsafe { &mut *l1_phys.kernel_mut_ptr::<PageTable>() };
+    if l1.entries[idx.l1].is_valid() {
+        return Err(MapError::AlreadyMapped);
+    }
+    let base = PtFlags::VALID | PtFlags::AF | PtFlags::SH_INNER | PtFlags::ATTR_NORMAL;
+    l1.entries[idx.l1] = PageTableEntry::new(phys, base | flags);
+    unsafe { tlb_invalidate_vae1(virt) };
+    Ok(())
+}
+
+/// Remove a 2 MiB L2 block and return its physical base.
+///
+/// # Safety
+/// Same root/identity-map contract as [`unmap_4kb`].
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub unsafe fn unmap_2mb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
+    const SIZE: u64 = 2 * 1024 * 1024;
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.as_u64() & (SIZE - 1) != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    let idx = WalkIndices::from_virt(virt);
+    let l0 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
+    let l0e = l0.entries[idx.l0];
+    if !l0e.is_valid() || (l0e.0 & 0b11) != 0b11 {
+        return Err(MapError::AlreadyMapped);
+    }
+    let l1 = unsafe { &mut *l0e.addr().kernel_mut_ptr::<PageTable>() };
+    let l1e = l1.entries[idx.l1];
+    if !l1e.is_valid() || (l1e.0 & 0b11) != 0b11 {
+        return Err(MapError::AlreadyMapped);
+    }
+    let l2 = unsafe { &mut *l1e.addr().kernel_mut_ptr::<PageTable>() };
+    let leaf = l2.entries[idx.l2];
+    if !leaf.is_valid() || (leaf.0 & 0b10) != 0 {
+        return Err(MapError::AlreadyMapped);
+    }
+    l2.entries[idx.l2] = PageTableEntry::EMPTY;
+    unsafe { tlb_invalidate_vae1(virt) };
+    Ok(leaf.addr())
+}
+
+/// Remove a 1 GiB L1 block and return its physical base.
+///
+/// # Safety
+/// Same root/identity-map contract as [`unmap_4kb`].
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub unsafe fn unmap_1gb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
+    const SIZE: u64 = 1024 * 1024 * 1024;
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.as_u64() & (SIZE - 1) != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    let idx = WalkIndices::from_virt(virt);
+    let l0 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
+    let l0e = l0.entries[idx.l0];
+    if !l0e.is_valid() || (l0e.0 & 0b11) != 0b11 {
+        return Err(MapError::AlreadyMapped);
+    }
+    let l1 = unsafe { &mut *l0e.addr().kernel_mut_ptr::<PageTable>() };
+    let leaf = l1.entries[idx.l1];
+    if !leaf.is_valid() || (leaf.0 & 0b10) != 0 {
+        return Err(MapError::AlreadyMapped);
+    }
+    l1.entries[idx.l1] = PageTableEntry::EMPTY;
+    unsafe { tlb_invalidate_vae1(virt) };
+    Ok(leaf.addr())
+}
+
 /// Map `virt` to `phys` at 4 KiB granularity under `root`.
 ///
 /// # Safety
@@ -574,7 +709,9 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     }
     if (e.0 & 0b11) != 0b11 {
         /* block at L1 — 1 GiB */
-        return None;
+        return Some(PhysAddr::new(
+            e.addr().raw() + (virt.as_u64() & ((1 << 30) - 1)),
+        ));
     }
 
     // SAFETY: `e` is a valid, non-block (`0b11`) L1 TABLE descriptor,
@@ -587,7 +724,9 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     }
     if (e.0 & 0b11) != 0b11 {
         /* block at L2 — 2 MiB */
-        return None;
+        return Some(PhysAddr::new(
+            e.addr().raw() + (virt.as_u64() & ((1 << 21) - 1)),
+        ));
     }
 
     // SAFETY: `e` is a valid, non-block (`0b11`) L2 TABLE descriptor,

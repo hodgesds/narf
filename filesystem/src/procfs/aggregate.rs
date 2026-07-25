@@ -575,7 +575,6 @@ fn gen_vmstat() -> Vec<u8> {
 
 fn gen_zoneinfo() -> Vec<u8> {
     let mut s = String::new();
-    let fs = narf_memory::frame_stats();
     let numa_aware = narf_memory::is_numa_aware();
     let max_nodes = if numa_aware {
         narf_memory::FRAME_MAX_NUMA_NODES
@@ -584,11 +583,13 @@ fn gen_zoneinfo() -> Vec<u8> {
     };
 
     for node in 0..max_nodes {
-        let node_free = narf_memory::node_free(node);
-        if node_free == 0 && node > 0 {
+        let total = narf_memory::node_total(node);
+        if total == 0 && node > 0 {
             // Skip empty NUMA nodes (not yet online).
             continue;
         }
+        let node_free = narf_memory::node_free(node);
+        let nv = narf_memory::numa_node_stats(node);
         let _ = writeln!(s, "Node {}, zone   Normal", node);
         let _ = writeln!(s, "  per-node stats");
         let _ = writeln!(s, "      nr_inactive_anon 0");
@@ -617,8 +618,13 @@ fn gen_zoneinfo() -> Vec<u8> {
         let _ = writeln!(s, "      nr_vmscan_immediate_reclaim 0");
         let _ = writeln!(s, "      nr_dirtied 0");
         let _ = writeln!(s, "      nr_written 0");
+        let _ = writeln!(s, "      numa_hit {}", nv.numa_hit);
+        let _ = writeln!(s, "      numa_miss {}", nv.numa_miss);
+        let _ = writeln!(s, "      numa_foreign {}", nv.numa_foreign);
+        let _ = writeln!(s, "      numa_interleave {}", nv.interleave_hit);
+        let _ = writeln!(s, "      numa_local {}", nv.local_node);
+        let _ = writeln!(s, "      numa_other {}", nv.other_node);
         // Per-zone fields
-        let total = if node == 0 { fs.total } else { node_free };
         let _ = writeln!(s, "  pages free     {}", node_free);
         let _ = writeln!(s, "        min      0");
         let _ = writeln!(s, "        low      0");
@@ -657,15 +663,12 @@ fn gen_buddyinfo() -> Vec<u8> {
     };
 
     for node in 0..max_nodes {
-        let node_free = narf_memory::node_free(node);
-        if node_free == 0 && node > 0 {
+        if narf_memory::node_total(node) == 0 && node > 0 {
             continue;
         }
         let _ = write!(s, "Node {}, zone   Normal", node);
-        // We don't have per-order counters exposed; emit zeroes.
-        // DEFERRED: expose BuddyZone::free_at_order(order) snapshot.
-        for _order in 0..11 {
-            let _ = write!(s, "  0");
+        for blocks in narf_memory::node_free_blocks(node) {
+            let _ = write!(s, "  {}", blocks);
         }
         let _ = writeln!(s);
     }
@@ -675,10 +678,8 @@ fn gen_buddyinfo() -> Vec<u8> {
 // ── /proc/numastat ───────────────────────────────────────────────────
 //
 // Linux: the global /proc/numastat mirrors per-node hit/miss/foreign
-// counters numactl reports. NARF doesn't track allocation-attribution
-// counters yet, so we emit a well-formed table keyed by the live NUMA
-// nodes (one column per online node) with zeroed counters. The column
-// header + row labels are the load-bearing shape userspace tools parse.
+// allocation counters numactl reports. The column header + row labels
+// are the load-bearing shape userspace tools parse.
 
 fn gen_numastat() -> Vec<u8> {
     let mut s = String::new();
@@ -692,17 +693,19 @@ fn gen_numastat() -> Vec<u8> {
         let _ = write!(s, "{:>16}", col);
     }
     let _ = writeln!(s);
-    for label in [
-        "numa_hit",
-        "numa_miss",
-        "numa_foreign",
-        "interleave_hit",
-        "local_node",
-        "other_node",
-    ] {
+    type NumaStatValue = fn(narf_memory::NumaNodeStats) -> u64;
+    let rows: [(&str, NumaStatValue); 6] = [
+        ("numa_hit", |v| v.numa_hit),
+        ("numa_miss", |v| v.numa_miss),
+        ("numa_foreign", |v| v.numa_foreign),
+        ("interleave_hit", |v| v.interleave_hit),
+        ("local_node", |v| v.local_node),
+        ("other_node", |v| v.other_node),
+    ];
+    for (label, value) in rows {
         let _ = write!(s, "{:<16}", label);
-        for _ in 0..nodes {
-            let _ = write!(s, "{:>16}", 0u64);
+        for node in 0..nodes {
+            let _ = write!(s, "{:>16}", value(narf_memory::numa_node_stats(node)));
         }
         let _ = writeln!(s);
     }
@@ -1097,6 +1100,64 @@ fn smoke_interrupts_header_matches_cpu_count() -> TestResult {
 kernel_test_in!(
     "filesystem/procfs/aggregate",
     smoke_interrupts_header_matches_cpu_count
+);
+
+/// /proc/numastat: standard rows are present and reflect live allocation
+/// events rather than a permanently zero-filled compatibility shell.
+fn smoke_numastat_has_live_counters() -> TestResult {
+    let body = gen_numastat();
+    let text = match String::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("numastat not utf-8"),
+    };
+    for label in [
+        "numa_hit",
+        "numa_miss",
+        "numa_foreign",
+        "interleave_hit",
+        "local_node",
+        "other_node",
+    ] {
+        if !text.lines().any(|line| line.starts_with(label)) {
+            return TestResult::Fail("numastat missing standard row");
+        }
+    }
+    let any_live = text
+        .lines()
+        .skip(1)
+        .flat_map(|line| line.split_ascii_whitespace().skip(1))
+        .any(|field| field.parse::<u64>().is_ok_and(|value| value != 0));
+    if any_live {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("numastat counters remained all zero after boot")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/aggregate",
+    smoke_numastat_has_live_counters
+);
+
+fn smoke_buddyinfo_has_live_order_counts() -> TestResult {
+    let body = gen_buddyinfo();
+    let text = match String::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("buddyinfo not utf-8"),
+    };
+    let live = text.lines().any(|line| {
+        line.split_ascii_whitespace()
+            .skip(4)
+            .any(|field| field.parse::<usize>().is_ok_and(|value| value != 0))
+    });
+    if live {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("buddyinfo contains no live free blocks")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/aggregate",
+    smoke_buddyinfo_has_live_order_counts
 );
 
 /// /proc/softirqs: all 10 standard type names are present.

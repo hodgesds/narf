@@ -1006,6 +1006,8 @@ fn node_cpulist_string(node: u32) -> String {
 /// - `distance`  — space-separated SLIT row (`node_distance(n, j)`).
 /// - `meminfo`   — `Node N MemTotal/MemFree:` lines from the per-node
 ///   buddy free counts.
+/// - `numastat`  — Linux-compatible per-node placement events.
+/// - `vmstat`    — per-node free-page and placement counters.
 /// - `cpulist` / `cpumap` — the CPUs in this proximity domain.
 ///
 /// Linux ref: `drivers/base/node.c` (`register_node`,
@@ -1051,20 +1053,58 @@ pub fn populate_numa_nodes() {
         // meminfo: per-node MemTotal / MemFree from the buddy.
         let node_idx = node as usize;
         kobject_add_attr(&kobj, "meminfo", move || {
-            let free_pages = if node_idx < narf_memory::FRAME_MAX_NUMA_NODES {
-                narf_memory::node_free(node_idx)
-            } else {
-                0
-            };
+            let total_pages = narf_memory::node_total(node_idx);
+            let free_pages = narf_memory::node_free(node_idx).min(total_pages);
+            let used_pages = total_pages.saturating_sub(free_pages);
+            let total_kb = (total_pages as u64) * 4;
             let free_kb = (free_pages as u64) * 4;
+            let used_kb = (used_pages as u64) * 4;
             format!(
                 "Node {n} MemTotal:       {tot} kB\n\
                  Node {n} MemFree:        {free} kB\n\
                  Node {n} MemUsed:        {used} kB\n",
                 n = node_idx,
-                tot = free_kb,
+                tot = total_kb,
                 free = free_kb,
-                used = 0u64,
+                used = used_kb,
+            )
+        });
+
+        kobject_add_attr(&kobj, "numastat", move || {
+            let v = narf_memory::numa_node_stats(node_idx);
+            format!(
+                "numa_hit {}\n\
+                 numa_miss {}\n\
+                 numa_foreign {}\n\
+                 interleave_hit {}\n\
+                 local_node {}\n\
+                 other_node {}\n",
+                v.numa_hit,
+                v.numa_miss,
+                v.numa_foreign,
+                v.interleave_hit,
+                v.local_node,
+                v.other_node,
+            )
+        });
+
+        kobject_add_attr(&kobj, "vmstat", move || {
+            let v = narf_memory::numa_node_stats(node_idx);
+            format!(
+                "nr_free_pages {}\n\
+                 numa_hit {}\n\
+                 numa_miss {}\n\
+                 numa_foreign {}\n\
+                 numa_interleave {}\n\
+                 numa_local {}\n\
+                 numa_other {}\n",
+                narf_memory::node_free(node_idx),
+                v.numa_hit,
+                v.numa_miss,
+                v.numa_foreign,
+                v.interleave_hit,
+                v.local_node,
+                v.other_node,
             )
         });
 
@@ -1860,6 +1900,57 @@ pub fn mount_sysfs() {
     let _ = registry().mount(&auth, "/sys", SysFs::new());
     populate_all();
 }
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+fn smoke_sysfs_numa_node_live_files() -> TestResult {
+    populate_numa_nodes();
+    let Some(devices) = get_root().get_child("devices") else {
+        return TestResult::Fail("sysfs devices missing");
+    };
+    let Some(system) = devices.get_child("system") else {
+        return TestResult::Fail("sysfs system missing");
+    };
+    let Some(nodes) = system.get_child("node") else {
+        return TestResult::Fail("sysfs node root missing");
+    };
+    let Some(node0) = nodes.get_child("node0") else {
+        return TestResult::Fail("sysfs node0 missing");
+    };
+    let Some(meminfo) = node0.attr_show("meminfo") else {
+        return TestResult::Fail("node0 meminfo missing");
+    };
+    let value = |label: &str| -> Option<u64> {
+        meminfo
+            .lines()
+            .find(|line| line.contains(label))
+            .and_then(|line| line.split_ascii_whitespace().nth(3))
+            .and_then(|field| field.parse().ok())
+    };
+    let (Some(total), Some(free), Some(used)) =
+        (value("MemTotal:"), value("MemFree:"), value("MemUsed:"))
+    else {
+        return TestResult::Fail("node0 meminfo fields malformed");
+    };
+    if total != free.saturating_add(used) {
+        return TestResult::Fail("node0 total != free + used");
+    }
+    let Some(numastat) = node0.attr_show("numastat") else {
+        return TestResult::Fail("node0 numastat missing");
+    };
+    if !numastat.contains("numa_hit ") || !numastat.contains("other_node ") {
+        return TestResult::Fail("node0 numastat fields missing");
+    }
+    let Some(vmstat) = node0.attr_show("vmstat") else {
+        return TestResult::Fail("node0 vmstat missing");
+    };
+    if vmstat.contains("nr_free_pages ") {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("node0 vmstat nr_free_pages missing")
+    }
+}
+kernel_test_in!("filesystem/sysfs", smoke_sysfs_numa_node_live_files);
 
 // ── Reset helper for tests ────────────────────────────────────────────
 

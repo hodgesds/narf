@@ -68,6 +68,85 @@ pub fn unmap(va: VirtAddr);
 pub fn assign_domain(region: VirtRange, domain: DomainId);
 pub fn set_domain_rights(domain: DomainId, rights: DomainRights); // PKRS write
 
+pub struct Mempolicy {
+    pub mode: u32,
+    pub nodemask: u64,
+    /// Hard boundary supplied by cpuset.mems; allocation never spills out.
+    pub allowed: u64,
+    /// MPOL_BIND/MPOL_PREFERRED_MANY distance anchor; u32::MAX selects
+    /// the policy's default anchor.
+    pub home_node: u32,
+}
+pub fn mempolicy_set(policy: Mempolicy);
+pub fn mempolicy_clear();
+
+/// Monotonic Linux-compatible allocation-event snapshot for one NUMA node.
+pub fn numa_node_stats(node: usize) -> NumaNodeStats;
+/// Stable allocator-managed base-page total established at NUMA rebalance.
+pub fn node_total(node: usize) -> usize;
+/// Free-block counts for buddy orders 0 through 10.
+pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT];
+
+/// Hugepage allocation is local-first with SLIT-ordered fallback.
+pub fn alloc_hugepage_2m() -> Result<HugeFrame, HugeAllocError>;
+pub fn alloc_hugepage_1g() -> Result<HugeFrame, HugeAllocError>;
+/// Strict node-selection primitives used by NUMA policy consumers.
+pub fn alloc_hugepage_2m_on(node: usize) -> Result<HugeFrame, HugeAllocError>;
+pub fn alloc_hugepage_1g_on(node: usize) -> Result<HugeFrame, HugeAllocError>;
+// Exported from the `hugepage` module.
+pub fn node_stats(node: usize) -> HugeNodeStats;
+
+pub struct HugeRegion {
+    pub base: VirtAddr,
+    pub len: u64,
+    pub perms: RegionPerms,
+    pub size: HugeSize,
+    pub frames: Vec<HugeFrame>,
+}
+
+impl AddressSpace {
+    /// Install real architecture huge/block leaves and take frame ownership.
+    pub unsafe fn map_huge_region(
+        &self,
+        region: HugeRegion,
+    ) -> Result<(), AddressSpaceError>;
+    /// Remove an exact huge mapping and return its backing to the pool.
+    pub fn unmap_huge_region(&self, base: VirtAddr)
+        -> Result<(), AddressSpaceError>;
+    /// Test membership across both base-page and hardware huge-page regions.
+    pub fn contains_address(&self, vaddr: VirtAddr) -> bool;
+    /// Non-owning per-region resident-page counts grouped by SRAT node.
+    pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot>;
+}
+
+impl AddressSpace {
+    /// Replace one resident private base page, or the complete hardware leaf
+    /// containing a huge-page address, with equivalent backing from a target
+    /// NUMA node, preserving bytes and permissions and completing the
+    /// required cross-CPU TLB invalidation before releasing old backing.
+    pub unsafe fn migrate_page_to_node(
+        &self,
+        va: VirtAddr,
+        target_node: usize,
+    ) -> Result<usize, AddressSpaceError>;
+
+    /// Bulk form used by Linux migrate_pages(2); returns pages not moved.
+    pub unsafe fn migrate_pages_between(
+        &self,
+        old_nodes: u64,
+        new_nodes: u64,
+    ) -> Result<usize, AddressSpaceError>;
+
+    /// Audit or migrate resident pages in a virtual range to a node mask.
+    pub unsafe fn conform_range_to_nodes(
+        &self,
+        start: VirtAddr,
+        len: u64,
+        target_nodes: u64,
+        do_move: bool,
+    ) -> Result<usize, AddressSpaceError>;
+}
+
 // --- Kernel heap (slab-style object allocator) ------------------------
 
 /// Slab API. Shape owes most to Bonwick SLAB (object caches with

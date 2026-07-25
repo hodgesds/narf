@@ -74,15 +74,19 @@ kernel_test_in!(
     smoke_abi_mem2_set_mempolicy_bind_nodemask_pos
 );
 
-// ── SetMempolicy (238) — top flag bits boundary ──────────────────────
-// `mpol_mode_valid` masks MPOL_MODE_FLAGS (0xc000_0000) before the range
-// check, so a mode carrying MPOL_F_STATIC_NODES with a low value still
+// ── SetMempolicy (238) — Linux UAPI mode-flag boundary ───────────────
+// `mpol_mode_valid` masks MPOL_MODE_FLAGS (bits 15 and 14) before the
+// range check, so a mode carrying MPOL_F_STATIC_NODES with a low value still
 // validates. mode = MPOL_F_STATIC_NODES | MPOL_INTERLEAVE(3) → valid.
 
 fn smoke_abi_mem2_set_mempolicy_flagged_mode_pos() -> TestResult {
     with_setup(|| {
-        // 0x8000_0000 (MPOL_F_STATIC_NODES) | 3 (INTERLEAVE) → masked to 3 < MAX.
-        match call(Syscall::SetMempolicy.raw(), a1(0x8000_0003, 0)) {
+        // 0x8000 (MPOL_F_STATIC_NODES) | 3 (INTERLEAVE).
+        let mask = 1u64;
+        match call(
+            Syscall::SetMempolicy.raw(),
+            a1(0x8003, &mask as *const u64 as u64),
+        ) {
             Some(0) => Ok(()),
             Some(_) => Err("set_mempolicy(STATIC_NODES|INTERLEAVE) should return 0"),
             None => Err("set_mempolicy(flagged mode) returned non-Ok status"),
@@ -90,6 +94,37 @@ fn smoke_abi_mem2_set_mempolicy_flagged_mode_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem2_set_mempolicy_flagged_mode_pos);
+
+fn smoke_abi_mem2_relative_nodes_tracks_cpuset() -> TestResult {
+    if narf_memory::node_total(1) == 0 {
+        return TestResult::Skip("requires a second online NUMA node");
+    }
+    with_setup(|| {
+        let task = crate::handlers::current_task_id();
+        narf_scheduler::set_task_mems_allowed(task, 0b10);
+        let mask = 1u64; // relative ordinal 0 => first allowed node => node 1
+        let set = call(
+            Syscall::SetMempolicy.raw(),
+            a1(0x4003, &mask as *const u64 as u64),
+        );
+        let mut node = -1i32;
+        let get = call(
+            Syscall::GetMempolicy.raw(),
+            SyscallArgs {
+                arg0: &mut node as *mut i32 as u64,
+                arg4: 1, // MPOL_F_NODE
+                ..a0(0)
+            },
+        );
+        narf_scheduler::clear_task_mems_allowed(task);
+        if set == Some(0) && get == Some(0) && node == 1 {
+            Ok(())
+        } else {
+            Err("relative node ordinal did not map into cpuset.mems")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem2_relative_nodes_tracks_cpuset);
 
 // ── GetMempolicy (239) — mode-pointer writeback ──────────────────────
 // abi_mem_tests covers MPOL_F_MEMS_ALLOWED and the null-everything
@@ -102,7 +137,12 @@ fn smoke_abi_mem2_get_mempolicy_mode_writeback_pos() -> TestResult {
     with_setup(|| {
         // Prime the per-task policy to MPOL_BIND(2) so the writeback is
         // observably non-zero (and distinct from the uninitialised case).
-        if call(Syscall::SetMempolicy.raw(), a1(2, 0)) != Some(0) {
+        let mask = 1u64;
+        if call(
+            Syscall::SetMempolicy.raw(),
+            a1(2, &mask as *const u64 as u64),
+        ) != Some(0)
+        {
             return Err("set_mempolicy precondition failed");
         }
         let mut mode_out = [0xFFu8; 4];
@@ -134,9 +174,9 @@ kernel_test_in!(
 );
 
 // ── GetMempolicy (239) — F_NODE|F_ADDR resolved-node writeback ───────
-// The deepest get_mempolicy branch: with MPOL_F_NODE|MPOL_F_ADDR the
-// out word is the resolved NUMA node (not the mode). NARF is single-node
-// for an unbound addr → node 0. Distinct from every abi_mem_tests case.
+// MPOL_F_NODE|MPOL_F_ADDR requires an address belonging to the current
+// address space. The ABI harness has no user AS, so Linux-compatible
+// behavior is EFAULT rather than predicting a placement node.
 
 fn smoke_abi_mem2_get_mempolicy_node_query_pos() -> TestResult {
     with_setup(|| {
@@ -151,18 +191,8 @@ fn smoke_abi_mem2_get_mempolicy_node_query_pos() -> TestResult {
             arg5: 0,
         };
         match call(Syscall::GetMempolicy.raw(), args) {
-            Some(0) => {
-                // The resolved node must be a real online-node index (the
-                // local node for an unbound addr). Pins the F_NODE|F_ADDR
-                // writeback path without coupling to a specific topology.
-                let node = i32::from_le_bytes(node_out);
-                if (0..64).contains(&node) {
-                    Ok(())
-                } else {
-                    Err("get_mempolicy(F_NODE|F_ADDR) should resolve a valid node id")
-                }
-            }
-            Some(_) => Err("get_mempolicy(F_NODE|F_ADDR) should return 0"),
+            Some(-14) => Ok(()),
+            Some(_) => Err("get_mempolicy(F_NODE|F_ADDR) should return EFAULT without an AS"),
             None => Err("get_mempolicy(F_NODE|F_ADDR) returned non-Ok status"),
         }
     })
@@ -203,22 +233,25 @@ kernel_test_in!("syscall_abi", smoke_abi_mem2_move_pages_bad_status_neg);
 
 // ── MovePages (279) — count boundary (exactly 1<<20) ─────────────────
 // abi_mem_tests pins (1<<20)+1 → EINVAL. The boundary value 1<<20 is
-// NOT over the cap (`count > 1<<20` is strict), so with status_ptr=0 it
-// skips the writeback and returns 0 — pins the off-by-one boundary.
+// NOT over the cap (`count > 1<<20` is strict), so validation advances to
+// the required page/status pointers and returns EFAULT, not EINVAL.
 
-fn smoke_abi_mem2_move_pages_count_boundary_pos() -> TestResult {
+fn smoke_abi_mem2_move_pages_count_boundary_efault_neg() -> TestResult {
     with_setup(|| {
-        // count == 1<<20 (the cap, inclusive), status=0 → no writeback, 0.
+        // count == 1<<20 (the cap, inclusive), pointers null → EFAULT.
         let args = a1(0, 1u64 << 20);
         match call(Syscall::MovePages.raw(), args) {
-            Some(0) => Ok(()),
+            Some(v) if v == EFAULT => Ok(()),
             Some(v) if v == EINVAL => Err("move_pages(count==1<<20) is the cap, not over it"),
-            Some(_) => Err("move_pages(count==1<<20) should return 0"),
+            Some(_) => Err("move_pages(count==1<<20, null pointers) should be -EFAULT"),
             None => Err("move_pages(boundary) returned non-Ok status"),
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_mem2_move_pages_count_boundary_pos);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem2_move_pages_count_boundary_efault_neg
+);
 
 // ── ProcessMadvise (440) — iovcnt boundary (exactly 1024) ────────────
 // abi_mem_tests pins iovcnt=2048 → EINVAL and a bogus pidfd → EBADF.

@@ -337,36 +337,17 @@ fn smoke_abi_mem_process_madvise_bad_pidfd_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_mem_process_madvise_bad_pidfd_neg);
 
 // ── MovePages (279) ──────────────────────────────────────────────────
-// No AS needed. count > 1<<20 → -EINVAL. A status query (status_ptr set,
-// small count) writes node-0 (i32 zeros) for each page and returns 0.
+// count > 1<<20 → -EINVAL. A zero-count query is a successful no-op;
+// non-empty queries require both the page array and status array.
 
-fn smoke_abi_mem_move_pages_status_pos() -> TestResult {
-    with_setup(|| {
-        // count=1, pages=0, nodes=0, status=&out, flags=0. Handler writes
-        // one i32 (node 0) into `out` and returns 0.
-        let mut out = [0xFFu8; 4];
-        let args = SyscallArgs {
-            arg0: 0,
-            arg1: 1,
-            arg2: 0,
-            arg3: 0,
-            arg4: out.as_mut_ptr() as u64,
-            arg5: 0,
-        };
-        match call(Syscall::MovePages.raw(), args) {
-            Some(0) => {
-                if out == [0u8; 4] {
-                    Ok(())
-                } else {
-                    Err("move_pages should report node 0 (i32 zero) per page")
-                }
-            }
-            Some(_) => Err("move_pages status query should return 0"),
-            None => Err("move_pages returned non-Ok status"),
-        }
+fn smoke_abi_mem_move_pages_zero_count_pos() -> TestResult {
+    with_setup(|| match call(Syscall::MovePages.raw(), a1(0, 0)) {
+        Some(0) => Ok(()),
+        Some(_) => Err("move_pages zero-count query should return 0"),
+        None => Err("move_pages returned non-Ok status"),
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_mem_move_pages_status_pos);
+kernel_test_in!("syscall_abi", smoke_abi_mem_move_pages_zero_count_pos);
 
 fn smoke_abi_mem_move_pages_bad_count_neg() -> TestResult {
     with_setup(|| {
@@ -382,28 +363,34 @@ fn smoke_abi_mem_move_pages_bad_count_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_mem_move_pages_bad_count_neg);
 
 // ── MigratePages (256) ───────────────────────────────────────────────
-// NARF is single-node for placement: always a no-op returning 0. No
-// reachable error arm, so only the success/no-op pin.
+// Null/empty node masks are invalid, matching Linux.
 
-fn smoke_abi_mem_migrate_pages_pos() -> TestResult {
+fn smoke_abi_mem_migrate_pages_empty_masks_neg() -> TestResult {
     with_setup(|| {
-        // (pid, maxnode, old_nodes, new_nodes) — all ignored; returns 0.
+        // (pid, maxnode, old_nodes, new_nodes) with maxnode=1 but no masks.
         match call(Syscall::MigratePages.raw(), a3(0, 1, 0, 0)) {
-            Some(0) => Ok(()),
-            Some(_) => Err("migrate_pages no-op should return 0"),
-            None => Err("migrate_pages returned non-Ok status"),
+            Some(v) if v == EINVAL => Ok(()),
+            Some(_) => Err("migrate_pages with null masks should be -EINVAL"),
+            None => Err("migrate_pages(EINVAL) should be Ok(-EINVAL)"),
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_mem_migrate_pages_pos);
+kernel_test_in!("syscall_abi", smoke_abi_mem_migrate_pages_empty_masks_neg);
 
 // ── SetMempolicyHomeNode (450) ───────────────────────────────────────
-// flags(arg3) must be 0 → else -EINVAL. Otherwise accepted with 0. No AS
-// needed.
+// The syscall updates an existing MPOL_BIND range; a range with no policy
+// returns -ENOENT.
 
 fn smoke_abi_mem_set_mempolicy_home_node_pos() -> TestResult {
     with_setup(|| {
-        // addr=0x1000, len=0x1000, home_node=0, flags=0.
+        let mask = 1u64;
+        if call(
+            Syscall::Mbind.raw(),
+            a3(0x1000, 0x1000, 2, &mask as *const u64 as u64),
+        ) != Some(0)
+        {
+            return Err("failed to install MPOL_BIND prerequisite");
+        }
         match call(
             Syscall::SetMempolicyHomeNode.raw(),
             a3(0x1000, 0x1000, 0, 0),
@@ -435,8 +422,8 @@ kernel_test_in!(
 );
 
 // ── SetMempolicy (238) ───────────────────────────────────────────────
-// arg0=mode, arg1=nodemask ptr. Valid modes are 0..MPOL_MAX(5) (with the
-// top flag bits masked). Stored in a per-task side table; success → 0.
+// arg0=mode, arg1=nodemask ptr. Implemented modes are DEFAULT through
+// PREFERRED_MANY (0..=5), with Linux UAPI mode flags masked.
 // No AS needed.
 
 fn smoke_abi_mem_set_mempolicy_pos() -> TestResult {
@@ -453,7 +440,7 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_set_mempolicy_pos);
 
 fn smoke_abi_mem_set_mempolicy_bad_mode_neg() -> TestResult {
     with_setup(|| {
-        // mode 9 >= MPOL_MAX(5) (and below the flag bits) → -EINVAL.
+        // mode 9 is not an implemented Linux policy → -EINVAL.
         match call(Syscall::SetMempolicy.raw(), a1(9, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             Some(_) => Err("set_mempolicy with an invalid mode should be -EINVAL"),
@@ -478,7 +465,7 @@ fn smoke_abi_mem_get_mempolicy_mems_allowed_pos() -> TestResult {
         let args = SyscallArgs {
             arg0: 0,
             arg1: mask.as_mut_ptr() as u64,
-            arg2: 0,
+            arg2: 64,
             arg3: 0,
             arg4: 4,
             arg5: 0,
@@ -507,6 +494,28 @@ fn smoke_abi_mem_get_mempolicy_default_query_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem_get_mempolicy_default_query_neg);
 
+fn smoke_abi_mem_get_mempolicy_bad_flags_neg() -> TestResult {
+    with_setup(|| {
+        let unknown = call(
+            Syscall::GetMempolicy.raw(),
+            SyscallArgs { arg4: 8, ..a0(0) },
+        );
+        let conflicting = call(
+            Syscall::GetMempolicy.raw(),
+            SyscallArgs {
+                arg4: 4 | 2,
+                ..a0(0)
+            },
+        );
+        if unknown == Some(-22) && conflicting == Some(-22) {
+            Ok(())
+        } else {
+            Err("get_mempolicy should reject unknown/conflicting flags")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_get_mempolicy_bad_flags_neg);
+
 // ── Mbind (237) ──────────────────────────────────────────────────────
 // arg0=addr, arg1=len, arg2=mode, arg3=nodemask ptr. Invalid mode →
 // -EINVAL; unaligned addr → -EINVAL. Valid + aligned → stored, returns 0.
@@ -514,8 +523,11 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_get_mempolicy_default_query_neg);
 
 fn smoke_abi_mem_mbind_pos() -> TestResult {
     with_setup(|| {
-        // addr=0x1000 (aligned), len=0x1000, mode=MPOL_BIND(2), nodemask=0.
-        match call(Syscall::Mbind.raw(), a3(0x1000, 0x1000, 2, 0)) {
+        let mask = 1u64;
+        match call(
+            Syscall::Mbind.raw(),
+            a3(0x1000, 0x1000, 2, &mask as *const u64 as u64),
+        ) {
             Some(0) => Ok(()),
             Some(_) => Err("mbind with a valid aligned range should return 0"),
             None => Err("mbind returned non-Ok status"),
@@ -526,7 +538,7 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_mbind_pos);
 
 fn smoke_abi_mem_mbind_bad_mode_neg() -> TestResult {
     with_setup(|| {
-        // mode 9 >= MPOL_MAX(5) → -EINVAL (checked before the addr align).
+        // mode 9 is invalid (checked before the addr alignment).
         match call(Syscall::Mbind.raw(), a3(0x1000, 0x1000, 9, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             Some(_) => Err("mbind with an invalid mode should be -EINVAL"),
@@ -547,6 +559,45 @@ fn smoke_abi_mem_mbind_unaligned_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem_mbind_unaligned_neg);
+
+fn smoke_abi_mem_mbind_unknown_flags_neg() -> TestResult {
+    with_setup(|| {
+        let args = SyscallArgs {
+            arg0: 0x1000,
+            arg1: 0x1000,
+            arg2: 2,
+            arg5: 1 << 3,
+            ..Default::default()
+        };
+        match call(Syscall::Mbind.raw(), args) {
+            Some(v) if v == EINVAL => Ok(()),
+            Some(_) => Err("mbind with an unknown flag should be -EINVAL"),
+            None => Err("mbind(unknown flag) should be Ok(-EINVAL)"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_mbind_unknown_flags_neg);
+
+fn smoke_abi_mem_mbind_move_all_requires_privilege_neg() -> TestResult {
+    with_setup(|| {
+        let args = SyscallArgs {
+            arg0: 0x1000,
+            arg1: 0x1000,
+            arg2: 2,
+            arg5: 1 << 2,
+            ..Default::default()
+        };
+        match call(Syscall::Mbind.raw(), args) {
+            Some(v) if v == EPERM => Ok(()),
+            Some(_) => Err("mbind(MPOL_MF_MOVE_ALL) should require privilege"),
+            None => Err("mbind(MOVE_ALL) should be Ok(-EPERM)"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mbind_move_all_requires_privilege_neg
+);
 
 // ── Msync (26) ───────────────────────────────────────────────────────
 // addr misaligned → -EINVAL (before the AS lookup). Aligned + no mapping

@@ -94,6 +94,29 @@ kernel↔user boundary; kernel-internal callers invoke directly.
 `poll_readiness_at` defaults to `poll_readiness`; offset-sensitive device
 descriptions such as `/dev/kmsg` override it so EOF is not reported readable.
 
+### 3.3.1 cgroup-v2 cpuset placement
+
+`cpuset.cpus.effective` is pushed into scheduler CPU affinity.
+`cpuset.mems.effective` is the parent-effective/requested intersection
+and is pushed into the scheduler's per-task allowed-node table on attach
+and every local policy update. Empty requests inherit the parent; an
+explicit request with an empty intersection is rejected.
+`cpuset.memory_migrate` accepts `0` or `1`. When enabled, attach and
+effective-memory-mask changes migrate each member address space's resident
+private base pages and complete hardware huge leaves away from disallowed
+nodes; shared mappings remain unmoved without explicit MOVE_ALL authority.
+
+`/proc/numastat` exposes live per-node allocation events supplied by
+`memory/`: hit, miss, foreign, interleave-hit, local, and other counters.
+`/proc/<pid>/numa_maps` reports each registered base-page or hardware
+huge-page region's effective policy, resident base-page equivalents grouped
+by SRAT node, and actual translation-leaf size.
+`/sys/devices/system/node/nodeN/{meminfo,numastat,vmstat}` exposes stable
+managed totals, live free/used pages, and the corresponding node-local
+event counters.
+`/proc/buddyinfo` reports live per-order free-block counts, while
+`/proc/zoneinfo` uses stable per-node managed totals and live NUMA events.
+
 ### 3.4 Directory operations
 
 ```rust

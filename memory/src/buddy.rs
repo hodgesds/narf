@@ -575,6 +575,13 @@ impl BuddyZone {
         self.free_frames
     }
 
+    /// Number of free buddy blocks at `order` (not base pages).
+    pub fn free_block_count(&self, order: u8) -> usize {
+        self.free_lists
+            .get(order as usize)
+            .map_or(0, alloc::vec::Vec::len)
+    }
+
     /// Diagnostic: walk every free-list entry and confirm no frame
     /// is covered by more than one block (across all orders).
     ///

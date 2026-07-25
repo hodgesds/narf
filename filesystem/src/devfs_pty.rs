@@ -218,6 +218,7 @@ pub const KERNEL_TERMIOS2_LEN: usize = 44;
 /// A plausible fixed baud (38400) reported in the `c_ispeed`/`c_ospeed`
 /// fields of a TCGETS2 reply for a virtual console/PTY (which has no real
 /// line rate). tcgetattr only needs a self-consistent value.
+#[cfg(feature = "linux-compat")]
 const TERMIOS2_BAUD: u32 = 38400;
 
 // `c_lflag` bits we honour (asm-generic termbits).

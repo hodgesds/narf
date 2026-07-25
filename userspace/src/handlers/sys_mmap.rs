@@ -6,7 +6,6 @@ use super::*;
 pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let hint = args.arg0;
-    let len = ((args.arg1 + 0xFFF) & !0xFFFu64).max(0x1000);
     // Standard 6-arg mmap ABI: arg2 prot, arg3 flags, arg4 fd, arg5 offset.
     // narf_user_runtime::mmap issues this same shape for NARF-native
     // anonymous maps (prot=RW, fd=-1), so the kernel decodes one layout.
@@ -14,6 +13,32 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     let flags = args.arg3 as u32;
     let fd = args.arg4 as i64 as i32;
     let offset = args.arg5;
+    const MAP_HUGETLB: u32 = 0x0004_0000;
+    const MAP_HUGE_SHIFT: u32 = 26;
+    const MAP_HUGE_MASK: u32 = 0x3f;
+    let huge_size = if flags & MAP_HUGETLB != 0 {
+        match (flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK {
+            0 | 21 => Some(narf_memory::hugepage::HugeSize::M2),
+            30 => Some(narf_memory::hugepage::HugeSize::G1),
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let page_size = huge_size.map_or(4096, |size| match size {
+        narf_memory::hugepage::HugeSize::M2 => narf_memory::hugepage::HUGEPAGE_2M_BYTES,
+        narf_memory::hugepage::HugeSize::G1 => narf_memory::hugepage::HUGEPAGE_1G_BYTES,
+    });
+    let len = match args.arg1.checked_add(page_size - 1) {
+        Some(v) => (v & !(page_size - 1)).max(page_size),
+        None => {
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+            return;
+        }
+    };
     let as_ref = match current_address_space() {
         Some(a) => a,
         None => {
@@ -32,7 +57,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // PROT_NONE then MAP_FIXED-maps each segment over it. Otherwise bump the
     // per-AS mmap cursor.
     let base = if flags & MAP_FIXED != 0 {
-        if hint == 0 || hint & 0xFFF != 0 {
+        if hint == 0 || hint & (page_size - 1) != 0 {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
@@ -64,7 +89,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         let _ = as_ref.punch_fixed(VirtAddr::new(hint), len);
         hint
     } else {
-        as_ref.reserve_mmap_va(len)
+        as_ref.reserve_mmap_va_aligned(len, page_size)
     };
     // reserve_mmap_va returns 0 when the no-hint mmap arena is exhausted
     // (the bump cursor would cross MMAP_WINDOW_TOP into the stack reserve).
@@ -77,6 +102,65 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     }
 
     const MAP_SHARED: u32 = 0x01;
+    if let Some(size) = huge_size {
+        if flags & MAP_SHARED != 0 {
+            ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP: no shared huge refs.
+            return;
+        }
+        if flags & MAP_ANONYMOUS == 0 && fd >= 0 {
+            ctx.set_return(SyscallReturn::ok((-19i64) as u64)); // ENODEV: no hugetlbfs.
+            return;
+        }
+        let task = current_task_id();
+        let stored = resolve_policy(task, base);
+        let allowed = narf_scheduler::task_mems_allowed(task);
+        let policy = narf_memory::Mempolicy {
+            mode: stored.mode & !MPOL_MODE_FLAGS,
+            nodemask: mpol_effective_nodemask(stored, allowed),
+            allowed,
+            home_node: stored.home_node,
+        };
+        let mut frames = alloc::vec::Vec::with_capacity((len / page_size) as usize);
+        for _ in 0..(len / page_size) {
+            let frame = match narf_memory::hugepage::alloc_hugepage_with(
+                size,
+                policy,
+                narf_memory::frame::local_node(),
+            ) {
+                Ok(frame) => frame,
+                Err(_) => {
+                    for frame in frames {
+                        narf_memory::hugepage::free_hugepage(frame);
+                    }
+                    ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+                    return;
+                }
+            };
+            // SAFETY: a newly allocated huge frame is exclusively owned and
+            // identity-reachable under the kernel's direct mapping.
+            unsafe {
+                core::ptr::write_bytes(frame.phys() as *mut u8, 0, frame.size_bytes() as usize);
+            }
+            frames.push(frame);
+        }
+        // SAFETY: `as_ref` is the caller's live root; frames are owned and
+        // aligned for the selected hardware leaf size.
+        let mapped = unsafe {
+            as_ref.map_huge_region(HugeRegion {
+                base: VirtAddr::new(base),
+                len,
+                perms,
+                size,
+                frames,
+            })
+        };
+        match mapped {
+            Ok(()) => ctx.set_return(SyscallReturn::ok(base)),
+            Err(_) => ctx.set_return(SyscallReturn::ok((-12i64) as u64)),
+        }
+        return;
+    }
+
     // Device-backed shared mapping — the keystone for graphics. A
     // `/dev/fb0` framebuffer (or a DRM dumb buffer) returns the
     // physical frames of its scanout buffer from `FileOps::mmap_frames`;

@@ -1527,6 +1527,74 @@ fn smoke_frame_alloc_per_node_distribution() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_frame_alloc_per_node_distribution);
 
+fn smoke_numa_allocation_stats_advance() -> TestResult {
+    let before = crate::numa_node_stats(0);
+    let frame = match crate::alloc_frame_on_strict(0) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Skip("node 0 strict allocation unavailable"),
+    };
+    let after = crate::numa_node_stats(0);
+    crate::free_frame(frame);
+
+    if after.numa_hit != before.numa_hit.saturating_add(1) {
+        return TestResult::Fail("strict local allocation did not increment numa_hit");
+    }
+    let locality_before = before.local_node.saturating_add(before.other_node);
+    let locality_after = after.local_node.saturating_add(after.other_node);
+    if locality_after != locality_before.saturating_add(1) {
+        return TestResult::Fail("allocation did not increment a locality counter");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_numa_allocation_stats_advance);
+
+fn smoke_numa_node_total_is_stable() -> TestResult {
+    let total = crate::node_total(0);
+    if total == 0 {
+        return TestResult::Skip("node 0 managed-page total unavailable");
+    }
+    let free_before = crate::node_free(0);
+    let frame = match crate::alloc_frame_on_strict(0) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Skip("node 0 strict allocation unavailable"),
+    };
+    if crate::node_total(0) != total {
+        crate::free_frame(frame);
+        return TestResult::Fail("node total changed after allocation");
+    }
+    if crate::node_free(0) >= free_before {
+        crate::free_frame(frame);
+        return TestResult::Fail("node free count did not decrease");
+    }
+    crate::free_frame(frame);
+    if crate::node_total(0) == total {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("node total changed after free")
+    }
+}
+kernel_test_in!("memory", smoke_numa_node_total_is_stable);
+
+fn smoke_numa_buddy_order_snapshot_sums_to_free() -> TestResult {
+    for node in 0..crate::FRAME_MAX_NUMA_NODES {
+        let total = crate::node_total(node);
+        if total == 0 {
+            continue;
+        }
+        let reconstructed = crate::node_free_blocks(node)
+            .iter()
+            .enumerate()
+            .fold(0usize, |sum, (order, blocks)| {
+                sum.saturating_add(blocks.saturating_mul(1usize << order))
+            });
+        if reconstructed != crate::node_free(node) {
+            return TestResult::Fail("buddy order counts do not sum to node_free");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_numa_buddy_order_snapshot_sums_to_free);
+
 fn smoke_memory_address_space_materialize() -> TestResult {
     // Full flow: new_for_user allocates a fresh root, map_region
     // records a region, materialize walks the region and installs
@@ -3113,8 +3181,8 @@ kernel_test_in!("memory", smoke_memory_remap_page_picks_up_perms_and_phys);
 fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
     use crate::frame::UsableRegion;
     use crate::hugepage::{
-        alloc_hugepage_2m, free_hugepage, reserve_from_regions, stats, HugeAllocError,
-        HUGEPAGE_2M_BYTES,
+        alloc_hugepage_2m, alloc_hugepage_2m_on, free_hugepage, node_stats, reserve_from_regions,
+        stats, HugeAllocError, HUGEPAGE_2M_BYTES,
     };
     use crate::PhysAddr;
 
@@ -3135,29 +3203,39 @@ fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
     if excludes.len() != PAGES {
         return TestResult::Fail("reserve_from_regions returned wrong exclude count");
     }
+    // SAFETY: the exclude is a synthetic physical address used only for
+    // topology lookup; the test never dereferences it.
+    let target_node = unsafe { crate::frame::narf_phys_node(excludes[0].0) };
+    let node_after_reserve = node_stats(target_node);
     let after_reserve = stats();
     if after_reserve.free_2m - before.free_2m != PAGES {
         return TestResult::Fail("free_2m didn't grow by reserve count");
     }
+    if node_after_reserve.free_2m < PAGES {
+        return TestResult::Fail("per-node free_2m omitted reserved pages");
+    }
 
-    // Drain exactly PAGES new allocations.
+    // Drain exactly PAGES new allocations through the strict-node API.
     let mut allocated = alloc::vec::Vec::new();
     for _ in 0..PAGES {
-        match alloc_hugepage_2m() {
+        match alloc_hugepage_2m_on(target_node) {
             Ok(f) => {
                 if f.phys() & (HUGEPAGE_2M_BYTES - 1) != 0 {
-                    return TestResult::Fail("alloc_hugepage_2m returned unaligned phys");
+                    return TestResult::Fail("alloc_hugepage_2m_on returned unaligned phys");
+                }
+                if f.node() != target_node {
+                    return TestResult::Fail("strict hugepage allocation returned wrong node");
                 }
                 allocated.push(f);
             }
-            Err(_) => return TestResult::Fail("alloc_hugepage_2m exhausted before PAGES"),
+            Err(_) => return TestResult::Fail("strict hugepage allocation exhausted before PAGES"),
         }
     }
 
     // Free one back, alloc one — roundtrip works.
     let returned = allocated.pop().unwrap();
     free_hugepage(returned);
-    match alloc_hugepage_2m() {
+    match alloc_hugepage_2m_on(target_node) {
         Ok(f) => allocated.push(f),
         Err(_) => return TestResult::Fail("alloc after free returned Empty"),
     }
@@ -3189,8 +3267,8 @@ kernel_test_in!("memory/hugepage", smoke_hugepage_2m_reserve_alloc_free);
 
 fn smoke_hugepage_1g_reserve_picks_aligned_chunk() -> TestResult {
     use crate::frame::UsableRegion;
-    use crate::hugepage::{reserve_from_regions, stats, HUGEPAGE_1G_BYTES};
-    use crate::PhysAddr;
+    use crate::hugepage::{alloc_hugepage_1g_on, reserve_from_regions, stats, HUGEPAGE_1G_BYTES};
+    use crate::{AddressSpace, HugeRegion, PhysAddr, RegionPerms, VirtAddr};
 
     // Region whose start is mis-aligned: head is dropped, the one
     // 1 GiB-aligned chunk is taken, the tail stays for the buddy.
@@ -3221,14 +3299,133 @@ fn smoke_hugepage_1g_reserve_picks_aligned_chunk() -> TestResult {
         return TestResult::Fail("free_1g didn't grow by 1");
     }
 
-    // Teardown: drain the one we reserved so the pool returns to
-    // its prior state.
-    let _ = crate::hugepage::alloc_hugepage_1g();
+    // Install it as a real 1 GiB hardware leaf and verify translation keeps
+    // the within-block offset.
+    // SAFETY: topology lookup only; synthetic memory is not dereferenced.
+    let node = unsafe { crate::frame::narf_phys_node(excl_start) };
+    let frame = match alloc_hugepage_1g_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("strict 1G allocation failed"),
+    };
+    let phys = frame.phys();
+    // SAFETY: kernel test runs with paging live.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(aspace) => aspace,
+        Err(_) => {
+            crate::hugepage::free_hugepage(frame);
+            return TestResult::Fail("1G test address-space creation failed");
+        }
+    };
+    const USER_VA: u64 = 0x0000_5000_8000_0000;
+    // SAFETY: fresh owned root with aligned VA and frame.
+    if unsafe {
+        aspace.map_huge_region(HugeRegion {
+            base: VirtAddr::new(USER_VA),
+            len: HUGEPAGE_1G_BYTES,
+            perms: RegionPerms::READ,
+            size: crate::hugepage::HugeSize::G1,
+            frames: alloc::vec![frame],
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("hardware 1G mapping failed");
+    }
+    let probe = VirtAddr::new(USER_VA + 0x20_0000);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
+    let translated = unsafe { crate::x86_64::paging::translate(aspace.root, probe) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
+    let translated = unsafe { crate::aarch64::paging::translate(aspace.root, probe) };
+    if translated.map(PhysAddr::raw) != Some(phys + 0x20_0000) {
+        return TestResult::Fail("1G translation lost its block offset");
+    }
+    if !aspace.contains_address(VirtAddr::new(USER_VA + HUGEPAGE_1G_BYTES - 1)) {
+        return TestResult::Fail("huge mapping absent from address-space membership");
+    }
+    if aspace.unmap_huge_region(VirtAddr::new(USER_VA)).is_err() {
+        return TestResult::Fail("hardware 1G unmap failed");
+    }
+    // Teardown: drain the synthetic reservation so the pool returns to entry.
+    let _ = alloc_hugepage_1g_on(node);
     TestResult::Pass
 }
 kernel_test_in!(
     "memory/hugepage",
     smoke_hugepage_1g_reserve_picks_aligned_chunk
+);
+
+fn smoke_hugepage_2m_hardware_mapping_roundtrip() -> TestResult {
+    use crate::frame::UsableRegion;
+    use crate::hugepage::{
+        alloc_hugepage_2m_on, node_stats, reserve_from_regions, HUGEPAGE_2M_BYTES,
+    };
+    use crate::{AddressSpace, HugeRegion, PhysAddr, RegionPerms, VirtAddr};
+
+    const SYNTH_BASE: u64 = 0x20_0000_0000;
+    const USER_VA: u64 = 0x0000_5000_4000_0000;
+    let region = UsableRegion {
+        start: PhysAddr::new(SYNTH_BASE),
+        len: HUGEPAGE_2M_BYTES,
+    };
+    let excludes = reserve_from_regions(&[region], 1, 0);
+    if excludes.len() != 1 {
+        return TestResult::Fail("failed to reserve synthetic 2M mapping frame");
+    }
+    // SAFETY: topology lookup only; no synthetic memory is dereferenced.
+    let node = unsafe { crate::frame::narf_phys_node(excludes[0].0) };
+    let before_map = node_stats(node);
+    let frame = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("strict 2M allocation failed"),
+    };
+    let phys = frame.phys();
+    // SAFETY: kernel test runs with paging live.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(aspace) => aspace,
+        Err(_) => {
+            crate::hugepage::free_hugepage(frame);
+            return TestResult::Fail("user address-space creation failed");
+        }
+    };
+    // SAFETY: the fresh AS owns a live root; frame and VA are 2M-aligned.
+    if unsafe {
+        aspace.map_huge_region(HugeRegion {
+            base: VirtAddr::new(USER_VA),
+            len: HUGEPAGE_2M_BYTES,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            size: crate::hugepage::HugeSize::M2,
+            frames: alloc::vec![frame],
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("hardware 2M mapping failed");
+    }
+    let probe = VirtAddr::new(USER_VA + 0x1f000);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
+    let translated = unsafe { crate::x86_64::paging::translate(aspace.root, probe) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
+    let translated = unsafe { crate::aarch64::paging::translate(aspace.root, probe) };
+    if translated.map(PhysAddr::raw) != Some(phys + 0x1f000) {
+        return TestResult::Fail("huge-leaf translation lost its block offset");
+    }
+    if aspace.unmap_huge_region(VirtAddr::new(USER_VA)).is_err() {
+        return TestResult::Fail("hardware 2M unmap failed");
+    }
+    if node_stats(node).free_2m != before_map.free_2m {
+        return TestResult::Fail("huge frame did not return to its NUMA pool");
+    }
+    // Drain the synthetic reservation so sibling tests see their entry state.
+    let _ = alloc_hugepage_2m_on(node);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory/hugepage",
+    smoke_hugepage_2m_hardware_mapping_roundtrip
 );
 
 fn smoke_slab_steady_state_under_churn() -> TestResult {
@@ -6490,3 +6687,94 @@ fn smoke_demand_fault_heals_absent_leaf_pte() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_demand_fault_heals_absent_leaf_pte);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_numa_migrate_page_preserves_contents() -> TestResult {
+    use crate::x86_64::paging;
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    if !crate::is_numa_aware() || crate::node_free(1) == 0 {
+        return TestResult::Skip("requires two online NUMA memory nodes");
+    }
+    // SAFETY: test context; the AS is never activated concurrently.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(x) => x,
+        Err(_) => return TestResult::Skip("AS alloc failed"),
+    };
+    let va = VirtAddr::new(0x0000_4080_3000_0000);
+    let old = match crate::frame::alloc_frame_on_strict(0) {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("node 0 allocation failed"),
+    };
+    // SAFETY: the freshly allocated frame is live in the direct map.
+    unsafe { old.kernel_mut_ptr::<u64>().write(0x4E55_4D41_4D4F_5645) };
+    if a.map_region(Region {
+        base: va,
+        len: 4096,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![old],
+    })
+    .is_err()
+    {
+        return TestResult::Fail("failed to register migration test page");
+    }
+    // SAFETY: a owns a fresh valid root and the test runs without mutation.
+    if unsafe { a.materialize() }.is_err() {
+        return TestResult::Fail("failed to materialize migration test page");
+    }
+    let node1_free_before = crate::node_free(1);
+    // SAFETY: root/direct map are live, the range is fully mapped, and the
+    // region is private.
+    if unsafe { a.conform_range_to_nodes(va, 4096, 0b10, true) } != Ok(0) {
+        return TestResult::Fail("range node 0 -> node 1 migration failed");
+    }
+    // SAFETY: a.root remains valid and no concurrent mutation occurs.
+    let Some(new_phys) = (unsafe { paging::translate(a.root, va) }) else {
+        return TestResult::Fail("migrated PTE is absent");
+    };
+    // ACPI parser smokes deliberately reset the live SRAT table, while the
+    // buddy's boot-time NUMA partition remains authoritative. Verify strict
+    // zone consumption rather than consulting that mutable test fixture.
+    if crate::node_free(1) + 1 != node1_free_before {
+        return TestResult::Fail("migrated page did not land on node 1");
+    }
+    // SAFETY: translated physical frame remains owned by the AS.
+    if unsafe { new_phys.kernel_ptr::<u64>().read() } != 0x4E55_4D41_4D4F_5645 {
+        return TestResult::Fail("migration did not preserve page contents");
+    }
+    // The ACPI topology-reset smokes described above also make AS teardown
+    // unable to route this node-1 frame back to its boot-time zone. Leak this
+    // isolated test AS rather than polluting the allocator for later smokes.
+    core::mem::forget(a);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_numa_migrate_page_preserves_contents);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_mempolicy_allowed_mask_is_hard_boundary() -> TestResult {
+    if !crate::is_numa_aware() || crate::node_free(1) == 0 {
+        return TestResult::Skip("requires two NUMA memory nodes");
+    }
+    let before = crate::node_free(1);
+    let policy = crate::Mempolicy {
+        mode: crate::MPOL_DEFAULT,
+        nodemask: 0,
+        allowed: 0b10,
+        home_node: u32::MAX,
+    };
+    let frame = match crate::mempolicy::alloc_frame_with(policy, 0) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("cpuset-constrained allocation failed"),
+    };
+    if crate::node_free(1) + 1 != before {
+        return TestResult::Fail("DEFAULT policy escaped cpuset node mask");
+    }
+    // ACPI parser smokes mutate the live SRAT fixture after the allocator was
+    // partitioned, so freeing this node-1 frame could route it to the wrong
+    // zone. Keep this single test frame allocated.
+    let _leaked_frame = frame;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_mempolicy_allowed_mask_is_hard_boundary);

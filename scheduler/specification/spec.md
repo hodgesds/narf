@@ -34,10 +34,16 @@ pub fn spawn<F: Future<Output=()> + Send + 'static>(f: F, domain: DomainId) -> T
 pub fn spawn_with(f: impl Future<Output=()>, domain: DomainId, spec: TaskSpec) -> TaskId;
 pub fn yield_now() -> impl Future<Output=()>;
 pub fn donate_to(task: TaskId) -> impl Future<Output=()>; // direct context transfer
+pub fn set_task_mems_allowed(task: u64, mask: u64);
+pub fn task_mems_allowed(task: u64) -> u64;
+pub fn clear_task_mems_allowed(task: u64);
 ```
 
 Executor internals: per-CPU queues + global stealing pool; each task
 carries `DomainId` so the executor switches domain before polling.
+The per-task NUMA mask is the task-identity seam for cgroup-v2
+`cpuset.mems`; the page-fault policy resolver treats it as a hard
+allocation boundary and removes it when the task exits or detaches.
 
 ### 3.2 CPU topology
 

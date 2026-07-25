@@ -22,8 +22,8 @@ const SCHED_OTHER: u64 = 0;
 const SCHED_RR: u64 = 2;
 
 // ── getcpu(cpu*, node*, tcache) ─────────────────────────────────────
-// Single-CPU/single-node: writes CPU=0, node=0, returns ok(0). Null
-// out-pointers are tolerated (the writes are simply skipped).
+// Reports the live logical CPU and its SRAT NUMA node. The ABI harness runs
+// on the BSP, which belongs to node 0 in the default QEMU topology.
 
 fn smoke_abi_sched_getcpu_pos() -> TestResult {
     with_setup(|| {
@@ -55,6 +55,14 @@ fn smoke_abi_sched_getcpu_null_ptrs_ok() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_getcpu_null_ptrs_ok);
+
+fn smoke_abi_sched_getcpu_bad_cpu_ptr_neg() -> TestResult {
+    with_setup(|| match call(Syscall::Getcpu.raw(), a2(BAD_PTR, 0, 0)) {
+        Some(v) if v == EFAULT => Ok(()),
+        _ => Err("getcpu with a bad CPU pointer should return -EFAULT"),
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_getcpu_bad_cpu_ptr_neg);
 
 // ── getpriority(which, who) ─────────────────────────────────────────
 // PRIO_PROCESS(0) only; returns nice+20 (default nice 0 ⇒ 20).

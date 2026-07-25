@@ -1,16 +1,24 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "0c79ac64af6ef07b1aa37efffada5205ea075c6acb882f73ddcfe1cc0a01cfe3"
+prompt_hash = "6e7ecf10083ec035057bdce834a72bbe2bffae8df9383ed10eb06c78dd70944b"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "The change is confined to x86 architectural extended-state policy and its tests; it neither adds a trusted subsystem nor moves the documented TCB boundary."
+argument = "Range conformance, BIND home-node selection, NUMA event accounting, huge-page allocator topology, and user huge-leaf ownership remain inside the existing memory-manager TCB and do not add a trusted subsystem or move the documented trust boundary."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "Selecting a saveable XCR0 mask does not change capability checks, page-domain tags, PKRS state, or domain transitions. AVX state remains per task and cannot grant memory access."
+argument = "NUMA procfs reporting copies only virtual metadata and aggregate node counts while the address-space region locks are held; it never exports physical addresses, clones HugeFrame ownership, or changes mapping/domain rights."
 
 [[invariants_preserved]]
-ref = "security-model/specification/spec.md#L67"
-argument = "The XSAVE image contains user arithmetic state only and remains separate from DomainSavedState; this change does not expose another task's PKRS history or broaden diagnostic access."
+ref = "security-model/specification/spec.md#L42"
+argument = "Huge mappings validate virtual/physical alignment before installing architecture leaves, retain authoritative frame ownership in AddressSpace, invalidate translations before returning frames to the pool, and preserve W^X plus NUMA/cpuset selection without changing domain assignment."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Explicit NUMA syscalls and cpuset.memory_migrate replace authoritative base-page or complete huge-leaf backing and flush peer TLBs before old frames return to the buddy or huge pool. Failed huge-leaf replacement restores the original mapping and retains its ownership. Shared mappings are never moved without MOVE_ALL authority, which NARF rejects because it has no ambient CAP_SYS_NICE."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Correcting Linux mempolicy flag values and adding PREFERRED_MANY only changes the order in which frames are requested from existing per-node allocators. The cpuset allowed mask remains a hard boundary, and frame ownership, domain assignment, and mapping authority are unchanged."

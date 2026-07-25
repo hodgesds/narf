@@ -27,7 +27,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+use narf_memory::{AddressSpace, HugeRegion, Region, RegionPerms, VirtAddr};
 
 use crate::{
     fd, RawFnHandler, SigDeliveryParams, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
@@ -3244,14 +3244,19 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
 // flags which we preserve in the stored value so get_mempolicy reflects
 // them, but they don't affect allocation steering.
 
-const MPOL_MAX: u32 = 5; // DEFAULT/PREFERRED/BIND/INTERLEAVE/LOCAL
-const MPOL_MODE_FLAGS: u32 = 0xc000_0000; // MPOL_F_STATIC_NODES | _RELATIVE_NODES
+const MPOL_PREFERRED_MANY: u32 = 5;
+const MPOL_F_RELATIVE_NODES: u32 = 1 << 14;
+const MPOL_F_STATIC_NODES: u32 = 1 << 15;
+const MPOL_MODE_FLAGS: u32 = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES;
 
 // Online NUMA node count via a weak hook (userspace avoids a direct
 // narf-acpi dep to keep the kernel image under lld's orphan-placement
 // threshold — see filesystem/src/sysfs.rs). `narf-frame` provides it.
 extern "Rust" {
     fn narf_numa_node_count() -> u32;
+    fn narf_cpu_to_node(cpu: u32) -> u32;
+    fn narf_phys_to_node(addr: u64) -> u32;
+    fn narf_node_distance(from: u32, to: u32) -> u32;
 }
 
 #[inline]
@@ -3260,13 +3265,58 @@ fn numa_node_count() -> u32 {
     unsafe { narf_numa_node_count() }.max(1)
 }
 
+#[inline]
+fn numa_node_for_cpu(cpu: u32) -> u32 {
+    // SAFETY: narf-frame provides the `#[no_mangle]` definition.
+    unsafe { narf_cpu_to_node(cpu) }
+}
+
+#[inline]
+fn numa_node_for_phys(phys: u64) -> u32 {
+    // SAFETY: narf-frame provides the `#[no_mangle]` definition.
+    unsafe { narf_phys_to_node(phys) }
+}
+
+fn mapped_phys(as_ref: &AddressSpace, va: u64) -> Option<u64> {
+    let page = VirtAddr::new(va & !0xFFF);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the live AddressSpace owns `root`; this is a read-only walk.
+        unsafe { narf_memory::x86_64::paging::translate(as_ref.root, page) }.map(|p| p.as_u64())
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: the live AddressSpace owns `root`; this is a read-only walk.
+        unsafe { narf_memory::aarch64::paging::translate(as_ref.root, page) }.map(|p| p.as_u64())
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (as_ref, page);
+        None
+    }
+}
+
 // get_mempolicy `flags` bits (uapi/linux/mempolicy.h).
 const MPOL_F_NODE: u32 = 1 << 0; // return the node id, not the mode
 const MPOL_F_ADDR: u32 = 1 << 1; // query the policy at `addr`
 const MPOL_F_MEMS_ALLOWED: u32 = 1 << 2; // return the allowed-nodes mask
 
-/// One stored policy: mode (with flags) + first-word nodemask.
-type StoredPolicy = (u32, u64);
+/// One stored policy: mode (with flags), first-word nodemask, and optional
+/// BIND distance anchor installed by set_mempolicy_home_node(2).
+#[derive(Copy, Clone)]
+struct StoredPolicy {
+    mode: u32,
+    nodemask: u64,
+    home_node: u32,
+}
+
+impl StoredPolicy {
+    const DEFAULT: Self = Self {
+        mode: 0,
+        nodemask: 0,
+        home_node: u32::MAX,
+    };
+}
 
 /// Per-task default policy (set_mempolicy).
 static MEMPOLICY_TABLE: narf_lib::sync::IrqSafeSpinLock<
@@ -3281,7 +3331,68 @@ static MBIND_TABLE: narf_lib::sync::IrqSafeSpinLock<
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn mpol_mode_valid(mode: u32) -> bool {
-    (mode & !MPOL_MODE_FLAGS) < MPOL_MAX
+    matches!(mode & !MPOL_MODE_FLAGS, 0..=MPOL_PREFERRED_MANY)
+}
+
+fn mpol_policy_shape_valid(mode: u32, nodemask: u64) -> bool {
+    let flags = mode & MPOL_MODE_FLAGS;
+    if flags == (MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES) {
+        return false;
+    }
+    match mode & !MPOL_MODE_FLAGS {
+        narf_memory::MPOL_DEFAULT | narf_memory::MPOL_LOCAL => nodemask == 0 && flags == 0,
+        narf_memory::MPOL_PREFERRED => nodemask != 0 || flags == 0,
+        narf_memory::MPOL_BIND | narf_memory::MPOL_INTERLEAVE | MPOL_PREFERRED_MANY => {
+            nodemask != 0
+        }
+        _ => false,
+    }
+}
+
+/// Resolve a user nodemask against the task's current cpuset constraint.
+///
+/// STATIC keeps physical node identities. RELATIVE treats each set bit as
+/// an ordinal into the allowed-node set, folding ordinals modulo its weight
+/// like Linux `nodes_fold` + `nodes_onto`. An empty result after a cpuset
+/// rebind falls back to the allowed set.
+fn mpol_effective_nodemask(policy: StoredPolicy, allowed: u64) -> u64 {
+    let allowed = allowed & ((1u64 << narf_memory::FRAME_MAX_NUMA_NODES) - 1);
+    if allowed == 0 || policy.nodemask == 0 {
+        return policy.nodemask & allowed;
+    }
+    let flags = policy.mode & MPOL_MODE_FLAGS;
+    let effective = if flags & MPOL_F_RELATIVE_NODES != 0 {
+        let weight = allowed.count_ones();
+        let mut ordinals = 0u64;
+        for bit in 0..64u32 {
+            if (policy.nodemask >> bit) & 1 != 0 {
+                ordinals |= 1u64 << (bit % weight);
+            }
+        }
+        let mut mapped = 0u64;
+        let mut ordinal = 0u32;
+        for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
+            if (allowed >> node) & 1 == 0 {
+                continue;
+            }
+            if (ordinals >> ordinal) & 1 != 0 {
+                mapped |= 1u64 << node;
+            }
+            ordinal += 1;
+        }
+        mapped
+    } else {
+        policy.nodemask & allowed
+    };
+    if effective == 0 {
+        allowed
+    } else {
+        effective
+    }
+}
+
+fn mpol_initial_nodemask_valid(mode: u32, nodemask: u64, allowed: u64) -> bool {
+    nodemask == 0 || mode & MPOL_F_RELATIVE_NODES != 0 || nodemask & allowed != 0
 }
 
 /// Resolve the policy in force for `task` at user address `va`: a
@@ -3298,7 +3409,7 @@ fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
         .lock()
         .as_ref()
         .and_then(|m| m.get(&task).copied())
-        .unwrap_or((0, 0))
+        .unwrap_or(StoredPolicy::DEFAULT)
 }
 
 /// Publish the current task's mempolicy for the faulting address `va`
@@ -3308,10 +3419,13 @@ fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
 /// `clear_mempolicy_for_fault` afterward.
 pub fn publish_mempolicy_for_fault(va: u64) {
     let task = current_task_id();
-    let (mode, nodemask) = resolve_policy(task, va);
+    let policy = resolve_policy(task, va);
+    let allowed = narf_scheduler::task_mems_allowed(task);
     narf_memory::mempolicy_set(narf_memory::Mempolicy {
-        mode: mode & !MPOL_MODE_FLAGS,
-        nodemask,
+        mode: policy.mode & !MPOL_MODE_FLAGS,
+        nodemask: mpol_effective_nodemask(policy, allowed),
+        allowed,
+        home_node: policy.home_node,
     });
 }
 
@@ -3324,23 +3438,86 @@ pub fn clear_mempolicy_for_fault() {
 /// get_mempolicy's MPOL_F_NODE|MPOL_F_ADDR query). Mirrors the
 /// allocator's preference resolution without actually allocating.
 fn mempolicy_resolved_node(pol: narf_memory::Mempolicy) -> u32 {
+    let allowed = pol.allowed & ((1u64 << narf_memory::FRAME_MAX_NUMA_NODES) - 1);
+    let first_allowed = if allowed == 0 {
+        0
+    } else {
+        allowed.trailing_zeros()
+    };
     match pol.mode {
-        x if x == narf_memory::MPOL_BIND || x == narf_memory::MPOL_PREFERRED => {
-            if pol.nodemask != 0 {
-                pol.nodemask.trailing_zeros()
+        x if x == narf_memory::MPOL_BIND => {
+            let preferred = pol.nodemask & allowed;
+            if preferred != 0 {
+                let anchor = if pol.home_node == u32::MAX {
+                    preferred.trailing_zeros()
+                } else {
+                    pol.home_node
+                };
+                let mut best = preferred.trailing_zeros();
+                let mut best_distance = u32::MAX;
+                for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
+                    if (preferred >> node) & 1 == 0 {
+                        continue;
+                    }
+                    // SAFETY: narf-frame provides the topology hook.
+                    let distance = unsafe { narf_node_distance(anchor, node) };
+                    if distance < best_distance || (distance == best_distance && node < best) {
+                        best = node;
+                        best_distance = distance;
+                    }
+                }
+                best
             } else {
-                narf_memory::frame::local_node() as u32
+                first_allowed
             }
         }
-        x if x == narf_memory::MPOL_INTERLEAVE => {
-            if pol.nodemask != 0 {
-                pol.nodemask.trailing_zeros()
+        x if x == narf_memory::MPOL_PREFERRED => {
+            let preferred = pol.nodemask & allowed;
+            if preferred != 0 {
+                preferred.trailing_zeros()
             } else {
-                0
+                first_allowed
+            }
+        }
+        x if x == narf_memory::MPOL_PREFERRED_MANY => {
+            let preferred = pol.nodemask & allowed;
+            let anchor = if pol.home_node == u32::MAX {
+                narf_memory::frame::local_node() as u32
+            } else {
+                pol.home_node
+            };
+            let mut best = first_allowed;
+            let mut best_distance = u32::MAX;
+            for node in 0..narf_memory::FRAME_MAX_NUMA_NODES as u32 {
+                if (preferred >> node) & 1 == 0 {
+                    continue;
+                }
+                // SAFETY: narf-frame provides the topology hook.
+                let distance = unsafe { narf_node_distance(anchor, node) };
+                if distance < best_distance || (distance == best_distance && node < best) {
+                    best = node;
+                    best_distance = distance;
+                }
+            }
+            best
+        }
+        x if x == narf_memory::MPOL_INTERLEAVE => {
+            let interleave = pol.nodemask & allowed;
+            if interleave != 0 {
+                interleave.trailing_zeros()
+            } else {
+                first_allowed
             }
         }
         // DEFAULT / LOCAL
-        _ => narf_memory::frame::local_node() as u32,
+        _ => {
+            let local = narf_memory::frame::local_node() as u32;
+            if (allowed >> local) & 1 != 0 {
+                local
+            } else {
+                first_allowed
+            }
+        }
     }
 }
 
@@ -5933,6 +6110,7 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = MBIND_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
+    narf_scheduler::clear_task_mems_allowed(tid);
     if let Some(m) = PKEY_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
@@ -7304,10 +7482,10 @@ pub fn __test_sched_param_reset() {
 
 // ── Getcpu — current CPU + NUMA node query ─────────────────────────
 //
-// Linux getcpu(2): real CPU + NUMA node lookup. NARF user mode is
-// single-CPU and single-node today — both return 0 — but library
-// code (libnuma, RT performance probes) queries this at startup
-// and the entry must exist.
+// Linux getcpu(2): real logical CPU + SRAT NUMA node lookup. Library
+// code (libnuma, RT performance probes) queries this at startup, so
+// returning the BSP unconditionally breaks placement decisions after
+// a task migrates.
 
 // ── Per-task umask ──────────────────────────────────────────────────
 //
@@ -10381,10 +10559,13 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
             }
         })
     {
-        for r in as_arc.regions_snapshot() {
+        for r in as_arc.numa_regions_snapshot() {
             let base = r.base.as_u64();
             let end = base + r.len;
             let prot = r.perms.prot_only();
+            let policy = resolve_policy(tid, base);
+            let effective_nodemask =
+                mpol_effective_nodemask(policy, narf_scheduler::task_mems_allowed(tid));
             let label: &'static str = if base == crate::process::DEFAULT_USER_STACK_BASE {
                 "[stack]"
             } else if base == 0x8000_0000_0000_u64
@@ -10406,6 +10587,11 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
                 // SHARED bit. Feeds maps' s/p column + statm's shared.
                 shared: r.perms.contains(RegionPerms::SHARED),
                 label,
+                numa_policy: policy.mode,
+                numa_nodemask: effective_nodemask,
+                numa_node_pages: r.node_pages,
+                resident_pages: r.resident_pages,
+                kernel_page_kb: r.kernel_page_kb,
             });
         }
     }
