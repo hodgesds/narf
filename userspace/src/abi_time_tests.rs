@@ -687,7 +687,7 @@ fn smoke_abi_time_timerfd_gettime_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_time_timerfd_gettime_neg);
 
 // ── gettimeofday(timeval, timezone) ───────────────────────────────────
-// Valid timeval* → ok(0) with non-zero tv_sec and tv_usec < 1_000_000.
+// Valid timeval* → ok(0) with a normalized, non-regressing timeval.
 // timezone* is ignored (NARF follows Linux).
 
 fn smoke_abi_time_gettimeofday_pos() -> TestResult {
@@ -695,14 +695,21 @@ fn smoke_abi_time_gettimeofday_pos() -> TestResult {
         let mut tv = [0i64; 2];
         match call(Syscall::Gettimeofday.raw(), a1(tv.as_mut_ptr() as u64, 0)) {
             Some(0) => {
-                // Verify tv_sec is plausible (non-zero) and tv_usec is in range.
+                // An unseeded wall clock may legitimately still be in epoch
+                // second zero when fast aarch64 CI reaches this test.
                 let tv_sec = tv[0];
                 let tv_usec = tv[1];
-                if tv_sec == 0 {
-                    return Err("gettimeofday tv_sec should be non-zero");
+                if tv_sec < 0 {
+                    return Err("gettimeofday tv_sec should be non-negative");
                 }
                 if !(0..1_000_000).contains(&tv_usec) {
                     return Err("gettimeofday tv_usec must be in [0, 1_000_000)");
+                }
+                let first = (tv_sec, tv_usec);
+                match call(Syscall::Gettimeofday.raw(), a1(tv.as_mut_ptr() as u64, 0)) {
+                    Some(0) if (tv[0], tv[1]) >= first => {}
+                    Some(0) => return Err("gettimeofday moved backwards"),
+                    _ => return Err("second gettimeofday call failed"),
                 }
                 Ok(())
             }
