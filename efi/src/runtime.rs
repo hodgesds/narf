@@ -3,8 +3,9 @@
 //! ## What this module does
 //!
 //! After `ExitBootServices` the UEFI firmware's Runtime-Services
-//! function-pointer table remains callable at the virtual addresses
-//! described by `SetVirtualAddressMap`. This module:
+//! function-pointer table can remain callable if the boot path preserves
+//! the runtime memory descriptors and establishes the address mapping
+//! required by the firmware. This module:
 //!
 //! 1. **Stores** the `EFI_RUNTIME_SERVICES` table pointer passed by the
 //!    bootloader (`install`).
@@ -34,11 +35,13 @@
 //!
 //! ## SetVirtualAddressMap
 //!
-//! `SetVirtualAddressMap` is a one-shot call the bootloader makes
-//! **before** handing off to the kernel; by the time `install` is
-//! called the memory map has already been remapped. This module does
-//! **not** expose `SetVirtualAddressMap` — it is exclusively a
-//! bootloader-side ritual.
+//! `SetVirtualAddressMap` is a one-shot transition owned by the OS loader
+//! or kernel after `ExitBootServices`. NARF's current Limine and AA64
+//! removable-media paths do not yet preserve the descriptor map needed
+//! to perform it, so neither path calls `install` and `is_available()`
+//! remains false on production boots. These wrappers are deliberately
+//! dormant until the boot ABI carries the runtime descriptors and the
+//! architecture memory managers can pin their mappings.
 //!
 //! ## Secure Boot hook
 //!

@@ -7,7 +7,7 @@ extern crate alloc;
 
 #[cfg(not(test))]
 use core::panic::PanicInfo;
-use core::ptr;
+use core::{ptr, slice};
 use uefi::{
     boot::{self, AllocateType, MemoryType},
     cstr16, entry, guid,
@@ -21,6 +21,12 @@ const PROGRAM_HEADER_SIZE: usize = 56;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const EM_AARCH64: u16 = 183;
+const ET_EXEC: u16 = 2;
+const EV_CURRENT: u32 = 1;
+const FDT_MAGIC: u32 = 0xd00d_feed;
+const FDT_HEADER_SIZE: usize = 40;
+const MAX_DTB_SIZE: usize = 2 * 1024 * 1024;
+const MAX_KERNEL_LOAD_SPAN: u64 = 1024 * 1024 * 1024;
 const EFI_DTB_TABLE_GUID: uefi::Guid = guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
 
 #[derive(Clone, Copy)]
@@ -38,6 +44,7 @@ enum LoadError {
     MissingDtb,
     InvalidElf,
     UnsupportedElf,
+    InvalidDtb,
     Arithmetic,
     Allocation,
 }
@@ -66,6 +73,20 @@ fn main() -> Status {
 }
 
 fn load_and_start() -> Result<(), LoadError> {
+    let dtb = system::with_config_table(|tables| {
+        tables
+            .iter()
+            .find(|entry| entry.guid == EFI_DTB_TABLE_GUID)
+            .map(|entry| entry.address as usize)
+    })
+    .filter(|address| *address != 0)
+    .ok_or(LoadError::MissingDtb)?;
+    // SAFETY: the standard EFI DTB configuration-table entry is a
+    // firmware-owned pointer valid through ExitBootServices.
+    let dtb_header = unsafe { slice::from_raw_parts(dtb as *const u8, FDT_HEADER_SIZE) };
+    let dtb_size = validate_dtb_header(dtb_header)?;
+    let dtb_end = dtb.checked_add(dtb_size).ok_or(LoadError::Arithmetic)?;
+
     let kernel = {
         let protocol =
             boot::get_image_file_system(boot::image_handle()).map_err(|_| LoadError::FileSystem)?;
@@ -77,6 +98,11 @@ fn load_and_start() -> Result<(), LoadError> {
     let (entry, segments, load_start, load_end) = parse_elf(&kernel)?;
     let page_start = align_down(load_start, PAGE_SIZE);
     let page_end = align_up(load_end, PAGE_SIZE).ok_or(LoadError::Arithmetic)?;
+    if page_end - page_start > MAX_KERNEL_LOAD_SPAN
+        || ranges_overlap(page_start as usize, page_end as usize, dtb, dtb_end)
+    {
+        return Err(LoadError::InvalidElf);
+    }
     let pages =
         usize::try_from((page_end - page_start) / PAGE_SIZE).map_err(|_| LoadError::Arithmetic)?;
     let allocation = boot::allocate_pages(
@@ -109,15 +135,6 @@ fn load_and_start() -> Result<(), LoadError> {
         };
     }
 
-    let dtb = system::with_config_table(|tables| {
-        tables
-            .iter()
-            .find(|entry| entry.guid == EFI_DTB_TABLE_GUID)
-            .map(|entry| entry.address as usize)
-    })
-    .filter(|address| *address != 0)
-    .ok_or(LoadError::MissingDtb)?;
-
     drop(kernel);
     // SAFETY: filesystem protocols and all pool-backed objects were dropped;
     // loaded pages and the firmware-owned DTB intentionally remain live.
@@ -137,7 +154,11 @@ fn parse_elf(bytes: &[u8]) -> Result<(u64, alloc::vec::Vec<LoadSegment>, u64, u6
         || bytes.get(0..4) != Some(b"\x7fELF")
         || bytes[4] != 2
         || bytes[5] != 1
+        || bytes[6] != 1
+        || read_u16(bytes, 16)? != ET_EXEC
         || read_u16(bytes, 18)? != EM_AARCH64
+        || read_u32(bytes, 20)? != EV_CURRENT
+        || read_u16(bytes, 52)? as usize != ELF_HEADER_SIZE
     {
         return Err(LoadError::UnsupportedElf);
     }
@@ -173,7 +194,14 @@ fn parse_elf(bytes: &[u8]) -> Result<(u64, alloc::vec::Vec<LoadSegment>, u64, u6
             file_size: read_u64(bytes, offset + 32)?,
             memory_size: read_u64(bytes, offset + 40)?,
         };
+        let alignment = read_u64(bytes, offset + 48)?;
         if segment.file_size > segment.memory_size || segment.memory_size == 0 {
+            return Err(LoadError::InvalidElf);
+        }
+        if alignment > 1
+            && (!alignment.is_power_of_two()
+                || segment.physical % alignment != segment.file_offset % alignment)
+        {
             return Err(LoadError::InvalidElf);
         }
         let file_end = segment
@@ -230,6 +258,24 @@ fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Lo
         .map_err(|_| LoadError::InvalidElf)
 }
 
+fn validate_dtb_header(bytes: &[u8]) -> Result<usize, LoadError> {
+    let magic = u32::from_be_bytes(read_array(bytes, 0)?);
+    let size = u32::from_be_bytes(read_array(bytes, 4)?) as usize;
+    if magic != FDT_MAGIC || !(FDT_HEADER_SIZE..=MAX_DTB_SIZE).contains(&size) {
+        return Err(LoadError::InvalidDtb);
+    }
+    Ok(size)
+}
+
+const fn ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
 const fn align_down(value: u64, alignment: u64) -> u64 {
     value & !(alignment - 1)
 }
@@ -250,11 +296,15 @@ mod tests {
         bytes[0..4].copy_from_slice(b"\x7fELF");
         bytes[4] = 2;
         bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
         bytes[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        bytes[20..24].copy_from_slice(&EV_CURRENT.to_le_bytes());
         bytes[24..32].copy_from_slice(&0x4008_0000u64.to_le_bytes());
         bytes[32..40].copy_from_slice(&(ELF_HEADER_SIZE as u64).to_le_bytes());
         bytes[54..56].copy_from_slice(&(PROGRAM_HEADER_SIZE as u16).to_le_bytes());
         bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+        bytes[52..54].copy_from_slice(&(ELF_HEADER_SIZE as u16).to_le_bytes());
         let ph = ELF_HEADER_SIZE;
         bytes[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
         bytes[ph + 4..ph + 8].copy_from_slice(&PF_X.to_le_bytes());
@@ -263,6 +313,7 @@ mod tests {
         bytes[ph + 24..ph + 32].copy_from_slice(&0x4008_0000u64.to_le_bytes());
         bytes[ph + 32..ph + 40].copy_from_slice(&4u64.to_le_bytes());
         bytes[ph + 40..ph + 48].copy_from_slice(&8u64.to_le_bytes());
+        bytes[ph + 48..ph + 56].copy_from_slice(&1u64.to_le_bytes());
         bytes
     }
 
@@ -295,5 +346,18 @@ mod tests {
         let mut bytes = valid_elf();
         bytes[24..32].copy_from_slice(&0x5000_0000u64.to_le_bytes());
         assert!(matches!(parse_elf(&bytes), Err(LoadError::InvalidElf)));
+    }
+
+    #[test]
+    fn validates_bounded_dtb_header() {
+        let mut header = [0u8; FDT_HEADER_SIZE];
+        header[0..4].copy_from_slice(&FDT_MAGIC.to_be_bytes());
+        header[4..8].copy_from_slice(&(FDT_HEADER_SIZE as u32).to_be_bytes());
+        assert_eq!(validate_dtb_header(&header).unwrap(), FDT_HEADER_SIZE);
+        header[4..8].copy_from_slice(&((MAX_DTB_SIZE + 1) as u32).to_be_bytes());
+        assert!(matches!(
+            validate_dtb_header(&header),
+            Err(LoadError::InvalidDtb)
+        ));
     }
 }
