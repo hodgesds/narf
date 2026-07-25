@@ -56,6 +56,7 @@ pub enum FuseOpcode {
     Destroy = 38,
     Poll = 40,
     Fallocate = 43,
+    ReadDirPlus = 44,
     Rename2 = 45,
     Lseek = 46,
     CopyFileRange = 47,
@@ -135,6 +136,8 @@ pub enum FuseInitFlag {
     AtomicOTrunc = 1 << 3,
     BigWrites = 1 << 5,
     FlockLocks = 1 << 10,
+    DoReaddirplus = 1 << 13,
+    ReaddirplusAuto = 1 << 14,
     AsyncDio = 1 << 15,
     WritebackCache = 1 << 16,
     ParallelDirops = 1 << 18,
@@ -147,6 +150,8 @@ pub const FUSE_SUPPORTED_INIT_FLAGS: u32 = FuseInitFlag::AsyncRead as u32
     | FuseInitFlag::PosixLocks as u32
     | FuseInitFlag::BigWrites as u32
     | FuseInitFlag::FlockLocks as u32
+    | FuseInitFlag::DoReaddirplus as u32
+    | FuseInitFlag::ReaddirplusAuto as u32
     | FuseInitFlag::AsyncDio as u32
     | FuseInitFlag::ParallelDirops as u32
     | FuseInitFlag::MaxPages as u32
@@ -570,6 +575,15 @@ pub struct FuseDirent {
     pub namelen: u32,
     pub type_: u32,
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FuseDirentPlus {
+    pub entry_out: FuseEntryOut,
+    pub dirent: FuseDirent,
+}
+
+pub const FUSE_DIRENTPLUS_HEADER_LEN: usize = core::mem::size_of::<FuseDirentPlus>();
 
 /// Fixed size of the `fuse_dirent` header (name bytes follow).
 pub const FUSE_DIRENT_HEADER_LEN: usize = core::mem::size_of::<FuseDirent>();

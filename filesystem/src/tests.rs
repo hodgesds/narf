@@ -2764,6 +2764,9 @@ fn smoke_fs_fuse_struct_sizes() -> TestResult {
     if size_of::<FuseDirent>() != 24 {
         return TestResult::Fail("fuse_dirent header != 24");
     }
+    if size_of::<FuseDirentPlus>() != 152 {
+        return TestResult::Fail("fuse_direntplus header != 152");
+    }
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_struct_sizes);
@@ -3075,8 +3078,8 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
             };
             Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
         }
-        // FUSE_READDIR (28): one entry, "hello".
-        28 => {
+        // FUSE_READDIR / FUSE_READDIRPLUS: one entry, "hello".
+        28 | 44 => {
             let mut out = alloc::vec::Vec::new();
             let de = FuseDirent {
                 ino: 2,
@@ -3084,7 +3087,19 @@ fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
                 namelen: 5,
                 type_: 8, // DT_REG
             };
-            out.extend_from_slice(&pod_as_bytes(&de));
+            if opcode == 44 {
+                out.extend_from_slice(&pod_as_bytes(&FuseDirentPlus {
+                    entry_out: FuseEntryOut {
+                        nodeid: 2,
+                        generation: 1,
+                        attr: file_attr,
+                        ..Default::default()
+                    },
+                    dirent: de,
+                }));
+            } else {
+                out.extend_from_slice(&pod_as_bytes(&de));
+            }
             out.extend_from_slice(b"hello");
             while out.len() % FUSE_DIRENT_ALIGN != 0 {
                 out.push(0);

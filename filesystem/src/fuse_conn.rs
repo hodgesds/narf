@@ -1224,8 +1224,7 @@ impl DirOps for FuseDir {
             let oout: FuseOpenOut = pod_from_bytes(&oreply).ok_or(FsError::InvalidData)?;
             let fh = oout.fh;
 
-            // READDIR: the daemon streams `fuse_dirent` records. We ask for
-            // a generous buffer and parse them all, then apply cursor/max.
+            let plus = self.conn.negotiated_flags() & FuseInitFlag::DoReaddirplus as u64 != 0;
             let readbody = pod_as_bytes(&FuseReadIn {
                 fh,
                 offset: 0,
@@ -1237,21 +1236,39 @@ impl DirOps for FuseDir {
             });
             let data = self
                 .conn
-                .request(FuseOpcode::ReadDir, self.nodeid, readbody)
+                .request(
+                    if plus {
+                        FuseOpcode::ReadDirPlus
+                    } else {
+                        FuseOpcode::ReadDir
+                    },
+                    self.nodeid,
+                    readbody,
+                )
                 .await?;
 
             let mut out: Vec<(String, FileType)> = Vec::new();
             let mut pos = 0usize;
-            while pos + FUSE_DIRENT_HEADER_LEN <= data.len() {
-                let de: FuseDirent = match pod_from_bytes(&data[pos..]) {
-                    Some(d) => d,
-                    None => break,
+            let header_len = if plus {
+                FUSE_DIRENTPLUS_HEADER_LEN
+            } else {
+                FUSE_DIRENT_HEADER_LEN
+            };
+            while pos + header_len <= data.len() {
+                let (de, nodeid) = if plus {
+                    let entry: FuseDirentPlus =
+                        pod_from_bytes(&data[pos..]).ok_or(FsError::InvalidData)?;
+                    (entry.dirent, Some(entry.entry_out.nodeid))
+                } else {
+                    let entry: FuseDirent =
+                        pod_from_bytes(&data[pos..]).ok_or(FsError::InvalidData)?;
+                    (entry, None)
                 };
                 let namelen = de.namelen as usize;
-                let name_start = pos + FUSE_DIRENT_HEADER_LEN;
+                let name_start = pos + header_len;
                 let name_end = name_start + namelen;
-                if name_end > data.len() {
-                    break; // truncated / malformed record
+                if namelen == 0 || name_end > data.len() {
+                    return Err(FsError::InvalidData);
                 }
                 let name = String::from_utf8_lossy(&data[name_start..name_end]).into_owned();
                 let ft = match de.type_ {
@@ -1263,6 +1280,13 @@ impl DirOps for FuseDir {
                 };
                 if name != "." && name != ".." {
                     out.push((name, ft));
+                }
+                if let Some(nodeid) = nodeid.filter(|nodeid| *nodeid != 0) {
+                    self.conn.submit_noreply(
+                        FuseOpcode::Forget,
+                        nodeid,
+                        &pod_as_bytes(&FuseForgetIn { nlookup: 1 }),
+                    );
                 }
                 pos = name_end;
                 // Records are 8-byte aligned on the wire.

@@ -221,6 +221,11 @@ wire-validated and accepted. They require no cache mutation while the
 FUSE bridge remains uncached; adding inode, dentry, or page caching must
 attach the corresponding invalidation before enabling that cache.
 
+When the daemon negotiates `DO_READDIRPLUS`, directory enumeration uses
+`READDIRPLUS`, validates each combined entry/dirent record, and emits an
+immediate `FORGET` for the otherwise-uncached lookup reference. Daemons
+without the capability continue to receive ordinary `READDIR`.
+
 Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with
 `FsError::InvalidData`; a disconnected daemon fails pending requests
