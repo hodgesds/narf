@@ -349,12 +349,41 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
         ),
         -EPERM
     );
-    let ext_denied =
-        build_replies_with_options(&request, None, ReplyOptions { ext_ack: true }).unwrap();
+    let ext_denied = build_replies_with_options(
+        &request,
+        None,
+        ReplyOptions {
+            ext_ack: true,
+            ..ReplyOptions::default()
+        },
+    )
+    .unwrap();
     let ext_hdr = parse_hdr(&ext_denied[0]).unwrap();
     assert_ne!(ext_hdr.flags & NLM_F_ACK_TLVS, 0);
+    let echoed_len = parse_hdr(&request).unwrap().len as usize;
     assert_eq!(
-        find_rtattr(&ext_denied[0], 20, NLMSGERR_ATTR_MSG).as_deref(),
+        find_rtattr(
+            &ext_denied[0],
+            4 + nlmsg_align(echoed_len),
+            NLMSGERR_ATTR_MSG
+        )
+        .as_deref(),
+        Some(&b"interface admin capability required\0"[..])
+    );
+    let capped = build_replies_with_options(
+        &request,
+        None,
+        ReplyOptions {
+            ext_ack: true,
+            cap_ack: true,
+        },
+    )
+    .unwrap();
+    let capped_hdr = parse_hdr(&capped[0]).unwrap();
+    assert_ne!(capped_hdr.flags & NLM_F_CAPPED, 0);
+    assert_ne!(capped_hdr.flags & NLM_F_ACK_TLVS, 0);
+    assert_eq!(
+        find_rtattr(&capped[0], 20, NLMSGERR_ATTR_MSG).as_deref(),
         Some(&b"interface admin capability required\0"[..])
     );
 

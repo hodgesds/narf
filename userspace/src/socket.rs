@@ -1486,6 +1486,7 @@ impl SocketFile {
                     admin.as_ref(),
                     narf_net::netlink_route::ReplyOptions {
                         ext_ack: self.netlink_ext_ack.load(Ordering::Acquire),
+                        cap_ack: self.netlink_cap_ack.load(Ordering::Acquire),
                     },
                 ) {
                     Ok(msgs) => msgs,

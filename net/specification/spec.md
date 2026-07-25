@@ -142,6 +142,9 @@ replacement or deletion of missing state returns `ENOENT`.
 When `NETLINK_EXT_ACK` is enabled, failed requests carry
 `NLM_F_ACK_TLVS` and a `NLMSGERR_ATTR_MSG` diagnostic describing the rejected
 authority, object-state, interface, validation, or support condition.
+Without `NETLINK_CAP_ACK`, `nlmsgerr` echoes the complete offending request.
+With CAP_ACK enabled the echo is header-only and marked `NLM_F_CAPPED`; any
+extended-ACK attributes follow the capped request header.
 
 Link dumps include Linux operational-state, carrier, qdisc, queue-length,
 broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero

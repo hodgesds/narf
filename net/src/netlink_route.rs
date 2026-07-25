@@ -79,6 +79,7 @@ pub const RTM_GETNEXTHOP: u16 = 106;
 pub const NLM_F_REQUEST: u16 = 0x01;
 pub const NLM_F_MULTI: u16 = 0x02;
 pub const NLM_F_ACK: u16 = 0x04;
+pub const NLM_F_CAPPED: u16 = 0x100;
 pub const NLM_F_ACK_TLVS: u16 = 0x200;
 pub const NLM_F_REPLACE: u16 = 0x100;
 pub const NLM_F_EXCL: u16 = 0x200;
@@ -408,13 +409,14 @@ fn build_done(seq: u32, pid: u32) -> Vec<u8> {
 /// Build an `NLMSG_ERROR` message carrying `-errno` (negated per netlink
 /// convention) followed by an echo of the offending request header.
 fn build_error(errno: i32, seq: u32, pid: u32, req: &[u8]) -> Vec<u8> {
-    // struct nlmsgerr: error(i32) msg(struct nlmsghdr). Echo back up to a
-    // full header of the request (zero-padded if the request was shorter).
-    let mut body = Vec::with_capacity(4 + NLMSG_HDRLEN);
+    // struct nlmsgerr: error(i32) followed by the offending request. Linux
+    // echoes the full aligned request unless NETLINK_CAP_ACK caps it later.
+    let mut body = Vec::with_capacity(4 + req.len().max(NLMSG_HDRLEN));
     body.extend_from_slice(&(-errno).to_le_bytes());
-    let echo = core::cmp::min(req.len(), NLMSG_HDRLEN);
-    body.extend_from_slice(&req[..echo]);
-    body.extend(core::iter::repeat_n(0u8, NLMSG_HDRLEN - echo));
+    body.extend_from_slice(req);
+    if req.len() < NLMSG_HDRLEN {
+        body.extend(core::iter::repeat_n(0u8, NLMSG_HDRLEN - req.len()));
+    }
     frame_message(NLMSG_ERROR, 0, seq, pid, &body)
 }
 
@@ -940,6 +942,7 @@ pub fn build_replies_authorized(
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ReplyOptions {
     pub ext_ack: bool,
+    pub cap_ack: bool,
 }
 
 pub fn build_replies_with_options(
@@ -1003,12 +1006,28 @@ pub fn build_replies_with_options(
             offset += step;
         }
     }
-    if options.ext_ack {
-        for reply in &mut replies {
+    for reply in &mut replies {
+        if options.cap_ack {
+            cap_acknowledgement(reply);
+        }
+        if options.ext_ack {
             append_extended_ack(reply);
         }
     }
     Ok(replies)
+}
+
+fn cap_acknowledgement(message: &mut Vec<u8>) {
+    let Some(hdr) = parse_hdr(message) else {
+        return;
+    };
+    if hdr.msg_type != NLMSG_ERROR || message.len() < NLMSG_HDRLEN + 4 + NLMSG_HDRLEN {
+        return;
+    }
+    let capped_len = NLMSG_HDRLEN + 4 + NLMSG_HDRLEN;
+    message.truncate(capped_len);
+    message[0..4].copy_from_slice(&(capped_len as u32).to_ne_bytes());
+    message[6..8].copy_from_slice(&(hdr.flags | NLM_F_CAPPED).to_ne_bytes());
 }
 
 fn append_extended_ack(message: &mut Vec<u8>) {
