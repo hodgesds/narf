@@ -203,8 +203,10 @@ same capped echo and diagnostic-TLV rules as rtnetlink.
 `inet_diag_req_v2` dumps for IPv4 TCP and UDP. It filters by the requested
 Linux socket-state mask and emits `inet_diag_msg` records from the same
 snapshots that back `/proc/net/tcp` and `/proc/net/udp`, followed by
-`NLMSG_DONE`. Unsupported address families and transport protocols return
-`EOPNOTSUPP`.
+`NLMSG_DONE`. Aligned requests may be batched, their sequences remain
+independent, and `NLM_F_ACK` adds a zero-error acknowledgement after a
+successful query. Messages without `NLM_F_REQUEST` return `EINVAL`.
+Unsupported address families and transport protocols return `EOPNOTSUPP`.
 
 `NETLINK_NETFILTER` accepts IPv4 conntrack `IPCTNL_MSG_CT_GET` dumps and
 emits Linux nfnetlink `IPCTNL_MSG_CT_NEW` records with original/reply tuples,
