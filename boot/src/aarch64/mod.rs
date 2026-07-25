@@ -135,6 +135,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         }
         // A present `/memory` node is not sufficient if firmware
         // reservations consume every byte.
+        // SAFETY: single-threaded boot initialization owns the static map.
         if memory_len == 0 || unsafe { *core::ptr::addr_of!(MEMORY_MAP_LEN) } == 0 {
             return Err(BootError::NoUsableRam);
         }
