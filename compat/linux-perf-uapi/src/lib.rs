@@ -105,6 +105,7 @@ pub const PERF_ATTR_FLAG_MMAP2: u64 = 1 << 23;
 pub const PERF_ATTR_FLAG_COMM_EXEC: u64 = 1 << 24;
 pub const PERF_ATTR_FLAG_KSYMBOL: u64 = 1 << 29;
 pub const PERF_ATTR_FLAG_BPF_EVENT: u64 = 1 << 30;
+pub const PERF_ATTR_FLAG_BUILD_ID: u64 = 1 << 34;
 
 pub const PERF_ATTR_SIZE_VER0: u32 = 64;
 pub const PERF_ATTR_SIZE_VER1: u32 = 72;

@@ -192,7 +192,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         let _ = call(Syscall::Close.raw(), a0(cpu_clock_fd as u64));
 
         let ignored_attr_flag = PerfEventAttr {
-            flags: 1 << 5, // exclude_kernel is not implemented for hardware PMU events
+            flags: 1 << 2, // pinned scheduling is not implemented
             ..attr
         };
         match call(

@@ -457,7 +457,11 @@ pub enum PmuEvent {
     Instructions,
     BranchInstructions,
     BranchMisses,
+    CacheReferences,
     CacheMisses,
+    L1dAccesses,
+    L1dMisses,
+    LlcReferences,
     LlcMisses,
     /// Pre-encoded event-select value (vendor-specific).
     Raw(u64),
@@ -509,6 +513,10 @@ fn sample_preload(width: u8, period: u64) -> Result<u64, PmuError> {
 /// Must be called at CPL = 0.
 pub unsafe fn alloc_counter(event: PmuEvent) -> Result<PmuCounter, PmuError> {
     let backend = detect().ok_or(PmuError::NoPmu)?;
+    // Validate the vendor-specific mapping before looking for a free slot.
+    // Otherwise an unsupported event can incorrectly report EBUSY merely
+    // because earlier events occupy every counter.
+    let sel = event_to_evtsel(event, backend.vendor)?;
     let cpu = narf_lib::percpu::current_cpu();
     let allocation = &COUNTER_ALLOC_MASK[cpu];
     let idx = loop {
@@ -529,13 +537,6 @@ pub unsafe fn alloc_counter(event: PmuEvent) -> Result<PmuCounter, PmuError> {
         }
     };
 
-    let sel = match event_to_evtsel(event, backend.vendor) {
-        Ok(sel) => sel,
-        Err(error) => {
-            allocation.fetch_and(!(1 << idx), Ordering::AcqRel);
-            return Err(error);
-        }
-    };
     // Program the counter.
     // SAFETY: caller-asserted CPL=0; idx < n_counters verified above.
     unsafe {
@@ -789,7 +790,12 @@ fn event_to_evtsel(event: PmuEvent, vendor: PmuVendor) -> Result<PerfEvtSel, Pmu
         (PmuEvent::BranchMisses, PmuVendor::Intel) => {
             arch_event::branch_mispredict_retired(true, true)
         }
-        (PmuEvent::CacheMisses, PmuVendor::Intel) => arch_event::llc_reference(true, true),
+        (PmuEvent::CacheReferences, PmuVendor::Intel)
+        | (PmuEvent::LlcReferences, PmuVendor::Intel) => arch_event::llc_reference(true, true),
+        (PmuEvent::CacheMisses, PmuVendor::Intel) => arch_event::llc_miss(true, true),
+        (PmuEvent::L1dAccesses, PmuVendor::Intel) | (PmuEvent::L1dMisses, PmuVendor::Intel) => {
+            return Err(PmuError::UnsupportedEvent);
+        }
         (PmuEvent::LlcMisses, PmuVendor::Intel) => arch_event::llc_miss(true, true),
         // AMD F17h/F19h events (amd/core.c amd_f17h_perfmon_event_map).
         (PmuEvent::Cycles, PmuVendor::Amd) => amd_event::cycles(true, true),
@@ -803,8 +809,19 @@ fn event_to_evtsel(event: PmuEvent, vendor: PmuVendor) -> Result<PerfEvtSel, Pmu
             // AMD: Retired Mispredicted Branch Instructions — 0x0C3 umask 0.
             PerfEvtSel::os_usr_raw(0xC3, 0x00, true, true)
         }
-        (PmuEvent::CacheMisses, PmuVendor::Amd) => amd_event::l1d_cache_misses(true, true),
-        (PmuEvent::LlcMisses, PmuVendor::Amd) => return Err(PmuError::UnsupportedEvent),
+        // Linux's Family-17h+ generic event table:
+        // CACHE_REFERENCES=0xff60, CACHE_MISSES=0x0964.
+        (PmuEvent::CacheReferences, PmuVendor::Amd) => {
+            PerfEvtSel::os_usr_raw(0x60, 0xff, true, true)
+        }
+        (PmuEvent::CacheMisses, PmuVendor::Amd) => PerfEvtSel::os_usr_raw(0x64, 0x09, true, true),
+        (PmuEvent::L1dAccesses, PmuVendor::Amd) => amd_event::l1d_cache_accesses(true, true),
+        // Linux amd_hw_cache_event_ids_f17h maps L1D read misses to
+        // event 0x60, umask 0xc8 ("L2 access from DC miss").
+        (PmuEvent::L1dMisses, PmuVendor::Amd) => PerfEvtSel::os_usr_raw(0x60, 0xc8, true, true),
+        (PmuEvent::LlcReferences, PmuVendor::Amd) | (PmuEvent::LlcMisses, PmuVendor::Amd) => {
+            return Err(PmuError::UnsupportedEvent);
+        }
         // Raw event: the caller supplies the pre-encoded value directly.
         (PmuEvent::Raw(v), _) => {
             return Ok(PerfEvtSel {

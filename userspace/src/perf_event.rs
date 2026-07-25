@@ -8,25 +8,27 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize
 use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_linux_perf_uapi::{
-    PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_COMM, PERF_ATTR_FLAG_COMM_EXEC,
-    PERF_ATTR_FLAG_DISABLED, PERF_ATTR_FLAG_ENABLE_ON_EXEC, PERF_ATTR_FLAG_EXCLUDE_GUEST,
-    PERF_ATTR_FLAG_EXCLUDE_KERNEL, PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT,
-    PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP, PERF_ATTR_FLAG_MMAP2, PERF_ATTR_FLAG_MMAP_DATA,
-    PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK,
-    PERF_ATTR_SIZE_VER0, PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES,
-    PERF_COUNT_HW_CACHE_MISSES, PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS,
-    PERF_COUNT_SW_CPU_CLOCK, PERF_COUNT_SW_DUMMY, PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP,
-    PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
-    PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK,
-    PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP,
-    PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER,
-    PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+    PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_BUILD_ID, PERF_ATTR_FLAG_COMM,
+    PERF_ATTR_FLAG_COMM_EXEC, PERF_ATTR_FLAG_DISABLED, PERF_ATTR_FLAG_ENABLE_ON_EXEC,
+    PERF_ATTR_FLAG_EXCLUDE_GUEST, PERF_ATTR_FLAG_EXCLUDE_HV, PERF_ATTR_FLAG_EXCLUDE_KERNEL,
+    PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT, PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP,
+    PERF_ATTR_FLAG_MMAP2, PERF_ATTR_FLAG_MMAP_DATA, PERF_ATTR_FLAG_SAMPLE_ID_ALL,
+    PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK, PERF_ATTR_SIZE_VER0,
+    PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_MISSES,
+    PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_CPU_CLOCK,
+    PERF_COUNT_SW_DUMMY, PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP, PERF_FORMAT_ID,
+    PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING,
+    PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST,
+    PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP, PERF_RECORD_MMAP2,
+    PERF_RECORD_SAMPLE, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
+    PERF_SAMPLE_PERIOD, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
     PERF_TYPE_HARDWARE, PERF_TYPE_RAW, PERF_TYPE_SOFTWARE,
 };
 #[cfg(target_arch = "x86_64")]
 use narf_linux_perf_uapi::{
-    PERF_COUNT_HW_CACHE_LL, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_MISS,
-    PERF_TYPE_HW_CACHE,
+    PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_LL, PERF_COUNT_HW_CACHE_OP_READ,
+    PERF_COUNT_HW_CACHE_REFERENCES, PERF_COUNT_HW_CACHE_RESULT_ACCESS,
+    PERF_COUNT_HW_CACHE_RESULT_MISS, PERF_TYPE_HW_CACHE,
 };
 
 static ACTIVE_PERF_EVENTS: AtomicUsize = AtomicUsize::new(0);
@@ -37,6 +39,11 @@ static PERF_EVENT_REGISTRY: IrqSafeSpinLock<Vec<Weak<PerfEventFile>>> =
 static PMI_VECTOR: IrqSafeSpinLock<Option<u8>> = IrqSafeSpinLock::new(None);
 #[cfg(target_arch = "x86_64")]
 static PMI_ROUTED_CPUS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
+static REMOTE_PMU_VECTOR: IrqSafeSpinLock<Option<u8>> = IrqSafeSpinLock::new(None);
+#[cfg(target_arch = "x86_64")]
+static REMOTE_PMU_MAILBOXES: [RemotePmuMailbox; narf_lib::percpu::MAX_CPUS] =
+    [const { RemotePmuMailbox::new() }; narf_lib::percpu::MAX_CPUS];
 const SAMPLE_CPU_SLOTS: usize = narf_lib::percpu::MAX_CPUS;
 static PENDING_SAMPLES: [PendingSample; SAMPLE_CPU_SLOTS] =
     [const { PendingSample::new() }; SAMPLE_CPU_SLOTS];
@@ -48,6 +55,248 @@ static CPU_USER_SLICE_START_NS: [AtomicU64; SAMPLE_CPU_SLOTS] =
     [const { AtomicU64::new(0) }; SAMPLE_CPU_SLOTS];
 static CPU_USER_DEPTH: [AtomicU32; SAMPLE_CPU_SLOTS] =
     [const { AtomicU32::new(0) }; SAMPLE_CPU_SLOTS];
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+enum RemotePmuCommand {
+    Allocate(narf_arch::x86_64::pmu::PmuEvent),
+    Read(narf_arch::x86_64::pmu::PmuCounter),
+    Arm(narf_arch::x86_64::pmu::PmuCounter, u64),
+    Pause(narf_arch::x86_64::pmu::PmuCounter),
+    Residual(narf_arch::x86_64::pmu::PmuCounter, u64),
+    RoutePmi(u8),
+    Release(narf_arch::x86_64::pmu::PmuCounter),
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+enum RemotePmuReply {
+    Counter(Result<narf_arch::x86_64::pmu::PmuCounter, narf_arch::x86_64::pmu::PmuError>),
+    Value(u64),
+    Result(Result<(), narf_arch::x86_64::pmu::PmuError>),
+    Residual(Result<u64, narf_arch::x86_64::pmu::PmuError>),
+    Released,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct RemotePmuMailbox {
+    state: AtomicU8,
+    command: IrqSafeSpinLock<Option<RemotePmuCommand>>,
+    reply: IrqSafeSpinLock<Option<RemotePmuReply>>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl RemotePmuMailbox {
+    const IDLE: u8 = 0;
+    const RESERVED: u8 = 1;
+    const READY: u8 = 2;
+    const DONE: u8 = 3;
+
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(Self::IDLE),
+            command: IrqSafeSpinLock::new(None),
+            reply: IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn execute_pmu_command(command: RemotePmuCommand) -> RemotePmuReply {
+    match command {
+        RemotePmuCommand::Allocate(event) => {
+            // SAFETY: this function executes at CPL0 on the CPU whose PMU bank
+            // is being allocated.
+            RemotePmuReply::Counter(unsafe { narf_arch::x86_64::pmu::alloc_counter(event) })
+        }
+        RemotePmuCommand::Read(counter) => {
+            // SAFETY: the synchronous mailbox preserves the live allocation
+            // and executes this command on `counter.cpu`.
+            RemotePmuReply::Value(unsafe { narf_arch::x86_64::pmu::read(&counter) })
+        }
+        RemotePmuCommand::Arm(counter, period) => {
+            // SAFETY: command executes on the allocation's owning CPU.
+            RemotePmuReply::Result(unsafe {
+                narf_arch::x86_64::pmu::arm_sampling(&counter, period)
+            })
+        }
+        RemotePmuCommand::Pause(counter) => {
+            // SAFETY: command executes on the allocation's owning CPU.
+            RemotePmuReply::Result(unsafe { narf_arch::x86_64::pmu::pause_sampling(&counter) })
+        }
+        RemotePmuCommand::Residual(counter, period) => {
+            // SAFETY: command executes on the allocation's owning CPU.
+            RemotePmuReply::Residual(unsafe {
+                narf_arch::x86_64::pmu::sampling_residual(&counter, period)
+            })
+        }
+        RemotePmuCommand::RoutePmi(vector) => {
+            // SAFETY: APIC bring-up is complete and this writes only this
+            // CPU's LVT-PC entry.
+            unsafe { narf_arch::x86_64::pmi::program_current_lvt_pc(vector, false) };
+            RemotePmuReply::Result(Ok(()))
+        }
+        RemotePmuCommand::Release(counter) => {
+            // SAFETY: the synchronous mailbox executes on `counter.cpu` and
+            // consumes the still-live allocation exactly once.
+            unsafe { narf_arch::x86_64::pmu::release(counter) };
+            RemotePmuReply::Released
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn remote_pmu_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
+    let cpu = narf_lib::percpu::current_cpu();
+    let Some(mailbox) = REMOTE_PMU_MAILBOXES.get(cpu) else {
+        return narf_interrupts::IrqStatus::None;
+    };
+    if mailbox
+        .state
+        .compare_exchange(
+            RemotePmuMailbox::READY,
+            RemotePmuMailbox::RESERVED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return narf_interrupts::IrqStatus::None;
+    }
+    let command = mailbox
+        .command
+        .lock()
+        .take()
+        .expect("remote PMU mailbox READY without a command");
+    *mailbox.reply.lock() = Some(execute_pmu_command(command));
+    mailbox
+        .state
+        .store(RemotePmuMailbox::DONE, Ordering::Release);
+    narf_interrupts::IrqStatus::Handled
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ensure_remote_pmu_vector() -> Result<u8, narf_arch::x86_64::pmu::PmuError> {
+    if !narf_interrupts::x86_64::apic::x2apic_active() {
+        return Err(narf_arch::x86_64::pmu::PmuError::NoPmu);
+    }
+    let mut slot = REMOTE_PMU_VECTOR.lock();
+    if let Some(vector) = *slot {
+        return Ok(vector);
+    }
+    let vector = narf_interrupts::vector::alloc()
+        .map_err(|_| narf_arch::x86_64::pmu::PmuError::NoFreeCounter)?;
+    narf_interrupts::install_handler_named(vector, "perf-remote-pmu", 0, remote_pmu_handler);
+    *slot = Some(vector);
+    Ok(vector)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn remote_pmu_call(
+    cpu: usize,
+    command: RemotePmuCommand,
+) -> Result<RemotePmuReply, narf_arch::x86_64::pmu::PmuError> {
+    if cpu == narf_lib::percpu::current_cpu() {
+        return Ok(execute_pmu_command(command));
+    }
+    if cpu >= narf_lib::percpu::MAX_CPUS || !narf_lib::smp::is_online(cpu as u32) {
+        return Err(narf_arch::x86_64::pmu::PmuError::NoPmu);
+    }
+    let vector = ensure_remote_pmu_vector()?;
+    let mailbox = &REMOTE_PMU_MAILBOXES[cpu];
+    while mailbox
+        .state
+        .compare_exchange_weak(
+            RemotePmuMailbox::IDLE,
+            RemotePmuMailbox::RESERVED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    *mailbox.command.lock() = Some(command);
+    *mailbox.reply.lock() = None;
+    mailbox
+        .state
+        .store(RemotePmuMailbox::READY, Ordering::Release);
+    narf_interrupts::x86_64::apic::send_fixed_ipi(1u64 << cpu, vector);
+    while mailbox.state.load(Ordering::Acquire) != RemotePmuMailbox::DONE {
+        core::hint::spin_loop();
+    }
+    let reply = mailbox
+        .reply
+        .lock()
+        .take()
+        .expect("remote PMU mailbox DONE without a reply");
+    mailbox
+        .state
+        .store(RemotePmuMailbox::IDLE, Ordering::Release);
+    Ok(reply)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn allocate_pmu_on(
+    cpu: usize,
+    event: narf_arch::x86_64::pmu::PmuEvent,
+) -> Result<narf_arch::x86_64::pmu::PmuCounter, narf_arch::x86_64::pmu::PmuError> {
+    match remote_pmu_call(cpu, RemotePmuCommand::Allocate(event))? {
+        RemotePmuReply::Counter(result) => result,
+        _ => unreachable!("allocate PMU command returned the wrong reply"),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_pmu_on(counter: narf_arch::x86_64::pmu::PmuCounter) -> u64 {
+    match remote_pmu_call(counter.cpu as usize, RemotePmuCommand::Read(counter)) {
+        Ok(RemotePmuReply::Value(value)) => value,
+        _ => unreachable!("live remote PMU allocation became unreachable"),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn arm_pmu_on(
+    counter: narf_arch::x86_64::pmu::PmuCounter,
+    period: u64,
+) -> Result<(), narf_arch::x86_64::pmu::PmuError> {
+    match remote_pmu_call(counter.cpu as usize, RemotePmuCommand::Arm(counter, period))? {
+        RemotePmuReply::Result(result) => result,
+        _ => unreachable!("arm PMU command returned the wrong reply"),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pause_pmu_on(
+    counter: narf_arch::x86_64::pmu::PmuCounter,
+) -> Result<(), narf_arch::x86_64::pmu::PmuError> {
+    match remote_pmu_call(counter.cpu as usize, RemotePmuCommand::Pause(counter))? {
+        RemotePmuReply::Result(result) => result,
+        _ => unreachable!("pause PMU command returned the wrong reply"),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn sampling_residual_on(
+    counter: narf_arch::x86_64::pmu::PmuCounter,
+    period: u64,
+) -> Result<u64, narf_arch::x86_64::pmu::PmuError> {
+    match remote_pmu_call(
+        counter.cpu as usize,
+        RemotePmuCommand::Residual(counter, period),
+    )? {
+        RemotePmuReply::Residual(result) => result,
+        _ => unreachable!("residual PMU command returned the wrong reply"),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn release_pmu_on(counter: narf_arch::x86_64::pmu::PmuCounter) {
+    match remote_pmu_call(counter.cpu as usize, RemotePmuCommand::Release(counter)) {
+        Ok(RemotePmuReply::Released) => {}
+        _ => unreachable!("live remote PMU allocation became unreachable"),
+    }
+}
 
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
@@ -214,8 +463,12 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
     // runtime kernel-symbol loader. These selectors therefore describe empty
     // event domains, rather than requests whose records are being suppressed.
     | PERF_ATTR_FLAG_EXCLUDE_GUEST
+    | PERF_ATTR_FLAG_EXCLUDE_HV
     | PERF_ATTR_FLAG_KSYMBOL
-    | PERF_ATTR_FLAG_BPF_EVENT;
+    | PERF_ATTR_FLAG_BPF_EVENT
+    // Linux permits an MMAP2_BUILD_ID request to fall back to the inode
+    // layout when no build ID is available for a mapping.
+    | PERF_ATTR_FLAG_BUILD_ID;
 
 const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
 const PERF_EVENT_IOC_DISABLE: u32 = 0x2401;
@@ -441,7 +694,11 @@ impl PerfEventFile {
                     } else {
                         narf_lib::percpu::current_cpu()
                     };
-                    cpu_user_time_ns(cpu)
+                    if self.attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0 {
+                        cpu_user_time_ns(cpu)
+                    } else {
+                        narf_time::monotonic_ns().saturating_sub(narf_scheduler::cpu_idle_ns(cpu))
+                    }
                 }
                 PERF_COUNT_SW_TASK_CLOCK => {
                     let user = crate::handlers::cpu_time_ns_of(self.target_task);
@@ -456,9 +713,12 @@ impl PerfEventFile {
         }
         #[cfg(target_arch = "x86_64")]
         if let Some(counter) = self.pmu_counter {
-            // SAFETY: the counter belongs to this open file and remains allocated
-            // until Drop, which cannot run while this method borrows `self`.
-            return unsafe { narf_arch::x86_64::pmu::read(&counter) };
+            let period = self.sample_period.load(Ordering::Acquire);
+            if period != 0 {
+                return sampling_residual_on(counter, period)
+                    .expect("live sampled PMU counter rejected its configured period");
+            }
+            return read_pmu_on(counter);
         }
         #[cfg(target_arch = "x86_64")]
         {
@@ -607,10 +867,8 @@ impl PerfEventFile {
                 self.last_sample_ns.store(0, Ordering::Release);
                 let sample_period = self.sample_period.load(Ordering::Acquire);
                 if sample_period != 0 {
-                    if let Some(counter) = &self.pmu_counter {
-                        // SAFETY: this file owns the live counter.
-                        let _ =
-                            unsafe { narf_arch::x86_64::pmu::arm_sampling(counter, sample_period) };
+                    if let Some(counter) = self.pmu_counter {
+                        let _ = arm_pmu_on(counter, sample_period);
                     }
                 }
             }
@@ -650,9 +908,8 @@ impl PerfEventFile {
             }
             #[cfg(target_arch = "x86_64")]
             if self.sample_period.load(Ordering::Acquire) != 0 {
-                if let Some(counter) = &self.pmu_counter {
-                    // SAFETY: this file owns the live counter.
-                    let _ = unsafe { narf_arch::x86_64::pmu::pause_sampling(counter) };
+                if let Some(counter) = self.pmu_counter {
+                    let _ = pause_pmu_on(counter);
                 }
             }
             #[cfg(target_arch = "aarch64")]
@@ -685,14 +942,9 @@ impl PerfEventFile {
             return Err(FsError::Unsupported);
         }
 
-        if let Some(counter) = self.pmu_counter.as_ref() {
-            // SAFETY: admitted per-CPU events own a current-CPU counter and
-            // this event is disabled, so validating the preload is synchronous.
-            unsafe { narf_arch::x86_64::pmu::arm_sampling(counter, period) }
-                .map_err(|_| FsError::InvalidData)?;
-            // SAFETY: same owned current-CPU counter; leave it disabled.
-            unsafe { narf_arch::x86_64::pmu::pause_sampling(counter) }
-                .map_err(|_| FsError::InvalidData)?;
+        if let Some(counter) = self.pmu_counter {
+            arm_pmu_on(counter, period).map_err(|_| FsError::InvalidData)?;
+            pause_pmu_on(counter).map_err(|_| FsError::InvalidData)?;
         } else {
             // Task events allocate counters at switch-in. Allocate a temporary
             // current-CPU slot to validate the backend's real width/preload.
@@ -1438,6 +1690,11 @@ fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
 
 #[cfg(target_arch = "x86_64")]
 fn ensure_pmi_route() -> Result<(), ()> {
+    ensure_pmi_route_on(narf_lib::percpu::current_cpu())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ensure_pmi_route_on(cpu: usize) -> Result<(), ()> {
     let mut slot = PMI_VECTOR.lock();
     let vector = if let Some(vector) = *slot {
         vector
@@ -1448,15 +1705,14 @@ fn ensure_pmi_route() -> Result<(), ()> {
         vector
     };
     drop(slot);
-    let cpu = narf_lib::percpu::current_cpu();
     let cpu_bit = 1u64.checked_shl(cpu as u32).ok_or(())?;
     if PMI_ROUTED_CPUS.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit != 0 {
         return Ok(());
     }
-    // SAFETY: APIC bring-up precedes userspace and this programs only the
-    // current CPU's LVT-PC entry.
-    unsafe { narf_arch::x86_64::pmi::program_current_lvt_pc(vector, false) };
-    Ok(())
+    match remote_pmu_call(cpu, RemotePmuCommand::RoutePmi(vector)).map_err(|_| ())? {
+        RemotePmuReply::Result(result) => result.map_err(|_| ()),
+        _ => unreachable!("route-PMI command returned the wrong reply"),
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1677,10 +1933,7 @@ impl Drop for PerfEventFile {
         }
         #[cfg(target_arch = "x86_64")]
         if let Some(counter) = self.pmu_counter {
-            // SAFETY: releasing the counter we allocated.
-            unsafe {
-                narf_arch::x86_64::pmu::release(counter);
-            }
+            release_pmu_on(counter);
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -2091,16 +2344,17 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
-    if attr.type_ != PERF_TYPE_SOFTWARE
-        && pid == -1
-        && (cpu != narf_lib::percpu::current_cpu() as i32 || narf_lib::smp::online_count() != 1)
+    // CPU_CLOCK is backed by exact per-CPU scheduler accounting: user time
+    // when exclude_kernel is set, otherwise elapsed non-idle time. It is not
+    // task accounting; admitting a pid target would return the whole CPU's
+    // time and fabricate attribution. Task consumers must use TASK_CLOCK.
+    if attr.type_ == PERF_TYPE_SOFTWARE
+        && attr.config == PERF_COUNT_SW_CPU_CLOCK
+        && (pid != -1 || cpu < 0)
     {
-        // A per-CPU event requires remote-CPU PMU calls on SMP. Task events are
-        // virtualized by the scheduler switch hook below.
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
-
     let group_leader = if group_fd != -1 {
         let leader =
             fd::with_table(task, |t| t.get(group_fd as u32).map(|e| Arc::clone(&e.ops))).flatten();
@@ -2132,7 +2386,10 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             PERF_TYPE_HARDWARE => match attr.config {
                 PERF_COUNT_HW_CPU_CYCLES => Some(narf_arch::x86_64::pmu::PmuEvent::Cycles),
                 PERF_COUNT_HW_INSTRUCTIONS => Some(narf_arch::x86_64::pmu::PmuEvent::Instructions),
-                PERF_COUNT_HW_CACHE_MISSES => Some(narf_arch::x86_64::pmu::PmuEvent::LlcMisses),
+                PERF_COUNT_HW_CACHE_REFERENCES => {
+                    Some(narf_arch::x86_64::pmu::PmuEvent::CacheReferences)
+                }
+                PERF_COUNT_HW_CACHE_MISSES => Some(narf_arch::x86_64::pmu::PmuEvent::CacheMisses),
                 PERF_COUNT_HW_BRANCH_INSTRUCTIONS => {
                     Some(narf_arch::x86_64::pmu::PmuEvent::BranchInstructions)
                 }
@@ -2145,6 +2402,21 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 let op_id = (attr.config >> 8) & 0xFF;
                 let result_id = (attr.config >> 16) & 0xFF;
                 match (cache_id, op_id, result_id) {
+                    (
+                        PERF_COUNT_HW_CACHE_L1D,
+                        PERF_COUNT_HW_CACHE_OP_READ,
+                        PERF_COUNT_HW_CACHE_RESULT_ACCESS,
+                    ) => Some(narf_arch::x86_64::pmu::PmuEvent::L1dAccesses),
+                    (
+                        PERF_COUNT_HW_CACHE_L1D,
+                        PERF_COUNT_HW_CACHE_OP_READ,
+                        PERF_COUNT_HW_CACHE_RESULT_MISS,
+                    ) => Some(narf_arch::x86_64::pmu::PmuEvent::L1dMisses),
+                    (
+                        PERF_COUNT_HW_CACHE_LL,
+                        PERF_COUNT_HW_CACHE_OP_READ,
+                        PERF_COUNT_HW_CACHE_RESULT_ACCESS,
+                    ) => Some(narf_arch::x86_64::pmu::PmuEvent::LlcReferences),
                     (
                         PERF_COUNT_HW_CACHE_LL,
                         PERF_COUNT_HW_CACHE_OP_READ,
@@ -2180,8 +2452,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 unsafe { narf_arch::x86_64::pmu::release(probe) };
                 (Some(event), None)
             } else {
-                // SAFETY: alloc_counter programs PMU hardware registers, which requires CPL=0.
-                match unsafe { narf_arch::x86_64::pmu::alloc_counter(event) } {
+                match allocate_pmu_on(cpu as usize, event) {
                     Ok(counter) => (Some(event), Some(counter)),
                     Err(narf_arch::x86_64::pmu::PmuError::NoFreeCounter) => {
                         ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
@@ -2242,61 +2513,60 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
 
     #[cfg(target_arch = "x86_64")]
     let sample_period = if attr.sample_period_or_freq != 0 {
-        if pmu_event.is_none() {
+        if let Some(pmu_event) = pmu_event {
+            let period = if attr.flags & PERF_ATTR_FLAG_FREQ != 0 {
+                narf_arch::x86_64::tsc::frequency_hz()
+                    .max(1_000_000_000)
+                    .checked_div(attr.sample_period_or_freq)
+                    .unwrap_or(1)
+                    .max(1)
+            } else {
+                attr.sample_period_or_freq
+            };
+            let route_cpu = pmu_counter
+                .map(|counter| counter.cpu as usize)
+                .unwrap_or_else(narf_lib::percpu::current_cpu);
+            if ensure_pmi_route_on(route_cpu).is_err() {
+                if let Some(counter) = pmu_counter {
+                    release_pmu_on(counter);
+                }
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                return;
+            }
+            let validation_counter;
+            let counter = if let Some(counter) = pmu_counter.as_ref() {
+                counter
+            } else {
+                // Task-scoped counters are allocated on switch-in, but validate
+                // overflow support and the requested period synchronously.
+                // SAFETY: syscall context at CPL0.
+                validation_counter =
+                    match unsafe { narf_arch::x86_64::pmu::alloc_counter(pmu_event) } {
+                        Ok(counter) => counter,
+                        Err(_) => {
+                            ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                            return;
+                        }
+                    };
+                &validation_counter
+            };
+            let armed = arm_pmu_on(*counter, period);
+            if armed.is_err() {
+                release_pmu_on(*counter);
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                return;
+            }
+            let _ = pause_pmu_on(*counter);
+            if pmu_counter.is_none() {
+                release_pmu_on(*counter);
+            }
+            period
+        } else if attr.type_ == PERF_TYPE_SOFTWARE && attr.config == PERF_COUNT_SW_DUMMY {
+            attr.sample_period_or_freq
+        } else {
             ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
             return;
         }
-        let period = if attr.flags & PERF_ATTR_FLAG_FREQ != 0 {
-            narf_arch::x86_64::tsc::frequency_hz()
-                .max(1_000_000_000)
-                .checked_div(attr.sample_period_or_freq)
-                .unwrap_or(1)
-                .max(1)
-        } else {
-            attr.sample_period_or_freq
-        };
-        if ensure_pmi_route().is_err() {
-            if let Some(counter) = pmu_counter {
-                // SAFETY: open still exclusively owns this allocation.
-                unsafe { narf_arch::x86_64::pmu::release(counter) };
-            }
-            ctx.set_return(SyscallReturn::ok((-95i64) as u64));
-            return;
-        }
-        let validation_counter;
-        let counter = if let Some(counter) = pmu_counter.as_ref() {
-            counter
-        } else {
-            // Task-scoped counters are allocated on switch-in, but validate
-            // overflow support and the requested period synchronously.
-            // SAFETY: syscall context at CPL0.
-            validation_counter =
-                match unsafe { narf_arch::x86_64::pmu::alloc_counter(pmu_event.unwrap()) } {
-                    Ok(counter) => counter,
-                    Err(_) => {
-                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
-                        return;
-                    }
-                };
-            &validation_counter
-        };
-        // Validate the period and counter backend now. Keep the event paused
-        // until ENABLE/enable_on_exec establishes the requested time window.
-        // SAFETY: this open path owns the freshly allocated live counter.
-        let armed = unsafe { narf_arch::x86_64::pmu::arm_sampling(counter, period) };
-        if armed.is_err() {
-            // SAFETY: open still exclusively owns this allocation.
-            unsafe { narf_arch::x86_64::pmu::release(*counter) };
-            ctx.set_return(SyscallReturn::ok((-95i64) as u64));
-            return;
-        }
-        // SAFETY: same live counter; restore non-interrupt counting state.
-        let _ = unsafe { narf_arch::x86_64::pmu::pause_sampling(counter) };
-        if pmu_counter.is_none() {
-            // SAFETY: task-scoped validation allocation on this CPU.
-            unsafe { narf_arch::x86_64::pmu::release(*counter) };
-        }
-        period
     } else {
         0
     };
@@ -2450,10 +2720,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         // ownership of the allocated counter.
         #[cfg(target_arch = "x86_64")]
         if let Some(counter) = pmu_counter {
-            // SAFETY: this is the counter allocated above and no file owns it.
-            unsafe {
-                narf_arch::x86_64::pmu::release(counter);
-            }
+            release_pmu_on(counter);
         }
         ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // EMFILE
     }
@@ -2486,6 +2753,7 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
                     attr.config,
                     PERF_COUNT_HW_CPU_CYCLES
                         | PERF_COUNT_HW_INSTRUCTIONS
+                        | PERF_COUNT_HW_CACHE_REFERENCES
                         | PERF_COUNT_HW_CACHE_MISSES
                         | PERF_COUNT_HW_BRANCH_INSTRUCTIONS
                         | PERF_COUNT_HW_BRANCH_MISSES
@@ -2496,12 +2764,10 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
             attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0 && aarch_pmu_event(attr).is_some()
         }
         // PERF_TYPE_SOFTWARE
-        PERF_TYPE_SOFTWARE => match attr.config {
-            PERF_COUNT_SW_DUMMY => attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0,
-            PERF_COUNT_SW_CPU_CLOCK => attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0,
-            PERF_COUNT_SW_TASK_CLOCK => true,
-            _ => false,
-        },
+        PERF_TYPE_SOFTWARE => matches!(
+            attr.config,
+            PERF_COUNT_SW_DUMMY | PERF_COUNT_SW_CPU_CLOCK | PERF_COUNT_SW_TASK_CLOCK
+        ),
         // PERF_TYPE_HW_CACHE (3)
         #[cfg(target_arch = "x86_64")]
         PERF_TYPE_HW_CACHE => {
@@ -2509,12 +2775,18 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
             let op_id = (attr.config >> 8) & 0xFF;
             let result_id = (attr.config >> 16) & 0xFF;
             attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0
-                && (cache_id, op_id, result_id)
-                    == (
+                && matches!(
+                    (cache_id, op_id, result_id),
+                    (
+                        PERF_COUNT_HW_CACHE_L1D,
+                        PERF_COUNT_HW_CACHE_OP_READ,
+                        PERF_COUNT_HW_CACHE_RESULT_ACCESS | PERF_COUNT_HW_CACHE_RESULT_MISS,
+                    ) | (
                         PERF_COUNT_HW_CACHE_LL,
                         PERF_COUNT_HW_CACHE_OP_READ,
-                        PERF_COUNT_HW_CACHE_RESULT_MISS,
+                        PERF_COUNT_HW_CACHE_RESULT_ACCESS | PERF_COUNT_HW_CACHE_RESULT_MISS,
                     )
+                )
         }
         // PERF_TYPE_RAW (4)
         #[cfg(target_arch = "x86_64")]

@@ -1349,6 +1349,7 @@ pub struct FrameStats {
 // narf-acpi; tests and other binaries that don't care about NUMA
 // can provide stubs returning 0.
 
+#[cfg(target_os = "none")]
 extern "Rust" {
     /// Look up the NUMA node a physical address belongs to. Returns
     /// `0` when topology is unknown or the address is outside any
@@ -1363,6 +1364,30 @@ extern "Rust" {
     /// (cross-node). Used to order the allocator's cross-node
     /// fallback nearest-first.
     fn narf_node_distance(from: u32, to: u32) -> u32;
+}
+
+// Host-side crate tests do not link the kernel binary that owns the ACPI
+// bridge above. Give them the documented no-topology behavior so every crate
+// that transitively links narf-memory gets the same deterministic fallback.
+// These definitions are excluded from kernel targets, where silently
+// replacing firmware topology would be incorrect.
+#[cfg(not(target_os = "none"))]
+unsafe fn narf_phys_to_node(_addr: u64) -> u32 {
+    0
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn narf_cpu_to_node(_cpu: u32) -> u32 {
+    0
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn narf_node_distance(from: u32, to: u32) -> u32 {
+    if from == to {
+        10
+    } else {
+        20
+    }
 }
 
 /// Resolve a physical address to an allocator NUMA-node index.

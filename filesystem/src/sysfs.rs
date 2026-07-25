@@ -172,6 +172,16 @@ fn cpu_node(cpu: u32) -> Option<u32> {
     }
 }
 
+/// Effective CPU membership for Linux's node sysfs ABI.
+///
+/// Firmware-less single-node machines still have every online CPU in node 0
+/// on Linux. Preserve `None` on multi-node systems, where guessing would
+/// fabricate proximity.
+#[inline]
+fn sysfs_cpu_node(cpu: u32) -> Option<u32> {
+    cpu_node(cpu).or_else(|| (numa_node_count() == 1).then_some(0))
+}
+
 /// Read the linker-generated GNU build-ID note exactly as Linux exposes it
 /// through `/sys/kernel/notes`.
 fn kernel_notes_read(offset: usize, buf: &mut [u8]) -> usize {
@@ -1042,7 +1052,7 @@ pub fn populate_kernel_dir() {
 fn node_cpumap_string(node: u32) -> String {
     let mut mask: u128 = 0;
     for cpu in 0..128u32 {
-        if cpu_node(cpu) == Some(node) {
+        if sysfs_cpu_node(cpu) == Some(node) {
             mask |= 1u128 << cpu;
         }
     }
@@ -1060,7 +1070,7 @@ fn node_cpumap_string(node: u32) -> String {
 fn node_cpulist_string(node: u32) -> String {
     let mut cpus: Vec<u32> = Vec::new();
     for cpu in 0..256u32 {
-        if cpu_node(cpu) == Some(node) {
+        if sysfs_cpu_node(cpu) == Some(node) {
             cpus.push(cpu);
         }
     }
@@ -1220,6 +1230,17 @@ fn populate_numa_node(node_dir: &Arc<Kobject>, node: u32) -> Arc<Kobject> {
 
     kobject_add_attr(&kobj, "cpulist", move || node_cpulist_string(node));
     kobject_add_attr(&kobj, "cpumap", move || node_cpumap_string(node));
+
+    // Linux exposes reciprocal CPU/node membership links.  perf does not
+    // derive its live cpu->node map from `cpulist`: cpu__setup_cpunode_map()
+    // walks nodeN and accepts only DT_LNK entries named cpuM.
+    let cpu_count = smp::cpu_count().max(1);
+    for cpu in 0..cpu_count {
+        if sysfs_cpu_node(cpu) == Some(node) {
+            let cpu_name = format!("cpu{}", cpu);
+            kobj.add_symlink(cpu_name.clone(), format!("../../cpu/{cpu_name}"));
+        }
+    }
     kobj
 }
 
@@ -1443,6 +1464,14 @@ pub fn populate_cpu_devices() {
     for cpu in 0..n {
         let cpu_name = format!("cpu{}", cpu);
         let cpu_kobj = get_or_create_child(&cpu_dir, &cpu_name);
+
+        if let Some(node) = sysfs_cpu_node(cpu) {
+            // Match Linux's cpuN/nodeM backlink.  The node-side cpuN link is
+            // installed by populate_numa_node() and is the one consumed by
+            // perf stat --per-node.
+            let node_name = format!("node{}", node);
+            cpu_kobj.add_symlink(node_name.clone(), format!("../../node/{node_name}"));
+        }
 
         // `online` — read-only "1".  Linux omits it for cpu0 (the boot CPU
         // is always online and has no hotplug sysfs interface).
@@ -2223,6 +2252,17 @@ fn smoke_sysfs_numa_node_live_files() -> TestResult {
     };
     if !vmstat.contains("nr_free_pages ") {
         return TestResult::Fail("node0 vmstat nr_free_pages missing");
+    }
+    let Some(cpu_member) = node0
+        .symlink_names()
+        .into_iter()
+        .find(|name| name.starts_with("cpu"))
+    else {
+        return TestResult::Fail("node0 has no perf-compatible cpuN membership");
+    };
+    let expected_cpu = format!("../../cpu/{}", cpu_member);
+    if node0.get_symlink(&cpu_member).as_deref() != Some(expected_cpu.as_str()) {
+        return TestResult::Fail("node0 cpuN membership target is not Linux-compatible");
     }
     let Some(member) = node0
         .symlink_names()

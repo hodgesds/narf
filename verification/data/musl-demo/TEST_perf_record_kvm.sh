@@ -20,7 +20,7 @@ run_record() {
     XTASK_RI_PROMPT_TIMEOUT_SECS=180 \
     XTASK_RI_ECHO_TIMEOUT_SECS=300 \
     cargo xtask run-interactive \
-        --cmd "busybox chroot /mnt sh -c 'rm -f perf.data; perf record ${mode} -e cycles -- busybox dd if=/dev/zero of=/dev/null bs=1M count=128; echo ${record_marker}'" \
+        --cmd "busybox chroot /mnt sh -c 'rm -f perf.data; perf record ${mode} -e cycles -- sleep 1 && test -s perf.data && echo ${record_marker}'" \
         --expect "$record_marker"
 
     XTASK_QEMU_NO_BALLOON=1 \
@@ -36,3 +36,4 @@ run_record() {
 
 run_record "-c 100000" "PROK"
 run_record "-F 1000" "FROK"
+run_record "-a -c 1000000" "SYSROK"

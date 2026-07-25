@@ -90,3 +90,7 @@ argument = "The aarch64 boot edit passes only a firmware-validated private inter
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The aarch64 IRQ edit publishes only the interrupted ELR scalar through the existing per-CPU interrupt context slot after the trap prologue has entered the Frame domain. It neither dereferences task memory nor changes domain rights, capabilities, or scheduling state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The NUMA topology fallback is compiled only for hosted crate tests, where the narf-frame ACPI bridge is absent. Kernel targets still require the authoritative frame-provided hooks, so production frame placement, ownership, cpuset constraints, and domain assignment are unchanged."

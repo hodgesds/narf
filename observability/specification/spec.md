@@ -70,7 +70,10 @@ Linux `perf_event_open(2)` fds. The adapter must preserve Linux
 `perf_event_attr`, read-format, ioctl, mmap-ring, and error semantics for every
 feature it advertises. Events without a real backend are rejected rather than
 estimated. `observability/PERF_LINUX_COMPAT_AUDIT.md` is the compatibility
-matrix; Linux ABI mechanics remain owned by `userspace/`.
+matrix; Linux ABI mechanics remain owned by `userspace/`. A system-wide
+hardware event is configured, read, updated, and released on its owning CPU;
+an architecture without a synchronous remote-PMU rendezvous rejects remote
+CPU operation instead of accessing CPU-local PMU registers indirectly.
 
 ### 3.2 Debugger integration
 

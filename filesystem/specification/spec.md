@@ -113,7 +113,12 @@ huge-page region's effective policy, resident base-page equivalents grouped
 by SRAT node, and actual translation-leaf size.
 `/sys/devices/system/node/nodeN/{meminfo,numastat,vmstat}` exposes stable
 managed totals, live free/used pages, and the corresponding node-local
-event counters.
+event counters. Each node directory exposes Linux-compatible `cpuM` symlinks,
+with reciprocal `cpuM/nodeN` links under `/sys/devices/system/cpu`; consumers
+such as `perf stat --per-node` use the symlink type and name to construct the
+CPU-to-node aggregation map. If firmware supplies no CPU-affinity table and
+exactly one node exists, all online CPUs belong to node 0; multi-node systems
+never infer missing proximity.
 `/sys/kernel/mm/mempolicy/weighted_interleave/nodeN` exposes writable
 decimal weights in Linux's inclusive range 1..=255. Changes affect new
 `MPOL_WEIGHTED_INTERLEAVE` allocations and never migrate existing pages.
