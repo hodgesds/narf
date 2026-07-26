@@ -52,10 +52,10 @@ Implemented:
   and `E2BIG` for a non-zero unknown tail.
 - Hardware, software, hardware-cache, and raw event parsing on x86_64;
   PMCEID-gated hardware and architectural raw-event parsing on aarch64.
-- Exact scheduler-accounted task clocks and per-CPU user clocks selected with
-  `exclude_kernel`; all-context per-CPU software clocks remain unsupported.
-- Hardware privilege filters fail closed with `EOPNOTSUPP`; the current PMU
-  selectors count both user and kernel execution.
+- Exact scheduler-accounted task and per-CPU clocks support all-context,
+  user-only, and kernel-only selection.
+- Hardware privilege filters program x86 event-select USR/OS bits and
+  aarch64 PMCCFILTR/PMEVTYPER P/U exclusion bits.
 - PID, CPU, group-fd existence, open flags, CLOEXEC, and reserved-field
   validation.
 - Stable fd lifetime and PMU counter release.

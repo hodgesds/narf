@@ -238,7 +238,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             flags: 1 << 5, // exclude_kernel
             ..attr
         };
-        match call(
+        let filtered_result = call(
             Syscall::PerfEventOpen.raw(),
             a3(
                 &hardware_privilege_filter as *const _ as u64,
@@ -246,9 +246,17 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 -1i32 as u64,
                 -1i32 as u64,
             ),
-        ) {
-            Some(EOPNOTSUPP) => {}
-            _ => return Err("hardware exclude_kernel reported false success"),
+        );
+        match filtered_result {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            #[cfg(target_arch = "x86_64")]
+            Some(EOPNOTSUPP) => {
+                // TCG's x86 `-cpu max` currently advertises no architectural
+                // PMU; backend filter encoding is covered in arch/pmu.
+            }
+            _ => return Err("hardware exclude_kernel filter was not programmed"),
         }
 
         let zero_frequency = PerfEventAttr {

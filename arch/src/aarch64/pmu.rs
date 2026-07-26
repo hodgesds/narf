@@ -55,6 +55,10 @@ pub const fn minimum_sample_period() -> u64 {
     MIN_SAMPLE_PERIOD
 }
 
+const fn privilege_filter_bits(kernel: bool, user: bool) -> u64 {
+    ((!kernel as u64) << 31) | ((!user as u64) << 30)
+}
+
 /// Number of architectural programmable event counters implemented.
 pub fn programmable_counter_count() -> u8 {
     if !available() {
@@ -79,6 +83,22 @@ pub fn event_supported(event: u16) -> bool {
 /// # Safety
 /// EL1, pinned to the current CPU until release.
 pub unsafe fn alloc_programmable(event: u16) -> Result<ProgrammableCounter, PmuError> {
+    // SAFETY: forwarded caller contract.
+    unsafe { alloc_programmable_filtered(event, true, true) }
+}
+
+/// Allocate a programmable counter with explicit EL1/EL0 filtering.
+///
+/// # Safety
+/// EL1, pinned to the current CPU until release.
+pub unsafe fn alloc_programmable_filtered(
+    event: u16,
+    kernel: bool,
+    user: bool,
+) -> Result<ProgrammableCounter, PmuError> {
+    if !kernel && !user {
+        return Err(PmuError::UnsupportedEvent);
+    }
     if !event_supported(event) {
         return Err(PmuError::UnsupportedEvent);
     }
@@ -118,7 +138,9 @@ pub unsafe fn alloc_programmable(event: u16) -> Result<ProgrammableCounter, PmuE
         sysreg::write_pmcntenclr_el0(1u64 << idx);
         sysreg::write_pmintenclr_el1(1u64 << idx);
         sysreg::write_pmovsclr_el0(1u64 << idx);
-        sysreg::write_pmxevtyper_el0(event as u64);
+        // PMEVTYPER.P/U exclude EL1/EL0 respectively when set.
+        let filters = privilege_filter_bits(kernel, user);
+        sysreg::write_pmxevtyper_el0(event as u64 | filters);
         sysreg::write_pmxevcntr_el0(0);
     }
     Ok(ProgrammableCounter {
@@ -282,6 +304,21 @@ pub unsafe fn release_programmable(counter: ProgrammableCounter) -> Result<(), P
 /// # Safety
 /// EL1, pinned to the current CPU until release.
 pub unsafe fn alloc_cycle_counter() -> Result<CycleCounter, PmuError> {
+    // SAFETY: forwarded caller contract.
+    unsafe { alloc_cycle_counter_filtered(true, true) }
+}
+
+/// Allocate the cycle counter with explicit EL1/EL0 filtering.
+///
+/// # Safety
+/// EL1, pinned to the current CPU until release.
+pub unsafe fn alloc_cycle_counter_filtered(
+    kernel: bool,
+    user: bool,
+) -> Result<CycleCounter, PmuError> {
+    if !kernel && !user {
+        return Err(PmuError::UnsupportedEvent);
+    }
     if !available() {
         return Err(PmuError::NoPmu);
     }
@@ -298,9 +335,10 @@ pub unsafe fn alloc_cycle_counter() -> Result<CycleCounter, PmuError> {
         let mut pmcr = sysreg::read_pmcr_el0();
         pmcr = (pmcr | (1 << 6) | 1) & !(1 << 3); // LC + E; clear /64 divider.
         sysreg::write_pmcr_el0(pmcr);
-        // Count at both EL0 and EL1. Firmware is permitted to leave filter
-        // exclusions behind; perf owns the counter while allocated.
-        sysreg::write_pmccfiltr_el0(0);
+        // PMCCFILTR.P/U exclude EL1/EL0 respectively when set. Firmware is
+        // permitted to leave filters behind, so perf always programs both.
+        let filters = privilege_filter_bits(kernel, user);
+        sysreg::write_pmccfiltr_el0(filters);
         sysreg::write_pmcntenclr_el0(CYCLE_BIT);
         sysreg::write_pmintenclr_el1(CYCLE_BIT);
         sysreg::write_pmovsclr_el0(CYCLE_BIT);

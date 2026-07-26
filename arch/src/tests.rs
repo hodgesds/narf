@@ -4264,6 +4264,50 @@ fn smoke_pmuv3_cycle_counter_round_trip() -> TestResult {
 kernel_test_in!("arch/pmu", smoke_pmuv3_cycle_counter_round_trip);
 
 #[cfg(target_arch = "aarch64")]
+fn smoke_pmuv3_privilege_filters() -> TestResult {
+    use crate::aarch64::{pmu, sysreg};
+    if !pmu::available() {
+        return TestResult::Skip("PMUv3 not exposed by this CPU");
+    }
+    // SAFETY: kernel smoke remains at EL1 on its current CPU.
+    let cycle = match unsafe { pmu::alloc_cycle_counter_filtered(false, true) } {
+        Ok(counter) => counter,
+        Err(_) => return TestResult::Fail("user-only cycle allocation failed"),
+    };
+    // SAFETY: PMUv3 is available and this smoke owns the cycle counter.
+    let cycle_filter = unsafe { sysreg::read_pmccfiltr_el0() };
+    // P excludes EL1 and U excludes EL0.
+    if cycle_filter & (1 << 31) == 0 || cycle_filter & (1 << 30) != 0 {
+        return TestResult::Fail("PMCCFILTR user-only bits are incorrect");
+    }
+    // SAFETY: same current-CPU ownership.
+    if unsafe { pmu::release(cycle) }.is_err() {
+        return TestResult::Fail("filtered cycle release failed");
+    }
+
+    if !pmu::event_supported(0x11) {
+        return TestResult::Skip("architectural programmable cycles unavailable");
+    }
+    // SAFETY: kernel smoke remains at EL1 on its current CPU.
+    let programmable = match unsafe { pmu::alloc_programmable_filtered(0x11, true, false) } {
+        Ok(counter) => counter,
+        Err(_) => return TestResult::Fail("kernel-only programmable allocation failed"),
+    };
+    // SAFETY: allocation left its owned selector selected.
+    let event_type = unsafe { sysreg::read_pmxevtyper_el0() };
+    if event_type & (1 << 31) != 0 || event_type & (1 << 30) == 0 {
+        return TestResult::Fail("PMEVTYPER kernel-only bits are incorrect");
+    }
+    // SAFETY: same current-CPU ownership.
+    if unsafe { pmu::release_programmable(programmable) }.is_err() {
+        return TestResult::Fail("filtered programmable release failed");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/pmu", smoke_pmuv3_privilege_filters);
+
+#[cfg(target_arch = "aarch64")]
 fn smoke_pmuv3_programmable_counter_round_trip() -> TestResult {
     use crate::aarch64::pmu;
     if pmu::programmable_counter_count() == 0 {

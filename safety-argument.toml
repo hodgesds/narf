@@ -122,3 +122,7 @@ argument = "Network namespace lifetime is retained by typed Arc ownership in tas
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Perf code-page-size sampling reads only registered virtual-region bounds and the hardware leaf-size enum under existing address-space locks. It exports no physical address or frame handle, transfers no ownership, and does not modify page tables, domain rights, capabilities, or scheduler state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Perf privilege filtering changes only the current CPU's exclusively allocated PMU selector bits. Existing ownership checks still guard allocation, rearm, pause, read, and release; the filters grant no memory access, capability, domain right, or cross-CPU register authority."

@@ -162,14 +162,12 @@ observer stops task-targeted leader groups before the monitoring process reads
 their terminal values. This is a compatibility adapter over `observability/`
 PMU authority, not an independent counter subsystem.
 
-`PERF_COUNT_SW_CPU_CLOCK` is admitted only with `exclude_kernel`, where the
-scheduler's per-CPU user-continuation brackets provide an exact accumulated
-user-time clock. Requests for an all-context per-CPU clock remain unsupported
-until kernel/executor time is accounted per CPU. `PERF_COUNT_SW_TASK_CLOCK`
-uses the existing per-task user and syscall CPU-time ledgers.
-Hardware events reject `exclude_kernel` with `EOPNOTSUPP` until x86 event
-selectors and aarch64 PMEVTYPER filters both enforce the requested privilege
-domain; accepting the bit while counting kernel execution is forbidden.
+`PERF_COUNT_SW_CPU_CLOCK` derives exact user time from scheduler continuation
+brackets and exact non-idle time from the per-CPU idle ledger; kernel-only time
+is their difference. `PERF_COUNT_SW_TASK_CLOCK` uses the corresponding
+per-task user and syscall CPU-time ledgers. Hardware `exclude_kernel` and
+`exclude_user` selectors program x86 USR/OS or aarch64 PMCCFILTR/PMEVTYPER
+P/U exclusions on allocation and preserve them across overflow rearming.
 
 A shared mapping of a perf fd exposes one Linux-shaped
 `perf_event_mmap_page` metadata page followed by a power-of-two data area.

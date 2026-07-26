@@ -11,21 +11,21 @@ use narf_linux_perf_uapi::{
     PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_BUILD_ID, PERF_ATTR_FLAG_COMM,
     PERF_ATTR_FLAG_COMM_EXEC, PERF_ATTR_FLAG_DISABLED, PERF_ATTR_FLAG_ENABLE_ON_EXEC,
     PERF_ATTR_FLAG_EXCLUDE_GUEST, PERF_ATTR_FLAG_EXCLUDE_HV, PERF_ATTR_FLAG_EXCLUDE_KERNEL,
-    PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT, PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP,
-    PERF_ATTR_FLAG_MMAP2, PERF_ATTR_FLAG_MMAP_DATA, PERF_ATTR_FLAG_SAMPLE_ID_ALL,
-    PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK, PERF_ATTR_SIZE_VER0,
-    PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_MISSES,
-    PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_CPU_CLOCK,
-    PERF_COUNT_SW_DUMMY, PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP, PERF_FORMAT_ID,
-    PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING,
-    PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST,
-    PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP, PERF_RECORD_MMAP2,
-    PERF_RECORD_SAMPLE, PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CODE_PAGE_SIZE,
-    PERF_SAMPLE_CPU, PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID,
-    PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_PHYS_ADDR,
-    PERF_SAMPLE_READ, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
-    PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT, PERF_TYPE_HARDWARE,
-    PERF_TYPE_RAW, PERF_TYPE_SOFTWARE,
+    PERF_ATTR_FLAG_EXCLUDE_USER, PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT,
+    PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP, PERF_ATTR_FLAG_MMAP2, PERF_ATTR_FLAG_MMAP_DATA,
+    PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK,
+    PERF_ATTR_SIZE_VER0, PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES,
+    PERF_COUNT_HW_CACHE_MISSES, PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS,
+    PERF_COUNT_SW_CPU_CLOCK, PERF_COUNT_SW_DUMMY, PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP,
+    PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
+    PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK,
+    PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP,
+    PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE, PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN,
+    PERF_SAMPLE_CODE_PAGE_SIZE, PERF_SAMPLE_CPU, PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC,
+    PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD,
+    PERF_SAMPLE_PHYS_ADDR, PERF_SAMPLE_READ, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
+    PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT,
+    PERF_TYPE_HARDWARE, PERF_TYPE_RAW, PERF_TYPE_SOFTWARE,
 };
 #[cfg(target_arch = "x86_64")]
 use narf_linux_perf_uapi::{
@@ -117,7 +117,7 @@ pub(crate) fn multiplex_quantum_due_for_test(last_ns: u64, now_ns: u64) -> bool 
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 enum RemotePmuCommand {
-    Allocate(narf_arch::x86_64::pmu::PmuEvent),
+    Allocate(narf_arch::x86_64::pmu::PmuEvent, bool, bool),
     Read(narf_arch::x86_64::pmu::PmuCounter),
     Arm(narf_arch::x86_64::pmu::PmuCounter, u64),
     Pause(narf_arch::x86_64::pmu::PmuCounter),
@@ -162,10 +162,12 @@ impl RemotePmuMailbox {
 #[cfg(target_arch = "x86_64")]
 fn execute_pmu_command(command: RemotePmuCommand) -> RemotePmuReply {
     match command {
-        RemotePmuCommand::Allocate(event) => {
+        RemotePmuCommand::Allocate(event, kernel, user) => {
             // SAFETY: this function executes at CPL0 on the CPU whose PMU bank
             // is being allocated.
-            RemotePmuReply::Counter(unsafe { narf_arch::x86_64::pmu::alloc_counter(event) })
+            RemotePmuReply::Counter(unsafe {
+                narf_arch::x86_64::pmu::alloc_counter_filtered(event, kernel, user)
+            })
         }
         RemotePmuCommand::Read(counter) => {
             // SAFETY: the synchronous mailbox preserves the live allocation
@@ -298,8 +300,10 @@ fn remote_pmu_call(
 fn allocate_pmu_on(
     cpu: usize,
     event: narf_arch::x86_64::pmu::PmuEvent,
+    kernel: bool,
+    user: bool,
 ) -> Result<narf_arch::x86_64::pmu::PmuCounter, narf_arch::x86_64::pmu::PmuError> {
-    match remote_pmu_call(cpu, RemotePmuCommand::Allocate(event))? {
+    match remote_pmu_call(cpu, RemotePmuCommand::Allocate(event, kernel, user))? {
         RemotePmuReply::Counter(result) => result,
         _ => unreachable!("allocate PMU command returned the wrong reply"),
     }
@@ -372,15 +376,20 @@ enum AarchCounter {
 
 #[cfg(target_arch = "aarch64")]
 impl AarchPmuEvent {
-    unsafe fn allocate(self) -> Result<AarchCounter, narf_arch::aarch64::pmu::PmuError> {
+    unsafe fn allocate(
+        self,
+        kernel: bool,
+        user: bool,
+    ) -> Result<AarchCounter, narf_arch::aarch64::pmu::PmuError> {
         match self {
             Self::Cycle => {
                 // SAFETY: caller guarantees EL1 execution pinned to this CPU.
-                unsafe { narf_arch::aarch64::pmu::alloc_cycle_counter() }.map(AarchCounter::Cycle)
+                unsafe { narf_arch::aarch64::pmu::alloc_cycle_counter_filtered(kernel, user) }
+                    .map(AarchCounter::Cycle)
             }
             Self::Programmable(event) => {
                 // SAFETY: caller guarantees EL1 execution pinned to this CPU.
-                unsafe { narf_arch::aarch64::pmu::alloc_programmable(event) }
+                unsafe { narf_arch::aarch64::pmu::alloc_programmable_filtered(event, kernel, user) }
                     .map(AarchCounter::Programmable)
             }
         }
@@ -565,6 +574,7 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
     | PERF_ATTR_FLAG_FREQ
     | PERF_ATTR_FLAG_WATERMARK
     | PERF_ATTR_FLAG_INHERIT
+    | PERF_ATTR_FLAG_EXCLUDE_USER
     | PERF_ATTR_FLAG_EXCLUDE_KERNEL
     // NARF does not execute nested guests and currently has no BPF VM or
     // runtime kernel-symbol loader. These selectors therefore describe empty
@@ -802,6 +812,14 @@ impl core::fmt::Debug for PerfEventFile {
 }
 
 impl PerfEventFile {
+    fn counts_kernel(&self) -> bool {
+        self.attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0
+    }
+
+    fn counts_user(&self) -> bool {
+        self.attr.flags & PERF_ATTR_FLAG_EXCLUDE_USER == 0
+    }
+
     fn is_task_hardware_event(&self) -> bool {
         self.attr.type_ != PERF_TYPE_SOFTWARE && self.target_task != u64::MAX
     }
@@ -849,18 +867,26 @@ impl PerfEventFile {
                     } else {
                         narf_lib::percpu::current_cpu()
                     };
-                    if self.attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0 {
-                        cpu_user_time_ns(cpu)
+                    let user = cpu_user_time_ns(cpu);
+                    let total =
+                        narf_time::monotonic_ns().saturating_sub(narf_scheduler::cpu_idle_ns(cpu));
+                    if !self.counts_kernel() {
+                        user
+                    } else if !self.counts_user() {
+                        total.saturating_sub(user)
                     } else {
-                        narf_time::monotonic_ns().saturating_sub(narf_scheduler::cpu_idle_ns(cpu))
+                        total
                     }
                 }
                 PERF_COUNT_SW_TASK_CLOCK => {
                     let user = crate::handlers::cpu_time_ns_of(self.target_task);
-                    if self.attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0 {
+                    let kernel = crate::handlers::kern_time_ns_of(self.target_task);
+                    if !self.counts_kernel() {
                         user
+                    } else if !self.counts_user() {
+                        kernel
                     } else {
-                        user.saturating_add(crate::handlers::kern_time_ns_of(self.target_task))
+                        user.saturating_add(kernel)
                     }
                 }
                 _ => 0,
@@ -919,9 +945,13 @@ impl PerfEventFile {
             }
             // SAFETY: the scheduler invokes this on the current logical CPU in
             // executor context. The returned slot belongs to this CPU.
-            let Ok(counter) =
-                (unsafe { narf_arch::x86_64::pmu::alloc_counter(self.pmu_event.unwrap()) })
-            else {
+            let Ok(counter) = (unsafe {
+                narf_arch::x86_64::pmu::alloc_counter_filtered(
+                    self.pmu_event.unwrap(),
+                    self.counts_kernel(),
+                    self.counts_user(),
+                )
+            }) else {
                 return;
             };
             let sample_period = self.sample_period.load(Ordering::Acquire);
@@ -998,7 +1028,11 @@ impl PerfEventFile {
                 return;
             }
             // SAFETY: scheduler invokes this hook on the current CPU at EL1.
-            let Ok(counter) = (unsafe { self.pmu_event.unwrap().allocate() }) else {
+            let Ok(counter) = (unsafe {
+                self.pmu_event
+                    .unwrap()
+                    .allocate(self.counts_kernel(), self.counts_user())
+            }) else {
                 return;
             };
             let period = self.sample_period.load(Ordering::Acquire);
@@ -1164,8 +1198,12 @@ impl PerfEventFile {
             // current-CPU slot to validate the backend's real width/preload.
             // SAFETY: ioctl runs at CPL0 on the current CPU.
             let counter = unsafe {
-                narf_arch::x86_64::pmu::alloc_counter(self.pmu_event.unwrap())
-                    .map_err(|_| FsError::Unsupported)?
+                narf_arch::x86_64::pmu::alloc_counter_filtered(
+                    self.pmu_event.unwrap(),
+                    self.counts_kernel(),
+                    self.counts_user(),
+                )
+                .map_err(|_| FsError::Unsupported)?
             };
             // SAFETY: the temporary slot is live and current-CPU-owned.
             let armed = unsafe { narf_arch::x86_64::pmu::arm_sampling(&counter, period) };
@@ -1214,8 +1252,12 @@ impl PerfEventFile {
             // Disabled or switched-out task event: validate the real backend
             // synchronously with a temporary current-CPU allocation.
             // SAFETY: ioctl executes at EL1 on the current CPU.
-            let counter =
-                unsafe { self.pmu_event.unwrap().allocate() }.map_err(|_| FsError::Unsupported)?;
+            let counter = unsafe {
+                self.pmu_event
+                    .unwrap()
+                    .allocate(self.counts_kernel(), self.counts_user())
+            }
+            .map_err(|_| FsError::Unsupported)?;
             // SAFETY: freshly allocated current-CPU counter and routed PPI.
             let armed = unsafe { counter.arm(period) };
             if armed.is_ok() {
@@ -2823,6 +2865,12 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
+    if attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0
+        && attr.flags & PERF_ATTR_FLAG_EXCLUDE_USER != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
     // Linux overlays these two fields in a union; requesting both is
     // ambiguous and rejected by the kernel rather than serialized twice.
     if attr.sample_type & PERF_SAMPLE_WEIGHT != 0
@@ -2836,15 +2884,9 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
-    // Software CPU/task clocks have authoritative user/kernel accounting
-    // below. Hardware selectors still count both privilege domains on both
-    // backends, so accepting exclude_kernel here would fabricate filtering.
-    if attr.type_ != PERF_TYPE_SOFTWARE && attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0 {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
-        return;
-    }
-
     let task = current_task_id();
+    let count_kernel = attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0;
+    let count_user = attr.flags & PERF_ATTR_FLAG_EXCLUDE_USER == 0;
 
     let target_task = if pid == 0 {
         task
@@ -2970,7 +3012,9 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 // Validate that this CPU exposes a real backend and mapping.
                 // The actual counter is allocated on each task switch-in.
                 // SAFETY: syscall context at CPL0 on the current CPU.
-                let probe = match unsafe { narf_arch::x86_64::pmu::alloc_counter(event) } {
+                let probe = match unsafe {
+                    narf_arch::x86_64::pmu::alloc_counter_filtered(event, count_kernel, count_user)
+                } {
                     Ok(counter) => counter,
                     Err(narf_arch::x86_64::pmu::PmuError::NoFreeCounter) => {
                         ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
@@ -2985,7 +3029,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 unsafe { narf_arch::x86_64::pmu::release(probe) };
                 (Some(event), None)
             } else {
-                match allocate_pmu_on(cpu as usize, event) {
+                match allocate_pmu_on(cpu as usize, event, count_kernel, count_user) {
                     Ok(counter) => (Some(event), Some(counter)),
                     Err(narf_arch::x86_64::pmu::PmuError::NoFreeCounter) => {
                         ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
@@ -3009,7 +3053,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let (pmu_event, pmu_counter) = if let Some(event) = aarch_pmu_event(&attr) {
         if pid != -1 {
             // SAFETY: syscall runs at EL1 on the current CPU; probe is released below.
-            let probe = match unsafe { event.allocate() } {
+            let probe = match unsafe { event.allocate(count_kernel, count_user) } {
                 Ok(counter) => counter,
                 Err(narf_arch::aarch64::pmu::PmuError::NoFreeCounter) => {
                     ctx.set_return(SyscallReturn::ok((-16i64) as u64));
@@ -3025,7 +3069,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             (Some(event), None)
         } else {
             // SAFETY: syscall runs at EL1 on the current CPU.
-            match unsafe { event.allocate() } {
+            match unsafe { event.allocate(count_kernel, count_user) } {
                 Ok(counter) => (Some(event), Some(counter)),
                 Err(narf_arch::aarch64::pmu::PmuError::NoFreeCounter) => {
                     ctx.set_return(SyscallReturn::ok((-16i64) as u64));
@@ -3073,14 +3117,19 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 // Task-scoped counters are allocated on switch-in, but validate
                 // overflow support and the requested period synchronously.
                 // SAFETY: syscall context at CPL0.
-                validation_counter =
-                    match unsafe { narf_arch::x86_64::pmu::alloc_counter(pmu_event) } {
-                        Ok(counter) => counter,
-                        Err(_) => {
-                            ctx.set_return(SyscallReturn::ok((-95i64) as u64));
-                            return;
-                        }
-                    };
+                validation_counter = match unsafe {
+                    narf_arch::x86_64::pmu::alloc_counter_filtered(
+                        pmu_event,
+                        count_kernel,
+                        count_user,
+                    )
+                } {
+                    Ok(counter) => counter,
+                    Err(_) => {
+                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        return;
+                    }
+                };
                 &validation_counter
             };
             let armed = arm_pmu_on(*counter, period);
@@ -3119,7 +3168,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             counter
         } else {
             // SAFETY: syscall runs at EL1 on the current CPU.
-            validation = match unsafe { pmu_event.unwrap().allocate() } {
+            validation = match unsafe { pmu_event.unwrap().allocate(count_kernel, count_user) } {
                 Ok(counter) => counter,
                 Err(_) => {
                     ctx.set_return(SyscallReturn::ok((-95i64) as u64));
@@ -3284,22 +3333,17 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
     match attr.type_ {
         // PERF_TYPE_HARDWARE
         #[cfg(target_arch = "x86_64")]
-        PERF_TYPE_HARDWARE => {
-            attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0
-                && matches!(
-                    attr.config,
-                    PERF_COUNT_HW_CPU_CYCLES
-                        | PERF_COUNT_HW_INSTRUCTIONS
-                        | PERF_COUNT_HW_CACHE_REFERENCES
-                        | PERF_COUNT_HW_CACHE_MISSES
-                        | PERF_COUNT_HW_BRANCH_INSTRUCTIONS
-                        | PERF_COUNT_HW_BRANCH_MISSES
-                )
-        }
+        PERF_TYPE_HARDWARE => matches!(
+            attr.config,
+            PERF_COUNT_HW_CPU_CYCLES
+                | PERF_COUNT_HW_INSTRUCTIONS
+                | PERF_COUNT_HW_CACHE_REFERENCES
+                | PERF_COUNT_HW_CACHE_MISSES
+                | PERF_COUNT_HW_BRANCH_INSTRUCTIONS
+                | PERF_COUNT_HW_BRANCH_MISSES
+        ),
         #[cfg(target_arch = "aarch64")]
-        PERF_TYPE_HARDWARE | PERF_TYPE_RAW => {
-            attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0 && aarch_pmu_event(attr).is_some()
-        }
+        PERF_TYPE_HARDWARE | PERF_TYPE_RAW => aarch_pmu_event(attr).is_some(),
         // PERF_TYPE_SOFTWARE
         PERF_TYPE_SOFTWARE => matches!(
             attr.config,
@@ -3311,23 +3355,22 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
             let cache_id = attr.config & 0xFF;
             let op_id = (attr.config >> 8) & 0xFF;
             let result_id = (attr.config >> 16) & 0xFF;
-            attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0
-                && matches!(
-                    (cache_id, op_id, result_id),
-                    (
-                        PERF_COUNT_HW_CACHE_L1D,
-                        PERF_COUNT_HW_CACHE_OP_READ,
-                        PERF_COUNT_HW_CACHE_RESULT_ACCESS | PERF_COUNT_HW_CACHE_RESULT_MISS,
-                    ) | (
-                        PERF_COUNT_HW_CACHE_LL,
-                        PERF_COUNT_HW_CACHE_OP_READ,
-                        PERF_COUNT_HW_CACHE_RESULT_ACCESS | PERF_COUNT_HW_CACHE_RESULT_MISS,
-                    )
+            matches!(
+                (cache_id, op_id, result_id),
+                (
+                    PERF_COUNT_HW_CACHE_L1D,
+                    PERF_COUNT_HW_CACHE_OP_READ,
+                    PERF_COUNT_HW_CACHE_RESULT_ACCESS | PERF_COUNT_HW_CACHE_RESULT_MISS,
+                ) | (
+                    PERF_COUNT_HW_CACHE_LL,
+                    PERF_COUNT_HW_CACHE_OP_READ,
+                    PERF_COUNT_HW_CACHE_RESULT_ACCESS | PERF_COUNT_HW_CACHE_RESULT_MISS,
                 )
+            )
         }
         // PERF_TYPE_RAW (4)
         #[cfg(target_arch = "x86_64")]
-        PERF_TYPE_RAW => attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0,
+        PERF_TYPE_RAW => true,
         _ => false,
     }
 }

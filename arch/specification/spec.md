@@ -80,6 +80,12 @@ pub unsafe fn speculation::configure_current_cpu(
 pub fn speculation::state(cpu: usize) -> speculation::State;
 
 #[cfg(target_arch = "x86_64")]
+pub unsafe fn pmu::alloc_counter_filtered(
+    event: pmu::PmuEvent,
+    os: bool,
+    usr: bool,
+) -> Result<pmu::PmuCounter, pmu::PmuError>;
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn pmu::arm_sampling(
     counter: &pmu::PmuCounter,
     period: u64,
@@ -107,6 +113,17 @@ pub unsafe fn pmi::program_current_lvt_pc(vector: u8, masked: bool);
 
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn pmu::alloc_cycle_counter() -> Result<pmu::CycleCounter, pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::alloc_cycle_counter_filtered(
+    kernel: bool,
+    user: bool,
+) -> Result<pmu::CycleCounter, pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::alloc_programmable_filtered(
+    event: u16,
+    kernel: bool,
+    user: bool,
+) -> Result<pmu::ProgrammableCounter, pmu::PmuError>;
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn pmu::start(
     counter: &pmu::CycleCounter,
