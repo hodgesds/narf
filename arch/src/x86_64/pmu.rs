@@ -474,6 +474,10 @@ pub struct PmuCounter {
     pub idx: u8,
     /// Event programmed into this counter.
     pub event: PmuEvent,
+    /// Count operating-system (CPL0) execution.
+    pub os: bool,
+    /// Count userspace (CPL3) execution.
+    pub usr: bool,
     /// Vendor of the underlying backend (drives the MSR namespace).
     pub(crate) vendor: PmuVendor,
     /// Logical CPU whose MSR bank owns this counter.
@@ -512,11 +516,27 @@ fn sample_preload(width: u8, period: u64) -> Result<u64, PmuError> {
 /// # Safety
 /// Must be called at CPL = 0.
 pub unsafe fn alloc_counter(event: PmuEvent) -> Result<PmuCounter, PmuError> {
+    // SAFETY: forwarded caller contract.
+    unsafe { alloc_counter_filtered(event, true, true) }
+}
+
+/// Allocate and program a counter with explicit CPL0/CPL3 filtering.
+///
+/// # Safety
+/// Must be called at CPL = 0.
+pub unsafe fn alloc_counter_filtered(
+    event: PmuEvent,
+    os: bool,
+    usr: bool,
+) -> Result<PmuCounter, PmuError> {
+    if !os && !usr {
+        return Err(PmuError::UnsupportedEvent);
+    }
     let backend = detect().ok_or(PmuError::NoPmu)?;
     // Validate the vendor-specific mapping before looking for a free slot.
     // Otherwise an unsupported event can incorrectly report EBUSY merely
     // because earlier events occupy every counter.
-    let sel = event_to_evtsel(event, backend.vendor)?;
+    let sel = apply_privilege_filter(event_to_evtsel(event, backend.vendor)?, os, usr);
     let cpu = narf_lib::percpu::current_cpu();
     let allocation = &COUNTER_ALLOC_MASK[cpu];
     let idx = loop {
@@ -552,6 +572,8 @@ pub unsafe fn alloc_counter(event: PmuEvent) -> Result<PmuCounter, PmuError> {
     Ok(PmuCounter {
         idx,
         event,
+        os,
+        usr,
         vendor: backend.vendor,
         cpu: cpu as u16,
     })
@@ -597,13 +619,34 @@ pub unsafe fn sampling_residual(counter: &PmuCounter, period: u64) -> Result<u64
 /// # Safety
 /// CPL=0 and `counter` is a live allocation on the current CPU.
 pub unsafe fn arm_sampling(counter: &PmuCounter, period: u64) -> Result<(), PmuError> {
+    // SAFETY: forwarded caller contract.
+    unsafe { arm_sampling_with_reload(counter, period, period) }
+}
+
+/// Arm sampling with a possibly shorter first overflow period.
+///
+/// `initial_period` is loaded into hardware now; after that overflow the IRQ
+/// path records it as the period that fired and reloads `reload_period`.
+///
+/// # Safety
+/// CPL=0 and `counter` is a live allocation on the current CPU.
+pub unsafe fn arm_sampling_with_reload(
+    counter: &PmuCounter,
+    initial_period: u64,
+    reload_period: u64,
+) -> Result<(), PmuError> {
     let cpu = narf_lib::percpu::current_cpu();
     if counter.cpu as usize != cpu {
         return Err(PmuError::UnsupportedEvent);
     }
     let backend = detect().ok_or(PmuError::NoPmu)?;
-    let preload = sample_preload(backend.counter_width, period)?;
-    let mut sel = event_to_evtsel(counter.event, counter.vendor)?;
+    let preload = sample_preload(backend.counter_width, initial_period)?;
+    let _ = sample_preload(backend.counter_width, reload_period)?;
+    let mut sel = apply_privilege_filter(
+        event_to_evtsel(counter.event, counter.vendor)?,
+        counter.os,
+        counter.usr,
+    );
     sel.apic_int = true;
     // SAFETY: caller owns this live slot on the current CPU.
     unsafe {
@@ -617,10 +660,28 @@ pub unsafe fn arm_sampling(counter: &PmuCounter, period: u64) -> Result<(), PmuE
         }
         program_counter(counter.idx, sel, counter.vendor);
     }
-    SAMPLE_PERIODS[cpu][counter.idx as usize].store(period, Ordering::Release);
-    SAMPLE_LOADED_PERIODS[cpu][counter.idx as usize].store(period, Ordering::Release);
+    SAMPLE_PERIODS[cpu][counter.idx as usize].store(reload_period, Ordering::Release);
+    SAMPLE_LOADED_PERIODS[cpu][counter.idx as usize].store(initial_period, Ordering::Release);
     SAMPLE_ARMED_MASK[cpu].fetch_or(1 << counter.idx, Ordering::AcqRel);
     Ok(())
+}
+
+/// Events remaining before the next overflow of a live sampled counter.
+///
+/// # Safety
+/// Same current-CPU live-counter requirements as [`sampling_residual`].
+pub unsafe fn sampling_period_left(counter: &PmuCounter) -> Result<u64, PmuError> {
+    let cpu = narf_lib::percpu::current_cpu();
+    if counter.cpu as usize != cpu {
+        return Err(PmuError::UnsupportedEvent);
+    }
+    let loaded = SAMPLE_LOADED_PERIODS[cpu][counter.idx as usize].load(Ordering::Acquire);
+    if loaded == 0 {
+        return Err(PmuError::UnsupportedEvent);
+    }
+    // SAFETY: forwarded caller contract.
+    let consumed = unsafe { sampling_residual(counter, loaded)? };
+    Ok(loaded.saturating_sub(consumed).max(1))
 }
 
 /// Change the reload period used after the next overflow of an armed counter.
@@ -744,7 +805,11 @@ pub fn disarm_sampling(counter: &PmuCounter) {
 /// CPL=0 and `counter` is a live allocation on the current CPU.
 pub unsafe fn pause_sampling(counter: &PmuCounter) -> Result<(), PmuError> {
     disarm_sampling(counter);
-    let mut sel = event_to_evtsel(counter.event, counter.vendor)?;
+    let mut sel = apply_privilege_filter(
+        event_to_evtsel(counter.event, counter.vendor)?,
+        counter.os,
+        counter.usr,
+    );
     sel.apic_int = false;
     // SAFETY: caller owns this live slot.
     unsafe { program_counter(counter.idx, sel, counter.vendor) };
@@ -837,6 +902,12 @@ fn event_to_evtsel(event: PmuEvent, vendor: PmuVendor) -> Result<PerfEvtSel, Pmu
             });
         }
     })
+}
+
+fn apply_privilege_filter(mut sel: PerfEvtSel, os: bool, usr: bool) -> PerfEvtSel {
+    sel.os = os;
+    sel.usr = usr;
+    sel
 }
 
 /// Write an event-select to hardware for counter slot `idx`.
@@ -1274,4 +1345,19 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("arch/pmu", smoke_pmu_os_usr_builder);
+
+    fn smoke_pmu_privilege_filter_bits() -> TestResult {
+        let base = arch_event::unhalted_core_cycles(true, true);
+        let user = apply_privilege_filter(base, false, true).encode();
+        let kernel = apply_privilege_filter(base, true, false).encode();
+        if user & (1 << 16) == 0
+            || user & (1 << 17) != 0
+            || kernel & (1 << 16) != 0
+            || kernel & (1 << 17) == 0
+        {
+            return TestResult::Fail("x86 PMU privilege filter bits are reversed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("arch/pmu", smoke_pmu_privilege_filter_bits);
 }

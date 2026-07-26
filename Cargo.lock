@@ -2003,6 +2003,7 @@ dependencies = [
  "narf-power",
  "narf-scheduler",
  "narf-time",
+ "narf-tracing",
 ]
 
 [[package]]

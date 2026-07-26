@@ -162,11 +162,17 @@ observer stops task-targeted leader groups before the monitoring process reads
 their terminal values. This is a compatibility adapter over `observability/`
 PMU authority, not an independent counter subsystem.
 
-`PERF_COUNT_SW_CPU_CLOCK` is admitted only with `exclude_kernel`, where the
-scheduler's per-CPU user-continuation brackets provide an exact accumulated
-user-time clock. Requests for an all-context per-CPU clock remain unsupported
-until kernel/executor time is accounted per CPU. `PERF_COUNT_SW_TASK_CLOCK`
-uses the existing per-task user and syscall CPU-time ledgers.
+`PERF_COUNT_SW_CPU_CLOCK` derives exact user time from scheduler continuation
+brackets and exact non-idle time from the per-CPU idle ledger; kernel-only time
+is their difference. `PERF_COUNT_SW_TASK_CLOCK` uses the corresponding
+per-task user and syscall CPU-time ledgers. Hardware `exclude_kernel` and
+`exclude_user` selectors program x86 USR/OS or aarch64 PMCCFILTR/PMEVTYPER
+P/U exclusions on allocation and preserve them across overflow rearming.
+Pinned task groups are scheduled atomically before flexible groups and are
+never multiplexed; failure to place the complete group enters Linux's
+observable error state, for which `read(2)` returns EOF. Only a group leader
+may select `pinned` or `exclusive`. An exclusive hardware group runs only
+while no hardware event outside that group owns a counter on the CPU.
 
 A shared mapping of a perf fd exposes one Linux-shaped
 `perf_event_mmap_page` metadata page followed by a power-of-two data area.
@@ -178,15 +184,25 @@ close.
 On x86_64, sampled hardware events arm the owned GP counter for
 interrupt-on-overflow and route LVT-PC through the normal IRQ dispatcher. The
 hard-IRQ handler acknowledges/reloads the counter and captures task, IP, time,
-and counter identity into a fixed per-CPU slot without allocation. Normal
+the complete Linux-numbered user register file, up to 8 KiB of resident user
+stack, counter identity, and the overflow's exact period into a bounded
+64-entry per-CPU ring without allocation or user faults. Normal
 syscall context drains those slots into `PERF_RECORD_SAMPLE`/`LOST` records,
 advances `data_head` with release ordering, and wakes poll/epoll readers.
+If that IRQ ring is full, loss is aggregated by the event ID active on each
+overflowed physical counter, so later counter reuse cannot transfer loss to a
+different event.
+Task-scoped samples are admitted by task/inheritance ownership; system-wide
+samples are admitted by the pending slot's source CPU matching the event's
+owning CPU, without requiring a synthetic target task.
 Committed exec, comm-change, fork/clone-process, and process-exit paths emit
 Linux `PERF_RECORD_COMM`, `FORK`, and `EXIT` records when their corresponding
 attribute bits are selected. Variable records are eight-byte aligned;
 `sample_id_all` appends the selected TID/TIME/ID/STREAM_ID/CPU/IDENTIFIER
 identity fields in Linux order. `wakeup_events` counts committed records and
-wakes readers at the requested threshold. `PERF_EVENT_IOC_PAUSE_OUTPUT`
+wakes readers at the requested threshold. With the `watermark` attribute,
+the same union member is instead compared against the exact unread byte count
+after each committed record. `PERF_EVENT_IOC_PAUSE_OUTPUT`
 atomically suppresses record commits while leaving the event enabled, and
 resuming makes subsequent records visible again. Ring-capacity failures
 increment the event's loss counter; reads selecting `PERF_FORMAT_LOST` return
@@ -200,6 +216,22 @@ overflow consumes one credit, and consuming the last credit synchronously
 stops the PMU event and exposes `POLLHUP`. A later refresh clears the terminal
 readiness and adds a new budget. A zero argument retains Linux's effectively
 unlimited behavior.
+`PERF_SAMPLE_READ` appends the event's authoritative counter snapshot using
+the same standalone or group `read_format` layout as fd `read(2)`, including
+enabled/running scaling times, IDs, and loss fields when selected.
+Sample records also serialize `ADDR`, `CALLCHAIN`, `RAW`, `REGS_USER`,
+`STACK_USER`, `WEIGHT`, `DATA_SRC`, `TRANSACTION`, `PHYS_ADDR`,
+`DATA_PAGE_SIZE`, and `WEIGHT_STRUCT` in Linux
+field order. Counting PMUs provide no sampled memory address or load/store
+metadata, so those fields carry Linux's unavailable value (`0`). Callchains
+start at the exact interrupted IP and walk validated, monotonically increasing
+x86 RBP or aarch64 X29 frames only within the captured stack. The register and
+stack payload also gives upstream perf the real input needed for offline DWARF
+and symbol unwind; mapping records name the corresponding ELF images.
+`CODE_PAGE_SIZE` is resolved against the sampled
+task's registered address-space mapping and reports its real 4 KiB, 2 MiB, or
+1 GiB hardware leaf size (or `0` when the IP is unmapped). The two weight
+union views are mutually exclusive.
 On x86_64, `PERF_EVENT_IOC_PERIOD` synchronously validates and installs a new
 nonzero hardware sampling period while the event is disabled. Updating a live
 or remotely active x86_64 event returns an error until a synchronous cross-CPU
@@ -240,7 +272,14 @@ immediately after every yield or preemption. Migration therefore carries the
 accumulated value while never reusing an origin CPU's MSR identity. PMU slot
 allocation, sampling overflow state, and LVT-PC routing are per logical CPU;
 the switch-in path installs the shared PMI vector in each destination CPU
-before arming its first sampled counter. `inherit` extends
+before arming its first sampled counter. When enabled task counting events
+outnumber the remaining physical slots, the user-mode timer tick rotates their
+allocation order at a 1 ms quantum. A rotation occurs only while an eligible
+event is waiting, folds the exact stopped counter values, and keeps
+`time_running` separate from `time_enabled`. Sampling events carry the exact
+hardware `period_left` across rotation and migration; the first overflow after
+resume reports that shortened period, then reloads the configured full period.
+`inherit` extends
 that task set at every process or thread clone and removes the child at its
 thread-exit callback; concurrently running descendants therefore receive
 independent per-CPU slots whose counts feed the original event. Frequency mode
@@ -250,7 +289,16 @@ adjusts the following reload period from observed elapsed time toward
 drain from creating an interrupt storm. `PERF_SAMPLE_PERIOD` reports the period
 that caused that overflow, not the next adaptive period. Per-CPU events on SMP
 still require remote-CPU PMU calls and fail explicitly.
-Cgroup, filter, probe, and BPF features fail explicitly.
+`PERF_TYPE_TRACEPOINT` subscribes to real `narf-tracing` typed events and
+dynamic-probe fires by numeric ID. Producers enter a bounded allocation-free
+per-CPU queue; payloads up to 256 bytes become `PERF_SAMPLE_RAW`, while
+oversize/full-queue events increment the matching event's loss count. Upstream
+perf discovers this source as `narf_trace` and selects it with `id=<config>`.
+Arbitrary Linux kprobe/uprobe PMU types remain unsupported and fail explicitly;
+NARF does not patch a probe merely because an event fd was opened.
+`sigtrap` sampling requires a task target plus `remove_on_exec`; each overflow
+queues SIGTRAP with `TRAP_PERF` and the exact `sig_data`. Cgroup, filter, and
+BPF features fail explicitly.
 `exclude_guest` is accepted because NARF never executes nested guest context.
 The `ksymbol` and `bpf_event` record selectors are also accepted as empty
 domains: NARF has neither a runtime kernel-symbol loader nor a BPF VM, so no

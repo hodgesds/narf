@@ -4,6 +4,7 @@ use crate::syscall::{SyscallReturn, TrapContext};
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -11,18 +12,23 @@ use narf_linux_perf_uapi::{
     PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_BUILD_ID, PERF_ATTR_FLAG_COMM,
     PERF_ATTR_FLAG_COMM_EXEC, PERF_ATTR_FLAG_DISABLED, PERF_ATTR_FLAG_ENABLE_ON_EXEC,
     PERF_ATTR_FLAG_EXCLUDE_GUEST, PERF_ATTR_FLAG_EXCLUDE_HV, PERF_ATTR_FLAG_EXCLUDE_KERNEL,
-    PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT, PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP,
-    PERF_ATTR_FLAG_MMAP2, PERF_ATTR_FLAG_MMAP_DATA, PERF_ATTR_FLAG_SAMPLE_ID_ALL,
-    PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK, PERF_ATTR_SIZE_VER0,
-    PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_MISSES,
-    PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_CPU_CLOCK,
-    PERF_COUNT_SW_DUMMY, PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP, PERF_FORMAT_ID,
-    PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING,
-    PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST,
-    PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP, PERF_RECORD_MMAP2,
-    PERF_RECORD_SAMPLE, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
-    PERF_SAMPLE_PERIOD, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
-    PERF_TYPE_HARDWARE, PERF_TYPE_RAW, PERF_TYPE_SOFTWARE,
+    PERF_ATTR_FLAG_EXCLUDE_USER, PERF_ATTR_FLAG_EXCLUSIVE, PERF_ATTR_FLAG_FREQ,
+    PERF_ATTR_FLAG_INHERIT, PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP, PERF_ATTR_FLAG_MMAP2,
+    PERF_ATTR_FLAG_MMAP_DATA, PERF_ATTR_FLAG_PINNED, PERF_ATTR_FLAG_REMOVE_ON_EXEC,
+    PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_SIGTRAP, PERF_ATTR_FLAG_TASK,
+    PERF_ATTR_FLAG_WATERMARK, PERF_ATTR_SIZE_VER0, PERF_COUNT_HW_BRANCH_INSTRUCTIONS,
+    PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_MISSES, PERF_COUNT_HW_CPU_CYCLES,
+    PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_CPU_CLOCK, PERF_COUNT_SW_DUMMY,
+    PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST,
+    PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM,
+    PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC,
+    PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP, PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE,
+    PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CODE_PAGE_SIZE, PERF_SAMPLE_CPU,
+    PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER,
+    PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_PHYS_ADDR, PERF_SAMPLE_RAW, PERF_SAMPLE_READ,
+    PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
+    PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT,
+    PERF_TYPE_HARDWARE, PERF_TYPE_RAW, PERF_TYPE_SOFTWARE, PERF_TYPE_TRACEPOINT,
 };
 #[cfg(target_arch = "x86_64")]
 use narf_linux_perf_uapi::{
@@ -35,6 +41,11 @@ static ACTIVE_PERF_EVENTS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 static PERF_EVENT_REGISTRY: IrqSafeSpinLock<Vec<Weak<PerfEventFile>>> =
     IrqSafeSpinLock::new(Vec::new());
+static PERF_LAST_SELECTED_TASK: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(u64::MAX) }; narf_lib::percpu::MAX_CPUS];
+static PERF_LAST_MULTIPLEX_NS: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+const PERF_MULTIPLEX_QUANTUM_NS: u64 = 1_000_000;
 #[cfg(target_arch = "x86_64")]
 static PMI_VECTOR: IrqSafeSpinLock<Option<u8>> = IrqSafeSpinLock::new(None);
 #[cfg(target_arch = "x86_64")]
@@ -45,21 +56,148 @@ static REMOTE_PMU_VECTOR: IrqSafeSpinLock<Option<u8>> = IrqSafeSpinLock::new(Non
 static REMOTE_PMU_MAILBOXES: [RemotePmuMailbox; narf_lib::percpu::MAX_CPUS] =
     [const { RemotePmuMailbox::new() }; narf_lib::percpu::MAX_CPUS];
 const SAMPLE_CPU_SLOTS: usize = narf_lib::percpu::MAX_CPUS;
-static PENDING_SAMPLES: [PendingSample; SAMPLE_CPU_SLOTS] =
-    [const { PendingSample::new() }; SAMPLE_CPU_SLOTS];
-static PENDING_SAMPLE_LOST: AtomicU64 = AtomicU64::new(0);
+const PENDING_SAMPLE_DEPTH: usize = 64;
+const PENDING_LOSS_BUCKETS: usize = 16;
+const PENDING_TRACE_DEPTH: usize = 64;
+const PENDING_TRACE_BYTES: usize = 256;
+static PENDING_SAMPLES: [[PendingSample; PENDING_SAMPLE_DEPTH]; SAMPLE_CPU_SLOTS] =
+    [const { [const { PendingSample::new() }; PENDING_SAMPLE_DEPTH] }; SAMPLE_CPU_SLOTS];
+static PENDING_SAMPLE_CURSOR: [AtomicUsize; SAMPLE_CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; SAMPLE_CPU_SLOTS];
+static PENDING_LOSSES: [[PendingLoss; PENDING_LOSS_BUCKETS]; SAMPLE_CPU_SLOTS] =
+    [const { [const { PendingLoss::new() }; PENDING_LOSS_BUCKETS] }; SAMPLE_CPU_SLOTS];
+static PENDING_TRACES: [[PendingTrace; PENDING_TRACE_DEPTH]; SAMPLE_CPU_SLOTS] =
+    [const { [const { PendingTrace::new() }; PENDING_TRACE_DEPTH] }; SAMPLE_CPU_SLOTS];
+static PENDING_TRACE_CURSOR: [AtomicUsize; SAMPLE_CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; SAMPLE_CPU_SLOTS];
+static PENDING_TRACE_LOSSES: [[PendingLoss; PENDING_LOSS_BUCKETS]; SAMPLE_CPU_SLOTS] =
+    [const { [const { PendingLoss::new() }; PENDING_LOSS_BUCKETS] }; SAMPLE_CPU_SLOTS];
+static TRACE_OBSERVERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_SAMPLE_IDS: [[AtomicU64; 8]; SAMPLE_CPU_SLOTS] =
     [const { [const { AtomicU64::new(0) }; 8] }; SAMPLE_CPU_SLOTS];
+static ACTIVE_SAMPLE_STACK_BYTES: [[AtomicU32; 8]; SAMPLE_CPU_SLOTS] =
+    [const { [const { AtomicU32::new(0) }; 8] }; SAMPLE_CPU_SLOTS];
+const PERF_MAX_USER_STACK_SAMPLE: usize = 8192;
 static CPU_USER_NS: [AtomicU64; SAMPLE_CPU_SLOTS] = [const { AtomicU64::new(0) }; SAMPLE_CPU_SLOTS];
 static CPU_USER_SLICE_START_NS: [AtomicU64; SAMPLE_CPU_SLOTS] =
     [const { AtomicU64::new(0) }; SAMPLE_CPU_SLOTS];
 static CPU_USER_DEPTH: [AtomicU32; SAMPLE_CPU_SLOTS] =
     [const { AtomicU32::new(0) }; SAMPLE_CPU_SLOTS];
 
+#[inline]
+fn rotation_index(start: usize, offset: usize, len: usize) -> usize {
+    debug_assert!(len != 0);
+    start.wrapping_add(offset) % len
+}
+
+pub(crate) fn rotation_index_for_test(start: usize, offset: usize, len: usize) -> usize {
+    rotation_index(start, offset, len)
+}
+
+#[inline]
+fn advance_rotation_cursor(previous_task: u64, task: u64, cursor: usize) -> usize {
+    if previous_task != u64::MAX && previous_task != task {
+        cursor.wrapping_add(1)
+    } else {
+        cursor
+    }
+}
+
+pub(crate) fn advance_rotation_cursor_for_test(
+    previous_task: u64,
+    task: u64,
+    cursor: usize,
+) -> usize {
+    advance_rotation_cursor(previous_task, task, cursor)
+}
+
+#[inline]
+fn multiplex_quantum_due(last_ns: u64, now_ns: u64) -> bool {
+    last_ns == 0 || now_ns.saturating_sub(last_ns) >= PERF_MULTIPLEX_QUANTUM_NS
+}
+
+#[inline]
+fn remaining_sample_period(loaded: u64, consumed: u64) -> u64 {
+    loaded.saturating_sub(consumed).max(1)
+}
+
+fn unwind_user_callchain(
+    ip: u64,
+    state: Option<&narf_interrupts::InterruptedUserState>,
+    stack: &[u8],
+    max_frames: usize,
+) -> Vec<u64> {
+    let mut chain = Vec::with_capacity(max_frames.min(128));
+    if max_frames == 0 {
+        return chain;
+    }
+    chain.push(ip);
+    let Some(state) = state else {
+        return chain;
+    };
+    #[cfg(target_arch = "x86_64")]
+    let mut frame_pointer = state.regs[6];
+    #[cfg(target_arch = "aarch64")]
+    let mut frame_pointer = state.regs[29];
+    let stack_end = state.sp.saturating_add(stack.len() as u64);
+    while chain.len() < max_frames
+        && frame_pointer >= state.sp
+        && frame_pointer.saturating_add(16) <= stack_end
+        && frame_pointer & 7 == 0
+    {
+        let offset = (frame_pointer - state.sp) as usize;
+        let previous = u64::from_ne_bytes(stack[offset..offset + 8].try_into().unwrap());
+        let return_ip = u64::from_ne_bytes(stack[offset + 8..offset + 16].try_into().unwrap());
+        if return_ip == 0 {
+            break;
+        }
+        chain.push(return_ip);
+        if previous <= frame_pointer {
+            break;
+        }
+        frame_pointer = previous;
+    }
+    chain
+}
+
+pub(crate) fn unwind_user_callchain_for_test(
+    ip: u64,
+    state: &narf_interrupts::InterruptedUserState,
+    stack: &[u8],
+) -> Vec<u64> {
+    unwind_user_callchain(ip, Some(state), stack, 127)
+}
+
+pub(crate) fn remaining_sample_period_for_test(loaded: u64, consumed: u64) -> u64 {
+    remaining_sample_period(loaded, consumed)
+}
+
+pub(crate) fn multiplex_quantum_due_for_test(last_ns: u64, now_ns: u64) -> bool {
+    multiplex_quantum_due(last_ns, now_ns)
+}
+
+fn publish_active_sample(cpu: usize, slot: usize, event: &PerfEventFile) {
+    let stack_bytes = if event.attr.sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
+        event
+            .attr
+            .sample_stack_user
+            .max(PERF_MAX_USER_STACK_SAMPLE as u32)
+    } else {
+        event.attr.sample_stack_user
+    };
+    ACTIVE_SAMPLE_STACK_BYTES[cpu][slot].store(stack_bytes, Ordering::Relaxed);
+    ACTIVE_SAMPLE_IDS[cpu][slot].store(event.id, Ordering::Release);
+}
+
+fn clear_active_sample(cpu: usize, slot: usize) {
+    ACTIVE_SAMPLE_IDS[cpu][slot].store(0, Ordering::Release);
+    ACTIVE_SAMPLE_STACK_BYTES[cpu][slot].store(0, Ordering::Relaxed);
+}
+
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 enum RemotePmuCommand {
-    Allocate(narf_arch::x86_64::pmu::PmuEvent),
+    Allocate(narf_arch::x86_64::pmu::PmuEvent, bool, bool),
     Read(narf_arch::x86_64::pmu::PmuCounter),
     Arm(narf_arch::x86_64::pmu::PmuCounter, u64),
     Pause(narf_arch::x86_64::pmu::PmuCounter),
@@ -104,10 +242,12 @@ impl RemotePmuMailbox {
 #[cfg(target_arch = "x86_64")]
 fn execute_pmu_command(command: RemotePmuCommand) -> RemotePmuReply {
     match command {
-        RemotePmuCommand::Allocate(event) => {
+        RemotePmuCommand::Allocate(event, kernel, user) => {
             // SAFETY: this function executes at CPL0 on the CPU whose PMU bank
             // is being allocated.
-            RemotePmuReply::Counter(unsafe { narf_arch::x86_64::pmu::alloc_counter(event) })
+            RemotePmuReply::Counter(unsafe {
+                narf_arch::x86_64::pmu::alloc_counter_filtered(event, kernel, user)
+            })
         }
         RemotePmuCommand::Read(counter) => {
             // SAFETY: the synchronous mailbox preserves the live allocation
@@ -240,8 +380,10 @@ fn remote_pmu_call(
 fn allocate_pmu_on(
     cpu: usize,
     event: narf_arch::x86_64::pmu::PmuEvent,
+    kernel: bool,
+    user: bool,
 ) -> Result<narf_arch::x86_64::pmu::PmuCounter, narf_arch::x86_64::pmu::PmuError> {
-    match remote_pmu_call(cpu, RemotePmuCommand::Allocate(event))? {
+    match remote_pmu_call(cpu, RemotePmuCommand::Allocate(event, kernel, user))? {
         RemotePmuReply::Counter(result) => result,
         _ => unreachable!("allocate PMU command returned the wrong reply"),
     }
@@ -314,15 +456,20 @@ enum AarchCounter {
 
 #[cfg(target_arch = "aarch64")]
 impl AarchPmuEvent {
-    unsafe fn allocate(self) -> Result<AarchCounter, narf_arch::aarch64::pmu::PmuError> {
+    unsafe fn allocate(
+        self,
+        kernel: bool,
+        user: bool,
+    ) -> Result<AarchCounter, narf_arch::aarch64::pmu::PmuError> {
         match self {
             Self::Cycle => {
                 // SAFETY: caller guarantees EL1 execution pinned to this CPU.
-                unsafe { narf_arch::aarch64::pmu::alloc_cycle_counter() }.map(AarchCounter::Cycle)
+                unsafe { narf_arch::aarch64::pmu::alloc_cycle_counter_filtered(kernel, user) }
+                    .map(AarchCounter::Cycle)
             }
             Self::Programmable(event) => {
                 // SAFETY: caller guarantees EL1 execution pinned to this CPU.
-                unsafe { narf_arch::aarch64::pmu::alloc_programmable(event) }
+                unsafe { narf_arch::aarch64::pmu::alloc_programmable_filtered(event, kernel, user) }
                     .map(AarchCounter::Programmable)
             }
         }
@@ -350,14 +497,44 @@ impl AarchCounter {
     }
 
     unsafe fn arm(self, period: u64) -> Result<(), narf_arch::aarch64::pmu::PmuError> {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.arm_with_reload(period, period) }
+    }
+
+    unsafe fn arm_with_reload(
+        self,
+        initial_period: u64,
+        reload_period: u64,
+    ) -> Result<(), narf_arch::aarch64::pmu::PmuError> {
         match self {
             // SAFETY: caller guarantees ownership and a routed current-CPU PMU PPI.
             Self::Cycle(counter) => unsafe {
-                narf_arch::aarch64::pmu::arm_sampling(&counter, period)
+                narf_arch::aarch64::pmu::arm_sampling_with_reload(
+                    &counter,
+                    initial_period,
+                    reload_period,
+                )
             },
             // SAFETY: caller guarantees ownership and a routed current-CPU PMU PPI.
             Self::Programmable(counter) => unsafe {
-                narf_arch::aarch64::pmu::arm_programmable(&counter, period)
+                narf_arch::aarch64::pmu::arm_programmable_with_reload(
+                    &counter,
+                    initial_period,
+                    reload_period,
+                )
+            },
+        }
+    }
+
+    unsafe fn period_left(self) -> Result<u64, narf_arch::aarch64::pmu::PmuError> {
+        match self {
+            // SAFETY: caller guarantees live current-CPU ownership.
+            Self::Cycle(counter) => unsafe {
+                narf_arch::aarch64::pmu::sampling_period_left(&counter)
+            },
+            // SAFETY: caller guarantees live current-CPU ownership.
+            Self::Programmable(counter) => unsafe {
+                narf_arch::aarch64::pmu::programmable_period_left(&counter)
             },
         }
     }
@@ -429,7 +606,14 @@ struct PendingSample {
     ip: AtomicU64,
     time: AtomicU64,
     counters: AtomicU8,
+    user_regs_valid: AtomicBool,
+    user_regs_abi: AtomicU64,
+    user_sp: AtomicU64,
+    user_regs: [AtomicU64; 34],
+    user_stack_size: AtomicU32,
+    user_stack: PendingStack,
     event_ids: [AtomicU64; 8],
+    periods: [AtomicU64; 8],
 }
 
 impl PendingSample {
@@ -440,14 +624,90 @@ impl PendingSample {
             ip: AtomicU64::new(0),
             time: AtomicU64::new(0),
             counters: AtomicU8::new(0),
+            user_regs_valid: AtomicBool::new(false),
+            user_regs_abi: AtomicU64::new(0),
+            user_sp: AtomicU64::new(0),
+            user_regs: [const { AtomicU64::new(0) }; 34],
+            user_stack_size: AtomicU32::new(0),
+            user_stack: PendingStack::new(),
             event_ids: [const { AtomicU64::new(0) }; 8],
+            periods: [const { AtomicU64::new(0) }; 8],
         }
     }
 }
 
+struct PendingStack([UnsafeCell<u8>; PERF_MAX_USER_STACK_SAMPLE]);
+
+// SAFETY: PendingSample::state grants one producer or consumer exclusive
+// access; bytes are published by its Release transition to state 2.
+unsafe impl Sync for PendingStack {}
+
+impl PendingStack {
+    const fn new() -> Self {
+        Self([const { UnsafeCell::new(0) }; PERF_MAX_USER_STACK_SAMPLE])
+    }
+
+    fn as_mut_ptr(&self) -> *mut u8 {
+        self.0.as_ptr().cast_mut().cast::<u8>()
+    }
+
+    unsafe fn slice(&self, len: usize) -> &[u8] {
+        // SAFETY: caller owns the surrounding pending slot in state 1 after
+        // acquiring the producer's state-2 publication.
+        unsafe { core::slice::from_raw_parts(self.0.as_ptr().cast::<u8>(), len) }
+    }
+}
+
+struct PendingLoss {
+    state: AtomicU8,
+    event_id: AtomicU64,
+    count: AtomicU64,
+}
+
+impl PendingLoss {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            event_id: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+}
+
+struct PendingTrace {
+    state: AtomicU8,
+    type_id: AtomicU64,
+    task: AtomicU64,
+    ip: AtomicU64,
+    time: AtomicU64,
+    len: AtomicU32,
+    bytes: PendingTraceBytes,
+}
+
+impl PendingTrace {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            type_id: AtomicU64::new(0),
+            task: AtomicU64::new(0),
+            ip: AtomicU64::new(0),
+            time: AtomicU64::new(0),
+            len: AtomicU32::new(0),
+            bytes: PendingTraceBytes([const { UnsafeCell::new(0) }; PENDING_TRACE_BYTES]),
+        }
+    }
+}
+
+struct PendingTraceBytes([UnsafeCell<u8>; PENDING_TRACE_BYTES]);
+
+// SAFETY: PendingTrace::state serializes its sole producer and consumer.
+unsafe impl Sync for PendingTraceBytes {}
+
 const PERF_FORMAT_SUPPORTED: u64 = (1 << 5) - 1;
 
 const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
+    | PERF_ATTR_FLAG_PINNED
+    | PERF_ATTR_FLAG_EXCLUSIVE
     | PERF_ATTR_FLAG_ENABLE_ON_EXEC
     | PERF_ATTR_FLAG_COMM
     | PERF_ATTR_FLAG_TASK
@@ -457,8 +717,12 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
     | PERF_ATTR_FLAG_MMAP_DATA
     | PERF_ATTR_FLAG_MMAP2
     | PERF_ATTR_FLAG_FREQ
+    | PERF_ATTR_FLAG_WATERMARK
     | PERF_ATTR_FLAG_INHERIT
+    | PERF_ATTR_FLAG_EXCLUDE_USER
     | PERF_ATTR_FLAG_EXCLUDE_KERNEL
+    | PERF_ATTR_FLAG_REMOVE_ON_EXEC
+    | PERF_ATTR_FLAG_SIGTRAP
     // NARF does not execute nested guests and currently has no BPF VM or
     // runtime kernel-symbol loader. These selectors therefore describe empty
     // event domains, rather than requests whose records are being suppressed.
@@ -492,11 +756,24 @@ const PERF_MMAP_DATA_SIZE_OFFSET: usize = 1048;
 const PERF_SAMPLE_SUPPORTED: u64 = PERF_SAMPLE_IP
     | PERF_SAMPLE_TID
     | PERF_SAMPLE_TIME
+    | PERF_SAMPLE_ADDR
+    | PERF_SAMPLE_READ
+    | PERF_SAMPLE_CALLCHAIN
+    | PERF_SAMPLE_RAW
+    | PERF_SAMPLE_REGS_USER
+    | PERF_SAMPLE_STACK_USER
     | PERF_SAMPLE_ID
     | PERF_SAMPLE_CPU
     | PERF_SAMPLE_PERIOD
     | PERF_SAMPLE_STREAM_ID
-    | PERF_SAMPLE_IDENTIFIER;
+    | PERF_SAMPLE_IDENTIFIER
+    | PERF_SAMPLE_WEIGHT
+    | PERF_SAMPLE_DATA_SRC
+    | PERF_SAMPLE_TRANSACTION
+    | PERF_SAMPLE_PHYS_ADDR
+    | PERF_SAMPLE_DATA_PAGE_SIZE
+    | PERF_SAMPLE_CODE_PAGE_SIZE
+    | PERF_SAMPLE_WEIGHT_STRUCT;
 
 struct PerfEventFile {
     attr: PerfEventAttr,
@@ -506,10 +783,14 @@ struct PerfEventFile {
     target_cpu: i32,
     inherited_tasks: IrqSafeSpinLock<Vec<u64>>,
     enabled: AtomicBool,
+    scheduling_error: AtomicBool,
     count_base: AtomicU64,
     count_accumulated: AtomicU64,
     enabled_at_ns: AtomicU64,
     time_enabled_ns: AtomicU64,
+    running_at_ns: [AtomicU64; narf_lib::percpu::MAX_CPUS],
+    time_running_ns: AtomicU64,
+    multiplex_cursor: AtomicUsize,
     registered: AtomicBool,
     sample_lost: AtomicU64,
     output_paused: AtomicBool,
@@ -517,6 +798,7 @@ struct PerfEventFile {
     refresh_limit: AtomicU32,
     wakeup_pending: AtomicU32,
     sample_period: AtomicU64,
+    sample_period_left: AtomicU64,
     last_sample_period: AtomicU64,
     sample_frequency: u64,
     last_sample_ns: AtomicU64,
@@ -681,8 +963,63 @@ impl core::fmt::Debug for PerfEventFile {
 }
 
 impl PerfEventFile {
+    fn is_group_leader(&self) -> bool {
+        self._group_leader.is_none()
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.attr.flags & PERF_ATTR_FLAG_PINNED != 0
+    }
+
+    fn is_exclusive(&self) -> bool {
+        self.attr.flags & PERF_ATTR_FLAG_EXCLUSIVE != 0
+    }
+
+    fn counts_kernel(&self) -> bool {
+        self.attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0
+    }
+
+    fn counts_user(&self) -> bool {
+        self.attr.flags & PERF_ATTR_FLAG_EXCLUDE_USER == 0
+    }
+
+    fn is_task_hardware_event(&self) -> bool {
+        !matches!(self.attr.type_, PERF_TYPE_SOFTWARE | PERF_TYPE_TRACEPOINT)
+            && self.target_task != u64::MAX
+    }
+
+    fn start_running_at(&self, cpu: usize, now: u64) {
+        let _ = self.running_at_ns[cpu].compare_exchange(
+            0,
+            now.max(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn start_running(&self, cpu: usize) {
+        self.start_running_at(cpu, narf_time::monotonic_ns());
+    }
+
+    fn stop_running(&self, cpu: usize) {
+        let since = self.running_at_ns[cpu].swap(0, Ordering::AcqRel);
+        if since != 0 {
+            self.time_running_ns.fetch_add(
+                narf_time::monotonic_ns().saturating_sub(since),
+                Ordering::AcqRel,
+            );
+        }
+    }
+
     fn tracks_task(&self, task: u64) -> bool {
         self.target_task == task || self.inherited_tasks.lock().contains(&task)
+    }
+
+    fn accepts_sample_from(&self, source_cpu: usize, task: u64) -> bool {
+        if self.target_task == u64::MAX {
+            return self.target_cpu >= 0 && self.target_cpu as usize == source_cpu;
+        }
+        self.tracks_task(task)
     }
 
     fn raw_count(&self) -> u64 {
@@ -694,18 +1031,26 @@ impl PerfEventFile {
                     } else {
                         narf_lib::percpu::current_cpu()
                     };
-                    if self.attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0 {
-                        cpu_user_time_ns(cpu)
+                    let user = cpu_user_time_ns(cpu);
+                    let total =
+                        narf_time::monotonic_ns().saturating_sub(narf_scheduler::cpu_idle_ns(cpu));
+                    if !self.counts_kernel() {
+                        user
+                    } else if !self.counts_user() {
+                        total.saturating_sub(user)
                     } else {
-                        narf_time::monotonic_ns().saturating_sub(narf_scheduler::cpu_idle_ns(cpu))
+                        total
                     }
                 }
                 PERF_COUNT_SW_TASK_CLOCK => {
                     let user = crate::handlers::cpu_time_ns_of(self.target_task);
-                    if self.attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0 {
+                    let kernel = crate::handlers::kern_time_ns_of(self.target_task);
+                    if !self.counts_kernel() {
                         user
+                    } else if !self.counts_user() {
+                        kernel
                     } else {
-                        user.saturating_add(crate::handlers::kern_time_ns_of(self.target_task))
+                        user.saturating_add(kernel)
                     }
                 }
                 _ => 0,
@@ -750,46 +1095,70 @@ impl PerfEventFile {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn task_switch(&self, cpu: usize, running: bool) {
+    fn task_switch(&self, cpu: usize, running: bool) -> bool {
         if self.target_task == u64::MAX || self.pmu_event.is_none() {
-            return;
+            return true;
         }
         let mut active = self.active_task_counters.lock();
         if self.target_cpu >= 0 && cpu != self.target_cpu as usize {
-            return;
+            return true;
         }
         if running {
             if active[cpu].is_some() || !self.enabled.load(Ordering::Acquire) {
-                return;
+                return true;
             }
             // SAFETY: the scheduler invokes this on the current logical CPU in
             // executor context. The returned slot belongs to this CPU.
-            let Ok(counter) =
-                (unsafe { narf_arch::x86_64::pmu::alloc_counter(self.pmu_event.unwrap()) })
-            else {
-                return;
+            let Ok(counter) = (unsafe {
+                narf_arch::x86_64::pmu::alloc_counter_filtered(
+                    self.pmu_event.unwrap(),
+                    self.counts_kernel(),
+                    self.counts_user(),
+                )
+            }) else {
+                return false;
             };
             let sample_period = self.sample_period.load(Ordering::Acquire);
             if sample_period != 0 {
                 if ensure_pmi_route().is_err() {
                     // SAFETY: same current-CPU allocation.
                     unsafe { narf_arch::x86_64::pmu::release(counter) };
-                    return;
+                    return false;
                 }
                 // SAFETY: freshly allocated current-CPU counter.
-                if unsafe { narf_arch::x86_64::pmu::arm_sampling(&counter, sample_period) }.is_err()
+                let period_left = self
+                    .sample_period_left
+                    .load(Ordering::Acquire)
+                    .clamp(1, sample_period);
+                // SAFETY: freshly allocated current-CPU counter; the first
+                // preload and subsequent reload are backend-validated.
+                if unsafe {
+                    narf_arch::x86_64::pmu::arm_sampling_with_reload(
+                        &counter,
+                        period_left,
+                        sample_period,
+                    )
+                }
+                .is_err()
                 {
                     // SAFETY: same current-CPU allocation.
                     unsafe { narf_arch::x86_64::pmu::release(counter) };
-                    return;
+                    return false;
                 }
-                ACTIVE_SAMPLE_IDS[cpu][counter.idx as usize].store(self.id, Ordering::Release);
+                publish_active_sample(cpu, counter.idx as usize, self);
             }
             active[cpu] = Some(counter);
+            self.start_running(cpu);
         } else if let Some(counter) = active[cpu].take() {
             let sample_period = self.sample_period.load(Ordering::Acquire);
             if sample_period != 0 {
-                ACTIVE_SAMPLE_IDS[cpu][counter.idx as usize].store(0, Ordering::Release);
+                clear_active_sample(cpu, counter.idx as usize);
+                // SAFETY: current-CPU live sampled allocation. Capture the
+                // exact remaining distance before disarming the slot.
+                if let Ok(left) = unsafe { narf_arch::x86_64::pmu::sampling_period_left(&counter) }
+                {
+                    self.sample_period_left.store(left, Ordering::Release);
+                }
                 // SAFETY: current-CPU live allocation.
                 let _ = unsafe { narf_arch::x86_64::pmu::pause_sampling(&counter) };
             }
@@ -805,46 +1174,63 @@ impl PerfEventFile {
             self.count_accumulated.fetch_add(value, Ordering::AcqRel);
             // SAFETY: current-CPU live allocation.
             unsafe { narf_arch::x86_64::pmu::release(counter) };
+            self.stop_running(cpu);
         }
+        true
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn task_switch(&self, cpu: usize, running: bool) {
+    fn task_switch(&self, cpu: usize, running: bool) -> bool {
         if self.target_task == u64::MAX || self.pmu_event.is_none() {
-            return;
+            return true;
         }
         let mut active = self.active_task_counters.lock();
         if self.target_cpu >= 0 && cpu != self.target_cpu as usize {
-            return;
+            return true;
         }
         if running {
             if active[cpu].is_some() || !self.enabled.load(Ordering::Acquire) {
-                return;
+                return true;
             }
             // SAFETY: scheduler invokes this hook on the current CPU at EL1.
-            let Ok(counter) = (unsafe { self.pmu_event.unwrap().allocate() }) else {
-                return;
+            let Ok(counter) = (unsafe {
+                self.pmu_event
+                    .unwrap()
+                    .allocate(self.counts_kernel(), self.counts_user())
+            }) else {
+                return false;
             };
             let period = self.sample_period.load(Ordering::Acquire);
             if period != 0 {
                 let route_failed = ensure_pmi_route().is_err();
+                let period_left = self
+                    .sample_period_left
+                    .load(Ordering::Acquire)
+                    .clamp(1, period);
                 // SAFETY: freshly allocated current-CPU counter and routed PPI.
-                let arm_failed = unsafe { counter.arm(period) }.is_err();
+                let arm_failed = unsafe { counter.arm_with_reload(period_left, period) }.is_err();
                 if route_failed || arm_failed {
                     // SAFETY: the fresh allocation is still owned on this CPU.
                     let _ = unsafe { counter.release() };
-                    return;
+                    return false;
                 }
-                ACTIVE_SAMPLE_IDS[cpu][counter.sample_slot()].store(self.id, Ordering::Release);
+                publish_active_sample(cpu, counter.sample_slot(), self);
             // SAFETY: freshly allocated current-CPU counter.
             } else if unsafe { counter.start() }.is_err() {
                 // SAFETY: the fresh allocation is still owned on this CPU.
                 let _ = unsafe { counter.release() };
-                return;
+                return false;
             }
             active[cpu] = Some(counter);
+            self.start_running(cpu);
         } else if let Some(counter) = active[cpu].take() {
-            ACTIVE_SAMPLE_IDS[cpu][counter.sample_slot()].store(0, Ordering::Release);
+            clear_active_sample(cpu, counter.sample_slot());
+            if self.sample_period.load(Ordering::Acquire) != 0 {
+                // SAFETY: switch-out runs on the CPU owning this live counter.
+                if let Ok(left) = unsafe { counter.period_left() } {
+                    self.sample_period_left.store(left, Ordering::Release);
+                }
+            }
             // SAFETY: switch-out runs on the CPU owning this active counter.
             let _ = unsafe { counter.pause() };
             // SAFETY: the paused counter remains owned on this CPU.
@@ -852,15 +1238,26 @@ impl PerfEventFile {
             self.count_accumulated.fetch_add(value, Ordering::AcqRel);
             // SAFETY: the paused counter remains owned on this CPU.
             let _ = unsafe { counter.release() };
+            self.stop_running(cpu);
         }
+        true
     }
 
     fn enable(&self) {
+        self.scheduling_error.store(false, Ordering::Release);
         if !self.enabled.swap(true, Ordering::AcqRel) {
             let raw = self.raw_count();
             let now = narf_time::monotonic_ns();
             self.count_base.store(raw, Ordering::Release);
             self.enabled_at_ns.store(now, Ordering::Release);
+            if !self.is_task_hardware_event() {
+                let cpu = if self.target_cpu >= 0 {
+                    self.target_cpu as usize
+                } else {
+                    narf_lib::percpu::current_cpu()
+                };
+                self.start_running_at(cpu, now);
+            }
             self.last_sample_ns.store(0, Ordering::Release);
             #[cfg(target_arch = "x86_64")]
             {
@@ -868,6 +1265,7 @@ impl PerfEventFile {
                 let sample_period = self.sample_period.load(Ordering::Acquire);
                 if sample_period != 0 {
                     if let Some(counter) = self.pmu_counter {
+                        publish_active_sample(counter.cpu as usize, counter.idx as usize, self);
                         let _ = arm_pmu_on(counter, sample_period);
                     }
                 }
@@ -881,6 +1279,11 @@ impl PerfEventFile {
                 let period = self.sample_period.load(Ordering::Acquire);
                 if let Some(counter) = self.pmu_counter.as_ref() {
                     if period != 0 {
+                        publish_active_sample(
+                            self.target_cpu as usize,
+                            counter.sample_slot(),
+                            self,
+                        );
                         // SAFETY: this per-CPU file owns the current-CPU counter.
                         let _ = unsafe { (*counter).arm(period) };
                     } else {
@@ -909,11 +1312,15 @@ impl PerfEventFile {
             #[cfg(target_arch = "x86_64")]
             if self.sample_period.load(Ordering::Acquire) != 0 {
                 if let Some(counter) = self.pmu_counter {
+                    clear_active_sample(counter.cpu as usize, counter.idx as usize);
                     let _ = pause_pmu_on(counter);
                 }
             }
             #[cfg(target_arch = "aarch64")]
             if let Some(counter) = self.pmu_counter.as_ref() {
+                if self.sample_period.load(Ordering::Acquire) != 0 {
+                    clear_active_sample(self.target_cpu as usize, counter.sample_slot());
+                }
                 // SAFETY: this per-CPU file owns the current-CPU counter.
                 let _ = unsafe { (*counter).pause() };
             }
@@ -925,6 +1332,14 @@ impl PerfEventFile {
             let since = self.enabled_at_ns.load(Ordering::Acquire);
             self.time_enabled_ns
                 .fetch_add(now.saturating_sub(since), Ordering::AcqRel);
+            if !self.is_task_hardware_event() {
+                let cpu = if self.target_cpu >= 0 {
+                    self.target_cpu as usize
+                } else {
+                    narf_lib::percpu::current_cpu()
+                };
+                self.stop_running(cpu);
+            }
         }
         self.publish_mmap_state();
     }
@@ -950,8 +1365,12 @@ impl PerfEventFile {
             // current-CPU slot to validate the backend's real width/preload.
             // SAFETY: ioctl runs at CPL0 on the current CPU.
             let counter = unsafe {
-                narf_arch::x86_64::pmu::alloc_counter(self.pmu_event.unwrap())
-                    .map_err(|_| FsError::Unsupported)?
+                narf_arch::x86_64::pmu::alloc_counter_filtered(
+                    self.pmu_event.unwrap(),
+                    self.counts_kernel(),
+                    self.counts_user(),
+                )
+                .map_err(|_| FsError::Unsupported)?
             };
             // SAFETY: the temporary slot is live and current-CPU-owned.
             let armed = unsafe { narf_arch::x86_64::pmu::arm_sampling(&counter, period) };
@@ -964,6 +1383,7 @@ impl PerfEventFile {
             armed.map_err(|_| FsError::InvalidData)?;
         }
         self.sample_period.store(period, Ordering::Release);
+        self.sample_period_left.store(period, Ordering::Release);
         self.last_sample_period.store(period, Ordering::Release);
         Ok(())
     }
@@ -999,8 +1419,12 @@ impl PerfEventFile {
             // Disabled or switched-out task event: validate the real backend
             // synchronously with a temporary current-CPU allocation.
             // SAFETY: ioctl executes at EL1 on the current CPU.
-            let counter =
-                unsafe { self.pmu_event.unwrap().allocate() }.map_err(|_| FsError::Unsupported)?;
+            let counter = unsafe {
+                self.pmu_event
+                    .unwrap()
+                    .allocate(self.counts_kernel(), self.counts_user())
+            }
+            .map_err(|_| FsError::Unsupported)?;
             // SAFETY: freshly allocated current-CPU counter and routed PPI.
             let armed = unsafe { counter.arm(period) };
             if armed.is_ok() {
@@ -1013,6 +1437,7 @@ impl PerfEventFile {
         }
         drop(active);
         self.sample_period.store(period, Ordering::Release);
+        self.sample_period_left.store(period, Ordering::Release);
         self.last_sample_period.store(period, Ordering::Release);
         Ok(())
     }
@@ -1020,32 +1445,48 @@ impl PerfEventFile {
     fn reset(&self) {
         self.count_accumulated.store(0, Ordering::Release);
         self.time_enabled_ns.store(0, Ordering::Release);
+        self.time_running_ns.store(0, Ordering::Release);
+        self.sample_period_left.store(
+            self.sample_period.load(Ordering::Acquire),
+            Ordering::Release,
+        );
         if self.enabled.load(Ordering::Acquire) {
+            let now = narf_time::monotonic_ns();
             self.count_base.store(self.raw_count(), Ordering::Release);
-            self.enabled_at_ns
-                .store(narf_time::monotonic_ns(), Ordering::Release);
+            self.enabled_at_ns.store(now, Ordering::Release);
+            for running_at in &self.running_at_ns {
+                if running_at.load(Ordering::Acquire) != 0 {
+                    running_at.store(now.max(1), Ordering::Release);
+                }
+            }
         }
         self.publish_mmap_state();
     }
 
-    fn snapshot(&self) -> (u64, u64) {
+    fn snapshot(&self) -> (u64, u64, u64) {
         let mut value = self.count_accumulated.load(Ordering::Acquire);
-        let mut time = self.time_enabled_ns.load(Ordering::Acquire);
+        let mut time_enabled = self.time_enabled_ns.load(Ordering::Acquire);
+        let mut time_running = self.time_running_ns.load(Ordering::Acquire);
+        let now = narf_time::monotonic_ns();
         if self.enabled.load(Ordering::Acquire) {
             value = value.wrapping_add(
                 self.raw_count()
                     .wrapping_sub(self.count_base.load(Ordering::Acquire)),
             );
-            time = time.saturating_add(
-                narf_time::monotonic_ns()
-                    .saturating_sub(self.enabled_at_ns.load(Ordering::Acquire)),
-            );
+            time_enabled = time_enabled
+                .saturating_add(now.saturating_sub(self.enabled_at_ns.load(Ordering::Acquire)));
         }
-        (value, time)
+        for running_at in &self.running_at_ns {
+            let running_since = running_at.load(Ordering::Acquire);
+            if running_since != 0 {
+                time_running = time_running.saturating_add(now.saturating_sub(running_since));
+            }
+        }
+        (value, time_enabled, time_running.min(time_enabled))
     }
 
     fn publish_mmap_state(&self) {
-        let (value, time) = self.snapshot();
+        let (value, time_enabled, time_running) = self.snapshot();
         let mapping = self.mmap.lock();
         let Some(mapping) = mapping.as_ref() else {
             return;
@@ -1056,8 +1497,8 @@ impl PerfEventFile {
         // `index == 0` (the zeroed default) tells userspace that direct RDPMC
         // is unavailable; Linux then treats `offset` as the count snapshot.
         mapping.write_u64(PERF_MMAP_OFFSET_OFFSET, value);
-        mapping.write_u64(PERF_MMAP_TIME_ENABLED_OFFSET, time);
-        mapping.write_u64(PERF_MMAP_TIME_RUNNING_OFFSET, time);
+        mapping.write_u64(PERF_MMAP_TIME_ENABLED_OFFSET, time_enabled);
+        mapping.write_u64(PERF_MMAP_TIME_RUNNING_OFFSET, time_running);
         core::sync::atomic::compiler_fence(Ordering::Release);
         mapping.write_u32(PERF_MMAP_LOCK_OFFSET, sequence.wrapping_add(2));
     }
@@ -1079,20 +1520,25 @@ impl PerfEventFile {
             return RecordPush::Full;
         }
         mapping.write_ring(head, record);
-        mapping.write_u64_release(
-            PERF_MMAP_DATA_HEAD_OFFSET,
-            head.wrapping_add(record.len() as u64),
-        );
+        let new_head = head.wrapping_add(record.len() as u64);
+        mapping.write_u64_release(PERF_MMAP_DATA_HEAD_OFFSET, new_head);
         let threshold = self.attr.wakeup_events_or_watermark;
-        if threshold != 0
-            && self
+        if threshold != 0 {
+            if self.attr.flags & PERF_ATTR_FLAG_WATERMARK != 0 {
+                // In watermark mode the union member is a byte threshold over
+                // unread ring data, not a record count.
+                if new_head.wrapping_sub(tail) >= u64::from(threshold) {
+                    narf_net::readiness::notify(0);
+                }
+            } else if self
                 .wakeup_pending
                 .fetch_add(1, Ordering::AcqRel)
                 .wrapping_add(1)
                 >= threshold
-        {
-            self.wakeup_pending.store(0, Ordering::Release);
-            narf_net::readiness::notify(0);
+            {
+                self.wakeup_pending.store(0, Ordering::Release);
+                narf_net::readiness::notify(0);
+            }
         }
         RecordPush::Committed
     }
@@ -1113,7 +1559,17 @@ impl PerfEventFile {
         result == RecordPush::Committed
     }
 
-    fn sample_record(&self, ip: u64, pid: u32, tid: u32, now: u64) -> bool {
+    #[allow(clippy::too_many_arguments)] // Linux sample fields are independent ABI columns.
+    fn sample_record(
+        &self,
+        ip: u64,
+        pid: u32,
+        tid: u32,
+        now: u64,
+        user_state: Option<&narf_interrupts::InterruptedUserState>,
+        user_stack: &[u8],
+        raw: &[u8],
+    ) -> bool {
         let sample_type = self.attr.sample_type;
         let mut payload = Vec::with_capacity(80);
         let push_u32 = |payload: &mut Vec<u8>, value: u32| {
@@ -1135,6 +1591,25 @@ impl PerfEventFile {
         if sample_type & PERF_SAMPLE_TIME != 0 {
             push_u64(&mut payload, now);
         }
+        if sample_type & PERF_SAMPLE_ADDR != 0 {
+            // Counting PMUs do not report a sampled data address.
+            push_u64(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_READ != 0 {
+            self.append_sample_read(&mut payload);
+        }
+        if sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
+            let max_stack = if self.attr.sample_max_stack == 0 {
+                127
+            } else {
+                usize::from(self.attr.sample_max_stack)
+            };
+            let callchain = unwind_user_callchain(ip, user_state, user_stack, max_stack);
+            push_u64(&mut payload, callchain.len() as u64);
+            for address in callchain {
+                push_u64(&mut payload, address);
+            }
+        }
         if sample_type & PERF_SAMPLE_ID != 0 {
             push_u64(&mut payload, self.id);
         }
@@ -1151,15 +1626,76 @@ impl PerfEventFile {
                 self.last_sample_period.load(Ordering::Acquire),
             );
         }
+        if sample_type & PERF_SAMPLE_RAW != 0 {
+            push_u32(&mut payload, raw.len() as u32);
+            payload.extend_from_slice(raw);
+            while payload.len() & 7 != 0 {
+                payload.push(0);
+            }
+        }
+        if sample_type & PERF_SAMPLE_REGS_USER != 0 {
+            let Some(state) = user_state else {
+                return false;
+            };
+            push_u64(&mut payload, state.abi);
+            for index in 0..64 {
+                if self.attr.sample_regs_user & (1 << index) != 0 {
+                    let Some(value) = state.regs.get(index) else {
+                        return false;
+                    };
+                    push_u64(&mut payload, *value);
+                }
+            }
+        }
+        if sample_type & PERF_SAMPLE_STACK_USER != 0 {
+            push_u64(&mut payload, user_stack.len() as u64);
+            payload.extend_from_slice(user_stack);
+            while payload.len() & 7 != 0 {
+                payload.push(0);
+            }
+            push_u64(&mut payload, user_stack.len() as u64);
+        }
+        if sample_type & PERF_SAMPLE_WEIGHT != 0 {
+            push_u64(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_DATA_SRC != 0 {
+            push_u64(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_TRANSACTION != 0 {
+            push_u64(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_PHYS_ADDR != 0 {
+            push_u64(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_DATA_PAGE_SIZE != 0 {
+            push_u64(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_CODE_PAGE_SIZE != 0 {
+            let task = u64::from(tid);
+            let page_size = narf_scheduler::address_space_of(narf_scheduler::TaskId(task))
+                .or_else(|| {
+                    (task == current_task_id()).then(narf_scheduler::current_address_space)?
+                })
+                .and_then(|space| space.mapped_page_size(narf_memory::VirtAddr::new(ip)))
+                .unwrap_or(0);
+            push_u64(&mut payload, page_size);
+        }
+        if sample_type & PERF_SAMPLE_WEIGHT_STRUCT != 0 {
+            push_u64(&mut payload, 0);
+        }
         let lost = self.sample_lost.swap(0, Ordering::AcqRel);
         if lost != 0 {
-            let mut record = Vec::with_capacity(24);
+            let mut record = Vec::with_capacity(64);
             push_u32(&mut record, PERF_RECORD_LOST);
             record.extend_from_slice(&0u16.to_ne_bytes());
-            record.extend_from_slice(&24u16.to_ne_bytes());
+            record.extend_from_slice(&0u16.to_ne_bytes());
             push_u64(&mut record, self.id);
             push_u64(&mut record, lost);
-            if !self.push_record(&record) {
+            // PERF_RECORD_LOST is a non-sample record. When sample_id_all is
+            // requested, Linux appends the selected sample identity fields;
+            // perf uses that trailer to associate the loss with an evsel.
+            self.append_sample_id(&mut record, pid, tid, now);
+            if !Self::finish_record(&mut record, 0) || !self.push_record(&record) {
                 self.sample_lost.fetch_add(lost, Ordering::Relaxed);
             }
         }
@@ -1174,6 +1710,59 @@ impl PerfEventFile {
         record.extend_from_slice(&size.to_ne_bytes());
         record.extend_from_slice(&payload);
         self.push_record(&record)
+    }
+
+    fn append_sample_read(&self, payload: &mut Vec<u8>) {
+        let push = |payload: &mut Vec<u8>, value: u64| {
+            payload.extend_from_slice(&value.to_ne_bytes());
+        };
+        let (value, time_enabled, time_running) = self.snapshot();
+        let format = self.attr.read_format;
+        if format & PERF_FORMAT_GROUP != 0 {
+            let members = self.member_files();
+            push(payload, 1 + members.len() as u64);
+            if format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
+                push(payload, time_enabled);
+            }
+            if format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
+                push(payload, time_running);
+            }
+            push(payload, value);
+            if format & PERF_FORMAT_ID != 0 {
+                push(payload, self.id);
+            }
+            if format & PERF_FORMAT_LOST != 0 {
+                push(payload, self.sample_lost.load(Ordering::Acquire));
+            }
+            for file in members {
+                let event = file
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<PerfEventFile>())
+                    .expect("perf group contains a non-perf member");
+                let (member_value, _, _) = event.snapshot();
+                push(payload, member_value);
+                if format & PERF_FORMAT_ID != 0 {
+                    push(payload, event.id);
+                }
+                if format & PERF_FORMAT_LOST != 0 {
+                    push(payload, event.sample_lost.load(Ordering::Acquire));
+                }
+            }
+        } else {
+            push(payload, value);
+            if format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
+                push(payload, time_enabled);
+            }
+            if format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
+                push(payload, time_running);
+            }
+            if format & PERF_FORMAT_ID != 0 {
+                push(payload, self.id);
+            }
+            if format & PERF_FORMAT_LOST != 0 {
+                push(payload, self.sample_lost.load(Ordering::Acquire));
+            }
+        }
     }
 
     /// Consume one genuine sampling overflow from an ioctl refresh budget.
@@ -1441,6 +2030,14 @@ pub(crate) fn on_exec(task: u64, mappings: &[crate::process::LoadedMapping], pro
         let Some(event) = weak.upgrade() else {
             return false;
         };
+        if event.tracks_task(task) && event.attr.flags & PERF_ATTR_FLAG_REMOVE_ON_EXEC != 0 {
+            event.disable();
+            event.registered.store(false, Ordering::Release);
+            if ACTIVE_PERF_EVENTS.fetch_sub(1, Ordering::Relaxed) == 1 {
+                narf_lib::perf::set_enabled(false);
+            }
+            return false;
+        }
         if event.tracks_task(task)
             && event.attr.flags & PERF_ATTR_FLAG_ENABLE_ON_EXEC != 0
             && event._group_leader.is_none()
@@ -1598,23 +2195,161 @@ pub(crate) fn on_thread_exit(_pid: u64, tid: u64) {
     });
 }
 
-#[cfg(target_arch = "x86_64")]
-fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
-    // SAFETY: this handler is installed only on LVT-PC and runs at CPL0.
-    let counters = unsafe { narf_arch::x86_64::pmu::handle_sampling_overflow() };
-    if counters == 0 {
-        return narf_interrupts::IrqStatus::None;
+fn record_pending_loss(cpu: usize, counters: u8) {
+    for (counter, active_id) in ACTIVE_SAMPLE_IDS[cpu].iter().enumerate() {
+        if counters & (1 << counter) == 0 {
+            continue;
+        }
+        let event_id = active_id.load(Ordering::Acquire);
+        if event_id == 0 {
+            continue;
+        }
+        let buckets = &PENDING_LOSSES[cpu];
+        for bucket in buckets {
+            let state = bucket.state.load(Ordering::Acquire);
+            if state == 2
+                && bucket.event_id.load(Ordering::Relaxed) == event_id
+                && bucket
+                    .state
+                    .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                bucket.count.fetch_add(1, Ordering::Relaxed);
+                bucket.state.store(2, Ordering::Release);
+                break;
+            }
+            if state == 0
+                && bucket
+                    .state
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                bucket.event_id.store(event_id, Ordering::Relaxed);
+                bucket.count.store(1, Ordering::Relaxed);
+                bucket.state.store(2, Ordering::Release);
+                break;
+            }
+        }
     }
+}
+
+fn capture_trace(type_id: u64, bytes: &[u8]) {
     let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
-    let pending = &PENDING_SAMPLES[cpu];
-    if pending
-        .state
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
-        PENDING_SAMPLE_LOST.fetch_add(1, Ordering::Relaxed);
-        return narf_interrupts::IrqStatus::Handled;
+    if bytes.len() > PENDING_TRACE_BYTES {
+        record_trace_loss(cpu, type_id);
+        return;
     }
+    let start = PENDING_TRACE_CURSOR[cpu].fetch_add(1, Ordering::Relaxed);
+    for offset in 0..PENDING_TRACE_DEPTH {
+        let pending = &PENDING_TRACES[cpu][rotation_index(start, offset, PENDING_TRACE_DEPTH)];
+        if pending
+            .state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            continue;
+        }
+        // SAFETY: state 1 grants this producer exclusive byte access.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                pending.bytes.0.as_ptr().cast_mut().cast::<u8>(),
+                bytes.len(),
+            );
+        }
+        pending.type_id.store(type_id, Ordering::Relaxed);
+        pending
+            .task
+            .store(crate::handlers::current_task_id(), Ordering::Relaxed);
+        pending
+            .ip
+            .store(narf_interrupts::interrupted_ip(), Ordering::Relaxed);
+        pending
+            .time
+            .store(narf_time::monotonic_ns(), Ordering::Relaxed);
+        pending.len.store(bytes.len() as u32, Ordering::Relaxed);
+        pending.state.store(2, Ordering::Release);
+        return;
+    }
+    record_trace_loss(cpu, type_id);
+}
+
+fn record_trace_loss(cpu: usize, type_id: u64) {
+    for bucket in &PENDING_TRACE_LOSSES[cpu] {
+        let state = bucket.state.load(Ordering::Acquire);
+        if state == 2
+            && bucket.event_id.load(Ordering::Relaxed) == type_id
+            && bucket
+                .state
+                .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            bucket.count.fetch_add(1, Ordering::Relaxed);
+            bucket.state.store(2, Ordering::Release);
+            return;
+        }
+        if state == 0
+            && bucket
+                .state
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            bucket.event_id.store(type_id, Ordering::Relaxed);
+            bucket.count.store(1, Ordering::Relaxed);
+            bucket.state.store(2, Ordering::Release);
+            return;
+        }
+    }
+}
+
+fn capture_dynamic_probe(probe_id: u32, args: narf_tracing::ProbeArgs) {
+    let mut bytes = [0; 32];
+    for (chunk, value) in bytes.chunks_exact_mut(8).zip(args.0) {
+        chunk.copy_from_slice(&value.to_ne_bytes());
+    }
+    capture_trace(u64::from(probe_id), &bytes);
+}
+
+fn ensure_trace_observers() {
+    if TRACE_OBSERVERS_INSTALLED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        narf_tracing::install_event_observer(capture_trace);
+        narf_tracing::install_probe_observer(capture_dynamic_probe);
+    }
+}
+
+fn deliver_sigtrap(event: &PerfEventFile, task: u64) {
+    if event.attr.flags & PERF_ATTR_FLAG_SIGTRAP == 0 {
+        return;
+    }
+    const SIGTRAP: u32 = 5;
+    const TRAP_PERF: i32 = 6;
+    if crate::handlers::store_sigqueue_info(task, SIGTRAP, TRAP_PERF, event.attr.sig_data, 0) {
+        crate::handlers::raise_signal_pending(task, SIGTRAP);
+    }
+}
+
+fn capture_pending_sample(cpu: usize, counters: u8) -> bool {
+    let start = PENDING_SAMPLE_CURSOR[cpu].fetch_add(1, Ordering::Relaxed);
+    let mut claimed = None;
+    for offset in 0..PENDING_SAMPLE_DEPTH {
+        let pending = &PENDING_SAMPLES[cpu][rotation_index(start, offset, PENDING_SAMPLE_DEPTH)];
+        if pending
+            .state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            claimed = Some(pending);
+            break;
+        }
+    }
+    let Some(pending) = claimed else {
+        record_pending_loss(cpu, counters);
+        return false;
+    };
+
     pending
         .task
         .store(crate::handlers::current_task_id(), Ordering::Relaxed);
@@ -1625,15 +2360,65 @@ fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
         .time
         .store(narf_time::monotonic_ns(), Ordering::Relaxed);
     pending.counters.store(counters, Ordering::Relaxed);
-    for (idx, event_id) in pending.event_ids.iter().enumerate() {
-        if counters & (1 << idx) != 0 {
-            event_id.store(
-                ACTIVE_SAMPLE_IDS[cpu][idx].load(Ordering::Acquire),
-                Ordering::Relaxed,
-            );
+    if let Some(state) = narf_interrupts::interrupted_user_state() {
+        pending.user_regs_abi.store(state.abi, Ordering::Relaxed);
+        pending.user_sp.store(state.sp, Ordering::Relaxed);
+        for (dst, value) in pending.user_regs.iter().zip(state.regs) {
+            dst.store(value, Ordering::Relaxed);
         }
+        let stack_bytes = (0..8)
+            .filter(|idx| counters & (1 << idx) != 0)
+            .map(|idx| ACTIVE_SAMPLE_STACK_BYTES[cpu][idx].load(Ordering::Relaxed) as usize)
+            .max()
+            .unwrap_or(0)
+            .min(PERF_MAX_USER_STACK_SAMPLE);
+        let copied = if stack_bytes == 0 {
+            0
+        } else if let Some(address_space) = narf_scheduler::current_address_space() {
+            // SAFETY: this producer exclusively owns the claimed state-1 slot.
+            let stack = unsafe {
+                core::slice::from_raw_parts_mut(pending.user_stack.as_mut_ptr(), stack_bytes)
+            };
+            address_space.copy_user_bytes_nofault(narf_memory::VirtAddr::new(state.sp), stack)
+        } else {
+            0
+        };
+        pending
+            .user_stack_size
+            .store(copied as u32, Ordering::Relaxed);
+        pending.user_regs_valid.store(true, Ordering::Relaxed);
+    } else {
+        pending.user_regs_valid.store(false, Ordering::Relaxed);
+        pending.user_stack_size.store(0, Ordering::Relaxed);
+    }
+    for (idx, active_id) in ACTIVE_SAMPLE_IDS[cpu].iter().enumerate() {
+        if counters & (1 << idx) == 0 {
+            continue;
+        }
+        pending.event_ids[idx].store(active_id.load(Ordering::Acquire), Ordering::Relaxed);
+        #[cfg(target_arch = "x86_64")]
+        let period = narf_arch::x86_64::pmu::last_overflow_period(cpu, idx);
+        #[cfg(target_arch = "aarch64")]
+        let period = if idx == 0 {
+            narf_arch::aarch64::pmu::last_overflow_period(cpu)
+        } else {
+            narf_arch::aarch64::pmu::programmable_period(cpu, idx - 1)
+        };
+        pending.periods[idx].store(period, Ordering::Relaxed);
     }
     pending.state.store(2, Ordering::Release);
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
+    // SAFETY: this handler is installed only on LVT-PC and runs at CPL0.
+    let counters = unsafe { narf_arch::x86_64::pmu::handle_sampling_overflow() };
+    if counters == 0 {
+        return narf_interrupts::IrqStatus::None;
+    }
+    let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
+    let _ = capture_pending_sample(cpu, counters);
     // Wake a parked poll/epoll task so its syscall re-enters normal context
     // and drains this allocation-free IRQ snapshot into the mmap ring.
     narf_net::readiness::notify(0);
@@ -1656,34 +2441,7 @@ fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
         return narf_interrupts::IrqStatus::None;
     }
     let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
-    let pending = &PENDING_SAMPLES[cpu];
-    if pending
-        .state
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
-        PENDING_SAMPLE_LOST.fetch_add(1, Ordering::Relaxed);
-        return narf_interrupts::IrqStatus::Handled;
-    }
-    pending
-        .task
-        .store(crate::handlers::current_task_id(), Ordering::Relaxed);
-    pending
-        .ip
-        .store(narf_interrupts::interrupted_ip(), Ordering::Relaxed);
-    pending
-        .time
-        .store(narf_time::monotonic_ns(), Ordering::Relaxed);
-    pending.counters.store(counters, Ordering::Relaxed);
-    for (idx, event_id) in pending.event_ids.iter().enumerate() {
-        if counters & (1 << idx) != 0 {
-            event_id.store(
-                ACTIVE_SAMPLE_IDS[cpu][idx].load(Ordering::Acquire),
-                Ordering::Relaxed,
-            );
-        }
-    }
-    pending.state.store(2, Ordering::Release);
+    let _ = capture_pending_sample(cpu, counters);
     narf_net::readiness::notify(0);
     narf_interrupts::IrqStatus::Handled
 }
@@ -1728,80 +2486,163 @@ fn ensure_pmi_route() -> Result<(), ()> {
 /// record encoding and readiness wakeups happen here where allocation is safe.
 pub(crate) fn drain_irq_samples() {
     let mut notify = false;
-    let deferred_lost = PENDING_SAMPLE_LOST.swap(0, Ordering::AcqRel);
-    for (_source_cpu, pending) in PENDING_SAMPLES.iter().enumerate() {
-        if pending
-            .state
-            .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            continue;
+    {
+        let registry = PERF_EVENT_REGISTRY.lock();
+        for buckets in &PENDING_LOSSES {
+            for bucket in buckets {
+                if bucket
+                    .state
+                    .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_err()
+                {
+                    continue;
+                }
+                let event_id = bucket.event_id.load(Ordering::Relaxed);
+                let lost = bucket.count.swap(0, Ordering::Relaxed);
+                if lost != 0 {
+                    for weak in registry.iter() {
+                        let Some(event) = weak.upgrade() else {
+                            continue;
+                        };
+                        if event.id == event_id {
+                            event.sample_lost.fetch_add(lost, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+                bucket.event_id.store(0, Ordering::Relaxed);
+                bucket.state.store(0, Ordering::Release);
+            }
         }
-        let task = pending.task.load(Ordering::Relaxed);
-        let ip = pending.ip.load(Ordering::Relaxed);
-        let now = pending.time.load(Ordering::Relaxed);
-        let counters = pending.counters.load(Ordering::Relaxed);
-        {
+    }
+    for (source_cpu, pending_ring) in PENDING_SAMPLES.iter().enumerate() {
+        for pending in pending_ring {
+            if pending
+                .state
+                .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            let task = pending.task.load(Ordering::Relaxed);
+            let ip = pending.ip.load(Ordering::Relaxed);
+            let now = pending.time.load(Ordering::Relaxed);
+            let counters = pending.counters.load(Ordering::Relaxed);
+            let user_state = pending.user_regs_valid.load(Ordering::Relaxed).then(|| {
+                let mut regs = [0; 34];
+                for (dst, source) in regs.iter_mut().zip(pending.user_regs.iter()) {
+                    *dst = source.load(Ordering::Relaxed);
+                }
+                narf_interrupts::InterruptedUserState {
+                    user: true,
+                    abi: pending.user_regs_abi.load(Ordering::Relaxed),
+                    ip,
+                    sp: pending.user_sp.load(Ordering::Relaxed),
+                    regs,
+                }
+            });
+            let stack_size = pending.user_stack_size.load(Ordering::Relaxed) as usize;
+            // SAFETY: this consumer exclusively owns the acquired state-1 slot.
+            let user_stack = unsafe { pending.user_stack.slice(stack_size) };
+            {
+                let registry = PERF_EVENT_REGISTRY.lock();
+                for weak in registry.iter() {
+                    let Some(event) = weak.upgrade() else {
+                        continue;
+                    };
+                    let matched_counter = (0..8).find(|&idx| {
+                        counters & (1 << idx) != 0
+                            && pending.event_ids[idx].load(Ordering::Relaxed) == event.id
+                    });
+                    if let Some(matched_counter) = matched_counter {
+                        if !event.enabled.load(Ordering::Acquire)
+                            || !event.accepts_sample_from(source_cpu, task)
+                        {
+                            continue;
+                        }
+                        let period = pending.periods[matched_counter].load(Ordering::Relaxed);
+                        event.last_sample_period.store(period, Ordering::Release);
+                        event.count_accumulated.fetch_add(period, Ordering::AcqRel);
+                        let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
+                        notify |= event.sample_record(
+                            ip,
+                            pid,
+                            task as u32,
+                            now,
+                            user_state.as_ref(),
+                            user_stack,
+                            &[],
+                        );
+                        deliver_sigtrap(&event, task);
+                        event.adjust_frequency_period(now);
+                        notify |= event.consume_refresh();
+                    }
+                }
+            }
+            pending.state.store(0, Ordering::Release);
+        }
+    }
+    for buckets in &PENDING_TRACE_LOSSES {
+        for bucket in buckets {
+            if bucket
+                .state
+                .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            let type_id = bucket.event_id.load(Ordering::Relaxed);
+            let lost = bucket.count.swap(0, Ordering::Relaxed);
+            let registry = PERF_EVENT_REGISTRY.lock();
+            for weak in registry.iter() {
+                if let Some(event) = weak.upgrade() {
+                    if event.attr.type_ == PERF_TYPE_TRACEPOINT && event.attr.config == type_id {
+                        event.sample_lost.fetch_add(lost, Ordering::Relaxed);
+                    }
+                }
+            }
+            bucket.event_id.store(0, Ordering::Relaxed);
+            bucket.state.store(0, Ordering::Release);
+        }
+    }
+    for (source_cpu, pending_ring) in PENDING_TRACES.iter().enumerate() {
+        for pending in pending_ring {
+            if pending
+                .state
+                .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            let type_id = pending.type_id.load(Ordering::Relaxed);
+            let task = pending.task.load(Ordering::Relaxed);
+            let ip = pending.ip.load(Ordering::Relaxed);
+            let now = pending.time.load(Ordering::Relaxed);
+            let len = pending.len.load(Ordering::Relaxed) as usize;
+            // SAFETY: this consumer owns the acquired state-1 slot.
+            let raw =
+                unsafe { core::slice::from_raw_parts(pending.bytes.0.as_ptr().cast::<u8>(), len) };
             let registry = PERF_EVENT_REGISTRY.lock();
             for weak in registry.iter() {
                 let Some(event) = weak.upgrade() else {
                     continue;
                 };
-                let matched_counter = (0..8).find(|&idx| {
-                    if counters & (1 << idx) == 0 {
-                        return false;
-                    }
-                    if pending.event_ids[idx].load(Ordering::Relaxed) == event.id {
-                        return true;
-                    }
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        event
-                            .pmu_counter
-                            .is_some_and(|counter| counter.idx as usize == idx)
-                    }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    false
-                });
-                if let Some(_matched_counter) = matched_counter {
-                    if !event.enabled.load(Ordering::Acquire) || !event.tracks_task(task) {
-                        continue;
-                    }
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        let period = narf_arch::x86_64::pmu::last_overflow_period(
-                            _source_cpu,
-                            _matched_counter,
-                        );
-                        event.last_sample_period.store(period, Ordering::Release);
-                        event.count_accumulated.fetch_add(period, Ordering::AcqRel);
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        let period = if _matched_counter == 0 {
-                            narf_arch::aarch64::pmu::last_overflow_period(_source_cpu)
-                        } else {
-                            narf_arch::aarch64::pmu::programmable_period(
-                                _source_cpu,
-                                _matched_counter - 1,
-                            )
-                        };
-                        event.last_sample_period.store(period, Ordering::Release);
-                        event.count_accumulated.fetch_add(period, Ordering::AcqRel);
-                    }
-                    if deferred_lost != 0 {
-                        event
-                            .sample_lost
-                            .fetch_add(deferred_lost, Ordering::Relaxed);
-                    }
-                    let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
-                    notify |= event.sample_record(ip, pid, task as u32, now);
-                    event.adjust_frequency_period(now);
-                    notify |= event.consume_refresh();
+                if event.attr.type_ != PERF_TYPE_TRACEPOINT
+                    || event.attr.config != type_id
+                    || !event.enabled.load(Ordering::Acquire)
+                    || !event.accepts_sample_from(source_cpu, task)
+                {
+                    continue;
                 }
+                event.count_accumulated.fetch_add(1, Ordering::AcqRel);
+                event.last_sample_period.store(1, Ordering::Release);
+                let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
+                notify |= event.sample_record(ip, pid, task as u32, now, None, &[], raw);
+                notify |= event.consume_refresh();
             }
+            drop(registry);
+            pending.state.store(0, Ordering::Release);
         }
-        pending.state.store(0, Ordering::Release);
     }
     if notify {
         narf_net::readiness::notify(0);
@@ -1817,12 +2658,38 @@ pub(crate) fn sample_from_irq_for_test(task: u64, ip: u64) {
         };
         if event.enabled.load(Ordering::Acquire) && event.tracks_task(task) {
             let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
-            let _ = event.sample_record(ip, pid, task as u32, now);
+            let _ = event.sample_record(ip, pid, task as u32, now, None, &[], &[]);
+            deliver_sigtrap(&event, task);
             if event.consume_refresh() {
                 narf_net::readiness::notify(0);
             }
         }
     }
+}
+
+pub(crate) fn sample_fd_for_test(fd_num: u32, task: u64, ip: u64) -> bool {
+    let now = narf_time::monotonic_ns();
+    let owner = crate::handlers::current_task_id();
+    fd::with_table(owner, |table| {
+        if let Some(event) = table
+            .get(fd_num)
+            .and_then(|entry| entry.ops.as_any())
+            .and_then(|any| any.downcast_ref::<PerfEventFile>())
+        {
+            if !event.enabled.load(Ordering::Acquire) || !event.tracks_task(task) {
+                return false;
+            }
+            let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
+            let _ = event.sample_record(ip, pid, task as u32, now, None, &[], &[]);
+            deliver_sigtrap(event, task);
+            if event.consume_refresh() {
+                narf_net::readiness::notify(0);
+            }
+            return true;
+        }
+        false
+    })
+    .unwrap_or(false)
 }
 
 pub(crate) fn event_tracks_task_for_test(fd_num: u32, task: u64) -> bool {
@@ -1855,6 +2722,64 @@ pub(crate) fn event_refresh_state_for_test(fd_num: u32) -> Option<(bool, u32, bo
     .flatten()
 }
 
+fn event_group_id(event: &PerfEventFile) -> u64 {
+    event
+        ._group_leader
+        .as_ref()
+        .and_then(|leader| leader.as_any())
+        .and_then(|any| any.downcast_ref::<PerfEventFile>())
+        .map_or(event.id, |leader| leader.id)
+}
+
+fn event_active_on_cpu(event: &PerfEventFile, cpu: usize) -> bool {
+    if event.pmu_counter.is_some() {
+        return event.enabled.load(Ordering::Acquire);
+    }
+    event.active_task_counters.lock()[cpu].is_some()
+}
+
+fn schedule_group(leader: &PerfEventFile, cpu: usize, registry: &[Weak<PerfEventFile>]) -> bool {
+    debug_assert!(leader.is_group_leader());
+    if registry.iter().filter_map(Weak::upgrade).any(|event| {
+        event_group_id(&event) != leader.id
+            && event_active_on_cpu(&event, cpu)
+            && (leader.is_exclusive() || event.is_exclusive())
+    }) {
+        return false;
+    }
+
+    if !leader.task_switch(cpu, true) {
+        return false;
+    }
+    let members = leader.group_members.lock();
+    for weak in members.iter() {
+        let Some(file) = weak.upgrade() else {
+            continue;
+        };
+        let Some(event) = file
+            .as_any()
+            .and_then(|any| any.downcast_ref::<PerfEventFile>())
+        else {
+            continue;
+        };
+        if !event.task_switch(cpu, true) {
+            leader.task_switch(cpu, false);
+            for rollback in members.iter() {
+                if let Some(file) = rollback.upgrade() {
+                    if let Some(member) = file
+                        .as_any()
+                        .and_then(|any| any.downcast_ref::<PerfEventFile>())
+                    {
+                        member.task_switch(cpu, false);
+                    }
+                }
+            }
+            return false;
+        }
+    }
+    true
+}
+
 /// Scheduler PMU context hook. Runs outside scheduler queue locks and brackets
 /// the matching task continuation on the current logical CPU.
 pub(crate) fn on_task_switch(task: u64, running: bool) {
@@ -1864,15 +2789,209 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
     }
     let cpu = narf_lib::percpu::current_cpu();
     let mut registry = PERF_EVENT_REGISTRY.lock();
-    registry.retain(|weak| {
-        let Some(event) = weak.upgrade() else {
-            return false;
-        };
-        if event.tracks_task(task) {
-            event.task_switch(cpu, running);
+    registry.retain(|weak| weak.strong_count() != 0);
+    if registry.is_empty() {
+        return;
+    }
+
+    if !running {
+        for weak in registry.iter() {
+            if let Some(event) = weak.upgrade() {
+                if event.tracks_task(task) {
+                    event.task_switch(cpu, false);
+                }
+            }
         }
-        true
-    });
+        return;
+    }
+
+    // Record every selected task, including one without a perf event. Otherwise
+    // A -> unmonitored B -> A would look like immediate re-entry into A.
+    let previous_task = PERF_LAST_SELECTED_TASK[cpu].swap(task, Ordering::Relaxed);
+
+    // Pinned groups have priority over every flexible group. Failure is
+    // observable through EOF on read, matching PERF_EVENT_STATE_ERROR.
+    for weak in registry.iter() {
+        let Some(event) = weak.upgrade() else {
+            continue;
+        };
+        if event.enabled.load(Ordering::Acquire)
+            && event.is_task_hardware_event()
+            && event.tracks_task(task)
+            && event.is_group_leader()
+            && event.is_pinned()
+            && !schedule_group(&event, cpu, &registry)
+        {
+            event.scheduling_error.store(true, Ordering::Release);
+        }
+    }
+
+    // Allocation failures are expected when a task has more enabled flexible
+    // events than physical counters. Rotate across that eligible set only:
+    // perf also opens software dummy/metadata events, and including those in
+    // the cursor would starve hardware events at stable registry positions.
+    let mut anchor = None;
+    let eligible = registry
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|event| {
+            event.enabled.load(Ordering::Acquire)
+                && event.is_task_hardware_event()
+                && event.tracks_task(task)
+                && event.is_group_leader()
+                && !event.is_pinned()
+        })
+        .inspect(|event| {
+            if anchor.is_none() {
+                anchor = Some(event.clone());
+            }
+        })
+        .count();
+    if eligible == 0 {
+        return;
+    }
+    // `poll_to_yield` brackets every stackful execution interval, including a
+    // syscall that returns to and immediately reselects the same task. That
+    // boundary must stop the PMU so executor time is not charged, but it is not
+    // a task/context switch and therefore must not advance the multiplex epoch.
+    // The first live eligible event owns the task's cursor. Keeping it with an
+    // event rather than a CPU preserves rotation progress when the task
+    // migrates; the registry's stable creation order makes every CPU select the
+    // same anchor.
+    let anchor = anchor.expect("eligible perf event has an anchor");
+    let cursor = anchor.multiplex_cursor.load(Ordering::Relaxed);
+    let next_cursor = advance_rotation_cursor(previous_task, task, cursor);
+    if next_cursor != cursor {
+        anchor
+            .multiplex_cursor
+            .store(next_cursor, Ordering::Relaxed);
+    }
+    let start = next_cursor % eligible;
+
+    // Two passes implement a circular walk without allocating in the scheduler
+    // context: [start, eligible), then [0, start).
+    for pass in 0..2 {
+        let mut ordinal = 0;
+        for weak in registry.iter() {
+            let Some(event) = weak.upgrade() else {
+                continue;
+            };
+            if !event.enabled.load(Ordering::Acquire)
+                || !event.is_task_hardware_event()
+                || !event.tracks_task(task)
+                || !event.is_group_leader()
+                || event.is_pinned()
+            {
+                continue;
+            }
+            let selected = if pass == 0 {
+                ordinal >= start
+            } else {
+                ordinal < start
+            };
+            ordinal += 1;
+            if selected {
+                let _ = schedule_group(&event, cpu, &registry);
+            }
+        }
+    }
+}
+
+/// Rotate oversubscribed task hardware events from the user-mode timer tick.
+///
+/// This is allocation-free and uses only IRQ-safe locks. Sampled events carry
+/// their exact hardware `period_left` through the stop/reallocate path.
+pub(crate) fn on_multiplex_tick(task: u64) {
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    let now = narf_time::monotonic_ns();
+    let last = PERF_LAST_MULTIPLEX_NS[cpu].load(Ordering::Relaxed);
+    if !multiplex_quantum_due(last, now)
+        || PERF_LAST_MULTIPLEX_NS[cpu]
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+
+    let mut registry = PERF_EVENT_REGISTRY.lock();
+    registry.retain(|weak| weak.strong_count() != 0);
+
+    let is_eligible = |event: &PerfEventFile| {
+        event.enabled.load(Ordering::Acquire)
+            && event.is_task_hardware_event()
+            && event.tracks_task(task)
+            && event.is_group_leader()
+            && !event.is_pinned()
+    };
+    let mut anchor = None;
+    let eligible = registry
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|event| is_eligible(event))
+        .inspect(|event| {
+            if anchor.is_none() {
+                anchor = Some(event.clone());
+            }
+        })
+        .count();
+    if eligible < 2 {
+        return;
+    }
+    let waiting = registry
+        .iter()
+        .filter_map(Weak::upgrade)
+        .any(|event| is_eligible(&event) && event.active_task_counters.lock()[cpu].is_none());
+    if !waiting {
+        return;
+    }
+
+    for weak in registry.iter() {
+        if let Some(event) = weak.upgrade() {
+            if is_eligible(&event) {
+                event.task_switch(cpu, false);
+                for member in event.group_members.lock().iter() {
+                    if let Some(file) = member.upgrade() {
+                        if let Some(member) = file
+                            .as_any()
+                            .and_then(|any| any.downcast_ref::<PerfEventFile>())
+                        {
+                            member.task_switch(cpu, false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let start = anchor
+        .expect("eligible perf event has an anchor")
+        .multiplex_cursor
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        % eligible;
+    for pass in 0..2 {
+        let mut ordinal = 0;
+        for weak in registry.iter() {
+            let Some(event) = weak.upgrade() else {
+                continue;
+            };
+            if !is_eligible(&event) {
+                continue;
+            }
+            let selected = if pass == 0 {
+                ordinal >= start
+            } else {
+                ordinal < start
+            };
+            ordinal += 1;
+            if selected {
+                let _ = schedule_group(&event, cpu, &registry);
+            }
+        }
+    }
 }
 
 fn account_cpu_user_switch(running: bool) {
@@ -1959,7 +3078,12 @@ impl Drop for PerfEventFile {
 impl FileOps for PerfEventFile {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            let (value, time_enabled) = self.snapshot();
+            // Linux exposes a pinned group which could not be scheduled as
+            // EOF, rather than returning a fabricated zero count.
+            if self.scheduling_error.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            let (value, time_enabled, time_running) = self.snapshot();
             let format = self.attr.read_format;
             let mut cursor = 0;
 
@@ -1970,7 +3094,7 @@ impl FileOps for PerfEventFile {
                     Self::push_word(buf, &mut cursor, time_enabled)?;
                 }
                 if format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
-                    Self::push_word(buf, &mut cursor, time_enabled)?;
+                    Self::push_word(buf, &mut cursor, time_running)?;
                 }
                 Self::push_word(buf, &mut cursor, value)?;
                 if format & PERF_FORMAT_ID != 0 {
@@ -1984,7 +3108,7 @@ impl FileOps for PerfEventFile {
                         .as_any()
                         .and_then(|any| any.downcast_ref::<PerfEventFile>())
                         .ok_or(FsError::InvalidData)?;
-                    let (member_value, _) = event.snapshot();
+                    let (member_value, _, _) = event.snapshot();
                     Self::push_word(buf, &mut cursor, member_value)?;
                     if format & PERF_FORMAT_ID != 0 {
                         Self::push_word(buf, &mut cursor, event.id)?;
@@ -2003,7 +3127,7 @@ impl FileOps for PerfEventFile {
                     Self::push_word(buf, &mut cursor, time_enabled)?;
                 }
                 if format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
-                    Self::push_word(buf, &mut cursor, time_enabled)?;
+                    Self::push_word(buf, &mut cursor, time_running)?;
                 }
                 if format & PERF_FORMAT_ID != 0 {
                     Self::push_word(buf, &mut cursor, self.id)?;
@@ -2276,13 +3400,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     // bits need scheduler/process integration; ignoring them would fabricate
     // compatibility.
     let unsupported_attr_flags = attr.flags & !PERF_ATTR_IMPLEMENTED;
-    let empty_bpf_sideband_dummy = attr.type_ == PERF_TYPE_SOFTWARE
-        && attr.config == PERF_COUNT_SW_DUMMY
-        && attr.flags & PERF_ATTR_FLAG_BPF_EVENT != 0
-        && attr.sample_period_or_freq == 0;
-    if unsupported_attr_flags != 0
-        && !(unsupported_attr_flags == PERF_ATTR_FLAG_WATERMARK && empty_bpf_sideband_dummy)
-    {
+    if unsupported_attr_flags != 0 {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
@@ -2305,13 +3423,59 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
+    if attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0
+        && attr.flags & PERF_ATTR_FLAG_EXCLUDE_USER != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    if attr.flags & PERF_ATTR_FLAG_SIGTRAP != 0
+        && (pid == -1 || attr.flags & PERF_ATTR_FLAG_REMOVE_ON_EXEC == 0)
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    if attr.flags & PERF_ATTR_FLAG_REMOVE_ON_EXEC != 0
+        && attr.flags & PERF_ATTR_FLAG_ENABLE_ON_EXEC != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let supported_user_regs = (1u64 << 20) - 1;
+    #[cfg(target_arch = "aarch64")]
+    let supported_user_regs = (1u64 << 34) - 1;
+    if attr.sample_type & PERF_SAMPLE_REGS_USER != 0
+        && attr.sample_regs_user & !supported_user_regs != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        return;
+    }
+    if attr.sample_type & PERF_SAMPLE_STACK_USER != 0
+        && attr.sample_stack_user as usize > PERF_MAX_USER_STACK_SAMPLE
+    {
+        ctx.set_return(SyscallReturn::ok((-7i64) as u64)); // E2BIG
+        return;
+    }
+    // Linux overlays these two fields in a union; requesting both is
+    // ambiguous and rejected by the kernel rather than serialized twice.
+    if attr.sample_type & PERF_SAMPLE_WEIGHT != 0
+        && attr.sample_type & PERF_SAMPLE_WEIGHT_STRUCT != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
 
     if !is_supported_event(&attr) {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
-
+    if attr.type_ == PERF_TYPE_TRACEPOINT {
+        ensure_trace_observers();
+    }
     let task = current_task_id();
+    let count_kernel = attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0;
+    let count_user = attr.flags & PERF_ATTR_FLAG_EXCLUDE_USER == 0;
 
     let target_task = if pid == 0 {
         task
@@ -2373,10 +3537,46 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
             return;
         }
+        // Linux permits these scheduling constraints only on the leader; the
+        // complete group inherits them and is scheduled atomically.
+        if attr.flags & (PERF_ATTR_FLAG_PINNED | PERF_ATTR_FLAG_EXCLUSIVE) != 0 {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
+        }
         Some(leader)
     } else {
         None
     };
+
+    // CPU-scoped counters remain physically allocated for the fd lifetime.
+    // Enforce exclusive ownership before touching the PMU. A sibling of the
+    // exclusive leader belongs to the same atomic group and is the sole
+    // exception.
+    if pid == -1 && !matches!(attr.type_, PERF_TYPE_SOFTWARE | PERF_TYPE_TRACEPOINT) {
+        let requested_group = group_leader
+            .as_ref()
+            .and_then(|leader| leader.as_any())
+            .and_then(|any| any.downcast_ref::<PerfEventFile>())
+            .map(|leader| leader.id);
+        let conflict = PERF_EVENT_REGISTRY
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|event| {
+                event.target_task == u64::MAX
+                    && event.target_cpu == cpu
+                    && event.attr.type_ != PERF_TYPE_SOFTWARE
+                    && Some(event_group_id(event)) != requested_group
+            })
+            .any(|event| {
+                attr.flags & PERF_ATTR_FLAG_EXCLUSIVE != 0
+                    || event.attr.flags & PERF_ATTR_FLAG_EXCLUSIVE != 0
+            });
+        if conflict {
+            ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
+            return;
+        }
+    }
 
     // Try to allocate PMU counter if target_arch is x86_64
     #[cfg(target_arch = "x86_64")]
@@ -2437,7 +3637,9 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 // Validate that this CPU exposes a real backend and mapping.
                 // The actual counter is allocated on each task switch-in.
                 // SAFETY: syscall context at CPL0 on the current CPU.
-                let probe = match unsafe { narf_arch::x86_64::pmu::alloc_counter(event) } {
+                let probe = match unsafe {
+                    narf_arch::x86_64::pmu::alloc_counter_filtered(event, count_kernel, count_user)
+                } {
                     Ok(counter) => counter,
                     Err(narf_arch::x86_64::pmu::PmuError::NoFreeCounter) => {
                         ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
@@ -2452,7 +3654,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 unsafe { narf_arch::x86_64::pmu::release(probe) };
                 (Some(event), None)
             } else {
-                match allocate_pmu_on(cpu as usize, event) {
+                match allocate_pmu_on(cpu as usize, event, count_kernel, count_user) {
                     Ok(counter) => (Some(event), Some(counter)),
                     Err(narf_arch::x86_64::pmu::PmuError::NoFreeCounter) => {
                         ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
@@ -2464,7 +3666,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                     }
                 }
             }
-        } else if attr.type_ == PERF_TYPE_SOFTWARE {
+        } else if matches!(attr.type_, PERF_TYPE_SOFTWARE | PERF_TYPE_TRACEPOINT) {
             (None, None)
         } else {
             ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
@@ -2476,7 +3678,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let (pmu_event, pmu_counter) = if let Some(event) = aarch_pmu_event(&attr) {
         if pid != -1 {
             // SAFETY: syscall runs at EL1 on the current CPU; probe is released below.
-            let probe = match unsafe { event.allocate() } {
+            let probe = match unsafe { event.allocate(count_kernel, count_user) } {
                 Ok(counter) => counter,
                 Err(narf_arch::aarch64::pmu::PmuError::NoFreeCounter) => {
                     ctx.set_return(SyscallReturn::ok((-16i64) as u64));
@@ -2492,7 +3694,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             (Some(event), None)
         } else {
             // SAFETY: syscall runs at EL1 on the current CPU.
-            match unsafe { event.allocate() } {
+            match unsafe { event.allocate(count_kernel, count_user) } {
                 Ok(counter) => (Some(event), Some(counter)),
                 Err(narf_arch::aarch64::pmu::PmuError::NoFreeCounter) => {
                     ctx.set_return(SyscallReturn::ok((-16i64) as u64));
@@ -2504,7 +3706,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 }
             }
         }
-    } else if attr.type_ == PERF_TYPE_SOFTWARE {
+    } else if matches!(attr.type_, PERF_TYPE_SOFTWARE | PERF_TYPE_TRACEPOINT) {
         (None, None)
     } else {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64));
@@ -2540,14 +3742,19 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 // Task-scoped counters are allocated on switch-in, but validate
                 // overflow support and the requested period synchronously.
                 // SAFETY: syscall context at CPL0.
-                validation_counter =
-                    match unsafe { narf_arch::x86_64::pmu::alloc_counter(pmu_event) } {
-                        Ok(counter) => counter,
-                        Err(_) => {
-                            ctx.set_return(SyscallReturn::ok((-95i64) as u64));
-                            return;
-                        }
-                    };
+                validation_counter = match unsafe {
+                    narf_arch::x86_64::pmu::alloc_counter_filtered(
+                        pmu_event,
+                        count_kernel,
+                        count_user,
+                    )
+                } {
+                    Ok(counter) => counter,
+                    Err(_) => {
+                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        return;
+                    }
+                };
                 &validation_counter
             };
             let armed = arm_pmu_on(*counter, period);
@@ -2561,7 +3768,9 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 release_pmu_on(*counter);
             }
             period
-        } else if attr.type_ == PERF_TYPE_SOFTWARE && attr.config == PERF_COUNT_SW_DUMMY {
+        } else if (attr.type_ == PERF_TYPE_SOFTWARE && attr.config == PERF_COUNT_SW_DUMMY)
+            || attr.type_ == PERF_TYPE_TRACEPOINT
+        {
             attr.sample_period_or_freq
         } else {
             ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
@@ -2573,58 +3782,63 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
 
     #[cfg(target_arch = "aarch64")]
     let sample_period = if attr.sample_period_or_freq != 0 {
-        if pmu_event.is_none() || ensure_pmi_route().is_err() {
-            if let Some(counter) = pmu_counter {
-                // SAFETY: open still exclusively owns this current-CPU allocation.
-                let _ = unsafe { counter.release() };
-            }
-            ctx.set_return(SyscallReturn::ok((-95i64) as u64));
-            return;
-        }
-        let validation;
-        let counter = if let Some(counter) = pmu_counter.as_ref() {
-            counter
-        } else {
-            // SAFETY: syscall runs at EL1 on the current CPU.
-            validation = match unsafe { pmu_event.unwrap().allocate() } {
-                Ok(counter) => counter,
-                Err(_) => {
-                    ctx.set_return(SyscallReturn::ok((-95i64) as u64));
-                    return;
-                }
-            };
-            &validation
-        };
-        let period = if attr.flags & PERF_ATTR_FLAG_FREQ != 0 {
-            // Start from the architectural counter clock. Feedback from real
-            // overflow timing refines this initial estimate.
-            match pmu_event.unwrap() {
-                AarchPmuEvent::Cycle => narf_arch::aarch64::timer::frequency_hz()
-                    .checked_div(attr.sample_period_or_freq)
-                    .unwrap_or(1)
-                    .max(narf_arch::aarch64::pmu::minimum_sample_period()),
-                AarchPmuEvent::Programmable(_) => 100_000,
-            }
-        } else {
+        if attr.type_ == PERF_TYPE_TRACEPOINT {
             attr.sample_period_or_freq
-        };
-        // SAFETY: open owns this current-CPU counter and the PMU PPI is routed.
-        let arm_failed = unsafe { (*counter).arm(period) }.is_err();
-        if counter.sample_slot() >= 8 || arm_failed {
+        } else {
+            if pmu_event.is_none() || ensure_pmi_route().is_err() {
+                if let Some(counter) = pmu_counter {
+                    // SAFETY: open still exclusively owns this current-CPU allocation.
+                    let _ = unsafe { counter.release() };
+                }
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                return;
+            }
+            let validation;
+            let counter = if let Some(counter) = pmu_counter.as_ref() {
+                counter
+            } else {
+                // SAFETY: syscall runs at EL1 on the current CPU.
+                validation = match unsafe { pmu_event.unwrap().allocate(count_kernel, count_user) }
+                {
+                    Ok(counter) => counter,
+                    Err(_) => {
+                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        return;
+                    }
+                };
+                &validation
+            };
+            let period = if attr.flags & PERF_ATTR_FLAG_FREQ != 0 {
+                // Start from the architectural counter clock. Feedback from real
+                // overflow timing refines this initial estimate.
+                match pmu_event.unwrap() {
+                    AarchPmuEvent::Cycle => narf_arch::aarch64::timer::frequency_hz()
+                        .checked_div(attr.sample_period_or_freq)
+                        .unwrap_or(1)
+                        .max(narf_arch::aarch64::pmu::minimum_sample_period()),
+                    AarchPmuEvent::Programmable(_) => 100_000,
+                }
+            } else {
+                attr.sample_period_or_freq
+            };
+            // SAFETY: open owns this current-CPU counter and the PMU PPI is routed.
+            let arm_failed = unsafe { (*counter).arm(period) }.is_err();
+            if counter.sample_slot() >= 8 || arm_failed {
+                if pmu_counter.is_none() {
+                    // SAFETY: validation counter remains live and current-CPU-owned.
+                    let _ = unsafe { (*counter).release() };
+                }
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                return;
+            }
+            // SAFETY: the live current-CPU counter remains owned by this open path.
+            let _ = unsafe { (*counter).pause() };
             if pmu_counter.is_none() {
                 // SAFETY: validation counter remains live and current-CPU-owned.
                 let _ = unsafe { (*counter).release() };
             }
-            ctx.set_return(SyscallReturn::ok((-95i64) as u64));
-            return;
+            period
         }
-        // SAFETY: the live current-CPU counter remains owned by this open path.
-        let _ = unsafe { (*counter).pause() };
-        if pmu_counter.is_none() {
-            // SAFETY: validation counter remains live and current-CPU-owned.
-            let _ = unsafe { (*counter).release() };
-        }
-        period
     } else {
         0
     };
@@ -2646,10 +3860,14 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             target_cpu: cpu,
             inherited_tasks: IrqSafeSpinLock::new(Vec::new()),
             enabled: AtomicBool::new(false),
+            scheduling_error: AtomicBool::new(false),
             count_base: AtomicU64::new(0),
             count_accumulated: AtomicU64::new(0),
             enabled_at_ns: AtomicU64::new(0),
             time_enabled_ns: AtomicU64::new(0),
+            running_at_ns: [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS],
+            time_running_ns: AtomicU64::new(0),
+            multiplex_cursor: AtomicUsize::new(0),
             registered: AtomicBool::new(false),
             sample_lost: AtomicU64::new(0),
             output_paused: AtomicBool::new(false),
@@ -2657,6 +3875,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             refresh_limit: AtomicU32::new(0),
             wakeup_pending: AtomicU32::new(0),
             sample_period: AtomicU64::new(sample_period),
+            sample_period_left: AtomicU64::new(sample_period),
             last_sample_period: AtomicU64::new(sample_period),
             sample_frequency: if attr.flags & PERF_ATTR_FLAG_FREQ != 0 {
                 attr.sample_period_or_freq
@@ -2747,50 +3966,45 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
     match attr.type_ {
         // PERF_TYPE_HARDWARE
         #[cfg(target_arch = "x86_64")]
-        PERF_TYPE_HARDWARE => {
-            attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0
-                && matches!(
-                    attr.config,
-                    PERF_COUNT_HW_CPU_CYCLES
-                        | PERF_COUNT_HW_INSTRUCTIONS
-                        | PERF_COUNT_HW_CACHE_REFERENCES
-                        | PERF_COUNT_HW_CACHE_MISSES
-                        | PERF_COUNT_HW_BRANCH_INSTRUCTIONS
-                        | PERF_COUNT_HW_BRANCH_MISSES
-                )
-        }
+        PERF_TYPE_HARDWARE => matches!(
+            attr.config,
+            PERF_COUNT_HW_CPU_CYCLES
+                | PERF_COUNT_HW_INSTRUCTIONS
+                | PERF_COUNT_HW_CACHE_REFERENCES
+                | PERF_COUNT_HW_CACHE_MISSES
+                | PERF_COUNT_HW_BRANCH_INSTRUCTIONS
+                | PERF_COUNT_HW_BRANCH_MISSES
+        ),
         #[cfg(target_arch = "aarch64")]
-        PERF_TYPE_HARDWARE | PERF_TYPE_RAW => {
-            attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0 && aarch_pmu_event(attr).is_some()
-        }
+        PERF_TYPE_HARDWARE | PERF_TYPE_RAW => aarch_pmu_event(attr).is_some(),
         // PERF_TYPE_SOFTWARE
         PERF_TYPE_SOFTWARE => matches!(
             attr.config,
             PERF_COUNT_SW_DUMMY | PERF_COUNT_SW_CPU_CLOCK | PERF_COUNT_SW_TASK_CLOCK
         ),
+        PERF_TYPE_TRACEPOINT => attr.config != 0,
         // PERF_TYPE_HW_CACHE (3)
         #[cfg(target_arch = "x86_64")]
         PERF_TYPE_HW_CACHE => {
             let cache_id = attr.config & 0xFF;
             let op_id = (attr.config >> 8) & 0xFF;
             let result_id = (attr.config >> 16) & 0xFF;
-            attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0
-                && matches!(
-                    (cache_id, op_id, result_id),
-                    (
-                        PERF_COUNT_HW_CACHE_L1D,
-                        PERF_COUNT_HW_CACHE_OP_READ,
-                        PERF_COUNT_HW_CACHE_RESULT_ACCESS | PERF_COUNT_HW_CACHE_RESULT_MISS,
-                    ) | (
-                        PERF_COUNT_HW_CACHE_LL,
-                        PERF_COUNT_HW_CACHE_OP_READ,
-                        PERF_COUNT_HW_CACHE_RESULT_ACCESS | PERF_COUNT_HW_CACHE_RESULT_MISS,
-                    )
+            matches!(
+                (cache_id, op_id, result_id),
+                (
+                    PERF_COUNT_HW_CACHE_L1D,
+                    PERF_COUNT_HW_CACHE_OP_READ,
+                    PERF_COUNT_HW_CACHE_RESULT_ACCESS | PERF_COUNT_HW_CACHE_RESULT_MISS,
+                ) | (
+                    PERF_COUNT_HW_CACHE_LL,
+                    PERF_COUNT_HW_CACHE_OP_READ,
+                    PERF_COUNT_HW_CACHE_RESULT_ACCESS | PERF_COUNT_HW_CACHE_RESULT_MISS,
                 )
+            )
         }
         // PERF_TYPE_RAW (4)
         #[cfg(target_arch = "x86_64")]
-        PERF_TYPE_RAW => attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0,
+        PERF_TYPE_RAW => true,
         _ => false,
     }
 }

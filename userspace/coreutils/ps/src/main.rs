@@ -47,22 +47,6 @@ unsafe fn cstr_len(p: *const u8) -> usize {
     n
 }
 
-/// Convert a u32 to decimal ASCII, writing into `buf` (at most 10
-/// digits + NUL). Returns the subslice of `buf` that was written.
-fn u32_to_decimal<'a>(mut v: u32, buf: &'a mut [u8; 12]) -> &'a [u8] {
-    if v == 0 {
-        buf[0] = b'0';
-        return &buf[..1];
-    }
-    let mut pos = 12usize;
-    while v > 0 {
-        pos -= 1;
-        buf[pos] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    &buf[pos..]
-}
-
 /// Return true if `bytes` consists entirely of ASCII decimal digits.
 fn all_digits(bytes: &[u8]) -> bool {
     !bytes.is_empty() && bytes.iter().all(|&b| b >= b'0' && b <= b'9')

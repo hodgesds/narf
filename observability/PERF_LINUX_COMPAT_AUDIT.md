@@ -35,10 +35,10 @@ over that authority; it is not a second PMU subsystem.
 | `perf stat -e '{cycles,instructions}'` | event groups and group leader reads | supported slice | Members are linked to the leader; group reads and group lifecycle ioctls cover the non-multiplexed counting case. |
 | `perf stat -a` | per-CPU events and online CPU discovery | supported slice | Per-CPU hardware operations execute on the owning CPU through a synchronous x2APIC rendezvous. Unmodified `perf stat -a -d --per-node` reports both SRAT nodes and real supported counters; scheduler software events and unavailable model-specific cache events remain `<not supported>`. Systems without the required rendezvous backend return `EOPNOTSUPP`. |
 | `perf stat -p PID` | task-scoped accounting | supported slice | Scheduler switch hooks allocate the target's architecture-specific counter only on the CPU where it runs and fold counts across preemption and migration on x86_64 and aarch64. |
-| `perf record` | overflow sampling, mmap metadata/data ring, poll wakeups | partial (x86_64 and aarch64 PMUv3) | Intel architectural PMU and AMD legacy/PerfMonV2 GP counters route real LVT-PC overflow IRQs into SAMPLE/LOST ring records; task counters switch architecture-specific per-CPU PMU state across preemption and migration and inherit across process/thread clones; frequency mode adapts real reload periods from observed overflow timing. On x86_64, system-wide allocation, PMI routing, arm, pause, period update, read, and release execute synchronously on each owning CPU through x2APIC IPIs; unmodified `perf record -a -c ... -e cycles` produces a nonempty data file on an SMP guest. On aarch64, fixed cycle and PMCEID-advertised programmable events are verified end to end through counter preload, firmware-discovered level-sensitive PPI 23, GICv3 dispatch, PMOVS acknowledgement/reload, interrupted-ELR capture, deferred drain, and a visible mmap sample. Exec publishes exact program/interpreter PT_LOAD and stack VMAs, and later mmap/comm/fork/exit paths emit MMAP/MMAP2/COMM/FORK/EXIT with `sample_id_all` trailers. Ring overflow is reported through both `PERF_RECORD_LOST` and `PERF_FORMAT_LOST`; `PERF_EVENT_IOC_PAUSE_OUTPUT` suppresses production until resumed; `PERF_EVENT_IOC_SET_OUTPUT` redirects compatible events into a shared mapped ring; `PERF_EVENT_IOC_REFRESH` budgets genuine overflows and stops with `POLLHUP` on the last credit. |
+| `perf record` | overflow sampling, mmap metadata/data ring, poll wakeups | partial (x86_64 and aarch64 PMUv3) | Intel architectural PMU and AMD legacy/PerfMonV2 GP counters route real LVT-PC overflow IRQs into SAMPLE/LOST ring records; task counters switch architecture-specific per-CPU PMU state across preemption and migration and inherit across process/thread clones; frequency mode adapts real reload periods from observed overflow timing. On x86_64, system-wide allocation, PMI routing, arm, pause, period update, read, and release execute synchronously on each owning CPU through x2APIC IPIs; unmodified `perf record -a -c ... -e cycles` produces a nonempty data file on an SMP guest. On aarch64, fixed cycle and PMCEID-advertised programmable events are verified end to end through counter preload, firmware-discovered level-sensitive PPI 23, GICv3 dispatch, PMOVS acknowledgement/reload, interrupted-ELR capture, deferred drain, and a visible mmap sample. Samples support IP/TID/TIME/ID/STREAM_ID/CPU/PERIOD/IDENTIFIER, authoritative standalone or grouped `PERF_SAMPLE_READ` payloads, an exact interrupted-IP leaf `CALLCHAIN`, real mapped code-page leaf sizes, and Linux unavailable-value encodings for counting-PMU ADDR/WEIGHT/DATA_SRC/TRANSACTION/PHYS_ADDR/DATA_PAGE_SIZE metadata. Exec publishes exact program/interpreter PT_LOAD and stack VMAs, and later mmap/comm/fork/exit paths emit MMAP/MMAP2/COMM/FORK/EXIT with `sample_id_all` trailers. Ring overflow is reported through both `PERF_RECORD_LOST` and `PERF_FORMAT_LOST`; poll wakeups support both record-count and unread-byte watermark modes; `PERF_EVENT_IOC_PAUSE_OUTPUT` suppresses production until resumed; `PERF_EVENT_IOC_SET_OUTPUT` redirects compatible events into a shared mapped ring; `PERF_EVENT_IOC_REFRESH` budgets genuine overflows and stops with `POLLHUP` on the last credit. |
 | `perf report` | perf.data parser, symbols, unwind | userspace-only after record | Kernel ELFs now carry deterministic SHA-1 build IDs and expose the exact GNU note at `/sys/kernel/notes`. Full kernel DSO attribution still requires real kallsyms/relocation metadata; an unmodified record of the no-build-ID BusyBox workload therefore honestly omits `HEADER_BUILD_ID` instead of inventing one. NUMA memory topology is authoritative through SRAT-backed node, CPU-membership, distance, and memory-block sysfs objects. Hybrid CPU topology metadata remains absent pending an authoritative cross-architecture interface. |
 | `perf trace` | tracepoint PMU, tracefs event metadata | unsupported | NARF tracing rings are not yet projected as Linux tracepoints. |
-| `perf top` | sampling plus periodic display | unsupported | Blocked by the same ring/PMI work as `perf record`. |
+| `perf top` | sampling plus periodic display | partial (x86_64 and aarch64 PMUv3) | Uses the same genuine overflow and mmap-ring path as `perf record`, including CPU-scoped attribution for system-wide events. A bounded 64-snapshot per-CPU IRQ ring absorbs bursts and preserves each overflow's event identity and period; full rings report event-attributed loss. Symbolized kernel display remains unavailable while the Linux adapter intentionally restricts `/proc/kallsyms` pending capability authorization. |
 | probes (`kprobe`, `uprobe`) | probe PMUs, tracefs dynamic events | unsupported | Must be capability-gated when added. |
 | cgroup mode | `PERF_FLAG_PID_CGROUP`, cgroup scheduler hooks | unsupported | Deferred with scheduler attribution. |
 | BPF attachment | SET_BPF/QUERY_BPF ioctls, BPF runtime | unsupported | Returns `ENOTTY`; no BPF program loading, execution, attachment, query, or synthesized BPF records are implemented. Perf's `bpf_event` metadata selector is accepted only on its dummy sideband event; because no BPF objects can exist, that event domain is empty and perf may print its normal synthesis warning. |
@@ -52,8 +52,10 @@ Implemented:
   and `E2BIG` for a non-zero unknown tail.
 - Hardware, software, hardware-cache, and raw event parsing on x86_64;
   PMCEID-gated hardware and architectural raw-event parsing on aarch64.
-- Exact scheduler-accounted task clocks and per-CPU user clocks selected with
-  `exclude_kernel`; all-context per-CPU software clocks remain unsupported.
+- Exact scheduler-accounted task and per-CPU clocks support all-context,
+  user-only, and kernel-only selection.
+- Hardware privilege filters program x86 event-select USR/OS bits and
+  aarch64 PMCCFILTR/PMEVTYPER P/U exclusion bits.
 - PID, CPU, group-fd existence, open flags, CLOEXEC, and reserved-field
   validation.
 - Stable fd lifetime and PMU counter release.
@@ -75,9 +77,18 @@ Gaps:
   implemented software event. Returning cycle-derived estimates for cache,
   branch, or stalled-cycle events is incompatible and invalid for performance
   claims.
-- `time_enabled` and `time_running` are currently equal. That is correct only
-  while no multiplexing occurs. Counter multiplexing must report the actual
-  running interval before more events than hardware slots can be accepted.
+- `time_enabled` measures the complete enabled interval while `time_running`
+  measures only intervals in which a hardware event owns a real PMU slot.
+  Oversubscribed task events rotate their allocation priority when a CPU
+  selects a different task, so unavailable events remain stopped and later
+  receive a real slot rather than being estimated. Syscall/poll re-entry for
+  the same task does not advance the multiplex epoch. Per-CPU events still
+  allocate eagerly and fail when no physical slot is available. A 1 ms
+  user-mode timer quantum rotates oversubscribed task hardware events even for
+  a lone runnable task. Sampled task events preserve the exact hardware
+  `period_left` across physical-counter rotation and CPU migration; the first
+  resumed overflow reports that shortened period before the configured full
+  reload cadence resumes.
 - Raw PMU formats are architecture-specific: sysfs exposes the x86
   event/unit-mask controls or the aarch64 16-bit architectural event number.
   Model-specific event aliases must still be generated from the detected CPU

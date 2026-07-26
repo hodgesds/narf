@@ -59,6 +59,10 @@ per-arch backends in `arch/`.
 provides, `CounterSet` time-multiplexes them with a scaling factor
 reported alongside each read. Honest-number reporting per
 `verification/` §8 — raw + scaling factor, never silently scaled.
+`time_enabled` covers the whole enabled lifetime; `time_running` covers only
+intervals in which the event owns a physical PMU slot. Sampled events preserve
+their exact remaining overflow period when multiplexing moves them between
+physical counters or CPUs.
 
 **Sampling.** Interrupt-on-overflow is exposed as a `Cap<Pmu, Sample>`
 capability and, when used, delivers a sample via a `tracing/`

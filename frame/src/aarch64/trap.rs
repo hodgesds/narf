@@ -94,7 +94,30 @@ pub extern "C" fn rust_aarch64_irq(frame: &TrapFrame) {
             // one driver (Stage-3 contract). Mark trap context so
             // on_irq can defer wakes (see x86_64 trap.rs for why).
             narf_lib::context::enter_trap_handler();
-            narf_interrupts::on_irq_with_context((intid & 0xFF) as u8, frame.elr);
+            let sp: u64;
+            // SAFETY: reading SP_EL0 at EL1 is architecturally defined.
+            unsafe {
+                core::arch::asm!("mrs {sp}, sp_el0", sp = out(reg) sp, options(nomem, nostack));
+            }
+            let regs = [
+                frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5, frame.x6, frame.x7,
+                frame.x8, frame.x9, frame.x10, frame.x11, frame.x12, frame.x13, frame.x14,
+                frame.x15, frame.x16, frame.x17, frame.x18, frame.x19, frame.x20, frame.x21,
+                frame.x22, frame.x23, frame.x24, frame.x25, frame.x26, frame.x27, frame.x28,
+                frame.x29, frame.x30, sp, frame.elr, frame.spsr,
+            ];
+            let user_state = narf_interrupts::InterruptedUserState {
+                user: frame.spsr & 0xF == 0,
+                abi: 1, // PERF_SAMPLE_REGS_ABI_64
+                ip: frame.elr,
+                sp,
+                regs,
+            };
+            narf_interrupts::on_irq_with_user_state(
+                (intid & 0xFF) as u8,
+                frame.elr,
+                Some(&user_state),
+            );
             narf_lib::context::exit_trap_handler();
         }
     }

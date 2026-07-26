@@ -85,6 +85,9 @@ pub fn install_probe(
 ) -> Probe;
 pub fn remove_probe(p: Probe);
 
+pub fn install_probe_observer(observer: fn(u32, ProbeArgs));
+pub fn install_event_observer(observer: fn(u64, &[u8]));
+
 pub enum ProbeAction {
     Capture { fields: &'static [Field] },
     IncrementCounter(SwCounter),
@@ -93,6 +96,12 @@ pub enum ProbeAction {
     RecordTo(RecorderRef),                                   // push event into flight-recorder ring
 }
 ```
+
+The two observer slots are kernel-internal, allocation-free bridges. A dynamic
+`fire(probe_id, args)` or typed `emit_event(type_id, bytes)` publishes to the
+installed observer before normal handler/sink dispatch. The perf compatibility
+adapter uses these slots to defer exact IDs and payload bytes into its own
+bounded per-CPU record queue; observer callbacks must not block or allocate.
 
 Declarative only. NARF explicitly rejects an eBPF-style VM at probe
 sites — probe actions are a fixed enum and compose via chaining

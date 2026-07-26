@@ -441,10 +441,42 @@ pub fn on_irq(vector: u8) {
     on_irq_with_context(vector, 0);
 }
 
+/// Architecture-neutral interrupted user register snapshot. `regs` uses the
+/// Linux perf register numbering for the current architecture.
+#[derive(Clone, Copy, Debug)]
+pub struct InterruptedUserState {
+    pub user: bool,
+    pub abi: u64,
+    pub ip: u64,
+    pub sp: u64,
+    pub regs: [u64; 34],
+}
+
+static INTERRUPTED_USER_VALID: [AtomicBool; PERCPU_FIRES_MAX] =
+    [const { AtomicBool::new(false) }; PERCPU_FIRES_MAX];
+static INTERRUPTED_USER_ABI: [AtomicU64; PERCPU_FIRES_MAX] =
+    [const { AtomicU64::new(0) }; PERCPU_FIRES_MAX];
+static INTERRUPTED_USER_SP: [AtomicU64; PERCPU_FIRES_MAX] =
+    [const { AtomicU64::new(0) }; PERCPU_FIRES_MAX];
+static INTERRUPTED_USER_REGS: [[AtomicU64; 34]; PERCPU_FIRES_MAX] =
+    [const { [const { AtomicU64::new(0) }; 34] }; PERCPU_FIRES_MAX];
+
 /// Dispatch an IRQ while publishing the interrupted instruction pointer to
 /// handlers on this CPU. The value is valid only for the handler walk.
 #[inline]
 pub fn on_irq_with_context(vector: u8, interrupted_ip: u64) {
+    on_irq_with_user_state(vector, interrupted_ip, None);
+}
+
+/// Dispatch an IRQ while publishing the complete interrupted userspace state.
+/// The snapshot is copied into per-CPU atomics before any handler runs and is
+/// cleared before return, so hard-IRQ consumers never retain a trap-frame
+/// pointer.
+pub fn on_irq_with_user_state(
+    vector: u8,
+    interrupted_ip: u64,
+    state: Option<&InterruptedUserState>,
+) {
     let s = &SLOTS[vector as usize];
 
     // Soft mask check FIRST — gives `disable_irq` strict semantics.
@@ -461,6 +493,14 @@ pub fn on_irq_with_context(vector: u8, interrupted_ip: u64) {
     // very-early boot; clamp.
     let cpu = current_cpu_index();
     INTERRUPTED_IP[cpu].store(interrupted_ip, Ordering::Release);
+    if let Some(state) = state.filter(|state| state.user) {
+        INTERRUPTED_USER_ABI[cpu].store(state.abi, Ordering::Relaxed);
+        INTERRUPTED_USER_SP[cpu].store(state.sp, Ordering::Relaxed);
+        for (dst, value) in INTERRUPTED_USER_REGS[cpu].iter().zip(state.regs) {
+            dst.store(value, Ordering::Relaxed);
+        }
+        INTERRUPTED_USER_VALID[cpu].store(true, Ordering::Release);
+    }
     s.per_cpu_fired[cpu].fetch_add(1, Ordering::Release);
 
     // Status-panel diag: bump the cross-vector total + record the
@@ -548,6 +588,7 @@ pub fn on_irq_with_context(vector: u8, interrupted_ip: u64) {
     s.in_flight.fetch_sub(1, Ordering::AcqRel);
     narf_lib::context::clear_current_irq_vector();
     INTERRUPTED_IP[cpu].store(0, Ordering::Release);
+    INTERRUPTED_USER_VALID[cpu].store(false, Ordering::Release);
     narf_lib::context::exit_irq();
 }
 
@@ -556,6 +597,25 @@ pub fn on_irq_with_context(vector: u8, interrupted_ip: u64) {
 #[inline]
 pub fn interrupted_ip() -> u64 {
     INTERRUPTED_IP[current_cpu_index()].load(Ordering::Acquire)
+}
+
+/// Complete user register state for the IRQ currently dispatched on this CPU.
+pub fn interrupted_user_state() -> Option<InterruptedUserState> {
+    let cpu = current_cpu_index();
+    if !INTERRUPTED_USER_VALID[cpu].load(Ordering::Acquire) {
+        return None;
+    }
+    let mut regs = [0; 34];
+    for (dst, source) in regs.iter_mut().zip(INTERRUPTED_USER_REGS[cpu].iter()) {
+        *dst = source.load(Ordering::Relaxed);
+    }
+    Some(InterruptedUserState {
+        user: true,
+        abi: INTERRUPTED_USER_ABI[cpu].load(Ordering::Relaxed),
+        ip: INTERRUPTED_IP[cpu].load(Ordering::Relaxed),
+        sp: INTERRUPTED_USER_SP[cpu].load(Ordering::Relaxed),
+        regs,
+    })
 }
 
 #[inline]

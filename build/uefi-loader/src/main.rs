@@ -25,7 +25,10 @@ const ET_EXEC: u16 = 2;
 const EV_CURRENT: u32 = 1;
 const FDT_MAGIC: u32 = 0xd00d_feed;
 const FDT_HEADER_SIZE: usize = 40;
-const MAX_DTB_SIZE: usize = 2 * 1024 * 1024;
+// ArmVirt EDK2 may expand QEMU's supplied tree with firmware nodes and slack;
+// current Ubuntu firmware publishes a little over 2 MiB. Keep a strict bound
+// while allowing that real configuration-table payload.
+const MAX_DTB_SIZE: usize = 4 * 1024 * 1024;
 const MAX_KERNEL_LOAD_SPAN: u64 = 1024 * 1024 * 1024;
 const EFI_DTB_TABLE_GUID: uefi::Guid = guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
 
@@ -84,6 +87,13 @@ fn load_and_start() -> Result<(), LoadError> {
     // SAFETY: the standard EFI DTB configuration-table entry is a
     // firmware-owned pointer valid through ExitBootServices.
     let dtb_header = unsafe { slice::from_raw_parts(dtb as *const u8, FDT_HEADER_SIZE) };
+    if validate_dtb_header(dtb_header).is_err() {
+        uefi::println!(
+            "NARF UEFI loader: invalid DTB table at {:#x}, header {:02x?}",
+            dtb,
+            &dtb_header[..8]
+        );
+    }
     let dtb_size = validate_dtb_header(dtb_header)?;
     let dtb_end = dtb.checked_add(dtb_size).ok_or(LoadError::Arithmetic)?;
 

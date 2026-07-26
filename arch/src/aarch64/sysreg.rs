@@ -50,10 +50,12 @@ macro_rules! pmu_write {
 pmu_read!(read_id_aa64dfr0_el1, "id_aa64dfr0_el1");
 pmu_read!(read_pmcr_el0, "pmcr_el0");
 pmu_read!(read_pmccntr_el0, "pmccntr_el0");
+pmu_read!(read_pmccfiltr_el0, "pmccfiltr_el0");
 pmu_read!(read_pmovsclr_el0, "pmovsclr_el0");
 pmu_read!(read_pmcntenset_el0, "pmcntenset_el0");
 pmu_read!(read_pmintenset_el1, "pmintenset_el1");
 pmu_read!(read_pmxevcntr_el0, "pmxevcntr_el0");
+pmu_read!(read_pmxevtyper_el0, "pmxevtyper_el0");
 pmu_read!(read_pmceid0_el0, "pmceid0_el0");
 pmu_read!(read_pmceid1_el0, "pmceid1_el0");
 pmu_write!(write_pmcr_el0, "pmcr_el0");

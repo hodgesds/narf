@@ -1623,6 +1623,11 @@ fn smoke_memory_address_space_materialize() -> TestResult {
         phys: alloc::vec![target],
     })
     .expect("map region");
+    if a.mapped_page_size(VirtAddr::new(vbase)) != Some(4096)
+        || a.mapped_page_size(VirtAddr::new(vbase + 0x1000)).is_some()
+    {
+        return TestResult::Fail("base-page mapping reported the wrong leaf size");
+    }
 
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
@@ -3342,6 +3347,9 @@ fn smoke_hugepage_1g_reserve_picks_aligned_chunk() -> TestResult {
     if translated.map(PhysAddr::raw) != Some(phys + 0x20_0000) {
         return TestResult::Fail("1G translation lost its block offset");
     }
+    if aspace.mapped_page_size(probe) != Some(HUGEPAGE_1G_BYTES) {
+        return TestResult::Fail("1G mapping reported the wrong leaf size");
+    }
     if !aspace.contains_address(VirtAddr::new(USER_VA + HUGEPAGE_1G_BYTES - 1)) {
         return TestResult::Fail("huge mapping absent from address-space membership");
     }
@@ -3413,6 +3421,9 @@ fn smoke_hugepage_2m_hardware_mapping_roundtrip() -> TestResult {
     let translated = unsafe { crate::aarch64::paging::translate(aspace.root, probe) };
     if translated.map(PhysAddr::raw) != Some(phys + 0x1f000) {
         return TestResult::Fail("huge-leaf translation lost its block offset");
+    }
+    if aspace.mapped_page_size(probe) != Some(HUGEPAGE_2M_BYTES) {
+        return TestResult::Fail("2M mapping reported the wrong leaf size");
     }
     if aspace.unmap_huge_region(VirtAddr::new(USER_VA)).is_err() {
         return TestResult::Fail("hardware 2M unmap failed");

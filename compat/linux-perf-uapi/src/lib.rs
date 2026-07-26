@@ -106,6 +106,8 @@ pub const PERF_ATTR_FLAG_COMM_EXEC: u64 = 1 << 24;
 pub const PERF_ATTR_FLAG_KSYMBOL: u64 = 1 << 29;
 pub const PERF_ATTR_FLAG_BPF_EVENT: u64 = 1 << 30;
 pub const PERF_ATTR_FLAG_BUILD_ID: u64 = 1 << 34;
+pub const PERF_ATTR_FLAG_REMOVE_ON_EXEC: u64 = 1 << 36;
+pub const PERF_ATTR_FLAG_SIGTRAP: u64 = 1 << 37;
 
 pub const PERF_ATTR_SIZE_VER0: u32 = 64;
 pub const PERF_ATTR_SIZE_VER1: u32 = 72;

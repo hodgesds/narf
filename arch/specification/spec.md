@@ -80,10 +80,24 @@ pub unsafe fn speculation::configure_current_cpu(
 pub fn speculation::state(cpu: usize) -> speculation::State;
 
 #[cfg(target_arch = "x86_64")]
+pub unsafe fn pmu::alloc_counter_filtered(
+    event: pmu::PmuEvent,
+    os: bool,
+    usr: bool,
+) -> Result<pmu::PmuCounter, pmu::PmuError>;
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn pmu::arm_sampling(
     counter: &pmu::PmuCounter,
     period: u64,
 ) -> Result<(), pmu::PmuError>;
+pub unsafe fn pmu::arm_sampling_with_reload(
+    counter: &pmu::PmuCounter,
+    initial_period: u64,
+    reload_period: u64,
+) -> Result<(), pmu::PmuError>;
+pub unsafe fn pmu::sampling_period_left(
+    counter: &pmu::PmuCounter,
+) -> Result<u64, pmu::PmuError>;
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn pmu::handle_sampling_overflow() -> u8;
 #[cfg(target_arch = "x86_64")]
@@ -100,6 +114,17 @@ pub unsafe fn pmi::program_current_lvt_pc(vector: u8, masked: bool);
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn pmu::alloc_cycle_counter() -> Result<pmu::CycleCounter, pmu::PmuError>;
 #[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::alloc_cycle_counter_filtered(
+    kernel: bool,
+    user: bool,
+) -> Result<pmu::CycleCounter, pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::alloc_programmable_filtered(
+    event: u16,
+    kernel: bool,
+    user: bool,
+) -> Result<pmu::ProgrammableCounter, pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn pmu::start(
     counter: &pmu::CycleCounter,
 ) -> Result<(), pmu::PmuError>;
@@ -108,6 +133,15 @@ pub unsafe fn pmu::arm_sampling(
     counter: &pmu::CycleCounter,
     period: u64,
 ) -> Result<(), pmu::PmuError>;
+pub unsafe fn pmu::arm_sampling_with_reload(
+    counter: &pmu::CycleCounter,
+    initial_period: u64,
+    reload_period: u64,
+) -> Result<(), pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::sampling_period_left(
+    counter: &pmu::CycleCounter,
+) -> Result<u64, pmu::PmuError>;
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn pmu::handle_sampling_overflow() -> bool;
 #[cfg(target_arch = "aarch64")]
@@ -141,6 +175,16 @@ pub unsafe fn pmu::arm_programmable(
     counter: &pmu::ProgrammableCounter,
     period: u64,
 ) -> Result<(), pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::arm_programmable_with_reload(
+    counter: &pmu::ProgrammableCounter,
+    initial_period: u64,
+    reload_period: u64,
+) -> Result<(), pmu::PmuError>;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pmu::programmable_period_left(
+    counter: &pmu::ProgrammableCounter,
+) -> Result<u64, pmu::PmuError>;
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn pmu::handle_programmable_overflows() -> u32;
 #[cfg(target_arch = "aarch64")]

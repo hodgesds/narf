@@ -31,6 +31,20 @@ pub enum IrqTarget {
 pub fn end_of_interrupt(n: IrqNum);
 pub fn trigger_sw(n: IrqNum, target_cpu: CpuId);
 
+pub struct InterruptedUserState {
+    pub user: bool,
+    pub abi: u64,
+    pub ip: u64,
+    pub sp: u64,
+    pub regs: [u64; 34],
+}
+pub fn on_irq_with_user_state(
+    vector: u8,
+    interrupted_ip: u64,
+    state: Option<&InterruptedUserState>,
+);
+pub fn interrupted_user_state() -> Option<InterruptedUserState>;
+
 #[cfg(target_arch = "aarch64")]
 pub fn gic::configure_pmu_ppi(intid: u32) -> Result<(), ()>;
 ```
@@ -129,11 +143,12 @@ pattern.
 ### 8.2 IRQ delivery + dispatch
 
 The in-kernel trap entry (`frame/`) calls
-`narf_interrupts::on_irq_with_context(vector, interrupted_ip)` followed by
-`eoi()`. Synthetic/test callers may use `on_irq(vector)`, which supplies a
-zero IP. A synchronous handler can read the contextual value through
-`interrupted_ip()` only during its handler walk. Dispatch otherwise preserves
-the `on_irq` contract:
+`narf_interrupts::on_irq_with_user_state(vector, state)` followed by `eoi()`.
+The state contains the architecture's Linux perf register image when the IRQ
+interrupted userspace. Synthetic/test callers may use `on_irq(vector)`, which
+supplies no user state. A synchronous handler can read the contextual value
+through `interrupted_user_state()` (or its IP through `interrupted_ip()`) only
+during its handler walk. Dispatch otherwise preserves the `on_irq` contract:
 
 ```rust
 pub fn on_irq(vector: u8) {

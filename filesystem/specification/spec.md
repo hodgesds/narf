@@ -370,13 +370,15 @@ without leaving callers parked indefinitely.
 
 With `linux-compat`, sysfs exposes only interfaces backed by a NARF authority.
 The perf discovery projection is
-`/sys/bus/event_source/devices/{cpu,software}`: it publishes PMU type numbers,
+`/sys/bus/event_source/devices/{cpu,software,narf_trace}`: it publishes PMU type numbers,
 the online CPU mask, and architecture-correct raw CPU PMU `format/*` bitfields
 (x86 event/unit-mask controls or the aarch64 16-bit architectural event
 number). On aarch64, `events/*` publishes the architectural cycles,
 instructions, cache-miss, branch, and branch-miss aliases only when the
 corresponding PMCEID bit is set. Model-specific event aliases must not be
-published until derived from the detected PMU.
+published until derived from the detected PMU. `narf_trace` publishes Linux
+tracepoint type 2 and a 64-bit `id` config field for authoritative typed-event
+or dynamic-probe IDs.
 
 ## 4. Invariants & safety properties
 

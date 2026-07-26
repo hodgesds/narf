@@ -26,9 +26,60 @@ const PERF_EVENT_IOC_SET_OUTPUT: u64 = 0x2405;
 const PERF_EVENT_IOC_ID: u64 = 0x8008_2407;
 const PERF_EVENT_IOC_PAUSE_OUTPUT: u64 = 0x4004_2409;
 const EOPNOTSUPP: i64 = -95;
+const E2BIG: i64 = -7;
 
 fn smoke_abi_perf_event_open_validation() -> TestResult {
     with_setup(|| {
+        let rotated: [usize; 4] =
+            core::array::from_fn(|offset| crate::perf_event::rotation_index_for_test(2, offset, 4));
+        if rotated != [2, 3, 0, 1] {
+            return Err("perf multiplex cursor did not wrap fairly");
+        }
+        if crate::perf_event::advance_rotation_cursor_for_test(u64::MAX, 7, 3) != 3
+            || crate::perf_event::advance_rotation_cursor_for_test(7, 7, 3) != 3
+            || crate::perf_event::advance_rotation_cursor_for_test(7, 8, 3) != 4
+        {
+            return Err("perf multiplex cursor advanced without a task switch");
+        }
+        if !crate::perf_event::multiplex_quantum_due_for_test(0, 1)
+            || crate::perf_event::multiplex_quantum_due_for_test(1, 1_000_000)
+            || !crate::perf_event::multiplex_quantum_due_for_test(1, 1_000_001)
+        {
+            return Err("perf multiplex timer quantum boundary is incorrect");
+        }
+        if crate::perf_event::remaining_sample_period_for_test(100_000, 25_000) != 75_000
+            || crate::perf_event::remaining_sample_period_for_test(100_000, 100_000) != 1
+            || crate::perf_event::remaining_sample_period_for_test(100_000, 125_000) != 1
+        {
+            return Err("perf sampled period-left accounting is incorrect");
+        }
+        let mut regs = [0; 34];
+        #[cfg(target_arch = "x86_64")]
+        {
+            regs[6] = 0x1010;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            regs[29] = 0x1010;
+        }
+        let unwind_state = narf_interrupts::InterruptedUserState {
+            user: true,
+            abi: 1,
+            ip: 0x999,
+            sp: 0x1000,
+            regs,
+        };
+        let mut unwind_stack = [0u8; 48];
+        unwind_stack[16..24].copy_from_slice(&0x1020u64.to_ne_bytes());
+        unwind_stack[24..32].copy_from_slice(&0xaaau64.to_ne_bytes());
+        unwind_stack[32..40].copy_from_slice(&0u64.to_ne_bytes());
+        unwind_stack[40..48].copy_from_slice(&0xbbbu64.to_ne_bytes());
+        if crate::perf_event::unwind_user_callchain_for_test(0x999, &unwind_state, &unwind_stack)
+            != [0x999, 0xaaa, 0xbbb]
+        {
+            return Err("perf frame-pointer unwind did not recover caller symbols");
+        }
+
         #[cfg(target_arch = "x86_64")]
         {
             if crate::perf_event::frequency_period(20_000, 100_000, 10_000) != 20_000
@@ -191,21 +242,65 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
         let _ = call(Syscall::Close.raw(), a0(cpu_clock_fd as u64));
 
-        let ignored_attr_flag = PerfEventAttr {
-            flags: 1 << 2, // pinned scheduling is not implemented
+        let pinned_attr = PerfEventAttr {
+            flags: 1 << 2, // pinned
             ..attr
         };
-        match call(
+        let pinned_fd = match call(
             Syscall::PerfEventOpen.raw(),
             a3(
-                &ignored_attr_flag as *const _ as u64,
+                &pinned_attr as *const _ as u64,
                 0,
                 -1i32 as u64,
                 -1i32 as u64,
             ),
         ) {
-            Some(EOPNOTSUPP) => {}
-            _ => return Err("perf_event_open ignored an unimplemented attr flag"),
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("perf_event_open rejected a pinned group leader"),
+        };
+        let constrained_member = PerfEventAttr {
+            flags: 1 << 3, // exclusive is leader-only
+            ..attr
+        };
+        match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &constrained_member as *const _ as u64,
+                0,
+                -1i32 as u64,
+                pinned_fd as u64,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("perf_event_open admitted an exclusive group member"),
+        }
+        let _ = call(Syscall::Close.raw(), a0(pinned_fd as u64));
+
+        let hardware_privilege_filter = PerfEventAttr {
+            type_: 0,      // PERF_TYPE_HARDWARE
+            config: 0,     // cycles
+            flags: 1 << 5, // exclude_kernel
+            ..attr
+        };
+        let filtered_result = call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &hardware_privilege_filter as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        );
+        match filtered_result {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            #[cfg(target_arch = "x86_64")]
+            Some(EOPNOTSUPP) => {
+                // TCG's x86 `-cpu max` currently advertises no architectural
+                // PMU; backend filter encoding is covered in arch/pmu.
+            }
+            _ => return Err("hardware exclude_kernel filter was not programmed"),
         }
 
         let zero_frequency = PerfEventAttr {
@@ -264,26 +359,43 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             _ => return Err("perf_event_open(unknown flags) did not return EINVAL"),
         }
 
-        // Unsupported sample payloads remain fail-closed even though the
-        // common perf-record layout is implemented.
-        let sampling_attr = PerfEventAttr {
+        let oversized_stack = PerfEventAttr {
             sample_period_or_freq: 1000,
-            sample_type: 1 << 3, // PERF_SAMPLE_ADDR is not implemented
+            sample_type: 1 << 13,
+            sample_stack_user: 8193,
             ..attr
         };
         match call(
             Syscall::PerfEventOpen.raw(),
             a3(
-                &sampling_attr as *const _ as u64,
+                &oversized_stack as *const _ as u64,
                 0,
                 -1i32 as u64,
                 -1i32 as u64,
             ),
         ) {
-            Some(EOPNOTSUPP) => {}
-            _ => {
-                return Err("perf_event_open(unsupported sample layout) did not return EOPNOTSUPP")
-            }
+            Some(E2BIG) => {}
+            _ => return Err("perf_event_open did not reject an unbounded IRQ stack snapshot"),
+        }
+
+        // PERF_SAMPLE_WEIGHT and PERF_SAMPLE_WEIGHT_STRUCT are two views of
+        // the same Linux ABI union and cannot be selected together.
+        let conflicting_weight_attr = PerfEventAttr {
+            sample_period_or_freq: 1000,
+            sample_type: (1 << 14) | (1 << 24),
+            ..attr
+        };
+        match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &conflicting_weight_attr as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("perf_event_open accepted conflicting weight sample fields"),
         }
 
         // PERF_FLAG_PID_CGROUP cannot be approximated as a normal pid event.
@@ -469,7 +581,11 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             Some(32) => {}
             _ => return Err("perf stat-format read did not return four u64 words"),
         }
-        if stat_read[2] == 0 || stat_read[3] != id {
+        if stat_read[1] == 0
+            || stat_read[2] == 0
+            || stat_read[2] > stat_read[1]
+            || stat_read[3] != id
+        {
             return Err("perf stat-format time/id fields are invalid");
         }
         if call(
@@ -715,11 +831,16 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             sample_type: (1 << 0) // IP
                 | (1 << 1) // TID
                 | (1 << 2) // TIME
+                | (1 << 3) // ADDR (not available for cycles/dummy)
+                | (1 << 4) // READ
+                | (1 << 5) // CALLCHAIN (exact leaf IP)
                 | (1 << 6) // ID
                 | (1 << 7) // CPU
-                | (1 << 8), // PERIOD
+                | (1 << 8) // PERIOD
+                | (1 << 23), // CODE_PAGE_SIZE (unmapped test IP => unavailable)
             read_format: PERF_FORMAT_LOST,
-            flags: 1 | PERF_ATTR_FLAG_INHERIT, // disabled + inherit
+            flags: 1 | PERF_ATTR_FLAG_INHERIT | PERF_ATTR_FLAG_WATERMARK | (1 << 18), // disabled + inherit + byte watermark + sample_id_all
+            wakeup_events_or_watermark: 104,
             ..PerfEventAttr::default()
         };
         let sample_fd = match call(
@@ -786,17 +907,23 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         if data_head == 0 {
             return Err("inherited perf event did not sample its child task");
         }
-        if data_head != 56 {
+        if data_head != 104 {
             return Err("perf sample record has the wrong wire size");
         }
-        // SAFETY: the first 56-byte record starts at the beginning of data page 0.
+        // SAFETY: the first 104-byte record starts at the beginning of data page 0.
         let record = unsafe {
             core::slice::from_raw_parts(sample_frames[1] as *const u8, data_head as usize)
         };
         if u32::from_ne_bytes(record[0..4].try_into().unwrap()) != 9
-            || u16::from_ne_bytes(record[6..8].try_into().unwrap()) != 56
+            || u16::from_ne_bytes(record[6..8].try_into().unwrap()) != 104
             || u64::from_ne_bytes(record[8..16].try_into().unwrap()) != 0x1234_5678
+            || u64::from_ne_bytes(record[32..40].try_into().unwrap()) != 0 // ADDR
+            || u64::from_ne_bytes(record[40..48].try_into().unwrap()) != 0
             || u64::from_ne_bytes(record[48..56].try_into().unwrap()) != 0
+            || u64::from_ne_bytes(record[56..64].try_into().unwrap()) != 1
+            || u64::from_ne_bytes(record[64..72].try_into().unwrap()) != 0x1234_5678
+            || u64::from_ne_bytes(record[88..96].try_into().unwrap()) != 0
+            || u64::from_ne_bytes(record[96..104].try_into().unwrap()) != 0
         {
             return Err("PERF_RECORD_SAMPLE wire layout is invalid");
         }
@@ -833,12 +960,12 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             return Err("redirecting perf output failed");
         }
         crate::perf_event::sample_from_irq_for_test(sample_parent, 0x8765_4321);
-        // Both the target event and redirected event commit a 56-byte sample
+        // Both the target event and redirected event commit a 104-byte sample
         // to the target ring; the redirected event has no mmap of its own.
         // SAFETY: sample_ops owns the mapped metadata frame.
         let redirected_head =
             unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
-        if redirected_head != data_head + 112 {
+        if redirected_head != data_head + 208 {
             return Err("PERF_EVENT_IOC_SET_OUTPUT did not share the target ring");
         }
         if call(
@@ -864,6 +991,50 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             || u64::from_ne_bytes(lost_read[8..16].try_into().unwrap()) == 0
         {
             return Err("PERF_FORMAT_LOST did not report ring drops");
+        }
+        // Free the ring and trigger one more sample. The pending loss must be
+        // emitted first with the sample_id_all trailer perf uses to resolve
+        // the owning event.
+        // SAFETY: sample_ops owns the metadata and two data frames.
+        let full_head =
+            unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
+        // SAFETY: userspace owns data_tail in perf_event_mmap_page.
+        unsafe {
+            core::ptr::write_volatile((sample_frames[0] as usize + 1032) as *mut u64, full_head);
+        }
+        crate::perf_event::sample_from_irq_for_test(88, 0xCAFE_BABE);
+        // SAFETY: sample_ops owns the metadata frame.
+        let recovered_head =
+            unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
+        if recovered_head != full_head + 160 {
+            return Err("PERF_RECORD_LOST and following sample have wrong combined size");
+        }
+        let ring_byte = |absolute: u64| {
+            let ring_offset = absolute as usize & (2 * 4096 - 1);
+            // SAFETY: the selected byte is inside one of the two data frames.
+            unsafe {
+                *((sample_frames[1 + ring_offset / 4096] as usize + ring_offset % 4096)
+                    as *const u8)
+            }
+        };
+        let ring_u32 = |absolute: u64| {
+            u32::from_ne_bytes(core::array::from_fn(|i| ring_byte(absolute + i as u64)))
+        };
+        let ring_u16 = |absolute: u64| {
+            u16::from_ne_bytes(core::array::from_fn(|i| ring_byte(absolute + i as u64)))
+        };
+        let ring_u64 = |absolute: u64| {
+            u64::from_ne_bytes(core::array::from_fn(|i| ring_byte(absolute + i as u64)))
+        };
+        let child_pid = crate::handlers::task_to_pid_raw(88).unwrap_or(88) as u32;
+        if ring_u32(full_head) != 2
+            || ring_u16(full_head + 6) != 56
+            || ring_u64(full_head + 8) == 0
+            || ring_u64(full_head + 8) != ring_u64(full_head + 40)
+            || ring_u32(full_head + 24) != child_pid
+            || ring_u32(full_head + 28) != 88
+        {
+            return Err("PERF_RECORD_LOST sample_id_all wire encoding is invalid");
         }
         crate::perf_event::on_thread_exit(77, 88);
         let _ = call(Syscall::Close.raw(), a0(sample_fd as u64));
@@ -1092,6 +1263,116 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             let _ = call(Syscall::Close.raw(), a0(inherited_fd as u64));
         }
 
+        let trace_attr = PerfEventAttr {
+            type_: 2, // PERF_TYPE_TRACEPOINT
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: 0x5a17,
+            sample_period_or_freq: 1,
+            sample_type: 1 << 10, // PERF_SAMPLE_RAW
+            flags: 1,             // disabled
+            ..PerfEventAttr::default()
+        };
+        let trace_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &trace_attr as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("tracepoint perf event was not admitted"),
+        };
+        let trace_ops = crate::fd::with_table(FAKE_TASK, |table| {
+            table.get(trace_fd).map(|entry| entry.ops.clone())
+        })
+        .flatten()
+        .ok_or("tracepoint fd missing")?;
+        let trace_frames = trace_ops
+            .mmap_frames(0, 3 * 4096)
+            .map_err(|_| "tracepoint mmap failed")?;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(trace_fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+        ) != Some(0)
+        {
+            return Err("tracepoint enable failed");
+        }
+        narf_tracing::emit_event(0x5a17, &[0xaa, 0xbb, 0xcc]);
+        crate::perf_event::drain_irq_samples();
+        // SAFETY: trace_ops owns the metadata and data frames.
+        let trace_head =
+            unsafe { core::ptr::read_volatile((trace_frames[0] as usize + 1024) as *const u64) };
+        if trace_head != 16 {
+            return Err("tracepoint did not emit one aligned PERF_RECORD_SAMPLE");
+        }
+        // SAFETY: the committed record occupies the first data-ring bytes.
+        let trace_record = unsafe {
+            core::slice::from_raw_parts(trace_frames[1] as *const u8, trace_head as usize)
+        };
+        if u32::from_ne_bytes(trace_record[0..4].try_into().unwrap()) != 9
+            || u32::from_ne_bytes(trace_record[8..12].try_into().unwrap()) != 3
+            || trace_record[12..15] != [0xaa, 0xbb, 0xcc]
+        {
+            return Err("tracepoint PERF_SAMPLE_RAW payload was malformed");
+        }
+        narf_tracing::fire(0x5a17, narf_tracing::ProbeArgs::two(0x11, 0x22));
+        crate::perf_event::drain_irq_samples();
+        // SAFETY: trace_ops retains the metadata frame.
+        let probe_head =
+            unsafe { core::ptr::read_volatile((trace_frames[0] as usize + 1024) as *const u64) };
+        if probe_head != 64 {
+            return Err("dynamic probe did not emit a perf raw sample");
+        }
+        // SAFETY: the second record starts immediately after the 16-byte event.
+        let probe_record =
+            unsafe { core::slice::from_raw_parts((trace_frames[1] + 16) as *const u8, 48) };
+        if u32::from_ne_bytes(probe_record[8..12].try_into().unwrap()) != 32
+            || u64::from_ne_bytes(probe_record[12..20].try_into().unwrap()) != 0x11
+            || u64::from_ne_bytes(probe_record[20..28].try_into().unwrap()) != 0x22
+        {
+            return Err("dynamic probe argument payload was malformed");
+        }
+        let _ = call(Syscall::Close.raw(), a0(trace_fd as u64));
+
+        let sigtrap_attr = PerfEventAttr {
+            type_: 2, // PERF_TYPE_TRACEPOINT (architecture-neutral sampling)
+            config: 0x5a18,
+            sample_period_or_freq: 1,
+            sample_type: 1,               // PERF_SAMPLE_IP
+            flags: (1 << 36) | (1 << 37), // remove_on_exec | sigtrap
+            sig_data: 0xfeed_cafe,
+            ..attr
+        };
+        let sigtrap_fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &sigtrap_attr as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("SIGTRAP sampling event was not admitted"),
+        };
+        let task = crate::handlers::current_task_id();
+        if !crate::perf_event::sample_fd_for_test(sigtrap_fd, task, 0x1234) {
+            return Err("SIGTRAP test perf event was not sampled");
+        }
+        if crate::handlers::signal_pending_bits(task) & (1 << (5 - 1)) == 0 {
+            return Err("perf overflow did not mark SIGTRAP pending");
+        }
+        match crate::handlers::take_sigqueue_info(task, 5) {
+            Some((6, 0xfeed_cafe, 0)) => {}
+            Some((6, 0, 0)) => return Err("perf overflow lost sig_data"),
+            Some(_) => return Err("perf overflow queued malformed TRAP_PERF metadata"),
+            None => return Err("perf overflow did not queue TRAP_PERF metadata"),
+        }
+        crate::handlers::clear_signal_pending(task, 5);
+        let _ = call(Syscall::Close.raw(), a0(sigtrap_fd as u64));
+
         Ok(())
     })
 }
@@ -1111,10 +1392,15 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
         };
         let fd = match call(
             Syscall::PerfEventOpen.raw(),
-            a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+            a3(
+                &attr as *const _ as u64,
+                -1i32 as u64,
+                narf_lib::percpu::current_cpu() as u64,
+                -1i32 as u64,
+            ),
         ) {
             Some(fd) if fd >= 0 => fd as u32,
-            _ => return Err("PMUv3 cycles event was not admitted"),
+            _ => return Err("system-wide PMUv3 cycles event was not admitted"),
         };
         let ops = crate::fd::with_table(FAKE_TASK, |table| {
             table.get(fd).map(|entry| entry.ops.clone())

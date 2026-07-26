@@ -589,20 +589,45 @@ const SCRATCH_VEC_CONTEXT: u8 = 117;
 fn smoke_dispatch_publishes_interrupted_ip_during_handler() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     static SEEN: AtomicU64 = AtomicU64::new(0);
+    static SEEN_SP: AtomicU64 = AtomicU64::new(0);
+    static SEEN_R3: AtomicU64 = AtomicU64::new(0);
     fn handler(_cookie: u64) -> crate::IrqStatus {
         SEEN.store(crate::interrupted_ip(), Ordering::Release);
+        if let Some(state) = crate::interrupted_user_state() {
+            SEEN_SP.store(state.sp, Ordering::Release);
+            SEEN_R3.store(state.regs[3], Ordering::Release);
+        }
         crate::IrqStatus::Handled
     }
 
     SEEN.store(0, Ordering::Relaxed);
+    SEEN_SP.store(0, Ordering::Relaxed);
+    SEEN_R3.store(0, Ordering::Relaxed);
     crate::install_handler_named(SCRATCH_VEC_CONTEXT, "context-test", 0, handler);
-    crate::on_irq_with_context(SCRATCH_VEC_CONTEXT, 0x1234_5678_9abc_def0);
+    let mut regs = [0; 34];
+    regs[3] = 0xfeed_face;
+    let state = crate::InterruptedUserState {
+        user: true,
+        abi: 1,
+        ip: 0x1234_5678_9abc_def0,
+        sp: 0x7000_1234,
+        regs,
+    };
+    crate::on_irq_with_user_state(SCRATCH_VEC_CONTEXT, 0x1234_5678_9abc_def0, Some(&state));
     crate::dispatch::clear_handler(SCRATCH_VEC_CONTEXT);
     if SEEN.load(Ordering::Acquire) != 0x1234_5678_9abc_def0 {
         return TestResult::Fail("handler did not observe interrupted IP");
     }
     if crate::interrupted_ip() != 0 {
         return TestResult::Fail("interrupted IP remained published after dispatch");
+    }
+    if SEEN_SP.load(Ordering::Acquire) != 0x7000_1234
+        || SEEN_R3.load(Ordering::Acquire) != 0xfeed_face
+    {
+        return TestResult::Fail("handler did not observe interrupted user registers");
+    }
+    if crate::interrupted_user_state().is_some() {
+        return TestResult::Fail("user registers remained published after dispatch");
     }
     TestResult::Pass
 }
