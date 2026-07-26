@@ -597,12 +597,29 @@ pub unsafe fn sampling_residual(counter: &PmuCounter, period: u64) -> Result<u64
 /// # Safety
 /// CPL=0 and `counter` is a live allocation on the current CPU.
 pub unsafe fn arm_sampling(counter: &PmuCounter, period: u64) -> Result<(), PmuError> {
+    // SAFETY: forwarded caller contract.
+    unsafe { arm_sampling_with_reload(counter, period, period) }
+}
+
+/// Arm sampling with a possibly shorter first overflow period.
+///
+/// `initial_period` is loaded into hardware now; after that overflow the IRQ
+/// path records it as the period that fired and reloads `reload_period`.
+///
+/// # Safety
+/// CPL=0 and `counter` is a live allocation on the current CPU.
+pub unsafe fn arm_sampling_with_reload(
+    counter: &PmuCounter,
+    initial_period: u64,
+    reload_period: u64,
+) -> Result<(), PmuError> {
     let cpu = narf_lib::percpu::current_cpu();
     if counter.cpu as usize != cpu {
         return Err(PmuError::UnsupportedEvent);
     }
     let backend = detect().ok_or(PmuError::NoPmu)?;
-    let preload = sample_preload(backend.counter_width, period)?;
+    let preload = sample_preload(backend.counter_width, initial_period)?;
+    let _ = sample_preload(backend.counter_width, reload_period)?;
     let mut sel = event_to_evtsel(counter.event, counter.vendor)?;
     sel.apic_int = true;
     // SAFETY: caller owns this live slot on the current CPU.
@@ -617,10 +634,28 @@ pub unsafe fn arm_sampling(counter: &PmuCounter, period: u64) -> Result<(), PmuE
         }
         program_counter(counter.idx, sel, counter.vendor);
     }
-    SAMPLE_PERIODS[cpu][counter.idx as usize].store(period, Ordering::Release);
-    SAMPLE_LOADED_PERIODS[cpu][counter.idx as usize].store(period, Ordering::Release);
+    SAMPLE_PERIODS[cpu][counter.idx as usize].store(reload_period, Ordering::Release);
+    SAMPLE_LOADED_PERIODS[cpu][counter.idx as usize].store(initial_period, Ordering::Release);
     SAMPLE_ARMED_MASK[cpu].fetch_or(1 << counter.idx, Ordering::AcqRel);
     Ok(())
+}
+
+/// Events remaining before the next overflow of a live sampled counter.
+///
+/// # Safety
+/// Same current-CPU live-counter requirements as [`sampling_residual`].
+pub unsafe fn sampling_period_left(counter: &PmuCounter) -> Result<u64, PmuError> {
+    let cpu = narf_lib::percpu::current_cpu();
+    if counter.cpu as usize != cpu {
+        return Err(PmuError::UnsupportedEvent);
+    }
+    let loaded = SAMPLE_LOADED_PERIODS[cpu][counter.idx as usize].load(Ordering::Acquire);
+    if loaded == 0 {
+        return Err(PmuError::UnsupportedEvent);
+    }
+    // SAFETY: forwarded caller contract.
+    let consumed = unsafe { sampling_residual(counter, loaded)? };
+    Ok(loaded.saturating_sub(consumed).max(1))
 }
 
 /// Change the reload period used after the next overflow of an armed counter.

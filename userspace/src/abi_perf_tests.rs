@@ -46,6 +46,12 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         {
             return Err("perf multiplex timer quantum boundary is incorrect");
         }
+        if crate::perf_event::remaining_sample_period_for_test(100_000, 25_000) != 75_000
+            || crate::perf_event::remaining_sample_period_for_test(100_000, 100_000) != 1
+            || crate::perf_event::remaining_sample_period_for_test(100_000, 125_000) != 1
+        {
+            return Err("perf sampled period-left accounting is incorrect");
+        }
 
         #[cfg(target_arch = "x86_64")]
         {

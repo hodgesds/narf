@@ -93,6 +93,15 @@ fn multiplex_quantum_due(last_ns: u64, now_ns: u64) -> bool {
     last_ns == 0 || now_ns.saturating_sub(last_ns) >= PERF_MULTIPLEX_QUANTUM_NS
 }
 
+#[inline]
+fn remaining_sample_period(loaded: u64, consumed: u64) -> u64 {
+    loaded.saturating_sub(consumed).max(1)
+}
+
+pub(crate) fn remaining_sample_period_for_test(loaded: u64, consumed: u64) -> u64 {
+    remaining_sample_period(loaded, consumed)
+}
+
 pub(crate) fn multiplex_quantum_due_for_test(last_ns: u64, now_ns: u64) -> bool {
     multiplex_quantum_due(last_ns, now_ns)
 }
@@ -391,14 +400,44 @@ impl AarchCounter {
     }
 
     unsafe fn arm(self, period: u64) -> Result<(), narf_arch::aarch64::pmu::PmuError> {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.arm_with_reload(period, period) }
+    }
+
+    unsafe fn arm_with_reload(
+        self,
+        initial_period: u64,
+        reload_period: u64,
+    ) -> Result<(), narf_arch::aarch64::pmu::PmuError> {
         match self {
             // SAFETY: caller guarantees ownership and a routed current-CPU PMU PPI.
             Self::Cycle(counter) => unsafe {
-                narf_arch::aarch64::pmu::arm_sampling(&counter, period)
+                narf_arch::aarch64::pmu::arm_sampling_with_reload(
+                    &counter,
+                    initial_period,
+                    reload_period,
+                )
             },
             // SAFETY: caller guarantees ownership and a routed current-CPU PMU PPI.
             Self::Programmable(counter) => unsafe {
-                narf_arch::aarch64::pmu::arm_programmable(&counter, period)
+                narf_arch::aarch64::pmu::arm_programmable_with_reload(
+                    &counter,
+                    initial_period,
+                    reload_period,
+                )
+            },
+        }
+    }
+
+    unsafe fn period_left(self) -> Result<u64, narf_arch::aarch64::pmu::PmuError> {
+        match self {
+            // SAFETY: caller guarantees live current-CPU ownership.
+            Self::Cycle(counter) => unsafe {
+                narf_arch::aarch64::pmu::sampling_period_left(&counter)
+            },
+            // SAFETY: caller guarantees live current-CPU ownership.
+            Self::Programmable(counter) => unsafe {
+                narf_arch::aarch64::pmu::programmable_period_left(&counter)
             },
         }
     }
@@ -561,6 +600,7 @@ struct PerfEventFile {
     refresh_limit: AtomicU32,
     wakeup_pending: AtomicU32,
     sample_period: AtomicU64,
+    sample_period_left: AtomicU64,
     last_sample_period: AtomicU64,
     sample_frequency: u64,
     last_sample_ns: AtomicU64,
@@ -848,7 +888,20 @@ impl PerfEventFile {
                     return;
                 }
                 // SAFETY: freshly allocated current-CPU counter.
-                if unsafe { narf_arch::x86_64::pmu::arm_sampling(&counter, sample_period) }.is_err()
+                let period_left = self
+                    .sample_period_left
+                    .load(Ordering::Acquire)
+                    .clamp(1, sample_period);
+                // SAFETY: freshly allocated current-CPU counter; the first
+                // preload and subsequent reload are backend-validated.
+                if unsafe {
+                    narf_arch::x86_64::pmu::arm_sampling_with_reload(
+                        &counter,
+                        period_left,
+                        sample_period,
+                    )
+                }
+                .is_err()
                 {
                     // SAFETY: same current-CPU allocation.
                     unsafe { narf_arch::x86_64::pmu::release(counter) };
@@ -862,6 +915,12 @@ impl PerfEventFile {
             let sample_period = self.sample_period.load(Ordering::Acquire);
             if sample_period != 0 {
                 ACTIVE_SAMPLE_IDS[cpu][counter.idx as usize].store(0, Ordering::Release);
+                // SAFETY: current-CPU live sampled allocation. Capture the
+                // exact remaining distance before disarming the slot.
+                if let Ok(left) = unsafe { narf_arch::x86_64::pmu::sampling_period_left(&counter) }
+                {
+                    self.sample_period_left.store(left, Ordering::Release);
+                }
                 // SAFETY: current-CPU live allocation.
                 let _ = unsafe { narf_arch::x86_64::pmu::pause_sampling(&counter) };
             }
@@ -901,8 +960,12 @@ impl PerfEventFile {
             let period = self.sample_period.load(Ordering::Acquire);
             if period != 0 {
                 let route_failed = ensure_pmi_route().is_err();
+                let period_left = self
+                    .sample_period_left
+                    .load(Ordering::Acquire)
+                    .clamp(1, period);
                 // SAFETY: freshly allocated current-CPU counter and routed PPI.
-                let arm_failed = unsafe { counter.arm(period) }.is_err();
+                let arm_failed = unsafe { counter.arm_with_reload(period_left, period) }.is_err();
                 if route_failed || arm_failed {
                     // SAFETY: the fresh allocation is still owned on this CPU.
                     let _ = unsafe { counter.release() };
@@ -919,6 +982,12 @@ impl PerfEventFile {
             self.start_running(cpu);
         } else if let Some(counter) = active[cpu].take() {
             ACTIVE_SAMPLE_IDS[cpu][counter.sample_slot()].store(0, Ordering::Release);
+            if self.sample_period.load(Ordering::Acquire) != 0 {
+                // SAFETY: switch-out runs on the CPU owning this live counter.
+                if let Ok(left) = unsafe { counter.period_left() } {
+                    self.sample_period_left.store(left, Ordering::Release);
+                }
+            }
             // SAFETY: switch-out runs on the CPU owning this active counter.
             let _ = unsafe { counter.pause() };
             // SAFETY: the paused counter remains owned on this CPU.
@@ -1055,6 +1124,7 @@ impl PerfEventFile {
             armed.map_err(|_| FsError::InvalidData)?;
         }
         self.sample_period.store(period, Ordering::Release);
+        self.sample_period_left.store(period, Ordering::Release);
         self.last_sample_period.store(period, Ordering::Release);
         Ok(())
     }
@@ -1104,6 +1174,7 @@ impl PerfEventFile {
         }
         drop(active);
         self.sample_period.store(period, Ordering::Release);
+        self.sample_period_left.store(period, Ordering::Release);
         self.last_sample_period.store(period, Ordering::Release);
         Ok(())
     }
@@ -1112,6 +1183,10 @@ impl PerfEventFile {
         self.count_accumulated.store(0, Ordering::Release);
         self.time_enabled_ns.store(0, Ordering::Release);
         self.time_running_ns.store(0, Ordering::Release);
+        self.sample_period_left.store(
+            self.sample_period.load(Ordering::Acquire),
+            Ordering::Release,
+        );
         if self.enabled.load(Ordering::Acquire) {
             let now = narf_time::monotonic_ns();
             self.count_base.store(self.raw_count(), Ordering::Release);
@@ -2054,12 +2129,10 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
     }
 }
 
-/// Rotate oversubscribed task counting events from the user-mode timer tick.
+/// Rotate oversubscribed task hardware events from the user-mode timer tick.
 ///
-/// This is allocation-free and uses only IRQ-safe locks. Sampling events are
-/// deliberately excluded: rotating those requires preserving the hardware
-/// `period_left` state, and restarting a full period would fabricate sampling
-/// semantics.
+/// This is allocation-free and uses only IRQ-safe locks. Sampled events carry
+/// their exact hardware `period_left` through the stop/reallocate path.
 pub(crate) fn on_multiplex_tick(task: u64) {
     if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
         return;
@@ -2081,7 +2154,6 @@ pub(crate) fn on_multiplex_tick(task: u64) {
     let is_eligible = |event: &PerfEventFile| {
         event.enabled.load(Ordering::Acquire)
             && event.is_task_hardware_event()
-            && event.sample_period.load(Ordering::Acquire) == 0
             && event.tracks_task(task)
     };
     let mut anchor = None;
@@ -2106,8 +2178,6 @@ pub(crate) fn on_multiplex_tick(task: u64) {
         return;
     }
 
-    // Stop only counting events. Sampling counters keep their live preload
-    // until period-left migration is implemented.
     for weak in registry.iter() {
         if let Some(event) = weak.upgrade() {
             if is_eligible(&event) {
@@ -2929,6 +2999,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             refresh_limit: AtomicU32::new(0),
             wakeup_pending: AtomicU32::new(0),
             sample_period: AtomicU64::new(sample_period),
+            sample_period_left: AtomicU64::new(sample_period),
             last_sample_period: AtomicU64::new(sample_period),
             sample_frequency: if attr.flags & PERF_ATTR_FLAG_FREQ != 0 {
                 attr.sample_period_or_freq

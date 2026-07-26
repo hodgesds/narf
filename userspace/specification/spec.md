@@ -244,9 +244,10 @@ before arming its first sampled counter. When enabled task counting events
 outnumber the remaining physical slots, the user-mode timer tick rotates their
 allocation order at a 1 ms quantum. A rotation occurs only while an eligible
 event is waiting, folds the exact stopped counter values, and keeps
-`time_running` separate from `time_enabled`. Sampling events are excluded from
-timer multiplexing until their hardware `period_left` can be migrated exactly;
-the adapter does not restart them with a fabricated full period. `inherit` extends
+`time_running` separate from `time_enabled`. Sampling events carry the exact
+hardware `period_left` across rotation and migration; the first overflow after
+resume reports that shortened period, then reloads the configured full period.
+`inherit` extends
 that task set at every process or thread clone and removes the child at its
 thread-exit callback; concurrently running descendants therefore receive
 independent per-CPU slots whose counts feed the original event. Frequency mode

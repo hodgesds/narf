@@ -15,7 +15,12 @@ static ALLOCATED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MA
 static PROGRAMMABLE_ALLOCATED: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 static PROGRAMMABLE_PERIOD: [[AtomicU64; 31]; MAX_CPUS] =
     [const { [const { AtomicU64::new(0) }; 31] }; MAX_CPUS];
+static PROGRAMMABLE_LOADED_PERIOD: [[AtomicU64; 31]; MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; 31] }; MAX_CPUS];
+static PROGRAMMABLE_OVERFLOW_PERIOD: [[AtomicU64; 31]; MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; 31] }; MAX_CPUS];
 static PERIOD: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static LOADED_PERIOD: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static LAST_OVERFLOW_PERIOD: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,8 +173,23 @@ pub unsafe fn pause_programmable(counter: &ProgrammableCounter) -> Result<(), Pm
 /// # Safety
 /// `counter` is live and owned by the current CPU; its firmware PPI is routed.
 pub unsafe fn arm_programmable(counter: &ProgrammableCounter, period: u64) -> Result<(), PmuError> {
+    // SAFETY: forwarded caller contract.
+    unsafe { arm_programmable_with_reload(counter, period, period) }
+}
+
+/// Arm a programmable counter with distinct first and subsequent periods.
+///
+/// # Safety
+/// `counter` is live and current-CPU-owned; its PMU PPI is routed.
+pub unsafe fn arm_programmable_with_reload(
+    counter: &ProgrammableCounter,
+    initial_period: u64,
+    reload_period: u64,
+) -> Result<(), PmuError> {
     check_programmable(counter)?;
-    if !(MIN_SAMPLE_PERIOD..=u32::MAX as u64).contains(&period) {
+    if !(1..=u32::MAX as u64).contains(&initial_period)
+        || !(MIN_SAMPLE_PERIOD..=u32::MAX as u64).contains(&reload_period)
+    {
         return Err(PmuError::InvalidPeriod);
     }
     let bit = 1u64 << counter.idx;
@@ -180,12 +200,14 @@ pub unsafe fn arm_programmable(counter: &ProgrammableCounter, period: u64) -> Re
         sysreg::write_pmintenclr_el1(bit);
         sysreg::write_pmovsclr_el0(bit);
         select_programmable(counter.idx);
-        sysreg::write_pmxevcntr_el0((0u32.wrapping_sub(period as u32)) as u64);
+        sysreg::write_pmxevcntr_el0((0u32.wrapping_sub(initial_period as u32)) as u64);
         sysreg::write_pmintenset_el1(bit);
         sysreg::write_pmcntenset_el0(bit);
     }
     PROGRAMMABLE_PERIOD[counter.cpu as usize][counter.idx as usize]
-        .store(period, Ordering::Release);
+        .store(reload_period, Ordering::Release);
+    PROGRAMMABLE_LOADED_PERIOD[counter.cpu as usize][counter.idx as usize]
+        .store(initial_period, Ordering::Release);
     Ok(())
 }
 
@@ -218,6 +240,10 @@ pub unsafe fn handle_programmable_overflows() -> u32 {
             continue;
         }
         let period = PROGRAMMABLE_PERIOD[cpu][idx as usize].load(Ordering::Acquire);
+        PROGRAMMABLE_OVERFLOW_PERIOD[cpu][idx as usize].store(
+            PROGRAMMABLE_LOADED_PERIOD[cpu][idx as usize].load(Ordering::Acquire),
+            Ordering::Release,
+        );
         // SAFETY: `pending` is restricted to counters allocated on this CPU.
         unsafe {
             sysreg::write_pmcntenclr_el0(bit as u64);
@@ -228,6 +254,7 @@ pub unsafe fn handle_programmable_overflows() -> u32 {
                 sysreg::write_pmcntenset_el0(bit as u64);
             }
         }
+        PROGRAMMABLE_LOADED_PERIOD[cpu][idx as usize].store(period, Ordering::Release);
     }
     pending
 }
@@ -243,6 +270,10 @@ pub unsafe fn release_programmable(counter: ProgrammableCounter) -> Result<(), P
     PROGRAMMABLE_ALLOCATED[counter.cpu as usize]
         .fetch_and(!(1u32 << counter.idx), Ordering::Release);
     PROGRAMMABLE_PERIOD[counter.cpu as usize][counter.idx as usize].store(0, Ordering::Release);
+    PROGRAMMABLE_LOADED_PERIOD[counter.cpu as usize][counter.idx as usize]
+        .store(0, Ordering::Release);
+    PROGRAMMABLE_OVERFLOW_PERIOD[counter.cpu as usize][counter.idx as usize]
+        .store(0, Ordering::Release);
     Ok(())
 }
 
@@ -303,8 +334,21 @@ pub unsafe fn start(counter: &CycleCounter) -> Result<(), PmuError> {
 /// # Safety
 /// `counter` is live and owned by the current CPU; its firmware PPI is routed.
 pub unsafe fn arm_sampling(counter: &CycleCounter, period: u64) -> Result<(), PmuError> {
+    // SAFETY: forwarded caller contract.
+    unsafe { arm_sampling_with_reload(counter, period, period) }
+}
+
+/// Arm the cycle counter with distinct first and subsequent periods.
+///
+/// # Safety
+/// `counter` is live and current-CPU-owned; its PMU PPI is routed.
+pub unsafe fn arm_sampling_with_reload(
+    counter: &CycleCounter,
+    initial_period: u64,
+    reload_period: u64,
+) -> Result<(), PmuError> {
     check_cpu(counter)?;
-    if period < MIN_SAMPLE_PERIOD {
+    if initial_period == 0 || reload_period < MIN_SAMPLE_PERIOD {
         return Err(PmuError::InvalidPeriod);
     }
     let cpu = counter.cpu as usize;
@@ -313,11 +357,12 @@ pub unsafe fn arm_sampling(counter: &CycleCounter, period: u64) -> Result<(), Pm
         sysreg::write_pmcntenclr_el0(CYCLE_BIT);
         sysreg::write_pmintenclr_el1(CYCLE_BIT);
         sysreg::write_pmovsclr_el0(CYCLE_BIT);
-        sysreg::write_pmccntr_el0(0u64.wrapping_sub(period));
+        sysreg::write_pmccntr_el0(0u64.wrapping_sub(initial_period));
         sysreg::write_pmintenset_el1(CYCLE_BIT);
         sysreg::write_pmcntenset_el0(CYCLE_BIT);
     }
-    PERIOD[cpu].store(period, Ordering::Release);
+    PERIOD[cpu].store(reload_period, Ordering::Release);
+    LOADED_PERIOD[cpu].store(initial_period, Ordering::Release);
     Ok(())
 }
 
@@ -350,6 +395,10 @@ pub unsafe fn handle_sampling_overflow() -> bool {
         return false;
     }
     let period = PERIOD[cpu].load(Ordering::Acquire);
+    LAST_OVERFLOW_PERIOD[cpu].store(
+        LOADED_PERIOD[cpu].load(Ordering::Acquire),
+        Ordering::Release,
+    );
     // SAFETY: PMU PPI proves current-CPU overflow context.
     unsafe {
         sysreg::write_pmcntenclr_el0(CYCLE_BIT);
@@ -357,7 +406,7 @@ pub unsafe fn handle_sampling_overflow() -> bool {
         sysreg::write_pmccntr_el0(0u64.wrapping_sub(period));
         sysreg::write_pmcntenset_el0(CYCLE_BIT);
     }
-    LAST_OVERFLOW_PERIOD[cpu].store(period, Ordering::Release);
+    LOADED_PERIOD[cpu].store(period, Ordering::Release);
     true
 }
 
@@ -368,10 +417,35 @@ pub fn last_overflow_period(cpu: usize) -> u64 {
 }
 
 pub fn programmable_period(cpu: usize, counter: usize) -> u64 {
-    PROGRAMMABLE_PERIOD
+    PROGRAMMABLE_OVERFLOW_PERIOD
         .get(cpu)
         .and_then(|periods| periods.get(counter))
         .map_or(0, |period| period.load(Ordering::Acquire))
+}
+
+/// Events remaining before a live PMUv3 counter's next overflow.
+///
+/// # Safety
+/// The counter is live and current-CPU-owned.
+pub unsafe fn sampling_period_left(counter: &CycleCounter) -> Result<u64, PmuError> {
+    // SAFETY: forwarded live current-CPU ownership contract.
+    let raw = unsafe { read(counter)? };
+    let loaded = LOADED_PERIOD[counter.cpu as usize].load(Ordering::Acquire);
+    let consumed = raw.wrapping_sub(0u64.wrapping_sub(loaded));
+    Ok(loaded.saturating_sub(consumed).max(1))
+}
+
+/// Events remaining before a live programmable counter's next overflow.
+///
+/// # Safety
+/// The counter is live and current-CPU-owned.
+pub unsafe fn programmable_period_left(counter: &ProgrammableCounter) -> Result<u64, PmuError> {
+    // SAFETY: forwarded live current-CPU ownership contract.
+    let raw = unsafe { read_programmable(counter)? } as u32;
+    let loaded = PROGRAMMABLE_LOADED_PERIOD[counter.cpu as usize][counter.idx as usize]
+        .load(Ordering::Acquire);
+    let consumed = raw.wrapping_sub(0u32.wrapping_sub(loaded as u32)) as u64;
+    Ok(loaded.saturating_sub(consumed).max(1))
 }
 
 pub fn update_sampling_period(counter: &CycleCounter, period: u64) {
@@ -396,6 +470,7 @@ pub unsafe fn release(counter: CycleCounter) -> Result<(), PmuError> {
     // SAFETY: validated current-CPU PMUv3 ownership.
     unsafe { pause_sampling(&counter)? };
     PERIOD[counter.cpu as usize].store(0, Ordering::Release);
+    LOADED_PERIOD[counter.cpu as usize].store(0, Ordering::Release);
     ALLOCATED[counter.cpu as usize].store(false, Ordering::Release);
     Ok(())
 }

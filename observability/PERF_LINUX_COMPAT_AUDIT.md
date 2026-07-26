@@ -82,10 +82,11 @@ Gaps:
   receive a real slot rather than being estimated. Syscall/poll re-entry for
   the same task does not advance the multiplex epoch. Per-CPU events still
   allocate eagerly and fail when no physical slot is available. A 1 ms
-  user-mode timer quantum rotates oversubscribed task counting events even for
-  a lone runnable task. Sampling-event multiplexing still requires preserving
-  `period_left` across physical counter migration and remains unsupported
-  rather than restarting a fabricated full sampling period.
+  user-mode timer quantum rotates oversubscribed task hardware events even for
+  a lone runnable task. Sampled task events preserve the exact hardware
+  `period_left` across physical-counter rotation and CPU migration; the first
+  resumed overflow reports that shortened period before the configured full
+  reload cadence resumes.
 - Raw PMU formats are architecture-specific: sysfs exposes the x86
   event/unit-mask controls or the aarch64 16-bit architectural event number.
   Model-specific event aliases must still be generated from the detected CPU
