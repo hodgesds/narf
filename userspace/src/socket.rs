@@ -418,6 +418,16 @@ pub struct SocketFile {
     /// when `dispatch_unix_dgram(Recv)` dequeues that message and consumed by
     /// the following `recvmsg` (or discarded by a plain `read`).
     last_recv_fds: IrqSafeSpinLock<Vec<Arc<dyn FileOps>>>,
+    /// Readable-transition generation for connectionless datagram inboxes.
+    /// A bound AF_UNIX DGRAM socket is the systemd `$NOTIFY_SOCKET` shape:
+    /// after an EPOLLET consumer drains it, a refill can occur before epoll
+    /// observes the temporary empty state. The generation preserves that edge.
+    dgram_readable_token: AtomicU64,
+    /// Receive-progress generation for AF_NETLINK queues.  A monitor can
+    /// drain one message between EPOLLET scans; advancing this token on that
+    /// drain preserves the next queued message's edge without manufacturing
+    /// an event while the socket stayed readable.
+    netlink_readable_token: AtomicU64,
     /// AF_NETLINK local and connected peer addresses. Port ID zero means
     /// unbound; an explicit bind with nl_pid=0 allocates a unique ID.
     netlink_portid: AtomicU32,
@@ -779,6 +789,8 @@ impl SocketFile {
             passcred: AtomicBool::new(false),
             last_recv_cred: IrqSafeSpinLock::new(Ucred::default()),
             last_recv_fds: IrqSafeSpinLock::new(Vec::new()),
+            dgram_readable_token: AtomicU64::new(0),
+            netlink_readable_token: AtomicU64::new(0),
             netlink_portid: AtomicU32::new(0),
             netlink_groups: AtomicU32::new(0),
             netlink_memberships: IrqSafeSpinLock::new(BTreeSet::new()),
@@ -998,6 +1010,9 @@ impl SocketFile {
                 inbox.pop_front()
             }
         }?;
+        if flags & MSG_PEEK == 0 {
+            self.netlink_readable_token.fetch_add(1, Ordering::Release);
+        }
         let n = buf.len().min(packet.payload.len());
         buf[..n].copy_from_slice(&packet.payload[..n]);
         self.netlink_last_recv_group.store(0, Ordering::Release);
@@ -1017,6 +1032,13 @@ impl SocketFile {
         self.netlink_reply_groups
             .lock()
             .extend(core::iter::repeat_n(0, count));
+    }
+
+    #[inline]
+    fn note_netlink_receive(&self, flags: u32) {
+        if flags & MSG_PEEK == 0 {
+            self.netlink_readable_token.fetch_add(1, Ordering::Release);
+        }
     }
 
     fn record_queued_netlink_group(&self, flags: u32) {
@@ -1739,6 +1761,16 @@ impl FileOps for SocketFile {
             | SocketState::Inet6Connected { rx, tx, .. } => {
                 (rx.readable_token(), tx.writable_token())
             }
+            SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => {
+                (self.dgram_readable_token.load(Ordering::Acquire), 0)
+            }
+            SocketState::NetlinkUevent { .. }
+            | SocketState::NetlinkRoute { .. }
+            | SocketState::NetlinkGeneric { .. }
+            | SocketState::NetlinkSockDiag { .. }
+            | SocketState::NetlinkNetfilter { .. }
+            | SocketState::NetlinkAudit { .. }
+            | SocketState::NetlinkSink => (self.netlink_readable_token.load(Ordering::Acquire), 0),
             _ => (0, 0),
         }
     }
@@ -1955,6 +1987,7 @@ impl SocketFile {
                 };
                 match msg {
                     Some(bytes) => {
+                        self.note_netlink_receive(flags);
                         self.record_queued_netlink_group(flags);
                         let n = core::cmp::min(buf.len(), bytes.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
@@ -2032,6 +2065,7 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
+                        self.note_netlink_receive(flags);
                         self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
@@ -2097,6 +2131,7 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
+                        self.note_netlink_receive(flags);
                         self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
@@ -2166,6 +2201,7 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
+                        self.note_netlink_receive(flags);
                         self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
@@ -2230,6 +2266,7 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
+                        self.note_netlink_receive(flags);
                         self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
@@ -2286,6 +2323,7 @@ impl SocketFile {
                 };
                 match ev {
                     Some(env) => {
+                        self.note_netlink_receive(flags);
                         self.netlink_last_recv_group.store(1, Ordering::Release);
                         // Kernel netlink uevent wire format (NUL-separated,
                         // `action@devpath` header) so libudev/udevd parse it.
@@ -3588,7 +3626,13 @@ impl SocketFile {
                 };
                 let mut ds = dest_sock.state.lock();
                 if let SocketState::InetDgram { inbox, .. } = &mut *ds {
+                    let was_empty = inbox.is_empty();
                     inbox.push_back(pkt);
+                    if was_empty {
+                        dest_sock
+                            .dgram_readable_token
+                            .fetch_add(1, Ordering::Release);
+                    }
                     SocketOpResult::Ok(buf.len() as u64)
                 } else {
                     SocketOpResult::Ok(buf.len() as u64) // dropped
@@ -3776,7 +3820,13 @@ impl SocketFile {
                 };
                 let mut ds = dest_sock.state.lock();
                 if let SocketState::UnixDgram { inbox, .. } = &mut *ds {
+                    let was_empty = inbox.is_empty();
                     inbox.push_back(pkt);
+                    if was_empty {
+                        dest_sock
+                            .dgram_readable_token
+                            .fetch_add(1, Ordering::Release);
+                    }
                 }
                 drop(ds);
                 // Wake a receiver parked in recv/recvmsg/poll on the dest —

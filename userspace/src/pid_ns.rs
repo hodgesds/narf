@@ -234,10 +234,12 @@ pub fn ns_visible_inner(task: u64, outer: u64) -> Option<u64> {
 
 /// Translate `task`'s outer pid through whichever namespace it
 /// belongs to, returning the inner pid the task sees of itself.
-/// Falls back to `outer_pid` when the task is in the root namespace.
+/// A PID that is not mapped into a non-root namespace reports as zero, as
+/// Linux does for credential and peer-PID queries; only the root namespace
+/// falls back to the outer PID.
 pub fn self_inner_pid(task: u64, outer_pid: u64) -> u64 {
     match ns_of(task) {
-        Some(ns) => ns.outer_to_inner(outer_pid).unwrap_or(outer_pid),
+        Some(ns) => ns.outer_to_inner(outer_pid).unwrap_or(0),
         None => outer_pid,
     }
 }

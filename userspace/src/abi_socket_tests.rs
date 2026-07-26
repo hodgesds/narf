@@ -1310,6 +1310,88 @@ kernel_test_in!(
     smoke_abi_socket_abstract_dgram_roundtrip
 );
 
+/// A bound AF_UNIX datagram socket (the shape of systemd's
+/// `$NOTIFY_SOCKET`) must retain an EPOLLET edge across a drain/refill even
+/// when no epoll scan observes its inbox empty. Connected socketpairs use
+/// RingBuf tokens; named datagram endpoints keep their own inbox and need the
+/// same guarantee.
+fn smoke_abi_socket_abstract_dgram_epollet_drain_refill() -> TestResult {
+    with_setup(|| {
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = abstract_sockaddr(b"narf-abstract-dgram-et");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind() to abstract EPOLLET datagram name failed");
+        }
+
+        let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+        if epfd < 0 {
+            return Err("epoll_create failed");
+        }
+        let mut interest = [0u8; 12];
+        interest[..4].copy_from_slice(&(1u32 | (1u32 << 31)).to_ne_bytes());
+        interest[4..].copy_from_slice(&0x4E4F_5449_4659u64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd as u64, 1, rx, interest.as_ptr() as u64),
+        )
+        .ok_or("epoll_ctl status")?
+            != 0
+        {
+            return Err("epoll_ctl ADD EPOLLET failed");
+        }
+
+        let tx = open_unix(SOCK_DGRAM)?;
+        let mut out = [0u8; 12];
+        for payload in [b"one".as_slice(), b"two".as_slice()] {
+            let sent = call(
+                Syscall::SocketSend.raw(),
+                SyscallArgs {
+                    arg0: tx,
+                    arg1: payload.as_ptr() as u64,
+                    arg2: payload.len() as u64,
+                    arg4: addr.as_ptr() as u64,
+                    arg5: alen,
+                    ..SyscallArgs::default()
+                },
+            )
+            .ok_or("sendto status")?;
+            if sent != payload.len() as i64 {
+                return Err("sendto() to abstract EPOLLET datagram name failed");
+            }
+
+            let ready = call(
+                Syscall::EpollWait.raw(),
+                a3(epfd as u64, out.as_mut_ptr() as u64, 1, 0),
+            )
+            .ok_or("epoll_wait status")?;
+            if ready != 1 {
+                return Err("EPOLLET lost abstract datagram drain/refill edge");
+            }
+
+            let mut buf = [0u8; 8];
+            let received = call(
+                Syscall::SocketRecv.raw(),
+                a3(rx, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+            )
+            .ok_or("recv status")?;
+            if received != payload.len() as i64 || &buf[..payload.len()] != payload {
+                return Err("recv() did not drain the abstract datagram");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_abstract_dgram_epollet_drain_refill
+);
+
 /// connect()/sendto to an unbound abstract name is ECONNREFUSED (-111),
 /// never the bare -1 sentinel.
 fn smoke_abi_socket_abstract_dgram_refused() -> TestResult {
@@ -2597,6 +2679,62 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_uevent_recv);
+
+/// A NETLINK_KOBJECT_UEVENT monitor is udevd's primary event source.  Its
+/// queue may be drained between epoll scans, so EPOLLET must see a subsequent
+/// uevent even though no scan observed the temporary empty state.
+fn smoke_abi_netlink_uevent_epollet_drain_refill() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        let (addr, alen) = netlink_sockaddr(1);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind(NETLINK_KOBJECT_UEVENT) failed");
+        }
+        let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+        if epfd < 0 {
+            return Err("epoll_create failed");
+        }
+        let mut interest = [0u8; 12];
+        interest[..4].copy_from_slice(&(1u32 | (1u32 << 31)).to_ne_bytes());
+        interest[4..].copy_from_slice(&0x5545_5645_4E54u64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd as u64, 1, fd, interest.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("epoll_ctl ADD EPOLLET uevent monitor failed");
+        }
+
+        let mut events = [0u8; 12];
+        for devpath in ["/devices/abi-uevent-et-one", "/devices/abi-uevent-et-two"] {
+            narf_filesystem::uevent::emit(
+                narf_filesystem::uevent::UeventAction::Add,
+                alloc::string::String::from(devpath),
+                alloc::string::String::from("net"),
+            );
+            if call(
+                Syscall::EpollWait.raw(),
+                a3(epfd as u64, events.as_mut_ptr() as u64, 1, 0),
+            ) != Some(1)
+            {
+                return Err("EPOLLET lost NETLINK_KOBJECT_UEVENT drain/refill edge");
+            }
+            let mut buf = [0u8; 512];
+            if netlink_recv(fd, &mut buf).ok_or("uevent recv status")? <= 0 {
+                return Err("uevent monitor did not drain its ready datagram");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_uevent_epollet_drain_refill
+);
 
 // systemd PID 1's audit setup opens `socket(AF_NETLINK, SOCK_RAW, 9)`.
 // Status queries return a disabled audit_status; configuration remains denied

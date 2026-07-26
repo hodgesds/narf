@@ -17170,6 +17170,36 @@ fn smoke_pid_ns_visible_inner_filters() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("userspace", smoke_pid_ns_visible_inner_filters);
 
+/// A credential PID outside the receiver's PID namespace must not leak its
+/// outer value. Linux reports zero for such peer/SCM credentials; this keeps
+/// `SO_PEERCRED` and `SCM_CREDENTIALS` namespace-safe.
+#[cfg(feature = "container")]
+fn smoke_pid_ns_unmapped_outer_pid_reports_zero() -> TestResult {
+    crate::pid_ns::__test_reset();
+    let (manager_task, manager_outer) = (0xB080u64, 100u64);
+    crate::pid_ns::unshare_pid_ns(manager_task, manager_outer);
+
+    if crate::pid_ns::self_inner_pid(manager_task, 999) != 0 {
+        return TestResult::Fail("unmapped outer pid did not report as zero");
+    }
+    let received = crate::handlers::report_ucred_to(
+        manager_task,
+        crate::socket::Ucred {
+            pid: 999,
+            uid: 0,
+            gid: 0,
+        },
+    );
+    crate::pid_ns::__test_reset();
+    if received.pid == 0 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("unmapped SCM_CREDENTIALS pid leaked into namespace")
+    }
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_pid_ns_unmapped_outer_pid_reports_zero);
+
 /// The REPORT (outer→inner, `self_inner_pid`) and ACCEPT (inner→outer,
 /// `resolve_inner_pid`) directions are exact inverses for a bound pid, and an
 /// unbound inner pid resolves to None. This is the round-trip the clone-return
