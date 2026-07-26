@@ -1331,13 +1331,17 @@ impl PerfEventFile {
         }
         let lost = self.sample_lost.swap(0, Ordering::AcqRel);
         if lost != 0 {
-            let mut record = Vec::with_capacity(24);
+            let mut record = Vec::with_capacity(64);
             push_u32(&mut record, PERF_RECORD_LOST);
             record.extend_from_slice(&0u16.to_ne_bytes());
-            record.extend_from_slice(&24u16.to_ne_bytes());
+            record.extend_from_slice(&0u16.to_ne_bytes());
             push_u64(&mut record, self.id);
             push_u64(&mut record, lost);
-            if !self.push_record(&record) {
+            // PERF_RECORD_LOST is a non-sample record. When sample_id_all is
+            // requested, Linux appends the selected sample identity fields;
+            // perf uses that trailer to associate the loss with an evsel.
+            self.append_sample_id(&mut record, pid, tid, now);
+            if !Self::finish_record(&mut record, 0) || !self.push_record(&record) {
                 self.sample_lost.fetch_add(lost, Ordering::Relaxed);
             }
         }

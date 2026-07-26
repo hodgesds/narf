@@ -747,7 +747,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 | (1 << 7) // CPU
                 | (1 << 8), // PERIOD
             read_format: PERF_FORMAT_LOST,
-            flags: 1 | PERF_ATTR_FLAG_INHERIT, // disabled + inherit
+            flags: 1 | PERF_ATTR_FLAG_INHERIT | (1 << 18), // disabled + inherit + sample_id_all
             ..PerfEventAttr::default()
         };
         let sample_fd = match call(
@@ -892,6 +892,50 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             || u64::from_ne_bytes(lost_read[8..16].try_into().unwrap()) == 0
         {
             return Err("PERF_FORMAT_LOST did not report ring drops");
+        }
+        // Free the ring and trigger one more sample. The pending loss must be
+        // emitted first with the sample_id_all trailer perf uses to resolve
+        // the owning event.
+        // SAFETY: sample_ops owns the metadata and two data frames.
+        let full_head =
+            unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
+        // SAFETY: userspace owns data_tail in perf_event_mmap_page.
+        unsafe {
+            core::ptr::write_volatile((sample_frames[0] as usize + 1032) as *mut u64, full_head);
+        }
+        crate::perf_event::sample_from_irq_for_test(88, 0xCAFE_BABE);
+        // SAFETY: sample_ops owns the metadata frame.
+        let recovered_head =
+            unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
+        if recovered_head != full_head + 112 {
+            return Err("PERF_RECORD_LOST and following sample have wrong combined size");
+        }
+        let ring_byte = |absolute: u64| {
+            let ring_offset = absolute as usize & (2 * 4096 - 1);
+            // SAFETY: the selected byte is inside one of the two data frames.
+            unsafe {
+                *((sample_frames[1 + ring_offset / 4096] as usize + ring_offset % 4096)
+                    as *const u8)
+            }
+        };
+        let ring_u32 = |absolute: u64| {
+            u32::from_ne_bytes(core::array::from_fn(|i| ring_byte(absolute + i as u64)))
+        };
+        let ring_u16 = |absolute: u64| {
+            u16::from_ne_bytes(core::array::from_fn(|i| ring_byte(absolute + i as u64)))
+        };
+        let ring_u64 = |absolute: u64| {
+            u64::from_ne_bytes(core::array::from_fn(|i| ring_byte(absolute + i as u64)))
+        };
+        let child_pid = crate::handlers::task_to_pid_raw(88).unwrap_or(88) as u32;
+        if ring_u32(full_head) != 2
+            || ring_u16(full_head + 6) != 56
+            || ring_u64(full_head + 8) == 0
+            || ring_u64(full_head + 8) != ring_u64(full_head + 40)
+            || ring_u32(full_head + 24) != child_pid
+            || ring_u32(full_head + 28) != 88
+        {
+            return Err("PERF_RECORD_LOST sample_id_all wire encoding is invalid");
         }
         crate::perf_event::on_thread_exit(77, 88);
         let _ = call(Syscall::Close.raw(), a0(sample_fd as u64));
