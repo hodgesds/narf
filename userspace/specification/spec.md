@@ -217,7 +217,10 @@ Sample records also serialize `ADDR`, `CALLCHAIN`, `WEIGHT`, `DATA_SRC`,
 field order. Counting PMUs provide no sampled memory address or load/store
 metadata, so those fields carry Linux's unavailable value (`0`); callchains
 contain the exact interrupted IP as their sole leaf frame until architecture
-unwind state is captured. The two weight union views are mutually exclusive.
+unwind state is captured. `CODE_PAGE_SIZE` is resolved against the sampled
+task's registered address-space mapping and reports its real 4 KiB, 2 MiB, or
+1 GiB hardware leaf size (or `0` when the IP is unmapped). The two weight
+union views are mutually exclusive.
 On x86_64, `PERF_EVENT_IOC_PERIOD` synchronously validates and installs a new
 nonzero hardware sampling period while the event is disabled. Updating a live
 or remotely active x86_64 event returns an error until a synchronous cross-CPU

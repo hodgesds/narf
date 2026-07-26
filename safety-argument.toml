@@ -118,3 +118,7 @@ argument = "The procfs adapters read only the scheduler-published current task i
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Network namespace lifetime is retained by typed Arc ownership in tasks, namespace fds, and sockets. Final-reference teardown removes only state keyed by that immutable namespace id, returns physical interfaces to namespace zero after releasing registry locks, and does not alter memory domains, frame ownership, capability epochs, or scheduler state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Perf code-page-size sampling reads only registered virtual-region bounds and the hardware leaf-size enum under existing address-space locks. It exports no physical address or frame handle, transfers no ownership, and does not modify page tables, domain rights, capabilities, or scheduler state."

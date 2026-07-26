@@ -20,12 +20,12 @@ use narf_linux_perf_uapi::{
     PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING,
     PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST,
     PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP, PERF_RECORD_MMAP2,
-    PERF_RECORD_SAMPLE, PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU,
-    PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER,
-    PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_PHYS_ADDR, PERF_SAMPLE_READ,
-    PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION,
-    PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT, PERF_TYPE_HARDWARE, PERF_TYPE_RAW,
-    PERF_TYPE_SOFTWARE,
+    PERF_RECORD_SAMPLE, PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CODE_PAGE_SIZE,
+    PERF_SAMPLE_CPU, PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID,
+    PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_PHYS_ADDR,
+    PERF_SAMPLE_READ, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+    PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT, PERF_TYPE_HARDWARE,
+    PERF_TYPE_RAW, PERF_TYPE_SOFTWARE,
 };
 #[cfg(target_arch = "x86_64")]
 use narf_linux_perf_uapi::{
@@ -612,6 +612,7 @@ const PERF_SAMPLE_SUPPORTED: u64 = PERF_SAMPLE_IP
     | PERF_SAMPLE_TRANSACTION
     | PERF_SAMPLE_PHYS_ADDR
     | PERF_SAMPLE_DATA_PAGE_SIZE
+    | PERF_SAMPLE_CODE_PAGE_SIZE
     | PERF_SAMPLE_WEIGHT_STRUCT;
 
 struct PerfEventFile {
@@ -1414,6 +1415,16 @@ impl PerfEventFile {
         }
         if sample_type & PERF_SAMPLE_DATA_PAGE_SIZE != 0 {
             push_u64(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_CODE_PAGE_SIZE != 0 {
+            let task = u64::from(tid);
+            let page_size = narf_scheduler::address_space_of(narf_scheduler::TaskId(task))
+                .or_else(|| {
+                    (task == current_task_id()).then(narf_scheduler::current_address_space)?
+                })
+                .and_then(|space| space.mapped_page_size(narf_memory::VirtAddr::new(ip)))
+                .unwrap_or(0);
+            push_u64(&mut payload, page_size);
         }
         if sample_type & PERF_SAMPLE_WEIGHT_STRUCT != 0 {
             push_u64(&mut payload, 0);

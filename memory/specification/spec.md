@@ -162,6 +162,8 @@ impl AddressSpace {
         -> Result<(), AddressSpaceError>;
     /// Test membership across both base-page and hardware huge-page regions.
     pub fn contains_address(&self, vaddr: VirtAddr) -> bool;
+    /// Return the registered hardware leaf size (4 KiB, 2 MiB, or 1 GiB).
+    pub fn mapped_page_size(&self, vaddr: VirtAddr) -> Option<u64>;
     /// Non-owning per-region resident-page counts grouped by SRAT node.
     pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot>;
 }

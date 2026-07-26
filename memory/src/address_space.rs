@@ -1443,6 +1443,31 @@ impl AddressSpace {
         })
     }
 
+    /// Return the hardware leaf size covering `vaddr`.
+    ///
+    /// This reports registered mapping metadata without exposing physical
+    /// backing or transferring frame ownership.
+    pub fn mapped_page_size(&self, vaddr: VirtAddr) -> Option<u64> {
+        let v = vaddr.as_u64();
+        if let Some(region) = self.huge_regions.lock().iter().find(|region| {
+            let base = region.base.as_u64();
+            v >= base && v < base.saturating_add(region.len)
+        }) {
+            return Some(match region.size {
+                crate::hugepage::HugeSize::M2 => crate::hugepage::HUGEPAGE_2M_BYTES,
+                crate::hugepage::HugeSize::G1 => crate::hugepage::HUGEPAGE_1G_BYTES,
+            });
+        }
+        self.regions
+            .lock()
+            .iter()
+            .any(|region| {
+                let base = region.base.as_u64();
+                v >= base && v < base.saturating_add(region.len)
+            })
+            .then_some(4096)
+    }
+
     /// Snapshot region-level NUMA residency without cloning or transferring
     /// ownership of any physical backing.
     pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot> {
