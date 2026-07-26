@@ -563,6 +563,7 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
     | PERF_ATTR_FLAG_MMAP_DATA
     | PERF_ATTR_FLAG_MMAP2
     | PERF_ATTR_FLAG_FREQ
+    | PERF_ATTR_FLAG_WATERMARK
     | PERF_ATTR_FLAG_INHERIT
     | PERF_ATTR_FLAG_EXCLUDE_KERNEL
     // NARF does not execute nested guests and currently has no BPF VM or
@@ -1309,20 +1310,25 @@ impl PerfEventFile {
             return RecordPush::Full;
         }
         mapping.write_ring(head, record);
-        mapping.write_u64_release(
-            PERF_MMAP_DATA_HEAD_OFFSET,
-            head.wrapping_add(record.len() as u64),
-        );
+        let new_head = head.wrapping_add(record.len() as u64);
+        mapping.write_u64_release(PERF_MMAP_DATA_HEAD_OFFSET, new_head);
         let threshold = self.attr.wakeup_events_or_watermark;
-        if threshold != 0
-            && self
+        if threshold != 0 {
+            if self.attr.flags & PERF_ATTR_FLAG_WATERMARK != 0 {
+                // In watermark mode the union member is a byte threshold over
+                // unread ring data, not a record count.
+                if new_head.wrapping_sub(tail) >= u64::from(threshold) {
+                    narf_net::readiness::notify(0);
+                }
+            } else if self
                 .wakeup_pending
                 .fetch_add(1, Ordering::AcqRel)
                 .wrapping_add(1)
                 >= threshold
-        {
-            self.wakeup_pending.store(0, Ordering::Release);
-            narf_net::readiness::notify(0);
+            {
+                self.wakeup_pending.store(0, Ordering::Release);
+                narf_net::readiness::notify(0);
+            }
         }
         RecordPush::Committed
     }
@@ -2783,13 +2789,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     // bits need scheduler/process integration; ignoring them would fabricate
     // compatibility.
     let unsupported_attr_flags = attr.flags & !PERF_ATTR_IMPLEMENTED;
-    let empty_bpf_sideband_dummy = attr.type_ == PERF_TYPE_SOFTWARE
-        && attr.config == PERF_COUNT_SW_DUMMY
-        && attr.flags & PERF_ATTR_FLAG_BPF_EVENT != 0
-        && attr.sample_period_or_freq == 0;
-    if unsupported_attr_flags != 0
-        && !(unsupported_attr_flags == PERF_ATTR_FLAG_WATERMARK && empty_bpf_sideband_dummy)
-    {
+    if unsupported_attr_flags != 0 {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }

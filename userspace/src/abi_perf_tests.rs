@@ -770,7 +770,8 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
                 | (1 << 7) // CPU
                 | (1 << 8), // PERIOD
             read_format: PERF_FORMAT_LOST,
-            flags: 1 | PERF_ATTR_FLAG_INHERIT | (1 << 18), // disabled + inherit + sample_id_all
+            flags: 1 | PERF_ATTR_FLAG_INHERIT | PERF_ATTR_FLAG_WATERMARK | (1 << 18), // disabled + inherit + byte watermark + sample_id_all
+            wakeup_events_or_watermark: 96,
             ..PerfEventAttr::default()
         };
         let sample_fd = match call(

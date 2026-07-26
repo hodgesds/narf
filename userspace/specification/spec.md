@@ -193,7 +193,9 @@ Linux `PERF_RECORD_COMM`, `FORK`, and `EXIT` records when their corresponding
 attribute bits are selected. Variable records are eight-byte aligned;
 `sample_id_all` appends the selected TID/TIME/ID/STREAM_ID/CPU/IDENTIFIER
 identity fields in Linux order. `wakeup_events` counts committed records and
-wakes readers at the requested threshold. `PERF_EVENT_IOC_PAUSE_OUTPUT`
+wakes readers at the requested threshold. With the `watermark` attribute,
+the same union member is instead compared against the exact unread byte count
+after each committed record. `PERF_EVENT_IOC_PAUSE_OUTPUT`
 atomically suppresses record commits while leaving the event enabled, and
 resuming makes subsequent records visible again. Ring-capacity failures
 increment the event's loss counter; reads selecting `PERF_FORMAT_LOST` return
