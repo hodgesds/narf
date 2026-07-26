@@ -17230,6 +17230,39 @@ fn smoke_pid_ns_child_view_of_parent_is_pid_one() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("userspace", smoke_pid_ns_child_view_of_parent_is_pid_one);
 
+/// A service's `sd_notify()` datagram is accepted by systemd only when the
+/// SCM_CREDENTIALS pid names that service in PID 1's namespace. Socket send
+/// stamps the sender's outer ProcessId, so receive-side reporting must perform
+/// the same outer→inner translation as wait4 and /proc. This pins that
+/// Type=notify identity contract independently of the socket transport.
+#[cfg(feature = "container")]
+fn smoke_pid_ns_ucred_reports_service_pid_to_manager() -> TestResult {
+    crate::pid_ns::__test_reset();
+    let (manager_task, manager_outer, service_task, service_outer) =
+        (0xB280u64, 100u64, 0xB281u64, 101u64);
+    crate::pid_ns::unshare_pid_ns(manager_task, manager_outer);
+    crate::pid_ns::inherit_into_child(manager_task, service_task, service_outer);
+
+    let received = crate::handlers::report_ucred_to(
+        manager_task,
+        crate::socket::Ucred {
+            pid: service_outer as u32,
+            uid: 0,
+            gid: 0,
+        },
+    );
+    if received.pid != 2 {
+        return TestResult::Fail("SCM_CREDENTIALS did not report service as PID 2 to manager");
+    }
+    crate::pid_ns::__test_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "userspace",
+    smoke_pid_ns_ucred_reports_service_pid_to_manager
+);
+
 /// Exit cleanup: `release_outer` frees the dying task's inner slot for reuse so
 /// a recycled outer pid doesn't inherit a stale inner id. `on_child_exit` keys
 /// this by the TaskId (ns lookup) but frees by the ProcessId (the outer↔inner
