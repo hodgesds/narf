@@ -751,8 +751,20 @@ fn smoke_abi_fsx2_mount_namespace_stack_pos() -> TestResult {
         if ns.mount_arc(&auth, "/abi-private-stack", first).is_err() {
             return Err("first private namespace mount failed");
         }
+        let first_id = match ns.mount_id_at("/abi-private-stack") {
+            Some(id) if id != 0 => id,
+            _ => return Err("first private mount must expose a nonzero mount id"),
+        };
         if ns.mount_arc(&auth, "/abi-private-stack", second).is_err() {
             return Err("private mount namespace must permit stacking at one target");
+        }
+        match ns.mount_id_at("/abi-private-stack") {
+            Some(id) if id != first_id => {}
+            _ => return Err("stacking a mount must change the visible mount id"),
+        }
+        match ns.list_mountinfo().last() {
+            Some((_, parent, path, _)) if *parent == first_id && path == "/abi-private-stack" => {}
+            _ => return Err("a stacked mount must name the covered mount as its parent"),
         }
         match ns.resolve_absolute("/abi-private-stack", |fs, _| fs.name() == "stack-second") {
             Some(true) => Ok(()),
@@ -1064,6 +1076,75 @@ fn smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos
+);
+
+fn smoke_abi_fsx2_recursive_bind_preserves_descendant_mounts_pos() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_BIND: u64 = 1 << 12;
+        const MS_REC: u64 = 1 << 14;
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("private mount namespace setup failed");
+            }
+            let ns = match crate::handlers::current_mount_namespace() {
+                Some(ns) => ns,
+                None => return Err("unshare did not install a mount namespace"),
+            };
+            let auth = narf_filesystem::bootstrap_mount_authority();
+            let root: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                alloc::sync::Arc::new(narf_filesystem::VirtiofsMount::new("rbind-root"));
+            let child: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                alloc::sync::Arc::new(narf_filesystem::VirtiofsMount::new("rbind-child"));
+            if ns.mount_arc(&auth, "/abi-rbind-source", root).is_err()
+                || ns
+                    .mount_arc(&auth, "/abi-rbind-source/sys/fs/cgroup", child)
+                    .is_err()
+            {
+                return Err("recursive-bind mount setup failed");
+            }
+            let source = b"/abi-rbind-source\0";
+            let target = b"/abi-rbind-target\0";
+            let bind = SyscallArgs {
+                arg0: source.as_ptr() as u64,
+                arg1: target.as_ptr() as u64,
+                arg2: 0,
+                arg3: MS_BIND | MS_REC,
+                ..Default::default()
+            };
+            if call(Syscall::Mount.raw(), bind) != Some(0) {
+                return Err("recursive bind mount failed");
+            }
+            match ns.resolve_absolute("/abi-rbind-target/sys/fs/cgroup", |fs, rel| {
+                rel.is_empty() && fs.name() == "rbind-child"
+            }) {
+                Some(true) => {}
+                _ => return Err("recursive bind must rebase descendant mounts"),
+            }
+            let before_self_bind = ns.list().len();
+            let self_source = b"/abi-rbind-target/\0";
+            let self_bind = SyscallArgs {
+                arg0: self_source.as_ptr() as u64,
+                arg1: target.as_ptr() as u64,
+                arg2: 0,
+                arg3: MS_BIND | MS_REC,
+                ..Default::default()
+            };
+            if call(Syscall::Mount.raw(), self_bind) != Some(0) {
+                return Err("recursive self-bind failed");
+            }
+            if ns.list().len() != before_self_bind + 1 {
+                return Err("recursive self-bind must not duplicate existing descendants");
+            }
+            Ok(())
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_recursive_bind_preserves_descendant_mounts_pos
 );
 
 // ── open_tree: ENOENT on an absolute path with no covering mount ──────

@@ -523,17 +523,21 @@ fn render_limits(pid: u64) -> String {
 ///   `mount_id parent_id major:minor root mount_point opts - fstype source opts`
 fn render_mountinfo(pid: u64) -> String {
     // Per-ns view first. The hook returns the task's private mount-ns
-    // mount list (one "path\tfsname" line per mount) when it has
+    // mount list (one "id\tparent\tpath\tfsname" line per mount) when it has
     // unshared CLONE_NEWNS; None ⇒ fall back to the global registry.
     if let Some(rows) = super::hook_ns_mountinfo(pid) {
         let mut s = String::new();
-        let mut id = 1u32;
         for line in rows.lines() {
-            let mut it = line.splitn(2, '\t');
+            let mut it = line.splitn(4, '\t');
+            let id = it.next().unwrap_or("1");
+            let parent = it.next().unwrap_or("0");
             let path = it.next().unwrap_or("/");
             let fs_name = it.next().unwrap_or("rootfs");
-            let _ = writeln!(s, "{} 0 0:1 / {} rw - {} {} rw", id, path, fs_name, fs_name);
-            id += 1;
+            let _ = writeln!(
+                s,
+                "{} {} 0:1 / {} rw - {} {} rw",
+                id, parent, path, fs_name, fs_name
+            );
         }
         if s.is_empty() {
             let _ = writeln!(s, "1 0 0:1 / / rw - rootfs rootfs rw");
@@ -541,10 +545,12 @@ fn render_mountinfo(pid: u64) -> String {
         return s;
     }
     let mut s = String::new();
-    let mut id = 1u32;
-    for (path, fs_name) in crate::registry().list_with_names() {
-        let _ = writeln!(s, "{} 0 0:1 / {} rw - {} {} rw", id, path, fs_name, fs_name);
-        id += 1;
+    for (id, parent, path, fs_name) in crate::registry().list_mountinfo() {
+        let _ = writeln!(
+            s,
+            "{} {} 0:1 / {} rw - {} {} rw",
+            id, parent, path, fs_name, fs_name
+        );
     }
     if s.is_empty() {
         // Guarantee at least one line so parsers don't fail.

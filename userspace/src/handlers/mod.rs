@@ -969,7 +969,7 @@ fn open_impl(
                 match new_fd {
                     Some(n) => {
                         #[cfg(feature = "linux-compat")]
-                        crate::mqueue::register_fd_path(task, n, path);
+                        crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                         ctx.set_return(SyscallReturn::ok(n as u64));
                     }
                     None => ctx.set_return(fail),
@@ -1038,7 +1038,7 @@ fn open_impl(
                     // Record the backing path so /proc/<pid>/fd/<n> readlinks
                     // to it (musl realpath, lsof, opendir-on-fd). See fd_path_of.
                     #[cfg(feature = "linux-compat")]
-                    crate::mqueue::register_fd_path(task, n, path);
+                    crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                     ctx.set_return(SyscallReturn::ok(n as u64));
                 }
                 None => ctx.set_return(fail),
@@ -1194,7 +1194,7 @@ fn open_impl(
     // and emit IN_CREATE (new file) + IN_OPEN against any matching watch.
     #[cfg(feature = "linux-compat")]
     {
-        crate::mqueue::register_fd_path(task, new_fd, path);
+        crate::mqueue::register_fd_path(task, new_fd, path, current_mount_id_at(path));
         if created {
             crate::mqueue::notify_create(path, false);
         }
@@ -1281,7 +1281,7 @@ fn open_fifo(
         || (can_write && shared.reader_count() > 0);
     if peer_ready {
         #[cfg(feature = "linux-compat")]
-        crate::mqueue::register_fd_path(task, new_fd, _path);
+        crate::mqueue::register_fd_path(task, new_fd, _path, current_mount_id_at(_path));
         ctx.set_return(SyscallReturn::ok(new_fd as u64));
         return;
     }
@@ -5129,7 +5129,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
             const CLONE_NEWPID: u64 = 0x20000000;
             if flags & CLONE_NEWNS != 0 {
                 task_mount_ns_init();
-                let snap = narf_filesystem::MountNamespace::snapshot_global();
+                let snap = snapshot_current_mount_namespace();
                 install_mount_namespace(child, snap);
             }
             if flags & CLONE_NEWPID != 0 {
@@ -9610,6 +9610,13 @@ pub fn current_mount_namespace() -> Option<alloc::sync::Arc<narf_filesystem::Mou
     g.as_ref().and_then(|m| m.get(&task).cloned())
 }
 
+pub(crate) fn snapshot_current_mount_namespace() -> alloc::sync::Arc<narf_filesystem::MountNamespace>
+{
+    current_mount_namespace()
+        .map(|ns| ns.snapshot())
+        .unwrap_or_else(narf_filesystem::MountNamespace::snapshot_global)
+}
+
 pub(crate) fn clear_current_mount_namespace_for_test() {
     let task = current_task_id();
     if let Some(namespaces) = TASK_MOUNT_NS.lock().as_mut() {
@@ -9702,6 +9709,13 @@ fn current_mount_list_with_names() -> alloc::vec::Vec<(alloc::string::String, al
     current_mount_namespace()
         .map(|ns| ns.list_with_names())
         .unwrap_or_else(|| narf_filesystem::registry().list_with_names())
+}
+
+fn current_mount_id_at(path: &str) -> Option<u64> {
+    match current_mount_namespace() {
+        Some(ns) => ns.mount_id_at(path),
+        None => narf_filesystem::registry().mount_id_at(path),
+    }
 }
 
 pub(crate) fn current_mount_arc(
@@ -9815,10 +9829,22 @@ pub fn proc_ns_readlink(pid: u64, tag: u8) -> Option<alloc::string::String> {
 pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
     let ns = mount_namespace_of(task)?;
+    let process_root = root_dir_of(task).unwrap_or_else(|| alloc::string::String::from("/"));
     let mut s = alloc::string::String::new();
     use core::fmt::Write as _;
-    for (path, name) in ns.list_with_names() {
-        let _ = writeln!(s, "{}\t{}", path, name);
+    for (id, parent, path, name) in ns.list_mountinfo() {
+        let visible = if process_root == "/" {
+            path
+        } else if path == process_root {
+            alloc::string::String::from("/")
+        } else if path.starts_with(process_root.as_str())
+            && path.as_bytes().get(process_root.len()) == Some(&b'/')
+        {
+            alloc::string::String::from(&path[process_root.len()..])
+        } else {
+            continue;
+        };
+        let _ = writeln!(s, "{}\t{}\t{}\t{}", id, parent, visible, name);
     }
     Some(s)
 }

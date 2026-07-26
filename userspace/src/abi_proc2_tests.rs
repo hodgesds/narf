@@ -498,6 +498,49 @@ fn smoke_abi_proc2_unshare_newns() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_unshare_newns);
 
+fn smoke_abi_proc2_unshare_newns_copies_current_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("first unshare(CLONE_NEWNS) failed");
+            }
+            let first = match crate::handlers::current_mount_namespace() {
+                Some(ns) => ns,
+                None => return Err("first unshare did not install a namespace"),
+            };
+            let auth = narf_filesystem::bootstrap_mount_authority();
+            let private: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                alloc::sync::Arc::new(narf_filesystem::VirtiofsMount::new("nested-private"));
+            if first.mount_arc(&auth, "/nested-private", private).is_err() {
+                return Err("private mount setup failed");
+            }
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("second unshare(CLONE_NEWNS) failed");
+            }
+            let second = match crate::handlers::current_mount_namespace() {
+                Some(ns) => ns,
+                None => return Err("second unshare did not install a namespace"),
+            };
+            if alloc::sync::Arc::ptr_eq(&first, &second) {
+                return Err("unshare must create an independent mount table");
+            }
+            match second.resolve_absolute("/nested-private", |fs, rel| {
+                rel.is_empty() && fs.name() == "nested-private"
+            }) {
+                Some(true) => Ok(()),
+                _ => Err("nested unshare must copy mounts from the current namespace"),
+            }
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_unshare_newns_copies_current_namespace
+);
+
 // ── prctl PR_SET/GET_PDEATHSIG + PR_SET/GET_CHILD_SUBREAPER ──
 
 fn smoke_abi_proc2_prctl_pdeathsig_roundtrip() -> TestResult {

@@ -746,12 +746,52 @@ fn smoke_abi_fsx_name_to_handle_at_pos() -> TestResult {
             mount_id.as_mut_ptr() as u64,
         );
         match call(Syscall::NameToHandleAt.raw(), args) {
-            Some(0) => Ok(()),
+            Some(0) if i32::from_ne_bytes(mount_id) > 0 => Ok(()),
+            Some(0) => Err("name_to_handle_at must report the visible mount id"),
             _ => Err("name_to_handle_at on an existing file should return 0"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_name_to_handle_at_pos);
+
+fn smoke_abi_fsx_name_to_handle_at_empty_path_mount_id_pos() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        const O_PATH: u64 = 0o10000000;
+        let path = b"/abi/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, O_PATH, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("O_PATH open for AT_EMPTY_PATH setup failed"),
+        };
+        let empty = b"\0";
+        let mut hbuf = [0u8; 16];
+        hbuf[0..4].copy_from_slice(&8u32.to_ne_bytes());
+        let mut mount_id = [0u8; 4];
+        let args = SyscallArgs {
+            arg0: fd,
+            arg1: empty.as_ptr() as u64,
+            arg2: hbuf.as_mut_ptr() as u64,
+            arg3: mount_id.as_mut_ptr() as u64,
+            arg4: AT_EMPTY_PATH,
+            ..Default::default()
+        };
+        let result = match call(Syscall::NameToHandleAt.raw(), args) {
+            Some(0) if i32::from_ne_bytes(mount_id) > 0 => Ok(()),
+            Some(0) => Err("AT_EMPTY_PATH must preserve the fd's opening mount id"),
+            _ => Err("name_to_handle_at(AT_EMPTY_PATH) failed"),
+        };
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_name_to_handle_at_empty_path_mount_id_pos
+);
 
 fn smoke_abi_fsx_name_to_handle_at_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {

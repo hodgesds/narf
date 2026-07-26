@@ -70,8 +70,9 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
             return;
         }
         if a.arg3 != 0 {
+            let mount_id = crate::mqueue::fd_mount_id(task, dirfd).unwrap_or(0) as i32;
             // SAFETY: copy_to_user validates the 4-byte destination.
-            let _ = unsafe { copy_to_user(a.arg3, &0i32.to_ne_bytes()) };
+            let _ = unsafe { copy_to_user(a.arg3, &mount_id.to_ne_bytes()) };
         }
         ctx.set_return(SyscallReturn::ok(0));
         return;
@@ -95,6 +96,7 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
         }
     };
     let path = apply_chroot(&raw);
+    let mount_id = current_mount_id_at(&path).unwrap_or(0) as i32;
     // Dir-aware resolution (files, directories, mount roots and mount
     // ancestors alike), carrying the object's stable inode. A dir-only
     // node — e.g. a cgroup directory, whose children exist purely as
@@ -135,7 +137,7 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
         }
         if a.arg3 != 0 {
             // SAFETY: copy_to_user validates the 4-byte destination.
-            let _ = unsafe { copy_to_user(a.arg3, &0i32.to_ne_bytes()) };
+            let _ = unsafe { copy_to_user(a.arg3, &mount_id.to_ne_bytes()) };
         }
         ctx.set_return(SyscallReturn::ok(0));
         return;
@@ -160,10 +162,11 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
         return;
     }
-    // mount_id (arg3) — one filesystem namespace, so report 0.
+    // Linux exposes the visible mount's ID here. systemd compares it with
+    // the parent mount ID to verify that a bind target became a mount point.
     if a.arg3 != 0 {
         // SAFETY: copy_to_user validates the 4-byte destination.
-        let _ = unsafe { copy_to_user(a.arg3, &0i32.to_ne_bytes()) };
+        let _ = unsafe { copy_to_user(a.arg3, &mount_id.to_ne_bytes()) };
     }
     ctx.set_return(SyscallReturn::ok(0));
 }

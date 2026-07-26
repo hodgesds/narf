@@ -1458,6 +1458,7 @@ pub struct Mount {
     pub path: alloc::string::String,
     pub fs: Arc<dyn FsInstance>,
     pub handle: Cap<MountPoint, Write>,
+    id: u64,
 }
 
 impl fmt::Debug for Mount {
@@ -1467,6 +1468,32 @@ impl fmt::Debug for Mount {
             .field("fs", &self.fs.name())
             .finish_non_exhaustive()
     }
+}
+
+fn mountinfo_rows(mounts: &[Mount]) -> Vec<(u64, u64, String, String)> {
+    mounts
+        .iter()
+        .enumerate()
+        .map(|(index, mount)| {
+            let parent = mounts[..index]
+                .iter()
+                .filter(|candidate| {
+                    mount.path == candidate.path
+                        || candidate.path == "/"
+                        || (mount.path.starts_with(candidate.path.as_str())
+                            && mount.path.as_bytes().get(candidate.path.len()) == Some(&b'/'))
+                })
+                .max_by_key(|candidate| candidate.path.len())
+                .map(|candidate| candidate.id)
+                .unwrap_or(0);
+            (
+                mount.id,
+                parent,
+                mount.path.clone(),
+                String::from(mount.fs.name()),
+            )
+        })
+        .collect()
 }
 
 /// Global VFS mount registry. Mirrors the cap-gate pattern used by
@@ -1480,6 +1507,12 @@ pub struct VfsRegistry {
 static REGISTRY: VfsRegistry = VfsRegistry {
     inner: IrqSafeSpinLock::new(Vec::new()),
 };
+
+static NEXT_MOUNT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+fn alloc_mount_id() -> u64 {
+    NEXT_MOUNT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Reference the global VFS registry.
 #[inline]
@@ -1567,26 +1600,38 @@ pub struct MountNamespace {
 }
 
 impl MountNamespace {
-    /// Build a private namespace seeded with the current global
-    /// registry's mounts. The mounts share the underlying
-    /// `Arc<dyn FsInstance>` — a bind-mount-style relationship,
-    /// not a deep copy.
-    pub fn snapshot_global() -> Arc<Self> {
-        let g = REGISTRY.inner.lock();
-        // Re-mint per-mount handles so the NS owns its own caps.
-        // The original handles in the global registry stay live.
-        let copied: Vec<Mount> = g
+    fn from_mounts(mounts: &[Mount]) -> Arc<Self> {
+        let copied = mounts
             .iter()
             .map(|m| Mount {
                 path: m.path.clone(),
                 fs: m.fs.clone(),
                 handle: Cap::<MountPoint, Write>::bootstrap(),
+                id: alloc_mount_id(),
             })
             .collect();
         Arc::new(Self {
             id: alloc_mount_ns_id(),
             inner: IrqSafeSpinLock::new(copied),
         })
+    }
+
+    /// Build a private namespace seeded with the current global
+    /// registry's mounts. The mounts share the underlying
+    /// `Arc<dyn FsInstance>` — a bind-mount-style relationship,
+    /// not a deep copy.
+    pub fn snapshot_global() -> Arc<Self> {
+        let g = REGISTRY.inner.lock();
+        Self::from_mounts(&g)
+    }
+
+    /// Copy this namespace's current mount table into a new namespace.
+    ///
+    /// Linux `unshare(CLONE_NEWNS)` and `clone(CLONE_NEWNS)` copy the
+    /// caller's current namespace, including mounts private to it.
+    pub fn snapshot(&self) -> Arc<Self> {
+        let g = self.inner.lock();
+        Self::from_mounts(&g)
     }
 
     /// Stable namespace id (nsfs inode in Linux).
@@ -1673,6 +1718,25 @@ impl MountNamespace {
             .collect()
     }
 
+    /// Mount identity and hierarchy in attachment order.
+    pub fn list_mountinfo(&self) -> Vec<(u64, u64, String, String)> {
+        mountinfo_rows(&self.inner.lock())
+    }
+
+    /// ID of the newest visible mount covering `abs`.
+    pub fn mount_id_at(&self, abs: &str) -> Option<u64> {
+        let q = self.inner.lock();
+        q.iter()
+            .filter(|m| {
+                abs == m.path
+                    || m.path == "/"
+                    || (abs.starts_with(m.path.as_str())
+                        && abs.as_bytes().get(m.path.len()) == Some(&b'/'))
+            })
+            .max_by_key(|m| m.path.len())
+            .map(|m| m.id)
+    }
+
     /// Attach a filesystem to this private namespace. Unlike the boot-time
     /// registry, private namespaces permit stacking at the same path; the most
     /// recently attached mount is the visible one.
@@ -1688,6 +1752,7 @@ impl MountNamespace {
             path: String::from(path),
             fs,
             handle,
+            id: alloc_mount_id(),
         });
         Ok(handle)
     }
@@ -1812,6 +1877,7 @@ impl VfsRegistry {
             path: alloc::string::String::from(path),
             fs: arc,
             handle,
+            id: alloc_mount_id(),
         });
         Ok(handle)
     }
@@ -1836,6 +1902,7 @@ impl VfsRegistry {
             path: alloc::string::String::from(path),
             fs,
             handle,
+            id: alloc_mount_id(),
         });
         Ok(handle)
     }
@@ -1906,6 +1973,27 @@ impl VfsRegistry {
         q.iter()
             .map(|m| (m.path.clone(), alloc::string::String::from(m.fs.name())))
             .collect()
+    }
+
+    /// Mount identity and hierarchy in attachment order.
+    pub fn list_mountinfo(
+        &self,
+    ) -> alloc::vec::Vec<(u64, u64, alloc::string::String, alloc::string::String)> {
+        mountinfo_rows(&self.inner.lock())
+    }
+
+    /// ID of the visible mount covering `abs`.
+    pub fn mount_id_at(&self, abs: &str) -> Option<u64> {
+        let q = self.inner.lock();
+        q.iter()
+            .filter(|m| {
+                abs == m.path
+                    || m.path == "/"
+                    || (abs.starts_with(m.path.as_str())
+                        && abs.as_bytes().get(m.path.len()) == Some(&b'/'))
+            })
+            .max_by_key(|m| m.path.len())
+            .map(|m| m.id)
     }
 
     /// Unmount the FS at `path`. The `handle` cap must be live and

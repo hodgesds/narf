@@ -181,6 +181,23 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // Wave-71: MS_BIND or fstype=="bind" → bind mount. `source` is
     // an absolute path; `target` is the new path. No block device.
     if fstype == "bind" || (flags & MS_BIND) != 0 {
+        let source_base = if source_resolved == "/" {
+            "/"
+        } else {
+            source_resolved.trim_end_matches('/')
+        };
+        let target_base = if target == "/" {
+            "/"
+        } else {
+            target.trim_end_matches('/')
+        };
+        let descendants = if flags & MS_REC != 0 && source_base != target_base {
+            current_clone_mount_subtree(source_base)
+                .map(|(_, descendants)| descendants)
+                .unwrap_or_default()
+        } else {
+            alloc::vec::Vec::new()
+        };
         // systemd protects procfs control files by bind-mounting a file onto
         // the identical path before a read-only remount. NARF's mount tree is
         // directory-rooted, but this exact self-bind cannot change lookup
@@ -192,7 +209,20 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             return;
         }
         return match current_bind_mount(&auth, source_resolved.as_str(), target.as_str()) {
-            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
+            Ok(_h) => {
+                for (relative, fs) in descendants {
+                    let child_target = if target == "/" {
+                        alloc::format!("/{}", relative.trim_start_matches('/'))
+                    } else {
+                        alloc::format!("{}{}", target.trim_end_matches('/'), relative)
+                    };
+                    if current_mount_arc(&auth, child_target.as_str(), fs).is_err() {
+                        ctx.set_return(ebusy);
+                        return;
+                    }
+                }
+                ctx.set_return(SyscallReturn::ok(0));
+            }
             Err(narf_filesystem::FsError::NotFound) => ctx.set_return(enoent),
             Err(narf_filesystem::FsError::Busy) => ctx.set_return(ebusy),
             Err(_) => ctx.set_return(einval),

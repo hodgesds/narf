@@ -164,6 +164,20 @@ Linux-compat mount namespaces hold a private snapshot of the mount table.
 Mount, bind-mount, and unmount operations after `CLONE_NEWNS` mutate that
 snapshot only. Private tables permit mount stacking; path resolution and
 unmount select the most recently attached mount at an equal path.
+Every attachment receives a nonzero mount ID, and `mount_id_at` reports the
+newest visible mount so Linux `name_to_handle_at(2)` can expose mount identity.
+Open file descriptions retain the mount ID visible at open time, including for
+`name_to_handle_at(AT_EMPTY_PATH)`, even when a later mount covers that path.
+`list_mountinfo` preserves attachment order and reports the covered or nearest
+ancestor mount ID as each entry's parent for `/proc/<pid>/mountinfo`.
+The procfs view hides mounts outside the queried task's root and projects that
+root to `/`, so a chrooted task never sees backing prefixes such as `/mnt`.
+Recursive bind mounts rebase every visible descendant mount beneath the new
+target, preserving nested API mounts such as cgroup2 beneath a bound `/sys`.
+A recursive bind whose normalized source and target are identical stacks the
+root only; its descendants are already attached at the required paths.
+Nested `unshare(CLONE_NEWNS)` and `clone(CLONE_NEWNS)` copy the caller's
+current private table rather than rebuilding from the global registry.
 `clone_tree_at` exposes an arbitrary directory subtree as a detached
 filesystem root for Linux `open_tree(2)` and later `move_mount(2)`.
 An `OPEN_TREE_CLONE` detached object retains the visible descendant

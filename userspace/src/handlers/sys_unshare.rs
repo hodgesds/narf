@@ -12,7 +12,7 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     if flags & CLONE_NEWNS != 0 {
         task_mount_ns_init();
         let task = current_task_id();
-        let snap = narf_filesystem::MountNamespace::snapshot_global();
+        let snap = snapshot_current_mount_namespace();
         let mut g = TASK_MOUNT_NS.lock();
         if let Some(m) = g.as_mut() {
             m.insert(task, snap);
