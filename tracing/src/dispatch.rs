@@ -20,7 +20,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -37,6 +37,12 @@ impl CapType for ProbeHandlerInstall {
 
 /// Monotonic source of probe IDs. `0` is reserved as "unassigned".
 static NEXT_PROBE_ID: AtomicU32 = AtomicU32::new(1);
+static PROBE_OBSERVER: AtomicUsize = AtomicUsize::new(0);
+
+/// Install one allocation-free observer invoked for every dynamic probe fire.
+pub fn install_probe_observer(observer: fn(u32, ProbeArgs)) {
+    PROBE_OBSERVER.store(observer as usize, Ordering::Release);
+}
 
 /// Reserve a fresh probe ID. Every compiled probe site calls this
 /// once at first fire (lazy assignment) so the ID is stable across
@@ -165,6 +171,13 @@ impl HandlerTable {
 /// Called from armed probe sites and from tests.
 #[inline]
 pub fn fire(probe_id: u32, args: ProbeArgs) {
+    let observer = PROBE_OBSERVER.load(Ordering::Acquire);
+    if observer != 0 {
+        // SAFETY: the slot is written only from a function pointer with this
+        // exact signature and remains valid for the kernel lifetime.
+        let observer: fn(u32, ProbeArgs) = unsafe { core::mem::transmute(observer) };
+        observer(probe_id, args);
+    }
     // Take a short-lived reference to the handler by first locking,
     // cloning the Box pointer via a trait-object reference, and
     // releasing the lock before invoking — so a handler that blocks

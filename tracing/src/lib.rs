@@ -49,8 +49,8 @@ pub mod tdigest;
 pub use hwtrace::{HwTraceConfig, HwTraceError, HwTraceMarker, HwTraceStatus};
 
 pub use dispatch::{
-    fire, reserve_probe_id, table as handler_table, HandlerTable, ProbeArgs, ProbeHandler,
-    ProbeHandlerInstall, RegisterError,
+    fire, install_probe_observer, reserve_probe_id, table as handler_table, HandlerTable,
+    ProbeArgs, ProbeHandler, ProbeHandlerInstall, RegisterError,
 };
 pub use fntime::{scope, FnTime, ScopeGuard, Welford};
 pub use sketch::{Histogram, HISTOGRAM_BUCKETS};
@@ -60,6 +60,13 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+
+static EVENT_OBSERVER: AtomicUsize = AtomicUsize::new(0);
+
+/// Install one allocation-free observer for typed trace events.
+pub fn install_event_observer(observer: fn(u64, &[u8])) {
+    EVENT_OBSERVER.store(observer as usize, Ordering::Release);
+}
 
 use alloc::boxed::Box;
 
@@ -760,6 +767,12 @@ pub fn current_event_sink_name() -> Option<&'static str> {
 /// already in place by the time the next call lands.
 #[inline]
 pub fn emit_event(type_id: u64, bytes: &[u8]) {
+    let observer = EVENT_OBSERVER.load(Ordering::Acquire);
+    if observer != 0 {
+        // SAFETY: installed only from a function pointer with this signature.
+        let observer: fn(u64, &[u8]) = unsafe { core::mem::transmute(observer) };
+        observer(type_id, bytes);
+    }
     let p = SINK.load(Ordering::Relaxed) as *mut Box<dyn EventSink>;
     if p.is_null() {
         return;

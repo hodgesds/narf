@@ -25,10 +25,11 @@ mod tests;
 pub use dispatch::{
     add_nmi_handler, disable_irq, enable_irq, fire_count, fire_count_on_cpu,
     install as install_handler, install_handler_named, installed_handler_names, interrupted_ip,
-    is_masked, nmi_fire_count, nmi_spurious_count, on_irq, on_irq_with_context, on_nmi,
-    remove_handler, remove_nmi_handler, snapshot_counters, spurious_count, synchronize_irq,
-    wakes_invoked, HandlerEntry, IrqCounterSnapshot, IrqStatus, NmiHandler, NmiHandlerId,
-    SyncHandler, NUM_VECTORS, PERCPU_FIRES_MAX,
+    interrupted_user_state, is_masked, nmi_fire_count, nmi_spurious_count, on_irq,
+    on_irq_with_context, on_irq_with_user_state, on_nmi, remove_handler, remove_nmi_handler,
+    snapshot_counters, spurious_count, synchronize_irq, wakes_invoked, HandlerEntry,
+    InterruptedUserState, IrqCounterSnapshot, IrqStatus, NmiHandler, NmiHandlerId, SyncHandler,
+    NUM_VECTORS, PERCPU_FIRES_MAX,
 };
 pub use wait::{wait_for_irq, wait_for_irq_until, WaitForIrq};
 

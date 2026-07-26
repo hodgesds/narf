@@ -4,6 +4,7 @@ use crate::syscall::{SyscallReturn, TrapContext};
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -13,20 +14,21 @@ use narf_linux_perf_uapi::{
     PERF_ATTR_FLAG_EXCLUDE_GUEST, PERF_ATTR_FLAG_EXCLUDE_HV, PERF_ATTR_FLAG_EXCLUDE_KERNEL,
     PERF_ATTR_FLAG_EXCLUDE_USER, PERF_ATTR_FLAG_EXCLUSIVE, PERF_ATTR_FLAG_FREQ,
     PERF_ATTR_FLAG_INHERIT, PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP, PERF_ATTR_FLAG_MMAP2,
-    PERF_ATTR_FLAG_MMAP_DATA, PERF_ATTR_FLAG_PINNED, PERF_ATTR_FLAG_SAMPLE_ID_ALL,
-    PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK, PERF_ATTR_SIZE_VER0,
-    PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_MISSES,
-    PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_CPU_CLOCK,
-    PERF_COUNT_SW_DUMMY, PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP, PERF_FORMAT_ID,
-    PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING,
-    PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST,
-    PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP, PERF_RECORD_MMAP2,
-    PERF_RECORD_SAMPLE, PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CODE_PAGE_SIZE,
-    PERF_SAMPLE_CPU, PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID,
-    PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_PHYS_ADDR,
-    PERF_SAMPLE_READ, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
-    PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT, PERF_TYPE_HARDWARE,
-    PERF_TYPE_RAW, PERF_TYPE_SOFTWARE,
+    PERF_ATTR_FLAG_MMAP_DATA, PERF_ATTR_FLAG_PINNED, PERF_ATTR_FLAG_REMOVE_ON_EXEC,
+    PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_SIGTRAP, PERF_ATTR_FLAG_TASK,
+    PERF_ATTR_FLAG_WATERMARK, PERF_ATTR_SIZE_VER0, PERF_COUNT_HW_BRANCH_INSTRUCTIONS,
+    PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_MISSES, PERF_COUNT_HW_CPU_CYCLES,
+    PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_CPU_CLOCK, PERF_COUNT_SW_DUMMY,
+    PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST,
+    PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM,
+    PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC,
+    PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP, PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE,
+    PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CODE_PAGE_SIZE, PERF_SAMPLE_CPU,
+    PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER,
+    PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_PHYS_ADDR, PERF_SAMPLE_RAW, PERF_SAMPLE_READ,
+    PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
+    PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT,
+    PERF_TYPE_HARDWARE, PERF_TYPE_RAW, PERF_TYPE_SOFTWARE, PERF_TYPE_TRACEPOINT,
 };
 #[cfg(target_arch = "x86_64")]
 use narf_linux_perf_uapi::{
@@ -56,14 +58,26 @@ static REMOTE_PMU_MAILBOXES: [RemotePmuMailbox; narf_lib::percpu::MAX_CPUS] =
 const SAMPLE_CPU_SLOTS: usize = narf_lib::percpu::MAX_CPUS;
 const PENDING_SAMPLE_DEPTH: usize = 64;
 const PENDING_LOSS_BUCKETS: usize = 16;
+const PENDING_TRACE_DEPTH: usize = 64;
+const PENDING_TRACE_BYTES: usize = 256;
 static PENDING_SAMPLES: [[PendingSample; PENDING_SAMPLE_DEPTH]; SAMPLE_CPU_SLOTS] =
     [const { [const { PendingSample::new() }; PENDING_SAMPLE_DEPTH] }; SAMPLE_CPU_SLOTS];
 static PENDING_SAMPLE_CURSOR: [AtomicUsize; SAMPLE_CPU_SLOTS] =
     [const { AtomicUsize::new(0) }; SAMPLE_CPU_SLOTS];
 static PENDING_LOSSES: [[PendingLoss; PENDING_LOSS_BUCKETS]; SAMPLE_CPU_SLOTS] =
     [const { [const { PendingLoss::new() }; PENDING_LOSS_BUCKETS] }; SAMPLE_CPU_SLOTS];
+static PENDING_TRACES: [[PendingTrace; PENDING_TRACE_DEPTH]; SAMPLE_CPU_SLOTS] =
+    [const { [const { PendingTrace::new() }; PENDING_TRACE_DEPTH] }; SAMPLE_CPU_SLOTS];
+static PENDING_TRACE_CURSOR: [AtomicUsize; SAMPLE_CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; SAMPLE_CPU_SLOTS];
+static PENDING_TRACE_LOSSES: [[PendingLoss; PENDING_LOSS_BUCKETS]; SAMPLE_CPU_SLOTS] =
+    [const { [const { PendingLoss::new() }; PENDING_LOSS_BUCKETS] }; SAMPLE_CPU_SLOTS];
+static TRACE_OBSERVERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_SAMPLE_IDS: [[AtomicU64; 8]; SAMPLE_CPU_SLOTS] =
     [const { [const { AtomicU64::new(0) }; 8] }; SAMPLE_CPU_SLOTS];
+static ACTIVE_SAMPLE_STACK_BYTES: [[AtomicU32; 8]; SAMPLE_CPU_SLOTS] =
+    [const { [const { AtomicU32::new(0) }; 8] }; SAMPLE_CPU_SLOTS];
+const PERF_MAX_USER_STACK_SAMPLE: usize = 8192;
 static CPU_USER_NS: [AtomicU64; SAMPLE_CPU_SLOTS] = [const { AtomicU64::new(0) }; SAMPLE_CPU_SLOTS];
 static CPU_USER_SLICE_START_NS: [AtomicU64; SAMPLE_CPU_SLOTS] =
     [const { AtomicU64::new(0) }; SAMPLE_CPU_SLOTS];
@@ -107,12 +121,77 @@ fn remaining_sample_period(loaded: u64, consumed: u64) -> u64 {
     loaded.saturating_sub(consumed).max(1)
 }
 
+fn unwind_user_callchain(
+    ip: u64,
+    state: Option<&narf_interrupts::InterruptedUserState>,
+    stack: &[u8],
+    max_frames: usize,
+) -> Vec<u64> {
+    let mut chain = Vec::with_capacity(max_frames.min(128));
+    if max_frames == 0 {
+        return chain;
+    }
+    chain.push(ip);
+    let Some(state) = state else {
+        return chain;
+    };
+    #[cfg(target_arch = "x86_64")]
+    let mut frame_pointer = state.regs[6];
+    #[cfg(target_arch = "aarch64")]
+    let mut frame_pointer = state.regs[29];
+    let stack_end = state.sp.saturating_add(stack.len() as u64);
+    while chain.len() < max_frames
+        && frame_pointer >= state.sp
+        && frame_pointer.saturating_add(16) <= stack_end
+        && frame_pointer & 7 == 0
+    {
+        let offset = (frame_pointer - state.sp) as usize;
+        let previous = u64::from_ne_bytes(stack[offset..offset + 8].try_into().unwrap());
+        let return_ip = u64::from_ne_bytes(stack[offset + 8..offset + 16].try_into().unwrap());
+        if return_ip == 0 {
+            break;
+        }
+        chain.push(return_ip);
+        if previous <= frame_pointer {
+            break;
+        }
+        frame_pointer = previous;
+    }
+    chain
+}
+
+pub(crate) fn unwind_user_callchain_for_test(
+    ip: u64,
+    state: &narf_interrupts::InterruptedUserState,
+    stack: &[u8],
+) -> Vec<u64> {
+    unwind_user_callchain(ip, Some(state), stack, 127)
+}
+
 pub(crate) fn remaining_sample_period_for_test(loaded: u64, consumed: u64) -> u64 {
     remaining_sample_period(loaded, consumed)
 }
 
 pub(crate) fn multiplex_quantum_due_for_test(last_ns: u64, now_ns: u64) -> bool {
     multiplex_quantum_due(last_ns, now_ns)
+}
+
+fn publish_active_sample(cpu: usize, slot: usize, event: &PerfEventFile) {
+    let stack_bytes = if event.attr.sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
+        event
+            .attr
+            .sample_stack_user
+            .max(PERF_MAX_USER_STACK_SAMPLE as u32)
+    } else {
+        event.attr.sample_stack_user
+    };
+    ACTIVE_SAMPLE_STACK_BYTES[cpu][slot].store(stack_bytes, Ordering::Relaxed);
+    ACTIVE_SAMPLE_IDS[cpu][slot].store(event.id, Ordering::Release);
+}
+
+fn clear_active_sample(cpu: usize, slot: usize) {
+    ACTIVE_SAMPLE_IDS[cpu][slot].store(0, Ordering::Release);
+    ACTIVE_SAMPLE_STACK_BYTES[cpu][slot].store(0, Ordering::Relaxed);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -527,6 +606,12 @@ struct PendingSample {
     ip: AtomicU64,
     time: AtomicU64,
     counters: AtomicU8,
+    user_regs_valid: AtomicBool,
+    user_regs_abi: AtomicU64,
+    user_sp: AtomicU64,
+    user_regs: [AtomicU64; 34],
+    user_stack_size: AtomicU32,
+    user_stack: PendingStack,
     event_ids: [AtomicU64; 8],
     periods: [AtomicU64; 8],
 }
@@ -539,9 +624,37 @@ impl PendingSample {
             ip: AtomicU64::new(0),
             time: AtomicU64::new(0),
             counters: AtomicU8::new(0),
+            user_regs_valid: AtomicBool::new(false),
+            user_regs_abi: AtomicU64::new(0),
+            user_sp: AtomicU64::new(0),
+            user_regs: [const { AtomicU64::new(0) }; 34],
+            user_stack_size: AtomicU32::new(0),
+            user_stack: PendingStack::new(),
             event_ids: [const { AtomicU64::new(0) }; 8],
             periods: [const { AtomicU64::new(0) }; 8],
         }
+    }
+}
+
+struct PendingStack([UnsafeCell<u8>; PERF_MAX_USER_STACK_SAMPLE]);
+
+// SAFETY: PendingSample::state grants one producer or consumer exclusive
+// access; bytes are published by its Release transition to state 2.
+unsafe impl Sync for PendingStack {}
+
+impl PendingStack {
+    const fn new() -> Self {
+        Self([const { UnsafeCell::new(0) }; PERF_MAX_USER_STACK_SAMPLE])
+    }
+
+    fn as_mut_ptr(&self) -> *mut u8 {
+        self.0.as_ptr().cast_mut().cast::<u8>()
+    }
+
+    unsafe fn slice(&self, len: usize) -> &[u8] {
+        // SAFETY: caller owns the surrounding pending slot in state 1 after
+        // acquiring the producer's state-2 publication.
+        unsafe { core::slice::from_raw_parts(self.0.as_ptr().cast::<u8>(), len) }
     }
 }
 
@@ -561,6 +674,35 @@ impl PendingLoss {
     }
 }
 
+struct PendingTrace {
+    state: AtomicU8,
+    type_id: AtomicU64,
+    task: AtomicU64,
+    ip: AtomicU64,
+    time: AtomicU64,
+    len: AtomicU32,
+    bytes: PendingTraceBytes,
+}
+
+impl PendingTrace {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            type_id: AtomicU64::new(0),
+            task: AtomicU64::new(0),
+            ip: AtomicU64::new(0),
+            time: AtomicU64::new(0),
+            len: AtomicU32::new(0),
+            bytes: PendingTraceBytes([const { UnsafeCell::new(0) }; PENDING_TRACE_BYTES]),
+        }
+    }
+}
+
+struct PendingTraceBytes([UnsafeCell<u8>; PENDING_TRACE_BYTES]);
+
+// SAFETY: PendingTrace::state serializes its sole producer and consumer.
+unsafe impl Sync for PendingTraceBytes {}
+
 const PERF_FORMAT_SUPPORTED: u64 = (1 << 5) - 1;
 
 const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
@@ -579,6 +721,8 @@ const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
     | PERF_ATTR_FLAG_INHERIT
     | PERF_ATTR_FLAG_EXCLUDE_USER
     | PERF_ATTR_FLAG_EXCLUDE_KERNEL
+    | PERF_ATTR_FLAG_REMOVE_ON_EXEC
+    | PERF_ATTR_FLAG_SIGTRAP
     // NARF does not execute nested guests and currently has no BPF VM or
     // runtime kernel-symbol loader. These selectors therefore describe empty
     // event domains, rather than requests whose records are being suppressed.
@@ -615,6 +759,9 @@ const PERF_SAMPLE_SUPPORTED: u64 = PERF_SAMPLE_IP
     | PERF_SAMPLE_ADDR
     | PERF_SAMPLE_READ
     | PERF_SAMPLE_CALLCHAIN
+    | PERF_SAMPLE_RAW
+    | PERF_SAMPLE_REGS_USER
+    | PERF_SAMPLE_STACK_USER
     | PERF_SAMPLE_ID
     | PERF_SAMPLE_CPU
     | PERF_SAMPLE_PERIOD
@@ -837,7 +984,8 @@ impl PerfEventFile {
     }
 
     fn is_task_hardware_event(&self) -> bool {
-        self.attr.type_ != PERF_TYPE_SOFTWARE && self.target_task != u64::MAX
+        !matches!(self.attr.type_, PERF_TYPE_SOFTWARE | PERF_TYPE_TRACEPOINT)
+            && self.target_task != u64::MAX
     }
 
     fn start_running_at(&self, cpu: usize, now: u64) {
@@ -997,14 +1145,14 @@ impl PerfEventFile {
                     unsafe { narf_arch::x86_64::pmu::release(counter) };
                     return false;
                 }
-                ACTIVE_SAMPLE_IDS[cpu][counter.idx as usize].store(self.id, Ordering::Release);
+                publish_active_sample(cpu, counter.idx as usize, self);
             }
             active[cpu] = Some(counter);
             self.start_running(cpu);
         } else if let Some(counter) = active[cpu].take() {
             let sample_period = self.sample_period.load(Ordering::Acquire);
             if sample_period != 0 {
-                ACTIVE_SAMPLE_IDS[cpu][counter.idx as usize].store(0, Ordering::Release);
+                clear_active_sample(cpu, counter.idx as usize);
                 // SAFETY: current-CPU live sampled allocation. Capture the
                 // exact remaining distance before disarming the slot.
                 if let Ok(left) = unsafe { narf_arch::x86_64::pmu::sampling_period_left(&counter) }
@@ -1066,7 +1214,7 @@ impl PerfEventFile {
                     let _ = unsafe { counter.release() };
                     return false;
                 }
-                ACTIVE_SAMPLE_IDS[cpu][counter.sample_slot()].store(self.id, Ordering::Release);
+                publish_active_sample(cpu, counter.sample_slot(), self);
             // SAFETY: freshly allocated current-CPU counter.
             } else if unsafe { counter.start() }.is_err() {
                 // SAFETY: the fresh allocation is still owned on this CPU.
@@ -1076,7 +1224,7 @@ impl PerfEventFile {
             active[cpu] = Some(counter);
             self.start_running(cpu);
         } else if let Some(counter) = active[cpu].take() {
-            ACTIVE_SAMPLE_IDS[cpu][counter.sample_slot()].store(0, Ordering::Release);
+            clear_active_sample(cpu, counter.sample_slot());
             if self.sample_period.load(Ordering::Acquire) != 0 {
                 // SAFETY: switch-out runs on the CPU owning this live counter.
                 if let Ok(left) = unsafe { counter.period_left() } {
@@ -1117,8 +1265,7 @@ impl PerfEventFile {
                 let sample_period = self.sample_period.load(Ordering::Acquire);
                 if sample_period != 0 {
                     if let Some(counter) = self.pmu_counter {
-                        ACTIVE_SAMPLE_IDS[counter.cpu as usize][counter.idx as usize]
-                            .store(self.id, Ordering::Release);
+                        publish_active_sample(counter.cpu as usize, counter.idx as usize, self);
                         let _ = arm_pmu_on(counter, sample_period);
                     }
                 }
@@ -1132,8 +1279,11 @@ impl PerfEventFile {
                 let period = self.sample_period.load(Ordering::Acquire);
                 if let Some(counter) = self.pmu_counter.as_ref() {
                     if period != 0 {
-                        ACTIVE_SAMPLE_IDS[self.target_cpu as usize][counter.sample_slot()]
-                            .store(self.id, Ordering::Release);
+                        publish_active_sample(
+                            self.target_cpu as usize,
+                            counter.sample_slot(),
+                            self,
+                        );
                         // SAFETY: this per-CPU file owns the current-CPU counter.
                         let _ = unsafe { (*counter).arm(period) };
                     } else {
@@ -1162,16 +1312,14 @@ impl PerfEventFile {
             #[cfg(target_arch = "x86_64")]
             if self.sample_period.load(Ordering::Acquire) != 0 {
                 if let Some(counter) = self.pmu_counter {
-                    ACTIVE_SAMPLE_IDS[counter.cpu as usize][counter.idx as usize]
-                        .store(0, Ordering::Release);
+                    clear_active_sample(counter.cpu as usize, counter.idx as usize);
                     let _ = pause_pmu_on(counter);
                 }
             }
             #[cfg(target_arch = "aarch64")]
             if let Some(counter) = self.pmu_counter.as_ref() {
                 if self.sample_period.load(Ordering::Acquire) != 0 {
-                    ACTIVE_SAMPLE_IDS[self.target_cpu as usize][counter.sample_slot()]
-                        .store(0, Ordering::Release);
+                    clear_active_sample(self.target_cpu as usize, counter.sample_slot());
                 }
                 // SAFETY: this per-CPU file owns the current-CPU counter.
                 let _ = unsafe { (*counter).pause() };
@@ -1411,7 +1559,17 @@ impl PerfEventFile {
         result == RecordPush::Committed
     }
 
-    fn sample_record(&self, ip: u64, pid: u32, tid: u32, now: u64) -> bool {
+    #[allow(clippy::too_many_arguments)] // Linux sample fields are independent ABI columns.
+    fn sample_record(
+        &self,
+        ip: u64,
+        pid: u32,
+        tid: u32,
+        now: u64,
+        user_state: Option<&narf_interrupts::InterruptedUserState>,
+        user_stack: &[u8],
+        raw: &[u8],
+    ) -> bool {
         let sample_type = self.attr.sample_type;
         let mut payload = Vec::with_capacity(80);
         let push_u32 = |payload: &mut Vec<u8>, value: u32| {
@@ -1441,10 +1599,16 @@ impl PerfEventFile {
             self.append_sample_read(&mut payload);
         }
         if sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
-            // The interrupted IP is an exact leaf frame. Additional frames
-            // require architecture unwind state and are intentionally omitted.
-            push_u64(&mut payload, 1);
-            push_u64(&mut payload, ip);
+            let max_stack = if self.attr.sample_max_stack == 0 {
+                127
+            } else {
+                usize::from(self.attr.sample_max_stack)
+            };
+            let callchain = unwind_user_callchain(ip, user_state, user_stack, max_stack);
+            push_u64(&mut payload, callchain.len() as u64);
+            for address in callchain {
+                push_u64(&mut payload, address);
+            }
         }
         if sample_type & PERF_SAMPLE_ID != 0 {
             push_u64(&mut payload, self.id);
@@ -1461,6 +1625,35 @@ impl PerfEventFile {
                 &mut payload,
                 self.last_sample_period.load(Ordering::Acquire),
             );
+        }
+        if sample_type & PERF_SAMPLE_RAW != 0 {
+            push_u32(&mut payload, raw.len() as u32);
+            payload.extend_from_slice(raw);
+            while payload.len() & 7 != 0 {
+                payload.push(0);
+            }
+        }
+        if sample_type & PERF_SAMPLE_REGS_USER != 0 {
+            let Some(state) = user_state else {
+                return false;
+            };
+            push_u64(&mut payload, state.abi);
+            for index in 0..64 {
+                if self.attr.sample_regs_user & (1 << index) != 0 {
+                    let Some(value) = state.regs.get(index) else {
+                        return false;
+                    };
+                    push_u64(&mut payload, *value);
+                }
+            }
+        }
+        if sample_type & PERF_SAMPLE_STACK_USER != 0 {
+            push_u64(&mut payload, user_stack.len() as u64);
+            payload.extend_from_slice(user_stack);
+            while payload.len() & 7 != 0 {
+                payload.push(0);
+            }
+            push_u64(&mut payload, user_stack.len() as u64);
         }
         if sample_type & PERF_SAMPLE_WEIGHT != 0 {
             push_u64(&mut payload, 0);
@@ -1837,6 +2030,14 @@ pub(crate) fn on_exec(task: u64, mappings: &[crate::process::LoadedMapping], pro
         let Some(event) = weak.upgrade() else {
             return false;
         };
+        if event.tracks_task(task) && event.attr.flags & PERF_ATTR_FLAG_REMOVE_ON_EXEC != 0 {
+            event.disable();
+            event.registered.store(false, Ordering::Release);
+            if ACTIVE_PERF_EVENTS.fetch_sub(1, Ordering::Relaxed) == 1 {
+                narf_lib::perf::set_enabled(false);
+            }
+            return false;
+        }
         if event.tracks_task(task)
             && event.attr.flags & PERF_ATTR_FLAG_ENABLE_ON_EXEC != 0
             && event._group_leader.is_none()
@@ -2032,6 +2233,104 @@ fn record_pending_loss(cpu: usize, counters: u8) {
     }
 }
 
+fn capture_trace(type_id: u64, bytes: &[u8]) {
+    let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
+    if bytes.len() > PENDING_TRACE_BYTES {
+        record_trace_loss(cpu, type_id);
+        return;
+    }
+    let start = PENDING_TRACE_CURSOR[cpu].fetch_add(1, Ordering::Relaxed);
+    for offset in 0..PENDING_TRACE_DEPTH {
+        let pending = &PENDING_TRACES[cpu][rotation_index(start, offset, PENDING_TRACE_DEPTH)];
+        if pending
+            .state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            continue;
+        }
+        // SAFETY: state 1 grants this producer exclusive byte access.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                pending.bytes.0.as_ptr().cast_mut().cast::<u8>(),
+                bytes.len(),
+            );
+        }
+        pending.type_id.store(type_id, Ordering::Relaxed);
+        pending
+            .task
+            .store(crate::handlers::current_task_id(), Ordering::Relaxed);
+        pending
+            .ip
+            .store(narf_interrupts::interrupted_ip(), Ordering::Relaxed);
+        pending
+            .time
+            .store(narf_time::monotonic_ns(), Ordering::Relaxed);
+        pending.len.store(bytes.len() as u32, Ordering::Relaxed);
+        pending.state.store(2, Ordering::Release);
+        return;
+    }
+    record_trace_loss(cpu, type_id);
+}
+
+fn record_trace_loss(cpu: usize, type_id: u64) {
+    for bucket in &PENDING_TRACE_LOSSES[cpu] {
+        let state = bucket.state.load(Ordering::Acquire);
+        if state == 2
+            && bucket.event_id.load(Ordering::Relaxed) == type_id
+            && bucket
+                .state
+                .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            bucket.count.fetch_add(1, Ordering::Relaxed);
+            bucket.state.store(2, Ordering::Release);
+            return;
+        }
+        if state == 0
+            && bucket
+                .state
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            bucket.event_id.store(type_id, Ordering::Relaxed);
+            bucket.count.store(1, Ordering::Relaxed);
+            bucket.state.store(2, Ordering::Release);
+            return;
+        }
+    }
+}
+
+fn capture_dynamic_probe(probe_id: u32, args: narf_tracing::ProbeArgs) {
+    let mut bytes = [0; 32];
+    for (chunk, value) in bytes.chunks_exact_mut(8).zip(args.0) {
+        chunk.copy_from_slice(&value.to_ne_bytes());
+    }
+    capture_trace(u64::from(probe_id), &bytes);
+}
+
+fn ensure_trace_observers() {
+    if TRACE_OBSERVERS_INSTALLED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        narf_tracing::install_event_observer(capture_trace);
+        narf_tracing::install_probe_observer(capture_dynamic_probe);
+    }
+}
+
+fn deliver_sigtrap(event: &PerfEventFile, task: u64) {
+    if event.attr.flags & PERF_ATTR_FLAG_SIGTRAP == 0 {
+        return;
+    }
+    const SIGTRAP: u32 = 5;
+    const TRAP_PERF: i32 = 6;
+    if crate::handlers::store_sigqueue_info(task, SIGTRAP, TRAP_PERF, event.attr.sig_data, 0) {
+        crate::handlers::raise_signal_pending(task, SIGTRAP);
+    }
+}
+
 fn capture_pending_sample(cpu: usize, counters: u8) -> bool {
     let start = PENDING_SAMPLE_CURSOR[cpu].fetch_add(1, Ordering::Relaxed);
     let mut claimed = None;
@@ -2061,6 +2360,37 @@ fn capture_pending_sample(cpu: usize, counters: u8) -> bool {
         .time
         .store(narf_time::monotonic_ns(), Ordering::Relaxed);
     pending.counters.store(counters, Ordering::Relaxed);
+    if let Some(state) = narf_interrupts::interrupted_user_state() {
+        pending.user_regs_abi.store(state.abi, Ordering::Relaxed);
+        pending.user_sp.store(state.sp, Ordering::Relaxed);
+        for (dst, value) in pending.user_regs.iter().zip(state.regs) {
+            dst.store(value, Ordering::Relaxed);
+        }
+        let stack_bytes = (0..8)
+            .filter(|idx| counters & (1 << idx) != 0)
+            .map(|idx| ACTIVE_SAMPLE_STACK_BYTES[cpu][idx].load(Ordering::Relaxed) as usize)
+            .max()
+            .unwrap_or(0)
+            .min(PERF_MAX_USER_STACK_SAMPLE);
+        let copied = if stack_bytes == 0 {
+            0
+        } else if let Some(address_space) = narf_scheduler::current_address_space() {
+            // SAFETY: this producer exclusively owns the claimed state-1 slot.
+            let stack = unsafe {
+                core::slice::from_raw_parts_mut(pending.user_stack.as_mut_ptr(), stack_bytes)
+            };
+            address_space.copy_user_bytes_nofault(narf_memory::VirtAddr::new(state.sp), stack)
+        } else {
+            0
+        };
+        pending
+            .user_stack_size
+            .store(copied as u32, Ordering::Relaxed);
+        pending.user_regs_valid.store(true, Ordering::Relaxed);
+    } else {
+        pending.user_regs_valid.store(false, Ordering::Relaxed);
+        pending.user_stack_size.store(0, Ordering::Relaxed);
+    }
     for (idx, active_id) in ACTIVE_SAMPLE_IDS[cpu].iter().enumerate() {
         if counters & (1 << idx) == 0 {
             continue;
@@ -2198,6 +2528,22 @@ pub(crate) fn drain_irq_samples() {
             let ip = pending.ip.load(Ordering::Relaxed);
             let now = pending.time.load(Ordering::Relaxed);
             let counters = pending.counters.load(Ordering::Relaxed);
+            let user_state = pending.user_regs_valid.load(Ordering::Relaxed).then(|| {
+                let mut regs = [0; 34];
+                for (dst, source) in regs.iter_mut().zip(pending.user_regs.iter()) {
+                    *dst = source.load(Ordering::Relaxed);
+                }
+                narf_interrupts::InterruptedUserState {
+                    user: true,
+                    abi: pending.user_regs_abi.load(Ordering::Relaxed),
+                    ip,
+                    sp: pending.user_sp.load(Ordering::Relaxed),
+                    regs,
+                }
+            });
+            let stack_size = pending.user_stack_size.load(Ordering::Relaxed) as usize;
+            // SAFETY: this consumer exclusively owns the acquired state-1 slot.
+            let user_stack = unsafe { pending.user_stack.slice(stack_size) };
             {
                 let registry = PERF_EVENT_REGISTRY.lock();
                 for weak in registry.iter() {
@@ -2218,12 +2564,83 @@ pub(crate) fn drain_irq_samples() {
                         event.last_sample_period.store(period, Ordering::Release);
                         event.count_accumulated.fetch_add(period, Ordering::AcqRel);
                         let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
-                        notify |= event.sample_record(ip, pid, task as u32, now);
+                        notify |= event.sample_record(
+                            ip,
+                            pid,
+                            task as u32,
+                            now,
+                            user_state.as_ref(),
+                            user_stack,
+                            &[],
+                        );
+                        deliver_sigtrap(&event, task);
                         event.adjust_frequency_period(now);
                         notify |= event.consume_refresh();
                     }
                 }
             }
+            pending.state.store(0, Ordering::Release);
+        }
+    }
+    for buckets in &PENDING_TRACE_LOSSES {
+        for bucket in buckets {
+            if bucket
+                .state
+                .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            let type_id = bucket.event_id.load(Ordering::Relaxed);
+            let lost = bucket.count.swap(0, Ordering::Relaxed);
+            let registry = PERF_EVENT_REGISTRY.lock();
+            for weak in registry.iter() {
+                if let Some(event) = weak.upgrade() {
+                    if event.attr.type_ == PERF_TYPE_TRACEPOINT && event.attr.config == type_id {
+                        event.sample_lost.fetch_add(lost, Ordering::Relaxed);
+                    }
+                }
+            }
+            bucket.event_id.store(0, Ordering::Relaxed);
+            bucket.state.store(0, Ordering::Release);
+        }
+    }
+    for (source_cpu, pending_ring) in PENDING_TRACES.iter().enumerate() {
+        for pending in pending_ring {
+            if pending
+                .state
+                .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            let type_id = pending.type_id.load(Ordering::Relaxed);
+            let task = pending.task.load(Ordering::Relaxed);
+            let ip = pending.ip.load(Ordering::Relaxed);
+            let now = pending.time.load(Ordering::Relaxed);
+            let len = pending.len.load(Ordering::Relaxed) as usize;
+            // SAFETY: this consumer owns the acquired state-1 slot.
+            let raw =
+                unsafe { core::slice::from_raw_parts(pending.bytes.0.as_ptr().cast::<u8>(), len) };
+            let registry = PERF_EVENT_REGISTRY.lock();
+            for weak in registry.iter() {
+                let Some(event) = weak.upgrade() else {
+                    continue;
+                };
+                if event.attr.type_ != PERF_TYPE_TRACEPOINT
+                    || event.attr.config != type_id
+                    || !event.enabled.load(Ordering::Acquire)
+                    || !event.accepts_sample_from(source_cpu, task)
+                {
+                    continue;
+                }
+                event.count_accumulated.fetch_add(1, Ordering::AcqRel);
+                event.last_sample_period.store(1, Ordering::Release);
+                let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
+                notify |= event.sample_record(ip, pid, task as u32, now, None, &[], raw);
+                notify |= event.consume_refresh();
+            }
+            drop(registry);
             pending.state.store(0, Ordering::Release);
         }
     }
@@ -2241,12 +2658,38 @@ pub(crate) fn sample_from_irq_for_test(task: u64, ip: u64) {
         };
         if event.enabled.load(Ordering::Acquire) && event.tracks_task(task) {
             let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
-            let _ = event.sample_record(ip, pid, task as u32, now);
+            let _ = event.sample_record(ip, pid, task as u32, now, None, &[], &[]);
+            deliver_sigtrap(&event, task);
             if event.consume_refresh() {
                 narf_net::readiness::notify(0);
             }
         }
     }
+}
+
+pub(crate) fn sample_fd_for_test(fd_num: u32, task: u64, ip: u64) -> bool {
+    let now = narf_time::monotonic_ns();
+    let owner = crate::handlers::current_task_id();
+    fd::with_table(owner, |table| {
+        if let Some(event) = table
+            .get(fd_num)
+            .and_then(|entry| entry.ops.as_any())
+            .and_then(|any| any.downcast_ref::<PerfEventFile>())
+        {
+            if !event.enabled.load(Ordering::Acquire) || !event.tracks_task(task) {
+                return false;
+            }
+            let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
+            let _ = event.sample_record(ip, pid, task as u32, now, None, &[], &[]);
+            deliver_sigtrap(event, task);
+            if event.consume_refresh() {
+                narf_net::readiness::notify(0);
+            }
+            return true;
+        }
+        false
+    })
+    .unwrap_or(false)
 }
 
 pub(crate) fn event_tracks_task_for_test(fd_num: u32, task: u64) -> bool {
@@ -2986,6 +3429,34 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
+    if attr.flags & PERF_ATTR_FLAG_SIGTRAP != 0
+        && (pid == -1 || attr.flags & PERF_ATTR_FLAG_REMOVE_ON_EXEC == 0)
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    if attr.flags & PERF_ATTR_FLAG_REMOVE_ON_EXEC != 0
+        && attr.flags & PERF_ATTR_FLAG_ENABLE_ON_EXEC != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let supported_user_regs = (1u64 << 20) - 1;
+    #[cfg(target_arch = "aarch64")]
+    let supported_user_regs = (1u64 << 34) - 1;
+    if attr.sample_type & PERF_SAMPLE_REGS_USER != 0
+        && attr.sample_regs_user & !supported_user_regs != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        return;
+    }
+    if attr.sample_type & PERF_SAMPLE_STACK_USER != 0
+        && attr.sample_stack_user as usize > PERF_MAX_USER_STACK_SAMPLE
+    {
+        ctx.set_return(SyscallReturn::ok((-7i64) as u64)); // E2BIG
+        return;
+    }
     // Linux overlays these two fields in a union; requesting both is
     // ambiguous and rejected by the kernel rather than serialized twice.
     if attr.sample_type & PERF_SAMPLE_WEIGHT != 0
@@ -2998,6 +3469,9 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     if !is_supported_event(&attr) {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
+    }
+    if attr.type_ == PERF_TYPE_TRACEPOINT {
+        ensure_trace_observers();
     }
     let task = current_task_id();
     let count_kernel = attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0;
@@ -3078,7 +3552,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     // Enforce exclusive ownership before touching the PMU. A sibling of the
     // exclusive leader belongs to the same atomic group and is the sole
     // exception.
-    if pid == -1 && attr.type_ != PERF_TYPE_SOFTWARE {
+    if pid == -1 && !matches!(attr.type_, PERF_TYPE_SOFTWARE | PERF_TYPE_TRACEPOINT) {
         let requested_group = group_leader
             .as_ref()
             .and_then(|leader| leader.as_any())
@@ -3192,7 +3666,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                     }
                 }
             }
-        } else if attr.type_ == PERF_TYPE_SOFTWARE {
+        } else if matches!(attr.type_, PERF_TYPE_SOFTWARE | PERF_TYPE_TRACEPOINT) {
             (None, None)
         } else {
             ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
@@ -3232,7 +3706,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 }
             }
         }
-    } else if attr.type_ == PERF_TYPE_SOFTWARE {
+    } else if matches!(attr.type_, PERF_TYPE_SOFTWARE | PERF_TYPE_TRACEPOINT) {
         (None, None)
     } else {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64));
@@ -3294,7 +3768,9 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 release_pmu_on(*counter);
             }
             period
-        } else if attr.type_ == PERF_TYPE_SOFTWARE && attr.config == PERF_COUNT_SW_DUMMY {
+        } else if (attr.type_ == PERF_TYPE_SOFTWARE && attr.config == PERF_COUNT_SW_DUMMY)
+            || attr.type_ == PERF_TYPE_TRACEPOINT
+        {
             attr.sample_period_or_freq
         } else {
             ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
@@ -3306,58 +3782,63 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
 
     #[cfg(target_arch = "aarch64")]
     let sample_period = if attr.sample_period_or_freq != 0 {
-        if pmu_event.is_none() || ensure_pmi_route().is_err() {
-            if let Some(counter) = pmu_counter {
-                // SAFETY: open still exclusively owns this current-CPU allocation.
-                let _ = unsafe { counter.release() };
-            }
-            ctx.set_return(SyscallReturn::ok((-95i64) as u64));
-            return;
-        }
-        let validation;
-        let counter = if let Some(counter) = pmu_counter.as_ref() {
-            counter
-        } else {
-            // SAFETY: syscall runs at EL1 on the current CPU.
-            validation = match unsafe { pmu_event.unwrap().allocate(count_kernel, count_user) } {
-                Ok(counter) => counter,
-                Err(_) => {
-                    ctx.set_return(SyscallReturn::ok((-95i64) as u64));
-                    return;
-                }
-            };
-            &validation
-        };
-        let period = if attr.flags & PERF_ATTR_FLAG_FREQ != 0 {
-            // Start from the architectural counter clock. Feedback from real
-            // overflow timing refines this initial estimate.
-            match pmu_event.unwrap() {
-                AarchPmuEvent::Cycle => narf_arch::aarch64::timer::frequency_hz()
-                    .checked_div(attr.sample_period_or_freq)
-                    .unwrap_or(1)
-                    .max(narf_arch::aarch64::pmu::minimum_sample_period()),
-                AarchPmuEvent::Programmable(_) => 100_000,
-            }
-        } else {
+        if attr.type_ == PERF_TYPE_TRACEPOINT {
             attr.sample_period_or_freq
-        };
-        // SAFETY: open owns this current-CPU counter and the PMU PPI is routed.
-        let arm_failed = unsafe { (*counter).arm(period) }.is_err();
-        if counter.sample_slot() >= 8 || arm_failed {
+        } else {
+            if pmu_event.is_none() || ensure_pmi_route().is_err() {
+                if let Some(counter) = pmu_counter {
+                    // SAFETY: open still exclusively owns this current-CPU allocation.
+                    let _ = unsafe { counter.release() };
+                }
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                return;
+            }
+            let validation;
+            let counter = if let Some(counter) = pmu_counter.as_ref() {
+                counter
+            } else {
+                // SAFETY: syscall runs at EL1 on the current CPU.
+                validation = match unsafe { pmu_event.unwrap().allocate(count_kernel, count_user) }
+                {
+                    Ok(counter) => counter,
+                    Err(_) => {
+                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        return;
+                    }
+                };
+                &validation
+            };
+            let period = if attr.flags & PERF_ATTR_FLAG_FREQ != 0 {
+                // Start from the architectural counter clock. Feedback from real
+                // overflow timing refines this initial estimate.
+                match pmu_event.unwrap() {
+                    AarchPmuEvent::Cycle => narf_arch::aarch64::timer::frequency_hz()
+                        .checked_div(attr.sample_period_or_freq)
+                        .unwrap_or(1)
+                        .max(narf_arch::aarch64::pmu::minimum_sample_period()),
+                    AarchPmuEvent::Programmable(_) => 100_000,
+                }
+            } else {
+                attr.sample_period_or_freq
+            };
+            // SAFETY: open owns this current-CPU counter and the PMU PPI is routed.
+            let arm_failed = unsafe { (*counter).arm(period) }.is_err();
+            if counter.sample_slot() >= 8 || arm_failed {
+                if pmu_counter.is_none() {
+                    // SAFETY: validation counter remains live and current-CPU-owned.
+                    let _ = unsafe { (*counter).release() };
+                }
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                return;
+            }
+            // SAFETY: the live current-CPU counter remains owned by this open path.
+            let _ = unsafe { (*counter).pause() };
             if pmu_counter.is_none() {
                 // SAFETY: validation counter remains live and current-CPU-owned.
                 let _ = unsafe { (*counter).release() };
             }
-            ctx.set_return(SyscallReturn::ok((-95i64) as u64));
-            return;
+            period
         }
-        // SAFETY: the live current-CPU counter remains owned by this open path.
-        let _ = unsafe { (*counter).pause() };
-        if pmu_counter.is_none() {
-            // SAFETY: validation counter remains live and current-CPU-owned.
-            let _ = unsafe { (*counter).release() };
-        }
-        period
     } else {
         0
     };
@@ -3501,6 +3982,7 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
             attr.config,
             PERF_COUNT_SW_DUMMY | PERF_COUNT_SW_CPU_CLOCK | PERF_COUNT_SW_TASK_CLOCK
         ),
+        PERF_TYPE_TRACEPOINT => attr.config != 0,
         // PERF_TYPE_HW_CACHE (3)
         #[cfg(target_arch = "x86_64")]
         PERF_TYPE_HW_CACHE => {

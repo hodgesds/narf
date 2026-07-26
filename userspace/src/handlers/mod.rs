@@ -3571,6 +3571,7 @@ pub fn numa_balance_tick() {
     // This is the existing cross-architecture user-mode timer hook. Keep perf
     // multiplexing ahead of NUMA's optional per-task state lookup so tasks
     // without automatic NUMA balancing still rotate oversubscribed counters.
+    #[cfg(feature = "linux-compat")]
     crate::perf_event::on_multiplex_tick(current_task_id());
 
     const SCAN_TICKS: u16 = 256;

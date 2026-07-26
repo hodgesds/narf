@@ -1569,6 +1569,14 @@ pub fn populate_perf_event_sources() {
 
     let software = get_or_create_child(&devices, "software");
     kobject_add_attr(&software, "type", || "1\n".to_string());
+
+    // NARF typed trace events and dynamic-probe IDs share Linux's tracepoint
+    // perf type. The generic format lets upstream perf select an authoritative
+    // numeric ID without inventing Linux tracefs event names.
+    let narf_trace = get_or_create_child(&devices, "narf_trace");
+    kobject_add_attr(&narf_trace, "type", || "2\n".to_string());
+    let trace_format = get_or_create_child(&narf_trace, "format");
+    kobject_add_attr(&trace_format, "id", || "config:0-63\n".to_string());
 }
 
 // ── Desktop/laptop device classes (LED / power_supply / thermal / hwmon) ──

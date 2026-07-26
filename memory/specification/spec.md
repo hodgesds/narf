@@ -164,6 +164,9 @@ impl AddressSpace {
     pub fn contains_address(&self, vaddr: VirtAddr) -> bool;
     /// Return the registered hardware leaf size (4 KiB, 2 MiB, or 1 GiB).
     pub fn mapped_page_size(&self, vaddr: VirtAddr) -> Option<u64>;
+    /// Copy resident bytes through owned physical backing without user faults.
+    pub fn copy_user_bytes_nofault(&self, vaddr: VirtAddr, dst: &mut [u8])
+        -> usize;
     /// Non-owning per-region resident-page counts grouped by SRAT node.
     pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot>;
 }

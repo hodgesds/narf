@@ -184,8 +184,9 @@ close.
 On x86_64, sampled hardware events arm the owned GP counter for
 interrupt-on-overflow and route LVT-PC through the normal IRQ dispatcher. The
 hard-IRQ handler acknowledges/reloads the counter and captures task, IP, time,
-counter identity, and the overflow's exact period into a bounded 64-entry
-per-CPU ring without allocation. Normal
+the complete Linux-numbered user register file, up to 8 KiB of resident user
+stack, counter identity, and the overflow's exact period into a bounded
+64-entry per-CPU ring without allocation or user faults. Normal
 syscall context drains those slots into `PERF_RECORD_SAMPLE`/`LOST` records,
 advances `data_head` with release ordering, and wakes poll/epoll readers.
 If that IRQ ring is full, loss is aggregated by the event ID active on each
@@ -218,12 +219,16 @@ unlimited behavior.
 `PERF_SAMPLE_READ` appends the event's authoritative counter snapshot using
 the same standalone or group `read_format` layout as fd `read(2)`, including
 enabled/running scaling times, IDs, and loss fields when selected.
-Sample records also serialize `ADDR`, `CALLCHAIN`, `WEIGHT`, `DATA_SRC`,
-`TRANSACTION`, `PHYS_ADDR`, `DATA_PAGE_SIZE`, and `WEIGHT_STRUCT` in Linux
+Sample records also serialize `ADDR`, `CALLCHAIN`, `RAW`, `REGS_USER`,
+`STACK_USER`, `WEIGHT`, `DATA_SRC`, `TRANSACTION`, `PHYS_ADDR`,
+`DATA_PAGE_SIZE`, and `WEIGHT_STRUCT` in Linux
 field order. Counting PMUs provide no sampled memory address or load/store
-metadata, so those fields carry Linux's unavailable value (`0`); callchains
-contain the exact interrupted IP as their sole leaf frame until architecture
-unwind state is captured. `CODE_PAGE_SIZE` is resolved against the sampled
+metadata, so those fields carry Linux's unavailable value (`0`). Callchains
+start at the exact interrupted IP and walk validated, monotonically increasing
+x86 RBP or aarch64 X29 frames only within the captured stack. The register and
+stack payload also gives upstream perf the real input needed for offline DWARF
+and symbol unwind; mapping records name the corresponding ELF images.
+`CODE_PAGE_SIZE` is resolved against the sampled
 task's registered address-space mapping and reports its real 4 KiB, 2 MiB, or
 1 GiB hardware leaf size (or `0` when the IP is unmapped). The two weight
 union views are mutually exclusive.
@@ -284,7 +289,16 @@ adjusts the following reload period from observed elapsed time toward
 drain from creating an interrupt storm. `PERF_SAMPLE_PERIOD` reports the period
 that caused that overflow, not the next adaptive period. Per-CPU events on SMP
 still require remote-CPU PMU calls and fail explicitly.
-Cgroup, filter, probe, and BPF features fail explicitly.
+`PERF_TYPE_TRACEPOINT` subscribes to real `narf-tracing` typed events and
+dynamic-probe fires by numeric ID. Producers enter a bounded allocation-free
+per-CPU queue; payloads up to 256 bytes become `PERF_SAMPLE_RAW`, while
+oversize/full-queue events increment the matching event's loss count. Upstream
+perf discovers this source as `narf_trace` and selects it with `id=<config>`.
+Arbitrary Linux kprobe/uprobe PMU types remain unsupported and fail explicitly;
+NARF does not patch a probe merely because an event fd was opened.
+`sigtrap` sampling requires a task target plus `remove_on_exec`; each overflow
+queues SIGTRAP with `TRAP_PERF` and the exact `sig_data`. Cgroup, filter, and
+BPF features fail explicitly.
 `exclude_guest` is accepted because NARF never executes nested guest context.
 The `ksymbol` and `bpf_event` record selectors are also accepted as empty
 domains: NARF has neither a runtime kernel-symbol loader nor a BPF VM, so no

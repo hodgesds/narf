@@ -126,3 +126,11 @@ argument = "Perf code-page-size sampling reads only registered virtual-region bo
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Perf privilege filtering changes only the current CPU's exclusively allocated PMU selector bits. Existing ownership checks still guard allocation, rearm, pause, read, and release; the filters grant no memory access, capability, domain right, or cross-CPU register authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Perf IRQ capture copies scalar registers from the already-saved architecture trap frame after the trap prologue has entered the Frame domain. The dispatcher publishes them only in kernel-owned per-CPU atomics for the synchronous handler walk; no trap-frame pointer, capability, domain right, or scheduling authority escapes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "User-stack sampling resolves bytes only through the sampled AddressSpace's locked, authoritative resident backing metadata and the kernel direct map. It stops at unmapped or lazy backing, never faults user pages in IRQ context, never exposes physical addresses, and retains all frame ownership."

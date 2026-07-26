@@ -1468,6 +1468,79 @@ impl AddressSpace {
             .then_some(4096)
     }
 
+    /// Copy resident user bytes through the kernel direct map without taking a
+    /// page fault. Stops at the first unmapped or lazily unbacked byte.
+    ///
+    /// This is suitable for hard-IRQ sampling: it consults authoritative
+    /// region ownership under the address-space locks and never dereferences
+    /// the userspace virtual address directly.
+    pub fn copy_user_bytes_nofault(&self, vaddr: VirtAddr, dst: &mut [u8]) -> usize {
+        let mut copied = 0usize;
+        while copied < dst.len() {
+            let address = vaddr.as_u64().saturating_add(copied as u64);
+            let base_regions = self.regions.lock();
+            if let Some(region) = base_regions.iter().find(|region| {
+                address >= region.base.as_u64()
+                    && address < region.base.as_u64().saturating_add(region.len)
+            }) {
+                let offset = address - region.base.as_u64();
+                let page = (offset / 4096) as usize;
+                let in_page = (offset % 4096) as usize;
+                let Some(phys) = region
+                    .phys
+                    .get(page)
+                    .copied()
+                    .filter(|phys| phys.as_u64() != 0)
+                else {
+                    break;
+                };
+                let amount = (4096 - in_page).min(dst.len() - copied);
+                // SAFETY: the region lock retains ownership of this resident
+                // frame; PhysAddr::kernel_ptr addresses its direct mapping.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        PhysAddr::new(phys.as_u64().saturating_add(in_page as u64))
+                            .kernel_ptr::<u8>(),
+                        dst[copied..].as_mut_ptr(),
+                        amount,
+                    );
+                }
+                copied += amount;
+                continue;
+            }
+            drop(base_regions);
+
+            let huge_regions = self.huge_regions.lock();
+            let Some(region) = huge_regions.iter().find(|region| {
+                address >= region.base.as_u64()
+                    && address < region.base.as_u64().saturating_add(region.len)
+            }) else {
+                break;
+            };
+            let offset = address - region.base.as_u64();
+            let frame_size = region.frames.first().map_or(0, |frame| frame.size_bytes());
+            if frame_size == 0 {
+                break;
+            }
+            let frame = (offset / frame_size) as usize;
+            let in_frame = offset % frame_size;
+            let Some(backing) = region.frames.get(frame) else {
+                break;
+            };
+            let amount = ((frame_size - in_frame) as usize).min(dst.len() - copied);
+            // SAFETY: the huge-region lock retains this owned backing frame.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    PhysAddr::new(backing.phys().saturating_add(in_frame)).kernel_ptr::<u8>(),
+                    dst[copied..].as_mut_ptr(),
+                    amount,
+                );
+            }
+            copied += amount;
+        }
+        copied
+    }
+
     /// Snapshot region-level NUMA residency without cloning or transferring
     /// ownership of any physical backing.
     pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot> {
