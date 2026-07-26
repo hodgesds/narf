@@ -6191,6 +6191,9 @@ fn ovmf_code_path() -> PathBuf {
         "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
         "/usr/share/edk2/x64/OVMF_CODE.fd",
         "/usr/share/ovmf/x64/OVMF.fd",
+        // Debian/Ubuntu's `ovmf` package installs the split 4 MiB image
+        // under this name on current runners.
+        "/usr/share/OVMF/OVMF_CODE_4M.fd",
         "/usr/share/OVMF/OVMF_CODE.fd",
         "/usr/share/edk2/OvmfX64/OVMF_CODE.fd",
     ] {
