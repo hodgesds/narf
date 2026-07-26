@@ -3228,14 +3228,27 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     }
 }
 
-/// Trace filter for the `syscall-trace` feature. Traces EVERY syscall — a
-/// proper `strace`-style firehose (the feature is opt-in at build time, so the
-/// volume is the caller's choice; grep the serial log by `t=<tid>` / name).
-/// The trace line is written straight to the serial console (not via the
-/// syscall path), so tracing `write`/`writev` cannot recurse.
+/// Trace filter for the `syscall-trace` feature. Fedora desktop diagnostics
+/// are deliberately comm-scoped: tracing every process perturbs scheduling
+/// and buries the first failing syscall under unrelated boot traffic.
 #[cfg(feature = "syscall-trace")]
-fn syscall_trace_relevant(_v: Syscall) -> bool {
-    true
+fn syscall_trace_relevant(v: Syscall) -> bool {
+    syscall_trace_target_task()
+        && matches!(
+            v,
+            Syscall::Mount
+                | Syscall::MoveMount
+                | Syscall::OpenTree
+                | Syscall::MountSetattr
+                | Syscall::Umount2
+        )
+}
+
+/// Shared predicate for syscall, exec, and exit diagnostics.
+#[cfg(feature = "syscall-trace")]
+pub fn syscall_trace_target_task() -> bool {
+    crate::handlers::proc_comm_of_task(crate::handlers::current_task_id())
+        .is_some_and(|comm| comm.starts_with("systemd-executo"))
 }
 
 #[inline]

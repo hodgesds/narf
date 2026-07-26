@@ -28,7 +28,10 @@ use narf_filesystem::{FileOps, FsError, FsFuture, FsInstance, MemFs, Mode, Stat}
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fd;
-use crate::handlers::{copy_user_cstr, current_task_id};
+use crate::handlers::{
+    apply_chroot, copy_user_cstr, current_clone_mount_subtree, current_clone_tree_at,
+    current_fs_arc_at, current_mount_arc, current_task_id, fd_path_of,
+};
 use crate::syscall::{SyscallReturn, TrapContext};
 
 // ── errno (negated-long convention) ─────────────────────────────────
@@ -58,6 +61,7 @@ const FSCONFIG_CMD_RECONFIGURE: u64 = 7;
 const FSOPEN_CLOEXEC: u64 = 0x0000_0001;
 const FSMOUNT_CLOEXEC: u64 = 0x0000_0001;
 const OPEN_TREE_CLOEXEC: u64 = 0o2000000; // O_CLOEXEC
+const OPEN_TREE_CLONE: u64 = 0x0000_0001;
 
 /// A filesystem context under construction (fsopen / fspick).
 struct FsContext {
@@ -66,8 +70,10 @@ struct FsContext {
 }
 
 /// A detached mount (fsmount / open_tree) awaiting move_mount.
+#[derive(Clone)]
 struct MountObject {
     fs: Arc<dyn FsInstance>,
+    descendants: alloc::vec::Vec<(String, Arc<dyn FsInstance>)>,
 }
 
 static CONTEXTS: IrqSafeSpinLock<Option<BTreeMap<u64, FsContext>>> = IrqSafeSpinLock::new(None);
@@ -210,7 +216,29 @@ macro_rules! stub_fileops {
     };
 }
 stub_fileops!(FsContextFile, fs_context_id);
-stub_fileops!(MountObjectFile, mount_object_id);
+
+impl FileOps for MountObjectFile {
+    fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async { Err(FsError::InvalidData) })
+    }
+
+    fn write<'a>(&'a self, _o: u64, _b: &'a [u8]) -> FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async { Err(FsError::InvalidData) })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::DIR_RO,
+            mtime_cycles: 0,
+        }
+    }
+
+    fn mount_object_id(&self) -> Option<u64> {
+        Some(self.id)
+    }
+}
 
 fn install_fd(file: Arc<dyn FileOps>, cloexec: bool) -> Option<u32> {
     let flags = if cloexec { fd::FD_CLOEXEC } else { 0 };
@@ -331,7 +359,15 @@ pub fn sys_fsmount(ctx: &mut dyn TrapContext) {
         }
     };
     let mid = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    with_mounts(|m| m.insert(mid, MountObject { fs }));
+    with_mounts(|m| {
+        m.insert(
+            mid,
+            MountObject {
+                fs,
+                descendants: alloc::vec::Vec::new(),
+            },
+        )
+    });
     match install_fd(
         Arc::new(MountObjectFile { id: mid }),
         a.arg1 & FSMOUNT_CLOEXEC != 0,
@@ -360,60 +396,143 @@ pub fn sys_move_mount(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let fs = match with_mounts(|m| m.get(&mid).map(|mo| mo.fs.clone())) {
-        Some(fs) => fs,
+    let mount = match with_mounts(|m| m.get(&mid).cloned()) {
+        Some(mount) => mount,
         None => {
             ctx.set_return(err(EBADF));
             return;
         }
     };
+    let target = apply_chroot(&to_path);
     let auth = narf_filesystem::bootstrap_mount_authority();
-    match narf_filesystem::registry().mount_arc(&auth, &to_path, fs) {
-        Ok(_) => {
-            // The detached mount has been attached; consume it.
-            with_mounts(|m| m.remove(&mid));
-            ctx.set_return(ok(0));
-        }
-        Err(_) => ctx.set_return(err(EBUSY)),
+    if current_mount_arc(&auth, &target, mount.fs).is_err() {
+        ctx.set_return(err(EBUSY));
+        return;
     }
+    for (relative, fs) in mount.descendants {
+        let child_target = if target == "/" {
+            alloc::format!("/{}", relative.trim_start_matches('/'))
+        } else {
+            alloc::format!("{}{}", target.trim_end_matches('/'), relative)
+        };
+        if current_mount_arc(&auth, &child_target, fs).is_err() {
+            ctx.set_return(err(EBUSY));
+            return;
+        }
+    }
+    // The complete detached tree has been attached; consume it.
+    with_mounts(|m| m.remove(&mid));
+    ctx.set_return(ok(0));
 }
 
 /// `open_tree(dfd, path, flags)` → detached-mount fd cloning the mount that
 /// covers `path` (so it can be re-attached elsewhere with move_mount).
 pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let path = match copy_user_cstr(a.arg1, 4096) {
-        Some(s) if !s.is_empty() && s.starts_with('/') => s,
-        _ => {
+    let task = current_task_id();
+    let raw_path = match copy_user_cstr(a.arg1, 4096) {
+        Some(s) => s,
+        None => {
             ctx.set_return(err(EINVAL));
             return;
         }
     };
-    let resolved = narf_filesystem::registry().resolve_absolute(&path, |fs, rel| {
-        if rel.is_empty() {
-            Ok(())
-        } else {
-            narf_filesystem::resolve(fs.root(), rel).map(|_| ())
-        }
-    });
-
-    match resolved {
-        Some(Ok(())) => {} // Exists
-        Some(Err(_)) | None => {
-            ctx.set_return(err(ENOENT));
+    // Mount-object fds returned by open_tree are valid dirfds for another
+    // open_tree lookup. systemd first opens the mount covering `/run`, then
+    // addresses `run` relative to that detached mount root.
+    if !raw_path.starts_with('/') {
+        if let Some(base_mount) =
+            mount_of(task, a.arg0 as u32).and_then(|mid| with_mounts(|m| m.get(&mid).cloned()))
+        {
+            let mut dir = base_mount.fs.root();
+            let mut found = true;
+            for component in raw_path
+                .split('/')
+                .filter(|part| !part.is_empty() && *part != ".")
+            {
+                dir = match dir.lookup_dir(component) {
+                    Some(next) => next,
+                    None => {
+                        found = false;
+                        break;
+                    }
+                };
+            }
+            if !found && a.arg2 & OPEN_TREE_CLONE != 0 {
+                ctx.set_return(err(ENOENT));
+                return;
+            }
+            let mid = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            with_mounts(|m| m.insert(mid, base_mount));
+            match install_fd(
+                Arc::new(MountObjectFile { id: mid }),
+                a.arg2 & OPEN_TREE_CLOEXEC != 0,
+            ) {
+                Some(n) => ctx.set_return(ok(n as u64)),
+                None => ctx.set_return(err(EBADF)),
+            }
             return;
         }
     }
-
-    let fs = match narf_filesystem::registry().fs_arc_at(&path) {
-        Some(fs) => fs,
+    // open_tree is an *at syscall: an empty path names dfd itself when the
+    // caller supplies the fd-addressed form, and a relative path is resolved
+    // below dfd. systemd uses this to clone the private root it has just
+    // bind-mounted without reopening it by pathname.
+    let visible_path = if raw_path.starts_with('/') {
+        raw_path.clone()
+    } else {
+        let base = match u32::try_from(a.arg0)
+            .ok()
+            .and_then(|fd| fd_path_of(current_task_id(), fd))
+            .filter(|path| path.starts_with('/'))
+        {
+            Some(path) => path,
+            None => {
+                ctx.set_return(err(EBADF));
+                return;
+            }
+        };
+        if raw_path.is_empty() || raw_path == "." {
+            base
+        } else if base == "/" {
+            alloc::format!("/{raw_path}")
+        } else {
+            alloc::format!("{}/{raw_path}", base.trim_end_matches('/'))
+        }
+    };
+    // Both pathname forms above are in the caller's visible namespace:
+    // fd_path_of() deliberately strips the task's chroot prefix. Resolve
+    // them back to the backing mount-table path before cloning the tree.
+    let path = apply_chroot(&visible_path);
+    let mount = match if a.arg2 & OPEN_TREE_CLONE != 0 {
+        current_clone_mount_subtree(&path)
+            .map(|(fs, descendants)| MountObject { fs, descendants })
+            .or_else(|| {
+                raw_path
+                    .is_empty()
+                    .then(|| current_fs_arc_at(&path))
+                    .flatten()
+                    .map(|fs| MountObject {
+                        fs,
+                        descendants: alloc::vec::Vec::new(),
+                    })
+            })
+    } else {
+        current_clone_tree_at(&path)
+            .and_then(|_| current_fs_arc_at(&path))
+            .map(|fs| MountObject {
+                fs,
+                descendants: alloc::vec::Vec::new(),
+            })
+    } {
+        Some(mount) => mount,
         None => {
             ctx.set_return(err(ENOENT));
             return;
         }
     };
     let mid = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    with_mounts(|m| m.insert(mid, MountObject { fs }));
+    with_mounts(|m| m.insert(mid, mount));
     match install_fd(
         Arc::new(MountObjectFile { id: mid }),
         a.arg2 & OPEN_TREE_CLOEXEC != 0,

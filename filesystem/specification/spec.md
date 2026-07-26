@@ -160,6 +160,18 @@ A mount is just another capability; removing it closes access via
 that path. Existing open caps on nodes across the mount continue to
 work (refcount-style) until they too are released.
 
+Linux-compat mount namespaces hold a private snapshot of the mount table.
+Mount, bind-mount, and unmount operations after `CLONE_NEWNS` mutate that
+snapshot only. Private tables permit mount stacking; path resolution and
+unmount select the most recently attached mount at an equal path.
+`clone_tree_at` exposes an arbitrary directory subtree as a detached
+filesystem root for Linux `open_tree(2)` and later `move_mount(2)`.
+An `OPEN_TREE_CLONE` detached object retains the visible descendant
+mounts beneath that root; attaching it rebases those mount paths beneath
+the new target.
+Classic `MS_MOVE` relocates the topmost source mount to the target without
+changing its filesystem object.
+
 ### 3.6 Filesystem driver interface
 
 ```rust

@@ -165,6 +165,23 @@ fn smoke_abi_pathx_faccessat_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_faccessat_pos);
 
+// access(2) applies to directories as well as regular files. In particular,
+// systemd checks W_OK on the cgroup2 mount root immediately after mount(2);
+// returning ENOENT for a mount directory makes it tear the hierarchy down.
+fn smoke_abi_pathx_faccessat_mount_root_writable() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let path = b"/p2\0";
+        match call(
+            Syscall::Faccessat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 2, 0),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("faccessat(W_OK) on a writable mount root should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_faccessat_mount_root_writable);
+
 fn smoke_abi_pathx_faccessat_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/nope\0";

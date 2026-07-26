@@ -1069,13 +1069,62 @@ fn smoke_abi_fsx_open_tree_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_open_tree_pos);
 
+fn smoke_abi_fsx_open_tree_mount_fd_relative() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        let path = b"/abi\0";
+        let mount_fd = match call(Syscall::OpenTree.raw(), a2(0, path.as_ptr() as u64, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("first open_tree should return a mount-object fd"),
+        };
+        let mut stat = [0u8; 256];
+        if call(Syscall::Fstat.raw(), a1(mount_fd, stat.as_mut_ptr() as u64)) != Some(0) {
+            return Err("fstat on an open_tree mount fd should succeed");
+        }
+        let mode = u32::from_ne_bytes(stat[24..28].try_into().unwrap());
+        if mode & 0o170000 != 0o040000 {
+            return Err("an open_tree mount fd must report S_IFDIR");
+        }
+        let relative = b"abi\0";
+        match call(
+            Syscall::OpenTree.raw(),
+            a2(mount_fd, relative.as_ptr() as u64, 0),
+        ) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("open_tree should accept a prior mount-object fd as dirfd"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_open_tree_mount_fd_relative);
+
+fn smoke_abi_fsx_open_tree_empty_path_pos() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        let dir = b"/abi\0";
+        let fd = match call_open(dir.as_ptr() as u64, 0) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("open_tree setup could not open its directory fd"),
+        };
+        let empty = b"\0";
+        match call(
+            Syscall::OpenTree.raw(),
+            a2(fd, empty.as_ptr() as u64, 0x1000),
+        ) {
+            Some(v) if v >= 0 => Ok(()),
+            _ => Err("open_tree(fd, empty, AT_EMPTY_PATH) should clone the fd's mount"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_open_tree_empty_path_pos);
+
 fn smoke_abi_fsx_open_tree_neg() -> TestResult {
     with_setup(|| {
-        // Relative path → EINVAL.
+        // A relative path is valid only when dfd names a directory.
         let path = b"relative\0";
-        match call(Syscall::OpenTree.raw(), a2(0, path.as_ptr() as u64, 0)) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("open_tree with a relative path must return -EINVAL"),
+        match call(
+            Syscall::OpenTree.raw(),
+            a2(u32::MAX as u64, path.as_ptr() as u64, 0),
+        ) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("open_tree with a bad dirfd must return -EBADF"),
         }
     })
 }

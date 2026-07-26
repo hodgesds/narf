@@ -488,10 +488,12 @@ fn smoke_abi_proc2_unshare_newns() -> TestResult {
         // mounts, records the entry (any = true) and returns 0. The base file
         // only covers the flags == 0 no-op success.
         const CLONE_NEWNS: u64 = 0x0002_0000;
-        match call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) {
+        let result = match call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) {
             Some(0) => Ok(()),
             _ => Err("unshare(CLONE_NEWNS) did not return 0"),
-        }
+        };
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_unshare_newns);

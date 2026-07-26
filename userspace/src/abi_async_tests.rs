@@ -189,6 +189,49 @@ fn smoke_abi_async_epoll_ctl_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_ctl_pos);
 
+fn smoke_abi_async_epoll_ctl_close_reuse() -> TestResult {
+    with_setup(|| {
+        let epfd = call(Syscall::EpollCreate.raw(), a0(0))
+            .filter(|fd| *fd >= 0)
+            .ok_or("epoll_create1 failed")? as u64;
+        let old_fd = call(
+            Syscall::Signalfd.raw(),
+            a3((-1i64) as u64, 0, 8, crate::fd::O_CLOEXEC as u64),
+        )
+        .filter(|fd| *fd >= 0)
+        .ok_or("first signalfd failed")? as u64;
+        let mut ev = [0u8; 12];
+        ev[0..4].copy_from_slice(&0x1u32.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd, EPOLL_CTL_ADD, old_fd, ev.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("initial epoll_ctl(ADD signalfd) failed");
+        }
+        if call(Syscall::Close.raw(), a0(old_fd)) != Some(0) {
+            return Err("close of watched signalfd failed");
+        }
+        let new_fd = call(
+            Syscall::Signalfd.raw(),
+            a3((-1i64) as u64, 0, 8, crate::fd::O_CLOEXEC as u64),
+        )
+        .filter(|fd| *fd >= 0)
+        .ok_or("replacement signalfd failed")? as u64;
+        if new_fd != old_fd {
+            return Err("closed descriptor number was not reused");
+        }
+        match call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd, EPOLL_CTL_ADD, new_fd, ev.as_ptr() as u64),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("stale epoll interest rejected a reused descriptor"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_ctl_close_reuse);
+
 fn smoke_abi_async_epoll_ctl_neg() -> TestResult {
     with_setup(|| {
         let mut ev = [0u8; 12];
@@ -925,7 +968,10 @@ fn smoke_abi_async_inotify_epollet_hidden_refill() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_epollet_hidden_refill);
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_inotify_epollet_hidden_refill
+);
 
 // (f) IN_ATTRIB — a chmod on a watched file queues an attribute event.
 fn smoke_abi_async_inotify_fire_attrib() -> TestResult {

@@ -714,6 +714,14 @@ impl FileOps for InotifyFile {
             0
         }
     }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        (
+            with_inotify(|m| m.get(&self.id).map(|s| s.readable_token).unwrap_or(0)),
+            0,
+        )
+    }
+
     /// A blocking read with no queued events must PARK (POSIX), not return
     /// a spurious 0 — inotify has no end-of-file.
     fn read_should_block(&self) -> bool {
@@ -960,13 +968,6 @@ impl FileOps for FanotifyFile {
         } else {
             0
         }
-    }
-
-    fn poll_edge_token(&self) -> (u64, u64) {
-        (
-            with_inotify(|m| m.get(&self.id).map(|s| s.readable_token).unwrap_or(0)),
-            0,
-        )
     }
 
     fn read_should_block(&self) -> bool {

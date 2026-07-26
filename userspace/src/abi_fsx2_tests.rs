@@ -589,6 +589,242 @@ fn smoke_abi_fsx2_mount_bind_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_pos);
 
+fn smoke_abi_fsx2_mount_bind_subdir_pos() -> TestResult {
+    with_setup(|| {
+        let src_source = b"none\0";
+        let src_target = b"/abi-bind-tree\0";
+        let tmpfs = b"tmpfs\0";
+        let margs = SyscallArgs {
+            arg0: src_source.as_ptr() as u64,
+            arg1: src_target.as_ptr() as u64,
+            arg2: tmpfs.as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), margs) != Some(0) {
+            return Err("subdirectory bind source mount failed");
+        }
+        let subdir = b"/abi-bind-tree/subdir\0";
+        let mkdir = a2(subdir.as_ptr() as u64, 0o755, 0);
+        if call(Syscall::Mkdir.raw(), mkdir) != Some(0) {
+            return Err("subdirectory bind source mkdir failed");
+        }
+        let target = b"/abi-bind-subdir-dst\0";
+        const MS_BIND: u64 = 1 << 12;
+        let bind = SyscallArgs {
+            arg0: subdir.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: 0,
+            arg3: MS_BIND,
+            ..Default::default()
+        };
+        match call(Syscall::Mount.raw(), bind) {
+            Some(0) => Ok(()),
+            _ => Err("bind mount of an ordinary subdirectory must return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_subdir_pos);
+
+fn smoke_abi_fsx2_mount_bind_file_to_self_pos() -> TestResult {
+    with_memfs(
+        "/abi-self-bind",
+        "self-bind",
+        &[("control", b"value")],
+        || {
+            let path = b"/abi-self-bind/control\0";
+            const MS_BIND: u64 = 1 << 12;
+            let bind = SyscallArgs {
+                arg0: path.as_ptr() as u64,
+                arg1: path.as_ptr() as u64,
+                arg2: 0,
+                arg3: MS_BIND,
+                ..Default::default()
+            };
+            match call(Syscall::Mount.raw(), bind) {
+                Some(0) => Ok(()),
+                _ => Err("bind-mounting a live file onto itself should succeed"),
+            }
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_file_to_self_pos);
+
+fn smoke_abi_fsx2_mount_bind_proc_file_alias_pos() -> TestResult {
+    with_setup(|| {
+        // systemd constructs service namespaces under a staging procfs mount,
+        // then protects individual controls by binding them onto the matching
+        // file in the visible /proc mount.
+        narf_filesystem::procfs::sys_kernel::register_all();
+        let source = b"proc\0";
+        let staging = b"/abi-proc-staging\0";
+        let procfs = b"proc\0";
+        let mount = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: staging.as_ptr() as u64,
+            arg2: procfs.as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), mount) != Some(0) {
+            return Err("staging procfs mount failed");
+        }
+
+        let staged_file = b"/abi-proc-staging/sys/kernel/domainname\0";
+        let visible_file = b"/proc/sys/kernel/domainname\0";
+        const MS_BIND: u64 = 1 << 12;
+        let bind = SyscallArgs {
+            arg0: staged_file.as_ptr() as u64,
+            arg1: visible_file.as_ptr() as u64,
+            arg2: 0,
+            arg3: MS_BIND,
+            ..Default::default()
+        };
+        match call(Syscall::Mount.raw(), bind) {
+            Some(0) => Ok(()),
+            _ => Err("same procfs file through two mountpoints must bind successfully"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_proc_file_alias_pos);
+
+fn smoke_abi_fsx2_mount_bind_remount_private_file_pos() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_RDONLY: u64 = 1;
+        const MS_REMOUNT: u64 = 1 << 5;
+        const MS_BIND: u64 = 1 << 12;
+
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("private mount namespace setup failed");
+            }
+            narf_filesystem::procfs::sys_kernel::register_all();
+            let source = b"proc\0";
+            let staging = b"/abi-private-proc\0";
+            let procfs = b"proc\0";
+            let mount = SyscallArgs {
+                arg0: source.as_ptr() as u64,
+                arg1: staging.as_ptr() as u64,
+                arg2: procfs.as_ptr() as u64,
+                ..Default::default()
+            };
+            if call(Syscall::Mount.raw(), mount) != Some(0) {
+                return Err("private staging procfs mount failed");
+            }
+
+            let file = b"/abi-private-proc/sys/kernel/domainname\0";
+            let open = a3((-100i64) as u64, file.as_ptr() as u64, 0, 0);
+            let fd = match call(Syscall::Openat.raw(), open) {
+                Some(fd) if (0..=u32::MAX as i64).contains(&fd) => fd as u32,
+                _ => return Err("open must resolve files in the current mount namespace"),
+            };
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+            let remount = SyscallArgs {
+                arg0: 0,
+                arg1: file.as_ptr() as u64,
+                arg2: 0,
+                arg3: MS_BIND | MS_REMOUNT | MS_RDONLY,
+                ..Default::default()
+            };
+            match call(Syscall::Mount.raw(), remount) {
+                Some(0) => Ok(()),
+                _ => Err("bind remount must validate files in the current mount namespace"),
+            }
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_mount_bind_remount_private_file_pos
+);
+
+fn smoke_abi_fsx2_mount_namespace_stack_pos() -> TestResult {
+    with_setup(|| {
+        let ns = narf_filesystem::MountNamespace::snapshot_global();
+        let auth = narf_filesystem::bootstrap_mount_authority();
+        let first: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+            alloc::sync::Arc::new(narf_filesystem::VirtiofsMount::new("stack-first"));
+        let second: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+            alloc::sync::Arc::new(narf_filesystem::VirtiofsMount::new("stack-second"));
+        if ns.mount_arc(&auth, "/abi-private-stack", first).is_err() {
+            return Err("first private namespace mount failed");
+        }
+        if ns.mount_arc(&auth, "/abi-private-stack", second).is_err() {
+            return Err("private mount namespace must permit stacking at one target");
+        }
+        match ns.resolve_absolute("/abi-private-stack", |fs, _| fs.name() == "stack-second") {
+            Some(true) => Ok(()),
+            _ => Err("private namespace path resolution must select the topmost mount"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_namespace_stack_pos);
+
+fn smoke_abi_fsx2_mount_namespace_move_pos() -> TestResult {
+    with_setup(|| {
+        let ns = narf_filesystem::MountNamespace::snapshot_global();
+        let auth = narf_filesystem::bootstrap_mount_authority();
+        let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+            alloc::sync::Arc::new(narf_filesystem::VirtiofsMount::new("move-source"));
+        if ns.mount_arc(&auth, "/abi-move-source", fs).is_err() {
+            return Err("private namespace move setup failed");
+        }
+        if ns
+            .move_mount("/abi-move-source", "/abi-move-target")
+            .is_err()
+        {
+            return Err("moving a private namespace mount should succeed");
+        }
+        if ns.resolve_absolute("/abi-move-source", |fs, _| fs.name() == "move-source") == Some(true)
+        {
+            return Err("moved mount must no longer resolve at its source");
+        }
+        match ns.resolve_absolute("/abi-move-target", |fs, _| fs.name() == "move-source") {
+            Some(true) => Ok(()),
+            _ => Err("moved mount must resolve at its target"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_namespace_move_pos);
+
+fn smoke_abi_fsx2_mount_bind_remount_null_source_pos() -> TestResult {
+    with_setup(|| {
+        let source = b"none\0";
+        let target = b"/abi-bind-remount\0";
+        let tmpfs = b"tmpfs\0";
+        let setup = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: tmpfs.as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), setup) != Some(0) {
+            return Err("bind-remount target setup failed");
+        }
+        const MS_RDONLY: u64 = 1;
+        const MS_REMOUNT: u64 = 1 << 5;
+        const MS_BIND: u64 = 1 << 12;
+        let remount = SyscallArgs {
+            arg0: 0,
+            arg1: target.as_ptr() as u64,
+            arg2: 0,
+            arg3: MS_BIND | MS_REMOUNT | MS_RDONLY,
+            arg4: 0,
+            ..Default::default()
+        };
+        match call(Syscall::Mount.raw(), remount) {
+            Some(0) => Ok(()),
+            _ => Err("MS_BIND|MS_REMOUNT with NULL source must update the existing mount"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_mount_bind_remount_null_source_pos
+);
+
 // ── mount: -EFAULT on an unreadable target pointer ────────────────────
 //
 // copy_user_cstr(arg1=bad, ...) fails → the handler's copy-failure branch,
@@ -712,6 +948,123 @@ fn smoke_abi_fsx2_move_mount_relpath_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_move_mount_relpath_neg);
+
+fn smoke_abi_fsx2_move_mount_private_namespace_pos() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("private mount namespace setup failed");
+            }
+            let fsname = b"tmpfs\0";
+            let fd = match call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) {
+                Some(v) if v >= 0 => v as u64,
+                _ => return Err("fsopen setup failed"),
+            };
+            let create = SyscallArgs {
+                arg0: fd,
+                arg1: FSCONFIG_CMD_CREATE,
+                ..Default::default()
+            };
+            if call(Syscall::Fsconfig.raw(), create) != Some(0) {
+                return Err("fsconfig setup failed");
+            }
+            let mfd = match call(Syscall::Fsmount.raw(), a2(fd, 0, 0)) {
+                Some(v) if v >= 0 => v as u64,
+                _ => return Err("fsmount setup failed"),
+            };
+            let target = b"/proc\0";
+            let attach = SyscallArgs {
+                arg0: mfd,
+                arg1: 0,
+                arg2: (-100i64) as u64,
+                arg3: target.as_ptr() as u64,
+                ..Default::default()
+            };
+            if call(Syscall::MoveMount.raw(), attach) != Some(0) {
+                return Err("move_mount must attach into the private namespace");
+            }
+            let resolved_target = crate::handlers::apply_chroot_for_test("/proc");
+            let attached = crate::handlers::current_mount_namespace()
+                .and_then(|ns| {
+                    ns.resolve_absolute(&resolved_target, |fs, rel| {
+                        rel.is_empty() && fs.name() == "tmpfs"
+                    })
+                })
+                .unwrap_or(false);
+            if !attached {
+                return Err("detached mount was not visible in the current namespace");
+            }
+            Ok(())
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_move_mount_private_namespace_pos
+);
+
+fn smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const OPEN_TREE_CLONE: u64 = 1;
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("private mount namespace setup failed");
+            }
+            let ns = match crate::handlers::current_mount_namespace() {
+                Some(ns) => ns,
+                None => return Err("unshare did not install a mount namespace"),
+            };
+            let auth = narf_filesystem::bootstrap_mount_authority();
+            let root: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                alloc::sync::Arc::new(narf_filesystem::VirtiofsMount::new("tree-root"));
+            let child: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                alloc::sync::Arc::new(narf_filesystem::VirtiofsMount::new("tree-child"));
+            if ns.mount_arc(&auth, "/abi-tree-source", root).is_err()
+                || ns
+                    .mount_arc(&auth, "/abi-tree-source/run/incoming", child)
+                    .is_err()
+            {
+                return Err("detached-tree mount setup failed");
+            }
+
+            let source = b"/abi-tree-source\0";
+            let mfd = match call(
+                Syscall::OpenTree.raw(),
+                a2((-100i64) as u64, source.as_ptr() as u64, OPEN_TREE_CLONE),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open_tree(CLONE) failed"),
+            };
+            let target = b"/abi-tree-target\0";
+            let attach = SyscallArgs {
+                arg0: mfd,
+                arg1: 0,
+                arg2: (-100i64) as u64,
+                arg3: target.as_ptr() as u64,
+                ..Default::default()
+            };
+            if call(Syscall::MoveMount.raw(), attach) != Some(0) {
+                return Err("move_mount of cloned tree failed");
+            }
+            match ns.resolve_absolute("/abi-tree-target/run/incoming", |fs, rel| {
+                rel.is_empty() && fs.name() == "tree-child"
+            }) {
+                Some(true) => Ok(()),
+                _ => Err("move_mount must rebase descendant mounts with the detached root"),
+            }
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos
+);
 
 // ── open_tree: ENOENT on an absolute path with no covering mount ──────
 //

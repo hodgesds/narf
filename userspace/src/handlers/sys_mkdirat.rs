@@ -5,7 +5,7 @@ pub(crate) fn sys_mkdirat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux ABI: `int mkdirat(int dirfd, const char *pathname,
     // mode_t mode)`. arg2 is mode, not path_len.
-    let _dirfd = args.arg0;
+    let dirfd = args.arg0 as i64;
     let path_uptr = args.arg1;
     let mode = args.arg2;
     let path_str = match copy_user_cstr(path_uptr, 4096) {
@@ -15,39 +15,23 @@ pub(crate) fn sys_mkdirat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
+    let _ = mode;
+    const AT_FDCWD: i64 = -100;
+    let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD {
+        path_str
+    } else if dirfd >= 0 {
+        match fd_path_of(current_task_id(), dirfd as u32) {
+            Some(base) if base.starts_with('/') => {
+                alloc::format!("{}/{}", base.trim_end_matches('/'), path_str)
+            }
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+                return;
+            }
         }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    let proxy_args = SyscallArgs {
-        arg0: path_uptr,
-        arg1: path_str.len() as u64,
-        arg2: mode,
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
+    } else {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
     };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_mkdir(&mut proxy);
+    crate::handlers::handler_sys_mkdir::mkdir_path(ctx, &effective);
 }

@@ -523,6 +523,36 @@ fn smoke_abi_path_mkdirat_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_mkdirat_pos);
 
+fn smoke_abi_path_mkdirat_dirfd_relative() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"x")], || {
+        let dir = b"/p\0";
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, O_RDONLY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("mkdirat setup could not open its directory fd"),
+        };
+        let relative = b"runtime\0";
+        if call(
+            Syscall::Mkdirat.raw(),
+            a3(dfd, relative.as_ptr() as u64, 0o755, 0),
+        ) != Some(0)
+        {
+            return Err("mkdirat(dirfd, relative) did not create below the directory fd");
+        }
+        let created = b"/p/runtime\0";
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, created.as_ptr() as u64, O_RDONLY, 0),
+        ) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("mkdirat(dirfd, relative) created at the wrong path"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_mkdirat_dirfd_relative);
+
 fn smoke_abi_path_mkdirat_neg() -> TestResult {
     with_memfs("/p", "p", &[("f", b"x")], || {
         // mkdirat under a missing parent.

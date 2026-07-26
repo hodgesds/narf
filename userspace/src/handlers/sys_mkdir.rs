@@ -12,7 +12,11 @@ pub(crate) fn sys_mkdir(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let path = resolve_cwd_path(current_task_id(), &path);
+    mkdir_path(ctx, &path);
+}
+
+pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str) {
+    let path = resolve_cwd_path(current_task_id(), raw_path);
     // Normalise trailing slashes; `mkdir("/")` (or any path that resolves
     // to the root) always already exists.
     let path_ref: &str = {

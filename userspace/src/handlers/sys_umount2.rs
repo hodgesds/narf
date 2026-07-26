@@ -29,8 +29,7 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // sys_mount), the balancing umount of one is also a no-op: report success
     // but keep the singleton mounted. tmpfs / bind / real mounts unmount as
     // normal.
-    let protected = narf_filesystem::registry()
-        .list_with_names()
+    let protected = current_mount_list_with_names()
         .into_iter()
         .any(|(path, name)| {
             path == target
@@ -51,7 +50,12 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
         narf_capabilities::Cap::<narf_filesystem::MountPoint, narf_capabilities::Write>::bootstrap(
         );
     let _ = auth;
-    match narf_filesystem::registry().unmount(&handle, target.as_str()) {
+    let result = if let Some(ns) = current_mount_namespace() {
+        ns.unmount(target.as_str())
+    } else {
+        narf_filesystem::registry().unmount(&handle, target.as_str())
+    };
+    match result {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(_) => ctx.set_return(fail),
     }

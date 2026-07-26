@@ -947,12 +947,11 @@ fn open_impl(
         // `readlinkat()` each symlink — following the final component here
         // handed them the target instead of the link. `resolve_async_nofollow`
         // follows intermediate symlinks but returns a final symlink as-is.
-        let leaf = narf_filesystem::registry()
-            .resolve_absolute(path, |fs, rel| {
-                poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
-                    .and_then(|r| r.ok())
-            })
-            .flatten();
+        let leaf = current_resolve_absolute(path, |fs, rel| {
+            poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+                .and_then(|r| r.ok())
+        })
+        .flatten();
         if let Some(lops) = leaf {
             if lops.stat().mode.file_type == narf_filesystem::FileType::Symlink {
                 if flags & O_PATH == 0 {
@@ -990,11 +989,10 @@ fn open_impl(
     // - Explicit-mount: arg2/arg3 = (ptr, len). The path is relative.
     //   Useful when the caller already knows the mount.
     let ops = if mnt_len == 0 {
-        narf_filesystem::registry()
-            .resolve_absolute(path, |fs, rel| {
-                poll_blocking(narf_filesystem::resolve_async(fs.root(), rel)).and_then(|r| r.ok())
-            })
-            .flatten()
+        current_resolve_absolute(path, |fs, rel| {
+            poll_blocking(narf_filesystem::resolve_async(fs.root(), rel)).and_then(|r| r.ok())
+        })
+        .flatten()
     } else {
         let mount_owned = match copy_user_path(mnt_ptr, mnt_len) {
             Some(s) => s,
@@ -2073,7 +2071,7 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
 // ── Wave-70 MemFdFile side table ───────────────────────────────────
 #[cfg(feature = "linux-compat")]
 static MEMFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::linux_compat::MemFdFile>>>,
+    Option<alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::linux_compat::MemFdFile>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 #[cfg(feature = "linux-compat")]
@@ -2081,7 +2079,7 @@ fn memfd_arc_register(arc: &alloc::sync::Arc<crate::linux_compat::MemFdFile>) {
     let key = alloc::sync::Arc::as_ptr(arc) as usize;
     let mut g = MEMFD_ARCS.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, arc.clone());
+    map.insert(key, alloc::sync::Arc::downgrade(arc));
 }
 
 #[cfg(feature = "linux-compat")]
@@ -2091,8 +2089,13 @@ pub(crate) fn memfd_arc_from_fd(
 ) -> Option<alloc::sync::Arc<crate::linux_compat::MemFdFile>> {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let g = MEMFD_ARCS.lock();
-    g.as_ref()?.get(&raw).cloned()
+    let mut g = MEMFD_ARCS.lock();
+    let map = g.as_mut()?;
+    let arc = map.get(&raw)?.upgrade();
+    if arc.is_none() {
+        map.remove(&raw);
+    }
+    arc
 }
 
 // ── Fsync / Fdatasync — flush stubs ────────────────────────────────
@@ -2218,35 +2221,32 @@ pub(crate) fn resolve_parent_dir_async(
         return None;
     }
     let parent_path = if last == 0 { "/" } else { &abs[..last] };
-    let dir = narf_filesystem::registry()
-        .resolve_absolute(parent_path, |fs, rel| {
-            // Walk `rel` segment-by-segment as DIRECTORIES. We can't use
-            // `resolve_async` here: it resolves to a FileOps and returns
-            // NotFound for a directory-only final component (e.g. a MemFs
-            // subdir, whose `lookup` yields None for Dir entries), so the
-            // parent of a nested create never resolved → EPERM. Prefer the
-            // async dir-lookup (ext2 needs block reads); fall back to the
-            // sync `lookup_dir` for filesystems that stub the async form.
-            let mut dir = fs.root();
-            for seg in rel.split('/') {
-                if seg.is_empty() || seg == "." {
-                    continue;
-                }
-                if seg == ".." {
-                    return None;
-                }
-                let next = match poll_blocking(dir.lookup_dir_async(seg)) {
-                    Some(Ok(d)) => d,
-                    Some(Err(narf_filesystem::FsError::Unsupported)) | None => {
-                        dir.lookup_dir(seg)?
-                    }
-                    Some(Err(_)) => return None,
-                };
-                dir = next;
+    let dir = current_resolve_absolute(parent_path, |fs, rel| {
+        // Walk `rel` segment-by-segment as DIRECTORIES. We can't use
+        // `resolve_async` here: it resolves to a FileOps and returns
+        // NotFound for a directory-only final component (e.g. a MemFs
+        // subdir, whose `lookup` yields None for Dir entries), so the
+        // parent of a nested create never resolved → EPERM. Prefer the
+        // async dir-lookup (ext2 needs block reads); fall back to the
+        // sync `lookup_dir` for filesystems that stub the async form.
+        let mut dir = fs.root();
+        for seg in rel.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
             }
-            Some(dir)
-        })
-        .flatten()?;
+            if seg == ".." {
+                return None;
+            }
+            let next = match poll_blocking(dir.lookup_dir_async(seg)) {
+                Some(Ok(d)) => d,
+                Some(Err(narf_filesystem::FsError::Unsupported)) | None => dir.lookup_dir(seg)?,
+                Some(Err(_)) => return None,
+            };
+            dir = next;
+        }
+        Some(dir)
+    })
+    .flatten()?;
     Some((dir, alloc::string::String::from(leaf)))
 }
 
@@ -4974,6 +4974,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         ),
         None => crate::user_task::spawn_user_process(proc, narf_scheduler::TaskSpec::user_task()),
     };
+    proc_identity_fork(parent_pid, child_tid.raw());
 
     // Register the (visible-pid → TaskId) binding. For
     // CLONE_THREAD children visible_pid == parent's pid, so the
@@ -8396,20 +8397,19 @@ fn path_is_mount_ancestor(path: &str) -> bool {
 }
 
 fn resolve_dir_absolute(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
-    narf_filesystem::registry()
-        .resolve_absolute(path, |fs, rel| {
-            let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
-                fs.root()
-            } else {
-                let mut cur = fs.root();
-                for seg in rel.split('/').filter(|s| !s.is_empty()) {
-                    cur = poll_blocking(cur.lookup_dir_async(seg)).and_then(|r| r.ok())?;
-                }
-                cur
-            };
-            Some(dir)
-        })
-        .flatten()
+    current_resolve_absolute(path, |fs, rel| {
+        let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
+            fs.root()
+        } else {
+            let mut cur = fs.root();
+            for seg in rel.split('/').filter(|s| !s.is_empty()) {
+                cur = poll_blocking(cur.lookup_dir_async(seg)).and_then(|r| r.ok())?;
+            }
+            cur
+        };
+        Some(dir)
+    })
+    .flatten()
 }
 
 /// Stat an absolute path, handling both files and directories.
@@ -8437,33 +8437,32 @@ fn stat_ino_path_dir_aware_ext(
     path: &str,
     follow_final: bool,
 ) -> Option<(narf_filesystem::Stat, u64, u64)> {
-    let file = narf_filesystem::registry()
-        .resolve_absolute(path, |fs, rel| {
-            if rel.is_empty() {
-                None // mount root → treated as a directory below
-            } else {
-                // Drive the ASYNC resolver (same as the open/execve path):
-                // on-disk filesystems like ext2 implement `lookup_async` but
-                // stub the sync `lookup` (block reads can't run synchronously),
-                // so the old `narf_filesystem::resolve` always missed real
-                // files — `stat("/mnt/bin/busybox")` failed while
-                // `open`/`execve` of the same path succeeded. That made every
-                // PATH probe (busybox/ash search applets via stat) report
-                // "not found" inside a mounted distro rootfs.
-                poll_blocking(narf_filesystem::resolve_async_ext(
-                    fs.root(),
-                    rel,
-                    follow_final,
-                ))
-                .and_then(|r| r.ok())
-                // rdev() is needed by seatd/libudev, which validate a
-                // device node's type via the MAJOR:MINOR from a PATH
-                // stat (not just fstat) — a 0 rdev reads as "not an
-                // evdev/drm device" and they refuse to open it.
-                .map(|ops| (ops.stat(), ops.ino(), ops.rdev()))
-            }
-        })
-        .flatten();
+    let file = current_resolve_absolute(path, |fs, rel| {
+        if rel.is_empty() {
+            None // mount root → treated as a directory below
+        } else {
+            // Drive the ASYNC resolver (same as the open/execve path):
+            // on-disk filesystems like ext2 implement `lookup_async` but
+            // stub the sync `lookup` (block reads can't run synchronously),
+            // so the old `narf_filesystem::resolve` always missed real
+            // files — `stat("/mnt/bin/busybox")` failed while
+            // `open`/`execve` of the same path succeeded. That made every
+            // PATH probe (busybox/ash search applets via stat) report
+            // "not found" inside a mounted distro rootfs.
+            poll_blocking(narf_filesystem::resolve_async_ext(
+                fs.root(),
+                rel,
+                follow_final,
+            ))
+            .and_then(|r| r.ok())
+            // rdev() is needed by seatd/libudev, which validate a
+            // device node's type via the MAJOR:MINOR from a PATH
+            // stat (not just fstat) — a 0 rdev reads as "not an
+            // evdev/drm device" and they refuse to open it.
+            .map(|ops| (ops.stat(), ops.ino(), ops.rdev()))
+        }
+    })
+    .flatten();
     if file.is_some() {
         return file;
     }
@@ -9611,6 +9610,143 @@ pub fn current_mount_namespace() -> Option<alloc::sync::Arc<narf_filesystem::Mou
     g.as_ref().and_then(|m| m.get(&task).cloned())
 }
 
+pub(crate) fn clear_current_mount_namespace_for_test() {
+    let task = current_task_id();
+    if let Some(namespaces) = TASK_MOUNT_NS.lock().as_mut() {
+        namespaces.remove(&task);
+    }
+}
+
+pub(crate) fn current_resolve_absolute<R, F>(path: &str, resolve: F) -> Option<R>
+where
+    F: FnOnce(&dyn narf_filesystem::FsInstance, &str) -> R,
+{
+    if let Some(ns) = current_mount_namespace() {
+        ns.resolve_absolute(path, resolve)
+    } else {
+        narf_filesystem::registry().resolve_absolute(path, resolve)
+    }
+}
+
+pub(crate) fn current_clone_tree_at(
+    path: &str,
+) -> Option<alloc::sync::Arc<dyn narf_filesystem::FsInstance>> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.clone_tree_at(path)
+    } else {
+        narf_filesystem::registry().clone_tree_at(path)
+    }
+}
+
+pub(crate) fn current_fs_arc_at(
+    path: &str,
+) -> Option<alloc::sync::Arc<dyn narf_filesystem::FsInstance>> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.fs_arc_at(path)
+    } else {
+        narf_filesystem::registry().fs_arc_at(path)
+    }
+}
+
+fn current_mount_list() -> alloc::vec::Vec<alloc::string::String> {
+    current_mount_namespace()
+        .map(|ns| ns.list())
+        .unwrap_or_else(|| narf_filesystem::registry().list())
+}
+
+type DetachedMountSubtree = (
+    alloc::sync::Arc<dyn narf_filesystem::FsInstance>,
+    alloc::vec::Vec<(
+        alloc::string::String,
+        alloc::sync::Arc<dyn narf_filesystem::FsInstance>,
+    )>,
+);
+
+pub(crate) fn current_clone_mount_subtree(path: &str) -> Option<DetachedMountSubtree> {
+    let base = if path == "/" {
+        "/"
+    } else {
+        path.trim_end_matches('/')
+    };
+    let root = current_clone_tree_at(base)?;
+    let paths = current_mount_namespace()
+        .map(|ns| ns.list())
+        .unwrap_or_else(|| narf_filesystem::registry().list());
+    let mut seen = alloc::collections::BTreeSet::new();
+    let mut descendants = alloc::vec::Vec::new();
+    for mount_path in paths {
+        if mount_path.len() <= base.len()
+            || !mount_path.starts_with(base)
+            || (base != "/" && mount_path.as_bytes().get(base.len()) != Some(&b'/'))
+        {
+            continue;
+        }
+        let relative = if base == "/" {
+            alloc::format!("/{}", mount_path.trim_start_matches('/'))
+        } else {
+            alloc::string::String::from(&mount_path[base.len()..])
+        };
+        if !seen.insert(relative.clone()) {
+            continue;
+        }
+        if let Some(fs) = current_fs_arc_at(&mount_path) {
+            descendants.push((relative, fs));
+        }
+    }
+    descendants.sort_by_key(|(relative, _)| relative.len());
+    Some((root, descendants))
+}
+
+fn current_mount_list_with_names() -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
+{
+    current_mount_namespace()
+        .map(|ns| ns.list_with_names())
+        .unwrap_or_else(|| narf_filesystem::registry().list_with_names())
+}
+
+pub(crate) fn current_mount_arc(
+    authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
+    path: &str,
+    fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance>,
+) -> Result<
+    narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
+    narf_filesystem::FsError,
+> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.mount_arc(authority, path, fs)
+    } else {
+        narf_filesystem::registry().mount_arc(authority, path, fs)
+    }
+}
+
+fn current_bind_mount(
+    authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
+    source: &str,
+    target: &str,
+) -> Result<
+    narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
+    narf_filesystem::FsError,
+> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.bind_mount(authority, source, target)
+    } else {
+        narf_filesystem::registry().bind_mount(authority, source, target)
+    }
+}
+
+fn current_move_mount(
+    authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
+    source: &str,
+    target: &str,
+) -> Result<(), narf_filesystem::FsError> {
+    if let Some(ns) = current_mount_namespace() {
+        let _ = authority;
+        ns.move_mount(source, target)
+    } else {
+        narf_filesystem::registry().move_mount(authority, source, target)
+    }
+}
+
 /// Look up the mount namespace of an arbitrary task by id.
 #[cfg(feature = "container")]
 pub fn mount_namespace_of(task: u64) -> Option<alloc::sync::Arc<narf_filesystem::MountNamespace>> {
@@ -10616,6 +10752,30 @@ static PROC_COMM: narf_lib::sync::IrqSafeSpinLock<
 static PROC_EXE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, alloc::string::String>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[cfg(target_arch = "x86_64")]
+fn proc_identity_fork(parent_task: u64, child_task: u64) {
+    let inherited_comm = {
+        let g = PROC_COMM.lock();
+        g.as_ref().and_then(|m| m.get(&parent_task).cloned())
+    };
+    if let Some(comm) = inherited_comm {
+        PROC_COMM
+            .lock()
+            .get_or_insert_with(alloc::collections::BTreeMap::new)
+            .insert(child_task, comm);
+    }
+    let inherited_exe = {
+        let g = PROC_EXE.lock();
+        g.as_ref().and_then(|m| m.get(&parent_task).cloned())
+    };
+    if let Some(exe) = inherited_exe {
+        PROC_EXE
+            .lock()
+            .get_or_insert_with(alloc::collections::BTreeMap::new)
+            .insert(child_task, exe);
+    }
+}
 
 /// Record the exec'd binary path for `/proc/[pid]/exe`. A relative
 /// exec path is resolved against the caller's cwd so the link is
@@ -12838,6 +12998,7 @@ pub fn default_sync_signal_delivery(
                 use core::fmt::Write;
                 let pid = task_to_pid_raw(task).unwrap_or(task);
                 let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
+                let exe = proc_exe_path(pid).unwrap_or_else(|| alloc::string::String::from("?"));
                 let cause = match vector {
                     6 => "#UD",
                     13 => "#GP",
@@ -12858,6 +13019,7 @@ pub fn default_sync_signal_delivery(
                     info.addr,
                     ctx.rip()
                 );
+                let _ = writeln!(narf_console::Writer, "  exe={}", exe);
                 // Dump the GP register file — a faulting instruction's
                 // operands (e.g. a corrupted heap/meta pointer in r13/r15)
                 // pin whether the fault is a slightly-off pointer (adjacent
@@ -13808,21 +13970,26 @@ const EPOLL_CTL_MOD: u32 = 3;
 // EpollFile recovery from FdEntry — same shape as the SocketFile
 // side table since Arc<dyn FileOps> can't be downcast generically.
 static EPOLL_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::io_mux::EpollFile>>>,
+    Option<alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::io_mux::EpollFile>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn epoll_arc_register(arc: &alloc::sync::Arc<crate::io_mux::EpollFile>) {
     let key = alloc::sync::Arc::as_ptr(arc) as usize;
     let mut g = EPOLL_ARCS.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, arc.clone());
+    map.insert(key, alloc::sync::Arc::downgrade(arc));
 }
 
 fn epoll_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mux::EpollFile>> {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let g = EPOLL_ARCS.lock();
-    g.as_ref()?.get(&raw).cloned()
+    let mut g = EPOLL_ARCS.lock();
+    let map = g.as_mut()?;
+    let arc = map.get(&raw)?.upgrade();
+    if arc.is_none() {
+        map.remove(&raw);
+    }
+    arc
 }
 
 // Wave-61: pidfd_open(pid, flags) → fd that signals POLLIN on exit.
@@ -13840,21 +14007,26 @@ fn epoll_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mu
 // (GPL-2.0-or-later, kernel.org).
 
 static TIMERFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::io_mux::TimerFd>>>,
+    Option<alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::io_mux::TimerFd>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn timerfd_arc_register(arc: &alloc::sync::Arc<crate::io_mux::TimerFd>) {
     let key = alloc::sync::Arc::as_ptr(arc) as usize;
     let mut g = TIMERFD_ARCS.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, arc.clone());
+    map.insert(key, alloc::sync::Arc::downgrade(arc));
 }
 
 fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mux::TimerFd>> {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let g = TIMERFD_ARCS.lock();
-    g.as_ref()?.get(&raw).cloned()
+    let mut g = TIMERFD_ARCS.lock();
+    let map = g.as_mut()?;
+    let arc = map.get(&raw)?.upgrade();
+    if arc.is_none() {
+        map.remove(&raw);
+    }
+    arc
 }
 
 // ── Wave-70 SignalFdFile side table ────────────────────────────────
@@ -13864,7 +14036,7 @@ fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_
 #[cfg(feature = "linux-compat")]
 static SIGNALFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
     Option<
-        alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::linux_compat::SignalFdFile>>,
+        alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::linux_compat::SignalFdFile>>,
     >,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -13873,7 +14045,7 @@ fn signalfd_arc_register(arc: &alloc::sync::Arc<crate::linux_compat::SignalFdFil
     let key = alloc::sync::Arc::as_ptr(arc) as usize;
     let mut g = SIGNALFD_ARCS.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, arc.clone());
+    map.insert(key, alloc::sync::Arc::downgrade(arc));
 }
 
 #[cfg(feature = "linux-compat")]
@@ -13883,8 +14055,13 @@ pub(crate) fn signalfd_arc_from_fd(
 ) -> Option<alloc::sync::Arc<crate::linux_compat::SignalFdFile>> {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let g = SIGNALFD_ARCS.lock();
-    g.as_ref()?.get(&raw).cloned()
+    let mut g = SIGNALFD_ARCS.lock();
+    let map = g.as_mut()?;
+    let arc = map.get(&raw)?.upgrade();
+    if arc.is_none() {
+        map.remove(&raw);
+    }
+    arc
 }
 
 // ── Installer ──────────────────────────────────────────────────────

@@ -1609,7 +1609,7 @@ impl MountNamespace {
                 || m.path == "/"
                 || (abs.starts_with(m.path.as_str())
                     && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
-            if is_match && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
+            if is_match && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len() {
                 best = Some(m);
             }
         }
@@ -1617,6 +1617,43 @@ impl MountNamespace {
         let rel = &abs[m.path.len()..];
         let rel = rel.strip_prefix('/').unwrap_or(rel);
         Some(f(&*m.fs, rel))
+    }
+
+    /// Clone the filesystem object of the visible mount covering `abs`.
+    ///
+    /// Equal-length entries are mount stacks; the newest entry wins, matching
+    /// `resolve_absolute`.
+    pub fn fs_arc_at(&self, abs: &str) -> Option<Arc<dyn FsInstance>> {
+        if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+            return None;
+        }
+        let q = self.inner.lock();
+        let mut best: Option<&Mount> = None;
+        for m in q.iter() {
+            let is_match = abs == m.path.as_str()
+                || m.path == "/"
+                || (abs.starts_with(m.path.as_str())
+                    && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
+            if is_match && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len() {
+                best = Some(m);
+            }
+        }
+        best.map(|m| m.fs.clone())
+    }
+
+    /// Clone the visible directory subtree rooted at `abs`.
+    pub fn clone_tree_at(&self, abs: &str) -> Option<Arc<dyn FsInstance>> {
+        self.resolve_absolute(abs, |fs, rel| {
+            let mut root = fs.root();
+            for component in rel.split('/').filter(|part| !part.is_empty()) {
+                root = root.lookup_dir(component)?;
+            }
+            Some(Arc::new(BindMount {
+                root,
+                fs_name: String::from(fs.name()),
+            }) as Arc<dyn FsInstance>)
+        })
+        .flatten()
     }
 
     /// List the mount paths in this namespace.
@@ -1635,6 +1672,86 @@ impl MountNamespace {
             .map(|m| (m.path.clone(), String::from(m.fs.name())))
             .collect()
     }
+
+    /// Attach a filesystem to this private namespace. Unlike the boot-time
+    /// registry, private namespaces permit stacking at the same path; the most
+    /// recently attached mount is the visible one.
+    pub fn mount_arc(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        path: &str,
+        fs: Arc<dyn FsInstance>,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
+        authority.check_live()?;
+        let handle = Cap::<MountPoint, Write>::bootstrap();
+        self.inner.lock().push(Mount {
+            path: String::from(path),
+            fs,
+            handle,
+        });
+        Ok(handle)
+    }
+
+    /// Bind an arbitrary directory into this private namespace.
+    pub fn bind_mount(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        source: &str,
+        target: &str,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
+        authority.check_live()?;
+        let (source_fs, rel) = {
+            let q = self.inner.lock();
+            let source_mount = q
+                .iter()
+                .filter(|m| {
+                    source == m.path
+                        || m.path == "/"
+                        || (source.starts_with(m.path.as_str())
+                            && source.as_bytes().get(m.path.len()) == Some(&b'/'))
+                })
+                .max_by_key(|m| m.path.len())
+                .ok_or(FsError::NotFound)?;
+            (
+                source_mount.fs.clone(),
+                String::from(source[source_mount.path.len()..].trim_start_matches('/')),
+            )
+        };
+        let mut root = source_fs.root();
+        for component in rel.split('/').filter(|part| !part.is_empty()) {
+            root = root.lookup_dir(component).ok_or(FsError::NotFound)?;
+        }
+        self.mount_arc(
+            authority,
+            target,
+            Arc::new(BindMount {
+                root,
+                fs_name: String::from(source_fs.name()),
+            }),
+        )
+    }
+
+    /// Detach the topmost mount at `path` from this private namespace.
+    pub fn unmount(&self, path: &str) -> Result<(), FsError> {
+        let mut q = self.inner.lock();
+        let index = q
+            .iter()
+            .rposition(|m| m.path == path)
+            .ok_or(FsError::NotFound)?;
+        q.remove(index);
+        Ok(())
+    }
+
+    /// Move the topmost mount at `source` to `target`.
+    pub fn move_mount(&self, source: &str, target: &str) -> Result<(), FsError> {
+        let mut q = self.inner.lock();
+        let index = q
+            .iter()
+            .rposition(|m| m.path == source)
+            .ok_or(FsError::NotFound)?;
+        q[index].path = String::from(target);
+        Ok(())
+    }
 }
 
 /// Bootstrap the mount-authority cap. TCB-only path — the kernel
@@ -1644,30 +1761,30 @@ pub fn bootstrap_mount_authority() -> Cap<MountPoint, Grant> {
     Cap::<MountPoint, Grant>::bootstrap()
 }
 
-/// FsInstance adapter that forwards root() / name() to another
-/// FsInstance. Used to implement `bind_mount` — the bound mount
-/// shares the source FS's root directory directly, no copying.
+/// FsInstance adapter that exposes a directory from another filesystem as a
+/// mount root. Used to implement `bind_mount` without copying the subtree.
 struct BindMount {
-    inner: Arc<dyn FsInstance>,
+    root: Arc<dyn DirOps>,
+    fs_name: String,
 }
 
 impl fmt::Debug for BindMount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BindMount")
-            .field("inner", &self.inner.name())
+            .field("fs_name", &self.fs_name)
             .finish_non_exhaustive()
     }
 }
 
 impl FsInstance for BindMount {
     fn root(&self) -> Arc<dyn DirOps> {
-        self.inner.root()
+        self.root.clone()
     }
     fn name(&self) -> &str {
         // POSIX `mount(2)` / `proc(5)` both report bind mounts with
         // their source FS name; matches Linux's /proc/mounts shape
         // where a bind mount lists the source FS type, not "bind".
-        self.inner.name()
+        &self.fs_name
     }
 }
 
@@ -1737,23 +1854,35 @@ impl VfsRegistry {
         target: &str,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
-        // Resolve the source to a DirOps. We need both the source FS
-        // (for name()) and the directory at the source path.
-        // resolve_absolute hands the FS + the relative path; we walk
-        // the relative path to a DirOps via lookup_dir / lookup_dir_async.
-        // For Stage-3 simplicity, only the mount-root case is wired:
-        // `bind_mount("/a", "/b")` where `/a` is itself a mount.
+        // Resolve the longest mount prefix first, then walk the remaining
+        // directory components. Linux permits binding any directory, not only
+        // a filesystem root; systemd relies on that while constructing a
+        // service's private mount namespace.
         let q = self.inner.lock();
         let source_mount = q
             .iter()
-            .find(|m| m.path == source)
+            .filter(|m| {
+                source == m.path
+                    || m.path == "/"
+                    || (source.starts_with(m.path.as_str())
+                        && source.as_bytes().get(m.path.len()) == Some(&b'/'))
+            })
+            .max_by_key(|m| m.path.len())
             .ok_or(FsError::NotFound)?;
         let source_fs = source_mount.fs.clone();
+        let rel = String::from(source[source_mount.path.len()..].trim_start_matches('/'));
         if q.iter().any(|m| m.path == target) {
             return Err(FsError::Busy);
         }
         drop(q);
-        let bind = alloc::sync::Arc::new(BindMount { inner: source_fs });
+        let mut root = source_fs.root();
+        for component in rel.split('/').filter(|part| !part.is_empty()) {
+            root = root.lookup_dir(component).ok_or(FsError::NotFound)?;
+        }
+        let bind = alloc::sync::Arc::new(BindMount {
+            root,
+            fs_name: String::from(source_fs.name()),
+        });
         self.mount_arc(authority, target, bind)
     }
 
@@ -1801,6 +1930,26 @@ impl VfsRegistry {
         // section short — important once page-cache eviction lands.
         drop(q);
         drop(m);
+        Ok(())
+    }
+
+    /// Move a mounted filesystem from `source` to `target`.
+    pub fn move_mount(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        source: &str,
+        target: &str,
+    ) -> Result<(), FsError> {
+        authority.check_live()?;
+        let mut q = self.inner.lock();
+        let index = q
+            .iter()
+            .position(|m| m.path == source)
+            .ok_or(FsError::NotFound)?;
+        if q.iter().any(|m| m.path == target) {
+            return Err(FsError::Busy);
+        }
+        q[index].path = String::from(target);
         Ok(())
     }
 
@@ -1875,6 +2024,21 @@ impl VfsRegistry {
             }
         }
         best.map(|m| m.fs.clone())
+    }
+
+    /// Clone the directory subtree rooted at `abs` as a detached filesystem.
+    pub fn clone_tree_at(&self, abs: &str) -> Option<Arc<dyn FsInstance>> {
+        self.resolve_absolute(abs, |fs, rel| {
+            let mut root = fs.root();
+            for component in rel.split('/').filter(|part| !part.is_empty()) {
+                root = root.lookup_dir(component)?;
+            }
+            Some(Arc::new(BindMount {
+                root,
+                fs_name: String::from(fs.name()),
+            }) as Arc<dyn FsInstance>)
+        })
+        .flatten()
     }
 
     /// Resolve `abs` to its parent directory + leaf name and run
