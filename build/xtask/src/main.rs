@@ -5985,7 +5985,7 @@ interface_resolution: 1024x768
     println!("xtask image: wrote {}", iso.display());
     let ovmf = ovmf_code_path();
     println!(
-        "  test under QEMU UEFI:  qemu-system-x86_64 -bios {} -machine q35 -cpu max -m 1024M \\\n\
+        "  test under QEMU UEFI:  qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file={} -machine q35 -cpu max -m 1024M \\\n\
          \x20                          -cdrom {} -serial stdio -display none -no-reboot",
         ovmf.display(),
         iso.display()
@@ -6069,7 +6069,13 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
     };
 
     let mut cmd = Command::new("qemu-system-x86_64");
-    cmd.arg("-bios").arg(&ovmf);
+    // Use OVMF as a read-only pflash device. Current Debian/Ubuntu packages
+    // ship a split 4 MiB CODE image which some QEMU builds reject through the
+    // legacy `-bios` loader even though it is a valid pflash image.
+    cmd.arg("-drive").arg(format!(
+        "if=pflash,format=raw,readonly=on,file={}",
+        ovmf.display()
+    ));
     // q35 — same chipset the smoke harness uses. The default `pc`
     // (i440FX) machine has no PCIe ECAM, only legacy CF8/CFC PCI
     // config IO, which the kernel's bus walker doesn't drive yet.
@@ -6363,20 +6369,25 @@ fn aarch64_uefi_boot_cmd(args: &BuildArgs) -> Result<()> {
             firmware.display()
         );
     }
+    let dtb = qemu_virt_dtb_path();
+    if std::fs::metadata(&dtb)
+        .map(|metadata| metadata.len() < 40)
+        .unwrap_or(true)
+    {
+        bail!(
+            "QEMU aarch64 virt DTB was not generated at {}; \
+             ensure qemu-system-aarch64 supports -machine virt,dumpdtb=...",
+            dtb.display()
+        );
+    }
 
     let mut command = Command::new("qemu-system-aarch64");
+    command.arg("-machine").arg(format!(
+        "virt,gic-version=3,mte=on,highmem-ecam=off,acpi=off,dtb={}",
+        dtb.display()
+    ));
     command
-        .args([
-            "-machine",
-            "virt,gic-version=3,mte=on,highmem-ecam=off",
-            "-cpu",
-            "max",
-            "-smp",
-            "2",
-            "-m",
-            "512M",
-            "-bios",
-        ])
+        .args(["-cpu", "max", "-smp", "2", "-m", "512M", "-bios"])
         .arg(&firmware)
         .args(["-drive"])
         .arg(format!(
