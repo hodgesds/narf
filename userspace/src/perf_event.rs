@@ -2836,6 +2836,13 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
+    // Software CPU/task clocks have authoritative user/kernel accounting
+    // below. Hardware selectors still count both privilege domains on both
+    // backends, so accepting exclude_kernel here would fabricate filtering.
+    if attr.type_ != PERF_TYPE_SOFTWARE && attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL != 0 {
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        return;
+    }
 
     let task = current_task_id();
 

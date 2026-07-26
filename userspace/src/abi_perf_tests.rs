@@ -232,6 +232,25 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             _ => return Err("perf_event_open ignored an unimplemented attr flag"),
         }
 
+        let hardware_privilege_filter = PerfEventAttr {
+            type_: 0,      // PERF_TYPE_HARDWARE
+            config: 0,     // cycles
+            flags: 1 << 5, // exclude_kernel
+            ..attr
+        };
+        match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &hardware_privilege_filter as *const _ as u64,
+                0,
+                -1i32 as u64,
+                -1i32 as u64,
+            ),
+        ) {
+            Some(EOPNOTSUPP) => {}
+            _ => return Err("hardware exclude_kernel reported false success"),
+        }
+
         let zero_frequency = PerfEventAttr {
             flags: PERF_ATTR_FLAG_FREQ,
             ..attr

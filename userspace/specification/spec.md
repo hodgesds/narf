@@ -167,6 +167,9 @@ scheduler's per-CPU user-continuation brackets provide an exact accumulated
 user-time clock. Requests for an all-context per-CPU clock remain unsupported
 until kernel/executor time is accounted per CPU. `PERF_COUNT_SW_TASK_CLOCK`
 uses the existing per-task user and syscall CPU-time ledgers.
+Hardware events reject `exclude_kernel` with `EOPNOTSUPP` until x86 event
+selectors and aarch64 PMEVTYPER filters both enforce the requested privilege
+domain; accepting the bit while counting kernel execution is forbidden.
 
 A shared mapping of a perf fd exposes one Linux-shaped
 `perf_event_mmap_page` metadata page followed by a power-of-two data area.

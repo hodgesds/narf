@@ -54,6 +54,8 @@ Implemented:
   PMCEID-gated hardware and architectural raw-event parsing on aarch64.
 - Exact scheduler-accounted task clocks and per-CPU user clocks selected with
   `exclude_kernel`; all-context per-CPU software clocks remain unsupported.
+- Hardware privilege filters fail closed with `EOPNOTSUPP`; the current PMU
+  selectors count both user and kernel execution.
 - PID, CPU, group-fd existence, open flags, CLOEXEC, and reserved-field
   validation.
 - Stable fd lifetime and PMU counter release.
