@@ -413,6 +413,11 @@ pub struct SocketFile {
     /// A `SO_PASSCRED` recvmsg on a DGRAM socket reports THESE (per-message
     /// identity), whereas a stream recvmsg reports the fixed `peer_cred`.
     last_recv_cred: IrqSafeSpinLock<Ucred>,
+    /// SCM_RIGHTS carried by the most recently received AF_UNIX datagram.
+    /// Datagram ancillary data is per-message, so this is overwritten exactly
+    /// when `dispatch_unix_dgram(Recv)` dequeues that message and consumed by
+    /// the following `recvmsg` (or discarded by a plain `read`).
+    last_recv_fds: IrqSafeSpinLock<Vec<Arc<dyn FileOps>>>,
     /// AF_NETLINK local and connected peer addresses. Port ID zero means
     /// unbound; an explicit bind with nl_pid=0 allocates a unique ID.
     netlink_portid: AtomicU32,
@@ -648,7 +653,6 @@ enum SocketState {
 /// One enqueued UDP-style datagram. Owns the payload bytes (UDP
 /// has no concept of partial reads — each recv yields one whole
 /// packet, padded or truncated to the user buffer size).
-#[derive(Debug)]
 pub struct DgramPacket {
     /// Source AF_UNIX address (pathname or abstract), if the sender was
     /// bound. `None` for an unbound sender or an AF_INET datagram.
@@ -659,6 +663,22 @@ pub struct DgramPacket {
     pub peer_addr: u32,
     pub peer_port: u16,
     pub payload: Vec<u8>,
+    /// Per-datagram SCM_RIGHTS payload. AF_UNIX datagrams preserve message
+    /// boundaries, so these descriptors must not share the stream ring.
+    pub fds: Vec<Arc<dyn FileOps>>,
+}
+
+impl core::fmt::Debug for DgramPacket {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DgramPacket")
+            .field("peer_unix", &self.peer_unix)
+            .field("sender_cred", &self.sender_cred)
+            .field("peer_addr", &self.peer_addr)
+            .field("peer_port", &self.peer_port)
+            .field("payload", &self.payload)
+            .field("fd_count", &self.fds.len())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -758,6 +778,7 @@ impl SocketFile {
             peer_groups: IrqSafeSpinLock::new(Vec::new()),
             passcred: AtomicBool::new(false),
             last_recv_cred: IrqSafeSpinLock::new(Ucred::default()),
+            last_recv_fds: IrqSafeSpinLock::new(Vec::new()),
             netlink_portid: AtomicU32::new(0),
             netlink_groups: AtomicU32::new(0),
             netlink_memberships: IrqSafeSpinLock::new(BTreeSet::new()),
@@ -2919,6 +2940,7 @@ impl SocketFile {
                 peer_addr: dest.0,
                 peer_port: dest.1,
                 payload: buf.to_vec(),
+                fds: Vec::new(),
             });
             return SocketOpResult::Ok(buf.len() as u64);
         }
@@ -3562,6 +3584,7 @@ impl SocketFile {
                     peer_addr: local_addr,
                     peer_port: local_port,
                     payload: buf.to_vec(),
+                    fds: Vec::new(),
                 };
                 let mut ds = dest_sock.state.lock();
                 if let SocketState::InetDgram { inbox, .. } = &mut *ds {
@@ -3614,6 +3637,14 @@ impl SocketFile {
     /// address (pathname or abstract name — sd_notify's $NOTIFY_SOCKET
     /// is an abstract datagram socket).
     fn dispatch_unix_dgram(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        self.dispatch_unix_dgram_with_fds(op, Vec::new())
+    }
+
+    fn dispatch_unix_dgram_with_fds(
+        self: &Arc<Self>,
+        op: SocketOp<'_>,
+        fds: Vec<Arc<dyn FileOps>>,
+    ) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => {
                 if addr.family != AF_UNIX {
@@ -3741,6 +3772,7 @@ impl SocketFile {
                     peer_addr: 0,
                     peer_port: 0,
                     payload: buf.to_vec(),
+                    fds,
                 };
                 let mut ds = dest_sock.state.lock();
                 if let SocketState::UnixDgram { inbox, .. } = &mut *ds {
@@ -3762,6 +3794,7 @@ impl SocketFile {
                         // Stash the sender's creds so a SO_PASSCRED recvmsg can
                         // attach them as SCM_CREDENTIALS.
                         *self.last_recv_cred.lock() = pkt.sender_cred;
+                        *self.last_recv_fds.lock() = pkt.fds;
                         return SocketOpResult::Received {
                             n,
                             peer: Some(SockAddr {
@@ -4049,10 +4082,34 @@ impl SocketFile {
         Ok(n)
     }
 
+    /// Send an AF_UNIX datagram with SCM_RIGHTS. `sd_notify` uses this exact
+    /// shape for `FDSTORE=1`: descriptor-bearing notification datagrams are
+    /// not AF_UNIX streams, so they must bypass `unix_sendmsg`'s stream ring.
+    pub(crate) fn unix_dgram_sendmsg(
+        self: &Arc<Self>,
+        buf: &[u8],
+        flags: u32,
+        addr: Option<SockAddr>,
+        fds: Vec<Arc<dyn FileOps>>,
+    ) -> Result<usize, SockError> {
+        if self.domain != AF_UNIX || self.kind != SOCK_DGRAM {
+            return Err(SockError::InvalidArg);
+        }
+        match self.dispatch_unix_dgram_with_fds(SocketOp::Send { buf, flags, addr }, fds) {
+            SocketOpResult::Ok(n) => Ok(n as usize),
+            SocketOpResult::Err(e) => Err(e),
+            _ => Err(SockError::InvalidArg),
+        }
+    }
+
     /// Pop the next received SCM_RIGHTS fd batch from an AF_UNIX stream
     /// socket's receive ring (empty for non-unix sockets or when none were
     /// passed).
     pub fn unix_take_recv_fds(&self) -> Vec<Arc<dyn FileOps>> {
+        let from_dgram = core::mem::take(&mut *self.last_recv_fds.lock());
+        if !from_dgram.is_empty() {
+            return from_dgram;
+        }
         let state = self.state.lock();
         match &*state {
             SocketState::UnixConnected { rx, .. } => rx.take_fds().unwrap_or_default(),
@@ -4572,6 +4629,7 @@ fn smoke_siocinq_unix_dgram_reports_head_len() -> TestResult {
         peer_addr: 0,
         peer_port: 0,
         payload: alloc::vec![0u8; 7], // head datagram: 7 bytes
+        fds: Vec::new(),
     });
     inbox.push_back(DgramPacket {
         peer_unix: None,
@@ -4579,6 +4637,7 @@ fn smoke_siocinq_unix_dgram_reports_head_len() -> TestResult {
         peer_addr: 0,
         peer_port: 0,
         payload: alloc::vec![0u8; 3], // second datagram: ignored by SIOCINQ
+        fds: Vec::new(),
     });
     *sock.state.lock() = SocketState::UnixDgram {
         addr: None,
@@ -4593,6 +4652,47 @@ fn smoke_siocinq_unix_dgram_reports_head_len() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_siocinq_unix_dgram_reports_head_len
+);
+
+/// SCM_RIGHTS belongs to the AF_UNIX message, not just stream sockets.
+/// systemd's sd_notify FDSTORE path sends an unconnected datagram carrying a
+/// descriptor; treating that as a stream produces ENOTCONN and prevents the
+/// service from completing its READY=1 handshake.
+fn smoke_unix_dgram_scm_rights_delivers_per_datagram() -> TestResult {
+    let receiver = SocketFile::new(AF_UNIX, SOCK_DGRAM);
+    let sender = SocketFile::new(AF_UNIX, SOCK_DGRAM);
+    let addr = SockAddr {
+        family: AF_UNIX,
+        body: b"\0narf-test-fdstore".to_vec(),
+    };
+    if !matches!(
+        receiver.dispatch_op(SocketOp::Bind { addr: addr.clone() }),
+        SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("failed to bind AF_UNIX datagram receiver");
+    }
+    let passed: Arc<dyn FileOps> = SocketFile::new(AF_UNIX, SOCK_STREAM);
+    match sender.unix_dgram_sendmsg(b"FDSTORE=1", 0, Some(addr), alloc::vec![passed.clone()]) {
+        Ok(n) if n == b"FDSTORE=1".len() => {}
+        _ => return TestResult::Fail("SCM_RIGHTS AF_UNIX datagram send failed"),
+    }
+    let mut payload = [0u8; 32];
+    match receiver.dispatch_op(SocketOp::Recv {
+        buf: &mut payload,
+        flags: 0,
+    }) {
+        SocketOpResult::Received { n, .. } if &payload[..n as usize] == b"FDSTORE=1" => {}
+        _ => return TestResult::Fail("AF_UNIX datagram payload was not delivered"),
+    }
+    let received = receiver.unix_take_recv_fds();
+    if received.len() != 1 || !Arc::ptr_eq(&received[0], &passed) {
+        return TestResult::Fail("AF_UNIX datagram SCM_RIGHTS batch was not delivered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_unix_dgram_scm_rights_delivers_per_datagram
 );
 
 /// The socket ioctl recognises ONLY `SIOCINQ`; any other request is an

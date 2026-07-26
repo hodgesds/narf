@@ -1708,6 +1708,100 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_scm_rights_fd_passing);
 
+/// AF_UNIX datagrams carry SCM_RIGHTS too. This exercises the complete syscall
+/// path used by sd_notify FDSTORE: sendmsg parses the control record, the
+/// datagram queue preserves it with the payload, recvmsg installs a fresh
+/// receiver fd, and the returned cmsghdr names that new fd.
+fn smoke_abi_socket_dgram_scm_rights_fd_passing() -> TestResult {
+    with_setup(|| {
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = abstract_sockaddr(b"narf-dgram-scm-rights");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("AF_UNIX datagram receiver bind failed");
+        }
+        let tx = open_unix(SOCK_DGRAM)?;
+
+        // Supply a real, independently open descriptor as SCM_RIGHTS data.
+        let mut pair = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, pair.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("passed-fd socketpair setup failed");
+        }
+        let passed_fd = i32::from_ne_bytes([pair[0], pair[1], pair[2], pair[3]]);
+
+        let payload = b"FDSTORE=1";
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 24];
+        ctrl[0..8].copy_from_slice(&(20u64).to_ne_bytes()); // cmsghdr + one fd
+        ctrl[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
+        ctrl[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        ctrl[16..20].copy_from_slice(&passed_fd.to_ne_bytes());
+        let mut smsg = [0u8; 56];
+        smsg[0..8].copy_from_slice(&(addr.as_ptr() as u64).to_ne_bytes());
+        smsg[8..16].copy_from_slice(&alen.to_ne_bytes());
+        smsg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        smsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        smsg[32..40].copy_from_slice(&(ctrl.as_ptr() as u64).to_ne_bytes());
+        smsg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        if call(
+            Syscall::SocketSendMsg.raw(),
+            a2(tx, smsg.as_ptr() as u64, 0),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("dgram sendmsg(SCM_RIGHTS) did not send its payload");
+        }
+
+        let mut dst = [0u8; 32];
+        let mut riov = [0u8; 16];
+        riov[0..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        riov[8..16].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut rctrl = [0u8; 64];
+        let mut rmsg = [0u8; 56];
+        rmsg[16..24].copy_from_slice(&(riov.as_ptr() as u64).to_ne_bytes());
+        rmsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        rmsg[32..40].copy_from_slice(&(rctrl.as_mut_ptr() as u64).to_ne_bytes());
+        rmsg[40..48].copy_from_slice(&(rctrl.len() as u64).to_ne_bytes());
+        if call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(rx, rmsg.as_ptr() as u64, 0),
+        ) != Some(payload.len() as i64)
+            || &dst[..payload.len()] != payload
+        {
+            return Err("dgram recvmsg did not receive the FDSTORE datagram");
+        }
+        let ctrllen = u64::from_ne_bytes(rmsg[40..48].try_into().unwrap()) as usize;
+        if ctrllen < 20 {
+            return Err("dgram recvmsg did not return an SCM_RIGHTS cmsg");
+        }
+        let level = i32::from_ne_bytes(rctrl[8..12].try_into().unwrap());
+        let ctype = i32::from_ne_bytes(rctrl[12..16].try_into().unwrap());
+        if level != SOL_SOCKET as i32 || ctype != SCM_RIGHTS {
+            return Err("dgram recvmsg returned the wrong ancillary record");
+        }
+        let received_fd = i32::from_ne_bytes(rctrl[16..20].try_into().unwrap());
+        if received_fd < 0 || received_fd as u64 == rx {
+            return Err("dgram recvmsg did not install a distinct receiver fd");
+        }
+        if call(Syscall::Close.raw(), a0(received_fd as u64)) != Some(0) {
+            return Err("dgram SCM_RIGHTS fd was not usable by the receiver");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_dgram_scm_rights_fd_passing
+);
+
 /// Closing a duplicated listener fd must not unbind the listener while the
 /// original fd remains open (dbus-broker receives its listener this way).
 fn smoke_abi_socket_dup_listener_close_keeps_binding() -> TestResult {
