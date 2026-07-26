@@ -207,6 +207,9 @@ overflow consumes one credit, and consuming the last credit synchronously
 stops the PMU event and exposes `POLLHUP`. A later refresh clears the terminal
 readiness and adds a new budget. A zero argument retains Linux's effectively
 unlimited behavior.
+`PERF_SAMPLE_READ` appends the event's authoritative counter snapshot using
+the same standalone or group `read_format` layout as fd `read(2)`, including
+enabled/running scaling times, IDs, and loss fields when selected.
 On x86_64, `PERF_EVENT_IOC_PERIOD` synchronously validates and installs a new
 nonzero hardware sampling period while the event is disabled. Updating a live
 or remotely active x86_64 event returns an error until a synchronous cross-CPU

@@ -21,7 +21,7 @@ use narf_linux_perf_uapi::{
     PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST,
     PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP, PERF_RECORD_MMAP2,
     PERF_RECORD_SAMPLE, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
-    PERF_SAMPLE_PERIOD, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+    PERF_SAMPLE_PERIOD, PERF_SAMPLE_READ, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
     PERF_TYPE_HARDWARE, PERF_TYPE_RAW, PERF_TYPE_SOFTWARE,
 };
 #[cfg(target_arch = "x86_64")]
@@ -595,6 +595,7 @@ const PERF_MMAP_DATA_SIZE_OFFSET: usize = 1048;
 const PERF_SAMPLE_SUPPORTED: u64 = PERF_SAMPLE_IP
     | PERF_SAMPLE_TID
     | PERF_SAMPLE_TIME
+    | PERF_SAMPLE_READ
     | PERF_SAMPLE_ID
     | PERF_SAMPLE_CPU
     | PERF_SAMPLE_PERIOD
@@ -1353,6 +1354,9 @@ impl PerfEventFile {
         if sample_type & PERF_SAMPLE_TIME != 0 {
             push_u64(&mut payload, now);
         }
+        if sample_type & PERF_SAMPLE_READ != 0 {
+            self.append_sample_read(&mut payload);
+        }
         if sample_type & PERF_SAMPLE_ID != 0 {
             push_u64(&mut payload, self.id);
         }
@@ -1396,6 +1400,59 @@ impl PerfEventFile {
         record.extend_from_slice(&size.to_ne_bytes());
         record.extend_from_slice(&payload);
         self.push_record(&record)
+    }
+
+    fn append_sample_read(&self, payload: &mut Vec<u8>) {
+        let push = |payload: &mut Vec<u8>, value: u64| {
+            payload.extend_from_slice(&value.to_ne_bytes());
+        };
+        let (value, time_enabled, time_running) = self.snapshot();
+        let format = self.attr.read_format;
+        if format & PERF_FORMAT_GROUP != 0 {
+            let members = self.member_files();
+            push(payload, 1 + members.len() as u64);
+            if format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
+                push(payload, time_enabled);
+            }
+            if format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
+                push(payload, time_running);
+            }
+            push(payload, value);
+            if format & PERF_FORMAT_ID != 0 {
+                push(payload, self.id);
+            }
+            if format & PERF_FORMAT_LOST != 0 {
+                push(payload, self.sample_lost.load(Ordering::Acquire));
+            }
+            for file in members {
+                let event = file
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<PerfEventFile>())
+                    .expect("perf group contains a non-perf member");
+                let (member_value, _, _) = event.snapshot();
+                push(payload, member_value);
+                if format & PERF_FORMAT_ID != 0 {
+                    push(payload, event.id);
+                }
+                if format & PERF_FORMAT_LOST != 0 {
+                    push(payload, event.sample_lost.load(Ordering::Acquire));
+                }
+            }
+        } else {
+            push(payload, value);
+            if format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
+                push(payload, time_enabled);
+            }
+            if format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
+                push(payload, time_running);
+            }
+            if format & PERF_FORMAT_ID != 0 {
+                push(payload, self.id);
+            }
+            if format & PERF_FORMAT_LOST != 0 {
+                push(payload, self.sample_lost.load(Ordering::Acquire));
+            }
+        }
     }
 
     /// Consume one genuine sampling overflow from an ioctl refresh budget.

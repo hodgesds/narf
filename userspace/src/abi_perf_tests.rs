@@ -743,6 +743,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             sample_type: (1 << 0) // IP
                 | (1 << 1) // TID
                 | (1 << 2) // TIME
+                | (1 << 4) // READ
                 | (1 << 6) // ID
                 | (1 << 7) // CPU
                 | (1 << 8), // PERIOD
@@ -814,17 +815,19 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         if data_head == 0 {
             return Err("inherited perf event did not sample its child task");
         }
-        if data_head != 56 {
+        if data_head != 72 {
             return Err("perf sample record has the wrong wire size");
         }
-        // SAFETY: the first 56-byte record starts at the beginning of data page 0.
+        // SAFETY: the first 72-byte record starts at the beginning of data page 0.
         let record = unsafe {
             core::slice::from_raw_parts(sample_frames[1] as *const u8, data_head as usize)
         };
         if u32::from_ne_bytes(record[0..4].try_into().unwrap()) != 9
-            || u16::from_ne_bytes(record[6..8].try_into().unwrap()) != 56
+            || u16::from_ne_bytes(record[6..8].try_into().unwrap()) != 72
             || u64::from_ne_bytes(record[8..16].try_into().unwrap()) != 0x1234_5678
-            || u64::from_ne_bytes(record[48..56].try_into().unwrap()) != 0
+            || u64::from_ne_bytes(record[32..40].try_into().unwrap()) != 0
+            || u64::from_ne_bytes(record[40..48].try_into().unwrap()) != 0
+            || u64::from_ne_bytes(record[64..72].try_into().unwrap()) != 0
         {
             return Err("PERF_RECORD_SAMPLE wire layout is invalid");
         }
@@ -861,12 +864,12 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             return Err("redirecting perf output failed");
         }
         crate::perf_event::sample_from_irq_for_test(sample_parent, 0x8765_4321);
-        // Both the target event and redirected event commit a 56-byte sample
+        // Both the target event and redirected event commit a 72-byte sample
         // to the target ring; the redirected event has no mmap of its own.
         // SAFETY: sample_ops owns the mapped metadata frame.
         let redirected_head =
             unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
-        if redirected_head != data_head + 112 {
+        if redirected_head != data_head + 144 {
             return Err("PERF_EVENT_IOC_SET_OUTPUT did not share the target ring");
         }
         if call(
@@ -907,7 +910,7 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         // SAFETY: sample_ops owns the metadata frame.
         let recovered_head =
             unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
-        if recovered_head != full_head + 112 {
+        if recovered_head != full_head + 128 {
             return Err("PERF_RECORD_LOST and following sample have wrong combined size");
         }
         let ring_byte = |absolute: u64| {
