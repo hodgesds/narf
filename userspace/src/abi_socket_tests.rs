@@ -1723,6 +1723,23 @@ fn smoke_abi_socket_dgram_scm_rights_fd_passing() -> TestResult {
         {
             return Err("AF_UNIX datagram receiver bind failed");
         }
+        // PID 1 enables SO_PASSCRED on its notify socket: the received
+        // credentials identify which service sent READY=/FDSTORE=.
+        let on = 1u32.to_ne_bytes();
+        if call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: rx,
+                arg1: SOL_SOCKET,
+                arg2: SO_PASSCRED,
+                arg3: on.as_ptr() as u64,
+                arg4: on.len() as u64,
+                arg5: 0,
+            },
+        ) != Some(0)
+        {
+            return Err("enabling SO_PASSCRED on datagram receiver failed");
+        }
         let tx = open_unix(SOCK_DGRAM)?;
 
         // Supply a real, independently open descriptor as SCM_RIGHTS data.
@@ -1779,8 +1796,8 @@ fn smoke_abi_socket_dgram_scm_rights_fd_passing() -> TestResult {
             return Err("dgram recvmsg did not receive the FDSTORE datagram");
         }
         let ctrllen = u64::from_ne_bytes(rmsg[40..48].try_into().unwrap()) as usize;
-        if ctrllen < 20 {
-            return Err("dgram recvmsg did not return an SCM_RIGHTS cmsg");
+        if ctrllen < 56 {
+            return Err("dgram recvmsg did not return rights and credentials");
         }
         let level = i32::from_ne_bytes(rctrl[8..12].try_into().unwrap());
         let ctype = i32::from_ne_bytes(rctrl[12..16].try_into().unwrap());
@@ -1790,6 +1807,15 @@ fn smoke_abi_socket_dgram_scm_rights_fd_passing() -> TestResult {
         let received_fd = i32::from_ne_bytes(rctrl[16..20].try_into().unwrap());
         if received_fd < 0 || received_fd as u64 == rx {
             return Err("dgram recvmsg did not install a distinct receiver fd");
+        }
+        // The rights cmsg is padded to 24 bytes; SCM_CREDENTIALS follows it.
+        let cred_level = i32::from_ne_bytes(rctrl[32..36].try_into().unwrap());
+        let cred_type = i32::from_ne_bytes(rctrl[36..40].try_into().unwrap());
+        let cred_pid = u32::from_ne_bytes(rctrl[40..44].try_into().unwrap());
+        let sender_pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u32;
+        if cred_level != SOL_SOCKET as i32 || cred_type != SCM_CREDENTIALS || cred_pid != sender_pid
+        {
+            return Err("dgram SCM_CREDENTIALS did not name the sender");
         }
         if call(Syscall::Close.raw(), a0(received_fd as u64)) != Some(0) {
             return Err("dgram SCM_RIGHTS fd was not usable by the receiver");
