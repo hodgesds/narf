@@ -210,6 +210,12 @@ unlimited behavior.
 `PERF_SAMPLE_READ` appends the event's authoritative counter snapshot using
 the same standalone or group `read_format` layout as fd `read(2)`, including
 enabled/running scaling times, IDs, and loss fields when selected.
+Sample records also serialize `ADDR`, `CALLCHAIN`, `WEIGHT`, `DATA_SRC`,
+`TRANSACTION`, `PHYS_ADDR`, `DATA_PAGE_SIZE`, and `WEIGHT_STRUCT` in Linux
+field order. Counting PMUs provide no sampled memory address or load/store
+metadata, so those fields carry Linux's unavailable value (`0`); callchains
+contain the exact interrupted IP as their sole leaf frame until architecture
+unwind state is captured. The two weight union views are mutually exclusive.
 On x86_64, `PERF_EVENT_IOC_PERIOD` synchronously validates and installs a new
 nonzero hardware sampling period while the event is disabled. Updating a live
 or remotely active x86_64 event returns an error until a synchronous cross-CPU

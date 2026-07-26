@@ -20,9 +20,12 @@ use narf_linux_perf_uapi::{
     PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING,
     PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST,
     PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP, PERF_RECORD_MMAP2,
-    PERF_RECORD_SAMPLE, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
-    PERF_SAMPLE_PERIOD, PERF_SAMPLE_READ, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
-    PERF_TYPE_HARDWARE, PERF_TYPE_RAW, PERF_TYPE_SOFTWARE,
+    PERF_RECORD_SAMPLE, PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU,
+    PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER,
+    PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_PHYS_ADDR, PERF_SAMPLE_READ,
+    PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION,
+    PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT, PERF_TYPE_HARDWARE, PERF_TYPE_RAW,
+    PERF_TYPE_SOFTWARE,
 };
 #[cfg(target_arch = "x86_64")]
 use narf_linux_perf_uapi::{
@@ -595,12 +598,20 @@ const PERF_MMAP_DATA_SIZE_OFFSET: usize = 1048;
 const PERF_SAMPLE_SUPPORTED: u64 = PERF_SAMPLE_IP
     | PERF_SAMPLE_TID
     | PERF_SAMPLE_TIME
+    | PERF_SAMPLE_ADDR
     | PERF_SAMPLE_READ
+    | PERF_SAMPLE_CALLCHAIN
     | PERF_SAMPLE_ID
     | PERF_SAMPLE_CPU
     | PERF_SAMPLE_PERIOD
     | PERF_SAMPLE_STREAM_ID
-    | PERF_SAMPLE_IDENTIFIER;
+    | PERF_SAMPLE_IDENTIFIER
+    | PERF_SAMPLE_WEIGHT
+    | PERF_SAMPLE_DATA_SRC
+    | PERF_SAMPLE_TRANSACTION
+    | PERF_SAMPLE_PHYS_ADDR
+    | PERF_SAMPLE_DATA_PAGE_SIZE
+    | PERF_SAMPLE_WEIGHT_STRUCT;
 
 struct PerfEventFile {
     attr: PerfEventAttr,
@@ -1354,8 +1365,18 @@ impl PerfEventFile {
         if sample_type & PERF_SAMPLE_TIME != 0 {
             push_u64(&mut payload, now);
         }
+        if sample_type & PERF_SAMPLE_ADDR != 0 {
+            // Counting PMUs do not report a sampled data address.
+            push_u64(&mut payload, 0);
+        }
         if sample_type & PERF_SAMPLE_READ != 0 {
             self.append_sample_read(&mut payload);
+        }
+        if sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
+            // The interrupted IP is an exact leaf frame. Additional frames
+            // require architecture unwind state and are intentionally omitted.
+            push_u64(&mut payload, 1);
+            push_u64(&mut payload, ip);
         }
         if sample_type & PERF_SAMPLE_ID != 0 {
             push_u64(&mut payload, self.id);
@@ -1372,6 +1393,24 @@ impl PerfEventFile {
                 &mut payload,
                 self.last_sample_period.load(Ordering::Acquire),
             );
+        }
+        if sample_type & PERF_SAMPLE_WEIGHT != 0 {
+            push_u64(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_DATA_SRC != 0 {
+            push_u64(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_TRANSACTION != 0 {
+            push_u64(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_PHYS_ADDR != 0 {
+            push_u64(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_DATA_PAGE_SIZE != 0 {
+            push_u64(&mut payload, 0);
+        }
+        if sample_type & PERF_SAMPLE_WEIGHT_STRUCT != 0 {
+            push_u64(&mut payload, 0);
         }
         let lost = self.sample_lost.swap(0, Ordering::AcqRel);
         if lost != 0 {
@@ -2771,6 +2810,14 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         && attr.sample_type & !PERF_SAMPLE_SUPPORTED != 0
     {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        return;
+    }
+    // Linux overlays these two fields in a union; requesting both is
+    // ambiguous and rejected by the kernel rather than serialized twice.
+    if attr.sample_type & PERF_SAMPLE_WEIGHT != 0
+        && attr.sample_type & PERF_SAMPLE_WEIGHT_STRUCT != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
 
