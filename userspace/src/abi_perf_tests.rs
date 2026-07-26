@@ -215,22 +215,39 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
         let _ = call(Syscall::Close.raw(), a0(cpu_clock_fd as u64));
 
-        let ignored_attr_flag = PerfEventAttr {
-            flags: 1 << 2, // pinned scheduling is not implemented
+        let pinned_attr = PerfEventAttr {
+            flags: 1 << 2, // pinned
             ..attr
         };
-        match call(
+        let pinned_fd = match call(
             Syscall::PerfEventOpen.raw(),
             a3(
-                &ignored_attr_flag as *const _ as u64,
+                &pinned_attr as *const _ as u64,
                 0,
                 -1i32 as u64,
                 -1i32 as u64,
             ),
         ) {
-            Some(EOPNOTSUPP) => {}
-            _ => return Err("perf_event_open ignored an unimplemented attr flag"),
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("perf_event_open rejected a pinned group leader"),
+        };
+        let constrained_member = PerfEventAttr {
+            flags: 1 << 3, // exclusive is leader-only
+            ..attr
+        };
+        match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(
+                &constrained_member as *const _ as u64,
+                0,
+                -1i32 as u64,
+                pinned_fd as u64,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("perf_event_open admitted an exclusive group member"),
         }
+        let _ = call(Syscall::Close.raw(), a0(pinned_fd as u64));
 
         let hardware_privilege_filter = PerfEventAttr {
             type_: 0,      // PERF_TYPE_HARDWARE

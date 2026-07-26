@@ -11,21 +11,22 @@ use narf_linux_perf_uapi::{
     PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_BUILD_ID, PERF_ATTR_FLAG_COMM,
     PERF_ATTR_FLAG_COMM_EXEC, PERF_ATTR_FLAG_DISABLED, PERF_ATTR_FLAG_ENABLE_ON_EXEC,
     PERF_ATTR_FLAG_EXCLUDE_GUEST, PERF_ATTR_FLAG_EXCLUDE_HV, PERF_ATTR_FLAG_EXCLUDE_KERNEL,
-    PERF_ATTR_FLAG_EXCLUDE_USER, PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT,
-    PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP, PERF_ATTR_FLAG_MMAP2, PERF_ATTR_FLAG_MMAP_DATA,
-    PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK,
-    PERF_ATTR_SIZE_VER0, PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES,
-    PERF_COUNT_HW_CACHE_MISSES, PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS,
-    PERF_COUNT_SW_CPU_CLOCK, PERF_COUNT_SW_DUMMY, PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP,
-    PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
-    PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK,
-    PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP,
-    PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE, PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN,
-    PERF_SAMPLE_CODE_PAGE_SIZE, PERF_SAMPLE_CPU, PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC,
-    PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD,
-    PERF_SAMPLE_PHYS_ADDR, PERF_SAMPLE_READ, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
-    PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT,
-    PERF_TYPE_HARDWARE, PERF_TYPE_RAW, PERF_TYPE_SOFTWARE,
+    PERF_ATTR_FLAG_EXCLUDE_USER, PERF_ATTR_FLAG_EXCLUSIVE, PERF_ATTR_FLAG_FREQ,
+    PERF_ATTR_FLAG_INHERIT, PERF_ATTR_FLAG_KSYMBOL, PERF_ATTR_FLAG_MMAP, PERF_ATTR_FLAG_MMAP2,
+    PERF_ATTR_FLAG_MMAP_DATA, PERF_ATTR_FLAG_PINNED, PERF_ATTR_FLAG_SAMPLE_ID_ALL,
+    PERF_ATTR_FLAG_TASK, PERF_ATTR_FLAG_WATERMARK, PERF_ATTR_SIZE_VER0,
+    PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_MISSES,
+    PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_CPU_CLOCK,
+    PERF_COUNT_SW_DUMMY, PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP, PERF_FORMAT_ID,
+    PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING,
+    PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST,
+    PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_MMAP_DATA, PERF_RECORD_MMAP, PERF_RECORD_MMAP2,
+    PERF_RECORD_SAMPLE, PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CODE_PAGE_SIZE,
+    PERF_SAMPLE_CPU, PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID,
+    PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_PHYS_ADDR,
+    PERF_SAMPLE_READ, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+    PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT, PERF_TYPE_HARDWARE,
+    PERF_TYPE_RAW, PERF_TYPE_SOFTWARE,
 };
 #[cfg(target_arch = "x86_64")]
 use narf_linux_perf_uapi::{
@@ -563,6 +564,8 @@ impl PendingLoss {
 const PERF_FORMAT_SUPPORTED: u64 = (1 << 5) - 1;
 
 const PERF_ATTR_IMPLEMENTED: u64 = PERF_ATTR_FLAG_DISABLED
+    | PERF_ATTR_FLAG_PINNED
+    | PERF_ATTR_FLAG_EXCLUSIVE
     | PERF_ATTR_FLAG_ENABLE_ON_EXEC
     | PERF_ATTR_FLAG_COMM
     | PERF_ATTR_FLAG_TASK
@@ -633,6 +636,7 @@ struct PerfEventFile {
     target_cpu: i32,
     inherited_tasks: IrqSafeSpinLock<Vec<u64>>,
     enabled: AtomicBool,
+    scheduling_error: AtomicBool,
     count_base: AtomicU64,
     count_accumulated: AtomicU64,
     enabled_at_ns: AtomicU64,
@@ -812,6 +816,18 @@ impl core::fmt::Debug for PerfEventFile {
 }
 
 impl PerfEventFile {
+    fn is_group_leader(&self) -> bool {
+        self._group_leader.is_none()
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.attr.flags & PERF_ATTR_FLAG_PINNED != 0
+    }
+
+    fn is_exclusive(&self) -> bool {
+        self.attr.flags & PERF_ATTR_FLAG_EXCLUSIVE != 0
+    }
+
     fn counts_kernel(&self) -> bool {
         self.attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0
     }
@@ -931,17 +947,17 @@ impl PerfEventFile {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn task_switch(&self, cpu: usize, running: bool) {
+    fn task_switch(&self, cpu: usize, running: bool) -> bool {
         if self.target_task == u64::MAX || self.pmu_event.is_none() {
-            return;
+            return true;
         }
         let mut active = self.active_task_counters.lock();
         if self.target_cpu >= 0 && cpu != self.target_cpu as usize {
-            return;
+            return true;
         }
         if running {
             if active[cpu].is_some() || !self.enabled.load(Ordering::Acquire) {
-                return;
+                return true;
             }
             // SAFETY: the scheduler invokes this on the current logical CPU in
             // executor context. The returned slot belongs to this CPU.
@@ -952,14 +968,14 @@ impl PerfEventFile {
                     self.counts_user(),
                 )
             }) else {
-                return;
+                return false;
             };
             let sample_period = self.sample_period.load(Ordering::Acquire);
             if sample_period != 0 {
                 if ensure_pmi_route().is_err() {
                     // SAFETY: same current-CPU allocation.
                     unsafe { narf_arch::x86_64::pmu::release(counter) };
-                    return;
+                    return false;
                 }
                 // SAFETY: freshly allocated current-CPU counter.
                 let period_left = self
@@ -979,7 +995,7 @@ impl PerfEventFile {
                 {
                     // SAFETY: same current-CPU allocation.
                     unsafe { narf_arch::x86_64::pmu::release(counter) };
-                    return;
+                    return false;
                 }
                 ACTIVE_SAMPLE_IDS[cpu][counter.idx as usize].store(self.id, Ordering::Release);
             }
@@ -1012,20 +1028,21 @@ impl PerfEventFile {
             unsafe { narf_arch::x86_64::pmu::release(counter) };
             self.stop_running(cpu);
         }
+        true
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn task_switch(&self, cpu: usize, running: bool) {
+    fn task_switch(&self, cpu: usize, running: bool) -> bool {
         if self.target_task == u64::MAX || self.pmu_event.is_none() {
-            return;
+            return true;
         }
         let mut active = self.active_task_counters.lock();
         if self.target_cpu >= 0 && cpu != self.target_cpu as usize {
-            return;
+            return true;
         }
         if running {
             if active[cpu].is_some() || !self.enabled.load(Ordering::Acquire) {
-                return;
+                return true;
             }
             // SAFETY: scheduler invokes this hook on the current CPU at EL1.
             let Ok(counter) = (unsafe {
@@ -1033,7 +1050,7 @@ impl PerfEventFile {
                     .unwrap()
                     .allocate(self.counts_kernel(), self.counts_user())
             }) else {
-                return;
+                return false;
             };
             let period = self.sample_period.load(Ordering::Acquire);
             if period != 0 {
@@ -1047,14 +1064,14 @@ impl PerfEventFile {
                 if route_failed || arm_failed {
                     // SAFETY: the fresh allocation is still owned on this CPU.
                     let _ = unsafe { counter.release() };
-                    return;
+                    return false;
                 }
                 ACTIVE_SAMPLE_IDS[cpu][counter.sample_slot()].store(self.id, Ordering::Release);
             // SAFETY: freshly allocated current-CPU counter.
             } else if unsafe { counter.start() }.is_err() {
                 // SAFETY: the fresh allocation is still owned on this CPU.
                 let _ = unsafe { counter.release() };
-                return;
+                return false;
             }
             active[cpu] = Some(counter);
             self.start_running(cpu);
@@ -1075,9 +1092,11 @@ impl PerfEventFile {
             let _ = unsafe { counter.release() };
             self.stop_running(cpu);
         }
+        true
     }
 
     fn enable(&self) {
+        self.scheduling_error.store(false, Ordering::Release);
         if !self.enabled.swap(true, Ordering::AcqRel) {
             let raw = self.raw_count();
             let now = narf_time::monotonic_ns();
@@ -2260,6 +2279,64 @@ pub(crate) fn event_refresh_state_for_test(fd_num: u32) -> Option<(bool, u32, bo
     .flatten()
 }
 
+fn event_group_id(event: &PerfEventFile) -> u64 {
+    event
+        ._group_leader
+        .as_ref()
+        .and_then(|leader| leader.as_any())
+        .and_then(|any| any.downcast_ref::<PerfEventFile>())
+        .map_or(event.id, |leader| leader.id)
+}
+
+fn event_active_on_cpu(event: &PerfEventFile, cpu: usize) -> bool {
+    if event.pmu_counter.is_some() {
+        return event.enabled.load(Ordering::Acquire);
+    }
+    event.active_task_counters.lock()[cpu].is_some()
+}
+
+fn schedule_group(leader: &PerfEventFile, cpu: usize, registry: &[Weak<PerfEventFile>]) -> bool {
+    debug_assert!(leader.is_group_leader());
+    if registry.iter().filter_map(Weak::upgrade).any(|event| {
+        event_group_id(&event) != leader.id
+            && event_active_on_cpu(&event, cpu)
+            && (leader.is_exclusive() || event.is_exclusive())
+    }) {
+        return false;
+    }
+
+    if !leader.task_switch(cpu, true) {
+        return false;
+    }
+    let members = leader.group_members.lock();
+    for weak in members.iter() {
+        let Some(file) = weak.upgrade() else {
+            continue;
+        };
+        let Some(event) = file
+            .as_any()
+            .and_then(|any| any.downcast_ref::<PerfEventFile>())
+        else {
+            continue;
+        };
+        if !event.task_switch(cpu, true) {
+            leader.task_switch(cpu, false);
+            for rollback in members.iter() {
+                if let Some(file) = rollback.upgrade() {
+                    if let Some(member) = file
+                        .as_any()
+                        .and_then(|any| any.downcast_ref::<PerfEventFile>())
+                    {
+                        member.task_switch(cpu, false);
+                    }
+                }
+            }
+            return false;
+        }
+    }
+    true
+}
+
 /// Scheduler PMU context hook. Runs outside scheduler queue locks and brackets
 /// the matching task continuation on the current logical CPU.
 pub(crate) fn on_task_switch(task: u64, running: bool) {
@@ -2289,7 +2366,24 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
     // A -> unmonitored B -> A would look like immediate re-entry into A.
     let previous_task = PERF_LAST_SELECTED_TASK[cpu].swap(task, Ordering::Relaxed);
 
-    // Allocation failures are expected when a task has more enabled hardware
+    // Pinned groups have priority over every flexible group. Failure is
+    // observable through EOF on read, matching PERF_EVENT_STATE_ERROR.
+    for weak in registry.iter() {
+        let Some(event) = weak.upgrade() else {
+            continue;
+        };
+        if event.enabled.load(Ordering::Acquire)
+            && event.is_task_hardware_event()
+            && event.tracks_task(task)
+            && event.is_group_leader()
+            && event.is_pinned()
+            && !schedule_group(&event, cpu, &registry)
+        {
+            event.scheduling_error.store(true, Ordering::Release);
+        }
+    }
+
+    // Allocation failures are expected when a task has more enabled flexible
     // events than physical counters. Rotate across that eligible set only:
     // perf also opens software dummy/metadata events, and including those in
     // the cursor would starve hardware events at stable registry positions.
@@ -2301,6 +2395,8 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
             event.enabled.load(Ordering::Acquire)
                 && event.is_task_hardware_event()
                 && event.tracks_task(task)
+                && event.is_group_leader()
+                && !event.is_pinned()
         })
         .inspect(|event| {
             if anchor.is_none() {
@@ -2340,6 +2436,8 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
             if !event.enabled.load(Ordering::Acquire)
                 || !event.is_task_hardware_event()
                 || !event.tracks_task(task)
+                || !event.is_group_leader()
+                || event.is_pinned()
             {
                 continue;
             }
@@ -2350,7 +2448,7 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
             };
             ordinal += 1;
             if selected {
-                event.task_switch(cpu, true);
+                let _ = schedule_group(&event, cpu, &registry);
             }
         }
     }
@@ -2382,6 +2480,8 @@ pub(crate) fn on_multiplex_tick(task: u64) {
         event.enabled.load(Ordering::Acquire)
             && event.is_task_hardware_event()
             && event.tracks_task(task)
+            && event.is_group_leader()
+            && !event.is_pinned()
     };
     let mut anchor = None;
     let eligible = registry
@@ -2409,6 +2509,16 @@ pub(crate) fn on_multiplex_tick(task: u64) {
         if let Some(event) = weak.upgrade() {
             if is_eligible(&event) {
                 event.task_switch(cpu, false);
+                for member in event.group_members.lock().iter() {
+                    if let Some(file) = member.upgrade() {
+                        if let Some(member) = file
+                            .as_any()
+                            .and_then(|any| any.downcast_ref::<PerfEventFile>())
+                        {
+                            member.task_switch(cpu, false);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2435,7 +2545,7 @@ pub(crate) fn on_multiplex_tick(task: u64) {
             };
             ordinal += 1;
             if selected {
-                event.task_switch(cpu, true);
+                let _ = schedule_group(&event, cpu, &registry);
             }
         }
     }
@@ -2525,6 +2635,11 @@ impl Drop for PerfEventFile {
 impl FileOps for PerfEventFile {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
+            // Linux exposes a pinned group which could not be scheduled as
+            // EOF, rather than returning a fabricated zero count.
+            if self.scheduling_error.load(Ordering::Acquire) {
+                return Ok(0);
+            }
             let (value, time_enabled, time_running) = self.snapshot();
             let format = self.attr.read_format;
             let mut cursor = 0;
@@ -2948,10 +3063,46 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
             return;
         }
+        // Linux permits these scheduling constraints only on the leader; the
+        // complete group inherits them and is scheduled atomically.
+        if attr.flags & (PERF_ATTR_FLAG_PINNED | PERF_ATTR_FLAG_EXCLUSIVE) != 0 {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
+        }
         Some(leader)
     } else {
         None
     };
+
+    // CPU-scoped counters remain physically allocated for the fd lifetime.
+    // Enforce exclusive ownership before touching the PMU. A sibling of the
+    // exclusive leader belongs to the same atomic group and is the sole
+    // exception.
+    if pid == -1 && attr.type_ != PERF_TYPE_SOFTWARE {
+        let requested_group = group_leader
+            .as_ref()
+            .and_then(|leader| leader.as_any())
+            .and_then(|any| any.downcast_ref::<PerfEventFile>())
+            .map(|leader| leader.id);
+        let conflict = PERF_EVENT_REGISTRY
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|event| {
+                event.target_task == u64::MAX
+                    && event.target_cpu == cpu
+                    && event.attr.type_ != PERF_TYPE_SOFTWARE
+                    && Some(event_group_id(event)) != requested_group
+            })
+            .any(|event| {
+                attr.flags & PERF_ATTR_FLAG_EXCLUSIVE != 0
+                    || event.attr.flags & PERF_ATTR_FLAG_EXCLUSIVE != 0
+            });
+        if conflict {
+            ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
+            return;
+        }
+    }
 
     // Try to allocate PMU counter if target_arch is x86_64
     #[cfg(target_arch = "x86_64")]
@@ -3228,6 +3379,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             target_cpu: cpu,
             inherited_tasks: IrqSafeSpinLock::new(Vec::new()),
             enabled: AtomicBool::new(false),
+            scheduling_error: AtomicBool::new(false),
             count_base: AtomicU64::new(0),
             count_accumulated: AtomicU64::new(0),
             enabled_at_ns: AtomicU64::new(0),

@@ -168,6 +168,11 @@ is their difference. `PERF_COUNT_SW_TASK_CLOCK` uses the corresponding
 per-task user and syscall CPU-time ledgers. Hardware `exclude_kernel` and
 `exclude_user` selectors program x86 USR/OS or aarch64 PMCCFILTR/PMEVTYPER
 P/U exclusions on allocation and preserve them across overflow rearming.
+Pinned task groups are scheduled atomically before flexible groups and are
+never multiplexed; failure to place the complete group enters Linux's
+observable error state, for which `read(2)` returns EOF. Only a group leader
+may select `pinned` or `exclusive`. An exclusive hardware group runs only
+while no hardware event outside that group owns a counter on the CPU.
 
 A shared mapping of a perf fd exposes one Linux-shaped
 `perf_event_mmap_page` metadata page followed by a power-of-two data area.
