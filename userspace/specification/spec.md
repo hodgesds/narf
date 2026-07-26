@@ -178,9 +178,13 @@ close.
 On x86_64, sampled hardware events arm the owned GP counter for
 interrupt-on-overflow and route LVT-PC through the normal IRQ dispatcher. The
 hard-IRQ handler acknowledges/reloads the counter and captures task, IP, time,
-and counter identity into a fixed per-CPU slot without allocation. Normal
+counter identity, and the overflow's exact period into a bounded 64-entry
+per-CPU ring without allocation. Normal
 syscall context drains those slots into `PERF_RECORD_SAMPLE`/`LOST` records,
 advances `data_head` with release ordering, and wakes poll/epoll readers.
+If that IRQ ring is full, loss is aggregated by the event ID active on each
+overflowed physical counter, so later counter reuse cannot transfer loss to a
+different event.
 Task-scoped samples are admitted by task/inheritance ownership; system-wide
 samples are admitted by the pending slot's source CPU matching the event's
 owning CPU, without requiring a synthetic target task.

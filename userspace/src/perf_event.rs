@@ -50,9 +50,14 @@ static REMOTE_PMU_VECTOR: IrqSafeSpinLock<Option<u8>> = IrqSafeSpinLock::new(Non
 static REMOTE_PMU_MAILBOXES: [RemotePmuMailbox; narf_lib::percpu::MAX_CPUS] =
     [const { RemotePmuMailbox::new() }; narf_lib::percpu::MAX_CPUS];
 const SAMPLE_CPU_SLOTS: usize = narf_lib::percpu::MAX_CPUS;
-static PENDING_SAMPLES: [PendingSample; SAMPLE_CPU_SLOTS] =
-    [const { PendingSample::new() }; SAMPLE_CPU_SLOTS];
-static PENDING_SAMPLE_LOST: AtomicU64 = AtomicU64::new(0);
+const PENDING_SAMPLE_DEPTH: usize = 64;
+const PENDING_LOSS_BUCKETS: usize = 16;
+static PENDING_SAMPLES: [[PendingSample; PENDING_SAMPLE_DEPTH]; SAMPLE_CPU_SLOTS] =
+    [const { [const { PendingSample::new() }; PENDING_SAMPLE_DEPTH] }; SAMPLE_CPU_SLOTS];
+static PENDING_SAMPLE_CURSOR: [AtomicUsize; SAMPLE_CPU_SLOTS] =
+    [const { AtomicUsize::new(0) }; SAMPLE_CPU_SLOTS];
+static PENDING_LOSSES: [[PendingLoss; PENDING_LOSS_BUCKETS]; SAMPLE_CPU_SLOTS] =
+    [const { [const { PendingLoss::new() }; PENDING_LOSS_BUCKETS] }; SAMPLE_CPU_SLOTS];
 static ACTIVE_SAMPLE_IDS: [[AtomicU64; 8]; SAMPLE_CPU_SLOTS] =
     [const { [const { AtomicU64::new(0) }; 8] }; SAMPLE_CPU_SLOTS];
 static CPU_USER_NS: [AtomicU64; SAMPLE_CPU_SLOTS] = [const { AtomicU64::new(0) }; SAMPLE_CPU_SLOTS];
@@ -510,6 +515,7 @@ struct PendingSample {
     time: AtomicU64,
     counters: AtomicU8,
     event_ids: [AtomicU64; 8],
+    periods: [AtomicU64; 8],
 }
 
 impl PendingSample {
@@ -521,6 +527,23 @@ impl PendingSample {
             time: AtomicU64::new(0),
             counters: AtomicU8::new(0),
             event_ids: [const { AtomicU64::new(0) }; 8],
+            periods: [const { AtomicU64::new(0) }; 8],
+        }
+    }
+}
+
+struct PendingLoss {
+    state: AtomicU8,
+    event_id: AtomicU64,
+    count: AtomicU64,
+}
+
+impl PendingLoss {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            event_id: AtomicU64::new(0),
+            count: AtomicU64::new(0),
         }
     }
 }
@@ -1797,23 +1820,63 @@ pub(crate) fn on_thread_exit(_pid: u64, tid: u64) {
     });
 }
 
-#[cfg(target_arch = "x86_64")]
-fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
-    // SAFETY: this handler is installed only on LVT-PC and runs at CPL0.
-    let counters = unsafe { narf_arch::x86_64::pmu::handle_sampling_overflow() };
-    if counters == 0 {
-        return narf_interrupts::IrqStatus::None;
+fn record_pending_loss(cpu: usize, counters: u8) {
+    for (counter, active_id) in ACTIVE_SAMPLE_IDS[cpu].iter().enumerate() {
+        if counters & (1 << counter) == 0 {
+            continue;
+        }
+        let event_id = active_id.load(Ordering::Acquire);
+        if event_id == 0 {
+            continue;
+        }
+        let buckets = &PENDING_LOSSES[cpu];
+        for bucket in buckets {
+            let state = bucket.state.load(Ordering::Acquire);
+            if state == 2
+                && bucket.event_id.load(Ordering::Relaxed) == event_id
+                && bucket
+                    .state
+                    .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                bucket.count.fetch_add(1, Ordering::Relaxed);
+                bucket.state.store(2, Ordering::Release);
+                break;
+            }
+            if state == 0
+                && bucket
+                    .state
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                bucket.event_id.store(event_id, Ordering::Relaxed);
+                bucket.count.store(1, Ordering::Relaxed);
+                bucket.state.store(2, Ordering::Release);
+                break;
+            }
+        }
     }
-    let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
-    let pending = &PENDING_SAMPLES[cpu];
-    if pending
-        .state
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
-        PENDING_SAMPLE_LOST.fetch_add(1, Ordering::Relaxed);
-        return narf_interrupts::IrqStatus::Handled;
+}
+
+fn capture_pending_sample(cpu: usize, counters: u8) -> bool {
+    let start = PENDING_SAMPLE_CURSOR[cpu].fetch_add(1, Ordering::Relaxed);
+    let mut claimed = None;
+    for offset in 0..PENDING_SAMPLE_DEPTH {
+        let pending = &PENDING_SAMPLES[cpu][rotation_index(start, offset, PENDING_SAMPLE_DEPTH)];
+        if pending
+            .state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            claimed = Some(pending);
+            break;
+        }
     }
+    let Some(pending) = claimed else {
+        record_pending_loss(cpu, counters);
+        return false;
+    };
+
     pending
         .task
         .store(crate::handlers::current_task_id(), Ordering::Relaxed);
@@ -1824,15 +1887,34 @@ fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
         .time
         .store(narf_time::monotonic_ns(), Ordering::Relaxed);
     pending.counters.store(counters, Ordering::Relaxed);
-    for (idx, event_id) in pending.event_ids.iter().enumerate() {
-        if counters & (1 << idx) != 0 {
-            event_id.store(
-                ACTIVE_SAMPLE_IDS[cpu][idx].load(Ordering::Acquire),
-                Ordering::Relaxed,
-            );
+    for (idx, active_id) in ACTIVE_SAMPLE_IDS[cpu].iter().enumerate() {
+        if counters & (1 << idx) == 0 {
+            continue;
         }
+        pending.event_ids[idx].store(active_id.load(Ordering::Acquire), Ordering::Relaxed);
+        #[cfg(target_arch = "x86_64")]
+        let period = narf_arch::x86_64::pmu::last_overflow_period(cpu, idx);
+        #[cfg(target_arch = "aarch64")]
+        let period = if idx == 0 {
+            narf_arch::aarch64::pmu::last_overflow_period(cpu)
+        } else {
+            narf_arch::aarch64::pmu::programmable_period(cpu, idx - 1)
+        };
+        pending.periods[idx].store(period, Ordering::Relaxed);
     }
     pending.state.store(2, Ordering::Release);
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
+    // SAFETY: this handler is installed only on LVT-PC and runs at CPL0.
+    let counters = unsafe { narf_arch::x86_64::pmu::handle_sampling_overflow() };
+    if counters == 0 {
+        return narf_interrupts::IrqStatus::None;
+    }
+    let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
+    let _ = capture_pending_sample(cpu, counters);
     // Wake a parked poll/epoll task so its syscall re-enters normal context
     // and drains this allocation-free IRQ snapshot into the mmap ring.
     narf_net::readiness::notify(0);
@@ -1855,34 +1937,7 @@ fn pmi_handler(_cookie: u64) -> narf_interrupts::IrqStatus {
         return narf_interrupts::IrqStatus::None;
     }
     let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
-    let pending = &PENDING_SAMPLES[cpu];
-    if pending
-        .state
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
-        PENDING_SAMPLE_LOST.fetch_add(1, Ordering::Relaxed);
-        return narf_interrupts::IrqStatus::Handled;
-    }
-    pending
-        .task
-        .store(crate::handlers::current_task_id(), Ordering::Relaxed);
-    pending
-        .ip
-        .store(narf_interrupts::interrupted_ip(), Ordering::Relaxed);
-    pending
-        .time
-        .store(narf_time::monotonic_ns(), Ordering::Relaxed);
-    pending.counters.store(counters, Ordering::Relaxed);
-    for (idx, event_id) in pending.event_ids.iter().enumerate() {
-        if counters & (1 << idx) != 0 {
-            event_id.store(
-                ACTIVE_SAMPLE_IDS[cpu][idx].load(Ordering::Acquire),
-                Ordering::Relaxed,
-            );
-        }
-    }
-    pending.state.store(2, Ordering::Release);
+    let _ = capture_pending_sample(cpu, counters);
     narf_net::readiness::notify(0);
     narf_interrupts::IrqStatus::Handled
 }
@@ -1927,72 +1982,76 @@ fn ensure_pmi_route() -> Result<(), ()> {
 /// record encoding and readiness wakeups happen here where allocation is safe.
 pub(crate) fn drain_irq_samples() {
     let mut notify = false;
-    let deferred_lost = PENDING_SAMPLE_LOST.swap(0, Ordering::AcqRel);
-    for (_source_cpu, pending) in PENDING_SAMPLES.iter().enumerate() {
-        if pending
-            .state
-            .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            continue;
-        }
-        let task = pending.task.load(Ordering::Relaxed);
-        let ip = pending.ip.load(Ordering::Relaxed);
-        let now = pending.time.load(Ordering::Relaxed);
-        let counters = pending.counters.load(Ordering::Relaxed);
-        {
-            let registry = PERF_EVENT_REGISTRY.lock();
-            for weak in registry.iter() {
-                let Some(event) = weak.upgrade() else {
+    {
+        let registry = PERF_EVENT_REGISTRY.lock();
+        for buckets in &PENDING_LOSSES {
+            for bucket in buckets {
+                if bucket
+                    .state
+                    .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_err()
+                {
                     continue;
-                };
-                let matched_counter = (0..8).find(|&idx| {
-                    if counters & (1 << idx) == 0 {
-                        return false;
-                    }
-                    pending.event_ids[idx].load(Ordering::Relaxed) == event.id
-                });
-                if let Some(_matched_counter) = matched_counter {
-                    if !event.enabled.load(Ordering::Acquire)
-                        || !event.accepts_sample_from(_source_cpu, task)
-                    {
-                        continue;
-                    }
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        let period = narf_arch::x86_64::pmu::last_overflow_period(
-                            _source_cpu,
-                            _matched_counter,
-                        );
-                        event.last_sample_period.store(period, Ordering::Release);
-                        event.count_accumulated.fetch_add(period, Ordering::AcqRel);
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        let period = if _matched_counter == 0 {
-                            narf_arch::aarch64::pmu::last_overflow_period(_source_cpu)
-                        } else {
-                            narf_arch::aarch64::pmu::programmable_period(
-                                _source_cpu,
-                                _matched_counter - 1,
-                            )
-                        };
-                        event.last_sample_period.store(period, Ordering::Release);
-                        event.count_accumulated.fetch_add(period, Ordering::AcqRel);
-                    }
-                    if deferred_lost != 0 {
-                        event
-                            .sample_lost
-                            .fetch_add(deferred_lost, Ordering::Relaxed);
-                    }
-                    let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
-                    notify |= event.sample_record(ip, pid, task as u32, now);
-                    event.adjust_frequency_period(now);
-                    notify |= event.consume_refresh();
                 }
+                let event_id = bucket.event_id.load(Ordering::Relaxed);
+                let lost = bucket.count.swap(0, Ordering::Relaxed);
+                if lost != 0 {
+                    for weak in registry.iter() {
+                        let Some(event) = weak.upgrade() else {
+                            continue;
+                        };
+                        if event.id == event_id {
+                            event.sample_lost.fetch_add(lost, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+                bucket.event_id.store(0, Ordering::Relaxed);
+                bucket.state.store(0, Ordering::Release);
             }
         }
-        pending.state.store(0, Ordering::Release);
+    }
+    for (source_cpu, pending_ring) in PENDING_SAMPLES.iter().enumerate() {
+        for pending in pending_ring {
+            if pending
+                .state
+                .compare_exchange(2, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            let task = pending.task.load(Ordering::Relaxed);
+            let ip = pending.ip.load(Ordering::Relaxed);
+            let now = pending.time.load(Ordering::Relaxed);
+            let counters = pending.counters.load(Ordering::Relaxed);
+            {
+                let registry = PERF_EVENT_REGISTRY.lock();
+                for weak in registry.iter() {
+                    let Some(event) = weak.upgrade() else {
+                        continue;
+                    };
+                    let matched_counter = (0..8).find(|&idx| {
+                        counters & (1 << idx) != 0
+                            && pending.event_ids[idx].load(Ordering::Relaxed) == event.id
+                    });
+                    if let Some(matched_counter) = matched_counter {
+                        if !event.enabled.load(Ordering::Acquire)
+                            || !event.accepts_sample_from(source_cpu, task)
+                        {
+                            continue;
+                        }
+                        let period = pending.periods[matched_counter].load(Ordering::Relaxed);
+                        event.last_sample_period.store(period, Ordering::Release);
+                        event.count_accumulated.fetch_add(period, Ordering::AcqRel);
+                        let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
+                        notify |= event.sample_record(ip, pid, task as u32, now);
+                        event.adjust_frequency_period(now);
+                        notify |= event.consume_refresh();
+                    }
+                }
+            }
+            pending.state.store(0, Ordering::Release);
+        }
     }
     if notify {
         narf_net::readiness::notify(0);
