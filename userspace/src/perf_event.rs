@@ -796,6 +796,13 @@ impl PerfEventFile {
         self.target_task == task || self.inherited_tasks.lock().contains(&task)
     }
 
+    fn accepts_sample_from(&self, source_cpu: usize, task: u64) -> bool {
+        if self.target_task == u64::MAX {
+            return self.target_cpu >= 0 && self.target_cpu as usize == source_cpu;
+        }
+        self.tracks_task(task)
+    }
+
     fn raw_count(&self) -> u64 {
         if self.attr.type_ == PERF_TYPE_SOFTWARE {
             return match self.attr.config {
@@ -1020,6 +1027,8 @@ impl PerfEventFile {
                 let sample_period = self.sample_period.load(Ordering::Acquire);
                 if sample_period != 0 {
                     if let Some(counter) = self.pmu_counter {
+                        ACTIVE_SAMPLE_IDS[counter.cpu as usize][counter.idx as usize]
+                            .store(self.id, Ordering::Release);
                         let _ = arm_pmu_on(counter, sample_period);
                     }
                 }
@@ -1033,6 +1042,8 @@ impl PerfEventFile {
                 let period = self.sample_period.load(Ordering::Acquire);
                 if let Some(counter) = self.pmu_counter.as_ref() {
                     if period != 0 {
+                        ACTIVE_SAMPLE_IDS[self.target_cpu as usize][counter.sample_slot()]
+                            .store(self.id, Ordering::Release);
                         // SAFETY: this per-CPU file owns the current-CPU counter.
                         let _ = unsafe { (*counter).arm(period) };
                     } else {
@@ -1061,11 +1072,17 @@ impl PerfEventFile {
             #[cfg(target_arch = "x86_64")]
             if self.sample_period.load(Ordering::Acquire) != 0 {
                 if let Some(counter) = self.pmu_counter {
+                    ACTIVE_SAMPLE_IDS[counter.cpu as usize][counter.idx as usize]
+                        .store(0, Ordering::Release);
                     let _ = pause_pmu_on(counter);
                 }
             }
             #[cfg(target_arch = "aarch64")]
             if let Some(counter) = self.pmu_counter.as_ref() {
+                if self.sample_period.load(Ordering::Acquire) != 0 {
+                    ACTIVE_SAMPLE_IDS[self.target_cpu as usize][counter.sample_slot()]
+                        .store(0, Ordering::Release);
+                }
                 // SAFETY: this per-CPU file owns the current-CPU counter.
                 let _ = unsafe { (*counter).pause() };
             }
@@ -1933,20 +1950,12 @@ pub(crate) fn drain_irq_samples() {
                     if counters & (1 << idx) == 0 {
                         return false;
                     }
-                    if pending.event_ids[idx].load(Ordering::Relaxed) == event.id {
-                        return true;
-                    }
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        event
-                            .pmu_counter
-                            .is_some_and(|counter| counter.idx as usize == idx)
-                    }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    false
+                    pending.event_ids[idx].load(Ordering::Relaxed) == event.id
                 });
                 if let Some(_matched_counter) = matched_counter {
-                    if !event.enabled.load(Ordering::Acquire) || !event.tracks_task(task) {
+                    if !event.enabled.load(Ordering::Acquire)
+                        || !event.accepts_sample_from(_source_cpu, task)
+                    {
                         continue;
                     }
                     #[cfg(target_arch = "x86_64")]

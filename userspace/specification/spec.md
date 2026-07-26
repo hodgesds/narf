@@ -181,6 +181,9 @@ hard-IRQ handler acknowledges/reloads the counter and captures task, IP, time,
 and counter identity into a fixed per-CPU slot without allocation. Normal
 syscall context drains those slots into `PERF_RECORD_SAMPLE`/`LOST` records,
 advances `data_head` with release ordering, and wakes poll/epoll readers.
+Task-scoped samples are admitted by task/inheritance ownership; system-wide
+samples are admitted by the pending slot's source CPU matching the event's
+owning CPU, without requiring a synthetic target task.
 Committed exec, comm-change, fork/clone-process, and process-exit paths emit
 Linux `PERF_RECORD_COMM`, `FORK`, and `EXIT` records when their corresponding
 attribute bits are selected. Variable records are eight-byte aligned;

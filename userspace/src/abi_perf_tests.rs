@@ -1183,10 +1183,15 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
         };
         let fd = match call(
             Syscall::PerfEventOpen.raw(),
-            a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+            a3(
+                &attr as *const _ as u64,
+                -1i32 as u64,
+                narf_lib::percpu::current_cpu() as u64,
+                -1i32 as u64,
+            ),
         ) {
             Some(fd) if fd >= 0 => fd as u32,
-            _ => return Err("PMUv3 cycles event was not admitted"),
+            _ => return Err("system-wide PMUv3 cycles event was not admitted"),
         };
         let ops = crate::fd::with_table(FAKE_TASK, |table| {
             table.get(fd).map(|entry| entry.ops.clone())
