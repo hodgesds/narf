@@ -1914,10 +1914,10 @@ impl FsInstance for FileMount {
 /// `source_fs`: a directory leaf becomes a [`BindMount`], a FILE leaf a
 /// [`FileMount`] (so `mount --bind <file> <target>` works, which systemd relies
 /// on for read-only procfs-control-file protection). Every component but the
-/// last must be a directory. Uses the sync `lookup`/`lookup_dir` — the same
-/// constraint the directory-only bind always had; block-backed filesystems
-/// that stub the sync side are unaffected here (their binds are directory
-/// subtrees resolved elsewhere).
+/// last must be a directory. Uses the sync `lookup`/`lookup_dir`; block-backed
+/// filesystems drive their real I/O from those synchronously (see the ext2
+/// driver's `lookup`/`lookup_dir`), so a DEEP bind source — systemd's
+/// StateDirectory=, e.g. binding /var/lib/systemd/linger for logind — resolves.
 fn build_bind_fs(
     source_fs: &Arc<dyn FsInstance>,
     rel: &str,

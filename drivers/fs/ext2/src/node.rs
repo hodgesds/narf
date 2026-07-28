@@ -296,10 +296,17 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
 }
 
 impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
-    fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
-        // Ext2 lookups are async (block reads). Sync API is
-        // unsupported — VFS prefers `lookup_async`.
-        None
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        // Ext2 lookups are fundamentally async (inode + directory-block reads),
+        // but the sync VFS API must still work for callers that can't await —
+        // notably bind-mount source resolution (`build_bind_fs` walking a DEEP
+        // StateDirectory= path such as /var/lib/systemd/linger) and mount-subtree
+        // cloning. Drive the async lookup to completion via the SPIN bridge: it
+        // is re-entrancy-safe inside a syscall's executor poll and never halts,
+        // so the block-device IRQ (IRQs are enabled on this path, and no mount
+        // lock is held) completes the reads. Returning None made every deep bind
+        // fail NotFound → ENOENT → 226/EXIT_NAMESPACE (logind et al.).
+        narf_scheduler::block_on_spin(self.lookup_async(name)).ok()
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
@@ -327,8 +334,10 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
         })
     }
 
-    fn lookup_dir(&self, _name: &str) -> Option<Arc<dyn DirOps>> {
-        None
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        // See `lookup`: drive the async directory lookup to completion so the
+        // synchronous VFS API resolves real entries on this block-backed FS.
+        narf_scheduler::block_on_spin(self.lookup_dir_async(name)).ok()
     }
 
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
