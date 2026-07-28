@@ -1227,6 +1227,20 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
         (*task_ptr).preempted.store(true, Ordering::Release);
     }
 
+    // Save the user FPU before another task clobbers XMM/x87/AVX. This CPL0
+    // tick preempted the current task IN THE KERNEL — but if it is a USER task
+    // that trapped in for a syscall, its live SIMD state is still in the
+    // hardware registers (the kernel is `+soft-float` and never touches them),
+    // exactly as after a CPL3 preempt. Without this save, the executor polls
+    // other user tasks whose `fpu_restore` overwrites the registers, and when
+    // this task's syscall resumes and `iretq`s back to user its in-flight
+    // `memcpy`/`memset` runs on another task's XMM/YMM — a torn heap/stack
+    // write that glibc later detects as corruption and `abort()`s (SIGABRT).
+    // `user_fpu_save` no-ops for a pure kernel task (its `user_fpu` is null).
+    // Must run BEFORE clearing CURRENT: `user_fpu_save` resolves the area via
+    // CURRENT_STACKFUL_TASK, so a cleared slot would silently skip the save.
+    // Mirrors the CPL3 `try_preempt_user` path.
+    user_fpu_save();
     // Clear CURRENT so timer ticks during the switch-out window
     // don't try to preempt a task that's no longer executing on
     // this CPU. task_body_rust re-publishes CURRENT at the top
@@ -1275,6 +1289,11 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
             .tsc_started
             .store(narf_time::now_cycles(), Ordering::Release);
     }
+    // Restore this task's user FPU, clobbered by whatever ran while we were
+    // switched out. Must run AFTER re-publishing CURRENT above (which
+    // `user_fpu_restore` reads to resolve the area) and before the `iretq`
+    // that returns to the interrupted kernel/user RIP. No-op for kernel tasks.
+    user_fpu_restore();
     true
 }
 
