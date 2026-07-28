@@ -3308,7 +3308,10 @@ fn boot_userspace_init() {
         .find_map(|t| t.strip_prefix("trace_comm="))
     {
         narf_userspace::syscall::set_trace_comm(prefix);
-        let _ = writeln!(console::Writer, "  boot-init: syscall-trace comm='{prefix}'");
+        let _ = writeln!(
+            console::Writer,
+            "  boot-init: syscall-trace comm='{prefix}'"
+        );
     }
     // Build the shared vDSO + vvar pages now that the TSC/counter scale is
     // calibrated; every process maps them and gets AT_SYSINFO_EHDR.

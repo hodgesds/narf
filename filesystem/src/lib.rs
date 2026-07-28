@@ -1946,7 +1946,10 @@ fn build_bind_fs(
                 return Ok(Arc::new(BindMount { root: d, fs_name }));
             }
         }
-        return Ok(Arc::new(FileMount { file: node, fs_name }));
+        return Ok(Arc::new(FileMount {
+            file: node,
+            fs_name,
+        }));
     }
     // Some filesystems only expose child directories via `lookup_dir`.
     if let Some(d) = dir.lookup_dir(last) {
@@ -2148,7 +2151,10 @@ impl VfsRegistry {
         let fs = {
             let q = self.inner.lock();
             // Topmost (last-pushed) mount at `path`, matching resolve_absolute.
-            q.iter().rev().find(|m| m.path == path).map(|m| m.fs.clone())
+            q.iter()
+                .rev()
+                .find(|m| m.path == path)
+                .map(|m| m.fs.clone())
         }?;
         Some(f(&*fs))
     }

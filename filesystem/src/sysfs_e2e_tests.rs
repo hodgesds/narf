@@ -1386,7 +1386,10 @@ fn smoke_core_uevent_attr_render_and_store_triggers() -> TestResult {
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]
-kernel_test_in!("sysfs_e2e/core", smoke_core_uevent_attr_render_and_store_triggers);
+kernel_test_in!(
+    "sysfs_e2e/core",
+    smoke_core_uevent_attr_render_and_store_triggers
+);
 
 // ── Core 3 — /sys/class/<sub>/<dev>/dev reports MAJOR:MINOR, and
 //             register_char_dev_link installs /sys/dev/char/MAJOR:MINOR
@@ -1592,7 +1595,10 @@ fn smoke_core_rw_roundtrip_and_ro_rejects_write() -> TestResult {
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]
-kernel_test_in!("sysfs_e2e/core", smoke_core_rw_roundtrip_and_ro_rejects_write);
+kernel_test_in!(
+    "sysfs_e2e/core",
+    smoke_core_rw_roundtrip_and_ro_rejects_write
+);
 
 // ── Core 6 — SysKobjDir enumeration returns children + attrs + symlinks with
 //             the right FileType, and a missing attr resolves to NotFound. ──
@@ -1657,7 +1663,10 @@ fn smoke_core_dir_enumeration_and_missing_notfound() -> TestResult {
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]
-kernel_test_in!("sysfs_e2e/core", smoke_core_dir_enumeration_and_missing_notfound);
+kernel_test_in!(
+    "sysfs_e2e/core",
+    smoke_core_dir_enumeration_and_missing_notfound
+);
 
 // ── Core 7 — symlink resolution through the VFS: SysKobjDir::lookup of a
 //             /sys/class/net/<if> symlink yields a SysSymlinkFile whose read

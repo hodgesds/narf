@@ -391,13 +391,8 @@ fn smoke_registry_overmount_deep_lifo() -> TestResult {
     };
 
     let visible = |want: &str| {
-        registry().resolve_absolute(PATH, |fs, _| {
-            if fs.name() == want {
-                1u8
-            } else {
-                0
-            }
-        }) == Some(1)
+        registry().resolve_absolute(PATH, |fs, _| if fs.name() == want { 1u8 } else { 0 })
+            == Some(1)
     };
 
     let mut fail: Option<&'static str> = None;
@@ -456,10 +451,12 @@ fn smoke_registry_stack_under_nested_mount() -> TestResult {
     };
 
     // A path at the stacked level resolves to the stack's TOP.
-    let at_base = registry().resolve_absolute("/nst/x", |fs, _| fs.name() == "nst-top") == Some(true);
+    let at_base =
+        registry().resolve_absolute("/nst/x", |fs, _| fs.name() == "nst-top") == Some(true);
     // A path under the deeper mount resolves to the NESTED fs (longest prefix
     // beats the stack), not to either /nst layer.
-    let at_sub = registry().resolve_absolute("/nst/sub/y", |fs, _| fs.name() == "nst-sub") == Some(true);
+    let at_sub =
+        registry().resolve_absolute("/nst/sub/y", |fs, _| fs.name() == "nst-sub") == Some(true);
 
     let _ = registry().unmount(&hs, SUB);
     let _ = registry().unmount(&ht, BASE);
@@ -471,7 +468,10 @@ fn smoke_registry_stack_under_nested_mount() -> TestResult {
         TestResult::Fail("longest-prefix must beat a same-path stack for deeper mounts")
     }
 }
-kernel_test_in!("filesystem/e2e/mount", smoke_registry_stack_under_nested_mount);
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_registry_stack_under_nested_mount
+);
 
 /// A private `MountNamespace` (the path a service takes after
 /// `unshare(CLONE_NEWNS)`) supports the same overmount stacking as the global
@@ -482,10 +482,16 @@ fn smoke_ns_overmount_stacks() -> TestResult {
     let ns = crate::MountNamespace::snapshot_global();
     const PATH: &str = "/ns-stack";
 
-    if ns.mount_arc(&auth, PATH, alloc::sync::Arc::new(MemFs::new("ns-bottom"))).is_err() {
+    if ns
+        .mount_arc(&auth, PATH, alloc::sync::Arc::new(MemFs::new("ns-bottom")))
+        .is_err()
+    {
         return TestResult::Fail("ns bottom mount failed");
     }
-    if ns.mount_arc(&auth, PATH, alloc::sync::Arc::new(MemFs::new("ns-top"))).is_err() {
+    if ns
+        .mount_arc(&auth, PATH, alloc::sync::Arc::new(MemFs::new("ns-top")))
+        .is_err()
+    {
         return TestResult::Fail("ns overmount rejected — namespace lacks stacking");
     }
     let top_visible = ns.resolve_absolute(PATH, |fs, _| fs.name() == "ns-top") == Some(true);
@@ -645,10 +651,7 @@ fn smoke_registry_file_overmount_stacks() -> TestResult {
         TestResult::Fail("file overmount must shadow the lower file and reveal it on unmount")
     }
 }
-kernel_test_in!(
-    "filesystem/e2e/mount",
-    smoke_registry_file_overmount_stacks
-);
+kernel_test_in!("filesystem/e2e/mount", smoke_registry_file_overmount_stacks);
 
 // ── Smoke 2: directory listing ────────────────────────────────────────
 //
@@ -1252,15 +1255,21 @@ fn smoke_vfs_stack_on_duplicate_mountpoint() -> TestResult {
 
     // The topmost FS (fs2) is visible: its g.txt resolves and fs1's f.txt is
     // shadowed.
-    let top_sees_g =
-        matches!(registry().with_mount(PATH, |fs| resolve(fs.root(), "g.txt").is_ok()), Some(true));
-    let top_hides_f =
-        matches!(registry().with_mount(PATH, |fs| resolve(fs.root(), "f.txt").is_err()), Some(true));
+    let top_sees_g = matches!(
+        registry().with_mount(PATH, |fs| resolve(fs.root(), "g.txt").is_ok()),
+        Some(true)
+    );
+    let top_hides_f = matches!(
+        registry().with_mount(PATH, |fs| resolve(fs.root(), "f.txt").is_err()),
+        Some(true)
+    );
 
     // Pop the top: fs1's f.txt is revealed again.
     let popped = registry().unmount(&h2, PATH).is_ok();
-    let bottom_sees_f =
-        matches!(registry().with_mount(PATH, |fs| resolve(fs.root(), "f.txt").is_ok()), Some(true));
+    let bottom_sees_f = matches!(
+        registry().with_mount(PATH, |fs| resolve(fs.root(), "f.txt").is_ok()),
+        Some(true)
+    );
 
     let _ = registry().unmount(&h1, PATH);
 

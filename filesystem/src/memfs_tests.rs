@@ -33,9 +33,7 @@ use alloc::vec;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::{
-    bootstrap_mount_authority, registry, resolve, FileType, FsError, FsInstance, MemFs,
-};
+use crate::{bootstrap_mount_authority, registry, resolve, FileType, FsError, FsInstance, MemFs};
 
 // ── poll_once helper ──────────────────────────────────────────────────
 //
@@ -317,7 +315,10 @@ fn smoke_memfs_unlink_rmdir_semantics() -> TestResult {
     }
 
     // Missing name → NotFound for both unlink and rmdir.
-    if !matches!(poll_once(root.unlink("ghost")), Some(Err(FsError::NotFound))) {
+    if !matches!(
+        poll_once(root.unlink("ghost")),
+        Some(Err(FsError::NotFound))
+    ) {
         return TestResult::Fail("unlink of missing name did not return NotFound");
     }
     if !matches!(poll_once(root.rmdir("ghost")), Some(Err(FsError::NotFound))) {

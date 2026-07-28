@@ -645,11 +645,11 @@ kernel_test_in!(
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(feature = "linux-compat")]
-use alloc::vec::Vec;
-#[cfg(feature = "linux-compat")]
 use crate::procfs::{poll_once, ProcRoot};
 #[cfg(feature = "linux-compat")]
 use crate::{DirOps, FileType, Mode};
+#[cfg(feature = "linux-compat")]
+use alloc::vec::Vec;
 
 /// Resolve `name` under `/proc` via `ProcRoot::lookup` and read the whole
 /// file into a `String`, draining the async `read` with `poll_once` (all
@@ -799,8 +799,8 @@ fn e2e_global_loadavg_five_field_shape() -> TestResult {
     // First three: x.xx floats with a 2-digit fraction.
     for t in toks.iter().take(3) {
         match t.split_once('.') {
-            Some((i, f)) if i.parse::<u64>().is_ok() && f.len() == 2 && f.parse::<u64>().is_ok() => {
-            }
+            Some((i, f))
+                if i.parse::<u64>().is_ok() && f.len() == 2 && f.parse::<u64>().is_ok() => {}
             _ => return TestResult::Fail("/proc/loadavg average is not an x.xx float"),
         }
     }
@@ -831,7 +831,10 @@ fn e2e_global_filesystems_lists_known_types() -> TestResult {
         None => return TestResult::Fail("/proc/filesystems did not resolve/read"),
     };
     // The set of type tokens is the trailing token of each line.
-    let has = |ty: &str| body.lines().any(|l| l.split_whitespace().next() == Some(ty));
+    let has = |ty: &str| {
+        body.lines()
+            .any(|l| l.split_whitespace().next() == Some(ty))
+    };
     // procfs is always mounted (we are reading it), so "proc" must be present.
     if !has("proc") {
         return TestResult::Fail("/proc/filesystems missing 'proc' type");
@@ -846,7 +849,10 @@ fn e2e_global_filesystems_lists_known_types() -> TestResult {
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]
-kernel_test_in!("procsys_e2e/global", e2e_global_filesystems_lists_known_types);
+kernel_test_in!(
+    "procsys_e2e/global",
+    e2e_global_filesystems_lists_known_types
+);
 
 // ── /proc/mounts ─────────────────────────────────────────────────────────────
 
@@ -905,7 +911,10 @@ fn e2e_global_cpuinfo_processor_and_model_name() -> TestResult {
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]
-kernel_test_in!("procsys_e2e/global", e2e_global_cpuinfo_processor_and_model_name);
+kernel_test_in!(
+    "procsys_e2e/global",
+    e2e_global_cpuinfo_processor_and_model_name
+);
 
 // ── /proc/version ────────────────────────────────────────────────────────────
 
@@ -1035,10 +1044,7 @@ fn e2e_global_pressure_psi_shape() -> TestResult {
             None => return TestResult::Fail("/proc/pressure/<res> read failed"),
         };
         let lines: Vec<&str> = body.lines().collect();
-        if lines.len() != 2
-            || !psi_line_ok(lines[0], "some")
-            || !psi_line_ok(lines[1], "full")
-        {
+        if lines.len() != 2 || !psi_line_ok(lines[0], "some") || !psi_line_ok(lines[1], "full") {
             return TestResult::Fail("/proc/pressure/{memory,io} not 'some'+'full' PSI lines");
         }
     }
@@ -1060,7 +1066,15 @@ fn e2e_global_seccomp_actions_avail_lists_actions() -> TestResult {
     };
     let toks: Vec<&str> = body.split_whitespace().collect();
     // libseccomp checks for the canonical action names it can request.
-    for want in ["kill_process", "kill_thread", "trap", "errno", "trace", "log", "allow"] {
+    for want in [
+        "kill_process",
+        "kill_thread",
+        "trap",
+        "errno",
+        "trace",
+        "log",
+        "allow",
+    ] {
         if !toks.iter().any(|t| *t == want) {
             return TestResult::Fail("seccomp/actions_avail missing a required action");
         }
@@ -1134,7 +1148,10 @@ fn e2e_global_sys_vm_fs_known_keys_numeric() -> TestResult {
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]
-kernel_test_in!("procsys_e2e/global", e2e_global_sys_vm_fs_known_keys_numeric);
+kernel_test_in!(
+    "procsys_e2e/global",
+    e2e_global_sys_vm_fs_known_keys_numeric
+);
 
 // ── /proc entries stat as the correct node type ──────────────────────────────
 

@@ -1593,7 +1593,10 @@ fn smoke_cgroup_misc_max_unset_and_current() -> TestResult {
     })
 }
 #[cfg(feature = "cgroup-misc")]
-kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_misc_max_unset_and_current);
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_misc_max_unset_and_current
+);
 
 // ── psi: every axis is PSI-shaped (some + full lines) ───────────────
 //
@@ -1798,4 +1801,7 @@ fn smoke_cgroup_subtree_control_delegates() -> TestResult {
     TestResult::Pass
 }
 #[cfg(feature = "cgroup-pids")]
-kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_subtree_control_delegates);
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_subtree_control_delegates
+);
