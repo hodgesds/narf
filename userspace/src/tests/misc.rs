@@ -1258,14 +1258,15 @@ fn smoke_userspace_prctl_name_round_trip() -> TestResult {
         return TestResult::Fail("PR_SET_DUMPABLE(true) did not stick");
     }
 
-    // Unknown op rejected.
+    // Unknown op rejected with -EINVAL (Linux's answer for an unrecognised
+    // prctl option; NOT the -1/EPERM sentinel).
     let r = call(99, 0);
     let unknown_rejected = matches!(
         r,
-        Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-1i64) as u64,
+        Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-22i64) as u64,
     );
     if !unknown_rejected {
-        return TestResult::Fail("prctl(99) was not rejected");
+        return TestResult::Fail("prctl(99) must return -EINVAL");
     }
 
     crate::handlers::__test_prctl_reset();
