@@ -766,7 +766,7 @@ fn e2e_global_uptime_two_floats() -> TestResult {
         Some(s) => s,
         None => return TestResult::Fail("/proc/uptime did not resolve/read"),
     };
-    let toks: Vec<&str> = body.trim_end().split_whitespace().collect();
+    let toks: Vec<&str> = body.split_whitespace().collect();
     if toks.len() != 2 {
         return TestResult::Fail("/proc/uptime must be exactly two tokens");
     }
@@ -792,7 +792,7 @@ fn e2e_global_loadavg_five_field_shape() -> TestResult {
         Some(s) => s,
         None => return TestResult::Fail("/proc/loadavg did not resolve/read"),
     };
-    let toks: Vec<&str> = body.trim_end().split_whitespace().collect();
+    let toks: Vec<&str> = body.split_whitespace().collect();
     if toks.len() != 5 {
         return TestResult::Fail("/proc/loadavg must have exactly 5 fields");
     }
@@ -1075,7 +1075,7 @@ fn e2e_global_seccomp_actions_avail_lists_actions() -> TestResult {
         "log",
         "allow",
     ] {
-        if !toks.iter().any(|t| *t == want) {
+        if !toks.contains(&want) {
             return TestResult::Fail("seccomp/actions_avail missing a required action");
         }
     }
@@ -1111,7 +1111,7 @@ fn e2e_global_sys_kernel_identity_keys() -> TestResult {
         _ => return TestResult::Fail("kernel/hostname default is not 'narf'"),
     }
     match sysctl_read(&["sys", "kernel", "pid_max"]).and_then(|s| s.parse::<u32>().ok()) {
-        Some(n) if n >= 1 && n <= 4_194_304 => {}
+        Some(n) if (1..=4_194_304).contains(&n) => {}
         _ => return TestResult::Fail("kernel/pid_max not a valid PID_MAX_LIMIT-bounded integer"),
     }
     TestResult::Pass

@@ -391,6 +391,7 @@ kernel_test_in!("userspace/mount", smoke_pivot_root_relative_dot);
 // path. A double prefix made umount2 (and the MS_MOVE fallback) return ENOENT →
 // "Failed to set up mount namespacing: No such file or directory" →
 // 226/EXIT_NAMESPACE, restart-looping systemd-udevd.
+#[cfg(feature = "container")]
 fn smoke_pivot_root_switch_root_umount_dot() -> TestResult {
     let task: u64 = 0x71_06;
     set_task(task);

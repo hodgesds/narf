@@ -1444,7 +1444,7 @@ fn smoke_vfs_resolve_absolute_lock_released_in_closure() -> TestResult {
             if nested_id != expected_b_id || nested_id.is_none() {
                 return TestResult::Fail("nested mount_id_at returned wrong id");
             }
-            if rel != "" {
+            if !rel.is_empty() {
                 return TestResult::Fail("nested resolve_absolute rel not empty for mount root");
             }
             if !b_ok {
@@ -1561,7 +1561,7 @@ fn smoke_vfs_resolve_parent_absolute_lock_released_in_closure() -> TestResult {
             if id != expected_b_id || id.is_none() {
                 return TestResult::Fail("nested mount_id_at wrong under resolve_parent_absolute");
             }
-            if rel != "" || name != "fme11cb" {
+            if !rel.is_empty() || name != "fme11cb" {
                 return TestResult::Fail("nested resolve_absolute wrong under parent closure");
             }
             TestResult::Pass

@@ -108,7 +108,7 @@ fn smoke_memfs_write_read_roundtrip() -> TestResult {
         Some(Ok(m)) => m,
         _ => return TestResult::Fail("offset read failed"),
     };
-    if m != PAYLOAD.len() - OFF || &tail[..m] != &PAYLOAD[OFF..] {
+    if m != PAYLOAD.len() - OFF || tail[..m] != PAYLOAD[OFF..] {
         return TestResult::Fail("offset read content/length mismatch");
     }
 
@@ -505,7 +505,7 @@ fn smoke_memfs_truncate_grow_shrink() -> TestResult {
         Some(Ok(m)) => m,
         _ => return TestResult::Fail("read after grow failed"),
     };
-    if m != 8 || &buf2[..4] != b"abcd" || &buf2[4..8] != &[0u8; 4] {
+    if m != 8 || buf2[..4] != *b"abcd" || buf2[4..8] != [0u8; 4] {
         return TestResult::Fail("grow did not zero-fill the tail");
     }
 

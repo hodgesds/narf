@@ -4790,7 +4790,7 @@ fn smoke_unix_dgram_scm_rights_delivers_per_datagram() -> TestResult {
         buf: &mut payload,
         flags: 0,
     }) {
-        SocketOpResult::Received { n, .. } if &payload[..n as usize] == b"FDSTORE=1" => {}
+        SocketOpResult::Received { n, .. } if &payload[..n] == b"FDSTORE=1" => {}
         _ => return TestResult::Fail("AF_UNIX datagram payload was not delivered"),
     }
     let received = receiver.unix_take_recv_fds();

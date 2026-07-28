@@ -33,6 +33,8 @@ pub(crate) fn sys_seccomp(ctx: &mut dyn TrapContext) {
     if op == SECCOMP_GET_ACTION_AVAIL {
         let action_ptr = args.arg2;
         let mut act_bytes = [0u8; 4];
+        // SAFETY: copy_from_user SMAP-brackets and validates the user pointer;
+        // act_bytes is a local 4-byte buffer sized exactly for the u32 action.
         if unsafe { copy_from_user(&mut act_bytes, action_ptr) }.is_ok() {
             let action = u32::from_ne_bytes(act_bytes);
             if matches!(

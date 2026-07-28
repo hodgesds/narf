@@ -701,9 +701,9 @@ fn smoke_abi_fsx_umount2_relative_dot() -> TestResult {
         crate::handlers::__test_cwd_reset();
         let target = b"/abi-swroot\0";
         let margs = SyscallArgs {
-            arg0: b"none\0".as_ptr() as u64,
+            arg0: c"none".as_ptr() as u64,
             arg1: target.as_ptr() as u64,
-            arg2: b"tmpfs\0".as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
             arg3: 0,
             arg4: 0,
             ..Default::default()
