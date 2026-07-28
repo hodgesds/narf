@@ -297,6 +297,212 @@ fn smoke_vfs_mount_read_unmount() -> TestResult {
 }
 kernel_test_in!("filesystem/e2e/mount", smoke_vfs_mount_read_unmount);
 
+/// Mount stacking (Linux overmount): a mount onto an already-occupied path
+/// succeeds and shadows the one below; resolution sees the topmost; unmount
+/// pops it and reveals the mount underneath. systemd's ProtectHostname= binds
+/// a read-only /proc/sys/kernel/domainname over the live one — rejecting the
+/// overmount with EBUSY broke service namespace setup (226/EXIT_NAMESPACE).
+fn smoke_registry_overmount_stacks() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    const PATH: &str = "/fme-stack";
+
+    // Bottom mount is visible.
+    let h1 = match registry().mount(&auth, PATH, MemFs::new("stack-bottom")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("bottom mount failed"),
+    };
+    let id_bottom = registry().mount_id_at(PATH);
+    if registry().resolve_absolute(PATH, |fs, _| fs.name() == "stack-bottom") != Some(true) {
+        let _ = registry().unmount(&h1, PATH);
+        return TestResult::Fail("bottom mount not visible");
+    }
+
+    // Overmount onto the SAME path must succeed (stacking), not EBUSY.
+    let h2 = match registry().mount(&auth, PATH, MemFs::new("stack-top")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&h1, PATH);
+            return TestResult::Fail("overmount rejected — registry lacks stacking");
+        }
+    };
+    // Topmost is now visible, with a distinct mount id.
+    let id_top = registry().mount_id_at(PATH);
+    let top_visible = registry().resolve_absolute(PATH, |fs, _| fs.name() == "stack-top");
+    if top_visible != Some(true) {
+        let _ = registry().unmount(&h2, PATH);
+        let _ = registry().unmount(&h1, PATH);
+        return TestResult::Fail("top of stack not visible after overmount");
+    }
+    if id_top.is_none() || id_top == id_bottom {
+        let _ = registry().unmount(&h2, PATH);
+        let _ = registry().unmount(&h1, PATH);
+        return TestResult::Fail("stacked mounts must have distinct mount ids");
+    }
+
+    // Pop the top: the bottom mount is revealed again (both fs identity and id).
+    if registry().unmount(&h2, PATH).is_err() {
+        let _ = registry().unmount(&h1, PATH);
+        return TestResult::Fail("unmount top of stack failed");
+    }
+    if registry().resolve_absolute(PATH, |fs, _| fs.name() == "stack-bottom") != Some(true) {
+        let _ = registry().unmount(&h1, PATH);
+        return TestResult::Fail("popping top did not reveal the lower mount");
+    }
+    if registry().mount_id_at(PATH) != id_bottom {
+        let _ = registry().unmount(&h1, PATH);
+        return TestResult::Fail("revealed mount is not the original bottom");
+    }
+
+    // Popping the last mount leaves the path unmounted.
+    if registry().unmount(&h1, PATH).is_err() {
+        return TestResult::Fail("unmount bottom failed");
+    }
+    if registry().with_mount(PATH, |_| ()).is_some() {
+        return TestResult::Fail("path still mounted after popping the whole stack");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/e2e/mount", smoke_registry_overmount_stacks);
+
+/// A deep (3-layer) stack pops strictly LIFO: each unmount reveals exactly the
+/// layer beneath, in reverse mount order.
+fn smoke_registry_overmount_deep_lifo() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    const PATH: &str = "/fme-deep";
+
+    let hb = match registry().mount(&auth, PATH, MemFs::new("deep-bottom")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("bottom mount failed"),
+    };
+    let hm = match registry().mount(&auth, PATH, MemFs::new("deep-middle")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&hb, PATH);
+            return TestResult::Fail("middle overmount failed");
+        }
+    };
+    let ht = match registry().mount(&auth, PATH, MemFs::new("deep-top")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&hm, PATH);
+            let _ = registry().unmount(&hb, PATH);
+            return TestResult::Fail("top overmount failed");
+        }
+    };
+
+    let visible = |want: &str| {
+        registry().resolve_absolute(PATH, |fs, _| {
+            if fs.name() == want {
+                1u8
+            } else {
+                0
+            }
+        }) == Some(1)
+    };
+
+    let mut fail: Option<&'static str> = None;
+    if !visible("deep-top") {
+        fail = Some("top of a 3-deep stack not visible");
+    }
+    if fail.is_none() && registry().unmount(&ht, PATH).is_err() {
+        fail = Some("pop top failed");
+    }
+    if fail.is_none() && !visible("deep-middle") {
+        fail = Some("pop top must reveal the middle mount");
+    }
+    if fail.is_none() && registry().unmount(&hm, PATH).is_err() {
+        fail = Some("pop middle failed");
+    }
+    if fail.is_none() && !visible("deep-bottom") {
+        fail = Some("pop middle must reveal the bottom mount");
+    }
+    // Always drain to keep the global registry clean for later tests.
+    let _ = registry().unmount(&ht, PATH);
+    let _ = registry().unmount(&hm, PATH);
+    let _ = registry().unmount(&hb, PATH);
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!("filesystem/e2e/mount", smoke_registry_overmount_deep_lifo);
+
+/// A same-path stack coexists with a DEEPER nested mount: longest-prefix
+/// resolution still selects the nested mount for paths under it, while the
+/// stack's topmost wins for paths at the stacked level.
+fn smoke_registry_stack_under_nested_mount() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    const BASE: &str = "/nst";
+    const SUB: &str = "/nst/sub";
+
+    let hb = match registry().mount(&auth, BASE, MemFs::new("nst-bottom")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("base bottom mount failed"),
+    };
+    let ht = match registry().mount(&auth, BASE, MemFs::new("nst-top")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&hb, BASE);
+            return TestResult::Fail("base overmount failed");
+        }
+    };
+    let hs = match registry().mount(&auth, SUB, MemFs::new("nst-sub")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&ht, BASE);
+            let _ = registry().unmount(&hb, BASE);
+            return TestResult::Fail("nested mount failed");
+        }
+    };
+
+    // A path at the stacked level resolves to the stack's TOP.
+    let at_base = registry().resolve_absolute("/nst/x", |fs, _| fs.name() == "nst-top") == Some(true);
+    // A path under the deeper mount resolves to the NESTED fs (longest prefix
+    // beats the stack), not to either /nst layer.
+    let at_sub = registry().resolve_absolute("/nst/sub/y", |fs, _| fs.name() == "nst-sub") == Some(true);
+
+    let _ = registry().unmount(&hs, SUB);
+    let _ = registry().unmount(&ht, BASE);
+    let _ = registry().unmount(&hb, BASE);
+
+    if at_base && at_sub {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("longest-prefix must beat a same-path stack for deeper mounts")
+    }
+}
+kernel_test_in!("filesystem/e2e/mount", smoke_registry_stack_under_nested_mount);
+
+/// A private `MountNamespace` (the path a service takes after
+/// `unshare(CLONE_NEWNS)`) supports the same overmount stacking as the global
+/// registry: overmount succeeds, topmost is visible, unmount reveals the lower.
+/// This is the exact path systemd's ProtectHostname= domainname bind takes.
+fn smoke_ns_overmount_stacks() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    let ns = crate::MountNamespace::snapshot_global();
+    const PATH: &str = "/ns-stack";
+
+    if ns.mount_arc(&auth, PATH, alloc::sync::Arc::new(MemFs::new("ns-bottom"))).is_err() {
+        return TestResult::Fail("ns bottom mount failed");
+    }
+    if ns.mount_arc(&auth, PATH, alloc::sync::Arc::new(MemFs::new("ns-top"))).is_err() {
+        return TestResult::Fail("ns overmount rejected — namespace lacks stacking");
+    }
+    let top_visible = ns.resolve_absolute(PATH, |fs, _| fs.name() == "ns-top") == Some(true);
+    if !top_visible {
+        return TestResult::Fail("ns top of stack not visible");
+    }
+    if ns.unmount(PATH).is_err() {
+        return TestResult::Fail("ns unmount top failed");
+    }
+    let bottom_revealed = ns.resolve_absolute(PATH, |fs, _| fs.name() == "ns-bottom") == Some(true);
+    if !bottom_revealed {
+        return TestResult::Fail("ns unmount did not reveal the lower mount");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/e2e/mount", smoke_ns_overmount_stacks);
+
 // ── Smoke 2: directory listing ────────────────────────────────────────
 //
 // Mount a CPIO archive with:
@@ -843,16 +1049,20 @@ fn smoke_vfs_multi_mount_independent() -> TestResult {
 }
 kernel_test_in!("filesystem/e2e/mount", smoke_vfs_multi_mount_independent);
 
-// ── Smoke 9: mount on occupied mountpoint → Busy ──────────────────────
+// ── Smoke 9: mount on occupied mountpoint → stacks (overmount) ────────
 //
-// Attempt to mount a second FS on the same path while the first is
-// still mounted. `VfsRegistry::mount` must return `FsError::Busy`.
+// Mounting a second FS on a path that is already mounted STACKS it: the new
+// mount shadows the first (Linux overmount), so the topmost FS's contents are
+// what resolve, and unmounting pops it to reveal the original underneath.
+// NARF previously returned `FsError::Busy` here, which broke systemd service
+// namespace setup (ProtectHostname= binds a read-only view over
+// /proc/sys/kernel/domainname) with 226/EXIT_NAMESPACE.
 //
 // References:
-//   Linux `fs/namespace.c::do_add_mount` → -EBUSY when the mount point
-//   is already occupied without `MNT_BIND`.
+//   Linux `fs/namespace.c::do_add_mount` stacks on an occupied mountpoint;
+//   the topmost mount is the visible one.
 
-fn smoke_vfs_busy_on_duplicate_mountpoint() -> TestResult {
+fn smoke_vfs_stack_on_duplicate_mountpoint() -> TestResult {
     const PATH: &str = "/fme9";
 
     let fs1 = match make_initramfs(
@@ -879,28 +1089,43 @@ fn smoke_vfs_busy_on_duplicate_mountpoint() -> TestResult {
     };
 
     let auth = bootstrap_mount_authority();
-    let handle = match registry().mount(&auth, PATH, fs1) {
+    let h1 = match registry().mount(&auth, PATH, fs1) {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("first mount failed"),
     };
 
-    let second_result = registry().mount(&auth, PATH, fs2);
-
-    let _ = registry().unmount(&handle, PATH);
-
-    match second_result {
-        Err(FsError::Busy) => TestResult::Pass,
-        Err(_) => TestResult::Fail("double mount returned wrong error (expected Busy)"),
-        Ok(h2) => {
-            // Clean up the unexpected second mount.
-            let _ = registry().unmount(&h2, PATH);
-            TestResult::Fail("double mount succeeded — should return Busy")
+    // Overmount the same path: must succeed (stack), not Busy.
+    let h2 = match registry().mount(&auth, PATH, fs2) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&h1, PATH);
+            return TestResult::Fail("overmount rejected — should stack, not Busy");
         }
+    };
+
+    // The topmost FS (fs2) is visible: its g.txt resolves and fs1's f.txt is
+    // shadowed.
+    let top_sees_g =
+        matches!(registry().with_mount(PATH, |fs| resolve(fs.root(), "g.txt").is_ok()), Some(true));
+    let top_hides_f =
+        matches!(registry().with_mount(PATH, |fs| resolve(fs.root(), "f.txt").is_err()), Some(true));
+
+    // Pop the top: fs1's f.txt is revealed again.
+    let popped = registry().unmount(&h2, PATH).is_ok();
+    let bottom_sees_f =
+        matches!(registry().with_mount(PATH, |fs| resolve(fs.root(), "f.txt").is_ok()), Some(true));
+
+    let _ = registry().unmount(&h1, PATH);
+
+    if top_sees_g && top_hides_f && popped && bottom_sees_f {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("duplicate mount must stack: top shadows bottom, unmount reveals it")
     }
 }
 kernel_test_in!(
     "filesystem/e2e/mount",
-    smoke_vfs_busy_on_duplicate_mountpoint
+    smoke_vfs_stack_on_duplicate_mountpoint
 );
 
 // ── Smoke 10: stat reports correct size and mode ─────────────────────

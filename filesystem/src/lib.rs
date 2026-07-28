@@ -1865,8 +1865,13 @@ impl VfsRegistry {
     /// Mount `fs` at `path`. The `authority` cap is checked live;
     /// a revoked authority returns `FsError::PermissionDenied`
     /// (via the `From<CapError>` impl) before any side effect.
-    /// Duplicate-path mounts return `FsError::Busy` — Stage 4 will
-    /// add bind-mount semantics under a separate `mount_bind` entry.
+    /// Mounting onto an already-occupied path stacks (Linux overmount
+    /// semantics): the new mount shadows the ones below it, `resolve_absolute`
+    /// selects the most-recently pushed mount at a path, and `unmount` pops the
+    /// topmost — matching `MountNamespace`. systemd relies on this to bind a
+    /// read-only copy of a procfs control file (e.g. /proc/sys/kernel/domainname
+    /// under ProtectHostname=) over the existing one; rejecting the overmount
+    /// with EBUSY failed service namespace setup with 226/EXIT_NAMESPACE.
     pub fn mount<F: FsInstance>(
         &self,
         authority: &Cap<MountPoint, Grant>,
@@ -1876,9 +1881,6 @@ impl VfsRegistry {
         authority.check_live()?;
 
         let mut q = self.inner.lock();
-        if q.iter().any(|m| m.path == path) {
-            return Err(FsError::Busy);
-        }
         let handle: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
         let arc: Arc<dyn FsInstance> = Arc::new(fs);
         q.push(Mount {
@@ -1902,9 +1904,6 @@ impl VfsRegistry {
         authority.check_live()?;
 
         let mut q = self.inner.lock();
-        if q.iter().any(|m| m.path == path) {
-            return Err(FsError::Busy);
-        }
         let handle: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
         q.push(Mount {
             path: alloc::string::String::from(path),
@@ -1946,9 +1945,7 @@ impl VfsRegistry {
             .ok_or(FsError::NotFound)?;
         let source_fs = source_mount.fs.clone();
         let rel = String::from(source[source_mount.path.len()..].trim_start_matches('/'));
-        if q.iter().any(|m| m.path == target) {
-            return Err(FsError::Busy);
-        }
+        // Overmount is allowed: a bind onto an occupied path stacks (see `mount`).
         drop(q);
         let mut root = source_fs.root();
         for component in rel.split('/').filter(|part| !part.is_empty()) {
@@ -2014,14 +2011,15 @@ impl VfsRegistry {
         handle.check_live()?;
 
         let mut q = self.inner.lock();
+        // Pop the TOPMOST mount at `path` (last pushed) and preserve the order
+        // of the rest: with stacking, `rposition` + `remove` reveal the mount
+        // directly below, matching Linux umount. `swap_remove` would reorder the
+        // vec and corrupt which stacked mount resolves as visible.
         let pos = q
             .iter()
-            .position(|m| m.path == path)
+            .rposition(|m| m.path == path)
             .ok_or(FsError::NotFound)?;
-        // Stage 3 doesn't track in-flight ops against a mount, so we
-        // pop the entry directly. Stage 4 needs a refcount drain
-        // (per spec §3.5) before the FS object goes away.
-        let m = q.swap_remove(pos);
+        let m = q.remove(pos);
         // Drop the FS Arc outside the lock to keep the critical
         // section short — important once page-cache eviction lands.
         drop(q);
@@ -2040,11 +2038,9 @@ impl VfsRegistry {
         let mut q = self.inner.lock();
         let index = q
             .iter()
-            .position(|m| m.path == source)
+            .rposition(|m| m.path == source)
             .ok_or(FsError::NotFound)?;
-        if q.iter().any(|m| m.path == target) {
-            return Err(FsError::Busy);
-        }
+        // Overmount is allowed: moving onto an occupied path stacks (see `mount`).
         q[index].path = String::from(target);
         Ok(())
     }
@@ -2062,7 +2058,8 @@ impl VfsRegistry {
     {
         let fs = {
             let q = self.inner.lock();
-            q.iter().find(|m| m.path == path).map(|m| m.fs.clone())
+            // Topmost (last-pushed) mount at `path`, matching resolve_absolute.
+            q.iter().rev().find(|m| m.path == path).map(|m| m.fs.clone())
         }?;
         Some(f(&*fs))
     }
@@ -2108,7 +2105,7 @@ impl VfsRegistry {
                     || m.path == "/"
                     || (abs.starts_with(m.path.as_str())
                         && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
-                if is_match && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
+                if is_match && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len() {
                     best = Some(m);
                 }
             }
@@ -2137,7 +2134,7 @@ impl VfsRegistry {
                 || m.path == "/"
                 || (abs.starts_with(m.path.as_str())
                     && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
-            if is_match && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
+            if is_match && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len() {
                 best = Some(m);
             }
         }
@@ -2206,7 +2203,7 @@ impl VfsRegistry {
                 if (parent_path == m.path
                     || (parent_path.starts_with(m.path.as_str())
                         && parent_path.as_bytes().get(m.path.len()) == Some(&b'/')))
-                    && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len()
+                    && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len()
                 {
                     best = Some(m);
                 }

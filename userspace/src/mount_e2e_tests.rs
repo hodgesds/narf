@@ -704,6 +704,84 @@ fn smoke_open_tree_move_mount() -> TestResult {
 }
 kernel_test_in!("userspace/mount", smoke_open_tree_move_mount);
 
+// ── Smoke 8b: move_mount onto an OCCUPIED path stacks, not EBUSY ───
+// systemd's ProtectHostname= sandbox clones /proc/sys/kernel/domainname with
+// open_tree(CLONE) and move_mount()s the read-only copy back over the live
+// one. NARF's registry rejected the overmount with EBUSY, so sys_move_mount
+// returned -16 and the whole service namespace setup failed with
+// 226/EXIT_NAMESPACE (udevd restart-loop, wedging the Fedora boot). With mount
+// stacking the overmount succeeds and leaves TWO entries at the target.
+// Linux ref: fs/namespace.c:do_move_mount (overmount allowed).
+fn smoke_move_mount_overmount_no_ebusy() -> TestResult {
+    let task: u64 = 0x71_20;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    let _ = unmount_for_test("/omm_src");
+    let _ = unmount_for_test("/omm_dst");
+    let _ = unmount_for_test("/omm_dst");
+
+    // A source to clone and an ALREADY-OCCUPIED destination.
+    let mut msrc = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/omm_src\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut msrc);
+    let mut mdst = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/omm_dst\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut mdst);
+    if !matches!(msrc.ret, Some(r) if r.value == 0) || !matches!(mdst.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("setup mounts failed");
+    }
+
+    const OPEN_TREE_CLONE: u64 = 0x0000_0001;
+    let mut otctx = StubCtx {
+        args: open_tree_args(0, b"/omm_src\0", OPEN_TREE_CLONE),
+        ret: None,
+    };
+    crate::mount_api::sys_open_tree(&mut otctx);
+    let tree_fd = match otctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) >= 0 => r.value,
+        _ => {
+            crate::fd::detach(task);
+            let _ = unmount_for_test("/omm_dst");
+            let _ = unmount_for_test("/omm_src");
+            return TestResult::Fail("open_tree(CLONE) did not return an fd");
+        }
+    };
+
+    // move_mount onto the OCCUPIED /omm_dst.
+    let mut mmctx = StubCtx {
+        args: move_mount_args(tree_fd, b"\0", 0, b"/omm_dst\0"),
+        ret: None,
+    };
+    crate::mount_api::sys_move_mount(&mut mmctx);
+    let ret = mmctx.ret.map(|r| r.value as i64);
+
+    // Two stacked entries at /omm_dst now (original + moved-over).
+    let count = narf_filesystem::registry()
+        .list()
+        .iter()
+        .filter(|p| p.as_str() == "/omm_dst")
+        .count();
+
+    crate::fd::detach(task);
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/omm_dst");
+    let _ = unmount_for_test("/omm_dst");
+    let _ = unmount_for_test("/omm_src");
+
+    if ret == Some(0) && count == 2 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("move_mount onto an occupied path must stack (ok + 2 entries), not EBUSY")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_move_mount_overmount_no_ebusy);
+
 // ── Smoke 9: chroot applied exactly once ───────────────────────────
 // apply_chroot must prefix the root exactly ONCE — a double-prefix
 // ("/jail9/jail9/...") was a real container bug. Also confirm the root
@@ -994,13 +1072,14 @@ fn smoke_move_mount_relocates() -> TestResult {
 }
 kernel_test_in!("userspace/mount", smoke_move_mount_relocates);
 
-// ── Smoke 14: pseudo-fs double-mount is idempotent (no stacking) ───
-// NARF has no mount stacking: re-mounting a tmpfs onto an already-mounted
-// target reports success (matching Linux, which stacks + succeeds) and
-// leaves exactly ONE registry entry for that path — it does not error and
-// does not create a duplicate. (A genuine EBUSY is unobservable through the
-// syscall here because the pseudo-fs arm swallows the registry Busy into
-// the documented idempotent success.)
+// ── Smoke 14: pseudo-fs double-mount is idempotent (single entry) ──
+// The registry supports mount stacking for real binds/overmounts (see
+// smoke_registry_overmount_stacks), but the sys_mount pseudo-fs arm
+// deliberately DEDUPS API filesystems: re-mounting a tmpfs onto an
+// already-mounted target short-circuits to success BEFORE reaching the
+// registry, so it reports ok and leaves exactly ONE entry for that path
+// (NARF's pseudo-fs are shared singletons; stacking identical views is
+// pointless). This runs the pseudo-fs arm, not the stacking path.
 // Linux ref: fs/namespace.c:do_new_mount (repeated API-fs mount).
 fn smoke_double_mount_idempotent() -> TestResult {
     set_task(0x71_0f);
