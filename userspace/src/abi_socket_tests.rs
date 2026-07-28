@@ -1392,6 +1392,128 @@ kernel_test_in!(
     smoke_abi_socket_abstract_dgram_epollet_drain_refill
 );
 
+/// The exact sd_notify(READY=1) → PID 1 shape end-to-end: a PATH-bound AF_UNIX
+/// SOCK_DGRAM notify socket ($NOTIFY_SOCKET = /run/systemd/notify) with
+/// SO_PASSCRED, waited on via epoll. A service sends a PLAIN datagram (a normal
+/// notify has send_ucred=false, so it attaches NO SCM_CREDENTIALS — the KERNEL
+/// must stamp the sender's credentials on the SO_PASSCRED receiver). PID 1's
+/// epoll_wait must wake, and recvmsg must deliver the payload plus an
+/// SCM_CREDENTIALS cmsg naming the sender; otherwise the Type=notify unit never
+/// sees READY and times out. Abstract-name delivery is covered above; this pins
+/// the PATH-bound (UNIX_DGRAM_BOUND) path systemd actually uses.
+fn smoke_abi_socket_notify_path_dgram_epoll_scm() -> TestResult {
+    with_setup(|| {
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"/notify-e2e.sock");
+        if call(Syscall::SocketBind.raw(), a2(rx, addr.as_ptr() as u64, alen)).ok_or("bind status")?
+            != 0
+        {
+            return Err("bind() of the PATH notify datagram socket failed");
+        }
+        // PID 1 sets SO_PASSCRED so the kernel attaches sender creds on recvmsg.
+        let on = 1u32.to_ne_bytes();
+        call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: rx,
+                arg1: SOL_SOCKET,
+                arg2: SO_PASSCRED,
+                arg3: on.as_ptr() as u64,
+                arg4: on.len() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("setsockopt status")?;
+
+        let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+        if epfd < 0 {
+            return Err("epoll_create failed");
+        }
+        let mut interest = [0u8; 12];
+        interest[..4].copy_from_slice(&1u32.to_ne_bytes()); // EPOLLIN
+        interest[4..].copy_from_slice(&0xABCDu64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd as u64, 1, rx, interest.as_ptr() as u64),
+        )
+        .ok_or("epoll_ctl status")?
+            != 0
+        {
+            return Err("epoll_ctl ADD of notify fd failed");
+        }
+
+        // Service sends a plain READY=1 datagram (no control message).
+        let tx = open_unix(SOCK_DGRAM)?;
+        let payload = b"READY=1\n";
+        let sent = call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: tx,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg4: addr.as_ptr() as u64,
+                arg5: alen,
+                ..SyscallArgs::default()
+            },
+        )
+        .ok_or("sendto status")?;
+        if sent != payload.len() as i64 {
+            return Err("sendto() of READY=1 to the notify path failed");
+        }
+
+        // PID 1's epoll_wait must report the notify fd readable.
+        let mut out = [0u8; 12];
+        let ready = call(
+            Syscall::EpollWait.raw(),
+            a3(epfd as u64, out.as_mut_ptr() as u64, 1, 0),
+        )
+        .ok_or("epoll_wait status")?;
+        if ready != 1 {
+            return Err("epoll_wait did not wake on the PATH notify datagram (READY lost)");
+        }
+
+        // recvmsg delivers the payload + an SCM_CREDENTIALS cmsg for the sender.
+        let mut dst = [0u8; 32];
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 64];
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        let n = call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(rx, msg.as_ptr() as u64, 0),
+        )
+        .ok_or("recvmsg status")?;
+        if n != payload.len() as i64 || &dst[..payload.len()] != payload {
+            return Err("recvmsg did not deliver the READY=1 payload");
+        }
+        let ctrllen = u64::from_ne_bytes([
+            msg[40], msg[41], msg[42], msg[43], msg[44], msg[45], msg[46], msg[47],
+        ]) as usize;
+        if ctrllen < 16 + 12 {
+            return Err("recvmsg did not attach SCM_CREDENTIALS for a plain notify datagram");
+        }
+        let ctype = i32::from_le_bytes([ctrl[12], ctrl[13], ctrl[14], ctrl[15]]);
+        if ctype != SCM_CREDENTIALS {
+            return Err("notify cmsg was not SCM_CREDENTIALS");
+        }
+        let cred_pid = u32::from_le_bytes([ctrl[16], ctrl[17], ctrl[18], ctrl[19]]);
+        let my_pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u32;
+        if cred_pid != my_pid {
+            return Err("notify SCM_CREDENTIALS pid did not name the sender");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_notify_path_dgram_epoll_scm
+);
+
 /// connect()/sendto to an unbound abstract name is ECONNREFUSED (-111),
 /// never the bare -1 sentinel.
 fn smoke_abi_socket_abstract_dgram_refused() -> TestResult {
@@ -1661,6 +1783,144 @@ fn smoke_abi_socket_recvmsg_scm_credentials() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_socket_recvmsg_scm_credentials
+);
+
+/// The exact shape of PID 1's `$NOTIFY_SOCKET`: a bound PATH AF_UNIX/SOCK_DGRAM
+/// socket with SO_PASSCRED, watched via LEVEL-TRIGGERED EPOLLIN
+/// (`sd_event_add_io(..., EPOLLIN, manager_dispatch_notify_fd)`). A datagram
+/// delivered from another socket — a service's `sd_notify(READY=1)` — must
+/// (a) make `epoll_wait` report EPOLLIN (the wake systemd's event loop blocks
+/// on) and (b) `recvmsg` with an SCM_CREDENTIALS cmsg naming the sender. If a
+/// bound-dgram delivery does not surface EPOLLIN, PID 1 never reads READY=1 and
+/// every Type=notify service (systemd-udevd, systemd-userdbd, dbus-broker,
+/// logind, …) times out.
+fn smoke_abi_socket_notify_path_dgram_epollin_deliver() -> TestResult {
+    with_setup(|| {
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"/run/systemd/notify-test");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind() to the notify path failed");
+        }
+        // SO_PASSCRED, exactly as PID 1 sets it.
+        let on = 1u32.to_ne_bytes();
+        call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: rx,
+                arg1: SOL_SOCKET,
+                arg2: SO_PASSCRED,
+                arg3: on.as_ptr() as u64,
+                arg4: on.len() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("setsockopt status")?;
+
+        // Level-triggered EPOLLIN (NO EPOLLET) — how sd_event watches the fd.
+        let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+        if epfd < 0 {
+            return Err("epoll_create failed");
+        }
+        let mut interest = [0u8; 12];
+        interest[..4].copy_from_slice(&1u32.to_ne_bytes()); // EPOLLIN
+        interest[4..].copy_from_slice(&0x4E4F_5449_4659u64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd as u64, 1, rx, interest.as_ptr() as u64),
+        )
+        .ok_or("epoll_ctl status")?
+            != 0
+        {
+            return Err("epoll_ctl ADD EPOLLIN failed");
+        }
+        // Nothing delivered yet → epoll_wait(timeout 0) reports no events.
+        let mut evt = [0u8; 12];
+        if call(
+            Syscall::EpollWait.raw(),
+            a3(epfd as u64, evt.as_mut_ptr() as u64, 1, 0),
+        )
+        .ok_or("epoll_wait status")?
+            != 0
+        {
+            return Err("empty notify socket must not report EPOLLIN");
+        }
+
+        // A service delivers sd_notify(READY=1) from its own datagram socket.
+        let tx = open_unix(SOCK_DGRAM)?;
+        let payload = b"READY=1\n";
+        let sent = call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: tx,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg4: addr.as_ptr() as u64,
+                arg5: alen,
+                ..SyscallArgs::default()
+            },
+        )
+        .ok_or("send status")?;
+        if sent != payload.len() as i64 {
+            return Err("sendto() to the notify path failed");
+        }
+
+        // epoll must now report EPOLLIN — the exact wake PID 1's sd_event needs.
+        if call(
+            Syscall::EpollWait.raw(),
+            a3(epfd as u64, evt.as_mut_ptr() as u64, 1, 0),
+        )
+        .ok_or("epoll_wait status")?
+            != 1
+        {
+            return Err("delivered notify datagram must report EPOLLIN to epoll");
+        }
+
+        // recvmsg it, with an SCM_CREDENTIALS cmsg naming the sender.
+        let mut dst = [0u8; 16];
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 64];
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        let n = call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(rx, msg.as_ptr() as u64, 0),
+        )
+        .ok_or("recvmsg status")?;
+        if n != payload.len() as i64 || &dst[..payload.len()] != payload {
+            return Err("recvmsg did not return the READY=1 datagram");
+        }
+        let ctrllen = u64::from_ne_bytes([
+            msg[40], msg[41], msg[42], msg[43], msg[44], msg[45], msg[46], msg[47],
+        ]) as usize;
+        if ctrllen < 16 + 12 {
+            return Err("notify recvmsg did not attach SCM_CREDENTIALS");
+        }
+        let ctype = i32::from_le_bytes([ctrl[12], ctrl[13], ctrl[14], ctrl[15]]);
+        if ctype != SCM_CREDENTIALS {
+            return Err("notify cmsg was not SCM_CREDENTIALS");
+        }
+        let cred_pid = u32::from_le_bytes([ctrl[16], ctrl[17], ctrl[18], ctrl[19]]);
+        let my_pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u32;
+        if cred_pid != my_pid {
+            return Err("notify SCM_CREDENTIALS pid did not name the sender");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_notify_path_dgram_epollin_deliver
 );
 
 /// SCM_RIGHTS: sendmsg an fd over one socketpair half, recvmsg the other
