@@ -899,6 +899,89 @@ kernel_test_in!(
     smoke_sandbox_root_swap_deep_path_resolves
 );
 
+// ── Smoke 5e: execve resolves the binary via the PRIVATE namespace ─
+// A systemd service sandbox unshare(CLONE_NEWNS)s and binds its rootfs into a
+// private mount before pivot_root, so the service binary is reachable ONLY via
+// the task's private mount table. execve must resolve namespace-aware (like the
+// O_PATH open in find_executable does) — resolving against the GLOBAL registry
+// makes a pivoted service's binary invisible → ENOENT → 203/EXIT_EXEC. Mount a
+// (bogus) binary ONLY in the private namespace and assert execve does NOT
+// return ENOENT: it resolves the bytes, then fails ELF validation with a
+// different error. Global-registry resolution would return ENOENT here.
+#[cfg(feature = "container")]
+fn smoke_execve_resolves_private_ns_binary() -> TestResult {
+    let task: u64 = 0x71_0e;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    // unshare(CLONE_NEWNS): private mount table.
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    let mut uctx = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut uctx);
+    if !matches!(uctx.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("unshare(CLONE_NEWNS) failed");
+    }
+
+    // A memfs holding a non-ELF "binary", mounted ONLY in the private ns.
+    // Non-ELF bytes (no \x7fELF magic) so execve rejects at validation without
+    // building a user context.
+    let junk = [0xAAu8; 128];
+    let fs: Arc<dyn narf_filesystem::FsInstance> = Arc::new(narf_filesystem::MemFs::with_seeds(
+        "pxprog",
+        &[("prog", &junk)],
+    ));
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    if crate::handlers::current_mount_arc(&auth, "/pxns_bin", fs).is_err() {
+        crate::handlers::clear_current_mount_namespace_for_test();
+        return TestResult::Fail("private mount of /pxns_bin failed");
+    }
+
+    // Sanity: the path is NOT visible in the global registry.
+    let global_has = narf_filesystem::registry()
+        .list()
+        .iter()
+        .any(|p| p == "/pxns_bin");
+
+    // execve("/pxns_bin/prog", ["prog"], []).
+    let path = b"/pxns_bin/prog\0";
+    let arg0 = b"prog\0";
+    let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
+    let envp: [u64; 1] = [0];
+    let mut ectx = StubCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: argv.as_ptr() as u64,
+            arg2: envp.as_ptr() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::handlers::sys_execve(&mut ectx);
+    // ENOENT (-2) means execve could NOT resolve the private-ns binary.
+    let is_enoent = matches!(ectx.ret, Some(r) if (r.value as i64) == -2);
+
+    crate::handlers::clear_current_mount_namespace_for_test();
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+
+    if global_has {
+        return TestResult::Fail("private mount leaked into global registry");
+    }
+    if is_enoent {
+        return TestResult::Fail(
+            "execve resolved binary via global registry, not private ns (ENOENT)",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace/mount", smoke_execve_resolves_private_ns_binary);
+
 // ── Smoke 6: pivot_root to a missing new_root fails ────────────────
 // pivot_root must reject a new_root that doesn't exist under the prior
 // root (returns -1); the task's root_dir must be left untouched.

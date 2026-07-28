@@ -8896,7 +8896,16 @@ fn do_execve_resolved(
     // "can't execute: Invalid argument" even though it existed.
     let read_exec = |p: &str| -> Result<alloc::vec::Vec<u8>, i64> {
         let ep = apply_chroot(p);
-        let ops = match narf_filesystem::registry().resolve_absolute(&ep, |fs, rel| {
+        // Resolve through the caller's PRIVATE mount namespace, not the global
+        // registry: a systemd service sandbox unshare(NEWNS)s, recursively binds
+        // its rootfs onto /run/systemd/mount-rootfs, and pivot_roots into it, so
+        // the binary is reachable ONLY via that task's private mount table. The
+        // O_PATH open in find_executable already resolves namespace-aware
+        // (current_resolve_absolute); execve must match, or a pivoted service's
+        // binary (e.g. systemd-udevd → ../../bin/udevadm) is invisible → ENOENT
+        // → 203/EXIT_EXEC. (Global resolution only worked while a pivot_root bug
+        // leaked the bind into the global registry.)
+        let ops = match current_resolve_absolute(&ep, |fs, rel| {
             poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
         }) {
             Some(Some(Ok(o))) => o,
