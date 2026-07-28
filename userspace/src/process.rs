@@ -901,15 +901,21 @@ fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
 /// is empty, the read exceeds 64 MiB (defensive cap — a sane ld-musl
 /// is <200 KiB), or any read short-circuits with `FsError`.
 #[cfg(feature = "linux-compat")]
-fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
-    use narf_filesystem::{registry, resolve_async};
+pub(crate) fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
+    use narf_filesystem::resolve_async;
 
-    // 1. Walk the VFS to a FileOps for `abs_path`.
-    let file = registry()
-        .resolve_absolute(abs_path, |fs, rel| {
-            poll_blocking(resolve_async(fs.root(), rel)).and_then(|r| r.ok())
-        })
-        .flatten()?;
+    // 1. Walk the VFS to a FileOps for `abs_path`, through the CALLER'S mount
+    //    namespace — not the global registry. This slurps the ELF interpreter
+    //    (ld.so) during execve; a systemd service sandbox unshare(NEWNS)s and
+    //    pivot_roots into a privately-bound rootfs, so /lib64/ld-linux-*.so.2 is
+    //    reachable ONLY via the task's private mount table. Resolving globally
+    //    returned None → the dynamic PIE loaded with NO interpreter → the entry
+    //    fell to the load bias and the process jumped to a null/uninitialised
+    //    RIP (#PF faultva=0 rip=0, SIGSEGV) before executing a single syscall.
+    let file = crate::handlers::current_resolve_absolute(abs_path, |fs, rel| {
+        poll_blocking(resolve_async(fs.root(), rel)).and_then(|r| r.ok())
+    })
+    .flatten()?;
 
     // 2. stat() to size the read; cap at 64 MiB.
     const MAX_INTERP_BYTES: u64 = 64 * 1024 * 1024;

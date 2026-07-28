@@ -982,6 +982,69 @@ fn smoke_execve_resolves_private_ns_binary() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("userspace/mount", smoke_execve_resolves_private_ns_binary);
 
+// ── Smoke 5f: the ELF-interpreter read resolves via the private ns ─
+// execve loads a dynamic binary's interpreter (ld.so) via read_path_from_vfs.
+// A pivoted service sandbox reaches /lib64/ld-linux-*.so.2 ONLY through its
+// private mount namespace; a global-registry read returns None → the PIE loads
+// with no interpreter → it jumps to a null entry (#PF faultva=0 rip=0, SIGSEGV)
+// before any syscall. Assert the interpreter read sees a file mounted only in
+// the private namespace.
+#[cfg(feature = "container")]
+fn smoke_interp_read_uses_private_ns() -> TestResult {
+    let task: u64 = 0x71_0f;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    let mut uctx = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut uctx);
+    if !matches!(uctx.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("unshare(CLONE_NEWNS) failed");
+    }
+
+    // A memfs "ld.so" mounted ONLY in the private namespace.
+    let payload = b"\x7fELF-fake-interpreter-bytes";
+    let fs: Arc<dyn narf_filesystem::FsInstance> = Arc::new(narf_filesystem::MemFs::with_seeds(
+        "pxld",
+        &[("ld.so", payload.as_slice())],
+    ));
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    if crate::handlers::current_mount_arc(&auth, "/pxinterp", fs).is_err() {
+        crate::handlers::clear_current_mount_namespace_for_test();
+        return TestResult::Fail("private mount of /pxinterp failed");
+    }
+
+    // Global read must miss; namespace-aware read must hit.
+    let global_hit = narf_filesystem::registry()
+        .resolve_absolute("/pxinterp/ld.so", |fs, rel| {
+            crate::handlers::poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
+                .and_then(|r| r.ok())
+        })
+        .flatten()
+        .is_some();
+    let ns_read = crate::process::read_path_from_vfs("/pxinterp/ld.so");
+
+    crate::handlers::clear_current_mount_namespace_for_test();
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+
+    if global_hit {
+        return TestResult::Fail("interpreter leaked into global registry");
+    }
+    match ns_read {
+        Some(bytes) if bytes == payload => TestResult::Pass,
+        Some(_) => TestResult::Fail("interpreter read returned wrong bytes"),
+        None => TestResult::Fail("interpreter read missed the private-ns file"),
+    }
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace/mount", smoke_interp_read_uses_private_ns);
+
 // ── Smoke 6: pivot_root to a missing new_root fails ────────────────
 // pivot_root must reject a new_root that doesn't exist under the prior
 // root (returns -1); the task's root_dir must be left untouched.
