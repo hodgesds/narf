@@ -481,6 +481,38 @@ fn smoke_abi_path_statx_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_statx_neg);
 
+// statx(2) must populate STATX_MNT_ID (mount id of the file's mount). systemd's
+// fds_inode_and_mount_same/path_is_root_at compare stx_mnt_id to tell a
+// bind/pivoted root from the real root; when statx omits STATX_MNT_ID,
+// statx_mount_same() returns -ENODATA and a service's mount-namespace setup
+// (e.g. systemd-udevd with PrivateMounts=yes) fails 226/EXIT_NAMESPACE and
+// restart-loops, wedging boot before dbus.
+fn smoke_abi_path_statx_reports_mnt_id() -> TestResult {
+    const STATX_MNT_ID: u32 = 0x1000;
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        let path = b"/p/f\0";
+        let mut buf = [0u8; 256];
+        let args = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: 0,
+            arg3: STATX_MNT_ID as u64, // request the mount id
+            arg4: buf.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Statx.raw(), args) != Some(0) {
+            return Err("statx(existing) should return 0");
+        }
+        // stx_mask is the first u32 of struct statx.
+        let mask = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if mask & STATX_MNT_ID == 0 {
+            return Err("statx must advertise STATX_MNT_ID in stx_mask");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_statx_reports_mnt_id);
+
 // ── lstat: Linux (path_ptr NUL-term, statbuf) → 0 / -1 ──
 
 fn smoke_abi_path_lstat_pos() -> TestResult {
@@ -630,6 +662,46 @@ fn smoke_abi_path_mknodat_fifo_honors_mode() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_mknodat_fifo_honors_mode);
+
+// open(2) O_PATH on a FIFO must NOT apply fifo(7) peer-rendezvous: an O_PATH
+// open resolves the inode without invoking any file operation, so it returns a
+// path-reference fd immediately even with no writer present and no O_NONBLOCK.
+// systemd-tmpfiles walks /dev with openat(…, O_NOFOLLOW|O_CLOEXEC|O_PATH) to
+// stat/chmod each node it creates; before O_PATH short-circuited the FIFO
+// rendezvous, that open PARKED forever on a writer that never came and
+// systemd-tmpfiles-setup-dev.service never finished (the whole boot wedged
+// before dbus). A plain O_RDONLY open of the same writerless FIFO would still
+// block — which is exactly why the O_PATH form must not.
+fn smoke_abi_path_open_opath_fifo_no_block() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"x")], || {
+        const S_IFIFO: u64 = 0o010000;
+        const O_NOFOLLOW: u64 = 0o400000;
+        const O_PATH: u64 = 0o10000000;
+        const O_CLOEXEC: u64 = 0o2000000;
+        let path = b"/p/opath.fifo\0";
+        if call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, S_IFIFO | 0o600, 0),
+        ) != Some(0)
+        {
+            return Err("mknodat(FIFO) at a fresh path should return 0");
+        }
+        // No writer, no O_NONBLOCK: only O_PATH keeps this from parking.
+        match call(
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                path.as_ptr() as u64,
+                O_PATH | O_NOFOLLOW | O_CLOEXEC,
+                0,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("openat(FIFO, O_PATH) must return a fd without blocking on a writer"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_open_opath_fifo_no_block);
 
 fn smoke_abi_path_mknodat_eexist() -> TestResult {
     with_memfs("/p", "p", &[("f", b"x")], || {
@@ -1540,3 +1612,249 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_path_linkat_proc_fd_materialises_tmpfile
 );
+
+// ── statx STATX_MNT_ID / inode / type discipline ────────────────────
+//
+// `struct statx` field byte offsets (verified against the `Statx`
+// definition in handlers/mod.rs — repr(C), size 256):
+//   stx_mask   u32 @ 0
+//   stx_mode   u16 @ 28
+//   stx_ino    u64 @ 32
+//   stx_size   u64 @ 40
+//   stx_mnt_id u64 @ 144
+// (statx's stx_mode is at 28, NOT 24 — offset 24 is `struct stat`'s
+// st_mode.)
+const STATX_MASK_OFF: usize = 0;
+const STATX_MODE_OFF: usize = 28;
+const STATX_INO_OFF: usize = 32;
+const STATX_SIZE_OFF: usize = 40;
+const STATX_MNT_ID_OFF: usize = 144;
+const STATX_MNT_ID_BIT: u32 = 0x1000;
+const AT_EMPTY_PATH_FLAG: u64 = 0x1000;
+const AT_SYMLINK_NOFOLLOW_FLAG: u64 = 0x100;
+const S_IFMT: u32 = 0o170000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFREG: u32 = 0o100000;
+const S_IFLNK: u32 = 0o120000;
+
+/// statx(dirfd, path, flags, mask, buf) into a 256-byte statx buffer.
+fn do_statx(dirfd: u64, path_ptr: u64, flags: u64, mask: u64, buf: &mut [u8; 256]) -> Option<i64> {
+    call(
+        Syscall::Statx.raw(),
+        SyscallArgs {
+            arg0: dirfd,
+            arg1: path_ptr,
+            arg2: flags,
+            arg3: mask,
+            arg4: buf.as_mut_ptr() as u64,
+            ..Default::default()
+        },
+    )
+}
+
+fn statx_u32(buf: &[u8; 256], off: usize) -> u32 {
+    u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap())
+}
+fn statx_u16(buf: &[u8; 256], off: usize) -> u16 {
+    u16::from_ne_bytes(buf[off..off + 2].try_into().unwrap())
+}
+fn statx_u64(buf: &[u8; 256], off: usize) -> u64 {
+    u64::from_ne_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+// Files on DIFFERENT mounts advertise DIFFERENT stx_mnt_id values.
+// systemd's statx_mount_same / path_is_root_at compare stx_mnt_id to tell
+// a bind/pivoted root from the real root; two independent mounts sharing a
+// mount id (or omitting STATX_MNT_ID) would make those comparisons alias
+// and mis-detect the root. Mount two separate MemFs and confirm the mount
+// ids of a file on each differ, with STATX_MNT_ID set on both.
+fn smoke_abi_path_statx_cross_mount_mnt_id_differs() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        // A second, independent MemFs mounted by hand (with_memfs owns its
+        // own setup/teardown and so can't nest).
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let other = MemFs::with_seeds("q", &[("g", b"bye" as &[u8])]);
+        let handle = match registry().mount(&auth, "/q", other) {
+            Ok(h) => h,
+            Err(_) => return Err("mounting the second memfs at /q failed"),
+        };
+        let run = || -> Result<(), &'static str> {
+            let pa = b"/p/f\0";
+            let pb = b"/q/g\0";
+            let mut ba = [0u8; 256];
+            let mut bb = [0u8; 256];
+            if do_statx(
+                AT_FDCWD,
+                pa.as_ptr() as u64,
+                0,
+                STATX_MNT_ID_BIT as u64,
+                &mut ba,
+            ) != Some(0)
+            {
+                return Err("statx(/p/f) should return 0");
+            }
+            if do_statx(
+                AT_FDCWD,
+                pb.as_ptr() as u64,
+                0,
+                STATX_MNT_ID_BIT as u64,
+                &mut bb,
+            ) != Some(0)
+            {
+                return Err("statx(/q/g) should return 0");
+            }
+            let mask_a = statx_u32(&ba, STATX_MASK_OFF);
+            let mask_b = statx_u32(&bb, STATX_MASK_OFF);
+            if mask_a & STATX_MNT_ID_BIT == 0 || mask_b & STATX_MNT_ID_BIT == 0 {
+                return Err("statx on both mounts must advertise STATX_MNT_ID in stx_mask");
+            }
+            let id_a = statx_u64(&ba, STATX_MNT_ID_OFF);
+            let id_b = statx_u64(&bb, STATX_MNT_ID_OFF);
+            if id_a == id_b {
+                return Err("files on two different mounts must have different stx_mnt_id");
+            }
+            Ok(())
+        };
+        let outcome = run();
+        let _ = registry().unmount(&handle, "/q");
+        outcome
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_path_statx_cross_mount_mnt_id_differs
+);
+
+// A directory and a file beneath it must have DISTINCT inodes, and their
+// S_IFMT bits must be S_IFDIR vs S_IFREG respectively. systemd's rm_rf
+// root-guard (rm_rf_children_inner) aborts if a directory and one of its
+// entries report the same st_ino — a symptom of a filesystem confusing a
+// dir with its parent — so a dir/file ino collision would make rm_rf bail.
+fn smoke_abi_path_statx_dir_vs_file_ino_and_type() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"payload")], || {
+        // Create a directory under the mount, then statx both it and the
+        // seeded regular file /p/f.
+        let dir = b"/p/d\0";
+        if call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0o755, 0),
+        ) != Some(0)
+        {
+            return Err("mkdirat(/p/d) should return 0");
+        }
+        let file = b"/p/f\0";
+        let mut bd = [0u8; 256];
+        let mut bf = [0u8; 256];
+        if do_statx(AT_FDCWD, dir.as_ptr() as u64, 0, 0, &mut bd) != Some(0) {
+            return Err("statx(/p/d) should return 0");
+        }
+        if do_statx(AT_FDCWD, file.as_ptr() as u64, 0, 0, &mut bf) != Some(0) {
+            return Err("statx(/p/f) should return 0");
+        }
+        let dir_mode = statx_u16(&bd, STATX_MODE_OFF) as u32;
+        let file_mode = statx_u16(&bf, STATX_MODE_OFF) as u32;
+        if dir_mode & S_IFMT != S_IFDIR {
+            return Err("the directory's stx_mode S_IFMT bits must be S_IFDIR");
+        }
+        if file_mode & S_IFMT != S_IFREG {
+            return Err("the file's stx_mode S_IFMT bits must be S_IFREG");
+        }
+        let dir_ino = statx_u64(&bd, STATX_INO_OFF);
+        let file_ino = statx_u64(&bf, STATX_INO_OFF);
+        if dir_ino == file_ino {
+            return Err("a directory and a file under it must have distinct stx_ino");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_statx_dir_vs_file_ino_and_type);
+
+// statx(fd, "", AT_EMPTY_PATH, …) describes the OPEN FD's file: it must
+// return 0, report S_IFREG with the right size, and still advertise
+// STATX_MNT_ID (the mount the fd resides on — from mqueue::fd_mount_id).
+// systemd's path_is_root_at fstats a dir fd with AT_EMPTY_PATH and compares
+// its stx_mnt_id against the parent's, so the fd form must carry it too.
+fn smoke_abi_path_statx_at_empty_path_fd() -> TestResult {
+    const PAYLOAD: &[u8] = b"empty-path-target";
+    with_memfs("/p", "p", &[("f", PAYLOAD)], || {
+        let path = b"/p/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(/p/f) should return a fd"),
+        };
+        let empty = b"\0";
+        let mut buf = [0u8; 256];
+        let r = do_statx(
+            fd,
+            empty.as_ptr() as u64,
+            AT_EMPTY_PATH_FLAG,
+            STATX_MNT_ID_BIT as u64,
+            &mut buf,
+        );
+        let _ = call(Syscall::Close.raw(), a3(fd, 0, 0, 0));
+        if r != Some(0) {
+            return Err("statx(fd, \"\", AT_EMPTY_PATH) should return 0");
+        }
+        let mode = statx_u16(&buf, STATX_MODE_OFF) as u32;
+        if mode & S_IFMT != S_IFREG {
+            return Err("statx AT_EMPTY_PATH on a file fd must report S_IFREG");
+        }
+        let size = statx_u64(&buf, STATX_SIZE_OFF);
+        if size != PAYLOAD.len() as u64 {
+            return Err("statx AT_EMPTY_PATH must report the file's real size");
+        }
+        let mask = statx_u32(&buf, STATX_MASK_OFF);
+        if mask & STATX_MNT_ID_BIT == 0 {
+            return Err("statx AT_EMPTY_PATH (fd form) must advertise STATX_MNT_ID");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_statx_at_empty_path_fd);
+
+// AT_SYMLINK_NOFOLLOW gives lstat semantics: statx of a symlink WITH the
+// flag describes the LINK node (S_IFLNK), while statx WITHOUT it follows to
+// the target regular file (S_IFREG). systemd's chase() walks each component
+// with statx(dir_fd, name, AT_SYMLINK_NOFOLLOW, STATX_TYPE) and must see the
+// link itself to readlink it; a follow there would resolve past the link.
+fn smoke_abi_path_statx_nofollow_reports_link() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"target-bytes")], || {
+        // /p/lnk -> f (relative target within the mount).
+        let target = b"f\0";
+        let link = b"/p/lnk\0";
+        if call_symlink(target.as_ptr() as u64, link.as_ptr() as u64).unwrap_or(-1) != 0 {
+            return Err("symlink(/p/lnk -> f) creation failed");
+        }
+        let p = b"/p/lnk\0";
+        // With AT_SYMLINK_NOFOLLOW → the link node itself (S_IFLNK).
+        let mut bl = [0u8; 256];
+        if do_statx(
+            AT_FDCWD,
+            p.as_ptr() as u64,
+            AT_SYMLINK_NOFOLLOW_FLAG,
+            0,
+            &mut bl,
+        ) != Some(0)
+        {
+            return Err("statx(link, AT_SYMLINK_NOFOLLOW) should return 0");
+        }
+        let lmode = statx_u16(&bl, STATX_MODE_OFF) as u32;
+        if lmode & S_IFMT != S_IFLNK {
+            return Err("statx(AT_SYMLINK_NOFOLLOW) on a symlink must report S_IFLNK");
+        }
+        // Without the flag → follow to the target regular file (S_IFREG).
+        let mut bt = [0u8; 256];
+        if do_statx(AT_FDCWD, p.as_ptr() as u64, 0, 0, &mut bt) != Some(0) {
+            return Err("statx(link) following the symlink should return 0");
+        }
+        let tmode = statx_u16(&bt, STATX_MODE_OFF) as u32;
+        if tmode & S_IFMT != S_IFREG {
+            return Err("statx(link) without NOFOLLOW must follow to the S_IFREG target");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_statx_nofollow_reports_link);

@@ -55,6 +55,11 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     } else {
         narf_filesystem::registry().unmount(&handle, target.as_str())
     };
+    // Linux `umount2(2)` reports failure (EINVAL for "not a mount point",
+    // ENOENT for a missing path) rather than silently succeeding — swallowing
+    // the error hid real unmount failures and broke conformance. A real mount
+    // (including the old root systemd detaches after pivot_root) unmounts and
+    // returns 0; a non-mount path returns the -1 sentinel.
     match result {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(_) => ctx.set_return(fail),

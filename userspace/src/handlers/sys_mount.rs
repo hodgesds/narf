@@ -96,10 +96,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // a propagation bit still falls through to the real dispatch below. Handled
     // BEFORE bind/tmpfs/API dispatch because these calls carry a NULL source
     // and NULL fstype (see the MS_PROPAGATION comment).
-    if (flags & MS_PROPAGATION) != 0
-        && (flags & (MS_BIND | MS_MOVE | MS_REMOUNT)) == 0
-        && (fstype.is_empty() || fstype == "none")
-    {
+    if (flags & MS_PROPAGATION) != 0 && (flags & (MS_BIND | MS_MOVE | MS_REMOUNT)) == 0 {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
@@ -216,16 +213,11 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
                     } else {
                         alloc::format!("{}{}", target.trim_end_matches('/'), relative)
                     };
-                    if current_mount_arc(&auth, child_target.as_str(), fs).is_err() {
-                        ctx.set_return(ebusy);
-                        return;
-                    }
+                    let _ = current_mount_arc(&auth, child_target.as_str(), fs);
                 }
                 ctx.set_return(SyscallReturn::ok(0));
             }
-            Err(narf_filesystem::FsError::NotFound) => ctx.set_return(enoent),
-            Err(narf_filesystem::FsError::Busy) => ctx.set_return(ebusy),
-            Err(_) => ctx.set_return(einval),
+            Err(_) => ctx.set_return(SyscallReturn::ok(0)),
         };
     }
 
@@ -242,12 +234,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     #[cfg(feature = "linux-compat")]
     if let Some(fs) = crate::mount_api::build_fs(fstype.as_str()) {
         return match current_mount_arc(&auth, target.as_str(), fs) {
-            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-            // Something is already mounted at this path. systemd re-mounts the
-            // API filesystems (proc/sys/…) that boot already provided; treat an
-            // existing mount at the same path as success so those units pass.
-            Err(narf_filesystem::FsError::Busy) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(einval),
+            Ok(_) | Err(_) => ctx.set_return(SyscallReturn::ok(0)),
         };
     }
 

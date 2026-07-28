@@ -1764,13 +1764,26 @@ impl FileOps for SocketFile {
             SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => {
                 (self.dgram_readable_token.load(Ordering::Acquire), 0)
             }
-            SocketState::NetlinkUevent { .. }
-            | SocketState::NetlinkRoute { .. }
-            | SocketState::NetlinkGeneric { .. }
-            | SocketState::NetlinkSockDiag { .. }
-            | SocketState::NetlinkNetfilter { .. }
-            | SocketState::NetlinkAudit { .. }
-            | SocketState::NetlinkSink => (self.netlink_readable_token.load(Ordering::Acquire), 0),
+            SocketState::NetlinkUevent { reader } => {
+                let rx_tok = if reader.has_pending() {
+                    narf_filesystem::uevent_current_seqnum()
+                } else {
+                    0
+                };
+                (rx_tok, 0)
+            }
+            SocketState::NetlinkRoute { replies }
+            | SocketState::NetlinkGeneric { replies }
+            | SocketState::NetlinkSockDiag { replies }
+            | SocketState::NetlinkNetfilter { replies }
+            | SocketState::NetlinkAudit { replies } => {
+                let rx_tok = if !replies.is_empty() {
+                    self.netlink_readable_token.load(Ordering::Acquire)
+                } else {
+                    0
+                };
+                (rx_tok, 0)
+            }
             _ => (0, 0),
         }
     }
@@ -3626,13 +3639,10 @@ impl SocketFile {
                 };
                 let mut ds = dest_sock.state.lock();
                 if let SocketState::InetDgram { inbox, .. } = &mut *ds {
-                    let was_empty = inbox.is_empty();
                     inbox.push_back(pkt);
-                    if was_empty {
-                        dest_sock
-                            .dgram_readable_token
-                            .fetch_add(1, Ordering::Release);
-                    }
+                    dest_sock
+                        .dgram_readable_token
+                        .fetch_add(1, Ordering::Release);
                     SocketOpResult::Ok(buf.len() as u64)
                 } else {
                     SocketOpResult::Ok(buf.len() as u64) // dropped
@@ -3820,13 +3830,10 @@ impl SocketFile {
                 };
                 let mut ds = dest_sock.state.lock();
                 if let SocketState::UnixDgram { inbox, .. } = &mut *ds {
-                    let was_empty = inbox.is_empty();
                     inbox.push_back(pkt);
-                    if was_empty {
-                        dest_sock
-                            .dgram_readable_token
-                            .fetch_add(1, Ordering::Release);
-                    }
+                    dest_sock
+                        .dgram_readable_token
+                        .fetch_add(1, Ordering::Release);
                 }
                 drop(ds);
                 // Wake a receiver parked in recv/recvmsg/poll on the dest —
@@ -4350,7 +4357,6 @@ impl RingBuf {
 
     fn write_packet_with_fds(&self, src: &[u8], fds: Vec<Arc<dyn FileOps>>, cred: Ucred) -> usize {
         let mut g = self.inner.lock();
-        let was_readable = g.len > 0 || !g.packets.is_empty();
         if src.len() > RING_CAP.saturating_sub(g.packet_bytes) {
             return 0;
         }
@@ -4360,11 +4366,8 @@ impl RingBuf {
             cred,
         });
         g.packet_bytes += src.len();
-        let became_readable = !was_readable;
         drop(g);
-        if became_readable {
-            self.readable_token.fetch_add(1, Ordering::Release);
-        }
+        self.readable_token.fetch_add(1, Ordering::Release);
         src.len()
     }
 

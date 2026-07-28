@@ -799,6 +799,34 @@ pub(crate) fn lookup_registry(components: &[&str]) -> Option<ProcNodeSnapshot> {
     None
 }
 
+#[derive(Debug)]
+struct ProcSelfSymlink;
+
+impl FileOps for ProcSelfSymlink {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let pid = current_pid();
+        Box::pin(async move {
+            let target = pid.to_string();
+            slice_read(target.as_bytes(), offset, buf)
+        })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+    fn stat(&self) -> Stat {
+        let pid = current_pid();
+        Stat {
+            size: pid.to_string().len() as u64,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Symlink,
+                perms: 0o777,
+            },
+            mtime_cycles: 0,
+        }
+    }
+}
+
 fn snapshot_dir(m: &BTreeMap<String, ProcNode>) -> Vec<(String, ProcNodeKind)> {
     m.iter()
         .map(|(k, v)| {
@@ -1535,7 +1563,7 @@ impl DirOps for ProcRoot {
             // it is always present, like meminfo — systemd's
             // memory-pressure event source needs it to exist.
             "pressure" => Some(Arc::new(ProcDirMarker)),
-            "self" => Some(Arc::new(ProcDirMarker)),
+            "self" => Some(Arc::new(ProcSelfSymlink)),
             // /proc/thread-self is a magic symlink (like /proc/self) that
             // resolves to `<pid>/task/<tid>`.  In NARF tid == the per-task
             // pid for procfs purposes, so the target is `<pid>/task/<pid>`.
@@ -1579,9 +1607,11 @@ impl DirOps for ProcRoot {
             return Some(Arc::new(pressure::ProcPressureDir));
         }
         if name == "self" {
-            // /proc/self resolves to the calling task's pid each time. ProcPidDir
-            // keys on the OUTER ProcessId (the space every per-pid renderer
-            // expects), so use the outer-pid hook, not the namespace-local one.
+            // /proc/self resolves to the calling task's in-namespace pid translated to outer pid.
+            let inner_pid = current_pid();
+            if let Some(pid) = pid_resolve(inner_pid) {
+                return Some(Arc::new(ProcPidDir { pid }));
+            }
             let pid = current_outer_pid();
             return Some(Arc::new(ProcPidDir { pid }));
         }
@@ -2023,11 +2053,17 @@ fn gen_filesystems() -> String {
     // can't back a block device; our mount surface doesn't track
     // that today, so omit the prefix — bare `mount` (no -t) only
     // checks for the FS-type token.
-    let names: BTreeSet<String> = crate::registry()
+    let mut names: BTreeSet<String> = crate::registry()
         .list_with_names()
         .into_iter()
         .map(|(_p, n)| n)
         .collect();
+    // Linux lists *registered* filesystem types, not just mounted ones. The
+    // pseudo-filesystems NARF always provides are present whether or not an
+    // instance happens to be mounted in this address space.
+    for n in ["sysfs", "proc", "devtmpfs", "devpts", "tmpfs", "9p"] {
+        names.insert(String::from(n));
+    }
     let mut s = String::new();
     for n in names {
         let _ = writeln!(s, "\t{}", n);

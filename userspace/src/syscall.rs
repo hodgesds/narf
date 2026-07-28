@@ -1284,6 +1284,7 @@ pub enum Syscall {
     ///
     /// Everything else returns -1.
     Prctl,
+    Seccomp,
 
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
@@ -2680,6 +2681,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Prlimit64, 302),
     (Syscall::Getcpu, 309),
     (Syscall::GetRandom, 318),
+    (Syscall::Seccomp, 317),
     (Syscall::MemfdCreate, 319),
     (Syscall::CopyFileRange, 326),
     (Syscall::Statx, 332),
@@ -3205,6 +3207,16 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
         // time is not CPU time; only its pre-park work is undercounted.
         let t0 = narf_scheduler::narf_time::monotonic_ns();
         table.dispatch_ctx_versioned(variant, version, ctx);
+        #[cfg(feature = "syscall-trace")]
+        if syscall_trace_relevant(variant) {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "SYSR t={} {} done",
+                crate::handlers::current_task_id(),
+                table.name_of(variant).unwrap_or("?"),
+            );
+        }
         // Own-stack parks RETURN through this point after arbitrarily
         // long sleeps — the parked flag (set at every kernel_switch
         // yield) tells us the measured span includes off-CPU time, so
@@ -3228,27 +3240,45 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     }
 }
 
-/// Trace filter for the `syscall-trace` feature. Fedora desktop diagnostics
-/// are deliberately comm-scoped: tracing every process perturbs scheduling
-/// and buries the first failing syscall under unrelated boot traffic.
+/// Comm-prefix selecting which processes the `syscall-trace` feature follows.
+/// Set from the kernel cmdline (`trace_comm=<prefix>`) by boot-init so the
+/// trace can be retargeted without a rebuild; defaults to `systemd-executo`
+/// (the sd-executor that stages every service exec) when the cmdline is silent.
 #[cfg(feature = "syscall-trace")]
-fn syscall_trace_relevant(v: Syscall) -> bool {
-    syscall_trace_target_task()
-        && matches!(
-            v,
-            Syscall::Mount
-                | Syscall::MoveMount
-                | Syscall::OpenTree
-                | Syscall::MountSetattr
-                | Syscall::Umount2
-        )
+static TRACE_COMM: narf_lib::sync::IrqSafeSpinLock<Option<alloc::string::String>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Install the comm-prefix filter for the syscall trace (see `TRACE_COMM`).
+/// A comma-separated list matches any of the listed prefixes.
+#[cfg(feature = "syscall-trace")]
+pub fn set_trace_comm(prefix: &str) {
+    *TRACE_COMM.lock() = Some(alloc::string::String::from(prefix));
 }
 
-/// Shared predicate for syscall, exec, and exit diagnostics.
+/// Trace filter for the `syscall-trace` feature. Fedora desktop diagnostics
+/// are deliberately comm-scoped: tracing every process perturbs scheduling
+/// and buries the first failing syscall under unrelated boot traffic. Every
+/// syscall the matched process makes is traced (entry + return) so the LAST
+/// entry with no matching return names the syscall a hung service blocks on.
+#[cfg(feature = "syscall-trace")]
+fn syscall_trace_relevant(_v: Syscall) -> bool {
+    syscall_trace_target_task()
+}
+
+/// Shared predicate for syscall, exec, and exit diagnostics. Matches when the
+/// current task's comm starts with any of the comma-separated `trace_comm=`
+/// prefixes (default `systemd-executo`).
 #[cfg(feature = "syscall-trace")]
 pub fn syscall_trace_target_task() -> bool {
-    crate::handlers::proc_comm_of_task(crate::handlers::current_task_id())
-        .is_some_and(|comm| comm.starts_with("systemd-executo"))
+    let comm = match crate::handlers::proc_comm_of_task(crate::handlers::current_task_id()) {
+        Some(c) => c,
+        None => return false,
+    };
+    let guard = TRACE_COMM.lock();
+    let filter = guard.as_deref().unwrap_or("systemd-executo");
+    filter
+        .split(',')
+        .any(|p| !p.is_empty() && comm.starts_with(p))
 }
 
 #[inline]

@@ -326,6 +326,988 @@ fn smoke_pivot_root_basic() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("userspace/mount", smoke_pivot_root_basic);
 
+// ── Smoke 4b: pivot_root(".", ".") — the container idiom ───────────
+// systemd's mount_switch_root_pivot (and runc, crun, …) do
+// `fchdir(new_root_fd); pivot_root(".", ".")`, passing RELATIVE "." paths.
+// pivot_root must resolve them against the cwd, not reject non-absolute
+// paths. Rejecting them made systemd-udevd's PrivateMounts=yes sandbox fail
+// 226/EXIT_NAMESPACE and restart-loop, wedging Fedora boot before dbus.
+#[cfg(feature = "container")]
+fn smoke_pivot_root_relative_dot() -> TestResult {
+    let task: u64 = 0x71_05;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+
+    let _ = unmount_for_test("/new_root2");
+    let mut m1 = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/new_root2\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut m1);
+    if !matches!(m1.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("mount /new_root2 failed");
+    }
+
+    // cwd := /new_root2 (as systemd does via fchdir on the new-root fd).
+    let cwd_path = b"/new_root2\0";
+    let mut cd = StubCtx {
+        args: SyscallArgs {
+            arg0: cwd_path.as_ptr() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::handlers::sys_chdir(&mut cd);
+    if !matches!(cd.ret, Some(r) if r.value == 0) {
+        let _ = unmount_for_test("/new_root2");
+        return TestResult::Fail("chdir /new_root2 failed");
+    }
+
+    // pivot_root(".", ".") — both relative to the cwd.
+    let mut pctx = StubCtx {
+        args: pivot_args(b".\0", b".\0"),
+        ret: None,
+    };
+    crate::handlers::sys_pivot_root_for_test(&mut pctx);
+    let ok = matches!(pctx.ret, Some(r) if r.value == 0)
+        && crate::handlers::root_dir_of(task).as_deref() == Some("/new_root2");
+
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    let _ = unmount_for_test("/new_root2");
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("pivot_root(\".\", \".\") should resolve cwd and swap root")
+    }
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace/mount", smoke_pivot_root_relative_dot);
+
+// Build SyscallArgs for a single-word syscall (arg0 only), e.g. unshare(flags).
+fn flags_args(flags: u64) -> SyscallArgs {
+    SyscallArgs {
+        arg0: flags,
+        ..Default::default()
+    }
+}
+
+// Build SyscallArgs for open_tree(dfd, path, flags).
+fn open_tree_args(dfd: u64, path: &[u8], flags: u64) -> SyscallArgs {
+    SyscallArgs {
+        arg0: dfd,
+        arg1: path.as_ptr() as u64,
+        arg2: flags,
+        ..Default::default()
+    }
+}
+
+// Build SyscallArgs for move_mount(from_dfd, from_path, to_dfd, to_path, flags).
+fn move_mount_args(from_dfd: u64, from_path: &[u8], to_dfd: u64, to_path: &[u8]) -> SyscallArgs {
+    SyscallArgs {
+        arg0: from_dfd,
+        arg1: from_path.as_ptr() as u64,
+        arg2: to_dfd,
+        arg3: to_path.as_ptr() as u64,
+        arg4: 0,
+        arg5: 0,
+    }
+}
+
+// ── Smoke 5: mount-namespace isolation ─────────────────────────────
+// unshare(CLONE_NEWNS) snapshots the caller's mount table into a
+// private MountNamespace. A tmpfs mounted AFTER the unshare is visible
+// to the task (via its namespace) but NOT in the global VfsRegistry or
+// to a task that still shares the global view. A mount that existed
+// BEFORE the unshare survives in the private snapshot.
+// Linux ref: fs/namespace.c:copy_mnt_ns / do_new_mount.
+fn smoke_mount_ns_isolation() -> TestResult {
+    let task: u64 = 0x71_06;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    // Start from a clean private-namespace slot for this task.
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    // A mount that exists BEFORE unshare, in the global registry.
+    let _ = unmount_for_test("/pre_ns");
+    let mut mpre = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/pre_ns\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut mpre);
+    if !matches!(mpre.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("preliminary global mount /pre_ns failed");
+    }
+
+    // unshare(CLONE_NEWNS): snapshot the current (global) table privately.
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    let mut uctx = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut uctx);
+    if !matches!(uctx.ret, Some(r) if r.value == 0) {
+        let _ = unmount_for_test("/pre_ns");
+        return TestResult::Fail("unshare(CLONE_NEWNS) failed");
+    }
+
+    let ns = match crate::handlers::current_mount_namespace() {
+        Some(ns) => ns,
+        None => {
+            let _ = unmount_for_test("/pre_ns");
+            return TestResult::Fail("no private mount namespace after unshare");
+        }
+    };
+
+    // The pre-unshare mount survives in the private snapshot.
+    if ns.mount_id_at("/pre_ns").is_none() {
+        crate::handlers::clear_current_mount_namespace_for_test();
+        let _ = unmount_for_test("/pre_ns");
+        return TestResult::Fail("pre-unshare mount missing from snapshot");
+    }
+
+    // Now mount a tmpfs AFTER the unshare — it lands in the private ns.
+    let mut mpriv = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/priv_ns\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut mpriv);
+    if !matches!(mpriv.ret, Some(r) if r.value == 0) {
+        crate::handlers::clear_current_mount_namespace_for_test();
+        let _ = unmount_for_test("/pre_ns");
+        return TestResult::Fail("private mount /priv_ns failed");
+    }
+
+    // Visible in the task's private namespace…  Use an EXACT mount-path check
+    // (`list()`), NOT `mount_id_at` — the latter does longest-prefix matching
+    // and the root `/` mount always matches as a fallback, so it can't tell
+    // whether `/priv_ns` is specifically mounted.
+    let seen_priv = crate::handlers::current_mount_namespace()
+        .map(|ns| ns.list().iter().any(|p| p == "/priv_ns"))
+        .unwrap_or(false);
+    // …but NOT in the global registry.
+    let global_has_priv = narf_filesystem::registry()
+        .list()
+        .iter()
+        .any(|p| p == "/priv_ns");
+
+    // A task that never unshared sees the global registry only. Switch the
+    // task-id shim to a different task and confirm it can't see /priv_ns.
+    set_task(0x71_06_ff);
+    crate::handlers::clear_current_mount_namespace_for_test(); // no-op; other task
+    let other_sees_priv = crate::handlers::current_mount_namespace().is_some()
+        || narf_filesystem::registry()
+            .list()
+            .iter()
+            .any(|p| p == "/priv_ns");
+
+    // Cleanup: drop the private namespace + the global pre mount.
+    set_task(task);
+    crate::handlers::clear_current_mount_namespace_for_test();
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/pre_ns");
+    // /priv_ns lived only in the (now-dropped) private ns; nothing to unmount
+    // globally, but be defensive.
+    let _ = unmount_for_test("/priv_ns");
+
+    if !seen_priv {
+        return TestResult::Fail("private mount not visible in own namespace");
+    }
+    if global_has_priv {
+        return TestResult::Fail("private mount leaked into global registry");
+    }
+    if other_sees_priv {
+        return TestResult::Fail("private mount visible to a non-unshared task");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/mount", smoke_mount_ns_isolation);
+
+// ── Smoke 6: pivot_root to a missing new_root fails ────────────────
+// pivot_root must reject a new_root that doesn't exist under the prior
+// root (returns -1); the task's root_dir must be left untouched.
+// Linux ref: fs/namespace.c:do_move_mount / SyS_pivot_root ENOENT path.
+#[cfg(feature = "container")]
+fn smoke_pivot_root_missing_target() -> TestResult {
+    let task: u64 = 0x71_07;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+
+    // Ensure the target really doesn't exist.
+    let _ = unmount_for_test("/does_not_exist");
+
+    let mut pctx = StubCtx {
+        args: pivot_args(b"/does_not_exist\0", b"/does_not_exist/old\0"),
+        ret: None,
+    };
+    crate::handlers::sys_pivot_root_for_test(&mut pctx);
+    let rejected = matches!(pctx.ret, Some(r) if r.value == (-1i64) as u64);
+    // root_dir must be unchanged (still the default: no per-task entry).
+    let root_untouched = crate::handlers::root_dir_of(task).is_none();
+
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    if rejected && root_untouched {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("pivot_root(missing new_root) must fail and leave root unchanged")
+    }
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace/mount", smoke_pivot_root_missing_target);
+
+// ── Smoke 7: pivot_root container idiom via chdir + relative put_old ─
+// A different scenario from smoke_pivot_root_relative_dot: chdir into a
+// PARENT dir, mount the new root and its put_old target as a sub-mount,
+// then pivot_root with a relative new_root and a relative put_old that
+// resolve against the cwd. Confirms the root swaps and the old root is
+// reachable at the resolved put_old.
+#[cfg(feature = "container")]
+fn smoke_pivot_root_relative_paths() -> TestResult {
+    let task: u64 = 0x71_08;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+
+    let _ = unmount_for_test("/stage/root8");
+    let _ = unmount_for_test("/stage/root8/old");
+    let _ = unmount_for_test("/stage");
+
+    // new_root at /stage/root8, put_old target as a sub-mount below it.
+    let mut m0 = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/stage\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut m0);
+    let mut m1 = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/stage/root8\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut m1);
+    let mut m2 = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/stage/root8/old\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut m2);
+    if !matches!(m1.ret, Some(r) if r.value == 0) || !matches!(m2.ret, Some(r) if r.value == 0) {
+        let _ = unmount_for_test("/stage/root8/old");
+        let _ = unmount_for_test("/stage/root8");
+        let _ = unmount_for_test("/stage");
+        return TestResult::Fail("staging mounts for relative pivot_root failed");
+    }
+
+    // cwd := /stage, then pivot_root("root8", "root8/old") — both relative.
+    let cwd_path = b"/stage\0";
+    let mut cd = StubCtx {
+        args: SyscallArgs {
+            arg0: cwd_path.as_ptr() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::handlers::sys_chdir(&mut cd);
+
+    let mut pctx = StubCtx {
+        args: pivot_args(b"root8\0", b"root8/old\0"),
+        ret: None,
+    };
+    crate::handlers::sys_pivot_root_for_test(&mut pctx);
+
+    let swapped = matches!(pctx.ret, Some(r) if r.value == 0)
+        && crate::handlers::root_dir_of(task).as_deref() == Some("/stage/root8");
+    // apply_chroot("/old") rewrites to /stage/root8/old — the bind-back
+    // of the prior root under the new root.
+    let old_reachable = crate::handlers::apply_chroot_for_test("/old") == "/stage/root8/old";
+
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    let _ = unmount_for_test("/stage/root8/old");
+    let _ = unmount_for_test("/stage/root8");
+    let _ = unmount_for_test("/stage");
+
+    if swapped && old_reachable {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("relative pivot_root(root8, root8/old) should swap root + bind old")
+    }
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace/mount", smoke_pivot_root_relative_paths);
+
+// ── Smoke 8: open_tree(CLONE) → move_mount round-trip ──────────────
+// open_tree(dfd, path, OPEN_TREE_CLONE) clones the mount covering a
+// path into a detached-mount fd; move_mount then re-attaches that fd at
+// a fresh target. Assert the fs resolves at the new target afterward.
+// Linux ref: fs/namespace.c:SyS_open_tree / SyS_move_mount.
+fn smoke_open_tree_move_mount() -> TestResult {
+    let task: u64 = 0x71_09;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    let _ = unmount_for_test("/ot_src");
+    let _ = unmount_for_test("/ot_dst");
+
+    // Source mount to clone.
+    let mut msrc = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/ot_src\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut msrc);
+    if !matches!(msrc.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("source mount /ot_src failed");
+    }
+
+    // open_tree("/ot_src", OPEN_TREE_CLONE) → detached-mount fd.
+    const OPEN_TREE_CLONE: u64 = 0x0000_0001;
+    let mut otctx = StubCtx {
+        args: open_tree_args(0, b"/ot_src\0", OPEN_TREE_CLONE),
+        ret: None,
+    };
+    crate::mount_api::sys_open_tree(&mut otctx);
+    let tree_fd = match otctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) >= 0 => r.value,
+        _ => {
+            let _ = unmount_for_test("/ot_src");
+            return TestResult::Fail("open_tree(CLONE) did not return an fd");
+        }
+    };
+
+    // move_mount(tree_fd, "", AT_FDCWD, "/ot_dst").
+    let mut mmctx = StubCtx {
+        args: move_mount_args(tree_fd, b"\0", 0, b"/ot_dst\0"),
+        ret: None,
+    };
+    crate::mount_api::sys_move_mount(&mut mmctx);
+    let moved = matches!(mmctx.ret, Some(r) if r.value == 0);
+
+    // The moved subtree resolves at the new target.
+    let resolves_at_dst = narf_filesystem::registry()
+        .resolve_absolute("/ot_dst", |fs, _rel| alloc::string::String::from(fs.name()))
+        .as_deref()
+        == Some("tmpfs");
+
+    // Cleanup: close the detached fd (consumed by move_mount already) +
+    // both mount points + the task's fd table.
+    crate::fd::detach(task);
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/ot_dst");
+    let _ = unmount_for_test("/ot_src");
+
+    if moved && resolves_at_dst {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("open_tree(CLONE)+move_mount should re-attach the fs at the new target")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_open_tree_move_mount);
+
+// ── Smoke 9: chroot applied exactly once ───────────────────────────
+// apply_chroot must prefix the root exactly ONCE — a double-prefix
+// ("/jail9/jail9/...") was a real container bug. Also confirm the root
+// path itself ("/") maps to the jail root, not "/jail9/".
+fn smoke_chroot_applied_once() -> TestResult {
+    let task: u64 = 0x71_0a;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+
+    let _ = unmount_for_test("/jail9");
+    let mut mctx = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/jail9\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut mctx);
+    if !matches!(mctx.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("preliminary mount /jail9 failed");
+    }
+
+    let mut cctx = StubCtx {
+        args: path_args(b"/jail9\0"),
+        ret: None,
+    };
+    crate::handlers::sys_chroot_for_test(&mut cctx);
+    if !matches!(cctx.ret, Some(r) if r.value == 0) {
+        crate::handlers::__test_root_dir_reset();
+        let _ = unmount_for_test("/jail9");
+        return TestResult::Fail("sys_chroot(/jail9) failed");
+    }
+
+    let once = crate::handlers::apply_chroot_for_test("/etc/passwd") == "/jail9/etc/passwd";
+    let root_maps = crate::handlers::apply_chroot_for_test("/") == "/jail9/";
+
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/jail9");
+
+    if once && root_maps {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("apply_chroot must prefix /jail9 exactly once")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_chroot_applied_once);
+
+// ── Smoke 10: chroot + `..` escape is contained ────────────────────
+// A chrooted task must not break out of its jail via `..`. resolve_cwd_path
+// normalizes `..` in the USER view first (so `../../etc` from "/" collapses
+// to "/etc") THEN re-roots under the chroot — the result stays under the
+// jail, never above it. Also exercises the chroot+cwd interaction: a
+// relative path resolves against the cwd and lands under the jail.
+fn smoke_chroot_escape_contained() -> TestResult {
+    let task: u64 = 0x71_0b;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+
+    let _ = unmount_for_test("/jailB");
+    let mut mctx = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/jailB\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut mctx);
+    if !matches!(mctx.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("preliminary mount /jailB failed");
+    }
+
+    let mut cctx = StubCtx {
+        args: path_args(b"/jailB\0"),
+        ret: None,
+    };
+    crate::handlers::sys_chroot_for_test(&mut cctx);
+    if !matches!(cctx.ret, Some(r) if r.value == 0) {
+        crate::handlers::__test_root_dir_reset();
+        let _ = unmount_for_test("/jailB");
+        return TestResult::Fail("sys_chroot(/jailB) failed");
+    }
+
+    // An absolute path trying to climb out with `..` collapses to a path
+    // still under the jail.
+    let escape = crate::handlers::resolve_cwd_path(task, "/../../../etc/shadow");
+    let contained = escape == "/jailB/etc/shadow";
+
+    // chroot + cwd: chdir("/work"), then a relative path resolves under
+    // the cwd and re-roots under the jail exactly once. chdir(2) validates the
+    // target is a real directory, so make `/work` (== /jailB/work under the
+    // jail) exist first by mounting a tmpfs there (mount targets are
+    // chroot-resolved, so "/work" lands at /jailB/work).
+    let mut mwork = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/work\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut mwork);
+    let cwd_path = b"/work\0";
+    let mut cd = StubCtx {
+        args: SyscallArgs {
+            arg0: cwd_path.as_ptr() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::handlers::sys_chdir(&mut cd);
+    let cd_ok = matches!(cd.ret, Some(r) if r.value == 0);
+    let rel = crate::handlers::resolve_cwd_path(task, "sub/file");
+    let cwd_ok = cd_ok && rel == "/jailB/work/sub/file";
+
+    let _ = unmount_for_test("/jailB/work");
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    let _ = unmount_for_test("/jailB");
+
+    if contained && cwd_ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("chroot must contain `..` escapes and re-root cwd-relative paths once")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_chroot_escape_contained);
+
+// ── Flag constants (mirror handlers/mod.rs; Linux mount(2) ABI) ────
+const MS_REMOUNT: u64 = 1 << 5; // 0x0020
+const MS_BIND: u64 = 1 << 12; // 0x1000
+const MS_MOVE: u64 = 1 << 13; // 0x2000
+const MS_REC: u64 = 1 << 14; // 0x4000
+const MS_PRIVATE: u64 = 1 << 18; // 0x40000
+const MS_SLAVE: u64 = 1 << 19; // 0x80000
+const CLONE_NEWNS: u64 = 0x0002_0000;
+
+// Convenience: run sys_mount and report whether it returned value==0.
+fn mount_ok(source: &[u8], target: &[u8], fstype: &[u8], flags: u64) -> bool {
+    let mut ctx = StubCtx {
+        args: mount_args(source, target, fstype, flags),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut ctx);
+    matches!(ctx.ret, Some(r) if r.value == 0)
+}
+
+// True iff `path` is an EXACT mount entry in the global registry. Uses
+// `list()`, NOT `mount_id_at` (which longest-prefix-matches and always falls
+// back to the root `/` mount — that fallback caused a false test failure).
+fn registry_has(path: &str) -> bool {
+    narf_filesystem::registry().list().iter().any(|p| p == path)
+}
+
+// Name of the FsInstance visible at an absolute path (via the global
+// registry), or None if nothing distinct covers it.
+fn fs_name_at(path: &str) -> Option<alloc::string::String> {
+    narf_filesystem::registry()
+        .resolve_absolute(path, |fs, _rel| alloc::string::String::from(fs.name()))
+}
+
+// ── Smoke 11: bind mount makes the source subtree visible at dst ───
+// mount(src, dst, MS_BIND) forwards dst's root to src's DirOps. A file
+// created in the source tmpfs is then reachable through the dst path.
+// Linux ref: fs/namespace.c:do_loopback (mount --bind).
+fn smoke_bind_mount_file_visible() -> TestResult {
+    set_task(0x71_0c);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    let _ = unmount_for_test("/bind_src");
+    let _ = unmount_for_test("/bind_dst");
+
+    if !mount_ok(b"tmpfs\0", b"/bind_src\0", b"tmpfs\0", 0) {
+        return TestResult::Fail("mount /bind_src failed");
+    }
+
+    // Create a marker file in the source tmpfs root.
+    let created = narf_filesystem::registry()
+        .resolve_absolute("/bind_src", |fs, _rel| {
+            matches!(
+                crate::handlers::poll_blocking(fs.root().create("marker")),
+                Some(Ok(_))
+            )
+        })
+        .unwrap_or(false);
+    if !created {
+        let _ = unmount_for_test("/bind_src");
+        return TestResult::Fail("could not create marker in /bind_src");
+    }
+
+    // Bind /bind_src → /bind_dst.
+    if !mount_ok(b"/bind_src\0", b"/bind_dst\0", b"\0", MS_BIND) {
+        let _ = unmount_for_test("/bind_src");
+        return TestResult::Fail("bind mount /bind_src → /bind_dst failed");
+    }
+
+    // The bind is registered at dst and forwards the source fs name.
+    let registered = registry_has("/bind_dst");
+    let name_ok = fs_name_at("/bind_dst").as_deref() == Some("tmpfs");
+    // The marker created via src is visible through dst.
+    let visible = narf_filesystem::registry()
+        .resolve_absolute("/bind_dst", |fs, _rel| fs.root().lookup("marker").is_some())
+        .unwrap_or(false);
+
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/bind_dst");
+    let _ = unmount_for_test("/bind_src");
+
+    if registered && name_ok && visible {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("bind mount must expose the source subtree (incl. its files) at dst")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_bind_mount_file_visible);
+
+// ── Smoke 12: recursive bind (MS_BIND|MS_REC) clones sub-mounts ────
+// A mount nested UNDER the source must reappear nested under the target.
+// Linux ref: fs/namespace.c:do_loopback with recurse=1 (mount --rbind).
+fn smoke_recursive_bind_clones_submount() -> TestResult {
+    set_task(0x71_0d);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    let _ = unmount_for_test("/rb_src/nested");
+    let _ = unmount_for_test("/rb_src");
+    let _ = unmount_for_test("/rb_dst/nested");
+    let _ = unmount_for_test("/rb_dst");
+
+    if !mount_ok(b"tmpfs\0", b"/rb_src\0", b"tmpfs\0", 0)
+        || !mount_ok(b"tmpfs\0", b"/rb_src/nested\0", b"tmpfs\0", 0)
+    {
+        let _ = unmount_for_test("/rb_src/nested");
+        let _ = unmount_for_test("/rb_src");
+        return TestResult::Fail("staging mounts for recursive bind failed");
+    }
+
+    // Recursive bind: /rb_src (+ its /rb_src/nested sub-mount) → /rb_dst.
+    if !mount_ok(b"/rb_src\0", b"/rb_dst\0", b"\0", MS_BIND | MS_REC) {
+        let _ = unmount_for_test("/rb_src/nested");
+        let _ = unmount_for_test("/rb_src");
+        return TestResult::Fail("recursive bind /rb_src → /rb_dst failed");
+    }
+
+    let dst_root = registry_has("/rb_dst");
+    let dst_nested = registry_has("/rb_dst/nested");
+
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/rb_dst/nested");
+    let _ = unmount_for_test("/rb_dst");
+    let _ = unmount_for_test("/rb_src/nested");
+    let _ = unmount_for_test("/rb_src");
+
+    if dst_root && dst_nested {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("MS_REC bind must clone the nested sub-mount under the target")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_recursive_bind_clones_submount);
+
+// ── Smoke 13: MS_MOVE relocates a mount ────────────────────────────
+// mount(old, new, MS_MOVE) detaches the mount at `old` and re-attaches it
+// at `new`: it resolves at `new` and no longer at `old`.
+// Linux ref: fs/namespace.c:do_move_mount.
+fn smoke_move_mount_relocates() -> TestResult {
+    set_task(0x71_0e);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    let _ = unmount_for_test("/mv_from");
+    let _ = unmount_for_test("/mv_to");
+
+    if !mount_ok(b"tmpfs\0", b"/mv_from\0", b"tmpfs\0", 0) {
+        return TestResult::Fail("mount /mv_from failed");
+    }
+
+    // MS_MOVE: source == old path, target == new path, NULL fstype.
+    if !mount_ok(b"/mv_from\0", b"/mv_to\0", b"\0", MS_MOVE) {
+        let _ = unmount_for_test("/mv_from");
+        return TestResult::Fail("MS_MOVE /mv_from → /mv_to failed");
+    }
+
+    let at_new = registry_has("/mv_to");
+    let gone_from_old = !registry_has("/mv_from");
+    let name_ok = fs_name_at("/mv_to").as_deref() == Some("tmpfs");
+
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/mv_to");
+    let _ = unmount_for_test("/mv_from");
+
+    if at_new && gone_from_old && name_ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("MS_MOVE must relocate the mount to the new path and clear the old")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_move_mount_relocates);
+
+// ── Smoke 14: pseudo-fs double-mount is idempotent (no stacking) ───
+// NARF has no mount stacking: re-mounting a tmpfs onto an already-mounted
+// target reports success (matching Linux, which stacks + succeeds) and
+// leaves exactly ONE registry entry for that path — it does not error and
+// does not create a duplicate. (A genuine EBUSY is unobservable through the
+// syscall here because the pseudo-fs arm swallows the registry Busy into
+// the documented idempotent success.)
+// Linux ref: fs/namespace.c:do_new_mount (repeated API-fs mount).
+fn smoke_double_mount_idempotent() -> TestResult {
+    set_task(0x71_0f);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    let _ = unmount_for_test("/dbl");
+
+    if !mount_ok(b"tmpfs\0", b"/dbl\0", b"tmpfs\0", 0) {
+        return TestResult::Fail("first mount /dbl failed");
+    }
+    // Second mount of the same fstype at the same path: idempotent success.
+    let second_ok = mount_ok(b"tmpfs\0", b"/dbl\0", b"tmpfs\0", 0);
+
+    // Exactly one entry for /dbl (no stacking / duplicate).
+    let count = narf_filesystem::registry()
+        .list()
+        .iter()
+        .filter(|p| p.as_str() == "/dbl")
+        .count();
+
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/dbl");
+
+    if second_ok && count == 1 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("tmpfs double-mount must be idempotent (ok, single registry entry)")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_double_mount_idempotent);
+
+// ── Smoke 15: propagation-only mount is a no-op success ────────────
+// mount(NULL, target, NULL, MS_SLAVE|MS_REC) / MS_PRIVATE changes only the
+// propagation type of an existing mount. NARF has no propagation model, so
+// it returns success and creates NO new mount at the target.
+// systemd does `mount(NULL, "/", NULL, MS_SLAVE|MS_REC, NULL)` right after
+// clone(CLONE_NEWNS); failing it aborts the sandbox ("Protocol error").
+// Linux ref: fs/namespace.c:do_change_type.
+fn smoke_propagation_only_noop() -> TestResult {
+    set_task(0x71_10);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    // A propagation-only change on "/" (SLAVE|REC) succeeds and adds nothing.
+    let before = narf_filesystem::registry().list().len();
+    let slave_ok = mount_ok(b"\0", b"/\0", b"\0", MS_SLAVE | MS_REC);
+    // MS_PRIVATE|MS_REC on an unmounted path also succeeds without creating it.
+    let priv_ok = mount_ok(b"\0", b"/prop_none\0", b"\0", MS_PRIVATE | MS_REC);
+    let after = narf_filesystem::registry().list().len();
+    let no_new_mount = !registry_has("/prop_none");
+    let count_stable = before == after;
+
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/prop_none");
+
+    if slave_ok && priv_ok && no_new_mount && count_stable {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("propagation-only mount must succeed and create no new mount")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_propagation_only_noop);
+
+// ── Smoke 16: mount_setattr size validation ────────────────────────
+// mount_setattr(dfd, path, flags, attr, size): a well-formed size (1..=64)
+// returns 0; size 0 or > 64 returns -EINVAL. NARF doesn't enforce per-mount
+// attrs, so a valid call just succeeds.
+// Linux ref: fs/namespace.c:SyS_mount_setattr (usize check).
+fn smoke_mount_setattr_size_validation() -> TestResult {
+    set_task(0x71_11);
+
+    const EINVAL: u64 = (-22i64) as u64;
+    // Well-formed: size == 32 (sizeof struct mount_attr) → 0.
+    let mut good = StubCtx {
+        args: SyscallArgs {
+            arg4: 32,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::mount_api::sys_mount_setattr(&mut good);
+    let good_ok = matches!(good.ret, Some(r) if r.value == 0);
+
+    // size == 0 → EINVAL.
+    let mut zero = StubCtx {
+        args: SyscallArgs {
+            arg4: 0,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::mount_api::sys_mount_setattr(&mut zero);
+    let zero_einval = matches!(zero.ret, Some(r) if r.value == EINVAL);
+
+    // size == 65 (> 64) → EINVAL.
+    let mut big = StubCtx {
+        args: SyscallArgs {
+            arg4: 65,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::mount_api::sys_mount_setattr(&mut big);
+    let big_einval = matches!(big.ret, Some(r) if r.value == EINVAL);
+
+    if good_ok && zero_einval && big_einval {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("mount_setattr: size 1..=64 → 0, size 0 or >64 → EINVAL")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_mount_setattr_size_validation);
+
+// ── Smoke 17: mount-namespace snapshot depth ───────────────────────
+// A deeper look at unshare(CLONE_NEWNS) than smoke_mount_ns_isolation: a
+// mount made AFTER the unshare must live ONLY in the private namespace's
+// `list()` and be absent from the GLOBAL registry snapshot; a mount that
+// predates the unshare must be present in the private snapshot.
+// Linux ref: fs/namespace.c:copy_mnt_ns.
+fn smoke_mount_ns_snapshot_depth() -> TestResult {
+    let task: u64 = 0x71_12;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    // Predates unshare — lands in the global registry.
+    let _ = unmount_for_test("/ns_pre");
+    if !mount_ok(b"tmpfs\0", b"/ns_pre\0", b"tmpfs\0", 0) {
+        return TestResult::Fail("pre-unshare mount /ns_pre failed");
+    }
+
+    let mut uctx = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut uctx);
+    if !matches!(uctx.ret, Some(r) if r.value == 0) {
+        let _ = unmount_for_test("/ns_pre");
+        return TestResult::Fail("unshare(CLONE_NEWNS) failed");
+    }
+
+    // The pre-existing mount is captured in the private snapshot's list().
+    let snapshot_has_pre = crate::handlers::current_mount_namespace()
+        .map(|ns| ns.list().iter().any(|p| p == "/ns_pre"))
+        .unwrap_or(false);
+
+    // A mount made AFTER unshare lands only in the private namespace.
+    if !mount_ok(b"tmpfs\0", b"/ns_post\0", b"tmpfs\0", 0) {
+        crate::handlers::clear_current_mount_namespace_for_test();
+        let _ = unmount_for_test("/ns_pre");
+        return TestResult::Fail("post-unshare private mount /ns_post failed");
+    }
+    let priv_has_post = crate::handlers::current_mount_namespace()
+        .map(|ns| ns.list().iter().any(|p| p == "/ns_post"))
+        .unwrap_or(false);
+    // …and is invisible in the global registry snapshot.
+    let global_lacks_post = !registry_has("/ns_post");
+
+    crate::handlers::clear_current_mount_namespace_for_test();
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/ns_pre");
+    let _ = unmount_for_test("/ns_post");
+
+    if snapshot_has_pre && priv_has_post && global_lacks_post {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("CLONE_NEWNS snapshot must keep pre-mounts + isolate post-mounts")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_mount_ns_snapshot_depth);
+
+// ── Smoke 18: umount2 real-vs-nonmount return semantics ────────────
+// umount2 of a real mount returns 0 and drops it from registry().list();
+// umount2 of a path that is not a mount point returns the -1 sentinel
+// (SyscallReturn::ok(!0)) and leaves the table unchanged.
+// Linux ref: fs/namespace.c:SyS_umount (EINVAL on non-mount).
+fn smoke_umount_real_vs_nonmount() -> TestResult {
+    set_task(0x71_13);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    let _ = unmount_for_test("/um_real");
+
+    if !mount_ok(b"tmpfs\0", b"/um_real\0", b"tmpfs\0", 0) {
+        return TestResult::Fail("mount /um_real failed");
+    }
+    let present_before = registry_has("/um_real");
+
+    // umount2 of the real mount → 0, and it disappears from the registry.
+    let mut u1 = StubCtx {
+        args: unmount_args(b"/um_real\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_umount2_for_test(&mut u1);
+    let real_ok = matches!(u1.ret, Some(r) if r.value == 0);
+    let removed = !registry_has("/um_real");
+
+    // umount2 of a path that was never mounted → the -1 sentinel (!0).
+    let mut u2 = StubCtx {
+        args: unmount_args(b"/um_never\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_umount2_for_test(&mut u2);
+    let nonmount_sentinel = matches!(u2.ret, Some(r) if r.value == (-1i64) as u64);
+
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/um_real");
+
+    if present_before && real_ok && removed && nonmount_sentinel {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("umount2: real mount → 0 + removed; non-mount → -1 sentinel")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_umount_real_vs_nonmount);
+
+// ── Smoke 19: MS_REMOUNT of a live mount succeeds; of nothing → ENOENT ─
+// A bind-remount (MS_REMOUNT, NULL fstype) validates the target: an existing
+// mount accepts the flag update (0); a path with no mount / dir / file
+// returns -ENOENT. NARF doesn't persist per-mount VFS flags, so the update
+// is accept-and-record only. systemd read-only-remounts each API fs after
+// mounting it.
+// Linux ref: fs/namespace.c:do_remount.
+fn smoke_remount_flag_update() -> TestResult {
+    set_task(0x71_14);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    let _ = unmount_for_test("/rmnt");
+
+    if !mount_ok(b"tmpfs\0", b"/rmnt\0", b"tmpfs\0", 0) {
+        return TestResult::Fail("mount /rmnt failed");
+    }
+
+    // Remount the live mount (NULL fstype) → success (0).
+    let remount_live = mount_ok(b"\0", b"/rmnt\0", b"\0", MS_REMOUNT);
+
+    // Remount a path that is neither a mount nor an existing dir/file → ENOENT.
+    let mut miss = StubCtx {
+        args: mount_args(b"\0", b"/rmnt_missing\0", b"\0", MS_REMOUNT),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut miss);
+    let remount_missing_enoent = matches!(miss.ret, Some(r) if r.value == (-2i64) as u64);
+
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/rmnt");
+
+    if remount_live && remount_missing_enoent {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("MS_REMOUNT: live mount → 0, missing target → -ENOENT")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_remount_flag_update);
+
+// ── Smoke 20: chroot re-roots mount targets into the jail ──────────
+// While chrooted to /cjail, mounting "/x" must register at /cjail/x in the
+// GLOBAL registry (mount targets are chroot-resolved via apply_chroot). The
+// jail-relative "/x" must NOT appear as a top-level registry entry.
+// Linux ref: fs/namespace.c:user_path (target resolved under the task root).
+fn smoke_chroot_mount_target_rerooted() -> TestResult {
+    let task: u64 = 0x71_15;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    let _ = unmount_for_test("/cjail/x");
+    let _ = unmount_for_test("/cjail");
+    let _ = unmount_for_test("/x");
+
+    if !mount_ok(b"tmpfs\0", b"/cjail\0", b"tmpfs\0", 0) {
+        return TestResult::Fail("mount /cjail failed");
+    }
+
+    // chroot into /cjail.
+    let mut cctx = StubCtx {
+        args: path_args(b"/cjail\0"),
+        ret: None,
+    };
+    crate::handlers::sys_chroot_for_test(&mut cctx);
+    if !matches!(cctx.ret, Some(r) if r.value == 0) {
+        crate::handlers::__test_root_dir_reset();
+        let _ = unmount_for_test("/cjail");
+        return TestResult::Fail("chroot /cjail failed");
+    }
+
+    // From inside the jail, mount tmpfs at "/x" — chroot-resolved to /cjail/x.
+    let mounted = mount_ok(b"tmpfs\0", b"/x\0", b"tmpfs\0", 0);
+    let rerooted = registry_has("/cjail/x");
+    // The un-rerooted "/x" must not be a registry entry.
+    let no_bare_x = !registry_has("/x");
+
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test("/cjail/x");
+    let _ = unmount_for_test("/cjail");
+    let _ = unmount_for_test("/x");
+
+    if mounted && rerooted && no_bare_x {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("chroot must re-root a mount target into the jail (/cjail/x)")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_chroot_mount_target_rerooted);
+
 // Helper: unmount a path under a fresh bootstrap handle. The
 // registry's unmount is keyed by path; the handle check is the
 // authority gate.

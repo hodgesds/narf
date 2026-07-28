@@ -2,6 +2,8 @@
 # Fedora KDE/systemd launcher for NARF's ext2 test image.
 exec 2>&1
 echo "fedora-shell-ran"
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+export LD_LIBRARY_PATH=/usr/lib64:/lib64:/usr/lib
 export container=narf
 mount -t tmpfs tmpfs /run 2>/dev/null
 mkdir -p /run/lock /tmp/nogen /run/systemd/system
@@ -14,10 +16,19 @@ ln -sf /dev/null /run/systemd/system/modprobe@.service
 ln -sf /dev/null /run/systemd/system/sys-kernel-debug.mount
 ln -sf /dev/null /run/systemd/system/sys-kernel-tracing.mount
 ln -sf /dev/null /run/systemd/system/systemd-journal-flush.service
+ln -sf /dev/null /run/systemd/system/systemd-journald.service
+ln -sf /dev/null /run/systemd/system/systemd-journald.socket
+ln -sf /dev/null /run/systemd/system/systemd-journald-dev-log.socket
+ln -sf /dev/null /run/systemd/system/systemd-journald-audit.socket
+ln -sf /dev/null /run/systemd/system/systemd-udev-load-credentials.service
 ln -sf /dev/null /run/systemd/system/systemd-update-utmp.service
 ln -sf /dev/null /run/systemd/system/getty@tty1.service
 
-unshare --pid /usr/lib/systemd/systemd --system --log-level=info --log-target=console &
+if [ "$$" -eq 1 ]; then
+  exec /usr/lib/systemd/systemd --system --log-level=info --log-target=console
+else
+  unshare -p -f --mount-proc /usr/lib/systemd/systemd --system --log-level=info --log-target=console &
+fi
 
 bus_ready=0
 for i in $(seq 1 120); do

@@ -48,20 +48,36 @@ set -e
 WORK="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$WORK/root"
 cp -f /etc/resolv.conf "$ROOT/etc/resolv.conf" 2>/dev/null || true
-exec unshare --user --map-auto --map-root-user --mount --pid --fork --kill-child \
-  /bin/bash -c '
-    set -e
-    ROOT="'"$ROOT"'"
-    mount --rbind /dev  "$ROOT/dev"
-    mount --rbind /sys  "$ROOT/sys"
-    mount -t proc proc  "$ROOT/proc"
-    mount -t tmpfs tmpfs "$ROOT/tmp"
-    mount --make-rslave "$ROOT/dev" || true
-    exec chroot "$ROOT" /usr/bin/env -i \
-      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-      HOME=/root TERM=dumb LANG=C.UTF-8 \
-      /bin/bash -l -c "$*"
-  ' -- "$@"
+if [ "$(id -u)" -eq 0 ]; then
+  mount --rbind /dev  "$ROOT/dev" 2>/dev/null || true
+  mount --rbind /sys  "$ROOT/sys" 2>/dev/null || true
+  mount -t proc proc  "$ROOT/proc" 2>/dev/null || true
+  mount -t tmpfs tmpfs "$ROOT/tmp" 2>/dev/null || true
+  chroot "$ROOT" /usr/bin/env -i \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/root TERM=dumb LANG=C.UTF-8 \
+    /bin/bash -l -c "$*"
+  RET=$?
+  for m in $(mount | grep "$ROOT" | awk '{print $3}' | sort -r); do
+    umount -l "$m" 2>/dev/null || true
+  done
+  exit $RET
+else
+  exec unshare --user --map-auto --map-root-user --mount --pid --fork --kill-child \
+    /bin/bash -c '
+      set -e
+      ROOT="'"$ROOT"'"
+      mount --rbind /dev  "$ROOT/dev"
+      mount --rbind /sys  "$ROOT/sys"
+      mount -t proc proc  "$ROOT/proc"
+      mount -t tmpfs tmpfs "$ROOT/tmp"
+      mount --make-rslave "$ROOT/dev" || true
+      exec chroot "$ROOT" /usr/bin/env -i \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        HOME=/root TERM=dumb LANG=C.UTF-8 \
+        /bin/bash -l -c "$*"
+    ' -- "$@"
+fi
 ENTEREOF
   chmod +x "$WORK/enter.sh"
 
@@ -98,20 +114,18 @@ install -m 0755 \
   "$WORK/root/narf-start.sh"
 
 # ------------------------------------------------------------------ pack ---
-mkdir -p "$ROOT/target"
-rm -f "$OUT"
-echo "Creating ${IMG_MB} MiB ext2 image at $OUT..."
-# Plain ext2 with 1 KiB blocks and every ext3/ext4 feature off — NARF's ext2
-# driver refuses to mount a volume with an incompat bit it doesn't implement
-# (drivers/fs/ext2/src/superblock.rs::incompat::SUPPORTED).
-#
-# mke2fs -d runs inside the same fake-root userns as the install: rpm left
-# files owned by non-root uids and some (/etc/gshadow) mode 0000, which a
-# plain user can neither read nor reproduce the ownership of.
-unshare --user --map-auto --map-root-user \
-  mke2fs -q -F -t ext2 -b 1024 -I 128 \
-    -O ^has_journal,^extent,^64bit,^metadata_csum,^dir_index,^resize_inode,^huge_file,^flex_bg,^ext_attr \
-    -d "$WORK/root" "$OUT" "$((IMG_MB * 1024))"
+for m in $(mount | grep "$WORK/root" | awk '{print $3}' | sort -r); do
+  umount -l "$m" 2>/dev/null || true
+done
+
+if [ "$(id -u)" -eq 0 ]; then
+  UNSHARE_CMD=""
+else
+  UNSHARE_CMD="unshare --user --map-auto --map-root-user"
+fi
+$UNSHARE_CMD mke2fs -q -F -t ext2 -b 1024 -I 128 \
+  -O ^has_journal,^extent,^64bit,^metadata_csum,^dir_index,^resize_inode,^huge_file,^flex_bg,^ext_attr \
+  -d "$WORK/root" "$OUT" "$((IMG_MB * 1024))"
 
 echo "built $OUT ($(du -h "$OUT" | cut -f1)) — Fedora $FEDORA_VER KDE rootfs"
 echo "boot it with: NARF_VBLK_IMG=$OUT cargo xtask run-interactive ..."

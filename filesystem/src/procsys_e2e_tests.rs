@@ -627,3 +627,546 @@ kernel_test_in!(
     "procsys_e2e/kernel",
     e2e_kernel_dmesg_restrict_write_returns_readonly
 );
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Global /proc node coverage (procsys_e2e/global)
+//
+// The tests above exercise the /proc/sys/* sysctl registry. The block
+// below covers the GLOBAL (non-per-pid) /proc nodes served directly by
+// `ProcRoot` — meminfo, stat, uptime, loadavg, filesystems, mounts,
+// cpuinfo, version, cmdline, self, pressure — by resolving each through
+// the real `DirOps`/`FileOps` surface (`ProcRoot::lookup` + the async
+// `read`, driven synchronously with `poll_once`), exactly the path
+// `resolve_async` walks for a `/proc/<name>` open. Each assertion parses
+// a prefix/substring of the renderer's actual output (read from the
+// source) rather than an exact full-string match, so the tests stay
+// robust to incidental formatting changes while pinning the shape that
+// tooling (ps, top, free, systemd, mount) depends on.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "linux-compat")]
+use alloc::vec::Vec;
+#[cfg(feature = "linux-compat")]
+use crate::procfs::{poll_once, ProcRoot};
+#[cfg(feature = "linux-compat")]
+use crate::{DirOps, FileType, Mode};
+
+/// Resolve `name` under `/proc` via `ProcRoot::lookup` and read the whole
+/// file into a `String`, draining the async `read` with `poll_once` (all
+/// procfs futures complete on the first poll). Returns `None` if the node
+/// does not resolve, read errors, a poll goes pending, or the bytes are
+/// not valid UTF-8.
+#[cfg(feature = "linux-compat")]
+fn read_root_file(name: &str) -> Option<String> {
+    use alloc::sync::Arc;
+    let root: Arc<dyn DirOps> = Arc::new(ProcRoot);
+    let f = root.lookup(name)?;
+    let mut out: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        let n = match poll_once(f.read(out.len() as u64, &mut chunk)) {
+            Some(Ok(n)) => n,
+            _ => return None,
+        };
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..n]);
+        // Guard against a misbehaving generator that never signals EOF.
+        if out.len() > 64 * 1024 {
+            break;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+// ── /proc/meminfo ────────────────────────────────────────────────────────────
+
+/// `/proc/meminfo` has `MemTotal:`/`MemFree:` lines whose value column is a
+/// numeric kB count. `free`, systemd, and every memory probe parse these.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_meminfo_memtotal_memfree_numeric_kb() -> TestResult {
+    let body = match read_root_file("meminfo") {
+        Some(s) => s,
+        None => return TestResult::Fail("/proc/meminfo did not resolve/read"),
+    };
+    // Each expected line reads e.g. "MemTotal:        524288 kB".
+    let check = |prefix: &str| -> bool {
+        body.lines().any(|l| {
+            if let Some(rest) = l.strip_prefix(prefix) {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                // "<number> kB"
+                toks.len() == 2 && toks[0].parse::<u64>().is_ok() && toks[1] == "kB"
+            } else {
+                false
+            }
+        })
+    };
+    if !check("MemTotal:") {
+        return TestResult::Fail("/proc/meminfo missing numeric-kB MemTotal: line");
+    }
+    if !check("MemFree:") {
+        return TestResult::Fail("/proc/meminfo missing numeric-kB MemFree: line");
+    }
+    if !check("MemAvailable:") {
+        return TestResult::Fail("/proc/meminfo missing numeric-kB MemAvailable: line");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "procsys_e2e/global",
+    e2e_global_meminfo_memtotal_memfree_numeric_kb
+);
+
+// ── /proc/stat ───────────────────────────────────────────────────────────────
+
+/// `/proc/stat` opens with a `cpu ` aggregate line carrying the 10 Linux
+/// jiffy columns (user nice system idle iowait irq softirq steal guest
+/// gnice), and carries the `intr`/`ctxt`/`btime`/`processes` summary lines
+/// that vmstat/top parse.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_stat_cpu_aggregate_and_summary_lines() -> TestResult {
+    let body = match read_root_file("stat") {
+        Some(s) => s,
+        None => return TestResult::Fail("/proc/stat did not resolve/read"),
+    };
+    // Aggregate line: "cpu " + 10 integer columns (11 whitespace tokens).
+    let agg = match body.lines().find(|l| l.starts_with("cpu ")) {
+        Some(l) => l,
+        None => return TestResult::Fail("/proc/stat missing 'cpu ' aggregate line"),
+    };
+    let toks: Vec<&str> = agg.split_whitespace().collect();
+    if toks.len() != 11 {
+        return TestResult::Fail("/proc/stat 'cpu' aggregate must have 10 value columns");
+    }
+    if toks[1..].iter().any(|t| t.parse::<u64>().is_err()) {
+        return TestResult::Fail("/proc/stat 'cpu' aggregate columns must be integers");
+    }
+    for key in ["intr ", "ctxt ", "btime ", "processes "] {
+        if !body.lines().any(|l| l.starts_with(key)) {
+            return TestResult::Fail("/proc/stat missing a required summary line");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "procsys_e2e/global",
+    e2e_global_stat_cpu_aggregate_and_summary_lines
+);
+
+// ── /proc/uptime ─────────────────────────────────────────────────────────────
+
+/// `/proc/uptime` is two space-separated floats (uptime, idle), each with a
+/// decimal point. `uptime(1)` and `procps` split on whitespace.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_uptime_two_floats() -> TestResult {
+    let body = match read_root_file("uptime") {
+        Some(s) => s,
+        None => return TestResult::Fail("/proc/uptime did not resolve/read"),
+    };
+    let toks: Vec<&str> = body.trim_end().split_whitespace().collect();
+    if toks.len() != 2 {
+        return TestResult::Fail("/proc/uptime must be exactly two tokens");
+    }
+    for t in &toks {
+        // Must be a float: contains a '.' and both sides parse as integers.
+        match t.split_once('.') {
+            Some((i, f)) if i.parse::<u64>().is_ok() && f.parse::<u64>().is_ok() => {}
+            _ => return TestResult::Fail("/proc/uptime token is not a decimal float"),
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("procsys_e2e/global", e2e_global_uptime_two_floats);
+
+// ── /proc/loadavg ────────────────────────────────────────────────────────────
+
+/// `/proc/loadavg` is the Linux 5-field shape: three x.xx EWMA floats, a
+/// `running/total` token, and a last-pid integer.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_loadavg_five_field_shape() -> TestResult {
+    let body = match read_root_file("loadavg") {
+        Some(s) => s,
+        None => return TestResult::Fail("/proc/loadavg did not resolve/read"),
+    };
+    let toks: Vec<&str> = body.trim_end().split_whitespace().collect();
+    if toks.len() != 5 {
+        return TestResult::Fail("/proc/loadavg must have exactly 5 fields");
+    }
+    // First three: x.xx floats with a 2-digit fraction.
+    for t in toks.iter().take(3) {
+        match t.split_once('.') {
+            Some((i, f)) if i.parse::<u64>().is_ok() && f.len() == 2 && f.parse::<u64>().is_ok() => {
+            }
+            _ => return TestResult::Fail("/proc/loadavg average is not an x.xx float"),
+        }
+    }
+    // Field 4: running/total, both integers.
+    match toks[3].split_once('/') {
+        Some((r, t)) if r.parse::<u64>().is_ok() && t.parse::<u64>().is_ok() => {}
+        _ => return TestResult::Fail("/proc/loadavg running/total token malformed"),
+    }
+    // Field 5: last pid, integer.
+    if toks[4].parse::<u64>().is_err() {
+        return TestResult::Fail("/proc/loadavg last-pid field is not an integer");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("procsys_e2e/global", e2e_global_loadavg_five_field_shape);
+
+// ── /proc/filesystems ────────────────────────────────────────────────────────
+
+/// `/proc/filesystems` lists the mounted fs-type tokens; `proc` and `tmpfs`
+/// (both mounted in a booted NARF) must appear. Bare `mount` scans this for
+/// the fs-type token. NARF omits the Linux "nodev" prefix, so each line is a
+/// tab followed by the bare type name.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_filesystems_lists_known_types() -> TestResult {
+    let body = match read_root_file("filesystems") {
+        Some(s) => s,
+        None => return TestResult::Fail("/proc/filesystems did not resolve/read"),
+    };
+    // The set of type tokens is the trailing token of each line.
+    let has = |ty: &str| body.lines().any(|l| l.split_whitespace().next() == Some(ty));
+    // procfs is always mounted (we are reading it), so "proc" must be present.
+    if !has("proc") {
+        return TestResult::Fail("/proc/filesystems missing 'proc' type");
+    }
+    // Every rendered line must be a single non-empty type token.
+    for l in body.lines() {
+        let toks: Vec<&str> = l.split_whitespace().collect();
+        if toks.len() != 1 || toks[0].is_empty() {
+            return TestResult::Fail("/proc/filesystems line is not a single type token");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("procsys_e2e/global", e2e_global_filesystems_lists_known_types);
+
+// ── /proc/mounts ─────────────────────────────────────────────────────────────
+
+/// Each `/proc/mounts` line is the fstab-shaped 6-column record
+/// `dev mountpoint fstype opts 0 0` that `mount`, `df`, and libmount parse.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_mounts_six_column_shape() -> TestResult {
+    let body = match read_root_file("mounts") {
+        Some(s) => s,
+        None => return TestResult::Fail("/proc/mounts did not resolve/read"),
+    };
+    let mut lines = 0usize;
+    for l in body.lines() {
+        if l.is_empty() {
+            continue;
+        }
+        lines += 1;
+        let cols: Vec<&str> = l.split_whitespace().collect();
+        if cols.len() != 6 {
+            return TestResult::Fail("/proc/mounts line does not have 6 columns");
+        }
+        // Trailing two dump/pass columns are "0 0".
+        if cols[4] != "0" || cols[5] != "0" {
+            return TestResult::Fail("/proc/mounts trailing columns are not '0 0'");
+        }
+    }
+    if lines == 0 {
+        return TestResult::Fail("/proc/mounts rendered no mount lines");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("procsys_e2e/global", e2e_global_mounts_six_column_shape);
+
+// ── /proc/cpuinfo ────────────────────────────────────────────────────────────
+
+/// `/proc/cpuinfo` records begin with a `processor\t: <n>` line and carry a
+/// `model name` field — the two lines lscpu / hwloc / build probes read.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_cpuinfo_processor_and_model_name() -> TestResult {
+    let body = match read_root_file("cpuinfo") {
+        Some(s) => s,
+        None => return TestResult::Fail("/proc/cpuinfo did not resolve/read"),
+    };
+    // First non-empty line must introduce processor 0.
+    let first = match body.lines().find(|l| !l.is_empty()) {
+        Some(l) => l,
+        None => return TestResult::Fail("/proc/cpuinfo is empty"),
+    };
+    if !first.starts_with("processor") || !first.contains(':') {
+        return TestResult::Fail("/proc/cpuinfo does not start with a 'processor :' line");
+    }
+    if !body.lines().any(|l| l.starts_with("model name")) {
+        return TestResult::Fail("/proc/cpuinfo missing a 'model name' line");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("procsys_e2e/global", e2e_global_cpuinfo_processor_and_model_name);
+
+// ── /proc/version ────────────────────────────────────────────────────────────
+
+/// `/proc/version` is a single line naming the kernel ("NARF kernel ...").
+#[cfg(feature = "linux-compat")]
+fn e2e_global_version_single_kernel_line() -> TestResult {
+    let body = match read_root_file("version") {
+        Some(s) => s,
+        None => return TestResult::Fail("/proc/version did not resolve/read"),
+    };
+    if !body.starts_with("NARF kernel ") {
+        return TestResult::Fail("/proc/version does not start with 'NARF kernel '");
+    }
+    // Exactly one text line (single trailing newline).
+    if body.trim_end_matches('\n').contains('\n') {
+        return TestResult::Fail("/proc/version is not a single line");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("procsys_e2e/global", e2e_global_version_single_kernel_line);
+
+// ── /proc/cmdline ────────────────────────────────────────────────────────────
+
+/// `/proc/cmdline` is a single newline-terminated line — the boot command
+/// line systemd and dracut parse.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_cmdline_single_line() -> TestResult {
+    let body = match read_root_file("cmdline") {
+        Some(s) => s,
+        None => return TestResult::Fail("/proc/cmdline did not resolve/read"),
+    };
+    // Terminated by exactly one '\n' and no embedded newlines.
+    if !body.ends_with('\n') {
+        return TestResult::Fail("/proc/cmdline is not newline-terminated");
+    }
+    if body.trim_end_matches('\n').contains('\n') {
+        return TestResult::Fail("/proc/cmdline has embedded newlines");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("procsys_e2e/global", e2e_global_cmdline_single_line);
+
+// ── /proc/self ───────────────────────────────────────────────────────────────
+
+/// `/proc/self` stats as a symlink whose readlink text is the caller's pid.
+/// With no current-pid hook installed in the test harness the hook falls
+/// back to pid 0, so the target must be the decimal string of `current_pid`.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_self_is_symlink_to_pid() -> TestResult {
+    use alloc::string::ToString;
+    use alloc::sync::Arc;
+    let root: Arc<dyn DirOps> = Arc::new(ProcRoot);
+    let f = match root.lookup("self") {
+        Some(f) => f,
+        None => return TestResult::Fail("/proc/self did not resolve"),
+    };
+    // Must stat as a symlink so readlink(2)/lstat(2) treat it correctly.
+    if f.stat().mode.file_type != FileType::Symlink {
+        return TestResult::Fail("/proc/self is not a Symlink");
+    }
+    // readlink target is the caller pid as decimal.
+    let expected = crate::procfs::current_pid().to_string();
+    let mut buf = [0u8; 32];
+    let n = match poll_once(f.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("/proc/self readlink read failed"),
+    };
+    match core::str::from_utf8(&buf[..n]) {
+        Ok(t) if t == expected => TestResult::Pass,
+        _ => TestResult::Fail("/proc/self target is not the caller's pid"),
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("procsys_e2e/global", e2e_global_self_is_symlink_to_pid);
+
+// ── /proc/pressure/{cpu,memory,io} ───────────────────────────────────────────
+
+/// The PSI files resolve through `/proc/pressure` and read back the
+/// `some avg10=... avg60=... avg300=... total=...` shape; `cpu` has only a
+/// `some` line while `memory`/`io` add a `full` line.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_pressure_psi_shape() -> TestResult {
+    use alloc::sync::Arc;
+    let root: Arc<dyn DirOps> = Arc::new(ProcRoot);
+    let dir = match root.lookup_dir("pressure") {
+        Some(d) => d,
+        None => return TestResult::Fail("/proc/pressure did not resolve as a directory"),
+    };
+
+    let read_psi = |name: &str| -> Option<String> {
+        let f = dir.lookup(name)?;
+        let mut buf = [0u8; 256];
+        let n = match poll_once(f.read(0, &mut buf)) {
+            Some(Ok(n)) => n,
+            _ => return None,
+        };
+        String::from_utf8(buf[..n].to_vec()).ok()
+    };
+
+    // Validate one PSI line: leading tag then avg10=/avg60=/avg300=/total=.
+    let psi_line_ok = |line: &str, tag: &str| -> bool {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        toks.len() == 5
+            && toks[0] == tag
+            && toks[1].starts_with("avg10=")
+            && toks[2].starts_with("avg60=")
+            && toks[3].starts_with("avg300=")
+            && toks[4].starts_with("total=")
+    };
+
+    // cpu: exactly one "some" line.
+    let cpu = match read_psi("cpu") {
+        Some(s) => s,
+        None => return TestResult::Fail("/proc/pressure/cpu read failed"),
+    };
+    let cpu_lines: Vec<&str> = cpu.lines().collect();
+    if cpu_lines.len() != 1 || !psi_line_ok(cpu_lines[0], "some") {
+        return TestResult::Fail("/proc/pressure/cpu is not a single well-formed 'some' line");
+    }
+
+    // memory + io: a "some" line then a "full" line.
+    for res in ["memory", "io"] {
+        let body = match read_psi(res) {
+            Some(s) => s,
+            None => return TestResult::Fail("/proc/pressure/<res> read failed"),
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        if lines.len() != 2
+            || !psi_line_ok(lines[0], "some")
+            || !psi_line_ok(lines[1], "full")
+        {
+            return TestResult::Fail("/proc/pressure/{memory,io} not 'some'+'full' PSI lines");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("procsys_e2e/global", e2e_global_pressure_psi_shape);
+
+// ── /proc/sys/kernel/seccomp/actions_avail ───────────────────────────────────
+
+/// `/proc/sys/kernel/seccomp/actions_avail` lists the seccomp filter action
+/// tokens libseccomp probes; the `allow` and `errno` actions must be present.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_seccomp_actions_avail_lists_actions() -> TestResult {
+    sys_kernel::register_all();
+    let body = match sysctl_read(&["sys", "kernel", "seccomp", "actions_avail"]) {
+        Some(s) => s,
+        None => return TestResult::Fail("seccomp/actions_avail not found in registry"),
+    };
+    let toks: Vec<&str> = body.split_whitespace().collect();
+    // libseccomp checks for the canonical action names it can request.
+    for want in ["kill_process", "kill_thread", "trap", "errno", "trace", "log", "allow"] {
+        if !toks.iter().any(|t| *t == want) {
+            return TestResult::Fail("seccomp/actions_avail missing a required action");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "procsys_e2e/global",
+    e2e_global_seccomp_actions_avail_lists_actions
+);
+
+// ── /proc/sys/kernel read-only identity keys ─────────────────────────────────
+
+/// The kernel identity sysctls read as their documented constants:
+/// ostype "NARF", non-empty osrelease, default hostname "narf", and a
+/// numeric pid_max within the Linux PID_MAX_LIMIT.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_sys_kernel_identity_keys() -> TestResult {
+    sys_kernel::register_all();
+
+    match sysctl_read(&["sys", "kernel", "ostype"]).as_deref() {
+        Some("NARF") => {}
+        _ => return TestResult::Fail("kernel/ostype is not 'NARF'"),
+    }
+    match sysctl_read(&["sys", "kernel", "osrelease"]) {
+        Some(s) if !s.is_empty() => {}
+        _ => return TestResult::Fail("kernel/osrelease missing or empty"),
+    }
+    // hostname default is "narf" (reset to isolate from any prior write).
+    let _ = sysctl_write(&["sys", "kernel", "hostname"], b"narf\n");
+    match sysctl_read(&["sys", "kernel", "hostname"]).as_deref() {
+        Some("narf") => {}
+        _ => return TestResult::Fail("kernel/hostname default is not 'narf'"),
+    }
+    match sysctl_read(&["sys", "kernel", "pid_max"]).and_then(|s| s.parse::<u32>().ok()) {
+        Some(n) if n >= 1 && n <= 4_194_304 => {}
+        _ => return TestResult::Fail("kernel/pid_max not a valid PID_MAX_LIMIT-bounded integer"),
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("procsys_e2e/global", e2e_global_sys_kernel_identity_keys);
+
+// ── /proc/sys/vm + /proc/sys/fs known keys ───────────────────────────────────
+
+/// Representative `/proc/sys/vm/*` and `/proc/sys/fs/*` keys resolve and
+/// read as integers: vm.swappiness (0..=200), vm.overcommit_memory, and
+/// fs.file-max.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_sys_vm_fs_known_keys_numeric() -> TestResult {
+    sys_vm::register_all();
+    crate::procfs::sys_fs::register_all();
+
+    // vm.swappiness: reset to default, then confirm it reads in range.
+    let _ = sysctl_write(&["sys", "vm", "swappiness"], b"60\n");
+    match sysctl_read(&["sys", "vm", "swappiness"]).and_then(|s| s.parse::<u64>().ok()) {
+        Some(n) if n <= 200 => {}
+        _ => return TestResult::Fail("vm/swappiness not an in-range integer"),
+    }
+    // vm.overcommit_memory is one of 0/1/2.
+    match sysctl_read(&["sys", "vm", "overcommit_memory"]).and_then(|s| s.parse::<u64>().ok()) {
+        Some(n) if n <= 2 => {}
+        _ => return TestResult::Fail("vm/overcommit_memory not 0/1/2"),
+    }
+    // fs.file-max is a positive integer.
+    match sysctl_read(&["sys", "fs", "file-max"]).and_then(|s| s.parse::<u64>().ok()) {
+        Some(n) if n >= 1 => {}
+        _ => return TestResult::Fail("fs/file-max not a positive integer"),
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("procsys_e2e/global", e2e_global_sys_vm_fs_known_keys_numeric);
+
+// ── /proc entries stat as the correct node type ──────────────────────────────
+
+/// A flat global file (`meminfo`) stats as a regular file, `self` as a
+/// symlink, and `pressure` as a directory — the node-type distinctions
+/// `resolve_async` and readdir rely on.
+#[cfg(feature = "linux-compat")]
+fn e2e_global_node_types_file_symlink_dir() -> TestResult {
+    use alloc::sync::Arc;
+    let root: Arc<dyn DirOps> = Arc::new(ProcRoot);
+
+    let meminfo = match root.lookup("meminfo") {
+        Some(f) => f,
+        None => return TestResult::Fail("/proc/meminfo did not resolve"),
+    };
+    if meminfo.stat().mode.file_type != FileType::File {
+        return TestResult::Fail("/proc/meminfo does not stat as a regular File");
+    }
+    if meminfo.stat().mode != Mode::FILE_RO {
+        return TestResult::Fail("/proc/meminfo is not read-only");
+    }
+
+    match root.lookup("self") {
+        Some(f) if f.stat().mode.file_type == FileType::Symlink => {}
+        _ => return TestResult::Fail("/proc/self does not stat as a Symlink"),
+    }
+
+    // pressure resolves as a directory (via lookup_dir).
+    if root.lookup_dir("pressure").is_none() {
+        return TestResult::Fail("/proc/pressure does not resolve as a directory");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("procsys_e2e/global", e2e_global_node_types_file_symlink_dir);

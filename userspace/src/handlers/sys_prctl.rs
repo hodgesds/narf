@@ -197,6 +197,18 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(0));
             }
         }
+        21 /* PR_GET_SECCOMP */ => {
+            let mode = read_prctl(task).seccomp_mode;
+            ctx.set_return(SyscallReturn::ok(mode as u64));
+        }
+        22 /* PR_SET_SECCOMP */ => {
+            let mode = if arg_a != 0 { 2 } else { 0 };
+            modify_prctl(task, |s| s.seccomp_mode = mode);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        52 /* PR_GET_SPECULATION_CTRL */ | 53 /* PR_SET_SPECULATION_CTRL */ | 0x53564d41 /* PR_SET_VMA */ => {
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         _ => ctx.set_return(fail),
     }
 }

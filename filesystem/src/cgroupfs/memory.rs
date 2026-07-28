@@ -79,18 +79,20 @@ const FILES: &[&str] = &[
 /// first time any `memory` cgroup state is created (`new_state`), so no
 /// external boot wiring is required.
 static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+static IN_CHARGE: AtomicBool = AtomicBool::new(false);
 
-/// The charge hook `narf-memory` calls on every user-facing frame
-/// allocation (`delta_bytes > 0`) and free (`delta_bytes < 0`).
-///
-/// Returns `true` if the (positive) charge is allowed, `false` if it
-/// would push some level over its `memory.max` — in which case the
-/// allocation is denied. Negative deltas always return `true`.
-///
-/// Two-phase for positive deltas: pre-check every level against its
-/// `max` (charging nothing), and only commit if all levels pass, so a
-/// rejected allocation leaves accounting untouched.
 fn charge_hook(pid: u64, delta_bytes: i64) -> bool {
+    if IN_CHARGE.swap(true, Ordering::AcqRel) {
+        return true;
+    }
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            IN_CHARGE.store(false, Ordering::Release);
+        }
+    }
+    let _guard = Guard;
+
     // Collect the chain's `MemoryState`s once (clone the `Arc`s so we
     // can iterate them twice without holding the chain lock across the
     // closure body).
@@ -128,6 +130,32 @@ fn charge_hook(pid: u64, delta_bytes: i64) -> bool {
         }
     }
     true
+}
+
+/// Test-only seam: drive the chain-walking [`charge_hook`] directly
+/// (the allocator normally invokes it via the installed fn-pointer).
+/// Lets the cgroupfs tests exercise the re-entrancy guard and the
+/// two-phase `memory.max` enforcement over a real cgroup chain without a
+/// live frame allocation.
+#[doc(hidden)]
+pub fn charge_hook_for_test(pid: u64, delta_bytes: i64) -> bool {
+    charge_hook(pid, delta_bytes)
+}
+
+/// Test-only seam: is a charge currently in progress on this path? Lets
+/// a test observe the re-entrancy guard's state to synthesise a nested
+/// entry deterministically.
+#[doc(hidden)]
+pub fn in_charge_for_test() -> bool {
+    IN_CHARGE.load(Ordering::Acquire)
+}
+
+/// Test-only seam: raise/lower the re-entrancy guard so a test can
+/// simulate a nested `charge_hook` entry (the real nesting arises when
+/// the charge path itself allocates). Returns the previous value.
+#[doc(hidden)]
+pub fn set_in_charge_for_test(v: bool) -> bool {
+    IN_CHARGE.swap(v, Ordering::AcqRel)
 }
 
 /// Install the allocator charge plumbing exactly once.

@@ -26,12 +26,7 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     #[cfg(feature = "container")]
     if flags & CLONE_NEWPID != 0 {
         let task = current_task_id();
-        // The task's outer pid is what the root-namespace fork
-        // recorded. If no mapping is present, fall back to the task
-        // id itself — it's a kernel-spawned task with implicit
-        // outer == inner already.
-        let outer = task_to_pid_raw(task).unwrap_or(task);
-        let _ns = crate::pid_ns::unshare_pid_ns(task, outer);
+        let _ns = crate::pid_ns::unshare_pid_ns_for_children(task);
         any = true;
     }
 

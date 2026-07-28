@@ -1085,6 +1085,42 @@ fn open_impl(
         }
     };
 
+    // O_PATH: install a bare path-reference fd. Per Linux `do_dentry_open`,
+    // an O_PATH open resolves the node but invokes NO file operation — no
+    // FIFO peer-rendezvous, no /dev/ptmx clone, no device `open`, and no
+    // read/write permission check on the file itself (O_PATH needs only
+    // search permission on the path components, already enforced by
+    // resolution). The resulting fd is usable for fstat / as an `openat`
+    // dirfd base / readlinkat, which is exactly what a walker needs. Without
+    // this, `systemd-tmpfiles-setup-dev` and sd-device — which scan /dev with
+    // `openat(…, O_PATH|O_NOFOLLOW)` purely to stat each node — parked forever
+    // the moment they reached a FIFO with no writer. Directories still wrap in
+    // `DirFdFile` so `openat`-relative descent and getdents work.
+    if flags & O_PATH != 0 {
+        let ops = if let Some(dirops) = ops.as_dir() {
+            alloc::sync::Arc::new(DirFdFile { dir: dirops }) as Arc<dyn narf_filesystem::FileOps>
+        } else {
+            ops
+        };
+        let new_fd = fd::with_table(task, |t| {
+            t.open(crate::fd::FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags: open_status_flags,
+            })
+        });
+        match new_fd {
+            Some(n) => {
+                #[cfg(feature = "linux-compat")]
+                crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
+                ctx.set_return(SyscallReturn::ok(n as u64));
+            }
+            None => ctx.set_return(fail),
+        }
+        return;
+    }
+
     // POSIX-2017 permission check. The accessor's UID/GID come from
     // the per-task uidgid table; the file's owners + perms come from
     // its FileOps trait. UID 0 (root) shortcuts; non-root must own
@@ -5114,17 +5150,18 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     #[cfg(feature = "container")]
     {
         let child = child_tid.raw();
+        let parent_task = current_task_id();
         // PID + mount namespaces (only meaningful for a new process).
         if !share_thread {
             // Binds the child into the parent's pid namespace (keyed by the
             // child's TaskId) and yields the inner pid the parent should see;
             // None in the root namespace leaves the outer pid unchanged.
             if let Some(inner) =
-                crate::pid_ns::inherit_into_child(parent_pid, child, child_visible_pid)
+                crate::pid_ns::inherit_into_child(parent_task, child, child_visible_pid)
             {
                 child_ns_pid = inner;
             }
-            mount_ns_inherit(parent_pid, child);
+            mount_ns_inherit(parent_task, child);
             const CLONE_NEWNS: u64 = 0x00020000;
             const CLONE_NEWPID: u64 = 0x20000000;
             if flags & CLONE_NEWNS != 0 {
@@ -5138,9 +5175,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         }
         // UTS / NET / IPC / User: shared by ref, then CLONE_NEW* mints
         // a fresh one for the child.
-        crate::namespaces::inherit_into_child(parent_pid, child);
+        crate::namespaces::inherit_into_child(parent_task, child);
         if flags & crate::namespaces::CLONE_NEWUSER != 0 {
-            let host_uid = read_uidgid(parent_pid).euid;
+            let host_uid = read_uidgid(parent_task).euid;
             let _ = crate::namespaces::unshare_user(child, host_uid);
             let _ = write_uidgid(child, |e| {
                 e.uid = 0;
@@ -7082,7 +7119,7 @@ pub(crate) fn pgid_to_user(task_space_id: u64) -> u64 {
         return 0;
     }
     let outer = task_to_pid_raw(task_space_id).unwrap_or(task_space_id);
-    crate::pid_ns::self_inner_pid(task_space_id, outer)
+    report_pid_to(current_task_id(), outer)
 }
 #[cfg(not(feature = "container"))]
 #[inline]
@@ -7752,6 +7789,7 @@ struct PrctlState {
     /// unimplemented GET returned -1, forcing a doomed SET on every
     /// service start (exit 213/EXIT_SECUREBITS).
     securebits: u64,
+    seccomp_mode: u32,
 }
 
 impl Default for PrctlState {
@@ -7765,6 +7803,7 @@ impl Default for PrctlState {
             keep_caps: false,
             ambient_caps: 0, // empty ambient set at exec, per Linux
             securebits: 0,   // SECBIT_* all clear, per Linux default
+            seccomp_mode: 0,
         }
     }
 }
@@ -14318,7 +14357,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Setns, "setns", RawFnHandler(sys_setns));
     #[cfg(feature = "linux-compat")]
     table.install_raw(Syscall::Chroot, "chroot", RawFnHandler(sys_chroot));
-    #[cfg(all(feature = "linux-compat", feature = "container"))]
+    #[cfg(feature = "linux-compat")]
     table.install_raw(
         Syscall::PivotRoot,
         "pivot_root",
@@ -14578,6 +14617,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_sched_setparam),
     );
     table.install_raw(Syscall::Prctl, "prctl", RawFnHandler(sys_prctl));
+    table.install_raw(Syscall::Seccomp, "seccomp", RawFnHandler(sys_seccomp));
     table.install_raw(
         Syscall::Getpriority,
         "getpriority",
@@ -16290,6 +16330,8 @@ mod handler_sys_sched_setattr;
 mod handler_sys_sched_setparam;
 #[path = "sys_sched_setscheduler.rs"]
 mod handler_sys_sched_setscheduler;
+#[path = "sys_seccomp.rs"]
+mod handler_sys_seccomp;
 #[path = "sys_semget.rs"]
 mod handler_sys_semget;
 #[path = "sys_sendfile.rs"]
@@ -16719,6 +16761,7 @@ pub(crate) use {
     handler_sys_sched_setattr::sys_sched_setattr,
     handler_sys_sched_setparam::sys_sched_setparam,
     handler_sys_sched_setscheduler::sys_sched_setscheduler,
+    handler_sys_seccomp::sys_seccomp,
     handler_sys_sendfile::sys_sendfile,
     handler_sys_set_mempolicy::sys_set_mempolicy,
     handler_sys_set_mempolicy_home_node::sys_set_mempolicy_home_node,

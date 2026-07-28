@@ -976,6 +976,375 @@ kernel_test_in!(
     smoke_vfs_stat_correct_size_mode_blocks
 );
 
+// ── Smoke 11: lock released across resolve_absolute closure ──────────
+//
+// REGRESSION GUARD for the SMP mount-table deadlock fixed in lib.rs.
+//
+// `VfsRegistry::{resolve_absolute, with_mount, resolve_parent_absolute}`
+// used to run their user closure WHILE HOLDING the `inner` IrqSafeSpinLock.
+// Callers pass BLOCKING closures (block-I/O resolvers busy-spin in
+// `poll_blocking`), so holding the IRQ-disabling lock across the closure
+// deadlocked the box under an SMP statx storm. The fix clones the
+// `Arc<dyn FsInstance>` + relative path out, DROPS the lock, THEN runs the
+// closure.
+//
+// To prove the lock is no longer held across the closure, we perform a
+// NESTED call back into the SAME registry FROM INSIDE the closure — a call
+// that itself acquires the `inner` lock (`mount_id_at`, and another
+// `resolve_absolute`). If the outer lock were still held, this nested
+// acquisition of the same non-reentrant `IrqSafeSpinLock` would deadlock
+// (hang the test forever). A test that RETURNS AT ALL therefore proves the
+// lock was released; we additionally assert the nested lookup returns the
+// correct value for a DIFFERENT mount.
+
+fn smoke_vfs_resolve_absolute_lock_released_in_closure() -> TestResult {
+    const PATH_A: &str = "/fme11a";
+    const PATH_B: &str = "/fme11b";
+
+    let fs_a = match make_initramfs(
+        "fme11a",
+        &[CpioEntry {
+            name: "a.txt",
+            mode: 0o100644,
+            data: b"aa",
+        }],
+    ) {
+        Some(f) => f,
+        None => return TestResult::Fail("CPIO build A failed"),
+    };
+    let fs_b = match make_initramfs(
+        "fme11b",
+        &[CpioEntry {
+            name: "b.txt",
+            mode: 0o100644,
+            data: b"bb",
+        }],
+    ) {
+        Some(f) => f,
+        None => return TestResult::Fail("CPIO build B failed"),
+    };
+
+    let auth = bootstrap_mount_authority();
+    let handle_a = match registry().mount(&auth, PATH_A, fs_a) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount A failed"),
+    };
+    let handle_b = match registry().mount(&auth, PATH_B, fs_b) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&handle_a, PATH_A);
+            return TestResult::Fail("mount B failed");
+        }
+    };
+
+    // The id of mount B, obtained WITHOUT any nesting, for comparison.
+    let expected_b_id = registry().mount_id_at(PATH_B);
+
+    // Resolve against mount A. INSIDE the closure — which now runs with
+    // the `inner` lock RELEASED — make two nested re-entrant calls that
+    // both re-acquire the `inner` lock. If the lock were still held these
+    // would deadlock. Return the nested results so we can assert on them.
+    let nested = registry().resolve_absolute(PATH_A, |_fs, _rel| {
+        // Nested lock-taking call #1: mount_id_at re-locks `inner`.
+        let nested_id = registry().mount_id_at(PATH_B);
+        // Nested lock-taking call #2: another resolve_absolute (different
+        // mount) re-locks `inner` and runs its own closure.
+        let nested_resolve = registry().resolve_absolute(PATH_B, |fs, rel| {
+            (String::from(rel), resolve(fs.root(), "b.txt").is_ok())
+        });
+        (nested_id, nested_resolve)
+    });
+
+    let _ = registry().unmount(&handle_a, PATH_A);
+    let _ = registry().unmount(&handle_b, PATH_B);
+
+    match nested {
+        Some((nested_id, Some((rel, b_ok)))) => {
+            if nested_id != expected_b_id || nested_id.is_none() {
+                return TestResult::Fail("nested mount_id_at returned wrong id");
+            }
+            if rel != "" {
+                return TestResult::Fail("nested resolve_absolute rel not empty for mount root");
+            }
+            if !b_ok {
+                return TestResult::Fail("nested resolve failed to read b.txt");
+            }
+            TestResult::Pass
+        }
+        Some((_, None)) => TestResult::Fail("nested resolve_absolute returned None"),
+        None => TestResult::Fail("outer resolve_absolute returned None for live mount"),
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_resolve_absolute_lock_released_in_closure
+);
+
+// ── Smoke 11b: lock released across with_mount closure ───────────────
+//
+// Same regression guard as smoke 11, for `with_mount`. A nested
+// `mount_id_at` (which re-locks `inner`) inside the `with_mount` closure
+// would deadlock if `with_mount` still held the lock across the closure.
+
+fn smoke_vfs_with_mount_lock_released_in_closure() -> TestResult {
+    const PATH_A: &str = "/fme11ba";
+    const PATH_B: &str = "/fme11bb";
+
+    let auth = bootstrap_mount_authority();
+    let handle_a = match registry().mount(&auth, PATH_A, MemFs::new("fme11ba")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount A failed"),
+    };
+    let handle_b = match registry().mount(&auth, PATH_B, MemFs::new("fme11bb")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&handle_a, PATH_A);
+            return TestResult::Fail("mount B failed");
+        }
+    };
+
+    let expected_b_id = registry().mount_id_at(PATH_B);
+
+    // Inside with_mount(A): nested lock-taking calls targeting mount B.
+    let nested = registry().with_mount(PATH_A, |_fs| {
+        let id = registry().mount_id_at(PATH_B);
+        let also = registry().with_mount(PATH_B, |fs| String::from(fs.name()));
+        (id, also)
+    });
+
+    let _ = registry().unmount(&handle_a, PATH_A);
+    let _ = registry().unmount(&handle_b, PATH_B);
+
+    match nested {
+        Some((id, Some(name))) => {
+            if id != expected_b_id || id.is_none() {
+                return TestResult::Fail("nested mount_id_at returned wrong id under with_mount");
+            }
+            if name != "fme11bb" {
+                return TestResult::Fail("nested with_mount saw wrong FS name");
+            }
+            TestResult::Pass
+        }
+        Some((_, None)) => TestResult::Fail("nested with_mount returned None"),
+        None => TestResult::Fail("outer with_mount returned None for live mount"),
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_with_mount_lock_released_in_closure
+);
+
+// ── Smoke 11c: lock released across resolve_parent_absolute closure ──
+//
+// Same regression guard, for `resolve_parent_absolute`. The nested
+// `mount_id_at` + `resolve_absolute` re-lock `inner`; a lock still held
+// across the closure would deadlock.
+
+fn smoke_vfs_resolve_parent_absolute_lock_released_in_closure() -> TestResult {
+    const PATH_A: &str = "/fme11ca";
+    const PATH_B: &str = "/fme11cb";
+
+    let auth = bootstrap_mount_authority();
+    let handle_a = match registry().mount(&auth, PATH_A, MemFs::new("fme11ca")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount A failed"),
+    };
+    let handle_b = match registry().mount(&auth, PATH_B, MemFs::new("fme11cb")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&handle_a, PATH_A);
+            return TestResult::Fail("mount B failed");
+        }
+    };
+
+    let expected_b_id = registry().mount_id_at(PATH_B);
+
+    // resolve_parent_absolute of "/fme11ca/leaf": parent is the A mount
+    // root, leaf == "leaf". Inside the closure (lock released) re-enter.
+    let nested = registry().resolve_parent_absolute("/fme11ca/leaf", |_fs, _dir, leaf| {
+        let id = registry().mount_id_at(PATH_B);
+        let also = registry().resolve_absolute(PATH_B, |fs, rel| {
+            (String::from(rel), String::from(fs.name()))
+        });
+        (String::from(leaf), id, also)
+    });
+
+    let _ = registry().unmount(&handle_a, PATH_A);
+    let _ = registry().unmount(&handle_b, PATH_B);
+
+    match nested {
+        Some((leaf, id, Some((rel, name)))) => {
+            if leaf != "leaf" {
+                return TestResult::Fail("resolve_parent_absolute produced wrong leaf");
+            }
+            if id != expected_b_id || id.is_none() {
+                return TestResult::Fail("nested mount_id_at wrong under resolve_parent_absolute");
+            }
+            if rel != "" || name != "fme11cb" {
+                return TestResult::Fail("nested resolve_absolute wrong under parent closure");
+            }
+            TestResult::Pass
+        }
+        Some((_, _, None)) => TestResult::Fail("nested resolve_absolute returned None"),
+        None => TestResult::Fail("outer resolve_parent_absolute returned None for live mount"),
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_resolve_parent_absolute_lock_released_in_closure
+);
+
+// ── Smoke 12: longest-prefix mount matching ──────────────────────────
+//
+// With `/fme12` and `/fme12/sub` BOTH mounted, `resolve_absolute` must
+// pick the LONGEST matching mount prefix:
+//   `/fme12/sub/bar` → resolves against the `/fme12/sub` mount, rel="bar"
+//   `/fme12/foo`     → resolves against the `/fme12`     mount, rel="foo"
+//
+// The relative path handed to the closure is what proves which mount was
+// chosen: a "bar" rel means the `/fme12/sub` mount matched (had the shorter
+// mount matched, rel would be "sub/bar").
+//
+// References: Linux `fs/namespace.c` — the mount hash picks the deepest
+// mount covering a dentry.
+
+fn smoke_vfs_longest_prefix_mount_match() -> TestResult {
+    const PATH_TOP: &str = "/fme12";
+    const PATH_SUB: &str = "/fme12/sub";
+
+    let auth = bootstrap_mount_authority();
+    let handle_top = match registry().mount(&auth, PATH_TOP, MemFs::new("fme12-top")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount top failed"),
+    };
+    let handle_sub = match registry().mount(&auth, PATH_SUB, MemFs::new("fme12-sub")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&handle_top, PATH_TOP);
+            return TestResult::Fail("mount sub failed");
+        }
+    };
+
+    // `/fme12/sub/bar` must select the deeper `/fme12/sub` mount → rel "bar"
+    // and the FS name of the sub mount.
+    let deep = registry().resolve_absolute("/fme12/sub/bar", |fs, rel| {
+        (String::from(rel), String::from(fs.name()))
+    });
+    // `/fme12/foo` must select the `/fme12` mount → rel "foo".
+    let shallow = registry().resolve_absolute("/fme12/foo", |fs, rel| {
+        (String::from(rel), String::from(fs.name()))
+    });
+
+    let _ = registry().unmount(&handle_sub, PATH_SUB);
+    let _ = registry().unmount(&handle_top, PATH_TOP);
+
+    match (deep, shallow) {
+        (Some((deep_rel, deep_name)), Some((shallow_rel, shallow_name))) => {
+            if deep_rel != "bar" {
+                return TestResult::Fail("deep path did not select /fme12/sub mount (rel != bar)");
+            }
+            if deep_name != "fme12-sub" {
+                return TestResult::Fail("deep path resolved against wrong FS");
+            }
+            if shallow_rel != "foo" {
+                return TestResult::Fail("shallow path did not select /fme12 mount (rel != foo)");
+            }
+            if shallow_name != "fme12-top" {
+                return TestResult::Fail("shallow path resolved against wrong FS");
+            }
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("resolve_absolute returned None for a covered path"),
+    }
+}
+kernel_test_in!("filesystem/e2e/mount", smoke_vfs_longest_prefix_mount_match);
+
+// ── Smoke 13: mount_id_at correctness ────────────────────────────────
+//
+// `mount_id_at` returns the id of the longest-prefix mount covering a
+// path. Assertions:
+//   - Two distinct mounts have DISTINCT ids.
+//   - A path under a mount returns THAT mount's id (id at mount path ==
+//     id at a file below it).
+//   - With nested `/fme13` + `/fme13/sub`, a path under `/fme13/sub`
+//     returns the SUB mount id (longest prefix), while a path under
+//     `/fme13` but not `/fme13/sub` returns the TOP mount id.
+//   - A file under `/` (an uncovered top-level path) returns the root
+//     mount id when a `/` mount exists (installed at boot).
+
+fn smoke_vfs_mount_id_at_correctness() -> TestResult {
+    const PATH_TOP: &str = "/fme13";
+    const PATH_SUB: &str = "/fme13/sub";
+    const PATH_OTHER: &str = "/fme13other";
+
+    let auth = bootstrap_mount_authority();
+    let handle_top = match registry().mount(&auth, PATH_TOP, MemFs::new("fme13-top")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount top failed"),
+    };
+    let handle_sub = match registry().mount(&auth, PATH_SUB, MemFs::new("fme13-sub")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&handle_top, PATH_TOP);
+            return TestResult::Fail("mount sub failed");
+        }
+    };
+    let handle_other = match registry().mount(&auth, PATH_OTHER, MemFs::new("fme13-other")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&handle_sub, PATH_SUB);
+            let _ = registry().unmount(&handle_top, PATH_TOP);
+            return TestResult::Fail("mount other failed");
+        }
+    };
+
+    let id_top = registry().mount_id_at(PATH_TOP);
+    let id_sub = registry().mount_id_at(PATH_SUB);
+    let id_other = registry().mount_id_at(PATH_OTHER);
+    // A file below the top mount but NOT under /fme13/sub.
+    let id_top_file = registry().mount_id_at("/fme13/foo.txt");
+    // A file below the sub mount → longest prefix is /fme13/sub.
+    let id_sub_file = registry().mount_id_at("/fme13/sub/bar.txt");
+    // A top-level path with no explicit mount → the boot `/` mount (if any).
+    let id_root_file = registry().mount_id_at("/fme13-not-mounted-anywhere");
+
+    let _ = registry().unmount(&handle_other, PATH_OTHER);
+    let _ = registry().unmount(&handle_sub, PATH_SUB);
+    let _ = registry().unmount(&handle_top, PATH_TOP);
+
+    // All three mounts must have resolved to some id.
+    let (id_top, id_sub, id_other) = match (id_top, id_sub, id_other) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => return TestResult::Fail("mount_id_at returned None for a live mount"),
+    };
+
+    // Distinct mounts → distinct ids.
+    if id_top == id_sub || id_top == id_other || id_sub == id_other {
+        return TestResult::Fail("distinct mounts returned duplicate ids");
+    }
+
+    // A file under the top mount (not under /sub) maps to the top id.
+    if id_top_file != Some(id_top) {
+        return TestResult::Fail("file under /fme13 did not map to top mount id");
+    }
+
+    // A file under the sub mount maps to the sub (longest-prefix) id.
+    if id_sub_file != Some(id_sub) {
+        return TestResult::Fail("file under /fme13/sub did not map to sub mount id");
+    }
+
+    // An uncovered top-level path falls back to the root mount when a `/`
+    // mount exists. It must NOT match any of our /fme13 mounts. If the boot
+    // `/` mount is present it returns that root id; if not, None. Either way
+    // it must differ from the three /fme13 mount ids.
+    if matches!(id_root_file, Some(x) if x == id_top || x == id_sub || x == id_other) {
+        return TestResult::Fail("uncovered path incorrectly matched a /fme13 mount");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/e2e/mount", smoke_vfs_mount_id_at_correctness);
+
 // ── FS coverage matrix ────────────────────────────────────────────────
 //
 // The VFS layer is FS-agnostic: every FsInstance goes through the same

@@ -110,26 +110,49 @@ pub struct CpuState {
     members: IrqSafeSpinLock<BTreeSet<u64>>,
 }
 
-/// `cpu.weight` (1..=10000) → nice (-20..=19). Default weight 100 ↔
-/// nice 0. Coarse inverse of the kernel's `sched_prio_to_weight`
-/// table, monotonic across the full range.
+/// Linux's `sched_prio_to_weight` load-weight table, indexed by
+/// `nice + 20` (nice -20..=19). `cpu.weight` is derived from this via
+/// the same scaling the kernel uses, so nice 0 (index 20, weight 1024)
+/// maps to the default `cpu.weight` 100. Ref: `kernel/sched/core.c`.
+const SCHED_PRIO_TO_WEIGHT: [u64; 40] = [
+    88761, 71755, 56483, 46273, 36291, // -20..-16
+    29154, 23254, 18705, 14949, 11916, // -15..-11
+    9548, 7620, 6100, 4904, 3906, // -10..-6
+    3121, 2501, 1991, 1586, 1277, // -5..-1
+    1024, 820, 655, 526, 423, // 0..4
+    335, 272, 215, 172, 137, // 5..9
+    110, 87, 70, 56, 45, // 10..14
+    36, 29, 23, 18, 15, // 15..19
+];
+
+/// `cpu.weight` (1..=10000) → nice (-20..=19). Finds the nice level
+/// whose derived `cpu.weight` is closest to the requested value. Nice 0
+/// ↔ weight 100 is the anchor; the mapping is a true inverse of
+/// [`nice_to_weight`] at every table point.
 fn weight_to_nice(weight: u64) -> i64 {
-    let w = weight.clamp(1, 10000) as i64;
-    (((10000 - w) * 39) / 9999) - 20
+    let w = weight.clamp(1, 10000);
+    let mut best = 0i64;
+    let mut best_diff = u64::MAX;
+    for (i, _) in SCHED_PRIO_TO_WEIGHT.iter().enumerate() {
+        let cw = nice_to_weight(i as i64 - 20);
+        let diff = cw.abs_diff(w);
+        if diff < best_diff {
+            best_diff = diff;
+            best = i as i64 - 20;
+        }
+    }
+    best
 }
 
-/// nice (-20..=19) → `cpu.weight` (1..=10000). Inverse of
-/// [`weight_to_nice`] for the `cpu.weight.nice` write path. Nice 0 ↔
-/// weight 100 is preserved as the anchor (Linux's default).
+/// nice (-20..=19) → `cpu.weight` (1..=10000). Scales the scheduler
+/// load-weight so nice 0 ↔ weight 100 (Linux's default), matching the
+/// kernel's `cpu.weight` presentation.
 fn nice_to_weight(nice: i64) -> u64 {
     let n = nice.clamp(-20, 19);
-    // Anchor the default: nice 0 must map back to weight 100.
-    if n == 0 {
-        return 100;
-    }
-    // Linear inverse over the same span used by `weight_to_nice`.
-    let w = 10000 - ((n + 20) * 9999) / 39;
-    w.clamp(1, 10000) as u64
+    let load = SCHED_PRIO_TO_WEIGHT[(n + 20) as usize];
+    // Scale so the nice-0 load (1024) presents as cpu.weight 100, with
+    // round-to-nearest; clamp into the valid 1..=10000 range.
+    ((load * 100 + 512) / 1024).clamp(1, 10000)
 }
 
 impl CpuState {

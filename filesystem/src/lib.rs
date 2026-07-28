@@ -91,6 +91,7 @@ mod devfs_block_tests;
 mod devfs_pty_tests;
 mod e2e_tests;
 mod fs_mount_e2e_tests;
+mod memfs_tests;
 mod procsys_e2e_tests;
 mod random_e2e_tests;
 mod sysfs_e2e_tests;
@@ -124,8 +125,8 @@ pub use sysfs::{
     Kobject, NetIfaceInfo, SysFs, SysKobjDir,
 };
 pub use uevent::{
-    emit as emit_uevent, emit_with_extras as emit_uevent_extras, UeventAction, UeventEnv,
-    UeventReader,
+    current_seqnum as uevent_current_seqnum, emit as emit_uevent,
+    emit_with_extras as emit_uevent_extras, UeventAction, UeventEnv, UeventReader,
 };
 
 use alloc::boxed::Box;
@@ -1647,21 +1648,28 @@ impl MountNamespace {
         if abs.is_empty() || abs.as_bytes()[0] != b'/' {
             return None;
         }
-        let q = self.inner.lock();
-        let mut best: Option<&Mount> = None;
-        for m in q.iter() {
-            let is_match = abs == m.path.as_str()
-                || m.path == "/"
-                || (abs.starts_with(m.path.as_str())
-                    && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
-            if is_match && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len() {
-                best = Some(m);
+        // Clone the covering mount's `Arc<fs>` + relative path and RELEASE the
+        // lock before running `f` — `f` can busy-block on block I/O and `inner`
+        // is an IrqSafeSpinLock, so holding it across `f` deadlocks the box
+        // (see VfsRegistry::resolve_absolute for the full rationale).
+        let (fs, rel) = {
+            let q = self.inner.lock();
+            let mut best: Option<&Mount> = None;
+            for m in q.iter() {
+                let is_match = abs == m.path.as_str()
+                    || m.path == "/"
+                    || (abs.starts_with(m.path.as_str())
+                        && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
+                if is_match && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len() {
+                    best = Some(m);
+                }
             }
-        }
-        let m = best?;
-        let rel = &abs[m.path.len()..];
-        let rel = rel.strip_prefix('/').unwrap_or(rel);
-        Some(f(&*m.fs, rel))
+            let m = best?;
+            let rel = &abs[m.path.len()..];
+            let rel = rel.strip_prefix('/').unwrap_or(rel);
+            (m.fs.clone(), alloc::string::String::from(rel))
+        };
+        Some(f(&*fs, &rel))
     }
 
     /// Clone the filesystem object of the visible mount covering `abs`.
@@ -2042,14 +2050,21 @@ impl VfsRegistry {
     }
 
     /// Run `f` against the named mount's `FsInstance`. Returns `None`
-    /// if no mount matches. The lock is held across `f`; `f` should be
-    /// short.
+    /// if no mount matches. The registry lock is released BEFORE `f` runs:
+    /// callers pass blocking closures (e.g. `sys_mount` drives
+    /// `resolve_async` via the busy-spinning `poll_blocking`), and holding
+    /// the `inner` IrqSafeSpinLock across a block-I/O wait deadlocks the box
+    /// (see `resolve_absolute`). The cloned `Arc` keeps the FsInstance alive
+    /// across a concurrent unmount.
     pub fn with_mount<R, F>(&self, path: &str, f: F) -> Option<R>
     where
         F: FnOnce(&dyn FsInstance) -> R,
     {
-        let q = self.inner.lock();
-        q.iter().find(|m| m.path == path).map(|m| f(&*m.fs))
+        let fs = {
+            let q = self.inner.lock();
+            q.iter().find(|m| m.path == path).map(|m| m.fs.clone())
+        }?;
+        Some(f(&*fs))
     }
 
     /// Resolve a POSIX-shaped absolute path by finding the
@@ -2068,29 +2083,44 @@ impl VfsRegistry {
         if abs.is_empty() || abs.as_bytes()[0] != b'/' {
             return None;
         }
-        let q = self.inner.lock();
-        // Find the longest matching mount path. The root mount `/`
-        // is a special case: every absolute path is under it, but
-        // the "next byte must be `/`" predicate would reject e.g.
-        // `/init` because byte 1 is `i` not `/`. Special-case "/"
-        // so the root mount always matches as the fallback option.
-        let mut best: Option<&Mount> = None;
-        for m in q.iter() {
-            let is_match = abs == m.path
-                || m.path == "/"
-                || (abs.starts_with(m.path.as_str())
-                    && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
-            if is_match && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
-                best = Some(m);
+        // Select the covering mount under the lock, then CLONE its `Arc<fs>`
+        // and the relative path and RELEASE the lock BEFORE running `f`. `f`
+        // may block: the stat/open/execve resolvers drive `resolve_async` via
+        // `poll_blocking`, which BUSY-SPINS on the backing block device's
+        // completion IRQ. `inner` is an IrqSafeSpinLock (IRQs disabled while
+        // held), so running `f` under it spins on an I/O IRQ that can never
+        // fire on this CPU — and every other task that touches the mount table
+        // (path resolution, statx mount-id, mount/umount) stalls behind it.
+        // Under an SMP statx storm (systemd unit loading) that deadlocked the
+        // whole box. The `Arc` keeps the FsInstance alive even if a concurrent
+        // umount drops it from the table mid-resolve, matching Linux (an
+        // in-flight op on an unmounted fs completes).
+        let (fs, rel) = {
+            let q = self.inner.lock();
+            // Find the longest matching mount path. The root mount `/`
+            // is a special case: every absolute path is under it, but
+            // the "next byte must be `/`" predicate would reject e.g.
+            // `/init` because byte 1 is `i` not `/`. Special-case "/"
+            // so the root mount always matches as the fallback option.
+            let mut best: Option<&Mount> = None;
+            for m in q.iter() {
+                let is_match = abs == m.path
+                    || m.path == "/"
+                    || (abs.starts_with(m.path.as_str())
+                        && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
+                if is_match && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
+                    best = Some(m);
+                }
             }
-        }
-        let m = best?;
-        let rel = &abs[m.path.len()..];
-        // Strip the leading slash; if the absolute path equals the
-        // mount path exactly, the relative is empty (caller's
-        // problem — `resolve` rejects empty paths).
-        let rel = rel.strip_prefix('/').unwrap_or(rel);
-        Some(f(&*m.fs, rel))
+            let m = best?;
+            let rel = &abs[m.path.len()..];
+            // Strip the leading slash; if the absolute path equals the
+            // mount path exactly, the relative is empty (caller's
+            // problem — `resolve` rejects empty paths).
+            let rel = rel.strip_prefix('/').unwrap_or(rel);
+            (m.fs.clone(), alloc::string::String::from(rel))
+        };
+        Some(f(&*fs, &rel))
     }
 
     /// Clone the `Arc<dyn FsInstance>` of the mount covering `abs` (the
@@ -2163,33 +2193,41 @@ impl VfsRegistry {
         } else {
             parent_path
         };
-        let q = self.inner.lock();
-        // Match the longest mount prefix against `parent_path`.
-        let mut best: Option<&Mount> = None;
-        for m in q.iter() {
-            if (parent_path == m.path
-                || (parent_path.starts_with(m.path.as_str())
-                    && parent_path.as_bytes().get(m.path.len()) == Some(&b'/')))
-                && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len()
-            {
-                best = Some(m);
+        // Resolve the mount + walk to the parent dir under the lock (the sync
+        // `lookup_dir` walk does not block), then CLONE the fs `Arc` + parent
+        // `DirOps` and RELEASE the lock BEFORE running `f` — `f` may block on
+        // block I/O (create/mkdir on ext2), and holding the `inner`
+        // IrqSafeSpinLock across that deadlocks the box (see `resolve_absolute`).
+        let (fs, dir) = {
+            let q = self.inner.lock();
+            // Match the longest mount prefix against `parent_path`.
+            let mut best: Option<&Mount> = None;
+            for m in q.iter() {
+                if (parent_path == m.path
+                    || (parent_path.starts_with(m.path.as_str())
+                        && parent_path.as_bytes().get(m.path.len()) == Some(&b'/')))
+                    && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len()
+                {
+                    best = Some(m);
+                }
             }
-        }
-        let m = best?;
-        let rel = &parent_path[m.path.len()..];
-        let rel = rel.strip_prefix('/').unwrap_or(rel);
-        // Walk segments to reach the parent dir.
-        let mut dir = m.fs.root();
-        for seg in rel.split('/') {
-            if seg.is_empty() || seg == "." {
-                continue;
+            let m = best?;
+            let rel = &parent_path[m.path.len()..];
+            let rel = rel.strip_prefix('/').unwrap_or(rel);
+            // Walk segments to reach the parent dir.
+            let mut dir = m.fs.root();
+            for seg in rel.split('/') {
+                if seg.is_empty() || seg == "." {
+                    continue;
+                }
+                if seg == ".." {
+                    return None;
+                }
+                dir = dir.lookup_dir(seg)?;
             }
-            if seg == ".." {
-                return None;
-            }
-            dir = dir.lookup_dir(seg)?;
-        }
-        Some(f(&*m.fs, dir, leaf))
+            (m.fs.clone(), dir)
+        };
+        Some(f(&*fs, dir, leaf))
     }
 
     /// Resolve the parent directories of TWO absolute paths at once,
@@ -2224,48 +2262,59 @@ impl VfsRegistry {
         let (a_parent, a_leaf) = split(a)?;
         let (b_parent, b_leaf) = split(b)?;
 
-        let q = self.inner.lock();
-        // Longest matching mount prefix, same rule as
-        // `resolve_parent_absolute`.
-        let best_mount = |parent_path: &str| -> Option<&Mount> {
-            let mut best: Option<&Mount> = None;
-            for m in q.iter() {
-                if (parent_path == m.path
-                    || (parent_path.starts_with(m.path.as_str())
-                        && parent_path.as_bytes().get(m.path.len()) == Some(&b'/')))
-                    && best.map(|x| x.path.len()).unwrap_or(0) < m.path.len()
-                {
-                    best = Some(m);
+        // Resolve BOTH parents + walk to their dirs under ONE lock (so a
+        // concurrent mount/unmount can't move one path's mount between the two
+        // resolutions — the atomicity `rename`'s EXDEV check needs), then CLONE
+        // the shared fs `Arc` + both parent `DirOps` and RELEASE the lock before
+        // running `f`. `f` performs the rename, which may block on block I/O;
+        // holding the `inner` IrqSafeSpinLock across it deadlocks the box (see
+        // `resolve_absolute`). Resolution atomicity is preserved; only `f` runs
+        // unlocked.
+        let (fs, a_dir, b_dir) = {
+            let q = self.inner.lock();
+            // Longest matching mount prefix, same rule as
+            // `resolve_parent_absolute`.
+            let best_mount = |parent_path: &str| -> Option<&Mount> {
+                let mut best: Option<&Mount> = None;
+                for m in q.iter() {
+                    if (parent_path == m.path
+                        || (parent_path.starts_with(m.path.as_str())
+                            && parent_path.as_bytes().get(m.path.len()) == Some(&b'/')))
+                        && best.map(|x| x.path.len()).unwrap_or(0) < m.path.len()
+                    {
+                        best = Some(m);
+                    }
                 }
+                best
+            };
+            let ma = best_mount(a_parent)?;
+            let mb = best_mount(b_parent)?;
+            // Different mounts ⇒ a genuine cross-device move. Mount paths
+            // are unique in the registry, so comparing them identifies the
+            // mount.
+            if ma.path != mb.path {
+                return None;
             }
-            best
-        };
-        let ma = best_mount(a_parent)?;
-        let mb = best_mount(b_parent)?;
-        // Different mounts ⇒ a genuine cross-device move. Mount paths
-        // are unique in the registry, so comparing them identifies the
-        // mount.
-        if ma.path != mb.path {
-            return None;
-        }
-        let walk = |m: &Mount, parent_path: &str| -> Option<Arc<dyn DirOps>> {
-            let rel = &parent_path[m.path.len()..];
-            let rel = rel.strip_prefix('/').unwrap_or(rel);
-            let mut dir = m.fs.root();
-            for seg in rel.split('/') {
-                if seg.is_empty() || seg == "." {
-                    continue;
+            let walk = |m: &Mount, parent_path: &str| -> Option<Arc<dyn DirOps>> {
+                let rel = &parent_path[m.path.len()..];
+                let rel = rel.strip_prefix('/').unwrap_or(rel);
+                let mut dir = m.fs.root();
+                for seg in rel.split('/') {
+                    if seg.is_empty() || seg == "." {
+                        continue;
+                    }
+                    if seg == ".." {
+                        return None;
+                    }
+                    dir = dir.lookup_dir(seg)?;
                 }
-                if seg == ".." {
-                    return None;
-                }
-                dir = dir.lookup_dir(seg)?;
-            }
-            Some(dir)
+                Some(dir)
+            };
+            let a_dir = walk(ma, a_parent)?;
+            let b_dir = walk(mb, b_parent)?;
+            (ma.fs.clone(), a_dir, b_dir)
         };
-        let a_dir = walk(ma, a_parent)?;
-        let b_dir = walk(mb, b_parent)?;
-        Some(f(&*ma.fs, a_dir, a_leaf, b_dir, b_leaf))
+        Some(f(&*fs, a_dir, a_leaf, b_dir, b_leaf))
     }
 
     /// Number of mounts.

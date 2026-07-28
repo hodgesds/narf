@@ -702,22 +702,21 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_neg);
 
 fn smoke_abi_fsx_pivot_root_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
-        // new_root is not absolute → -1 sentinel (relative path rejected).
-        let new_root = b"relative\0";
+        // Linux ABI: pivot_root(new_root, put_old), both NUL-terminated paths
+        // resolved against the cwd. A new_root that does not resolve to an
+        // existing directory must fail — here a relative name with no matching
+        // entry under the cwd. (Relative paths are NOT rejected wholesale:
+        // `pivot_root(".", ".")` is the standard container idiom — see
+        // smoke_pivot_root_relative_dot in mount_e2e_tests.)
+        let new_root = b"nonexistent-dir\0";
         let put_old = b"/abi\0";
-        let args = a3(
-            new_root.as_ptr() as u64,
-            (new_root.len() - 1) as u64, // strip NUL: pass the byte length
-            put_old.as_ptr() as u64,
-            (put_old.len() - 1) as u64,
-        );
-        // LINUX-GAP: Linux returns -EINVAL/-ENOTDIR; NARF returns -1 on a
-        // non-absolute new_root. The pivot_root slot may also be absent
-        // (no "container" feature) — then the entry reports a non-Ok
-        // status and `call` is None. Accept either failure shape.
+        let args = a2(new_root.as_ptr() as u64, put_old.as_ptr() as u64, 0);
+        // The pivot_root slot may also be absent (no "container" feature) — then
+        // the entry reports a non-Ok status and `call` is None. Accept either
+        // failure shape.
         match call(Syscall::PivotRoot.raw(), args) {
             Some(-1) | None => Ok(()),
-            Some(_) => Err("pivot_root with a relative new_root must fail"),
+            Some(_) => Err("pivot_root with an unresolvable new_root must fail"),
         }
     })
 }

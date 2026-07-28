@@ -3299,6 +3299,17 @@ fn boot_userspace_init() {
     signal_init();
     narf_userspace::handlers::init_per_task_state();
     narf_userspace::fd::init();
+    // `trace_comm=<prefix>[,<prefix>...]` retargets the syscall-trace feature's
+    // comm filter without a rebuild (default `systemd-executo`). No-op unless
+    // the kernel was built with `--features syscall-trace`.
+    #[cfg(feature = "syscall-trace")]
+    if let Some(prefix) = narf_boot::cmdline()
+        .split_ascii_whitespace()
+        .find_map(|t| t.strip_prefix("trace_comm="))
+    {
+        narf_userspace::syscall::set_trace_comm(prefix);
+        let _ = writeln!(console::Writer, "  boot-init: syscall-trace comm='{prefix}'");
+    }
     // Build the shared vDSO + vvar pages now that the TSC/counter scale is
     // calibrated; every process maps them and gets AT_SYSINFO_EHDR.
     narf_userspace::vdso::register_vdso_image(

@@ -356,11 +356,13 @@ pub fn with_chain_states<F: FnMut(&Arc<dyn ControllerState>)>(
     name: &'static str,
     mut f: F,
 ) {
-    let cg = cgroup_of(pid);
-    for node in charge_chain(&cg) {
-        if let Some(s) = node.ctrl_state.lock().get(name) {
-            f(s);
+    let mut cur = Some(cgroup_of(pid));
+    while let Some(c) = cur {
+        let state = c.ctrl_state.lock().get(name).cloned();
+        if let Some(s) = state {
+            f(&s);
         }
+        cur = c.parent.clone();
     }
 }
 

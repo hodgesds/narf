@@ -213,14 +213,15 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     let mut child_ns_pid = child_pid.raw();
     #[cfg(feature = "container")]
     {
+        let parent_task = current_task_id();
         if let Some(inner) =
-            crate::pid_ns::inherit_into_child(parent_pid, child_tid.raw(), child_pid.raw())
+            crate::pid_ns::inherit_into_child(parent_task, child_tid.raw(), child_pid.raw())
         {
             child_ns_pid = inner;
         }
-        mount_ns_inherit(parent_pid, child_tid.raw());
+        mount_ns_inherit(parent_task, child_tid.raw());
         // UTS / NET / IPC / User namespaces share the parent's Arc.
-        crate::namespaces::inherit_into_child(parent_pid, child_tid.raw());
+        crate::namespaces::inherit_into_child(parent_task, child_tid.raw());
     }
     // A forked child joins its parent's cgroup. cgroup membership is keyed by
     // ProcessId (per-process in v2), so the parent must be looked up by its

@@ -1924,7 +1924,7 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
     let mut cmd = Command::new(qemu);
     cmd.args(args.arch.qemu_args(&kernel, &args.display, args.hw_profile));
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    cmd.stderr(Stdio::inherit());
 
     let secs = std::env::var("XTASK_SYSTEMD_PID1_TIMEOUT_SECS")
         .ok()
