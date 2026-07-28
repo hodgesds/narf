@@ -8406,6 +8406,20 @@ pub fn cwd_of(task: u64) -> alloc::string::String {
         .unwrap_or_else(|| alloc::string::String::from("/"))
 }
 
+/// Set `task`'s cwd (USER-view, chroot-relative — the same frame chdir stores).
+/// Used by `sys_pivot_root` to recompute the cwd in the new root's frame after
+/// the root swap, so a following relative resolution doesn't double-apply the
+/// new chroot prefix.
+pub(crate) fn set_cwd(task: u64, path: &str) {
+    let mut g = CWD_TABLE.lock();
+    if g.is_none() {
+        *g = Some(alloc::collections::BTreeMap::new());
+    }
+    if let Some(m) = g.as_mut() {
+        m.insert(task, alloc::string::String::from(path));
+    }
+}
+
 /// Collapse `.`/`..`/empty segments into a clean absolute path.
 /// `normalize_abs("/a/./b/../c")` → `/c`; an empty result is `/`.
 fn normalize_abs(p: &str) -> alloc::string::String {

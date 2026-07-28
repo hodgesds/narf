@@ -385,6 +385,85 @@ fn smoke_pivot_root_relative_dot() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("userspace/mount", smoke_pivot_root_relative_dot);
 
+// The full systemd switch-root sequence: fchdir(new_root); pivot_root(".",".");
+// umount2(".", MNT_DETACH). After pivot_root moves the root, the relative "."
+// must still resolve to the cwd (the new root) — NOT a doubly-chroot-prefixed
+// path. A double prefix made umount2 (and the MS_MOVE fallback) return ENOENT →
+// "Failed to set up mount namespacing: No such file or directory" →
+// 226/EXIT_NAMESPACE, restart-looping systemd-udevd.
+fn smoke_pivot_root_switch_root_umount_dot() -> TestResult {
+    let task: u64 = 0x71_06;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    let _ = unmount_for_test("/swr");
+    let mut m1 = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/swr\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut m1);
+    if !matches!(m1.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("mount /swr failed");
+    }
+
+    // fchdir-equivalent: cwd := /swr (systemd fchdir's the new-root fd).
+    let cwd_path = b"/swr\0";
+    let mut cd = StubCtx {
+        args: SyscallArgs {
+            arg0: cwd_path.as_ptr() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::handlers::sys_chdir(&mut cd);
+    if !matches!(cd.ret, Some(r) if r.value == 0) {
+        let _ = unmount_for_test("/swr");
+        return TestResult::Fail("chdir /swr failed");
+    }
+
+    // pivot_root(".", ".") — moves the root to /swr.
+    let mut pctx = StubCtx {
+        args: pivot_args(b".\0", b".\0"),
+        ret: None,
+    };
+    crate::handlers::sys_pivot_root_for_test(&mut pctx);
+    if !matches!(pctx.ret, Some(r) if r.value == 0) {
+        crate::handlers::__test_root_dir_reset();
+        crate::handlers::__test_cwd_reset();
+        let _ = unmount_for_test("/swr");
+        return TestResult::Fail("pivot_root(\".\",\".\") failed");
+    }
+
+    // umount2(".", MNT_DETACH=2): "." must resolve to the cwd (the new root),
+    // not "/swr/swr", so it finds the mount and returns 0.
+    let dot = b".\0";
+    let mut um = StubCtx {
+        args: SyscallArgs {
+            arg0: dot.as_ptr() as u64,
+            arg1: 2,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::handlers::sys_umount2_for_test(&mut um);
+    let umount_ok = matches!(um.ret, Some(r) if r.value == 0);
+
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    let _ = unmount_for_test("/swr");
+    let _ = unmount_for_test("/swr");
+
+    if umount_ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("umount2(\".\") after pivot_root must resolve to the cwd (new root) and return 0")
+    }
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace/mount", smoke_pivot_root_switch_root_umount_dot);
+
 // Build SyscallArgs for a single-word syscall (arg0 only), e.g. unshare(flags).
 fn flags_args(flags: u64) -> SyscallArgs {
     SyscallArgs {

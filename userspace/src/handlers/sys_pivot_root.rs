@@ -36,6 +36,11 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let new_root_resolved = resolve_cwd_path(task, &new_root);
     let put_old_resolved = resolve_cwd_path(task, &put_old);
+    // The caller's cwd as a host path, resolved in the CURRENT (pre-swap) root
+    // frame. systemd does `fchdir(new_root_fd); pivot_root(".", ".")`, so this
+    // equals new_root_resolved for that idiom. Captured before ROOT_DIR_TABLE is
+    // updated so it uses the old chroot prefix.
+    let cwd_host = resolve_cwd_path(task, ".");
     let prior_root = {
         let g = ROOT_DIR_TABLE.lock();
         g.as_ref()
@@ -58,11 +63,37 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     let _ = narf_filesystem::registry().bind_mount(&auth, &prior_root, &put_old_resolved);
     // Install the new root.
     root_dir_init_if_needed();
-    let mut g = ROOT_DIR_TABLE.lock();
-    if let Some(m) = g.as_mut() {
-        m.insert(task, new_root_resolved);
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
+    let inserted = {
+        let mut g = ROOT_DIR_TABLE.lock();
+        match g.as_mut() {
+            Some(m) => {
+                m.insert(task, new_root_resolved.clone());
+                true
+            }
+            None => false,
+        }
+    };
+    if !inserted {
         ctx.set_return(fail);
+        return;
     }
+    // The cwd directory is physically unchanged, but the root moved — recompute
+    // the cwd in the NEW root's frame. Without this, a following relative
+    // resolution (systemd's `umount2(".", MNT_DETACH)` / `mount(".", "/",
+    // MS_MOVE)` right after `pivot_root(".", ".")`) re-applies the new chroot
+    // prefix on top of the still-old cwd, yielding a doubly-prefixed path that
+    // matches no mount → ENOENT → 226/EXIT_NAMESPACE. A cwd at or above the new
+    // root clamps to "/".
+    let new_cwd = if cwd_host == new_root_resolved {
+        alloc::string::String::from("/")
+    } else if let Some(rest) = cwd_host
+        .strip_prefix(new_root_resolved.as_str())
+        .filter(|r| r.starts_with('/'))
+    {
+        alloc::string::String::from(rest)
+    } else {
+        alloc::string::String::from("/")
+    };
+    set_cwd(task, &new_cwd);
+    ctx.set_return(SyscallReturn::ok(0));
 }

@@ -140,7 +140,19 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         } else {
             resolve_cwd_path(current_task_id(), source_resolved.as_str())
         };
-        return match current_move_mount(&auth, move_source.as_str(), target.as_str()) {
+        // Trim a trailing slash so the exact mount-path match succeeds — a
+        // relative "." at cwd "/" resolves to "<root>/" (see sys_umount2).
+        let move_source = if move_source.len() > 1 {
+            alloc::string::String::from(move_source.trim_end_matches('/'))
+        } else {
+            move_source
+        };
+        let move_target = if target.len() > 1 {
+            target.trim_end_matches('/')
+        } else {
+            target.as_str()
+        };
+        return match current_move_mount(&auth, move_source.as_str(), move_target) {
             Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
             Err(narf_filesystem::FsError::NotFound) => ctx.set_return(enoent),
             Err(narf_filesystem::FsError::Busy) => ctx.set_return(ebusy),

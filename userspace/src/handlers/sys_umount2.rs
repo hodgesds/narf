@@ -21,7 +21,18 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // "." that matches no mount. When umount2(".") failed here, systemd fell
     // back to `mount(".", "/", MS_MOVE)`, which also mis-resolved "." and
     // returned ENOENT → 226/EXIT_NAMESPACE (udevd et al.).
-    let target = resolve_cwd_path(current_task_id(), target_raw.as_str());
+    // Trim any trailing slash so the exact-match against registry mount paths
+    // (which have none, except root) succeeds: `apply_chroot("/")` yields
+    // "<root>/" (intentional, see apply_chroot), so umount2(".") right after
+    // pivot_root(".",".") — cwd "/" in the new root — resolves to "<newroot>/".
+    let target = {
+        let t = resolve_cwd_path(current_task_id(), target_raw.as_str());
+        if t.len() > 1 {
+            alloc::string::String::from(t.trim_end_matches('/'))
+        } else {
+            t
+        }
+    };
     let flags = args.arg1;
     // We accept MNT_FORCE / MNT_DETACH / MNT_EXPIRE / UMOUNT_NOFOLLOW
     // but the registry doesn't yet track in-flight refs against a
