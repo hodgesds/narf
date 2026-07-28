@@ -30,6 +30,25 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
     // chroot, so a chrooted process (elogind under /mnt) resolves in its
     // own namespace. See the twin fix in `sys_openat`.
     const AT_FDCWD: i64 = -100;
+    // AT_EMPTY_PATH: an empty path names the fd ITSELF. glibc's access_fd()
+    // does faccessat2(fd, "", mode, AT_EMPTY_PATH) to test an O_PATH fd for
+    // X_OK — systemd's open_and_check_executable / find_executable_full relies
+    // on exactly this to confirm a service binary is executable before execve.
+    // An already-open fd trivially exists (NARF enforces existence, not mode),
+    // so report success. The relative-join arm below would instead append "/"
+    // to the fd's path (empty `raw`), turning a regular-file fd into a
+    // directory-shaped path that stat_path_dir_aware misses → ENOENT →
+    // every sandboxed service dying 203/EXIT_EXEC.
+    if raw.is_empty() && dirfd >= 0 {
+        let valid =
+            fd::with_table(current_task_id(), |t| t.get(dirfd as u32).is_some()).unwrap_or(false);
+        ctx.set_return(if valid {
+            SyscallReturn::ok(0)
+        } else {
+            SyscallReturn::ok((-9i64) as u64) // -EBADF
+        });
+        return;
+    }
     let effective = if raw.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
         raw
     } else {

@@ -35,6 +35,25 @@ pub(crate) fn sys_faccessat(ctx: &mut dyn TrapContext) {
     };
     const AT_FDCWD: i64 = -100;
     let dirfd = args.arg0 as i64;
+    // AT_EMPTY_PATH (faccessat2 flags = arg3): an empty path names the fd
+    // ITSELF. glibc's access_fd() does faccessat2(fd, "", X_OK, AT_EMPTY_PATH)
+    // to test an O_PATH fd for executability, which systemd's
+    // open_and_check_executable / find_executable_full uses to confirm a
+    // service binary before execve. An already-open fd trivially exists (NARF
+    // enforces existence, not mode), so report success. Without this the
+    // relative-join arm below appends "/" to the fd's path, turning a
+    // regular-file fd into a directory-shaped path that misses (ENOENT) and
+    // kills every sandboxed service 203/EXIT_EXEC.
+    if raw.is_empty() && dirfd >= 0 {
+        let valid =
+            fd::with_table(current_task_id(), |t| t.get(dirfd as u32).is_some()).unwrap_or(false);
+        ctx.set_return(if valid {
+            SyscallReturn::ok(0)
+        } else {
+            SyscallReturn::ok((-9i64) as u64) // -EBADF
+        });
+        return;
+    }
     let effective = if raw.starts_with('/') || dirfd == AT_FDCWD {
         raw
     } else if dirfd >= 0 {

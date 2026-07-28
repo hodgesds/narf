@@ -3298,7 +3298,21 @@ fn trace_syscall_paths(name: &str, args: &SyscallArgs) {
             if let Some(p) = cstr(args.arg1) {
                 let _ = write!(line, "  PATH {name} dfd={:#x} path={:?}", args.arg0, p);
                 if p.starts_with('/') {
-                    let _ = write!(line, " -> {:?}", crate::handlers::apply_chroot_for_test(&p));
+                    let resolved = crate::handlers::apply_chroot_for_test(&p);
+                    let _ = write!(line, " -> {resolved:?}");
+                    // When opening the service executable (the 203/EXIT_EXEC
+                    // failure point), dump the private mount table so a missing
+                    // or shadowing mount is visible directly.
+                    if p.ends_with("systemd-udevd") || p.ends_with("systemd-userdbd") {
+                        if let Some(ns) = crate::handlers::current_mount_namespace() {
+                            let _ = write!(line, "\n  MOUNTS(private):");
+                            for (path, fsname) in ns.list_with_names() {
+                                let _ = write!(line, "\n    {path} [{fsname}]");
+                            }
+                        } else {
+                            let _ = write!(line, "\n  MOUNTS: none (global registry)");
+                        }
+                    }
                 }
             }
         }
