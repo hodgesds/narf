@@ -3199,6 +3199,7 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
                 a.arg2,
                 a.arg3,
             );
+            trace_syscall_paths(table.name_of(variant).unwrap_or("?"), a);
         }
         // Kernel-time accounting (getrusage ru_stime / times tms_stime /
         // /proc stat field 15): bracket the handler with two monotonic
@@ -3281,6 +3282,66 @@ pub fn syscall_trace_target_task() -> bool {
         .any(|p| !p.is_empty() && comm.starts_with(p))
 }
 
+/// Decode and print the path-string arguments of the path-taking syscalls,
+/// so a `trace_comm=` capture shows WHICH files/mounts a service touches (raw
+/// pointer args alone are useless for debugging namespace assembly). Also
+/// prints the caller's post-chroot resolution of the primary path so a
+/// pivot_root / bind mismatch is visible directly. Gated behind syscall-trace.
+#[cfg(feature = "syscall-trace")]
+fn trace_syscall_paths(name: &str, args: &SyscallArgs) {
+    use core::fmt::Write as _;
+    let cstr = |p: u64| crate::handlers::copy_user_cstr(p, 4096);
+    let task = crate::handlers::current_task_id();
+    let mut line = alloc::string::String::new();
+    match name {
+        "openat" | "newfstatat" | "statx" | "faccessat" | "faccessat2" => {
+            if let Some(p) = cstr(args.arg1) {
+                let _ = write!(line, "  PATH {name} dfd={:#x} path={:?}", args.arg0, p);
+                if p.starts_with('/') {
+                    let _ = write!(line, " -> {:?}", crate::handlers::apply_chroot_for_test(&p));
+                }
+            }
+        }
+        "open" | "chdir" | "access" | "stat" | "lstat" | "readlink" | "unlink" | "rmdir" => {
+            if let Some(p) = cstr(args.arg0) {
+                let _ = write!(line, "  PATH {name} path={:?}", p);
+                if p.starts_with('/') {
+                    let _ = write!(line, " -> {:?}", crate::handlers::apply_chroot_for_test(&p));
+                }
+            }
+        }
+        "pivot_root" => {
+            let nr = cstr(args.arg0).unwrap_or_default();
+            let po = cstr(args.arg1).unwrap_or_default();
+            let _ = write!(line, "  PATH pivot_root new_root={nr:?} put_old={po:?}");
+        }
+        "mount" => {
+            let src = cstr(args.arg0).unwrap_or_default();
+            let tgt = cstr(args.arg1).unwrap_or_default();
+            let fst = cstr(args.arg2).unwrap_or_default();
+            let _ = write!(
+                line,
+                "  PATH mount src={src:?} tgt={tgt:?} fstype={fst:?} flags={:#x}",
+                args.arg3
+            );
+        }
+        "umount2" => {
+            if let Some(p) = cstr(args.arg0) {
+                let _ = write!(line, "  PATH umount2 target={p:?} flags={:#x}", args.arg1);
+            }
+        }
+        "fchdir" => {
+            if let Some(p) = crate::handlers::fd_path_of(task, args.arg0 as u32) {
+                let _ = write!(line, "  PATH fchdir fd={:#x} -> {p:?}", args.arg0);
+            }
+        }
+        _ => return,
+    }
+    if !line.is_empty() {
+        let _ = writeln!(narf_console::Writer, "{line}");
+    }
+}
+
 #[inline]
 pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn {
     kernel_syscall_entry_plain_with_state(num, args, core::ptr::null_mut())
@@ -3325,6 +3386,7 @@ pub fn kernel_syscall_entry_plain_with_state(
             args.arg2,
             args.arg3,
         );
+        trace_syscall_paths(table.name_of(n).unwrap_or("?"), args);
     }
     let mut ctx = ArgsOnlyCtx::new(*args, user_state);
     // PTRACE_SYSCALL entry-stop: if this task is traced and armed, stop it

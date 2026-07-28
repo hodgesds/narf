@@ -685,6 +685,220 @@ fn smoke_pivot_root_putold_bind_private() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("userspace/mount", smoke_pivot_root_putold_bind_private);
 
+// ── Smoke 5c: recursive bind of / exposes the whole subtree ────────
+// A systemd service sandbox recursively binds the host root
+// (`mount("/", "/run/systemd/mount-rootfs", MS_BIND|MS_REC)`) as the first
+// step of building its private root, then pivot_roots into it. If the
+// recursive bind fails to expose the source's subtree, the sandboxed
+// service's find_executable("/usr/lib/systemd/…") hits ENOENT and dies
+// 203/EXIT_EXEC. Assert the bound tree resolves a deep source directory.
+// Skips gracefully when the boot rootfs lacks /usr (non-distro test images).
+#[cfg(feature = "container")]
+fn smoke_recursive_bind_exposes_subtree() -> TestResult {
+    let task: u64 = 0x71_0c;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    // Baseline: only run where the boot rootfs actually has /usr (the Fedora
+    // vblk image). Otherwise there is nothing to expose — skip.
+    let global_has_usr = narf_filesystem::registry().clone_tree_at("/usr").is_some();
+    if !global_has_usr {
+        return TestResult::Skip("boot rootfs has no /usr to bind");
+    }
+
+    // unshare(CLONE_NEWNS): private mount table.
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    let mut uctx = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut uctx);
+    if !matches!(uctx.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("unshare(CLONE_NEWNS) failed");
+    }
+
+    // Recursive bind: mount("/", "/swr_rb", MS_BIND|MS_REC).
+    const MS_BIND: u64 = 0x1000;
+    const MS_REC: u64 = 0x4000;
+    let _ = unmount_for_test("/swr_rb");
+    let mut mb = StubCtx {
+        args: mount_args(b"/\0", b"/swr_rb\0", b"none\0", MS_BIND | MS_REC),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut mb);
+    let bind_ok = matches!(mb.ret, Some(r) if r.value == 0);
+
+    // The bound root must expose the source's /usr subtree at /swr_rb/usr.
+    let exposed = crate::handlers::current_mount_namespace()
+        .and_then(|ns| ns.clone_tree_at("/swr_rb/usr"))
+        .is_some();
+
+    crate::handlers::clear_current_mount_namespace_for_test();
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    let _ = unmount_for_test("/swr_rb");
+
+    if !bind_ok {
+        return TestResult::Fail("recursive bind of / failed");
+    }
+    if !exposed {
+        return TestResult::Fail("recursive bind of / did not expose /usr subtree");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace/mount", smoke_recursive_bind_exposes_subtree);
+
+// ── Smoke 5d: full systemd sandbox root swap keeps deep paths resolvable ─
+// Reproduces the exact sequence a systemd service sandbox runs after
+// unshare(CLONE_NEWNS): recursively bind a source root onto the mount-rootfs
+// dir, chdir into it, pivot_root(".", "."), umount2(".", MNT_DETACH). After
+// the swap, opening a deep path (systemd does
+// open("/usr/lib/systemd/systemd-udevd", O_PATH) in find_executable) must
+// still resolve — i.e. apply_chroot() + the private namespace must reach the
+// bound subtree. A regression here is a service dying 203/EXIT_EXEC
+// ("Unable to locate executable").
+#[cfg(feature = "container")]
+fn smoke_sandbox_root_swap_deep_path_resolves() -> TestResult {
+    let task: u64 = 0x71_0d;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    // A source root (tmpfs) with a deep subdir, mounted before the unshare so
+    // it stands in for the host "/" that the sandbox binds.
+    let _ = unmount_for_test("/srcr");
+    let mut msrc = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/srcr\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut msrc);
+    if !matches!(msrc.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("mount /srcr tmpfs failed");
+    }
+    for dir in [b"/srcr/usr\0".as_slice(), b"/srcr/usr/lib\0".as_slice()] {
+        let mut mk = StubCtx {
+            args: SyscallArgs {
+                arg0: dir.as_ptr() as u64,
+                arg1: 0o755,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        crate::handlers::sys_mkdir(&mut mk);
+        // 0 (created) or -EEXIST are both fine.
+    }
+
+    // unshare(CLONE_NEWNS).
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    let mut uctx = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut uctx);
+    if !matches!(uctx.ret, Some(r) if r.value == 0) {
+        let _ = unmount_for_test("/srcr");
+        return TestResult::Fail("unshare(CLONE_NEWNS) failed");
+    }
+
+    // Recursively bind the source root onto the mount-rootfs dir.
+    const MS_BIND: u64 = 0x1000;
+    const MS_REC: u64 = 0x4000;
+    let _ = unmount_for_test("/mrfs");
+    let mut mb = StubCtx {
+        args: mount_args(b"/srcr\0", b"/mrfs\0", b"none\0", MS_BIND | MS_REC),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut mb);
+    if !matches!(mb.ret, Some(r) if r.value == 0) {
+        crate::handlers::clear_current_mount_namespace_for_test();
+        let _ = unmount_for_test("/srcr");
+        return TestResult::Fail("recursive bind /srcr -> /mrfs failed");
+    }
+
+    // systemd opens the new root O_PATH|O_DIRECTORY|O_CLOEXEC (0x290000) and
+    // fchdir's THAT fd — not chdir(path). Reproduce faithfully: an O_PATH fd
+    // opened through the bind, then fchdir, then pivot_root(".", ".").
+    const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+    let nr_path = b"/mrfs\0";
+    let mut op = StubCtx {
+        args: SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: nr_path.as_ptr() as u64,
+            arg2: 0x29_0000, // O_PATH|O_DIRECTORY|O_CLOEXEC
+            arg3: 0,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::handlers::sys_openat(&mut op);
+    let nr_fd = match op.ret {
+        Some(r) if (r.value as i64) >= 0 => r.value,
+        _ => {
+            crate::handlers::clear_current_mount_namespace_for_test();
+            let _ = unmount_for_test("/mrfs");
+            let _ = unmount_for_test("/srcr");
+            return TestResult::Fail("openat(/mrfs, O_PATH) failed");
+        }
+    };
+    let mut cd = StubCtx {
+        args: SyscallArgs {
+            arg0: nr_fd,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::handlers::sys_fchdir(&mut cd);
+    if !matches!(cd.ret, Some(r) if r.value == 0) {
+        crate::handlers::clear_current_mount_namespace_for_test();
+        let _ = unmount_for_test("/mrfs");
+        let _ = unmount_for_test("/srcr");
+        return TestResult::Fail("fchdir(new_root fd) failed");
+    }
+    let mut pctx = StubCtx {
+        args: pivot_args(b".\0", b".\0"),
+        ret: None,
+    };
+    crate::handlers::sys_pivot_root_for_test(&mut pctx);
+    let pivot_ok = matches!(pctx.ret, Some(r) if r.value == 0);
+    // umount2(".", MNT_DETACH): drop the stacked old root.
+    let mut um = StubCtx {
+        args: unmount_args(b".\0", 2),
+        ret: None,
+    };
+    crate::handlers::sys_umount2_for_test(&mut um);
+
+    // After the swap, root == /mrfs. Opening "/usr/lib" must resolve to the
+    // bound source subtree. Mirror open_impl: apply_chroot, then resolve in
+    // the private namespace.
+    let resolved = crate::handlers::apply_chroot_for_test("/usr/lib");
+    let deep_ok = crate::handlers::current_mount_namespace()
+        .and_then(|ns| ns.clone_tree_at(&resolved))
+        .is_some();
+
+    crate::handlers::clear_current_mount_namespace_for_test();
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    let _ = unmount_for_test("/mrfs");
+    let _ = unmount_for_test("/srcr");
+
+    if !pivot_ok {
+        return TestResult::Fail("pivot_root(\".\",\".\") in sandbox failed");
+    }
+    if !deep_ok {
+        return TestResult::Fail("deep path /usr/lib unresolvable after sandbox root swap");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "userspace/mount",
+    smoke_sandbox_root_swap_deep_path_resolves
+);
+
 // ── Smoke 6: pivot_root to a missing new_root fails ────────────────
 // pivot_root must reject a new_root that doesn't exist under the prior
 // root (returns -1); the task's root_dir must be left untouched.
