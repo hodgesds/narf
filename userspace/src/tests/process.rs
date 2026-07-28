@@ -79,6 +79,58 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_clone_shares_address_space);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_pending_spawn_publishes_only_after_inheritance() -> TestResult {
+    // A fork-like syscall needs the child's TaskId to populate inherited state,
+    // but the scheduler must not observe the child until that setup completes.
+    // This is the publication boundary used by clone3/fork before a child can
+    // perform an immediate fexecve through an inherited descriptor.
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+
+    // SAFETY: the kernel test harness has paging enabled.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
+    };
+    let pending = crate::user_task::prepare_user_process_initial(
+        crate::UserProcess {
+            pid: crate::ProcessId(0xC10E),
+            address_space: address_space.clone(),
+            entry: crate::loader::EntryPoint(narf_memory::VirtAddr::new(0x400000)),
+            stack_top: narf_memory::VirtAddr::new(0x7fff_ffff_f000),
+            fs_base: None,
+            entry_arg: None,
+            loaded_mappings: alloc::vec::Vec::new(),
+        },
+        narf_scheduler::TaskSpec::user_task(),
+    );
+    let child = pending.task_id();
+
+    if crate::task::task_get(child.raw()).is_none() {
+        return TestResult::Fail("pending child was not registered");
+    }
+    if narf_scheduler::address_space_of(child).is_some() {
+        return TestResult::Fail("pending child was runnable before inheritance");
+    }
+
+    pending.spawn();
+    let published = narf_scheduler::address_space_of(child)
+        .is_some_and(|actual| Arc::ptr_eq(&actual, &address_space));
+    narf_scheduler::__reset_queues_for_test();
+    let _ = crate::task::release_task(child.raw());
+    crate::syscall::__test_clear_global();
+    if !published {
+        return TestResult::Fail("published child missing its address space");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_pending_spawn_publishes_only_after_inheritance
+);
+
 // CLONE_VFORK wait-table state machine: a parent registered on a child is
 // "pending" until the child's execve/exit calls `vfork_child_release`, which
 // drops the entry (and wakes the parent). Registering BEFORE the child can run

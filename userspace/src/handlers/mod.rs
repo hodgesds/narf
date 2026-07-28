@@ -5071,14 +5071,22 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     if share_thread {
         thread_group_live_inc(child_visible_pid);
     }
-    let child_tid = match child_state {
-        Some(state) => crate::user_task::spawn_user_process_resume(
+    // Reserve and register the child now, but do not enqueue it until all
+    // inherited state below has been installed.  A vfork/posix_spawn child may
+    // execute its first `execveat(AT_EMPTY_PATH)` immediately, so publishing
+    // it before `fd::fork` is an SMP-visible ENOENT race.
+    let pending_child = match child_state {
+        Some(state) => crate::user_task::prepare_user_process_resume(
             proc,
             state,
             narf_scheduler::TaskSpec::user_task(),
         ),
-        None => crate::user_task::spawn_user_process(proc, narf_scheduler::TaskSpec::user_task()),
+        None => crate::user_task::prepare_user_process_initial(
+            proc,
+            narf_scheduler::TaskSpec::user_task(),
+        ),
     };
+    let child_tid = pending_child.task_id();
     proc_identity_fork(parent_pid, child_tid.raw());
 
     // Register the (visible-pid → TaskId) binding. For
@@ -5348,6 +5356,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     } else {
         child_visible_pid
     };
+    // This is the publication point for the child. Everything keyed by its
+    // TaskId, including the copied fd table used by the immediate executor
+    // fexecve, has been installed above.
+    pending_child.spawn();
     ctx.set_return(SyscallReturn::ok(ret_val));
 
     // CLONE_VFORK: suspend the parent here until the child execs or exits

@@ -167,16 +167,23 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
         loaded_mappings: alloc::vec::Vec::new(),
     };
 
-    let child_tid = match child_state {
-        Some(state) => crate::user_task::spawn_user_process_resume(
+    // Register the child under its TaskId but defer scheduler publication
+    // until all fork inheritance below is complete.  The child may otherwise
+    // run on another CPU before `fd::fork` installs its table.
+    let pending_child = match child_state {
+        Some(state) => crate::user_task::prepare_user_process_resume(
             proc,
             state,
             narf_scheduler::TaskSpec::user_task(),
         ),
         // Fallback if save_user_state didn't fire (test contexts
         // with synthetic TrapContexts whose stub returns false).
-        None => crate::user_task::spawn_user_process(proc, narf_scheduler::TaskSpec::user_task()),
+        None => crate::user_task::prepare_user_process_initial(
+            proc,
+            narf_scheduler::TaskSpec::user_task(),
+        ),
     };
+    let child_tid = pending_child.task_id();
     // Record the explicit ProcessId ↔ TaskId binding.  Must happen
     // before any code that crosses the ID-space boundary.
     register_pid_task_mapping(child_pid.raw(), child_tid.raw());
@@ -249,6 +256,9 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // contract). The parent's waitpid() passes this same value back as
     // `want_pid`, which sys_wait4 translates back to the outer ProcessId before
     // matching PENDING_EXITS. Root-namespace parents see the outer pid.
+    // All child-visible state is now installed, so it is safe for the child
+    // to execute on another CPU.
+    pending_child.spawn();
     #[cfg(feature = "container")]
     ctx.set_return(SyscallReturn::ok(child_ns_pid));
     #[cfg(not(feature = "container"))]

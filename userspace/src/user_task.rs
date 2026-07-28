@@ -2707,10 +2707,85 @@ pub fn install_user_task_hooks() {}
 
 // ── User-task spawn entry points ────────────────────────────────────
 //
-// ALL user-task spawns (boot init, fork, clone) go through these two
-// helpers so the refcounted `Task` is registered under its reserved
-// `TaskId` BEFORE the slot is enqueued — the task must be resolvable
-// via `crate::task::task_get` from its very first instruction.
+// ALL user-task spawns (boot init, fork, clone) go through these helpers so
+// the refcounted `Task` is registered under its reserved `TaskId` BEFORE the
+// slot is enqueued — the task must be resolvable via `crate::task::task_get`
+// from its very first instruction.
+
+/// A registered user task which has not yet been made runnable.
+///
+/// Fork-like syscalls must install all of the child's inherited kernel state
+/// (fd table, namespaces, signal state, cgroup membership, and so on) before
+/// its first instruction can run.  In particular, `posix_spawn` commonly
+/// performs an immediate `execveat(AT_EMPTY_PATH)` through an inherited fd;
+/// enqueuing before `fd::fork` creates an SMP race where that lookup observes
+/// no child table and spuriously returns `ENOENT`.
+pub struct PendingUserProcess {
+    id: narf_scheduler::TaskId,
+    future: UserTaskFuture,
+    spec: narf_scheduler::TaskSpec,
+    addr_space: alloc::sync::Arc<narf_memory::AddressSpace>,
+}
+
+impl core::fmt::Debug for PendingUserProcess {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PendingUserProcess")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingUserProcess {
+    /// The reserved task id, usable as the key for inheritance state before
+    /// [`Self::spawn`] publishes the task to the scheduler.
+    pub const fn task_id(&self) -> narf_scheduler::TaskId {
+        self.id
+    }
+
+    /// Publish this fully initialized task to the scheduler.
+    pub fn spawn(self) -> narf_scheduler::TaskId {
+        narf_scheduler::spawn_user(self.id, self.future, self.spec, self.addr_space)
+    }
+}
+
+fn prepare_user_process(
+    process: crate::UserProcess,
+    future: impl FnOnce(crate::UserProcess, alloc::sync::Arc<crate::task::Task>) -> UserTaskFuture,
+    spec: narf_scheduler::TaskSpec,
+) -> PendingUserProcess {
+    let id = narf_scheduler::alloc_task_id();
+    let addr_space = process.address_space.clone();
+    let task = crate::task::Task::new_registered(id.raw(), process.pid.raw());
+    PendingUserProcess {
+        id,
+        future: future(process, task),
+        spec,
+        addr_space,
+    }
+}
+
+/// Register a fresh user task without making it runnable.  Callers that need
+/// no child-state setup should use [`spawn_user_process`] instead.
+pub fn prepare_user_process_initial(
+    process: crate::UserProcess,
+    spec: narf_scheduler::TaskSpec,
+) -> PendingUserProcess {
+    prepare_user_process(process, UserTaskFuture::new, spec)
+}
+
+/// Register a fork/clone child with its saved user state, but do not make it
+/// runnable until the caller has installed all inherited kernel state.
+pub fn prepare_user_process_resume(
+    process: crate::UserProcess,
+    state: UserState,
+    spec: narf_scheduler::TaskSpec,
+) -> PendingUserProcess {
+    prepare_user_process(
+        process,
+        move |process, task| UserTaskFuture::resume_with(process, task, state),
+        spec,
+    )
+}
 
 /// Reserve a `TaskId`, register the refcounted `Task`, and enqueue a
 /// fresh polling future for `process` under that id.
@@ -2718,11 +2793,7 @@ pub fn spawn_user_process(
     process: crate::UserProcess,
     spec: narf_scheduler::TaskSpec,
 ) -> narf_scheduler::TaskId {
-    let id = narf_scheduler::alloc_task_id();
-    let addr_space = process.address_space.clone();
-    let task = crate::task::Task::new_registered(id.raw(), process.pid.raw());
-    let future = UserTaskFuture::new(process, task);
-    narf_scheduler::spawn_user(id, future, spec, addr_space)
+    prepare_user_process_initial(process, spec).spawn()
 }
 
 /// Same as [`spawn_user_process`] but seeds the child with a saved
@@ -2732,9 +2803,5 @@ pub fn spawn_user_process_resume(
     state: UserState,
     spec: narf_scheduler::TaskSpec,
 ) -> narf_scheduler::TaskId {
-    let id = narf_scheduler::alloc_task_id();
-    let addr_space = process.address_space.clone();
-    let task = crate::task::Task::new_registered(id.raw(), process.pid.raw());
-    let future = UserTaskFuture::resume_with(process, task, state);
-    narf_scheduler::spawn_user(id, future, spec, addr_space)
+    prepare_user_process_resume(process, state, spec).spawn()
 }
