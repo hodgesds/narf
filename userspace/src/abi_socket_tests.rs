@@ -2308,6 +2308,7 @@ const SIOCINQ: u64 = 0x541B;
 /// rtnetlink message types (rtnetlink.h).
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
+const RTM_SETLINK: u16 = 19;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
 const RTM_NEWROUTE: u16 = 24;
@@ -2320,7 +2321,10 @@ const RTM_GETQDISC: u16 = 38;
 const RTM_GETTFILTER: u16 = 46;
 /// netlink control message types (netlink.h).
 const NLMSG_DONE: u16 = 3;
+const NLMSG_ERROR: u16 = 2;
 const NLMSG_HDRLEN: usize = 16;
+const NLM_F_REQUEST: u16 = 0x01;
+const NLM_F_ACK: u16 = 0x04;
 /// `NLM_F_REQUEST | NLM_F_DUMP` — the flags a dump request carries.
 const NLM_F_REQUEST_DUMP: u16 = 0x01 | (0x100 | 0x200);
 
@@ -2531,11 +2535,8 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_msg_trunc);
 /// NLMSG_ERROR ack path (the exact loopback_setup request shape).
 fn smoke_abi_netlink_reply_pid_matches_bound_port() -> TestResult {
     with_setup(|| {
-        const NLM_F_REQUEST: u16 = 0x01;
-        const NLM_F_ACK: u16 = 0x04;
         const AF_INET_ADDR: u8 = 2;
         const IFA_LOCAL: u16 = 2;
-        const NLMSG_ERROR: u16 = 2;
 
         let fd = open_netlink(NETLINK_ROUTE)?;
 
@@ -2612,6 +2613,11 @@ fn smoke_abi_netlink_reply_pid_matches_bound_port() -> TestResult {
         if nlmsg_type_of(&ack) != NLMSG_ERROR {
             return Err("RTM_NEWADDR ack was not NLMSG_ERROR");
         }
+        if i32::from_ne_bytes(ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap())
+            != EPERM as i32
+        {
+            return Err("ordinary route socket gained loopback admin authority");
+        }
         let ack_pid = u32::from_ne_bytes(ack[12..16].try_into().unwrap());
         if ack_pid != portid {
             return Err("NLMSG_ERROR ack nlmsg_pid did not match the bound port id");
@@ -2624,6 +2630,99 @@ fn smoke_abi_netlink_reply_pid_matches_bound_port() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_netlink_reply_pid_matches_bound_port
+);
+
+/// systemd PID 1 creates a route socket during early boot and sends this
+/// RTM_SETLINK request for synthetic loopback. The kernel grants only this
+/// socket a loopback-bound handle; ordinary sockets remain covered by the
+/// preceding EPERM regression test.
+fn smoke_abi_netlink_pid1_can_start_loopback() -> TestResult {
+    with_setup(|| {
+        const AF_INET: u8 = 2;
+        const AF_INET6: u8 = 10;
+        const IFA_LOCAL: u16 = 2;
+        const EEXIST: i32 = -17;
+
+        crate::handlers::register_task_to_pid(FAKE_TASK, 1);
+        let fd = open_netlink(NETLINK_ROUTE)?;
+
+        // struct ifinfomsg: family/pad/type/index/flags/change. This is the
+        // sd_rtnl_message_link_set_flags(IFF_UP, IFF_UP) request emitted by
+        // systemd's loopback_setup().
+        let mut set_link = [0u8; 32];
+        set_link[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        set_link[4..6].copy_from_slice(&RTM_SETLINK.to_ne_bytes());
+        set_link[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+        set_link[8..12].copy_from_slice(&89u32.to_ne_bytes());
+        set_link[20..24].copy_from_slice(&1i32.to_ne_bytes());
+        set_link[24..28].copy_from_slice(&1u32.to_ne_bytes()); // IFF_UP
+        set_link[28..32].copy_from_slice(&1u32.to_ne_bytes()); // IFF_UP mask
+
+        if netlink_send(fd, &set_link).ok_or("setlink send")? != set_link.len() as i64 {
+            return Err("PID 1 RTM_SETLINK send failed");
+        }
+        let mut ack = [0u8; 512];
+        let received = netlink_recv(fd, &mut ack).ok_or("setlink recv")?;
+        if received < (NLMSG_HDRLEN + 4) as i64 || nlmsg_type_of(&ack) != NLMSG_ERROR {
+            return Err("PID 1 RTM_SETLINK did not receive an NLMSG_ERROR ack");
+        }
+        if i32::from_ne_bytes(ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()) != 0 {
+            return Err("PID 1 RTM_SETLINK loopback ack was not successful");
+        }
+
+        // Linux creates the two loopback addresses before userspace starts.
+        // systemd intentionally re-adds them and treats EEXIST as success, so
+        // model their built-in state rather than granting a one-off bypass.
+        let mut add_v4 = [0u8; 32];
+        add_v4[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        add_v4[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
+        add_v4[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+        add_v4[8..12].copy_from_slice(&90u32.to_ne_bytes());
+        add_v4[16] = AF_INET;
+        add_v4[17] = 8;
+        add_v4[20..24].copy_from_slice(&1u32.to_ne_bytes());
+        add_v4[24..26].copy_from_slice(&8u16.to_ne_bytes());
+        add_v4[26..28].copy_from_slice(&IFA_LOCAL.to_ne_bytes());
+        add_v4[28..32].copy_from_slice(&[127, 0, 0, 1]);
+
+        if netlink_send(fd, &add_v4).ok_or("ipv4 add send")? != add_v4.len() as i64 {
+            return Err("PID 1 RTM_NEWADDR IPv4 send failed");
+        }
+        let received = netlink_recv(fd, &mut ack).ok_or("ipv4 add recv")?;
+        if received < (NLMSG_HDRLEN + 4) as i64
+            || i32::from_ne_bytes(ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()) != EEXIST
+        {
+            return Err("PID 1 RTM_NEWADDR IPv4 did not report built-in loopback state");
+        }
+
+        let mut add_v6 = [0u8; 44];
+        add_v6[0..4].copy_from_slice(&44u32.to_ne_bytes());
+        add_v6[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
+        add_v6[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+        add_v6[8..12].copy_from_slice(&91u32.to_ne_bytes());
+        add_v6[16] = AF_INET6;
+        add_v6[17] = 128;
+        add_v6[20..24].copy_from_slice(&1u32.to_ne_bytes());
+        add_v6[24..26].copy_from_slice(&20u16.to_ne_bytes());
+        add_v6[26..28].copy_from_slice(&IFA_LOCAL.to_ne_bytes());
+        add_v6[43] = 1;
+
+        if netlink_send(fd, &add_v6).ok_or("ipv6 add send")? != add_v6.len() as i64 {
+            return Err("PID 1 RTM_NEWADDR IPv6 send failed");
+        }
+        let received = netlink_recv(fd, &mut ack).ok_or("ipv6 add recv")?;
+        if received < (NLMSG_HDRLEN + 4) as i64
+            || i32::from_ne_bytes(ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()) != EEXIST
+        {
+            return Err("PID 1 RTM_NEWADDR IPv6 did not report built-in loopback state");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_pid1_can_start_loopback
 );
 
 fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
@@ -2946,14 +3045,26 @@ fn smoke_abi_netlink_route_getaddr_family_filter() -> TestResult {
         req[4..6].copy_from_slice(&RTM_GETADDR.to_ne_bytes());
         req[6..8].copy_from_slice(&NLM_F_REQUEST_DUMP.to_ne_bytes());
         req[8..12].copy_from_slice(&15u32.to_ne_bytes());
-        req[16] = 10; // AF_INET6; NARF currently publishes no IPv6 addresses.
+        req[16] = 10; // AF_INET6; synthetic loopback publishes ::1/128.
         if netlink_send(fd, &req).ok_or("filtered addr send")? != req.len() as i64 {
             return Err("filtered RTM_GETADDR send failed");
         }
         let mut reply = [0u8; 64];
         let n = netlink_recv(fd, &mut reply).ok_or("filtered addr recv")?;
-        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&reply) != NLMSG_DONE {
-            return Err("empty filtered address dump did not return NLMSG_DONE");
+        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&reply) != RTM_NEWADDR {
+            return Err("IPv6-filtered address dump did not return loopback ::1");
+        }
+        if reply[NLMSG_HDRLEN] != 10
+            || reply[NLMSG_HDRLEN + 1] != 128
+            || reply[NLMSG_HDRLEN + 3] != 254 // RT_SCOPE_HOST
+            || reply[43] != 1
+        {
+            return Err("IPv6-filtered address dump did not describe ::1/128");
+        }
+        let mut done = [0u8; 64];
+        let n = netlink_recv(fd, &mut done).ok_or("filtered addr done recv")?;
+        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&done) != NLMSG_DONE {
+            return Err("IPv6-filtered address dump did not terminate with NLMSG_DONE");
         }
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())

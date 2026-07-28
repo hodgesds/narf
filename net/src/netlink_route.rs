@@ -338,6 +338,7 @@ fn build_newaddr_v6(
     };
     body.push(flags);
     body.push(match addr.scope {
+        AddrScope::Host => 254, // RT_SCOPE_HOST
         AddrScope::Global | AddrScope::UniqueLocal => 0,
         AddrScope::LinkLocal => 0x20,
     });
@@ -507,6 +508,27 @@ fn enumerate() -> (Vec<LinkInfo>, Vec<AddrInfo>) {
     enumerate_in(0)
 }
 
+fn is_builtin_loopback_ipv4(addr: [u8; 4], prefix_len: u8) -> bool {
+    addr == [127, 0, 0, 1] && prefix_len == 8
+}
+
+fn is_builtin_loopback_ipv6(addr: [u8; 16], prefix_len: u8) -> bool {
+    addr == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] && prefix_len == 128
+}
+
+fn builtin_loopback_ipv6() -> crate::ipv6::addrs::Ipv6IfAddr {
+    crate::ipv6::addrs::Ipv6IfAddr {
+        iface: alloc::string::String::from("lo"),
+        addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        prefix_len: 128,
+        state: crate::ipv6::addrs::AddrState::Preferred,
+        scope: crate::ipv6::addrs::AddrScope::Host,
+        preferred_deadline_ns: u64::MAX,
+        valid_deadline_ns: u64::MAX,
+        temporary: false,
+    }
+}
+
 fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
     let mut links = Vec::new();
     let mut addrs = Vec::new();
@@ -660,6 +682,10 @@ pub fn build_dump_in(net_ns_id: u64, req: &[u8]) -> Vec<Vec<u8>> {
                 }
             }
             if requested_family == 0 || requested_family == AF_INET6 {
+                let loopback = builtin_loopback_ipv6();
+                if requested_ifindex == 0 || requested_ifindex == 1 {
+                    out.push(build_newaddr_v6(&loopback, 1, seq, pid));
+                }
                 for addr in crate::ipv6::addrs::list_all() {
                     if addr.state == crate::ipv6::addrs::AddrState::Invalid {
                         continue;
@@ -977,9 +1003,11 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             match family {
                 AF_INET if addr.len() == 4 => {
                     let addr: [u8; 4] = addr.try_into().map_err(|_| EINVAL)?;
-                    let exists = crate::iface::get_addrs(admin.iface_name())
-                        .iter()
-                        .any(|(existing, prefix)| existing.0 == addr && *prefix == prefix_len);
+                    let exists = (admin.iface_name() == "lo"
+                        && is_builtin_loopback_ipv4(addr, prefix_len))
+                        || crate::iface::get_addrs(admin.iface_name())
+                            .iter()
+                            .any(|(existing, prefix)| existing.0 == addr && *prefix == prefix_len);
                     if hdr.msg_type == RTM_NEWADDR {
                         validate_new_flags(exists, hdr.flags)?;
                         admin.add_ipv4(addr, prefix_len).map_err(admin_errno)
@@ -991,9 +1019,13 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                 }
                 AF_INET6 if addr.len() == 16 => {
                     let addr: [u8; 16] = addr.try_into().map_err(|_| EINVAL)?;
-                    let exists = crate::ipv6::addrs::list_iface(admin.iface_name())
-                        .iter()
-                        .any(|existing| existing.addr == addr && existing.prefix_len == prefix_len);
+                    let exists = (admin.iface_name() == "lo"
+                        && is_builtin_loopback_ipv6(addr, prefix_len))
+                        || crate::ipv6::addrs::list_iface(admin.iface_name())
+                            .iter()
+                            .any(|existing| {
+                                existing.addr == addr && existing.prefix_len == prefix_len
+                            });
                     if hdr.msg_type == RTM_NEWADDR {
                         validate_new_flags(exists, hdr.flags)?;
                         admin.add_ipv6(addr, prefix_len).map_err(admin_errno)

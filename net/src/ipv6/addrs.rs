@@ -46,6 +46,8 @@ pub enum AddrState {
 /// IPv6 address scope (RFC 4291 §2.7).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AddrScope {
+    /// This node only (`::1`).
+    Host,
     LinkLocal,
     UniqueLocal,
     Global,
@@ -142,6 +144,7 @@ pub fn snapshot() -> Vec<Ipv6IfAddrSnapshot> {
             i
         });
         let scope = match e.scope {
+            AddrScope::Host => 0x10,
             AddrScope::Global => 0x00,
             AddrScope::LinkLocal => 0x20,
             AddrScope::UniqueLocal => 0x40,
@@ -225,7 +228,9 @@ pub fn pick_source(iface: &str, dst: &[u8; 16]) -> Option<[u8; 16]> {
 
 /// Classify an address by its scope (RFC 4291).
 pub fn scope_of(addr: &[u8; 16]) -> AddrScope {
-    if addr[0] == 0xFE && (addr[1] & 0xC0) == 0x80 {
+    if *addr == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] {
+        AddrScope::Host // ::1
+    } else if addr[0] == 0xFE && (addr[1] & 0xC0) == 0x80 {
         AddrScope::LinkLocal // fe80::/10
     } else if addr[0] == 0xFC || addr[0] == 0xFD {
         AddrScope::UniqueLocal // fc00::/7

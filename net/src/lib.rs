@@ -110,8 +110,8 @@ pub mod udp_sock;
 pub mod wireguard;
 pub mod ws;
 pub use stack::{
-    AdminCap, AdminError, AdminHandle, AdminIpv4Route, AdminIpv6Route, AttachError, StackAttach,
-    StackAttachReply, StackDaemon,
+    initial_loopback_admin, AdminCap, AdminError, AdminHandle, AdminIpv4Route, AdminIpv6Route,
+    AttachError, StackAttach, StackAttachReply, StackDaemon,
 };
 
 mod dhcp_dns_e2e_tests;
