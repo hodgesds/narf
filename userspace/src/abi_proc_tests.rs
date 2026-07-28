@@ -227,7 +227,10 @@ fn smoke_abi_proc_prctl_feature_probes() -> TestResult {
         const PR_MDWE_REFUSE_EXEC_GAIN: u64 = 1;
 
         // MDWE is unsupported → EINVAL (drives systemd's seccomp fallback).
-        match call(Syscall::Prctl.raw(), a1(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN)) {
+        match call(
+            Syscall::Prctl.raw(),
+            a1(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN),
+        ) {
             Some(-22) => {}
             _ => return Err("PR_SET_MDWE must return -EINVAL (unsupported)"),
         }
@@ -246,7 +249,10 @@ fn smoke_abi_proc_prctl_feature_probes() -> TestResult {
             Some(0) => {}
             _ => return Err("PR_SET_TSC must return 0"),
         }
-        match call(Syscall::Prctl.raw(), a1(PR_GET_TSC, tsc.as_mut_ptr() as u64)) {
+        match call(
+            Syscall::Prctl.raw(),
+            a1(PR_GET_TSC, tsc.as_mut_ptr() as u64),
+        ) {
             Some(0) => {}
             _ => return Err("PR_GET_TSC must return 0"),
         }

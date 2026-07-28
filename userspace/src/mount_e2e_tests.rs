@@ -458,7 +458,9 @@ fn smoke_pivot_root_switch_root_umount_dot() -> TestResult {
     if umount_ok {
         TestResult::Pass
     } else {
-        TestResult::Fail("umount2(\".\") after pivot_root must resolve to the cwd (new root) and return 0")
+        TestResult::Fail(
+            "umount2(\".\") after pivot_root must resolve to the cwd (new root) and return 0",
+        )
     }
 }
 #[cfg(feature = "container")]
@@ -812,7 +814,8 @@ fn smoke_move_mount_overmount_no_ebusy() -> TestResult {
         ret: None,
     };
     crate::handlers::sys_mount_for_test(&mut mdst);
-    if !matches!(msrc.ret, Some(r) if r.value == 0) || !matches!(mdst.ret, Some(r) if r.value == 0) {
+    if !matches!(msrc.ret, Some(r) if r.value == 0) || !matches!(mdst.ret, Some(r) if r.value == 0)
+    {
         return TestResult::Fail("setup mounts failed");
     }
 

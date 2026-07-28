@@ -32,9 +32,7 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
     // probe on every sd_netlink_open(); the generic `val_ptr==0 || in_len==0`
     // rejection below turned it into -1 (== -EPERM to libc), which surfaced as
     // systemd's "Failed to open netlink, ignoring: Operation not permitted".
-    if level == crate::socket::SOL_NETLINK
-        && name == crate::socket::NETLINK_LIST_MEMBERSHIPS
-    {
+    if level == crate::socket::SOL_NETLINK && name == crate::socket::NETLINK_LIST_MEMBERSHIPS {
         // The optlen out-parameter is mandatory (EFAULT without it).
         if len_ptr == 0 {
             const EFAULT: i64 = 14;
