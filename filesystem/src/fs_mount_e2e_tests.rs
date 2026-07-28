@@ -503,6 +503,153 @@ fn smoke_ns_overmount_stacks() -> TestResult {
 }
 kernel_test_in!("filesystem/e2e/mount", smoke_ns_overmount_stacks);
 
+/// A FILE can be bind-mounted (mount --bind of a file), producing a
+/// file-rooted mount: it appears as a mount entry (so /proc/self/mountinfo
+/// lists it — what systemd's read-only procfs-control-file protection needs)
+/// and resolving its path returns the bound file's content. Without this the
+/// self-bind was a no-op, the path never showed up as a mount, and systemd's
+/// recursive read-only remount looped 32× then failed EBUSY / 226.
+fn smoke_registry_file_bind_resolves_to_file() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    let src = match make_initramfs(
+        "fb-src",
+        &[CpioEntry {
+            name: "f.txt",
+            mode: 0o100644,
+            data: b"filedata",
+        }],
+    ) {
+        Some(f) => f,
+        None => return TestResult::Fail("CPIO build failed"),
+    };
+    let h_src = match registry().mount(&auth, "/fb_src", src) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("source mount failed"),
+    };
+
+    // Bind the FILE /fb_src/f.txt onto /fb_dst.
+    let h_dst = match registry().bind_mount(&auth, "/fb_src/f.txt", "/fb_dst") {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&h_src, "/fb_src");
+            return TestResult::Fail("file bind_mount failed (a file source must bind)");
+        }
+    };
+
+    // The target is a file-rooted mount: root_file() is the bound file and it
+    // reads back the source content.
+    let content_ok = registry().with_mount("/fb_dst", |fs| match fs.root_file() {
+        Some(file) => {
+            let mut buf = vec![0u8; 16];
+            matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if &buf[..n] == b"filedata")
+        }
+        None => false,
+    }) == Some(true);
+
+    // It is a real mount entry (this is what makes it appear in mountinfo).
+    let listed = registry().list().iter().any(|p| p == "/fb_dst");
+
+    let _ = registry().unmount(&h_dst, "/fb_dst");
+    let _ = registry().unmount(&h_src, "/fb_src");
+
+    if content_ok && listed {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("a file bind mount must be listed and resolve to the file's content")
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_registry_file_bind_resolves_to_file
+);
+
+/// Stacking works for FILES too: overmounting one bound file with another
+/// shadows it, and unmounting reveals the file underneath — the file analogue
+/// of smoke_registry_overmount_stacks.
+fn smoke_registry_file_overmount_stacks() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    let a = match make_initramfs(
+        "fov-a",
+        &[CpioEntry {
+            name: "a.txt",
+            mode: 0o100644,
+            data: b"aaa",
+        }],
+    ) {
+        Some(f) => f,
+        None => return TestResult::Fail("CPIO build a failed"),
+    };
+    let b = match make_initramfs(
+        "fov-b",
+        &[CpioEntry {
+            name: "b.txt",
+            mode: 0o100644,
+            data: b"bbb",
+        }],
+    ) {
+        Some(f) => f,
+        None => return TestResult::Fail("CPIO build b failed"),
+    };
+    let ha = match registry().mount(&auth, "/fova", a) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount a failed"),
+    };
+    let hb = match registry().mount(&auth, "/fovb", b) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&ha, "/fova");
+            return TestResult::Fail("mount b failed");
+        }
+    };
+
+    let reads = |want: &[u8]| {
+        registry().with_mount("/fovstk", |fs| match fs.root_file() {
+            Some(file) => {
+                let mut buf = vec![0u8; 8];
+                matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if &buf[..n] == want)
+            }
+            None => false,
+        }) == Some(true)
+    };
+
+    // Bottom file, then overmount with the top file.
+    let hbot = match registry().bind_mount(&auth, "/fova/a.txt", "/fovstk") {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&hb, "/fovb");
+            let _ = registry().unmount(&ha, "/fova");
+            return TestResult::Fail("bottom file bind failed");
+        }
+    };
+    let htop = match registry().bind_mount(&auth, "/fovb/b.txt", "/fovstk") {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&hbot, "/fovstk");
+            let _ = registry().unmount(&hb, "/fovb");
+            let _ = registry().unmount(&ha, "/fova");
+            return TestResult::Fail("file overmount failed");
+        }
+    };
+
+    let top_wins = reads(b"bbb");
+    let popped = registry().unmount(&htop, "/fovstk").is_ok();
+    let bottom_revealed = reads(b"aaa");
+
+    let _ = registry().unmount(&hbot, "/fovstk");
+    let _ = registry().unmount(&hb, "/fovb");
+    let _ = registry().unmount(&ha, "/fova");
+
+    if top_wins && popped && bottom_revealed {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("file overmount must shadow the lower file and reveal it on unmount")
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_registry_file_overmount_stacks
+);
+
 // ── Smoke 2: directory listing ────────────────────────────────────────
 //
 // Mount a CPIO archive with:

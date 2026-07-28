@@ -1,41 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// Return true when two absolute paths name the same registry-backed procfs
-/// file through different procfs mountpoints.
-///
-/// systemd builds a service namespace under a staging procfs mount and then
-/// bind-mounts individual control files (for example
-/// `sys/kernel/domainname`) onto the corresponding file in the namespace's
-/// visible `/proc`. ProcFs instances are zero-sized views over one global
-/// registry, so equal relative paths are the same node even when the
-/// `Arc<dyn FsInstance>` values came from separate `mount("proc")` calls.
-fn same_procfs_file_alias(source: &str, target: &str) -> bool {
-    fn identity(path: &str) -> Option<alloc::string::String> {
-        current_resolve_absolute(path, |fs, rel| {
-            if fs.name() != "procfs" || rel.is_empty() {
-                return None;
-            }
-            let rel = alloc::string::String::from(rel.trim_matches('/'));
-            match poll_blocking(narf_filesystem::resolve_async_nofollow(
-                fs.root(),
-                rel.as_str(),
-            )) {
-                Some(Ok(file)) if file.stat().mode.file_type != narf_filesystem::FileType::Dir => {
-                    Some(rel)
-                }
-                _ => None,
-            }
-        })
-        .flatten()
-    }
-
-    match (identity(source), identity(target)) {
-        (Some(source), Some(target)) => source == target,
-        _ => false,
-    }
-}
-
 fn current_file_exists(path: &str) -> bool {
     current_resolve_absolute(path, |fs, rel| {
         if rel.is_empty() {
@@ -195,16 +160,14 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         } else {
             alloc::vec::Vec::new()
         };
-        // systemd protects procfs control files by bind-mounting a file onto
-        // the identical path before a read-only remount. NARF's mount tree is
-        // directory-rooted, but this exact self-bind cannot change lookup
-        // semantics, so validate the inode and accept it.
-        if source_resolved == target
-            || same_procfs_file_alias(source_resolved.as_str(), target.as_str())
-        {
-            ctx.set_return(SyscallReturn::ok(0));
-            return;
-        }
+        // systemd protects procfs control files (ProtectHostname=,
+        // ProtectKernelTunables=) by bind-mounting a file over itself before a
+        // read-only remount. That must create a REAL mount entry — even for a
+        // self-bind — so the path shows up in /proc/self/mountinfo; otherwise
+        // systemd's recursive remount loops 32× waiting for it and fails EBUSY
+        // (226/EXIT_NAMESPACE). current_bind_mount handles a file source by
+        // registering a FileMount, so a self-bind of a file is a real mount
+        // whose lookups still resolve to the same file.
         return match current_bind_mount(&auth, source_resolved.as_str(), target.as_str()) {
             Ok(_h) => {
                 for (relative, fs) in descendants {

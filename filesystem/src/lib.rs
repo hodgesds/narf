@@ -1186,6 +1186,20 @@ pub trait FsInstance: Send + Sync + 'static {
     /// stable across the FS's lifetime.
     fn name(&self) -> &str;
 
+    /// The single file this mount exposes, when the mount root is a FILE
+    /// rather than a directory (Linux `mount --bind <file> <file2>`). Default
+    /// `None` — a normal directory-rooted filesystem. A resolver that lands on
+    /// a mount's root (empty relative path) consults this first: `Some(file)`
+    /// means the mount point itself IS that file. systemd's ProtectHostname= /
+    /// ProtectKernelTunables= bind a read-only copy of a procfs control file
+    /// (e.g. /proc/sys/kernel/domainname) over itself; without a real
+    /// file-rooted mount the path never appears in /proc/self/mountinfo and
+    /// systemd's recursive read-only remount loops 32× then fails EBUSY
+    /// (226/EXIT_NAMESPACE).
+    fn root_file(&self) -> Option<Arc<dyn FileOps>> {
+        None
+    }
+
     /// Query filesystem-wide capacity. Synthetic filesystems retain the
     /// conservative default used before this interface existed.
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
@@ -1790,18 +1804,10 @@ impl MountNamespace {
                 String::from(source[source_mount.path.len()..].trim_start_matches('/')),
             )
         };
-        let mut root = source_fs.root();
-        for component in rel.split('/').filter(|part| !part.is_empty()) {
-            root = root.lookup_dir(component).ok_or(FsError::NotFound)?;
-        }
-        self.mount_arc(
-            authority,
-            target,
-            Arc::new(BindMount {
-                root,
-                fs_name: String::from(source_fs.name()),
-            }),
-        )
+        // A directory source binds as a subtree; a FILE source binds as a
+        // single file (mount --bind of a file).
+        let bind = build_bind_fs(&source_fs, &rel)?;
+        self.mount_arc(authority, target, bind)
     }
 
     /// Detach the topmost mount at `path` from this private namespace.
@@ -1859,6 +1865,94 @@ impl FsInstance for BindMount {
         // where a bind mount lists the source FS type, not "bind".
         &self.fs_name
     }
+}
+
+/// A directory with no entries — the `root()` of a [`FileMount`], whose real
+/// content is a single file reached via [`FsInstance::root_file`], not children.
+#[derive(Debug)]
+struct EmptyDir;
+
+impl DirOps for EmptyDir {
+    fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
+        None
+    }
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+        Box::new(core::iter::empty())
+    }
+}
+
+/// FsInstance adapter that exposes a single FILE (from another filesystem) as a
+/// mount root — Linux `mount --bind <file> <target-file>`. Resolution that
+/// lands on this mount's root returns the file via [`FsInstance::root_file`];
+/// the directory `root()` is empty because a file mount has no children.
+struct FileMount {
+    file: Arc<dyn FileOps>,
+    fs_name: String,
+}
+
+impl fmt::Debug for FileMount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileMount")
+            .field("fs_name", &self.fs_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FsInstance for FileMount {
+    fn root(&self) -> Arc<dyn DirOps> {
+        Arc::new(EmptyDir)
+    }
+    fn name(&self) -> &str {
+        &self.fs_name
+    }
+    fn root_file(&self) -> Option<Arc<dyn FileOps>> {
+        Some(self.file.clone())
+    }
+}
+
+/// Build the `FsInstance` for binding the node at relative path `rel` within
+/// `source_fs`: a directory leaf becomes a [`BindMount`], a FILE leaf a
+/// [`FileMount`] (so `mount --bind <file> <target>` works, which systemd relies
+/// on for read-only procfs-control-file protection). Every component but the
+/// last must be a directory. Uses the sync `lookup`/`lookup_dir` — the same
+/// constraint the directory-only bind always had; block-backed filesystems
+/// that stub the sync side are unaffected here (their binds are directory
+/// subtrees resolved elsewhere).
+fn build_bind_fs(
+    source_fs: &Arc<dyn FsInstance>,
+    rel: &str,
+) -> Result<Arc<dyn FsInstance>, FsError> {
+    let fs_name = String::from(source_fs.name());
+    let comps: alloc::vec::Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+    if comps.is_empty() {
+        // Binding the source mount's root directory itself.
+        return Ok(Arc::new(BindMount {
+            root: source_fs.root(),
+            fs_name,
+        }));
+    }
+    let mut dir = source_fs.root();
+    for c in &comps[..comps.len() - 1] {
+        dir = dir.lookup_dir(c).ok_or(FsError::NotFound)?;
+    }
+    let last = comps[comps.len() - 1];
+    // Dispatch on the leaf's actual type, not on which lookup succeeds: some
+    // filesystems expose a directory as a Dir-typed FileOps via `lookup` too.
+    // A directory leaf binds as a subtree (BindMount); anything else binds as a
+    // single file (FileMount).
+    if let Some(node) = dir.lookup(last) {
+        if node.stat().mode.file_type == FileType::Dir {
+            if let Some(d) = dir.lookup_dir(last) {
+                return Ok(Arc::new(BindMount { root: d, fs_name }));
+            }
+        }
+        return Ok(Arc::new(FileMount { file: node, fs_name }));
+    }
+    // Some filesystems only expose child directories via `lookup_dir`.
+    if let Some(d) = dir.lookup_dir(last) {
+        return Ok(Arc::new(BindMount { root: d, fs_name }));
+    }
+    Err(FsError::NotFound)
 }
 
 impl VfsRegistry {
@@ -1947,14 +2041,9 @@ impl VfsRegistry {
         let rel = String::from(source[source_mount.path.len()..].trim_start_matches('/'));
         // Overmount is allowed: a bind onto an occupied path stacks (see `mount`).
         drop(q);
-        let mut root = source_fs.root();
-        for component in rel.split('/').filter(|part| !part.is_empty()) {
-            root = root.lookup_dir(component).ok_or(FsError::NotFound)?;
-        }
-        let bind = alloc::sync::Arc::new(BindMount {
-            root,
-            fs_name: String::from(source_fs.name()),
-        });
+        // A directory source binds as a subtree; a FILE source binds as a
+        // single file (mount --bind of a file).
+        let bind = build_bind_fs(&source_fs, &rel)?;
         self.mount_arc(authority, target, bind)
     }
 

@@ -990,7 +990,14 @@ fn open_impl(
     //   Useful when the caller already knows the mount.
     let ops = if mnt_len == 0 {
         current_resolve_absolute(path, |fs, rel| {
-            poll_blocking(narf_filesystem::resolve_async(fs.root(), rel)).and_then(|r| r.ok())
+            if rel.is_empty() {
+                // A file-rooted mount (mount --bind of a file) resolves to the
+                // file at its own path; a directory-rooted mount yields None
+                // here and is handled by the directory branch below.
+                fs.root_file()
+            } else {
+                poll_blocking(narf_filesystem::resolve_async(fs.root(), rel)).and_then(|r| r.ok())
+            }
         })
         .flatten()
     } else {
@@ -8478,7 +8485,11 @@ fn stat_ino_path_dir_aware_ext(
 ) -> Option<(narf_filesystem::Stat, u64, u64)> {
     let file = current_resolve_absolute(path, |fs, rel| {
         if rel.is_empty() {
-            None // mount root → treated as a directory below
+            // A file-rooted mount (mount --bind of a file, e.g. systemd's
+            // read-only /proc/sys/kernel/domainname protection) IS the file at
+            // its own path — stat it directly. A directory-rooted mount falls
+            // through to the resolve_dir_absolute path below.
+            fs.root_file().map(|f| (f.stat(), f.ino(), f.rdev()))
         } else {
             // Drive the ASYNC resolver (same as the open/execve path):
             // on-disk filesystems like ext2 implement `lookup_async` but
