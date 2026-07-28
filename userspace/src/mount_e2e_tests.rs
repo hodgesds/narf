@@ -605,6 +605,86 @@ fn smoke_mount_ns_isolation() -> TestResult {
 }
 kernel_test_in!("userspace/mount", smoke_mount_ns_isolation);
 
+// ── Smoke 5b: pivot_root's put_old bind stays in the private ns ─────
+// A systemd service sandbox does `unshare(CLONE_NEWNS)` and only then
+// `pivot_root`. The put_old bind pivot_root installs (so the old root is
+// reachable from inside the new root) must land in the caller's PRIVATE
+// mount table — NOT the global registry. Leaking it globally made every
+// executor's root assembly order-dependent: a fresh service's
+// find_executable() intermittently hit ENOENT / 203/EXIT_EXEC while a later
+// one, snapshotting the polluted global table, happened to succeed.
+// Regression guard for the `registry().bind_mount` → `current_bind_mount`
+// fix in sys_pivot_root.
+#[cfg(feature = "container")]
+fn smoke_pivot_root_putold_bind_private() -> TestResult {
+    let task: u64 = 0x71_0b;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    // The new root must exist as a directory before the pivot.
+    let _ = unmount_for_test("/pvr_new");
+    let _ = unmount_for_test("/pvr_new/old");
+    let mut mnr = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/pvr_new\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut mnr);
+    if !matches!(mnr.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("mount /pvr_new failed");
+    }
+
+    // unshare(CLONE_NEWNS): the task now has a private mount table.
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    let mut uctx = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut uctx);
+    if !matches!(uctx.ret, Some(r) if r.value == 0) {
+        let _ = unmount_for_test("/pvr_new");
+        return TestResult::Fail("unshare(CLONE_NEWNS) failed");
+    }
+
+    // pivot_root(new_root, put_old): binds the prior root (/) at put_old.
+    let mut pctx = StubCtx {
+        args: pivot_args(b"/pvr_new\0", b"/pvr_new/old\0"),
+        ret: None,
+    };
+    crate::handlers::sys_pivot_root_for_test(&mut pctx);
+    let pivot_ok = matches!(pctx.ret, Some(r) if r.value == 0);
+
+    // The put_old bind must be present in the PRIVATE namespace…
+    let priv_has_putold = crate::handlers::current_mount_namespace()
+        .map(|ns| ns.list().iter().any(|p| p == "/pvr_new/old"))
+        .unwrap_or(false);
+    // …and must NOT have leaked into the global registry.
+    let global_has_putold = narf_filesystem::registry()
+        .list()
+        .iter()
+        .any(|p| p == "/pvr_new/old");
+
+    crate::handlers::clear_current_mount_namespace_for_test();
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    let _ = unmount_for_test("/pvr_new/old");
+    let _ = unmount_for_test("/pvr_new");
+
+    if !pivot_ok {
+        return TestResult::Fail("pivot_root in a private namespace failed");
+    }
+    if !priv_has_putold {
+        return TestResult::Fail("put_old bind missing from the private namespace");
+    }
+    if global_has_putold {
+        return TestResult::Fail("put_old bind leaked into the global registry");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace/mount", smoke_pivot_root_putold_bind_private);
+
 // ── Smoke 6: pivot_root to a missing new_root fails ────────────────
 // pivot_root must reject a new_root that doesn't exist under the prior
 // root (returns -1); the task's root_dir must be left untouched.

@@ -58,9 +58,17 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
         return;
     }
     // Bind-mount prior_root at put_old_resolved so the old root is
-    // still reachable from inside the new root.
+    // still reachable from inside the new root. Route through the
+    // namespace-aware helper: when the caller unshared CLONE_NEWNS (every
+    // systemd service sandbox does, before pivot_root), the put_old bind
+    // must land in that task's PRIVATE mount table, not the global registry.
+    // Binding into the global registry leaked each executor's put_old into
+    // every other task's view, so the per-service root assembly became
+    // order-dependent — a fresh executor's find_executable() intermittently
+    // hit ENOENT (203/EXIT_EXEC) while a later one, snapshotting the polluted
+    // global table, happened to succeed.
     let auth = narf_filesystem::bootstrap_mount_authority();
-    let _ = narf_filesystem::registry().bind_mount(&auth, &prior_root, &put_old_resolved);
+    let _ = current_bind_mount(&auth, &prior_root, &put_old_resolved);
     // Install the new root.
     root_dir_init_if_needed();
     let inserted = {
