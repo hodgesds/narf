@@ -258,6 +258,93 @@ fn smoke_abi_socket_accept_empty_eagain() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_accept_empty_eagain);
 
+/// The varlink primitive: a path-bound AF_UNIX stream listener, a client
+/// connect, the server accept()ing the queued connection, and BIDIRECTIONAL
+/// request→reply data over the accepted pair. This is exactly the shape
+/// systemd's sd-varlink uses (e.g. udevd → io.systemd.Multiplexer → userdbd
+/// worker → reply). If a connect doesn't enqueue, accept doesn't dequeue, or
+/// the reply doesn't flow back, a Type=notify service that gates readiness on
+/// such a call hangs and times out.
+fn smoke_abi_socket_unix_stream_request_reply() -> TestResult {
+    with_setup(|| {
+        let srv = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-varlink-rr");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("server bind failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0 {
+            return Err("server listen failed");
+        }
+        let cli = open_unix_stream()?;
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("connect status")?
+            != 0
+        {
+            return Err("client connect failed");
+        }
+        // Server accepts the queued connection.
+        let conn = call(Syscall::SocketAccept.raw(), a0(srv)).ok_or("accept status")?;
+        if conn < 0 {
+            return Err("accept did not return a connection fd for a queued connect");
+        }
+        let conn = conn as u64;
+        // Client → server request.
+        let req = b"REQUEST";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(cli, req.as_ptr() as u64, req.len() as u64, 0),
+        )
+        .ok_or("cli send status")?
+            != req.len() as i64
+        {
+            return Err("client send did not write the whole request");
+        }
+        let mut sbuf = [0u8; 16];
+        let rn = call(
+            Syscall::SocketRecv.raw(),
+            a3(conn, sbuf.as_mut_ptr() as u64, sbuf.len() as u64, 0),
+        )
+        .ok_or("srv recv status")?;
+        if rn != req.len() as i64 || &sbuf[..req.len()] != req {
+            return Err("server did not receive the client's request");
+        }
+        // Server → client reply.
+        let rep = b"REPLY";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(conn, rep.as_ptr() as u64, rep.len() as u64, 0),
+        )
+        .ok_or("srv send status")?
+            != rep.len() as i64
+        {
+            return Err("server send did not write the whole reply");
+        }
+        let mut cbuf = [0u8; 16];
+        let cn = call(
+            Syscall::SocketRecv.raw(),
+            a3(cli, cbuf.as_mut_ptr() as u64, cbuf.len() as u64, 0),
+        )
+        .ok_or("cli recv status")?;
+        if cn != rep.len() as i64 || &cbuf[..rep.len()] != rep {
+            return Err("client did not receive the server's reply");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_stream_request_reply
+);
+
 // ──────────────────────────── SocketAccept4 ───────────────────────────
 
 fn smoke_abi_socket_accept4_neg() -> TestResult {
