@@ -40,22 +40,32 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // recorded for diagnostic symmetry only.
     let _ = flags & (MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW);
 
-    // Protect the core API pseudo-filesystems from destructive unmount.
-    // NARF has no mount stacking: /proc, /sys, /dev (and cgroup2) are single
-    // shared instances that the chroot's Stage::Late `mnt-dev-bind` provides
-    // and everything depends on. Because NARF mounts these idempotently (see
-    // sys_mount), the balancing umount of one is also a no-op: report success
-    // but keep the singleton mounted. tmpfs / bind / real mounts unmount as
-    // normal.
-    let protected = current_mount_list_with_names()
-        .into_iter()
-        .any(|(path, name)| {
-            path == target
-                && matches!(
-                    name.as_str(),
-                    "procfs" | "sysfs" | "devfs" | "cgroup2" | "cgroupfs"
-                )
-        });
+    // Protect the core API pseudo-filesystems from destructive unmount ONLY in
+    // the GLOBAL registry. NARF has no mount stacking: the global /proc, /sys,
+    // /dev (and cgroup2) are single shared instances the chroot's Stage::Late
+    // `mnt-dev-bind` provides and everything depends on, so a global umount is a
+    // keep-mounted no-op.
+    //
+    // A task with a PRIVATE mount namespace (every systemd service sandbox, after
+    // unshare(CLONE_NEWNS)) must NOT get that no-op: `ns.unmount` only pops that
+    // namespace's OWN mount entry — the shared singleton's `FsInstance` Arc, still
+    // held by the global registry, is untouched. Applying the no-op there made
+    // umount2 of a service's PRIVATE /dev (systemd's mount_private_dev →
+    // umount_recursive before the MS_MOVE) a silent success while the mount stayed
+    // in /proc/self/mountinfo, so umount_recursive looped FOREVER — the service's
+    // sd-executor hung before execve and the Type=notify unit timed out (userdbd,
+    // and every service with PrivateDevices=/ProtectProc=/etc.).
+    let private_ns = current_mount_namespace();
+    let protected = private_ns.is_none()
+        && current_mount_list_with_names()
+            .into_iter()
+            .any(|(path, name)| {
+                path == target
+                    && matches!(
+                        name.as_str(),
+                        "procfs" | "sysfs" | "devfs" | "cgroup2" | "cgroupfs"
+                    )
+            });
     if protected {
         ctx.set_return(SyscallReturn::ok(0));
         return;
@@ -68,7 +78,7 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
         narf_capabilities::Cap::<narf_filesystem::MountPoint, narf_capabilities::Write>::bootstrap(
         );
     let _ = auth;
-    let result = if let Some(ns) = current_mount_namespace() {
+    let result = if let Some(ns) = private_ns {
         ns.unmount(target.as_str())
     } else {
         narf_filesystem::registry().unmount(&handle, target.as_str())

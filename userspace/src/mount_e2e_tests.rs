@@ -605,6 +605,86 @@ fn smoke_mount_ns_isolation() -> TestResult {
 }
 kernel_test_in!("userspace/mount", smoke_mount_ns_isolation);
 
+// ── Smoke 5g: umount2 of a private pseudo-fs actually removes it ────
+// systemd's mount_private_dev (PrivateDevices=/ProtectProc=/… — userdbd,
+// logind, most sandboxed services) builds a private /dev tmpfs+devfs, then
+// umount_recursive()s everything under the target before MS_MOVE'ing it into
+// place. umount_recursive reads /proc/self/mountinfo, unmounts each entry, and
+// LOOPS until none remain. NARF protects the GLOBAL singleton /dev,/proc,/sys
+// from a destructive umount by returning success-without-removing — but that
+// no-op must NOT apply inside a private mount namespace, where umount pops only
+// that namespace's entry. Applying it there left the devfs in mountinfo, so
+// umount_recursive spun FOREVER and the service's executor hung before execve
+// (Type=notify timeout). Assert umount2 of a private devfs truly removes it.
+#[cfg(feature = "container")]
+fn smoke_umount_private_pseudofs_actually_removes() -> TestResult {
+    let task: u64 = 0x71_10;
+    set_task(task);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    // unshare(CLONE_NEWNS): private mount table.
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    let mut uctx = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut uctx);
+    if !matches!(uctx.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("unshare(CLONE_NEWNS) failed");
+    }
+
+    // Mount a devfs (a "protected" pseudo-fs name) in the private namespace.
+    let _ = unmount_for_test("/priv_dev");
+    let mut md = StubCtx {
+        args: mount_args(b"devtmpfs\0", b"/priv_dev\0", b"devtmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut md);
+    if !matches!(md.ret, Some(r) if r.value == 0) {
+        crate::handlers::clear_current_mount_namespace_for_test();
+        return TestResult::Fail("mount devtmpfs /priv_dev failed");
+    }
+    let present_before = crate::handlers::current_mount_namespace()
+        .map(|ns| ns.list().iter().any(|p| p == "/priv_dev"))
+        .unwrap_or(false);
+
+    // umount2("/priv_dev", UMOUNT_NOFOLLOW) — must actually pop the entry.
+    const UMOUNT_NOFOLLOW: u64 = 0x8;
+    let mut um = StubCtx {
+        args: unmount_args(b"/priv_dev\0", UMOUNT_NOFOLLOW),
+        ret: None,
+    };
+    crate::handlers::sys_umount2_for_test(&mut um);
+    let umount_ok = matches!(um.ret, Some(r) if r.value == 0);
+    let present_after = crate::handlers::current_mount_namespace()
+        .map(|ns| ns.list().iter().any(|p| p == "/priv_dev"))
+        .unwrap_or(false);
+
+    crate::handlers::clear_current_mount_namespace_for_test();
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+
+    if !present_before {
+        return TestResult::Fail("private devfs mount was not registered");
+    }
+    if !umount_ok {
+        return TestResult::Fail("umount2 of a private devfs did not return 0");
+    }
+    if present_after {
+        return TestResult::Fail(
+            "umount2 no-op'd a private devfs (still mounted) — umount_recursive would loop",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "userspace/mount",
+    smoke_umount_private_pseudofs_actually_removes
+);
+
 // ── Smoke 5b: pivot_root's put_old bind stays in the private ns ─────
 // A systemd service sandbox does `unshare(CLONE_NEWNS)` and only then
 // `pivot_root`. The put_old bind pivot_root installs (so the old root is
