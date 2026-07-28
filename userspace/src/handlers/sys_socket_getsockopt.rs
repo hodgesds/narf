@@ -24,6 +24,50 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
     } else {
         0
     };
+    // NETLINK_LIST_MEMBERSHIPS is a length-query option: Linux answers a
+    // `getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, NULL, &len)` (optval
+    // NULL, *optlen 0) by writing the required bitmap byte length into optlen
+    // and returning 0 — the caller then allocates and issues a second call.
+    // sd-netlink's netlink_socket_get_multicast_groups() runs exactly this
+    // probe on every sd_netlink_open(); the generic `val_ptr==0 || in_len==0`
+    // rejection below turned it into -1 (== -EPERM to libc), which surfaced as
+    // systemd's "Failed to open netlink, ignoring: Operation not permitted".
+    if level == crate::socket::SOL_NETLINK
+        && name == crate::socket::NETLINK_LIST_MEMBERSHIPS
+    {
+        // The optlen out-parameter is mandatory (EFAULT without it).
+        if len_ptr == 0 {
+            const EFAULT: i64 = 14;
+            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+            return;
+        }
+        let required = sock.netlink_list_memberships_len();
+        // Fill the bitmap only up to the caller-provided buffer; the probe
+        // form (val_ptr == 0 or in_len == 0) writes nothing but still reports
+        // the required length so the next call can size its allocation.
+        let copy_len = if val_ptr != 0 {
+            core::cmp::min(required, in_len)
+        } else {
+            0
+        };
+        if copy_len > 0 {
+            if validate_user_range(val_ptr, copy_len).is_err() {
+                ctx.set_return(fail);
+                return;
+            }
+            let mut buf = alloc::vec![0u8; copy_len];
+            let _ = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+                level,
+                name,
+                buf: &mut buf,
+            });
+            // SAFETY: val_ptr was range-validated to hold copy_len bytes.
+            let _ = unsafe { copy_to_user(val_ptr, &buf[..copy_len]) };
+        }
+        write_user_u32(len_ptr, required as u32);
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
     if val_ptr == 0 || in_len == 0 {
         ctx.set_return(fail);
         return;

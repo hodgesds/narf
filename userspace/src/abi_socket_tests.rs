@@ -2218,6 +2218,7 @@ const NETLINK_KOBJECT_UEVENT: u64 = 15;
 const SOL_NETLINK: u64 = 270;
 const NETLINK_ADD_MEMBERSHIP: u64 = 1;
 const NETLINK_EXT_ACK: u64 = 11;
+const NETLINK_LIST_MEMBERSHIPS: u64 = 9;
 const SIOCINQ: u64 = 0x541B;
 /// rtnetlink message types (rtnetlink.h).
 const RTM_NEWLINK: u16 = 16;
@@ -2541,6 +2542,118 @@ fn smoke_abi_netlink_uevent_socket_bind() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_uevent_socket_bind);
+
+// sd-netlink's netlink_socket_get_multicast_groups() probes the required
+// bitmap length with getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, NULL,
+// &len) where *len starts at 0. It runs on EVERY sd_netlink_open() (loopback
+// setup, udev, rtnetlink). NARF's getsockopt handler previously rejected the
+// NULL/zero-length probe with -1, which libc maps to EPERM — the exact cause
+// of systemd PID 1's "Failed to open netlink, ignoring: Operation not
+// permitted". This test reproduces the probe and asserts it now succeeds and
+// reports the required length, and that the follow-up bitmap read agrees.
+fn smoke_abi_netlink_list_memberships_length_probe() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+
+        // A fresh socket has joined no groups: the NULL-optval, *optlen=0
+        // probe must succeed (return 0) and report a required length of 0.
+        let mut probe_len = 0u32.to_ne_bytes();
+        let r = call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_LIST_MEMBERSHIPS,
+                arg3: 0, // optval == NULL, the sd-netlink probe form
+                arg4: probe_len.as_mut_ptr() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("list-memberships probe status")?;
+        if r != 0 {
+            return Err("NETLINK_LIST_MEMBERSHIPS NULL probe did not return 0 (was EPERM)");
+        }
+        if u32::from_ne_bytes(probe_len) != 0 {
+            return Err("empty NETLINK_LIST_MEMBERSHIPS probe reported nonzero length");
+        }
+
+        // Join group 65 → highest group forces a 3-word (12-byte) bitmap.
+        let group = 65u32.to_ne_bytes();
+        if call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_ADD_MEMBERSHIP,
+                arg3: group.as_ptr() as u64,
+                arg4: group.len() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("add-membership status")?
+            != 0
+        {
+            return Err("NETLINK_ADD_MEMBERSHIP failed");
+        }
+
+        // The NULL-optval probe now reports the required 12-byte length.
+        let mut probe_len = 0u32.to_ne_bytes();
+        let r = call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_LIST_MEMBERSHIPS,
+                arg3: 0,
+                arg4: probe_len.as_mut_ptr() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("list-memberships probe#2 status")?;
+        if r != 0 {
+            return Err("NETLINK_LIST_MEMBERSHIPS probe after join did not return 0");
+        }
+        if u32::from_ne_bytes(probe_len) != 12 {
+            return Err("NETLINK_LIST_MEMBERSHIPS probe reported the wrong required length");
+        }
+
+        // A follow-up read of the reported length returns the bitmap with the
+        // group-65 bit set in the third word, and updates optlen to 12.
+        let mut bitmap = [0u8; 12];
+        let mut read_len = (bitmap.len() as u32).to_ne_bytes();
+        let r = call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_LIST_MEMBERSHIPS,
+                arg3: bitmap.as_mut_ptr() as u64,
+                arg4: read_len.as_mut_ptr() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("list-memberships read status")?;
+        if r != 0 {
+            return Err("NETLINK_LIST_MEMBERSHIPS bitmap read did not return 0");
+        }
+        if u32::from_ne_bytes(read_len) != 12 {
+            return Err("NETLINK_LIST_MEMBERSHIPS read did not update optlen to 12");
+        }
+        // group 65 → word 2 (bytes 8..12), bit (65-1) % 32 == 0.
+        if u32::from_ne_bytes(bitmap[8..12].try_into().unwrap()) != 1
+            || u32::from_ne_bytes(bitmap[0..4].try_into().unwrap()) != 0
+        {
+            return Err("NETLINK_LIST_MEMBERSHIPS bitmap did not report group 65");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_list_memberships_length_probe
+);
 
 fn smoke_abi_netlink_route_getlink_dump() -> TestResult {
     with_setup(|| {

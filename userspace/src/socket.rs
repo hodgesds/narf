@@ -1062,6 +1062,21 @@ impl SocketFile {
         }
     }
 
+    /// Byte length of the `NETLINK_LIST_MEMBERSHIPS` bitmap this socket would
+    /// report: `ceil(highest_group / 32)` u32 words, expressed in bytes. Zero
+    /// when the socket has joined no multicast groups. Linux answers a
+    /// `getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, NULL, &len)` probe
+    /// with exactly this value so callers can size their buffer; sd-netlink's
+    /// `netlink_socket_get_multicast_groups()` issues that probe on every
+    /// `sd_netlink_open()` (loopback-setup, udev, rtnetlink).
+    pub fn netlink_list_memberships_len(&self) -> usize {
+        self.netlink_memberships
+            .lock()
+            .last()
+            .map(|group| (*group as usize).div_ceil(32) * 4)
+            .unwrap_or(0)
+    }
+
     fn connect_netlink(&self, addr: &SockAddr) -> SocketOpResult {
         let (portid, groups) = match Self::netlink_addr(addr) {
             Some(v) => v,
@@ -2873,25 +2888,32 @@ impl SocketFile {
                 write_bool(buf, self.netlink_strict_check.load(Ordering::Acquire))
             }
             (SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS) => {
+                // Linux reports the FULL required byte length in optlen (so a
+                // NULL/short-buffer probe can size its allocation) while only
+                // filling as many bytes of the bitmap as the caller's buffer
+                // holds. `OptValue { n }` therefore carries the required
+                // length, not the bytes written; the syscall handler copies
+                // `min(n, in_len)` bytes back and writes `n` into optlen.
                 let memberships = self.netlink_memberships.lock();
                 let words = memberships
                     .last()
                     .map(|group| (*group as usize).div_ceil(32))
                     .unwrap_or(0);
-                let n = core::cmp::min(buf.len() / 4, words) * 4;
-                buf[..n].fill(0);
+                let required = words * 4;
+                let fill = core::cmp::min(buf.len() / 4, words) * 4;
+                buf[..fill].fill(0);
                 for group in memberships.iter().copied() {
                     let word = (group as usize - 1) / 32;
-                    if word * 4 >= n {
+                    let offset = word * 4;
+                    if offset >= fill {
                         continue;
                     }
-                    let offset = word * 4;
                     let mut value =
                         u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap_or([0; 4]));
                     value |= 1u32 << ((group - 1) % 32);
                     buf[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
                 }
-                SocketOpResult::OptValue { n }
+                SocketOpResult::OptValue { n: required }
             }
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
@@ -4808,6 +4830,53 @@ fn smoke_netlink_lists_high_membership_groups() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_netlink_lists_high_membership_groups
+);
+
+// Linux reports the FULL required bitmap length in optlen even when the caller
+// passes a buffer too small to hold it (or an empty length-query buffer), so
+// callers can size a second read. This backs the sd-netlink probe path.
+fn smoke_netlink_list_memberships_reports_required_length() -> TestResult {
+    let sock = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    // No groups joined: the length query reports zero and the accessor agrees.
+    let mut empty: [u8; 0] = [];
+    if !matches!(
+        sock.handle_getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, &mut empty),
+        SocketOpResult::OptValue { n: 0 }
+    ) || sock.netlink_list_memberships_len() != 0
+    {
+        return TestResult::Fail("empty membership set did not report zero length");
+    }
+    if !matches!(
+        sock.handle_setsockopt(SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &65u32.to_ne_bytes()),
+        SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("NETLINK_ADD_MEMBERSHIP rejected group 65");
+    }
+    // group 65 needs 3 u32 words = 12 bytes. An empty query still reports 12.
+    if !matches!(
+        sock.handle_getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, &mut empty),
+        SocketOpResult::OptValue { n: 12 }
+    ) || sock.netlink_list_memberships_len() != 12
+    {
+        return TestResult::Fail("length query did not report the required 12 bytes");
+    }
+    // A short 4-byte buffer still reports the full 12-byte requirement and only
+    // fills the word it can hold (word 0, which has no bits for group 65).
+    let mut short = [0xFFu8; 4];
+    if !matches!(
+        sock.handle_getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, &mut short),
+        SocketOpResult::OptValue { n: 12 }
+    ) {
+        return TestResult::Fail("short buffer did not report the full required length");
+    }
+    if u32::from_ne_bytes(short) != 0 {
+        return TestResult::Fail("short buffer word 0 was not cleared");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_netlink_list_memberships_reports_required_length
 );
 
 fn smoke_netlink_pktinfo_tracks_received_multicast_group() -> TestResult {
