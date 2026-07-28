@@ -1405,7 +1405,11 @@ fn smoke_abi_socket_notify_path_dgram_epoll_scm() -> TestResult {
     with_setup(|| {
         let rx = open_unix(SOCK_DGRAM)?;
         let (addr, alen) = unix_sockaddr(b"/notify-e2e.sock");
-        if call(Syscall::SocketBind.raw(), a2(rx, addr.as_ptr() as u64, alen)).ok_or("bind status")?
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
             != 0
         {
             return Err("bind() of the PATH notify datagram socket failed");
@@ -1483,11 +1487,8 @@ fn smoke_abi_socket_notify_path_dgram_epoll_scm() -> TestResult {
         msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
         msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
         msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
-        let n = call(
-            Syscall::SocketRecvMsg.raw(),
-            a2(rx, msg.as_ptr() as u64, 0),
-        )
-        .ok_or("recvmsg status")?;
+        let n = call(Syscall::SocketRecvMsg.raw(), a2(rx, msg.as_ptr() as u64, 0))
+            .ok_or("recvmsg status")?;
         if n != payload.len() as i64 || &dst[..payload.len()] != payload {
             return Err("recvmsg did not deliver the READY=1 payload");
         }
@@ -1892,11 +1893,8 @@ fn smoke_abi_socket_notify_path_dgram_epollin_deliver() -> TestResult {
         msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
         msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
         msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
-        let n = call(
-            Syscall::SocketRecvMsg.raw(),
-            a2(rx, msg.as_ptr() as u64, 0),
-        )
-        .ok_or("recvmsg status")?;
+        let n = call(Syscall::SocketRecvMsg.raw(), a2(rx, msg.as_ptr() as u64, 0))
+            .ok_or("recvmsg status")?;
         if n != payload.len() as i64 || &dst[..payload.len()] != payload {
             return Err("recvmsg did not return the READY=1 datagram");
         }
@@ -2434,6 +2432,112 @@ fn smoke_abi_netlink_route_msg_trunc() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_msg_trunc);
+
+/// Every unicast rtnetlink reply must carry `nlmsg_pid == <bound port id>`.
+/// sd-netlink's `parse_message_one` silently drops any non-broadcast message
+/// whose `nlmsg_pid` differs from the socket's own port; the real kernel stamps
+/// a unicast reply's `nlmsg_pid` with the recipient's port (`netlink_ack` /
+/// `__nlmsg_put`). With a zero `nlmsg_pid`, systemd's `loopback_setup` never
+/// sees the ack for its RTM_NEWADDR/RTM_SETLINK requests, so `n_messages` never
+/// reaches zero and it spins in `ppoll` forever — wedging PID 1 boot right after
+/// the "Welcome to …" banner. This covers dump entries, NLMSG_DONE, and the
+/// NLMSG_ERROR ack path (the exact loopback_setup request shape).
+fn smoke_abi_netlink_reply_pid_matches_bound_port() -> TestResult {
+    with_setup(|| {
+        const NLM_F_REQUEST: u16 = 0x01;
+        const NLM_F_ACK: u16 = 0x04;
+        const AF_INET_ADDR: u8 = 2;
+        const IFA_LOCAL: u16 = 2;
+        const NLMSG_ERROR: u16 = 2;
+
+        let fd = open_netlink(NETLINK_ROUTE)?;
+
+        // A dump: RTM_GETLINK → one or more RTM_NEWLINK + a terminating
+        // NLMSG_DONE. The send allocates the socket's port id.
+        let req = nlmsg_request(RTM_GETLINK, 77);
+        if netlink_send(fd, &req).ok_or("dump send")? != req.len() as i64 {
+            return Err("RTM_GETLINK send failed");
+        }
+
+        let mut local = [0u8; 12];
+        let mut local_len = (local.len() as u32).to_ne_bytes();
+        if call(
+            Syscall::SocketGetSockName.raw(),
+            a2(fd, local.as_mut_ptr() as u64, local_len.as_mut_ptr() as u64),
+        )
+        .ok_or("getsockname status")?
+            != 0
+        {
+            return Err("netlink getsockname failed");
+        }
+        let portid = u32::from_ne_bytes(local[4..8].try_into().unwrap());
+        if portid == 0 {
+            return Err("netlink port id was not allocated");
+        }
+
+        // Every message in the dump must be stamped with our port id.
+        let mut saw_done = false;
+        for _ in 0..64 {
+            let mut reply = [0u8; 1024];
+            let n = netlink_recv(fd, &mut reply).ok_or("dump recv")?;
+            if n < NLMSG_HDRLEN as i64 {
+                return Err("dump recv returned a short message");
+            }
+            let msg_pid = u32::from_ne_bytes(reply[12..16].try_into().unwrap());
+            if msg_pid != portid {
+                return Err("dump reply nlmsg_pid did not match the bound port id");
+            }
+            if nlmsg_type_of(&reply) == NLMSG_DONE {
+                saw_done = true;
+                break;
+            }
+        }
+        if !saw_done {
+            return Err("dump did not terminate with NLMSG_DONE");
+        }
+
+        // The NLMSG_ERROR ack path: RTM_NEWADDR(127.0.0.1/8 on lo) with
+        // NLM_F_ACK — the exact request systemd's loopback_setup enqueues. It
+        // fails with EPERM here (no admin capability), but the error ack must
+        // still carry our port id so the caller's wait loop can complete.
+        let mut add = [0u8; 32];
+        add[0..4].copy_from_slice(&32u32.to_le_bytes());
+        add[4..6].copy_from_slice(&RTM_NEWADDR.to_le_bytes());
+        add[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_le_bytes());
+        add[8..12].copy_from_slice(&88u32.to_le_bytes());
+        // struct ifaddrmsg: family, prefixlen, flags, scope, index(u32).
+        add[16] = AF_INET_ADDR;
+        add[17] = 8;
+        add[20..24].copy_from_slice(&1u32.to_ne_bytes());
+        // rtattr IFA_LOCAL = 127.0.0.1 (len includes the 4-byte header).
+        add[24..26].copy_from_slice(&8u16.to_le_bytes());
+        add[26..28].copy_from_slice(&IFA_LOCAL.to_le_bytes());
+        add[28..32].copy_from_slice(&[127, 0, 0, 1]);
+
+        if netlink_send(fd, &add).ok_or("newaddr send")? != add.len() as i64 {
+            return Err("RTM_NEWADDR send failed");
+        }
+        let mut ack = [0u8; 512];
+        let an = netlink_recv(fd, &mut ack).ok_or("ack recv")?;
+        if an < NLMSG_HDRLEN as i64 {
+            return Err("ack recv returned a short message");
+        }
+        if nlmsg_type_of(&ack) != NLMSG_ERROR {
+            return Err("RTM_NEWADDR ack was not NLMSG_ERROR");
+        }
+        let ack_pid = u32::from_ne_bytes(ack[12..16].try_into().unwrap());
+        if ack_pid != portid {
+            return Err("NLMSG_ERROR ack nlmsg_pid did not match the bound port id");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_reply_pid_matches_bound_port
+);
 
 fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
     with_setup(|| {

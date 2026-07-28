@@ -891,6 +891,35 @@ impl SocketFile {
         }
     }
 
+    /// Stamp each queued unicast netlink reply's `nlmsg_pid` with the
+    /// destination socket's own port id. The Linux kernel sets a unicast
+    /// reply's `nlmsg_pid` to the recipient's port id (see `netlink_ack` /
+    /// `__nlmsg_put(skb, NETLINK_CB(in_skb).portid, ...)`), and sd-netlink's
+    /// `parse_message_one` silently drops any non-broadcast message whose
+    /// `nlmsg_pid` differs from its bound port. A reply stamped with 0 is
+    /// therefore discarded, so a caller waiting on the ack (e.g. systemd's
+    /// `loopback_setup`) never sees `n_messages` reach zero and spins in
+    /// `ppoll` forever. Broadcast/multicast notifications keep `nlmsg_pid=0`
+    /// (kernel origin) and are stamped separately, so only the direct replies
+    /// pass through here. A `Vec` may carry more than one concatenated
+    /// message; walk them by `nlmsg_len` alignment.
+    fn stamp_netlink_reply_portid(messages: &mut [alloc::vec::Vec<u8>], portid: u32) {
+        const NLMSG_HDRLEN: usize = 16;
+        for msg in messages.iter_mut() {
+            let mut off = 0;
+            while off + NLMSG_HDRLEN <= msg.len() {
+                let len = u32::from_ne_bytes([msg[off], msg[off + 1], msg[off + 2], msg[off + 3]])
+                    as usize;
+                if len < NLMSG_HDRLEN || off + len > msg.len() {
+                    break;
+                }
+                // nlmsg_pid occupies bytes 12..16 of the nlmsghdr.
+                msg[off + 12..off + 16].copy_from_slice(&portid.to_ne_bytes());
+                off += (len + 3) & !3;
+            }
+        }
+    }
+
     fn ensure_netlink_portid(&self) -> u32 {
         let current = self.netlink_portid.load(Ordering::Acquire);
         if current != 0 {
@@ -1963,10 +1992,10 @@ impl SocketFile {
                 if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
                     return result;
                 }
-                self.ensure_netlink_portid();
+                let dest_portid = self.ensure_netlink_portid();
                 let sent = buf.len() as u64;
                 let admin = self.netlink_admin.lock().clone();
-                let msgs = match narf_net::netlink_route::build_replies_with_options_in(
+                let mut msgs = match narf_net::netlink_route::build_replies_with_options_in(
                     self.net_ns_id(),
                     buf,
                     admin.as_ref(),
@@ -1981,6 +2010,7 @@ impl SocketFile {
                 };
                 let notifications =
                     narf_net::netlink_route::successful_mutation_notifications(buf, &msgs);
+                Self::stamp_netlink_reply_portid(&mut msgs, dest_portid);
                 let reply_count = msgs.len();
                 {
                     let mut g = self.state.lock();
@@ -2053,8 +2083,8 @@ impl SocketFile {
                 if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
                     return result;
                 }
-                self.ensure_netlink_portid();
-                let replies = match narf_net::netlink_generic::build_replies_with_options(
+                let dest_portid = self.ensure_netlink_portid();
+                let mut replies = match narf_net::netlink_generic::build_replies_with_options(
                     buf,
                     narf_net::netlink_generic::ReplyOptions {
                         ext_ack: self.netlink_ext_ack.load(Ordering::Acquire),
@@ -2064,6 +2094,7 @@ impl SocketFile {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                Self::stamp_netlink_reply_portid(&mut replies, dest_portid);
                 let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {
@@ -2124,12 +2155,13 @@ impl SocketFile {
                 if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
                     return result;
                 }
-                self.ensure_netlink_portid();
-                let replies = match narf_net::netlink_diag::build_replies_in(self.net_ns_id(), buf)
-                {
-                    Ok(replies) => replies,
-                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
-                };
+                let dest_portid = self.ensure_netlink_portid();
+                let mut replies =
+                    match narf_net::netlink_diag::build_replies_in(self.net_ns_id(), buf) {
+                        Ok(replies) => replies,
+                        Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                    };
+                Self::stamp_netlink_reply_portid(&mut replies, dest_portid);
                 let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {
@@ -2190,9 +2222,9 @@ impl SocketFile {
                 if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
                     return result;
                 }
-                self.ensure_netlink_portid();
+                let dest_portid = self.ensure_netlink_portid();
                 let admin = self.netfilter_admin.lock().clone();
-                let replies = match narf_net::netlink_netfilter::build_replies_authorized(
+                let mut replies = match narf_net::netlink_netfilter::build_replies_authorized(
                     self.net_ns_id(),
                     buf,
                     admin.as_ref(),
@@ -2200,6 +2232,7 @@ impl SocketFile {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                Self::stamp_netlink_reply_portid(&mut replies, dest_portid);
                 let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {
@@ -2260,11 +2293,12 @@ impl SocketFile {
                 if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
                     return result;
                 }
-                self.ensure_netlink_portid();
-                let replies = match narf_net::netlink_audit::build_replies(buf) {
+                let dest_portid = self.ensure_netlink_portid();
+                let mut replies = match narf_net::netlink_audit::build_replies(buf) {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                Self::stamp_netlink_reply_portid(&mut replies, dest_portid);
                 let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {
