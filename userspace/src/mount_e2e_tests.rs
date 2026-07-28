@@ -1337,6 +1337,54 @@ fn smoke_remount_flag_update() -> TestResult {
 }
 kernel_test_in!("userspace/mount", smoke_remount_flag_update);
 
+// clone3(CLONE_INTO_CGROUP) resolves the cgroup fd's path to a cgroup-relative
+// path by stripping the ACTUAL cgroup2 mount prefix from the live mount table —
+// cgroup2 is not fixed at /sys/fs/cgroup (systemd can mount it anywhere, and a
+// chroot makes the recorded path host-view). A hardcoded "/sys/fs/cgroup" strip
+// would miss a cgroup2 mounted elsewhere, so the service would fall back to the
+// parent cgroup and PID 1 could not attribute its sd_notify(READY=1) → the unit
+// (manager_get_unit_by_pidref_cgroup) → Type=notify start timeout.
+#[cfg(feature = "cgroup")]
+fn smoke_clone_into_cgroup_rel_path_dynamic() -> TestResult {
+    set_task(0x71_40);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    // Mount cgroup2 at a NON-standard location.
+    let _ = unmount_for_test("/oddloc/cg");
+    let h = match narf_filesystem::registry().mount_arc(
+        &auth,
+        "/oddloc/cg",
+        alloc::sync::Arc::new(narf_filesystem::CgroupFs::new()),
+    ) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount cgroup2 at /oddloc/cg failed"),
+    };
+
+    // A path under the (non-standard) cgroup2 mount strips to the cgroup path.
+    let rel = crate::handlers::cgroup_rel_path("/oddloc/cg/system.slice/test.service");
+    // The mount point itself maps to the cgroup root "/".
+    let root_rel = crate::handlers::cgroup_rel_path("/oddloc/cg");
+    // A path under NO cgroup2 mount → None (clone3 then inherits the parent cg).
+    let none = crate::handlers::cgroup_rel_path("/definitely/not/a/cgroup/x");
+
+    let _ = narf_filesystem::registry().unmount(&h, "/oddloc/cg");
+
+    if rel.as_deref() == Some("/system.slice/test.service")
+        && root_rel.as_deref() == Some("/")
+        && none.is_none()
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail(
+            "cgroup_rel_path must strip the live cgroup2 mount prefix wherever it is mounted",
+        )
+    }
+}
+#[cfg(feature = "cgroup")]
+kernel_test_in!("userspace/mount", smoke_clone_into_cgroup_rel_path_dynamic);
+
 // ── Smoke 20: chroot re-roots mount targets into the jail ──────────
 // While chrooted to /cjail, mounting "/x" must register at /cjail/x in the
 // GLOBAL registry (mount targets are chroot-resolved via apply_chroot). The

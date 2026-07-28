@@ -425,6 +425,44 @@ fn smoke_cgroup_proc_pid_format() -> TestResult {
 }
 kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_proc_pid_format);
 
+// clone3(CLONE_INTO_CGROUP) attaches a child to a NESTED cgroup path (systemd
+// spawns every service into /<slice>/<unit>) via attach_by_path;
+// /proc/<pid>/cgroup then reports that exact path — which is how PID 1 matches a
+// service's sd_notify(READY=1) datagram back to its unit. A path naming a
+// non-existent cgroup must be rejected so the caller falls back to inheritance.
+fn smoke_cgroup_attach_by_path_nested_roundtrip() -> TestResult {
+    use crate::cgroupfs::{attach_by_path, proc_pid_cgroup, task_exited};
+    let root = root_dir();
+    let slice = match poll_once(root.mkdir("t_cia_slice")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir t_cia_slice failed"),
+    };
+    let _svc = match poll_once(slice.mkdir("t_cia_svc")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir t_cia_svc failed"),
+    };
+
+    let pid: u64 = 3_300_000_050;
+    let placed = attach_by_path("/t_cia_slice/t_cia_svc", pid).is_ok();
+    let line = proc_pid_cgroup(pid);
+    // A path naming a cgroup that does not exist must NOT place the pid.
+    let bogus_rejected = attach_by_path("/t_cia_slice/nope", 3_300_000_051).is_err();
+
+    task_exited(pid);
+    let _ = poll_once(slice.rmdir("t_cia_svc"));
+    let _ = poll_once(root.rmdir("t_cia_slice"));
+
+    if placed && line == b"0::/t_cia_slice/t_cia_svc\n" && bogus_rejected {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("nested attach_by_path + /proc/<pid>/cgroup roundtrip mismatch")
+    }
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_attach_by_path_nested_roundtrip
+);
+
 // ── 9. Base cpu.stat is a core file ─────────────────────────────────
 
 fn smoke_cgroup_base_cpu_stat() -> TestResult {

@@ -4485,6 +4485,68 @@ const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 #[cfg_attr(not(feature = "cgroup"), allow(dead_code))]
 const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+
+/// Place a `clone3(CLONE_INTO_CGROUP)` child in the cgroup named by the O_PATH
+/// directory fd `cgroup_fd` in `parent_task`'s fd table (systemd opens it with
+/// `open(cgroup, O_PATH|O_DIRECTORY|O_CLOEXEC)` for pidfd_spawn /
+/// POSIX_SPAWN_SETCGROUP). Resolves the fd to its recorded open path, strips the
+/// `/sys/fs/cgroup` mount prefix (present chroot-prefixed or not), and attaches
+/// `child_pid`. Returns true iff the child was placed; the caller falls back to
+/// parent-cgroup inheritance on false (the spawn itself must not fail).
+///
+/// `cgroup_of(child_pid)` — and hence `/proc/<child_pid>/cgroup` — reflects the
+/// placement, which is how PID 1 attributes a service's sd_notify(READY=1)
+/// datagram back to its unit (`manager_get_unit_by_pidref_cgroup`).
+#[cfg(feature = "cgroup")]
+fn place_clone_into_cgroup(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> bool {
+    let full = match crate::mqueue::fd_path(parent_task, cgroup_fd) {
+        Some(f) => f,
+        None => return false,
+    };
+    match cgroup_rel_path(&full) {
+        Some(rel) => narf_filesystem::cgroupfs::attach_by_path(&rel, child_pid).is_ok(),
+        None => false,
+    }
+}
+
+/// Resolve an absolute path that lands inside a mounted cgroup2/cgroupfs to its
+/// cgroup-relative path (everything below the cgroupfs mount point).
+///
+/// cgroup2 is NOT fixed at `/sys/fs/cgroup`: it can be mounted anywhere, more
+/// than once, and — under a chroot — the recorded path is host-view
+/// (`/mnt/sys/fs/cgroup/...`). So this consults the live mount table and strips
+/// the LONGEST matching `cgroup2`/`cgroupfs` mount prefix rather than assuming a
+/// literal path. Returns `None` when `abs` is not under any cgroupfs mount (the
+/// caller then falls back to parent-cgroup inheritance). The mount table is in
+/// the caller's mount namespace, which is the space the cgroup fd was opened in.
+#[cfg(feature = "cgroup")]
+pub(crate) fn cgroup_rel_path(abs: &str) -> Option<alloc::string::String> {
+    current_mount_list_with_names()
+        .into_iter()
+        .filter(|(mnt, name)| {
+            (name.as_str() == "cgroup2" || name.as_str() == "cgroupfs")
+                && (abs == mnt.as_str()
+                    || (abs.starts_with(mnt.as_str())
+                        && abs.as_bytes().get(mnt.len()) == Some(&b'/')))
+        })
+        .max_by_key(|(mnt, _)| mnt.len())
+        .map(|(mnt, _)| {
+            let rel = &abs[mnt.len()..];
+            if rel.is_empty() {
+                alloc::string::String::from("/")
+            } else {
+                alloc::string::String::from(rel)
+            }
+        })
+}
+
+/// Test seam for [`place_clone_into_cgroup`] — exercises the clone3
+/// CLONE_INTO_CGROUP placement without spawning a real user task.
+#[cfg(feature = "cgroup")]
+#[doc(hidden)]
+pub fn place_clone_into_cgroup_for_test(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> bool {
+    place_clone_into_cgroup(parent_task, cgroup_fd, child_pid)
+}
 #[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_FS: u64 = 0x0000_0200;
@@ -5042,26 +5104,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         // systemd migrates stragglers via cgroup.procs anyway.
         #[cfg(feature = "cgroup")]
         {
-            let mut placed = false;
-            if flags & CLONE_INTO_CGROUP != 0 {
-                let full = crate::mqueue::fd_path(parent_pid, ca.cgroup as u32);
-                if let Some(full) = &full {
-                    const CG_MNT: &str = "/sys/fs/cgroup";
-                    if let Some(i) = full.find(CG_MNT) {
-                        let rel = &full[i + CG_MNT.len()..];
-                        placed = narf_filesystem::cgroupfs::attach_by_path(rel, child_visible_pid)
-                            .is_ok();
-                    }
-                }
-                #[cfg(feature = "syscall-trace")]
-                if !placed {
-                    narf_console::write_str(&alloc::format!(
-                        "[CLONE3 INTO_CGROUP unresolved fd={} path={:?}]\n",
-                        ca.cgroup,
-                        full
-                    ));
-                }
-            }
+            let placed = flags & CLONE_INTO_CGROUP != 0
+                && place_clone_into_cgroup(parent_pid, ca.cgroup as u32, child_visible_pid);
             if !placed {
                 // cgroup membership is keyed by ProcessId — look the parent up
                 // by its ProcessId, not the raw TaskId (see sys_fork).
