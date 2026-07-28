@@ -311,7 +311,9 @@ fn render_ext(pid: u64, field: PidExtField) -> Vec<u8> {
             // single default hierarchy (no cgroups present).
             #[cfg(feature = "cgroup")]
             {
-                crate::cgroupfs::proc_pid_cgroup(pid)
+                // Render relative to the READER's cgroup namespace (Linux
+                // semantics), not the target's — see proc_pid_cgroup.
+                crate::cgroupfs::proc_pid_cgroup(pid, crate::procfs::current_outer_pid())
             }
             #[cfg(not(feature = "cgroup"))]
             {

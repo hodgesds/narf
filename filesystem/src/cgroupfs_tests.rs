@@ -402,7 +402,7 @@ fn smoke_cgroup_proc_pid_format() -> TestResult {
 
     // An unplaced pid is implicitly in the root cgroup: "0::/\n".
     let unplaced: u64 = 3_300_000_020;
-    if proc_pid_cgroup(unplaced) != b"0::/\n" {
+    if proc_pid_cgroup(unplaced, unplaced) != b"0::/\n" {
         return TestResult::Fail("unplaced pid not rendered as 0::/");
     }
     // A placed pid renders its absolute cgroup path after "0::".
@@ -414,7 +414,7 @@ fn smoke_cgroup_proc_pid_format() -> TestResult {
         _ => return TestResult::Fail("mkdir failed"),
     };
     let _ = attach_pid(&child, pid);
-    let line = proc_pid_cgroup(pid);
+    let line = proc_pid_cgroup(pid, pid);
     task_exited(pid);
     let _ = poll_once(root.rmdir(name));
     if line == b"0::/t_pfmt\n" {
@@ -444,7 +444,7 @@ fn smoke_cgroup_attach_by_path_nested_roundtrip() -> TestResult {
 
     let pid: u64 = 3_300_000_050;
     let placed = attach_by_path("/t_cia_slice/t_cia_svc", pid).is_ok();
-    let line = proc_pid_cgroup(pid);
+    let line = proc_pid_cgroup(pid, pid);
     // A path naming a cgroup that does not exist must NOT place the pid.
     let bogus_rejected = attach_by_path("/t_cia_slice/nope", 3_300_000_051).is_err();
 
@@ -461,6 +461,56 @@ fn smoke_cgroup_attach_by_path_nested_roundtrip() -> TestResult {
 kernel_test_in!(
     "filesystem/cgroupfs",
     smoke_cgroup_attach_by_path_nested_roundtrip
+);
+
+// /proc/<pid>/cgroup renders relative to the READER's cgroup namespace, not the
+// target's (Linux). A process in a cgroup namespace (systemd services with
+// ProtectControlGroups= unshare CLONE_NEWCGROUP) reads its OWN cgroup as "/",
+// but a reader OUTSIDE that namespace (PID 1) must see the ABSOLUTE path — that
+// is what lets PID 1 attribute a service's sd_notify(READY=1) to its unit
+// (manager_get_unit_by_pidref_cgroup reads /proc/<service>/cgroup). Keying the
+// relativization on the TARGET's namespace made a namespaced service read back
+// as 0::/ to PID 1, so every ProtectControlGroups= Type=notify service timed out.
+fn smoke_cgroup_proc_pid_relative_to_reader_ns() -> TestResult {
+    use crate::cgroupfs::{attach_by_path, proc_pid_cgroup, task_exited, unshare_cgroup_ns};
+    let root = root_dir();
+    let slice = match poll_once(root.mkdir("t_rns_slice")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir t_rns_slice failed"),
+    };
+    let _svc = match poll_once(slice.mkdir("t_rns_svc")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir t_rns_svc failed"),
+    };
+
+    let target: u64 = 3_300_000_060;
+    let reader_outside: u64 = 3_300_000_061; // in NO cgroup namespace (e.g. PID 1)
+    if attach_by_path("/t_rns_slice/t_rns_svc", target).is_err() {
+        return TestResult::Fail("attach target failed");
+    }
+    // Target enters a cgroup namespace rooted at its current cgroup.
+    unshare_cgroup_ns(target);
+
+    // A reader OUTSIDE any cgroup ns must see the ABSOLUTE path.
+    let outside = proc_pid_cgroup(target, reader_outside);
+    // The target reading its OWN cgroup sees the ns-relative root "/".
+    let selfview = proc_pid_cgroup(target, target);
+
+    task_exited(target);
+    let _ = poll_once(slice.rmdir("t_rns_svc"));
+    let _ = poll_once(root.rmdir("t_rns_slice"));
+
+    if outside == b"0::/t_rns_slice/t_rns_svc\n" && selfview == b"0::/\n" {
+        TestResult::Pass
+    } else {
+        TestResult::Fail(
+            "proc_pid_cgroup must render relative to the READER's cgroup ns (absolute for an outside reader)",
+        )
+    }
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_proc_pid_relative_to_reader_ns
 );
 
 // ── 9. Base cpu.stat is a core file ─────────────────────────────────

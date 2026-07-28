@@ -563,9 +563,21 @@ fn cgroup_path_relative(cg: &Arc<Cgroup>, nsroot: &Arc<Cgroup>) -> String {
 }
 
 /// `/proc/[pid]/cgroup` content: the v2 single-line form `0::<path>\n`.
-pub fn proc_pid_cgroup(pid: u64) -> Vec<u8> {
+/// `/proc/<pid>/cgroup` for target process `pid`, rendered relative to the
+/// cgroup namespace of the READER (`reader_pid`, an outer ProcessId) — NOT the
+/// target's. This is the Linux contract: `/proc/<pid>/cgroup` shows the path
+/// namespaced to the process that opened the file. A reader outside any cgroup
+/// namespace (e.g. PID 1) therefore sees the ABSOLUTE path even for a target
+/// that is itself in a cgroup namespace — which is exactly what lets PID 1
+/// attribute a service's `sd_notify(READY=1)` to its unit via
+/// `manager_get_unit_by_pidref_cgroup` (it reads `/proc/<service>/cgroup` and
+/// matches `/system.slice/<unit>`). Keying the relativization on the TARGET's
+/// namespace made a namespaced service (ProtectControlGroups= → CLONE_NEWCGROUP)
+/// read back as `0::/` to PID 1, so the match failed and every such
+/// `Type=notify` service timed out.
+pub fn proc_pid_cgroup(pid: u64, reader_pid: u64) -> Vec<u8> {
     let cg = cgroup_of(pid);
-    let path = match TASK_NS_ROOT.lock().get(&pid).cloned() {
+    let path = match TASK_NS_ROOT.lock().get(&reader_pid).cloned() {
         Some(nsroot) => cgroup_path_relative(&cg, &nsroot),
         None => cgroup_path(&cg),
     };
