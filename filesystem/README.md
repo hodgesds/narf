@@ -6,5 +6,7 @@ Concrete filesystems (virtiofs, ext4-ish, initramfs) plug in under
 `drivers/fs/` and are glued here.
 
 - Spec: [`specification/spec.md`](./specification/spec.md)
+- Testing requirements (conformance checklist every FS must satisfy):
+  [`specification/testing-requirements.md`](./specification/testing-requirements.md)
 - Research: [`research/README.md`](./research/README.md)
 - Stage: 3 (VFS core + in-memory FS) → 4 (virtiofs, persistent FS, caching).
