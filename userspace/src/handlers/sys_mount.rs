@@ -132,7 +132,15 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let domain = narf_lib::id::DomainId::DRIVER_0;
 
     if (flags & MS_MOVE) != 0 {
-        return match current_move_mount(&auth, source_resolved.as_str(), target.as_str()) {
+        // A relative source (systemd's switch-root fallback does
+        // `mount(".", "/", MS_MOVE)` after fchdir into the new root) resolves
+        // against the caller's cwd, not as a literal path that matches no mount.
+        let move_source = if source_resolved.starts_with('/') {
+            source_resolved.clone()
+        } else {
+            resolve_cwd_path(current_task_id(), source_resolved.as_str())
+        };
+        return match current_move_mount(&auth, move_source.as_str(), target.as_str()) {
             Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
             Err(narf_filesystem::FsError::NotFound) => ctx.set_return(enoent),
             Err(narf_filesystem::FsError::Busy) => ctx.set_return(ebusy),

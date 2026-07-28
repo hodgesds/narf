@@ -691,6 +691,42 @@ fn smoke_abi_fsx_umount2_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_neg);
 
+// systemd's switch-root does `fchdir(new_root_fd); pivot_root(".", ".");
+// umount2(".", MNT_DETACH)`. The RELATIVE "." must resolve against the cwd (the
+// new root), not be taken literally — a literal "." matched no mount, umount2
+// failed, and systemd's `mount(".", "/", MS_MOVE)` fallback then returned
+// ENOENT → 226/EXIT_NAMESPACE (udevd et al., after the domainname fix).
+fn smoke_abi_fsx_umount2_relative_dot() -> TestResult {
+    with_setup(|| {
+        crate::handlers::__test_cwd_reset();
+        let target = b"/abi-swroot\0";
+        let margs = SyscallArgs {
+            arg0: b"none\0".as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: b"tmpfs\0".as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), margs) != Some(0) {
+            return Err("setup mount failed");
+        }
+        // Change into the new mount, then umount2(".").
+        if call(Syscall::Chdir.raw(), a1(target.as_ptr() as u64, 0)) != Some(0) {
+            crate::handlers::__test_cwd_reset();
+            return Err("chdir into the new mount failed");
+        }
+        let dot = b".\0";
+        let r = call(Syscall::Umount2.raw(), a1(dot.as_ptr() as u64, 0));
+        crate::handlers::__test_cwd_reset();
+        match r {
+            Some(0) => Ok(()),
+            _ => Err("umount2(\".\") must resolve to the cwd mount and return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_relative_dot);
+
 // ── pivot_root ────────────────────────────────────────────────────────
 //
 // arg0/arg1 = new_root ptr/len, arg2/arg3 = put_old ptr/len. Both must be

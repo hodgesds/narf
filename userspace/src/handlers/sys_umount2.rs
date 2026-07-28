@@ -14,7 +14,14 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let target = apply_chroot(target_raw.as_str());
+    // Resolve against the caller's cwd (and re-root under any chroot), like
+    // sys_pivot_root / sys_mount. systemd's switch-root does
+    // `fchdir(new_root_fd); pivot_root(".", "."); umount2(".", MNT_DETACH)` —
+    // the RELATIVE "." must resolve to the cwd (the new root), not a literal
+    // "." that matches no mount. When umount2(".") failed here, systemd fell
+    // back to `mount(".", "/", MS_MOVE)`, which also mis-resolved "." and
+    // returned ENOENT → 226/EXIT_NAMESPACE (udevd et al.).
+    let target = resolve_cwd_path(current_task_id(), target_raw.as_str());
     let flags = args.arg1;
     // We accept MNT_FORCE / MNT_DETACH / MNT_EXPIRE / UMOUNT_NOFOLLOW
     // but the registry doesn't yet track in-flight refs against a

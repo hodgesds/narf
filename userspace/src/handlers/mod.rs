@@ -15975,6 +15975,8 @@ mod handler_sys_capset;
 mod handler_sys_chdir;
 #[path = "sys_chmod.rs"]
 mod handler_sys_chmod;
+#[path = "sys_chdir_for_test.rs"]
+mod handler_sys_chdir_for_test;
 #[path = "sys_chroot.rs"]
 mod handler_sys_chroot;
 #[path = "sys_chroot_for_test.rs"]
@@ -16545,6 +16547,7 @@ pub(crate) use handler_sys_arch_prctl::*;
 #[allow(unused_imports)]
 pub(crate) use handler_sys_chroot::*;
 #[allow(unused_imports)]
+pub use handler_sys_chdir_for_test::*;
 pub use handler_sys_chroot_for_test::*;
 #[allow(unused_imports)]
 pub(crate) use handler_sys_clone::*;
