@@ -24,6 +24,10 @@ ln -sf /dev/null /run/systemd/system/systemd-udev-load-credentials.service
 ln -sf /dev/null /run/systemd/system/systemd-update-utmp.service
 ln -sf /dev/null /run/systemd/system/getty@tty1.service
 
+# Force every systemd process (incl. sd-executor) to log to the console so
+# service-child failures (e.g. the mount-namespace error path in sd-executor,
+# normally emitted to /dev/kmsg) are visible on the serial capture.
+export SYSTEMD_LOG_TARGET=console
 if [ "$$" -eq 1 ]; then
   exec /usr/lib/systemd/systemd --system --log-level=info --log-target=console
 else

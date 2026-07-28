@@ -278,6 +278,34 @@ impl FileOps for DevZero {
 /// Callers wanting a stable view should fetch in a single large
 /// read; callers wanting tail-style updates can just keep reading
 /// past EOF (offset = current_len) on each iteration.
+/// Extract the human-readable message from a `/dev/kmsg` write. Linux's kmsg
+/// injection format is "<priority>,<seq>,<timestamp>,<flags>[,...];message":
+/// comma-separated numeric metadata, a ';', then the message. Strip the
+/// metadata prefix (only when it is exactly that shape) and the trailing
+/// newline; anything else is passed through verbatim so a bare
+/// `echo foo > /dev/kmsg` still shows "foo".
+fn kmsg_visible_message(buf: &[u8]) -> &str {
+    let text = core::str::from_utf8(buf).unwrap_or("");
+    // The record header is "<priority>,<seq>,<timestamp>,<flags>;" — the flags
+    // field can be non-numeric (e.g. "-" or "c"), so only require the FIRST
+    // comma-separated field (priority) to be all digits and the header to be
+    // comma-separated. That distinguishes a real record from a bare
+    // `echo foo;bar > /dev/kmsg`, which is passed through untouched.
+    let msg = match text.split_once(';') {
+        Some((meta, rest))
+            if meta.contains(',')
+                && meta
+                    .split(',')
+                    .next()
+                    .is_some_and(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            rest
+        }
+        _ => text,
+    };
+    msg.trim_end_matches('\n')
+}
+
 struct DevKmsg;
 
 impl FileOps for DevKmsg {
@@ -305,8 +333,19 @@ impl FileOps for DevKmsg {
     }
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        // Accept-and-discard so `echo foo > /dev/kmsg` doesn't error.
+        // Forward the message to the console (which also records into klog, so
+        // a later /dev/kmsg read reflects it). systemd's kmsg log target — used
+        // by PID 1 and, crucially, by sd-executor for pre-exec failures like the
+        // mount-namespace error path — writes here; echoing surfaces those on
+        // the serial capture. The Linux kmsg record format is
+        // "<priority>,<seq>,<ts>,<flags>;message"; strip the leading metadata up
+        // to the first ';' so the human-readable message is what's shown.
         let len = buf.len();
+        let msg = kmsg_visible_message(buf);
+        if !msg.is_empty() {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "kmsg: {msg}");
+        }
         Box::pin(async move { Ok(len) })
     }
 
@@ -1551,6 +1590,33 @@ fn smoke_dev_fd_is_symlink() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_fd_is_symlink);
+
+/// `/dev/kmsg` writes strip the Linux "<pri>,<seq>,<ts>,<flags>;" metadata
+/// prefix so the human-readable message is what gets echoed, while non-record
+/// text (a bare `echo`) and malformed prefixes pass through unchanged.
+fn smoke_dev_kmsg_visible_message_strips_meta() -> TestResult {
+    // Canonical systemd record: metadata, ';', message, trailing newline.
+    if kmsg_visible_message(b"6,42,12345,-;hello udev\n") != "hello udev" {
+        return TestResult::Fail("kmsg metadata prefix not stripped");
+    }
+    // Bare echo (no ';'): passed through verbatim (minus trailing newline).
+    if kmsg_visible_message(b"just a line\n") != "just a line" {
+        return TestResult::Fail("bare kmsg line not preserved");
+    }
+    // A ';' whose left side isn't pure numeric metadata must NOT be stripped.
+    if kmsg_visible_message(b"key=val;more") != "key=val;more" {
+        return TestResult::Fail("non-metadata prefix wrongly stripped");
+    }
+    // Empty write yields an empty message (nothing echoed).
+    if !kmsg_visible_message(b"").is_empty() {
+        return TestResult::Fail("empty kmsg write not empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs",
+    smoke_dev_kmsg_visible_message_strips_meta
+);
 
 /// devtmpfs is writable for runtime aliases such as journald's `/dev/log`.
 fn smoke_dev_runtime_symlink_create_lookup_unlink() -> TestResult {
