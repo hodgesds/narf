@@ -81,6 +81,23 @@ impl PageTableEntry {
     pub const fn addr(self) -> PhysAddr {
         PhysAddr::new(self.0 & 0x0000_FFFF_FFFF_F000)
     }
+
+    /// Raw 64-bit descriptor.
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Rebuild a descriptor from a raw 64-bit value.
+    ///
+    /// The counterpart of [`PageTableEntry::raw`], for callers that
+    /// read-modify-write a live leaf in place — permission flips (`bpf_text`'s
+    /// RW→RX seal clears `PXN` and rewrites `AP`) rather than fresh mappings,
+    /// where the address bits and descriptor type must survive untouched.
+    #[inline]
+    pub const fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
 }
 
 /// 4 KiB / 512 entries.

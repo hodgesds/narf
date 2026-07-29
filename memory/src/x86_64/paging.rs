@@ -116,6 +116,17 @@ impl PageTableEntry {
     pub const fn raw(self) -> u64 {
         self.0
     }
+
+    /// Rebuild an entry from a raw 64-bit value.
+    ///
+    /// The counterpart of [`PageTableEntry::raw`], for callers that
+    /// read-modify-write a live leaf in place — permission flips (`bpf_text`'s
+    /// RW→RX seal) rather than fresh mappings, where the address bits and the
+    /// PS bit must be preserved exactly as the hardware left them.
+    #[inline]
+    pub const fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
 }
 
 impl fmt::Debug for PageTableEntry {

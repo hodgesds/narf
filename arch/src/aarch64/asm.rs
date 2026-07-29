@@ -184,24 +184,114 @@ pub unsafe fn patch_word(addr: *mut u32, new: u32) {
     unsafe {
         core::ptr::write_volatile(addr, new);
     }
-    // Self-modifying-code flush per ARMv8 B2.3:
-    //   DSB ISH        — drain the pending data write to the PoU
-    //   IC IVAU, <addr> — invalidate the I-cache line holding the patch
-    //   DSB ISH        — ensure the invalidate completes before ISB
-    //   ISB            — flush the pipeline so the next fetch sees the
-    //                     new word
-    // SAFETY: DSB/IC IVAU/ISB are the cache-maintenance ops for SMC at
-    // EL1; `addr` is the just-written word.
-    // SAFETY: Valid memory or trusted environment
+    // SAFETY: `addr` names 4 bytes we just wrote and which are mapped for
+    // the duration; the helper only issues cache maintenance by VA.
     unsafe {
-        asm!(
-            "dsb ish",
-            "ic ivau, {a}",
-            "dsb ish",
-            "isb",
-            a = in(reg) addr,
-            options(nostack, preserves_flags),
-        );
+        flush_icache_range(addr as u64, 4);
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Cache-line size (bytes) for `DC CVAU` / `IC IVAU`, read from `CTR_EL0`.
+///
+/// `CTR_EL0.DminLine` (bits 19:16) and `IminLine` (bits 3:0) are
+/// log2(words), i.e. the line size is `4 << field`. We take the smaller of
+/// the two so a single stride is safe for both maintenance ops.
+#[inline]
+fn cache_line_bytes() -> u64 {
+    let ctr: u64;
+    // SAFETY: `MRS .., CTR_EL0` is readable at EL1 (and at EL0 when
+    // SCTLR_EL1.UCT permits); it has no side effects.
+    unsafe {
+        asm!("mrs {c}, ctr_el0", c = out(reg) ctr, options(nomem, nostack, preserves_flags));
+    }
+    let dmin = 4u64 << ((ctr >> 16) & 0xF);
+    let imin = 4u64 << (ctr & 0xF);
+    dmin.min(imin).max(4)
+}
+
+/// `CTR_EL0.IDC` (bit 28): instruction cache is coherent with the data
+/// cache, so `DC CVAU` is not required before `IC IVAU`.
+const CTR_IDC: u64 = 1 << 28;
+/// `CTR_EL0.DIC` (bit 29): instruction cache invalidation is not required
+/// for instruction-to-data coherence, so `IC IVAU` may be skipped.
+const CTR_DIC: u64 = 1 << 29;
+
+/// Make newly written bytes in `[base, base + len)` visible to instruction
+/// fetch on this PE.
+///
+/// The architecturally required sequence for self-modifying code
+/// (Arm ARM DDI0487, B2.4.4 "Concurrent modification and execution") is
+/// **`DC CVAU` per line → `DSB ISH` → `IC IVAU` per line → `DSB ISH` →
+/// `ISB`**. NARF's `patch_word` previously skipped the `DC CVAU` step
+/// entirely, which is only legal when `CTR_EL0.IDC == 1`. It happened to
+/// work on QEMU (`-cpu max` reports IDC) and on cores whose caches are
+/// PoU-coherent, and would have failed on a core that is not — silently,
+/// by executing stale bytes. A bulk JIT publish writes megabytes rather
+/// than a single word, so it hits that far harder than a probe patch does;
+/// hence the fix lands here rather than being deferred.
+///
+/// `DC CVAU` is elided when `CTR_EL0.IDC` is set, and `IC IVAU` when
+/// `CTR_EL0.DIC` is set, exactly as Linux's `__flush_cache_user_range`
+/// does (`arch/arm64/mm/cache.S`).
+///
+/// `IC IVAU` is broadcast to the inner-shareable domain by the hardware, so
+/// no IPI plumbing is needed — an asymmetry with x86_64 worth remembering.
+///
+/// # Safety
+/// `[base, base + len)` must be mapped and readable for the duration.
+/// Cache maintenance by VA on an unmapped address takes a translation
+/// fault.
+pub unsafe fn flush_icache_range(base: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    compiler_fence(Ordering::SeqCst);
+
+    let ctr: u64;
+    // SAFETY: see `cache_line_bytes`.
+    unsafe {
+        asm!("mrs {c}, ctr_el0", c = out(reg) ctr, options(nomem, nostack, preserves_flags));
+    }
+    let line = cache_line_bytes();
+    let start = base & !(line - 1);
+    let end = base + len;
+
+    if ctr & CTR_IDC == 0 {
+        let mut p = start;
+        while p < end {
+            // SAFETY: cache maintenance by VA over a mapped range.
+            unsafe {
+                asm!("dc cvau, {a}", a = in(reg) p, options(nostack, preserves_flags));
+            }
+            p += line;
+        }
+    }
+    // The `DSB` is required even when `DC CVAU` was elided: it orders the
+    // *stores* that produced the new instructions ahead of the invalidate.
+    // SAFETY: `DSB` is always legal at EL1.
+    unsafe {
+        asm!("dsb ish", options(nostack, preserves_flags));
+    }
+
+    if ctr & CTR_DIC == 0 {
+        let mut p = start;
+        while p < end {
+            // SAFETY: cache maintenance by VA over a mapped range.
+            unsafe {
+                asm!("ic ivau, {a}", a = in(reg) p, options(nostack, preserves_flags));
+            }
+            p += line;
+        }
+        // SAFETY: `DSB` is always legal at EL1.
+        unsafe {
+            asm!("dsb ish", options(nostack, preserves_flags));
+        }
+    }
+
+    // SAFETY: `ISB` is always legal at EL1.
+    unsafe {
+        asm!("isb", options(nostack, preserves_flags));
     }
     compiler_fence(Ordering::SeqCst);
 }

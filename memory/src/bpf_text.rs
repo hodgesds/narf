@@ -1,0 +1,1184 @@
+//! `bpf_text` — the executable-text allocator for JIT-compiled BPF programs.
+//!
+//! Spec: `bpf/specification/spec.md` §3.3, §4.1–§4.3, §5.
+//!
+//! Three things live here, in decreasing order of how badly they can hurt:
+//!
+//! 1. [`reserve_kernel_slots`] — allocates the *top-level* page tables for the
+//!    two BPF kernel-VA windows at boot, before the first user address space
+//!    exists. Invariant §4.1. See the long comment on that function.
+//! 2. The **prog pack**: one 2 MiB hugepage per pack, chunked at 64-byte
+//!    granularity and bitmap-allocated, so hundreds of small programs share a
+//!    single iTLB entry instead of burning one each. Linux states the rationale
+//!    verbatim at `kernel/bpf/core.c:863`.
+//! 3. The RW→RX **publish** ([`seal`]).
+//!
+//! ## Why there is no temporary-alias mechanism here
+//!
+//! Linux's prog pack keeps its text RO+X from creation and publishes through
+//! `text_poke_copy`, because Linux's direct map is NX and there is therefore no
+//! writable alias of the pack's frames. NARF's low identity map is
+//! `PRESENT | WRITABLE | HUGE_PAGE` with **no** `NO_EXEC`
+//! (`memory/src/x86_64/mmu.rs`), so every frame is already aliased RWX. We
+//! write through that alias ([`write`]) and skip the whole mechanism.
+//!
+//! The honest consequence, recorded rather than papered over (spec §4.2): the
+//! RX mapping at the BPF text VA is **not a W^X boundary today**. It is the
+//! correct end state, and it makes the JIT's own view of its output
+//! non-writable, but an attacker with an arbitrary kernel write already has a
+//! writable alias of these bytes through the identity map. Kernel-text W^X
+//! becomes real only when the identity map is demoted to NX
+//! (`bpf/specification/spec.md` §8.6), which needs a huge-page demote helper
+//! that does not exist yet.
+//!
+//! ## Reclamation
+//!
+//! [`free`] does **not** immediately hand chunks back: a CPU may be executing
+//! the program right now. Freed allocations go to a quarantine list and are
+//! released by [`reclaim`], which the owning subsystem calls after an RCU grace
+//! period. `narf-memory` cannot depend on `narf-rcu` (the dep graph runs
+//! `rcu → time → console → memory`, so that would be a cycle), so the grace
+//! period arrives through the [`install_reclaim_hook`] seam — the same shape as
+//! `install_pager` / `install_frame_alloc` elsewhere in this crate.
+
+extern crate alloc as alloc_crate;
+
+use alloc_crate::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use narf_capabilities::{CapKind, CapType, Grant};
+use narf_lib::sync::IrqSafeSpinLock;
+
+use crate::{PhysAddr, VirtAddr};
+
+// ── VA layout ──────────────────────────────────────────────────────────
+//
+// Both windows are picked by arithmetic, not by reading comments. A PML4 /
+// L0 slot `n` spans `n << 39` bytes, so slot `n`'s canonical base is
+// `0xFFFF_0000_0000_0000 | (n << 39)` for `n >= 256`, and
+// `(base >> 39) & 0x1FF` recovers `n`. The `debug_assert`s in
+// `reserve_kernel_slots` do exactly that check at boot.
+//
+// Occupied slots on x86_64 (verified against the tree, not assumed):
+//   0          low identity map, 0..512 GiB       (`mmu.rs` `init_mmu`)
+//   1          high MMIO 512 GiB..1 TiB + the user binary PDPT[0]
+//   2..=255    user address space
+//   256..=271  per-domain private PCID slots      (`x86_64/domain.rs`)
+//   272        vmalloc, 0xFFFF_8800_0000_0000     (`vmalloc.rs` — note that
+//              file's "273" comment is wrong; 0xFFFF_8800_0000_0000 >> 39
+//              is 0x110 = 272)
+//   384..=510  kernel direct map                  (`addr.rs`)
+//   511        kernel image (-2 GiB)              (`mmu.rs`)
+//
+// So 273..=383 is free. We take four consecutive slots:
+//
+//   273  BPF text        0xFFFF_8880_0000_0000    (0x111 << 39)
+//   274  guard, never mapped
+//   275  BPF arena       0xFFFF_8980_0000_0000    (0x113 << 39)
+//   276  guard, never mapped
+//
+// The guards are the ISA-derived bound from `kernel/bpf/arena.c:45`, taken to
+// its structural conclusion: Linux sizes its guard at
+// `round_up(1 << 16, PAGE_SIZE << 1)` = 64 KiB, because the largest
+// displacement an instruction can name is the signed 16-bit `off` field. A
+// whole unmapped 512 GiB slot on each side is 8388608× that, so an escape by
+// immediate displacement from anywhere inside the arena window cannot reach a
+// mapped page — it is impossible by construction rather than by arithmetic.
+//
+// On aarch64 the same numbers work unchanged: TTBR1 is configured with
+// `T1SZ = 16` (`frame/src/aarch64/boot.S:150`), i.e. a 48-bit high half whose
+// L0 index is also VA[47:39], and 0xFFFF_8880_0000_0000 is inside it. aarch64
+// does not have the §4.1 propagation hazard at all (user space lives in TTBR0,
+// the kernel in TTBR1, separate roots), but keeping one set of constants
+// avoids a second mental model.
+
+/// PML4 (x86_64) / L0 (aarch64) slot holding the BPF text window.
+pub const BPF_TEXT_PML4_SLOT: usize = 273;
+/// Base kernel VA of the BPF text window.
+pub const BPF_TEXT_BASE: u64 = 0xFFFF_8880_0000_0000;
+
+/// PML4 / L0 slot holding the BPF arena window. See `bpf_arena.rs`.
+pub const BPF_ARENA_PML4_SLOT: usize = 275;
+/// Base kernel VA of the BPF arena window.
+pub const BPF_ARENA_BASE: u64 = 0xFFFF_8980_0000_0000;
+
+/// Bytes covered by one PML4 / L0 slot.
+pub const SLOT_SPAN: u64 = 1u64 << 39;
+
+/// Usable prefix of the text window. A slot is 512 GiB; we only ever hand out
+/// the low 1 GiB of it, which is 512 hugepage packs — far more JIT text than
+/// any plausible workload, and it keeps the pack index arithmetic in a `u32`.
+pub const BPF_TEXT_USABLE: u64 = 1u64 << 30;
+
+/// Hugepage-backed pack size. One 2 MiB page ⇒ one PMD entry ⇒ **one** iTLB
+/// entry for every program in the pack. That is the entire point of the pack
+/// allocator (`kernel/bpf/core.c:863`).
+pub const PACK_HUGE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Fallback pack size when the hugepage pool is empty. `hugepage.rs` documents
+/// that 2 MiB allocations do **not** fall back to the buddy — if the boot
+/// reservation didn't capture enough contiguous memory, `alloc_hugepage_2m`
+/// returns `Err(Empty)` by design. Failing a program load on that would be
+/// wrong, so we build a smaller pack out of ordinary 4 KiB frames and accept
+/// the iTLB cost. Real on the bring-up laptops, where boot-time fragmentation
+/// is not hypothetical.
+pub const PACK_SMALL_BYTES: u64 = 64 * 1024;
+
+/// Allocation granularity inside a pack. Matches Linux's
+/// `BPF_PROG_CHUNK_SIZE` — small enough that a 40-byte program doesn't waste a
+/// page, large enough that the bitmap stays tiny.
+pub const CHUNK_BYTES: usize = 64;
+
+/// Byte that fills every unallocated chunk, so a stray jump into dead pack
+/// space traps instead of executing whatever was there before.
+#[cfg(target_arch = "x86_64")]
+const TRAP_FILL: [u8; 4] = [0xCC, 0xCC, 0xCC, 0xCC]; // int3
+#[cfg(target_arch = "aarch64")]
+const TRAP_FILL: [u8; 4] = [0x00, 0x00, 0x20, 0xD4]; // brk #0, little-endian
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const TRAP_FILL: [u8; 4] = [0, 0, 0, 0];
+
+// ── Capability ─────────────────────────────────────────────────────────
+
+/// Authority to create executable kernel text.
+///
+/// `memory/src/wx.rs` has described this capability since it was written —
+/// *"expressed as a capability not a per-process bit, so the privilege is
+/// named and revocable"* — but until now no `CapKind` backed it and nothing
+/// checked it. `CapKind::Jit` (0x0053) closes that.
+#[derive(Copy, Clone, Debug)]
+pub struct Jit;
+
+impl CapType for Jit {
+    const KIND: CapKind = CapKind::Jit;
+}
+
+/// Convenience alias for the granting form of the JIT capability.
+pub type JitCap = narf_capabilities::Cap<Jit, Grant>;
+
+// ── Errors ─────────────────────────────────────────────────────────────
+
+/// Failure modes of the text allocator.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TextError {
+    /// [`reserve_kernel_slots`] has not run (or failed). Every other entry
+    /// point refuses rather than populating a slot the live user address
+    /// spaces do not have — see §4.1.
+    SlotsUnreserved,
+    /// Zero-length, or larger than a single pack can hold.
+    BadLen,
+    /// No pack has a free run of the requested size and no new pack could be
+    /// created (neither hugepage pool nor buddy had memory).
+    Exhausted,
+    /// Frame allocator failed while building a pack or a page table.
+    NoFrame,
+    /// A page-table walk failed. Carries nothing — the underlying `MapError`
+    /// is arch-specific and this crate's callers cannot act on it.
+    MapFailed,
+    /// The capability was revoked between grant and use (invariant #5:
+    /// holding a `Cap` proves prior grant, only a live check proves current
+    /// validity).
+    CapRevoked,
+    /// The allocation does not belong to any live pack — a double free, or a
+    /// handle that outlived [`reclaim`].
+    Stale,
+    /// Write past the end of the allocation.
+    OutOfBounds,
+}
+
+// ── Boot reservation ───────────────────────────────────────────────────
+
+/// Set once [`reserve_kernel_slots`] has installed both top-level tables.
+static SLOTS_RESERVED: AtomicBool = AtomicBool::new(false);
+
+/// The page-table root the BPF windows were installed into: the kernel PML4 on
+/// x86_64, the TTBR1 L0 on aarch64. Recorded at reservation time so every
+/// later map walks a deterministic root instead of whatever CR3 happens to
+/// hold. Both windows live at PML4[256..511], which `new_user_pml4_on`
+/// snapshot-copies into every address space, so populating the *shared*
+/// sub-tables through this root is visible everywhere.
+static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+/// `true` once the BPF top-level tables exist in the kernel root.
+///
+/// `new_user_pml4_on` `debug_assert`s on this: see §4.1.
+#[inline]
+pub fn slots_reserved() -> bool {
+    SLOTS_RESERVED.load(Ordering::Acquire)
+}
+
+/// The page-table root the BPF windows were installed into, for other
+/// modules that map inside the same reserved slot (`bpf_stack`, `bpf_arena`).
+///
+/// Returns `None` before [`reserve_kernel_slots`] — mapping into an
+/// unreserved slot would create a top-level entry that live address spaces
+/// have already snapshot-copied *without*, which is precisely the §4.1
+/// triple-fault.
+#[inline]
+pub fn kernel_root_for_mapping() -> Option<PhysAddr> {
+    kernel_root().ok()
+}
+
+#[inline]
+fn kernel_root() -> Result<PhysAddr, TextError> {
+    if !slots_reserved() {
+        return Err(TextError::SlotsUnreserved);
+    }
+    Ok(PhysAddr::new(KERNEL_ROOT.load(Ordering::Acquire) as u64))
+}
+
+/// Allocate the top-level page tables for both BPF kernel-VA windows.
+///
+/// **This is the highest-risk function in the BPF memory path, and it must run
+/// as a direct call from `frame/src/bare_main.rs` — right after the MMU
+/// handoff and before the first `new_user_pml4` — not as a staged initcall.**
+///
+/// The reason is `new_user_pml4_on` (`memory/src/x86_64/paging.rs`):
+///
+/// ```text
+/// for i in 256u64..512 {
+///     ptr::write_volatile(dst, ptr::read_volatile(src));   // by value, once
+/// }
+/// ```
+///
+/// PML4[256..511] is snapshot-copied **by value** at address-space creation and
+/// nothing propagates later changes. If a BPF slot is first populated after a
+/// user address space exists, that address space's CR3 holds a zero entry for
+/// it, and the first BPF text fetch or arena access taken while that task is
+/// current is a page fault on a not-present PML4 entry inside the fault
+/// handler's own working set — i.e. a triple fault, on a machine with no
+/// diagnostic left to print.
+///
+/// Populating the slots *before* the first snapshot makes every later address
+/// space inherit the same PDPT frame by pointer, so all sub-PML4 population
+/// (PDPT/PD/PT entries installed by `alloc`, `seal`, arena `populate`) is
+/// automatically shared. Only the PML4 level is copied by value; everything
+/// below it is shared structure.
+///
+/// Idempotent — a second call is a no-op.
+pub fn reserve_kernel_slots() -> Result<(), TextError> {
+    // Arithmetic self-check on the two window bases. If someone edits a
+    // constant, this fires at boot instead of silently colliding with vmalloc
+    // (272) or the direct map (384).
+    debug_assert_eq!(
+        ((BPF_TEXT_BASE >> 39) & 0x1FF) as usize,
+        BPF_TEXT_PML4_SLOT,
+        "BPF_TEXT_BASE does not decode to BPF_TEXT_PML4_SLOT"
+    );
+    debug_assert_eq!(
+        ((BPF_ARENA_BASE >> 39) & 0x1FF) as usize,
+        BPF_ARENA_PML4_SLOT,
+        "BPF_ARENA_BASE does not decode to BPF_ARENA_PML4_SLOT"
+    );
+    debug_assert!(
+        BPF_ARENA_PML4_SLOT >= BPF_TEXT_PML4_SLOT + 2,
+        "BPF text and arena windows must not be adjacent — slot 274 is a guard"
+    );
+
+    if slots_reserved() {
+        return Ok(());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: CR3 is readable at CPL=0 and, at the call site (immediately
+        // after `init_mmu`'s CR3 swap, on the BSP, with interrupts masked),
+        // names the final kernel PML4.
+        let root = unsafe { crate::x86_64::paging::read_cr3() };
+        if root.raw() == 0 {
+            return Err(TextError::NoFrame);
+        }
+        for slot in [BPF_TEXT_PML4_SLOT, BPF_ARENA_PML4_SLOT] {
+            // SAFETY: `root` is the live kernel PML4, identity-reachable
+            // (page tables live in low RAM), and we are single-threaded on the
+            // BSP with interrupts masked, so the read-modify-write of one
+            // entry cannot race.
+            unsafe { reserve_slot_x86(root, slot)? };
+        }
+        KERNEL_ROOT.store(root.raw() as usize, Ordering::Release);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: `MRS .., TTBR1_EL1` is defined at EL1 with no precondition.
+        let root = unsafe { crate::aarch64::paging::read_ttbr1_el1() };
+        if root.raw() == 0 {
+            return Err(TextError::NoFrame);
+        }
+        for slot in [BPF_TEXT_PML4_SLOT, BPF_ARENA_PML4_SLOT] {
+            // SAFETY: same as x86_64 — live kernel root, single-threaded BSP.
+            unsafe { reserve_slot_aarch64(root, slot)? };
+        }
+        KERNEL_ROOT.store(root.raw() as usize, Ordering::Release);
+    }
+
+    SLOTS_RESERVED.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Install a present, kernel-only, writable next-level table at `root[slot]`
+/// if one is not already there.
+///
+/// # Safety
+/// `root` must be a live, identity-reachable PML4 and the caller must have
+/// exclusive access to it (boot BSP, interrupts masked).
+#[cfg(target_arch = "x86_64")]
+unsafe fn reserve_slot_x86(root: PhysAddr, slot: usize) -> Result<(), TextError> {
+    use crate::x86_64::paging::{PageTable, PageTableEntry, PtFlags};
+
+    // SAFETY: caller guarantees `root` is a live, identity-reachable PML4.
+    let pml4 = unsafe { &mut *root.as_mut_ptr::<PageTable>() };
+    if pml4.entries[slot].is_present() {
+        return Ok(());
+    }
+    let frame = crate::frame::alloc_frame().map_err(|_| TextError::NoFrame)?;
+    let phys = frame.start_address();
+    crate::frame::__pagetable_register(phys.raw());
+    // SAFETY: a freshly-allocated frame; reachable through the kernel RAM
+    // accessor and exclusively ours until we publish the entry below.
+    unsafe {
+        core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
+    }
+    // No `USER`: both windows are kernel-only. No `NO_EXEC` either — the text
+    // window has to be executable, and the CPU OR's NX down the walk, so an NX
+    // PML4 entry would make the whole subtree non-executable.
+    pml4.entries[slot] = PageTableEntry::new(phys, PtFlags::PRESENT | PtFlags::WRITABLE);
+    Ok(())
+}
+
+/// aarch64 equivalent of [`reserve_slot_x86`]: install an L1 table descriptor
+/// under the TTBR1 L0.
+///
+/// # Safety
+/// Same contract as [`reserve_slot_x86`].
+#[cfg(target_arch = "aarch64")]
+unsafe fn reserve_slot_aarch64(root: PhysAddr, slot: usize) -> Result<(), TextError> {
+    use crate::aarch64::paging::PageTable;
+
+    // SAFETY: caller guarantees `root` is the live TTBR1 L0 table.
+    let l0 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
+    if l0.entries[slot].is_valid() {
+        return Ok(());
+    }
+    let frame = crate::frame::alloc_frame().map_err(|_| TextError::NoFrame)?;
+    let phys = frame.start_address();
+    // SAFETY: freshly-allocated frame, exclusively ours until published.
+    unsafe {
+        core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
+    }
+    // Table descriptor: bits[1:0] = 0b11 (valid + table). Attributes on a
+    // table descriptor are permission *restrictions*; leaving them clear means
+    // "no restriction", which is what we want — the leaf entries carry the
+    // real permissions.
+    l0.entries[slot] = crate::aarch64::paging::PageTableEntry::from_raw(phys.raw() | 0b11);
+    Ok(())
+}
+
+// ── Packs ──────────────────────────────────────────────────────────────
+
+/// How a pack's memory was obtained.
+#[derive(Debug)]
+enum Backing {
+    /// One 2 MiB hugepage, mapped by a single PMD entry.
+    Huge(crate::hugepage::HugeFrame),
+    /// `PACK_SMALL_BYTES / 4096` ordinary frames, mapped by individual PTEs.
+    /// The fallback path; see [`PACK_SMALL_BYTES`].
+    Small(Vec<crate::frame::PhysFrame>),
+}
+
+#[derive(Debug)]
+struct Pack {
+    /// Kernel VA base of the pack. Always `PACK_HUGE_BYTES`-aligned so a
+    /// hugepage-backed pack can use a PMD leaf.
+    base: u64,
+    /// Bytes covered.
+    len: u64,
+    backing: Backing,
+    /// One bit per [`CHUNK_BYTES`] chunk; set = allocated.
+    bitmap: Vec<u64>,
+    /// Chunks currently allocated (including quarantined ones).
+    used: usize,
+    /// `true` once the leaf mapping has been flipped to RX by [`seal`].
+    sealed: bool,
+}
+
+impl Pack {
+    #[inline]
+    fn chunks(&self) -> usize {
+        (self.len as usize) / CHUNK_BYTES
+    }
+
+    #[inline]
+    fn bit(&self, i: usize) -> bool {
+        (self.bitmap[i / 64] >> (i % 64)) & 1 == 1
+    }
+
+    #[inline]
+    fn set_range(&mut self, start: usize, n: usize, on: bool) {
+        for i in start..start + n {
+            if on {
+                self.bitmap[i / 64] |= 1u64 << (i % 64);
+            } else {
+                self.bitmap[i / 64] &= !(1u64 << (i % 64));
+            }
+        }
+    }
+
+    /// First-fit run of `n` free chunks.
+    fn find_run(&self, n: usize) -> Option<usize> {
+        let total = self.chunks();
+        let mut i = 0;
+        while i + n <= total {
+            let mut j = 0;
+            while j < n && !self.bit(i + j) {
+                j += 1;
+            }
+            if j == n {
+                return Some(i);
+            }
+            // `i + j` is allocated (or we ran off the run); resume past it.
+            i += j + 1;
+        }
+        None
+    }
+
+    /// Kernel-writable alias of the byte at pack offset `off`.
+    ///
+    /// This is the identity (or direct-map) alias of the underlying physical
+    /// frame — deliberately *not* the pack's own VA, which is NX-then-RX. See
+    /// the module docs on why that is legitimate here and why it is not yet a
+    /// W^X boundary.
+    fn alias_at(&self, off: u64) -> *mut u8 {
+        match &self.backing {
+            Backing::Huge(h) => PhysAddr::new(h.phys() + off).kernel_mut_ptr::<u8>(),
+            Backing::Small(frames) => {
+                let idx = (off / 4096) as usize;
+                let within = off % 4096;
+                PhysAddr::new(frames[idx].start_address().raw() + within).kernel_mut_ptr::<u8>()
+            }
+        }
+    }
+
+    /// Bytes from `off` to the end of the physically-contiguous run containing
+    /// it. 2 MiB for a hugepage pack; whatever remains of the 4 KiB page for a
+    /// small pack.
+    fn contig_from(&self, off: u64) -> u64 {
+        match &self.backing {
+            Backing::Huge(_) => self.len - off,
+            Backing::Small(_) => 4096 - (off % 4096),
+        }
+    }
+}
+
+/// Registry of live packs. Not a hot path — every entry point here runs at
+/// program load, attach, or teardown, never inside a running program.
+static PACKS: IrqSafeSpinLock<Vec<Pack>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Next pack VA to hand out. Bump-only; a pack's VA is never recycled, which
+/// costs nothing (the window is 512 GiB) and removes a whole class of
+/// stale-TLB bug.
+static NEXT_PACK_VA: AtomicUsize = AtomicUsize::new(BPF_TEXT_BASE as usize);
+
+// ── Allocation handle ──────────────────────────────────────────────────
+
+/// A run of chunks inside one pack.
+///
+/// `Copy` on purpose: [`free`] hands this across an RCU grace period, and
+/// nothing in the reclaim path may allocate.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TextAlloc {
+    /// Kernel VA of the first byte. This is the address the JIT computes
+    /// displacements against and the address the program is entered at.
+    pub va: u64,
+    /// Bytes requested by the caller (not the rounded-up chunk span).
+    pub len: usize,
+    /// Pack base VA — the key [`free`] / [`seal`] use to find the pack again.
+    pack_base: u64,
+    /// First chunk index within the pack.
+    chunk: usize,
+    /// Chunk count.
+    chunks: usize,
+}
+
+impl TextAlloc {
+    /// Entry pointer for the compiled program.
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.va as *const u8
+    }
+}
+
+// ── Public API ─────────────────────────────────────────────────────────
+
+/// Reserve `len` bytes of kernel text.
+///
+/// The bytes come back **writable through the identity alias and not yet
+/// executable at `va`** — write with [`write`], register every faulting
+/// instruction's extable entry (invariant §4.3), then [`seal`].
+///
+/// `node` steers the hugepage allocation; pass the NUMA node the program will
+/// mostly run on.
+pub fn alloc(cap: &JitCap, len: usize, node: usize) -> Result<TextAlloc, TextError> {
+    cap.check_live().map_err(|_| TextError::CapRevoked)?;
+    let root = kernel_root()?;
+    if len == 0 || len as u64 > PACK_HUGE_BYTES {
+        return Err(TextError::BadLen);
+    }
+    let want = len.div_ceil(CHUNK_BYTES);
+
+    let mut packs = PACKS.lock();
+
+    // First fit across existing packs.
+    for p in packs.iter_mut() {
+        if let Some(start) = p.find_run(want) {
+            p.set_range(start, want, true);
+            p.used += want;
+            return Ok(TextAlloc {
+                va: p.base + (start * CHUNK_BYTES) as u64,
+                len,
+                pack_base: p.base,
+                chunk: start,
+                chunks: want,
+            });
+        }
+    }
+
+    // No room — build a new pack. Try a hugepage first; fall back to 4 KiB
+    // frames rather than failing the load (`hugepage.rs`: 2 MiB allocations
+    // never spill to the buddy).
+    // SAFETY: `root` is the recorded kernel root and both windows' top-level
+    // entries were installed by `reserve_kernel_slots`, so the walk cannot
+    // create a PML4 entry that a live address space is missing.
+    let mut pack = unsafe { new_pack(root, node, len as u64)? };
+    if pack.find_run(want).is_none() {
+        // The fallback pack is smaller than a hugepage pack; a program larger
+        // than it and larger than the hugepage pool can supply has nowhere to
+        // go.
+        release_pack_backing(&mut pack);
+        return Err(TextError::Exhausted);
+    }
+    let start = pack.find_run(want).expect("checked above");
+    pack.set_range(start, want, true);
+    pack.used += want;
+    let out = TextAlloc {
+        va: pack.base + (start * CHUNK_BYTES) as u64,
+        len,
+        pack_base: pack.base,
+        chunk: start,
+        chunks: want,
+    };
+    packs.push(pack);
+    Ok(out)
+}
+
+/// Copy `bytes` into the allocation at `off`, through the identity alias.
+///
+/// Legal both before and after [`seal`] — see the module docs. After a seal
+/// the caller is responsible for a fresh `seal` (or an arch icache flush) if
+/// the bytes may already have been fetched.
+pub fn write(a: &TextAlloc, off: usize, bytes: &[u8]) -> Result<(), TextError> {
+    if off.saturating_add(bytes.len()) > a.len {
+        return Err(TextError::OutOfBounds);
+    }
+    let packs = PACKS.lock();
+    let p = packs
+        .iter()
+        .find(|p| p.base == a.pack_base)
+        .ok_or(TextError::Stale)?;
+
+    let mut pack_off = (a.chunk * CHUNK_BYTES) as u64 + off as u64;
+    let mut done = 0usize;
+    while done < bytes.len() {
+        let run = p.contig_from(pack_off).min((bytes.len() - done) as u64) as usize;
+        let dst = p.alias_at(pack_off);
+        // SAFETY: `pack_off + run` stays inside the pack (bounds-checked
+        // against `a.len` above, and the allocation lies inside the pack), and
+        // `alias_at` returns the kernel-reachable alias of that physical byte.
+        // `run` never crosses a physical discontinuity — `contig_from` is what
+        // caps it.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes[done..].as_ptr(), dst, run);
+        }
+        done += run;
+        pack_off += run as u64;
+    }
+    Ok(())
+}
+
+/// Publish: flip the containing pack's leaf mapping from RW+NX to RX and make
+/// the new bytes visible to instruction fetch.
+///
+/// Idempotent per pack. The permission flip happens once — the first program
+/// sealed in a pack seals the whole pack, exactly as Linux's prog pack is
+/// RO+X from creation with the unallocated remainder full of trap bytes. Later
+/// allocations in the same pack still write through the identity alias, so
+/// nothing needs to un-seal.
+///
+/// Invariant §4.3: every faulting instruction in `a` must already have an
+/// extable entry registered. This function cannot check that (it does not know
+/// the instruction stream) — the caller must not reorder it.
+pub fn seal(cap: &JitCap, a: &TextAlloc) -> Result<(), TextError> {
+    cap.check_live().map_err(|_| TextError::CapRevoked)?;
+    let root = kernel_root()?;
+    let mut packs = PACKS.lock();
+    let p = packs
+        .iter_mut()
+        .find(|p| p.base == a.pack_base)
+        .ok_or(TextError::Stale)?;
+
+    if !p.sealed {
+        // SAFETY: `root` is the recorded kernel root; the pack's mapping was
+        // installed through the same root by `new_pack`, so every level of the
+        // walk exists and the leaf is ours to rewrite.
+        unsafe { seal_mapping(root, p)? };
+        p.sealed = true;
+    }
+
+    // Make the freshly-written bytes fetchable even when the pack was already
+    // sealed. On x86_64 this is a serialising instruction on this CPU;
+    // cross-modifying code on peer CPUs is not a concern here because a
+    // program is never entered before its `seal` returns.
+    serialize_after_publish(p.base, p.len);
+    Ok(())
+}
+
+/// Retire an allocation.
+///
+/// The chunks are **not** returned to the pack immediately — a CPU may be
+/// executing this program right now. The handle goes to a quarantine list and
+/// is released by [`reclaim`] after a grace period. If a reclaim hook has been
+/// installed ([`install_reclaim_hook`]), it is invoked with the handle so the
+/// owner can defer through RCU; otherwise the handle sits in quarantine until
+/// someone calls [`reclaim`].
+pub fn free(a: TextAlloc) {
+    // Poison the body so a stale entry into a freed program traps rather than
+    // running whatever the next program writes there. Best-effort: a failure
+    // here means the pack is already gone.
+    let _ = fill_traps(&a);
+
+    if let Some(hook) = RECLAIM_HOOK.lock().as_ref().copied() {
+        hook(a);
+        return;
+    }
+    QUARANTINE.lock().push(a);
+}
+
+/// Actually release a quarantined allocation's chunks.
+///
+/// Call only after a grace period during which no CPU can have been executing
+/// the program — that is the whole contract. Releasing the last allocation in
+/// a pack frees the pack's backing memory too.
+pub fn reclaim(a: TextAlloc) {
+    let mut packs = PACKS.lock();
+    let Some(idx) = packs.iter().position(|p| p.base == a.pack_base) else {
+        return;
+    };
+    {
+        let p = &mut packs[idx];
+        p.set_range(a.chunk, a.chunks, false);
+        p.used = p.used.saturating_sub(a.chunks);
+        if p.used != 0 {
+            return;
+        }
+    }
+    // Pack is empty — give the memory back. The VA is *not* recycled (see
+    // `NEXT_PACK_VA`), so no peer CPU can land on it through a stale TLB entry
+    // and find someone else's text.
+    let mut pack = packs.swap_remove(idx);
+    // SAFETY: the pack has no live allocations and its VA is never reissued,
+    // so unmapping the leaves cannot pull the ground out from under a running
+    // program.
+    unsafe { unmap_pack(&pack) };
+    release_pack_backing(&mut pack);
+}
+
+/// Drain the quarantine. Same contract as [`reclaim`].
+pub fn reclaim_all_quarantined() {
+    let pending = core::mem::take(&mut *QUARANTINE.lock());
+    for a in pending {
+        reclaim(a);
+    }
+}
+
+/// Hook the owning subsystem installs so [`free`] can defer through RCU.
+///
+/// `narf-memory` cannot depend on `narf-rcu` — the dependency graph already
+/// runs `rcu → time → console → memory`, so the edge would be a cycle. The
+/// hook is the same seam shape as `install_pager` / `install_frame_alloc`.
+/// The installed function must arrange for [`reclaim`] to be called after a
+/// grace period, and must not block.
+pub type ReclaimHook = fn(TextAlloc);
+
+static RECLAIM_HOOK: IrqSafeSpinLock<Option<ReclaimHook>> = IrqSafeSpinLock::new(None);
+static QUARANTINE: IrqSafeSpinLock<Vec<TextAlloc>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Install the deferred-reclaim hook. Last writer wins.
+pub fn install_reclaim_hook(h: ReclaimHook) {
+    *RECLAIM_HOOK.lock() = Some(h);
+}
+
+/// Diagnostics: (live packs, allocated chunks, quarantined allocations).
+pub fn stats() -> (usize, usize, usize) {
+    let packs = PACKS.lock();
+    let used = packs.iter().map(|p| p.used).sum();
+    (packs.len(), used, QUARANTINE.lock().len())
+}
+
+// ── Internals ──────────────────────────────────────────────────────────
+
+fn fill_traps(a: &TextAlloc) -> Result<(), TextError> {
+    let packs = PACKS.lock();
+    let p = packs
+        .iter()
+        .find(|p| p.base == a.pack_base)
+        .ok_or(TextError::Stale)?;
+    let start = (a.chunk * CHUNK_BYTES) as u64;
+    let span = (a.chunks * CHUNK_BYTES) as u64;
+    fill_traps_raw(p, start, span);
+    Ok(())
+}
+
+fn fill_traps_raw(p: &Pack, start: u64, span: u64) {
+    let mut off = start;
+    let end = start + span;
+    while off < end {
+        let run = p.contig_from(off).min(end - off) as usize;
+        let dst = p.alias_at(off);
+        // SAFETY: `[off, off + run)` lies inside the pack and does not cross a
+        // physical discontinuity (`contig_from`); `alias_at` gives the
+        // kernel-reachable alias of the first byte.
+        unsafe {
+            for i in 0..run {
+                dst.add(i).write_volatile(TRAP_FILL[i % TRAP_FILL.len()]);
+            }
+        }
+        off += run as u64;
+    }
+}
+
+/// Build a pack big enough for `need` bytes and map it into the text window.
+///
+/// # Safety
+/// `root` must be the kernel page-table root recorded by
+/// [`reserve_kernel_slots`], and its BPF text top-level entry must be present.
+unsafe fn new_pack(root: PhysAddr, node: usize, need: u64) -> Result<Pack, TextError> {
+    // Pack VAs are always 2 MiB-aligned so a hugepage pack can take a PMD
+    // leaf. Small packs waste the remainder of their 2 MiB slot of VA; the
+    // window is 512 GiB, so that is free.
+    let base = NEXT_PACK_VA.fetch_add(PACK_HUGE_BYTES as usize, Ordering::Relaxed) as u64;
+    if base + PACK_HUGE_BYTES > BPF_TEXT_BASE + BPF_TEXT_USABLE {
+        return Err(TextError::Exhausted);
+    }
+
+    match crate::hugepage::alloc_hugepage_2m_on(node) {
+        Ok(h) => {
+            // SAFETY: caller's root contract; `base` is a fresh 2 MiB-aligned
+            // VA inside the reserved window, and `h.phys()` is a naturally
+            // aligned 2 MiB frame the pool just handed us exclusively.
+            unsafe { map_pack_huge(root, base, h.phys())? };
+            let mut p = Pack {
+                base,
+                len: PACK_HUGE_BYTES,
+                backing: Backing::Huge(h),
+                bitmap: alloc_crate::vec![0u64; (PACK_HUGE_BYTES as usize / CHUNK_BYTES).div_ceil(64)],
+                used: 0,
+                sealed: false,
+            };
+            fill_traps_raw(&p, 0, p.len);
+            p.sealed = false;
+            Ok(p)
+        }
+        Err(_) => {
+            // Hugepage pool empty. `hugepage.rs` documents that this does not
+            // fall back to the buddy, and failing a program load on boot-time
+            // fragmentation would be the wrong answer, so build a smaller pack
+            // out of ordinary frames and accept the iTLB cost.
+            if need > PACK_SMALL_BYTES {
+                return Err(TextError::Exhausted);
+            }
+            let pages = (PACK_SMALL_BYTES / 4096) as usize;
+            let mut frames = Vec::with_capacity(pages);
+            for _ in 0..pages {
+                match crate::frame::alloc_frame_on(node) {
+                    Ok(f) => frames.push(f),
+                    Err(_) => {
+                        for f in frames {
+                            crate::frame::free_frame(f);
+                        }
+                        return Err(TextError::NoFrame);
+                    }
+                }
+            }
+            for (i, f) in frames.iter().enumerate() {
+                // SAFETY: caller's root contract; `base + i*4096` is fresh VA
+                // inside the reserved window and `f` is exclusively ours.
+                if let Err(e) =
+                    unsafe { map_pack_page(root, base + (i as u64) * 4096, f.start_address()) }
+                {
+                    for f in frames {
+                        crate::frame::free_frame(f);
+                    }
+                    return Err(e);
+                }
+            }
+            let p = Pack {
+                base,
+                len: PACK_SMALL_BYTES,
+                backing: Backing::Small(frames),
+                bitmap: alloc_crate::vec![
+                    0u64;
+                    (PACK_SMALL_BYTES as usize / CHUNK_BYTES).div_ceil(64)
+                ],
+                used: 0,
+                sealed: false,
+            };
+            fill_traps_raw(&p, 0, p.len);
+            Ok(p)
+        }
+    }
+}
+
+fn release_pack_backing(p: &mut Pack) {
+    match core::mem::replace(&mut p.backing, Backing::Small(Vec::new())) {
+        Backing::Huge(h) => crate::hugepage::free_hugepage(h),
+        Backing::Small(frames) => {
+            for f in frames {
+                crate::frame::free_frame(f);
+            }
+        }
+    }
+}
+
+// ── Arch-specific mapping ──────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn map_pack_huge(root: PhysAddr, va: u64, phys: u64) -> Result<(), TextError> {
+    use crate::x86_64::paging::{map_2mb, PtFlags};
+    // Created RW + NX: the JIT never writes through this VA (it uses the
+    // identity alias), but leaving it non-executable until `seal` means a
+    // half-built program is not reachable by instruction fetch at its final
+    // address.
+    let flags = PtFlags::WRITABLE | PtFlags::NO_EXEC;
+    // SAFETY: caller's root contract; `va` is fresh and 2 MiB-aligned.
+    unsafe {
+        map_2mb(root, VirtAddr::new(va), PhysAddr::new(phys), flags)
+            .map_err(|_| TextError::MapFailed)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn map_pack_page(root: PhysAddr, va: u64, phys: PhysAddr) -> Result<(), TextError> {
+    use crate::x86_64::paging::{map_4kb, PtFlags};
+    let flags = PtFlags::WRITABLE | PtFlags::NO_EXEC;
+    // SAFETY: caller's root contract; `va` is fresh and page-aligned.
+    unsafe { map_4kb(root, VirtAddr::new(va), phys, flags).map_err(|_| TextError::MapFailed) }
+}
+
+/// Rewrite the pack's leaf entries: drop `WRITABLE`, drop `NO_EXEC`, add
+/// `GLOBAL`, then **one** ranged shootdown for the whole pack.
+///
+/// `GLOBAL` is correct and worth having: BPF text is at the same VA with the
+/// same contents under every CR3 (the top-level entry is snapshot-copied into
+/// every address space), so there is nothing for a CR3 switch to invalidate.
+///
+/// One `invlpg_global_range` rather than 512 individual shootdown IPIs — the
+/// range hook exists precisely for this shape.
+///
+/// # Safety
+/// `root` must be the recorded kernel root and `p`'s mapping must have been
+/// installed through it.
+#[cfg(target_arch = "x86_64")]
+unsafe fn seal_mapping(root: PhysAddr, p: &Pack) -> Result<(), TextError> {
+    use crate::x86_64::paging::{
+        invlpg_global_range, PageTable, PageTableEntry, PtFlags, WalkIndices,
+    };
+
+    let rewrite = |va: u64, huge: bool| -> Result<(), TextError> {
+        let idx = WalkIndices::from_virt(VirtAddr::new(va));
+        // SAFETY: `root` is live and identity-reachable; every level below it
+        // was created by `map_2mb`/`map_4kb` through this same root.
+        unsafe {
+            let pml4 = &mut *root.as_mut_ptr::<PageTable>();
+            let e = pml4.entries[idx.pml4];
+            if !e.is_present() {
+                return Err(TextError::MapFailed);
+            }
+            let pdpt = &mut *e.addr().as_mut_ptr::<PageTable>();
+            let e = pdpt.entries[idx.pdpt];
+            if !e.is_present() || e.flags().contains(PtFlags::HUGE_PAGE) {
+                return Err(TextError::MapFailed);
+            }
+            let pd = &mut *e.addr().as_mut_ptr::<PageTable>();
+            let leaf_slot: &mut PageTableEntry = if huge {
+                &mut pd.entries[idx.pd]
+            } else {
+                let e = pd.entries[idx.pd];
+                if !e.is_present() || e.flags().contains(PtFlags::HUGE_PAGE) {
+                    return Err(TextError::MapFailed);
+                }
+                let pt = &mut *e.addr().as_mut_ptr::<PageTable>();
+                &mut pt.entries[idx.pt]
+            };
+            if !leaf_slot.is_present() {
+                return Err(TextError::MapFailed);
+            }
+            // Preserve the physical address and PS bit; rewrite permissions.
+            const KEEP: u64 = 0x000f_ffff_ffff_f000 | (1 << 7);
+            let kept = leaf_slot.raw() & KEEP;
+            *leaf_slot =
+                PageTableEntry::from_raw(kept | (PtFlags::PRESENT | PtFlags::GLOBAL).bits());
+            Ok(())
+        }
+    };
+
+    match p.backing {
+        Backing::Huge(_) => rewrite(p.base, true)?,
+        Backing::Small(_) => {
+            for i in 0..(p.len / 4096) {
+                rewrite(p.base + i * 4096, false)?;
+            }
+        }
+    }
+
+    // ONE ranged shootdown for the whole pack. `invlpg_global_range` walks the
+    // page count locally and broadcasts a single range request; 512 separate
+    // `invlpg_global` calls would be 512 IPI round-trips.
+    // SAFETY: INVLPG (and the range broadcast) is always legal at CPL=0.
+    unsafe {
+        invlpg_global_range(VirtAddr::new(p.base), p.len / 4096);
+    }
+    Ok(())
+}
+
+/// x86_64 requires a serialising instruction on a processor before it executes
+/// bytes that were written after its last serialisation (SDM Vol 3
+/// §8.1.3 — self-modifying code). `CPUID` is the canonical choice.
+///
+/// Cross-modifying code (a *peer* CPU already fetching these bytes) is not a
+/// concern here: a program is never entered before its `seal` returns, and the
+/// pack's unallocated remainder holds trap bytes, so a peer that somehow lands
+/// mid-pack faults rather than executing stale bytes.
+#[cfg(target_arch = "x86_64")]
+fn serialize_after_publish(_base: u64, _len: u64) {
+    // SAFETY: `CPUID` is unprivileged and has no memory operands. Clobbers
+    // rax/rbx/rcx/rdx, all declared.
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "xor eax, eax",
+            "cpuid",
+            "pop rbx",
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nostack),
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn unmap_pack(p: &Pack) {
+    use crate::x86_64::paging::{unmap_2mb, unmap_4kb};
+    // SAFETY: the pack has no live allocations; its VA is never reissued.
+    unsafe {
+        match p.backing {
+            Backing::Huge(_) => {
+                let _ = unmap_2mb(
+                    PhysAddr::new(KERNEL_ROOT.load(Ordering::Acquire) as u64),
+                    VirtAddr::new(p.base),
+                );
+            }
+            Backing::Small(_) => {
+                for i in 0..(p.len / 4096) {
+                    let _ = unmap_4kb(
+                        PhysAddr::new(KERNEL_ROOT.load(Ordering::Acquire) as u64),
+                        VirtAddr::new(p.base + i * 4096),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn map_pack_huge(root: PhysAddr, va: u64, phys: u64) -> Result<(), TextError> {
+    use crate::aarch64::paging::{map_2mb, PtFlags};
+    // RW at EL1, never executable at EL0, and PXN until `seal`.
+    let flags = PtFlags::AP_RW_EL1 | PtFlags::UXN | PtFlags::PXN;
+    // SAFETY: caller's root contract; `va` is fresh and 2 MiB-aligned.
+    unsafe {
+        map_2mb(root, VirtAddr::new(va), PhysAddr::new(phys), flags)
+            .map_err(|_| TextError::MapFailed)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn map_pack_page(root: PhysAddr, va: u64, phys: PhysAddr) -> Result<(), TextError> {
+    use crate::aarch64::paging::{map_4kb, PtFlags};
+    let flags = PtFlags::AP_RW_EL1 | PtFlags::UXN | PtFlags::PXN;
+    // SAFETY: caller's root contract; `va` is fresh and page-aligned.
+    unsafe { map_4kb(root, VirtAddr::new(va), phys, flags).map_err(|_| TextError::MapFailed) }
+}
+
+/// aarch64 seal: read-only at EL1 (`AP_RO_EL1`), still `UXN`, and **clear**
+/// `PXN` so EL1 may fetch instructions from it.
+///
+/// No IPI plumbing: `tlbi vae1is` is inner-shareable and self-broadcasts. That
+/// asymmetry with x86_64 is worth remembering — the arch does the shootdown
+/// for us.
+///
+/// # Safety
+/// Same contract as the x86_64 arm.
+#[cfg(target_arch = "aarch64")]
+unsafe fn seal_mapping(root: PhysAddr, p: &Pack) -> Result<(), TextError> {
+    use crate::aarch64::paging::{tlb_invalidate_vae1, PageTable, PageTableEntry, PtFlags};
+
+    // AP[2:1] occupy bits 7:6; UXN is 54, PXN is 53. Clear the AP field and
+    // PXN, then set RO-at-EL1 + UXN.
+    const AP_MASK: u64 = 0b11 << 6;
+    const PXN: u64 = 1 << 53;
+
+    let rewrite = |va: u64, block_level: usize| -> Result<(), TextError> {
+        let raw = va;
+        let i0 = ((raw >> 39) & 0x1FF) as usize;
+        let i1 = ((raw >> 30) & 0x1FF) as usize;
+        let i2 = ((raw >> 21) & 0x1FF) as usize;
+        let i3 = ((raw >> 12) & 0x1FF) as usize;
+        // SAFETY: `root` is the live TTBR1 L0; every level below it was
+        // created by `map_2mb`/`map_4kb` through this same root, and the
+        // kernel RAM accessor reaches page-table frames.
+        unsafe {
+            let l0 = &mut *root.kernel_mut_ptr::<PageTable>();
+            let e = l0.entries[i0];
+            if !e.is_valid() {
+                return Err(TextError::MapFailed);
+            }
+            let l1 = &mut *e.addr().kernel_mut_ptr::<PageTable>();
+            let e = l1.entries[i1];
+            if !e.is_valid() {
+                return Err(TextError::MapFailed);
+            }
+            let l2 = &mut *e.addr().kernel_mut_ptr::<PageTable>();
+            let leaf: &mut PageTableEntry = if block_level == 2 {
+                &mut l2.entries[i2]
+            } else {
+                let e = l2.entries[i2];
+                if !e.is_valid() {
+                    return Err(TextError::MapFailed);
+                }
+                let l3 = &mut *e.addr().kernel_mut_ptr::<PageTable>();
+                &mut l3.entries[i3]
+            };
+            if !leaf.is_valid() {
+                return Err(TextError::MapFailed);
+            }
+            let v = (leaf.raw() & !(AP_MASK | PXN)) | PtFlags::AP_RO_EL1.bits();
+            *leaf = PageTableEntry::from_raw(v);
+            Ok(())
+        }
+    };
+
+    match p.backing {
+        Backing::Huge(_) => rewrite(p.base, 2)?,
+        Backing::Small(_) => {
+            for i in 0..(p.len / 4096) {
+                rewrite(p.base + i * 4096, 3)?;
+            }
+        }
+    }
+
+    // `tlbi vae1is` is inner-shareable; the hardware broadcasts it. Issue one
+    // per 4 KiB page of the pack — for a 2 MiB pack that is 512 `tlbi`s, but
+    // they are cheap local instructions, not IPI round-trips.
+    for i in 0..(p.len / 4096) {
+        // SAFETY: TLB invalidation is always legal at EL1.
+        unsafe {
+            tlb_invalidate_vae1(VirtAddr::new(p.base + i * 4096));
+        }
+    }
+    Ok(())
+}
+
+/// aarch64 publish barrier.
+///
+/// The architecture requires, for every line of newly-written instruction
+/// memory: clean the D-cache to the point of unification (`dc cvau`), `dsb
+/// ish`, invalidate the I-cache (`ic ivau`), `dsb ish`, `isb`. Delegated to
+/// `narf_arch::aarch64::flush_icache_range`, which is the same primitive
+/// `patch_word` uses.
+#[cfg(target_arch = "aarch64")]
+fn serialize_after_publish(base: u64, len: u64) {
+    // SAFETY: cache-maintenance-by-VA on a mapped, readable kernel range. The
+    // pack is mapped for the whole call.
+    unsafe {
+        narf_arch::aarch64::asm::flush_icache_range(base, len);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn unmap_pack(p: &Pack) {
+    use crate::aarch64::paging::{unmap_2mb, unmap_4kb};
+    let root = PhysAddr::new(KERNEL_ROOT.load(Ordering::Acquire) as u64);
+    // SAFETY: the pack has no live allocations; its VA is never reissued.
+    unsafe {
+        match p.backing {
+            Backing::Huge(_) => {
+                let _ = unmap_2mb(root, VirtAddr::new(p.base));
+            }
+            Backing::Small(_) => {
+                for i in 0..(p.len / 4096) {
+                    let _ = unmap_4kb(root, VirtAddr::new(p.base + i * 4096));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod stub_arch {
+    use super::*;
+    pub(super) unsafe fn map_pack_huge(_: PhysAddr, _: u64, _: u64) -> Result<(), TextError> {
+        Err(TextError::MapFailed)
+    }
+    pub(super) unsafe fn map_pack_page(_: PhysAddr, _: u64, _: PhysAddr) -> Result<(), TextError> {
+        Err(TextError::MapFailed)
+    }
+    pub(super) unsafe fn seal_mapping(_: PhysAddr, _: &Pack) -> Result<(), TextError> {
+        Err(TextError::MapFailed)
+    }
+    pub(super) fn serialize_after_publish(_: u64, _: u64) {}
+    pub(super) unsafe fn unmap_pack(_: &Pack) {}
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+use stub_arch::*;
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_base_decodes_to_its_slot() {
+        assert_eq!(((BPF_TEXT_BASE >> 39) & 0x1FF) as usize, BPF_TEXT_PML4_SLOT);
+        assert_eq!(
+            ((BPF_ARENA_BASE >> 39) & 0x1FF) as usize,
+            BPF_ARENA_PML4_SLOT
+        );
+    }
+
+    #[test]
+    fn windows_avoid_every_claimed_slot() {
+        // 0 identity, 1 high MMIO, 2..=255 user, 256..=271 per-domain PCID,
+        // 272 vmalloc, 384..=510 direct map, 511 kernel image.
+        for slot in [BPF_TEXT_PML4_SLOT, BPF_ARENA_PML4_SLOT] {
+            assert!(slot > 272, "collides with vmalloc or lower");
+            assert!(slot < 384, "collides with the kernel direct map");
+        }
+    }
+
+    #[test]
+    fn a_guard_slot_separates_the_windows() {
+        assert!(BPF_ARENA_PML4_SLOT >= BPF_TEXT_PML4_SLOT + 2);
+    }
+}
