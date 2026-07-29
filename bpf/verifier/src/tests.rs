@@ -1,9 +1,13 @@
-//! Host tests for the verification contract.
+//! Host tests for the verification contract — the kfunc calling convention
+//! and the `verify()` entry point. The abstract interpreter's own tests are in
+//! `verify_tests.rs`.
 //!
-//! The abstract interpreter is Phase 2; what is testable now is the kfunc
-//! calling contract, and it is worth testing hard — it is the thing that
-//! replaces ~2,000 lines of Linux verifier code, and a hole in it is a hole
-//! in every kfunc signature at once.
+//! The contract is worth testing hard: it is the thing that replaces ~2,000
+//! lines of Linux verifier code, and a hole in it is a hole in every kfunc
+//! signature at once. Where a rule is a *conjunction* of predicates, assert
+//! the conjunction — a lock guard that must be both linear and sleep-unsafe
+//! spent a while being neither, because the two halves were asserted on
+//! separate descriptors.
 
 use narf_bpf_isa::encode::encode;
 use narf_bpf_isa::{Decoded, Insn};
@@ -12,6 +16,11 @@ use crate::kfunc::*;
 use crate::{verify, Program, VerifyError};
 
 fn ptr(kind: PtrKind, domain: ValidityDomain, flags: ArgFlags) -> ArgDesc {
+    ptr_const(kind, domain, flags)
+}
+
+/// The same, usable in a `static` — which is where `kfunc!` will build them.
+const fn ptr_const(kind: PtrKind, domain: ValidityDomain, flags: ArgFlags) -> ArgDesc {
     ArgDesc {
         kind: TypeKind::Ptr {
             kind,
@@ -57,21 +66,102 @@ fn qsbr_pointers_cannot_cross_an_await() {
 }
 
 #[test]
-fn lock_guards_are_never_sleep_safe() {
-    // "No sleeping with a lock held" is not a separate check — it falls out
-    // of the guard's validity domain.
-    let g = ptr(
+fn a_lock_guard_is_linear_and_sleep_unsafe_at_the_same_time() {
+    // The property spec §1.11 promises, and the one an earlier version of this
+    // file could not express: a `Guard` must be **both** linear (given back
+    // before exit) **and** killed at an await (so no sleeping with a lock
+    // held). Asserting the two halves on *separate* descriptors is what hid
+    // the bug — `Guard` + `Owned` was linear but failed `validate()`, and
+    // `Guard` + `NonPreemptible` validated but was not linear, so no single
+    // spelling had both. The conjunction is the test.
+    let guard = ptr(
         PtrKind::LockGuard,
         ValidityDomain::NonPreemptible,
         ArgFlags::NONE,
     );
-    assert!(!g.survives_await());
+    static GUARD_ARG: &[ArgDesc] = &[ptr_const(
+        PtrKind::LockGuard,
+        ValidityDomain::NonPreemptible,
+        ArgFlags::NONE,
+    )];
 
-    // A guard released back to the kernel is `Owned`-domain, which makes
-    // "must be released before exit" the same linear-type rule as any other
-    // acquired reference — no bespoke lock bookkeeping.
-    let releasable = ptr(PtrKind::LockGuard, ValidityDomain::Owned, ArgFlags::NONE);
-    assert!(releasable.consumes_in_arg_position());
+    assert!(!guard.survives_await(), "a guard must die at an await");
+    assert!(
+        guard.consumes_in_arg_position(),
+        "a guard must be linear — passing it back is what releases the lock"
+    );
+    assert_eq!(
+        desc(GUARD_ARG, ArgDesc::VOID, Context::Atomic).validate(),
+        Ok(()),
+        "…and the same descriptor must be declarable"
+    );
+    // Return position too: `lock() -> Option<Guard<'_>>`.
+    assert_eq!(
+        desc(
+            &[],
+            ptr_const(
+                PtrKind::LockGuard,
+                ValidityDomain::NonPreemptible,
+                ArgFlags::NULLABLE,
+            ),
+            Context::Atomic,
+        )
+        .validate(),
+        Ok(())
+    );
+}
+
+#[test]
+fn linearity_of_a_guard_does_not_depend_on_its_domain() {
+    // Whatever lifetime a guard is given, you still have to give it back.
+    // Keying linearity on `ValidityDomain::Owned` made "linear" and "not
+    // sleep-safe" mutually exclusive, which is exactly backwards for a lock.
+    for domain in [
+        ValidityDomain::NonPreemptible,
+        ValidityDomain::RcuRead,
+        ValidityDomain::Owned,
+    ] {
+        assert!(
+            ptr(PtrKind::LockGuard, domain, ArgFlags::NONE).consumes_in_arg_position(),
+            "{domain:?}"
+        );
+    }
+    // An object, by contrast, is linear only when it carries a refcount.
+    assert!(ptr(PtrKind::Object, ValidityDomain::Owned, ArgFlags::NONE).consumes_in_arg_position());
+    assert!(!ptr(
+        PtrKind::Object,
+        ValidityDomain::NonPreemptible,
+        ArgFlags::NONE
+    )
+    .consumes_in_arg_position());
+}
+
+#[test]
+fn a_sleep_safe_lock_guard_argument_is_rejected() {
+    // The mirror of `rejects_a_sleep_safe_lock_guard`. Without it, a kfunc
+    // could *take back* a guard it claims survived a sleep — legitimising the
+    // exact state the return-position check exists to prevent.
+    static OWNED_GUARD: &[ArgDesc] = &[ptr_const(
+        PtrKind::LockGuard,
+        ValidityDomain::Owned,
+        ArgFlags::NONE,
+    )];
+    assert_eq!(
+        desc(OWNED_GUARD, ArgDesc::VOID, Context::Atomic).validate(),
+        Err(KfuncError::SleepableLockGuardArg(0))
+    );
+
+    // `Static` is rejected for the same reason: a guard that is always valid
+    // is not a guard.
+    static STATIC_GUARD: &[ArgDesc] = &[ptr_const(
+        PtrKind::LockGuard,
+        ValidityDomain::Static,
+        ArgFlags::NONE,
+    )];
+    assert_eq!(
+        desc(STATIC_GUARD, ArgDesc::VOID, Context::Atomic).validate(),
+        Err(KfuncError::SleepableLockGuardArg(0))
+    );
 }
 
 #[test]

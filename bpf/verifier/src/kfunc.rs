@@ -247,18 +247,38 @@ impl ArgDesc {
     /// Whether passing this value *consumes* it — i.e. the caller's copy is
     /// dead afterwards.
     ///
-    /// Positional, not a flag: an `Owned<T>` in argument position releases,
-    /// and the same type in return position acquires.
+    /// Positional, not a flag: a linear value in argument position releases,
+    /// and the same type in return position acquires. The verifier reads it
+    /// both ways round.
+    ///
+    /// A `Guard<'_>` is linear **structurally**, from its [`PtrKind`], not from
+    /// its [`ValidityDomain`]. Keying it on the domain made "linear" and "not
+    /// sleep-safe" mutually exclusive, which is exactly backwards for a lock:
+    /// [`ValidityDomain::Owned`] is the only domain
+    /// [`ValidityDomain::requires_release`] accepts, and `Owned` *survives* an
+    /// await — so the one spelling that gave linearity was the one
+    /// [`KfuncDesc::validate`] rejects. A guard is by definition something you
+    /// must give back, whatever its lifetime; the domain's job is only to say
+    /// how long that lifetime is.
+    ///
+    /// The canonical spelling is therefore [`PtrKind::LockGuard`] +
+    /// [`ValidityDomain::NonPreemptible`]: linear, and killed at every await by
+    /// the same rule that kills a `Trusted<T>`. Spec §1.11's three properties —
+    /// fallible acquire, linear release, never held across a sleep — all follow.
     #[inline]
     #[must_use]
     pub const fn consumes_in_arg_position(&self) -> bool {
-        matches!(
-            self.kind,
+        match self.kind {
             TypeKind::Ptr {
-                kind: PtrKind::Object | PtrKind::LockGuard,
+                kind: PtrKind::LockGuard,
                 ..
-            }
-        ) && self.domain.requires_release()
+            } => true,
+            TypeKind::Ptr {
+                kind: PtrKind::Object,
+                ..
+            } => self.domain.requires_release(),
+            _ => false,
+        }
     }
 }
 
@@ -354,9 +374,29 @@ impl KfuncDesc {
             if matches!(a.kind, TypeKind::Void) {
                 return Err(KfuncError::VoidArgument(i));
             }
+            // A lock guard is never sleep-safe, in either position. Checking
+            // arguments too closes the hole where a kfunc *takes back* a guard
+            // it claims survived a sleep, which would legitimise the very
+            // state the return-position check exists to prevent.
+            if matches!(
+                a.kind,
+                TypeKind::Ptr {
+                    kind: PtrKind::LockGuard,
+                    ..
+                }
+            ) && a.domain.survives_await()
+            {
+                return Err(KfuncError::SleepableLockGuardArg(i));
+            }
         }
         // A lock guard is never sleep-safe; a kfunc claiming otherwise would
         // let a program sleep holding a lock.
+        //
+        // Note this rejects [`ValidityDomain::Static`] as well as `Owned` and
+        // `SleepableRcuRead`: a guard that is "always valid" is not a guard.
+        // What is left — `NonPreemptible` and `RcuRead` — is exactly the set
+        // of domains that die at an await, which is the property spec §4.4
+        // needs and the only thing the domain has to say about a lock.
         if matches!(
             self.ret.kind,
             TypeKind::Ptr {
@@ -385,6 +425,10 @@ pub enum KfuncError {
     ScalarWithDomain(usize),
     /// An argument had type [`TypeKind::Void`].
     VoidArgument(usize),
-    /// A lock guard was declared sleep-safe.
+    /// A lock guard was declared sleep-safe in return position.
     SleepableLockGuard,
+    /// A lock guard argument was declared sleep-safe. Separate from
+    /// [`SleepableLockGuard`](Self::SleepableLockGuard) so the diagnostic can
+    /// name which parameter.
+    SleepableLockGuardArg(usize),
 }

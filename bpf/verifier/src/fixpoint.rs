@@ -983,6 +983,14 @@ impl Analysis<'_, '_> {
         // domain does not survive it dies here — spec §4.4, the single rule
         // that delivers sleep safety, lock discipline, and reference validity
         // at once.
+        //
+        // The runtime is currently narrower than this: the uniform kfunc shim
+        // returns a `u64`, so a kfunc cannot suspend through it and
+        // `narf_yield()` is an interpreter intrinsic. Treating *every*
+        // `Context::Sleepable` kfunc as an await point is therefore a strict
+        // over-approximation of what can actually suspend today — it rejects
+        // more, never less — and it means the rule needs no revisiting when
+        // the shim grows a suspending form.
         if desc.context == Context::Sleepable {
             for (reg, domain) in st.kill_at_await() {
                 // Liveness turns a silent kill into a diagnostic: report only
@@ -998,16 +1006,10 @@ impl Analysis<'_, '_> {
         for k in 1..=5u8 {
             st.regs[k as usize] = AbsValue::NotInit;
         }
-        // A lock guard is linear because of *what it is*, not because of its
-        // domain. The landed contract cannot express it the other way round:
-        // `KfuncDesc::validate()` rejects a `LockGuard` return whose domain
-        // survives an await (`KfuncError::SleepableLockGuard`), and `Owned` is
-        // the only domain `requires_release()` accepts — and `Owned` survives
-        // awaits. So a guard must be `NonPreemptible` to be declarable, which
-        // leaves the domain unable to carry its linearity. Deriving linearity
-        // from the kind restores all three properties spec §1.11 asks for:
-        // fallible acquire (`Option`), linear release (here), and "never held
-        // across a sleep" (the `NonPreemptible` domain, killed at every await).
+        // Acquisition is the mirror of release: whatever a type consumes in
+        // argument position, it acquires in return position. One predicate,
+        // read both ways round, so an acquire whose release was forgotten is
+        // not expressible.
         let is_lock = matches!(
             desc.ret.kind,
             TypeKind::Ptr {
@@ -1015,9 +1017,7 @@ impl Analysis<'_, '_> {
                 ..
             }
         );
-        let ret_ref = if is_lock
-            || (desc.ret.domain.requires_release() && matches!(desc.ret.kind, TypeKind::Ptr { .. }))
-        {
+        let ret_ref = if desc.ret.consumes_in_arg_position() {
             if is_lock && st.live_locks() >= 1 {
                 return Err(VerifyError::TooManyLocks { at });
             }
@@ -1094,7 +1094,7 @@ impl Analysis<'_, '_> {
                     // position releases what the same type in return position
                     // acquired, which is why there is no way to declare an
                     // acquire whose release was forgotten.
-                    if arg.consumes_in_arg_position() || kind == PtrKind::LockGuard {
+                    if arg.consumes_in_arg_position() {
                         if p.ref_id == NO_REF || !st.release(p.ref_id) {
                             return Err(VerifyError::ReleaseOfUnacquired { at, reg: r.index() });
                         }
