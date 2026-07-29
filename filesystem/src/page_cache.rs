@@ -114,6 +114,12 @@ impl PageCache {
     pub fn is_empty(&self) -> bool {
         self.pages.lock().is_empty()
     }
+
+    /// Invalidate every resident page. Filesystems with direct block writes
+    /// use this when they cannot identify the exact affected cache key.
+    pub fn clear(&self) {
+        self.pages.lock().clear();
+    }
 }
 
 impl Default for PageCache {

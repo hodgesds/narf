@@ -456,6 +456,88 @@ fn smoke_ext2_mount_ramblock_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_mount_ramblock_round_trip);
 
+fn smoke_ext2_page_cache_reuses_1k_data_block() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_block::{
+        ram::RamBlockDevice, BlockCompletion, BlockDevice, BlockFeature, BlockOp, BlockRequest,
+        CancelResult, LbaRange,
+    };
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    struct CountingBlock {
+        inner: Arc<RamBlockDevice>,
+        reads: AtomicUsize,
+    }
+
+    impl BlockDevice for CountingBlock {
+        fn logical_block_size(&self) -> u32 {
+            self.inner.logical_block_size()
+        }
+        fn physical_block_size(&self) -> u32 {
+            self.inner.physical_block_size()
+        }
+        fn capacity_blocks(&self) -> u64 {
+            self.inner.capacity_blocks()
+        }
+        fn supports(&self, feature: BlockFeature) -> bool {
+            self.inner.supports(feature)
+        }
+        fn submit(
+            &self,
+            request: BlockRequest,
+        ) -> impl core::future::Future<Output = BlockCompletion> + Send {
+            if matches!(request.op, BlockOp::Read) {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.submit(request)
+        }
+        fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
+            self.inner.flush()
+        }
+        fn discard(&self, range: LbaRange) -> impl core::future::Future<Output = ()> + Send {
+            self.inner.discard(range)
+        }
+        fn cancel(&self, tag: u64) -> impl core::future::Future<Output = CancelResult> + Send {
+            self.inner.cancel(tag)
+        }
+    }
+
+    let device = Arc::new(CountingBlock {
+        inner: RamBlockDevice::from_image(512, build_ext2_image(b"page cache")),
+        reads: AtomicUsize::new(0),
+    });
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let file = match poll_once(root.lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    let mut first = [0u8; 10];
+    if !matches!(poll_once(file.read(0, &mut first)), Some(Ok(10))) {
+        return TestResult::Fail("first read failed");
+    }
+    let reads_after_first = device.reads.load(Ordering::Relaxed);
+    let mut second = [0u8; 10];
+    if !matches!(poll_once(file.read(0, &mut second)), Some(Ok(10))) {
+        return TestResult::Fail("second read failed");
+    }
+    if first != second || device.reads.load(Ordering::Relaxed) != reads_after_first {
+        return TestResult::Fail("second read missed the cached 1 KiB ext block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_page_cache_reuses_1k_data_block
+);
+
 /// Build a minimal EXT4 image: same block layout as `build_ext2_image`,
 /// but the superblock sets the EXTENTS incompat feature and every inode
 /// stores an extent tree in its `i_block[]` region instead of the
