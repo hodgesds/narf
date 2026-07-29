@@ -290,13 +290,13 @@ fn smoke_bpf_interp_calls_kfunc() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_interp_calls_kfunc);
 
-fn smoke_bpf_interp_call_clobbers_arg_regs() -> TestResult {
-    // The BPF ABI makes R1..R5 caller-saved and R6..R9 callee-saved. A
-    // interpreter that quietly preserved R1..R5 would accept programs the JIT
-    // then miscompiles, so the clobber is pinned here rather than left
-    // implicit.
-    //   r3 = 0x55; r6 = 0x66; r1 = 0; call narf_counter_read; r0 = r3 + r6
-    let insns = asm(&[
+/// The clobber program: `r3 = 0x55; r6 = 0x66; r1 = 0; call; r0 = r3 + r6`.
+///
+/// R1..R5 are caller-saved, so the read of `r3` after the call is a read of an
+/// uninitialised register. That makes this program both a good verifier
+/// negative *and* a good interpreter fixture, so the two tests below share it.
+fn clobber_program() -> Vec<Insn> {
+    asm(&[
         mov_imm(3, 0x55),
         mov_imm(6, 0x66),
         mov_imm(1, 0),
@@ -304,11 +304,58 @@ fn smoke_bpf_interp_call_clobbers_arg_regs() -> TestResult {
         alu_reg(AluOp::Add, 3, 6),
         mov_reg(0, 3),
         EXIT,
-    ]);
-    let Ok(p) = load("clobber", insns, Context::Atomic) else {
-        return TestResult::Fail("load rejected the clobber program");
-    };
-    match p.run_atomic([0; 4], 4) {
+    ])
+}
+
+/// `r1 = 0; r0 = *(u64 *)(r1 + 0); exit` — a null dereference.
+fn wild_load_program() -> Vec<Insn> {
+    asm(&[mov_imm(1, 0), ldx(0, 1, 0), EXIT])
+}
+
+/// Run an **unverified** instruction image straight through the interpreter.
+///
+/// Deliberately bypasses [`BpfProg::load`]. The interpreter's bounds checks
+/// are defence in depth *behind* verification, and `crate::provisional`'s
+/// safety argument leans on them directly — so they have to stay covered even
+/// for programs the verifier now rejects outright. A test that can only reach
+/// the interpreter through a passing `verify()` silently stops exercising this
+/// layer the moment the verifier gets stricter, which is exactly what happened
+/// when the real abstract interpreter landed.
+fn run_unverified(insns: &[Insn], fuel: u64) -> Option<Outcome> {
+    use crate::mem::BpfStack;
+    let provider = crate::mem::PerCpuStackStub;
+    let frame = provider.acquire(64)?;
+    let registry = crate::kfunc::registry()?;
+    let mut vm = crate::interp::Vm::new(
+        insns,
+        [0; crate::interp::MAX_CTX_WORDS],
+        4,
+        frame,
+        fuel,
+        registry,
+        Context::Atomic,
+    );
+    Some(crate::interp::drive(vm.run()))
+}
+
+fn smoke_bpf_verify_rejects_read_of_clobbered_arg_reg() -> TestResult {
+    // The primary guarantee: because R1..R5 are caller-saved, reading r3 after
+    // a call reads an uninitialised register, and the verifier must refuse the
+    // program rather than leave the JIT free to miscompile it. Catching this
+    // at load is strictly stronger than catching it at run time.
+    match load("clobber", clobber_program(), Context::Atomic) {
+        Err(_) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("verifier accepted a read of a caller-saved register"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_verify_rejects_read_of_clobbered_arg_reg);
+
+fn smoke_bpf_interp_call_clobbers_arg_regs() -> TestResult {
+    // Defence in depth, with verification bypassed: the interpreter must model
+    // the BPF ABI's caller-saved R1..R5 faithfully on its own. An interpreter
+    // that quietly preserved them would disagree with the JIT, and the
+    // disagreement would only surface once the JIT was enabled.
+    match run_unverified(&clobber_program(), 64) {
         // r3 was clobbered to 0, r6 survived: 0 + 0x66.
         Some(Outcome::Returned(0x66)) => TestResult::Pass,
         Some(Outcome::Returned(0xBB)) => {
@@ -323,14 +370,22 @@ kernel_test_in!("bpf", smoke_bpf_interp_call_clobbers_arg_regs);
 
 // ── interpreter: negative ───────────────────────────────────────────
 
+fn smoke_bpf_verify_rejects_wild_load() -> TestResult {
+    // The primary guarantee: a scalar is not a pointer, so a null dereference
+    // must be rejected at load time.
+    match load("wild", wild_load_program(), Context::Atomic) {
+        Err(_) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("verifier accepted a null dereference"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_verify_rejects_wild_load);
+
 fn smoke_bpf_interp_wild_load_traps_not_faults() -> TestResult {
-    // r1 = 0; r0 = *(u64 *)(r1 + 0); exit — a null dereference, which must
-    // produce a diagnostic rather than a kernel page fault.
-    let insns = asm(&[mov_imm(1, 0), ldx(0, 1, 0), EXIT]);
-    let Ok(p) = load("wild", insns, Context::Atomic) else {
-        return TestResult::Fail("load rejected the wild-access program");
-    };
-    match p.run_atomic([0; 4], 4) {
+    // Defence in depth, with verification bypassed. This is the property
+    // `crate::provisional` names as the reason the runtime is safe while the
+    // verifier matures: a bad program must produce a diagnostic, never a
+    // kernel page fault — whatever the verifier did or did not catch.
+    match run_unverified(&wild_load_program(), 64) {
         Some(Outcome::Trapped(Trap::BadAccess { .. })) => TestResult::Pass,
         Some(Outcome::Trapped(_)) => TestResult::Fail("wrong trap for a wild access"),
         Some(Outcome::Returned(_)) => TestResult::Fail("wild access was not caught"),
