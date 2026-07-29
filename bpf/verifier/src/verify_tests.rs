@@ -1433,33 +1433,43 @@ fn a_load_through_an_object_pointer_records_a_fault_site() {
         ),
         Context::Atomic,
     )];
-    let v = check_full(
+    // This test previously asserted the load *verified*, on the grounds that
+    // "an unchecked probe load is safe because the extable covers it". That
+    // is false: the extable makes an *unmapped* address survivable and does
+    // nothing for a mapped one, so an unchecked object load is an arbitrary
+    // kernel read. Without BTF there is no object size to check an offset
+    // against, so the honest answer is to reject the dereference outright.
+    let err = check_full(
         &[call(0), ldx(Size::Dw, 6, 0, 24), movr(0, 6), EXIT],
         &[],
         &k,
         Context::Atomic,
     )
-    .expect("an unchecked probe load is safe because the extable covers it");
-    assert_eq!(v.fault_sites.len(), 1);
-    assert_eq!(v.fault_sites[0].insn_index, 1);
-    assert_eq!(v.fault_sites[0].dst_reg, Some(6));
-    assert!(!v.fault_sites[0].arena);
-    assert!(!v.uses_arena);
+    .expect_err("an opaque object pointer must not be dereferenceable");
+    assert!(
+        matches!(err, VerifyError::OpaqueDeref { at: 1, .. }),
+        "expected OpaqueDeref at the load, got {err:?}"
+    );
 }
 
 #[test]
-fn arena_arithmetic_is_unrestricted_and_records_arena_fault_sites() {
-    // Arena pointer arithmetic is deliberately unchecked: the guard is a whole
-    // unmapped 512 GiB slot on each side of the window, so an escape by the
-    // ISA's 16-bit displacement is structurally impossible. Same bargain as
-    // `verifier.c:16186`, with more room.
+fn arena_arithmetic_is_bounded_and_records_arena_fault_sites() {
+    // The guard slots either side of the window are sized from the ISA's
+    // 16-bit displacement, so an escape *by immediate* is structurally
+    // impossible — that much of the original argument holds, and is why an
+    // in-window access still needs no explicit check beyond the window bound.
+    //
+    // What the argument does *not* cover, and what this test previously got
+    // wrong, is an escape by register-width arithmetic: `r0 *= 12345` leaves
+    // the offset unknown, and no guard slot bounds an unknown u64.
     let k = [kfunc(
         "arena_base",
         NO_ARGS,
         ptr_desc(PtrKind::Arena, ValidityDomain::Static, ArgFlags::NONE),
         Context::Atomic,
     )];
-    let v = check_full(
+    // Unknown offset: rejected.
+    let err = check_full(
         &[
             call(0),
             alu(AluOp::Mul, 0, 12345),
@@ -1471,7 +1481,21 @@ fn arena_arithmetic_is_unrestricted_and_records_arena_fault_sites() {
         &k,
         Context::Atomic,
     )
-    .expect("arena arithmetic needs no proof");
+    .expect_err("an unknown arena offset must not verify");
+    assert!(
+        matches!(err, VerifyError::ArenaOutOfWindow { .. }),
+        "expected ArenaOutOfWindow, got {err:?}"
+    );
+
+    // In-window access: verifies, and still records the fault site the JIT
+    // needs, because an in-bounds arena page may simply not be populated.
+    let v = check_full(
+        &[call(0), st(Size::Dw, 0, 32767, 1), mov(0, 0), EXIT],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("an in-window arena store is fine");
     assert!(v.uses_arena);
     assert_eq!(v.fault_sites.len(), 1);
     assert!(v.fault_sites[0].arena);
@@ -1826,4 +1850,76 @@ fn divergence_is_reported_not_hung() {
     // exactly the outcome the cap exists to prevent.
     assert!(crate::fixpoint::fixpoint_round_budget(0) > 0);
     assert!(crate::fixpoint::fixpoint_round_budget(1_000_000) > 0);
+}
+
+// ── faulting pointer classes are still bounds-checked ───────────────
+
+/// The review's proof-of-concept, verbatim in shape: take an
+/// attacker-controlled word out of the context, add it to a kfunc-returned
+/// object pointer, and dereference.
+fn arbitrary_access_program(write: bool) -> Vec<Decoded> {
+    let mut p = vec![
+        ldx(Size::Dw, 7, 1, 0),   // r7 = ctx[0] — attacker-controlled
+        call(0),                  // r0 = acquire() -> Option<Owned<T>>
+        jmp(CondOp::Eq, 0, 0, 5), // null path skips straight to the exit
+        movr(6, 0),
+        alur(AluOp::Add, 6, 7), // r6 = obj + attacker word
+    ];
+    if write {
+        p.push(stx(Size::Dw, 6, 0, 7));
+    } else {
+        p.push(ldx(Size::Dw, 8, 6, 0));
+    }
+    p.push(movr(1, 0));
+    p.push(call(1)); // release
+    p.push(mov(0, 0));
+    p.push(EXIT);
+    p
+}
+
+#[test]
+fn unbounded_arithmetic_on_an_object_pointer_is_rejected() {
+    // Before the fix this verified with `fault_sites=2`. The extable makes an
+    // *unmapped* address survivable; it does nothing for a mapped one, so an
+    // unbounded add to a live kernel object pointer is an arbitrary kernel
+    // read/write primitive, not a recoverable fault.
+    let k = [acquire_kfunc(), release_kfunc()];
+    for write in [false, true] {
+        let err = check_full(
+            &arbitrary_access_program(write),
+            &[ArgDesc::SCALAR64],
+            &k,
+            Context::Atomic,
+        )
+        .expect_err("unbounded arithmetic on an object pointer must be rejected");
+        assert!(
+            matches!(err, VerifyError::OpaqueDeref { .. }),
+            "expected OpaqueDeref, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn even_a_constant_offset_into_an_opaque_object_is_rejected() {
+    // Constant does not mean safe: the constant is in an attacker-supplied
+    // program, and without BTF nothing says how large the object is. Linux
+    // permits field access only because `btf_struct_access()` can check the
+    // offset names a real field. Until NARF has that, a `Trusted<T>` is a
+    // handle to hand back to a kfunc, not something to dereference.
+    let k = [acquire_kfunc(), release_kfunc()];
+    let prog = &[
+        call(0),
+        jmp(CondOp::Eq, 0, 0, 3),
+        ldx(Size::Dw, 8, 0, 16), // constant field offset
+        movr(1, 0),
+        call(1),
+        mov(0, 0),
+        EXIT,
+    ];
+    let err = check_full(prog, &[], &k, Context::Atomic)
+        .expect_err("opaque object dereference must be rejected");
+    assert!(
+        matches!(err, VerifyError::OpaqueDeref { .. }),
+        "expected OpaqueDeref, got {err:?}"
+    );
 }

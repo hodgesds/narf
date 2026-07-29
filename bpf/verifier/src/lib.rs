@@ -231,6 +231,25 @@ pub enum VerifyError {
     StackTooDeep { needed: u32, limit: u32 },
     /// A malformed kfunc descriptor was supplied.
     Kfunc(KfuncError),
+    /// A dereference of an opaque object pointer.
+    ///
+    /// A `Trusted<T>`/`Owned<T>` is a handle to hand back to a kfunc, not
+    /// something to load through: without BTF nothing says how large the
+    /// object is, so no offset — constant or otherwise — can be proved in
+    /// bounds. Linux permits field access only because `btf_struct_access()`
+    /// can check the offset names a real field.
+    ///
+    /// The exception table does not help here. It makes an *unmapped* address
+    /// survivable; it does nothing for a mapped one, so an unchecked object
+    /// access is an arbitrary kernel read/write primitive rather than a
+    /// recoverable fault.
+    OpaqueDeref { at: u32, reg: u8 },
+    /// An arena access whose offset could not be proved inside the window.
+    ///
+    /// The guard slots are derived from the ISA's 16-bit displacement, so
+    /// they catch an escape by immediate — not one by register-width
+    /// arithmetic.
+    ArenaOutOfWindow { at: u32, reg: u8 },
     /// The abstract-interpretation fixpoint did not converge within its round
     /// budget.
     ///
@@ -257,6 +276,15 @@ impl From<KfuncError> for VerifyError {
 /// a budget rather than a hard architectural constraint — see
 /// `bpf/specification/spec.md` §1.5.
 pub const MAX_STACK_BYTES: u32 = 16 * 1024;
+
+/// Size of the arena window an in-program arena pointer may address.
+///
+/// The guard slots either side are derived from the ISA's 16-bit displacement
+/// — the trick NARF keeps from `kernel/bpf/arena.c:45` — so an escape *by
+/// immediate* lands in unmapped VA and is caught by the exception table. An
+/// escape by register-width arithmetic is not covered by that argument, which
+/// is why the verifier bounds the computed offset against this explicitly.
+pub const ARENA_WINDOW_BYTES: u64 = 4 << 30;
 
 /// Default starting fuel.
 ///

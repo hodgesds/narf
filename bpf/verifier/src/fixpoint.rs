@@ -738,12 +738,55 @@ impl Analysis<'_, '_> {
         let bytes = size.bytes();
 
         if p.class.is_faulting() {
-            // Object and arena accesses are emitted unchecked; a fault zeroes
-            // the destination register and resumes at the next instruction.
-            // That is what makes `task->mm->owner` safe to write without a
-            // null test, and it is why `fault_sites` exists — the JIT must
-            // have an extable entry registered *before* the text is published
-            // (spec §4.3).
+            // A faulting class still has to be proved in bounds first.
+            //
+            // The exception table makes an *unmapped* address survivable; it
+            // does nothing for a mapped one. Treating "it faults safely" as
+            // "it needs no bounds check" turned unbounded arithmetic on a
+            // live kernel object into an arbitrary read/write primitive —
+            // six instructions, verified clean, with a recorded fault site.
+            match p.class {
+                PtrClass::Object => {
+                    // No BTF, so nothing says how large the object is and no
+                    // offset can be proved to land inside it — not even a
+                    // constant one, since the constant comes from an
+                    // attacker-supplied program. Linux permits field access
+                    // only because `btf_struct_access()` can check the offset
+                    // names a real field.
+                    //
+                    // So a `Trusted<T>`/`Owned<T>` is a handle to hand back to
+                    // a kfunc, not something to load through. This is
+                    // deliberately stricter than Linux and lifts when a type
+                    // registry lands.
+                    return Err(VerifyError::OpaqueDeref {
+                        at,
+                        reg: reg.index(),
+                    });
+                }
+                PtrClass::Arena => {
+                    // The guard slots are sized from the ISA's 16-bit
+                    // displacement (the derivation NARF keeps from
+                    // `kernel/bpf/arena.c:45`), so they catch an escape by
+                    // immediate. They do not catch one by register-width
+                    // arithmetic, which is what this bound is for.
+                    if addr.min < 0
+                        || (addr.max as u64).saturating_add(bytes) > crate::ARENA_WINDOW_BYTES
+                    {
+                        return Err(VerifyError::ArenaOutOfWindow {
+                            at,
+                            reg: reg.index(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+
+            // Past the bounds check, the extable covers what remains: the
+            // object may have been freed, or the arena page may not be
+            // populated. A fault zeroes the destination register and resumes
+            // at the next instruction, which is why `fault_sites` exists — the
+            // JIT must register an extable entry *before* the text is
+            // published (spec §4.3).
             if p.class == PtrClass::Arena {
                 self.uses_arena = true;
             }
