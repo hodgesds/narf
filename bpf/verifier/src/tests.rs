@@ -33,6 +33,7 @@ const fn ptr_const(kind: PtrKind, domain: ValidityDomain, flags: ArgFlags) -> Ar
 
 fn desc(args: &'static [ArgDesc], ret: ArgDesc, context: Context) -> KfuncDesc {
     KfuncDesc {
+        id: 0,
         name: "test_kfunc",
         addr: 0x1000,
         args,

@@ -957,16 +957,23 @@ impl Analysis<'_, '_> {
         i: u32,
         id: i32,
     ) -> Result<(), VerifyError> {
-        // `imm` indexes the kfunc table the loader resolved for this program.
+        // `imm` carries the kfunc's *id*, and resolution is a search on that
+        // id — deliberately not an index into `prog.kfuncs`. Indexing would
+        // couple every compiled program to the order in which the loader
+        // enumerates the registry, so registering one more kfunc would
+        // silently re-target existing programs' calls.
+        //
         // Linux puts a BTF id here and looks it up against a global registry
         // plus a hardcoded `special_kfunc_list[]` of ~60 ids the verifier
-        // knows by name; here resolution has already happened, and the
-        // verifier's entire model of a kfunc is its descriptor.
-        let idx = usize::try_from(id).map_err(|_| VerifyError::UnknownKfunc { at, id })?;
+        // knows by name (`verifier.c:13911`); here the verifier's entire
+        // model of a kfunc is its descriptor, so there is nothing to
+        // special-case. Linear scan: the registry is a closed, audited set of
+        // tens of entries, and this runs once per call site at load time.
         let desc = *self
             .prog
             .kfuncs
-            .get(idx)
+            .iter()
+            .find(|d| d.id == id)
             .ok_or(VerifyError::UnknownKfunc { at, id })?;
 
         if !self.prog.context.permits(desc.context) {

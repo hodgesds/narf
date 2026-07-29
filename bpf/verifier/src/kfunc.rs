@@ -320,6 +320,24 @@ impl Context {
 /// `probe!` collects `.note.narf.probes`.
 #[derive(Copy, Clone, Debug)]
 pub struct KfuncDesc {
+    /// The id a `call` instruction's `imm` carries to name this kfunc.
+    ///
+    /// Resolution is by *id*, not by position in [`Program::kfuncs`]. That
+    /// distinction is load-bearing: making `imm` an index would silently
+    /// couple every compiled program to the order in which the loader happens
+    /// to enumerate the registry, so adding a kfunc would re-target existing
+    /// programs' calls. The id is stable across builds and independent of
+    /// registration order.
+    ///
+    /// Linux puts a BTF id here and resolves against a global registry plus a
+    /// hardcoded `special_kfunc_list[]` of ~60 ids the verifier knows by name
+    /// (`verifier.c:13911`). Here the verifier's entire model of a kfunc is
+    /// this descriptor, so there is nothing to special-case.
+    ///
+    /// No value is reserved: `KfuncDesc` has no `Default`, so every
+    /// construction site is forced by the compiler to spell `id` out, and
+    /// there is nothing a sentinel would catch that the type system does not.
+    pub id: i32,
     /// The symbol name, as programs refer to it.
     pub name: &'static str,
     /// Address of the `extern "C"` shim.

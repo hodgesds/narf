@@ -85,6 +85,11 @@ impl KfuncEntry {
     #[must_use]
     pub fn desc(&self) -> KfuncDesc {
         KfuncDesc {
+            // The verifier resolves a `call` by matching this id against the
+            // instruction's `imm`, so it must be the same hash `id()` hands
+            // out to whoever emitted the program. Leaving it unset would make
+            // every kfunc call fail to resolve — fail-closed, but silently.
+            id: self.id(),
             name: self.name,
             addr: self.shim as usize,
             args: self.args,

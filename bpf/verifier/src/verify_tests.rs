@@ -125,11 +125,20 @@ fn check_full(
     context: Context,
 ) -> Result<VerifiedProgram, VerifyError> {
     let image = encode_all(insns);
+    // Stamp ids by position. Resolution in the verifier is by *id*, never by
+    // index — but the tests are far more readable when `call(N)` names the
+    // Nth kfunc, so the harness keeps the two in step rather than making
+    // every test invent and thread an id.
+    let kfuncs: Vec<KfuncDesc> = kfuncs
+        .iter()
+        .enumerate()
+        .map(|(i, k)| KfuncDesc { id: i as i32, ..*k })
+        .collect();
     verify(&Program {
         insns: &image,
         context,
         ctx_fields,
-        kfuncs,
+        kfuncs: &kfuncs,
     })
 }
 
@@ -167,6 +176,8 @@ const fn ptr_desc(kind: PtrKind, domain: ValidityDomain, flags: ArgFlags) -> Arg
     }
 }
 
+/// Build a test kfunc. `id` is a placeholder — `check_full` stamps ids by
+/// position, so `call(N)` names the Nth entry of the slice a test passes.
 fn kfunc(
     name: &'static str,
     args: &'static [ArgDesc],
@@ -174,6 +185,7 @@ fn kfunc(
     context: Context,
 ) -> KfuncDesc {
     KfuncDesc {
+        id: 0,
         name,
         addr: 0x1000,
         args,
