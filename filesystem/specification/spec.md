@@ -172,6 +172,10 @@ Open file descriptions retain the mount ID visible at open time, including for
 ancestor mount ID as each entry's parent for `/proc/<pid>/mountinfo`.
 The procfs view hides mounts outside the queried task's root and projects that
 root to `/`, so a chrooted task never sees backing prefixes such as `/mnt`.
+This per-task mountinfo projection is wired for every Linux-compat build,
+independently of optional container namespaces: service managers use
+`CLONE_NEWNS` for sandboxing and must observe private stacked file binds before
+they remount them read-only.
 Recursive bind mounts rebase every visible descendant mount beneath the new
 target, preserving nested API mounts such as cgroup2 beneath a bound `/sys`.
 A recursive bind whose normalized source and target are identical stacks the

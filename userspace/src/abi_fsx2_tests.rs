@@ -694,6 +694,12 @@ fn smoke_abi_fsx2_mount_bind_remount_private_file_pos() -> TestResult {
         const MS_BIND: u64 = 1 << 12;
 
         let result = (|| {
+            // Direct PID 1 runs with its root published at /mnt. Exercise
+            // the same root-relative paths that systemd hands to mount(2),
+            // while the mount namespace stores the resolved host paths.
+            if !crate::handlers::install_root_dir(FAKE_TASK, "/abi-private-root") {
+                return Err("test root installation failed");
+            }
             if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
                 return Err("private mount namespace setup failed");
             }
@@ -719,6 +725,41 @@ fn smoke_abi_fsx2_mount_bind_remount_private_file_pos() -> TestResult {
             };
             let _ = call(Syscall::Close.raw(), a0(fd as u64));
 
+            // ProtectHostname= takes this exact Linux path: first bind the
+            // procfs control FILE onto itself, which must stack a distinct
+            // mount in the private namespace; only then remount that top
+            // layer read-only. A plain remount test is insufficient: it
+            // misses the file-rooted stack that systemd observes through
+            // mountinfo while constructing a service sandbox.
+            let rooted_file = "/abi-private-root/abi-private-proc/sys/kernel/domainname";
+            let before_bind = crate::handlers::current_mount_namespace()
+                .and_then(|ns| ns.mount_id_at(rooted_file));
+            let bind = SyscallArgs {
+                arg0: file.as_ptr() as u64,
+                arg1: file.as_ptr() as u64,
+                arg2: 0,
+                arg3: MS_BIND,
+                ..Default::default()
+            };
+            if call(Syscall::Mount.raw(), bind) != Some(0) {
+                return Err("self-bind of a procfs control file must succeed");
+            }
+            let after_bind = crate::handlers::current_mount_namespace()
+                .and_then(|ns| ns.mount_id_at(rooted_file));
+            if !matches!((before_bind, after_bind), (Some(before), Some(after)) if after != before)
+            {
+                return Err("self-bind must stack a distinct private file mount");
+            }
+            let mountinfo = crate::handlers::proc_ns_mountinfo(FAKE_TASK)
+                .ok_or("private mount namespace must render mountinfo")?;
+            if !mountinfo.lines().any(|line| {
+                line.split('\t').nth(2) == Some("/abi-private-proc/sys/kernel/domainname")
+            }) {
+                return Err(
+                    "mountinfo must expose the stacked file mount at its root-relative path",
+                );
+            }
+
             let remount = SyscallArgs {
                 arg0: 0,
                 arg1: file.as_ptr() as u64,
@@ -732,6 +773,7 @@ fn smoke_abi_fsx2_mount_bind_remount_private_file_pos() -> TestResult {
             }
         })();
         crate::handlers::clear_current_mount_namespace_for_test();
+        crate::handlers::__test_root_dir_reset();
         result
     })
 }

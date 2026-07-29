@@ -32,8 +32,18 @@ pub fn install_all_hooks() {
     install_net_stack();
     #[cfg(feature = "linux-compat")]
     install_procfs_net_hooks();
+    #[cfg(feature = "linux-compat")]
+    install_proc_mountinfo_hook();
     #[cfg(all(feature = "linux-compat", feature = "container"))]
     install_ns_proc_hooks();
+}
+
+/// Mount namespaces back Linux service sandboxing even when the broader
+/// container feature is disabled. Their `/proc/self/mountinfo` view must
+/// therefore be wired independently of the container-only namespace hooks.
+#[cfg(feature = "linux-compat")]
+fn install_proc_mountinfo_hook() {
+    narf_filesystem::procfs::install_mountinfo_hook(narf_userspace::handlers::proc_ns_mountinfo);
 }
 
 /// Wire the namespace procfs hooks so /proc/<pid>/ns/*, uid_map,

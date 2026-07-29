@@ -9891,7 +9891,6 @@ fn current_move_mount(
 }
 
 /// Look up the mount namespace of an arbitrary task by id.
-#[cfg(feature = "container")]
 pub fn mount_namespace_of(task: u64) -> Option<alloc::sync::Arc<narf_filesystem::MountNamespace>> {
     let g = TASK_MOUNT_NS.lock();
     g.as_ref().and_then(|m| m.get(&task).cloned())
@@ -9954,7 +9953,7 @@ pub fn proc_ns_readlink(pid: u64, tag: u8) -> Option<alloc::string::String> {
 
 /// `/proc/<pid>/mountinfo` per-ns view — None when the task rides the
 /// global mount registry (procfs then renders the global view).
-#[cfg(all(feature = "container", feature = "linux-compat"))]
+#[cfg(feature = "linux-compat")]
 pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
     let ns = mount_namespace_of(task)?;

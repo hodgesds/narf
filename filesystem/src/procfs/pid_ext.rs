@@ -1034,6 +1034,31 @@ kernel_test_in!(
     smoke_mountinfo_at_least_one_line
 );
 
+/// A mountinfo renderer installed independently of the optional container
+/// namespace bundle must be consumed by the actual procfs file renderer.
+/// This is the production path systemd uses after `CLONE_NEWNS` and a stacked
+/// file bind, before its bind-remount pass.
+fn mountinfo_hook_for_stacked_file_test(pid: u64) -> Option<String> {
+    (pid == 0x4d49).then(|| String::from("41\t40\t/proc/sys/kernel/domainname\tproc"))
+}
+
+fn smoke_mountinfo_uses_installed_namespace_hook() -> TestResult {
+    super::install_mountinfo_hook(mountinfo_hook_for_stacked_file_test);
+    let out = render_mountinfo(0x4d49);
+    if out.lines().any(|line| {
+        line.split_whitespace().nth(4) == Some("/proc/sys/kernel/domainname")
+            && line.contains(" - proc proc rw")
+    }) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("render_mountinfo did not use its installed namespace hook")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_mountinfo_uses_installed_namespace_hook
+);
+
 /// Smoke: `render_wchan` for an unknown pid (no task-info hook)
 /// returns "0\n" because the fallback state is 'R'.
 fn smoke_wchan_unknown_pid_returns_zero() -> TestResult {
