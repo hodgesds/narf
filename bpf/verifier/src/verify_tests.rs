@@ -1923,3 +1923,65 @@ fn even_a_constant_offset_into_an_opaque_object_is_rejected() {
         "expected OpaqueDeref, got {err:?}"
     );
 }
+
+// ── null tests must be 64-bit to refine a pointer ───────────────────
+
+#[test]
+fn a_32bit_null_test_does_not_release_the_reference() {
+    // `(u32)ptr == 0` does not imply `ptr == 0`. Treating it as a null test
+    // meant a one-bit opcode change — JEQ32 for JEQ64 — convinced the verifier
+    // an acquired reference had been released. At run time any object whose
+    // low 32 bits happen to be zero (page-aligned, or any handle-shaped
+    // return) takes the branch and leaks the refcount permanently.
+    //
+    // The sharper form is locks: Option<Guard<'_>> acquires a lock reference
+    // the same way, so the same substitution makes the verifier believe the
+    // lock was dropped, and `kill_at_await` then finds nothing to kill. That
+    // is spec §4.4 — the one rule covering sleep safety, lock discipline and
+    // reference tracking — defeated by a choice of jump width.
+    // The two programs below differ in exactly one bit — the jump class —
+    // so the assertion cannot pass for an unrelated reason.
+    let k = [acquire_kfunc(), release_kfunc()];
+    let err = check_full(&null_check_program(false), &[], &k, Context::Atomic)
+        .expect_err("a 32-bit null test must not discharge the reference");
+    // PossiblyNull, not LeakedReference: with no refinement the pointer stays
+    // nullable, so handing it to `release(Owned<T>)` is caught before the
+    // program can reach an exit still holding the reference. Either would be
+    // a sound rejection; this is the one that actually fires, and asserting
+    // the specific variant keeps the test honest about what the verifier does.
+    assert!(
+        matches!(err, VerifyError::PossiblyNull { at: 3, .. }),
+        "expected PossiblyNull at the release call, got {err:?}"
+    );
+}
+
+#[test]
+fn a_64bit_null_test_still_releases_the_reference() {
+    // The control: the same program with JEQ64 is the idiomatic null check
+    // and must keep verifying, or the fix above would just be a ban on
+    // Option-returning kfuncs.
+    let k = [acquire_kfunc(), release_kfunc()];
+    check_full(&null_check_program(true), &[], &k, Context::Atomic)
+        .expect("a 64-bit null test discharges the reference");
+}
+
+/// acquire; if (ptr == 0) skip; release(ptr); exit
+///
+/// `wide` selects JEQ64 or JEQ32 and is the *only* difference between the two
+/// forms — which is the point: the narrow one must not be accepted.
+fn null_check_program(wide: bool) -> Vec<Decoded> {
+    vec![
+        call(0),
+        Decoded::JumpCond {
+            wide,
+            op: CondOp::Eq,
+            dst: r(0),
+            src: Source::Imm(0),
+            off: 2,
+        },
+        movr(1, 0),
+        call(1),
+        mov(0, 0),
+        EXIT,
+    ]
+}

@@ -1316,7 +1316,18 @@ impl Analysis<'_, '_> {
         // convention: a nullable result is unusable until a comparison against
         // zero has cleared the flag on one edge.
         if let (AbsValue::Ptr(p), AbsValue::Scalar(z)) = (d, s) {
-            if z.as_const() == Some(0) && matches!(pred, Pred::Eq | Pred::Ne) {
+            // `wide` is load-bearing: `(u32)ptr == 0` does not imply
+            // `ptr == 0`. Refining on a 32-bit compare let a one-bit opcode
+            // change — JEQ32 for JEQ64 — convince the verifier an acquired
+            // reference had been released, and at run time any object whose
+            // low 32 bits are zero would then leak its refcount. With a
+            // lock guard in place of an object it is worse: the verifier
+            // believes the lock was dropped, so `kill_at_await` finds nothing
+            // to kill and the program may sleep holding it.
+            //
+            // A narrow compare against zero simply says nothing about a
+            // pointer, so both edges keep the unrefined state.
+            if wide && z.as_const() == Some(0) && matches!(pred, Pred::Eq | Pred::Ne) {
                 let mut out = st.clone();
                 if pred == Pred::Eq {
                     if !p.nullable {
