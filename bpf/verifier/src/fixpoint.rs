@@ -1364,3 +1364,115 @@ fn value_of(d: &ArgDesc, ref_id: u32) -> AbsValue {
         }
     }
 }
+
+#[cfg(test)]
+mod pred_tests {
+    use super::*;
+
+    /// Evaluate a predicate concretely, so the negation table can be checked
+    /// against something other than itself.
+    fn holds(p: Pred, a: u64, b: u64) -> bool {
+        match p {
+            Pred::Eq => a == b,
+            Pred::Ne => a != b,
+            Pred::Gt => a > b,
+            Pred::Ge => a >= b,
+            Pred::Lt => a < b,
+            Pred::Le => a <= b,
+            Pred::Sgt => (a as i64) > (b as i64),
+            Pred::Sge => (a as i64) >= (b as i64),
+            Pred::Slt => (a as i64) < (b as i64),
+            Pred::Sle => (a as i64) <= (b as i64),
+            Pred::Set => (a & b) != 0,
+            Pred::NotSet => (a & b) == 0,
+        }
+    }
+
+    const ALL: &[Pred] = &[
+        Pred::Eq,
+        Pred::Ne,
+        Pred::Gt,
+        Pred::Ge,
+        Pred::Lt,
+        Pred::Le,
+        Pred::Sgt,
+        Pred::Sge,
+        Pred::Slt,
+        Pred::Sle,
+        Pred::Set,
+        Pred::NotSet,
+    ];
+
+    #[test]
+    fn negation_is_exact_for_every_predicate() {
+        // The fallthrough edge is refined by the *negated* predicate. If the
+        // table were wrong in either direction the verifier would apply a
+        // constraint that does not hold on that edge — which is the shape of
+        // bug that proves a false bound rather than merely rejecting a
+        // program. Checked against a concrete evaluator, not against itself.
+        let values: &[u64] = &[
+            0,
+            1,
+            2,
+            7,
+            0xff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x7fff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            u64::MAX,
+        ];
+        for &p in ALL {
+            assert_eq!(p.negate().negate(), p, "{p:?} is not an involution");
+            for &a in values {
+                for &b in values {
+                    assert_ne!(
+                        holds(p, a, b),
+                        holds(p.negate(), a, b),
+                        "{p:?} and its negation agree on ({a:#x}, {b:#x})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_isa_predicate_maps_into_pred() {
+        // `CondOp::Set` is the only one whose negation is not itself an
+        // opcode; everything else must round-trip through `Pred` unchanged.
+        for op in [
+            CondOp::Eq,
+            CondOp::Ne,
+            CondOp::Gt,
+            CondOp::Ge,
+            CondOp::Lt,
+            CondOp::Le,
+            CondOp::Sgt,
+            CondOp::Sge,
+            CondOp::Slt,
+            CondOp::Sle,
+            CondOp::Set,
+        ] {
+            let p = Pred::of(op);
+            assert!(ALL.contains(&p), "{op:?} mapped outside the predicate set");
+        }
+        assert_eq!(Pred::of(CondOp::Set).negate(), Pred::NotSet);
+    }
+
+    #[test]
+    fn signedness_classification_matches_the_predicates() {
+        // The 32-bit refinement gate depends on this: an unsigned comparison
+        // may be reflected from a value in `[0, u32::MAX]`, a signed one only
+        // from `[0, i32::MAX]`. Getting the classification wrong would let a
+        // signed `JMP32` refine a value whose sign the 64-bit view disagrees
+        // about.
+        for &p in ALL {
+            assert_eq!(
+                p.is_unsigned(),
+                !matches!(p, Pred::Sgt | Pred::Sge | Pred::Slt | Pred::Sle),
+                "{p:?}"
+            );
+            assert_eq!(p.is_unsigned(), p.negate().is_unsigned());
+        }
+    }
+}

@@ -454,6 +454,77 @@ fn overwriting_one_byte_of_a_spilled_pointer_destroys_it() {
 }
 
 #[test]
+fn a_slot_written_on_only_one_path_is_not_initialised_after_the_merge() {
+    // A byte is initialised only where it is initialised on *every* path — the
+    // join intersects, it does not union. Getting that backwards is the
+    // classic uninitialised-read hole, and it is invisible to any test that
+    // only exercises straight-line code.
+    //
+    //   0: r2 = ctx[0]
+    //   1: if r2 == 0 goto 3        ← skips the store
+    //   2: *(u64 *)(r10 - 8) = 1
+    //   3: r0 = *(u64 *)(r10 - 8)
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
+    assert_eq!(
+        check_ctx(
+            &[
+                ldx(Size::Dw, 2, 1, 0),
+                jmp(CondOp::Eq, 2, 0, 1),
+                st(Size::Dw, 10, -8, 1),
+                ldx(Size::Dw, 0, 10, -8),
+                EXIT,
+            ],
+            CTX,
+        )
+        .unwrap_err(),
+        VerifyError::UninitStack { at: 3, off: -8 }
+    );
+}
+
+#[test]
+fn a_slot_written_on_every_path_is_initialised_after_the_merge() {
+    // The positive counterpart, so the rule above cannot be satisfied by
+    // simply never believing a store.
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
+    check_ctx(
+        &[
+            ldx(Size::Dw, 2, 1, 0),
+            jmp(CondOp::Eq, 2, 0, 2),
+            st(Size::Dw, 10, -8, 1),
+            Decoded::Jump { off: 1 },
+            st(Size::Dw, 10, -8, 2),
+            ldx(Size::Dw, 0, 10, -8),
+            EXIT,
+        ],
+        CTX,
+    )
+    .expect("both arms write the slot");
+}
+
+#[test]
+fn a_pointer_spilled_on_only_one_path_is_not_a_pointer_after_the_merge() {
+    // The same rule one level up: a slot holding a pointer on one path and a
+    // scalar on the other holds neither afterwards.
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
+    let e = check_ctx(
+        &[
+            ldx(Size::Dw, 2, 1, 0),
+            jmp(CondOp::Eq, 2, 0, 2),
+            stx(Size::Dw, 10, -8, 10),
+            Decoded::Jump { off: 1 },
+            st(Size::Dw, 10, -8, 0),
+            ldx(Size::Dw, 3, 10, -8),
+            st(Size::Dw, 3, -16, 1),
+            mov(0, 0),
+            EXIT,
+        ],
+        CTX,
+    )
+    .unwrap_err();
+    assert_eq!(e, VerifyError::NotAPointer { at: 6, reg: 3 });
+}
+
+#[test]
 fn stack_access_above_the_frame_pointer_is_rejected() {
     assert_eq!(
         err(&[st(Size::Dw, 10, 0, 1), mov(0, 0), EXIT]),
@@ -1551,4 +1622,152 @@ fn verification_is_a_function_of_the_program_alone() {
     prog.push(EXIT);
     let v = ok(&prog);
     assert_eq!(v.insns.len(), 2002);
+}
+
+// ── The whole-program safety property ───────────────────────────────
+
+/// xorshift64*, so the corpus is reproducible without a dependency.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+fn random_size(rng: &mut Rng) -> Size {
+    match rng.below(4) {
+        0 => Size::B,
+        1 => Size::H,
+        2 => Size::W,
+        _ => Size::Dw,
+    }
+}
+
+/// A displacement biased towards the two edges that matter.
+///
+/// A uniform draw over the whole frame almost never lands within eight bytes
+/// of the frame pointer, which is exactly where a wide access straddles it —
+/// the case a bounds check is most likely to get wrong. Nor does it often
+/// reach past the budget. Both edges are sampled explicitly.
+fn random_off(rng: &mut Rng) -> i16 {
+    let mag = match rng.below(4) {
+        0 => rng.below(9),
+        1 => rng.below(64),
+        2 => rng.below(4096),
+        _ => rng.below(20_000),
+    };
+    -(mag.min(i16::MAX as u64) as i16)
+}
+
+/// A random program of stack traffic, arithmetic, and forward branches.
+///
+/// Only forward branches, so every generated program terminates and a trap
+/// means a real out-of-bounds rather than exhausted fuel.
+fn random_program(rng: &mut Rng, len: usize) -> Vec<Decoded> {
+    let mut out = Vec::with_capacity(len + 2);
+    for i in 0..len {
+        let remaining = (len - i) as i16;
+        out.push(match rng.below(9) {
+            0 => mov(rng.below(7) as u8, rng.next() as i32),
+            1 | 2 => {
+                // Manufacture a frame pointer at a random depth. The register
+                // pool is small on purpose: a store only reaches the stack if
+                // it names a register some earlier instruction pointed there.
+                let d = rng.below(4) as u8;
+                if rng.below(2) == 0 {
+                    movr(d, 10)
+                } else {
+                    alu(AluOp::Sub, d, rng.below(2048) as i32)
+                }
+            }
+            3 => alu(
+                [AluOp::Add, AluOp::Sub, AluOp::And, AluOp::Or, AluOp::Xor][rng.below(5) as usize],
+                rng.below(7) as u8,
+                rng.next() as i32,
+            ),
+            7 => alur(AluOp::Add, rng.below(7) as u8, rng.below(7) as u8),
+            4 => st(
+                random_size(rng),
+                rng.below(4) as u8,
+                random_off(rng),
+                rng.next() as i32,
+            ),
+            5 => stx(
+                random_size(rng),
+                rng.below(4) as u8,
+                random_off(rng),
+                rng.below(7) as u8,
+            ),
+            6 => ldx(
+                random_size(rng),
+                rng.below(7) as u8,
+                rng.below(4) as u8,
+                random_off(rng),
+            ),
+            _ => jmp(
+                CondOp::Gt,
+                rng.below(7) as u8,
+                rng.next() as i32,
+                rng.below(remaining.max(1) as u64) as i16,
+            ),
+        });
+    }
+    out.push(mov(0, 0));
+    out.push(EXIT);
+    out
+}
+
+#[test]
+fn every_program_the_verifier_accepts_runs_without_an_out_of_bounds_access() {
+    // The property the whole crate exists for, stated end to end: verification
+    // implies the concrete machine never leaves its stack. Most random
+    // programs are rejected — that is fine and expected — but every one that
+    // is *accepted* must run clean.
+    //
+    // The reference interpreter's stack is exactly the verifier's budget, so
+    // "accepted" and "in range" are the same statement and a trap here is a
+    // real hole rather than a modelling mismatch.
+    let mut rng = Rng(0x5EED_1234_5678_9ABC);
+    let mut accepted = 0usize;
+    for _ in 0..20_000 {
+        let len = 1 + rng.below(12) as usize;
+        let prog = random_program(&mut rng, len);
+        let image = encode_all(&prog);
+        let Ok(verified) = verify(&Program {
+            insns: &image,
+            context: Context::Atomic,
+            ctx_fields: &[],
+            kfuncs: &[],
+        }) else {
+            continue;
+        };
+        accepted += 1;
+        assert!(
+            verified.max_stack_bytes <= crate::MAX_STACK_BYTES,
+            "verified program claims {} bytes of stack",
+            verified.max_stack_bytes
+        );
+        let mut m = interp::Machine::new();
+        match interp::run(&image, &mut m) {
+            Ok(_) => {}
+            Err(interp::Trap::OutOfFuel) => {}
+            Err(t) => panic!("verified program trapped with {t:?}:\n{prog:#?}"),
+        }
+    }
+    // If the generator drifted into producing nothing acceptable, the test
+    // above would pass vacuously. It must not be allowed to.
+    assert!(
+        accepted > 200,
+        "only {accepted} of 20000 generated programs verified — the corpus has \
+         stopped exercising anything"
+    );
 }

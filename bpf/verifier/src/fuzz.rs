@@ -482,6 +482,55 @@ fn meet_is_exactly_intersection() {
 }
 
 #[test]
+fn is_subset_of_never_claims_a_containment_that_is_false() {
+    // The fixpoint stops when a block's input `is_subset_of` the previous one.
+    // A false positive here terminates the analysis on a state that has not
+    // converged — the abstract state would then be missing values the program
+    // can actually reach, and a bounds check derived from it would be a lie.
+    // This is the single most dangerous predicate in the crate.
+    let mut rng = Rng::new(26);
+    for _ in 0..50_000 {
+        let (a, avs) = sample_abstract(&mut rng);
+        let (b, _) = sample_abstract(&mut rng);
+        if !a.is_subset_of(&b) {
+            continue;
+        }
+        for &v in &avs {
+            assert!(b.contains(v), "{a:?} ⊑ {b:?} but {v:#x} escapes b");
+        }
+        // Sample beyond the generators too: anything in `a` must be in `b`.
+        for _ in 0..8 {
+            let v = a.tnum.value | (rng.next() & a.tnum.mask);
+            if a.contains(v) {
+                assert!(b.contains(v), "{a:?} ⊑ {b:?} but {v:#x} escapes b");
+            }
+        }
+    }
+}
+
+#[test]
+fn widening_is_extensive() {
+    // A widening must be an upper bound of *both* sides, or the fixpoint's
+    // ascending chain is not ascending and the convergence argument collapses.
+    let mut rng = Rng::new(27);
+    let thresholds = [-1i64, 0, 1, 8, 64, 4096];
+    for _ in 0..20_000 {
+        let (old, oldvs) = sample_abstract(&mut rng);
+        let (new, newvs) = sample_abstract(&mut rng);
+        let w = old.widen(&new, &thresholds);
+        for &v in oldvs.iter().chain(newvs.iter()) {
+            assert!(w.contains(v), "{old:?} ∇ {new:?} = {w:?} lost {v:#x}");
+        }
+        // Widening the same value twice must be stable, or a loop header would
+        // keep reporting "changed" forever.
+        assert!(
+            w.widen(&w, &thresholds).is_subset_of(&w),
+            "widening is not idempotent at {w:?}"
+        );
+    }
+}
+
+#[test]
 fn widening_covers_the_new_value() {
     let mut rng = Rng::new(23);
     let thresholds = [-1i64, 0, 1, 8, 64, 4096, i64::from(i32::MAX)];

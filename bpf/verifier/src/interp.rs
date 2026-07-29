@@ -32,7 +32,13 @@ use crate::domain::{
 
 /// Bytes of stack the reference interpreter provides. R10 points one past the
 /// top; offsets are negative.
-pub const STACK_BYTES: usize = 512;
+///
+/// Deliberately the same as the verifier's budget, so that "the verifier
+/// accepted this stack access" and "the concrete machine can perform it" are
+/// the same statement. A smaller concrete stack would make the program-level
+/// safety differential report false traps for accesses the verifier was right
+/// to allow.
+pub const STACK_BYTES: usize = crate::MAX_STACK_BYTES as usize;
 
 /// Why a concrete run stopped early.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
