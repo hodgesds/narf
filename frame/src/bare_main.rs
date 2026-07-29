@@ -3585,7 +3585,6 @@ fn boot_userspace_init() {
         let envp = [
             "container=narf",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "SYSTEMD_LOG_TARGET=console",
         ];
         // SAFETY: boot has the loader's identity mapping and frame allocator.
         let proc =
@@ -3600,7 +3599,6 @@ fn boot_userspace_init() {
                 }
             };
         let pid = proc.pid;
-        let entry = proc.entry.0.as_u64();
         let pending = narf_userspace::user_task::prepare_user_process_initial(
             proc,
             narf_scheduler::TaskSpec::unthrottled(),
@@ -3619,12 +3617,6 @@ fn boot_userspace_init() {
         narf_filesystem::cgroupfs::attach_to_root(pid.raw());
         narf_userspace::handlers::set_proc_argv(tid.raw(), &argv);
         narf_userspace::handlers::set_proc_comm(tid.raw(), name);
-        let _ = writeln!(
-            console::Writer,
-            "  boot-init: spawning {name} directly as pid={} entry={:#x}",
-            pid.raw(),
-            entry
-        );
         pending.spawn();
         true
     }
