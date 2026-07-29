@@ -700,6 +700,24 @@ fn smoke_userspace_fcntl_flags_round_trip() -> TestResult {
         _ => return TestResult::Fail("F_GETFD did not round-trip FD_CLOEXEC"),
     }
 
+    // Linux checks that the fd is open before it dispatches the fcntl command.
+    // D-Bus probes inherited descriptors with F_GETFD; reporting NARF's
+    // internal InvalidOp as a successful zero makes every closed descriptor
+    // look valid and causes it to walk a bogus inherited-fd set.
+    let mut bad_ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: target.saturating_add(100) as u64,
+            arg1: F_GETFD,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut bad_ctx);
+    match bad_ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value as i64 == -9 => {}
+        _ => return TestResult::Fail("F_GETFD on a closed fd did not return -EBADF"),
+    }
+
     fd::__test_reset();
     __test_clear_global();
     TestResult::Pass
