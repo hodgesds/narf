@@ -50,10 +50,25 @@ pub trait BpfStack {
 
 /// A borrowed BPF stack frame. Releasing is `Drop`, so an early return from
 /// the interpreter cannot leak a per-CPU slot.
+///
+/// **Not `Send`.** A per-CPU frame is only valid on the CPU that claimed it,
+/// and the release must land on *that* CPU's flag. Making the type `!Send`
+/// makes any future holding one `!Send` too, so it cannot be handed to
+/// `narf_scheduler::spawn` and cannot be work-stolen mid-run — the migration
+/// is prevented rather than detected.
 #[derive(Debug)]
 pub struct StackFrame<'a> {
     bytes: &'a mut [u8],
-    release: Option<fn()>,
+    /// Called with the CPU index recorded at acquire time — never with
+    /// `current_cpu()` re-read at drop. Re-reading was a real bug: a task
+    /// that migrated between acquire and drop cleared the *wrong* CPU's flag,
+    /// leaking the original CPU's cell forever (it would decline every later
+    /// program) and clearing a flag whose cell was still live, handing the
+    /// same `&mut [u8]` out twice.
+    release: Option<(fn(usize), usize)>,
+    /// `*mut ()` is the standard way to opt out of `Send`/`Sync` without the
+    /// unstable `negative_impls`. Never dereferenced.
+    _not_send: core::marker::PhantomData<*mut ()>,
 }
 
 impl StackFrame<'_> {
@@ -80,8 +95,8 @@ impl StackFrame<'_> {
 
 impl Drop for StackFrame<'_> {
     fn drop(&mut self) {
-        if let Some(f) = self.release {
-            f();
+        if let Some((f, cpu)) = self.release {
+            f(cpu);
         }
     }
 }
@@ -104,6 +119,14 @@ struct PerCpuFrames {
 // cell because the depth counter declines the second acquire. This is the
 // same argument the per-CPU slab magazine makes (`memory/src/slab.rs`), and
 // it has the same load-bearing precondition: IRQs masked across the RMW.
+//
+// An earlier version of this comment also leaned on "handlers run under
+// `dispatch::fire()` with IRQs masked for their whole duration". That premise
+// was removed by this same series — `fire()` now drops its lock, and restores
+// IRQs, before invoking a handler — so the frame is held across a preemptible
+// region. What closes the gap is not IRQ masking but `StackFrame` being
+// `!Send` (so the frame cannot migrate) and carrying the CPU index it was
+// claimed on (so the release cannot land on the wrong flag even if it did).
 unsafe impl Sync for PerCpuFrames {}
 
 static FRAMES: PerCpuFrames = PerCpuFrames {
@@ -123,9 +146,19 @@ static DECLINED: AtomicUsize = AtomicUsize::new(0);
 #[derive(Copy, Clone, Debug, Default)]
 pub struct PerCpuStackStub;
 
-fn release_current_cpu() {
+/// Release the frame belonging to `cpu` — the CPU recorded at acquire time.
+///
+/// Deliberately takes the index rather than calling `current_cpu()`. See
+/// [`StackFrame::release`].
+fn release_cpu(cpu: usize) {
     without_interrupts(|| {
-        let cpu = current_cpu();
+        debug_assert_eq!(
+            cpu,
+            current_cpu(),
+            "a per-CPU BPF frame was released on a different CPU than it was \
+             claimed on — StackFrame is !Send precisely to make this \
+             impossible, so reaching here means something moved it anyway"
+        );
         IN_USE[cpu].store(0, Ordering::Release);
     });
 }
@@ -162,7 +195,8 @@ impl BpfStack for PerCpuStackStub {
         frame.fill(0);
         Some(StackFrame {
             bytes: frame,
-            release: Some(release_current_cpu),
+            release: Some((release_cpu, cpu)),
+            _not_send: core::marker::PhantomData,
         })
     }
 }
@@ -222,6 +256,12 @@ impl BpfStack for HeapStack {
         Some(StackFrame {
             bytes: frame,
             release: None,
+            // A heap stack is owned by the future and is not per-CPU, so it
+            // would be safe to move. It inherits `!Send` anyway rather than
+            // splitting the type — a sleepable program's frame moving between
+            // CPUs is fine, but nothing needs it to, and one shape is easier
+            // to reason about than two.
+            _not_send: core::marker::PhantomData,
         })
     }
 }

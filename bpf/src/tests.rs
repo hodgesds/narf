@@ -719,3 +719,33 @@ fn smoke_bpf_interp_wrapping_ctx_access_traps() -> TestResult {
     }
 }
 kernel_test_in!("bpf", smoke_bpf_interp_wrapping_ctx_access_traps);
+
+fn smoke_bpf_percpu_frame_is_released_to_its_own_cpu() -> TestResult {
+    // The per-CPU slot must be reusable after a program finishes. The bug
+    // this guards: `release` used to re-read `current_cpu()` at drop, so a
+    // task that migrated between acquire and drop cleared the *wrong* CPU's
+    // flag — the original CPU's cell then stayed claimed forever and declined
+    // every later program, while another CPU's live cell was handed out
+    // twice. `StackFrame` is now `!Send` and carries its CPU index.
+    //
+    // A migration cannot be provoked from a smoke, so this checks the
+    // observable consequence: repeated acquire/release cycles keep working
+    // and nothing is declined.
+    let before = crate::mem::declined_count();
+    for _ in 0..64 {
+        let insns = asm(&[mov_imm(0, 1), EXIT]);
+        let Ok(p) = load("reuse", insns, Context::Atomic) else {
+            return TestResult::Fail("load rejected a trivial program");
+        };
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(1)) => {}
+            Some(_) => return TestResult::Fail("trivial program did not return 1"),
+            None => return TestResult::Fail("per-CPU frame was not released"),
+        }
+    }
+    if crate::mem::declined_count() != before {
+        return TestResult::Fail("a frame leaked — a later acquire was declined");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_percpu_frame_is_released_to_its_own_cpu);
