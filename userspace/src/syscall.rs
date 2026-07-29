@@ -691,8 +691,9 @@ pub enum Syscall {
     /// `put_old` (an absolute path under the new root). Used by
     /// container-init to drop the bootstrap root after mounting
     /// the new image. arg0 = new_root ptr, arg1 = new_root len,
-    /// arg2 = put_old ptr, arg3 = put_old len. Returns 0 / !0u64.
-    /// Gated behind `linux-compat` + `container`.
+    /// Returns 0 / !0u64. Part of `linux-compat`: service managers use it
+    /// after a private `CLONE_NEWNS` sandbox even without the broader
+    /// container namespace feature.
     PivotRoot,
 
     /// `sigreturn()` — restore the calling task's user-mode trap
@@ -2607,7 +2608,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setrlimit, 160),
     #[cfg(feature = "linux-compat")]
     (Syscall::Chroot, 161),
-    #[cfg(all(feature = "linux-compat", feature = "container"))]
+    #[cfg(feature = "linux-compat")]
     (Syscall::PivotRoot, 155),
     (Syscall::Mount, 165),
     (Syscall::Umount2, 166),
@@ -2762,7 +2763,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Renameat, 38),
     (Syscall::Umount2, 39),
     (Syscall::Mount, 40),
-    #[cfg(all(feature = "linux-compat", feature = "container"))]
+    #[cfg(feature = "linux-compat")]
     (Syscall::PivotRoot, 41),
     #[cfg(feature = "linux-compat")]
     (Syscall::Chroot, 51),

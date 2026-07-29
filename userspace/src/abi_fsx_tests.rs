@@ -729,12 +729,11 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_relative_dot);
 
 // ── pivot_root ────────────────────────────────────────────────────────
 //
-// arg0/arg1 = new_root ptr/len, arg2/arg3 = put_old ptr/len. Both must be
-// absolute and new_root must resolve to an existing path. NOTE: under the
-// harness this handler is only present with feature "container"; the test
-// still compiles unconditionally and asserts the negative (failure)
-// behaviour, which the table reports as -1 / OK either way (a missing slot
-// in kernel_syscall_entry returns its own failure shape).
+// arg0/arg1 = new_root/put_old C-string pointers. The handler is part of the
+// Linux-compat syscall surface, independently of the optional container
+// namespace bundle: systemd uses pivot_root while constructing a service
+// sandbox after CLONE_NEWNS. A missing syscall-table slot returns EPERM and
+// turns that otherwise valid setup into 226/NAMESPACE.
 
 fn smoke_abi_fsx_pivot_root_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
@@ -747,12 +746,12 @@ fn smoke_abi_fsx_pivot_root_neg() -> TestResult {
         let new_root = b"nonexistent-dir\0";
         let put_old = b"/abi\0";
         let args = a2(new_root.as_ptr() as u64, put_old.as_ptr() as u64, 0);
-        // The pivot_root slot may also be absent (no "container" feature) — then
-        // the entry reports a non-Ok status and `call` is None. Accept either
-        // failure shape.
+        // This exercises the installed dispatcher slot, not just the handler
+        // directly. The missing path must reach pivot_root and fail normally.
         match call(Syscall::PivotRoot.raw(), args) {
-            Some(-1) | None => Ok(()),
+            Some(-1) => Ok(()),
             Some(_) => Err("pivot_root with an unresolvable new_root must fail"),
+            None => Err("linux-compat pivot_root must be present in the syscall table"),
         }
     })
 }
