@@ -143,6 +143,19 @@ pub fn run(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
     })
 }
 
+/// Worklist rounds allowed before we declare the fixpoint divergent.
+///
+/// Generous: with a sound widening operator a block re-enters the worklist a
+/// small constant number of times, so anything approaching this is a bug in
+/// the lattice rather than an unusually hard program. Sized off the block
+/// count so a large program is not penalised for being large, and saturating
+/// so the arithmetic itself cannot be the overflow.
+pub(crate) fn fixpoint_round_budget(blocks: usize) -> u64 {
+    const PER_BLOCK: u64 = 512;
+    const FLOOR: u64 = 16_384;
+    (blocks as u64).saturating_mul(PER_BLOCK).max(FLOOR)
+}
+
 fn align8(n: u32) -> u32 {
     n.div_ceil(8) * 8
 }
@@ -264,7 +277,30 @@ impl Analysis<'_, '_> {
         in_state[entry_block as usize] = Some(entry);
         let mut worklist = vec![entry_block];
 
+        // Hard cap on worklist rounds.
+        //
+        // Termination is supposed to be structural — a finite-height lattice
+        // plus a widening operator at every back-edge target. This cap is the
+        // backstop for that argument being *wrong*, and it has already earned
+        // its place: stack slots were joined rather than widened, so any value
+        // carried around a loop through a slot climbed forever. Without a cap
+        // that is not a slow load, it is a kernel hang — `verify()` runs
+        // synchronously inside `sys_bpf` with no yield point, and the
+        // scheduler does not tick inside a syscall.
+        //
+        // Exceeding it is a verifier bug, not a program bug, so it is worth
+        // reporting distinctly from an ordinary rejection.
+        let mut rounds = 0u64;
+        let budget = fixpoint_round_budget(self.ir.blocks.len());
+
         while let Some(b) = worklist.pop() {
+            rounds += 1;
+            if rounds > budget {
+                return Err(VerifyError::FixpointDiverged {
+                    subprog: sp,
+                    rounds,
+                });
+            }
             let Some(start) = in_state[b as usize].clone() else {
                 continue;
             };

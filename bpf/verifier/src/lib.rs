@@ -231,6 +231,15 @@ pub enum VerifyError {
     StackTooDeep { needed: u32, limit: u32 },
     /// A malformed kfunc descriptor was supplied.
     Kfunc(KfuncError),
+    /// The abstract-interpretation fixpoint did not converge within its round
+    /// budget.
+    ///
+    /// A verifier bug rather than a program bug: termination is meant to be
+    /// structural (finite-height lattice + widening at every back-edge
+    /// target), so reaching this means the lattice has an infinite ascending
+    /// chain somewhere. Reported distinctly from an ordinary rejection so it
+    /// cannot be mistaken for one.
+    FixpointDiverged { subprog: u32, rounds: u64 },
     /// This construct is not implemented yet.
     NotImplemented(&'static str),
 }

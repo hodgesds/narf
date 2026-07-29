@@ -348,6 +348,25 @@ impl StackSlot {
         }
     }
 
+    /// Widen against `next`, mirroring [`StackSlot::join`]'s shape.
+    ///
+    /// A slot's value has to widen for the same reason a register's does: it
+    /// can carry a value around a loop. Joining here instead — which is what
+    /// this did — gives the slot an infinite ascending chain, so a counter
+    /// spilled to the stack never converges.
+    fn widen(&self, next: &StackSlot, thresholds: &[i64]) -> StackSlot {
+        let whole = self.whole && next.whole;
+        StackSlot {
+            init: self.init & next.init,
+            value: if whole {
+                self.value.widen(&next.value, thresholds)
+            } else {
+                AbsValue::NotInit
+            },
+            whole,
+        }
+    }
+
     fn is_subset_of(&self, other: &StackSlot) -> bool {
         // More initialised bytes is a smaller (more defined) state.
         (other.init & !self.init) == 0
@@ -487,6 +506,23 @@ impl Stack {
         Stack {
             slots: out,
             depth: self.depth.max(other.depth),
+        }
+    }
+
+    /// Widen against `next`. Same traversal as [`Stack::join`]; only the
+    /// per-slot combinator differs.
+    fn widen(&self, next: &Stack, thresholds: &[i64]) -> Stack {
+        let mut out = BTreeMap::new();
+        for (&i, a) in &self.slots {
+            let b = next.slot(i);
+            let w = a.widen(&b, thresholds);
+            if w != StackSlot::EMPTY {
+                out.insert(i, w);
+            }
+        }
+        Stack {
+            slots: out,
+            depth: self.depth.max(next.depth),
         }
     }
 
@@ -662,7 +698,11 @@ impl AbsState {
         }
         AbsState {
             regs,
-            stack: joined.stack,
+            // Widen the stack too. Taking `joined.stack` here was the defect:
+            // the operator existed and was correct, it was simply never
+            // reached for slot state, so anything carried around a loop
+            // through the stack diverged.
+            stack: self.stack.widen(&joined.stack, thresholds),
             refs: joined.refs,
         }
     }

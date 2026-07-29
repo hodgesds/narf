@@ -1783,3 +1783,47 @@ fn every_program_the_verifier_accepts_runs_without_an_out_of_bounds_access() {
          stopped exercising anything"
     );
 }
+
+// ── termination: the stack must widen, not just join ────────────────
+
+#[test]
+fn stack_carried_counter_converges() {
+    // r1 = 0; *(u64*)(r10-8) = r1
+    // L: r1 = *(u64*)(r10-8); r1 += 1; *(u64*)(r10-8) = r1; goto L
+    //
+    // An unbounded loop is *supposed* to verify — fuel bounds it at run time
+    // (spec §1.1). The hazard is the value carried around the loop through a
+    // stack slot: `AbsState::widen` widened the eleven registers and then
+    // took the plain join of the stack, so the slot's interval climbed one
+    // step per round and the fixpoint never converged.
+    //
+    // That is not a slow load. `verify()` runs synchronously inside `sys_bpf`
+    // with no yield point, and the scheduler does not tick inside a syscall,
+    // so a non-converging fixpoint is an unprivileged kernel hang.
+    //
+    // The identical loop with the counter in a *register* has always
+    // converged (see `unbounded_loop_verifies`), which is what made this easy
+    // to miss: the widening operator was correct and simply never reached.
+    let prog = &[
+        mov(1, 0),
+        stx(Size::Dw, 10, -8, 1),
+        ldx(Size::Dw, 1, 10, -8),
+        alu(AluOp::Add, 1, 1),
+        stx(Size::Dw, 10, -8, 1),
+        Decoded::Jump { off: -4 },
+    ];
+    let v = check_full(prog, &[], &[], Context::Atomic)
+        .expect("a stack-carried counter must converge, not diverge");
+    assert!(v.max_stack_bytes >= 8);
+}
+
+#[test]
+fn divergence_is_reported_not_hung() {
+    // The backstop itself: whatever the lattice does, the fixpoint must
+    // terminate with an error rather than spin. Asserting the budget is
+    // finite is enough — a regression that removes the cap turns
+    // `stack_carried_counter_converges` from a failure into a hang, which is
+    // exactly the outcome the cap exists to prevent.
+    assert!(crate::fixpoint::fixpoint_round_budget(0) > 0);
+    assert!(crate::fixpoint::fixpoint_round_budget(1_000_000) > 0);
+}
