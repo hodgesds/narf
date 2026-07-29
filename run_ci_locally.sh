@@ -9,8 +9,11 @@ export NARF_QEMU_MEM_MB=2048
 echo "Running fmt"
 cargo fmt --all -- --check
 
-echo "Running login-core tests"
-cargo test --manifest-path userspace/login-core/Cargo.toml
+echo "Running host tests"
+# Single source of truth for the host-test gate; also what CI's host-tests job
+# runs. Covers narf-lib, narf-hid, the BPF host-testable crates, and the
+# isolated login-core workspace.
+cargo xtask host-test
 
 echo "Running clippy (x86_64)"
 cargo clippy -p narf-frame --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128 --features boot-smoke,cgroup-all -- -D warnings

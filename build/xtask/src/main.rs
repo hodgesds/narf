@@ -7328,7 +7328,17 @@ fn host_test_cmd() -> Result<()> {
     let suites: &[(&str, &[&str])] = &[
         (
             "kernel workspace host-safe crates",
-            &["test", "-p", "narf-lib", "-p", "narf-hid"],
+            &[
+                "test",
+                "-p",
+                "narf-lib",
+                "-p",
+                "narf-hid",
+                "-p",
+                "narf-bpf-isa",
+                "-p",
+                "narf-bpf-verifier",
+            ],
         ),
         (
             "isolated login-core workspace",
