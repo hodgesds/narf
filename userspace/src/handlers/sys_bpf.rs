@@ -14,10 +14,11 @@
 //! * `BPF_PROG_TEST_RUN` (10) — run once with a caller-supplied context and
 //!   report the return value in `attr.test.retval`.
 //!
-//! Both are gated on `Cap<BpfProgLoad, Grant>` (§4.10: there is no
-//! unprivileged mode and no second set of limits). The capability is minted
-//! once at first use and cached — `Cap::bootstrap()` allocates an object-table
-//! slot per call, so minting per syscall would leak one per `bpf(2)`.
+//! Both require privilege (§4.10: there is no unprivileged mode and no second
+//! set of limits). The check is `task_may_load_bpf`, on per-task credentials;
+//! the `Cap<BpfProgLoad, Grant>` threaded into `BpfProg::load` is a type-level
+//! statement that loading is privileged, not the check itself — it is minted
+//! by this handler, so it cannot authorise the handler.
 
 #[allow(unused_imports)]
 use super::*;
@@ -77,11 +78,16 @@ const BPF_PROG_TYPE_SYSCALL: u32 = 31;
 
 /// The `Cap<BpfProgLoad, Grant>` this handler presents.
 ///
-/// Minted once. There is no per-task capability table for userspace yet
-/// (`sys_bootstrap` hands out ad-hoc integer ids), so this is the same shape
-/// every other privileged syscall in the tree uses: a boot-minted authority
-/// whose liveness is checked per call, ready to become a per-task grant when
-/// that table lands.
+/// Minted once, and — importantly — **this is not the authorisation check**.
+/// A capability the syscall mints for itself proves nothing; `check_live()` on
+/// it only proves nothing has revoked it since. The real gate is
+/// [`task_may_load_bpf`], which reads per-task credentials.
+///
+/// This exists because `BpfProg::load` takes a `Cap<BpfProgLoad, Grant>` as
+/// the type-level statement that loading is privileged. It becomes a genuine
+/// per-task grant once NARF has a per-task capability table (`sys_bootstrap`
+/// still hands out ad-hoc integer ids). Until then the cap is plumbing and the
+/// credential check is the security boundary — do not reverse those roles.
 fn load_cap() -> &'static Cap<BpfProgLoad, Grant> {
     use narf_lib::sync::IrqSafeSpinLock;
     static SLOT: IrqSafeSpinLock<Option<&'static Cap<BpfProgLoad, Grant>>> =
@@ -144,11 +150,37 @@ fn u64_at(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b)
 }
 
+/// Whether the calling task may use `bpf(2)` at all.
+///
+/// Deliberately checks per-task credential state rather than a capability the
+/// syscall mints for itself. See the call site for why.
+fn task_may_load_bpf() -> bool {
+    super::read_uidgid(super::current_task_id()).euid == 0
+}
+
 pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let cmd = args.arg0 as u32;
     let attr_uptr = args.arg1;
     let size = args.arg2 as usize;
+
+    // Privilege gate, before anything reads the attribute block.
+    //
+    // `load_cap()` below *mints* the capability it hands to `BpfProg::load`,
+    // so `cap.check_live()` there proves only that nothing has revoked a
+    // capability this syscall created for itself — it is not an authorisation
+    // check and never was. Without this, any unprivileged process could load
+    // and run BPF, which makes the verifier the sole barrier and turns every
+    // verifier bug into an unprivileged primitive.
+    //
+    // euid 0 is a placeholder for the per-task capability table NARF does not
+    // have yet (`sys_bootstrap` still hands out ad-hoc integer ids). It is
+    // coarse, but it is a real check against real per-task state, which
+    // `Cap::bootstrap()` is not. Spec §4.10 — there is no unprivileged mode.
+    if !task_may_load_bpf() {
+        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        return;
+    }
 
     let ret = match cmd {
         BPF_PROG_LOAD => prog_load(attr_uptr, size),

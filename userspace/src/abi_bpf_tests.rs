@@ -231,3 +231,46 @@ fn smoke_abi_bpf_unimplemented_cmds() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_unimplemented_cmds);
+
+// ── privilege ───────────────────────────────────────────────────────
+
+/// `bpf(2)` must refuse an unprivileged caller.
+///
+/// The original handler "gated" on a `Cap<BpfProgLoad, Grant>` that it minted
+/// itself, so the check proved only that nothing had revoked a capability the
+/// syscall created a moment earlier. Any process could load and run BPF, which
+/// makes the verifier the sole barrier and turns every verifier bug into an
+/// unprivileged primitive.
+fn smoke_abi_bpf_requires_privilege() -> TestResult {
+    with_setup(|| {
+        let insns = ret_imm(7);
+
+        // Unprivileged: refused, and refused *before* the attribute block is
+        // read — so a bad pointer must still give EPERM, not EFAULT.
+        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        if load_prog(BPF_PROG_TYPE_TRACING, &insns) != Some(-1 /* EPERM */) {
+            return Err("unprivileged BPF_PROG_LOAD was not refused with EPERM");
+        }
+        if call(Syscall::Bpf.raw(), a2(BPF_PROG_LOAD, 0, ATTR_LEN as u64)) != Some(-1) {
+            return Err("unprivileged bpf() with a null attr did not return EPERM");
+        }
+        // Every command, not just the implemented ones — otherwise the gate
+        // could be added to one arm and quietly missed on the rest.
+        for cmd in [BPF_MAP_CREATE, BPF_OBJ_PIN, BPF_BTF_LOAD, BPF_PROG_TEST_RUN] {
+            if call(Syscall::Bpf.raw(), a2(cmd, 0, ATTR_LEN as u64)) != Some(-1) {
+                return Err("an unprivileged bpf() command was not refused");
+            }
+        }
+
+        // Privileged: the same call succeeds, so the gate is a privilege check
+        // and not a blanket refusal.
+        crate::handlers::__test_set_fsids(FAKE_TASK, 0, 0);
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &insns).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("privileged BPF_PROG_LOAD was refused");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_requires_privilege);
