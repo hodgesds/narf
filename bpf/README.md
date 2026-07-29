@@ -19,4 +19,21 @@ Reading list: [`research/README.md`](research/README.md).
 | `jit/` | x86_64 and aarch64 emitters — host-testable against golden disassembly |
 | `src/` | kernel runtime, `kfunc!`/`struct_ops!` macros, attach adapters |
 
+## Where it is
+
+Landed: the instruction layer, the kfunc/struct_ops contract, the runtime with
+its fuel-metered interpreter, `bpf(2)`'s `BPF_PROG_LOAD` and
+`BPF_PROG_TEST_RUN`, and the first attach surface (dynamic probes).
+
+Not yet: the abstract interpreter (`verify()` returns `NotImplemented` and
+`bpf/src/provisional.rs` carries a structural stand-in), maps and arenas, the
+JIT and its RX allocator, struct_ops trampolines, and the net/perf attach
+surfaces.
+
+**The JIT must not be enabled before the real verifier is.** Today's safety
+comes from the interpreter never dereferencing a program-supplied address —
+pointers index synthetic regions and every access is bounds-checked. JITed
+code gives that up in exchange for the verifier plus the extable plus the
+arena guard slots, which is the right trade only once the verifier exists.
+
 Stage 5+.

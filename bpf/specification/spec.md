@@ -324,3 +324,22 @@ and the perf event layer, all of which are closed.
 8. **aarch64 `probe.rs`.** Porting the x86_64 recoverable-probe module would
    let `memory/src/tests.rs`'s four `probe::arm` sites stop being x86-only.
    Optional scope, but adjacent.
+9. **An ABI for kfuncs that await.** The kfunc calling convention is one
+   uniform `extern "C" fn(u64, u64, u64, u64, u64) -> u64`, which is what lets
+   the interpreter transmute a shim address once and the JIT emit one call
+   sequence — but a `u64` is not a future, so a sleepable kfunc cannot go
+   through it. `narf_yield()` is currently an interpreter intrinsic recognised
+   by id (`interp::Vm::call_kfunc`). A second sleepable kfunc, or any kfunc
+   that parks on real I/O rather than yielding to itself, needs a real answer:
+   either a second shim shape returning `Poll`, or a registry flag routing
+   sleepable kfuncs through a boxed-future path. Related: `interp::drive`
+   spins because `YieldNow` wakes itself, which is only sound while `yield` is
+   the sole await point.
+10. **A `Guard` cannot be both linear and sleep-unsafe under the Phase-0
+    contract.** `ArgDesc::consumes_in_arg_position` requires
+    `domain.requires_release()`, which only `ValidityDomain::Owned` satisfies —
+    but `KfuncDesc::validate` rejects a `PtrKind::LockGuard` return whose
+    domain survives an await, and `Owned` does. §1.11's three properties want
+    both. The fix is probably for linearity to key on `PtrKind::LockGuard`
+    directly rather than on the validity domain; it should land with the
+    abstract interpreter, which is the first consumer that cares.

@@ -192,7 +192,7 @@ Delivery model and mask width are detailed in §3.2.
 | `perf_event_open` | implemented | `linux-compat` | `handlers.rs:~21949` |
 | `init_module`/`finit_module`/`delete_module` | present | — | NARF has no out-of-tree module model; treat as stubs unless verified **(unverified)** |
 | `io_uring_setup`/`enter`/`register` | **not present** | — | intentional non-goal (§6) |
-| `bpf` | **in progress** | — | see `bpf/specification/spec.md`; ISA-compatible, ABI-divergent |
+| `bpf` | partial | — | x86_64 321 / aarch64 280. `BPF_PROG_LOAD` + `BPF_PROG_TEST_RUN`; every other command `ENOTSUP`. `handlers/sys_bpf.rs` |
 
 ---
 
