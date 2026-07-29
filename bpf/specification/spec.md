@@ -269,10 +269,13 @@ rejected. `VerifyError` carries an instruction index wherever one exists.
   exists, and `frame/src/aarch64/trap.rs` handles only data aborts from a
   *lower* EL; `EC = 0b100101` (current EL) falls through to `exit_kernel(42)`.
   The extable is first-of-its-kind here, not a re-wiring.
-- **Cache maintenance.** `arch::patch_word` does `dsb ish; ic ivau; dsb ish;
-  isb` with **no `dc cvau`** — architecturally required before `ic ivau` unless
-  `CTR_EL0.IDC == 1`. A bulk JIT publish hits this far harder than a 4-byte
-  probe patch; fix it as part of this work.
+- **Cache maintenance — fixed.** `arch::patch_word` used to do `dsb ish; ic
+  ivau; dsb ish; isb` with **no `dc cvau`**, which the architecture requires
+  before `ic ivau` unless `CTR_EL0.IDC == 1`. It now delegates to
+  `narf_arch::aarch64::asm::flush_icache_range`, which reads `CTR_EL0` for the
+  line size and elides `dc cvau` / `ic ivau` on `IDC` / `DIC` exactly as
+  Linux's `__flush_cache_user_range` does. `bpf_text::seal` uses the same
+  primitive, scoped to the sealed allocation rather than the whole pack.
 - **TLB.** `tlbi vale1is` is inner-shareable and self-broadcasts, so no IPI
   plumbing is needed — an asymmetry with x86_64 worth remembering.
 - The JIT is x86_64-first; aarch64 runs interpreted until its emitter lands.
@@ -305,6 +308,10 @@ and the perf event layer, all of which are closed.
    `mmap_fault(offset)` hook routed from the demand-paging arm of the trap
    handler fixes this and would make every device node demand-pageable, not
    just arenas. Roughly 40 lines; scope in Phase 3.
+   **Interim behaviour (landed):** `Arena::snapshot_frames` freezes the arena
+   and `Arena::populate` then returns `ArenaError::SnapshotTaken`, so the
+   mistake surfaces as a typed error at the call that makes it rather than as
+   a page that silently does not exist in userspace.
 3. **Nested locks.** v1 permits one live `Guard` at a time. Nesting under a
    declared lock-order lattice is deferred.
 4. **`struct_ops!` form.** Whether it re-declares traits or mirrors existing
