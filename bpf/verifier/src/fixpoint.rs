@@ -1265,6 +1265,20 @@ impl Analysis<'_, '_> {
                 }
             }
             PtrClass::Arena => {
+                // An arena byte region is still a bounded region. The guard
+                // slots are sized from the ISA's 16-bit displacement, so they
+                // say nothing about a u64 length — without this a kfunc taking
+                // `&[u8]` could be handed an attacker-chosen offset *and* an
+                // attacker-chosen length, and `<&[u8]>::from_raw` would call
+                // `slice::from_raw_parts` on it.
+                if p.off.min < 0
+                    || (p.off.max as u64).saturating_add(len_max) > crate::ARENA_WINDOW_BYTES
+                {
+                    return Err(VerifyError::OutOfBounds { at });
+                }
+                if writes && p.readonly {
+                    return Err(VerifyError::WriteToReadOnly { at });
+                }
                 self.uses_arena = true;
             }
             _ => return Err(bad),

@@ -256,13 +256,24 @@ impl<'a> Vm<'a> {
             return Ok(widen(u64::from_le_bytes(buf), size, signed));
         }
         // The context tuple is word-addressed and read-only.
-        let ctx_limit = CTX_REGION + (self.ctx_len as u64) * 8;
-        if addr >= CTX_REGION && addr + len as u64 <= ctx_limit {
-            let off = (addr - CTX_REGION) as usize;
-            let word = self.ctx[off / 8];
-            let shift = (off % 8) * 8;
-            let raw = word >> shift;
-            return Ok(widen(raw, size, signed));
+        //
+        // `checked_add` is load-bearing on both sides, exactly as in
+        // `stack_range`. Computing `addr + len` unchecked let `u64::MAX` wrap
+        // to 0, which satisfied *both* guards — `addr >= CTX_REGION` and
+        // `0 <= ctx_limit` — and the load then indexed a `[u64; 4]` far out of
+        // bounds. That is a kernel panic in the layer `crate::provisional`
+        // nominates as the reason the runtime is safe when the verifier is
+        // wrong, so it has to be the layer that cannot itself be broken.
+        let ctx_limit = CTX_REGION.checked_add((self.ctx_len as u64) * 8);
+        let end = addr.checked_add(len as u64);
+        if let (Some(limit), Some(end)) = (ctx_limit, end) {
+            if addr >= CTX_REGION && end <= limit {
+                let off = (addr - CTX_REGION) as usize;
+                let word = self.ctx[off / 8];
+                let shift = (off % 8) * 8;
+                let raw = word >> shift;
+                return Ok(widen(raw, size, signed));
+            }
         }
         Err(Trap::BadAccess { at, addr, len })
     }

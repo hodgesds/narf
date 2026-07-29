@@ -1985,3 +1985,53 @@ fn null_check_program(wide: bool) -> Vec<Decoded> {
         EXIT,
     ]
 }
+
+// ── a byte region in an arena is still a bounded region ─────────────
+
+#[test]
+fn an_arena_mem_argument_is_bounds_checked() {
+    // `check_mem_arg` had `PtrClass::Arena => { self.uses_arena = true; }` —
+    // no bound on the offset, none on the length, no readonly check. A kfunc
+    // taking `&[u8]` could therefore be handed an attacker-chosen offset *and*
+    // an attacker-chosen length, and `<&[u8]>::from_raw` then calls
+    // `slice::from_raw_parts` on it.
+    //
+    // The guard-slot argument does not cover this either: the slots are sized
+    // from the ISA's 16-bit displacement, not from a u64 length.
+    let k = [
+        kfunc(
+            "arena_base",
+            NO_ARGS,
+            ptr_desc(PtrKind::Arena, ValidityDomain::Static, ArgFlags::NONE),
+            Context::Atomic,
+        ),
+        kfunc(
+            "read_mem",
+            READ_MEM_ARGS,
+            ArgDesc::SCALAR64,
+            Context::Atomic,
+        ),
+    ];
+
+    // r2 is an unconstrained length read out of the context.
+    let unbounded = &[
+        ldx(Size::Dw, 6, 1, 0),
+        call(0),
+        movr(1, 0),
+        movr(2, 6),
+        call(1),
+        mov(0, 0),
+        EXIT,
+    ];
+    let err = check_full(unbounded, &[ArgDesc::SCALAR64], &k, Context::Atomic)
+        .expect_err("an unbounded length into an arena region must be rejected");
+    assert!(
+        matches!(err, VerifyError::OutOfBounds { .. }),
+        "expected OutOfBounds, got {err:?}"
+    );
+
+    // The control: a small constant length inside the window is fine, so the
+    // fix is a bound and not a ban on arena byte regions.
+    let bounded = &[call(0), movr(1, 0), mov(2, 64), call(1), mov(0, 0), EXIT];
+    check_full(bounded, &[], &k, Context::Atomic).expect("a bounded arena region is fine");
+}

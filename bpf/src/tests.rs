@@ -73,6 +73,15 @@ fn ldx(dst: u8, src: u8, off: i16) -> Decoded {
         off,
     }
 }
+fn ldx_size(size: Size, dst: u8, src: u8, off: i16) -> Decoded {
+    Decoded::Load {
+        size,
+        sign_extend: false,
+        dst: r(dst),
+        src: r(src),
+        off,
+    }
+}
 fn st_imm(dst: u8, off: i16, v: i32) -> Decoded {
     Decoded::Store {
         size: Size::Dw,
@@ -691,3 +700,22 @@ fn smoke_bpf_structops_install_requires_matching_cap() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_structops_install_requires_matching_cap);
+
+fn smoke_bpf_interp_wrapping_ctx_access_traps() -> TestResult {
+    // r0 = -1; r1 = *(u8 *)(r0 + 0)
+    //
+    // The ctx path computed `addr + len` unchecked. At `u64::MAX` that wraps
+    // to 0, so `addr >= CTX_REGION` and `addr + len <= ctx_limit` were *both*
+    // true and the load indexed a `[u64; 4]` far out of bounds — a kernel
+    // panic, in the very layer `crate::provisional` nominates as the reason
+    // the runtime is safe when the verifier is wrong. The stack path had used
+    // `checked_add` all along, which is what made the asymmetry easy to miss.
+    let insns = asm(&[mov_imm(0, -1), ldx_size(Size::B, 1, 0, 0), EXIT]);
+    match run_unverified(&insns, 64) {
+        Some(Outcome::Trapped(Trap::BadAccess { .. })) => TestResult::Pass,
+        Some(Outcome::Trapped(_)) => TestResult::Fail("wrong trap for a wrapping access"),
+        Some(Outcome::Returned(_)) => TestResult::Fail("wrapping access was not caught"),
+        None => TestResult::Fail("per-CPU stack declined"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_interp_wrapping_ctx_access_traps);
