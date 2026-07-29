@@ -146,3 +146,11 @@ argument = "Forward-progress counters and queue diagnostics neither bypass nor a
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L62"
 argument = "The new scheduler observations are aggregate queue depths, a monotonic progress counter, and fatal-path task state. They remain within the existing documented per-CPU scheduling-state exception and do not expose task memory or capabilities to userspace."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The direct PID 1 loader remains inside the existing frame TCB and only publishes a task after the existing ELF loader has built its address space and the task's explicit filesystem-root metadata is installed. It grants no capability, changes no domain assignment, and removes a userspace chroot launcher rather than adding an authority-bearing intermediary."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The rooted interpreter lookup reads bytes only through the existing VFS resolver under the explicit mounted root and retains the normal ELF-loader validation path. It does not dereference untrusted user pointers, alter page mappings outside the loader, or bypass capability or domain checks."

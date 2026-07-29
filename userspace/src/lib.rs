@@ -144,9 +144,9 @@ pub use loader::{
     LoadError,
 };
 pub use process::{
-    init_sysv_stack, load_user_process, load_user_process_with, ProcessLoadError, SysVStackError,
-    UserProcess, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES, DEFAULT_USER_STACK_RESERVED,
-    DEFAULT_USER_STACK_TOP,
+    init_sysv_stack, load_user_process, load_user_process_with, load_user_process_with_root,
+    ProcessLoadError, SysVStackError, UserProcess, DEFAULT_USER_STACK_BASE,
+    DEFAULT_USER_STACK_BYTES, DEFAULT_USER_STACK_RESERVED, DEFAULT_USER_STACK_TOP,
 };
 pub use syscall::{
     install_global, kernel_syscall_entry, kernel_syscall_entry_plain,

@@ -31,6 +31,13 @@ pub fn spawn_process(elf: &Elf, caps: CapBundle) -> Cap<Process, Own>;
 pub fn exec_into(proc: &Process, arg0: &str, argv: &[&str], env: &[&str]);
 ```
 
+`load_user_process_with_root` is the kernel-boot counterpart to an exec under
+an already-established process root: it resolves a filesystem-backed
+`PT_INTERP` beneath an explicit mounted-root prefix, and the caller installs
+that same root on the reserved task before making it runnable. This permits a
+dynamic service manager to be the direct PID 1 without a userspace chroot
+launcher.
+
 The Linux-compatibility syscall surface includes stored `prctl(2)` process
 state required by service managers and brokers. Capability-shaped controls
 such as `PR_SET_KEEPCAPS` round-trip according to the Linux ABI but do not mint

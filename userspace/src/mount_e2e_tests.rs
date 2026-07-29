@@ -253,6 +253,35 @@ fn smoke_chroot_rewrites_paths() -> TestResult {
 }
 kernel_test_in!("userspace/mount", smoke_chroot_rewrites_paths);
 
+// Direct kernel boot has no userspace chroot launcher. It must nevertheless
+// install the exact same per-task root before a dynamic PID 1 starts resolving
+// its interpreter and first pathname.
+fn smoke_boot_root_is_visible_before_first_task_instruction() -> TestResult {
+    const TASK: u64 = 0x71_03_01;
+    set_task(TASK);
+    crate::handlers::__test_root_dir_reset();
+
+    let installed = crate::handlers::install_root_dir(TASK, "/mnt/");
+    let root = crate::handlers::root_dir_of(TASK);
+    let resolved = crate::handlers::apply_chroot_for_test("/lib64/ld-linux-x86-64.so.2");
+
+    crate::handlers::__test_root_dir_reset();
+    if !installed {
+        return TestResult::Fail("direct boot root was rejected");
+    }
+    if root.as_deref() != Some("/mnt") {
+        return TestResult::Fail("direct boot root was not normalized");
+    }
+    if resolved != "/mnt/lib64/ld-linux-x86-64.so.2" {
+        return TestResult::Fail("direct boot root did not resolve PT_INTERP path");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/mount",
+    smoke_boot_root_is_visible_before_first_task_instruction
+);
+
 // ── Smoke 4: pivot_root swap with put_old bind ────────────────────
 #[cfg(feature = "container")]
 fn smoke_pivot_root_basic() -> TestResult {

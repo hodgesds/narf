@@ -10078,6 +10078,33 @@ pub fn root_dir_of(task: u64) -> Option<alloc::string::String> {
     g.as_ref().and_then(|m| m.get(&task).cloned())
 }
 
+/// Install the filesystem root for a task before its first instruction.
+///
+/// Kernel boot uses this to make a directly loaded dynamic PID 1 observe the
+/// mounted distro root from its first interpreter and pathname lookup.  It is
+/// the same per-task root state `chroot(2)` installs, but does not require a
+/// temporary userspace launcher to perform that syscall.
+#[cfg(feature = "linux-compat")]
+pub fn install_root_dir(task: u64, root: &str) -> bool {
+    if !root.starts_with('/') {
+        return false;
+    }
+    let root = root.trim_end_matches('/');
+    let root = if root.is_empty() { "/" } else { root };
+    root_dir_init_if_needed();
+    if let Some(entries) = ROOT_DIR_TABLE.lock().as_mut() {
+        entries.insert(task, alloc::string::String::from(root));
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(feature = "linux-compat"))]
+pub fn install_root_dir(_task: u64, _root: &str) -> bool {
+    false
+}
+
 /// fork(2) inheritance — child inherits parent's chroot.
 #[cfg(feature = "linux-compat")]
 pub fn root_dir_fork(parent: u64, child: u64) {
