@@ -1,0 +1,40 @@
+[package]
+name        = "narf-bpf"
+description = "BPF kernel runtime: kfunc!/struct_ops! registries, the fuel-metered interpreter, and the attach adapters."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+# `bpf/isa`, `bpf/verifier`, and `bpf/jit` are nested packages inside this
+# package's directory. Turning off target auto-discovery keeps cargo from
+# walking into them looking for bins/examples/benches.
+autobins     = false
+autoexamples = false
+autotests    = false
+autobenches  = false
+
+[lib]
+name = "narf_bpf"
+path = "src/lib.rs"
+
+[features]
+default = []
+# In-kernel smokes, registered through `narf-kernel-test` into `narf.tests`.
+# The crate itself is always linked (the `bpf(2)` handler and
+# `register_initcalls()` are unconditional), so this gates only the tests.
+kernel-test = ["dep:narf-kernel-test"]
+
+[dependencies]
+narf-bpf-isa      = { path = "isa" }
+narf-bpf-verifier = { path = "verifier" }
+narf-lib          = { path = "../lib" }
+narf-arch         = { path = "../arch" }
+narf-capabilities = { path = "../capabilities" }
+narf-filesystem   = { path = "../filesystem" }
+narf-tracing      = { path = "../tracing" }
+narf-init         = { path = "../init" }
+narf-kernel-test  = { path = "../verification/kernel-test", optional = true }
+
+[lints]
+workspace = true

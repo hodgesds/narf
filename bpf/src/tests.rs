@@ -1,0 +1,596 @@
+//! In-kernel smokes for the BPF runtime.
+//!
+//! Positive *and* negative per behaviour, per `feedback_tests_are_the_value`.
+//! These run inside the kernel because everything they exercise — the link
+//! section, the per-CPU stack, the probe dispatcher — has no host analogue;
+//! the pure logic is tested on the host in `narf-bpf-isa` and
+//! `narf-bpf-verifier`.
+
+use alloc::vec::Vec;
+
+use narf_bpf_isa::encode::encode;
+use narf_bpf_isa::{AluOp, CallTarget, CondOp, Decoded, Insn, Reg, Size, Source};
+use narf_bpf_verifier::kfunc::Context;
+use narf_capabilities::{Cap, Grant};
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+use crate::interp::{Outcome, Trap};
+use crate::prog::{BpfProg, BpfProgLoad, LoadRequest};
+
+// Minted once, at first use, and cached — `Cap::bootstrap()` allocates an
+// object-table slot per call, so calling it per test would leak a slot per
+// smoke run.
+fn load_cap() -> &'static Cap<BpfProgLoad, Grant> {
+    use narf_lib::sync::IrqSafeSpinLock;
+    static SLOT: IrqSafeSpinLock<Option<&'static Cap<BpfProgLoad, Grant>>> =
+        IrqSafeSpinLock::new(None);
+    let mut g = SLOT.lock();
+    if g.is_none() {
+        let c: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(Cap::<
+            BpfProgLoad,
+            Grant,
+        >::bootstrap()));
+        *g = Some(c);
+    }
+    g.expect("just installed")
+}
+
+fn r(n: u8) -> Reg {
+    Reg::new(n).expect("register in range")
+}
+
+/// Assemble a straight list of decoded instructions.
+fn asm(items: &[Decoded]) -> Vec<Insn> {
+    let mut out = Vec::new();
+    for d in items {
+        out.extend_from_slice(encode(*d).slots());
+    }
+    out
+}
+
+fn mov_imm(dst: u8, v: i32) -> Decoded {
+    Decoded::Mov {
+        wide: true,
+        dst: r(dst),
+        src: Source::Imm(v),
+        sign_extend: None,
+    }
+}
+fn mov_reg(dst: u8, src: u8) -> Decoded {
+    Decoded::Mov {
+        wide: true,
+        dst: r(dst),
+        src: Source::Reg(r(src)),
+        sign_extend: None,
+    }
+}
+fn ldx(dst: u8, src: u8, off: i16) -> Decoded {
+    Decoded::Load {
+        size: Size::Dw,
+        sign_extend: false,
+        dst: r(dst),
+        src: r(src),
+        off,
+    }
+}
+fn st_imm(dst: u8, off: i16, v: i32) -> Decoded {
+    Decoded::Store {
+        size: Size::Dw,
+        dst: r(dst),
+        off,
+        src: Source::Imm(v),
+    }
+}
+fn alu_imm(op: AluOp, dst: u8, v: i32) -> Decoded {
+    Decoded::Alu {
+        wide: true,
+        op,
+        dst: r(dst),
+        src: Source::Imm(v),
+    }
+}
+fn jne_imm(dst: u8, v: i32, off: i16) -> Decoded {
+    Decoded::JumpCond {
+        wide: true,
+        op: CondOp::Ne,
+        dst: r(dst),
+        src: Source::Imm(v),
+        off,
+    }
+}
+fn ja(off: i32) -> Decoded {
+    Decoded::Jump { off }
+}
+fn call(name: &str) -> Decoded {
+    Decoded::Call(CallTarget::Kfunc(crate::kfunc::id_for(name)))
+}
+fn call_id(id: i32) -> Decoded {
+    Decoded::Call(CallTarget::Kfunc(id))
+}
+const EXIT: Decoded = Decoded::Exit;
+
+fn load(
+    name: &str,
+    insns: Vec<Insn>,
+    ctx: Context,
+) -> Result<alloc::sync::Arc<BpfProg>, &'static str> {
+    BpfProg::load(
+        load_cap(),
+        LoadRequest {
+            name: alloc::string::String::from(name),
+            insns,
+            context: ctx,
+        },
+    )
+    .map_err(|_| "load rejected")
+}
+
+// ── registry ────────────────────────────────────────────────────────
+
+fn smoke_bpf_kfunc_registry_populated() -> TestResult {
+    let Some(reg) = crate::kfunc::registry() else {
+        return TestResult::Fail("kfunc registry not installed (initcall did not run)");
+    };
+    if reg.is_empty() {
+        return TestResult::Fail("kfunc registry is empty — narf.kfuncs section was dropped");
+    }
+    if reg.by_name("narf_counter_add").is_none() {
+        return TestResult::Fail("narf_counter_add missing from the registry");
+    }
+    if reg.by_name("narf_yield").is_none() {
+        return TestResult::Fail("narf_yield missing from the registry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_kfunc_registry_populated);
+
+fn smoke_bpf_kfunc_id_matches_name_hash() -> TestResult {
+    let Some(reg) = crate::kfunc::registry() else {
+        return TestResult::Fail("kfunc registry not installed");
+    };
+    let Some(e) = reg.by_name("narf_counter_read") else {
+        return TestResult::Fail("narf_counter_read missing");
+    };
+    // The id a `call` immediate carries must be computable from the name
+    // alone, so a loader never has to read BTF to resolve a kfunc.
+    if e.id() != crate::kfunc::id_for("narf_counter_read") {
+        return TestResult::Fail("kfunc id is not the name hash");
+    }
+    if reg.by_id(crate::kfunc::id_for("no_such_kfunc")).is_some() {
+        return TestResult::Fail("registry resolved a name that was never declared");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_kfunc_id_matches_name_hash);
+
+fn smoke_bpf_kfunc_descriptors_validate() -> TestResult {
+    let Some(reg) = crate::kfunc::registry() else {
+        return TestResult::Fail("kfunc registry not installed");
+    };
+    for e in reg.all() {
+        if e.desc().validate().is_err() {
+            return TestResult::Fail("a registered kfunc descriptor failed validate()");
+        }
+        if e.shim as usize == 0 {
+            return TestResult::Fail("a registered kfunc has a null shim");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_kfunc_descriptors_validate);
+
+// ── interpreter: positive ───────────────────────────────────────────
+
+fn smoke_bpf_interp_returns_immediate() -> TestResult {
+    // r0 = 42; exit
+    let insns = asm(&[mov_imm(0, 42), EXIT]);
+    let Ok(p) = load("ret42", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected a trivial program");
+    };
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Returned(42)) => TestResult::Pass,
+        Some(Outcome::Returned(v)) => {
+            if v == 42 {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("wrong return value")
+            }
+        }
+        Some(Outcome::Trapped(_)) => TestResult::Fail("trivial program trapped"),
+        None => TestResult::Fail("per-CPU stack declined the first invocation"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_interp_returns_immediate);
+
+fn smoke_bpf_interp_reads_context() -> TestResult {
+    // r0 = *(u64 *)(r1 + 8); exit   — the second context word.
+    let insns = asm(&[ldx(0, 1, 8), EXIT]);
+    let Ok(p) = load("ctxread", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected a context read");
+    };
+    match p.run_atomic([11, 22, 33, 44], 4) {
+        Some(Outcome::Returned(22)) => TestResult::Pass,
+        Some(Outcome::Returned(_)) => TestResult::Fail("read the wrong context word"),
+        Some(Outcome::Trapped(_)) => TestResult::Fail("context read trapped"),
+        None => TestResult::Fail("per-CPU stack declined"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_interp_reads_context);
+
+fn smoke_bpf_interp_stack_roundtrip() -> TestResult {
+    // *(u64 *)(r10 - 8) = 0x1234; r0 = *(u64 *)(r10 - 8); exit
+    let insns = asm(&[st_imm(10, -8, 0x1234), ldx(0, 10, -8), EXIT]);
+    let Ok(p) = load("stack", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected a stack round-trip");
+    };
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Returned(0x1234)) => TestResult::Pass,
+        Some(Outcome::Returned(_)) => TestResult::Fail("stack read back the wrong value"),
+        Some(Outcome::Trapped(_)) => TestResult::Fail("stack round-trip trapped"),
+        None => TestResult::Fail("per-CPU stack declined"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_interp_stack_roundtrip);
+
+fn smoke_bpf_interp_loop_terminates() -> TestResult {
+    // r0 = 0; r1 = 10; loop { r0 += 1; r1 -= 1; if r1 != 0 goto loop } exit
+    let insns = asm(&[
+        mov_imm(0, 0),
+        mov_imm(1, 10),
+        alu_imm(AluOp::Add, 0, 1),
+        alu_imm(AluOp::Sub, 1, 1),
+        jne_imm(1, 0, -3),
+        EXIT,
+    ]);
+    let Ok(p) = load("loop", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected a loop — arbitrary loops are legal here");
+    };
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Returned(10)) => TestResult::Pass,
+        Some(Outcome::Returned(_)) => TestResult::Fail("loop produced the wrong count"),
+        Some(Outcome::Trapped(_)) => TestResult::Fail("bounded loop trapped"),
+        None => TestResult::Fail("per-CPU stack declined"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_interp_loop_terminates);
+
+fn smoke_bpf_interp_calls_kfunc() -> TestResult {
+    const SLOT: u32 = 3;
+    crate::kfuncs::reset_counter(SLOT as usize);
+    // r1 = SLOT; r2 = 7; call narf_counter_add; exit  (r0 = pre-add value)
+    let insns = asm(&[
+        mov_imm(1, SLOT as i32),
+        mov_imm(2, 7),
+        call("narf_counter_add"),
+        EXIT,
+    ]);
+    let Ok(p) = load("kfunc", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected a kfunc call");
+    };
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Returned(0)) => {}
+        Some(Outcome::Returned(_)) => {
+            return TestResult::Fail("kfunc returned a stale pre-add value")
+        }
+        Some(Outcome::Trapped(_)) => return TestResult::Fail("kfunc call trapped"),
+        None => return TestResult::Fail("per-CPU stack declined"),
+    }
+    if crate::kfuncs::counter(SLOT as usize) != 7 {
+        return TestResult::Fail("kfunc did not take effect on the counter");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_interp_calls_kfunc);
+
+// ── interpreter: negative ───────────────────────────────────────────
+
+fn smoke_bpf_interp_wild_load_traps_not_faults() -> TestResult {
+    // r1 = 0; r0 = *(u64 *)(r1 + 0); exit — a null dereference, which must
+    // produce a diagnostic rather than a kernel page fault.
+    let insns = asm(&[mov_imm(1, 0), ldx(0, 1, 0), EXIT]);
+    let Ok(p) = load("wild", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected the wild-access program");
+    };
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Trapped(Trap::BadAccess { .. })) => TestResult::Pass,
+        Some(Outcome::Trapped(_)) => TestResult::Fail("wrong trap for a wild access"),
+        Some(Outcome::Returned(_)) => TestResult::Fail("wild access was not caught"),
+        None => TestResult::Fail("per-CPU stack declined"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_interp_wild_load_traps_not_faults);
+
+fn smoke_bpf_interp_fuel_bounds_infinite_loop() -> TestResult {
+    // goto -1 — an unconditional infinite loop, which the verifier is
+    // *supposed* to accept (spec §1.1: termination is a runtime property).
+    // Fuel is what stops it.
+    let insns = asm(&[ja(-1), EXIT]);
+    let Ok(p) = load("spin", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected an unbounded loop — fuel makes it legal");
+    };
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Trapped(Trap::OutOfFuel { .. })) => TestResult::Pass,
+        Some(Outcome::Trapped(_)) => TestResult::Fail("infinite loop produced the wrong trap"),
+        Some(Outcome::Returned(_)) => TestResult::Fail("infinite loop returned"),
+        None => TestResult::Fail("per-CPU stack declined"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_interp_fuel_bounds_infinite_loop);
+
+fn smoke_bpf_load_rejects_unknown_kfunc() -> TestResult {
+    let insns = asm(&[call_id(0x7FFF_FFFF), EXIT]);
+    match load("badkfunc", insns, Context::Atomic) {
+        Err(_) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("load accepted a call to an unregistered kfunc"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_load_rejects_unknown_kfunc);
+
+fn smoke_bpf_load_rejects_sleepable_kfunc_in_atomic() -> TestResult {
+    // `narf_yield` declares `Context::Sleepable`. Attaching it to an atomic
+    // program must fail at load, by type — not at fire time, by flag check.
+    let insns = asm(&[call("narf_yield"), EXIT]);
+    if load("yield-atomic", insns.clone(), Context::Atomic).is_ok() {
+        return TestResult::Fail("atomic program accepted a sleepable kfunc");
+    }
+    // …and the same program is fine in a sleepable context.
+    if load("yield-sleepable", insns, Context::Sleepable).is_err() {
+        return TestResult::Fail("sleepable program rejected a sleepable kfunc");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_load_rejects_sleepable_kfunc_in_atomic);
+
+fn smoke_bpf_load_rejects_out_of_range_jump() -> TestResult {
+    let insns = asm(&[ja(9999), EXIT]);
+    match load("badjump", insns, Context::Atomic) {
+        Err(_) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("load accepted a jump past the end of the program"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_load_rejects_out_of_range_jump);
+
+fn smoke_bpf_load_rejects_empty_program() -> TestResult {
+    match load("empty", Vec::new(), Context::Atomic) {
+        Err(_) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("load accepted an empty program"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_load_rejects_empty_program);
+
+// ── sleepable path ──────────────────────────────────────────────────
+
+fn smoke_bpf_sleepable_yield_completes() -> TestResult {
+    // call narf_yield; r0 = 5; exit. The yield parks the future once, so this
+    // exercises the async interpreter's resume path — not just its fast path.
+    let insns = asm(&[call("narf_yield"), mov_imm(0, 5), EXIT]);
+    let Ok(p) = load("yield", insns, Context::Sleepable) else {
+        return TestResult::Fail("load rejected a sleepable program");
+    };
+    match crate::interp::drive(p.run_sleepable([0; 4], 4)) {
+        Some(Outcome::Returned(5)) => TestResult::Pass,
+        Some(Outcome::Returned(_)) => {
+            TestResult::Fail("sleepable program returned the wrong value")
+        }
+        Some(Outcome::Trapped(_)) => TestResult::Fail("sleepable program trapped"),
+        None => TestResult::Fail("heap stack allocation failed"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_sleepable_yield_completes);
+
+fn smoke_bpf_yield_does_not_refill_fuel() -> TestResult {
+    // Spec §4.9: yielding lets other tasks interleave; it does not restore
+    // fuel. A yield inside an unbounded loop must therefore still run out.
+    let insns = asm(&[call("narf_yield"), ja(-2), EXIT]);
+    let Ok(p) = load("yieldspin", insns, Context::Sleepable) else {
+        return TestResult::Fail("load rejected the yield-loop program");
+    };
+    match crate::interp::drive(p.run_sleepable([0; 4], 4)) {
+        Some(Outcome::Trapped(Trap::OutOfFuel { .. })) => TestResult::Pass,
+        Some(Outcome::Trapped(_)) => TestResult::Fail("wrong trap for a yielding infinite loop"),
+        Some(Outcome::Returned(_)) => TestResult::Fail("yielding infinite loop returned"),
+        None => TestResult::Fail("heap stack allocation failed"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_yield_does_not_refill_fuel);
+
+// ── attach ──────────────────────────────────────────────────────────
+
+fn smoke_bpf_probe_attach_fires() -> TestResult {
+    use narf_tracing::dispatch::{self, ProbeArgs, ProbeHandlerInstall};
+
+    const SLOT: u32 = 5;
+    crate::kfuncs::reset_counter(SLOT as usize);
+
+    // r1 = SLOT; r2 = *(u64 *)(r1_ctx + 0) — needs the ctx before r1 is
+    // clobbered, so read first, then set up the call.
+    //   r3 = *(u64 *)(r1 + 0)     ; ctx word 0
+    //   r1 = SLOT
+    //   r2 = r3
+    //   call narf_counter_add
+    //   r0 = r3
+    //   exit
+    let insns = asm(&[
+        ldx(3, 1, 0),
+        mov_imm(1, SLOT as i32),
+        mov_reg(2, 3),
+        call("narf_counter_add"),
+        mov_reg(0, 3),
+        EXIT,
+    ]);
+    let Ok(prog) = load("probe", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected the probe program");
+    };
+
+    let attach_cap = Cap::<crate::prog::BpfAttach, Grant>::bootstrap();
+    let install_cap = Cap::<ProbeHandlerInstall, Grant>::bootstrap();
+    let probe_id = dispatch::reserve_probe_id();
+
+    if crate::attach::attach_probe(&attach_cap, &install_cap, probe_id, prog.clone()).is_err() {
+        return TestResult::Fail("attach_probe failed");
+    }
+
+    // Firing goes through the real dispatcher, so this also proves the
+    // Stage-4 lock rework: under the old shape the handler ran with
+    // `TABLE.inner` held.
+    dispatch::fire(probe_id, ProbeArgs::two(6, 0));
+    dispatch::fire(probe_id, ProbeArgs::two(7, 0));
+
+    let _ = crate::attach::detach_probe(&install_cap, probe_id);
+
+    if prog.runs() != 2 {
+        return TestResult::Fail("probe fired but the program did not run twice");
+    }
+    if prog.traps() != 0 {
+        return TestResult::Fail("attached program trapped");
+    }
+    if crate::kfuncs::counter(SLOT as usize) != 13 {
+        return TestResult::Fail("counter did not accumulate 6 + 7 from the probe fires");
+    }
+    if prog.accumulated() != 13 {
+        return TestResult::Fail("return values did not accumulate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_probe_attach_fires);
+
+fn smoke_bpf_probe_attach_rejects_sleepable_program() -> TestResult {
+    use narf_tracing::dispatch::{self, ProbeHandlerInstall};
+
+    let insns = asm(&[mov_imm(0, 1), EXIT]);
+    let Ok(prog) = load("sleepy", insns, Context::Sleepable) else {
+        return TestResult::Fail("load rejected a sleepable program");
+    };
+    let attach_cap = Cap::<crate::prog::BpfAttach, Grant>::bootstrap();
+    let install_cap = Cap::<ProbeHandlerInstall, Grant>::bootstrap();
+    let probe_id = dispatch::reserve_probe_id();
+    // A probe site runs with IRQs masked, so it provides `Atomic` and only
+    // `Atomic`. The mismatch is a type error at attach (spec §4.5).
+    match crate::attach::attach_probe(&attach_cap, &install_cap, probe_id, prog) {
+        Err(crate::AttachError::ContextMismatch) => TestResult::Pass,
+        Err(_) => TestResult::Fail("attach failed for the wrong reason"),
+        Ok(()) => {
+            let _ = crate::attach::detach_probe(&install_cap, probe_id);
+            TestResult::Fail("a sleepable program attached to an atomic hook")
+        }
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_probe_attach_rejects_sleepable_program);
+
+// ── struct_ops ──────────────────────────────────────────────────────
+
+crate::struct_ops! {
+    /// A minimal pluggable trait, declared here so the `struct_ops!` macro,
+    /// the `narf.structops` section, and the cap-gated install path are all
+    /// exercised without waiting for Phase 5's trampolines.
+    #[cap(IdleGovernor)]
+    #[install(install_bpf_demo_governor)]
+    #[desc(DEMO_GOVERNOR_OPS)]
+    #[optional(init)]
+    pub trait DemoGovernor {
+        /// Pick an idle state for an expected idle duration.
+        fn select_state(&self, expected_idle_ns: u64) -> u32;
+        /// Optional one-time setup.
+        fn init(&self) -> i32;
+    }
+}
+
+/// A native in-tree implementation.
+///
+/// The point of the whole `struct_ops!` design is that the trait comes out of
+/// the macro *unchanged*, so a Rust impl needs to know nothing about BPF. This
+/// is that claim, compiled.
+struct NativeDemoGovernor;
+
+impl DemoGovernor for NativeDemoGovernor {
+    fn select_state(&self, expected_idle_ns: u64) -> u32 {
+        if expected_idle_ns > 1_000_000 {
+            2
+        } else {
+            0
+        }
+    }
+    fn init(&self) -> i32 {
+        0
+    }
+}
+
+fn smoke_bpf_structops_native_impl_still_works() -> TestResult {
+    let g = NativeDemoGovernor;
+    if g.select_state(10) != 0 || g.select_state(2_000_000) != 2 || g.init() != 0 {
+        return TestResult::Fail("native impl of a struct_ops trait misbehaved");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_structops_native_impl_still_works);
+
+fn smoke_bpf_structops_descriptor_registered() -> TestResult {
+    let all = crate::structops::descriptors();
+    let Some(d) = all.iter().find(|d| d.name == "DemoGovernor") else {
+        return TestResult::Fail("narf.structops section did not carry DemoGovernor");
+    };
+    if d.cap != narf_capabilities::CapKind::IdleGovernor {
+        return TestResult::Fail("struct_ops descriptor carried the wrong CapKind");
+    }
+    if d.methods.len() != 2 {
+        return TestResult::Fail("struct_ops descriptor has the wrong method count");
+    }
+    // `#[optional(init)]` must reach the descriptor, or a program set could
+    // omit a required method and be installed anyway.
+    if d.methods[0].optional || !d.methods[1].optional {
+        return TestResult::Fail("#[optional] did not reach the method descriptors");
+    }
+    // The ctx tuple is the method's real argument list — one u64 here.
+    if d.methods[0].ctx.len() != 1 {
+        return TestResult::Fail("method ctx tuple was not derived from the signature");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_structops_descriptor_registered);
+
+/// The install authority for the demo trait.
+///
+/// `power::IdleGov` is the real marker for `CapKind::IdleGovernor`; declaring
+/// a local one keeps this crate off a `narf-power` dependency it otherwise has
+/// no use for. `CapType::KIND` is what `structops::install` compares, and both
+/// markers name the same kind.
+#[derive(Copy, Clone, Debug)]
+struct IdleGovInstall;
+impl narf_capabilities::CapType for IdleGovInstall {
+    const KIND: narf_capabilities::CapKind = narf_capabilities::CapKind::IdleGovernor;
+}
+
+fn smoke_bpf_structops_install_requires_matching_cap() -> TestResult {
+    use crate::structops::{ProgSet, StructOpsError};
+
+    let insns = asm(&[mov_imm(0, 1), EXIT]);
+    let Ok(prog) = load("gov", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected the governor program");
+    };
+
+    // Negative: the right shape, the wrong authority.
+    let wrong = Cap::<BpfProgLoad, Grant>::bootstrap();
+    let set = ProgSet::new().with("select_state", prog.clone());
+    match crate::structops::install(&DEMO_GOVERNOR_OPS, &wrong, set) {
+        Err(StructOpsError::WrongCapability { .. }) => {}
+        _ => return TestResult::Fail("install accepted a capability of the wrong kind"),
+    }
+
+    // Negative: right authority, missing a required method.
+    let right = Cap::<IdleGovInstall, Grant>::bootstrap();
+    match install_bpf_demo_governor(&right, ProgSet::new()) {
+        Err(StructOpsError::MissingMethod("select_state")) => {}
+        _ => return TestResult::Fail("install accepted a set missing a required method"),
+    }
+
+    // Positive: the optional method may be omitted.
+    let set = ProgSet::new().with("select_state", prog);
+    if install_bpf_demo_governor(&right, set).is_err() {
+        return TestResult::Fail("install rejected a complete program set");
+    }
+    if !crate::structops::is_installed("DemoGovernor") {
+        return TestResult::Fail("installed set was not recorded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_structops_install_requires_matching_cap);

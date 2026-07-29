@@ -13,12 +13,19 @@
 //! - Up to 4 u64 args per fire — matches the `abi/` Submission inline
 //!   slot width and covers every built-in probe site. Variadic
 //!   arg-lists are Stage 4.
-//! - Handlers run in the firing task's context; re-entrancy is the
-//!   caller's concern. A handler that itself fires a probe will
-//!   currently recurse through the same dispatcher; Stage 4 adds a
-//!   per-CPU "in-dispatch" bit to short-circuit.
+//! - Handlers run in the firing task's context. `fire()` no longer holds
+//!   `TABLE.inner` across the handler call: it clones the `Arc<dyn
+//!   ProbeHandler>` under the lock, releases it, and invokes outside.
+//!   That is the Stage-4 rework this header used to promise, and it is a
+//!   *prerequisite* of the BPF fentry attach type rather than a
+//!   nice-to-have — `IrqSafeSpinLock` is not reentrant, so a handler that
+//!   fires a probe (or calls anything that does) deadlocked the kernel
+//!   outright under the old shape. See `bpf/specification/spec.md` §4.7.
+//!   Re-entrancy beyond the lock is still the handler's concern; a
+//!   handler that fires its *own* probe id recurses until the stack runs
+//!   out, exactly as a self-recursive function would.
 
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
@@ -79,7 +86,12 @@ impl ProbeArgs {
 
 struct Entry {
     probe_id: u32,
-    handler: Box<dyn ProbeHandler>,
+    /// `Arc`, not `Box`, so `fire()` can take a counted reference under the
+    /// lock and invoke after dropping it. The clone is one relaxed atomic
+    /// increment — cheap enough for the hot path, and the only alternative
+    /// (holding the lock across the call) is what made a probe-firing handler
+    /// self-deadlock.
+    handler: Arc<dyn ProbeHandler>,
 }
 
 impl core::fmt::Debug for Entry {
@@ -139,7 +151,7 @@ impl HandlerTable {
         }
         q.push(Entry {
             probe_id,
-            handler: Box::new(handler),
+            handler: Arc::new(handler),
         });
         Ok(())
     }
@@ -178,16 +190,23 @@ pub fn fire(probe_id: u32, args: ProbeArgs) {
         let observer: fn(u32, ProbeArgs) = unsafe { core::mem::transmute(observer) };
         observer(probe_id, args);
     }
-    // Take a short-lived reference to the handler by first locking,
-    // cloning the Box pointer via a trait-object reference, and
-    // releasing the lock before invoking — so a handler that blocks
-    // doesn't hold the registry lock. Each Entry.handler is behind a
-    // Box<dyn _>; we invoke through the trait pointer directly while
-    // the lock is held in Stage 3 (handler must be non-blocking).
-    // Stage 4 replaces with a hazard-pointer-backed lookup that drops
-    // the lock before the call.
-    let q = TABLE.inner.lock();
-    if let Some(e) = q.iter().find(|e| e.probe_id == probe_id) {
-        e.handler.fire(args);
+    // Clone the counted handler reference under the lock, then drop the lock
+    // before invoking. Holding `TABLE.inner` across the call meant any
+    // handler that reached `dispatch::*` again — directly, or through a
+    // helper that fires a probe — deadlocked on a non-reentrant
+    // `IrqSafeSpinLock` with IRQs masked. The `Arc` also keeps the handler
+    // alive if a concurrent `unregister` drops the table's copy mid-call.
+    //
+    // A hazard-pointer-backed slot array would avoid the refcount entirely;
+    // that is still worth doing, but it is an optimisation, not the
+    // correctness fix.
+    let handler = {
+        let q = TABLE.inner.lock();
+        q.iter()
+            .find(|e| e.probe_id == probe_id)
+            .map(|e| Arc::clone(&e.handler))
+    };
+    if let Some(h) = handler {
+        h.fire(args);
     }
 }

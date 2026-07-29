@@ -641,6 +641,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-bpf"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bpf-isa",
+ "narf-bpf-verifier",
+ "narf-capabilities",
+ "narf-filesystem",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-tracing",
+]
+
+[[package]]
 name = "narf-bpf-isa"
 version = "0.0.0"
 dependencies = [
