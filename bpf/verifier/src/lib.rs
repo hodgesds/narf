@@ -4,14 +4,26 @@
 //! this crate has no kernel dependencies, contains no `unsafe`, and builds and
 //! tests on the host.
 //!
-//! ## Status
+//! ## How it fits together
 //!
-//! Phase 0 lands the **contract** — the kfunc calling convention
-//! ([`kfunc`]), the verification inputs ([`Program`]) and outputs
-//! ([`VerifiedProgram`]). The abstract interpreter itself is Phase 2.
-//! [`verify`] currently returns [`VerifyError::NotImplemented`] for anything
-//! non-trivial, which is deliberate: it lets the runtime and JIT integrate
-//! against the real types now, and it fails *closed*.
+//! | Module | Job |
+//! |---|---|
+//! | [`ir`] | decode → basic blocks → CFG, dominators, SCCs, call graph |
+//! | [`domain`] | the numeric abstract domain: `tnum × signed interval` |
+//! | [`state`] | registers, stack, typed pointers, live references |
+//! | [`liveness`] | liveness and precision, as one lattice dataflow |
+//! | [`fixpoint`] | the forward worklist and the transfer functions |
+//! | [`kfunc`] | the one call ABI, with semantics carried by Rust types |
+//!
+//! [`verify`] runs all of it and returns a [`VerifiedProgram`]: the validated
+//! image plus everything the JIT and the runtime need — peak stack across the
+//! call graph, the fault sites needing exception-table coverage, subprogram
+//! boundaries, and the initial fuel.
+//!
+//! Still unimplemented, and failing *closed* rather than guessing: the
+//! `LD_IMM64` map and BTF pseudo-forms, which need registries `Program` does
+//! not yet carry (maps are Phase 3), and callback subprogram addresses, which
+//! need a callback-typed kfunc argument.
 //!
 //! ## Why this is a separate crate
 //!
@@ -39,6 +51,12 @@
 //! * **Verify an IR, lower once.** Nothing here patches instructions in
 //!   place, so there is no `delta` bookkeeping threaded through rewrite
 //!   passes.
+//! * **One rule for references, locks, and sleep safety.** At an await point,
+//!   every value whose [`ValidityDomain`] fails `survives_await()` dies. That
+//!   single rule is Linux's `REF_TYPE_LOCK`, `active_lock_id`,
+//!   `process_spin_lock()`, `invalidate_non_owning_refs()`,
+//!   `bpf_rcu_read_lock`, `KF_RCU_PROTECTED`, and `MEM_RCU` — see
+//!   [`state::AbsState::kill_at_await`].
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
