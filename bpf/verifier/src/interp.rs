@@ -25,7 +25,10 @@ use alloc::vec::Vec;
 
 use narf_bpf_isa::{AluOp, ByteOrder, CondOp, Decoded, Imm64, Insn, Reg, Size, Source};
 
-use crate::domain::{concrete_bswap, concrete_sdiv, concrete_smod, concrete_udiv, concrete_umod};
+use crate::domain::{
+    concrete_bswap, concrete_sdiv, concrete_sdiv32, concrete_smod, concrete_smod32, concrete_udiv,
+    concrete_umod,
+};
 
 /// Bytes of stack the reference interpreter provides. R10 points one past the
 /// top; offsets are negative.
@@ -149,18 +152,7 @@ pub fn div(wide: bool, signed: bool, dst: u64, src: u64) -> u64 {
         (false, false) => {
             u64::from(concrete_udiv(u64::from(dst as u32), u64::from(src as u32)) as u32)
         }
-        (false, true) => {
-            let a = dst as u32 as i32;
-            let b = src as u32 as i32;
-            let r = if b == 0 {
-                0
-            } else if a == i32::MIN && b == -1 {
-                i32::MIN
-            } else {
-                a / b
-            };
-            u64::from(r as u32)
-        }
+        (false, true) => u64::from(concrete_sdiv32(dst as u32 as i32, src as u32 as i32) as u32),
     }
 }
 
@@ -175,18 +167,7 @@ pub fn rem(wide: bool, signed: bool, dst: u64, src: u64) -> u64 {
         (false, false) => {
             u64::from(concrete_umod(u64::from(dst as u32), u64::from(src as u32)) as u32)
         }
-        (false, true) => {
-            let a = dst as u32 as i32;
-            let b = src as u32 as i32;
-            let r = if b == 0 {
-                a
-            } else if a == i32::MIN && b == -1 {
-                0
-            } else {
-                a % b
-            };
-            u64::from(r as u32)
-        }
+        (false, true) => u64::from(concrete_smod32(dst as u32 as i32, src as u32 as i32) as u32),
     }
 }
 

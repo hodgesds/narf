@@ -51,8 +51,11 @@ use alloc::vec::Vec;
 use narf_bpf_isa::{DecodeError, Insn};
 
 pub mod domain;
+pub mod fixpoint;
 pub mod ir;
 pub mod kfunc;
+pub mod liveness;
+pub mod state;
 
 #[cfg(test)]
 mod fuzz;
@@ -61,7 +64,11 @@ mod interp;
 #[cfg(test)]
 mod ir_tests;
 #[cfg(test)]
+mod liveness_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod verify_tests;
 
 pub use kfunc::{
     ArgDesc, ArgFlags, Context, KfuncDesc, KfuncError, PtrKind, TypeKey, TypeKind, ValidityDomain,
@@ -182,6 +189,26 @@ pub enum VerifyError {
     },
     /// A reference was still held when the program exited.
     LeakedReference { at: u32, reg: u8 },
+    /// A consuming kfunc argument was given a reference the program does not
+    /// hold — a double release, or a pointer that was never acquired.
+    ReleaseOfUnacquired { at: u32, reg: u8 },
+    /// More critical-section guards were live than v1 allows. Nesting needs a
+    /// declared lock-order lattice; see `bpf/specification/spec.md` §8.3.
+    TooManyLocks { at: u32 },
+    /// A memory access through something that is not a pointer.
+    NotAPointer { at: u32, reg: u8 },
+    /// Arithmetic that is not defined on a pointer — anything but adding or
+    /// subtracting a scalar, outside an arena.
+    PointerArithmetic { at: u32, reg: u8 },
+    /// A pointer that may be null was dereferenced without being tested.
+    PossiblyNull { at: u32, reg: u8 },
+    /// A store through a read-only pointer.
+    WriteToReadOnly { at: u32 },
+    /// A read of stack bytes nothing has written.
+    UninitStack { at: u32, off: i64 },
+    /// The static call graph contains a cycle. Fuel bounds a program's *work*,
+    /// not its stack, so recursion has no bound this verifier can compute.
+    Recursion { at: u32 },
     /// The static call graph needs more stack than a program may use.
     StackTooDeep { needed: u32, limit: u32 },
     /// A malformed kfunc descriptor was supplied.
@@ -221,31 +248,10 @@ pub fn verify(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
     if prog.insns.is_empty() {
         return Err(VerifyError::Empty);
     }
+    // A malformed descriptor is a build-time bug in a `kfunc!` invocation.
+    // Reasoning from a broken contract would be worse than refusing to.
     for k in prog.kfuncs {
         k.validate()?;
     }
-
-    // Phase 0 scope: decode the whole image so a malformed program is
-    // rejected with a precise location, and confirm the program cannot run
-    // off the end. The abstract interpreter that proves memory safety is
-    // Phase 2 — until it lands, fail closed rather than accepting anything.
-    let mut i = 0usize;
-    let mut saw_exit = false;
-    while i < prog.insns.len() {
-        let (decoded, width) = narf_bpf_isa::decode(prog.insns, i)
-            .map_err(|err| VerifyError::Decode { at: i as u32, err })?;
-        if matches!(decoded, narf_bpf_isa::Decoded::Exit) {
-            saw_exit = true;
-        }
-        i += width;
-    }
-    if !saw_exit {
-        return Err(VerifyError::FallsOffEnd {
-            at: (prog.insns.len() - 1) as u32,
-        });
-    }
-
-    Err(VerifyError::NotImplemented(
-        "abstract interpretation lands in Phase 2",
-    ))
+    fixpoint::run(prog)
 }

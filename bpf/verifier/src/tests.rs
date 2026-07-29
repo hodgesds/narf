@@ -314,7 +314,12 @@ fn rejects_undecodable_program_with_a_location() {
 
 #[test]
 fn rejects_program_that_falls_off_the_end() {
-    let insns = prog_of(&[Decoded::Jump { off: 0 }]);
+    let insns = prog_of(&[narf_bpf_isa::Decoded::Mov {
+        wide: true,
+        dst: narf_bpf_isa::Reg::R0,
+        src: narf_bpf_isa::Source::Imm(0),
+        sign_extend: None,
+    }]);
     assert!(matches!(
         check(&insns).unwrap_err(),
         VerifyError::FallsOffEnd { .. }
@@ -322,14 +327,32 @@ fn rejects_program_that_falls_off_the_end() {
 }
 
 #[test]
-fn fails_closed_until_the_interpreter_lands() {
-    // A well-formed program is still rejected — the verifier must never
-    // accept what it cannot yet prove.
+fn accepts_the_smallest_well_formed_program() {
+    // A bare `exit` returns whatever R0 holds, which nothing wrote. That is a
+    // *use* of an uninitialised register and the verifier says so, naming it —
+    // which is more than "your program was rejected".
     let insns = prog_of(&[Decoded::Exit]);
-    assert!(matches!(
+    assert_eq!(
         check(&insns).unwrap_err(),
-        VerifyError::NotImplemented(_)
-    ));
+        VerifyError::UninitRegister { at: 0, reg: 0 }
+    );
+
+    // With R0 written first, it verifies.
+    let insns = prog_of(&[
+        narf_bpf_isa::Decoded::Mov {
+            wide: true,
+            dst: narf_bpf_isa::Reg::R0,
+            src: narf_bpf_isa::Source::Imm(0),
+            sign_extend: None,
+        },
+        Decoded::Exit,
+    ]);
+    let v = check(&insns).expect("a program that returns 0 is safe");
+    assert_eq!(v.max_stack_bytes, 0);
+    assert_eq!(v.subprogs.len(), 1);
+    assert!(v.fault_sites.is_empty());
+    assert!(!v.uses_arena);
+    assert_eq!(v.initial_fuel, crate::DEFAULT_FUEL);
 }
 
 #[test]

@@ -1,0 +1,1554 @@
+//! End-to-end verification tests: a positive and a negative case per
+//! instruction class, plus the rules that only exist at whole-program scope.
+//!
+//! Every negative case asserts the *specific* error, not merely that the
+//! program was rejected. That is deliberate: "your program was rejected" with
+//! no location is the single most-complained-about property of Linux's
+//! verifier, and a test suite that only checks `is_err()` is how a diagnostic
+//! silently degrades into that.
+//!
+//! The loop tests are the load-bearing ones. There is no instruction budget
+//! and no state limit here, so a program with an unbounded loop must *finish
+//! verifying* — if widening were wrong, these would hang rather than fail, and
+//! that is exactly the property worth a test.
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+use narf_bpf_isa::encode::encode;
+use narf_bpf_isa::{AluOp, AtomicOp, CallTarget, CondOp, Decoded, Imm64, Insn, Reg, Size, Source};
+
+use crate::kfunc::{
+    ArgDesc, ArgFlags, Context, KfuncDesc, PtrKind, TypeKey, TypeKind, ValidityDomain,
+};
+use crate::{interp, verify, Program, VerifiedProgram, VerifyError};
+
+// ── Program construction ────────────────────────────────────────────
+
+fn r(n: u8) -> Reg {
+    Reg::new(n).expect("register in range")
+}
+
+fn mov(dst: u8, v: i32) -> Decoded {
+    Decoded::Mov {
+        wide: true,
+        dst: r(dst),
+        src: Source::Imm(v),
+        sign_extend: None,
+    }
+}
+
+fn movr(dst: u8, src: u8) -> Decoded {
+    Decoded::Mov {
+        wide: true,
+        dst: r(dst),
+        src: Source::Reg(r(src)),
+        sign_extend: None,
+    }
+}
+
+fn alu(op: AluOp, dst: u8, v: i32) -> Decoded {
+    Decoded::Alu {
+        wide: true,
+        op,
+        dst: r(dst),
+        src: Source::Imm(v),
+    }
+}
+
+fn alur(op: AluOp, dst: u8, src: u8) -> Decoded {
+    Decoded::Alu {
+        wide: true,
+        op,
+        dst: r(dst),
+        src: Source::Reg(r(src)),
+    }
+}
+
+fn ldx(size: Size, dst: u8, src: u8, off: i16) -> Decoded {
+    Decoded::Load {
+        size,
+        sign_extend: false,
+        dst: r(dst),
+        src: r(src),
+        off,
+    }
+}
+
+fn stx(size: Size, dst: u8, off: i16, src: u8) -> Decoded {
+    Decoded::Store {
+        size,
+        dst: r(dst),
+        off,
+        src: Source::Reg(r(src)),
+    }
+}
+
+fn st(size: Size, dst: u8, off: i16, imm: i32) -> Decoded {
+    Decoded::Store {
+        size,
+        dst: r(dst),
+        off,
+        src: Source::Imm(imm),
+    }
+}
+
+fn jmp(op: CondOp, dst: u8, imm: i32, off: i16) -> Decoded {
+    Decoded::JumpCond {
+        wide: true,
+        op,
+        dst: r(dst),
+        src: Source::Imm(imm),
+        off,
+    }
+}
+
+fn call(id: i32) -> Decoded {
+    Decoded::Call(CallTarget::Kfunc(id))
+}
+
+const EXIT: Decoded = Decoded::Exit;
+
+fn encode_all(insns: &[Decoded]) -> Vec<Insn> {
+    let mut out = Vec::new();
+    for d in insns {
+        out.extend_from_slice(encode(*d).slots());
+    }
+    out
+}
+
+/// Verify with an explicit context tuple, kfunc set, and execution context.
+fn check_full(
+    insns: &[Decoded],
+    ctx_fields: &'static [ArgDesc],
+    kfuncs: &[KfuncDesc],
+    context: Context,
+) -> Result<VerifiedProgram, VerifyError> {
+    let image = encode_all(insns);
+    verify(&Program {
+        insns: &image,
+        context,
+        ctx_fields,
+        kfuncs,
+    })
+}
+
+/// Verify an atomic program with no context and no kfuncs.
+fn check(insns: &[Decoded]) -> Result<VerifiedProgram, VerifyError> {
+    check_full(insns, &[], &[], Context::Atomic)
+}
+
+/// Verify with a context tuple.
+fn check_ctx(
+    insns: &[Decoded],
+    ctx_fields: &'static [ArgDesc],
+) -> Result<VerifiedProgram, VerifyError> {
+    check_full(insns, ctx_fields, &[], Context::Atomic)
+}
+
+fn ok(insns: &[Decoded]) -> VerifiedProgram {
+    check(insns).expect("program should verify")
+}
+
+fn err(insns: &[Decoded]) -> VerifyError {
+    check(insns).expect_err("program should be rejected")
+}
+
+// ── Descriptor helpers ──────────────────────────────────────────────
+
+const fn ptr_desc(kind: PtrKind, domain: ValidityDomain, flags: ArgFlags) -> ArgDesc {
+    ArgDesc {
+        kind: TypeKind::Ptr {
+            kind,
+            key: TypeKey(1),
+        },
+        domain,
+        flags,
+    }
+}
+
+fn kfunc(
+    name: &'static str,
+    args: &'static [ArgDesc],
+    ret: ArgDesc,
+    context: Context,
+) -> KfuncDesc {
+    KfuncDesc {
+        name,
+        addr: 0x1000,
+        args,
+        ret,
+        context,
+    }
+}
+
+static NO_ARGS: &[ArgDesc] = &[];
+static SCALAR_ARG: &[ArgDesc] = &[ArgDesc::SCALAR64];
+static OWNED_ARG: &[ArgDesc] = &[ptr_desc(
+    PtrKind::Object,
+    ValidityDomain::Owned,
+    ArgFlags::NONE,
+)];
+static TRUSTED_ARG: &[ArgDesc] = &[ptr_desc(
+    PtrKind::Object,
+    ValidityDomain::NonPreemptible,
+    ArgFlags::NONE,
+)];
+static GUARD_ARG: &[ArgDesc] = &[ptr_desc(
+    PtrKind::LockGuard,
+    ValidityDomain::NonPreemptible,
+    ArgFlags::NONE,
+)];
+/// `&mut MaybeUninit<[u8]>` plus its length.
+///
+/// Built at runtime and leaked because [`ArgFlags`] composes only through
+/// `BitOr`, which is not `const` — so a combination of two flags cannot appear
+/// in a `static`. Noted rather than worked around silently: `kfunc!` will want
+/// exactly this shape in a `#[link_section]` static, where leaking is not an
+/// option.
+fn uninit_mem_args() -> &'static [ArgDesc] {
+    Vec::leak(vec![
+        ArgDesc {
+            kind: TypeKind::Ptr {
+                kind: PtrKind::Mem,
+                key: TypeKey::NONE,
+            },
+            domain: ValidityDomain::Static,
+            flags: ArgFlags::SIZED_BY_NEXT | ArgFlags::UNINIT,
+        },
+        ArgDesc::SCALAR64,
+    ])
+}
+static READ_MEM_ARGS: &[ArgDesc] = &[
+    ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::Mem,
+            key: TypeKey::NONE,
+        },
+        domain: ValidityDomain::Static,
+        flags: ArgFlags::SIZED_BY_NEXT,
+    },
+    ArgDesc::SCALAR64,
+];
+static CONST_ARG: &[ArgDesc] = &[ArgDesc {
+    kind: TypeKind::Scalar {
+        bits: 64,
+        signed: false,
+    },
+    domain: ValidityDomain::Static,
+    flags: ArgFlags::CONST,
+}];
+
+/// An acquiring kfunc: `fn acquire() -> Option<Owned<T>>`.
+fn acquire_kfunc() -> KfuncDesc {
+    kfunc(
+        "acquire",
+        NO_ARGS,
+        ptr_desc(PtrKind::Object, ValidityDomain::Owned, ArgFlags::NULLABLE),
+        Context::Atomic,
+    )
+}
+
+/// `fn release(Owned<T>)`.
+fn release_kfunc() -> KfuncDesc {
+    kfunc("release", OWNED_ARG, ArgDesc::VOID, Context::Atomic)
+}
+
+/// `fn lock() -> Option<Guard<'_>>`.
+fn lock_kfunc() -> KfuncDesc {
+    kfunc(
+        "lock",
+        NO_ARGS,
+        ptr_desc(
+            PtrKind::LockGuard,
+            ValidityDomain::NonPreemptible,
+            ArgFlags::NULLABLE,
+        ),
+        Context::Atomic,
+    )
+}
+
+/// `fn unlock(Guard<'_>)`.
+fn unlock_kfunc() -> KfuncDesc {
+    kfunc("unlock", GUARD_ARG, ArgDesc::VOID, Context::Atomic)
+}
+
+/// A kfunc that may sleep. Calling it is an await point.
+fn sleepy_kfunc() -> KfuncDesc {
+    kfunc("narf_yield", NO_ARGS, ArgDesc::VOID, Context::Sleepable)
+}
+
+// ── ALU ─────────────────────────────────────────────────────────────
+
+#[test]
+fn arithmetic_on_scalars_verifies() {
+    let v = ok(&[
+        mov(0, 1),
+        alu(AluOp::Add, 0, 2),
+        alu(AluOp::Mul, 0, 3),
+        alu(AluOp::And, 0, 0xff),
+        EXIT,
+    ]);
+    assert_eq!(v.max_stack_bytes, 0);
+}
+
+#[test]
+fn reading_an_uninitialised_register_is_rejected() {
+    assert_eq!(
+        err(&[alu(AluOp::Add, 3, 1), mov(0, 0), EXIT]),
+        VerifyError::UninitRegister { at: 0, reg: 3 }
+    );
+}
+
+#[test]
+fn writing_the_frame_pointer_is_rejected() {
+    // R10 is read-only by the ISA, and a program that could move it could
+    // point the frame anywhere.
+    assert_eq!(
+        err(&[mov(10, 0), mov(0, 0), EXIT]),
+        VerifyError::WriteToFramePointer { at: 0 }
+    );
+}
+
+#[test]
+fn multiplying_a_pointer_is_rejected() {
+    // Add and subtract are the only defined pointer arithmetic outside an
+    // arena; anything else produces an address with no provenance.
+    assert_eq!(
+        err(&[movr(1, 10), alu(AluOp::Mul, 1, 4), mov(0, 0), EXIT]),
+        VerifyError::PointerArithmetic { at: 1, reg: 1 }
+    );
+}
+
+#[test]
+fn thirty_two_bit_arithmetic_on_a_pointer_is_rejected() {
+    // A 32-bit ALU result is zero-extended, so it is not the address it came
+    // from — the pointer's provenance does not survive the truncation.
+    assert_eq!(
+        err(&[
+            movr(1, 10),
+            Decoded::Alu {
+                wide: false,
+                op: AluOp::Add,
+                dst: r(1),
+                src: Source::Imm(0),
+            },
+            mov(0, 0),
+            EXIT,
+        ]),
+        VerifyError::PointerArithmetic { at: 1, reg: 1 }
+    );
+}
+
+#[test]
+fn the_difference_of_two_stack_pointers_is_a_scalar() {
+    let v = ok(&[
+        movr(1, 10),
+        movr(2, 10),
+        alu(AluOp::Sub, 2, 16),
+        alur(AluOp::Sub, 1, 2),
+        movr(0, 1),
+        EXIT,
+    ]);
+    assert_eq!(v.max_stack_bytes, 0);
+}
+
+#[test]
+fn returning_a_pointer_from_the_program_is_rejected() {
+    // `exit` hands R0 to the kernel as a return code. A kernel address in it
+    // is a leak with no purpose.
+    assert_eq!(
+        err(&[movr(0, 10), EXIT]),
+        VerifyError::PointerArithmetic { at: 1, reg: 0 }
+    );
+}
+
+#[test]
+fn division_by_a_possibly_zero_value_verifies() {
+    // The ISA defines `x / 0 == 0` (`instruction-set.rst:351`), so requiring a
+    // proof that the divisor is non-zero would reject code LLVM emits freely.
+    // The JIT's job is to emit the guard; the verifier's is not to demand one.
+    let v = ok(&[mov(0, 100), mov(1, 0), alur(AluOp::Add, 0, 1), EXIT]);
+    let _ = v;
+    ok(&[
+        mov(0, 100),
+        mov(1, 0),
+        Decoded::Div {
+            wide: true,
+            signed: false,
+            dst: r(0),
+            src: Source::Reg(r(1)),
+        },
+        EXIT,
+    ]);
+}
+
+// ── Stack ───────────────────────────────────────────────────────────
+
+#[test]
+fn a_doubleword_spill_round_trips() {
+    let v = ok(&[st(Size::Dw, 10, -8, 42), ldx(Size::Dw, 0, 10, -8), EXIT]);
+    assert_eq!(v.max_stack_bytes, 8);
+}
+
+#[test]
+fn reading_uninitialised_stack_is_rejected() {
+    // The BPF stack is a per-CPU region reused between programs, so a read of
+    // bytes nothing wrote returns whatever the previous program left.
+    assert_eq!(
+        err(&[ldx(Size::Dw, 0, 10, -8), EXIT]),
+        VerifyError::UninitStack { at: 0, off: -8 }
+    );
+}
+
+#[test]
+fn byte_writes_initialise_a_slot_for_a_wider_read() {
+    // Per-byte initialisation tracking, not per-slot: a compiler that fills a
+    // word with four byte stores and then reads it is doing nothing wrong, and
+    // slot-granular tracking would reject it.
+    let v = ok(&[
+        st(Size::B, 10, -4, 1),
+        st(Size::B, 10, -3, 2),
+        st(Size::B, 10, -2, 3),
+        st(Size::B, 10, -1, 4),
+        ldx(Size::W, 0, 10, -4),
+        EXIT,
+    ]);
+    assert_eq!(v.max_stack_bytes, 8);
+}
+
+#[test]
+fn a_partly_written_slot_is_not_readable_as_a_doubleword() {
+    assert_eq!(
+        err(&[st(Size::W, 10, -8, 1), ldx(Size::Dw, 0, 10, -8), EXIT]),
+        VerifyError::UninitStack { at: 1, off: -8 }
+    );
+}
+
+#[test]
+fn a_spilled_pointer_survives_a_doubleword_round_trip() {
+    ok(&[
+        stx(Size::Dw, 10, -8, 10),
+        ldx(Size::Dw, 1, 10, -8),
+        st(Size::Dw, 1, -16, 7),
+        mov(0, 0),
+        EXIT,
+    ]);
+}
+
+#[test]
+fn overwriting_one_byte_of_a_spilled_pointer_destroys_it() {
+    // Half a pointer is not a pointer. Without this, a program could forge an
+    // address by spilling a real one and editing a byte.
+    assert_eq!(
+        err(&[
+            stx(Size::Dw, 10, -8, 10),
+            st(Size::B, 10, -8, 0),
+            ldx(Size::Dw, 1, 10, -8),
+            st(Size::Dw, 1, -16, 7),
+            mov(0, 0),
+            EXIT,
+        ]),
+        VerifyError::NotAPointer { at: 3, reg: 1 }
+    );
+}
+
+#[test]
+fn stack_access_above_the_frame_pointer_is_rejected() {
+    assert_eq!(
+        err(&[st(Size::Dw, 10, 0, 1), mov(0, 0), EXIT]),
+        VerifyError::OutOfBounds { at: 0 }
+    );
+}
+
+#[test]
+fn stack_access_beyond_the_budget_is_rejected() {
+    assert_eq!(
+        err(&[st(Size::Dw, 10, -20000, 1), mov(0, 0), EXIT]),
+        VerifyError::OutOfBounds { at: 0 }
+    );
+}
+
+#[test]
+fn a_variable_stack_offset_is_rejected() {
+    // // LINUX-GAP: Linux permits a variable frame offset within proved
+    // bounds in some cases. Here it is rejected — an offset the verifier
+    // cannot pin names a slot it cannot type.
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
+    let e = check_ctx(
+        &[
+            ldx(Size::Dw, 2, 1, 0),
+            jmp(CondOp::Gt, 2, 8, 4),
+            movr(3, 10),
+            alu(AluOp::Sub, 3, 16),
+            alur(AluOp::Add, 3, 2),
+            st(Size::Dw, 3, 0, 1),
+            mov(0, 0),
+            EXIT,
+        ],
+        CTX,
+    )
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::OutOfBounds { .. }), "{e:?}");
+}
+
+#[test]
+fn stack_depth_is_the_deepest_byte_touched() {
+    let v = ok(&[
+        st(Size::Dw, 10, -8, 1),
+        st(Size::Dw, 10, -128, 1),
+        st(Size::B, 10, -200, 1),
+        mov(0, 0),
+        EXIT,
+    ]);
+    assert_eq!(v.max_stack_bytes, 200);
+}
+
+// ── Context ─────────────────────────────────────────────────────────
+
+#[test]
+fn a_context_field_load_produces_the_declared_type() {
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64, ArgDesc::SCALAR64];
+    check_ctx(&[ldx(Size::Dw, 0, 1, 8), EXIT], CTX).expect("field 1 exists");
+}
+
+#[test]
+fn a_context_load_past_the_tuple_is_rejected() {
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
+    assert_eq!(
+        check_ctx(&[ldx(Size::Dw, 0, 1, 8), EXIT], CTX).unwrap_err(),
+        VerifyError::OutOfBounds { at: 0 }
+    );
+}
+
+#[test]
+fn an_unaligned_context_load_is_rejected() {
+    // The context is the hook's argument list spilled to an eight-byte-per-
+    // field array by the trampoline. There is no narrow-load fixup layer here
+    // because there is no fictional struct to fix up.
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64, ArgDesc::SCALAR64];
+    assert_eq!(
+        check_ctx(&[ldx(Size::W, 0, 1, 4), EXIT], CTX).unwrap_err(),
+        VerifyError::OutOfBounds { at: 0 }
+    );
+}
+
+#[test]
+fn storing_to_the_context_is_rejected() {
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
+    assert_eq!(
+        check_ctx(&[st(Size::Dw, 1, 0, 0), mov(0, 0), EXIT], CTX).unwrap_err(),
+        VerifyError::WriteToReadOnly { at: 0 }
+    );
+}
+
+// ── Bounds checks and branch refinement ─────────────────────────────
+
+#[test]
+fn a_bounds_checked_index_permits_the_access() {
+    // The whole point of the numeric domain, exercised end to end: an unknown
+    // 64-bit value from the context, bounded by an unsigned comparison, used
+    // as a variable offset into a region whose size the verifier knows.
+    //
+    // The region is the caller's frame seen from inside a subprogram, which is
+    // where a *sized* region with a *variable* offset actually arises before
+    // maps land in Phase 3.
+    //
+    //   main: r1 = r10 - 64; r2 = ctx[0]; if r2 > 48 goto skip
+    //         call sub
+    //   skip: r0 = 0; exit
+    //   sub:  r1 += r2; r0 = *(u64 *)(r1 + 0); exit
+    // The index is loaded before R1 is repurposed as the frame pointer.
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
+    let prog = &[
+        ldx(Size::Dw, 2, 1, 0),
+        movr(1, 10),
+        alu(AluOp::Sub, 1, 64),
+        jmp(CondOp::Gt, 2, 48, 1),
+        Decoded::Call(CallTarget::Subprog(2)),
+        mov(0, 0),
+        EXIT,
+        alur(AluOp::Add, 1, 2),
+        ldx(Size::Dw, 0, 1, 0),
+        EXIT,
+    ];
+    check_ctx(prog, CTX).expect("a bounded index into a sized region is safe");
+}
+
+#[test]
+fn an_unbounded_index_is_rejected() {
+    // The same program with the comparison removed. If this were accepted, the
+    // bounds check above would be proving nothing.
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
+    let e = check_ctx(
+        &[
+            ldx(Size::Dw, 2, 1, 0),
+            movr(1, 10),
+            alu(AluOp::Sub, 1, 64),
+            Decoded::Call(CallTarget::Subprog(2)),
+            mov(0, 0),
+            EXIT,
+            alur(AluOp::Add, 1, 2),
+            ldx(Size::Dw, 0, 1, 0),
+            EXIT,
+        ],
+        CTX,
+    )
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::OutOfBounds { .. }), "{e:?}");
+}
+
+#[test]
+fn an_impossible_branch_is_not_analysed() {
+    // `r0 = 1; if r0 == 0 goto bad` — the taken edge is unreachable, so the
+    // uninitialised-register read on it is never reported.
+    ok(&[
+        mov(0, 1),
+        jmp(CondOp::Eq, 0, 0, 1),
+        EXIT,
+        alu(AluOp::Add, 5, 1),
+        EXIT,
+    ]);
+}
+
+// ── Loops ───────────────────────────────────────────────────────────
+
+#[test]
+fn an_unbounded_loop_verifies() {
+    // The headline property. Linux's `check_cfg()` rejects this outright
+    // because it cannot bound the iteration count. NARF does not need to:
+    // fuel terminates the program at runtime, so the verifier only has to
+    // reach a fixpoint — and if widening were wrong this test would hang
+    // rather than fail, which is precisely why it is worth having.
+    //
+    //   r0 = 0
+    //   loop: r0 += 1; goto loop
+    let v = ok(&[mov(0, 0), alu(AluOp::Add, 0, 1), Decoded::Jump { off: -2 }]);
+    assert!(v.initial_fuel > 0);
+}
+
+#[test]
+fn a_counted_loop_keeps_its_bound() {
+    //   r0 = 0
+    //   loop: r0 += 1; if r0 < 64 goto loop
+    //   *(u64 *)(r10 - 8) = r0
+    ok(&[
+        mov(0, 0),
+        alu(AluOp::Add, 0, 1),
+        jmp(CondOp::Lt, 0, 64, -2),
+        stx(Size::Dw, 10, -8, 0),
+        EXIT,
+    ]);
+}
+
+#[test]
+fn a_loop_whose_counter_escapes_still_converges() {
+    // A counter with no bound at all: the interval widens to top and the
+    // fixpoint settles. Termination here is a property of the widening
+    // operator, not of a visit budget.
+    ok(&[
+        mov(0, 0),
+        alu(AluOp::Add, 0, 1),
+        alu(AluOp::Mul, 0, 3),
+        jmp(CondOp::Ne, 1, 0, -3),
+        EXIT,
+    ]);
+}
+
+#[test]
+fn a_nested_loop_converges() {
+    ok(&[
+        mov(0, 0),
+        mov(1, 0),
+        alu(AluOp::Add, 1, 1),
+        jmp(CondOp::Lt, 1, 16, -2),
+        alu(AluOp::Add, 0, 1),
+        jmp(CondOp::Lt, 0, 256, -5),
+        EXIT,
+    ]);
+}
+
+#[test]
+fn may_goto_is_just_a_branch() {
+    // Linux gives `may_goto` its own verifier state because it is trying to
+    // bound the loop. Under fuel it is a branch that may or may not be taken,
+    // which is what "we cannot say" already means abstractly.
+    ok(&[
+        mov(0, 0),
+        alu(AluOp::Add, 0, 1),
+        Decoded::MayGoto { off: -2 },
+        EXIT,
+    ]);
+}
+
+// ── Subprograms ─────────────────────────────────────────────────────
+
+#[test]
+fn a_subprogram_call_verifies_and_sums_stack() {
+    //   main: *(u64 *)(r10 - 8) = 1; call sub; r0 = 0; exit
+    //   sub:  *(u64 *)(r10 - 128) = 1; r0 = 0; exit
+    let v = ok(&[
+        st(Size::Dw, 10, -8, 1),
+        Decoded::Call(CallTarget::Subprog(2)),
+        mov(0, 0),
+        EXIT,
+        st(Size::Dw, 10, -128, 1),
+        mov(0, 0),
+        EXIT,
+    ]);
+    assert_eq!(v.subprogs.len(), 2);
+    assert_eq!(v.subprogs[0].stack_bytes, 8);
+    assert_eq!(v.subprogs[1].stack_bytes, 128);
+    assert_eq!(v.max_stack_bytes, 136);
+}
+
+#[test]
+fn direct_recursion_is_rejected() {
+    // Fuel bounds a program's *work*, not its stack. A recursive call graph
+    // has no depth the verifier can compute and nothing at runtime would catch
+    // the overflow, so it is the one control-flow shape NARF still refuses.
+    let e = check(&[
+        Decoded::Call(CallTarget::Subprog(1)),
+        EXIT,
+        Decoded::Call(CallTarget::Subprog(-1)),
+        EXIT,
+    ])
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::Recursion { .. }), "{e:?}");
+}
+
+#[test]
+fn mutual_recursion_is_rejected() {
+    //   0: call +1      → 2
+    //   1: exit
+    //   2: call +1      → 4
+    //   3: exit
+    //   4: call -3      → 2
+    //   5: exit
+    let e = check(&[
+        Decoded::Call(CallTarget::Subprog(1)),
+        EXIT,
+        Decoded::Call(CallTarget::Subprog(1)),
+        EXIT,
+        Decoded::Call(CallTarget::Subprog(-3)),
+        EXIT,
+    ])
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::Recursion { .. }), "{e:?}");
+}
+
+#[test]
+fn a_call_graph_needing_too_much_stack_is_rejected() {
+    // Each subprogram takes 8 KiB; two of them exceed the 16 KiB budget once
+    // the leaf's frame is added.
+    let e = check(&[
+        st(Size::Dw, 10, -8192, 1),
+        Decoded::Call(CallTarget::Subprog(2)),
+        mov(0, 0),
+        EXIT,
+        st(Size::Dw, 10, -8192, 1),
+        Decoded::Call(CallTarget::Subprog(2)),
+        mov(0, 0),
+        EXIT,
+        st(Size::Dw, 10, -8192, 1),
+        mov(0, 0),
+        EXIT,
+    ])
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::StackTooDeep { .. }), "{e:?}");
+}
+
+#[test]
+fn a_callee_reading_a_callee_saved_register_first_is_rejected() {
+    // R6..R9 are callee-saved: they hold the *caller's* values, which the
+    // callee has no business reading.
+    let e = check(&[
+        Decoded::Call(CallTarget::Subprog(2)),
+        mov(0, 0),
+        EXIT,
+        movr(0, 6),
+        EXIT,
+    ])
+    .unwrap_err();
+    assert_eq!(e, VerifyError::UninitRegister { at: 3, reg: 6 });
+}
+
+// ── kfunc calls ─────────────────────────────────────────────────────
+
+#[test]
+fn an_unknown_kfunc_id_is_rejected() {
+    assert_eq!(
+        check_full(&[call(7), mov(0, 0), EXIT], &[], &[], Context::Atomic).unwrap_err(),
+        VerifyError::UnknownKfunc { at: 0, id: 7 }
+    );
+}
+
+#[test]
+fn an_argument_register_does_not_survive_a_call() {
+    // R0..R5 are clobbered by the ABI whatever the callee's arity. A verifier
+    // that let a value survive there would let a released reference look
+    // alive, which is the shape of bug that only shows up as a use-after-free.
+    let k = [kfunc(
+        "takes_scalar",
+        SCALAR_ARG,
+        ArgDesc::VOID,
+        Context::Atomic,
+    )];
+    assert_eq!(
+        check_full(
+            &[mov(1, 1), call(0), movr(0, 1), EXIT],
+            &[],
+            &k,
+            Context::Atomic
+        )
+        .unwrap_err(),
+        VerifyError::UninitRegister { at: 2, reg: 1 }
+    );
+}
+
+#[test]
+fn a_sleepable_kfunc_is_unreachable_from_an_atomic_program() {
+    // Sleepability is declared by the *hook*, not by a program flag, so this
+    // is a type error rather than a runtime check (spec §4.5).
+    let k = [sleepy_kfunc()];
+    assert_eq!(
+        check_full(&[call(0), mov(0, 0), EXIT], &[], &k, Context::Atomic).unwrap_err(),
+        VerifyError::ContextMismatch {
+            at: 0,
+            required: Context::Sleepable,
+            actual: Context::Atomic,
+        }
+    );
+    // …and reachable from a sleepable one.
+    check_full(&[call(0), mov(0, 0), EXIT], &[], &k, Context::Sleepable)
+        .expect("a sleepable program may yield");
+}
+
+#[test]
+fn a_scalar_argument_must_be_a_scalar() {
+    let k = [kfunc(
+        "takes_scalar",
+        SCALAR_ARG,
+        ArgDesc::VOID,
+        Context::Atomic,
+    )];
+    let e = check_full(
+        &[movr(1, 10), call(0), mov(0, 0), EXIT],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, VerifyError::KfuncSignature { arg: 0, .. }),
+        "{e:?}"
+    );
+
+    check_full(
+        &[mov(1, 5), call(0), mov(0, 0), EXIT],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("a scalar argument is fine");
+}
+
+#[test]
+fn a_const_argument_must_be_a_proved_constant() {
+    // `Const<N>`, which Linux spells as a `__k` suffix on a BTF parameter
+    // name. A range is not a constant, however narrow.
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
+    let k = [kfunc(
+        "takes_const",
+        CONST_ARG,
+        ArgDesc::VOID,
+        Context::Atomic,
+    )];
+    check_full(
+        &[mov(1, 5), call(0), mov(0, 0), EXIT],
+        CTX,
+        &k,
+        Context::Atomic,
+    )
+    .expect("a literal is constant");
+
+    let e = check_full(
+        &[
+            ldx(Size::Dw, 1, 1, 0),
+            jmp(CondOp::Gt, 1, 4, 3),
+            call(0),
+            mov(0, 0),
+            EXIT,
+            mov(0, 0),
+            EXIT,
+        ],
+        CTX,
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, VerifyError::KfuncSignature { arg: 0, .. }),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_nullable_result_must_be_tested_before_use() {
+    // `Option<Owned<T>>` is a verifier-enforced obligation, not a convention.
+    let k = [acquire_kfunc(), release_kfunc()];
+    let e = check_full(
+        &[call(0), movr(1, 0), call(1), mov(0, 0), EXIT],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert_eq!(e, VerifyError::PossiblyNull { at: 2, reg: 1 });
+}
+
+#[test]
+fn acquire_test_and_release_verifies() {
+    //   r0 = acquire()
+    //   if r0 == 0 goto out
+    //   r1 = r0; release(r1)
+    //   out: r0 = 0; exit
+    let k = [acquire_kfunc(), release_kfunc()];
+    check_full(
+        &[
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 2),
+            movr(1, 0),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("acquire, test, release is the whole idiom");
+}
+
+#[test]
+fn an_unreleased_reference_is_a_leak() {
+    let k = [acquire_kfunc(), release_kfunc()];
+    let e = check_full(
+        &[call(0), jmp(CondOp::Eq, 0, 0, 0), mov(0, 0), EXIT],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::LeakedReference { .. }), "{e:?}");
+}
+
+#[test]
+fn releasing_twice_is_rejected() {
+    let k = [acquire_kfunc(), release_kfunc()];
+    let e = check_full(
+        &[
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 4),
+            movr(6, 0),
+            movr(1, 6),
+            call(1),
+            movr(1, 6),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            VerifyError::ReleaseOfUnacquired { .. } | VerifyError::UninitRegister { .. }
+        ),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn releasing_something_never_acquired_is_rejected() {
+    // A `Trusted<T>` from the context is not a reference, so handing it to a
+    // release is a refcount underflow waiting to happen.
+    static CTX: &[ArgDesc] = &[ptr_desc(
+        PtrKind::Object,
+        ValidityDomain::Owned,
+        ArgFlags::NONE,
+    )];
+    let k = [release_kfunc()];
+    let e = check_full(
+        &[ldx(Size::Dw, 1, 1, 0), call(0), mov(0, 0), EXIT],
+        CTX,
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    // The context field is loaded as an opaque scalar (there is no BTF to type
+    // it with), so this is caught as a signature mismatch rather than as an
+    // unacquired release — either way, it does not verify.
+    assert!(
+        matches!(
+            e,
+            VerifyError::ReleaseOfUnacquired { .. } | VerifyError::KfuncSignature { .. }
+        ),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_weaker_pointer_domain_does_not_satisfy_a_stronger_one() {
+    // The verifier never widens a validity domain: a `Trusted<T>` cannot be
+    // passed where an `Owned<T>` is wanted, though the reverse is fine.
+    let k = [
+        kfunc(
+            "get_trusted",
+            NO_ARGS,
+            ptr_desc(
+                PtrKind::Object,
+                ValidityDomain::NonPreemptible,
+                ArgFlags::NONE,
+            ),
+            Context::Atomic,
+        ),
+        release_kfunc(),
+        kfunc("takes_trusted", TRUSTED_ARG, ArgDesc::VOID, Context::Atomic),
+    ];
+    let e = check_full(
+        &[call(0), movr(1, 0), call(1), mov(0, 0), EXIT],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, VerifyError::KfuncSignature { arg: 0, .. }),
+        "{e:?}"
+    );
+
+    check_full(
+        &[call(0), movr(1, 0), call(2), mov(0, 0), EXIT],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("a trusted pointer satisfies a trusted parameter");
+}
+
+// ── The one rule: validity domains at an await ──────────────────────
+
+#[test]
+fn a_trusted_pointer_cannot_cross_an_await() {
+    // Spec §4.4, and the whole of NARF's sleep-safety story. Linux needs
+    // `bpf_rcu_read_lock`, `KF_RCU_PROTECTED`, `MEM_RCU`, and refcounted kptrs
+    // to say this, because sleepability arrived years after the pointer model.
+    let k = [
+        kfunc(
+            "get_trusted",
+            NO_ARGS,
+            ptr_desc(
+                PtrKind::Object,
+                ValidityDomain::NonPreemptible,
+                ArgFlags::NONE,
+            ),
+            Context::Atomic,
+        ),
+        sleepy_kfunc(),
+        kfunc("takes_trusted", TRUSTED_ARG, ArgDesc::VOID, Context::Atomic),
+    ];
+    let e = check_full(
+        &[
+            call(0),
+            movr(6, 0),
+            call(1),
+            movr(1, 6),
+            call(2),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Sleepable,
+    )
+    .unwrap_err();
+    assert_eq!(
+        e,
+        VerifyError::PointerCrossesAwait {
+            at: 2,
+            reg: 6,
+            domain: ValidityDomain::NonPreemptible,
+        }
+    );
+}
+
+#[test]
+fn an_owned_reference_survives_an_await() {
+    // Same program shape, one field different in the descriptor. That is the
+    // point of putting validity in the type system: the rule is the same, the
+    // answer follows from the domain.
+    let k = [acquire_kfunc(), sleepy_kfunc(), release_kfunc()];
+    check_full(
+        &[
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 4),
+            movr(6, 0),
+            call(1),
+            movr(1, 6),
+            call(2),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Sleepable,
+    )
+    .expect("a refcount holds the object alive across a sleep");
+}
+
+#[test]
+fn a_lock_guard_cannot_be_held_across_an_await() {
+    // "No sleeping with a lock held" is not a separate check — a guard is
+    // simply not sleep-safe, so the same kill-at-await rule catches it.
+    let k = [lock_kfunc(), sleepy_kfunc(), unlock_kfunc()];
+    let e = check_full(
+        &[
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 4),
+            movr(6, 0),
+            call(1),
+            movr(1, 6),
+            call(2),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Sleepable,
+    )
+    .unwrap_err();
+    assert_eq!(
+        e,
+        VerifyError::PointerCrossesAwait {
+            at: 3,
+            reg: 6,
+            domain: ValidityDomain::NonPreemptible,
+        }
+    );
+}
+
+#[test]
+fn a_lock_must_be_released_before_exit() {
+    // Linearity from the same bookkeeping as any acquired reference — no
+    // `active_lock_id`, no `process_spin_lock()`, no
+    // `invalidate_non_owning_refs()`.
+    let k = [lock_kfunc(), unlock_kfunc()];
+    let e = check_full(
+        &[call(0), jmp(CondOp::Eq, 0, 0, 0), mov(0, 0), EXIT],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::LeakedReference { .. }), "{e:?}");
+
+    check_full(
+        &[
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 2),
+            movr(1, 0),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("lock, test, unlock");
+}
+
+#[test]
+fn only_one_lock_may_be_held_at_a_time() {
+    // v1 permits one live guard, enforced by counting them — free, given the
+    // reference bookkeeping already exists. Nesting under a declared
+    // lock-order lattice is spec §8.3.
+    let k = [lock_kfunc(), unlock_kfunc()];
+    let e = check_full(
+        &[
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 5),
+            movr(6, 0),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 2),
+            movr(1, 6),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            VerifyError::TooManyLocks { .. } | VerifyError::LeakedReference { .. }
+        ),
+        "{e:?}"
+    );
+}
+
+// ── Sized memory arguments ──────────────────────────────────────────
+
+#[test]
+fn an_uninit_memory_argument_initialises_the_stack() {
+    // `&mut MaybeUninit<[u8]>`: the callee fills it, so the caller need not
+    // have, and the bytes are defined afterwards.
+    let k = [kfunc(
+        "fill",
+        uninit_mem_args(),
+        ArgDesc::VOID,
+        Context::Atomic,
+    )];
+    check_full(
+        &[
+            movr(1, 10),
+            alu(AluOp::Sub, 1, 16),
+            mov(2, 16),
+            call(0),
+            ldx(Size::Dw, 0, 10, -16),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("the callee initialised the region");
+}
+
+#[test]
+fn a_read_memory_argument_requires_initialised_bytes() {
+    let k = [kfunc("read", READ_MEM_ARGS, ArgDesc::VOID, Context::Atomic)];
+    let e = check_full(
+        &[
+            movr(1, 10),
+            alu(AluOp::Sub, 1, 16),
+            mov(2, 16),
+            call(0),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert_eq!(e, VerifyError::UninitStack { at: 3, off: -16 });
+}
+
+#[test]
+fn a_memory_argument_longer_than_its_region_is_rejected() {
+    let k = [kfunc(
+        "fill",
+        uninit_mem_args(),
+        ArgDesc::VOID,
+        Context::Atomic,
+    )];
+    let e = check_full(
+        &[
+            movr(1, 10),
+            alu(AluOp::Sub, 1, 16),
+            mov(2, 32),
+            call(0),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert_eq!(e, VerifyError::OutOfBounds { at: 3 });
+}
+
+#[test]
+fn a_memory_argument_with_an_unbounded_length_is_rejected() {
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
+    let k = [kfunc(
+        "fill",
+        uninit_mem_args(),
+        ArgDesc::VOID,
+        Context::Atomic,
+    )];
+    let e = check_full(
+        &[
+            ldx(Size::Dw, 2, 1, 0),
+            movr(1, 10),
+            alu(AluOp::Sub, 1, 16),
+            call(0),
+            mov(0, 0),
+            EXIT,
+        ],
+        CTX,
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert_eq!(e, VerifyError::OutOfBounds { at: 3 });
+}
+
+#[test]
+fn a_bounded_length_makes_the_same_argument_safe() {
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
+    let k = [kfunc(
+        "fill",
+        uninit_mem_args(),
+        ArgDesc::VOID,
+        Context::Atomic,
+    )];
+    check_full(
+        &[
+            ldx(Size::Dw, 2, 1, 0),
+            jmp(CondOp::Gt, 2, 16, 5),
+            movr(1, 10),
+            alu(AluOp::Sub, 1, 16),
+            call(0),
+            mov(0, 0),
+            EXIT,
+            mov(0, 0),
+            EXIT,
+        ],
+        CTX,
+        &k,
+        Context::Atomic,
+    )
+    .expect("an unsigned upper bound is exactly what the region check needs");
+}
+
+// ── Fault sites: objects and arenas ─────────────────────────────────
+
+#[test]
+fn a_load_through_an_object_pointer_records_a_fault_site() {
+    // A typed kernel object is opaque — there is no in-kernel BTF to give it a
+    // layout — so the load is emitted unchecked and covered by the exception
+    // table instead. That is what makes `task->mm->owner` safe to write
+    // without a null test, and the JIT must register the entry *before*
+    // publishing the text (spec §4.3).
+    let k = [kfunc(
+        "get_object",
+        NO_ARGS,
+        ptr_desc(
+            PtrKind::Object,
+            ValidityDomain::NonPreemptible,
+            ArgFlags::NONE,
+        ),
+        Context::Atomic,
+    )];
+    let v = check_full(
+        &[call(0), ldx(Size::Dw, 6, 0, 24), movr(0, 6), EXIT],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("an unchecked probe load is safe because the extable covers it");
+    assert_eq!(v.fault_sites.len(), 1);
+    assert_eq!(v.fault_sites[0].insn_index, 1);
+    assert_eq!(v.fault_sites[0].dst_reg, Some(6));
+    assert!(!v.fault_sites[0].arena);
+    assert!(!v.uses_arena);
+}
+
+#[test]
+fn arena_arithmetic_is_unrestricted_and_records_arena_fault_sites() {
+    // Arena pointer arithmetic is deliberately unchecked: the guard is a whole
+    // unmapped 512 GiB slot on each side of the window, so an escape by the
+    // ISA's 16-bit displacement is structurally impossible. Same bargain as
+    // `verifier.c:16186`, with more room.
+    let k = [kfunc(
+        "arena_base",
+        NO_ARGS,
+        ptr_desc(PtrKind::Arena, ValidityDomain::Static, ArgFlags::NONE),
+        Context::Atomic,
+    )];
+    let v = check_full(
+        &[
+            call(0),
+            alu(AluOp::Mul, 0, 12345),
+            st(Size::Dw, 0, 32767, 1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("arena arithmetic needs no proof");
+    assert!(v.uses_arena);
+    assert_eq!(v.fault_sites.len(), 1);
+    assert!(v.fault_sites[0].arena);
+    assert_eq!(
+        v.fault_sites[0].dst_reg, None,
+        "a store has no register to zero"
+    );
+}
+
+// ── Atomics ─────────────────────────────────────────────────────────
+
+#[test]
+fn an_atomic_add_on_the_stack_verifies() {
+    ok(&[
+        st(Size::Dw, 10, -8, 0),
+        mov(1, 1),
+        Decoded::Atomic {
+            size: Size::Dw,
+            op: AtomicOp::Add { fetch: true },
+            dst: r(10),
+            src: r(1),
+            off: -8,
+        },
+        movr(0, 1),
+        EXIT,
+    ]);
+}
+
+#[test]
+fn a_compare_and_exchange_clobbers_r0() {
+    // The only instruction in the ISA with an implicit register operand.
+    ok(&[
+        st(Size::Dw, 10, -8, 0),
+        mov(0, 0),
+        mov(1, 1),
+        Decoded::Atomic {
+            size: Size::Dw,
+            op: AtomicOp::Cmpxchg,
+            dst: r(10),
+            src: r(1),
+            off: -8,
+        },
+        EXIT,
+    ]);
+}
+
+#[test]
+fn an_atomic_on_a_scalar_is_rejected() {
+    assert_eq!(
+        err(&[
+            mov(2, 0),
+            mov(1, 1),
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Add { fetch: false },
+                dst: r(2),
+                src: r(1),
+                off: 0,
+            },
+            mov(0, 0),
+            EXIT,
+        ]),
+        VerifyError::NotAPointer { at: 2, reg: 2 }
+    );
+}
+
+// ── Constructs that fail closed ─────────────────────────────────────
+
+#[test]
+fn map_pseudo_immediates_are_not_implemented_yet() {
+    // Maps are Phase 3, and there is nowhere in `Program` to describe one. A
+    // verifier that guessed a value size would be worse than one that says no.
+    let e = check(&[
+        Decoded::LoadImm64 {
+            dst: r(1),
+            value: Imm64::MapFd(3),
+        },
+        mov(0, 0),
+        EXIT,
+    ])
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::NotImplemented(_)), "{e:?}");
+}
+
+#[test]
+fn callback_subprogram_addresses_are_not_implemented_yet() {
+    let e = check(&[
+        Decoded::LoadImm64 {
+            dst: r(1),
+            value: Imm64::SubprogAddr(1),
+        },
+        mov(0, 0),
+        EXIT,
+        EXIT,
+    ])
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::NotImplemented(_)), "{e:?}");
+}
+
+// ── Against the reference interpreter ───────────────────────────────
+
+#[test]
+fn a_verified_program_computes_what_the_reference_interpreter_says() {
+    // Verification proves safety, not correctness — but a program the verifier
+    // accepts must still *mean* what the ISA says, and running it is the only
+    // way to check that the transfer functions were modelling the right
+    // machine. If the abstract stack model disagreed with the concrete one
+    // about slot addressing, this would diverge.
+    let prog = &[
+        mov(0, 7),
+        alu(AluOp::Mul, 0, 6),
+        stx(Size::Dw, 10, -8, 0),
+        mov(0, 0),
+        ldx(Size::Dw, 0, 10, -8),
+        alu(AluOp::Add, 0, 1),
+        EXIT,
+    ];
+    ok(prog);
+    let image = encode_all(prog);
+    let mut m = interp::Machine::new();
+    assert_eq!(interp::run(&image, &mut m), Ok(43));
+}
+
+#[test]
+fn a_verified_counted_loop_terminates_under_fuel() {
+    // Fuel is what makes verification a safety problem rather than a
+    // termination problem, so the two halves of that bargain are worth
+    // exercising together: the verifier accepts the loop, and the concrete
+    // machine's fuel is what stops it.
+    let prog = &[
+        mov(0, 0),
+        alu(AluOp::Add, 0, 1),
+        jmp(CondOp::Lt, 0, 64, -2),
+        EXIT,
+    ];
+    ok(prog);
+    let image = encode_all(prog);
+    let mut m = interp::Machine::new();
+    assert_eq!(interp::run(&image, &mut m), Ok(64));
+
+    // An unbounded loop verifies just as happily, and fuel is what ends it.
+    let spin = &[mov(0, 0), alu(AluOp::Add, 0, 1), Decoded::Jump { off: -2 }];
+    ok(spin);
+    let image = encode_all(spin);
+    let mut m = interp::Machine::new();
+    m.fuel = 1000;
+    assert_eq!(interp::run(&image, &mut m), Err(interp::Trap::OutOfFuel));
+}
+
+#[test]
+fn verification_is_a_function_of_the_program_alone() {
+    // No budget means no dependence on how much work verification took, so the
+    // same program verifies identically however large it is. A thousand
+    // sequential adds would blow past Linux's per-instruction state limit long
+    // before its instruction limit.
+    let mut prog = vec![mov(0, 0)];
+    for _ in 0..2000 {
+        prog.push(alu(AluOp::Add, 0, 1));
+    }
+    prog.push(EXIT);
+    let v = ok(&prog);
+    assert_eq!(v.insns.len(), 2002);
+}

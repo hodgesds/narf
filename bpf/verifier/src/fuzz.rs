@@ -139,6 +139,129 @@ where
     }
 }
 
+// ─── Instruction-level transfers, both widths ───────────────────────
+//
+// These drive the abstract side through the *same* dispatch the verifier's
+// transfer function uses (`Scalar::alu`, `div_op`, `mod_op`, …), against the
+// reference interpreter's dispatch. Fuzzing only the 64-bit primitives would
+// leave the 32-bit forms — where the zero-extension and the arithmetic-shift
+// sign handling live, and where the subtle bugs are — covered by nothing.
+
+const ALU_OPS: &[AluOp] = &[
+    AluOp::Add,
+    AluOp::Sub,
+    AluOp::Mul,
+    AluOp::Or,
+    AluOp::And,
+    AluOp::Xor,
+    AluOp::Lsh,
+    AluOp::Rsh,
+    AluOp::Arsh,
+];
+
+#[test]
+fn every_alu_op_is_sound_in_both_widths() {
+    let mut rng = Rng::new(30);
+    for _ in 0..8_000 {
+        let (a, avs) = sample_abstract(&mut rng);
+        // Shifts only say anything about a constant amount, so half the
+        // right-hand sides are drawn as constants.
+        let (b, bvs) = if rng.below(2) == 0 {
+            let n = rng.below(70);
+            (Scalar::constant(n as i64), alloc::vec![n])
+        } else {
+            sample_abstract(&mut rng)
+        };
+        for &op in ALU_OPS {
+            for wide in [true, false] {
+                let r = a.alu(op, wide, &b);
+                for &x in &avs {
+                    for &y in &bvs {
+                        let c = interp::alu(op, wide, x, y);
+                        assert!(
+                            r.contains(c),
+                            "{op:?} wide={wide}: {x:#x} op {y:#x} = {c:#x} escaped {r:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn division_and_modulo_are_sound_in_both_widths_and_signednesses() {
+    let mut rng = Rng::new(31);
+    for _ in 0..8_000 {
+        let (a, avs) = sample_abstract(&mut rng);
+        let (b, bvs) = sample_abstract(&mut rng);
+        for wide in [true, false] {
+            for signed in [true, false] {
+                let d = a.div_op(wide, signed, &b);
+                let m = a.mod_op(wide, signed, &b);
+                for &x in &avs {
+                    for &y in &bvs {
+                        assert!(
+                            d.contains(interp::div(wide, signed, x, y)),
+                            "div wide={wide} signed={signed}: {x:#x}/{y:#x} escaped {d:?}"
+                        );
+                        assert!(
+                            m.contains(interp::rem(wide, signed, x, y)),
+                            "mod wide={wide} signed={signed}: {x:#x}%{y:#x} escaped {m:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn moves_negations_and_byte_swaps_are_sound() {
+    let mut rng = Rng::new(32);
+    for _ in 0..10_000 {
+        let (a, avs) = sample_abstract(&mut rng);
+        for wide in [true, false] {
+            let n = a.neg_op(wide);
+            for &x in &avs {
+                let c = if wide {
+                    (x as i64).wrapping_neg() as u64
+                } else {
+                    u64::from((x as u32).wrapping_neg())
+                };
+                assert!(
+                    n.contains(c),
+                    "neg wide={wide}: {x:#x} → {c:#x} escaped {n:?}"
+                );
+            }
+            for sx in [None, Some(8u8), Some(16), Some(32)] {
+                let m = a.mov_op(wide, sx);
+                for &x in &avs {
+                    let c = match (sx, wide) {
+                        (Some(bits), true) => interp::sext(x, u32::from(bits)),
+                        (Some(bits), false) => u64::from(interp::sext(x, u32::from(bits)) as u32),
+                        (None, true) => x,
+                        (None, false) => u64::from(x as u32),
+                    };
+                    assert!(m.contains(c), "mov wide={wide} sx={sx:?}: {x:#x} → {c:#x}");
+                }
+            }
+        }
+        for order in [ByteOrder::Little, ByteOrder::Big, ByteOrder::Swap] {
+            for width in [16u8, 32, 64] {
+                let e = a.end_op(order, width);
+                for &x in &avs {
+                    let c = interp::end(order, width, x);
+                    assert!(
+                        e.contains(c),
+                        "end {order:?}/{width}: {x:#x} → {c:#x} escaped {e:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 // ─── Transfer functions, per instruction class ──────────────────────
 
 #[test]
@@ -410,7 +533,10 @@ fn refinement_keeps_every_satisfying_value() {
         let (a, avs) = sample_abstract(&mut rng);
         let c = sample_value(&mut rng);
 
-        let cases: [(Option<Scalar>, &dyn Fn(u64) -> bool, &str); 4] = [
+        /// A refined value, the predicate it was refined by, and a label.
+        type Case<'a> = (Option<Scalar>, &'a dyn Fn(u64) -> bool, &'static str);
+
+        let cases: [Case<'_>; 4] = [
             (a.refine_unsigned_max(c), &|v: u64| v <= c, "u<="),
             (a.refine_unsigned_min(c), &|v: u64| v >= c, "u>="),
             (

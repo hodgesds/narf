@@ -41,6 +41,8 @@
 
 use core::cmp::{max, min};
 
+use narf_bpf_isa::{AluOp, ByteOrder};
+
 /// A tristate number: each bit is 0, 1, or unknown.
 ///
 /// Invariant: `value & mask == 0`. A bit set in `mask` is unknown, and its
@@ -1003,6 +1005,123 @@ impl Scalar {
     }
 }
 
+// ── Instruction-level transfers ─────────────────────────────────────
+//
+// One method per instruction class, so the differential fuzzer can drive the
+// abstract side through exactly the same dispatch the verifier does. The
+// alternative — assembling these in the transfer function and fuzzing only the
+// primitives — leaves the 32-bit forms, which are where the subtle bugs live,
+// covered by nothing.
+
+impl Scalar {
+    /// A binary ALU operation.
+    ///
+    /// Every 32-bit form is "do it on the low half, zero-extend the result",
+    /// which is one rule rather than nine, and is why the shifts are the only
+    /// ones needing more than a `zext32` sandwich.
+    #[must_use]
+    pub fn alu(&self, op: AluOp, wide: bool, other: &Scalar) -> Scalar {
+        if wide {
+            return match op {
+                AluOp::Add => self.add(other),
+                AluOp::Sub => self.sub(other),
+                AluOp::Mul => self.mul(other),
+                AluOp::Or => self.or(other),
+                AluOp::And => self.and(other),
+                AluOp::Xor => self.xor(other),
+                AluOp::Lsh => self.shl(other),
+                AluOp::Rsh => self.shr(other),
+                AluOp::Arsh => self.sar(other),
+            };
+        }
+        let a = self.zext32();
+        let b = other.zext32();
+        let amount = b.and(&Scalar::constant(31));
+        match op {
+            AluOp::Add => a.add(&b).zext32(),
+            AluOp::Sub => a.sub(&b).zext32(),
+            AluOp::Mul => a.mul(&b).zext32(),
+            AluOp::Or => a.or(&b),
+            AluOp::And => a.and(&b),
+            AluOp::Xor => a.xor(&b),
+            AluOp::Lsh => a.shl(&amount).zext32(),
+            AluOp::Rsh => a.shr(&amount),
+            // Arithmetic shift is the one that has to see the *signed* 32-bit
+            // value, which is exactly the fact a zero-extended view discards.
+            AluOp::Arsh => self.sext32().sar(&amount).zext32(),
+        }
+    }
+
+    /// Division, in either width and either signedness.
+    #[must_use]
+    pub fn div_op(&self, wide: bool, signed: bool, other: &Scalar) -> Scalar {
+        match (wide, signed) {
+            (true, false) => self.udiv(other),
+            (true, true) => self.sdiv(other),
+            (false, false) => self.zext32().udiv(&other.zext32()).zext32(),
+            (false, true) => match (self.sext32().as_const(), other.sext32().as_const()) {
+                (Some(a), Some(b)) => {
+                    Scalar::constant(i64::from(concrete_sdiv32(a as i32, b as i32) as u32))
+                }
+                _ => Scalar::unsigned_bits(32),
+            },
+        }
+    }
+
+    /// Modulo, in either width and either signedness. Returns the new value of
+    /// the destination, which for a zero divisor is the old one.
+    #[must_use]
+    pub fn mod_op(&self, wide: bool, signed: bool, other: &Scalar) -> Scalar {
+        match (wide, signed) {
+            (true, false) => self.umod(other),
+            (true, true) => self.smod(other),
+            (false, false) => self.zext32().umod(&other.zext32()).zext32(),
+            (false, true) => match (self.sext32().as_const(), other.sext32().as_const()) {
+                (Some(a), Some(b)) => {
+                    Scalar::constant(i64::from(concrete_smod32(a as i32, b as i32) as u32))
+                }
+                _ => Scalar::unsigned_bits(32),
+            },
+        }
+    }
+
+    /// Negation.
+    #[must_use]
+    pub fn neg_op(&self, wide: bool) -> Scalar {
+        if wide {
+            self.neg()
+        } else {
+            self.zext32().neg().zext32()
+        }
+    }
+
+    /// A register or immediate move, with optional sign extension.
+    #[must_use]
+    pub fn mov_op(&self, wide: bool, sign_extend: Option<u8>) -> Scalar {
+        match (sign_extend, wide) {
+            (None, true) => *self,
+            (None, false) => self.zext32(),
+            (Some(bits), true) => self.sign_extend(u32::from(bits)),
+            (Some(bits), false) => self.sign_extend(u32::from(bits)).zext32(),
+        }
+    }
+
+    /// Byte-order conversion.
+    #[must_use]
+    pub fn end_op(&self, order: ByteOrder, width: u8) -> Scalar {
+        match order {
+            // Both supported targets are little-endian, so `to_le` truncates
+            // and does nothing else.
+            ByteOrder::Little => match width {
+                16 => self.zext32().and(&Scalar::constant(0xffff)),
+                32 => self.zext32(),
+                _ => *self,
+            },
+            ByteOrder::Big | ByteOrder::Swap => self.bswap(width),
+        }
+    }
+}
+
 /// Abstraction of an unsigned range.
 #[must_use]
 pub fn from_unsigned_range(lo: u64, hi: u64) -> Scalar {
@@ -1093,6 +1212,32 @@ pub const fn concrete_smod(a: i64, b: i64) -> i64 {
     if b == 0 {
         a
     } else if a == i64::MIN && b == -1 {
+        0
+    } else {
+        a % b
+    }
+}
+
+/// Signed 32-bit division with the ISA's special cases.
+#[inline]
+#[must_use]
+pub const fn concrete_sdiv32(a: i32, b: i32) -> i32 {
+    if b == 0 {
+        0
+    } else if a == i32::MIN && b == -1 {
+        i32::MIN
+    } else {
+        a / b
+    }
+}
+
+/// Signed 32-bit modulo. A zero divisor leaves the dividend.
+#[inline]
+#[must_use]
+pub const fn concrete_smod32(a: i32, b: i32) -> i32 {
+    if b == 0 {
+        a
+    } else if a == i32::MIN && b == -1 {
         0
     } else {
         a % b
