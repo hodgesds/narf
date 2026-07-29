@@ -89,6 +89,14 @@ fn alu_imm(op: AluOp, dst: u8, v: i32) -> Decoded {
         src: Source::Imm(v),
     }
 }
+fn alu_reg(op: AluOp, dst: u8, src: u8) -> Decoded {
+    Decoded::Alu {
+        wide: true,
+        op,
+        dst: r(dst),
+        src: Source::Reg(r(src)),
+    }
+}
 fn jne_imm(dst: u8, v: i32, off: i16) -> Decoded {
     Decoded::JumpCond {
         wide: true,
@@ -282,6 +290,37 @@ fn smoke_bpf_interp_calls_kfunc() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_interp_calls_kfunc);
 
+fn smoke_bpf_interp_call_clobbers_arg_regs() -> TestResult {
+    // The BPF ABI makes R1..R5 caller-saved and R6..R9 callee-saved. A
+    // interpreter that quietly preserved R1..R5 would accept programs the JIT
+    // then miscompiles, so the clobber is pinned here rather than left
+    // implicit.
+    //   r3 = 0x55; r6 = 0x66; r1 = 0; call narf_counter_read; r0 = r3 + r6
+    let insns = asm(&[
+        mov_imm(3, 0x55),
+        mov_imm(6, 0x66),
+        mov_imm(1, 0),
+        call("narf_counter_read"),
+        alu_reg(AluOp::Add, 3, 6),
+        mov_reg(0, 3),
+        EXIT,
+    ]);
+    let Ok(p) = load("clobber", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected the clobber program");
+    };
+    match p.run_atomic([0; 4], 4) {
+        // r3 was clobbered to 0, r6 survived: 0 + 0x66.
+        Some(Outcome::Returned(0x66)) => TestResult::Pass,
+        Some(Outcome::Returned(0xBB)) => {
+            TestResult::Fail("R1..R5 survived a call — they are caller-saved")
+        }
+        Some(Outcome::Returned(_)) => TestResult::Fail("unexpected value after a call"),
+        Some(Outcome::Trapped(_)) => TestResult::Fail("clobber program trapped"),
+        None => TestResult::Fail("per-CPU stack declined"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_interp_call_clobbers_arg_regs);
+
 // ── interpreter: negative ───────────────────────────────────────────
 
 fn smoke_bpf_interp_wild_load_traps_not_faults() -> TestResult {
@@ -402,20 +441,23 @@ fn smoke_bpf_probe_attach_fires() -> TestResult {
     const SLOT: u32 = 5;
     crate::kfuncs::reset_counter(SLOT as usize);
 
-    // r1 = SLOT; r2 = *(u64 *)(r1_ctx + 0) — needs the ctx before r1 is
-    // clobbered, so read first, then set up the call.
-    //   r3 = *(u64 *)(r1 + 0)     ; ctx word 0
+    //   r6 = *(u64 *)(r1 + 0)     ; ctx word 0, stashed callee-saved
     //   r1 = SLOT
-    //   r2 = r3
+    //   r2 = r6
     //   call narf_counter_add
-    //   r0 = r3
+    //   r0 = r6
     //   exit
+    //
+    // The stash must be R6..R9: the BPF ABI makes R1..R5 caller-saved, so a
+    // call clobbers them. Reading the ctx into R3 and expecting it to survive
+    // `call` is the classic version of this bug, and the interpreter models
+    // the clobber faithfully rather than quietly preserving the register.
     let insns = asm(&[
-        ldx(3, 1, 0),
+        ldx(6, 1, 0),
         mov_imm(1, SLOT as i32),
-        mov_reg(2, 3),
+        mov_reg(2, 6),
         call("narf_counter_add"),
-        mov_reg(0, 3),
+        mov_reg(0, 6),
         EXIT,
     ]);
     let Ok(prog) = load("probe", insns, Context::Atomic) else {

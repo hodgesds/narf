@@ -6351,6 +6351,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_epoll_wait),
     );
     table.install_raw(Syscall::Eventfd, "eventfd", RawFnHandler(sys_eventfd));
+    table.install_raw(Syscall::Bpf, "bpf", RawFnHandler(sys_bpf));
     table.install_raw(
         Syscall::PidfdOpen,
         "pidfd_open",
@@ -7854,6 +7855,8 @@ mod handler_sys_arch_prctl;
 mod handler_sys_at2_reshape;
 #[path = "sys_bootstrap.rs"]
 mod handler_sys_bootstrap;
+#[path = "sys_bpf.rs"]
+mod handler_sys_bpf;
 #[path = "sys_brk.rs"]
 mod handler_sys_brk;
 #[path = "sys_capget.rs"]
@@ -8433,6 +8436,8 @@ mod handler_sys_yield;
 
 #[allow(unused_imports)]
 pub(crate) use handler_sys_arch_prctl::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_bpf::*;
 #[allow(unused_imports)]
 pub use handler_sys_chdir_for_test::*;
 #[allow(unused_imports)]

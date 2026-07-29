@@ -2254,6 +2254,17 @@ pub enum Syscall {
     /// Linux (x86_64=298, aarch64=241).
     PerfEventOpen,
 
+    /// `bpf(cmd, attr, size)` — load and run BPF programs.
+    /// Linux (x86_64=321, aarch64=280).
+    ///
+    /// NARF implements `BPF_PROG_LOAD` and `BPF_PROG_TEST_RUN`; every other
+    /// command returns `ENOTSUP` with a `// LINUX-GAP` note at its arm, per
+    /// `bpf/specification/spec.md` §1. The `union bpf_attr` layout is Linux's
+    /// verbatim so `libbpf`-shaped loaders work unchanged, but the *semantics*
+    /// above the instruction encoding are NARF's — one call ABI, no
+    /// unprivileged mode, and fuel instead of an instruction budget.
+    Bpf,
+
     /// `lsm_get_self_attr(attr, ctx, size, flags)` — read a task security
     /// attribute. Linux (x86_64=459, aarch64=459).
     LsmGetSelfAttr,
@@ -2660,6 +2671,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     // issues eventfd2, so map 290 to the same (eventfd2-shaped) handler.
     (Syscall::Eventfd, 290),
     (Syscall::PerfEventOpen, 298),
+    (Syscall::Bpf, 321),
     (Syscall::Fallocate, 285),
     (Syscall::TimerfdSettime, 286),
     (Syscall::TimerfdGettime, 287),
@@ -2868,6 +2880,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SocketRecvMsg, 212),
     (Syscall::SocketPair, 199),
     (Syscall::PerfEventOpen, 241),
+    (Syscall::Bpf, 280),
     (Syscall::SocketAccept4, 242),
     (Syscall::Sendfile, 71),
     (Syscall::Mremap, 216),

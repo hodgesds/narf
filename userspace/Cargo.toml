@@ -26,6 +26,9 @@ narf-memory       = { path = "../memory" }
 narf-scheduler    = { path = "../scheduler" }
 narf-time         = { path = "../time" }
 narf-tracing      = { path = "../tracing" }
+narf-bpf          = { path = "../bpf" }
+narf-bpf-isa      = { path = "../bpf/isa" }
+narf-bpf-verifier = { path = "../bpf/verifier" }
 narf-initramfs    = { path = "../initramfs" }
 narf-input        = { path = "../input" }
 narf-interrupts   = { path = "../interrupts" }

@@ -92,6 +92,7 @@ narf-rcu             = { path = "../rcu" }
 narf-filesystem      = { path = "../filesystem" }
 narf-userspace       = { path = "../userspace" }
 narf-user-runtime    = { path = "../user-runtime" }
+narf-bpf             = { path = "../bpf" }
 narf-kernel-test     = { path = "../verification/kernel-test" }
 narf-verification    = { path = "../verification", optional = true }
 
@@ -256,7 +257,17 @@ kernel-test  = [
     "narf-fb/kernel-test",
     "narf-arch/kernel-test",
     "narf-scheduler/kernel-test",
+    "bpf",
 ]
+# In-kernel BPF smokes (`cargo xtask test --subsystem bpf`).
+#
+# The BPF *subsystem* is unconditional: `bpf(2)` is registered on every build
+# (cap-gated, so an unprivileged caller gains nothing) and
+# `narf_bpf::register_initcalls()` runs at boot. Gating the syscall behind a
+# feature would only add another feature-combination to check while changing
+# nothing an attacker sees. This feature turns on the smokes.
+bpf = ["narf-bpf/kernel-test"]
+
 # Chain into verification's opt-in user-mode smoke tests (round-trip,
 # yield_resume, poll_yield_exit, future yield_exit). These pass the
 # kernel through to subsequent tests without exiting.

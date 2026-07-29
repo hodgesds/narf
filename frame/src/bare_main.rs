@@ -2123,6 +2123,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_bus::set_probe_log_hook(_init_log);
             narf_bus::set_probe_log(true);
 
+            // BPF: collect and validate the `narf.kfuncs` link section.
+            // `Subsys` because collection allocates; the boot-order
+            // constraint that actually matters for BPF — reserving the
+            // kernel-VA slots *before* the first user address space
+            // (`bpf/specification/spec.md` §4.1) — is a direct call, not an
+            // initcall, and arrives with the arena work.
+            narf_bpf::register_initcalls();
             narf_input::register_initcalls();
             narf_drivers_nvme::register_initcalls();
             narf_drivers_virtio::register_initcalls();

@@ -65,6 +65,14 @@ extern crate narf_crypto;
 #[used]
 static __FORCE_LINK_CRYPTO: fn() -> usize = || narf_crypto::blake3_hash(&[]).len();
 
+// narf-bpf contributes the `bpf` subsystem smokes. It also carries the only
+// writers of the `narf.kfuncs` and `narf.structops` link sections, so a
+// dropped compilation unit here costs more than a few tests: the kfunc
+// registry comes up empty and every program load fails to resolve a call.
+extern crate narf_bpf;
+#[used]
+static __FORCE_LINK_BPF: fn() -> (usize, usize) = narf_bpf::summary;
+
 use core::fmt::Write;
 
 use narf_console::Writer;
