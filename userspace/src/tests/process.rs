@@ -1058,6 +1058,33 @@ fn smoke_userspace_fork_inherits_fd_path_identity() -> TestResult {
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_fork_inherits_fd_path_identity);
 
+// Procfs APIs address an fd by Linux PID, but syscall handlers already have a
+// scheduler TaskId. These number spaces may collide: resolving a TaskId via
+// the PID map can select another process's fd table. The TaskId-specific path
+// lookup must always keep the calling task's descriptor identity.
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_fd_path_task_lookup_avoids_pid_collision() -> TestResult {
+    const TASK: u64 = 0xF101;
+    const OTHER_TASK: u64 = 0xF102;
+    const FD: u32 = 7;
+    crate::handlers::register_pid_task_mapping(TASK, OTHER_TASK);
+    crate::mqueue::register_fd_path(TASK, FD, "/sys/kernel", None);
+    crate::mqueue::register_fd_path(OTHER_TASK, FD, "/wrong-process", None);
+    let path = crate::handlers::fd_path_for_task(TASK, FD);
+    crate::mqueue::forget_fd_path(TASK, FD);
+    crate::mqueue::forget_fd_path(OTHER_TASK, FD);
+    if path.as_deref() == Some("/sys/kernel") {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("TaskId fd lookup followed a colliding PID mapping")
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_fd_path_task_lookup_avoids_pid_collision
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_fork_rejects_without_address_space() -> TestResult {
     // Defence-in-depth: with no AS lookup installed, fork must

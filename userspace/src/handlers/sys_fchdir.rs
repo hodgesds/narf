@@ -11,7 +11,7 @@ pub(crate) fn sys_fchdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
     let task = current_task_id();
-    let path = match fd_path_of(task, fd) {
+    let path = match fd_path_for_task(task, fd) {
         // fd_path_of falls back to a type_name for pathless fds
         // (pipes, sockets, …) — those never start with '/' and are
         // ENOTDIR, same as Linux fchdir on a non-directory fd.

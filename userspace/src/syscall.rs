@@ -3346,7 +3346,7 @@ fn trace_syscall_paths(name: &str, args: &SyscallArgs) {
             }
         }
         "fchdir" => {
-            if let Some(p) = crate::handlers::fd_path_of(task, args.arg0 as u32) {
+            if let Some(p) = crate::handlers::fd_path_for_task(task, args.arg0 as u32) {
                 let _ = write!(line, "  PATH fchdir fd={:#x} -> {p:?}", args.arg0);
             }
         }

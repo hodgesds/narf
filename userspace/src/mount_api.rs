@@ -30,7 +30,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::fd;
 use crate::handlers::{
     apply_chroot, copy_user_cstr, current_clone_mount_subtree, current_clone_tree_at,
-    current_fs_arc_at, current_mount_arc, current_task_id, fd_path_of,
+    current_fs_arc_at, current_mount_arc, current_task_id, fd_path_for_task,
 };
 use crate::syscall::{SyscallReturn, TrapContext};
 
@@ -483,7 +483,7 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
     } else {
         let base = match u32::try_from(a.arg0)
             .ok()
-            .and_then(|fd| fd_path_of(current_task_id(), fd))
+            .and_then(|fd| fd_path_for_task(current_task_id(), fd))
             .filter(|path| path.starts_with('/'))
         {
             Some(path) => path,

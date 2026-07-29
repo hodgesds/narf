@@ -28,7 +28,7 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
             .flatten()
             .filter(|&i| i != 0)
             .or_else(|| {
-                fd_path_of(task, dirfd).map(|p| {
+                fd_path_for_task(task, dirfd).map(|p| {
                     // FNV-1a over the fd's backing path — stable per object.
                     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
                     for b in p.as_bytes() {
@@ -88,7 +88,7 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
     let raw = if raw.starts_with('/') || dirfd_i == AT_FDCWD_I32 || dirfd_i < 0 {
         raw
     } else {
-        match fd_path_of(current_task_id(), dirfd_i as u32) {
+        match fd_path_for_task(current_task_id(), dirfd_i as u32) {
             Some(dir) if dir.starts_with('/') => {
                 alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
             }

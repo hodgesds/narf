@@ -11529,6 +11529,25 @@ pub fn fd_path_of(pid: u64, n: u32) -> Option<alloc::string::String> {
     .flatten()
 }
 
+/// Return an fd path for an internal scheduler TaskId. Syscall handlers must
+/// use this rather than [`fd_path_of`]: the latter intentionally interprets
+/// its first argument as a Linux PID for procfs. Treating a TaskId as a PID
+/// misroutes a lookup whenever it numerically collides with another process's
+/// PID (as systemd's forked mount helpers routinely do).
+pub(crate) fn fd_path_for_task(task: u64, n: u32) -> Option<alloc::string::String> {
+    #[cfg(feature = "linux-compat")]
+    if let Some(p) = crate::mqueue::fd_path(task, n) {
+        return Some(strip_chroot_prefix(task, &p));
+    }
+    crate::fd::with_table(task, |t| {
+        let entry = t.get(n)?;
+        let name = core::any::type_name_of_val(&*entry.ops);
+        let short = name.rsplit("::").next().unwrap_or(name);
+        Some(alloc::format!("anon_inode:[{}]", short))
+    })
+    .flatten()
+}
+
 /// Strip the task's chroot prefix from a host-absolute path, yielding the
 /// path as the (possibly chrooted) task sees it. No-op for un-chrooted
 /// tasks. Used so `/proc/<pid>/fd/<n>` and similar surfaces report paths a

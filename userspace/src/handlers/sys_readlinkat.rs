@@ -23,7 +23,7 @@ pub(crate) fn sys_readlinkat(ctx: &mut dyn TrapContext) {
     let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
         path_str
     } else {
-        match fd_path_of(current_task_id(), dirfd as u32) {
+        match fd_path_for_task(current_task_id(), dirfd as u32) {
             Some(dir) if dir.starts_with('/') => {
                 alloc::format!("{}/{}", dir.trim_end_matches('/'), path_str)
             }

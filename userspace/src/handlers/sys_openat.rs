@@ -34,7 +34,7 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
     let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
         path_str
     } else {
-        match fd_path_of(current_task_id(), dirfd as u32) {
+        match fd_path_for_task(current_task_id(), dirfd as u32) {
             Some(dir) if dir.starts_with('/') => {
                 alloc::format!("{}/{}", dir.trim_end_matches('/'), path_str)
             }
@@ -54,7 +54,7 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
     if let Some(n) = parse_proc_self_fd(&effective) {
         let task = current_task_id();
         // Prefer reopening the fd's real backing path with the caller's flags.
-        if let Some(p) = fd_path_of(task, n).filter(|p| p.starts_with('/')) {
+        if let Some(p) = fd_path_for_task(task, n).filter(|p| p.starts_with('/')) {
             open_impl(ctx, p, flags, 0, 0);
             return;
         }

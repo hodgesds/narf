@@ -72,7 +72,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // over the procfs entry instead of the directory and leaves the assembled
     // namespace root absent.
     let target_path = parse_proc_self_fd(target_raw.as_str())
-        .and_then(|fd| fd_path_of(current_task_id(), fd))
+        .and_then(|fd| fd_path_for_task(current_task_id(), fd))
         .filter(|path| path.starts_with('/'))
         .unwrap_or(target_raw);
     // Resolve target under the calling task's chroot.
@@ -81,7 +81,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // source-as-label is harmless to pass through; block-device names
     // don't start with `/` so apply_chroot is a no-op).
     let source_path = parse_proc_self_fd(source.as_str())
-        .and_then(|fd| fd_path_of(current_task_id(), fd))
+        .and_then(|fd| fd_path_for_task(current_task_id(), fd))
         .filter(|path| path.starts_with('/'))
         .unwrap_or_else(|| source.clone());
     let source_resolved = if source_path.starts_with('/') {
