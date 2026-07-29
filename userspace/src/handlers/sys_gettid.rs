@@ -2,11 +2,25 @@
 use super::*;
 
 pub(crate) fn sys_gettid(ctx: &mut dyn TrapContext) {
-    // Returns the scheduler's TaskId for the currently-polling
-    // task. With `sys_clone` wired (Syscall::Clone = 56), threads
-    // in the same address space observe distinct tids here even
-    // though they share `getpid` (when process-group bookkeeping
-    // lands; today gettid==getpid since both go through the same
-    // task_id_lookup, but `clone` already produces distinct tids).
-    ctx.set_return(SyscallReturn::ok(current_task_id()));
+    let task = current_task_id();
+    // Linux gives a thread-group leader the same numeric identity from
+    // gettid() and getpid(). NARF's scheduler TaskId is an internal handle
+    // and diverges from the ProcessId after fork; leaking it makes a normal
+    // single-threaded child look non-main to systemd's rename_process().
+    // `PID_TO_TASK` identifies the group leader, while CLONE_THREAD siblings
+    // keep their distinct scheduler id as their thread id.
+    let tid = match task_to_pid_raw(task) {
+        Some(pid) if pid_to_task_raw(pid) == Some(task) => {
+            #[cfg(feature = "container")]
+            {
+                crate::pid_ns::self_inner_pid(task, pid)
+            }
+            #[cfg(not(feature = "container"))]
+            {
+                pid
+            }
+        }
+        _ => task,
+    };
+    ctx.set_return(SyscallReturn::ok(tid));
 }

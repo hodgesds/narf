@@ -303,24 +303,27 @@ fn smoke_abi_proc2_waitid_ppid_no_child() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_waitid_ppid_no_child);
 
-fn smoke_abi_proc2_waitid_blocking_fallback() -> TestResult {
+fn smoke_abi_proc2_waitid_blocking_without_executor_echild() -> TestResult {
     with_setup(|| {
-        // waitid with NO WNOHANG and no child: there is no UserTaskCtx / yield
-        // hook in the harness, so the blocking arm falls through to the
-        // "report no child" fallback (ok(0)) rather than parking. This pins
-        // the no-future fallback the base file's WNOHANG-only case skips.
+        // waitid with NO WNOHANG and no child must not claim a successful
+        // reap: that would leave a zeroed siginfo_t which userspace reads as
+        // an unknown child state. Linux returns ECHILD when no eligible child
+        // exists; the kernel-test harness has no executor on which to park.
         const P_ALL: u64 = 0;
         let mut si = [0u8; 128];
         match call(
             Syscall::Waitid.raw(),
             a3(P_ALL, 0, si.as_mut_ptr() as u64, 0),
         ) {
-            Some(0) => Ok(()),
-            _ => Err("waitid blocking fallback (no future) did not return 0"),
+            Some(v) if v == ECHILD => Ok(()),
+            _ => Err("waitid without a child/executor did not return -ECHILD"),
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc2_waitid_blocking_fallback);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_waitid_blocking_without_executor_echild
+);
 
 // ── waitid(2) — WNOWAIT peek leaves the zombie reapable ──
 

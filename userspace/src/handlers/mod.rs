@@ -6046,7 +6046,11 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
     let uctx = match crate::user_task::current_user_task() {
         Some(u) => u,
         None => {
-            ctx.set_return(SyscallReturn::ok(0));
+            // No task context means this is a kernel-test/non-executor call,
+            // not a completed wait. Returning success leaves userspace with a
+            // zeroed siginfo_t, which systemd interprets as an unknown child
+            // state. Linux reports ECHILD when no eligible child exists.
+            ctx.set_return(SyscallReturn::ok((-10i64) as u64)); // ECHILD
             return;
         }
     };
@@ -6090,7 +6094,7 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
                 let _ = take_wait_rusage_ptr(parent);
                 uc.wait_child_pending
                     .store(false, core::sync::atomic::Ordering::Release);
-                ctx.set_return(SyscallReturn::ok(0));
+                ctx.set_return(SyscallReturn::ok((-10i64) as u64)); // ECHILD
                 return;
             }
         };

@@ -42,7 +42,7 @@ fn smoke_abi_proc_getppid_ignores_args() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_getppid_ignores_args);
 
-// ── gettid(2) — infallible, returns the caller's TaskId ──
+// ── gettid(2) — infallible; a group leader's tid equals its pid ──
 
 fn smoke_abi_proc_gettid_pos() -> TestResult {
     with_setup(|| {
@@ -69,6 +69,22 @@ fn smoke_abi_proc_gettid_tracks_set_task() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_gettid_tracks_set_task);
+
+fn smoke_abi_proc_gettid_group_leader_equals_pid() -> TestResult {
+    with_setup(|| {
+        const TASK: u64 = 0xBEEF;
+        const PID: u64 = 0xCAFE;
+        set_task(TASK);
+        crate::handlers::register_pid_task_mapping(PID, TASK);
+        let result = call(Syscall::Gettid.raw(), a0(0));
+        set_task(FAKE_TASK);
+        match result {
+            Some(value) if value == PID as i64 => Ok(()),
+            _ => Err("gettid did not equal getpid for group leader"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_gettid_group_leader_equals_pid);
 
 // ── getpgid(2) / setpgid(2) — process-group bookkeeping ──
 
