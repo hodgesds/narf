@@ -4497,7 +4497,7 @@ const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 /// `cgroup_of(child_pid)` — and hence `/proc/<child_pid>/cgroup` — reflects the
 /// placement, which is how PID 1 attributes a service's sd_notify(READY=1)
 /// datagram back to its unit (`manager_get_unit_by_pidref_cgroup`).
-#[cfg(feature = "cgroup")]
+#[cfg(all(feature = "cgroup", feature = "linux-compat"))]
 fn place_clone_into_cgroup(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> bool {
     let full = match crate::mqueue::fd_path(parent_task, cgroup_fd) {
         Some(f) => f,
@@ -4542,7 +4542,7 @@ pub(crate) fn cgroup_rel_path(abs: &str) -> Option<alloc::string::String> {
 
 /// Test seam for [`place_clone_into_cgroup`] — exercises the clone3
 /// CLONE_INTO_CGROUP placement without spawning a real user task.
-#[cfg(feature = "cgroup")]
+#[cfg(all(feature = "cgroup", feature = "linux-compat"))]
 #[doc(hidden)]
 pub fn place_clone_into_cgroup_for_test(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> bool {
     place_clone_into_cgroup(parent_task, cgroup_fd, child_pid)
