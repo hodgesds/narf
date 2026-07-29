@@ -414,6 +414,17 @@ pub enum CapKind {
     Domain = 0x0050,
     DmaBuffer = 0x0051,
     SharedRegion = 0x0052,
+    /// Authority to make a mapping executable that was previously
+    /// writable — the JIT codegen flip. `memory/src/wx.rs` has described
+    /// this capability since it was written ("the JIT exception expressed
+    /// as a *capability* not a per-process bit, so the privilege is named
+    /// and revocable"); this is the `CapKind` that finally backs it.
+    ///
+    /// Deliberately a *memory* capability rather than a BPF one: any JIT
+    /// needs it, and a userspace JS engine reaching it through `mprotect`
+    /// is the same authority as the BPF JIT reaching it through
+    /// `bpf_text::seal`.
+    Jit = 0x0053,
 
     // Tracing / observability
     Probe = 0x0060,
@@ -507,6 +518,26 @@ pub enum CapKind {
     CongestionControl = 0x0207,
     IdleGovernor = 0x0208,
     EventSink = 0x0209,
+
+    // BPF (0x0300..). Split by operation rather than lumped into one
+    // "CAP_BPF", because the authorities are genuinely different: loading
+    // a program runs the verifier and the JIT, attaching one changes
+    // kernel behaviour at a hook, and creating an arena commits memory.
+    // A tool that only needs to read a map should not be able to attach.
+    //
+    // NARF has exactly one privilege regime for BPF — there is no
+    // unprivileged mode, so none of these have a weakened variant. See
+    // `bpf/specification/spec.md` §4.
+    /// Load and verify a BPF program.
+    BpfProgLoad = 0x0300,
+    /// Attach a verified program to a hook.
+    BpfAttach = 0x0301,
+    /// Create BPF maps.
+    BpfMap = 0x0302,
+    /// Create or grow a BPF arena.
+    BpfArena = 0x0303,
+    /// Install a struct_ops program set into a pluggable trait slot.
+    BpfStructOps = 0x0304,
 }
 
 pub trait CapType: 'static {
@@ -556,6 +587,7 @@ const KIND_NAMES: &[(&str, CapKind)] = &[
     ("Domain", CapKind::Domain),
     ("DmaBuffer", CapKind::DmaBuffer),
     ("SharedRegion", CapKind::SharedRegion),
+    ("Jit", CapKind::Jit),
     ("Probe", CapKind::Probe),
     ("TraceRing", CapKind::TraceRing),
     ("Recorder", CapKind::Recorder),
@@ -606,6 +638,11 @@ const KIND_NAMES: &[(&str, CapKind)] = &[
     ("CongestionControl", CapKind::CongestionControl),
     ("IdleGovernor", CapKind::IdleGovernor),
     ("EventSink", CapKind::EventSink),
+    ("BpfProgLoad", CapKind::BpfProgLoad),
+    ("BpfAttach", CapKind::BpfAttach),
+    ("BpfMap", CapKind::BpfMap),
+    ("BpfArena", CapKind::BpfArena),
+    ("BpfStructOps", CapKind::BpfStructOps),
 ];
 
 // ── Badge ───────────────────────────────────────────────────────────

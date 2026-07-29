@@ -21,6 +21,7 @@ members = [
     "verification/busybox",
     "verification/kernel-test",
     "bpf/isa",
+    "bpf/verifier",
     "frame",
     "rcu",
     "bus",
