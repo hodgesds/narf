@@ -110,6 +110,26 @@ pub fn run(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
             .unwrap_or(0);
         total[sp as usize] = align8(a.depth[sp as usize]) + callee_max;
     }
+    // Nesting depth along the same DAG. The runtime enforces a frame limit,
+    // so the verifier has to agree with it — otherwise a deep-but-safe program
+    // verifies and then traps on its first run.
+    let mut depth = vec![1u32; ir.subprogs.len()];
+    for &sp in order.iter().rev() {
+        let callee_max = ir.subprogs[sp as usize]
+            .callees
+            .iter()
+            .map(|&c| depth[c as usize])
+            .max()
+            .unwrap_or(0);
+        depth[sp as usize] = 1 + callee_max;
+    }
+    if depth[0] > crate::MAX_CALL_DEPTH {
+        return Err(VerifyError::CallDepth {
+            needed: depth[0],
+            limit: crate::MAX_CALL_DEPTH,
+        });
+    }
+
     let max_stack_bytes = total[0];
     if max_stack_bytes > MAX_STACK_BYTES {
         return Err(VerifyError::StackTooDeep {

@@ -161,6 +161,9 @@ pub type JitCap = narf_capabilities::Cap<Jit, Grant>;
 /// Failure modes of the text allocator.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TextError {
+    /// `seal` was called on an image with no registered exception table.
+    /// See spec §4.3 — registration must precede execution.
+    ExtableMissing,
     /// [`reserve_kernel_slots`] has not run (or failed). Every other entry
     /// point refuses rather than populating a slot the live user address
     /// spaces do not have — see §4.1.
@@ -619,6 +622,18 @@ pub fn write(a: &TextAlloc, off: usize, bytes: &[u8]) -> Result<(), TextError> {
 /// the instruction stream) — the caller must not reorder it.
 pub fn seal(cap: &JitCap, a: &TextAlloc) -> Result<(), TextError> {
     cap.check_live().map_err(|_| TextError::CapRevoked)?;
+    // Spec §4.3, as a mechanism rather than a comment: every faulting
+    // instruction in this image must already have an exception-table entry,
+    // because a fault with no entry is fatal. This is the last moment the
+    // obligation is checkable — one instruction later the code can run.
+    //
+    // The verifier hands the JIT a `fault_sites` list precisely so it can
+    // build those entries; nothing was consuming it, so "Ok from the verifier"
+    // silently meant "safe *provided* someone registers the extable", with no
+    // one doing so and nothing noticing.
+    if !crate::bpf_extable::image_covers(a.va, a.va + a.len as u64) {
+        return Err(TextError::ExtableMissing);
+    }
     let root = kernel_root()?;
     let mut packs = PACKS.lock();
     let p = packs
@@ -1247,6 +1262,29 @@ const RET42: &[u8] = &[0x40, 0x05, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
 /// way that only shows up as an instruction fetch on a page the CPU thinks is
 /// NX, or as stale bytes in the I-cache — neither of which any amount of
 /// checking the return values would catch.
+fn smoke_bpf_text_seal_refuses_undeclared_image() -> TestResult {
+    // The negative half of spec §4.3: sealing without a registered exception
+    // table must fail. Before this, `Ok` from the verifier meant "safe
+    // *provided* someone registers the extable" and nobody did — the
+    // obligation existed only in prose.
+    let cap = JitCap::bootstrap();
+    let Ok(a) = alloc(&cap, RET42.len(), 0) else {
+        return TestResult::Fail("bpf_text::alloc failed");
+    };
+    if write(&a, 0, RET42).is_err() {
+        free(a);
+        return TestResult::Fail("bpf_text::write failed");
+    }
+    let refused = matches!(seal(&cap, &a), Err(TextError::ExtableMissing));
+    free(a);
+    if refused {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("seal accepted an image with no registered extable")
+    }
+}
+kernel_test_in!("memory", smoke_bpf_text_seal_refuses_undeclared_image);
+
 fn smoke_bpf_text_alloc_seal_execute() -> TestResult {
     let cap = JitCap::bootstrap();
     let a = match alloc(&cap, RET42.len(), 0) {
@@ -1264,7 +1302,17 @@ fn smoke_bpf_text_alloc_seal_execute() -> TestResult {
         free(a);
         return TestResult::Fail("bpf_text::write failed");
     }
+    // Declare the (empty) exception table before sealing. `seal` cannot tell
+    // whether an image contains faulting instructions, so the only safe rule
+    // is that the producer must always say — an image with no fault sites
+    // registers an empty list. Spec §4.3.
+    let token = a.va;
+    if crate::bpf_extable::register_image(token, a.va, a.va + a.len as u64, Vec::new()).is_err() {
+        free(a);
+        return TestResult::Fail("bpf_extable::register_image failed");
+    }
     if seal(&cap, &a).is_err() {
+        crate::bpf_extable::unregister_image(token);
         free(a);
         return TestResult::Fail("bpf_text::seal failed");
     }
@@ -1272,6 +1320,7 @@ fn smoke_bpf_text_alloc_seal_execute() -> TestResult {
     // no arguments, clobbers only the return register, and returns.
     let f: extern "C" fn() -> u64 = unsafe { core::mem::transmute::<u64, _>(a.va) };
     let got = f();
+    crate::bpf_extable::unregister_image(token);
     free(a);
     if got != 42 {
         return TestResult::Fail("sealed BPF text returned the wrong value");

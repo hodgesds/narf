@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use narf_bpf_isa::Insn;
 use narf_bpf_verifier::kfunc::Context;
+use narf_bpf_verifier::SubprogInfo;
 use narf_bpf_verifier::{VerifyError, DEFAULT_FUEL, MAX_STACK_BYTES};
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
 
@@ -81,6 +82,14 @@ pub struct BpfProg {
     initial_fuel: u64,
     /// Bytes of BPF stack the program may use.
     stack_bytes: u32,
+    /// Per-subprogram frame sizes, as the verifier modelled them.
+    ///
+    /// Kept, not discarded: `Ok` from the verifier is conditional on the
+    /// frames being laid out this way. Handing every frame a fixed width
+    /// instead disagreed in both directions — eight tiny subprograms verified
+    /// with a 64-byte budget and then exhausted the region on the first call,
+    /// and a single 1 KiB callee verified and then wrote below it.
+    subprogs: Vec<SubprogInfo>,
     /// Invocations.
     runs: AtomicU64,
     /// Sum of return values. Until maps land in Phase 3 this is how an
@@ -133,6 +142,7 @@ impl BpfProg {
             kfuncs: &descs,
         };
 
+        let mut subprogs: Vec<SubprogInfo> = Vec::new();
         let stack_bytes = match narf_bpf_verifier::verify(&prog) {
             Ok(v) => {
                 if v.max_stack_bytes > MAX_STACK_BYTES {
@@ -141,6 +151,7 @@ impl BpfProg {
                         limit: MAX_STACK_BYTES,
                     });
                 }
+                subprogs = v.subprogs;
                 v.max_stack_bytes.max(1)
             }
             // Phase 2 is not here yet: the abstract interpreter reports
@@ -163,6 +174,7 @@ impl BpfProg {
             context: req.context,
             initial_fuel: DEFAULT_FUEL,
             stack_bytes,
+            subprogs,
             runs: AtomicU64::new(0),
             accumulated: AtomicU64::new(0),
             traps: AtomicU64::new(0),
@@ -232,13 +244,16 @@ impl BpfProg {
         let frame = provider.acquire(self.stack_bytes as usize)?;
         let registry = crate::kfunc::registry()?;
         let mut vm = Vm::new(
-            &self.insns,
+            crate::interp::VmProgram {
+                insns: &self.insns,
+                subprogs: &self.subprogs,
+                context: self.context,
+                fuel: self.initial_fuel,
+            },
             ctx,
             ctx_len,
             frame,
-            self.initial_fuel,
             registry,
-            self.context,
         );
         // An atomic program cannot reach an await point, so the future
         // completes on its first poll and `drive` never spins.
@@ -260,13 +275,16 @@ impl BpfProg {
         let frame = stack.acquire(self.stack_bytes as usize)?;
         let registry = crate::kfunc::registry()?;
         let mut vm = Vm::new(
-            &self.insns,
+            crate::interp::VmProgram {
+                insns: &self.insns,
+                subprogs: &self.subprogs,
+                context: self.context,
+                fuel: self.initial_fuel,
+            },
             ctx,
             ctx_len,
             frame,
-            self.initial_fuel,
             registry,
-            self.context,
         );
         let outcome = vm.run().await;
         self.record(outcome);

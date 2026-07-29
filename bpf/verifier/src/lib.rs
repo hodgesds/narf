@@ -229,6 +229,8 @@ pub enum VerifyError {
     Recursion { at: u32 },
     /// The static call graph needs more stack than a program may use.
     StackTooDeep { needed: u32, limit: u32 },
+    /// The static call graph nests deeper than [`MAX_CALL_DEPTH`].
+    CallDepth { needed: u32, limit: u32 },
     /// A malformed kfunc descriptor was supplied.
     Kfunc(KfuncError),
     /// A dereference of an opaque object pointer.
@@ -285,6 +287,15 @@ pub const MAX_STACK_BYTES: u32 = 16 * 1024;
 /// escape by register-width arithmetic is not covered by that argument, which
 /// is why the verifier bounds the computed offset against this explicitly.
 pub const ARENA_WINDOW_BYTES: u64 = 4 << 30;
+
+/// Maximum subprogram nesting depth.
+///
+/// Must match the interpreter's `MAX_CALL_FRAMES` and the JIT's frame layout.
+/// The verifier previously had no limit at all while the runtime enforced one,
+/// so a nine-deep call chain verified and then trapped — a program accepted by
+/// the verifier that cannot run is a contract break even though it is not a
+/// safety hole.
+pub const MAX_CALL_DEPTH: u32 = 8;
 
 /// Default starting fuel.
 ///

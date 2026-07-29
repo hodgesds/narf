@@ -41,6 +41,8 @@ use narf_bpf_isa::{
 };
 use narf_bpf_verifier::kfunc::Context;
 
+use narf_bpf_verifier::SubprogInfo;
+
 use crate::kfunc::{KfuncShim, Registry};
 use crate::mem::StackFrame;
 
@@ -160,6 +162,25 @@ impl Future for YieldNow {
     }
 }
 
+/// The program-derived half of a [`Vm`]'s inputs.
+///
+/// Grouped because these four always come from the same `VerifiedProgram` and
+/// are only meaningful together — in particular `subprogs` must be the table
+/// the same verification produced, or frame layout silently disagrees with
+/// what was proved. Passing them positionally alongside the run-specific
+/// arguments made that easy to get wrong.
+#[derive(Copy, Clone, Debug)]
+pub struct VmProgram<'a> {
+    /// The verified instruction image.
+    pub insns: &'a [Insn],
+    /// Per-subprogram frame sizes from that same verification.
+    pub subprogs: &'a [SubprogInfo],
+    /// The execution context the program was verified for.
+    pub context: Context,
+    /// Starting fuel.
+    pub fuel: u64,
+}
+
 /// The virtual machine.
 pub struct Vm<'a> {
     regs: [u64; 11],
@@ -169,6 +190,15 @@ pub struct Vm<'a> {
     ctx_len: usize,
     stack: StackFrame<'a>,
     frames: Vec<Frame>,
+    /// Per-subprogram stack sizes, from the verifier.
+    ///
+    /// Frames used to be a fixed [`FRAME_BYTES`], which disagreed with the
+    /// verifier in both directions: a program of eight tiny subprograms
+    /// verified with a 64-byte budget and then exhausted the region on its
+    /// *first* call, while a single 1 KiB callee verified and then wrote
+    /// below the region. `Ok` from the verifier is only meaningful if the
+    /// frames are laid out the way it modelled them.
+    subprogs: &'a [SubprogInfo],
     registry: &'static Registry,
     context: Context,
     /// Instructions retired, for diagnostics.
@@ -190,14 +220,18 @@ impl<'a> Vm<'a> {
     /// Build a VM over a verified instruction image.
     #[must_use]
     pub fn new(
-        insns: &'a [Insn],
+        prog: VmProgram<'a>,
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
         stack: StackFrame<'a>,
-        fuel: u64,
         registry: &'static Registry,
-        context: Context,
     ) -> Self {
+        let VmProgram {
+            insns,
+            subprogs,
+            context,
+            fuel,
+        } = prog;
         let mut regs = [0u64; 11];
         // BPF entry convention: R1 = context pointer, R10 = frame pointer.
         regs[1] = CTX_REGION;
@@ -210,6 +244,7 @@ impl<'a> Vm<'a> {
             ctx_len: ctx_len.min(MAX_CTX_WORDS),
             stack,
             frames: Vec::new(),
+            subprogs,
             registry,
             context,
             steps: 0,
@@ -478,7 +513,7 @@ impl<'a> Vm<'a> {
                         }
                         narf_bpf_isa::CallTarget::Subprog(rel) => {
                             let target = self.subprog_target(at, next, rel)?;
-                            self.push_frame(at, next, &mut frame_base)?;
+                            self.push_frame(at, next, &mut frame_base, target as u32)?;
                             pc = target;
                         }
                     }
@@ -547,12 +582,26 @@ impl<'a> Vm<'a> {
         Ok(target as usize)
     }
 
-    fn push_frame(&mut self, at: u32, return_pc: usize, frame_base: &mut u64) -> Result<(), Trap> {
+    fn push_frame(
+        &mut self,
+        at: u32,
+        return_pc: usize,
+        frame_base: &mut u64,
+        target_slot: u32,
+    ) -> Result<(), Trap> {
         if self.frames.len() >= MAX_CALL_FRAMES {
             return Err(Trap::CallDepth { at });
         }
+        // The callee's frame is exactly what the verifier sized it at. A
+        // fixed width here is what made `Ok` from the verifier meaningless:
+        // it modelled one layout and the interpreter used another.
+        let bytes = self
+            .subprogs
+            .iter()
+            .find(|s| s.start == target_slot)
+            .map_or(FRAME_BYTES as u64, |s| u64::from(s.stack_bytes));
         let new_base = frame_base
-            .checked_sub(FRAME_BYTES as u64)
+            .checked_sub(bytes)
             .ok_or(Trap::StackExhausted { at })?;
         if new_base < STACK_REGION {
             return Err(Trap::StackExhausted { at });

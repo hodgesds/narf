@@ -336,13 +336,19 @@ fn run_unverified(insns: &[Insn], fuel: u64) -> Option<Outcome> {
     let frame = provider.acquire(64)?;
     let registry = crate::kfunc::registry()?;
     let mut vm = crate::interp::Vm::new(
-        insns,
+        crate::interp::VmProgram {
+            insns,
+            // No subprograms: `run_unverified` bypasses the verifier, so
+            // there is no table to honour and a call falls back to
+            // FRAME_BYTES.
+            subprogs: &[],
+            context: Context::Atomic,
+            fuel,
+        },
         [0; crate::interp::MAX_CTX_WORDS],
         4,
         frame,
-        fuel,
         registry,
-        Context::Atomic,
     );
     Some(crate::interp::drive(vm.run()))
 }
@@ -749,3 +755,73 @@ fn smoke_bpf_percpu_frame_is_released_to_its_own_cpu() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_percpu_frame_is_released_to_its_own_cpu);
+
+// ── subprogram calls ────────────────────────────────────────────────
+
+fn subprog_call(rel: i32) -> Decoded {
+    Decoded::Call(narf_bpf_isa::CallTarget::Subprog(rel))
+}
+
+fn smoke_bpf_subprog_frames_do_not_overlap() -> TestResult {
+    // main:  *(u64*)(r10-8) = 0x11; call sub; r0 = *(u64*)(r10-8); exit
+    // sub:   *(u64*)(r10-8) = 0x22; r0 = 0; exit
+    //
+    // The callee writes its own frame at the same *relative* offset. If the
+    // frames overlap, main reads back 0x22.
+    //
+    // There was no subprogram-call test at all, which is how the frame sizing
+    // came to disagree with the verifier in both directions: every frame got a
+    // fixed 512 bytes regardless of what the verifier had modelled, so eight
+    // tiny subprograms verified with a 64-byte budget and then exhausted the
+    // region on the *first* call, while a single oversized callee verified and
+    // then wrote below the region.
+    let insns = asm(&[
+        st_imm(10, -8, 0x11),
+        subprog_call(2),
+        ldx(0, 10, -8),
+        EXIT,
+        st_imm(10, -8, 0x22),
+        mov_imm(0, 0),
+        EXIT,
+    ]);
+    let Ok(p) = load("subcall", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected a subprogram call");
+    };
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Returned(0x11)) => TestResult::Pass,
+        Some(Outcome::Returned(0x22)) => TestResult::Fail("callee frame overlapped the caller's"),
+        Some(Outcome::Returned(_)) => TestResult::Fail("unexpected value after a subprogram call"),
+        Some(Outcome::Trapped(t)) => match t {
+            Trap::StackExhausted { .. } => {
+                TestResult::Fail("frame sizing exhausted the region on a two-frame program")
+            }
+            _ => TestResult::Fail("subprogram call trapped"),
+        },
+        None => TestResult::Fail("per-CPU stack declined"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_subprog_frames_do_not_overlap);
+
+fn smoke_bpf_verify_rejects_excessive_call_depth() -> TestResult {
+    // A chain deeper than the runtime's frame limit must be refused at load.
+    // The verifier had no depth limit while the interpreter enforced one, so
+    // such a program verified and then trapped — accepted-but-unrunnable is a
+    // contract break even though it is not a safety hole.
+    //
+    // Nine frames: main plus eight callees, each calling the next.
+    let mut items: Vec<Decoded> = Vec::new();
+    let depth = 9usize;
+    for _ in 0..depth - 1 {
+        // Each level: call the next subprogram, then return 0.
+        items.push(subprog_call(2));
+        items.push(mov_imm(0, 0));
+        items.push(EXIT);
+    }
+    items.push(mov_imm(0, 0));
+    items.push(EXIT);
+    match load("deep", asm(&items), Context::Atomic) {
+        Err(_) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("a call chain deeper than the frame limit was accepted"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_verify_rejects_excessive_call_depth);

@@ -172,6 +172,22 @@ pub fn unregister_image(token: u64) {
 /// any lock the faulting code might already hold — `IMAGES` is only ever taken
 /// by this module, and never across a call that can fault.
 #[inline]
+/// Whether an image covering `[base, end)` has been registered.
+///
+/// Exists so [`crate::bpf_text::seal`] can *enforce* spec §4.3 rather than
+/// document it: every faulting instruction the JIT emits must have an entry
+/// in place before the text becomes executable, because a fault with no entry
+/// is fatal. Checking at the moment of the RW→RX flip is the only point where
+/// the obligation is still checkable — afterwards the code can already run.
+#[must_use]
+pub fn image_covers(base: u64, end: u64) -> bool {
+    if IMAGE_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    let images = IMAGES.lock();
+    images.iter().any(|i| i.base <= base && i.end >= end)
+}
+
 pub fn lookup(fault_pc: u64) -> Option<ExEntry> {
     // Fast bail *without* touching the lock: an empty table is the common case
     // on a kernel with no BPF loaded, and every unrecovered kernel fault runs
