@@ -50,8 +50,16 @@ use alloc::vec::Vec;
 
 use narf_bpf_isa::{DecodeError, Insn};
 
+pub mod domain;
+pub mod ir;
 pub mod kfunc;
 
+#[cfg(test)]
+mod fuzz;
+#[cfg(test)]
+mod interp;
+#[cfg(test)]
+mod ir_tests;
 #[cfg(test)]
 mod tests;
 
