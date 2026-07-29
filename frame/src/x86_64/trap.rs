@@ -406,6 +406,45 @@ pub struct TrapFrame {
     pub ss: u64,
 }
 
+/// Zero one saved general-purpose register in a live trap frame.
+///
+/// `reg` is the x86_64 architectural register number — the same 0..=15
+/// ModRM/REX encoding the JIT already emitted for the faulting instruction's
+/// destination, so the BPF extable stores it verbatim and no translation table
+/// is needed:
+///
+/// ```text
+/// 0 rax   1 rcx   2 rdx   3 rbx   4 rsp   5 rbp   6 rsi   7 rdi
+/// 8 r8    9 r9   10 r10  11 r11  12 r12  13 r13  14 r14  15 r15
+/// ```
+///
+/// `rsp` (4) is refused: the CPU pushed it and `iretq` will reload it, so
+/// zeroing it would return to a null stack. A JIT can never name `rsp` as a
+/// load destination, but this is the trap handler and defending costs one
+/// comparison.
+#[cfg(target_arch = "x86_64")]
+fn zero_trap_frame_gpr(frame: &mut TrapFrame, reg: u8) {
+    match reg {
+        0 => frame.rax = 0,
+        1 => frame.rcx = 0,
+        2 => frame.rdx = 0,
+        3 => frame.rbx = 0,
+        // 4 == rsp: deliberately not writable, see above.
+        5 => frame.rbp = 0,
+        6 => frame.rsi = 0,
+        7 => frame.rdi = 0,
+        8 => frame.r8 = 0,
+        9 => frame.r9 = 0,
+        10 => frame.r10 = 0,
+        11 => frame.r11 = 0,
+        12 => frame.r12 = 0,
+        13 => frame.r13 = 0,
+        14 => frame.r14 = 0,
+        15 => frame.r15 = 0,
+        _ => {}
+    }
+}
+
 /// Kernel core-dump: on a fatal exception, stream a minimal ELF core
 /// (`NT_PRSTATUS` registers + a `PT_LOAD` of the live kernel stack) out COM2
 /// (0x2F8). Route COM2 to a host file with QEMU `-serial file:<path>` (it is
@@ -1094,6 +1133,40 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             if hook(&mut ctx, vector, info) {
                 return;
             }
+        }
+    }
+
+    // BPF extable. A JIT-compiled probe load may fault by design — that is
+    // what makes `task->mm->owner` safe to write without a null check on
+    // every hop — and the recovery is Linux's `ex_handler_bpf`
+    // (`bpf_jit_comp.c:1479`): zero the destination register, resume at the
+    // fixup address.
+    //
+    // Placement is load-bearing in both directions:
+    //
+    //   * AFTER every legitimate recovery surface (demand paging, stack grow,
+    //     COW split, and the CPL=3 synchronous-signal hook). A BPF program
+    //     touching a demand-paged user buffer must get the *page* recovery,
+    //     not have its access silently zeroed.
+    //   * BEFORE `probe::consume` and `diag::note_pf`. `consume` is a
+    //     single-shot armed latch; a BPF fault must not consume someone
+    //     else's armed recovery. `note_pf` is first-fault-wins, and a fault
+    //     we successfully recover from must not poison the latch that names
+    //     the fault which actually killed the kernel.
+    //
+    // Kernel-mode only: the BPF windows are kernel-only at every level of the
+    // page-table walk, so a CPL=3 fault can never be in BPF text, and gating
+    // on CS keeps the invariant local and cheap.
+    if (frame.cs & 3) == 0 {
+        if let Some(rec) = narf_memory::bpf_extable::try_recover(frame.rip) {
+            // One fixup label per program rather than a stub per fault site:
+            // the destination register is zeroed by mutating the saved GPR in
+            // this trap frame, so the JIT never has to emit recovery code.
+            if !rec.zero_reg.is_none() {
+                zero_trap_frame_gpr(frame, rec.zero_reg.0);
+            }
+            frame.rip = rec.resume_pc;
+            return;
         }
     }
 

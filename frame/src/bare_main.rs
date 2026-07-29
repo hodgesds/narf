@@ -1228,6 +1228,31 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
 
+                // BPF kernel-VA windows. MUST run here: after the MMU handoff
+                // (CR3 is the final kernel PML4) and BEFORE the first
+                // `new_user_pml4`, which `setup_pcid_domains()` immediately
+                // below is. `new_user_pml4_on` snapshot-copies PML4[256..511]
+                // BY VALUE and nothing propagates later changes, so a BPF slot
+                // first populated after a user address space exists leaves
+                // that AS's CR3 holding a zero entry — and the first BPF
+                // access taken while that task is current triple-faults. This
+                // is a direct call rather than a staged initcall precisely
+                // because the ordering is too load-bearing to delegate.
+                // `bpf/specification/spec.md` §4.1.
+                match narf_memory::bpf_text::reserve_kernel_slots() {
+                    Ok(()) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  bpf: kernel VA slots reserved (text {:#x}, arena {:#x})",
+                            narf_memory::bpf_text::BPF_TEXT_BASE,
+                            narf_memory::bpf_text::BPF_ARENA_BASE
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(console::Writer, "  bpf: slot reservation failed: {e:?}");
+                    }
+                }
+
                 // Per-domain PCID PML4s — deferred here, AFTER the MMU
                 // handoff (CR3 is now the final kernel PML4) and the buddy
                 // populate, so the clones snapshot the right PML4 from a live
@@ -1897,6 +1922,26 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                     Err(e) => {
                         let _ = writeln!(console::Writer, "  mmu: init failed: {e:?}");
+                    }
+                }
+
+                // BPF kernel-VA windows — same call as the x86_64 arm above.
+                // aarch64 does not have the PML4-snapshot hazard (user space
+                // lives in TTBR0, the kernel in TTBR1, separate roots), but the
+                // windows still have to exist before anything maps into them,
+                // and keeping one call site shape across arches means the
+                // ordering rule is stated once.
+                match narf_memory::bpf_text::reserve_kernel_slots() {
+                    Ok(()) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  bpf: kernel VA slots reserved (text {:#x}, arena {:#x})",
+                            narf_memory::bpf_text::BPF_TEXT_BASE,
+                            narf_memory::bpf_text::BPF_ARENA_BASE
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(console::Writer, "  bpf: slot reservation failed: {e:?}");
                     }
                 }
 
