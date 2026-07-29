@@ -270,10 +270,6 @@ pub fn reserve_kernel_slots() -> Result<(), TextError> {
         BPF_ARENA_PML4_SLOT,
         "BPF_ARENA_BASE does not decode to BPF_ARENA_PML4_SLOT"
     );
-    debug_assert!(
-        BPF_ARENA_PML4_SLOT >= BPF_TEXT_PML4_SLOT + 2,
-        "BPF text and arena windows must not be adjacent — slot 274 is a guard"
-    );
 
     if slots_reserved() {
         return Ok(());
@@ -550,14 +546,18 @@ pub fn alloc(cap: &JitCap, len: usize, node: usize) -> Result<TextAlloc, TextErr
     // entries were installed by `reserve_kernel_slots`, so the walk cannot
     // create a PML4 entry that a live address space is missing.
     let mut pack = unsafe { new_pack(root, node, len as u64)? };
-    if pack.find_run(want).is_none() {
+    let Some(start) = pack.find_run(want) else {
         // The fallback pack is smaller than a hugepage pack; a program larger
         // than it and larger than the hugepage pool can supply has nowhere to
-        // go.
+        // go. Tear the mapping down before releasing the frames — freeing a
+        // frame that is still mapped at a kernel VA leaves a dangling window
+        // onto whatever the buddy hands out next.
+        // SAFETY: the pack was just created and has no allocations, so nothing
+        // can be executing out of it.
+        unsafe { unmap_pack(&pack) };
         release_pack_backing(&mut pack);
         return Err(TextError::Exhausted);
-    }
-    let start = pack.find_run(want).expect("checked above");
+    };
     pack.set_range(start, want, true);
     pack.used += want;
     let out = TextAlloc {
@@ -635,10 +635,16 @@ pub fn seal(cap: &JitCap, a: &TextAlloc) -> Result<(), TextError> {
     }
 
     // Make the freshly-written bytes fetchable even when the pack was already
-    // sealed. On x86_64 this is a serialising instruction on this CPU;
-    // cross-modifying code on peer CPUs is not a concern here because a
-    // program is never entered before its `seal` returns.
-    serialize_after_publish(p.base, p.len);
+    // sealed. Scoped to *this allocation*, not the whole pack: on aarch64 the
+    // barrier is a per-cache-line `dc cvau` / `ic ivau` sweep, and doing 2 MiB
+    // of it per program load would be thousands of pointless maintenance ops.
+    //
+    // On x86_64 this is a serialising instruction on this CPU. Cross-modifying
+    // code on peer CPUs is not a concern: a program is never entered before
+    // its `seal` returns, and the pack's unallocated remainder holds trap
+    // bytes, so a peer that somehow lands mid-pack faults rather than
+    // executing something stale.
+    serialize_after_publish(a.va, (a.chunks * CHUNK_BYTES) as u64);
     Ok(())
 }
 
@@ -719,9 +725,16 @@ pub fn install_reclaim_hook(h: ReclaimHook) {
 
 /// Diagnostics: (live packs, allocated chunks, quarantined allocations).
 pub fn stats() -> (usize, usize, usize) {
-    let packs = PACKS.lock();
-    let used = packs.iter().map(|p| p.used).sum();
-    (packs.len(), used, QUARANTINE.lock().len())
+    // Deliberately not holding both locks at once. `reclaim_all_quarantined`
+    // takes `QUARANTINE` then `PACKS`; holding them in the opposite order here
+    // would be a lock cycle waiting for someone to make one of them outlive a
+    // statement.
+    let (packs, used) = {
+        let p = PACKS.lock();
+        (p.len(), p.iter().map(|p| p.used).sum())
+    };
+    let quarantined = QUARANTINE.lock().len();
+    (packs, used, quarantined)
 }
 
 // ── Internals ──────────────────────────────────────────────────────────
@@ -776,7 +789,7 @@ unsafe fn new_pack(root: PhysAddr, node: usize, need: u64) -> Result<Pack, TextE
             // VA inside the reserved window, and `h.phys()` is a naturally
             // aligned 2 MiB frame the pool just handed us exclusively.
             unsafe { map_pack_huge(root, base, h.phys())? };
-            let mut p = Pack {
+            let p = Pack {
                 base,
                 len: PACK_HUGE_BYTES,
                 backing: Backing::Huge(h),
@@ -785,7 +798,6 @@ unsafe fn new_pack(root: PhysAddr, node: usize, need: u64) -> Result<Pack, TextE
                 sealed: false,
             };
             fill_traps_raw(&p, 0, p.len);
-            p.sealed = false;
             Ok(p)
         }
         Err(_) => {
@@ -812,9 +824,9 @@ unsafe fn new_pack(root: PhysAddr, node: usize, need: u64) -> Result<Pack, TextE
             for (i, f) in frames.iter().enumerate() {
                 // SAFETY: caller's root contract; `base + i*4096` is fresh VA
                 // inside the reserved window and `f` is exclusively ours.
-                if let Err(e) =
-                    unsafe { map_pack_page(root, base + (i as u64) * 4096, f.start_address()) }
-                {
+                let mapped =
+                    unsafe { map_pack_page(root, base + (i as u64) * 4096, f.start_address()) };
+                if let Err(e) = mapped {
                     for f in frames {
                         crate::frame::free_frame(f);
                     }
@@ -960,20 +972,15 @@ unsafe fn seal_mapping(root: PhysAddr, p: &Pack) -> Result<(), TextError> {
 /// mid-pack faults rather than executing stale bytes.
 #[cfg(target_arch = "x86_64")]
 fn serialize_after_publish(_base: u64, _len: u64) {
-    // SAFETY: `CPUID` is unprivileged and has no memory operands. Clobbers
-    // rax/rbx/rcx/rdx, all declared.
-    unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "xor eax, eax",
-            "cpuid",
-            "pop rbx",
-            out("eax") _,
-            out("ecx") _,
-            out("edx") _,
-            options(nostack),
-        );
-    }
+    // Delegated to `narf_arch`'s wrapper rather than hand-rolled, because the
+    // obvious hand-rolled form is a known NARF bug: `push rbx; cpuid; pop rbx`
+    // under `options(nostack)` is a lie to the compiler, which then keeps live
+    // data in the red zone that the `push` clobbers. That silently corrupted
+    // CPUID results in release builds once already (`arch/src/x86_64/cpuid.rs`
+    // carries the post-mortem); the wrapper preserves rbx through a scratch
+    // register instead, so `nostack` is truthful.
+    // SAFETY: CPUID is always legal at CPL=0.
+    let _ = unsafe { narf_arch::x86_64::cpuid::cpuid(0, 0) };
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1151,6 +1158,302 @@ mod stub_arch {
 }
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 use stub_arch::*;
+
+// ── In-kernel smokes ───────────────────────────────────────────────────
+//
+// These are the tests that matter: the host tests below can only check
+// arithmetic, and every genuinely dangerous thing here — the boot-order
+// propagation, the RW→RX flip, the fault recovery — is only observable on a
+// live MMU.
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// §4.1 regression test, and the reason this file exists.
+///
+/// `reserve_kernel_slots` must have run *before* the first user address
+/// space, so the BPF top-level entries are present in the **currently active**
+/// page-table root — not merely in the boot PML4 we installed them into. If a
+/// future edit moves the reservation after `setup_pcid_domains`, the entry is
+/// absent here and this fails; without the test the same mistake is a triple
+/// fault with nothing on the wire.
+#[cfg(target_arch = "x86_64")]
+fn smoke_bpf_text_slots_present_in_active_root() -> TestResult {
+    if !slots_reserved() {
+        return TestResult::Fail("bpf_text::reserve_kernel_slots() never ran");
+    }
+    // SAFETY: CR3 is readable at CPL=0 and names the live root; the PML4 is in
+    // identity-reachable low RAM.
+    let live = unsafe { crate::x86_64::paging::read_cr3() };
+    // SAFETY: `live` is the active PML4, identity-reachable.
+    let pml4 = unsafe { &*live.as_ptr::<crate::x86_64::paging::PageTable>() };
+    if !pml4.entries[BPF_TEXT_PML4_SLOT].is_present() {
+        return TestResult::Fail("BPF text PML4 slot absent from the active root");
+    }
+    if !pml4.entries[BPF_ARENA_PML4_SLOT].is_present() {
+        return TestResult::Fail("BPF arena PML4 slot absent from the active root");
+    }
+    // The guard slots on either side of the arena must stay empty — that is
+    // what makes an escape by immediate displacement structurally impossible
+    // rather than merely improbable.
+    for guard in [BPF_ARENA_PML4_SLOT - 1, BPF_ARENA_PML4_SLOT + 1] {
+        if pml4.entries[guard].is_present() {
+            return TestResult::Fail("an arena guard slot is mapped");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_bpf_text_slots_present_in_active_root);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_bpf_text_slots_present_in_active_root() -> TestResult {
+    if !slots_reserved() {
+        return TestResult::Fail("bpf_text::reserve_kernel_slots() never ran");
+    }
+    // SAFETY: `MRS .., TTBR1_EL1` is defined at EL1; the L0 table is reachable
+    // through the kernel RAM accessor.
+    let live = unsafe { crate::aarch64::paging::read_ttbr1_el1() };
+    // SAFETY: `live` is the active TTBR1 L0 table.
+    let l0 = unsafe { &*live.kernel_ptr::<crate::aarch64::paging::PageTable>() };
+    if !l0.entries[BPF_TEXT_PML4_SLOT].is_valid() {
+        return TestResult::Fail("BPF text L0 slot absent from TTBR1");
+    }
+    if !l0.entries[BPF_ARENA_PML4_SLOT].is_valid() {
+        return TestResult::Fail("BPF arena L0 slot absent from TTBR1");
+    }
+    for guard in [BPF_ARENA_PML4_SLOT - 1, BPF_ARENA_PML4_SLOT + 1] {
+        if l0.entries[guard].is_valid() {
+            return TestResult::Fail("an arena guard slot is mapped");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("memory", smoke_bpf_text_slots_present_in_active_root);
+
+/// A stub that returns 42, hand-assembled so the test needs no JIT.
+///
+/// x86_64: `b8 2a 00 00 00` (`mov eax, 42`) + `c3` (`ret`).
+/// aarch64: `52800540` (`mov w0, #42`) + `d65f03c0` (`ret`), little-endian.
+#[cfg(target_arch = "x86_64")]
+const RET42: &[u8] = &[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
+#[cfg(target_arch = "aarch64")]
+const RET42: &[u8] = &[0x40, 0x05, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
+
+/// End-to-end: reserve → map → write through the identity alias → seal →
+/// **execute**.
+///
+/// The execution is the point. Everything up to `seal` could be wrong in a
+/// way that only shows up as an instruction fetch on a page the CPU thinks is
+/// NX, or as stale bytes in the I-cache — neither of which any amount of
+/// checking the return values would catch.
+fn smoke_bpf_text_alloc_seal_execute() -> TestResult {
+    let cap = JitCap::bootstrap();
+    let a = match alloc(&cap, RET42.len(), 0) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = e;
+            return TestResult::Fail("bpf_text::alloc failed");
+        }
+    };
+    if a.va < BPF_TEXT_BASE || a.va >= BPF_TEXT_BASE + BPF_TEXT_USABLE {
+        free(a);
+        return TestResult::Fail("allocation landed outside the text window");
+    }
+    if write(&a, 0, RET42).is_err() {
+        free(a);
+        return TestResult::Fail("bpf_text::write failed");
+    }
+    if seal(&cap, &a).is_err() {
+        free(a);
+        return TestResult::Fail("bpf_text::seal failed");
+    }
+    // SAFETY: `a.va` holds a sealed, executable, `extern "C"` stub that takes
+    // no arguments, clobbers only the return register, and returns.
+    let f: extern "C" fn() -> u64 = unsafe { core::mem::transmute::<u64, _>(a.va) };
+    let got = f();
+    free(a);
+    if got != 42 {
+        return TestResult::Fail("sealed BPF text returned the wrong value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_bpf_text_alloc_seal_execute);
+
+/// A stub whose first instruction is a load through its argument, so the
+/// caller can choose whether it faults.
+///
+/// x86_64: `48 8b 07` (`mov rax, [rdi]`) + `c3` (`ret`) — fault at +0, fixup
+/// at +3, destination register 0 (`rax`).
+/// aarch64: `f9400000` (`ldr x0, [x0]`) + `d65f03c0` (`ret`) — fault at +0,
+/// fixup at +4, destination register 0 (`x0`).
+#[cfg(target_arch = "x86_64")]
+const PROBE_LOAD: (&[u8], u64, u8) = (&[0x48, 0x8B, 0x07, 0xC3], 3, 0);
+#[cfg(target_arch = "aarch64")]
+const PROBE_LOAD: (&[u8], u64, u8) = (&[0x00, 0x00, 0x40, 0xF9, 0xC0, 0x03, 0x5F, 0xD6], 4, 0);
+
+/// The fault-recoverable probe load, end to end: a real page fault inside
+/// sealed BPF text, recovered by the extable, with the destination register
+/// zeroed and execution resumed — instead of a dead kernel.
+///
+/// The address dereferenced is the base of the **guard slot** between the text
+/// and arena windows, which nothing ever maps. That is deliberate: it proves
+/// the guard is genuinely unmapped at the same time as it proves the recovery
+/// works.
+fn smoke_bpf_text_extable_recovers_probe_fault() -> TestResult {
+    use crate::bpf_extable::{self, ExEntry, GpReg};
+
+    let (code, fixup_off, dst) = PROBE_LOAD;
+    let cap = JitCap::bootstrap();
+    let a = match alloc(&cap, code.len(), 0) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("bpf_text::alloc failed"),
+    };
+    if write(&a, 0, code).is_err() {
+        free(a);
+        return TestResult::Fail("bpf_text::write failed");
+    }
+
+    // Invariant §4.3: registration precedes `seal`. Doing it the other way
+    // round would leave a window in which the text is executable but a fault
+    // in it is fatal.
+    let token = a.va;
+    if bpf_extable::register_image(
+        token,
+        a.va,
+        a.va + code.len() as u64,
+        alloc_crate::vec![ExEntry {
+            fault_pc: a.va,
+            fixup_pc: a.va + fixup_off,
+            dst: GpReg(dst),
+        }],
+    )
+    .is_err()
+    {
+        free(a);
+        return TestResult::Fail("extable registration failed");
+    }
+    if seal(&cap, &a).is_err() {
+        bpf_extable::unregister_image(token);
+        free(a);
+        return TestResult::Fail("bpf_text::seal failed");
+    }
+
+    // The guard slot between the two BPF windows. Canonical, kernel-half,
+    // and never mapped by anything.
+    let unmapped = BPF_TEXT_BASE + SLOT_SPAN;
+    // SAFETY: `a.va` holds a sealed `extern "C"` stub taking one pointer-sized
+    // argument. Its single load is registered in the extable, so a fault at it
+    // is recovered by the trap handler rather than being fatal.
+    let f: extern "C" fn(u64) -> u64 = unsafe { core::mem::transmute::<u64, _>(a.va) };
+
+    // Control: a load that does *not* fault must return the real value, so a
+    // pass here can't be an artefact of the stub always returning zero.
+    let witness: u64 = 0x5EED_5EED_5EED_5EED;
+    let good = f(&witness as *const u64 as u64);
+
+    // The recovered case.
+    let recovered = f(unmapped);
+
+    bpf_extable::unregister_image(token);
+    free(a);
+
+    if good != witness {
+        return TestResult::Fail("non-faulting probe load returned the wrong value");
+    }
+    if recovered != 0 {
+        return TestResult::Fail("recovered probe load did not zero its destination");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_bpf_text_extable_recovers_probe_fault);
+
+/// A fault inside BPF text at an address with **no** extable entry must stay
+/// fatal — §4.3 says so explicitly, and a recovery that fired on unregistered
+/// addresses would turn a JIT bug into a silently corrupted register.
+///
+/// Checked at the table level rather than by actually faulting, because the
+/// alternative is a test that kills the kernel when it passes.
+fn smoke_bpf_text_unregistered_fault_is_not_recoverable() -> TestResult {
+    use crate::bpf_extable;
+
+    let cap = JitCap::bootstrap();
+    let a = match alloc(&cap, 64, 0) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("bpf_text::alloc failed"),
+    };
+    let hit = bpf_extable::try_recover(a.va).is_some();
+    free(a);
+    if hit {
+        return TestResult::Fail("extable claimed a recovery for an unregistered address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_bpf_text_unregistered_fault_is_not_recoverable
+);
+
+/// Freed chunks come back only through `reclaim`, and a freed program's body
+/// is trap-filled so a stale entry into it faults rather than running whatever
+/// the next allocation writes there.
+fn smoke_bpf_text_free_quarantines_then_reclaims() -> TestResult {
+    let cap = JitCap::bootstrap();
+    // Start from a drained quarantine: sibling smokes in this subsystem also
+    // alloc and free, and their still-quarantined chunks would otherwise be
+    // counted in `used_before` and released by our own `reclaim_all` — making
+    // the result depend on test order.
+    reclaim_all_quarantined();
+    let (_, used_before, q_before) = stats();
+    if q_before != 0 {
+        return TestResult::Fail("quarantine not empty after a full drain");
+    }
+    let a = match alloc(&cap, 128, 0) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("bpf_text::alloc failed"),
+    };
+    let (_, used_alloced, _) = stats();
+    if used_alloced != used_before + 2 {
+        return TestResult::Fail("128 bytes should claim exactly two 64-byte chunks");
+    }
+    free(a);
+    let (_, used_freed, q) = stats();
+    if used_freed != used_alloced {
+        return TestResult::Fail("free() released chunks before the grace period");
+    }
+    if q == 0 {
+        return TestResult::Fail("free() did not quarantine the allocation");
+    }
+    reclaim_all_quarantined();
+    let (_, used_after, q_after) = stats();
+    if q_after != 0 {
+        return TestResult::Fail("quarantine not drained");
+    }
+    if used_after != used_before {
+        return TestResult::Fail("reclaim did not return the chunks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_bpf_text_free_quarantines_then_reclaims);
+
+/// A revoked capability must stop working immediately — invariant #5: holding
+/// a `Cap` proves *prior* grant; only the live check proves current validity.
+fn smoke_bpf_text_revoked_cap_cannot_allocate() -> TestResult {
+    let cap = JitCap::bootstrap();
+    if alloc(&cap, 64, 0).map(free).is_err() {
+        return TestResult::Fail("alloc failed with a live cap");
+    }
+    cap.revoke();
+    match alloc(&cap, 64, 0) {
+        Err(TextError::CapRevoked) => TestResult::Pass,
+        Ok(a) => {
+            free(a);
+            TestResult::Fail("revoked cap still allocated executable text")
+        }
+        Err(_) => TestResult::Fail("revoked cap failed for the wrong reason"),
+    }
+}
+kernel_test_in!("memory", smoke_bpf_text_revoked_cap_cannot_allocate);
 
 // ── Tests ──────────────────────────────────────────────────────────────
 

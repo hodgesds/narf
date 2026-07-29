@@ -88,6 +88,14 @@ struct Image {
 /// Images, sorted by `base`, non-overlapping.
 static IMAGES: IrqSafeSpinLock<Vec<Image>> = IrqSafeSpinLock::new(Vec::new());
 
+/// Number of registered images, readable without taking [`IMAGES`].
+///
+/// [`lookup`] runs on **every** unrecovered kernel fault, including the ones
+/// that are about to panic, so on a kernel with no BPF loaded it must not
+/// touch a lock at all: a CPU that died holding `IMAGES` would otherwise turn
+/// a diagnosable panic into a hang on the next CPU to fault.
+static IMAGE_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Registration failures.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExError {
@@ -142,6 +150,7 @@ pub fn register_image(
             entries,
         },
     );
+    IMAGE_COUNT.store(images.len(), core::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -151,7 +160,9 @@ pub fn register_image(
 /// before: an in-flight fault on a still-running program must still find its
 /// entry.
 pub fn unregister_image(token: u64) {
-    IMAGES.lock().retain(|i| i.token != token);
+    let mut images = IMAGES.lock();
+    images.retain(|i| i.token != token);
+    IMAGE_COUNT.store(images.len(), core::sync::atomic::Ordering::Release);
 }
 
 /// Look up a faulting PC.
@@ -162,13 +173,13 @@ pub fn unregister_image(token: u64) {
 /// by this module, and never across a call that can fault.
 #[inline]
 pub fn lookup(fault_pc: u64) -> Option<ExEntry> {
-    // Fast bail before touching the lock: an empty table is the common case on
-    // a kernel with no BPF loaded, and every unrecovered kernel fault runs
-    // through here.
-    let images = IMAGES.lock();
-    if images.is_empty() {
+    // Fast bail *without* touching the lock: an empty table is the common case
+    // on a kernel with no BPF loaded, and every unrecovered kernel fault runs
+    // through here — including ones on the way to a panic. See `IMAGE_COUNT`.
+    if IMAGE_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
         return None;
     }
+    let images = IMAGES.lock();
     let at = images.partition_point(|i| i.base <= fault_pc);
     if at == 0 {
         return None;
@@ -194,6 +205,7 @@ pub fn stats() -> (usize, usize) {
 #[doc(hidden)]
 pub fn __reset_for_test() {
     IMAGES.lock().clear();
+    IMAGE_COUNT.store(0, core::sync::atomic::Ordering::Release);
 }
 
 // ── The trap-handler side ──────────────────────────────────────────────

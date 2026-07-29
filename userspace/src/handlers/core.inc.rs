@@ -583,6 +583,10 @@ pub fn init_per_task_state() {
     umask_init();
     prctl_init();
     sched_param_init();
+    // W^X JIT grants. `memory/src/wx.rs` has described this capability since
+    // it was written; `CapKind::Jit` and `wx::jit_mprotect` are what finally
+    // implement it. Swept per-task by `release_task_tables`.
+    narf_memory::wx::jit_grants_init();
     pgid_init();
     sid_init();
     wait_init();
@@ -4279,6 +4283,20 @@ fn mprotect_core(
     // `change_perms_range` is whole-region only.
     #[cfg(feature = "linux-compat")]
     {
+        // W^X: `mprotect_range` refuses a W|X end state outright. That is the
+        // right default and stays the fast path — the only way past it is a
+        // live `Cap<Jit, Grant>`, which `wx::jit_mprotect` re-classifies the
+        // transition against and which still refuses X→WX unconditionally.
+        //
+        // Checked *before* the plain call rather than as a fallback so a
+        // capability-gated request is never partially applied by the
+        // non-capability path first.
+        if perms.contains(RegionPerms::WRITE | RegionPerms::EXEC) {
+            let Some(cap) = narf_memory::wx::jit_cap(current_task_id()) else {
+                return Err(());
+            };
+            return narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| ());
+        }
         as_ref.mprotect_range(base, len, perms).map_err(|_| ())
     }
     #[cfg(not(feature = "linux-compat"))]
@@ -6441,6 +6459,10 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
 fn release_task_tables(tid: u64) {
     #[cfg(feature = "container")]
     crate::namespaces::release_task(tid);
+    // JIT (W^X) grant. Revoking bumps the object's epoch, so any capability
+    // copy that escaped this table fails its next `check_live` — the grant
+    // cannot outlive the task that was given it.
+    narf_memory::wx::revoke_jit(tid);
     // Signal state.
     if let Some(m) = SIGNAL_PENDING.lock().as_mut() {
         m.remove(&tid);

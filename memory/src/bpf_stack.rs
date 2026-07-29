@@ -37,6 +37,8 @@
 //! region is a page fault at a known address, which the trap handler's
 //! diagnostic names, rather than a silent scribble over the next CPU's frames.
 
+extern crate alloc as alloc_crate;
+
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -332,6 +334,83 @@ unsafe fn map_stack_page(va: u64, phys: PhysAddr) -> Result<(), StackError> {
 unsafe fn map_stack_page(_va: u64, _phys: PhysAddr) -> Result<(), StackError> {
     Err(StackError::MapFailed)
 }
+
+// ── In-kernel smokes ───────────────────────────────────────────────────
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// The region is backed and writable at both ends of a CPU's slice, and the
+/// depth counter starts at zero.
+fn smoke_bpf_stack_region_is_backed() -> TestResult {
+    if init(MAX_CPUS).is_err() {
+        return TestResult::Fail("bpf_stack::init failed");
+    }
+    if depth() != 0 {
+        return TestResult::Fail("depth counter did not start at zero");
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    let base = base_of(cpu);
+    let top = top_of(cpu);
+    // Touch the first and last usable words. Anything wrong with the mapping
+    // (wrong root, wrong slot, off-by-a-page against the guards) faults here.
+    // SAFETY: `[base, top)` was mapped RW by `init`; both accesses are inside
+    // it and naturally aligned.
+    unsafe {
+        let lo = base as *mut u64;
+        let hi = (top - 8) as *mut u64;
+        lo.write_volatile(0xA5A5_A5A5_A5A5_A5A5);
+        hi.write_volatile(0x5A5A_5A5A_5A5A_5A5A);
+        if lo.read_volatile() != 0xA5A5_A5A5_A5A5_A5A5
+            || hi.read_volatile() != 0x5A5A_5A5A_5A5A_5A5A
+        {
+            return TestResult::Fail("per-CPU BPF stack did not read back what was written");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_bpf_stack_region_is_backed);
+
+/// Nesting to [`MAX_NEST`] is supported; level `MAX_NEST + 1` **declines the
+/// program** rather than handing out a slice that overlaps someone else's.
+///
+/// This is the whole difference from Linux's global `bpf_prog_active`
+/// recursion guard, which turns the same situation into a silent skip.
+fn smoke_bpf_stack_depth_declines_beyond_max() -> TestResult {
+    if init(MAX_CPUS).is_err() {
+        return TestResult::Fail("bpf_stack::init failed");
+    }
+    // Hold the whole nest inside one IRQ-masked region: a `StackLease` is
+    // per-CPU state and must not cross a preemption point.
+    narf_lib::sync::without_interrupts(|| {
+        let mut held = alloc_crate::vec::Vec::new();
+        for level in 0..MAX_NEST {
+            match try_enter() {
+                Some(l) => {
+                    if depth() != level + 1 {
+                        return TestResult::Fail("depth counter out of step with the lease count");
+                    }
+                    held.push(l);
+                }
+                None => return TestResult::Fail("declined a level within MAX_NEST"),
+            }
+        }
+        // Levels must not overlap.
+        for i in 1..held.len() {
+            if held[i].top() + held[i].len() != held[i - 1].top() {
+                return TestResult::Fail("nesting levels overlap or leave a gap");
+            }
+        }
+        if try_enter().is_some() {
+            return TestResult::Fail("MAX_NEST + 1 was granted");
+        }
+        drop(held);
+        if depth() != 0 {
+            return TestResult::Fail("dropping every lease did not return depth to zero");
+        }
+        TestResult::Pass
+    })
+}
+kernel_test_in!("memory", smoke_bpf_stack_depth_declines_beyond_max);
 
 #[cfg(test)]
 mod tests {

@@ -2263,13 +2263,54 @@ impl AddressSpace {
         len: u64,
         new_perms: RegionPerms,
     ) -> Result<(), AddressSpaceError> {
-        // W^X: reject WRITE | EXEC outright. Used by sys_mprotect's
-        // cap-free fast path; CAP_JIT-gated RW→RX transitions go
-        // through a separate cap-checked entry.
+        // W^X: reject WRITE | EXEC outright. This is sys_mprotect's cap-free
+        // fast path; the `Cap<Jit, Grant>`-gated transitions go through
+        // `wx::jit_mprotect`, which classifies the change and then calls
+        // `mprotect_range_wx_checked` below.
         let prot = new_perms.prot_only();
         if prot.contains(RegionPerms::WRITE | RegionPerms::EXEC) {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
+        self.mprotect_range_wx_checked(base, len, new_perms)
+    }
+
+    /// Permissions of the region covering `[base, base + len)`, or `None` if
+    /// no single region covers the whole request.
+    ///
+    /// `wx::jit_mprotect` needs the *old* permission set to classify the
+    /// transition, and "one region or nothing" is the right shape for that:
+    /// a request straddling two regions with different permissions has no
+    /// single `old` to classify, and silently classifying against the first
+    /// one would let a JIT grant cover a region it was never meant to.
+    pub fn perms_covering(&self, base: VirtAddr, len: u64) -> Option<RegionPerms> {
+        let lo = base.as_u64();
+        let hi = lo.checked_add(len)?;
+        self.regions
+            .lock()
+            .iter()
+            .find(|r| {
+                let rb = r.base.as_u64();
+                rb <= lo && hi <= rb + r.len
+            })
+            .map(|r| r.perms)
+    }
+
+    /// `mprotect_range` **without** the W^X end-state rejection.
+    ///
+    /// Not public: the only caller is `wx::jit_mprotect`, which has already
+    /// classified the `old → new` transition through
+    /// [`wx::classify_mprotect`](crate::wx::classify_mprotect) and verified a
+    /// live `Cap<Jit, Grant>`. Splitting it out this way keeps exactly one
+    /// place where a W|X mapping can come into existence, and that place is
+    /// capability-gated.
+    #[cfg(feature = "linux-compat")]
+    pub(crate) fn mprotect_range_wx_checked(
+        &self,
+        base: VirtAddr,
+        len: u64,
+        new_perms: RegionPerms,
+    ) -> Result<(), AddressSpaceError> {
+        let prot = new_perms.prot_only();
         // Page-align the request. Linux mprotect(2) requires
         // `addr` to be page-aligned; `len` is rounded up by the
         // libc caller but we reject silently-misaligned lengths

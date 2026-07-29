@@ -448,6 +448,107 @@ unsafe fn map_arena_page(_va: u64, _phys: PhysAddr) -> Result<(), ArenaError> {
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 unsafe fn unmap_arena_page(_va: u64) {}
 
+// ── In-kernel smokes ───────────────────────────────────────────────────
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// Demand population works, the kernel VA is stable, and a populated page
+/// actually reads back what a program wrote — the live-MMU half of the arena
+/// that no host test can reach.
+fn smoke_bpf_arena_populate_and_roundtrip() -> TestResult {
+    let cap = ArenaCap::bootstrap();
+    let arena = match Arena::new(&cap, 64) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("Arena::new failed"),
+    };
+    if arena.kva() < BPF_ARENA_BASE || arena.kva() >= BPF_ARENA_BASE + SLOT_SPAN {
+        return TestResult::Fail("arena landed outside the arena window");
+    }
+    if arena.populated_pages() != 0 {
+        return TestResult::Fail("a fresh arena should have no backed pages");
+    }
+    let va = match arena.populate(3) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("populate failed"),
+    };
+    if va != arena.kva() + 3 * 4096 {
+        return TestResult::Fail("populate returned the wrong VA");
+    }
+    // Freshly populated pages must be zeroed — arena memory is
+    // program-visible and must never leak the previous owner's bytes.
+    // SAFETY: `va` names a page this call just mapped RW.
+    unsafe {
+        let p = va as *mut u64;
+        if p.read_volatile() != 0 {
+            return TestResult::Fail("populated page was not zeroed");
+        }
+        p.write_volatile(0xDEAD_BEEF_CAFE_F00D);
+        if p.read_volatile() != 0xDEAD_BEEF_CAFE_F00D {
+            return TestResult::Fail("arena page did not read back what was written");
+        }
+    }
+    // Idempotent.
+    if arena.populate(3) != Ok(va) {
+        return TestResult::Fail("re-populating a backed page changed its VA");
+    }
+    if arena.populated_pages() != 1 {
+        return TestResult::Fail("re-populating a backed page allocated a second frame");
+    }
+    if arena.first_unpopulated(0) != Some(0) || arena.first_unpopulated(3) != Some(4) {
+        return TestResult::Fail("free-range tracking disagrees with the populated set");
+    }
+    if arena.populate(64).is_ok() {
+        return TestResult::Fail("populate accepted a page past max_pages");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_bpf_arena_populate_and_roundtrip);
+
+/// Once the frame list has been handed to the mmap layer, growing the arena
+/// must fail loudly. `FileOps::mmap_frames` is eager and snapshot-based, so a
+/// page populated afterwards would simply not exist in the userspace mapping —
+/// a hole nobody could explain later. Open question §8.2 is the real fix.
+fn smoke_bpf_arena_snapshot_freezes_population() -> TestResult {
+    let cap = ArenaCap::bootstrap();
+    let arena = match Arena::new(&cap, 8) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("Arena::new failed"),
+    };
+    if arena.populate_range(0, 4).is_err() {
+        return TestResult::Fail("populate_range failed");
+    }
+    let frames = arena.snapshot_frames();
+    if frames.len() != 4 {
+        return TestResult::Fail("snapshot did not return one frame per populated page");
+    }
+    match arena.populate(5) {
+        Err(ArenaError::SnapshotTaken) => {}
+        _ => return TestResult::Fail("populate after snapshot must fail with SnapshotTaken"),
+    }
+    // An already-backed page is still resolvable, though — freezing growth is
+    // not the same as breaking what exists.
+    if arena.populate(0).is_err() {
+        return TestResult::Fail("snapshot broke access to already-backed pages");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_bpf_arena_snapshot_freezes_population);
+
+/// A revoked `Cap<BpfArena, Grant>` cannot create an arena — invariant #5.
+fn smoke_bpf_arena_revoked_cap_cannot_create() -> TestResult {
+    let cap = ArenaCap::bootstrap();
+    if Arena::new(&cap, 4).is_err() {
+        return TestResult::Fail("Arena::new failed with a live cap");
+    }
+    cap.revoke();
+    match Arena::new(&cap, 4) {
+        Err(ArenaError::CapRevoked) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("revoked cap still created an arena"),
+        Err(_) => TestResult::Fail("revoked cap failed for the wrong reason"),
+    }
+}
+kernel_test_in!("memory", smoke_bpf_arena_revoked_cap_cannot_create);
+
 #[cfg(test)]
 mod tests {
     use super::*;

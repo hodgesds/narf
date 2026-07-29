@@ -89,19 +89,79 @@ Descriptors go into a `narf.kfuncs` link section, collected at boot exactly as
 ### 3.3 Memory-subsystem interface (Stream B)
 
 ```rust
-// memory/src/bpf_text.rs
-pub fn reserve_kernel_slots() -> Result<(), TextError>;   // §4.1, boot-order critical
-pub fn alloc(cap: &Cap<Jit, Grant>, len: usize) -> Result<TextAlloc, TextError>;
-pub fn seal(cap: &Cap<Jit, Grant>, a: &TextAlloc) -> Result<(), TextError>;
-pub fn free(a: TextAlloc);                                 // via RCU retire
+// memory/src/bpf_text.rs — executable kernel text
+pub struct Jit;                       // CapType, CapKind::Jit
+pub type JitCap = Cap<Jit, Grant>;
 
-// memory/src/bpf_arena.rs
+pub fn reserve_kernel_slots() -> Result<(), TextError>;   // §4.1, boot-order critical
+pub fn slots_reserved() -> bool;                          // what §4.1's debug_assert reads
+pub fn alloc(cap: &JitCap, len: usize, node: usize) -> Result<TextAlloc, TextError>;
+pub fn write(a: &TextAlloc, off: usize, bytes: &[u8]) -> Result<(), TextError>;
+pub fn seal(cap: &JitCap, a: &TextAlloc) -> Result<(), TextError>;
+pub fn free(a: TextAlloc);            // quarantine, then the reclaim hook
+pub fn reclaim(a: TextAlloc);         // call only after a grace period
+pub fn install_reclaim_hook(h: fn(TextAlloc));
+pub fn stats() -> (usize, usize, usize);   // (packs, chunks used, quarantined)
+```
+
+`write` goes through the identity alias, so it is legal before *and* after
+`seal` (§4.2). `narf-memory` cannot depend on `narf-rcu` — the dependency graph
+already runs `rcu → time → console → memory` — so the RCU grace period arrives
+through `install_reclaim_hook`, the same seam shape as `install_pager`.
+
+```rust
+// memory/src/bpf_arena.rs — the program heap
+pub struct BpfArena;                  // CapType, CapKind::BpfArena
 impl Arena {
-    pub fn new(cap: &Cap<BpfArena, Grant>, max_pages: usize) -> Result<Arena, ArenaError>;
+    pub fn new(cap: &ArenaCap, max_pages: usize) -> Result<Arena, ArenaError>;
     pub fn kva(&self) -> u64;                              // stable for the arena's life
+    pub fn window_offset(&self) -> u64;                    // the base-relative pointer
     pub fn populate(&self, page: usize) -> Result<u64, ArenaError>;
+    pub fn populate_range(&self, from: usize, count: usize) -> Result<(), ArenaError>;
+    pub fn first_unpopulated(&self, from: usize) -> Option<usize>;
+    pub fn snapshot_frames(&self) -> Vec<PhysAddr>;        // freezes the arena — §8.2
+    pub fn resolve(&self, offset: u64) -> Option<u64>;
 }
 ```
+
+```rust
+// memory/src/bpf_extable.rs — recoverable fault sites
+pub struct ExEntry { pub fault_pc: u64, pub fixup_pc: u64, pub dst: GpReg }
+pub fn register_image(token: u64, base: u64, end: u64, e: Vec<ExEntry>) -> Result<(), ExError>;
+pub fn unregister_image(token: u64);
+pub fn try_recover(fault_pc: u64) -> Option<Recovery>;     // called from both trap handlers
+```
+
+`GpReg` is the *architectural* register number the JIT already emitted —
+0..=15 in x86_64's ModRM/REX encoding, 0..=30 for aarch64's `x0..x30` — so no
+translation table exists to drift.
+
+```rust
+// memory/src/bpf_stack.rs — the per-CPU atomic-program stack
+pub const STACK_BYTES: u64;  pub const MAX_NEST: u32;
+pub fn init(cpus: usize) -> Result<(), StackError>;
+pub fn try_enter() -> Option<StackLease>;   // None ⇒ decline the program
+pub const fn bytes_per_level() -> u64;      // the verifier's stack bound
+```
+
+`StackLease` is `!Send` and releases on drop; it must be taken and dropped
+inside one non-preemptible region, because the depth counter is a per-CPU
+non-atomic RMW. Sleepable programs use a heap stack instead (§4.8), so this is
+not the only path — `STACK_BYTES` is public so both size identically.
+
+```rust
+// memory/src/wx.rs — the W^X capability gate
+pub fn jit_grants_init();
+pub fn grant_jit(task: u64) -> JitCap;      // idempotent per task
+pub fn jit_cap(task: u64) -> Option<JitCap>;
+pub fn revoke_jit(task: u64);               // wired to the thread exit-observer fan-out
+pub fn jit_mprotect(cap: &JitCap, space: &AddressSpace,
+                    base: VirtAddr, len: u64, new: RegionPerms) -> Result<(), WxError>;
+```
+
+`jit_mprotect` is the only path by which a `W | X` user mapping can come into
+existence. `AddressSpace::mprotect_range` keeps rejecting `W | X` outright and
+stays the cap-free fast path.
 
 ### 3.4 Maps
 
