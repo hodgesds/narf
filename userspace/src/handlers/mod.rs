@@ -11946,6 +11946,21 @@ fn signal_target_exists(tid: u64) -> bool {
         .is_some_and(|m| m.contains_key(&tid))
 }
 
+/// Resolve the thread identifier supplied by a Linux signal syscall to the
+/// TaskId that owns NARF's signal state.  A thread-group leader is visible as
+/// its PID through gettid(2), while CLONE_THREAD siblings retain their
+/// distinct TaskId-derived TIDs.  Keep the latter in task space, then map a
+/// leader PID (including the caller's PID-namespace view) back to its task.
+fn signal_tid_from_user(caller: u64, tid: u64) -> Option<u64> {
+    let is_non_leader_thread =
+        tid == caller || task_to_pid_raw(tid).is_some_and(|pid| pid_to_task_raw(pid) != Some(tid));
+    if is_non_leader_thread {
+        return Some(tid);
+    }
+    let pid = accept_pid_from(caller, tid)?;
+    Some(pid_to_task_raw(pid).unwrap_or(pid))
+}
+
 /// Copy `si_code` (offset 8), `si_pid` (offset 16) and `si_value` (the
 /// sigval union, offset 24) out of a user `siginfo_t` and stash them for
 /// delivery / sigtimedwait / signalfd. Returns `false` only when the
