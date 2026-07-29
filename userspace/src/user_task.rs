@@ -114,6 +114,11 @@ pub struct UserTaskCtx {
     /// `FUTEX_WAKE` on that word wakes this task PROMPTLY (a real blocking
     /// futex, not the old fixed ~1ms nanosleep park). Mirrors `net_io_wait`.
     pub futex_uaddr: AtomicU64,
+    /// Address-space namespace for `FUTEX_PRIVATE` queue lookup. Zero denotes
+    /// a process-shared futex; non-zero is the shared `Arc<AddressSpace>`
+    /// identity, so CLONE_VM threads match while unrelated processes using
+    /// the same virtual address cannot consume each other's wakes.
+    pub futex_namespace: AtomicU64,
     /// Snapshot of the per-uaddr `FUTEX_WAKE` counter taken by `sys_futex`
     /// just before it parks. The poll routine re-reads the live counter after
     /// registering the waker; if it advanced, a wake landed in the
@@ -320,6 +325,7 @@ impl UserTaskCtx {
             net_io_wait: AtomicBool::new(false),
             epoll_park_gen: AtomicU64::new(0),
             futex_uaddr: AtomicU64::new(0),
+            futex_namespace: AtomicU64::new(0),
             futex_park_gen: AtomicU64::new(0),
             futex_val: AtomicU32::new(0),
             pending_exec: AtomicPtr::new(core::ptr::null_mut()),
@@ -639,17 +645,20 @@ fn park_should_block(
             // on the new word with the retargeted gen/val snapshots.
             let fu = uc.futex_uaddr.load(Ordering::Acquire);
             if fu != 0 {
-                crate::handlers::futex_register_waiter(fu, task_id, waker.clone());
+                let key =
+                    crate::handlers::futex_key(uc.futex_namespace.load(Ordering::Acquire), fu);
+                crate::handlers::futex_register_waiter_key(key, task_id, waker.clone());
                 let stay = crate::handlers::futex_park_should_stay(
-                    crate::handlers::futex_gen(fu),
+                    crate::handlers::futex_gen_key(key),
                     uc.futex_park_gen.load(Ordering::Acquire),
                     crate::handlers::futex_read_user_word(fu),
                     uc.futex_val.load(Ordering::Acquire),
                 );
                 if !stay {
-                    crate::handlers::futex_drop_waiter(fu, task_id);
+                    crate::handlers::futex_drop_waiter_key(key, task_id);
                     uc.sleep_deadline_ns.store(0, Ordering::Release);
                     uc.futex_uaddr.store(0, Ordering::Release);
+                    uc.futex_namespace.store(0, Ordering::Release);
                     return false; // wake landed / word changed → re-execute (musl re-checks)
                 }
             }
@@ -734,6 +743,7 @@ fn park_should_block(
         uc.sleep_deadline_ns.store(0, Ordering::Release);
         uc.net_io_wait.store(false, Ordering::Release);
         uc.futex_uaddr.store(0, Ordering::Release);
+        uc.futex_namespace.store(0, Ordering::Release);
         // The waiter-queue entry (if any) is dropped by the re-executed
         // fcntl's exit paths, which know the key; just clear the routing.
         uc.flock_key.store(0, Ordering::Release);
@@ -2697,10 +2707,85 @@ pub fn install_user_task_hooks() {}
 
 // ── User-task spawn entry points ────────────────────────────────────
 //
-// ALL user-task spawns (boot init, fork, clone) go through these two
-// helpers so the refcounted `Task` is registered under its reserved
-// `TaskId` BEFORE the slot is enqueued — the task must be resolvable
-// via `crate::task::task_get` from its very first instruction.
+// ALL user-task spawns (boot init, fork, clone) go through these helpers so
+// the refcounted `Task` is registered under its reserved `TaskId` BEFORE the
+// slot is enqueued — the task must be resolvable via `crate::task::task_get`
+// from its very first instruction.
+
+/// A registered user task which has not yet been made runnable.
+///
+/// Fork-like syscalls must install all of the child's inherited kernel state
+/// (fd table, namespaces, signal state, cgroup membership, and so on) before
+/// its first instruction can run.  In particular, `posix_spawn` commonly
+/// performs an immediate `execveat(AT_EMPTY_PATH)` through an inherited fd;
+/// enqueuing before `fd::fork` creates an SMP race where that lookup observes
+/// no child table and spuriously returns `ENOENT`.
+pub struct PendingUserProcess {
+    id: narf_scheduler::TaskId,
+    future: UserTaskFuture,
+    spec: narf_scheduler::TaskSpec,
+    addr_space: alloc::sync::Arc<narf_memory::AddressSpace>,
+}
+
+impl core::fmt::Debug for PendingUserProcess {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PendingUserProcess")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingUserProcess {
+    /// The reserved task id, usable as the key for inheritance state before
+    /// [`Self::spawn`] publishes the task to the scheduler.
+    pub const fn task_id(&self) -> narf_scheduler::TaskId {
+        self.id
+    }
+
+    /// Publish this fully initialized task to the scheduler.
+    pub fn spawn(self) -> narf_scheduler::TaskId {
+        narf_scheduler::spawn_user(self.id, self.future, self.spec, self.addr_space)
+    }
+}
+
+fn prepare_user_process(
+    process: crate::UserProcess,
+    future: impl FnOnce(crate::UserProcess, alloc::sync::Arc<crate::task::Task>) -> UserTaskFuture,
+    spec: narf_scheduler::TaskSpec,
+) -> PendingUserProcess {
+    let id = narf_scheduler::alloc_task_id();
+    let addr_space = process.address_space.clone();
+    let task = crate::task::Task::new_registered(id.raw(), process.pid.raw());
+    PendingUserProcess {
+        id,
+        future: future(process, task),
+        spec,
+        addr_space,
+    }
+}
+
+/// Register a fresh user task without making it runnable.  Callers that need
+/// no child-state setup should use [`spawn_user_process`] instead.
+pub fn prepare_user_process_initial(
+    process: crate::UserProcess,
+    spec: narf_scheduler::TaskSpec,
+) -> PendingUserProcess {
+    prepare_user_process(process, UserTaskFuture::new, spec)
+}
+
+/// Register a fork/clone child with its saved user state, but do not make it
+/// runnable until the caller has installed all inherited kernel state.
+pub fn prepare_user_process_resume(
+    process: crate::UserProcess,
+    state: UserState,
+    spec: narf_scheduler::TaskSpec,
+) -> PendingUserProcess {
+    prepare_user_process(
+        process,
+        move |process, task| UserTaskFuture::resume_with(process, task, state),
+        spec,
+    )
+}
 
 /// Reserve a `TaskId`, register the refcounted `Task`, and enqueue a
 /// fresh polling future for `process` under that id.
@@ -2708,11 +2793,7 @@ pub fn spawn_user_process(
     process: crate::UserProcess,
     spec: narf_scheduler::TaskSpec,
 ) -> narf_scheduler::TaskId {
-    let id = narf_scheduler::alloc_task_id();
-    let addr_space = process.address_space.clone();
-    let task = crate::task::Task::new_registered(id.raw(), process.pid.raw());
-    let future = UserTaskFuture::new(process, task);
-    narf_scheduler::spawn_user(id, future, spec, addr_space)
+    prepare_user_process_initial(process, spec).spawn()
 }
 
 /// Same as [`spawn_user_process`] but seeds the child with a saved
@@ -2722,9 +2803,5 @@ pub fn spawn_user_process_resume(
     state: UserState,
     spec: narf_scheduler::TaskSpec,
 ) -> narf_scheduler::TaskId {
-    let id = narf_scheduler::alloc_task_id();
-    let addr_space = process.address_space.clone();
-    let task = crate::task::Task::new_registered(id.raw(), process.pid.raw());
-    let future = UserTaskFuture::resume_with(process, task, state);
-    narf_scheduler::spawn_user(id, future, spec, addr_space)
+    prepare_user_process_resume(process, state, spec).spawn()
 }

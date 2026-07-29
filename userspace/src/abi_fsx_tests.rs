@@ -691,33 +691,67 @@ fn smoke_abi_fsx_umount2_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_neg);
 
+// systemd's switch-root does `fchdir(new_root_fd); pivot_root(".", ".");
+// umount2(".", MNT_DETACH)`. The RELATIVE "." must resolve against the cwd (the
+// new root), not be taken literally — a literal "." matched no mount, umount2
+// failed, and systemd's `mount(".", "/", MS_MOVE)` fallback then returned
+// ENOENT → 226/EXIT_NAMESPACE (udevd et al., after the domainname fix).
+fn smoke_abi_fsx_umount2_relative_dot() -> TestResult {
+    with_setup(|| {
+        crate::handlers::__test_cwd_reset();
+        let target = b"/abi-swroot\0";
+        let margs = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), margs) != Some(0) {
+            return Err("setup mount failed");
+        }
+        // Change into the new mount, then umount2(".").
+        if call(Syscall::Chdir.raw(), a1(target.as_ptr() as u64, 0)) != Some(0) {
+            crate::handlers::__test_cwd_reset();
+            return Err("chdir into the new mount failed");
+        }
+        let dot = b".\0";
+        let r = call(Syscall::Umount2.raw(), a1(dot.as_ptr() as u64, 0));
+        crate::handlers::__test_cwd_reset();
+        match r {
+            Some(0) => Ok(()),
+            _ => Err("umount2(\".\") must resolve to the cwd mount and return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_relative_dot);
+
 // ── pivot_root ────────────────────────────────────────────────────────
 //
-// arg0/arg1 = new_root ptr/len, arg2/arg3 = put_old ptr/len. Both must be
-// absolute and new_root must resolve to an existing path. NOTE: under the
-// harness this handler is only present with feature "container"; the test
-// still compiles unconditionally and asserts the negative (failure)
-// behaviour, which the table reports as -1 / OK either way (a missing slot
-// in kernel_syscall_entry returns its own failure shape).
+// arg0/arg1 = new_root/put_old C-string pointers. The handler is part of the
+// Linux-compat syscall surface, independently of the optional container
+// namespace bundle: systemd uses pivot_root while constructing a service
+// sandbox after CLONE_NEWNS. A missing syscall-table slot returns EPERM and
+// turns that otherwise valid setup into 226/NAMESPACE.
 
 fn smoke_abi_fsx_pivot_root_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
-        // new_root is not absolute → -1 sentinel (relative path rejected).
-        let new_root = b"relative\0";
+        // Linux ABI: pivot_root(new_root, put_old), both NUL-terminated paths
+        // resolved against the cwd. A new_root that does not resolve to an
+        // existing directory must fail — here a relative name with no matching
+        // entry under the cwd. (Relative paths are NOT rejected wholesale:
+        // `pivot_root(".", ".")` is the standard container idiom — see
+        // smoke_pivot_root_relative_dot in mount_e2e_tests.)
+        let new_root = b"nonexistent-dir\0";
         let put_old = b"/abi\0";
-        let args = a3(
-            new_root.as_ptr() as u64,
-            (new_root.len() - 1) as u64, // strip NUL: pass the byte length
-            put_old.as_ptr() as u64,
-            (put_old.len() - 1) as u64,
-        );
-        // LINUX-GAP: Linux returns -EINVAL/-ENOTDIR; NARF returns -1 on a
-        // non-absolute new_root. The pivot_root slot may also be absent
-        // (no "container" feature) — then the entry reports a non-Ok
-        // status and `call` is None. Accept either failure shape.
+        let args = a2(new_root.as_ptr() as u64, put_old.as_ptr() as u64, 0);
+        // This exercises the installed dispatcher slot, not just the handler
+        // directly. The missing path must reach pivot_root and fail normally.
         match call(Syscall::PivotRoot.raw(), args) {
-            Some(-1) | None => Ok(()),
-            Some(_) => Err("pivot_root with a relative new_root must fail"),
+            Some(-1) => Ok(()),
+            Some(_) => Err("pivot_root with an unresolvable new_root must fail"),
+            None => Err("linux-compat pivot_root must be present in the syscall table"),
         }
     })
 }
@@ -746,12 +780,52 @@ fn smoke_abi_fsx_name_to_handle_at_pos() -> TestResult {
             mount_id.as_mut_ptr() as u64,
         );
         match call(Syscall::NameToHandleAt.raw(), args) {
-            Some(0) => Ok(()),
+            Some(0) if i32::from_ne_bytes(mount_id) > 0 => Ok(()),
+            Some(0) => Err("name_to_handle_at must report the visible mount id"),
             _ => Err("name_to_handle_at on an existing file should return 0"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_name_to_handle_at_pos);
+
+fn smoke_abi_fsx_name_to_handle_at_empty_path_mount_id_pos() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        const O_PATH: u64 = 0o10000000;
+        let path = b"/abi/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, O_PATH, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("O_PATH open for AT_EMPTY_PATH setup failed"),
+        };
+        let empty = b"\0";
+        let mut hbuf = [0u8; 16];
+        hbuf[0..4].copy_from_slice(&8u32.to_ne_bytes());
+        let mut mount_id = [0u8; 4];
+        let args = SyscallArgs {
+            arg0: fd,
+            arg1: empty.as_ptr() as u64,
+            arg2: hbuf.as_mut_ptr() as u64,
+            arg3: mount_id.as_mut_ptr() as u64,
+            arg4: AT_EMPTY_PATH,
+            ..Default::default()
+        };
+        let result = match call(Syscall::NameToHandleAt.raw(), args) {
+            Some(0) if i32::from_ne_bytes(mount_id) > 0 => Ok(()),
+            Some(0) => Err("AT_EMPTY_PATH must preserve the fd's opening mount id"),
+            _ => Err("name_to_handle_at(AT_EMPTY_PATH) failed"),
+        };
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_name_to_handle_at_empty_path_mount_id_pos
+);
 
 fn smoke_abi_fsx_name_to_handle_at_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
@@ -1069,13 +1143,62 @@ fn smoke_abi_fsx_open_tree_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_open_tree_pos);
 
+fn smoke_abi_fsx_open_tree_mount_fd_relative() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        let path = b"/abi\0";
+        let mount_fd = match call(Syscall::OpenTree.raw(), a2(0, path.as_ptr() as u64, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("first open_tree should return a mount-object fd"),
+        };
+        let mut stat = [0u8; 256];
+        if call(Syscall::Fstat.raw(), a1(mount_fd, stat.as_mut_ptr() as u64)) != Some(0) {
+            return Err("fstat on an open_tree mount fd should succeed");
+        }
+        let mode = u32::from_ne_bytes(stat[24..28].try_into().unwrap());
+        if mode & 0o170000 != 0o040000 {
+            return Err("an open_tree mount fd must report S_IFDIR");
+        }
+        let relative = b"abi\0";
+        match call(
+            Syscall::OpenTree.raw(),
+            a2(mount_fd, relative.as_ptr() as u64, 0),
+        ) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("open_tree should accept a prior mount-object fd as dirfd"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_open_tree_mount_fd_relative);
+
+fn smoke_abi_fsx_open_tree_empty_path_pos() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        let dir = b"/abi\0";
+        let fd = match call_open(dir.as_ptr() as u64, 0) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("open_tree setup could not open its directory fd"),
+        };
+        let empty = b"\0";
+        match call(
+            Syscall::OpenTree.raw(),
+            a2(fd, empty.as_ptr() as u64, 0x1000),
+        ) {
+            Some(v) if v >= 0 => Ok(()),
+            _ => Err("open_tree(fd, empty, AT_EMPTY_PATH) should clone the fd's mount"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_open_tree_empty_path_pos);
+
 fn smoke_abi_fsx_open_tree_neg() -> TestResult {
     with_setup(|| {
-        // Relative path → EINVAL.
+        // A relative path is valid only when dfd names a directory.
         let path = b"relative\0";
-        match call(Syscall::OpenTree.raw(), a2(0, path.as_ptr() as u64, 0)) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("open_tree with a relative path must return -EINVAL"),
+        match call(
+            Syscall::OpenTree.raw(),
+            a2(u32::MAX as u64, path.as_ptr() as u64, 0),
+        ) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("open_tree with a bad dirfd must return -EBADF"),
         }
     })
 }

@@ -42,7 +42,7 @@ fn smoke_abi_proc_getppid_ignores_args() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_getppid_ignores_args);
 
-// ── gettid(2) — infallible, returns the caller's TaskId ──
+// ── gettid(2) — infallible; a group leader's tid equals its pid ──
 
 fn smoke_abi_proc_gettid_pos() -> TestResult {
     with_setup(|| {
@@ -69,6 +69,22 @@ fn smoke_abi_proc_gettid_tracks_set_task() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_gettid_tracks_set_task);
+
+fn smoke_abi_proc_gettid_group_leader_equals_pid() -> TestResult {
+    with_setup(|| {
+        const TASK: u64 = 0xBEEF;
+        const PID: u64 = 0xCAFE;
+        set_task(TASK);
+        crate::handlers::register_pid_task_mapping(PID, TASK);
+        let result = call(Syscall::Gettid.raw(), a0(0));
+        set_task(FAKE_TASK);
+        match result {
+            Some(value) if value == PID as i64 => Ok(()),
+            _ => Err("gettid did not equal getpid for group leader"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_gettid_group_leader_equals_pid);
 
 // ── getpgid(2) / setpgid(2) — process-group bookkeeping ──
 
@@ -198,20 +214,75 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_prctl_pos);
 
 fn smoke_abi_proc_prctl_neg() -> TestResult {
     with_setup(|| {
-        // An unrecognised prctl op falls to the `_ => fail` arm, which
-        // returns the -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL for an unknown option; NARF
-        // returns the bare -1 sentinel.
+        // An unrecognised prctl option returns -EINVAL, matching Linux (NOT the
+        // -1/EPERM sentinel — that made systemd treat a PR_SET_MDWE feature
+        // probe as a fatal 228/EXIT_SECCOMP instead of degrading to seccomp).
         match call(Syscall::Prctl.raw(), a0(0xFFFF)) {
-            Some(-1) => Ok(()),
+            Some(-22) => Ok(()),
             other => {
                 let _ = other;
-                Err("prctl with an unknown op did not return -1")
+                Err("prctl with an unknown op must return -EINVAL")
             }
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_prctl_neg);
+
+// prctl feature-probe / no-op options systemd and glibc exercise during
+// service setup. PR_SET_MDWE must report EINVAL (unsupported, pre-6.3-style) so
+// systemd's MemoryDenyWriteExecute= falls back to seccomp instead of failing
+// 228/EXIT_SECCOMP; the rest are accepted no-ops with Linux-shaped returns.
+fn smoke_abi_proc_prctl_feature_probes() -> TestResult {
+    with_setup(|| {
+        const PR_GET_TSC: u64 = 25;
+        const PR_SET_TSC: u64 = 26;
+        const PR_SET_TIMERSLACK: u64 = 29;
+        const PR_GET_TIMERSLACK: u64 = 30;
+        const PR_SET_THP_DISABLE: u64 = 41;
+        const PR_SET_MDWE: u64 = 65;
+        const PR_MDWE_REFUSE_EXEC_GAIN: u64 = 1;
+
+        // MDWE is unsupported → EINVAL (drives systemd's seccomp fallback).
+        match call(
+            Syscall::Prctl.raw(),
+            a1(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN),
+        ) {
+            Some(-22) => {}
+            _ => return Err("PR_SET_MDWE must return -EINVAL (unsupported)"),
+        }
+        // Timer slack: SET accepted, GET returns the default slack (ns).
+        match call(Syscall::Prctl.raw(), a1(PR_SET_TIMERSLACK, 1000)) {
+            Some(0) => {}
+            _ => return Err("PR_SET_TIMERSLACK must return 0"),
+        }
+        match call(Syscall::Prctl.raw(), a0(PR_GET_TIMERSLACK)) {
+            Some(v) if v > 0 => {}
+            _ => return Err("PR_GET_TIMERSLACK must return a positive slack"),
+        }
+        // TSC stays enabled: SET_TSC(ENABLE) and GET_TSC both succeed.
+        let mut tsc = [0u8; 4];
+        match call(Syscall::Prctl.raw(), a1(PR_SET_TSC, 1)) {
+            Some(0) => {}
+            _ => return Err("PR_SET_TSC must return 0"),
+        }
+        match call(
+            Syscall::Prctl.raw(),
+            a1(PR_GET_TSC, tsc.as_mut_ptr() as u64),
+        ) {
+            Some(0) => {}
+            _ => return Err("PR_GET_TSC must return 0"),
+        }
+        if i32::from_ne_bytes(tsc) != 1 {
+            return Err("PR_GET_TSC must report rdtsc enabled (1)");
+        }
+        // THP toggle is a no-op success (NARF has no transparent huge pages).
+        match call(Syscall::Prctl.raw(), a1(PR_SET_THP_DISABLE, 1)) {
+            Some(0) => Ok(()),
+            _ => Err("PR_SET_THP_DISABLE must return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_prctl_feature_probes);
 
 fn smoke_abi_proc_prctl_keepcaps_roundtrip() -> TestResult {
     with_setup(|| {

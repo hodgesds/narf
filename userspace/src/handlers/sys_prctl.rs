@@ -197,6 +197,67 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(0));
             }
         }
-        _ => ctx.set_return(fail),
+        21 /* PR_GET_SECCOMP */ => {
+            let mode = read_prctl(task).seccomp_mode;
+            ctx.set_return(SyscallReturn::ok(mode as u64));
+        }
+        22 /* PR_SET_SECCOMP */ => {
+            let mode = if arg_a != 0 { 2 } else { 0 };
+            modify_prctl(task, |s| s.seccomp_mode = mode);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        52 /* PR_GET_SPECULATION_CTRL */ | 53 /* PR_SET_SPECULATION_CTRL */ | 0x53564d41 /* PR_SET_VMA */ => {
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        29 /* PR_SET_TIMERSLACK */ => {
+            // Timer slack tunes nanosleep/poll wakeup coalescing; NARF doesn't
+            // coalesce timers, so accept and ignore (arg_a==0 resets to default).
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        30 /* PR_GET_TIMERSLACK */ => {
+            // Return value IS the slack (ns); report the Linux default (50µs).
+            ctx.set_return(SyscallReturn::ok(50_000));
+        }
+        25 /* PR_GET_TSC */ => {
+            // rdtsc is always enabled for user mode on NARF; report ON (1)
+            // through the arg2 int pointer, matching Linux.
+            if arg_a != 0 {
+                let one: i32 = 1;
+                // SAFETY: `arg_a` is the user int pointer (non-zero, checked);
+                // copy_to_user range-validates and SMAP-brackets the 4-byte write.
+                let _ = unsafe { copy_to_user(arg_a, &one.to_ne_bytes()) };
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        26 /* PR_SET_TSC */ => {
+            // Accept PR_TSC_ENABLE; NARF never disables rdtsc, so this is a no-op.
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        33 /* PR_MCE_KILL */ | 34 /* PR_MCE_KILL_GET */ => {
+            // Machine-check kill policy: NARF has no MCE handling, so accept the
+            // set and report the system-default policy (0) on get.
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        41 /* PR_SET_THP_DISABLE */ | 42 /* PR_GET_THP_DISABLE */ => {
+            // NARF has no transparent huge pages; the per-process toggle is a
+            // no-op and GET reports 0 (not disabled / not applicable).
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        65 /* PR_SET_MDWE */ | 66 /* PR_GET_MDWE */ => {
+            // NARF doesn't support PR_SET_MDWE (Linux 6.3+ W^X enforcement).
+            // Report EINVAL like a pre-6.3 kernel so systemd's
+            // apply_memory_deny_write_execute() falls back to its seccomp path
+            // (which NARF accepts) instead of treating it as fatal
+            // 228/EXIT_SECCOMP. Enforcing W^X in mmap/mprotect is a separate
+            // feature; until then "unsupported" is the honest, non-fatal answer.
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        }
+        _ => {
+            // Linux returns EINVAL for an unrecognised prctl option, not EPERM.
+            // A -1/EPERM sentinel here made systemd treat a feature probe (e.g.
+            // PR_SET_MDWE on this pre-6.3-style kernel) as a hard error instead
+            // of degrading gracefully.
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        }
     }
 }

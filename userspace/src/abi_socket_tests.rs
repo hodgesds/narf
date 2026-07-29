@@ -55,7 +55,7 @@ fn smoke_abi_socket_socket_open_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_socket_open_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_socket_open_pos);
 
 fn smoke_abi_socket_socket_open_neg() -> TestResult {
     with_setup(|| {
@@ -70,7 +70,7 @@ fn smoke_abi_socket_socket_open_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_socket_open_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_socket_open_neg);
 
 // ───────────────────────────── SocketBind ─────────────────────────────
 
@@ -86,7 +86,7 @@ fn smoke_abi_socket_bind_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_bind_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_bind_pos);
 
 fn smoke_abi_socket_bind_neg() -> TestResult {
     with_setup(|| {
@@ -101,7 +101,7 @@ fn smoke_abi_socket_bind_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_bind_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_bind_neg);
 
 // ──────────────────────────── SocketListen ────────────────────────────
 
@@ -121,7 +121,7 @@ fn smoke_abi_socket_listen_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_listen_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_listen_pos);
 
 fn smoke_abi_socket_listen_neg() -> TestResult {
     with_setup(|| {
@@ -136,7 +136,7 @@ fn smoke_abi_socket_listen_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_listen_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_listen_neg);
 
 // ──────────────────────────── SocketConnect ───────────────────────────
 
@@ -162,7 +162,7 @@ fn smoke_abi_socket_connect_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_connect_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_connect_pos);
 
 fn smoke_abi_socket_bound_client_connects() -> TestResult {
     with_setup(|| {
@@ -199,7 +199,7 @@ fn smoke_abi_socket_bound_client_connects() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_bound_client_connects);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_bound_client_connects);
 
 fn smoke_abi_socket_connect_neg() -> TestResult {
     with_setup(|| {
@@ -216,7 +216,7 @@ fn smoke_abi_socket_connect_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_connect_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_connect_neg);
 
 // ───────────────────────────── SocketAccept ───────────────────────────
 
@@ -231,7 +231,7 @@ fn smoke_abi_socket_accept_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_accept_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_accept_neg);
 
 fn smoke_abi_socket_accept_empty_eagain() -> TestResult {
     with_setup(|| {
@@ -256,7 +256,94 @@ fn smoke_abi_socket_accept_empty_eagain() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_accept_empty_eagain);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_accept_empty_eagain);
+
+/// The varlink primitive: a path-bound AF_UNIX stream listener, a client
+/// connect, the server accept()ing the queued connection, and BIDIRECTIONAL
+/// request→reply data over the accepted pair. This is exactly the shape
+/// systemd's sd-varlink uses (e.g. udevd → io.systemd.Multiplexer → userdbd
+/// worker → reply). If a connect doesn't enqueue, accept doesn't dequeue, or
+/// the reply doesn't flow back, a Type=notify service that gates readiness on
+/// such a call hangs and times out.
+fn smoke_abi_socket_unix_stream_request_reply() -> TestResult {
+    with_setup(|| {
+        let srv = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-varlink-rr");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("server bind failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0 {
+            return Err("server listen failed");
+        }
+        let cli = open_unix_stream()?;
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("connect status")?
+            != 0
+        {
+            return Err("client connect failed");
+        }
+        // Server accepts the queued connection.
+        let conn = call(Syscall::SocketAccept.raw(), a0(srv)).ok_or("accept status")?;
+        if conn < 0 {
+            return Err("accept did not return a connection fd for a queued connect");
+        }
+        let conn = conn as u64;
+        // Client → server request.
+        let req = b"REQUEST";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(cli, req.as_ptr() as u64, req.len() as u64, 0),
+        )
+        .ok_or("cli send status")?
+            != req.len() as i64
+        {
+            return Err("client send did not write the whole request");
+        }
+        let mut sbuf = [0u8; 16];
+        let rn = call(
+            Syscall::SocketRecv.raw(),
+            a3(conn, sbuf.as_mut_ptr() as u64, sbuf.len() as u64, 0),
+        )
+        .ok_or("srv recv status")?;
+        if rn != req.len() as i64 || &sbuf[..req.len()] != req {
+            return Err("server did not receive the client's request");
+        }
+        // Server → client reply.
+        let rep = b"REPLY";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(conn, rep.as_ptr() as u64, rep.len() as u64, 0),
+        )
+        .ok_or("srv send status")?
+            != rep.len() as i64
+        {
+            return Err("server send did not write the whole reply");
+        }
+        let mut cbuf = [0u8; 16];
+        let cn = call(
+            Syscall::SocketRecv.raw(),
+            a3(cli, cbuf.as_mut_ptr() as u64, cbuf.len() as u64, 0),
+        )
+        .ok_or("cli recv status")?;
+        if cn != rep.len() as i64 || &cbuf[..rep.len()] != rep {
+            return Err("client did not receive the server's reply");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_stream_request_reply
+);
 
 // ──────────────────────────── SocketAccept4 ───────────────────────────
 
@@ -271,7 +358,7 @@ fn smoke_abi_socket_accept4_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_accept4_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_accept4_neg);
 
 fn smoke_abi_socket_accept4_empty_eagain() -> TestResult {
     with_setup(|| {
@@ -293,7 +380,7 @@ fn smoke_abi_socket_accept4_empty_eagain() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_accept4_empty_eagain);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_accept4_empty_eagain);
 
 // ───────────────────────────── SocketPair ─────────────────────────────
 
@@ -315,7 +402,7 @@ fn smoke_abi_socket_pair_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_pair_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_pair_pos);
 
 fn smoke_abi_socket_pair_neg() -> TestResult {
     with_setup(|| {
@@ -331,7 +418,7 @@ fn smoke_abi_socket_pair_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_pair_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_pair_neg);
 
 // ───────────────────────────── SocketSend ─────────────────────────────
 
@@ -356,7 +443,7 @@ fn smoke_abi_socket_send_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_send_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_send_pos);
 
 fn smoke_abi_socket_send_neg() -> TestResult {
     with_setup(|| {
@@ -374,7 +461,7 @@ fn smoke_abi_socket_send_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_send_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_send_neg);
 
 // ───────────────────────────── SocketRecv ─────────────────────────────
 
@@ -390,6 +477,7 @@ fn smoke_abi_socket_recv_pos() -> TestResult {
         }
         let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
         let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+
         let payload = b"abcd";
         let send = Syscall::SocketSend.raw();
         if call(
@@ -414,7 +502,7 @@ fn smoke_abi_socket_recv_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_recv_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recv_pos);
 
 fn smoke_abi_socket_recv_neg() -> TestResult {
     with_setup(|| {
@@ -432,7 +520,7 @@ fn smoke_abi_socket_recv_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_recv_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recv_neg);
 
 // ── Non-blocking empty-but-open stream must EAGAIN, never a phantom 0 ──
 // Regression for the AF_UNIX read/recv spurious-EOF bug: a non-blocking read
@@ -468,7 +556,10 @@ fn smoke_abi_socket_read_nonblock_empty_eagain() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_read_nonblock_empty_eagain);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_read_nonblock_empty_eagain
+);
 
 fn smoke_abi_socket_recv_dontwait_empty_eagain() -> TestResult {
     with_setup(|| {
@@ -493,7 +584,10 @@ fn smoke_abi_socket_recv_dontwait_empty_eagain() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_recv_dontwait_empty_eagain);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_recv_dontwait_empty_eagain
+);
 
 fn smoke_abi_socket_read_nonblock_then_data() -> TestResult {
     with_setup(|| {
@@ -524,7 +618,10 @@ fn smoke_abi_socket_read_nonblock_then_data() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_read_nonblock_then_data);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_read_nonblock_then_data
+);
 
 fn smoke_abi_socket_read_eof_after_peer_shutdown() -> TestResult {
     with_setup(|| {
@@ -532,8 +629,12 @@ fn smoke_abi_socket_read_eof_after_peer_shutdown() -> TestResult {
         // the fix distinguishes empty-open (EAGAIN) from closed (EOF).
         let (fd0, fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
         let shutdown = Syscall::SocketShutdown.raw();
+        let generation = narf_net::readiness::generation();
         if call(shutdown, a1(fd0, SHUT_RDWR)).ok_or("shutdown status")? != 0 {
             return Err("shutdown(fd0) failed");
+        }
+        if narf_net::readiness::generation() <= generation {
+            return Err("shutdown did not publish a readiness wake");
         }
         let mut rbuf = [0u8; 16];
         let read = Syscall::Read.raw();
@@ -545,7 +646,10 @@ fn smoke_abi_socket_read_eof_after_peer_shutdown() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_read_eof_after_peer_shutdown);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_read_eof_after_peer_shutdown
+);
 
 // ─────────────────────────── SocketShutdown ───────────────────────────
 
@@ -568,7 +672,7 @@ fn smoke_abi_socket_shutdown_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_shutdown_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_shutdown_pos);
 
 fn smoke_abi_socket_shutdown_neg() -> TestResult {
     with_setup(|| {
@@ -581,7 +685,7 @@ fn smoke_abi_socket_shutdown_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_shutdown_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_shutdown_neg);
 
 // ──────────────────────────── SocketGetSockOpt ────────────────────────
 
@@ -615,7 +719,7 @@ fn smoke_abi_socket_getsockopt_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_getsockopt_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getsockopt_pos);
 
 fn smoke_abi_socket_getsockopt_neg() -> TestResult {
     with_setup(|| {
@@ -638,7 +742,7 @@ fn smoke_abi_socket_getsockopt_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_getsockopt_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getsockopt_neg);
 
 fn smoke_abi_socket_getsockopt_peersec_without_lsm() -> TestResult {
     with_setup(|| {
@@ -661,36 +765,82 @@ fn smoke_abi_socket_getsockopt_peersec_without_lsm() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/socket",
     smoke_abi_socket_getsockopt_peersec_without_lsm
 );
 
-fn smoke_abi_socket_getsockopt_peergroups_unavailable() -> TestResult {
+fn smoke_abi_socket_getsockopt_peergroups() -> TestResult {
     with_setup(|| {
         const SO_PEERGROUPS: u64 = 59;
-        const SO_PEERPIDFD: u64 = 77;
-        let fd = open_unix_stream()?;
+        let groups = [12u32, 34, 56];
+        if call(
+            Syscall::Setgroups.raw(),
+            a1(groups.len() as u64, groups.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setgroups setup failed");
+        }
+        let mut sv = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd = i32::from_ne_bytes(sv[0..4].try_into().unwrap()) as u64;
         let mut val = [0u8; 64];
-        for option in [SO_PEERGROUPS, SO_PEERPIDFD] {
-            let mut optlen = (val.len() as u32).to_ne_bytes();
-            let args = SyscallArgs {
-                arg0: fd,
-                arg1: SOL_SOCKET,
-                arg2: option,
-                arg3: val.as_mut_ptr() as u64,
-                arg4: optlen.as_mut_ptr() as u64,
-                ..Default::default()
-            };
-            if call(Syscall::SocketGetSockOpt.raw(), args) != Some(-92) {
-                return Err("unavailable Unix peer metadata did not return ENOPROTOOPT");
-            }
+        let mut optlen = (val.len() as u32).to_ne_bytes();
+        let args = SyscallArgs {
+            arg0: fd,
+            arg1: SOL_SOCKET,
+            arg2: SO_PEERGROUPS,
+            arg3: val.as_mut_ptr() as u64,
+            arg4: optlen.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::SocketGetSockOpt.raw(), args) != Some(0) {
+            return Err("SO_PEERGROUPS failed");
+        }
+        if u32::from_ne_bytes(optlen) != 12 {
+            return Err("SO_PEERGROUPS returned wrong length");
+        }
+        let returned = [
+            u32::from_ne_bytes(val[0..4].try_into().unwrap()),
+            u32::from_ne_bytes(val[4..8].try_into().unwrap()),
+            u32::from_ne_bytes(val[8..12].try_into().unwrap()),
+        ];
+        if returned != groups {
+            return Err("SO_PEERGROUPS returned wrong gids");
         }
         Ok(())
     })
 }
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getsockopt_peergroups);
+
+fn smoke_abi_socket_getsockopt_peerpidfd_unavailable() -> TestResult {
+    with_setup(|| {
+        const SO_PEERPIDFD: u64 = 77;
+        let fd = open_unix_stream()?;
+        let mut val = [0u8; 8];
+        let mut optlen = (val.len() as u32).to_ne_bytes();
+        let args = SyscallArgs {
+            arg0: fd,
+            arg1: SOL_SOCKET,
+            arg2: SO_PEERPIDFD,
+            arg3: val.as_mut_ptr() as u64,
+            arg4: optlen.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::SocketGetSockOpt.raw(), args) {
+            Some(-92) => Ok(()),
+            _ => Err("SO_PEERPIDFD without retained pidfd did not return ENOPROTOOPT"),
+        }
+    })
+}
 kernel_test_in!(
-    "syscall_abi",
-    smoke_abi_socket_getsockopt_peergroups_unavailable
+    "syscall_abi/socket",
+    smoke_abi_socket_getsockopt_peerpidfd_unavailable
 );
 
 // getsockopt(SO_ACCEPTCONN) is the gate systemd's is_socket_internal() (behind
@@ -724,7 +874,10 @@ fn smoke_abi_socket_acceptconn_not_listening() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_acceptconn_not_listening);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_acceptconn_not_listening
+);
 
 fn smoke_abi_socket_acceptconn_listening() -> TestResult {
     with_setup(|| {
@@ -762,7 +915,7 @@ fn smoke_abi_socket_acceptconn_listening() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_acceptconn_listening);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_acceptconn_listening);
 
 // A socket fd must `fstat` as S_IFSOCK (0o140000), not a char device. systemd's
 // is_socket_internal() rejects any fd whose st_mode fails S_ISSOCK before it
@@ -786,7 +939,7 @@ fn smoke_abi_socket_fstat_is_sock() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_fstat_is_sock);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_fstat_is_sock);
 
 // ──────────────────────────── SocketSetSockOpt ────────────────────────
 
@@ -811,7 +964,7 @@ fn smoke_abi_socket_setsockopt_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_setsockopt_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_setsockopt_pos);
 
 fn smoke_abi_socket_setsockopt_neg() -> TestResult {
     with_setup(|| {
@@ -835,7 +988,7 @@ fn smoke_abi_socket_setsockopt_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_setsockopt_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_setsockopt_neg);
 
 // ─────────────────────────── SocketGetSockName ────────────────────────
 
@@ -875,7 +1028,7 @@ fn smoke_abi_socket_getsockname_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_getsockname_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getsockname_pos);
 
 fn smoke_abi_socket_getsockname_neg() -> TestResult {
     with_setup(|| {
@@ -894,9 +1047,48 @@ fn smoke_abi_socket_getsockname_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_getsockname_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getsockname_neg);
 
 // ─────────────────────────── SocketGetPeerName ────────────────────────
+
+fn smoke_abi_socket_getpeername_socketpair_pos() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        let pair = Syscall::SocketPair.raw();
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+
+        // An unnamed AF_UNIX peer is encoded as sa_family alone.  Keep the
+        // caller capacity at one byte to also pin Linux's truncation rule:
+        // copy only the available prefix, but report the full length.
+        let mut out = [0xa5u8; 1];
+        let mut outlen = 1u32.to_ne_bytes();
+        let n = Syscall::SocketGetPeerName.raw();
+        let r = call(
+            n,
+            a2(fd0, out.as_mut_ptr() as u64, outlen.as_mut_ptr() as u64),
+        )
+        .ok_or("status not Ok")?;
+        if r != 0 {
+            return Err("getpeername() on an unnamed socketpair failed");
+        }
+        if out[0] != (AF_UNIX as u16).to_le_bytes()[0] {
+            return Err("getpeername() did not copy the available address prefix");
+        }
+        if u32::from_ne_bytes(outlen) != 2 {
+            return Err("getpeername() did not report the full unnamed address length");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_getpeername_socketpair_pos
+);
 
 fn smoke_abi_socket_getpeername_neg_badfd() -> TestResult {
     with_setup(|| {
@@ -915,14 +1107,12 @@ fn smoke_abi_socket_getpeername_neg_badfd() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_getpeername_neg_badfd);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getpeername_neg_badfd);
 
 fn smoke_abi_socket_getpeername_neg_unconnected() -> TestResult {
     with_setup(|| {
-        // A fresh (or connected AF_UNIX stream) socket has no peer_addr()
-        // entry → GetPeerName → NotConnected → -1. NARF never reports a
-        // peer name for AF_UNIX stream sockets, so the success path is
-        // unreachable from this harness; pin the unconnected error instead.
+        // A fresh socket has no peer_addr() entry:
+        // GetPeerName → NotConnected → -1.
         let fd = open_unix_stream()?;
         let mut out = [0u8; 16];
         let mut outlen = (out.len() as u32).to_ne_bytes();
@@ -939,7 +1129,10 @@ fn smoke_abi_socket_getpeername_neg_unconnected() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_getpeername_neg_unconnected);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_getpeername_neg_unconnected
+);
 
 // ───────────────────────────── SocketSendMsg ──────────────────────────
 
@@ -974,7 +1167,7 @@ fn smoke_abi_socket_sendmsg_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_sendmsg_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sendmsg_pos);
 
 fn smoke_abi_socket_sendmsg_neg() -> TestResult {
     with_setup(|| {
@@ -989,7 +1182,7 @@ fn smoke_abi_socket_sendmsg_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_sendmsg_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sendmsg_neg);
 
 // ───────────────────────────── SocketRecvMsg ──────────────────────────
 
@@ -1035,7 +1228,7 @@ fn smoke_abi_socket_recvmsg_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_recvmsg_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recvmsg_pos);
 
 fn smoke_abi_socket_recvmsg_neg() -> TestResult {
     with_setup(|| {
@@ -1050,7 +1243,7 @@ fn smoke_abi_socket_recvmsg_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_recvmsg_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recvmsg_neg);
 
 // ─────────────────────────── SockRegisterBuf ──────────────────────────
 
@@ -1067,7 +1260,7 @@ fn smoke_abi_socket_sock_register_buf_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_sock_register_buf_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_register_buf_pos);
 
 fn smoke_abi_socket_sock_register_buf_neg() -> TestResult {
     with_setup(|| {
@@ -1080,7 +1273,7 @@ fn smoke_abi_socket_sock_register_buf_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_sock_register_buf_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_register_buf_neg);
 
 // ───────────────────────────── SockSendZc ─────────────────────────────
 
@@ -1112,7 +1305,7 @@ fn smoke_abi_socket_sock_send_zc_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_sock_send_zc_pos);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_send_zc_pos);
 
 fn smoke_abi_socket_sock_send_zc_neg() -> TestResult {
     with_setup(|| {
@@ -1126,7 +1319,7 @@ fn smoke_abi_socket_sock_send_zc_neg() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_sock_send_zc_neg);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_send_zc_neg);
 
 // ─────────────────── AF_UNIX abstract namespace ───────────────────
 
@@ -1199,7 +1392,215 @@ fn smoke_abi_socket_abstract_dgram_roundtrip() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_abstract_dgram_roundtrip);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_abstract_dgram_roundtrip
+);
+
+/// A bound AF_UNIX datagram socket (the shape of systemd's
+/// `$NOTIFY_SOCKET`) must retain an EPOLLET edge across a drain/refill even
+/// when no epoll scan observes its inbox empty. Connected socketpairs use
+/// RingBuf tokens; named datagram endpoints keep their own inbox and need the
+/// same guarantee.
+fn smoke_abi_socket_abstract_dgram_epollet_drain_refill() -> TestResult {
+    with_setup(|| {
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = abstract_sockaddr(b"narf-abstract-dgram-et");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind() to abstract EPOLLET datagram name failed");
+        }
+
+        let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+        if epfd < 0 {
+            return Err("epoll_create failed");
+        }
+        let mut interest = [0u8; 12];
+        interest[..4].copy_from_slice(&(1u32 | (1u32 << 31)).to_ne_bytes());
+        interest[4..].copy_from_slice(&0x4E4F_5449_4659u64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd as u64, 1, rx, interest.as_ptr() as u64),
+        )
+        .ok_or("epoll_ctl status")?
+            != 0
+        {
+            return Err("epoll_ctl ADD EPOLLET failed");
+        }
+
+        let tx = open_unix(SOCK_DGRAM)?;
+        let mut out = [0u8; 12];
+        for payload in [b"one".as_slice(), b"two".as_slice()] {
+            let sent = call(
+                Syscall::SocketSend.raw(),
+                SyscallArgs {
+                    arg0: tx,
+                    arg1: payload.as_ptr() as u64,
+                    arg2: payload.len() as u64,
+                    arg4: addr.as_ptr() as u64,
+                    arg5: alen,
+                    ..SyscallArgs::default()
+                },
+            )
+            .ok_or("sendto status")?;
+            if sent != payload.len() as i64 {
+                return Err("sendto() to abstract EPOLLET datagram name failed");
+            }
+
+            let ready = call(
+                Syscall::EpollWait.raw(),
+                a3(epfd as u64, out.as_mut_ptr() as u64, 1, 0),
+            )
+            .ok_or("epoll_wait status")?;
+            if ready != 1 {
+                return Err("EPOLLET lost abstract datagram drain/refill edge");
+            }
+
+            let mut buf = [0u8; 8];
+            let received = call(
+                Syscall::SocketRecv.raw(),
+                a3(rx, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+            )
+            .ok_or("recv status")?;
+            if received != payload.len() as i64 || &buf[..payload.len()] != payload {
+                return Err("recv() did not drain the abstract datagram");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_abstract_dgram_epollet_drain_refill
+);
+
+/// The exact sd_notify(READY=1) → PID 1 shape end-to-end: a PATH-bound AF_UNIX
+/// SOCK_DGRAM notify socket ($NOTIFY_SOCKET = /run/systemd/notify) with
+/// SO_PASSCRED, waited on via epoll. A service sends a PLAIN datagram (a normal
+/// notify has send_ucred=false, so it attaches NO SCM_CREDENTIALS — the KERNEL
+/// must stamp the sender's credentials on the SO_PASSCRED receiver). PID 1's
+/// epoll_wait must wake, and recvmsg must deliver the payload plus an
+/// SCM_CREDENTIALS cmsg naming the sender; otherwise the Type=notify unit never
+/// sees READY and times out. Abstract-name delivery is covered above; this pins
+/// the PATH-bound (UNIX_DGRAM_BOUND) path systemd actually uses.
+fn smoke_abi_socket_notify_path_dgram_epoll_scm() -> TestResult {
+    with_setup(|| {
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"/notify-e2e.sock");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind() of the PATH notify datagram socket failed");
+        }
+        // PID 1 sets SO_PASSCRED so the kernel attaches sender creds on recvmsg.
+        let on = 1u32.to_ne_bytes();
+        call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: rx,
+                arg1: SOL_SOCKET,
+                arg2: SO_PASSCRED,
+                arg3: on.as_ptr() as u64,
+                arg4: on.len() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("setsockopt status")?;
+
+        let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+        if epfd < 0 {
+            return Err("epoll_create failed");
+        }
+        let mut interest = [0u8; 12];
+        interest[..4].copy_from_slice(&1u32.to_ne_bytes()); // EPOLLIN
+        interest[4..].copy_from_slice(&0xABCDu64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd as u64, 1, rx, interest.as_ptr() as u64),
+        )
+        .ok_or("epoll_ctl status")?
+            != 0
+        {
+            return Err("epoll_ctl ADD of notify fd failed");
+        }
+
+        // Service sends a plain READY=1 datagram (no control message).
+        let tx = open_unix(SOCK_DGRAM)?;
+        let payload = b"READY=1\n";
+        let sent = call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: tx,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg4: addr.as_ptr() as u64,
+                arg5: alen,
+                ..SyscallArgs::default()
+            },
+        )
+        .ok_or("sendto status")?;
+        if sent != payload.len() as i64 {
+            return Err("sendto() of READY=1 to the notify path failed");
+        }
+
+        // PID 1's epoll_wait must report the notify fd readable.
+        let mut out = [0u8; 12];
+        let ready = call(
+            Syscall::EpollWait.raw(),
+            a3(epfd as u64, out.as_mut_ptr() as u64, 1, 0),
+        )
+        .ok_or("epoll_wait status")?;
+        if ready != 1 {
+            return Err("epoll_wait did not wake on the PATH notify datagram (READY lost)");
+        }
+
+        // recvmsg delivers the payload + an SCM_CREDENTIALS cmsg for the sender.
+        let mut dst = [0u8; 32];
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 64];
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        let n = call(Syscall::SocketRecvMsg.raw(), a2(rx, msg.as_ptr() as u64, 0))
+            .ok_or("recvmsg status")?;
+        if n != payload.len() as i64 || &dst[..payload.len()] != payload {
+            return Err("recvmsg did not deliver the READY=1 payload");
+        }
+        let ctrllen = u64::from_ne_bytes([
+            msg[40], msg[41], msg[42], msg[43], msg[44], msg[45], msg[46], msg[47],
+        ]) as usize;
+        if ctrllen < 16 + 12 {
+            return Err("recvmsg did not attach SCM_CREDENTIALS for a plain notify datagram");
+        }
+        let ctype = i32::from_le_bytes([ctrl[12], ctrl[13], ctrl[14], ctrl[15]]);
+        if ctype != SCM_CREDENTIALS {
+            return Err("notify cmsg was not SCM_CREDENTIALS");
+        }
+        let cred_pid = u32::from_le_bytes([ctrl[16], ctrl[17], ctrl[18], ctrl[19]]);
+        let my_pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u32;
+        if cred_pid != my_pid {
+            return Err("notify SCM_CREDENTIALS pid did not name the sender");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_notify_path_dgram_epoll_scm
+);
 
 /// connect()/sendto to an unbound abstract name is ECONNREFUSED (-111),
 /// never the bare -1 sentinel.
@@ -1223,7 +1624,10 @@ fn smoke_abi_socket_abstract_dgram_refused() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_abstract_dgram_refused);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_abstract_dgram_refused
+);
 
 /// A second bind to a live abstract name is EADDRINUSE (-98 via the
 /// dispatcher's AddrInUse → the handler's -1 sentinel is NOT used here
@@ -1248,7 +1652,7 @@ fn smoke_abi_socket_abstract_stream_inuse() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_abstract_stream_inuse);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_abstract_stream_inuse);
 
 /// Autobind: bind with `addrlen == sizeof(sa_family_t)` (2) assigns a
 /// fresh abstract name; getsockname reports a usable abstract address
@@ -1287,7 +1691,7 @@ fn smoke_abi_socket_autobind() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_autobind);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_autobind);
 
 // ─────────────────── SO_PASSCRED / SO_PEERCRED / SCM ───────────────────
 
@@ -1335,7 +1739,7 @@ fn smoke_abi_socket_so_peercred() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_so_peercred);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_so_peercred);
 
 /// SO_PASSCRED round-trips through set/getsockopt.
 fn smoke_abi_socket_so_passcred_roundtrip() -> TestResult {
@@ -1378,7 +1782,7 @@ fn smoke_abi_socket_so_passcred_roundtrip() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_so_passcred_roundtrip);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_so_passcred_roundtrip);
 
 /// SO_PASSCRED + recvmsg attaches an SCM_CREDENTIALS control message
 /// naming the sender. Send over a socketpair, then recvmsg the other end
@@ -1464,7 +1868,145 @@ fn smoke_abi_socket_recvmsg_scm_credentials() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_recvmsg_scm_credentials);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_recvmsg_scm_credentials
+);
+
+/// The exact shape of PID 1's `$NOTIFY_SOCKET`: a bound PATH AF_UNIX/SOCK_DGRAM
+/// socket with SO_PASSCRED, watched via LEVEL-TRIGGERED EPOLLIN
+/// (`sd_event_add_io(..., EPOLLIN, manager_dispatch_notify_fd)`). A datagram
+/// delivered from another socket — a service's `sd_notify(READY=1)` — must
+/// (a) make `epoll_wait` report EPOLLIN (the wake systemd's event loop blocks
+/// on) and (b) `recvmsg` with an SCM_CREDENTIALS cmsg naming the sender. If a
+/// bound-dgram delivery does not surface EPOLLIN, PID 1 never reads READY=1 and
+/// every Type=notify service (systemd-udevd, systemd-userdbd, dbus-broker,
+/// logind, …) times out.
+fn smoke_abi_socket_notify_path_dgram_epollin_deliver() -> TestResult {
+    with_setup(|| {
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"/run/systemd/notify-test");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind() to the notify path failed");
+        }
+        // SO_PASSCRED, exactly as PID 1 sets it.
+        let on = 1u32.to_ne_bytes();
+        call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: rx,
+                arg1: SOL_SOCKET,
+                arg2: SO_PASSCRED,
+                arg3: on.as_ptr() as u64,
+                arg4: on.len() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("setsockopt status")?;
+
+        // Level-triggered EPOLLIN (NO EPOLLET) — how sd_event watches the fd.
+        let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+        if epfd < 0 {
+            return Err("epoll_create failed");
+        }
+        let mut interest = [0u8; 12];
+        interest[..4].copy_from_slice(&1u32.to_ne_bytes()); // EPOLLIN
+        interest[4..].copy_from_slice(&0x4E4F_5449_4659u64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd as u64, 1, rx, interest.as_ptr() as u64),
+        )
+        .ok_or("epoll_ctl status")?
+            != 0
+        {
+            return Err("epoll_ctl ADD EPOLLIN failed");
+        }
+        // Nothing delivered yet → epoll_wait(timeout 0) reports no events.
+        let mut evt = [0u8; 12];
+        if call(
+            Syscall::EpollWait.raw(),
+            a3(epfd as u64, evt.as_mut_ptr() as u64, 1, 0),
+        )
+        .ok_or("epoll_wait status")?
+            != 0
+        {
+            return Err("empty notify socket must not report EPOLLIN");
+        }
+
+        // A service delivers sd_notify(READY=1) from its own datagram socket.
+        let tx = open_unix(SOCK_DGRAM)?;
+        let payload = b"READY=1\n";
+        let sent = call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: tx,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg4: addr.as_ptr() as u64,
+                arg5: alen,
+                ..SyscallArgs::default()
+            },
+        )
+        .ok_or("send status")?;
+        if sent != payload.len() as i64 {
+            return Err("sendto() to the notify path failed");
+        }
+
+        // epoll must now report EPOLLIN — the exact wake PID 1's sd_event needs.
+        if call(
+            Syscall::EpollWait.raw(),
+            a3(epfd as u64, evt.as_mut_ptr() as u64, 1, 0),
+        )
+        .ok_or("epoll_wait status")?
+            != 1
+        {
+            return Err("delivered notify datagram must report EPOLLIN to epoll");
+        }
+
+        // recvmsg it, with an SCM_CREDENTIALS cmsg naming the sender.
+        let mut dst = [0u8; 16];
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 64];
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        let n = call(Syscall::SocketRecvMsg.raw(), a2(rx, msg.as_ptr() as u64, 0))
+            .ok_or("recvmsg status")?;
+        if n != payload.len() as i64 || &dst[..payload.len()] != payload {
+            return Err("recvmsg did not return the READY=1 datagram");
+        }
+        let ctrllen = u64::from_ne_bytes([
+            msg[40], msg[41], msg[42], msg[43], msg[44], msg[45], msg[46], msg[47],
+        ]) as usize;
+        if ctrllen < 16 + 12 {
+            return Err("notify recvmsg did not attach SCM_CREDENTIALS");
+        }
+        let ctype = i32::from_le_bytes([ctrl[12], ctrl[13], ctrl[14], ctrl[15]]);
+        if ctype != SCM_CREDENTIALS {
+            return Err("notify cmsg was not SCM_CREDENTIALS");
+        }
+        let cred_pid = u32::from_le_bytes([ctrl[16], ctrl[17], ctrl[18], ctrl[19]]);
+        let my_pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u32;
+        if cred_pid != my_pid {
+            return Err("notify SCM_CREDENTIALS pid did not name the sender");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_notify_path_dgram_epollin_deliver
+);
 
 /// SCM_RIGHTS: sendmsg an fd over one socketpair half, recvmsg the other
 /// half, and confirm a NEW fd (different number, usable) was installed.
@@ -1482,6 +2024,18 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
         }
         let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
         let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+
+        // Queue ordinary stream bytes before the fd-bearing message. Rights
+        // must remain attached to the latter's first byte rather than being
+        // stolen by the first receive.
+        let prefix = b"plain";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(fd0, prefix.as_ptr() as u64, prefix.len() as u64, 0),
+        ) != Some(prefix.len() as i64)
+        {
+            return Err("ordinary prefix send failed");
+        }
 
         // The fd we pass: a second, independent socketpair end.
         let mut sv2 = [0u8; 8];
@@ -1520,6 +2074,21 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
         .ok_or("sendmsg status")?;
         if sent != payload.len() as i64 {
             return Err("sendmsg(SCM_RIGHTS) did not return the payload byte count");
+        }
+
+        let mut prefix_out = [0u8; 5];
+        if call(
+            Syscall::SocketRecv.raw(),
+            a3(
+                fd1,
+                prefix_out.as_mut_ptr() as u64,
+                prefix_out.len() as u64,
+                0,
+            ),
+        ) != Some(prefix.len() as i64)
+            || &prefix_out != prefix
+        {
+            return Err("ordinary prefix receive failed");
         }
 
         // recvmsg the other half with a control buffer.
@@ -1564,7 +2133,127 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_socket_scm_rights_fd_passing);
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_scm_rights_fd_passing);
+
+/// AF_UNIX datagrams carry SCM_RIGHTS too. This exercises the complete syscall
+/// path used by sd_notify FDSTORE: sendmsg parses the control record, the
+/// datagram queue preserves it with the payload, recvmsg installs a fresh
+/// receiver fd, and the returned cmsghdr names that new fd.
+fn smoke_abi_socket_dgram_scm_rights_fd_passing() -> TestResult {
+    with_setup(|| {
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = abstract_sockaddr(b"narf-dgram-scm-rights");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("AF_UNIX datagram receiver bind failed");
+        }
+        // PID 1 enables SO_PASSCRED on its notify socket: the received
+        // credentials identify which service sent READY=/FDSTORE=.
+        let on = 1u32.to_ne_bytes();
+        if call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: rx,
+                arg1: SOL_SOCKET,
+                arg2: SO_PASSCRED,
+                arg3: on.as_ptr() as u64,
+                arg4: on.len() as u64,
+                arg5: 0,
+            },
+        ) != Some(0)
+        {
+            return Err("enabling SO_PASSCRED on datagram receiver failed");
+        }
+        let tx = open_unix(SOCK_DGRAM)?;
+
+        // Supply a real, independently open descriptor as SCM_RIGHTS data.
+        let mut pair = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, pair.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("passed-fd socketpair setup failed");
+        }
+        let passed_fd = i32::from_ne_bytes([pair[0], pair[1], pair[2], pair[3]]);
+
+        let payload = b"FDSTORE=1";
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 24];
+        ctrl[0..8].copy_from_slice(&(20u64).to_ne_bytes()); // cmsghdr + one fd
+        ctrl[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
+        ctrl[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        ctrl[16..20].copy_from_slice(&passed_fd.to_ne_bytes());
+        let mut smsg = [0u8; 56];
+        smsg[0..8].copy_from_slice(&(addr.as_ptr() as u64).to_ne_bytes());
+        smsg[8..16].copy_from_slice(&alen.to_ne_bytes());
+        smsg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        smsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        smsg[32..40].copy_from_slice(&(ctrl.as_ptr() as u64).to_ne_bytes());
+        smsg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        if call(
+            Syscall::SocketSendMsg.raw(),
+            a2(tx, smsg.as_ptr() as u64, 0),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("dgram sendmsg(SCM_RIGHTS) did not send its payload");
+        }
+
+        let mut dst = [0u8; 32];
+        let mut riov = [0u8; 16];
+        riov[0..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        riov[8..16].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut rctrl = [0u8; 64];
+        let mut rmsg = [0u8; 56];
+        rmsg[16..24].copy_from_slice(&(riov.as_ptr() as u64).to_ne_bytes());
+        rmsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        rmsg[32..40].copy_from_slice(&(rctrl.as_mut_ptr() as u64).to_ne_bytes());
+        rmsg[40..48].copy_from_slice(&(rctrl.len() as u64).to_ne_bytes());
+        if call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(rx, rmsg.as_ptr() as u64, 0),
+        ) != Some(payload.len() as i64)
+            || &dst[..payload.len()] != payload
+        {
+            return Err("dgram recvmsg did not receive the FDSTORE datagram");
+        }
+        let ctrllen = u64::from_ne_bytes(rmsg[40..48].try_into().unwrap()) as usize;
+        if ctrllen < 56 {
+            return Err("dgram recvmsg did not return rights and credentials");
+        }
+        let level = i32::from_ne_bytes(rctrl[8..12].try_into().unwrap());
+        let ctype = i32::from_ne_bytes(rctrl[12..16].try_into().unwrap());
+        if level != SOL_SOCKET as i32 || ctype != SCM_RIGHTS {
+            return Err("dgram recvmsg returned the wrong ancillary record");
+        }
+        let received_fd = i32::from_ne_bytes(rctrl[16..20].try_into().unwrap());
+        if received_fd < 0 || received_fd as u64 == rx {
+            return Err("dgram recvmsg did not install a distinct receiver fd");
+        }
+        // The rights cmsg is padded to 24 bytes; SCM_CREDENTIALS follows it.
+        let cred_level = i32::from_ne_bytes(rctrl[32..36].try_into().unwrap());
+        let cred_type = i32::from_ne_bytes(rctrl[36..40].try_into().unwrap());
+        let cred_pid = u32::from_ne_bytes(rctrl[40..44].try_into().unwrap());
+        let sender_pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u32;
+        if cred_level != SOL_SOCKET as i32 || cred_type != SCM_CREDENTIALS || cred_pid != sender_pid
+        {
+            return Err("dgram SCM_CREDENTIALS did not name the sender");
+        }
+        if call(Syscall::Close.raw(), a0(received_fd as u64)) != Some(0) {
+            return Err("dgram SCM_RIGHTS fd was not usable by the receiver");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_dgram_scm_rights_fd_passing
+);
 
 /// Closing a duplicated listener fd must not unbind the listener while the
 /// original fd remains open (dbus-broker receives its listener this way).
@@ -1597,7 +2286,7 @@ fn smoke_abi_socket_dup_listener_close_keeps_binding() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/socket",
     smoke_abi_socket_dup_listener_close_keeps_binding
 );
 
@@ -1614,10 +2303,12 @@ const NETLINK_KOBJECT_UEVENT: u64 = 15;
 const SOL_NETLINK: u64 = 270;
 const NETLINK_ADD_MEMBERSHIP: u64 = 1;
 const NETLINK_EXT_ACK: u64 = 11;
+const NETLINK_LIST_MEMBERSHIPS: u64 = 9;
 const SIOCINQ: u64 = 0x541B;
 /// rtnetlink message types (rtnetlink.h).
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
+const RTM_SETLINK: u16 = 19;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
 const RTM_NEWROUTE: u16 = 24;
@@ -1630,7 +2321,10 @@ const RTM_GETQDISC: u16 = 38;
 const RTM_GETTFILTER: u16 = 46;
 /// netlink control message types (netlink.h).
 const NLMSG_DONE: u16 = 3;
+const NLMSG_ERROR: u16 = 2;
 const NLMSG_HDRLEN: usize = 16;
+const NLM_F_REQUEST: u16 = 0x01;
+const NLM_F_ACK: u16 = 0x04;
 /// `NLM_F_REQUEST | NLM_F_DUMP` — the flags a dump request carries.
 const NLM_F_REQUEST_DUMP: u16 = 0x01 | (0x100 | 0x200);
 
@@ -1746,7 +2440,7 @@ fn smoke_abi_netlink_route_socket_bind() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_socket_bind);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_socket_bind);
 
 fn smoke_abi_netlink_route_siocinq() -> TestResult {
     with_setup(|| {
@@ -1768,7 +2462,7 @@ fn smoke_abi_netlink_route_siocinq() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_siocinq);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_siocinq);
 
 fn smoke_abi_netlink_route_msg_peek() -> TestResult {
     with_setup(|| {
@@ -1794,7 +2488,7 @@ fn smoke_abi_netlink_route_msg_peek() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_msg_peek);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_msg_peek);
 
 fn smoke_abi_netlink_route_msg_trunc() -> TestResult {
     with_setup(|| {
@@ -1828,7 +2522,208 @@ fn smoke_abi_netlink_route_msg_trunc() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_msg_trunc);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_msg_trunc);
+
+/// Every unicast rtnetlink reply must carry `nlmsg_pid == <bound port id>`.
+/// sd-netlink's `parse_message_one` silently drops any non-broadcast message
+/// whose `nlmsg_pid` differs from the socket's own port; the real kernel stamps
+/// a unicast reply's `nlmsg_pid` with the recipient's port (`netlink_ack` /
+/// `__nlmsg_put`). With a zero `nlmsg_pid`, systemd's `loopback_setup` never
+/// sees the ack for its RTM_NEWADDR/RTM_SETLINK requests, so `n_messages` never
+/// reaches zero and it spins in `ppoll` forever — wedging PID 1 boot right after
+/// the "Welcome to …" banner. This covers dump entries, NLMSG_DONE, and the
+/// NLMSG_ERROR ack path (the exact loopback_setup request shape).
+fn smoke_abi_netlink_reply_pid_matches_bound_port() -> TestResult {
+    with_setup(|| {
+        const AF_INET_ADDR: u8 = 2;
+        const IFA_LOCAL: u16 = 2;
+
+        let fd = open_netlink(NETLINK_ROUTE)?;
+
+        // A dump: RTM_GETLINK → one or more RTM_NEWLINK + a terminating
+        // NLMSG_DONE. The send allocates the socket's port id.
+        let req = nlmsg_request(RTM_GETLINK, 77);
+        if netlink_send(fd, &req).ok_or("dump send")? != req.len() as i64 {
+            return Err("RTM_GETLINK send failed");
+        }
+
+        let mut local = [0u8; 12];
+        let mut local_len = (local.len() as u32).to_ne_bytes();
+        if call(
+            Syscall::SocketGetSockName.raw(),
+            a2(fd, local.as_mut_ptr() as u64, local_len.as_mut_ptr() as u64),
+        )
+        .ok_or("getsockname status")?
+            != 0
+        {
+            return Err("netlink getsockname failed");
+        }
+        let portid = u32::from_ne_bytes(local[4..8].try_into().unwrap());
+        if portid == 0 {
+            return Err("netlink port id was not allocated");
+        }
+
+        // Every message in the dump must be stamped with our port id.
+        let mut saw_done = false;
+        for _ in 0..64 {
+            let mut reply = [0u8; 1024];
+            let n = netlink_recv(fd, &mut reply).ok_or("dump recv")?;
+            if n < NLMSG_HDRLEN as i64 {
+                return Err("dump recv returned a short message");
+            }
+            let msg_pid = u32::from_ne_bytes(reply[12..16].try_into().unwrap());
+            if msg_pid != portid {
+                return Err("dump reply nlmsg_pid did not match the bound port id");
+            }
+            if nlmsg_type_of(&reply) == NLMSG_DONE {
+                saw_done = true;
+                break;
+            }
+        }
+        if !saw_done {
+            return Err("dump did not terminate with NLMSG_DONE");
+        }
+
+        // The NLMSG_ERROR ack path: RTM_NEWADDR(127.0.0.1/8 on lo) with
+        // NLM_F_ACK — the exact request systemd's loopback_setup enqueues. It
+        // fails with EPERM here (no admin capability), but the error ack must
+        // still carry our port id so the caller's wait loop can complete.
+        let mut add = [0u8; 32];
+        add[0..4].copy_from_slice(&32u32.to_le_bytes());
+        add[4..6].copy_from_slice(&RTM_NEWADDR.to_le_bytes());
+        add[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_le_bytes());
+        add[8..12].copy_from_slice(&88u32.to_le_bytes());
+        // struct ifaddrmsg: family, prefixlen, flags, scope, index(u32).
+        add[16] = AF_INET_ADDR;
+        add[17] = 8;
+        add[20..24].copy_from_slice(&1u32.to_ne_bytes());
+        // rtattr IFA_LOCAL = 127.0.0.1 (len includes the 4-byte header).
+        add[24..26].copy_from_slice(&8u16.to_le_bytes());
+        add[26..28].copy_from_slice(&IFA_LOCAL.to_le_bytes());
+        add[28..32].copy_from_slice(&[127, 0, 0, 1]);
+
+        if netlink_send(fd, &add).ok_or("newaddr send")? != add.len() as i64 {
+            return Err("RTM_NEWADDR send failed");
+        }
+        let mut ack = [0u8; 512];
+        let an = netlink_recv(fd, &mut ack).ok_or("ack recv")?;
+        if an < NLMSG_HDRLEN as i64 {
+            return Err("ack recv returned a short message");
+        }
+        if nlmsg_type_of(&ack) != NLMSG_ERROR {
+            return Err("RTM_NEWADDR ack was not NLMSG_ERROR");
+        }
+        if i32::from_ne_bytes(ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap())
+            != EPERM as i32
+        {
+            return Err("ordinary route socket gained loopback admin authority");
+        }
+        let ack_pid = u32::from_ne_bytes(ack[12..16].try_into().unwrap());
+        if ack_pid != portid {
+            return Err("NLMSG_ERROR ack nlmsg_pid did not match the bound port id");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_reply_pid_matches_bound_port
+);
+
+/// systemd PID 1 creates a route socket during early boot and sends this
+/// RTM_SETLINK request for synthetic loopback. The kernel grants only this
+/// socket a loopback-bound handle; ordinary sockets remain covered by the
+/// preceding EPERM regression test.
+fn smoke_abi_netlink_pid1_can_start_loopback() -> TestResult {
+    with_setup(|| {
+        const AF_INET: u8 = 2;
+        const AF_INET6: u8 = 10;
+        const IFA_LOCAL: u16 = 2;
+        const EEXIST: i32 = -17;
+
+        crate::handlers::register_task_to_pid(FAKE_TASK, 1);
+        let fd = open_netlink(NETLINK_ROUTE)?;
+
+        // struct ifinfomsg: family/pad/type/index/flags/change. This is the
+        // sd_rtnl_message_link_set_flags(IFF_UP, IFF_UP) request emitted by
+        // systemd's loopback_setup().
+        let mut set_link = [0u8; 32];
+        set_link[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        set_link[4..6].copy_from_slice(&RTM_SETLINK.to_ne_bytes());
+        set_link[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+        set_link[8..12].copy_from_slice(&89u32.to_ne_bytes());
+        set_link[20..24].copy_from_slice(&1i32.to_ne_bytes());
+        set_link[24..28].copy_from_slice(&1u32.to_ne_bytes()); // IFF_UP
+        set_link[28..32].copy_from_slice(&1u32.to_ne_bytes()); // IFF_UP mask
+
+        if netlink_send(fd, &set_link).ok_or("setlink send")? != set_link.len() as i64 {
+            return Err("PID 1 RTM_SETLINK send failed");
+        }
+        let mut ack = [0u8; 512];
+        let received = netlink_recv(fd, &mut ack).ok_or("setlink recv")?;
+        if received < (NLMSG_HDRLEN + 4) as i64 || nlmsg_type_of(&ack) != NLMSG_ERROR {
+            return Err("PID 1 RTM_SETLINK did not receive an NLMSG_ERROR ack");
+        }
+        if i32::from_ne_bytes(ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()) != 0 {
+            return Err("PID 1 RTM_SETLINK loopback ack was not successful");
+        }
+
+        // Linux creates the two loopback addresses before userspace starts.
+        // systemd intentionally re-adds them and treats EEXIST as success, so
+        // model their built-in state rather than granting a one-off bypass.
+        let mut add_v4 = [0u8; 32];
+        add_v4[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        add_v4[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
+        add_v4[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+        add_v4[8..12].copy_from_slice(&90u32.to_ne_bytes());
+        add_v4[16] = AF_INET;
+        add_v4[17] = 8;
+        add_v4[20..24].copy_from_slice(&1u32.to_ne_bytes());
+        add_v4[24..26].copy_from_slice(&8u16.to_ne_bytes());
+        add_v4[26..28].copy_from_slice(&IFA_LOCAL.to_ne_bytes());
+        add_v4[28..32].copy_from_slice(&[127, 0, 0, 1]);
+
+        if netlink_send(fd, &add_v4).ok_or("ipv4 add send")? != add_v4.len() as i64 {
+            return Err("PID 1 RTM_NEWADDR IPv4 send failed");
+        }
+        let received = netlink_recv(fd, &mut ack).ok_or("ipv4 add recv")?;
+        if received < (NLMSG_HDRLEN + 4) as i64
+            || i32::from_ne_bytes(ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()) != EEXIST
+        {
+            return Err("PID 1 RTM_NEWADDR IPv4 did not report built-in loopback state");
+        }
+
+        let mut add_v6 = [0u8; 44];
+        add_v6[0..4].copy_from_slice(&44u32.to_ne_bytes());
+        add_v6[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
+        add_v6[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+        add_v6[8..12].copy_from_slice(&91u32.to_ne_bytes());
+        add_v6[16] = AF_INET6;
+        add_v6[17] = 128;
+        add_v6[20..24].copy_from_slice(&1u32.to_ne_bytes());
+        add_v6[24..26].copy_from_slice(&20u16.to_ne_bytes());
+        add_v6[26..28].copy_from_slice(&IFA_LOCAL.to_ne_bytes());
+        add_v6[43] = 1;
+
+        if netlink_send(fd, &add_v6).ok_or("ipv6 add send")? != add_v6.len() as i64 {
+            return Err("PID 1 RTM_NEWADDR IPv6 send failed");
+        }
+        let received = netlink_recv(fd, &mut ack).ok_or("ipv6 add recv")?;
+        if received < (NLMSG_HDRLEN + 4) as i64
+            || i32::from_ne_bytes(ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()) != EEXIST
+        {
+            return Err("PID 1 RTM_NEWADDR IPv6 did not report built-in loopback state");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_pid1_can_start_loopback
+);
 
 fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
     with_setup(|| {
@@ -1915,7 +2810,7 @@ fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/socket",
     smoke_abi_netlink_address_and_options_roundtrip
 );
 
@@ -1936,7 +2831,119 @@ fn smoke_abi_netlink_uevent_socket_bind() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_uevent_socket_bind);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_uevent_socket_bind);
+
+// sd-netlink's netlink_socket_get_multicast_groups() probes the required
+// bitmap length with getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, NULL,
+// &len) where *len starts at 0. It runs on EVERY sd_netlink_open() (loopback
+// setup, udev, rtnetlink). NARF's getsockopt handler previously rejected the
+// NULL/zero-length probe with -1, which libc maps to EPERM — the exact cause
+// of systemd PID 1's "Failed to open netlink, ignoring: Operation not
+// permitted". This test reproduces the probe and asserts it now succeeds and
+// reports the required length, and that the follow-up bitmap read agrees.
+fn smoke_abi_netlink_list_memberships_length_probe() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+
+        // A fresh socket has joined no groups: the NULL-optval, *optlen=0
+        // probe must succeed (return 0) and report a required length of 0.
+        let mut probe_len = 0u32.to_ne_bytes();
+        let r = call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_LIST_MEMBERSHIPS,
+                arg3: 0, // optval == NULL, the sd-netlink probe form
+                arg4: probe_len.as_mut_ptr() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("list-memberships probe status")?;
+        if r != 0 {
+            return Err("NETLINK_LIST_MEMBERSHIPS NULL probe did not return 0 (was EPERM)");
+        }
+        if u32::from_ne_bytes(probe_len) != 0 {
+            return Err("empty NETLINK_LIST_MEMBERSHIPS probe reported nonzero length");
+        }
+
+        // Join group 65 → highest group forces a 3-word (12-byte) bitmap.
+        let group = 65u32.to_ne_bytes();
+        if call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_ADD_MEMBERSHIP,
+                arg3: group.as_ptr() as u64,
+                arg4: group.len() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("add-membership status")?
+            != 0
+        {
+            return Err("NETLINK_ADD_MEMBERSHIP failed");
+        }
+
+        // The NULL-optval probe now reports the required 12-byte length.
+        let mut probe_len = 0u32.to_ne_bytes();
+        let r = call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_LIST_MEMBERSHIPS,
+                arg3: 0,
+                arg4: probe_len.as_mut_ptr() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("list-memberships probe#2 status")?;
+        if r != 0 {
+            return Err("NETLINK_LIST_MEMBERSHIPS probe after join did not return 0");
+        }
+        if u32::from_ne_bytes(probe_len) != 12 {
+            return Err("NETLINK_LIST_MEMBERSHIPS probe reported the wrong required length");
+        }
+
+        // A follow-up read of the reported length returns the bitmap with the
+        // group-65 bit set in the third word, and updates optlen to 12.
+        let mut bitmap = [0u8; 12];
+        let mut read_len = (bitmap.len() as u32).to_ne_bytes();
+        let r = call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_NETLINK,
+                arg2: NETLINK_LIST_MEMBERSHIPS,
+                arg3: bitmap.as_mut_ptr() as u64,
+                arg4: read_len.as_mut_ptr() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("list-memberships read status")?;
+        if r != 0 {
+            return Err("NETLINK_LIST_MEMBERSHIPS bitmap read did not return 0");
+        }
+        if u32::from_ne_bytes(read_len) != 12 {
+            return Err("NETLINK_LIST_MEMBERSHIPS read did not update optlen to 12");
+        }
+        // group 65 → word 2 (bytes 8..12), bit (65-1) % 32 == 0.
+        if u32::from_ne_bytes(bitmap[8..12].try_into().unwrap()) != 1
+            || u32::from_ne_bytes(bitmap[0..4].try_into().unwrap()) != 0
+        {
+            return Err("NETLINK_LIST_MEMBERSHIPS bitmap did not report group 65");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_list_memberships_length_probe
+);
 
 fn smoke_abi_netlink_route_getlink_dump() -> TestResult {
     with_setup(|| {
@@ -1987,7 +2994,7 @@ fn smoke_abi_netlink_route_getlink_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getlink_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getlink_dump);
 
 fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
     with_setup(|| {
@@ -2028,7 +3035,7 @@ fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getaddr_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getaddr_dump);
 
 fn smoke_abi_netlink_route_getaddr_family_filter() -> TestResult {
     with_setup(|| {
@@ -2038,20 +3045,35 @@ fn smoke_abi_netlink_route_getaddr_family_filter() -> TestResult {
         req[4..6].copy_from_slice(&RTM_GETADDR.to_ne_bytes());
         req[6..8].copy_from_slice(&NLM_F_REQUEST_DUMP.to_ne_bytes());
         req[8..12].copy_from_slice(&15u32.to_ne_bytes());
-        req[16] = 10; // AF_INET6; NARF currently publishes no IPv6 addresses.
+        req[16] = 10; // AF_INET6; synthetic loopback publishes ::1/128.
         if netlink_send(fd, &req).ok_or("filtered addr send")? != req.len() as i64 {
             return Err("filtered RTM_GETADDR send failed");
         }
         let mut reply = [0u8; 64];
         let n = netlink_recv(fd, &mut reply).ok_or("filtered addr recv")?;
-        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&reply) != NLMSG_DONE {
-            return Err("empty filtered address dump did not return NLMSG_DONE");
+        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&reply) != RTM_NEWADDR {
+            return Err("IPv6-filtered address dump did not return loopback ::1");
+        }
+        if reply[NLMSG_HDRLEN] != 10
+            || reply[NLMSG_HDRLEN + 1] != 128
+            || reply[NLMSG_HDRLEN + 3] != 254 // RT_SCOPE_HOST
+            || reply[43] != 1
+        {
+            return Err("IPv6-filtered address dump did not describe ::1/128");
+        }
+        let mut done = [0u8; 64];
+        let n = netlink_recv(fd, &mut done).ok_or("filtered addr done recv")?;
+        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&done) != NLMSG_DONE {
+            return Err("IPv6-filtered address dump did not terminate with NLMSG_DONE");
         }
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getaddr_family_filter);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_route_getaddr_family_filter
+);
 
 fn smoke_abi_netlink_route_getroute_dump() -> TestResult {
     with_setup(|| {
@@ -2090,7 +3112,7 @@ fn smoke_abi_netlink_route_getroute_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getroute_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getroute_dump);
 
 fn smoke_abi_netlink_route_point_lookup() -> TestResult {
     with_setup(|| {
@@ -2154,7 +3176,7 @@ fn smoke_abi_netlink_route_point_lookup() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_point_lookup);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_point_lookup);
 
 fn smoke_abi_netlink_route_getneigh_dump() -> TestResult {
     with_setup(|| {
@@ -2184,7 +3206,7 @@ fn smoke_abi_netlink_route_getneigh_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getneigh_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getneigh_dump);
 
 fn smoke_abi_netlink_route_getrule_dump() -> TestResult {
     with_setup(|| {
@@ -2212,7 +3234,7 @@ fn smoke_abi_netlink_route_getrule_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getrule_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getrule_dump);
 
 fn smoke_abi_netlink_route_getqdisc_dump() -> TestResult {
     with_setup(|| {
@@ -2245,7 +3267,7 @@ fn smoke_abi_netlink_route_getqdisc_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getqdisc_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getqdisc_dump);
 
 fn smoke_abi_netlink_empty_collection_dump() -> TestResult {
     with_setup(|| {
@@ -2263,7 +3285,10 @@ fn smoke_abi_netlink_empty_collection_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_empty_collection_dump);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_empty_collection_dump
+);
 
 fn smoke_abi_netlink_uevent_recv() -> TestResult {
     with_setup(|| {
@@ -2290,6 +3315,21 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
         if queued <= 4 {
             return Err("SIOCINQ did not report the pending uevent");
         }
+        let sized = call(
+            Syscall::SocketRecv.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: 0,
+                arg2: 0,
+                arg3: MSG_DONTWAIT | 0x02 | 0x20,
+                arg4: 0,
+                arg5: 0,
+            },
+        )
+        .ok_or("zero-length uevent MSG_PEEK|MSG_TRUNC status")?;
+        if sized != queued {
+            return Err("zero-length uevent probe did not return complete datagram length");
+        }
         let mut short = [0u8; 4];
         let peeked = netlink_recv_flags(fd, &mut short, MSG_DONTWAIT | 0x02 | 0x20)
             .ok_or("uevent MSG_PEEK|MSG_TRUNC status")?;
@@ -2313,7 +3353,63 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_uevent_recv);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_uevent_recv);
+
+/// A NETLINK_KOBJECT_UEVENT monitor is udevd's primary event source.  Its
+/// queue may be drained between epoll scans, so EPOLLET must see a subsequent
+/// uevent even though no scan observed the temporary empty state.
+fn smoke_abi_netlink_uevent_epollet_drain_refill() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        let (addr, alen) = netlink_sockaddr(1);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind(NETLINK_KOBJECT_UEVENT) failed");
+        }
+        let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+        if epfd < 0 {
+            return Err("epoll_create failed");
+        }
+        let mut interest = [0u8; 12];
+        interest[..4].copy_from_slice(&(1u32 | (1u32 << 31)).to_ne_bytes());
+        interest[4..].copy_from_slice(&0x5545_5645_4E54u64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd as u64, 1, fd, interest.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("epoll_ctl ADD EPOLLET uevent monitor failed");
+        }
+
+        let mut events = [0u8; 12];
+        for devpath in ["/devices/abi-uevent-et-one", "/devices/abi-uevent-et-two"] {
+            narf_filesystem::uevent::emit(
+                narf_filesystem::uevent::UeventAction::Add,
+                alloc::string::String::from(devpath),
+                alloc::string::String::from("net"),
+            );
+            if call(
+                Syscall::EpollWait.raw(),
+                a3(epfd as u64, events.as_mut_ptr() as u64, 1, 0),
+            ) != Some(1)
+            {
+                return Err("EPOLLET lost NETLINK_KOBJECT_UEVENT drain/refill edge");
+            }
+            let mut buf = [0u8; 512];
+            if netlink_recv(fd, &mut buf).ok_or("uevent recv status")? <= 0 {
+                return Err("uevent monitor did not drain its ready datagram");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_uevent_epollet_drain_refill
+);
 
 // systemd PID 1's audit setup opens `socket(AF_NETLINK, SOCK_RAW, 9)`.
 // Status queries return a disabled audit_status; configuration remains denied
@@ -2352,7 +3448,10 @@ fn smoke_abi_netlink_audit_socket_open_bind_send() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_audit_socket_open_bind_send);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_audit_socket_open_bind_send
+);
 
 fn smoke_abi_netlink_generic_socket_open() -> TestResult {
     with_setup(|| {
@@ -2429,7 +3528,7 @@ fn smoke_abi_netlink_generic_socket_open() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_generic_socket_open);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_generic_socket_open);
 
 fn smoke_abi_netlink_generic_batched_requests() -> TestResult {
     with_setup(|| {
@@ -2467,7 +3566,10 @@ fn smoke_abi_netlink_generic_batched_requests() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_generic_batched_requests);
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_generic_batched_requests
+);
 
 fn smoke_abi_netlink_generic_extended_capped_error() -> TestResult {
     with_setup(|| {
@@ -2509,7 +3611,7 @@ fn smoke_abi_netlink_generic_extended_capped_error() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/socket",
     smoke_abi_netlink_generic_extended_capped_error
 );
 
@@ -2566,7 +3668,7 @@ fn smoke_abi_netlink_sock_diag_tcp_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_sock_diag_tcp_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_sock_diag_tcp_dump);
 
 fn smoke_abi_netlink_conntrack_dump() -> TestResult {
     with_setup(|| {
@@ -2613,7 +3715,7 @@ fn smoke_abi_netlink_conntrack_dump() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_netlink_conntrack_dump);
+kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_conntrack_dump);
 
 fn smoke_abi_netlink_userspace_unicast_and_unique_portid() -> TestResult {
     with_setup(|| {
@@ -2697,7 +3799,7 @@ fn smoke_abi_netlink_userspace_unicast_and_unique_portid() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/socket",
     smoke_abi_netlink_userspace_unicast_and_unique_portid
 );
 

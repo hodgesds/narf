@@ -58,10 +58,25 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
     // (Wayland) ships shm/dma-buf fds this way.
     let ctrl_ptr = read_user_u64(msg_ptr + 32);
     let ctrl_len = read_user_u64(msg_ptr + 40) as usize;
-    let passed_fds = parse_scm_rights_fds(ctrl_ptr, ctrl_len);
+    let passed_fds = match parse_scm_rights_fds(ctrl_ptr, ctrl_len) {
+        Ok(fds) => fds,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
     if !passed_fds.is_empty() {
-        // fd-carrying send → AF_UNIX stream path.
-        return match sock.unix_sendmsg(&total, passed_fds) {
+        // SCM_RIGHTS applies to AF_UNIX datagrams too. systemd uses that
+        // shape for sd_notify's FDSTORE=1 messages; routing it through the
+        // stream-only ring reports ENOTCONN and prevents services from ever
+        // completing their READY=1 startup handshake.
+        let send =
+            if sock.domain == crate::socket::AF_UNIX && sock.kind == crate::socket::SOCK_DGRAM {
+                sock.unix_dgram_sendmsg(&total, flags, dest, passed_fds)
+            } else {
+                sock.unix_sendmsg(&total, passed_fds)
+            };
+        return match send {
             Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
             Err(e) => ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64)),
         };

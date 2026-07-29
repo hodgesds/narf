@@ -312,6 +312,11 @@ impl UeventReader {
     }
 }
 
+/// Returns the current global uevent ring sequence number.
+pub fn current_seqnum() -> u64 {
+    UEVENT_RING.lock().next_seqnum
+}
+
 // ── /sys/kernel/uevent_seqnum virtual file ────────────────────────────
 
 /// Generate the content of `/sys/kernel/uevent_seqnum`.

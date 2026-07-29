@@ -49,8 +49,9 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 #[cfg(feature = "linux-compat")]
 use crate::sysfs::{
-    __reset_for_test as sysfs_reset, class_device_register, class_register, kobject_add_attr,
-    kobject_add_writable_attr, sysfs_root, Kobject,
+    __reset_for_test as sysfs_reset, class_device_register, class_register, coldplug,
+    get_or_create_child, kobject_add_attr, kobject_add_uevent_attr, kobject_add_writable_attr,
+    populate_kernel_dir, register_char_dev_link, sysfs_root, Kobject, SysKobjDir,
 };
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
@@ -1237,3 +1238,547 @@ fn smoke_drm_sysfs_e2e() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/drm", smoke_drm_sysfs_e2e);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Core sysfs semantics — class listing, /sys/devices symlinks, uevent store,
+// dev (MAJOR:MINOR), /sys/kernel, ro-write rejection, dir enumeration,
+// missing-attr NotFound, and VFS symlink resolution.
+//
+// These exercise the kobject/SysFs surface directly rather than a specific
+// device class, matching what udev/libudev depend on. All values asserted
+// are what the source in sysfs.rs actually produces (see the renderers /
+// stores read above).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Core 1 — /sys/class/<sub>/ lists members; a member symlinks into
+//             /sys/devices/... (mirrors how populate_input_class wires the
+//             class dir to the /sys/devices topology) ──────────────────────
+
+#[cfg(feature = "linux-compat")]
+fn smoke_core_class_lists_members_and_symlink() -> TestResult {
+    sysfs_reset();
+
+    // Register two devices in one class so the class dir has >1 member.
+    let class = class_register("net");
+    let _eth0 = class_device_register(class.clone(), "eth0");
+    let _lo = class_device_register(class.clone(), "lo");
+
+    // The class dir must list both members via child_names().
+    let names = class.child_names();
+    if !names.iter().any(|n| n == "eth0") || !names.iter().any(|n| n == "lo") {
+        sysfs_reset();
+        return TestResult::Fail("/sys/class/net does not list eth0 + lo");
+    }
+
+    // Reachable through sysfs_root() → class → net → eth0.
+    let eth0 = sysfs_root()
+        .get_child("class")
+        .and_then(|c| c.get_child("net"))
+        .and_then(|n| n.get_child("eth0"));
+    let eth0 = match eth0 {
+        Some(k) => k,
+        None => {
+            sysfs_reset();
+            return TestResult::Fail("/sys/class/net/eth0 unreachable via sysfs_root");
+        }
+    };
+
+    // Root the real device under /sys/devices/... and point the class
+    // member's `device` link at it, exactly as the real bridges do.
+    let root = sysfs_root();
+    let devices = get_or_create_child(&root, "devices");
+    let platform = get_or_create_child(&devices, "platform");
+    let _phys = get_or_create_child(&platform, "narf-net.0");
+    eth0.add_symlink("device", "../../../devices/platform/narf-net.0");
+    // `subsystem` back-link (basename must be "net").
+    eth0.add_symlink("subsystem", "../../../class/net");
+
+    match eth0.get_symlink("device").as_deref() {
+        Some("../../../devices/platform/narf-net.0") => {}
+        other => {
+            sysfs_reset();
+            let _ = other;
+            return TestResult::Fail("eth0/device symlink target wrong");
+        }
+    }
+    // subsystem basename is "net".
+    let sub = eth0.get_symlink("subsystem").unwrap_or_default();
+    if sub.rsplit('/').next() != Some("net") {
+        sysfs_reset();
+        return TestResult::Fail("eth0/subsystem basename != 'net'");
+    }
+
+    sysfs_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("sysfs_e2e/core", smoke_core_class_lists_members_and_symlink);
+
+// ── Core 2 — a device's `uevent` attr renders KEY=value lines, and writing
+//             "add" re-triggers a uevent (seqnum bumps). This is the coldplug
+//             `echo add > uevent` store path (kobject_add_uevent_attr). ─────
+
+#[cfg(feature = "linux-compat")]
+fn smoke_core_uevent_attr_render_and_store_triggers() -> TestResult {
+    sysfs_reset();
+    crate::uevent::__reset_for_test();
+
+    let class = class_register("block");
+    let kobj = class_device_register(class, "vda");
+
+    // `dev` (MAJOR:MINOR) alongside a writable `uevent` — the shape a
+    // block device exposes (see populate_block_class).
+    kobject_add_attr(&kobj, "dev", || "259:0\n".to_string());
+    kobject_add_uevent_attr(
+        &kobj,
+        "MAJOR=259\nMINOR=0\nDEVNAME=vda\nDEVTYPE=disk\n".to_string(),
+    );
+
+    // ── uevent attr renders the expected KEY=value lines ───────────────
+    let body = kobj.attr_show("uevent").unwrap_or_default();
+    for needle in ["MAJOR=259", "MINOR=0", "DEVNAME=vda", "DEVTYPE=disk"] {
+        if !body.contains(needle) {
+            sysfs_reset();
+            crate::uevent::__reset_for_test();
+            return TestResult::Fail("uevent body missing an expected KEY=value line");
+        }
+    }
+
+    // ── uevent must be writable; a store of "add" re-triggers a uevent ─
+    if !kobj.attr_is_writable("uevent") {
+        sysfs_reset();
+        crate::uevent::__reset_for_test();
+        return TestResult::Fail("device uevent attr is not writable");
+    }
+
+    let before = crate::uevent::next_seqnum();
+    let mut reader = crate::uevent::UeventReader::new();
+    match kobj.attr_store("uevent", b"add\n") {
+        Some(Ok(())) => {}
+        _ => {
+            sysfs_reset();
+            crate::uevent::__reset_for_test();
+            return TestResult::Fail("uevent store('add') failed");
+        }
+    }
+    let after = crate::uevent::next_seqnum();
+    if after <= before {
+        sysfs_reset();
+        crate::uevent::__reset_for_test();
+        return TestResult::Fail("uevent_seqnum did not bump after 'echo add > uevent'");
+    }
+
+    // The re-triggered event is an ADD carrying DEVPATH for /class/block/vda.
+    let events = reader.drain(8);
+    let saw_add = events.iter().any(|e| {
+        e.action == crate::uevent::UeventAction::Add
+            && e.devpath.contains("/class/block/vda")
+            && e.subsystem == "block"
+    });
+    if !saw_add {
+        sysfs_reset();
+        crate::uevent::__reset_for_test();
+        return TestResult::Fail("no matching ADD uevent broadcast by uevent store");
+    }
+
+    sysfs_reset();
+    crate::uevent::__reset_for_test();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "sysfs_e2e/core",
+    smoke_core_uevent_attr_render_and_store_triggers
+);
+
+// ── Core 3 — /sys/class/<sub>/<dev>/dev reports MAJOR:MINOR, and
+//             register_char_dev_link installs /sys/dev/char/MAJOR:MINOR
+//             pointing at the class dir (udev by-devnum lookup). ───────────
+
+#[cfg(feature = "linux-compat")]
+fn smoke_core_dev_attr_and_char_devnum_link() -> TestResult {
+    sysfs_reset();
+
+    let class = class_register("drm");
+    let card0 = class_device_register(class, "card0");
+    kobject_add_attr(&card0, "dev", || "226:0\n".to_string());
+
+    // /sys/class/drm/card0/dev == "226:0".
+    match attr_show_trimmed(&card0, "dev").as_deref() {
+        Some("226:0") => {}
+        other => {
+            sysfs_reset();
+            let _ = other;
+            return TestResult::Fail("drm/card0/dev != '226:0'");
+        }
+    }
+
+    // Install /sys/dev/char/226:0 → ../../class/drm/card0.
+    register_char_dev_link(226, 0, "drm", "card0");
+    let link = sysfs_root()
+        .get_child("dev")
+        .and_then(|d| d.get_child("char"))
+        .and_then(|c| c.get_symlink("226:0"));
+    match link.as_deref() {
+        Some("../../class/drm/card0") => {}
+        other => {
+            sysfs_reset();
+            let _ = other;
+            return TestResult::Fail("/sys/dev/char/226:0 symlink target wrong");
+        }
+    }
+    // register_char_dev_link also ensures /sys/dev/block exists (udev scandir).
+    let has_block = sysfs_root()
+        .get_child("dev")
+        .and_then(|d| d.get_child("block"))
+        .is_some();
+    if !has_block {
+        sysfs_reset();
+        return TestResult::Fail("/sys/dev/block not created alongside /sys/dev/char");
+    }
+
+    sysfs_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("sysfs_e2e/core", smoke_core_dev_attr_and_char_devnum_link);
+
+// ── Core 4 — /sys/kernel/uevent_seqnum reads a monotonically-increasing
+//             number, and /sys/kernel exposes the known THP knobs. ─────────
+
+#[cfg(feature = "linux-compat")]
+fn smoke_core_kernel_uevent_seqnum_monotonic() -> TestResult {
+    sysfs_reset();
+    crate::uevent::__reset_for_test();
+
+    populate_kernel_dir();
+    let kernel = match sysfs_root().get_child("kernel") {
+        Some(k) => k,
+        None => {
+            sysfs_reset();
+            crate::uevent::__reset_for_test();
+            return TestResult::Fail("/sys/kernel missing after populate_kernel_dir");
+        }
+    };
+
+    // uevent_seqnum renders next_seqnum()-1 as a decimal number.
+    let parse = |kobj: &Kobject| -> Option<u64> {
+        attr_show_trimmed(kobj, "uevent_seqnum").and_then(|s| s.parse().ok())
+    };
+    let first = match parse(&kernel) {
+        Some(v) => v,
+        None => {
+            sysfs_reset();
+            crate::uevent::__reset_for_test();
+            return TestResult::Fail("/sys/kernel/uevent_seqnum not a number");
+        }
+    };
+
+    // Emit a uevent to advance the counter; re-read must be >= first.
+    crate::uevent::emit(
+        crate::uevent::UeventAction::Add,
+        "/devices/virtual/test".to_string(),
+        "test".to_string(),
+    );
+    let second = parse(&kernel).unwrap_or(first);
+    if second < first || second == 0 {
+        sysfs_reset();
+        crate::uevent::__reset_for_test();
+        return TestResult::Fail("uevent_seqnum did not increase monotonically");
+    }
+
+    // Known /sys/kernel/mm/transparent_hugepage knobs — [never] is active.
+    let thp = sysfs_root()
+        .get_child("kernel")
+        .and_then(|k| k.get_child("mm"))
+        .and_then(|mm| mm.get_child("transparent_hugepage"));
+    let thp = match thp {
+        Some(t) => t,
+        None => {
+            sysfs_reset();
+            crate::uevent::__reset_for_test();
+            return TestResult::Fail("/sys/kernel/mm/transparent_hugepage missing");
+        }
+    };
+    let enabled = thp.attr_show("enabled").unwrap_or_default();
+    if !enabled.contains("[never]") {
+        sysfs_reset();
+        crate::uevent::__reset_for_test();
+        return TestResult::Fail("transparent_hugepage/enabled active policy != [never]");
+    }
+
+    sysfs_reset();
+    crate::uevent::__reset_for_test();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("sysfs_e2e/core", smoke_core_kernel_uevent_seqnum_monotonic);
+
+// ── Core 5 — attribute read/write round-trip on a writable attr, and a
+//             read-only attr rejects writes (attr_store → None, surfaced as
+//             ReadOnly by SysAttrFile::write). ─────────────────────────────
+
+#[cfg(feature = "linux-compat")]
+fn smoke_core_rw_roundtrip_and_ro_rejects_write() -> TestResult {
+    sysfs_reset();
+
+    let class = class_register("backlight");
+    let kobj = class_device_register(class, "acpi_video0");
+
+    // Read-only attr.
+    kobject_add_attr(&kobj, "max_brightness", || "255\n".to_string());
+
+    // Writable attr backed by an atomic — full round-trip.
+    let cur: Arc<AtomicU32> = Arc::new(AtomicU32::new(10));
+    {
+        let show = cur.clone();
+        let store = cur.clone();
+        kobject_add_writable_attr(
+            &kobj,
+            "brightness",
+            move || format!("{}\n", show.load(Ordering::Acquire)),
+            move |buf| {
+                let s = core::str::from_utf8(buf)
+                    .map_err(|_| FsError::InvalidData)?
+                    .trim();
+                let v: u32 = s.parse().map_err(|_| FsError::InvalidData)?;
+                store.store(v, Ordering::Release);
+                Ok(())
+            },
+        );
+    }
+
+    // Round-trip: write then read back.
+    match kobj.attr_store("brightness", b"200\n") {
+        Some(Ok(())) => {}
+        _ => {
+            sysfs_reset();
+            return TestResult::Fail("writable brightness store failed");
+        }
+    }
+    if attr_show_trimmed(&kobj, "brightness").as_deref() != Some("200") {
+        sysfs_reset();
+        return TestResult::Fail("brightness did not round-trip to 200");
+    }
+
+    // is_writable reflects the store registration.
+    if !kobj.attr_is_writable("brightness") || kobj.attr_is_writable("max_brightness") {
+        sysfs_reset();
+        return TestResult::Fail("attr_is_writable classification wrong");
+    }
+
+    // Read-only attr: attr_store returns None (no store callback).
+    if kobj.attr_store("max_brightness", b"1\n").is_some() {
+        sysfs_reset();
+        return TestResult::Fail("read-only attr wrongly accepted a store");
+    }
+
+    // Through the VFS SysAttrFile, a write to the RO attr surfaces ReadOnly.
+    let dir = SysKobjDir { kobj: kobj.clone() };
+    let ro_file = match dir.lookup("max_brightness") {
+        Some(f) => f,
+        None => {
+            sysfs_reset();
+            return TestResult::Fail("max_brightness not resolvable via SysKobjDir");
+        }
+    };
+    match poll_once(ro_file.write(0, b"1\n")) {
+        Some(Err(FsError::ReadOnly)) => {}
+        other => {
+            sysfs_reset();
+            let _ = other;
+            return TestResult::Fail("RO attr write did not return ReadOnly");
+        }
+    }
+
+    sysfs_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "sysfs_e2e/core",
+    smoke_core_rw_roundtrip_and_ro_rejects_write
+);
+
+// ── Core 6 — SysKobjDir enumeration returns children + attrs + symlinks with
+//             the right FileType, and a missing attr resolves to NotFound. ──
+
+#[cfg(feature = "linux-compat")]
+fn smoke_core_dir_enumeration_and_missing_notfound() -> TestResult {
+    sysfs_reset();
+
+    let class = class_register("power_supply");
+    let bat = class_device_register(class, "BAT0");
+    kobject_add_attr(&bat, "capacity", || "73\n".to_string());
+    kobject_add_attr(&bat, "status", || "Charging\n".to_string());
+    bat.add_symlink("subsystem", "../../../class/power_supply");
+    // A nested child dir under the device.
+    let _power = get_or_create_child(&bat, "power");
+
+    let dir = SysKobjDir { kobj: bat.clone() };
+
+    // enumerate() must surface all three kinds with the right FileType.
+    let entries = dir.enumerate(0, 64);
+    let has = |name: &str, ft: FileType| {
+        entries
+            .iter()
+            .any(|(n, t)| n == name && core::mem::discriminant(t) == core::mem::discriminant(&ft))
+    };
+    if !has("capacity", FileType::File) || !has("status", FileType::File) {
+        sysfs_reset();
+        return TestResult::Fail("enumerate missing attr entries as File");
+    }
+    if !has("power", FileType::Dir) {
+        sysfs_reset();
+        return TestResult::Fail("enumerate missing child dir 'power' as Dir");
+    }
+    if !has("subsystem", FileType::Symlink) {
+        sysfs_reset();
+        return TestResult::Fail("enumerate missing 'subsystem' as Symlink");
+    }
+
+    // iter() yields the same population (count matches: 2 attrs + 1 dir + 1 link).
+    let iter_count = dir.iter().count();
+    if iter_count != 4 {
+        sysfs_reset();
+        return TestResult::Fail("SysKobjDir::iter entry count != 4");
+    }
+
+    // A missing attr resolves to None via lookup...
+    if dir.lookup("no_such_attr").is_some() {
+        sysfs_reset();
+        return TestResult::Fail("lookup of missing attr returned Some");
+    }
+    // ...and to NotFound via the DirOps lookup_async default helper.
+    match poll_once(dir.lookup_async("no_such_attr")) {
+        Some(Err(FsError::NotFound)) => {}
+        other => {
+            sysfs_reset();
+            let _ = other;
+            return TestResult::Fail("lookup_async of missing attr != NotFound");
+        }
+    }
+
+    sysfs_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "sysfs_e2e/core",
+    smoke_core_dir_enumeration_and_missing_notfound
+);
+
+// ── Core 7 — symlink resolution through the VFS: SysKobjDir::lookup of a
+//             /sys/class/net/<if> symlink yields a SysSymlinkFile whose read
+//             returns the /sys/devices target verbatim (readlink shape). ───
+
+#[cfg(feature = "linux-compat")]
+fn smoke_core_symlink_resolution_via_vfs() -> TestResult {
+    sysfs_reset();
+
+    // Model Linux's /sys/class/net/eth0 → ../../devices/... class symlink.
+    let root = sysfs_root();
+    let class_dir = get_or_create_child(&root, "class");
+    let class_net = get_or_create_child(&class_dir, "net");
+    let devices = get_or_create_child(&root, "devices");
+    let platform = get_or_create_child(&devices, "platform");
+    let _phys = get_or_create_child(&platform, "narf-net.0");
+    let target = "../../devices/platform/narf-net.0";
+    class_net.add_symlink("eth0", target);
+
+    // lookup() on the class dir returns a symlink file for "eth0".
+    let dir = SysKobjDir { kobj: class_net };
+    let link_file = match dir.lookup("eth0") {
+        Some(f) => f,
+        None => {
+            sysfs_reset();
+            return TestResult::Fail("/sys/class/net/eth0 symlink not resolvable");
+        }
+    };
+
+    // stat() reports Symlink and size == target.len().
+    let st = link_file.stat();
+    if !matches!(st.mode.file_type, FileType::Symlink) {
+        sysfs_reset();
+        return TestResult::Fail("class symlink stat file_type != Symlink");
+    }
+    if st.size != target.len() as u64 {
+        sysfs_reset();
+        return TestResult::Fail("class symlink stat size != target length");
+    }
+
+    // read() returns the target verbatim (what sys_readlink hands back).
+    let mut buf = [0u8; 64];
+    let n = match poll_once(link_file.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        other => {
+            sysfs_reset();
+            let _ = other;
+            return TestResult::Fail("class symlink read failed");
+        }
+    };
+    if &buf[..n] != target.as_bytes() {
+        sysfs_reset();
+        return TestResult::Fail("class symlink read did not return the target verbatim");
+    }
+
+    sysfs_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("sysfs_e2e/core", smoke_core_symlink_resolution_via_vfs);
+
+// ── Core 8 — coldplug() broadcasts an ADD per device kobject (one carrying a
+//             `uevent` attr), matching `udevadm trigger --action=add`. ──────
+
+#[cfg(feature = "linux-compat")]
+fn smoke_core_coldplug_emits_add_per_device() -> TestResult {
+    sysfs_reset();
+    crate::uevent::__reset_for_test();
+
+    // Two device kobjects (have a `uevent` attr) + one plain container dir
+    // (no `uevent`, so coldplug must skip it).
+    let class = class_register("power_supply");
+    let bat = class_device_register(class.clone(), "BAT0");
+    kobject_add_uevent_attr(&bat, "POWER_SUPPLY_NAME=BAT0\n".to_string());
+    let ac = class_device_register(class.clone(), "AC");
+    kobject_add_uevent_attr(&ac, "POWER_SUPPLY_NAME=AC\n".to_string());
+    // Plain container (the class dir itself has no uevent attr).
+
+    let mut reader = crate::uevent::UeventReader::new();
+    let emitted = coldplug();
+    if emitted != 2 {
+        sysfs_reset();
+        crate::uevent::__reset_for_test();
+        return TestResult::Fail("coldplug did not emit exactly one ADD per device");
+    }
+
+    let events = reader.drain(16);
+    let adds = events
+        .iter()
+        .filter(|e| e.action == crate::uevent::UeventAction::Add)
+        .count();
+    if adds != 2 {
+        sysfs_reset();
+        crate::uevent::__reset_for_test();
+        return TestResult::Fail("coldplug ADD uevents count != 2 in the ring");
+    }
+    // Both device devpaths appear, with SUBSYSTEM=power_supply.
+    let bat_ok = events
+        .iter()
+        .any(|e| e.devpath.contains("/class/power_supply/BAT0") && e.subsystem == "power_supply");
+    let ac_ok = events
+        .iter()
+        .any(|e| e.devpath.contains("/class/power_supply/AC") && e.subsystem == "power_supply");
+    if !bat_ok || !ac_ok {
+        sysfs_reset();
+        crate::uevent::__reset_for_test();
+        return TestResult::Fail("coldplug ADD uevents missing expected devpath/subsystem");
+    }
+
+    sysfs_reset();
+    crate::uevent::__reset_for_test();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("sysfs_e2e/core", smoke_core_coldplug_emits_add_per_device);

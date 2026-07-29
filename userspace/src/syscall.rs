@@ -691,8 +691,9 @@ pub enum Syscall {
     /// `put_old` (an absolute path under the new root). Used by
     /// container-init to drop the bootstrap root after mounting
     /// the new image. arg0 = new_root ptr, arg1 = new_root len,
-    /// arg2 = put_old ptr, arg3 = put_old len. Returns 0 / !0u64.
-    /// Gated behind `linux-compat` + `container`.
+    /// Returns 0 / !0u64. Part of `linux-compat`: service managers use it
+    /// after a private `CLONE_NEWNS` sandbox even without the broader
+    /// container namespace feature.
     PivotRoot,
 
     /// `sigreturn()` — restore the calling task's user-mode trap
@@ -1284,6 +1285,7 @@ pub enum Syscall {
     ///
     /// Everything else returns -1.
     Prctl,
+    Seccomp,
 
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
@@ -2606,7 +2608,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setrlimit, 160),
     #[cfg(feature = "linux-compat")]
     (Syscall::Chroot, 161),
-    #[cfg(all(feature = "linux-compat", feature = "container"))]
+    #[cfg(feature = "linux-compat")]
     (Syscall::PivotRoot, 155),
     (Syscall::Mount, 165),
     (Syscall::Umount2, 166),
@@ -2680,6 +2682,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Prlimit64, 302),
     (Syscall::Getcpu, 309),
     (Syscall::GetRandom, 318),
+    (Syscall::Seccomp, 317),
     (Syscall::MemfdCreate, 319),
     (Syscall::CopyFileRange, 326),
     (Syscall::Statx, 332),
@@ -2760,7 +2763,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Renameat, 38),
     (Syscall::Umount2, 39),
     (Syscall::Mount, 40),
-    #[cfg(all(feature = "linux-compat", feature = "container"))]
+    #[cfg(feature = "linux-compat")]
     (Syscall::PivotRoot, 41),
     #[cfg(feature = "linux-compat")]
     (Syscall::Chroot, 51),
@@ -3197,6 +3200,7 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
                 a.arg2,
                 a.arg3,
             );
+            trace_syscall_paths(table.name_of(variant).unwrap_or("?"), a);
         }
         // Kernel-time accounting (getrusage ru_stime / times tms_stime /
         // /proc stat field 15): bracket the handler with two monotonic
@@ -3205,6 +3209,16 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
         // time is not CPU time; only its pre-park work is undercounted.
         let t0 = narf_scheduler::narf_time::monotonic_ns();
         table.dispatch_ctx_versioned(variant, version, ctx);
+        #[cfg(feature = "syscall-trace")]
+        if syscall_trace_relevant(variant) {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "SYSR t={} {} done",
+                crate::handlers::current_task_id(),
+                table.name_of(variant).unwrap_or("?"),
+            );
+        }
         // Own-stack parks RETURN through this point after arbitrarily
         // long sleeps — the parked flag (set at every kernel_switch
         // yield) tells us the measured span includes off-CPU time, so
@@ -3228,14 +3242,119 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     }
 }
 
-/// Trace filter for the `syscall-trace` feature. Traces EVERY syscall — a
-/// proper `strace`-style firehose (the feature is opt-in at build time, so the
-/// volume is the caller's choice; grep the serial log by `t=<tid>` / name).
-/// The trace line is written straight to the serial console (not via the
-/// syscall path), so tracing `write`/`writev` cannot recurse.
+/// Comm-prefix selecting which processes the `syscall-trace` feature follows.
+/// Set from the kernel cmdline (`trace_comm=<prefix>`) by boot-init so the
+/// trace can be retargeted without a rebuild; defaults to `systemd-executo`
+/// (the sd-executor that stages every service exec) when the cmdline is silent.
+#[cfg(feature = "syscall-trace")]
+static TRACE_COMM: narf_lib::sync::IrqSafeSpinLock<Option<alloc::string::String>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Install the comm-prefix filter for the syscall trace (see `TRACE_COMM`).
+/// A comma-separated list matches any of the listed prefixes.
+#[cfg(feature = "syscall-trace")]
+pub fn set_trace_comm(prefix: &str) {
+    *TRACE_COMM.lock() = Some(alloc::string::String::from(prefix));
+}
+
+/// Trace filter for the `syscall-trace` feature. Fedora desktop diagnostics
+/// are deliberately comm-scoped: tracing every process perturbs scheduling
+/// and buries the first failing syscall under unrelated boot traffic. Every
+/// syscall the matched process makes is traced (entry + return) so the LAST
+/// entry with no matching return names the syscall a hung service blocks on.
 #[cfg(feature = "syscall-trace")]
 fn syscall_trace_relevant(_v: Syscall) -> bool {
-    true
+    syscall_trace_target_task()
+}
+
+/// Shared predicate for syscall, exec, and exit diagnostics. Matches when the
+/// current task's comm starts with any of the comma-separated `trace_comm=`
+/// prefixes (default `systemd-executo`).
+#[cfg(feature = "syscall-trace")]
+pub fn syscall_trace_target_task() -> bool {
+    let comm = match crate::handlers::proc_comm_of_task(crate::handlers::current_task_id()) {
+        Some(c) => c,
+        None => return false,
+    };
+    let guard = TRACE_COMM.lock();
+    let filter = guard.as_deref().unwrap_or("systemd-executo");
+    filter
+        .split(',')
+        .any(|p| !p.is_empty() && comm.starts_with(p))
+}
+
+/// Decode and print the path-string arguments of the path-taking syscalls,
+/// so a `trace_comm=` capture shows WHICH files/mounts a service touches (raw
+/// pointer args alone are useless for debugging namespace assembly). Also
+/// prints the caller's post-chroot resolution of the primary path so a
+/// pivot_root / bind mismatch is visible directly. Gated behind syscall-trace.
+#[cfg(feature = "syscall-trace")]
+fn trace_syscall_paths(name: &str, args: &SyscallArgs) {
+    use core::fmt::Write as _;
+    let cstr = |p: u64| crate::handlers::copy_user_cstr(p, 4096);
+    let task = crate::handlers::current_task_id();
+    let mut line = alloc::string::String::new();
+    match name {
+        "openat" | "newfstatat" | "statx" | "faccessat" | "faccessat2" => {
+            if let Some(p) = cstr(args.arg1) {
+                let _ = write!(line, "  PATH {name} dfd={:#x} path={:?}", args.arg0, p);
+                if p.starts_with('/') {
+                    let resolved = crate::handlers::apply_chroot_for_test(&p);
+                    let _ = write!(line, " -> {resolved:?}");
+                    // When opening the service executable (the 203/EXIT_EXEC
+                    // failure point), dump the private mount table so a missing
+                    // or shadowing mount is visible directly.
+                    if p.ends_with("systemd-udevd") || p.ends_with("systemd-userdbd") {
+                        if let Some(ns) = crate::handlers::current_mount_namespace() {
+                            let _ = write!(line, "\n  MOUNTS(private):");
+                            for (path, fsname) in ns.list_with_names() {
+                                let _ = write!(line, "\n    {path} [{fsname}]");
+                            }
+                        } else {
+                            let _ = write!(line, "\n  MOUNTS: none (global registry)");
+                        }
+                    }
+                }
+            }
+        }
+        "open" | "chdir" | "access" | "stat" | "lstat" | "readlink" | "unlink" | "rmdir" => {
+            if let Some(p) = cstr(args.arg0) {
+                let _ = write!(line, "  PATH {name} path={:?}", p);
+                if p.starts_with('/') {
+                    let _ = write!(line, " -> {:?}", crate::handlers::apply_chroot_for_test(&p));
+                }
+            }
+        }
+        "pivot_root" => {
+            let nr = cstr(args.arg0).unwrap_or_default();
+            let po = cstr(args.arg1).unwrap_or_default();
+            let _ = write!(line, "  PATH pivot_root new_root={nr:?} put_old={po:?}");
+        }
+        "mount" => {
+            let src = cstr(args.arg0).unwrap_or_default();
+            let tgt = cstr(args.arg1).unwrap_or_default();
+            let fst = cstr(args.arg2).unwrap_or_default();
+            let _ = write!(
+                line,
+                "  PATH mount src={src:?} tgt={tgt:?} fstype={fst:?} flags={:#x}",
+                args.arg3
+            );
+        }
+        "umount2" => {
+            if let Some(p) = cstr(args.arg0) {
+                let _ = write!(line, "  PATH umount2 target={p:?} flags={:#x}", args.arg1);
+            }
+        }
+        "fchdir" => {
+            if let Some(p) = crate::handlers::fd_path_of(task, args.arg0 as u32) {
+                let _ = write!(line, "  PATH fchdir fd={:#x} -> {p:?}", args.arg0);
+            }
+        }
+        _ => return,
+    }
+    if !line.is_empty() {
+        let _ = writeln!(narf_console::Writer, "{line}");
+    }
 }
 
 #[inline]
@@ -3282,6 +3401,7 @@ pub fn kernel_syscall_entry_plain_with_state(
             args.arg2,
             args.arg3,
         );
+        trace_syscall_paths(table.name_of(n).unwrap_or("?"), args);
     }
     let mut ctx = ArgsOnlyCtx::new(*args, user_state);
     // PTRACE_SYSCALL entry-stop: if this task is traced and armed, stop it

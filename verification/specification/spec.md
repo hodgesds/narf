@@ -20,6 +20,8 @@ build orchestration (`build/`), release sign-off (`process/`).
 
 - `build/`'s `cargo xtask test` can boot the kernel in QEMU and collect
   structured exit codes + instrumentation output.
+- `cargo xtask test --subsystem NAME` selects one exact registered subsystem
+  for fast local iteration; the unfiltered command remains the merge gate.
 - `console/` provides a deterministic log sink we can parse.
 - CI runners have dedicated (not shared) cores, with frequency scaling
   and turbo disabled for perf jobs.

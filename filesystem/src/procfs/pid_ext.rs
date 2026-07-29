@@ -311,7 +311,9 @@ fn render_ext(pid: u64, field: PidExtField) -> Vec<u8> {
             // single default hierarchy (no cgroups present).
             #[cfg(feature = "cgroup")]
             {
-                crate::cgroupfs::proc_pid_cgroup(pid)
+                // Render relative to the READER's cgroup namespace (Linux
+                // semantics), not the target's — see proc_pid_cgroup.
+                crate::cgroupfs::proc_pid_cgroup(pid, crate::procfs::current_outer_pid())
             }
             #[cfg(not(feature = "cgroup"))]
             {
@@ -523,17 +525,21 @@ fn render_limits(pid: u64) -> String {
 ///   `mount_id parent_id major:minor root mount_point opts - fstype source opts`
 fn render_mountinfo(pid: u64) -> String {
     // Per-ns view first. The hook returns the task's private mount-ns
-    // mount list (one "path\tfsname" line per mount) when it has
+    // mount list (one "id\tparent\tpath\tfsname" line per mount) when it has
     // unshared CLONE_NEWNS; None ⇒ fall back to the global registry.
     if let Some(rows) = super::hook_ns_mountinfo(pid) {
         let mut s = String::new();
-        let mut id = 1u32;
         for line in rows.lines() {
-            let mut it = line.splitn(2, '\t');
+            let mut it = line.splitn(4, '\t');
+            let id = it.next().unwrap_or("1");
+            let parent = it.next().unwrap_or("0");
             let path = it.next().unwrap_or("/");
             let fs_name = it.next().unwrap_or("rootfs");
-            let _ = writeln!(s, "{} 0 0:1 / {} rw - {} {} rw", id, path, fs_name, fs_name);
-            id += 1;
+            let _ = writeln!(
+                s,
+                "{} {} 0:1 / {} rw - {} {} rw",
+                id, parent, path, fs_name, fs_name
+            );
         }
         if s.is_empty() {
             let _ = writeln!(s, "1 0 0:1 / / rw - rootfs rootfs rw");
@@ -541,10 +547,12 @@ fn render_mountinfo(pid: u64) -> String {
         return s;
     }
     let mut s = String::new();
-    let mut id = 1u32;
-    for (path, fs_name) in crate::registry().list_with_names() {
-        let _ = writeln!(s, "{} 0 0:1 / {} rw - {} {} rw", id, path, fs_name, fs_name);
-        id += 1;
+    for (id, parent, path, fs_name) in crate::registry().list_mountinfo() {
+        let _ = writeln!(
+            s,
+            "{} {} 0:1 / {} rw - {} {} rw",
+            id, parent, path, fs_name, fs_name
+        );
     }
     if s.is_empty() {
         // Guarantee at least one line so parsers don't fail.
@@ -1024,6 +1032,31 @@ fn smoke_mountinfo_at_least_one_line() -> TestResult {
 kernel_test_in!(
     "filesystem/procfs/pid_ext",
     smoke_mountinfo_at_least_one_line
+);
+
+/// A mountinfo renderer installed independently of the optional container
+/// namespace bundle must be consumed by the actual procfs file renderer.
+/// This is the production path systemd uses after `CLONE_NEWNS` and a stacked
+/// file bind, before its bind-remount pass.
+fn mountinfo_hook_for_stacked_file_test(pid: u64) -> Option<String> {
+    (pid == 0x4d49).then(|| String::from("41\t40\t/proc/sys/kernel/domainname\tproc"))
+}
+
+fn smoke_mountinfo_uses_installed_namespace_hook() -> TestResult {
+    super::install_mountinfo_hook(mountinfo_hook_for_stacked_file_test);
+    let out = render_mountinfo(0x4d49);
+    if out.lines().any(|line| {
+        line.split_whitespace().nth(4) == Some("/proc/sys/kernel/domainname")
+            && line.contains(" - proc proc rw")
+    }) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("render_mountinfo did not use its installed namespace hook")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_mountinfo_uses_installed_namespace_hook
 );
 
 /// Smoke: `render_wchan` for an unknown pid (no task-info hook)

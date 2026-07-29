@@ -22,7 +22,7 @@ fn smoke_abi_async_poll_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_poll_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_poll_pos);
 
 fn smoke_abi_async_poll_neg() -> TestResult {
     with_setup(|| {
@@ -34,7 +34,7 @@ fn smoke_abi_async_poll_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_poll_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_poll_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // ppoll(2) — sys_ppoll(fds, nfds, timespec*, sigmask, sigsetsize)
@@ -52,7 +52,7 @@ fn smoke_abi_async_ppoll_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_ppoll_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_ppoll_pos);
 
 fn smoke_abi_async_ppoll_neg() -> TestResult {
     with_setup(|| {
@@ -64,7 +64,7 @@ fn smoke_abi_async_ppoll_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_ppoll_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_ppoll_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // select(2) — sys_select(nfds, rfds, wfds, efds, timeval*)
@@ -84,7 +84,7 @@ fn smoke_abi_async_select_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_select_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_select_pos);
 
 fn smoke_abi_async_select_neg() -> TestResult {
     with_setup(|| {
@@ -96,7 +96,7 @@ fn smoke_abi_async_select_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_select_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_select_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // pselect6(2) — sys_pselect6(nfds, rfds, wfds, efds, timespec*, sigmask)
@@ -114,7 +114,7 @@ fn smoke_abi_async_pselect6_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_pselect6_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_pselect6_pos);
 
 fn smoke_abi_async_pselect6_neg() -> TestResult {
     with_setup(|| {
@@ -126,7 +126,7 @@ fn smoke_abi_async_pselect6_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_pselect6_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_pselect6_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // epoll_create1(2) — sys_epoll_create1(flags)
@@ -145,7 +145,7 @@ fn smoke_abi_async_epoll_create_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_epoll_create_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_create_pos);
 
 fn smoke_abi_async_epoll_create_cloexec() -> TestResult {
     with_setup(|| {
@@ -156,13 +156,13 @@ fn smoke_abi_async_epoll_create_cloexec() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_epoll_create_cloexec);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_create_cloexec);
 
 // ════════════════════════════════════════════════════════════════════
 // epoll_ctl(2) — sys_epoll_ctl(epfd, op, fd, epoll_event*)
 //
-// EPOLL_CTL_ADD inserts into the instance's interest map (the target fd
-// is NOT validated against the fd table). A bad epfd → the -1 sentinel.
+// EPOLL_CTL_ADD resolves and retains the target open-file description.
+// A bad epfd or target fd fails.
 // ════════════════════════════════════════════════════════════════════
 
 const EPOLL_CTL_ADD: u64 = 1;
@@ -173,18 +173,64 @@ fn smoke_abi_async_epoll_ctl_pos() -> TestResult {
             Some(fd) if fd >= 0 => fd as u64,
             _ => return Err("epoll_create1 failed"),
         };
+        let target_fd = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("target epoll_create1 failed"),
+        };
         // struct epoll_event { u32 events; u64 data; } — read as 12 bytes.
         let mut ev = [0u8; 12];
         ev[0..4].copy_from_slice(&(0x1u32).to_ne_bytes()); // EPOLLIN
-                                                           // EPOLL_CTL_ADD with a (here-arbitrary) target fd → 0.
-        let args = a3(epfd, EPOLL_CTL_ADD, 5, ev.as_ptr() as u64);
+        let args = a3(epfd, EPOLL_CTL_ADD, target_fd, ev.as_ptr() as u64);
         match call(Syscall::EpollCtl.raw(), args) {
             Some(0) => Ok(()),
             _ => Err("epoll_ctl(ADD) should return 0"),
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_epoll_ctl_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_ctl_pos);
+
+fn smoke_abi_async_epoll_ctl_close_reuse() -> TestResult {
+    with_setup(|| {
+        let epfd = call(Syscall::EpollCreate.raw(), a0(0))
+            .filter(|fd| *fd >= 0)
+            .ok_or("epoll_create1 failed")? as u64;
+        let old_fd = call(
+            Syscall::Signalfd.raw(),
+            a3((-1i64) as u64, 0, 8, crate::fd::O_CLOEXEC as u64),
+        )
+        .filter(|fd| *fd >= 0)
+        .ok_or("first signalfd failed")? as u64;
+        let mut ev = [0u8; 12];
+        ev[0..4].copy_from_slice(&0x1u32.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd, EPOLL_CTL_ADD, old_fd, ev.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("initial epoll_ctl(ADD signalfd) failed");
+        }
+        if call(Syscall::Close.raw(), a0(old_fd)) != Some(0) {
+            return Err("close of watched signalfd failed");
+        }
+        let new_fd = call(
+            Syscall::Signalfd.raw(),
+            a3((-1i64) as u64, 0, 8, crate::fd::O_CLOEXEC as u64),
+        )
+        .filter(|fd| *fd >= 0)
+        .ok_or("replacement signalfd failed")? as u64;
+        if new_fd != old_fd {
+            return Err("closed descriptor number was not reused");
+        }
+        match call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd, EPOLL_CTL_ADD, new_fd, ev.as_ptr() as u64),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("stale epoll interest rejected a reused descriptor"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_ctl_close_reuse);
 
 fn smoke_abi_async_epoll_ctl_neg() -> TestResult {
     with_setup(|| {
@@ -199,7 +245,7 @@ fn smoke_abi_async_epoll_ctl_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_epoll_ctl_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_ctl_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // epoll_wait(2) — sys_epoll_wait(epfd, events, maxevents, timeout)
@@ -224,7 +270,7 @@ fn smoke_abi_async_epoll_wait_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_epoll_wait_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_wait_pos);
 
 fn smoke_abi_async_epoll_wait_neg() -> TestResult {
     with_setup(|| {
@@ -241,7 +287,7 @@ fn smoke_abi_async_epoll_wait_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_epoll_wait_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_wait_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // epoll_pwait(2) — also wired to sys_epoll_wait (is_pwait set, but the
@@ -270,7 +316,7 @@ fn smoke_abi_async_epoll_pwait_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_epoll_pwait_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_pwait_pos);
 
 fn smoke_abi_async_epoll_pwait_neg() -> TestResult {
     with_setup(|| {
@@ -284,7 +330,7 @@ fn smoke_abi_async_epoll_pwait_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_epoll_pwait_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_pwait_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // epoll_pwait2(2) — sys_epoll_pwait2. Like epoll_pwait but arg3 is a
@@ -318,7 +364,10 @@ fn smoke_abi_async_epoll_pwait2_null_timeout() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_epoll_pwait2_null_timeout);
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_epoll_pwait2_null_timeout
+);
 
 fn smoke_abi_async_epoll_pwait2_timespec() -> TestResult {
     with_setup(|| {
@@ -345,7 +394,7 @@ fn smoke_abi_async_epoll_pwait2_timespec() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_epoll_pwait2_timespec);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_pwait2_timespec);
 
 fn smoke_abi_async_epoll_pwait2_neg() -> TestResult {
     with_setup(|| {
@@ -366,7 +415,7 @@ fn smoke_abi_async_epoll_pwait2_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_epoll_pwait2_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_pwait2_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // futex(2) — sys_futex(uaddr, op, val, timeout)
@@ -389,7 +438,22 @@ fn smoke_abi_async_futex_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_futex_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_pos);
+
+fn smoke_abi_async_classic_futex_wait_stale_eagain() -> TestResult {
+    with_setup(|| {
+        let word: u32 = 7;
+        let args = a3(&word as *const u32 as u64, 0, 1, 0);
+        match call(Syscall::Futex.raw(), args) {
+            Some(-11) => Ok(()),
+            _ => Err("classic FUTEX_WAIT on a stale value must return -EAGAIN"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_async_classic_futex_wait_stale_eagain
+);
 
 fn smoke_abi_async_futex_neg() -> TestResult {
     with_setup(|| {
@@ -403,7 +467,7 @@ fn smoke_abi_async_futex_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_futex_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // futex_wake(2) [futex2] — sys_futex_wake(uaddr, mask, nr, flags)
@@ -423,7 +487,7 @@ fn smoke_abi_async_futex_wake_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_futex_wake_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wake_pos);
 
 fn smoke_abi_async_futex_wake_null() -> TestResult {
     with_setup(|| {
@@ -435,7 +499,7 @@ fn smoke_abi_async_futex_wake_null() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_futex_wake_null);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wake_null);
 
 // ════════════════════════════════════════════════════════════════════
 // futex_wait(2) [futex2] — sys_futex_wait(uaddr, val, mask, flags, ...)
@@ -456,7 +520,7 @@ fn smoke_abi_async_futex_wait_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_futex_wait_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wait_pos);
 
 fn smoke_abi_async_futex_wait_neg() -> TestResult {
     with_setup(|| {
@@ -469,7 +533,7 @@ fn smoke_abi_async_futex_wait_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_futex_wait_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wait_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // futex_requeue(2) [futex2] — sys_futex_requeue(waiters, flags, nr_wake,
@@ -498,7 +562,7 @@ fn smoke_abi_async_futex_requeue_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_futex_requeue_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_requeue_pos);
 
 fn smoke_abi_async_futex_requeue_null() -> TestResult {
     with_setup(|| {
@@ -511,7 +575,7 @@ fn smoke_abi_async_futex_requeue_null() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_futex_requeue_null);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_requeue_null);
 
 // ════════════════════════════════════════════════════════════════════
 // futex_waitv(2) [futex2] — sys_futex_waitv(waiters, nr, flags, timeout,
@@ -536,7 +600,7 @@ fn smoke_abi_async_futex_waitv_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_futex_waitv_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_waitv_pos);
 
 fn smoke_abi_async_futex_waitv_neg() -> TestResult {
     with_setup(|| {
@@ -548,7 +612,7 @@ fn smoke_abi_async_futex_waitv_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_futex_waitv_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_waitv_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // inotify_init1(2) — sys_inotify_init1(flags)
@@ -566,7 +630,7 @@ fn smoke_abi_async_inotify_init1_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_init1_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_init1_pos);
 
 fn smoke_abi_async_inotify_init1_nonblock() -> TestResult {
     with_setup(|| {
@@ -577,7 +641,7 @@ fn smoke_abi_async_inotify_init1_nonblock() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_init1_nonblock);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_init1_nonblock);
 
 // ════════════════════════════════════════════════════════════════════
 // inotify_add_watch(2) — sys_inotify_add_watch(fd, path, mask)
@@ -602,7 +666,7 @@ fn smoke_abi_async_inotify_add_watch_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_add_watch_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_add_watch_pos);
 
 fn smoke_abi_async_inotify_add_watch_neg() -> TestResult {
     with_setup(|| {
@@ -615,7 +679,7 @@ fn smoke_abi_async_inotify_add_watch_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_add_watch_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_add_watch_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // inotify_rm_watch(2) — sys_inotify_rm_watch(fd, wd)
@@ -645,7 +709,7 @@ fn smoke_abi_async_inotify_rm_watch_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_rm_watch_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_rm_watch_pos);
 
 fn smoke_abi_async_inotify_rm_watch_neg() -> TestResult {
     with_setup(|| {
@@ -656,7 +720,7 @@ fn smoke_abi_async_inotify_rm_watch_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_rm_watch_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_rm_watch_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // inotify event delivery — a filesystem mutation on a watched directory
@@ -757,7 +821,7 @@ fn smoke_abi_async_inotify_fire_create() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_fire_create);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_fire_create);
 
 // (b) modify a watched file → IN_MODIFY on the watched file (no name).
 fn smoke_abi_async_inotify_fire_modify() -> TestResult {
@@ -780,7 +844,7 @@ fn smoke_abi_async_inotify_fire_modify() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_fire_modify);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_fire_modify);
 
 // (c) delete a file in a watched dir → IN_DELETE with the child's name.
 fn smoke_abi_async_inotify_fire_delete() -> TestResult {
@@ -797,7 +861,7 @@ fn smoke_abi_async_inotify_fire_delete() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_fire_delete);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_fire_delete);
 
 // (d) rename within a watched dir → paired IN_MOVED_FROM / IN_MOVED_TO
 // carrying the SAME cookie and the old/new leaf names.
@@ -827,7 +891,7 @@ fn smoke_abi_async_inotify_fire_rename() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_fire_rename);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_fire_rename);
 
 // (e) poll(2) on the inotify fd is NOT readable while the queue is empty
 // and BECOMES readable after a watched mutation queues an event.
@@ -854,7 +918,60 @@ fn smoke_abi_async_inotify_poll_readiness() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_poll_readiness);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_poll_readiness);
+
+fn smoke_abi_async_inotify_epollet_hidden_refill() -> TestResult {
+    with_memfs("/ino", "ino", &[], || {
+        let (ifd, _wd) = watch(b"/ino\0", IN_CREATE)?;
+        let epfd = call(Syscall::EpollCreate.raw(), a0(0))
+            .filter(|fd| *fd >= 0)
+            .ok_or("epoll_create1 failed")? as u64;
+        let mut event = [0u8; 12];
+        event[0..4].copy_from_slice(&(0x1u32 | (1u32 << 31)).to_ne_bytes());
+        event[4..12].copy_from_slice(&ifd.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd, 1, ifd, event.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("epoll_ctl(ADD inotify EPOLLET) failed");
+        }
+        let mut out = [0u8; 12];
+
+        if call_open(c"/ino/first".as_ptr() as u64, O_CREAT | O_WRONLY).is_none()
+            || call(
+                Syscall::EpollWait.raw(),
+                a3(epfd, out.as_mut_ptr() as u64, 1, 0),
+            ) != Some(1)
+        {
+            return Err("initial inotify edge was not delivered");
+        }
+        if read_events(ifd).is_empty() {
+            return Err("failed to drain first inotify event");
+        }
+        // Refill before epoll gets a chance to observe the empty queue.
+        if call_open(c"/ino/second".as_ptr() as u64, O_CREAT | O_WRONLY).is_none()
+            || call(
+                Syscall::EpollWait.raw(),
+                a3(epfd, out.as_mut_ptr() as u64, 1, 0),
+            ) != Some(1)
+        {
+            return Err("EPOLLET lost hidden inotify refill edge");
+        }
+        if call(
+            Syscall::EpollWait.raw(),
+            a3(epfd, out.as_mut_ptr() as u64, 1, 0),
+        ) != Some(0)
+        {
+            return Err("inotify refill edge was delivered more than once");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_inotify_epollet_hidden_refill
+);
 
 // (f) IN_ATTRIB — a chmod on a watched file queues an attribute event.
 fn smoke_abi_async_inotify_fire_attrib() -> TestResult {
@@ -881,7 +998,7 @@ fn smoke_abi_async_inotify_fire_attrib() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_inotify_fire_attrib);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_fire_attrib);
 
 // ════════════════════════════════════════════════════════════════════
 // fanotify_init(2) — sys_fanotify_init(flags, event_f_flags)
@@ -899,7 +1016,7 @@ fn smoke_abi_async_fanotify_init_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_fanotify_init_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_fanotify_init_pos);
 
 fn smoke_abi_async_fanotify_init_cloexec() -> TestResult {
     with_setup(|| {
@@ -910,7 +1027,7 @@ fn smoke_abi_async_fanotify_init_cloexec() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_fanotify_init_cloexec);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_fanotify_init_cloexec);
 
 // ════════════════════════════════════════════════════════════════════
 // fanotify_mark(2) — sys_fanotify_mark(fd, flags, mask, dirfd, path)
@@ -943,7 +1060,7 @@ fn smoke_abi_async_fanotify_mark_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_fanotify_mark_pos);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_fanotify_mark_pos);
 
 fn smoke_abi_async_fanotify_mark_neg() -> TestResult {
     with_setup(|| {
@@ -963,4 +1080,4 @@ fn smoke_abi_async_fanotify_mark_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_async_fanotify_mark_neg);
+kernel_test_in!("syscall_abi/async", smoke_abi_async_fanotify_mark_neg);

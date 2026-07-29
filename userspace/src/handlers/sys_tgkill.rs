@@ -8,9 +8,15 @@ use super::*;
 pub(crate) fn sys_tgkill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let tgid = args.arg0;
-    let tid = args.arg1;
-    let signum = args.arg2 as u32;
     let esrch = SyscallReturn::ok((-3i64) as u64);
+    let tid = match signal_tid_from_user(current_task_id(), args.arg1) {
+        Some(tid) => tid,
+        None => {
+            ctx.set_return(esrch);
+            return;
+        }
+    };
+    let signum = args.arg2 as u32;
     if signum > 64 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
@@ -25,7 +31,18 @@ pub(crate) fn sys_tgkill(ctx: &mut dyn TrapContext) {
     // tkill: it prevents a recycled tid in ANOTHER process from
     // absorbing the signal. Our tids never recycle, but the check is
     // still Linux-visible semantics (musl relies on ESRCH here).
-    if tgid != 0 && task_to_pid_raw(tid).unwrap_or(tid) != tgid {
+    let outer_tgid = if tgid == 0 {
+        0
+    } else {
+        match accept_pid_from(current_task_id(), tgid) {
+            Some(tgid) => tgid,
+            None => {
+                ctx.set_return(esrch);
+                return;
+            }
+        }
+    };
+    if outer_tgid != 0 && task_to_pid_raw(tid).unwrap_or(tid) != outer_tgid {
         ctx.set_return(esrch);
         return;
     }

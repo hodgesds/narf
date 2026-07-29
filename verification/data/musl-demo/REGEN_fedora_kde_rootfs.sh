@@ -48,20 +48,36 @@ set -e
 WORK="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$WORK/root"
 cp -f /etc/resolv.conf "$ROOT/etc/resolv.conf" 2>/dev/null || true
-exec unshare --user --map-auto --map-root-user --mount --pid --fork --kill-child \
-  /bin/bash -c '
-    set -e
-    ROOT="'"$ROOT"'"
-    mount --rbind /dev  "$ROOT/dev"
-    mount --rbind /sys  "$ROOT/sys"
-    mount -t proc proc  "$ROOT/proc"
-    mount -t tmpfs tmpfs "$ROOT/tmp"
-    mount --make-rslave "$ROOT/dev" || true
-    exec chroot "$ROOT" /usr/bin/env -i \
-      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-      HOME=/root TERM=dumb LANG=C.UTF-8 \
-      /bin/bash -l -c "$*"
-  ' -- "$@"
+if [ "$(id -u)" -eq 0 ]; then
+  mount --rbind /dev  "$ROOT/dev" 2>/dev/null || true
+  mount --rbind /sys  "$ROOT/sys" 2>/dev/null || true
+  mount -t proc proc  "$ROOT/proc" 2>/dev/null || true
+  mount -t tmpfs tmpfs "$ROOT/tmp" 2>/dev/null || true
+  chroot "$ROOT" /usr/bin/env -i \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/root TERM=dumb LANG=C.UTF-8 \
+    /bin/bash -l -c "$*"
+  RET=$?
+  for m in $(mount | grep "$ROOT" | awk '{print $3}' | sort -r); do
+    umount -l "$m" 2>/dev/null || true
+  done
+  exit $RET
+else
+  exec unshare --user --map-auto --map-root-user --mount --pid --fork --kill-child \
+    /bin/bash -c '
+      set -e
+      ROOT="'"$ROOT"'"
+      mount --rbind /dev  "$ROOT/dev"
+      mount --rbind /sys  "$ROOT/sys"
+      mount -t proc proc  "$ROOT/proc"
+      mount -t tmpfs tmpfs "$ROOT/tmp"
+      mount --make-rslave "$ROOT/dev" || true
+      exec chroot "$ROOT" /usr/bin/env -i \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        HOME=/root TERM=dumb LANG=C.UTF-8 \
+        /bin/bash -l -c "$*"
+    ' -- "$@"
+fi
 ENTEREOF
   chmod +x "$WORK/enter.sh"
 
@@ -71,6 +87,7 @@ ENTEREOF
       kwin-wayland plasma-breeze qt6-qtwayland \
       mesa-dri-drivers mesa-libgbm mesa-libEGL \
       dbus-daemon dbus-tools \
+      xrdb \
       bash coreutils util-linux procps-ng strace file less findutils \
       dejavu-sans-fonts kde-cli-tools konsole foot'
   "$WORK/enter.sh" 'dnf clean all'
@@ -92,81 +109,23 @@ rm -f "$WORK/root/usr/share/dbus-1/services/org.freedesktop.systemd1.service"
 # ld.so.cache: the image is built offline, so make sure it matches the tree.
 "$WORK/enter.sh" 'ldconfig' || true
 
-cat > "$WORK/root/narf-start.sh" <<'STARTEOF'
-#!/bin/bash
-# Fedora KDE launcher, run by /bin/distro_fedora after chroot("/mnt").
-# Stage 1 prints glibc-userland proof tokens; stage 2 launches Plasma.
-set -x
-
-echo "=== FED-STAGE1 fedora userland on NARF ==="
-cat /etc/os-release
-echo -n "uname: "; uname -sm
-echo -n "id: "; id
-echo "fedora-shell-ran"
-
-# The ext2 rootfs is read-mostly — put HOME and every XDG dir on the kernel's
-# writable /tmp tmpfs so kconfig locks, ksycoca and Qt caches actually write.
-export HOME=/tmp/kde-home
-export XDG_RUNTIME_DIR=/tmp/xdg-runtime
-export XDG_CACHE_HOME=$HOME/.cache
-export XDG_CONFIG_HOME=$HOME/.config
-export XDG_DATA_HOME=$HOME/.local/share
-export XDG_STATE_HOME=$HOME/.local/state
-mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
-         "$XDG_DATA_HOME" "$XDG_STATE_HOME"
-chmod 0700 "$XDG_RUNTIME_DIR"
-
-# Qt refuses to run in a non-UTF-8 locale and falls back with a warning.
-export LANG=C.UTF-8 LC_ALL=C.UTF-8
-
-# Fedora's Plasma prefers a systemd USER session and asks D-Bus to activate
-# org.freedesktop.systemd1. NARF runs no systemd, so that activation never
-# completes and startplasma sits there forever — take the classic ksmserver
-# startup path instead.
-cat > "$XDG_CONFIG_HOME/startkderc" <<'CFG'
-[General]
-systemdBoot=false
-CFG
-
-unset WAYLAND_DISPLAY            # KWin is the SERVER — it creates the socket.
-export KWIN_DRM_NO_AMS=1         # NARF has no atomic KMS — force legacy modeset.
-# Without logind/udev seat enumeration KWin finds no DRM device on its own
-# ("Failed to create gbm device for \"\"") — name the card explicitly.
-export KWIN_DRM_DEVICES=/dev/dri/card0
-export QT_QPA_PLATFORM=wayland
-export QT_LOGGING_RULES="kwin_*.debug=true"
-export XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=KDE
-# No GPU behind NARF's DRM (dumb buffers only) — force the software stack.
-export LIBGL_ALWAYS_SOFTWARE=1
-export GALLIUM_DRIVER=llvmpipe
-
-echo "=== FED-STAGE2 devices ==="
-ls -l /dev/dri /dev/input 2>&1
-# Build the service database up front: a missing ksycoca leaves every KDE
-# component resolving services against a fake empty stream.
-echo "=== FED-STAGE2 kbuildsycoca6 ==="
-kbuildsycoca6 --noincremental 2>&1 | tail -3
-echo "=== FED-STAGE2 launching startplasma-wayland (root) ==="
-dbus-run-session -- startplasma-wayland 2>&1
-echo "=== FED-STAGE2 startplasma exited rc=$? ==="
-STARTEOF
-chmod +x "$WORK/root/narf-start.sh"
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-systemd-start.sh" \
+  "$WORK/root/narf-start.sh"
 
 # ------------------------------------------------------------------ pack ---
-mkdir -p "$ROOT/target"
-rm -f "$OUT"
-echo "Creating ${IMG_MB} MiB ext2 image at $OUT..."
-# Plain ext2 with 1 KiB blocks and every ext3/ext4 feature off — NARF's ext2
-# driver refuses to mount a volume with an incompat bit it doesn't implement
-# (drivers/fs/ext2/src/superblock.rs::incompat::SUPPORTED).
-#
-# mke2fs -d runs inside the same fake-root userns as the install: rpm left
-# files owned by non-root uids and some (/etc/gshadow) mode 0000, which a
-# plain user can neither read nor reproduce the ownership of.
-unshare --user --map-auto --map-root-user \
-  mke2fs -q -F -t ext2 -b 1024 -I 128 \
-    -O ^has_journal,^extent,^64bit,^metadata_csum,^dir_index,^resize_inode,^huge_file,^flex_bg,^ext_attr \
-    -d "$WORK/root" "$OUT" "$((IMG_MB * 1024))"
+for m in $(mount | grep "$WORK/root" | awk '{print $3}' | sort -r); do
+  umount -l "$m" 2>/dev/null || true
+done
+
+if [ "$(id -u)" -eq 0 ]; then
+  UNSHARE_CMD=""
+else
+  UNSHARE_CMD="unshare --user --map-auto --map-root-user"
+fi
+$UNSHARE_CMD mke2fs -q -F -t ext2 -b 1024 -I 128 \
+  -O ^has_journal,^extent,^64bit,^metadata_csum,^dir_index,^resize_inode,^huge_file,^flex_bg,^ext_attr \
+  -d "$WORK/root" "$OUT" "$((IMG_MB * 1024))"
 
 echo "built $OUT ($(du -h "$OUT" | cut -f1)) — Fedora $FEDORA_VER KDE rootfs"
 echo "boot it with: NARF_VBLK_IMG=$OUT cargo xtask run-interactive ..."

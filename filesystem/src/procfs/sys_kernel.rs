@@ -200,6 +200,13 @@ fn write_randomize_va_space(v: &str) -> Result<(), FsError> {
     Ok(())
 }
 
+fn read_seccomp_actions_avail() -> String {
+    String::from("kill_process kill_thread trap errno user_notif trace log allow\n")
+}
+fn read_seccomp_actions_logged() -> String {
+    String::from("kill_process kill_thread trap errno user_notif trace log\n")
+}
+
 fn read_panic() -> String {
     format!("{}\n", PANIC_SECS.load(Ordering::Relaxed))
 }
@@ -392,6 +399,18 @@ pub fn register_all() {
         read: read_randomize_va_space,
         write: Some(write_randomize_va_space),
         perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/seccomp/actions_avail",
+        read: read_seccomp_actions_avail,
+        write: None,
+        perms: 0o444,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/seccomp/actions_logged",
+        read: read_seccomp_actions_logged,
+        write: None,
+        perms: 0o444,
     });
     register_sysctl(SysctlEntry {
         path: "kernel/panic",

@@ -46,3 +46,4 @@ qemu.log
 .codex/
 .mcp.json
 systemd_ctx.md
+.semcode-mcp.json

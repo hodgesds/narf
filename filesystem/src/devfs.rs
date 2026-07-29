@@ -55,6 +55,13 @@ struct MknodEntry {
 static MKNOD_NODES: IrqSafeSpinLock<alloc::collections::BTreeMap<String, MknodEntry>> =
     IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
 
+/// Runtime-created devtmpfs symlinks (for example journald's
+/// `/dev/log -> /run/systemd/journal/dev-log`). Static aliases remain in the
+/// match table below; this registry supplies the writable devtmpfs surface
+/// expected by systemd and udev.
+static SYMLINK_NODES: IrqSafeSpinLock<alloc::collections::BTreeMap<String, String>> =
+    IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
 /// FileOps for a `mknod`-created char/block node.
 struct MknodFile {
     entry: MknodEntry,
@@ -271,6 +278,34 @@ impl FileOps for DevZero {
 /// Callers wanting a stable view should fetch in a single large
 /// read; callers wanting tail-style updates can just keep reading
 /// past EOF (offset = current_len) on each iteration.
+/// Extract the human-readable message from a `/dev/kmsg` write. Linux's kmsg
+/// injection format is "<priority>,<seq>,<timestamp>,<flags>[,...];message":
+/// comma-separated numeric metadata, a ';', then the message. Strip the
+/// metadata prefix (only when it is exactly that shape) and the trailing
+/// newline; anything else is passed through verbatim so a bare
+/// `echo foo > /dev/kmsg` still shows "foo".
+fn kmsg_visible_message(buf: &[u8]) -> &str {
+    let text = core::str::from_utf8(buf).unwrap_or("");
+    // The record header is "<priority>,<seq>,<timestamp>,<flags>;" — the flags
+    // field can be non-numeric (e.g. "-" or "c"), so only require the FIRST
+    // comma-separated field (priority) to be all digits and the header to be
+    // comma-separated. That distinguishes a real record from a bare
+    // `echo foo;bar > /dev/kmsg`, which is passed through untouched.
+    let msg = match text.split_once(';') {
+        Some((meta, rest))
+            if meta.contains(',')
+                && meta
+                    .split(',')
+                    .next()
+                    .is_some_and(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            rest
+        }
+        _ => text,
+    };
+    msg.trim_end_matches('\n')
+}
+
 struct DevKmsg;
 
 impl FileOps for DevKmsg {
@@ -298,8 +333,19 @@ impl FileOps for DevKmsg {
     }
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        // Accept-and-discard so `echo foo > /dev/kmsg` doesn't error.
+        // Forward the message to the console (which also records into klog, so
+        // a later /dev/kmsg read reflects it). systemd's kmsg log target — used
+        // by PID 1 and, crucially, by sd-executor for pre-exec failures like the
+        // mount-namespace error path — writes here; echoing surfaces those on
+        // the serial capture. The Linux kmsg record format is
+        // "<priority>,<seq>,<ts>,<flags>;message"; strip the leading metadata up
+        // to the first ';' so the human-readable message is what's shown.
         let len = buf.len();
+        let msg = kmsg_visible_message(buf);
+        if !msg.is_empty() {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "kmsg: {msg}");
+        }
         Box::pin(async move { Ok(len) })
     }
 
@@ -1047,12 +1093,12 @@ impl FileOps for DevConsole {
 // whose stat() reports `FileType::Symlink` by reading its target and
 // re-resolving, so a simple readable node with the right stat suffices.
 
-/// A static symlink inside /dev — stat() is S_IFLNK, read() returns the
+/// A symlink inside /dev — stat() is S_IFLNK, read() returns the
 /// target string verbatim (the shape sys_readlink and resolve_async use).
 #[derive(Debug)]
 struct DevSymlink {
     /// Symlink target (absolute path).
-    target: &'static str,
+    target: String,
 }
 
 impl FileOps for DevSymlink {
@@ -1117,28 +1163,43 @@ impl DirOps for DevEmptyDir {
 struct DevDir;
 
 impl DirOps for DevDir {
-    fn symlink<'a>(&'a self, name: &'a str, _target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         if self.lookup(name).is_some() {
             Box::pin(async move { Err(FsError::Busy) })
         } else {
-            Box::pin(async move { Err(FsError::ReadOnly) })
+            SYMLINK_NODES.lock().insert(name.into(), target.into());
+            let file = Arc::new(DevSymlink {
+                target: target.into(),
+            }) as Arc<dyn FileOps>;
+            Box::pin(async move { Ok(file) })
         }
+    }
+
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        let removed = SYMLINK_NODES.lock().remove(name).is_some();
+        Box::pin(async move {
+            if removed {
+                Ok(())
+            } else {
+                Err(FsError::NotFound)
+            }
+        })
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         match name {
             // Static symlinks [[devfs-symlinks]].
             "fd" => Some(Arc::new(DevSymlink {
-                target: "/proc/self/fd",
+                target: "/proc/self/fd".into(),
             }) as Arc<dyn FileOps>),
             "stdin" => Some(Arc::new(DevSymlink {
-                target: "/proc/self/fd/0",
+                target: "/proc/self/fd/0".into(),
             }) as Arc<dyn FileOps>),
             "stdout" => Some(Arc::new(DevSymlink {
-                target: "/proc/self/fd/1",
+                target: "/proc/self/fd/1".into(),
             }) as Arc<dyn FileOps>),
             "stderr" => Some(Arc::new(DevSymlink {
-                target: "/proc/self/fd/2",
+                target: "/proc/self/fd/2".into(),
             }) as Arc<dyn FileOps>),
             "null" => Some(Arc::new(DevNull) as Arc<dyn FileOps>),
             "zero" => Some(Arc::new(DevZero) as Arc<dyn FileOps>),
@@ -1169,7 +1230,7 @@ impl DirOps for DevDir {
             // devfs has a DevSymlink node type [[devfs-symlinks]]).
             "rtc0" => Some(Arc::new(crate::devfs_rtc::DevRtc) as Arc<dyn FileOps>),
             "rtc" => Some(Arc::new(DevSymlink {
-                target: "/dev/rtc0",
+                target: "/dev/rtc0".into(),
             }) as Arc<dyn FileOps>),
             // Dynamic: ttyUSB<N> USB-to-serial ports.
             // Linux ref: `drivers/usb/serial/usb-serial.c:tty_port_register_device`.
@@ -1190,7 +1251,15 @@ impl DirOps for DevDir {
             // Covers registered names like "nvme0", "sata0p1", "vblk0", etc.
             _ => crate::devfs_block::lookup_block_file(name)
                 // Then any node udev created via mknod (coldplug /dev nodes).
-                .or_else(|| mknod_lookup(name)),
+                .or_else(|| mknod_lookup(name))
+                // Finally runtime-created devtmpfs symlinks.
+                .or_else(|| {
+                    SYMLINK_NODES
+                        .lock()
+                        .get(name)
+                        .cloned()
+                        .map(|target| Arc::new(DevSymlink { target }) as Arc<dyn FileOps>)
+                }),
         }
     }
 
@@ -1419,6 +1488,12 @@ impl DirOps for DevDir {
             .into_iter()
             .filter(|(name, _)| !static_names.iter().any(|s| s == name))
             .collect();
+        let symlink_extras: Vec<(String, FileType)> = SYMLINK_NODES
+            .lock()
+            .keys()
+            .filter(|name| !static_names.iter().any(|s| s == *name))
+            .map(|name| (name.clone(), FileType::Symlink))
+            .collect();
 
         static_entries
             .iter()
@@ -1428,6 +1503,7 @@ impl DirOps for DevDir {
             .chain(tty_usb_extras)
             .chain(video_extras)
             .chain(mknod_extras)
+            .chain(symlink_extras)
             .skip(cursor)
             .take(max)
             .collect()
@@ -1514,6 +1590,60 @@ fn smoke_dev_fd_is_symlink() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_fd_is_symlink);
+
+/// `/dev/kmsg` writes strip the Linux "<pri>,<seq>,<ts>,<flags>;" metadata
+/// prefix so the human-readable message is what gets echoed, while non-record
+/// text (a bare `echo`) and malformed prefixes pass through unchanged.
+fn smoke_dev_kmsg_visible_message_strips_meta() -> TestResult {
+    // Canonical systemd record: metadata, ';', message, trailing newline.
+    if kmsg_visible_message(b"6,42,12345,-;hello udev\n") != "hello udev" {
+        return TestResult::Fail("kmsg metadata prefix not stripped");
+    }
+    // Bare echo (no ';'): passed through verbatim (minus trailing newline).
+    if kmsg_visible_message(b"just a line\n") != "just a line" {
+        return TestResult::Fail("bare kmsg line not preserved");
+    }
+    // A ';' whose left side isn't pure numeric metadata must NOT be stripped.
+    if kmsg_visible_message(b"key=val;more") != "key=val;more" {
+        return TestResult::Fail("non-metadata prefix wrongly stripped");
+    }
+    // Empty write yields an empty message (nothing echoed).
+    if !kmsg_visible_message(b"").is_empty() {
+        return TestResult::Fail("empty kmsg write not empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs",
+    smoke_dev_kmsg_visible_message_strips_meta
+);
+
+/// devtmpfs is writable for runtime aliases such as journald's `/dev/log`.
+fn smoke_dev_runtime_symlink_create_lookup_unlink() -> TestResult {
+    let dir = DevDir;
+    let name = "log-test";
+    let target = "/run/systemd/journal/dev-log";
+    let created = poll_once_devfs(dir.symlink(name, target));
+    match created {
+        Some(Ok(file)) if file.stat().mode.file_type == FileType::Symlink => {}
+        _ => return TestResult::Fail("devfs runtime symlink create failed"),
+    }
+    match dir.lookup(name) {
+        Some(file) if file.stat().size == target.len() as u64 => {}
+        _ => return TestResult::Fail("devfs runtime symlink lookup failed"),
+    }
+    if !matches!(poll_once_devfs(dir.unlink(name)), Some(Ok(()))) {
+        return TestResult::Fail("devfs runtime symlink unlink failed");
+    }
+    if dir.lookup(name).is_some() {
+        return TestResult::Fail("devfs runtime symlink survived unlink");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs",
+    smoke_dev_runtime_symlink_create_lookup_unlink
+);
 
 /// Smoke: /dev/{shm,mqueue,hugepages} exist as (empty) mountpoint-stub
 /// directories that an init O_PATH-opens to mount tmpfs / mqueue /

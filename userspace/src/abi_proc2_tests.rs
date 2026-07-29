@@ -303,24 +303,27 @@ fn smoke_abi_proc2_waitid_ppid_no_child() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_waitid_ppid_no_child);
 
-fn smoke_abi_proc2_waitid_blocking_fallback() -> TestResult {
+fn smoke_abi_proc2_waitid_blocking_without_executor_echild() -> TestResult {
     with_setup(|| {
-        // waitid with NO WNOHANG and no child: there is no UserTaskCtx / yield
-        // hook in the harness, so the blocking arm falls through to the
-        // "report no child" fallback (ok(0)) rather than parking. This pins
-        // the no-future fallback the base file's WNOHANG-only case skips.
+        // waitid with NO WNOHANG and no child must not claim a successful
+        // reap: that would leave a zeroed siginfo_t which userspace reads as
+        // an unknown child state. Linux returns ECHILD when no eligible child
+        // exists; the kernel-test harness has no executor on which to park.
         const P_ALL: u64 = 0;
         let mut si = [0u8; 128];
         match call(
             Syscall::Waitid.raw(),
             a3(P_ALL, 0, si.as_mut_ptr() as u64, 0),
         ) {
-            Some(0) => Ok(()),
-            _ => Err("waitid blocking fallback (no future) did not return 0"),
+            Some(v) if v == ECHILD => Ok(()),
+            _ => Err("waitid without a child/executor did not return -ECHILD"),
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc2_waitid_blocking_fallback);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_waitid_blocking_without_executor_echild
+);
 
 // ── waitid(2) — WNOWAIT peek leaves the zombie reapable ──
 
@@ -488,13 +491,58 @@ fn smoke_abi_proc2_unshare_newns() -> TestResult {
         // mounts, records the entry (any = true) and returns 0. The base file
         // only covers the flags == 0 no-op success.
         const CLONE_NEWNS: u64 = 0x0002_0000;
-        match call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) {
+        let result = match call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) {
             Some(0) => Ok(()),
             _ => Err("unshare(CLONE_NEWNS) did not return 0"),
-        }
+        };
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_unshare_newns);
+
+fn smoke_abi_proc2_unshare_newns_copies_current_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("first unshare(CLONE_NEWNS) failed");
+            }
+            let first = match crate::handlers::current_mount_namespace() {
+                Some(ns) => ns,
+                None => return Err("first unshare did not install a namespace"),
+            };
+            let auth = narf_filesystem::bootstrap_mount_authority();
+            let private: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                alloc::sync::Arc::new(narf_filesystem::VirtiofsMount::new("nested-private"));
+            if first.mount_arc(&auth, "/nested-private", private).is_err() {
+                return Err("private mount setup failed");
+            }
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("second unshare(CLONE_NEWNS) failed");
+            }
+            let second = match crate::handlers::current_mount_namespace() {
+                Some(ns) => ns,
+                None => return Err("second unshare did not install a namespace"),
+            };
+            if alloc::sync::Arc::ptr_eq(&first, &second) {
+                return Err("unshare must create an independent mount table");
+            }
+            match second.resolve_absolute("/nested-private", |fs, rel| {
+                rel.is_empty() && fs.name() == "nested-private"
+            }) {
+                Some(true) => Ok(()),
+                _ => Err("nested unshare must copy mounts from the current namespace"),
+            }
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_unshare_newns_copies_current_namespace
+);
 
 // ── prctl PR_SET/GET_PDEATHSIG + PR_SET/GET_CHILD_SUBREAPER ──
 
@@ -591,3 +639,436 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_pdeathsig_and_subreaper_on_exit
 );
+
+// ── /proc/<pid>/* end-to-end renderer coverage ──────────────────────
+//
+// The per-pid procfs renderers (stat/status/statm/comm/cmdline, the fd/
+// directory and the root magic symlink) live behind private structs in
+// `narf_filesystem::procfs`; the only public seam that drives the FULL
+// stack (path resolver → the kernel task_info hook → renderer) is a real
+// `open("<base>/<pid>/<file>")` + `read()` against a mounted `ProcFs`.
+// `with_procfs` mounts ProcFs at a pid-unique base (so a boot-mounted
+// `/proc` never makes the mount `Busy`), wires only the hooks the
+// renderers need (TASK_INFO/CURRENT_PID/LIST_PIDS + FD_PATH via the
+// snapshot/restore seam), registers a synthetic task with a KNOWN comm /
+// argv / parent, and asserts the rendered output matches that known state
+// — field counts + key fields, never brittle full strings. pid == tid
+// identity (like FAKE_TASK) so the TaskId-keyed comm/argv/fd tables and
+// the pid-keyed PARENT_OF row agree. Every hook this helper installs is
+// undone on exit so the filesystem crate's un-hooked-slot assertions
+// (`smoke_fd_lookup_no_hook_returns_none` etc.) still hold.
+
+/// Wire the procfs per-pid hooks to the real handlers, mount `ProcFs` at a
+/// UNIQUE per-pid path, run `body` (passed that mount base, e.g.
+/// `/proc_test_22343`), then unmount + release the synthetic task and undo
+/// every hook this helper installs.
+///
+/// Two properties this helper must preserve for the full kernel-test run:
+///
+///   * **Mount is Busy-proof.** In the full boot `/proc` is already
+///     mounted, so `registry().mount("/proc", ..)` returns `Busy`. Mounting
+///     at a pid-unique base (`/proc_test_<pid>`) always succeeds and still
+///     drives the identical resolver → task_info hook → renderer stack,
+///     because ProcFs resolves paths relative to its mount point.
+///
+///   * **No leaked global hook state.** The procfs hook slots are
+///     process-global `AtomicUsize` fn-pointer stores with no boot-time
+///     install in a `kernel-test` build (the harness runs before
+///     `install_all_hooks`). `install_proc_ext_hooks` / `install_proc_path_hooks`
+///     would leave FD_PATH / EXE_PATH / CWD_PATH / ENVIRON installed, which
+///     the filesystem crate's `smoke_fd_lookup_no_hook_returns_none`,
+///     `smoke_magic_links_empty_without_hook`, and `smoke_environ_empty_without_hook`
+///     tests assert are ABSENT. So this helper installs only what the
+///     renderers under test need and what it can undo:
+///       - `install_proc_hooks` (TASK_INFO / CURRENT_PID / LIST_PIDS) — no
+///         test asserts these absent, and `pid_resolve`/`current_outer_pid`
+///         fall back to identity when the pidns hooks are unset, so numeric
+///         `/proc/<pid>/*` and `/proc/self/*` both resolve without them.
+///       - FD_PATH — the only ext/path hook needed here (the fd-symlink
+///         test). It is the one hook with a snapshot/restore seam, so it is
+///         saved before and restored after every call.
+///
+/// The exe/cwd/root magic links and the ext (rlimits/nice/environ/auxv)
+/// hooks are deliberately NOT installed: root defaults to "/" un-hooked and
+/// no test here reads exe/cwd/environ/rlimits.
+fn with_procfs(
+    pid: u64,
+    comm: &str,
+    argv: &[&str],
+    parent: u64,
+    body: impl FnOnce(&str) -> Result<(), &'static str>,
+) -> TestResult {
+    setup();
+    // TASK_INFO / CURRENT_PID / LIST_PIDS — needed by every renderer and by
+    // `/proc/self` resolution; none has a hook-absent assertion elsewhere.
+    narf_filesystem::procfs::install_proc_hooks(
+        crate::handlers::proc_current_pid,
+        crate::handlers::proc_list_pids,
+        crate::handlers::proc_task_info,
+    );
+    // FD_PATH: snapshot so we can restore the exact prior slot (0 in a
+    // kernel-test build) after the test, keeping the un-hooked fd-lookup
+    // assertion valid. Install by re-pointing through the restore seam.
+    let fd_path_prev = narf_filesystem::procfs::__test_fd_path_hook_snapshot();
+    narf_filesystem::procfs::__test_fd_path_hook_restore(crate::handlers::fd_path_of as usize);
+    // Synthetic task with pid == tid identity + a real registry entry so
+    // proc_task_info's liveness gate resolves it in every state.
+    if pid != FAKE_TASK {
+        crate::handlers::register_task_to_pid(pid, pid);
+        crate::handlers::register_pid_task_mapping(pid, pid);
+        if crate::task::task_get(pid).is_none() {
+            let _ = crate::task::Task::new_registered(pid, pid);
+        }
+    }
+    crate::handlers::set_proc_comm(pid, comm);
+    crate::handlers::set_proc_argv(pid, argv);
+    crate::handlers::__test_inject_parent_of(pid, parent);
+
+    // Pid-unique mount base so a boot-mounted (or prior-test) `/proc` never
+    // makes this `Busy`.
+    let base = alloc::format!("/proc_test_{}", pid);
+    let auth = bootstrap_mount_authority();
+    let handle = match registry().mount(&auth, &base, narf_filesystem::procfs::ProcFs) {
+        Ok(h) => h,
+        Err(_) => {
+            narf_filesystem::procfs::__test_fd_path_hook_restore(fd_path_prev);
+            teardown();
+            return TestResult::Fail("procfs mount failed");
+        }
+    };
+    let outcome = body(&base);
+    let _ = registry().unmount(&handle, &base);
+    // Undo the FD_PATH install so `smoke_fd_lookup_no_hook_returns_none`
+    // still sees the slot unhooked.
+    narf_filesystem::procfs::__test_fd_path_hook_restore(fd_path_prev);
+    if pid != FAKE_TASK {
+        crate::handlers::release_reaped_task(pid);
+    }
+    teardown();
+    match outcome {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+
+/// Read a whole small `/proc` file into `out`, returning the byte count.
+/// `path` is the NUL-terminated absolute path bytes. The per-pid renderers
+/// are all well under 4 KiB, so a single read at offset 0 captures the
+/// entire file.
+fn read_proc_file(path: &[u8], out: &mut [u8]) -> Result<usize, &'static str> {
+    let fd = match call_open(path.as_ptr() as u64, 0) {
+        Some(fd) if fd >= 0 => fd as u64,
+        _ => return Err("open of /proc file failed"),
+    };
+    let n = match call(
+        Syscall::Read.raw(),
+        a2(fd, out.as_mut_ptr() as u64, out.len() as u64),
+    ) {
+        Some(n) if n >= 0 => n as usize,
+        _ => return Err("read of /proc file failed"),
+    };
+    Ok(n)
+}
+
+// ── /proc/<pid>/stat — field count + leading fields match known state ──
+
+fn smoke_abi_proc2_pid_stat_fields() -> TestResult {
+    const PID: u64 = 0x5747;
+    const PARENT: u64 = 0x5740;
+    with_procfs(PID, "statproc", &["statproc"], PARENT, |base| {
+        let mut buf = [0u8; 512];
+        let path = alloc::format!("{}/{}/stat\0", base, PID);
+        let n = read_proc_file(path.as_bytes(), &mut buf)?;
+        let s = core::str::from_utf8(&buf[..n]).map_err(|_| "stat not utf-8")?;
+        let line = s.trim_end_matches('\n');
+        // The comm field is parenthesised and may contain spaces; Linux
+        // parsers split on the LAST ')'. pid before '(', the rest after.
+        let open = line.find('(').ok_or("stat missing '(' around comm")?;
+        let close = line.rfind(')').ok_or("stat missing ')' around comm")?;
+        let pid_field = line[..open].trim();
+        let comm_field = &line[open + 1..close];
+        let rest: alloc::vec::Vec<&str> = line[close + 1..].split_whitespace().collect();
+        // Field 1: pid echoes /proc/<N>.
+        if pid_field != "22343" {
+            return Err("stat field 1 (pid) does not echo /proc/<N>");
+        }
+        // Field 2: comm without the parens.
+        if comm_field != "statproc" {
+            return Err("stat comm field does not match the known comm");
+        }
+        // After the comm there are 50 more fields (Linux has 52 total; we
+        // render the full 52-column line). rest[0]=state, [1]=ppid,
+        // [2]=pgrp, [3]=session.
+        if rest.len() != 50 {
+            return Err("stat must render 50 fields after (comm)");
+        }
+        if rest[0] != "R" {
+            return Err("stat state field (3) is not R for a running task");
+        }
+        if rest[1] != "22336" {
+            return Err("stat ppid field (4) does not match the injected parent");
+        }
+        // pgrp + session are non-negative integers.
+        if rest[2].parse::<u64>().is_err() || rest[3].parse::<u64>().is_err() {
+            return Err("stat pgrp/session fields (5/6) are not integers");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_stat_fields);
+
+// ── /proc/<pid>/status — key lines present + consistent with stat ──
+
+fn smoke_abi_proc2_pid_status_lines() -> TestResult {
+    const PID: u64 = 0x5748;
+    const PARENT: u64 = 0x5741;
+    with_procfs(PID, "statusproc", &["statusproc"], PARENT, |base| {
+        let mut buf = [0u8; 2048];
+        let path = alloc::format!("{}/{}/status\0", base, PID);
+        let n = read_proc_file(path.as_bytes(), &mut buf)?;
+        let s = core::str::from_utf8(&buf[..n]).map_err(|_| "status not utf-8")?;
+        // Name: matches comm.
+        let name = s
+            .lines()
+            .find_map(|l| l.strip_prefix("Name:\t"))
+            .ok_or("status missing Name: line")?;
+        if name != "statusproc" {
+            return Err("status Name: does not match the known comm");
+        }
+        // State: leading char R (running).
+        let state = s
+            .lines()
+            .find_map(|l| l.strip_prefix("State:\t"))
+            .ok_or("status missing State: line")?;
+        if !state.starts_with('R') {
+            return Err("status State: is not R for a running task");
+        }
+        // Pid: echoes /proc/<N>.
+        let pidl = s
+            .lines()
+            .find_map(|l| l.strip_prefix("Pid:\t"))
+            .ok_or("status missing Pid: line")?;
+        if pidl.trim() != "22344" {
+            return Err("status Pid: does not echo /proc/<N>");
+        }
+        // PPid: matches the injected parent (0x5741 = 22337).
+        let ppidl = s
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:\t"))
+            .ok_or("status missing PPid: line")?;
+        if ppidl.trim() != "22337" {
+            return Err("status PPid: does not match the injected parent");
+        }
+        // Uid:/Gid: are 4-column tab-separated quads of integers.
+        for key in ["Uid:\t", "Gid:\t"] {
+            let l = s
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .ok_or("status missing Uid:/Gid: line")?;
+            let cols: alloc::vec::Vec<&str> = l.split('\t').collect();
+            if cols.len() != 4 || cols.iter().any(|c| c.parse::<u32>().is_err()) {
+                return Err("status Uid:/Gid: is not a 4-column integer quad");
+            }
+        }
+        // VmSize:/VmRSS: present and " kB"-suffixed.
+        for key in ["VmSize:", "VmRSS:"] {
+            let l = s
+                .lines()
+                .find(|l| l.starts_with(key))
+                .ok_or("status missing VmSize:/VmRSS: line")?;
+            if !l.trim_end().ends_with("kB") {
+                return Err("status VmSize:/VmRSS: is not kB-suffixed");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_status_lines);
+
+// ── /proc/<pid>/statm — exactly 7 integer fields ──
+
+fn smoke_abi_proc2_pid_statm_seven_ints() -> TestResult {
+    const PID: u64 = 0x5749;
+    with_procfs(PID, "statmproc", &["statmproc"], 0, |base| {
+        let mut buf = [0u8; 256];
+        let path = alloc::format!("{}/{}/statm\0", base, PID);
+        let n = read_proc_file(path.as_bytes(), &mut buf)?;
+        let s = core::str::from_utf8(&buf[..n]).map_err(|_| "statm not utf-8")?;
+        let line = s.trim_end_matches('\n');
+        let fields: alloc::vec::Vec<&str> = line.split(' ').collect();
+        if fields.len() != 7 {
+            return Err("statm must render exactly 7 space-separated fields");
+        }
+        if fields.iter().any(|f| f.parse::<u64>().is_err()) {
+            return Err("statm fields must all be non-negative integers");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_statm_seven_ints);
+
+// ── /proc/<pid>/comm — matches the process comm (+ 15-byte truncation) ──
+
+fn smoke_abi_proc2_pid_comm_matches() -> TestResult {
+    const PID: u64 = 0x574a;
+    with_procfs(PID, "commproc", &["commproc"], 0, |base| {
+        let mut buf = [0u8; 64];
+        let path = alloc::format!("{}/{}/comm\0", base, PID);
+        let n = read_proc_file(path.as_bytes(), &mut buf)?;
+        let s = core::str::from_utf8(&buf[..n]).map_err(|_| "comm not utf-8")?;
+        if s.trim_end_matches('\n') == "commproc" {
+            Ok(())
+        } else {
+            Err("/proc/<pid>/comm did not match the known comm")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_comm_matches);
+
+fn smoke_abi_proc2_pid_comm_truncated_to_15() -> TestResult {
+    const PID: u64 = 0x574b;
+    // 20 chars in; TASK_COMM_LEN-1 = 15 kept (set_proc_comm truncates).
+    with_procfs(PID, "abcdefghijklmnopqrst", &["x"], 0, |base| {
+        let mut buf = [0u8; 64];
+        let path = alloc::format!("{}/{}/comm\0", base, PID);
+        let n = read_proc_file(path.as_bytes(), &mut buf)?;
+        let s = core::str::from_utf8(&buf[..n]).map_err(|_| "comm not utf-8")?;
+        let name = s.trim_end_matches('\n');
+        if name == "abcdefghijklmno" {
+            Ok(())
+        } else {
+            Err("/proc/<pid>/comm was not truncated to 15 bytes")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_comm_truncated_to_15);
+
+// ── /proc/<pid>/cmdline — NUL-separated argv ──
+
+fn smoke_abi_proc2_pid_cmdline_nul_separated() -> TestResult {
+    const PID: u64 = 0x574c;
+    with_procfs(PID, "cmdproc", &["/bin/cmdproc", "-x", "arg"], 0, |base| {
+        let mut buf = [0u8; 256];
+        let path = alloc::format!("{}/{}/cmdline\0", base, PID);
+        let n = read_proc_file(path.as_bytes(), &mut buf)?;
+        let raw = &buf[..n];
+        // Linux /proc/<pid>/cmdline: argv joined by NULs (trailing NUL after
+        // the last arg). Split on NUL and drop the empty tail.
+        let mut parts: alloc::vec::Vec<&[u8]> = raw.split(|&b| b == 0).collect();
+        while parts.last() == Some(&&b""[..]) {
+            parts.pop();
+        }
+        if parts.len() != 3 {
+            return Err("cmdline did not split into 3 NUL-separated argv entries");
+        }
+        if parts[0] != b"/bin/cmdproc" || parts[1] != b"-x" || parts[2] != b"arg" {
+            return Err("cmdline argv entries do not match the known argv");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_cmdline_nul_separated);
+
+// ── /proc/<pid>/fd/ — lists open fds; fd/N symlinks to its backing path ──
+
+fn smoke_abi_proc2_pid_fd_lists_and_symlinks() -> TestResult {
+    // Use FAKE_TASK (pid == tid) so the fd table the harness opens into is
+    // the same TaskId proc_fd_list / fd_path_of resolve.
+    with_procfs(FAKE_TASK, "fdproc", &["fdproc"], 0, |base| {
+        // Seed a real backing file and open it in the caller's fd table.
+        let auth = bootstrap_mount_authority();
+        let fs = narf_filesystem::MemFs::with_seeds("fdm", &[("f", b"hi")]);
+        let mh = registry()
+            .mount(&auth, "/fdm", fs)
+            .map_err(|_| "backing memfs mount failed")?;
+        let result = (|| {
+            let backing = b"/fdm/f\0";
+            let srcfd = match call_open(backing.as_ptr() as u64, 0) {
+                Some(fd) if fd >= 0 => fd as u32,
+                _ => return Err("open of backing file failed"),
+            };
+            // /proc/<pid>/fd/<srcfd> readlinks to the recorded backing path.
+            let link_path = alloc::format!("{}/{}/fd/{}\0", base, FAKE_TASK, srcfd);
+            let mut tbuf = [0u8; 128];
+            let tn = call_readlink(
+                link_path.as_ptr() as u64,
+                tbuf.as_mut_ptr() as u64,
+                tbuf.len() as u64,
+            );
+            let tn = match tn {
+                Some(v) if v > 0 => v as usize,
+                _ => return Err("readlink of /proc/<pid>/fd/<n> failed"),
+            };
+            let target =
+                core::str::from_utf8(&tbuf[..tn]).map_err(|_| "fd link target not utf-8")?;
+            if !target.ends_with("/fdm/f") {
+                return Err("/proc/<pid>/fd/<n> did not symlink to the backing path");
+            }
+            // The fd-list hook reports srcfd as an open fd for this task.
+            let fds = crate::handlers::proc_fd_list(FAKE_TASK);
+            if !fds.contains(&srcfd) {
+                return Err("proc_fd_list did not list the freshly opened fd");
+            }
+            Ok(())
+        })();
+        let _ = registry().unmount(&mh, "/fdm");
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_fd_lists_and_symlinks);
+
+// ── /proc/self resolves to the calling pid ──
+
+fn smoke_abi_proc2_proc_self_is_caller() -> TestResult {
+    with_procfs(FAKE_TASK, "selfproc", &["selfproc"], 0, |base| {
+        // <base>/self/comm must render THIS task's comm — proving /proc/self
+        // resolved to the caller's pid (FAKE_TASK).
+        let mut buf = [0u8; 64];
+        let comm_path = alloc::format!("{}/self/comm\0", base);
+        let n = read_proc_file(comm_path.as_bytes(), &mut buf)?;
+        let s = core::str::from_utf8(&buf[..n]).map_err(|_| "self/comm not utf-8")?;
+        if s.trim_end_matches('\n') != "selfproc" {
+            return Err("/proc/self/comm did not render the caller's comm");
+        }
+        // And <base>/self/stat's pid field 1 equals FAKE_TASK.
+        let mut sbuf = [0u8; 512];
+        let stat_path = alloc::format!("{}/self/stat\0", base);
+        let sn = read_proc_file(stat_path.as_bytes(), &mut sbuf)?;
+        let st = core::str::from_utf8(&sbuf[..sn]).map_err(|_| "self/stat not utf-8")?;
+        let pid_field = st.split(' ').next().unwrap_or("");
+        if pid_field != alloc::format!("{}", FAKE_TASK) {
+            return Err("/proc/self/stat pid field is not the caller's pid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_proc_self_is_caller);
+
+// ── /proc/<pid>/root symlink defaults to "/" (exe/cwd unimplemented here) ──
+//
+// exe/cwd render empty when no exec/cwd is recorded for the synthetic task
+// (hook_exe_path / hook_cwd_path return None → empty target), so only the
+// root magic link — which defaults to "/" — is asserted end-to-end.
+fn smoke_abi_proc2_pid_root_symlink_default() -> TestResult {
+    const PID: u64 = 0x574d;
+    with_procfs(PID, "rootproc", &["rootproc"], 0, |base| {
+        let mut buf = [0u8; 64];
+        let path = alloc::format!("{}/{}/root\0", base, PID);
+        let n = call_readlink(
+            path.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        );
+        let n = match n {
+            Some(v) if v > 0 => v as usize,
+            _ => return Err("readlink of /proc/<pid>/root failed"),
+        };
+        let target = core::str::from_utf8(&buf[..n]).map_err(|_| "root link not utf-8")?;
+        if target == "/" {
+            Ok(())
+        } else {
+            Err("/proc/<pid>/root did not default to '/'")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_root_symlink_default);

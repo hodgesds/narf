@@ -31,21 +31,79 @@ pub fn spawn_process(elf: &Elf, caps: CapBundle) -> Cap<Process, Own>;
 pub fn exec_into(proc: &Process, arg0: &str, argv: &[&str], env: &[&str]);
 ```
 
+`load_user_process_with_root` is the kernel-boot counterpart to an exec under
+an already-established process root: it resolves a filesystem-backed
+`PT_INTERP` beneath an explicit mounted-root prefix, and the caller installs
+that same root on the reserved task before making it runnable. This permits a
+dynamic service manager to be the direct PID 1 without a userspace chroot
+launcher.
+
 The Linux-compatibility syscall surface includes stored `prctl(2)` process
 state required by service managers and brokers. Capability-shaped controls
 such as `PR_SET_KEEPCAPS` round-trip according to the Linux ABI but do not mint
 or retain NARF capabilities; authority remains capability-object based.
-Likewise, `SO_PEERSEC`, `SO_PEERGROUPS`, and `SO_PEERPIDFD` report
-`ENOPROTOOPT` while NARF has no Linux Security Module label provider,
-socket-stamped supplementary group list, or retained peer pidfd; the
-compatibility layer never fabricates security identity.
+`SO_PEERSEC` and `SO_PEERPIDFD` report `ENOPROTOOPT` while NARF has no Linux
+Security Module label provider or retained peer pidfd; the compatibility layer
+never fabricates security identity. Supplementary groups are stored per task,
+inherited across fork/clone, replaced and queried by `setgroups(2)` and
+`getgroups(2)`, and captured on Unix endpoints at listen/connect/socketpair
+time. `SO_PEERGROUPS` returns that immutable peer snapshot, translated into
+the reader's user namespace; an undersized option buffer returns `ERANGE`.
 AF_UNIX stream clients may bind a local pathname or abstract address before
 `connect(2)`; binding does not put the socket into listening state. Connected
 stream receive operations honor `MSG_PEEK` without consuming queued bytes.
+Connected AF_UNIX `SOCK_SEQPACKET` and datagram socketpairs retain one record
+per send; receive consumes at most one record and reports truncation through
+the existing `MSG_TRUNC` result path. Per-record `SCM_RIGHTS` and
+`SCM_CREDENTIALS` remain associated with that record; credentials snapshot the
+sender's effective identity at send time. `SO_PEERCRED` snapshots connection
+identity at `connect`/`listen`/`socketpair`. Stored credentials are
+host-absolute and are translated into the receiving task's PID/user namespace,
+with unmapped uid/gid values reported as the overflow id.
+Invalid SCM_RIGHTS descriptors fail `sendmsg` with `EBADF` without sending the
+payload. `MSG_CMSG_CLOEXEC` marks installed received descriptors close-on-exec,
+and insufficient ancillary space reports `MSG_CTRUNC`. On byte-stream Unix
+sockets, rights are associated with the first byte of their `sendmsg`; they are
+delivered only by a receive that reaches that byte, and an ordinary
+`read`/`recv` consumes and discards them rather than exposing them to a later
+`recvmsg`.
 Epoll readiness callbacks run without holding the parent epoll instance lock,
 including during edge-state write-back for nested epoll sets.
+Epoll interest records retain a weak reference to the watched open file
+description. Descriptor-number reuse cannot retarget an existing watch, a
+duplicate descriptor keeps the watch live after the original descriptor
+closes, and final close invalidates the watch without the epoll instance
+artificially retaining the file. `EPOLLERR` and `EPOLLHUP` are delivered
+regardless of the registered interest mask, matching Linux epoll semantics.
 Poll and epoll pass the file-description offset to offset-sensitive readiness
 providers; `/dev/kmsg` is readable only while unread snapshot bytes remain.
+Edge-triggered epoll also records provider-local monotonic state tokens.
+Connected socket rings advance their token only on readiness transitions
+(empty to non-empty, full to non-full, and closure), so reads and writes that
+leave readiness unchanged do not synthesize edges. A drain followed by new
+data before the next `epoll_wait` remains a deliverable edge even though both
+sampled readiness masks contain `POLL_IN`.
+Readable and writable tokens are independent and epoll correlates each token
+only with its matching ready bit; a hidden receive-and-drain cycle cannot
+manufacture `EPOLLOUT` on a continuously writable socket.
+Eventfd advances the same directional tokens on zero-to-nonzero and
+saturated-to-writable transitions. A counter drain/refill between epoll scans
+therefore remains a deliverable `EPOLLIN` edge.
+Anonymous pipes advance readable and writable tokens on empty-to-nonempty,
+full-to-space, and peer-close transitions. Timerfd advances its readable token
+when an armed deadline creates the first pending expiration.
+Inotify advances its readable token only when its event queue changes from
+empty to nonempty, preserving a drain/refill edge without retriggering merely
+because another event joined an already-readable queue.
+Signalfd uses a per-task pending-set generation that advances only when the
+set changes from empty to nonempty, including the allocation-free IRQ raise
+path.
+Explicit stream shutdown publishes the same readiness notification as final
+descriptor close; a peer parked in an infinite poll/epoll wait wakes to
+`POLL_IN|POLL_HUP` and can consume EOF.
+Connected unnamed AF_UNIX peers, including `socketpair(2)` endpoints, report a
+minimal `sockaddr_un` containing only `sa_family` from `getpeername(2)`;
+truncated output still reports the full address length.
 `open(2)`/`openat(2)` reject an empty pathname with `ENOENT` before cwd
 normalization; an empty path never aliases the current directory.
 `clock_gettime(2)` accepts realtime/monotonic coarse clocks and process/thread
@@ -57,6 +115,11 @@ readiness notification so parked `poll`/`epoll` waiters wake without unrelated
 system activity.
 Legacy `clone(2)` honors `CLONE_PIDFD` by installing a pidfd in the parent and
 writing its descriptor through the overloaded `parent_tid` pointer argument.
+Private futex wait queues are keyed by `(address-space identity, user address)`;
+`CLONE_VM` threads share wakes, while unrelated processes that map the same
+virtual address cannot consume one another's `FUTEX_WAKE_PRIVATE` events.
+Classic `FUTEX_WAIT` returns `EAGAIN` when the user word no longer equals the
+expected value; a stale wait is never reported as a successful wake.
 
 Linux NUMA compatibility reports live topology rather than a structural
 single-node stub: `getcpu(2)` returns the current logical CPU and its

@@ -53,6 +53,9 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
     };
     match result {
         crate::socket::SocketOpResult::Received { n, peer } => {
+            // Kernel output field: clear caller stack contents before
+            // ancillary/data truncation paths OR their flags into it.
+            write_user_u32(msg_ptr + 48, 0);
             // Scatter into iovec destinations under SMAP bracket.
             let mut copied = 0;
             for i in 0..iov_len {
@@ -100,6 +103,10 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                 // sd_notify's PID 1 reads $NOTIFY_SOCKET with SO_PASSCRED to
                 // learn which service reported READY=1.
                 let recv_fds = sock.unix_take_recv_fds();
+                // Consume the per-record credential even when SO_PASSCRED is
+                // off; otherwise the next recvmsg could observe stale sender
+                // identity from this record.
+                let message_cred = sock.recvmsg_cred();
                 let cred = if sock.passcred() {
                     // The stored sender cred carries the sender's OUTER
                     // ProcessId; deliver it in the RECEIVER's PID-namespace view
@@ -108,13 +115,17 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                     // datagram whose SCM_CREDENTIALS pid != the service MainPID,
                     // and MainPID is now the child's in-namespace pid (see the
                     // clone-return translation). Identity in the root namespace.
-                    let mut c = sock.recvmsg_cred();
-                    c.pid = report_pid_to(current_task_id(), c.pid as u64) as u32;
-                    Some(c)
+                    Some(report_ucred_to(current_task_id(), message_cred))
                 } else {
                     None
                 };
-                install_recv_ancillary(msg_ptr, recv_fds, cred);
+                const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
+                let ancillary_truncated =
+                    install_recv_ancillary(msg_ptr, recv_fds, cred, flags & MSG_CMSG_CLOEXEC != 0);
+                // Preserve this for the msg_flags write below.
+                if ancillary_truncated {
+                    write_user_u32(msg_ptr + 48, 0x8); // MSG_CTRUNC
+                }
             }
 
             // `msg_flags` (msghdr offset 48) is a kernel OUTPUT field — Linux
@@ -127,13 +138,15 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
             // (a lone 0x71 byte) and the bus dropped it → no KDE session bus.
             // We deliver the whole datagram/stream chunk and never truncate
             // ancillary data here, so the correct value is 0.
+            let existing_flags = read_user_u32(msg_ptr + 48);
             write_user_u32(
                 msg_ptr + 48,
-                if truncated_full_len.is_some() {
-                    crate::socket::MSG_TRUNC
-                } else {
-                    0
-                },
+                existing_flags
+                    | if truncated_full_len.is_some() {
+                        crate::socket::MSG_TRUNC
+                    } else {
+                        0
+                    },
             );
 
             let returned = if flags & crate::socket::MSG_TRUNC != 0 {

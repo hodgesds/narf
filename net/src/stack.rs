@@ -78,6 +78,16 @@ pub struct AdminHandle {
     iface_name: String,
 }
 
+/// Mint the kernel-held administrative handle for the initial namespace's
+/// synthetic loopback device.
+///
+/// This is intentionally narrower than a stack-daemon attachment: callers
+/// can operate only on `lo`, which has ifindex 1 and is always up. The Linux
+/// syscall ABI never accepts a serialized admin handle.
+pub fn initial_loopback_admin() -> AdminHandle {
+    AdminHandle::new(Cap::<AdminCap, Invoke>::bootstrap(), String::from("lo"))
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct AdminIpv4Route {
     pub dst: [u8; 4],
@@ -112,6 +122,9 @@ impl AdminHandle {
 
     pub fn net_ns_id(&self) -> Result<u64, AdminError> {
         self.check_live()?;
+        if self.iface_name == "lo" {
+            return Ok(0);
+        }
         if let Some(iface) = crate::iface::lookup(&self.iface_name) {
             return Ok(iface.net_ns_id);
         }
@@ -128,6 +141,12 @@ impl AdminHandle {
 
     pub fn set_link(&self, up: bool) -> Result<(), AdminError> {
         self.check_live()?;
+        // Loopback is synthetic rather than a legacy L3 interface. It is
+        // permanently up, so systemd's idempotent RTM_SETLINK(IFF_UP) is a
+        // successful no-op.
+        if self.iface_name == "lo" && up {
+            return Ok(());
+        }
         crate::iface::set_link_state(&self.iface_name, up)
             .then_some(())
             .ok_or(AdminError::NoIface)

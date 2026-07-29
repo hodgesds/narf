@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "2cbba0df0c488aa2884316f09ad9ee123a1afa676628eed9b1c85d61bf47d750"
+prompt_hash = "8b8e20989a9ad3650a89697df9b39d761092ffa12c888571dfb49837275bb5f8"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -134,3 +134,23 @@ argument = "Perf IRQ capture copies scalar registers from the already-saved arch
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "User-stack sampling resolves bytes only through the sampled AddressSpace's locked, authoritative resident backing metadata and the kernel direct map. It stops at unmapped or lazy backing, never faults user pages in IRQ context, never exposes physical addresses, and retains all frame ownership."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The scheduler and frame edits add forward-progress accounting, idle-state reporting, and fatal-path stall diagnostics inside the existing TCB. They add no trusted subsystem and do not move the documented TCB boundary."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Forward-progress counters and queue diagnostics neither bypass nor alter capability checks, domain tags, PKRS state, or domain transitions. The watchdog reads aggregate scheduling state and can only diagnose or panic after runnable work has made no progress."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L62"
+argument = "The new scheduler observations are aggregate queue depths, a monotonic progress counter, and fatal-path task state. They remain within the existing documented per-CPU scheduling-state exception and do not expose task memory or capabilities to userspace."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The direct PID 1 loader remains inside the existing frame TCB and only publishes a task after the existing ELF loader has built its address space and the task's explicit filesystem-root metadata is installed. It grants no capability, changes no domain assignment, and removes a userspace chroot launcher rather than adding an authority-bearing intermediary."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The rooted interpreter lookup reads bytes only through the existing VFS resolver under the explicit mounted root and retains the normal ELF-loader validation path. It does not dereference untrusted user pointers, alter page mappings outside the loader, or bypass capability or domain checks."

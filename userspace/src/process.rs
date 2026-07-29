@@ -160,6 +160,29 @@ pub unsafe fn load_user_process_with(
     envp: &[&str],
     aux: &[AuxEntry],
 ) -> Result<UserProcess, ProcessLoadError> {
+    // SAFETY: this is the default global-root form of the rooted loader below.
+    unsafe { load_user_process_with_root(bytes, argv, envp, aux, None) }
+}
+
+/// Load an ELF as a new process, resolving a filesystem-backed `PT_INTERP`
+/// below `root` when supplied.
+///
+/// This is for direct kernel boot of a dynamic PID 1 from an already-mounted
+/// root filesystem.  Unlike an `execve`, boot has no current user task whose
+/// chroot can provide the interpreter's root, so the caller supplies the
+/// absolute VFS prefix explicitly.  The caller must install the same root on
+/// the reserved task before publishing it to the scheduler.
+///
+/// # Safety
+/// Same contract as [`load_user_process_with`]. `root`, if present, must name
+/// an absolute mounted directory.
+pub unsafe fn load_user_process_with_root(
+    bytes: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    aux: &[AuxEntry],
+    root: Option<&str>,
+) -> Result<UserProcess, ProcessLoadError> {
     // SAFETY: caller upholds this fn's `# Safety` contract (live low-4-GiB
     // identity map + initialised frame allocator), which is precisely what
     // `load_elf_bytes` needs to map the program's PT_LOAD segments.
@@ -257,7 +280,11 @@ pub unsafe fn load_user_process_with(
         .as_deref()
         .filter(|name| interp::lookup_interpreter(name).is_none())
         .and_then(|name| {
-            let resolved = crate::handlers::apply_chroot(name);
+            let resolved = match root {
+                Some(prefix) if prefix != "/" => alloc::format!("{}{}", prefix, name),
+                Some(_) => alloc::string::String::from(name),
+                None => crate::handlers::apply_chroot(name),
+            };
             read_path_from_vfs(&resolved)
         });
     #[cfg(not(feature = "linux-compat"))]
@@ -901,15 +928,21 @@ fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
 /// is empty, the read exceeds 64 MiB (defensive cap — a sane ld-musl
 /// is <200 KiB), or any read short-circuits with `FsError`.
 #[cfg(feature = "linux-compat")]
-fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
-    use narf_filesystem::{registry, resolve_async};
+pub fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
+    use narf_filesystem::resolve_async;
 
-    // 1. Walk the VFS to a FileOps for `abs_path`.
-    let file = registry()
-        .resolve_absolute(abs_path, |fs, rel| {
-            poll_blocking(resolve_async(fs.root(), rel)).and_then(|r| r.ok())
-        })
-        .flatten()?;
+    // 1. Walk the VFS to a FileOps for `abs_path`, through the CALLER'S mount
+    //    namespace — not the global registry. This slurps the ELF interpreter
+    //    (ld.so) during execve; a systemd service sandbox unshare(NEWNS)s and
+    //    pivot_roots into a privately-bound rootfs, so /lib64/ld-linux-*.so.2 is
+    //    reachable ONLY via the task's private mount table. Resolving globally
+    //    returned None → the dynamic PIE loaded with NO interpreter → the entry
+    //    fell to the load bias and the process jumped to a null/uninitialised
+    //    RIP (#PF faultva=0 rip=0, SIGSEGV) before executing a single syscall.
+    let file = crate::handlers::current_resolve_absolute(abs_path, |fs, rel| {
+        poll_blocking(resolve_async(fs.root(), rel)).and_then(|r| r.ok())
+    })
+    .flatten()?;
 
     // 2. stat() to size the read; cap at 64 MiB.
     const MAX_INTERP_BYTES: u64 = 64 * 1024 * 1024;

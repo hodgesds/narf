@@ -447,6 +447,17 @@ struct InotifyState {
     events: VecDeque<Vec<u8>>,
     /// Monotonic cookie source for pairing IN_MOVED_FROM/IN_MOVED_TO.
     next_cookie: u32,
+    /// Empty-to-nonempty generation used by edge-triggered epoll.
+    readable_token: u64,
+}
+
+impl InotifyState {
+    fn enqueue(&mut self, event: Vec<u8>) {
+        if self.events.is_empty() {
+            self.readable_token = self.readable_token.wrapping_add(1);
+        }
+        self.events.push_back(event);
+    }
 }
 
 static INOTIFY: IrqSafeSpinLock<Option<BTreeMap<u64, InotifyState>>> = IrqSafeSpinLock::new(None);
@@ -463,17 +474,19 @@ fn with_inotify<R>(f: impl FnOnce(&mut BTreeMap<u64, InotifyState>) -> R) -> R {
 // (task, fd) → absolute path at open and consult it on write; close drops
 // the entry. This is best-effort (dup/dup2 don't propagate it), which is
 // all inotify needs.
-static FD_PATHS: IrqSafeSpinLock<Option<BTreeMap<(u64, u32), String>>> = IrqSafeSpinLock::new(None);
+type FdPathIdentity = (String, Option<u64>);
+static FD_PATHS: IrqSafeSpinLock<Option<BTreeMap<(u64, u32), FdPathIdentity>>> =
+    IrqSafeSpinLock::new(None);
 
-fn with_fd_paths<R>(f: impl FnOnce(&mut BTreeMap<(u64, u32), String>) -> R) -> R {
+fn with_fd_paths<R>(f: impl FnOnce(&mut BTreeMap<(u64, u32), FdPathIdentity>) -> R) -> R {
     let mut g = FD_PATHS.lock();
     f(g.get_or_insert_with(BTreeMap::new))
 }
 
 /// Record the absolute path an fd was opened on (for later IN_MODIFY).
-pub(crate) fn register_fd_path(task: u64, fd: u32, path: &str) {
+pub(crate) fn register_fd_path(task: u64, fd: u32, path: &str, mount_id: Option<u64>) {
     with_fd_paths(|m| {
-        m.insert((task, fd), String::from(path));
+        m.insert((task, fd), (String::from(path), mount_id));
     });
 }
 
@@ -487,7 +500,12 @@ pub(crate) fn forget_fd_path(task: u64, fd: u32) {
 /// Look up the absolute path an fd was opened on, if recorded. Used by
 /// `landlock_add_rule` to turn a `parent_fd` back into a path.
 pub(crate) fn fd_path(task: u64, fd: u32) -> Option<String> {
-    with_fd_paths(|m| m.get(&(task, fd)).cloned())
+    with_fd_paths(|m| m.get(&(task, fd)).map(|(path, _)| path.clone()))
+}
+
+/// Mount that was visible when `fd` was opened.
+pub(crate) fn fd_mount_id(task: u64, fd: u32) -> Option<u64> {
+    with_fd_paths(|m| m.get(&(task, fd)).and_then(|(_, id)| *id))
 }
 
 fn parent_and_base(abs: &str) -> (&str, &str) {
@@ -567,8 +585,7 @@ fn inotify_dispatch(abs_path: &str, mask: u32, is_dir: bool) {
                 .collect();
             for (wd, _, use_base) in matched {
                 let name = if use_base { base } else { "" };
-                st.events
-                    .push_back(serialize_event(wd, full_mask, cookie, name));
+                st.enqueue(serialize_event(wd, full_mask, cookie, name));
             }
         }
     });
@@ -598,7 +615,7 @@ pub(crate) fn notify_attrib(abs_path: &str, is_dir: bool) {
 /// IN_ATTRIB for the file behind `fd` (fchmod/fchown/futimens), looked up
 /// via the fd → path table.
 pub(crate) fn notify_attrib_fd(task: u64, fd: u32) {
-    let path = with_fd_paths(|m| m.get(&(task, fd)).cloned());
+    let path = fd_path(task, fd);
     if let Some(p) = path {
         fs_notify(&p, IN_ATTRIB, false);
     }
@@ -612,7 +629,7 @@ pub(crate) fn notify_modify_path(abs_path: &str) {
 
 /// IN_MODIFY for the file behind `fd`, looked up via the fd → path table.
 pub(crate) fn notify_modify_fd(task: u64, fd: u32) {
-    let path = with_fd_paths(|m| m.get(&(task, fd)).cloned());
+    let path = fd_path(task, fd);
     if let Some(p) = path {
         fs_notify(&p, IN_MODIFY, false);
     }
@@ -620,7 +637,7 @@ pub(crate) fn notify_modify_fd(task: u64, fd: u32) {
 
 /// IN_CLOSE_WRITE for the file behind `fd`.
 pub(crate) fn notify_close_fd(task: u64, fd: u32) {
-    let path = with_fd_paths(|m| m.get(&(task, fd)).cloned());
+    let path = fd_path(task, fd);
     if let Some(p) = path {
         fs_notify(&p, IN_CLOSE_WRITE, false);
     }
@@ -652,8 +669,7 @@ pub(crate) fn notify_moved(from: &str, to: &str) {
                 .collect();
             for (wd, use_base) in from_hits {
                 let name = if use_base { fb } else { "" };
-                st.events
-                    .push_back(serialize_event(wd, IN_MOVED_FROM, cookie, name));
+                st.enqueue(serialize_event(wd, IN_MOVED_FROM, cookie, name));
             }
             let to_hits: Vec<(i32, bool)> = st
                 .watches
@@ -672,8 +688,7 @@ pub(crate) fn notify_moved(from: &str, to: &str) {
                 .collect();
             for (wd, use_base) in to_hits {
                 let name = if use_base { tb } else { "" };
-                st.events
-                    .push_back(serialize_event(wd, IN_MOVED_TO, cookie, name));
+                st.enqueue(serialize_event(wd, IN_MOVED_TO, cookie, name));
             }
         }
     });
@@ -706,6 +721,14 @@ impl FileOps for InotifyFile {
             0
         }
     }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        (
+            with_inotify(|m| m.get(&self.id).map(|s| s.readable_token).unwrap_or(0)),
+            0,
+        )
+    }
+
     /// A blocking read with no queued events must PARK (POSIX), not return
     /// a spurious 0 — inotify has no end-of-file.
     fn read_should_block(&self) -> bool {
@@ -792,6 +815,7 @@ fn inotify_init_common(ctx: &mut dyn TrapContext, flags: u64) {
                 watches: BTreeMap::new(),
                 events: VecDeque::new(),
                 next_cookie: 0,
+                readable_token: 0,
             },
         )
     });

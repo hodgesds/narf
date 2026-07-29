@@ -248,6 +248,16 @@ pub fn run_all_and_exit() -> ! {
     unsafe { narf_arch::exit_kernel(code) }
 }
 
+/// Run one exact subsystem and immediately exit with the mapped status.
+pub fn run_subsystem_and_exit(wanted: &str) -> ! {
+    let code = match run_subsystem(wanted) {
+        Summary::AllOk => 0,
+        Summary::SomeFailed => 1,
+    };
+    // SAFETY: this is the terminal action of the kernel-test boot.
+    unsafe { narf_arch::exit_kernel(code) }
+}
+
 // ── built-in smoke tests that always register ──────────────────
 //
 // These live in the library so any binary linking `narf-verification`

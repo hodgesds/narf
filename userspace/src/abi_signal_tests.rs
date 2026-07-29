@@ -505,6 +505,39 @@ fn smoke_abi_signal_tkill_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_tkill_pos);
 
+// gettid(2) reports a thread-group leader's PID, but the signal-pending
+// table is TaskId-keyed.  tkill/tgkill must translate that Linux-visible TID
+// back to the leader task before checking liveness or queuing the signal.
+// This is the exact self-signal shape used by musl's signal smoke.
+fn smoke_abi_signal_tkill_accepts_leader_gettid() -> TestResult {
+    with_setup(|| {
+        const PID: u64 = 0xCAFE;
+        crate::handlers::register_task_to_pid(FAKE_TASK, PID);
+        crate::handlers::register_pid_task_mapping(PID, FAKE_TASK);
+
+        let tid = call(Syscall::Gettid.raw(), a0(0));
+        if tid != Some(PID as i64) {
+            return Err("gettid did not return the leader's PID");
+        }
+        if call(Syscall::Tkill.raw(), a1(PID, 10)) != Some(0) {
+            return Err("tkill(gettid(), SIGUSR1) should target the leader");
+        }
+        if crate::handlers::signal_pending_of(FAKE_TASK) & (1 << (10 - 1)) == 0 {
+            return Err("tkill(gettid()) did not queue SIGUSR1 on the leader task");
+        }
+        crate::handlers::clear_signal_pending(FAKE_TASK, 10);
+
+        if call(Syscall::Tgkill.raw(), a2(PID, PID, 10)) != Some(0) {
+            return Err("tgkill(getpid(), gettid(), SIGUSR1) should target the leader");
+        }
+        if crate::handlers::signal_pending_of(FAKE_TASK) & (1 << (10 - 1)) == 0 {
+            return Err("tgkill(getpid(), gettid()) did not queue SIGUSR1 on the leader task");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_tkill_accepts_leader_gettid);
+
 fn smoke_abi_signal_tkill_neg() -> TestResult {
     with_setup(|| {
         // sig >= 32 → -EINVAL (Linux parity; was InvalidOp before).

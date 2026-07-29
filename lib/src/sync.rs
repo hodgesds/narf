@@ -30,11 +30,26 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 /// use-after-unmap. Draining the pending shootdown from the spin loop keeps a
 /// masked spinner responsive, so a shootdown is never stranded.
 static LOCK_SPIN_HOOK: AtomicUsize = AtomicUsize::new(0);
+const MAX_DIAGNOSTIC_CPUS: usize = 16;
+static CONTENDED_IRQ_LOCK: [AtomicUsize; MAX_DIAGNOSTIC_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_DIAGNOSTIC_CPUS];
 
 /// Install the spin-wait hook (see [`LOCK_SPIN_HOOK`]). `hook` must be safe to
 /// call from any CPL=0 context with IRQs masked. Idempotent.
 pub fn set_lock_spin_hook(hook: fn()) {
     LOCK_SPIN_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Address of the `IrqSafeSpinLock` on which `cpu` is currently spinning.
+///
+/// This is a diagnostic snapshot for fatal-path watchdogs. A zero value means
+/// that the CPU has not crossed the throttled contention threshold, or has
+/// since acquired the lock.
+pub fn contended_irq_lock(cpu: usize) -> usize {
+    CONTENDED_IRQ_LOCK
+        .get(cpu)
+        .map(|slot| slot.load(Ordering::Acquire))
+        .unwrap_or(0)
 }
 
 /// Run the installed spin-wait hook if any. Tiny by design — one acquire load
@@ -254,9 +269,17 @@ impl<T: ?Sized> IrqSafeSpinLock<T> {
                 spin_loop();
                 spins = spins.wrapping_add(1);
                 if spins & 0xFF == 0 {
+                    let cpu = crate::percpu::current_cpu();
+                    if let Some(slot) = CONTENDED_IRQ_LOCK.get(cpu) {
+                        slot.store(self as *const Self as *const () as usize, Ordering::Release);
+                    }
                     run_lock_spin_hook();
                 }
             }
+        }
+        let cpu = crate::percpu::current_cpu();
+        if let Some(slot) = CONTENDED_IRQ_LOCK.get(cpu) {
+            slot.store(0, Ordering::Release);
         }
         IrqSafeSpinLockGuard {
             lock: &self.inner,

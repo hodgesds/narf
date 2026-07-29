@@ -35,6 +35,25 @@ pub(crate) fn sys_faccessat(ctx: &mut dyn TrapContext) {
     };
     const AT_FDCWD: i64 = -100;
     let dirfd = args.arg0 as i64;
+    // AT_EMPTY_PATH (faccessat2 flags = arg3): an empty path names the fd
+    // ITSELF. glibc's access_fd() does faccessat2(fd, "", X_OK, AT_EMPTY_PATH)
+    // to test an O_PATH fd for executability, which systemd's
+    // open_and_check_executable / find_executable_full uses to confirm a
+    // service binary before execve. An already-open fd trivially exists (NARF
+    // enforces existence, not mode), so report success. Without this the
+    // relative-join arm below appends "/" to the fd's path, turning a
+    // regular-file fd into a directory-shaped path that misses (ENOENT) and
+    // kills every sandboxed service 203/EXIT_EXEC.
+    if raw.is_empty() && dirfd >= 0 {
+        let valid =
+            fd::with_table(current_task_id(), |t| t.get(dirfd as u32).is_some()).unwrap_or(false);
+        ctx.set_return(if valid {
+            SyscallReturn::ok(0)
+        } else {
+            SyscallReturn::ok((-9i64) as u64) // -EBADF
+        });
+        return;
+    }
     let effective = if raw.starts_with('/') || dirfd == AT_FDCWD {
         raw
     } else if dirfd >= 0 {
@@ -54,36 +73,46 @@ pub(crate) fn sys_faccessat(ctx: &mut dyn TrapContext) {
 }
 
 fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
-    let Some(file) = xattr_file(path) else {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+    if let Some(file) = xattr_file(path) {
+        match poll_blocking(file.access(mode)) {
+            Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
+            Some(Err(narf_filesystem::FsError::PermissionDenied)) => {
+                ctx.set_return(SyscallReturn::ok((-13i64) as u64))
+            }
+            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {
+                let st = file.stat();
+                let (uid, gid) = file.owners();
+                set_access_result(ctx, mode, st.mode.perms, uid, gid);
+            }
+            _ => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
+        }
         return;
-    };
-    match poll_blocking(file.access(mode)) {
-        Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
-        Some(Err(narf_filesystem::FsError::PermissionDenied)) => {
-            ctx.set_return(SyscallReturn::ok((-13i64) as u64))
-        }
-        Some(Err(narf_filesystem::FsError::Unsupported)) | None => {
-            let st = file.stat();
-            let (uid, gid) = file.owners();
-            let request = narf_filesystem::AccessRequest {
-                read: mode & 4 != 0,
-                write: mode & 2 != 0,
-                exec: mode & 1 != 0,
-            };
-            let allowed = narf_filesystem::posix_access_ok(
-                narf_filesystem::FileOwner {
-                    uid,
-                    gid,
-                    perms: st.mode.perms,
-                },
-                current_accessor(current_task_id()),
-                request,
-            );
-            ctx.set_return(SyscallReturn::ok(if allowed { 0 } else { (-13i64) as u64 }));
-        }
-        _ => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
     }
+
+    // `FileOps` resolution deliberately excludes directories. access(2)
+    // applies to both inode kinds, however, and systemd probes a freshly
+    // mounted cgroup2 root with W_OK before accepting the hierarchy. Treating
+    // every directory (especially a mount root) as ENOENT makes systemd undo
+    // the successful mount and abort PID 1.
+    if let Some(dir) = resolve_dir_absolute(path) {
+        set_access_result(ctx, mode, dir.dir_mode(), 0, 0);
+    } else {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+    }
+}
+
+fn set_access_result(ctx: &mut dyn TrapContext, mode: u32, perms: u16, uid: u32, gid: u32) {
+    let request = narf_filesystem::AccessRequest {
+        read: mode & 4 != 0,
+        write: mode & 2 != 0,
+        exec: mode & 1 != 0,
+    };
+    let allowed = narf_filesystem::posix_access_ok(
+        narf_filesystem::FileOwner { uid, gid, perms },
+        current_accessor(current_task_id()),
+        request,
+    );
+    ctx.set_return(SyscallReturn::ok(if allowed { 0 } else { (-13i64) as u64 }));
 }
 
 pub(crate) fn sys_access_chmod_chown(ctx: &mut dyn TrapContext) {

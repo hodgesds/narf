@@ -21,8 +21,9 @@ use alloc::vec::Vec;
 use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
 use narf_capabilities::{Cap, Read, Write};
 use narf_driver_runtime::DomainId;
-use narf_filesystem::{DirOps, FsError, FsInstance};
+use narf_filesystem::{DirOps, FsError, FsInstance, Page, PageCache, PageKey, PAGE_SIZE};
 use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister, DmaBuffer};
+use narf_lib::mutex::Mutex;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_time::now_wall;
 
@@ -153,6 +154,10 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// wholesale on any block write so a freed/rewritten indirect block can't
     /// be served stale. Capacity covers triple-indirect's live set (l3/l2/l1).
     indirect_cache: IrqSafeSpinLock<Vec<(u32, Vec<u8>)>>,
+    /// Clean filesystem data blocks. The lock remains held while a cache miss
+    /// is filled so parallel dynamic-linker mmaps coalesce rather than issuing
+    /// the same block read once per process.
+    page_cache: Mutex<PageCache>,
 }
 
 /// Free-function indirect-pointer read used by the pre-construction
@@ -356,6 +361,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             io: IrqSafeSpinLock::new(io),
             journal_overrides,
             indirect_cache: IrqSafeSpinLock::new(Vec::new()),
+            page_cache: Mutex::new(PageCache::new()),
         }))
     }
 
@@ -565,6 +571,41 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 return Ok(());
             }
         }
+        // The unified cache is 4 KiB-page based while ext2 permits smaller
+        // block sizes. Fill the containing page of contiguous filesystem
+        // blocks, then return this block's slice. Holding the async mutex
+        // through the miss fill intentionally coalesces identical concurrent
+        // reads; dropping it between lookup and insert would let systemd's
+        // parallel generators stampede the same shared-library pages through
+        // the single virtio queue.
+        if bs <= PAGE_SIZE && PAGE_SIZE % bs == 0 {
+            let blocks_per_page = PAGE_SIZE / bs;
+            let first_block = block_no / blocks_per_page as u64 * blocks_per_page as u64;
+            let in_page = (block_no - first_block) as usize * bs;
+            let key = PageKey {
+                fs_id: 0,
+                inode: 0,
+                page_off: first_block / blocks_per_page as u64,
+            };
+            let cache = self.page_cache.lock().await;
+            if let Some(page) = cache.lookup(key) {
+                dst.copy_from_slice(&page.data[in_page..in_page + bs]);
+                return Ok(());
+            }
+            let mut data = [0u8; PAGE_SIZE];
+            let byte_off = first_block * bs as u64;
+            self.read_byte_range(byte_off, &mut data).await?;
+            dst.copy_from_slice(&data[in_page..in_page + bs]);
+            cache.insert(
+                key,
+                Page {
+                    data: Arc::new(data),
+                    dirty: false,
+                    gen: 0,
+                },
+            );
+            return Ok(());
+        }
         let byte_off = block_no * bs as u64;
         self.read_byte_range(byte_off, dst).await
     }
@@ -631,6 +672,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // one), so drop the read cache wholesale to avoid serving stale
         // pointers. Writes are rare next to reads; clearing 8 entries is cheap.
         self.indirect_cache.lock().clear();
+        // Direct block writes bypass the page-cache writeback path, so they
+        // must invalidate cached clean data before changing the device.
+        self.page_cache.lock().await.clear();
         let lbs = self.io.lock().lbs;
         let mut cursor = 0usize;
         while cursor < src.len() {

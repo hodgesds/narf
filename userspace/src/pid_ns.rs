@@ -141,6 +141,9 @@ fn ns_table_init(g: &mut Option<BTreeMap<u64, Arc<PidNamespace>>>) {
     }
 }
 
+static TASK_PID_NS_FOR_CHILDREN: IrqSafeSpinLock<Option<BTreeMap<u64, Arc<PidNamespace>>>> =
+    IrqSafeSpinLock::new(None);
+
 /// Look up the PID namespace the given task belongs to. None means
 /// the task is in the root namespace and its outer == inner.
 pub fn ns_of(task: u64) -> Option<Arc<PidNamespace>> {
@@ -166,42 +169,45 @@ pub fn clear_ns(task: u64) {
     if let Some(m) = g.as_mut() {
         m.remove(&task);
     }
+    let mut g_child = TASK_PID_NS_FOR_CHILDREN.lock();
+    if let Some(m) = g_child.as_mut() {
+        m.remove(&task);
+    }
 }
 
-/// Inherit the parent's PID namespace into the child without minting
-/// a new one. The child gets a fresh inner pid inside the same
-/// namespace (because that's POSIX-ish fork behaviour: the child is
-/// a new process inside whatever PID namespace the parent already
-/// belonged to). Returns the child's inner pid in the namespace, or
-/// None if the parent was in the root namespace (no rebind needed).
-///
-/// `child_task` is the child's **TaskId** — the key `TASK_PID_NS` is looked
-/// up by everywhere else (`ns_of` in `self_inner_pid`/`resolve_inner_pid`,
-/// which `getpid`/`kill`/`getppid`/`/proc` all funnel through, plus
-/// `unshare_pid_ns`/`setns`). Keying the store by the child's ProcessId
-/// instead (as an earlier version did) left the child's namespace unreachable
-/// from every TaskId-based self-lookup, so a forked child reported its OUTER
-/// pid and — fatally — when the child itself forked, `ns_of(child_task)`
-/// returned None and the grandchild fell out of the namespace entirely.
-/// `child_outer_pid` (the ProcessId) is still what `bind_outer` maps to an
-/// inner pid — the namespace's outer↔inner tables are ProcessId-space; only
-/// the *lookup key* is the TaskId.
+/// Inherit the parent's PID namespace into the child. If the parent called
+/// `unshare(CLONE_NEWPID)`, the first child spawned by fork/clone becomes PID 1
+/// in the new namespace per Linux semantics.
 pub fn inherit_into_child(parent_task: u64, child_task: u64, child_outer_pid: u64) -> Option<u64> {
-    let ns = ns_of(parent_task)?;
+    let pending_ns = {
+        let g = TASK_PID_NS_FOR_CHILDREN.lock();
+        g.as_ref().and_then(|m| m.get(&parent_task).cloned())
+    };
+
+    let ns = match pending_ns {
+        Some(ns) => ns,
+        None => ns_of(parent_task)?,
+    };
+
     let inner = ns.bind_outer(child_outer_pid);
     set_ns(child_task, ns);
     Some(inner)
 }
 
-/// `unshare(CLONE_NEWPID)` — create a fresh PID namespace for `task`
-/// and bind `task`'s outer pid into it as inner pid 1. Returns the
-/// new namespace.
-///
-/// Note: per Linux, `unshare(CLONE_NEWPID)` makes the *next* fork land
-/// in the new namespace; the calling task itself stays in its old
-/// namespace. We deviate here for simplicity: the calling task IS
-/// rebound, becoming pid 1 in the new namespace. This is the shape
-/// most tests want.
+/// Linux `unshare(CLONE_NEWPID)` semantics: creates a fresh PID namespace for
+/// future children of `task`. The calling task itself remains in its current namespace.
+pub fn unshare_pid_ns_for_children(task: u64) -> Arc<PidNamespace> {
+    let ns = PidNamespace::new();
+    let mut g = TASK_PID_NS_FOR_CHILDREN.lock();
+    ns_table_init(&mut g);
+    if let Some(m) = g.as_mut() {
+        m.insert(task, ns.clone());
+    }
+    ns
+}
+
+/// `unshare(CLONE_NEWPID)` legacy/test helper — create a fresh PID namespace for `task`
+/// and bind `task`'s outer pid into it as inner pid 1 immediately.
 pub fn unshare_pid_ns(task: u64, outer_pid: u64) -> Arc<PidNamespace> {
     let ns = PidNamespace::new();
     let inner = ns.bind_outer(outer_pid);
@@ -234,10 +240,29 @@ pub fn ns_visible_inner(task: u64, outer: u64) -> Option<u64> {
 
 /// Translate `task`'s outer pid through whichever namespace it
 /// belongs to, returning the inner pid the task sees of itself.
-/// Falls back to `outer_pid` when the task is in the root namespace.
+/// A PID that is not mapped into a non-root namespace reports as zero, as
+/// Linux does for credential and peer-PID queries; only the root namespace
+/// falls back to the outer PID.
 pub fn self_inner_pid(task: u64, outer_pid: u64) -> u64 {
     match ns_of(task) {
-        Some(ns) => ns.outer_to_inner(outer_pid).unwrap_or(outer_pid),
+        Some(ns) => {
+            if let Some(inner) = ns.outer_to_inner(outer_pid) {
+                inner
+            } else if let Some(inner) = ns.outer_to_inner(task) {
+                // Some callers pass the caller's own TaskId in the `outer_pid`
+                // slot; accept a direct TaskId→inner binding too.
+                inner
+            } else {
+                // The outer pid is NOT mapped into this namespace (an ancestor,
+                // or a process in an un-nested namespace). Linux reports 0 for
+                // such peer/SCM credentials rather than leaking a host pid — and
+                // MUST NOT substitute an unrelated inner pid. A previous
+                // single-entry fallback returned the namespace's sole inner pid
+                // here, which leaked into SO_PEERCRED / SCM_CREDENTIALS (see
+                // smoke_pid_ns_unmapped_outer_pid_reports_zero).
+                0
+            }
+        }
         None => outer_pid,
     }
 }

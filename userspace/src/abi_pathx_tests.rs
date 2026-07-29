@@ -165,6 +165,23 @@ fn smoke_abi_pathx_faccessat_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_faccessat_pos);
 
+// access(2) applies to directories as well as regular files. In particular,
+// systemd checks W_OK on the cgroup2 mount root immediately after mount(2);
+// returning ENOENT for a mount directory makes it tear the hierarchy down.
+fn smoke_abi_pathx_faccessat_mount_root_writable() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let path = b"/p2\0";
+        match call(
+            Syscall::Faccessat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 2, 0),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("faccessat(W_OK) on a writable mount root should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_faccessat_mount_root_writable);
+
 fn smoke_abi_pathx_faccessat_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/nope\0";
@@ -211,6 +228,35 @@ fn smoke_abi_pathx_faccessat2_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_faccessat2_neg);
+
+// ── faccessat2(fd, "", X_OK, AT_EMPTY_PATH) → 0 ────────────────────
+//
+// glibc's access_fd() tests an O_PATH fd for executability via
+// faccessat2(fd, "", X_OK, AT_EMPTY_PATH); systemd's
+// open_and_check_executable / find_executable_full relies on it to confirm a
+// service binary before execve. An empty path must name the fd itself — NOT
+// resolve fd_path + "/", which turned a regular-file fd into a dir-shaped
+// path that missed (ENOENT) and killed every sandboxed service 203/EXIT_EXEC.
+fn smoke_abi_pathx_faccessat2_empty_path_fd() -> TestResult {
+    with_memfs("/p2e", "p2e", &[("bin", b"exe")], || {
+        let path = b"/p2e/bin\0";
+        let fd = match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open /p2e/bin failed"),
+        };
+        const X_OK: u64 = 1;
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        let empty = b"\0";
+        match call(
+            Syscall::Faccessat2.raw(),
+            a3(fd, empty.as_ptr() as u64, X_OK, AT_EMPTY_PATH),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("faccessat2(fd, \"\", X_OK, AT_EMPTY_PATH) must return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_faccessat2_empty_path_fd);
 
 // ── fchmod (fd, mode) → 0 / -1 ─────────────────────────────────────
 //

@@ -2901,7 +2901,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
     #[cfg(feature = "kernel-test")]
     {
-        narf_verification::run_all_and_exit();
+        let selected = narf_boot::cmdline()
+            .split_ascii_whitespace()
+            .find_map(|arg| arg.strip_prefix("test_subsystem="));
+        match selected {
+            Some(subsystem) if !subsystem.is_empty() => {
+                narf_verification::run_subsystem_and_exit(subsystem)
+            }
+            _ => narf_verification::run_all_and_exit(),
+        }
     }
 
     // Boot-smoke: real init flow + clean ACPI/isa-debug-exit shutdown.
@@ -3270,8 +3278,8 @@ fn boot_userspace_init() {
     use narf_userspace::{
         bootstrap_init, brk_init, cwd_init, install_address_space_lookup,
         install_all_address_spaces_lookup, install_core_syscalls, install_global,
-        install_task_id_lookup, install_user_task_hooks, load_user_process_with, sigaction_init,
-        signal_init, SyscallTable,
+        install_task_id_lookup, install_user_task_hooks, load_user_process_with,
+        load_user_process_with_root, sigaction_init, signal_init, SyscallTable,
     };
 
     let bytes = narf_verification::NARF_INIT_ELF;
@@ -3291,6 +3299,20 @@ fn boot_userspace_init() {
     signal_init();
     narf_userspace::handlers::init_per_task_state();
     narf_userspace::fd::init();
+    // `trace_comm=<prefix>[,<prefix>...]` retargets the syscall-trace feature's
+    // comm filter without a rebuild (default `systemd-executo`). No-op unless
+    // the kernel was built with `--features syscall-trace`.
+    #[cfg(feature = "syscall-trace")]
+    if let Some(prefix) = narf_boot::cmdline()
+        .split_ascii_whitespace()
+        .find_map(|t| t.strip_prefix("trace_comm="))
+    {
+        narf_userspace::syscall::set_trace_comm(prefix);
+        let _ = writeln!(
+            console::Writer,
+            "  boot-init: syscall-trace comm='{prefix}'"
+        );
+    }
     // Build the shared vDSO + vvar pages now that the TSC/counter scale is
     // calibrated; every process maps them and gets AT_SYSINFO_EHDR.
     narf_userspace::vdso::register_vdso_image(
@@ -3548,6 +3570,54 @@ fn boot_userspace_init() {
         // load_user_process_with uses above.
         narf_userspace::handlers::set_proc_argv(tid.raw(), argv);
         narf_userspace::handlers::set_proc_comm(tid.raw(), name);
+        true
+    }
+
+    // Directly load a dynamic program from an already-mounted filesystem root.
+    // The task's root is installed before it is enqueued, so systemd is the
+    // first and only process in its PID-1 chain — no chroot shell/launcher is
+    // involved.
+    fn spawn_rooted_pid1(name: &'static str, bytes: &[u8], root: &str) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        let argv = [name];
+        let envp = [
+            "container=narf",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        ];
+        // SAFETY: boot has the loader's identity mapping and frame allocator.
+        let proc =
+            match unsafe { load_user_process_with_root(bytes, &argv, &envp, &[], Some(root)) } {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = writeln!(
+                        console::Writer,
+                        "  boot-init: {name}: direct load failed: {e:?}"
+                    );
+                    return false;
+                }
+            };
+        let pid = proc.pid;
+        let pending = narf_userspace::user_task::prepare_user_process_initial(
+            proc,
+            narf_scheduler::TaskSpec::unthrottled(),
+        );
+        let tid = pending.task_id();
+        if !narf_userspace::handlers::install_root_dir(tid.raw(), root) {
+            let _ = writeln!(
+                console::Writer,
+                "  boot-init: {name}: could not install root {root}"
+            );
+            let _ = narf_userspace::task::release_task(tid.raw());
+            return false;
+        }
+        narf_userspace::handlers::register_pid_task_mapping(pid.raw(), tid.raw());
+        #[cfg(feature = "cgroup")]
+        narf_filesystem::cgroupfs::attach_to_root(pid.raw());
+        narf_userspace::handlers::set_proc_argv(tid.raw(), &argv);
+        narf_userspace::handlers::set_proc_comm(tid.raw(), name);
+        pending.spawn();
         true
     }
 
@@ -4093,12 +4163,10 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
     }
 
     // `systemd_pid1` cmdline flag: boot the mounted /mnt rootfs's
-    // `/lib/systemd/systemd` as REAL PID 1 instead of the NARF
-    // init/getty/shell stack. The chroot launcher (NARF_CHROOT_RUN_ELF)
-    // is spawned as the FIRST user task, so `alloc_pid()` hands it PID 1;
-    // it chroots to /mnt and exec's `/probe.sh`, which `exec`s systemd —
-    // and execve preserves the PID down the whole chain, so systemd ends
-    // up as PID 1 (which it requires for `--system` outside `--test`).
+    // `/usr/lib/systemd/systemd` directly as PID 1 instead of the NARF
+    // init/getty/shell stack. The mounted Fedora filesystem is installed as
+    // the task's root before scheduler publication; there is no launcher,
+    // shell, chroot helper, or exec chain ahead of systemd.
     // The Stage::Late `mnt-dev-bind`/`root-mount-auto` initcalls have
     // already run synchronously above (see the run_stage loop in
     // `_start_rust`), so /mnt + /mnt/{dev,run,tmp,sys,proc} + the chroot
@@ -4108,17 +4176,15 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
         .split_ascii_whitespace()
         .any(|t| t == "systemd_pid1");
     if systemd_pid1 {
-        if narf_verification::NARF_CHROOT_RUN_ELF.is_empty() {
+        let systemd_path = "/mnt/usr/lib/systemd/systemd";
+        let systemd = narf_userspace::process::read_path_from_vfs(systemd_path);
+        if systemd.is_none() {
             let _ = writeln!(
                 console::Writer,
-                "  boot-init: systemd_pid1 requested but chroot_run ELF is empty — skipping"
+                "  boot-init: systemd_pid1 requested but {systemd_path} is unavailable"
             );
         } else {
-            let _ = writeln!(
-                console::Writer,
-                "  boot-init: systemd_pid1 — booting /mnt systemd as PID 1 (init/getty skipped)"
-            );
-            spawn_one("systemd", narf_verification::NARF_CHROOT_RUN_ELF);
+            spawn_rooted_pid1("systemd", systemd.as_deref().unwrap_or(&[]), "/mnt");
         }
         let _ = baked_shell;
         return;

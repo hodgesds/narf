@@ -1447,6 +1447,32 @@ fn smoke_fs_page_cache_insert_overwrites() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_page_cache_insert_overwrites);
 
+fn smoke_fs_page_cache_clear_invalidates_all_pages() -> TestResult {
+    use crate::{Page, PageCache, PageKey};
+    let pc = PageCache::new();
+    let first = PageKey {
+        fs_id: 1,
+        inode: 1,
+        page_off: 0,
+    };
+    let second = PageKey {
+        fs_id: 1,
+        inode: 2,
+        page_off: 0,
+    };
+    pc.insert(first, Page::zeroed());
+    pc.insert(second, Page::zeroed());
+    pc.clear();
+    if !pc.is_empty() || pc.lookup(first).is_some() || pc.lookup(second).is_some() {
+        return TestResult::Fail("clear left a resident page behind");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_fs_page_cache_clear_invalidates_all_pages
+);
+
 fn smoke_fs_mode_constants_match_perms() -> TestResult {
     use crate::{FileType, Mode};
     if Mode::FILE_RO.file_type != FileType::File || Mode::FILE_RO.perms != 0o444 {

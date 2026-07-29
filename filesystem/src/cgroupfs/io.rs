@@ -173,26 +173,29 @@ impl ControllerState for IoState {
                 Ok(())
             }
             "io.max" => {
-                let (dev, limits) = parse_max_line(text)?;
+                let (dev, update) = parse_max_line(text)?;
                 let mut map = self.limits.lock();
-                if limits.is_empty() {
+                // Merge: a write updates only the fields it names,
+                // leaving unmentioned ones intact (v2 semantics). A
+                // named field of `max` clears that one field to
+                // unlimited (`None`) without dropping the whole row.
+                let cur = map.entry(dev).or_default();
+                if let Some(v) = update.rbps {
+                    cur.rbps = v;
+                }
+                if let Some(v) = update.wbps {
+                    cur.wbps = v;
+                }
+                if let Some(v) = update.riops {
+                    cur.riops = v;
+                }
+                if let Some(v) = update.wiops {
+                    cur.wiops = v;
+                }
+                // A row with every field back to `max` carries no
+                // information → drop it.
+                if cur.is_empty() {
                     map.remove(&dev);
-                } else {
-                    // Merge: a write updates only the named fields,
-                    // leaving previously-set ones intact (v2 semantics).
-                    let cur = map.entry(dev).or_default();
-                    if limits.rbps.is_some() {
-                        cur.rbps = limits.rbps;
-                    }
-                    if limits.wbps.is_some() {
-                        cur.wbps = limits.wbps;
-                    }
-                    if limits.riops.is_some() {
-                        cur.riops = limits.riops;
-                    }
-                    if limits.wiops.is_some() {
-                        cur.wiops = limits.wiops;
-                    }
                 }
                 Ok(())
             }
@@ -281,29 +284,42 @@ fn write_limit(out: &mut String, key: &str, v: Option<u64>) {
 
 // ── Parsing ─────────────────────────────────────────────────────────
 
+/// A single `io.max` write's effect on a device row. Each field is
+/// `Some(inner)` when the write *named* that key (inner `None` = the
+/// literal `max`, i.e. clear to unlimited; inner `Some(n)` = set the
+/// limit) and `None` when the key was absent (leave as-is on merge).
+#[derive(Clone, Copy, Debug, Default)]
+struct DevLimitUpdate {
+    rbps: Option<Option<u64>>,
+    wbps: Option<Option<u64>>,
+    riops: Option<Option<u64>>,
+    wiops: Option<Option<u64>>,
+}
+
 /// Parse `MAJ:MIN [rbps=..] [wbps=..] [riops=..] [wiops=..]`.
 ///
-/// Each value is either a `u64` or the literal `max` (→ `None`, clears
-/// that field). Unknown keys and malformed numbers are
-/// `FsError::InvalidData`.
-fn parse_max_line(text: &str) -> Result<(u64, DevLimits), FsError> {
+/// Each value is either a `u64` or the literal `max`. Only the keys
+/// actually present are recorded, so a partial write (e.g. `rbps=max`)
+/// clears just that field on merge rather than resetting the whole row.
+/// Unknown keys and malformed numbers are `FsError::InvalidData`.
+fn parse_max_line(text: &str) -> Result<(u64, DevLimitUpdate), FsError> {
     let mut it = text.split_whitespace();
     let dev = it.next().ok_or(FsError::InvalidData)?;
     let dev = parse_dev(dev)?;
 
-    let mut limits = DevLimits::default();
+    let mut update = DevLimitUpdate::default();
     for tok in it {
         let (key, val) = tok.split_once('=').ok_or(FsError::InvalidData)?;
         let parsed = parse_limit_val(val)?;
         match key {
-            "rbps" => limits.rbps = parsed,
-            "wbps" => limits.wbps = parsed,
-            "riops" => limits.riops = parsed,
-            "wiops" => limits.wiops = parsed,
+            "rbps" => update.rbps = Some(parsed),
+            "wbps" => update.wbps = Some(parsed),
+            "riops" => update.riops = Some(parsed),
+            "wiops" => update.wiops = Some(parsed),
             _ => return Err(FsError::InvalidData),
         }
     }
-    Ok((dev, limits))
+    Ok((dev, update))
 }
 
 /// Parse a `MAJ:MIN` pair into the packed `dev` id.

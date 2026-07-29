@@ -7,7 +7,13 @@ use super::*;
 /// uses, addressed by tid instead of pid.
 pub(crate) fn sys_tkill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let tid = args.arg0;
+    let tid = match signal_tid_from_user(current_task_id(), args.arg0) {
+        Some(tid) => tid,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+            return;
+        }
+    };
     let signum = args.arg1 as u32;
     if signum > 64 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL

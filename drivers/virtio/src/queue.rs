@@ -312,6 +312,19 @@ impl Virtqueue {
         unsafe { core::ptr::read_volatile(self.used_base().add(1)) }
     }
 
+    /// Non-mutating queue state for fatal-path diagnostics.
+    ///
+    /// The tuple is `(avail_idx, last_used_idx, device_used_idx, num_free)`.
+    /// Reading it does not consume a completion.
+    pub fn diagnostic_snapshot(&self) -> (u16, u16, u16, u16) {
+        (
+            self.avail_idx,
+            self.last_used_idx,
+            self.used_idx_snapshot(),
+            self.num_free,
+        )
+    }
+
     /// Returns true if the device requested a notification (kick) for this queue.
     /// In VIRTIO 1.0 (without EVENT_IDX), this is checked via the `used` ring's
     /// flags. If `VIRTQ_USED_F_NO_NOTIFY` (bit 0) is set, the device is actively

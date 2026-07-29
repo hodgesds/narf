@@ -947,12 +947,11 @@ fn open_impl(
         // `readlinkat()` each symlink — following the final component here
         // handed them the target instead of the link. `resolve_async_nofollow`
         // follows intermediate symlinks but returns a final symlink as-is.
-        let leaf = narf_filesystem::registry()
-            .resolve_absolute(path, |fs, rel| {
-                poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
-                    .and_then(|r| r.ok())
-            })
-            .flatten();
+        let leaf = current_resolve_absolute(path, |fs, rel| {
+            poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+                .and_then(|r| r.ok())
+        })
+        .flatten();
         if let Some(lops) = leaf {
             if lops.stat().mode.file_type == narf_filesystem::FileType::Symlink {
                 if flags & O_PATH == 0 {
@@ -970,7 +969,7 @@ fn open_impl(
                 match new_fd {
                     Some(n) => {
                         #[cfg(feature = "linux-compat")]
-                        crate::mqueue::register_fd_path(task, n, path);
+                        crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                         ctx.set_return(SyscallReturn::ok(n as u64));
                     }
                     None => ctx.set_return(fail),
@@ -990,11 +989,17 @@ fn open_impl(
     // - Explicit-mount: arg2/arg3 = (ptr, len). The path is relative.
     //   Useful when the caller already knows the mount.
     let ops = if mnt_len == 0 {
-        narf_filesystem::registry()
-            .resolve_absolute(path, |fs, rel| {
+        current_resolve_absolute(path, |fs, rel| {
+            if rel.is_empty() {
+                // A file-rooted mount (mount --bind of a file) resolves to the
+                // file at its own path; a directory-rooted mount yields None
+                // here and is handled by the directory branch below.
+                fs.root_file()
+            } else {
                 poll_blocking(narf_filesystem::resolve_async(fs.root(), rel)).and_then(|r| r.ok())
-            })
-            .flatten()
+            }
+        })
+        .flatten()
     } else {
         let mount_owned = match copy_user_path(mnt_ptr, mnt_len) {
             Some(s) => s,
@@ -1040,7 +1045,7 @@ fn open_impl(
                     // Record the backing path so /proc/<pid>/fd/<n> readlinks
                     // to it (musl realpath, lsof, opendir-on-fd). See fd_path_of.
                     #[cfg(feature = "linux-compat")]
-                    crate::mqueue::register_fd_path(task, n, path);
+                    crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                     ctx.set_return(SyscallReturn::ok(n as u64));
                 }
                 None => ctx.set_return(fail),
@@ -1086,6 +1091,42 @@ fn open_impl(
             return;
         }
     };
+
+    // O_PATH: install a bare path-reference fd. Per Linux `do_dentry_open`,
+    // an O_PATH open resolves the node but invokes NO file operation — no
+    // FIFO peer-rendezvous, no /dev/ptmx clone, no device `open`, and no
+    // read/write permission check on the file itself (O_PATH needs only
+    // search permission on the path components, already enforced by
+    // resolution). The resulting fd is usable for fstat / as an `openat`
+    // dirfd base / readlinkat, which is exactly what a walker needs. Without
+    // this, `systemd-tmpfiles-setup-dev` and sd-device — which scan /dev with
+    // `openat(…, O_PATH|O_NOFOLLOW)` purely to stat each node — parked forever
+    // the moment they reached a FIFO with no writer. Directories still wrap in
+    // `DirFdFile` so `openat`-relative descent and getdents work.
+    if flags & O_PATH != 0 {
+        let ops = if let Some(dirops) = ops.as_dir() {
+            alloc::sync::Arc::new(DirFdFile { dir: dirops }) as Arc<dyn narf_filesystem::FileOps>
+        } else {
+            ops
+        };
+        let new_fd = fd::with_table(task, |t| {
+            t.open(crate::fd::FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags: open_status_flags,
+            })
+        });
+        match new_fd {
+            Some(n) => {
+                #[cfg(feature = "linux-compat")]
+                crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
+                ctx.set_return(SyscallReturn::ok(n as u64));
+            }
+            None => ctx.set_return(fail),
+        }
+        return;
+    }
 
     // POSIX-2017 permission check. The accessor's UID/GID come from
     // the per-task uidgid table; the file's owners + perms come from
@@ -1196,7 +1237,7 @@ fn open_impl(
     // and emit IN_CREATE (new file) + IN_OPEN against any matching watch.
     #[cfg(feature = "linux-compat")]
     {
-        crate::mqueue::register_fd_path(task, new_fd, path);
+        crate::mqueue::register_fd_path(task, new_fd, path, current_mount_id_at(path));
         if created {
             crate::mqueue::notify_create(path, false);
         }
@@ -1283,7 +1324,7 @@ fn open_fifo(
         || (can_write && shared.reader_count() > 0);
     if peer_ready {
         #[cfg(feature = "linux-compat")]
-        crate::mqueue::register_fd_path(task, new_fd, _path);
+        crate::mqueue::register_fd_path(task, new_fd, _path, current_mount_id_at(_path));
         ctx.set_return(SyscallReturn::ok(new_fd as u64));
         return;
     }
@@ -2073,7 +2114,7 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
 // ── Wave-70 MemFdFile side table ───────────────────────────────────
 #[cfg(feature = "linux-compat")]
 static MEMFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::linux_compat::MemFdFile>>>,
+    Option<alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::linux_compat::MemFdFile>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 #[cfg(feature = "linux-compat")]
@@ -2081,7 +2122,7 @@ fn memfd_arc_register(arc: &alloc::sync::Arc<crate::linux_compat::MemFdFile>) {
     let key = alloc::sync::Arc::as_ptr(arc) as usize;
     let mut g = MEMFD_ARCS.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, arc.clone());
+    map.insert(key, alloc::sync::Arc::downgrade(arc));
 }
 
 #[cfg(feature = "linux-compat")]
@@ -2091,8 +2132,13 @@ pub(crate) fn memfd_arc_from_fd(
 ) -> Option<alloc::sync::Arc<crate::linux_compat::MemFdFile>> {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let g = MEMFD_ARCS.lock();
-    g.as_ref()?.get(&raw).cloned()
+    let mut g = MEMFD_ARCS.lock();
+    let map = g.as_mut()?;
+    let arc = map.get(&raw)?.upgrade();
+    if arc.is_none() {
+        map.remove(&raw);
+    }
+    arc
 }
 
 // ── Fsync / Fdatasync — flush stubs ────────────────────────────────
@@ -2218,35 +2264,32 @@ pub(crate) fn resolve_parent_dir_async(
         return None;
     }
     let parent_path = if last == 0 { "/" } else { &abs[..last] };
-    let dir = narf_filesystem::registry()
-        .resolve_absolute(parent_path, |fs, rel| {
-            // Walk `rel` segment-by-segment as DIRECTORIES. We can't use
-            // `resolve_async` here: it resolves to a FileOps and returns
-            // NotFound for a directory-only final component (e.g. a MemFs
-            // subdir, whose `lookup` yields None for Dir entries), so the
-            // parent of a nested create never resolved → EPERM. Prefer the
-            // async dir-lookup (ext2 needs block reads); fall back to the
-            // sync `lookup_dir` for filesystems that stub the async form.
-            let mut dir = fs.root();
-            for seg in rel.split('/') {
-                if seg.is_empty() || seg == "." {
-                    continue;
-                }
-                if seg == ".." {
-                    return None;
-                }
-                let next = match poll_blocking(dir.lookup_dir_async(seg)) {
-                    Some(Ok(d)) => d,
-                    Some(Err(narf_filesystem::FsError::Unsupported)) | None => {
-                        dir.lookup_dir(seg)?
-                    }
-                    Some(Err(_)) => return None,
-                };
-                dir = next;
+    let dir = current_resolve_absolute(parent_path, |fs, rel| {
+        // Walk `rel` segment-by-segment as DIRECTORIES. We can't use
+        // `resolve_async` here: it resolves to a FileOps and returns
+        // NotFound for a directory-only final component (e.g. a MemFs
+        // subdir, whose `lookup` yields None for Dir entries), so the
+        // parent of a nested create never resolved → EPERM. Prefer the
+        // async dir-lookup (ext2 needs block reads); fall back to the
+        // sync `lookup_dir` for filesystems that stub the async form.
+        let mut dir = fs.root();
+        for seg in rel.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
             }
-            Some(dir)
-        })
-        .flatten()?;
+            if seg == ".." {
+                return None;
+            }
+            let next = match poll_blocking(dir.lookup_dir_async(seg)) {
+                Some(Ok(d)) => d,
+                Some(Err(narf_filesystem::FsError::Unsupported)) | None => dir.lookup_dir(seg)?,
+                Some(Err(_)) => return None,
+            };
+            dir = next;
+        }
+        Some(dir)
+    })
+    .flatten()?;
     Some((dir, alloc::string::String::from(leaf)))
 }
 
@@ -4200,10 +4243,9 @@ pub(crate) fn terminate_current_task(
 ) {
     let pid = task_to_pid_raw(task).unwrap_or(task);
     #[cfg(feature = "syscall-trace")]
-    let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
-    #[cfg(feature = "syscall-trace")]
-    {
+    if crate::syscall::syscall_trace_target_task() {
         use core::fmt::Write;
+        let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
         let _ = writeln!(
             narf_console::Writer,
             "[process-exit] kind=signal tid={} pid={} comm={} signal={} core_dumped={} ip={:x}",
@@ -4443,6 +4485,68 @@ const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 #[cfg_attr(not(feature = "cgroup"), allow(dead_code))]
 const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+
+/// Place a `clone3(CLONE_INTO_CGROUP)` child in the cgroup named by the O_PATH
+/// directory fd `cgroup_fd` in `parent_task`'s fd table (systemd opens it with
+/// `open(cgroup, O_PATH|O_DIRECTORY|O_CLOEXEC)` for pidfd_spawn /
+/// POSIX_SPAWN_SETCGROUP). Resolves the fd to its recorded open path, strips the
+/// `/sys/fs/cgroup` mount prefix (present chroot-prefixed or not), and attaches
+/// `child_pid`. Returns true iff the child was placed; the caller falls back to
+/// parent-cgroup inheritance on false (the spawn itself must not fail).
+///
+/// `cgroup_of(child_pid)` — and hence `/proc/<child_pid>/cgroup` — reflects the
+/// placement, which is how PID 1 attributes a service's sd_notify(READY=1)
+/// datagram back to its unit (`manager_get_unit_by_pidref_cgroup`).
+#[cfg(all(feature = "cgroup", feature = "linux-compat"))]
+fn place_clone_into_cgroup(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> bool {
+    let full = match crate::mqueue::fd_path(parent_task, cgroup_fd) {
+        Some(f) => f,
+        None => return false,
+    };
+    match cgroup_rel_path(&full) {
+        Some(rel) => narf_filesystem::cgroupfs::attach_by_path(&rel, child_pid).is_ok(),
+        None => false,
+    }
+}
+
+/// Resolve an absolute path that lands inside a mounted cgroup2/cgroupfs to its
+/// cgroup-relative path (everything below the cgroupfs mount point).
+///
+/// cgroup2 is NOT fixed at `/sys/fs/cgroup`: it can be mounted anywhere, more
+/// than once, and — under a chroot — the recorded path is host-view
+/// (`/mnt/sys/fs/cgroup/...`). So this consults the live mount table and strips
+/// the LONGEST matching `cgroup2`/`cgroupfs` mount prefix rather than assuming a
+/// literal path. Returns `None` when `abs` is not under any cgroupfs mount (the
+/// caller then falls back to parent-cgroup inheritance). The mount table is in
+/// the caller's mount namespace, which is the space the cgroup fd was opened in.
+#[cfg(feature = "cgroup")]
+pub(crate) fn cgroup_rel_path(abs: &str) -> Option<alloc::string::String> {
+    current_mount_list_with_names()
+        .into_iter()
+        .filter(|(mnt, name)| {
+            (name.as_str() == "cgroup2" || name.as_str() == "cgroupfs")
+                && (abs == mnt.as_str()
+                    || (abs.starts_with(mnt.as_str())
+                        && abs.as_bytes().get(mnt.len()) == Some(&b'/')))
+        })
+        .max_by_key(|(mnt, _)| mnt.len())
+        .map(|(mnt, _)| {
+            let rel = &abs[mnt.len()..];
+            if rel.is_empty() {
+                alloc::string::String::from("/")
+            } else {
+                alloc::string::String::from(rel)
+            }
+        })
+}
+
+/// Test seam for [`place_clone_into_cgroup`] — exercises the clone3
+/// CLONE_INTO_CGROUP placement without spawning a real user task.
+#[cfg(all(feature = "cgroup", feature = "linux-compat"))]
+#[doc(hidden)]
+pub fn place_clone_into_cgroup_for_test(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> bool {
+    place_clone_into_cgroup(parent_task, cgroup_fd, child_pid)
+}
 #[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_FS: u64 = 0x0000_0200;
@@ -4967,14 +5071,23 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     if share_thread {
         thread_group_live_inc(child_visible_pid);
     }
-    let child_tid = match child_state {
-        Some(state) => crate::user_task::spawn_user_process_resume(
+    // Reserve and register the child now, but do not enqueue it until all
+    // inherited state below has been installed.  A vfork/posix_spawn child may
+    // execute its first `execveat(AT_EMPTY_PATH)` immediately, so publishing
+    // it before `fd::fork` is an SMP-visible ENOENT race.
+    let pending_child = match child_state {
+        Some(state) => crate::user_task::prepare_user_process_resume(
             proc,
             state,
             narf_scheduler::TaskSpec::user_task(),
         ),
-        None => crate::user_task::spawn_user_process(proc, narf_scheduler::TaskSpec::user_task()),
+        None => crate::user_task::prepare_user_process_initial(
+            proc,
+            narf_scheduler::TaskSpec::user_task(),
+        ),
     };
+    let child_tid = pending_child.task_id();
+    proc_identity_fork(parent_pid, child_tid.raw());
 
     // Register the (visible-pid → TaskId) binding. For
     // CLONE_THREAD children visible_pid == parent's pid, so the
@@ -4999,26 +5112,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         // systemd migrates stragglers via cgroup.procs anyway.
         #[cfg(feature = "cgroup")]
         {
-            let mut placed = false;
-            if flags & CLONE_INTO_CGROUP != 0 {
-                let full = crate::mqueue::fd_path(parent_pid, ca.cgroup as u32);
-                if let Some(full) = &full {
-                    const CG_MNT: &str = "/sys/fs/cgroup";
-                    if let Some(i) = full.find(CG_MNT) {
-                        let rel = &full[i + CG_MNT.len()..];
-                        placed = narf_filesystem::cgroupfs::attach_by_path(rel, child_visible_pid)
-                            .is_ok();
-                    }
-                }
-                #[cfg(feature = "syscall-trace")]
-                if !placed {
-                    narf_console::write_str(&alloc::format!(
-                        "[CLONE3 INTO_CGROUP unresolved fd={} path={:?}]\n",
-                        ca.cgroup,
-                        full
-                    ));
-                }
-            }
+            let placed = flags & CLONE_INTO_CGROUP != 0
+                && place_clone_into_cgroup(parent_pid, ca.cgroup as u32, child_visible_pid);
             if !placed {
                 // cgroup membership is keyed by ProcessId — look the parent up
                 // by its ProcessId, not the raw TaskId (see sys_fork).
@@ -5114,22 +5209,23 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     #[cfg(feature = "container")]
     {
         let child = child_tid.raw();
+        let parent_task = current_task_id();
         // PID + mount namespaces (only meaningful for a new process).
         if !share_thread {
             // Binds the child into the parent's pid namespace (keyed by the
             // child's TaskId) and yields the inner pid the parent should see;
             // None in the root namespace leaves the outer pid unchanged.
             if let Some(inner) =
-                crate::pid_ns::inherit_into_child(parent_pid, child, child_visible_pid)
+                crate::pid_ns::inherit_into_child(parent_task, child, child_visible_pid)
             {
                 child_ns_pid = inner;
             }
-            mount_ns_inherit(parent_pid, child);
+            mount_ns_inherit(parent_task, child);
             const CLONE_NEWNS: u64 = 0x00020000;
             const CLONE_NEWPID: u64 = 0x20000000;
             if flags & CLONE_NEWNS != 0 {
                 task_mount_ns_init();
-                let snap = narf_filesystem::MountNamespace::snapshot_global();
+                let snap = snapshot_current_mount_namespace();
                 install_mount_namespace(child, snap);
             }
             if flags & CLONE_NEWPID != 0 {
@@ -5138,9 +5234,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         }
         // UTS / NET / IPC / User: shared by ref, then CLONE_NEW* mints
         // a fresh one for the child.
-        crate::namespaces::inherit_into_child(parent_pid, child);
+        crate::namespaces::inherit_into_child(parent_task, child);
         if flags & crate::namespaces::CLONE_NEWUSER != 0 {
-            let host_uid = read_uidgid(parent_pid).euid;
+            let host_uid = read_uidgid(parent_task).euid;
             let _ = crate::namespaces::unshare_user(child, host_uid);
             let _ = write_uidgid(child, |e| {
                 e.uid = 0;
@@ -5260,6 +5356,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     } else {
         child_visible_pid
     };
+    // This is the publication point for the child. Everything keyed by its
+    // TaskId, including the copied fd table used by the immediate executor
+    // fexecve, has been installed above.
+    pending_child.spawn();
     ctx.set_return(SyscallReturn::ok(ret_val));
 
     // CLONE_VFORK: suspend the parent here until the child execs or exits
@@ -5946,7 +6046,11 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
     let uctx = match crate::user_task::current_user_task() {
         Some(u) => u,
         None => {
-            ctx.set_return(SyscallReturn::ok(0));
+            // No task context means this is a kernel-test/non-executor call,
+            // not a completed wait. Returning success leaves userspace with a
+            // zeroed siginfo_t, which systemd interprets as an unknown child
+            // state. Linux reports ECHILD when no eligible child exists.
+            ctx.set_return(SyscallReturn::ok((-10i64) as u64)); // ECHILD
             return;
         }
     };
@@ -5990,7 +6094,7 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
                 let _ = take_wait_rusage_ptr(parent);
                 uc.wait_child_pending
                     .store(false, core::sync::atomic::Ordering::Release);
-                ctx.set_return(SyscallReturn::ok(0));
+                ctx.set_return(SyscallReturn::ok((-10i64) as u64)); // ECHILD
                 return;
             }
         };
@@ -6306,6 +6410,9 @@ fn release_task_tables(tid: u64) {
 
     // Identity / credentials / per-task knobs.
     if let Some(m) = UIDGID_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = GROUPS_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
     if let Some(m) = CAP_TABLE.lock().as_mut() {
@@ -7079,7 +7186,7 @@ pub(crate) fn pgid_to_user(task_space_id: u64) -> u64 {
         return 0;
     }
     let outer = task_to_pid_raw(task_space_id).unwrap_or(task_space_id);
-    crate::pid_ns::self_inner_pid(task_space_id, outer)
+    report_pid_to(current_task_id(), outer)
 }
 #[cfg(not(feature = "container"))]
 #[inline]
@@ -7345,17 +7452,21 @@ struct UidGid {
 
 static UIDGID_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, UidGid>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+static GROUPS_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, alloc::vec::Vec<u32>>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Initialise the per-task uid/gid registry. Call once at boot
 /// before any user task issues `setuid` / `getuid`.
 pub fn uidgid_init() {
     *UIDGID_TABLE.lock() = Some(BTreeMap::new());
+    *GROUPS_TABLE.lock() = Some(BTreeMap::new());
 }
 
 /// Reset the registry — test hook.
 #[doc(hidden)]
 pub fn __test_uidgid_reset() {
     *UIDGID_TABLE.lock() = Some(BTreeMap::new());
+    *GROUPS_TABLE.lock() = Some(BTreeMap::new());
 }
 
 /// Set a task's (fsuid, fsgid) — test hook for the DAC security smoke.
@@ -7384,11 +7495,80 @@ fn read_uidgid(task: u64) -> UidGid {
 pub fn current_ucred() -> crate::socket::Ucred {
     let task = current_task_id();
     let ids = read_uidgid(task);
+    #[cfg(feature = "container")]
+    let (uid, gid) = {
+        let ns = crate::namespaces::current_user_ns(task);
+        if ns.is_initial() {
+            (ids.euid, ids.egid)
+        } else {
+            (
+                ns.translate_uid_to_host(ids.euid),
+                ns.translate_gid_to_host(ids.egid),
+            )
+        }
+    };
+    #[cfg(not(feature = "container"))]
+    let (uid, gid) = (ids.euid, ids.egid);
     crate::socket::Ucred {
         pid: task_to_pid_raw(task).unwrap_or(task) as u32,
-        uid: ids.euid,
-        gid: ids.egid,
+        uid,
+        gid,
     }
+}
+
+/// Calling task's supplementary groups in host-absolute form, suitable for
+/// capture in a Unix socket peer-credential snapshot.
+pub fn current_groups() -> alloc::vec::Vec<u32> {
+    let task = current_task_id();
+    let groups = read_groups(task);
+    #[cfg(feature = "container")]
+    {
+        let ns = crate::namespaces::current_user_ns(task);
+        if !ns.is_initial() {
+            return groups
+                .into_iter()
+                .map(|gid| ns.translate_gid_to_host(gid))
+                .collect();
+        }
+    }
+    groups
+}
+
+/// Translate host-absolute supplementary groups into the reader's user
+/// namespace. Groups not mapped into that namespace are omitted, matching
+/// Linux's peer-group visibility rules without aliasing them to overflow IDs.
+pub fn report_groups_to(_reader: u64, groups: &[u32]) -> alloc::vec::Vec<u32> {
+    #[cfg(feature = "container")]
+    {
+        let ns = crate::namespaces::current_user_ns(_reader);
+        if !ns.is_initial() {
+            return groups
+                .iter()
+                .filter_map(|gid| ns.translate_gid_from_host(*gid))
+                .collect();
+        }
+    }
+    groups.to_vec()
+}
+
+/// Translate host-absolute socket credentials into `reader`'s PID and user
+/// namespace views. Unmapped uid/gid values surface as the Linux overflow id
+/// instead of aliasing a privileged in-namespace identity.
+pub fn report_ucred_to(reader: u64, mut cred: crate::socket::Ucred) -> crate::socket::Ucred {
+    cred.pid = report_pid_to(reader, cred.pid as u64) as u32;
+    #[cfg(feature = "container")]
+    {
+        let ns = crate::namespaces::current_user_ns(reader);
+        if !ns.is_initial() {
+            cred.uid = ns
+                .translate_uid_from_host(cred.uid)
+                .unwrap_or(crate::namespaces::OVERFLOW_ID);
+            cred.gid = ns
+                .translate_gid_from_host(cred.gid)
+                .unwrap_or(crate::namespaces::OVERFLOW_ID);
+        }
+    }
+    cred
 }
 
 /// SECURITY-CRITICAL single funnel for every filesystem `Accessor`.
@@ -7455,6 +7635,34 @@ pub fn uidgid_fork(parent: u64, child: u64) {
             map.insert(child, v);
         }
     }
+    drop(g);
+    let mut groups = GROUPS_TABLE.lock();
+    if let Some(map) = groups.as_mut() {
+        if let Some(v) = map.get(&parent).cloned() {
+            map.insert(child, v);
+        }
+    }
+}
+
+pub(crate) fn read_groups(task: u64) -> alloc::vec::Vec<u32> {
+    GROUPS_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).cloned())
+        .unwrap_or_default()
+}
+
+pub(crate) fn write_groups(task: u64, groups: alloc::vec::Vec<u32>) -> bool {
+    let mut table = GROUPS_TABLE.lock();
+    let Some(map) = table.as_mut() else {
+        return false;
+    };
+    if groups.is_empty() {
+        map.remove(&task);
+    } else {
+        map.insert(task, groups);
+    }
+    true
 }
 
 fn write_uidgid<F: FnOnce(&mut UidGid)>(task: u64, f: F) -> bool {
@@ -7648,6 +7856,7 @@ struct PrctlState {
     /// unimplemented GET returned -1, forcing a doomed SET on every
     /// service start (exit 213/EXIT_SECUREBITS).
     securebits: u64,
+    seccomp_mode: u32,
 }
 
 impl Default for PrctlState {
@@ -7661,6 +7870,7 @@ impl Default for PrctlState {
             keep_caps: false,
             ambient_caps: 0, // empty ambient set at exec, per Linux
             securebits: 0,   // SECBIT_* all clear, per Linux default
+            seccomp_mode: 0,
         }
     }
 }
@@ -8212,6 +8422,20 @@ pub fn cwd_of(task: u64) -> alloc::string::String {
         .unwrap_or_else(|| alloc::string::String::from("/"))
 }
 
+/// Set `task`'s cwd (USER-view, chroot-relative — the same frame chdir stores).
+/// Used by `sys_pivot_root` to recompute the cwd in the new root's frame after
+/// the root swap, so a following relative resolution doesn't double-apply the
+/// new chroot prefix.
+pub(crate) fn set_cwd(task: u64, path: &str) {
+    let mut g = CWD_TABLE.lock();
+    if g.is_none() {
+        *g = Some(alloc::collections::BTreeMap::new());
+    }
+    if let Some(m) = g.as_mut() {
+        m.insert(task, alloc::string::String::from(path));
+    }
+}
+
 /// Collapse `.`/`..`/empty segments into a clean absolute path.
 /// `normalize_abs("/a/./b/../c")` → `/c`; an empty result is `/`.
 fn normalize_abs(p: &str) -> alloc::string::String {
@@ -8293,20 +8517,19 @@ fn path_is_mount_ancestor(path: &str) -> bool {
 }
 
 fn resolve_dir_absolute(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
-    narf_filesystem::registry()
-        .resolve_absolute(path, |fs, rel| {
-            let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
-                fs.root()
-            } else {
-                let mut cur = fs.root();
-                for seg in rel.split('/').filter(|s| !s.is_empty()) {
-                    cur = poll_blocking(cur.lookup_dir_async(seg)).and_then(|r| r.ok())?;
-                }
-                cur
-            };
-            Some(dir)
-        })
-        .flatten()
+    current_resolve_absolute(path, |fs, rel| {
+        let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
+            fs.root()
+        } else {
+            let mut cur = fs.root();
+            for seg in rel.split('/').filter(|s| !s.is_empty()) {
+                cur = poll_blocking(cur.lookup_dir_async(seg)).and_then(|r| r.ok())?;
+            }
+            cur
+        };
+        Some(dir)
+    })
+    .flatten()
 }
 
 /// Stat an absolute path, handling both files and directories.
@@ -8334,33 +8557,36 @@ fn stat_ino_path_dir_aware_ext(
     path: &str,
     follow_final: bool,
 ) -> Option<(narf_filesystem::Stat, u64, u64)> {
-    let file = narf_filesystem::registry()
-        .resolve_absolute(path, |fs, rel| {
-            if rel.is_empty() {
-                None // mount root → treated as a directory below
-            } else {
-                // Drive the ASYNC resolver (same as the open/execve path):
-                // on-disk filesystems like ext2 implement `lookup_async` but
-                // stub the sync `lookup` (block reads can't run synchronously),
-                // so the old `narf_filesystem::resolve` always missed real
-                // files — `stat("/mnt/bin/busybox")` failed while
-                // `open`/`execve` of the same path succeeded. That made every
-                // PATH probe (busybox/ash search applets via stat) report
-                // "not found" inside a mounted distro rootfs.
-                poll_blocking(narf_filesystem::resolve_async_ext(
-                    fs.root(),
-                    rel,
-                    follow_final,
-                ))
-                .and_then(|r| r.ok())
-                // rdev() is needed by seatd/libudev, which validate a
-                // device node's type via the MAJOR:MINOR from a PATH
-                // stat (not just fstat) — a 0 rdev reads as "not an
-                // evdev/drm device" and they refuse to open it.
-                .map(|ops| (ops.stat(), ops.ino(), ops.rdev()))
-            }
-        })
-        .flatten();
+    let file = current_resolve_absolute(path, |fs, rel| {
+        if rel.is_empty() {
+            // A file-rooted mount (mount --bind of a file, e.g. systemd's
+            // read-only /proc/sys/kernel/domainname protection) IS the file at
+            // its own path — stat it directly. A directory-rooted mount falls
+            // through to the resolve_dir_absolute path below.
+            fs.root_file().map(|f| (f.stat(), f.ino(), f.rdev()))
+        } else {
+            // Drive the ASYNC resolver (same as the open/execve path):
+            // on-disk filesystems like ext2 implement `lookup_async` but
+            // stub the sync `lookup` (block reads can't run synchronously),
+            // so the old `narf_filesystem::resolve` always missed real
+            // files — `stat("/mnt/bin/busybox")` failed while
+            // `open`/`execve` of the same path succeeded. That made every
+            // PATH probe (busybox/ash search applets via stat) report
+            // "not found" inside a mounted distro rootfs.
+            poll_blocking(narf_filesystem::resolve_async_ext(
+                fs.root(),
+                rel,
+                follow_final,
+            ))
+            .and_then(|r| r.ok())
+            // rdev() is needed by seatd/libudev, which validate a
+            // device node's type via the MAJOR:MINOR from a PATH
+            // stat (not just fstat) — a 0 rdev reads as "not an
+            // evdev/drm device" and they refuse to open it.
+            .map(|ops| (ops.stat(), ops.ino(), ops.rdev()))
+        }
+    })
+    .flatten();
     if file.is_some() {
         return file;
     }
@@ -8652,7 +8878,7 @@ fn do_execve_resolved(
     let path: &str = &path_owned;
 
     #[cfg(feature = "syscall-trace")]
-    {
+    if crate::syscall::syscall_trace_target_task() {
         use core::fmt::Write as _;
         let _ = writeln!(narf_console::Writer, "EXECVE path={}", path);
     }
@@ -8686,7 +8912,16 @@ fn do_execve_resolved(
     // "can't execute: Invalid argument" even though it existed.
     let read_exec = |p: &str| -> Result<alloc::vec::Vec<u8>, i64> {
         let ep = apply_chroot(p);
-        let ops = match narf_filesystem::registry().resolve_absolute(&ep, |fs, rel| {
+        // Resolve through the caller's PRIVATE mount namespace, not the global
+        // registry: a systemd service sandbox unshare(NEWNS)s, recursively binds
+        // its rootfs onto /run/systemd/mount-rootfs, and pivot_roots into it, so
+        // the binary is reachable ONLY via that task's private mount table. The
+        // O_PATH open in find_executable already resolves namespace-aware
+        // (current_resolve_absolute); execve must match, or a pivoted service's
+        // binary (e.g. systemd-udevd → ../../bin/udevadm) is invisible → ENOENT
+        // → 203/EXIT_EXEC. (Global resolution only worked while a pivot_root bug
+        // leaked the bind into the global registry.)
+        let ops = match current_resolve_absolute(&ep, |fs, rel| {
             poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
         }) {
             Some(Some(Ok(o))) => o,
@@ -9508,8 +9743,158 @@ pub fn current_mount_namespace() -> Option<alloc::sync::Arc<narf_filesystem::Mou
     g.as_ref().and_then(|m| m.get(&task).cloned())
 }
 
+pub(crate) fn snapshot_current_mount_namespace() -> alloc::sync::Arc<narf_filesystem::MountNamespace>
+{
+    current_mount_namespace()
+        .map(|ns| ns.snapshot())
+        .unwrap_or_else(narf_filesystem::MountNamespace::snapshot_global)
+}
+
+pub(crate) fn clear_current_mount_namespace_for_test() {
+    let task = current_task_id();
+    if let Some(namespaces) = TASK_MOUNT_NS.lock().as_mut() {
+        namespaces.remove(&task);
+    }
+}
+
+pub(crate) fn current_resolve_absolute<R, F>(path: &str, resolve: F) -> Option<R>
+where
+    F: FnOnce(&dyn narf_filesystem::FsInstance, &str) -> R,
+{
+    if let Some(ns) = current_mount_namespace() {
+        ns.resolve_absolute(path, resolve)
+    } else {
+        narf_filesystem::registry().resolve_absolute(path, resolve)
+    }
+}
+
+pub(crate) fn current_clone_tree_at(
+    path: &str,
+) -> Option<alloc::sync::Arc<dyn narf_filesystem::FsInstance>> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.clone_tree_at(path)
+    } else {
+        narf_filesystem::registry().clone_tree_at(path)
+    }
+}
+
+pub(crate) fn current_fs_arc_at(
+    path: &str,
+) -> Option<alloc::sync::Arc<dyn narf_filesystem::FsInstance>> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.fs_arc_at(path)
+    } else {
+        narf_filesystem::registry().fs_arc_at(path)
+    }
+}
+
+fn current_mount_list() -> alloc::vec::Vec<alloc::string::String> {
+    current_mount_namespace()
+        .map(|ns| ns.list())
+        .unwrap_or_else(|| narf_filesystem::registry().list())
+}
+
+type DetachedMountSubtree = (
+    alloc::sync::Arc<dyn narf_filesystem::FsInstance>,
+    alloc::vec::Vec<(
+        alloc::string::String,
+        alloc::sync::Arc<dyn narf_filesystem::FsInstance>,
+    )>,
+);
+
+pub(crate) fn current_clone_mount_subtree(path: &str) -> Option<DetachedMountSubtree> {
+    let base = if path == "/" {
+        "/"
+    } else {
+        path.trim_end_matches('/')
+    };
+    let root = current_clone_tree_at(base)?;
+    let paths = current_mount_namespace()
+        .map(|ns| ns.list())
+        .unwrap_or_else(|| narf_filesystem::registry().list());
+    let mut seen = alloc::collections::BTreeSet::new();
+    let mut descendants = alloc::vec::Vec::new();
+    for mount_path in paths {
+        if mount_path.len() <= base.len()
+            || !mount_path.starts_with(base)
+            || (base != "/" && mount_path.as_bytes().get(base.len()) != Some(&b'/'))
+        {
+            continue;
+        }
+        let relative = if base == "/" {
+            alloc::format!("/{}", mount_path.trim_start_matches('/'))
+        } else {
+            alloc::string::String::from(&mount_path[base.len()..])
+        };
+        if !seen.insert(relative.clone()) {
+            continue;
+        }
+        if let Some(fs) = current_fs_arc_at(&mount_path) {
+            descendants.push((relative, fs));
+        }
+    }
+    descendants.sort_by_key(|(relative, _)| relative.len());
+    Some((root, descendants))
+}
+
+fn current_mount_list_with_names() -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
+{
+    current_mount_namespace()
+        .map(|ns| ns.list_with_names())
+        .unwrap_or_else(|| narf_filesystem::registry().list_with_names())
+}
+
+fn current_mount_id_at(path: &str) -> Option<u64> {
+    match current_mount_namespace() {
+        Some(ns) => ns.mount_id_at(path),
+        None => narf_filesystem::registry().mount_id_at(path),
+    }
+}
+
+pub(crate) fn current_mount_arc(
+    authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
+    path: &str,
+    fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance>,
+) -> Result<
+    narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
+    narf_filesystem::FsError,
+> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.mount_arc(authority, path, fs)
+    } else {
+        narf_filesystem::registry().mount_arc(authority, path, fs)
+    }
+}
+
+fn current_bind_mount(
+    authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
+    source: &str,
+    target: &str,
+) -> Result<
+    narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
+    narf_filesystem::FsError,
+> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.bind_mount(authority, source, target)
+    } else {
+        narf_filesystem::registry().bind_mount(authority, source, target)
+    }
+}
+
+fn current_move_mount(
+    authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
+    source: &str,
+    target: &str,
+) -> Result<(), narf_filesystem::FsError> {
+    if let Some(ns) = current_mount_namespace() {
+        let _ = authority;
+        ns.move_mount(source, target)
+    } else {
+        narf_filesystem::registry().move_mount(authority, source, target)
+    }
+}
+
 /// Look up the mount namespace of an arbitrary task by id.
-#[cfg(feature = "container")]
 pub fn mount_namespace_of(task: u64) -> Option<alloc::sync::Arc<narf_filesystem::MountNamespace>> {
     let g = TASK_MOUNT_NS.lock();
     g.as_ref().and_then(|m| m.get(&task).cloned())
@@ -9572,14 +9957,26 @@ pub fn proc_ns_readlink(pid: u64, tag: u8) -> Option<alloc::string::String> {
 
 /// `/proc/<pid>/mountinfo` per-ns view — None when the task rides the
 /// global mount registry (procfs then renders the global view).
-#[cfg(all(feature = "container", feature = "linux-compat"))]
+#[cfg(feature = "linux-compat")]
 pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
     let ns = mount_namespace_of(task)?;
+    let process_root = root_dir_of(task).unwrap_or_else(|| alloc::string::String::from("/"));
     let mut s = alloc::string::String::new();
     use core::fmt::Write as _;
-    for (path, name) in ns.list_with_names() {
-        let _ = writeln!(s, "{}\t{}", path, name);
+    for (id, parent, path, name) in ns.list_mountinfo() {
+        let visible = if process_root == "/" {
+            path
+        } else if path == process_root {
+            alloc::string::String::from("/")
+        } else if path.starts_with(process_root.as_str())
+            && path.as_bytes().get(process_root.len()) == Some(&b'/')
+        {
+            alloc::string::String::from(&path[process_root.len()..])
+        } else {
+            continue;
+        };
+        let _ = writeln!(s, "{}\t{}\t{}\t{}", id, parent, visible, name);
     }
     Some(s)
 }
@@ -9679,6 +10076,33 @@ fn root_dir_init_if_needed() {
 pub fn root_dir_of(task: u64) -> Option<alloc::string::String> {
     let g = ROOT_DIR_TABLE.lock();
     g.as_ref().and_then(|m| m.get(&task).cloned())
+}
+
+/// Install the filesystem root for a task before its first instruction.
+///
+/// Kernel boot uses this to make a directly loaded dynamic PID 1 observe the
+/// mounted distro root from its first interpreter and pathname lookup.  It is
+/// the same per-task root state `chroot(2)` installs, but does not require a
+/// temporary userspace launcher to perform that syscall.
+#[cfg(feature = "linux-compat")]
+pub fn install_root_dir(task: u64, root: &str) -> bool {
+    if !root.starts_with('/') {
+        return false;
+    }
+    let root = root.trim_end_matches('/');
+    let root = if root.is_empty() { "/" } else { root };
+    root_dir_init_if_needed();
+    if let Some(entries) = ROOT_DIR_TABLE.lock().as_mut() {
+        entries.insert(task, alloc::string::String::from(root));
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(feature = "linux-compat"))]
+pub fn install_root_dir(_task: u64, _root: &str) -> bool {
+    false
 }
 
 /// fork(2) inheritance — child inherits parent's chroot.
@@ -9839,6 +10263,8 @@ pub(crate) fn sig_from_bit(bits: u64) -> u32 {
 }
 
 pub(crate) static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+static SIGNAL_READABLE_GEN: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 // ── Per-task CPU-time accounting (getrusage / times) ────────────────
@@ -10396,6 +10822,7 @@ fn take_suspend_saved_mask(task: u64) -> Option<u64> {
 /// Pair with `sigaction_init` at boot.
 pub fn signal_init() {
     *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
+    *SIGNAL_READABLE_GEN.lock() = Some(BTreeMap::new());
     *SIGNAL_MASK.lock() = Some(BTreeMap::new());
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
 }
@@ -10404,6 +10831,7 @@ pub fn signal_init() {
 #[doc(hidden)]
 pub fn __test_signal_reset() {
     *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
+    *SIGNAL_READABLE_GEN.lock() = Some(BTreeMap::new());
     *SIGNAL_MASK.lock() = Some(BTreeMap::new());
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
     *SIGQUEUE_INFO.lock() = Some(BTreeMap::new());
@@ -10413,6 +10841,14 @@ pub fn __test_signal_reset() {
 /// Diagnostic: peek the pending bitmap for `task`.
 pub fn signal_pending_of(task: u64) -> u64 {
     SIGNAL_PENDING
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0)
+}
+
+pub fn signal_readable_generation(task: u64) -> u64 {
+    SIGNAL_READABLE_GEN
         .lock()
         .as_ref()
         .and_then(|m| m.get(&task).copied())
@@ -10501,6 +10937,30 @@ static PROC_COMM: narf_lib::sync::IrqSafeSpinLock<
 static PROC_EXE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, alloc::string::String>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[cfg(target_arch = "x86_64")]
+fn proc_identity_fork(parent_task: u64, child_task: u64) {
+    let inherited_comm = {
+        let g = PROC_COMM.lock();
+        g.as_ref().and_then(|m| m.get(&parent_task).cloned())
+    };
+    if let Some(comm) = inherited_comm {
+        PROC_COMM
+            .lock()
+            .get_or_insert_with(alloc::collections::BTreeMap::new)
+            .insert(child_task, comm);
+    }
+    let inherited_exe = {
+        let g = PROC_EXE.lock();
+        g.as_ref().and_then(|m| m.get(&parent_task).cloned())
+    };
+    if let Some(exe) = inherited_exe {
+        PROC_EXE
+            .lock()
+            .get_or_insert_with(alloc::collections::BTreeMap::new)
+            .insert(child_task, exe);
+    }
+}
 
 /// Record the exec'd binary path for `/proc/[pid]/exe`. A relative
 /// exec path is resolved against the caller's cwd so the link is
@@ -10596,6 +11056,13 @@ pub fn proc_argv_of(pid: u64) -> alloc::vec::Vec<u8> {
 /// the comm-from-argv[0]-basename step ran.
 pub fn proc_comm_of(pid: u64) -> Option<alloc::string::String> {
     let tid = proc_pid_to_tid(pid);
+    proc_comm_of_task(tid)
+}
+
+/// Read the comm table by scheduler task id. Diagnostic filters run before
+/// translating to a user-visible PID and must not feed a TaskId through
+/// `proc_pid_to_tid` a second time.
+pub fn proc_comm_of_task(tid: u64) -> Option<alloc::string::String> {
     let g = PROC_COMM.lock();
     g.as_ref().and_then(|m| m.get(&tid).cloned())
 }
@@ -11112,8 +11579,17 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
         None => return,
     };
     let slot = map.entry(task).or_insert(0);
+    let was_empty = *slot == 0;
     *slot |= sig_bit(signum);
     drop(g);
+    if was_empty {
+        let mut gens = SIGNAL_READABLE_GEN.lock();
+        let generation = gens
+            .get_or_insert_with(BTreeMap::new)
+            .entry(task)
+            .or_insert(0);
+        *generation = generation.wrapping_add(1);
+    }
     // Wake the task if it is parked (sleep/pause) so an asynchronously
     // raised signal — e.g. SIGALRM from an interval timer — is taken
     // promptly rather than only at the next self-driven re-poll.
@@ -11235,7 +11711,18 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
     let mut g = SIGNAL_PENDING.lock();
     if let Some(map) = g.as_mut() {
         if let Some(slot) = map.get_mut(&task) {
+            let was_empty = *slot == 0;
             *slot |= sig_bit(signum);
+            if was_empty {
+                drop(g);
+                let mut gens = SIGNAL_READABLE_GEN.lock();
+                let generation = gens
+                    .get_or_insert_with(BTreeMap::new)
+                    .entry(task)
+                    .or_insert(0);
+                *generation = generation.wrapping_add(1);
+                return true;
+            }
             return true;
         }
     }
@@ -11459,6 +11946,21 @@ fn signal_target_exists(tid: u64) -> bool {
         .is_some_and(|m| m.contains_key(&tid))
 }
 
+/// Resolve the thread identifier supplied by a Linux signal syscall to the
+/// TaskId that owns NARF's signal state.  A thread-group leader is visible as
+/// its PID through gettid(2), while CLONE_THREAD siblings retain their
+/// distinct TaskId-derived TIDs.  Keep the latter in task space, then map a
+/// leader PID (including the caller's PID-namespace view) back to its task.
+fn signal_tid_from_user(caller: u64, tid: u64) -> Option<u64> {
+    let is_non_leader_thread =
+        tid == caller || task_to_pid_raw(tid).is_some_and(|pid| pid_to_task_raw(pid) != Some(tid));
+    if is_non_leader_thread {
+        return Some(tid);
+    }
+    let pid = accept_pid_from(caller, tid)?;
+    Some(pid_to_task_raw(pid).unwrap_or(pid))
+}
+
 /// Copy `si_code` (offset 8), `si_pid` (offset 16) and `si_value` (the
 /// sigval union, offset 24) out of a user `siginfo_t` and stash them for
 /// delivery / sigtimedwait / signalfd. Returns `false` only when the
@@ -11544,7 +12046,14 @@ const FUTEX_OP_MASK: u64 = !(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
 /// Perform `FUTEX_WAKE_OP` (Linux `kernel/futex/core.c::futex_wake_op`).
 /// `nr_wake`/`nr_wake2` = arg2/arg3, `uaddr2` = arg4, `encoded_op` = arg5.
 /// Returns the syscall result (total woken, or a negative errno).
-fn futex_wake_op(uaddr: u64, nr_wake: u32, nr_wake2: u32, uaddr2: u64, encoded_op: u32) -> i64 {
+fn futex_wake_op(
+    namespace: u64,
+    uaddr: u64,
+    nr_wake: u32,
+    nr_wake2: u32,
+    uaddr2: u64,
+    encoded_op: u32,
+) -> i64 {
     const EFAULT: i64 = 14;
     if uaddr2 == 0 {
         return -EFAULT;
@@ -11581,8 +12090,9 @@ fn futex_wake_op(uaddr: u64, nr_wake: u32, nr_wake2: u32, uaddr2: u64, encoded_o
         return -EFAULT;
     }
     // Wake `nr_wake` on uaddr unconditionally.
-    futex_bump_counter(uaddr);
-    let mut woken = futex_wake_waiters(uaddr, nr_wake) as i64;
+    let key = futex_key(namespace, uaddr);
+    futex_bump_counter_key(key);
+    let mut woken = futex_wake_waiters_key(key, nr_wake) as i64;
     // Conditionally wake `nr_wake2` on uaddr2 if (oldval CMP cmparg).
     let ov = oldval as i32;
     let cond = match cmp {
@@ -11595,8 +12105,9 @@ fn futex_wake_op(uaddr: u64, nr_wake: u32, nr_wake2: u32, uaddr2: u64, encoded_o
         _ => return -22,   // EINVAL
     };
     if cond {
-        futex_bump_counter(uaddr2);
-        woken += futex_wake_waiters(uaddr2, nr_wake2) as i64;
+        let key2 = futex_key(namespace, uaddr2);
+        futex_bump_counter_key(key2);
+        woken += futex_wake_waiters_key(key2, nr_wake2) as i64;
     }
     woken
 }
@@ -11607,8 +12118,30 @@ fn futex_wake_op(uaddr: u64, nr_wake: u32, nr_wake2: u32, uaddr2: u64, encoded_o
 /// "queue + dequeue" — Linux models them as "tagged wakeup events",
 /// and the counter gives us that without per-task ownership, which
 /// keeps the implementation lock-free except for the table mutation.
+#[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct FutexKey {
+    namespace: u64,
+    uaddr: u64,
+}
+
+#[inline]
+pub(crate) fn futex_key(namespace: u64, uaddr: u64) -> FutexKey {
+    FutexKey { namespace, uaddr }
+}
+
+/// Namespace for a futex operation. Private futexes are scoped to the live
+/// AddressSpace Arc; CLONE_VM threads share it, unrelated processes do not.
+fn futex_namespace(private: bool) -> u64 {
+    if !private {
+        return 0;
+    }
+    current_address_space()
+        .map(|space| alloc::sync::Arc::as_ptr(&space) as usize as u64)
+        .unwrap_or(0)
+}
+
 static FUTEX_WAKE_COUNTERS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, u64>>,
+    Option<alloc::collections::BTreeMap<FutexKey, u64>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn futex_table_init() {
@@ -11618,19 +12151,27 @@ fn futex_table_init() {
     }
 }
 
-fn futex_wake_counter(uaddr: u64) -> u64 {
+fn futex_wake_counter_key(key: FutexKey) -> u64 {
     futex_table_init();
     let g = FUTEX_WAKE_COUNTERS.lock();
-    g.as_ref().and_then(|m| m.get(&uaddr).copied()).unwrap_or(0)
+    g.as_ref().and_then(|m| m.get(&key).copied()).unwrap_or(0)
 }
 
-fn futex_bump_counter(uaddr: u64) {
+pub(crate) fn futex_bump_counter_key(key: FutexKey) {
     futex_table_init();
     let mut g = FUTEX_WAKE_COUNTERS.lock();
     if let Some(m) = g.as_mut() {
-        let slot = m.entry(uaddr).or_insert(0);
+        let slot = m.entry(key).or_insert(0);
         *slot = slot.wrapping_add(1);
     }
+}
+
+fn futex_wake_counter(uaddr: u64) -> u64 {
+    futex_wake_counter_key(futex_key(0, uaddr))
+}
+
+fn futex_bump_counter(uaddr: u64) {
+    futex_bump_counter_key(futex_key(0, uaddr));
 }
 
 /// Live per-uaddr `FUTEX_WAKE` generation. The user-task poll routine
@@ -11639,6 +12180,11 @@ fn futex_bump_counter(uaddr: u64) {
 /// (lost-wakeup guard). Public mirror of `futex_wake_counter`.
 pub fn futex_gen(uaddr: u64) -> u64 {
     futex_wake_counter(uaddr)
+}
+
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(crate) fn futex_gen_key(key: FutexKey) -> u64 {
+    futex_wake_counter_key(key)
 }
 
 /// `FUTEX_WAIT` seqlock read: sample the per-uaddr wake generation FIRST,
@@ -11658,7 +12204,14 @@ pub(crate) fn futex_wait_seqlock_read(
     uaddr: u64,
     read_word: impl FnOnce() -> Option<u32>,
 ) -> Option<(u64, u32)> {
-    let gen = futex_wake_counter(uaddr);
+    futex_wait_seqlock_read_key(futex_key(0, uaddr), read_word)
+}
+
+pub(crate) fn futex_wait_seqlock_read_key(
+    key: FutexKey,
+    read_word: impl FnOnce() -> Option<u32>,
+) -> Option<(u64, u32)> {
+    let gen = futex_wake_counter_key(key);
     let current = read_word()?;
     Some((gen, current))
 }
@@ -11680,26 +12233,39 @@ pub fn __test_futex_bump_counter(uaddr: u64) {
 /// overwrites its own slot (bounded) and `futex_drop_waiter` can remove it.
 #[allow(clippy::type_complexity)]
 static FUTEX_WAITERS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, alloc::collections::BTreeMap<u64, core::task::Waker>>>,
+    Option<
+        alloc::collections::BTreeMap<
+            FutexKey,
+            alloc::collections::BTreeMap<u64, core::task::Waker>,
+        >,
+    >,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Register `task_id`'s waker as parked on futex word `uaddr`. Called from
 /// the user-task poll routine while a task blocks in `FUTEX_WAIT`.
 pub fn futex_register_waiter(uaddr: u64, task_id: u64, waker: core::task::Waker) {
+    futex_register_waiter_key(futex_key(0, uaddr), task_id, waker);
+}
+
+pub(crate) fn futex_register_waiter_key(key: FutexKey, task_id: u64, waker: core::task::Waker) {
     let mut g = FUTEX_WAITERS.lock();
     let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    m.entry(uaddr).or_default().insert(task_id, waker);
+    m.entry(key).or_default().insert(task_id, waker);
 }
 
 /// Remove `task_id`'s futex waker on `uaddr` without firing it (the task
 /// woke for another reason — lost-wakeup re-poll, timeout, or exit).
 pub fn futex_drop_waiter(uaddr: u64, task_id: u64) {
+    futex_drop_waiter_key(futex_key(0, uaddr), task_id);
+}
+
+pub(crate) fn futex_drop_waiter_key(key: FutexKey, task_id: u64) {
     let mut g = FUTEX_WAITERS.lock();
     if let Some(m) = g.as_mut() {
-        if let Some(set) = m.get_mut(&uaddr) {
+        if let Some(set) = m.get_mut(&key) {
             set.remove(&task_id);
             if set.is_empty() {
-                m.remove(&uaddr);
+                m.remove(&key);
             }
         }
     }
@@ -11711,12 +12277,16 @@ pub fn futex_drop_waiter(uaddr: u64, task_id: u64) {
 /// clears each woken task's finite sleep deadline so its re-poll falls
 /// through to re-enter user mode (where musl re-checks the futex word).
 fn futex_wake_waiters(uaddr: u64, n: u32) -> usize {
+    futex_wake_waiters_key(futex_key(0, uaddr), n)
+}
+
+pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
     let drained: alloc::vec::Vec<(u64, core::task::Waker)> = {
         let mut g = FUTEX_WAITERS.lock();
         let Some(m) = g.as_mut() else {
             return 0;
         };
-        let Some(set) = m.get_mut(&uaddr) else {
+        let Some(set) = m.get_mut(&key) else {
             return 0;
         };
         // BTreeMap has no pop; collect the first `n` keys then remove them.
@@ -11728,7 +12298,7 @@ fn futex_wake_waiters(uaddr: u64, n: u32) -> usize {
             }
         }
         if set.is_empty() {
-            m.remove(&uaddr);
+            m.remove(&key);
         }
         out
     };
@@ -11765,21 +12335,39 @@ fn futex_requeue_waiters(
     n_move: u32,
     new_val: u32,
 ) -> (usize, usize) {
+    futex_requeue_waiters_keyed(
+        futex_key(0, uaddr),
+        futex_key(0, uaddr2),
+        uaddr2,
+        n_wake,
+        n_move,
+        new_val,
+    )
+}
+
+fn futex_requeue_waiters_keyed(
+    key: FutexKey,
+    key2: FutexKey,
+    uaddr2: u64,
+    n_wake: u32,
+    n_move: u32,
+    new_val: u32,
+) -> (usize, usize) {
     // Wake side first, exactly like FUTEX_WAKE: bump the source generation
     // (so a waiter racing its park registration re-checks), then pop + fire.
-    futex_bump_counter(uaddr);
-    let woken = futex_wake_waiters(uaddr, n_wake);
+    futex_bump_counter_key(key);
+    let woken = futex_wake_waiters_key(key, n_wake);
     if n_move == 0 {
         return (woken, 0);
     }
     // Destination-generation snapshot BEFORE the queue move (see above).
-    let gen2 = futex_wake_counter(uaddr2);
+    let gen2 = futex_wake_counter_key(key2);
     let moved: alloc::vec::Vec<u64> = {
         let mut g = FUTEX_WAITERS.lock();
         let Some(m) = g.as_mut() else {
             return (woken, 0);
         };
-        let Some(set) = m.get_mut(&uaddr) else {
+        let Some(set) = m.get_mut(&key) else {
             return (woken, 0);
         };
         let take: alloc::vec::Vec<u64> = set.keys().take(n_move as usize).copied().collect();
@@ -11791,9 +12379,9 @@ fn futex_requeue_waiters(
             }
         }
         if set.is_empty() {
-            m.remove(&uaddr);
+            m.remove(&key);
         }
-        let dst = m.entry(uaddr2).or_default();
+        let dst = m.entry(key2).or_default();
         let mut tids = alloc::vec::Vec::with_capacity(movers.len());
         for (tid, w) in movers {
             dst.insert(tid, w);
@@ -11808,6 +12396,7 @@ fn futex_requeue_waiters(
             uc.futex_park_gen.store(gen2, Ordering::Release);
             uc.futex_val.store(new_val, Ordering::Release);
             uc.futex_uaddr.store(uaddr2, Ordering::Release);
+            uc.futex_namespace.store(key2.namespace, Ordering::Release);
         });
     }
     (woken, moved.len())
@@ -11876,8 +12465,37 @@ pub fn __test_futex_requeue(uaddr: u64, uaddr2: u64, n_wake: u32, n_move: u32) -
 pub fn __test_futex_waiter_count(uaddr: u64) -> usize {
     let g = FUTEX_WAITERS.lock();
     g.as_ref()
-        .and_then(|m| m.get(&uaddr).map(|s| s.len()))
+        .and_then(|m| m.get(&futex_key(0, uaddr)).map(|s| s.len()))
         .unwrap_or(0)
+}
+
+#[doc(hidden)]
+pub fn __test_futex_register_waiter_scoped(
+    namespace: u64,
+    uaddr: u64,
+    task_id: u64,
+    waker: core::task::Waker,
+) {
+    futex_register_waiter_key(futex_key(namespace, uaddr), task_id, waker);
+}
+
+#[doc(hidden)]
+pub fn __test_futex_wake_scoped(namespace: u64, uaddr: u64, n: u32) -> usize {
+    let key = futex_key(namespace, uaddr);
+    futex_bump_counter_key(key);
+    futex_wake_waiters_key(key, n)
+}
+
+/// Fatal-path futex snapshot: `(live_generation, registered_waiters)`.
+pub fn dbg_futex_state(namespace: u64, uaddr: u64) -> (u64, usize) {
+    let key = futex_key(namespace, uaddr);
+    let generation = futex_wake_counter_key(key);
+    let waiters = FUTEX_WAITERS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&key).map(|set| set.len()))
+        .unwrap_or(0);
+    (generation, waiters)
 }
 
 /// Test-only FUTEX_WAKE equivalent (gen bump + pop-and-fire), so tests can
@@ -11904,7 +12522,13 @@ pub fn futex_wake_waiters_for_test(uaddr: u64, n: u32) -> usize {
 ///
 /// `uaddr == 0` is treated as an immediate (POSIX-permitted) spurious
 /// wake so wake-path smokes can run without a backing mapping.
-fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns: u64) {
+fn futex_wait_core(
+    ctx: &mut dyn TrapContext,
+    namespace: u64,
+    uaddr: u64,
+    val: u32,
+    park_cap_ns: u64,
+) {
     const EAGAIN: i64 = 11;
     const EFAULT: i64 = 14;
     if uaddr == 0 {
@@ -11914,7 +12538,8 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
     // Seqlock read: sample the wake generation BEFORE reading `*uaddr` (see
     // `futex_wait_seqlock_read` — sampling after the read loses a racing
     // FUTEX_WAKE and deadlocks a contended mutex/condvar under SMP).
-    let (gen, current) = match futex_wait_seqlock_read(uaddr, || {
+    let key = futex_key(namespace, uaddr);
+    let (gen, current) = match futex_wait_seqlock_read_key(key, || {
         let mut buf4 = [0u8; 4];
         // SAFETY: copy_from_user range-validates `uaddr` + SMAP-brackets the read.
         if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
@@ -11955,6 +12580,7 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
             // Park-loop word re-validation snapshot (see sys_futex).
             uc.futex_val.store(val, Ordering::Release);
             uc.futex_uaddr.store(uaddr, Ordering::Release);
+            uc.futex_namespace.store(namespace, Ordering::Release);
             uc.sleep_deadline_ns.store(deadline, Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
@@ -12572,6 +13198,7 @@ pub fn default_sync_signal_delivery(
                 use core::fmt::Write;
                 let pid = task_to_pid_raw(task).unwrap_or(task);
                 let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
+                let exe = proc_exe_path(pid).unwrap_or_else(|| alloc::string::String::from("?"));
                 let cause = match vector {
                     6 => "#UD",
                     13 => "#GP",
@@ -12592,6 +13219,7 @@ pub fn default_sync_signal_delivery(
                     info.addr,
                     ctx.rip()
                 );
+                let _ = writeln!(narf_console::Writer, "  exe={}", exe);
                 // Dump the GP register file — a faulting instruction's
                 // operands (e.g. a corrupted heap/meta pointer in r13/r15)
                 // pin whether the fault is a slightly-off pointer (adjacent
@@ -13126,18 +13754,24 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
 fn parse_scm_rights_fds(
     ctrl_ptr: u64,
     ctrl_len: usize,
-) -> alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
+) -> Result<alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>>, i64> {
     const SOL_SOCKET: i32 = 1;
     const SCM_RIGHTS: i32 = 1;
     // struct cmsghdr { u64 cmsg_len; i32 cmsg_level; i32 cmsg_type; } = 16 B.
     let mut out = alloc::vec::Vec::new();
-    if ctrl_ptr == 0 || !(16..=MAX_USER_COPY).contains(&ctrl_len) {
-        return out;
+    if ctrl_len == 0 {
+        return Ok(out);
+    }
+    if ctrl_ptr == 0 {
+        return Err(14); // EFAULT
+    }
+    if !(16..=MAX_USER_COPY).contains(&ctrl_len) {
+        return Err(22); // EINVAL
     }
     let mut ctrl = alloc::vec![0u8; ctrl_len];
     // SAFETY: ctrl sized to ctrl_len; copy_from_user range-validates + SMAP.
     if unsafe { copy_from_user(&mut ctrl, ctrl_ptr) }.is_err() {
-        return out;
+        return Err(14); // EFAULT
     }
     let task = current_task_id();
     // Walk cmsg records (8-byte aligned).
@@ -13147,7 +13781,7 @@ fn parse_scm_rights_fds(
         let level = i32::from_le_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
         let ctype = i32::from_le_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
         if cmsg_len < 16 || off + cmsg_len > ctrl_len {
-            break;
+            return Err(22); // EINVAL
         }
         if level == SOL_SOCKET && ctype == SCM_RIGHTS {
             let nfds = (cmsg_len - 16) / 4;
@@ -13155,19 +13789,20 @@ fn parse_scm_rights_fds(
                 let fpos = off + 16 + i * 4;
                 let fd = i32::from_le_bytes(ctrl[fpos..fpos + 4].try_into().unwrap());
                 if fd < 0 {
-                    continue;
+                    return Err(9); // EBADF
                 }
-                if let Some(ops) =
+                let Some(ops) =
                     fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten()
-                {
-                    out.push(ops);
-                }
+                else {
+                    return Err(9); // EBADF: send no payload or partial rights
+                };
+                out.push(ops);
             }
         }
         // Advance to the next cmsg (CMSG_ALIGN to 8 bytes).
         off += (cmsg_len + 7) & !7;
     }
-    out
+    Ok(out)
 }
 
 /// Install kernel-sender credentials and, when requested through
@@ -13220,7 +13855,8 @@ fn install_recv_ancillary(
     msg_ptr: u64,
     fds: alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
     cred: Option<crate::socket::Ucred>,
-) {
+    cloexec: bool,
+) -> bool {
     const SOL_SOCKET: i32 = 1;
     const SCM_RIGHTS: i32 = 1;
     const SCM_CREDENTIALS: i32 = 2;
@@ -13232,21 +13868,31 @@ fn install_recv_ancillary(
         // `copy_to_user` range-validates the user address and SMAP-brackets the
         // write, so a bad pointer returns Err rather than faulting the kernel.
         let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
-        return;
+        return false;
     }
-    // Install each received file object at a fresh fd (SCM_RIGHTS semantics:
-    // the fds are consumed even if the control buffer can't report them).
+    // Only install descriptors that fit in the caller's control buffer.
+    // Installing an fd whose number cannot be reported leaks an unreachable
+    // slot in the receiver. Linux instead closes truncated SCM_RIGHTS entries.
+    let control_capacity = if ctrl_ptr == 0 { 0 } else { ctrl_len };
+    let mut max_rights = control_capacity.saturating_sub(16) / 4;
+    while max_rights > 0 && ((16 + max_rights * 4 + 7) & !7) > control_capacity {
+        max_rights -= 1;
+    }
+    let rights_to_install = core::cmp::min(fds.len(), max_rights);
+    let mut truncated = rights_to_install < fds.len();
     let task = current_task_id();
     let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
-    for ops in fds {
+    for ops in fds.into_iter().take(rights_to_install) {
         let entry = fd::FdEntry {
             ops,
             offset: 0,
-            flags: 0,
+            flags: if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
             status_flags: 0,
         };
         if let Some(newfd) = fd::with_table(task, |t| t.open(entry)) {
             new_fds.push(newfd as i32);
+        } else {
+            truncated = true;
         }
     }
     // Build the control buffer: each cmsg is cmsghdr(16) + data, padded to
@@ -13277,19 +13923,24 @@ fn install_recv_ancillary(
         data[0..4].copy_from_slice(&c.pid.to_le_bytes());
         data[4..8].copy_from_slice(&c.uid.to_le_bytes());
         data[8..12].copy_from_slice(&c.gid.to_le_bytes());
-        push_cmsg(&mut ctrl, SCM_CREDENTIALS, &data);
+        // SCM_RIGHTS precedes SCM_CREDENTIALS. If the latter does not fit,
+        // omit it and report MSG_CTRUNC while retaining any rights that did.
+        if ctrl.len().saturating_add(32) <= control_capacity {
+            push_cmsg(&mut ctrl, SCM_CREDENTIALS, &data);
+        } else {
+            truncated = true;
+        }
     }
-    if ctrl_ptr == 0 || ctrl_len < ctrl.len() {
-        // No room for the control data — any fds are still installed but the
-        // numbers can't be reported (Linux would set MSG_CTRUNC here).
+    if ctrl_ptr == 0 {
         // SAFETY: 8-byte write to `msg_controllen` at `msg_ptr + 40`.
         let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
-        return;
+        return true;
     }
     // SAFETY: ctrl_ptr is the user msg_control buffer, len-checked above.
     let _ = unsafe { copy_to_user(ctrl_ptr, &ctrl) };
     // SAFETY: 8-byte write to `msg_controllen` at `msg_ptr + 40`.
     let _ = unsafe { copy_to_user(msg_ptr + 40, &(ctrl.len() as u64).to_le_bytes()) };
+    truncated
 }
 
 #[inline]
@@ -13519,21 +14170,26 @@ const EPOLL_CTL_MOD: u32 = 3;
 // EpollFile recovery from FdEntry — same shape as the SocketFile
 // side table since Arc<dyn FileOps> can't be downcast generically.
 static EPOLL_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::io_mux::EpollFile>>>,
+    Option<alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::io_mux::EpollFile>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn epoll_arc_register(arc: &alloc::sync::Arc<crate::io_mux::EpollFile>) {
     let key = alloc::sync::Arc::as_ptr(arc) as usize;
     let mut g = EPOLL_ARCS.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, arc.clone());
+    map.insert(key, alloc::sync::Arc::downgrade(arc));
 }
 
 fn epoll_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mux::EpollFile>> {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let g = EPOLL_ARCS.lock();
-    g.as_ref()?.get(&raw).cloned()
+    let mut g = EPOLL_ARCS.lock();
+    let map = g.as_mut()?;
+    let arc = map.get(&raw)?.upgrade();
+    if arc.is_none() {
+        map.remove(&raw);
+    }
+    arc
 }
 
 // Wave-61: pidfd_open(pid, flags) → fd that signals POLLIN on exit.
@@ -13551,21 +14207,26 @@ fn epoll_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mu
 // (GPL-2.0-or-later, kernel.org).
 
 static TIMERFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::io_mux::TimerFd>>>,
+    Option<alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::io_mux::TimerFd>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn timerfd_arc_register(arc: &alloc::sync::Arc<crate::io_mux::TimerFd>) {
     let key = alloc::sync::Arc::as_ptr(arc) as usize;
     let mut g = TIMERFD_ARCS.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, arc.clone());
+    map.insert(key, alloc::sync::Arc::downgrade(arc));
 }
 
 fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mux::TimerFd>> {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let g = TIMERFD_ARCS.lock();
-    g.as_ref()?.get(&raw).cloned()
+    let mut g = TIMERFD_ARCS.lock();
+    let map = g.as_mut()?;
+    let arc = map.get(&raw)?.upgrade();
+    if arc.is_none() {
+        map.remove(&raw);
+    }
+    arc
 }
 
 // ── Wave-70 SignalFdFile side table ────────────────────────────────
@@ -13575,7 +14236,7 @@ fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_
 #[cfg(feature = "linux-compat")]
 static SIGNALFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
     Option<
-        alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::linux_compat::SignalFdFile>>,
+        alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::linux_compat::SignalFdFile>>,
     >,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -13584,7 +14245,7 @@ fn signalfd_arc_register(arc: &alloc::sync::Arc<crate::linux_compat::SignalFdFil
     let key = alloc::sync::Arc::as_ptr(arc) as usize;
     let mut g = SIGNALFD_ARCS.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, arc.clone());
+    map.insert(key, alloc::sync::Arc::downgrade(arc));
 }
 
 #[cfg(feature = "linux-compat")]
@@ -13594,8 +14255,13 @@ pub(crate) fn signalfd_arc_from_fd(
 ) -> Option<alloc::sync::Arc<crate::linux_compat::SignalFdFile>> {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let g = SIGNALFD_ARCS.lock();
-    g.as_ref()?.get(&raw).cloned()
+    let mut g = SIGNALFD_ARCS.lock();
+    let map = g.as_mut()?;
+    let arc = map.get(&raw)?.upgrade();
+    if arc.is_none() {
+        map.remove(&raw);
+    }
+    arc
 }
 
 // ── Installer ──────────────────────────────────────────────────────
@@ -13826,7 +14492,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Setns, "setns", RawFnHandler(sys_setns));
     #[cfg(feature = "linux-compat")]
     table.install_raw(Syscall::Chroot, "chroot", RawFnHandler(sys_chroot));
-    #[cfg(all(feature = "linux-compat", feature = "container"))]
+    #[cfg(feature = "linux-compat")]
     table.install_raw(
         Syscall::PivotRoot,
         "pivot_root",
@@ -14086,6 +14752,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_sched_setparam),
     );
     table.install_raw(Syscall::Prctl, "prctl", RawFnHandler(sys_prctl));
+    table.install_raw(Syscall::Seccomp, "seccomp", RawFnHandler(sys_seccomp));
     table.install_raw(
         Syscall::Getpriority,
         "getpriority",
@@ -15430,6 +16097,8 @@ mod handler_sys_capget;
 mod handler_sys_capset;
 #[path = "sys_chdir.rs"]
 mod handler_sys_chdir;
+#[path = "sys_chdir_for_test.rs"]
+mod handler_sys_chdir_for_test;
 #[path = "sys_chmod.rs"]
 mod handler_sys_chmod;
 #[path = "sys_chroot.rs"]
@@ -15798,6 +16467,8 @@ mod handler_sys_sched_setattr;
 mod handler_sys_sched_setparam;
 #[path = "sys_sched_setscheduler.rs"]
 mod handler_sys_sched_setscheduler;
+#[path = "sys_seccomp.rs"]
+mod handler_sys_seccomp;
 #[path = "sys_semget.rs"]
 mod handler_sys_semget;
 #[path = "sys_sendfile.rs"]
@@ -15998,8 +16669,9 @@ mod handler_sys_yield;
 #[allow(unused_imports)]
 pub(crate) use handler_sys_arch_prctl::*;
 #[allow(unused_imports)]
-pub(crate) use handler_sys_chroot::*;
+pub use handler_sys_chdir_for_test::*;
 #[allow(unused_imports)]
+pub(crate) use handler_sys_chroot::*;
 pub use handler_sys_chroot_for_test::*;
 #[allow(unused_imports)]
 pub(crate) use handler_sys_clone::*;
@@ -16227,6 +16899,7 @@ pub(crate) use {
     handler_sys_sched_setattr::sys_sched_setattr,
     handler_sys_sched_setparam::sys_sched_setparam,
     handler_sys_sched_setscheduler::sys_sched_setscheduler,
+    handler_sys_seccomp::sys_seccomp,
     handler_sys_sendfile::sys_sendfile,
     handler_sys_set_mempolicy::sys_set_mempolicy,
     handler_sys_set_mempolicy_home_node::sys_set_mempolicy_home_node,

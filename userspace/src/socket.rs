@@ -27,7 +27,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -149,8 +149,7 @@ pub const SO_ACCEPTCONN: u32 = 30;
 pub const SO_PEERSEC: u32 = 31;
 pub const SO_PROTOCOL: u32 = 38;
 pub const SO_DOMAIN: u32 = 39;
-/// Supplementary groups captured from a Unix peer. NARF does not yet stamp
-/// this metadata onto sockets, so getsockopt reports ENOPROTOOPT.
+/// Supplementary groups captured from a Unix peer at connection time.
 pub const SO_PEERGROUPS: u32 = 59;
 /// pidfd naming the Unix peer. Socket peer credentials currently carry a PID
 /// value but not a retained pidfd object, so getsockopt reports ENOPROTOOPT.
@@ -346,6 +345,7 @@ pub enum SockError {
     ConnectionRefused,
     Pipe,
     InProgress,
+    Range,
 }
 
 impl SockError {
@@ -363,6 +363,7 @@ impl SockError {
             Self::ConnectionRefused => 111, // ECONNREFUSED
             Self::Pipe => 32,               // EPIPE
             Self::InProgress => 115,        // EINPROGRESS
+            Self::Range => 34,              // ERANGE
         }
     }
 }
@@ -401,12 +402,32 @@ pub struct SocketFile {
     /// time (each end copies the other's `local_cred`). Read by
     /// `getsockopt(SO_PEERCRED)`.
     peer_cred: IrqSafeSpinLock<Ucred>,
+    /// Supplementary groups owned by this endpoint and captured from its peer.
+    /// Values are host-absolute gids; getsockopt translates them into the
+    /// reader's user namespace.
+    local_groups: IrqSafeSpinLock<Vec<u32>>,
+    peer_groups: IrqSafeSpinLock<Vec<u32>>,
     /// `SO_PASSCRED` — recvmsg attaches an `SCM_CREDENTIALS` cmsg when set.
     passcred: AtomicBool,
     /// Credentials of the sender of the most recently received datagram.
     /// A `SO_PASSCRED` recvmsg on a DGRAM socket reports THESE (per-message
     /// identity), whereas a stream recvmsg reports the fixed `peer_cred`.
     last_recv_cred: IrqSafeSpinLock<Ucred>,
+    /// SCM_RIGHTS carried by the most recently received AF_UNIX datagram.
+    /// Datagram ancillary data is per-message, so this is overwritten exactly
+    /// when `dispatch_unix_dgram(Recv)` dequeues that message and consumed by
+    /// the following `recvmsg` (or discarded by a plain `read`).
+    last_recv_fds: IrqSafeSpinLock<Vec<Arc<dyn FileOps>>>,
+    /// Readable-transition generation for connectionless datagram inboxes.
+    /// A bound AF_UNIX DGRAM socket is the systemd `$NOTIFY_SOCKET` shape:
+    /// after an EPOLLET consumer drains it, a refill can occur before epoll
+    /// observes the temporary empty state. The generation preserves that edge.
+    dgram_readable_token: AtomicU64,
+    /// Receive-progress generation for AF_NETLINK queues.  A monitor can
+    /// drain one message between EPOLLET scans; advancing this token on that
+    /// drain preserves the next queued message's edge without manufacturing
+    /// an event while the socket stayed readable.
+    netlink_readable_token: AtomicU64,
     /// AF_NETLINK local and connected peer addresses. Port ID zero means
     /// unbound; an explicit bind with nl_pid=0 allocates a unique ID.
     netlink_portid: AtomicU32,
@@ -642,7 +663,6 @@ enum SocketState {
 /// One enqueued UDP-style datagram. Owns the payload bytes (UDP
 /// has no concept of partial reads — each recv yields one whole
 /// packet, padded or truncated to the user buffer size).
-#[derive(Debug)]
 pub struct DgramPacket {
     /// Source AF_UNIX address (pathname or abstract), if the sender was
     /// bound. `None` for an unbound sender or an AF_INET datagram.
@@ -653,6 +673,22 @@ pub struct DgramPacket {
     pub peer_addr: u32,
     pub peer_port: u16,
     pub payload: Vec<u8>,
+    /// Per-datagram SCM_RIGHTS payload. AF_UNIX datagrams preserve message
+    /// boundaries, so these descriptors must not share the stream ring.
+    pub fds: Vec<Arc<dyn FileOps>>,
+}
+
+impl core::fmt::Debug for DgramPacket {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DgramPacket")
+            .field("peer_unix", &self.peer_unix)
+            .field("sender_cred", &self.sender_cred)
+            .field("peer_addr", &self.peer_addr)
+            .field("peer_port", &self.peer_port)
+            .field("payload", &self.payload)
+            .field("fd_count", &self.fds.len())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -748,8 +784,13 @@ impl SocketFile {
             net_namespace: IrqSafeSpinLock::new(None),
             local_cred: IrqSafeSpinLock::new(Ucred::default()),
             peer_cred: IrqSafeSpinLock::new(Ucred::default()),
+            local_groups: IrqSafeSpinLock::new(Vec::new()),
+            peer_groups: IrqSafeSpinLock::new(Vec::new()),
             passcred: AtomicBool::new(false),
             last_recv_cred: IrqSafeSpinLock::new(Ucred::default()),
+            last_recv_fds: IrqSafeSpinLock::new(Vec::new()),
+            dgram_readable_token: AtomicU64::new(0),
+            netlink_readable_token: AtomicU64::new(0),
             netlink_portid: AtomicU32::new(0),
             netlink_groups: AtomicU32::new(0),
             netlink_memberships: IrqSafeSpinLock::new(BTreeSet::new()),
@@ -847,6 +888,35 @@ impl SocketFile {
         SockAddr {
             family: AF_NETLINK,
             body,
+        }
+    }
+
+    /// Stamp each queued unicast netlink reply's `nlmsg_pid` with the
+    /// destination socket's own port id. The Linux kernel sets a unicast
+    /// reply's `nlmsg_pid` to the recipient's port id (see `netlink_ack` /
+    /// `__nlmsg_put(skb, NETLINK_CB(in_skb).portid, ...)`), and sd-netlink's
+    /// `parse_message_one` silently drops any non-broadcast message whose
+    /// `nlmsg_pid` differs from its bound port. A reply stamped with 0 is
+    /// therefore discarded, so a caller waiting on the ack (e.g. systemd's
+    /// `loopback_setup`) never sees `n_messages` reach zero and spins in
+    /// `ppoll` forever. Broadcast/multicast notifications keep `nlmsg_pid=0`
+    /// (kernel origin) and are stamped separately, so only the direct replies
+    /// pass through here. A `Vec` may carry more than one concatenated
+    /// message; walk them by `nlmsg_len` alignment.
+    fn stamp_netlink_reply_portid(messages: &mut [alloc::vec::Vec<u8>], portid: u32) {
+        const NLMSG_HDRLEN: usize = 16;
+        for msg in messages.iter_mut() {
+            let mut off = 0;
+            while off + NLMSG_HDRLEN <= msg.len() {
+                let len = u32::from_ne_bytes([msg[off], msg[off + 1], msg[off + 2], msg[off + 3]])
+                    as usize;
+                if len < NLMSG_HDRLEN || off + len > msg.len() {
+                    break;
+                }
+                // nlmsg_pid occupies bytes 12..16 of the nlmsghdr.
+                msg[off + 12..off + 16].copy_from_slice(&portid.to_ne_bytes());
+                off += (len + 3) & !3;
+            }
         }
     }
 
@@ -969,6 +1039,9 @@ impl SocketFile {
                 inbox.pop_front()
             }
         }?;
+        if flags & MSG_PEEK == 0 {
+            self.netlink_readable_token.fetch_add(1, Ordering::Release);
+        }
         let n = buf.len().min(packet.payload.len());
         buf[..n].copy_from_slice(&packet.payload[..n]);
         self.netlink_last_recv_group.store(0, Ordering::Release);
@@ -990,6 +1063,13 @@ impl SocketFile {
             .extend(core::iter::repeat_n(0, count));
     }
 
+    #[inline]
+    fn note_netlink_receive(&self, flags: u32) {
+        if flags & MSG_PEEK == 0 {
+            self.netlink_readable_token.fetch_add(1, Ordering::Release);
+        }
+    }
+
     fn record_queued_netlink_group(&self, flags: u32) {
         let group = {
             let mut groups = self.netlink_reply_groups.lock();
@@ -1009,6 +1089,21 @@ impl SocketFile {
         } else {
             None
         }
+    }
+
+    /// Byte length of the `NETLINK_LIST_MEMBERSHIPS` bitmap this socket would
+    /// report: `ceil(highest_group / 32)` u32 words, expressed in bytes. Zero
+    /// when the socket has joined no multicast groups. Linux answers a
+    /// `getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, NULL, &len)` probe
+    /// with exactly this value so callers can size their buffer; sd-netlink's
+    /// `netlink_socket_get_multicast_groups()` issues that probe on every
+    /// `sd_netlink_open()` (loopback-setup, udev, rtnetlink).
+    pub fn netlink_list_memberships_len(&self) -> usize {
+        self.netlink_memberships
+            .lock()
+            .last()
+            .map(|group| (*group as usize).div_ceil(32) * 4)
+            .unwrap_or(0)
     }
 
     fn connect_netlink(&self, addr: &SockAddr) -> SocketOpResult {
@@ -1033,6 +1128,14 @@ impl SocketFile {
         *self.local_cred.lock()
     }
 
+    pub fn set_local_groups(&self, groups: Vec<u32>) {
+        *self.local_groups.lock() = groups;
+    }
+
+    pub fn local_groups(&self) -> Vec<u32> {
+        self.local_groups.lock().clone()
+    }
+
     /// The connected peer's credentials (SO_PEERCRED source).
     pub fn peer_cred(&self) -> Ucred {
         *self.peer_cred.lock()
@@ -1040,6 +1143,14 @@ impl SocketFile {
 
     fn set_peer_cred(&self, cred: Ucred) {
         *self.peer_cred.lock() = cred;
+    }
+
+    fn set_peer_groups(&self, groups: Vec<u32>) {
+        *self.peer_groups.lock() = groups;
+    }
+
+    pub fn peer_groups(&self) -> Vec<u32> {
+        self.peer_groups.lock().clone()
     }
 
     /// Whether `SO_PASSCRED` is enabled — recvmsg attaches SCM_CREDENTIALS.
@@ -1052,8 +1163,21 @@ impl SocketFile {
     /// recently received datagram; connected (stream) sockets report the
     /// fixed peer credentials.
     pub fn recvmsg_cred(&self) -> Ucred {
+        if self.kind == SOCK_DGRAM || self.kind == SOCK_SEQPACKET {
+            let rx = match &*self.state.lock() {
+                SocketState::UnixConnected { rx, .. } => Some(rx.clone()),
+                _ => None,
+            };
+            if let Some(cred) = rx.and_then(|rx| rx.take_delivered_packet_cred()) {
+                return cred;
+            }
+        }
         if self.kind == SOCK_DGRAM {
-            *self.last_recv_cred.lock()
+            if matches!(&*self.state.lock(), SocketState::UnixConnected { .. }) {
+                *self.peer_cred.lock()
+            } else {
+                *self.last_recv_cred.lock()
+            }
         } else {
             *self.peer_cred.lock()
         }
@@ -1081,9 +1205,9 @@ impl SocketFile {
     /// each end's `tx` is the other end's `rx` — the same wiring the
     /// `connect()`/`accept()` handshake produces, minus the named
     /// listener lookup. Both ends come back already `UnixConnected`.
-    pub fn unix_stream_pair() -> (Arc<Self>, Arc<Self>) {
-        let a = Self::new(AF_UNIX, SOCK_STREAM);
-        let b = Self::new(AF_UNIX, SOCK_STREAM);
+    pub fn unix_pair(kind: u32) -> (Arc<Self>, Arc<Self>) {
+        let a = Self::new(AF_UNIX, kind);
+        let b = Self::new(AF_UNIX, kind);
         let a_to_b = Arc::new(RingBuf::new());
         let b_to_a = Arc::new(RingBuf::new());
         *a.state.lock() = SocketState::UnixConnected {
@@ -1099,6 +1223,10 @@ impl SocketFile {
         (a, b)
     }
 
+    pub fn unix_stream_pair() -> (Arc<Self>, Arc<Self>) {
+        Self::unix_pair(SOCK_STREAM)
+    }
+
     /// Cross-wire two connected ends' peer credentials. Both ends of a
     /// `socketpair` (and the two halves of a `connect`/`accept`) belong to
     /// the same or cooperating processes; each end's `SO_PEERCRED` should
@@ -1108,6 +1236,10 @@ impl SocketFile {
         let cb = b.local_cred();
         a.set_peer_cred(cb);
         b.set_peer_cred(ca);
+        let ga = a.local_groups();
+        let gb = b.local_groups();
+        a.set_peer_groups(gb);
+        b.set_peer_groups(ga);
     }
 
     /// Toggle the O_NONBLOCK flag (fcntl F_SETFL path).
@@ -1211,6 +1343,14 @@ impl SocketFile {
             SocketState::UnixDgram { peer: Some(p), .. } => Some(SockAddr {
                 family: AF_UNIX,
                 body: p.to_body(),
+            }),
+            // Linux reports a connected unnamed AF_UNIX peer (including
+            // socketpair endpoints) as a minimal sockaddr_un containing only
+            // sa_family.  The crossed-ring state does not currently retain a
+            // named peer address, but it still proves that a peer exists.
+            SocketState::UnixConnected { .. } => Some(SockAddr {
+                family: AF_UNIX,
+                body: alloc::vec::Vec::new(),
             }),
             SocketState::Inet6Connected {
                 peer_addr,
@@ -1398,9 +1538,34 @@ impl FileOps for SocketFile {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             // POSIX `read` on a socket == `recv` with flags=0.
+            if self.kind == SOCK_SEQPACKET || self.kind == SOCK_DGRAM {
+                if let Some(rx) = match &*self.state.lock() {
+                    SocketState::UnixConnected { rx, .. } => Some(rx.clone()),
+                    _ => None,
+                } {
+                    return match rx.read_packet(buf, false) {
+                        Some((n, _)) => {
+                            // read() has no ancillary output: discard the
+                            // record's rights and credential.
+                            drop(rx.take_fds());
+                            let _ = rx.take_delivered_packet_cred();
+                            Ok(n)
+                        }
+                        None if rx.is_closed() => Ok(0),
+                        None => Ok(0),
+                    };
+                }
+            }
             let r = self.do_recv(buf, 0);
             match r {
-                Ok((n, _)) => Ok(n),
+                Ok((n, _)) => {
+                    // read(2) has no ancillary-data output. If this byte range
+                    // crossed an AF_UNIX stream control marker, consume and
+                    // discard those rights now so a later recvmsg(2) cannot
+                    // receive descriptors attached to already-consumed bytes.
+                    drop(self.unix_take_recv_fds());
+                    Ok(n)
+                }
                 Err(SockError::WouldBlock) => Ok(0),
                 Err(_) => Err(FsError::Unsupported),
             }
@@ -1632,6 +1797,40 @@ impl FileOps for SocketFile {
             SocketState::NetlinkSink => narf_filesystem::POLL_OUT,
         }
     }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        match &*self.state.lock() {
+            SocketState::UnixConnected { rx, tx, .. }
+            | SocketState::InetConnected { rx, tx, .. }
+            | SocketState::Inet6Connected { rx, tx, .. } => {
+                (rx.readable_token(), tx.writable_token())
+            }
+            SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => {
+                (self.dgram_readable_token.load(Ordering::Acquire), 0)
+            }
+            SocketState::NetlinkUevent { reader } => {
+                let rx_tok = if reader.has_pending() {
+                    narf_filesystem::uevent_current_seqnum()
+                } else {
+                    0
+                };
+                (rx_tok, 0)
+            }
+            SocketState::NetlinkRoute { replies }
+            | SocketState::NetlinkGeneric { replies }
+            | SocketState::NetlinkSockDiag { replies }
+            | SocketState::NetlinkNetfilter { replies }
+            | SocketState::NetlinkAudit { replies } => {
+                let rx_tok = if !replies.is_empty() {
+                    self.netlink_readable_token.load(Ordering::Acquire)
+                } else {
+                    0
+                };
+                (rx_tok, 0)
+            }
+            _ => (0, 0),
+        }
+    }
 }
 
 impl SocketFile {
@@ -1740,6 +1939,16 @@ impl SocketFile {
             }
             _ => {}
         }
+        // A connected AF_UNIX datagram socketpair uses the same crossed-ring
+        // state as stream/seqpacket pairs, but retains datagram record
+        // semantics in `do_send`/the Unix-connected recv branch. Named
+        // datagram sockets still use the address-registry dispatcher.
+        if self.domain == AF_UNIX
+            && self.kind == SOCK_DGRAM
+            && matches!(&*self.state.lock(), SocketState::UnixConnected { .. })
+        {
+            return self.dispatch_unix_stream(op);
+        }
         match (self.domain, self.kind) {
             (AF_UNIX, SOCK_STREAM) | (AF_UNIX, SOCK_SEQPACKET) => self.dispatch_unix_stream(op),
             (AF_INET, SOCK_STREAM) => self.dispatch_inet_stream(op),
@@ -1783,10 +1992,10 @@ impl SocketFile {
                 if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
                     return result;
                 }
-                self.ensure_netlink_portid();
+                let dest_portid = self.ensure_netlink_portid();
                 let sent = buf.len() as u64;
                 let admin = self.netlink_admin.lock().clone();
-                let msgs = match narf_net::netlink_route::build_replies_with_options_in(
+                let mut msgs = match narf_net::netlink_route::build_replies_with_options_in(
                     self.net_ns_id(),
                     buf,
                     admin.as_ref(),
@@ -1801,6 +2010,7 @@ impl SocketFile {
                 };
                 let notifications =
                     narf_net::netlink_route::successful_mutation_notifications(buf, &msgs);
+                Self::stamp_netlink_reply_portid(&mut msgs, dest_portid);
                 let reply_count = msgs.len();
                 {
                     let mut g = self.state.lock();
@@ -1835,6 +2045,7 @@ impl SocketFile {
                 };
                 match msg {
                     Some(bytes) => {
+                        self.note_netlink_receive(flags);
                         self.record_queued_netlink_group(flags);
                         let n = core::cmp::min(buf.len(), bytes.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
@@ -1872,8 +2083,8 @@ impl SocketFile {
                 if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
                     return result;
                 }
-                self.ensure_netlink_portid();
-                let replies = match narf_net::netlink_generic::build_replies_with_options(
+                let dest_portid = self.ensure_netlink_portid();
+                let mut replies = match narf_net::netlink_generic::build_replies_with_options(
                     buf,
                     narf_net::netlink_generic::ReplyOptions {
                         ext_ack: self.netlink_ext_ack.load(Ordering::Acquire),
@@ -1883,6 +2094,7 @@ impl SocketFile {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                Self::stamp_netlink_reply_portid(&mut replies, dest_portid);
                 let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {
@@ -1912,6 +2124,7 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
+                        self.note_netlink_receive(flags);
                         self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
@@ -1942,12 +2155,13 @@ impl SocketFile {
                 if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
                     return result;
                 }
-                self.ensure_netlink_portid();
-                let replies = match narf_net::netlink_diag::build_replies_in(self.net_ns_id(), buf)
-                {
-                    Ok(replies) => replies,
-                    Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
-                };
+                let dest_portid = self.ensure_netlink_portid();
+                let mut replies =
+                    match narf_net::netlink_diag::build_replies_in(self.net_ns_id(), buf) {
+                        Ok(replies) => replies,
+                        Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
+                    };
+                Self::stamp_netlink_reply_portid(&mut replies, dest_portid);
                 let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {
@@ -1977,6 +2191,7 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
+                        self.note_netlink_receive(flags);
                         self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
@@ -2007,9 +2222,9 @@ impl SocketFile {
                 if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
                     return result;
                 }
-                self.ensure_netlink_portid();
+                let dest_portid = self.ensure_netlink_portid();
                 let admin = self.netfilter_admin.lock().clone();
-                let replies = match narf_net::netlink_netfilter::build_replies_authorized(
+                let mut replies = match narf_net::netlink_netfilter::build_replies_authorized(
                     self.net_ns_id(),
                     buf,
                     admin.as_ref(),
@@ -2017,6 +2232,7 @@ impl SocketFile {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                Self::stamp_netlink_reply_portid(&mut replies, dest_portid);
                 let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {
@@ -2046,6 +2262,7 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
+                        self.note_netlink_receive(flags);
                         self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
@@ -2076,11 +2293,12 @@ impl SocketFile {
                 if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
                     return result;
                 }
-                self.ensure_netlink_portid();
-                let replies = match narf_net::netlink_audit::build_replies(buf) {
+                let dest_portid = self.ensure_netlink_portid();
+                let mut replies = match narf_net::netlink_audit::build_replies(buf) {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                Self::stamp_netlink_reply_portid(&mut replies, dest_portid);
                 let reply_count = replies.len();
                 let mut state = self.state.lock();
                 match &mut *state {
@@ -2110,6 +2328,7 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
+                        self.note_netlink_receive(flags);
                         self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
@@ -2166,6 +2385,7 @@ impl SocketFile {
                 };
                 match ev {
                     Some(env) => {
+                        self.note_netlink_receive(flags);
                         self.netlink_last_recv_group.store(1, Ordering::Release);
                         // Kernel netlink uevent wire format (NUL-separated,
                         // `action@devpath` header) so libudev/udevd parse it.
@@ -2650,6 +2870,17 @@ impl SocketFile {
                 buf[8..12].copy_from_slice(&c.gid.to_ne_bytes());
                 SocketOpResult::OptValue { n: 12 }
             }
+            (SOL_SOCKET, SO_PEERGROUPS) => {
+                let groups = self.peer_groups();
+                let needed = groups.len().saturating_mul(4);
+                if buf.len() < needed {
+                    return SocketOpResult::Err(SockError::Range);
+                }
+                for (slot, gid) in buf.chunks_exact_mut(4).zip(groups) {
+                    slot.copy_from_slice(&gid.to_ne_bytes());
+                }
+                SocketOpResult::OptValue { n: needed }
+            }
             (SOL_SOCKET, SO_DOMAIN) => write_u32(buf, self.domain as u32),
             (SOL_SOCKET, SO_PROTOCOL) => write_u32(buf, self.protocol),
             (IPPROTO_TCP, TCP_NODELAY) => write_bool(buf, opts.tcp_nodelay),
@@ -2691,25 +2922,32 @@ impl SocketFile {
                 write_bool(buf, self.netlink_strict_check.load(Ordering::Acquire))
             }
             (SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS) => {
+                // Linux reports the FULL required byte length in optlen (so a
+                // NULL/short-buffer probe can size its allocation) while only
+                // filling as many bytes of the bitmap as the caller's buffer
+                // holds. `OptValue { n }` therefore carries the required
+                // length, not the bytes written; the syscall handler copies
+                // `min(n, in_len)` bytes back and writes `n` into optlen.
                 let memberships = self.netlink_memberships.lock();
                 let words = memberships
                     .last()
                     .map(|group| (*group as usize).div_ceil(32))
                     .unwrap_or(0);
-                let n = core::cmp::min(buf.len() / 4, words) * 4;
-                buf[..n].fill(0);
+                let required = words * 4;
+                let fill = core::cmp::min(buf.len() / 4, words) * 4;
+                buf[..fill].fill(0);
                 for group in memberships.iter().copied() {
                     let word = (group as usize - 1) / 32;
-                    if word * 4 >= n {
+                    let offset = word * 4;
+                    if offset >= fill {
                         continue;
                     }
-                    let offset = word * 4;
                     let mut value =
                         u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap_or([0; 4]));
                     value |= 1u32 << ((group - 1) % 32);
                     buf[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
                 }
-                SocketOpResult::OptValue { n }
+                SocketOpResult::OptValue { n: required }
             }
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
@@ -2809,6 +3047,7 @@ impl SocketFile {
                 peer_addr: dest.0,
                 peer_port: dest.1,
                 payload: buf.to_vec(),
+                fds: Vec::new(),
             });
             return SocketOpResult::Ok(buf.len() as u64);
         }
@@ -2861,6 +3100,11 @@ impl SocketFile {
                 SocketOpResult::Ok(0)
             }
             SocketOp::Listen { backlog: _ } => {
+                // SO_PEERCRED on clients of a listening Unix socket reflects
+                // the credentials in effect when listen() established the
+                // endpoint (important for systemd socket activation).
+                self.set_local_cred(crate::handlers::current_ucred());
+                self.set_local_groups(crate::handlers::current_groups());
                 let mut state = self.state.lock();
                 let addr = match &*state {
                     SocketState::UnixBound { addr } => addr.clone(),
@@ -2939,9 +3183,19 @@ impl SocketFile {
                 // (The listener process typically inherits/re-owns the
                 // accepted fd, so the server end's local_cred = listener's.)
                 let listener_cred = listener.local_cred();
-                let client_cred = self.local_cred();
+                let listener_groups = listener.local_groups();
+                // Linux snapshots the connector's effective credentials at
+                // connect time. A process may legitimately setuid between
+                // socket() and connect(); creation-time credentials would
+                // grant D-Bus policy under the wrong identity.
+                let client_cred = crate::handlers::current_ucred();
+                let client_groups = crate::handlers::current_groups();
+                self.set_local_cred(client_cred);
+                self.set_local_groups(client_groups.clone());
                 server_end.set_local_cred(listener_cred);
+                server_end.set_local_groups(listener_groups.clone());
                 server_end.set_peer_cred(client_cred);
+                server_end.set_peer_groups(client_groups);
                 {
                     let mut lst = listener.state.lock();
                     if let SocketState::UnixListener { pending, .. } = &mut *lst {
@@ -2974,6 +3228,7 @@ impl SocketFile {
                         };
                         drop(state);
                         self.set_peer_cred(listener_cred);
+                        self.set_peer_groups(listener_groups);
                         SocketOpResult::Ok(0)
                     }
                     _ => SocketOpResult::Err(SockError::AlreadyConnected),
@@ -2987,6 +3242,28 @@ impl SocketFile {
                 Ok(n) => SocketOpResult::Ok(n as u64),
                 Err(e) => SocketOpResult::Err(e),
             },
+            SocketOp::Recv { buf, flags }
+                if self.kind == SOCK_SEQPACKET || self.kind == SOCK_DGRAM =>
+            {
+                let state = self.state.lock();
+                let rx = match &*state {
+                    SocketState::UnixConnected { rx, .. } => rx.clone(),
+                    _ => return SocketOpResult::Err(SockError::NotConnected),
+                };
+                drop(state);
+                match rx.read_packet(buf, flags & MSG_PEEK != 0) {
+                    Some((copied, full_len)) if copied < full_len => {
+                        SocketOpResult::ReceivedTruncated {
+                            copied,
+                            full_len,
+                            peer: None,
+                        }
+                    }
+                    Some((n, _)) => SocketOpResult::Received { n, peer: None },
+                    None if rx.is_closed() => SocketOpResult::Received { n: 0, peer: None },
+                    None => SocketOpResult::Err(SockError::WouldBlock),
+                }
+            }
             SocketOp::Recv { buf, flags } => match self.do_recv(buf, flags) {
                 Ok((n, peer)) => SocketOpResult::Received { n, peer },
                 Err(e) => SocketOpResult::Err(e),
@@ -3001,6 +3278,10 @@ impl SocketFile {
                         if how == SHUT_RD || how == SHUT_RDWR {
                             rx.close();
                         }
+                        drop(state);
+                        // Explicit shutdown must wake an infinite-timeout
+                        // poll/epoll waiter just like final descriptor close.
+                        narf_net::readiness::notify(0);
                         SocketOpResult::Ok(0)
                     }
                     _ => SocketOpResult::Err(SockError::NotConnected),
@@ -3258,6 +3539,8 @@ impl SocketFile {
                         if how == SHUT_RD || how == SHUT_RDWR {
                             rx.close();
                         }
+                        drop(state);
+                        narf_net::readiness::notify(0);
                         SocketOpResult::Ok(0)
                     }
                     SocketState::InetWired { tcb_id, .. } => {
@@ -3408,10 +3691,14 @@ impl SocketFile {
                     peer_addr: local_addr,
                     peer_port: local_port,
                     payload: buf.to_vec(),
+                    fds: Vec::new(),
                 };
                 let mut ds = dest_sock.state.lock();
                 if let SocketState::InetDgram { inbox, .. } = &mut *ds {
                     inbox.push_back(pkt);
+                    dest_sock
+                        .dgram_readable_token
+                        .fetch_add(1, Ordering::Release);
                     SocketOpResult::Ok(buf.len() as u64)
                 } else {
                     SocketOpResult::Ok(buf.len() as u64) // dropped
@@ -3460,6 +3747,14 @@ impl SocketFile {
     /// address (pathname or abstract name — sd_notify's $NOTIFY_SOCKET
     /// is an abstract datagram socket).
     fn dispatch_unix_dgram(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        self.dispatch_unix_dgram_with_fds(op, Vec::new())
+    }
+
+    fn dispatch_unix_dgram_with_fds(
+        self: &Arc<Self>,
+        op: SocketOp<'_>,
+        fds: Vec<Arc<dyn FileOps>>,
+    ) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => {
                 if addr.family != AF_UNIX {
@@ -3560,7 +3855,9 @@ impl SocketFile {
                     }
                     _ => return SocketOpResult::Err(SockError::NotConnected),
                 };
-                let sender_cred = self.local_cred();
+                // SCM_CREDENTIALS names the sender's effective identity at
+                // send time, not the identity it had when socket() ran.
+                let sender_cred = crate::handlers::current_ucred();
                 drop(state);
                 let dest_sock = match &dest_addr {
                     UnixAddr::Path(p) => UNIX_DGRAM_BOUND
@@ -3585,10 +3882,14 @@ impl SocketFile {
                     peer_addr: 0,
                     peer_port: 0,
                     payload: buf.to_vec(),
+                    fds,
                 };
                 let mut ds = dest_sock.state.lock();
                 if let SocketState::UnixDgram { inbox, .. } = &mut *ds {
                     inbox.push_back(pkt);
+                    dest_sock
+                        .dgram_readable_token
+                        .fetch_add(1, Ordering::Release);
                 }
                 drop(ds);
                 // Wake a receiver parked in recv/recvmsg/poll on the dest —
@@ -3606,6 +3907,7 @@ impl SocketFile {
                         // Stash the sender's creds so a SO_PASSCRED recvmsg can
                         // attach them as SCM_CREDENTIALS.
                         *self.last_recv_cred.lock() = pkt.sender_cred;
+                        *self.last_recv_fds.lock() = pkt.fds;
                         return SocketOpResult::Received {
                             n,
                             peer: Some(SockAddr {
@@ -3770,6 +4072,8 @@ impl SocketFile {
                     if how == SHUT_RD || how == SHUT_RDWR {
                         rx.close();
                     }
+                    drop(state);
+                    narf_net::readiness::notify(0);
                     SocketOpResult::Ok(0)
                 } else {
                     SocketOpResult::Err(SockError::NotConnected)
@@ -3801,7 +4105,11 @@ impl SocketFile {
         if tx.is_closed() {
             return Err(SockError::Pipe);
         }
-        let n = tx.write(buf);
+        let n = if self.kind == SOCK_SEQPACKET || self.kind == SOCK_DGRAM {
+            tx.write_packet(buf, crate::handlers::current_ucred())
+        } else {
+            tx.write(buf)
+        };
         drop(state);
         // Wake any peer parked in poll/epoll/recv on the other end of this
         // ring. AF_UNIX (and loopback INET) sockets carry no kernel TCB, so
@@ -3869,8 +4177,12 @@ impl SocketFile {
         if tx.is_closed() {
             return Err(SockError::Pipe);
         }
-        let n = tx.write(buf);
-        tx.write_fds(fds);
+        let packet = self.kind == SOCK_SEQPACKET || self.kind == SOCK_DGRAM;
+        let n = if packet {
+            tx.write_packet_with_fds(buf, fds, crate::handlers::current_ucred())
+        } else {
+            tx.write_stream_with_fds(buf, fds)
+        };
         drop(state);
         // Wake a peer parked in poll/epoll/recv on the other end — same as
         // `do_send`. An fd-passing `sendmsg` (SCM_RIGHTS) is how libseat hands a
@@ -3883,10 +4195,34 @@ impl SocketFile {
         Ok(n)
     }
 
+    /// Send an AF_UNIX datagram with SCM_RIGHTS. `sd_notify` uses this exact
+    /// shape for `FDSTORE=1`: descriptor-bearing notification datagrams are
+    /// not AF_UNIX streams, so they must bypass `unix_sendmsg`'s stream ring.
+    pub(crate) fn unix_dgram_sendmsg(
+        self: &Arc<Self>,
+        buf: &[u8],
+        flags: u32,
+        addr: Option<SockAddr>,
+        fds: Vec<Arc<dyn FileOps>>,
+    ) -> Result<usize, SockError> {
+        if self.domain != AF_UNIX || self.kind != SOCK_DGRAM {
+            return Err(SockError::InvalidArg);
+        }
+        match self.dispatch_unix_dgram_with_fds(SocketOp::Send { buf, flags, addr }, fds) {
+            SocketOpResult::Ok(n) => Ok(n as usize),
+            SocketOpResult::Err(e) => Err(e),
+            _ => Err(SockError::InvalidArg),
+        }
+    }
+
     /// Pop the next received SCM_RIGHTS fd batch from an AF_UNIX stream
     /// socket's receive ring (empty for non-unix sockets or when none were
     /// passed).
     pub fn unix_take_recv_fds(&self) -> Vec<Arc<dyn FileOps>> {
+        let from_dgram = core::mem::take(&mut *self.last_recv_fds.lock());
+        if !from_dgram.is_empty() {
+            return from_dgram;
+        }
         let state = self.state.lock();
         match &*state {
             SocketState::UnixConnected { rx, .. } => rx.take_fds().unwrap_or_default(),
@@ -3949,18 +4285,38 @@ impl Drop for SocketFile {
 pub struct RingBuf {
     inner: IrqSafeSpinLock<RingInner>,
     closed: AtomicBool,
+    readable_token: AtomicU64,
+    writable_token: AtomicU64,
 }
 
 struct RingInner {
     buf: Vec<u8>,
     head: usize,
     len: usize,
-    /// AF_UNIX SCM_RIGHTS fd-passing: a FIFO of fd batches sent alongside
-    /// the byte stream. Each `sendmsg` carrying SCM_RIGHTS pushes one
-    /// batch; each `recvmsg` that returns data pops the front batch and
-    /// installs the file objects into the receiver's fd table. Wayland's
-    /// shm/dma-buf buffer sharing rides on this.
-    fds: VecDeque<Vec<Arc<dyn FileOps>>>,
+    /// Record queue for connected SOCK_SEQPACKET/SOCK_DGRAM pairs.
+    packets: VecDeque<PacketRecord>,
+    packet_bytes: usize,
+    /// Ancillary batch attached to the record most recently consumed by
+    /// recv/recvmsg. `recvmsg` takes it immediately after the data read.
+    delivered_packet_fds: Option<Vec<Arc<dyn FileOps>>>,
+    delivered_packet_cred: Option<Ucred>,
+    /// Monotonic byte positions for stream ancillary association.
+    stream_read_seq: u64,
+    stream_write_seq: u64,
+    /// AF_UNIX stream SCM_RIGHTS is attached to the first byte written by
+    /// sendmsg, rather than queued independently of the byte stream.
+    stream_controls: VecDeque<StreamControl>,
+}
+
+struct PacketRecord {
+    data: Vec<u8>,
+    fds: Vec<Arc<dyn FileOps>>,
+    cred: Ucred,
+}
+
+struct StreamControl {
+    offset: u64,
+    fds: Vec<Arc<dyn FileOps>>,
 }
 
 impl core::fmt::Debug for RingInner {
@@ -3968,7 +4324,7 @@ impl core::fmt::Debug for RingInner {
         f.debug_struct("RingInner")
             .field("head", &self.head)
             .field("len", &self.len)
-            .field("fd_batches", &self.fds.len())
+            .field("stream_controls", &self.stream_controls.len())
             .finish()
     }
 }
@@ -3980,26 +4336,32 @@ impl RingBuf {
                 buf: alloc::vec![0u8; RING_CAP],
                 head: 0,
                 len: 0,
-                fds: VecDeque::new(),
+                packets: VecDeque::new(),
+                packet_bytes: 0,
+                delivered_packet_fds: None,
+                delivered_packet_cred: None,
+                stream_read_seq: 0,
+                stream_write_seq: 0,
+                stream_controls: VecDeque::new(),
             }),
             closed: AtomicBool::new(false),
+            readable_token: AtomicU64::new(0),
+            writable_token: AtomicU64::new(0),
         }
     }
 
-    /// Queue an SCM_RIGHTS fd batch alongside the byte stream.
-    fn write_fds(&self, fds: Vec<Arc<dyn FileOps>>) {
-        if !fds.is_empty() {
-            self.inner.lock().fds.push_back(fds);
-        }
-    }
-
-    /// Pop the next queued fd batch (FIFO), if any.
+    /// Take ancillary rights associated with the most recent receive.
     fn take_fds(&self) -> Option<Vec<Arc<dyn FileOps>>> {
-        self.inner.lock().fds.pop_front()
+        self.inner.lock().delivered_packet_fds.take()
+    }
+
+    fn take_delivered_packet_cred(&self) -> Option<Ucred> {
+        self.inner.lock().delivered_packet_cred.take()
     }
 
     fn write(&self, src: &[u8]) -> usize {
         let mut g = self.inner.lock();
+        let was_readable = g.len > 0 || !g.packets.is_empty();
         let avail = RING_CAP - g.len;
         let n = core::cmp::min(src.len(), avail);
         for (i, &byte) in src.iter().enumerate().take(n) {
@@ -4007,11 +4369,68 @@ impl RingBuf {
             g.buf[pos] = byte;
         }
         g.len += n;
+        g.stream_write_seq = g.stream_write_seq.saturating_add(n as u64);
+        let became_readable = !was_readable && n != 0;
+        drop(g);
+        if became_readable {
+            self.readable_token.fetch_add(1, Ordering::Release);
+        }
         n
+    }
+
+    fn write_stream_with_fds(&self, src: &[u8], fds: Vec<Arc<dyn FileOps>>) -> usize {
+        let mut g = self.inner.lock();
+        let was_readable = g.len > 0 || !g.packets.is_empty();
+        let avail = RING_CAP - g.len;
+        let n = core::cmp::min(src.len(), avail);
+        if n == 0 {
+            return 0;
+        }
+        let marker = g.stream_write_seq;
+        for (i, &byte) in src.iter().enumerate().take(n) {
+            let pos = (g.head + g.len + i) % RING_CAP;
+            g.buf[pos] = byte;
+        }
+        g.len += n;
+        g.stream_write_seq = g.stream_write_seq.saturating_add(n as u64);
+        if !fds.is_empty() {
+            g.stream_controls.push_back(StreamControl {
+                offset: marker,
+                fds,
+            });
+        }
+        let became_readable = !was_readable;
+        drop(g);
+        if became_readable {
+            self.readable_token.fetch_add(1, Ordering::Release);
+        }
+        n
+    }
+
+    fn write_packet(&self, src: &[u8], cred: Ucred) -> usize {
+        self.write_packet_with_fds(src, Vec::new(), cred)
+    }
+
+    fn write_packet_with_fds(&self, src: &[u8], fds: Vec<Arc<dyn FileOps>>, cred: Ucred) -> usize {
+        let mut g = self.inner.lock();
+        if src.len() > RING_CAP.saturating_sub(g.packet_bytes) {
+            return 0;
+        }
+        g.packets.push_back(PacketRecord {
+            data: src.to_vec(),
+            fds,
+            cred,
+        });
+        g.packet_bytes += src.len();
+        drop(g);
+        self.readable_token.fetch_add(1, Ordering::Release);
+        src.len()
     }
 
     fn read(&self, dst: &mut [u8]) -> usize {
         let mut g = self.inner.lock();
+        let was_writable = g.len < RING_CAP && g.packet_bytes < RING_CAP;
+        g.delivered_packet_fds = None;
         let n = core::cmp::min(dst.len(), g.len);
         for (i, slot) in dst.iter_mut().enumerate().take(n) {
             let pos = (g.head + i) % RING_CAP;
@@ -4019,17 +4438,71 @@ impl RingBuf {
         }
         g.head = (g.head + n) % RING_CAP;
         g.len -= n;
+        let end = g.stream_read_seq.saturating_add(n as u64);
+        let mut delivered = Vec::new();
+        while g
+            .stream_controls
+            .front()
+            .is_some_and(|control| control.offset < end)
+        {
+            if let Some(control) = g.stream_controls.pop_front() {
+                delivered.extend(control.fds);
+            }
+        }
+        g.stream_read_seq = end;
+        if !delivered.is_empty() {
+            g.delivered_packet_fds = Some(delivered);
+        }
+        let became_writable = !was_writable && n != 0;
+        drop(g);
+        if became_writable {
+            self.writable_token.fetch_add(1, Ordering::Release);
+        }
         n
     }
 
     /// Copy immediately readable bytes without advancing the stream head.
     fn peek(&self, dst: &mut [u8]) -> usize {
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
+        g.delivered_packet_fds = None;
         let n = core::cmp::min(dst.len(), g.len);
         for (i, slot) in dst.iter_mut().enumerate().take(n) {
             *slot = g.buf[(g.head + i) % RING_CAP];
         }
+        let end = g.stream_read_seq.saturating_add(n as u64);
+        let delivered: Vec<_> = g
+            .stream_controls
+            .iter()
+            .take_while(|control| control.offset < end)
+            .flat_map(|control| control.fds.iter().cloned())
+            .collect();
+        if !delivered.is_empty() {
+            g.delivered_packet_fds = Some(delivered);
+        }
         n
+    }
+
+    /// Read exactly one record, discarding any tail that does not fit.
+    /// Returns `(copied, full_record_len)`.
+    fn read_packet(&self, dst: &mut [u8], peek: bool) -> Option<(usize, usize)> {
+        let mut g = self.inner.lock();
+        let was_writable = g.len < RING_CAP && g.packet_bytes < RING_CAP;
+        let packet = g.packets.front()?;
+        let full = packet.data.len();
+        let copied = dst.len().min(full);
+        dst[..copied].copy_from_slice(&packet.data[..copied]);
+        g.delivered_packet_cred = Some(packet.cred);
+        if !peek {
+            let packet = g.packets.pop_front().unwrap();
+            g.packet_bytes = g.packet_bytes.saturating_sub(full);
+            g.delivered_packet_fds = Some(packet.fds);
+            let became_writable = !was_writable;
+            drop(g);
+            if became_writable {
+                self.writable_token.fetch_add(1, Ordering::Release);
+            }
+        }
+        Some((copied, full))
     }
 
     fn is_closed(&self) -> bool {
@@ -4037,20 +4510,36 @@ impl RingBuf {
     }
 
     fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.readable_token.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn readable_token(&self) -> u64 {
+        self.readable_token.load(Ordering::Acquire)
+    }
+
+    fn writable_token(&self) -> u64 {
+        self.writable_token.load(Ordering::Acquire)
     }
 
     fn has_data(&self) -> bool {
-        self.inner.lock().len > 0
+        let g = self.inner.lock();
+        g.len > 0 || !g.packets.is_empty()
     }
 
     /// Buffered byte count — backs `SIOCINQ`/`FIONREAD` on a stream socket.
     fn len(&self) -> usize {
-        self.inner.lock().len
+        let g = self.inner.lock();
+        g.packets
+            .front()
+            .map(|packet| packet.data.len())
+            .unwrap_or(g.len)
     }
 
     fn has_space(&self) -> bool {
-        self.inner.lock().len < RING_CAP
+        let g = self.inner.lock();
+        g.len < RING_CAP && g.packet_bytes < RING_CAP
     }
 }
 
@@ -4249,6 +4738,7 @@ fn smoke_siocinq_unix_dgram_reports_head_len() -> TestResult {
         peer_addr: 0,
         peer_port: 0,
         payload: alloc::vec![0u8; 7], // head datagram: 7 bytes
+        fds: Vec::new(),
     });
     inbox.push_back(DgramPacket {
         peer_unix: None,
@@ -4256,6 +4746,7 @@ fn smoke_siocinq_unix_dgram_reports_head_len() -> TestResult {
         peer_addr: 0,
         peer_port: 0,
         payload: alloc::vec![0u8; 3], // second datagram: ignored by SIOCINQ
+        fds: Vec::new(),
     });
     *sock.state.lock() = SocketState::UnixDgram {
         addr: None,
@@ -4270,6 +4761,47 @@ fn smoke_siocinq_unix_dgram_reports_head_len() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_siocinq_unix_dgram_reports_head_len
+);
+
+/// SCM_RIGHTS belongs to the AF_UNIX message, not just stream sockets.
+/// systemd's sd_notify FDSTORE path sends an unconnected datagram carrying a
+/// descriptor; treating that as a stream produces ENOTCONN and prevents the
+/// service from completing its READY=1 handshake.
+fn smoke_unix_dgram_scm_rights_delivers_per_datagram() -> TestResult {
+    let receiver = SocketFile::new(AF_UNIX, SOCK_DGRAM);
+    let sender = SocketFile::new(AF_UNIX, SOCK_DGRAM);
+    let addr = SockAddr {
+        family: AF_UNIX,
+        body: b"\0narf-test-fdstore".to_vec(),
+    };
+    if !matches!(
+        receiver.dispatch_op(SocketOp::Bind { addr: addr.clone() }),
+        SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("failed to bind AF_UNIX datagram receiver");
+    }
+    let passed: Arc<dyn FileOps> = SocketFile::new(AF_UNIX, SOCK_STREAM);
+    match sender.unix_dgram_sendmsg(b"FDSTORE=1", 0, Some(addr), alloc::vec![passed.clone()]) {
+        Ok(n) if n == b"FDSTORE=1".len() => {}
+        _ => return TestResult::Fail("SCM_RIGHTS AF_UNIX datagram send failed"),
+    }
+    let mut payload = [0u8; 32];
+    match receiver.dispatch_op(SocketOp::Recv {
+        buf: &mut payload,
+        flags: 0,
+    }) {
+        SocketOpResult::Received { n, .. } if &payload[..n] == b"FDSTORE=1" => {}
+        _ => return TestResult::Fail("AF_UNIX datagram payload was not delivered"),
+    }
+    let received = receiver.unix_take_recv_fds();
+    if received.len() != 1 || !Arc::ptr_eq(&received[0], &passed) {
+        return TestResult::Fail("AF_UNIX datagram SCM_RIGHTS batch was not delivered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_unix_dgram_scm_rights_delivers_per_datagram
 );
 
 /// The socket ioctl recognises ONLY `SIOCINQ`; any other request is an
@@ -4334,6 +4866,53 @@ kernel_test_in!(
     smoke_netlink_lists_high_membership_groups
 );
 
+// Linux reports the FULL required bitmap length in optlen even when the caller
+// passes a buffer too small to hold it (or an empty length-query buffer), so
+// callers can size a second read. This backs the sd-netlink probe path.
+fn smoke_netlink_list_memberships_reports_required_length() -> TestResult {
+    let sock = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    // No groups joined: the length query reports zero and the accessor agrees.
+    let mut empty: [u8; 0] = [];
+    if !matches!(
+        sock.handle_getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, &mut empty),
+        SocketOpResult::OptValue { n: 0 }
+    ) || sock.netlink_list_memberships_len() != 0
+    {
+        return TestResult::Fail("empty membership set did not report zero length");
+    }
+    if !matches!(
+        sock.handle_setsockopt(SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &65u32.to_ne_bytes()),
+        SocketOpResult::Ok(0)
+    ) {
+        return TestResult::Fail("NETLINK_ADD_MEMBERSHIP rejected group 65");
+    }
+    // group 65 needs 3 u32 words = 12 bytes. An empty query still reports 12.
+    if !matches!(
+        sock.handle_getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, &mut empty),
+        SocketOpResult::OptValue { n: 12 }
+    ) || sock.netlink_list_memberships_len() != 12
+    {
+        return TestResult::Fail("length query did not report the required 12 bytes");
+    }
+    // A short 4-byte buffer still reports the full 12-byte requirement and only
+    // fills the word it can hold (word 0, which has no bits for group 65).
+    let mut short = [0xFFu8; 4];
+    if !matches!(
+        sock.handle_getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, &mut short),
+        SocketOpResult::OptValue { n: 12 }
+    ) {
+        return TestResult::Fail("short buffer did not report the full required length");
+    }
+    if u32::from_ne_bytes(short) != 0 {
+        return TestResult::Fail("short buffer word 0 was not cleared");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_netlink_list_memberships_reports_required_length
+);
+
 fn smoke_netlink_pktinfo_tracks_received_multicast_group() -> TestResult {
     let sock = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     let group = 5u32;
@@ -4365,4 +4944,79 @@ fn smoke_netlink_pktinfo_tracks_received_multicast_group() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_netlink_pktinfo_tracks_received_multicast_group
+);
+
+fn smoke_unix_stream_rights_follow_byte_boundaries() -> TestResult {
+    let ring = RingBuf::new();
+    let passed: Arc<dyn FileOps> = SocketFile::new(AF_UNIX, SOCK_STREAM);
+
+    if ring.write(b"plain") != 5
+        || ring.write_stream_with_fds(b"fd", alloc::vec![passed.clone()]) != 2
+    {
+        return TestResult::Fail("failed to seed stream control boundary");
+    }
+
+    let mut prefix = [0u8; 5];
+    if ring.read(&mut prefix) != 5 || &prefix != b"plain" || ring.take_fds().is_some() {
+        return TestResult::Fail("rights escaped before their marker byte");
+    }
+
+    let mut first = [0u8; 1];
+    if ring.read(&mut first) != 1 || first[0] != b'f' {
+        return TestResult::Fail("failed to cross stream control marker");
+    }
+    let Some(fds) = ring.take_fds() else {
+        return TestResult::Fail("rights were not delivered at their marker byte");
+    };
+    if fds.len() != 1 || !Arc::ptr_eq(&fds[0], &passed) {
+        return TestResult::Fail("wrong rights batch delivered at stream marker");
+    }
+    if ring.take_fds().is_some() {
+        return TestResult::Fail("stream rights batch was delivered more than once");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_unix_stream_rights_follow_byte_boundaries
+);
+
+fn smoke_unix_stream_multiple_rights_batches_preserve_order() -> TestResult {
+    let ring = RingBuf::new();
+    let first: Arc<dyn FileOps> = SocketFile::new(AF_UNIX, SOCK_STREAM);
+    let second: Arc<dyn FileOps> = SocketFile::new(AF_UNIX, SOCK_STREAM);
+
+    if ring.write_stream_with_fds(b"a", alloc::vec![first.clone()]) != 1
+        || ring.write(b"-") != 1
+        || ring.write_stream_with_fds(b"b", alloc::vec![second.clone()]) != 1
+    {
+        return TestResult::Fail("failed to seed multiple stream control batches");
+    }
+
+    let mut one = [0u8; 1];
+    if ring.read(&mut one) != 1 || one[0] != b'a' {
+        return TestResult::Fail("failed to consume first marker byte");
+    }
+    let Some(first_batch) = ring.take_fds() else {
+        return TestResult::Fail("first rights batch was missing");
+    };
+    if first_batch.len() != 1 || !Arc::ptr_eq(&first_batch[0], &first) {
+        return TestResult::Fail("first rights batch was reordered");
+    }
+
+    let mut tail = [0u8; 2];
+    if ring.read(&mut tail) != 2 || &tail != b"-b" {
+        return TestResult::Fail("failed to consume second marker range");
+    }
+    let Some(second_batch) = ring.take_fds() else {
+        return TestResult::Fail("second rights batch was missing");
+    };
+    if second_batch.len() != 1 || !Arc::ptr_eq(&second_batch[0], &second) {
+        return TestResult::Fail("second rights batch was reordered or duplicated");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_unix_stream_multiple_rights_batches_preserve_order
 );

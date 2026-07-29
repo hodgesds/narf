@@ -7,6 +7,32 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn smoke_scheduler_parked_idle_leaves_rcu_census() -> TestResult {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= 64 {
+        return TestResult::Skip("current CPU is outside watchdog mask");
+    }
+    let bit = 1u64 << cpu;
+
+    // Establish an active timestamp, then exercise the exact helper used by
+    // run_until_empty's parked-queue halt. An arbitrarily-late watchdog
+    // snapshot must no longer classify this CPU as stalled.
+    narf_rcu::report_quiescent();
+    if narf_rcu::stalled_cpu_mask(u64::MAX, 1) & bit == 0 {
+        return TestResult::Fail("active CPU missing from synthetic stale snapshot");
+    }
+    crate::report_parked_queue_idle();
+    let still_active = narf_rcu::stalled_cpu_mask(u64::MAX, 1) & bit != 0;
+    // Restore the active state for later tests sharing this CPU.
+    narf_rcu::report_quiescent();
+    if still_active {
+        TestResult::Fail("parked idle CPU remained in RCU watchdog census")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("scheduler", smoke_scheduler_parked_idle_leaves_rcu_census);
+
 fn smoke_scheduler_drives_future() -> TestResult {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1637,9 +1663,13 @@ kernel_test_in!(
 // ── responsive_spin ────────────────────────────────────────────────
 
 fn smoke_scheduler_responsive_spin_returns_true_when_done_immediately() -> TestResult {
+    let before = crate::forward_progress_count();
     let result = crate::responsive_spin(|| true, 10);
     if !result {
         return TestResult::Fail("responsive_spin with immediate done didn't return true");
+    }
+    if crate::forward_progress_count() == before {
+        return TestResult::Fail("successful responsive_spin did not publish forward progress");
     }
     TestResult::Pass
 }

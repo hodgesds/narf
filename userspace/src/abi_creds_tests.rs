@@ -430,15 +430,29 @@ fn smoke_abi_creds_getresgid_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_creds_getresgid_neg);
 
-// ── getgroups ────────────────────────────────────────────────────────
-// NARF carries no supplementary groups: always Ok(0), even when querying
-// the count (size==0) or asking to fill a list. No reachable error path.
+// ── getgroups / setgroups ────────────────────────────────────────────
 fn smoke_abi_creds_getgroups_pos() -> TestResult {
     with_setup(|| {
-        // size==0 ⇒ "return the count" ⇒ 0 groups.
-        let r = call(Syscall::Getgroups.raw(), a1(0, 0)).ok_or("getgroups not Ok")?;
-        if r != 0 {
-            return Err("getgroups(0,NULL) expected 0");
+        let input = [10u32, 20, 30];
+        if call(
+            Syscall::Setgroups.raw(),
+            a1(input.len() as u64, input.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setgroups did not install group list");
+        }
+        let count = call(Syscall::Getgroups.raw(), a1(0, 0)).ok_or("getgroups count")?;
+        if count != input.len() as i64 {
+            return Err("getgroups(0,NULL) returned wrong count");
+        }
+        let mut output = [0u32; 3];
+        let n = call(
+            Syscall::Getgroups.raw(),
+            a1(output.len() as u64, output.as_mut_ptr() as u64),
+        )
+        .ok_or("getgroups data")?;
+        if n != input.len() as i64 || output != input {
+            return Err("getgroups did not round-trip group list");
         }
         Ok(())
     })
@@ -447,12 +461,19 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_getgroups_pos);
 
 fn smoke_abi_creds_getgroups_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux EFAULTs a non-NULL list with a too-small size,
-        // and EINVAL when size < ngroups. NARF has no group list, so it
-        // unconditionally returns Ok(0) — even for a bad list pointer.
-        let r = call(Syscall::Getgroups.raw(), a1(8, BAD_PTR)).ok_or("getgroups not Ok")?;
-        if r != 0 {
-            return Err("getgroups(8,bad) still expected 0 (NARF stub)");
+        let input = [10u32, 20];
+        if call(
+            Syscall::Setgroups.raw(),
+            a1(input.len() as u64, input.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setgroups setup failed");
+        }
+        if call(Syscall::Getgroups.raw(), a1(1, BAD_PTR)) != Some(-22) {
+            return Err("getgroups undersized list did not return EINVAL");
+        }
+        if call(Syscall::Getgroups.raw(), a1(2, BAD_PTR)) != Some(-14) {
+            return Err("getgroups bad pointer did not return EFAULT");
         }
         Ok(())
     })
@@ -462,9 +483,18 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_getgroups_neg);
 // ── setgroups ────────────────────────────────────────────────────────
 fn smoke_abi_creds_setgroups_pos() -> TestResult {
     with_setup(|| {
-        let r = call(Syscall::Setgroups.raw(), a1(0, 0)).ok_or("setgroups not Ok")?;
-        if r != 0 {
-            return Err("setgroups(0,NULL) expected 0");
+        let input = [7u32, 8];
+        if call(
+            Syscall::Setgroups.raw(),
+            a1(input.len() as u64, input.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setgroups(nonempty) expected 0");
+        }
+        if call(Syscall::Setgroups.raw(), a1(0, 0)) != Some(0)
+            || call(Syscall::Getgroups.raw(), a1(0, 0)) != Some(0)
+        {
+            return Err("setgroups(0,NULL) did not clear groups");
         }
         Ok(())
     })
@@ -473,11 +503,11 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setgroups_pos);
 
 fn smoke_abi_creds_setgroups_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux EPERMs an unprivileged setgroups and EFAULTs a
-        // bad list pointer; NARF accepts everything structurally ⇒ Ok(0).
-        let r = call(Syscall::Setgroups.raw(), a1(4, BAD_PTR)).ok_or("setgroups not Ok")?;
-        if r != 0 {
-            return Err("setgroups(4,bad) still expected 0 (NARF stub)");
+        if call(Syscall::Setgroups.raw(), a1(4, BAD_PTR)) != Some(-14) {
+            return Err("setgroups bad pointer did not return EFAULT");
+        }
+        if call(Syscall::Setgroups.raw(), a1(65_537, BAD_PTR)) != Some(-22) {
+            return Err("setgroups above NGROUPS_MAX did not return EINVAL");
         }
         Ok(())
     })

@@ -128,9 +128,12 @@ pub fn __test_itimer_real_next_fire(task: u64) -> u64 {
     })
 }
 
-fn with_table<R>(f: impl FnOnce(&mut BTreeMap<u64, TimerTable>) -> R) -> Option<R> {
+fn with_table<R>(f: impl FnOnce(&mut BTreeMap<u64, TimerTable>) -> R) -> R {
+    // Match the interval-timer path below: the normal boot path does not call
+    // `posix_timer_init`, so the first timer_create(2) must stand the table up.
     let mut g = TIMERS.lock();
-    g.as_mut().map(f)
+    let m = g.get_or_insert_with(BTreeMap::new);
+    f(m)
 }
 
 fn read_timespec(buf: &[u8; 16]) -> (i64, i64) {
@@ -246,13 +249,6 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
         );
         id
     });
-    let id = match id {
-        Some(i) => i,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
     // Write the timerid (kernel_timer_t is a `void*`-sized opaque on
     // Linux; we emit a u32 zero-extended to 8 B to keep wire-size
     // sane on both 32/64-bit consumers).
@@ -326,8 +322,7 @@ pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
         entry.interval_ns = interval_ns;
         entry.overrun = 0;
         Some((prev_next, prev_interval))
-    })
-    .flatten();
+    });
     let (prev_next, prev_interval) = match prev {
         Some(p) => p,
         None => {
@@ -369,8 +364,7 @@ pub fn sys_timer_gettime(ctx: &mut dyn TrapContext) {
         let t = m.get(&task)?;
         let e = t.by_id.get(&id)?;
         Some((e.next_fire_ns, e.interval_ns))
-    })
-    .flatten();
+    });
     let (next, interval) = match snap {
         Some(s) => s,
         None => {
@@ -404,8 +398,7 @@ pub fn sys_timer_delete(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let id = args.arg0 as u32;
     let task = current_task_id();
-    let removed = with_table(|m| m.get_mut(&task).and_then(|t| t.by_id.remove(&id)).is_some())
-        .unwrap_or(false);
+    let removed = with_table(|m| m.get_mut(&task).and_then(|t| t.by_id.remove(&id)).is_some());
     if removed {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
@@ -914,7 +907,6 @@ pub fn overrun_of(task: u64, id: u32) -> Option<u32> {
             .and_then(|t| t.by_id.get(&id))
             .map(|t| t.overrun)
     })
-    .flatten()
 }
 
 /// Diagnostic for the smokes — peek the next-fire deadline.
@@ -925,7 +917,6 @@ pub fn next_fire_of(task: u64, id: u32) -> Option<u64> {
             .and_then(|t| t.by_id.get(&id))
             .map(|t| t.next_fire_ns)
     })
-    .flatten()
 }
 
 /// Force the pump to run — for tests that don't have a real

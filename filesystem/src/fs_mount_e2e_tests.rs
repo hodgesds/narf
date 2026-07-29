@@ -297,6 +297,362 @@ fn smoke_vfs_mount_read_unmount() -> TestResult {
 }
 kernel_test_in!("filesystem/e2e/mount", smoke_vfs_mount_read_unmount);
 
+/// Mount stacking (Linux overmount): a mount onto an already-occupied path
+/// succeeds and shadows the one below; resolution sees the topmost; unmount
+/// pops it and reveals the mount underneath. systemd's ProtectHostname= binds
+/// a read-only /proc/sys/kernel/domainname over the live one — rejecting the
+/// overmount with EBUSY broke service namespace setup (226/EXIT_NAMESPACE).
+fn smoke_registry_overmount_stacks() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    const PATH: &str = "/fme-stack";
+
+    // Bottom mount is visible.
+    let h1 = match registry().mount(&auth, PATH, MemFs::new("stack-bottom")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("bottom mount failed"),
+    };
+    let id_bottom = registry().mount_id_at(PATH);
+    if registry().resolve_absolute(PATH, |fs, _| fs.name() == "stack-bottom") != Some(true) {
+        let _ = registry().unmount(&h1, PATH);
+        return TestResult::Fail("bottom mount not visible");
+    }
+
+    // Overmount onto the SAME path must succeed (stacking), not EBUSY.
+    let h2 = match registry().mount(&auth, PATH, MemFs::new("stack-top")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&h1, PATH);
+            return TestResult::Fail("overmount rejected — registry lacks stacking");
+        }
+    };
+    // Topmost is now visible, with a distinct mount id.
+    let id_top = registry().mount_id_at(PATH);
+    let top_visible = registry().resolve_absolute(PATH, |fs, _| fs.name() == "stack-top");
+    if top_visible != Some(true) {
+        let _ = registry().unmount(&h2, PATH);
+        let _ = registry().unmount(&h1, PATH);
+        return TestResult::Fail("top of stack not visible after overmount");
+    }
+    if id_top.is_none() || id_top == id_bottom {
+        let _ = registry().unmount(&h2, PATH);
+        let _ = registry().unmount(&h1, PATH);
+        return TestResult::Fail("stacked mounts must have distinct mount ids");
+    }
+
+    // Pop the top: the bottom mount is revealed again (both fs identity and id).
+    if registry().unmount(&h2, PATH).is_err() {
+        let _ = registry().unmount(&h1, PATH);
+        return TestResult::Fail("unmount top of stack failed");
+    }
+    if registry().resolve_absolute(PATH, |fs, _| fs.name() == "stack-bottom") != Some(true) {
+        let _ = registry().unmount(&h1, PATH);
+        return TestResult::Fail("popping top did not reveal the lower mount");
+    }
+    if registry().mount_id_at(PATH) != id_bottom {
+        let _ = registry().unmount(&h1, PATH);
+        return TestResult::Fail("revealed mount is not the original bottom");
+    }
+
+    // Popping the last mount leaves the path unmounted.
+    if registry().unmount(&h1, PATH).is_err() {
+        return TestResult::Fail("unmount bottom failed");
+    }
+    if registry().with_mount(PATH, |_| ()).is_some() {
+        return TestResult::Fail("path still mounted after popping the whole stack");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/e2e/mount", smoke_registry_overmount_stacks);
+
+/// A deep (3-layer) stack pops strictly LIFO: each unmount reveals exactly the
+/// layer beneath, in reverse mount order.
+fn smoke_registry_overmount_deep_lifo() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    const PATH: &str = "/fme-deep";
+
+    let hb = match registry().mount(&auth, PATH, MemFs::new("deep-bottom")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("bottom mount failed"),
+    };
+    let hm = match registry().mount(&auth, PATH, MemFs::new("deep-middle")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&hb, PATH);
+            return TestResult::Fail("middle overmount failed");
+        }
+    };
+    let ht = match registry().mount(&auth, PATH, MemFs::new("deep-top")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&hm, PATH);
+            let _ = registry().unmount(&hb, PATH);
+            return TestResult::Fail("top overmount failed");
+        }
+    };
+
+    let visible = |want: &str| {
+        registry().resolve_absolute(PATH, |fs, _| if fs.name() == want { 1u8 } else { 0 })
+            == Some(1)
+    };
+
+    let mut fail: Option<&'static str> = None;
+    if !visible("deep-top") {
+        fail = Some("top of a 3-deep stack not visible");
+    }
+    if fail.is_none() && registry().unmount(&ht, PATH).is_err() {
+        fail = Some("pop top failed");
+    }
+    if fail.is_none() && !visible("deep-middle") {
+        fail = Some("pop top must reveal the middle mount");
+    }
+    if fail.is_none() && registry().unmount(&hm, PATH).is_err() {
+        fail = Some("pop middle failed");
+    }
+    if fail.is_none() && !visible("deep-bottom") {
+        fail = Some("pop middle must reveal the bottom mount");
+    }
+    // Always drain to keep the global registry clean for later tests.
+    let _ = registry().unmount(&ht, PATH);
+    let _ = registry().unmount(&hm, PATH);
+    let _ = registry().unmount(&hb, PATH);
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!("filesystem/e2e/mount", smoke_registry_overmount_deep_lifo);
+
+/// A same-path stack coexists with a DEEPER nested mount: longest-prefix
+/// resolution still selects the nested mount for paths under it, while the
+/// stack's topmost wins for paths at the stacked level.
+fn smoke_registry_stack_under_nested_mount() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    const BASE: &str = "/nst";
+    const SUB: &str = "/nst/sub";
+
+    let hb = match registry().mount(&auth, BASE, MemFs::new("nst-bottom")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("base bottom mount failed"),
+    };
+    let ht = match registry().mount(&auth, BASE, MemFs::new("nst-top")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&hb, BASE);
+            return TestResult::Fail("base overmount failed");
+        }
+    };
+    let hs = match registry().mount(&auth, SUB, MemFs::new("nst-sub")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&ht, BASE);
+            let _ = registry().unmount(&hb, BASE);
+            return TestResult::Fail("nested mount failed");
+        }
+    };
+
+    // A path at the stacked level resolves to the stack's TOP.
+    let at_base =
+        registry().resolve_absolute("/nst/x", |fs, _| fs.name() == "nst-top") == Some(true);
+    // A path under the deeper mount resolves to the NESTED fs (longest prefix
+    // beats the stack), not to either /nst layer.
+    let at_sub =
+        registry().resolve_absolute("/nst/sub/y", |fs, _| fs.name() == "nst-sub") == Some(true);
+
+    let _ = registry().unmount(&hs, SUB);
+    let _ = registry().unmount(&ht, BASE);
+    let _ = registry().unmount(&hb, BASE);
+
+    if at_base && at_sub {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("longest-prefix must beat a same-path stack for deeper mounts")
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_registry_stack_under_nested_mount
+);
+
+/// A private `MountNamespace` (the path a service takes after
+/// `unshare(CLONE_NEWNS)`) supports the same overmount stacking as the global
+/// registry: overmount succeeds, topmost is visible, unmount reveals the lower.
+/// This is the exact path systemd's ProtectHostname= domainname bind takes.
+fn smoke_ns_overmount_stacks() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    let ns = crate::MountNamespace::snapshot_global();
+    const PATH: &str = "/ns-stack";
+
+    if ns
+        .mount_arc(&auth, PATH, alloc::sync::Arc::new(MemFs::new("ns-bottom")))
+        .is_err()
+    {
+        return TestResult::Fail("ns bottom mount failed");
+    }
+    if ns
+        .mount_arc(&auth, PATH, alloc::sync::Arc::new(MemFs::new("ns-top")))
+        .is_err()
+    {
+        return TestResult::Fail("ns overmount rejected — namespace lacks stacking");
+    }
+    let top_visible = ns.resolve_absolute(PATH, |fs, _| fs.name() == "ns-top") == Some(true);
+    if !top_visible {
+        return TestResult::Fail("ns top of stack not visible");
+    }
+    if ns.unmount(PATH).is_err() {
+        return TestResult::Fail("ns unmount top failed");
+    }
+    let bottom_revealed = ns.resolve_absolute(PATH, |fs, _| fs.name() == "ns-bottom") == Some(true);
+    if !bottom_revealed {
+        return TestResult::Fail("ns unmount did not reveal the lower mount");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/e2e/mount", smoke_ns_overmount_stacks);
+
+/// A FILE can be bind-mounted (mount --bind of a file), producing a
+/// file-rooted mount: it appears as a mount entry (so /proc/self/mountinfo
+/// lists it — what systemd's read-only procfs-control-file protection needs)
+/// and resolving its path returns the bound file's content. Without this the
+/// self-bind was a no-op, the path never showed up as a mount, and systemd's
+/// recursive read-only remount looped 32× then failed EBUSY / 226.
+fn smoke_registry_file_bind_resolves_to_file() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    let src = match make_initramfs(
+        "fb-src",
+        &[CpioEntry {
+            name: "f.txt",
+            mode: 0o100644,
+            data: b"filedata",
+        }],
+    ) {
+        Some(f) => f,
+        None => return TestResult::Fail("CPIO build failed"),
+    };
+    let h_src = match registry().mount(&auth, "/fb_src", src) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("source mount failed"),
+    };
+
+    // Bind the FILE /fb_src/f.txt onto /fb_dst.
+    let h_dst = match registry().bind_mount(&auth, "/fb_src/f.txt", "/fb_dst") {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&h_src, "/fb_src");
+            return TestResult::Fail("file bind_mount failed (a file source must bind)");
+        }
+    };
+
+    // The target is a file-rooted mount: root_file() is the bound file and it
+    // reads back the source content.
+    let content_ok = registry().with_mount("/fb_dst", |fs| match fs.root_file() {
+        Some(file) => {
+            let mut buf = vec![0u8; 16];
+            matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if &buf[..n] == b"filedata")
+        }
+        None => false,
+    }) == Some(true);
+
+    // It is a real mount entry (this is what makes it appear in mountinfo).
+    let listed = registry().list().iter().any(|p| p == "/fb_dst");
+
+    let _ = registry().unmount(&h_dst, "/fb_dst");
+    let _ = registry().unmount(&h_src, "/fb_src");
+
+    if content_ok && listed {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("a file bind mount must be listed and resolve to the file's content")
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_registry_file_bind_resolves_to_file
+);
+
+/// Stacking works for FILES too: overmounting one bound file with another
+/// shadows it, and unmounting reveals the file underneath — the file analogue
+/// of smoke_registry_overmount_stacks.
+fn smoke_registry_file_overmount_stacks() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    let a = match make_initramfs(
+        "fov-a",
+        &[CpioEntry {
+            name: "a.txt",
+            mode: 0o100644,
+            data: b"aaa",
+        }],
+    ) {
+        Some(f) => f,
+        None => return TestResult::Fail("CPIO build a failed"),
+    };
+    let b = match make_initramfs(
+        "fov-b",
+        &[CpioEntry {
+            name: "b.txt",
+            mode: 0o100644,
+            data: b"bbb",
+        }],
+    ) {
+        Some(f) => f,
+        None => return TestResult::Fail("CPIO build b failed"),
+    };
+    let ha = match registry().mount(&auth, "/fova", a) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount a failed"),
+    };
+    let hb = match registry().mount(&auth, "/fovb", b) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&ha, "/fova");
+            return TestResult::Fail("mount b failed");
+        }
+    };
+
+    let reads = |want: &[u8]| {
+        registry().with_mount("/fovstk", |fs| match fs.root_file() {
+            Some(file) => {
+                let mut buf = vec![0u8; 8];
+                matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if &buf[..n] == want)
+            }
+            None => false,
+        }) == Some(true)
+    };
+
+    // Bottom file, then overmount with the top file.
+    let hbot = match registry().bind_mount(&auth, "/fova/a.txt", "/fovstk") {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&hb, "/fovb");
+            let _ = registry().unmount(&ha, "/fova");
+            return TestResult::Fail("bottom file bind failed");
+        }
+    };
+    let htop = match registry().bind_mount(&auth, "/fovb/b.txt", "/fovstk") {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&hbot, "/fovstk");
+            let _ = registry().unmount(&hb, "/fovb");
+            let _ = registry().unmount(&ha, "/fova");
+            return TestResult::Fail("file overmount failed");
+        }
+    };
+
+    let top_wins = reads(b"bbb");
+    let popped = registry().unmount(&htop, "/fovstk").is_ok();
+    let bottom_revealed = reads(b"aaa");
+
+    let _ = registry().unmount(&hbot, "/fovstk");
+    let _ = registry().unmount(&hb, "/fovb");
+    let _ = registry().unmount(&ha, "/fova");
+
+    if top_wins && popped && bottom_revealed {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("file overmount must shadow the lower file and reveal it on unmount")
+    }
+}
+kernel_test_in!("filesystem/e2e/mount", smoke_registry_file_overmount_stacks);
+
 // ── Smoke 2: directory listing ────────────────────────────────────────
 //
 // Mount a CPIO archive with:
@@ -843,16 +1199,20 @@ fn smoke_vfs_multi_mount_independent() -> TestResult {
 }
 kernel_test_in!("filesystem/e2e/mount", smoke_vfs_multi_mount_independent);
 
-// ── Smoke 9: mount on occupied mountpoint → Busy ──────────────────────
+// ── Smoke 9: mount on occupied mountpoint → stacks (overmount) ────────
 //
-// Attempt to mount a second FS on the same path while the first is
-// still mounted. `VfsRegistry::mount` must return `FsError::Busy`.
+// Mounting a second FS on a path that is already mounted STACKS it: the new
+// mount shadows the first (Linux overmount), so the topmost FS's contents are
+// what resolve, and unmounting pops it to reveal the original underneath.
+// NARF previously returned `FsError::Busy` here, which broke systemd service
+// namespace setup (ProtectHostname= binds a read-only view over
+// /proc/sys/kernel/domainname) with 226/EXIT_NAMESPACE.
 //
 // References:
-//   Linux `fs/namespace.c::do_add_mount` → -EBUSY when the mount point
-//   is already occupied without `MNT_BIND`.
+//   Linux `fs/namespace.c::do_add_mount` stacks on an occupied mountpoint;
+//   the topmost mount is the visible one.
 
-fn smoke_vfs_busy_on_duplicate_mountpoint() -> TestResult {
+fn smoke_vfs_stack_on_duplicate_mountpoint() -> TestResult {
     const PATH: &str = "/fme9";
 
     let fs1 = match make_initramfs(
@@ -879,28 +1239,49 @@ fn smoke_vfs_busy_on_duplicate_mountpoint() -> TestResult {
     };
 
     let auth = bootstrap_mount_authority();
-    let handle = match registry().mount(&auth, PATH, fs1) {
+    let h1 = match registry().mount(&auth, PATH, fs1) {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("first mount failed"),
     };
 
-    let second_result = registry().mount(&auth, PATH, fs2);
-
-    let _ = registry().unmount(&handle, PATH);
-
-    match second_result {
-        Err(FsError::Busy) => TestResult::Pass,
-        Err(_) => TestResult::Fail("double mount returned wrong error (expected Busy)"),
-        Ok(h2) => {
-            // Clean up the unexpected second mount.
-            let _ = registry().unmount(&h2, PATH);
-            TestResult::Fail("double mount succeeded — should return Busy")
+    // Overmount the same path: must succeed (stack), not Busy.
+    let h2 = match registry().mount(&auth, PATH, fs2) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&h1, PATH);
+            return TestResult::Fail("overmount rejected — should stack, not Busy");
         }
+    };
+
+    // The topmost FS (fs2) is visible: its g.txt resolves and fs1's f.txt is
+    // shadowed.
+    let top_sees_g = matches!(
+        registry().with_mount(PATH, |fs| resolve(fs.root(), "g.txt").is_ok()),
+        Some(true)
+    );
+    let top_hides_f = matches!(
+        registry().with_mount(PATH, |fs| resolve(fs.root(), "f.txt").is_err()),
+        Some(true)
+    );
+
+    // Pop the top: fs1's f.txt is revealed again.
+    let popped = registry().unmount(&h2, PATH).is_ok();
+    let bottom_sees_f = matches!(
+        registry().with_mount(PATH, |fs| resolve(fs.root(), "f.txt").is_ok()),
+        Some(true)
+    );
+
+    let _ = registry().unmount(&h1, PATH);
+
+    if top_sees_g && top_hides_f && popped && bottom_sees_f {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("duplicate mount must stack: top shadows bottom, unmount reveals it")
     }
 }
 kernel_test_in!(
     "filesystem/e2e/mount",
-    smoke_vfs_busy_on_duplicate_mountpoint
+    smoke_vfs_stack_on_duplicate_mountpoint
 );
 
 // ── Smoke 10: stat reports correct size and mode ─────────────────────
@@ -975,6 +1356,375 @@ kernel_test_in!(
     "filesystem/e2e/mount",
     smoke_vfs_stat_correct_size_mode_blocks
 );
+
+// ── Smoke 11: lock released across resolve_absolute closure ──────────
+//
+// REGRESSION GUARD for the SMP mount-table deadlock fixed in lib.rs.
+//
+// `VfsRegistry::{resolve_absolute, with_mount, resolve_parent_absolute}`
+// used to run their user closure WHILE HOLDING the `inner` IrqSafeSpinLock.
+// Callers pass BLOCKING closures (block-I/O resolvers busy-spin in
+// `poll_blocking`), so holding the IRQ-disabling lock across the closure
+// deadlocked the box under an SMP statx storm. The fix clones the
+// `Arc<dyn FsInstance>` + relative path out, DROPS the lock, THEN runs the
+// closure.
+//
+// To prove the lock is no longer held across the closure, we perform a
+// NESTED call back into the SAME registry FROM INSIDE the closure — a call
+// that itself acquires the `inner` lock (`mount_id_at`, and another
+// `resolve_absolute`). If the outer lock were still held, this nested
+// acquisition of the same non-reentrant `IrqSafeSpinLock` would deadlock
+// (hang the test forever). A test that RETURNS AT ALL therefore proves the
+// lock was released; we additionally assert the nested lookup returns the
+// correct value for a DIFFERENT mount.
+
+fn smoke_vfs_resolve_absolute_lock_released_in_closure() -> TestResult {
+    const PATH_A: &str = "/fme11a";
+    const PATH_B: &str = "/fme11b";
+
+    let fs_a = match make_initramfs(
+        "fme11a",
+        &[CpioEntry {
+            name: "a.txt",
+            mode: 0o100644,
+            data: b"aa",
+        }],
+    ) {
+        Some(f) => f,
+        None => return TestResult::Fail("CPIO build A failed"),
+    };
+    let fs_b = match make_initramfs(
+        "fme11b",
+        &[CpioEntry {
+            name: "b.txt",
+            mode: 0o100644,
+            data: b"bb",
+        }],
+    ) {
+        Some(f) => f,
+        None => return TestResult::Fail("CPIO build B failed"),
+    };
+
+    let auth = bootstrap_mount_authority();
+    let handle_a = match registry().mount(&auth, PATH_A, fs_a) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount A failed"),
+    };
+    let handle_b = match registry().mount(&auth, PATH_B, fs_b) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&handle_a, PATH_A);
+            return TestResult::Fail("mount B failed");
+        }
+    };
+
+    // The id of mount B, obtained WITHOUT any nesting, for comparison.
+    let expected_b_id = registry().mount_id_at(PATH_B);
+
+    // Resolve against mount A. INSIDE the closure — which now runs with
+    // the `inner` lock RELEASED — make two nested re-entrant calls that
+    // both re-acquire the `inner` lock. If the lock were still held these
+    // would deadlock. Return the nested results so we can assert on them.
+    let nested = registry().resolve_absolute(PATH_A, |_fs, _rel| {
+        // Nested lock-taking call #1: mount_id_at re-locks `inner`.
+        let nested_id = registry().mount_id_at(PATH_B);
+        // Nested lock-taking call #2: another resolve_absolute (different
+        // mount) re-locks `inner` and runs its own closure.
+        let nested_resolve = registry().resolve_absolute(PATH_B, |fs, rel| {
+            (String::from(rel), resolve(fs.root(), "b.txt").is_ok())
+        });
+        (nested_id, nested_resolve)
+    });
+
+    let _ = registry().unmount(&handle_a, PATH_A);
+    let _ = registry().unmount(&handle_b, PATH_B);
+
+    match nested {
+        Some((nested_id, Some((rel, b_ok)))) => {
+            if nested_id != expected_b_id || nested_id.is_none() {
+                return TestResult::Fail("nested mount_id_at returned wrong id");
+            }
+            if !rel.is_empty() {
+                return TestResult::Fail("nested resolve_absolute rel not empty for mount root");
+            }
+            if !b_ok {
+                return TestResult::Fail("nested resolve failed to read b.txt");
+            }
+            TestResult::Pass
+        }
+        Some((_, None)) => TestResult::Fail("nested resolve_absolute returned None"),
+        None => TestResult::Fail("outer resolve_absolute returned None for live mount"),
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_resolve_absolute_lock_released_in_closure
+);
+
+// ── Smoke 11b: lock released across with_mount closure ───────────────
+//
+// Same regression guard as smoke 11, for `with_mount`. A nested
+// `mount_id_at` (which re-locks `inner`) inside the `with_mount` closure
+// would deadlock if `with_mount` still held the lock across the closure.
+
+fn smoke_vfs_with_mount_lock_released_in_closure() -> TestResult {
+    const PATH_A: &str = "/fme11ba";
+    const PATH_B: &str = "/fme11bb";
+
+    let auth = bootstrap_mount_authority();
+    let handle_a = match registry().mount(&auth, PATH_A, MemFs::new("fme11ba")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount A failed"),
+    };
+    let handle_b = match registry().mount(&auth, PATH_B, MemFs::new("fme11bb")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&handle_a, PATH_A);
+            return TestResult::Fail("mount B failed");
+        }
+    };
+
+    let expected_b_id = registry().mount_id_at(PATH_B);
+
+    // Inside with_mount(A): nested lock-taking calls targeting mount B.
+    let nested = registry().with_mount(PATH_A, |_fs| {
+        let id = registry().mount_id_at(PATH_B);
+        let also = registry().with_mount(PATH_B, |fs| String::from(fs.name()));
+        (id, also)
+    });
+
+    let _ = registry().unmount(&handle_a, PATH_A);
+    let _ = registry().unmount(&handle_b, PATH_B);
+
+    match nested {
+        Some((id, Some(name))) => {
+            if id != expected_b_id || id.is_none() {
+                return TestResult::Fail("nested mount_id_at returned wrong id under with_mount");
+            }
+            if name != "fme11bb" {
+                return TestResult::Fail("nested with_mount saw wrong FS name");
+            }
+            TestResult::Pass
+        }
+        Some((_, None)) => TestResult::Fail("nested with_mount returned None"),
+        None => TestResult::Fail("outer with_mount returned None for live mount"),
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_with_mount_lock_released_in_closure
+);
+
+// ── Smoke 11c: lock released across resolve_parent_absolute closure ──
+//
+// Same regression guard, for `resolve_parent_absolute`. The nested
+// `mount_id_at` + `resolve_absolute` re-lock `inner`; a lock still held
+// across the closure would deadlock.
+
+fn smoke_vfs_resolve_parent_absolute_lock_released_in_closure() -> TestResult {
+    const PATH_A: &str = "/fme11ca";
+    const PATH_B: &str = "/fme11cb";
+
+    let auth = bootstrap_mount_authority();
+    let handle_a = match registry().mount(&auth, PATH_A, MemFs::new("fme11ca")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount A failed"),
+    };
+    let handle_b = match registry().mount(&auth, PATH_B, MemFs::new("fme11cb")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&handle_a, PATH_A);
+            return TestResult::Fail("mount B failed");
+        }
+    };
+
+    let expected_b_id = registry().mount_id_at(PATH_B);
+
+    // resolve_parent_absolute of "/fme11ca/leaf": parent is the A mount
+    // root, leaf == "leaf". Inside the closure (lock released) re-enter.
+    let nested = registry().resolve_parent_absolute("/fme11ca/leaf", |_fs, _dir, leaf| {
+        let id = registry().mount_id_at(PATH_B);
+        let also = registry().resolve_absolute(PATH_B, |fs, rel| {
+            (String::from(rel), String::from(fs.name()))
+        });
+        (String::from(leaf), id, also)
+    });
+
+    let _ = registry().unmount(&handle_a, PATH_A);
+    let _ = registry().unmount(&handle_b, PATH_B);
+
+    match nested {
+        Some((leaf, id, Some((rel, name)))) => {
+            if leaf != "leaf" {
+                return TestResult::Fail("resolve_parent_absolute produced wrong leaf");
+            }
+            if id != expected_b_id || id.is_none() {
+                return TestResult::Fail("nested mount_id_at wrong under resolve_parent_absolute");
+            }
+            if !rel.is_empty() || name != "fme11cb" {
+                return TestResult::Fail("nested resolve_absolute wrong under parent closure");
+            }
+            TestResult::Pass
+        }
+        Some((_, _, None)) => TestResult::Fail("nested resolve_absolute returned None"),
+        None => TestResult::Fail("outer resolve_parent_absolute returned None for live mount"),
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_resolve_parent_absolute_lock_released_in_closure
+);
+
+// ── Smoke 12: longest-prefix mount matching ──────────────────────────
+//
+// With `/fme12` and `/fme12/sub` BOTH mounted, `resolve_absolute` must
+// pick the LONGEST matching mount prefix:
+//   `/fme12/sub/bar` → resolves against the `/fme12/sub` mount, rel="bar"
+//   `/fme12/foo`     → resolves against the `/fme12`     mount, rel="foo"
+//
+// The relative path handed to the closure is what proves which mount was
+// chosen: a "bar" rel means the `/fme12/sub` mount matched (had the shorter
+// mount matched, rel would be "sub/bar").
+//
+// References: Linux `fs/namespace.c` — the mount hash picks the deepest
+// mount covering a dentry.
+
+fn smoke_vfs_longest_prefix_mount_match() -> TestResult {
+    const PATH_TOP: &str = "/fme12";
+    const PATH_SUB: &str = "/fme12/sub";
+
+    let auth = bootstrap_mount_authority();
+    let handle_top = match registry().mount(&auth, PATH_TOP, MemFs::new("fme12-top")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount top failed"),
+    };
+    let handle_sub = match registry().mount(&auth, PATH_SUB, MemFs::new("fme12-sub")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&handle_top, PATH_TOP);
+            return TestResult::Fail("mount sub failed");
+        }
+    };
+
+    // `/fme12/sub/bar` must select the deeper `/fme12/sub` mount → rel "bar"
+    // and the FS name of the sub mount.
+    let deep = registry().resolve_absolute("/fme12/sub/bar", |fs, rel| {
+        (String::from(rel), String::from(fs.name()))
+    });
+    // `/fme12/foo` must select the `/fme12` mount → rel "foo".
+    let shallow = registry().resolve_absolute("/fme12/foo", |fs, rel| {
+        (String::from(rel), String::from(fs.name()))
+    });
+
+    let _ = registry().unmount(&handle_sub, PATH_SUB);
+    let _ = registry().unmount(&handle_top, PATH_TOP);
+
+    match (deep, shallow) {
+        (Some((deep_rel, deep_name)), Some((shallow_rel, shallow_name))) => {
+            if deep_rel != "bar" {
+                return TestResult::Fail("deep path did not select /fme12/sub mount (rel != bar)");
+            }
+            if deep_name != "fme12-sub" {
+                return TestResult::Fail("deep path resolved against wrong FS");
+            }
+            if shallow_rel != "foo" {
+                return TestResult::Fail("shallow path did not select /fme12 mount (rel != foo)");
+            }
+            if shallow_name != "fme12-top" {
+                return TestResult::Fail("shallow path resolved against wrong FS");
+            }
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("resolve_absolute returned None for a covered path"),
+    }
+}
+kernel_test_in!("filesystem/e2e/mount", smoke_vfs_longest_prefix_mount_match);
+
+// ── Smoke 13: mount_id_at correctness ────────────────────────────────
+//
+// `mount_id_at` returns the id of the longest-prefix mount covering a
+// path. Assertions:
+//   - Two distinct mounts have DISTINCT ids.
+//   - A path under a mount returns THAT mount's id (id at mount path ==
+//     id at a file below it).
+//   - With nested `/fme13` + `/fme13/sub`, a path under `/fme13/sub`
+//     returns the SUB mount id (longest prefix), while a path under
+//     `/fme13` but not `/fme13/sub` returns the TOP mount id.
+//   - A file under `/` (an uncovered top-level path) returns the root
+//     mount id when a `/` mount exists (installed at boot).
+
+fn smoke_vfs_mount_id_at_correctness() -> TestResult {
+    const PATH_TOP: &str = "/fme13";
+    const PATH_SUB: &str = "/fme13/sub";
+    const PATH_OTHER: &str = "/fme13other";
+
+    let auth = bootstrap_mount_authority();
+    let handle_top = match registry().mount(&auth, PATH_TOP, MemFs::new("fme13-top")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount top failed"),
+    };
+    let handle_sub = match registry().mount(&auth, PATH_SUB, MemFs::new("fme13-sub")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&handle_top, PATH_TOP);
+            return TestResult::Fail("mount sub failed");
+        }
+    };
+    let handle_other = match registry().mount(&auth, PATH_OTHER, MemFs::new("fme13-other")) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = registry().unmount(&handle_sub, PATH_SUB);
+            let _ = registry().unmount(&handle_top, PATH_TOP);
+            return TestResult::Fail("mount other failed");
+        }
+    };
+
+    let id_top = registry().mount_id_at(PATH_TOP);
+    let id_sub = registry().mount_id_at(PATH_SUB);
+    let id_other = registry().mount_id_at(PATH_OTHER);
+    // A file below the top mount but NOT under /fme13/sub.
+    let id_top_file = registry().mount_id_at("/fme13/foo.txt");
+    // A file below the sub mount → longest prefix is /fme13/sub.
+    let id_sub_file = registry().mount_id_at("/fme13/sub/bar.txt");
+    // A top-level path with no explicit mount → the boot `/` mount (if any).
+    let id_root_file = registry().mount_id_at("/fme13-not-mounted-anywhere");
+
+    let _ = registry().unmount(&handle_other, PATH_OTHER);
+    let _ = registry().unmount(&handle_sub, PATH_SUB);
+    let _ = registry().unmount(&handle_top, PATH_TOP);
+
+    // All three mounts must have resolved to some id.
+    let (id_top, id_sub, id_other) = match (id_top, id_sub, id_other) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => return TestResult::Fail("mount_id_at returned None for a live mount"),
+    };
+
+    // Distinct mounts → distinct ids.
+    if id_top == id_sub || id_top == id_other || id_sub == id_other {
+        return TestResult::Fail("distinct mounts returned duplicate ids");
+    }
+
+    // A file under the top mount (not under /sub) maps to the top id.
+    if id_top_file != Some(id_top) {
+        return TestResult::Fail("file under /fme13 did not map to top mount id");
+    }
+
+    // A file under the sub mount maps to the sub (longest-prefix) id.
+    if id_sub_file != Some(id_sub) {
+        return TestResult::Fail("file under /fme13/sub did not map to sub mount id");
+    }
+
+    // An uncovered top-level path falls back to the root mount when a `/`
+    // mount exists. It must NOT match any of our /fme13 mounts. If the boot
+    // `/` mount is present it returns that root id; if not, None. Either way
+    // it must differ from the three /fme13 mount ids.
+    if matches!(id_root_file, Some(x) if x == id_top || x == id_sub || x == id_other) {
+        return TestResult::Fail("uncovered path incorrectly matched a /fme13 mount");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/e2e/mount", smoke_vfs_mount_id_at_correctness);
 
 // ── FS coverage matrix ────────────────────────────────────────────────
 //

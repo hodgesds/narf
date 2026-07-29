@@ -721,6 +721,13 @@ impl UserNamespace {
         g.uid_map.iter().find_map(|e| e.outer_to_inner(host))
     }
 
+    /// Translate a host gid to the id this ns sees, or `None` if the
+    /// host gid isn't mapped into this ns.
+    pub fn translate_gid_from_host(&self, host: u32) -> Option<u32> {
+        let g = self.inner.lock();
+        g.gid_map.iter().find_map(|e| e.outer_to_inner(host))
+    }
+
     /// True if inner uid `id` is mapped (so e.g. setuid to it is OK).
     pub fn uid_is_mapped(&self, inner: u32) -> bool {
         let g = self.inner.lock();

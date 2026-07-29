@@ -143,7 +143,12 @@ typed operations in §3.3. `RTM_NEWNEIGH`/`RTM_DELNEIGH` update IPv4 ARP or
 IPv6 NDP state through the same interface-bound authority.
 The stack-daemon launcher performs delegation as a kernel-held transfer from a
 successful `StackAttachReply` to a route socket in the attaching task's fd
-table. The Linux syscall surface never accepts raw admin-handle bytes.
+table. During bootstrap, when outer PID 1 opens a `NETLINK_ROUTE` socket in
+the initial network namespace, the kernel attaches a separate `lo`-only
+handle so systemd can issue its idempotent `RTM_SETLINK(IFF_UP)` loopback
+request. This handle cannot administer another interface or namespace, and
+all other route sockets remain undelegated. The Linux syscall surface never
+accepts raw admin-handle bytes.
 
 Successful mutations emit kernel-originated sequence-zero notifications to
 the Linux rtnetlink multicast group for the changed object (link, neighbor,

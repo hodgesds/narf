@@ -26,6 +26,11 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub struct EventFd {
     counter: AtomicU64,
     semaphore: bool,
+    /// Advances on each 0 → non-zero transition so EPOLLET can observe a
+    /// drain/refill edge even when both epoll scans see POLLIN set.
+    readable_token: AtomicU64,
+    /// Advances when a saturated counter becomes writable again.
+    writable_token: AtomicU64,
 }
 
 pub const EFD_SEMAPHORE: u32 = 1;
@@ -35,6 +40,8 @@ impl EventFd {
         Arc::new(Self {
             counter: AtomicU64::new(initval),
             semaphore: (flags & EFD_SEMAPHORE) != 0,
+            readable_token: AtomicU64::new(u64::from(initval != 0)),
+            writable_token: AtomicU64::new(0),
         })
     }
 }
@@ -45,20 +52,32 @@ impl FileOps for EventFd {
             if buf.len() < 8 {
                 return Err(FsError::InvalidPath);
             }
-            let v = if self.semaphore {
-                let cur = self.counter.load(Ordering::Acquire);
-                if cur == 0 {
-                    return Ok(0);
+            let (v, was_saturated) = if self.semaphore {
+                let mut cur = self.counter.load(Ordering::Acquire);
+                loop {
+                    if cur == 0 {
+                        return Ok(0);
+                    }
+                    match self.counter.compare_exchange_weak(
+                        cur,
+                        cur - 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break (1, cur >= u64::MAX - 1),
+                        Err(observed) => cur = observed,
+                    }
                 }
-                self.counter.fetch_sub(1, Ordering::AcqRel);
-                1u64
             } else {
                 let cur = self.counter.swap(0, Ordering::AcqRel);
                 if cur == 0 {
                     return Ok(0);
                 }
-                cur
+                (cur, cur >= u64::MAX - 1)
             };
+            if was_saturated {
+                self.writable_token.fetch_add(1, Ordering::Release);
+            }
             buf[..8].copy_from_slice(&v.to_le_bytes());
             Ok(8)
         })
@@ -76,7 +95,29 @@ impl FileOps for EventFd {
             if add == u64::MAX {
                 return Err(FsError::InvalidPath);
             }
-            let _ = self.counter.fetch_add(add, Ordering::AcqRel);
+            let mut cur = self.counter.load(Ordering::Acquire);
+            loop {
+                let Some(next) = cur.checked_add(add) else {
+                    return Err(FsError::InvalidPath);
+                };
+                if next == u64::MAX {
+                    return Err(FsError::InvalidPath);
+                }
+                match self.counter.compare_exchange_weak(
+                    cur,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        if cur == 0 && next != 0 {
+                            self.readable_token.fetch_add(1, Ordering::Release);
+                        }
+                        break;
+                    }
+                    Err(observed) => cur = observed,
+                }
+            }
             // Wake any task parked in poll/epoll on this eventfd. Without a
             // readiness notify an eventfd was a "silent" source, so a blocking
             // poll containing one could NOT park — it fell back to a busy spin
@@ -123,6 +164,13 @@ impl FileOps for EventFd {
         }
         bits
     }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        (
+            self.readable_token.load(Ordering::Acquire),
+            self.writable_token.load(Ordering::Acquire),
+        )
+    }
 }
 
 // ── timerfd ─────────────────────────────────────────────────────
@@ -133,6 +181,7 @@ impl FileOps for EventFd {
 #[derive(Debug)]
 pub struct TimerFd {
     state: IrqSafeSpinLock<TimerState>,
+    readable_token: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -153,6 +202,7 @@ impl TimerFd {
                 interval_ns: 0,
                 expirations: 0,
             }),
+            readable_token: AtomicU64::new(0),
         })
     }
 
@@ -192,6 +242,7 @@ impl TimerFd {
         if s.next_fire_ns == 0 || now < s.next_fire_ns {
             return;
         }
+        let was_readable = s.expirations != 0;
         if s.interval_ns == 0 {
             s.expirations += 1;
             s.next_fire_ns = 0;
@@ -202,6 +253,11 @@ impl TimerFd {
             s.next_fire_ns = s
                 .next_fire_ns
                 .saturating_add(s.interval_ns.saturating_mul(missed));
+        }
+        let became_readable = !was_readable && s.expirations != 0;
+        drop(s);
+        if became_readable {
+            self.readable_token.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -259,6 +315,10 @@ impl FileOps for TimerFd {
         } else {
             Some(s.next_fire_ns)
         }
+    }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        (self.readable_token.load(Ordering::Acquire), 0)
     }
 }
 
@@ -341,6 +401,13 @@ impl FileOps for SignalFd {
         } else {
             0
         }
+    }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        (
+            crate::handlers::signal_readable_generation(self.owner_task),
+            0,
+        )
     }
 }
 

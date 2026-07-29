@@ -41,17 +41,23 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     //                                  task cwd so non-AT_FDCWD
     //                                  relative paths fail)
     //   3. otherwise                → fail
-    let fs_stat = if empty {
+    let (fs_stat, mnt_id) = if empty {
         if dirfd < 0 {
             ctx.set_return(fail);
             return;
         }
         let task = current_task_id();
-        fd::with_table(task, |t| {
+        let st = fd::with_table(task, |t| {
             t.get(dirfd as u32)
                 .map(|e| (e.ops.stat(), e.ops.ino(), e.ops.rdev()))
         })
-        .flatten()
+        .flatten();
+        // The mount id of the mount this fd resides on. systemd's
+        // path_is_root_at / fds_inode_and_mount_same compare STATX_MNT_ID to
+        // distinguish a bind/pivoted root from the real root; absent it,
+        // statx_mount_same returns -ENODATA and a service's mount-namespace
+        // setup fails with 226/EXIT_NAMESPACE (systemd-udevd et al.).
+        (st, crate::mqueue::fd_mount_id(task, dirfd as u32))
     } else {
         let raw = match copy_user_cstr(path_uptr, 4096) {
             Some(s) => s,
@@ -84,7 +90,8 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         // AT_SYMLINK_NOFOLLOW → describe the symlink itself (S_IFLNK),
         // not its target; otherwise follow like plain stat.
         let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
-        stat_ino_path_dir_aware_ext(&path_owned, follow_final)
+        let st = stat_ino_path_dir_aware_ext(&path_owned, follow_final);
+        (st, current_mount_id_at(&path_owned))
     };
 
     let (s, ino, rdev) = match fs_stat {
@@ -134,7 +141,8 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         | STATX_SIZE
         | STATX_BLOCKS
         | STATX_MTIME
-        | STATX_CTIME;
+        | STATX_CTIME
+        | STATX_MNT_ID;
     let out = Statx {
         stx_blksize: 4096,
         stx_mode: mode_word,
@@ -150,6 +158,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         stx_nlink: 1,
         stx_rdev_major: rdev_major,
         stx_rdev_minor: rdev_minor,
+        stx_mnt_id: mnt_id.unwrap_or(0),
         stx_mask: filled
             & if mask == 0 {
                 filled

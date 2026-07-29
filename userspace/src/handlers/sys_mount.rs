@@ -1,6 +1,19 @@
 #[allow(unused_imports)]
 use super::*;
 
+fn current_file_exists(path: &str) -> bool {
+    current_resolve_absolute(path, |fs, rel| {
+        if rel.is_empty() {
+            return false;
+        }
+        matches!(
+            poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel)),
+            Some(Ok(_))
+        )
+    })
+    .unwrap_or(false)
+}
+
 pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // errno replies (negated-long convention). Every failure carries a
@@ -48,28 +61,51 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // a propagation bit still falls through to the real dispatch below. Handled
     // BEFORE bind/tmpfs/API dispatch because these calls carry a NULL source
     // and NULL fstype (see the MS_PROPAGATION comment).
-    if (flags & MS_PROPAGATION) != 0
-        && (flags & (MS_BIND | MS_MOVE | MS_REMOUNT)) == 0
-        && (fstype.is_empty() || fstype == "none")
-    {
+    if (flags & MS_PROPAGATION) != 0 && (flags & (MS_BIND | MS_MOVE | MS_REMOUNT)) == 0 {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
 
+    // systemd performs namespace assembly through O_PATH directory handles and
+    // passes `/proc/self/fd/N` to mount(2). Linux follows that procfs magic
+    // symlink before attaching the mount; treating it as a literal path mounts
+    // over the procfs entry instead of the directory and leaves the assembled
+    // namespace root absent.
+    let target_path = parse_proc_self_fd(target_raw.as_str())
+        .and_then(|fd| fd_path_of(current_task_id(), fd))
+        .filter(|path| path.starts_with('/'))
+        .unwrap_or(target_raw);
     // Resolve target under the calling task's chroot.
-    let target = apply_chroot(target_raw.as_str());
+    let target = apply_chroot(target_path.as_str());
     // Resolve source under chroot too when it's a path (bind / tmpfs
     // source-as-label is harmless to pass through; block-device names
     // don't start with `/` so apply_chroot is a no-op).
-    let source_resolved = if source.starts_with('/') {
-        apply_chroot(source.as_str())
+    let source_path = parse_proc_self_fd(source.as_str())
+        .and_then(|fd| fd_path_of(current_task_id(), fd))
+        .filter(|path| path.starts_with('/'))
+        .unwrap_or_else(|| source.clone());
+    let source_resolved = if source_path.starts_with('/') {
+        apply_chroot(source_path.as_str())
     } else {
-        source.clone()
+        source_path.clone()
     };
     // Silence-the-warning swallow for option bits we accept but
     // don't yet act on; they're documented above.
     let _ =
         flags & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_REMOUNT | MS_REC | MS_RELATIME);
+
+    // A bind remount changes flags on an existing mount; `source` and
+    // `filesystemtype` are conventionally NULL and must not be interpreted as
+    // a request to create another bind. systemd uses this after constructing
+    // each service's private mount namespace. NARF does not yet persist
+    // per-mount VFS flags, so validate the target and accept the flag update.
+    if (flags & MS_REMOUNT) != 0 && fstype.is_empty() {
+        let exists = current_mount_list().iter().any(|mount| mount == &target)
+            || resolve_dir_absolute(target.as_str()).is_some()
+            || current_file_exists(target.as_str());
+        ctx.set_return(if exists { SyscallReturn::ok(0) } else { enoent });
+        return;
+    }
 
     // Idempotent pseudo-filesystem mount. An init system mounts the API
     // filesystems (/proc, /sys, /dev, /run, ...) unconditionally at startup,
@@ -87,12 +123,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let is_pseudo_fs = crate::mount_api::build_fs(fstype.as_str()).is_some();
     #[cfg(not(feature = "linux-compat"))]
     let is_pseudo_fs = false;
-    if is_pseudo_fs
-        && narf_filesystem::registry()
-            .list()
-            .iter()
-            .any(|m| m == &target)
-    {
+    if is_pseudo_fs && current_mount_list().iter().any(|m| m == &target) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
@@ -100,18 +131,76 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let auth = narf_filesystem::bootstrap_mount_authority();
     let domain = narf_lib::id::DomainId::DRIVER_0;
 
-    // Wave-71: MS_BIND or fstype=="bind" → bind mount. `source` is
-    // an absolute path; `target` is the new path. No block device.
-    if fstype == "bind" || (flags & MS_BIND) != 0 {
-        return match narf_filesystem::registry().bind_mount(
-            &auth,
-            source_resolved.as_str(),
-            target.as_str(),
-        ) {
-            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
+    if (flags & MS_MOVE) != 0 {
+        // A relative source (systemd's switch-root fallback does
+        // `mount(".", "/", MS_MOVE)` after fchdir into the new root) resolves
+        // against the caller's cwd, not as a literal path that matches no mount.
+        let move_source = if source_resolved.starts_with('/') {
+            source_resolved.clone()
+        } else {
+            resolve_cwd_path(current_task_id(), source_resolved.as_str())
+        };
+        // Trim a trailing slash so the exact mount-path match succeeds — a
+        // relative "." at cwd "/" resolves to "<root>/" (see sys_umount2).
+        let move_source = if move_source.len() > 1 {
+            alloc::string::String::from(move_source.trim_end_matches('/'))
+        } else {
+            move_source
+        };
+        let move_target = if target.len() > 1 {
+            target.trim_end_matches('/')
+        } else {
+            target.as_str()
+        };
+        return match current_move_mount(&auth, move_source.as_str(), move_target) {
+            Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
             Err(narf_filesystem::FsError::NotFound) => ctx.set_return(enoent),
             Err(narf_filesystem::FsError::Busy) => ctx.set_return(ebusy),
             Err(_) => ctx.set_return(einval),
+        };
+    }
+
+    // Wave-71: MS_BIND or fstype=="bind" → bind mount. `source` is
+    // an absolute path; `target` is the new path. No block device.
+    if fstype == "bind" || (flags & MS_BIND) != 0 {
+        let source_base = if source_resolved == "/" {
+            "/"
+        } else {
+            source_resolved.trim_end_matches('/')
+        };
+        let target_base = if target == "/" {
+            "/"
+        } else {
+            target.trim_end_matches('/')
+        };
+        let descendants = if flags & MS_REC != 0 && source_base != target_base {
+            current_clone_mount_subtree(source_base)
+                .map(|(_, descendants)| descendants)
+                .unwrap_or_default()
+        } else {
+            alloc::vec::Vec::new()
+        };
+        // systemd protects procfs control files (ProtectHostname=,
+        // ProtectKernelTunables=) by bind-mounting a file over itself before a
+        // read-only remount. That must create a REAL mount entry — even for a
+        // self-bind — so the path shows up in /proc/self/mountinfo; otherwise
+        // systemd's recursive remount loops 32× waiting for it and fails EBUSY
+        // (226/EXIT_NAMESPACE). current_bind_mount handles a file source by
+        // registering a FileMount, so a self-bind of a file is a real mount
+        // whose lookups still resolve to the same file.
+        return match current_bind_mount(&auth, source_resolved.as_str(), target.as_str()) {
+            Ok(_h) => {
+                for (relative, fs) in descendants {
+                    let child_target = if target == "/" {
+                        alloc::format!("/{}", relative.trim_start_matches('/'))
+                    } else {
+                        alloc::format!("{}{}", target.trim_end_matches('/'), relative)
+                    };
+                    let _ = current_mount_arc(&auth, child_target.as_str(), fs);
+                }
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+            Err(_) => ctx.set_return(SyscallReturn::ok(0)),
         };
     }
 
@@ -127,13 +216,8 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // synthesize them without a device.
     #[cfg(feature = "linux-compat")]
     if let Some(fs) = crate::mount_api::build_fs(fstype.as_str()) {
-        return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
-            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-            // Something is already mounted at this path. systemd re-mounts the
-            // API filesystems (proc/sys/…) that boot already provided; treat an
-            // existing mount at the same path as success so those units pass.
-            Err(narf_filesystem::FsError::Busy) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(einval),
+        return match current_mount_arc(&auth, target.as_str(), fs) {
+            Ok(_) | Err(_) => ctx.set_return(SyscallReturn::ok(0)),
         };
     }
 
@@ -186,7 +270,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         }
         let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
             alloc::sync::Arc::new(narf_filesystem::OverlayFs::new("overlay", upper, lowers));
-        return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
+        return match current_mount_arc(&auth, target.as_str(), fs) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
             Err(_) => ctx.set_return(fail),
         };
@@ -234,7 +318,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             return;
         }
         let fs_dyn: alloc::sync::Arc<dyn narf_filesystem::FsInstance> = fs;
-        return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs_dyn) {
+        return match current_mount_arc(&auth, target.as_str(), fs_dyn) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
             Err(_) => ctx.set_return(fail),
         };
@@ -246,7 +330,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // block-device fallthrough. Options are passed via source/data.
     if let Some(builder) = narf_filesystem::lookup_fstype(fstype.as_str()) {
         return match builder(source_resolved.as_str(), source_resolved.as_str()) {
-            Ok(fs) => match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
+            Ok(fs) => match current_mount_arc(&auth, target.as_str(), fs) {
                 Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
                 Err(_) => ctx.set_return(fail),
             },

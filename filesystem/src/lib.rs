@@ -91,6 +91,7 @@ mod devfs_block_tests;
 mod devfs_pty_tests;
 mod e2e_tests;
 mod fs_mount_e2e_tests;
+mod memfs_tests;
 mod procsys_e2e_tests;
 mod random_e2e_tests;
 mod sysfs_e2e_tests;
@@ -124,8 +125,8 @@ pub use sysfs::{
     Kobject, NetIfaceInfo, SysFs, SysKobjDir,
 };
 pub use uevent::{
-    emit as emit_uevent, emit_with_extras as emit_uevent_extras, UeventAction, UeventEnv,
-    UeventReader,
+    current_seqnum as uevent_current_seqnum, emit as emit_uevent,
+    emit_with_extras as emit_uevent_extras, UeventAction, UeventEnv, UeventReader,
 };
 
 use alloc::boxed::Box;
@@ -603,6 +604,18 @@ pub trait FileOps: Send + Sync {
     /// object-wide readiness contract; offset-sensitive devices override it.
     fn poll_readiness_at(&self, _offset: u64) -> u32 {
         self.poll_readiness()
+    }
+
+    /// Monotonic source-local tokens for edge-triggered readiness.
+    ///
+    /// A readiness provider that can transition away from and back to the
+    /// same readiness mask between two polls should advance one of these
+    /// tokens on every state-changing I/O operation. Epoll uses the tokens
+    /// to distinguish a new edge from a continuously-ready file. The default
+    /// is stable for providers whose readiness is adequately represented by
+    /// the current mask alone.
+    fn poll_edge_token(&self) -> (u64, u64) {
+        (0, 0)
     }
 
     /// Absolute monotonic-ns instant at which this file will *next*
@@ -1173,6 +1186,20 @@ pub trait FsInstance: Send + Sync + 'static {
     /// stable across the FS's lifetime.
     fn name(&self) -> &str;
 
+    /// The single file this mount exposes, when the mount root is a FILE
+    /// rather than a directory (Linux `mount --bind <file> <file2>`). Default
+    /// `None` — a normal directory-rooted filesystem. A resolver that lands on
+    /// a mount's root (empty relative path) consults this first: `Some(file)`
+    /// means the mount point itself IS that file. systemd's ProtectHostname= /
+    /// ProtectKernelTunables= bind a read-only copy of a procfs control file
+    /// (e.g. /proc/sys/kernel/domainname) over itself; without a real
+    /// file-rooted mount the path never appears in /proc/self/mountinfo and
+    /// systemd's recursive read-only remount loops 32× then fails EBUSY
+    /// (226/EXIT_NAMESPACE).
+    fn root_file(&self) -> Option<Arc<dyn FileOps>> {
+        None
+    }
+
     /// Query filesystem-wide capacity. Synthetic filesystems retain the
     /// conservative default used before this interface existed.
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
@@ -1446,6 +1473,7 @@ pub struct Mount {
     pub path: alloc::string::String,
     pub fs: Arc<dyn FsInstance>,
     pub handle: Cap<MountPoint, Write>,
+    id: u64,
 }
 
 impl fmt::Debug for Mount {
@@ -1455,6 +1483,32 @@ impl fmt::Debug for Mount {
             .field("fs", &self.fs.name())
             .finish_non_exhaustive()
     }
+}
+
+fn mountinfo_rows(mounts: &[Mount]) -> Vec<(u64, u64, String, String)> {
+    mounts
+        .iter()
+        .enumerate()
+        .map(|(index, mount)| {
+            let parent = mounts[..index]
+                .iter()
+                .filter(|candidate| {
+                    mount.path == candidate.path
+                        || candidate.path == "/"
+                        || (mount.path.starts_with(candidate.path.as_str())
+                            && mount.path.as_bytes().get(candidate.path.len()) == Some(&b'/'))
+                })
+                .max_by_key(|candidate| candidate.path.len())
+                .map(|candidate| candidate.id)
+                .unwrap_or(0);
+            (
+                mount.id,
+                parent,
+                mount.path.clone(),
+                String::from(mount.fs.name()),
+            )
+        })
+        .collect()
 }
 
 /// Global VFS mount registry. Mirrors the cap-gate pattern used by
@@ -1468,6 +1522,12 @@ pub struct VfsRegistry {
 static REGISTRY: VfsRegistry = VfsRegistry {
     inner: IrqSafeSpinLock::new(Vec::new()),
 };
+
+static NEXT_MOUNT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+fn alloc_mount_id() -> u64 {
+    NEXT_MOUNT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Reference the global VFS registry.
 #[inline]
@@ -1555,26 +1615,38 @@ pub struct MountNamespace {
 }
 
 impl MountNamespace {
-    /// Build a private namespace seeded with the current global
-    /// registry's mounts. The mounts share the underlying
-    /// `Arc<dyn FsInstance>` — a bind-mount-style relationship,
-    /// not a deep copy.
-    pub fn snapshot_global() -> Arc<Self> {
-        let g = REGISTRY.inner.lock();
-        // Re-mint per-mount handles so the NS owns its own caps.
-        // The original handles in the global registry stay live.
-        let copied: Vec<Mount> = g
+    fn from_mounts(mounts: &[Mount]) -> Arc<Self> {
+        let copied = mounts
             .iter()
             .map(|m| Mount {
                 path: m.path.clone(),
                 fs: m.fs.clone(),
                 handle: Cap::<MountPoint, Write>::bootstrap(),
+                id: alloc_mount_id(),
             })
             .collect();
         Arc::new(Self {
             id: alloc_mount_ns_id(),
             inner: IrqSafeSpinLock::new(copied),
         })
+    }
+
+    /// Build a private namespace seeded with the current global
+    /// registry's mounts. The mounts share the underlying
+    /// `Arc<dyn FsInstance>` — a bind-mount-style relationship,
+    /// not a deep copy.
+    pub fn snapshot_global() -> Arc<Self> {
+        let g = REGISTRY.inner.lock();
+        Self::from_mounts(&g)
+    }
+
+    /// Copy this namespace's current mount table into a new namespace.
+    ///
+    /// Linux `unshare(CLONE_NEWNS)` and `clone(CLONE_NEWNS)` copy the
+    /// caller's current namespace, including mounts private to it.
+    pub fn snapshot(&self) -> Arc<Self> {
+        let g = self.inner.lock();
+        Self::from_mounts(&g)
     }
 
     /// Stable namespace id (nsfs inode in Linux).
@@ -1590,6 +1662,38 @@ impl MountNamespace {
         if abs.is_empty() || abs.as_bytes()[0] != b'/' {
             return None;
         }
+        // Clone the covering mount's `Arc<fs>` + relative path and RELEASE the
+        // lock before running `f` — `f` can busy-block on block I/O and `inner`
+        // is an IrqSafeSpinLock, so holding it across `f` deadlocks the box
+        // (see VfsRegistry::resolve_absolute for the full rationale).
+        let (fs, rel) = {
+            let q = self.inner.lock();
+            let mut best: Option<&Mount> = None;
+            for m in q.iter() {
+                let is_match = abs == m.path.as_str()
+                    || m.path == "/"
+                    || (abs.starts_with(m.path.as_str())
+                        && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
+                if is_match && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len() {
+                    best = Some(m);
+                }
+            }
+            let m = best?;
+            let rel = &abs[m.path.len()..];
+            let rel = rel.strip_prefix('/').unwrap_or(rel);
+            (m.fs.clone(), alloc::string::String::from(rel))
+        };
+        Some(f(&*fs, &rel))
+    }
+
+    /// Clone the filesystem object of the visible mount covering `abs`.
+    ///
+    /// Equal-length entries are mount stacks; the newest entry wins, matching
+    /// `resolve_absolute`.
+    pub fn fs_arc_at(&self, abs: &str) -> Option<Arc<dyn FsInstance>> {
+        if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+            return None;
+        }
         let q = self.inner.lock();
         let mut best: Option<&Mount> = None;
         for m in q.iter() {
@@ -1597,14 +1701,26 @@ impl MountNamespace {
                 || m.path == "/"
                 || (abs.starts_with(m.path.as_str())
                     && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
-            if is_match && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
+            if is_match && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len() {
                 best = Some(m);
             }
         }
-        let m = best?;
-        let rel = &abs[m.path.len()..];
-        let rel = rel.strip_prefix('/').unwrap_or(rel);
-        Some(f(&*m.fs, rel))
+        best.map(|m| m.fs.clone())
+    }
+
+    /// Clone the visible directory subtree rooted at `abs`.
+    pub fn clone_tree_at(&self, abs: &str) -> Option<Arc<dyn FsInstance>> {
+        self.resolve_absolute(abs, |fs, rel| {
+            let mut root = fs.root();
+            for component in rel.split('/').filter(|part| !part.is_empty()) {
+                root = root.lookup_dir(component)?;
+            }
+            Some(Arc::new(BindMount {
+                root,
+                fs_name: String::from(fs.name()),
+            }) as Arc<dyn FsInstance>)
+        })
+        .flatten()
     }
 
     /// List the mount paths in this namespace.
@@ -1623,6 +1739,98 @@ impl MountNamespace {
             .map(|m| (m.path.clone(), String::from(m.fs.name())))
             .collect()
     }
+
+    /// Mount identity and hierarchy in attachment order.
+    pub fn list_mountinfo(&self) -> Vec<(u64, u64, String, String)> {
+        mountinfo_rows(&self.inner.lock())
+    }
+
+    /// ID of the newest visible mount covering `abs`.
+    pub fn mount_id_at(&self, abs: &str) -> Option<u64> {
+        let q = self.inner.lock();
+        q.iter()
+            .filter(|m| {
+                abs == m.path
+                    || m.path == "/"
+                    || (abs.starts_with(m.path.as_str())
+                        && abs.as_bytes().get(m.path.len()) == Some(&b'/'))
+            })
+            .max_by_key(|m| m.path.len())
+            .map(|m| m.id)
+    }
+
+    /// Attach a filesystem to this private namespace. Unlike the boot-time
+    /// registry, private namespaces permit stacking at the same path; the most
+    /// recently attached mount is the visible one.
+    pub fn mount_arc(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        path: &str,
+        fs: Arc<dyn FsInstance>,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
+        authority.check_live()?;
+        let handle = Cap::<MountPoint, Write>::bootstrap();
+        self.inner.lock().push(Mount {
+            path: String::from(path),
+            fs,
+            handle,
+            id: alloc_mount_id(),
+        });
+        Ok(handle)
+    }
+
+    /// Bind an arbitrary directory into this private namespace.
+    pub fn bind_mount(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        source: &str,
+        target: &str,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
+        authority.check_live()?;
+        let (source_fs, rel) = {
+            let q = self.inner.lock();
+            let source_mount = q
+                .iter()
+                .filter(|m| {
+                    source == m.path
+                        || m.path == "/"
+                        || (source.starts_with(m.path.as_str())
+                            && source.as_bytes().get(m.path.len()) == Some(&b'/'))
+                })
+                .max_by_key(|m| m.path.len())
+                .ok_or(FsError::NotFound)?;
+            (
+                source_mount.fs.clone(),
+                String::from(source[source_mount.path.len()..].trim_start_matches('/')),
+            )
+        };
+        // A directory source binds as a subtree; a FILE source binds as a
+        // single file (mount --bind of a file).
+        let bind = build_bind_fs(&source_fs, &rel)?;
+        self.mount_arc(authority, target, bind)
+    }
+
+    /// Detach the topmost mount at `path` from this private namespace.
+    pub fn unmount(&self, path: &str) -> Result<(), FsError> {
+        let mut q = self.inner.lock();
+        let index = q
+            .iter()
+            .rposition(|m| m.path == path)
+            .ok_or(FsError::NotFound)?;
+        q.remove(index);
+        Ok(())
+    }
+
+    /// Move the topmost mount at `source` to `target`.
+    pub fn move_mount(&self, source: &str, target: &str) -> Result<(), FsError> {
+        let mut q = self.inner.lock();
+        let index = q
+            .iter()
+            .rposition(|m| m.path == source)
+            .ok_or(FsError::NotFound)?;
+        q[index].path = String::from(target);
+        Ok(())
+    }
 }
 
 /// Bootstrap the mount-authority cap. TCB-only path — the kernel
@@ -1632,39 +1840,135 @@ pub fn bootstrap_mount_authority() -> Cap<MountPoint, Grant> {
     Cap::<MountPoint, Grant>::bootstrap()
 }
 
-/// FsInstance adapter that forwards root() / name() to another
-/// FsInstance. Used to implement `bind_mount` — the bound mount
-/// shares the source FS's root directory directly, no copying.
+/// FsInstance adapter that exposes a directory from another filesystem as a
+/// mount root. Used to implement `bind_mount` without copying the subtree.
 struct BindMount {
-    inner: Arc<dyn FsInstance>,
+    root: Arc<dyn DirOps>,
+    fs_name: String,
 }
 
 impl fmt::Debug for BindMount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BindMount")
-            .field("inner", &self.inner.name())
+            .field("fs_name", &self.fs_name)
             .finish_non_exhaustive()
     }
 }
 
 impl FsInstance for BindMount {
     fn root(&self) -> Arc<dyn DirOps> {
-        self.inner.root()
+        self.root.clone()
     }
     fn name(&self) -> &str {
         // POSIX `mount(2)` / `proc(5)` both report bind mounts with
         // their source FS name; matches Linux's /proc/mounts shape
         // where a bind mount lists the source FS type, not "bind".
-        self.inner.name()
+        &self.fs_name
     }
+}
+
+/// A directory with no entries — the `root()` of a [`FileMount`], whose real
+/// content is a single file reached via [`FsInstance::root_file`], not children.
+#[derive(Debug)]
+struct EmptyDir;
+
+impl DirOps for EmptyDir {
+    fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
+        None
+    }
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+        Box::new(core::iter::empty())
+    }
+}
+
+/// FsInstance adapter that exposes a single FILE (from another filesystem) as a
+/// mount root — Linux `mount --bind <file> <target-file>`. Resolution that
+/// lands on this mount's root returns the file via [`FsInstance::root_file`];
+/// the directory `root()` is empty because a file mount has no children.
+struct FileMount {
+    file: Arc<dyn FileOps>,
+    fs_name: String,
+}
+
+impl fmt::Debug for FileMount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileMount")
+            .field("fs_name", &self.fs_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FsInstance for FileMount {
+    fn root(&self) -> Arc<dyn DirOps> {
+        Arc::new(EmptyDir)
+    }
+    fn name(&self) -> &str {
+        &self.fs_name
+    }
+    fn root_file(&self) -> Option<Arc<dyn FileOps>> {
+        Some(self.file.clone())
+    }
+}
+
+/// Build the `FsInstance` for binding the node at relative path `rel` within
+/// `source_fs`: a directory leaf becomes a [`BindMount`], a FILE leaf a
+/// [`FileMount`] (so `mount --bind <file> <target>` works, which systemd relies
+/// on for read-only procfs-control-file protection). Every component but the
+/// last must be a directory. Uses the sync `lookup`/`lookup_dir`; block-backed
+/// filesystems drive their real I/O from those synchronously (see the ext2
+/// driver's `lookup`/`lookup_dir`), so a DEEP bind source — systemd's
+/// StateDirectory=, e.g. binding /var/lib/systemd/linger for logind — resolves.
+fn build_bind_fs(
+    source_fs: &Arc<dyn FsInstance>,
+    rel: &str,
+) -> Result<Arc<dyn FsInstance>, FsError> {
+    let fs_name = String::from(source_fs.name());
+    let comps: alloc::vec::Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+    if comps.is_empty() {
+        // Binding the source mount's root directory itself.
+        return Ok(Arc::new(BindMount {
+            root: source_fs.root(),
+            fs_name,
+        }));
+    }
+    let mut dir = source_fs.root();
+    for c in &comps[..comps.len() - 1] {
+        dir = dir.lookup_dir(c).ok_or(FsError::NotFound)?;
+    }
+    let last = comps[comps.len() - 1];
+    // Dispatch on the leaf's actual type, not on which lookup succeeds: some
+    // filesystems expose a directory as a Dir-typed FileOps via `lookup` too.
+    // A directory leaf binds as a subtree (BindMount); anything else binds as a
+    // single file (FileMount).
+    if let Some(node) = dir.lookup(last) {
+        if node.stat().mode.file_type == FileType::Dir {
+            if let Some(d) = dir.lookup_dir(last) {
+                return Ok(Arc::new(BindMount { root: d, fs_name }));
+            }
+        }
+        return Ok(Arc::new(FileMount {
+            file: node,
+            fs_name,
+        }));
+    }
+    // Some filesystems only expose child directories via `lookup_dir`.
+    if let Some(d) = dir.lookup_dir(last) {
+        return Ok(Arc::new(BindMount { root: d, fs_name }));
+    }
+    Err(FsError::NotFound)
 }
 
 impl VfsRegistry {
     /// Mount `fs` at `path`. The `authority` cap is checked live;
     /// a revoked authority returns `FsError::PermissionDenied`
     /// (via the `From<CapError>` impl) before any side effect.
-    /// Duplicate-path mounts return `FsError::Busy` — Stage 4 will
-    /// add bind-mount semantics under a separate `mount_bind` entry.
+    /// Mounting onto an already-occupied path stacks (Linux overmount
+    /// semantics): the new mount shadows the ones below it, `resolve_absolute`
+    /// selects the most-recently pushed mount at a path, and `unmount` pops the
+    /// topmost — matching `MountNamespace`. systemd relies on this to bind a
+    /// read-only copy of a procfs control file (e.g. /proc/sys/kernel/domainname
+    /// under ProtectHostname=) over the existing one; rejecting the overmount
+    /// with EBUSY failed service namespace setup with 226/EXIT_NAMESPACE.
     pub fn mount<F: FsInstance>(
         &self,
         authority: &Cap<MountPoint, Grant>,
@@ -1674,15 +1978,13 @@ impl VfsRegistry {
         authority.check_live()?;
 
         let mut q = self.inner.lock();
-        if q.iter().any(|m| m.path == path) {
-            return Err(FsError::Busy);
-        }
         let handle: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
         let arc: Arc<dyn FsInstance> = Arc::new(fs);
         q.push(Mount {
             path: alloc::string::String::from(path),
             fs: arc,
             handle,
+            id: alloc_mount_id(),
         });
         Ok(handle)
     }
@@ -1699,14 +2001,12 @@ impl VfsRegistry {
         authority.check_live()?;
 
         let mut q = self.inner.lock();
-        if q.iter().any(|m| m.path == path) {
-            return Err(FsError::Busy);
-        }
         let handle: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
         q.push(Mount {
             path: alloc::string::String::from(path),
             fs,
             handle,
+            id: alloc_mount_id(),
         });
         Ok(handle)
     }
@@ -1725,23 +2025,28 @@ impl VfsRegistry {
         target: &str,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
-        // Resolve the source to a DirOps. We need both the source FS
-        // (for name()) and the directory at the source path.
-        // resolve_absolute hands the FS + the relative path; we walk
-        // the relative path to a DirOps via lookup_dir / lookup_dir_async.
-        // For Stage-3 simplicity, only the mount-root case is wired:
-        // `bind_mount("/a", "/b")` where `/a` is itself a mount.
+        // Resolve the longest mount prefix first, then walk the remaining
+        // directory components. Linux permits binding any directory, not only
+        // a filesystem root; systemd relies on that while constructing a
+        // service's private mount namespace.
         let q = self.inner.lock();
         let source_mount = q
             .iter()
-            .find(|m| m.path == source)
+            .filter(|m| {
+                source == m.path
+                    || m.path == "/"
+                    || (source.starts_with(m.path.as_str())
+                        && source.as_bytes().get(m.path.len()) == Some(&b'/'))
+            })
+            .max_by_key(|m| m.path.len())
             .ok_or(FsError::NotFound)?;
         let source_fs = source_mount.fs.clone();
-        if q.iter().any(|m| m.path == target) {
-            return Err(FsError::Busy);
-        }
+        let rel = String::from(source[source_mount.path.len()..].trim_start_matches('/'));
+        // Overmount is allowed: a bind onto an occupied path stacks (see `mount`).
         drop(q);
-        let bind = alloc::sync::Arc::new(BindMount { inner: source_fs });
+        // A directory source binds as a subtree; a FILE source binds as a
+        // single file (mount --bind of a file).
+        let bind = build_bind_fs(&source_fs, &rel)?;
         self.mount_arc(authority, target, bind)
     }
 
@@ -1767,6 +2072,27 @@ impl VfsRegistry {
             .collect()
     }
 
+    /// Mount identity and hierarchy in attachment order.
+    pub fn list_mountinfo(
+        &self,
+    ) -> alloc::vec::Vec<(u64, u64, alloc::string::String, alloc::string::String)> {
+        mountinfo_rows(&self.inner.lock())
+    }
+
+    /// ID of the visible mount covering `abs`.
+    pub fn mount_id_at(&self, abs: &str) -> Option<u64> {
+        let q = self.inner.lock();
+        q.iter()
+            .filter(|m| {
+                abs == m.path
+                    || m.path == "/"
+                    || (abs.starts_with(m.path.as_str())
+                        && abs.as_bytes().get(m.path.len()) == Some(&b'/'))
+            })
+            .max_by_key(|m| m.path.len())
+            .map(|m| m.id)
+    }
+
     /// Unmount the FS at `path`. The `handle` cap must be live and
     /// must be the one returned from the matching `mount`. A revoked
     /// handle surfaces as `PermissionDenied`. Holding the lock across
@@ -1777,14 +2103,15 @@ impl VfsRegistry {
         handle.check_live()?;
 
         let mut q = self.inner.lock();
+        // Pop the TOPMOST mount at `path` (last pushed) and preserve the order
+        // of the rest: with stacking, `rposition` + `remove` reveal the mount
+        // directly below, matching Linux umount. `swap_remove` would reorder the
+        // vec and corrupt which stacked mount resolves as visible.
         let pos = q
             .iter()
-            .position(|m| m.path == path)
+            .rposition(|m| m.path == path)
             .ok_or(FsError::NotFound)?;
-        // Stage 3 doesn't track in-flight ops against a mount, so we
-        // pop the entry directly. Stage 4 needs a refcount drain
-        // (per spec §3.5) before the FS object goes away.
-        let m = q.swap_remove(pos);
+        let m = q.remove(pos);
         // Drop the FS Arc outside the lock to keep the critical
         // section short — important once page-cache eviction lands.
         drop(q);
@@ -1792,15 +2119,44 @@ impl VfsRegistry {
         Ok(())
     }
 
+    /// Move a mounted filesystem from `source` to `target`.
+    pub fn move_mount(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        source: &str,
+        target: &str,
+    ) -> Result<(), FsError> {
+        authority.check_live()?;
+        let mut q = self.inner.lock();
+        let index = q
+            .iter()
+            .rposition(|m| m.path == source)
+            .ok_or(FsError::NotFound)?;
+        // Overmount is allowed: moving onto an occupied path stacks (see `mount`).
+        q[index].path = String::from(target);
+        Ok(())
+    }
+
     /// Run `f` against the named mount's `FsInstance`. Returns `None`
-    /// if no mount matches. The lock is held across `f`; `f` should be
-    /// short.
+    /// if no mount matches. The registry lock is released BEFORE `f` runs:
+    /// callers pass blocking closures (e.g. `sys_mount` drives
+    /// `resolve_async` via the busy-spinning `poll_blocking`), and holding
+    /// the `inner` IrqSafeSpinLock across a block-I/O wait deadlocks the box
+    /// (see `resolve_absolute`). The cloned `Arc` keeps the FsInstance alive
+    /// across a concurrent unmount.
     pub fn with_mount<R, F>(&self, path: &str, f: F) -> Option<R>
     where
         F: FnOnce(&dyn FsInstance) -> R,
     {
-        let q = self.inner.lock();
-        q.iter().find(|m| m.path == path).map(|m| f(&*m.fs))
+        let fs = {
+            let q = self.inner.lock();
+            // Topmost (last-pushed) mount at `path`, matching resolve_absolute.
+            q.iter()
+                .rev()
+                .find(|m| m.path == path)
+                .map(|m| m.fs.clone())
+        }?;
+        Some(f(&*fs))
     }
 
     /// Resolve a POSIX-shaped absolute path by finding the
@@ -1819,29 +2175,44 @@ impl VfsRegistry {
         if abs.is_empty() || abs.as_bytes()[0] != b'/' {
             return None;
         }
-        let q = self.inner.lock();
-        // Find the longest matching mount path. The root mount `/`
-        // is a special case: every absolute path is under it, but
-        // the "next byte must be `/`" predicate would reject e.g.
-        // `/init` because byte 1 is `i` not `/`. Special-case "/"
-        // so the root mount always matches as the fallback option.
-        let mut best: Option<&Mount> = None;
-        for m in q.iter() {
-            let is_match = abs == m.path
-                || m.path == "/"
-                || (abs.starts_with(m.path.as_str())
-                    && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
-            if is_match && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
-                best = Some(m);
+        // Select the covering mount under the lock, then CLONE its `Arc<fs>`
+        // and the relative path and RELEASE the lock BEFORE running `f`. `f`
+        // may block: the stat/open/execve resolvers drive `resolve_async` via
+        // `poll_blocking`, which BUSY-SPINS on the backing block device's
+        // completion IRQ. `inner` is an IrqSafeSpinLock (IRQs disabled while
+        // held), so running `f` under it spins on an I/O IRQ that can never
+        // fire on this CPU — and every other task that touches the mount table
+        // (path resolution, statx mount-id, mount/umount) stalls behind it.
+        // Under an SMP statx storm (systemd unit loading) that deadlocked the
+        // whole box. The `Arc` keeps the FsInstance alive even if a concurrent
+        // umount drops it from the table mid-resolve, matching Linux (an
+        // in-flight op on an unmounted fs completes).
+        let (fs, rel) = {
+            let q = self.inner.lock();
+            // Find the longest matching mount path. The root mount `/`
+            // is a special case: every absolute path is under it, but
+            // the "next byte must be `/`" predicate would reject e.g.
+            // `/init` because byte 1 is `i` not `/`. Special-case "/"
+            // so the root mount always matches as the fallback option.
+            let mut best: Option<&Mount> = None;
+            for m in q.iter() {
+                let is_match = abs == m.path
+                    || m.path == "/"
+                    || (abs.starts_with(m.path.as_str())
+                        && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
+                if is_match && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len() {
+                    best = Some(m);
+                }
             }
-        }
-        let m = best?;
-        let rel = &abs[m.path.len()..];
-        // Strip the leading slash; if the absolute path equals the
-        // mount path exactly, the relative is empty (caller's
-        // problem — `resolve` rejects empty paths).
-        let rel = rel.strip_prefix('/').unwrap_or(rel);
-        Some(f(&*m.fs, rel))
+            let m = best?;
+            let rel = &abs[m.path.len()..];
+            // Strip the leading slash; if the absolute path equals the
+            // mount path exactly, the relative is empty (caller's
+            // problem — `resolve` rejects empty paths).
+            let rel = rel.strip_prefix('/').unwrap_or(rel);
+            (m.fs.clone(), alloc::string::String::from(rel))
+        };
+        Some(f(&*fs, &rel))
     }
 
     /// Clone the `Arc<dyn FsInstance>` of the mount covering `abs` (the
@@ -1858,11 +2229,26 @@ impl VfsRegistry {
                 || m.path == "/"
                 || (abs.starts_with(m.path.as_str())
                     && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
-            if is_match && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
+            if is_match && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len() {
                 best = Some(m);
             }
         }
         best.map(|m| m.fs.clone())
+    }
+
+    /// Clone the directory subtree rooted at `abs` as a detached filesystem.
+    pub fn clone_tree_at(&self, abs: &str) -> Option<Arc<dyn FsInstance>> {
+        self.resolve_absolute(abs, |fs, rel| {
+            let mut root = fs.root();
+            for component in rel.split('/').filter(|part| !part.is_empty()) {
+                root = root.lookup_dir(component)?;
+            }
+            Some(Arc::new(BindMount {
+                root,
+                fs_name: String::from(fs.name()),
+            }) as Arc<dyn FsInstance>)
+        })
+        .flatten()
     }
 
     /// Resolve `abs` to its parent directory + leaf name and run
@@ -1899,33 +2285,41 @@ impl VfsRegistry {
         } else {
             parent_path
         };
-        let q = self.inner.lock();
-        // Match the longest mount prefix against `parent_path`.
-        let mut best: Option<&Mount> = None;
-        for m in q.iter() {
-            if (parent_path == m.path
-                || (parent_path.starts_with(m.path.as_str())
-                    && parent_path.as_bytes().get(m.path.len()) == Some(&b'/')))
-                && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len()
-            {
-                best = Some(m);
+        // Resolve the mount + walk to the parent dir under the lock (the sync
+        // `lookup_dir` walk does not block), then CLONE the fs `Arc` + parent
+        // `DirOps` and RELEASE the lock BEFORE running `f` — `f` may block on
+        // block I/O (create/mkdir on ext2), and holding the `inner`
+        // IrqSafeSpinLock across that deadlocks the box (see `resolve_absolute`).
+        let (fs, dir) = {
+            let q = self.inner.lock();
+            // Match the longest mount prefix against `parent_path`.
+            let mut best: Option<&Mount> = None;
+            for m in q.iter() {
+                if (parent_path == m.path
+                    || (parent_path.starts_with(m.path.as_str())
+                        && parent_path.as_bytes().get(m.path.len()) == Some(&b'/')))
+                    && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len()
+                {
+                    best = Some(m);
+                }
             }
-        }
-        let m = best?;
-        let rel = &parent_path[m.path.len()..];
-        let rel = rel.strip_prefix('/').unwrap_or(rel);
-        // Walk segments to reach the parent dir.
-        let mut dir = m.fs.root();
-        for seg in rel.split('/') {
-            if seg.is_empty() || seg == "." {
-                continue;
+            let m = best?;
+            let rel = &parent_path[m.path.len()..];
+            let rel = rel.strip_prefix('/').unwrap_or(rel);
+            // Walk segments to reach the parent dir.
+            let mut dir = m.fs.root();
+            for seg in rel.split('/') {
+                if seg.is_empty() || seg == "." {
+                    continue;
+                }
+                if seg == ".." {
+                    return None;
+                }
+                dir = dir.lookup_dir(seg)?;
             }
-            if seg == ".." {
-                return None;
-            }
-            dir = dir.lookup_dir(seg)?;
-        }
-        Some(f(&*m.fs, dir, leaf))
+            (m.fs.clone(), dir)
+        };
+        Some(f(&*fs, dir, leaf))
     }
 
     /// Resolve the parent directories of TWO absolute paths at once,
@@ -1960,48 +2354,59 @@ impl VfsRegistry {
         let (a_parent, a_leaf) = split(a)?;
         let (b_parent, b_leaf) = split(b)?;
 
-        let q = self.inner.lock();
-        // Longest matching mount prefix, same rule as
-        // `resolve_parent_absolute`.
-        let best_mount = |parent_path: &str| -> Option<&Mount> {
-            let mut best: Option<&Mount> = None;
-            for m in q.iter() {
-                if (parent_path == m.path
-                    || (parent_path.starts_with(m.path.as_str())
-                        && parent_path.as_bytes().get(m.path.len()) == Some(&b'/')))
-                    && best.map(|x| x.path.len()).unwrap_or(0) < m.path.len()
-                {
-                    best = Some(m);
+        // Resolve BOTH parents + walk to their dirs under ONE lock (so a
+        // concurrent mount/unmount can't move one path's mount between the two
+        // resolutions — the atomicity `rename`'s EXDEV check needs), then CLONE
+        // the shared fs `Arc` + both parent `DirOps` and RELEASE the lock before
+        // running `f`. `f` performs the rename, which may block on block I/O;
+        // holding the `inner` IrqSafeSpinLock across it deadlocks the box (see
+        // `resolve_absolute`). Resolution atomicity is preserved; only `f` runs
+        // unlocked.
+        let (fs, a_dir, b_dir) = {
+            let q = self.inner.lock();
+            // Longest matching mount prefix, same rule as
+            // `resolve_parent_absolute`.
+            let best_mount = |parent_path: &str| -> Option<&Mount> {
+                let mut best: Option<&Mount> = None;
+                for m in q.iter() {
+                    if (parent_path == m.path
+                        || (parent_path.starts_with(m.path.as_str())
+                            && parent_path.as_bytes().get(m.path.len()) == Some(&b'/')))
+                        && best.map(|x| x.path.len()).unwrap_or(0) < m.path.len()
+                    {
+                        best = Some(m);
+                    }
                 }
+                best
+            };
+            let ma = best_mount(a_parent)?;
+            let mb = best_mount(b_parent)?;
+            // Different mounts ⇒ a genuine cross-device move. Mount paths
+            // are unique in the registry, so comparing them identifies the
+            // mount.
+            if ma.path != mb.path {
+                return None;
             }
-            best
-        };
-        let ma = best_mount(a_parent)?;
-        let mb = best_mount(b_parent)?;
-        // Different mounts ⇒ a genuine cross-device move. Mount paths
-        // are unique in the registry, so comparing them identifies the
-        // mount.
-        if ma.path != mb.path {
-            return None;
-        }
-        let walk = |m: &Mount, parent_path: &str| -> Option<Arc<dyn DirOps>> {
-            let rel = &parent_path[m.path.len()..];
-            let rel = rel.strip_prefix('/').unwrap_or(rel);
-            let mut dir = m.fs.root();
-            for seg in rel.split('/') {
-                if seg.is_empty() || seg == "." {
-                    continue;
+            let walk = |m: &Mount, parent_path: &str| -> Option<Arc<dyn DirOps>> {
+                let rel = &parent_path[m.path.len()..];
+                let rel = rel.strip_prefix('/').unwrap_or(rel);
+                let mut dir = m.fs.root();
+                for seg in rel.split('/') {
+                    if seg.is_empty() || seg == "." {
+                        continue;
+                    }
+                    if seg == ".." {
+                        return None;
+                    }
+                    dir = dir.lookup_dir(seg)?;
                 }
-                if seg == ".." {
-                    return None;
-                }
-                dir = dir.lookup_dir(seg)?;
-            }
-            Some(dir)
+                Some(dir)
+            };
+            let a_dir = walk(ma, a_parent)?;
+            let b_dir = walk(mb, b_parent)?;
+            (ma.fs.clone(), a_dir, b_dir)
         };
-        let a_dir = walk(ma, a_parent)?;
-        let b_dir = walk(mb, b_parent)?;
-        Some(f(&*ma.fs, a_dir, a_leaf, b_dir, b_leaf))
+        Some(f(&*fs, a_dir, a_leaf, b_dir, b_leaf))
     }
 
     /// Number of mounts.

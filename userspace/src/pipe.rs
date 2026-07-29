@@ -27,7 +27,7 @@
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -55,6 +55,8 @@ struct PipeShared {
     /// this to discard further writes silently (Stage-4 simplification
     /// — POSIX would surface SIGPIPE / EPIPE; deferred).
     reader_closed: AtomicBool,
+    readable_token: AtomicU64,
+    writable_token: AtomicU64,
 }
 
 /// Read end of a pipe.
@@ -87,6 +89,8 @@ pub fn pipe_pair() -> (Arc<PipeRead>, Arc<PipeWrite>) {
         queue: IrqSafeSpinLock::new(VecDeque::with_capacity(PIPE_BUF_BYTES)),
         writer_closed: AtomicBool::new(false),
         reader_closed: AtomicBool::new(false),
+        readable_token: AtomicU64::new(0),
+        writable_token: AtomicU64::new(0),
     });
     (
         Arc::new(PipeRead {
@@ -104,6 +108,7 @@ impl Drop for PipeRead {
         // there are no readers left and the writer should observe
         // EOF on its side.
         self.shared.reader_closed.store(true, Ordering::Release);
+        self.shared.writable_token.fetch_add(1, Ordering::Release);
         narf_net::readiness::notify(0);
     }
 }
@@ -113,6 +118,7 @@ impl Drop for PipeWrite {
         // Same Arc-counted reasoning as PipeRead::drop — only flips
         // when every writer fd has been closed.
         self.shared.writer_closed.store(true, Ordering::Release);
+        self.shared.readable_token.fetch_add(1, Ordering::Release);
         narf_net::readiness::notify(0);
     }
 }
@@ -134,6 +140,11 @@ impl FileOps for PipeRead {
             for slot in buf.iter_mut().take(n) {
                 // VecDeque::pop_front cannot fail: avail > 0 above.
                 *slot = q.pop_front().unwrap();
+            }
+            let became_writable = avail == PIPE_BUF_BYTES && n != 0;
+            drop(q);
+            if became_writable {
+                self.shared.writable_token.fetch_add(1, Ordering::Release);
             }
             Ok(n)
         })
@@ -184,6 +195,10 @@ impl FileOps for PipeRead {
         true
     }
 
+    fn poll_edge_token(&self) -> (u64, u64) {
+        (self.shared.readable_token.load(Ordering::Acquire), 0)
+    }
+
     fn read_should_block(&self) -> bool {
         // Block (retry the read) unless we are TRULY at EOF: the queue is empty
         // AND the writer has gone. Reporting "don't block" merely because the
@@ -231,6 +246,7 @@ impl FileOps for PipeWrite {
                 return Ok(buf.len());
             }
             let mut q = self.shared.queue.lock();
+            let was_empty = q.is_empty();
             let room = PIPE_BUF_BYTES.saturating_sub(q.len());
             let n = core::cmp::min(buf.len(), room);
             for &b in buf.iter().take(n) {
@@ -238,6 +254,9 @@ impl FileOps for PipeWrite {
             }
             drop(q);
             if n != 0 {
+                if was_empty {
+                    self.shared.readable_token.fetch_add(1, Ordering::Release);
+                }
                 narf_net::readiness::notify(0);
             }
             Ok(n)
@@ -279,6 +298,10 @@ impl FileOps for PipeWrite {
 
     fn readiness_notifies(&self) -> bool {
         true
+    }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        (0, self.shared.writable_token.load(Ordering::Acquire))
     }
 
     fn write_should_block(&self) -> bool {

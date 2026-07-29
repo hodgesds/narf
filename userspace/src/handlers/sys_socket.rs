@@ -31,18 +31,32 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
     // Stamp the creator's credentials so SO_PEERCRED / SCM_CREDENTIALS on
     // the peer end report this process's real (pid, uid, gid).
     sock.set_local_cred(current_ucred());
+    sock.set_local_groups(current_groups());
     // Net-namespace scoping: stamp the creator's net-ns id so the
     // AF_INET bind/port tables are keyed per-ns (two processes in
     // different net-ns can both bind the same addr:port). 0 = host ns.
+    let task = current_task_id();
     #[cfg(feature = "container")]
     {
-        let t = current_task_id();
-        if let Some(ns) = crate::namespaces::current_net_ns(t) {
+        if let Some(ns) = crate::namespaces::current_net_ns(task) {
             sock.set_net_namespace(ns);
         }
     }
+    // PID 1 configures only the initial namespace's synthetic loopback during
+    // early systemd boot. Keep the authority kernel-held and interface-bound:
+    // no other route socket receives an ambient administrative capability.
+    if domain == crate::socket::AF_NETLINK
+        && proto == crate::socket::NETLINK_ROUTE
+        && sock.net_ns_id() == 0
+        && task_to_pid_raw(task) == Some(1)
+        && sock
+            .delegate_netlink_admin(narf_net::initial_loopback_admin())
+            .is_err()
+    {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        return;
+    }
     socket_arc_register(&sock);
-    let task = current_task_id();
     let new_fd = match fd::with_table(task, |t| {
         t.open(crate::fd::FdEntry {
             ops: sock.clone(),

@@ -14,7 +14,25 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let target = apply_chroot(target_raw.as_str());
+    // Resolve against the caller's cwd (and re-root under any chroot), like
+    // sys_pivot_root / sys_mount. systemd's switch-root does
+    // `fchdir(new_root_fd); pivot_root(".", "."); umount2(".", MNT_DETACH)` —
+    // the RELATIVE "." must resolve to the cwd (the new root), not a literal
+    // "." that matches no mount. When umount2(".") failed here, systemd fell
+    // back to `mount(".", "/", MS_MOVE)`, which also mis-resolved "." and
+    // returned ENOENT → 226/EXIT_NAMESPACE (udevd et al.).
+    // Trim any trailing slash so the exact-match against registry mount paths
+    // (which have none, except root) succeeds: `apply_chroot("/")` yields
+    // "<root>/" (intentional, see apply_chroot), so umount2(".") right after
+    // pivot_root(".",".") — cwd "/" in the new root — resolves to "<newroot>/".
+    let target = {
+        let t = resolve_cwd_path(current_task_id(), target_raw.as_str());
+        if t.len() > 1 {
+            alloc::string::String::from(t.trim_end_matches('/'))
+        } else {
+            t
+        }
+    };
     let flags = args.arg1;
     // We accept MNT_FORCE / MNT_DETACH / MNT_EXPIRE / UMOUNT_NOFOLLOW
     // but the registry doesn't yet track in-flight refs against a
@@ -22,23 +40,32 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // recorded for diagnostic symmetry only.
     let _ = flags & (MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW);
 
-    // Protect the core API pseudo-filesystems from destructive unmount.
-    // NARF has no mount stacking: /proc, /sys, /dev (and cgroup2) are single
-    // shared instances that the chroot's Stage::Late `mnt-dev-bind` provides
-    // and everything depends on. Because NARF mounts these idempotently (see
-    // sys_mount), the balancing umount of one is also a no-op: report success
-    // but keep the singleton mounted. tmpfs / bind / real mounts unmount as
-    // normal.
-    let protected = narf_filesystem::registry()
-        .list_with_names()
-        .into_iter()
-        .any(|(path, name)| {
-            path == target
-                && matches!(
-                    name.as_str(),
-                    "procfs" | "sysfs" | "devfs" | "cgroup2" | "cgroupfs"
-                )
-        });
+    // Protect the core API pseudo-filesystems from destructive unmount ONLY in
+    // the GLOBAL registry. NARF has no mount stacking: the global /proc, /sys,
+    // /dev (and cgroup2) are single shared instances the chroot's Stage::Late
+    // `mnt-dev-bind` provides and everything depends on, so a global umount is a
+    // keep-mounted no-op.
+    //
+    // A task with a PRIVATE mount namespace (every systemd service sandbox, after
+    // unshare(CLONE_NEWNS)) must NOT get that no-op: `ns.unmount` only pops that
+    // namespace's OWN mount entry — the shared singleton's `FsInstance` Arc, still
+    // held by the global registry, is untouched. Applying the no-op there made
+    // umount2 of a service's PRIVATE /dev (systemd's mount_private_dev →
+    // umount_recursive before the MS_MOVE) a silent success while the mount stayed
+    // in /proc/self/mountinfo, so umount_recursive looped FOREVER — the service's
+    // sd-executor hung before execve and the Type=notify unit timed out (userdbd,
+    // and every service with PrivateDevices=/ProtectProc=/etc.).
+    let private_ns = current_mount_namespace();
+    let protected = private_ns.is_none()
+        && current_mount_list_with_names()
+            .into_iter()
+            .any(|(path, name)| {
+                path == target
+                    && matches!(
+                        name.as_str(),
+                        "procfs" | "sysfs" | "devfs" | "cgroup2" | "cgroupfs"
+                    )
+            });
     if protected {
         ctx.set_return(SyscallReturn::ok(0));
         return;
@@ -51,7 +78,17 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
         narf_capabilities::Cap::<narf_filesystem::MountPoint, narf_capabilities::Write>::bootstrap(
         );
     let _ = auth;
-    match narf_filesystem::registry().unmount(&handle, target.as_str()) {
+    let result = if let Some(ns) = private_ns {
+        ns.unmount(target.as_str())
+    } else {
+        narf_filesystem::registry().unmount(&handle, target.as_str())
+    };
+    // Linux `umount2(2)` reports failure (EINVAL for "not a mount point",
+    // ENOENT for a missing path) rather than silently succeeding — swallowing
+    // the error hid real unmount failures and broke conformance. A real mount
+    // (including the old root systemd detaches after pivot_root) unmounts and
+    // returns 0; a non-mount path returns the -1 sentinel.
+    match result {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(_) => ctx.set_return(fail),
     }

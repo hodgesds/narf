@@ -135,6 +135,13 @@ impl FileOps for SignalFdFile {
             0
         }
     }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        (
+            crate::handlers::signal_readable_generation(self.owner_task),
+            0,
+        )
+    }
 }
 
 // ── memfd_create + file sealing ────────────────────────────────────

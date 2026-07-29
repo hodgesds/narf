@@ -31,13 +31,15 @@ pub(crate) fn sys_socket_get_addr(ctx: &mut dyn TrapContext, peer: bool) {
             // Pack as: family(u16) + body.
             let total = 2 + addr.body.len();
             let n = core::cmp::min(in_len, total);
-            if addr_ptr != 0 && n >= 2 {
+            if addr_ptr != 0 && n != 0 {
                 let mut out = alloc::vec![0u8; n];
                 let fam_bytes = addr.family.to_le_bytes();
-                out[0] = fam_bytes[0];
-                out[1] = fam_bytes[1];
-                let body_n = n - 2;
-                out[2..2 + body_n].copy_from_slice(&addr.body[..body_n]);
+                let family_n = n.min(fam_bytes.len());
+                out[..family_n].copy_from_slice(&fam_bytes[..family_n]);
+                if n > fam_bytes.len() {
+                    let body_n = n - fam_bytes.len();
+                    out[fam_bytes.len()..].copy_from_slice(&addr.body[..body_n]);
+                }
                 // SAFETY: addr_ptr is a user VA; SMAP bracket inside copy_to_user.
                 let _ = unsafe { copy_to_user(addr_ptr, &out) };
             }

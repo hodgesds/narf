@@ -86,6 +86,7 @@ pub fn truncate(f: &FileCap, len: u64)                         -> impl Future<Ou
 pub trait FileOps {
     fn poll_readiness(&self) -> u32;
     fn poll_readiness_at(&self, offset: u64) -> u32;
+    fn poll_edge_token(&self) -> (u64, u64);
 }
 ```
 
@@ -93,6 +94,13 @@ All operations submit through `abi/` rings when crossing the
 kernel↔user boundary; kernel-internal callers invoke directly.
 `poll_readiness_at` defaults to `poll_readiness`; offset-sensitive device
 descriptions such as `/dev/kmsg` override it so EOF is not reported readable.
+`poll_edge_token` defaults to `(0, 0)`; stateful readiness providers advance
+one component whenever an edge-relevant source changes so `EPOLLET` cannot
+lose a drain/refill transition between readiness scans.
+
+The devtmpfs-compatible root accepts runtime symlink creation and removal.
+This includes journald's `/dev/log -> /run/systemd/journal/dev-log` alias;
+static device aliases retain precedence over dynamic names.
 
 ### 3.3.1 cgroup-v2 cpuset placement
 
@@ -151,6 +159,36 @@ pub fn unmount(mp: Cap<MountPoint, Own>) -> impl Future<Output = ()>;
 A mount is just another capability; removing it closes access via
 that path. Existing open caps on nodes across the mount continue to
 work (refcount-style) until they too are released.
+
+Linux-compat mount namespaces hold a private snapshot of the mount table.
+Mount, bind-mount, and unmount operations after `CLONE_NEWNS` mutate that
+snapshot only. Private tables permit mount stacking; path resolution and
+unmount select the most recently attached mount at an equal path.
+Every attachment receives a nonzero mount ID, and `mount_id_at` reports the
+newest visible mount so Linux `name_to_handle_at(2)` can expose mount identity.
+Open file descriptions retain the mount ID visible at open time, including for
+`name_to_handle_at(AT_EMPTY_PATH)`, even when a later mount covers that path.
+`list_mountinfo` preserves attachment order and reports the covered or nearest
+ancestor mount ID as each entry's parent for `/proc/<pid>/mountinfo`.
+The procfs view hides mounts outside the queried task's root and projects that
+root to `/`, so a chrooted task never sees backing prefixes such as `/mnt`.
+This per-task mountinfo projection is wired for every Linux-compat build,
+independently of optional container namespaces: service managers use
+`CLONE_NEWNS` for sandboxing and must observe private stacked file binds before
+they remount them read-only.
+Recursive bind mounts rebase every visible descendant mount beneath the new
+target, preserving nested API mounts such as cgroup2 beneath a bound `/sys`.
+A recursive bind whose normalized source and target are identical stacks the
+root only; its descendants are already attached at the required paths.
+Nested `unshare(CLONE_NEWNS)` and `clone(CLONE_NEWNS)` copy the caller's
+current private table rather than rebuilding from the global registry.
+`clone_tree_at` exposes an arbitrary directory subtree as a detached
+filesystem root for Linux `open_tree(2)` and later `move_mount(2)`.
+An `OPEN_TREE_CLONE` detached object retains the visible descendant
+mounts beneath that root; attaching it rebases those mount paths beneath
+the new target.
+Classic `MS_MOVE` relocates the topmost source mount to the target without
+changing its filesystem object.
 
 ### 3.6 Filesystem driver interface
 

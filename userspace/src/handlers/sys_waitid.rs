@@ -148,10 +148,7 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
 
     // Blocking: park via the shared wait machinery with the waitid
     // flag set so the poll routine writes a siginfo + returns 0.
-    if let (Some(uctx), Some(hook)) = (
-        crate::user_task::current_user_task(),
-        crate::user_task::yield_hook(),
-    ) {
+    if let Some(uctx) = crate::user_task::current_user_task() {
         // SAFETY: `uctx` is the live per-task UserTaskCtx; we hold the
         // only reference while staging the wait state and saving CPU
         // state before the yield hook hands the task to the executor.
@@ -173,13 +170,22 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
             if narf_scheduler::stackful::user_own_stack_enabled() {
+                // The own-stack executor parks through `kernel_switch`; it
+                // does not use the legacy longjmp yield hook. Requiring that
+                // hook here made a real waitid(2) falsely return success with
+                // a zeroed siginfo_t when a direct systemd PID 1 waited for a
+                // generator child. systemd correctly treats that as an
+                // unknown child state and aborts its generator sandbox.
                 own_stack_block(ctx);
                 return;
             }
-            hook(uctx);
+            if let Some(hook) = crate::user_task::yield_hook() {
+                hook(uctx);
+            }
         }
     }
-    // Fallback (no polling future, e.g. kernel-test context): report no
-    // child rather than spin.
-    ctx.set_return(SyscallReturn::ok(0));
+    // A blocking waitid with no task context cannot safely park. It must not
+    // masquerade as a successful reap: Linux reports ECHILD when there is no
+    // eligible child, while a successful waitid must fill siginfo_t.
+    ctx.set_return(SyscallReturn::ok((-10i64) as u64)); // ECHILD
 }

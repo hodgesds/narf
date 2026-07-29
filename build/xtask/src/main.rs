@@ -40,7 +40,7 @@ enum Cmd {
     /// Cross-compile and boot under QEMU.
     Run(BuildArgs),
     /// Cross-compile and run kernel tests under QEMU.
-    Test(BuildArgs),
+    Test(TestArgs),
     /// Cross-compile and boot under QEMU as a real init pass (no
     /// kernel-test feature), parsing serial output for panic markers
     /// and known success markers. Catches regressions that smoke
@@ -343,6 +343,16 @@ struct BuildArgs {
     /// inline shadow check and panics IN the corruptor's frame. x86_64 only.
     #[arg(long, default_value_t = false)]
     kasan: bool,
+}
+
+#[derive(Parser, Clone)]
+struct TestArgs {
+    #[command(flatten)]
+    build: BuildArgs,
+
+    /// Run only kernel tests registered under this exact subsystem.
+    #[arg(long)]
+    subsystem: Option<String>,
 }
 
 /// Wave-49 — args for `xtask run-interactive`. Inherits BuildArgs
@@ -1914,7 +1924,7 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
     let mut cmd = Command::new(qemu);
     cmd.args(args.arch.qemu_args(&kernel, &args.display, args.hw_profile));
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    cmd.stderr(Stdio::inherit());
 
     let secs = std::env::var("XTASK_SYSTEMD_PID1_TIMEOUT_SECS")
         .ok()
@@ -7196,28 +7206,56 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Run(args) => run_cmd(&args),
-        Cmd::Test(mut args) => {
-            // Phase 1: kernel-test feature on, run all in-kernel smokes.
-            let mut smoke_args = args.clone();
-            if smoke_args.features.is_empty() {
-                smoke_args.features = "kernel-test".into();
-            } else if !smoke_args.features.contains("kernel-test") {
-                smoke_args.features.push_str(",kernel-test");
+        Cmd::Test(test) => {
+            let mut args = test.build;
+            let prior_append = std::env::var_os("XTASK_QEMU_APPEND");
+            if let Some(subsystem) = &test.subsystem {
+                if subsystem.is_empty()
+                    || !subsystem
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
+                {
+                    bail!("--subsystem must contain only letters, digits, '/', '_', '-', or '.'");
+                }
+                let mut append = prior_append
+                    .as_ref()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !append.is_empty() {
+                    append.push(' ');
+                }
+                append.push_str("test_subsystem=");
+                append.push_str(subsystem);
+                std::env::set_var("XTASK_QEMU_APPEND", append);
             }
-            // Gate on the kernel-test runner's exit status: a failing
-            // smoke makes the runner exit_kernel(1), which this fails on.
-            run_cmd_inner(&smoke_args, true)?;
-            // Phase 2: boot-smoke without kernel-test. Catches
-            // regressions that smokes miss because they exercise modules
-            // in isolation, not the full init flow. Strip the
-            // kernel-test feature explicitly so the real init runs.
-            args.features = args
-                .features
-                .split(',')
-                .filter(|f| !f.is_empty() && *f != "kernel-test")
-                .collect::<Vec<_>>()
-                .join(",");
-            boot_smoke_cmd(&args)
+            let result = (|| {
+                // Phase 1: kernel-test feature on, run selected in-kernel smokes.
+                let mut smoke_args = args.clone();
+                if smoke_args.features.is_empty() {
+                    smoke_args.features = "kernel-test".into();
+                } else if !smoke_args.features.contains("kernel-test") {
+                    smoke_args.features.push_str(",kernel-test");
+                }
+                // Gate on the kernel-test runner's exit status: a failing
+                // smoke makes the runner exit_kernel(1), which this fails on.
+                run_cmd_inner(&smoke_args, true)?;
+                // Phase 2: boot-smoke without kernel-test. Catches
+                // regressions that smokes miss because they exercise modules
+                // in isolation, not the full init flow. Strip the
+                // kernel-test feature explicitly so the real init runs.
+                args.features = args
+                    .features
+                    .split(',')
+                    .filter(|f| !f.is_empty() && *f != "kernel-test")
+                    .collect::<Vec<_>>()
+                    .join(",");
+                boot_smoke_cmd(&args)
+            })();
+            match prior_append {
+                Some(value) => std::env::set_var("XTASK_QEMU_APPEND", value),
+                None => std::env::remove_var("XTASK_QEMU_APPEND"),
+            }
+            result
         }
         Cmd::BootSmoke(args) => boot_smoke_cmd(&args),
         Cmd::SystemdPid1(args) => systemd_pid1_cmd(&args),

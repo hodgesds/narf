@@ -456,6 +456,88 @@ fn smoke_ext2_mount_ramblock_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_mount_ramblock_round_trip);
 
+fn smoke_ext2_page_cache_reuses_1k_data_block() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_block::{
+        ram::RamBlockDevice, BlockCompletion, BlockDevice, BlockFeature, BlockOp, BlockRequest,
+        CancelResult, LbaRange,
+    };
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    struct CountingBlock {
+        inner: Arc<RamBlockDevice>,
+        reads: AtomicUsize,
+    }
+
+    impl BlockDevice for CountingBlock {
+        fn logical_block_size(&self) -> u32 {
+            self.inner.logical_block_size()
+        }
+        fn physical_block_size(&self) -> u32 {
+            self.inner.physical_block_size()
+        }
+        fn capacity_blocks(&self) -> u64 {
+            self.inner.capacity_blocks()
+        }
+        fn supports(&self, feature: BlockFeature) -> bool {
+            self.inner.supports(feature)
+        }
+        fn submit(
+            &self,
+            request: BlockRequest,
+        ) -> impl core::future::Future<Output = BlockCompletion> + Send {
+            if matches!(request.op, BlockOp::Read) {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.submit(request)
+        }
+        fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
+            self.inner.flush()
+        }
+        fn discard(&self, range: LbaRange) -> impl core::future::Future<Output = ()> + Send {
+            self.inner.discard(range)
+        }
+        fn cancel(&self, tag: u64) -> impl core::future::Future<Output = CancelResult> + Send {
+            self.inner.cancel(tag)
+        }
+    }
+
+    let device = Arc::new(CountingBlock {
+        inner: RamBlockDevice::from_image(512, build_ext2_image(b"page cache")),
+        reads: AtomicUsize::new(0),
+    });
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let file = match poll_once(root.lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    let mut first = [0u8; 10];
+    if !matches!(poll_once(file.read(0, &mut first)), Some(Ok(10))) {
+        return TestResult::Fail("first read failed");
+    }
+    let reads_after_first = device.reads.load(Ordering::Relaxed);
+    let mut second = [0u8; 10];
+    if !matches!(poll_once(file.read(0, &mut second)), Some(Ok(10))) {
+        return TestResult::Fail("second read failed");
+    }
+    if first != second || device.reads.load(Ordering::Relaxed) != reads_after_first {
+        return TestResult::Fail("second read missed the cached 1 KiB ext block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_page_cache_reuses_1k_data_block
+);
+
 /// Build a minimal EXT4 image: same block layout as `build_ext2_image`,
 /// but the superblock sets the EXTENTS incompat feature and every inode
 /// stores an extent tree in its `i_block[]` region instead of the
@@ -2520,3 +2602,197 @@ fn smoke_ext2_htree_collect_sorted_entries() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_htree_collect_sorted_entries);
+
+// ─────────────────── Synchronous DirOps::lookup / lookup_dir ───────────────
+//
+// ext2 lookups are fundamentally async (inode + directory-block reads), but the
+// synchronous VFS API (`DirOps::lookup`, `DirOps::lookup_dir`) must still work:
+// bind-mount source resolution (`build_bind_fs`) and mount-subtree cloning walk
+// a path with the sync API and cannot await. The driver drives the async lookup
+// to completion via the scheduler's spin bridge. These tests pin that contract.
+
+/// A nested ext2 image: root → "sub" (dir) → "deep" (file). Extends the flat
+/// `build_ext2_image` with inode 13 (sub dir, block 11) and inode 14 (deep file,
+/// block 12), so a DEEP synchronous walk (the StateDirectory=/var/lib/... shape)
+/// can be exercised end-to-end.
+fn build_ext2_image_nested(deep_data: &[u8]) -> Vec<u8> {
+    const BS: usize = 1024;
+    let mut img = build_ext2_image(b"flat-file\n");
+
+    let itab_off = 5 * BS;
+    const INODE_SIZE: usize = 128;
+
+    // ── inode 13: "sub" directory (table index 12), data block 11 ──
+    let sub_off = itab_off + 12 * INODE_SIZE;
+    put_u16(&mut img, sub_off, 0x4000 | 0o755); // S_IFDIR | 0755
+    put_u32(&mut img, sub_off + 4, BS as u32); // size = 1 block
+    put_u32(&mut img, sub_off + 28, (BS / 512) as u32); // i_blocks
+    put_u32(&mut img, sub_off + 40, 11); // i_block[0] = 11
+
+    // ── inode 14: "deep" regular file (table index 13), data block 12 ──
+    let deep_off = itab_off + 13 * INODE_SIZE;
+    put_u16(&mut img, deep_off, 0x8000 | 0o644); // S_IFREG | 0644
+    put_u32(&mut img, deep_off + 4, deep_data.len() as u32);
+    put_u32(
+        &mut img,
+        deep_off + 28,
+        deep_data.len().div_ceil(512) as u32,
+    );
+    if !deep_data.is_empty() {
+        put_u32(&mut img, deep_off + 40, 12); // i_block[0] = 12
+    }
+
+    // ── inode bitmap (block 4): also mark inodes 13, 14 used ──
+    let ibm_off = 4 * BS;
+    img[ibm_off + 1] = 0b0011_1000; // inodes 12, 13, 14
+
+    // ── block bitmap (block 3): also mark blocks 11, 12 used ──
+    let bm_off = 3 * BS;
+    img[bm_off + 1] = 0x1F; // blocks 8..=12
+
+    // ── rewrite the root directory block (9): ".", "..", "data", "sub" ──
+    let root_data = 9 * BS;
+    for b in &mut img[root_data..root_data + BS] {
+        *b = 0;
+    }
+    // Write one directory record at absolute byte offset `at`.
+    fn put_dirent(img: &mut [u8], at: usize, ino: u32, name: &[u8], ftype_byte: u8, rec: u16) {
+        put_u32(img, at, ino);
+        put_u16(img, at + 4, rec);
+        img[at + 6] = name.len() as u8;
+        img[at + 7] = ftype_byte;
+        img[at + 8..at + 8 + name.len()].copy_from_slice(name);
+    }
+    put_dirent(&mut img, root_data, 2, b".", ftype::DIR, 12);
+    put_dirent(&mut img, root_data + 12, 2, b"..", ftype::DIR, 12);
+    put_dirent(&mut img, root_data + 24, 12, b"data", ftype::REGULAR, 12);
+    // "sub" is the last record — fills the rest of the block.
+    put_dirent(
+        &mut img,
+        root_data + 36,
+        13,
+        b"sub",
+        ftype::DIR,
+        (BS - 36) as u16,
+    );
+
+    // ── sub directory data (block 11): ".", "..", "deep" ──
+    let sub_data = 11 * BS;
+    put_dirent(&mut img, sub_data, 13, b".", ftype::DIR, 12);
+    put_dirent(&mut img, sub_data + 12, 2, b"..", ftype::DIR, 12);
+    put_dirent(
+        &mut img,
+        sub_data + 24,
+        14,
+        b"deep",
+        ftype::REGULAR,
+        (BS - 24) as u16,
+    );
+
+    // ── deep file data (block 12) ──
+    if !deep_data.is_empty() {
+        let d = 12 * BS;
+        img[d..d + deep_data.len()].copy_from_slice(deep_data);
+    }
+
+    img
+}
+
+fn mount_root(img: Vec<u8>) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
+    use crate::volume::Ext2Volume;
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return None,
+    };
+    Some(volume.root())
+}
+
+/// `DirOps::lookup` (SYNC) resolves a real file entry on ext2.
+fn smoke_ext2_sync_lookup_resolves_file() -> TestResult {
+    let root = match mount_root(build_ext2_image(b"payload!!\n")) {
+        Some(r) => r,
+        None => return TestResult::Fail("mount failed"),
+    };
+    match root.lookup("data") {
+        Some(f) => {
+            if f.stat().size != 10 {
+                return TestResult::Fail("sync lookup returned wrong size");
+            }
+            TestResult::Pass
+        }
+        None => TestResult::Fail("sync lookup(\"data\") returned None on a real ext2 file"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_sync_lookup_resolves_file);
+
+/// `DirOps::lookup` (SYNC) returns None for a missing name.
+fn smoke_ext2_sync_lookup_missing_is_none() -> TestResult {
+    let root = match mount_root(build_ext2_image(b"x\n")) {
+        Some(r) => r,
+        None => return TestResult::Fail("mount failed"),
+    };
+    match root.lookup("nope") {
+        None => TestResult::Pass,
+        Some(_) => TestResult::Fail("sync lookup of a missing name must be None"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_sync_lookup_missing_is_none);
+
+/// `DirOps::lookup_dir` (SYNC) resolves a directory entry (".", which is the
+/// root dir inode).
+fn smoke_ext2_sync_lookup_dir_resolves() -> TestResult {
+    let root = match mount_root(build_ext2_image(b"x\n")) {
+        Some(r) => r,
+        None => return TestResult::Fail("mount failed"),
+    };
+    match root.lookup_dir(".") {
+        Some(_) => TestResult::Pass,
+        None => TestResult::Fail("sync lookup_dir(\".\") returned None on a real ext2 dir"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_sync_lookup_dir_resolves);
+
+/// `DirOps::lookup_dir` (SYNC) returns None when the name is a FILE, not a dir.
+fn smoke_ext2_sync_lookup_dir_on_file_is_none() -> TestResult {
+    let root = match mount_root(build_ext2_image(b"x\n")) {
+        Some(r) => r,
+        None => return TestResult::Fail("mount failed"),
+    };
+    match root.lookup_dir("data") {
+        None => TestResult::Pass,
+        Some(_) => TestResult::Fail("sync lookup_dir on a FILE must be None"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_sync_lookup_dir_on_file_is_none
+);
+
+/// A DEEP synchronous walk — root → "sub" (dir) → "deep" (file) — via the sync
+/// API only. This is the shape `build_bind_fs` walks for systemd's
+/// StateDirectory= (e.g. binding /var/lib/systemd/linger); a sync-stubbed
+/// lookup_dir failed it NotFound → ENOENT → 226/EXIT_NAMESPACE.
+fn smoke_ext2_sync_deep_walk() -> TestResult {
+    let root = match mount_root(build_ext2_image_nested(b"deepdata")) {
+        Some(r) => r,
+        None => return TestResult::Fail("mount failed"),
+    };
+    let sub = match root.lookup_dir("sub") {
+        Some(d) => d,
+        None => return TestResult::Fail("sync lookup_dir(\"sub\") failed"),
+    };
+    match sub.lookup("deep") {
+        Some(f) => {
+            if f.stat().size != 8 {
+                return TestResult::Fail("deep file wrong size");
+            }
+            TestResult::Pass
+        }
+        None => TestResult::Fail("sync lookup(\"deep\") under sub/ failed"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_sync_deep_walk);

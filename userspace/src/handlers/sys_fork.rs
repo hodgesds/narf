@@ -167,16 +167,23 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
         loaded_mappings: alloc::vec::Vec::new(),
     };
 
-    let child_tid = match child_state {
-        Some(state) => crate::user_task::spawn_user_process_resume(
+    // Register the child under its TaskId but defer scheduler publication
+    // until all fork inheritance below is complete.  The child may otherwise
+    // run on another CPU before `fd::fork` installs its table.
+    let pending_child = match child_state {
+        Some(state) => crate::user_task::prepare_user_process_resume(
             proc,
             state,
             narf_scheduler::TaskSpec::user_task(),
         ),
         // Fallback if save_user_state didn't fire (test contexts
         // with synthetic TrapContexts whose stub returns false).
-        None => crate::user_task::spawn_user_process(proc, narf_scheduler::TaskSpec::user_task()),
+        None => crate::user_task::prepare_user_process_initial(
+            proc,
+            narf_scheduler::TaskSpec::user_task(),
+        ),
     };
+    let child_tid = pending_child.task_id();
     // Record the explicit ProcessId ↔ TaskId binding.  Must happen
     // before any code that crosses the ID-space boundary.
     register_pid_task_mapping(child_pid.raw(), child_tid.raw());
@@ -213,14 +220,15 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     let mut child_ns_pid = child_pid.raw();
     #[cfg(feature = "container")]
     {
+        let parent_task = current_task_id();
         if let Some(inner) =
-            crate::pid_ns::inherit_into_child(parent_pid, child_tid.raw(), child_pid.raw())
+            crate::pid_ns::inherit_into_child(parent_task, child_tid.raw(), child_pid.raw())
         {
             child_ns_pid = inner;
         }
-        mount_ns_inherit(parent_pid, child_tid.raw());
+        mount_ns_inherit(parent_task, child_tid.raw());
         // UTS / NET / IPC / User namespaces share the parent's Arc.
-        crate::namespaces::inherit_into_child(parent_pid, child_tid.raw());
+        crate::namespaces::inherit_into_child(parent_task, child_tid.raw());
     }
     // A forked child joins its parent's cgroup. cgroup membership is keyed by
     // ProcessId (per-process in v2), so the parent must be looked up by its
@@ -248,6 +256,9 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // contract). The parent's waitpid() passes this same value back as
     // `want_pid`, which sys_wait4 translates back to the outer ProcessId before
     // matching PENDING_EXITS. Root-namespace parents see the outer pid.
+    // All child-visible state is now installed, so it is safe for the child
+    // to execute on another CPU.
+    pending_child.spawn();
     #[cfg(feature = "container")]
     ctx.set_return(SyscallReturn::ok(child_ns_pid));
     #[cfg(not(feature = "container"))]
