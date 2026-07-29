@@ -641,6 +641,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-bpf-isa"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+]
+
+[[package]]
 name = "narf-bus"
 version = "0.0.0"
 dependencies = [
