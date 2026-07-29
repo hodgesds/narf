@@ -508,6 +508,26 @@ pub(crate) fn fd_mount_id(task: u64, fd: u32) -> Option<u64> {
     with_fd_paths(|m| m.get(&(task, fd)).and_then(|(_, id)| *id))
 }
 
+/// Copy fd-path identities along with the descriptor table during fork/clone.
+/// The table is task-keyed even when CLONE_FILES shares the underlying file
+/// descriptions, because proc-fd lookups and *at syscalls resolve through the
+/// calling task.  Without this, a forked systemd mount helper inherited a
+/// valid O_PATH parent fd but `mkdirat(parent_fd, ...)` saw EBADF.
+pub(crate) fn fork_fd_paths(parent: u64, child: u64) {
+    let inherited: Vec<(u32, FdPathIdentity)> = with_fd_paths(|m| {
+        m.iter()
+            .filter(|&(&(task, _), _)| task == parent)
+            .map(|(&(_, fd), identity)| (fd, identity.clone()))
+            .collect()
+    });
+    with_fd_paths(|m| {
+        m.retain(|&(task, _), _| task != child);
+        for (fd, identity) in inherited {
+            m.insert((child, fd), identity);
+        }
+    });
+}
+
 fn parent_and_base(abs: &str) -> (&str, &str) {
     match abs.rfind('/') {
         Some(0) => ("/", &abs[1..]),

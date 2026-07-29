@@ -455,6 +455,44 @@ fn smoke_abi_pathx_openat2_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_pos);
 
+// systemd's mount units chase the parent with openat2(O_PATH|O_DIRECTORY)
+// then create the final mount point with mkdirat(parent_fd, leaf, …).  The
+// O_PATH fd must retain its backing pathname so the relative mkdirat does not
+// degrade to EBADF.
+fn smoke_abi_pathx_openat2_opath_dirfd_mkdirat() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        const O_PATH: u64 = 0o10000000;
+        const O_DIRECTORY: u64 = 0o200000;
+        let parent = b"/p2\0";
+        let mut how = [0u8; 24];
+        how[..8].copy_from_slice(&(O_PATH | O_DIRECTORY).to_ne_bytes());
+        let dfd = match call(
+            Syscall::Openat2.raw(),
+            a3(AT_FDCWD, parent.as_ptr() as u64, how.as_ptr() as u64, 24),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat2(O_PATH directory) did not return an fd"),
+        };
+        let leaf = b"connections\0";
+        if call(
+            Syscall::Mkdirat.raw(),
+            a3(dfd, leaf.as_ptr() as u64, 0o755, 0),
+        ) != Some(0)
+        {
+            return Err("mkdirat(openat2 O_PATH fd, leaf) should create the mount point");
+        }
+        let created = b"/p2/connections\0";
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, created.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("mkdirat under the O_PATH fd created at the wrong path"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_opath_dirfd_mkdirat);
+
 fn smoke_abi_pathx_openat2_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";

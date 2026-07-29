@@ -1034,6 +1034,30 @@ fn smoke_userspace_fork_inherits_fd_table() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_fork_inherits_fd_table);
 
+// Forked helpers inherit the descriptor table AND the task-keyed path
+// identities used by Linux *at syscalls. systemd opens a mount parent in PID 1
+// then its mount helper calls mkdirat(parent_fd, leaf, ...); losing this
+// metadata turned the valid inherited O_PATH fd into EBADF.
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_fork_inherits_fd_path_identity() -> TestResult {
+    const PARENT: u64 = 0xF001;
+    const CHILD: u64 = 0xF002;
+    const FD: u32 = 9;
+    crate::mqueue::register_fd_path(PARENT, FD, "/sys/fs/fuse", Some(7));
+    crate::mqueue::fork_fd_paths(PARENT, CHILD);
+    let path = crate::mqueue::fd_path(CHILD, FD);
+    let mount_id = crate::mqueue::fd_mount_id(CHILD, FD);
+    crate::mqueue::forget_fd_path(PARENT, FD);
+    crate::mqueue::forget_fd_path(CHILD, FD);
+    if path.as_deref() == Some("/sys/fs/fuse") && mount_id == Some(7) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("fork lost the inherited fd path identity")
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_fork_inherits_fd_path_identity);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_fork_rejects_without_address_space() -> TestResult {
     // Defence-in-depth: with no AS lookup installed, fork must

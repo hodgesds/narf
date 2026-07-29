@@ -5144,6 +5144,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     } else {
         crate::fd::fork(parent_pid, child_tid.raw());
     }
+    #[cfg(feature = "linux-compat")]
+    crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
 
     // CLONE_PIDFD: install the pidfd in the PARENT's table only, AFTER the
     // child's fd-table fork above so the child doesn't inherit it (Linux

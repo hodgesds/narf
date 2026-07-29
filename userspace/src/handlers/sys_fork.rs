@@ -191,6 +191,8 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // copied; pending signals reset (handled by sigaction_fork
     // not touching the pending bitmap).
     crate::fd::fork(parent_pid, child_tid.raw());
+    #[cfg(feature = "linux-compat")]
+    crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
     cwd_fork(parent_pid, child_tid.raw());
     // chroot inheritance (see do_clone3) — child inherits the parent's root.
     #[cfg(feature = "linux-compat")]
