@@ -448,10 +448,19 @@ allowlist (typically held only by debug tools).
 Stage 4 lands the basic `Cap<HwTrace, _>` API; Stage 5 adds
 per-domain HW-trace filtering for cross-tenant safety.
 
-### 8.7 BPF-free declarative aggregation (resolved)
+### 8.7 Declarative aggregation (resolved; scope narrowed 2026-07)
 
 **Decision:** **declarative aggregation via a tiny safe DSL**,
 not a VM.
+
+**Amendment.** This decision was originally argued partly as avoiding a
+"slippery-slope to a kernel BPF interpreter". NARF now has one — see
+`bpf/specification/spec.md`. The decision *stands* on its own merits and is
+not reversed: the aggregate clause below is a declarative annotation on a
+probe site, resolved at compile time with no runtime program loading,
+verification, or JIT. It remains the right tool for static aggregation.
+BPF is the tool for programs supplied at runtime. The two coexist, and
+`tracing::dispatch` is the seam BPF attaches through.
 
 ```rust
 #[narf_tracing::usdt(...)]

@@ -19,9 +19,10 @@
 //! - `linux/net/core/dev.c::netif_receive_skb_core` — the classifier
 //!   hook XDP installs ahead of the network stack
 //!
-//! NARF model omits eBPF program attachment (we have no eBPF runtime
-//! today); the classifier table is the only matching mechanism. A
-//! future eBPF surface would feed the same table.
+//! The classifier table is the base matching mechanism. NARF is growing an
+//! eBPF runtime (`bpf/`), and XDP-style programs attach here: a program runs
+//! ahead of both the daemon claim and the flow table, mirroring Linux's
+//! ordering in `netif_receive_skb_core`, and feeds the same table.
 
 use alloc::string::String;
 use alloc::sync::Arc;

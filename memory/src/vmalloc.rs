@@ -10,7 +10,8 @@
 //! Layout:
 //!   * x86_64 — kernel VA space lives in the upper half. The
 //!     vmalloc cursor starts at 0xFFFF_8800_0000_0000 (PML4
-//!     slot 273), well clear of:
+//!     slot 272 — bits 47:39 of that address are 0b1_0001_0000),
+//!     well clear of:
 //!       - the higher-half kernel image at PML4[511] (Stage 1 boot).
 //!       - the per-driver-domain private slots 256..=271 we
 //!         carved out for the PCID enforcer.
