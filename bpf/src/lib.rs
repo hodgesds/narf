@@ -119,6 +119,22 @@ pub fn register_initcalls() {
     });
 }
 
+/// Recover a loaded program from an `Arc<dyn FileOps>`'s `as_any`.
+///
+/// Lives here rather than in `narf-userspace` because the concrete fd type is
+/// `narf-bpf`'s: the caller has an `Arc<dyn FileOps>` and no way to name what it
+/// might downcast to. The same shape `setns(2)` uses to pull a namespace back
+/// out of a file.
+///
+/// Returns `None` for any fd that is not a BPF program, which is what makes
+/// `PERF_EVENT_IOC_SET_BPF` on the wrong fd an `EINVAL` rather than a
+/// misinterpretation.
+#[must_use]
+pub fn prog_from_file_ops(any: &dyn core::any::Any) -> Option<alloc::sync::Arc<prog::BpfProg>> {
+    any.downcast_ref::<prog::ProgFile>()
+        .map(prog::ProgFile::prog)
+}
+
 /// Reclaims a text allocation when dropped, which `narf_rcu::retire_box`
 /// arranges to happen after a grace period.
 struct ReclaimOnGracePeriod(Option<narf_memory::bpf_text::TextAlloc>);

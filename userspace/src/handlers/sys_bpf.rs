@@ -23,7 +23,7 @@
 #[allow(unused_imports)]
 use super::*;
 
-use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadRequest};
+use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadRequest, ProgFile};
 use narf_bpf_verifier::kfunc::Context;
 use narf_capabilities::{Cap, Grant};
 
@@ -101,43 +101,6 @@ fn load_cap() -> &'static Cap<BpfProgLoad, Grant> {
         *g = Some(c);
     }
     g.expect("just installed")
-}
-
-/// A loaded program behind an fd.
-///
-/// Anon-fd pattern, as `sys_eventfd` / `sys_memfd_create` use: an
-/// `Arc<dyn FileOps>` in an `FdEntry` with no backing file. Reads and writes
-/// are `Unsupported` — Linux's prog fd is a handle, not a stream, and
-/// `read(2)` on one returns `-EINVAL` there too.
-struct BpfProgFile {
-    prog: alloc::sync::Arc<BpfProg>,
-}
-
-impl narf_filesystem::FileOps for BpfProgFile {
-    fn read<'a>(
-        &'a self,
-        _offset: u64,
-        _buf: &'a mut [u8],
-    ) -> narf_filesystem::FsFuture<'a, usize> {
-        alloc::boxed::Box::pin(async { Err(narf_filesystem::FsError::Unsupported) })
-    }
-    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
-        alloc::boxed::Box::pin(async { Err(narf_filesystem::FsError::Unsupported) })
-    }
-    fn stat(&self) -> narf_filesystem::Stat {
-        narf_filesystem::Stat {
-            size: 0,
-            blocks: 0,
-            mode: narf_filesystem::Mode::FILE_RO,
-            mtime_cycles: 0,
-        }
-    }
-    /// Needed so `BPF_PROG_TEST_RUN` can recover the program from its fd.
-    /// The same hook `setns(2)` uses to pull a namespace back out of an
-    /// `Arc<dyn FileOps>`.
-    fn as_any(&self) -> Option<&dyn core::any::Any> {
-        Some(self)
-    }
 }
 
 fn u32_at(buf: &[u8], off: usize) -> u32 {
@@ -284,7 +247,7 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
     };
 
     let ops: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
-        alloc::sync::Arc::new(BpfProgFile { prog });
+        alloc::sync::Arc::new(ProgFile::new(prog));
     let task = current_task_id();
     match fd::with_table(task, |t| {
         t.open(crate::fd::FdEntry {
@@ -317,10 +280,10 @@ fn prog_test_run(attr_uptr: u64, size: usize) -> i64 {
         Some(Some(o)) => o,
         _ => return -EBADF_,
     };
-    let Some(file) = ops.as_any().and_then(|a| a.downcast_ref::<BpfProgFile>()) else {
+    let Some(file) = ops.as_any().and_then(|a| a.downcast_ref::<ProgFile>()) else {
         return -EINVAL;
     };
-    let prog = file.prog.clone();
+    let prog = file.prog();
 
     // The context tuple. Linux's `ctx_in` is a program-type-specific struct;
     // for NARF's probe context it is the `[u64; 4]` the probe ABI already

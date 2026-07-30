@@ -274,3 +274,126 @@ fn smoke_abi_bpf_requires_privilege() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_requires_privilege);
+
+// ── PERF_EVENT_IOC_SET_BPF ──────────────────────────────────────────
+
+/// `_IOW('$', 8, __u32)`.
+const PERF_EVENT_IOC_SET_BPF: u64 = 0x4004_2408;
+/// `PERF_TYPE_TRACEPOINT`, the only type NARF wires to its trace events.
+const PERF_TYPE_TRACEPOINT_: u32 = 2;
+const PERF_TYPE_SOFTWARE_: u32 = 1;
+
+/// A `perf_event_open` of `type_`.
+///
+/// Uses the real `PerfEventAttr` from `narf-linux-perf-uapi`, not a local
+/// re-declaration. A first attempt hand-rolled the struct and every open
+/// failed on the `size` field — which is the good outcome, because the bad one
+/// is a duplicate ABI struct that happens to be accepted and then diverges
+/// silently.
+fn open_event_of_type(type_: u32, config: u64) -> Option<u32> {
+    let attr = narf_linux_perf_uapi::PerfEventAttr {
+        type_,
+        size: core::mem::size_of::<narf_linux_perf_uapi::PerfEventAttr>() as u32,
+        config,
+        sample_period_or_freq: 1,
+        sample_type: 1 << 10, // PERF_SAMPLE_RAW
+        flags: 1,             // disabled
+        ..Default::default()
+    };
+    match call(
+        Syscall::PerfEventOpen.raw(),
+        a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+    ) {
+        Some(fd) if fd >= 0 => Some(fd as u32),
+        _ => None,
+    }
+}
+
+fn open_tracepoint_event() -> Option<u32> {
+    // A NARF trace-event id; the tracepoint type takes it in `config`.
+    open_event_of_type(PERF_TYPE_TRACEPOINT_, 0x5a17)
+}
+
+fn smoke_abi_perf_set_bpf_pos() -> TestResult {
+    with_setup(|| {
+        // `observability/PERF_LINUX_COMPAT_AUDIT.md` recorded this ioctl as
+        // returning ENOTTY, with the note that BPF should land only once its
+        // capability and safety story existed. This is that arm working.
+        let insns = ret_imm(1);
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &insns).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a filter program");
+        }
+        let ev = open_tracepoint_event().ok_or("could not open a tracepoint event")?;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, prog_fd as u64),
+        ) != Some(0)
+        {
+            return Err("SET_BPF on a tracepoint event was refused");
+        }
+        // Detaching with an all-ones fd is the SET_OUTPUT convention and must
+        // work here too, or a program can never be removed.
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, u64::from(u32::MAX)),
+        ) != Some(0)
+        {
+            return Err("detaching the program was refused");
+        }
+        let _ = call(Syscall::Close.raw(), a0(ev as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_perf_set_bpf_pos);
+
+fn smoke_abi_perf_set_bpf_neg() -> TestResult {
+    with_setup(|| {
+        let insns = ret_imm(1);
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &insns).ok_or("bpf() not Ok")?;
+
+        // A non-tracepoint event: refused, because NARF wires only the
+        // tracepoint type to its trace events, so the program could never run.
+        // Accepting it would be worse than refusing — a silently dead filter.
+        // `PERF_COUNT_SW_DUMMY` (9) — `perf_event.rs:1105` names it as the
+        // software event admitted for sideband use, which is what this needs: a
+        // *non-tracepoint* event that opens cleanly.
+        //
+        // Two earlier attempts were refused for good reasons worth recording.
+        // A tracepoint's id is not a valid software config (they are a small
+        // enumeration, not arbitrary ids). And `CPU_CLOCK` is deliberately
+        // refused for a pid target — it would report the whole CPU's time and
+        // fabricate attribution (`perf_event.rs:3595`).
+        let sw = open_event_of_type(PERF_TYPE_SOFTWARE_, 9).ok_or("no software event")?;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(sw as u64, PERF_EVENT_IOC_SET_BPF, prog_fd as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("SET_BPF on a software event was not refused");
+        }
+        let _ = call(Syscall::Close.raw(), a0(sw as u64));
+
+        // A bad fd, and an fd that is not a program.
+        let ev = open_tracepoint_event().ok_or("could not open a tracepoint event")?;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, 4095),
+        ) != Some(EINVAL)
+        {
+            return Err("SET_BPF with a bad fd did not return EINVAL");
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, ev as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("SET_BPF with a non-program fd did not return EINVAL");
+        }
+        let _ = call(Syscall::Close.raw(), a0(ev as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_perf_set_bpf_neg);

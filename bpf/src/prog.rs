@@ -391,3 +391,59 @@ impl BpfProg {
 /// The four scalar fields of the probe context tuple.
 static CTX_SCALARS: [narf_bpf_verifier::ArgDesc; MAX_CTX_WORDS] =
     [narf_bpf_verifier::ArgDesc::SCALAR64; MAX_CTX_WORDS];
+
+/// A loaded program behind an fd.
+///
+/// Anon-fd pattern, as `sys_eventfd` / `sys_memfd_create` use: an
+/// `Arc<dyn FileOps>` in an `FdEntry` with no backing file. Reads and writes are
+/// `Unsupported` — a prog fd is a handle, not a stream, and `read(2)` on one
+/// returns `-EINVAL` on Linux too.
+///
+/// Lives here rather than beside the `bpf(2)` handler because more than one
+/// caller needs to recover a program from a file descriptor —
+/// `BPF_PROG_TEST_RUN` and `PERF_EVENT_IOC_SET_BPF` — and a downcast only works
+/// if every one of them can name the concrete type. When it was private to the
+/// syscall module, perf had no way to express the downcast at all.
+#[derive(Debug)]
+pub struct ProgFile {
+    prog: Arc<BpfProg>,
+}
+
+impl ProgFile {
+    /// Wrap a loaded program for installation in an fd table.
+    #[must_use]
+    pub fn new(prog: Arc<BpfProg>) -> Self {
+        Self { prog }
+    }
+
+    /// The program behind this fd.
+    #[must_use]
+    pub fn prog(&self) -> Arc<BpfProg> {
+        Arc::clone(&self.prog)
+    }
+}
+
+impl narf_filesystem::FileOps for ProgFile {
+    fn read<'a>(
+        &'a self,
+        _offset: u64,
+        _buf: &'a mut [u8],
+    ) -> narf_filesystem::FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async { Err(narf_filesystem::FsError::Unsupported) })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async { Err(narf_filesystem::FsError::Unsupported) })
+    }
+    fn stat(&self) -> narf_filesystem::Stat {
+        narf_filesystem::Stat {
+            size: 0,
+            blocks: 0,
+            mode: narf_filesystem::Mode::FILE_RO,
+            mtime_cycles: 0,
+        }
+    }
+    /// The hook every fd-to-program recovery goes through.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+}

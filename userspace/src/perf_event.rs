@@ -741,6 +741,12 @@ const PERF_EVENT_IOC_RESET: u32 = 0x2403;
 const PERF_EVENT_IOC_PERIOD: u32 = 0x4008_2404;
 const PERF_EVENT_IOC_SET_OUTPUT: u32 = 0x2405;
 const PERF_EVENT_IOC_ID: u32 = 0x8008_2407;
+/// `_IOW('$', 8, __u32)` — attach a BPF program to this event.
+///
+/// `observability/PERF_LINUX_COMPAT_AUDIT.md` recorded this as returning
+/// ENOTTY, with the note that BPF should land only once its capability and
+/// safety story existed. It does now (`bpf/specification/spec.md` §4).
+const PERF_EVENT_IOC_SET_BPF: u32 = 0x4004_2408;
 const PERF_EVENT_IOC_PAUSE_OUTPUT: u32 = 0x4004_2409;
 const PERF_IOC_FLAG_GROUP: usize = 1;
 const PERF_MMAP_PAGE_BYTES: usize = 4096;
@@ -812,6 +818,14 @@ struct PerfEventFile {
     mmap_seq: AtomicU32,
     mmap: IrqSafeSpinLock<Option<PerfMmap>>,
     output_target: IrqSafeSpinLock<Option<Arc<dyn FileOps>>>,
+    /// A BPF program attached with `PERF_EVENT_IOC_SET_BPF`.
+    ///
+    /// Consulted in the tracepoint *drain*, not in the sample producer. The
+    /// producers (`capture_pending_sample`, `capture_trace`) run in PMI and IRQ
+    /// context and only stage into lock-free per-CPU rings; `drain_irq_samples`
+    /// runs from the syscall-return path, which is where a BPF program can be
+    /// run without inheriting NMI-safety constraints (spec §6.1).
+    bpf_prog: IrqSafeSpinLock<Option<Arc<narf_bpf::prog::BpfProg>>>,
     group_members: IrqSafeSpinLock<Vec<Weak<dyn FileOps>>>,
     // A member keeps its leader's open-file description alive. The leader
     // holds only weak member links, so this cannot form a reference cycle.
@@ -2637,6 +2651,40 @@ pub(crate) fn drain_irq_samples() {
                 event.count_accumulated.fetch_add(1, Ordering::AcqRel);
                 event.last_sample_period.store(1, Ordering::Release);
                 let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task) as u32;
+                // An attached BPF program filters the sample. A non-zero return
+                // means "keep it", matching Linux, where a zero return from a
+                // perf-attached program drops the record.
+                //
+                // Here rather than in the producer: `capture_trace` runs in IRQ
+                // context and only stages into a lock-free per-CPU ring, while
+                // this drain runs from the syscall-return path. Running the
+                // program here is what keeps NMI-safety out of the picture
+                // entirely (spec §6.1) — and the `raw` slice is already exactly
+                // the tracepoint argument blob a program expects as its context.
+                if let Some(prog) = event.bpf_prog.lock().as_ref() {
+                    let mut ctx = [0u64; narf_bpf::interp::MAX_CTX_WORDS];
+                    let words = raw.len() / 8;
+                    for (i, w) in ctx
+                        .iter_mut()
+                        .enumerate()
+                        .take(words.min(narf_bpf::interp::MAX_CTX_WORDS))
+                    {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&raw[i * 8..i * 8 + 8]);
+                        *w = u64::from_le_bytes(b);
+                    }
+                    let keep =
+                        match prog.run_atomic(ctx, words.min(narf_bpf::interp::MAX_CTX_WORDS)) {
+                            Some(o) => o.value() != 0,
+                            // Declined or trapped: keep the sample. Dropping data
+                            // because a filter could not run would silently lose
+                            // records, which is worse than an unfiltered one.
+                            None => true,
+                        };
+                    if !keep {
+                        continue;
+                    }
+                }
                 notify |= event.sample_record(ip, pid, task as u32, now, None, &[], raw);
                 notify |= event.consume_refresh();
             }
@@ -3240,6 +3288,38 @@ impl FileOps for PerfEventFile {
                     return Err(FsError::InvalidData);
                 }
                 self.output_paused.store(arg != 0, Ordering::Release);
+                Ok(0)
+            }
+            PERF_EVENT_IOC_SET_BPF => {
+                // `arg` is a BPF program fd. Same shape as SET_OUTPUT above:
+                // resolve it in the caller's table and downcast.
+                if arg == usize::MAX || arg == u32::MAX as usize {
+                    *self.bpf_prog.lock() = None;
+                    return Ok(0);
+                }
+                // Linux permits SET_BPF only on tracepoint, kprobe and uprobe
+                // events. NARF has only the tracepoint type wired to its trace
+                // events, so anything else would attach a program that could
+                // never run — reported rather than accepted silently.
+                if self.attr.type_ != PERF_TYPE_TRACEPOINT {
+                    return Err(FsError::InvalidData);
+                }
+                let ops = fd::with_table(current_task_id(), |table| {
+                    table.get(arg as u32).map(|entry| Arc::clone(&entry.ops))
+                })
+                .flatten()
+                .ok_or(FsError::InvalidData)?;
+                let prog = ops
+                    .as_any()
+                    .and_then(narf_bpf::prog_from_file_ops)
+                    .ok_or(FsError::InvalidData)?;
+                // An atomic-context program only: the drain holds
+                // PERF_EVENT_REGISTRY, so a sleepable program would be
+                // awaiting with a lock held (spec §4.4).
+                if prog.context() != narf_bpf_verifier::kfunc::Context::Atomic {
+                    return Err(FsError::InvalidData);
+                }
+                *self.bpf_prog.lock() = Some(prog);
                 Ok(0)
             }
             _ => Err(FsError::Unsupported),
@@ -3889,6 +3969,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             active_task_counters: IrqSafeSpinLock::new([None; narf_lib::percpu::MAX_CPUS]),
             #[cfg(target_arch = "aarch64")]
             active_task_counters: IrqSafeSpinLock::new([None; narf_lib::percpu::MAX_CPUS]),
+            bpf_prog: IrqSafeSpinLock::new(None),
             mmap_seq: AtomicU32::new(0),
             mmap: IrqSafeSpinLock::new(None),
             output_target: IrqSafeSpinLock::new(None),
