@@ -1502,3 +1502,70 @@ fn smoke_bpf_structops_adapter_is_the_trait() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_structops_adapter_is_the_trait);
+
+// ── XDP attach ──────────────────────────────────────────────────────
+
+fn smoke_bpf_xdp_program_decides() -> TestResult {
+    // The seam `net/src/bypass/classifier.rs` has named since it was written.
+    //
+    // The frame is *summarised* into the context tuple — length, then the first
+    // 24 bytes as three words — because the verifier has no packet-pointer
+    // class, so a program cannot dereference the frame. This checks that the
+    // summary is real: the program returns DROP only when the EtherType word
+    // matches, so a zeroed or misaligned context would show up as the wrong
+    // verdict rather than passing quietly.
+    use narf_net::bypass::classifier::{XdpAction, XdpProgram};
+
+    // ctx[2] holds frame bytes 8..16, which for an Ethernet frame spans the
+    // last 4 bytes of the source MAC and the EtherType. `if ctx[2] == K` then
+    // drop (1), else pass (2).
+    let insns = asm(&[
+        ldx(1, 1, 16), // r1 = ctx[2]
+        mov_imm(0, 2), // default: XDP_PASS
+        jne_imm(1, 0x11, 1),
+        mov_imm(0, 1), // XDP_DROP
+        EXIT,
+    ]);
+    let Ok(prog) = load("xdp", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected the XDP program");
+    };
+    let x = crate::attach_xdp::BpfXdp::for_test(prog, "test0");
+
+    // A frame whose bytes 8..16 are 0x11 followed by zeroes → matches → DROP.
+    let mut frame = [0u8; 64];
+    frame[8] = 0x11;
+    if x.run("test0", &frame) != XdpAction::Drop {
+        return TestResult::Fail("program did not see the frame summary");
+    }
+    // Change the matched byte → PASS. If the context were zeroed, both frames
+    // would take the same branch and this would be the failure.
+    frame[8] = 0x22;
+    if x.run("test0", &frame) != XdpAction::Pass {
+        return TestResult::Fail("verdict did not follow the frame contents");
+    }
+    // A short frame must not panic and must still be summarised — the tail is
+    // zero-padded, and ctx[0] stays the authority on how much is real.
+    if x.run("test0", &[0u8; 3]) != XdpAction::Pass {
+        return TestResult::Fail("a short frame was mishandled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_program_decides);
+
+fn smoke_bpf_xdp_unknown_action_aborts() -> TestResult {
+    // Linux treats an unrecognised XDP return as XDP_ABORTED. So does this: a
+    // program returning nonsense drops the frame *and is counted*, rather than
+    // being read as PASS — a broken filter that silently passes everything is
+    // the worst outcome available.
+    use narf_net::bypass::classifier::{XdpAction, XdpProgram};
+    let insns = asm(&[mov_imm(0, 99), EXIT]);
+    let Ok(prog) = load("xdp-bad", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected");
+    };
+    let x = crate::attach_xdp::BpfXdp::for_test(prog, "test1");
+    if x.run("test1", &[0u8; 64]) != XdpAction::Aborted {
+        return TestResult::Fail("an unknown action was not treated as aborted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_unknown_action_aborts);

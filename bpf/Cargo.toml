@@ -41,6 +41,7 @@ narf-rcu          = { path = "../rcu" }
 narf-arch         = { path = "../arch" }
 narf-capabilities = { path = "../capabilities" }
 narf-filesystem   = { path = "../filesystem" }
+narf-net          = { path = "../net" }
 narf-tracing      = { path = "../tracing" }
 narf-init         = { path = "../init" }
 narf-kernel-test  = { path = "../verification/kernel-test", optional = true }

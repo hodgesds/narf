@@ -19,16 +19,22 @@
 //! - `linux/net/core/dev.c::netif_receive_skb_core` — the classifier
 //!   hook XDP installs ahead of the network stack
 //!
-//! The classifier table is the base matching mechanism. NARF is growing an
-//! eBPF runtime (`bpf/`), and XDP-style programs attach here: a program runs
-//! ahead of both the daemon claim and the flow table, mirroring Linux's
-//! ordering in `netif_receive_skb_core`, and feeds the same table.
+//! The classifier table is the base matching mechanism, and XDP-style eBPF
+//! programs attach ahead of it — see [`install_xdp`]. A program runs before both
+//! the daemon claim and the flow table, mirroring Linux's ordering in
+//! `netif_receive_skb_core`.
+//!
+//! The attached surface is **read-only** and offers `Pass`/`Drop` only. Header
+//! rewriting, `XDP_TX` and `XDP_REDIRECT` need a `&mut [u8]` frame, which means
+//! widening `iface::RxHandler` and every driver RX path that feeds it — see
+//! [`XdpProgram`] for why that is deferred rather than done.
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use narf_capabilities::{Cap, CapType, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::umem::{Umem, UmemError};
@@ -136,6 +142,8 @@ pub enum ClassifyError {
     NoFillBuffer,
     /// Daemon already owns this iface.
     AlreadyAttached,
+    /// The capability presented for an XDP attach was revoked.
+    CapRevoked,
 }
 
 /// Install a per-flow claim. Returns a sequence id callers can use
@@ -243,10 +251,126 @@ pub fn is_poll_mode(iface_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ── XDP program attach ──────────────────────────────────────────────
+
+/// An eBPF program attached ahead of the bypass table.
+///
+/// The seam this module's header has named since it was written. Implemented by
+/// `narf-bpf`; declared here so `narf-net` keeps no dependency on the BPF
+/// subsystem, which is the same shape `PLUGGABILITY.md` uses everywhere else.
+///
+/// **Read-only.** Linux's XDP programs rewrite headers and can return `XDP_TX`
+/// or `XDP_REDIRECT`; those need a `&mut [u8]` frame, which means widening
+/// `RxHandler` (`iface.rs:468`) and every driver RX path that feeds it —
+/// virtio-net and e1000 both hand over an immutable borrow of a DMA buffer
+/// today. That refactor is deferred, so this surface offers `Pass`/`Drop` only,
+/// which is what filtering and drop-based mitigation need.
+pub trait XdpProgram: Send + Sync + 'static {
+    /// A name, for diagnostics.
+    fn name(&self) -> &str;
+    /// Decide the frame's fate. Must not block.
+    fn run(&self, iface: &str, frame: &[u8]) -> XdpAction;
+}
+
+/// What an [`XdpProgram`] decided.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum XdpAction {
+    /// Continue to the bypass table and then the kernel stack.
+    Pass,
+    /// Discard the frame.
+    Drop,
+    /// The program failed. Treated as [`XdpAction::Drop`] and counted
+    /// separately, matching Linux's `XDP_ABORTED`, so a broken program is
+    /// visible rather than merely quiet.
+    Aborted,
+}
+
+type XdpSlot = (alloc::string::String, alloc::boxed::Box<dyn XdpProgram>);
+static XDP_PROGS: IrqSafeSpinLock<Vec<XdpSlot>> = IrqSafeSpinLock::new(Vec::new());
+static XDP_ABORTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static XDP_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Attach `prog` to `iface`, replacing any program already there.
+///
+/// # Errors
+///
+/// [`ClassifyError::CapRevoked`] if the capability is not live.
+pub fn install_xdp<M: CapType>(
+    cap: &Cap<M, Grant>,
+    iface: alloc::string::String,
+    prog: alloc::boxed::Box<dyn XdpProgram>,
+) -> Result<(), ClassifyError> {
+    cap.check_live().map_err(|_| ClassifyError::CapRevoked)?;
+    let mut g = XDP_PROGS.lock();
+    g.retain(|(n, _)| *n != iface);
+    g.push((iface, prog));
+    Ok(())
+}
+
+/// Detach any program on `iface`. Returns whether one was removed.
+pub fn remove_xdp<M: CapType>(cap: &Cap<M, Grant>, iface: &str) -> Result<bool, ClassifyError> {
+    cap.check_live().map_err(|_| ClassifyError::CapRevoked)?;
+    let mut g = XDP_PROGS.lock();
+    let before = g.len();
+    g.retain(|(n, _)| n != iface);
+    Ok(g.len() != before)
+}
+
+/// (drops, aborts) attributed to XDP programs.
+#[must_use]
+pub fn xdp_stats() -> (u64, u64) {
+    (
+        XDP_DROPS.load(Ordering::Relaxed),
+        XDP_ABORTS.load(Ordering::Relaxed),
+    )
+}
+
+/// Run the attached program, if any.
+///
+/// The lock is dropped before the program runs. A program that reached back
+/// into this module would otherwise deadlock on a non-reentrant
+/// `IrqSafeSpinLock` — the same defect `tracing::dispatch::fire` had, and the
+/// reason it was reworked.
+fn run_xdp(iface: &str, frame: &[u8]) -> XdpAction {
+    // The program runs while `XDP_PROGS` is held. That is a deliberate,
+    // recorded limitation rather than an oversight: `Box<dyn XdpProgram>` is
+    // not clonable, so releasing the lock first would need an `Arc` — exactly
+    // the change `tracing::dispatch::fire` made for the same reason. It is safe
+    // only because the kfunc set a program can reach is closed and audited and
+    // contains nothing that re-enters this module. If that ever stops being
+    // true, this deadlocks on a non-reentrant lock, so switch to `Arc` before
+    // widening the kfunc set rather than after.
+    let action = {
+        let g = XDP_PROGS.lock();
+        match g.iter().find(|(n, _)| n == iface) {
+            Some((_, p)) => p.run(iface, frame),
+            None => return XdpAction::Pass,
+        }
+    };
+    match action {
+        XdpAction::Drop => {
+            XDP_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+        XdpAction::Aborted => {
+            XDP_ABORTS.fetch_add(1, Ordering::Relaxed);
+        }
+        XdpAction::Pass => {}
+    }
+    action
+}
+
 /// Classify an inbound L2 frame originating from `iface_name`.
 /// Returns the verdict and, if consumed, the frame is already
 /// staged into UMEM + posted to the RX ring of the chosen socket.
 pub fn classify(iface_name: &str, frame: &[u8]) -> Verdict {
+    // An XDP program runs first — ahead of the daemon claim and the flow
+    // table, mirroring Linux, where XDP sits in front of everything in
+    // `netif_receive_skb_core`.
+    match run_xdp(iface_name, frame) {
+        XdpAction::Drop | XdpAction::Aborted => return Verdict::Dropped,
+        XdpAction::Pass => {}
+    }
+
     // Whole-NIC daemon attach — pure forward, no L3 parse needed.
     if let Some(sock) = daemon_socket(iface_name) {
         return stage_into_socket(&sock, frame);
