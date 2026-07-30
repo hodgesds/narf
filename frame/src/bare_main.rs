@@ -1134,11 +1134,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 (s.free as u64) * narf_memory::PAGE_SIZE / (1024 * 1024)
             );
 
-            // Size the file page-cache reclaim watermark from RAM: reclaim
-            // clean cached pages once free memory falls below ~3% of total,
-            // mirroring Linux's watermark-driven reclaim rather than a fixed
-            // cap (the cache still keeps a hard-ceiling backstop). Sized here
+            // Size the file page-cache reclaim from RAM (Linux-shaped): let
+            // the cache grow to ~half of RAM as a hard backstop, but reclaim
+            // clean pages once free memory falls below ~3% of total so the
+            // *watermark*, not a fixed cap, is the primary limiter. Sized here
             // because total RAM is only known after the frame allocator inits.
+            narf_filesystem::page_cache::set_default_capacity_pages(s.total / 2);
             narf_filesystem::page_cache::set_low_watermark_pages(s.total / 32);
 
             // MMU handoff per console/ §3.1. The three-step sequence

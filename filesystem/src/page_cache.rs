@@ -50,6 +50,27 @@ const RECLAIM_BATCH_PAGES: usize = 256;
 /// makes parallel dynamic-linker reads cheap.
 const RECLAIM_FLOOR_PAGES: usize = 256;
 
+/// Process-global default hard-ceiling backstop, in pages, used by
+/// caches built with [`PageCache::new`]. Boot sizes this from total
+/// RAM (a large fraction) so the cache can grow to use available
+/// memory — the free-memory watermark, not this ceiling, is the
+/// primary limiter (Linux-shaped). A fixed 128 MiB start keeps a
+/// bound before boot wires the RAM-proportional value.
+static DEFAULT_CAP_PAGES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_RESIDENT_PAGES);
+
+/// Set the process-global default hard ceiling (pages) that
+/// [`PageCache::new`]-built caches use as their backstop. Boot sizes
+/// this from total RAM; a value of 0 makes those caches rely solely
+/// on the watermark (no hard ceiling).
+pub fn set_default_capacity_pages(pages: usize) {
+    DEFAULT_CAP_PAGES.store(pages, Ordering::Relaxed);
+}
+
+/// The current process-global default hard ceiling, in pages.
+pub fn default_capacity_pages() -> usize {
+    DEFAULT_CAP_PAGES.load(Ordering::Relaxed)
+}
+
 /// Free-frame low watermark, in pages. When the frame allocator
 /// reports fewer free pages than this, inserts reclaim clean pages.
 /// 0 disables watermark reclaim (only the hard ceiling applies) — the
@@ -135,7 +156,18 @@ struct Inner {
     /// giving referenced pages a second chance (bit cleared + requeued)
     /// and evicting the first cold, clean page it meets.
     clock: VecDeque<PageKey>,
+    /// Inserts since the last free-memory watermark probe. The probe
+    /// reads the frame allocator (a lock + sum), so it is rate-limited
+    /// to once per [`WATERMARK_CHECK_INTERVAL`] inserts rather than
+    /// hit on every 4 KiB read — otherwise it contends with the read
+    /// path's own frame allocations and measurably slows I/O.
+    since_watermark_check: usize,
 }
+
+/// Inserts between free-memory watermark probes. 64 pages (256 KiB of
+/// reads) keeps reclaim responsive while making the per-insert cost of
+/// the probe negligible.
+const WATERMARK_CHECK_INTERVAL: usize = 64;
 
 /// Unified page cache. A `BTreeMap` of page-sized entries under a
 /// single lock, reclaimed by CLOCK-LRU under a hard ceiling and a
@@ -150,17 +182,22 @@ pub struct PageCache {
 
 impl PageCache {
     pub const fn new() -> Self {
-        Self::with_capacity(DEFAULT_MAX_RESIDENT_PAGES)
+        // `usize::MAX` = "follow the process-global default ceiling"
+        // ([`set_default_capacity_pages`]), which boot sizes from RAM so
+        // the cache scales with available memory instead of a fixed cap.
+        Self::with_capacity(usize::MAX)
     }
 
     /// Construct a cache with an explicit resident-page ceiling.
-    /// A ceiling of 0 is treated as "unbounded" (no hard cap — only
-    /// watermark reclaim, if a watermark is set, applies).
+    /// `0` is "unbounded" (no hard cap — only watermark reclaim, if a
+    /// watermark is set, applies); `usize::MAX` follows the global
+    /// default ceiling; any other value is an explicit fixed ceiling.
     pub const fn with_capacity(max_pages: usize) -> Self {
         Self {
             inner: IrqSafeSpinLock::new(Inner {
                 pages: BTreeMap::new(),
                 clock: VecDeque::new(),
+                since_watermark_check: 0,
             }),
             max_pages,
         }
@@ -202,9 +239,15 @@ impl PageCache {
             }
         }
 
-        // Hard-ceiling backstop.
-        if self.max_pages != 0 {
-            while g.pages.len() > self.max_pages {
+        // Hard-ceiling backstop. `usize::MAX` follows the RAM-sized global
+        // default; `0` means unbounded (watermark reclaim only).
+        let cap = if self.max_pages == usize::MAX {
+            DEFAULT_CAP_PAGES.load(Ordering::Relaxed)
+        } else {
+            self.max_pages
+        };
+        if cap != 0 {
+            while g.pages.len() > cap {
                 if !Self::evict_one_cold_clean(&mut g) {
                     break; // nothing clean to shed
                 }
@@ -212,9 +255,13 @@ impl PageCache {
         }
 
         // Free-memory watermark reclaim (Linux-shaped). Only when a
-        // watermark is configured and the allocator is under it.
+        // watermark is configured and the allocator is under it. The
+        // free-memory probe is rate-limited (it locks the allocator), so
+        // it never rides every 4 KiB read.
         let low = LOW_WATERMARK_PAGES.load(Ordering::Relaxed);
-        if low > 0 {
+        g.since_watermark_check += 1;
+        if low > 0 && g.since_watermark_check >= WATERMARK_CHECK_INTERVAL {
+            g.since_watermark_check = 0;
             if let Some(free) = free_pages_available() {
                 if free < low {
                     let mut shed = 0;
@@ -229,33 +276,52 @@ impl PageCache {
         }
     }
 
-    /// One CLOCK sweep step: evict the first cold, clean page. Gives
-    /// referenced pages a second chance (clear bit + requeue) and skips
-    /// dirty pages (requeued — they still owe a writeback). Returns
-    /// `true` if a page was evicted, `false` if a full sweep found none.
+    /// One CLOCK sweep step: evict a cold, clean page. Gives referenced
+    /// pages a second chance (clear bit + requeue) and skips dirty pages
+    /// (requeued — they still owe a writeback). Returns `true` if a page
+    /// was evicted.
+    ///
+    /// The scan is bounded to a small constant window so eviction stays
+    /// O(1) regardless of cache size — a full-length CLOCK lap over a
+    /// mult-GiB cache on every insert-at-capacity would serialise I/O
+    /// (the boot-slowdown that starved udevd's start timeout). Within
+    /// the window a cold clean page is preferred; failing that, the
+    /// first clean page seen is evicted (recency-approximate, still
+    /// correctness-preserving) so progress is guaranteed and cheap.
     fn evict_one_cold_clean(inner: &mut Inner) -> bool {
-        let sweep = inner.clock.len();
-        // At most two laps: one to clear reference bits, one to evict.
-        for _ in 0..sweep.saturating_mul(2).saturating_add(1) {
+        const MAX_SCAN: usize = 128;
+        let scan = inner.clock.len().min(MAX_SCAN);
+        let mut fallback_clean: Option<PageKey> = None;
+        for _ in 0..scan {
             let Some(k) = inner.clock.pop_front() else {
-                return false;
+                break;
             };
             match inner.pages.get_mut(&k) {
                 None => { /* stale queue entry — drop it */ }
                 Some(slot) if slot.page.dirty => {
-                    // Un-evictable this round; keep it resident.
-                    inner.clock.push_back(k);
+                    inner.clock.push_back(k); // owes a writeback — keep
                 }
                 Some(slot) if slot.referenced => {
-                    // Second chance: clear the bit and requeue.
+                    // Second chance: clear the bit, requeue, remember it
+                    // as a clean fallback if the window yields no cold page.
                     slot.referenced = false;
+                    fallback_clean.get_or_insert(k);
                     inner.clock.push_back(k);
                 }
                 Some(_) => {
-                    inner.pages.remove(&k);
+                    inner.pages.remove(&k); // cold + clean → evict
                     return true;
                 }
             }
+        }
+        // No cold clean page in the window: evict the first clean one seen
+        // (it was requeued, so pull it back out).
+        if let Some(k) = fallback_clean {
+            if let Some(pos) = inner.clock.iter().position(|&q| q == k) {
+                inner.clock.remove(pos);
+            }
+            inner.pages.remove(&k);
+            return true;
         }
         false
     }

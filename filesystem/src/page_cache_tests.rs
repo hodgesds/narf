@@ -12,7 +12,8 @@ use alloc::sync::Arc;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::page_cache::{
-    set_free_pages_hook, set_low_watermark_pages, Page, PageCache, PageKey, PAGE_SIZE,
+    default_capacity_pages, set_default_capacity_pages, set_free_pages_hook,
+    set_low_watermark_pages, Page, PageCache, PageKey, PAGE_SIZE,
 };
 
 fn key(page_off: u64) -> PageKey {
@@ -157,6 +158,29 @@ fn smoke_page_cache_watermark_reclaim() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/page_cache", smoke_page_cache_watermark_reclaim);
+
+/// `PageCache::new()` follows the process-global default ceiling so
+/// the cache scales with the RAM-sized value boot installs, rather
+/// than a compile-time constant.
+fn smoke_page_cache_new_follows_global_default() -> TestResult {
+    reset_globals();
+    let saved = default_capacity_pages();
+    set_default_capacity_pages(4);
+    let cache = PageCache::new();
+    for i in 0..10 {
+        cache.insert(key(i), clean_page(0));
+    }
+    let n = cache.len();
+    set_default_capacity_pages(saved); // restore boot's RAM-sized value
+    if n != 4 {
+        return TestResult::Fail("new() did not honour the global default ceiling");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/page_cache",
+    smoke_page_cache_new_follows_global_default
+);
 
 /// A hard capacity of 0 with no watermark set is unbounded — the
 /// escape hatch for callers that manage lifetime themselves.
