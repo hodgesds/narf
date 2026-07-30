@@ -2271,6 +2271,9 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // SMP=16 — see condbcast_smoke above for the permanent-strand
         // regression pin.
         ("futex_contend_smoke", "futex-contend-ok"),
+        // Systemd Type=notify topology on live SMP: a service process pinned
+        // to CPU 1 wakes PID-1-like epoll_wait on CPU 0 with SCM credentials.
+        ("notify_epoll_smp_smoke", "notify-epoll-smp-ok"),
         // Linux-compat round 21: keyrings (add_key/request_key/keyctl).
         ("keyring_smoke", "keyring-ok"),
         // Linux-compat round 22: inotify real event delivery.

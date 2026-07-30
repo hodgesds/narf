@@ -3912,6 +3912,12 @@ fn boot_userspace_init() {
                     "condbcast_smoke",
                     narf_verification::NARF_CONDBCAST_SMOKE_ELF,
                 ),
+                // Systemd-style READY=1 datagram: a CPU-1 service wakes the
+                // CPU-0 manager's blocking epoll_wait and supplies SCM_CREDENTIALS.
+                (
+                    "notify_epoll_smp_smoke",
+                    narf_verification::NARF_NOTIFY_EPOLL_SMP_SMOKE_ELF,
+                ),
                 // Linux-compat round 21: keyrings (add_key/request_key/keyctl).
                 ("keyring_smoke", narf_verification::NARF_KEYRING_SMOKE_ELF),
                 // Linux-compat round 22: inotify real event delivery.

@@ -580,6 +580,7 @@ fn main() {
         "futex2_smoke",
         "futex_contend_smoke",
         "condbcast_smoke",
+        "notify_epoll_smp_smoke",
         "keyring_smoke",
         "inotify2_smoke",
         "fanotify_smoke",
