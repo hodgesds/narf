@@ -967,6 +967,33 @@ unsafe fn dealloc_large(ptr: NonNull<u8>, layout: Layout) {
     // `PhysAddr::new(ptr)` would treat the direct-map VA as a physical
     // address and free the wrong frame (buddy double-alloc) once the
     // high-half direct map is live.
+    // Every pointer `alloc_large` returns is a frame start, so it is page
+    // aligned. Anything else reaching here is a *small* block being freed with
+    // a layout larger than the one it was allocated with, and the consequence
+    // is not a leak — it hands the buddy a frame that is still carved into
+    // small blocks, several of which are on this slab's free lists. The buddy
+    // then reissues that frame for something else (a kernel stack, say), and
+    // its writes land on top of live free-list nodes.
+    //
+    // That is precisely the shape of the corruption this check was added to
+    // catch: a free-block canary clobbered with a *return address*, and KASAN
+    // reporting an 8-byte store into slab-poisoned memory from
+    // `buddy_alloc_frame_on` at an address just above the current stack
+    // pointer. Silent frame donation is unrecoverable and lands far from its
+    // cause, so refuse it loudly here where the caller is still on the stack.
+    //
+    // `assert!`, not `debug_assert!` — the builds where this matters are
+    // release builds, and this whole class of bug was invisible for exactly
+    // that reason.
+    assert!(
+        (ptr.as_ptr() as usize) % PAGE_SIZE_USIZE == 0,
+        "slab: large-free of a non-page-aligned pointer {:p} (layout {} B / align {}) — \
+         this is a small block being freed with a large layout, which would donate a \
+         still-carved frame to the buddy",
+        ptr.as_ptr(),
+        layout.size(),
+        layout.align(),
+    );
     let phys = crate::PhysAddr::from_kernel_ptr(ptr.as_ptr());
     let frame = PhysFrame::new(phys);
     let n_pages = layout.size().div_ceil(PAGE_SIZE_USIZE);
