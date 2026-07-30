@@ -134,8 +134,22 @@ impl Emit {
     /// ModRM + optional SIB/displacement for `[base + disp]`.
     fn modrm_mem(&mut self, reg: u8, base: u8, disp: i32) {
         let short = i8::try_from(disp).is_ok();
-        // rbp/r13 with mod=00 means RIP-relative or disp32-only, so a base of
-        // rbp always needs an explicit displacement byte even when it is zero.
+        // rbp/r13 with mod=00 means RIP-relative, so those bases need an
+        // explicit displacement byte even when it is zero — without it,
+        // `[r13 + 0]` encodes as a RIP-relative load and reads the wrong
+        // address entirely.
+        //
+        // **Currently unreachable through `narf_bpf::jit_glue`**, and mutation
+        // testing is how that was discovered: deleting this line broke nothing.
+        // The verifier requires stack offsets to be negative (so R10/rbp never
+        // has disp 0) and gate 5 restricts load bases to R10 and R1, and R1 is
+        // `rdi`. R7 maps to r13 and would reach it, but gate 5 blocks R7.
+        //
+        // Kept because it is correct and becomes live the moment gate 5
+        // relaxes — which happens as soon as map values or kfunc returns are
+        // emitted. Covered by `golden_r13_base_needs_a_displacement_byte`,
+        // which calls the emitter directly rather than pretending the
+        // differential sweep reaches it.
         let force_disp = (base & 7) == (hr::RBP & 7);
         let md = if disp == 0 && !force_disp {
             0x00
@@ -221,9 +235,16 @@ fn emit_shift(e: &mut Emit, wide: bool, op: AluOp, dst: u8, src: Source) {
     };
     match src {
         Source::Imm(v) => {
-            // BPF masks the shift count to the operand width; x86 does the
-            // same in hardware (mod 64 with REX.W, mod 32 without), so the
-            // low bits can be passed through as-is.
+            // Masking here is **cosmetic, not load-bearing**: x86 masks the
+            // count in hardware (mod 32 for a 32-bit operand, mod 64 with
+            // REX.W), so emitting an unmasked count would behave identically.
+            // Mutation testing proved it — changing the 32-bit mask to 63 was
+            // an *equivalent* mutant that no test could distinguish, because
+            // there is nothing to distinguish.
+            //
+            // Kept so a disassembly reads as the shift the program actually
+            // performs rather than one the CPU silently reinterprets. Do not
+            // mistake it for a correctness check.
             e.rex(wide, 0, dst);
             e.b(0xC1);
             e.modrm_rr(slash, dst);
@@ -458,6 +479,14 @@ fn emit_insn(
             dst,
             src,
         } => emit_mul(e, wide, host(dst), src),
+
+        Decoded::Neg { wide, dst } => {
+            // `neg r/m` — F7 /3. Included so the ALU differential sweep can be
+            // exhaustive over the operation space rather than skipping a hole.
+            e.rex(wide, 0, host(dst));
+            e.b(0xF7);
+            e.modrm_rr(3, host(dst));
+        }
 
         Decoded::Alu { wide, op, dst, src } => {
             let Some((slash, rr)) = alu_forms(op) else {

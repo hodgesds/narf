@@ -646,6 +646,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-bpf-isa",
+ "narf-bpf-jit",
  "narf-bpf-verifier",
  "narf-capabilities",
  "narf-filesystem",

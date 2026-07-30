@@ -1178,3 +1178,273 @@ fn smoke_bpf_jit_gates_reject_a_back_edge() -> TestResult {
     }
 }
 kernel_test_in!("bpf", smoke_bpf_jit_gates_reject_a_back_edge);
+
+// ── heavy differential coverage ─────────────────────────────────────
+//
+// Combinatorial sweeps rather than more hand-written cases. The dimensions
+// below are the ones that actually break a code generator:
+//
+//   * operand width — a 32-bit BPF op must zero-extend to 64, and the emitter
+//     relies on x86's 32-bit-write rule to do it;
+//   * register number — r8..r15 need REX.R/REX.B, and rbp/r13 need a forced
+//     displacement byte, so a bug can hide in half the register file;
+//   * boundary immediates — sign-extension of imm32 to 64 bits;
+//   * shift counts above the operand width, which hardware masks and the
+//     interpreter masks separately;
+//   * both edges of every predicate, signed and unsigned.
+//
+// Every case asserts `is_jited()` before comparing. Without that a case that
+// falls back compares the interpreter against itself and passes for free —
+// which is how the missing `ST`-immediate encoding was found.
+
+/// Load, require compilation, run both ways, compare.
+fn diff_case(name: &str, items: &[Decoded], ctx: [u64; 4]) -> Result<(), &'static str> {
+    let p = load(name, asm(items), Context::Atomic).map_err(|_| "load rejected")?;
+    if !p.is_jited() {
+        return Err("not compiled — the comparison would be vacuous");
+    }
+    match (p.run_atomic(ctx, 4), p.run_atomic_interpreted(ctx, 4)) {
+        (Some(Outcome::Returned(a)), Some(Outcome::Returned(b))) => {
+            if a == b {
+                Ok(())
+            } else {
+                Err("native and interpreted results differ")
+            }
+        }
+        (Some(Outcome::Trapped(_)), Some(Outcome::Trapped(_))) => Ok(()),
+        (None, _) | (_, None) => Err("a run was declined"),
+        _ => Err("one path trapped and the other did not"),
+    }
+}
+
+/// Immediates chosen for sign-extension and shift-count boundaries.
+const SWEEP_IMMS: [i32; 10] = [0, 1, -1, 2, -2, 7, 31, 32, 63, 64];
+/// Wider boundaries, for the operands rather than the counts.
+const SWEEP_VALS: [i32; 8] = [0, 1, -1, i32::MAX, i32::MIN, 0x7FFF, -0x8000, 0x5A5A_5A5A];
+
+const ALL_ALU: [AluOp; 9] = [
+    AluOp::Add,
+    AluOp::Sub,
+    AluOp::Mul,
+    AluOp::Or,
+    AluOp::And,
+    AluOp::Xor,
+    AluOp::Lsh,
+    AluOp::Rsh,
+    AluOp::Arsh,
+];
+
+const ALL_COND: [CondOp; 11] = [
+    CondOp::Eq,
+    CondOp::Ne,
+    CondOp::Gt,
+    CondOp::Ge,
+    CondOp::Lt,
+    CondOp::Le,
+    CondOp::Sgt,
+    CondOp::Sge,
+    CondOp::Slt,
+    CondOp::Sle,
+    CondOp::Set,
+];
+
+fn smoke_bpf_jit_diff_alu_sweep() -> TestResult {
+    // Every operation × both widths × immediate and register source × boundary
+    // operands. ~1150 cases.
+    for &op in &ALL_ALU {
+        for wide in [false, true] {
+            for &a in &SWEEP_VALS {
+                for &b in &SWEEP_IMMS {
+                    // Immediate source.
+                    let prog = [
+                        mov_imm(0, a),
+                        Decoded::Alu {
+                            wide,
+                            op,
+                            dst: r(0),
+                            src: Source::Imm(b),
+                        },
+                        EXIT,
+                    ];
+                    if diff_case("alu_i", &prog, [0; 4]).is_err() {
+                        return TestResult::Fail("ALU immediate sweep diverged");
+                    }
+                    // Register source.
+                    let prog = [
+                        mov_imm(0, a),
+                        mov_imm(1, b),
+                        Decoded::Alu {
+                            wide,
+                            op,
+                            dst: r(0),
+                            src: Source::Reg(r(1)),
+                        },
+                        EXIT,
+                    ];
+                    if diff_case("alu_r", &prog, [0; 4]).is_err() {
+                        return TestResult::Fail("ALU register sweep diverged");
+                    }
+                }
+            }
+        }
+    }
+    // Negate, both widths.
+    for wide in [false, true] {
+        for &a in &SWEEP_VALS {
+            let prog = [mov_imm(0, a), Decoded::Neg { wide, dst: r(0) }, EXIT];
+            if diff_case("neg", &prog, [0; 4]).is_err() {
+                return TestResult::Fail("negate sweep diverged");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_diff_alu_sweep);
+
+fn smoke_bpf_jit_diff_branch_sweep() -> TestResult {
+    // Every predicate × both widths × immediate and register source, with
+    // operands chosen so each predicate is exercised on both edges. Signed and
+    // unsigned matter here: BPF's `Gt` is unsigned, so -1 > 0 must be *true*
+    // natively and interpreted alike, and a JA/JG mix-up shows up only on a
+    // case like that.
+    let pairs: [(i32, i32); 7] = [
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (-1, 0),
+        (0, -1),
+        (i32::MIN, i32::MAX),
+        (0x5A5A, 0x5A5A),
+    ];
+    for &op in &ALL_COND {
+        for wide in [false, true] {
+            for &(a, b) in &pairs {
+                // `r0 = a; if r0 <op> b goto +1; r0 = 0xBAD; exit`
+                // The return value distinguishes taken from not-taken, so a
+                // wrong condition code changes the result rather than being
+                // invisible.
+                let prog = [
+                    mov_imm(0, a),
+                    Decoded::JumpCond {
+                        wide,
+                        op,
+                        dst: r(0),
+                        src: Source::Imm(b),
+                        off: 1,
+                    },
+                    mov_imm(0, 0x0BAD),
+                    EXIT,
+                ];
+                if diff_case("br_i", &prog, [0; 4]).is_err() {
+                    return TestResult::Fail("branch immediate sweep diverged");
+                }
+                let prog = [
+                    mov_imm(0, a),
+                    mov_imm(2, b),
+                    Decoded::JumpCond {
+                        wide,
+                        op,
+                        dst: r(0),
+                        src: Source::Reg(r(2)),
+                        off: 1,
+                    },
+                    mov_imm(0, 0x0BAD),
+                    EXIT,
+                ];
+                if diff_case("br_r", &prog, [0; 4]).is_err() {
+                    return TestResult::Fail("branch register sweep diverged");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_diff_branch_sweep);
+
+fn smoke_bpf_jit_diff_register_sweep() -> TestResult {
+    // Every general register as destination and as source. R6..R9 map to
+    // rbx/r13/r14/r15 — callee-saved and, for three of them, needing REX.B —
+    // so a prefix bug hides in half the register file. R10 is excluded: it is
+    // the read-only frame pointer and the verifier rejects writing it.
+    for d in 0..10u8 {
+        for sr in 0..10u8 {
+            let prog = [
+                mov_imm(d, 0x1234),
+                mov_imm(sr, 0x5678),
+                Decoded::Alu {
+                    wide: true,
+                    op: AluOp::Add,
+                    dst: r(d),
+                    src: Source::Reg(r(sr)),
+                },
+                mov_reg(0, d),
+                EXIT,
+            ];
+            if diff_case("regs", &prog, [0; 4]).is_err() {
+                return TestResult::Fail("register sweep diverged");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_diff_register_sweep);
+
+fn smoke_bpf_jit_diff_stack_and_ctx_sweep() -> TestResult {
+    // Frame offsets across the whole slot range, and every context word.
+    // rbp-relative addressing needs a forced displacement byte, and the
+    // disp8/disp32 boundary at -128 is where `modrm_mem` switches encodings —
+    // so both sides of it are swept.
+    for slot in 1..=24i16 {
+        let off = -8 * slot;
+        let prog = [
+            mov_imm(1, 0x4321),
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(10),
+                off,
+                src: Source::Reg(r(1)),
+            },
+            Decoded::Load {
+                size: Size::Dw,
+                sign_extend: false,
+                dst: r(0),
+                src: r(10),
+                off,
+            },
+            EXIT,
+        ];
+        if diff_case("stack", &prog, [0; 4]).is_err() {
+            return TestResult::Fail("stack offset sweep diverged");
+        }
+        // And an immediate store at the same offset.
+        let prog = [
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(10),
+                off,
+                src: Source::Imm(-99),
+            },
+            Decoded::Load {
+                size: Size::Dw,
+                sign_extend: false,
+                dst: r(0),
+                src: r(10),
+                off,
+            },
+            EXIT,
+        ];
+        if diff_case("stack_i", &prog, [0; 4]).is_err() {
+            return TestResult::Fail("immediate store sweep diverged");
+        }
+    }
+    for word in 0..4i16 {
+        let prog = [ldx(0, 1, word * 8), EXIT];
+        for ctx in [[0u64; 4], [1, 2, 3, 4], [u64::MAX, 0, 0x5A5A, 1]] {
+            if diff_case("ctx", &prog, ctx).is_err() {
+                return TestResult::Fail("context sweep diverged");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_diff_stack_and_ctx_sweep);

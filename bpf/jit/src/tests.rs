@@ -452,3 +452,33 @@ fn golden_store_immediate() {
         ],
     );
 }
+
+#[test]
+fn golden_r13_base_needs_a_displacement_byte() {
+    // `r0 = *(u64 *)(r7 + 0)`  →  mov rax, [r13+0]  →  49 8B 45 00
+    //
+    // R7 maps to r13, and r13 shares rm=101 with rbp: with mod=00 that
+    // encoding means *RIP-relative*, so omitting the displacement byte would
+    // read a completely different address. The `00` disp8 is what makes it a
+    // plain base+0 load.
+    //
+    // Tested here, through `compile` directly, because the in-kernel
+    // differential sweep cannot reach it: `jit_glue`'s gate 5 restricts load
+    // bases to R10 and R1, and the verifier forbids a zero stack offset — so
+    // no gate-passing program produces a zero-displacement rbp/r13 access.
+    // Mutation testing found that gap: deleting `force_disp` left all 40
+    // in-kernel smokes passing.
+    assert_body(
+        &[
+            Decoded::Load {
+                size: Size::Dw,
+                sign_extend: false,
+                dst: r(0),
+                src: r(7),
+                off: 0,
+            },
+            EXIT,
+        ],
+        &[0x49, 0x8B, 0x45, 0x00, 0xE9, 0, 0, 0, 0],
+    );
+}
