@@ -42,6 +42,349 @@ fn open_memfs_fd(path: &[u8]) -> Result<u32, &'static str> {
     }
 }
 
+// ── /proc/self/mountinfo: open/read reaches the live renderer ─────────
+// systemd synchronously rescans this file after each mount helper exits. It
+// is not enough for the userspace hook to format the right rows: the procfs
+// pathname, open fd, and read syscall must deliver non-empty content at
+// offset zero, including a mount that was just attached.
+fn smoke_abi_fsx2_proc_self_mountinfo_reads_content() -> TestResult {
+    with_setup(|| {
+        const TARGET: &[u8] = b"/abi-mountinfo-live\0";
+        let path = b"/proc/self/mountinfo\0";
+        let fstype = b"tmpfs\0";
+        // The kernel-test build does not run the normal boot hook wiring.
+        // `/proc/self` needs the live pid/task hooks before ProcFs can descend
+        // through the caller's per-pid directory.
+        narf_filesystem::procfs::install_proc_hooks(
+            crate::handlers::proc_current_pid,
+            crate::handlers::proc_list_pids,
+            crate::handlers::proc_task_info,
+        );
+        narf_filesystem::procfs::install_mountinfo_hook(crate::handlers::proc_ns_mountinfo);
+        narf_filesystem::procfs::install_mountinfo_generation_hook(
+            crate::handlers::proc_ns_mountinfo_generation,
+        );
+        if !narf_filesystem::registry()
+            .list()
+            .iter()
+            .any(|mount| mount == "/proc")
+        {
+            return Err("/proc mount vanished before mountinfo ABI test");
+        }
+        if mount_fstype(TARGET, fstype) != Some(0) {
+            return Err("mountinfo setup mount failed");
+        }
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3((-100i64) as u64, path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            Some(-2) => return Err("open /proc/self/mountinfo returned ENOENT"),
+            Some(-1) => return Err("open /proc/self/mountinfo returned the failure sentinel"),
+            Some(_) => return Err("open /proc/self/mountinfo returned an unexpected errno"),
+            None => return Err("open /proc/self/mountinfo did not return a Linux ABI result"),
+        };
+        let mut buf = [0u8; 4096];
+        let read = call(
+            Syscall::Read.raw(),
+            a2(fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let n = match read {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("read /proc/self/mountinfo returned no content"),
+        };
+        if core::str::from_utf8(&buf[..n])
+            .ok()
+            .is_some_and(|body| body.contains("/abi-mountinfo-live"))
+        {
+            Ok(())
+        } else {
+            Err("mountinfo read omitted the newly attached mount")
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_proc_self_mountinfo_reads_content
+);
+
+// Linux signals POLLPRI on an already-open mountinfo file whenever the
+// caller's mount namespace changes. libmount (and therefore systemd) uses
+// that edge to decide when it must rescan after a mount helper exits.
+fn smoke_abi_fsx2_proc_mountinfo_pollpri_after_mount_change() -> TestResult {
+    with_setup(|| {
+        let path = b"/proc/self/mountinfo\0";
+        let fstype = b"tmpfs\0";
+        let target = b"/abi-mountinfo-poll-edge\0";
+        narf_filesystem::procfs::install_proc_hooks(
+            crate::handlers::proc_current_pid,
+            crate::handlers::proc_list_pids,
+            crate::handlers::proc_task_info,
+        );
+        narf_filesystem::procfs::install_mountinfo_hook(crate::handlers::proc_ns_mountinfo);
+        narf_filesystem::procfs::install_mountinfo_generation_hook(
+            crate::handlers::proc_ns_mountinfo_generation,
+        );
+
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3((-100i64) as u64, path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("open /proc/self/mountinfo before its change failed"),
+        };
+        let file = crate::fd::with_table(FAKE_TASK, |table| {
+            table.get(fd).map(|entry| entry.ops.clone())
+        })
+        .flatten()
+        .ok_or("mountinfo fd was not installed")?;
+        if file.poll_readiness() & narf_filesystem::POLL_PRI != 0 {
+            return Err("a fresh mountinfo fd must not report a stale POLLPRI edge");
+        }
+        if mount_fstype(target, fstype) != Some(0) {
+            return Err("mount change setup failed");
+        }
+        let changed = file.poll_readiness();
+        if changed & (narf_filesystem::POLL_PRI | narf_filesystem::POLL_ERR)
+            != narf_filesystem::POLL_PRI | narf_filesystem::POLL_ERR
+        {
+            return Err("mountinfo must report POLLPRI|POLLERR after a mount-table change");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_proc_mountinfo_pollpri_after_mount_change
+);
+
+// libmount registers the already-open mountinfo file for EPOLLIN|EPOLLET,
+// drains its initial readable event, then relies on Linux's unconditional
+// POLLERR mount-change edge to re-wake the monitor after a mount helper exits.
+// Exercise those exact flags through the syscall ABI rather than calling
+// FileOps directly.
+fn smoke_abi_fsx2_proc_mountinfo_libmount_epollet_after_mount_change() -> TestResult {
+    with_setup(|| {
+        let path = b"/proc/self/mountinfo\0";
+        let fstype = b"tmpfs\0";
+        let target = b"/abi-mountinfo-epoll-edge\0";
+        narf_filesystem::procfs::install_proc_hooks(
+            crate::handlers::proc_current_pid,
+            crate::handlers::proc_list_pids,
+            crate::handlers::proc_task_info,
+        );
+        narf_filesystem::procfs::install_mountinfo_hook(crate::handlers::proc_ns_mountinfo);
+        narf_filesystem::procfs::install_mountinfo_generation_hook(
+            crate::handlers::proc_ns_mountinfo_generation,
+        );
+
+        let mountinfo_fd = match call(
+            Syscall::Openat.raw(),
+            a3((-100i64) as u64, path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open /proc/self/mountinfo for epoll failed"),
+        };
+        let epfd = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("epoll_create1 failed"),
+        };
+        let mut interest = [0u8; 12];
+        interest[..4]
+            .copy_from_slice(&(crate::epoll::EPOLLIN | crate::epoll::EPOLLET).to_ne_bytes());
+        interest[4..].copy_from_slice(&0x4d4f554e545f5052_u64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            SyscallArgs {
+                arg0: epfd,
+                arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+                arg2: mountinfo_fd,
+                arg3: interest.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("epoll_ctl(ADD, EPOLLIN|EPOLLET mountinfo) failed");
+        }
+        let mut events = [0u8; 12];
+        let initial = call(
+            Syscall::EpollWait.raw(),
+            SyscallArgs {
+                arg0: epfd,
+                arg1: events.as_mut_ptr() as u64,
+                arg2: 1,
+                ..Default::default()
+            },
+        );
+        let initial_mask = u32::from_ne_bytes(events[..4].try_into().unwrap());
+        if initial != Some(1) || initial_mask & crate::epoll::EPOLLIN == 0 {
+            return Err("libmount must receive mountinfo's initial EPOLLIN edge");
+        }
+        if call(
+            Syscall::EpollWait.raw(),
+            SyscallArgs {
+                arg0: epfd,
+                arg1: events.as_mut_ptr() as u64,
+                arg2: 1,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("drained mountinfo EPOLLET monitor must be quiet before a change");
+        }
+        if mount_fstype(target, fstype) != Some(0) {
+            return Err("mount change setup failed");
+        }
+        let ready = call(
+            Syscall::EpollWait.raw(),
+            SyscallArgs {
+                arg0: epfd,
+                arg1: events.as_mut_ptr() as u64,
+                arg2: 1,
+                ..Default::default()
+            },
+        );
+        let event_mask = u32::from_ne_bytes(events[..4].try_into().unwrap());
+        let _ = call(Syscall::Close.raw(), a0(epfd));
+        let _ = call(Syscall::Close.raw(), a0(mountinfo_fd));
+        if ready == Some(1) && event_mask & crate::epoll::EPOLLERR != 0 {
+            Ok(())
+        } else {
+            Err("mountinfo generation change must re-wake libmount via EPOLLERR")
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_proc_mountinfo_libmount_epollet_after_mount_change
+);
+
+// systemd puts libmount's EPOLLIN|EPOLLET mountinfo monitor inside its
+// manager epoll. A passive readiness query of that nested epoll must not
+// consume the mountinfo change before libmount drains the inner epoll after
+// SIGCHLD. This is the topology used by mount_sigchld_event().
+fn smoke_abi_fsx2_proc_mountinfo_nested_epoll_preserves_change() -> TestResult {
+    with_setup(|| {
+        let path = b"/proc/self/mountinfo\0";
+        let fstype = b"tmpfs\0";
+        let target = b"/abi-mountinfo-nested-epoll-edge\0";
+        narf_filesystem::procfs::install_proc_hooks(
+            crate::handlers::proc_current_pid,
+            crate::handlers::proc_list_pids,
+            crate::handlers::proc_task_info,
+        );
+        narf_filesystem::procfs::install_mountinfo_hook(crate::handlers::proc_ns_mountinfo);
+        narf_filesystem::procfs::install_mountinfo_generation_hook(
+            crate::handlers::proc_ns_mountinfo_generation,
+        );
+
+        let mountinfo_fd = match call(
+            Syscall::Openat.raw(),
+            a3((-100i64) as u64, path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open /proc/self/mountinfo for nested epoll failed"),
+        };
+        let inner = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("inner epoll_create failed"),
+        };
+        let outer = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("outer epoll_create failed"),
+        };
+        let mut mount_interest = [0u8; 12];
+        mount_interest[..4]
+            .copy_from_slice(&(crate::epoll::EPOLLIN | crate::epoll::EPOLLET).to_ne_bytes());
+        mount_interest[4..].copy_from_slice(&0x4d4f554e545f4e53_u64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            SyscallArgs {
+                arg0: inner,
+                arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+                arg2: mountinfo_fd,
+                arg3: mount_interest.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("inner epoll_ctl(ADD, mountinfo) failed");
+        }
+        let mut outer_interest = [0u8; 12];
+        outer_interest[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+        outer_interest[4..].copy_from_slice(&0x4d4f554e545f4f55_u64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            SyscallArgs {
+                arg0: outer,
+                arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+                arg2: inner,
+                arg3: outer_interest.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("outer epoll_ctl(ADD, libmount monitor) failed");
+        }
+        let mut events = [0u8; 12];
+        // libmount drains the ordinary initial EPOLLIN edge before the
+        // manager begins its event loop.
+        if call(
+            Syscall::EpollWait.raw(),
+            SyscallArgs {
+                arg0: inner,
+                arg1: events.as_mut_ptr() as u64,
+                arg2: 1,
+                ..Default::default()
+            },
+        ) != Some(1)
+        {
+            return Err("inner mountinfo monitor must receive its initial edge");
+        }
+        if mount_fstype(target, fstype) != Some(0) {
+            return Err("nested epoll mount change setup failed");
+        }
+        let outer_ready = call(
+            Syscall::EpollWait.raw(),
+            SyscallArgs {
+                arg0: outer,
+                arg1: events.as_mut_ptr() as u64,
+                arg2: 1,
+                ..Default::default()
+            },
+        );
+        let outer_mask = u32::from_ne_bytes(events[..4].try_into().unwrap());
+        let inner_ready = call(
+            Syscall::EpollWait.raw(),
+            SyscallArgs {
+                arg0: inner,
+                arg1: events.as_mut_ptr() as u64,
+                arg2: 1,
+                ..Default::default()
+            },
+        );
+        let inner_mask = u32::from_ne_bytes(events[..4].try_into().unwrap());
+        let _ = call(Syscall::Close.raw(), a0(outer));
+        let _ = call(Syscall::Close.raw(), a0(inner));
+        let _ = call(Syscall::Close.raw(), a0(mountinfo_fd));
+        if outer_ready == Some(1)
+            && outer_mask & crate::epoll::EPOLLIN != 0
+            && inner_ready == Some(1)
+            && inner_mask & crate::epoll::EPOLLERR != 0
+        {
+            Ok(())
+        } else {
+            Err("nested epoll probe must leave the mountinfo change for libmount to drain")
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_proc_mountinfo_nested_epoll_preserves_change
+);
+
 // ── setxattr: EFAULT on a NULL path pointer ───────────────────────────
 //
 // sys_setxattr → xattr_user_path(arg0); a 0/zero pointer yields None →
@@ -624,6 +967,72 @@ fn smoke_abi_fsx2_mount_bind_subdir_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_subdir_pos);
+
+// mount(2) resolves both source and target symlinks before attaching a bind
+// mount. Fedora's /var/mail -> spool/mail exercises this during the
+// accounts-daemon sandbox setup: binding the symlink inode would make it a
+// file-rooted mount and later namespace operations fail with EINVAL.
+fn smoke_abi_fsx2_mount_bind_symlink_directory_pos() -> TestResult {
+    with_setup(|| {
+        let source = b"none\0";
+        let root = b"/abi-bind-symlink\0";
+        let tmpfs = b"tmpfs\0";
+        let mount = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: root.as_ptr() as u64,
+            arg2: tmpfs.as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), mount) != Some(0) {
+            return Err("symlink-bind source tmpfs setup mount failed");
+        }
+
+        let actual = b"/abi-bind-symlink/spool\0";
+        if call(Syscall::Mkdir.raw(), a2(actual.as_ptr() as u64, 0o755, 0)) != Some(0) {
+            return Err("symlink-bind destination directory creation failed");
+        }
+        let target = b"spool\0";
+        let link = b"/abi-bind-symlink/mail\0";
+        if call_symlink(target.as_ptr() as u64, link.as_ptr() as u64) != Some(0) {
+            return Err("symlink-bind source symlink creation failed");
+        }
+
+        const MS_BIND: u64 = 1 << 12;
+        let bind = SyscallArgs {
+            arg0: link.as_ptr() as u64,
+            arg1: link.as_ptr() as u64,
+            arg2: 0,
+            arg3: MS_BIND,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), bind) != Some(0) {
+            return Err("bind mount through a directory symlink must succeed");
+        }
+
+        let canonical_is_dir = narf_filesystem::registry()
+            .with_mount("/abi-bind-symlink/spool", |fs| fs.root_file().is_none())
+            .unwrap_or(false);
+        let raw_symlink_was_not_mounted = !narf_filesystem::registry()
+            .list()
+            .iter()
+            .any(|path| path == "/abi-bind-symlink/mail");
+        // These mounts live in the global registry in this ABI smoke. Pop
+        // them before returning so later tests start from the documented
+        // empty mount view.
+        let _ = call(Syscall::Umount2.raw(), a1(actual.as_ptr() as u64, 0));
+        let _ = call(Syscall::Umount2.raw(), a1(link.as_ptr() as u64, 0));
+        let _ = call(Syscall::Umount2.raw(), a1(root.as_ptr() as u64, 0));
+        if canonical_is_dir && raw_symlink_was_not_mounted {
+            Ok(())
+        } else {
+            Err("bind mount must attach at the directory resolved through source and target symlinks")
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_mount_bind_symlink_directory_pos
+);
 
 fn smoke_abi_fsx2_mount_bind_file_to_self_pos() -> TestResult {
     with_memfs(
@@ -1405,4 +1814,69 @@ fn smoke_abi_fsx2_new_mount_api_chain_registers_pos() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_fsx2_new_mount_api_chain_registers_pos
+);
+
+// `mount(8)` may address its destination through an O_PATH handle, using
+// `/proc/self/fd/N` as move_mount(2)'s `to_path`.  This must name the opened
+// directory, not a literal procfs path: systemd verifies the resulting mount
+// in its own `/proc/self/mountinfo` immediately after the helper exits.
+fn smoke_abi_fsx2_new_mount_api_procfd_target_pos() -> TestResult {
+    with_setup(|| {
+        let destination = b"/abi-newapi-procfd-target\0";
+        if mount_fstype(destination, b"tmpfs\0") != Some(0) {
+            return Err("could not create a directory to address through an fd");
+        }
+        let dirfd = match call_open(destination.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open of new-mount destination should return a directory fd"),
+        };
+
+        let fsname = b"debugfs\0";
+        let fsfd = match call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("fsopen(debugfs) should return a context fd"),
+        };
+        let create = SyscallArgs {
+            arg0: fsfd,
+            arg1: FSCONFIG_CMD_CREATE,
+            ..Default::default()
+        };
+        if call(Syscall::Fsconfig.raw(), create) != Some(0) {
+            return Err("fsconfig(CMD_CREATE) for debugfs should succeed");
+        }
+        let mountfd = match call(Syscall::Fsmount.raw(), a2(fsfd, 0, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("fsmount(debugfs) should return a detached mount fd"),
+        };
+
+        let procfd_target = alloc::format!("/proc/self/fd/{dirfd}");
+        let mut procfd_target_c = procfd_target.into_bytes();
+        procfd_target_c.push(0);
+        let empty = b"\0";
+        let move_args = SyscallArgs {
+            arg0: mountfd,
+            arg1: empty.as_ptr() as u64,
+            arg2: (-100i64) as u64, // AT_FDCWD
+            arg3: procfd_target_c.as_ptr() as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        let moved = call(Syscall::MoveMount.raw(), move_args) == Some(0);
+        let _ = call(Syscall::Close.raw(), a0(dirfd));
+        let visible_type = narf_filesystem::registry()
+            .resolve_absolute("/abi-newapi-procfd-target", |fs, _| {
+                alloc::string::String::from(fs.name())
+            })
+            .as_deref()
+            == Some("debugfs");
+        if moved && visible_type {
+            Ok(())
+        } else {
+            Err("move_mount(/proc/self/fd/N) must attach at the opened directory")
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_new_mount_api_procfd_target_pos
 );

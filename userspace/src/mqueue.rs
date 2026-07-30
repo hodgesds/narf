@@ -472,8 +472,8 @@ fn with_inotify<R>(f: impl FnOnce(&mut BTreeMap<u64, InotifyState>) -> R) -> R {
 // The fd table stores only an `Arc<dyn FileOps>`, so sys_write (which has
 // just an fd) can't recover the file's path to fire IN_MODIFY. We record
 // (task, fd) → absolute path at open and consult it on write; close drops
-// the entry. This is best-effort (dup/dup2 don't propagate it), which is
-// all inotify needs.
+// the entry. The path is part of descriptor identity, so every duplication
+// path preserves it as well; *at syscalls also rely on it for directory fds.
 type FdPathIdentity = (String, Option<u64>);
 static FD_PATHS: IrqSafeSpinLock<Option<BTreeMap<(u64, u32), FdPathIdentity>>> =
     IrqSafeSpinLock::new(None);
@@ -494,6 +494,20 @@ pub(crate) fn register_fd_path(task: u64, fd: u32, path: &str, mount_id: Option<
 pub(crate) fn forget_fd_path(task: u64, fd: u32) {
     with_fd_paths(|m| {
         m.remove(&(task, fd));
+    });
+}
+
+/// Duplicate (or replace) a descriptor's pathname identity.
+///
+/// `dup2`/`dup3` may replace an existing destination, so an untracked source
+/// must explicitly clear any former identity at the destination.
+pub(crate) fn duplicate_fd_path(task: u64, source_fd: u32, destination_fd: u32) {
+    with_fd_paths(|m| {
+        if let Some(identity) = m.get(&(task, source_fd)).cloned() {
+            m.insert((task, destination_fd), identity);
+        } else {
+            m.remove(&(task, destination_fd));
+        }
     });
 }
 

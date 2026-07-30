@@ -7,11 +7,13 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
     let uargs = args.arg0;
     let size = args.arg1 as usize;
     #[cfg(feature = "syscall-trace")]
-    narf_console::write_str(&alloc::format!(
-        "[CLONE3 uargs={:#x} size={}]\n",
-        uargs,
-        size
-    ));
+    if crate::syscall::syscall_trace_target_task() {
+        narf_console::write_str(&alloc::format!(
+            "[CLONE3 uargs={:#x} size={}]\n",
+            uargs,
+            size
+        ));
+    }
     if uargs == 0 || size < 8 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -38,14 +40,16 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
     // SAFETY: Valid memory or trusted environment
     let ca: CloneArgs = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const CloneArgs) };
     #[cfg(feature = "syscall-trace")]
-    narf_console::write_str(&alloc::format!(
-        "[CLONE3 flags={:#x} pidfd_ptr={:#x} cgroup_fd={} stack={:#x}+{:#x}]\n",
-        ca.flags,
-        ca.pidfd,
-        ca.cgroup,
-        ca.stack,
-        ca.stack_size
-    ));
+    if crate::syscall::syscall_trace_target_task() {
+        narf_console::write_str(&alloc::format!(
+            "[CLONE3 flags={:#x} pidfd_ptr={:#x} cgroup_fd={} stack={:#x}+{:#x}]\n",
+            ca.flags,
+            ca.pidfd,
+            ca.cgroup,
+            ca.stack,
+            ca.stack_size
+        ));
+    }
     do_clone3(ctx, ca);
 }
 

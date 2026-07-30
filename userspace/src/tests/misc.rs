@@ -1655,6 +1655,63 @@ fn smoke_userspace_park_io_wait_fallback_backstop() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_park_io_wait_fallback_backstop);
 
+/// A global readiness notification that races an epoll/poll waiter's
+/// registration is not evidence that *this* interest set is ready.  The
+/// waiter must remain parked (with its generation refreshed) so unrelated
+/// AF_UNIX or network activity cannot turn an infinite wait into a tight
+/// return-to-userspace loop.  A true missed source-specific wake is bounded by
+/// the established 10 ms backstop above.
+fn smoke_userspace_io_generation_race_keeps_wait_parked() -> TestResult {
+    use crate::user_task::{refresh_io_wait_generation_after_registration, UserTaskCtx};
+    use core::sync::atomic::Ordering;
+
+    let ctx = UserTaskCtx::new();
+    ctx.net_io_wait.store(true, Ordering::Release);
+    ctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+    ctx.epoll_park_gen.store(41, Ordering::Release);
+
+    // Simulate an unrelated readiness notification in the scan→register
+    // window.  The handler has already registered the waker; it must not
+    // clear the park state and synchronously return 0 from epoll_wait.
+    refresh_io_wait_generation_after_registration(&ctx, 42);
+
+    if !ctx.net_io_wait.load(Ordering::Acquire)
+        || ctx.sleep_deadline_ns.load(Ordering::Acquire) != u64::MAX
+    {
+        return TestResult::Fail("global readiness race cancelled an I/O park");
+    }
+    if ctx.epoll_park_gen.load(Ordering::Acquire) != 42 {
+        return TestResult::Fail("I/O park did not refresh its readiness generation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_io_generation_race_keeps_wait_parked
+);
+
+/// An own-stack task parks by `kernel_switch`, not the legacy longjmp hook.
+/// Requiring that hook before considering the own-stack path turns an
+/// infinite `epoll_wait` into a tight stream of successful empty returns.
+fn smoke_userspace_own_stack_park_does_not_require_legacy_hook() -> TestResult {
+    use crate::epoll::can_park_with_task_context;
+
+    if !can_park_with_task_context(true, false) {
+        return TestResult::Fail("own-stack park incorrectly requires legacy yield hook");
+    }
+    if !can_park_with_task_context(false, true) {
+        return TestResult::Fail("legacy park with a yield hook was rejected");
+    }
+    if can_park_with_task_context(false, false) {
+        return TestResult::Fail("park without own-stack or legacy hook was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_own_stack_park_does_not_require_legacy_hook
+);
+
 /// Multi-threaded `exit_group` must run PROCESS-scoped exit observers
 /// EXACTLY ONCE — on the group's last thread (`group_dead`) — while
 /// THREAD-scoped observers run for EVERY thread. This is Linux's

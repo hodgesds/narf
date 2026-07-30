@@ -30,7 +30,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::fd;
 use crate::handlers::{
     apply_chroot, copy_user_cstr, current_clone_mount_subtree, current_clone_tree_at,
-    current_fs_arc_at, current_mount_arc, current_task_id, fd_path_for_task,
+    current_fs_arc_at, current_mount_arc, current_task_id, fd_path_for_task, parse_proc_self_fd,
 };
 use crate::syscall::{SyscallReturn, TrapContext};
 
@@ -403,7 +403,17 @@ pub fn sys_move_mount(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let target = apply_chroot(&to_path);
+    // mount(8) commonly creates the target directory as an O_PATH fd and
+    // gives move_mount() its `/proc/self/fd/N` magic-link spelling.  Resolve
+    // that spelling before applying the task root, just as sys_mount does:
+    // attaching it literally below procfs makes the syscall report success
+    // while systemd's subsequent /proc/self/mountinfo scan cannot find its
+    // `Where=` path.
+    let target_path = parse_proc_self_fd(to_path.as_str())
+        .and_then(|fd| fd_path_for_task(task, fd))
+        .filter(|path| path.starts_with('/'))
+        .unwrap_or(to_path);
+    let target = apply_chroot(&target_path);
     let auth = narf_filesystem::bootstrap_mount_authority();
     if current_mount_arc(&auth, &target, mount.fs).is_err() {
         ctx.set_return(err(EBUSY));
@@ -425,8 +435,8 @@ pub fn sys_move_mount(ctx: &mut dyn TrapContext) {
     ctx.set_return(ok(0));
 }
 
-/// `open_tree(dfd, path, flags)` → detached-mount fd cloning the mount that
-/// covers `path` (so it can be re-attached elsewhere with move_mount).
+/// `open_tree(dfd, path, flags)` → an O_PATH fd to `path`, or a detached
+/// mount fd when `OPEN_TREE_CLONE` requests a clone for `move_mount`.
 pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let task = current_task_id();
@@ -473,6 +483,27 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
             }
             return;
         }
+    }
+    // Linux's non-cloning open_tree form is an O_PATH acquisition, not a
+    // detached mount object. systemd uses it for automount-triggering path
+    // walking, then passes the returned directory fd to mkdirat() while
+    // creating mount points. Reuse the real openat resolver so dirfd,
+    // chroot, FD_CLOEXEC and fd-path identity have their normal semantics.
+    // A detached mount-object fd and AT_EMPTY_PATH retain the specialized
+    // handling below.
+    if a.arg2 & OPEN_TREE_CLONE == 0 && !raw_path.is_empty() {
+        const O_PATH: u64 = 0o10000000;
+        const O_NOFOLLOW: u64 = 0o400000;
+        const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+        let flags = O_PATH
+            | (a.arg2 & OPEN_TREE_CLOEXEC)
+            | if a.arg2 & AT_SYMLINK_NOFOLLOW != 0 {
+                O_NOFOLLOW
+            } else {
+                0
+            };
+        crate::handlers::handler_sys_openat::sys_openat_with_flags(ctx, flags);
+        return;
     }
     // open_tree is an *at syscall: an empty path names dfd itself when the
     // caller supplies the fd-addressed form, and a relative path is resolved

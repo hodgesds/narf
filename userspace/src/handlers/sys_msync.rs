@@ -1,8 +1,9 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// `msync(addr, len, flags)` — anonymous mappings have nothing to
-/// write back; just validate the range starts inside a mapping.
+/// `msync(addr, len, flags)` — validate the range and commit fallback
+/// file-backed MAP_SHARED pages. Anonymous and device mappings need no
+/// writeback here.
 pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let addr = a.arg0;
@@ -14,7 +15,10 @@ pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
         .map(|as_ref| as_ref.lookup(VirtAddr::new(addr)).is_some())
         .unwrap_or(false);
     if mapped {
-        ctx.set_return(SyscallReturn::ok(0));
+        match crate::mapped_file::flush_current_range(addr, a.arg1) {
+            Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(()) => ctx.set_return(SyscallReturn::ok((-5i64) as u64)), // -EIO
+        }
     } else {
         ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
     }

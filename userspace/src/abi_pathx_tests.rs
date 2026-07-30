@@ -420,6 +420,33 @@ fn smoke_abi_pathx_newfstatat_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_newfstatat_pos);
 
+// systemd-journald creates its runtime journal, enumerates the containing
+// directory, then describes each entry through `newfstatat(dirfd, name,
+// AT_SYMLINK_NOFOLLOW)`. The lookup must be relative to the real directory
+// fd, rather than to the task cwd.
+fn smoke_abi_pathx_newfstatat_relative_dirfd() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let dir = b"/p2\0";
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("opening the newfstatat parent directory failed"),
+        };
+        let name = b"f\0";
+        let mut sb = [0u8; 256];
+        match call(
+            Syscall::Newfstatat.raw(),
+            a3(dfd, name.as_ptr() as u64, sb.as_mut_ptr() as u64, 0x100),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("newfstatat(dirfd, relative path) should find the directory entry"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_newfstatat_relative_dirfd);
+
 fn smoke_abi_pathx_newfstatat_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/nope\0";
@@ -492,6 +519,106 @@ fn smoke_abi_pathx_openat2_opath_dirfd_mkdirat() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_opath_dirfd_mkdirat);
+
+// `openat2` has the same dirfd-relative lookup contract as `openat`.  The
+// systemd mount-unit path walker obtains a parent directory this way before
+// calling mkdirat for the final mount-point component.
+fn smoke_abi_pathx_openat2_relative_dirfd() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let parent = b"/p2\0";
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, parent.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(parent) did not return a directory fd"),
+        };
+        let child = b"f\0";
+        let how = [0u8; 24]; // O_RDONLY, mode=0, resolve=0.
+        match call(
+            Syscall::Openat2.raw(),
+            a3(dfd, child.as_ptr() as u64, how.as_ptr() as u64, 24),
+        ) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("openat2(dirfd, relative path) should resolve below dirfd"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_relative_dirfd);
+
+// All descriptor duplication APIs preserve the identity of a directory fd.
+// systemd passes such duplicated O_PATH fds to mkdirat() while preparing
+// mount points; losing this identity turns a live descriptor into EBADF.
+fn smoke_abi_pathx_duplicated_dirfd_preserves_path() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let parent = b"/p2\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, parent.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(parent) did not return a directory fd"),
+        };
+        const F_DUPFD: u64 = 0;
+        let duplicates = [
+            call(Syscall::Dup.raw(), a2(fd, 0, 0)),
+            call(Syscall::Dup2.raw(), a2(fd, 110, 0)),
+            call(Syscall::Dup3.raw(), a3(fd, 111, 0, 0)),
+            call(Syscall::Fcntl.raw(), a2(fd, F_DUPFD, 112)),
+        ];
+        for (index, duplicate) in duplicates.into_iter().enumerate() {
+            let duplicate = match duplicate {
+                Some(new_fd) if new_fd >= 0 => new_fd as u64,
+                _ => return Err("descriptor duplication did not return a usable fd"),
+            };
+            let leaf = match index {
+                0 => b"dup\0".as_slice(),
+                1 => b"dup2\0".as_slice(),
+                2 => b"dup3\0".as_slice(),
+                _ => b"fcntl\0".as_slice(),
+            };
+            if call(
+                Syscall::Mkdirat.raw(),
+                a3(duplicate, leaf.as_ptr() as u64, 0o755, 0),
+            ) != Some(0)
+            {
+                return Err("mkdirat through a duplicated directory fd should succeed");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_duplicated_dirfd_preserves_path
+);
+
+// Linux open_tree without OPEN_TREE_CLONE returns an O_PATH fd to the named
+// tree, not a detached mount object. systemd uses that fd as the parent for
+// mkdirat while it creates an automount-triggering mount point.
+fn smoke_abi_pathx_open_tree_path_fd_mkdirat() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        const OPEN_TREE_CLOEXEC: u64 = 0o2000000;
+        let parent = b"/p2\0";
+        let dfd = match call(
+            Syscall::OpenTree.raw(),
+            a3(AT_FDCWD, parent.as_ptr() as u64, OPEN_TREE_CLOEXEC, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open_tree(path) did not return an O_PATH fd"),
+        };
+        let leaf = b"tree-child\0";
+        if call(
+            Syscall::Mkdirat.raw(),
+            a3(dfd, leaf.as_ptr() as u64, 0o755, 0),
+        ) != Some(0)
+        {
+            return Err("mkdirat(open_tree path fd, leaf) should create the child");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_open_tree_path_fd_mkdirat);
 
 fn smoke_abi_pathx_openat2_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {

@@ -1602,6 +1602,589 @@ kernel_test_in!(
     smoke_abi_socket_notify_path_dgram_epoll_scm
 );
 
+/// `sd_notify()` sends its plain `READY=1` datagram with `sendmsg()`, rather
+/// than `sendto()`.  PID 1 enables `SO_PASSCRED` on `/run/systemd/notify`, so
+/// the path-bound datagram must wake its epoll waiter and arrive with the
+/// sender's credentials even when the sender supplied no control messages.
+fn smoke_abi_socket_notify_path_sendmsg_epoll_scm() -> TestResult {
+    with_setup(|| {
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"/notify-sendmsg-e2e.sock");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind() of the sendmsg notify datagram socket failed");
+        }
+
+        let on = 1u32.to_ne_bytes();
+        if call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: rx,
+                arg1: SOL_SOCKET,
+                arg2: SO_PASSCRED,
+                arg3: on.as_ptr() as u64,
+                arg4: on.len() as u64,
+                arg5: 0,
+            },
+        ) != Some(0)
+        {
+            return Err("setsockopt(SO_PASSCRED) for sendmsg notify failed");
+        }
+
+        let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+        if epfd < 0 {
+            return Err("epoll_create for sendmsg notify failed");
+        }
+        let mut interest = [0u8; 12];
+        interest[..4].copy_from_slice(&1u32.to_ne_bytes()); // EPOLLIN
+        interest[4..].copy_from_slice(&0xD0D0u64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd as u64, 1, rx, interest.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("epoll_ctl ADD for sendmsg notify failed");
+        }
+
+        let tx = open_unix(SOCK_DGRAM)?;
+        let payload = b"READY=1\n";
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        let mut msg = [0u8; 56];
+        msg[..8].copy_from_slice(&(addr.as_ptr() as u64).to_ne_bytes());
+        msg[8..16].copy_from_slice(&alen.to_ne_bytes());
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        if call(Syscall::SocketSendMsg.raw(), a2(tx, msg.as_ptr() as u64, 0))
+            != Some(payload.len() as i64)
+        {
+            return Err("sendmsg() of READY=1 to the notify path failed");
+        }
+
+        let mut events = [0u8; 12];
+        if call(
+            Syscall::EpollWait.raw(),
+            a3(epfd as u64, events.as_mut_ptr() as u64, 1, 0),
+        ) != Some(1)
+        {
+            return Err("epoll_wait did not wake for sendmsg READY=1");
+        }
+
+        let mut dst = [0u8; 32];
+        let mut riov = [0u8; 16];
+        riov[..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        riov[8..].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 64];
+        let mut rmsg = [0u8; 56];
+        rmsg[16..24].copy_from_slice(&(riov.as_ptr() as u64).to_ne_bytes());
+        rmsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        rmsg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        rmsg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        if call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(rx, rmsg.as_ptr() as u64, 0),
+        ) != Some(payload.len() as i64)
+            || &dst[..payload.len()] != payload
+        {
+            return Err("recvmsg did not receive sendmsg READY=1");
+        }
+        let cred_type = i32::from_le_bytes(ctrl[12..16].try_into().unwrap());
+        let cred_pid = u32::from_le_bytes(ctrl[16..20].try_into().unwrap());
+        let sender_pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u32;
+        if cred_type != SCM_CREDENTIALS || cred_pid != sender_pid {
+            return Err("sendmsg READY=1 did not carry the sender SCM_CREDENTIALS");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_notify_path_sendmsg_epoll_scm
+);
+
+/// `systemd` identifies a Type=notify sender from SCM_CREDENTIALS in PID 1's
+/// PID namespace. Exercise the real sendmsg/recvmsg transport with distinct
+/// outer task IDs and assert that a child service arrives as PID 2, rather
+/// than leaking its host-visible PID to the manager.
+#[cfg(feature = "container")]
+fn smoke_abi_socket_notify_sendmsg_pid_namespace_credentials() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xC100;
+        const MANAGER_PID: u64 = 4100;
+        const SERVICE_TASK: u64 = 0xC101;
+        const SERVICE_PID: u64 = 4101;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            set_task(MANAGER_TASK);
+            crate::handlers::register_pid_task_mapping(MANAGER_PID, MANAGER_TASK);
+            crate::pid_ns::unshare_pid_ns(MANAGER_TASK, MANAGER_PID);
+
+            let rx = open_unix(SOCK_DGRAM)?;
+            let (addr, alen) = unix_sockaddr(b"/notify-pidns-e2e.sock");
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(rx, addr.as_ptr() as u64, alen),
+            ) != Some(0)
+            {
+                return Err("manager could not bind its notify socket");
+            }
+            let on = 1u32.to_ne_bytes();
+            if call(
+                Syscall::SocketSetSockOpt.raw(),
+                SyscallArgs {
+                    arg0: rx,
+                    arg1: SOL_SOCKET,
+                    arg2: SO_PASSCRED,
+                    arg3: on.as_ptr() as u64,
+                    arg4: on.len() as u64,
+                    arg5: 0,
+                },
+            ) != Some(0)
+            {
+                return Err("manager could not enable SO_PASSCRED");
+            }
+
+            crate::handlers::register_pid_task_mapping(SERVICE_PID, SERVICE_TASK);
+            if crate::pid_ns::inherit_into_child(MANAGER_TASK, SERVICE_TASK, SERVICE_PID) != Some(2)
+            {
+                return Err("service was not assigned PID 2 in the manager namespace");
+            }
+            set_task(SERVICE_TASK);
+            let tx = open_unix(SOCK_DGRAM)?;
+            let payload = b"READY=1\n";
+            let mut iov = [0u8; 16];
+            iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+            iov[8..].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+            let mut msg = [0u8; 56];
+            msg[..8].copy_from_slice(&(addr.as_ptr() as u64).to_ne_bytes());
+            msg[8..16].copy_from_slice(&alen.to_ne_bytes());
+            msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+            msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+            if call(Syscall::SocketSendMsg.raw(), a2(tx, msg.as_ptr() as u64, 0))
+                != Some(payload.len() as i64)
+            {
+                return Err("service sendmsg(READY=1) failed");
+            }
+
+            set_task(MANAGER_TASK);
+            let mut dst = [0u8; 32];
+            let mut iov = [0u8; 16];
+            iov[..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+            iov[8..].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+            let mut ctrl = [0u8; 64];
+            let mut msg = [0u8; 56];
+            msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+            msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+            msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+            msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+            if call(Syscall::SocketRecvMsg.raw(), a2(rx, msg.as_ptr() as u64, 0))
+                != Some(payload.len() as i64)
+                || &dst[..payload.len()] != payload
+            {
+                return Err("manager did not receive the service READY=1 datagram");
+            }
+            let cred_type = i32::from_le_bytes(ctrl[12..16].try_into().unwrap());
+            let cred_pid = u32::from_le_bytes(ctrl[16..20].try_into().unwrap());
+            if cred_type != SCM_CREDENTIALS || cred_pid != 2 {
+                return Err("SCM_CREDENTIALS did not report the service as PID 2");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        result
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_notify_sendmsg_pid_namespace_credentials
+);
+
+/// `PrivateMounts=yes` gives a service a cloned mount tree, rather than an
+/// unrelated filesystem. A pathname `$NOTIFY_SOCKET` bound by PID 1 must
+/// therefore remain reachable after the service unshares only its mount
+/// namespace. This is the systemd Type=notify topology: path lookup is in the
+/// service's namespace, while the socket inode is shared with the manager.
+fn smoke_abi_socket_notify_sendmsg_across_cloned_mount_namespace() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xC180;
+        const SERVICE_TASK: u64 = 0xC181;
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MOUNT: &str = "/abi-notify-shared-mount-ns";
+        const SOCKET: &[u8] = b"/abi-notify-shared-mount-ns/notify";
+
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let mount = registry()
+            .mount_arc(
+                &auth,
+                MOUNT,
+                alloc::sync::Arc::new(MemFs::with_seeds("notify-shared", &[])),
+            )
+            .map_err(|_| "shared notify mount setup failed")?;
+        let result = (|| {
+            set_task(MANAGER_TASK);
+            let rx = open_unix(SOCK_DGRAM)?;
+            let (addr, alen) = unix_sockaddr(SOCKET);
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(rx, addr.as_ptr() as u64, alen),
+            ) != Some(0)
+            {
+                return Err("manager could not bind the shared notify socket");
+            }
+            let on = 1u32.to_ne_bytes();
+            if call(
+                Syscall::SocketSetSockOpt.raw(),
+                SyscallArgs {
+                    arg0: rx,
+                    arg1: SOL_SOCKET,
+                    arg2: SO_PASSCRED,
+                    arg3: on.as_ptr() as u64,
+                    arg4: on.len() as u64,
+                    arg5: 0,
+                },
+            ) != Some(0)
+            {
+                return Err("manager could not enable SO_PASSCRED");
+            }
+            let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create failed")?;
+            let mut interest = [0u8; 12];
+            interest[..4].copy_from_slice(&1u32.to_ne_bytes());
+            if call(
+                Syscall::EpollCtl.raw(),
+                a3(epfd as u64, 1, rx, interest.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("manager could not add notify socket to epoll");
+            }
+
+            set_task(SERVICE_TASK);
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("service could not clone its mount namespace");
+            }
+            let tx = open_unix(SOCK_DGRAM)?;
+            let payload = b"READY=1\nSTATUS=Processing requests...";
+            let mut iov = [0u8; 16];
+            iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+            iov[8..].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+            let mut msg = [0u8; 56];
+            msg[..8].copy_from_slice(&(addr.as_ptr() as u64).to_ne_bytes());
+            msg[8..16].copy_from_slice(&alen.to_ne_bytes());
+            msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+            msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+            if call(Syscall::SocketSendMsg.raw(), a2(tx, msg.as_ptr() as u64, 0))
+                != Some(payload.len() as i64)
+            {
+                return Err("service sendmsg(READY=1) did not reach the shared notify socket");
+            }
+
+            set_task(MANAGER_TASK);
+            let mut events = [0u8; 12];
+            if call(
+                Syscall::EpollWait.raw(),
+                a3(epfd as u64, events.as_mut_ptr() as u64, 1, 0),
+            ) != Some(1)
+            {
+                return Err("manager epoll did not observe service READY=1");
+            }
+            let mut received = [0u8; 64];
+            if call(
+                Syscall::SocketRecv.raw(),
+                a3(rx, received.as_mut_ptr() as u64, received.len() as u64, 0),
+            ) != Some(payload.len() as i64)
+                || &received[..payload.len()] != payload
+            {
+                return Err("manager did not receive service READY=1");
+            }
+            Ok(())
+        })();
+        set_task(SERVICE_TASK);
+        crate::handlers::clear_current_mount_namespace_for_test();
+        set_task(MANAGER_TASK);
+        let _ = registry().unmount(&mount, MOUNT);
+        set_task(FAKE_TASK);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_notify_sendmsg_across_cloned_mount_namespace
+);
+
+/// Pathname AF_UNIX sockets name filesystem inodes, not globally interned
+/// strings.  Two services whose private mount namespaces overmount the same
+/// `/run` directory therefore may bind the same visible notify pathname: each
+/// name resolves to a different socket inode.  This is how systemd's
+/// `PrivateTmp=`/mount-sandboxed services avoid colliding with host sockets.
+fn smoke_abi_socket_bind_pathname_isolated_by_mount_namespace() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xC200;
+        const SERVICE_TASK: u64 = 0xC201;
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MOUNT: &str = "/abi-notify-mount-ns";
+        const SOCKET: &[u8] = b"/abi-notify-mount-ns/notify.sock";
+
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let global = registry()
+            .mount_arc(
+                &auth,
+                MOUNT,
+                alloc::sync::Arc::new(MemFs::with_seeds("notify-global", &[])),
+            )
+            .map_err(|_| "global notify mount setup failed")?;
+        let result = (|| {
+            set_task(MANAGER_TASK);
+            let manager_rx = open_unix(SOCK_DGRAM)?;
+            let (addr, alen) = unix_sockaddr(SOCKET);
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(manager_rx, addr.as_ptr() as u64, alen),
+            ) != Some(0)
+            {
+                return Err("manager could not bind its pathname socket");
+            }
+
+            set_task(SERVICE_TASK);
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("service could not unshare its mount namespace");
+            }
+            let private = crate::handlers::current_mount_namespace()
+                .ok_or("unshare did not install a private mount namespace")?;
+            private
+                .mount_arc(
+                    &auth,
+                    MOUNT,
+                    alloc::sync::Arc::new(MemFs::with_seeds("notify-private", &[])),
+                )
+                .map_err(|_| "private notify mount setup failed")?;
+
+            let service_rx = open_unix(SOCK_DGRAM)?;
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(service_rx, addr.as_ptr() as u64, alen),
+            ) != Some(0)
+            {
+                return Err("private mount namespace collided with the manager socket");
+            }
+            Ok(())
+        })();
+        set_task(SERVICE_TASK);
+        crate::handlers::clear_current_mount_namespace_for_test();
+        set_task(MANAGER_TASK);
+        let _ = registry().unmount(&global, MOUNT);
+        set_task(FAKE_TASK);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_bind_pathname_isolated_by_mount_namespace
+);
+
+/// A bind mount is a second VFS path to the same directory inode.  AF_UNIX
+/// must consequently route a pathname sent through the alias to the socket
+/// bound through the source path, and reject a second bind through that alias.
+/// This complements the private-overmount case above: namespace isolation
+/// must not turn two aliases *within the same mount view* into different
+/// socket names.
+fn smoke_abi_socket_pathname_bind_mount_aliases_same_inode() -> TestResult {
+    with_setup(|| {
+        const SOURCE: &[u8] = b"/abi-unix-alias-source\0";
+        const ALIAS: &[u8] = b"/abi-unix-alias-dest\0";
+        const TMPFS: &[u8] = b"tmpfs\0";
+        const MS_BIND: u64 = 1 << 12;
+
+        if call(
+            Syscall::Mount.raw(),
+            SyscallArgs {
+                arg0: c"none".as_ptr() as u64,
+                arg1: SOURCE.as_ptr() as u64,
+                arg2: TMPFS.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("could not mount the source directory for the AF_UNIX alias test");
+        }
+        if call(
+            Syscall::Mount.raw(),
+            SyscallArgs {
+                arg0: SOURCE.as_ptr() as u64,
+                arg1: ALIAS.as_ptr() as u64,
+                arg3: MS_BIND,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("could not bind-mount the AF_UNIX alias directory");
+        }
+
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (source_addr, source_len) = unix_sockaddr(b"/abi-unix-alias-source/notify.sock");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, source_addr.as_ptr() as u64, source_len),
+        ) != Some(0)
+        {
+            return Err("could not bind the source-path AF_UNIX socket");
+        }
+
+        let tx = open_unix(SOCK_DGRAM)?;
+        let (alias_addr, alias_len) = unix_sockaddr(b"/abi-unix-alias-dest/notify.sock");
+        let payload = b"alias";
+        if call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: tx,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg3: 0,
+                arg4: alias_addr.as_ptr() as u64,
+                arg5: alias_len,
+            },
+        ) != Some(payload.len() as i64)
+        {
+            return Err("sendto through the bind-mount alias did not find the socket");
+        }
+        let mut received = [0u8; 16];
+        if call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, received.as_mut_ptr() as u64, received.len() as u64, 0),
+        ) != Some(payload.len() as i64)
+            || &received[..payload.len()] != payload
+        {
+            return Err("source-path socket did not receive datagram sent through its alias");
+        }
+
+        let duplicate = open_unix(SOCK_DGRAM)?;
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(duplicate, alias_addr.as_ptr() as u64, alias_len),
+        ) != Some(-1)
+        {
+            return Err("bind through alias did not see source-path socket inode as occupied");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_pathname_bind_mount_aliases_same_inode
+);
+
+/// Linux keeps abstract AF_UNIX names in `struct net`, not in the mount
+/// namespace. Two independent network namespaces may therefore bind the same
+/// abstract DGRAM name; a global registry leaks traffic and spuriously returns
+/// EADDRINUSE to the second service.
+#[cfg(feature = "container")]
+fn smoke_abi_socket_abstract_dgram_isolated_by_net_namespace() -> TestResult {
+    with_setup(|| {
+        const HOST_TASK: u64 = 0xC300;
+        const PRIVATE_TASK: u64 = 0xC301;
+        const CLONE_NEWNET: u64 = 0x4000_0000;
+
+        crate::namespaces::__test_reset_all();
+        let result = (|| {
+            set_task(HOST_TASK);
+            let host = open_unix(SOCK_DGRAM)?;
+            let (addr, alen) = abstract_sockaddr(b"notify-netns-e2e");
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(host, addr.as_ptr() as u64, alen),
+            ) != Some(0)
+            {
+                return Err("host netns could not bind the abstract notify socket");
+            }
+
+            set_task(PRIVATE_TASK);
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNET)) != Some(0) {
+                return Err("private task could not unshare its network namespace");
+            }
+            let private = open_unix(SOCK_DGRAM)?;
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(private, addr.as_ptr() as u64, alen),
+            ) != Some(0)
+            {
+                return Err("abstract socket collided across network namespaces");
+            }
+
+            let private_tx = open_unix(SOCK_DGRAM)?;
+            let private_payload = b"private";
+            if call(
+                Syscall::SocketSend.raw(),
+                SyscallArgs {
+                    arg0: private_tx,
+                    arg1: private_payload.as_ptr() as u64,
+                    arg2: private_payload.len() as u64,
+                    arg3: 0,
+                    arg4: addr.as_ptr() as u64,
+                    arg5: alen,
+                },
+            ) != Some(private_payload.len() as i64)
+            {
+                return Err("private netns could not send to its abstract socket");
+            }
+            let mut private_buf = [0u8; 16];
+            if call(
+                Syscall::SocketRecv.raw(),
+                a3(
+                    private,
+                    private_buf.as_mut_ptr() as u64,
+                    private_buf.len() as u64,
+                    0,
+                ),
+            ) != Some(private_payload.len() as i64)
+                || &private_buf[..private_payload.len()] != private_payload
+            {
+                return Err("private netns did not receive its own abstract datagram");
+            }
+
+            set_task(HOST_TASK);
+            let host_tx = open_unix(SOCK_DGRAM)?;
+            let host_payload = b"host";
+            if call(
+                Syscall::SocketSend.raw(),
+                SyscallArgs {
+                    arg0: host_tx,
+                    arg1: host_payload.as_ptr() as u64,
+                    arg2: host_payload.len() as u64,
+                    arg3: 0,
+                    arg4: addr.as_ptr() as u64,
+                    arg5: alen,
+                },
+            ) != Some(host_payload.len() as i64)
+            {
+                return Err("host netns could not send to its abstract socket");
+            }
+            let mut host_buf = [0u8; 16];
+            if call(
+                Syscall::SocketRecv.raw(),
+                a3(host, host_buf.as_mut_ptr() as u64, host_buf.len() as u64, 0),
+            ) != Some(host_payload.len() as i64)
+                || &host_buf[..host_payload.len()] != host_payload
+            {
+                return Err("host netns did not receive its own abstract datagram");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::namespaces::__test_reset_all();
+        result
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_abstract_dgram_isolated_by_net_namespace
+);
+
 /// connect()/sendto to an unbound abstract name is ECONNREFUSED (-111),
 /// never the bare -1 sentinel.
 fn smoke_abi_socket_abstract_dgram_refused() -> TestResult {
@@ -3451,6 +4034,52 @@ fn smoke_abi_netlink_audit_socket_open_bind_send() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_netlink_audit_socket_open_bind_send
+);
+
+/// libaudit emits userspace event records while systemd records boot state.
+/// With auditing disabled, Linux accepts the record and returns a successful
+/// `NLMSG_ERROR` ACK rather than rejecting it as an unsupported operation.
+fn smoke_abi_netlink_audit_user_record_acknowledged() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_AUDIT)?;
+        let (addr, alen) = netlink_sockaddr(0);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind(NETLINK_AUDIT) did not return 0");
+        }
+
+        const AUDIT_FIRST_USER_MSG: u16 = 1100;
+        let mut message = [0u8; NLMSG_HDRLEN + 16];
+        let message_len = message.len() as u32;
+        message[0..4].copy_from_slice(&message_len.to_ne_bytes());
+        message[4..6].copy_from_slice(&AUDIT_FIRST_USER_MSG.to_ne_bytes());
+        message[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+        message[8..12].copy_from_slice(&2u32.to_ne_bytes());
+        message[NLMSG_HDRLEN..].copy_from_slice(b"narf audit event");
+        if netlink_send(fd, &message).ok_or("send status")? != message.len() as i64 {
+            return Err("NETLINK_AUDIT did not accept a userspace audit record");
+        }
+
+        let mut ack = [0u8; 80];
+        let n = netlink_recv(fd, &mut ack).ok_or("recv status")?;
+        if n < (NLMSG_HDRLEN + 4) as i64 || nlmsg_type_of(&ack) != NLMSG_ERROR {
+            return Err("NETLINK_AUDIT userspace audit record did not receive an ACK");
+        }
+        if i32::from_ne_bytes(ack[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()) != 0 {
+            return Err("NETLINK_AUDIT rejected a userspace audit record");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_audit_user_record_acknowledged
 );
 
 fn smoke_abi_netlink_generic_socket_open() -> TestResult {

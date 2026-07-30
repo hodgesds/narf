@@ -865,6 +865,22 @@ fn open_impl(
     } else {
         path_owned_raw
     };
+    // Filesystem-local resolution restarts an absolute symlink at the root of
+    // the filesystem containing that link. Linux instead restarts at the
+    // task's VFS root, which may cross a mount boundary (for example a distro
+    // unit masked by `/etc/systemd/system/foo.service -> /dev/null`). Expand
+    // those links through the current mount table before the final lookup.
+    // O_NOFOLLOW still preserves a final link, while intermediate links must
+    // always be traversed.
+    let proc_prefix = apply_chroot("/proc");
+    let proc_magic_path = path_owned == proc_prefix
+        || (path_owned.starts_with(proc_prefix.as_str())
+            && path_owned.as_bytes().get(proc_prefix.len()) == Some(&b'/'));
+    let path_owned = if mnt_len == 0 && !proc_magic_path {
+        resolve_vfs_symlink_path(&path_owned, flags & 0o400000 == 0).unwrap_or(path_owned)
+    } else {
+        path_owned
+    };
     let path: &str = &path_owned;
 
     // RLIMIT_NOFILE enforcement: a task may not exceed its soft limit of
@@ -2030,12 +2046,26 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
             return;
         }
     };
+    stat_linux_path(ctx, &raw, out_arg, follow_final);
+}
+
+/// Write a Linux `struct stat` for a path in the caller's visible namespace.
+/// `raw` may be absolute or relative to the caller's cwd; callers of
+/// `newfstatat(2)` first join its relative pathname to the supplied dirfd.
+#[cfg(feature = "linux-compat")]
+fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_final: bool) {
+    let out_ptr = out_arg as *mut linux_compat::Stat;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if out_ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
     // Resolve relative paths (e.g. `ls`'s `lstat(".")`) against the
     // caller's cwd before chroot, so the stat family works from any
     // working directory — not just absolute paths.
     // resolve_cwd_path already re-roots under the task's chroot — do
     // not apply_chroot again or the prefix is composed twice.
-    let path_owned = resolve_cwd_path(current_task_id(), &raw);
+    let path_owned = resolve_cwd_path(current_task_id(), raw);
     let _ = (); // silence unused-binding lint when both arms drop the value
     let path: &str = &path_owned;
     // `resolve_absolute` splits an absolute path into (mount, rel).
@@ -2291,6 +2321,40 @@ pub(crate) fn resolve_parent_dir_async(
     })
     .flatten()?;
     Some((dir, alloc::string::String::from(leaf)))
+}
+
+/// Build the VFS key for a pathname AF_UNIX socket. The preferred identity is
+/// `(backing filesystem, parent inode)`: a bind mount gets the source
+/// filesystem identity and therefore aliases the same directory, while an
+/// overmount remains distinct. The legacy initramfs reports inode zero, so it
+/// falls back to the parent spelling within the stable backing filesystem.
+pub(crate) fn unix_socket_path_key(
+    path: &str,
+) -> Option<(
+    usize,
+    u64,
+    Option<alloc::string::String>,
+    alloc::string::String,
+)> {
+    if path.is_empty() || path.starts_with('\0') {
+        return None;
+    }
+    let abs = resolve_cwd_path(current_task_id(), path);
+    let path_ref = abs.trim_end_matches('/');
+    let last = path_ref.rfind('/')?;
+    let parent_path = if last == 0 { "/" } else { &path_ref[..last] };
+    let (parent, leaf) = resolve_parent_dir_async(path_ref)?;
+    let name = leaf;
+    current_resolve_absolute(parent_path, |fs, rel| {
+        let parent_ino = parent.ino();
+        let fallback_parent_path = (parent_ino == 0).then(|| alloc::string::String::from(rel));
+        (
+            fs.backing_identity(),
+            parent_ino,
+            fallback_parent_path,
+            name,
+        )
+    })
 }
 
 /// Move `old_abs` to `new_abs` when the two live in DIFFERENT parent
@@ -4151,12 +4215,18 @@ fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
 }
 
 pub fn retain_external_shared_frame(phys: u64) {
+    if crate::mapped_file::retain_shared_file_page(phys) {
+        return;
+    }
     if let Some(vtable) = shmem_vtable() {
         (vtable.retain_frame)(phys);
     }
 }
 
 pub fn release_external_shared_frame(phys: u64) {
+    if crate::mapped_file::release_shared_file_page(phys) {
+        return;
+    }
     if let Some(vtable) = shmem_vtable() {
         (vtable.release_frame)(phys);
     }
@@ -4449,8 +4519,7 @@ fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32)
 //                    on thread exit, the kernel writes 0 there and
 //                    FUTEX_WAKEs one waiter.
 //
-// CLONE_NEWPID / CLONE_NEWNS / etc are accepted-and-ignored — the
-// container surface is a separate wave.
+// Namespace flags are applied in the clone inheritance section below.
 //
 // set_tid_address(tidptr) sets the calling task's CLOSE_CHILD_CLEARTID
 // slot in the same per-task table; returns the caller's TID.
@@ -5208,6 +5277,22 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // when the parent is namespaced.
     #[cfg(feature = "container")]
     let mut child_ns_pid = child_visible_pid;
+    // Mount namespaces are part of the Linux-compat syscall surface even
+    // without the optional container feature. A fork/clone child inherits the
+    // parent's current mount namespace by reference, just as Linux's
+    // copy_mnt_ns() does. This must happen for threads too: the per-task map
+    // needs an entry even though the namespace object itself is shared.
+    mount_ns_inherit(parent_pid, child_tid.raw());
+
+    // CLONE_NEWNS is not contingent on the optional container bundle: systemd
+    // uses clone(CLONE_NEWNS|SIGCHLD) to construct its generator and service
+    // sandboxes. It receives a distinct snapshot, while a regular clone keeps
+    // the inherited Arc above.
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    if !share_thread && flags & CLONE_NEWNS != 0 {
+        install_mount_namespace(child_tid.raw(), snapshot_current_mount_namespace());
+    }
+
     #[cfg(feature = "container")]
     {
         let child = child_tid.raw();
@@ -5222,14 +5307,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
             {
                 child_ns_pid = inner;
             }
-            mount_ns_inherit(parent_task, child);
-            const CLONE_NEWNS: u64 = 0x00020000;
             const CLONE_NEWPID: u64 = 0x20000000;
-            if flags & CLONE_NEWNS != 0 {
-                task_mount_ns_init();
-                let snap = snapshot_current_mount_namespace();
-                install_mount_namespace(child, snap);
-            }
             if flags & CLONE_NEWPID != 0 {
                 let _ = crate::pid_ns::unshare_pid_ns(child, child_visible_pid);
             }
@@ -8474,6 +8552,80 @@ pub(crate) fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
     }
 }
 
+/// Expand symlinks component-by-component through the current task's mount
+/// table. This supplies the VFS boundary that a filesystem-local resolver
+/// cannot cross after an absolute symlink target.
+pub(crate) fn resolve_vfs_symlink_path(
+    path: &str,
+    follow_final: bool,
+) -> Option<alloc::string::String> {
+    let mut expanded = normalize_abs(path);
+    const SYMLOOP_MAX: usize = 40;
+
+    for _ in 0..SYMLOOP_MAX {
+        let components: alloc::vec::Vec<&str> = expanded
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .collect();
+        let mut prefix = alloc::string::String::new();
+        let mut followed = false;
+
+        for (index, component) in components.iter().enumerate() {
+            prefix.push('/');
+            prefix.push_str(component);
+            let is_final = index + 1 == components.len();
+            let node = current_resolve_absolute(&prefix, |fs, rel| {
+                if rel.is_empty() {
+                    fs.root_file()
+                } else {
+                    poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+                        .and_then(|result| result.ok())
+                }
+            })
+            .flatten();
+            let Some(node) = node else {
+                continue;
+            };
+            if node.stat().mode.file_type != narf_filesystem::FileType::Symlink
+                || (is_final && !follow_final)
+            {
+                continue;
+            }
+
+            let mut bytes = alloc::vec![0u8; 4096];
+            let n = poll_blocking(node.read(0, &mut bytes)).and_then(|result| result.ok())?;
+            let target = core::str::from_utf8(&bytes[..n]).ok()?;
+            if target.is_empty() {
+                return None;
+            }
+            let parent = prefix
+                .rsplit_once('/')
+                .map(|(parent, _)| parent)
+                .unwrap_or("");
+            let target_path = if target.starts_with('/') {
+                apply_chroot(target)
+            } else if parent.is_empty() {
+                normalize_abs(&alloc::format!("/{target}"))
+            } else {
+                normalize_abs(&alloc::format!("{parent}/{target}"))
+            };
+            let tail = &components[index + 1..];
+            expanded = if tail.is_empty() {
+                target_path
+            } else {
+                normalize_abs(&alloc::format!("{}/{}", target_path, tail.join("/")))
+            };
+            followed = true;
+            break;
+        }
+
+        if !followed {
+            return Some(expanded);
+        }
+    }
+    None
+}
+
 /// The join-and-normalize half of [`resolve_cwd_path`] — the USER-VIEW
 /// absolute path, before the chroot prefix. This is what CWD_TABLE must
 /// store: chdir used to store the post-chroot result, so a chrooted
@@ -9683,9 +9835,15 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     if buf_ptr == 0 {
         return false;
     }
+    // Both statfs(path) and fstatfs(fd) hand us a path in the caller's
+    // namespace: fds deliberately retain a chroot-relative path so
+    // /proc/self/fd can expose a reopenable link. Re-root it before finding
+    // the backing mount, otherwise a chrooted PID 1's /run resolves against
+    // NARF's host root rather than /mnt/run.
+    let path = resolve_cwd_path(current_task_id(), path);
     // Map the filesystem covering `path` to its Linux super-magic so callers
     // detect the fs type (elogind → CGROUP2_SUPER_MAGIC at /sys/fs/cgroup).
-    let fs = match narf_filesystem::registry().fs_arc_at(path) {
+    let fs = match current_fs_arc_at(&path) {
         Some(fs) => fs,
         None => return false,
     };
@@ -9721,11 +9879,9 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     unsafe { copy_to_user(buf_ptr, &bytes) }.is_ok()
 }
 
-// Per-task mount namespace table. Entries appear here when a task
-// calls unshare(CLONE_NEWNS); absent entries fall back to the
-// global VfsRegistry. Today every mount-touching syscall still
-// consults the global registry — the per-task lookup wires in
-// once a multi-namespace workload (a la container) needs it.
+// Per-task mount namespace table. Entries appear when a task calls
+// unshare(CLONE_NEWNS) or is created with clone(CLONE_NEWNS); absent entries
+// fall back to the global VfsRegistry.
 static TASK_MOUNT_NS: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, alloc::sync::Arc<narf_filesystem::MountNamespace>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -9757,6 +9913,14 @@ pub(crate) fn clear_current_mount_namespace_for_test() {
     if let Some(namespaces) = TASK_MOUNT_NS.lock().as_mut() {
         namespaces.remove(&task);
     }
+}
+
+/// Test hook — ABI smokes share one kernel image, so reset every task's
+/// namespace rather than relying on whichever task-id lookup a prior test
+/// left installed.
+#[doc(hidden)]
+pub fn __test_mount_namespaces_reset() {
+    *TASK_MOUNT_NS.lock() = Some(alloc::collections::BTreeMap::new());
 }
 
 pub(crate) fn current_resolve_absolute<R, F>(path: &str, resolve: F) -> Option<R>
@@ -9905,7 +10069,6 @@ pub fn mount_namespace_of(task: u64) -> Option<alloc::sync::Arc<narf_filesystem:
 /// Wave-67 — install a private mount namespace for `task`. Replaces
 /// any existing entry. Used by `setns` and the fork-inheritance
 /// path.
-#[cfg(feature = "container")]
 pub fn install_mount_namespace(task: u64, ns: alloc::sync::Arc<narf_filesystem::MountNamespace>) {
     task_mount_ns_init();
     let mut g = TASK_MOUNT_NS.lock();
@@ -9918,8 +10081,7 @@ pub fn install_mount_namespace(task: u64, ns: alloc::sync::Arc<narf_filesystem::
 /// share (no deep clone — they keep the same view until one calls
 /// unshare(CLONE_NEWNS) again). A parent in the root-global view
 /// leaves the child in the same root-global view.
-#[cfg(feature = "container")]
-fn mount_ns_inherit(parent_task: u64, child_task: u64) {
+pub(crate) fn mount_ns_inherit(parent_task: u64, child_task: u64) {
     let parent_ns = {
         let g = TASK_MOUNT_NS.lock();
         g.as_ref().and_then(|m| m.get(&parent_task).cloned())
@@ -9957,16 +10119,23 @@ pub fn proc_ns_readlink(pid: u64, tag: u8) -> Option<alloc::string::String> {
     Some(s)
 }
 
-/// `/proc/<pid>/mountinfo` per-ns view — None when the task rides the
-/// global mount registry (procfs then renders the global view).
+/// `/proc/<pid>/mountinfo` in the task's visible mount and chroot view.
+///
+/// The global registry stores backing paths, while a task with a chroot must
+/// observe those paths relative to its root. Returning `None` for a global
+/// task used to make procfs render the backing paths directly (for example
+/// `/mnt/sys/kernel/debug` to PID 1 rooted at `/mnt`), so systemd could not
+/// find the mount it had just created when it rescanned mountinfo.
 #[cfg(feature = "linux-compat")]
 pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
-    let ns = mount_namespace_of(task)?;
     let process_root = root_dir_of(task).unwrap_or_else(|| alloc::string::String::from("/"));
     let mut s = alloc::string::String::new();
     use core::fmt::Write as _;
-    for (id, parent, path, name) in ns.list_mountinfo() {
+    let rows = mount_namespace_of(task)
+        .map(|ns| ns.list_mountinfo())
+        .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
+    for (id, parent, path, name) in rows {
         let visible = if process_root == "/" {
             path
         } else if path == process_root {
@@ -9981,6 +10150,17 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
         let _ = writeln!(s, "{}\t{}\t{}\t{}", id, parent, visible, name);
     }
     Some(s)
+}
+
+/// Current mount-table generation in the named task's mount namespace. Procfs
+/// uses this to expose Linux's `POLLPRI` edge on an open mountinfo file after
+/// attach, detach, or move operations.
+#[cfg(feature = "linux-compat")]
+pub fn proc_ns_mountinfo_generation(pid: u64) -> u64 {
+    let task = pid_to_task_raw(pid).unwrap_or(pid);
+    mount_namespace_of(task)
+        .map(|ns| ns.mountinfo_generation())
+        .unwrap_or_else(|| narf_filesystem::registry().mountinfo_generation())
 }
 
 /// `/proc/<pid>/{uid,gid}_map` render.
@@ -11067,6 +11247,24 @@ pub fn proc_comm_of(pid: u64) -> Option<alloc::string::String> {
 pub fn proc_comm_of_task(tid: u64) -> Option<alloc::string::String> {
     let g = PROC_COMM.lock();
     g.as_ref().and_then(|m| m.get(&tid).cloned())
+}
+
+/// Check a task's Linux `comm` name against comma-separated prefixes without
+/// cloning it. A selector ending in `$` matches the complete comm name; other
+/// selectors retain prefix semantics. Diagnostic paths call this on every
+/// syscall, so cloning the short comm string (and taking a second configuration
+/// lock) would itself perturb the workload being traced.
+pub fn proc_comm_of_task_matches(tid: u64, prefixes: &str) -> bool {
+    let g = PROC_COMM.lock();
+    let Some(comm) = g.as_ref().and_then(|m| m.get(&tid)) else {
+        return false;
+    };
+    prefixes
+        .split(',')
+        .any(|selector| match selector.strip_suffix('$') {
+            Some(exact) => !exact.is_empty() && comm == exact,
+            None => !selector.is_empty() && comm.starts_with(selector),
+        })
 }
 
 // ── /proc/[pid]/comm writable hook ─────────────────────────────
@@ -16373,7 +16571,7 @@ mod handler_sys_open_by_handle_at;
 #[path = "sys_open_linux.rs"]
 mod handler_sys_open_linux;
 #[path = "sys_openat.rs"]
-mod handler_sys_openat;
+pub(crate) mod handler_sys_openat;
 #[path = "sys_openat2.rs"]
 mod handler_sys_openat2;
 #[path = "sys_pause.rs"]

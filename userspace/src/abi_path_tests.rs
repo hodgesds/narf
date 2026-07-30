@@ -151,6 +151,54 @@ fn smoke_abi_path_openat_nofollow_symlink() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_openat_nofollow_symlink);
 
+// An absolute symlink is rooted at the process mount namespace, not at the
+// filesystem instance that contained the link. Fedora masks several units
+// with `/etc/systemd/system/*.service -> /dev/null`; the source rootfs and
+// `/dev` are separate mounts in a direct PID 1 boot.
+fn smoke_abi_path_openat_absolute_symlink_crosses_mount() -> TestResult {
+    with_memfs("/p", "p", &[], || {
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let target = MemFs::with_seeds("target", &[("f", b"cross-mount" as &[u8])]);
+        let handle = match registry().mount(&auth, "/target", target) {
+            Ok(handle) => handle,
+            Err(_) => return Err("mounting symlink target filesystem failed"),
+        };
+        let outcome = (|| {
+            let link_target = b"/target/f\0";
+            let link = b"/p/to-target\0";
+            if call_symlink(link_target.as_ptr() as u64, link.as_ptr() as u64) != Some(0) {
+                return Err("creating absolute symlink failed");
+            }
+            let fd = match call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, link.as_ptr() as u64, O_RDONLY, 0),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open must follow an absolute symlink through the mount table"),
+            };
+            let mut bytes = [0u8; 32];
+            let n = match call(
+                Syscall::Read.raw(),
+                a2(fd, bytes.as_mut_ptr() as u64, bytes.len() as u64),
+            ) {
+                Some(n) if n > 0 => n as usize,
+                _ => return Err("reading cross-mount symlink target failed"),
+            };
+            if &bytes[..n] == b"cross-mount" {
+                Ok(())
+            } else {
+                Err("absolute symlink resolved to the wrong mount")
+            }
+        })();
+        let _ = registry().unmount(&handle, "/target");
+        outcome
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_path_openat_absolute_symlink_crosses_mount
+);
+
 // ── os-release-shaped symlink: chase (O_NOFOLLOW|O_PATH) vs follow ──
 //
 // systemd (PID 1) reads /etc/os-release — a symlink to ../usr/lib/os-release —
@@ -273,6 +321,118 @@ fn smoke_abi_path_fstatfs_reports_fd_fs() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_fstatfs_reports_fd_fs);
+
+// fstatfs follows the caller's mount namespace, not the global registry. A
+// service with a private /run tmpfs uses this to distinguish runtime state
+// from the host's persistent filesystem before recursively cleaning it.
+fn smoke_abi_path_fstatfs_uses_private_mount_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const TMPFS_MAGIC: u64 = 0x0102_1994;
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let global = registry()
+            .mount_arc(
+                &auth,
+                "/abi-statfs-ns",
+                alloc::sync::Arc::new(narf_filesystem::SysFs::new()),
+            )
+            .map_err(|_| "global sysfs mount setup failed")?;
+
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("private mount namespace setup failed");
+            }
+            let ns = crate::handlers::current_mount_namespace()
+                .ok_or("unshare did not install a mount namespace")?;
+            ns.mount_arc(
+                &auth,
+                "/abi-statfs-ns",
+                alloc::sync::Arc::new(MemFs::with_seeds("statfs-private", &[])),
+            )
+            .map_err(|_| "private tmpfs mount setup failed")?;
+
+            let path = b"/abi-statfs-ns\0";
+            let fd = match call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open of private mount root failed"),
+            };
+            let mut buf = [0u8; 128];
+            if call(Syscall::Fstatfs.raw(), a1(fd, buf.as_mut_ptr() as u64)) != Some(0) {
+                return Err("fstatfs of private mount failed");
+            }
+            let f_type = u64::from_ne_bytes(buf[..8].try_into().unwrap());
+            if f_type != TMPFS_MAGIC {
+                return Err("fstatfs used the global mount instead of the private tmpfs");
+            }
+            Ok(())
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        let _ = registry().unmount(&global, "/abi-statfs-ns");
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_path_fstatfs_uses_private_mount_namespace
+);
+
+// The path recorded for an open fd is deliberately chroot-relative so it can
+// be returned through /proc/self/fd. fstatfs must re-root that visible path
+// before finding its backing mount.
+fn smoke_abi_path_fstatfs_reroots_chrooted_fd_path() -> TestResult {
+    with_setup(|| {
+        const TMPFS_MAGIC: u64 = 0x0102_1994;
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let visible = registry()
+            .mount_arc(
+                &auth,
+                "/abi-statfs-visible",
+                alloc::sync::Arc::new(narf_filesystem::SysFs::new()),
+            )
+            .map_err(|_| "visible sysfs mount setup failed")?;
+        let rooted = registry()
+            .mount(
+                &auth,
+                "/abi-statfs-root/abi-statfs-visible",
+                MemFs::new("statfs-rooted"),
+            )
+            .map_err(|_| "rooted tmpfs mount setup failed")?;
+
+        let result = (|| {
+            if !crate::handlers::install_root_dir(FAKE_TASK, "/abi-statfs-root") {
+                return Err("chroot setup failed");
+            }
+            let path = b"/abi-statfs-visible\0";
+            let fd = match call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open of chrooted private mount root failed"),
+            };
+            let mut buf = [0u8; 128];
+            if call(Syscall::Fstatfs.raw(), a1(fd, buf.as_mut_ptr() as u64)) != Some(0) {
+                return Err("fstatfs of chrooted fd failed");
+            }
+            let f_type = u64::from_ne_bytes(buf[..8].try_into().unwrap());
+            if f_type != TMPFS_MAGIC {
+                return Err("fstatfs did not re-root the fd path before mount lookup");
+            }
+            Ok(())
+        })();
+        crate::handlers::__test_root_dir_reset();
+        let _ = registry().unmount(&rooted, "/abi-statfs-root/abi-statfs-visible");
+        let _ = registry().unmount(&visible, "/abi-statfs-visible");
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_path_fstatfs_reroots_chrooted_fd_path
+);
 
 // ── creat: NUL-term path, returns a fd ──
 

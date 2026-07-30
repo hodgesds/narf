@@ -51,7 +51,10 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 Some(t.open_at_least(clone, min_fd))
             });
             match outcome {
-                Some(Some(new_fd)) => ctx.set_return(SyscallReturn::ok(new_fd as u64)),
+                Some(Some(new_fd)) => {
+                    crate::mqueue::duplicate_fd_path(task, fd, new_fd);
+                    ctx.set_return(SyscallReturn::ok(new_fd as u64));
+                }
                 // F_DUPFD on a fd that isn't open → -EBADF (was InvalidOp).
                 _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
             }

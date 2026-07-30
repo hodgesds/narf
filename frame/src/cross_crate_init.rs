@@ -50,6 +50,19 @@ pub fn install_all_hooks() {
 #[cfg(feature = "linux-compat")]
 fn install_proc_mountinfo_hook() {
     narf_filesystem::procfs::install_mountinfo_hook(narf_userspace::handlers::proc_ns_mountinfo);
+    narf_filesystem::procfs::install_mountinfo_generation_hook(
+        narf_userspace::handlers::proc_ns_mountinfo_generation,
+    );
+    narf_filesystem::install_mount_change_hook(wake_mountinfo_waiters);
+}
+
+/// Wake poll/epoll waiters after a mount-table mutation. `/proc/*/mountinfo`
+/// exposes the namespace generation as POLLPRI; the scheduler must be kicked
+/// so systemd's libmount monitor drains that edge before it observes SIGCHLD
+/// from the successful mount helper.
+#[cfg(feature = "linux-compat")]
+fn wake_mountinfo_waiters() {
+    narf_net::readiness::notify(0);
 }
 
 /// Wire the namespace procfs hooks so /proc/<pid>/ns/*, uid_map,

@@ -3242,19 +3242,24 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     }
 }
 
-/// Comm-prefix selecting which processes the `syscall-trace` feature follows.
-/// Set from the kernel cmdline (`trace_comm=<prefix>`) by boot-init so the
-/// trace can be retargeted without a rebuild; defaults to `systemd-executo`
-/// (the sd-executor that stages every service exec) when the cmdline is silent.
+/// Comm selector for the `syscall-trace` feature. Set from the kernel cmdline
+/// (`trace_comm=<prefix>`) by boot-init so the trace can be retargeted without
+/// a rebuild; a trailing `$` requests an exact comm match. Defaults to
+/// `systemd-executo` (the sd-executor that stages every service exec) when the
+/// cmdline is silent.
 #[cfg(feature = "syscall-trace")]
-static TRACE_COMM: narf_lib::sync::IrqSafeSpinLock<Option<alloc::string::String>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+static TRACE_COMM: narf_lib::sync::OnceLock<alloc::string::String> =
+    narf_lib::sync::OnceLock::new();
 
 /// Install the comm-prefix filter for the syscall trace (see `TRACE_COMM`).
 /// A comma-separated list matches any of the listed prefixes.
 #[cfg(feature = "syscall-trace")]
 pub fn set_trace_comm(prefix: &str) {
-    *TRACE_COMM.lock() = Some(alloc::string::String::from(prefix));
+    // boot-init configures this once, before it starts userspace. Keep the
+    // first value if a test or an accidental second call repeats setup: the
+    // read path must remain lock-free so unmatched tasks do not perturb the
+    // workload being diagnosed.
+    let _ = TRACE_COMM.set(alloc::string::String::from(prefix));
 }
 
 /// Trace filter for the `syscall-trace` feature. Fedora desktop diagnostics
@@ -3268,19 +3273,15 @@ fn syscall_trace_relevant(_v: Syscall) -> bool {
 }
 
 /// Shared predicate for syscall, exec, and exit diagnostics. Matches when the
-/// current task's comm starts with any of the comma-separated `trace_comm=`
-/// prefixes (default `systemd-executo`).
+/// current task's comm starts with any comma-separated `trace_comm=` selector;
+/// a selector ending in `$` is exact (default `systemd-executo`).
 #[cfg(feature = "syscall-trace")]
 pub fn syscall_trace_target_task() -> bool {
-    let comm = match crate::handlers::proc_comm_of_task(crate::handlers::current_task_id()) {
-        Some(c) => c,
-        None => return false,
-    };
-    let guard = TRACE_COMM.lock();
-    let filter = guard.as_deref().unwrap_or("systemd-executo");
-    filter
-        .split(',')
-        .any(|p| !p.is_empty() && comm.starts_with(p))
+    let filter = TRACE_COMM
+        .get()
+        .map(alloc::string::String::as_str)
+        .unwrap_or("systemd-executo");
+    crate::handlers::proc_comm_of_task_matches(crate::handlers::current_task_id(), filter)
 }
 
 /// Decode and print the path-string arguments of the path-taking syscalls,

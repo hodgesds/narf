@@ -89,6 +89,23 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     } else {
         source_path.clone()
     };
+    // `mount(2)` resolves symlinks in both source and target before doing a
+    // bind. Fedora's `/var/mail -> spool/mail` is one ordinary example:
+    // binding the link inode as a file mount makes later namespace remounts
+    // fail instead of binding the directory it names. `/proc/self/fd/N` magic
+    // links were expanded above from their descriptor's backing path; leave
+    // other procfs magic links to the procfs-specific resolver.
+    let target = if target.starts_with("/proc/") {
+        target
+    } else {
+        resolve_vfs_symlink_path(target.as_str(), true).unwrap_or(target)
+    };
+    let source_resolved =
+        if !source_resolved.starts_with('/') || source_resolved.starts_with("/proc/") {
+            source_resolved
+        } else {
+            resolve_vfs_symlink_path(source_resolved.as_str(), true).unwrap_or(source_resolved)
+        };
     // Silence-the-warning swallow for option bits we accept but
     // don't yet act on; they're documented above.
     let _ =
