@@ -454,6 +454,12 @@ pub(crate) fn hook_fd_path(pid: u64, fd: u32) -> Option<String> {
 type NsReadlinkFn = fn(u64, u8) -> Option<String>;
 /// `pid -> per-ns mountinfo body`. `None` ⇒ fall back to the global.
 type MountinfoFn = fn(u64) -> Option<String>;
+/// `pid -> the visible mount namespace's change generation`.
+///
+/// Linux wakes pollers of `/proc/<pid>/mountinfo` with `POLLPRI` when this
+/// value advances. Keeping the lookup here preserves the one-way procfs →
+/// userspace dependency used by the renderer hook above.
+type MountinfoGenerationFn = fn(u64) -> u64;
 /// `(pid, is_uid) -> rendered uid_map/gid_map`.
 type IdMapRenderFn = fn(u64, bool) -> Option<String>;
 /// `(pid, is_uid, bytes) -> Ok(written) | Err`. Linux one-shot rule.
@@ -461,6 +467,7 @@ type IdMapWriteFn = fn(u64, bool, &[u8]) -> Result<usize, FsError>;
 
 static NS_READLINK_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NS_MOUNTINFO_HOOK: AtomicUsize = AtomicUsize::new(0);
+static NS_MOUNTINFO_GENERATION_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NS_IDMAP_RENDER_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NS_IDMAP_WRITE_HOOK: AtomicUsize = AtomicUsize::new(0);
 
@@ -499,6 +506,14 @@ pub fn install_mountinfo_hook(mountinfo: MountinfoFn) {
     NS_MOUNTINFO_HOOK.store(mountinfo as usize, Ordering::Release);
 }
 
+/// Wire the per-namespace mount-table generation used for mountinfo poll
+/// notifications. Kept separate from the renderer hook so existing early
+/// boot users of the renderer continue to have a safe zero-generation
+/// fallback until userspace state is available.
+pub fn install_mountinfo_generation_hook(generation: MountinfoGenerationFn) {
+    NS_MOUNTINFO_GENERATION_HOOK.store(generation as usize, Ordering::Release);
+}
+
 pub(crate) fn hook_ns_readlink(pid: u64, flavour: u8) -> Option<String> {
     let v = NS_READLINK_HOOK.load(Ordering::Acquire);
     if v == 0 {
@@ -516,6 +531,17 @@ pub(crate) fn hook_ns_mountinfo(pid: u64) -> Option<String> {
     }
     // SAFETY: stored by install_ns_proc_hooks as a MountinfoFn; non-zero confirms it.
     let f: MountinfoFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+pub(crate) fn hook_ns_mountinfo_generation(pid: u64) -> u64 {
+    let v = NS_MOUNTINFO_GENERATION_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return 0;
+    }
+    // SAFETY: stored by install_mountinfo_generation_hook as exactly this
+    // fn-pointer type; non-zero confirms it was initialized.
+    let f: MountinfoGenerationFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
 

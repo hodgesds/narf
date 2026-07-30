@@ -60,9 +60,36 @@ pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    let raw = match copy_user_cstr(path_uptr, 4096) {
+        Some(path) => path,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
+    // Linux resolves a relative pathname beneath dirfd. Journald creates its
+    // runtime journal and subsequently validates directory entries through
+    // `newfstatat(parent_fd, "system.journal", AT_SYMLINK_NOFOLLOW)`; treating
+    // that name as cwd-relative made it lose the file it had just created.
+    let effective = if raw.starts_with('/') || dirfd == linux_compat::AT_FDCWD {
+        raw
+    } else if dirfd >= 0 {
+        match fd_path_for_task(current_task_id(), dirfd as u32) {
+            Some(base) if base.starts_with('/') => {
+                alloc::format!("{}/{}", base.trim_end_matches('/'), raw)
+            }
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+                return;
+            }
+        }
+    } else {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
+    };
     // AT_SYMLINK_NOFOLLOW (lstat's shape via fstatat) means "describe the
     // symlink itself" — don't follow the final component. Without it,
     // fstatat follows like plain stat.
     let follow_final = flags & linux_compat::AT_SYMLINK_NOFOLLOW == 0;
-    stat_linux_common(ctx, path_uptr, stat_out, follow_final);
+    stat_linux_path(ctx, &effective, stat_out, follow_final);
 }

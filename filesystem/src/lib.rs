@@ -618,6 +618,13 @@ pub trait FileOps: Send + Sync {
         (0, 0)
     }
 
+    /// Acknowledge readiness after an event multiplexer has actually delivered
+    /// it to its caller. Passive readiness probes (notably a nested epoll's
+    /// poll method) must not call this: some procfs sources expose a
+    /// per-open-file change edge which is consumed only by the monitor that
+    /// receives the event.
+    fn acknowledge_poll_readiness(&self, _readiness: u32) {}
+
     /// Absolute monotonic-ns instant at which this file will *next*
     /// become readable purely on its own timed schedule, if any.
     ///
@@ -1186,6 +1193,15 @@ pub trait FsInstance: Send + Sync + 'static {
     /// stable across the FS's lifetime.
     fn name(&self) -> &str;
 
+    /// Stable identity of the backing filesystem object.  This is distinct
+    /// from an individual mount attachment: bind mounts must return the
+    /// source filesystem's identity so VFS users can recognise two paths to
+    /// the same inode.  The default is the concrete filesystem allocation;
+    /// adapters that forward a source filesystem override it.
+    fn backing_identity(&self) -> usize {
+        self as *const Self as *const () as usize
+    }
+
     /// The single file this mount exposes, when the mount root is a FILE
     /// rather than a directory (Linux `mount --bind <file> <file2>`). Default
     /// `None` — a normal directory-rooted filesystem. A resolver that lands on
@@ -1517,13 +1533,40 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<(u64, u64, String, String)> {
 #[derive(Debug)]
 pub struct VfsRegistry {
     inner: IrqSafeSpinLock<Vec<Mount>>,
+    mountinfo_generation: core::sync::atomic::AtomicU64,
 }
 
 static REGISTRY: VfsRegistry = VfsRegistry {
     inner: IrqSafeSpinLock::new(Vec::new()),
+    mountinfo_generation: core::sync::atomic::AtomicU64::new(1),
 };
 
 static NEXT_MOUNT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+// A mount-table mutation changes `/proc/<pid>/mountinfo` readiness. The
+// userspace poller owns the scheduler wake mechanism, so keep that dependency
+// one-way with a boot-installed callback (the same pattern as uevent wakeups).
+static MOUNT_CHANGE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the callback invoked after a visible mount-table mutation.
+///
+/// The callback is deliberately parameterless: a poll/epoll waiter must
+/// re-query its own mountinfo file to determine whether its namespace changed.
+/// Waking all readiness waiters mirrors the existing I/O readiness bridge and
+/// prevents a mount helper's SIGCHLD from racing ahead of libmount's
+/// `POLLPRI` processing.
+pub fn install_mount_change_hook(hook: fn()) {
+    MOUNT_CHANGE_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn notify_mount_change() {
+    let raw = MOUNT_CHANGE_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: `install_mount_change_hook` stores only `fn()` values.
+        let hook: fn() = unsafe { core::mem::transmute(raw) };
+        hook();
+    }
+}
 
 fn alloc_mount_id() -> u64 {
     NEXT_MOUNT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
@@ -1612,6 +1655,7 @@ pub struct MountNamespace {
     /// process-global `NsId` counter via `NS_ID_ALLOC_HOOK`.
     id: u64,
     inner: IrqSafeSpinLock<Vec<Mount>>,
+    mountinfo_generation: core::sync::atomic::AtomicU64,
 }
 
 impl MountNamespace {
@@ -1628,6 +1672,7 @@ impl MountNamespace {
         Arc::new(Self {
             id: alloc_mount_ns_id(),
             inner: IrqSafeSpinLock::new(copied),
+            mountinfo_generation: core::sync::atomic::AtomicU64::new(1),
         })
     }
 
@@ -1652,6 +1697,14 @@ impl MountNamespace {
     /// Stable namespace id (nsfs inode in Linux).
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Monotonic change counter for `/proc/<pid>/mountinfo` poll waiters in
+    /// this namespace. It advances after every visible attach, detach, or
+    /// move, matching Linux's `POLLPRI` mountinfo notification contract.
+    pub fn mountinfo_generation(&self) -> u64 {
+        self.mountinfo_generation
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 
     /// Resolve an absolute path against this namespace.
@@ -1718,6 +1771,7 @@ impl MountNamespace {
             Some(Arc::new(BindMount {
                 root,
                 fs_name: String::from(fs.name()),
+                backing_identity: fs.backing_identity(),
             }) as Arc<dyn FsInstance>)
         })
         .flatten()
@@ -1776,6 +1830,9 @@ impl MountNamespace {
             handle,
             id: alloc_mount_id(),
         });
+        self.mountinfo_generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        notify_mount_change();
         Ok(handle)
     }
 
@@ -1818,6 +1875,10 @@ impl MountNamespace {
             .rposition(|m| m.path == path)
             .ok_or(FsError::NotFound)?;
         q.remove(index);
+        self.mountinfo_generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        drop(q);
+        notify_mount_change();
         Ok(())
     }
 
@@ -1829,6 +1890,10 @@ impl MountNamespace {
             .rposition(|m| m.path == source)
             .ok_or(FsError::NotFound)?;
         q[index].path = String::from(target);
+        self.mountinfo_generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        drop(q);
+        notify_mount_change();
         Ok(())
     }
 }
@@ -1845,6 +1910,7 @@ pub fn bootstrap_mount_authority() -> Cap<MountPoint, Grant> {
 struct BindMount {
     root: Arc<dyn DirOps>,
     fs_name: String,
+    backing_identity: usize,
 }
 
 impl fmt::Debug for BindMount {
@@ -1864,6 +1930,9 @@ impl FsInstance for BindMount {
         // their source FS name; matches Linux's /proc/mounts shape
         // where a bind mount lists the source FS type, not "bind".
         &self.fs_name
+    }
+    fn backing_identity(&self) -> usize {
+        self.backing_identity
     }
 }
 
@@ -1888,6 +1957,11 @@ impl DirOps for EmptyDir {
 struct FileMount {
     file: Arc<dyn FileOps>,
     fs_name: String,
+    // A file bind is another mount attachment to the *source* inode, not a
+    // new filesystem.  Preserve that identity for inode-aware VFS users such
+    // as pathname AF_UNIX, which must recognise the source and target as the
+    // same socket node.
+    backing_identity: usize,
 }
 
 impl fmt::Debug for FileMount {
@@ -1904,6 +1978,9 @@ impl FsInstance for FileMount {
     }
     fn name(&self) -> &str {
         &self.fs_name
+    }
+    fn backing_identity(&self) -> usize {
+        self.backing_identity
     }
     fn root_file(&self) -> Option<Arc<dyn FileOps>> {
         Some(self.file.clone())
@@ -1929,6 +2006,7 @@ fn build_bind_fs(
         return Ok(Arc::new(BindMount {
             root: source_fs.root(),
             fs_name,
+            backing_identity: source_fs.backing_identity(),
         }));
     }
     let mut dir = source_fs.root();
@@ -1943,22 +2021,39 @@ fn build_bind_fs(
     if let Some(node) = dir.lookup(last) {
         if node.stat().mode.file_type == FileType::Dir {
             if let Some(d) = dir.lookup_dir(last) {
-                return Ok(Arc::new(BindMount { root: d, fs_name }));
+                return Ok(Arc::new(BindMount {
+                    root: d,
+                    fs_name,
+                    backing_identity: source_fs.backing_identity(),
+                }));
             }
         }
         return Ok(Arc::new(FileMount {
             file: node,
             fs_name,
+            backing_identity: source_fs.backing_identity(),
         }));
     }
     // Some filesystems only expose child directories via `lookup_dir`.
     if let Some(d) = dir.lookup_dir(last) {
-        return Ok(Arc::new(BindMount { root: d, fs_name }));
+        return Ok(Arc::new(BindMount {
+            root: d,
+            fs_name,
+            backing_identity: source_fs.backing_identity(),
+        }));
     }
     Err(FsError::NotFound)
 }
 
 impl VfsRegistry {
+    /// Monotonic change counter for global `/proc/<pid>/mountinfo` poll
+    /// waiters. The userspace proc hook selects this only for tasks that have
+    /// not unshared a private mount namespace.
+    pub fn mountinfo_generation(&self) -> u64 {
+        self.mountinfo_generation
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
     /// Mount `fs` at `path`. The `authority` cap is checked live;
     /// a revoked authority returns `FsError::PermissionDenied`
     /// (via the `From<CapError>` impl) before any side effect.
@@ -1986,6 +2081,10 @@ impl VfsRegistry {
             handle,
             id: alloc_mount_id(),
         });
+        self.mountinfo_generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        drop(q);
+        notify_mount_change();
         Ok(handle)
     }
 
@@ -2008,6 +2107,10 @@ impl VfsRegistry {
             handle,
             id: alloc_mount_id(),
         });
+        self.mountinfo_generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        drop(q);
+        notify_mount_change();
         Ok(handle)
     }
 
@@ -2112,10 +2215,13 @@ impl VfsRegistry {
             .rposition(|m| m.path == path)
             .ok_or(FsError::NotFound)?;
         let m = q.remove(pos);
+        self.mountinfo_generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         // Drop the FS Arc outside the lock to keep the critical
         // section short — important once page-cache eviction lands.
         drop(q);
         drop(m);
+        notify_mount_change();
         Ok(())
     }
 
@@ -2134,6 +2240,10 @@ impl VfsRegistry {
             .ok_or(FsError::NotFound)?;
         // Overmount is allowed: moving onto an occupied path stacks (see `mount`).
         q[index].path = String::from(target);
+        self.mountinfo_generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        drop(q);
+        notify_mount_change();
         Ok(())
     }
 
@@ -2246,6 +2356,7 @@ impl VfsRegistry {
             Some(Arc::new(BindMount {
                 root,
                 fs_name: String::from(fs.name()),
+                backing_identity: fs.backing_identity(),
             }) as Arc<dyn FsInstance>)
         })
         .flatten()

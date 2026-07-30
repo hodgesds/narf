@@ -51,7 +51,10 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 Some(t.open_at_least(clone, min_fd))
             });
             match outcome {
-                Some(Some(new_fd)) => ctx.set_return(SyscallReturn::ok(new_fd as u64)),
+                Some(Some(new_fd)) => {
+                    crate::mqueue::duplicate_fd_path(task, fd, new_fd);
+                    ctx.set_return(SyscallReturn::ok(new_fd as u64));
+                }
                 // F_DUPFD on a fd that isn't open → -EBADF (was InvalidOp).
                 _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
             }
@@ -369,6 +372,11 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     });
     match outcome {
         Some(Some(r)) => ctx.set_return(r),
-        _ => ctx.set_return(SyscallReturn::invalid_op()),
+        // Linux validates the descriptor before dispatching the command
+        // (`fs/fcntl.c::SYSCALL_DEFINE3(fcntl)`).  In particular, callers such
+        // as D-Bus use F_GETFD to probe inherited descriptors and must observe
+        // -EBADF for a closed slot, not NARF's internal InvalidOp value (zero
+        // on the Linux return-value wire).
+        _ => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),
     }
 }

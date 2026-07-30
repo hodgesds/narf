@@ -37,6 +37,12 @@ pub fn donate_to(task: TaskId) -> impl Future<Output=()>; // direct context tran
 pub fn set_task_mems_allowed(task: u64, mask: u64);
 pub fn task_mems_allowed(task: u64) -> u64;
 pub fn clear_task_mems_allowed(task: u64);
+pub fn install_memory_pid_resolver(resolve: fn(task: u64) -> Option<u64>);
+pub fn install_process_task_resolver(resolve: fn(pid: u64) -> Option<u64>);
+pub fn online_cpu_set() -> CpuSet;
+pub fn task_affinity(task: TaskId) -> Option<CpuSet>;
+pub fn set_task_affinity(task: TaskId, requested: CpuSet)
+    -> Result<(), SetAffinityError>;
 /// Distinct live user address spaces, including currently-polled tasks.
 pub fn all_address_spaces() -> Vec<Arc<AddressSpace>>;
 pub fn set_user_perf_switch_hook(hook: fn(task: u64, running: bool));
@@ -49,6 +55,10 @@ carries `DomainId` so the executor switches domain before polling.
 The per-task NUMA mask is the task-identity seam for cgroup-v2
 `cpuset.mems`; the page-fault policy resolver treats it as a hard
 allocation boundary and removes it when the task exits or detaches.
+The memory-controller charge provider resolves the executor-private `TaskId`
+through `install_memory_pid_resolver` before charging: cgroup membership is
+keyed by the outer userspace ProcessId, never by a numerically coincident task
+id. Kernel tasks and unmapped bootstrap tasks remain unattributed.
 The optional userspace PMU hook brackets every stackful continuation in
 executor context after run-queue locks have been released. `running=true`
 precedes the switch into the task and `running=false` follows every switch
@@ -97,12 +107,25 @@ pub struct TaskSpec {
 ```
 
 - **Hints, not guarantees.** The executor honours `Affinity.preferred`
-  when possible; work-stealing may move a task within `allowed` under
-  load.
+  for initial placement when possible; a completed poll remains on its
+  current CPU while that CPU is allowed. Work-stealing may move a task
+  within `allowed` under load.
+- Runtime affinity updates are published in a task-identity registry so
+  a currently-polled slot cannot miss them. A parked slot whose queue is
+  excluded is moved immediately; a running cooperative continuation is
+  moved only after it yields back to the executor.
+- The infallible spawn API validates that an initial mask contains an online
+  CPU. A partly offline mask is retained for future hot-plug; if an internal
+  caller supplies a wholly stale/offline mask, creation falls back to the
+  caller's online CPU instead of admitting an unrunnable slot. Subsequent
+  runtime updates reject an empty effective mask.
 - **`smt_share: Require`** is opt-in (latency-sensitive driver pairs
   that benefit from sharing an LLC).
-- Pinning a task to a specific CPU requires a `Cap<CpuAffinity, Pin>`
-  — not ambient, to prevent user tasks locking out kernel work.
+- Native domain callers that restrict another domain's tasks require
+  `Cap<CpuAffinity, Pin>`; the capability-bearing control surface remains
+  separate from Linux process compatibility. The Linux-compat
+  `sched_setaffinity(2)` bridge authorises self/same-uid processes and calls
+  the task-identity/online-mask checked scheduler path.
 
 ### 3.4 Resource accounting (CPU share)
 
@@ -151,7 +174,9 @@ pub fn cpu_take_offline(id: CpuId, cap: &Cap<CpuLifecycle, Manage>) -> impl Futu
 - The executor never holds a lock across a poll boundary.
 - Work-stealing preserves per-task FIFO ordering of wakes.
 - A task is never scheduled on a CPU outside its `Affinity.allowed`
-  set. Work-stealing respects this as a hard constraint.
+  set. Work-stealing and runtime requeue both respect this as a hard
+  constraint; a mask change takes effect at the next cooperative poll
+  boundary if the task is already executing.
 - `cpu_take_offline` is atomic from a running-task's perspective:
   it sees either the old CPU or a new CPU; never a torn migration.
 - Resource-budget accounting is never racy: a task that exceeds its

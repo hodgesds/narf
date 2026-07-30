@@ -220,6 +220,35 @@ pub enum UnixAddr {
     Unnamed,
 }
 
+/// A pathname UNIX socket is identified by the directory entry the caller
+/// resolves, not by the spelling in `sun_path`. The backing filesystem plus
+/// parent inode preserves aliases through a bind mount while a private
+/// overmount remains distinct. This mirrors the VFS boundary without
+/// pretending a mount-namespace ID is an inode.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct UnixPathKey {
+    filesystem: usize,
+    parent_ino: u64,
+    /// Legacy initramfs directory handles are rebuilt on every lookup and do
+    /// not expose an inode. In that case retain the mount-relative parent
+    /// spelling as the stable portion of the VFS key.
+    fallback_parent_path: Option<String>,
+    name: String,
+}
+
+impl UnixPathKey {
+    fn for_current_path(path: &str) -> Self {
+        let (filesystem, parent_ino, fallback_parent_path, name) =
+            crate::handlers::unix_socket_path_key(path).unwrap_or((0, 0, None, String::from(path)));
+        Self {
+            filesystem,
+            parent_ino,
+            fallback_parent_path,
+            name,
+        }
+    }
+}
+
 impl UnixAddr {
     /// Parse the `body` bytes of an AF_UNIX `SockAddr` (everything after
     /// the 2-byte family). `body.len()` equals `addrlen - 2`, so an empty
@@ -392,6 +421,14 @@ pub struct SocketFile {
     /// socket() time. Keys AF_INET bind tables and selects namespace-scoped
     /// netlink, routing, interface, and netfilter views.
     net_ns_id: core::sync::atomic::AtomicU64,
+    /// Filesystem identity of this socket's bound pathname, if any.  Keep it
+    /// with the endpoint so close/listen unregister the same inode even if an
+    /// fd crossed into a different mount namespace.
+    bound_unix_path: IrqSafeSpinLock<Option<UnixPathKey>>,
+    /// Filesystem identity captured by a connected pathname datagram socket.
+    /// `connect(2)` resolves its peer once; subsequent `send(2)` calls do not
+    /// re-resolve it in whichever namespace happens to own a passed fd.
+    connected_unix_path: IrqSafeSpinLock<Option<UnixPathKey>>,
     #[cfg(feature = "container")]
     net_namespace: IrqSafeSpinLock<Option<Arc<crate::namespaces::NetNamespace>>>,
     /// Credentials of the process that owns this socket end. Stamped by
@@ -780,6 +817,8 @@ impl SocketFile {
             nonblock: AtomicBool::new(false),
             pending_error: IrqSafeSpinLock::new(None),
             net_ns_id: core::sync::atomic::AtomicU64::new(0),
+            bound_unix_path: IrqSafeSpinLock::new(None),
+            connected_unix_path: IrqSafeSpinLock::new(None),
             #[cfg(feature = "container")]
             net_namespace: IrqSafeSpinLock::new(None),
             local_cred: IrqSafeSpinLock::new(Ucred::default()),
@@ -1367,16 +1406,17 @@ impl SocketFile {
     /// sockets are no-ops.
     pub fn unregister(&self) {
         enum Reg {
-            Unix(String),
-            AbstractStream(Vec<u8>),
+            Unix(UnixPathKey),
+            AbstractStream((u64, Vec<u8>)),
             Inet(u32, u16),
             Inet6([u8; 16], u16),
-            UnixDgram(String),
-            AbstractDgram(Vec<u8>),
+            UnixDgram(UnixPathKey),
+            AbstractDgram((u64, Vec<u8>)),
             InetDgram(u32, u16),
             Tcb(u32),
             None,
         }
+        let bound_path = self.bound_unix_path.lock().clone();
         let reg = {
             let state = self.state.lock();
             match &*state {
@@ -1386,8 +1426,12 @@ impl SocketFile {
                     local_addr: Some(addr),
                     ..
                 } => match addr {
-                    UnixAddr::Path(p) => Reg::Unix(p.clone()),
-                    UnixAddr::Abstract(n) => Reg::AbstractStream(n.clone()),
+                    UnixAddr::Path(p) => Reg::Unix(
+                        bound_path
+                            .clone()
+                            .unwrap_or_else(|| UnixPathKey::for_current_path(p)),
+                    ),
+                    UnixAddr::Abstract(n) => Reg::AbstractStream((self.net_ns_id(), n.clone())),
                     UnixAddr::Unnamed => Reg::None,
                 },
                 SocketState::InetListener {
@@ -1407,8 +1451,12 @@ impl SocketFile {
                 }
                 SocketState::Inet6Listener { addr, port, .. } => Reg::Inet6(*addr, *port),
                 SocketState::UnixDgram { addr: Some(a), .. } => match a {
-                    UnixAddr::Path(p) => Reg::UnixDgram(p.clone()),
-                    UnixAddr::Abstract(n) => Reg::AbstractDgram(n.clone()),
+                    UnixAddr::Path(p) => Reg::UnixDgram(
+                        bound_path
+                            .clone()
+                            .unwrap_or_else(|| UnixPathKey::for_current_path(p)),
+                    ),
+                    UnixAddr::Abstract(n) => Reg::AbstractDgram((self.net_ns_id(), n.clone())),
                     UnixAddr::Unnamed => Reg::None,
                 },
                 SocketState::InetDgram {
@@ -3076,12 +3124,12 @@ impl SocketFile {
                     UnixAddr::Path(p) => LISTENERS
                         .lock()
                         .as_ref()
-                        .map(|m| m.contains_key(p))
+                        .map(|m| m.contains_key(&UnixPathKey::for_current_path(p)))
                         .unwrap_or(false),
                     UnixAddr::Abstract(n) => ABSTRACT_STREAM
                         .lock()
                         .as_ref()
-                        .map(|m| m.contains_key(n))
+                        .map(|m| m.contains_key(&(self.net_ns_id(), n.clone())))
                         .unwrap_or(false),
                     UnixAddr::Unnamed => false,
                 };
@@ -3094,7 +3142,10 @@ impl SocketFile {
                 if let UnixAddr::Abstract(n) = &uaddr {
                     let mut reg = ABSTRACT_STREAM.lock();
                     reg.get_or_insert_with(BTreeMap::new)
-                        .insert(n.clone(), self.clone());
+                        .insert((self.net_ns_id(), n.clone()), self.clone());
+                }
+                if let UnixAddr::Path(p) = &uaddr {
+                    *self.bound_unix_path.lock() = Some(UnixPathKey::for_current_path(p));
                 }
                 *state = SocketState::UnixBound { addr: uaddr };
                 SocketOpResult::Ok(0)
@@ -3118,10 +3169,15 @@ impl SocketFile {
                 // addresses were reserved in bind(), so this is a no-op.
                 if let UnixAddr::Path(p) = addr {
                     drop(state);
+                    let key = self
+                        .bound_unix_path
+                        .lock()
+                        .clone()
+                        .unwrap_or_else(|| UnixPathKey::for_current_path(&p));
                     LISTENERS
                         .lock()
                         .get_or_insert_with(BTreeMap::new)
-                        .insert(p, self.clone());
+                        .insert(key, self.clone());
                 }
                 SocketOpResult::Ok(0)
             }
@@ -3152,11 +3208,14 @@ impl SocketFile {
                     _ => return SocketOpResult::Err(SockError::InvalidArg),
                 };
                 let listener = match &uaddr {
-                    UnixAddr::Path(p) => LISTENERS.lock().as_ref().and_then(|m| m.get(p).cloned()),
+                    UnixAddr::Path(p) => LISTENERS
+                        .lock()
+                        .as_ref()
+                        .and_then(|m| m.get(&UnixPathKey::for_current_path(p)).cloned()),
                     UnixAddr::Abstract(n) => ABSTRACT_STREAM
                         .lock()
                         .as_ref()
-                        .and_then(|m| m.get(n).cloned()),
+                        .and_then(|m| m.get(&(self.net_ns_id(), n.clone())).cloned()),
                     UnixAddr::Unnamed => None,
                 };
                 let listener = match listener {
@@ -3771,20 +3830,23 @@ impl SocketFile {
                 }
                 match &uaddr {
                     UnixAddr::Path(p) => {
+                        let key = UnixPathKey::for_current_path(p);
                         let mut bound = UNIX_DGRAM_BOUND.lock();
                         let map = bound.get_or_insert_with(BTreeMap::new);
-                        if map.contains_key(p) {
+                        if map.contains_key(&key) {
                             return SocketOpResult::Err(SockError::AddrInUse);
                         }
-                        map.insert(p.clone(), self.clone());
+                        *self.bound_unix_path.lock() = Some(key.clone());
+                        map.insert(key, self.clone());
                     }
                     UnixAddr::Abstract(n) => {
                         let mut bound = ABSTRACT_DGRAM.lock();
                         let map = bound.get_or_insert_with(BTreeMap::new);
-                        if map.contains_key(n) {
+                        let key = (self.net_ns_id(), n.clone());
+                        if map.contains_key(&key) {
                             return SocketOpResult::Err(SockError::AddrInUse);
                         }
-                        map.insert(n.clone(), self.clone());
+                        map.insert(key, self.clone());
                     }
                     UnixAddr::Unnamed => return SocketOpResult::Err(SockError::InvalidArg),
                 }
@@ -3804,6 +3866,11 @@ impl SocketFile {
                     _ => return SocketOpResult::Err(SockError::InvalidArg),
                 };
                 let mut state = self.state.lock();
+                if let UnixAddr::Path(p) = &uaddr {
+                    *self.connected_unix_path.lock() = Some(UnixPathKey::for_current_path(p));
+                } else {
+                    *self.connected_unix_path.lock() = None;
+                }
                 if matches!(&*state, SocketState::Fresh) {
                     *state = SocketState::UnixDgram {
                         addr: None,
@@ -3824,8 +3891,9 @@ impl SocketFile {
                 flags: _,
                 addr,
             } => {
+                let explicit_dest = addr.is_some();
                 let state = self.state.lock();
-                let (local_addr, dest_addr) = match &*state {
+                let (local_addr, dest_addr, connected_path) = match &*state {
                     SocketState::UnixDgram { addr: la, peer, .. } => {
                         let dest = if let Some(a) = addr {
                             match UnixAddr::parse(&a.body) {
@@ -3837,7 +3905,7 @@ impl SocketFile {
                         } else {
                             return SocketOpResult::Err(SockError::InvalidArg);
                         };
-                        (la.clone(), dest)
+                        (la.clone(), dest, self.connected_unix_path.lock().clone())
                     }
                     // Unbound datagram sendto: Linux auto-binds an unnamed
                     // local address and delivers to the explicit destination.
@@ -3851,7 +3919,7 @@ impl SocketFile {
                             },
                             None => return SocketOpResult::Err(SockError::InvalidArg),
                         };
-                        (None, dest)
+                        (None, dest, None)
                     }
                     _ => return SocketOpResult::Err(SockError::NotConnected),
                 };
@@ -3860,14 +3928,21 @@ impl SocketFile {
                 let sender_cred = crate::handlers::current_ucred();
                 drop(state);
                 let dest_sock = match &dest_addr {
-                    UnixAddr::Path(p) => UNIX_DGRAM_BOUND
-                        .lock()
-                        .as_ref()
-                        .and_then(|m| m.get(p).cloned()),
+                    UnixAddr::Path(p) => {
+                        let key = if explicit_dest {
+                            UnixPathKey::for_current_path(p)
+                        } else {
+                            connected_path.unwrap_or_else(|| UnixPathKey::for_current_path(p))
+                        };
+                        UNIX_DGRAM_BOUND
+                            .lock()
+                            .as_ref()
+                            .and_then(|m| m.get(&key).cloned())
+                    }
                     UnixAddr::Abstract(n) => ABSTRACT_DGRAM
                         .lock()
                         .as_ref()
-                        .and_then(|m| m.get(n).cloned()),
+                        .and_then(|m| m.get(&(self.net_ns_id(), n.clone())).cloned()),
                     UnixAddr::Unnamed => None,
                 };
                 let dest_sock = match dest_sock {
@@ -4554,7 +4629,7 @@ type Inet4Map = BTreeMap<(u64, u32, u16), Arc<SocketFile>>;
 /// Registry map keyed by AF_INET6 (ipv6, port).
 type Inet6Map = BTreeMap<([u8; 16], u16), Arc<SocketFile>>;
 
-static LISTENERS: IrqSafeSpinLock<Option<BTreeMap<String, Arc<SocketFile>>>> =
+static LISTENERS: IrqSafeSpinLock<Option<BTreeMap<UnixPathKey, Arc<SocketFile>>>> =
     IrqSafeSpinLock::new(None);
 
 /// Release a bound AF_UNIX pathname from the stream + dgram registries so
@@ -4563,12 +4638,13 @@ static LISTENERS: IrqSafeSpinLock<Option<BTreeMap<String, Arc<SocketFile>>>> =
 /// in Linux removing the socket inode frees the address. Returns true if
 /// an entry was actually removed (the path was a live bound socket).
 pub fn unbind_path(path: &str) -> bool {
+    let key = UnixPathKey::for_current_path(path);
     let mut removed = false;
     if let Some(map) = LISTENERS.lock().as_mut() {
-        removed |= map.remove(path).is_some();
+        removed |= map.remove(&key).is_some();
     }
     if let Some(map) = UNIX_DGRAM_BOUND.lock().as_mut() {
-        removed |= map.remove(path).is_some();
+        removed |= map.remove(&key).is_some();
     }
     removed
 }
@@ -4587,7 +4663,7 @@ static INET6_LISTENERS: IrqSafeSpinLock<Option<Inet6Map>> = IrqSafeSpinLock::new
 static INET_DGRAM_BOUND: IrqSafeSpinLock<Option<Inet4Map>> = IrqSafeSpinLock::new(None);
 
 /// AF_UNIX datagram-bound registry: path → socket.
-static UNIX_DGRAM_BOUND: IrqSafeSpinLock<Option<BTreeMap<String, Arc<SocketFile>>>> =
+static UNIX_DGRAM_BOUND: IrqSafeSpinLock<Option<BTreeMap<UnixPathKey, Arc<SocketFile>>>> =
     IrqSafeSpinLock::new(None);
 
 // ── Abstract-namespace registries (sun_path[0] == '\0') ─────────
@@ -4599,12 +4675,13 @@ static UNIX_DGRAM_BOUND: IrqSafeSpinLock<Option<BTreeMap<String, Arc<SocketFile>
 // D-Bus stream socket both live here.
 
 /// Abstract-namespace SOCK_STREAM / SOCK_SEQPACKET listeners: name → socket.
-static ABSTRACT_STREAM: IrqSafeSpinLock<Option<BTreeMap<Vec<u8>, Arc<SocketFile>>>> =
+type AbstractSocketRegistry = BTreeMap<(u64, Vec<u8>), Arc<SocketFile>>;
+
+static ABSTRACT_STREAM: IrqSafeSpinLock<Option<AbstractSocketRegistry>> =
     IrqSafeSpinLock::new(None);
 
 /// Abstract-namespace SOCK_DGRAM bound sockets: name → socket.
-static ABSTRACT_DGRAM: IrqSafeSpinLock<Option<BTreeMap<Vec<u8>, Arc<SocketFile>>>> =
-    IrqSafeSpinLock::new(None);
+static ABSTRACT_DGRAM: IrqSafeSpinLock<Option<AbstractSocketRegistry>> = IrqSafeSpinLock::new(None);
 
 /// Monotonic counter for autobind (`Unnamed`) addresses. Linux assigns a
 /// 5-hex-digit abstract name; we mint `\0<hex>` names from this counter.
@@ -4623,7 +4700,9 @@ fn autobind_name(stream: bool) -> Vec<u8> {
             } else {
                 ABSTRACT_DGRAM.lock()
             };
-            reg.as_ref().map(|m| m.contains_key(&name)).unwrap_or(false)
+            reg.as_ref()
+                .map(|m| m.keys().any(|(_, existing)| existing == &name))
+                .unwrap_or(false)
         };
         if !taken {
             return name;

@@ -18,7 +18,7 @@ pub(crate) fn sys_futimesat(ctx: &mut dyn TrapContext) {
     let eff = if raw.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
         raw
     } else {
-        match fd_path_of(current_task_id(), dirfd as u32) {
+        match fd_path_for_task(current_task_id(), dirfd as u32) {
             Some(dir) if dir.starts_with('/') => {
                 alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
             }

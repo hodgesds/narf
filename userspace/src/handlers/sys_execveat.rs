@@ -28,14 +28,14 @@ pub(crate) fn sys_execveat(ctx: &mut dyn TrapContext) {
     //   - relative path → resolved against the dirfd's recorded open path.
     let resolved: Option<alloc::string::String> = if path_str.is_empty() {
         if (a.arg4 & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
-            fd_path_of(task, dirfd as u32)
+            fd_path_for_task(task, dirfd as u32)
         } else {
             None
         }
     } else if path_str.starts_with('/') {
         Some(path_str)
     } else if dirfd >= 0 {
-        fd_path_of(task, dirfd as u32).map(|mut d| {
+        fd_path_for_task(task, dirfd as u32).map(|mut d| {
             if !d.ends_with('/') {
                 d.push('/');
             }

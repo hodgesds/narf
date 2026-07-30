@@ -1128,16 +1128,16 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_move_mount_neg);
 
 // ── open_tree ─────────────────────────────────────────────────────────
 //
-// open_tree(dfd, path, flags) → detached-mount fd cloning the mount that
-// covers an existing absolute path. A MemFs mounted at /abi gives a real
-// fs to clone.
+// open_tree(dfd, path, flags) → O_PATH fd by default; OPEN_TREE_CLONE
+// requests a detached mount fd cloning the mount that covers an existing
+// absolute path. A MemFs mounted at /abi gives a real fs to clone.
 
 fn smoke_abi_fsx_open_tree_pos() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
         let path = b"/abi\0";
         match call(Syscall::OpenTree.raw(), a2(0, path.as_ptr() as u64, 0)) {
             Some(v) if v >= 0 => Ok(()),
-            _ => Err("open_tree of a mounted path should return a detached-mount fd"),
+            _ => Err("open_tree of a mounted path should return an O_PATH fd"),
         }
     })
 }
@@ -1146,9 +1146,13 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_open_tree_pos);
 fn smoke_abi_fsx_open_tree_mount_fd_relative() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
         let path = b"/abi\0";
-        let mount_fd = match call(Syscall::OpenTree.raw(), a2(0, path.as_ptr() as u64, 0)) {
+        const OPEN_TREE_CLONE: u64 = 1;
+        let mount_fd = match call(
+            Syscall::OpenTree.raw(),
+            a2(0, path.as_ptr() as u64, OPEN_TREE_CLONE),
+        ) {
             Some(fd) if fd >= 0 => fd as u64,
-            _ => return Err("first open_tree should return a mount-object fd"),
+            _ => return Err("open_tree(OPEN_TREE_CLONE) should return a mount-object fd"),
         };
         let mut stat = [0u8; 256];
         if call(Syscall::Fstat.raw(), a1(mount_fd, stat.as_mut_ptr() as u64)) != Some(0) {

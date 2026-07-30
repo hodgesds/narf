@@ -72,7 +72,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // over the procfs entry instead of the directory and leaves the assembled
     // namespace root absent.
     let target_path = parse_proc_self_fd(target_raw.as_str())
-        .and_then(|fd| fd_path_of(current_task_id(), fd))
+        .and_then(|fd| fd_path_for_task(current_task_id(), fd))
         .filter(|path| path.starts_with('/'))
         .unwrap_or(target_raw);
     // Resolve target under the calling task's chroot.
@@ -81,7 +81,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // source-as-label is harmless to pass through; block-device names
     // don't start with `/` so apply_chroot is a no-op).
     let source_path = parse_proc_self_fd(source.as_str())
-        .and_then(|fd| fd_path_of(current_task_id(), fd))
+        .and_then(|fd| fd_path_for_task(current_task_id(), fd))
         .filter(|path| path.starts_with('/'))
         .unwrap_or_else(|| source.clone());
     let source_resolved = if source_path.starts_with('/') {
@@ -89,6 +89,23 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     } else {
         source_path.clone()
     };
+    // `mount(2)` resolves symlinks in both source and target before doing a
+    // bind. Fedora's `/var/mail -> spool/mail` is one ordinary example:
+    // binding the link inode as a file mount makes later namespace remounts
+    // fail instead of binding the directory it names. `/proc/self/fd/N` magic
+    // links were expanded above from their descriptor's backing path; leave
+    // other procfs magic links to the procfs-specific resolver.
+    let target = if target.starts_with("/proc/") {
+        target
+    } else {
+        resolve_vfs_symlink_path(target.as_str(), true).unwrap_or(target)
+    };
+    let source_resolved =
+        if !source_resolved.starts_with('/') || source_resolved.starts_with("/proc/") {
+            source_resolved
+        } else {
+            resolve_vfs_symlink_path(source_resolved.as_str(), true).unwrap_or(source_resolved)
+        };
     // Silence-the-warning swallow for option bits we accept but
     // don't yet act on; they're documented above.
     let _ =

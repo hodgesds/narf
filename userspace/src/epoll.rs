@@ -303,6 +303,15 @@ impl EpollInstance {
                 continue;
             }
 
+            // Some readiness sources carry a per-open-file change edge.
+            // Consume it only after this epoll has accepted the event for
+            // delivery. `EpollInstance::poll_readiness()` is intentionally a
+            // passive query for nested epolls and therefore never performs
+            // this acknowledgement; otherwise systemd's manager epoll can
+            // steal libmount's mountinfo event before libmount drains it.
+            if let Some(file) = item.file.upgrade() {
+                file.acknowledge_poll_readiness(cur_mask);
+            }
             results.push((ready, item.data));
             delivered_fds.push(*fd);
         }
@@ -758,6 +767,17 @@ pub fn sys_epoll_pwait2(ctx: &mut dyn TrapContext) {
     epoll_wait_common(ctx, true, Some(timeout_ms));
 }
 
+/// A live user task can park through either execution model. The legacy model
+/// needs its longjmp hook; the own-stack model instead switches directly back
+/// to the executor and deliberately has no such hook.
+#[inline]
+pub(crate) fn can_park_with_task_context(
+    own_stack_enabled: bool,
+    legacy_yield_hook_present: bool,
+) -> bool {
+    own_stack_enabled || legacy_yield_hook_present
+}
+
 /// `is_pwait` selects the sigmask save/restore (epoll_pwait / epoll_pwait2).
 /// `timeout_override` supplies a pre-computed ms timeout for callers whose
 /// arg3 is NOT already an `int` ms (epoll_pwait2's `timespec*`); `None` reads
@@ -825,7 +845,6 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
     // single non-blocking readiness poll. `uctx` is therefore an
     // Option; `None` forces the `timeout == 0` (non-blocking) path.
     let uctx_opt = crate::user_task::current_user_task();
-
     // Reset the net-I/O-wait *flag* on every (re-)entry (the syscall
     // re-executes via RIP-rewind each park cycle). We deliberately do
     // NOT drop the io-waiter here: the readiness wake `take()`s the
@@ -944,87 +963,96 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                 return;
             }
             _ => {
-                if let (Some(uctx_ptr), Some(hook)) = (uctx_opt, crate::user_task::yield_hook()) {
-                    // Check for signals. If delivered, return -EINTR.
-                    if let Some(h) = crate::signal_delivery_hook() {
-                        if h(ctx, crate::Syscall::EpollWait.raw()) {
-                            // Signal delivered. Interrupt syscall with EINTR.
-                            if let Some(old) = old_mask {
-                                crate::handlers::set_signal_mask_for_task(task, old);
+                if let Some(uctx_ptr) = uctx_opt {
+                    let own_stack = narf_scheduler::stackful::user_own_stack_enabled();
+                    let hook = crate::user_task::yield_hook();
+                    if !can_park_with_task_context(own_stack, hook.is_some()) {
+                        // A task context exists, but this execution mode has no
+                        // route back to an executor. Fall through to the
+                        // non-blocking fallback below rather than spinning.
+                    } else {
+                        // Check for signals. If delivered, return -EINTR.
+                        if let Some(h) = crate::signal_delivery_hook() {
+                            if h(ctx, crate::Syscall::EpollWait.raw()) {
+                                // Signal delivered. Interrupt syscall with EINTR.
+                                if let Some(old) = old_mask {
+                                    crate::handlers::set_signal_mask_for_task(task, old);
+                                }
+                                ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                                // SAFETY: `uctx_ptr` is the in-flight task's
+                                // `UserTaskCtx` from `CURRENT`, live for this trap;
+                                // `sleep_deadline_ns` is an atomic field, so the
+                                // store needs only a valid pointer.
+                                // SAFETY: Valid memory or trusted environment
+                                unsafe {
+                                    (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
+                                    (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                                };
+                                return;
                             }
-                            ctx.set_return(SyscallReturn::ok((-4i64) as u64));
-                            // SAFETY: `uctx_ptr` is the in-flight task's
-                            // `UserTaskCtx` from `CURRENT`, live for this trap;
-                            // `sleep_deadline_ns` is an atomic field, so the
-                            // store needs only a valid pointer.
-                            // SAFETY: Valid memory or trusted environment
-                            unsafe {
-                                (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
-                                (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
-                            };
-                            return;
                         }
-                    }
 
-                    // epoll_pwait: restore the caller's signal mask before we
-                    // park. This syscall re-executes from the top on resume
-                    // (RIP rewind below), which re-applies the pwait sigmask and
-                    // re-snapshots the "old" mask. If we left the pwait mask
-                    // applied across the park, that re-snapshot would capture
-                    // the ALREADY-modified mask and the caller's original would
-                    // be lost permanently. (The pre-park signal check above
-                    // already ran with the pwait mask applied.)
-                    if let Some(old) = old_mask {
-                        crate::handlers::set_signal_mask_for_task(task, old);
-                    }
-                    // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx`
-                    // from `CURRENT`, live for this trap; `state`/`exit_reason`
-                    // are its own `UnsafeCell` fields and the `hook` consumes
-                    // the same pointer to park exactly this task.
-                    // SAFETY: Valid memory or trusted environment
-                    unsafe {
-                        let uc = &*uctx_ptr;
-                        // Flag this park as a net-I/O wait so the poll
-                        // routine registers our waker for inbound-data
-                        // wakeups (immediate re-poll on TCP data instead
-                        // of waiting out the deadline).
-                        uc.net_io_wait.store(true, Ordering::Release);
-                        // Clamp the scheduler wake-up to the nearest armed
-                        // timerfd in the interest set. A timerfd expiry does
-                        // NOT fire a readiness notify (unlike socket data), so
-                        // without this clamp a timerfd-driven wait sleeps until
-                        // the full timeout — or, with an infinite timeout (the
-                        // Wayland repaint loop), forever. On wake the syscall
-                        // re-executes from the top and re-polls, finding the
-                        // timer ready. (For a finite timeout this replaces the
-                        // persisted timeout deadline with the earlier timer one;
-                        // since the timer is readable at that instant the re-poll
-                        // returns its event before the timeout path is reached.
-                        // The only lost case is a timer disarmed from another
-                        // thread mid-park, which no single-threaded waiter hits.)
-                        if let Some(timer_dl) = instance.nearest_poll_deadline(task) {
-                            let cur = uc.sleep_deadline_ns.load(Ordering::Acquire);
-                            let clamped = if cur == 0 {
-                                timer_dl
-                            } else {
-                                cur.min(timer_dl)
-                            };
-                            uc.sleep_deadline_ns.store(clamped, Ordering::Release);
+                        // epoll_pwait: restore the caller's signal mask before we
+                        // park. This syscall re-executes from the top on resume
+                        // (RIP rewind below), which re-applies the pwait sigmask and
+                        // re-snapshots the "old" mask. If we left the pwait mask
+                        // applied across the park, that re-snapshot would capture
+                        // the ALREADY-modified mask and the caller's original would
+                        // be lost permanently. (The pre-park signal check above
+                        // already ran with the pwait mask applied.)
+                        if let Some(old) = old_mask {
+                            crate::handlers::set_signal_mask_for_task(task, old);
                         }
-                        // Rewind RIP so we re-execute epoll_wait on resume.
-                        ctx.set_rip(ctx.rip().wrapping_sub(2));
-                        ctx.save_user_state(uc.state.get() as *mut u8);
-                        *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                        if narf_scheduler::stackful::user_own_stack_enabled() {
-                            crate::handlers::own_stack_block(ctx);
-                            return;
+                        // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx`
+                        // from `CURRENT`, live for this trap; `state`/`exit_reason`
+                        // are its own `UnsafeCell` fields and the `hook` consumes
+                        // the same pointer to park exactly this task.
+                        // SAFETY: Valid memory or trusted environment
+                        unsafe {
+                            let uc = &*uctx_ptr;
+                            // Flag this park as a net-I/O wait so the poll
+                            // routine registers our waker for inbound-data
+                            // wakeups (immediate re-poll on TCP data instead
+                            // of waiting out the deadline).
+                            uc.net_io_wait.store(true, Ordering::Release);
+                            // Clamp the scheduler wake-up to the nearest armed
+                            // timerfd in the interest set. A timerfd expiry does
+                            // NOT fire a readiness notify (unlike socket data), so
+                            // without this clamp a timerfd-driven wait sleeps until
+                            // the full timeout — or, with an infinite timeout (the
+                            // Wayland repaint loop), forever. On wake the syscall
+                            // re-executes from the top and re-polls, finding the
+                            // timer ready. (For a finite timeout this replaces the
+                            // persisted timeout deadline with the earlier timer one;
+                            // since the timer is readable at that instant the re-poll
+                            // returns its event before the timeout path is reached.
+                            // The only lost case is a timer disarmed from another
+                            // thread mid-park, which no single-threaded waiter hits.)
+                            if let Some(timer_dl) = instance.nearest_poll_deadline(task) {
+                                let cur = uc.sleep_deadline_ns.load(Ordering::Acquire);
+                                let clamped = if cur == 0 {
+                                    timer_dl
+                                } else {
+                                    cur.min(timer_dl)
+                                };
+                                uc.sleep_deadline_ns.store(clamped, Ordering::Release);
+                            }
+                            // Rewind RIP so we re-execute epoll_wait on resume.
+                            ctx.set_rip(ctx.rip().wrapping_sub(2));
+                            ctx.save_user_state(uc.state.get() as *mut u8);
+                            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                            if own_stack {
+                                crate::handlers::own_stack_block(ctx);
+                                return;
+                            }
+                            // `can_park_with_task_context` above established that
+                            // the legacy execution path has its mandatory hook.
+                            hook.expect("legacy epoll park requires yield hook")(uctx_ptr);
                         }
-                        hook(uctx_ptr);
                     }
-                    // unreachable
                 }
 
-                // No task context or no yield hook to park on (the
+                // No task context or execution-model park route (the
                 // in-kernel test harness, or an early-boot caller):
                 // there is no cooperative way to block, so report no
                 // events ready rather than spinning forever. A real

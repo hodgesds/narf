@@ -635,6 +635,66 @@ fn smoke_mount_ns_isolation() -> TestResult {
 }
 kernel_test_in!("userspace/mount", smoke_mount_ns_isolation);
 
+// ── Smoke 5a: fork inherits a private mount namespace ──────────────
+// Mount namespaces are a Linux-compat primitive, not a container-only one.
+// A child of a process that called unshare(CLONE_NEWNS) must share the exact
+// namespace object: each side sees mounts made by the other, while the global
+// registry remains unchanged. This mirrors Linux copy_mnt_ns() on fork.
+fn smoke_mount_ns_fork_inherits_private_view() -> TestResult {
+    const PARENT: u64 = 0x0007_106a;
+    const CHILD: u64 = 0x0007_106b;
+    set_task(PARENT);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+    set_task(CHILD);
+    crate::handlers::clear_current_mount_namespace_for_test();
+    set_task(PARENT);
+
+    let mut uctx = StubCtx {
+        args: flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut uctx);
+    if !matches!(uctx.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("unshare(CLONE_NEWNS) failed");
+    }
+    if !mount_ok(b"tmpfs\0", b"/fork_ns_parent\0", b"tmpfs\0", 0) {
+        crate::handlers::clear_current_mount_namespace_for_test();
+        return TestResult::Fail("parent private mount failed");
+    }
+
+    crate::handlers::mount_ns_inherit(PARENT, CHILD);
+    let parent_ns = crate::handlers::current_mount_namespace();
+    set_task(CHILD);
+    let child_ns = crate::handlers::current_mount_namespace();
+    let child_sees_parent = child_ns
+        .as_ref()
+        .is_some_and(|ns| ns.list().iter().any(|p| p == "/fork_ns_parent"));
+    let shared = match (&parent_ns, &child_ns) {
+        (Some(parent), Some(child)) => alloc::sync::Arc::ptr_eq(parent, child),
+        _ => false,
+    };
+    let child_mount_ok = mount_ok(b"tmpfs\0", b"/fork_ns_child\0", b"tmpfs\0", 0);
+
+    set_task(PARENT);
+    let parent_sees_child = crate::handlers::current_mount_namespace()
+        .is_some_and(|ns| ns.list().iter().any(|p| p == "/fork_ns_child"));
+    let global_clean = !registry_has("/fork_ns_parent") && !registry_has("/fork_ns_child");
+
+    crate::handlers::clear_current_mount_namespace_for_test();
+    set_task(CHILD);
+    crate::handlers::clear_current_mount_namespace_for_test();
+    crate::handlers::__test_root_dir_reset();
+    set_task(PARENT);
+
+    if shared && child_sees_parent && child_mount_ok && parent_sees_child && global_clean {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("fork child did not share the parent's private mount namespace")
+    }
+}
+kernel_test_in!("userspace/mount", smoke_mount_ns_fork_inherits_private_view);
+
 // ── Smoke 5g: umount2 of a private pseudo-fs actually removes it ────
 // systemd's mount_private_dev (PrivateDevices=/ProtectProc=/… — userdbd,
 // logind, most sandboxed services) builds a private /dev tmpfs+devfs, then
@@ -1275,6 +1335,7 @@ kernel_test_in!("userspace/mount", smoke_pivot_root_relative_paths);
 fn smoke_open_tree_move_mount() -> TestResult {
     let task: u64 = 0x71_09;
     set_task(task);
+    crate::fd::init();
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
 
@@ -1346,6 +1407,7 @@ kernel_test_in!("userspace/mount", smoke_open_tree_move_mount);
 fn smoke_move_mount_overmount_no_ebusy() -> TestResult {
     let task: u64 = 0x71_20;
     set_task(task);
+    crate::fd::init();
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
 
@@ -2066,6 +2128,72 @@ fn smoke_chroot_mount_target_rerooted() -> TestResult {
     }
 }
 kernel_test_in!("userspace/mount", smoke_chroot_mount_target_rerooted);
+
+// `/proc/self/mountinfo` is part of the mount(2) completion contract: systemd
+// rescans it after its mount helper exits and rejects a successful helper when
+// the requested `Where=` is absent. A chrooted task must see mountpoints in
+// its visible namespace, not the backing registry paths below its chroot.
+fn smoke_chrooted_global_mountinfo_uses_visible_paths() -> TestResult {
+    const PID: u64 = 0x71_17;
+    const TASK: u64 = 0x0000_7116;
+    const JAIL: &str = "/mountinfo-jail";
+    const CHILD: &str = "/mountinfo-jail/sys/kernel/debug";
+    set_task(TASK);
+    // procfs passes the user-visible ProcessId to the hook; PID 1 in the
+    // Fedora boot likewise differs from its scheduler TaskId.
+    crate::handlers::register_pid_task_mapping(PID, TASK);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    let _ = unmount_for_test(CHILD);
+    let _ = unmount_for_test(JAIL);
+    if !mount_ok(b"tmpfs\0", b"/mountinfo-jail\0", b"tmpfs\0", 0)
+        || !mount_ok(
+            b"debugfs\0",
+            b"/mountinfo-jail/sys/kernel/debug\0",
+            b"debugfs\0",
+            0,
+        )
+        || !crate::handlers::install_root_dir(TASK, JAIL)
+    {
+        crate::handlers::__test_root_dir_reset();
+        let _ = unmount_for_test(CHILD);
+        let _ = unmount_for_test(JAIL);
+        return TestResult::Fail("mountinfo setup failed");
+    }
+
+    let rows = crate::handlers::proc_ns_mountinfo(PID);
+    crate::handlers::__test_root_dir_reset();
+    let _ = unmount_for_test(CHILD);
+    let _ = unmount_for_test(JAIL);
+
+    let rows = match rows {
+        Some(rows) => rows,
+        None => return TestResult::Fail("chrooted global task did not render mountinfo"),
+    };
+    let visible_root = rows.lines().any(|line| {
+        let mut fields = line.split('\t');
+        let _id = fields.next();
+        let _parent = fields.next();
+        fields.next() == Some("/")
+    });
+    let visible_child = rows.lines().any(|line| {
+        let mut fields = line.split('\t');
+        let _id = fields.next();
+        let _parent = fields.next();
+        fields.next() == Some("/sys/kernel/debug") && fields.next() == Some("debugfs")
+    });
+    let leaked_backing_path = rows.contains(JAIL);
+    if visible_root && visible_child && !leaked_backing_path {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("chrooted mountinfo did not expose visible mount paths")
+    }
+}
+kernel_test_in!(
+    "userspace/mount",
+    smoke_chrooted_global_mountinfo_uses_visible_paths
+);
 
 // Helper: unmount a path under a fresh bootstrap handle. The
 // registry's unmount is keyed by path; the handle check is the

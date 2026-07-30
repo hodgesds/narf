@@ -31,16 +31,25 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
     // chroot keeps a chrooted process (e.g. elogind under /mnt) resolving in
     // its own namespace.
     const AT_FDCWD: i64 = -100;
-    let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
+    let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD {
         path_str
-    } else {
-        match fd_path_of(current_task_id(), dirfd as u32) {
+    } else if dirfd >= 0 {
+        match fd_path_for_task(current_task_id(), dirfd as u32) {
             Some(dir) if dir.starts_with('/') => {
                 alloc::format!("{}/{}", dir.trim_end_matches('/'), path_str)
             }
-            // Unknown / non-directory fd → best-effort cwd-relative resolve.
-            _ => path_str,
+            // An untracked or pathless descriptor cannot name a directory.
+            // Resolving it from cwd would silently operate outside the
+            // caller-selected directory, whereas Linux returns EBADF.
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+                return;
+            }
         }
+    } else {
+        // AT_FDCWD is the only negative dirfd accepted for a relative path.
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        return;
     };
     // Resolve the `/proc/self/fd/N` (and `/proc/<pid>/fd/N`) magic symlink:
     // opening it reopens the target of fd N. systemd's `fd_reopen` opens an
@@ -54,7 +63,7 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
     if let Some(n) = parse_proc_self_fd(&effective) {
         let task = current_task_id();
         // Prefer reopening the fd's real backing path with the caller's flags.
-        if let Some(p) = fd_path_of(task, n).filter(|p| p.starts_with('/')) {
+        if let Some(p) = fd_path_for_task(task, n).filter(|p| p.starts_with('/')) {
             open_impl(ctx, p, flags, 0, 0);
             return;
         }
@@ -81,4 +90,24 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
         return;
     }
     open_impl(ctx, effective, flags, 0, 0);
+}
+
+/// Re-enter `openat` with the pathname and directory fd from `ctx`, but a
+/// caller-selected flags word.  `open_tree(2)` uses this to implement Linux's
+/// non-cloning O_PATH form without exposing the legacy NARF `open` ABI.
+pub(crate) fn sys_openat_with_flags(ctx: &mut dyn TrapContext, flags: u64) {
+    let args = *ctx.args();
+    let proxy_args = SyscallArgs {
+        arg0: args.arg0,
+        arg1: args.arg1,
+        arg2: flags,
+        arg3: 0,
+        arg4: 0,
+        arg5: 0,
+    };
+    let mut proxy = ReshapeArgs {
+        inner: ctx,
+        args: proxy_args,
+    };
+    sys_openat(&mut proxy);
 }

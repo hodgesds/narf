@@ -32,7 +32,11 @@ pub(crate) fn sys_dup2(ctx: &mut dyn TrapContext) {
         Some(())
     });
     match outcome {
-        Some(Some(())) => ctx.set_return(SyscallReturn::ok(newfd as u64)),
+        Some(Some(())) => {
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::duplicate_fd_path(task, oldfd, newfd);
+            ctx.set_return(SyscallReturn::ok(newfd as u64));
+        }
         // oldfd not open → -EBADF (was InvalidOp).
         _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
     }

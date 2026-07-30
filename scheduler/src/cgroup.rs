@@ -41,19 +41,16 @@
 //!   `cpu` controller accepts `cpu.max` and reports it but cannot
 //!   enforce it. See the comment in `cpu.rs`.
 //!
-//! All apply functions scan the per-CPU ready queues and rewrite the
-//! matching parked task's `spec`. A task that is *mid-poll* (popped
-//! onto the executor stack) is not in any queue; it picks up the new
-//! value when it returns `Poll::Pending` and is re-enqueued, i.e.
-//! after its current poll completes. This is the natural granularity
-//! for a cooperative scheduler and is documented rather than worked
-//! around.
+//! Affinity updates use the scheduler's task-identity registry. A task
+//! that is *mid-poll* (popped onto the executor stack) observes the new
+//! mask immediately through queries and is re-homed when it returns
+//! `Poll::Pending`. Priority updates remain parked-slot updates.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::affinity::{Affinity, CpuId, CpuSet};
+use crate::affinity::{CpuId, CpuSet};
 use crate::priority::Priority;
-use crate::{current_task_id, TaskId, READY};
+use crate::{current_task_id, set_task_affinity, TaskId, READY};
 
 // ── memory-controller charge-PID provider ───────────────────────────
 //
@@ -67,19 +64,72 @@ use crate::{current_task_id, TaskId, READY};
 // hooks use, just in the opposite direction), wiring the provider below
 // into the allocator. See `filesystem/src/cgroupfs/memory.rs`.
 
-/// Resolve the PID to charge for the in-flight allocation: the
-/// currently-polling task's id, or `None` outside any poll context
-/// (early boot, between rounds, kernel-internal allocations) so those
-/// allocations stay unattributed rather than charged to the wrong
-/// cgroup. The cgroup membership pid and the [`TaskId`] raw value share
-/// one namespace (see [`apply_priority`]).
+/// Function-pointer seam from the userspace process table. The scheduler
+/// deliberately does not depend on `narf-userspace`; frame installs this hook
+/// once userspace's TaskId-to-ProcessId map is ready.
+static MEMORY_PID_RESOLVER: AtomicUsize = AtomicUsize::new(0);
+static PROCESS_TASK_RESOLVER: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the resolver which maps a scheduler task id to the outer userspace
+/// process id used by cgroup membership. A missing mapping means the task is
+/// kernel-internal and its allocation remains unattributed.
+///
+/// Calling this replaces the prior resolver, which is useful during bootstrap
+/// when the userspace process table becomes available after the scheduler.
+pub fn install_memory_pid_resolver(resolver: fn(u64) -> Option<u64>) {
+    MEMORY_PID_RESOLVER.store(resolver as usize, Ordering::Release);
+}
+
+/// Install the reverse ProcessId-to-TaskId resolver used by cgroup controller
+/// updates. Cgroup membership is keyed by outer ProcessId, while READY slots
+/// are keyed by executor-private TaskId.
+pub fn install_process_task_resolver(resolver: fn(u64) -> Option<u64>) {
+    PROCESS_TASK_RESOLVER.store(resolver as usize, Ordering::Release);
+}
+
+fn process_task(pid: u64) -> Option<TaskId> {
+    let ptr = PROCESS_TASK_RESOLVER.load(Ordering::Acquire);
+    if ptr == 0 {
+        return Some(TaskId(pid));
+    }
+    // SAFETY: installed from the exact `fn(u64) -> Option<u64>` type above.
+    let resolve: fn(u64) -> Option<u64> = unsafe { core::mem::transmute(ptr) };
+    resolve(pid).map(TaskId)
+}
+
+/// Temporarily install a process-to-task resolver while an in-kernel
+/// regression test exercises the cgroup seam, then restore the boot-time
+/// resolver. Kernel tests share one address space, so leaving a synthetic
+/// resolver installed would make later tests order-dependent.
+pub(crate) fn with_process_task_resolver_for_test<R>(
+    resolver: fn(u64) -> Option<u64>,
+    test: impl FnOnce() -> R,
+) -> R {
+    let previous = PROCESS_TASK_RESOLVER.swap(resolver as usize, Ordering::AcqRel);
+    let result = test();
+    PROCESS_TASK_RESOLVER.store(previous, Ordering::Release);
+    result
+}
+
+/// Resolve the PID to charge for the in-flight allocation. The current task
+/// id is an executor-private identity; cgroup membership is keyed by the
+/// userspace ProcessId, so translate it through the installed resolver.
+/// Outside a task poll (early boot, between rounds, kernel-internal work), or
+/// without a process mapping, allocations stay unattributed rather than being
+/// charged to an unrelated cgroup with the same raw numeric id.
 fn current_charge_pid() -> Option<u64> {
     let id = current_task_id();
     if id == TaskId::NONE {
-        None
-    } else {
-        Some(id.raw())
+        return None;
     }
+    let ptr = MEMORY_PID_RESOLVER.load(Ordering::Acquire);
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: `ptr` is non-zero (checked) and was produced by
+    // `install_memory_pid_resolver` from the exact function-pointer type.
+    let resolve: fn(u64) -> Option<u64> = unsafe { core::mem::transmute(ptr) };
+    resolve(id.raw())
 }
 
 /// Install the `memory`-controller charge-PID provider into
@@ -92,14 +142,10 @@ pub fn install_memory_pid_provider() {
     narf_memory::install_cgroup_pid_provider(current_charge_pid);
 }
 
-/// Apply a nice-style priority to the task whose raw id equals `pid`.
-///
-/// In NARF the cgroup membership pid and the scheduler [`TaskId`] raw
-/// value are the same namespace (see `sys_sched_setattr` in
-/// `userspace/src/handlers.rs`, which treats the syscall pid directly
-/// as the task id). `nice` is the cgroup's `cpu.weight.nice`
-/// equivalent; it is wrapped into [`Priority`] verbatim. Returns
-/// `true` if a matching parked task was found and updated.
+/// Apply a nice-style priority to the task mapped from outer ProcessId `pid`.
+/// `nice` is the cgroup's `cpu.weight.nice` equivalent; it is wrapped into
+/// [`Priority`] verbatim. Returns `true` if a matching parked task was found
+/// and updated.
 ///
 /// Signature matches [`CpuPriorityHook`] so the controller can install
 /// it directly. REAL effect is policy-dependent: the
@@ -107,7 +153,9 @@ pub fn install_memory_pid_provider() {
 /// policy carries it forward without reordering (see module docs).
 pub fn apply_priority(pid: u64, nice: i8) -> bool {
     let priority = Priority(nice);
-    let want = TaskId(pid);
+    let Some(want) = process_task(pid) else {
+        return false;
+    };
     for q in READY.iter() {
         let mut g = q.lock();
         if let Some(ref mut dq) = *g {
@@ -120,13 +168,13 @@ pub fn apply_priority(pid: u64, nice: i8) -> bool {
     false
 }
 
-/// Apply a CPU affinity mask to the task whose raw id equals `pid`.
+/// Apply a CPU affinity mask to the task mapped from outer ProcessId `pid`.
 ///
 /// The mask becomes the task's hard `allowed` constraint; the
 /// `preferred` hint is set to the lowest-numbered CPU in the mask (or
 /// cleared if the mask is empty). REAL: the executor honours
 /// `allowed` for dispatch and work-stealing from the next dispatch
-/// onward. Returns `true` if a matching parked task was updated.
+/// onward. Returns `true` if a matching live task was updated.
 ///
 /// `mask_bits` are the raw `CpuSet` bits (signature matches
 /// [`AffinityHook`] so the controller can install this directly). An
@@ -138,27 +186,7 @@ pub fn apply_priority(pid: u64, nice: i8) -> bool {
 pub fn apply_affinity(pid: u64, mask_bits: u64) -> bool {
     let cpus = cpu_set_from_bits(mask_bits);
     let allowed = if cpus.is_empty() { CpuSet::ALL } else { cpus };
-    let preferred = lowest_cpu(allowed);
-    let aff = Affinity { allowed, preferred };
-    let want = TaskId(pid);
-    for q in READY.iter() {
-        let mut g = q.lock();
-        if let Some(ref mut dq) = *g {
-            if let Some(slot) = dq.iter_mut().find(|s| s.id == want) {
-                slot.spec.affinity = aff;
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Lowest-numbered CPU present in `set`, as the `preferred` hint.
-fn lowest_cpu(set: CpuSet) -> Option<CpuId> {
-    (0u32..(narf_lib::percpu::MAX_CPUS as u32)).find_map(|c| {
-        let id = CpuId(c);
-        set.contains(id).then_some(id)
-    })
+    process_task(pid).is_some_and(|task| set_task_affinity(task, allowed).is_ok())
 }
 
 /// Sum of measured CPU cycles spent by the parked tasks whose raw ids

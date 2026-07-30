@@ -3795,6 +3795,14 @@ fn boot_userspace_init() {
                     "fork_pipe_smoke",
                     narf_verification::NARF_FORK_PIPE_SMOKE_ELF,
                 ),
+                (
+                    "fork_exec_burst_smoke",
+                    narf_verification::NARF_FORK_EXEC_BURST_SMOKE_ELF,
+                ),
+                (
+                    "sched_affinity_smp_smoke",
+                    narf_verification::NARF_SCHED_AFFINITY_SMP_SMOKE_ELF,
+                ),
                 ("epoll_smoke", narf_verification::NARF_EPOLL_SMOKE_ELF),
                 ("signal_smoke", narf_verification::NARF_SIGNAL_SMOKE_ELF),
                 ("sigrcx_smoke", narf_verification::NARF_SIGRCX_SMOKE_ELF),
@@ -3840,6 +3848,10 @@ fn boot_userspace_init() {
                 (
                     "closerange_smoke",
                     narf_verification::NARF_CLOSERANGE_SMOKE_ELF,
+                ),
+                (
+                    "fd_cloexec_exec_smoke",
+                    narf_verification::NARF_FD_CLOEXEC_EXEC_SMOKE_ELF,
                 ),
                 ("sched_smoke", narf_verification::NARF_SCHED_SMOKE_ELF),
                 ("mcore_smoke", narf_verification::NARF_MCORE_SMOKE_ELF),
@@ -3911,6 +3923,12 @@ fn boot_userspace_init() {
                 (
                     "condbcast_smoke",
                     narf_verification::NARF_CONDBCAST_SMOKE_ELF,
+                ),
+                // Systemd-style READY=1 datagram: a CPU-1 service wakes the
+                // CPU-0 manager's blocking epoll_wait and supplies SCM_CREDENTIALS.
+                (
+                    "notify_epoll_smp_smoke",
+                    narf_verification::NARF_NOTIFY_EPOLL_SMP_SMOKE_ELF,
                 ),
                 // Linux-compat round 21: keyrings (add_key/request_key/keyctl).
                 ("keyring_smoke", narf_verification::NARF_KEYRING_SMOKE_ELF),

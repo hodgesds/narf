@@ -102,11 +102,12 @@ pub struct UserTaskCtx {
     pub net_io_wait: AtomicBool,
     /// `narf_net::readiness::generation()` snapshot taken by
     /// `sys_epoll_wait`/`sys_poll` just before its final readiness
-    /// check. After the poll routine registers the I/O waker it
-    /// re-reads the live generation; if it advanced, inbound data
-    /// landed in the check→register window (the classic lost-wakeup
-    /// race) and the task self-wakes to re-poll instead of sleeping
-    /// out its deadline.
+    /// check. After registering the I/O waker, the park path refreshes
+    /// this snapshot if it advanced. The generation is global, so an
+    /// advance cannot prove that this task's interest set is ready;
+    /// treating it as such would turn unrelated AF_UNIX or network
+    /// activity into a tight epoll/poll return loop. A real missed
+    /// source wake is recovered by the bounded I/O backstop timer.
     pub epoll_park_gen: AtomicU64,
     /// Futex word address this task is blocked on (`FUTEX_WAIT`), or 0 when
     /// not futex-waiting. Set by `sys_futex` before it yields; the poll
@@ -542,6 +543,21 @@ pub(crate) fn park_fire_deadline_ns(deadline_ns: u64, now_ns: u64, net_io_wait: 
     }
 }
 
+/// Record the readiness generation observed after an I/O waiter has been
+/// registered, without cancelling its park.
+///
+/// `narf_net::readiness::generation()` is intentionally global: it closes the
+/// crate-layering gap for sources that cannot name a particular waiter. That
+/// also means a changed generation is not a predicate on this task's poll or
+/// epoll interest set. Linux's `ep_poll()` queues the task and does its final
+/// ready-list check under the epoll wait-queue lock; it does not return a
+/// successful empty wait because another file became ready. NARF keeps the
+/// waiter registered and refreshes the advisory snapshot instead. The existing
+/// 10 ms I/O backstop guarantees a true scan→register lost wake is retried.
+pub(crate) fn refresh_io_wait_generation_after_registration(uc: &UserTaskCtx, observed: u64) {
+    uc.epoll_park_gen.store(observed, Ordering::Release);
+}
+
 /// Register `waker` with the park condition's event source and report whether
 /// the task should actually block (`true`) or proceed/re-execute now (`false`,
 /// condition already satisfied or a wake raced us). Mirrors the poll dispatch.
@@ -622,11 +638,10 @@ fn park_should_block(
             // Net I/O wait (epoll/poll flagged inbound TCP): register + lost-wake guard.
             if uc.net_io_wait.load(Ordering::Acquire) {
                 crate::handlers::register_io_waiter(task_id, waker.clone());
-                if narf_net::readiness::generation() != uc.epoll_park_gen.load(Ordering::Acquire) {
-                    uc.sleep_deadline_ns.store(0, Ordering::Release);
-                    uc.net_io_wait.store(false, Ordering::Release);
-                    return false; // raced ready → re-execute the syscall
-                }
+                refresh_io_wait_generation_after_registration(
+                    uc,
+                    narf_net::readiness::generation(),
+                );
             }
             // FUTEX_WAIT: register on the per-uaddr queue + lost-wake guard.
             //
@@ -708,7 +723,7 @@ fn park_should_block(
                 match narf_scheduler::narf_time::timer_wheel::register(fire_cycles, waker.clone()) {
                     Ok(h) => *sleep_handle = Some(h),
                     Err(_) => {
-                        // Timer wheel saturated (single global 64-slot wheel): we
+                        // Timer wheel saturated (single global 1024-slot wheel): we
                         // could NOT arm the lost-wake fallback timer. Blocking now
                         // would rely SOLELY on the io/futex/signal waker; if that
                         // wake then raced the idle-halt Dekker fence, the task
@@ -1608,22 +1623,15 @@ impl core::future::Future for UserTaskFuture {
                         crate::handlers::current_task_id(),
                         cx.waker().clone(),
                     );
-                    // Lost-wakeup guard: if a net readiness notify fired
-                    // between the syscall's readiness check and this
-                    // registration, the data is already waiting — don't
-                    // sleep it out. Clear the sleep deadline so the next
-                    // poll falls through the sleep block and re-enters
-                    // user mode (re-running the syscall, which collects
-                    // the now-ready event), and self-wake to force that
-                    // re-poll immediately.
-                    if narf_net::readiness::generation()
-                        != this.task.uctx.epoll_park_gen.load(Ordering::Acquire)
-                    {
-                        this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
-                        this.task.uctx.net_io_wait.store(false, Ordering::Release);
-                        cx.waker().wake_by_ref();
-                        return core::task::Poll::Pending;
-                    }
+                    // The global readiness generation is advisory, not a
+                    // readiness predicate for this task's interest set. Keep
+                    // the waiter parked after refreshing it; a true missed
+                    // source wake is retried by the I/O backstop instead of
+                    // making unrelated activity spin epoll/poll in userspace.
+                    refresh_io_wait_generation_after_registration(
+                        &this.task.uctx,
+                        narf_net::readiness::generation(),
+                    );
                 }
                 // FUTEX_WAIT: `sys_futex` published the futex word here.
                 // Register our waker on the per-uaddr wait queue so a
@@ -1736,7 +1744,7 @@ impl core::future::Future for UserTaskFuture {
                     )
                     .ok();
                     if this.sleep_handle.is_none() {
-                        // Wheel full (>64 sleepers) or no arm callback: fall
+                        // Wheel full or no arm callback: fall
                         // back to a self-wake so the task still makes
                         // progress (degraded, never wedged).
                         cx.waker().wake_by_ref();

@@ -472,8 +472,8 @@ fn with_inotify<R>(f: impl FnOnce(&mut BTreeMap<u64, InotifyState>) -> R) -> R {
 // The fd table stores only an `Arc<dyn FileOps>`, so sys_write (which has
 // just an fd) can't recover the file's path to fire IN_MODIFY. We record
 // (task, fd) → absolute path at open and consult it on write; close drops
-// the entry. This is best-effort (dup/dup2 don't propagate it), which is
-// all inotify needs.
+// the entry. The path is part of descriptor identity, so every duplication
+// path preserves it as well; *at syscalls also rely on it for directory fds.
 type FdPathIdentity = (String, Option<u64>);
 static FD_PATHS: IrqSafeSpinLock<Option<BTreeMap<(u64, u32), FdPathIdentity>>> =
     IrqSafeSpinLock::new(None);
@@ -497,6 +497,20 @@ pub(crate) fn forget_fd_path(task: u64, fd: u32) {
     });
 }
 
+/// Duplicate (or replace) a descriptor's pathname identity.
+///
+/// `dup2`/`dup3` may replace an existing destination, so an untracked source
+/// must explicitly clear any former identity at the destination.
+pub(crate) fn duplicate_fd_path(task: u64, source_fd: u32, destination_fd: u32) {
+    with_fd_paths(|m| {
+        if let Some(identity) = m.get(&(task, source_fd)).cloned() {
+            m.insert((task, destination_fd), identity);
+        } else {
+            m.remove(&(task, destination_fd));
+        }
+    });
+}
+
 /// Look up the absolute path an fd was opened on, if recorded. Used by
 /// `landlock_add_rule` to turn a `parent_fd` back into a path.
 pub(crate) fn fd_path(task: u64, fd: u32) -> Option<String> {
@@ -506,6 +520,26 @@ pub(crate) fn fd_path(task: u64, fd: u32) -> Option<String> {
 /// Mount that was visible when `fd` was opened.
 pub(crate) fn fd_mount_id(task: u64, fd: u32) -> Option<u64> {
     with_fd_paths(|m| m.get(&(task, fd)).and_then(|(_, id)| *id))
+}
+
+/// Copy fd-path identities along with the descriptor table during fork/clone.
+/// The table is task-keyed even when CLONE_FILES shares the underlying file
+/// descriptions, because proc-fd lookups and *at syscalls resolve through the
+/// calling task.  Without this, a forked systemd mount helper inherited a
+/// valid O_PATH parent fd but `mkdirat(parent_fd, ...)` saw EBADF.
+pub(crate) fn fork_fd_paths(parent: u64, child: u64) {
+    let inherited: Vec<(u32, FdPathIdentity)> = with_fd_paths(|m| {
+        m.iter()
+            .filter(|&(&(task, _), _)| task == parent)
+            .map(|(&(_, fd), identity)| (fd, identity.clone()))
+            .collect()
+    });
+    with_fd_paths(|m| {
+        m.retain(|&(task, _), _| task != child);
+        for (fd, identity) in inherited {
+            m.insert((child, fd), identity);
+        }
+    });
 }
 
 fn parent_and_base(abs: &str) -> (&str, &str) {

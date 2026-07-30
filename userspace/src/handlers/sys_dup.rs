@@ -17,7 +17,11 @@ pub(crate) fn sys_dup(ctx: &mut dyn TrapContext) {
         Some(t.open(clone))
     });
     match outcome {
-        Some(Some(new_fd)) => ctx.set_return(SyscallReturn::ok(new_fd as u64)),
+        Some(Some(new_fd)) => {
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::duplicate_fd_path(task, oldfd, new_fd);
+            ctx.set_return(SyscallReturn::ok(new_fd as u64));
+        }
         _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }

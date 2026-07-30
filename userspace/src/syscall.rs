@@ -1100,17 +1100,15 @@ pub enum Syscall {
 
     /// `arg0 = pid` (0 = self), `arg1 = mask_size` (bytes),
     /// `arg2 = mask_out_ptr`. Linux sched_getaffinity(2): write
-    /// a CPU-set bitmap for the target task. NARF is single-CPU
-    /// in user mode; we always return a 1-bit mask (CPU 0 set,
-    /// every other bit clear). Returns the byte count written
-    /// on success (= `mask_size` rounded down to a multiple of 8),
-    /// -1 on bad pointer or oversized request.
+    /// a CPU-set bitmap for the target task, intersected with the
+    /// online CPU set. Returns the kernel mask size written (8 bytes)
+    /// or a negative Linux errno.
     SchedGetaffinity,
 
     /// `arg0 = pid`, `arg1 = mask_size` (bytes),
-    /// `arg2 = mask_in_ptr`. sched_setaffinity(2). NARF doesn't
-    /// pin tasks (single-CPU model); the bitmap is read but
-    /// ignored. Returns 0 on success, -1 on bad pointer.
+    /// `arg2 = mask_in_ptr`. sched_setaffinity(2). Updates the
+    /// scheduler's hard allowed set and migrates at a cooperative
+    /// poll boundary. Returns 0 or a negative Linux errno.
     SchedSetaffinity,
 
     /// `arg0 = policy`. Linux sched_get_priority_max(2): return
@@ -3242,19 +3240,24 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     }
 }
 
-/// Comm-prefix selecting which processes the `syscall-trace` feature follows.
-/// Set from the kernel cmdline (`trace_comm=<prefix>`) by boot-init so the
-/// trace can be retargeted without a rebuild; defaults to `systemd-executo`
-/// (the sd-executor that stages every service exec) when the cmdline is silent.
+/// Comm selector for the `syscall-trace` feature. Set from the kernel cmdline
+/// (`trace_comm=<prefix>`) by boot-init so the trace can be retargeted without
+/// a rebuild; a trailing `$` requests an exact comm match. Defaults to
+/// `systemd-executo` (the sd-executor that stages every service exec) when the
+/// cmdline is silent.
 #[cfg(feature = "syscall-trace")]
-static TRACE_COMM: narf_lib::sync::IrqSafeSpinLock<Option<alloc::string::String>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+static TRACE_COMM: narf_lib::sync::OnceLock<alloc::string::String> =
+    narf_lib::sync::OnceLock::new();
 
 /// Install the comm-prefix filter for the syscall trace (see `TRACE_COMM`).
 /// A comma-separated list matches any of the listed prefixes.
 #[cfg(feature = "syscall-trace")]
 pub fn set_trace_comm(prefix: &str) {
-    *TRACE_COMM.lock() = Some(alloc::string::String::from(prefix));
+    // boot-init configures this once, before it starts userspace. Keep the
+    // first value if a test or an accidental second call repeats setup: the
+    // read path must remain lock-free so unmatched tasks do not perturb the
+    // workload being diagnosed.
+    let _ = TRACE_COMM.set(alloc::string::String::from(prefix));
 }
 
 /// Trace filter for the `syscall-trace` feature. Fedora desktop diagnostics
@@ -3268,19 +3271,15 @@ fn syscall_trace_relevant(_v: Syscall) -> bool {
 }
 
 /// Shared predicate for syscall, exec, and exit diagnostics. Matches when the
-/// current task's comm starts with any of the comma-separated `trace_comm=`
-/// prefixes (default `systemd-executo`).
+/// current task's comm starts with any comma-separated `trace_comm=` selector;
+/// a selector ending in `$` is exact (default `systemd-executo`).
 #[cfg(feature = "syscall-trace")]
 pub fn syscall_trace_target_task() -> bool {
-    let comm = match crate::handlers::proc_comm_of_task(crate::handlers::current_task_id()) {
-        Some(c) => c,
-        None => return false,
-    };
-    let guard = TRACE_COMM.lock();
-    let filter = guard.as_deref().unwrap_or("systemd-executo");
-    filter
-        .split(',')
-        .any(|p| !p.is_empty() && comm.starts_with(p))
+    let filter = TRACE_COMM
+        .get()
+        .map(alloc::string::String::as_str)
+        .unwrap_or("systemd-executo");
+    crate::handlers::proc_comm_of_task_matches(crate::handlers::current_task_id(), filter)
 }
 
 /// Decode and print the path-string arguments of the path-taking syscalls,
@@ -3346,7 +3345,7 @@ fn trace_syscall_paths(name: &str, args: &SyscallArgs) {
             }
         }
         "fchdir" => {
-            if let Some(p) = crate::handlers::fd_path_of(task, args.arg0 as u32) {
+            if let Some(p) = crate::handlers::fd_path_for_task(task, args.arg0 as u32) {
                 let _ = write!(line, "  PATH fchdir fd={:#x} -> {p:?}", args.arg0);
             }
         }

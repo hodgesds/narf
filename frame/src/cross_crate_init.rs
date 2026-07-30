@@ -20,6 +20,14 @@ use narf_console as console;
 /// init_per_task_state) have run.
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub fn install_all_hooks() {
+    // Cgroup membership is keyed by userspace ProcessId, whereas the executor
+    // only knows its private TaskId. Install the translation before any cgroup
+    // controller activates allocator charging, so memory.max observes the
+    // same process identity as cgroup.procs.
+    #[cfg(feature = "cgroup")]
+    narf_scheduler::install_memory_pid_resolver(narf_userspace::handlers::task_to_pid_raw);
+    #[cfg(feature = "cgroup")]
+    narf_scheduler::install_process_task_resolver(narf_userspace::handlers::pid_to_task_raw);
     install_console_signal_hook();
     #[cfg(feature = "linux-compat")]
     install_proc_hooks();
@@ -44,6 +52,19 @@ pub fn install_all_hooks() {
 #[cfg(feature = "linux-compat")]
 fn install_proc_mountinfo_hook() {
     narf_filesystem::procfs::install_mountinfo_hook(narf_userspace::handlers::proc_ns_mountinfo);
+    narf_filesystem::procfs::install_mountinfo_generation_hook(
+        narf_userspace::handlers::proc_ns_mountinfo_generation,
+    );
+    narf_filesystem::install_mount_change_hook(wake_mountinfo_waiters);
+}
+
+/// Wake poll/epoll waiters after a mount-table mutation. `/proc/*/mountinfo`
+/// exposes the namespace generation as POLLPRI; the scheduler must be kicked
+/// so systemd's libmount monitor drains that edge before it observes SIGCHLD
+/// from the successful mount helper.
+#[cfg(feature = "linux-compat")]
+fn wake_mountinfo_waiters() {
+    narf_net::readiness::notify(0);
 }
 
 /// Wire the namespace procfs hooks so /proc/<pid>/ns/*, uid_map,

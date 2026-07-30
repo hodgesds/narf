@@ -523,6 +523,8 @@ fn main() {
     });
     for test in [
         "fork_pipe_smoke",
+        "fork_exec_burst_smoke",
+        "sched_affinity_smp_smoke",
         "epoll_smoke",
         "signal_smoke",
         "sigrcx_smoke",
@@ -544,6 +546,7 @@ fn main() {
         "splice_smoke",
         "barrier_smoke",
         "closerange_smoke",
+        "fd_cloexec_exec_smoke",
         "sched_smoke",
         "mcore_smoke",
         "sync_smoke",
@@ -580,6 +583,7 @@ fn main() {
         "futex2_smoke",
         "futex_contend_smoke",
         "condbcast_smoke",
+        "notify_epoll_smp_smoke",
         "keyring_smoke",
         "inotify2_smoke",
         "fanotify_smoke",

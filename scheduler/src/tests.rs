@@ -335,13 +335,20 @@ kernel_test_in!("scheduler", smoke_scheduler_current_task_id_during_poll);
 #[cfg(feature = "cgroup")]
 fn smoke_scheduler_memory_pid_provider_resolves_current() -> TestResult {
     // The `memory` cgroup controller installs this provider so the
-    // frame allocator can attribute a charge to the allocating task.
-    // Once installed, narf-memory must resolve the polling task's id
-    // during a poll and `None` outside one — the wiring `memory.max`
-    // enforcement rides on.
+    // frame allocator can attribute a charge to the allocating process.
+    // Scheduler TaskId and userspace ProcessId deliberately have separate
+    // namespaces, so exercise a non-identity resolver: `memory.max` must
+    // never accidentally charge the task whose raw id happens to equal a
+    // process id.
     use crate::current_task_id;
     use core::sync::atomic::{AtomicU64, Ordering};
 
+    const PID_OFFSET: u64 = 0x1_0000;
+    fn task_to_process_for_test(task: u64) -> Option<u64> {
+        task.checked_add(PID_OFFSET)
+    }
+
+    crate::install_memory_pid_resolver(task_to_process_for_test);
     crate::install_memory_pid_provider();
 
     // Outside any poll: unattributed.
@@ -355,14 +362,15 @@ fn smoke_scheduler_memory_pid_provider_resolves_current() -> TestResult {
 
     let tid = crate::spawn(async {
         let pid = narf_memory::__charge_pid_for_test().unwrap_or(u64::MAX);
-        // Sanity: the provider agrees with current_task_id().
-        debug_assert_eq!(pid, current_task_id().raw());
+        // The provider must resolve through the process-ID hook rather than
+        // leak the scheduler's private task id to the cgroup controller.
+        debug_assert_eq!(pid, current_task_id().raw() + PID_OFFSET);
         OBSERVED.store(pid, Ordering::Relaxed);
     });
     crate::run_until_empty();
 
-    if OBSERVED.load(Ordering::Relaxed) != tid.raw() {
-        return TestResult::Fail("charge pid did not resolve to the allocating task");
+    if OBSERVED.load(Ordering::Relaxed) != tid.raw() + PID_OFFSET {
+        return TestResult::Fail("charge pid did not resolve through the process-id hook");
     }
     if narf_memory::__charge_pid_for_test().is_some() {
         return TestResult::Fail("charge pid not cleared after run_until_empty");
@@ -373,6 +381,49 @@ fn smoke_scheduler_memory_pid_provider_resolves_current() -> TestResult {
 kernel_test_in!(
     "scheduler",
     smoke_scheduler_memory_pid_provider_resolves_current
+);
+
+#[cfg(feature = "cgroup")]
+fn smoke_scheduler_cgroup_affinity_resolves_process_to_task() -> TestResult {
+    use crate::{Affinity, CpuId, CpuSet, TaskSpec};
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    const OUTER_PID: u64 = 0x4242;
+    static TARGET_TASK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    fn process_to_task_for_test(pid: u64) -> Option<u64> {
+        (pid == OUTER_PID).then(|| TARGET_TASK.load(Ordering::Acquire))
+    }
+
+    crate::__reset_queues_for_test();
+    let id = crate::spawn_with_spec(
+        core::future::pending::<()>(),
+        TaskSpec {
+            affinity: Affinity::any(),
+            ..TaskSpec::unthrottled()
+        },
+    );
+    TARGET_TASK.store(id.raw(), Ordering::Release);
+
+    let boot = CpuSet::single(CpuId::BOOT);
+    let applied =
+        crate::cgroup::with_process_task_resolver_for_test(process_to_task_for_test, || {
+            crate::apply_affinity(OUTER_PID, boot.bits())
+        });
+    if !applied {
+        return TestResult::Fail("cgroup affinity rejected the resolved task");
+    }
+    if crate::task_affinity(id) != Some(boot) {
+        return TestResult::Fail("cgroup affinity updated the process id instead of its task");
+    }
+
+    crate::__reset_queues_for_test();
+    TestResult::Pass
+}
+#[cfg(feature = "cgroup")]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_cgroup_affinity_resolves_process_to_task
 );
 
 fn smoke_scheduler_donate_to_rejects_revoked_cap() -> TestResult {
@@ -449,6 +500,45 @@ fn smoke_scheduler_steal_disabled_returns_clean() -> TestResult {
 kernel_test_in!("scheduler", smoke_scheduler_steal_disabled_returns_clean);
 
 // ── scheduler/affinity + AS routing ──────────────────────────────────
+
+fn smoke_scheduler_two_cpu_user_spawn_balances_bsp_and_ap() -> TestResult {
+    use crate::affinity::CpuId;
+
+    let mut sole_ap = [0u32; 64];
+    sole_ap[0] = 1;
+    let first = crate::user_affinity_from_aps(sole_ap, 1, 0);
+    let second = crate::user_affinity_from_aps(sole_ap, 1, 1);
+    let third = crate::user_affinity_from_aps(sole_ap, 1, 2);
+    if first.preferred != Some(CpuId::BOOT)
+        || second.preferred != Some(CpuId(1))
+        || third.preferred != Some(CpuId::BOOT)
+    {
+        return TestResult::Fail("sole-AP user placement did not alternate BSP/AP");
+    }
+    if first.allowed != crate::affinity::CpuSet::ALL
+        || second.allowed != crate::affinity::CpuSet::ALL
+    {
+        return TestResult::Fail("two-CPU user placement narrowed the allowed mask");
+    }
+
+    // Larger machines retain the AP-only policy: this fix must not move
+    // ordinary user work back onto the housekeeping BSP when multiple APs
+    // are available.
+    let mut several_aps = [0u32; 64];
+    several_aps[..3].copy_from_slice(&[1, 2, 3]);
+    for sequence in 0..6 {
+        let affinity = crate::user_affinity_from_aps(several_aps, 3, sequence);
+        if affinity.preferred == Some(CpuId::BOOT) {
+            return TestResult::Fail("multi-AP user placement selected the BSP");
+        }
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_two_cpu_user_spawn_balances_bsp_and_ap
+);
 
 fn smoke_scheduler_per_cpu_pin_to_bsp() -> TestResult {
     // Pinning a task to CpuId(0) lands it on BSP's queue. With the
@@ -1204,6 +1294,110 @@ fn smoke_scheduler_cpuset_insert_accumulates() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_scheduler_cpuset_insert_accumulates);
+
+fn smoke_scheduler_cpuset_bitmap_intersection() -> TestResult {
+    use crate::affinity::CpuSet;
+    let left = CpuSet::from_bits(0b1011);
+    let right = CpuSet::from_bits(0b0110);
+    if left.bits() != 0b1011 {
+        return TestResult::Fail("CpuSet bitmap round trip changed bits");
+    }
+    if left.intersection(right).bits() != 0b0010 {
+        return TestResult::Fail("CpuSet intersection returned wrong CPUs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_cpuset_bitmap_intersection);
+
+fn smoke_scheduler_live_task_affinity_round_trip() -> TestResult {
+    use crate::{Affinity, CpuId, CpuSet, SetAffinityError, TaskSpec};
+
+    crate::__reset_queues_for_test();
+    let spec = TaskSpec {
+        affinity: Affinity::any(),
+        ..TaskSpec::unthrottled()
+    };
+    let id = crate::spawn_with_spec(core::future::pending::<()>(), spec);
+    if crate::task_affinity(id) != Some(CpuSet::ALL) {
+        return TestResult::Fail("spawn did not register its initial affinity");
+    }
+
+    let boot = CpuSet::single(CpuId::BOOT);
+    if crate::set_task_affinity(id, boot).is_err() {
+        return TestResult::Fail("live queued task rejected an online CPU");
+    }
+    if crate::task_affinity(id) != Some(boot) {
+        return TestResult::Fail("affinity update did not round trip");
+    }
+    if crate::set_task_affinity(id, CpuSet::EMPTY) != Err(SetAffinityError::NoOnlineCpu) {
+        return TestResult::Fail("empty affinity was not rejected");
+    }
+    if crate::task_affinity(id) != Some(boot) {
+        return TestResult::Fail("rejected update changed the live mask");
+    }
+
+    crate::__reset_queues_for_test();
+    if crate::task_affinity(id).is_some() {
+        return TestResult::Fail("completed/dropped task retained affinity state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_live_task_affinity_round_trip);
+
+fn smoke_scheduler_spawn_normalizes_offline_affinity() -> TestResult {
+    use crate::{Affinity, CpuId, CpuSet, TaskSpec};
+
+    let Some(offline) = (0..narf_lib::percpu::MAX_CPUS as u32)
+        .find(|cpu| !narf_lib::smp::is_online(*cpu))
+        .map(CpuId)
+    else {
+        return TestResult::Skip("all inline CPUs are online");
+    };
+    let here = CpuId(narf_lib::percpu::current_cpu() as u32);
+    let fallback = if narf_lib::smp::is_online(here.0) {
+        here
+    } else {
+        CpuId::BOOT
+    };
+
+    crate::__reset_queues_for_test();
+    let id = crate::spawn_with_spec(
+        core::future::pending::<()>(),
+        TaskSpec {
+            affinity: Affinity::pinned(offline),
+            ..TaskSpec::unthrottled()
+        },
+    );
+    if crate::task_affinity(id) != Some(CpuSet::single(fallback)) {
+        return TestResult::Fail("spawn retained an affinity with no online CPU");
+    }
+    crate::__reset_queues_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_spawn_normalizes_offline_affinity
+);
+
+fn smoke_scheduler_requeue_keeps_allowed_current_cpu() -> TestResult {
+    use crate::{Affinity, CpuId, CpuSet};
+
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("soft-preference requeue needs a second online CPU");
+    }
+    let affinity = Affinity {
+        allowed: CpuSet::ALL,
+        preferred: Some(CpuId(1)),
+    };
+    if crate::requeue_cpu_for_affinity(affinity, 0) != 0 {
+        return TestResult::Fail("soft preferred CPU overrode the allowed current CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_requeue_keeps_allowed_current_cpu
+);
 
 fn smoke_scheduler_affinity_any_and_pinned() -> TestResult {
     use crate::affinity::{Affinity, CpuId, CpuSet};

@@ -13,7 +13,7 @@ pub(crate) fn sys_fstatfs(ctx: &mut dyn TrapContext) {
     // node and rejects it ("outside of sysfs") unless f_type == SYSFS_MAGIC —
     // so a synthetic "/" answer (ext2/tmpfs magic) broke every udev device
     // lookup. Fall back to "/" for fds with no path (pipes, sockets, eventfd).
-    let path = fd_path_of(current_task_id(), fd)
+    let path = fd_path_for_task(current_task_id(), fd)
         .filter(|p| p.starts_with('/'))
         .unwrap_or_else(|| alloc::string::String::from("/"));
     if fill_statfs_for_path(&path, buf_ptr) {

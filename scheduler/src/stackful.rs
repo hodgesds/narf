@@ -692,8 +692,9 @@ impl KernelTask {
     /// lifetime covers the duration of this call.
     ///
     /// # Safety
-    /// - Must be called on the same CPU the task was created on
-    ///   (phase 1b is BSP-only; phase 3 generalises).
+    /// - The task may move only between completed calls: its dedicated stack
+    ///   and saved context move with it, while this call rebinds `exec_ctx`,
+    ///   TSS.rsp0, CR3, FS_BASE, and per-CPU publication before switch-in.
     /// - No concurrent `poll_to_yield` for the same task. The
     ///   AtomicPtr/AtomicBool make in-CPU re-entry detectable
     ///   in debug builds; the precondition is the caller's.

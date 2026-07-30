@@ -7,8 +7,7 @@
 //! `Affinity.allowed` as a hard constraint and `Affinity.preferred`
 //! as a hint during work-stealing.
 
-/// Single-CPU stand-in for `CpuId`. Stage 4 will widen this to match
-/// the platform's topology ID space.
+/// Logical CPU identifier in the scheduler's inline 0..64 CPU space.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CpuId(pub u32);
 
@@ -31,6 +30,24 @@ impl CpuSet {
     #[inline]
     pub const fn single(cpu: CpuId) -> Self {
         CpuSet(1u64 << (cpu.0 & 0x3F))
+    }
+
+    /// Construct an inline CPU set from its Linux-compatible bitmap.
+    #[inline]
+    pub const fn from_bits(bits: u64) -> Self {
+        CpuSet(bits)
+    }
+
+    /// Return the Linux-compatible inline bitmap.
+    #[inline]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// CPUs present in both sets.
+    #[inline]
+    pub const fn intersection(self, other: CpuSet) -> CpuSet {
+        CpuSet(self.0 & other.0)
     }
 
     #[inline]
@@ -73,10 +90,8 @@ impl Affinity {
         }
     }
 
-    /// Pin to a single CPU. Stage 4 enforces this through
-    /// `Cap<CpuAffinity, Pin>` per spec §3.3 — the type here is
-    /// permissive and the cap gate will land with the spawn-site
-    /// integration.
+    /// Pin to a single CPU. This constructor is structural; mutation
+    /// entry points remain responsible for their own authority checks.
     pub const fn pinned(cpu: CpuId) -> Self {
         Self {
             allowed: CpuSet::single(cpu),

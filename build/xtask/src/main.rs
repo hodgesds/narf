@@ -2152,6 +2152,13 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("oci_smoke", "oci-smoke-ok"),
         ("fs_smoke", "fs-ok"),
         ("fork_pipe_smoke", "fork-ok"),
+        // Early-systemd process topology: sixteen children are released
+        // together across available CPUs, self-exec with one explicitly
+        // preserved fd, report their post-exec identity, exit, and are reaped.
+        ("fork_exec_burst_smoke", "fork-exec-burst-ok"),
+        // Linux affinity masks are real scheduler constraints: self-migration,
+        // remote-PID updates, a namespace boundary, and invalid masks.
+        ("sched_affinity_smp_smoke", "sched-affinity-smp-ok"),
         ("pty_smoke", "pty-ok"),
         // Framebuffer smoke — opens /dev/fb0, FBIOGET_VSCREENINFO,
         // mmap MAP_SHARED, writes + reads back pixels through the
@@ -2210,6 +2217,7 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("barrier_smoke", "barrier-ok"),
         // Linux-compat round 4: close_range, sched-policy, msync+mincore, sync+syncfs+personality.
         ("closerange_smoke", "closerange-ok"),
+        ("fd_cloexec_exec_smoke", "fd-cloexec-exec-ok"),
         ("sched_smoke", "sched-ok"),
         ("mcore_smoke", "mcore-ok"),
         ("sync_smoke", "sync-ok"),
@@ -2271,6 +2279,9 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // SMP=16 — see condbcast_smoke above for the permanent-strand
         // regression pin.
         ("futex_contend_smoke", "futex-contend-ok"),
+        // Systemd Type=notify topology on live SMP: a service process pinned
+        // to CPU 1 wakes PID-1-like epoll_wait on CPU 0 with SCM credentials.
+        ("notify_epoll_smp_smoke", "notify-epoll-smp-ok"),
         // Linux-compat round 21: keyrings (add_key/request_key/keyctl).
         ("keyring_smoke", "keyring-ok"),
         // Linux-compat round 22: inotify real event delivery.

@@ -79,6 +79,106 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_clone_shares_address_space);
 
+// systemd creates its generator and service sandboxes with
+// clone(CLONE_NEWNS|SIGCHLD), rather than calling unshare() in the child.
+// Mount namespaces are part of the base Linux-compat surface, so that must
+// create a snapshot even when the optional container bundle is disabled.
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_userspace_clone_newns_snapshots_mount_namespace() -> TestResult {
+    const PARENT: u64 = 0xC10E_0001;
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    const SIGCHLD: u64 = 17;
+
+    static ACTIVE_TASK: narf_lib::sync::IrqSafeSpinLock<u64> =
+        narf_lib::sync::IrqSafeSpinLock::new(PARENT);
+    fn task_lookup() -> u64 {
+        *ACTIVE_TASK.lock()
+    }
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    crate::handlers::install_task_id_lookup(task_lookup);
+    *ACTIVE_TASK.lock() = PARENT;
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    // SAFETY: the test harness has paging enabled; this only allocates a
+    // fresh user root and does not switch the active address space.
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
+    };
+    *PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_parent_as);
+
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+    install_global(table);
+
+    // Give the parent a private mount namespace first. The clone must receive
+    // a distinct snapshot, not merely another reference to this namespace.
+    let mut unshare = StubCtx {
+        args: SyscallArgs {
+            arg0: CLONE_NEWNS,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut unshare);
+    let parent_ns = crate::handlers::current_mount_namespace();
+    if !matches!(unshare.ret, Some(r) if r.status == SyscallReturn::OK) || parent_ns.is_none() {
+        crate::handlers::clear_current_mount_namespace_for_test();
+        *PARENT_AS.lock() = None;
+        crate::handlers::__test_reset_task_id_lookup();
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("parent CLONE_NEWNS setup failed");
+    }
+
+    let mut clone = StubCtx {
+        args: SyscallArgs {
+            arg0: CLONE_NEWNS | SIGCHLD,
+            arg1: 0x7fff_fff0_0000,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Clone.raw(), &mut clone);
+    let child = match clone.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+        _ => {
+            crate::handlers::clear_current_mount_namespace_for_test();
+            *PARENT_AS.lock() = None;
+            crate::handlers::__test_reset_task_id_lookup();
+            crate::syscall::__test_clear_global();
+            return TestResult::Fail("clone(CLONE_NEWNS) failed");
+        }
+    };
+    let child_task = crate::handlers::pid_to_task_raw(child).unwrap_or(child);
+    let child_ns = crate::handlers::mount_namespace_of(child_task);
+    let isolated = matches!(parent_ns.as_ref(), Some(parent)
+        if child_ns.as_ref().is_some_and(|child_ns| !Arc::ptr_eq(parent, child_ns)));
+
+    *ACTIVE_TASK.lock() = child_task;
+    crate::handlers::clear_current_mount_namespace_for_test();
+    *ACTIVE_TASK.lock() = PARENT;
+    crate::handlers::clear_current_mount_namespace_for_test();
+    let _ = crate::task::release_task(child_task);
+    narf_scheduler::__reset_queues_for_test();
+    *PARENT_AS.lock() = None;
+    crate::handlers::__test_reset_task_id_lookup();
+    crate::syscall::__test_clear_global();
+
+    if isolated {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("clone(CLONE_NEWNS) inherited instead of snapshotting mount namespace")
+    }
+}
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_clone_newns_snapshots_mount_namespace
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_pending_spawn_publishes_only_after_inheritance() -> TestResult {
     // A fork-like syscall needs the child's TaskId to populate inherited state,
@@ -1034,6 +1134,57 @@ fn smoke_userspace_fork_inherits_fd_table() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_fork_inherits_fd_table);
 
+// Forked helpers inherit the descriptor table AND the task-keyed path
+// identities used by Linux *at syscalls. systemd opens a mount parent in PID 1
+// then its mount helper calls mkdirat(parent_fd, leaf, ...); losing this
+// metadata turned the valid inherited O_PATH fd into EBADF.
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_fork_inherits_fd_path_identity() -> TestResult {
+    const PARENT: u64 = 0xF001;
+    const CHILD: u64 = 0xF002;
+    const FD: u32 = 9;
+    crate::mqueue::register_fd_path(PARENT, FD, "/sys/fs/fuse", Some(7));
+    crate::mqueue::fork_fd_paths(PARENT, CHILD);
+    let path = crate::mqueue::fd_path(CHILD, FD);
+    let mount_id = crate::mqueue::fd_mount_id(CHILD, FD);
+    crate::mqueue::forget_fd_path(PARENT, FD);
+    crate::mqueue::forget_fd_path(CHILD, FD);
+    if path.as_deref() == Some("/sys/fs/fuse") && mount_id == Some(7) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("fork lost the inherited fd path identity")
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_fork_inherits_fd_path_identity);
+
+// Procfs APIs address an fd by Linux PID, but syscall handlers already have a
+// scheduler TaskId. These number spaces may collide: resolving a TaskId via
+// the PID map can select another process's fd table. The TaskId-specific path
+// lookup must always keep the calling task's descriptor identity.
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_fd_path_task_lookup_avoids_pid_collision() -> TestResult {
+    const TASK: u64 = 0xF101;
+    const OTHER_TASK: u64 = 0xF102;
+    const FD: u32 = 7;
+    crate::handlers::register_pid_task_mapping(TASK, OTHER_TASK);
+    crate::mqueue::register_fd_path(TASK, FD, "/sys/kernel", None);
+    crate::mqueue::register_fd_path(OTHER_TASK, FD, "/wrong-process", None);
+    let path = crate::handlers::fd_path_for_task(TASK, FD);
+    crate::mqueue::forget_fd_path(TASK, FD);
+    crate::mqueue::forget_fd_path(OTHER_TASK, FD);
+    if path.as_deref() == Some("/sys/kernel") {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("TaskId fd lookup followed a colliding PID mapping")
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_fd_path_task_lookup_avoids_pid_collision
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_fork_rejects_without_address_space() -> TestResult {
     // Defence-in-depth: with no AS lookup installed, fork must
@@ -1701,6 +1852,37 @@ kernel_test_in!(
     "userspace",
     smoke_userspace_execve_sets_comm_to_argv0_basename
 );
+
+/// The comm-scoped syscall tracer must test the task name while holding the
+/// comm table lock, rather than clone it for every unrelated syscall. Verify
+/// its Linux-style 15-byte comm prefixes and comma-separated filter syntax.
+fn smoke_userspace_proc_comm_prefix_filter() -> TestResult {
+    const TID: u64 = 0xC0DE_C011;
+    crate::handlers::set_proc_comm(TID, "dbus-daemon");
+
+    let exact = crate::handlers::proc_comm_of_task_matches(TID, "dbus-daemon");
+    let prefix = crate::handlers::proc_comm_of_task_matches(TID, "systemd,dbus-daem");
+    let exact_selector = crate::handlers::proc_comm_of_task_matches(TID, "dbus-daemon$");
+    crate::handlers::set_proc_comm(TID, "dbus-daemon-worker");
+    let exact_rejects_suffix = !crate::handlers::proc_comm_of_task_matches(TID, "dbus-daemon$");
+    let prefix_still_matches_suffix =
+        crate::handlers::proc_comm_of_task_matches(TID, "dbus-daemon");
+    crate::handlers::set_proc_comm(TID, "dbus-daemon");
+    let miss = crate::handlers::proc_comm_of_task_matches(TID, "dbus-broker");
+
+    if exact
+        && prefix
+        && exact_selector
+        && exact_rejects_suffix
+        && prefix_still_matches_suffix
+        && !miss
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("comm prefix filter did not select only the matching task")
+    }
+}
+kernel_test_in!("userspace", smoke_userspace_proc_comm_prefix_filter);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_execve_publishes_cmdline_argv_pack() -> TestResult {

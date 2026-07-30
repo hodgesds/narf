@@ -305,7 +305,9 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     }
 
     let anonymous = flags & MAP_ANONYMOUS != 0 || fd < 0;
-    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = if anonymous {
+    let shared_file_fallback = !anonymous && flags & MAP_SHARED != 0;
+    let mut shared_file_ops = None;
+    let mut phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = if anonymous {
         // Lazy-back: phys[i] == 0; the #PF handler demand-allocates + zeros
         // each page on first access.
         alloc::vec![narf_memory::PhysAddr::new(0); pages]
@@ -330,6 +332,9 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 return;
             }
         };
+        if shared_file_fallback {
+            shared_file_ops = Some(Arc::clone(&ops));
+        }
         let mut frames = alloc::vec::Vec::with_capacity(pages);
         for i in 0..pages {
             let frame = match narf_memory::alloc_frame() {
@@ -377,15 +382,30 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         frames
     };
 
+    if let Some(ops) = shared_file_ops.as_ref() {
+        phys_list = crate::mapped_file::publish_shared_file_pages(ops, offset, phys_list);
+    }
+
     if as_ref
         .map_region(Region {
             base: VirtAddr::new(base),
             len,
-            perms,
-            phys: phys_list,
+            // Generic MAP_SHARED file mappings borrow a frame from the
+            // userspace file-page cache. RegionPerms::SHARED lets multiple
+            // VMAs alias one page and delegates lifetime to the cache through
+            // memory's shared-frame hooks.
+            perms: if shared_file_ops.is_some() {
+                perms | RegionPerms::SHARED
+            } else {
+                perms
+            },
+            phys: phys_list.clone(),
         })
         .is_err()
     {
+        if shared_file_ops.is_some() {
+            crate::mapped_file::discard_unmapped_shared_file_pages(&phys_list);
+        }
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
@@ -403,6 +423,14 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    if let Some(ops) = shared_file_ops {
+        let phys = as_ref
+            .lookup(VirtAddr::new(base))
+            .map(|region| region.phys)
+            .unwrap_or_default();
+        crate::mapped_file::register_file_current(base, len, offset, ops, phys);
+    }
+
     #[cfg(feature = "linux-compat")]
     crate::perf_event::on_mmap(
         current_task_id(),
@@ -414,4 +442,231 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         flags,
     );
     ctx.set_return(SyscallReturn::ok(base));
+}
+
+#[cfg(target_arch = "x86_64")]
+mod tests {
+    use super::*;
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_lib::sync::IrqSafeSpinLock;
+    use narf_memory::AddressSpace;
+
+    static USER_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
+    const TASK: u64 = 0x4d4d_4150;
+    const WORKER_TASK: u64 = TASK + 1;
+    const PROCESS: u64 = 0x4d4d_4152;
+    static CURRENT_TASK: AtomicU64 = AtomicU64::new(TASK);
+
+    fn address_space() -> Option<Arc<AddressSpace>> {
+        USER_AS.lock().clone()
+    }
+
+    fn task() -> u64 {
+        CURRENT_TASK.load(Ordering::Relaxed)
+    }
+
+    struct TestFile(IrqSafeSpinLock<alloc::vec::Vec<u8>>);
+
+    impl FileOps for TestFile {
+        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async move {
+                let bytes = self.0.lock();
+                let start = offset as usize;
+                if start >= bytes.len() {
+                    return Ok(0);
+                }
+                let count = (bytes.len() - start).min(buf.len());
+                buf[..count].copy_from_slice(&bytes[start..start + count]);
+                Ok(count)
+            })
+        }
+
+        fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async move {
+                let start = offset as usize;
+                let end = start + buf.len();
+                let mut bytes = self.0.lock();
+                if bytes.len() < end {
+                    bytes.resize(end, 0);
+                }
+                bytes[start..end].copy_from_slice(buf);
+                Ok(buf.len())
+            })
+        }
+
+        fn stat(&self) -> Stat {
+            Stat {
+                size: self.0.lock().len() as u64,
+                blocks: 8,
+                mode: Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+    }
+
+    struct TestCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+
+    impl TrapContext for TestCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.ret = Some(ret);
+        }
+
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+
+        fn set_rip(&mut self, _rip: u64) {}
+
+        fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+            false
+        }
+    }
+
+    // `MAP_SHARED` promises that modifications become file data once the
+    // caller synchronizes the mapped file. The synchronizing thread need not
+    // be the thread that created the mapping: journald's offlining worker
+    // maps the header in one thread and fsyncs it from another in the same
+    // thread group.
+    fn smoke_mmap_shared_file_fsync_writes_back_from_thread_group_peer() -> TestResult {
+        // SAFETY: the syscall runs with paging active; this allocates an
+        // independent user address space without switching the active one.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(aspace) => Arc::new(aspace),
+            Err(_) => return TestResult::Fail("new_for_user failed"),
+        };
+        *USER_AS.lock() = Some(Arc::clone(&aspace));
+        install_address_space_lookup(address_space);
+        install_task_id_lookup(task);
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+        crate::fd::__test_reset();
+        crate::fd::init();
+        crate::handlers::register_task_to_pid(TASK, PROCESS);
+        crate::handlers::register_task_to_pid(WORKER_TASK, PROCESS);
+
+        let file = Arc::new(TestFile(IrqSafeSpinLock::new(vec![0; 4096])));
+        let fd = crate::fd::with_table(TASK, |table| {
+            table.open(crate::fd::FdEntry {
+                ops: Arc::clone(&file) as Arc<dyn FileOps>,
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            })
+        })
+        .unwrap_or(u32::MAX);
+        if fd == u32::MAX {
+            return TestResult::Fail("could not install test file fd");
+        }
+        crate::fd::share(TASK, WORKER_TASK);
+
+        let mut mmap = TestCtx {
+            args: SyscallArgs {
+                arg1: 4096,
+                arg2: 3,    // PROT_READ | PROT_WRITE
+                arg3: 0x01, // MAP_SHARED
+                arg4: fd as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        sys_mmap(&mut mmap);
+        let base = match mmap.ret {
+            Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) > 0 => ret.value,
+            _ => return TestResult::Fail("MAP_SHARED file mmap failed"),
+        };
+        let region = match aspace.lookup(narf_memory::VirtAddr::new(base)) {
+            Some(region) if region.phys.len() == 1 && region.phys[0].raw() != 0 => region,
+            _ => return TestResult::Fail("file mapping has no physical page"),
+        };
+        // SAFETY: the syscall allocated this page exclusively for the test
+        // mapping and all physical memory is kernel identity-mapped.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                c"JOURNAL".as_ptr().cast(),
+                region.phys[0].raw() as *mut u8,
+                8,
+            );
+        }
+
+        // A second MAP_SHARED mapping of the same file range must alias the
+        // original page, not obtain another private fallback copy. Journald
+        // keeps a 4 KiB header mapping alongside a whole-file mapping; two
+        // copies would let the stale whole-file page overwrite the header on
+        // fsync.
+        let mut second_mmap = TestCtx {
+            args: SyscallArgs {
+                arg1: 4096,
+                arg2: 3,    // PROT_READ | PROT_WRITE
+                arg3: 0x01, // MAP_SHARED
+                arg4: fd as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        sys_mmap(&mut second_mmap);
+        let second_base = match second_mmap.ret {
+            Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) > 0 => ret.value,
+            _ => return TestResult::Fail("second MAP_SHARED file mmap failed"),
+        };
+        let second_region = match aspace.lookup(narf_memory::VirtAddr::new(second_base)) {
+            Some(region) if region.phys.len() == 1 && region.phys[0].raw() != 0 => region,
+            _ => return TestResult::Fail("second file mapping has no physical page"),
+        };
+        if second_region.phys[0] != region.phys[0] {
+            return TestResult::Fail("same-range MAP_SHARED mappings did not alias one file page");
+        }
+        // SAFETY: both mappings resolve to the same identity-mapped page.
+        if unsafe { core::slice::from_raw_parts(second_region.phys[0].raw() as *const u8, 8) }
+            != b"JOURNAL\0"
+        {
+            return TestResult::Fail(
+                "second MAP_SHARED mapping did not observe the first mapping's write",
+            );
+        }
+
+        // Switch to a CLONE_THREAD peer. It has the same process-visible PID
+        // and shared fd table, but a distinct scheduler TaskId.
+        CURRENT_TASK.store(WORKER_TASK, Ordering::Relaxed);
+        let mut fsync = TestCtx {
+            args: SyscallArgs {
+                arg0: fd as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        crate::handlers::sys_fsync(&mut fsync);
+        if !matches!(fsync.ret, Some(ret) if ret.status == SyscallReturn::OK && ret.value == 0) {
+            return TestResult::Fail("fsync on the mapped file failed");
+        }
+        if &file.0.lock()[..8] != b"JOURNAL\0" {
+            return TestResult::Fail("MAP_SHARED file data was not written back by fsync");
+        }
+
+        let _ = aspace.unmap_region(narf_memory::VirtAddr::new(second_base));
+        crate::mapped_file::unmap_current(second_base);
+        let _ = aspace.unmap_region(narf_memory::VirtAddr::new(base));
+        crate::mapped_file::unmap_current(base);
+        crate::fd::__test_reset();
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_mmap_shared_file_fsync_writes_back_from_thread_group_peer
+    );
 }

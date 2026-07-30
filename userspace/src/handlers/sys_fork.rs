@@ -191,6 +191,8 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // copied; pending signals reset (handled by sigaction_fork
     // not touching the pending bitmap).
     crate::fd::fork(parent_pid, child_tid.raw());
+    #[cfg(feature = "linux-compat")]
+    crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
     cwd_fork(parent_pid, child_tid.raw());
     // chroot inheritance (see do_clone3) — child inherits the parent's root.
     #[cfg(feature = "linux-compat")]
@@ -218,6 +220,11 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // changing only one re-opens the mismatch (see project_pidns_flow_model).
     #[cfg(feature = "container")]
     let mut child_ns_pid = child_pid.raw();
+    // Mount namespaces are implemented by the Linux-compat layer itself, not
+    // by the optional container feature. A child always shares its parent's
+    // current mount namespace until it explicitly unshares a new one.
+    crate::handlers::mount_ns_inherit(parent_pid, child_tid.raw());
+
     #[cfg(feature = "container")]
     {
         let parent_task = current_task_id();
@@ -226,7 +233,6 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
         {
             child_ns_pid = inner;
         }
-        mount_ns_inherit(parent_task, child_tid.raw());
         // UTS / NET / IPC / User namespaces share the parent's Arc.
         crate::namespaces::inherit_into_child(parent_task, child_tid.raw());
     }

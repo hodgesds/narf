@@ -93,6 +93,11 @@ impl TrapContext for AbiCtx {
 /// test; pair with [`teardown`].
 pub fn setup() {
     TASK_SLOT.store(FAKE_TASK, Ordering::Relaxed);
+    // ABI smokes share the kernel image. A preceding CLONE_NEWNS/unshare test
+    // must not leave FAKE_TASK resolving paths in its private namespace: this
+    // harness promises a fresh task view to every test.
+    crate::handlers::__test_mount_namespaces_reset();
+    crate::handlers::__test_root_dir_reset();
     __test_clear_global();
     fd::__test_reset();
     fd::init();
@@ -116,6 +121,8 @@ pub fn setup() {
 }
 
 pub fn teardown() {
+    crate::handlers::__test_mount_namespaces_reset();
+    crate::handlers::__test_root_dir_reset();
     __test_clear_global();
     fd::__test_reset();
 }

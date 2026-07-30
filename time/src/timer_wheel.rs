@@ -33,11 +33,12 @@ use core::task::Waker;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-/// Maximum number of in-flight sleepers. 64 is enough for the
-/// per-CPU IRQ pump, the AML / driver init pumps, and a few
-/// test smokes simultaneously. Bumping this up is a one-line
-/// change if drivers grow.
-pub const MAX_SLEEPERS: usize = 64;
+/// Maximum number of in-flight sleepers.  A desktop userspace routinely has
+/// hundreds of services blocked in epoll/poll at once; each needs a bounded
+/// lost-wake backstop in addition to its primary event-source waker.  Keep the
+/// fixed, IRQ-safe representation, but size it for that real workload rather
+/// than the early-boot-only one.
+pub const MAX_SLEEPERS: usize = 1024;
 
 #[derive(Debug)]
 struct Slot {

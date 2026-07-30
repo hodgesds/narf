@@ -57,7 +57,7 @@ pub(crate) fn sys_faccessat(ctx: &mut dyn TrapContext) {
     let effective = if raw.starts_with('/') || dirfd == AT_FDCWD {
         raw
     } else if dirfd >= 0 {
-        match fd_path_of(current_task_id(), dirfd as u32) {
+        match fd_path_for_task(current_task_id(), dirfd as u32) {
             Some(base) => alloc::format!("{}/{}", base.trim_end_matches('/'), raw),
             None => {
                 ctx.set_return(SyscallReturn::ok((-9i64) as u64));

@@ -84,7 +84,8 @@ pub use budget::{BudgetAccount, CpuBudget, OverrunPolicy, ResourceBudget};
 pub use cgroup::{
     apply_affinity, apply_priority, cgroup_cycles_for, cgroup_set_affinity, cgroup_set_priority,
     cpu_set_from_bits, install_cgroup_affinity_hook, install_cgroup_cpu_hook,
-    install_memory_pid_provider, AffinityHook, CpuPriorityHook,
+    install_memory_pid_provider, install_memory_pid_resolver, install_process_task_resolver,
+    AffinityHook, CpuPriorityHook,
 };
 pub use cpu_lifecycle::{
     cpu_bring_up, cpu_online, cpu_take_offline, online_count, CpuLifecycle, HotPlugError,
@@ -222,6 +223,12 @@ impl Drop for NprocGuard {
     #[inline]
     fn drop(&mut self) {
         LIVE_USER_TASKS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for TaskSlot {
+    fn drop(&mut self) {
+        unregister_task_affinity(self.id);
     }
 }
 
@@ -686,9 +693,11 @@ impl TaskSpec {
     /// Not `const`: the affinity depends on the runtime enable flag.
     pub fn user_task() -> Self {
         let affinity = if user_task_smp_enabled() {
-            // Reserve the BSP for kernel/IRQ/forwarder work; run user
-            // tasks on the APs so the RX forwarder (BSP) and request
-            // processing (AP) pipeline across cores. See `user_ap_affinity`.
+            // Prefer APs so the RX forwarder (BSP) and request processing
+            // pipeline across cores. On a two-CPU topology the placement
+            // policy includes both CPUs: excluding the BSP there would put
+            // every user process on the sole AP and serialize fork bursts.
+            // See `user_ap_affinity`.
             user_ap_affinity()
         } else {
             Affinity::pinned(crate::affinity::CpuId::BOOT)
@@ -801,24 +810,196 @@ pub fn __reset_queues_for_test() {
     }
 }
 
+/// Authoritative affinity for every live scheduler task.
+///
+/// A slot is absent from all ready queues while its future is being polled.
+/// Keeping the mask independently makes `sched_getaffinity(2)` exact during
+/// that interval and lets a concurrent setter publish an update that the slot
+/// consumes at the next cooperative poll boundary.
+static TASK_AFFINITY: IrqSafeSpinLock<alloc::vec::Vec<(TaskId, Affinity)>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+fn register_task_affinity(id: TaskId, affinity: Affinity) {
+    let mut entries = TASK_AFFINITY.lock();
+    entries.retain(|(task, _)| *task != id);
+    entries.push((id, affinity));
+}
+
+fn unregister_task_affinity(id: TaskId) {
+    TASK_AFFINITY.lock().retain(|(task, _)| *task != id);
+}
+
+/// Snapshot the online CPU set used by Linux affinity syscalls and cgroups.
+pub fn online_cpu_set() -> CpuSet {
+    CpuSet::from_bits(narf_lib::smp::online_bitmap())
+}
+
+/// Return a live task's hard affinity mask.
+pub fn task_affinity(id: TaskId) -> Option<CpuSet> {
+    TASK_AFFINITY
+        .lock()
+        .iter()
+        .find(|(task, _)| *task == id)
+        .map(|(_, affinity)| affinity.allowed)
+}
+
+/// Failure from [`set_task_affinity`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SetAffinityError {
+    /// The requested task has already exited or never existed.
+    TaskNotFound,
+    /// The supplied set has no online CPU.
+    NoOnlineCpu,
+}
+
+/// Change a task's hard affinity and migrate a queued slot when necessary.
+///
+/// A currently-polled task observes the registry update immediately through
+/// [`task_affinity`] and is re-homed when that poll returns `Pending`. This is
+/// the cooperative equivalent of Linux's `__set_cpus_allowed_ptr()` boundary:
+/// never move a live kernel continuation, and never dispatch the next slice
+/// outside the new mask.
+pub fn set_task_affinity(id: TaskId, requested: CpuSet) -> Result<(), SetAffinityError> {
+    let allowed = requested.intersection(online_cpu_set());
+    if allowed.is_empty() {
+        return Err(SetAffinityError::NoOnlineCpu);
+    }
+    let affinity = Affinity {
+        allowed,
+        preferred: lowest_allowed_cpu(allowed),
+    };
+    {
+        let mut entries = TASK_AFFINITY.lock();
+        let Some((_, current)) = entries.iter_mut().find(|(task, _)| *task == id) else {
+            return Err(SetAffinityError::TaskNotFound);
+        };
+        *current = affinity;
+    }
+
+    // If the task is parked, update and (when its old queue is no longer
+    // allowed) move it before it can dispatch again. At most one READY lock is
+    // held at a time; enqueue_on acquires the destination only after removal.
+    for (cpu, ready) in READY.iter().enumerate() {
+        let moved = {
+            let mut queue = ready.lock();
+            let Some(queue) = queue.as_mut() else {
+                continue;
+            };
+            let Some(pos) = queue.iter().position(|slot| slot.id == id) else {
+                continue;
+            };
+            if allowed.contains(CpuId(cpu as u32)) {
+                queue[pos].spec.affinity = affinity;
+                return Ok(());
+            }
+            let mut slot = queue.remove(pos).expect("affinity slot disappeared");
+            slot.spec.affinity = affinity;
+            slot
+        };
+        let target = target_cpu_for_affinity(affinity, cpu);
+        enqueue_on(target, moved);
+        return Ok(());
+    }
+
+    // The live slot is currently being polled (or is in the tiny
+    // poll-return→requeue interval). Its requeue path reads TASK_AFFINITY.
+    Ok(())
+}
+
+fn registered_affinity(id: TaskId) -> Option<Affinity> {
+    TASK_AFFINITY
+        .lock()
+        .iter()
+        .find(|(task, _)| *task == id)
+        .map(|(_, affinity)| *affinity)
+}
+
+fn refresh_slot_affinity(slot: &mut TaskSlot) {
+    if let Some(affinity) = registered_affinity(slot.id) {
+        slot.spec.affinity = affinity;
+    }
+}
+
+fn lowest_allowed_cpu(set: CpuSet) -> Option<CpuId> {
+    (0..narf_lib::percpu::MAX_CPUS as u32)
+        .find(|cpu| narf_lib::smp::is_online(*cpu) && set.contains(CpuId(*cpu)))
+        .map(CpuId)
+}
+
+fn target_cpu_for_affinity(affinity: Affinity, fallback: usize) -> usize {
+    if let Some(preferred) = affinity.preferred {
+        let cpu = preferred.0 as usize;
+        if cpu < narf_lib::percpu::MAX_CPUS
+            && narf_lib::smp::is_online(preferred.0)
+            && affinity.allowed.contains(preferred)
+        {
+            return cpu;
+        }
+    }
+    if fallback < narf_lib::percpu::MAX_CPUS
+        && narf_lib::smp::is_online(fallback as u32)
+        && affinity.allowed.contains(CpuId(fallback as u32))
+    {
+        return fallback;
+    }
+    lowest_allowed_cpu(affinity.allowed)
+        .map(|cpu| cpu.0 as usize)
+        .unwrap_or(0)
+}
+
+fn requeue_cpu_for_affinity(affinity: Affinity, current: usize) -> usize {
+    if current < narf_lib::percpu::MAX_CPUS
+        && narf_lib::smp::is_online(current as u32)
+        && affinity.allowed.contains(CpuId(current as u32))
+    {
+        return current;
+    }
+    target_cpu_for_affinity(affinity, current)
+}
+
+/// Make an infallible spawn request runnable on the current online topology.
+///
+/// Unlike `set_task_affinity`, the historic spawn API cannot return
+/// `NoOnlineCpu`. Internal callers can nevertheless construct a stale
+/// `TaskSpec` while CPUs are being hot-unplugged. Retaining an empty
+/// `allowed ∩ online` set would make the new slot bounce between dispatch and
+/// requeue forever, so an impossible initial mask falls back to the caller's
+/// online CPU. A valid mask remains a hard constraint.
+fn normalize_spawn_affinity(affinity: Affinity) -> Affinity {
+    let eligible = affinity.allowed.intersection(online_cpu_set());
+    if eligible.is_empty() {
+        let here = narf_lib::percpu::current_cpu();
+        let fallback = if here < narf_lib::percpu::MAX_CPUS && narf_lib::smp::is_online(here as u32)
+        {
+            CpuId(here as u32)
+        } else {
+            CpuId::BOOT
+        };
+        return Affinity::pinned(fallback);
+    }
+    let preferred = affinity
+        .preferred
+        .filter(|cpu| narf_lib::smp::is_online(cpu.0) && eligible.contains(*cpu));
+    Affinity {
+        allowed: affinity.allowed,
+        preferred,
+    }
+}
+
+fn enqueue_after_poll(cpu: usize, mut slot: TaskSlot) {
+    refresh_slot_affinity(&mut slot);
+    let target = requeue_cpu_for_affinity(slot.spec.affinity, cpu);
+    enqueue_on(target, slot);
+}
+
 /// Pick the CPU index a task with `spec` should land on. Honours
 /// `affinity.preferred` when the named CPU is online; otherwise spawns
 /// on the current CPU. Falls back to CPU 0 if the current CPU is
 /// somehow not online (shouldn't happen — current_cpu() returning a
 /// CPU implies that CPU is executing).
 fn target_cpu(spec: &TaskSpec) -> usize {
-    if let Some(cpu) = spec.affinity.preferred {
-        let id = cpu.0 as usize;
-        if id < narf_lib::percpu::MAX_CPUS && narf_lib::smp::is_online(cpu.0) {
-            return id;
-        }
-    }
     let here = narf_lib::percpu::current_cpu();
-    if here < narf_lib::percpu::MAX_CPUS {
-        here
-    } else {
-        0
-    }
+    target_cpu_for_affinity(spec.affinity, here)
 }
 
 /// Round-robin cursor for spreading user tasks across application
@@ -837,6 +1018,29 @@ static NEXT_USER_AP: AtomicU32 = AtomicU32::new(0);
 /// but is the correct MQ core layout, so it's kept.
 static RX_FORWARDER_CORES: AtomicU32 = AtomicU32::new(0);
 
+/// Convert the online AP candidate list into a user-task affinity.
+///
+/// The sole-AP topology is special only in the mathematical sense: an
+/// AP-only round robin has one element and therefore performs no balancing.
+/// Include the BSP in that degenerate case so consecutive user-task spawns
+/// alternate across both allowed CPUs. Larger topologies retain the AP-only
+/// pipeline that keeps ordinary user work away from BSP housekeeping.
+fn user_affinity_from_aps(mut aps: [u32; 64], mut n: usize, sequence: u32) -> Affinity {
+    if n == 0 {
+        return Affinity::any();
+    }
+    if n == 1 && aps[0] != crate::affinity::CpuId::BOOT.0 {
+        aps[1] = aps[0];
+        aps[0] = crate::affinity::CpuId::BOOT.0;
+        n = 2;
+    }
+    let idx = (sequence as usize) % n;
+    Affinity {
+        allowed: crate::affinity::CpuSet::ALL,
+        preferred: Some(crate::affinity::CpuId(aps[idx])),
+    }
+}
+
 /// Reserve CPUs `0..n` for RX forwarders (see [`RX_FORWARDER_CORES`]).
 /// Idempotent; the driver calls this once it knows the queue count.
 pub fn reserve_rx_forwarder_cores(n: u32) {
@@ -844,9 +1048,9 @@ pub fn reserve_rx_forwarder_cores(n: u32) {
 }
 
 /// Affinity for a user task when user-task SMP is live: **`preferred`
-/// biased to a round-robin online application processor, `allowed`
-/// left wide open** (every CPU). A soft initial-placement hint, not a
-/// pin.
+/// biased to round-robin online application processors (or BSP+AP on
+/// a two-CPU system), `allowed` left wide open** (every CPU). A soft
+/// initial-placement hint, not a pin.
 ///
 /// Rationale (redis SMP scaling — see `docs/redis-perf-plan.md`): the
 /// virtio RX forwarder and the other kernel housekeeping tasks are
@@ -859,12 +1063,12 @@ pub fn reserve_rx_forwarder_cores(n: u32) {
 /// BSP, where it is woken and re-enqueued, forming the pipeline —
 /// measured: SMP PING p99 254→222µs, p50 69→65µs (20k samples).
 ///
-/// `allowed` stays `CpuSet::ALL` deliberately: an earlier hard "APs
-/// only" mask exiled *every* user task to the lone AP on a 2-vCPU box
-/// and starved co-resident user tasks (net-smoke's `netserve` never
-/// reached `listen`) while the BSP sat kernel-idle. Leaving the BSP in
-/// `allowed` lets work-stealing rebalance under load while keeping the
-/// AP bias for the common case.
+/// `allowed` stays `CpuSet::ALL` deliberately. On a topology with only one
+/// AP, initial placement also alternates over the BSP: relying on later
+/// stealing left every short-lived fork/exec child serialized on the AP
+/// while BSP housekeeping prevented timely steals. With two or more APs,
+/// initial placement remains AP-only to keep the common forwarder(BSP) ↔
+/// application(AP) pipeline.
 ///
 /// Falls back to `Affinity::any()` if — against the
 /// `user_task_smp_enabled()` precondition — no AP is online, so a task
@@ -872,14 +1076,13 @@ pub fn reserve_rx_forwarder_cores(n: u32) {
 /// list is a fixed 64-wide buffer); NARF tops out well below that.
 fn user_ap_affinity() -> Affinity {
     // SOFT bias, not a hard pin: `allowed` stays ALL so a user task can
-    // still fall back to the BSP under load — only `preferred` (the
-    // initial-placement / target_cpu hint) is steered to a round-robin
-    // online AP. A hard "APs only" mask exiled *every* user task to the
-    // single AP on a 2-vCPU box, starving co-resident user tasks
-    // (observed: net-smoke's netserve never reached `listen`) while the
-    // BSP sat kernel-idle. Biasing only the initial CPU still forms the
-    // forwarder(BSP)↔app(AP) pipeline for a hot server (it spawns on an
-    // AP, is woken there, and re-enqueues there) without the starvation.
+    // still fall back to the BSP under load. `preferred` steers initial
+    // placement over APs on larger systems and over BSP+AP on a two-CPU
+    // system. A hard "APs only" mask exiled every user task to the single
+    // AP on a 2-vCPU box, starving co-resident user tasks (observed:
+    // net-smoke's netserve never reached `listen`) while the BSP sat
+    // kernel-idle. Larger systems keep the forwarder(BSP)↔app(AP) pipeline
+    // for hot servers without that degenerate-topology starvation.
     let cap = narf_lib::percpu::MAX_CPUS.min(64) as u32;
     // Skip CPUs reserved for RX forwarders so workers land on disjoint
     // cores (start at least at 1 — the BSP is never a worker target).
@@ -902,14 +1105,7 @@ fn user_ap_affinity() -> Affinity {
             }
         }
     }
-    if n == 0 {
-        return Affinity::any();
-    }
-    let idx = (NEXT_USER_AP.fetch_add(1, Ordering::Relaxed) as usize) % n;
-    Affinity {
-        allowed: crate::affinity::CpuSet::ALL,
-        preferred: Some(crate::affinity::CpuId(aps[idx])),
-    }
+    user_affinity_from_aps(aps, n, NEXT_USER_AP.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Push `slot` onto `cpu`'s ready queue. Panics if `init()` hasn't run.
@@ -958,6 +1154,8 @@ pub fn spawn_with_spec<F>(f: F, spec: TaskSpec) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let mut spec = spec;
+    spec.affinity = normalize_spawn_affinity(spec.affinity);
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     let slot = TaskSlot {
         task: Box::pin(f),
@@ -975,6 +1173,7 @@ where
         nproc_guard: None,
     };
     let cpu = target_cpu(&spec);
+    register_task_affinity(id, spec.affinity);
     enqueue_on(cpu, slot);
     id
 }
@@ -1119,6 +1318,8 @@ pub fn spawn_user<F>(id: TaskId, f: F, spec: TaskSpec, addr_space: Arc<AddressSp
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let mut spec = spec;
+    spec.affinity = normalize_spawn_affinity(spec.affinity);
     // Run user tasks on their OWN kernel stack via the no-preempt stackful
     // adapter. The cooperative executor polls a slot ON THE EXECUTOR STACK; a
     // *plain* UserTaskFuture would therefore run `enter_user_mode_resume` —
@@ -1155,6 +1356,7 @@ where
         nproc_guard: Some(NprocGuard::new()),
     };
     let cpu = target_cpu(&spec);
+    register_task_affinity(id, spec.affinity);
     enqueue_on(cpu, slot);
     id
 }
@@ -1723,11 +1925,15 @@ pub fn poll_one_round() -> usize {
                 None => break,
             }
         };
+        refresh_slot_affinity(&mut slot);
+        if !slot.spec.affinity.allowed.contains(CpuId(cpu as u32)) {
+            enqueue_after_poll(cpu, slot);
+            continue;
+        }
         // Skip user-mode tasks — see fn-level comment. Re-push so
         // the outer run loop still sees them when this returns.
         if slot.addr_space.is_some() {
-            let mut q = READY[cpu].lock();
-            q.as_mut().unwrap().push_back(slot);
+            enqueue_after_poll(cpu, slot);
             continue;
         }
         // Settle any pending donation claim before deciding to
@@ -1743,8 +1949,7 @@ pub fn poll_one_round() -> usize {
             }
         }
         if !slot.awake.flag.swap(false, Ordering::Acquire) {
-            let mut q = READY[cpu].lock();
-            q.as_mut().unwrap().push_back(slot);
+            enqueue_after_poll(cpu, slot);
             continue;
         }
         // Running on this CPU now — aim future wakes' reschedule IPI here
@@ -1823,8 +2028,7 @@ pub fn poll_one_round() -> usize {
                     }
                     ChargeOutcome::Continue => {}
                 }
-                let mut q = READY[cpu].lock();
-                q.as_mut().unwrap().push_back(slot);
+                enqueue_after_poll(cpu, slot);
             }
         }
     }
@@ -1992,6 +2196,11 @@ pub fn run_until_empty() {
             if let Some(new_as) = take_pending_slot_as(slot.id) {
                 slot.addr_space = Some(new_as);
             }
+            refresh_slot_affinity(&mut slot);
+            if !slot.spec.affinity.allowed.contains(CpuId(cpu as u32)) {
+                enqueue_after_poll(cpu, slot);
+                continue;
+            }
 
             // Settle any pending donation claim before deciding to
             // drop. A revoked donation cap rolls back both sides;
@@ -2014,8 +2223,7 @@ pub fn run_until_empty() {
             // Skip if no waker has fired since the last poll. The slot
             // stays in the queue, waiting for an external signal.
             if !slot.awake.flag.swap(false, Ordering::Acquire) {
-                let mut q = READY[cpu].lock();
-                q.as_mut().unwrap().push_back(slot);
+                enqueue_after_poll(cpu, slot);
                 continue;
             }
             // Running on this CPU now — aim future wakes' reschedule IPI
@@ -2226,8 +2434,7 @@ pub fn run_until_empty() {
                             // this slot; only an external wake
                             // (timer, IRQ, peer-wake) revives it.
                             slot.awake.flag.store(false, Ordering::Release);
-                            let mut q = READY[cpu].lock();
-                            q.as_mut().unwrap().push_back(slot);
+                            enqueue_after_poll(cpu, slot);
                             continue;
                         }
                         ChargeOutcome::Continue => {}
@@ -2238,8 +2445,7 @@ pub fn run_until_empty() {
                     // re-polls, so a self-waking future keeps making
                     // progress (and an idle CPU still halts once nothing
                     // is awake) without a separate progress counter.
-                    let mut q = READY[cpu].lock();
-                    q.as_mut().unwrap().push_back(slot);
+                    enqueue_after_poll(cpu, slot);
                 }
             }
         }

@@ -31,13 +31,15 @@ pub(crate) fn sys_socket_bind(ctx: &mut dyn TrapContext) {
     } else {
         None
     };
+    // `unix_bind_bsd()` creates the S_IFSOCK dentry before publishing the
+    // socket.  The registry key is consequently the inode identity from the
+    // outset, which lets a later file bind find the same endpoint through a
+    // different mount parent.
+    if let Some(p) = unix_path.as_deref() {
+        create_unix_socket_node(p);
+    }
     match sock.dispatch_op(crate::socket::SocketOp::Bind { addr }) {
-        crate::socket::SocketOpResult::Ok(_) => {
-            if let Some(p) = unix_path {
-                create_unix_socket_node(&p);
-            }
-            ctx.set_return(SyscallReturn::ok(0))
-        }
+        crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(fail),
     }
 }
