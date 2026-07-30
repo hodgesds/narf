@@ -55,10 +55,19 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::{bootstrap_mount_authority, registry, resolve, FileType, FsError, Initramfs, MemFs};
+
+static MOUNT_CHANGE_HOOK_HITS: AtomicUsize = AtomicUsize::new(0);
+
+fn count_mount_change() {
+    MOUNT_CHANGE_HOOK_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn ignore_mount_change() {}
 
 // ── poll_once helper ──────────────────────────────────────────────────
 //
@@ -473,6 +482,38 @@ kernel_test_in!(
     smoke_registry_stack_under_nested_mount
 );
 
+/// A mount-table change wakes blocked poll/epoll waiters after advancing the
+/// mountinfo generation. systemd relies on that wake to drain libmount before
+/// it reaps a successful mount(8) child; polling the generation alone is too
+/// late because SIGCHLD may otherwise win the event-loop race.
+fn smoke_global_mount_change_fires_wake_hook() -> TestResult {
+    const PATH: &str = "/mount-change-wake";
+    let auth = bootstrap_mount_authority();
+    MOUNT_CHANGE_HOOK_HITS.store(0, Ordering::Relaxed);
+    crate::install_mount_change_hook(count_mount_change);
+
+    let handle = match registry().mount(&auth, PATH, MemFs::new("mount-change-wake")) {
+        Ok(handle) => handle,
+        Err(_) => {
+            crate::install_mount_change_hook(ignore_mount_change);
+            return TestResult::Fail("mount change setup failed");
+        }
+    };
+    let woke_after_mount = MOUNT_CHANGE_HOOK_HITS.load(Ordering::Acquire) == 1;
+    let unmounted = registry().unmount(&handle, PATH).is_ok();
+    crate::install_mount_change_hook(ignore_mount_change);
+
+    if woke_after_mount && unmounted {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("a successful global mount must fire exactly one wake hook")
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_global_mount_change_fires_wake_hook
+);
+
 /// A private `MountNamespace` (the path a service takes after
 /// `unshare(CLONE_NEWNS)`) supports the same overmount stacking as the global
 /// registry: overmount succeeds, topmost is visible, unmount reveals the lower.
@@ -567,6 +608,44 @@ fn smoke_registry_file_bind_resolves_to_file() -> TestResult {
 kernel_test_in!(
     "filesystem/e2e/mount",
     smoke_registry_file_bind_resolves_to_file
+);
+
+/// Bind mounts and detached `clone_tree_at` roots are alternate paths into
+/// the same backing filesystem, not newly-created filesystems.  Consumers
+/// that key VFS objects by `(backing filesystem, inode)` (notably pathname
+/// AF_UNIX) rely on this identity surviving each adapter boundary.
+fn smoke_bind_and_clone_tree_preserve_backing_identity() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    let source = match registry().mount(&auth, "/bind-id-src", MemFs::new("bind-id-src")) {
+        Ok(handle) => handle,
+        Err(_) => return TestResult::Fail("source mount for backing-identity test failed"),
+    };
+    let expected = registry().resolve_absolute("/bind-id-src", |fs, _| fs.backing_identity());
+    let alias = match registry().bind_mount(&auth, "/bind-id-src", "/bind-id-alias") {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = registry().unmount(&source, "/bind-id-src");
+            return TestResult::Fail("bind mount for backing-identity test failed");
+        }
+    };
+    let alias_identity =
+        registry().resolve_absolute("/bind-id-alias", |fs, _| fs.backing_identity());
+    let clone_identity = registry()
+        .clone_tree_at("/bind-id-src")
+        .map(|fs| fs.backing_identity());
+
+    let _ = registry().unmount(&alias, "/bind-id-alias");
+    let _ = registry().unmount(&source, "/bind-id-src");
+
+    if expected.is_some() && expected == alias_identity && expected == clone_identity {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("bind/clone adapters changed the backing filesystem identity")
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_bind_and_clone_tree_preserve_backing_identity
 );
 
 /// Stacking works for FILES too: overmounting one bound file with another

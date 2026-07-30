@@ -87,6 +87,7 @@ pub trait FileOps {
     fn poll_readiness(&self) -> u32;
     fn poll_readiness_at(&self, offset: u64) -> u32;
     fn poll_edge_token(&self) -> (u64, u64);
+    fn acknowledge_poll_readiness(&self, readiness: u32);
 }
 ```
 
@@ -97,6 +98,10 @@ descriptions such as `/dev/kmsg` override it so EOF is not reported readable.
 `poll_edge_token` defaults to `(0, 0)`; stateful readiness providers advance
 one component whenever an edge-relevant source changes so `EPOLLET` cannot
 lose a drain/refill transition between readiness scans.
+`acknowledge_poll_readiness` defaults to a no-op and is called only after an
+epoll instance accepts an event for delivery. It lets a source retire a
+per-open-file change edge without allowing a passive nested-epoll readiness
+query to consume an event owned by its inner monitor.
 
 The devtmpfs-compatible root accepts runtime symlink creation and removal.
 This includes journald's `/dev/log -> /run/systemd/journal/dev-log` alias;
@@ -176,6 +181,13 @@ This per-task mountinfo projection is wired for every Linux-compat build,
 independently of optional container namespaces: service managers use
 `CLONE_NEWNS` for sandboxing and must observe private stacked file binds before
 they remount them read-only.
+An already-open `/proc/<pid>/mountinfo` file reports a `POLLPRI` edge after an
+attach, detach, or move in that task's visible mount namespace; unrelated
+namespace mutations do not advance its generation. This lets libmount rescan
+the same view synchronously after a mount helper exits. Each successful table
+mutation also fires the boot-installed readiness wake hook after releasing the
+mount-table lock, so a blocked poll/epoll monitor is scheduled before a
+concurrent mount-helper `SIGCHLD` can be processed.
 Recursive bind mounts rebase every visible descendant mount beneath the new
 target, preserving nested API mounts such as cgroup2 beneath a bound `/sys`.
 A recursive bind whose normalized source and target are identical stacks the
@@ -206,10 +218,20 @@ pub trait DirOps: Send + Sync {
     async fn syncfs(&self) -> Result<(), FsError>;
     /* … */
 }
+
+pub trait FsInstance: Send + Sync {
+    fn root(&self) -> Arc<dyn DirOps>;
+    fn name(&self) -> &str;
+    fn backing_identity(&self) -> usize;
+}
 ```
 
 Filesystems run in their own PKS/MTE domain (Stage 4) and communicate
 with `filesystem/` core via Narf-Ring.
+
+`backing_identity` identifies the backing filesystem object rather than a
+mount attachment. Bind-mount adapters preserve their source value so a VFS
+consumer can recognise aliases of the same `(filesystem, inode)` pair.
 
 ### 3.7 Page cache (optional per fs)
 

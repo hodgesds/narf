@@ -21,13 +21,15 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 use super::{
     hook_auxv, hook_coredump_get, hook_coredump_set, hook_cwd_path, hook_environ, hook_exe_path,
-    hook_fd_list, hook_fd_path, hook_fd_pidfd_pid, hook_nice, hook_oom_adj_get, hook_oom_adj_set,
-    hook_oom_score, hook_rlimits, hook_root_path, slice_read, task_info, ProcDirMarker,
+    hook_fd_list, hook_fd_path, hook_fd_pidfd_pid, hook_nice, hook_ns_mountinfo_generation,
+    hook_oom_adj_get, hook_oom_adj_set, hook_oom_score, hook_rlimits, hook_root_path, slice_read,
+    task_info, ProcDirMarker,
 };
 
 // ── Extended flat-file enum ─────────────────────────────────────────
@@ -82,9 +84,62 @@ pub enum PidExtField {
 pub struct PidExtFile {
     pub pid: u64,
     pub field: PidExtField,
+    mountinfo_generation: AtomicU64,
+}
+
+impl PidExtFile {
+    pub fn new(pid: u64, field: PidExtField) -> Self {
+        Self {
+            pid,
+            field,
+            mountinfo_generation: AtomicU64::new(hook_ns_mountinfo_generation(pid)),
+        }
+    }
 }
 
 impl FileOps for PidExtFile {
+    fn poll_readiness(&self) -> u32 {
+        if !matches!(self.field, PidExtField::Mountinfo) {
+            return crate::POLL_IN | crate::POLL_OUT;
+        }
+        let current = hook_ns_mountinfo_generation(self.pid);
+        let observed = self.mountinfo_generation.load(Ordering::Acquire);
+        // mountinfo remains an ordinary readable proc file. Linux adds the
+        // mount-namespace change edge to that normal readiness rather than
+        // replacing it; libmount may read its initial table before it arms
+        // the POLLPRI monitor.
+        let mut ready = crate::POLL_IN | crate::POLL_OUT;
+        if current != observed {
+            // Linux's proc_mounts_poll() returns both EPOLLPRI and EPOLLERR
+            // for a mount-namespace event (fs/proc_namespace.c). libmount
+            // treats that pair as its rescan trigger before systemd reaps a
+            // successful mount helper.
+            ready |= crate::POLL_PRI | crate::POLL_ERR;
+        }
+        ready
+    }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        if matches!(self.field, PidExtField::Mountinfo) {
+            (hook_ns_mountinfo_generation(self.pid), 0)
+        } else {
+            (0, 0)
+        }
+    }
+
+    fn acknowledge_poll_readiness(&self, readiness: u32) {
+        if matches!(self.field, PidExtField::Mountinfo)
+            && readiness & (crate::POLL_PRI | crate::POLL_ERR) != 0
+        {
+            // `proc_mounts_poll()`'s namespace sequence is per open file.
+            // Only the epoll instance that returned this event advances its
+            // cursor; a parent epoll merely querying a nested monitor must
+            // leave the edge available for the monitor to drain.
+            self.mountinfo_generation
+                .store(hook_ns_mountinfo_generation(self.pid), Ordering::Release);
+        }
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let pid = self.pid;
         let field = self.field;
@@ -245,7 +300,7 @@ pub fn lookup_pid_ext(pid: u64, name: &str) -> Option<PidExtFile> {
         "root" => PidExtField::Root,
         _ => return None,
     };
-    Some(PidExtFile { pid, field })
+    Some(PidExtFile::new(pid, field))
 }
 
 // ── Renderers ───────────────────────────────────────────────────────
@@ -1135,18 +1190,9 @@ kernel_test_in!("filesystem/procfs/pid_ext", smoke_task_dir_own_tid_only);
 
 /// Smoke: `oom_score_adj` + `coredump_filter` are writable; `oom_score` is read-only.
 fn smoke_writable_files_have_rw_mode() -> TestResult {
-    let adj = PidExtFile {
-        pid: 1,
-        field: PidExtField::OomScoreAdj,
-    };
-    let cd = PidExtFile {
-        pid: 1,
-        field: PidExtField::CoredumpFilter,
-    };
-    let score = PidExtFile {
-        pid: 1,
-        field: PidExtField::OomScore,
-    };
+    let adj = PidExtFile::new(1, PidExtField::OomScoreAdj);
+    let cd = PidExtFile::new(1, PidExtField::CoredumpFilter);
+    let score = PidExtFile::new(1, PidExtField::OomScore);
     if adj.stat().mode == Mode::FILE_RW
         && cd.stat().mode == Mode::FILE_RW
         && score.stat().mode == Mode::FILE_RO
@@ -1164,10 +1210,7 @@ kernel_test_in!(
 /// Smoke: oom_score reads back "0\n" (no hook installed → 0).
 fn smoke_oom_score_reads_back_zero() -> TestResult {
     use super::poll_once;
-    let f = PidExtFile {
-        pid: 1,
-        field: PidExtField::OomScore,
-    };
+    let f = PidExtFile::new(1, PidExtField::OomScore);
     let mut buf = [0u8; 64];
     match poll_once(f.read(0, &mut buf)) {
         Some(Ok(n)) if n > 0 => {
@@ -1187,10 +1230,7 @@ kernel_test_in!("filesystem/procfs/pid_ext", smoke_oom_score_reads_back_zero);
 /// Smoke: coredump_filter default returns "33\n" (no hook → 0x33).
 fn smoke_coredump_filter_default() -> TestResult {
     use super::poll_once;
-    let f = PidExtFile {
-        pid: 1,
-        field: PidExtField::CoredumpFilter,
-    };
+    let f = PidExtFile::new(1, PidExtField::CoredumpFilter);
     let mut buf = [0u8; 64];
     match poll_once(f.read(0, &mut buf)) {
         Some(Ok(n)) if n > 0 => {
@@ -1244,10 +1284,7 @@ fn smoke_oom_score_adj_write_validation() -> TestResult {
     use super::poll_once;
     _install_stub_proc_write_hooks();
     // Valid write: "100\n".
-    let f = PidExtFile {
-        pid: 1,
-        field: PidExtField::OomScoreAdj,
-    };
+    let f = PidExtFile::new(1, PidExtField::OomScoreAdj);
     let ok = poll_once(f.write(0, b"100\n"));
     let reject = poll_once(f.write(0, b"1500\n"));
     let reject_neg = poll_once(f.write(0, b"-1001\n"));
@@ -1267,10 +1304,7 @@ kernel_test_in!(
 fn smoke_coredump_filter_write_validation() -> TestResult {
     use super::poll_once;
     _install_stub_proc_write_hooks();
-    let f = PidExtFile {
-        pid: 1,
-        field: PidExtField::CoredumpFilter,
-    };
+    let f = PidExtFile::new(1, PidExtField::CoredumpFilter);
     let ok = poll_once(f.write(0, b"ff\n"));
     let bad = poll_once(f.write(0, b"zz\n"));
     match (ok, bad) {
@@ -1388,10 +1422,7 @@ kernel_test_in!(
 /// Smoke: exe/cwd/root stat() reports FileType::Symlink.
 fn smoke_magic_links_stat_as_symlink() -> TestResult {
     for field in &[PidExtField::Exe, PidExtField::Cwd, PidExtField::Root] {
-        let f = PidExtFile {
-            pid: 1,
-            field: *field,
-        };
+        let f = PidExtFile::new(1, *field);
         if f.stat().mode.file_type != FileType::Symlink {
             return TestResult::Fail("magic link must stat as S_IFLNK");
         }
@@ -1408,10 +1439,7 @@ kernel_test_in!(
 fn smoke_magic_links_empty_without_hook() -> TestResult {
     use super::poll_once;
     for field in &[PidExtField::Exe, PidExtField::Cwd] {
-        let f = PidExtFile {
-            pid: 1,
-            field: *field,
-        };
+        let f = PidExtFile::new(1, *field);
         let mut buf = [0u8; 64];
         match poll_once(f.read(0, &mut buf)) {
             Some(Ok(0)) => {} // expected: empty target
@@ -1429,10 +1457,7 @@ kernel_test_in!(
 /// Smoke: root read() returns "/" when no hook installed (default fallback).
 fn smoke_root_link_defaults_to_slash() -> TestResult {
     use super::poll_once;
-    let f = PidExtFile {
-        pid: 1,
-        field: PidExtField::Root,
-    };
+    let f = PidExtFile::new(1, PidExtField::Root);
     let mut buf = [0u8; 8];
     match poll_once(f.read(0, &mut buf)) {
         Some(Ok(n)) if n > 0 => {
@@ -1457,10 +1482,7 @@ fn smoke_loginuid_write_round_trips() -> TestResult {
     use super::poll_once;
     // A stable per-test pid to avoid colliding with any live task.
     const PID: u64 = 0x000f_109a_1d01;
-    let f = PidExtFile {
-        pid: PID,
-        field: PidExtField::Loginuid,
-    };
+    let f = PidExtFile::new(PID, PidExtField::Loginuid);
     // The node must be writable per its stat().
     if f.stat().mode != Mode::FILE_RW {
         return TestResult::Fail("loginuid must be RW");
@@ -1504,10 +1526,7 @@ kernel_test_in!(
 /// it) and rejects garbage.
 fn smoke_setgroups_accepts_allow_deny() -> TestResult {
     use super::poll_once;
-    let f = PidExtFile {
-        pid: 1,
-        field: PidExtField::Setgroups,
-    };
+    let f = PidExtFile::new(1, PidExtField::Setgroups);
     if f.stat().mode != Mode::FILE_RW {
         return TestResult::Fail("setgroups must be RW");
     }
@@ -1545,10 +1564,7 @@ kernel_test_in!("filesystem/procfs/pid_ext", smoke_mounts_has_fstab_row);
 /// (systemd reads this to place a process in its slice).
 fn smoke_cgroup_v2_unified_line() -> TestResult {
     use super::poll_once;
-    let f = PidExtFile {
-        pid: 1,
-        field: PidExtField::Cgroup,
-    };
+    let f = PidExtFile::new(1, PidExtField::Cgroup);
     let mut buf = [0u8; 64];
     match poll_once(f.read(0, &mut buf)) {
         Some(Ok(n)) => {
