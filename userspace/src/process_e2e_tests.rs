@@ -1515,7 +1515,6 @@ kernel_test_in!("userspace/process", smoke_process_pgid_setsid_roundtrip);
 //
 // Linux ref: fs/exec.c::do_execve → bprm_fill_uid.
 
-#[cfg(target_arch = "x86_64")]
 fn smoke_process_execve_input_validation() -> TestResult {
     crate::syscall::__test_clear_global();
     let mut t = SyscallTable::new();
@@ -1540,25 +1539,27 @@ fn smoke_process_execve_input_validation() -> TestResult {
         }
     }
 
-    // (B) too-short ELF (< 64 bytes)
-    // (B) a non-resolvable path pointer is rejected. Linux-ABI execve takes
-    // (path, argv, envp) — arg0 is a path, not an inline ELF. A path that
-    // doesn't resolve must be rejected: -ENOENT (so execvp(3) keeps searching
-    // PATH) or invalid_op — either way never a success.
-    let mut ctx = StubCtx {
-        args: SyscallArgs {
-            arg0: 0xDEAD_BEEF,
-            arg1: 0,
-            ..SyscallArgs::default()
-        },
-        ret: None,
-    };
-    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
-    match ctx.ret {
-        Some(r) if r.status != SyscallReturn::OK || (r.value as i64) < 0 => {}
-        _ => {
-            crate::syscall::__test_clear_global();
-            return TestResult::Fail("execve of an unresolvable path should be rejected");
+    // (B) A non-resolvable pointer is rejected on x86_64, whose SMAP-backed
+    // test uaccess path recovers the fault. The aarch64 kernel-test image does
+    // not install a recoverable EL1 uaccess fixup for arbitrary addresses, so
+    // its portable invalid-path case is the mapped string in (C).
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: 0xDEAD_BEEF,
+                arg1: 0,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
+        match ctx.ret {
+            Some(r) if r.status != SyscallReturn::OK || (r.value as i64) < 0 => {}
+            _ => {
+                crate::syscall::__test_clear_global();
+                return TestResult::Fail("execve of an unresolvable path should be rejected");
+            }
         }
     }
 
@@ -1584,7 +1585,6 @@ fn smoke_process_execve_input_validation() -> TestResult {
     crate::syscall::__test_clear_global();
     TestResult::Pass
 }
-#[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_process_execve_input_validation);
 
 // ── Smoke 13 (Wave-35): fork via Syscall::Fork returns non-zero child

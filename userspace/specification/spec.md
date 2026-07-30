@@ -38,6 +38,16 @@ that same root on the reserved task before making it runnable. This permits a
 dynamic service manager to be the direct PID 1 without a userspace chroot
 launcher.
 
+Architecture syscall reverse tables are unambiguous: every published wire
+number resolves through `Syscall::from_raw` to a single canonical variant. On
+aarch64, generic-ABI numbers such as `openat`, `newfstatat`, and `pipe2` are
+not also assigned to legacy variants that the generic ABI omitted. Legacy
+operations with NARF-private numbers remain available through that extension
+ABI. The sole forward-only alias is `Syscall::raw(EpollWait)` on aarch64:
+internal four-argument callers emit generic `epoll_pwait` number 22, whose
+zero-sigmask behavior shares the same handler; reverse lookup canonically
+returns `EpollPwait`.
+
 The Linux-compatibility syscall surface includes stored `prctl(2)` process
 state required by service managers and brokers. Capability-shaped controls
 such as `PR_SET_KEEPCAPS` round-trip according to the Linux ABI but do not mint

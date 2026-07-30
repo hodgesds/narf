@@ -784,3 +784,28 @@ fn smoke_abi_misc_restart_syscall_eintr() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_restart_syscall_eintr);
+
+// ── Reserved NARF-native submission entries ────────────────────────
+//
+// Submit/WaitCompl were published with the original native ABI but the
+// production fast path moved to the shared SQ/CQ mappings driven by
+// bootstrap + ring_kick. Keep the wire numbers reserved and pin the
+// current tombstone contract: dispatch reaches no handler and reports
+// NarfStatus::InvalidOp. These are NARF-native entries, not Linux
+// io_uring(2).
+
+fn smoke_abi_misc_reserved_native_ring_entries_are_invalid_op() -> TestResult {
+    with_setup(|| {
+        for variant in [Syscall::Submit, Syscall::WaitCompl] {
+            let ret = call_raw(variant.raw(), SyscallArgs::default());
+            if ret.status != SyscallReturn::INVALID_OP || ret.value != 0 {
+                return Err("reserved native ring entry must return InvalidOp with value zero");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_misc_reserved_native_ring_entries_are_invalid_op
+);

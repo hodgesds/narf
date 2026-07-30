@@ -643,6 +643,23 @@ fn smoke_abi_async_inotify_init1_nonblock() -> TestResult {
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_init1_nonblock);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_async_inotify_init_legacy_alias() -> TestResult {
+    with_setup(|| {
+        // Linux fs/notify/inotify/inotify_user.c::inotify_init dispatches
+        // exactly as inotify_init1(0). The legacy entry is x86_64-only.
+        match call(Syscall::InotifyInit.raw(), SyscallArgs::default()) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("legacy inotify_init() should return an fd"),
+        }
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_inotify_init_legacy_alias
+);
+
 // ════════════════════════════════════════════════════════════════════
 // inotify_add_watch(2) — sys_inotify_add_watch(fd, path, mask)
 //
