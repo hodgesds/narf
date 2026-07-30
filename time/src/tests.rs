@@ -509,6 +509,63 @@ fn smoke_wheel_full_returns_err() -> TestResult {
 }
 kernel_test_in!("time/wheel", smoke_wheel_full_returns_err);
 
+/// A desktop boot parks substantially more than the original 64-service
+/// bring-up workload.  The timer wheel must still supply each parked task a
+/// lost-wake backstop; rejecting the 65th registration makes `epoll_wait(-1)`
+/// fall back to a CPU-burning retry loop instead of blocking.
+fn smoke_wheel_desktop_scale_sleepers_fire() -> TestResult {
+    use crate::timer_wheel;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    const DESKTOP_SLEEPERS: usize = 128;
+
+    timer_wheel::__reset_for_test();
+
+    struct Counter(AtomicUsize);
+    impl Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let counter = Arc::new(Counter(AtomicUsize::new(0)));
+    let mut handles = Vec::with_capacity(DESKTOP_SLEEPERS);
+    for i in 0..DESKTOP_SLEEPERS {
+        let waker: core::task::Waker = counter.clone().into();
+        let handle = match timer_wheel::register(1_000 + i as u64, waker) {
+            Ok(handle) => handle,
+            Err(_) => {
+                timer_wheel::__reset_for_test();
+                return TestResult::Fail("desktop-scale sleepers exhausted timer wheel");
+            }
+        };
+        handles.push(handle);
+    }
+
+    if timer_wheel::fire_due(u64::MAX) != DESKTOP_SLEEPERS {
+        timer_wheel::__reset_for_test();
+        return TestResult::Fail("desktop-scale timer-wheel drain count mismatch");
+    }
+    if counter.0.load(Ordering::Relaxed) != DESKTOP_SLEEPERS {
+        timer_wheel::__reset_for_test();
+        return TestResult::Fail("desktop-scale sleepers did not all wake");
+    }
+
+    // Fired slots are already free; stale cancellation must remain harmless.
+    for handle in handles {
+        timer_wheel::cancel(handle);
+    }
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_desktop_scale_sleepers_fire);
+
 fn smoke_sleep_until_uses_wheel() -> TestResult {
     // SleepUntil registers with the wheel on first poll, then
     // returns Ready when fire_due crosses its deadline.
