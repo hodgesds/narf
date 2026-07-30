@@ -90,8 +90,17 @@ fn invoke(pid: u64, delta_bytes: i64) -> bool {
 /// `memory.max` and the allocation must be denied. Unattributed
 /// allocations (no PID provider, or `None` PID — e.g. early boot and
 /// kernel-internal allocs) are always allowed and not accounted.
+///
+/// `pub` rather than `pub(crate)` because not every accountable
+/// allocation goes through the frame allocator. A BPF map is a
+/// heap-backed object whose whole size is chosen by a `bpf(2)`
+/// argument (`bpf/src/map.rs`), so it has to charge for itself; the
+/// alternative is an fd that pins unbounded kernel memory outside any
+/// `memory.max`. Callers outside this crate own the pairing: every
+/// successful `try_charge` needs exactly one [`uncharge`] on the
+/// object's teardown path *and* on the failure path in between.
 #[must_use]
-pub(crate) fn try_charge(bytes: u64) -> bool {
+pub fn try_charge(bytes: u64) -> bool {
     let Some(pid) = current_charge_pid() else {
         return true;
     };
@@ -102,7 +111,9 @@ pub(crate) fn try_charge(bytes: u64) -> bool {
 /// effort: a free can race the task's exit/detach, and unattributed
 /// frees are simply ignored. The hook's return is irrelevant for an
 /// uncharge (a negative delta never denies).
-pub(crate) fn uncharge(bytes: u64) {
+///
+/// `pub` for the same reason [`try_charge`] is.
+pub fn uncharge(bytes: u64) {
     if let Some(pid) = current_charge_pid() {
         let _ = invoke(pid, -(bytes as i64));
     }
