@@ -116,6 +116,19 @@ pub enum JitError {
     Decode { at: u32 },
 }
 
+/// Whether this build has a native backend at all.
+///
+/// `false` on aarch64, where programs run interpreted (spec §5). Exposed so a
+/// test can tell "no backend on this architecture" — a legitimate skip — from
+/// "there is a backend and this program did not compile", which must stay a
+/// failure. Conflating the two is how a differential test starts passing
+/// vacuously; keeping them apart is why this is a separate predicate rather
+/// than a check on the error.
+#[must_use]
+pub const fn has_backend() -> bool {
+    cfg!(target_arch = "x86_64")
+}
+
 /// Compile a verified program for the host architecture.
 ///
 /// # Errors

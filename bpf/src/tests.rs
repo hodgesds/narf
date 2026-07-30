@@ -1123,6 +1123,13 @@ fn jit_corpus() -> Vec<(&'static str, Vec<Insn>)> {
 }
 
 fn smoke_bpf_jit_matches_the_interpreter() -> TestResult {
+    // Wholesale skip where there is no backend: every case would compare the
+    // interpreter with itself. Stated as a Skip with a reason rather than a
+    // Pass, so "the JIT is untested on this architecture" stays visible.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+
     // The only test that checks the emitter's *semantics*. Golden encodings
     // prove it emitted what was intended; the interpreter is the oracle for
     // whether the intent was right — and three of the four defects the JIT
@@ -1162,6 +1169,13 @@ fn smoke_bpf_jit_matches_the_interpreter() -> TestResult {
 kernel_test_in!("bpf", smoke_bpf_jit_matches_the_interpreter);
 
 fn smoke_bpf_jit_compiles_a_loop_and_runs_out_of_fuel() -> TestResult {
+    // Wholesale skip where there is no backend: every case would compare the
+    // interpreter with itself. Stated as a Skip with a reason rather than a
+    // Pass, so "the JIT is untested on this architecture" stays visible.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+
     // This test previously asserted the *opposite*: that a back-edge must never
     // reach the JIT, because no fuel was emitted and native code would have run
     // `loop: r0 += 1; goto loop` forever with IRQs masked. The emitter now burns
@@ -1196,6 +1210,13 @@ fn smoke_bpf_jit_compiles_a_loop_and_runs_out_of_fuel() -> TestResult {
 kernel_test_in!("bpf", smoke_bpf_jit_compiles_a_loop_and_runs_out_of_fuel);
 
 fn smoke_bpf_jit_bounded_loop_completes() -> TestResult {
+    // Wholesale skip where there is no backend: every case would compare the
+    // interpreter with itself. Stated as a Skip with a reason rather than a
+    // Pass, so "the JIT is untested on this architecture" stays visible.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+
     // The other half: fuel must not fire on a loop that legitimately finishes.
     // Without this, "everything runs out of fuel" would pass the test above.
     //
@@ -1249,11 +1270,23 @@ kernel_test_in!("bpf", smoke_bpf_jit_bounded_loop_completes);
 // falls back compares the interpreter against itself and passes for free —
 // which is how the missing `ST`-immediate encoding was found.
 
+/// Sentinel meaning "this architecture has no native backend", so the caller
+/// skips rather than failing. Compared by pointer-equal `&'static str`.
+const NO_BACKEND: &str = "no native backend on this architecture";
+
 /// Load, require compilation, run both ways, compare.
 fn diff_case(name: &str, items: &[Decoded], ctx: [u64; 4]) -> Result<(), &'static str> {
     let p = load(name, asm(items), Context::Atomic).map_err(|_| "load rejected")?;
     if !p.is_jited() {
-        return Err("not compiled — the comparison would be vacuous");
+        // On an architecture with a backend this is a real failure: a
+        // differential test whose subject fell back compares the interpreter
+        // with itself. Where there is no backend at all there is nothing to
+        // compare, and the caller skips.
+        return Err(if narf_bpf_jit::has_backend() {
+            "not compiled — the comparison would be vacuous"
+        } else {
+            NO_BACKEND
+        });
     }
     match (p.run_atomic(ctx, 4), p.run_atomic_interpreted(ctx, 4)) {
         (Some(Outcome::Returned(a)), Some(Outcome::Returned(b))) => {
@@ -1301,6 +1334,13 @@ const ALL_COND: [CondOp; 11] = [
 ];
 
 fn smoke_bpf_jit_diff_alu_sweep() -> TestResult {
+    // Wholesale skip where there is no backend: every case would compare the
+    // interpreter with itself. Stated as a Skip with a reason rather than a
+    // Pass, so "the JIT is untested on this architecture" stays visible.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+
     // Every operation × both widths × immediate and register source × boundary
     // operands. ~1150 cases.
     for &op in &ALL_ALU {
@@ -1354,6 +1394,13 @@ fn smoke_bpf_jit_diff_alu_sweep() -> TestResult {
 kernel_test_in!("bpf", smoke_bpf_jit_diff_alu_sweep);
 
 fn smoke_bpf_jit_diff_branch_sweep() -> TestResult {
+    // Wholesale skip where there is no backend: every case would compare the
+    // interpreter with itself. Stated as a Skip with a reason rather than a
+    // Pass, so "the JIT is untested on this architecture" stays visible.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+
     // Every predicate × both widths × immediate and register source, with
     // operands chosen so each predicate is exercised on both edges. Signed and
     // unsigned matter here: BPF's `Gt` is unsigned, so -1 > 0 must be *true*
@@ -1414,6 +1461,13 @@ fn smoke_bpf_jit_diff_branch_sweep() -> TestResult {
 kernel_test_in!("bpf", smoke_bpf_jit_diff_branch_sweep);
 
 fn smoke_bpf_jit_diff_register_sweep() -> TestResult {
+    // Wholesale skip where there is no backend: every case would compare the
+    // interpreter with itself. Stated as a Skip with a reason rather than a
+    // Pass, so "the JIT is untested on this architecture" stays visible.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+
     // Every general register as destination and as source. R6..R9 map to
     // rbx/r13/r14/r15 — callee-saved and, for three of them, needing REX.B —
     // so a prefix bug hides in half the register file. R10 is excluded: it is
@@ -1442,6 +1496,13 @@ fn smoke_bpf_jit_diff_register_sweep() -> TestResult {
 kernel_test_in!("bpf", smoke_bpf_jit_diff_register_sweep);
 
 fn smoke_bpf_jit_diff_stack_and_ctx_sweep() -> TestResult {
+    // Wholesale skip where there is no backend: every case would compare the
+    // interpreter with itself. Stated as a Skip with a reason rather than a
+    // Pass, so "the JIT is untested on this architecture" stays visible.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+
     // Frame offsets across the whole slot range, and every context word.
     // rbp-relative addressing needs a forced displacement byte, and the
     // disp8/disp32 boundary at -128 is where `modrm_mem` switches encodings —
@@ -1492,8 +1553,10 @@ fn smoke_bpf_jit_diff_stack_and_ctx_sweep() -> TestResult {
     for word in 0..4i16 {
         let prog = [ldx(0, 1, word * 8), EXIT];
         for ctx in [[0u64; 4], [1, 2, 3, 4], [u64::MAX, 0, 0x5A5A, 1]] {
-            if diff_case("ctx", &prog, ctx).is_err() {
-                return TestResult::Fail("context sweep diverged");
+            match diff_case("ctx", &prog, ctx) {
+                Ok(()) => {}
+                Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+                Err(_) => return TestResult::Fail("context sweep diverged"),
             }
         }
     }

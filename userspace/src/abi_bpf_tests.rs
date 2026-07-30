@@ -349,33 +349,14 @@ fn smoke_abi_perf_set_bpf_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_perf_set_bpf_pos);
 
 fn smoke_abi_perf_set_bpf_neg() -> TestResult {
+    // The arch-neutral half: fd validation. Split from the event-type gate
+    // below because that one needs a *non-tracepoint* perf event to exist, and
+    // which software events are admitted differs by architecture — bundling
+    // them made this whole test fail on aarch64 for a reason unrelated to what
+    // it checks.
     with_setup(|| {
         let insns = ret_imm(1);
         let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &insns).ok_or("bpf() not Ok")?;
-
-        // A non-tracepoint event: refused, because NARF wires only the
-        // tracepoint type to its trace events, so the program could never run.
-        // Accepting it would be worse than refusing — a silently dead filter.
-        // `PERF_COUNT_SW_DUMMY` (9) — `perf_event.rs:1105` names it as the
-        // software event admitted for sideband use, which is what this needs: a
-        // *non-tracepoint* event that opens cleanly.
-        //
-        // Two earlier attempts were refused for good reasons worth recording.
-        // A tracepoint's id is not a valid software config (they are a small
-        // enumeration, not arbitrary ids). And `CPU_CLOCK` is deliberately
-        // refused for a pid target — it would report the whole CPU's time and
-        // fabricate attribution (`perf_event.rs:3595`).
-        let sw = open_event_of_type(PERF_TYPE_SOFTWARE_, 9).ok_or("no software event")?;
-        if call(
-            Syscall::Ioctl.raw(),
-            a2(sw as u64, PERF_EVENT_IOC_SET_BPF, prog_fd as u64),
-        ) != Some(EINVAL)
-        {
-            return Err("SET_BPF on a software event was not refused");
-        }
-        let _ = call(Syscall::Close.raw(), a0(sw as u64));
-
-        // A bad fd, and an fd that is not a program.
         let ev = open_tracepoint_event().ok_or("could not open a tracepoint event")?;
         if call(
             Syscall::Ioctl.raw(),
@@ -397,3 +378,45 @@ fn smoke_abi_perf_set_bpf_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_perf_set_bpf_neg);
+
+fn smoke_abi_perf_set_bpf_wrong_event_type() -> TestResult {
+    // NARF wires only the tracepoint type to its trace events, so attaching to
+    // anything else would install a program that could never run — a silently
+    // dead filter, worse than a refusal.
+    //
+    // Needs a non-tracepoint event to exist. `PERF_COUNT_SW_DUMMY` is the one
+    // `perf_event.rs:1105` names for sideband use, but admission is
+    // arch-dependent, so a failure to open is reported as a Skip with its
+    // reason rather than as a failure of the gate under test. Not silently
+    // passing: an unopenable event leaves the gate unverified on that arch and
+    // the skip says so.
+    /// Returned by the closure when no non-tracepoint event can be opened, so
+    /// the result becomes a Skip rather than a Pass. A Pass would claim the gate
+    /// was verified on an architecture where it was not tested at all.
+    const NO_SW_EVENT: &str = "no non-tracepoint perf event is admitted here";
+
+    let outcome = with_setup(|| {
+        let insns = ret_imm(1);
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &insns).ok_or("bpf() not Ok")?;
+        let Some(sw) = open_event_of_type(PERF_TYPE_SOFTWARE_, 9) else {
+            let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+            return Err(NO_SW_EVENT);
+        };
+        let refused = call(
+            Syscall::Ioctl.raw(),
+            a2(sw as u64, PERF_EVENT_IOC_SET_BPF, prog_fd as u64),
+        ) == Some(EINVAL);
+        let _ = call(Syscall::Close.raw(), a0(sw as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        if refused {
+            Ok(())
+        } else {
+            Err("SET_BPF on a non-tracepoint event was not refused")
+        }
+    });
+    match outcome {
+        TestResult::Fail(m) if m == NO_SW_EVENT => TestResult::Skip(NO_SW_EVENT),
+        other => other,
+    }
+}
+kernel_test_in!("syscall_abi", smoke_abi_perf_set_bpf_wrong_event_type);
