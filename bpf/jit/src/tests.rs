@@ -123,6 +123,148 @@ fn reports_unsupported_rather_than_emitting_wrong_code() {
     ));
 }
 
+/// The prologue, hand-derived from the Intel SDM.
+///
+/// `push rbx; push r13; push r14; push r15; mov rbp, rdi; mov rdi, rsi`
+const PROLOGUE: &[u8] = &[
+    0x53, // push rbx
+    0x41, 0x55, // push r13
+    0x41, 0x56, // push r14
+    0x41, 0x57, // push r15
+    0x48, 0x89, 0xFD, // mov rbp, rdi
+    0x48, 0x89, 0xF7, // mov rdi, rsi
+];
+
+/// `pop r15; pop r14; pop r13; pop rbx; ret`
+const EPILOGUE: &[u8] = &[
+    0x41, 0x5F, // pop r15
+    0x41, 0x5E, // pop r14
+    0x41, 0x5D, // pop r13
+    0x5B, // pop rbx
+    0xC3, // ret
+];
+
+/// Assert the emitted body — everything between prologue and epilogue — is
+/// exactly `want`.
+///
+/// Exact bytes, not "contains". The earlier tests asserted things like
+/// `code.contains(&0xD3)`, which passes on wrong code that happens to include
+/// that byte somewhere, and one asserted a displacement byte appeared *anywhere*
+/// in the image, which is close to vacuous. For a code generator the encoding
+/// *is* the behaviour, so the test has to pin it.
+#[track_caller]
+fn assert_body(items: &[Decoded], want: &[u8]) {
+    let c = compile(&verified(items)).expect("should compile");
+    assert!(
+        c.code.starts_with(PROLOGUE),
+        "prologue changed:\n got {:02X?}\nwant {PROLOGUE:02X?}",
+        &c.code[..PROLOGUE.len().min(c.code.len())]
+    );
+    assert!(
+        c.code.ends_with(EPILOGUE),
+        "epilogue changed: got {:02X?}",
+        &c.code[c.code.len().saturating_sub(EPILOGUE.len())..]
+    );
+    let body = &c.code[PROLOGUE.len()..c.code.len() - EPILOGUE.len()];
+    assert_eq!(body, want, "\n got {body:02X?}\nwant {want:02X?}");
+}
+
+#[test]
+fn golden_mov_imm64() {
+    // r0 = 42; exit  →  mov rax, 42 (10-byte form) ; jmp epilogue
+    assert_body(
+        &[mov(0, 42), EXIT],
+        &[
+            0x48, 0xB8, 0x2A, 0, 0, 0, 0, 0, 0, 0, // mov rax, 42
+            0xE9, 0x00, 0x00, 0x00, 0x00, // jmp rel32 -> epilogue (disp 0)
+        ],
+    );
+}
+
+#[test]
+fn golden_add_reg() {
+    // r0 += r1  →  add rax, rdi
+    assert_body(
+        &[
+            Decoded::Alu {
+                wide: true,
+                op: AluOp::Add,
+                dst: r(0),
+                src: Source::Reg(r(1)),
+            },
+            EXIT,
+        ],
+        &[0x48, 0x01, 0xF8, 0xE9, 0, 0, 0, 0],
+    );
+}
+
+#[test]
+fn golden_shift_imm() {
+    // r0 <<= 5  →  shl rax, 5
+    assert_body(
+        &[
+            Decoded::Alu {
+                wide: true,
+                op: AluOp::Lsh,
+                dst: r(0),
+                src: Source::Imm(5),
+            },
+            EXIT,
+        ],
+        &[0x48, 0xC1, 0xE0, 0x05, 0xE9, 0, 0, 0, 0],
+    );
+}
+
+#[test]
+fn golden_imul_reg() {
+    // r0 *= r1  →  imul rax, rdi  (two-operand; the one-operand form would
+    // clobber rdx = R3)
+    assert_body(
+        &[
+            Decoded::Alu {
+                wide: true,
+                op: AluOp::Mul,
+                dst: r(0),
+                src: Source::Reg(r(1)),
+            },
+            EXIT,
+        ],
+        &[0x48, 0x0F, 0xAF, 0xC7, 0xE9, 0, 0, 0, 0],
+    );
+}
+
+#[test]
+fn golden_frame_store_and_load() {
+    // *(u64*)(r10-8) = r0 ; r1 = *(u64*)(r10-8)
+    //   mov [rbp-8], rax   →  48 89 45 F8
+    //   mov rdi, [rbp-8]   →  48 8B 7D F8
+    // rbp as a base needs an explicit displacement byte even at zero, which is
+    // the encoding trap `modrm_mem`'s `force_disp` exists for.
+    assert_body(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(10),
+                off: -8,
+                src: Source::Reg(r(0)),
+            },
+            Decoded::Load {
+                size: Size::Dw,
+                sign_extend: false,
+                dst: r(1),
+                src: r(10),
+                off: -8,
+            },
+            EXIT,
+        ],
+        &[
+            0x48, 0x89, 0x45, 0xF8, // mov [rbp-8], rax
+            0x48, 0x8B, 0x7D, 0xF8, // mov rdi, [rbp-8]
+            0xE9, 0, 0, 0, 0,
+        ],
+    );
+}
+
 #[test]
 fn load_and_store_against_the_frame_encode() {
     let prog = verified(&[
@@ -142,10 +284,9 @@ fn load_and_store_against_the_frame_encode() {
         mov(0, 0),
         EXIT,
     ]);
-    let c = compile(&prog).expect("frame access must compile");
-    // R10 maps to rbp, which needs an explicit displacement byte even at zero
-    // — the encoding trap `modrm_mem` handles. A negative offset exercises it.
-    assert!(c.code.windows(2).any(|w| w[1] == 0xF8 || w[0] == 0xF8));
+    // Superseded by `golden_frame_store_and_load`, which pins the exact
+    // bytes. Kept as a smoke that the shape compiles at all.
+    compile(&prog).expect("frame access must compile");
 }
 
 // ── the convergence cap ─────────────────────────────────────────────
@@ -189,8 +330,20 @@ fn shift_by_register_routes_through_cl() {
         EXIT,
     ]);
     let c = compile(&prog).expect("register shift must compile");
-    // 0xD3 is the group-2 "shift by cl" opcode.
-    assert!(c.code.contains(&0xD3), "expected a shift-by-cl encoding");
+    // Exact: mov rcx, rdi (48 89 F9) then shl rax, cl (48 D3 E0).
+    //
+    // Note the ModRM byte: for opcode 0x89 (`MOV r/m64, r64`) the reg field is
+    // the *source* and r/m is the destination, so `mov rcx, rdi` is F9 —
+    // reg=111(rdi), rm=001(rcx). CF would be `mov rdi, rcx`, the other
+    // direction. I wrote CF here first and this test caught it, which is the
+    // argument for exact encodings over byte-presence checks.
+    let body = &c.code[PROLOGUE.len()..c.code.len() - EPILOGUE.len()];
+    assert_eq!(
+        &body[..6],
+        &[0x48, 0x89, 0xF9, 0x48, 0xD3, 0xE0],
+        "got {:02X?}",
+        &body[..6.min(body.len())]
+    );
 }
 
 #[test]
