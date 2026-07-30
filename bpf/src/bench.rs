@@ -274,6 +274,12 @@ fn straight_line(n: usize) -> Vec<Insn> {
 /// surprise, and a straight line cannot show it.
 fn branchy(pairs: usize) -> Vec<Insn> {
     let mut prog: Vec<Decoded> = Vec::new();
+    // R0 first. Without it the verifier rejects the whole image with
+    // `UninitRegister { at: 5, reg: 0 }` — correctly, since the body's `r0 += 1`
+    // reads a register nothing wrote. It is worth noting how this failed: the
+    // first run of this suite skipped *every* case, because one rejected image
+    // took the shared cache down with it. Both halves of that are fixed.
+    prog.push(mov_imm(0, 0));
     prog.push(mov_imm(1, 0));
     for i in 0..pairs {
         prog.push(Decoded::JumpCond {
@@ -302,9 +308,14 @@ struct Cache {
     /// declaration order are the same fact stated twice. `cache()` builds it
     /// in that order.
     shapes: [Vec<Insn>; 4],
-    /// Verified straight-line programs, keyed by the sizes in
-    /// [`VERIFY_SIZES`], plus the branchy shape last.
-    verified: Vec<VerifiedProgram>,
+    /// Verified forms of [`Cache::load_images`], positionally.
+    ///
+    /// `Option` per entry, not a single `Option` over the lot: a shape the
+    /// verifier declines must cost only its own cases their samples. The first
+    /// run of this suite had one rejected image return `None` from `cache()`,
+    /// which skipped all seventeen benchmarks including every interpreter one —
+    /// a shared cache turning one bad fixture into total silence.
+    verified: Vec<Option<VerifiedProgram>>,
     /// Un-verified images for the load-path cases, cloned per iteration.
     load_images: Vec<Vec<Insn>>,
 }
@@ -316,7 +327,12 @@ static CACHE: IrqSafeSpinLock<Option<&'static Cache>> = IrqSafeSpinLock::new(Non
 /// figure across three points rather than having to be inferred from one.
 const VERIFY_SIZES: [usize; 3] = [16, 64, 256];
 
-/// Forward-branch pairs in the branchy verification shape.
+/// Forward-branch forks in the branchy verification shape.
+///
+/// 64 forks is 194 instruction slots (two prologue movs, three per fork, one
+/// `exit`), which is where the `branchy194` benchmark's name comes from — named
+/// for its size rather than its fork count so it is directly comparable with
+/// `straight256`.
 const BRANCHY_PAIRS: usize = 64;
 
 /// The four scalar words of the probe context tuple, as `prog.rs` declares
@@ -357,18 +373,13 @@ fn cache() -> Option<&'static Cache> {
     }
     load_images.push(branchy(BRANCHY_PAIRS));
 
-    // Verified forms of the same images. A `None` here means the verifier
-    // declined a shape this module built, which is a bug in the shape rather
-    // than a result — the affected cases then skip with a reason instead of
-    // reporting the cost of a rejection.
-    let mut verified = Vec::new();
-    for img in &load_images {
-        let prog = verifier_program(img, &descs);
-        match narf_bpf_verifier::verify(&prog) {
-            Ok(v) => verified.push(v),
-            Err(_) => return None,
-        }
-    }
+    // A `None` here means the verifier declined a shape this module built,
+    // which is a bug in the shape rather than a result — the cases that need
+    // that shape skip with a reason instead of timing a rejection.
+    let verified: Vec<Option<VerifiedProgram>> = load_images
+        .iter()
+        .map(|img| narf_bpf_verifier::verify(&verifier_program(img, &descs)).ok())
+        .collect();
 
     let c: &'static Cache = Box::leak(Box::new(Cache {
         shapes,
@@ -421,7 +432,20 @@ fn jit_cap() -> &'static Cap<narf_memory::bpf_text::Jit, Grant> {
 /// directly rather than loaded.
 const BENCH_STACK_BYTES: usize = 2048;
 
-fn sample_interp(shape: Shape, per_insn: bool, iters: u32) -> Option<Sample> {
+/// Which arm of the fuel experiment a sample runs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Arm {
+    /// The production policy: `Vm::run`.
+    PerInsn,
+    /// The policy it replaced.
+    Hoisted,
+    /// The production policy again, through a second monomorphisation. See
+    /// `interp::FUEL_PER_INSN_CONTROL` — this is the A/A control that says how
+    /// much of any A/B difference is code placement rather than fuel.
+    PerInsnControl,
+}
+
+fn sample_interp(shape: Shape, arm: Arm, iters: u32) -> Option<Sample> {
     let cache = cache()?;
     let registry = crate::kfunc::registry()?;
     let insns = &cache.shapes[shape as usize];
@@ -446,12 +470,10 @@ fn sample_interp(shape: Shape, per_insn: bool, iters: u32) -> Option<Sample> {
             frame,
             registry,
         );
-        let (c, outcome) = measure(|| {
-            if per_insn {
-                drive(vm.run())
-            } else {
-                drive(vm.run_fuel_hoisted())
-            }
+        let (c, outcome) = measure(|| match arm {
+            Arm::PerInsn => drive(vm.run()),
+            Arm::Hoisted => drive(vm.run_fuel_hoisted()),
+            Arm::PerInsnControl => drive(vm.run_fuel_per_insn_control()),
         });
         // A trap means the shape ran out of fuel or escaped its region, which
         // makes the sample a measurement of the failure path. Decline rather
@@ -495,7 +517,7 @@ fn sample_verify(idx: usize, iters: u32) -> Option<Sample> {
 
 fn sample_codegen(idx: usize, iters: u32) -> Option<Sample> {
     let cache = cache()?;
-    let v = cache.verified.get(idx)?;
+    let v = cache.verified.get(idx)?.as_ref()?;
     // Probe once outside the window: on aarch64 there is no emitter, so this
     // case must skip rather than time a `Err(Unsupported)` return.
     narf_bpf_jit::compile(v).ok()?;
@@ -524,7 +546,7 @@ fn sample_publish(idx: usize, iters: u32) -> Option<Sample> {
     use narf_memory::{bpf_extable, bpf_text};
 
     let cache = cache()?;
-    let v = cache.verified.get(idx)?;
+    let v = cache.verified.get(idx)?.as_ref()?;
     let compiled = narf_bpf_jit::compile(v).ok()?;
     let cap = jit_cap();
 
@@ -640,7 +662,7 @@ const DELTA_PCT: f64 = 3.0;
 const TARGET_N: u32 = 60;
 
 macro_rules! interp_case {
-    ($name:literal, $pair:literal, $shape:expr, $per_insn:literal) => {
+    ($name:literal, $pair:literal, $shape:expr, $arm:expr) => {
         Benchmark {
             name: $name,
             subsystem: "bpf",
@@ -651,9 +673,26 @@ macro_rules! interp_case {
             target_n: TARGET_N,
             delta_pct: DELTA_PCT,
             compare_with: Some($pair),
-            sample: |iters| sample_interp($shape, $per_insn, iters),
+            sample: |iters| sample_interp($shape, $arm, iters),
             skip_reason: "kfunc registry or BPF stack unavailable, or the shape trapped",
         }
+    };
+}
+
+/// Declare one shape's three arms: the A/B pair and the A/A control.
+///
+/// A macro over the whole triple rather than three `interp_case!`s, because the
+/// cross-links have to agree — the control must name the production arm and the
+/// pair must name each other, and writing twelve of those by hand is twelve
+/// chances to point a benchmark at the wrong peer and get a meaningless
+/// comparison that still looks like a result.
+macro_rules! interp_triple {
+    ($shape:expr, $per_insn:literal, $hoisted:literal, $control:literal) => {
+        [
+            interp_case!($per_insn, $hoisted, $shape, Arm::PerInsn),
+            interp_case!($hoisted, $per_insn, $shape, Arm::Hoisted),
+            interp_case!($control, $per_insn, $shape, Arm::PerInsnControl),
+        ]
     };
 }
 
@@ -675,62 +714,38 @@ macro_rules! load_case {
     };
 }
 
-/// The suite.
+/// The fuel-granularity experiment, one group per instruction mix.
 ///
-/// A flat static slice, so adding a benchmark in a later phase is one entry
-/// and no wiring. The fuel pairs come first because they are the question the
-/// suite was built to answer.
-static BENCHES: &[Benchmark] = &[
-    // ── the fuel-granularity A/B ────────────────────────────────────
-    interp_case!(
-        "bpf.interp.alu.fuel_per_insn",
-        "bpf.interp.alu.fuel_hoisted",
-        Shape::Alu,
-        true
-    ),
-    interp_case!(
-        "bpf.interp.alu.fuel_hoisted",
-        "bpf.interp.alu.fuel_per_insn",
-        Shape::Alu,
-        false
-    ),
-    interp_case!(
-        "bpf.interp.mem.fuel_per_insn",
-        "bpf.interp.mem.fuel_hoisted",
-        Shape::Mem,
-        true
-    ),
-    interp_case!(
-        "bpf.interp.mem.fuel_hoisted",
-        "bpf.interp.mem.fuel_per_insn",
-        Shape::Mem,
-        false
-    ),
-    interp_case!(
-        "bpf.interp.branch.fuel_per_insn",
-        "bpf.interp.branch.fuel_hoisted",
-        Shape::Branch,
-        true
-    ),
-    interp_case!(
-        "bpf.interp.branch.fuel_hoisted",
-        "bpf.interp.branch.fuel_per_insn",
-        Shape::Branch,
-        false
-    ),
-    interp_case!(
-        "bpf.interp.call.fuel_per_insn",
-        "bpf.interp.call.fuel_hoisted",
-        Shape::Call,
-        true
-    ),
-    interp_case!(
-        "bpf.interp.call.fuel_hoisted",
-        "bpf.interp.call.fuel_per_insn",
-        Shape::Call,
-        false
-    ),
-    // ── load-time decomposition ─────────────────────────────────────
+/// Grouped per shape rather than flattened because the harness takes groups and
+/// the shape is the unit that has to stay internally consistent: three arms,
+/// two comparisons, all four names sharing a prefix.
+static ALU_FUEL: [Benchmark; 3] = interp_triple!(
+    Shape::Alu,
+    "bpf.interp.alu.fuel_per_insn",
+    "bpf.interp.alu.fuel_hoisted",
+    "bpf.interp.alu.fuel_per_insn_ctl"
+);
+static MEM_FUEL: [Benchmark; 3] = interp_triple!(
+    Shape::Mem,
+    "bpf.interp.mem.fuel_per_insn",
+    "bpf.interp.mem.fuel_hoisted",
+    "bpf.interp.mem.fuel_per_insn_ctl"
+);
+static BRANCH_FUEL: [Benchmark; 3] = interp_triple!(
+    Shape::Branch,
+    "bpf.interp.branch.fuel_per_insn",
+    "bpf.interp.branch.fuel_hoisted",
+    "bpf.interp.branch.fuel_per_insn_ctl"
+);
+static CALL_FUEL: [Benchmark; 3] = interp_triple!(
+    Shape::Call,
+    "bpf.interp.call.fuel_per_insn",
+    "bpf.interp.call.fuel_hoisted",
+    "bpf.interp.call.fuel_per_insn_ctl"
+);
+
+/// Load-time latency, whole and decomposed.
+static LOAD_BENCHES: &[Benchmark] = &[
     load_case!(
         "bpf.load.verify.straight16",
         |i| sample_verify(0, i),
@@ -747,7 +762,7 @@ static BENCHES: &[Benchmark] = &[
         "verifier declined the benchmark's own image"
     ),
     load_case!(
-        "bpf.load.verify.branchy64",
+        "bpf.load.verify.branchy194",
         |i| sample_verify(3, i),
         "verifier declined the benchmark's own image"
     ),
@@ -767,7 +782,7 @@ static BENCHES: &[Benchmark] = &[
         "load rejected the benchmark's own image"
     ),
     load_case!(
-        "bpf.load.total.branchy64",
+        "bpf.load.total.branchy194",
         |i| sample_load_total(3, i),
         "load rejected the benchmark's own image"
     ),
@@ -803,6 +818,10 @@ static NOISE: &[Benchmark] = &[Benchmark {
 /// Contribute the suite. Called from `crate::register_initcalls`.
 pub fn register() {
     narf_bpf_bench::register_group(NOISE);
-    narf_bpf_bench::register_group(BENCHES);
+    narf_bpf_bench::register_group(&ALU_FUEL);
+    narf_bpf_bench::register_group(&MEM_FUEL);
+    narf_bpf_bench::register_group(&BRANCH_FUEL);
+    narf_bpf_bench::register_group(&CALL_FUEL);
+    narf_bpf_bench::register_group(LOAD_BENCHES);
     narf_bpf_bench::register_initcalls();
 }

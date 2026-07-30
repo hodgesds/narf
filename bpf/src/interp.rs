@@ -68,11 +68,33 @@ pub const MAX_CALL_FRAMES: usize = 8;
 
 /// The production fuel policy: one unit per instruction retired (§4.9).
 ///
-/// Named rather than spelled `true` at the one call site so the `const`
-/// parameter on the interpreter loop reads as a policy selection and not as a
-/// mystery boolean. The only other value is reachable from
-/// [`Vm::run_fuel_hoisted`], which exists to be benchmarked against this one.
-pub const FUEL_PER_INSN: bool = true;
+/// A named code rather than a bare literal at the one call site, so the `const`
+/// parameter on the interpreter loop reads as a policy selection. The other two
+/// values exist only under the `bench` feature; see [`Vm::run_fuel_hoisted`] and
+/// [`Vm::run_fuel_per_insn_control`].
+pub const FUEL_PER_INSN: u8 = 0;
+
+/// The single policy code that hoists the burn.
+///
+/// Private and unconditional, because the interpreter loop compares against it
+/// in every build while the *public* name for it exists only under `bench`.
+const POLICY_HOISTED: u8 = 1;
+
+/// Burn fuel only on back-edges and calls — the policy §8 item 7 replaced.
+#[cfg(feature = "bench")]
+pub const FUEL_HOISTED: u8 = POLICY_HOISTED;
+
+/// [`FUEL_PER_INSN`]'s semantics under a second policy code, and therefore a
+/// second monomorphisation of the same loop.
+///
+/// The A/A control. Two instantiations of identical source differ in code
+/// placement, and on an out-of-order core that is worth a percent or two by
+/// itself — so an A/B difference between the two *policies* is only
+/// interpretable next to the difference between two *identical* ones. Without
+/// this arm, "per-instruction fuel costs 2%" and "these two functions landed at
+/// different alignments" are the same measurement.
+#[cfg(feature = "bench")]
+pub const FUEL_PER_INSN_CONTROL: u8 = 2;
 
 /// Bytes each subprogram frame gets inside the stack region.
 pub const FRAME_BYTES: usize = 512;
@@ -367,7 +389,17 @@ impl<'a> Vm<'a> {
     /// production build cannot name it.
     #[cfg(feature = "bench")]
     pub async fn run_fuel_hoisted(&mut self) -> Outcome {
-        match self.run_inner::<false>().await {
+        match self.run_inner::<FUEL_HOISTED>().await {
+            Ok(v) => Outcome::Returned(v),
+            Err(t) => Outcome::Trapped(t),
+        }
+    }
+
+    /// Run under [`FUEL_PER_INSN_CONTROL`] — identical semantics to [`Vm::run`],
+    /// a different monomorphisation. The A/A control; see that constant.
+    #[cfg(feature = "bench")]
+    pub async fn run_fuel_per_insn_control(&mut self) -> Outcome {
+        match self.run_inner::<FUEL_PER_INSN_CONTROL>().await {
             Ok(v) => Outcome::Returned(v),
             Err(t) => Outcome::Trapped(t),
         }
@@ -379,11 +411,16 @@ impl<'a> Vm<'a> {
     /// question the A/B asks is what a decrement-and-branch per instruction
     /// costs, and a *runtime* policy check would add a second load and branch
     /// per instruction to production in order to measure the first one.
-    /// Monomorphised, `PER_INSN` folds at compile time and the production
+    /// Monomorphised, `POLICY` folds at compile time and the production
     /// instantiation keeps exactly the code it had before this parameter
     /// existed.
     #[allow(clippy::too_many_lines)]
-    async fn run_inner<const PER_INSN: bool>(&mut self) -> Result<u64, Trap> {
+    async fn run_inner<const POLICY: u8>(&mut self) -> Result<u64, Trap> {
+        // Folds to a constant in every instantiation, so neither arm carries a
+        // policy test at runtime. Written once here rather than repeated at
+        // each of the five burn sites, so adding a policy cannot leave one site
+        // reading the old sense of the comparison.
+        let per_insn = POLICY != POLICY_HOISTED;
         let mut pc: usize = 0;
         let mut frame_base: u64 = STACK_REGION + self.stack.len() as u64;
         loop {
@@ -410,7 +447,7 @@ impl<'a> Vm<'a> {
             // paying a decode and a match per instruction, so the marginal
             // cost is noise. The JIT will burn per basic block instead, which
             // is the same bound at coarser granularity.
-            if PER_INSN {
+            if per_insn {
                 self.burn(at)?;
             }
             let next = pc + width;
@@ -551,7 +588,7 @@ impl<'a> Vm<'a> {
                         // through its body rather than a flat unit per turn.
                         // Under the hoisted policy this *is* the whole meter,
                         // so the back-edge has to pay for the iteration.
-                        if !PER_INSN && off < 0 {
+                        if !per_insn && off < 0 {
                             self.burn(at)?;
                         }
                         pc = self.branch(at, next, i32::from(off))?;
@@ -570,7 +607,7 @@ impl<'a> Vm<'a> {
                     // there is fuel and the branch may be taken. `may_goto`
                     // needs no counter of its own — that is the whole point of
                     // metering at runtime.
-                    if !PER_INSN {
+                    if !per_insn {
                         self.burn(at)?;
                     }
                     pc = self.branch(at, next, i32::from(off))?;
@@ -582,14 +619,14 @@ impl<'a> Vm<'a> {
                         // unmetered kfunc loop. Kept for fidelity: the arm is
                         // only worth measuring if it is the policy that was
                         // actually replaced.
-                        if !PER_INSN {
+                        if !per_insn {
                             self.burn(at)?;
                         }
                         self.call_kfunc(at, id).await?;
                         pc = next;
                     }
                     narf_bpf_isa::CallTarget::Subprog(rel) => {
-                        if !PER_INSN {
+                        if !per_insn {
                             self.burn(at)?;
                         }
                         let target = self.subprog_target(at, next, rel)?;
