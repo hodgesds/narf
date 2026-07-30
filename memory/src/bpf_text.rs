@@ -734,8 +734,19 @@ static RECLAIM_HOOK: IrqSafeSpinLock<Option<ReclaimHook>> = IrqSafeSpinLock::new
 static QUARANTINE: IrqSafeSpinLock<Vec<TextAlloc>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Install the deferred-reclaim hook. Last writer wins.
-pub fn install_reclaim_hook(h: ReclaimHook) {
-    *RECLAIM_HOOK.lock() = Some(h);
+pub fn install_reclaim_hook(h: ReclaimHook) -> Option<ReclaimHook> {
+    RECLAIM_HOOK.lock().replace(h)
+}
+
+/// Remove the reclaim hook, returning it.
+///
+/// Exists so the quarantine fallback can be tested deterministically. Once a
+/// hook is installed, `free` routes everything through it and the quarantine
+/// is never exercised — so a test of the fallback has to be able to take the
+/// hook away and put it back, rather than being written to tolerate whichever
+/// path happens to be wired.
+pub fn take_reclaim_hook() -> Option<ReclaimHook> {
+    RECLAIM_HOOK.lock().take()
 }
 
 /// Diagnostics: (live packs, allocated chunks, quarantined allocations).
@@ -1448,6 +1459,21 @@ kernel_test_in!(
 /// the next allocation writes there.
 fn smoke_bpf_text_free_quarantines_then_reclaims() -> TestResult {
     let cap = JitCap::bootstrap();
+    // Exercise the *fallback* path explicitly. `narf-bpf` installs a reclaim
+    // hook at boot which routes `free` straight to RCU, so with it in place
+    // the quarantine is never touched and this test would be asserting a code
+    // path the kernel no longer takes. Take the hook away for the duration and
+    // put it back, so both paths stay covered rather than whichever one
+    // happens to be wired.
+    let saved = take_reclaim_hook();
+    let outcome = free_quarantine_fallback(&cap);
+    if let Some(h) = saved {
+        install_reclaim_hook(h);
+    }
+    outcome
+}
+
+fn free_quarantine_fallback(cap: &JitCap) -> TestResult {
     // Start from a drained quarantine: sibling smokes in this subsystem also
     // alloc and free, and their still-quarantined chunks would otherwise be
     // counted in `used_before` and released by our own `reclaim_all` — making
@@ -1457,7 +1483,7 @@ fn smoke_bpf_text_free_quarantines_then_reclaims() -> TestResult {
     if q_before != 0 {
         return TestResult::Fail("quarantine not empty after a full drain");
     }
-    let a = match alloc(&cap, 128, 0) {
+    let a = match alloc(cap, 128, 0) {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("bpf_text::alloc failed"),
     };

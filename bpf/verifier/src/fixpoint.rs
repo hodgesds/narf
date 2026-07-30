@@ -1014,10 +1014,21 @@ impl Analysis<'_, '_> {
                 // Linux's `frame[MAX_CALL_FRAMES]` array, at the cost of the
                 // callee losing per-byte initialisation tracking for it.
                 // // LINUX-GAP: the callee may therefore read caller stack
-                // bytes nothing wrote. Those bytes are the BPF stack region,
-                // reachable only by a program whose loader already holds
-                // `Cap<BpfProgLoad, Grant>` (spec §4.10), so this is not the
-                // privilege boundary it is for unprivileged Linux BPF.
+                // bytes nothing wrote.
+                //
+                // Those bytes are never another program's: **the runtime is
+                // required to zero a frame before handing it out**, and every
+                // provider in `bpf/src/mem.rs` does (pinned by
+                // `smoke_bpf_fresh_frame_is_zeroed`). Without that this would
+                // be a cross-program information leak, because the per-CPU
+                // region is reused and would otherwise still hold the previous
+                // program's spills.
+                //
+                // Stated here explicitly because it is a *cross-crate*
+                // obligation: a plausible optimisation in `mem.rs` — skipping
+                // the memset of a large frame on a hot probe path — would
+                // silently turn this precision loss into a disclosure, with
+                // nothing in that crate saying why the fill is load-bearing.
                 AbsValue::Ptr(p) if p.class == PtrClass::Stack => {
                     passed_frame_pointer = true;
                     let room = p.off.as_const().map_or(0, |o| (-o).max(0) as u64);

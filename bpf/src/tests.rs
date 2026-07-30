@@ -880,3 +880,45 @@ fn smoke_bpf_verified_ceiling_fits_the_real_region() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_verified_ceiling_fits_the_real_region);
+
+fn smoke_bpf_fresh_frame_is_zeroed() -> TestResult {
+    // Pins a cross-crate obligation. The verifier deliberately loses per-byte
+    // initialisation tracking for a caller frame passed to a callee, which is
+    // only sound because those bytes belong to the same program — and that in
+    // turn is only true because the runtime clears a frame before handing it
+    // out. The per-CPU region is reused, so an unzeroed level would hand a
+    // program the previous one's spills.
+    //
+    // Written dirty, released, re-acquired: the bytes must be zero again.
+    use crate::mem::BpfStack;
+    for provider_is_region in [false, true] {
+        if provider_is_region && !crate::mem::region_ready() {
+            continue;
+        }
+        let dirty: u8 = 0xA5;
+        {
+            let acquired = if provider_is_region {
+                crate::mem::PerCpuRegion.acquire(128)
+            } else {
+                crate::mem::PerCpuStackStub.acquire(128)
+            };
+            let Some(mut f) = acquired else {
+                return TestResult::Fail("provider declined a 128-byte frame");
+            };
+            f.bytes_mut().fill(dirty);
+        }
+        let again = if provider_is_region {
+            crate::mem::PerCpuRegion.acquire(128)
+        } else {
+            crate::mem::PerCpuStackStub.acquire(128)
+        };
+        let Some(mut f) = again else {
+            return TestResult::Fail("provider declined the second acquire");
+        };
+        if f.bytes_mut().iter().any(|&b| b != 0) {
+            return TestResult::Fail("a reused frame still held the previous contents");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_fresh_frame_is_zeroed);

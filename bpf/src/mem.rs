@@ -217,6 +217,12 @@ impl BpfStack for PerCpuStackStub {
         // this cell.
         let all = unsafe { &mut *FRAMES.cells[cpu].get() };
         let frame = &mut all[..bytes];
+        // Load-bearing, not hygiene: the verifier lets a callee read caller
+        // frame bytes nothing wrote (a deliberate precision loss — see the
+        // LINUX-GAP at `fixpoint.rs`'s `call_subprog`). Those bytes are only
+        // safe to expose because they are this program's, so a reused per-CPU
+        // level must be cleared before it is handed out. Do not skip this for
+        // large frames without closing that gap in the verifier first.
         frame.fill(0);
         Some(StackFrame {
             bytes: frame,
@@ -262,6 +268,12 @@ impl BpfStack for PerCpuRegion {
         // CPU that took it, and `StackFrame` is `!Send` for the same reason,
         // so no other CPU or nesting level can alias these bytes.
         let frame = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, bytes) };
+        // Load-bearing, not hygiene: the verifier lets a callee read caller
+        // frame bytes nothing wrote (a deliberate precision loss — see the
+        // LINUX-GAP at `fixpoint.rs`'s `call_subprog`). Those bytes are only
+        // safe to expose because they are this program's, so a reused per-CPU
+        // level must be cleared before it is handed out. Do not skip this for
+        // large frames without closing that gap in the verifier first.
         frame.fill(0);
         Some(StackFrame {
             bytes: frame,
@@ -338,6 +350,12 @@ impl BpfStack for HeapStack {
         // a reference.
         let all = unsafe { &mut *self.bytes.get() };
         let frame = &mut all[..bytes];
+        // Load-bearing, not hygiene: the verifier lets a callee read caller
+        // frame bytes nothing wrote (a deliberate precision loss — see the
+        // LINUX-GAP at `fixpoint.rs`'s `call_subprog`). Those bytes are only
+        // safe to expose because they are this program's, so a reused per-CPU
+        // level must be cleared before it is handed out. Do not skip this for
+        // large frames without closing that gap in the verifier first.
         frame.fill(0);
         Some(StackFrame {
             bytes: frame,
