@@ -1683,3 +1683,80 @@ fn smoke_bpf_xdp_unknown_action_aborts() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_xdp_unknown_action_aborts);
+
+fn smoke_bpf_jit_fuel_covers_every_path() -> TestResult {
+    // The risk fuel emission actually has: if a back-edge target is not a block
+    // start, the loop bypasses the burn and runs forever. `block_starts` marks
+    // every branch target, so it should hold — this exercises the shapes where
+    // it would not.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+
+    // (a) A back-edge into the *middle* of the program, not to instruction 0.
+    //     r0=0; r1=0; L: r0+=1; r1+=1; goto L   — target is index 2.
+    let mid = asm(&[
+        mov_imm(0, 0),
+        mov_imm(1, 0),
+        alu_imm(AluOp::Add, 0, 1),
+        alu_imm(AluOp::Add, 1, 1),
+        ja(-3),
+    ]);
+
+    // (b) A loop whose body contains a conditional, so the body spans several
+    //     blocks and only one of them is the back-edge target. A burn on the
+    //     loop head alone would not bound this.
+    //     L: r0+=1; if r0 == 0 goto skip; r1+=1; skip: goto L
+    let multi = asm(&[
+        mov_imm(0, 0),
+        mov_imm(1, 0),
+        alu_imm(AluOp::Add, 0, 1),
+        Decoded::JumpCond {
+            wide: true,
+            op: CondOp::Eq,
+            dst: r(0),
+            src: Source::Imm(0),
+            off: 1,
+        },
+        alu_imm(AluOp::Add, 1, 1),
+        ja(-4),
+    ]);
+
+    // (c) Two back-edges to the same target.
+    //     L: r0+=1; if r0==7 goto L; if r0==9 goto L; goto L
+    let two = asm(&[
+        mov_imm(0, 0),
+        alu_imm(AluOp::Add, 0, 1),
+        jne_imm(0, 7, -2),
+        jne_imm(0, 9, -3),
+        ja(-4),
+    ]);
+
+    for (name, insns) in [("mid", mid), ("multi", multi), ("two", two)] {
+        let Ok(p) = load(name, insns, Context::Atomic) else {
+            return TestResult::Fail("load rejected an unbounded loop — fuel makes it legal");
+        };
+        if !p.is_jited() {
+            return TestResult::Fail("a loop shape did not compile");
+        }
+        // The whole point: it must stop. A missing burn on any path shows up
+        // here as a hang rather than a wrong answer, which is why this runs
+        // the program instead of inspecting bytes.
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Trapped(Trap::OutOfFuel { .. })) => {}
+            Some(Outcome::Returned(_)) => {
+                return TestResult::Fail("an unbounded loop returned — a path skipped the burn")
+            }
+            Some(Outcome::Trapped(_)) => return TestResult::Fail("wrong trap"),
+            None => return TestResult::Fail("run declined"),
+        }
+        // And the interpreter agrees, which is what makes the native verdict
+        // trustworthy rather than merely plausible.
+        match p.run_atomic_interpreted([0; 4], 4) {
+            Some(Outcome::Trapped(Trap::OutOfFuel { .. })) => {}
+            _ => return TestResult::Fail("interpreted and native disagreed on exhaustion"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_fuel_covers_every_path);
