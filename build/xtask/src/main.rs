@@ -2210,6 +2210,7 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("barrier_smoke", "barrier-ok"),
         // Linux-compat round 4: close_range, sched-policy, msync+mincore, sync+syncfs+personality.
         ("closerange_smoke", "closerange-ok"),
+        ("fd_cloexec_exec_smoke", "fd-cloexec-exec-ok"),
         ("sched_smoke", "sched-ok"),
         ("mcore_smoke", "mcore-ok"),
         ("sync_smoke", "sync-ok"),

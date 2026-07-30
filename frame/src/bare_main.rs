@@ -3841,6 +3841,10 @@ fn boot_userspace_init() {
                     "closerange_smoke",
                     narf_verification::NARF_CLOSERANGE_SMOKE_ELF,
                 ),
+                (
+                    "fd_cloexec_exec_smoke",
+                    narf_verification::NARF_FD_CLOEXEC_EXEC_SMOKE_ELF,
+                ),
                 ("sched_smoke", narf_verification::NARF_SCHED_SMOKE_ELF),
                 ("mcore_smoke", narf_verification::NARF_MCORE_SMOKE_ELF),
                 ("sync_smoke", narf_verification::NARF_SYNC_SMOKE_ELF),

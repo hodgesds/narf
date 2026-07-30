@@ -544,6 +544,7 @@ fn main() {
         "splice_smoke",
         "barrier_smoke",
         "closerange_smoke",
+        "fd_cloexec_exec_smoke",
         "sched_smoke",
         "mcore_smoke",
         "sync_smoke",
