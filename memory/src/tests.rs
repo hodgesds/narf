@@ -6911,3 +6911,271 @@ fn smoke_shared_frame_replacement_updates_all_aliases() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_shared_frame_replacement_updates_all_aliases);
+
+// ════════════════════════════════════════════════════════════════════
+// mlock / munlock semantics.
+//
+// Coverage before this block was error-branch only: the six
+// `abi_mem*_tests.rs` pins all assert a *rejection* (no address space →
+// InvalidOp, bad flags → EINVAL), because the ABI harness deliberately
+// installs no per-task AddressSpace. Nothing anywhere exercised
+// `mlock_range`/`munlock_range` themselves, so neither the LOCKED
+// bookkeeping nor mlock's primary documented job — force-backing lazy
+// pages — had a test that could go red. munlock had no test at all.
+// ════════════════════════════════════════════════════════════════════
+
+/// Two pages mapped, one deliberately unbacked. `mlock` must allocate a
+/// frame for the hole and stamp it into the region, and `munlock` must
+/// leave the backing in place (there is no swap to release it to).
+///
+/// This is mlock's headline behaviour and it had zero coverage.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_mlock_force_backs_lazy_pages() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh user AS for this test only; forgotten below rather
+    // than dropped, as every sibling AS test in this file does.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let backed = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => {
+            core::mem::forget(a);
+            return TestResult::Skip("frame drained");
+        }
+    };
+    let v = VirtAddr::new(0x0000_0080_1000_0000);
+    // phys[1] == 0 is the "lazy / not yet backed" encoding mlock_range
+    // scans for.
+    if a.map_region(Region {
+        base: v,
+        len: 0x2000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![backed, PhysAddr::new(0)],
+    })
+    .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("map_region rejected a partially-backed region");
+    }
+
+    let hole_before = a
+        .regions_snapshot()
+        .iter()
+        .find(|r| r.base.as_u64() == v.as_u64())
+        .and_then(|r| r.phys.get(1).map(|p| p.raw()));
+    if hole_before != Some(0) {
+        core::mem::forget(a);
+        return TestResult::Fail("test setup: page 1 was not an unbacked hole");
+    }
+
+    if a.mlock_range(v, 0x2000).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("mlock_range on a mapped range returned Err");
+    }
+
+    let after = a
+        .regions_snapshot()
+        .iter()
+        .find(|r| r.base.as_u64() == v.as_u64())
+        .map(|r| {
+            (
+                r.phys.first().map(|p| p.raw()).unwrap_or(0),
+                r.phys.get(1).map(|p| p.raw()).unwrap_or(0),
+                r.perms.contains(RegionPerms::LOCKED),
+            )
+        });
+    let Some((p0, p1, locked)) = after else {
+        core::mem::forget(a);
+        return TestResult::Fail("region vanished across mlock");
+    };
+    if p0 != backed.raw() {
+        core::mem::forget(a);
+        return TestResult::Fail("mlock disturbed an already-backed page");
+    }
+    if p1 == 0 {
+        core::mem::forget(a);
+        return TestResult::Fail("mlock did not force-back the lazy page");
+    }
+    if !locked {
+        core::mem::forget(a);
+        return TestResult::Fail("mlock did not set LOCKED");
+    }
+
+    // munlock clears the flag but must NOT hand the backing back: there
+    // is no swap tier to release it to, and dropping it would turn a
+    // munlock into a silent data loss.
+    if a.munlock_range(v, 0x2000).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("munlock_range returned Err");
+    }
+    let unlocked = a
+        .regions_snapshot()
+        .iter()
+        .find(|r| r.base.as_u64() == v.as_u64())
+        .map(|r| {
+            (
+                r.perms.contains(RegionPerms::LOCKED),
+                r.phys.get(1).map(|p| p.raw()).unwrap_or(0),
+                r.perms.contains(RegionPerms::READ) && r.perms.contains(RegionPerms::WRITE),
+            )
+        });
+    core::mem::forget(a);
+    match unlocked {
+        None => TestResult::Fail("region vanished across munlock"),
+        Some((true, _, _)) => TestResult::Fail("munlock left LOCKED set"),
+        Some((_, p, _)) if p != p1 => TestResult::Fail("munlock released the backing"),
+        Some((_, _, false)) => TestResult::Fail("munlock clobbered the POSIX prot bits"),
+        Some(_) => TestResult::Pass,
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_mlock_force_backs_lazy_pages);
+
+/// A range spanning two adjacent regions must flag **both**. The
+/// intersect test is `rb < hi && lo < re`; an off-by-one there (or a
+/// `find`-style "first match wins") would silently leave the second
+/// region unlocked.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_mlock_spans_multiple_regions() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: as above.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let (f0, f1) = match (crate::alloc_frame(), crate::alloc_frame()) {
+        (Ok(x), Ok(y)) => (x.start_address(), y.start_address()),
+        _ => {
+            core::mem::forget(a);
+            return TestResult::Skip("frame drained");
+        }
+    };
+    let base = 0x0000_0080_2000_0000u64;
+    for (i, f) in [f0, f1].into_iter().enumerate() {
+        if a.map_region(Region {
+            base: VirtAddr::new(base + (i as u64) * 0x1000),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![f],
+        })
+        .is_err()
+        {
+            core::mem::forget(a);
+            return TestResult::Fail("map_region failed");
+        }
+    }
+
+    if a.mlock_range(VirtAddr::new(base), 0x2000).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("mlock_range across two regions returned Err");
+    }
+    let both = a
+        .regions_snapshot()
+        .iter()
+        .filter(|r| r.base.as_u64() == base || r.base.as_u64() == base + 0x1000)
+        .filter(|r| r.perms.contains(RegionPerms::LOCKED))
+        .count();
+    core::mem::forget(a);
+    if both == 2 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("mlock across two regions did not flag both")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_mlock_spans_multiple_regions);
+
+/// Negative pair: a range intersecting nothing is `Unmapped`, for both
+/// verbs. `munlock` had no negative test at all, so a change making it
+/// silently succeed on an unmapped range would not have been noticed.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_mlock_unmapped_is_rejected() -> TestResult {
+    use crate::{AddressSpace, VirtAddr};
+
+    // SAFETY: as above.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let nowhere = VirtAddr::new(0x0000_0080_3000_0000);
+    let mlock_err = a.mlock_range(nowhere, 0x1000).is_err();
+    let munlock_err = a.munlock_range(nowhere, 0x1000).is_err();
+    core::mem::forget(a);
+    match (mlock_err, munlock_err) {
+        (true, true) => TestResult::Pass,
+        (false, _) => TestResult::Fail("mlock on an unmapped range succeeded"),
+        (_, false) => TestResult::Fail("munlock on an unmapped range succeeded"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_mlock_unmapped_is_rejected);
+
+/// `mprotect` must not silently unlock an mlocked region.
+///
+/// Linux keeps `VM_LOCKED` across an `mprotect`, and NARF's 4 KiB path
+/// does too — it rebuilds the middle fragment as `prot | preserved_flags`
+/// where `preserved_flags` is everything outside `PROT_MASK`. This pins
+/// that, because the obvious simplification (`perms: prot`) reads as
+/// correct and silently drops LOCKED. The hugetlb path in the same
+/// function *does* use bare `prot`; see the `// LINUX-GAP` note there.
+#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+fn smoke_memory_mlock_survives_mprotect() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: as above.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let f = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => {
+            core::mem::forget(a);
+            return TestResult::Skip("frame drained");
+        }
+    };
+    let v = VirtAddr::new(0x0000_0080_4000_0000);
+    if a.map_region(Region {
+        base: v,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![f],
+    })
+    .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("map_region failed");
+    }
+    if a.mlock_range(v, 0x1000).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("mlock_range returned Err");
+    }
+    // RW -> R. Not a JIT transition, so no capability is involved.
+    if a.mprotect_range(v, 0x1000, RegionPerms::READ).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("mprotect_range returned Err");
+    }
+    let still = a
+        .regions_snapshot()
+        .iter()
+        .find(|r| r.base.as_u64() == v.as_u64())
+        .map(|r| {
+            (
+                r.perms.contains(RegionPerms::LOCKED),
+                r.perms.contains(RegionPerms::WRITE),
+            )
+        });
+    core::mem::forget(a);
+    match still {
+        Some((true, false)) => TestResult::Pass,
+        Some((false, _)) => TestResult::Fail("mprotect silently cleared LOCKED"),
+        Some((_, true)) => TestResult::Fail("mprotect did not drop WRITE"),
+        None => TestResult::Fail("region vanished across mprotect"),
+    }
+}
+#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+kernel_test_in!("memory", smoke_memory_mlock_survives_mprotect);

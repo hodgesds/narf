@@ -2282,6 +2282,11 @@ impl AddressSpace {
     /// a request straddling two regions with different permissions has no
     /// single `old` to classify, and silently classifying against the first
     /// one would let a JIT grant cover a region it was never meant to.
+    ///
+    /// **Not** a precondition for `mprotect(2)` in general — see
+    /// [`Self::perms_intersecting`]. Making it one narrowed the syscall to
+    /// single-region ranges and broke every multi-region `mprotect` that used
+    /// to work.
     pub fn perms_covering(&self, base: VirtAddr, len: u64) -> Option<RegionPerms> {
         let lo = base.as_u64();
         let hi = lo.checked_add(len)?;
@@ -2293,6 +2298,34 @@ impl AddressSpace {
                 rb <= lo && hi <= rb + r.len
             })
             .map(|r| r.perms)
+    }
+
+    /// Permissions of **every** region intersecting `[base, base + len)`.
+    ///
+    /// `mprotect_range` splits across every intersecting region, so the W^X
+    /// classification has to see every one of them too. Using
+    /// [`Self::perms_covering`] for that instead was a real regression: it
+    /// returns `None` unless a *single* region spans the whole request, so a
+    /// range crossing two adjacent mappings — or one an earlier `mprotect`
+    /// had already split — was refused outright rather than classified.
+    ///
+    /// Returns them in region order. An empty result means nothing is mapped
+    /// there, which is `mprotect_range`'s error to report, not this one's.
+    pub fn perms_intersecting(&self, base: VirtAddr, len: u64) -> alloc::vec::Vec<RegionPerms> {
+        let lo = base.as_u64();
+        let Some(hi) = lo.checked_add(len) else {
+            return alloc::vec::Vec::new();
+        };
+        self.regions
+            .lock()
+            .iter()
+            .filter(|r| {
+                let rb = r.base.as_u64();
+                let re = rb + r.len;
+                rb < hi && lo < re
+            })
+            .map(|r| r.perms)
+            .collect()
     }
 
     /// `mprotect_range` **without** the W^X end-state rejection.
@@ -2377,6 +2410,21 @@ impl AddressSpace {
                     let _ = self.unmap_huge_leaf(va, region.size);
                     self.map_huge_leaf(va, frame.phys(), region.size, prot)?;
                 }
+                // LINUX-GAP: bare `prot` here drops the internal flags —
+                // LOCKED above all — where the 4 KiB path below preserves them
+                // (`prot | preserved_flags`). Linux keeps `VM_LOCKED` across an
+                // `mprotect`, so an `mlock`ed hugetlb mapping is silently
+                // unlocked by a later `mprotect` of part of it.
+                //
+                // Consequences are contained today only because nothing reads a
+                // *huge* region's LOCKED: the COW and fork paths consult
+                // `self.regions` alone, and `Drop` frees huge frames
+                // unconditionally (huge mappings never honour SHARED either).
+                // The moment a reclaim tier consults huge LOCKED this becomes a
+                // real unlock. Pinned for the 4 KiB path by
+                // `smoke_memory_mlock_survives_mprotect`; deliberately not
+                // "fixed" here because the flag has no consumer to be correct
+                // for yet, and a fix with no test would just be a claim.
                 rebuilt.push(HugeRegion {
                     base: VirtAddr::new(split_lo),
                     len: middle_frames.len() as u64 * page_size,
