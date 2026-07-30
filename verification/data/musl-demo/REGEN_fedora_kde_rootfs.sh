@@ -109,6 +109,53 @@ rm -f "$WORK/root/usr/share/dbus-1/services/org.freedesktop.systemd1.service"
 # ld.so.cache: the image is built offline, so make sure it matches the tree.
 "$WORK/enter.sh" 'ldconfig' || true
 
+# Plasma must run as an ordinary desktop user. The image is a container base
+# and therefore has no login user by default; create the deterministic test
+# account only when it is absent so incremental image rebuilds stay stable.
+if ! grep -q '^narf:' "$WORK/root/etc/passwd"; then
+  "$WORK/enter.sh" 'useradd --create-home --uid 1000 --shell /bin/bash narf'
+fi
+install -d -m 0755 "$WORK/root/home/narf/.config" "$WORK/root/etc/systemd/system/graphical.target.wants"
+printf '[General]\nsystemdBoot=false\n' > "$WORK/root/home/narf/.config/startkderc"
+chown -R 1000:1000 "$WORK/root/home/narf"
+
+# The graphical session is a normal systemd service, deliberately not the
+# legacy narf-start.sh diagnostic wrapper. PID 1 orders it after the system
+# bus, gives it a private user-owned runtime directory, and starts Plasma
+# through a fresh session bus. logind is intentionally not a requirement:
+# Plasma can run without it, and a login-manager compatibility failure must
+# not suppress the graphical compositor.
+printf '%s\n' \
+  '[Unit]' \
+  'Description=NARF Plasma Wayland Session' \
+  'Wants=dbus-broker.service' \
+  'After=dbus-broker.service' \
+  '' \
+  '[Service]' \
+  'Type=exec' \
+  'User=narf' \
+  'Environment=HOME=/home/narf' \
+  'Environment=XDG_RUNTIME_DIR=/run/narf-plasma' \
+  'Environment=XDG_SESSION_TYPE=wayland' \
+  'Environment=XDG_CURRENT_DESKTOP=KDE' \
+  'Environment=QT_QPA_PLATFORM=wayland' \
+  'Environment=KWIN_DRM_NO_AMS=1' \
+  'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \
+  'Environment=LIBGL_ALWAYS_SOFTWARE=1' \
+  'Environment=GALLIUM_DRIVER=llvmpipe' \
+  'RuntimeDirectory=narf-plasma' \
+  'RuntimeDirectoryMode=0700' \
+  'ExecStart=/usr/bin/dbus-run-session -- /usr/bin/startplasma-wayland' \
+  'Restart=on-failure' \
+  'RestartSec=3s' \
+  'TimeoutStartSec=180s' \
+  '' \
+  '[Install]' \
+  'WantedBy=graphical.target' \
+  > "$WORK/root/etc/systemd/system/narf-plasma.service"
+ln -sfn ../narf-plasma.service \
+  "$WORK/root/etc/systemd/system/graphical.target.wants/narf-plasma.service"
+
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-systemd-start.sh" \
   "$WORK/root/narf-start.sh"
