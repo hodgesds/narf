@@ -39,8 +39,7 @@
 
 extern crate alloc as alloc_crate;
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use narf_lib::percpu::{current_cpu, MAX_CPUS};
 
@@ -161,30 +160,41 @@ pub fn init(cpus: usize) -> Result<(), StackError> {
 
 /// Per-CPU nesting depth, cache-line isolated so two CPUs' counters never
 /// share a line.
+///
+/// **Atomic, not `UnsafeCell<u32>`.** It was the latter, guarded by
+/// `without_interrupts` plus a claim that `StackLease` being `!Send` kept every
+/// access on the owning CPU. `!Send` does not do that: it stops the *value*
+/// being handed to another thread, and says nothing about the *task* being
+/// timer-preempted and work-stolen onto another CPU between acquire and
+/// release. The premise that used to close the gap — handlers running IRQ-masked
+/// end to end — was removed when `tracing::dispatch::fire` started cloning the
+/// `Arc` and dropping its lock before invoking.
+///
+/// With a plain RMW, a migrated release decremented whichever CPU was current:
+/// the origin CPU leaked a level permanently (declining every later program once
+/// it reached [`MAX_NEST`]) and the destination's count went below its true
+/// value, so two live activations could be handed the *same* slice. `saturating_sub`
+/// hid the underflow. An atomic makes a cross-CPU release merely unusual instead
+/// of unsound, and costs one uncontended RMW per program — nothing against the
+/// cost of running one.
 #[repr(align(64))]
 struct DepthCell {
-    inner: UnsafeCell<u32>,
+    inner: AtomicU32,
 }
-
-// SAFETY: every access goes through `without_interrupts` on the owning CPU
-// only — see `try_enter`. Exactly the argument `slab.rs`'s magazine array
-// makes for the same shape.
-unsafe impl Sync for DepthCell {}
 
 static DEPTH: [DepthCell; MAX_CPUS] = [const {
     DepthCell {
-        inner: UnsafeCell::new(0),
+        inner: AtomicU32::new(0),
     }
 }; MAX_CPUS];
 
 /// A claimed nesting level. Releases on drop.
 ///
-/// **`!Send` on purpose**, and it must be dropped inside the same
-/// non-preemptible region that created it: the decrement is a per-CPU
-/// non-atomic RMW, so a preempt-and-migrate between enter and exit would
-/// decrement a *different* CPU's cell and permanently leak a level on this
-/// one. `PhantomData<*const ()>` is what makes that a compile error rather
-/// than a comment.
+/// `!Send` is kept — handing a lease to another executor is still not a thing
+/// any caller should do — but correctness no longer *rests* on it. See
+/// [`DepthCell`] for why it never could: the release always targets
+/// [`Self::cpu`], the CPU the level was actually taken on, rather than whichever
+/// CPU happens to be current at drop.
 #[derive(Debug)]
 pub struct StackLease {
     cpu: usize,
@@ -219,22 +229,24 @@ impl StackLease {
 
 impl Drop for StackLease {
     fn drop(&mut self) {
-        // Mirror of `try_enter`: mask IRQs so the read-modify-write cannot be
-        // interleaved by a nested program on this CPU, and so `current_cpu()`
-        // is pinned across it.
-        narf_lib::sync::without_interrupts(|| {
-            let cpu = current_cpu();
-            debug_assert_eq!(
-                cpu, self.cpu,
-                "StackLease dropped on a different CPU than it was taken on — \
-                 the lease must not cross a preemption point"
-            );
-            // SAFETY: per-CPU access invariant — only the running CPU touches
-            // its own cell, and IRQs are masked so no same-CPU re-entry can
-            // alias this borrow.
-            let d = unsafe { &mut *DEPTH[cpu].inner.get() };
-            *d = d.saturating_sub(1);
-        });
+        // Release on the CPU the level was *taken* on — `self.cpu` — never on
+        // whichever CPU is current now. Re-reading `current_cpu()` here was the
+        // bug: it is the exact mistake `bpf/src/mem.rs` had already fixed on its
+        // own release path (`release: Some((release_cpu, cpu))`), left in place
+        // one file over and downgraded to a `debug_assert` that release builds —
+        // which this tree now defaults to — compile out entirely.
+        //
+        // No `without_interrupts` needed: the counter is atomic, so a nested
+        // program on this CPU cannot interleave the RMW, and there is nothing
+        // left for masking to pin.
+        //
+        // `fetch_update` rather than `fetch_sub` so an underflow *cannot* be
+        // papered over. A saturating decrement of a counter that is already zero
+        // means two releases claimed the same level, which is a bookkeeping bug
+        // worth leaving detectable rather than silently absorbing.
+        let _ = DEPTH[self.cpu]
+            .inner
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |d| d.checked_sub(1));
     }
 }
 
@@ -246,15 +258,15 @@ impl Drop for StackLease {
 /// same situation into "silently skip", and the retrofitted `priv_stack_ptr`
 /// exists because skipping was not actually safe.
 ///
-/// The read-modify-write is per-CPU and non-atomic, bracketed by
-/// `without_interrupts` exactly as `slab.rs`'s magazine pop is. Masking does
-/// two jobs, and both are load-bearing:
+/// The claim is a single atomic `fetch_update`, so the level a caller receives
+/// is unique by construction rather than by a masking argument. `IRQs` are still
+/// masked around it, but now for one reason only: to pin `current_cpu()` long
+/// enough that the level is charged to the CPU whose stack we hand out. Getting
+/// *that* wrong is a mis-attribution, not a double-issue.
 ///
-/// 1. a nested IRQ that runs a BPF program between our read and our write
-///    would otherwise hand two levels the same stack range, and
-/// 2. it pins `current_cpu()` for the duration, so a caller that arrived with
-///    IRQs enabled cannot be preempted and migrated mid-update and end up
-///    mutating CPU A's cell from CPU B.
+/// It used to be a non-atomic RMW resting on two claims — that masking excluded
+/// a nested IRQ, and that `StackLease` being `!Send` excluded migration. The
+/// second was false (see [`DepthCell`]), which is why this is atomic now.
 ///
 /// When the caller already has IRQs masked (an IRQ handler, or an
 /// `IrqSafeSpinLock` held — which is the normal case for an atomic BPF hook)
@@ -268,13 +280,20 @@ pub fn try_enter() -> Option<StackLease> {
         if cpu >= BACKED_CPUS.load(Ordering::Acquire) {
             return None;
         }
-        // SAFETY: per-CPU access invariant, IRQs masked — see the doc comment.
-        let d = unsafe { &mut *DEPTH[cpu].inner.get() };
-        if *d >= MAX_NEST {
-            return None;
-        }
-        let level = *d;
-        *d = level + 1;
+        // Claim a level atomically. `fetch_update` returns the *previous* value
+        // on success, which is exactly the level index we want, and declines
+        // (rather than clamping) at the limit — declining is the whole point of
+        // this design over Linux's global `bpf_prog_active`.
+        let level = DEPTH[cpu]
+            .inner
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |d| {
+                if d >= MAX_NEST {
+                    None
+                } else {
+                    Some(d + 1)
+                }
+            })
+            .ok()?;
 
         // Each level gets an equal slice, carved from the top down. Equal
         // slices rather than a bump pointer because the *verifier* needs a
@@ -293,11 +312,7 @@ pub fn try_enter() -> Option<StackLease> {
 
 /// Current nesting depth on this CPU. Diagnostic only.
 pub fn depth() -> u32 {
-    narf_lib::sync::without_interrupts(|| {
-        let cpu = current_cpu();
-        // SAFETY: per-CPU access invariant, IRQs masked.
-        unsafe { *DEPTH[cpu].inner.get() }
-    })
+    narf_lib::sync::without_interrupts(|| DEPTH[current_cpu()].inner.load(Ordering::Acquire))
 }
 
 /// Bytes a single nesting level may use. The verifier's stack bound.

@@ -589,6 +589,32 @@ pub fn write(a: &TextAlloc, off: usize, bytes: &[u8]) -> Result<(), TextError> {
         .find(|p| p.base == a.pack_base)
         .ok_or(TextError::Stale)?;
 
+    // §4.3 is enforced *here* too, not only in `seal`, and this is the case
+    // that made the difference.
+    //
+    // `alloc` first-fits into packs that are already sealed, and a pack's
+    // permissions are whole-pack (one PMD leaf for a hugepage pack, and there is
+    // no huge-page demotion helper — see the plan's finding 0.2). So for every
+    // allocation *after the first* in a given pack, the returned VA is already
+    // RX the moment `alloc` returns: before `write`, before registration, before
+    // `seal`. `seal` returning `ExtableMissing` at that point cannot un-publish
+    // anything.
+    //
+    // Until `write`, the range holds trap bytes, so the exposure is a
+    // diagnosable fault rather than execution of anything. The hazard begins the
+    // instant formed instructions land at an executable VA — which is exactly
+    // this call. Refusing it unless the extable is already registered turns
+    // "no path to executable text without registration" from a claim about
+    // `seal` into a property of the only function that can create the situation.
+    //
+    // Conditional on `p.sealed` deliberately: an unsealed pack is RW+NX, so
+    // there is no executable VA yet and no failure the check would prevent.
+    // Requiring it there would be a rule guarding nothing, which is the shape
+    // this review keeps finding.
+    if p.sealed && !crate::bpf_extable::image_covers(a.va, a.va + a.len as u64) {
+        return Err(TextError::ExtableMissing);
+    }
+
     let mut pack_off = (a.chunk * CHUNK_BYTES) as u64 + off as u64;
     let mut done = 0usize;
     while done < bytes.len() {
@@ -616,6 +642,15 @@ pub fn write(a: &TextAlloc, off: usize, bytes: &[u8]) -> Result<(), TextError> {
 /// RO+X from creation with the unallocated remainder full of trap bytes. Later
 /// allocations in the same pack still write through the identity alias, so
 /// nothing needs to un-seal.
+///
+/// **A consequence worth stating plainly:** because the flip is per *pack*, an
+/// allocation after the first in a given pack is executable from `alloc`
+/// onwards, so this function is not the first line of defence for §4.3 — it
+/// cannot be, since by the time it runs the code has been executable for the
+/// whole of `write`. [`write`] carries the same check for exactly that reason.
+/// This one remains because it is the last point before the caller is permitted
+/// to *enter* the code, and because it is the only check that covers the
+/// first-in-pack case.
 ///
 /// Invariant §4.3: every faulting instruction in `a` must already have an
 /// extable entry registered. This function cannot check that (it does not know
@@ -853,6 +888,25 @@ unsafe fn new_pack(root: PhysAddr, node: usize, need: u64) -> Result<Pack, TextE
                 let mapped =
                     unsafe { map_pack_page(root, base + (i as u64) * 4096, f.start_address()) };
                 if let Err(e) = mapped {
+                    // Unmap what we already installed *before* releasing the
+                    // frames. This used to free all of them while pages
+                    // `0..i` were still mapped RW+NX at their kernel VA —
+                    // leaving a writable kernel window onto whatever the buddy
+                    // handed out next, for the life of the boot. The sibling
+                    // failure path in `alloc` names this exact hazard and gets
+                    // the order right; this one did not.
+                    //
+                    // The VA is never reissued (the pack base comes off a bump
+                    // cursor), so nothing re-maps *there* — but that is an
+                    // argument about the VA, and the danger is to the *frame*,
+                    // which is very much reused.
+                    for j in 0..i {
+                        // SAFETY: `base + j*4096` was mapped by this loop on a
+                        // previous iteration through the same root.
+                        unsafe {
+                            let _ = unmap_pack_page(root, base + (j as u64) * 4096);
+                        }
+                    }
                     for f in frames {
                         crate::frame::free_frame(f);
                     }
@@ -1009,6 +1063,36 @@ fn serialize_after_publish(_base: u64, _len: u64) {
     let _ = unsafe { narf_arch::x86_64::cpuid::cpuid(0, 0) };
 }
 
+/// Remove one 4 KiB pack page. Used by the fallback pack's partial-failure
+/// unwind, which must unmap before it frees.
+///
+/// # Safety
+/// `va` must be a page this module mapped through `root`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn unmap_pack_page(root: PhysAddr, va: u64) -> Result<(), TextError> {
+    // SAFETY: per the fn contract, `va` was mapped by `map_pack_page` through
+    // this same root.
+    unsafe {
+        crate::x86_64::paging::unmap_4kb(root, VirtAddr::new(va))
+            .map(|_| ())
+            .map_err(|_| TextError::MapFailed)
+    }
+}
+
+/// aarch64 twin of the above.
+///
+/// # Safety
+/// `va` must be a page this module mapped through `root`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn unmap_pack_page(root: PhysAddr, va: u64) -> Result<(), TextError> {
+    // SAFETY: as the x86_64 twin.
+    unsafe {
+        crate::aarch64::paging::unmap_4kb(root, VirtAddr::new(va))
+            .map(|_| ())
+            .map_err(|_| TextError::MapFailed)
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 unsafe fn unmap_pack(p: &Pack) {
     use crate::x86_64::paging::{unmap_2mb, unmap_4kb};
@@ -1060,11 +1144,18 @@ unsafe fn map_pack_page(root: PhysAddr, va: u64, phys: PhysAddr) -> Result<(), T
 /// asymmetry with x86_64 is worth remembering — the arch does the shootdown
 /// for us.
 ///
+/// That was true of the *instruction named here* and false of the code: this
+/// called `tlb_invalidate_vae1`, the non-shareable form, which invalidates on
+/// the issuing PE only. So on SMP a peer CPU could keep the pre-flip leaf —
+/// PXN still set (instruction fetch at the entry faults at a PC with no
+/// extable entry) and AP=RW (a writable alias of live text). The primitive now
+/// issues `vae1is`, so the comment describes what runs.
+///
 /// # Safety
 /// Same contract as the x86_64 arm.
 #[cfg(target_arch = "aarch64")]
 unsafe fn seal_mapping(root: PhysAddr, p: &Pack) -> Result<(), TextError> {
-    use crate::aarch64::paging::{tlb_invalidate_vae1, PageTable, PageTableEntry, PtFlags};
+    use crate::aarch64::paging::{tlb_invalidate_vae1is, PageTable, PageTableEntry, PtFlags};
 
     // AP[2:1] occupy bits 7:6; UXN is 54, PXN is 53. Clear the AP field and
     // PXN, then set RO-at-EL1 + UXN.
@@ -1126,7 +1217,7 @@ unsafe fn seal_mapping(root: PhysAddr, p: &Pack) -> Result<(), TextError> {
     for i in 0..(p.len / 4096) {
         // SAFETY: TLB invalidation is always legal at EL1.
         unsafe {
-            tlb_invalidate_vae1(VirtAddr::new(p.base + i * 4096));
+            tlb_invalidate_vae1is(VirtAddr::new(p.base + i * 4096));
         }
     }
     Ok(())
@@ -1181,6 +1272,9 @@ mod stub_arch {
     }
     pub(super) fn serialize_after_publish(_: u64, _: u64) {}
     pub(super) unsafe fn unmap_pack(_: &Pack) {}
+    pub(super) unsafe fn unmap_pack_page(_: PhysAddr, _: u64) -> Result<(), TextError> {
+        Err(TextError::MapFailed)
+    }
 }
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 use stub_arch::*;
@@ -1274,27 +1368,94 @@ const RET42: &[u8] = &[0x40, 0x05, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
 /// NX, or as stale bytes in the I-cache — neither of which any amount of
 /// checking the return values would catch.
 fn smoke_bpf_text_seal_refuses_undeclared_image() -> TestResult {
-    // The negative half of spec §4.3: sealing without a registered exception
-    // table must fail. Before this, `Ok` from the verifier meant "safe
-    // *provided* someone registers the extable" and nobody did — the
-    // obligation existed only in prose.
+    // The negative half of spec §4.3: an image with no registered exception
+    // table must not become executable. Before this, `Ok` from the verifier
+    // meant "safe *provided* someone registers the extable" and nobody did —
+    // the obligation existed only in prose.
+    //
+    // Asserted as "write *or* seal refuses", not "seal refuses", because which
+    // one fires depends on whether this allocation landed in a pack that is
+    // already sealed — and that depends on what ran before us. Pinning it to
+    // `seal` made the test order-dependent: in a fresh pack `write` succeeds and
+    // `seal` refuses, but in a sealed pack the VA is executable from `alloc`, so
+    // `write` is the check that must refuse. Both are the same invariant; only
+    // one can be the *first* to enforce it.
     let cap = JitCap::bootstrap();
     let Ok(a) = alloc(&cap, RET42.len(), 0) else {
         return TestResult::Fail("bpf_text::alloc failed");
     };
-    if write(&a, 0, RET42).is_err() {
-        free(a);
-        return TestResult::Fail("bpf_text::write failed");
-    }
-    let refused = matches!(seal(&cap, &a), Err(TextError::ExtableMissing));
+    let write_refused = matches!(write(&a, 0, RET42), Err(TextError::ExtableMissing));
+    let seal_refused = matches!(seal(&cap, &a), Err(TextError::ExtableMissing));
     free(a);
-    if refused {
+    if write_refused || seal_refused {
         TestResult::Pass
     } else {
-        TestResult::Fail("seal accepted an image with no registered extable")
+        TestResult::Fail("an unregistered image was allowed to become executable")
     }
 }
 kernel_test_in!("memory", smoke_bpf_text_seal_refuses_undeclared_image);
+
+/// The second allocation in an already-sealed pack is executable from `alloc`,
+/// so registration must be enforced at **write** — `seal` is too late.
+///
+/// This is the case §4.3's enforcement used to miss entirely. A pack's
+/// permissions are whole-pack (one PMD leaf, and there is no huge-page demotion
+/// helper), so once any program in it is sealed the whole pack is RX. `alloc`
+/// first-fits into such packs, so allocation 2..n came back already executable:
+/// `write` laid formed instructions into executable memory with no extable
+/// coverage, and `seal` refusing afterwards could not un-publish them.
+fn smoke_bpf_text_write_into_sealed_pack_needs_extable() -> TestResult {
+    let cap = JitCap::bootstrap();
+    // First allocation: register + seal, which seals the whole pack.
+    let Ok(first) = alloc(&cap, RET42.len(), 0) else {
+        return TestResult::Fail("first alloc failed");
+    };
+    let token = first.va;
+    if crate::bpf_extable::register_image(token, first.va, first.va + first.len as u64, Vec::new())
+        .is_err()
+    {
+        free(first);
+        return TestResult::Fail("register_image failed");
+    }
+    if write(&first, 0, RET42).is_err() {
+        crate::bpf_extable::unregister_image(token);
+        free(first);
+        return TestResult::Fail("first write failed");
+    }
+    if seal(&cap, &first).is_err() {
+        crate::bpf_extable::unregister_image(token);
+        free(first);
+        return TestResult::Fail("first seal failed");
+    }
+
+    // Second allocation. If it landed in the pack we just sealed, its VA is
+    // already executable and an unregistered `write` must be refused.
+    let Ok(second) = alloc(&cap, RET42.len(), 0) else {
+        crate::bpf_extable::unregister_image(token);
+        free(first);
+        return TestResult::Fail("second alloc failed");
+    };
+    let same_pack = second.pack_base == first.pack_base;
+    let refused = matches!(write(&second, 0, RET42), Err(TextError::ExtableMissing));
+    free(second);
+    crate::bpf_extable::unregister_image(token);
+    free(first);
+
+    if !same_pack {
+        // Not a pass by luck: if the allocator did not reuse the pack there is
+        // nothing to assert, and claiming otherwise would be a vacuous pass.
+        return TestResult::Skip("second allocation did not land in the sealed pack");
+    }
+    if refused {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("write into a sealed pack accepted an unregistered image")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_bpf_text_write_into_sealed_pack_needs_extable
+);
 
 fn smoke_bpf_text_alloc_seal_execute() -> TestResult {
     let cap = JitCap::bootstrap();
@@ -1309,18 +1470,23 @@ fn smoke_bpf_text_alloc_seal_execute() -> TestResult {
         free(a);
         return TestResult::Fail("allocation landed outside the text window");
     }
-    if write(&a, 0, RET42).is_err() {
-        free(a);
-        return TestResult::Fail("bpf_text::write failed");
-    }
-    // Declare the (empty) exception table before sealing. `seal` cannot tell
-    // whether an image contains faulting instructions, so the only safe rule
-    // is that the producer must always say — an image with no fault sites
-    // registers an empty list. Spec §4.3.
+    // Declare the (empty) exception table before **writing**. Neither `write`
+    // nor `seal` can tell whether an image contains faulting instructions, so
+    // the only safe rule is that the producer must always say — an image with no
+    // fault sites registers an empty list. Spec §4.3.
+    //
+    // Before `write` rather than before `seal`: an allocation landing in a pack
+    // that is already sealed is executable from `alloc`, so `write` is the first
+    // moment formed instructions exist at an executable VA.
     let token = a.va;
     if crate::bpf_extable::register_image(token, a.va, a.va + a.len as u64, Vec::new()).is_err() {
         free(a);
         return TestResult::Fail("bpf_extable::register_image failed");
+    }
+    if write(&a, 0, RET42).is_err() {
+        crate::bpf_extable::unregister_image(token);
+        free(a);
+        return TestResult::Fail("bpf_text::write failed");
     }
     if seal(&cap, &a).is_err() {
         crate::bpf_extable::unregister_image(token);
@@ -1369,14 +1535,14 @@ fn smoke_bpf_text_extable_recovers_probe_fault() -> TestResult {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("bpf_text::alloc failed"),
     };
-    if write(&a, 0, code).is_err() {
-        free(a);
-        return TestResult::Fail("bpf_text::write failed");
-    }
-
-    // Invariant §4.3: registration precedes `seal`. Doing it the other way
-    // round would leave a window in which the text is executable but a fault
-    // in it is fatal.
+    // Invariant §4.3: registration precedes **`write`**, not merely `seal`.
+    //
+    // This test used to write first. That was legal when `seal` was the only
+    // enforcement point, and wrong for the same reason the production path was:
+    // if this allocation lands in a pack another program already sealed, the VA
+    // is executable from `alloc`, so writing first put formed instructions into
+    // executable memory with no extable coverage. `write` now refuses that, so
+    // the order here is enforced rather than merely conventional.
     let token = a.va;
     if bpf_extable::register_image(
         token,
@@ -1392,6 +1558,11 @@ fn smoke_bpf_text_extable_recovers_probe_fault() -> TestResult {
     {
         free(a);
         return TestResult::Fail("extable registration failed");
+    }
+    if write(&a, 0, code).is_err() {
+        bpf_extable::unregister_image(token);
+        free(a);
+        return TestResult::Fail("bpf_text::write failed");
     }
     if seal(&cap, &a).is_err() {
         bpf_extable::unregister_image(token);

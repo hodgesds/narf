@@ -1766,7 +1766,7 @@ impl AddressSpace {
                     // SAFETY: TLBI VAE1 at EL1 is always legal; `v` is the
                     // page-aligned faulting VA owned by this AS.
                     unsafe {
-                        crate::aarch64::paging::tlb_invalidate_vae1(va);
+                        crate::aarch64::paging::tlb_invalidate_vae1is(va);
                     }
                     return Ok(());
                 }

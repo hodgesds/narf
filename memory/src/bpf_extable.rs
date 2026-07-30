@@ -165,20 +165,15 @@ pub fn unregister_image(token: u64) {
     IMAGE_COUNT.store(images.len(), core::sync::atomic::Ordering::Release);
 }
 
-/// Look up a faulting PC.
-///
-/// Allocation-free and O(log images + log entries). Called from the trap
-/// handler with the fault frame live, so it must not panic and must not take
-/// any lock the faulting code might already hold — `IMAGES` is only ever taken
-/// by this module, and never across a call that can fault.
-#[inline]
 /// Whether an image covering `[base, end)` has been registered.
 ///
-/// Exists so [`crate::bpf_text::seal`] can *enforce* spec §4.3 rather than
-/// document it: every faulting instruction the JIT emits must have an entry
-/// in place before the text becomes executable, because a fault with no entry
-/// is fatal. Checking at the moment of the RW→RX flip is the only point where
-/// the obligation is still checkable — afterwards the code can already run.
+/// Exists so [`crate::bpf_text`] can *enforce* spec §4.3 rather than document
+/// it: every faulting instruction the JIT emits must have an entry in place
+/// before the text becomes executable, because a fault with no entry is fatal.
+/// Both [`crate::bpf_text::write`] and [`crate::bpf_text::seal`] consult it —
+/// `write` because an allocation after the first in a pack is executable before
+/// it is written, and `seal` because it is the last point before the caller may
+/// enter the code.
 #[must_use]
 pub fn image_covers(base: u64, end: u64) -> bool {
     if IMAGE_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
@@ -188,6 +183,18 @@ pub fn image_covers(base: u64, end: u64) -> bool {
     images.iter().any(|i| i.base <= base && i.end >= end)
 }
 
+/// Look up a faulting PC.
+///
+/// Allocation-free and O(log images + log entries). Called from the trap
+/// handler with the fault frame live, so it must not panic and must not take
+/// any lock the faulting code might already hold — `IMAGES` is only ever taken
+/// by this module, and never across a call that can fault.
+///
+/// This doc block and the `#[inline]` had drifted onto `image_covers`: that
+/// function was inserted between them and the function they describe, so the
+/// fault-path function — the one that actually wanted inlining, and the one the
+/// lock-discipline argument is about — had neither.
+#[inline]
 pub fn lookup(fault_pc: u64) -> Option<ExEntry> {
     // Fast bail *without* touching the lock: an empty table is the common case
     // on a kernel with no BPF loaded, and every unrecovered kernel fault runs

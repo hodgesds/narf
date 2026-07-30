@@ -198,27 +198,36 @@ pub fn try_compile(v: &VerifiedProgram, fully_verified: bool) -> Result<JitImage
     let compiled = narf_bpf_jit::compile(v).map_err(|_| JitSkip::Unsupported)?;
     let cap = jit_cap();
     let a = bpf_text::alloc(cap, compiled.code.len(), 0).map_err(|_| JitSkip::TextUnavailable)?;
-    if bpf_text::write(&a, 0, &compiled.code).is_err() {
-        bpf_text::free(a);
-        return Err(JitSkip::TextUnavailable);
-    }
 
-    // Register before sealing, in that order, because `seal` requires it —
-    // spec §4.3 as a mechanism. The table is empty by gate 3; registering it
-    // anyway is the point, since `seal` cannot tell an image with no faulting
-    // instructions from one whose producer forgot.
+    // Register **before writing**, not merely before sealing — spec §4.3 as a
+    // mechanism rather than a convention.
+    //
+    // The order used to be write → register → seal, on the reasoning that `seal`
+    // is the gate and it checks registration. That was wrong for every
+    // allocation after the first in a pack: `alloc` first-fits into already
+    // sealed packs, permissions are whole-pack, so the VA handed back is
+    // *already executable*. `write` therefore laid fully-formed instructions
+    // into executable memory with no extable coverage, and `seal` refusing
+    // afterwards could not take that back. `bpf_text::write` now refuses in
+    // that situation, so this order is enforced rather than merely documented.
+    //
+    // The table is empty by gate 3; registering it anyway is the point, since
+    // neither `write` nor `seal` can tell an image with no faulting instructions
+    // from one whose producer forgot.
     let lo = a.va;
     let hi = a.va + a.len as u64;
-    // Gate 3 guarantees there is nothing to register, but registering anyway is
-    // the point: `seal` cannot distinguish an image with no faulting
-    // instructions from one whose producer forgot. The assertion catches the
-    // day `record_fault` gains a caller and this silently starts discarding a
-    // real table.
+    // The assertion catches the day `record_fault` gains a caller and this
+    // silently starts discarding a real table.
     debug_assert!(
         compiled.faults.0.is_empty(),
         "codegen produced fault entries that this path would discard"
     );
     if narf_memory::bpf_extable::register_image(lo, lo, hi, alloc::vec::Vec::new()).is_err() {
+        bpf_text::free(a);
+        return Err(JitSkip::TextUnavailable);
+    }
+    if bpf_text::write(&a, 0, &compiled.code).is_err() {
+        narf_memory::bpf_extable::unregister_image(lo);
         bpf_text::free(a);
         return Err(JitSkip::TextUnavailable);
     }

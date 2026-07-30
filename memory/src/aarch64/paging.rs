@@ -232,14 +232,44 @@ pub unsafe fn write_ttbr0_el1(root: PhysAddr) {
 }
 
 /// Invalidate a single virtual address from the TLB via
-/// `TLBI VAE1, xN` with the required barrier dance.
+/// `TLBI VAE1IS, xN` with the required barrier dance.
+///
+/// # The `IS` is load-bearing
+///
+/// This used to issue `tlbi vae1` — the **non-shareable** form, which
+/// invalidates on the issuing PE only. Every caller is mutating a *kernel-half*
+/// (TTBR1) mapping, which every CPU shares, so a local-only invalidation leaves
+/// peer CPUs holding the stale translation. That is a plain SMP correctness bug,
+/// and it was reachable in several shapes:
+///
+///   * `bpf_text::seal` flips JIT text from `AP_RW | PXN` to `AP_RO`, PXN
+///     clear. A peer CPU keeping the pre-flip leaf sees **PXN still set** (so an
+///     instruction fetch at the program entry faults at a PC with no extable
+///     entry — fatal by design) and **AP=RW** (so the W^X flip bought nothing
+///     on that CPU).
+///   * `unmap_2mb` / `unmap_1gb` / `bpf_text::unmap_pack` return the frame to
+///     the hugepage pool while a peer CPU can still hold an **executable**
+///     translation onto it — a stale RX window onto recycled memory. The
+///     reclaim path's note that "its VA is never reissued, so a stale TLB entry
+///     cannot alias a later mapping" was wrong in the direction that matters:
+///     the *frame* is reissued, not the VA.
+///
+/// The tree already knew the difference — `unmap_4kb` twelve lines below uses
+/// `tlbi vale1is`, and `ioremap`'s module doc explicitly noted that `vae1`
+/// "covers the local CPU" while assuming a separate IPI paired with it. Nothing
+/// issued that IPI for these paths.
+///
+/// `vae1is` broadcasts to the whole inner-shareable domain in hardware, so it
+/// needs no IPI plumbing and cannot deadlock against a held lock the way a
+/// shootdown IPI can. It is strictly *more* invalidation than the old form —
+/// never less correct, only marginally slower.
 ///
 /// # Safety
 /// `TLBI`/`DSB`/`ISB` at EL1 are unconditional, but dropping a stale
 /// TLB entry only yields a coherent address space when `virt`'s
 /// page-table entry has already been updated; the caller must order
 /// the descriptor write before this call.
-pub unsafe fn tlb_invalidate_vae1(virt: VirtAddr) {
+pub unsafe fn tlb_invalidate_vae1is(virt: VirtAddr) {
     use core::arch::asm;
     use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -250,7 +280,7 @@ pub unsafe fn tlb_invalidate_vae1(virt: VirtAddr) {
     unsafe {
         asm!(
             "dsb ishst",
-            "tlbi vae1, {a}",
+            "tlbi vae1is, {a}",
             "dsb ish",
             "isb",
             a = in(reg) (virt.as_u64() >> 12),
@@ -461,7 +491,7 @@ pub unsafe fn map_2mb(
     }
     let base = PtFlags::VALID | PtFlags::AF | PtFlags::SH_INNER | PtFlags::ATTR_NORMAL;
     l2.entries[idx.l2] = PageTableEntry::new(phys, base | flags);
-    unsafe { tlb_invalidate_vae1(virt) };
+    unsafe { tlb_invalidate_vae1is(virt) };
     Ok(())
 }
 
@@ -495,7 +525,7 @@ pub unsafe fn map_1gb(
     }
     let base = PtFlags::VALID | PtFlags::AF | PtFlags::SH_INNER | PtFlags::ATTR_NORMAL;
     l1.entries[idx.l1] = PageTableEntry::new(phys, base | flags);
-    unsafe { tlb_invalidate_vae1(virt) };
+    unsafe { tlb_invalidate_vae1is(virt) };
     Ok(())
 }
 
@@ -529,7 +559,7 @@ pub unsafe fn unmap_2mb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
         return Err(MapError::AlreadyMapped);
     }
     l2.entries[idx.l2] = PageTableEntry::EMPTY;
-    unsafe { tlb_invalidate_vae1(virt) };
+    unsafe { tlb_invalidate_vae1is(virt) };
     Ok(leaf.addr())
 }
 
@@ -558,7 +588,7 @@ pub unsafe fn unmap_1gb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
         return Err(MapError::AlreadyMapped);
     }
     l1.entries[idx.l1] = PageTableEntry::EMPTY;
-    unsafe { tlb_invalidate_vae1(virt) };
+    unsafe { tlb_invalidate_vae1is(virt) };
     Ok(leaf.addr())
 }
 
