@@ -44,6 +44,10 @@ use crate::{
 /// Host register numbers, in ModRM/REX encoding order.
 mod hr {
     pub const RAX: u8 = 0;
+    /// Scratch. Variable shifts require the count in `cl`, and `rcx` is
+    /// deliberately absent from [`super::REGS`] so no BPF register can alias
+    /// it — which is what makes moving a count into it unconditionally safe.
+    pub const RCX: u8 = 1;
     pub const RDX: u8 = 2;
     pub const RBX: u8 = 3;
     pub const RSP: u8 = 4;
@@ -191,9 +195,70 @@ const fn alu_forms(op: AluOp) -> Option<(u8, u8)> {
         AluOp::Or => (1, 0x09),
         AluOp::And => (4, 0x21),
         AluOp::Xor => (6, 0x31),
-        // Shifts and multiply do not use the group-1 encodings.
+        // Shifts and multiply have their own encodings; see `emit_shift` and
+        // `emit_mul`.
         AluOp::Lsh | AluOp::Rsh | AluOp::Arsh | AluOp::Mul => return None,
     })
+}
+
+/// The group-2 /digit selector for a shift.
+const fn shift_slash(op: AluOp) -> Option<u8> {
+    Some(match op {
+        AluOp::Lsh => 4,  // shl
+        AluOp::Rsh => 5,  // shr — logical, matching BPF's unsigned semantics
+        AluOp::Arsh => 7, // sar
+        _ => return None,
+    })
+}
+
+/// `shl`/`shr`/`sar`, by immediate or by register.
+///
+/// A register count goes through `cl`, which the ISA requires. That is safe
+/// without saving: `rcx` is absent from [`REGS`], so no BPF register can be
+/// living in it.
+fn emit_shift(e: &mut Emit, wide: bool, op: AluOp, dst: u8, src: Source) {
+    let slash = match shift_slash(op) {
+        Some(s) => s,
+        None => return,
+    };
+    match src {
+        Source::Imm(v) => {
+            // BPF masks the shift count to the operand width; x86 does the
+            // same in hardware (mod 64 with REX.W, mod 32 without), so the
+            // low bits can be passed through as-is.
+            e.rex(wide, 0, dst);
+            e.b(0xC1);
+            e.modrm_rr(slash, dst);
+            e.b((v as u32 & if wide { 63 } else { 31 }) as u8);
+        }
+        Source::Reg(sr) => {
+            mov_rr(e, true, hr::RCX, host(sr));
+            e.rex(wide, 0, dst);
+            e.b(0xD3);
+            e.modrm_rr(slash, dst);
+        }
+    }
+}
+
+/// `imul` — the two-operand truncating form.
+///
+/// Deliberately not the one-operand widening `mul`: that writes `rdx:rax` and
+/// would clobber R3 (mapped to `rdx`) and R0. BPF's multiply is truncating, so
+/// the two-operand form is both correct and free of side effects.
+fn emit_mul(e: &mut Emit, wide: bool, dst: u8, src: Source) {
+    match src {
+        Source::Reg(sr) => {
+            e.rex(wide, dst, host(sr));
+            e.bs(&[0x0F, 0xAF]);
+            e.modrm_rr(dst, host(sr));
+        }
+        Source::Imm(v) => {
+            e.rex(wide, dst, dst);
+            e.b(0x69);
+            e.modrm_rr(dst, dst);
+            e.d32(v);
+        }
+    }
 }
 
 const fn cond_cc(op: CondOp) -> u8 {
@@ -373,11 +438,25 @@ fn emit_insn(
             }
         },
 
+        Decoded::Alu {
+            wide,
+            op: op @ (AluOp::Lsh | AluOp::Rsh | AluOp::Arsh),
+            dst,
+            src,
+        } => emit_shift(e, wide, op, host(dst), src),
+
+        Decoded::Alu {
+            wide,
+            op: AluOp::Mul,
+            dst,
+            src,
+        } => emit_mul(e, wide, host(dst), src),
+
         Decoded::Alu { wide, op, dst, src } => {
             let Some((slash, rr)) = alu_forms(op) else {
                 return Err(JitError::Unsupported {
                     at,
-                    what: "shift or multiply",
+                    what: "unhandled ALU operation",
                 });
             };
             match src {

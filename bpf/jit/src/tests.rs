@@ -97,16 +97,23 @@ fn sizing_converges_for_a_long_forward_branch() {
 
 #[test]
 fn reports_unsupported_rather_than_emitting_wrong_code() {
-    // Multiply is not emitted yet. The caller answers `Unsupported` by
+    // Atomics are not emitted yet. The caller answers `Unsupported` by
     // interpreting, so this must be an error and never a silently wrong
     // encoding — the interpreter is a complete implementation, which is what
     // makes growing this backend incrementally safe.
+    //
+    // This test previously used multiply, which is now emitted. Deliberately
+    // re-pointed at something still unhandled rather than deleted: the
+    // property under test is "unemitted means refused", not any one opcode,
+    // and it stops being tested at all the moment the chosen instruction gets
+    // an encoding.
     let prog = verified(&[
-        Decoded::Alu {
-            wide: true,
-            op: AluOp::Mul,
-            dst: r(0),
-            src: Source::Imm(3),
+        Decoded::Atomic {
+            size: Size::Dw,
+            op: narf_bpf_isa::AtomicOp::Add { fetch: false },
+            dst: r(10),
+            src: r(0),
+            off: -8,
         },
         EXIT,
     ]);
@@ -162,4 +169,78 @@ fn sizing_pass_budget_is_finite() {
     // Divergence must be reported, never looped on: this crate has no fuel of
     // its own and runs inside a syscall.
     assert!(MAX_SIZING_PASSES > 0 && MAX_SIZING_PASSES < 1000);
+}
+
+// ── shifts and multiply ─────────────────────────────────────────────
+
+#[test]
+fn shift_by_register_routes_through_cl() {
+    // x86 requires a variable shift count in `cl`. `rcx` is absent from the
+    // BPF→host map precisely so the count can be moved there without saving
+    // anything — if a BPF register lived in `rcx` this would silently corrupt
+    // it.
+    let prog = verified(&[
+        Decoded::Alu {
+            wide: true,
+            op: AluOp::Lsh,
+            dst: r(0),
+            src: Source::Reg(r(1)),
+        },
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("register shift must compile");
+    // 0xD3 is the group-2 "shift by cl" opcode.
+    assert!(c.code.contains(&0xD3), "expected a shift-by-cl encoding");
+}
+
+#[test]
+fn shift_by_immediate_is_masked_to_the_operand_width() {
+    // BPF masks the count to the operand width and so does x86 in hardware,
+    // so the low bits pass through — but the emitted byte must still be the
+    // masked value, or a 64-bit shift by 65 would encode as 65 and a 32-bit
+    // one differently again.
+    for (wide, count, want) in [(true, 65i32, 1u8), (false, 33, 1), (true, 63, 63)] {
+        let prog = verified(&[
+            Decoded::Alu {
+                wide,
+                op: AluOp::Lsh,
+                dst: r(0),
+                src: Source::Imm(count),
+            },
+            EXIT,
+        ]);
+        let c = compile(&prog).expect("immediate shift must compile");
+        assert!(
+            c.code.contains(&want),
+            "shift of {count} (wide={wide}) should encode a masked count of {want}"
+        );
+    }
+}
+
+#[test]
+fn multiply_uses_the_two_operand_form() {
+    // The one-operand `mul` writes rdx:rax, which would clobber R3 (rdx) and
+    // R0. BPF's multiply is truncating, so `imul r64, r/m64` is both correct
+    // and side-effect free — a real trap, since the obvious encoding is wrong.
+    let prog = verified(&[
+        Decoded::Alu {
+            wide: true,
+            op: AluOp::Mul,
+            dst: r(0),
+            src: Source::Reg(r(1)),
+        },
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("multiply must compile");
+    assert!(
+        c.code.windows(2).any(|w| w == [0x0F, 0xAF]),
+        "expected the two-operand imul (0F AF), not the rdx-clobbering form"
+    );
+    // And the one-operand form's /5 ModRM under 0xF7 must not appear.
+    assert!(
+        !c.code
+            .windows(2)
+            .any(|w| w[0] == 0xF7 && (w[1] >> 3) & 7 == 5),
+        "one-operand imul would clobber rdx (R3) and rax (R0)"
+    );
 }
