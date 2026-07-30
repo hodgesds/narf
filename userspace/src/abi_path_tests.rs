@@ -893,6 +893,32 @@ fn smoke_abi_path_mknodat_enoent() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_mknodat_enoent);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_path_mknod_legacy_alias() -> TestResult {
+    with_memfs("/p", "p", &[], || {
+        let path = b"/p/legacy-fifo\0";
+        const S_IFIFO: u64 = 0o010000;
+        if call(
+            Syscall::Mknod.raw(),
+            a2(path.as_ptr() as u64, S_IFIFO | 0o620, 0),
+        ) != Some(0)
+        {
+            return Err("legacy mknod(FIFO) should create the node");
+        }
+        let mut sb = [0u8; 144];
+        if call_lstat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+            return Err("legacy mknod result should be reachable by lstat");
+        }
+        let mode = u32::from_ne_bytes(sb[24..28].try_into().unwrap()) as u64;
+        if mode & 0o170000 != S_IFIFO || mode & 0o777 != 0o620 {
+            return Err("legacy mknod must preserve FIFO type and permission bits");
+        }
+        Ok(())
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_path_mknod_legacy_alias);
+
 // mkdirat returns the right Linux errnos: EEXIST for an existing name,
 // ENOENT for a missing parent. busybox `mkdir -p` walks each path
 // component and depends on these exactly — EEXIST to skip components
@@ -1175,6 +1201,30 @@ fn smoke_abi_path_utime_sets_mtime_seconds() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_utime_sets_mtime_seconds);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_path_futimesat_sets_mtime() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        let path = b"/p/f\0";
+        // timeval[2]: atime {31 s, 0 us}, mtime {47 s, 125 us}.
+        let tv: [i64; 4] = [31, 0, 47, 125];
+        if call(
+            Syscall::Futimesat.raw(),
+            a2(AT_FDCWD, path.as_ptr() as u64, tv.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("futimesat should return 0 for an existing file");
+        }
+        let (sec, nsec) = stat_mtime(path)?;
+        if sec != 47 || nsec != 125_000 {
+            return Err("futimesat mtime must round-trip through stat");
+        }
+        Ok(())
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_path_futimesat_sets_mtime);
 
 fn smoke_abi_path_utimensat_omit_and_invalid() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {

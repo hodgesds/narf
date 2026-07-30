@@ -815,7 +815,6 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_vfork_neg);
 
 // ── clone(2) — no live address space ──
 
-#[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_clone_neg() -> TestResult {
     with_setup(|| {
         // clone routes through do_clone3, whose first step is the
@@ -828,7 +827,6 @@ fn smoke_abi_proc_clone_neg() -> TestResult {
         }
     })
 }
-#[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_clone_neg);
 
 fn smoke_abi_proc_legacy_clone_pidfd_pointer() -> TestResult {
@@ -1085,3 +1083,58 @@ fn smoke_abi_proc_fdinfo_read_no_deadlock() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_fdinfo_read_no_deadlock);
+
+// ── seccomp(2): compatibility query/error subset ───────────────────
+//
+// NARF does not implement a BPF VM or enforce seccomp filters. It does
+// expose the Linux feature-query subset used during runtime probing and
+// rejects NEW_LISTENER, whose notification fd semantics are unavailable.
+// Linux reference: kernel/seccomp.c::do_seccomp and
+// seccomp_get_action_avail.
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_proc_seccomp_query_subset() -> TestResult {
+    with_setup(|| {
+        const SECCOMP_GET_ACTION_AVAIL: u64 = 2;
+        const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+        const UNKNOWN_ACTION: u32 = 0x1234_0000;
+
+        let allow = SECCOMP_RET_ALLOW;
+        if call(
+            Syscall::Seccomp.raw(),
+            a2(SECCOMP_GET_ACTION_AVAIL, 0, (&allow as *const u32) as u64),
+        ) != Some(0)
+        {
+            return Err("seccomp GET_ACTION_AVAIL must accept SECCOMP_RET_ALLOW");
+        }
+
+        let unknown = UNKNOWN_ACTION;
+        if call(
+            Syscall::Seccomp.raw(),
+            a2(SECCOMP_GET_ACTION_AVAIL, 0, (&unknown as *const u32) as u64),
+        ) != Some(-95)
+        {
+            return Err("seccomp GET_ACTION_AVAIL must reject an unknown action with EOPNOTSUPP");
+        }
+        Ok(())
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_proc_seccomp_query_subset);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_proc_seccomp_new_listener_is_einval() -> TestResult {
+    with_setup(|| {
+        const SECCOMP_SET_MODE_FILTER: u64 = 1;
+        const SECCOMP_FILTER_FLAG_NEW_LISTENER: u64 = 1 << 3;
+        match call(
+            Syscall::Seccomp.raw(),
+            a2(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, 0),
+        ) {
+            Some(EINVAL) => Ok(()),
+            _ => Err("seccomp NEW_LISTENER must return -EINVAL when notifications are unsupported"),
+        }
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_proc_seccomp_new_listener_is_einval);

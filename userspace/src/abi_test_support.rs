@@ -11,6 +11,9 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use alloc::sync::Arc;
+use narf_memory::AddressSpace;
+
 pub use narf_capabilities::{Cap, Grant};
 pub use narf_filesystem::{bootstrap_mount_authority, registry, MemFs, MountPoint};
 pub use narf_kernel_test::{kernel_test_in, TestResult};
@@ -49,6 +52,9 @@ pub const ENOTEMPTY: i64 = -39;
 /// The pid every ABI test runs as (overridable per test via [`set_task`]).
 pub const FAKE_TASK: u64 = 99;
 static TASK_SLOT: AtomicU64 = AtomicU64::new(FAKE_TASK);
+type TestAsLookupFn = fn() -> Option<Arc<AddressSpace>>;
+static SAVED_AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<TestAsLookupFn>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn task_lookup() -> u64 {
     TASK_SLOT.load(Ordering::Relaxed)
@@ -93,6 +99,12 @@ impl TrapContext for AbiCtx {
 /// test; pair with [`teardown`].
 pub fn setup() {
     TASK_SLOT.store(FAKE_TASK, Ordering::Relaxed);
+    // The kernel-test registry shares one image, and process/VM tests install
+    // a global scheduler bridge. ABI smokes promise a no-AS baseline unless
+    // their own body installs one, so save and clear that bridge explicitly
+    // instead of depending on registry order.
+    *SAVED_AS_LOOKUP.lock() = crate::handlers::address_space_lookup();
+    crate::handlers::restore_address_space_lookup(None);
     // ABI smokes share the kernel image. A preceding CLONE_NEWNS/unshare test
     // must not leave FAKE_TASK resolving paths in its private namespace: this
     // harness promises a fresh task view to every test.
@@ -125,6 +137,7 @@ pub fn teardown() {
     crate::handlers::__test_root_dir_reset();
     __test_clear_global();
     fd::__test_reset();
+    crate::handlers::restore_address_space_lookup(*SAVED_AS_LOOKUP.lock());
 }
 
 /// Invoke `num` with `args`; return the result decoded as a signed Linux

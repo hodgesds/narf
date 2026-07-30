@@ -2725,10 +2725,10 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
 /// aarch64 / Generic ABI wire numbers per
 /// `include/uapi/asm-generic/unistd.h`. Sources: kernel.org
 /// (GPL-2.0-or-later). The Generic ABI dropped `open`/`stat`/`pipe`
-/// etc. in favour of the `*at` family — NARF mirrors the same choice
-/// on aarch64 by routing the legacy variants to the `*at` numbers
-/// when the kernel sees them on this arch. Userspace targeting
-/// aarch64 should call the `*at` syscalls directly.
+/// etc. in favour of the `*at` family, so those Linux numbers map only
+/// to their canonical generic-ABI variants. Legacy variants that have
+/// NARF-private numbers remain reachable through the extension table.
+/// Userspace targeting aarch64 should call the `*at` syscalls directly.
 #[cfg(target_arch = "aarch64")]
 const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Getcwd, 17),
@@ -2741,8 +2741,12 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Eventfd, 19),     // eventfd2
     (Syscall::EpollCreate, 20), // epoll_create1
     (Syscall::EpollCtl, 21),
-    (Syscall::EpollWait, 22), // epoll_pwait
     (Syscall::EpollPwait, 22),
+    // Internal callers historically use EpollWait on both architectures.
+    // Its four arguments are the zero-sigmask subset of epoll_pwait, and both
+    // variants share the same handler. Keep raw(EpollWait) useful while reverse
+    // lookup remains canonical: Linux aarch64 #22 resolves to EpollPwait.
+    (Syscall::EpollWait, 22),
     (Syscall::EpollPwait2, 441), // epoll_pwait2 (timespec* timeout)
     (Syscall::Dup, 23),
     (Syscall::Dup3, 24),
@@ -2776,10 +2780,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Fchownat, 54),
     (Syscall::Fchown, 55),
     (Syscall::Openat, 56),
-    (Syscall::OpenFile, 56), // legacy open → openat on aarch64
     (Syscall::Close, 57),
     (Syscall::Pipe2, 59),
-    (Syscall::Pipe, 59), // legacy pipe → pipe2 on aarch64
     (Syscall::Getdents64, 61),
     (Syscall::Lseek, 62),
     (Syscall::Read, 63),
@@ -2791,8 +2793,6 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Readlinkat, 78),
     (Syscall::Newfstatat, 79),
     (Syscall::Fstat, 80),
-    (Syscall::Stat, 79),  // legacy stat → newfstatat on aarch64
-    (Syscall::Lstat, 79), // ditto
     (Syscall::Fsync, 82),
     (Syscall::Fdatasync, 83),
     (Syscall::TimerfdCreate, 85),
