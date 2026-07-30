@@ -122,6 +122,19 @@ pub fn attach(
     iface: String,
     prog: Arc<BpfProg>,
 ) -> Result<(), narf_net::bypass::classifier::ClassifyError> {
+    // Spec §4.5: the hook's execution context is part of its type, and an XDP
+    // hook is `Atomic`. `attach_probe` has always checked this; this path did
+    // not, and the consequence was worse than a missing diagnostic.
+    //
+    // `BpfXdp::run` calls `run_atomic`, which returns `None` for a program
+    // verified for `Sleepable` — and `None` means "pass the frame" (declining
+    // traffic because a filter could not run would turn a resource limit into a
+    // network outage). So a sleepable program installed as an XDP filter
+    // succeeded, then **failed open on every frame**: the interface looks
+    // filtered and is not.
+    if prog.context() != narf_bpf_verifier::Context::Atomic {
+        return Err(narf_net::bypass::classifier::ClassifyError::WrongContext);
+    }
     let name = iface.clone();
     install_xdp(cap, iface, Box::new(BpfXdp { prog, name }))
 }

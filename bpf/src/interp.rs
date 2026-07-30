@@ -33,7 +33,6 @@
 //! the same bargain Linux strikes at `verifier.c:16186`, and it is only sound
 //! once the verifier is real.
 
-use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context as TaskContext, Poll};
@@ -159,7 +158,7 @@ impl Outcome {
 }
 
 /// One subprogram activation.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 struct Frame {
     /// Instruction index to resume at.
     return_pc: usize,
@@ -167,6 +166,8 @@ struct Frame {
     saved: [u64; 5],
     /// The caller's frame base within the stack region.
     frame_base: u64,
+    /// The caller's [`Vm::current_sp`], restored on `exit`.
+    saved_sp: usize,
 }
 
 /// A `yield` point for sleepable programs: returns `Pending` exactly once, so
@@ -231,7 +232,19 @@ pub struct Vm<'a> {
     ctx: [u64; MAX_CTX_WORDS],
     ctx_len: usize,
     stack: StackFrame<'a>,
-    frames: Vec<Frame>,
+    /// Active subprogram frames, innermost last.
+    ///
+    /// A fixed array, not a `Vec`: [`MAX_CALL_FRAMES`] is a compile-time
+    /// constant, and a `Vec` meant the *running program* called the global
+    /// allocator on every BPF-to-BPF call. Spec §4.6 forbids exactly that on
+    /// these paths — `run_xdp` invokes with `XDP_PROGS` held and IRQs masked,
+    /// `drain_irq_samples` with `PERF_EVENT_REGISTRY` *and* the event's program
+    /// lock held — and it was also an unadmitted panic site, since
+    /// `Vec::push`'s allocation failure calls `handle_alloc_error`, i.e. a
+    /// kernel panic driven by a program instruction.
+    frames: [Frame; MAX_CALL_FRAMES],
+    /// Number of live entries in `frames`.
+    depth: usize,
     /// Per-subprogram stack sizes, from the verifier.
     ///
     /// Frames used to be a fixed [`FRAME_BYTES`], which disagreed with the
@@ -241,6 +254,15 @@ pub struct Vm<'a> {
     /// below the region. `Ok` from the verifier is only meaningful if the
     /// frames are laid out the way it modelled them.
     subprogs: &'a [SubprogInfo],
+    /// Index into [`Self::subprogs`] of the subprogram currently executing.
+    ///
+    /// Load-bearing for frame layout, and the reason it exists: the callee's
+    /// frame base is `caller_base - size(caller)`, so laying out a call needs
+    /// the size of the subprogram making it. `push_frame` used to look up the
+    /// *callee's* size instead, which is wrong in both directions and matched
+    /// the verifier only when the two happened to be equal — which is exactly
+    /// what the one existing frame-overlap test did (8 bytes on both sides).
+    current_sp: usize,
     registry: &'static Registry,
     context: Context,
     /// Instructions retired, for diagnostics.
@@ -285,8 +307,12 @@ impl<'a> Vm<'a> {
             ctx,
             ctx_len: ctx_len.min(MAX_CTX_WORDS),
             stack,
-            frames: Vec::new(),
+            frames: [Frame::default(); MAX_CALL_FRAMES],
+            depth: 0,
             subprogs,
+            // Entry is subprogram 0 by construction: the verifier always emits
+            // the program entry as `subprogs[0]` with `start == 0`.
+            current_sp: 0,
             registry,
             context,
             steps: 0,
@@ -641,14 +667,17 @@ impl<'a> Vm<'a> {
                         pc = target;
                     }
                 },
-                Decoded::Exit => match self.frames.pop() {
-                    None => return Ok(self.regs[0]),
-                    Some(f) => {
-                        self.regs[6..11].copy_from_slice(&f.saved);
-                        frame_base = f.frame_base;
-                        pc = f.return_pc;
+                Decoded::Exit => {
+                    if self.depth == 0 {
+                        return Ok(self.regs[0]);
                     }
-                },
+                    self.depth -= 1;
+                    let f = self.frames[self.depth];
+                    self.regs[6..11].copy_from_slice(&f.saved);
+                    frame_base = f.frame_base;
+                    self.current_sp = f.saved_sp;
+                    pc = f.return_pc;
+                }
             }
         }
     }
@@ -712,16 +741,41 @@ impl<'a> Vm<'a> {
         frame_base: &mut u64,
         target_slot: u32,
     ) -> Result<(), Trap> {
-        if self.frames.len() >= MAX_CALL_FRAMES {
+        if self.depth >= MAX_CALL_FRAMES {
             return Err(Trap::CallDepth { at });
         }
-        // The callee's frame is exactly what the verifier sized it at. A
-        // fixed width here is what made `Ok` from the verifier meaningless:
-        // it modelled one layout and the interpreter used another.
-        let bytes = self
+        // Which subprogram are we calling? Needed to track `current_sp` across
+        // the call. The verifier creates a subprogram for every call target, so
+        // a miss means the image and the descriptor disagree — refuse rather
+        // than guess a layout.
+        let callee_sp = self
             .subprogs
             .iter()
-            .find(|s| s.start == target_slot)
+            .position(|s| s.start == target_slot)
+            .ok_or(Trap::BadTarget { at })?;
+
+        // The callee's frame sits directly below the *caller's*, so the amount
+        // to descend is the size of the subprogram making the call — not the
+        // size of the one being called.
+        //
+        // This used to look up the callee's size, which matched the verifier
+        // only when caller and callee happened to be equal-sized. The verifier
+        // models frames as disjoint and sizes the region as a sum down the
+        // deepest path (`total[sp] = align8(depth[sp]) + max(callee totals)`),
+        // so getting it backwards broke both ways:
+        //
+        //   * main uses 8 bytes, callee 512 → region is 520, top = SR+520, and
+        //     subtracting the *callee's* 512 put its base at SR+8, so its
+        //     `r10-512` addressed SR-504: a `BadAccess` in a program the
+        //     verifier had proved fits.
+        //   * main uses 512, callee 8 → the callee's base landed 8 below the
+        //     top, i.e. *inside* main's frame, and it silently overwrote a slot
+        //     the verifier had proved untouched (`clobber()` only runs when a
+        //     frame pointer is actually passed, so main's slot model survived
+        //     the call intact).
+        let bytes = self
+            .subprogs
+            .get(self.current_sp)
             .map_or(FRAME_BYTES as u64, |s| u64::from(s.stack_bytes));
         let new_base = frame_base
             .checked_sub(bytes)
@@ -731,11 +785,14 @@ impl<'a> Vm<'a> {
         }
         let mut saved = [0u64; 5];
         saved.copy_from_slice(&self.regs[6..11]);
-        self.frames.push(Frame {
+        self.frames[self.depth] = Frame {
             return_pc,
             saved,
             frame_base: *frame_base,
-        });
+            saved_sp: self.current_sp,
+        };
+        self.depth += 1;
+        self.current_sp = callee_sp;
         *frame_base = new_base;
         self.regs[10] = new_base;
         Ok(())
@@ -801,13 +858,85 @@ impl<'a> Vm<'a> {
         // the callee did not declare arrives as the caller left it, which is
         // harmless because the shim only reads the registers its own
         // signature names.
-        let (a0, a1, a2, a3, a4) = (
+        let mut args = [
             self.regs[1],
             self.regs[2],
             self.regs[3],
             self.regs[4],
             self.regs[5],
-        );
+        ];
+
+        // Translate byte-region arguments from the interpreter's *synthetic*
+        // address space into real kernel addresses.
+        //
+        // This is the seam `crate::provisional` rests its whole safety story on
+        // — "the interpreter never dereferences a program-supplied address" —
+        // and for byte regions that was false the moment such a kfunc existed.
+        // R10 here is `STACK_REGION` (0x0000_2000_0000_0000), a *fabricated*
+        // base, and `<&[u8]>::from_raw` does
+        // `core::slice::from_raw_parts(raw as *const u8, len)` on the register
+        // verbatim. So a `kfunc!` taking `&[u8]` would have been handed a slice
+        // pointing into the **user half** of the address space (`0x2000…` is
+        // canonical and user-mappable): a fault or SMAP violation at best, a
+        // user-influenced address at worst.
+        //
+        // The verifier cannot prevent this — `check_mem_arg` proves the pointer
+        // is an in-bounds *BPF stack* offset, which is exactly the thing that
+        // is not a kernel address. And the same kfunc works correctly under the
+        // JIT, where R10 really is the frame, so the interpreter was the only
+        // backend where it broke.
+        //
+        // Translated rather than rejected because the descriptors are already
+        // expressive enough to be correct here, and refusing `PtrKind::Mem`
+        // outright would make `&[u8]`/`&mut MaybeUninit<T>` undeclarable.
+        for (k, arg) in entry.args.iter().enumerate().take(args.len()) {
+            let is_mem = matches!(
+                arg.kind,
+                narf_bpf_verifier::TypeKind::Ptr {
+                    kind: narf_bpf_verifier::PtrKind::Mem,
+                    ..
+                }
+            );
+            if !is_mem {
+                continue;
+            }
+            let synthetic = args[k];
+            // A null region stays null: `from_raw` maps it to an empty slice,
+            // which is what a `NULLABLE` byte-region argument means.
+            if synthetic == 0 {
+                continue;
+            }
+            // `SIZED_BY_NEXT` puts the length in the following register. The
+            // descriptor validator guarantees that register exists and is a
+            // scalar, so `k + 1` is in range.
+            let len = if arg
+                .flags
+                .contains(narf_bpf_verifier::ArgFlags::SIZED_BY_NEXT)
+            {
+                args.get(k + 1).copied().unwrap_or(0)
+            } else {
+                // No declared length: the callee reads a fixed-size `T`, and
+                // the narrowest thing we can safely admit is a single byte —
+                // anything more would be asserting a size the descriptor did
+                // not state. `check_mem_arg` currently rejects this shape
+                // outright, so this arm is unreachable today and exists so that
+                // enabling it cannot silently skip the bounds check.
+                1
+            };
+            let (lo, hi) = self
+                .stack_range(synthetic, usize::try_from(len).unwrap_or(usize::MAX))
+                .ok_or(Trap::BadAccess {
+                    at,
+                    addr: synthetic,
+                    len: usize::try_from(len).unwrap_or(usize::MAX),
+                })?;
+            debug_assert!(hi <= self.stack.len());
+            let base = self.stack.bytes_mut().as_mut_ptr();
+            // SAFETY: `stack_range` proved `lo..hi` lies inside the frame, so
+            // `base.add(lo)` is in bounds of the same allocation.
+            args[k] = unsafe { base.add(lo) } as u64;
+        }
+        let (a0, a1, a2, a3, a4) = (args[0], args[1], args[2], args[3], args[4]);
         self.regs[0] = match entry.shim {
             KfuncShim::Sync(f) => f(a0, a1, a2, a3, a4),
             // The point of the two-variant ABI: a kfunc that suspends is just

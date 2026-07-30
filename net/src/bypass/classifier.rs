@@ -144,6 +144,33 @@ pub enum ClassifyError {
     AlreadyAttached,
     /// The capability presented for an XDP attach was revoked.
     CapRevoked,
+    /// The capability presented for an XDP attach was of the wrong *kind*.
+    ///
+    /// Liveness and kind are independent questions, and checking only the first
+    /// let any live grant of any kind install an XDP program.
+    WrongCapKind,
+    /// The program's execution context does not match what this hook provides.
+    ///
+    /// An XDP hook is `Atomic`; a program verified for `Sleepable` cannot run
+    /// here, and installing one anyway made the interface fail open.
+    WrongContext,
+}
+
+/// The capability kind an XDP attach/detach requires.
+///
+/// Split out so `install_xdp` and `remove_xdp` cannot disagree about it, and
+/// checked *before* liveness because a wrong-kind capability is a programming
+/// error rather than an expired authority.
+///
+/// This check was missing entirely: both entry points were generic over
+/// `M: CapType` and only called `check_live()`, so **any** live grant of **any**
+/// kind authorised replacing an interface's XDP program. `structops::install`
+/// gets this right (`M::KIND != desc.cap`), one module over.
+fn require_attach_cap<M: CapType>() -> Result<(), ClassifyError> {
+    if M::KIND != narf_capabilities::CapKind::BpfAttach {
+        return Err(ClassifyError::WrongCapKind);
+    }
+    Ok(())
 }
 
 /// Install a per-flow claim. Returns a sequence id callers can use
@@ -304,6 +331,7 @@ pub fn install_xdp<M: CapType>(
     iface: alloc::string::String,
     prog: alloc::boxed::Box<dyn XdpProgram>,
 ) -> Result<(), ClassifyError> {
+    require_attach_cap::<M>()?;
     cap.check_live().map_err(|_| ClassifyError::CapRevoked)?;
     let mut g = XDP_PROGS.lock();
     g.retain(|(n, _)| *n != iface);
@@ -314,6 +342,7 @@ pub fn install_xdp<M: CapType>(
 
 /// Detach any program on `iface`. Returns whether one was removed.
 pub fn remove_xdp<M: CapType>(cap: &Cap<M, Grant>, iface: &str) -> Result<bool, ClassifyError> {
+    require_attach_cap::<M>()?;
     cap.check_live().map_err(|_| ClassifyError::CapRevoked)?;
     let mut g = XDP_PROGS.lock();
     let before = g.len();

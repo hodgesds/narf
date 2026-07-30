@@ -1760,3 +1760,84 @@ fn smoke_bpf_jit_fuel_covers_every_path() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_jit_fuel_covers_every_path);
+
+/// Asymmetric frame sizes: a big caller and a small callee.
+///
+/// The existing overlap test uses 8 bytes on *both* sides, which is the one
+/// arrangement where subtracting the callee's frame size and subtracting the
+/// caller's give the same answer — so it passed while `push_frame` used the
+/// wrong one.
+///
+/// Here main uses 512 bytes and the callee 8. With the callee's size subtracted,
+/// its base landed 8 bytes below main's top, i.e. *inside* main's frame, and its
+/// store silently overwrote a slot the verifier had proved untouched. Main then
+/// read back the callee's value.
+fn smoke_bpf_big_caller_small_callee_frames_disjoint() -> TestResult {
+    // main:  *(u64*)(r10-16) = 0x11; *(u64*)(r10-512) = 0x33; call sub;
+    //        r0 = *(u64*)(r10-16); exit
+    // sub:   *(u64*)(r10-8) = 0x22; r0 = 0; exit
+    //
+    // The sentinel sits at -16 deliberately. Subtracting the *callee's* 8 bytes
+    // puts its base at `top - 8`, so its own `r10-8` resolves to `top - 16` —
+    // exactly main's `r10-16`. A sentinel at -8 would sit one slot clear of the
+    // collision and the test would pass under the bug it exists to catch.
+    let insns = asm(&[
+        st_imm(10, -16, 0x11),
+        st_imm(10, -512, 0x33),
+        subprog_call(2),
+        ldx(0, 10, -16),
+        EXIT,
+        st_imm(10, -8, 0x22),
+        mov_imm(0, 0),
+        EXIT,
+    ]);
+    let Ok(p) = load("bigsmall", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected an asymmetric subprogram call");
+    };
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Returned(0x11)) => TestResult::Pass,
+        Some(Outcome::Returned(0x22)) => {
+            TestResult::Fail("callee frame landed inside the caller's frame")
+        }
+        Some(Outcome::Returned(_)) => TestResult::Fail("unexpected value after a subprogram call"),
+        Some(Outcome::Trapped(_)) => TestResult::Fail("asymmetric subprogram call trapped"),
+        None => TestResult::Fail("run declined"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_big_caller_small_callee_frames_disjoint);
+
+/// The mirror case: a small caller and a big callee.
+///
+/// With the callee's size subtracted, `max_stack_bytes` was 520 while the
+/// callee's base was placed at `top - 512`, so its own `r10-512` addressed
+/// *below* the region and trapped `BadAccess` — a program the verifier had
+/// proved fits, failing at runtime.
+fn smoke_bpf_small_caller_big_callee_fits() -> TestResult {
+    // main:  *(u64*)(r10-8) = 0x11; call sub; r0 = *(u64*)(r10-8); exit
+    // sub:   *(u64*)(r10-512) = 0x22; r0 = 0; exit
+    let insns = asm(&[
+        st_imm(10, -8, 0x11),
+        subprog_call(2),
+        ldx(0, 10, -8),
+        EXIT,
+        st_imm(10, -512, 0x22),
+        mov_imm(0, 0),
+        EXIT,
+    ]);
+    let Ok(p) = load("smallbig", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected a small-caller/big-callee call");
+    };
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Returned(0x11)) => TestResult::Pass,
+        Some(Outcome::Returned(_)) => TestResult::Fail("caller slot was clobbered"),
+        Some(Outcome::Trapped(Trap::BadAccess { .. })) => {
+            TestResult::Fail("callee addressed below the stack region — frame sizing is wrong")
+        }
+        Some(Outcome::Trapped(Trap::StackExhausted { .. })) => {
+            TestResult::Fail("frame sizing exhausted a region the verifier proved sufficient")
+        }
+        Some(Outcome::Trapped(_)) => TestResult::Fail("call trapped"),
+        None => TestResult::Fail("run declined"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_small_caller_big_callee_fits);
