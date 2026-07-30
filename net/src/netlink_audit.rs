@@ -20,6 +20,15 @@ pub const AUDIT_GET: u16 = 1000;
 pub const AUDIT_SET: u16 = 1001;
 pub const AUDIT_LIST_RULES: u16 = 1013;
 
+// `linux/audit.h`: these messages originate in userspace. With auditing
+// disabled Linux accepts them without creating a record; libaudit still
+// expects the requested successful netlink ACK.
+const AUDIT_USER: u16 = 1005;
+const AUDIT_FIRST_USER_MSG: u16 = 1100;
+const AUDIT_LAST_USER_MSG: u16 = 1199;
+const AUDIT_FIRST_USER_MSG2: u16 = 2100;
+const AUDIT_LAST_USER_MSG2: u16 = 2999;
+
 const EINVAL: i32 = 22;
 const EPERM: i32 = 1;
 const EOPNOTSUPP: i32 = 95;
@@ -75,6 +84,9 @@ fn build_one(request: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
             alloc::vec![frame(NLMSG_DONE, NLM_F_MULTI, seq, &0i32.to_ne_bytes())]
         }
         AUDIT_SET => alloc::vec![error(EPERM, seq, request)],
+        AUDIT_USER
+        | AUDIT_FIRST_USER_MSG..=AUDIT_LAST_USER_MSG
+        | AUDIT_FIRST_USER_MSG2..=AUDIT_LAST_USER_MSG2 => Vec::new(),
         _ => alloc::vec![error(EOPNOTSUPP, seq, request)],
     };
     if flags & NLM_F_ACK != 0
@@ -143,6 +155,24 @@ mod tests {
                     .unwrap()
             ),
             -EPERM
+        );
+    }
+
+    #[test]
+    fn userspace_records_are_acknowledged_when_audit_is_disabled() {
+        let replies = build_replies(&request(AUDIT_FIRST_USER_MSG, NLM_F_ACK, 9)).unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            u16::from_ne_bytes(replies[0][4..6].try_into().unwrap()),
+            NLMSG_ERROR
+        );
+        assert_eq!(
+            i32::from_ne_bytes(
+                replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0
         );
     }
 }
