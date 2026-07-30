@@ -645,6 +645,7 @@ name = "narf-bpf"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-bpf-bench",
  "narf-bpf-isa",
  "narf-bpf-jit",
  "narf-bpf-verifier",
@@ -656,6 +657,17 @@ dependencies = [
  "narf-memory",
  "narf-rcu",
  "narf-tracing",
+]
+
+[[package]]
+name = "narf-bpf-bench"
+version = "0.0.0"
+dependencies = [
+ "narf-boot",
+ "narf-console",
+ "narf-init",
+ "narf-lib",
+ "narf-time",
 ]
 
 [[package]]

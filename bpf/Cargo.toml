@@ -24,6 +24,12 @@ default = []
 # The crate itself is always linked (the `bpf(2)` handler and
 # `register_initcalls()` are unconditional), so this gates only the tests.
 kernel-test = ["dep:narf-kernel-test"]
+# In-kernel benchmarks, registered through `narf-bpf-bench` and run only when
+# the kernel cmdline carries `bpf_bench`. Off by default because it compiles
+# `interp::Vm::run_fuel_hoisted` — a fuel policy that bounds iterations rather
+# than work, kept solely so the policy that replaced it can be measured against
+# it. A production kernel must not be able to name it.
+bench = ["dep:narf-bpf-bench"]
 
 [dependencies]
 narf-bpf-isa      = { path = "isa" }
@@ -38,6 +44,7 @@ narf-filesystem   = { path = "../filesystem" }
 narf-tracing      = { path = "../tracing" }
 narf-init         = { path = "../init" }
 narf-kernel-test  = { path = "../verification/kernel-test", optional = true }
+narf-bpf-bench    = { path = "bench", optional = true }
 
 [lints]
 workspace = true

@@ -30,6 +30,8 @@
 extern crate alloc;
 
 pub mod attach;
+#[cfg(feature = "bench")]
+pub mod bench;
 pub mod interp;
 pub mod jit_glue;
 pub mod kfunc;
@@ -117,6 +119,12 @@ pub fn register_initcalls() {
         // establishes that none is.
         narf_rcu::retire_box(alloc::boxed::Box::new(ReclaimOnGracePeriod(Some(alloc))));
     });
+    // The benchmark suite, when built with it. Registers a `Late` initcall
+    // that is a cmdline check and nothing else unless `bpf_bench` was asked
+    // for — benchmarks are not tests and must not run as a side effect of
+    // booting.
+    #[cfg(feature = "bench")]
+    bench::register();
 }
 
 /// Recover a loaded program from an `Arc<dyn FileOps>`'s `as_any`.

@@ -1,0 +1,26 @@
+[package]
+name        = "narf-bpf-bench"
+description = "Benchmark harness: declaration, in-kernel sample collection, and raw-sample emission for the verification/ statistical protocol."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_bpf_bench"
+path = "src/lib.rs"
+
+# Deliberately NOT dependent on `narf-bpf`. The benchmark *cases* live in
+# `narf-bpf` (behind its `bench` feature) and depend on this crate; if the
+# dependency went the other way the two would cycle, and the harness would
+# stop being reusable by any other subsystem that wants §8-shaped samples.
+[dependencies]
+narf-lib     = { path = "../../lib" }
+narf-time    = { path = "../../time" }
+narf-console = { path = "../../console" }
+narf-init    = { path = "../../init" }
+narf-boot    = { path = "../../boot" }
+
+[lints]
+workspace = true

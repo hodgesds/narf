@@ -66,6 +66,14 @@ pub const MAX_CTX_WORDS: usize = 4;
 /// Maximum nested subprogram frames. Matches Linux's `MAX_CALL_FRAMES`.
 pub const MAX_CALL_FRAMES: usize = 8;
 
+/// The production fuel policy: one unit per instruction retired (§4.9).
+///
+/// Named rather than spelled `true` at the one call site so the `const`
+/// parameter on the interpreter loop reads as a policy selection and not as a
+/// mystery boolean. The only other value is reachable from
+/// [`Vm::run_fuel_hoisted`], which exists to be benchmarked against this one.
+pub const FUEL_PER_INSN: bool = true;
+
 /// Bytes each subprogram frame gets inside the stack region.
 pub const FRAME_BYTES: usize = 512;
 
@@ -342,14 +350,40 @@ impl<'a> Vm<'a> {
     /// Atomic programs never hit an await point, so polling this future once
     /// is enough for them; sleepable programs park at `narf_yield()`.
     pub async fn run(&mut self) -> Outcome {
-        match self.run_inner().await {
+        match self.run_inner::<FUEL_PER_INSN>().await {
             Ok(v) => Outcome::Returned(v),
             Err(t) => Outcome::Trapped(t),
         }
     }
 
+    /// Run with the fuel burn hoisted off the per-instruction path and onto
+    /// back-edges and calls — the policy this interpreter used before
+    /// `bpf/specification/spec.md` §8 item 7 was resolved to "per instruction".
+    ///
+    /// This is **not** a supported way to run a program: the bound it gives is
+    /// on iterations, not on work, which is precisely why it was replaced. It
+    /// exists so the cost of the replacement can be measured rather than
+    /// asserted, and it is compiled only under the `bench` feature so a
+    /// production build cannot name it.
+    #[cfg(feature = "bench")]
+    pub async fn run_fuel_hoisted(&mut self) -> Outcome {
+        match self.run_inner::<false>().await {
+            Ok(v) => Outcome::Returned(v),
+            Err(t) => Outcome::Trapped(t),
+        }
+    }
+
+    /// The interpreter loop, parameterised on where fuel is spent.
+    ///
+    /// A `const` parameter rather than a field, deliberately: the whole
+    /// question the A/B asks is what a decrement-and-branch per instruction
+    /// costs, and a *runtime* policy check would add a second load and branch
+    /// per instruction to production in order to measure the first one.
+    /// Monomorphised, `PER_INSN` folds at compile time and the production
+    /// instantiation keeps exactly the code it had before this parameter
+    /// existed.
     #[allow(clippy::too_many_lines)]
-    async fn run_inner(&mut self) -> Result<u64, Trap> {
+    async fn run_inner<const PER_INSN: bool>(&mut self) -> Result<u64, Trap> {
         let mut pc: usize = 0;
         let mut frame_base: u64 = STACK_REGION + self.stack.len() as u64;
         loop {
@@ -376,7 +410,9 @@ impl<'a> Vm<'a> {
             // paying a decode and a match per instruction, so the marginal
             // cost is noise. The JIT will burn per basic block instead, which
             // is the same bound at coarser granularity.
-            self.burn(at)?;
+            if PER_INSN {
+                self.burn(at)?;
+            }
             let next = pc + width;
 
             match insn {
@@ -513,6 +549,11 @@ impl<'a> Vm<'a> {
                         // No extra burn for a back-edge: every instruction
                         // already burns one, so a loop pays per iteration
                         // through its body rather than a flat unit per turn.
+                        // Under the hoisted policy this *is* the whole meter,
+                        // so the back-edge has to pay for the iteration.
+                        if !PER_INSN && off < 0 {
+                            self.burn(at)?;
+                        }
                         pc = self.branch(at, next, i32::from(off))?;
                     } else {
                         pc = next;
@@ -529,14 +570,28 @@ impl<'a> Vm<'a> {
                     // there is fuel and the branch may be taken. `may_goto`
                     // needs no counter of its own — that is the whole point of
                     // metering at runtime.
+                    if !PER_INSN {
+                        self.burn(at)?;
+                    }
                     pc = self.branch(at, next, i32::from(off))?;
                 }
                 Decoded::Call(target) => match target {
                     narf_bpf_isa::CallTarget::Kfunc(id) => {
+                        // The hoisted policy metered calls as well as
+                        // back-edges, so a program could not spin through an
+                        // unmetered kfunc loop. Kept for fidelity: the arm is
+                        // only worth measuring if it is the policy that was
+                        // actually replaced.
+                        if !PER_INSN {
+                            self.burn(at)?;
+                        }
                         self.call_kfunc(at, id).await?;
                         pc = next;
                     }
                     narf_bpf_isa::CallTarget::Subprog(rel) => {
+                        if !PER_INSN {
+                            self.burn(at)?;
+                        }
                         let target = self.subprog_target(at, next, rel)?;
                         self.push_frame(at, next, &mut frame_base, target as u32)?;
                         pc = target;
