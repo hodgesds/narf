@@ -392,6 +392,18 @@ impl KfuncDesc {
             if matches!(a.kind, TypeKind::Void) {
                 return Err(KfuncError::VoidArgument(i));
             }
+            // `CONST` means "the verifier proved a single value", which only
+            // has a meaning for a scalar. On a pointer it was silently
+            // ignored, so a kfunc author writing `Const<Trusted<T>>` got a
+            // guarantee they did not have.
+            //
+            // Rejected rather than reinterpreted: for a pointer the nearest
+            // sensible reading is "the offset is known", which is a different
+            // and weaker property than the one the name promises. Inventing
+            // that mapping silently would be worse than refusing the shape.
+            if a.flags.contains(ArgFlags::CONST) && !matches!(a.kind, TypeKind::Scalar { .. }) {
+                return Err(KfuncError::ConstOnNonScalar(i));
+            }
             // A lock guard is never sleep-safe, in either position. Checking
             // arguments too closes the hole where a kfunc *takes back* a guard
             // it claims survived a sleep, which would legitimise the very
@@ -441,6 +453,9 @@ pub enum KfuncError {
     MissingSizeArg(usize),
     /// A scalar argument declared a non-static validity domain.
     ScalarWithDomain(usize),
+    /// [`ArgFlags::CONST`] on a non-scalar argument, where it has no meaning
+    /// and was previously ignored.
+    ConstOnNonScalar(usize),
     /// An argument had type [`TypeKind::Void`].
     VoidArgument(usize),
     /// A lock guard was declared sleep-safe in return position.

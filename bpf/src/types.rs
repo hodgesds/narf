@@ -497,6 +497,18 @@ unsafe impl<T: BpfType> BpfType for Const<T> {
             "Const<T> where T already carries argument flags: the flag set \
              would be lost. Nesting flag-carrying types is not supported."
         );
+        // Caught at build time as well as at registration, so a kfunc that
+        // asks for something meaningless fails to compile rather than
+        // failing to validate at boot.
+        assert!(
+            matches!(
+                T::DESC.kind,
+                narf_bpf_verifier::kfunc::TypeKind::Scalar { .. }
+            ),
+            "Const<T> is only meaningful for a scalar: 'the verifier proved a \
+             single value' has no reading for a pointer, and the flag was \
+             silently ignored there."
+        );
         ArgDesc {
             kind: T::DESC.kind,
             domain: T::DESC.domain,

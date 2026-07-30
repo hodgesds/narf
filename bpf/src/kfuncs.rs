@@ -66,6 +66,11 @@ crate::kfunc! {
             .map_or(u64::MAX, |c| c.load(Ordering::Relaxed))
     }
 
+}
+
+// A separate `kfunc!` invocation: every item in one invocation must match the
+// same rule, and this one is the sleepable (`async fn`) form.
+crate::kfunc! {
     /// Yield to the scheduler. Sleepable programs only.
     ///
     /// Yielding does **not** refill fuel (§4.9): fuel bounds total work, and
@@ -73,12 +78,36 @@ crate::kfunc! {
     /// what makes a long iterator walk cooperative rather than either
     /// CPU-hogging or fuel-fatal.
     ///
-    /// The body here is never executed — the interpreter recognises
-    /// [`YIELD_ID`] and awaits instead. It exists so the descriptor carries a
-    /// real shim address (`KfuncDesc::validate` rejects a null one) and so the
-    /// signature and context live in the same place as every other kfunc's.
-    #[context(Sleepable)]
-    pub fn narf_yield() -> u64 {
+    /// Unlike every other kfunc here this one is `async`, which is the whole
+    /// declaration: `kfunc!`'s sleepable rule derives
+    /// [`Context::Sleepable`](narf_bpf_verifier::kfunc::Context) from the
+    /// keyword, so there is no attribute to forget and no way to declare an
+    /// awaiting kfunc as atomic.
+    ///
+    /// It was previously an interpreter intrinsic with a dead body, because a
+    /// uniform `u64`-returning shim had nowhere to put a suspension. Now it is
+    /// an ordinary kfunc, and so can any other sleepable one be.
+    pub async fn narf_yield() -> u64 {
+        crate::interp::yield_now().await;
         0
+    }
+
+    /// Yield `n` times, returning the number of yields performed.
+    ///
+    /// Exists to prove the sleepable ABI generalises: `narf_yield` suspends at
+    /// most once, so on its own it could be satisfied by a shim that returned
+    /// `Pending` a single time. This one suspends an argument-dependent number
+    /// of times, which only a real future can do — and it is the shape a
+    /// blocking kfunc (a filesystem walk, an iterator drain) would take.
+    ///
+    /// Capped so a program cannot turn one call into an unbounded stall; the
+    /// caller's fuel is not consumed by the suspension itself, so the cap is
+    /// the only bound here.
+    pub async fn narf_yield_n(n: u32) -> u64 {
+        let count = n.min(64);
+        for _ in 0..count {
+            crate::interp::yield_now().await;
+        }
+        u64::from(count)
     }
 }

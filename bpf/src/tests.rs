@@ -188,7 +188,7 @@ fn smoke_bpf_kfunc_descriptors_validate() -> TestResult {
         if e.desc().validate().is_err() {
             return TestResult::Fail("a registered kfunc descriptor failed validate()");
         }
-        if e.shim as usize == 0 {
+        if e.shim.addr() == 0 {
             return TestResult::Fail("a registered kfunc has a null shim");
         }
     }
@@ -922,3 +922,75 @@ fn smoke_bpf_fresh_frame_is_zeroed() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_fresh_frame_is_zeroed);
+
+fn smoke_bpf_fuel_bounds_straight_line_work() -> TestResult {
+    // Fuel must bound *work*, not iterations. It used to burn only on
+    // back-edges and calls, so a straight-line program cost one unit however
+    // long it was — the default 2^20 tank permitted on the order of 7e10
+    // instructions per invocation, which is no bound at all in an atomic probe
+    // running with IRQs masked on someone else's timeslice.
+    //
+    // A straight line longer than the tank must therefore run out. Built with
+    // a tiny tank so the test stays cheap.
+    let mut items: Vec<Decoded> = Vec::new();
+    for _ in 0..64 {
+        items.push(alu_imm(AluOp::Add, 0, 1));
+    }
+    items.push(EXIT);
+    let insns = asm(&items);
+    match run_unverified(&insns, 8) {
+        Some(Outcome::Trapped(Trap::OutOfFuel { .. })) => {}
+        Some(Outcome::Returned(_)) => {
+            return TestResult::Fail("a straight line longer than the tank did not run out of fuel")
+        }
+        Some(Outcome::Trapped(_)) => return TestResult::Fail("wrong trap"),
+        None => return TestResult::Fail("per-CPU stack declined"),
+    }
+    // And with enough fuel the same program completes, so the bound is a
+    // bound and not a blanket refusal.
+    match run_unverified(&insns, 1024) {
+        Some(Outcome::Returned(_)) => TestResult::Pass,
+        _ => TestResult::Fail("the program did not complete with ample fuel"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_fuel_bounds_straight_line_work);
+
+// ── the sleepable kfunc ABI ─────────────────────────────────────────
+
+fn smoke_bpf_sleepable_kfunc_suspends_and_resumes() -> TestResult {
+    // r1 = 5; call narf_yield_n; exit  — in a Sleepable program.
+    //
+    // The uniform `extern "C" fn(u64x5) -> u64` shim had nowhere to put a
+    // suspension, so `narf_yield()` was an interpreter intrinsic with a dead
+    // body and *no* kfunc could actually sleep — "sleepable" bought yielding
+    // and nothing else. `narf_yield_n` suspends an argument-dependent number of
+    // times, which only a real future can do, and is the shape a blocking
+    // kfunc (a filesystem walk, an iterator drain) would take.
+    let insns = asm(&[mov_imm(1, 5), call("narf_yield_n"), EXIT]);
+    let Ok(p) = load("sleepy", insns, Context::Sleepable) else {
+        return TestResult::Fail("load rejected a sleepable program");
+    };
+    match crate::interp::drive(p.run_sleepable([0; 4], 4)) {
+        Some(Outcome::Returned(5)) => TestResult::Pass,
+        Some(Outcome::Returned(_)) => TestResult::Fail("wrong yield count"),
+        Some(Outcome::Trapped(_)) => TestResult::Fail("sleepable kfunc trapped"),
+        None => TestResult::Fail("sleepable run declined"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_sleepable_kfunc_suspends_and_resumes);
+
+fn smoke_bpf_atomic_program_cannot_call_a_sleepable_kfunc() -> TestResult {
+    // The context rule, enforced by type rather than by a flag: an `async fn`
+    // kfunc is Sleepable because it is `async`, so an atomic program calling it
+    // must be refused at load. Nothing in the declaration could have said
+    // otherwise.
+    let insns = asm(&[mov_imm(1, 1), call("narf_yield_n"), mov_imm(0, 0), EXIT]);
+    match load("atomic-sleeps", insns, Context::Atomic) {
+        Err(_) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("an atomic program was allowed to call a sleepable kfunc"),
+    }
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_atomic_program_cannot_call_a_sleepable_kfunc
+);

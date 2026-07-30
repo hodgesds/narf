@@ -460,3 +460,40 @@ fn propagates_malformed_kfunc_descriptors() {
     .unwrap_err();
     assert_eq!(err, VerifyError::Kfunc(KfuncError::VoidArgument(0)));
 }
+
+#[test]
+fn rejects_const_on_a_pointer_argument() {
+    // `ArgFlags::CONST` means "the verifier proved a single value", which the
+    // call-site check only ever applied to scalars. On a pointer it was
+    // silently ignored, so `Const<Trusted<T>>` compiled, registered, verified,
+    // and delivered nothing — a kfunc author had a guarantee they did not
+    // have.
+    static ARGS: &[ArgDesc] = &[ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::Object,
+            key: TypeKey(1),
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::CONST,
+    }];
+    assert_eq!(
+        desc(ARGS, ArgDesc::VOID, Context::Atomic).validate(),
+        Err(KfuncError::ConstOnNonScalar(0))
+    );
+}
+
+#[test]
+fn accepts_const_on_a_scalar_argument() {
+    static ARGS: &[ArgDesc] = &[ArgDesc {
+        kind: TypeKind::Scalar {
+            bits: 64,
+            signed: false,
+        },
+        domain: ValidityDomain::Static,
+        flags: ArgFlags::CONST,
+    }];
+    assert_eq!(
+        desc(ARGS, ArgDesc::VOID, Context::Atomic).validate(),
+        Ok(())
+    );
+}

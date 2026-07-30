@@ -320,7 +320,12 @@ and the perf event layer, all of which are closed.
    sleepable ⇒ interpreted".
 6. **Demoting the low identity map to NX**, which is what would make §4.2 an
    actual W^X boundary. Needs a huge-page demote helper that does not exist.
-7. **Fuel accounting granularity** — per back-edge only, or per basic block.
+7. ~~**Fuel accounting granularity**~~ — **resolved: per instruction.** Per
+   back-edge bounds iterations rather than work: 65536 straight-line
+   instructions cost one unit, so the default tank permitted ~7e10
+   instructions per invocation, which is no bound inside an atomic probe. The
+   interpreter burns per instruction retired; the JIT will burn per basic
+   block, the same bound at coarser granularity.
 8. **aarch64 `probe.rs`.** Porting the x86_64 recoverable-probe module would
    let `memory/src/tests.rs`'s four `probe::arm` sites stop being x86-only.
    Optional scope, but adjacent.
@@ -343,3 +348,37 @@ and the perf event layer, all of which are closed.
     both. The fix is probably for linearity to key on `PtrKind::LockGuard`
     directly rather than on the validity domain; it should land with the
     abstract interpreter, which is the first consumer that cares.
+
+## 9. Post-review corrections
+
+A Fable review of the merged subsystem returned **do not land** with three
+kernel-compromise or kernel-hang defects, two of them reachable unprivileged.
+All fourteen findings are recorded here because several were *documentation*
+that had come loose from the code, and the pattern is worth keeping.
+
+Closed: unbounded arithmetic on faulting pointer classes (arbitrary kernel
+read/write); a non-terminating fixpoint (stack slots joined, never widened —
+an unprivileged kernel hang); `bpf(2)` gated on a capability the syscall
+minted for itself; a 32-bit null test discharging a reference; unbounded arena
+byte regions; a wrapping ctx access panicking the kernel; a per-CPU frame
+released on the wrong CPU; BPF-to-BPF frames ignoring the verifier's table;
+`seal` not enforcing §4.3; the runtime never depending on the memory
+subsystem at all; a boot-order guard compiled out of release builds;
+`CAP_JIT` gating the inverse of the JIT flip; a cross-crate frame-zeroing
+obligation stated nowhere; fuel bounding iterations rather than work.
+
+**The dominant failure mode was not any individual bug.** Four separate
+safety arguments lived in one crate while depending on another's behaviour,
+and stayed correct-looking after the thing they rested on changed:
+
+* `PerCpuFrames: Sync` rested on handlers running with IRQs masked for their
+  whole duration — a premise *this same series* removed when `dispatch::fire`
+  was reworked to drop its lock before invoking.
+* §4.3's extable-before-execute was prose; `seal` never checked.
+* The verifier's caller-frame precision loss was safe only because the runtime
+  zeroes frames, with nothing on either side saying so.
+* `Ok` from the verifier carried obligations (`fault_sites`, `subprogs`,
+  `uses_arena`) that nothing consumed.
+
+Accordingly: an invariant that spans two crates belongs in a test, not in a
+comment on one side of the seam.

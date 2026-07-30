@@ -11,9 +11,11 @@
 //!
 //! ## Fuel
 //!
-//! Every back-edge and every call decrements the fuel counter; exhaustion
-//! stops the program with a diagnostic, never a fault, and fuel is **never
-//! refilled** (§4.9). That is what lets the verifier be a plain converging
+//! Every instruction retired decrements the fuel counter; exhaustion stops the
+//! program with a diagnostic, never a fault, and fuel is **never refilled**
+//! (§4.9). Per *instruction* rather than per back-edge, because the latter
+//! bounds iterations rather than work — 65536 straight-line instructions cost
+//! one unit, which is no bound at all inside an atomic probe. That is what lets the verifier be a plain converging
 //! fixpoint instead of Linux's termination heuristics — a 1M instruction
 //! budget, 8192 pushed states, 64 states/insn, SCC computation, open-coded
 //! iterator convergence, `may_goto` counters, and `bpf_loop` callbacks, five
@@ -147,6 +149,16 @@ struct Frame {
 #[derive(Debug, Default)]
 struct YieldNow {
     yielded: bool,
+}
+
+/// Yield once to the executor.
+///
+/// The primitive behind the `narf_yield()` kfunc. Public so that kfunc lives
+/// in `crate::kfuncs` with every other one, rather than being special-cased
+/// inside the interpreter's dispatch — which is what it had to be while the
+/// kfunc ABI could not express suspension.
+pub async fn yield_now() {
+    YieldNow::default().await;
 }
 
 impl Future for YieldNow {
@@ -350,6 +362,21 @@ impl<'a> Vm<'a> {
                 what: "undecodable instruction",
             })?;
             self.steps = self.steps.wrapping_add(1);
+            // Fuel burns per instruction retired, not only on back-edges.
+            //
+            // Burning only on back-edges and calls made fuel a bound on
+            // *iterations* rather than on work: a straight-line program of
+            // 65536 instructions cost one unit, so the default tank of 2^20
+            // permitted on the order of 7e10 instructions per invocation. That
+            // is not a usable bound in an atomic probe, where the program runs
+            // with IRQs masked on someone else's timeslice.
+            //
+            // A decrement per instruction is what makes §4.9's claim — fuel
+            // bounds total work — actually true. The interpreter is already
+            // paying a decode and a match per instruction, so the marginal
+            // cost is noise. The JIT will burn per basic block instead, which
+            // is the same bound at coarser granularity.
+            self.burn(at)?;
             let next = pc + width;
 
             match insn {
@@ -483,10 +510,10 @@ impl<'a> Vm<'a> {
                     let a = self.reg(dst);
                     let b = self.src_value(src);
                     if cond(op, wide, a, b) {
+                        // No extra burn for a back-edge: every instruction
+                        // already burns one, so a loop pays per iteration
+                        // through its body rather than a flat unit per turn.
                         pc = self.branch(at, next, i32::from(off))?;
-                        if off < 0 {
-                            self.burn(at)?;
-                        }
                     } else {
                         pc = next;
                     }
@@ -497,27 +524,24 @@ impl<'a> Vm<'a> {
                     // here it is simply a back-edge that burns fuel and stops
                     // branching when the tank is dry — the same observable
                     // behaviour with none of the machinery.
-                    if self.fuel == 0 {
+                    // The per-instruction burn above already stopped the
+                    // program if the tank was dry, so reaching here means
+                    // there is fuel and the branch may be taken. `may_goto`
+                    // needs no counter of its own — that is the whole point of
+                    // metering at runtime.
+                    pc = self.branch(at, next, i32::from(off))?;
+                }
+                Decoded::Call(target) => match target {
+                    narf_bpf_isa::CallTarget::Kfunc(id) => {
+                        self.call_kfunc(at, id).await?;
                         pc = next;
-                    } else {
-                        self.fuel -= 1;
-                        pc = self.branch(at, next, i32::from(off))?;
                     }
-                }
-                Decoded::Call(target) => {
-                    self.burn(at)?;
-                    match target {
-                        narf_bpf_isa::CallTarget::Kfunc(id) => {
-                            self.call_kfunc(at, id).await?;
-                            pc = next;
-                        }
-                        narf_bpf_isa::CallTarget::Subprog(rel) => {
-                            let target = self.subprog_target(at, next, rel)?;
-                            self.push_frame(at, next, &mut frame_base, target as u32)?;
-                            pc = target;
-                        }
+                    narf_bpf_isa::CallTarget::Subprog(rel) => {
+                        let target = self.subprog_target(at, next, rel)?;
+                        self.push_frame(at, next, &mut frame_base, target as u32)?;
+                        pc = target;
                     }
-                }
+                },
                 Decoded::Exit => match self.frames.pop() {
                     None => return Ok(self.regs[0]),
                     Some(f) => {
@@ -663,39 +687,36 @@ impl<'a> Vm<'a> {
     }
 
     async fn call_kfunc(&mut self, at: u32, id: i32) -> Result<(), Trap> {
-        // `narf_yield()` is an interpreter intrinsic rather than a shim call:
-        // the uniform kfunc ABI returns a `u64`, not a future, so a kfunc
-        // that awaits cannot go through it. A general async kfunc ABI is a
-        // Phase-2 question (`bpf/specification/spec.md` §8); the one kfunc
-        // that needs it today is handled here.
-        if id == crate::kfuncs::YIELD_ID {
-            if self.context != Context::Sleepable {
-                return Err(Trap::WrongContext { at });
-            }
-            YieldNow::default().await;
-            self.regs[0] = 0;
-            return Ok(());
-        }
-
         let entry = *self
             .registry
             .by_id(id)
             .ok_or(Trap::UnknownKfunc { at, id })?;
-        if !self.context.permits(entry.context) {
+        // Re-checked here even though the verifier already rejected it: the
+        // consequence of being wrong is a program sleeping with IRQs masked
+        // and a per-CPU stack level held, which is not a failure worth
+        // discovering in production.
+        if !self.context.permits(entry.effective_context()) {
             return Err(Trap::WrongContext { at });
         }
-        let shim: KfuncShim = entry.shim;
         // R1..R5 are the argument registers; R0 takes the result. Everything
         // the callee did not declare arrives as the caller left it, which is
         // harmless because the shim only reads the registers its own
         // signature names.
-        self.regs[0] = shim(
+        let (a0, a1, a2, a3, a4) = (
             self.regs[1],
             self.regs[2],
             self.regs[3],
             self.regs[4],
             self.regs[5],
         );
+        self.regs[0] = match entry.shim {
+            KfuncShim::Sync(f) => f(a0, a1, a2, a3, a4),
+            // The point of the two-variant ABI: a kfunc that suspends is just
+            // an `.await` here. Under a uniform `u64`-returning shim there was
+            // nowhere to put the suspension, so `narf_yield()` had to be an
+            // interpreter intrinsic and no other kfunc could sleep at all.
+            KfuncShim::Sleepable(f) => f(a0, a1, a2, a3, a4).await,
+        };
         // The BPF ABI clobbers R1..R5 across a call.
         self.regs[1..6].fill(0);
         Ok(())

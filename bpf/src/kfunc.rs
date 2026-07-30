@@ -45,18 +45,80 @@
 
 use alloc::vec::Vec;
 
+use alloc::boxed::Box;
+use core::future::Future;
+use core::pin::Pin;
+
 use narf_bpf_verifier::kfunc::MAX_KFUNC_ARGS;
 use narf_bpf_verifier::kfunc::{ArgDesc, ArgFlags, Context, KfuncDesc, KfuncError, TypeKind};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::types::{fnv1a32_nonzero, BpfType};
 
-/// The uniform kfunc calling convention.
+/// A kfunc that completes without suspending.
 ///
-/// One signature for every kfunc, so the interpreter needs one
-/// `core::mem::transmute` site and the JIT needs one call sequence. Arguments
-/// the callee does not declare are passed as zero.
-pub type KfuncShim = extern "C" fn(u64, u64, u64, u64, u64) -> u64;
+/// Arguments the callee does not declare are passed as zero.
+pub type SyncShim = extern "C" fn(u64, u64, u64, u64, u64) -> u64;
+
+/// A kfunc that may suspend.
+///
+/// Returns a boxed future because a `macro_rules!`-generated `async fn` has an
+/// opaque type with no name to put in a `static`. The allocation is acceptable
+/// *here specifically*: a sleepable kfunc is only reachable from a sleepable
+/// program, which by definition runs as an ordinary executor task in
+/// preemptible context — spec §4.6's "a running program may not allocate"
+/// governs the atomic path, where no sleepable kfunc can be called at all.
+pub type SleepShim = fn(u64, u64, u64, u64, u64) -> Pin<Box<dyn Future<Output = u64>>>;
+
+/// How the runtime enters a kfunc.
+///
+/// Two variants rather than one uniform `u64`-returning ABI, because a uniform
+/// one cannot express suspension: a kfunc that awaits has nothing to return
+/// until it resumes. That limitation is why `narf_yield()` used to be an
+/// interpreter intrinsic and why "sleepable" bought yielding and nothing else
+/// — no kfunc could actually sleep.
+#[derive(Copy, Clone, Debug)]
+pub enum KfuncShim {
+    /// Callable from either context.
+    Sync(SyncShim),
+    /// Callable only from [`Context::Sleepable`]. The verifier rejects a call
+    /// from an atomic program, and the interpreter re-checks, because the
+    /// consequence of being wrong is sleeping with IRQs masked.
+    Sleepable(SleepShim),
+}
+
+impl KfuncShim {
+    /// Address of the entry point, for the verifier's descriptor and for the
+    /// JIT's call sequence.
+    #[inline]
+    #[must_use]
+    pub fn addr(self) -> usize {
+        match self {
+            KfuncShim::Sync(f) => f as usize,
+            KfuncShim::Sleepable(f) => f as usize,
+        }
+    }
+
+    /// Whether this shim may suspend.
+    #[inline]
+    #[must_use]
+    pub const fn is_sleepable(self) -> bool {
+        matches!(self, KfuncShim::Sleepable(_))
+    }
+
+    /// The weakest context this shim may be entered from.
+    ///
+    /// Derived from the shim kind rather than declared alongside it, so an
+    /// `async` kfunc cannot claim to be atomic.
+    #[inline]
+    #[must_use]
+    pub const fn required_context(self) -> Context {
+        match self {
+            KfuncShim::Sync(_) => Context::Atomic,
+            KfuncShim::Sleepable(_) => Context::Sleepable,
+        }
+    }
+}
 
 /// One entry in the `narf.kfuncs` link section.
 #[derive(Copy, Clone, Debug)]
@@ -81,6 +143,23 @@ impl KfuncEntry {
         fnv1a32_nonzero(self.name) as i32
     }
 
+    /// The context this kfunc must be called from.
+    ///
+    /// The stricter of what was declared and what the shim kind requires, so
+    /// an `async` kfunc cannot be reached from an atomic program even if its
+    /// declaration said otherwise. `kfunc!` derives the declaration from the
+    /// syntax, so the two agree by construction — this is the belt to that
+    /// brace, and it is what `validate_entry` checks.
+    #[inline]
+    #[must_use]
+    pub fn effective_context(&self) -> Context {
+        if self.shim.is_sleepable() {
+            Context::Sleepable
+        } else {
+            self.context
+        }
+    }
+
     /// The verifier's view of this kfunc.
     #[must_use]
     pub fn desc(&self) -> KfuncDesc {
@@ -91,10 +170,10 @@ impl KfuncEntry {
             // every kfunc call fail to resolve — fail-closed, but silently.
             id: self.id(),
             name: self.name,
-            addr: self.shim as usize,
+            addr: self.shim.addr(),
             args: self.args,
             ret: self.ret,
-            context: self.context,
+            context: self.effective_context(),
         }
     }
 }
@@ -308,8 +387,112 @@ pub unsafe fn __arg<T: BpfType>(raw: &[u64; MAX_KFUNC_ARGS], i: usize) -> T {
 ///
 /// The return type is mandatory; write `-> ()` for a kfunc that returns
 /// nothing.
+/// The signature assertions shared by both `kfunc!` rules.
+///
+/// Factored out so the sleepable and synchronous forms cannot drift: an
+/// assertion added to one and not the other would mean an `async` kfunc could
+/// declare a type the verifier has no model for.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! kfunc_assert_signature {
+    ($name:ident, $ret:ty, $($pname:ident : $pty:ty),*) => {
+        $(
+            assert!(
+                <$pty as $crate::types::BpfType>::LEGAL_IN_ARG,
+                concat!(
+                    "kfunc `", stringify!($name), "`: parameter `",
+                    stringify!($pname), "` has a type that is not legal in \
+                     argument position"
+                ),
+            );
+        )*
+        assert!(
+            <$ret as $crate::types::BpfType>::LEGAL_IN_RET,
+            concat!(
+                "kfunc `", stringify!($name),
+                "`: return type is not legal in return position"
+            ),
+        );
+        assert!(
+            $crate::kfunc::args_well_formed(
+                &[$(<$pty as $crate::types::BpfType>::DESC),*]
+            ),
+            concat!(
+                "kfunc `", stringify!($name),
+                "`: malformed argument list (more than 5 arguments, a void \
+                 argument, or a sized region not followed by a scalar length)"
+            ),
+        );
+    };
+}
+
 #[macro_export]
 macro_rules! kfunc {
+    // ── sleepable: `async fn` ───────────────────────────────────────
+    //
+    // The `async` keyword *is* the declaration. There is no
+    // `#[context(Sleepable)]` to write and none to forget, and no way to
+    // declare an awaiting kfunc as atomic — which is the mistake a separate
+    // attribute would eventually let someone make.
+    ($(
+        $(#[doc = $doc:literal])*
+        $vis:vis async fn $name:ident ( $($pname:ident : $pty:ty),* $(,)? ) -> $ret:ty $body:block
+    )*) => {$(
+        $(#[doc = $doc])*
+        $vis async fn $name ( $($pname : $pty),* ) -> $ret $body
+
+        const _: () = {
+            $crate::kfunc_assert_signature!($name, $ret, $($pname : $pty),*);
+
+            const ARGS: &[$crate::reexport::ArgDesc] =
+                &[$(<$pty as $crate::types::BpfType>::DESC),*];
+
+            /// Boxes the future so it has a nameable type. The allocation is
+            /// only ever on a sleepable path — see [`KfuncShim::Sleepable`].
+            fn __shim(
+                a0: u64,
+                a1: u64,
+                a2: u64,
+                a3: u64,
+                a4: u64,
+            ) -> ::core::pin::Pin<alloc::boxed::Box<dyn ::core::future::Future<Output = u64>>> {
+                alloc::boxed::Box::pin(async move {
+                    let __raw = [a0, a1, a2, a3, a4];
+                    #[allow(unused_mut)]
+                    let mut __i = 0usize;
+                    $(
+                        let $pname: $pty = {
+                            // SAFETY: as the sync shim — the verifier proved
+                            // every register satisfies its `ArgDesc`.
+                            let __v = unsafe { $crate::kfunc::__arg::<$pty>(&__raw, __i) };
+                            __i += 1;
+                            __v
+                        };
+                    )*
+                    let _ = (&__raw, __i);
+                    $crate::types::BpfType::into_raw($name($($pname),*).await)
+                })
+            }
+
+            #[used]
+            #[link_section = "narf.kfuncs"]
+            static ENTRY: $crate::kfunc::KfuncEntry = $crate::kfunc::KfuncEntry {
+                name: stringify!($name),
+                shim: $crate::kfunc::KfuncShim::Sleepable(__shim),
+                args: ARGS,
+                ret: <$ret as $crate::types::BpfType>::DESC,
+                // Not `$ctx`: an `async fn` is sleepable, full stop.
+                context: $crate::reexport::Context::Sleepable,
+            };
+        };
+    )*};
+
+    // ── synchronous: plain `fn` ─────────────────────────────────────
+    //
+    // Keeps an explicit `#[context(...)]`, because a *non*-awaiting kfunc can
+    // still be one that must not run in atomic context — one that takes a lock
+    // a probe handler might already hold, say. That is a real category and only
+    // the author knows it.
     ($(
         $(#[doc = $doc:literal])*
         #[context($ctx:ident)]
@@ -319,34 +502,7 @@ macro_rules! kfunc {
         $vis fn $name ( $($pname : $pty),* ) -> $ret $body
 
         const _: () = {
-            // The signature assertions. Each is a plain `const` assert, so a
-            // bad kfunc fails to build rather than failing to verify.
-            $(
-                assert!(
-                    <$pty as $crate::types::BpfType>::LEGAL_IN_ARG,
-                    concat!(
-                        "kfunc `", stringify!($name), "`: parameter `",
-                        stringify!($pname), "` has a type that is not legal in \
-                         argument position"
-                    ),
-                );
-            )*
-            assert!(
-                <$ret as $crate::types::BpfType>::LEGAL_IN_RET,
-                concat!(
-                    "kfunc `", stringify!($name),
-                    "`: return type is not legal in return position"
-                ),
-            );
-            assert!(
-                $crate::kfunc::args_well_formed(ARGS),
-                concat!(
-                    "kfunc `", stringify!($name),
-                    "`: malformed argument list (more than 5 arguments, a \
-                     void argument, or a sized region not followed by a \
-                     scalar length)"
-                ),
-            );
+            $crate::kfunc_assert_signature!($name, $ret, $($pname : $pty),*);
 
             const ARGS: &[$crate::reexport::ArgDesc] =
                 &[$(<$pty as $crate::types::BpfType>::DESC),*];
@@ -376,7 +532,7 @@ macro_rules! kfunc {
             #[link_section = "narf.kfuncs"]
             static ENTRY: $crate::kfunc::KfuncEntry = $crate::kfunc::KfuncEntry {
                 name: stringify!($name),
-                shim: __shim,
+                shim: $crate::kfunc::KfuncShim::Sync(__shim),
                 args: ARGS,
                 ret: <$ret as $crate::types::BpfType>::DESC,
                 context: $crate::reexport::Context::$ctx,
