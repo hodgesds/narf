@@ -23,15 +23,37 @@
 //!
 //! ## The address model
 //!
-//! The interpreter never dereferences a program-supplied address. Every
-//! pointer a program can hold names a byte offset into one of a small set of
-//! synthetic regions, and every load and store is bounds-checked against
-//! them. A program that escapes its regions gets [`Trap::BadAccess`] and is
-//! terminated; it cannot reach kernel memory even if the verifier is wrong,
-//! which matters while the abstract interpreter is still Phase 2. The JIT
-//! trades these checks for the extable and the arena guard slots — that is
-//! the same bargain Linux strikes at `verifier.c:16186`, and it is only sound
-//! once the verifier is real.
+//! Every pointer a program can hold names a byte offset into a region the
+//! runtime supplied, and every load and store is bounds-checked against it. A
+//! program that escapes its regions is terminated rather than faulting. There
+//! are two kinds of region and they differ in one important way.
+//!
+//! **Stack and context** are *synthetic*: [`STACK_REGION`] and [`CTX_REGION`]
+//! are fabricated bases that exist only inside the VM, so the address a program
+//! computes is not an address at all and cannot be dereferenced even by mistake.
+//! An escape gets [`Trap::BadAccess`].
+//!
+//! **Arenas are not synthetic**, and this is the one place the interpreter turns
+//! a program-supplied value into a real kernel address. It has to: an arena
+//! pointer is a slot-relative handle, a program stores handles *inside* the
+//! arena, and userspace walks those handles through its own mapping — so biasing
+//! them by a fabricated base would make every stored pointer meaningless outside
+//! this interpreter, and would make the interpreter and the JIT disagree about
+//! the bytes in shared memory. What replaces the fabricated base is a bound:
+//! [`crate::arena::resolve_in`] admits a handle only if it lies entirely inside
+//! one of *the running program's own* arenas, all of which are fully populated,
+//! and traps [`Trap::ArenaOutOfBounds`] otherwise. So the reachable set is
+//! exactly this program's arena bytes — never kernel memory, never another
+//! program's arena — but it is reached by a real dereference and not by an index
+//! into a slice. A program with no arena bound reaches nothing this way and gets
+//! [`Trap::BadAccess`] as before.
+//!
+//! That bound is a *runtime* check, so it holds even if the verifier is wrong,
+//! which is what matters while the abstract interpreter is still being trusted.
+//! The JIT trades these checks for the extable and the arena guard slots — that
+//! is the same bargain Linux strikes at `verifier.c:16186`, and it is only sound
+//! once the verifier is real. `crate::jit_glue` gate 2 still refuses arena
+//! programs for that reason.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -127,6 +149,27 @@ pub enum Trap {
     WroteFramePointer { at: u32 },
     /// The stack region could not accommodate another frame.
     StackExhausted { at: u32 },
+    /// An arena access whose handle does not lie entirely inside one of the
+    /// running program's arenas.
+    ///
+    /// Distinct from [`Trap::BadAccess`] only in *which program* got it: this
+    /// one is what a program that has at least one arena gets for any address
+    /// that is neither stack nor context, and [`Trap::BadAccess`] is what a
+    /// program with no arena gets for the same value. So it covers walking off
+    /// the end of an arena, into the slot's null guard, and into a gap between
+    /// two arenas — but it also covers a wild value that was never a handle,
+    /// because once a program has an arena the runtime has no way to tell those
+    /// apart. Carries the handle so the offending value is visible instead of
+    /// inferred, which is the part that makes it diagnosable.
+    ArenaOutOfBounds { at: u32, handle: u64, len: usize },
+    /// An atomic read-modify-write on a misaligned arena address.
+    ///
+    /// Arena memory is shared with userspace, so an arena atomic has to be a
+    /// real atomic instruction, and a real atomic instruction needs its operand
+    /// naturally aligned. Refused rather than emulated: emulating it would make
+    /// the operation non-atomic with respect to the other side of the mapping,
+    /// which is the one property the program asked for.
+    ArenaUnaligned { at: u32, handle: u64, len: usize },
 }
 
 /// How a program run ended.
@@ -265,6 +308,16 @@ pub struct Vm<'a> {
     current_sp: usize,
     registry: &'static Registry,
     context: Context,
+    /// The arenas this program may address, in slot placement order.
+    ///
+    /// Empty for a program with no arena, which is what makes an arena-shaped
+    /// address unreachable for it rather than merely out of bounds.
+    ///
+    /// Not part of [`VmProgram`] even though it is program-derived: `VmProgram`
+    /// is constructed by struct literal in `crate::bench`, so growing it would
+    /// break a file this change has no business editing. [`Vm::with_arenas`] is
+    /// the seam instead.
+    arenas: &'a [alloc::sync::Arc<crate::arena::ProgArena>],
     /// Instructions retired, for diagnostics.
     steps: u64,
 }
@@ -315,8 +368,21 @@ impl<'a> Vm<'a> {
             current_sp: 0,
             registry,
             context,
+            arenas: &[],
             steps: 0,
         }
+    }
+
+    /// Bind the arenas this program may address.
+    ///
+    /// Without this a program's arena handles resolve to nothing and its first
+    /// arena access is [`Trap::BadAccess`] — fail-closed, which is why this is a
+    /// builder step rather than a mandatory argument: forgetting it costs a
+    /// program its run, not its containment.
+    #[must_use]
+    pub fn with_arenas(mut self, arenas: &'a [alloc::sync::Arc<crate::arena::ProgArena>]) -> Self {
+        self.arenas = arenas;
+        self
     }
 
     /// Fuel remaining.
@@ -351,6 +417,34 @@ impl<'a> Vm<'a> {
         Some((off, off + len))
     }
 
+    /// Resolve an arena handle to a real kernel address, or trap.
+    ///
+    /// `None` from [`crate::arena::resolve_in`] covers every way out of an arena:
+    /// past the end, into the slot's null guard, into a gap between two arenas,
+    /// or a handle belonging to no arena at all.
+    #[inline]
+    fn arena_kva(&self, at: u32, handle: u64, len: usize) -> Result<u64, Trap> {
+        crate::arena::resolve_in(self.arenas, handle, len).ok_or(Trap::ArenaOutOfBounds {
+            at,
+            handle,
+            len,
+        })
+    }
+
+    /// Whether an address that matched no synthetic region may be treated as an
+    /// arena handle at all.
+    ///
+    /// Only when the program has an arena. A program with none must keep getting
+    /// [`Trap::BadAccess`] for a wild address: "you walked out of your arena" is
+    /// a different diagnosis from "that was never a pointer", and reporting the
+    /// former for a program that has no arena would be a lie. It says nothing
+    /// about whether any *particular* address is in range — that is
+    /// [`Vm::arena_kva`]'s job, and it is the only bound there is.
+    #[inline]
+    fn has_arena(&self) -> bool {
+        !self.arenas.is_empty()
+    }
+
     fn load(&mut self, at: u32, addr: u64, size: Size, signed: bool) -> Result<u64, Trap> {
         let len = size_bytes(size);
         if let Some((lo, hi)) = self.stack_range(addr, len) {
@@ -378,17 +472,44 @@ impl<'a> Vm<'a> {
                 return Ok(widen(raw, size, signed));
             }
         }
+        // Neither region matched, so the only remaining meaning of the value is
+        // an arena handle. See the module docs on why this one is a real
+        // dereference and what bounds it.
+        if self.has_arena() {
+            let kva = self.arena_kva(at, addr, len)?;
+            let mut buf = [0u8; 8];
+            // SAFETY: `arena_kva` proved `[kva, kva + len)` lies inside a
+            // populated page range of one of this program's arenas, which is
+            // mapped RW in the kernel root for the arena's whole life. Byte-wise
+            // rather than a typed read because BPF permits unaligned access and
+            // `read_volatile` does not.
+            unsafe {
+                core::ptr::copy_nonoverlapping(kva as *const u8, buf.as_mut_ptr(), len);
+            }
+            return Ok(widen(u64::from_le_bytes(buf), size, signed));
+        }
         Err(Trap::BadAccess { at, addr, len })
     }
 
     fn store(&mut self, at: u32, addr: u64, size: Size, value: u64) -> Result<(), Trap> {
         let len = size_bytes(size);
-        let (lo, hi) = self
-            .stack_range(addr, len)
-            .ok_or(Trap::BadAccess { at, addr, len })?;
         let bytes = value.to_le_bytes();
-        self.stack.bytes_mut()[lo..hi].copy_from_slice(&bytes[..len]);
-        Ok(())
+        if let Some((lo, hi)) = self.stack_range(addr, len) {
+            self.stack.bytes_mut()[lo..hi].copy_from_slice(&bytes[..len]);
+            return Ok(());
+        }
+        // The context region is deliberately not tried here: it is read-only, so
+        // a store into it must be rejected rather than silently aliasing.
+        if self.has_arena() {
+            let kva = self.arena_kva(at, addr, len)?;
+            // SAFETY: as in `load` — `arena_kva` bounded the range to a mapped,
+            // populated, writable arena page belonging to this program.
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), kva as *mut u8, len);
+            }
+            return Ok(());
+        }
+        Err(Trap::BadAccess { at, addr, len })
     }
 
     // ── execution ───────────────────────────────────────────────────
@@ -540,11 +661,37 @@ impl<'a> Vm<'a> {
                     self.set_reg(at, dst, v)?;
                     pc = next;
                 }
-                Decoded::AddrSpaceCast { .. } => {
-                    return Err(Trap::Unsupported {
-                        at,
-                        what: "address-space cast (arenas are Phase 3)",
-                    })
+                Decoded::AddrSpaceCast {
+                    dst,
+                    src,
+                    dst_as,
+                    src_as,
+                } => {
+                    // NARF needs no truncation sequence here, and that answers
+                    // half of spec §8.1. Linux's `cast_kern`/`cast_user` exist
+                    // because its in-program arena pointer is the low 32 bits of
+                    // a *user* address, so moving between address spaces means
+                    // adding or stripping the top half. A base-relative handle
+                    // has the same value in both spaces — the base is supplied by
+                    // the addressing mode, not by the pointer — so both casts are
+                    // the identity, and the verifier models exactly that (it
+                    // keeps `PtrClass::Arena` and loses the offset's precision,
+                    // which is why a cast pointer usually needs re-bounding
+                    // before it can be dereferenced).
+                    //
+                    // The pair is still checked: address space 1 is the arena, 0
+                    // the kernel, and anything else is an encoding NARF has no
+                    // meaning for. The verifier rejects it too; this is the
+                    // runtime saying the same thing rather than trusting it.
+                    if !matches!((dst_as, src_as), (0, 1) | (1, 0)) {
+                        return Err(Trap::Unsupported {
+                            at,
+                            what: "address-space cast outside the arena pair",
+                        });
+                    }
+                    let v = self.reg(src);
+                    self.set_reg(at, dst, v)?;
+                    pc = next;
                 }
                 Decoded::Load {
                     size,
@@ -806,13 +953,21 @@ impl<'a> Vm<'a> {
         op: AtomicOp,
         src: Reg,
     ) -> Result<(), Trap> {
-        // Single-threaded with respect to the program: the interpreter holds
-        // the only reference to this stack frame, so a read-modify-write is
-        // atomic by construction. Real atomicity — and real memory ordering
-        // for `LoadAcquire`/`StoreRelease` — arrives with shared maps and
-        // arenas in Phase 3. This is a faithful *semantic* model and is
-        // marked so nobody mistakes it for an ordering implementation.
         let wide = size == Size::Dw;
+        // Arena memory is shared: the same frames are mapped into userspace and
+        // may be reached from another CPU. A read-modify-write there has to be a
+        // real atomic instruction, so it takes a separate path.
+        //
+        // The stack is different and stays where it was: the interpreter holds
+        // the only reference to this frame, so a read-modify-write on it is
+        // atomic by construction and the sequence below is a faithful *semantic*
+        // model rather than an ordering implementation. That was the whole story
+        // before arenas existed, which is why this comment used to say ordering
+        // "arrives with shared maps and arenas in Phase 3" — for arenas it has,
+        // just above.
+        if self.has_arena() && self.stack_range(addr, size_bytes(size)).is_none() {
+            return self.atomic_arena(at, addr, size, op, src);
+        }
         let cur = self.load(at, addr, size, false)?;
         let operand = self.reg(src);
         let (new, fetched, writes_src) = match op {
@@ -836,6 +991,129 @@ impl<'a> Vm<'a> {
             }
         };
         self.store(at, addr, size, new)?;
+        if writes_src {
+            self.set_reg(at, src, mask(fetched, wide))?;
+        }
+        Ok(())
+    }
+
+    /// A read-modify-write on arena memory, with real atomicity.
+    ///
+    /// Each BPF atomic maps onto one hardware primitive rather than onto a
+    /// load-compute-store sequence, because the other side of the mapping is
+    /// userspace and a sequence would give it a window to observe or clobber.
+    ///
+    /// Orderings mirror Linux's: the non-fetching forms are `atomic_add()` and
+    /// friends, which carry no ordering, and the fetching forms are
+    /// `atomic_fetch_add()` and friends, which Linux documents as fully ordered.
+    /// `LoadAcquire`/`StoreRelease` say what they mean.
+    fn atomic_arena(
+        &mut self,
+        at: u32,
+        handle: u64,
+        size: Size,
+        op: AtomicOp,
+        src: Reg,
+    ) -> Result<(), Trap> {
+        use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+        let len = size_bytes(size);
+        // BPF has no byte or halfword atomic — Linux's verifier rejects those
+        // widths too — so there is nothing to lower rather than something to
+        // emulate.
+        if size != Size::W && size != Size::Dw {
+            return Err(Trap::Unsupported {
+                at,
+                what: "atomic narrower than a word",
+            });
+        }
+        let kva = self.arena_kva(at, handle, len)?;
+        if kva % len as u64 != 0 {
+            return Err(Trap::ArenaUnaligned { at, handle, len });
+        }
+        let wide = size == Size::Dw;
+        let operand = self.reg(src);
+        let expected = mask(self.regs[0], wide);
+
+        // Fetching forms are fully ordered, non-fetching ones carry no ordering —
+        // Linux's `atomic_fetch_add()` versus `atomic_add()`.
+        let ord = |fetch: bool| {
+            if fetch {
+                Ordering::AcqRel
+            } else {
+                Ordering::Relaxed
+            }
+        };
+        //
+        // The two references below are *deliberately* not exclusive: the same
+        // frames are mapped SHARED into userspace, which is the whole purpose of
+        // an arena. That is why every access through them is an atomic operation
+        // and none is a plain load or store. A concurrent *non*-atomic access
+        // from the other side of the mapping is a race this cannot prevent and
+        // does not claim to — the same is true of every `mmap_frames` mapping in
+        // the tree, `/dev/fb0` included.
+        let (fetched, writes_src) = if wide {
+            // SAFETY: `arena_kva` proved `[kva, kva + 8)` lies inside a
+            // populated, RW-mapped page of one of this program's arenas, and the
+            // alignment check above makes `kva` a valid `AtomicU64` address. See
+            // the note above on why shared access is intended.
+            let a = unsafe { &*(kva as *const AtomicU64) };
+            match op {
+                AtomicOp::Add { fetch } => (a.fetch_add(operand, ord(fetch)), fetch),
+                AtomicOp::Or { fetch } => (a.fetch_or(operand, ord(fetch)), fetch),
+                AtomicOp::And { fetch } => (a.fetch_and(operand, ord(fetch)), fetch),
+                AtomicOp::Xor { fetch } => (a.fetch_xor(operand, ord(fetch)), fetch),
+                AtomicOp::Xchg => (a.swap(operand, Ordering::AcqRel), true),
+                AtomicOp::LoadAcquire => (a.load(Ordering::Acquire), true),
+                AtomicOp::StoreRelease => {
+                    a.store(operand, Ordering::Release);
+                    (0, false)
+                }
+                AtomicOp::Cmpxchg => {
+                    // One instruction, not a loop: the program asked to swap
+                    // exactly once and to be told what was there.
+                    let prev = match a.compare_exchange(
+                        expected,
+                        operand,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(v) | Err(v) => v,
+                    };
+                    self.regs[0] = prev;
+                    (prev, false)
+                }
+            }
+        } else {
+            // SAFETY: as the `AtomicU64` arm — bounded by `arena_kva`, 4-byte
+            // aligned by the check above, and shared on purpose.
+            let a = unsafe { &*(kva as *const AtomicU32) };
+            let operand32 = operand as u32;
+            match op {
+                AtomicOp::Add { fetch } => (u64::from(a.fetch_add(operand32, ord(fetch))), fetch),
+                AtomicOp::Or { fetch } => (u64::from(a.fetch_or(operand32, ord(fetch))), fetch),
+                AtomicOp::And { fetch } => (u64::from(a.fetch_and(operand32, ord(fetch))), fetch),
+                AtomicOp::Xor { fetch } => (u64::from(a.fetch_xor(operand32, ord(fetch))), fetch),
+                AtomicOp::Xchg => (u64::from(a.swap(operand32, Ordering::AcqRel)), true),
+                AtomicOp::LoadAcquire => (u64::from(a.load(Ordering::Acquire)), true),
+                AtomicOp::StoreRelease => {
+                    a.store(operand32, Ordering::Release);
+                    (0, false)
+                }
+                AtomicOp::Cmpxchg => {
+                    let prev = match a.compare_exchange(
+                        expected as u32,
+                        operand32,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(v) | Err(v) => v,
+                    };
+                    self.regs[0] = u64::from(prev);
+                    (u64::from(prev), false)
+                }
+            }
+        };
         if writes_src {
             self.set_reg(at, src, mask(fetched, wide))?;
         }

@@ -29,6 +29,7 @@
 
 extern crate alloc;
 
+pub mod arena;
 pub mod attach;
 pub mod attach_xdp;
 #[cfg(feature = "bench")]

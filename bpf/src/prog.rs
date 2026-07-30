@@ -102,6 +102,16 @@ pub struct BpfProg {
     /// [`crate::jit_glue`]. `None` means it runs interpreted, which is a
     /// complete implementation and not a degraded one.
     jit: Option<crate::jit_glue::JitImage>,
+    /// The arenas this program may address, if any.
+    ///
+    /// Held as an `Arc` because the same arenas are reachable through an
+    /// [`crate::arena::ArenaFile`] fd that userspace mapped, and the frames must
+    /// outlive whichever of the two goes away first.
+    ///
+    /// Bound at load time and never after: the interpreter reads this slice on
+    /// the run path with no lock, which is only sound because it cannot change
+    /// under it.
+    arenas: Option<Arc<crate::arena::ArenaGroup>>,
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -126,6 +136,35 @@ impl BpfProg {
     ///
     /// See [`LoadError`].
     pub fn load(cap: &Cap<BpfProgLoad, Grant>, req: LoadRequest) -> Result<Arc<Self>, LoadError> {
+        Self::load_with_arena(cap, req, None)
+    }
+
+    /// Verify and load, binding an arena group the program may address.
+    ///
+    /// A separate entry point rather than a field on [`LoadRequest`]: that struct
+    /// is built by literal in `narf-userspace`'s `bpf(2)` handler and in
+    /// `crate::bench`, so a new field would be a breaking change across crates
+    /// for the benefit of one caller.
+    ///
+    /// The group is *not* something the verifier is told about, and that is worth
+    /// stating precisely. `narf-bpf-verifier` bounds an arena displacement
+    /// against a fixed `ARENA_WINDOW_BYTES`, not against this group's extent, so
+    /// it will accept a program that walks past the end of its own arenas. What
+    /// makes that safe is the runtime: the interpreter resolves every handle
+    /// against exactly this slice and traps
+    /// [`crate::interp::Trap::ArenaOutOfBounds`] otherwise, and the slot's tail
+    /// guard means even an unchecked access could not reach another program's
+    /// arenas. It is also why `crate::jit_glue` still refuses arena programs —
+    /// native code performs neither check.
+    ///
+    /// # Errors
+    ///
+    /// See [`LoadError`].
+    pub fn load_with_arena(
+        cap: &Cap<BpfProgLoad, Grant>,
+        req: LoadRequest,
+        arenas: Option<Arc<crate::arena::ArenaGroup>>,
+    ) -> Result<Arc<Self>, LoadError> {
         cap.check_live()?;
         if req.insns.is_empty() || req.insns.len() > MAX_INSNS {
             return Err(LoadError::BadSize(req.insns.len()));
@@ -186,10 +225,18 @@ impl BpfProg {
             stack_bytes,
             subprogs,
             jit,
+            arenas,
             runs: AtomicU64::new(0),
             accumulated: AtomicU64::new(0),
             traps: AtomicU64::new(0),
         }))
+    }
+
+    /// The arenas this program may address. Empty when it has none.
+    #[inline]
+    #[must_use]
+    pub fn arenas(&self) -> &[Arc<crate::arena::ProgArena>] {
+        self.arenas.as_ref().map_or(&[], |g| g.arenas())
     }
 
     /// The context this program was verified for.
@@ -248,7 +295,13 @@ impl BpfProg {
     /// counter, so depth N+1 loses its invocation rather than corrupting the
     /// frame below it.
     pub fn run_atomic(&self, ctx: [u64; MAX_CTX_WORDS], ctx_len: usize) -> Option<Outcome> {
-        if self.jit.is_some() {
+        // The arena test is the belt to `jit_glue`'s gate-2 brace. That gate
+        // already means `jit` is `None` for any program the verifier saw touch an
+        // arena, so this can only fire if the two ever disagree — and the failure
+        // mode if they do is native code dereferencing a handle with no bound
+        // whatsoever, which is worth one comparison per invocation to make
+        // structurally impossible rather than merely currently true.
+        if self.jit.is_some() && self.arenas().is_empty() {
             return self.run_atomic_native(ctx, ctx_len);
         }
         self.run_atomic_interpreted(ctx, ctx_len)
@@ -299,7 +352,8 @@ impl BpfProg {
             MAX_CTX_WORDS,
             frame,
             registry,
-        );
+        )
+        .with_arenas(self.arenas());
         // An atomic program cannot reach an await point, so the future
         // completes on its first poll and `drive` never spins.
         let outcome = crate::interp::drive(vm.run());
@@ -406,7 +460,8 @@ impl BpfProg {
             ctx_len,
             frame,
             registry,
-        );
+        )
+        .with_arenas(self.arenas());
         let outcome = vm.run().await;
         self.record(outcome);
         Some(outcome)
