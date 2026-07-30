@@ -23,6 +23,7 @@ members = [
     "bpf",
     "bpf/isa",
     "bpf/verifier",
+    "bpf/jit",
     "frame",
     "rcu",
     "bus",

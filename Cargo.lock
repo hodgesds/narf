@@ -665,6 +665,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-bpf-jit"
+version = "0.0.0"
+dependencies = [
+ "narf-bpf-isa",
+ "narf-bpf-verifier",
+ "narf-kernel-test",
+]
+
+[[package]]
 name = "narf-bpf-verifier"
 version = "0.0.0"
 dependencies = [

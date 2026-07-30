@@ -7338,6 +7338,8 @@ fn host_test_cmd() -> Result<()> {
                 "narf-bpf-isa",
                 "-p",
                 "narf-bpf-verifier",
+                "-p",
+                "narf-bpf-jit",
             ],
         ),
         (
