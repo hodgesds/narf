@@ -37,9 +37,7 @@ use alloc::vec::Vec;
 use narf_bpf_isa::{decode, AluOp, CondOp, Decoded, Reg, Size, Source};
 use narf_bpf_verifier::VerifiedProgram;
 
-use crate::{
-    is_imm8_branch, Compiled, FaultEntry, FaultTable, JitError, EXIT_OUT_OF_FUEL, MAX_SIZING_PASSES,
-};
+use crate::{Compiled, FaultEntry, FaultTable, JitError};
 
 /// Host register numbers, in ModRM/REX encoding order.
 mod hr {
@@ -296,47 +294,45 @@ struct Reloc {
     next: u32,
     /// Target BPF instruction index.
     target: u32,
-    /// Displacement width in bytes: 1 or 4.
+    /// Displacement width in bytes. Always 4 — see `compile`.
     width: u8,
 }
 
 /// Compile a verified program.
+///
+/// A single pass. There is no sizing fixpoint, because every branch this
+/// backend emits is `rel32`: nothing shrinks, so nothing needs re-measuring.
+///
+/// An earlier version ran a convergence loop with a 123-byte short-branch cap
+/// copied from `arch/x86/net/bpf_jit_comp.c:70-113`, and the module documented
+/// the oscillation bug that cap defends against. That was theatre — the
+/// emitter never selected a short encoding, so the loop compared identical
+/// lengths, `is_imm8_branch` was never called outside its own test, and the
+/// `width == 1` patch arm was unreachable. It has been removed rather than
+/// left to imply a mechanism that does not exist.
+///
+/// If `rel8` selection is ever added, the loop comes back **with** the cap and
+/// with a real convergence argument — the Linux post-mortem is a genuine
+/// hazard, just not one this code was exposed to.
 pub fn compile(prog: &VerifiedProgram) -> Result<Compiled, JitError> {
-    // Sizing loop. Each pass computes every BPF instruction's native offset
-    // from the previous pass's sizes; the image shrinks monotonically as
-    // branches take shorter encodings, so it reaches a fixpoint. `is_imm8_branch`'s
-    // 123-byte cap is what stops that from oscillating — see its docs.
-    let mut offsets: Vec<u32> = (0..=prog.insns.len() as u32).map(|i| i * 16).collect();
-    let mut last_len = u32::MAX;
-    for _ in 0..MAX_SIZING_PASSES {
-        let e = emit_pass(prog, &offsets)?;
-        let len = e.0.len();
-        offsets = e.1;
-        if len == last_len {
-            // Converged: emit once more so the buffer matches the offsets
-            // exactly, then hand it over.
-            let (e, _) = emit_pass(prog, &offsets)?;
-            return Ok(Compiled {
-                code: e.buf,
-                faults: {
-                    let mut f = e.faults;
-                    f.sort_unstable_by_key(|x| x.fault_off);
-                    FaultTable(f)
-                },
-                entry_off: 0,
-            });
-        }
-        last_len = len;
-    }
-    Err(JitError::SizingDiverged)
+    let (e, _) = emit_pass(prog)?;
+    Ok(Compiled {
+        code: e.buf,
+        faults: {
+            let mut f = e.faults;
+            f.sort_unstable_by_key(|x| x.fault_off);
+            FaultTable(f)
+        },
+        entry_off: 0,
+    })
 }
 
 /// One sizing/emission pass. Returns the emitter and the offset table this
 /// pass produced.
-fn emit_pass(prog: &VerifiedProgram, offsets: &[u32]) -> Result<(Emit, Vec<u32>), JitError> {
+fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
     let mut e = Emit::default();
     let mut relocs: Vec<Reloc> = Vec::new();
-    let mut out = Vec::with_capacity(offsets.len());
+    let mut out = Vec::with_capacity(prog.insns.len() + 1);
 
     emit_prologue(&mut e, prog);
 
@@ -347,8 +343,14 @@ fn emit_pass(prog: &VerifiedProgram, offsets: &[u32]) -> Result<(Emit, Vec<u32>)
             decode(&prog.insns, i).map_err(|_| JitError::Decode { at: i as u32 })?;
         emit_insn(&mut e, &insn, i as u32, &mut relocs)?;
         i += width;
-        // A wide instruction occupies two slots; the second has the same
-        // offset as the first so a branch to it lands correctly.
+        // A wide instruction occupies two slots. This records the *following*
+        // instruction's offset for the trailing slot, not the wide
+        // instruction's own — which is fine only because nothing can branch
+        // there: the verifier rejects a jump into an `LD_IMM64`'s second slot,
+        // and `LD_IMM64` is `Unsupported` here anyway so `width` is always 1
+        // today. An earlier comment claimed the two slots shared an offset,
+        // which the loop order does not do. Whichever is wanted must be
+        // decided before LD_IMM64 emission lands.
         for _ in 1..width {
             out.push(e.len());
         }
@@ -389,7 +391,12 @@ fn emit_pass(prog: &VerifiedProgram, offsets: &[u32]) -> Result<(Emit, Vec<u32>)
 /// the runtime passes the frame top, so the same code works on the per-CPU
 /// region and on a sleepable program's heap stack without recompiling.
 fn emit_prologue(e: &mut Emit, _prog: &VerifiedProgram) {
-    for r in [hr::RBX, hr::R13, hr::R14, hr::R15] {
+    // `rbp` first, and it is not optional: R10 maps to rbp, so the body
+    // overwrites it — and rbp is callee-saved in SysV. Omitting it destroyed
+    // the *caller's* frame pointer on every invocation, which then misbehaved
+    // after the program returned cleanly. Worst failure class there is:
+    // executes, corrupts elsewhere, blames someone else.
+    for r in [hr::RBP, hr::RBX, hr::R13, hr::R14, hr::R15] {
         if r >= 8 {
             e.b(0x41);
         }
@@ -402,7 +409,7 @@ fn emit_prologue(e: &mut Emit, _prog: &VerifiedProgram) {
 }
 
 fn emit_epilogue(e: &mut Emit) {
-    for r in [hr::R15, hr::R14, hr::R13, hr::RBX] {
+    for r in [hr::R15, hr::R14, hr::R13, hr::RBX, hr::RBP] {
         if r >= 8 {
             e.b(0x41);
         }
@@ -490,11 +497,9 @@ fn emit_insn(
         }
 
         Decoded::Jump { off } => {
-            // Always the rel32 form. Choosing between rel8 and rel32 here is
-            // what makes the sizing loop interesting; emitting the long form
-            // unconditionally would converge in one pass but cost three bytes
-            // on every branch, so the short form is taken when the *previous*
-            // pass's offsets say it fits.
+            // Always `rel32`. A short form would save three bytes per branch
+            // but requires the sizing fixpoint this backend deliberately does
+            // not have — see `compile`.
             e.b(0xE9);
             let at_disp = e.len();
             e.d32(0);
@@ -582,17 +587,4 @@ fn record_fault(e: &mut Emit, fault_off: u32, dst: Option<u8>, arena: bool) {
         dst_host_reg: dst,
         arena,
     });
-}
-
-/// Kept public for the tests, which assert the constant rather than the
-/// literal so a change to the ABI shows up as one failure.
-#[must_use]
-pub const fn out_of_fuel_value() -> u64 {
-    EXIT_OUT_OF_FUEL
-}
-
-/// Whether a displacement takes the short branch encoding on this pass.
-#[must_use]
-pub const fn short_branch(disp: i64) -> bool {
-    is_imm8_branch(disp)
 }

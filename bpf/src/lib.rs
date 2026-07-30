@@ -31,6 +31,7 @@ extern crate alloc;
 
 pub mod attach;
 pub mod interp;
+pub mod jit_glue;
 pub mod kfunc;
 pub mod kfuncs;
 pub mod mem;
@@ -125,6 +126,14 @@ struct ReclaimOnGracePeriod(Option<narf_memory::bpf_text::TextAlloc>);
 impl Drop for ReclaimOnGracePeriod {
     fn drop(&mut self) {
         if let Some(a) = self.0.take() {
+            // Release the exception-table registration here, not in
+            // `JitImage::drop`: `bpf_extable` requires unregistering only after
+            // the grace period, and the fault handler may still be consulting
+            // it until then. Leaving it registered leaks — and worse than
+            // leaks, since `register_image` rejects overlapping ranges while
+            // `bpf_text` reuses VAs, so a stale entry permanently blocks every
+            // later program that lands on the same address.
+            narf_memory::bpf_extable::unregister_image(a.va);
             narf_memory::bpf_text::reclaim(a);
         }
     }

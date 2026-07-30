@@ -16,25 +16,28 @@
 //! the two together from one call: there is no way to obtain the code without
 //! also obtaining the table it requires.
 //!
-//! ## Two-pass sizing, and why it needs care
+//! ## No sizing fixpoint, and no fuel — read this before enabling anything
 //!
-//! Branch displacements shrink as the image shrinks, so the emitter runs to a
-//! fixpoint and then emits once more into the real buffer. That loop does not
-//! converge for free. `arch/x86/net/bpf_jit_comp.c:70-113` documents a real
-//! oscillation between a 2-byte and a 6-byte `je` paired with a 5-byte and a
-//! 2-byte `jmp`, fixed by capping positive 8-bit jump offsets at 123 rather
-//! than 127. [`is_imm8_branch`] does the same thing for the same reason —
-//! this is the one part of Linux's JIT worth copying behaviour-for-behaviour,
-//! because the bug is invisible until a program of exactly the wrong shape
-//! appears.
+//! Two things this crate does **not** do, both of which an earlier version of
+//! these docs claimed it did:
 //!
-//! ## Fuel
+//! * **There is no sizing fixpoint.** Every branch is `rel32`, so nothing
+//!   shrinks and nothing needs re-measuring. The convergence loop and the
+//!   123-byte short-branch cap borrowed from
+//!   `arch/x86/net/bpf_jit_comp.c:70-113` were removed: the emitter never
+//!   selected a short form, so the machinery guarded a hazard it was not
+//!   exposed to. It comes back with `rel8` selection, if that ever lands.
+//! * **No fuel is emitted.** The verifier deliberately does not prove
+//!   termination — `bpf/verifier/src/lib.rs` says so, and
+//!   `an_unbounded_loop_verifies` is a passing test — so fuel is the *only*
+//!   thing bounding a program's work (spec §4.9). Native code that omits it
+//!   turns `loop: r0 += 1; goto loop` into an unterminated loop on a hook that
+//!   may run with IRQs masked.
 //!
-//! The interpreter burns fuel per instruction. Native code burns it **per
-//! basic block**, decrementing by the block's instruction count on entry:
-//! the same bound at coarser granularity, and one `sub`/`jz` pair instead of
-//! one per instruction. A block that would take the counter below zero exits
-//! with [`EXIT_OUT_OF_FUEL`].
+//!   Until per-block fuel accounting exists, `narf_bpf::jit_glue` refuses any
+//!   program containing a back-edge. That gate is what makes this crate safe to
+//!   use at all, and it lives there rather than here because it is a statement
+//!   about what the emitter lacks.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -50,12 +53,6 @@ pub mod x86_64;
 mod tests;
 
 use narf_bpf_verifier::VerifiedProgram;
-
-/// Return value a program's native code produces when its fuel runs out.
-///
-/// Distinct from any value a program can return itself, so the caller can
-/// report exhaustion as the diagnostic §4.9 requires rather than as a result.
-pub const EXIT_OUT_OF_FUEL: u64 = u64::MAX;
 
 /// One instruction that may fault, and what to do about it.
 ///
@@ -108,33 +105,11 @@ pub enum JitError {
     Unsupported { at: u32, what: &'static str },
     /// A jump or call target outside the program.
     BadTarget { at: u32 },
-    /// The two-pass sizing loop did not reach a fixpoint.
-    ///
-    /// Should be impossible given [`is_imm8_branch`]'s cap; reported rather
-    /// than looped on, because the alternative is a kernel hang at load time
-    /// and this crate has no fuel of its own.
-    SizingDiverged,
     /// The instruction stream could not be decoded. Should be unreachable —
     /// the verifier decoded it already — so it means the image changed
     /// underneath us.
     Decode { at: u32 },
 }
-
-/// Whether a branch displacement fits the short form.
-///
-/// **Capped at 123, not 127.** The five bytes of headroom stop the sizing
-/// fixpoint oscillating: at exactly 127 a displacement can flip between the
-/// short and long encodings on alternate passes, each choice making the other
-/// correct. `arch/x86/net/bpf_jit_comp.c:70-113` carries the post-mortem of
-/// exactly this bug, and the fix is this constant.
-#[inline]
-#[must_use]
-pub const fn is_imm8_branch(disp: i64) -> bool {
-    disp <= 123 && disp >= -128
-}
-
-/// Maximum sizing passes before declaring divergence.
-pub const MAX_SIZING_PASSES: usize = 20;
 
 /// Compile a verified program for the host architecture.
 ///

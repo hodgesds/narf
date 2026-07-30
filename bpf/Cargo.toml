@@ -28,6 +28,7 @@ kernel-test = ["dep:narf-kernel-test"]
 [dependencies]
 narf-bpf-isa      = { path = "isa" }
 narf-bpf-verifier = { path = "verifier" }
+narf-bpf-jit      = { path = "jit" }
 narf-lib          = { path = "../lib" }
 narf-memory       = { path = "../memory" }
 narf-rcu          = { path = "../rcu" }

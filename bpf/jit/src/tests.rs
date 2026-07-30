@@ -9,7 +9,7 @@ use narf_bpf_isa::encode::encode;
 use narf_bpf_isa::{AluOp, CondOp, Decoded, Insn, Reg, Size, Source};
 use narf_bpf_verifier::{Context, VerifiedProgram};
 
-use crate::{compile, is_imm8_branch, JitError, MAX_SIZING_PASSES};
+use crate::{compile, JitError};
 
 fn r(n: u8) -> Reg {
     Reg::new(n).expect("register in range")
@@ -125,8 +125,15 @@ fn reports_unsupported_rather_than_emitting_wrong_code() {
 
 /// The prologue, hand-derived from the Intel SDM.
 ///
-/// `push rbx; push r13; push r14; push r15; mov rbp, rdi; mov rdi, rsi`
+/// `push rbp; push rbx; push r13; push r14; push r15; mov rbp, rdi; mov rdi, rsi`
+///
+/// `push rbp` is not decoration: R10 maps to rbp so the body overwrites it, and
+/// rbp is callee-saved in SysV. An earlier version of this constant omitted it
+/// and therefore *faithfully pinned the bug* — the test passed while every
+/// invocation destroyed the caller's frame pointer. A golden test is only as
+/// good as the derivation behind it.
 const PROLOGUE: &[u8] = &[
+    0x55, // push rbp
     0x53, // push rbx
     0x41, 0x55, // push r13
     0x41, 0x56, // push r14
@@ -141,6 +148,7 @@ const EPILOGUE: &[u8] = &[
     0x41, 0x5E, // pop r14
     0x41, 0x5D, // pop r13
     0x5B, // pop rbx
+    0x5D, // pop rbp
     0xC3, // ret
 ];
 
@@ -289,27 +297,44 @@ fn load_and_store_against_the_frame_encode() {
     compile(&prog).expect("frame access must compile");
 }
 
-// ── the convergence cap ─────────────────────────────────────────────
+// ── branch encoding ─────────────────────────────────────────────────
 
 #[test]
-fn short_branch_cap_is_123_not_127() {
-    // The five bytes of headroom are the fix for a real oscillation between a
-    // 2-byte and a 6-byte `je` paired with a 5-byte and a 2-byte `jmp`
-    // (`arch/x86/net/bpf_jit_comp.c:70-113`). Asserted as a boundary, because
-    // "it happens to converge on the programs we tried" is exactly how the
-    // Linux bug survived.
-    assert!(is_imm8_branch(123));
-    assert!(!is_imm8_branch(124));
-    assert!(!is_imm8_branch(127));
-    assert!(is_imm8_branch(-128));
-    assert!(!is_imm8_branch(-129));
-}
-
-#[test]
-fn sizing_pass_budget_is_finite() {
-    // Divergence must be reported, never looped on: this crate has no fuel of
-    // its own and runs inside a syscall.
-    assert!(MAX_SIZING_PASSES > 0 && MAX_SIZING_PASSES < 1000);
+fn every_branch_is_rel32() {
+    // This replaces a test that asserted a 123-byte short-branch cap as though
+    // it were load-bearing. It was not: the emitter never selected a short
+    // form, so the cap, the convergence loop, and that test all guarded a
+    // hazard the code was not exposed to. Both are gone.
+    //
+    // What is worth pinning is the property the emitter actually has, because
+    // it is the premise of there being no sizing fixpoint at all: every branch
+    // is `rel32`. A short branch appearing without the loop coming back is the
+    // regression this catches.
+    let items = &[
+        Decoded::JumpCond {
+            wide: true,
+            op: CondOp::Eq,
+            dst: r(0),
+            src: Source::Imm(0),
+            off: 1,
+        },
+        mov(0, 1),
+        mov(0, 0),
+        EXIT,
+    ];
+    let c = compile(&verified(items)).expect("compiles");
+    // 0F 84 (je rel32) — not 74 (je rel8).
+    assert!(
+        c.code.windows(2).any(|w| w == [0x0F, 0x84]),
+        "conditional branch should be the rel32 form"
+    );
+    assert!(
+        !c.code.contains(&0x74),
+        "a rel8 je appeared; the sizing fixpoint must come back with it"
+    );
+    // E9 (jmp rel32), never EB (jmp rel8).
+    assert!(c.code.contains(&0xE9));
+    assert!(!c.code.contains(&0xEB));
 }
 
 // ── shifts and multiply ─────────────────────────────────────────────
