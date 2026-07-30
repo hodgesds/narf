@@ -6,18 +6,27 @@
 //! cache before hitting the backing store; writes mark pages dirty
 //! and a writeback worker flushes them to disk.
 //!
-//! The cache is bounded: clean pages are evicted in FIFO order once
-//! the resident set exceeds [`DEFAULT_MAX_RESIDENT_PAGES`]. Without a
-//! bound the map grows one 4 KiB `Arc` per device page ever read — a
-//! full distro boot streams hundreds of MiB of shared libraries
-//! (libLLVM alone is ~161 MiB) through it, exhausting RAM and
-//! panicking the allocator. Dirty pages are never evicted (they still
-//! owe a writeback); only clean, re-readable pages are dropped, so
-//! eviction is always correctness-preserving.
+//! Reclaim (Linux-shaped): the cache is not a fixed vector. Two
+//! pressures shrink it, both evicting only CLEAN pages via a CLOCK
+//! (second-chance approximate-LRU) so a hot, recently-referenced page
+//! outlives a cold one:
+//!
+//!  * a hard resident-page ceiling ([`PageCache::with_capacity`]) — a
+//!    backstop so a single cache can never dominate RAM; and
+//!  * a **free-memory watermark**: once the frame allocator's free
+//!    count drops below [`set_low_watermark_pages`], each insert
+//!    reclaims a batch of cold clean pages (down to a small floor),
+//!    mirroring the kernel's watermark-driven page reclaim rather than
+//!    a blunt capped array.
+//!
+//! Dirty pages still owe a writeback and are never evicted; only
+//! re-readable clean pages are dropped, so reclaim is always
+//! correctness-preserving.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -26,11 +35,58 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub const PAGE_SIZE: usize = 4096;
 
 /// Default resident-page ceiling: 32 Ki pages = 128 MiB of cached
-/// file data per cache. Large enough to coalesce the parallel
-/// dynamic-linker reads of a distro boot (systemd's generators, then
-/// Plasma) yet bounded so the cache can never grow without limit and
-/// OOM the kernel. Clean pages past this are evicted FIFO on insert.
+/// file data per cache. A hard backstop — watermark reclaim (below)
+/// keeps the working set well under this on a healthy system; this
+/// only bounds pathological growth if the watermark source is unset.
 pub const DEFAULT_MAX_RESIDENT_PAGES: usize = 32 * 1024;
+
+/// Pages reclaimed per insert while under the free-memory watermark.
+/// Bounded so a single insert never stalls scanning the whole cache;
+/// sustained pressure drains it over successive inserts.
+const RECLAIM_BATCH_PAGES: usize = 256;
+
+/// Floor the watermark reclaim will not shrink below, so transient
+/// pressure can't empty the cache and destroy the coalescing that
+/// makes parallel dynamic-linker reads cheap.
+const RECLAIM_FLOOR_PAGES: usize = 256;
+
+/// Free-frame low watermark, in pages. When the frame allocator
+/// reports fewer free pages than this, inserts reclaim clean pages.
+/// 0 disables watermark reclaim (only the hard ceiling applies) — the
+/// default until boot wires it via [`set_low_watermark_pages`].
+static LOW_WATERMARK_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the free-memory low watermark (in pages) that triggers page
+/// reclaim. Boot sizes this from total RAM (a small percentage);
+/// 0 disables watermark reclaim.
+pub fn set_low_watermark_pages(pages: usize) {
+    LOW_WATERMARK_PAGES.store(pages, Ordering::Relaxed);
+}
+
+/// The current free-memory low watermark, in pages.
+pub fn low_watermark_pages() -> usize {
+    LOW_WATERMARK_PAGES.load(Ordering::Relaxed)
+}
+
+/// Test-injectable free-page source. Production leaves this null and
+/// the cache reads the real frame allocator; tests install a closure
+/// so they can simulate memory pressure deterministically.
+static FREE_PAGES_HOOK: IrqSafeSpinLock<Option<fn() -> usize>> = IrqSafeSpinLock::new(None);
+
+/// Override the free-page source (tests only). `None` restores the
+/// real frame-allocator reading.
+pub fn set_free_pages_hook(hook: Option<fn() -> usize>) {
+    *FREE_PAGES_HOOK.lock() = hook;
+}
+
+/// Free frames available, per the injected hook or the real frame
+/// allocator. `None` means "unknown" (no reclaim decision is made).
+fn free_pages_available() -> Option<usize> {
+    if let Some(f) = *FREE_PAGES_HOOK.lock() {
+        return Some(f());
+    }
+    Some(narf_memory::frame_stats().free)
+}
 
 /// Cache key: filesystem + inode + page offset (in pages, not
 /// bytes).
@@ -64,22 +120,31 @@ impl Page {
 }
 
 #[derive(Debug)]
-struct Inner {
-    pages: BTreeMap<PageKey, Page>,
-    /// Recency order of resident keys, oldest at the front. Drives
-    /// eviction; a key appears at most once — re-inserting an existing
-    /// key moves it to the back (refreshes recency).
-    order: VecDeque<PageKey>,
+struct Slot {
+    page: Page,
+    /// CLOCK reference bit: set on every cache hit, cleared when the
+    /// clock hand sweeps past. An entry survives an eviction pass iff
+    /// it was referenced since the last sweep (second chance).
+    referenced: bool,
 }
 
-/// Unified page cache. Stage-4 uses a `BTreeMap<PageKey, Page>`
-/// under a single lock; Stage-4-refinement will shard the map
-/// per-filesystem + switch readers to RCU.
+#[derive(Debug)]
+struct Inner {
+    pages: BTreeMap<PageKey, Slot>,
+    /// CLOCK ring of resident keys. Eviction sweeps from the front,
+    /// giving referenced pages a second chance (bit cleared + requeued)
+    /// and evicting the first cold, clean page it meets.
+    clock: VecDeque<PageKey>,
+}
+
+/// Unified page cache. A `BTreeMap` of page-sized entries under a
+/// single lock, reclaimed by CLOCK-LRU under a hard ceiling and a
+/// free-memory watermark.
 #[derive(Debug)]
 pub struct PageCache {
     inner: IrqSafeSpinLock<Inner>,
-    /// Resident-page ceiling. Clean pages are evicted FIFO once
-    /// `pages.len()` would exceed this.
+    /// Hard resident-page ceiling backstop. Clean pages are evicted
+    /// once `pages.len()` would exceed this.
     max_pages: usize,
 }
 
@@ -89,70 +154,117 @@ impl PageCache {
     }
 
     /// Construct a cache with an explicit resident-page ceiling.
-    /// A ceiling of 0 is treated as "unbounded" (no eviction).
+    /// A ceiling of 0 is treated as "unbounded" (no hard cap — only
+    /// watermark reclaim, if a watermark is set, applies).
     pub const fn with_capacity(max_pages: usize) -> Self {
         Self {
             inner: IrqSafeSpinLock::new(Inner {
                 pages: BTreeMap::new(),
-                order: VecDeque::new(),
+                clock: VecDeque::new(),
             }),
             max_pages,
         }
     }
 
-    /// Look up a page; returns `None` if not present.
+    /// Look up a page; returns `None` if not present. A hit sets the
+    /// CLOCK reference bit so the entry survives the next eviction
+    /// sweep (approximate-LRU recency).
     pub fn lookup(&self, key: PageKey) -> Option<Page> {
-        self.inner.lock().pages.get(&key).cloned()
+        let mut g = self.inner.lock();
+        if let Some(slot) = g.pages.get_mut(&key) {
+            slot.referenced = true;
+            Some(slot.page.clone())
+        } else {
+            None
+        }
     }
 
-    /// Insert `page` under `key`, replacing any prior page. Evicts
-    /// clean pages in FIFO order if the resident set would exceed the
-    /// capacity ceiling; dirty pages are retained (they still owe a
-    /// writeback).
+    /// Insert `page` under `key`, replacing any prior page, then
+    /// reclaim: enforce the hard ceiling and, under memory pressure,
+    /// shed a batch of cold clean pages.
     pub fn insert(&self, key: PageKey, page: Page) {
         let mut g = self.inner.lock();
-        if g.pages.insert(key, page).is_some() {
-            // Existing key: refresh its recency so an active re-fill isn't
-            // the next thing evicted. Drop its stale queue position (a
-            // linear scan — re-inserts are rare, callers insert on miss).
-            if let Some(pos) = g.order.iter().position(|&k| k == key) {
-                g.order.remove(pos);
+        match g.pages.get_mut(&key) {
+            Some(slot) => {
+                // Existing key: update contents, refresh recency.
+                slot.page = page;
+                slot.referenced = true;
+            }
+            None => {
+                g.pages.insert(
+                    key,
+                    Slot {
+                        page,
+                        referenced: false,
+                    },
+                );
+                g.clock.push_back(key);
             }
         }
-        g.order.push_back(key);
-        if self.max_pages == 0 {
-            return;
-        }
-        // Evict oldest clean pages until back under the ceiling (or no
-        // evictable page remains — an all-dirty cache stays resident).
-        while g.pages.len() > self.max_pages {
-            let scan = g.order.len();
-            let mut evicted = false;
-            for _ in 0..scan {
-                let Some(k) = g.order.pop_front() else { break };
-                match g.pages.get(&k) {
-                    Some(p) if !p.dirty => {
-                        g.pages.remove(&k);
-                        evicted = true;
-                        break;
-                    }
-                    // Dirty: give it another lap so writeback can claim it.
-                    Some(_) => g.order.push_back(k),
-                    // Stale queue entry (page already gone): just drop it.
-                    None => {}
+
+        // Hard-ceiling backstop.
+        if self.max_pages != 0 {
+            while g.pages.len() > self.max_pages {
+                if !Self::evict_one_cold_clean(&mut g) {
+                    break; // nothing clean to shed
                 }
             }
-            if !evicted {
-                break;
+        }
+
+        // Free-memory watermark reclaim (Linux-shaped). Only when a
+        // watermark is configured and the allocator is under it.
+        let low = LOW_WATERMARK_PAGES.load(Ordering::Relaxed);
+        if low > 0 {
+            if let Some(free) = free_pages_available() {
+                if free < low {
+                    let mut shed = 0;
+                    while shed < RECLAIM_BATCH_PAGES
+                        && g.pages.len() > RECLAIM_FLOOR_PAGES
+                        && Self::evict_one_cold_clean(&mut g)
+                    {
+                        shed += 1;
+                    }
+                }
             }
         }
+    }
+
+    /// One CLOCK sweep step: evict the first cold, clean page. Gives
+    /// referenced pages a second chance (clear bit + requeue) and skips
+    /// dirty pages (requeued — they still owe a writeback). Returns
+    /// `true` if a page was evicted, `false` if a full sweep found none.
+    fn evict_one_cold_clean(inner: &mut Inner) -> bool {
+        let sweep = inner.clock.len();
+        // At most two laps: one to clear reference bits, one to evict.
+        for _ in 0..sweep.saturating_mul(2).saturating_add(1) {
+            let Some(k) = inner.clock.pop_front() else {
+                return false;
+            };
+            match inner.pages.get_mut(&k) {
+                None => { /* stale queue entry — drop it */ }
+                Some(slot) if slot.page.dirty => {
+                    // Un-evictable this round; keep it resident.
+                    inner.clock.push_back(k);
+                }
+                Some(slot) if slot.referenced => {
+                    // Second chance: clear the bit and requeue.
+                    slot.referenced = false;
+                    inner.clock.push_back(k);
+                }
+                Some(_) => {
+                    inner.pages.remove(&k);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Mark `key` dirty and bump the generation.
     pub fn mark_dirty(&self, key: PageKey) -> bool {
-        if let Some(p) = self.inner.lock().pages.get_mut(&key) {
-            p.dirty = true;
-            p.gen = p.gen.saturating_add(1);
+        if let Some(slot) = self.inner.lock().pages.get_mut(&key) {
+            slot.page.dirty = true;
+            slot.page.gen = slot.page.gen.saturating_add(1);
             true
         } else {
             false
@@ -167,10 +279,10 @@ impl PageCache {
     pub fn drain_dirty(&self) -> Vec<(PageKey, Page)> {
         let mut out = Vec::new();
         let mut g = self.inner.lock();
-        for (k, p) in g.pages.iter_mut() {
-            if p.dirty {
-                out.push((*k, p.clone()));
-                p.dirty = false;
+        for (k, slot) in g.pages.iter_mut() {
+            if slot.page.dirty {
+                out.push((*k, slot.page.clone()));
+                slot.page.dirty = false;
             }
         }
         out
@@ -190,7 +302,7 @@ impl PageCache {
     pub fn clear(&self) {
         let mut g = self.inner.lock();
         g.pages.clear();
-        g.order.clear();
+        g.clock.clear();
     }
 }
 
