@@ -496,6 +496,21 @@ fn emit_insn(
             e.modrm_mem(host(s), host(dst), i32::from(off));
         }
 
+        Decoded::Store {
+            size: Size::Dw,
+            dst,
+            off,
+            src: Source::Imm(v),
+        } => {
+            // `mov qword [base + disp], imm32` — C7 /0. The immediate is
+            // sign-extended to 64 bits by REX.W, which matches BPF's `ST`
+            // semantics (the interpreter does `imm as i64 as u64`).
+            e.rex(true, 0, host(dst));
+            e.b(0xC7);
+            e.modrm_mem(0, host(dst), i32::from(off));
+            e.d32(v);
+        }
+
         Decoded::Jump { off } => {
             // Always `rel32`. A short form would save three bytes per branch
             // but requires the sizing fixpoint this backend deliberately does

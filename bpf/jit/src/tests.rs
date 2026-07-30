@@ -422,3 +422,33 @@ fn multiply_uses_the_two_operand_form() {
         "one-operand imul would clobber rdx (R3) and rax (R0)"
     );
 }
+
+#[test]
+fn golden_store_immediate() {
+    // *(u64*)(r10-8) = 0x1234  →  mov qword [rbp-8], 0x1234
+    //   48 C7 45 F8 34 12 00 00
+    //
+    // Found by the in-kernel differential test refusing to run: the corpus
+    // used a `ST` with an immediate source, the emitter only handled a register
+    // source, so the program silently fell back to the interpreter — and a
+    // differential test whose subject is not compiled compares the interpreter
+    // with itself and passes for free. Worth stating: the test caught a missing
+    // *encoding* only because it asserted its subject was actually JITed.
+    assert_body(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(10),
+                off: -8,
+                src: Source::Imm(0x1234),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        &[
+            0x48, 0xC7, 0x45, 0xF8, 0x34, 0x12, 0x00, 0x00, // mov [rbp-8], 0x1234
+            0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, 0
+            0xE9, 0, 0, 0, 0,
+        ],
+    );
+}

@@ -103,6 +103,18 @@ impl StackFrame<'_> {
         self.bytes.is_empty()
     }
 
+    /// Highest address of the frame — the value R10 takes.
+    ///
+    /// BPF stacks grow down, so this is one past the last byte. Native code
+    /// needs the real address (the interpreter uses a synthetic region and
+    /// bounds-checks against it instead), and it must be the *same* byte range
+    /// both paths see or a differential test compares two different programs.
+    #[inline]
+    #[must_use]
+    pub fn top_addr(&self) -> u64 {
+        self.bytes.as_ptr() as u64 + self.bytes.len() as u64
+    }
+
     /// The CPU whose per-CPU region backs this frame, if any.
     ///
     /// `None` for the interpreter-only stub and for a sleepable program's heap

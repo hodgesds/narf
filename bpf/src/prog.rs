@@ -98,6 +98,10 @@ pub struct BpfProg {
     accumulated: AtomicU64,
     /// Invocations that ended in a [`crate::interp::Trap`].
     traps: AtomicU64,
+    /// Native code, when the program passed every gate in
+    /// [`crate::jit_glue`]. `None` means it runs interpreted, which is a
+    /// complete implementation and not a degraded one.
+    jit: Option<crate::jit_glue::JitImage>,
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -143,6 +147,11 @@ impl BpfProg {
         };
 
         let mut subprogs: Vec<SubprogInfo> = Vec::new();
+        // `None` unless a clean `verify()` produced a program that passed every
+        // gate. Deliberately not set on the `provisional` path below: that
+        // acceptance is *defined* as leaning on the interpreter's runtime
+        // bounds checks, which native code does not perform.
+        let mut jit = None;
         let stack_bytes = match narf_bpf_verifier::verify(&prog) {
             Ok(v) => {
                 if v.max_stack_bytes > MAX_STACK_BYTES {
@@ -151,6 +160,7 @@ impl BpfProg {
                         limit: MAX_STACK_BYTES,
                     });
                 }
+                jit = crate::jit_glue::try_compile(&v, true).ok();
                 subprogs = v.subprogs;
                 v.max_stack_bytes.max(1)
             }
@@ -175,6 +185,7 @@ impl BpfProg {
             initial_fuel: DEFAULT_FUEL,
             stack_bytes,
             subprogs,
+            jit,
             runs: AtomicU64::new(0),
             accumulated: AtomicU64::new(0),
             traps: AtomicU64::new(0),
@@ -237,6 +248,24 @@ impl BpfProg {
     /// counter, so depth N+1 loses its invocation rather than corrupting the
     /// frame below it.
     pub fn run_atomic(&self, ctx: [u64; MAX_CTX_WORDS], ctx_len: usize) -> Option<Outcome> {
+        if self.jit.is_some() {
+            return self.run_atomic_native(ctx, ctx_len);
+        }
+        self.run_atomic_interpreted(ctx, ctx_len)
+    }
+
+    /// Run interpreted, whatever `self.jit` holds.
+    ///
+    /// Public so the differential smoke can compare the two paths on the same
+    /// program. That comparison is the only test that checks the emitter's
+    /// *semantics* rather than its bytes — golden encodings prove the emitter
+    /// produced what was intended, and the interpreter is the oracle for
+    /// whether the intent was right.
+    pub fn run_atomic_interpreted(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+    ) -> Option<Outcome> {
         if self.context != Context::Atomic {
             return None;
         }
@@ -269,6 +298,52 @@ impl BpfProg {
         let outcome = crate::interp::drive(vm.run());
         self.record(outcome);
         Some(outcome)
+    }
+
+    /// Run the compiled image.
+    ///
+    /// Only reachable when [`crate::jit_glue::try_compile`] accepted the
+    /// program, which means: the verifier proved it (not the `provisional`
+    /// path), it uses no arena, it has no faulting accesses, it contains no
+    /// back-edge, and it dereferences only R10 and R1. Those five gates are why
+    /// this can hand control to generated code without the interpreter's
+    /// per-access bounds checks.
+    fn run_atomic_native(&self, ctx: [u64; MAX_CTX_WORDS], ctx_len: usize) -> Option<Outcome> {
+        if self.context != Context::Atomic {
+            return None;
+        }
+        let image = self.jit.as_ref()?;
+        let mut frame = if crate::mem::region_ready() {
+            PerCpuRegion.acquire(self.stack_bytes as usize)?
+        } else {
+            PerCpuStackStub.acquire(self.stack_bytes as usize)?
+        };
+        // The frame is already zeroed by the provider, which native code relies
+        // on exactly as the interpreter does: the verifier permits reading a
+        // widened stack slot before any concrete write, so the bytes must not be
+        // a previous program's.
+        let top = frame.top_addr();
+        let _ = frame.bytes_mut();
+        let ctx_len = ctx_len.min(MAX_CTX_WORDS);
+        let _ = ctx_len;
+        let entry = image.entry();
+        // SAFETY: `entry` points at sealed, executable text emitted for this
+        // program, entered with the ABI its prologue expects — `top` is the
+        // frame's highest address (R10) and `ctx.as_ptr()` a live `[u64; 4]`
+        // (R1). `ctx` outlives the call; `frame` is held across it so the
+        // memory R10 addresses stays leased. The five gates above are what make
+        // the absence of runtime bounds checks sound.
+        let ret = unsafe { entry(top, ctx.as_ptr() as u64) };
+        let outcome = Outcome::Returned(ret);
+        self.record(outcome);
+        Some(outcome)
+    }
+
+    /// Whether this program runs as native code.
+    #[inline]
+    #[must_use]
+    pub fn is_jited(&self) -> bool {
+        self.jit.is_some()
     }
 
     /// Run the program on a heap stack owned by the caller's future.

@@ -994,3 +994,187 @@ kernel_test_in!(
     "bpf",
     smoke_bpf_atomic_program_cannot_call_a_sleepable_kfunc
 );
+
+// ── JIT ↔ interpreter differential ──────────────────────────────────
+
+/// A corpus of programs that pass every `jit_glue` gate.
+///
+/// No back-edges, only R10/R1 dereferences, no arena, no faulting accesses —
+/// so each of these actually compiles rather than silently falling back, which
+/// a differential test must guarantee or it compares the interpreter with
+/// itself and passes vacuously.
+fn jit_corpus() -> Vec<(&'static str, Vec<Insn>)> {
+    alloc::vec![
+        ("ret_imm", asm(&[mov_imm(0, 42), EXIT])),
+        (
+            "add_imm",
+            asm(&[mov_imm(0, 100), alu_imm(AluOp::Add, 0, 23), EXIT])
+        ),
+        (
+            "sub_and_or_xor",
+            asm(&[
+                mov_imm(0, 0xFF),
+                alu_imm(AluOp::Sub, 0, 0x0F),
+                alu_imm(AluOp::And, 0, 0xF0),
+                alu_imm(AluOp::Or, 0, 0x03),
+                alu_imm(AluOp::Xor, 0, 0x01),
+                EXIT,
+            ])
+        ),
+        (
+            "reg_to_reg",
+            asm(&[
+                mov_imm(6, 7),
+                mov_imm(7, 6),
+                mov_reg(0, 6),
+                alu_reg(AluOp::Mul, 0, 7),
+                EXIT,
+            ])
+        ),
+        (
+            "shift_imm",
+            asm(&[mov_imm(0, 1), alu_imm(AluOp::Lsh, 0, 20), EXIT])
+        ),
+        (
+            "shift_reg",
+            asm(&[
+                mov_imm(0, 1),
+                mov_imm(1, 8),
+                alu_reg(AluOp::Lsh, 0, 1),
+                EXIT,
+            ])
+        ),
+        (
+            "arsh_negative",
+            asm(&[mov_imm(0, -256), alu_imm(AluOp::Arsh, 0, 4), EXIT])
+        ),
+        (
+            "stack_roundtrip",
+            asm(&[
+                mov_imm(0, 0x5EED),
+                st_imm(10, -8, 0x1234),
+                ldx(0, 10, -8),
+                EXIT,
+            ])
+        ),
+        (
+            "stack_two_slots",
+            asm(&[
+                mov_imm(1, 11),
+                mov_imm(2, 22),
+                Decoded::Store {
+                    size: Size::Dw,
+                    dst: r(10),
+                    off: -8,
+                    src: Source::Reg(r(1)),
+                },
+                Decoded::Store {
+                    size: Size::Dw,
+                    dst: r(10),
+                    off: -16,
+                    src: Source::Reg(r(2)),
+                },
+                ldx(0, 10, -16),
+                alu_reg(AluOp::Add, 0, 1),
+                EXIT,
+            ])
+        ),
+        ("ctx_read", asm(&[ldx(0, 1, 8), EXIT])),
+        (
+            "forward_branch_taken",
+            asm(&[mov_imm(0, 1), jne_imm(0, 1, 1), mov_imm(0, 99), EXIT,])
+        ),
+        (
+            "forward_branch_not_taken",
+            asm(&[mov_imm(0, 5), jne_imm(0, 1, 1), mov_imm(0, 99), EXIT,])
+        ),
+        (
+            "signed_compare",
+            asm(&[
+                mov_imm(0, -1),
+                Decoded::JumpCond {
+                    wide: true,
+                    op: CondOp::Slt,
+                    dst: r(0),
+                    src: Source::Imm(0),
+                    off: 1,
+                },
+                mov_imm(0, 7),
+                EXIT,
+            ])
+        ),
+        (
+            "unsigned_compare",
+            asm(&[
+                mov_imm(0, -1),
+                Decoded::JumpCond {
+                    wide: true,
+                    op: CondOp::Gt,
+                    dst: r(0),
+                    src: Source::Imm(0),
+                    off: 1,
+                },
+                mov_imm(0, 7),
+                EXIT,
+            ])
+        ),
+    ]
+}
+
+fn smoke_bpf_jit_matches_the_interpreter() -> TestResult {
+    // The only test that checks the emitter's *semantics*. Golden encodings
+    // prove it emitted what was intended; the interpreter is the oracle for
+    // whether the intent was right — and three of the four defects the JIT
+    // review found were about what the code did not do rather than what it
+    // encoded wrongly, which is exactly the class byte-level tests cannot see.
+    let ctxs: [[u64; 4]; 3] = [[0; 4], [1, 2, 3, 4], [u64::MAX, 0, 0x5A5A, 1]];
+    let mut compiled = 0usize;
+    for (name, insns) in jit_corpus() {
+        let Ok(p) = load(name, insns, Context::Atomic) else {
+            return TestResult::Fail("load rejected a corpus program");
+        };
+        if !p.is_jited() {
+            // A gate rejected it. Not a pass: a corpus entry that silently
+            // falls back would make this test compare the interpreter against
+            // itself.
+            return TestResult::Fail("a corpus program was not compiled");
+        }
+        compiled += 1;
+        for ctx in ctxs {
+            let native = p.run_atomic(ctx, 4);
+            let interp = p.run_atomic_interpreted(ctx, 4);
+            match (native, interp) {
+                (Some(Outcome::Returned(a)), Some(Outcome::Returned(b))) if a == b => {}
+                (Some(Outcome::Returned(_)), Some(Outcome::Returned(_))) => {
+                    return TestResult::Fail("native and interpreted results differ")
+                }
+                (None, _) | (_, None) => return TestResult::Fail("a run was declined"),
+                _ => return TestResult::Fail("one path trapped and the other did not"),
+            }
+        }
+    }
+    if compiled == 0 {
+        return TestResult::Fail("nothing in the corpus compiled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_matches_the_interpreter);
+
+fn smoke_bpf_jit_gates_reject_a_back_edge() -> TestResult {
+    // No fuel is emitted, so a back-edge must never reach native code — the
+    // verifier accepts unbounded loops by design (fuel bounds them at runtime),
+    // and native code that omits fuel would run one forever with IRQs masked.
+    let insns = asm(&[mov_imm(0, 0), alu_imm(AluOp::Add, 0, 1), ja(-2)]);
+    let Ok(p) = load("spin-jit", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected an unbounded loop — fuel makes it legal");
+    };
+    if p.is_jited() {
+        return TestResult::Fail("a back-edge reached the JIT with no fuel emitted");
+    }
+    // And interpreted it still terminates, on fuel.
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Trapped(Trap::OutOfFuel { .. })) => TestResult::Pass,
+        _ => TestResult::Fail("the interpreted loop did not run out of fuel"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_jit_gates_reject_a_back_edge);
