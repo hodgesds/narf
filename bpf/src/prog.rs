@@ -281,6 +281,13 @@ impl BpfProg {
             PerCpuStackStub.acquire(self.stack_bytes as usize)?
         };
         let registry = crate::kfunc::registry()?;
+        // Four readable words, tail zero-filled — the same contract
+        // `run_atomic_native` provides, because the verifier proved all four
+        // readable and the two paths must not disagree. See the note there.
+        let mut ctx = ctx;
+        for w in ctx.iter_mut().skip(ctx_len.min(MAX_CTX_WORDS)) {
+            *w = 0;
+        }
         let mut vm = Vm::new(
             crate::interp::VmProgram {
                 insns: &self.insns,
@@ -289,7 +296,7 @@ impl BpfProg {
                 fuel: self.initial_fuel,
             },
             ctx,
-            ctx_len,
+            MAX_CTX_WORDS,
             frame,
             registry,
         );
@@ -324,8 +331,25 @@ impl BpfProg {
         // a previous program's.
         let top = frame.top_addr();
         let _ = frame.bytes_mut();
-        let ctx_len = ctx_len.min(MAX_CTX_WORDS);
-        let _ = ctx_len;
+        // The verifier types every program's context as four scalars
+        // (`CTX_SCALARS`), so it proves all four readable — but the interpreter
+        // additionally bounds reads at the *runtime* `ctx_len`, while native
+        // code emits no such check. A caller passing fewer words therefore got
+        // `Trap::BadAccess` interpreted and a zero read JITed: same program,
+        // different answer. Reachable through perf, whose `ctx_len` is
+        // `raw.len() / 8` and can be zero.
+        //
+        // Resolved in favour of what was actually proved: the runtime supplies
+        // four readable words, zero-filling the tail. A caller with less data
+        // is not lying to the program — `ctx[0]`-style length fields remain the
+        // authority on how much is meaningful, as the XDP summary already does.
+        // Per-attach-point context typing is the real fix and is spec §8's
+        // remaining ctx item; this makes the two execution paths agree in the
+        // meantime, which is the property that cannot be allowed to differ.
+        let mut ctx = ctx;
+        for w in ctx.iter_mut().skip(ctx_len.min(MAX_CTX_WORDS)) {
+            *w = 0;
+        }
         let entry = image.entry();
         // SAFETY: `entry` points at sealed, executable text emitted for this
         // program, entered with the ABI its prologue expects — `top` is the

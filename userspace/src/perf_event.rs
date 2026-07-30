@@ -2673,13 +2673,19 @@ pub(crate) fn drain_irq_samples() {
                         b.copy_from_slice(&raw[i * 8..i * 8 + 8]);
                         *w = u64::from_le_bytes(b);
                     }
+                    // Only a program that *returned* filters. `Outcome::value()`
+                    // is 0 for a trap, so testing it discarded the sample on
+                    // every trap — the opposite of the policy stated below, and
+                    // silently. An unbounded loop verifies (fuel bounds it at
+                    // run time), so a program that exhausted fuel would have
+                    // dropped every sample it was attached to.
                     let keep =
                         match prog.run_atomic(ctx, words.min(narf_bpf::interp::MAX_CTX_WORDS)) {
-                            Some(o) => o.value() != 0,
+                            Some(narf_bpf::interp::Outcome::Returned(v)) => v != 0,
                             // Declined or trapped: keep the sample. Dropping data
                             // because a filter could not run would silently lose
                             // records, which is worse than an unfiltered one.
-                            None => true,
+                            Some(narf_bpf::interp::Outcome::Trapped(_)) | None => true,
                         };
                     if !keep {
                         continue;

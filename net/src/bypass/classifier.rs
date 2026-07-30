@@ -288,6 +288,10 @@ pub enum XdpAction {
 type XdpSlot = (alloc::string::String, alloc::boxed::Box<dyn XdpProgram>);
 static XDP_PROGS: IrqSafeSpinLock<Vec<XdpSlot>> = IrqSafeSpinLock::new(Vec::new());
 static XDP_ABORTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Whether *any* program is attached, so the RX path can skip the lock
+/// entirely when none is. Relaxed: a frame racing an attach may take either
+/// answer, which is the same latitude the daemon and flow tables already have.
+static XDP_ANY: AtomicBool = AtomicBool::new(false);
 static XDP_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Attach `prog` to `iface`, replacing any program already there.
@@ -304,6 +308,7 @@ pub fn install_xdp<M: CapType>(
     let mut g = XDP_PROGS.lock();
     g.retain(|(n, _)| *n != iface);
     g.push((iface, prog));
+    XDP_ANY.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -313,6 +318,7 @@ pub fn remove_xdp<M: CapType>(cap: &Cap<M, Grant>, iface: &str) -> Result<bool, 
     let mut g = XDP_PROGS.lock();
     let before = g.len();
     g.retain(|(n, _)| n != iface);
+    XDP_ANY.store(!g.is_empty(), Ordering::Release);
     Ok(g.len() != before)
 }
 
@@ -327,11 +333,31 @@ pub fn xdp_stats() -> (u64, u64) {
 
 /// Run the attached program, if any.
 ///
-/// The lock is dropped before the program runs. A program that reached back
-/// into this module would otherwise deadlock on a non-reentrant
-/// `IrqSafeSpinLock` — the same defect `tracing::dispatch::fire` had, and the
-/// reason it was reworked.
+/// **The program runs while `XDP_PROGS` is held**, and with interrupts masked
+/// for that duration — `IrqSafeSpinLock` masks them for the guard's lifetime.
+/// An earlier version of this doc claimed the opposite of the body three lines
+/// below it, which is worse than no comment.
+///
+/// Two consequences, both real:
+///
+/// * A program that reached back into this module would deadlock on a
+///   non-reentrant lock. Safe only because the kfunc set is closed and audited
+///   and contains nothing that does — switch to `Arc` (the change
+///   `tracing::dispatch::fire` made) *before* widening it, not after.
+/// * Fuel bounds a program's *work*, not its *time*. With interrupts masked,
+///   a frame can spend up to `DEFAULT_FUEL` interpreted instructions with IRQs
+///   off. That is a latency characteristic of attaching a program at all, not
+///   something this function can fix; recorded in `bpf/specification/spec.md`
+///   §8 rather than left for someone to discover from a jitter graph.
 fn run_xdp(iface: &str, frame: &[u8]) -> XdpAction {
+    // Fast path for the overwhelmingly common case: nothing attached. Without
+    // this, every RX frame paid an IRQ-save, a `lock cmpxchg`, and a linear
+    // `String == &str` scan before the existing daemon and flow-table locks —
+    // roughly a third more locking on the bypass path for a feature that is
+    // off. `POLL_MODE` next door already uses this shape.
+    if !XDP_ANY.load(Ordering::Relaxed) {
+        return XdpAction::Pass;
+    }
     // The program runs while `XDP_PROGS` is held. That is a deliberate,
     // recorded limitation rather than an oversight: `Box<dyn XdpProgram>` is
     // not clonable, so releasing the lock first would need an `Arc` — exactly

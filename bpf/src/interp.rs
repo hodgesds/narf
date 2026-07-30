@@ -568,10 +568,17 @@ impl<'a> Vm<'a> {
                     pc = next;
                 }
                 Decoded::Jump { off } => {
-                    pc = self.branch(at, next, off)?;
-                    if off < 0 {
+                    // Gated on the policy, exactly as `JumpCond` below. It was
+                    // not, so under the production per-instruction policy an
+                    // unconditional backwards `goto` burned twice — once as an
+                    // instruction retired and once again here — while the JIT
+                    // charged it once as part of its block. Same program,
+                    // different verdict depending on whether it happened to
+                    // clear `jit_glue`'s gates.
+                    if !per_insn && off < 0 {
                         self.burn(at)?;
                     }
+                    pc = self.branch(at, next, off)?;
                 }
                 Decoded::JumpCond {
                     wide,

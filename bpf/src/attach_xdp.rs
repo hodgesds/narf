@@ -86,22 +86,28 @@ impl XdpProgram for BpfXdp {
                 *w = u64::from_le_bytes(b);
             }
         }
+        // Only a program that *returned* decides. `Outcome::value()` is 0 for a
+        // trap, so matching on it treated every trap as an unknown action and
+        // therefore dropped the frame — the exact opposite of the policy stated
+        // here, and severe: an unbounded loop verifies (fuel bounds it at
+        // runtime), so a program that exhausts fuel would have silently dropped
+        // *every frame on the interface*.
         match self.prog.run_atomic(ctx, 1 + FRAME_WORDS) {
             // Linux's XDP_PASS is 2 and XDP_DROP is 1; matching those keeps a
             // program written against Linux's constants behaving the same way.
-            Some(o) => match o.value() {
+            Some(crate::interp::Outcome::Returned(v)) => match v {
                 1 => XdpAction::Drop,
                 2 => XdpAction::Pass,
-                // Any other value is a program bug. Linux treats an unknown
-                // action as XDP_ABORTED, and so does this — dropping while
-                // counting it, so a broken program is visible rather than
+                // Any other *returned* value is a program bug. Linux treats an
+                // unknown action as XDP_ABORTED, and so does this — dropping
+                // while counting it, so a broken program is visible rather than
                 // silently passing everything.
                 _ => XdpAction::Aborted,
             },
-            // Declined (nesting limit, no frame) or trapped: pass the frame.
+            // Trapped, or declined by the stack provider: pass the frame.
             // Dropping traffic because a filter could not run would turn a
             // resource limit into a network outage.
-            None => XdpAction::Pass,
+            Some(crate::interp::Outcome::Trapped(_)) | None => XdpAction::Pass,
         }
     }
 }
