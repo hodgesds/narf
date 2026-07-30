@@ -2177,3 +2177,129 @@ fn a_frame_pointer_passed_to_a_subprogram_counts_toward_the_frame() {
         v.max_stack_bytes
     );
 }
+
+#[test]
+fn a_loop_nested_inside_an_scc_still_gets_a_widening_point() {
+    // Tarjan returns *maximal* SCCs, so a cycle nested inside a larger one has
+    // no predecessor outside the component: `entered_from_outside` is false for
+    // its header, and being irreducible it has no dominance back-edge either.
+    // Nothing widened it, joins climbed forever, and the only thing that stopped
+    // the analysis was the round budget — so this program was rejected with
+    // `FixpointDiverged`, which is documented as a *verifier* bug.
+    //
+    // Layout (slot: instruction):
+    //   0   r0 = 0
+    //   1   r0 += 1        <- outer header (target of both back-edges, widened)
+    //   2   r2 = 0            fresh *bounded* value, set AFTER the widening
+    //   3   may_goto +2  -> 6                \
+    //   4   may_goto +4  -> 9                 \ two entries into the inner
+    //   5   goto +8      -> 14 (exit)         / cycle, so it is irreducible
+    //   6   r2 += 1         [B]              /
+    //   7   may_goto +1  -> 9  (B -> C)
+    //   8   goto -8      -> 1  (outer back-edge)
+    //   9   r2 += 1         [C]
+    //   10  may_goto -5  -> 6  (C -> B)
+    //   11  goto -11     -> 1  (outer back-edge)
+    //   12  r0 = 0       (unreachable filler)
+    //   13  r0 = 0       (unreachable filler)
+    //   14  exit
+    //
+    // Two details make this an actual divergence rather than a shape that merely
+    // looks like one, and both were needed — earlier drafts of this test passed
+    // with the fix disabled:
+    //
+    //   1. The inner cycle must increment a register the outer widening has not
+    //      already saturated. `r2` is reset to 0 at slot 2, *after* the header
+    //      where widening applies, so the inner cycle starts from [0, 0] every
+    //      time and climbs 1, 2, 3, ... with nothing to stop it. An earlier
+    //      version incremented `r0`, which the header had already widened to
+    //      top, so the inner iteration converged immediately by absorption.
+    //   2. The inner cycle must be entered from two places (slots 3 and 4) so it
+    //      is irreducible and dominance finds no back-edge for it, and it must
+    //      sit inside a larger SCC so `entered_from_outside` is false for both
+    //      its blocks. That combination is exactly what the maximal-SCC pass
+    //      cannot see.
+    let prog = &[
+        mov(0, 0),                    // 0
+        alu(AluOp::Add, 0, 1),        // 1  outer header
+        mov(2, 0),                    // 2  r2 = 0
+        Decoded::MayGoto { off: 2 },  // 3  -> 6
+        Decoded::MayGoto { off: 4 },  // 4  -> 9
+        Decoded::Jump { off: 8 },     // 5  -> 14
+        alu(AluOp::Add, 2, 1),        // 6  [B]
+        Decoded::MayGoto { off: 1 },  // 7  -> 9
+        Decoded::Jump { off: -8 },    // 8  -> 1
+        alu(AluOp::Add, 2, 1),        // 9  [C]
+        Decoded::MayGoto { off: -5 }, // 10 -> 6
+        Decoded::Jump { off: -11 },   // 11 -> 1
+        mov(0, 0),                    // 12
+        mov(0, 0),                    // 13
+        EXIT,                         // 14
+    ];
+    // The assertion that matters: it converges. Whether it is *accepted* is a
+    // separate question (it is — nothing here is unsafe), but `FixpointDiverged`
+    // specifically must not happen.
+    match check(prog) {
+        Ok(_) => {}
+        Err(VerifyError::FixpointDiverged { rounds, .. }) => {
+            panic!("fixpoint diverged after {rounds} rounds — a nested cycle has no widening point")
+        }
+        Err(e) => panic!("unexpected rejection: {e:?}"),
+    }
+}
+
+#[test]
+fn every_cycle_has_a_widening_point() {
+    // The structural property the fix establishes, asserted directly on the IR
+    // rather than inferred from convergence: after `Ir::build`, no cycle exists
+    // among blocks that are not widening points.
+    //
+    // Checked by removing every `widen_here` block and confirming the remaining
+    // subgraph is acyclic (a DFS finds no back-edge). This is the invariant the
+    // module doc claims; before the nested-cycle pass it was false.
+    let prog = &[
+        mov(0, 0),
+        Decoded::MayGoto { off: 2 },
+        Decoded::MayGoto { off: 3 },
+        Decoded::Jump { off: 5 },
+        Decoded::MayGoto { off: 1 },
+        Decoded::Jump { off: -5 },
+        Decoded::MayGoto { off: -3 },
+        Decoded::Jump { off: -7 },
+        mov(0, 0),
+        EXIT,
+    ];
+    let image = encode_all(prog);
+    let ir = crate::ir::Ir::build(&image).expect("ir builds");
+
+    // Iterative DFS with colouring over the unmarked subgraph.
+    let n = ir.blocks.len();
+    let mut colour = alloc::vec![0u8; n]; // 0 = unvisited, 1 = on path, 2 = done
+    for root in 0..n {
+        if ir.blocks[root].widen_here || colour[root] != 0 {
+            continue;
+        }
+        let mut stack: Vec<(usize, usize)> = alloc::vec![(root, 0)];
+        colour[root] = 1;
+        while let Some(&mut (v, ref mut i)) = stack.last_mut() {
+            if *i < ir.blocks[v].succs.len() {
+                let w = ir.blocks[v].succs[*i] as usize;
+                *i += 1;
+                if ir.blocks[w].widen_here {
+                    continue;
+                }
+                assert_ne!(
+                    colour[w], 1,
+                    "cycle through blocks {v} -> {w} with no widening point on it"
+                );
+                if colour[w] == 0 {
+                    colour[w] = 1;
+                    stack.push((w, 0));
+                }
+            } else {
+                colour[v] = 2;
+                stack.pop();
+            }
+        }
+    }
+}

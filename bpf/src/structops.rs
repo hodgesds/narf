@@ -179,6 +179,15 @@ pub enum StructOpsError {
     UnknownMethod,
     /// No trait with that name is registered.
     UnknownTrait,
+    /// A bound program was verified for a context this hook does not provide.
+    ///
+    /// struct_ops dispatch is `Atomic`; a `Sleepable` program cannot run there,
+    /// and binding one anyway made every call return `DEFAULT_RET` — the policy
+    /// looks installed and does nothing.
+    WrongContext {
+        /// The method whose binding was rejected.
+        method: &'static str,
+    },
 }
 
 impl From<CapError> for StructOpsError {
@@ -226,6 +235,15 @@ pub fn install<M: CapType>(
     for b in set.bindings() {
         if !desc.methods.iter().any(|m| m.name == b.method) {
             return Err(StructOpsError::UnknownMethod);
+        }
+        // Every struct_ops dispatch goes through `run_atomic`, which returns
+        // `None` for a program verified for `Sleepable` — and `None` maps to
+        // `DEFAULT_RET`. So binding a sleepable program installed cleanly and
+        // then silently returned the default on every call: the policy looks
+        // installed and does nothing. Rejected at install, by type, exactly as
+        // spec §4.5 requires and as `attach_probe` and (now) XDP attach do.
+        if b.prog.context() != narf_bpf_verifier::Context::Atomic {
+            return Err(StructOpsError::WrongContext { method: b.method });
         }
     }
     let mut slot = INSTALLED.lock();
@@ -378,6 +396,25 @@ macro_rules! struct_ops {
                     // The context tuple is the method's own argument list —
                     // no rewriting layer, because there is no fictional UAPI
                     // struct to rewrite from (spec §1.6).
+                    // Arity is a compile-time error, not a silent truncation.
+                    //
+                    // The adapter can only carry `MAX_CTX_WORDS` arguments, and
+                    // it used to drop the rest with no diagnostic — while
+                    // `MethodDesc::ctx` was still built from the *full*
+                    // signature. So the descriptor the verifier consults
+                    // described a wider context than the runtime can ever fill,
+                    // and the moment struct_ops programs are verified against
+                    // `MethodDesc::ctx` that becomes a proved-in-bounds read of
+                    // a word nothing supplies. `kfunc!` already asserts its
+                    // arity; this is the same brace for the other macro.
+                    const _: () = {
+                        let __arity = 0usize $(+ { let _ = stringify!($pname); 1 })*;
+                        assert!(
+                            __arity <= $crate::interp::MAX_CTX_WORDS,
+                            "struct_ops method takes more arguments than the \
+                             context tuple can carry",
+                        );
+                    };
                     #[allow(unused_mut)]
                     let mut __ctx = [0u64; $crate::interp::MAX_CTX_WORDS];
                     #[allow(unused_mut)]
@@ -391,12 +428,21 @@ macro_rules! struct_ops {
                     )*
                     match self.progs.get(stringify!($method)) {
                         Some(p) => match p.run_atomic(__ctx, __n) {
-                            Some(o) => <$mret as $crate::types::BpfRet>::from_ret(o.value()),
+                            // Only a *returned* value decides. `Outcome::value()`
+                            // is 0 for a trap, so matching on it sent every
+                            // trapped run through `from_ret(0)` instead of
+                            // `DEFAULT_RET` — benign only for as long as every
+                            // `BpfRet::DEFAULT_RET` happens to be 0, which is not
+                            // a property any implementor is asked to preserve.
+                            // Same fix already applied to the XDP and perf paths.
+                            Some($crate::interp::Outcome::Returned(v)) =>
+                                <$mret as $crate::types::BpfRet>::from_ret(v),
                             // Declined (nesting limit, no frame) or trapped:
                             // fall back rather than fabricate a value. A
                             // policy hook returning nonsense is worse than one
                             // returning the default.
-                            None => <$mret as $crate::types::BpfRet>::DEFAULT_RET,
+                            Some($crate::interp::Outcome::Trapped(_)) | None =>
+                                <$mret as $crate::types::BpfRet>::DEFAULT_RET,
                         },
                         None => <$mret as $crate::types::BpfRet>::DEFAULT_RET,
                     }

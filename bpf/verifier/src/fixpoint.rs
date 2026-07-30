@@ -16,10 +16,23 @@
 //! transfer function is monotone. So the fixpoint converges on any CFG, for
 //! any program, and acceptance is a function of the program alone.
 //!
-//! Widening exists to make convergence *fast*, not to make it happen. It is
-//! applied wherever [`crate::ir::Block::widen_here`] is set: back-edge targets
-//! and, for the irreducible cases dominance cannot see, entries into a
-//! non-trivial SCC.
+//! Widening is applied wherever [`crate::ir::Block::widen_here`] is set, and
+//! [`crate::ir`] guarantees that **every cycle contains at least one such
+//! block** — back-edge targets, entries into a non-trivial SCC, and heads for
+//! cycles nested inside another cycle.
+//!
+//! That third case is why the guarantee is stated here rather than assumed. The
+//! text above used to claim convergence "on any CFG, for any program" while the
+//! CFG pass only handled *maximal* SCCs, so a loop nested inside another had no
+//! widening point at all: joins alone climbed forever and only
+//! `fixpoint_round_budget` stopped it, at 16 385 rounds for a 15-instruction
+//! program and ~13 s extrapolated to `MAX_INSNS` — un-preemptible, inside
+//! `sys_bpf`. The claim is now backed by a structural invariant with a test
+//! (`every_cycle_has_a_widening_point`) rather than by inspection.
+//!
+//! Widening therefore does two jobs: it makes convergence *fast* where a cycle
+//! would otherwise converge slowly, and it makes convergence *happen* where the
+//! lattice has no finite ascending chain of its own.
 //!
 //! The termination question Linux is really asking — does the *program*
 //! terminate? — NARF answers at runtime with fuel. That is what lets this file

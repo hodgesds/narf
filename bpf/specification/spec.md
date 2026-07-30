@@ -438,6 +438,31 @@ and the perf event layer, all of which are closed.
     arise (§9, the sizing fixpoint). The lever if this ever bites is an await
     point in the load path, which costs nothing when verification is fast.
 
+    **Amendment — the reasoning above did not cover every shape, and one of
+    them was a genuine divergence.** The paragraph beginning "The existing
+    `fixpoint_round_budget` does not bound this" rested on the measured cost
+    being "the cost of a fixpoint that *converges*". A review found a class
+    where it does not converge: a loop *nested* inside another cycle had no
+    widening point at all, because Tarjan returns maximal SCCs (so the inner
+    header has no predecessor outside the component) and an irreducible inner
+    loop has no dominance back-edge either. Measured: 16 385 rounds / 6 ms at 13
+    slots, rising linearly to 8 195 073 rounds / 3.3 s at 16 013 slots — roughly
+    13 s at `MAX_INSNS`, and `fixpoint_round_budget` was the *only* thing
+    stopping it, at 30–130× the honest cost. It also rejected safe programs with
+    `FixpointDiverged`, which this document describes as a verifier bug.
+
+    Fixed in `ir.rs` pass 7b by iterating the widening set to a fixed point —
+    the essential content of Bourdoncle's hierarchical decomposition without
+    materialising the weak topological order — so that **every cycle contains a
+    widening point**. That invariant now has a test
+    (`every_cycle_has_a_widening_point`) rather than resting on inspection.
+
+    The QoS-not-DoS conclusion still stands for the *converging* case, which is
+    what the original numbers measured. The lesson worth keeping is narrower: a
+    latency measurement taken over programs that converge says nothing about
+    programs that do not, and "the budget is not the lever" was true of the cost
+    and false of the bound.
+
 12. **A packet pointer needs *dynamic* region bounds, and the obvious
     shortcut is an information leak.** XDP programs currently receive the frame
     *summarised* into the context tuple (length, then 24 bytes as three words)

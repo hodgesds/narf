@@ -19,10 +19,22 @@
 //! Exactly two things:
 //!
 //!   * **Where to widen.** The fixpoint ([`crate::fixpoint`]) widens at loop
-//!     entries, and needs them identified up front. Back-edges found by
-//!     dominance cover reducible loops; SCC entries cover the irreducible ones
-//!     a hostile program can construct, since nothing stops a compiler-shaped
-//!     invariant from being violated by hand-written bytecode.
+//!     entries, and needs them identified up front. Three passes, because the
+//!     first two are each insufficient on their own:
+//!
+//!     1. back-edges found by dominance, which cover reducible loops;
+//!     2. entries into a non-trivial SCC, which cover the irreducible ones a
+//!        hostile program can construct — nothing stops a compiler-shaped
+//!        invariant from being violated by hand-written bytecode;
+//!     3. heads for cycles *nested* inside another cycle, which neither of the
+//!        above finds: Tarjan returns maximal SCCs, so an inner loop shares its
+//!        parent's component and has no predecessor outside it, and if it is
+//!        also irreducible then dominance sees no back-edge for it.
+//!
+//!     Together these establish the invariant the fixpoint needs and could not
+//!     previously rely on: **every cycle contains at least one widening point.**
+//!     Pinned by `every_cycle_has_a_widening_point`, which removes the marked
+//!     blocks and asserts the remainder is acyclic.
 //!   * **Where subprograms begin and end,** so stack depth can be summed along
 //!     the static call graph.
 //!
@@ -505,6 +517,45 @@ impl Ir {
             }
         }
 
+        // ── Pass 7b: nested cycles ──────────────────────────────────
+        //
+        // Everything above finds widening points for *maximal* SCCs, and that
+        // is not enough. Tarjan returns maximal components, so a loop nested
+        // inside another shares its parent's SCC: the inner header has no
+        // predecessor outside the component, `entered_from_outside` is false,
+        // and if the inner loop is irreducible then dominance finds no back-edge
+        // for it either. Nothing widened it, joins alone climbed forever, and
+        // the only thing that stopped it was `fixpoint_round_budget` — so a safe
+        // program was rejected with `FixpointDiverged`, which the docs
+        // (correctly) describe as a verifier bug rather than a program bug.
+        //
+        // It was also a latency problem, and a much bigger one than §8.11
+        // assessed: measured 16 385 rounds / 6 ms at 13 slots, rising linearly
+        // to 8 195 073 rounds / 3.3 s at 16 013 slots, i.e. ~13 s at
+        // `MAX_INSNS`, un-preemptible inside `sys_bpf`. §8.11 had reasoned that
+        // the measured per-instruction cost "is the cost of a fixpoint that
+        // *converges* — real work proportional to branching, not a divergence."
+        // That reasoning does not cover this shape, because this shape *is* a
+        // divergence.
+        //
+        // Fixed by iterating to a fixed point on the widening set, which is the
+        // essential content of Bourdoncle's hierarchical decomposition without
+        // needing to materialise the weak topological order: repeatedly find the
+        // cyclic components among blocks that are *not yet* widening points, and
+        // give each one a head. Treating an already-marked block as absent is
+        // what makes this work — a cycle passing through a widening point is
+        // already bounded, so only cycles avoiding every marked block still need
+        // one. Each round marks at least one block, so this terminates, and on
+        // exit **every cycle in the CFG contains a widening point** — which is
+        // the property the module doc claims and previously did not have.
+        //
+        // Additive rather than a replacement: the pass above marks *every*
+        // entry into a maximal SCC, and this only adds heads for cycles it
+        // missed. Widening at more points is always sound (it costs precision,
+        // never termination), and keeping the existing marks means the
+        // irreducible-entry behaviour the tests pin is unchanged.
+        mark_nested_widening_points(&mut blocks);
+
         thresholds.push(0);
         thresholds.push(-1);
         thresholds.push(i64::from(i32::MIN));
@@ -726,6 +777,125 @@ pub fn dominates(blocks: &[Block], a: u32, b: u32) -> bool {
         }
         cur = next;
     }
+}
+
+/// Give every cycle a widening point, including cycles nested inside another.
+///
+/// See pass 7b for why the maximal-SCC pass is not sufficient. The loop below
+/// is the fixed-point formulation: while some cycle avoids every block already
+/// marked `widen_here`, give that cycle a head.
+///
+/// Terminates because each round marks at least one previously-unmarked block,
+/// and there are finitely many blocks.
+fn mark_nested_widening_points(blocks: &mut [Block]) {
+    loop {
+        let comps = cyclic_components_avoiding_marked(blocks);
+        if comps.is_empty() {
+            return;
+        }
+        for comp in &comps {
+            let head = pick_component_head(blocks, comp);
+            blocks[head as usize].widen_here = true;
+        }
+    }
+}
+
+/// The head to widen at, chosen deterministically.
+///
+/// Determinism is not cosmetic here: acceptance must be a function of the
+/// program alone (that is the whole point of §1.1's fuel model), and the
+/// widening set changes precision, so a nondeterministic choice would make a
+/// program's acceptance depend on iteration order.
+///
+/// Prefers a block entered from outside the component — that is the natural
+/// loop header and widening there loses the least — and falls back to the
+/// lowest block index when the component has no external entry, which happens
+/// once an enclosing head has been removed.
+fn pick_component_head(blocks: &[Block], comp: &[u32]) -> u32 {
+    let in_comp = |b: u32| comp.contains(&b);
+    let mut entry: Option<u32> = None;
+    for &b in comp {
+        if blocks[b as usize].preds.iter().any(|&p| !in_comp(p)) {
+            entry = Some(entry.map_or(b, |e: u32| e.min(b)));
+        }
+    }
+    entry.unwrap_or_else(|| comp.iter().copied().min().expect("non-empty component"))
+}
+
+/// Cyclic SCCs of the subgraph induced by blocks that are **not** already
+/// widening points.
+///
+/// Marked blocks are treated as absent, edges through them included: a cycle
+/// that passes through a widening point is already bounded, so it must not keep
+/// being reported as needing one (which would loop forever).
+fn cyclic_components_avoiding_marked(blocks: &[Block]) -> Vec<Vec<u32>> {
+    let n = blocks.len();
+    let live = |b: usize| !blocks[b].widen_here;
+
+    let mut index = vec![NONE; n];
+    let mut lowlink = vec![0u32; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<u32> = Vec::new();
+    let mut next_index = 0u32;
+    let mut out: Vec<Vec<u32>> = Vec::new();
+
+    for root in 0..n {
+        if !live(root) || index[root] != NONE {
+            continue;
+        }
+        let mut work: Vec<(u32, usize)> = vec![(root as u32, 0)];
+        index[root] = next_index;
+        lowlink[root] = next_index;
+        next_index += 1;
+        stack.push(root as u32);
+        on_stack[root] = true;
+
+        while let Some(&mut (v, ref mut si)) = work.last_mut() {
+            let vu = v as usize;
+            if *si < blocks[vu].succs.len() {
+                let w = blocks[vu].succs[*si] as usize;
+                *si += 1;
+                if !live(w) {
+                    continue;
+                }
+                if index[w] == NONE {
+                    index[w] = next_index;
+                    lowlink[w] = next_index;
+                    next_index += 1;
+                    stack.push(w as u32);
+                    on_stack[w] = true;
+                    work.push((w as u32, 0));
+                } else if on_stack[w] {
+                    lowlink[vu] = lowlink[vu].min(index[w]);
+                }
+            } else {
+                work.pop();
+                if let Some(&(parent, _)) = work.last() {
+                    let pu = parent as usize;
+                    lowlink[pu] = lowlink[pu].min(lowlink[vu]);
+                }
+                if lowlink[vu] == index[vu] {
+                    let mut members: Vec<u32> = Vec::new();
+                    loop {
+                        let w = stack.pop().expect("scc stack underflow");
+                        on_stack[w as usize] = false;
+                        members.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    // A single block is a cycle only if it loops to itself, and
+                    // that self-edge must itself be live.
+                    let cyclic = members.len() > 1 || (blocks[vu].succs.contains(&v) && live(vu));
+                    if cyclic {
+                        members.sort_unstable();
+                        out.push(members);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Iterative Tarjan SCC. Assigns [`Block::scc`] for every block that is part
