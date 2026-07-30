@@ -1355,13 +1355,30 @@ impl FpuArea {
     /// area would restore `MXCSR = 0` (SSE exceptions UNmasked), so the first
     /// denormal/inexact in user SSE would raise a spurious `#XF` — hence the
     /// two control words are seeded explicitly.
-    fn reset() -> Self {
-        let mut a = [0u8; narf_arch::x86_64::xsave::FPU_AREA_SIZE];
-        a[0] = 0x7F; // FCW byte 0
-        a[1] = 0x03; // FCW byte 1  → 0x037F
-        a[24] = 0x80; // MXCSR byte 0
-        a[25] = 0x1F; // MXCSR byte 1 → 0x1F80
-        FpuArea(a)
+    /// Heap-first construction of the reset image. A by-value
+    /// `FpuArea` return would materialise a 4 KiB temporary on the
+    /// caller's kernel stack — the exact frame bloat that overflowed
+    /// the 16 KiB own-stack in `sys_fork` (see the `fpu` field doc);
+    /// zero-allocating the Box and poking the two control words in
+    /// place keeps every frame small.
+    fn reset_boxed() -> alloc::boxed::Box<Self> {
+        let layout = core::alloc::Layout::new::<Self>();
+        // SAFETY: `FpuArea` is a plain `[u8; N]` wrapper — the all-zero
+        // bit pattern is a valid value — and `layout` is its exact
+        // (non-zero-size, 64-aligned) layout, so a zeroed allocation of
+        // it is a fully-initialized `FpuArea` the Box may own.
+        let mut b = unsafe {
+            let p = alloc::alloc::alloc_zeroed(layout) as *mut Self;
+            if p.is_null() {
+                alloc::alloc::handle_alloc_error(layout);
+            }
+            alloc::boxed::Box::from_raw(p)
+        };
+        b.0[0] = 0x7F; // FCW byte 0
+        b.0[1] = 0x03; // FCW byte 1  → 0x037F
+        b.0[24] = 0x80; // MXCSR byte 0
+        b.0[25] = 0x1F; // MXCSR byte 1 → 0x1F80
+        b
     }
 }
 
@@ -1398,7 +1415,15 @@ pub struct UserTaskFuture {
     /// every entry into user mode and `FXSAVE`'d on every trap-return,
     /// so the task's XMM/x87 state survives preemption + migration.
     /// See [`FpuArea`].
-    fpu: FpuArea,
+    ///
+    /// Boxed, NOT inline: `UserTaskFuture` and `PendingUserProcess`
+    /// travel by value through `sys_fork` / `do_clone3` / the spawn
+    /// helpers, and an inline 4 KiB `FpuArea` multiplied into ~14 KiB
+    /// of inlined stack frame in `sys_fork` — which overflowed the
+    /// 16 KiB per-task own kernel stack into the heap below it (the
+    /// wl_xdg slab free-block canary corruption). The Box keeps the
+    /// future a small struct; the FPU image lives on the heap.
+    fpu: alloc::boxed::Box<FpuArea>,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1436,7 +1461,7 @@ impl UserTaskFuture {
             state: TaskState::Initial,
             saved_cr3: core::cell::Cell::new(None),
             sleep_handle: None,
-            fpu: FpuArea::reset(),
+            fpu: FpuArea::reset_boxed(),
         }
     }
 
@@ -1477,7 +1502,7 @@ impl UserTaskFuture {
             // that issued the clone — XMM/x87 are caller-saved across the
             // syscall per the SysV ABI, so a canonical reset image (not
             // the parent's live FPU) is the correct seed.
-            fpu: FpuArea::reset(),
+            fpu: FpuArea::reset_boxed(),
         }
     }
 
@@ -2044,10 +2069,10 @@ impl core::future::Future for UserTaskFuture {
         if narf_scheduler::stackful::user_own_stack_enabled() {
             // Publish the FPU area so the scheduler's preempt/park can
             // FXSAVE/FXRSTOR it across a kernel_switch, then restore it now.
-            narf_scheduler::stackful::set_current_user_fpu(&this.fpu as *const FpuArea as *mut u8);
+            narf_scheduler::stackful::set_current_user_fpu(&*this.fpu as *const FpuArea as *mut u8);
             // SAFETY: live FpuArea (≥FPU_AREA_SIZE, 64-aligned); CR4.OSFXSR/OSXSAVE set.
             unsafe {
-                narf_arch::x86_64::xsave::fpu_restore(&this.fpu as *const FpuArea as *const u8);
+                narf_arch::x86_64::xsave::fpu_restore(&*this.fpu as *const FpuArea as *const u8);
             }
             let top = narf_scheduler::stackful::current_stackful_stack_top();
             let _ = slice_start_ns; // CPU accounting on the own-stack path TODO
@@ -2107,7 +2132,7 @@ impl core::future::Future for UserTaskFuture {
             // every CPU; the buffer lives in kernel memory mapped in the
             // active (user) AS's kernel half.
             unsafe {
-                narf_arch::x86_64::xsave::fpu_restore(&this.fpu as *const FpuArea as *const u8);
+                narf_arch::x86_64::xsave::fpu_restore(&*this.fpu as *const FpuArea as *const u8);
             }
             match this.state {
                 TaskState::Initial => {
@@ -2173,7 +2198,7 @@ impl core::future::Future for UserTaskFuture {
         // is in its kernel half; CR4.OSFXSR/OSXSAVE is set.
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            narf_arch::x86_64::xsave::fpu_save(&mut this.fpu as *mut FpuArea as *mut u8);
+            narf_arch::x86_64::xsave::fpu_save(&mut *this.fpu as *mut FpuArea as *mut u8);
         }
 
         // Longjmp path: a hook fired, control is back on the
