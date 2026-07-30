@@ -22,8 +22,7 @@ pub use crate::syscall::{
     kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
 };
 pub use crate::{
-    fd, install_address_space_lookup, install_core_syscalls, install_global,
-    install_task_id_lookup, syscall::__test_clear_global,
+    fd, install_core_syscalls, install_global, install_task_id_lookup, syscall::__test_clear_global,
 };
 
 // ── Linux errno wire values (negative, in `SyscallReturn.value`, status Ok) ──
@@ -59,14 +58,6 @@ static SAVED_AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<TestAsLookupFn>> 
 
 fn task_lookup() -> u64 {
     TASK_SLOT.load(Ordering::Relaxed)
-}
-
-/// The address-space lookup this harness installs: deliberately always `None`.
-///
-/// See the note in [`setup`] — this is what makes "no per-task AddressSpace" a
-/// property rather than a hope.
-fn no_address_space() -> Option<alloc::sync::Arc<narf_memory::AddressSpace>> {
-    None
 }
 
 /// Override the current-task id the harness reports. Resets to
@@ -123,25 +114,14 @@ pub fn setup() {
     fd::__test_reset();
     fd::init();
     install_task_id_lookup(task_lookup);
-    // This harness promises every test "a fake task + fd table but NO per-task
-    // AddressSpace" (see the note at the top of `abi_mem_tests.rs`), and a whole
-    // family of mem tests asserts the resulting `invalid_op`. That promise was
-    // documented and not enforced: `AS_LOOKUP` is one process-global
-    // `Option<fn>`, so any earlier test in the boot that called
-    // `install_address_space_lookup` — several in `tests/misc.rs` and
-    // `shell_e2e_tests.rs` do, and none uninstall it — left the harness handing
-    // out a live address space.
-    //
-    // The result was a latent cross-subsystem order dependency: those tests
-    // passed only while they happened to run before any installer. Adding tests
-    // anywhere in the image could reorder registration and turn them red, which
-    // is exactly what happened — `bootstrap` and `fb_ring_map` started
-    // *succeeding* where they must report `invalid_op`, and they passed when
-    // their subsystem ran alone.
-    //
-    // Installing a `None` lookup makes the documented precondition true by
-    // construction, for every test, regardless of what ran before.
-    install_address_space_lookup(no_address_space);
+    // The no-AS baseline this harness promises is established above, by the
+    // save-clear-restore of `address_space_lookup()`. An earlier version of this
+    // file also installed a `None`-returning lookup here; upstream arrived at
+    // the same fix independently and scoped it properly (restored in
+    // `teardown`, so a test body that installs its own bridge still works),
+    // which makes the second mechanism redundant. Two mechanisms for one
+    // invariant is how invariants rot, so the duplicate is gone rather than
+    // left as belt-and-braces.
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
