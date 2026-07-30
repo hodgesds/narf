@@ -326,6 +326,42 @@ and the perf event layer, all of which are closed.
    instructions per invocation, which is no bound inside an atomic probe. The
    interpreter burns per instruction retired; the JIT will burn per basic
    block, the same bound at coarser granularity.
+
+   The cost of that choice is now **measured**, not asserted. `cargo xtask
+   bpf-bench` runs the interpreter over four instruction mixes under both
+   policies as an A/B pair, N = 60 each, samples interleaved round-robin, and
+   applies §8's protocol. Median cycles per interpreted instruction, and the
+   per-instruction policy's cost relative to the hoisted one:
+
+   | shape  | cycles/insn | delta | 95% CI | decision |
+   |--------|------------:|------:|--------|----------|
+   | alu    | 97.4 | +0.22% | [+0.07, +0.37] | inconclusive (tests disagree) |
+   | mem    | 122.7 | +0.40% | [+0.26, +0.62] | significant, within δ |
+   | branch | 89.6 | +0.63% | [+0.43, +0.79] | significant, within δ |
+   | call   | 88.1 | +0.03% | [−0.11, +0.25] | no difference established |
+
+   Declared δ is 3%. The suite also carries an **A/A control** — a second
+   monomorphisation of the production policy, compared against production —
+   whose delta bounds what the harness can resolve: within ±0.2% on this
+   runner. The controls are what make the numbers above readable, and they
+   corrected an earlier answer: a two-arm build measured +2.4% on `mem` and
+   +1.2% on `branch`, and adding a third instantiation moved both to under
+   0.7%. Most of that 2.4% was where the function landed in the image, not
+   what it did. Between-build code placement is a larger effect on this
+   interpreter than the fuel policy is.
+
+   So the original justification — "the interpreter already pays a decode and
+   a match per instruction, so the marginal cost is noise" — holds, with the
+   number attached: at most ~0.7% of interpreter throughput, on the
+   branch-heavy mix, well inside δ. Item 7 stays resolved.
+
+   Runner caveat: collected under KVM on an AMD Zen4 laptop whose §8.2
+   noise-control preconditions (governor, boost, SMT, ASLR) are **not** met.
+   `bpf-bench` refuses such a runner unless `--allow-unverified-runner` is
+   passed and marks every record it emits `noise_control: unverified`. These
+   are development measurements, not publishable perf numbers; the conclusion
+   survives because the effect is an order of magnitude below δ, not because
+   the environment was clean.
 8. **aarch64 `probe.rs`.** Porting the x86_64 recoverable-probe module would
    let `memory/src/tests.rs`'s four `probe::arm` sites stop being x86-only.
    Optional scope, but adjacent.
@@ -348,6 +384,40 @@ and the perf event layer, all of which are closed.
     both. The fix is probably for linearity to key on `PtrKind::LockGuard`
     directly rather than on the validity domain; it should land with the
     abstract interpreter, which is the first consumer that cares.
+11. **`bpf(2)` load latency has no yield point, and verification dominates
+    it.** Measured by `cargo xtask bpf-bench` (N = 60, same runner caveat as
+    item 7), for one `BpfProg::load` of a 64-instruction straight-line
+    program:
+
+    | phase | median cycles | share |
+    |-------|--------------:|------:|
+    | verify | 140 050 | 69% |
+    | codegen | 11 076 | 5% |
+    | publish (text alloc + write + extable + seal) | 47 322 | 23% |
+    | **total, end to end** | **203 878** | |
+
+    The three parts sum to 198 448 against a measured 203 878 — a 2.7%
+    residual for `BpfProg::load`'s own bookkeeping, which is also the check
+    that the decomposition is real.
+
+    The concern is the scaling. Verification costs 3 030 cycles per
+    instruction at 16 slots, 2 188 at 64, and 1 978 at 256 — flat, because it
+    is amortising a fixed cost, not because the fixpoint is cheap. Forking
+    changes that: the 194-slot `branchy194` shape (64 forward forks) costs
+    5 121 cycles per instruction, 2.6× the straight-line rate at comparable
+    size. `MAX_INSNS` is 65 536, so a maximally-branchy program at that rate
+    is on the order of 3 × 10⁸ cycles — ~100 ms — spent inside `sys_bpf` with
+    no yield point and no fuel-equivalent bound on the *verifier's* own work.
+    Fuel bounds what a program does at runtime; nothing bounds what proving it
+    costs.
+
+    Two things this suggests, neither scoped yet: a work budget on the
+    fixpoint that fails a program as too complex rather than making the caller
+    wait, and an await point in the load path so a long verification is
+    preemptible. Note that Linux's `BPF_COMPLEXITY_LIMIT_INSNS` is exactly the
+    first of those, and §4.9's argument for not having one was about
+    *termination*, which fuel does handle — it was never an argument about
+    latency.
 
 ## 9. Post-review corrections
 
