@@ -8,11 +8,19 @@
 //! map cleanly. Everything else returns `ENOTSUP` with a `// LINUX-GAP` note at
 //! its arm, rather than a plausible-looking lie.
 //!
-//! Phase 1 implements two commands:
+//! Implemented here:
 //!
 //! * `BPF_PROG_LOAD` (5) — verify and load, returning a program fd.
 //! * `BPF_PROG_TEST_RUN` (10) — run once with a caller-supplied context and
 //!   report the return value in `attr.test.retval`.
+//! * `BPF_MAP_CREATE` (0) and the four element commands (1..=4), over the four
+//!   keyed map kinds in `narf_bpf::map`.
+//!
+//! The element commands take the **syscall** view of a per-CPU map: the value
+//! buffer spans every CPU at an 8-byte stride, exactly as Linux's
+//! `bpf_percpu_array_copy` lays it out. A program sees one CPU's slot instead;
+//! `narf_bpf::map::BpfMapOps` keeps the two views as separate methods so that
+//! neither caller can accidentally take the other's.
 //!
 //! Both require privilege (§4.10: there is no unprivileged mode and no second
 //! set of limits). The check is `task_may_load_bpf`, on per-task credentials;
@@ -23,6 +31,7 @@
 #[allow(unused_imports)]
 use super::*;
 
+use narf_bpf::map::{BpfMap, BpfMapCap, MapAttr, MapFile, MapKind};
 use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadRequest, ProgFile};
 use narf_bpf_verifier::kfunc::Context;
 use narf_capabilities::{Cap, Grant};
@@ -34,6 +43,7 @@ const EBADF_: i64 = 9;
 const EAGAIN: i64 = 11;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
+const EFAULT: i64 = 14;
 /// Linux's `ENOTSUPP` is an internal 524; the userspace-visible spelling is
 /// `EOPNOTSUPP`, which on Linux equals `ENOTSUP` (95).
 const ENOTSUP: i64 = 95;
@@ -149,11 +159,11 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         BPF_PROG_LOAD => prog_load(attr_uptr, size),
         BPF_PROG_TEST_RUN => prog_test_run(attr_uptr, size),
 
-        // LINUX-GAP: maps are Phase 3 (`bpf/specification/spec.md` §3.4 —
-        // five native kinds behind an ~8-method trait, against Linux's 45-slot
-        // `bpf_map_ops` union).
-        BPF_MAP_CREATE | BPF_MAP_LOOKUP_ELEM | BPF_MAP_UPDATE_ELEM | BPF_MAP_DELETE_ELEM
-        | BPF_MAP_GET_NEXT_KEY => -ENOTSUP,
+        BPF_MAP_CREATE => map_create(attr_uptr, size),
+        BPF_MAP_LOOKUP_ELEM => map_lookup_elem(attr_uptr, size),
+        BPF_MAP_UPDATE_ELEM => map_update_elem(attr_uptr, size),
+        BPF_MAP_DELETE_ELEM => map_delete_elem(attr_uptr, size),
+        BPF_MAP_GET_NEXT_KEY => map_get_next_key(attr_uptr, size),
 
         // LINUX-GAP: everything else — `BPF_OBJ_PIN`/`BPF_OBJ_GET` (bpffs
         // pinning), `BPF_PROG_ATTACH`/`DETACH` and `LINK_CREATE` (attach is
@@ -229,12 +239,21 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
         alloc::string::String::new()
     };
 
+    // Every map the program's `LD_IMM64` immediates name, resolved through the
+    // caller's fd table. The `Arc`s travel into the program and keep the maps
+    // alive after the creating fds are closed.
+    let maps = match resolve_prog_maps(&insns) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+
     let prog = match BpfProg::load(
         load_cap(),
         LoadRequest {
             name,
             insns,
             context,
+            maps,
         },
     ) {
         Ok(p) => p,
@@ -338,4 +357,328 @@ fn prog_test_run(attr_uptr: u64, size: usize) -> i64 {
         return -(e as i64);
     }
     0
+}
+// ── maps ────────────────────────────────────────────────────────────
+
+/// The `Cap<BpfMapCap, Grant>` this handler presents to `BpfMap::create`.
+///
+/// Minted and cached once, for the same two reasons as [`load_cap`]: it is
+/// plumbing rather than the authorisation check ([`task_may_load_bpf`] is
+/// that), and `Cap::bootstrap()` allocates an object-table slot per call, so
+/// minting per syscall would leak one per `BPF_MAP_CREATE`.
+fn map_cap() -> &'static Cap<BpfMapCap, Grant> {
+    use narf_lib::sync::IrqSafeSpinLock;
+    static SLOT: IrqSafeSpinLock<Option<&'static Cap<BpfMapCap, Grant>>> =
+        IrqSafeSpinLock::new(None);
+    let mut g = SLOT.lock();
+    if g.is_none() {
+        let c: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(Cap::<
+            BpfMapCap,
+            Grant,
+        >::bootstrap()));
+        *g = Some(c);
+    }
+    g.expect("just installed")
+}
+
+// `struct { … } map_create` field offsets within `union bpf_attr`.
+const MC_MAP_TYPE: usize = 0;
+const MC_KEY_SIZE: usize = 4;
+const MC_VALUE_SIZE: usize = 8;
+const MC_MAX_ENTRIES: usize = 12;
+const MC_MAP_FLAGS: usize = 16;
+const MC_MAP_NAME: usize = 28;
+
+// `struct { … } map_elem` field offsets. `value` and `next_key` are the same
+// union member, so one offset serves both.
+const ME_MAP_FD: usize = 0;
+const ME_KEY: usize = 8;
+const ME_VALUE: usize = 16;
+const ME_FLAGS: usize = 24;
+
+/// `BPF_F_NO_PREALLOC`.
+///
+/// Accepted and ignored. NARF's hash maps are always pre-sized — spec §4.6
+/// forbids allocating on the program-run path, which is the whole reason Linux
+/// has this flag as an *option* and NARF does not. A map created with it behaves
+/// identically; only its memory profile differs, and it differs in the safe
+/// direction.
+///
+/// // LINUX-GAP: on Linux this flag changes when memory is charged and lets a
+/// hash map hold more entries than were reserved. Here it cannot, and a loader
+/// that sets it (libbpf sets it for most hash maps) gets a working map rather
+/// than `EINVAL`.
+const BPF_F_NO_PREALLOC: u32 = 1;
+
+/// `BPF_F_ZERO_SEED`.
+///
+/// Accepted because it is already true: `crate::map`'s hash is unseeded, since
+/// there is no unprivileged BPF for a seed to defend against (spec §4.10).
+const BPF_F_ZERO_SEED: u32 = 64;
+
+fn map_create(attr_uptr: u64, size: usize) -> i64 {
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < MC_MAX_ENTRIES + 4 {
+        return -EINVAL;
+    }
+    let map_type = u32_at(&attr, MC_MAP_TYPE);
+    // LINUX-GAP: the map-type zoo beyond the native kinds — LRU, LPM tries,
+    // bloom filters, queues/stacks, map-in-map, and the whole
+    // graph-data-structure API — is deliberately absent (spec §3.4). Those
+    // become arena + kfunc libraries, not kernel map types, so `ENOTSUP` is the
+    // permanent answer rather than a placeholder. `RINGBUF` is the one that will
+    // arrive later.
+    let Some(kind) = MapKind::from_linux(map_type) else {
+        return -ENOTSUP;
+    };
+    let map_flags = if size >= MC_MAP_FLAGS + 4 {
+        u32_at(&attr, MC_MAP_FLAGS)
+    } else {
+        0
+    };
+    if map_flags & !(BPF_F_NO_PREALLOC | BPF_F_ZERO_SEED) != 0 {
+        // Every remaining flag changes observable behaviour — read-only maps,
+        // mmapability, NUMA placement, LRU tuning — so accepting one silently
+        // would be a lie about what the map does. `EINVAL` is what Linux
+        // returns for a flag a map type does not support.
+        return -EINVAL;
+    }
+
+    let map_attr = MapAttr {
+        kind,
+        key_size: u32_at(&attr, MC_KEY_SIZE),
+        value_size: u32_at(&attr, MC_VALUE_SIZE),
+        max_entries: u32_at(&attr, MC_MAX_ENTRIES),
+    };
+
+    // `map_name` is a fixed 16-byte NUL-padded field inside `bpf_attr`, not a
+    // pointer, so it is already in the buffer.
+    let name = if size >= MC_MAP_NAME + PROG_NAME_LEN {
+        let raw = &attr[MC_MAP_NAME..MC_MAP_NAME + PROG_NAME_LEN];
+        let end = raw.iter().position(|b| *b == 0).unwrap_or(PROG_NAME_LEN);
+        alloc::string::String::from_utf8_lossy(&raw[..end]).into_owned()
+    } else {
+        alloc::string::String::new()
+    };
+
+    let map = match BpfMap::create(map_cap(), map_attr, name) {
+        Ok(m) => m,
+        Err(e) => return -(i64::from(e.errno())),
+    };
+
+    let ops: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
+        alloc::sync::Arc::new(MapFile::new(map));
+    match fd::with_table(current_task_id(), |t| {
+        t.open(crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            // As for a program fd: Linux's `bpf_map_new_fd` passes `O_CLOEXEC`,
+            // because a leaked map fd is a leaked capability.
+            flags: crate::fd::FD_CLOEXEC,
+            status_flags: 0,
+        })
+    }) {
+        Some(n) => n as i64,
+        None => -EMFILE,
+    }
+}
+
+/// Recover the map behind a file descriptor.
+fn map_from_fd(fd: u32) -> Result<alloc::sync::Arc<narf_bpf::map::BpfMap>, i64> {
+    let ops = match fd::with_table(current_task_id(), |t| t.get(fd).map(|e| e.ops.clone())) {
+        Some(Some(o)) => o,
+        _ => return Err(-EBADF_),
+    };
+    ops.as_any()
+        .and_then(|a| a.downcast_ref::<MapFile>())
+        .map(MapFile::map)
+        .ok_or(-EINVAL)
+}
+
+/// The three fields every element command reads: the map, the key, and the
+/// user pointer for the value or next key.
+///
+/// Factored out because the four element commands agree on the layout and on
+/// the order the errnos come in — `EBADF` for the fd before `EFAULT` for the
+/// key — and four copies of that order is how one of them ends up different.
+struct ElemArgs {
+    map: alloc::sync::Arc<narf_bpf::map::BpfMap>,
+    key: alloc::vec::Vec<u8>,
+    value_uptr: u64,
+    flags: u64,
+}
+
+fn elem_args(attr_uptr: u64, size: usize, need_value: bool) -> Result<ElemArgs, i64> {
+    let attr = read_attr(attr_uptr, size)?;
+    if size < ME_VALUE + 8 {
+        return Err(-EINVAL);
+    }
+    let map = map_from_fd(u32_at(&attr, ME_MAP_FD))?;
+    let key_uptr = u64_at(&attr, ME_KEY);
+    let value_uptr = u64_at(&attr, ME_VALUE);
+    if key_uptr == 0 || (need_value && value_uptr == 0) {
+        // Linux takes a NULL key as `EFAULT` from `copy_from_user`, not as
+        // `EINVAL` — the exception is `GET_NEXT_KEY`, where NULL means "start
+        // at the first key" and the caller below never comes through here.
+        return Err(-EFAULT);
+    }
+    let key_size = map.attr().key_size as usize;
+    // SAFETY: `copy_from_user_vec` validates the range and length before it
+    // allocates, and converts a fault into `Err(EFAULT)`.
+    let key = unsafe { copy_from_user_vec(key_uptr, key_size) }.map_err(|e| -(e as i64))?;
+    Ok(ElemArgs {
+        map,
+        key,
+        value_uptr,
+        flags: if size >= ME_FLAGS + 8 {
+            u64_at(&attr, ME_FLAGS)
+        } else {
+            0
+        },
+    })
+}
+
+fn map_lookup_elem(attr_uptr: u64, size: usize) -> i64 {
+    let a = match elem_args(attr_uptr, size, true) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    let ops = a.map.ops();
+    // The syscall view: for a per-CPU kind this is every CPU's slot, so the
+    // caller's buffer is `cpus * round_up(value_size, 8)` bytes. Linux requires
+    // exactly the same and the man page says so; getting it wrong here would
+    // read past a userspace buffer.
+    let mut out = alloc::vec![0u8; ops.syscall_value_bytes()];
+    if let Err(e) = ops.lookup(&a.key, &mut out) {
+        return -(i64::from(e.errno()));
+    }
+    // SAFETY: range-validated inside `copy_to_user`, which also brackets SMAP.
+    match unsafe { copy_to_user(a.value_uptr, &out) } {
+        Ok(()) => 0,
+        Err(e) => -(e as i64),
+    }
+}
+
+fn map_update_elem(attr_uptr: u64, size: usize) -> i64 {
+    let a = match elem_args(attr_uptr, size, true) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    let ops = a.map.ops();
+    // SAFETY: as `elem_args`' key copy.
+    let value = match unsafe { copy_from_user_vec(a.value_uptr, ops.syscall_value_bytes()) } {
+        Ok(v) => v,
+        Err(e) => return -(e as i64),
+    };
+    match ops.update(&a.key, &value, a.flags) {
+        Ok(()) => 0,
+        Err(e) => -(i64::from(e.errno())),
+    }
+}
+
+fn map_delete_elem(attr_uptr: u64, size: usize) -> i64 {
+    let a = match elem_args(attr_uptr, size, false) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    match a.map.ops().delete(&a.key) {
+        Ok(()) => 0,
+        Err(e) => -(i64::from(e.errno())),
+    }
+}
+
+fn map_get_next_key(attr_uptr: u64, size: usize) -> i64 {
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < ME_VALUE + 8 {
+        return -EINVAL;
+    }
+    let map = match map_from_fd(u32_at(&attr, ME_MAP_FD)) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let key_uptr = u64_at(&attr, ME_KEY);
+    let next_uptr = u64_at(&attr, ME_VALUE);
+    if next_uptr == 0 {
+        return -EFAULT;
+    }
+    let key_size = map.attr().key_size as usize;
+    // A NULL key means "start at the first key" — this is the one element
+    // command where NULL is a value rather than a fault.
+    let key = if key_uptr == 0 {
+        None
+    } else {
+        // SAFETY: as above.
+        match unsafe { copy_from_user_vec(key_uptr, key_size) } {
+            Ok(k) => Some(k),
+            Err(e) => return -(e as i64),
+        }
+    };
+    let mut out = alloc::vec![0u8; key_size];
+    if let Err(e) = map.ops().next_key(key.as_deref(), &mut out) {
+        return -(i64::from(e.errno()));
+    }
+    // SAFETY: as above.
+    match unsafe { copy_to_user(next_uptr, &out) } {
+        Ok(()) => 0,
+        Err(e) => -(e as i64),
+    }
+}
+
+/// Resolve every map a program's `LD_IMM64` immediates name.
+///
+/// Linux does this in `resolve_pseudo_ldimm64` and *rewrites the instruction*
+/// to hold the map's kernel address. NARF does not rewrite: verification does
+/// not touch instructions (spec §1.7), so the resolved set travels beside the
+/// image and the interpreter resolves each reference again at run time from the
+/// same list. The cost is one lookup per `LD_IMM64`; the gain is that there is
+/// no second, patched copy of the program to keep consistent.
+///
+/// Duplicate fds collapse to one entry, so a program that names the same map
+/// twenty times holds one reference and the verifier sees one descriptor.
+fn resolve_prog_maps(
+    insns: &[narf_bpf_isa::Insn],
+) -> Result<alloc::vec::Vec<(i32, alloc::sync::Arc<narf_bpf::map::BpfMap>)>, i64> {
+    use narf_bpf_isa::{Decoded, Imm64};
+
+    let mut out: alloc::vec::Vec<(i32, alloc::sync::Arc<narf_bpf::map::BpfMap>)> =
+        alloc::vec::Vec::new();
+    let mut i = 0usize;
+    while i < insns.len() {
+        // An undecodable instruction is not this function's error to report:
+        // `BpfProg::load` decodes the whole image and names the offending slot.
+        let Ok((d, width)) = narf_bpf_isa::decode(insns, i) else {
+            return Ok(out);
+        };
+        if let Decoded::LoadImm64 { value, .. } = d {
+            let fd = match value {
+                Imm64::MapFd(fd) | Imm64::MapValue { fd, .. } => Some(fd),
+                // The `MapIdx` forms index this very list, so there is no fd to
+                // resolve — the loader must have named its maps by fd at least
+                // once for the array to exist. A program using only the index
+                // forms therefore resolves to an empty set and the verifier
+                // reports `UnknownMap`, which is the honest answer: NARF has no
+                // separate `fd_array` attribute to populate it from.
+                //
+                // LINUX-GAP: `bpf_attr.prog_load.fd_array` is not implemented,
+                // so `BPF_PSEUDO_MAP_IDX{,_VALUE}` cannot resolve. The verifier
+                // supports the forms; the syscall has nowhere to get the array.
+                Imm64::MapIdx(_) | Imm64::MapIdxValue { .. } => None,
+                _ => None,
+            };
+            if let Some(fd) = fd {
+                if !out.iter().any(|(f, _)| *f == fd) {
+                    let m = map_from_fd(fd as u32)?;
+                    out.push((fd, m));
+                }
+            }
+        }
+        i += width;
+    }
+    Ok(out)
 }

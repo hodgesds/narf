@@ -76,7 +76,7 @@ container = []
 # of process cgroup membership into the task lifecycle. Forwards to
 # narf-filesystem, which owns the cgroupfs tree. Orthogonal to
 # linux-compat and container.
-cgroup = ["narf-filesystem/cgroup"]
+cgroup = ["narf-filesystem/cgroup", "narf-bpf/cgroup"]
 
 [lints]
 workspace = true
