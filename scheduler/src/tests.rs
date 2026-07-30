@@ -458,6 +458,45 @@ kernel_test_in!("scheduler", smoke_scheduler_steal_disabled_returns_clean);
 
 // ── scheduler/affinity + AS routing ──────────────────────────────────
 
+fn smoke_scheduler_two_cpu_user_spawn_balances_bsp_and_ap() -> TestResult {
+    use crate::affinity::CpuId;
+
+    let mut sole_ap = [0u32; 64];
+    sole_ap[0] = 1;
+    let first = crate::user_affinity_from_aps(sole_ap, 1, 0);
+    let second = crate::user_affinity_from_aps(sole_ap, 1, 1);
+    let third = crate::user_affinity_from_aps(sole_ap, 1, 2);
+    if first.preferred != Some(CpuId::BOOT)
+        || second.preferred != Some(CpuId(1))
+        || third.preferred != Some(CpuId::BOOT)
+    {
+        return TestResult::Fail("sole-AP user placement did not alternate BSP/AP");
+    }
+    if first.allowed != crate::affinity::CpuSet::ALL
+        || second.allowed != crate::affinity::CpuSet::ALL
+    {
+        return TestResult::Fail("two-CPU user placement narrowed the allowed mask");
+    }
+
+    // Larger machines retain the AP-only policy: this fix must not move
+    // ordinary user work back onto the housekeeping BSP when multiple APs
+    // are available.
+    let mut several_aps = [0u32; 64];
+    several_aps[..3].copy_from_slice(&[1, 2, 3]);
+    for sequence in 0..6 {
+        let affinity = crate::user_affinity_from_aps(several_aps, 3, sequence);
+        if affinity.preferred == Some(CpuId::BOOT) {
+            return TestResult::Fail("multi-AP user placement selected the BSP");
+        }
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_two_cpu_user_spawn_balances_bsp_and_ap
+);
+
 fn smoke_scheduler_per_cpu_pin_to_bsp() -> TestResult {
     // Pinning a task to CpuId(0) lands it on BSP's queue. With the
     // BSP running run_until_empty, the task completes — same outcome

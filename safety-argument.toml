@@ -166,3 +166,11 @@ argument = "The frame edit embeds a verification-only static test binary in the 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The mount-change bridge invokes the existing global readiness notifier only after filesystem state has committed and released its mount-table lock. It carries no path, task, capability, mapping, domain, or ownership authority; waiters independently re-query their own namespace-scoped procfs view."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Two-CPU user-task placement changes only the preferred initial run queue within the existing CpuSet::ALL allowed mask. It does not expand the TCB, alter a task's domain, capability, address space, or saved security state, and larger topologies retain the existing AP-only policy."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The placement helper selects only already-online scheduler CPUs and enqueue_on continues to enforce the existing task metadata and domain restore path before polling. Alternating BSP/AP grants no memory or capability authority and never schedules outside Affinity.allowed."

@@ -686,9 +686,11 @@ impl TaskSpec {
     /// Not `const`: the affinity depends on the runtime enable flag.
     pub fn user_task() -> Self {
         let affinity = if user_task_smp_enabled() {
-            // Reserve the BSP for kernel/IRQ/forwarder work; run user
-            // tasks on the APs so the RX forwarder (BSP) and request
-            // processing (AP) pipeline across cores. See `user_ap_affinity`.
+            // Prefer APs so the RX forwarder (BSP) and request processing
+            // pipeline across cores. On a two-CPU topology the placement
+            // policy includes both CPUs: excluding the BSP there would put
+            // every user process on the sole AP and serialize fork bursts.
+            // See `user_ap_affinity`.
             user_ap_affinity()
         } else {
             Affinity::pinned(crate::affinity::CpuId::BOOT)
@@ -837,6 +839,29 @@ static NEXT_USER_AP: AtomicU32 = AtomicU32::new(0);
 /// but is the correct MQ core layout, so it's kept.
 static RX_FORWARDER_CORES: AtomicU32 = AtomicU32::new(0);
 
+/// Convert the online AP candidate list into a user-task affinity.
+///
+/// The sole-AP topology is special only in the mathematical sense: an
+/// AP-only round robin has one element and therefore performs no balancing.
+/// Include the BSP in that degenerate case so consecutive user-task spawns
+/// alternate across both allowed CPUs. Larger topologies retain the AP-only
+/// pipeline that keeps ordinary user work away from BSP housekeeping.
+fn user_affinity_from_aps(mut aps: [u32; 64], mut n: usize, sequence: u32) -> Affinity {
+    if n == 0 {
+        return Affinity::any();
+    }
+    if n == 1 && aps[0] != crate::affinity::CpuId::BOOT.0 {
+        aps[1] = aps[0];
+        aps[0] = crate::affinity::CpuId::BOOT.0;
+        n = 2;
+    }
+    let idx = (sequence as usize) % n;
+    Affinity {
+        allowed: crate::affinity::CpuSet::ALL,
+        preferred: Some(crate::affinity::CpuId(aps[idx])),
+    }
+}
+
 /// Reserve CPUs `0..n` for RX forwarders (see [`RX_FORWARDER_CORES`]).
 /// Idempotent; the driver calls this once it knows the queue count.
 pub fn reserve_rx_forwarder_cores(n: u32) {
@@ -844,9 +869,9 @@ pub fn reserve_rx_forwarder_cores(n: u32) {
 }
 
 /// Affinity for a user task when user-task SMP is live: **`preferred`
-/// biased to a round-robin online application processor, `allowed`
-/// left wide open** (every CPU). A soft initial-placement hint, not a
-/// pin.
+/// biased to round-robin online application processors (or BSP+AP on
+/// a two-CPU system), `allowed` left wide open** (every CPU). A soft
+/// initial-placement hint, not a pin.
 ///
 /// Rationale (redis SMP scaling — see `docs/redis-perf-plan.md`): the
 /// virtio RX forwarder and the other kernel housekeeping tasks are
@@ -859,12 +884,12 @@ pub fn reserve_rx_forwarder_cores(n: u32) {
 /// BSP, where it is woken and re-enqueued, forming the pipeline —
 /// measured: SMP PING p99 254→222µs, p50 69→65µs (20k samples).
 ///
-/// `allowed` stays `CpuSet::ALL` deliberately: an earlier hard "APs
-/// only" mask exiled *every* user task to the lone AP on a 2-vCPU box
-/// and starved co-resident user tasks (net-smoke's `netserve` never
-/// reached `listen`) while the BSP sat kernel-idle. Leaving the BSP in
-/// `allowed` lets work-stealing rebalance under load while keeping the
-/// AP bias for the common case.
+/// `allowed` stays `CpuSet::ALL` deliberately. On a topology with only one
+/// AP, initial placement also alternates over the BSP: relying on later
+/// stealing left every short-lived fork/exec child serialized on the AP
+/// while BSP housekeeping prevented timely steals. With two or more APs,
+/// initial placement remains AP-only to keep the common forwarder(BSP) ↔
+/// application(AP) pipeline.
 ///
 /// Falls back to `Affinity::any()` if — against the
 /// `user_task_smp_enabled()` precondition — no AP is online, so a task
@@ -872,14 +897,13 @@ pub fn reserve_rx_forwarder_cores(n: u32) {
 /// list is a fixed 64-wide buffer); NARF tops out well below that.
 fn user_ap_affinity() -> Affinity {
     // SOFT bias, not a hard pin: `allowed` stays ALL so a user task can
-    // still fall back to the BSP under load — only `preferred` (the
-    // initial-placement / target_cpu hint) is steered to a round-robin
-    // online AP. A hard "APs only" mask exiled *every* user task to the
-    // single AP on a 2-vCPU box, starving co-resident user tasks
-    // (observed: net-smoke's netserve never reached `listen`) while the
-    // BSP sat kernel-idle. Biasing only the initial CPU still forms the
-    // forwarder(BSP)↔app(AP) pipeline for a hot server (it spawns on an
-    // AP, is woken there, and re-enqueues there) without the starvation.
+    // still fall back to the BSP under load. `preferred` steers initial
+    // placement over APs on larger systems and over BSP+AP on a two-CPU
+    // system. A hard "APs only" mask exiled every user task to the single
+    // AP on a 2-vCPU box, starving co-resident user tasks (observed:
+    // net-smoke's netserve never reached `listen`) while the BSP sat
+    // kernel-idle. Larger systems keep the forwarder(BSP)↔app(AP) pipeline
+    // for hot servers without that degenerate-topology starvation.
     let cap = narf_lib::percpu::MAX_CPUS.min(64) as u32;
     // Skip CPUs reserved for RX forwarders so workers land on disjoint
     // cores (start at least at 1 — the BSP is never a worker target).
@@ -902,14 +926,7 @@ fn user_ap_affinity() -> Affinity {
             }
         }
     }
-    if n == 0 {
-        return Affinity::any();
-    }
-    let idx = (NEXT_USER_AP.fetch_add(1, Ordering::Relaxed) as usize) % n;
-    Affinity {
-        allowed: crate::affinity::CpuSet::ALL,
-        preferred: Some(crate::affinity::CpuId(aps[idx])),
-    }
+    user_affinity_from_aps(aps, n, NEXT_USER_AP.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Push `slot` onto `cpu`'s ready queue. Panics if `init()` hasn't run.

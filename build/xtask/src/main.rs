@@ -2152,6 +2152,10 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("oci_smoke", "oci-smoke-ok"),
         ("fs_smoke", "fs-ok"),
         ("fork_pipe_smoke", "fork-ok"),
+        // Early-systemd process topology: sixteen children are released
+        // together across available CPUs, self-exec with one explicitly
+        // preserved fd, report their post-exec identity, exit, and are reaped.
+        ("fork_exec_burst_smoke", "fork-exec-burst-ok"),
         ("pty_smoke", "pty-ok"),
         // Framebuffer smoke — opens /dev/fb0, FBIOGET_VSCREENINFO,
         // mmap MAP_SHARED, writes + reads back pixels through the
