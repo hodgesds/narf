@@ -419,6 +419,25 @@ and the perf event layer, all of which are closed.
     *termination*, which fuel does handle — it was never an argument about
     latency.
 
+    **Severity, and why nothing is being changed yet.** This is a quality-of-
+    service characteristic, not a denial of service: `bpf(2)` requires euid 0
+    (§4.10, `task_may_load_bpf`), so the only caller who can provoke a 100 ms
+    stall is one who can already do considerably worse. It is a privileged
+    process making its own syscall slow.
+
+    The existing `fixpoint_round_budget` does not bound this and is not the
+    lever. The measured 5 121 cycles per instruction is the cost of a fixpoint
+    that *converges* — real work proportional to branching, not a divergence —
+    so a tighter round cap would reject legitimate programs without addressing
+    the cost of legitimate ones.
+
+    So: recorded with numbers, deliberately unfixed. Adding a complexity limit
+    now would trade a real capability (large branchy programs verify) against a
+    problem no caller has reported, and the design already carries one
+    cautionary example of defensive machinery guarding a case that could not
+    arise (§9, the sizing fixpoint). The lever if this ever bites is an await
+    point in the load path, which costs nothing when verification is fast.
+
 ## 9. Post-review corrections
 
 A Fable review of the merged subsystem returned **do not land** with three
