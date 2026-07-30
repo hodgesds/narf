@@ -438,6 +438,35 @@ and the perf event layer, all of which are closed.
     arise (§9, the sizing fixpoint). The lever if this ever bites is an await
     point in the load path, which costs nothing when verification is fast.
 
+12. **A packet pointer needs *dynamic* region bounds, and the obvious
+    shortcut is an information leak.** XDP programs currently receive the frame
+    *summarised* into the context tuple (length, then 24 bytes as three words)
+    because a program cannot dereference the frame at all. Lifting that is the
+    next substantial verifier feature, and the shape of it is worth recording
+    before someone reaches for the easy version.
+
+    `PtrClass::Mem` is already the right class — "an untyped bounded byte
+    region", which is exactly what a packet is. What blocks it is that
+    `PtrVal::size` is an `Option<u64>`: a *constant*. A packet's length is only
+    known at runtime, so the feature is `Mem` whose bound comes from a register
+    or a sibling context field rather than from a literal. That is the same
+    feature a variable-size map value needs, and the same one a kfunc returning
+    `&[u8]` needs — the descriptor cannot express a size in return position
+    today for the same reason.
+
+    **The shortcut to avoid:** declaring the region a fixed size (an MTU, say)
+    and letting programs read anywhere inside it. That is unsound here in a way
+    it would not be for a buffer we owned. The frame reaches the classifier as
+    an *immutable borrow of a driver DMA buffer* — see the XDP attach notes —
+    so the runtime cannot zero the tail, and a program reading past a short
+    frame's real length would see the previous packet's bytes. An
+    information leak, and exactly the fail-open shape §9 records two of.
+
+    So: dynamic bounds or nothing. Until then the context summary is honest
+    about what a program gets, which is the property that matters — a program
+    that appeared to hold a packet pointer while silently seeing zeroes would
+    be worse than one that never had one.
+
 ## 9. Post-review corrections
 
 A Fable review of the merged subsystem returned **do not land** with three
