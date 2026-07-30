@@ -224,8 +224,9 @@ struct Collected {
 
 /// Run every registered benchmark and write the record stream to `out`.
 ///
-/// `n` overrides each benchmark's `target_n` when non-zero, so a cmdline can
-/// trade run time for tightness without a rebuild. It is clamped up to 30:
+/// `n_override` replaces each benchmark's `target_n` when non-zero, so a
+/// cmdline can trade run time for tightness without a rebuild. It is clamped
+/// up to 30:
 /// §8.3's floor is not a suggestion, and a harness that will happily emit
 /// `n=5` invites exactly the report the protocol exists to prevent.
 pub fn run(out: &mut impl Write, n_override: u32) {
