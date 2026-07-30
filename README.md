@@ -1,92 +1,95 @@
 # NARF
 
-**Not Another Rust Frame Kernel** — a `no_std` Rust *framekernel* for
-x86_64 + aarch64. Minimal Ring-0 TCB, hardware-enforced domain
-isolation (PKS / MTE / PCID-tagged page tables), zero-copy `Narf-Ring`
-IPC, async-first executor, capability-typed access control, no root
-user.
+**A framekernel with first-class Linux compatibility.**
+
+**Not Another Rust Frame Kernel** is a `no_std` Rust operating system
+for x86_64 and aarch64. NARF combines a small Ring-0 trusted computing
+base (TCB) with a kernel organized into protection domains, then
+exposes both a native interface and a Linux-compatible userspace
+interface. The goal is to contain kernel faults without giving up the
+shared-memory performance of a monolithic kernel or the software
+ecosystem built around the Linux ABI.
 
 GPL-2.0-or-later. See [`LICENSE`](LICENSE).
 
 ---
 
-## What it is
+## What is a framekernel?
 
-NARF is a research kernel built around four ideas:
+A **framekernel** is a kernel architecture in which a small trusted
+core — the *frame* — establishes the system's protection rules, while
+the rest of the kernel runs in hardware-isolated domains. The frame
+handles the operations that must be globally trusted: bootstrapping
+the machine, entering and leaving protection domains, dispatching
+traps, scheduling work, and managing memory protection.
 
-1. **Framekernel.** A small Rust TCB (boot, traps, scheduler, memory,
-   capabilities) plus everything else — drivers, the network stack,
-   filesystems above the VFS — in isolated *domains* that run at Ring 0
-   but can't access each other's memory. Three runtime-selected
-   backends enforce this in hardware: **PKS** on Intel SPR+, **MTE** on
-   aarch64, **PCID-tagged per-domain page tables** on AMD x86_64 /
-   pre-SPR Intel. See [`docs/DOMAIN_BACKENDS.md`](docs/DOMAIN_BACKENDS.md).
+A framekernel occupies a middle ground between familiar kernel models:
 
-2. **Async-first.** Every syscall, IRQ, and driver task is a stackless
-   Rust `Future` on a global executor. Direct context transfer lets a
-   caller donate its time-slice to the callee — no double-trip
-   scheduling. The executor *is* the scheduler.
-
-3. **Narf-Ring IPC.** Zero-copy shared-memory rings. Data moves via
-   Rust ownership transfer — bytes never relocate in physical RAM. A
-   producer surrenders a `DmaBuffer` into the ring; the consumer
-   receives the owning handle. No syscall on the fast path.
-
-4. **Capabilities, not permissions.** Every resource — memory region,
-   file, IPC ring, device — is named by a typed `Cap<T, R>`. No root,
-   no setuid, no ambient authority. Revocation is O(1) via an epoch
-   counter.
-
-The Linux-compat surface (epoll, eventfd, timerfd, clone3, mmap,
-fcntl, statx, signalfd, memfd, mount/umount/chroot/pivot_root, POSIX
-timers, namespaces) lives behind Cargo features so you can build a
-NARF-native kernel without it. It is complete enough to run unmodified
-musl binaries (BusyBox sh, dynamically linked) and an **OCI-style
-container** end-to-end — read a bundle (`config.json` + `rootfs/`),
-unshare namespaces, `chroot` into the rootfs, and `execve` the
-contained entrypoint, which then sees only the container's own
-filesystem. See [`docs/PERSONAS.md`](docs/PERSONAS.md).
-
----
-
-## Status
-
-| Stage | Theme | State |
+| Model | Where kernel services run | What must be trusted |
 |---|---|---|
-| 1 — Skeleton | Boot, async exec, console | **closed** |
-| 2 — Barrier | PKS / MTE + UIPI + GICv3 | **closed** |
-| 3 — Flow | Caps + Narf-Ring + first virtio | **closed** |
-| 4 — Compatibility | relibc / Linux-compat surface | **closed for in-tree shell + coreutils** |
-| 5 — Silicon | Boot on AMD Zen2 Renoir + Phoenix HawkPoint1 laptops | **in progress** |
-| G — Desktop Linux | `/dev/fb0` + evdev + DRM/KMS + `/dev/uinput`; unmodified libdrm & libwayland | **runs an off-the-shelf Wayland GUI app (weston-simple-shm)** |
-| D — Distro | Mounts a real Alpine Linux rootfs (ext2); chroot + exec its busybox/musl | **boots Alpine userland + runs the Wayland desktop inside it** |
+| Monolithic kernel | One privileged address space | The whole kernel, including every in-kernel driver |
+| Microkernel | Separate user processes and address spaces | A small kernel; service calls cross address-space boundaries |
+| Framekernel | One privileged address space split into hardware-enforced domains | The frame; isolated services remain outside the TCB |
 
-Today, both arches boot under QEMU and run the full async demo. The
-interactive end-to-end loop (`echo hello world` over `-serial stdio`)
-works through the IRQ-4 → byte ring → fd 0 → shell → fd 1 → UART chain.
-`cargo xtask test` runs 5022+ kernel-test smokes / 0 fail / 73 skip.
+Sharing an address space preserves direct calls and shared-memory data
+paths. Hardware domains prevent “runs in Ring 0” from meaning “may
+read or overwrite the entire kernel.” The result is a small security
+boundary without requiring a process and page-table switch for every
+kernel service.
 
-On the graphics track, NARF exposes Linux device files — `/dev/fb0`
-(fbdev), `/dev/input/event*` (evdev), `/dev/dri/card0` (DRM/KMS
-dumb-buffer modeset), `/dev/uinput` (virtual input) — and runs
-**unmodified** `libdrm` (`modetest` enumerates + modesets + page-flips)
-and `libwayland`. A Wayland compositor maps `xdg_toplevel` windows,
-presents client buffers via DRM/KMS **page-flip**, and delivers **real
-evdev input** (injected through `/dev/uinput`) over `wl_seat`. The
-headline: an **unmodified off-the-shelf GUI client** — weston's
-`simple-shm`, vendored verbatim — maps a window and renders a frame on
-NARF with zero awareness it isn't Linux.
+## How NARF uses the framekernel model
 
-Beyond individual binaries, NARF mounts a real **Alpine Linux 3.21** rootfs
-(ext2 on virtio-blk) and `chroot`s into it to run Alpine's *own* busybox +
-musl — `uname` inside the distro prints `NARF x86_64` — and even runs the
-**Wayland desktop from inside the distro** (compositor + weston-simple-shm
-against Alpine's musl, with `/dev` bind-mounted into the chroot). See
-[`docs/DESKTOP_LINUX_PLAN.md`](docs/DESKTOP_LINUX_PLAN.md).
+NARF's frame consists of `frame/`, the memory domain manager, the
+capability core, and the executor core; `security-model/` defines that
+trusted boundary. Drivers and other kernel subsystems execute at Ring
+0 / EL1. On the x86_64 backends, domain protection prevents them from
+freely accessing the frame or one another; the aarch64 design applies
+the same boundary with MTE tags.
 
-For the full per-feature landing log and live driver portfolio see
-[`STATUS.md`](STATUS.md). For the per-stage subsystem matrix see
-[`ROADMAP.md`](ROADMAP.md).
+NARF turns that architecture into a complete system with three
+connected mechanisms:
+
+1. **Domain backends.** NARF defines up to 16 protection domains. On
+   x86_64, boot-time feature detection selects **PKS** on supported
+   Intel systems or **PCID-tagged page tables** on AMD and older Intel
+   systems. The aarch64 design maps the same contract to **MTE** tags.
+   See
+   [`docs/DOMAIN_BACKENDS.md`](docs/DOMAIN_BACKENDS.md).
+
+2. **The async executor is the scheduler.** Syscalls, IRQ work, and
+   driver tasks are stackless Rust `Future`s. Direct context transfer
+   lets a caller donate its remaining time slice to a callee, avoiding
+   a second scheduling round trip.
+
+3. **Narf-Ring carries data across boundaries.** Shared-memory rings
+   transfer ownership of buffers instead of copying their bytes. The
+   domain system constrains access, and the executor wakes the
+   receiving task.
+
+## Linux compatibility is a first-class feature
+
+Linux compatibility is a supported userspace contract, not an
+afterthought or a claim that NARF is internally Linux. NARF implements
+a growing Linux ABI surface directly on its native process, VFS,
+networking, device, and async primitives. That surface
+includes Linux syscall numbers and semantics, dynamic ELF loading for
+musl, familiar interfaces such as epoll/eventfd/timerfd, and Linux
+device ABIs including fbdev, evdev, uinput, and DRM/KMS. Composable
+`container` and `cgroup` personalities add namespaces and the cgroup-v2
+hierarchy.
+
+This compatibility is delivered as the composable `linux-compat`
+personality and is enabled by default in the userspace crate. A
+NARF-native build can omit it with `--no-default-features`, and CI
+checks the native, Linux-compatible, container, and cgroup feature
+combinations independently.
+
+The important boundary is deliberate: Linux programs see the ABI they
+expect, while NARF retains isolated kernel domains and an async-first
+implementation underneath. See
+[`docs/PERSONAS.md`](docs/PERSONAS.md) for feature composition and
+[`docs/DESKTOP_LINUX_PLAN.md`](docs/DESKTOP_LINUX_PLAN.md) for the
+end-to-end compatibility track.
 
 ---
 
@@ -160,9 +163,8 @@ with `--esp-size-mib` / `--root-fs` / `--root-label` flags.
 | | Linux / BSD | NARF |
 |---|---|---|
 | TCB | Monolithic kernel — every driver is in the TCB | Minimal `frame/` + memory domain manager + caps core + executor + `security-model/`; drivers are *not* in the TCB |
-| Isolation | Address space (rings 0/3) | Address space + 16 hardware-enforced domains within Ring 0 |
+| Isolation | Address space (rings 0/3) | Up to 16 Ring-0 domains; PKS / PCID enforcement on x86_64, MTE design on aarch64 |
 | IPC | pipes / UDS / SysV / futex / io_uring | `Narf-Ring` — typed zero-copy ownership transfer with explicit acquire/release |
-| Authorization | uid/gid + LSM / capsicum / pledge | `Cap<T, R>` everywhere with O(1) epoch revocation; no root user |
 | Concurrency | Threads + locks | Stackless `Future`s on a domain-aware executor; direct context transfer |
 | ACPI / AML | ACPICA (C, imported) | From-scratch Rust parser + AML interpreter inside the TCB |
 
