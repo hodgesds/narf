@@ -1,9 +1,14 @@
-//! Host tests for the emitter.
+//! Host tests for the x86-64 emitter, and the program-building helpers both
+//! backends' tests share.
 //!
 //! Golden encodings rather than execution: running JITed code on the host would
 //! need an executable mapping and a matching ABI, and the property that matters
 //! here is that the *bytes* are right. Execution is covered in-kernel, where
 //! the same image runs against the interpreter's result.
+//!
+//! The aarch64 emitter's tests live in [`crate::tests_aarch64`], which adds a
+//! differential harness — an emulator plus a reference evaluator — because a
+//! host cannot execute the bytes it emits.
 
 use narf_bpf_isa::encode::encode;
 use narf_bpf_isa::{AluOp, CondOp, Decoded, Insn, Reg, Size, Source};
@@ -11,7 +16,7 @@ use narf_bpf_verifier::{Context, VerifiedProgram};
 
 use crate::{compile, JitError};
 
-fn r(n: u8) -> Reg {
+pub(crate) fn r(n: u8) -> Reg {
     Reg::new(n).expect("register in range")
 }
 
@@ -19,7 +24,7 @@ fn r(n: u8) -> Reg {
 /// verifier. Sound for a *codegen* test: the emitter's contract is "given a
 /// program the verifier accepted, produce equivalent machine code", and what
 /// is under test is the second half.
-fn verified(items: &[Decoded]) -> VerifiedProgram {
+pub(crate) fn verified(items: &[Decoded]) -> VerifiedProgram {
     let mut insns: Vec<Insn> = Vec::new();
     for d in items {
         insns.extend_from_slice(encode(*d).slots());
@@ -35,9 +40,9 @@ fn verified(items: &[Decoded]) -> VerifiedProgram {
     }
 }
 
-const EXIT: Decoded = Decoded::Exit;
+pub(crate) const EXIT: Decoded = Decoded::Exit;
 
-fn mov(dst: u8, v: i32) -> Decoded {
+pub(crate) fn mov(dst: u8, v: i32) -> Decoded {
     Decoded::Mov {
         wide: true,
         dst: r(dst),

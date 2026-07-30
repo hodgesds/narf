@@ -16,17 +16,23 @@
 //! the two together from one call: there is no way to obtain the code without
 //! also obtaining the table it requires.
 //!
-//! ## No sizing fixpoint, and no fuel — read this before enabling anything
+//! ## No sizing fixpoint on either backend
 //!
-//! Two things this crate does **not** do, both of which an earlier version of
-//! these docs claimed it did:
+//! Neither emitter runs a convergence loop, and each gets there a different
+//! way:
 //!
-//! * **There is no sizing fixpoint.** Every branch is `rel32`, so nothing
-//!   shrinks and nothing needs re-measuring. The convergence loop and the
-//!   123-byte short-branch cap borrowed from
-//!   `arch/x86/net/bpf_jit_comp.c:70-113` were removed: the emitter never
-//!   selected a short form, so the machinery guarded a hazard it was not
-//!   exposed to. It comes back with `rel8` selection, if that ever lands.
+//! * **x86-64**: every branch is `rel32`, so nothing shrinks and nothing needs
+//!   re-measuring. The convergence loop and the 123-byte short-branch cap
+//!   borrowed from `arch/x86/net/bpf_jit_comp.c:70-113` were removed: the
+//!   emitter never selected a short form, so the machinery guarded a hazard it
+//!   was not exposed to. It comes back with `rel8` selection, if that ever
+//!   lands.
+//! * **aarch64**: fixed-size branch *shapes* rather than one branch width.
+//!   `B` reaches ±128 MiB but `B.cond` only ±1 MiB, so a conditional jump
+//!   always lowers to an inverted-condition `B.cond` over a `B` — two
+//!   instructions whatever the distance. See [`aarch64`] for why a
+//!   distance-dependent choice is what oscillates.
+//!
 //! ## Fuel, and how exhaustion is reported
 //!
 //! The verifier deliberately does not prove termination — fuel is the *only*
@@ -34,15 +40,20 @@
 //! `loop: r0 += 1; goto loop` runs forever on a hook that may have IRQs masked.
 //!
 //! Fuel is burned **per basic block**, decrementing by the block's instruction
-//! count on entry: the same bound as the interpreter's per-instruction burn, at
-//! one `sub`/`jb` pair per block instead of per instruction.
+//! count on entry: the same *total* as the interpreter's per-instruction burn,
+//! at one subtract-and-branch per block instead of per instruction. Equal
+//! totals is a correctness property, not an optimisation — a program that
+//! completes JITed and exhausts fuel interpreted is a program whose verdict
+//! depends on whether it happened to clear `jit_glue`'s gates. Both backends
+//! compute the charge from the same `blocks` module so the two cannot drift.
 //!
-//! Exhaustion is reported **out of band**, in `rdx`. An in-band sentinel was
-//! tried and removed: the obvious choice, `u64::MAX`, is exactly what
-//! `r0 = -1; exit` returns, so "ran out of fuel" and "returned -1" would be the
-//! same answer. SysV returns a 128-bit value in `rax:rdx`, so the entry point
-//! is declared `-> u128` and the high half carries the flag — the value and the
-//! verdict travel together with no extra memory traffic and nothing to confuse.
+//! Exhaustion is reported **out of band**, in the second return register. An
+//! in-band sentinel was tried and removed: the obvious choice, `u64::MAX`, is
+//! exactly what `r0 = -1; exit` returns, so "ran out of fuel" and "returned -1"
+//! would be the same answer. Both ABIs return a 128-bit value in a register
+//! pair — SysV `rax:rdx`, AAPCS64 `x0:x1` — so the entry point is declared
+//! `-> u128` and the high half carries the flag. The value and the verdict
+//! travel together with no extra memory traffic and nothing to confuse.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -52,10 +63,14 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+pub mod aarch64;
+mod blocks;
 pub mod x86_64;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_aarch64;
 
 use narf_bpf_verifier::VerifiedProgram;
 
@@ -118,15 +133,16 @@ pub enum JitError {
 
 /// Whether this build has a native backend at all.
 ///
-/// `false` on aarch64, where programs run interpreted (spec §5). Exposed so a
-/// test can tell "no backend on this architecture" — a legitimate skip — from
-/// "there is a backend and this program did not compile", which must stay a
-/// failure. Conflating the two is how a differential test starts passing
-/// vacuously; keeping them apart is why this is a separate predicate rather
-/// than a check on the error.
+/// True on both supported architectures now that [`aarch64`] emits — spec §5's
+/// "aarch64 runs interpreted" no longer holds. Kept as a predicate rather than
+/// deleted: it is what lets a test tell "no backend on this architecture" — a
+/// legitimate skip — from "there is a backend and this program did not
+/// compile", which must stay a failure. Conflating the two is how a
+/// differential test starts passing vacuously, and a third architecture would
+/// bring the distinction straight back.
 #[must_use]
 pub const fn has_backend() -> bool {
-    cfg!(target_arch = "x86_64")
+    cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
 }
 
 /// Compile a verified program for the host architecture.
@@ -141,11 +157,14 @@ pub fn compile(prog: &VerifiedProgram) -> Result<Compiled, JitError> {
     {
         x86_64::compile(prog)
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        // aarch64 runs interpreted until its emitter lands (spec §5). Reported
-        // as `Unsupported` at instruction 0 so the caller's existing fallback
-        // path handles it with no special case.
+        aarch64::compile(prog)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        // Reported as `Unsupported` at instruction 0 so the caller's existing
+        // fallback path handles it with no special case.
         let _ = prog;
         Err(JitError::Unsupported {
             at: 0,

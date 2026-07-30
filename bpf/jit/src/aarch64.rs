@@ -1,0 +1,822 @@
+//! The aarch64 emitter.
+//!
+//! ## Register allocation
+//!
+//! Fixed, not allocated — same reason as the x86-64 backend: a static map lets
+//! the fault table name a *host* register directly, with no translation table
+//! to drift out of step (see [`FaultEntry::dst_host_reg`]).
+//!
+//! ```text
+//!   R0 → x0     R4 → x4     R8  → x21
+//!   R1 → x1     R5 → x5     R9  → x22
+//!   R2 → x2     R6 → x19    R10 → x25   (frame pointer, read-only)
+//!   R3 → x3     R7 → x20
+//! ```
+//!
+//! R0 → `x0` and R1..R5 → `x1`..`x5` is the AAPCS64 argument sequence, so a
+//! kfunc call would need almost no shuffling — the same reasoning as SysV on
+//! x86-64. R6..R9 and R10 land in callee-saved registers because BPF requires
+//! them to survive a call.
+//!
+//! **R10 is `x25`, deliberately not `x29`.** The x86-64 backend maps R10 to
+//! `rbp`, which is tempting to mirror as `x29`. It is not mirrored, because
+//! `x29` is architecturally the frame-record pointer that AAPCS64 backtraces
+//! follow, and aarch64 has *no kernel fault recovery* for current-EL data
+//! aborts (`frame/src/aarch64/trap.rs` handles lower-EL aborts only; a
+//! current-EL abort falls through to `exit_kernel(42)`). A fault anywhere near
+//! JITed code therefore ends in a fatal dump, and an intact frame chain is
+//! exactly what makes that dump readable. `x25` is a plain callee-saved
+//! register with none of that meaning.
+//!
+//! `x24` holds the fuel counter. `x16`/`x17` (IP0/IP1) are the scratch pair:
+//! `x16` carries materialised immediates, `x17` carries computed addresses.
+//! None of the four appears in the register map, so no BPF register can alias them —
+//! which is what makes writing them unconditionally safe. `x18` is left alone
+//! entirely (it is the platform register).
+//!
+//! ## Immediates always go through a register
+//!
+//! Every immediate operand is materialised into `x16` with a MOVZ/MOVK
+//! sequence and then used through the register form of the operation. That is
+//! more instructions than aarch64's immediate forms would need, and it is
+//! deliberate: `ADD`/`SUB` take a 12-bit unsigned immediate, `AND`/`ORR`/`EOR`
+//! take a *bitmask* immediate whose encoding is a rotate/element-width triple,
+//! and BPF immediates are `i32` sign-extended to 64 bits. Selecting between
+//! those forms means several encodings per operation, each an opportunity to
+//! emit something that assembles and computes the wrong thing. One register
+//! form per operation is one encoding to get right. Correctness first; the
+//! immediate forms are a size optimisation available later.
+//!
+//! The materialisation is a fixed four instructions (two for a 32-bit operand)
+//! regardless of the value, so an immediate's magnitude never changes the
+//! emitted size.
+//!
+//! ## Branch policy, and why it cannot oscillate
+//!
+//! `B` reaches ±128 MiB; `B.cond` only ±1 MiB. Rather than choose per branch —
+//! which needs the distance *before* emission and therefore a sizing fixpoint
+//! — every BPF branch lowers to a **fixed-size** shape:
+//!
+//! * unconditional (`ja`, `exit`): one `B`.
+//! * conditional: `B.<inverted cond> +8` over one `B`. Two instructions,
+//!   always, with the long-range `B` carrying the displacement.
+//!
+//! Nothing depends on the distance, so nothing is re-measured and there is no
+//! convergence loop to oscillate. That is the hazard Linux's x86 JIT documents
+//! at `arch/x86/net/bpf_jit_comp.c:70-113`: choosing a short form shrinks the
+//! image, which brings other branches into short range, which shrinks it
+//! again, and a branch that was in range at one size is out of range at the
+//! next. A single fixed shape has no such feedback.
+//!
+//! The one conditional branch that is *not* a trampoline is the per-block fuel
+//! test, which is `B.cond` straight to the out-of-fuel epilogue: it is the
+//! hottest branch in the image (one per block) and the trampoline would add an
+//! instruction to every block. Its range is checked when the displacement is
+//! patched and a program too large for `imm19` returns
+//! [`JitError::BadTarget`] — fail closed to the interpreter, never a truncated
+//! displacement.
+//!
+//! ## What is emitted, and what is not
+//!
+//! The subset `narf_bpf::jit_glue`'s gates admit: ALU (32 and 64 bit), `MOV`,
+//! doubleword loads and stores through R10/R1, jumps, conditional jumps, and
+//! `exit`. Everything else returns [`JitError::Unsupported`] and runs
+//! interpreted, which is a complete implementation — so an unemitted
+//! instruction costs speed, not correctness.
+//!
+//! Nothing here records a [`FaultEntry`]. That is not an omission to fill in
+//! later on this architecture: with no current-EL data-abort recovery, a
+//! faulting access in emitted code is fatal rather than fixable, so a fault
+//! site would have nothing to resume to. Emitting one would need the trap
+//! handler taught to recover first.
+
+use alloc::vec::Vec;
+
+use narf_bpf_isa::{decode, AluOp, CondOp, Decoded, Reg, Size, Source};
+use narf_bpf_verifier::VerifiedProgram;
+
+use crate::blocks::{block_len, block_starts};
+use crate::{Compiled, FaultEntry, FaultTable, JitError};
+
+/// Host register numbers.
+mod hr {
+    /// Holds the remaining fuel for the whole program. Callee-saved and absent
+    /// from [`super::REGS`], so no BPF register aliases it.
+    pub const FUEL: u8 = 24;
+    /// R10, the BPF frame pointer. See the module docs for why this is not
+    /// `x29`.
+    pub const FP: u8 = 25;
+    /// Scratch for materialised immediates (IP0).
+    pub const IMM: u8 = 16;
+    /// Scratch for computed addresses (IP1).
+    pub const ADDR: u8 = 17;
+    /// `sp` and `xzr` share encoding 31; which one an instruction means is
+    /// fixed by the instruction, not by the field.
+    pub const SP: u8 = 31;
+    /// The zero register.
+    pub const ZR: u8 = 31;
+}
+
+/// The BPF → host register map. See the module docs for why it is fixed.
+const REGS: [u8; 11] = [
+    0,      // R0
+    1,      // R1
+    2,      // R2
+    3,      // R3
+    4,      // R4
+    5,      // R5
+    19,     // R6
+    20,     // R7
+    21,     // R8
+    22,     // R9
+    hr::FP, // R10 — frame pointer
+];
+
+#[inline]
+const fn host(r: Reg) -> u8 {
+    REGS[r.as_usize()]
+}
+
+/// Callee-saved registers the body clobbers, in the order the prologue stores
+/// them. Three `STP` pairs, so the count must stay even.
+const SAVED: [u8; 6] = [19, 20, 21, 22, hr::FUEL, hr::FP];
+
+/// Bytes of stack the prologue claims for [`SAVED`].
+const FRAME_BYTES: i32 = 48;
+
+// ── instruction encoders ─────────────────────────────────────────────
+//
+// Every base constant below is the *64-bit* form; `sf` clears bit 31 to select
+// the 32-bit form, which is uniform across every class used here. Each was
+// cross-checked against `llvm-mc -triple=aarch64 -show-encoding` rather than
+// read off the manual, because the manual is where transcription errors come
+// from.
+
+/// Select the 32-bit form by clearing `sf` (bit 31).
+#[inline]
+const fn sf(base: u32, wide: bool) -> u32 {
+    if wide {
+        base
+    } else {
+        base & !(1 << 31)
+    }
+}
+
+/// `<op> Rd, Rn, Rm` — the shifted-register form with no shift.
+#[inline]
+const fn shifted_reg(base: u32, wide: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    sf(base, wide) | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+}
+
+const ADD_X: u32 = 0x8B00_0000;
+const SUB_X: u32 = 0xCB00_0000;
+const SUBS_X: u32 = 0xEB00_0000;
+const AND_X: u32 = 0x8A00_0000;
+const ANDS_X: u32 = 0xEA00_0000;
+const ORR_X: u32 = 0xAA00_0000;
+const EOR_X: u32 = 0xCA00_0000;
+/// `MADD Rd, Rn, Rm, Ra`; with `Ra = xzr` it is `MUL`.
+const MADD_X: u32 = 0x9B00_0000;
+/// Data-processing 2-source shift group. `LSLV` as encoded; `+0x400` selects
+/// `LSRV` and `+0x800` selects `ASRV`.
+const LSLV_X: u32 = 0x9AC0_2000;
+
+/// `MOV Rd, Rm` — `ORR Rd, ZR, Rm`.
+#[inline]
+const fn mov_rr(wide: bool, rd: u8, rm: u8) -> u32 {
+    shifted_reg(ORR_X, wide, rd, hr::ZR, rm)
+}
+
+/// `SUBS Rd, Rn, #imm12` (no shift). `imm` must be ≤ 0xFFF.
+#[inline]
+const fn subs_imm(wide: bool, rd: u8, rn: u8, imm: u16) -> u32 {
+    sf(0xF100_0000, wide) | ((imm as u32 & 0xFFF) << 10) | ((rn as u32) << 5) | rd as u32
+}
+
+/// `MOVZ Rd, #imm16, LSL #(16*hw)`.
+#[inline]
+const fn movz(wide: bool, rd: u8, hw: u8, imm: u16) -> u32 {
+    sf(0xD280_0000, wide) | ((hw as u32) << 21) | ((imm as u32) << 5) | rd as u32
+}
+
+/// `MOVK Rd, #imm16, LSL #(16*hw)`.
+#[inline]
+const fn movk(wide: bool, rd: u8, hw: u8, imm: u16) -> u32 {
+    sf(0xF280_0000, wide) | ((hw as u32) << 21) | ((imm as u32) << 5) | rd as u32
+}
+
+/// `LDUR Rt, [Rn, #simm9]` — the unscaled form, so a negative or unaligned
+/// displacement needs no special case. `simm9` must be in `-256..=255`.
+#[inline]
+const fn ldur(rt: u8, rn: u8, simm9: i32) -> u32 {
+    0xF840_0000 | (((simm9 as u32) & 0x1FF) << 12) | ((rn as u32) << 5) | rt as u32
+}
+
+/// `STUR Rt, [Rn, #simm9]`.
+#[inline]
+const fn stur(rt: u8, rn: u8, simm9: i32) -> u32 {
+    0xF800_0000 | (((simm9 as u32) & 0x1FF) << 12) | ((rn as u32) << 5) | rt as u32
+}
+
+/// `STP Rt, Rt2, [Rn, #imm]` with the addressing mode chosen by `base`.
+#[inline]
+const fn pair(base: u32, rt: u8, rt2: u8, rn: u8, byte_off: i32) -> u32 {
+    let imm7 = (byte_off / 8) as u32 & 0x7F;
+    base | (imm7 << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt as u32
+}
+
+/// `STP Rt, Rt2, [Rn, #imm]!` — pre-indexed, writing the base back.
+const STP_PRE: u32 = 0xA980_0000;
+/// `STP Rt, Rt2, [Rn, #imm]` — signed offset, base unchanged.
+const STP_OFF: u32 = 0xA900_0000;
+/// `LDP Rt, Rt2, [Rn, #imm]` — signed offset.
+const LDP_OFF: u32 = 0xA940_0000;
+/// `LDP Rt, Rt2, [Rn], #imm` — post-indexed, writing the base back.
+const LDP_POST: u32 = 0xA8C0_0000;
+
+/// `RET` (to `x30`).
+const RET: u32 = 0xD65F_03C0;
+
+/// The AAPCS64 condition codes this backend uses. Inverting any of them is
+/// `code ^ 1`, which the architecture guarantees for every code except
+/// `AL`/`NV` — neither of which appears here.
+mod cc {
+    pub const EQ: u8 = 0;
+    pub const NE: u8 = 1;
+    /// Unsigned ≥ — also "no borrow" after `SUBS`.
+    pub const HS: u8 = 2;
+    /// Unsigned < — also "borrow" after `SUBS`.
+    pub const LO: u8 = 3;
+    /// Unsigned >.
+    pub const HI: u8 = 8;
+    /// Unsigned ≤.
+    pub const LS: u8 = 9;
+    pub const GE: u8 = 10;
+    pub const LT: u8 = 11;
+    pub const GT: u8 = 12;
+    pub const LE: u8 = 13;
+}
+
+/// The condition to branch on when a BPF conditional jump is *taken*.
+///
+/// `JSET` is `TST`-then-not-zero; the caller emits the `TST`.
+const fn cond_cc(op: CondOp) -> u8 {
+    match op {
+        CondOp::Eq => cc::EQ,
+        CondOp::Ne => cc::NE,
+        CondOp::Gt => cc::HI,
+        CondOp::Ge => cc::HS,
+        CondOp::Lt => cc::LO,
+        CondOp::Le => cc::LS,
+        CondOp::Sgt => cc::GT,
+        CondOp::Sge => cc::GE,
+        CondOp::Slt => cc::LT,
+        CondOp::Sle => cc::LE,
+        CondOp::Set => cc::NE,
+    }
+}
+
+/// `B.<cond> #(4*imm19)`, relative to this instruction.
+#[inline]
+const fn b_cond(cond: u8, imm19: i32) -> u32 {
+    0x5400_0000 | (((imm19 as u32) & 0x7_FFFF) << 5) | cond as u32
+}
+
+/// `B #(4*imm26)`, relative to this instruction.
+#[inline]
+const fn b(imm26: i32) -> u32 {
+    0x1400_0000 | ((imm26 as u32) & 0x03FF_FFFF)
+}
+
+/// A byte sink that also records where things landed.
+#[derive(Debug, Default)]
+struct Emit {
+    buf: Vec<u8>,
+    faults: Vec<FaultEntry>,
+}
+
+impl Emit {
+    #[inline]
+    fn len(&self) -> u32 {
+        self.buf.len() as u32
+    }
+    /// Append one instruction word. Every aarch64 instruction is four bytes,
+    /// little-endian regardless of data endianness.
+    #[inline]
+    fn w(&mut self, insn: u32) {
+        self.buf.extend_from_slice(&insn.to_le_bytes());
+    }
+    /// Overwrite the word at `off`, for branch patching.
+    fn patch(&mut self, off: u32, insn: u32) {
+        let at = off as usize;
+        self.buf[at..at + 4].copy_from_slice(&insn.to_le_bytes());
+    }
+    fn word_at(&self, off: u32) -> u32 {
+        let at = off as usize;
+        u32::from_le_bytes([
+            self.buf[at],
+            self.buf[at + 1],
+            self.buf[at + 2],
+            self.buf[at + 3],
+        ])
+    }
+}
+
+/// Materialise a 64-bit constant into `dst`.
+///
+/// Always four instructions, so the size never depends on the value — the same
+/// property the x86-64 backend gets from always using the 10-byte `mov
+/// reg, imm64`. A shorter sequence for small constants would be a size that
+/// varies with the operand, which is the other way (besides branches) to make
+/// a sizing fixpoint oscillate. This backend has no fixpoint and intends to
+/// keep it that way.
+fn mov_imm64(e: &mut Emit, dst: u8, v: i64) {
+    let u = v as u64;
+    e.w(movz(true, dst, 0, u as u16));
+    e.w(movk(true, dst, 1, (u >> 16) as u16));
+    e.w(movk(true, dst, 2, (u >> 32) as u16));
+    e.w(movk(true, dst, 3, (u >> 48) as u16));
+}
+
+/// Materialise a 32-bit constant into `dst`, zero-extending to 64 bits.
+///
+/// Two instructions, likewise constant. Writing a `W` register zeroes the top
+/// half of the `X` register, which is exactly BPF's 32-bit `MOV` semantics.
+fn mov_imm32(e: &mut Emit, dst: u8, v: i32) {
+    let u = v as u32;
+    e.w(movz(false, dst, 0, u as u16));
+    e.w(movk(false, dst, 1, (u >> 16) as u16));
+}
+
+/// Put an immediate operand in [`hr::IMM`] and return that register.
+///
+/// For a 32-bit operation only the low half is ever read, so the two-word
+/// materialisation suffices; for a 64-bit one the immediate is sign-extended
+/// to 64 bits, matching the interpreter's `imm as i64 as u64`.
+fn imm_operand(e: &mut Emit, wide: bool, v: i32) -> u8 {
+    if wide {
+        mov_imm64(e, hr::IMM, i64::from(v));
+    } else {
+        mov_imm32(e, hr::IMM, v);
+    }
+    hr::IMM
+}
+
+/// The register holding `src`, materialising an immediate if needed.
+fn src_reg(e: &mut Emit, wide: bool, src: Source) -> u8 {
+    match src {
+        Source::Reg(r) => host(r),
+        Source::Imm(v) => imm_operand(e, wide, v),
+    }
+}
+
+/// The shifted-register base for a binary ALU operation, or `None` for the
+/// ones with their own encoding.
+const fn alu_base(op: AluOp) -> Option<u32> {
+    Some(match op {
+        AluOp::Add => ADD_X,
+        AluOp::Sub => SUB_X,
+        AluOp::Or => ORR_X,
+        AluOp::And => AND_X,
+        AluOp::Xor => EOR_X,
+        // Multiply is `MADD`; shifts are the 2-source group.
+        AluOp::Mul | AluOp::Lsh | AluOp::Rsh | AluOp::Arsh => return None,
+    })
+}
+
+/// The 2-source shift encoding for a shift operation.
+const fn shift_insn(op: AluOp, wide: bool, rd: u8, rn: u8, rm: u8) -> Option<u32> {
+    let base = match op {
+        AluOp::Lsh => LSLV_X,
+        AluOp::Rsh => LSLV_X + 0x400,  // LSRV — logical, matching BPF
+        AluOp::Arsh => LSLV_X + 0x800, // ASRV
+        _ => return None,
+    };
+    Some(shifted_reg(base, wide, rd, rn, rm))
+}
+
+/// Reloc target meaning "the shared epilogue" rather than a BPF instruction.
+///
+/// Every `exit` branches here instead of duplicating the restore sequence.
+/// Not a real instruction index, so it resolves against the final entry of the
+/// offset table, which is where the body ends and the epilogue begins.
+const EPILOGUE: u32 = u32::MAX;
+
+/// Reloc target meaning "the out-of-fuel epilogue".
+const OOF_EPILOGUE: u32 = u32::MAX - 1;
+
+/// Which branch field a relocation patches.
+///
+/// Both are fixed width — the point of the branch policy in the module docs is
+/// that a relocation never changes an instruction's *size*, only the
+/// displacement inside it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RelKind {
+    /// `B`, `imm26`, ±128 MiB.
+    B26,
+    /// `B.cond`, `imm19`, ±1 MiB.
+    Cond19,
+}
+
+/// A branch whose target is a BPF instruction index, resolved once every
+/// instruction's offset is known.
+#[derive(Copy, Clone, Debug)]
+struct Reloc {
+    /// Offset of the branch instruction word. aarch64 branch displacements are
+    /// relative to the branch itself, not to the following instruction, so
+    /// there is no separate base to record.
+    at: u32,
+    /// Target BPF instruction index, or one of the two pseudo-targets.
+    target: u32,
+    kind: RelKind,
+}
+
+/// Compile a verified program.
+///
+/// A single pass, with no sizing fixpoint: every branch shape has a fixed size
+/// that does not depend on how far it reaches (module docs), and every
+/// immediate materialisation has a fixed size that does not depend on its
+/// value. Nothing shrinks, so nothing needs re-measuring.
+///
+/// # Errors
+///
+/// [`JitError`]. `Unsupported` means "run this one interpreted".
+pub fn compile(prog: &VerifiedProgram) -> Result<Compiled, JitError> {
+    let e = emit_pass(prog)?;
+    Ok(Compiled {
+        code: e.buf,
+        faults: {
+            let mut f = e.faults;
+            f.sort_unstable_by_key(|x| x.fault_off);
+            FaultTable(f)
+        },
+        entry_off: 0,
+    })
+}
+
+fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
+    let mut e = Emit::default();
+    let mut relocs: Vec<Reloc> = Vec::new();
+    let mut out = Vec::with_capacity(prog.insns.len() + 1);
+    let starts = block_starts(prog)?;
+
+    emit_prologue(&mut e);
+
+    let mut i = 0usize;
+    while i < prog.insns.len() {
+        out.push(e.len());
+        // Burn this block's worth of fuel on entry. Per block rather than per
+        // instruction: the same total as the interpreter charges, because a
+        // block that is entered retires all of its instructions. The charge is
+        // taken *before* the block runs, so a block that cannot be paid for
+        // does not execute at all.
+        if starts[i] {
+            emit_fuel_burn(&mut e, block_len(prog, &starts, i), &mut relocs);
+        }
+        let (insn, width) =
+            decode(&prog.insns, i).map_err(|_| JitError::Decode { at: i as u32 })?;
+        emit_insn(&mut e, &insn, i as u32, &mut relocs)?;
+        i += width;
+        // A wide instruction occupies two slots. `LD_IMM64` is the only one and
+        // it is `Unsupported` here, so `width` is always 1 today; the trailing
+        // slot records the *following* instruction's offset, which is only
+        // sound because the verifier rejects a jump into it.
+        for _ in 1..width {
+            out.push(e.len());
+        }
+    }
+    out.push(e.len());
+
+    emit_epilogue(&mut e);
+    let oof_at = e.len();
+    emit_oof_epilogue(&mut e);
+
+    for r in &relocs {
+        let target = if r.target == OOF_EPILOGUE {
+            oof_at
+        } else if r.target == EPILOGUE {
+            // The last offset recorded is one past the body — the epilogue.
+            *out.last()
+                .expect("the offset table always has the trailing entry")
+        } else {
+            *out.get(r.target as usize)
+                .ok_or(JitError::BadTarget { at: r.target })?
+        };
+        // Relative to the branch itself, in instruction words.
+        let words = (i64::from(target) - i64::from(r.at)) / 4;
+        let word = e.word_at(r.at);
+        let patched = match r.kind {
+            RelKind::B26 => {
+                if !(-(1 << 25)..(1 << 25)).contains(&words) {
+                    return Err(JitError::BadTarget { at: r.target });
+                }
+                b(words as i32)
+            }
+            RelKind::Cond19 => {
+                // Out of `imm19` range means the image is larger than 1 MiB.
+                // Refused rather than truncated: a wrong displacement is a
+                // branch into the middle of an instruction, and the caller's
+                // answer to an error is to interpret.
+                if !(-(1 << 18)..(1 << 18)).contains(&words) {
+                    return Err(JitError::BadTarget { at: r.target });
+                }
+                b_cond((word & 0xF) as u8, words as i32)
+            }
+        };
+        e.patch(r.at, patched);
+    }
+    Ok(e)
+}
+
+/// Save the callee-saved registers the body clobbers, then install the ABI's
+/// arguments in the registers the body expects them in.
+///
+/// The ABI is `(frame_top, ctx_ptr, fuel)` in `x0`/`x1`/`x2`.
+fn emit_prologue(e: &mut Emit) {
+    // Three pairs in 48 bytes: the first is pre-indexed to claim the frame,
+    // the rest are plain offsets from the new `sp`.
+    e.w(pair(STP_PRE, SAVED[0], SAVED[1], hr::SP, -FRAME_BYTES));
+    e.w(pair(STP_OFF, SAVED[2], SAVED[3], hr::SP, 16));
+    e.w(pair(STP_OFF, SAVED[4], SAVED[5], hr::SP, 32));
+    // Fuel out of `x2` **before** anything writes `x2`, which R2 maps to.
+    e.w(mov_rr(true, hr::FUEL, 2));
+    // Frame top out of `x0` before anything writes `x0`, which R0 maps to.
+    e.w(mov_rr(true, hr::FP, 0));
+    // The context pointer needs no move at all: it arrives in `x1`, which is
+    // exactly R1's host register. Absence of an instruction is the kind of
+    // claim that stops being true silently if the register map is edited, so
+    // it is pinned two ways: `A64_PROLOGUE` is an exact word list with no
+    // `mov x1, x1` in it, and `a64_the_context_pointer_arrives_in_r1_untouched`
+    // loads through R1 and checks the value.
+    //
+    // R0 is zeroed. x86-64 does not, because there R0's host register is not
+    // an argument register and holds nothing meaningful on entry; here `x0`
+    // arrives holding `frame_top`, a kernel pointer, and a program that
+    // reached `exit` without writing R0 would return it to the caller.
+    e.w(mov_rr(true, 0, hr::ZR));
+}
+
+/// The normal epilogue: exhaustion flag clear, restore, return.
+fn emit_epilogue(e: &mut Emit) {
+    // `x1` is the high half of the 128-bit return — the exhaustion flag.
+    // Cleared here so a clean exit is unambiguous. Writing `x1` clobbers R1,
+    // which is finished with by definition at the epilogue.
+    e.w(mov_rr(true, 1, hr::ZR));
+    emit_restore(e);
+}
+
+/// The out-of-fuel epilogue: flag set, and `x0` left as-is (meaningless).
+fn emit_oof_epilogue(e: &mut Emit) {
+    e.w(movz(true, 1, 0, 1));
+    emit_restore(e);
+}
+
+fn emit_restore(e: &mut Emit) {
+    e.w(pair(LDP_OFF, SAVED[2], SAVED[3], hr::SP, 16));
+    e.w(pair(LDP_OFF, SAVED[4], SAVED[5], hr::SP, 32));
+    // Post-indexed, releasing the frame as it loads the first pair.
+    e.w(pair(LDP_POST, SAVED[0], SAVED[1], hr::SP, FRAME_BYTES));
+    e.w(RET);
+}
+
+/// `subs x24, x24, n` then a branch to the out-of-fuel epilogue on borrow.
+///
+/// `B.LO` is the right test: `SUBS` clears `C` exactly when the subtraction
+/// borrowed, i.e. when there was not enough fuel left to pay for this block.
+/// Testing the *result* instead would need a second comparison and would
+/// misread a wrapped counter as plenty.
+fn emit_fuel_burn(e: &mut Emit, n: u32, relocs: &mut Vec<Reloc>) {
+    if n <= 0xFFF {
+        e.w(subs_imm(true, hr::FUEL, hr::FUEL, n as u16));
+    } else {
+        burn_via_scratch(e, n);
+    }
+    let at = e.len();
+    e.w(b_cond(cc::LO, 0));
+    relocs.push(Reloc {
+        at,
+        target: OOF_EPILOGUE,
+        kind: RelKind::Cond19,
+    });
+}
+
+/// The fuel burn for a block longer than `SUBS`'s 12-bit immediate reaches —
+/// more than 4095 instructions with no branch and no branch target in them.
+///
+/// Rare, but a silently truncated charge would be a *fuel* bug, which is the
+/// class the interpreter and the JIT must not disagree on. Costing five words
+/// instead of one here is free of consequences: the block length is known
+/// before emission, so a size that varies with it cannot perturb any branch.
+/// There is no fixpoint to disturb.
+fn burn_via_scratch(e: &mut Emit, n: u32) {
+    mov_imm64(e, hr::IMM, i64::from(n));
+    e.w(shifted_reg(SUBS_X, true, hr::FUEL, hr::FUEL, hr::IMM));
+}
+
+/// Emit a conditional branch to a BPF instruction as an inverted-condition
+/// skip over an unconditional `B`. See the module docs for why the shape is
+/// fixed rather than chosen.
+fn emit_cond_branch(e: &mut Emit, taken: u8, target: u32, relocs: &mut Vec<Reloc>) {
+    // `+2` words skips the `B` that follows. Inverting the condition is
+    // `taken ^ 1` — architecturally exact for every code this backend uses.
+    e.w(b_cond(taken ^ 1, 2));
+    let at = e.len();
+    e.w(b(0));
+    relocs.push(Reloc {
+        at,
+        target,
+        kind: RelKind::B26,
+    });
+}
+
+/// The register holding `base + off`, and the displacement to use with it.
+///
+/// `LDUR`/`STUR` take an unscaled `simm9`, so they reach `-256..=255` — which
+/// covers every stack frame BPF allows. Beyond that the displacement is folded
+/// into [`hr::ADDR`] and the access uses a zero displacement, reusing the one
+/// memory encoding rather than adding the scaled and register-offset forms.
+/// Fewer encodings is fewer chances to emit something that assembles and
+/// addresses the wrong place.
+///
+/// The unscaled forms are also why negative offsets need no special case at
+/// all: `LDR`/`STR` with `uimm12` cannot express one, and every BPF stack
+/// access is negative.
+fn addr_operand(e: &mut Emit, base: u8, off: i16) -> (u8, i32) {
+    let off = i32::from(off);
+    if (-256..=255).contains(&off) {
+        (base, off)
+    } else {
+        mov_imm64(e, hr::ADDR, i64::from(off));
+        e.w(shifted_reg(ADD_X, true, hr::ADDR, base, hr::ADDR));
+        (hr::ADDR, 0)
+    }
+}
+
+fn emit_insn(
+    e: &mut Emit,
+    insn: &Decoded,
+    at: u32,
+    relocs: &mut Vec<Reloc>,
+) -> Result<(), JitError> {
+    match *insn {
+        Decoded::Mov {
+            wide,
+            dst,
+            src,
+            sign_extend: None,
+        } => match src {
+            Source::Reg(s) => e.w(mov_rr(wide, host(dst), host(s))),
+            Source::Imm(v) => {
+                if wide {
+                    mov_imm64(e, host(dst), i64::from(v));
+                } else {
+                    // A `W`-register write zero-extends, which is exactly
+                    // BPF's semantics for a 32-bit move.
+                    mov_imm32(e, host(dst), v);
+                }
+            }
+        },
+
+        Decoded::Alu {
+            wide,
+            op: op @ (AluOp::Lsh | AluOp::Rsh | AluOp::Arsh),
+            dst,
+            src,
+        } => {
+            // The count goes through a register even when it is a constant.
+            // `LSLV`/`LSRV`/`ASRV` mask it to the operand width in hardware —
+            // mod 64 for `X`, mod 32 for `W` — which is exactly the
+            // interpreter's `b & 63` / `b & 31`. The constant-shift forms
+            // (`UBFM`/`SBFM` aliases, with their inverted immediate fields)
+            // would save one instruction and add an encoding class to get
+            // wrong.
+            let rm = src_reg(e, wide, src);
+            let Some(w) = shift_insn(op, wide, host(dst), host(dst), rm) else {
+                return Err(JitError::Unsupported {
+                    at,
+                    what: "unhandled shift operation",
+                });
+            };
+            e.w(w);
+        }
+
+        Decoded::Alu {
+            wide,
+            op: AluOp::Mul,
+            dst,
+            src,
+        } => {
+            // `MADD Rd, Rn, Rm, xzr` — the truncating multiply, which is what
+            // BPF's is. There is no wide-result register pair to clobber the
+            // way x86-64's one-operand `mul` has, so no trap here.
+            let rm = src_reg(e, wide, src);
+            e.w(sf(MADD_X, wide)
+                | ((rm as u32) << 16)
+                | ((hr::ZR as u32) << 10)
+                | ((host(dst) as u32) << 5)
+                | host(dst) as u32);
+        }
+
+        Decoded::Neg { wide, dst } => {
+            // `NEG Rd, Rd` — `SUB Rd, ZR, Rd`.
+            e.w(shifted_reg(SUB_X, wide, host(dst), hr::ZR, host(dst)));
+        }
+
+        Decoded::Alu { wide, op, dst, src } => {
+            let Some(base) = alu_base(op) else {
+                return Err(JitError::Unsupported {
+                    at,
+                    what: "unhandled ALU operation",
+                });
+            };
+            let rm = src_reg(e, wide, src);
+            e.w(shifted_reg(base, wide, host(dst), host(dst), rm));
+        }
+
+        Decoded::Load {
+            size: Size::Dw,
+            sign_extend: false,
+            dst,
+            src,
+            off,
+        } => {
+            let (base, disp) = addr_operand(e, host(src), off);
+            e.w(ldur(host(dst), base, disp));
+        }
+
+        Decoded::Store {
+            size: Size::Dw,
+            dst,
+            off,
+            src: Source::Reg(s),
+        } => {
+            let (base, disp) = addr_operand(e, host(dst), off);
+            e.w(stur(host(s), base, disp));
+        }
+
+        Decoded::Store {
+            size: Size::Dw,
+            dst,
+            off,
+            src: Source::Imm(v),
+        } => {
+            // The stored value is the immediate sign-extended to 64 bits,
+            // matching the interpreter's `imm as i64 as u64`. `hr::IMM` holds
+            // the value and `hr::ADDR` the address, so the two scratch uses
+            // cannot collide.
+            mov_imm64(e, hr::IMM, i64::from(v));
+            let (base, disp) = addr_operand(e, host(dst), off);
+            e.w(stur(hr::IMM, base, disp));
+        }
+
+        Decoded::Jump { off } => {
+            let at_word = e.len();
+            e.w(b(0));
+            relocs.push(Reloc {
+                at: at_word,
+                target: (at as i64 + 1 + i64::from(off)) as u32,
+                kind: RelKind::B26,
+            });
+        }
+
+        Decoded::JumpCond {
+            wide,
+            op,
+            dst,
+            src,
+            off,
+        } => {
+            // Compare, then branch. `JSET` is `TST` (`ANDS` to `xzr`) instead
+            // of `CMP` (`SUBS` to `xzr`).
+            let rm = src_reg(e, wide, src);
+            let base = if op == CondOp::Set { ANDS_X } else { SUBS_X };
+            e.w(shifted_reg(base, wide, hr::ZR, host(dst), rm));
+            emit_cond_branch(
+                e,
+                cond_cc(op),
+                (at as i64 + 1 + i64::from(off)) as u32,
+                relocs,
+            );
+        }
+
+        Decoded::Exit => {
+            // Branch to the shared epilogue rather than duplicating the
+            // restore sequence at every `exit`.
+            let at_word = e.len();
+            e.w(b(0));
+            relocs.push(Reloc {
+                at: at_word,
+                target: EPILOGUE,
+                kind: RelKind::B26,
+            });
+        }
+
+        _ => {
+            return Err(JitError::Unsupported {
+                at,
+                what: "instruction not yet emitted by the aarch64 backend",
+            })
+        }
+    }
+    Ok(())
+}
