@@ -652,6 +652,8 @@ dependencies = [
  "narf-init",
  "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
+ "narf-rcu",
  "narf-tracing",
 ]
 
