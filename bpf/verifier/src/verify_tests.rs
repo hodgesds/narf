@@ -21,7 +21,7 @@ use narf_bpf_isa::{AluOp, AtomicOp, CallTarget, CondOp, Decoded, Imm64, Insn, Re
 use crate::kfunc::{
     ArgDesc, ArgFlags, Context, KfuncDesc, PtrKind, TypeKey, TypeKind, ValidityDomain,
 };
-use crate::{interp, verify, Program, VerifiedProgram, VerifyError};
+use crate::{interp, verify, MapDesc, Program, VerifiedProgram, VerifyError};
 
 // ── Program construction ────────────────────────────────────────────
 
@@ -117,11 +117,13 @@ fn encode_all(insns: &[Decoded]) -> Vec<Insn> {
     out
 }
 
-/// Verify with an explicit context tuple, kfunc set, and execution context.
-fn check_full(
+/// Verify with an explicit context tuple, kfunc set, map set, and execution
+/// context.
+fn check_all(
     insns: &[Decoded],
     ctx_fields: &'static [ArgDesc],
     kfuncs: &[KfuncDesc],
+    maps: &[MapDesc],
     context: Context,
 ) -> Result<VerifiedProgram, VerifyError> {
     let image = encode_all(insns);
@@ -139,7 +141,23 @@ fn check_full(
         context,
         ctx_fields,
         kfuncs: &kfuncs,
+        maps,
     })
+}
+
+/// Verify with an explicit context tuple, kfunc set, and execution context.
+fn check_full(
+    insns: &[Decoded],
+    ctx_fields: &'static [ArgDesc],
+    kfuncs: &[KfuncDesc],
+    context: Context,
+) -> Result<VerifiedProgram, VerifyError> {
+    check_all(insns, ctx_fields, kfuncs, &[], context)
+}
+
+/// Verify an atomic program against a map set.
+fn check_maps(insns: &[Decoded], maps: &[MapDesc]) -> Result<VerifiedProgram, VerifyError> {
+    check_all(insns, &[], &[], maps, Context::Atomic)
 }
 
 /// Verify an atomic program with no context and no kfuncs.
@@ -1565,22 +1583,6 @@ fn an_atomic_on_a_scalar_is_rejected() {
 // ── Constructs that fail closed ─────────────────────────────────────
 
 #[test]
-fn map_pseudo_immediates_are_not_implemented_yet() {
-    // Maps are Phase 3, and there is nowhere in `Program` to describe one. A
-    // verifier that guessed a value size would be worse than one that says no.
-    let e = check(&[
-        Decoded::LoadImm64 {
-            dst: r(1),
-            value: Imm64::MapFd(3),
-        },
-        mov(0, 0),
-        EXIT,
-    ])
-    .unwrap_err();
-    assert!(matches!(e, VerifyError::NotImplemented(_)), "{e:?}");
-}
-
-#[test]
 fn callback_subprogram_addresses_are_not_implemented_yet() {
     // Main must *terminate* before the callback's entry slot. It previously did
     // not — a `mov` sat where the boundary falls, so main fell straight through
@@ -1604,6 +1606,379 @@ fn callback_subprogram_addresses_are_not_implemented_yet() {
     ])
     .unwrap_err();
     assert!(matches!(e, VerifyError::NotImplemented(_)), "{e:?}");
+}
+
+// ── `LD_IMM64` map pseudo-forms ──────────────────────────────────────
+
+const MAP8: MapDesc = MapDesc {
+    fd: 3,
+    key_size: 4,
+    value_size: 8,
+    max_entries: 16,
+};
+
+fn ld_map_fd(dst: u8, fd: i32) -> Decoded {
+    Decoded::LoadImm64 {
+        dst: r(dst),
+        value: Imm64::MapFd(fd),
+    }
+}
+
+fn ld_map_value(dst: u8, fd: i32, value_offset: i32) -> Decoded {
+    Decoded::LoadImm64 {
+        dst: r(dst),
+        value: Imm64::MapValue { fd, value_offset },
+    }
+}
+
+#[test]
+fn a_map_fd_immediate_resolves_against_the_map_set() {
+    // Was `NotImplemented` before `Program` carried a map set. The handle is
+    // opaque, so the only thing the program does with it here is not touch it.
+    let v = check_maps(&[ld_map_fd(1, 3), mov(0, 0), EXIT], &[MAP8]).expect("map fd resolved");
+    // A handle is not an arena pointer; naming one must not pin the arena base
+    // register for the program's whole body.
+    assert!(!v.uses_arena);
+}
+
+#[test]
+fn an_unknown_map_fd_is_rejected() {
+    // Fails closed: the value width is what bounds every access through a map
+    // pointer, and there is no safe default for a width nobody stated.
+    let e = check_maps(&[ld_map_fd(1, 9), mov(0, 0), EXIT], &[MAP8]).unwrap_err();
+    assert!(
+        matches!(e, VerifyError::UnknownMap { at: 0, fd: 9 }),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_map_fd_immediate_with_an_empty_map_set_is_rejected() {
+    let e = check(&[ld_map_fd(1, 3), mov(0, 0), EXIT]).unwrap_err();
+    assert!(
+        matches!(e, VerifyError::UnknownMap { at: 0, fd: 3 }),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_map_handle_may_not_be_dereferenced() {
+    // Linux's `CONST_PTR_TO_MAP` is equally undereferenceable. Here it falls out
+    // of the handle being a `PtrClass::Object` with no BTF: nothing says how
+    // large a `struct bpf_map` is, so no offset can be proved inside it.
+    let e = check_maps(&[ld_map_fd(1, 3), ldx(Size::Dw, 0, 1, 0), EXIT], &[MAP8]).unwrap_err();
+    assert!(
+        matches!(e, VerifyError::OpaqueDeref { at: 2, reg: 1 }),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_map_handle_may_not_be_returned() {
+    // `exit` hands R0 to the kernel. A pointer there is a kernel address
+    // leaking into a program's return value.
+    let e = check_maps(&[ld_map_fd(0, 3), EXIT], &[MAP8]).unwrap_err();
+    assert!(
+        matches!(e, VerifyError::PointerArithmetic { at: 2, reg: 0 }),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_map_index_immediate_resolves_by_position() {
+    // `BPF_PSEUDO_MAP_IDX` indexes the loader's fd array instead of naming an
+    // fd, which is how libbpf avoids patching instructions after creating the
+    // maps. Descriptor 1 is deliberately given a *different* fd from its index,
+    // so a resolver that confused the two would fail this.
+    let maps = [
+        MapDesc { fd: 40, ..MAP8 },
+        MapDesc {
+            fd: 41,
+            value_size: 32,
+            ..MAP8
+        },
+    ];
+    let v = check_maps(
+        &[
+            Decoded::LoadImm64 {
+                dst: r(1),
+                value: Imm64::MapIdx(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        &maps,
+    );
+    assert!(v.is_ok(), "{:?}", v.unwrap_err());
+    // ...and index 2 does not exist, even though there are fds 40 and 41.
+    let e = check_maps(
+        &[
+            Decoded::LoadImm64 {
+                dst: r(1),
+                value: Imm64::MapIdx(2),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        &maps,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, VerifyError::UnknownMap { at: 0, fd: 2 }),
+        "{e:?}"
+    );
+    // A negative index is the same failure, not a panic on the cast.
+    let e = check_maps(
+        &[
+            Decoded::LoadImm64 {
+                dst: r(1),
+                value: Imm64::MapIdx(-1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        &maps,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, VerifyError::UnknownMap { at: 0, fd: -1 }),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_map_value_immediate_is_a_bounded_writable_region() {
+    // This is the form LLVM emits for a global variable, whose storage is a
+    // one-entry `.data`/`.bss` map. The whole point of the descriptor is that
+    // `value_size` bounds the access.
+    let v = check_maps(
+        &[
+            ld_map_value(1, 3, 0),
+            ldx(Size::Dw, 0, 1, 0),
+            st(Size::Dw, 1, 0, 7),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[MAP8],
+    );
+    assert!(v.is_ok(), "{:?}", v.unwrap_err());
+    // A map value is not a faulting class, so no exception-table entry is owed
+    // for an access through it.
+    assert!(v.unwrap().fault_sites.is_empty());
+}
+
+#[test]
+fn a_map_value_access_past_the_value_is_rejected() {
+    // `value_size` is 8, so a dword load at +8 is one byte past the end. The
+    // bound is what the whole descriptor exists to supply; without it this
+    // pointer would be an unbounded region.
+    let e = check_maps(
+        &[ld_map_value(1, 3, 0), ldx(Size::Dw, 0, 1, 8), EXIT],
+        &[MAP8],
+    )
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::OutOfBounds { at: 2 }), "{e:?}");
+}
+
+#[test]
+fn a_map_value_offset_is_folded_into_the_pointer() {
+    // `value_offset` shifts the whole window, so with a 16-byte value and an
+    // offset of 8 the reachable range is [8, 16): a dword at +0 fits and one at
+    // +8 does not. A resolver that dropped the offset would accept both.
+    const MAP16: MapDesc = MapDesc {
+        value_size: 16,
+        ..MAP8
+    };
+    let ok = check_maps(
+        &[ld_map_value(1, 3, 8), ldx(Size::Dw, 0, 1, 0), EXIT],
+        &[MAP16],
+    );
+    assert!(ok.is_ok(), "{:?}", ok.unwrap_err());
+    let e = check_maps(
+        &[ld_map_value(1, 3, 8), ldx(Size::Dw, 0, 1, 8), EXIT],
+        &[MAP16],
+    )
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::OutOfBounds { at: 2 }), "{e:?}");
+}
+
+#[test]
+fn a_map_value_offset_outside_the_value_is_rejected_at_the_immediate() {
+    // Rejected where the mistake is, not at the first access through it, so the
+    // instruction index names something the loader can act on. Linux rejects
+    // the same thing in `resolve_pseudo_ldimm64`.
+    let e = check_maps(&[ld_map_value(1, 3, 8), mov(0, 0), EXIT], &[MAP8]).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            VerifyError::MapValueOffset {
+                at: 0,
+                off: 8,
+                size: 8
+            }
+        ),
+        "{e:?}"
+    );
+    let e = check_maps(&[ld_map_value(1, 3, -4), mov(0, 0), EXIT], &[MAP8]).unwrap_err();
+    assert!(
+        matches!(e, VerifyError::MapValueOffset { at: 0, off: -4, .. }),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_map_value_pointer_may_be_passed_as_a_byte_region() {
+    // `check_mem_arg` already bounds `PtrClass::MapValue` against `p.size`;
+    // supplying the size is what makes that arm reachable at all.
+    let take_mem = KfuncDesc {
+        id: 0,
+        name: "take_mem",
+        addr: 0x1000,
+        args: &[
+            ArgDesc {
+                kind: TypeKind::Ptr {
+                    kind: PtrKind::Mem,
+                    key: TypeKey::NONE,
+                },
+                domain: ValidityDomain::NonPreemptible,
+                flags: ArgFlags::SIZED_BY_NEXT,
+            },
+            ArgDesc::SCALAR64,
+        ],
+        ret: ArgDesc::SCALAR64,
+        context: Context::Atomic,
+    };
+    // The whole 8-byte value: in bounds.
+    let ok = check_all(
+        &[ld_map_value(1, 3, 0), mov(2, 8), call(0), mov(0, 0), EXIT],
+        &[],
+        &[take_mem],
+        &[MAP8],
+        Context::Atomic,
+    );
+    assert!(ok.is_ok(), "{:?}", ok.unwrap_err());
+    // One byte more than the value holds.
+    let e = check_all(
+        &[ld_map_value(1, 3, 0), mov(2, 9), call(0), mov(0, 0), EXIT],
+        &[],
+        &[take_mem],
+        &[MAP8],
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::OutOfBounds { at: 3 }), "{e:?}");
+}
+
+#[test]
+fn a_map_handle_satisfies_a_trusted_object_parameter() {
+    // How a map-access kfunc receives its map. The handle's domain is `Static`
+    // — a program holds a reference to every map it names for its whole life —
+    // and a `Static` pointer satisfies a `NonPreemptible` parameter because the
+    // verifier accepts a *stronger* domain than asked for, never a weaker one.
+    let take_map = KfuncDesc {
+        id: 0,
+        name: "take_map",
+        addr: 0x1000,
+        args: &[ArgDesc {
+            kind: TypeKind::Ptr {
+                kind: PtrKind::Object,
+                key: crate::kfunc::MAP_HANDLE_TYPE_KEY,
+            },
+            domain: ValidityDomain::NonPreemptible,
+            flags: ArgFlags::NONE,
+        }],
+        ret: ArgDesc::SCALAR64,
+        context: Context::Atomic,
+    };
+    let ok = check_all(
+        &[ld_map_fd(1, 3), call(0), mov(0, 0), EXIT],
+        &[],
+        &[take_map],
+        &[MAP8],
+        Context::Atomic,
+    );
+    assert!(ok.is_ok(), "{:?}", ok.unwrap_err());
+
+    // A kfunc wanting some *other* object type must not accept a map handle:
+    // the `TypeKey` is what keeps two opaque handles from being interchangeable.
+    let take_other = KfuncDesc {
+        args: &[ArgDesc {
+            kind: TypeKind::Ptr {
+                kind: PtrKind::Object,
+                key: TypeKey(0xABCD),
+            },
+            domain: ValidityDomain::NonPreemptible,
+            flags: ArgFlags::NONE,
+        }],
+        ..take_map
+    };
+    let e = check_all(
+        &[ld_map_fd(1, 3), call(0), mov(0, 0), EXIT],
+        &[],
+        &[take_other],
+        &[MAP8],
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, VerifyError::KfuncSignature { at: 2, arg: 0, .. }),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_shifted_map_handle_is_not_a_map_handle() {
+    // `alu`'s (Ptr, Scalar) arm permits add/sub on every pointer class, so the
+    // offset check in `check_args` is the only thing standing between a kfunc
+    // and a `NonNull<BpfMap>` at an attacker-chosen address.
+    let take_map = KfuncDesc {
+        id: 0,
+        name: "take_map",
+        addr: 0x1000,
+        args: &[ArgDesc {
+            kind: TypeKind::Ptr {
+                kind: PtrKind::Object,
+                key: crate::kfunc::MAP_HANDLE_TYPE_KEY,
+            },
+            domain: ValidityDomain::NonPreemptible,
+            flags: ArgFlags::NONE,
+        }],
+        ret: ArgDesc::SCALAR64,
+        context: Context::Atomic,
+    };
+    let e = check_all(
+        &[
+            ld_map_fd(1, 3),
+            alu(AluOp::Add, 1, 64),
+            call(0),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &[take_map],
+        &[MAP8],
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, VerifyError::KfuncSignature { at: 3, arg: 0, .. }),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn the_map_handle_type_key_is_not_the_reserved_none() {
+    // `TypeKey(0)` means "not a typed object", so a handle keyed 0 would be
+    // interchangeable with every other untyped pointer at a kfunc boundary.
+    assert!(crate::kfunc::MAP_HANDLE_TYPE_KEY.is_some());
+    // And the hash is a pure function of the name, so `narf-bpf`'s `BpfObject`
+    // impl can derive the same key without a shared registry.
+    assert_eq!(
+        crate::kfunc::MAP_HANDLE_TYPE_KEY,
+        TypeKey(crate::kfunc::fnv1a32_nonzero(
+            crate::kfunc::MAP_HANDLE_TYPE_NAME
+        ))
+    );
 }
 
 // ── Against the reference interpreter ───────────────────────────────
@@ -1794,6 +2169,7 @@ fn every_program_the_verifier_accepts_runs_without_an_out_of_bounds_access() {
             context: Context::Atomic,
             ctx_fields: &[],
             kfuncs: &[],
+            maps: &[],
         }) else {
             continue;
         };

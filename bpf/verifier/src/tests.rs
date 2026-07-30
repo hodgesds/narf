@@ -372,6 +372,7 @@ fn check(insns: &[Insn]) -> Result<crate::VerifiedProgram, VerifyError> {
         context: Context::Atomic,
         ctx_fields: &[],
         kfuncs: &[],
+        maps: &[],
     })
 }
 
@@ -456,6 +457,7 @@ fn propagates_malformed_kfunc_descriptors() {
         context: Context::Atomic,
         ctx_fields: &[],
         kfuncs: &kfuncs,
+        maps: &[],
     })
     .unwrap_err();
     assert_eq!(err, VerifyError::Kfunc(KfuncError::VoidArgument(0)));

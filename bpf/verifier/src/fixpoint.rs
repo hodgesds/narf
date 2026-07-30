@@ -54,10 +54,15 @@ use narf_bpf_isa::{AluOp, AtomicOp, CallTarget, CondOp, Decoded, Imm64, Reg, Siz
 
 use crate::domain::Scalar;
 use crate::ir::Ir;
-use crate::kfunc::{ArgDesc, ArgFlags, Context, KfuncDesc, PtrKind, TypeKind};
+use crate::kfunc::{
+    ArgDesc, ArgFlags, Context, KfuncDesc, PtrKind, TypeKey, TypeKind, ValidityDomain,
+    MAP_HANDLE_TYPE_KEY,
+};
 use crate::liveness::{self, Masks};
 use crate::state::{weaker_domain, AbsState, AbsValue, PtrClass, PtrVal, Ref, Stack, NO_REF};
-use crate::{FaultSite, Program, SubprogInfo, VerifiedProgram, VerifyError, MAX_STACK_BYTES};
+use crate::{
+    FaultSite, MapDesc, Program, SubprogInfo, VerifiedProgram, VerifyError, MAX_STACK_BYTES,
+};
 
 /// Everything the fixpoint accumulates that outlives a single block.
 struct Analysis<'a, 'p> {
@@ -452,6 +457,98 @@ impl Analysis<'_, '_> {
         }
     }
 
+    // ── `LD_IMM64` map pseudo-forms ─────────────────────────────────
+
+    /// The descriptor for the map with this file descriptor.
+    ///
+    /// Linear search: the map set is a handful of entries per program (Linux's
+    /// `MAX_USED_MAPS` is 64) and a linear scan over a `&[MapDesc]` beats
+    /// building a lookup structure the fixpoint would have to carry. The same
+    /// reasoning `Registry::by_id` uses for kfuncs.
+    fn map_by_fd(&self, at: u32, fd: i32) -> Result<MapDesc, VerifyError> {
+        self.prog
+            .maps
+            .iter()
+            .copied()
+            .find(|m| m.fd == fd)
+            .ok_or(VerifyError::UnknownMap { at, fd })
+    }
+
+    /// The descriptor at this position in the loader's fd array.
+    ///
+    /// `BPF_PSEUDO_MAP_IDX` indexes the array rather than naming an fd, which
+    /// is how a `libbpf`-shaped loader avoids patching instructions after it
+    /// has created the maps. A negative or past-the-end index is the same
+    /// failure as an unknown fd and reports as one, carrying the index in the
+    /// `fd` field because that is the number the instruction actually held.
+    fn map_by_idx(&self, at: u32, idx: i32) -> Result<MapDesc, VerifyError> {
+        usize::try_from(idx)
+            .ok()
+            .and_then(|i| self.prog.maps.get(i))
+            .copied()
+            .ok_or(VerifyError::UnknownMap { at, fd: idx })
+    }
+
+    /// A map *handle*: Linux's `CONST_PTR_TO_MAP`.
+    ///
+    /// Opaque and read-only. `Static` because a program holds a reference to
+    /// every map it names for its whole life, so the handle survives an await —
+    /// which is what lets a sleepable program touch a map at all.
+    ///
+    /// `readonly` is belt to `access()`'s brace: an `Object` deref is rejected
+    /// outright, so the flag can never be the thing that stops a store. It is
+    /// set because a handle is not a place, and a future class that *is*
+    /// dereferenceable should not inherit "writable" from this constructor.
+    fn map_handle(&self, _at: u32, _m: MapDesc) -> AbsValue {
+        AbsValue::Ptr(PtrVal {
+            class: PtrClass::Object,
+            key: MAP_HANDLE_TYPE_KEY,
+            domain: ValidityDomain::Static,
+            off: Scalar::constant(0),
+            size: None,
+            nullable: false,
+            ref_id: NO_REF,
+            readonly: true,
+        })
+    }
+
+    /// A pointer `value_offset` bytes into the map's first value.
+    ///
+    /// `BPF_PSEUDO_MAP_VALUE` is what LLVM emits for a global variable, whose
+    /// storage is a one-entry `.data`/`.bss` map. The offset is folded into the
+    /// pointer and the region is the whole value, so `access()` and
+    /// `check_mem_arg` bound `off + len <= value_size` with no map-specific
+    /// code — the size is the only thing they were missing.
+    fn map_value_ptr(
+        &self,
+        at: u32,
+        m: MapDesc,
+        value_offset: i32,
+    ) -> Result<AbsValue, VerifyError> {
+        // A negative offset, or one at or past the end, has no in-bounds access
+        // through it at all. Rejecting here rather than letting every later
+        // access fail names the instruction that is actually wrong. Linux
+        // rejects the same thing in `resolve_pseudo_ldimm64`
+        // (`off >= map->value_size` ⇒ `-EINVAL`).
+        if value_offset < 0 || value_offset.unsigned_abs() >= m.value_size {
+            return Err(VerifyError::MapValueOffset {
+                at,
+                off: value_offset,
+                size: m.value_size,
+            });
+        }
+        Ok(AbsValue::Ptr(PtrVal {
+            class: PtrClass::MapValue,
+            key: TypeKey::NONE,
+            domain: ValidityDomain::Static,
+            off: Scalar::constant(i64::from(value_offset)),
+            size: Some(u64::from(m.value_size)),
+            nullable: false,
+            ref_id: NO_REF,
+            readonly: false,
+        }))
+    }
+
     fn set(&self, st: &mut AbsState, at: u32, r: Reg, v: AbsValue) -> Result<(), VerifyError> {
         if r.is_frame_ptr() {
             return Err(VerifyError::WriteToFramePointer { at });
@@ -592,19 +689,30 @@ impl Analysis<'_, '_> {
                 let v =
                     match value {
                         Imm64::Value(v) => AbsValue::Scalar(Scalar::constant(v as i64)),
-                        // The remaining `LD_IMM64` pseudo-forms all name something
-                        // the verifier would have to look up — a map's value size,
-                        // a BTF id's type, a callback's signature — and `Program`
-                        // carries no registry for any of them. Maps and BTF are
-                        // Phase 3; failing closed is the only honest answer until
-                        // the contract grows a place to put them.
-                        Imm64::MapFd(_)
-                        | Imm64::MapValue { .. }
-                        | Imm64::MapIdx(_)
-                        | Imm64::MapIdxValue { .. } => {
-                            return Err(VerifyError::NotImplemented(
-                                "map pseudo-immediates need a map registry in Program",
-                            ))
+                        // The four map pseudo-forms split two ways, exactly as
+                        // Linux's `resolve_pseudo_ldimm64` splits them.
+                        //
+                        // `MapFd`/`MapIdx` produce a *handle*: Linux's
+                        // `CONST_PTR_TO_MAP`, here an opaque `PtrClass::Object`
+                        // keyed `MAP_HANDLE_TYPE_KEY`. `access()` already
+                        // rejects dereferencing an `Object`, which is the
+                        // correct behaviour for a handle and needed no new
+                        // class to say so — the only thing a program may do
+                        // with one is hand it to a map kfunc.
+                        //
+                        // `MapValue`/`MapIdxValue` produce a *pointer into the
+                        // map's first value* at a fixed offset. That is what
+                        // LLVM emits for a global variable in a `.data`/`.bss`
+                        // map, and it is where the value width earns its keep:
+                        // `PtrClass::MapValue` with `size = value_size` is what
+                        // `access()` and `check_mem_arg` bound against.
+                        Imm64::MapFd(fd) => self.map_handle(at, self.map_by_fd(at, fd)?),
+                        Imm64::MapIdx(idx) => self.map_handle(at, self.map_by_idx(at, idx)?),
+                        Imm64::MapValue { fd, value_offset } => {
+                            self.map_value_ptr(at, self.map_by_fd(at, fd)?, value_offset)?
+                        }
+                        Imm64::MapIdxValue { idx, value_offset } => {
+                            self.map_value_ptr(at, self.map_by_idx(at, idx)?, value_offset)?
                         }
                         Imm64::BtfId(_) => {
                             return Err(VerifyError::NotImplemented(

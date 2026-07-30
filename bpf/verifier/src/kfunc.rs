@@ -100,6 +100,48 @@ impl ValidityDomain {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct TypeKey(pub u32);
 
+/// FNV-1a over a type or symbol name, forced non-zero because
+/// [`TypeKey::NONE`] is reserved.
+///
+/// Lives in the verifier rather than in `narf-bpf` because the verifier is the
+/// crate that has to *name* a type without being able to see the Rust `impl` —
+/// `MAP_HANDLE_TYPE_KEY` below is the first such case. `narf-bpf`'s
+/// `types::fnv1a32_nonzero` re-exports this rather than carrying a second copy;
+/// two implementations of the same hash silently disagreeing is how a program's
+/// kfunc references stop resolving.
+///
+/// Not cryptographic, and not a security boundary: this is a namespacing device
+/// over a closed in-tree set, and a collision is a build-time bug the kfunc
+/// registry's duplicate check catches.
+#[must_use]
+pub const fn fnv1a32_nonzero(s: &str) -> u32 {
+    let bytes = s.as_bytes();
+    let mut hash: u32 = 0x811C_9DC5;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+        i += 1;
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
+/// The pointee type name a BPF map handle carries.
+///
+/// A map handle is an opaque object pointer: a program obtains one from
+/// `LD_IMM64`'s map pseudo-form and can only hand it back to a kfunc.
+/// `access()` rejects dereferencing it ([`crate::VerifyError::OpaqueDeref`]),
+/// which is exactly right — Linux's `CONST_PTR_TO_MAP` is equally
+/// undereferenceable.
+pub const MAP_HANDLE_TYPE_NAME: &str = "narf_bpf_map";
+
+/// The [`TypeKey`] a map handle carries.
+pub const MAP_HANDLE_TYPE_KEY: TypeKey = TypeKey(fnv1a32_nonzero(MAP_HANDLE_TYPE_NAME));
+
 impl TypeKey {
     /// The reserved "not a typed object" key.
     pub const NONE: TypeKey = TypeKey(0);
@@ -178,6 +220,19 @@ impl ArgFlags {
     pub const CONST: ArgFlags = ArgFlags(1 << 3);
     /// Read-only; the program may not write through this pointer.
     pub const READONLY: ArgFlags = ArgFlags(1 << 4);
+
+    /// Union of two flag sets.
+    ///
+    /// Duplicates [`core::ops::BitOr`] because a trait impl cannot be `const`
+    /// and [`crate::ArgDesc`]s are built in `const` position — so a type that
+    /// carries two flags had no way to spell it. `&mut [u8]` is the first:
+    /// a region that is both sized by the next argument *and* written by the
+    /// callee.
+    #[inline]
+    #[must_use]
+    pub const fn with(self, other: ArgFlags) -> ArgFlags {
+        ArgFlags(self.0 | other.0)
+    }
 
     /// Whether every flag in `other` is set here.
     #[inline]

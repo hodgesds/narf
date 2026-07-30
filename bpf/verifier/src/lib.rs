@@ -89,7 +89,8 @@ mod tests;
 mod verify_tests;
 
 pub use kfunc::{
-    ArgDesc, ArgFlags, Context, KfuncDesc, KfuncError, PtrKind, TypeKey, TypeKind, ValidityDomain,
+    fnv1a32_nonzero, ArgDesc, ArgFlags, Context, KfuncDesc, KfuncError, PtrKind, TypeKey, TypeKind,
+    ValidityDomain, MAP_HANDLE_TYPE_KEY, MAP_HANDLE_TYPE_NAME,
 };
 
 /// A program submitted for verification.
@@ -106,6 +107,39 @@ pub struct Program<'a> {
     pub ctx_fields: &'a [ArgDesc],
     /// Every kfunc this program may call.
     pub kfuncs: &'a [KfuncDesc],
+    /// Every map this program may reference, in the order the loader supplied
+    /// them. See [`MapDesc`].
+    pub maps: &'a [MapDesc],
+}
+
+/// What the verifier knows about one map a program references.
+///
+/// The verifier needs three things and nothing else: which descriptor a
+/// `LD_IMM64` map pseudo-form names, and — for the value form — how wide a
+/// value is, so `PtrClass::MapValue` gets a real bound instead of an
+/// unbounded region. Everything else about a map (its kind, its locking, its
+/// storage) is the runtime's business.
+///
+/// Linux keeps a `struct bpf_map *` array on `bpf_prog_aux` and reaches through
+/// it for `map->value_size`, `map->key_size`, `map->map_type`, `map->ops`, and
+/// twelve other fields, which is how `verifier.c` ends up knowing about map
+/// *implementations*. A flat descriptor is what keeps that coupling out.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MapDesc {
+    /// The file descriptor the loader put in `LD_IMM64`'s `imm` for the
+    /// `MapFd` / `MapValue` forms.
+    ///
+    /// Resolution is by fd value, not by position, because that is what the
+    /// instruction encoding carries. The `MapIdx` forms index this slice
+    /// instead, which is why both a descriptor's fd *and* its position are
+    /// meaningful.
+    pub fd: i32,
+    /// Key width in bytes.
+    pub key_size: u32,
+    /// Value width in bytes, as one program-visible value.
+    pub value_size: u32,
+    /// Capacity.
+    pub max_entries: u32,
 }
 
 /// An instruction that can fault at runtime and must be covered by an
@@ -282,6 +316,19 @@ pub enum VerifyError {
     /// chain somewhere. Reported distinctly from an ordinary rejection so it
     /// cannot be mistaken for one.
     FixpointDiverged { subprog: u32, rounds: u64 },
+    /// A `LD_IMM64` map pseudo-form naming a map the load request did not
+    /// supply.
+    ///
+    /// Fails closed rather than admitting an unknown map: the value width is
+    /// what bounds every access through the resulting pointer, and there is no
+    /// safe default for a width nobody stated. Linux reports the same condition
+    /// as `EBADF`/`EINVAL` from `resolve_pseudo_ldimm64` before the verifier
+    /// proper runs; here the resolution *is* a transfer function, so it is a
+    /// `VerifyError` with an instruction index.
+    UnknownMap { at: u32, fd: i32 },
+    /// A `LD_IMM64` map-value pseudo-form whose offset is outside the map's
+    /// value.
+    MapValueOffset { at: u32, off: i32, size: u32 },
     /// This construct is not implemented yet.
     NotImplemented(&'static str),
 }
