@@ -4283,21 +4283,39 @@ fn mprotect_core(
     // `change_perms_range` is whole-region only.
     #[cfg(feature = "linux-compat")]
     {
-        // W^X: `mprotect_range` refuses a W|X end state outright. That is the
-        // right default and stays the fast path — the only way past it is a
-        // live `Cap<Jit, Grant>`, which `wx::jit_mprotect` re-classifies the
-        // transition against and which still refuses X→WX unconditionally.
+        // W^X. `CapKind::Jit` gates the **RW → RX flip** — the transition
+        // `wx.rs` has described as the JIT exception since it was written —
+        // and *nothing* grants a W|X end state.
         //
-        // Checked *before* the plain call rather than as a fallback so a
-        // capability-gated request is never partially applied by the
-        // non-capability path first.
-        if perms.contains(RegionPerms::WRITE | RegionPerms::EXEC) {
-            let Some(cap) = narf_memory::wx::jit_cap(current_task_id()) else {
-                return Err(());
-            };
-            return narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| ());
+        // This used to be the other way round: the cap was demanded only when
+        // the request contained W|X, which made `CAP_JIT` a licence to create
+        // a genuinely RWX mapping (something NARF had previously made
+        // impossible) while leaving the flip it exists for ungated. Since a
+        // task that can write a page and then make it executable has the same
+        // power as one holding RWX, gating the flip is what actually buys
+        // anything.
+        //
+        // Classified before any mutation so a capability-gated request is
+        // never partially applied by the ungated path first.
+        let old_perms = as_ref
+            .perms_covering(base, len)
+            .map(|p| p.prot_only())
+            .ok_or(())?;
+        match narf_memory::wx::classify_mprotect(old_perms, perms.prot_only()) {
+            // Refusals, whatever the caller holds.
+            narf_memory::wx::WxTransition::DenyWX | narf_memory::wx::WxTransition::DenyXtoWX => {
+                Err(())
+            }
+            narf_memory::wx::WxTransition::NeedsCapJit => {
+                let Some(cap) = narf_memory::wx::jit_cap(current_task_id()) else {
+                    return Err(());
+                };
+                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| ())
+            }
+            narf_memory::wx::WxTransition::Allow => {
+                as_ref.mprotect_range(base, len, perms).map_err(|_| ())
+            }
         }
-        as_ref.mprotect_range(base, len, perms).map_err(|_| ())
     }
     #[cfg(not(feature = "linux-compat"))]
     {

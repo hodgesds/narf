@@ -77,10 +77,21 @@ pub enum WxTransition {
     /// implies self-modifying code with no relocation, which we don't
     /// support).
     DenyXtoWX,
-    /// Transition adds X to a currently-W mapping. Permitted *only*
-    /// if the caller holds `CAP_JIT`. The cap check is the caller's
-    /// responsibility — this enum is just the protocol.
+    /// Transition adds X to a currently-W mapping, ending at RX. Permitted
+    /// *only* if the caller holds `CAP_JIT`. This is the canonical JIT codegen
+    /// flip. The cap check is the caller's responsibility — this enum is just
+    /// the protocol.
     NeedsCapJit,
+    /// The destination state is simultaneously writable and executable.
+    /// Refused unconditionally: **no capability grants RWX.**
+    ///
+    /// This used to be [`Self::NeedsCapJit`] when the source mapping was not
+    /// already executable, which had the effect of making `CAP_JIT` a licence
+    /// to create a genuinely RWX user mapping — something NARF had previously
+    /// made impossible — while leaving the RW → RX flip the capability was
+    /// designed for ungated. That is backwards: grsecurity/PaX never permits
+    /// W|X, and the flip is the whole point of the exception.
+    DenyWX,
 }
 
 /// Check a proposed `mmap` permission set. Returns [`WxCheck::Allow`]
@@ -107,17 +118,17 @@ pub fn classify_mprotect(old: RegionPerms, new: RegionPerms) -> WxTransition {
     let new_w = new.contains(RegionPerms::WRITE);
     let new_x = new.contains(RegionPerms::EXEC);
 
-    // Refuse W|X end state.
+    // Refuse a W|X end state, unconditionally and whatever the caller holds.
+    //
+    // `DenyXtoWX` is kept as a distinct answer when the mapping was already
+    // executable, because that case names a different mistake (self-modifying
+    // code with no relocation) and is worth reporting separately. Both are
+    // refusals.
     if new_w && new_x {
-        // Two sub-cases: was X (adding W) or was W (adding X). The
-        // grsecurity model rejects the first absolutely; the second
-        // is the JIT path that needs the cap. Adding both bits at
-        // once (from RO) is the same as the JIT path — if you can
-        // write OR execute, you can certainly write then execute.
         if old_x {
             return WxTransition::DenyXtoWX;
         }
-        return WxTransition::NeedsCapJit;
+        return WxTransition::DenyWX;
     }
 
     // Otherwise W^X holds in the destination state.
@@ -216,6 +227,8 @@ pub fn __reset_jit_grants_for_test() {
 /// Why a capability-gated `mprotect` was refused.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WxError {
+    /// The destination state would be simultaneously writable and executable.
+    DenyWX,
     /// The request does not cover a single mapped region, so there is no
     /// `old` permission set to classify the transition against.
     Unmapped,
@@ -272,6 +285,8 @@ pub fn jit_mprotect(
         .prot_only();
     match classify_mprotect(old, new_perms.prot_only()) {
         WxTransition::DenyXtoWX => Err(WxError::DenyXtoWX),
+        // No capability grants RWX.
+        WxTransition::DenyWX => Err(WxError::DenyWX),
         // Both `Allow` and `NeedsCapJit` proceed — the capability was already
         // proven live above, and `Allow` never needed it.
         WxTransition::Allow | WxTransition::NeedsCapJit => space
@@ -330,16 +345,26 @@ fn smoke_wx_classify_covers_every_arm() -> TestResult {
     let rwx = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC;
 
     let cases: &[(RegionPerms, RegionPerms, WxTransition)] = &[
-        // The JIT codegen flip, and the two ways of asking for W|X.
+        // The JIT codegen flip — the one transition CAP_JIT exists for.
         (rw, rx, WxTransition::NeedsCapJit),
-        (rw, rwx, WxTransition::NeedsCapJit),
-        (r, rwx, WxTransition::NeedsCapJit),
-        // Adding W to an existing X mapping: never, cap or not.
+        // Asking for W|X: refused, whatever the caller holds. These two used
+        // to be `NeedsCapJit`, which made the capability a licence to create a
+        // genuinely RWX mapping — something NARF had previously made
+        // impossible — while the flip above went ungated. A task that can
+        // write a page and then make it executable already has RWX's power, so
+        // gating the flip is what buys something and permitting W|X is what
+        // gives it away.
+        (rw, rwx, WxTransition::DenyWX),
+        (r, rwx, WxTransition::DenyWX),
+        // Adding W to an existing X mapping names a different mistake
+        // (self-modifying code with no relocation) and keeps its own answer.
         (rx, rwx, WxTransition::DenyXtoWX),
         // W^X-preserving transitions need no authority at all.
         (rx, rw, WxTransition::Allow),
         (rx, r, WxTransition::Allow),
         (rw, r, WxTransition::Allow),
+        // R -> RX is deliberately still ungated: it adds no write path, and
+        // gating it would break a dynamic linker making a mapping executable.
         (r, rx, WxTransition::Allow),
     ];
     for &(old, new, want) in cases {
