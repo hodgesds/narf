@@ -8068,11 +8068,9 @@ pub fn __test_sched_param_reset() {
 
 // ── Sched_get/setaffinity — CPU bitmap ─────────────────────────────
 //
-// NARF user mode is single-CPU; the affinity bitmap is structural
-// state only. getaffinity always reports a 1-bit mask (CPU 0 set);
-// setaffinity reads the supplied bitmap and discards it (no
-// pinning to perform). Surface exists so pthread / libnuma
-// probes succeed at startup.
+// The split handlers resolve namespace-visible ProcessIds to scheduler
+// TaskIds, report the live allowed∩online bitmap, and publish hard-mask
+// changes to the scheduler's cooperative migration path.
 
 // ── Getcpu — current CPU + NUMA node query ─────────────────────────
 //

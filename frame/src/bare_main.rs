@@ -3799,6 +3799,10 @@ fn boot_userspace_init() {
                     "fork_exec_burst_smoke",
                     narf_verification::NARF_FORK_EXEC_BURST_SMOKE_ELF,
                 ),
+                (
+                    "sched_affinity_smp_smoke",
+                    narf_verification::NARF_SCHED_AFFINITY_SMP_SMOKE_ELF,
+                ),
                 ("epoll_smoke", narf_verification::NARF_EPOLL_SMOKE_ELF),
                 ("signal_smoke", narf_verification::NARF_SIGNAL_SMOKE_ELF),
                 ("sigrcx_smoke", narf_verification::NARF_SIGRCX_SMOKE_ELF),

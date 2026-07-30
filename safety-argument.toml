@@ -174,3 +174,19 @@ argument = "Two-CPU user-task placement changes only the preferred initial run q
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The placement helper selects only already-online scheduler CPUs and enqueue_on continues to enforce the existing task metadata and domain restore path before polling. Alternating BSP/AP grants no memory or capability authority and never schedules outside Affinity.allowed."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Runtime affinity changes remain inside the existing scheduler TCB and change only a live task's allowed online CPU set. The task retains its TaskId, address space, domain, capabilities, saved protection-key state, and dedicated kernel stack across the cooperative requeue."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A parked task is removed under its sole run-queue lock and enqueued only after that lock is released; a currently-executing task is never moved mid-continuation and consumes the registered mask only after returning to the executor. Every dispatch and work-steal path checks the hard allowed mask before restoring task state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Task creation validates caller-provided affinity against the online topology before publishing either the run-queue slot or registry entry. Because the legacy spawn API is infallible, a wholly offline mask is normalized to the spawning CPU while a partly online mask is retained for hot-plug; this prevents an awake slot from cycling forever without weakening any valid hard affinity constraint."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Post-poll requeue keeps the CPU that just executed the continuation whenever it remains online and allowed. Affinity.preferred is only an initial-placement hint; it cannot force an otherwise-unnecessary cross-core context migration or bypass the hard allowed mask."

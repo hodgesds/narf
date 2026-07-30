@@ -26,6 +26,8 @@ pub fn install_all_hooks() {
     // same process identity as cgroup.procs.
     #[cfg(feature = "cgroup")]
     narf_scheduler::install_memory_pid_resolver(narf_userspace::handlers::task_to_pid_raw);
+    #[cfg(feature = "cgroup")]
+    narf_scheduler::install_process_task_resolver(narf_userspace::handlers::pid_to_task_raw);
     install_console_signal_hook();
     #[cfg(feature = "linux-compat")]
     install_proc_hooks();

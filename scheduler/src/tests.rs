@@ -383,6 +383,49 @@ kernel_test_in!(
     smoke_scheduler_memory_pid_provider_resolves_current
 );
 
+#[cfg(feature = "cgroup")]
+fn smoke_scheduler_cgroup_affinity_resolves_process_to_task() -> TestResult {
+    use crate::{Affinity, CpuId, CpuSet, TaskSpec};
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    const OUTER_PID: u64 = 0x4242;
+    static TARGET_TASK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    fn process_to_task_for_test(pid: u64) -> Option<u64> {
+        (pid == OUTER_PID).then(|| TARGET_TASK.load(Ordering::Acquire))
+    }
+
+    crate::__reset_queues_for_test();
+    let id = crate::spawn_with_spec(
+        core::future::pending::<()>(),
+        TaskSpec {
+            affinity: Affinity::any(),
+            ..TaskSpec::unthrottled()
+        },
+    );
+    TARGET_TASK.store(id.raw(), Ordering::Release);
+
+    let boot = CpuSet::single(CpuId::BOOT);
+    let applied =
+        crate::cgroup::with_process_task_resolver_for_test(process_to_task_for_test, || {
+            crate::apply_affinity(OUTER_PID, boot.bits())
+        });
+    if !applied {
+        return TestResult::Fail("cgroup affinity rejected the resolved task");
+    }
+    if crate::task_affinity(id) != Some(boot) {
+        return TestResult::Fail("cgroup affinity updated the process id instead of its task");
+    }
+
+    crate::__reset_queues_for_test();
+    TestResult::Pass
+}
+#[cfg(feature = "cgroup")]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_cgroup_affinity_resolves_process_to_task
+);
+
 fn smoke_scheduler_donate_to_rejects_revoked_cap() -> TestResult {
     use crate::{donate_to, DonateError, Task, TaskId};
     use narf_capabilities::{Cap, Invoke};
@@ -1251,6 +1294,110 @@ fn smoke_scheduler_cpuset_insert_accumulates() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_scheduler_cpuset_insert_accumulates);
+
+fn smoke_scheduler_cpuset_bitmap_intersection() -> TestResult {
+    use crate::affinity::CpuSet;
+    let left = CpuSet::from_bits(0b1011);
+    let right = CpuSet::from_bits(0b0110);
+    if left.bits() != 0b1011 {
+        return TestResult::Fail("CpuSet bitmap round trip changed bits");
+    }
+    if left.intersection(right).bits() != 0b0010 {
+        return TestResult::Fail("CpuSet intersection returned wrong CPUs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_cpuset_bitmap_intersection);
+
+fn smoke_scheduler_live_task_affinity_round_trip() -> TestResult {
+    use crate::{Affinity, CpuId, CpuSet, SetAffinityError, TaskSpec};
+
+    crate::__reset_queues_for_test();
+    let spec = TaskSpec {
+        affinity: Affinity::any(),
+        ..TaskSpec::unthrottled()
+    };
+    let id = crate::spawn_with_spec(core::future::pending::<()>(), spec);
+    if crate::task_affinity(id) != Some(CpuSet::ALL) {
+        return TestResult::Fail("spawn did not register its initial affinity");
+    }
+
+    let boot = CpuSet::single(CpuId::BOOT);
+    if crate::set_task_affinity(id, boot).is_err() {
+        return TestResult::Fail("live queued task rejected an online CPU");
+    }
+    if crate::task_affinity(id) != Some(boot) {
+        return TestResult::Fail("affinity update did not round trip");
+    }
+    if crate::set_task_affinity(id, CpuSet::EMPTY) != Err(SetAffinityError::NoOnlineCpu) {
+        return TestResult::Fail("empty affinity was not rejected");
+    }
+    if crate::task_affinity(id) != Some(boot) {
+        return TestResult::Fail("rejected update changed the live mask");
+    }
+
+    crate::__reset_queues_for_test();
+    if crate::task_affinity(id).is_some() {
+        return TestResult::Fail("completed/dropped task retained affinity state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_live_task_affinity_round_trip);
+
+fn smoke_scheduler_spawn_normalizes_offline_affinity() -> TestResult {
+    use crate::{Affinity, CpuId, CpuSet, TaskSpec};
+
+    let Some(offline) = (0..narf_lib::percpu::MAX_CPUS as u32)
+        .find(|cpu| !narf_lib::smp::is_online(*cpu))
+        .map(CpuId)
+    else {
+        return TestResult::Skip("all inline CPUs are online");
+    };
+    let here = CpuId(narf_lib::percpu::current_cpu() as u32);
+    let fallback = if narf_lib::smp::is_online(here.0) {
+        here
+    } else {
+        CpuId::BOOT
+    };
+
+    crate::__reset_queues_for_test();
+    let id = crate::spawn_with_spec(
+        core::future::pending::<()>(),
+        TaskSpec {
+            affinity: Affinity::pinned(offline),
+            ..TaskSpec::unthrottled()
+        },
+    );
+    if crate::task_affinity(id) != Some(CpuSet::single(fallback)) {
+        return TestResult::Fail("spawn retained an affinity with no online CPU");
+    }
+    crate::__reset_queues_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_spawn_normalizes_offline_affinity
+);
+
+fn smoke_scheduler_requeue_keeps_allowed_current_cpu() -> TestResult {
+    use crate::{Affinity, CpuId, CpuSet};
+
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("soft-preference requeue needs a second online CPU");
+    }
+    let affinity = Affinity {
+        allowed: CpuSet::ALL,
+        preferred: Some(CpuId(1)),
+    };
+    if crate::requeue_cpu_for_affinity(affinity, 0) != 0 {
+        return TestResult::Fail("soft preferred CPU overrode the allowed current CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_requeue_keeps_allowed_current_cpu
+);
 
 fn smoke_scheduler_affinity_any_and_pinned() -> TestResult {
     use crate::affinity::{Affinity, CpuId, CpuSet};

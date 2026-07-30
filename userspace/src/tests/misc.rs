@@ -1112,12 +1112,18 @@ fn smoke_userspace_sched_affinity_round_trip() -> TestResult {
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
+    narf_scheduler::__reset_queues_for_test();
+    let spec = narf_scheduler::TaskSpec {
+        affinity: narf_scheduler::Affinity::any(),
+        ..narf_scheduler::TaskSpec::unthrottled()
+    };
+    let target = narf_scheduler::spawn_with_spec(core::future::pending::<()>(), spec);
 
-    // sched_getaffinity into a 16-byte buffer.
+    // Linux copies the kernel mask width (8), not the caller's entire buffer.
     let mut mask = [0xFFu8; 16];
     let mut ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: 0,
+            arg0: target.raw(),
             arg1: mask.len() as u64,
             arg2: mask.as_mut_ptr() as u64,
             ..SyscallArgs::default()
@@ -1129,21 +1135,22 @@ fn smoke_userspace_sched_affinity_round_trip() -> TestResult {
         Some(r) if r.status == SyscallReturn::OK => r.value,
         _ => return TestResult::Fail("sched_getaffinity did not return OK"),
     };
-    if n != 16 {
-        return TestResult::Fail("sched_getaffinity byte-count != 16");
+    if n != 8 {
+        return TestResult::Fail("sched_getaffinity byte-count != kernel mask width");
     }
-    if mask[0] != 0x01 {
-        return TestResult::Fail("sched_getaffinity did not set CPU 0");
+    if u64::from_ne_bytes(mask[..8].try_into().unwrap()) != narf_lib::smp::online_bitmap() {
+        return TestResult::Fail("sched_getaffinity did not report online allowed CPUs");
     }
-    if mask[1..16].iter().any(|&b| b != 0) {
-        return TestResult::Fail("sched_getaffinity stamped a non-zero tail");
+    if mask[8..].iter().any(|&b| b != 0xFF) {
+        return TestResult::Fail("sched_getaffinity overwrote beyond kernel mask");
     }
 
-    // sched_setaffinity returns 0 on a valid bitmap.
-    let in_mask = [0xAAu8; 16];
+    // sched_setaffinity updates the target task's real hard mask.
+    let mut in_mask = [0u8; 16];
+    in_mask[0] = 1;
     let mut ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: 0,
+            arg0: target.raw(),
             arg1: in_mask.len() as u64,
             arg2: in_mask.as_ptr() as u64,
             ..SyscallArgs::default()
@@ -1154,12 +1161,17 @@ fn smoke_userspace_sched_affinity_round_trip() -> TestResult {
     if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
         return TestResult::Fail("sched_setaffinity did not return 0");
     }
+    if narf_scheduler::task_affinity(target)
+        != Some(narf_scheduler::CpuSet::single(narf_scheduler::CpuId::BOOT))
+    {
+        return TestResult::Fail("sched_setaffinity did not update scheduler state");
+    }
 
     // Tiny size rejected.
     let mut tiny = [0u8; 4];
     let mut ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: 0,
+            arg0: target.raw(),
             arg1: tiny.len() as u64,
             arg2: tiny.as_mut_ptr() as u64,
             ..SyscallArgs::default()
@@ -1169,12 +1181,13 @@ fn smoke_userspace_sched_affinity_round_trip() -> TestResult {
     kernel_syscall_entry(Syscall::SchedGetaffinity.raw(), &mut ctx);
     let tiny_rejected = matches!(
         ctx.ret,
-        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-22i64) as u64,
     );
     if !tiny_rejected {
         return TestResult::Fail("sched_getaffinity did not reject tiny buf");
     }
 
+    narf_scheduler::__reset_queues_for_test();
     __test_clear_global();
     TestResult::Pass
 }

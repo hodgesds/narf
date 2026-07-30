@@ -2156,6 +2156,9 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // together across available CPUs, self-exec with one explicitly
         // preserved fd, report their post-exec identity, exit, and are reaped.
         ("fork_exec_burst_smoke", "fork-exec-burst-ok"),
+        // Linux affinity masks are real scheduler constraints: self-migration,
+        // remote-PID updates, a namespace boundary, and invalid masks.
+        ("sched_affinity_smp_smoke", "sched-affinity-smp-ok"),
         ("pty_smoke", "pty-ok"),
         // Framebuffer smoke — opens /dev/fb0, FBIOGET_VSCREENINFO,
         // mmap MAP_SHARED, writes + reads back pixels through the

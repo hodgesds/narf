@@ -524,6 +524,7 @@ fn main() {
     for test in [
         "fork_pipe_smoke",
         "fork_exec_burst_smoke",
+        "sched_affinity_smp_smoke",
         "epoll_smoke",
         "signal_smoke",
         "sigrcx_smoke",

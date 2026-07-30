@@ -3,11 +3,8 @@
 //! Shares the harness in [`crate::abi_test_support`]; see that module for
 //! the rationale. Scheduler / rlimit / priority surface.
 //!
-//! Many of these handlers are deliberate single-CPU / cooperative-scheduler
-//! stubs: they exist so libc / pthread / libnuma startup probes succeed, and
-//! they report the NARF "wire -1" sentinel (`SyscallReturn::ok((-1) as u64)`)
-//! rather than a Linux -errno on failure. Each test pins the ACTUAL return so
-//! it passes today; LINUX-GAP comments flag where that diverges from Linux.
+//! Tests pin the implemented Linux-compatible wire behavior. Remaining
+//! cooperative-scheduler gaps are called out locally with LINUX-GAP comments.
 #![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
@@ -254,24 +251,33 @@ fn smoke_abi_sched_prlimit64_bad_resource_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_sched_prlimit64_bad_resource_neg);
 
 // ── sched_getaffinity(pid, cpusetsize, mask*) ───────────────────────
-// Reports a 1-bit mask (CPU 0). Returns the number of bytes written.
+// Reports the task's allowed mask intersected with online CPUs.
 
 fn smoke_abi_sched_getaffinity_pos() -> TestResult {
     with_setup(|| {
+        narf_scheduler::__reset_queues_for_test();
+        let spec = narf_scheduler::TaskSpec {
+            affinity: narf_scheduler::Affinity::any(),
+            ..narf_scheduler::TaskSpec::unthrottled()
+        };
+        let target = narf_scheduler::spawn_with_spec(core::future::pending::<()>(), spec);
         let mut mask = [0xFFu8; 128];
-        // cpusetsize 128, mask out-pointer. Returns bytes written (128).
-        let args = a2(0, 128, mask.as_mut_ptr() as u64);
-        match call(Syscall::SchedGetaffinity.raw(), args) {
-            Some(128) => {
-                // Byte 0 has CPU 0 set; the rest are cleared.
-                if mask[0] == 0x01 && mask[1] == 0x00 {
+        let args = a2(target.raw(), 128, mask.as_mut_ptr() as u64);
+        let result = match call(Syscall::SchedGetaffinity.raw(), args) {
+            Some(8) => {
+                if u64::from_ne_bytes(mask[..8].try_into().unwrap())
+                    == narf_lib::smp::online_bitmap()
+                    && mask[8..].iter().all(|byte| *byte == 0xFF)
+                {
                     Ok(())
                 } else {
-                    Err("sched_getaffinity should set only CPU 0")
+                    Err("sched_getaffinity returned the wrong live mask")
                 }
             }
-            _ => Err("sched_getaffinity should return bytes written (128)"),
-        }
+            _ => Err("sched_getaffinity should return kernel mask width (8)"),
+        };
+        narf_scheduler::__reset_queues_for_test();
+        result
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_getaffinity_pos);
@@ -279,12 +285,11 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_getaffinity_pos);
 fn smoke_abi_sched_getaffinity_tiny_size_neg() -> TestResult {
     with_setup(|| {
         let mut mask = [0u8; 8];
-        // cpusetsize 4 (< sizeof(unsigned long)) ⇒ wire -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL for a sub-word cpuset size.
+        // cpusetsize 4 (< sizeof(unsigned long)) ⇒ -EINVAL.
         let args = a2(0, 4, mask.as_mut_ptr() as u64);
         match call(Syscall::SchedGetaffinity.raw(), args) {
-            Some(-1) => Ok(()),
-            _ => Err("sched_getaffinity with size < 8 should return -1"),
+            Some(-22) => Ok(()),
+            _ => Err("sched_getaffinity with size < 8 should return -EINVAL"),
         }
     })
 }
@@ -294,23 +299,36 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_getaffinity_tiny_size_neg);
 
 fn smoke_abi_sched_setaffinity_pos() -> TestResult {
     with_setup(|| {
-        let mask = [0x01u8; 8]; // request CPU 0 (discarded; we don't pin)
-        let args = a2(0, 8, mask.as_ptr() as u64);
-        match call(Syscall::SchedSetaffinity.raw(), args) {
-            Some(0) => Ok(()),
+        narf_scheduler::__reset_queues_for_test();
+        let spec = narf_scheduler::TaskSpec {
+            affinity: narf_scheduler::Affinity::any(),
+            ..narf_scheduler::TaskSpec::unthrottled()
+        };
+        let target = narf_scheduler::spawn_with_spec(core::future::pending::<()>(), spec);
+        let mut mask = [0u8; 8];
+        mask[0] = 1;
+        let args = a2(target.raw(), 8, mask.as_ptr() as u64);
+        let result = match call(Syscall::SchedSetaffinity.raw(), args) {
+            Some(0)
+                if narf_scheduler::task_affinity(target)
+                    == Some(narf_scheduler::CpuSet::single(narf_scheduler::CpuId::BOOT)) =>
+            {
+                Ok(())
+            }
             _ => Err("sched_setaffinity should return 0"),
-        }
+        };
+        narf_scheduler::__reset_queues_for_test();
+        result
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_setaffinity_pos);
 
 fn smoke_abi_sched_setaffinity_null_mask_neg() -> TestResult {
     with_setup(|| {
-        // Null mask pointer ⇒ wire -1 sentinel.
-        // LINUX-GAP: Linux returns -EFAULT for a bad mask pointer.
+        // Null mask pointer ⇒ -EFAULT.
         match call(Syscall::SchedSetaffinity.raw(), a2(0, 8, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("sched_setaffinity with null mask should return -1"),
+            Some(-14) => Ok(()),
+            _ => Err("sched_setaffinity with null mask should return -EFAULT"),
         }
     })
 }

@@ -1100,17 +1100,15 @@ pub enum Syscall {
 
     /// `arg0 = pid` (0 = self), `arg1 = mask_size` (bytes),
     /// `arg2 = mask_out_ptr`. Linux sched_getaffinity(2): write
-    /// a CPU-set bitmap for the target task. NARF is single-CPU
-    /// in user mode; we always return a 1-bit mask (CPU 0 set,
-    /// every other bit clear). Returns the byte count written
-    /// on success (= `mask_size` rounded down to a multiple of 8),
-    /// -1 on bad pointer or oversized request.
+    /// a CPU-set bitmap for the target task, intersected with the
+    /// online CPU set. Returns the kernel mask size written (8 bytes)
+    /// or a negative Linux errno.
     SchedGetaffinity,
 
     /// `arg0 = pid`, `arg1 = mask_size` (bytes),
-    /// `arg2 = mask_in_ptr`. sched_setaffinity(2). NARF doesn't
-    /// pin tasks (single-CPU model); the bitmap is read but
-    /// ignored. Returns 0 on success, -1 on bad pointer.
+    /// `arg2 = mask_in_ptr`. sched_setaffinity(2). Updates the
+    /// scheduler's hard allowed set and migrates at a cooperative
+    /// poll boundary. Returns 0 or a negative Linux errno.
     SchedSetaffinity,
 
     /// `arg0 = policy`. Linux sched_get_priority_max(2): return
