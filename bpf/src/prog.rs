@@ -92,9 +92,9 @@ pub struct BpfProg {
     subprogs: Vec<SubprogInfo>,
     /// Invocations.
     runs: AtomicU64,
-    /// Sum of return values. Until maps land in Phase 3 this is how an
-    /// attached program's effect is observed; the kfunc scratch counters in
-    /// `crate::kfuncs` are the other way.
+    /// Sum of return values. One of three ways an attached program's effect is
+    /// observed, alongside the scratch counters in `crate::kfuncs` and — now
+    /// that they exist — the maps in `crate::map`.
     accumulated: AtomicU64,
     /// Invocations that ended in a [`crate::interp::Trap`].
     traps: AtomicU64,
@@ -112,6 +112,13 @@ pub struct BpfProg {
     /// the run path with no lock, which is only sound because it cannot change
     /// under it.
     arenas: Option<Arc<crate::arena::ArenaGroup>>,
+    /// The maps this program may reference, paired with the file descriptors
+    /// its `LD_IMM64` immediates name.
+    ///
+    /// Held for the program's life, which is the point: the `Arc` is what keeps
+    /// a map alive after the fd that created it is closed. Linux does the same
+    /// through `prog->aux->used_maps`.
+    maps: Vec<(i32, Arc<crate::map::BpfMap>)>,
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -127,6 +134,17 @@ pub struct LoadRequest {
     /// The execution context the target hook provides. Declared by the hook,
     /// never by a program flag — spec §4.5.
     pub context: Context,
+    /// Every map the program may reference, in the order the loader supplied
+    /// them, each paired with the file descriptor its `LD_IMM64` immediates
+    /// name.
+    ///
+    /// Resolved by the caller, not here: `narf-bpf` cannot depend on
+    /// `narf-userspace` (that is the cycle spec §3.1 forbids), so it has no way
+    /// to turn an fd into a map. The `bpf(2)` handler does the lookup and hands
+    /// over the `Arc`s, which is also what makes the program hold a reference
+    /// for its whole life — a map cannot be freed out from under a program that
+    /// names it.
+    pub maps: Vec<(i32, Arc<crate::map::BpfMap>)>,
 }
 
 impl BpfProg {
@@ -170,11 +188,28 @@ impl BpfProg {
             return Err(LoadError::BadSize(req.insns.len()));
         }
         let registry = crate::kfunc::registry().ok_or(LoadError::NoRegistry)?;
+        reject_unrunnable(&req.insns)?;
 
         // Descriptors for every kfunc the program may call. The whole
         // registry, because NARF has one call ABI and one closed kfunc set —
         // there is no per-program-type helper allowlist to intersect with.
         let descs: Vec<_> = registry.all().iter().map(|e| e.desc()).collect();
+        // The verifier's view of the map set: an fd, and the three widths that
+        // bound an access. Built here rather than by the caller so the
+        // descriptor cannot disagree with the map it describes.
+        let map_descs: Vec<narf_bpf_verifier::MapDesc> = req
+            .maps
+            .iter()
+            .map(|(fd, m)| {
+                let a = m.attr();
+                narf_bpf_verifier::MapDesc {
+                    fd: *fd,
+                    key_size: a.key_size,
+                    value_size: a.value_size,
+                    max_entries: a.max_entries,
+                }
+            })
+            .collect();
         let prog = narf_bpf_verifier::Program {
             insns: &req.insns,
             context: req.context,
@@ -183,6 +218,7 @@ impl BpfProg {
             // scalars.
             ctx_fields: &CTX_SCALARS,
             kfuncs: &descs,
+            maps: &map_descs,
         };
 
         let mut subprogs: Vec<SubprogInfo> = Vec::new();
@@ -226,6 +262,7 @@ impl BpfProg {
             subprogs,
             jit,
             arenas,
+            maps: req.maps,
             runs: AtomicU64::new(0),
             accumulated: AtomicU64::new(0),
             traps: AtomicU64::new(0),
@@ -258,6 +295,30 @@ impl BpfProg {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.insns.is_empty()
+    }
+
+    /// The map named by this file descriptor, or `None`.
+    ///
+    /// What the interpreter resolves `LD_IMM64`'s `MapFd` form against. The
+    /// verifier already proved the fd is in the set — this is the runtime
+    /// looking up the same entry, and a `None` here would mean the two
+    /// disagreed.
+    #[must_use]
+    pub fn map_by_fd(&self, fd: i32) -> Option<&Arc<crate::map::BpfMap>> {
+        self.maps.iter().find(|(f, _)| *f == fd).map(|(_, m)| m)
+    }
+
+    /// The map at this position in the loader's fd array — `LD_IMM64`'s
+    /// `MapIdx` form.
+    #[must_use]
+    pub fn map_by_idx(&self, idx: usize) -> Option<&Arc<crate::map::BpfMap>> {
+        self.maps.get(idx).map(|(_, m)| m)
+    }
+
+    /// How many maps this program references.
+    #[must_use]
+    pub fn map_count(&self) -> usize {
+        self.maps.len()
     }
 
     /// Invocation count.
@@ -347,6 +408,7 @@ impl BpfProg {
                 subprogs: &self.subprogs,
                 context: self.context,
                 fuel: self.initial_fuel,
+                maps: &self.maps,
             },
             ctx,
             MAX_CTX_WORDS,
@@ -455,6 +517,7 @@ impl BpfProg {
                 subprogs: &self.subprogs,
                 context: self.context,
                 fuel: self.initial_fuel,
+                maps: &self.maps,
             },
             ctx,
             ctx_len,
@@ -478,6 +541,41 @@ impl BpfProg {
             }
         }
     }
+}
+
+/// Refuse a construct the verifier accepts but no backend can execute.
+///
+/// A program the verifier proves and the runtime then cannot run is a contract
+/// break even though it is not a safety hole — the same one [`MAX_STACK_BYTES`]
+/// and `MAX_CALL_DEPTH` exist to prevent, and it is much worse to discover at
+/// fire time than at load. The verifier is a library and stays general; this is
+/// the runtime stating its own limit.
+///
+/// Today that is exactly one construct: `LD_IMM64`'s map-*value* pseudo-forms.
+/// The verifier resolves and bounds them, but neither the interpreter (which has
+/// no synthetic region aliasing a map's value bytes) nor the x86_64 emitter
+/// (which does not lower `LD_IMM64` at all) can produce the address.
+fn reject_unrunnable(insns: &[Insn]) -> Result<(), LoadError> {
+    use narf_bpf_isa::{Decoded, Imm64};
+    let mut i = 0usize;
+    while i < insns.len() {
+        // An undecodable image is the verifier's error to report, with its own
+        // instruction index; stopping here would pre-empt a better diagnostic.
+        let Ok((d, width)) = narf_bpf_isa::decode(insns, i) else {
+            return Ok(());
+        };
+        if let Decoded::LoadImm64 {
+            value: Imm64::MapValue { .. } | Imm64::MapIdxValue { .. },
+            ..
+        } = d
+        {
+            return Err(LoadError::Rejected(VerifyError::NotImplemented(
+                "LD_IMM64 map-value pseudo-form: no backend can produce the address",
+            )));
+        }
+        i += width;
+    }
+    Ok(())
 }
 
 /// The four scalar fields of the probe context tuple.

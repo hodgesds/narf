@@ -19,9 +19,9 @@
 //! trade away for the extable and the arena guard slots — so the JIT must not
 //! be enabled before the real verifier is. [`provisional`] is the reminder.
 //!
-//! Not here yet: maps and arenas (Phase 3), the JIT and the RX allocator
-//! (Phase 4), struct_ops trampolines (Phase 5), and the net/perf attach
-//! surfaces (Phase 6).
+//! Not here yet: arenas and the `RingBuf` map kind (Phase 3 — the four keyed
+//! kinds are in [`map`]), struct_ops trampolines (Phase 5), and the net/perf
+//! attach surfaces (Phase 6).
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -38,6 +38,7 @@ pub mod interp;
 pub mod jit_glue;
 pub mod kfunc;
 pub mod kfuncs;
+pub mod map;
 pub mod mem;
 pub mod prog;
 pub mod provisional;
@@ -60,6 +61,7 @@ pub mod reexport {
 pub use attach::{attach_probe, detach_probe, AttachError, ProbeProgram};
 pub use interp::{Outcome, Trap, Vm};
 pub use kfunc::{KfuncEntry, KfuncShim, Registry, RegistryError};
+pub use map::{ArrayMap, BpfMap, BpfMapCap, BpfMapOps, HashMap, MapAttr, MapError, MapKind};
 pub use prog::{BpfAttach, BpfProg, BpfProgLoad, LoadError, LoadRequest};
 pub use structops::{ProgSet, StructOpsDesc, StructOpsError};
 pub use types::{ArenaPtr, BpfObject, BpfType, Const, Guard, Owned, Rcu, SleepableRcu, Trusted};

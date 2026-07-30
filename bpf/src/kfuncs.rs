@@ -21,12 +21,14 @@ use crate::types::fnv1a32_nonzero;
 /// cannot drift.
 pub const YIELD_ID: i32 = fnv1a32_nonzero("narf_yield") as i32;
 
-/// Scratch counters programs can bump before maps land in Phase 3.
+/// Scratch counters, kept after `crate::map` landed.
 ///
-/// Sixteen `AtomicU64`s, no allocation, no locking — which is exactly the
-/// property `PerCpuArray` will need to preserve when it replaces this. Kept
-/// deliberately small and boring so that "maps are Phase 3" stays true: this
-/// is a counter array, not a map implementation in disguise.
+/// Sixteen `AtomicU64`s, no allocation, no locking. `PerCpuArray` supersedes
+/// them for anything a program wants to *keep* — it is created by userspace,
+/// read back through `bpf(2)`, and sized by the caller — but these need no map
+/// to exist, so they stay as what the interpreter and probe-attach smokes
+/// observe an effect through. Deliberately still a counter array and not a map
+/// implementation in disguise.
 const COUNTER_SLOTS: usize = 16;
 static COUNTERS: [AtomicU64; COUNTER_SLOTS] = [const { AtomicU64::new(0) }; COUNTER_SLOTS];
 

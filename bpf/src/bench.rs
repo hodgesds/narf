@@ -349,6 +349,7 @@ fn verifier_program<'a>(
         context: Context::Atomic,
         ctx_fields: &CTX_SCALARS,
         kfuncs: descs,
+        maps: &[],
     }
 }
 
@@ -464,6 +465,7 @@ fn sample_interp(shape: Shape, arm: Arm, iters: u32) -> Option<Sample> {
                 subprogs: &[],
                 context: Context::Atomic,
                 fuel: narf_bpf_verifier::DEFAULT_FUEL,
+                maps: &[],
             },
             [0; MAX_CTX_WORDS],
             0,
@@ -608,6 +610,7 @@ fn sample_load_total(idx: usize, iters: u32) -> Option<Sample> {
             name: alloc::format!("bench{i}"),
             insns: insns.clone(),
             context: Context::Atomic,
+            maps: alloc::vec::Vec::new(),
         })
         .collect();
 

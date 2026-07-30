@@ -601,6 +601,53 @@ unsafe impl BpfType for &[u8] {
     }
 }
 
+/// A writable byte region whose length is the next argument.
+///
+/// `SIZED_BY_NEXT | UNINIT`: sized like `&[u8]`, and written by the callee like
+/// `&mut MaybeUninit<T>`. Both flags are needed and neither alone is enough —
+/// without `SIZED_BY_NEXT` the verifier has no length to bound the region with
+/// and `check_mem_arg` refuses outright; without `UNINIT` the caller would have
+/// to have initialised a buffer it only ever reads back.
+///
+/// This is the shape a copy-out kfunc needs, and `&mut MaybeUninit<T>` cannot
+/// serve: it carries no length, so `check_mem_arg` rejects it. `crate::map`'s
+/// lookup kfunc is the first caller.
+///
+// SAFETY: as `&[u8]` — the slice is built from a program-supplied
+// pointer/length pair the verifier proved describes an in-bounds region, and
+// `READONLY` is checked there for the write.
+unsafe impl BpfType for &mut [u8] {
+    const DESC: ArgDesc = ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::Mem,
+            key: TypeKey::NONE,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::SIZED_BY_NEXT.with(ArgFlags::UNINIT),
+    };
+    // A borrowed region has no lifetime a program could honour after the call.
+    const LEGAL_IN_RET: bool = false;
+    #[inline]
+    unsafe fn from_raw(raw: u64, next: u64) -> Self {
+        if raw == 0 || next == 0 {
+            return &mut [];
+        }
+        // SAFETY: verifier-proved in-bounds writable region; see the type-level
+        // note. Exclusivity holds because the only writable region a program can
+        // name today is its own stack frame, which the interpreter translated
+        // for this one call and which no other holder can reach for its
+        // duration. `PtrClass::MapValue` is the other region `check_mem_arg`
+        // would admit, and `BpfProg::load`'s `reject_unrunnable` refuses every
+        // instruction that could produce one — so if that rejection is ever
+        // lifted, this argument has to be re-made rather than inherited.
+        unsafe { core::slice::from_raw_parts_mut(raw as *mut u8, next as usize) }
+    }
+    #[inline]
+    fn into_raw(self) -> u64 {
+        self.as_ptr() as u64
+    }
+}
+
 /// A region the callee initialises. Linux spells it `__uninit`.
 ///
 // SAFETY: as `&[u8]`, plus the `UNINIT` flag telling the verifier the caller

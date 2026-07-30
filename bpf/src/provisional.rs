@@ -76,17 +76,25 @@ pub fn accept(insns: &[Insn], context: Context, registry: &Registry) -> Result<(
                 }
             }
 
-            // Maps and arenas are Phase 3. Rejecting their instruction forms
-            // here — rather than letting the interpreter trap at fire time —
-            // means a program that needs them fails to load with a location,
-            // which is the whole point of `VerifyError` carrying one.
+            // A map reference must go through the *real* verifier, never this
+            // structural check.
+            //
+            // `narf_bpf_verifier` now resolves `LD_IMM64`'s map pseudo-forms
+            // against `Program::maps`, and that resolution is load-bearing in
+            // both directions: it is what bounds a map-value pointer to
+            // `value_size`, and it is what requires a map *handle* to reach a
+            // kfunc at offset zero. This function proves neither, so admitting
+            // a map form here would hand a kfunc a `NonNull<BpfMap>` at a
+            // program-chosen address. Rejecting is not "maps are unimplemented"
+            // — it is that this path cannot discharge their obligations.
             Decoded::LoadImm64 {
                 value: Imm64::Value(_),
                 ..
             } => {}
             Decoded::LoadImm64 { .. } => {
                 return Err(VerifyError::NotImplemented(
-                    "map references land in Phase 3",
+                    "a map or BTF reference needs the abstract interpreter, not the \
+                     structural check",
                 ))
             }
             Decoded::AddrSpaceCast { .. } => {

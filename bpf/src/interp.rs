@@ -170,6 +170,13 @@ pub enum Trap {
     /// the operation non-atomic with respect to the other side of the mapping,
     /// which is the one property the program asked for.
     ArenaUnaligned { at: u32, handle: u64, len: usize },
+    /// A `LD_IMM64` map reference the runtime could not resolve.
+    ///
+    /// Normally impossible: the verifier resolved the same reference against the
+    /// same set. Reaching it means the verifier's `Program::maps` and the
+    /// program's own list disagreed, and the alternative to trapping is handing
+    /// a kfunc a null it will treat as non-null.
+    UnresolvedMap { at: u32 },
 }
 
 /// How a program run ended.
@@ -265,6 +272,15 @@ pub struct VmProgram<'a> {
     pub context: Context,
     /// Starting fuel.
     pub fuel: u64,
+    /// Maps the program may reference, paired with the file descriptors its
+    /// `LD_IMM64` immediates name.
+    ///
+    /// Resolved here rather than patched into the image: verification does not
+    /// rewrite instructions (spec §1.7), so Linux's
+    /// `resolve_pseudo_ldimm64`-rewrites-the-insn trick is not available and a
+    /// reference costs one lookup per execution instead. There are at most a
+    /// handful of maps per program, so the lookup is a linear scan.
+    pub maps: &'a [(i32, alloc::sync::Arc<crate::map::BpfMap>)],
 }
 
 /// The virtual machine.
@@ -318,6 +334,8 @@ pub struct Vm<'a> {
     /// break a file this change has no business editing. [`Vm::with_arenas`] is
     /// the seam instead.
     arenas: &'a [alloc::sync::Arc<crate::arena::ProgArena>],
+    /// See [`VmProgram::maps`].
+    maps: &'a [(i32, alloc::sync::Arc<crate::map::BpfMap>)],
     /// Instructions retired, for diagnostics.
     steps: u64,
 }
@@ -348,6 +366,7 @@ impl<'a> Vm<'a> {
             subprogs,
             context,
             fuel,
+            maps,
         } = prog;
         let mut regs = [0u64; 11];
         // BPF entry convention: R1 = context pointer, R10 = frame pointer.
@@ -369,6 +388,7 @@ impl<'a> Vm<'a> {
             registry,
             context,
             arenas: &[],
+            maps,
             steps: 0,
         }
     }
@@ -443,6 +463,29 @@ impl<'a> Vm<'a> {
     #[inline]
     fn has_arena(&self) -> bool {
         !self.arenas.is_empty()
+    /// The map named by this file descriptor.
+    fn map_by_fd(&self, fd: i32) -> Option<&alloc::sync::Arc<crate::map::BpfMap>> {
+        self.maps.iter().find(|(f, _)| *f == fd).map(|(_, m)| m)
+    }
+
+    /// The address a map handle carries.
+    ///
+    /// `Arc::as_ptr`, not a synthetic token: the kfunc shim reconstitutes a
+    /// `Trusted<BpfMap>` from the register, and the program holds the `Arc` for
+    /// its whole life, so the pointee outlives every call that can see it.
+    ///
+    /// `None` means the verifier accepted a reference the runtime cannot
+    /// resolve, which is the two halves disagreeing — a trap rather than a
+    /// silent zero, since a zero here would reach `NonNull::new_unchecked`.
+    fn map_addr(
+        &self,
+        at: u32,
+        m: Option<&alloc::sync::Arc<crate::map::BpfMap>>,
+    ) -> Result<u64, Trap> {
+        match m {
+            Some(m) => Ok(alloc::sync::Arc::as_ptr(m) as u64),
+            None => Err(Trap::UnresolvedMap { at }),
+        }
     }
 
     fn load(&mut self, at: u32, addr: u64, size: Size, signed: bool) -> Result<u64, Trap> {
@@ -730,10 +773,47 @@ impl<'a> Vm<'a> {
                 Decoded::LoadImm64 { dst, value } => {
                     let v = match value {
                         Imm64::Value(v) => v,
+                        // A map handle is the map's own address. That is a real
+                        // kernel pointer in a program-visible register, which is
+                        // a deliberate exception to "the interpreter never
+                        // dereferences a program-supplied address" — the
+                        // interpreter still never dereferences it. Loads and
+                        // stores through it are rejected (`stack_range` and the
+                        // ctx window do not contain it, so `Trap::BadAccess`),
+                        // and the only thing that *can* consume it is a kfunc
+                        // whose `Trusted<BpfMap>` parameter the verifier proved
+                        // was passed at offset zero. `crate::provisional` cannot
+                        // discharge that obligation and therefore rejects every
+                        // map form, so this value only ever exists in a fully
+                        // verified program.
+                        Imm64::MapFd(fd) => self.map_addr(at, self.map_by_fd(fd))?,
+                        Imm64::MapIdx(idx) => {
+                            let m = usize::try_from(idx)
+                                .ok()
+                                .and_then(|i| self.maps.get(i))
+                                .map(|(_, m)| m);
+                            self.map_addr(at, m)?
+                        }
+                        // LINUX-GAP: `BPF_PSEUDO_MAP_VALUE` — a pointer into
+                        // the map's first value, which is what LLVM emits for a
+                        // global variable. The verifier resolves and bounds it;
+                        // the interpreter has no synthetic region that aliases a
+                        // map's value bytes, and `BpfMapOps` is copy-based by
+                        // design (see `map_lookup_elem`'s note on why a
+                        // borrowed map-value pointer is not offered). Rejected
+                        // at load by `BpfProg::load` so this arm is unreachable
+                        // from a loaded program; it exists so that enabling the
+                        // form cannot silently produce a wrong address.
+                        Imm64::MapValue { .. } | Imm64::MapIdxValue { .. } => {
+                            return Err(Trap::Unsupported {
+                                at,
+                                what: "LD_IMM64 map-value pseudo-form",
+                            })
+                        }
                         _ => {
                             return Err(Trap::Unsupported {
                                 at,
-                                what: "LD_IMM64 pseudo-form (maps are Phase 3)",
+                                what: "LD_IMM64 pseudo-form",
                             })
                         }
                     };

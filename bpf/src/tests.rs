@@ -137,6 +137,7 @@ fn load(
             name: alloc::string::String::from(name),
             insns,
             context: ctx,
+            maps: alloc::vec::Vec::new(),
         },
     )
     .map_err(|_| "load rejected")
@@ -344,6 +345,7 @@ fn run_unverified(insns: &[Insn], fuel: u64) -> Option<Outcome> {
             subprogs: &[],
             context: Context::Atomic,
             fuel,
+            maps: &[],
         },
         [0; crate::interp::MAX_CTX_WORDS],
         4,
@@ -1890,3 +1892,900 @@ fn smoke_bpf_jit_diff_trapping_program_agrees() -> TestResult {
     }
 }
 kernel_test_in!("bpf", smoke_bpf_jit_diff_trapping_program_agrees);
+// ════════════════════════════════════════════════════════════════════
+// Maps (`crate::map`).
+//
+// In-kernel rather than host tests because a map's width comes from
+// `narf_lib::smp::cpu_count()`, its storage sits behind an `IrqSafeSpinLock`,
+// and the per-CPU kinds are indexed by `current_cpu()` — none of which has a
+// host analogue. The Linux-ABI errno mapping is pinned separately from
+// userspace in `userspace/src/abi_bpf_tests.rs`.
+// ════════════════════════════════════════════════════════════════════
+
+use alloc::string::String;
+use alloc::sync::Arc;
+
+use crate::map::{
+    BpfMap, BpfMapCap, MapAttr, MapError, MapKind, BPF_ANY, BPF_EXIST, BPF_F_LOCK, BPF_NOEXIST,
+};
+
+/// Cached for the same reason [`load_cap`] is: `Cap::bootstrap()` allocates an
+/// object-table slot per call.
+fn map_cap() -> &'static Cap<BpfMapCap, Grant> {
+    use narf_lib::sync::IrqSafeSpinLock;
+    static SLOT: IrqSafeSpinLock<Option<&'static Cap<BpfMapCap, Grant>>> =
+        IrqSafeSpinLock::new(None);
+    let mut g = SLOT.lock();
+    if g.is_none() {
+        let c: &'static _ =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(Cap::<BpfMapCap, Grant>::bootstrap()));
+        *g = Some(c);
+    }
+    g.expect("just installed")
+}
+
+fn mk(
+    kind: MapKind,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+) -> Result<Arc<BpfMap>, MapError> {
+    BpfMap::create(
+        map_cap(),
+        MapAttr {
+            kind,
+            key_size,
+            value_size,
+            max_entries,
+        },
+        String::from("smoke"),
+    )
+}
+
+fn k32(v: u32) -> [u8; 4] {
+    v.to_le_bytes()
+}
+
+/// `?`-style bodies, so a test reads as a list of assertions rather than a
+/// staircase of `match`.
+fn checked(f: impl FnOnce() -> Result<(), &'static str>) -> TestResult {
+    match f() {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+
+// ── Array ───────────────────────────────────────────────────────────
+
+fn smoke_bpf_map_array_roundtrip() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::Array, 4, 8, 4).map_err(|_| "Array create failed")?;
+        let ops = m.ops();
+        let mut out = [0u8; 8];
+        // Every array slot exists from creation and reads as zero. A program
+        // may load a slot nothing has written, so the bytes must not be a
+        // previous map's.
+        ops.lookup(&k32(2), &mut out)
+            .map_err(|_| "a fresh Array slot was not readable")?;
+        if out != [0u8; 8] {
+            return Err("a fresh Array slot was not zeroed");
+        }
+        ops.update(&k32(2), &0xDEAD_BEEF_u64.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "Array update rejected")?;
+        ops.lookup(&k32(2), &mut out)
+            .map_err(|_| "Array lookup after update failed")?;
+        if u64::from_le_bytes(out) != 0xDEAD_BEEF {
+            return Err("Array lookup returned the wrong value");
+        }
+        // Sentinels on *both* sides of the written slot, because an off-by-one
+        // in `slot_range` shifts in one direction only and a single neighbour
+        // would miss half of them.
+        for neighbour in [1u32, 3] {
+            ops.lookup(&k32(neighbour), &mut out)
+                .map_err(|_| "Array neighbour lookup failed")?;
+            if out != [0u8; 8] {
+                return Err("Array update wrote outside its own slot");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_array_roundtrip);
+
+fn smoke_bpf_map_array_errnos() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::Array, 4, 8, 4).map_err(|_| "Array create failed")?;
+        let ops = m.ops();
+        let mut out = [0u8; 8];
+        // A key past `max_entries` is a *missing* key on lookup and an
+        // oversized one on update. Linux splits them exactly here
+        // (`array_map_lookup_elem` returns NULL ⇒ ENOENT;
+        // `array_map_update_elem` returns -E2BIG) and a loader that probes
+        // capacity depends on the difference.
+        if ops.lookup(&k32(4), &mut out) != Err(MapError::NotFound) {
+            return Err("Array lookup past max_entries was not NotFound");
+        }
+        if ops.update(&k32(4), &out, BPF_ANY) != Err(MapError::TooBig) {
+            return Err("Array update past max_entries was not TooBig");
+        }
+        // Every slot already exists, so "create only" can never be satisfied.
+        if ops.update(&k32(0), &out, BPF_NOEXIST) != Err(MapError::Exists) {
+            return Err("Array update with BPF_NOEXIST was not Exists");
+        }
+        // ...but "overwrite only" always can.
+        if ops.update(&k32(0), &out, BPF_EXIST).is_err() {
+            return Err("Array update with BPF_EXIST was refused");
+        }
+        // An array slot cannot stop existing: `array_map_delete_elem` is
+        // -EINVAL, not -ENOENT.
+        if ops.delete(&k32(0)) != Err(MapError::Invalid) {
+            return Err("Array delete was not Invalid");
+        }
+        // Widths are part of the contract; a short buffer would otherwise be a
+        // panicking slice copy.
+        if ops.lookup(&k32(0), &mut [0u8; 4]) != Err(MapError::Invalid) {
+            return Err("Array lookup into a short buffer was not Invalid");
+        }
+        if ops.update(&k32(0), &[0u8; 4], BPF_ANY) != Err(MapError::Invalid) {
+            return Err("Array update from a short buffer was not Invalid");
+        }
+        if ops.lookup(&[0u8; 2], &mut out) != Err(MapError::Invalid) {
+            return Err("Array lookup with a 2-byte key was not Invalid");
+        }
+        // No map value can carry a `bpf_spin_lock`: there is no BTF to say
+        // where it would live, so `BPF_F_LOCK` is EINVAL exactly as it is on
+        // Linux for a map with no lock field.
+        if ops.update(&k32(0), &out, BPF_F_LOCK) != Err(MapError::Invalid) {
+            return Err("BPF_F_LOCK was not rejected");
+        }
+        // `BPF_NOEXIST | BPF_EXIST` is not a flag combination.
+        if ops.update(&k32(0), &out, BPF_NOEXIST | BPF_EXIST) != Err(MapError::Invalid) {
+            return Err("a nonsense flag word was not rejected");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_array_errnos);
+
+fn smoke_bpf_map_array_next_key() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::Array, 4, 8, 3).map_err(|_| "Array create failed")?;
+        let ops = m.ops();
+        let mut out = [0u8; 4];
+        // `array_map_get_next_key`: NULL starts at 0, index i yields i+1, and
+        // the last index terminates the walk.
+        ops.next_key(None, &mut out)
+            .map_err(|_| "Array next_key(None) failed")?;
+        if out != k32(0) {
+            return Err("Array next_key(None) did not start at 0");
+        }
+        ops.next_key(Some(&k32(0)), &mut out)
+            .map_err(|_| "Array next_key(0) failed")?;
+        if out != k32(1) {
+            return Err("Array next_key(0) was not 1");
+        }
+        ops.next_key(Some(&k32(1)), &mut out)
+            .map_err(|_| "Array next_key(1) failed")?;
+        if out != k32(2) {
+            return Err("Array next_key(1) was not 2");
+        }
+        if ops.next_key(Some(&k32(2)), &mut out) != Err(MapError::NotFound) {
+            return Err("Array next_key past the last index was not NotFound");
+        }
+        // An out-of-range key restarts the walk rather than failing — Linux's
+        // `if (index >= max_entries) { *next = 0; return 0; }`.
+        ops.next_key(Some(&k32(99)), &mut out)
+            .map_err(|_| "Array next_key with an out-of-range key failed")?;
+        if out != k32(0) {
+            return Err("Array next_key with an out-of-range key did not restart at 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_array_next_key);
+
+// ── Hash ────────────────────────────────────────────────────────────
+
+fn smoke_bpf_map_hash_roundtrip() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::Hash, 4, 8, 8).map_err(|_| "Hash create failed")?;
+        let ops = m.ops();
+        let mut out = [0u8; 8];
+        // Absent until written — unlike an array, a hash slot does not exist
+        // until something creates it.
+        if ops.lookup(&k32(7), &mut out) != Err(MapError::NotFound) {
+            return Err("a fresh Hash reported a key it does not hold");
+        }
+        for i in 0..8u32 {
+            ops.update(&k32(i), &(u64::from(i) * 1000 + 1).to_le_bytes(), BPF_ANY)
+                .map_err(|_| "Hash update rejected")?;
+        }
+        // Every key, read back after every other key was written: a bucket
+        // chain that drops a node shows up here and nowhere in a single
+        // insert/lookup pair.
+        for i in 0..8u32 {
+            ops.lookup(&k32(i), &mut out)
+                .map_err(|_| "Hash lost a key that was inserted")?;
+            if u64::from_le_bytes(out) != u64::from(i) * 1000 + 1 {
+                return Err("Hash returned another key's value");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_hash_roundtrip);
+
+fn smoke_bpf_map_hash_flag_policy() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::Hash, 4, 8, 4).map_err(|_| "Hash create failed")?;
+        let ops = m.ops();
+        let v = 1u64.to_le_bytes();
+        // "Overwrite only" against an absent key is ENOENT, and must not
+        // create it.
+        if ops.update(&k32(1), &v, BPF_EXIST) != Err(MapError::NotFound) {
+            return Err("Hash update with BPF_EXIST on an absent key was not NotFound");
+        }
+        if ops.lookup(&k32(1), &mut [0u8; 8]) != Err(MapError::NotFound) {
+            return Err("a refused BPF_EXIST update created the key anyway");
+        }
+        // "Create only" against an absent key succeeds...
+        ops.update(&k32(1), &v, BPF_NOEXIST)
+            .map_err(|_| "Hash update with BPF_NOEXIST on an absent key was refused")?;
+        // ...and against a present one is EEXIST, without overwriting.
+        if ops.update(&k32(1), &2u64.to_le_bytes(), BPF_NOEXIST) != Err(MapError::Exists) {
+            return Err("Hash update with BPF_NOEXIST on a present key was not Exists");
+        }
+        let mut out = [0u8; 8];
+        ops.lookup(&k32(1), &mut out)
+            .map_err(|_| "Hash lookup failed")?;
+        if u64::from_le_bytes(out) != 1 {
+            return Err("a refused BPF_NOEXIST update overwrote the value");
+        }
+        // Now BPF_EXIST does overwrite.
+        ops.update(&k32(1), &3u64.to_le_bytes(), BPF_EXIST)
+            .map_err(|_| "Hash update with BPF_EXIST on a present key was refused")?;
+        ops.lookup(&k32(1), &mut out)
+            .map_err(|_| "Hash lookup failed")?;
+        if u64::from_le_bytes(out) != 3 {
+            return Err("BPF_EXIST did not overwrite");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_hash_flag_policy);
+
+fn smoke_bpf_map_hash_delete_and_reuse() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::Hash, 4, 8, 3).map_err(|_| "Hash create failed")?;
+        let ops = m.ops();
+        let v = 9u64.to_le_bytes();
+        if ops.delete(&k32(0)) != Err(MapError::NotFound) {
+            return Err("Hash delete of an absent key was not NotFound");
+        }
+        for i in 0..3u32 {
+            ops.update(&k32(i), &v, BPF_ANY)
+                .map_err(|_| "Hash update rejected")?;
+        }
+        // Full: a fourth key has no node to take.
+        if ops.update(&k32(3), &v, BPF_ANY) != Err(MapError::TooBig) {
+            return Err("insertion into a full Hash was not TooBig");
+        }
+        ops.delete(&k32(1)).map_err(|_| "Hash delete failed")?;
+        if ops.lookup(&k32(1), &mut [0u8; 8]) != Err(MapError::NotFound) {
+            return Err("a deleted key is still present");
+        }
+        // Unlinking must return the node to the free list; if it only cleared
+        // `live`, capacity would leak one node per delete and this insert would
+        // be TooBig.
+        ops.update(&k32(3), &v, BPF_ANY)
+            .map_err(|_| "a deleted node's capacity was not reclaimed")?;
+        // The two survivors are still reachable — a mis-unlinked chain drops
+        // the node that followed the removed one.
+        for i in [0u32, 2, 3] {
+            if ops.lookup(&k32(i), &mut [0u8; 8]).is_err() {
+                return Err("deleting a key unlinked a different key too");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_hash_delete_and_reuse);
+
+fn smoke_bpf_map_hash_recycled_node_is_zeroed() -> TestResult {
+    checked(|| {
+        // A recycled node must not hand a new key the previous occupant's
+        // bytes. Reachable through the per-CPU kinds, where `update_local`
+        // writes one CPU's slot and leaves the others at whatever was there.
+        let m = mk(MapKind::Hash, 4, 8, 1).map_err(|_| "Hash create failed")?;
+        let ops = m.ops();
+        ops.update(&k32(1), &0x5555_5555_5555_5555_u64.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "Hash update rejected")?;
+        ops.delete(&k32(1)).map_err(|_| "Hash delete failed")?;
+        // The only node is now free, so key 2 must land on it.
+        ops.update(&k32(2), &0u64.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "Hash reinsert rejected")?;
+        let mut out = [0u8; 8];
+        ops.lookup(&k32(2), &mut out)
+            .map_err(|_| "Hash lookup failed")?;
+        if out != [0u8; 8] {
+            return Err("a recycled hash node leaked the previous key's value");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_hash_recycled_node_is_zeroed);
+
+fn smoke_bpf_map_hash_next_key_walk() -> TestResult {
+    checked(|| {
+        const N: u32 = 6;
+        let m = mk(MapKind::Hash, 4, 8, N).map_err(|_| "Hash create failed")?;
+        let ops = m.ops();
+        for i in 0..N {
+            ops.update(&k32(i * 7), &u64::from(i).to_le_bytes(), BPF_ANY)
+                .map_err(|_| "Hash update rejected")?;
+        }
+        // A full walk must visit every key exactly once and then terminate.
+        let mut seen = [false; N as usize];
+        let mut key: Option<[u8; 4]> = None;
+        let mut out = [0u8; 4];
+        for _ in 0..=N {
+            match ops.next_key(key.as_ref().map(|k| &k[..]), &mut out) {
+                Ok(()) => {}
+                Err(MapError::NotFound) => {
+                    key = None;
+                    break;
+                }
+                Err(_) => return Err("Hash next_key failed for a reason other than NotFound"),
+            }
+            let raw = u32::from_le_bytes(out);
+            if raw % 7 != 0 || raw / 7 >= N {
+                return Err("Hash next_key produced a key that was never inserted");
+            }
+            let slot = (raw / 7) as usize;
+            if seen[slot] {
+                return Err("Hash next_key revisited a key inside one walk");
+            }
+            seen[slot] = true;
+            key = Some(out);
+        }
+        if key.is_some() {
+            return Err("Hash next_key walk did not terminate after max_entries steps");
+        }
+        if seen.iter().any(|s| !*s) {
+            return Err("Hash next_key walk skipped a key");
+        }
+        // A key the map does not hold restarts the walk rather than failing —
+        // the quirk `htab_map_get_next_key`'s `goto find_first_elem` produces,
+        // and what lets a delete-while-iterating loop keep going.
+        ops.next_key(Some(&k32(12345)), &mut out)
+            .map_err(|_| "Hash next_key with an absent key did not restart the walk")?;
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_hash_next_key_walk);
+
+fn smoke_bpf_map_hash_next_key_empty() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::Hash, 4, 8, 4).map_err(|_| "Hash create failed")?;
+        let mut out = [0u8; 4];
+        // An empty map terminates immediately; anything else would make
+        // `BPF_MAP_GET_NEXT_KEY` on a fresh map return an uninitialised key.
+        if m.ops().next_key(None, &mut out) != Err(MapError::NotFound) {
+            return Err("next_key on an empty Hash was not NotFound");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_hash_next_key_empty);
+
+// ── per-CPU kinds ───────────────────────────────────────────────────
+
+fn smoke_bpf_map_percpu_array_views() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::PerCpuArray, 4, 8, 2).map_err(|_| "PerCpuArray create failed")?;
+        let ops = m.ops();
+        let cpus = narf_lib::smp::cpu_count().max(1) as usize;
+        // The syscall view spans every CPU at an 8-byte stride, exactly as
+        // Linux's `bpf_percpu_array_copy` lays it out.
+        if ops.syscall_value_bytes() != cpus * 8 {
+            return Err("PerCpuArray syscall_value_bytes is not cpus * stride");
+        }
+        // Syscall update writes every CPU.
+        let all: alloc::vec::Vec<u8> = (0..cpus).flat_map(|_| 0x11u64.to_le_bytes()).collect();
+        ops.update(&k32(0), &all, BPF_ANY)
+            .map_err(|_| "PerCpuArray syscall update rejected")?;
+        // The program view sees this CPU's slot, which the all-CPU write set.
+        let mut local = [0u8; 8];
+        ops.lookup_local(&k32(0), &mut local)
+            .map_err(|_| "PerCpuArray lookup_local failed")?;
+        if u64::from_le_bytes(local) != 0x11 {
+            return Err("PerCpuArray lookup_local did not see the all-CPU write");
+        }
+        // The program view writes only this CPU's slot.
+        ops.update_local(&k32(0), &0x22u64.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "PerCpuArray update_local rejected")?;
+        let mut read_all = alloc::vec![0u8; cpus * 8];
+        ops.lookup(&k32(0), &mut read_all)
+            .map_err(|_| "PerCpuArray syscall lookup failed")?;
+        let mut changed = 0usize;
+        for c in 0..cpus {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&read_all[c * 8..c * 8 + 8]);
+            match u64::from_le_bytes(w) {
+                0x22 => changed += 1,
+                0x11 => {}
+                _ => return Err("PerCpuArray slot holds neither value written to it"),
+            }
+        }
+        if changed != 1 {
+            // `changed == cpus` means `update_local` wrote every slot;
+            // `changed == 0` means it wrote none of the ones the syscall view
+            // reads, i.e. the two views disagree about the stride.
+            return Err("PerCpuArray update_local did not write exactly one CPU's slot");
+        }
+        // Entry 1 must be untouched: the per-CPU stride multiplies the index,
+        // so an off-by-one there lands on the next entry.
+        ops.lookup(&k32(1), &mut read_all)
+            .map_err(|_| "PerCpuArray syscall lookup failed")?;
+        if read_all.iter().any(|b| *b != 0) {
+            return Err("a PerCpuArray write reached the next entry");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_percpu_array_views);
+
+/// The syscall view of a per-CPU map is `cpus * stride` wide, and must reject a
+/// buffer of the *program* width.
+///
+/// Separate from the test above because on a single-CPU boot the two widths
+/// coincide, so there is nothing to distinguish and a Pass would claim a gate
+/// that was never exercised.
+fn smoke_bpf_map_percpu_rejects_program_width_buffer() -> TestResult {
+    let cpus = narf_lib::smp::cpu_count().max(1) as usize;
+    if cpus < 2 {
+        return TestResult::Skip("single CPU: the syscall and program value widths coincide");
+    }
+    checked(|| {
+        for kind in [MapKind::PerCpuArray, MapKind::PerCpuHash] {
+            let m = mk(kind, 4, 8, 2).map_err(|_| "per-CPU create failed")?;
+            let ops = m.ops();
+            if ops.update(&k32(0), &[0u8; 8], BPF_ANY) != Err(MapError::Invalid) {
+                return Err("a per-CPU syscall update accepted a program-width buffer");
+            }
+            // Width is checked before the key is resolved, so this is `Invalid`
+            // and not `NotFound` even for a key the map does not hold.
+            if ops.lookup(&k32(0), &mut [0u8; 8]) != Err(MapError::Invalid) {
+                return Err("a per-CPU syscall lookup accepted a program-width buffer");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_percpu_rejects_program_width_buffer);
+
+fn smoke_bpf_map_percpu_hash_views() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::PerCpuHash, 4, 8, 4).map_err(|_| "PerCpuHash create failed")?;
+        let ops = m.ops();
+        let cpus = narf_lib::smp::cpu_count().max(1) as usize;
+        if ops.syscall_value_bytes() != cpus * 8 {
+            return Err("PerCpuHash syscall_value_bytes is not cpus * stride");
+        }
+        // `update_local` creates the entry when absent — a per-CPU counter map
+        // is written by programs, never by the syscall side, so this is the
+        // only path that populates it.
+        ops.update_local(&k32(5), &0x33u64.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "PerCpuHash update_local could not create an entry")?;
+        let mut local = [0u8; 8];
+        ops.lookup_local(&k32(5), &mut local)
+            .map_err(|_| "PerCpuHash lookup_local failed")?;
+        if u64::from_le_bytes(local) != 0x33 {
+            return Err("PerCpuHash lookup_local returned the wrong value");
+        }
+        let mut all = alloc::vec![0u8; cpus * 8];
+        ops.lookup(&k32(5), &mut all)
+            .map_err(|_| "PerCpuHash syscall lookup failed")?;
+        let mut nonzero = 0usize;
+        for c in 0..cpus {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&all[c * 8..c * 8 + 8]);
+            if u64::from_le_bytes(w) != 0 {
+                nonzero += 1;
+            }
+        }
+        if nonzero != 1 {
+            return Err("PerCpuHash update_local did not write exactly one CPU's slot");
+        }
+        // Flag policy still applies to the program view.
+        if ops.update_local(&k32(5), &local, BPF_NOEXIST) != Err(MapError::Exists) {
+            return Err("PerCpuHash update_local ignored BPF_NOEXIST");
+        }
+        if ops.update_local(&k32(6), &local, BPF_EXIST) != Err(MapError::NotFound) {
+            return Err("PerCpuHash update_local ignored BPF_EXIST");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_percpu_hash_views);
+
+// ── creation gates ──────────────────────────────────────────────────
+
+fn smoke_bpf_map_create_rejects_bad_shapes() -> TestResult {
+    checked(|| {
+        // `max_entries == 0` and `value_size == 0` are EINVAL for every kind:
+        // a zero-capacity map has no reachable key and a zero-width value has
+        // nothing to store.
+        for kind in [
+            MapKind::Array,
+            MapKind::Hash,
+            MapKind::PerCpuArray,
+            MapKind::PerCpuHash,
+        ] {
+            if mk(kind, 4, 8, 0).err() != Some(MapError::Invalid) {
+                return Err("max_entries == 0 was accepted");
+            }
+            if mk(kind, 4, 0, 4).err() != Some(MapError::Invalid) {
+                return Err("value_size == 0 was accepted");
+            }
+            if mk(kind, 0, 8, 4).err() != Some(MapError::Invalid) {
+                return Err("key_size == 0 was accepted");
+            }
+        }
+        // The array kinds *are* their index, so the key is exactly 4 bytes.
+        for kind in [MapKind::Array, MapKind::PerCpuArray] {
+            if mk(kind, 8, 8, 4).err() != Some(MapError::Invalid) {
+                return Err("an array kind accepted a key_size other than 4");
+            }
+        }
+        // A hash key may be any width up to the cap.
+        if mk(MapKind::Hash, 16, 8, 4).is_err() {
+            return Err("Hash refused a 16-byte key");
+        }
+        if mk(MapKind::Hash, crate::map::MAX_KEY_SIZE + 1, 8, 4).err() != Some(MapError::Invalid) {
+            return Err("a key past MAX_KEY_SIZE was accepted");
+        }
+        if mk(MapKind::Hash, 4, crate::map::MAX_VALUE_SIZE + 1, 4).err() != Some(MapError::TooBig) {
+            return Err("a value past MAX_VALUE_SIZE was not TooBig");
+        }
+        // The *product* is what gets allocated. Both factors below are legal on
+        // their own; without a bound on the product this asks for 4 GiB.
+        if mk(MapKind::Array, 4, 4096, 1 << 20).err() != Some(MapError::TooBig) {
+            return Err("a map whose footprint exceeds MAX_MAP_BYTES was accepted");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_create_rejects_bad_shapes);
+
+fn smoke_bpf_map_create_needs_live_cap() -> TestResult {
+    checked(|| {
+        // Possession is not authority: the cap is checked live at every entry,
+        // so a revoked one fails even though the caller still holds it.
+        let cap = Cap::<BpfMapCap, Grant>::bootstrap();
+        let attr = MapAttr {
+            kind: MapKind::Array,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
+        };
+        if BpfMap::create(&cap, attr, String::new()).is_err() {
+            return Err("create with a live cap failed");
+        }
+        cap.revoke();
+        match BpfMap::create(&cap, attr, String::new()) {
+            Err(MapError::AuthorityRevoked) => Ok(()),
+            Err(_) => Err("create with a revoked cap failed for the wrong reason"),
+            Ok(_) => Err("create with a revoked cap succeeded"),
+        }
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_create_needs_live_cap);
+
+fn smoke_bpf_map_file_is_a_handle() -> TestResult {
+    checked(|| {
+        use narf_filesystem::FileOps;
+        let m = mk(MapKind::Array, 4, 8, 1).map_err(|_| "Array create failed")?;
+        let id = m.id;
+        let f = crate::map::MapFile::new(m);
+        // The downcast every fd-to-map recovery goes through.
+        let any = f.as_any().ok_or("MapFile does not expose as_any")?;
+        let back = any
+            .downcast_ref::<crate::map::MapFile>()
+            .ok_or("MapFile did not downcast back to itself")?;
+        if back.map().id != id {
+            return Err("the recovered map is a different map");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_file_is_a_handle);
+
+// ── map access from a program ───────────────────────────────────────
+
+/// The fd a smoke's `LD_IMM64` immediates name.
+///
+/// Arbitrary: these tests hand `LoadRequest::maps` the pair directly rather
+/// than going through an fd table, so the number only has to agree between the
+/// instruction and the list. Deliberately not 0..2, so a resolver that treated
+/// the immediate as an *index* would miss.
+const SMOKE_MAP_FD: i32 = 7;
+
+fn ld_map_fd(dst: u8, fd: i32) -> Decoded {
+    Decoded::LoadImm64 {
+        dst: r(dst),
+        value: narf_bpf_isa::Imm64::MapFd(fd),
+    }
+}
+
+fn load_with_map(
+    name: &str,
+    insns: Vec<Insn>,
+    map: &Arc<BpfMap>,
+) -> Result<Arc<BpfProg>, crate::prog::LoadError> {
+    BpfProg::load(
+        load_cap(),
+        crate::prog::LoadRequest {
+            name: String::from(name),
+            insns,
+            context: Context::Atomic,
+            maps: alloc::vec![(SMOKE_MAP_FD, Arc::clone(map))],
+        },
+    )
+}
+
+/// `r1 = map; r2 = key; r3 = r10 - 8; r4 = 8` — the four registers every map
+/// kfunc below starts from.
+fn map_call_prelude(key: i32) -> alloc::vec::Vec<Decoded> {
+    alloc::vec![
+        ld_map_fd(1, SMOKE_MAP_FD),
+        mov_imm(2, key),
+        mov_reg(3, 10),
+        alu_imm(AluOp::Add, 3, -8),
+        mov_imm(4, 8),
+    ]
+}
+
+fn smoke_bpf_map_kfunc_update_then_lookup() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::Array, 4, 8, 4).map_err(|_| "Array create failed")?;
+
+        // *(u64*)(r10-8) = 0x5A5A; narf_map_update(map, 1, r10-8, 8, BPF_ANY);
+        // exit with the kfunc's return value.
+        let mut prog = alloc::vec![st_imm(10, -8, 0x5A5A)];
+        prog.extend(map_call_prelude(1));
+        prog.extend([mov_imm(5, 0), call("narf_map_update"), EXIT]);
+        let p = load_with_map("mapupd", asm(&prog), &m)
+            .map_err(|_| "load rejected a program calling narf_map_update")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(0)) => {}
+            Some(Outcome::Returned(v)) => {
+                // The kfunc reports failure as a negative errno in R0.
+                let _ = v;
+                return Err("narf_map_update returned an error");
+            }
+            Some(Outcome::Trapped(_)) => return Err("narf_map_update trapped"),
+            None => return Err("run declined"),
+        }
+        // The kernel side must see it.
+        let mut out = [0u8; 8];
+        m.ops()
+            .lookup(&k32(1), &mut out)
+            .map_err(|_| "the map has no entry the program wrote")?;
+        if u64::from_le_bytes(out) != 0x5A5A {
+            return Err("narf_map_update wrote the wrong value");
+        }
+        // ...and a neighbouring slot must not have been touched.
+        m.ops()
+            .lookup(&k32(2), &mut out)
+            .map_err(|_| "neighbour lookup failed")?;
+        if out != [0u8; 8] {
+            return Err("narf_map_update reached the neighbouring slot");
+        }
+
+        // Now read it back *from a program*: narf_map_lookup(map, 1, r10-8, 8);
+        // r0 = *(u64*)(r10-8); exit.
+        let mut prog = map_call_prelude(1);
+        prog.extend([call("narf_map_lookup"), ldx(0, 10, -8), EXIT]);
+        let p = load_with_map("maplkp", asm(&prog), &m)
+            .map_err(|_| "load rejected a program calling narf_map_lookup")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(0x5A5A)) => Ok(()),
+            Some(Outcome::Returned(0)) => {
+                Err("narf_map_lookup did not write the program's output buffer")
+            }
+            Some(Outcome::Returned(_)) => Err("narf_map_lookup returned the wrong value"),
+            Some(Outcome::Trapped(_)) => Err("narf_map_lookup trapped"),
+            None => Err("run declined"),
+        }
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_kfunc_update_then_lookup);
+
+fn smoke_bpf_map_kfunc_reports_errnos() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::Array, 4, 8, 4).map_err(|_| "Array create failed")?;
+        // A key past `max_entries`: `-ENOENT` from a lookup, and the program
+        // gets it as a value rather than as a trap — spec's rule that a kfunc
+        // reports failure through R0, because trapping would make every map
+        // access a termination point.
+        let mut prog = map_call_prelude(9);
+        prog.extend([call("narf_map_lookup"), EXIT]);
+        let p = load_with_map("maperr", asm(&prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            // -ENOENT sign-extended into R0.
+            Some(Outcome::Returned(v)) if v as i64 == -2 => {}
+            Some(Outcome::Returned(0)) => {
+                return Err("narf_map_lookup reported success for a missing key")
+            }
+            Some(Outcome::Returned(_)) => return Err("narf_map_lookup returned the wrong errno"),
+            Some(Outcome::Trapped(_)) => {
+                return Err("a missing key trapped the program instead of returning an errno")
+            }
+            None => return Err("run declined"),
+        }
+        // `delete` is not defined on an array kind: `-EINVAL`.
+        let prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 0),
+            call("narf_map_delete"),
+            EXIT,
+        ];
+        let p = load_with_map("mapdel", asm(&prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(v)) if v as i64 == -22 => {}
+            Some(Outcome::Returned(_)) => {
+                return Err("narf_map_delete on an array was not -EINVAL")
+            }
+            Some(Outcome::Trapped(_)) => return Err("narf_map_delete trapped"),
+            None => return Err("run declined"),
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_kfunc_reports_errnos);
+
+fn smoke_bpf_map_kfunc_wrong_buffer_width_is_einval() -> TestResult {
+    checked(|| {
+        // The map's value is 8 bytes and the program offers 4. The verifier
+        // proves the *region* in bounds — 4 bytes at r10-8 is fine — so nothing
+        // upstream catches the mismatch, and without the width check in the
+        // kfunc `lookup_local` would be handed a short buffer.
+        let m = mk(MapKind::Array, 4, 8, 4).map_err(|_| "Array create failed")?;
+        let prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 0),
+            mov_reg(3, 10),
+            alu_imm(AluOp::Add, 3, -8),
+            mov_imm(4, 4),
+            call("narf_map_lookup"),
+            EXIT,
+        ];
+        let p = load_with_map("mapwid", asm(&prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(v)) if v as i64 == -22 => Ok(()),
+            Some(Outcome::Returned(0)) => {
+                Err("narf_map_lookup accepted a buffer narrower than the map value")
+            }
+            Some(Outcome::Returned(_)) => Err("narf_map_lookup returned the wrong errno"),
+            Some(Outcome::Trapped(_)) => Err("narf_map_lookup trapped"),
+            None => Err("run declined"),
+        }
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_kfunc_wrong_buffer_width_is_einval);
+
+fn smoke_bpf_map_kfunc_per_cpu_hash_counter() -> TestResult {
+    checked(|| {
+        // What a per-CPU map is for: a program aggregating into its own CPU's
+        // slot, read back across every CPU from the syscall side.
+        let m = mk(MapKind::PerCpuHash, 4, 8, 4).map_err(|_| "PerCpuHash create failed")?;
+        let mut prog = alloc::vec![st_imm(10, -8, 0x77)];
+        prog.extend(map_call_prelude(3));
+        prog.extend([mov_imm(5, 0), call("narf_map_update"), EXIT]);
+        let p = load_with_map("pcupd", asm(&prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(0)) => {}
+            Some(Outcome::Returned(_)) => return Err("narf_map_update on a PerCpuHash failed"),
+            Some(Outcome::Trapped(_)) => return Err("narf_map_update trapped"),
+            None => return Err("run declined"),
+        }
+        // The syscall view sees exactly one CPU's slot written. A kfunc that
+        // took the all-CPU path would show `cpus` of them.
+        let cpus = narf_lib::smp::cpu_count().max(1) as usize;
+        let mut all = alloc::vec![0u8; cpus * 8];
+        m.ops()
+            .lookup(&k32(3), &mut all)
+            .map_err(|_| "the program's PerCpuHash entry does not exist")?;
+        let written = (0..cpus)
+            .filter(|c| {
+                let mut w = [0u8; 8];
+                w.copy_from_slice(&all[c * 8..c * 8 + 8]);
+                u64::from_le_bytes(w) == 0x77
+            })
+            .count();
+        if written != 1 {
+            return Err("a program's PerCpuHash update did not write exactly one CPU's slot");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_kfunc_per_cpu_hash_counter);
+
+fn smoke_bpf_map_handle_may_not_be_dereferenced() -> TestResult {
+    checked(|| {
+        // The runtime half of the host test `a_map_handle_may_not_be_dereferenced`.
+        // A map handle is a *real kernel address* in a program-visible register,
+        // which is the one exception to "the interpreter never dereferences a
+        // program-supplied address" — so the load through it has to be refused
+        // at verification, not left to the interpreter's region check.
+        let m = mk(MapKind::Array, 4, 8, 4).map_err(|_| "Array create failed")?;
+        let prog = alloc::vec![ld_map_fd(1, SMOKE_MAP_FD), ldx(0, 1, 0), EXIT];
+        match load_with_map("mapderef", asm(&prog), &m) {
+            Err(crate::prog::LoadError::Rejected(
+                narf_bpf_verifier::VerifyError::OpaqueDeref { .. },
+            )) => Ok(()),
+            Err(_) => Err("dereferencing a map handle was rejected for the wrong reason"),
+            Ok(_) => Err("a program dereferencing a map handle was accepted"),
+        }
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_handle_may_not_be_dereferenced);
+
+fn smoke_bpf_map_reference_needs_the_real_verifier() -> TestResult {
+    checked(|| {
+        // `crate::provisional` cannot prove a map handle reaches a kfunc at
+        // offset zero, so it refuses every map form. Without that, a program the
+        // real verifier could not prove would still get a raw `Arc<BpfMap>`
+        // pointer in a register it may do arithmetic on.
+        let m = mk(MapKind::Array, 4, 8, 4).map_err(|_| "Array create failed")?;
+        // `run_unverified` is the only way to reach the interpreter without a
+        // passing `verify()`, and it is what the provisional path used to feed.
+        // Here the point is the *load* gate: a map form plus something the real
+        // verifier rejects must not fall through to `provisional` and be
+        // accepted.
+        let prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            // Returning a pointer is rejected by the real verifier, so this
+            // program cannot pass it; if it fell through to `provisional`
+            // instead, that path would have to reject it too.
+            mov_reg(0, 1),
+            EXIT,
+        ];
+        match load_with_map("mapprov", asm(&prog), &m) {
+            Err(crate::prog::LoadError::Rejected(_)) => Ok(()),
+            Err(_) => Err("rejected for the wrong reason"),
+            Ok(_) => Err("a program returning a map handle was accepted"),
+        }
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_reference_needs_the_real_verifier);
+
+fn smoke_bpf_map_value_pseudo_form_is_refused_at_load() -> TestResult {
+    checked(|| {
+        // The verifier resolves and bounds `BPF_PSEUDO_MAP_VALUE`; no backend
+        // can produce the address. A program the verifier accepts and the
+        // runtime cannot execute is a contract break, so it is refused at load
+        // rather than trapping at fire time.
+        let m = mk(MapKind::Array, 4, 8, 4).map_err(|_| "Array create failed")?;
+        let prog = alloc::vec![
+            Decoded::LoadImm64 {
+                dst: r(1),
+                value: narf_bpf_isa::Imm64::MapValue {
+                    fd: SMOKE_MAP_FD,
+                    value_offset: 0,
+                },
+            },
+            mov_imm(0, 0),
+            EXIT,
+        ];
+        match load_with_map("mapval", asm(&prog), &m) {
+            Err(crate::prog::LoadError::Rejected(
+                narf_bpf_verifier::VerifyError::NotImplemented(_),
+            )) => Ok(()),
+            Err(_) => Err("the map-value pseudo-form was refused for the wrong reason"),
+            Ok(_) => Err("a program the interpreter cannot run was accepted"),
+        }
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_value_pseudo_form_is_refused_at_load);
