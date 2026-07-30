@@ -133,11 +133,31 @@ fn current_preempt_vector() -> u64 {
     }
 }
 
-/// Default per-task kernel stack size. 16 KiB matches the TSS.rsp0
-/// stack the kernel uses for user→kernel trap entry; deep enough
-/// for any in-kernel future poll path that doesn't do unbounded
-/// recursion.
-pub const DEFAULT_KERNEL_STACK_BYTES: usize = 16 * 1024;
+/// Default per-task kernel stack size. 32 KiB: under the own-stack
+/// model the ENTIRE syscall/trap path of a user task runs on this
+/// stack — with interrupts enabled, so an IRQ handler's frames land
+/// on top of whatever depth the syscall body already reached. The
+/// kernel has several multi-KiB monolithic frames (fork/clone spawn
+/// plumbing, ext2 block staging, pty open), and 16 KiB measurably
+/// overflowed during `fork(2)` (the wl_xdg slab-canary corruption —
+/// see STACK_CANARY below, which now catches any recurrence with
+/// attribution). 32 KiB gives those paths + IRQ nesting real
+/// headroom at 8 pages per task.
+pub const DEFAULT_KERNEL_STACK_BYTES: usize = 32 * 1024;
+
+/// Stack-overflow tripwire: number of canary words at the LOW end of
+/// every `KernelTask` stack. A stack that grows past its bottom must
+/// push through these words first (pushes descend contiguously), so a
+/// clobbered canary = the stack overflowed into the heap object below
+/// it. Checked on every executor switch-back (`poll_to_yield`) so the
+/// overflow is reported with task attribution instead of surfacing
+/// later as unexplained heap corruption (the wl_xdg slab free-block
+/// canary trip: `sys_fork`'s ~14 KiB inlined frame + syscall depth
+/// overran the 16 KiB own-stack into an adjacent 128 B slab page).
+const STACK_CANARY_WORDS: usize = 8;
+
+/// Recognisable in raw memory dumps ("SAFE STACK" flavored).
+const STACK_CANARY: u64 = 0x5AFE_57AC_0F10_D511;
 
 /// Per-CPU currently-running stackful task. Set by
 /// `poll_to_yield` immediately before `kernel_switch`-in;
@@ -632,7 +652,14 @@ impl KernelTask {
         // Allocate the stack on the heap so it's stable across
         // moves (we're going to point r15 at the task itself, and
         // rsp at this stack — both pointers must stay valid).
-        let stack: Box<[u8]> = alloc::vec![0u8; stack_bytes].into_boxed_slice();
+        let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes].into_boxed_slice();
+
+        // Arm the overflow tripwire at the LOW end of the stack. See
+        // STACK_CANARY: a stack overrunning its bottom pushes through
+        // these words before it reaches the heap object below.
+        for i in 0..STACK_CANARY_WORDS {
+            stack[i * 8..(i + 1) * 8].copy_from_slice(&STACK_CANARY.to_ne_bytes());
+        }
 
         // We'll fill in ctx after the Box exists (need its
         // address). Start with a placeholder.
@@ -681,6 +708,46 @@ impl KernelTask {
         let _ = (stack_top, task_ptr_as_u64); // silence warnings on aarch64 stub
 
         me
+    }
+
+    /// Verify the stack-overflow tripwire at the low end of this
+    /// task's stack. Panics with attribution if any canary word was
+    /// overwritten — the task's kernel stack grew past its bottom and
+    /// scribbled the heap object physically below it. Detecting it
+    /// here (every executor switch-back) names the culprit while the
+    /// task is still identifiable, instead of leaving a slab canary
+    /// to trip minutes later in an unrelated context.
+    pub fn check_stack_canary(&self) {
+        if let Some((i, got)) = self.stack_canary_clobbered() {
+            let base = self.stack.as_ptr() as u64;
+            panic!(
+                "KERNEL TASK STACK OVERFLOW: canary word {} at {:#x} clobbered \
+                 ({:#018x} != {:#018x}) — stack [{:#x},{:#x}) ({} KiB) overran its \
+                 bottom into the heap below",
+                i,
+                base + (i as u64) * 8,
+                got,
+                STACK_CANARY,
+                base,
+                base + self.stack.len() as u64,
+                self.stack.len() / 1024,
+            );
+        }
+    }
+
+    /// First clobbered canary word at the low end of the stack, as
+    /// `(word_index, found_value)`, or `None` when the tripwire is
+    /// intact. Split from `check_stack_canary` so the smoke test can
+    /// exercise the detector without panicking.
+    fn stack_canary_clobbered(&self) -> Option<(usize, u64)> {
+        for i in 0..STACK_CANARY_WORDS {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&self.stack[i * 8..(i + 1) * 8]);
+            if u64::from_ne_bytes(w) != STACK_CANARY {
+                return Some((i, u64::from_ne_bytes(w)));
+            }
+        }
+        None
     }
 
     /// Resume the task. Switches to its stack and lets it run
@@ -829,6 +896,11 @@ impl KernelTask {
         // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         // ── We are resumed here when the task yields back ──
+        // Stack-overflow tripwire: catch a task whose kernel stack
+        // grew past its bottom during the slice that just ended,
+        // with attribution, before the scribbled heap is touched
+        // further (see check_stack_canary).
+        self.check_stack_canary();
         user_perf_switch(perf_task, false);
         // Restore the EXEC_CTX slot contents that were live before this poll, so
         // a nested poll leaves the OUTER task's saved continuation intact (see
@@ -1930,6 +2002,32 @@ pub mod tests {
             return TestResult::Fail("final counter wrong");
         }
         TestResult::Pass
+    }
+
+    /// Stack-overflow tripwire detector: a fresh task's low-end
+    /// canary is intact; scribbling any canary word (what a stack
+    /// overrunning its bottom does on its way into the heap below)
+    /// must be reported. Regression guard for the wl_xdg heap
+    /// corruption (sys_fork's ~14 KiB frame overran the 16 KiB
+    /// own-stack into an adjacent slab page — the detector is what
+    /// turns that into an attributed panic instead of a slab canary
+    /// trip minutes later).
+    fn smoke_stack_canary_detects_bottom_scribble() -> TestResult {
+        let mut task = KernelTask::new(async {});
+        if task.stack_canary_clobbered().is_some() {
+            return TestResult::Fail("fresh task's stack canary not intact");
+        }
+        // Simulate the first word an overflowing push sequence hits:
+        // the HIGHEST canary word (pushes descend from the top).
+        let hi = (STACK_CANARY_WORDS - 1) * 8;
+        task.stack[hi..hi + 8].copy_from_slice(&0xdead_beef_dead_beefu64.to_ne_bytes());
+        match task.stack_canary_clobbered() {
+            Some((i, got)) if i == STACK_CANARY_WORDS - 1 && got == 0xdead_beef_dead_beef => {
+                TestResult::Pass
+            }
+            Some(_) => TestResult::Fail("detector reported the wrong word"),
+            None => TestResult::Fail("scribbled stack canary not detected"),
+        }
     }
 
     // ── try_preempt filter coverage ─────────────────────────────────
@@ -4234,6 +4332,10 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_stackful_trivial_future_completes
+    );
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stack_canary_detects_bottom_scribble
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(

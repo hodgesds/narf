@@ -197,12 +197,13 @@ unsafe fn canary_on_alloc(blk: NonNull<FreeBlock>, class_idx: usize) {
         if got != free_canary_value(blk) {
             panic!(
                 "slab: free-block canary clobbered on block {:p} (class {} B): {:#x} != {:#x} — \
-                 write-after-free while the block sat on a free list{}",
+                 write-after-free while the block sat on a free list{}{}",
                 blk.as_ptr(),
                 class_size(class_idx),
                 got,
                 free_canary_value(blk),
                 free_site_note(blk),
+                CorruptionWindow(blk.as_ptr().cast()),
             );
         }
         w.write(0);
@@ -223,12 +224,13 @@ unsafe fn canary_check_free(blk: NonNull<FreeBlock>, class_idx: usize) {
         if got != free_canary_value(blk) {
             panic!(
                 "slab: free-block canary clobbered on block {:p} (class {} B): {:#x} != {:#x} — \
-                 write-after-free while the block sat on a free list{}",
+                 write-after-free while the block sat on a free list{}{}",
                 blk.as_ptr(),
                 class_size(class_idx),
                 got,
                 free_canary_value(blk),
                 free_site_note(blk),
+                CorruptionWindow(blk.as_ptr().cast()),
             );
         }
     }
@@ -385,6 +387,45 @@ impl core::fmt::Display for FreeSiteNote {
                 " [freed as data={:#x} vtable={:#x} — addr2line vtable → concrete type]",
                 w0, w1
             );
+        }
+        Ok(())
+    }
+}
+
+/// Panic-path diagnostic: formats the nonzero 8-byte words in a
+/// two-page window starting at the clobbered block's page. A stack
+/// that overflowed INTO this page from the object above leaves its
+/// pushed return addresses / frame pointers here — `addr2line` the
+/// `.text` words to name the overflowing call chain. Costs nothing
+/// until a canary actually trips (only ever formatted inside the
+/// panic message).
+struct CorruptionWindow(*const u8);
+
+impl core::fmt::Display for CorruptionWindow {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let page = (self.0 as usize) & !(PAGE_SIZE_USIZE - 1);
+        let end = page + 2 * PAGE_SIZE_USIZE;
+        writeln!(
+            f,
+            "\n  corruption window [{page:#x}..{end:#x}) nonzero words:"
+        )?;
+        let mut printed = 0usize;
+        let mut addr = page;
+        while addr < end {
+            // SAFETY: the window covers the clobbered block's own slab
+            // page plus the physically-adjacent next page; both are in
+            // the kernel direct map (heap frames), so a volatile read
+            // cannot fault. Read-only — the dump perturbs nothing.
+            let v = unsafe { (addr as *const u64).read_volatile() };
+            if v != 0 {
+                writeln!(f, "    [{addr:#010x}] {v:#018x}")?;
+                printed += 1;
+                if printed >= 384 {
+                    writeln!(f, "    ... (truncated)")?;
+                    break;
+                }
+            }
+            addr += 8;
         }
         Ok(())
     }
