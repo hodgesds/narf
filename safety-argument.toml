@@ -154,3 +154,7 @@ argument = "The direct PID 1 loader remains inside the existing frame TCB and on
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The rooted interpreter lookup reads bytes only through the existing VFS resolver under the explicit mounted root and retains the normal ELF-loader validation path. It does not dereference untrusted user pointers, alter page mappings outside the loader, or bypass capability or domain checks."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The cgroup memory-charge resolver maps an executor-private TaskId to the already authoritative userspace ProcessId before consulting existing cgroup membership. It adds no capability, domain transition, memory mapping, or frame-ownership path; unmapped kernel tasks remain deliberately unattributed rather than being charged to an accidental numeric TaskId match."

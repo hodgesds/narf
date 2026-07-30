@@ -67,19 +67,40 @@ use crate::{current_task_id, TaskId, READY};
 // hooks use, just in the opposite direction), wiring the provider below
 // into the allocator. See `filesystem/src/cgroupfs/memory.rs`.
 
-/// Resolve the PID to charge for the in-flight allocation: the
-/// currently-polling task's id, or `None` outside any poll context
-/// (early boot, between rounds, kernel-internal allocations) so those
-/// allocations stay unattributed rather than charged to the wrong
-/// cgroup. The cgroup membership pid and the [`TaskId`] raw value share
-/// one namespace (see [`apply_priority`]).
+/// Function-pointer seam from the userspace process table. The scheduler
+/// deliberately does not depend on `narf-userspace`; frame installs this hook
+/// once userspace's TaskId-to-ProcessId map is ready.
+static MEMORY_PID_RESOLVER: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the resolver which maps a scheduler task id to the outer userspace
+/// process id used by cgroup membership. A missing mapping means the task is
+/// kernel-internal and its allocation remains unattributed.
+///
+/// Calling this replaces the prior resolver, which is useful during bootstrap
+/// when the userspace process table becomes available after the scheduler.
+pub fn install_memory_pid_resolver(resolver: fn(u64) -> Option<u64>) {
+    MEMORY_PID_RESOLVER.store(resolver as usize, Ordering::Release);
+}
+
+/// Resolve the PID to charge for the in-flight allocation. The current task
+/// id is an executor-private identity; cgroup membership is keyed by the
+/// userspace ProcessId, so translate it through the installed resolver.
+/// Outside a task poll (early boot, between rounds, kernel-internal work), or
+/// without a process mapping, allocations stay unattributed rather than being
+/// charged to an unrelated cgroup with the same raw numeric id.
 fn current_charge_pid() -> Option<u64> {
     let id = current_task_id();
     if id == TaskId::NONE {
-        None
-    } else {
-        Some(id.raw())
+        return None;
     }
+    let ptr = MEMORY_PID_RESOLVER.load(Ordering::Acquire);
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: `ptr` is non-zero (checked) and was produced by
+    // `install_memory_pid_resolver` from the exact function-pointer type.
+    let resolve: fn(u64) -> Option<u64> = unsafe { core::mem::transmute(ptr) };
+    resolve(id.raw())
 }
 
 /// Install the `memory`-controller charge-PID provider into

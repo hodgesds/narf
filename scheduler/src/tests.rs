@@ -335,13 +335,20 @@ kernel_test_in!("scheduler", smoke_scheduler_current_task_id_during_poll);
 #[cfg(feature = "cgroup")]
 fn smoke_scheduler_memory_pid_provider_resolves_current() -> TestResult {
     // The `memory` cgroup controller installs this provider so the
-    // frame allocator can attribute a charge to the allocating task.
-    // Once installed, narf-memory must resolve the polling task's id
-    // during a poll and `None` outside one — the wiring `memory.max`
-    // enforcement rides on.
+    // frame allocator can attribute a charge to the allocating process.
+    // Scheduler TaskId and userspace ProcessId deliberately have separate
+    // namespaces, so exercise a non-identity resolver: `memory.max` must
+    // never accidentally charge the task whose raw id happens to equal a
+    // process id.
     use crate::current_task_id;
     use core::sync::atomic::{AtomicU64, Ordering};
 
+    const PID_OFFSET: u64 = 0x1_0000;
+    fn task_to_process_for_test(task: u64) -> Option<u64> {
+        task.checked_add(PID_OFFSET)
+    }
+
+    crate::install_memory_pid_resolver(task_to_process_for_test);
     crate::install_memory_pid_provider();
 
     // Outside any poll: unattributed.
@@ -355,14 +362,15 @@ fn smoke_scheduler_memory_pid_provider_resolves_current() -> TestResult {
 
     let tid = crate::spawn(async {
         let pid = narf_memory::__charge_pid_for_test().unwrap_or(u64::MAX);
-        // Sanity: the provider agrees with current_task_id().
-        debug_assert_eq!(pid, current_task_id().raw());
+        // The provider must resolve through the process-ID hook rather than
+        // leak the scheduler's private task id to the cgroup controller.
+        debug_assert_eq!(pid, current_task_id().raw() + PID_OFFSET);
         OBSERVED.store(pid, Ordering::Relaxed);
     });
     crate::run_until_empty();
 
-    if OBSERVED.load(Ordering::Relaxed) != tid.raw() {
-        return TestResult::Fail("charge pid did not resolve to the allocating task");
+    if OBSERVED.load(Ordering::Relaxed) != tid.raw() + PID_OFFSET {
+        return TestResult::Fail("charge pid did not resolve through the process-id hook");
     }
     if narf_memory::__charge_pid_for_test().is_some() {
         return TestResult::Fail("charge pid not cleared after run_until_empty");

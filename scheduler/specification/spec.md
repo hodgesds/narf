@@ -37,6 +37,7 @@ pub fn donate_to(task: TaskId) -> impl Future<Output=()>; // direct context tran
 pub fn set_task_mems_allowed(task: u64, mask: u64);
 pub fn task_mems_allowed(task: u64) -> u64;
 pub fn clear_task_mems_allowed(task: u64);
+pub fn install_memory_pid_resolver(resolve: fn(task: u64) -> Option<u64>);
 /// Distinct live user address spaces, including currently-polled tasks.
 pub fn all_address_spaces() -> Vec<Arc<AddressSpace>>;
 pub fn set_user_perf_switch_hook(hook: fn(task: u64, running: bool));
@@ -49,6 +50,10 @@ carries `DomainId` so the executor switches domain before polling.
 The per-task NUMA mask is the task-identity seam for cgroup-v2
 `cpuset.mems`; the page-fault policy resolver treats it as a hard
 allocation boundary and removes it when the task exits or detaches.
+The memory-controller charge provider resolves the executor-private `TaskId`
+through `install_memory_pid_resolver` before charging: cgroup membership is
+keyed by the outer userspace ProcessId, never by a numerically coincident task
+id. Kernel tasks and unmapped bootstrap tasks remain unattributed.
 The optional userspace PMU hook brackets every stackful continuation in
 executor context after run-queue locks have been released. `running=true`
 precedes the switch into the task and `running=false` follows every switch

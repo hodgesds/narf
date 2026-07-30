@@ -20,6 +20,12 @@ use narf_console as console;
 /// init_per_task_state) have run.
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub fn install_all_hooks() {
+    // Cgroup membership is keyed by userspace ProcessId, whereas the executor
+    // only knows its private TaskId. Install the translation before any cgroup
+    // controller activates allocator charging, so memory.max observes the
+    // same process identity as cgroup.procs.
+    #[cfg(feature = "cgroup")]
+    narf_scheduler::install_memory_pid_resolver(narf_userspace::handlers::task_to_pid_raw);
     install_console_signal_hook();
     #[cfg(feature = "linux-compat")]
     install_proc_hooks();
