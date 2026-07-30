@@ -2324,10 +2324,13 @@ pub(crate) fn resolve_parent_dir_async(
 }
 
 /// Build the VFS key for a pathname AF_UNIX socket. The preferred identity is
-/// `(backing filesystem, parent inode)`: a bind mount gets the source
-/// filesystem identity and therefore aliases the same directory, while an
-/// overmount remains distinct. The legacy initramfs reports inode zero, so it
-/// falls back to the parent spelling within the stable backing filesystem.
+/// `(backing filesystem, socket inode)`: a file bind gets the source
+/// filesystem identity and exposes that exact inode at its mount root, so the
+/// two spellings alias. A pathname not yet materialised as a filesystem node
+/// falls back to `(backing filesystem, parent inode, leaf)`; that is the
+/// identity needed while `bind(2)` creates the socket node. The legacy
+/// initramfs reports inode zero, so it falls back to the parent spelling within
+/// the stable backing filesystem.
 pub(crate) fn unix_socket_path_key(
     path: &str,
 ) -> Option<(
@@ -2341,6 +2344,39 @@ pub(crate) fn unix_socket_path_key(
     }
     let abs = resolve_cwd_path(current_task_id(), path);
     let path_ref = abs.trim_end_matches('/');
+    // Linux pathname AF_UNIX sockets are named by their dentry/inode.  This
+    // also covers a `mount --bind <socket-file> <target-file>`: the target is
+    // a file-rooted mount (`rel` is empty) whose `root_file()` is the original
+    // socket node.  Do this before the parent fallback so a private overmount
+    // cannot split a service's `$NOTIFY_SOCKET` from PID 1's endpoint.
+    if let Some(Some(key)) = current_resolve_absolute(path_ref, |fs, rel| {
+        let file = if rel.is_empty() {
+            fs.root_file()
+        } else {
+            // Socket nodes on tmpfs/memfs are intentionally lightweight and
+            // expose the synchronous DirOps path; block-backed filesystems
+            // need the async resolver.  Use each according to the backing's
+            // capability so this identity path never makes an in-memory
+            // S_IFSOCK node disappear.
+            narf_filesystem::resolve(fs.root(), rel).ok().or_else(|| {
+                poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+                    .and_then(|result| result.ok())
+            })
+        };
+        file.and_then(|file| {
+            let ino = file.ino();
+            (ino != 0).then(|| {
+                (
+                    fs.backing_identity(),
+                    ino,
+                    None,
+                    alloc::string::String::new(),
+                )
+            })
+        })
+    }) {
+        return Some(key);
+    }
     let last = path_ref.rfind('/')?;
     let parent_path = if last == 0 { "/" } else { &path_ref[..last] };
     let (parent, leaf) = resolve_parent_dir_async(path_ref)?;

@@ -1917,6 +1917,175 @@ kernel_test_in!(
     smoke_abi_socket_notify_sendmsg_across_cloned_mount_namespace
 );
 
+/// systemd's `PrivateMounts=yes` setup may overmount the directory that holds
+/// `$NOTIFY_SOCKET`, then bind the notify *file* back into the service view.
+/// The target spelling is therefore under a different parent mount even though
+/// it denotes the same socket inode. A Type=notify service must still deliver
+/// `READY=1` to PID 1 through that stacked file bind.
+fn smoke_abi_socket_notify_sendmsg_through_stacked_file_bind() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xC1A0;
+        const SERVICE_TASK: u64 = 0xC1A1;
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_BIND: u64 = 1 << 12;
+        const SOURCE_MOUNT: &str = "/abi-notify-file-bind-source";
+        const PRIVATE_MOUNT: &str = "/abi-notify-file-bind-private";
+        const SOURCE_PATH: &str = "/abi-notify-file-bind-source/notify";
+        const TARGET_PATH: &str = "/abi-notify-file-bind-private/notify";
+        const SOURCE_SOCKET: &[u8] = b"/abi-notify-file-bind-source/notify\0";
+        const TARGET_SOCKET: &[u8] = b"/abi-notify-file-bind-private/notify\0";
+
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let source = registry()
+            .mount_arc(
+                &auth,
+                SOURCE_MOUNT,
+                alloc::sync::Arc::new(MemFs::with_seeds("notify-file-source", &[])),
+            )
+            .map_err(|_| "notify source mount setup failed")?;
+        let private = registry()
+            .mount_arc(
+                &auth,
+                PRIVATE_MOUNT,
+                alloc::sync::Arc::new(MemFs::with_seeds("notify-file-private", &[])),
+            )
+            .map_err(|_| "notify private mount setup failed")?;
+
+        let result = (|| {
+            set_task(MANAGER_TASK);
+            let rx = open_unix(SOCK_DGRAM)?;
+            let (source_addr, source_len) = unix_sockaddr(SOURCE_SOCKET);
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(rx, source_addr.as_ptr() as u64, source_len),
+            ) != Some(0)
+            {
+                return Err("manager could not bind the source notify socket");
+            }
+            let source_key = crate::handlers::unix_socket_path_key(
+                core::str::from_utf8(&SOURCE_SOCKET[..SOURCE_SOCKET.len() - 1])
+                    .map_err(|_| "source notify path was not UTF-8")?,
+            )
+            .ok_or("manager notify socket has no VFS identity")?;
+            let source_inode = crate::handlers::current_resolve_absolute(SOURCE_PATH, |fs, rel| {
+                narf_filesystem::resolve(fs.root(), rel)
+                    .ok()
+                    .map(|file| (fs.backing_identity(), file.ino()))
+            })
+            .flatten()
+            .ok_or("manager bind did not materialise its socket inode")?;
+            let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create failed")?;
+            let mut interest = [0u8; 12];
+            interest[..4].copy_from_slice(&1u32.to_ne_bytes());
+            if call(
+                Syscall::EpollCtl.raw(),
+                a3(epfd as u64, 1, rx, interest.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("manager could not watch source notify socket");
+            }
+
+            set_task(SERVICE_TASK);
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("service could not clone its mount namespace");
+            }
+            let ns = crate::handlers::current_mount_namespace()
+                .ok_or("service mount namespace missing after unshare")?;
+            ns.mount_arc(
+                &auth,
+                PRIVATE_MOUNT,
+                alloc::sync::Arc::new(MemFs::with_seeds("notify-private-overmount", &[])),
+            )
+            .map_err(|_| "service could not overmount notify parent")?;
+
+            if call(
+                Syscall::Mount.raw(),
+                SyscallArgs {
+                    arg0: SOURCE_SOCKET.as_ptr() as u64,
+                    arg1: TARGET_SOCKET.as_ptr() as u64,
+                    arg3: MS_BIND,
+                    ..Default::default()
+                },
+            ) != Some(0)
+            {
+                return Err("service could not bind the notify file into its private mount");
+            }
+            let target_key = crate::handlers::unix_socket_path_key(
+                core::str::from_utf8(&TARGET_SOCKET[..TARGET_SOCKET.len() - 1])
+                    .map_err(|_| "target notify path was not UTF-8")?,
+            )
+            .ok_or("private notify file bind has no VFS identity")?;
+            let target_inode = crate::handlers::current_resolve_absolute(TARGET_PATH, |fs, rel| {
+                if !rel.is_empty() {
+                    return None;
+                }
+                fs.root_file()
+                    .map(|file| (fs.backing_identity(), file.ino()))
+            })
+            .flatten()
+            .ok_or("private notify bind did not install a file-rooted mount")?;
+            if target_inode.0 != source_inode.0 {
+                return Err("file bind changed the notify socket backing filesystem");
+            }
+            if target_inode.1 != source_inode.1 {
+                return Err("file bind changed the notify socket inode");
+            }
+            if target_key != source_key {
+                return Err("file bind did not preserve the notify socket VFS identity");
+            }
+
+            let tx = open_unix(SOCK_DGRAM)?;
+            let (target_addr, target_len) = unix_sockaddr(TARGET_SOCKET);
+            let payload = b"READY=1\nSTATUS=stacked file bind";
+            let mut iov = [0u8; 16];
+            iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+            iov[8..].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+            let mut msg = [0u8; 56];
+            msg[..8].copy_from_slice(&(target_addr.as_ptr() as u64).to_ne_bytes());
+            msg[8..16].copy_from_slice(&target_len.to_ne_bytes());
+            msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+            msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+            if call(Syscall::SocketSendMsg.raw(), a2(tx, msg.as_ptr() as u64, 0))
+                != Some(payload.len() as i64)
+            {
+                return Err("sendmsg through stacked notify file bind did not reach PID 1");
+            }
+
+            set_task(MANAGER_TASK);
+            let mut events = [0u8; 12];
+            if call(
+                Syscall::EpollWait.raw(),
+                a3(epfd as u64, events.as_mut_ptr() as u64, 1, 0),
+            ) != Some(1)
+            {
+                return Err("PID 1 epoll did not observe stacked-bind READY=1");
+            }
+            let mut received = [0u8; 64];
+            if call(
+                Syscall::SocketRecv.raw(),
+                a3(rx, received.as_mut_ptr() as u64, received.len() as u64, 0),
+            ) != Some(payload.len() as i64)
+                || &received[..payload.len()] != payload
+            {
+                return Err("PID 1 did not receive stacked-bind READY=1");
+            }
+            Ok(())
+        })();
+
+        set_task(SERVICE_TASK);
+        crate::handlers::clear_current_mount_namespace_for_test();
+        set_task(MANAGER_TASK);
+        let _ = registry().unmount(&private, PRIVATE_MOUNT);
+        let _ = registry().unmount(&source, SOURCE_MOUNT);
+        set_task(FAKE_TASK);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_notify_sendmsg_through_stacked_file_bind
+);
+
 /// Pathname AF_UNIX sockets name filesystem inodes, not globally interned
 /// strings.  Two services whose private mount namespaces overmount the same
 /// `/run` directory therefore may bind the same visible notify pathname: each

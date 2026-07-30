@@ -1957,6 +1957,11 @@ impl DirOps for EmptyDir {
 struct FileMount {
     file: Arc<dyn FileOps>,
     fs_name: String,
+    // A file bind is another mount attachment to the *source* inode, not a
+    // new filesystem.  Preserve that identity for inode-aware VFS users such
+    // as pathname AF_UNIX, which must recognise the source and target as the
+    // same socket node.
+    backing_identity: usize,
 }
 
 impl fmt::Debug for FileMount {
@@ -1973,6 +1978,9 @@ impl FsInstance for FileMount {
     }
     fn name(&self) -> &str {
         &self.fs_name
+    }
+    fn backing_identity(&self) -> usize {
+        self.backing_identity
     }
     fn root_file(&self) -> Option<Arc<dyn FileOps>> {
         Some(self.file.clone())
@@ -2023,6 +2031,7 @@ fn build_bind_fs(
         return Ok(Arc::new(FileMount {
             file: node,
             fs_name,
+            backing_identity: source_fs.backing_identity(),
         }));
     }
     // Some filesystems only expose child directories via `lookup_dir`.
