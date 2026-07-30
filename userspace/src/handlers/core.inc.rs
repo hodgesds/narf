@@ -4297,17 +4297,31 @@ fn mprotect_core(
         //
         // Classified before any mutation so a capability-gated request is
         // never partially applied by the ungated path first.
-        let old_perms = as_ref
-            .perms_covering(base, len)
-            .map(|p| p.prot_only())
-            .ok_or(())?;
-        match narf_memory::wx::classify_mprotect(old_perms, perms.prot_only()) {
+        //
+        // Classified over *every* intersecting region, not a single covering
+        // one. Requiring one region to span the whole request narrowed
+        // `mprotect(2)` to single-region ranges: a range crossing two adjacent
+        // mappings, or one an earlier `mprotect` had already split, returned
+        // `Err` where it used to succeed. The fold takes the strictest verdict
+        // any region produces, so a request that would flip even one RW region
+        // to RX needs the capability and one that would produce W|X anywhere is
+        // refused — while an all-`Allow` range behaves exactly as before.
+        //
+        // An empty set means nothing is mapped in the range; that is
+        // `mprotect_range`'s error to report, and routing it there keeps the
+        // pre-existing errno rather than inventing one here.
+        let transition = narf_memory::wx::classify_mprotect_range(
+            as_ref.perms_intersecting(base, len).into_iter(),
+            perms.prot_only(),
+        );
+        match transition {
             // Refusals, whatever the caller holds.
             narf_memory::wx::WxTransition::DenyWX | narf_memory::wx::WxTransition::DenyXtoWX => {
                 Err(())
             }
             narf_memory::wx::WxTransition::NeedsCapJit => {
-                let Some(cap) = narf_memory::wx::jit_cap(current_task_id()) else {
+                let Some(cap) = narf_memory::wx::jit_cap_default_policy(current_task_id())
+                else {
                     return Err(());
                 };
                 narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| ())

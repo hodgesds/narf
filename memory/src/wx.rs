@@ -142,6 +142,41 @@ pub fn classify_mprotect(old: RegionPerms, new: RegionPerms) -> WxTransition {
     WxTransition::Allow
 }
 
+/// Fold [`classify_mprotect`] over every region an `mprotect` request spans.
+///
+/// `mprotect_range` splits across every intersecting region, so classification
+/// has to consider every one of them. The fold takes the **strictest** verdict:
+/// a refusal anywhere refuses the whole request, and a `NeedsCapJit` anywhere
+/// demands the capability. Partial application is not an option — the request
+/// is one syscall and either happens or does not.
+///
+/// An empty iterator yields [`WxTransition::Allow`], deliberately: nothing is
+/// mapped in the range, and reporting *that* is the address-space layer's job.
+/// Returning a refusal here would replace a precise `Unmapped` with a generic
+/// permission error.
+#[must_use]
+pub fn classify_mprotect_range<I: Iterator<Item = RegionPerms>>(
+    olds: I,
+    new: RegionPerms,
+) -> WxTransition {
+    let mut worst = WxTransition::Allow;
+    for old in olds {
+        let t = classify_mprotect(old.prot_only(), new);
+        // Strictness order: the two refusals outrank NeedsCapJit, which
+        // outranks Allow. `DenyXtoWX` is reported in preference to `DenyWX`
+        // because it names the more specific mistake.
+        worst = match (worst, t) {
+            (WxTransition::DenyXtoWX, _) | (_, WxTransition::DenyXtoWX) => WxTransition::DenyXtoWX,
+            (WxTransition::DenyWX, _) | (_, WxTransition::DenyWX) => WxTransition::DenyWX,
+            (WxTransition::NeedsCapJit, _) | (_, WxTransition::NeedsCapJit) => {
+                WxTransition::NeedsCapJit
+            }
+            (WxTransition::Allow, WxTransition::Allow) => WxTransition::Allow,
+        };
+    }
+    worst
+}
+
 /// `true` iff the permission set is RW (read + write, no exec) — the
 /// state a JIT engine populates before flipping to RX.
 #[inline]
@@ -171,51 +206,144 @@ pub fn is_jit_code(perms: RegionPerms) -> bool {
 // `Cap::bootstrap()` allocates an object-table slot per call, so it is called
 // **once per grant**, never per `mprotect` — see `feedback_cap_bootstrap_hot_path`.
 
-static JIT_GRANTS: IrqSafeSpinLock<Option<BTreeMap<u64, JitCap>>> = IrqSafeSpinLock::new(None);
+/// A task's standing with respect to the JIT authority.
+///
+/// Three states, not two, because "no entry" and "explicitly denied" must be
+/// distinguishable. Collapsing them into a bare "is it in the map" test is what
+/// makes revocation either meaningless (the next `mprotect` re-grants) or
+/// permanent in the wrong way (a recycled task id inherits a denial).
+#[derive(Copy, Clone, Debug)]
+enum JitState {
+    /// Holds the authority.
+    Granted(JitCap),
+    /// Denied by policy. The default grant policy will not re-grant; only an
+    /// explicit [`grant_jit`] restores it.
+    Denied,
+}
+
+static JIT_GRANTS: IrqSafeSpinLock<Option<BTreeMap<u64, JitState>>> = IrqSafeSpinLock::new(None);
 
 /// Initialise the JIT grant registry. Boot calls this alongside the other
 /// per-task state tables.
+///
+/// Idempotent, and deliberately so: `init_per_task_state` is called from many
+/// test paths as well as from boot, and replacing the map wholesale dropped
+/// live grants **without revoking them** — leaving every escaped capability
+/// copy still passing `check_live`, which is exactly what invariant #5 forbids.
 pub fn jit_grants_init() {
-    *JIT_GRANTS.lock() = Some(BTreeMap::new());
+    let mut g = JIT_GRANTS.lock();
+    if g.is_none() {
+        *g = Some(BTreeMap::new());
+    }
 }
 
 /// Grant `task` the JIT capability, minting a fresh object-table entry.
 ///
 /// Re-granting returns the existing capability rather than minting a second
 /// one — the object table is not free, and two live caps for the same
-/// authority would make revocation ambiguous.
+/// authority would make revocation ambiguous. An explicit grant overrides a
+/// prior [`deny_jit`].
 pub fn grant_jit(task: u64) -> JitCap {
     let mut g = JIT_GRANTS.lock();
     let map = g.get_or_insert_with(BTreeMap::new);
-    if let Some(c) = map.get(&task) {
+    if let Some(JitState::Granted(c)) = map.get(&task) {
         return *c;
     }
     let cap = JitCap::bootstrap();
-    map.insert(task, cap);
+    map.insert(task, JitState::Granted(cap));
     cap
 }
 
-/// This task's JIT capability, if it holds one.
-pub fn jit_cap(task: u64) -> Option<JitCap> {
-    JIT_GRANTS.lock().as_ref()?.get(&task).copied()
+/// Deny `task` the JIT authority by policy, revoking any capability it holds.
+///
+/// Distinct from [`revoke_jit`], which is the *exit sweep*: this one leaves a
+/// standing denial so the default grant policy will not hand the authority
+/// straight back on the next `mprotect`. Without that distinction, revocation
+/// on a live task would last exactly until its next syscall.
+pub fn deny_jit(task: u64) {
+    let mut g = JIT_GRANTS.lock();
+    let map = g.get_or_insert_with(BTreeMap::new);
+    let prior = map.insert(task, JitState::Denied);
+    drop(g);
+    if let Some(JitState::Granted(cap)) = prior {
+        cap.revoke();
+    }
 }
 
-/// Revoke `task`'s JIT capability.
+/// This task's JIT capability, if it holds one.
+///
+/// Reports possession only — it never grants. Use
+/// [`jit_cap_default_policy`] on the `mprotect` path, or a task that was
+/// never explicitly granted can perform no RW→RX flip at all.
+pub fn jit_cap(task: u64) -> Option<JitCap> {
+    match JIT_GRANTS.lock().as_ref()?.get(&task) {
+        Some(JitState::Granted(c)) => Some(*c),
+        Some(JitState::Denied) | None => None,
+    }
+}
+
+/// The capability `mprotect` should use, applying the **default grant policy**.
+///
+/// NARF's policy today is *permissive by default, revocable on demand*: a task
+/// that has not been explicitly revoked gets the grant the first time it needs
+/// one. This is a deliberate choice and the alternative was a regression, so it
+/// is worth being precise about why.
+///
+/// Before `CapKind::Jit` existed, `AddressSpace::mprotect_range` refused `W|X`
+/// end states and permitted RW→RX for everyone. Gating the flip on a capability
+/// that **nothing granted** did not tighten that policy — it denied the flip
+/// unconditionally, breaking every JIT userland that relies on it (V8, the JVM,
+/// LuaJIT, libffi trampolines). A gate whose authority is unobtainable is not a
+/// gate; it is an outage.
+///
+/// So what the capability buys today is not admission control — it is a *named,
+/// revocable* authority with a real revocation path ([`revoke_jit`], swept on
+/// task exit) and one enforcement point ([`jit_mprotect`]). Tightening the
+/// policy is then a change at this one function — refuse to auto-grant, and
+/// have whoever decides policy call [`grant_jit`] — rather than a re-plumbing of
+/// the enforcement path. `W|X` remains refused for everyone regardless, which is
+/// the property that was actually load-bearing.
+pub fn jit_cap_default_policy(task: u64) -> Option<JitCap> {
+    {
+        let g = JIT_GRANTS.lock();
+        match g.as_ref().and_then(|m| m.get(&task)) {
+            Some(JitState::Granted(c)) => return Some(*c),
+            // A standing policy denial. Not re-granted.
+            Some(JitState::Denied) => return None,
+            None => {}
+        }
+    }
+    Some(grant_jit(task))
+}
+
+/// Revoke `task`'s JIT capability and forget it entirely.
 ///
 /// Wired to the thread-scoped exit-observer fan-out, so a task that exits
 /// while holding the grant cannot leave a live authority behind. Revocation
 /// bumps the object's epoch, so any capability copy that escaped fails its
 /// next `check_live` — invariant #5.
+///
+/// Removes the entry rather than marking it [`JitState::Denied`], which matters
+/// because task ids are recycled: leaving a denial behind would make a *future*
+/// unrelated task inherit this one's revocation.
 pub fn revoke_jit(task: u64) {
     let taken = JIT_GRANTS.lock().as_mut().and_then(|m| m.remove(&task));
-    if let Some(cap) = taken {
+    if let Some(JitState::Granted(cap)) = taken {
         cap.revoke();
     }
 }
 
 /// Live grants. Diagnostic only.
 pub fn jit_grant_count() -> usize {
-    JIT_GRANTS.lock().as_ref().map(|m| m.len()).unwrap_or(0)
+    JIT_GRANTS
+        .lock()
+        .as_ref()
+        .map(|m| {
+            m.values()
+                .filter(|s| matches!(s, JitState::Granted(_)))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// Test-only reset.
