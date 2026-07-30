@@ -377,7 +377,9 @@ impl KfuncDesc {
         if self.addr == 0 {
             return Err(KfuncError::NullAddress);
         }
+        validate_type(self.ret, usize::MAX)?;
         for (i, a) in self.args.iter().enumerate() {
+            validate_type(*a, i)?;
             // A sized region needs a following argument to be its length.
             if a.flags.contains(ArgFlags::SIZED_BY_NEXT) {
                 match self.args.get(i + 1).map(|n| n.kind) {
@@ -464,4 +466,28 @@ pub enum KfuncError {
     /// [`SleepableLockGuard`](Self::SleepableLockGuard) so the diagnostic can
     /// name which parameter.
     SleepableLockGuardArg(usize),
+    /// A scalar declared a width no access has. `bits` must be 8, 16, 32 or 64.
+    ///
+    /// Worth a distinct variant because the failure it prevents was a *panic*,
+    /// not a rejection: `Scalar::signed_bits(0)` computes `1 << (bits - 1)` and
+    /// underflowed.
+    BadScalarWidth { at: usize, bits: u8 },
+}
+
+/// Validate one type descriptor in isolation.
+///
+/// Split out of [`KfuncDesc::validate`] so the *context* descriptor gets the
+/// same treatment. It did not: `verify()` validated `prog.kfuncs` and never
+/// `prog.ctx_fields`, so a malformed ctx field reached the abstract domain
+/// directly. Scalar width was not checked on either path.
+///
+/// `at` is the position being described — an argument index or a ctx field
+/// index — and appears only in diagnostics.
+pub const fn validate_type(a: ArgDesc, at: usize) -> Result<(), KfuncError> {
+    if let TypeKind::Scalar { bits, .. } = a.kind {
+        if !matches!(bits, 8 | 16 | 32 | 64) {
+            return Err(KfuncError::BadScalarWidth { at, bits });
+        }
+    }
+    Ok(())
 }

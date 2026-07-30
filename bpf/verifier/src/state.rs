@@ -74,15 +74,18 @@ pub enum PtrClass {
 }
 
 impl PtrClass {
-    /// Whether an access through this pointer must be proved in bounds.
-    ///
-    /// False for `Object` and `Arena`, whose accesses are instead covered by
-    /// exception-table entries — a fault zeroes the destination and resumes.
-    #[inline]
-    #[must_use]
-    pub const fn needs_bounds_check(self) -> bool {
-        !matches!(self, PtrClass::Object | PtrClass::Arena)
-    }
+    // `needs_bounds_check` used to live here, returning false for `Object` and
+    // `Arena` "whose accesses are instead covered by exception-table entries —
+    // a fault zeroes the destination and resumes".
+    //
+    // Deleted rather than corrected. It had no callers anywhere in the tree, and
+    // that sentence describes a design `access()` now refutes at length:
+    // `Object` deref is rejected outright and `Arena` is bounded to the window,
+    // because an extable entry turns a fault into a recoverable event but does
+    // nothing about an access that *doesn't* fault — one that lands on mapped
+    // kernel memory a program was never given. A `pub` predicate stating the
+    // opposite of what the verifier enforces is worse than no predicate: it is
+    // the shape a future caller would reach for.
 
     /// Whether an access through this pointer needs an exception-table entry.
     #[inline]

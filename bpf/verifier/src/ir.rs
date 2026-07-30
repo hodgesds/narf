@@ -300,6 +300,66 @@ impl Ir {
         subprog_entry_slots.sort_unstable();
         subprog_entry_slots.dedup();
 
+        // ── Pass 2b: confine every edge to its own subprogram ───────
+        //
+        // Pass 2 could not do this: it *discovers* subprogram entries while it
+        // resolves control flow, so the entry set is only complete now.
+        //
+        // This is what makes "the CFG has no inter-subprogram edges" true. It
+        // used to be asserted (below, at pass 5) and not checked, and three
+        // separate analyses were resting on it:
+        //
+        //   1. `run()` analyses subprograms in call-graph topological order and
+        //      skips any whose entry state is still `None`, on the grounds that
+        //      nothing calls it so it is dead code. A branch into another
+        //      subprogram can populate an entry state *after* that
+        //      subprogram's turn has passed — so it is never analysed, and its
+        //      instructions are then dismissed as unreachable. Unverified code
+        //      that runs. A 10-instruction program was enough: `call` into a
+        //      subprogram whose body is `goto` backwards into a *second* call,
+        //      and the second callee is never looked at.
+        //
+        //   2. The call graph attributes a `call` to
+        //      `blocks[block_of[i]].subprog` — a slot-range label, not the
+        //      subprogram whose control flow actually reaches it. So a
+        //      cross-subprogram jump makes the graph describe edges that do not
+        //      exist, which defeats the `Recursion` check (a real cycle looks
+        //      acyclic) and under-reports `max_stack_bytes` (the sum walks the
+        //      wrong path). That number is what `jit_glue`/`mem.rs` size the
+        //      frame from.
+        //
+        //   3. Each subprogram is analysed with a fresh `Stack`, which is only
+        //      sound if control cannot arrive mid-subprogram carrying another
+        //      frame's slot model.
+        //
+        // Checked for *every* successor, fallthrough included: an instruction
+        // falling through into the next subprogram's first slot is the same
+        // violation as jumping there. A `call` is not an edge here — it is
+        // recorded as a call-graph edge and its fallthrough stays local — so
+        // legitimate calls are unaffected.
+        {
+            // `subprog_entry_slots` is sorted and deduped, so the enclosing
+            // subprogram of a slot is the last entry at or below it.
+            let enclosing = |slot: u32| -> (u32, u32) {
+                let idx = subprog_entry_slots.partition_point(|&e| e <= slot) - 1;
+                let lo = subprog_entry_slots[idx];
+                let hi = subprog_entry_slots
+                    .get(idx + 1)
+                    .copied()
+                    .unwrap_or(insns.len() as u32);
+                (lo, hi)
+            };
+            for (i, succs) in succ_slots.iter().enumerate() {
+                let at = ir[i].slot;
+                let (lo, hi) = enclosing(at);
+                for &t in succs {
+                    if t < lo || t >= hi {
+                        return Err(VerifyError::CrossSubprogEdge { at, target: t });
+                    }
+                }
+            }
+        }
+
         // ── Pass 3: block leaders ───────────────────────────────────
         let mut is_leader = vec![false; n];
         is_leader[0] = true;

@@ -1029,9 +1029,38 @@ impl Analysis<'_, '_> {
                 // the memset of a large frame on a hot probe path — would
                 // silently turn this precision loss into a disclosure, with
                 // nothing in that crate saying why the fill is load-bearing.
+                // The region is clamped to the frame and *counted* in the stack
+                // budget. Both were missing, and together they were the whole
+                // primitive back: `room` was `-off` with no upper bound, and
+                // this path never called `note_depth`, so
+                //
+                //     r1 = r10; r1 -= 1000000; call sub
+                //     sub: *(u64*)(r1+0) = r2
+                //
+                // verified with `max_stack_bytes = 0` — a writable megabyte
+                // region based a megabyte *below* a frame the runtime was told
+                // needed nothing. The `// LINUX-GAP` above was fail-open under
+                // it: "the runtime zeroes the frame" bounds what a callee can
+                // read from *inside* the frame, and says nothing about a
+                // writable region extending arbitrarily below it.
                 AbsValue::Ptr(p) if p.class == PtrClass::Stack => {
                     passed_frame_pointer = true;
-                    let room = p.off.as_const().map_or(0, |o| (-o).max(0) as u64);
+                    // A frame pointer offset is negative and measured down from
+                    // R10; anything at or above R10, or beyond the frame
+                    // ceiling, is not a frame slot at all.
+                    let Some(off) = p.off.as_const() else {
+                        return Err(VerifyError::OutOfBounds { at });
+                    };
+                    let room = (-off).max(0) as u64;
+                    if room > u64::from(MAX_STACK_BYTES) {
+                        return Err(VerifyError::OutOfBounds { at });
+                    }
+                    // The callee can address the whole region, so the frame has
+                    // to be at least that deep for the runtime's layout to match
+                    // what was proved here.
+                    // `room <= MAX_STACK_BYTES` was just checked, so the
+                    // narrowing cannot truncate.
+                    self.note_depth(room as u32);
                     AbsValue::Ptr(PtrVal::region(PtrClass::Mem, room))
                 }
                 v => v,
@@ -1202,6 +1231,39 @@ impl Analysis<'_, '_> {
                         // slice, a map value, an arena range.
                         self.check_mem_arg(st, at, k, desc, &p)?;
                     } else if p.class != want || (kind == PtrKind::Object && p.key != key) {
+                        return Err(bad);
+                    } else if p.off.as_const() != Some(0) {
+                        // The offset must be exactly zero for every non-`Mem`
+                        // pointer argument. Linux requires the same
+                        // (`reg->off == 0` for these argument types) and it is
+                        // load-bearing here for a blunt reason: the kfunc shim
+                        // turns the register straight into a Rust reference.
+                        // `Trusted<T>::from_raw` and `Owned<T>::from_raw` do
+                        // `NonNull::new_unchecked(raw as *mut T)` on the
+                        // strength of "the verifier proves this".
+                        //
+                        // Nothing proved it. `alu`'s `(Ptr, Scalar)` arm permits
+                        // unbounded add/sub on every pointer class, and this arm
+                        // checked nullability, the validity domain, the class and
+                        // the `TypeKey` — and never the offset. So
+                        //
+                        //     r6 = ctx[0]        // Trusted<Task>
+                        //     r1 = r6
+                        //     r1 += ctx[2]       // attacker-chosen u64
+                        //     use_trusted(r1)
+                        //
+                        // verified, handing a kfunc a `NonNull<Task>` at an
+                        // arbitrary address. The same shape freed an `Owned<T>`
+                        // at a shifted address, walked off a map value or a ctx
+                        // tuple, and unlocked with a bogus lock token.
+                        //
+                        // Latent only because today's registered kfuncs take
+                        // scalars — but this is the *contract*, so the first
+                        // `kfunc!` declaring a `Trusted<T>` parameter would have
+                        // inherited an arbitrary kernel write on day one.
+                        //
+                        // `Mem` is exempt because `check_mem_arg` bounds offset
+                        // and length together against the region it resolves.
                         return Err(bad);
                     }
                     if p.class == PtrClass::Arena {

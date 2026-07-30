@@ -177,6 +177,27 @@ pub enum VerifyError {
     FallsOffEnd { at: u32 },
     /// A jump or call target is outside the program.
     BadTarget { at: u32, target: i64 },
+    /// A context-field descriptor is malformed.
+    BadCtxField {
+        field: usize,
+        err: kfunc::KfuncError,
+    },
+    /// A control-flow edge leaves the subprogram it starts in.
+    ///
+    /// Every analysis downstream assumes subprograms are CFG-disjoint: each is
+    /// analysed once with its own entry state and its own fresh `Stack`, stack
+    /// depth is summed along the call *graph*, and the graph attributes a call
+    /// to the subprogram whose slot range encloses it. A branch across that
+    /// boundary breaks all three at once — it can reach a subprogram after its
+    /// turn in the topological order has passed (so it is analysed never, and
+    /// dismissed as dead code), and it makes the call graph describe edges the
+    /// real control flow does not have, hiding recursion and under-counting the
+    /// frame budget.
+    ///
+    /// Linux rejects the same thing in `check_subprogs()`. Its diagnostic is
+    /// worth quoting because it is the whole reason this is an error and not a
+    /// precision loss: "jump out of range".
+    CrossSubprogEdge { at: u32, target: u32 },
     /// A register was read before anything was written to it.
     UninitRegister { at: u32, reg: u8 },
     /// An attempt to write R10, the read-only frame pointer.
@@ -286,7 +307,28 @@ pub const MAX_STACK_BYTES: u32 = 16 * 1024;
 /// immediate* lands in unmapped VA and is caught by the exception table. An
 /// escape by register-width arithmetic is not covered by that argument, which
 /// is why the verifier bounds the computed offset against this explicitly.
+/// # Load-bearing: this must stay exactly `2^32`
+///
+/// 32-bit ALU on an arena pointer keeps `PtrClass::Arena` and does **not**
+/// truncate the abstract offset, while the concrete register holds
+/// `sum mod 2^32`. That is sound only because `access` requires the whole
+/// abstract offset range to lie in `[0, ARENA_WINDOW_BYTES)`, and on a window
+/// of exactly `2^32` the reduction `mod 2^32` is the identity there — so at any
+/// *accepted* access the abstract and concrete offsets coincide.
+///
+/// Widening the window (spec §8.1 contemplates "lifting the 4 GiB cap") breaks
+/// that silently: the abstract offset would then admit values the concrete
+/// register cannot hold, and a 32-bit `+=` would be verified against an offset
+/// the hardware never computes. Whoever lifts it must first make the 32-bit
+/// path zero-extend the offset. The `const` assertion below is the tripwire;
+/// the dependency was previously stated nowhere.
 pub const ARENA_WINDOW_BYTES: u64 = 4 << 30;
+
+const _: () = assert!(
+    ARENA_WINDOW_BYTES == 1 << 32,
+    "the 32-bit arena ALU path relies on `mod 2^32` being the identity on \
+     [0, ARENA_WINDOW_BYTES); see the note above before changing this"
+);
 
 /// Maximum subprogram nesting depth.
 ///
@@ -318,6 +360,13 @@ pub fn verify(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
     // Reasoning from a broken contract would be worse than refusing to.
     for k in prog.kfuncs {
         k.validate()?;
+    }
+    // The *context* descriptor was never validated, only the kfunc ones — so a
+    // `Scalar { bits: 0 }` ctx field reached `Scalar::signed_bits(0)` and
+    // panicked the verifier on a `1 << (bits - 1)` underflow. Same class of
+    // "reasoning from a broken contract", one descriptor over.
+    for (i, f) in prog.ctx_fields.iter().enumerate() {
+        kfunc::validate_type(*f, i).map_err(|err| VerifyError::BadCtxField { field: i, err })?;
     }
     fixpoint::run(prog)
 }

@@ -385,7 +385,14 @@ impl Scalar {
     /// Everything representable in `bits` bits, sign-extended.
     #[must_use]
     pub fn signed_bits(bits: u32) -> Scalar {
-        if bits >= 64 {
+        // `bits == 0` is not a width any ISA access has, but it can arrive from
+        // a hand-written descriptor, and `1 << (bits - 1)` underflows on it —
+        // a panic in a `forbid(unsafe_code)`, fail-closed component, reached
+        // from a `ctx_fields` entry that nothing validated. `UNKNOWN` is the
+        // sound answer for a width carrying no information. Descriptors are also
+        // now checked up front (`validate_type`), so this is the belt to that
+        // brace rather than the only guard.
+        if bits == 0 || bits >= 64 {
             return Scalar::UNKNOWN;
         }
         let lo = -(1i64 << (bits - 1));

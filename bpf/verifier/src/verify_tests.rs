@@ -1582,13 +1582,24 @@ fn map_pseudo_immediates_are_not_implemented_yet() {
 
 #[test]
 fn callback_subprogram_addresses_are_not_implemented_yet() {
+    // Main must *terminate* before the callback's entry slot. It previously did
+    // not — a `mov` sat where the boundary falls, so main fell straight through
+    // into the callback body — and the program reached the `NotImplemented` arm
+    // only because nothing checked subprogram confinement yet. Now that
+    // something does, the malformed shape is caught first and this test would
+    // have been asserting the wrong rejection.
+    //
+    // Fixed by making the program well-formed (which is what a compiler emits)
+    // rather than by relaxing the check. The fallthrough-across-a-boundary case
+    // it used to exercise by accident is now covered on purpose, by
+    // `fallthrough_into_the_next_subprogram_is_rejected`.
     let e = check(&[
         Decoded::LoadImm64 {
             dst: r(1),
             value: Imm64::SubprogAddr(1),
         },
-        mov(0, 0),
         EXIT,
+        mov(0, 0),
         EXIT,
     ])
     .unwrap_err();
@@ -2034,4 +2045,135 @@ fn an_arena_mem_argument_is_bounds_checked() {
     // fix is a bound and not a ban on arena byte regions.
     let bounded = &[call(0), movr(1, 0), mov(2, 64), call(1), mov(0, 0), EXIT];
     check_full(bounded, &[], &k, Context::Atomic).expect("a bounded arena region is fine");
+}
+
+// ── Subprogram confinement, and what rested on it ────────────────────
+//
+// Three analyses assumed subprograms are CFG-disjoint and nothing checked it:
+// `run()` skips a subprogram whose entry state is still `None` as dead code,
+// the call graph attributes a `call` to the subprogram whose *slot range*
+// encloses it, and each subprogram is analysed with a fresh `Stack`. A branch
+// across the boundary breaks all three.
+
+#[test]
+fn a_jump_out_of_its_own_subprogram_is_rejected() {
+    // The shape that let unverified code run. Slot 7 is subprogram A, reached
+    // by `call +5` from main. A's body jumps *backwards into main's slot range*
+    // (slot 4), where a second `call +3` targets slot 8 — subprogram B.
+    //
+    // Because B's entry state was populated only while walking A, and A is
+    // ordered after B in the call-graph topological order, B's turn had already
+    // passed: `run()` saw `entry[B] == None`, called it dead code, and never
+    // looked at it. `verify()` returned Ok. Slot 8 in isolation is a wild store
+    // (`OutOfBounds`), so this accepted a program containing an unverified
+    // out-of-bounds write.
+    let e = check(&[
+        movr(1, 10),                           // 0
+        Decoded::Call(CallTarget::Subprog(5)), // 1 -> slot 7 (A)
+        mov(0, 0),                             // 2
+        EXIT,                                  // 3
+        Decoded::Call(CallTarget::Subprog(3)), // 4 -> slot 8 (B)
+        mov(0, 0),                             // 5
+        EXIT,                                  // 6
+        Decoded::Jump { off: -4 },             // 7  A: -> slot 4, out of A
+        stx(Size::Dw, 10, -32000, 1),          // 8  B: never examined
+        mov(0, 0),                             // 9
+        EXIT,                                  // 10
+    ])
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::CrossSubprogEdge { .. }), "{e:?}");
+}
+
+#[test]
+fn fallthrough_into_the_next_subprogram_is_rejected() {
+    // An edge is an edge: falling off the end of main into a callee's first
+    // instruction is the same violation as jumping there, and it arrives
+    // through a different arm of pass 2. Main's `mov` sits exactly on the
+    // boundary.
+    let e = check(&[
+        Decoded::Call(CallTarget::Subprog(1)), // 0 -> slot 2
+        mov(0, 0),                             // 1  falls through into slot 2
+        mov(0, 0),                             // 2  callee entry
+        EXIT,                                  // 3
+    ])
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::CrossSubprogEdge { .. }), "{e:?}");
+}
+
+#[test]
+fn recursion_hidden_by_a_cross_subprogram_jump_is_rejected() {
+    // Recursion detection reads the call *graph*, and the graph attributed this
+    // `call` to whichever subprogram's slot range encloses it rather than to
+    // the subprogram whose control flow reaches it. So this program — main
+    // calls slot 2, whose body jumps back to slot 0 and calls it again —
+    // presented as acyclic, verified with no `Recursion` error, and recursed
+    // without bound at runtime. It also under-reported `max_stack_bytes`, which
+    // is the number `jit_glue`/`mem.rs` size the frame from.
+    let e = check(&[
+        Decoded::Call(CallTarget::Subprog(1)), // 0 -> slot 2
+        EXIT,                                  // 1
+        Decoded::Jump { off: -3 },             // 2 -> slot 0, out of this subprog
+        EXIT,                                  // 3
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            VerifyError::CrossSubprogEdge { .. } | VerifyError::Recursion { .. }
+        ),
+        "{e:?}"
+    );
+}
+
+// ── A frame pointer passed to a subprogram ───────────────────────────
+
+#[test]
+fn a_frame_pointer_passed_to_a_subprogram_is_clamped_and_counted() {
+    // `room` was `-off` with no upper bound, and this path never called
+    // `note_depth`. So an offset far below the frame produced a writable region
+    // of that size, based that far below R10, in a program the runtime was told
+    // needed *zero* stack. The callee's store then landed outside the frame
+    // entirely.
+    //
+    // A megabyte below R10 is not a frame slot, so it is rejected outright.
+    for &off in &[16_384_i32 + 8, 1_000_000] {
+        let e = check(&[
+            movr(1, 10),
+            alu(AluOp::Sub, 1, off),
+            Decoded::Call(CallTarget::Subprog(2)),
+            mov(0, 0),
+            EXIT,
+            stx(Size::Dw, 1, 0, 1),
+            mov(0, 0),
+            EXIT,
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(e, VerifyError::OutOfBounds { .. }),
+            "off={off}: {e:?}"
+        );
+    }
+}
+
+#[test]
+fn a_frame_pointer_passed_to_a_subprogram_counts_toward_the_frame() {
+    // The in-range case must still be *counted*: the callee can address the
+    // whole region, so the runtime has to allocate a frame at least that deep
+    // or the layout it hands out disagrees with what was proved here. This
+    // reported `max_stack_bytes == 0` before.
+    let v = ok(&[
+        movr(1, 10),
+        alu(AluOp::Sub, 1, 64),
+        Decoded::Call(CallTarget::Subprog(2)),
+        mov(0, 0),
+        EXIT,
+        stx(Size::Dw, 1, 0, 1),
+        mov(0, 0),
+        EXIT,
+    ]);
+    assert!(
+        v.max_stack_bytes >= 64,
+        "a 64-byte region handed to a callee must be counted, got {}",
+        v.max_stack_bytes
+    );
 }
