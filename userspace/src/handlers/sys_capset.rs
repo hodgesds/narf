@@ -28,10 +28,13 @@ pub(crate) fn sys_capset(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // capset only operates on the calling thread (pid 0 or self).
+    // Linux's `task_pid_vnr(current)` comparison is against the caller's
+    // visible PID, not NARF's internal scheduler TaskId. A service launcher
+    // obtains that value from getpid(2) and supplies it here.
     let task = current_task_id();
-    if pid != 0 && pid as u64 != task {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM-ish
+    let self_pid = task_to_pid_raw(task).unwrap_or(task);
+    if pid != 0 && pid as u64 != self_pid {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
         return;
     }
     // SAFETY: datap checked non-zero above; copy_from_user_vec range-validates

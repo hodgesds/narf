@@ -202,7 +202,7 @@ fn smoke_abi_proc2_capget_probe() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_capget_probe);
 
-// ── capset(2) — datap == NULL EFAULT + wrong-pid arm ──
+// ── capset(2) — datap == NULL EFAULT + visible-self / wrong-pid arms ──
 
 fn smoke_abi_proc2_capset_null_data() -> TestResult {
     with_setup(|| {
@@ -220,13 +220,45 @@ fn smoke_abi_proc2_capset_null_data() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_capset_null_data);
 
+/// Linux accepts the caller's visible PID in `cap_user_header_t.pid`, not
+/// only its internal scheduler task ID.  `dbus-broker-launch` follows the
+/// standard capget→capset sequence with `getpid_cached()` here while it drops
+/// privileges before exec; rejecting that PID made the launcher exit 1 before
+/// the broker could serve the system bus.
+fn smoke_abi_proc2_capset_visible_self_pid() -> TestResult {
+    with_setup(|| {
+        const TASK: u64 = 0xBEEF;
+        const PID: u64 = 0xCAFE;
+        const CAP_VERSION_3: u32 = 0x2008_0522;
+
+        set_task(TASK);
+        crate::handlers::register_pid_task_mapping(PID, TASK);
+
+        let mut hdr = [0u8; 8];
+        hdr[..4].copy_from_slice(&CAP_VERSION_3.to_le_bytes());
+        hdr[4..].copy_from_slice(&(PID as i32).to_le_bytes());
+        let mut data = [0u8; 24];
+
+        let result = call(
+            Syscall::Capset.raw(),
+            a1(hdr.as_mut_ptr() as u64, data.as_mut_ptr() as u64),
+        );
+        set_task(FAKE_TASK);
+
+        match result {
+            Some(0) => Ok(()),
+            _ => Err("capset rejected the caller's visible self PID"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_capset_visible_self_pid);
+
 fn smoke_abi_proc2_capset_other_pid() -> TestResult {
     with_setup(|| {
         // capset only operates on the calling thread; a header naming a pid
-        // that is neither 0 nor the caller takes the `pid != self → -1`
-        // (EPERM-ish) arm. The base file never sets a non-self pid.
-        // LINUX-GAP: Linux returns -EPERM for cross-thread capset; NARF
-        // returns the bare -1 sentinel.
+        // that is neither 0 nor the caller's visible PID takes the
+        // `pid != self → -EPERM` arm. The base file never sets a non-self
+        // pid.
         const CAP_VERSION_3: u32 = 0x2008_0522;
         let mut hdr = [0u8; 8];
         hdr[..4].copy_from_slice(&CAP_VERSION_3.to_le_bytes());
@@ -237,8 +269,8 @@ fn smoke_abi_proc2_capset_other_pid() -> TestResult {
             Syscall::Capset.raw(),
             a1(hdr.as_mut_ptr() as u64, data.as_mut_ptr() as u64),
         ) {
-            Some(-1) => Ok(()),
-            _ => Err("capset for a non-self pid did not return -1"),
+            Some(EPERM) => Ok(()),
+            _ => Err("capset for a non-self pid did not return -EPERM"),
         }
     })
 }
