@@ -333,8 +333,21 @@ impl BpfProg {
         // (R1). `ctx` outlives the call; `frame` is held across it so the
         // memory R10 addresses stays leased. The five gates above are what make
         // the absence of runtime bounds checks sound.
-        let ret = unsafe { entry(top, ctx.as_ptr() as u64) };
-        let outcome = Outcome::Returned(ret);
+        let packed = unsafe { entry(top, ctx.as_ptr() as u64, self.initial_fuel) };
+        // SysV's rax:rdx pair: low half is R0, high half is the exhaustion
+        // flag. Reported out of band because no in-band sentinel works — the
+        // obvious one, u64::MAX, is exactly what `r0 = -1; exit` returns.
+        let value = packed as u64;
+        let exhausted = (packed >> 64) as u64 != 0;
+        let outcome = if exhausted {
+            // Matches the interpreter: exhaustion stops the program with a
+            // diagnostic rather than a fault, and the return value is
+            // meaningless (§4.9). `at` is not recoverable from native code
+            // without a side table, so it names the entry.
+            Outcome::Trapped(crate::interp::Trap::OutOfFuel { at: 0 })
+        } else {
+            Outcome::Returned(value)
+        };
         self.record(outcome);
         Some(outcome)
     }

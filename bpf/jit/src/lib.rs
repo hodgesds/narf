@@ -27,17 +27,22 @@
 //!   `arch/x86/net/bpf_jit_comp.c:70-113` were removed: the emitter never
 //!   selected a short form, so the machinery guarded a hazard it was not
 //!   exposed to. It comes back with `rel8` selection, if that ever lands.
-//! * **No fuel is emitted.** The verifier deliberately does not prove
-//!   termination — `bpf/verifier/src/lib.rs` says so, and
-//!   `an_unbounded_loop_verifies` is a passing test — so fuel is the *only*
-//!   thing bounding a program's work (spec §4.9). Native code that omits it
-//!   turns `loop: r0 += 1; goto loop` into an unterminated loop on a hook that
-//!   may run with IRQs masked.
+//! ## Fuel, and how exhaustion is reported
 //!
-//!   Until per-block fuel accounting exists, `narf_bpf::jit_glue` refuses any
-//!   program containing a back-edge. That gate is what makes this crate safe to
-//!   use at all, and it lives there rather than here because it is a statement
-//!   about what the emitter lacks.
+//! The verifier deliberately does not prove termination — fuel is the *only*
+//! thing bounding a program's work (spec §4.9) — so native code must burn it or
+//! `loop: r0 += 1; goto loop` runs forever on a hook that may have IRQs masked.
+//!
+//! Fuel is burned **per basic block**, decrementing by the block's instruction
+//! count on entry: the same bound as the interpreter's per-instruction burn, at
+//! one `sub`/`jb` pair per block instead of per instruction.
+//!
+//! Exhaustion is reported **out of band**, in `rdx`. An in-band sentinel was
+//! tried and removed: the obvious choice, `u64::MAX`, is exactly what
+//! `r0 = -1; exit` returns, so "ran out of fuel" and "returned -1" would be the
+//! same answer. SysV returns a 128-bit value in `rax:rdx`, so the entry point
+//! is declared `-> u128` and the high half carries the flag — the value and the
+//! verdict travel together with no extra memory traffic and nothing to confuse.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]

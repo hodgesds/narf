@@ -125,28 +125,52 @@ fn reports_unsupported_rather_than_emitting_wrong_code() {
 
 /// The prologue, hand-derived from the Intel SDM.
 ///
-/// `push rbp; push rbx; push r13; push r14; push r15; mov rbp, rdi; mov rdi, rsi`
+/// `push rbp/rbx/r12/r13/r14/r15; mov r12, rdx; mov rbp, rdi; mov rdi, rsi`
 ///
 /// `push rbp` is not decoration: R10 maps to rbp so the body overwrites it, and
 /// rbp is callee-saved in SysV. An earlier version of this constant omitted it
 /// and therefore *faithfully pinned the bug* — the test passed while every
 /// invocation destroyed the caller's frame pointer. A golden test is only as
 /// good as the derivation behind it.
+///
+/// `r12` holds the fuel counter and is likewise callee-saved. `mov r12, rdx`
+/// runs before anything can write rdx, which R3 maps to.
 const PROLOGUE: &[u8] = &[
     0x55, // push rbp
     0x53, // push rbx
+    0x41, 0x54, // push r12
     0x41, 0x55, // push r13
     0x41, 0x56, // push r14
     0x41, 0x57, // push r15
+    0x49, 0x89, 0xD4, // mov r12, rdx   (fuel)
     0x48, 0x89, 0xFD, // mov rbp, rdi
     0x48, 0x89, 0xF7, // mov rdi, rsi
 ];
 
+/// The per-block fuel burn: `sub r12, imm32` then `jb rel32` to the
+/// out-of-fuel epilogue. Thirteen bytes; the immediate and displacement vary.
+const FUEL_BURN_LEN: usize = 13;
+
 /// `pop r15; pop r14; pop r13; pop rbx; ret`
-const EPILOGUE: &[u8] = &[
+/// Pops and `ret`, shared by both epilogues.
+const RESTORE: &[u8] = &[
     0x41, 0x5F, // pop r15
     0x41, 0x5E, // pop r14
     0x41, 0x5D, // pop r13
+    0x41, 0x5C, // pop r12
+    0x5B, // pop rbx
+    0x5D, // pop rbp
+    0xC3, // ret
+];
+
+/// The normal epilogue. The image ends with the *out-of-fuel* one, which shares
+/// [`RESTORE`] but sets the flag instead of clearing it.
+const EPILOGUE: &[u8] = &[
+    0x48, 0x31, 0xD2, // xor rdx, rdx  — the exhaustion flag, cleared
+    0x41, 0x5F, // pop r15
+    0x41, 0x5E, // pop r14
+    0x41, 0x5D, // pop r13
+    0x41, 0x5C, // pop r12
     0x5B, // pop rbx
     0x5D, // pop rbp
     0xC3, // ret
@@ -168,12 +192,43 @@ fn assert_body(items: &[Decoded], want: &[u8]) {
         "prologue changed:\n got {:02X?}\nwant {PROLOGUE:02X?}",
         &c.code[..PROLOGUE.len().min(c.code.len())]
     );
+    // The image ends with the out-of-fuel epilogue, so it is `RESTORE` that
+    // terminates it — the normal epilogue sits just before.
     assert!(
-        c.code.ends_with(EPILOGUE),
-        "epilogue changed: got {:02X?}",
-        &c.code[c.code.len().saturating_sub(EPILOGUE.len())..]
+        c.code.ends_with(RESTORE),
+        "image does not end in the restore sequence: got {:02X?}",
+        &c.code[c.code.len().saturating_sub(RESTORE.len())..]
     );
-    let body = &c.code[PROLOGUE.len()..c.code.len() - EPILOGUE.len()];
+    assert!(
+        c.code.windows(EPILOGUE.len()).any(|w| w == EPILOGUE),
+        "the normal (flag-clearing) epilogue is missing"
+    );
+    // Every block opens with a fuel burn: `sub r12, imm32` then `jb rel32` to
+    // the out-of-fuel epilogue. Checked for shape and then skipped, so each
+    // golden stays about the instruction under test rather than restating the
+    // burn in every expectation.
+    let after = &c.code[PROLOGUE.len()..];
+    assert_eq!(
+        &after[..3],
+        &[0x49, 0x81, 0xEC],
+        "expected `sub r12, imm32` at the block head, got {:02X?}",
+        &after[..3]
+    );
+    assert_eq!(
+        &after[7..9],
+        &[0x0F, 0x82],
+        "expected `jb rel32` after the fuel burn"
+    );
+
+    // The body runs from after the burn to the normal epilogue. Located by
+    // searching rather than by arithmetic, so a change to either epilogue's
+    // length cannot silently shift what is compared.
+    let rest = &after[FUEL_BURN_LEN..];
+    let end = rest
+        .windows(EPILOGUE.len())
+        .position(|w| w == EPILOGUE)
+        .expect("the normal epilogue must appear after the body");
+    let body = &rest[..end];
     assert_eq!(body, want, "\n got {body:02X?}\nwant {want:02X?}");
 }
 
@@ -362,7 +417,7 @@ fn shift_by_register_routes_through_cl() {
     // reg=111(rdi), rm=001(rcx). CF would be `mov rdi, rcx`, the other
     // direction. I wrote CF here first and this test caught it, which is the
     // argument for exact encodings over byte-presence checks.
-    let body = &c.code[PROLOGUE.len()..c.code.len() - EPILOGUE.len()];
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
     assert_eq!(
         &body[..6],
         &[0x48, 0x89, 0xF9, 0x48, 0xD3, 0xE0],

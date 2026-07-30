@@ -32,6 +32,7 @@
 //! correctness. That is the property that makes it safe to grow this file
 //! incrementally instead of all at once.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use narf_bpf_isa::{decode, AluOp, CondOp, Decoded, Reg, Size, Source};
@@ -42,6 +43,13 @@ use crate::{Compiled, FaultEntry, FaultTable, JitError};
 /// Host register numbers, in ModRM/REX encoding order.
 mod hr {
     pub const RAX: u8 = 0;
+    /// Holds the remaining fuel for the whole program.
+    ///
+    /// Callee-saved and absent from [`super::REGS`], so no BPF register aliases
+    /// it. Note spec §5 earmarks a pinned register for the arena window base;
+    /// arena programs are not compiled yet (gate 2), and whichever lands second
+    /// picks a different one — `r10`/`r11` are still free.
+    pub const R12: u8 = 12;
     /// Scratch. Variable shifts require the count in `cl`, and `rcx` is
     /// deliberately absent from [`super::REGS`] so no BPF register can alias
     /// it — which is what makes moving a count into it unconditionally safe.
@@ -305,6 +313,9 @@ const fn cond_cc(op: CondOp) -> u8 {
 /// is where the body ends and the epilogue begins.
 const EPILOGUE: u32 = u32::MAX;
 
+/// Reloc target meaning "the out-of-fuel epilogue".
+const OOF_EPILOGUE: u32 = u32::MAX - 1;
+
 /// A branch whose target is a BPF instruction index, resolved once every
 /// instruction's offset is known.
 #[derive(Copy, Clone, Debug)]
@@ -317,6 +328,96 @@ struct Reloc {
     target: u32,
     /// Displacement width in bytes. Always 4 — see `compile`.
     width: u8,
+}
+
+/// Instruction indices that begin a basic block.
+///
+/// Index 0, every branch target, and the instruction after every branch. A
+/// pre-pass rather than a real CFG because that is all per-block fuel needs:
+/// the count of instructions between one boundary and the next.
+fn block_starts(prog: &VerifiedProgram) -> Result<Vec<bool>, JitError> {
+    let n = prog.insns.len();
+    let mut starts = vec![false; n + 1];
+    if n == 0 {
+        return Ok(starts);
+    }
+    starts[0] = true;
+    let mut i = 0usize;
+    while i < n {
+        let (d, width) = decode(&prog.insns, i).map_err(|_| JitError::Decode { at: i as u32 })?;
+        let next = i + width;
+        let mut mark_target = |off: i64| -> Result<(), JitError> {
+            let t = i as i64 + 1 + off;
+            if t < 0 || t as usize > n {
+                return Err(JitError::BadTarget { at: i as u32 });
+            }
+            starts[t as usize] = true;
+            Ok(())
+        };
+        match d {
+            Decoded::Jump { off } => {
+                mark_target(i64::from(off))?;
+                if next <= n {
+                    starts[next] = true;
+                }
+            }
+            Decoded::JumpCond { off, .. } => {
+                mark_target(i64::from(off))?;
+                if next <= n {
+                    starts[next] = true;
+                }
+            }
+            // `exit` ends a block; whatever follows begins one.
+            Decoded::Exit => {
+                if next <= n {
+                    starts[next] = true;
+                }
+            }
+            _ => {}
+        }
+        i = next;
+    }
+    Ok(starts)
+}
+
+/// Instructions in the block beginning at `i`.
+fn block_len(prog: &VerifiedProgram, starts: &[bool], i: usize) -> u32 {
+    let mut count = 0u32;
+    let mut k = i;
+    while k < prog.insns.len() {
+        if k != i && starts[k] {
+            break;
+        }
+        let width = decode(&prog.insns, k).map(|(_, w)| w).unwrap_or(1);
+        count += 1;
+        k += width;
+    }
+    count.max(1)
+}
+
+/// `sub r12, n` then a branch to the out-of-fuel epilogue on borrow.
+///
+/// `jb` (borrow) is the right test: `sub` sets CF exactly when the subtrahend
+/// exceeds the minuend, i.e. when there was not enough fuel left to pay for
+/// this block. Testing the *result* instead would need a comparison and would
+/// misread a wrapped value as plenty.
+fn emit_fuel_burn(e: &mut Emit, n: u32, relocs: &mut Vec<Reloc>) {
+    // sub r12, imm32 — always the imm32 form, so the size does not vary with
+    // the block length and cannot perturb offsets.
+    e.rex(true, 0, hr::R12);
+    e.b(0x81);
+    e.modrm_rr(5, hr::R12);
+    e.d32(n as i32);
+    // jb rel32 -> out-of-fuel epilogue
+    e.bs(&[0x0F, 0x82]);
+    let at_disp = e.len();
+    e.d32(0);
+    relocs.push(Reloc {
+        at: at_disp,
+        next: e.len(),
+        target: OOF_EPILOGUE,
+        width: 4,
+    });
 }
 
 /// Compile a verified program.
@@ -354,12 +455,20 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
     let mut e = Emit::default();
     let mut relocs: Vec<Reloc> = Vec::new();
     let mut out = Vec::with_capacity(prog.insns.len() + 1);
+    let starts = block_starts(prog)?;
 
     emit_prologue(&mut e, prog);
 
     let mut i = 0usize;
     while i < prog.insns.len() {
         out.push(e.len());
+        // Burn this block's worth of fuel on entry. Per block rather than per
+        // instruction: the same bound, one `sub`/`jb` pair instead of one per
+        // instruction. The charge is taken *before* the block runs, so a block
+        // that cannot be paid for does not execute at all.
+        if starts[i] {
+            emit_fuel_burn(&mut e, block_len(prog, &starts, i), &mut relocs);
+        }
         let (insn, width) =
             decode(&prog.insns, i).map_err(|_| JitError::Decode { at: i as u32 })?;
         emit_insn(&mut e, &insn, i as u32, &mut relocs)?;
@@ -379,10 +488,14 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
     out.push(e.len());
 
     emit_epilogue(&mut e);
+    let oof_at = e.len();
+    emit_oof_epilogue(&mut e);
 
     // Patch branch displacements now that every offset is known.
     for r in &relocs {
-        let target = if r.target == EPILOGUE {
+        let target = if r.target == OOF_EPILOGUE {
+            oof_at
+        } else if r.target == EPILOGUE {
             // The last offset recorded is one past the body — the epilogue.
             *out.last()
                 .expect("the offset table always has the trailing entry")
@@ -417,20 +530,39 @@ fn emit_prologue(e: &mut Emit, _prog: &VerifiedProgram) {
     // the *caller's* frame pointer on every invocation, which then misbehaved
     // after the program returned cleanly. Worst failure class there is:
     // executes, corrupts elsewhere, blames someone else.
-    for r in [hr::RBP, hr::RBX, hr::R13, hr::R14, hr::R15] {
+    for r in [hr::RBP, hr::RBX, hr::R12, hr::R13, hr::R14, hr::R15] {
         if r >= 8 {
             e.b(0x41);
         }
         e.b(0x50 | (r & 7));
     }
+    // r12 := rdx (fuel) **before** anything writes rdx, which R3 maps to.
+    // Ordering matters for the same reason as the rdi/rsi pair below.
+    mov_rr(e, true, hr::R12, hr::RDX);
     // rbp := rdi (frame top), then rdi := rsi (the ctx pointer) so R1 holds
     // the context on entry as the ABI requires.
     mov_rr(e, true, hr::RBP, hr::RDI);
     mov_rr(e, true, hr::RDI, hr::RSI);
 }
 
+/// The normal epilogue: `rdx = 0` (fuel intact), restore, return.
 fn emit_epilogue(e: &mut Emit) {
-    for r in [hr::R15, hr::R14, hr::R13, hr::RBX, hr::RBP] {
+    // rdx is the high half of the 128-bit return — the exhaustion flag.
+    // Zeroed here so a clean exit is unambiguous.
+    e.rex(true, 0, hr::RDX);
+    e.b(0x31);
+    e.modrm_rr(hr::RDX, hr::RDX);
+    emit_restore(e);
+}
+
+/// The out-of-fuel epilogue: `rdx = 1`, and `rax` is left as-is (meaningless).
+fn emit_oof_epilogue(e: &mut Emit) {
+    mov_reg_imm64(e, hr::RDX, 1);
+    emit_restore(e);
+}
+
+fn emit_restore(e: &mut Emit) {
+    for r in [hr::R15, hr::R14, hr::R13, hr::R12, hr::RBX, hr::RBP] {
         if r >= 8 {
             e.b(0x41);
         }

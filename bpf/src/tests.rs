@@ -1161,24 +1161,75 @@ fn smoke_bpf_jit_matches_the_interpreter() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_jit_matches_the_interpreter);
 
-fn smoke_bpf_jit_gates_reject_a_back_edge() -> TestResult {
-    // No fuel is emitted, so a back-edge must never reach native code — the
-    // verifier accepts unbounded loops by design (fuel bounds them at runtime),
-    // and native code that omits fuel would run one forever with IRQs masked.
+fn smoke_bpf_jit_compiles_a_loop_and_runs_out_of_fuel() -> TestResult {
+    // This test previously asserted the *opposite*: that a back-edge must never
+    // reach the JIT, because no fuel was emitted and native code would have run
+    // `loop: r0 += 1; goto loop` forever with IRQs masked. The emitter now burns
+    // fuel per basic block, so the gate is lifted and the assertion inverts —
+    // a loop must compile, and must still terminate.
+    //
+    // Loops are the only shape where native code is meaningfully faster than
+    // interpreting, so this is the gate whose removal the whole JIT was for.
     let insns = asm(&[mov_imm(0, 0), alu_imm(AluOp::Add, 0, 1), ja(-2)]);
     let Ok(p) = load("spin-jit", insns, Context::Atomic) else {
         return TestResult::Fail("load rejected an unbounded loop — fuel makes it legal");
     };
-    if p.is_jited() {
-        return TestResult::Fail("a back-edge reached the JIT with no fuel emitted");
+    if !p.is_jited() {
+        return TestResult::Fail("a loop did not compile even though fuel is now emitted");
     }
-    // And interpreted it still terminates, on fuel.
     match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Trapped(Trap::OutOfFuel { .. })) => {}
+        Some(Outcome::Returned(_)) => {
+            return TestResult::Fail("the native loop returned — it should have exhausted fuel")
+        }
+        Some(Outcome::Trapped(_)) => return TestResult::Fail("wrong trap"),
+        None => return TestResult::Fail("run declined"),
+    }
+    // Interpreted, the same program must reach the same verdict. That is the
+    // property fuel emission has to preserve: the two paths agree on
+    // termination, not merely on results.
+    match p.run_atomic_interpreted([0; 4], 4) {
         Some(Outcome::Trapped(Trap::OutOfFuel { .. })) => TestResult::Pass,
-        _ => TestResult::Fail("the interpreted loop did not run out of fuel"),
+        _ => TestResult::Fail("interpreted and native disagreed on exhaustion"),
     }
 }
-kernel_test_in!("bpf", smoke_bpf_jit_gates_reject_a_back_edge);
+kernel_test_in!("bpf", smoke_bpf_jit_compiles_a_loop_and_runs_out_of_fuel);
+
+fn smoke_bpf_jit_bounded_loop_completes() -> TestResult {
+    // The other half: fuel must not fire on a loop that legitimately finishes.
+    // Without this, "everything runs out of fuel" would pass the test above.
+    //
+    // r0 = 0; r1 = 8;  L: r0 += 3; r1 -= 1; if r1 != 0 goto L;  exit
+    let insns = asm(&[
+        mov_imm(0, 0),
+        mov_imm(1, 8),
+        alu_imm(AluOp::Add, 0, 3),
+        alu_imm(AluOp::Sub, 1, 1),
+        jne_imm(1, 0, -3),
+        EXIT,
+    ]);
+    let Ok(p) = load("bounded", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected a bounded loop");
+    };
+    if !p.is_jited() {
+        return TestResult::Fail("bounded loop did not compile");
+    }
+    let native = p.run_atomic([0; 4], 4);
+    let interp = p.run_atomic_interpreted([0; 4], 4);
+    match (native, interp) {
+        (Some(Outcome::Returned(a)), Some(Outcome::Returned(b))) if a == b && a == 24 => {
+            TestResult::Pass
+        }
+        (Some(Outcome::Returned(a)), Some(Outcome::Returned(b))) if a == b => {
+            TestResult::Fail("both paths agree but the value is wrong")
+        }
+        (Some(Outcome::Returned(_)), Some(Outcome::Returned(_))) => {
+            TestResult::Fail("native and interpreted results differ")
+        }
+        _ => TestResult::Fail("a bounded loop did not complete on one of the paths"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_jit_bounded_loop_completes);
 
 // ── heavy differential coverage ─────────────────────────────────────
 //

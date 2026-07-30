@@ -25,13 +25,13 @@
 //!    faulting accesses would have them unregistered — and `seal` requires a
 //!    registered image, so this would fail closed anyway. Checked explicitly
 //!    so the reason is visible rather than inferred from an error.
-//! 4. **No back-edge.** The verifier deliberately does *not* prove
-//!    termination — `an_unbounded_loop_verifies` is a passing test — because
-//!    fuel bounds work at runtime instead (spec §4.9). The emitter does not
-//!    emit fuel accounting, so `loop: r0 += 1; goto loop` would compile to an
-//!    unterminated `add`/`jmp` on a hook that may run with IRQs masked. This
-//!    gate is what stands in for the missing fuel, and it must be removed only
-//!    together with per-block fuel emission.
+//! 4. ~~No back-edge.~~ **Lifted.** This gate stood in for missing fuel
+//!    emission: the verifier deliberately does not prove termination
+//!    (`an_unbounded_loop_verifies` is a passing test) because fuel bounds work
+//!    at runtime, and native code that omitted fuel would have run
+//!    `loop: r0 += 1; goto loop` forever. The emitter now burns fuel per basic
+//!    block, so loops compile — which matters, because a loop is the only shape
+//!    where native code is meaningfully faster than interpreting.
 //! 5. **Only stack and context pointers are dereferenced.** Checked
 //!    positively, by walking the program, rather than inferred from the set of
 //!    instructions the emitter happens to refuse. Today gates 1–3 already
@@ -49,11 +49,18 @@ use narf_memory::bpf_text::{self, Jit, TextAlloc};
 
 /// The ABI of a compiled program.
 ///
-/// `(frame_top, ctx_ptr) -> return value`. The prologue moves `frame_top` into
-/// the host register R10 maps to and `ctx_ptr` into R1's, so the same image
-/// runs on the per-CPU region and on a sleepable program's heap stack with no
-/// recompilation.
-pub type JitEntry = unsafe extern "C" fn(u64, u64) -> u64;
+/// `(frame_top, ctx_ptr, fuel) -> (value, exhausted)`.
+///
+/// The prologue moves `frame_top` into the host register R10 maps to and
+/// `ctx_ptr` into R1's, so the same image runs on the per-CPU region and on a
+/// sleepable program's heap stack with no recompilation.
+///
+/// The `u128` return is SysV's `rax:rdx` pair: the low half is R0, the high half
+/// is non-zero if the program ran out of fuel. Out of band deliberately — an
+/// in-band sentinel was tried and removed, because the obvious choice
+/// (`u64::MAX`) is exactly what `r0 = -1; exit` returns, so "exhausted" and
+/// "returned -1" would have been the same answer.
+pub type JitEntry = unsafe extern "C" fn(u64, u64, u64) -> u128;
 
 /// A compiled program's text, freed on drop.
 #[derive(Debug)]
@@ -149,9 +156,8 @@ fn scan_program(insns: &[narf_bpf_isa::Insn]) -> Result<(), JitSkip> {
             return Err(JitSkip::Unsupported);
         };
         match d {
-            // Back-edge, in any of the three spellings.
-            Decoded::Jump { off } if off < 0 => return Err(JitSkip::Unbounded),
-            Decoded::JumpCond { off, .. } if off < 0 => return Err(JitSkip::Unbounded),
+            // `may_goto` still declines: it carries a hidden counter the
+            // emitter does not model, which is separate from fuel.
             Decoded::MayGoto { .. } => return Err(JitSkip::Unbounded),
             // A load or store base must be the frame pointer or the context.
             // Any other register could hold a class the emitter would lower to
