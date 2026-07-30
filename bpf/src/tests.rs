@@ -2191,23 +2191,53 @@ fn smoke_bpf_map_hash_delete_and_reuse() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_map_hash_delete_and_reuse);
 
+/// A recycled hash node must not hand a new key the previous occupant's bytes.
+///
+/// This has to go through a *per-CPU* kind and reinsert with `update_local`,
+/// because that is the only combination where the reinsert does not itself
+/// overwrite the stale bytes. A plain `Hash` reinserted through the
+/// syscall-view `update` writes the whole value, so the previous occupant's
+/// bytes are gone whether or not `unlink_node` zeroed them — a test written
+/// that way passes with the zeroing deleted, which is to say it tests nothing.
+/// `update_local` writes one CPU's slot and leaves the rest, so the syscall
+/// view below reads exactly the bytes the free path was supposed to clear.
+///
+/// Skipped rather than run on a single-CPU boot for the same reason
+/// [`smoke_bpf_map_percpu_rejects_program_width_buffer`] is: there
+/// `update_local` covers the whole value, nothing distinguishes a cleared slot
+/// from an overwritten one, and a Pass would claim a gate that was never
+/// exercised.
 fn smoke_bpf_map_hash_recycled_node_is_zeroed() -> TestResult {
+    let cpus = narf_lib::smp::cpu_count().max(1) as usize;
+    if cpus < 2 {
+        return TestResult::Skip("single CPU: update_local covers the whole value");
+    }
     checked(|| {
-        // A recycled node must not hand a new key the previous occupant's
-        // bytes. Reachable through the per-CPU kinds, where `update_local`
-        // writes one CPU's slot and leaves the others at whatever was there.
-        let m = mk(MapKind::Hash, 4, 8, 1).map_err(|_| "Hash create failed")?;
+        let m = mk(MapKind::PerCpuHash, 4, 8, 1).map_err(|_| "PerCpuHash create failed")?;
         let ops = m.ops();
-        ops.update(&k32(1), &0x5555_5555_5555_5555_u64.to_le_bytes(), BPF_ANY)
-            .map_err(|_| "Hash update rejected")?;
-        ops.delete(&k32(1)).map_err(|_| "Hash delete failed")?;
-        // The only node is now free, so key 2 must land on it.
-        ops.update(&k32(2), &0u64.to_le_bytes(), BPF_ANY)
-            .map_err(|_| "Hash reinsert rejected")?;
-        let mut out = [0u8; 8];
+        let width = ops.syscall_value_bytes();
+        // Fill every CPU's slot with the sentinel.
+        let poison = alloc::vec![0x55u8; width];
+        ops.update(&k32(1), &poison, BPF_ANY)
+            .map_err(|_| "PerCpuHash update rejected")?;
+        // Pin that the sentinel really landed, so a future change that stopped
+        // the poison taking would show up here rather than as a pass below.
+        let mut seeded = alloc::vec![0u8; width];
+        ops.lookup(&k32(1), &mut seeded)
+            .map_err(|_| "PerCpuHash lookup of the seeded key failed")?;
+        if seeded.iter().any(|b| *b != 0x55) {
+            return Err("the per-CPU sentinel did not reach every slot");
+        }
+        ops.delete(&k32(1))
+            .map_err(|_| "PerCpuHash delete failed")?;
+        // The only node is now free, so key 2 must land on it. `update_local`
+        // touches this CPU's slot alone.
+        ops.update_local(&k32(2), &0u64.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "PerCpuHash local reinsert rejected")?;
+        let mut out = alloc::vec![0u8; width];
         ops.lookup(&k32(2), &mut out)
-            .map_err(|_| "Hash lookup failed")?;
-        if out != [0u8; 8] {
+            .map_err(|_| "PerCpuHash lookup failed")?;
+        if out.iter().any(|b| *b != 0) {
             return Err("a recycled hash node leaked the previous key's value");
         }
         Ok(())
