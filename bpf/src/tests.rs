@@ -592,12 +592,13 @@ kernel_test_in!("bpf", smoke_bpf_probe_attach_rejects_sleepable_program);
 // ── struct_ops ──────────────────────────────────────────────────────
 
 crate::struct_ops! {
-    /// A minimal pluggable trait, declared here so the `struct_ops!` macro,
-    /// the `narf.structops` section, and the cap-gated install path are all
-    /// exercised without waiting for Phase 5's trampolines.
+    /// A minimal pluggable trait, exercising the `struct_ops!` macro, the
+    /// `narf.structops` section, the cap-gated install path, and the generated
+    /// adapter that dispatches through BPF programs.
     #[cap(IdleGovernor)]
     #[install(install_bpf_demo_governor)]
     #[desc(DEMO_GOVERNOR_OPS)]
+    #[adapter(BpfDemoGovernor)]
     #[optional(init)]
     pub trait DemoGovernor {
         /// Pick an idle state for an expected idle duration.
@@ -1448,3 +1449,56 @@ fn smoke_bpf_jit_diff_stack_and_ctx_sweep() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_jit_diff_stack_and_ctx_sweep);
+
+fn smoke_bpf_structops_adapter_dispatches() -> TestResult {
+    // The generated adapter is what Linux spends a code generator on. Linux
+    // needs `arch_prepare_bpf_trampoline` (306 lines of assembly emission)
+    // because it patches into an arbitrary function's `__fentry__` nop, where
+    // there is no host language to interpose. NARF's struct_ops targets are
+    // trait slots with a Rust-level install point, so the adapter is an
+    // ordinary `impl` — this test is that claim, executed.
+    //
+    // The program returns its first context word doubled, so the result proves
+    // the argument reached it as ctx[0] rather than being zero or stale.
+    let insns = asm(&[ldx(0, 1, 0), alu_reg(AluOp::Add, 0, 0), EXIT]);
+    let Ok(prog) = load("gov", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected the governor program");
+    };
+    let set = crate::structops::ProgSet::new().with("select_state", prog);
+    let gov = BpfDemoGovernor::new(set);
+
+    if gov.select_state(21) != 42 {
+        return TestResult::Fail("adapter did not pass the argument as ctx[0]");
+    }
+    if gov.select_state(0) != 0 {
+        return TestResult::Fail("adapter returned a stale value");
+    }
+    // `init` is `#[optional]` and unbound, so it must fall back rather than
+    // fabricate. Returning nonsense from a policy hook is worse than returning
+    // the default.
+    if gov.init() != 0 {
+        return TestResult::Fail("unbound optional method did not fall back");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_structops_adapter_dispatches);
+
+fn smoke_bpf_structops_adapter_is_the_trait() -> TestResult {
+    // The adapter must be usable anywhere the trait is — that is the whole
+    // point of the trait coming out of the macro unchanged. Exercised through a
+    // `&dyn` so nothing can be specialised away.
+    let insns = asm(&[mov_imm(0, 7), EXIT]);
+    let Ok(prog) = load("gov7", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected");
+    };
+    let bpf = BpfDemoGovernor::new(crate::structops::ProgSet::new().with("select_state", prog));
+    let native = NativeDemoGovernor;
+    let both: [&dyn DemoGovernor; 2] = [&bpf, &native];
+    if both[0].select_state(1) != 7 {
+        return TestResult::Fail("BPF impl did not dispatch through &dyn");
+    }
+    // The native impl still works and still has no idea BPF exists.
+    let _ = both[1].select_state(1);
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_structops_adapter_is_the_trait);

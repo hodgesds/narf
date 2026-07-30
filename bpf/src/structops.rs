@@ -18,13 +18,25 @@
 //!    method's Rust signature through `BpfType`, exactly as `kfunc!` does;
 //! 3. a cap-gated install entry point, named by the invocation.
 //!
-//! ## What it does not emit yet
+//! ## There is no trampoline, and there does not need to be
 //!
-//! The generated `BpfFoo` that implements the trait by invoking programs
-//! through trampolines is Phase 5. Until then [`install`] records the program
-//! set in a registry and reports it; nothing dispatches through it. Getting
-//! the macro, the descriptors, and the registry right first is deliberate —
-//! the trampoline is the mechanical part.
+//! Linux generates one per attach point — `arch_prepare_bpf_trampoline`, 306
+//! lines of assembly emission (`bpf_jit_comp.c:3211`) — because it patches
+//! machine code into an arbitrary kernel function's `__fentry__` nop. At that
+//! seam there is no C, let alone Rust, to interpose: the trampoline *is* the
+//! adapter, and it has to spill the native arguments into a stack array by
+//! hand because nothing else can.
+//!
+//! NARF's struct_ops targets are `PLUGGABILITY.md` trait slots with a
+//! **Rust-level install point**, so the adapter is an ordinary `impl` of the
+//! trait. It builds the context tuple from its own typed arguments and calls
+//! [`BpfProg::run_atomic`], which already owns frame acquisition and — when the
+//! program compiled — the native call. Nothing needs generating.
+//!
+//! This is the clearest case in the subsystem of the clean-slate framing paying
+//! off: the work is not done more cheaply than Linux, it is *absent*, because
+//! the attach mechanism was chosen to be one a host language can express.
+//! The generated impl below is what Linux spends a code generator on.
 
 use alloc::vec::Vec;
 
@@ -121,6 +133,21 @@ impl ProgSet {
     #[must_use]
     pub fn bindings(&self) -> &[Binding] {
         &self.bindings
+    }
+
+    /// The program bound to `method`, if any.
+    ///
+    /// Linear scan. A struct_ops trait has a handful of methods, so this beats
+    /// a map on both allocation and cache behaviour — and it must not allocate,
+    /// because a dispatch may happen in a context where the global allocator is
+    /// off limits (spec §4.6). A per-method index is the optimisation if a hot
+    /// slot ever needs it.
+    #[must_use]
+    pub fn get(&self, method: &str) -> Option<&alloc::sync::Arc<BpfProg>> {
+        self.bindings
+            .iter()
+            .find(|b| b.method == method)
+            .map(|b| &b.prog)
     }
 
     /// Whether `method` is bound.
@@ -282,6 +309,7 @@ macro_rules! struct_ops {
         #[cap($cap:ident)]
         #[install($install:ident)]
         #[desc($descname:ident)]
+        #[adapter($descname2:ident)]
         $(#[optional($($optm:ident),* $(,)?)])?
         $vis:vis trait $trait_name:ident {
             $(
@@ -322,6 +350,59 @@ macro_rules! struct_ops {
             #[link_section = "narf.structops"]
             static ENTRY: $crate::structops::StructOpsDesc = $descname;
         };
+
+        #[doc = concat!(
+            "A BPF program set dispatching as [`", stringify!($trait_name), "`]."
+        )]
+        ///
+        /// The adapter Linux generates a trampoline for. Each method packs its
+        /// typed arguments into the context tuple and runs the bound program;
+        /// a method with no program bound falls back to the trait's default,
+        /// which is what `#[optional(...)]` declares.
+        #[derive(Debug)]
+        $vis struct $descname2 {
+            progs: $crate::structops::ProgSet,
+        }
+
+        impl $descname2 {
+            /// Wrap a program set.
+            #[must_use]
+            $vis fn new(progs: $crate::structops::ProgSet) -> Self {
+                Self { progs }
+            }
+        }
+
+        impl $trait_name for $descname2 {
+            $(
+                fn $method (&self $(, $pname : $pty)*) -> $mret {
+                    // The context tuple is the method's own argument list —
+                    // no rewriting layer, because there is no fictional UAPI
+                    // struct to rewrite from (spec §1.6).
+                    #[allow(unused_mut)]
+                    let mut __ctx = [0u64; $crate::interp::MAX_CTX_WORDS];
+                    #[allow(unused_mut)]
+                    let mut __n = 0usize;
+                    $(
+                        if __n < $crate::interp::MAX_CTX_WORDS {
+                            __ctx[__n] =
+                                <$pty as $crate::types::BpfType>::into_raw($pname);
+                            __n += 1;
+                        }
+                    )*
+                    match self.progs.get(stringify!($method)) {
+                        Some(p) => match p.run_atomic(__ctx, __n) {
+                            Some(o) => <$mret as $crate::types::BpfRet>::from_ret(o.value()),
+                            // Declined (nesting limit, no frame) or trapped:
+                            // fall back rather than fabricate a value. A
+                            // policy hook returning nonsense is worse than one
+                            // returning the default.
+                            None => <$mret as $crate::types::BpfRet>::DEFAULT_RET,
+                        },
+                        None => <$mret as $crate::types::BpfRet>::DEFAULT_RET,
+                    }
+                }
+            )*
+        }
 
         #[doc = concat!(
             "Install a BPF program set implementing [`", stringify!($trait_name),

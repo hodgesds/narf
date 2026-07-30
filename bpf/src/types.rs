@@ -627,3 +627,52 @@ unsafe impl<T: 'static> BpfType for &mut MaybeUninit<T> {
         (self as *mut MaybeUninit<T>) as u64
     }
 }
+
+/// A type a struct_ops method may return.
+///
+/// Deliberately narrower than [`BpfType`], which describes what the *verifier*
+/// sees and covers pointer wrappers that have no meaning coming back out of a
+/// program. A struct_ops method returns a decision — a CPU number, a
+/// frequency, a verdict — so scalars and `()` are the whole set, and keeping
+/// them in a separate trait means `BpfType` does not grow a `from_raw` that is
+/// nonsense for most of its implementors.
+pub trait BpfRet: Sized {
+    /// The value used when no program is bound to the method, or when a run is
+    /// declined or traps.
+    ///
+    /// Falling back is the right answer rather than fabricating something: a
+    /// policy hook returning nonsense is worse than one returning the default.
+    const DEFAULT_RET: Self;
+
+    /// Reinterpret a program's R0.
+    fn from_ret(raw: u64) -> Self;
+}
+
+macro_rules! impl_bpf_ret {
+    ($($t:ty),*) => {$(
+        impl BpfRet for $t {
+            const DEFAULT_RET: Self = 0;
+            #[inline]
+            fn from_ret(raw: u64) -> Self {
+                // Truncating is correct: BPF returns a u64 in R0 and a narrower
+                // return type means the upper bits were never meaningful.
+                raw as $t
+            }
+        }
+    )*};
+}
+impl_bpf_ret!(u8, u16, u32, u64, i8, i16, i32, i64);
+
+impl BpfRet for () {
+    const DEFAULT_RET: Self = ();
+    #[inline]
+    fn from_ret(_raw: u64) -> Self {}
+}
+
+impl BpfRet for bool {
+    const DEFAULT_RET: Self = false;
+    #[inline]
+    fn from_ret(raw: u64) -> Self {
+        raw != 0
+    }
+}
