@@ -825,3 +825,58 @@ fn smoke_bpf_verify_rejects_excessive_call_depth() -> TestResult {
     }
 }
 kernel_test_in!("bpf", smoke_bpf_verify_rejects_excessive_call_depth);
+
+// ── integration: the runtime uses the real memory subsystem ─────────
+
+fn smoke_bpf_uses_the_real_percpu_region() -> TestResult {
+    // The two halves of this subsystem were built in parallel and, for a
+    // while, never connected: `memory::bpf_stack` allocated and mapped a
+    // 64 KiB-per-CPU region at boot, nothing called `init`, and every atomic
+    // program ran on a 4 KiB interpreter-only stub instead — while the
+    // verifier was proving programs against a 16 KiB ceiling. A program
+    // needing more than 4 KiB was accepted and then declined at every
+    // invocation.
+    //
+    // `StackFrame::cpu()` is `Some` only for a frame that came from the real
+    // region, so it distinguishes "integrated" from "still on the stub"
+    // without inspecting private state.
+    if !crate::mem::region_ready() {
+        return TestResult::Fail("bpf-percpu-stack initcall did not run");
+    }
+    use crate::mem::BpfStack;
+    let Some(frame) = crate::mem::PerCpuRegion.acquire(64) else {
+        return TestResult::Fail("the real per-CPU region declined a 64-byte frame");
+    };
+    if frame.cpu().is_none() {
+        return TestResult::Fail("frame did not come from the per-CPU region");
+    }
+    if frame.len() != 64 {
+        return TestResult::Fail("wrong frame length");
+    }
+    drop(frame);
+
+    // And a program actually runs on it.
+    let insns = asm(&[st_imm(10, -8, 0x5A), ldx(0, 10, -8), EXIT]);
+    let Ok(p) = load("region", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected a stack round-trip");
+    };
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Returned(0x5A)) => TestResult::Pass,
+        Some(Outcome::Returned(_)) => TestResult::Fail("stack round-trip returned wrong value"),
+        Some(Outcome::Trapped(_)) => TestResult::Fail("program trapped on the real region"),
+        None => TestResult::Fail("the real region declined the program"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_uses_the_real_percpu_region);
+
+fn smoke_bpf_verified_ceiling_fits_the_real_region() -> TestResult {
+    // The sizing agreement that was silently broken: whatever the verifier
+    // accepts must fit in a real per-CPU frame, or a verified program is
+    // declined at run time rather than rejected at load.
+    let per_level = narf_memory::bpf_stack::bytes_per_level();
+    if per_level < u64::from(narf_bpf_verifier::MAX_STACK_BYTES) {
+        return TestResult::Fail("per-CPU frame is smaller than the verifier's ceiling");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_verified_ceiling_fits_the_real_region);

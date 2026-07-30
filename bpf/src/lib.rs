@@ -86,6 +86,48 @@ pub fn register_initcalls() {
             Err(_) => InitResult::Error("malformed kfunc descriptor"),
         },
     );
+    // The per-CPU BPF stack region. `memory::bpf_stack` allocates and maps it,
+    // but nothing was calling `init`, so the region existed and had no users
+    // and every atomic program ran on the interpreter-only stub instead. This
+    // is the seam that connects the two halves of the subsystem.
+    //
+    // `Subsys` and after `bpf-kfunc-registry` because it needs
+    // `bpf_text::slots_reserved()`, which `bare_main` establishes before any
+    // initcall runs.
+    narf_init::register(Stage::Subsys, "bpf-percpu-stack", || {
+        let cpus = narf_lib::smp::cpu_count().max(1) as usize;
+        match narf_memory::bpf_stack::init(cpus) {
+            Ok(()) => InitResult::Ok,
+            // Not fatal: `run_atomic` falls back to the stub, which declines
+            // any program needing more than its much smaller frame. Degraded
+            // rather than unsafe.
+            Err(_) => InitResult::Error("bpf per-CPU stack region unavailable"),
+        }
+    });
+    // Program-text reclamation. `narf-memory` cannot depend on `narf-rcu`
+    // (the graph already runs rcu -> time -> console -> memory), so freeing
+    // JIT text quarantines it and defers the actual reclaim through this hook.
+    // Without it, freed text is quarantined forever.
+    narf_memory::bpf_text::install_reclaim_hook(|alloc| {
+        // `retire_box` frees the box after a grace period, so wrapping the
+        // allocation in a type whose `Drop` reclaims it is how a *deferred
+        // action* is expressed with the RCU API this tree has. A CPU may still
+        // be executing the text when `free` is called; only the grace period
+        // establishes that none is.
+        narf_rcu::retire_box(alloc::boxed::Box::new(ReclaimOnGracePeriod(Some(alloc))));
+    });
+}
+
+/// Reclaims a text allocation when dropped, which `narf_rcu::retire_box`
+/// arranges to happen after a grace period.
+struct ReclaimOnGracePeriod(Option<narf_memory::bpf_text::TextAlloc>);
+
+impl Drop for ReclaimOnGracePeriod {
+    fn drop(&mut self) {
+        if let Some(a) = self.0.take() {
+            narf_memory::bpf_text::reclaim(a);
+        }
+    }
 }
 
 /// A short one-line summary of the subsystem's state, for the boot log and

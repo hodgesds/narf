@@ -66,6 +66,17 @@ pub struct StackFrame<'a> {
     /// program) and clearing a flag whose cell was still live, handing the
     /// same `&mut [u8]` out twice.
     release: Option<(fn(usize), usize)>,
+    /// The real per-CPU region's lease, when this frame came from
+    /// `memory::bpf_stack` rather than from the interpreter-only stub.
+    ///
+    /// Held rather than released explicitly: `StackLease` has its own `Drop`
+    /// which returns the nesting level with IRQs masked and asserts it is
+    /// dropped on the CPU it was taken on. Owning it here is what makes the
+    /// runtime actually *use* the memory subsystem — the two halves of this
+    /// subsystem were built in parallel and, until this, never connected: the
+    /// region was allocated and mapped at boot and had no callers outside its
+    /// own smokes.
+    lease: Option<narf_memory::bpf_stack::StackLease>,
     /// `*mut ()` is the standard way to opt out of `Send`/`Sync` without the
     /// unstable `negative_impls`. Never dereferenced.
     _not_send: core::marker::PhantomData<*mut ()>,
@@ -90,6 +101,20 @@ impl StackFrame<'_> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
+    }
+
+    /// The CPU whose per-CPU region backs this frame, if any.
+    ///
+    /// `None` for the interpreter-only stub and for a sleepable program's heap
+    /// stack. Exists so a caller can assert it is still on the CPU it started
+    /// on — and so the lease is *read* rather than only held: its release runs
+    /// in `StackLease::drop`, which the compiler cannot see as a use.
+    #[inline]
+    #[must_use]
+    pub fn cpu(&self) -> Option<usize> {
+        self.lease
+            .as_ref()
+            .map(narf_memory::bpf_stack::StackLease::cpu)
     }
 }
 
@@ -196,9 +221,70 @@ impl BpfStack for PerCpuStackStub {
         Some(StackFrame {
             bytes: frame,
             release: Some((release_cpu, cpu)),
+            lease: None,
             _not_send: core::marker::PhantomData,
         })
     }
+}
+
+/// The real per-CPU BPF stack, from `memory::bpf_stack`.
+///
+/// This is the provider atomic programs use once `memory::bpf_stack::init` has
+/// run at boot. [`PerCpuStackStub`] remains for `run_unverified` and for the
+/// window before `init`, and is deliberately much smaller so that a program
+/// verified against the real ceiling cannot silently fall back to it.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PerCpuRegion;
+
+/// Invocations declined because the region was not initialised or was full.
+static REGION_DECLINED: AtomicUsize = AtomicUsize::new(0);
+
+impl BpfStack for PerCpuRegion {
+    fn acquire(&self, bytes: usize) -> Option<StackFrame<'_>> {
+        let lease = narf_memory::bpf_stack::try_enter().or_else(|| {
+            REGION_DECLINED.fetch_add(1, Ordering::Relaxed);
+            None
+        })?;
+        if (bytes as u64) > lease.len() {
+            // Dropping the lease here releases the nesting level; returning
+            // None makes the caller decline the program rather than run it on
+            // a frame smaller than the verifier proved it needs.
+            REGION_DECLINED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        // R10 starts at `top` and grows down, so the usable frame is the
+        // `bytes` immediately below it.
+        let base = lease.top() - bytes as u64;
+        // SAFETY: `[top - len, top)` is a distinct nesting level of this CPU's
+        // BPF stack region, mapped RW at boot by `bpf_stack::init` and leased
+        // exclusively to this activation until the `StackLease` we hold is
+        // dropped. `StackLease` is `!Send` and asserts it is released on the
+        // CPU that took it, and `StackFrame` is `!Send` for the same reason,
+        // so no other CPU or nesting level can alias these bytes.
+        let frame = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, bytes) };
+        frame.fill(0);
+        Some(StackFrame {
+            bytes: frame,
+            release: None,
+            lease: Some(lease),
+            _not_send: core::marker::PhantomData,
+        })
+    }
+}
+
+/// Invocations the real per-CPU region has declined.
+#[must_use]
+pub fn region_declined_count() -> usize {
+    REGION_DECLINED.load(Ordering::Relaxed)
+}
+
+/// Whether the real per-CPU region is available.
+///
+/// `false` before `memory::bpf_stack::init` runs, which is why the stub still
+/// exists.
+#[must_use]
+pub fn region_ready() -> bool {
+    narf_memory::bpf_stack::ready()
 }
 
 /// How many invocations the per-CPU stub has declined (nesting or oversize).
@@ -256,6 +342,7 @@ impl BpfStack for HeapStack {
         Some(StackFrame {
             bytes: frame,
             release: None,
+            lease: None,
             // A heap stack is owned by the future and is not per-CPU, so it
             // would be safe to move. It inherits `!Send` anyway rather than
             // splitting the type — a sleepable program's frame moving between

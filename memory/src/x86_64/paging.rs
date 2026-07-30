@@ -213,7 +213,14 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
     // Fail loudly here instead, so a future reordering of `bare_main` shows up
     // as an assertion naming the cause rather than as a dead machine.
     // See `bpf/specification/spec.md` §4.1.
-    debug_assert!(
+    //
+    // `assert!`, not `debug_assert!`: `[profile.release]` does not enable
+    // debug assertions and this tree builds `--release`, so a debug assertion
+    // here would be absent from every kernel anyone actually boots — guarding
+    // exactly nothing in the configuration that matters. The cost is one
+    // relaxed load per address-space creation, against a failure mode that is
+    // a triple fault with no output.
+    assert!(
         crate::bpf_text::slots_reserved(),
         "new_user_pml4_on ran before bpf_text::reserve_kernel_slots(); \
          PML4[256..511] is snapshot-copied by value, so the BPF windows would \

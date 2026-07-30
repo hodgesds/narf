@@ -12,7 +12,7 @@ use narf_bpf_verifier::{VerifyError, DEFAULT_FUEL, MAX_STACK_BYTES};
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
 
 use crate::interp::{Outcome, Vm, MAX_CTX_WORDS};
-use crate::mem::{BpfStack, HeapStack, PerCpuStackStub, STUB_STACK_BYTES};
+use crate::mem::{BpfStack, HeapStack, PerCpuRegion, PerCpuStackStub, STUB_STACK_BYTES};
 
 /// Authority to load and verify a BPF program.
 ///
@@ -240,8 +240,17 @@ impl BpfProg {
         if self.context != Context::Atomic {
             return None;
         }
-        let provider = PerCpuStackStub;
-        let frame = provider.acquire(self.stack_bytes as usize)?;
+        // Prefer the real per-CPU region; fall back to the stub only before
+        // `memory::bpf_stack::init` has run. The fallback is deliberately
+        // small, so a program verified against the real ceiling is *declined*
+        // rather than silently run on a frame smaller than it was proved to
+        // need — the two sizes disagreeing silently is what the stub-only path
+        // used to do (4 KiB stub against a 16 KiB verified ceiling).
+        let frame = if crate::mem::region_ready() {
+            PerCpuRegion.acquire(self.stack_bytes as usize)?
+        } else {
+            PerCpuStackStub.acquire(self.stack_bytes as usize)?
+        };
         let registry = crate::kfunc::registry()?;
         let mut vm = Vm::new(
             crate::interp::VmProgram {
