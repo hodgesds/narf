@@ -506,12 +506,33 @@ impl Stack {
     /// program actually initialised the whole range, which it had to execute
     /// stores to do. A range with any uninitialised slot bails at that slot,
     /// and an absent slot is uninitialised by construction.
+    ///
+    /// A range that is not a frame range at all answers **false**. Every caller
+    /// bounds `off` and `len` against the frame before asking, so this is
+    /// unreachable — but it is worth spelling out, because the previous
+    /// byte-wise form answered *true* for one: `len as i64` on a `u64` near
+    /// `u64::MAX` is negative, `off..off + negative` is empty, and `all` on an
+    /// empty iterator is vacuously true. "Everything is initialised" is the
+    /// wrong direction for this function to be wrong in, whatever the caller
+    /// does.
     #[must_use]
     pub fn is_initialized(&self, off: i64, len: u64) -> bool {
         if len == 0 {
             return true;
         }
-        let end = off + len as i64;
+        let Ok(len) = i64::try_from(len) else {
+            return false;
+        };
+        let Some(end) = off.checked_add(len) else {
+            return false;
+        };
+        // Offsets are negative and measured down from R10; `end == 0` is the
+        // byte just below it and is in range, `end > 0` is not. The floor is
+        // not merely tidiness — `slot_index` negates its argument, so
+        // `i64::MIN` panics the verifier rather than answering anything.
+        if off >= 0 || end > 0 || off < -i64::from(crate::MAX_STACK_BYTES) {
+            return false;
+        }
         // Slot indices count upwards as offsets go down, so the last byte names
         // the first slot.
         let first = Stack::slot_index(end - 1);

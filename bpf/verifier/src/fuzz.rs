@@ -811,3 +811,25 @@ fn an_empty_range_is_initialised_and_a_whole_frame_range_is_not() {
         "an untouched frame has nothing initialised"
     );
 }
+
+#[test]
+fn a_range_that_is_not_a_frame_range_answers_false() {
+    // Fail-closed on nonsense, because the natural implementation fails *open*
+    // on it: the byte-wise form this replaced computed `off + len as i64`,
+    // which for a `len` near `u64::MAX` is negative, giving an empty iterator
+    // and a vacuous `true` — "every byte in this range is initialised" for a
+    // range that does not exist.
+    //
+    // A fully written frame is used so the answer cannot come from the bytes
+    // being uninitialised; only the range check can produce it.
+    let mut s = Stack::default();
+    for i in 0..8 {
+        s.write(-8 * (i + 1), Size::Dw, AbsValue::UNKNOWN_SCALAR);
+    }
+    assert!(s.is_initialized(-64, 64), "the frame really is written");
+    assert!(!s.is_initialized(-8, u64::MAX), "a wrapping length");
+    assert!(!s.is_initialized(-8, i64::MAX as u64 + 1), "past i64");
+    assert!(!s.is_initialized(i64::MIN, 8), "an offset that cannot add");
+    assert!(!s.is_initialized(8, 8), "above the frame pointer");
+    assert!(!s.is_initialized(-8, 16), "running past the frame pointer");
+}
