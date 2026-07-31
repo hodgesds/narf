@@ -3297,6 +3297,22 @@ impl FileOps for PerfEventFile {
                 Ok(0)
             }
             PERF_EVENT_IOC_SET_BPF => {
+                // Privilege gate, before anything else — spec §4.10's "one
+                // privilege regime" covers *running* a program, not just
+                // loading one, and this is the other way to make one run.
+                //
+                // Without it a prog fd that leaves its root loader — inherited
+                // across `fork` (FD_CLOEXEC is only consumed on the exec path)
+                // or passed deliberately over SCM_RIGHTS — let any task attach
+                // it to a tracepoint it opened (`perf_event_open` takes no
+                // credential) and then fire it at will: each drain runs up to
+                // `DEFAULT_FUEL` instructions with IRQs masked and two locks
+                // held. The clear arm below is gated too, or an unprivileged
+                // holder of the *event* fd could silently remove a filter a
+                // privileged task installed.
+                if !crate::handlers::task_may_use_bpf() {
+                    return Err(FsError::PermissionDenied);
+                }
                 // `arg` is a BPF program fd. Same shape as SET_OUTPUT above:
                 // resolve it in the caller's table and downcast.
                 if arg == usize::MAX || arg == u32::MAX as usize {

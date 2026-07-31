@@ -387,6 +387,78 @@ fn smoke_abi_perf_set_bpf_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_perf_set_bpf_neg);
 
+/// `SET_BPF` is an entry point into running a BPF program, so it takes the same
+/// privilege gate `bpf(2)` does.
+///
+/// It did not. `bpf(2)` checks euid on every command, but `perf_event_open`
+/// takes no credential at all and this ioctl took none either — so a program fd
+/// that left its privileged loader, inherited across `fork` (`FD_CLOEXEC` is
+/// consumed only on the exec path) or passed deliberately over `SCM_RIGHTS`,
+/// let an unprivileged task attach it to a tracepoint it opened and then fire
+/// it at will. Each fire runs up to `DEFAULT_FUEL` instructions from the perf
+/// drain with IRQs masked and two locks held.
+///
+/// Both arms are gated, and both are checked here: the *clear* arm matters
+/// independently, because without it any holder of the event fd could silently
+/// remove a filter a privileged task installed.
+fn smoke_abi_perf_set_bpf_requires_privilege() -> TestResult {
+    with_setup(|| {
+        // Set up privileged, exactly as the legitimate loader would.
+        let insns = ret_imm(1);
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &insns).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a filter program");
+        }
+        let ev = open_tracepoint_event().ok_or("could not open a tracepoint event")?;
+
+        // Drop privilege. The fds survive — that is the whole point.
+        //
+        // LINUX-GAP: Linux returns EPERM here — `perf_allow_tracepoint()`
+        // (include/linux/perf_event.h) is `-EPERM`, distinct from
+        // `perf_allow_cpu()`'s `-EACCES`. NARF reports EACCES, because
+        // `sys_ioctl` maps every `FsError::PermissionDenied` to `-13` and
+        // `FsError` has no variant that reaches EPERM through that path.
+        // Asserted as EACCES rather than left unpinned, so the divergence is a
+        // recorded fact and a future `FsError` split flips this one line
+        // instead of discovering the gap. The refusal itself — which is the
+        // security property — is identical either way.
+        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, prog_fd as u64),
+        ) != Some(EACCES)
+        {
+            return Err("unprivileged SET_BPF was not refused");
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, u64::from(u32::MAX)),
+        ) != Some(EACCES)
+        {
+            return Err("unprivileged SET_BPF clear was not refused");
+        }
+
+        // Privileged again: the same calls work, so this is a privilege gate
+        // and not a blanket refusal.
+        crate::handlers::__test_set_fsids(FAKE_TASK, 0, 0);
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, prog_fd as u64),
+        ) != Some(0)
+        {
+            return Err("privileged SET_BPF was refused");
+        }
+        let _ = call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, u64::from(u32::MAX)),
+        );
+        let _ = call(Syscall::Close.raw(), a0(ev as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_perf_set_bpf_requires_privilege);
+
 fn smoke_abi_perf_set_bpf_wrong_event_type() -> TestResult {
     // NARF wires only the tracepoint type to its trace events, so attaching to
     // anything else would install a program that could never run — a silently

@@ -7624,6 +7624,21 @@ fn read_uidgid(task: u64) -> UidGid {
         .unwrap_or_default()
 }
 
+/// Whether the calling task may reach BPF at all.
+///
+/// Spec §4.10 is "one privilege regime": there is no unprivileged BPF mode and
+/// no second set of limits, so *every* entry point that can load, attach, or
+/// cause a program to run asks this one question.
+///
+/// It lives here rather than in `sys_bpf.rs` because `bpf(2)` is not the only
+/// such entry point — `PERF_EVENT_IOC_SET_BPF` installs a program on a perf
+/// event and the drain then runs it — and a gate that each entry point restates
+/// for itself is a gate one of them will forget. `perf_event_open` needs no
+/// credential of its own, so this is where the regime is enforced for that path.
+pub(crate) fn task_may_use_bpf() -> bool {
+    read_uidgid(current_task_id()).euid == 0
+}
+
 /// The calling task's socket credentials (`struct ucred` shape): its
 /// visible pid plus effective uid/gid. Stamped onto every socket end at
 /// creation so `SO_PEERCRED` / `SCM_CREDENTIALS` report a real identity.

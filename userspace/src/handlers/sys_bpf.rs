@@ -145,7 +145,7 @@ fn u64_at(buf: &[u8], off: usize) -> u64 {
 /// Deliberately checks per-task credential state rather than a capability the
 /// syscall mints for itself. See the call site for why.
 fn task_may_load_bpf() -> bool {
-    super::read_uidgid(super::current_task_id()).euid == 0
+    super::task_may_use_bpf()
 }
 
 pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
