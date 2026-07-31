@@ -454,6 +454,45 @@ impl Stack {
         }
     }
 
+    /// Record a store that certainly landed somewhere inside `[lo, hi)` but
+    /// whose exact offset is unknown.
+    ///
+    /// What a *maybe*-write does to a slot is the whole content of this
+    /// function, and it is not what either [`Stack::write`] or
+    /// [`Stack::write_unspecified`] does:
+    ///
+    ///   * any spilled value dies. After the store the slot holds either what
+    ///     it held before or what was just written, and "either of two things"
+    ///     is not a value this domain can spell — so it records none.
+    ///   * the initialisation bits are left **exactly** as they were. The store
+    ///     cannot *define* a byte, because it may not have landed on that byte;
+    ///     and it cannot *undefine* one, because a byte that was already
+    ///     written is still written whether or not this store touched it.
+    ///
+    /// Setting the init bits here would be the unsound direction and is worth
+    /// naming: it would let `*(u64 *)(r1 + 0) = 0` at an unknown offset stand
+    /// in for initialising the whole range, and a later read would be admitted
+    /// against bytes nothing wrote.
+    ///
+    /// Slots with no entry are already `EMPTY` — nothing initialised, no
+    /// value — which is what this would write to them, so they are skipped and
+    /// a store spanning a wide range stays proportional to the slots actually
+    /// in use rather than to the range.
+    pub fn write_maybe(&mut self, lo: i64, hi: i64) {
+        debug_assert!(lo < hi, "an empty maybe-write range is a caller bug");
+        // `lo` is the lowest address the store could reach, so it is what the
+        // frame has to be deep enough for.
+        self.note_depth(lo);
+        // Slot indices count *upwards* as offsets go down, so the range runs
+        // from the highest address to the lowest.
+        let first = Stack::slot_index(hi - 1);
+        let last = Stack::slot_index(lo);
+        for (_, s) in self.slots.range_mut(first..=last) {
+            s.whole = false;
+            s.value = AbsValue::NotInit;
+        }
+    }
+
     /// Whether every byte in `[off, off + len)` has been written.
     #[must_use]
     pub fn is_initialized(&self, off: i64, len: u64) -> bool {

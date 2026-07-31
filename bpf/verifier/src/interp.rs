@@ -40,11 +40,40 @@ use crate::domain::{
 /// to allow.
 pub const STACK_BYTES: usize = crate::MAX_STACK_BYTES as usize;
 
+/// Address of the context tuple, when a machine is given one.
+///
+/// Chosen to be nowhere near the stack, which occupies `[0, STACK_BYTES)`, so
+/// that "which region is this address in" is a comparison rather than a
+/// convention. A machine from [`Machine::new`] has no context and leaves R1 at
+/// zero, exactly as before this region existed.
+///
+/// The context is what a differential test uses to make a value the *verifier*
+/// cannot pin — the abstract domain knows only that a context field is some
+/// `u64`. Without it every register in a generated program traces back to an
+/// immediate, so the verifier constant-folds the whole thing and the interesting
+/// transfer functions (a bounded-but-unknown index, in particular) are never
+/// reached.
+pub const CTX_BASE: u64 = 1 << 32;
+
 /// Why a concrete run stopped early.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Trap {
     /// A load or store left the stack region.
     BadAccess,
+    /// A load read a stack byte no store in this run had written.
+    ///
+    /// Not something a real machine reports — the bytes are simply whatever
+    /// was there. It is here because the *verifier* claims a program never
+    /// does it ([`crate::VerifyError::UninitStack`]), and a claim with no
+    /// concrete counterpart is a claim nothing tests.
+    ///
+    /// This is the differential counterpart to `Stack`'s per-byte `init`
+    /// bits, and it is the only way to catch an abstract write that marks
+    /// bytes defined which the concrete store never touched — the exact
+    /// failure mode a variable-offset store invites, because the abstract
+    /// range covers many bytes and the concrete store covers one width's
+    /// worth somewhere inside it.
+    UninitRead,
     /// Control left the program.
     BadPc,
     /// A construct the reference interpreter does not model (calls, maps).
@@ -61,6 +90,16 @@ pub struct Machine {
     pub regs: [u64; 11],
     /// The stack, addressed as `R10 + off` for `off` in `-STACK_BYTES..0`.
     pub stack: Vec<u8>,
+    /// The context tuple, as little-endian bytes at [`CTX_BASE`]. Empty unless
+    /// the machine was built with one.
+    pub ctx: Vec<u8>,
+    /// Which stack bytes a store in this run has written.
+    ///
+    /// A shadow, not part of the machine: the concrete stack is zeroed at
+    /// construction and a real one is not, so "reads as zero" is not the same
+    /// question as "was written". Keeping the two separate is what lets
+    /// [`Trap::UninitRead`] mean something.
+    pub defined: Vec<bool>,
     /// Remaining fuel.
     pub fuel: u64,
 }
@@ -83,8 +122,44 @@ impl Machine {
         Machine {
             regs,
             stack: vec![0u8; STACK_BYTES],
+            ctx: Vec::new(),
+            defined: vec![false; STACK_BYTES],
             fuel: 1 << 20,
         }
+    }
+
+    /// A machine whose R1 points at a context tuple of these words.
+    ///
+    /// The words are the *only* input to a generated program that the verifier
+    /// cannot see through, so this is what turns a differential test from
+    /// "does this constant-folded program still work" into "does this hold for
+    /// every value the index could take".
+    #[must_use]
+    pub fn with_ctx(words: &[u64]) -> Machine {
+        let mut m = Machine::new();
+        m.ctx = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        m.regs[1] = CTX_BASE;
+        m
+    }
+
+    /// Read from the context, if `addr` names it.
+    ///
+    /// `None` means "not a context address", which is how the caller knows to
+    /// try the stack. A context address that is out of range is a trap rather
+    /// than a fallthrough — landing in the stack because the context read
+    /// overran would make a bug look like a success.
+    fn ctx_load(&self, addr: u64, size: Size) -> Option<Result<u64, Trap>> {
+        if addr < CTX_BASE {
+            return None;
+        }
+        let off = (addr - CTX_BASE) as usize;
+        let n = size.bytes() as usize;
+        let Some(end) = off.checked_add(n).filter(|&e| e <= self.ctx.len()) else {
+            return Some(Err(Trap::BadAccess));
+        };
+        let mut buf = [0u8; 8];
+        buf[..n].copy_from_slice(&self.ctx[off..end]);
+        Some(Ok(u64::from_le_bytes(buf)))
     }
 
     fn slot(&self, addr: u64, size: Size) -> Result<usize, Trap> {
@@ -98,16 +173,32 @@ impl Machine {
     }
 
     fn load(&self, addr: u64, size: Size) -> Result<u64, Trap> {
+        if let Some(v) = self.ctx_load(addr, size) {
+            return v;
+        }
         let i = self.slot(addr, size)?;
+        let n = size.bytes() as usize;
+        if !self.defined[i..i + n].iter().all(|&d| d) {
+            return Err(Trap::UninitRead);
+        }
         let mut buf = [0u8; 8];
-        buf[..size.bytes() as usize].copy_from_slice(&self.stack[i..i + size.bytes() as usize]);
+        buf[..n].copy_from_slice(&self.stack[i..i + n]);
         Ok(u64::from_le_bytes(buf))
     }
 
     fn store(&mut self, addr: u64, size: Size, v: u64) -> Result<(), Trap> {
+        // The context is read-only to a BPF program — the verifier marks it so
+        // — and this machine models no writable region but the stack. A store
+        // there is a trap rather than a silent fallthrough into stack indices,
+        // which is what the arithmetic would otherwise produce.
+        if addr >= CTX_BASE {
+            return Err(Trap::BadAccess);
+        }
         let i = self.slot(addr, size)?;
+        let n = size.bytes() as usize;
         let bytes = v.to_le_bytes();
-        self.stack[i..i + size.bytes() as usize].copy_from_slice(&bytes[..size.bytes() as usize]);
+        self.stack[i..i + n].copy_from_slice(&bytes[..n]);
+        self.defined[i..i + n].fill(true);
         Ok(())
     }
 }

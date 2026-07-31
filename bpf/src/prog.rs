@@ -239,11 +239,20 @@ impl BpfProg {
                 subprogs = v.subprogs;
                 v.max_stack_bytes.max(1)
             }
-            // Phase 2 is not here yet: the abstract interpreter reports
-            // `NotImplemented` for everything it decoded successfully. Fall
-            // through to `provisional`, which is a *structural* check plus the
-            // interpreter's runtime bounds checks — see that module for why
-            // this is not fail-open.
+            // The abstract interpreter is live, so this arm no longer catches
+            // "everything" — it catches the two constructs `narf-bpf-verifier`
+            // still declines to reason about, both `LD_IMM64` pseudo-forms: a
+            // BTF-id kernel-variable address, and a subprogram address taken as
+            // a value for a callback-style kfunc.
+            //
+            // Worth stating plainly, because the shape is misleading: this
+            // fallthrough currently accepts **nothing**. `provisional` rejects
+            // every non-`Value` `LD_IMM64` itself, so both constructs are
+            // rejected either way — and `interp.rs` cannot execute either one,
+            // so an acceptance here would produce a program that traps on its
+            // first run. Reaching `provisional` is not the same as being
+            // admitted by it, and the difference is the whole of why this is
+            // not fail-open.
             Err(VerifyError::NotImplemented(_)) => {
                 crate::provisional::accept(&req.insns, req.context, registry)
                     .map_err(LoadError::Rejected)?;

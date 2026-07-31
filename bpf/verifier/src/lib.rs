@@ -329,6 +329,20 @@ pub enum VerifyError {
     /// A `LD_IMM64` map-value pseudo-form whose offset is outside the map's
     /// value.
     MapValueOffset { at: u32, off: i32, size: u32 },
+    /// An address-space cast naming a pair of address spaces that has no
+    /// meaning.
+    ///
+    /// Address space 1 is the arena and 0 is the kernel; the only two casts
+    /// that exist are between them. Anything else is a *malformed* instruction
+    /// rather than an unimplemented one — there is no construct to implement,
+    /// because nothing generates the encoding and nothing could execute it.
+    ///
+    /// Reported separately from [`VerifyError::NotImplemented`] because the two
+    /// mean opposite things to a caller: `NotImplemented` says "this program
+    /// might be fine, the verifier just cannot say", and `narf-bpf`'s loader
+    /// answers it by retrying under a weaker structural check. A malformed
+    /// operand must never take that path, however that path is gated in future.
+    BadAddrSpaceCast { at: u32, dst_as: u16, src_as: u16 },
     /// This construct is not implemented yet.
     NotImplemented(&'static str),
 }
