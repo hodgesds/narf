@@ -7179,3 +7179,239 @@ fn smoke_memory_mlock_survives_mprotect() -> TestResult {
 }
 #[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
 kernel_test_in!("memory", smoke_memory_mlock_survives_mprotect);
+
+// ── W^X: the kernel's non-text mappings have no executable alias ────────
+//
+// Before this, `mmu::init_mmu` built every window `PRESENT | WRITABLE |
+// HUGE_PAGE` with no `NO_EXEC`, so every physical frame was aliased RWX at
+// its identity address and again through the higher-half kernel window.
+// Mapping BPF JIT text RX at a private kernel VA therefore bought nothing:
+// the same bytes were executable at two other addresses that anyone with a
+// kernel write could reach. These tests are the reason that claim can now be
+// made, and the reason it will fail loudly if a future edit takes it back.
+
+/// Jump to `alias` under an armed recoverable probe and report what the CPU
+/// did.
+///
+/// The first 14 bytes of `alias` are overwritten with an absolute indirect
+/// jump back to the probe's own recovery label, so the "it was executable
+/// after all" branch lands somewhere safe instead of running whatever
+/// happened to be in the page. A test whose failure mode is an unrecoverable
+/// kernel crash tells you nothing.
+///
+/// # Safety
+/// `alias` must be a writable kernel mapping of a frame the caller owns, at
+/// least 14 bytes long.
+#[cfg(target_arch = "x86_64")]
+unsafe fn probe_fetch_at(alias: u64) -> narf_arch::x86_64::probe::Caught {
+    use core::arch::asm;
+    use narf_arch::x86_64::probe;
+
+    let recovery: u64;
+    // SAFETY: LEA of a local label is always safe.
+    unsafe {
+        asm!(
+            "lea {r}, [66f + rip]",
+            r = out(reg) recovery,
+            options(nostack, preserves_flags),
+        );
+    }
+
+    // `FF 25 00 00 00 00` = `jmp qword ptr [rip + 0]`, followed by the
+    // 8-byte absolute target. Position-independent, so it works for any
+    // distance between the alias and the kernel image — a `jmp rel32` does
+    // not: the identity alias of a buddy frame and a `-2 GiB` kernel label
+    // are almost exactly 2 GiB apart, right on the `i32` boundary.
+    const JMP_INDIRECT: [u8; 6] = [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
+    // SAFETY: per the fn contract, `alias` is a writable mapping of a frame
+    // the caller owns and 14 bytes fit inside it.
+    unsafe {
+        let p = alias as *mut u8;
+        for (i, b) in JMP_INDIRECT.iter().enumerate() {
+            p.add(i).write_volatile(*b);
+        }
+        for (i, b) in recovery.to_le_bytes().iter().enumerate() {
+            p.add(6 + i).write_volatile(*b);
+        }
+    }
+
+    probe::arm(recovery);
+    // SAFETY: either the fetch faults (the probe redirects RIP to `66:`) or
+    // the stub we just wrote jumps to the same label. Both paths converge
+    // with the stack untouched.
+    unsafe {
+        asm!(
+            "jmp {p}",
+            "66:",
+            p = in(reg) alias,
+            options(nostack),
+        );
+    }
+    probe::disarm()
+}
+
+/// Classify what [`probe_fetch_at`] caught, so the three tests below agree on
+/// what "the alias is not executable" means.
+#[cfg(target_arch = "x86_64")]
+fn expect_nx_fault(caught: narf_arch::x86_64::probe::Caught, what: &'static str) -> TestResult {
+    match caught.vector {
+        None => TestResult::Fail(what),
+        Some(14) => {
+            if caught.error_code & (1 << 4) == 0 {
+                TestResult::Fail("faulted, but not on instruction fetch — not NX")
+            } else {
+                TestResult::Pass
+            }
+        }
+        Some(_) => TestResult::Fail("wrong vector caught (not #PF)"),
+    }
+}
+
+/// The load-bearing negative test: a frame the buddy handed out is writable
+/// at its identity alias and **not executable there**.
+///
+/// This is the exact sequence an attacker with an arbitrary-kernel-write
+/// primitive would perform, and it used to succeed at producing runnable
+/// code. If someone drops `NO_EXEC` from `init_mmu`'s leaf flags, or the
+/// 1 GiB → 2 MiB → 4 KiB demotion stops covering the address, this goes red.
+#[cfg(target_arch = "x86_64")]
+fn smoke_identity_alias_of_buddy_frame_is_nx() -> TestResult {
+    use crate::{alloc_frame, free_frame, FrameAllocError};
+
+    let frame = match alloc_frame() {
+        Ok(f) => f,
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    let phys = frame.start_address().raw();
+    if phys >= crate::addr::LOW_IDENTITY_LIMIT {
+        free_frame(frame);
+        return TestResult::Skip("frame is above the low identity map");
+    }
+
+    // SAFETY: `phys` is the identity alias of a frame we exclusively own.
+    let caught = unsafe { probe_fetch_at(phys) };
+    free_frame(frame);
+    expect_nx_fault(caught, "identity alias of a buddy frame was executable")
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_identity_alias_of_buddy_frame_is_nx);
+
+/// The same question asked of the higher-half kernel window, which is the
+/// answer the identity map alone does not give.
+///
+/// `PML4[511]/PDPT[510]` used to be one 1 GiB RWX huge page over physical
+/// 0..1 GiB — precisely where a small machine's buddy allocates — so NXing
+/// only the identity map would have left a complete, equally reachable
+/// replacement alias at `KERNEL_VIRT_BASE + phys`.
+#[cfg(target_arch = "x86_64")]
+fn smoke_kernel_window_alias_of_buddy_frame_is_nx() -> TestResult {
+    use crate::{alloc_frame, free_frame, FrameAllocError};
+    const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+
+    let frame = match alloc_frame() {
+        Ok(f) => f,
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    let phys = frame.start_address().raw();
+    if phys >= (1u64 << 30) {
+        free_frame(frame);
+        return TestResult::Skip("frame is outside the higher-half kernel window");
+    }
+
+    // SAFETY: the kernel window aliases this frame writably and we own it.
+    let caught = unsafe { probe_fetch_at(KERNEL_VIRT_BASE + phys) };
+    free_frame(frame);
+    expect_nx_fault(caught, "kernel-window alias of a buddy frame was executable")
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_kernel_window_alias_of_buddy_frame_is_nx);
+
+/// Positive control for the demotion: the AP trampoline window is still
+/// executable, at 4 KiB granularity, and the page just past it is not.
+///
+/// Without the second half this would pass just as well if the whole first
+/// 2 MiB had been left executable — 256× more RWX than the SIPI vector needs,
+/// at a fixed and famous address.
+#[cfg(target_arch = "x86_64")]
+fn smoke_ap_trampoline_window_is_exactly_executable() -> TestResult {
+    use crate::mmu::{AP_TRAMPOLINE_EXEC_BASE, AP_TRAMPOLINE_EXEC_LEN};
+    use crate::paging::{leaf_flags_at, read_cr3, PtFlags};
+    use crate::VirtAddr;
+
+    // SAFETY: CR3 is readable at CPL=0 and names the live kernel PML4.
+    let cr3 = unsafe { read_cr3() };
+    // SAFETY: the live PML4 is identity-reachable.
+    let inside = unsafe { leaf_flags_at(cr3, VirtAddr::new(AP_TRAMPOLINE_EXEC_BASE)) };
+    let (flags, size) = match inside {
+        Some(v) => v,
+        None => return TestResult::Fail("AP trampoline page is not mapped at all"),
+    };
+    if size != 4096 {
+        return TestResult::Fail("AP trampoline page was not demoted to a 4 KiB leaf");
+    }
+    if flags.contains(PtFlags::NO_EXEC) {
+        return TestResult::Fail("AP trampoline page is NX — APs cannot reach long mode");
+    }
+
+    let past = AP_TRAMPOLINE_EXEC_BASE + AP_TRAMPOLINE_EXEC_LEN;
+    // SAFETY: as above.
+    match unsafe { leaf_flags_at(cr3, VirtAddr::new(past)) } {
+        None => TestResult::Fail("the page past the trampoline window is unmapped"),
+        Some((f, _)) if f.contains(PtFlags::NO_EXEC) => TestResult::Pass,
+        Some(_) => TestResult::Fail("the executable window is wider than the trampoline"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_ap_trampoline_window_is_exactly_executable);
+
+/// The kernel's own text stays executable and its `.bss` does not.
+///
+/// This is what catches a `kernel_exec_phys_range` that resolved to the wrong
+/// linker symbols. A range that is too *small* kills the boot outright and
+/// needs no test; a range that is too *large* boots perfectly well and
+/// quietly restores the RWX alias. Only the `.bss` half notices that.
+#[cfg(target_arch = "x86_64")]
+fn smoke_kernel_text_executable_bss_is_not() -> TestResult {
+    use crate::paging::{leaf_flags_at, read_cr3, PtFlags};
+    use crate::VirtAddr;
+
+    // A genuine `.bss` object — zero-initialised, so the linker cannot fold
+    // it into `.rodata` — written to here so it cannot be optimised away.
+    static BSS_WITNESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    BSS_WITNESS.store(1, core::sync::atomic::Ordering::Relaxed);
+
+    unsafe extern "C" {
+        static __text_start: u8;
+    }
+    let text = core::ptr::addr_of!(__text_start) as u64;
+    let bss = &BSS_WITNESS as *const _ as u64;
+
+    // SAFETY: CR3 is readable at CPL=0 and names the live kernel PML4.
+    let cr3 = unsafe { read_cr3() };
+    // SAFETY: the live PML4 is identity-reachable.
+    let t = unsafe { leaf_flags_at(cr3, VirtAddr::new(text)) };
+    // SAFETY: as above.
+    let b = unsafe { leaf_flags_at(cr3, VirtAddr::new(bss)) };
+
+    match (t, b) {
+        (None, _) => TestResult::Fail("kernel .text is unmapped"),
+        (_, None) => TestResult::Fail("kernel .bss is unmapped"),
+        (Some((tf, _)), Some((bf, _))) => {
+            if tf.contains(PtFlags::NO_EXEC) {
+                return TestResult::Fail("kernel .text is NX — the boot should not have survived");
+            }
+            if !bf.contains(PtFlags::NO_EXEC) {
+                return TestResult::Fail("kernel .bss is executable — the exec range is too wide");
+            }
+            TestResult::Pass
+        }
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_kernel_text_executable_bss_is_not);

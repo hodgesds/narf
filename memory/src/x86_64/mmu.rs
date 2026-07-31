@@ -1,9 +1,16 @@
 //! MMU bring-up and the `console/` §3.1 handoff protocol.
 //!
-//! Stage 1 scope: build our own identity-mapped PML4 covering the
-//! first 4 GiB with 1-GiB huge pages, execute the handoff sequence in
-//! `console/` §3.1, and swap to it. Higher-half migration (`-2 GiB`
-//! kernel) is a Wave 2 follow-on.
+//! Builds the kernel's final PML4 — low identity map, high MMIO window,
+//! optional high-half direct map, and the `-2 GiB` kernel window — executes
+//! the handoff sequence in `console/` §3.1, and swaps CR3 to it.
+//!
+//! **Every leaf is `NO_EXEC` except the two ranges something demonstrably
+//! fetches from.** That is what makes an RX mapping elsewhere in the address
+//! space (BPF JIT text, most obviously) mean anything at all: before it, the
+//! same physical bytes were writable *and* executable at their identity
+//! address and again through the kernel window. The exceptions and how they
+//! were derived are on [`kernel_exec_phys_range`] and
+//! [`AP_TRAMPOLINE_EXEC_BASE`].
 //!
 //! The handoff sequence, verbatim from `console/` §3.1:
 //!

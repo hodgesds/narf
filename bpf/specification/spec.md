@@ -37,11 +37,15 @@ lowering of sleepable programs (§8.5).
    kinds of call.
 2. **Programs are hostile.** Every guarantee is enforced, never assumed.
 3. **`alloc` is available**, but a *running* program may not use it — see §4.6.
-4. **The kernel address space is currently RWX.** `memory/src/x86_64/mmu.rs`
-   maps the low identity window `PRESENT | WRITABLE | HUGE_PAGE` with no
-   `NO_EXEC`, and there is no huge-page demote helper. JIT text mapped RX at
-   its own VA is therefore *simultaneously aliased RWX* through the identity
-   map. See §4.2 — this is stated as a limitation, not claimed as a boundary.
+4. **The kernel address space is NX outside kernel text, but not read-only.**
+   `memory/src/x86_64/mmu.rs` now builds every window — low identity, high
+   MMIO, kernel direct map, and the higher-half kernel window — with
+   `NO_EXEC`, demoting 1 GiB leaves to 2 MiB and 4 KiB where a narrower
+   exception is needed; `frame/src/aarch64/boot.S` does the same with
+   `PXN|UXN`. The only executable ranges are `[__kernel_start, __text_end)`
+   and the 8 KiB AP-trampoline window at physical `0x8000`. JIT text is
+   therefore no longer *aliased RWX* — but the alias is still **writable**,
+   so an arbitrary kernel write can still overwrite live JIT text. See §4.2.
 5. **BPF kernel-VA slots must exist before the first user address space.**
    `new_user_pml4_on` (`memory/src/x86_64/paging.rs:239`) snapshot-copies
    PML4[256..511] *by value*, and nothing propagates later changes. See §4.1.
@@ -186,13 +190,19 @@ call from `bare_main.rs` after MMU init, *not* a staged initcall. A
 `debug_assert` in `new_user_pml4_on` checks both slots are present so a future
 reordering fails loudly.
 
-**4.2 — JIT text is mapped RX at its own VA, and this is not yet a security
-boundary.** Per assumption 2.4 the identity map aliases the same frames RWX.
-The RX mapping is still correct and worth doing, but W^X for kernel text is
-incomplete until the identity map is demoted to NX (tracked; §8.6).
-Consequence: the RW→RX publish writes *through the identity alias*. Do **not**
-build Linux's temporary-alias mechanism — it exists because Linux's direct map
-is NX, and here it would add attack surface for nothing.
+**4.2 — JIT text is mapped RX at its own VA, and it is a *partial* security
+boundary: no executable alias, but still a writable one.** Per assumption 2.4
+every kernel window is NX apart from kernel text and the AP trampoline, so the
+pack's frames are aliased RW+NX and the bytes are executable at exactly one
+address. What that buys: an attacker with an arbitrary kernel write can no
+longer turn heap, stack or buddy memory into code anywhere in the kernel. What
+it does not buy: the same attacker can still overwrite the pack's bytes
+through the alias, and they are live text. Strict W^X for JIT text is
+therefore still incomplete — see §8.6 for exactly what is missing.
+
+Consequence for the code: the RW→RX publish still writes *through the alias*,
+so no `text_poke_copy` equivalent exists. That stays true only while the alias
+is writable; §8.6's item 1 and item 2 have to land together.
 
 **4.3 — Extable registration precedes execution.** Every faulting instruction
 the JIT emits has an `ExEntry` registered *before* `seal()` publishes the text
@@ -349,8 +359,34 @@ and the perf event layer, all of which are closed.
    ones via `struct_ops_for!(path::Trait { … })`.
 5. **Continuation-style JIT lowering for sleepable programs**, replacing "
    sleepable ⇒ interpreted".
-6. **Demoting the low identity map to NX**, which is what would make §4.2 an
-   actual W^X boundary. Needs a huge-page demote helper that does not exist.
+6. **Making JIT text unwritable, not merely un-aliased-executable.** The first
+   half of this is **done**: `mmu::init_mmu` and `frame/src/aarch64/boot.S`
+   build every kernel window NX/`PXN|UXN` except `[__kernel_start,
+   __text_end)` and the AP-trampoline window, demoting 1 GiB → 2 MiB → 4 KiB
+   at boot so those exceptions are stated at the granularity they need. The
+   demotion is built *before* the CR3/`sctlr_el1` handoff, so it never splits
+   a live mapping. `memory/src/tests.rs` pins it: a buddy frame written
+   through its identity alias and through the higher-half kernel window is
+   proved to `#PF` with the instruction-fetch bit set, and the AP-trampoline
+   window is proved executable at 4 KiB granularity with the next page NX.
+
+   What is left is the *writable* half, which the NX work does not touch:
+
+   1. **`seal` must make the pack's alias read-only.** That is a split of a
+      **live** identity leaf (the pack's frames can be anywhere in RAM), so
+      unlike the boot-time demotion it needs a shootdown — `tlb_shootdown.rs`
+      `shootdown_range` — and Linux's `__split_large_page`
+      (`arch/x86/mm/pageattr.c`) argument for why installing a table that
+      translates identically to the huge leaf it replaces is safe without
+      break-before-make.
+   2. **A `text_poke_copy` equivalent**, because every allocation after the
+      first in a pack is written into already-sealed text, and once (1) lands
+      `write` has no writable address left to use. A temporary RW+NX alias of
+      the pack's frames at a scratch kernel VA, torn down before the call
+      returns, is the narrow form.
+
+   Neither is useful alone: (1) without (2) breaks program loading, and (2)
+   without (1) is a mechanism guarding nothing.
 7. ~~**Fuel accounting granularity**~~ — **resolved: per instruction.** Per
    back-edge bounds iterations rather than work: 65536 straight-line
    instructions cost one unit, so the default tank permitted ~7e10
