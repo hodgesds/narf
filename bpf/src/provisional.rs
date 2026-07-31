@@ -1,11 +1,22 @@
-//! Phase-1 provisional acceptance. **Delete when Stream A's abstract
-//! interpreter lands.**
+//! Phase-1 provisional acceptance. **Now accepts nothing; delete it.**
 //!
-//! `narf_bpf_verifier::verify` currently decodes the image, checks it cannot
-//! run off the end, and then returns `VerifyError::NotImplemented` — it fails
-//! closed, deliberately, so nothing accidentally ships on a half-verifier.
-//! That leaves Phase 1 needing *some* acceptance rule to be able to run a
-//! program at all.
+//! This existed because `narf_bpf_verifier::verify` returned
+//! `VerifyError::NotImplemented` for everything it decoded, leaving Phase 1
+//! needing *some* rule to be able to run a program at all. The abstract
+//! interpreter has landed, and `NotImplemented` now names exactly two
+//! constructs — a `LD_IMM64` BTF-id kernel-variable address, and a subprogram
+//! address taken as a value. Both are `LD_IMM64` pseudo-forms, and the check
+//! below rejects **every** non-`Value` `LD_IMM64` itself.
+//!
+//! So every path that reaches this function also leaves it with an error. It
+//! is reachable, and it admits nothing. That is worth stating rather than
+//! leaving to be rediscovered, because the shape of `BpfProg::load` reads as a
+//! live fallback and is not one — and because "does anything get in this way"
+//! is the first question anyone auditing the JIT gate will ask.
+//!
+//! Deleting it is a change to `BpfProg::load`'s error paths rather than to the
+//! set of programs that load, and belongs with whoever next touches that
+//! function.
 //!
 //! ## Why this is not fail-open
 //!
