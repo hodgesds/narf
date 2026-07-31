@@ -7859,6 +7859,8 @@ mod handler_sys_bootstrap;
 mod handler_sys_bpf;
 #[path = "sys_bpf_btf.rs"]
 mod handler_sys_bpf_btf;
+#[path = "sys_bpf_info.rs"]
+mod handler_sys_bpf_info;
 #[path = "sys_brk.rs"]
 mod handler_sys_brk;
 #[path = "sys_capget.rs"]
@@ -8442,6 +8444,7 @@ pub(crate) use handler_sys_arch_prctl::*;
 pub(crate) use handler_sys_bpf::*;
 #[allow(unused_imports)]
 pub(crate) use handler_sys_bpf_btf::*;
+pub(crate) use handler_sys_bpf_info::*;
 #[allow(unused_imports)]
 pub use handler_sys_chdir_for_test::*;
 #[allow(unused_imports)]

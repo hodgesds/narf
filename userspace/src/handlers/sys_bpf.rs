@@ -58,6 +58,11 @@ const BPF_MAP_GET_NEXT_KEY: u32 = 4;
 const BPF_PROG_LOAD: u32 = 5;
 const BPF_PROG_TEST_RUN: u32 = 10;
 const BPF_BTF_LOAD: u32 = 18;
+const BPF_PROG_GET_NEXT_ID: u32 = 11;
+const BPF_MAP_GET_NEXT_ID: u32 = 12;
+const BPF_PROG_GET_FD_BY_ID: u32 = 13;
+const BPF_MAP_GET_FD_BY_ID: u32 = 14;
+const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
 
 /// `union bpf_attr` is 120+ bytes and grows with every kernel release. Linux
 /// accepts any size and zero-extends, so that an older binary works on a newer
@@ -166,18 +171,35 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         BPF_MAP_DELETE_ELEM => map_delete_elem(attr_uptr, size),
         BPF_MAP_GET_NEXT_KEY => map_get_next_key(attr_uptr, size),
 
-        // `sys_bpf_btf.rs`. Kept out of this file because three commands'
-        // worth of BTF glue does not belong in the dispatcher, and because
-        // this file is edited concurrently.
+        // BTF — `sys_bpf_btf.rs`.
         BPF_BTF_LOAD => btf_load(attr_uptr, size),
 
+        // Introspection — `sys_bpf_info.rs`.
+        BPF_OBJ_GET_INFO_BY_FD => super::bpf_obj_get_info_by_fd(attr_uptr, size),
+        BPF_PROG_GET_NEXT_ID => super::bpf_prog_get_next_id(attr_uptr, size),
+        BPF_MAP_GET_NEXT_ID => super::bpf_map_get_next_id(attr_uptr, size),
+        BPF_PROG_GET_FD_BY_ID => super::bpf_prog_get_fd_by_id(attr_uptr, size),
+        BPF_MAP_GET_FD_BY_ID => super::bpf_map_get_fd_by_id(attr_uptr, size),
+
         // LINUX-GAP: everything else — `BPF_OBJ_PIN`/`BPF_OBJ_GET` (bpffs
-        // pinning), `BPF_PROG_ATTACH`/`DETACH` and `LINK_CREATE` (attach is
-        // Phase 6), the `*_GET_FD_BY_ID` and `*_GET_NEXT_ID` families
-        // (including BTF's — they need a kernel-wide id registry that does not
-        // exist yet), and the token/iterator commands. `ENOTSUP` rather than
+        // pinning), and the token/iterator commands. `ENOTSUP` rather than
         // `EINVAL` so a probing loader can tell "this kernel does not do that"
         // from "you passed nonsense".
+        //
+        // This comment is merged from two branches that each described the
+        // other's gap as unfilled; both claims are now stale. BTF loading and
+        // the prog/map id families are implemented above, and attach arrives
+        // with `sys_bpf_attach.rs`.
+        //
+        // LINUX-GAP: `BPF_BTF_GET_FD_BY_ID` (19) / `BPF_BTF_GET_NEXT_ID` (23)
+        // remain unimplemented even though `narf_bpf::idreg` now exists — BTF
+        // blobs are not registered in it, which is a follow-up of a few lines
+        // via `BtfFile::btf()`, not a missing mechanism.
+        //
+        // LINUX-GAP: `BPF_LINK_GET_NEXT_ID` (33) / `BPF_LINK_GET_FD_BY_ID`
+        // (32). The registry is generic and a third table is two lines; what
+        // was missing when it was written is the *object*. If a link type has
+        // since landed, this is the place to wire it.
         _ => -ENOTSUP,
     };
     ctx.set_return(SyscallReturn::ok(ret as u64));
