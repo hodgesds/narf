@@ -39,6 +39,7 @@ pub mod interp;
 pub mod jit_glue;
 pub mod kfunc;
 pub mod kfuncs;
+pub mod link;
 pub mod map;
 pub mod mem;
 pub mod prog;
@@ -62,6 +63,7 @@ pub mod reexport {
 pub use attach::{attach_probe, detach_probe, AttachError, ProbeProgram};
 pub use interp::{Outcome, Trap, Vm};
 pub use kfunc::{KfuncEntry, KfuncShim, Registry, RegistryError};
+pub use link::{BpfLink, LinkCaps, LinkError, LinkFile, LinkTarget};
 pub use map::{ArrayMap, BpfMap, BpfMapCap, BpfMapOps, HashMap, MapAttr, MapError, MapKind};
 pub use prog::{BpfAttach, BpfProg, BpfProgLoad, LoadError, LoadRequest};
 pub use structops::{ProgSet, StructOpsDesc, StructOpsError};

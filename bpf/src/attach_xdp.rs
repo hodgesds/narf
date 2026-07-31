@@ -30,7 +30,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use narf_net::bypass::classifier::{install_xdp, XdpAction, XdpProgram};
+use narf_net::bypass::classifier::{install_xdp, remove_xdp, XdpAction, XdpProgram};
 
 use crate::prog::BpfProg;
 
@@ -137,4 +137,23 @@ pub fn attach(
     }
     let name = iface.clone();
     install_xdp(cap, iface, Box::new(BpfXdp { prog, name }))
+}
+
+/// Detach whatever program is on `iface`. Returns whether one was removed.
+///
+/// The mirror of [`attach`], and here rather than at the call sites so that the
+/// two cannot disagree about which capability the classifier wants: `remove_xdp`
+/// is generic over the cap type and checks the *kind* at run time, so passing
+/// the wrong one is a run-time `WrongCapKind` rather than a compile error.
+/// Naming `Cap<BpfAttach, Grant>` in this signature is what turns it back into
+/// one.
+///
+/// # Errors
+///
+/// Propagates `narf_net`'s error if the capability is not live.
+pub fn detach(
+    cap: &narf_capabilities::Cap<crate::prog::BpfAttach, narf_capabilities::Grant>,
+    iface: &str,
+) -> Result<bool, narf_net::bypass::classifier::ClassifyError> {
+    remove_xdp(cap, iface)
 }
