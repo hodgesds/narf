@@ -1018,12 +1018,18 @@ impl BpfMap {
                 return Err(e);
             }
         };
-        Ok(Arc::new(Self {
+        let map = Arc::new(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             name,
             ops,
             charged,
-        }))
+        });
+        // Publish the id → map direction for `BPF_MAP_GET_FD_BY_ID`. Same
+        // reasoning as `BpfProg::load_with_arena`: registering here rather than
+        // in the `bpf(2)` handler means every map that has an id is reachable
+        // by it, whoever created it.
+        crate::idreg::maps().insert(map.id, &map);
+        Ok(map)
     }
 
     /// The operations table.
@@ -1061,6 +1067,10 @@ const _: () = assert!(
 
 impl Drop for BpfMap {
     fn drop(&mut self) {
+        // Prune the id entry before the charge is released — order does not
+        // matter for correctness, but keeping the registry edit adjacent to the
+        // `create` that inserted it is what stops the pair drifting apart.
+        crate::idreg::maps().remove(self.id);
         uncharge(self.charged);
     }
 }

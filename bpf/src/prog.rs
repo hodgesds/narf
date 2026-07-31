@@ -252,7 +252,7 @@ impl BpfProg {
             Err(e) => return Err(LoadError::Rejected(e)),
         };
 
-        Ok(Arc::new(Self {
+        let prog = Arc::new(Self {
             name: req.name,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             insns: req.insns,
@@ -266,7 +266,14 @@ impl BpfProg {
             runs: AtomicU64::new(0),
             accumulated: AtomicU64::new(0),
             traps: AtomicU64::new(0),
-        }))
+        });
+        // Publish the id → program direction, so `BPF_PROG_GET_FD_BY_ID` can
+        // resolve it. Here rather than in the `bpf(2)` handler because a
+        // program loaded any other way (the bench suite, the in-kernel smokes)
+        // has an id too, and an id the registry does not know about is an id
+        // that enumerates as a hole.
+        crate::idreg::progs().insert(prog.id, &prog);
+        Ok(prog)
     }
 
     /// The arenas this program may address. Empty when it has none.
@@ -499,6 +506,20 @@ impl BpfProg {
         self.jit.is_some()
     }
 
+    /// Bytes of emitted native code, or 0 when the program runs interpreted.
+    ///
+    /// `bpf_prog_info.jited_prog_len` is how every Linux tool decides whether a
+    /// program is JITed — bpftool prints "jited" on `jited_prog_len != 0` and
+    /// nothing else. Reporting 0 for a compiled program would therefore be a
+    /// lie in the one field that answers the question.
+    #[inline]
+    #[must_use]
+    pub fn jited_len(&self) -> usize {
+        self.jit
+            .as_ref()
+            .map_or(0, crate::jit_glue::JitImage::text_len)
+    }
+
     /// Run the program on a heap stack owned by the caller's future.
     ///
     /// The sleepable path (spec §4.8): a sleeping program cannot hold a
@@ -540,6 +561,16 @@ impl BpfProg {
                 self.traps.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+impl Drop for BpfProg {
+    fn drop(&mut self) {
+        // Prune the id entry. The registry holds a `Weak`, so a lookup racing
+        // this teardown already fails rather than resurrecting anything — this
+        // is about the table not growing by one slot per program for the whole
+        // boot. See `crate::idreg` for why both halves are needed.
+        crate::idreg::progs().remove(self.id);
     }
 }
 

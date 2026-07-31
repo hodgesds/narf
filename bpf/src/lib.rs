@@ -34,6 +34,7 @@ pub mod attach;
 pub mod attach_xdp;
 #[cfg(feature = "bench")]
 pub mod bench;
+pub mod idreg;
 pub mod interp;
 pub mod jit_glue;
 pub mod kfunc;

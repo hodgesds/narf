@@ -79,6 +79,17 @@ impl JitImage {
         // matches the prologue the emitter generates — see [`JitEntry`].
         unsafe { core::mem::transmute::<u64, JitEntry>(self.entry) }
     }
+
+    /// Bytes of emitted text — what `bpf_prog_info.jited_prog_len` reports.
+    ///
+    /// The requested length, not the rounded-up chunk span, because that is
+    /// what Linux reports for `prog->jited_len` and what a disassembler would
+    /// need to bound its read.
+    #[inline]
+    #[must_use]
+    pub fn text_len(&self) -> usize {
+        self.alloc.as_ref().map_or(0, |a| a.len)
+    }
 }
 
 impl Drop for JitImage {
