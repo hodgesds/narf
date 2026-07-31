@@ -657,6 +657,19 @@ fn a_variable_stack_read_needs_every_byte_it_could_reach() {
     // The range is [-16, 0); only [-8, 0) was written. The read is admitted
     // against `addr.min` alone if the initialisation check follows the
     // constant path, and that is the hole this pins.
+    //
+    // The written half is the *deep* one on purpose. Writing the shallow half
+    // instead would leave `addr.min` uninitialised, so a check that only
+    // looked at `addr.min` would reject too and the test would pass while
+    // proving nothing — which is exactly what it did before the mutation table
+    // caught it.
+    let mut p = vec![st(Size::Dw, 10, -16, 0)];
+    p.extend(variable_frame_ptr(16, 8));
+    p.extend_from_slice(&[ldx(Size::Dw, 4, 3, 0), mov(0, 0), EXIT]);
+    let e = check_ctx(&p, CTX1).unwrap_err();
+    assert!(matches!(e, VerifyError::UninitStack { .. }), "{e:?}");
+
+    // …and the mirror, so neither edge can be the only one checked.
     let mut p = vec![st(Size::Dw, 10, -8, 0)];
     p.extend(variable_frame_ptr(16, 8));
     p.extend_from_slice(&[ldx(Size::Dw, 4, 3, 0), mov(0, 0), EXIT]);
@@ -2501,19 +2514,27 @@ fn assert_frame_fits(m: &interp::Machine, max_stack_bytes: u32, prog: &[Decoded]
 /// One randomly-shaped program built around a bounded variable frame offset.
 ///
 /// The knobs are the ones that can each independently break the bound: how
-/// deep the base is, how far the index can reach, how wide the access is, how
-/// much of the frame was written first, and which direction the access goes.
+/// deep the base is, how far the index can reach, how wide the access is,
+/// *which window* of the frame was written first, and which direction the
+/// access goes.
+///
+/// `init_from` is not decoration. Always pre-writing the frame from R10
+/// downwards means the deep end of a read's range is the uninitialised end, so
+/// an initialisation check that looked only at `addr.min` would reject the same
+/// programs the correct one does and the differential would agree with a broken
+/// verifier. A window that can start anywhere makes both ends reachable.
 #[allow(clippy::too_many_arguments)]
 fn variable_offset_program(
     depth: i32,
     mask: i32,
     disp: i16,
     size: Size,
+    init_from: u32,
     init_words: u32,
     write: bool,
 ) -> Vec<Decoded> {
     let mut p = Vec::new();
-    for j in 0..init_words {
+    for j in init_from..init_from + init_words {
         p.push(st(Size::Dw, 10, -8 * (j as i16 + 1), 0));
     }
     p.push(ldx(Size::Dw, 2, 1, 0)); // r2 = ctx[0] — the unknown
@@ -2563,9 +2584,13 @@ fn a_verified_variable_frame_access_is_safe_for_every_index_it_admits() {
             _ => -(rng.below(24) as i16),
         };
         let size = random_size(&mut rng);
+        // The window starts anywhere in the shallow end of the frame and runs
+        // downwards, so a read's range can be initialised at its deep end, its
+        // shallow end, both, or neither.
+        let init_from = rng.below(8) as u32;
         let init_words = rng.below(6) as u32;
         let write = rng.below(2) == 0;
-        let prog = variable_offset_program(depth, mask, disp, size, init_words, write);
+        let prog = variable_offset_program(depth, mask, disp, size, init_from, init_words, write);
         let image = encode_all(&prog);
         let Ok(verified) = verify(&Program {
             insns: &image,
