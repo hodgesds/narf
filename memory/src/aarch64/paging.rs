@@ -231,6 +231,43 @@ pub unsafe fn write_ttbr0_el1(root: PhysAddr) {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// Make a freshly-written translation-table descriptor visible to the table
+/// walker before the caller touches the VA it describes.
+///
+/// The architecture does not guarantee that a normal store to a page-table
+/// entry is observed by the walker in program order: the walk is a separate
+/// observer, so the descriptor write needs a `DSB ISHST` to be ordered ahead of
+/// any subsequent access, and an `ISB` before an instruction fetch through the
+/// new mapping can be relied on.
+///
+/// **This was missing from every `map_*` path** while `unmap_4kb` twelve lines
+/// below correctly issued `dsb ishst; tlbi vale1is; dsb ish; isb`. Callers
+/// routinely map a page and write through the returned VA immediately —
+/// `bpf_arena`'s populate does exactly that — so on real silicon the access
+/// could be reordered ahead of the descriptor becoming visible and take a
+/// spurious translation fault. QEMU's TCG walker re-reads the tables on every
+/// access and so never reproduces it, which is why the boot smokes stayed green;
+/// the justification here is the architecture, not the emulator.
+///
+/// No TLB maintenance: these paths install a mapping where the leaf was
+/// **invalid**, and there is no stale valid entry to evict. Changing a live
+/// valid entry is break-before-make and belongs with the caller that does it
+/// (see `unmap_4kb`, and `bpf_text::seal`'s permission flip).
+///
+/// # Safety
+/// `DSB`/`ISB` at EL1 are unconditional; the caller must have completed the
+/// descriptor write before calling.
+#[inline]
+unsafe fn publish_table_write() {
+    use core::sync::atomic::{compiler_fence, Ordering};
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: barriers at EL1 are always legal and have no operands.
+    unsafe {
+        core::arch::asm!("dsb ishst", "isb", options(nostack, preserves_flags));
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
 /// Invalidate a single virtual address from the TLB via
 /// `TLBI VAE1IS, xN` with the required barrier dance.
 ///
@@ -491,6 +528,8 @@ pub unsafe fn map_2mb(
     }
     let base = PtFlags::VALID | PtFlags::AF | PtFlags::SH_INNER | PtFlags::ATTR_NORMAL;
     l2.entries[idx.l2] = PageTableEntry::new(phys, base | flags);
+    // SAFETY: publish the descriptor before returning — see `publish_table_write`.
+    unsafe { publish_table_write() };
     unsafe { tlb_invalidate_vae1is(virt) };
     Ok(())
 }
@@ -525,6 +564,8 @@ pub unsafe fn map_1gb(
     }
     let base = PtFlags::VALID | PtFlags::AF | PtFlags::SH_INNER | PtFlags::ATTR_NORMAL;
     l1.entries[idx.l1] = PageTableEntry::new(phys, base | flags);
+    // SAFETY: publish the descriptor before returning — see `publish_table_write`.
+    unsafe { publish_table_write() };
     unsafe { tlb_invalidate_vae1is(virt) };
     Ok(())
 }
@@ -655,6 +696,8 @@ pub unsafe fn map_4kb(
         | PtFlags::SH_INNER
         | PtFlags::ATTR_NORMAL;
     l3.entries[idx.l3] = PageTableEntry::new(phys, base | flags);
+    // SAFETY: publish the descriptor before returning — see `publish_table_write`.
+    unsafe { publish_table_write() };
     Ok(())
 }
 
