@@ -830,6 +830,52 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     Some(e.addr())
 }
 
+/// Flags of whichever descriptor actually maps `virt` — 1 GiB or 2 MiB block,
+/// or 4 KiB page — together with that leaf's size in bytes.
+///
+/// [`flags_at`] returns `None` at a block descriptor, which makes it useless
+/// for asking whether an address is executable: the kernel's own mappings are
+/// blocks, so a `PXN` check built on `flags_at` silently passes on every
+/// address it cannot see. The x86_64 twin is `x86_64::paging::leaf_flags_at`.
+///
+/// # Safety
+/// Same contract as [`flags_at`].
+pub unsafe fn leaf_flags_at(root: PhysAddr, virt: VirtAddr) -> Option<(PtFlags, u64)> {
+    const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+    let idx = WalkIndices::from_virt(virt);
+    // SAFETY: `root` is the identity-mapped root `PageTable` per the contract.
+    let l0 = unsafe { &*(root.kernel_ptr::<PageTable>()) };
+    let e = l0.entries[idx.l0];
+    if !e.is_valid() || (e.0 & 0b11) != 0b11 {
+        return None;
+    }
+    // SAFETY: verified L0 TABLE descriptor.
+    let l1 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
+    let e = l1.entries[idx.l1];
+    if !e.is_valid() {
+        return None;
+    }
+    if (e.0 & 0b11) != 0b11 {
+        return Some((PtFlags(e.0 & !ADDR_MASK), 1 << 30));
+    }
+    // SAFETY: verified L1 TABLE descriptor.
+    let l2 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
+    let e = l2.entries[idx.l2];
+    if !e.is_valid() {
+        return None;
+    }
+    if (e.0 & 0b11) != 0b11 {
+        return Some((PtFlags(e.0 & !ADDR_MASK), 1 << 21));
+    }
+    // SAFETY: verified L2 TABLE descriptor.
+    let l3 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
+    let e = l3.entries[idx.l3];
+    if !e.is_valid() {
+        return None;
+    }
+    Some((PtFlags(e.0 & !ADDR_MASK), 1 << 12))
+}
+
 /// Walk the table at `root` and return the flags for `virt`, or
 /// `None` if unmapped.
 ///

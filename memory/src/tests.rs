@@ -7327,7 +7327,10 @@ fn smoke_kernel_window_alias_of_buddy_frame_is_nx() -> TestResult {
     // SAFETY: the kernel window aliases this frame writably and we own it.
     let caught = unsafe { probe_fetch_at(KERNEL_VIRT_BASE + phys) };
     free_frame(frame);
-    expect_nx_fault(caught, "kernel-window alias of a buddy frame was executable")
+    expect_nx_fault(
+        caught,
+        "kernel-window alias of a buddy frame was executable",
+    )
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_kernel_window_alias_of_buddy_frame_is_nx);
@@ -7415,3 +7418,114 @@ fn smoke_kernel_text_executable_bss_is_not() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_kernel_text_executable_bss_is_not);
+
+/// aarch64 twin of the two `_is_nx` smokes above — asserted **structurally**,
+/// by reading the live TTBR0/TTBR1 descriptors, rather than by taking the
+/// fault.
+///
+/// LINUX-GAP: `narf_arch::x86_64::probe` has no aarch64 port
+/// (`bpf/specification/spec.md` §8.8), so there is no way to attempt an
+/// instruction fetch from a PXN page and survive it. Linux would express this
+/// with an `extable`-covered probe either way; here the descriptor check is
+/// what is available, and it catches the regression this work is guarding
+/// against — a leaf built without PXN|UXN — even though it cannot witness the
+/// CPU refusing the fetch.
+///
+/// Both windows are checked because they are different tables: the TTBR0 map
+/// is the identity one, and the TTBR1 window at `KERNEL_PHYS_OFFSET` is what
+/// `PhysAddr::kernel_ptr` actually resolves to on this arch, so it is the
+/// alias every BPF pack write goes through.
+#[cfg(target_arch = "aarch64")]
+fn smoke_buddy_frame_alias_is_pxn() -> TestResult {
+    use crate::aarch64::paging::{leaf_flags_at, read_ttbr0_el1, read_ttbr1_el1, PtFlags};
+    use crate::{alloc_frame, free_frame, FrameAllocError, VirtAddr};
+
+    let frame = match alloc_frame() {
+        Ok(f) => f,
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    let phys = frame.start_address().raw();
+    let nx = PtFlags::PXN.bits() | PtFlags::UXN.bits();
+
+    // SAFETY: `MRS .., TTBR0_EL1/TTBR1_EL1` is defined at EL1 with no
+    // precondition, and both roots are reachable through the kernel accessor.
+    let (ttbr0, ttbr1) = unsafe { (read_ttbr0_el1(), read_ttbr1_el1()) };
+    // SAFETY: both roots are live translation tables.
+    let ident = unsafe { leaf_flags_at(ttbr0, VirtAddr::new(phys)) };
+    // SAFETY: as above; `phys | KERNEL_PHYS_OFFSET` is the kernel window
+    // alias `PhysAddr::kernel_ptr` hands out.
+    let window = unsafe { leaf_flags_at(ttbr1, VirtAddr::new(phys | crate::KERNEL_PHYS_OFFSET)) };
+    free_frame(frame);
+
+    match ident {
+        None => return TestResult::Fail("buddy frame has no TTBR0 identity mapping"),
+        Some((f, size)) => {
+            if size != (1 << 21) {
+                return TestResult::Fail("TTBR0 RAM block was not demoted to 2 MiB");
+            }
+            if f.bits() & nx != nx {
+                return TestResult::Fail("TTBR0 identity alias of a buddy frame is executable");
+            }
+        }
+    }
+    match window {
+        None => TestResult::Fail("buddy frame has no TTBR1 kernel-window mapping"),
+        Some((f, size)) => {
+            if size != (1 << 21) {
+                TestResult::Fail("TTBR1 RAM block was not demoted to 2 MiB")
+            } else if f.bits() & nx != nx {
+                TestResult::Fail("TTBR1 kernel-window alias of a buddy frame is executable")
+            } else {
+                TestResult::Pass
+            }
+        }
+    }
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("memory", smoke_buddy_frame_alias_is_pxn);
+
+/// The aarch64 control: kernel `.text` is still fetchable at EL1 and `.bss` is
+/// not.
+///
+/// Same argument as the x86_64 twin — an exec range that came out too small
+/// never boots, so only the `.bss` half can catch one that came out too large.
+#[cfg(target_arch = "aarch64")]
+fn smoke_kernel_text_executable_bss_is_not_aarch64() -> TestResult {
+    use crate::aarch64::paging::{leaf_flags_at, read_ttbr1_el1, PtFlags};
+    use crate::VirtAddr;
+
+    static BSS_WITNESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    BSS_WITNESS.store(1, core::sync::atomic::Ordering::Relaxed);
+
+    unsafe extern "C" {
+        static __text_start: u8;
+    }
+    let text = core::ptr::addr_of!(__text_start) as u64;
+    let bss = &BSS_WITNESS as *const _ as u64;
+
+    // SAFETY: `MRS .., TTBR1_EL1` is defined at EL1 with no precondition.
+    let ttbr1 = unsafe { read_ttbr1_el1() };
+    // SAFETY: `ttbr1` is the live kernel translation table.
+    let t = unsafe { leaf_flags_at(ttbr1, VirtAddr::new(text)) };
+    // SAFETY: as above.
+    let b = unsafe { leaf_flags_at(ttbr1, VirtAddr::new(bss)) };
+
+    match (t, b) {
+        (None, _) => TestResult::Fail("kernel .text is unmapped"),
+        (_, None) => TestResult::Fail("kernel .bss is unmapped"),
+        (Some((tf, _)), Some((bf, _))) => {
+            if tf.bits() & PtFlags::PXN.bits() != 0 {
+                return TestResult::Fail("kernel .text is PXN — the boot should not have survived");
+            }
+            if bf.bits() & PtFlags::PXN.bits() == 0 {
+                return TestResult::Fail("kernel .bss is executable — the exec range is too wide");
+            }
+            TestResult::Pass
+        }
+    }
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("memory", smoke_kernel_text_executable_bss_is_not_aarch64);
