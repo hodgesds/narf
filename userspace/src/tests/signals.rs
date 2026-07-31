@@ -4,6 +4,12 @@
 use super::*;
 
 fn smoke_userspace_sigaction_records_handler() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // Sigaction: arg0 = signum, arg1 = new handler vaddr, arg2 =
     // out-pointer for prior handler. Install one handler, install
     // another and confirm the prior is reported.
@@ -857,6 +863,12 @@ kernel_test_in!(
 // signal smokes.
 
 fn smoke_userspace_sigaltstack_install_and_query() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global,
@@ -1105,6 +1117,12 @@ fn smoke_userspace_tgkill_routes_via_tid() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_tgkill_routes_via_tid);
 
 fn smoke_userspace_rt_sigpending_filters_by_mask() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global,
@@ -1184,6 +1202,12 @@ fn smoke_userspace_rt_sigpending_filters_by_mask() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_rt_sigpending_filters_by_mask);
 
 fn smoke_userspace_rt_sigsuspend_replaces_mask() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global,
@@ -1242,6 +1266,12 @@ fn smoke_userspace_rt_sigsuspend_replaces_mask() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_rt_sigsuspend_replaces_mask);
 
 fn smoke_userspace_rt_sigtimedwait_returns_pending_signal() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global,
@@ -1353,6 +1383,12 @@ kernel_test_in!(
 );
 
 fn smoke_userspace_rt_sigtimedwait_picks_lowest_match() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global,
@@ -1415,6 +1451,12 @@ kernel_test_in!(
 );
 
 fn smoke_userspace_rt_sigpending_zero_when_nothing_blocked() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global,
@@ -1469,6 +1511,12 @@ kernel_test_in!(
 );
 
 fn smoke_userspace_sigaltstack_query_only_keeps_prior_install() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global,
@@ -1974,6 +2022,12 @@ kernel_test_in!(
 
 #[cfg(feature = "linux-compat")]
 fn smoke_userspace_signalfd_reads_pending_siginfo() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::handlers::__test_signal_reset;
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
@@ -2089,6 +2143,12 @@ kernel_test_in!("userspace", smoke_userspace_signalfd_reads_pending_siginfo);
 
 #[cfg(feature = "linux-compat")]
 fn smoke_userspace_posix_timer_signal_delivery() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         fd,
         handlers::{__test_signal_reset, signal_init, signal_pending_of},
@@ -2202,6 +2262,12 @@ kernel_test_in!("userspace", smoke_userspace_posix_timer_signal_delivery);
 
 #[cfg(feature = "linux-compat")]
 fn smoke_userspace_posix_timer_gettime_remaining() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // Arm a 1-second timer; timer_gettime must return sane remaining value.
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
@@ -2315,6 +2381,12 @@ kernel_test_in!("userspace", smoke_userspace_posix_timer_gettime_remaining);
 
 #[cfg(feature = "linux-compat")]
 fn smoke_userspace_posix_timer_delete_cancels() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // Arm a timer, then delete it; timer_gettime on the stale id returns -1.
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,

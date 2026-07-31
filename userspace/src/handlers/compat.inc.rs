@@ -1145,34 +1145,175 @@ const EINVAL_CODE: u64 = 22;
 /// 16 MiB per-call cap.
 const MAX_USER_COPY: usize = 16 * 1024 * 1024;
 
-/// Validate that `[ptr, ptr + len)` is a plausible pointer.
+/// First address above the user half of a 48-bit canonical VA space.
+///
+/// Both supported architectures split at bit 47: a user-half VA has
+/// bits 47..=63 all zero, so `addr < USER_VA_LIMIT` is simultaneously
+/// the canonicality test and the user/kernel-half test. The highest
+/// legal user byte is `USER_VA_LIMIT - 1` (0x0000_7FFF_FFFF_FFFF).
+///
+/// Linux analogue: `TASK_SIZE_MAX`, against which `__access_ok()`
+/// (`include/asm-generic/access_ok.h`) tests `addr <= limit - size`.
+pub(crate) const USER_VA_LIMIT: u64 = 1 << 47;
+
+/// True when `a` is a canonical *user-half* address.
+#[inline]
+fn in_user_half(a: u64) -> bool {
+    a < USER_VA_LIMIT
+}
+
+/// True when `a` is canonical at all — user half (bits 47..=63 zero)
+/// or kernel half (bits 47..=63 one). Bit 63 and bit 47 are PART of
+/// the rule: an earlier version of this check masked bit 63 out and
+/// only examined bits 48..=62, so the non-canonical shapes
+///   0x8000_0000_0000_0000 (bit 63 set, middle bits clear) and
+///   0x7FFF_8000_0000_0000 (bit 63 clear, middle bits set)
+/// slipped through and the copy took a kernel #GP.
+///
+/// The production predicate is [`in_user_half`], which is strictly
+/// stronger; this laxer form exists only to keep the `kernel-test`
+/// opt-in from ever admitting a hole-spanning range.
+#[cfg(feature = "kernel-test")]
+#[inline]
+fn canonical(a: u64) -> bool {
+    let top = a >> 47; // bits 47..=63, 17 bits
+    top == 0 || top == 0x1_FFFF
+}
+
+/// Scoped opt-in that lets the *calling task* pass kernel-half
+/// pointers through [`validate_user_range`] for the duration of `f`.
+///
+/// The bypass it enables is compiled **only** into the `kernel-test`
+/// build; in every production build this is an inlined no-op wrapper
+/// and `validate_user_range` contains no path that accepts a kernel
+/// address at all. The wrapper itself is unconditional because the
+/// `abi_*_tests.rs` modules are compiled into every build of this
+/// crate (they register into the `narf.tests` link section) and so
+/// must always be able to name it.
+///
+/// Even in the test build the opt-in is deliberately narrow:
+///
+/// - it is **dynamically scoped**, not a build-wide switch, so every
+///   one of the thousands of `kernel-test` cases that does not wrap
+///   itself in it keeps exercising the production predicate — which
+///   is what makes a negative test for a rejected kernel-half
+///   destination possible at all; and
+/// - it is **keyed on the CPU**, so a syscall issued concurrently on
+///   any other CPU is still checked strictly.
+///
+/// Use it only where the kernel pointer is the *point* of the test
+/// (a handler being unit-tested with a kernel scratch buffer standing
+/// in for a user buffer). Never wrap an assertion about the check
+/// itself in it.
+#[inline]
+pub(crate) fn with_kernel_buffers<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = kernel_buffers_guard();
+    f()
+}
+
+/// RAII form of [`with_kernel_buffers`], for the in-kernel smokes that
+/// are written as a bare `fn … -> TestResult` with early returns rather
+/// than as a closure passed to a harness. Bind it to a named local
+/// (`let _guard = …;`) at the top of the test: it closes on every exit
+/// path, including the early ones.
+#[inline]
+pub(crate) fn kernel_buffers_guard() -> KernelBufferGuard {
+    KernelBufferGuard {
+        #[cfg(feature = "kernel-test")]
+        _scope: kernel_buf_scope::KernelBufScope::new(),
+    }
+}
+
+/// See [`kernel_buffers_guard`]. Outside `kernel-test` this is a
+/// zero-sized nothing and `validate_user_range` has no bypass at all.
+pub(crate) struct KernelBufferGuard {
+    #[cfg(feature = "kernel-test")]
+    _scope: kernel_buf_scope::KernelBufScope,
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) mod kernel_buf_scope {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// Nesting depth of the opt-in, per CPU.
+    ///
+    /// Keyed on the CPU rather than the task id on purpose. The scope
+    /// describes *a block of code*, and an in-kernel smoke runs that
+    /// block straight through with no `.await` — so the syscalls it
+    /// issues run on the same CPU. Task-keying looked tighter but was
+    /// wrong: several smokes call `set_task()` *inside* the block, and
+    /// a scope keyed on the id read at entry silently stopped applying
+    /// the moment the test changed it. A CPU that is not running the
+    /// block has depth 0 and gets the production predicate.
+    static DEPTH: [AtomicU32; narf_lib::percpu::MAX_CPUS] =
+        [const { AtomicU32::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+    /// RAII guard. While alive, `validate_user_range` accepts canonical
+    /// kernel-half ranges *on the CPU that created it*.
+    pub(crate) struct KernelBufScope {
+        cpu: usize,
+    }
+
+    impl KernelBufScope {
+        /// Open the scope on the calling CPU.
+        pub(crate) fn new() -> Self {
+            let cpu = narf_lib::percpu::current_cpu();
+            DEPTH[cpu].fetch_add(1, Ordering::AcqRel);
+            Self { cpu }
+        }
+    }
+
+    impl Drop for KernelBufScope {
+        fn drop(&mut self) {
+            DEPTH[self.cpu].fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Is a scope open on the calling CPU?
+    #[inline]
+    pub(crate) fn active() -> bool {
+        DEPTH[narf_lib::percpu::current_cpu()].load(Ordering::Acquire) != 0
+    }
+}
+
+/// Validate that `[ptr, ptr + len)` is a plausible *user-space* range.
 ///
 /// Rejects:
 /// - `ptr == 0` (null) → EFAULT
 /// - `len > MAX_USER_COPY` → EINVAL
 /// - Integer overflow of `ptr + len` → EFAULT
-/// - A non-canonical FIRST or LAST byte address (bits 47–63 partial —
-///   neither all-zero for user-space nor all-one for kernel-space),
-///   or a range whose ends sit in different halves → EFAULT.
-///   Checking the last byte matters: a canonical user-half base whose
-///   `len` pushes the range across 0x0000_8000_0000_0000 would walk
-///   the kernel copy into the canonical hole — a mid-`rep movsb`
-///   **#GP**, not #PF, because non-canonical linear addresses are the
-///   one data-access fault x86_64 reports as #GP (stress-ng --vma's
-///   randomized write() buffers hit exactly this).
+/// - A FIRST or LAST byte address outside the user half — either
+///   non-canonical (bits 47–63 partial) or canonical-but-kernel
+///   (≥ 0xFFFF_8000_0000_0000) → EFAULT.
 ///
-/// Note: canonical kernel-half addresses (≥ 0xFFFF_8000_0000_0000)
-/// are intentionally *not* rejected here.  In production the hardware
-/// SMAP bit enforces the user/kernel boundary (kernel pages have
-/// PTE.U=0 so the STAC bracket opens silently and the copy succeeds);
-/// kernel-test code legitimately passes kernel-heap pointers through
-/// this path.  A future hardening pass can add a strict user-only
-/// range assertion once the test infrastructure maps every test buffer
-/// into a user AddressSpace.
+/// Checking the last byte matters twice over. A canonical user-half
+/// base whose `len` pushes the range across 0x0000_8000_0000_0000
+/// would walk the kernel copy into the canonical hole — a mid-`rep
+/// movsb` **#GP**, not #PF, because non-canonical linear addresses are
+/// the one data-access fault x86_64 reports as #GP (stress-ng --vma's
+/// randomized write() buffers hit exactly this). And a base one byte
+/// below `USER_VA_LIMIT` with a large `len` would otherwise put all
+/// but the first byte of the transfer in the kernel half.
 ///
-/// Linux analogue: `access_ok()` in `arch/x86/include/asm/uaccess.h`
-/// which similarly trusts the user-range upper bound and the HW
-/// enforcement rather than hard-checking the kernel half at this layer.
+/// # Why the kernel half must be rejected here
+///
+/// SMAP does **not** enforce this boundary, and a prior version of
+/// this comment claimed it did. SMAP faults a CPL-0 access to a page
+/// whose PTE has `U=1` while `EFLAGS.AC` is clear; it says nothing
+/// about a kernel page (`U=0`), and `copy_user_guarded` runs the whole
+/// `rep movsb` inside a `STAC`/`CLAC` bracket, which disables SMAP for
+/// the duration regardless. A mapped kernel-half destination is
+/// therefore written *silently* — no #PF, no #GP — the guarded copy's
+/// fault path never fires and the caller is handed `Ok(())`. Without
+/// the check below, every syscall that copies a caller-supplied length
+/// of caller-influenced bytes to a caller-supplied address is an
+/// arbitrary-kernel-write primitive (`bpf(BPF_OBJ_GET_INFO_BY_FD)` on
+/// a loaded BTF blob was the demonstrated gadget).
+///
+/// Linux analogue: `__access_ok()` in `include/asm-generic/access_ok.h`
+/// — `(size <= TASK_SIZE_MAX) && (addr <= TASK_SIZE_MAX - size)` — which
+/// likewise confines both ends of the range to the user half rather
+/// than deferring to hardware.
 #[inline]
 pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
     if len > MAX_USER_COPY {
@@ -1185,34 +1326,24 @@ pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
     if ptr.checked_add(len as u64).is_none() {
         return Err(EFAULT);
     }
-    // Reject non-canonical addresses (x86_64/aarch64 require bits 48–63
-    // to be the sign-extension of bit 47).
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        // Canonical 48-bit VA: bits 47..=63 all-zero (user half) or
-        // all-one (kernel half). Bit 63 and bit 47 are PART of the
-        // rule — a previous version of this check masked bit 63 out
-        // and only examined bits 48..=62, so the non-canonical shapes
-        //   0x8000_0000_0000_0000 (bit 63 set, middle bits clear) and
-        //   0x7FFF_8000_0000_0000 (bit 63 clear, middle bits set)
-        // slipped through and the copy took a kernel #GP.
-        #[inline]
-        fn canonical(a: u64) -> bool {
-            let top = a >> 47; // bits 47..=63, 17 bits
-            top == 0 || top == 0x1_FFFF
-        }
-        if !canonical(ptr) {
-            return Err(EFAULT);
-        }
-        // The LAST byte must be canonical too, and in the same half:
-        // a range must not span the canonical hole (see the doc
-        // comment). `ptr + len` can't overflow — checked above — so
+        // `ptr + len` can't overflow — checked above — so
         // `ptr + len - 1` can't either for len > 0.
-        if len > 0 {
-            let last = ptr + (len as u64 - 1);
-            if !canonical(last) || (last >> 63) != (ptr >> 63) {
-                return Err(EFAULT);
+        let last = if len > 0 { ptr + (len as u64 - 1) } else { ptr };
+        if !in_user_half(ptr) || !in_user_half(last) {
+            // The kernel-test opt-in is the only way past this, and it
+            // still demands a canonical range in ONE half so a test
+            // buffer can never be handed a hole-spanning transfer.
+            #[cfg(feature = "kernel-test")]
+            if kernel_buf_scope::active()
+                && canonical(ptr)
+                && canonical(last)
+                && (ptr >> 63) == (last >> 63)
+            {
+                return Ok(());
             }
+            return Err(EFAULT);
         }
     }
     Ok(())

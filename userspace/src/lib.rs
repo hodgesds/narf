@@ -114,6 +114,7 @@ mod abi_socket_tests;
 mod abi_test_support;
 mod abi_tests;
 mod abi_time_tests;
+mod abi_uaccess_tests;
 mod mount_e2e_tests;
 mod process_e2e_tests;
 mod shell_e2e_tests;

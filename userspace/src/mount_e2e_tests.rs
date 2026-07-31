@@ -110,6 +110,12 @@ fn pivot_args(new_root: &[u8], put_old: &[u8]) -> SyscallArgs {
 
 // ── Smoke 1: mount tmpfs at /tmp ───────────────────────────────────
 fn smoke_mount_tmpfs() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     set_task(0x71_01);
     crate::handlers::__test_root_dir_reset();
 
@@ -152,6 +158,12 @@ kernel_test_in!("userspace/mount", smoke_mount_tmpfs);
 
 // ── Smoke 2: umount2 /tmp ─────────────────────────────────────────
 fn smoke_umount_tmpfs() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     set_task(0x71_02);
     crate::handlers::__test_root_dir_reset();
 
@@ -198,6 +210,12 @@ kernel_test_in!("userspace/mount", smoke_umount_tmpfs);
 
 // ── Smoke 3: chroot rewrites absolute paths ───────────────────────
 fn smoke_chroot_rewrites_paths() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_03;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -285,6 +303,12 @@ kernel_test_in!(
 // ── Smoke 4: pivot_root swap with put_old bind ────────────────────
 #[cfg(feature = "container")]
 fn smoke_pivot_root_basic() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_04;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -363,6 +387,12 @@ kernel_test_in!("userspace/mount", smoke_pivot_root_basic);
 // 226/EXIT_NAMESPACE and restart-loop, wedging Fedora boot before dbus.
 #[cfg(feature = "container")]
 fn smoke_pivot_root_relative_dot() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_05;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -422,6 +452,12 @@ kernel_test_in!("userspace/mount", smoke_pivot_root_relative_dot);
 // 226/EXIT_NAMESPACE, restart-looping systemd-udevd.
 #[cfg(feature = "container")]
 fn smoke_pivot_root_switch_root_umount_dot() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_06;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -534,6 +570,12 @@ fn move_mount_args(from_dfd: u64, from_path: &[u8], to_dfd: u64, to_path: &[u8])
 // BEFORE the unshare survives in the private snapshot.
 // Linux ref: fs/namespace.c:copy_mnt_ns / do_new_mount.
 fn smoke_mount_ns_isolation() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_06;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -641,6 +683,12 @@ kernel_test_in!("userspace/mount", smoke_mount_ns_isolation);
 // namespace object: each side sees mounts made by the other, while the global
 // registry remains unchanged. This mirrors Linux copy_mnt_ns() on fork.
 fn smoke_mount_ns_fork_inherits_private_view() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const PARENT: u64 = 0x0007_106a;
     const CHILD: u64 = 0x0007_106b;
     set_task(PARENT);
@@ -708,6 +756,12 @@ kernel_test_in!("userspace/mount", smoke_mount_ns_fork_inherits_private_view);
 // (Type=notify timeout). Assert umount2 of a private devfs truly removes it.
 #[cfg(feature = "container")]
 fn smoke_umount_private_pseudofs_actually_removes() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_10;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -787,6 +841,12 @@ kernel_test_in!(
 // fix in sys_pivot_root.
 #[cfg(feature = "container")]
 fn smoke_pivot_root_putold_bind_private() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_0b;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -932,6 +992,12 @@ kernel_test_in!("userspace/mount", smoke_recursive_bind_exposes_subtree);
 // ("Unable to locate executable").
 #[cfg(feature = "container")]
 fn smoke_sandbox_root_swap_deep_path_resolves() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_0d;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -1257,6 +1323,12 @@ kernel_test_in!("userspace/mount", smoke_pivot_root_missing_target);
 // reachable at the resolved put_old.
 #[cfg(feature = "container")]
 fn smoke_pivot_root_relative_paths() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_08;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -1333,6 +1405,12 @@ kernel_test_in!("userspace/mount", smoke_pivot_root_relative_paths);
 // a fresh target. Assert the fs resolves at the new target afterward.
 // Linux ref: fs/namespace.c:SyS_open_tree / SyS_move_mount.
 fn smoke_open_tree_move_mount() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_09;
     set_task(task);
     crate::fd::__test_reset();
@@ -1405,6 +1483,12 @@ kernel_test_in!("userspace/mount", smoke_open_tree_move_mount);
 // stacking the overmount succeeds and leaves TWO entries at the target.
 // Linux ref: fs/namespace.c:do_move_mount (overmount allowed).
 fn smoke_move_mount_overmount_no_ebusy() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_20;
     set_task(task);
     crate::fd::__test_reset();
@@ -1481,6 +1565,12 @@ kernel_test_in!("userspace/mount", smoke_move_mount_overmount_no_ebusy);
 // ("/jail9/jail9/...") was a real container bug. Also confirm the root
 // path itself ("/") maps to the jail root, not "/jail9/".
 fn smoke_chroot_applied_once() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_0a;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -1527,6 +1617,12 @@ kernel_test_in!("userspace/mount", smoke_chroot_applied_once);
 // jail, never above it. Also exercises the chroot+cwd interaction: a
 // relative path resolves against the cwd and lands under the jail.
 fn smoke_chroot_escape_contained() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_0b;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -1632,6 +1728,12 @@ fn fs_name_at(path: &str) -> Option<alloc::string::String> {
 // created in the source tmpfs is then reachable through the dst path.
 // Linux ref: fs/namespace.c:do_loopback (mount --bind).
 fn smoke_bind_mount_file_visible() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     set_task(0x71_0c);
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
@@ -1687,6 +1789,12 @@ kernel_test_in!("userspace/mount", smoke_bind_mount_file_visible);
 // A mount nested UNDER the source must reappear nested under the target.
 // Linux ref: fs/namespace.c:do_loopback with recurse=1 (mount --rbind).
 fn smoke_recursive_bind_clones_submount() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     set_task(0x71_0d);
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
@@ -1733,6 +1841,12 @@ kernel_test_in!("userspace/mount", smoke_recursive_bind_clones_submount);
 // at `new`: it resolves at `new` and no longer at `old`.
 // Linux ref: fs/namespace.c:do_move_mount.
 fn smoke_move_mount_relocates() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     set_task(0x71_0e);
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
@@ -1776,6 +1890,12 @@ kernel_test_in!("userspace/mount", smoke_move_mount_relocates);
 // pointless). This runs the pseudo-fs arm, not the stacking path.
 // Linux ref: fs/namespace.c:do_new_mount (repeated API-fs mount).
 fn smoke_double_mount_idempotent() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     set_task(0x71_0f);
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
@@ -1814,6 +1934,12 @@ kernel_test_in!("userspace/mount", smoke_double_mount_idempotent);
 // clone(CLONE_NEWNS); failing it aborts the sandbox ("Protocol error").
 // Linux ref: fs/namespace.c:do_change_type.
 fn smoke_propagation_only_noop() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     set_task(0x71_10);
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
@@ -1895,6 +2021,12 @@ kernel_test_in!("userspace/mount", smoke_mount_setattr_size_validation);
 // predates the unshare must be present in the private snapshot.
 // Linux ref: fs/namespace.c:copy_mnt_ns.
 fn smoke_mount_ns_snapshot_depth() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_12;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -1952,6 +2084,12 @@ kernel_test_in!("userspace/mount", smoke_mount_ns_snapshot_depth);
 // (SyscallReturn::ok(!0)) and leaves the table unchanged.
 // Linux ref: fs/namespace.c:SyS_umount (EINVAL on non-mount).
 fn smoke_umount_real_vs_nonmount() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     set_task(0x71_13);
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
@@ -1999,6 +2137,12 @@ kernel_test_in!("userspace/mount", smoke_umount_real_vs_nonmount);
 // mounting it.
 // Linux ref: fs/namespace.c:do_remount.
 fn smoke_remount_flag_update() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     set_task(0x71_14);
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
@@ -2085,6 +2229,12 @@ kernel_test_in!("userspace/mount", smoke_clone_into_cgroup_rel_path_dynamic);
 // jail-relative "/x" must NOT appear as a top-level registry entry.
 // Linux ref: fs/namespace.c:user_path (target resolved under the task root).
 fn smoke_chroot_mount_target_rerooted() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_15;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -2134,6 +2284,12 @@ kernel_test_in!("userspace/mount", smoke_chroot_mount_target_rerooted);
 // the requested `Where=` is absent. A chrooted task must see mountpoints in
 // its visible namespace, not the backing registry paths below its chroot.
 fn smoke_chrooted_global_mountinfo_uses_visible_paths() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const PID: u64 = 0x71_17;
     const TASK: u64 = 0x0000_7116;
     const JAIL: &str = "/mountinfo-jail";

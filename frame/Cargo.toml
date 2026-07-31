@@ -267,6 +267,7 @@ kernel-test  = [
     "narf-fb/kernel-test",
     "narf-arch/kernel-test",
     "narf-scheduler/kernel-test",
+    "narf-userspace/kernel-test",
     "bpf",
 ]
 # In-kernel BPF smokes (`cargo xtask test --subsystem bpf`).

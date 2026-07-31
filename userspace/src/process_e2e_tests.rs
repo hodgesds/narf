@@ -1128,6 +1128,12 @@ kernel_test_in!("userspace/process", smoke_fatal_signal_zaps_thread_group);
 // Linux ref: kernel/signal.c::handle_signal → sigorsets for sa_mask.
 
 fn smoke_process_sa_mask_blocks_reentry() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const TASK: u64 = 0xF0_08;
     const SIGUSR1: u32 = 10;
     const HANDLER: u64 = 0xDEAD_0008;
@@ -1261,6 +1267,12 @@ kernel_test_in!("userspace/process", smoke_process_sa_mask_blocks_reentry);
 // Linux ref: kernel/signal.c::__set_task_blocked / do_sigprocmask.
 
 fn smoke_process_sigprocmask_block_unblock() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const TASK: u64 = 0xF0_09;
     const SIGUSR2: u32 = 12;
     const HANDLER: u64 = 0xDEAD_0012;
@@ -1665,6 +1677,12 @@ kernel_test_in!(
 // Linux ref: fs/pipe.c::do_pipe2; musl src/unistd/pipe.c.
 
 fn smoke_wave35_pipe_allocates_distinct_fds() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const TASK: u64 = 0xF0_14;
     crate::syscall::__test_clear_global();
     setup_process_state(TASK);
@@ -1726,6 +1744,12 @@ kernel_test_in!(
 // Linux ref: fs/fcntl.c::do_dup2; musl src/unistd/dup2.c.
 
 fn smoke_wave35_dup2_rewires_descriptor() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const TASK: u64 = 0xF0_15;
     crate::syscall::__test_clear_global();
     setup_process_state(TASK);
@@ -2006,6 +2030,12 @@ kernel_test_in!(
 // Linux ref: kernel/exit.c::do_wait.
 
 fn smoke_wave37_blocking_wait4_fallback_exit_before_wait() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const PARENT: u64 = 0xF0_19;
     const CHILD: u64 = 0xC0_19;
     crate::syscall::__test_clear_global();
@@ -4357,6 +4387,12 @@ kernel_test_in!("userspace/process", smoke_process_ptrace_syscall_stop);
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 fn smoke_process_coredump_e2e() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use narf_memory::AddressSpace;
 
     const PARENT: u64 = 0xF0_02;

@@ -13,6 +13,12 @@ use super::*;
 
 /// Connected Unix SEQPACKET pairs preserve one record per send.
 fn smoke_unix_seqpacket_socketpair_preserves_records() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     setup_poll_test();
     let mut sv = [0i32; 2];
     let pair = call(

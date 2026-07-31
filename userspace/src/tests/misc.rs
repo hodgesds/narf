@@ -354,6 +354,12 @@ fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_bootstrap_rings_round_trip);
 
 fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // Verify the per-task cwd state round-trips through Chdir +
     // Getcwd. Drive both through the synthetic TrapContext path so
     // we exercise install_core_syscalls' slot wiring as well as
@@ -787,6 +793,12 @@ fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_setuid_setgid_round_trip);
 
 fn smoke_userspace_rlimit_round_trip() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, rlimit_init,
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
@@ -1079,6 +1091,12 @@ fn smoke_userspace_umask_round_trip() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_umask_round_trip);
 
 fn smoke_userspace_sched_affinity_round_trip() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
         Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
@@ -1193,6 +1211,12 @@ fn smoke_userspace_sched_affinity_round_trip() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_sched_affinity_round_trip);
 
 fn smoke_userspace_prctl_name_round_trip() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, prctl_init,
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
@@ -1810,6 +1834,12 @@ kernel_test_in!("userspace", smoke_userspace_exit_observer_group_dead_once);
 /// wake and a Qt6 app (kcalc) deadlocked at startup — its worker thread
 /// signalled the main thread via FUTEX_WAKE_OP and the main thread never woke.
 fn smoke_userspace_futex_wake_op_rmw() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
         Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
@@ -1882,6 +1912,12 @@ fn smoke_userspace_futex_wake_op_rmw() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_futex_wake_op_rmw);
 
 fn smoke_userspace_sched_priority_bounds_and_param() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         init_per_task_state, install_core_syscalls, install_global, kernel_syscall_entry,
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
@@ -2156,6 +2192,12 @@ kernel_test_in!("userspace", smoke_userspace_setsid_makes_session_leader);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // Bootstrap mints rings, kernel installs the
     // abi-file-op-bridge, dispatcher runs on the kernel-side
     // ends, user-side task issues an `OpCode::Open` followed by
