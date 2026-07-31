@@ -1119,3 +1119,956 @@ fn smoke_abi_bpf_prog_load_with_a_map_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_with_a_map_neg);
+
+// ════════════════════════════════════════════════════════════════════
+// Introspection — `BPF_OBJ_GET_INFO_BY_FD` and the id family.
+//
+// Three properties carry the weight here and each has its own smoke:
+//
+//  1. the `info_len` in/out truncation contract, in *both* directions —
+//     an older caller must see only the prefix it understands, a newer
+//     one must be told how much was filled;
+//  2. id lifetime — an id is never reused, a freed object's id is
+//     `ENOENT` rather than a dangling handle, and an fd obtained by id
+//     holds its own reference;
+//  3. the errno vocabulary — `EBADF` for a bad fd, `ENOENT` for an
+//     unknown id, `EINVAL` for nonsense, `ENOTSUP` for absent features.
+// ════════════════════════════════════════════════════════════════════
+
+const BPF_PROG_GET_NEXT_ID: u64 = 11;
+const BPF_MAP_GET_NEXT_ID: u64 = 12;
+const BPF_PROG_GET_FD_BY_ID: u64 = 13;
+const BPF_MAP_GET_FD_BY_ID: u64 = 14;
+const BPF_OBJ_GET_INFO_BY_FD: u64 = 15;
+const BPF_LINK_GET_FD_BY_ID: u64 = 32;
+const BPF_LINK_GET_NEXT_ID: u64 = 33;
+
+/// `sizeof(struct bpf_prog_info)` and `sizeof(struct bpf_map_info)`, as the
+/// handler reports them. Spelled out again rather than imported from
+/// `sys_bpf_info.rs`: a test that shared the constant would agree with the
+/// implementation by construction and could never catch it drifting from the
+/// uapi header.
+const PROG_INFO_LEN: usize = 232;
+const MAP_INFO_LEN: usize = 88;
+
+/// Big enough for either info struct plus room to sentinel past the end.
+const INFO_BUF: usize = 320;
+
+// `struct bpf_prog_info` field offsets.
+const PI_TYPE: usize = 0;
+const PI_ID: usize = 4;
+const PI_JITED_PROG_LEN: usize = 16;
+const PI_XLATED_PROG_LEN: usize = 20;
+const PI_XLATED_PROG_INSNS: usize = 32;
+const PI_NR_MAP_IDS: usize = 52;
+const PI_MAP_IDS: usize = 56;
+const PI_NAME: usize = 64;
+const PI_RUN_CNT: usize = 200;
+
+// `struct bpf_map_info` field offsets.
+const MI_TYPE: usize = 0;
+const MI_ID: usize = 4;
+const MI_KEY_SIZE: usize = 8;
+const MI_VALUE_SIZE: usize = 12;
+const MI_MAX_ENTRIES: usize = 16;
+const MI_NAME: usize = 24;
+
+// `struct { … } info` offsets within `union bpf_attr`.
+const AI_BPF_FD: usize = 0;
+const AI_INFO_LEN: usize = 4;
+const AI_INFO: usize = 8;
+
+fn info_u32(buf: &[u8; INFO_BUF], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+fn info_u64(buf: &[u8; INFO_BUF], off: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&buf[off..off + 8]);
+    u64::from_le_bytes(b)
+}
+
+fn put_info_u64(buf: &mut [u8; INFO_BUF], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// `BPF_OBJ_GET_INFO_BY_FD` with a caller-chosen `info_len`.
+///
+/// Returns the syscall result *and* the `info_len` the kernel wrote back — the
+/// second half of the truncation contract, and the half a test that only
+/// checked field values would never look at.
+fn obj_info(fd: i64, info: &mut [u8; INFO_BUF], info_len: u32) -> (Option<i64>, u32) {
+    let mut attr = [0u8; ATTR_LEN];
+    put_u32(&mut attr, AI_BPF_FD, fd as u32);
+    put_u32(&mut attr, AI_INFO_LEN, info_len);
+    put_u64(&mut attr, AI_INFO, info.as_mut_ptr() as u64);
+    let r = call(
+        Syscall::Bpf.raw(),
+        a2(
+            BPF_OBJ_GET_INFO_BY_FD,
+            attr.as_mut_ptr() as u64,
+            ATTR_LEN as u64,
+        ),
+    );
+    (r, get_u32(&attr, AI_INFO_LEN))
+}
+
+/// `BPF_*_GET_NEXT_ID`: the syscall result and the id written back.
+fn next_id(cmd: u64, start: u32) -> (Option<i64>, u32) {
+    let mut attr = [0u8; ATTR_LEN];
+    put_u32(&mut attr, 0, start);
+    let r = call(
+        Syscall::Bpf.raw(),
+        a2(cmd, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+    );
+    (r, get_u32(&attr, 4))
+}
+
+/// `BPF_*_GET_FD_BY_ID`.
+fn fd_by_id(cmd: u64, id: u32) -> Option<i64> {
+    let mut attr = [0u8; ATTR_LEN];
+    put_u32(&mut attr, 0, id);
+    call(
+        Syscall::Bpf.raw(),
+        a2(cmd, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+    )
+}
+
+/// The id of the program behind `fd`, read out of its info struct.
+fn id_of(fd: i64) -> Result<u32, &'static str> {
+    let mut info = [0u8; INFO_BUF];
+    let (r, _) = obj_info(fd, &mut info, PROG_INFO_LEN as u32);
+    if r != Some(0) {
+        return Err("BPF_OBJ_GET_INFO_BY_FD failed on a program fd");
+    }
+    Ok(info_u32(&info, PI_ID))
+}
+
+/// The id of the *map* behind `fd`. Same offset as a program's, but reached
+/// through the map struct's length, so this is the call a map caller makes.
+fn map_id_of(fd: i64) -> Result<u32, &'static str> {
+    let mut info = [0u8; INFO_BUF];
+    let (r, _) = obj_info(fd, &mut info, MAP_INFO_LEN as u32);
+    if r != Some(0) {
+        return Err("BPF_OBJ_GET_INFO_BY_FD failed on a map fd");
+    }
+    Ok(info_u32(&info, MI_ID))
+}
+
+// ── BPF_OBJ_GET_INFO_BY_FD: programs ────────────────────────────────
+
+fn smoke_abi_bpf_obj_get_info_prog_pos() -> TestResult {
+    with_setup(|| {
+        let insns = ret_imm(7);
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &insns).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        let mut info = [0u8; INFO_BUF];
+        let (r, back) = obj_info(fd, &mut info, PROG_INFO_LEN as u32);
+        if r != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD on a program fd failed");
+        }
+        if back != PROG_INFO_LEN as u32 {
+            return Err("bpf_prog_info: kernel did not report sizeof(bpf_prog_info) back");
+        }
+        // `BPF_PROG_TYPE_TRACING` is what this was loaded as, so the round trip
+        // has to land back on it — a reported type that will not reload is
+        // worse than no type at all.
+        if info_u32(&info, PI_TYPE) != BPF_PROG_TYPE_TRACING {
+            return Err("bpf_prog_info.type did not round-trip BPF_PROG_TYPE_TRACING");
+        }
+        if info_u32(&info, PI_ID) == 0 {
+            return Err("bpf_prog_info.id is 0 — ids start at 1");
+        }
+        // NARF does not rewrite instructions, so the xlated length is exactly
+        // the loaded image.
+        if info_u32(&info, PI_XLATED_PROG_LEN) != insns.len() as u32 {
+            return Err("bpf_prog_info.xlated_prog_len is not the loaded image size");
+        }
+        if &info[PI_NAME..PI_NAME + 4] != b"abit" || info[PI_NAME + 4] != 0 {
+            return Err("bpf_prog_info.name is not the NUL-padded load-time name");
+        }
+        if info_u64(&info, PI_RUN_CNT) != 0 {
+            return Err("bpf_prog_info.run_cnt is non-zero for a program never run");
+        }
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, fd as u32);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_TEST_RUN, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(0)
+        {
+            return Err("BPF_PROG_TEST_RUN failed");
+        }
+        let (r, _) = obj_info(fd, &mut info, PROG_INFO_LEN as u32);
+        if r != Some(0) {
+            return Err("second BPF_OBJ_GET_INFO_BY_FD failed");
+        }
+        if info_u64(&info, PI_RUN_CNT) != 1 {
+            return Err("bpf_prog_info.run_cnt did not count the one run");
+        }
+        // A program the JIT declined reports 0; one it compiled reports the
+        // emitted byte count. Either is correct — what is not is a non-zero
+        // length claimed for something that never got text, so pin the only
+        // relation that holds either way.
+        let jited = info_u32(&info, PI_JITED_PROG_LEN);
+        if jited != 0 && jited < insns.len() as u32 {
+            return Err("bpf_prog_info.jited_prog_len is non-zero but implausibly small");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_prog_pos);
+
+fn smoke_abi_bpf_obj_get_info_neg() -> TestResult {
+    with_setup(|| {
+        let mut info = [0u8; INFO_BUF];
+        // An fd that names nothing.
+        if obj_info(4095, &mut info, PROG_INFO_LEN as u32).0 != Some(EBADF) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD on an unopened fd did not return EBADF");
+        }
+        // An fd that names something that is not a BPF object. `EINVAL` and not
+        // `ENOTSUP`: the kernel did not fail to *support* the object, it failed
+        // to recognise one.
+        let efd = call(Syscall::Eventfd.raw(), a0(0)).ok_or("eventfd() not Ok")?;
+        if efd < 0 {
+            return Err("eventfd failed");
+        }
+        if obj_info(efd, &mut info, PROG_INFO_LEN as u32).0 != Some(EINVAL) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD on a non-BPF fd did not return EINVAL");
+        }
+        let _ = call(Syscall::Close.raw(), a0(efd as u64));
+
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+        // A NULL info pointer with a non-zero length is a fault, not a silent
+        // no-op — the caller believes it has a filled buffer.
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, AI_BPF_FD, fd as u32);
+        put_u32(&mut attr, AI_INFO_LEN, PROG_INFO_LEN as u32);
+        put_u64(&mut attr, AI_INFO, 0);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_OBJ_GET_INFO_BY_FD,
+                attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(EFAULT)
+        {
+            return Err("BPF_OBJ_GET_INFO_BY_FD with a NULL info pointer did not return EFAULT");
+        }
+        // A `bpf_attr` shorter than the command's own fields.
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_OBJ_GET_INFO_BY_FD, attr.as_mut_ptr() as u64, 12),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_OBJ_GET_INFO_BY_FD with a truncated bpf_attr did not return EINVAL");
+        }
+        // `CHECK_ATTR`: a non-zero byte past this command's last field means
+        // the caller relies on something this kernel does not implement.
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, AI_BPF_FD, fd as u32);
+        put_u32(&mut attr, AI_INFO_LEN, PROG_INFO_LEN as u32);
+        put_u64(&mut attr, AI_INFO, info.as_mut_ptr() as u64);
+        attr[16] = 1;
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_OBJ_GET_INFO_BY_FD,
+                attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_OBJ_GET_INFO_BY_FD ignored a non-zero byte past its last field");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_neg);
+
+/// The instruction-dump fields. NARF has no dump path, and a caller that asked
+/// for the image must not get a success with its buffer untouched — it would
+/// disassemble whatever was already there.
+fn smoke_abi_bpf_obj_get_info_dump_neg() -> TestResult {
+    with_setup(|| {
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+        let mut sink = [0u8; INFO_BUF];
+        let mut info = [0u8; INFO_BUF];
+        put_info_u64(&mut info, PI_XLATED_PROG_INSNS, sink.as_mut_ptr() as u64);
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(EOPNOTSUPP) {
+            return Err("a request to dump xlated instructions did not return ENOTSUP");
+        }
+        // …and the same call without the dump pointer still works, so the
+        // refusal is scoped to the feature and not to the command.
+        let mut info = [0u8; INFO_BUF];
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD failed without a dump request");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_dump_neg);
+
+/// `nr_map_ids` / `map_ids` — the in/out pair a loader uses to rediscover the
+/// maps a program holds.
+fn smoke_abi_bpf_obj_get_info_map_ids_pos() -> TestResult {
+    with_setup(|| {
+        let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
+        if map_fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let map_id = map_id_of(map_fd)?;
+        let prog_fd =
+            load_prog(BPF_PROG_TYPE_TRACING, &ld_map_fd_prog(map_fd)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a program holding a map handle");
+        }
+
+        // Pass 1: capacity 0. The count comes back, nothing is written — this
+        // is how a caller sizes its buffer.
+        let mut info = [0u8; INFO_BUF];
+        if obj_info(prog_fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD failed");
+        }
+        if info_u32(&info, PI_NR_MAP_IDS) != 1 {
+            return Err("bpf_prog_info.nr_map_ids is not the program's map count");
+        }
+
+        // Pass 2: a real buffer, with a sentinel in the slot *immediately*
+        // after the one the kernel may fill. One id is due, so `ids[1]` must
+        // survive.
+        let mut ids = [0xAAAA_AAAAu32; 2];
+        let mut info = [0u8; INFO_BUF];
+        info[PI_NR_MAP_IDS..PI_NR_MAP_IDS + 4].copy_from_slice(&1u32.to_le_bytes());
+        put_info_u64(&mut info, PI_MAP_IDS, ids.as_mut_ptr() as u64);
+        if obj_info(prog_fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD with a map_ids buffer failed");
+        }
+        if ids[0] != map_id {
+            return Err("bpf_prog_info.map_ids[0] is not the id of the map the program holds");
+        }
+        if ids[1] != 0xAAAA_AAAA {
+            return Err("bpf_prog_info.map_ids wrote past the caller's declared capacity");
+        }
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_map_ids_pos);
+
+// ── BPF_OBJ_GET_INFO_BY_FD: maps ────────────────────────────────────
+
+fn smoke_abi_bpf_obj_get_info_map_pos() -> TestResult {
+    with_setup(|| {
+        let fd = create_map(BPF_MAP_TYPE_PERCPU_HASH, 4, 8, 6).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let mut info = [0u8; INFO_BUF];
+        let (r, back) = obj_info(fd, &mut info, MAP_INFO_LEN as u32);
+        if r != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD on a map fd failed");
+        }
+        if back != MAP_INFO_LEN as u32 {
+            return Err("bpf_map_info: kernel did not report sizeof(bpf_map_info) back");
+        }
+        // The type must round-trip through `BPF_MAP_CREATE`'s own value, or a
+        // loader reopening a map from its info would create the wrong kind.
+        if info_u32(&info, MI_TYPE) != BPF_MAP_TYPE_PERCPU_HASH {
+            return Err("bpf_map_info.type did not round-trip BPF_MAP_TYPE_PERCPU_HASH");
+        }
+        if info_u32(&info, MI_ID) == 0 {
+            return Err("bpf_map_info.id is 0 — ids start at 1");
+        }
+        if info_u32(&info, MI_KEY_SIZE) != 4 {
+            return Err("bpf_map_info.key_size is wrong");
+        }
+        if info_u32(&info, MI_VALUE_SIZE) != 8 {
+            return Err("bpf_map_info.value_size is wrong");
+        }
+        if info_u32(&info, MI_MAX_ENTRIES) != 6 {
+            return Err("bpf_map_info.max_entries is wrong");
+        }
+        if info[MI_NAME] != 0 {
+            return Err("bpf_map_info.name should be empty for an unnamed map");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_map_pos);
+
+// ── the info_len truncation contract ────────────────────────────────
+
+/// Backward compatibility: a caller compiled against a *smaller* struct gets
+/// exactly the prefix it declared and not one byte more.
+fn smoke_abi_bpf_info_len_short_pos() -> TestResult {
+    with_setup(|| {
+        let fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 3).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let id = map_id_of(fd)?;
+
+        // Sentinel the *whole* buffer. Anything written past the declared 8
+        // bytes is an overrun into a caller that never asked for the space —
+        // the failure this contract exists to prevent.
+        let mut info = [0xAAu8; INFO_BUF];
+        let (r, back) = obj_info(fd, &mut info, 8);
+        if r != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD with a short info_len failed");
+        }
+        if back != 8 {
+            return Err("a short info_len must be echoed back unchanged");
+        }
+        if info_u32(&info, MI_TYPE) != BPF_MAP_TYPE_ARRAY {
+            return Err("the 8-byte prefix does not carry bpf_map_info.type");
+        }
+        if info_u32(&info, MI_ID) != id {
+            return Err("the 8-byte prefix does not carry bpf_map_info.id");
+        }
+        // Byte 8 is the first the kernel must not touch — one slot past the
+        // boundary, not somewhere safely distant.
+        if info[8] != 0xAA {
+            return Err("BPF_OBJ_GET_INFO_BY_FD wrote past the caller's declared info_len");
+        }
+        if info[MAP_INFO_LEN - 1] != 0xAA || info[MAP_INFO_LEN] != 0xAA {
+            return Err("BPF_OBJ_GET_INFO_BY_FD filled the whole struct despite a short info_len");
+        }
+        // An info_len of 0 is legal and writes nothing.
+        let mut info = [0xAAu8; INFO_BUF];
+        let (r, back) = obj_info(fd, &mut info, 0);
+        if r != Some(0) || back != 0 {
+            return Err("an info_len of 0 should succeed and report 0");
+        }
+        if info[0] != 0xAA {
+            return Err("an info_len of 0 still wrote to the caller's buffer");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_info_len_short_pos);
+
+/// Forward compatibility: a caller compiled against a *larger* struct is told
+/// how much was filled, so it can tell "this kernel left the field alone" from
+/// "the field is genuinely zero".
+fn smoke_abi_bpf_info_len_long_pos() -> TestResult {
+    with_setup(|| {
+        let fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 3).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        // Tail zeroed, as a well-behaved newer caller does.
+        let mut info = [0u8; INFO_BUF];
+        let (r, back) = obj_info(fd, &mut info, MAP_INFO_LEN as u32 + 32);
+        if r != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD with an oversized info_len failed");
+        }
+        if back != MAP_INFO_LEN as u32 {
+            return Err(
+                "an oversized info_len must be answered with sizeof, not echoed — the caller \
+                 cannot otherwise tell which suffix went unfilled",
+            );
+        }
+        if info_u32(&info, MI_MAX_ENTRIES) != 3 {
+            return Err("the leading struct was not filled");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_info_len_long_pos);
+
+fn smoke_abi_bpf_info_len_long_neg() -> TestResult {
+    with_setup(|| {
+        let fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 3).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        // A non-zero byte in the part this kernel cannot fill means the caller
+        // relies on a field that does not exist here. `E2BIG` says so;
+        // succeeding would leave it reading its own stale value as an answer.
+        let mut info = [0u8; INFO_BUF];
+        info[MAP_INFO_LEN] = 1;
+        if obj_info(fd, &mut info, MAP_INFO_LEN as u32 + 32).0 != Some(E2BIG) {
+            return Err("an oversized info_len with a non-zero tail did not return E2BIG");
+        }
+        // …and the byte immediately *before* the boundary is inside the struct,
+        // so it must not trigger the check.
+        let mut info = [0u8; INFO_BUF];
+        info[MAP_INFO_LEN - 1] = 1;
+        if obj_info(fd, &mut info, MAP_INFO_LEN as u32 + 32).0 != Some(0) {
+            return Err("the tail-zero check started one byte early");
+        }
+        // Silly large, matching Linux's PAGE_SIZE guard.
+        let mut info = [0u8; INFO_BUF];
+        if obj_info(fd, &mut info, 8192).0 != Some(E2BIG) {
+            return Err("an absurd info_len did not return E2BIG");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_info_len_long_neg);
+
+// ── BPF_*_GET_NEXT_ID ───────────────────────────────────────────────
+
+fn smoke_abi_bpf_get_next_id_pos() -> TestResult {
+    with_setup(|| {
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(3)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+        let want = id_of(fd)?;
+        let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 2).ok_or("bpf() not Ok")?;
+        if map_fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let want_map = map_id_of(map_fd)?;
+
+        // A walk from 0 must reach the object just made, and must terminate.
+        // The step bound is generous but finite: an id table that never says
+        // ENOENT is an infinite loop in every enumerating tool.
+        let mut cur = 0u32;
+        let mut found = false;
+        let mut steps = 0;
+        loop {
+            let (r, id) = next_id(BPF_PROG_GET_NEXT_ID, cur);
+            if r == Some(ENOENT) {
+                break;
+            }
+            if r != Some(0) {
+                return Err("BPF_PROG_GET_NEXT_ID returned neither 0 nor ENOENT");
+            }
+            if id <= cur {
+                return Err("BPF_PROG_GET_NEXT_ID did not advance strictly — a walk would loop");
+            }
+            if id == want {
+                found = true;
+            }
+            cur = id;
+            steps += 1;
+            if steps > 100_000 {
+                return Err("BPF_PROG_GET_NEXT_ID never terminated");
+            }
+        }
+        if !found {
+            return Err("a freshly loaded program was not reachable by BPF_PROG_GET_NEXT_ID");
+        }
+
+        let mut cur = 0u32;
+        let mut found = false;
+        let mut steps = 0;
+        loop {
+            let (r, id) = next_id(BPF_MAP_GET_NEXT_ID, cur);
+            if r == Some(ENOENT) {
+                break;
+            }
+            if r != Some(0) {
+                return Err("BPF_MAP_GET_NEXT_ID returned neither 0 nor ENOENT");
+            }
+            if id <= cur {
+                return Err("BPF_MAP_GET_NEXT_ID did not advance strictly");
+            }
+            if id == want_map {
+                found = true;
+            }
+            cur = id;
+            steps += 1;
+            if steps > 100_000 {
+                return Err("BPF_MAP_GET_NEXT_ID never terminated");
+            }
+        }
+        if !found {
+            return Err("a freshly created map was not reachable by BPF_MAP_GET_NEXT_ID");
+        }
+        // Starting *at* an object's own id must skip it: the walk contract is
+        // "strictly greater", which is what makes feeding each answer back in
+        // terminate rather than repeat.
+        let (r, id) = next_id(BPF_MAP_GET_NEXT_ID, want_map);
+        if r == Some(0) && id == want_map {
+            return Err("BPF_MAP_GET_NEXT_ID returned the id it was given");
+        }
+        let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_get_next_id_pos);
+
+fn smoke_abi_bpf_get_next_id_neg() -> TestResult {
+    with_setup(|| {
+        // Past the last possible id there is nothing, and the answer is ENOENT
+        // rather than a zero id reported as success.
+        if next_id(BPF_PROG_GET_NEXT_ID, u32::MAX).0 != Some(ENOENT) {
+            return Err("BPF_PROG_GET_NEXT_ID past the end did not return ENOENT");
+        }
+        if next_id(BPF_MAP_GET_NEXT_ID, u32::MAX).0 != Some(ENOENT) {
+            return Err("BPF_MAP_GET_NEXT_ID past the end did not return ENOENT");
+        }
+        // A `bpf_attr` shorter than the command's own fields.
+        let mut attr = [0u8; ATTR_LEN];
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_GET_NEXT_ID, attr.as_mut_ptr() as u64, 4),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_GET_NEXT_ID with a truncated bpf_attr did not return EINVAL");
+        }
+        // `CHECK_ATTR`: `open_flags` is past this command's last field.
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 8, 1);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_PROG_GET_NEXT_ID,
+                attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_GET_NEXT_ID ignored a non-zero byte past its last field");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_get_next_id_neg);
+
+// ── BPF_*_GET_FD_BY_ID ──────────────────────────────────────────────
+
+fn smoke_abi_bpf_get_fd_by_id_pos() -> TestResult {
+    with_setup(|| {
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(9)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+        let id = id_of(fd)?;
+        let fd2 = fd_by_id(BPF_PROG_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+        if fd2 < 0 {
+            return Err("BPF_PROG_GET_FD_BY_ID failed for a live program");
+        }
+        if fd2 == fd {
+            return Err("BPF_PROG_GET_FD_BY_ID handed back the same fd, not a new one");
+        }
+        if id_of(fd2)? != id {
+            return Err("the fd obtained by id names a different program");
+        }
+        // Linux sets close-on-exec on every bpf fd, including this one.
+        let flags = call(Syscall::Fcntl.raw(), a2(fd2 as u64, 1, 0)).ok_or("fcntl not Ok")?;
+        if flags & 1 == 0 {
+            return Err("BPF_PROG_GET_FD_BY_ID did not set close-on-exec");
+        }
+
+        let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 2).ok_or("bpf() not Ok")?;
+        if map_fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let map_id = map_id_of(map_fd)?;
+        let map_fd2 = fd_by_id(BPF_MAP_GET_FD_BY_ID, map_id).ok_or("bpf() not Ok")?;
+        if map_fd2 < 0 {
+            return Err("BPF_MAP_GET_FD_BY_ID failed for a live map");
+        }
+        if map_id_of(map_fd2)? != map_id {
+            return Err("the fd obtained by id names a different map");
+        }
+        let _ = call(Syscall::Close.raw(), a0(map_fd2 as u64));
+        let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(fd2 as u64));
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_get_fd_by_id_pos);
+
+fn smoke_abi_bpf_get_fd_by_id_neg() -> TestResult {
+    with_setup(|| {
+        // Id 0 is never assigned — both counters start at 1.
+        if fd_by_id(BPF_PROG_GET_FD_BY_ID, 0) != Some(ENOENT) {
+            return Err("BPF_PROG_GET_FD_BY_ID(0) did not return ENOENT");
+        }
+        if fd_by_id(BPF_MAP_GET_FD_BY_ID, 0) != Some(ENOENT) {
+            return Err("BPF_MAP_GET_FD_BY_ID(0) did not return ENOENT");
+        }
+        // An id far past anything this boot assigned.
+        if fd_by_id(BPF_PROG_GET_FD_BY_ID, u32::MAX) != Some(ENOENT) {
+            return Err("BPF_PROG_GET_FD_BY_ID on an unassigned id did not return ENOENT");
+        }
+        if fd_by_id(BPF_MAP_GET_FD_BY_ID, u32::MAX) != Some(ENOENT) {
+            return Err("BPF_MAP_GET_FD_BY_ID on an unassigned id did not return ENOENT");
+        }
+
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+        let prog_id = id_of(fd)?;
+        // The two id spaces are independent, so a program id may or may not
+        // also name a map. What must never happen is the *program* coming back
+        // through the map table.
+        if let Some(r) = fd_by_id(BPF_MAP_GET_FD_BY_ID, prog_id) {
+            if r >= 0 {
+                let mut info = [0u8; INFO_BUF];
+                let (ok, back) = obj_info(r, &mut info, PROG_INFO_LEN as u32);
+                if ok == Some(0) && back == PROG_INFO_LEN as u32 {
+                    return Err("BPF_MAP_GET_FD_BY_ID resolved a program id to a program fd");
+                }
+                let _ = call(Syscall::Close.raw(), a0(r as u64));
+            }
+        }
+        // `CHECK_ATTR`: a program fd takes no `open_flags`.
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, prog_id);
+        put_u32(&mut attr, 8, 1);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_PROG_GET_FD_BY_ID,
+                attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_GET_FD_BY_ID ignored a non-zero open_flags");
+        }
+        // LINUX-GAP: a map fd *does* take `open_flags` on Linux
+        // (`BPF_F_RDONLY`/`BPF_F_WRONLY`), and NARF has no read-only map fd —
+        // so it must refuse rather than hand back a fully writable one.
+        let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 2).ok_or("bpf() not Ok")?;
+        if map_fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let map_id = map_id_of(map_fd)?;
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, map_id);
+        put_u32(&mut attr, 8, 0x0000_0008 /* BPF_F_RDONLY */);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_MAP_GET_FD_BY_ID,
+                attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(EOPNOTSUPP)
+        {
+            return Err("BPF_MAP_GET_FD_BY_ID with BPF_F_RDONLY did not return ENOTSUP");
+        }
+        let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_get_fd_by_id_neg);
+
+// ── id lifetime ─────────────────────────────────────────────────────
+
+/// An fd obtained by id holds its **own** reference: closing the fd the object
+/// was created through must not invalidate it. That is the whole reason
+/// `GET_FD_BY_ID` exists, and it is the property that rots silently if the
+/// second fd ever ends up sharing the first one's ownership.
+fn smoke_abi_bpf_fd_by_id_keeps_object_alive_pos() -> TestResult {
+    with_setup(|| {
+        let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 2).ok_or("bpf() not Ok")?;
+        if map_fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let id = map_id_of(map_fd)?;
+        let by_id = fd_by_id(BPF_MAP_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+        if by_id < 0 {
+            return Err("BPF_MAP_GET_FD_BY_ID failed");
+        }
+        // Drop the creating fd. Everything below runs against `by_id` alone.
+        let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+
+        if map_id_of(by_id)? != id {
+            return Err("the id-obtained fd stopped naming its map once the creating fd closed");
+        }
+        // Not just readable metadata — the map itself must still work.
+        let key = 1u32;
+        let value = 0x1122_3344_5566_7788u64;
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, ME_MAP_FD, by_id as u32);
+        put_u64(&mut attr, ME_KEY, (&key as *const u32) as u64);
+        put_u64(&mut attr, ME_VALUE, (&value as *const u64) as u64);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_MAP_UPDATE_ELEM,
+                attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("update through an id-obtained fd failed after the creating fd closed");
+        }
+        let mut got = 0u64;
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, ME_MAP_FD, by_id as u32);
+        put_u64(&mut attr, ME_KEY, (&key as *const u32) as u64);
+        put_u64(&mut attr, ME_VALUE, (&mut got as *mut u64) as u64);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_MAP_LOOKUP_ELEM,
+                attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("lookup through an id-obtained fd failed");
+        }
+        if got != value {
+            return Err("the id-obtained fd read back the wrong value — it is not the same map");
+        }
+        // And the id is still live for a *third* opener while `by_id` is held.
+        let third = fd_by_id(BPF_MAP_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+        if third < 0 {
+            return Err("the id stopped resolving while an id-obtained fd was still open");
+        }
+        let _ = call(Syscall::Close.raw(), a0(third as u64));
+        let _ = call(Syscall::Close.raw(), a0(by_id as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_fd_by_id_keeps_object_alive_pos);
+
+/// The teardown half: once the last reference goes, the id stops resolving —
+/// and is never handed to a later object. A reused id is how a loader that
+/// cached one silently starts addressing something else.
+fn smoke_abi_bpf_id_not_reused_after_teardown_neg() -> TestResult {
+    with_setup(|| {
+        let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 2).ok_or("bpf() not Ok")?;
+        if map_fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let dead_id = map_id_of(map_fd)?;
+        let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+
+        // The object is gone: the registry holds a weak reference, so this is a
+        // failed lookup and not a dangling handle.
+        if fd_by_id(BPF_MAP_GET_FD_BY_ID, dead_id) != Some(ENOENT) {
+            return Err("BPF_MAP_GET_FD_BY_ID resolved a map whose last fd was closed");
+        }
+        // …and the walk no longer visits it.
+        let (r, id) = next_id(BPF_MAP_GET_NEXT_ID, dead_id - 1);
+        if r == Some(0) && id == dead_id {
+            return Err("BPF_MAP_GET_NEXT_ID still walks over a freed map's id");
+        }
+
+        // The next map must not inherit the freed id.
+        let next = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 2).ok_or("bpf() not Ok")?;
+        if next < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let new_id = map_id_of(next)?;
+        if new_id == dead_id {
+            return Err("a freed map's id was reused — a cached id now names a different map");
+        }
+        if new_id < dead_id {
+            return Err("map ids went backwards");
+        }
+
+        // Same for programs.
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+        let dead_prog = id_of(prog_fd)?;
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        if fd_by_id(BPF_PROG_GET_FD_BY_ID, dead_prog) != Some(ENOENT) {
+            return Err("BPF_PROG_GET_FD_BY_ID resolved a program whose last fd was closed");
+        }
+        let again = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if again < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+        if id_of(again)? == dead_prog {
+            return Err("a freed program's id was reused");
+        }
+        let _ = call(Syscall::Close.raw(), a0(again as u64));
+        let _ = call(Syscall::Close.raw(), a0(next as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_bpf_id_not_reused_after_teardown_neg
+);
+
+/// A map a program still references outlives its own fd — so its id keeps
+/// resolving. The complement of the teardown smoke: "the fd closed" is not the
+/// same event as "the object died", and an id table that confused the two would
+/// hide exactly the maps a loader most wants to rediscover.
+fn smoke_abi_bpf_id_survives_fd_close_while_referenced_pos() -> TestResult {
+    with_setup(|| {
+        let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
+        if map_fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let map_id = map_id_of(map_fd)?;
+        let prog_fd =
+            load_prog(BPF_PROG_TYPE_TRACING, &ld_map_fd_prog(map_fd)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a program holding a map handle");
+        }
+        // The program holds an `Arc`, so closing the creating fd does not free
+        // the map.
+        let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+
+        let reopened = fd_by_id(BPF_MAP_GET_FD_BY_ID, map_id).ok_or("bpf() not Ok")?;
+        if reopened < 0 {
+            return Err("a map still referenced by a program stopped resolving by id");
+        }
+        if map_id_of(reopened)? != map_id {
+            return Err("the reopened fd names a different map");
+        }
+        let _ = call(Syscall::Close.raw(), a0(reopened as u64));
+        // Now drop the program too. With no reference left the id must stop
+        // resolving — otherwise the entry, not the object, was keeping it alive.
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        if fd_by_id(BPF_MAP_GET_FD_BY_ID, map_id) != Some(ENOENT) {
+            return Err("the map's id still resolved after its last reference went away");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_bpf_id_survives_fd_close_while_referenced_pos
+);
+
+// ── links ───────────────────────────────────────────────────────────
+
+/// LINUX-GAP: `BPF_LINK_GET_NEXT_ID` / `BPF_LINK_GET_FD_BY_ID`. NARF has no
+/// link object to assign ids to, so these stay `ENOTSUP` — worth pinning,
+/// because the failure mode when a link type does arrive is these arms being
+/// forgotten and a probing loader concluding the kernel has no links at all.
+fn smoke_abi_bpf_link_id_cmds_neg() -> TestResult {
+    with_setup(|| {
+        let mut attr = [0u8; ATTR_LEN];
+        for cmd in [BPF_LINK_GET_NEXT_ID, BPF_LINK_GET_FD_BY_ID] {
+            if call(
+                Syscall::Bpf.raw(),
+                a2(cmd, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+            ) != Some(EOPNOTSUPP)
+            {
+                return Err("a link id command did not return ENOTSUP");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_link_id_cmds_neg);
