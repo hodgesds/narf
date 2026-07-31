@@ -317,6 +317,19 @@ pub fn __reset_shrinkers_for_test() {
     *SHRINKERS.lock() = [None; MAX_SHRINKERS];
 }
 
+/// Free up to `target` reclaimable pages for a caller under allocation
+/// pressure — the direct-reclaim entry point. Returns the number freed.
+///
+/// ALLOCATION-FREE: this is called from `GlobalAlloc::alloc` when an
+/// allocation fails, where allocating is precisely what must not happen.
+/// It therefore drives only the shrinker path (`shrink_all`), which is
+/// allocation-free; the per-page frame LRU (`reclaim_target_pages`) is
+/// NOT yet included because it snapshots into a `Vec` — it will join once
+/// it is made allocation-free (and once a producer registers frames).
+pub fn try_to_free(target: usize) -> usize {
+    shrink_all(target)
+}
+
 /// Watermark-math tests. Always compiled (not `#[cfg(test)]`) so they
 /// register in the in-kernel `narf.tests` section and actually run under
 /// `cargo xtask test` — unlike the host-only `#[cfg(test)] mod tests`
