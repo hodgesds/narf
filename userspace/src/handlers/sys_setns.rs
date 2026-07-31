@@ -40,6 +40,15 @@ pub(crate) fn sys_setns(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(!0u64));
                 return;
             }
+            if let crate::namespaces::HeldNs::MntGlobal(_) = &held {
+                if nstype == 0 || nstype & CLONE_NEWNS != 0 {
+                    install_initial_mount_namespace(caller);
+                    ctx.set_return(SyscallReturn::ok(0));
+                    return;
+                }
+                ctx.set_return(SyscallReturn::ok(!0u64));
+                return;
+            }
             if crate::namespaces::install_held_ns(caller, outer, &held, nstype) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {

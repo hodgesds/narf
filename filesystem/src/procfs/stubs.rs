@@ -12,15 +12,9 @@
 //! | /proc/cgroups                      | hdr/live  | controller list when enabled |
 //! | /proc/keys                         | ""        | no keyring subsystem |
 //! | /proc/key-users                    | ""        | no keyring subsystem |
-//! | /proc/sys/kernel/ns_last_pid       | "0\n"     | no PID namespaces in this build |
+//! | /proc/sys/kernel/ns_last_pid       | "0\n"     | namespace support disabled in this build |
 //! | /proc/sys/kernel/keys/maxkeys      | "200\n"   | no keyring subsystem |
-//! | /proc/sys/user/max_user_namespaces | "0\n"     | no user namespaces in this build |
-//! | /proc/sys/user/max_pid_namespaces  | "0\n"     | no PID namespaces in this build |
-//! | /proc/sys/user/max_net_namespaces  | "0\n"     | no network namespaces in this build |
-//! | /proc/sys/user/max_mnt_namespaces  | "0\n"     | no mount namespaces in this build |
-//! | /proc/sys/user/max_ipc_namespaces  | "0\n"     | no IPC namespaces in this build |
-//! | /proc/sys/user/max_uts_namespaces  | "0\n"     | no UTS namespaces in this build |
-//! | /proc/sys/user/max_cgroup_namespaces | "0\n"   | no cgroup namespaces in this build |
+//! | /proc/sys/user/max_*_namespaces    | "0\n"     | namespace support disabled in this build |
 //!
 //! NOTE: `/proc/<pid>/cgroup`, `/proc/<pid>/personality`, and
 //! `/proc/<pid>/wchan` are per-task stubs that live in `pid_ext.rs`
@@ -106,15 +100,15 @@ impl ProcFile for KeyUsersFile {
 // ── /proc/sys/kernel/ns_last_pid ────────────────────────────────
 //
 // Linux: last PID allocated in the current PID namespace. Used by
-// tools that tune PID recycling (e.g. sysbox-runc).  NARF has a flat
-// pid space with no namespace layer today.  "0\n" is a safe sentinel.
-// When PID namespaces land, surface the real last-allocated PID from
-// the scheduler.
+// tools that tune PID recycling (e.g. sysbox-runc). In a build without
+// the `container` feature NARF has a flat pid space, so "0\n" is a safe
+// disabled sentinel. Container-enabled builds omit this sysctl until the
+// PID namespace exports its authoritative high-water mark.
 
 #[cfg(not(feature = "container"))]
 fn read_ns_last_pid() -> String {
-    // No PID namespaces in NARF; 0 is the sentinel for "not yet
-    // allocated in any namespace".  Linux ref: kernel/pid.c::
+    // Namespace support is disabled in this build; 0 is the sentinel for
+    // "not yet allocated in any namespace". Linux ref: kernel/pid.c::
     // proc_sys_last_pid (sysctl handler).
     String::from("0\n")
 }
@@ -137,12 +131,11 @@ fn read_maxkeys() -> String {
 //
 // Linux: per-user limits on namespace counts. These are meaningful
 // only when the corresponding namespace type exists in the kernel.
-// NARF has no namespace layer (no user_ns, pid_ns, net_ns, mnt_ns,
-// ipc_ns, uts_ns, cgroup_ns).  All limits are 0 — the correct value
-// for a kernel that does not support the namespace type.
-//
-// When a namespace type is added, replace the corresponding fn with a
-// real atomic-backed read/write handler and raise the limit.
+// In builds without the `container` feature none of these namespace types
+// is compiled, so all limits are 0. Container-enabled builds omit these
+// entries until userspace exports authoritative per-user limits; publishing
+// zero there would incorrectly tell Linux software that namespaces are
+// disabled.
 //
 // Linux ref: kernel/ucount.c::create_user_ns_sysctl_table.
 
@@ -161,10 +154,10 @@ pub fn register_all() {
     register_proc("keys", Arc::new(KeysFile));
     register_proc("key-users", Arc::new(KeyUsersFile));
 
-    // Do not publish a zero namespace limit in a container-enabled build:
-    // zero means "disabled" to Linux userspace, while those namespaces are
-    // actually usable. Until the namespace layer exposes authoritative
-    // limits/high-water marks, absence is the honest older-kernel shape.
+    // Do not publish zero namespace values in a container-enabled build:
+    // zero means "disabled" to Linux userspace, while namespaces are usable.
+    // Until userspace exposes authoritative limits/high-water marks, absence
+    // is the honest older-kernel shape.
     #[cfg(not(feature = "container"))]
     {
         register_sysctl(SysctlEntry {
@@ -271,6 +264,23 @@ kernel_test_in!(
     smoke_sys_user_max_user_namespaces_zero
 );
 
+#[cfg(feature = "container")]
+fn smoke_namespace_limits_absent_when_enabled() -> TestResult {
+    register_all();
+    let user_limit = lookup_registry(&["sys", "user", "max_user_namespaces"]);
+    let last_pid = lookup_registry(&["sys", "kernel", "ns_last_pid"]);
+    if user_limit.is_none() && last_pid.is_none() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("container build published a false zero namespace limit")
+    }
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "filesystem/procfs/stubs",
+    smoke_namespace_limits_absent_when_enabled
+);
+
 fn smoke_proc_keys_empty() -> TestResult {
     register_all();
     let snap = lookup_registry(&["keys"]);
@@ -283,6 +293,7 @@ fn smoke_proc_keys_empty() -> TestResult {
 }
 kernel_test_in!("filesystem/procfs/stubs", smoke_proc_keys_empty);
 
+#[cfg(not(feature = "container"))]
 fn smoke_sys_kernel_ns_last_pid_zero() -> TestResult {
     register_all();
     let snap = lookup_registry(&["sys", "kernel", "ns_last_pid"]);
@@ -293,6 +304,7 @@ fn smoke_sys_kernel_ns_last_pid_zero() -> TestResult {
         TestResult::Fail("ns_last_pid did not return '0\\n'")
     }
 }
+#[cfg(not(feature = "container"))]
 kernel_test_in!("filesystem/procfs/stubs", smoke_sys_kernel_ns_last_pid_zero);
 
 fn smoke_sys_kernel_keys_maxkeys_200() -> TestResult {

@@ -97,6 +97,27 @@ pub struct ProcAuxEntry {
     pub value: u64,
 }
 
+/// Authoritative open-file metadata for `/proc/<pid>/fdinfo/<fd>`.
+/// Values are captured by the fd-table owner so procfs does not invent
+/// offsets, flags, mount identities, or inode numbers.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcFdInfo {
+    pub pos: u64,
+    pub flags: u32,
+    pub mnt_id: u64,
+    pub ino: u64,
+}
+
+/// One atomic-enough fd-table projection used by both `/proc/<pid>/fd/<fd>`
+/// and `/proc/<pid>/fdinfo/<fd>`. Keeping the path and metadata behind one
+/// provider hook avoids separate boot wiring for two views of the same open
+/// file description.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcFdSnapshot {
+    pub path: String,
+    pub info: ProcFdInfo,
+}
+
 /// One virtual-memory area entry. Mirrors what `/proc/[pid]/maps`
 /// reports per line: range, protection bits, and an optional name.
 #[derive(Copy, Clone, Debug, Default)]
@@ -234,7 +255,7 @@ pub(crate) fn task_info(pid: u64) -> Option<ProcTaskInfo> {
 
 // ── Extended + writable per-pid hook types ──────────────────────
 
-type FdPathFn = fn(u64, u32) -> Option<String>;
+type FdSnapshotFn = fn(u64, u32) -> Option<ProcFdSnapshot>;
 /// Returns the fd numbers currently open for a pid — an exact snapshot of
 /// the fd table, ascending. Backs `/proc/<pid>/fd` enumeration.
 type FdListFn = fn(u64) -> Vec<u32>;
@@ -345,13 +366,13 @@ static OOM_SCORE_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Wire the extended /proc/[pid]/* read hooks. Called once at boot.
 pub fn install_proc_ext_hooks(
-    fd_path: FdPathFn,
+    fd_snapshot: FdSnapshotFn,
     rlimits: RlimitsFn,
     nice: NiceFn,
     environ: EnvironFn,
     auxv: AuxvFn,
 ) {
-    FD_PATH_HOOK.store(fd_path as usize, Ordering::Release);
+    FD_PATH_HOOK.store(fd_snapshot as usize, Ordering::Release);
     RLIMITS_HOOK.store(rlimits as usize, Ordering::Release);
     NICE_HOOK.store(nice as usize, Ordering::Release);
     ENVIRON_HOOK.store(environ as usize, Ordering::Release);
@@ -420,6 +441,16 @@ pub(crate) fn hook_fd_pidfd_pid(pid: u64, fd: u32) -> Option<u64> {
     f(pid, fd)
 }
 
+pub(crate) fn hook_fd_info(pid: u64, fd: u32) -> Option<ProcFdInfo> {
+    let v = FD_PATH_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: stored by install_proc_ext_hooks as an FdSnapshotFn; non-zero confirms it.
+    let f: FdSnapshotFn = unsafe { core::mem::transmute(v) };
+    f(pid, fd).map(|snapshot| snapshot.info)
+}
+
 /// The open fd numbers for `pid` via the installed hook, or `None` if no
 /// hook is wired (callers then fall back to per-fd probing).
 pub(crate) fn hook_fd_list(pid: u64) -> Option<Vec<u32>> {
@@ -437,9 +468,9 @@ pub(crate) fn hook_fd_path(pid: u64, fd: u32) -> Option<String> {
     if v == 0 {
         return None;
     }
-    // SAFETY: v was stored by install_proc_ext_hooks as a FdPathFn fn-pointer; non-zero confirms it.
-    let f: FdPathFn = unsafe { core::mem::transmute(v) };
-    f(pid, fd)
+    // SAFETY: v was stored by install_proc_ext_hooks as an FdSnapshotFn fn-pointer; non-zero confirms it.
+    let f: FdSnapshotFn = unsafe { core::mem::transmute(v) };
+    f(pid, fd).map(|snapshot| snapshot.path)
 }
 
 // ── Namespace procfs hooks ──────────────────────────────────────

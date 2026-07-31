@@ -71,7 +71,7 @@ linux-compat = ["narf-memory/linux-compat", "narf-filesystem/linux-compat"]
 # Orthogonal to linux-compat — a container runtime needs both; a
 # namespace-aware native kernel needs only this. pivot_root also
 # requires both linux-compat and container.
-container = []
+container = ["narf-filesystem/container"]
 
 # cgroup-v2 unified hierarchy. Wires fork-inheritance + exit-cleanup
 # of process cgroup membership into the task lifecycle. Forwards to

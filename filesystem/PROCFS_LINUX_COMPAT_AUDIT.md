@@ -1,6 +1,6 @@
 # Linux procfs compatibility audit
 
-Status: compatibility audit of the implemented procfs surface, 2026-07-30.
+Status: compatibility audit of the implemented procfs surface, 2026-07-31.
 
 Target: present Linux-shaped procfs metadata and text formats to unmodified
 Linux userspace without inventing kernel state that NARF does not track. This
@@ -42,9 +42,9 @@ Semcode call-chain analysis covered all four seams. In particular:
 | `/proc/{uptime,loadavg,stat}` | compatible implemented fields | Uptime includes aggregate CPU idle time; loadavg's final field is a visible PID; stat includes per-vector interrupt and softirq rows. |
 | `/proc/filesystems` | compatible shape | Pseudo filesystems use Linux's `nodev NAME` form and each filesystem appears once. |
 | `/proc/<pid>/status` memory rows | compatible accounting shape | VmSize/VmData/VmStk use VMA extents; VmRSS uses resident pages instead of mirroring virtual size. |
-| `/proc/<pid>/fdinfo/<fd>` | partial | Baseline `pos`, `flags`, `mnt_id`, and `ino` fields are present. Several values remain placeholders until fd/VFS metadata exposes authoritative offsets, mount IDs, and inode numbers. |
+| `/proc/<pid>/fdinfo/<fd>` | compatible implemented fields | Baseline `pos`, `flags`, `mnt_id`, and `ino` fields come from the live fd entry and backing VFS object. Provider absence produces neutral values rather than fabricated identity. |
 | `/proc/<pid>/mountinfo`, `/proc/mounts` | compatible implemented fields | Rows use the `proc` filesystem name and task-visible mount/chroot projection. Optional Linux fields are omitted when NARF has no corresponding state. |
-| `/proc/<pid>/ns/*` | partial | Link text and symlink metadata are exposed. Following/opening every magic link as an nsfs fd is not yet complete, especially for the global mount and cgroup namespaces. |
+| `/proc/<pid>/ns/*` | compatible implemented flavours | Link text, symlink metadata, followed `open(2)` to an nsfs-like fd, and `setns(2)` work for UTS, network, IPC, PID, mount, user, and enabled cgroup namespaces. Initial namespaces retain stable identities; `O_PATH|O_NOFOLLOW` opens the link itself. |
 | registered stub and bus nodes | compatible discovery shape | Existing proc stubs and `/proc/bus` are registered during procfs boot instead of being test-only unreachable code. |
 
 ## Findings corrected
@@ -67,17 +67,18 @@ Semcode call-chain analysis covered all four seams. In particular:
 - Root directory enumeration mislabeled `self` as a directory and depended on
   a shadowed registration to expose `stat`.
 - Boot registered neither the already-implemented proc stubs nor `/proc/bus`.
+- The userspace `container` feature did not forward the filesystem feature,
+  so procfs could publish zero namespace limits while namespace syscalls were
+  active. The feature now propagates, and enabled builds omit limits for which
+  NARF has no authoritative accounting provider.
+- Namespace magic links now mint retained namespace descriptors through the
+  normal open path, including stable initial mount and cgroup namespace
+  identities. The same bridge also completes pidfd namespace ioctls.
+- `fdinfo` now receives the live offset, open-file status flags, mount ID, and
+  backing inode in the same provider snapshot as the fd link target.
 
 ## Remaining gaps
 
-- Namespace magic links need an explicit VFS/open contract that produces an
-  nsfs-like fd while preserving `O_PATH|O_NOFOLLOW` access to the symlink
-  itself. The existing namespace-fd object is not yet connected to the normal
-  open path for every namespace flavour.
-- `fdinfo` must obtain the real file offset, open flags, mount ID, and inode
-  from the fd entry and backing VFS node. Zero placeholders are preferable to
-  fabricated identity, but consumers that compare these values are not fully
-  supported yet.
 - Dynamic proc directory iteration currently interns generated names for the
   lifetime of the kernel because `DirEntry` carries a borrowed string. Removing
   that leak requires a VFS directory-entry ownership change rather than a

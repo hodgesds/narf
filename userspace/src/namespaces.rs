@@ -52,10 +52,25 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub type NsId = u64;
 
 static NS_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+static INITIAL_NET_NS_ID: AtomicU64 = AtomicU64::new(0);
+static INITIAL_IPC_NS_ID: AtomicU64 = AtomicU64::new(0);
+static INITIAL_PID_NS_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Allocate a fresh, never-reused namespace id.
 pub fn alloc_ns_id() -> NsId {
     NS_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn initial_ns_id(slot: &AtomicU64) -> NsId {
+    let current = slot.load(Ordering::Acquire);
+    if current != 0 {
+        return current;
+    }
+    let fresh = alloc_ns_id();
+    match slot.compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => fresh,
+        Err(existing) => existing,
+    }
 }
 
 /// Linux ns-flavour tags used to render `readlink` text and to tag the
@@ -499,11 +514,9 @@ pub fn unshare_ipc(task: u64) {
 
 // ── setns(2) — join an existing namespace by Arc ─────────────────
 //
-// Linux `setns` takes an fd that names an existing namespace; NARF
-// has no namespace-fd plumbing yet (it lands with /proc/<pid>/ns/*
-// in a later wave). Until then, these entrypoints accept an
-// `Arc<…>` directly so tests and the future fd path share one
-// install routine.
+// Linux `setns` takes an fd that names an existing namespace. Procfs and
+// pidfd ioctls mint `NsFd`, then the syscall downcasts it and routes the held
+// `Arc` through these shared install routines.
 
 pub fn setns_uts(task: u64, ns: Arc<UtsNamespace>) {
     ensure_uts_table();
@@ -526,6 +539,18 @@ pub fn setns_ipc(task: u64, ns: Arc<IpcNamespace>) {
     let mut g = IPC_BY_TASK.lock();
     if let Some(map) = g.as_mut() {
         map.insert(task, ns);
+    }
+}
+
+fn setns_initial_net(task: u64) {
+    if let Some(map) = NET_BY_TASK.lock().as_mut() {
+        map.remove(&task);
+    }
+}
+
+fn setns_initial_ipc(task: u64) {
+    if let Some(map) = IPC_BY_TASK.lock().as_mut() {
+        map.remove(&task);
     }
 }
 
@@ -852,9 +877,17 @@ pub fn setns_user(task: u64, ns: Arc<UserNamespace>) {
 pub enum HeldNs {
     Uts(Arc<UtsNamespace>),
     Net(Arc<NetNamespace>),
+    NetGlobal(NsId),
     Ipc(Arc<IpcNamespace>),
+    IpcGlobal(NsId),
     Pid(Arc<crate::pid_ns::PidNamespace>),
+    PidGlobal(NsId),
     Mnt(Arc<narf_filesystem::MountNamespace>),
+    /// The shared initial mount namespace is backed directly by the global
+    /// mount registry, so it has identity but no snapshot `MountNamespace`.
+    MntGlobal(NsId),
+    #[cfg(feature = "cgroup")]
+    Cgroup(Arc<narf_filesystem::cgroupfs::CgroupNamespace>),
     User(Arc<UserNamespace>),
 }
 
@@ -863,9 +896,15 @@ impl HeldNs {
         match self {
             HeldNs::Uts(_) => NsFlavour::Uts,
             HeldNs::Net(_) => NsFlavour::Net,
+            HeldNs::NetGlobal(_) => NsFlavour::Net,
             HeldNs::Ipc(_) => NsFlavour::Ipc,
+            HeldNs::IpcGlobal(_) => NsFlavour::Ipc,
             HeldNs::Pid(_) => NsFlavour::Pid,
+            HeldNs::PidGlobal(_) => NsFlavour::Pid,
             HeldNs::Mnt(_) => NsFlavour::Mnt,
+            HeldNs::MntGlobal(_) => NsFlavour::Mnt,
+            #[cfg(feature = "cgroup")]
+            HeldNs::Cgroup(_) => NsFlavour::Cgroup,
             HeldNs::User(_) => NsFlavour::User,
         }
     }
@@ -873,9 +912,15 @@ impl HeldNs {
         match self {
             HeldNs::Uts(n) => n.id(),
             HeldNs::Net(n) => n.id(),
+            HeldNs::NetGlobal(id) => *id,
             HeldNs::Ipc(n) => n.id(),
+            HeldNs::IpcGlobal(id) => *id,
             HeldNs::Pid(n) => n.id(),
+            HeldNs::PidGlobal(id) => *id,
             HeldNs::Mnt(n) => n.id(),
+            HeldNs::MntGlobal(id) => *id,
+            #[cfg(feature = "cgroup")]
+            HeldNs::Cgroup(n) => n.id(),
             HeldNs::User(n) => n.id(),
         }
     }
@@ -944,12 +989,18 @@ impl narf_filesystem::FileOps for NsFd {
 pub fn ns_fd_for(task: u64, flavour: NsFlavour) -> Option<Arc<NsFd>> {
     let held = match flavour {
         NsFlavour::Uts => HeldNs::Uts(current_uts_ns(task)),
-        NsFlavour::Net => HeldNs::Net(current_net_ns(task)?),
-        NsFlavour::Ipc => HeldNs::Ipc(current_ipc_ns(task)?),
-        NsFlavour::Pid => HeldNs::Pid(crate::pid_ns::ns_of(task)?),
+        NsFlavour::Net => current_net_ns(task)
+            .map(HeldNs::Net)
+            .unwrap_or_else(|| HeldNs::NetGlobal(initial_ns_id(&INITIAL_NET_NS_ID))),
+        NsFlavour::Ipc => current_ipc_ns(task)
+            .map(HeldNs::Ipc)
+            .unwrap_or_else(|| HeldNs::IpcGlobal(initial_ns_id(&INITIAL_IPC_NS_ID))),
+        NsFlavour::Pid => crate::pid_ns::ns_of(task)
+            .map(HeldNs::Pid)
+            .unwrap_or_else(|| HeldNs::PidGlobal(initial_ns_id(&INITIAL_PID_NS_ID))),
         NsFlavour::User => HeldNs::User(current_user_ns(task)),
-        // Mount-ns fd minting goes through the handlers layer (the
-        // mount-ns table lives there); not reachable from this module.
+        // Mount and cgroup namespace ownership spans the handlers/filesystem
+        // layers; the handlers' namespace_fd_for_task bridge mints those.
         NsFlavour::Mnt | NsFlavour::Cgroup => return None,
     };
     Some(NsFd::new(held))
@@ -967,15 +1018,23 @@ pub fn install_held_ns(caller: u64, outer_pid: u64, held: &HeldNs, nstype: u64) 
     match held {
         HeldNs::Uts(n) => setns_uts(caller, n.clone()),
         HeldNs::Net(n) => setns_net(caller, n.clone()),
+        HeldNs::NetGlobal(_) => setns_initial_net(caller),
         HeldNs::Ipc(n) => setns_ipc(caller, n.clone()),
+        HeldNs::IpcGlobal(_) => setns_initial_ipc(caller),
         HeldNs::User(n) => setns_user(caller, n.clone()),
         HeldNs::Pid(n) => {
             let _ = crate::pid_ns::attach_to_ns(caller, outer_pid, n.clone());
         }
+        HeldNs::PidGlobal(_) => crate::pid_ns::clear_ns(caller),
         HeldNs::Mnt(_) => {
             // Mount-ns install lives in the handlers layer
             // (install_mount_namespace); the caller handles it.
             return false;
+        }
+        HeldNs::MntGlobal(_) => return false,
+        #[cfg(feature = "cgroup")]
+        HeldNs::Cgroup(n) => {
+            narf_filesystem::cgroupfs::install_cgroup_namespace(outer_pid, n.clone());
         }
     }
     true

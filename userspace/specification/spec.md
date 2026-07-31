@@ -197,6 +197,14 @@ Linux `readlink(2)` and `readlinkat(2)` size their kernel staging read from
 the caller's `bufsiz`; they never treat `st_size` as the target length.
 This is required for procfs magic links, whose Linux-compatible stat metadata
 has a zero size even when `readlink` returns a non-empty target.
+The `container` Cargo feature enables namespace support in both userspace and
+`narf-filesystem`; procfs must therefore never publish zero namespace limits
+in a build where the namespace syscalls are enabled.
+Opening a followed `/proc/<pid>/ns/<flavour>` magic link installs an `NsFd`
+that retains the named namespace and is accepted by `setns(2)`. An
+`O_PATH|O_NOFOLLOW` open retains symlink-node semantics. Initial UTS, network,
+IPC, PID, mount, user, and enabled cgroup namespaces have stable nonzero
+identities even before a task unshares them.
 Sysfs exposes Linux memory blocks under `/sys/devices/system/memory/memoryN`
 and each block's `nodeN/memoryN` membership from allocator RAM ranges
 classified by SRAT; CPU topology is never used to infer memory membership.

@@ -27,9 +27,9 @@ use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 use super::{
     hook_auxv, hook_coredump_get, hook_coredump_set, hook_cwd_path, hook_environ, hook_exe_path,
-    hook_fd_list, hook_fd_path, hook_fd_pidfd_pid, hook_nice, hook_ns_mountinfo_generation,
-    hook_oom_adj_get, hook_oom_adj_set, hook_oom_score, hook_rlimits, hook_root_path, slice_read,
-    task_info, ProcDirMarker,
+    hook_fd_info, hook_fd_list, hook_fd_path, hook_fd_pidfd_pid, hook_nice,
+    hook_ns_mountinfo_generation, hook_oom_adj_get, hook_oom_adj_set, hook_oom_score, hook_rlimits,
+    hook_root_path, slice_read, task_info, ProcDirMarker,
 };
 
 // ── Extended flat-file enum ─────────────────────────────────────────
@@ -855,18 +855,12 @@ impl FileOps for ProcFdInfoFile {
         let fd = self.fd;
         Box::pin(async move {
             let mut s = String::new();
-            // pos: file position offset.
-            // TODO: read offset from FdEntry once fd table exposes snapshot-of-pid.
-            let _ = writeln!(s, "pos:\t0");
-            // flags: open-file status flags.
-            // TODO: map FdEntry::flags to the O_* bitfield.
-            let _ = writeln!(s, "flags:\t0100002");
-            // mnt_id: mount-table ID. Always 1 until per-mount id allocator lands.
-            let _ = writeln!(s, "mnt_id:\t1");
-            // ino: stable backing inode when available. The procfs hook does
-            // not expose a cross-task inode snapshot yet, so report the
-            // documented field with the synthetic-filesystem sentinel.
-            let _ = writeln!(s, "ino:\t0");
+            let info = hook_fd_info(pid, fd).unwrap_or_default();
+            let _ = writeln!(s, "pos:\t{}", info.pos);
+            // Linux renders the open-file status flags in octal.
+            let _ = writeln!(s, "flags:\t0{:o}", info.flags);
+            let _ = writeln!(s, "mnt_id:\t{}", info.mnt_id);
+            let _ = writeln!(s, "ino:\t{}", info.ino);
             // pidfd fds carry `Pid:`/`NSpid:` lines (Linux
             // `fs/pidfs.c::pidfd_show_fdinfo`). Pre-pidfs userspace resolves
             // a pidfd to its process by parsing exactly these — systemd 258's

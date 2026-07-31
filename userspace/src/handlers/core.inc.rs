@@ -777,6 +777,44 @@ pub const O_CREAT: u64 = 0o100;
 /// reuse the exact same resolution / permission / O_CREAT / directory-fd /
 /// inotify logic — a real `dirfd` is what sd-device's `chase_symlinks` (behind
 /// libudev / elogind seat enumeration) walks with, one `openat` per component.
+#[cfg(feature = "container")]
+fn proc_namespace_fd_from_path(
+    caller: u64,
+    path: &str,
+    proc_prefix: &str,
+) -> Option<alloc::sync::Arc<crate::namespaces::NsFd>> {
+    use crate::namespaces::NsFlavour;
+
+    let relative = path.strip_prefix(proc_prefix)?.strip_prefix('/')?;
+    let mut components = relative.split('/');
+    let process = components.next()?;
+    if components.next()? != "ns" {
+        return None;
+    }
+    let flavour = match components.next()? {
+        "uts" => NsFlavour::Uts,
+        "net" => NsFlavour::Net,
+        "ipc" => NsFlavour::Ipc,
+        "pid" => NsFlavour::Pid,
+        "mnt" => NsFlavour::Mnt,
+        "cgroup" => NsFlavour::Cgroup,
+        "user" => NsFlavour::User,
+        _ => return None,
+    };
+    if components.next().is_some() {
+        return None;
+    }
+    let target_task = match process {
+        "self" | "thread-self" => caller,
+        visible => {
+            let inner = visible.parse::<u64>().ok()?;
+            let outer = accept_pid_from(caller, inner)?;
+            pid_to_task_raw(outer)?
+        }
+    };
+    namespace_fd_for_task(target_task, flavour)
+}
+
 fn open_impl(
     ctx: &mut dyn TrapContext,
     path_owned_raw: alloc::string::String,
@@ -859,6 +897,33 @@ fn open_impl(
         let nofile_cur = rlimits_of(task)[7].0;
         if crate::fd::open_fds(task).len() as u64 >= nofile_cur {
             ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            return;
+        }
+    }
+
+    // Following a proc namespace magic link yields an nsfs-like fd whose
+    // held namespace can be consumed by setns(2). O_PATH|O_NOFOLLOW must
+    // still open the symlink itself, so leave that case to the nofollow path.
+    #[cfg(feature = "container")]
+    if mnt_len == 0 && flags & 0o400000 == 0 {
+        if let Some(nsfd) = proc_namespace_fd_from_path(task, path, &proc_prefix) {
+            let ops: Arc<dyn narf_filesystem::FileOps> = nsfd;
+            let new_fd = fd::with_table(task, |table| {
+                table.open(crate::fd::FdEntry {
+                    ops,
+                    offset: 0,
+                    flags: 0,
+                    status_flags: open_status_flags,
+                })
+            });
+            match new_fd {
+                Some(n) => {
+                    #[cfg(feature = "linux-compat")]
+                    crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
+                    ctx.set_return(SyscallReturn::ok(n as u64));
+                }
+                None => ctx.set_return(fail),
+            }
             return;
         }
     }
@@ -3023,7 +3088,7 @@ fn xattr_user_path(ptr: u64) -> Option<alloc::string::String> {
 /// against each other on the same fd, but do NOT share storage with the
 /// path-keyed `*xattr` family (a documented limitation).
 fn xattr_fd_key(fd: u32) -> Option<alloc::string::String> {
-    fd_path_of(current_task_id(), fd)
+    fd_path_string_of(current_task_id(), fd)
 }
 
 fn xattr_file(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
