@@ -463,6 +463,8 @@ impl<'a> Vm<'a> {
     #[inline]
     fn has_arena(&self) -> bool {
         !self.arenas.is_empty()
+    }
+
     /// The map named by this file descriptor.
     fn map_by_fd(&self, fd: i32) -> Option<&alloc::sync::Arc<crate::map::BpfMap>> {
         self.maps.iter().find(|(f, _)| *f == fd).map(|(_, m)| m)

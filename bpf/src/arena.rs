@@ -493,6 +493,10 @@ mod smokes {
             name: alloc::string::String::from(name),
             insns,
             context: Context::Atomic,
+            // These arena smokes reference no maps. The field arrived with the
+            // map work on a sibling branch; an empty list is what a program
+            // with no `LD_IMM64` map reference carries.
+            maps: alloc::vec::Vec::new(),
         }
     }
 
