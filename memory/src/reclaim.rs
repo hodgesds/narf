@@ -99,6 +99,381 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::PhysAddr;
 
+// ── Free-memory watermarks (Linux-shaped) ──────────────────────────
+//
+// `min`/`low`/`high`, in pages, sized from total RAM at boot. They are
+// the single pressure signal a real reclaimer keys off:
+//   * free ≥ high  — comfortable; background reclaim (kswapd) stops here.
+//   * free < low   — reclaim should run (foreground/background).
+//   * free < min   — emergency: direct reclaim before an allocation may
+//                    fail; below this is OOM territory.
+// Zero until `init_watermarks` runs; the accessors treat an unset
+// watermark as "no reclaim" so a pre-boot / unconfigured kernel never
+// spuriously reclaims.
+//
+// Sizing mirrors Linux's shape (min scales with √RAM, clamped to a
+// band; low = 5/4·min; high = 3/2·min) without consulting its source.
+
+static WMARK_MIN: AtomicU64 = AtomicU64::new(0);
+static WMARK_LOW: AtomicU64 = AtomicU64::new(0);
+static WMARK_HIGH: AtomicU64 = AtomicU64::new(0);
+
+/// Lower clamp on `min` (pages): keep at least ~2 MiB free even on
+/// tiny memories so an allocation storm always has a little headroom.
+const WMARK_MIN_FLOOR_PAGES: u64 = 512;
+/// Upper clamp on `min` (pages): cap the reserve at ~256 MiB so a huge
+/// machine doesn't hold back an absurd amount of otherwise-usable RAM.
+const WMARK_MIN_CEIL_PAGES: u64 = 65_536;
+
+/// Compute + install the free-memory watermarks from the total usable
+/// page count. Call once, at boot, after the frame allocator reports
+/// its total. `min = clamp(4·√total, floor, ceil)`, `low = 5/4·min`,
+/// `high = 3/2·min`.
+pub fn init_watermarks(total_pages: usize) {
+    let (min, low, high) = compute_watermarks(total_pages);
+    WMARK_MIN.store(min, Ordering::Relaxed);
+    WMARK_LOW.store(low, Ordering::Relaxed);
+    WMARK_HIGH.store(high, Ordering::Relaxed);
+}
+
+/// Runtime override of the `min` free-page reserve — the analogue of
+/// Linux's `vm.min_free_kbytes` sysctl. `low`/`high` are re-derived
+/// from it (`low = 5/4·min`, `high = 3/2·min`), so tuning this one
+/// knob shifts the whole reclaim band, exactly as writing
+/// `min_free_kbytes` does. The value is clamped to the same
+/// [floor, ceil] band as the boot auto-sizing. Intended to back a
+/// future `/proc/sys/vm/min_free_kbytes` write.
+pub fn set_min_free_pages(min_pages: u64) {
+    let (min, low, high) = derive_watermarks(min_pages);
+    WMARK_MIN.store(min, Ordering::Relaxed);
+    WMARK_LOW.store(low, Ordering::Relaxed);
+    WMARK_HIGH.store(high, Ordering::Relaxed);
+}
+
+/// Pure watermark math (no global state) — `(min, low, high)` in pages
+/// sized from total RAM. Split out so it can be unit-tested without
+/// perturbing the live boot-installed watermarks.
+fn compute_watermarks(total_pages: usize) -> (u64, u64, u64) {
+    derive_watermarks((total_pages as u64).isqrt().saturating_mul(4))
+}
+
+/// Clamp a requested `min` to the sane band and derive `(min, low,
+/// high)`. Shared by the RAM auto-sizing and the runtime override so
+/// both produce an identically-shaped, ordered band.
+fn derive_watermarks(requested_min: u64) -> (u64, u64, u64) {
+    let min = requested_min.clamp(WMARK_MIN_FLOOR_PAGES, WMARK_MIN_CEIL_PAGES);
+    (min, min.saturating_mul(5) / 4, min.saturating_mul(3) / 2)
+}
+
+/// The `min` (emergency) free-page watermark, or 0 if unconfigured.
+pub fn watermark_min() -> u64 {
+    WMARK_MIN.load(Ordering::Relaxed)
+}
+/// The `low` (start-reclaim) free-page watermark, or 0 if unconfigured.
+pub fn watermark_low() -> u64 {
+    WMARK_LOW.load(Ordering::Relaxed)
+}
+/// The `high` (stop-reclaim) free-page watermark, or 0 if unconfigured.
+pub fn watermark_high() -> u64 {
+    WMARK_HIGH.load(Ordering::Relaxed)
+}
+
+/// `true` when free memory has fallen below the `low` watermark — the
+/// signal that reclaim should run. `false` when watermarks are unset.
+pub fn under_low_watermark() -> bool {
+    let low = WMARK_LOW.load(Ordering::Relaxed);
+    low != 0 && (crate::frame_stats().free as u64) < low
+}
+
+/// `true` when free memory is below the `min` (emergency) watermark —
+/// the point at which an allocation path should reclaim before failing.
+pub fn under_min_watermark() -> bool {
+    let min = WMARK_MIN.load(Ordering::Relaxed);
+    min != 0 && (crate::frame_stats().free as u64) < min
+}
+
+/// Pages a reclaim pass should aim to free to reach the `high`
+/// watermark, or 0 if already at/above it (or unconfigured).
+pub fn reclaim_goal_pages() -> usize {
+    let high = WMARK_HIGH.load(Ordering::Relaxed);
+    if high == 0 {
+        return 0;
+    }
+    high.saturating_sub(crate::frame_stats().free as u64) as usize
+}
+
+// ── Shrinker registry (Linux `struct shrinker`) ────────────────────
+//
+// The per-page frame LRU below (`register_page` / `reclaim_target_pages`)
+// reclaims frames whose owner handed the subsystem a PhysAddr. But most
+// NARF caches hold reclaimable state on the *heap* (e.g. the filesystem
+// page cache's `Arc<[u8; PAGE_SIZE]>` entries, dentry/inode caches), not
+// as registered frames. A shrinker is the general Linux mechanism for
+// those: a subsystem registers a `{count, scan}` pair; under pressure the
+// reclaimer asks each how much it holds and tells it to shed a slice,
+// applying pressure *proportional* to each shrinker's size so a big cache
+// gives back more than a small one.
+//
+// Callbacks are plain `fn` pointers (no captured state): a subsystem
+// registers module-level functions that act on its own global cache
+// registry. This keeps the registry `'static` and lock-simple.
+
+/// A registered reclaimable cache.
+#[derive(Copy, Clone, Debug)]
+pub struct Shrinker {
+    /// Stable identifier for diagnostics (`"page-cache"`, `"dentry"`, …).
+    pub name: &'static str,
+    /// Number of reclaimable objects the cache currently holds.
+    pub count: fn() -> usize,
+    /// Try to free up to `nr` objects; returns the number actually freed.
+    pub scan: fn(usize) -> usize,
+}
+
+/// Max concurrently-registered shrinkers. A fixed array (not a `Vec`)
+/// keeps the whole registry — registration AND reclaim — allocation-free
+/// so `shrink_all` is safe to call from the allocation-failure / OOM
+/// path, where allocating (as a `Vec` snapshot would) is exactly what
+/// must not happen. The kernel has a handful of caches; 16 is ample.
+const MAX_SHRINKERS: usize = 16;
+
+static SHRINKERS: IrqSafeSpinLock<[Option<Shrinker>; MAX_SHRINKERS]> =
+    IrqSafeSpinLock::new([None; MAX_SHRINKERS]);
+
+/// Register a shrinker. Idempotent by name — re-registering the same
+/// name replaces the entry rather than duplicating it, so a subsystem
+/// that re-initialises doesn't get scanned twice. Silently ignored if
+/// the fixed registry is full (raise `MAX_SHRINKERS` if that ever bites).
+pub fn register_shrinker(s: Shrinker) {
+    let mut g = SHRINKERS.lock();
+    // Replace a same-named entry if present.
+    for slot in g.iter_mut() {
+        if matches!(slot, Some(e) if e.name == s.name) {
+            *slot = Some(s);
+            return;
+        }
+    }
+    // Otherwise take the first empty slot.
+    for slot in g.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(s);
+            return;
+        }
+    }
+}
+
+/// Total reclaimable objects across all registered shrinkers.
+pub fn shrinkable_objects() -> usize {
+    let snap = *SHRINKERS.lock();
+    snap.iter()
+        .flatten()
+        .map(|s| (s.count)())
+        .fold(0usize, |a, c| a.saturating_add(c))
+}
+
+/// Drive all shrinkers to free about `target` objects, distributing the
+/// pressure in proportion to each shrinker's current size (Linux's
+/// proportional-pressure model). Returns the total number of objects
+/// actually freed (which may exceed or fall short of `target`).
+///
+/// Allocation-free: the registry array is copied out under the lock
+/// (it is `Copy`), then the lock is dropped before invoking any `scan`
+/// — a shrinker's `scan` may take its own locks, and must never run
+/// while the registry lock is held. This is why the whole path avoids
+/// `Vec`: `shrink_all` is callable from the allocation-failure path.
+pub fn shrink_all(target: usize) -> usize {
+    if target == 0 {
+        return 0;
+    }
+    let snap = *SHRINKERS.lock();
+    let total: usize = snap
+        .iter()
+        .flatten()
+        .map(|s| (s.count)())
+        .fold(0usize, |a, c| a.saturating_add(c));
+    if total == 0 {
+        return 0;
+    }
+    let mut freed = 0usize;
+    for s in snap.iter().flatten() {
+        if freed >= target {
+            break;
+        }
+        let count = (s.count)();
+        if count == 0 {
+            continue;
+        }
+        // This shrinker's proportional share of the target, at least 1 so a
+        // small cache still contributes when it holds anything.
+        let share = ((target.saturating_mul(count)) / total).max(1);
+        freed = freed.saturating_add((s.scan)(share));
+    }
+    freed
+}
+
+/// Test-only: drop all registered shrinkers so a test's mock never
+/// leaks into another test's `shrink_all`.
+#[doc(hidden)]
+pub fn __reset_shrinkers_for_test() {
+    *SHRINKERS.lock() = [None; MAX_SHRINKERS];
+}
+
+/// Free up to `target` reclaimable pages for a caller under allocation
+/// pressure — the direct-reclaim entry point. Returns the number freed.
+///
+/// ALLOCATION-FREE: this is called from `GlobalAlloc::alloc` when an
+/// allocation fails, where allocating is precisely what must not happen.
+/// It therefore drives only the shrinker path (`shrink_all`), which is
+/// allocation-free; the per-page frame LRU (`reclaim_target_pages`) is
+/// NOT yet included because it snapshots into a `Vec` — it will join once
+/// it is made allocation-free (and once a producer registers frames).
+pub fn try_to_free(target: usize) -> usize {
+    shrink_all(target)
+}
+
+/// Watermark-math tests. Always compiled (not `#[cfg(test)]`) so they
+/// register in the in-kernel `narf.tests` section and actually run under
+/// `cargo xtask test` — unlike the host-only `#[cfg(test)] mod tests`
+/// below. They exercise the pure `compute_watermarks`, so they never
+/// touch the live boot-installed watermark globals.
+mod watermark_tests {
+    use super::{
+        compute_watermarks, derive_watermarks, WMARK_MIN_CEIL_PAGES, WMARK_MIN_FLOOR_PAGES,
+    };
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_reclaim_watermarks_ordered_and_scaled() -> TestResult {
+        // 1 GiB = 262144 pages: min = clamp(4·√262144, ..) = 4·512 = 2048.
+        let (min, low, high) = compute_watermarks(262_144);
+        if min != 2048 {
+            return TestResult::Fail("min for 1 GiB should be 2048 pages");
+        }
+        if low != min * 5 / 4 || high != min * 3 / 2 {
+            return TestResult::Fail("low/high must be 5/4·min and 3/2·min");
+        }
+        if !(min < low && low < high) {
+            return TestResult::Fail("watermarks must be strictly min<low<high");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_watermarks_ordered_and_scaled
+    );
+
+    fn smoke_reclaim_watermarks_clamped() -> TestResult {
+        // Tiny memory clamps min up to the floor.
+        let (min_small, _, _) = compute_watermarks(16);
+        if min_small != WMARK_MIN_FLOOR_PAGES {
+            return TestResult::Fail("tiny RAM must clamp min to the floor");
+        }
+        // Huge memory clamps min down to the ceiling.
+        let (min_huge, low_huge, high_huge) = compute_watermarks(usize::MAX);
+        if min_huge != WMARK_MIN_CEIL_PAGES {
+            return TestResult::Fail("huge RAM must clamp min to the ceiling");
+        }
+        if !(min_huge < low_huge && low_huge < high_huge) {
+            return TestResult::Fail("clamped watermarks must still be ordered");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_watermarks_clamped);
+
+    fn smoke_reclaim_watermarks_tunable_override() -> TestResult {
+        // The runtime override (vm.min_free_kbytes analogue) re-derives the
+        // whole band from the requested min, clamped to the same range.
+        let (min, low, high) = derive_watermarks(4096);
+        if min != 4096 || low != 5120 || high != 6144 {
+            return TestResult::Fail("override should derive low=5/4·min, high=3/2·min");
+        }
+        // Below the floor and above the ceiling clamp identically to boot.
+        if derive_watermarks(1).0 != WMARK_MIN_FLOOR_PAGES {
+            return TestResult::Fail("override below floor must clamp up");
+        }
+        if derive_watermarks(u64::MAX).0 != WMARK_MIN_CEIL_PAGES {
+            return TestResult::Fail("override above ceiling must clamp down");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_watermarks_tunable_override);
+}
+
+/// Shrinker-registry tests. Always compiled so they register + run under
+/// `cargo xtask test`. A mock shrinker backed by an atomic object count
+/// exercises registration, proportional `shrink_all`, and idempotent
+/// re-registration; the registry is reset before/after so the mock never
+/// leaks into another test.
+mod shrinker_tests {
+    use super::{
+        __reset_shrinkers_for_test, register_shrinker, shrink_all, shrinkable_objects, Shrinker,
+    };
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    static MOCK_AVAIL: AtomicUsize = AtomicUsize::new(0);
+
+    fn mock_count() -> usize {
+        MOCK_AVAIL.load(Ordering::Relaxed)
+    }
+
+    fn mock_scan(nr: usize) -> usize {
+        let mut freed = 0usize;
+        while freed < nr {
+            let cur = MOCK_AVAIL.load(Ordering::Relaxed);
+            if cur == 0 {
+                break;
+            }
+            let take = core::cmp::min(nr - freed, cur);
+            if MOCK_AVAIL
+                .compare_exchange(cur, cur - take, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                freed += take;
+            }
+        }
+        freed
+    }
+
+    fn smoke_reclaim_shrinker_proportional() -> TestResult {
+        __reset_shrinkers_for_test();
+        MOCK_AVAIL.store(100, Ordering::Relaxed);
+        register_shrinker(Shrinker {
+            name: "mock",
+            count: mock_count,
+            scan: mock_scan,
+        });
+        let result = (|| {
+            if shrinkable_objects() != 100 {
+                return TestResult::Fail("registry should report the mock's 100 objects");
+            }
+            if shrink_all(30) != 30 || MOCK_AVAIL.load(Ordering::Relaxed) != 70 {
+                return TestResult::Fail("shrink_all(30) should free exactly 30");
+            }
+            // Re-register same name → replace, not duplicate.
+            register_shrinker(Shrinker {
+                name: "mock",
+                count: mock_count,
+                scan: mock_scan,
+            });
+            if shrinkable_objects() != 70 {
+                return TestResult::Fail("re-register by name must not duplicate the shrinker");
+            }
+            // Over-target request frees all that remains.
+            shrink_all(1000);
+            if MOCK_AVAIL.load(Ordering::Relaxed) != 0 {
+                return TestResult::Fail("over-target shrink should drain the cache");
+            }
+            // Nothing left → shrink_all is a no-op.
+            if shrink_all(10) != 0 {
+                return TestResult::Fail("empty cache should free nothing");
+            }
+            TestResult::Pass
+        })();
+        __reset_shrinkers_for_test();
+        result
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_shrinker_proportional);
+}
+
 /// Reclaim handler outcome. The owner reports back what happened
 /// when we asked it to give the page up.
 ///

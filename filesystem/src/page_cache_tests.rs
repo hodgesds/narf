@@ -13,7 +13,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::page_cache::{
     default_capacity_pages, set_default_capacity_pages, set_free_pages_hook,
-    set_low_watermark_pages, Page, PageCache, PageKey, PAGE_SIZE,
+    set_low_watermark_pages, CachePage, Page, PageCache, PageKey,
 };
 
 fn key(page_off: u64) -> PageKey {
@@ -25,8 +25,10 @@ fn key(page_off: u64) -> PageKey {
 }
 
 fn clean_page(fill: u8) -> Page {
+    let mut cp = CachePage::alloc_zeroed().expect("cache page frame for test");
+    cp[..].fill(fill);
     Page {
-        data: Arc::new([fill; PAGE_SIZE]),
+        data: Arc::new(cp),
         dirty: false,
         gen: 0,
     }
@@ -180,6 +182,39 @@ fn smoke_page_cache_new_follows_global_default() -> TestResult {
 kernel_test_in!(
     "filesystem/page_cache",
     smoke_page_cache_new_follows_global_default
+);
+
+/// The shrinker path (`reclaimable` / `shrink`) sheds clean pages under
+/// memory pressure but never a dirty page (which still owes a writeback).
+fn smoke_page_cache_shrink_evicts_clean_keeps_dirty() -> TestResult {
+    reset_globals();
+    let cache = PageCache::with_capacity(0); // unbounded: isolate shrink()
+    for i in 0..10 {
+        cache.insert(key(i), clean_page(0));
+    }
+    cache.mark_dirty(key(3));
+    cache.mark_dirty(key(7));
+    if cache.reclaimable() != 8 {
+        return TestResult::Fail("reclaimable must count only the 8 clean pages");
+    }
+    if cache.shrink(5) != 5 || cache.len() != 5 {
+        return TestResult::Fail("shrink(5) should evict exactly 5 clean pages");
+    }
+    if cache.lookup(key(3)).is_none() || cache.lookup(key(7)).is_none() {
+        return TestResult::Fail("dirty pages must survive shrink");
+    }
+    // Over-ask: evicts the 3 remaining clean pages, keeps both dirty.
+    if cache.shrink(100) != 3 {
+        return TestResult::Fail("shrink should evict the remaining clean pages");
+    }
+    if cache.len() != 2 || cache.reclaimable() != 0 {
+        return TestResult::Fail("only the 2 dirty pages should remain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/page_cache",
+    smoke_page_cache_shrink_evicts_clean_keeps_dirty
 );
 
 /// A hard capacity of 0 with no watermark set is unbounded — the

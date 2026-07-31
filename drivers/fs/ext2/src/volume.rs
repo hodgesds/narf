@@ -21,7 +21,9 @@ use alloc::vec::Vec;
 use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
 use narf_capabilities::{Cap, Read, Write};
 use narf_driver_runtime::DomainId;
-use narf_filesystem::{DirOps, FsError, FsInstance, Page, PageCache, PageKey, PAGE_SIZE};
+use narf_filesystem::{
+    CachePage, DirOps, FsError, FsInstance, Page, PageCache, PageKey, PAGE_SIZE,
+};
 use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister, DmaBuffer};
 use narf_lib::mutex::Mutex;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -154,10 +156,17 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// wholesale on any block write so a freed/rewritten indirect block can't
     /// be served stale. Capacity covers triple-indirect's live set (l3/l2/l1).
     indirect_cache: IrqSafeSpinLock<Vec<(u32, Vec<u8>)>>,
-    /// Clean filesystem data blocks. The lock remains held while a cache miss
-    /// is filled so parallel dynamic-linker mmaps coalesce rather than issuing
-    /// the same block read once per process.
-    page_cache: Mutex<PageCache>,
+    /// Clean filesystem data blocks. An `Arc` (not `Mutex<PageCache>`) so the
+    /// cache can also be registered with the central memory reclaimer as a
+    /// shrinker — its own internal lock serialises map access, and reclaim
+    /// runs from a synchronous context that cannot take an async `Mutex`.
+    page_cache: Arc<PageCache>,
+    /// Serialises page-cache miss fills so parallel dynamic-linker mmaps
+    /// coalesce (the first reader fills; the rest hit) rather than each
+    /// issuing the same block read. Held across lookup→read→insert. This is
+    /// the coalescing role the old `Mutex<PageCache>` played, split out so the
+    /// cache itself is a lock-free-to-reach `Arc`.
+    fill_lock: Mutex<()>,
 }
 
 /// Free-function indirect-pointer read used by the pre-construction
@@ -352,7 +361,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
         }
 
-        Ok(Arc::new_cyclic(|self_weak| Ext2Volume {
+        let volume = Arc::new_cyclic(|self_weak| Ext2Volume {
             device,
             superblock,
             group_descs,
@@ -361,8 +370,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             io: IrqSafeSpinLock::new(io),
             journal_overrides,
             indirect_cache: IrqSafeSpinLock::new(Vec::new()),
-            page_cache: Mutex::new(PageCache::new()),
-        }))
+            page_cache: Arc::new(PageCache::new()),
+            fill_lock: Mutex::new(()),
+        });
+        // Register the page cache with the central memory reclaimer so its
+        // clean pages can be shed under pressure (shrinker). Done after the
+        // owning Arc exists so a Weak can be held without keeping it alive.
+        narf_filesystem::page_cache::register_for_reclaim(&volume.page_cache);
+        Ok(volume)
     }
 
     /// Drive `journal::replay_journal` against the on-disk journal
@@ -587,23 +602,39 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 inode: 0,
                 page_off: first_block / blocks_per_page as u64,
             };
-            let cache = self.page_cache.lock().await;
-            if let Some(page) = cache.lookup(key) {
+            // Hold the fill lock across lookup→read→insert so parallel
+            // readers of the same block coalesce (first fills, rest hit).
+            // The cache itself is an Arc reachable without this lock (so the
+            // reclaimer can shrink it); its internal lock guards the map.
+            let _fill = self.fill_lock.lock().await;
+            if let Some(page) = self.page_cache.lookup(key) {
                 dst.copy_from_slice(&page.data[in_page..in_page + bs]);
                 return Ok(());
             }
-            let mut data = [0u8; PAGE_SIZE];
             let byte_off = first_block * bs as u64;
-            self.read_byte_range(byte_off, &mut data).await?;
-            dst.copy_from_slice(&data[in_page..in_page + bs]);
-            cache.insert(
-                key,
-                Page {
-                    data: Arc::new(data),
-                    dirty: false,
-                    gen: 0,
-                },
-            );
+            // Read straight into a buddy-frame-backed cache page so cached
+            // data lives off the slab and returns to the buddy on reclaim.
+            // Under memory pressure the frame alloc fails — serve the read
+            // from a stack buffer without caching rather than error.
+            match CachePage::alloc_zeroed() {
+                Some(mut cp) => {
+                    self.read_byte_range(byte_off, &mut cp[..]).await?;
+                    dst.copy_from_slice(&cp[in_page..in_page + bs]);
+                    self.page_cache.insert(
+                        key,
+                        Page {
+                            data: Arc::new(cp),
+                            dirty: false,
+                            gen: 0,
+                        },
+                    );
+                }
+                None => {
+                    let mut data = [0u8; PAGE_SIZE];
+                    self.read_byte_range(byte_off, &mut data).await?;
+                    dst.copy_from_slice(&data[in_page..in_page + bs]);
+                }
+            }
             return Ok(());
         }
         let byte_off = block_no * bs as u64;
@@ -673,8 +704,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // pointers. Writes are rare next to reads; clearing 8 entries is cheap.
         self.indirect_cache.lock().clear();
         // Direct block writes bypass the page-cache writeback path, so they
-        // must invalidate cached clean data before changing the device.
-        self.page_cache.lock().await.clear();
+        // must invalidate cached clean data before changing the device. Take
+        // the fill lock so the clear can't race a concurrent miss-fill into
+        // re-inserting a now-stale page.
+        let _fill = self.fill_lock.lock().await;
+        self.page_cache.clear();
         let lbs = self.io.lock().lbs;
         let mut cursor = 0usize;
         while cursor < src.len() {

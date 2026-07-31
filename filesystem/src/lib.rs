@@ -117,7 +117,7 @@ pub use memfs::{
     MemFs,
 };
 pub use overlayfs::{OverlayFs, WHITEOUT_PREFIX};
-pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
+pub use page_cache::{CachePage, Page, PageCache, PageKey, PAGE_SIZE};
 #[cfg(feature = "linux-compat")]
 pub use sysfs::{
     class_device_register, class_register, get_or_create_child, get_root,

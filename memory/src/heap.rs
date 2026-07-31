@@ -273,6 +273,16 @@ pub(crate) fn bump_alloc(layout: Layout) -> *mut u8 {
 // produced them. Concurrent calls are serialised through the backend's
 // own atomics (the bump path is a lock-free CAS loop), so the impl is
 // sound under the multi-threaded use the global allocator sees.
+/// Minimum pages `GlobalAlloc::alloc` asks direct reclaim to free when an
+/// allocation fails: shed ~2 MiB of clean cache so a small allocation's
+/// retry has ample headroom (a large allocation asks for its own size,
+/// rounded up, if bigger).
+const RECLAIM_ON_ALLOC_FAIL_PAGES: usize = 512;
+
+// SAFETY: the backend dispatched to (`current_backend`) upholds the
+// `GlobalAlloc` contract; alloc/dealloc forward the caller's layout
+// unchanged, and the direct-reclaim retry only sheds clean cache pages
+// (never allocates), so it cannot violate the contract or re-enter.
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // First-allocation lazy default: if no backend is installed
@@ -292,6 +302,29 @@ unsafe impl GlobalAlloc for BumpAllocator {
         // which is the same contract `HeapBackend::alloc`
         // forwards.
         // SAFETY: Valid memory or trusted environment
+        let ptr = unsafe { backend.alloc(layout) };
+        if !ptr.is_null() {
+            return ptr;
+        }
+        // Direct reclaim: the allocation failed, so shed reclaimable cached
+        // memory and retry ONCE before giving up (a null return routes to the
+        // alloc-error handler / panic). This turns transient memory pressure
+        // into backpressure instead of an instant OOM kill.
+        //
+        // Safe against re-entry: the failed `backend.alloc` above already
+        // released its locks, and `reclaim::try_to_free` is allocation-free
+        // (it only sheds clean cache pages, whose drops call `dealloc`, never
+        // `alloc`), so it cannot recurse into this path. The retry is a plain
+        // `backend.alloc` (unhooked), so failure returns null directly with no
+        // second reclaim attempt.
+        let want_pages = layout
+            .size()
+            .div_ceil(4096)
+            .max(RECLAIM_ON_ALLOC_FAIL_PAGES);
+        if crate::reclaim::try_to_free(want_pages) == 0 {
+            return core::ptr::null_mut();
+        }
+        // SAFETY: same contract as the first attempt.
         unsafe { backend.alloc(layout) }
     }
 
