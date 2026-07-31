@@ -165,8 +165,8 @@ fn kernel_exec_phys_range() -> (u64, u64) {
     // Defensive: a linker-script edit that inverted these, or moved the image
     // out of the first GiB, would otherwise silently produce an unbootable
     // (or silently over-permissive) map. Clamp to "whole first GiB
-    // executable" — that boots, and `smoke_kernel_bss_alias_is_nx` goes red so
-    // the regression is visible rather than latent.
+    // executable" — that boots, and `smoke_kernel_text_executable_bss_is_not`
+    // goes red so the regression is visible rather than latent.
     if end <= start || end > (1u64 << 30) {
         return (0, 1u64 << 30);
     }
