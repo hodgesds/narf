@@ -950,21 +950,34 @@ impl Arch {
                     ]);
                 }
 
+                // The kernel command line reaches aarch64 through the DEVICE
+                // TREE, not through `-append`. This arm hands the blob over
+                // with a generic `loader` device — opaque bytes at a fixed
+                // address — and QEMU only injects `-append` into a device tree
+                // it builds itself or receives via `-dtb`. So `-append` alone
+                // was silently dropped here and `narf_boot::cmdline()` read
+                // empty on this arch.
+                //
+                // `qemu_virt_dtb_path_with_cmdline` therefore bakes the string
+                // into `/chosen/bootargs` when it generates the blob, which is
+                // where `boot/src/aarch64` already parses it from.
+                let append = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
                 args.extend_from_slice(&[
                     "-device".into(),
                     format!(
                         "loader,file={},addr={:#x},force-raw=on",
-                        qemu_virt_dtb_path().display(),
+                        qemu_virt_dtb_path_with_cmdline(&append).display(),
                         DTB_LOAD_ADDR
                     ),
                 ]);
 
-                // Optional kernel cmdline — see the x86_64 arm above.
-                if let Ok(append) = std::env::var("XTASK_QEMU_APPEND") {
-                    if !append.is_empty() {
-                        args.push("-append".into());
-                        args.push(append);
-                    }
+                // Passed as well, harmlessly: it is what a `-dtb`-style boot
+                // would use, and keeping it means a future switch away from the
+                // generic loader needs no change here. The DTB above is the
+                // transport that actually works today.
+                if !append.is_empty() {
+                    args.push("-append".into());
+                    args.push(append);
                 }
                 args.push("-kernel".into());
                 args.push(kernel);
@@ -976,9 +989,37 @@ impl Arch {
 
 const DTB_LOAD_ADDR: u64 = 0x4F00_0000;
 
-fn qemu_virt_dtb_path() -> PathBuf {
+/// Path to a cached QEMU `virt` device tree, optionally carrying a kernel
+/// command line in `/chosen/bootargs`.
+///
+/// The aarch64 boot path hands the kernel this blob via
+/// `-device loader,file=...,force-raw=on` — i.e. as opaque bytes at a fixed
+/// address. QEMU only injects `-append` into a device tree it *builds* (or one
+/// given via `-dtb`), so with a generic-loader blob the command line was
+/// silently dropped and `narf_boot::cmdline()` read empty on aarch64. The
+/// visible symptom was `cargo xtask test --subsystem <name>` filtering nothing
+/// there: the kernel never saw `test_subsystem=`, took `run_all_and_exit()`,
+/// ran the whole suite, and still reported success.
+///
+/// Fixed by letting QEMU do the work it is already doing — the blob is produced
+/// by `-machine ...,dumpdtb=`, so passing `-append` to *that* invocation makes
+/// QEMU write `/chosen/bootargs` into the dump. Blobs are cached per command
+/// line (hashed into the filename) because the cmdline varies per run and a
+/// single cached path would serve a stale one.
+fn qemu_virt_dtb_path_with_cmdline(cmdline: &str) -> PathBuf {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
-    let path = root.join("target").join("qemu-virt.dtb");
+    // Distinct file per command line. An empty cmdline keeps the historical
+    // name so existing callers and any cached artifact stay valid.
+    let path = if cmdline.is_empty() {
+        root.join("target").join("qemu-virt.dtb")
+    } else {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in cmdline.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        root.join("target").join(format!("qemu-virt-{h:016x}.dtb"))
+    };
     if !path.exists() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -989,6 +1030,36 @@ fn qemu_virt_dtb_path() -> PathBuf {
                 "virt,gic-version=3,mte=on,highmem-ecam=off,dumpdtb={}",
                 path.display()
             ))
+            .args(if cmdline.is_empty() {
+                // `-append ""` is not the same as omitting it: QEMU still
+                // creates an empty `/chosen/bootargs`, which is harmless but
+                // makes the two cache entries differ for no reason.
+                Vec::new()
+            } else {
+                // `-kernel` is required, not incidental: QEMU refuses with
+                // "-append only allowed with -kernel option", so without one
+                // the dump never runs and the loader below points at a file
+                // that does not exist.
+                //
+                // It must NOT be the real kernel. `dumpdtb` does not exit
+                // early enough to skip image loading, and handing QEMU the
+                // 231 MB narf-frame ELF makes it **segfault** (exit 139) — the
+                // dump silently never happens, which is exactly how this looked
+                // the first time. A 4 KiB zero-filled raw image is accepted as
+                // a bare aarch64 boot image, produces the same device tree, and
+                // costs nothing. (An ELF stub is rejected outright with
+                // "image is from incompatible architecture".)
+                let stub = root.join("target").join("dtb-append-stub.img");
+                if !stub.exists() {
+                    let _ = std::fs::write(&stub, [0u8; 4096]);
+                }
+                vec![
+                    "-append".to_string(),
+                    cmdline.to_string(),
+                    "-kernel".to_string(),
+                    stub.display().to_string(),
+                ]
+            })
             .arg("-cpu")
             .arg("max")
             .arg("-smp")
@@ -1027,6 +1098,11 @@ fn qemu_virt_dtb_path() -> PathBuf {
             .status();
     }
     path
+}
+
+/// The plain device tree, with no kernel command line.
+fn qemu_virt_dtb_path() -> PathBuf {
+    qemu_virt_dtb_path_with_cmdline("")
 }
 
 fn ahci_image_path() -> PathBuf {
