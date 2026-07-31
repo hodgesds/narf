@@ -1425,6 +1425,111 @@ kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_dump_neg);
 /// maps a program holds.
 fn smoke_abi_bpf_obj_get_info_map_ids_pos() -> TestResult {
     with_setup(|| {
+// The attach commands — BPF_PROG_ATTACH / DETACH and the link family.
+//
+// `sys_bpf_attach.rs` owns the translation from Linux's `bpf_attach_type` onto
+// NARF's two hooks. The errno each refusal produces is a contract a probing
+// loader reads, so every one of them is pinned here.
+// ════════════════════════════════════════════════════════════════════
+
+const BPF_PROG_ATTACH: u64 = 8;
+const BPF_PROG_DETACH: u64 = 9;
+const BPF_LINK_CREATE: u64 = 28;
+const BPF_LINK_UPDATE: u64 = 29;
+const BPF_LINK_DETACH: u64 = 34;
+
+/// `enum bpf_attach_type`. `BPF_TRACE_FENTRY` is NARF's probe sites and
+/// `BPF_XDP` is the classifier's XDP slot; the other two here exist to pin the
+/// `ENOTSUP`-vs-`EINVAL` split.
+const BPF_TRACE_FENTRY: u32 = 24;
+const BPF_XDP: u32 = 37;
+/// A type Linux defines and NARF has no surface for → `EOPNOTSUPP`.
+const BPF_CGROUP_INET_INGRESS: u32 = 0;
+/// Past `__MAX_BPF_ATTACH_TYPE` → `EINVAL`, because it is not a value at all.
+const BPF_ATTACH_TYPE_NONSENSE: u32 = 4242;
+
+/// `BPF_PROG_TYPE_SYSCALL` — NARF's `Context::Sleepable`.
+const BPF_PROG_TYPE_SYSCALL: u32 = 31;
+
+const EBUSY: i64 = -16;
+
+fn bpf(cmd: u64, attr: &[u8; ATTR_LEN]) -> Option<i64> {
+    call(
+        Syscall::Bpf.raw(),
+        a2(cmd, attr.as_ptr() as u64, ATTR_LEN as u64),
+    )
+}
+
+/// `bpf_attr` for `BPF_PROG_ATTACH` / `BPF_PROG_DETACH`.
+fn attach_attr(target: u32, prog_fd: u32, attach_type: u32) -> [u8; ATTR_LEN] {
+    let mut a = [0u8; ATTR_LEN];
+    put_u32(&mut a, 0, target); // target_fd / target_ifindex
+    put_u32(&mut a, 4, prog_fd); // attach_bpf_fd
+    put_u32(&mut a, 8, attach_type);
+    a
+}
+
+/// `bpf_attr.link_create`.
+fn link_attr(prog_fd: u32, target: u32, attach_type: u32) -> [u8; ATTR_LEN] {
+    let mut a = [0u8; ATTR_LEN];
+    put_u32(&mut a, 0, prog_fd);
+    put_u32(&mut a, 4, target); // target_fd / target_ifindex
+    put_u32(&mut a, 8, attach_type);
+    a
+}
+
+/// A fresh probe id, so tests never contend for the same target.
+fn fresh_probe() -> u32 {
+    narf_tracing::dispatch::reserve_probe_id()
+}
+
+// ── BPF_PROG_ATTACH / BPF_PROG_DETACH ───────────────────────────────
+
+fn smoke_abi_bpf_prog_attach_pos() -> TestResult {
+    with_setup(|| {
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        let probe = fresh_probe();
+        let attr = attach_attr(probe, fd as u32, BPF_TRACE_FENTRY);
+        if bpf(BPF_PROG_ATTACH, &attr) != Some(0) {
+            return Err("BPF_PROG_ATTACH on a fresh probe id failed");
+        }
+        // Attaching twice is `EBUSY`: NARF's probe sites hold one program, and
+        // the flags that mean "several" on Linux are cgroup-hierarchy concepts.
+        if bpf(BPF_PROG_ATTACH, &attr) != Some(EBUSY) {
+            return Err("a second BPF_PROG_ATTACH on the same target did not return EBUSY");
+        }
+        if bpf(BPF_PROG_DETACH, &attr) != Some(0) {
+            return Err("BPF_PROG_DETACH failed");
+        }
+        // And once detached the target is free again.
+        if bpf(BPF_PROG_ATTACH, &attr) != Some(0) {
+            return Err("the target was not released by BPF_PROG_DETACH");
+        }
+        let _ = bpf(BPF_PROG_DETACH, &attr);
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_attach_pos);
+
+fn smoke_abi_bpf_prog_attach_neg() -> TestResult {
+    with_setup(|| {
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        // An fd that names nothing.
+        if bpf(
+            BPF_PROG_ATTACH,
+            &attach_attr(fresh_probe(), 4095, BPF_TRACE_FENTRY),
+        ) != Some(EBADF)
+        {
+            return Err("BPF_PROG_ATTACH with an unopened prog fd did not return EBADF");
+        }
+        // An fd that names something that is not a program. A *map* fd, because
+        // that is the confusion the downcast exists to catch.
         let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
         if map_fd < 0 {
             return Err("BPF_MAP_CREATE failed");
@@ -2042,6 +2147,224 @@ fn smoke_abi_bpf_id_survives_fd_close_while_referenced_pos() -> TestResult {
         if fd_by_id(BPF_MAP_GET_FD_BY_ID, map_id) != Some(ENOENT) {
             return Err("the map's id still resolved after its last reference went away");
         }
+        if bpf(
+            BPF_PROG_ATTACH,
+            &attach_attr(fresh_probe(), map_fd as u32, BPF_TRACE_FENTRY),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_ATTACH with a map fd did not return EINVAL");
+        }
+        // A probe id of 0. `reserve_probe_id` starts at 1 and keeps 0 as
+        // "unassigned", so 0 names no site.
+        if bpf(
+            BPF_PROG_ATTACH,
+            &attach_attr(0, fd as u32, BPF_TRACE_FENTRY),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_ATTACH with probe id 0 did not return EINVAL");
+        }
+        // An attach type Linux defines and NARF has no surface for. `ENOTSUP`,
+        // not `EINVAL` — the whole point of the split.
+        if bpf(
+            BPF_PROG_ATTACH,
+            &attach_attr(1, fd as u32, BPF_CGROUP_INET_INGRESS),
+        ) != Some(EOPNOTSUPP)
+        {
+            return Err("an unimplemented attach type did not return EOPNOTSUPP");
+        }
+        // An attach type that is not a value at all.
+        if bpf(
+            BPF_PROG_ATTACH,
+            &attach_attr(1, fd as u32, BPF_ATTACH_TYPE_NONSENSE),
+        ) != Some(EINVAL)
+        {
+            return Err("an out-of-enum attach type did not return EINVAL");
+        }
+        // `attach_flags` selects multi-program semantics NARF's hooks cannot
+        // provide, so it is refused rather than ignored.
+        let mut flagged = attach_attr(fresh_probe(), fd as u32, BPF_TRACE_FENTRY);
+        put_u32(&mut flagged, 12, 1 /* BPF_F_ALLOW_OVERRIDE */);
+        if bpf(BPF_PROG_ATTACH, &flagged) != Some(EINVAL) {
+            return Err("BPF_PROG_ATTACH with attach_flags did not return EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_attach_neg);
+
+fn smoke_abi_bpf_prog_detach_neg() -> TestResult {
+    with_setup(|| {
+        // Detaching a target nothing is attached to.
+        if bpf(
+            BPF_PROG_DETACH,
+            &attach_attr(fresh_probe(), 0, BPF_TRACE_FENTRY),
+        ) != Some(ENOENT)
+        {
+            return Err("BPF_PROG_DETACH of nothing did not return ENOENT");
+        }
+        // A link's target is not detachable this way. Without that rule the
+        // link's own close would later unhook whatever had replaced it.
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        let probe = fresh_probe();
+        let link_fd = bpf(
+            BPF_LINK_CREATE,
+            &link_attr(fd as u32, probe, BPF_TRACE_FENTRY),
+        )
+        .ok_or("bpf() not Ok")?;
+        if link_fd < 0 {
+            return Err("BPF_LINK_CREATE failed");
+        }
+        if bpf(BPF_PROG_DETACH, &attach_attr(probe, 0, BPF_TRACE_FENTRY)) != Some(EBUSY) {
+            return Err("BPF_PROG_DETACH on a link-held target did not return EBUSY");
+        }
+        let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_detach_neg);
+
+// ── BPF_LINK_CREATE ─────────────────────────────────────────────────
+
+fn smoke_abi_bpf_link_create_pos() -> TestResult {
+    with_setup(|| {
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        let probe = fresh_probe();
+        let link_fd = bpf(
+            BPF_LINK_CREATE,
+            &link_attr(fd as u32, probe, BPF_TRACE_FENTRY),
+        )
+        .ok_or("bpf() not Ok")?;
+        if link_fd < 0 {
+            return Err("BPF_LINK_CREATE failed on a fresh probe id");
+        }
+        // Linux's `bpf_link_new_fd` passes `O_CLOEXEC`; here a leaked link fd
+        // is a leaked *attach*, since only its last close detaches.
+        let flags = call(Syscall::Fcntl.raw(), a2(link_fd as u64, 1 /* F_GETFD */, 0))
+            .ok_or("fcntl not Ok")?;
+        if flags & 1 == 0 {
+            return Err("bpf link fd is not close-on-exec");
+        }
+        // A second link on the same target is `EBUSY`, and must not disturb the
+        // first.
+        if bpf(
+            BPF_LINK_CREATE,
+            &link_attr(fd as u32, probe, BPF_TRACE_FENTRY),
+        ) != Some(EBUSY)
+        {
+            return Err("a second link on one probe id did not return EBUSY");
+        }
+        if call(Syscall::Close.raw(), a0(link_fd as u64)) != Some(0) {
+            return Err("closing the link fd failed");
+        }
+        // Closed → detached → the target is free.
+        let again = bpf(
+            BPF_LINK_CREATE,
+            &link_attr(fd as u32, probe, BPF_TRACE_FENTRY),
+        )
+        .ok_or("bpf() not Ok")?;
+        if again < 0 {
+            return Err("closing the link fd did not release its target");
+        }
+        let _ = call(Syscall::Close.raw(), a0(again as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_link_create_pos);
+
+fn smoke_abi_bpf_link_create_neg() -> TestResult {
+    with_setup(|| {
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        if bpf(
+            BPF_LINK_CREATE,
+            &link_attr(4095, fresh_probe(), BPF_TRACE_FENTRY),
+        ) != Some(EBADF)
+        {
+            return Err("BPF_LINK_CREATE with an unopened prog fd did not return EBADF");
+        }
+        if bpf(
+            BPF_LINK_CREATE,
+            &link_attr(fd as u32, 1, BPF_CGROUP_INET_INGRESS),
+        ) != Some(EOPNOTSUPP)
+        {
+            return Err("an unimplemented attach type did not return EOPNOTSUPP");
+        }
+        if bpf(
+            BPF_LINK_CREATE,
+            &link_attr(fd as u32, 1, BPF_ATTACH_TYPE_NONSENSE),
+        ) != Some(EINVAL)
+        {
+            return Err("an out-of-enum attach type did not return EINVAL");
+        }
+        // No `BPF_LINK_CREATE` flag NARF understands; every one Linux defines
+        // belongs to an attach type NARF does not have.
+        let mut flagged = link_attr(fd as u32, fresh_probe(), BPF_TRACE_FENTRY);
+        put_u32(&mut flagged, 12, 1);
+        if bpf(BPF_LINK_CREATE, &flagged) != Some(EINVAL) {
+            return Err("BPF_LINK_CREATE with a flag set did not return EINVAL");
+        }
+        // XDP: ifindex 1 is the rtnetlink dump's synthetic loopback, which no
+        // driver RX path classifies — a program attached there would install
+        // cleanly and never run, so it is refused.
+        if bpf(BPF_LINK_CREATE, &link_attr(fd as u32, 1, BPF_XDP)) != Some(ENODEV) {
+            return Err("XDP on the synthetic loopback did not return ENODEV");
+        }
+        // …and an ifindex past every registered NIC.
+        if bpf(BPF_LINK_CREATE, &link_attr(fd as u32, 0xFFFF, BPF_XDP)) != Some(ENODEV) {
+            return Err("XDP on an unknown ifindex did not return ENODEV");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_link_create_neg);
+
+fn smoke_abi_bpf_link_create_context_mismatch_neg() -> TestResult {
+    with_setup(|| {
+        // Spec §4.5: a probe site is `Atomic`. A program verified for
+        // `Sleepable` declines at run time, and for XDP "declines" means "pass
+        // the frame" — so an accepted attach would leave an interface that
+        // looks filtered and is not. `EINVAL`, at attach.
+        let fd = load_prog(BPF_PROG_TYPE_SYSCALL, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial sleepable program");
+        }
+        let probe = fresh_probe();
+        if bpf(
+            BPF_LINK_CREATE,
+            &link_attr(fd as u32, probe, BPF_TRACE_FENTRY),
+        ) != Some(EINVAL)
+        {
+            return Err("a sleepable program linked to an atomic hook");
+        }
+        if bpf(
+            BPF_PROG_ATTACH,
+            &attach_attr(probe, fd as u32, BPF_TRACE_FENTRY),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_ATTACH accepted a sleepable program on an atomic hook");
+        }
+        // The refusal must not have claimed the target.
+        let ok = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if ok < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial atomic program");
+        }
+        let link_fd = bpf(
+            BPF_LINK_CREATE,
+            &link_attr(ok as u32, probe, BPF_TRACE_FENTRY),
+        )
+        .ok_or("bpf() not Ok")?;
+        if link_fd < 0 {
+            return Err("a refused attach left the target claimed");
+        }
+        let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
         Ok(())
     })
 }
@@ -2067,8 +2390,250 @@ fn smoke_abi_bpf_link_id_cmds_neg() -> TestResult {
             {
                 return Err("a link id command did not return ENOTSUP");
             }
+    smoke_abi_bpf_link_create_context_mismatch_neg
+);
+
+// ── BPF_LINK_UPDATE / BPF_LINK_DETACH ───────────────────────────────
+
+fn smoke_abi_bpf_link_detach_pos() -> TestResult {
+    with_setup(|| {
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        let probe = fresh_probe();
+        let link_fd = bpf(
+            BPF_LINK_CREATE,
+            &link_attr(fd as u32, probe, BPF_TRACE_FENTRY),
+        )
+        .ok_or("bpf() not Ok")?;
+        if link_fd < 0 {
+            return Err("BPF_LINK_CREATE failed");
+        }
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, link_fd as u32);
+        if bpf(BPF_LINK_DETACH, &attr) != Some(0) {
+            return Err("BPF_LINK_DETACH failed");
+        }
+        // The fd stays valid and the link stays dead — Linux's shape too.
+        if bpf(BPF_LINK_DETACH, &attr) != Some(ENOENT) {
+            return Err("a second BPF_LINK_DETACH did not return ENOENT");
+        }
+        let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_link_detach_pos);
+
+fn smoke_abi_bpf_link_detach_neg() -> TestResult {
+    with_setup(|| {
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, 4095);
+        if bpf(BPF_LINK_DETACH, &attr) != Some(EBADF) {
+            return Err("BPF_LINK_DETACH on an unopened fd did not return EBADF");
+        }
+        // A program fd is not a link fd.
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        put_u32(&mut attr, 0, fd as u32);
+        if bpf(BPF_LINK_DETACH, &attr) != Some(EINVAL) {
+            return Err("BPF_LINK_DETACH on a program fd did not return EINVAL");
         }
         Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_link_id_cmds_neg);
+kernel_test_in!("syscall_abi", smoke_abi_bpf_link_detach_neg);
+
+fn smoke_abi_bpf_link_update_neg() -> TestResult {
+    with_setup(|| {
+        let a = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        let b = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(2)).ok_or("bpf() not Ok")?;
+        if a < 0 || b < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        let probe = fresh_probe();
+        let link_fd = bpf(
+            BPF_LINK_CREATE,
+            &link_attr(a as u32, probe, BPF_TRACE_FENTRY),
+        )
+        .ok_or("bpf() not Ok")?;
+        if link_fd < 0 {
+            return Err("BPF_LINK_CREATE failed");
+        }
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, link_fd as u32); // link_fd
+        put_u32(&mut attr, 4, b as u32); // new_prog_fd
+                                         // LINUX-GAP: `BPF_LINK_UPDATE` on a tracing link. `narf_tracing`'s
+                                         // `HandlerTable` has register and unregister and no atomic replace, so
+                                         // a swap would silently drop every probe that fired between them.
+                                         // Linux's is atomic; imitating it non-atomically is the divergence this
+                                         // subsystem exists to avoid, so the honest answer is EOPNOTSUPP.
+        if bpf(BPF_LINK_UPDATE, &attr) != Some(EOPNOTSUPP) {
+            return Err("BPF_LINK_UPDATE on a tracing link did not return EOPNOTSUPP");
+        }
+        // Unknown flags are refused before anything else is touched.
+        let mut flagged = attr;
+        put_u32(&mut flagged, 8, 1);
+        if bpf(BPF_LINK_UPDATE, &flagged) != Some(EINVAL) {
+            return Err("BPF_LINK_UPDATE with an unknown flag did not return EINVAL");
+        }
+        // A program fd where a link fd belongs.
+        let mut wrong = attr;
+        put_u32(&mut wrong, 0, a as u32);
+        if bpf(BPF_LINK_UPDATE, &wrong) != Some(EINVAL) {
+            return Err("BPF_LINK_UPDATE on a program fd did not return EINVAL");
+        }
+        // An unopened link fd.
+        put_u32(&mut wrong, 0, 4095);
+        if bpf(BPF_LINK_UPDATE, &wrong) != Some(EBADF) {
+            return Err("BPF_LINK_UPDATE on an unopened fd did not return EBADF");
+        }
+        let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_link_update_neg);
+
+// ════════════════════════════════════════════════════════════════════
+// End-to-end, in the `bpf` subsystem: load through `bpf(2)`, attach through
+// `bpf(2)`, fire the real hook, observe the effect, undo it, fire again.
+//
+// The errno pins above are conformance; these are the ones that would catch an
+// attach that reports success and does nothing.
+// ════════════════════════════════════════════════════════════════════
+
+/// The `Arc<BpfProg>` behind a program fd, so a test can read `runs()`.
+///
+/// The same resolution the handler uses. Reaching into the fd table is fair
+/// here: these tests run inside the kernel, and the alternative — inferring
+/// "did it run" from a side effect — is what lets a test pass for the wrong
+/// reason.
+fn prog_behind_fd(fd: i64) -> Option<alloc::sync::Arc<narf_bpf::prog::BpfProg>> {
+    let ops = fd::with_table(FAKE_TASK, |t| t.get(fd as u32).map(|e| e.ops.clone()))??;
+    let file = ops
+        .as_any()
+        .and_then(|a| a.downcast_ref::<narf_bpf::prog::ProgFile>())?;
+    Some(file.prog())
+}
+
+fn smoke_bpf_syscall_link_close_detaches_the_probe() -> TestResult {
+    with_setup(|| {
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        let prog = prog_behind_fd(fd).ok_or("could not recover the program behind its fd")?;
+        let probe = fresh_probe();
+        let link_fd = bpf(
+            BPF_LINK_CREATE,
+            &link_attr(fd as u32, probe, BPF_TRACE_FENTRY),
+        )
+        .ok_or("bpf() not Ok")?;
+        if link_fd < 0 {
+            return Err("BPF_LINK_CREATE failed");
+        }
+
+        narf_tracing::dispatch::fire(probe, narf_tracing::dispatch::ProbeArgs::none());
+        if prog.runs() != 1 {
+            return Err("the program attached through bpf(2) did not run when the probe fired");
+        }
+
+        // Closing the *program* fd must not disturb the attach: the link holds
+        // its own `Arc`.
+        if call(Syscall::Close.raw(), a0(fd as u64)) != Some(0) {
+            return Err("closing the program fd failed");
+        }
+        narf_tracing::dispatch::fire(probe, narf_tracing::dispatch::ProbeArgs::none());
+        if prog.runs() != 2 {
+            return Err("closing the program fd detached the link");
+        }
+
+        // The keystone: closing the link fd is the detach.
+        if call(Syscall::Close.raw(), a0(link_fd as u64)) != Some(0) {
+            return Err("closing the link fd failed");
+        }
+        narf_tracing::dispatch::fire(probe, narf_tracing::dispatch::ProbeArgs::none());
+        if prog.runs() != 2 {
+            return Err("the probe still ran the program after the link fd was closed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_syscall_link_close_detaches_the_probe);
+
+fn smoke_bpf_syscall_prog_attach_fires_then_detach_stops() -> TestResult {
+    with_setup(|| {
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        let prog = prog_behind_fd(fd).ok_or("could not recover the program behind its fd")?;
+        let probe = fresh_probe();
+        let attr = attach_attr(probe, fd as u32, BPF_TRACE_FENTRY);
+        if bpf(BPF_PROG_ATTACH, &attr) != Some(0) {
+            return Err("BPF_PROG_ATTACH failed");
+        }
+        narf_tracing::dispatch::fire(probe, narf_tracing::dispatch::ProbeArgs::none());
+        if prog.runs() != 1 {
+            return Err("the attached program did not run when the probe fired");
+        }
+        if bpf(BPF_PROG_DETACH, &attr) != Some(0) {
+            return Err("BPF_PROG_DETACH failed");
+        }
+        narf_tracing::dispatch::fire(probe, narf_tracing::dispatch::ProbeArgs::none());
+        if prog.runs() != 1 {
+            return Err("the probe still ran the program after BPF_PROG_DETACH");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_syscall_prog_attach_fires_then_detach_stops);
+
+fn smoke_bpf_syscall_link_close_detaches_xdp() -> TestResult {
+    with_setup(|| {
+        use narf_net::bypass::classifier::{classify, Verdict};
+
+        // A NIC of this test's own. `iface::register` de-dups by name, so a
+        // re-run replaces rather than accumulating.
+        const IFACE: &str = "bpf-abi-xdp0";
+        fn discard(_frame: &[u8]) -> Result<(), ()> {
+            Ok(())
+        }
+        narf_net::iface::register(IFACE, [0x02, 0, 0, 0, 0xB9, 1], discard);
+
+        // The ifindex NARF's rtnetlink dump would report for it: 1 is the
+        // synthetic loopback, registered NICs follow at 2, 3, … in registration
+        // order. Deriving it here from the same public source the handler uses
+        // is what pins the two together — if the handler resolved a different
+        // interface, the classify() below would not see the program at all.
+        let ifindex = narf_net::iface::snapshot_all()
+            .iter()
+            .position(|nic| nic.name == IFACE)
+            .map(|i| i as u32 + 2)
+            .ok_or("the registered interface is not in the snapshot")?;
+
+        // 1 is Linux's `XDP_DROP`.
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        let link_fd =
+            bpf(BPF_LINK_CREATE, &link_attr(fd as u32, ifindex, BPF_XDP)).ok_or("bpf() not Ok")?;
+        if link_fd < 0 {
+            return Err("BPF_LINK_CREATE on a registered interface's ifindex failed");
+        }
+
+        let frame = [0u8; 64];
+        if !matches!(classify(IFACE, &frame), Verdict::Dropped) {
+            return Err("the linked XDP program did not drop the frame");
+        }
+        if call(Syscall::Close.raw(), a0(link_fd as u64)) != Some(0) {
+            return Err("closing the link fd failed");
+        }
+        if !matches!(classify(IFACE, &frame), Verdict::PassThrough) {
+            return Err("frames were still dropped after the link fd was closed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_syscall_link_close_detaches_xdp);
