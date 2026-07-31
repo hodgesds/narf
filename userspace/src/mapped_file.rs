@@ -4,6 +4,16 @@
 //! on filesystem objects. Keep the backing open-file description alive here
 //! until the last process mapping disappears, matching Linux's VMA-held file
 //! reference without adding a filesystem dependency to the memory TCB.
+//!
+//! That reference is **load-bearing for memory safety**, not only for
+//! writeback. A file whose frames are aliased into userspace `MAP_SHARED` —
+//! `mmap_frames` or `mmap_fault` — must outlive every mapping of them, or
+//! teardown returns user-mapped frames to the buddy and userspace keeps a
+//! writable window onto whatever is allocated next. `/dev/fb0` and perf's ring
+//! are accidentally safe (device memory that is never in the buddy; a ring
+//! that lives as long as the task); a BPF arena is not, which is what turned
+//! this table from bookkeeping into the thing that makes `Arena::drop` sound.
+//! `memory/src/bpf_arena.rs`'s `Arena::drop` names the test that pins it.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -21,6 +31,10 @@ struct MappingOwner {
     pid: u64,
     base: u64,
     len: u64,
+    /// File offset of `base`. Needed by [`demand_frame`] to turn a faulting
+    /// address back into the file offset `FileOps::mmap_fault` expects, and
+    /// therefore adjusted wherever `base` moves (`punch`).
+    file_offset: u64,
     ops: Arc<dyn FileOps>,
     /// Ordinary file MAP_SHARED mappings use private physical frames as a
     /// fallback when the filesystem cannot expose cache pages directly. Keep
@@ -50,8 +64,40 @@ fn current_pid() -> u64 {
     crate::handlers::task_to_pid_raw(task).unwrap_or(task)
 }
 
-pub(crate) fn register_current(base: u64, len: u64, ops: Arc<dyn FileOps>) {
-    register(current_pid(), base, len, ops, None);
+pub(crate) fn register_current(base: u64, len: u64, offset: u64, ops: Arc<dyn FileOps>) {
+    register(current_pid(), base, len, offset, ops, None);
+}
+
+/// Resolve a fault on a demand-paged `MAP_SHARED` mapping to the frame its
+/// backing file wants at `vaddr`.
+///
+/// Installed into `narf-memory` as the `RegionPerms::FILE_DEMAND` hook (see
+/// `sys_mmap`), which is why this lives with the mapping owners rather than
+/// with the syscall: the owner table is already the thing that knows which
+/// file a user address belongs to, and it is the reference that keeps that
+/// file alive while the mapping exists.
+///
+/// The lock is dropped before entering the file. `FileOps::mmap_fault` may
+/// allocate and take its own locks — a BPF arena installs a kernel page-table
+/// entry inside it — and holding `MAPPING_OWNERS` across that would put this
+/// lock beneath every lock any demand-pageable file might take, on a path
+/// entered from the page-fault handler.
+pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
+    let page = vaddr & !0xFFFu64;
+    let pid = current_pid();
+    let (offset, ops) = {
+        let owners = MAPPING_OWNERS.lock();
+        let owner = owners.iter().find(|mapping| {
+            mapping.pid == pid
+                && page >= mapping.base
+                && page < mapping.base.saturating_add(mapping.len)
+        })?;
+        (
+            owner.file_offset.checked_add(page - owner.base)?,
+            Arc::clone(&owner.ops),
+        )
+    };
+    ops.mmap_fault(offset).ok()
 }
 
 /// Register a file-backed shared mapping whose frames must be written back on
@@ -68,6 +114,7 @@ pub(crate) fn register_file_current(
         current_pid(),
         base,
         len,
+        offset,
         ops,
         Some(FileWriteback { offset, phys }),
     );
@@ -169,6 +216,7 @@ fn register(
     pid: u64,
     base: u64,
     len: u64,
+    file_offset: u64,
     ops: Arc<dyn FileOps>,
     writeback: Option<FileWriteback>,
 ) {
@@ -176,6 +224,7 @@ fn register(
         pid,
         base,
         len,
+        file_offset,
         ops,
         writeback,
     });
@@ -218,6 +267,11 @@ fn punch(pid: u64, base: u64, len: u64) {
                     pid,
                     base: end,
                     len: mapping_end - end,
+                    // The suffix starts `end - original_base` further into the
+                    // file, exactly as its writeback offset below does. A
+                    // stale offset here would fault the wrong page of the file
+                    // into the surviving half of a punched mapping.
+                    file_offset: mapping.file_offset.saturating_add(end - original_base),
                     ops: Arc::clone(&mapping.ops),
                     writeback: mapping.writeback.clone(),
                 };
@@ -242,6 +296,7 @@ fn punch(pid: u64, base: u64, len: u64) {
             let skipped = end - mapping.base;
             mapping.base = end;
             mapping.len = mapping_end - end;
+            mapping.file_offset = mapping.file_offset.saturating_add(skipped);
             if let Some(wb) = mapping.writeback.as_mut() {
                 let pages = (skipped / 4096) as usize;
                 wb.offset = wb.offset.saturating_add(skipped);
@@ -261,6 +316,7 @@ pub(crate) fn fork_process(parent_pid: u64, child_pid: u64) {
             pid: child_pid,
             base: mapping.base,
             len: mapping.len,
+            file_offset: mapping.file_offset,
             ops: Arc::clone(&mapping.ops),
             writeback: mapping.writeback.clone(),
         })
@@ -399,7 +455,7 @@ mod tests {
         DROPS.store(0, Ordering::Relaxed);
 
         let owner: Arc<dyn FileOps> = Arc::new(TestOwner);
-        register(PARENT, 0x1000, 0x3000, Arc::clone(&owner), None);
+        register(PARENT, 0x1000, 0x3000, 0, Arc::clone(&owner), None);
         drop(owner);
         if DROPS.load(Ordering::Relaxed) != 0 || owner_count(PARENT) != 1 {
             return TestResult::Fail("mapping did not retain its file owner");

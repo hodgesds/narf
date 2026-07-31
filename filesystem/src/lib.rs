@@ -715,6 +715,43 @@ pub trait FileOps: Send + Sync {
         Err(FsError::Unsupported)
     }
 
+    /// `mmap(2)` **demand** backing: return the physical frame that backs the
+    /// single page at `offset`, populating it if this file is lazily backed.
+    ///
+    /// This is [`FileOps::mmap_frames`]'s per-page twin, and the difference is
+    /// *when* it is asked. `mmap_frames` is answered once, at `mmap` time, so
+    /// the mapping is a **snapshot**: a page the file backs afterwards is
+    /// absent from userspace forever. This is answered from the page-fault
+    /// handler, on the first user access to each page, so the mapping
+    /// **tracks** the file. A file that can grow behind a live mapping must
+    /// implement this one.
+    ///
+    /// `offset` is page-aligned by the syscall layer, and is a file offset —
+    /// the mapping's own `mmap` offset plus the faulting page's distance from
+    /// the mapping base. The returned address must be page-aligned and
+    /// non-zero (zero is the address space's "unbacked" sentinel). Like
+    /// `mmap_frames`, the frame is mapped **borrowed**: the region carries
+    /// `RegionPerms::SHARED`, so `munmap` and address-space teardown clear the
+    /// PTEs and never free it. The file owns it, and must keep owning it for
+    /// as long as any mapping of the file can exist — which is what the
+    /// syscall layer's mapping-held `Arc<dyn FileOps>` guarantees.
+    ///
+    /// Called from the demand-paging arm of the trap handler, i.e. with no
+    /// address-space lock held and in a context that may allocate — but *not*
+    /// one that may await, so an implementation must be synchronous.
+    ///
+    /// **Must be idempotent per offset**: two calls for the same offset must
+    /// return the same frame. Two CPUs can fault the same page concurrently,
+    /// and the address space keeps whichever answer it records first — a
+    /// second, different frame would simply be dropped on the floor.
+    ///
+    /// The default returns [`FsError::Unsupported`], which is also how the
+    /// syscall layer probes: a file that supports neither `mmap_frames` nor
+    /// this falls through to the private-copy file-mapping path.
+    fn mmap_fault(&self, _offset: u64) -> Result<u64, FsError> {
+        Err(FsError::Unsupported)
+    }
+
     /// Wave-76: if this file is a PTY master, return the slave index.
     /// Used by `sys_ioctl(TIOCGPTPEER)` to open a fresh slave fd
     /// without going through a downcast / Any dance. Default: `None`.
