@@ -22,6 +22,7 @@ members = [
     "verification/kernel-test",
     "bpf",
     "bpf/bench",
+    "bpf/btf",
     "bpf/isa",
     "bpf/verifier",
     "bpf/jit",

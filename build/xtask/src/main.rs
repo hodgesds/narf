@@ -7359,6 +7359,11 @@ fn host_test_cmd() -> Result<()> {
                 "narf-bpf-verifier",
                 "-p",
                 "narf-bpf-jit",
+                // The BTF parser. Its input comes straight from a syscall
+                // argument, so its negative tests are the whole point and CI
+                // must run them on every push, not only when a kernel boots.
+                "-p",
+                "narf-bpf-btf",
                 // xtask itself: `bench_stats` implements the §8 protocol, and
                 // its distribution functions are anchored on closed forms
                 // (Cauchy at ν=1, the ν=2 closed form, the normal at ±1.96).
