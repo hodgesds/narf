@@ -568,8 +568,9 @@ pub fn bootstrap_init() {
 ///   - sigaction + signal
 ///   - uid/gid + hostname + rlimit + nice + umask + prctl
 ///
-/// fd::init is kept separate (different module) but consumers
-/// almost always call it alongside.
+/// The fd table store needs no counterpart here — its shards are
+/// const-initialised and materialise a task's table on first touch
+/// (see `crate::fd::with_table`).
 pub fn init_per_task_state() {
     bootstrap_init();
     cwd_init();

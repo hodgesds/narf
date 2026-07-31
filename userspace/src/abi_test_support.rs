@@ -112,7 +112,6 @@ pub fn setup() {
     crate::handlers::__test_root_dir_reset();
     __test_clear_global();
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     // The no-AS baseline this harness promises is established above, by the
     // save-clear-restore of `address_space_lookup()`. An earlier version of this

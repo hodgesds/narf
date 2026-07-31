@@ -1717,7 +1717,6 @@ fn smoke_epoll_shared_fd_table_cross_thread_wait() -> TestResult {
     // Own the current-task switch: setup_poll_test pins a fixed id.
     crate::syscall::__test_clear_global();
     crate::fd::__test_reset();
-    crate::fd::init();
     crate::handlers::init_per_task_state();
     crate::epoll::__test_reset();
 
@@ -2494,7 +2493,6 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
 
     __test_clear_global();
     crate::fd::__test_reset();
-    crate::fd::init();
     __test_signal_reset();
     crate::handlers::signal_init();
     let mut t = SyscallTable::new();

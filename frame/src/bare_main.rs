@@ -3358,7 +3358,6 @@ fn boot_userspace_init() {
     sigaction_init();
     signal_init();
     narf_userspace::handlers::init_per_task_state();
-    narf_userspace::fd::init();
     // `trace_comm=<prefix>[,<prefix>...]` retargets the syscall-trace feature's
     // comm filter without a rebuild (default `systemd-executo`). No-op unless
     // the kernel was built with `--features syscall-trace`.

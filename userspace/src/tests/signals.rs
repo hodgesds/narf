@@ -2005,7 +2005,6 @@ fn smoke_userspace_signalfd_reads_pending_siginfo() -> TestResult {
 
     __test_clear_global();
     crate::fd::__test_reset();
-    crate::fd::init();
     __test_signal_reset();
     crate::handlers::signal_init();
     let mut t = SyscallTable::new();
@@ -2111,7 +2110,6 @@ fn smoke_userspace_posix_timer_signal_delivery() -> TestResult {
     posix_timer::__test_reset();
     posix_timer::posix_timer_init();
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -2220,7 +2218,6 @@ fn smoke_userspace_posix_timer_gettime_remaining() -> TestResult {
     posix_timer::__test_reset();
     posix_timer::posix_timer_init();
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -2334,7 +2331,6 @@ fn smoke_userspace_posix_timer_delete_cancels() -> TestResult {
     posix_timer::__test_reset();
     posix_timer::posix_timer_init();
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();

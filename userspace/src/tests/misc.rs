@@ -101,7 +101,6 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     install_address_space_lookup(as_lookup);
     install_task_id_lookup(task_lookup);
     crate::fd::__test_reset();
-    crate::fd::init();
     crate::bootstrap_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -2254,7 +2253,6 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     install_address_space_lookup(as_lookup);
     install_task_id_lookup(task_lookup);
     crate::fd::__test_reset();
-    crate::fd::init();
     crate::bootstrap_init();
     narf_abi::install_file_op_bridge(abi_file_op_bridge);
     __test_clear_global();
@@ -2420,7 +2418,6 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
     install_address_space_lookup(as_lookup);
     install_task_id_lookup(task_lookup);
     crate::fd::__test_reset();
-    crate::fd::init();
     crate::bootstrap_init();
     narf_abi::install_file_op_bridge(abi_file_op_bridge);
     __test_clear_global();

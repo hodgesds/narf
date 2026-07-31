@@ -349,7 +349,6 @@ fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
     install_address_space_lookup(as_lookup);
     install_task_id_lookup(task_lookup);
     crate::fd::__test_reset();
-    crate::fd::init();
     crate::bootstrap_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -482,7 +481,6 @@ fn smoke_userspace_dup_clones_fd() -> TestResult {
     }
 
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
 
     let task = FAKE_TASK.load(Ordering::Relaxed);
@@ -636,7 +634,6 @@ fn smoke_userspace_fcntl_dupfd_cloexec() -> TestResult {
     }
 
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(t);
     let task = TASK.load(Ordering::Relaxed);
     let src = fd::with_table(task, |x| {
@@ -1078,7 +1075,7 @@ fn smoke_userspace_fork_inherits_fd_table() -> TestResult {
 
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
-    fd::init();
+    fd::__test_reset();
 
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that

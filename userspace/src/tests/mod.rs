@@ -264,7 +264,6 @@ fn install_ready_file(task_id: u64, mask: u32) -> u32 {
 fn setup_poll_test() -> u64 {
     crate::syscall::__test_clear_global();
     crate::fd::__test_reset();
-    crate::fd::init();
     crate::handlers::init_per_task_state();
     crate::epoll::__test_reset();
 

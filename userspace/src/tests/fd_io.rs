@@ -77,7 +77,6 @@ fn smoke_userspace_open_routes_through_vfs() -> TestResult {
 
     // ── Wire the userspace fd + task-id lookups. ──────────────────
     fd::__test_reset();
-    fd::init();
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(99);
     fn task_lookup() -> u64 {
@@ -192,7 +191,6 @@ fn smoke_userspace_symlink_create_and_readlink_round_trip() -> TestResult {
 
     __test_clear_global();
     fd::__test_reset();
-    fd::init();
 
     let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
     let fs = MemFs::with_seeds("sl-test", &[("target", b"hello")]);
@@ -327,7 +325,6 @@ fn smoke_userspace_readlink_on_non_symlink_fails() -> TestResult {
 
     __test_clear_global();
     fd::__test_reset();
-    fd::init();
 
     let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
     let fs = MemFs::with_seeds("sl-fail", &[("regular", b"x")]);
@@ -454,7 +451,6 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
     }
 
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
 
     // Open one fd in task 7's table.
@@ -626,7 +622,6 @@ fn smoke_userspace_fcntl_flags_round_trip() -> TestResult {
     }
 
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     let task = FAKE_TASK.load(Ordering::Relaxed);
     let target = fd::with_table(task, |t| {
@@ -760,7 +755,6 @@ fn smoke_userspace_fcntl_status_flags() -> TestResult {
     }
 
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(t);
     let task = TASK.load(Ordering::Relaxed);
     let fd_n = fd::with_table(task, |x| {
@@ -920,7 +914,6 @@ fn smoke_userspace_pipe_round_trip() -> TestResult {
     }
 
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
 
     __test_clear_global();
@@ -1039,7 +1032,6 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
     }
 
     fd::__test_reset();
-    fd::init();
 
     let task_a: u64 = 0xAA;
     let task_b: u64 = 0xBB;
@@ -1489,7 +1481,6 @@ fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
     crate::fd::__test_reset();
-    crate::fd::init();
 
     let auth = bootstrap_mount_authority();
     let _ = registry().mount(
@@ -1868,7 +1859,6 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
     crate::fd::__test_reset();
-    crate::fd::init();
 
     let auth = bootstrap_mount_authority();
     let _ = registry().mount(
@@ -2102,7 +2092,6 @@ fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
 
     __test_clear_global();
     crate::fd::__test_reset();
-    crate::fd::init();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
@@ -2382,7 +2371,6 @@ fn smoke_userspace_memfd_seal_write_rejects_write() -> TestResult {
 
     __test_clear_global();
     crate::fd::__test_reset();
-    crate::fd::init();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
@@ -2535,7 +2523,6 @@ fn smoke_userspace_memfd_seal_seal_blocks_further_seals() -> TestResult {
 
     __test_clear_global();
     crate::fd::__test_reset();
-    crate::fd::init();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
@@ -2669,7 +2656,6 @@ fn smoke_userspace_statx_known_file_reports_mode_size() -> TestResult {
     let _ = registry().mount(&auth, "/statx-known", StatxKnownFs);
 
     fd::__test_reset();
-    fd::init();
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xE001);
     fn task_lookup() -> u64 {
@@ -2803,7 +2789,6 @@ fn smoke_userspace_statx_mask_zero_still_fills_basic_fields() -> TestResult {
     let _ = registry().mount(&auth, "/statx-m0", StatxM0Fs);
 
     fd::__test_reset();
-    fd::init();
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xE002);
     fn task_lookup() -> u64 {
         FAKE_TASK.load(Ordering::Relaxed)
@@ -2940,7 +2925,6 @@ fn smoke_userspace_statx_at_empty_path_uses_dirfd() -> TestResult {
     let _ = registry().mount(&auth, "/statx-ep", StatxEpFs);
 
     fd::__test_reset();
-    fd::init();
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xE003);
     fn task_lookup() -> u64 {
         FAKE_TASK.load(Ordering::Relaxed)
@@ -3111,7 +3095,6 @@ fn smoke_userspace_statx_device_node_reports_rdev() -> TestResult {
     let _ = registry().mount(&auth, "/statx-rdev", RdevFs);
 
     fd::__test_reset();
-    fd::init();
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xE004);
     fn task_lookup() -> u64 {
         FAKE_TASK.load(Ordering::Relaxed)

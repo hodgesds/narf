@@ -524,7 +524,6 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_classify);
 fn smoke_shell_pipe_round_trip() -> TestResult {
     crate::syscall::__test_clear_global();
     fd::__test_reset();
-    fd::init();
 
     SHELL_TASK.store(0x5009, Ordering::Relaxed);
     install_task_id_lookup(shell_task_id);
@@ -618,7 +617,6 @@ kernel_test_in!("userspace/shell", smoke_shell_pipe_round_trip);
 fn smoke_shell_dup2_stdout_to_pipe() -> TestResult {
     crate::syscall::__test_clear_global();
     fd::__test_reset();
-    fd::init();
 
     SHELL_TASK.store(0x500A, Ordering::Relaxed);
     install_task_id_lookup(shell_task_id);
@@ -727,7 +725,6 @@ kernel_test_in!("userspace/shell", smoke_shell_dup2_stdout_to_pipe);
 fn smoke_shell_dup2_stdin_from_pipe() -> TestResult {
     crate::syscall::__test_clear_global();
     fd::__test_reset();
-    fd::init();
 
     SHELL_TASK.store(0x500B, Ordering::Relaxed);
     install_task_id_lookup(shell_task_id);
@@ -945,7 +942,6 @@ kernel_test_in!("userspace/shell", smoke_shell_fork_wait4_exit_status);
 fn smoke_shell_pipe_full_ring() -> TestResult {
     crate::syscall::__test_clear_global();
     fd::__test_reset();
-    fd::init();
 
     SHELL_TASK.store(0x500D, Ordering::Relaxed);
     install_task_id_lookup(shell_task_id);
@@ -1035,7 +1031,6 @@ kernel_test_in!("userspace/shell", smoke_shell_pipe_full_ring);
 fn smoke_shell_dup2_same_fd_noop() -> TestResult {
     crate::syscall::__test_clear_global();
     fd::__test_reset();
-    fd::init();
 
     SHELL_TASK.store(0x500E, Ordering::Relaxed);
     install_task_id_lookup(shell_task_id);
@@ -1119,7 +1114,6 @@ kernel_test_in!("userspace/shell", smoke_shell_dup2_same_fd_noop);
 fn smoke_shell_pipe_sequential_writes() -> TestResult {
     crate::syscall::__test_clear_global();
     fd::__test_reset();
-    fd::init();
 
     SHELL_TASK.store(0x500F, Ordering::Relaxed);
     install_task_id_lookup(shell_task_id);
@@ -1808,7 +1802,6 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_complex_pipeline);
 fn smoke_shell_pipe_exec_wiring() -> TestResult {
     crate::syscall::__test_clear_global();
     fd::__test_reset();
-    fd::init();
 
     SHELL_TASK.store(0x5020, Ordering::Relaxed);
     install_task_id_lookup(shell_task_id);

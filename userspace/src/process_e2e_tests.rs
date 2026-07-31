@@ -1670,7 +1670,6 @@ fn smoke_wave35_pipe_allocates_distinct_fds() -> TestResult {
     setup_process_state(TASK);
 
     crate::fd::__test_reset();
-    crate::fd::init();
 
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -1732,7 +1731,6 @@ fn smoke_wave35_dup2_rewires_descriptor() -> TestResult {
     setup_process_state(TASK);
 
     crate::fd::__test_reset();
-    crate::fd::init();
 
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);

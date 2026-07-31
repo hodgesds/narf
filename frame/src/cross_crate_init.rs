@@ -16,7 +16,7 @@ use narf_console as console;
 
 /// Wire every cross-crate fn-pointer hook the kernel needs at
 /// boot time. Called once from `bare_main` after the per-task
-/// initialisers (sigaction_init, signal_init, fd::init,
+/// initialisers (sigaction_init, signal_init,
 /// init_per_task_state) have run.
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub fn install_all_hooks() {
