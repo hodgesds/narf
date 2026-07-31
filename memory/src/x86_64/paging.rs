@@ -1212,6 +1212,54 @@ pub unsafe fn flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
     Some(e.flags())
 }
 
+/// Return the flags of whichever leaf actually maps `virt` — 1 GiB, 2 MiB or
+/// 4 KiB — together with that leaf's size in bytes.
+///
+/// [`flags_at`] deliberately returns `None` at a huge leaf, which makes it
+/// useless for asking the one question the W^X work needs answered: *is this
+/// address executable?* Most of the kernel's own mappings are huge, so a check
+/// built on `flags_at` silently passes on every address it cannot see.
+///
+/// # Safety
+/// `pml4_phys` must be identity-reachable (same as `map_4kb`).
+pub unsafe fn leaf_flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<(PtFlags, u64)> {
+    if !is_canonical(virt) {
+        return None;
+    }
+    let idx = WalkIndices::from_virt(virt);
+    // SAFETY: caller guarantees `pml4_phys` is identity-reachable.
+    let pml4 = unsafe { &*pml4_phys.as_ptr::<PageTable>() };
+    let e = pml4.entries[idx.pml4];
+    if !e.is_present() {
+        return None;
+    }
+    // SAFETY: a present non-leaf PML4 entry names a live PDPT frame.
+    let pdpt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let e = pdpt.entries[idx.pdpt];
+    if !e.is_present() {
+        return None;
+    }
+    if e.flags().contains(PtFlags::HUGE_PAGE) {
+        return Some((e.flags(), 1 << 30));
+    }
+    // SAFETY: a present non-huge PDPT entry names a live PD frame.
+    let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let e = pd.entries[idx.pd];
+    if !e.is_present() {
+        return None;
+    }
+    if e.flags().contains(PtFlags::HUGE_PAGE) {
+        return Some((e.flags(), 1 << 21));
+    }
+    // SAFETY: a present non-huge PD entry names a live PT frame.
+    let pt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let e = pt.entries[idx.pt];
+    if !e.is_present() {
+        return None;
+    }
+    Some((e.flags(), 1 << 12))
+}
+
 /// Resolve the physical address currently mapped at `virt`, if any.
 /// Returns `None` when the walk hits a not-present entry. Treats huge
 /// pages (1 GiB at PDPT level, 2 MiB at PD level) as first-class —
