@@ -1111,7 +1111,6 @@ fn smoke_stack_admin_delegates_only_to_current_route_socket() -> TestResult {
 
     crate::install_task_id_lookup(task_lookup);
     crate::fd::__test_reset();
-    crate::fd::init();
     let route = crate::socket::SocketFile::with_protocol(
         crate::socket::AF_NETLINK,
         crate::socket::SOCK_RAW,

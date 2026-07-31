@@ -270,28 +270,37 @@ fn table_shard(task_id: u64) -> usize {
     (task_id as usize) & (TABLE_SHARDS - 1)
 }
 
-static TABLES: [IrqSafeSpinLock<Option<Tables>>; TABLE_SHARDS] =
-    [const { IrqSafeSpinLock::new(None) }; TABLE_SHARDS];
-
-/// Initialise the per-task fd table store. Called once at boot
-/// before any task can install fds.
-pub fn init() {
-    for shard in TABLES.iter() {
-        *shard.lock() = Some(BTreeMap::new());
-    }
-}
+/// The shard array is const-initialised to empty maps: there is NO
+/// "store not yet initialised" state.
+///
+/// It used to be `Option<Tables>` seeded by an explicit `init()`, and every
+/// accessor mapped the `None` to a silent failure — `with_table` returned
+/// `None`, which `open_impl`'s directory branch reported as the generic `-1`
+/// open failure rather than an errno. Because `init()` ran from
+/// `boot_userspace_init` (x86_64 + `boot-init` only, and never in a
+/// `kernel-test` boot), the whole fd layer was live only if some earlier
+/// smoke happened to call `init()`/`__test_reset()` first. That made every
+/// fd-using kernel test silently depend on link-section registration order:
+/// `smoke_sandbox_root_swap_deep_path_resolves` failed on aarch64 with
+/// `openat(/mrfs, O_PATH) failed` purely because a reordering moved the last
+/// initialiser after it. `BTreeMap::new()` is `const`, so the uninitialised
+/// state buys nothing — deleting it makes the failure unrepresentable.
+static TABLES: [IrqSafeSpinLock<Tables>; TABLE_SHARDS] =
+    [const { IrqSafeSpinLock::new(BTreeMap::new()) }; TABLE_SHARDS];
 
 /// Look up + run `op` against the table for `task_id`. Creates a
 /// fresh table — pre-populated with stdio at fds 0/1/2 — on first
 /// reference. Returns the closure's value.
+///
+/// Always `Some`. The `Option` is retained because ~240 call sites read it,
+/// not because the lookup can fail.
 pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option<R> {
     // Get-or-create this task's table Arc under the shard lock, clone the Arc,
     // then DROP the shard lock before running `op` under the per-table lock.
     // This keeps the hot shard lock held only for the brief map lookup, and lets
     // CLONE_FILES siblings (who share one Arc) serialise on the table itself.
     let arc = {
-        let mut g = TABLES[table_shard(task_id)].lock();
-        let map = g.as_mut()?;
+        let mut map = TABLES[table_shard(task_id)].lock();
         map.entry(task_id)
             .or_insert_with(|| Arc::new(IrqSafeSpinLock::new(fresh_table())))
             .clone()
@@ -900,13 +909,7 @@ pub fn fork(parent: u64, child: u64) -> usize {
     // Snapshot the parent's slots (under the parent table's own lock), build an
     // INDEPENDENT copy in a fresh Arc, install for the child. Never hold two
     // shard locks at once → no lock-ordering hazard.
-    let parent_arc = {
-        let g = TABLES[table_shard(parent)].lock();
-        match g.as_ref() {
-            Some(m) => m.get(&parent).cloned(),
-            None => return 0,
-        }
-    };
+    let parent_arc = TABLES[table_shard(parent)].lock().get(&parent).cloned();
     let parent_slots: Vec<Option<FdEntry>> = match parent_arc {
         Some(a) => a.lock().slots.clone(),
         None => Vec::new(),
@@ -914,14 +917,10 @@ pub fn fork(parent: u64, child: u64) -> usize {
     let copied = parent_slots.iter().filter(|s| s.is_some()).count();
     let mut child_table = FdTable::new();
     child_table.slots = parent_slots;
-    let mut g = TABLES[table_shard(child)].lock();
-    match g.as_mut() {
-        Some(m) => {
-            m.insert(child, Arc::new(IrqSafeSpinLock::new(child_table)));
-            copied
-        }
-        None => 0,
-    }
+    TABLES[table_shard(child)]
+        .lock()
+        .insert(child, Arc::new(IrqSafeSpinLock::new(child_table)));
+    copied
 }
 
 /// CLONE_FILES: install the SAME table `Arc` under the child's TaskId so the
@@ -933,19 +932,13 @@ pub fn share(parent: u64, child: u64) -> usize {
     // Get-or-create the parent's table Arc atomically (same logic as
     // `with_table`'s first-touch), then install that same Arc for the child.
     let arc = {
-        let mut g = TABLES[table_shard(parent)].lock();
-        let map = match g.as_mut() {
-            Some(m) => m,
-            None => return 0,
-        };
+        let mut map = TABLES[table_shard(parent)].lock();
         map.entry(parent)
             .or_insert_with(|| Arc::new(IrqSafeSpinLock::new(fresh_table())))
             .clone()
     };
     let n = arc.lock().slots.iter().filter(|s| s.is_some()).count();
-    if let Some(m) = TABLES[table_shard(child)].lock().as_mut() {
-        m.insert(child, arc);
-    }
+    TABLES[table_shard(child)].lock().insert(child, arc);
     n
 }
 
@@ -955,12 +948,9 @@ pub fn share(parent: u64, child: u64) -> usize {
 /// CLOEXEC close is visible to them too — matching Linux, where exec
 /// unshares files first; NARF's exec implies a non-shared table.
 pub fn close_cloexec(task_id: u64) -> usize {
-    let arc = {
-        let g = TABLES[table_shard(task_id)].lock();
-        match g.as_ref().and_then(|m| m.get(&task_id).cloned()) {
-            Some(a) => a,
-            None => return 0,
-        }
+    let arc = match TABLES[table_shard(task_id)].lock().get(&task_id).cloned() {
+        Some(a) => a,
+        None => return 0,
     };
     let n = arc.lock().close_cloexec_slots();
     n
@@ -969,9 +959,7 @@ pub fn close_cloexec(task_id: u64) -> usize {
 /// Drop the entire fd table for `task_id`. Call on task exit so
 /// the FileOps `Arc`s can release.
 pub fn detach(task_id: u64) {
-    if let Some(map) = TABLES[table_shard(task_id)].lock().as_mut() {
-        map.remove(&task_id);
-    }
+    TABLES[table_shard(task_id)].lock().remove(&task_id);
     // Drop any advisory POSIX locks the task held so its peers can
     // make progress on shared inodes — and wake their F_SETLKW waiters
     // NOW. This is the FIRST of the two exit-path release_owner calls
@@ -991,16 +979,13 @@ pub fn detach(task_id: u64) {
 #[doc(hidden)]
 pub fn __test_reset() {
     for shard in TABLES.iter() {
-        *shard.lock() = Some(BTreeMap::new());
+        shard.lock().clear();
     }
 }
 
 /// Number of tasks with at least one fd installed. Diagnostic.
 pub fn live_task_count() -> usize {
-    TABLES
-        .iter()
-        .map(|s| s.lock().as_ref().map(|m| m.len()).unwrap_or(0))
-        .sum()
+    TABLES.iter().map(|s| s.lock().len()).sum()
 }
 
 // ── Advisory POSIX file locks (Wave-68, linux-compat) ──────────────

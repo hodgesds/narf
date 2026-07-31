@@ -192,7 +192,7 @@ Delivery model and mask width are detailed in §3.2.
 | `perf_event_open` | implemented | `linux-compat` | `handlers.rs:~21949` |
 | `init_module`/`finit_module`/`delete_module` | present | — | NARF has no out-of-tree module model; treat as stubs unless verified **(unverified)** |
 | `io_uring_setup`/`enter`/`register` | **not present** | — | intentional non-goal (§6) |
-| `bpf` | **not present** | — | intentional non-goal (§6) |
+| `bpf` | partial | — | x86_64 321 / aarch64 280. `BPF_PROG_LOAD` + `BPF_PROG_TEST_RUN`; every other command `ENOTSUP`. `handlers/sys_bpf.rs` |
 
 ---
 
@@ -420,8 +420,12 @@ FUSE and virtio-fs/9p give a userspace-filesystem escape hatch.
 - **io_uring** — no `io_uring_setup`/`enter`/`register` in the table. NARF's
   async I/O story is `Narf-Ring` (capability-typed zero-copy rings), which is
   conceptually io_uring with cap typing; a Linux `io_uring` shim is not a goal.
-- **BPF** — no `bpf(2)`. No in-kernel BPF verifier/JIT. systemd degrades
-  gracefully without it (per the gap analysis).
+- **BPF** — *no longer a non-goal.* NARF is growing an in-kernel BPF
+  verifier and JIT: instruction-set compatible with Linux (so `clang -target
+  bpf` is the compiler) but ABI-divergent above the encoding. `bpf(2)` covers
+  the subset that maps cleanly onto the new data model; the rest returns
+  `ENOTSUP` with a `// LINUX-GAP` note. See `bpf/specification/spec.md`.
+  systemd still degrades gracefully without it.
 - **Out-of-tree binary drivers** — no module ABI for third-party blobs. All
   drivers are in-tree Rust. `init_module`/`finit_module` are present but should
   be treated as non-functional for real modules **(unverified)**.

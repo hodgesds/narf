@@ -1,0 +1,174 @@
+//! # `narf-bpf-jit` — native code generation for verified BPF programs
+//!
+//! Takes a [`VerifiedProgram`] and emits machine code into a buffer the caller
+//! provides. Deliberately knows nothing about *where* that buffer lives: the
+//! executable-text allocator, the RW→RX seal, and the exception-table
+//! registration are `narf-bpf`'s and `narf-memory`'s business. That keeps this
+//! crate dependency-free of the kernel and testable on the host against golden
+//! encodings.
+//!
+//! ## The order that matters
+//!
+//! Codegen produces both the bytes and a [`FaultTable`]. The caller must
+//! register the fault table **before** sealing the text as executable — spec
+//! §4.3, enforced by `memory::bpf_text::seal` returning `ExtableMissing`
+//! rather than trusted. This crate makes that hard to get wrong by returning
+//! the two together from one call: there is no way to obtain the code without
+//! also obtaining the table it requires.
+//!
+//! ## No sizing fixpoint on either backend
+//!
+//! Neither emitter runs a convergence loop, and each gets there a different
+//! way:
+//!
+//! * **x86-64**: every branch is `rel32`, so nothing shrinks and nothing needs
+//!   re-measuring. The convergence loop and the 123-byte short-branch cap
+//!   borrowed from `arch/x86/net/bpf_jit_comp.c:70-113` were removed: the
+//!   emitter never selected a short form, so the machinery guarded a hazard it
+//!   was not exposed to. It comes back with `rel8` selection, if that ever
+//!   lands.
+//! * **aarch64**: fixed-size branch *shapes* rather than one branch width.
+//!   `B` reaches ±128 MiB but `B.cond` only ±1 MiB, so a conditional jump
+//!   always lowers to an inverted-condition `B.cond` over a `B` — two
+//!   instructions whatever the distance. See [`aarch64`] for why a
+//!   distance-dependent choice is what oscillates.
+//!
+//! ## Fuel, and how exhaustion is reported
+//!
+//! The verifier deliberately does not prove termination — fuel is the *only*
+//! thing bounding a program's work (spec §4.9) — so native code must burn it or
+//! `loop: r0 += 1; goto loop` runs forever on a hook that may have IRQs masked.
+//!
+//! Fuel is burned **per basic block**, decrementing by the block's instruction
+//! count on entry: the same *total* as the interpreter's per-instruction burn,
+//! at one subtract-and-branch per block instead of per instruction. Equal
+//! totals is a correctness property, not an optimisation — a program that
+//! completes JITed and exhausts fuel interpreted is a program whose verdict
+//! depends on whether it happened to clear `jit_glue`'s gates. Both backends
+//! compute the charge from the same `blocks` module so the two cannot drift.
+//!
+//! Exhaustion is reported **out of band**, in the second return register. An
+//! in-band sentinel was tried and removed: the obvious choice, `u64::MAX`, is
+//! exactly what `r0 = -1; exit` returns, so "ran out of fuel" and "returned -1"
+//! would be the same answer. Both ABIs return a 128-bit value in a register
+//! pair — SysV `rax:rdx`, AAPCS64 `x0:x1` — so the entry point is declared
+//! `-> u128` and the high half carries the flag. The value and the verdict
+//! travel together with no extra memory traffic and nothing to confuse.
+
+#![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
+#![deny(missing_debug_implementations)]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
+
+pub mod aarch64;
+mod blocks;
+pub mod x86_64;
+
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod tests_aarch64;
+
+use narf_bpf_verifier::VerifiedProgram;
+
+/// One instruction that may fault, and what to do about it.
+///
+/// The native counterpart of [`narf_bpf_verifier::FaultSite`]: the verifier
+/// says *which BPF instruction*, codegen says *which native address*.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FaultEntry {
+    /// Byte offset from the start of the emitted image to the faulting
+    /// instruction. The caller adds the image's base address — codegen does
+    /// not know it, which is what lets the same bytes be sized before they are
+    /// placed.
+    pub fault_off: u32,
+    /// Byte offset to resume at: the instruction after the faulting one.
+    pub fixup_off: u32,
+    /// Host register to zero on fault, or `None` for a store.
+    ///
+    /// A host register number, not a BPF one — the trap handler writes the
+    /// trap frame directly, so no translation table exists to drift out of
+    /// step with the register allocation.
+    pub dst_host_reg: Option<u8>,
+    /// Whether this is an arena access, which reports differently.
+    pub arena: bool,
+}
+
+/// Every faulting site in an emitted image, sorted by `fault_off`.
+#[derive(Clone, Debug, Default)]
+pub struct FaultTable(pub Vec<FaultEntry>);
+
+/// A completed compilation.
+#[derive(Clone, Debug)]
+pub struct Compiled {
+    /// The machine code.
+    pub code: Vec<u8>,
+    /// Faulting sites, which must be registered before the code is sealed.
+    pub faults: FaultTable,
+    /// Byte offset of the program's entry point within `code`.
+    ///
+    /// Non-zero once a CFI or endbr preamble is emitted; zero today. Returned
+    /// explicitly rather than assumed, because Linux's equivalent assumption
+    /// broke when FineIBT started placing its hash *before* the entry
+    /// (`bpf_jit_comp.c:3902`).
+    pub entry_off: u32,
+}
+
+/// Why compilation failed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum JitError {
+    /// An instruction this backend does not emit yet. Falls back to the
+    /// interpreter rather than refusing the program.
+    Unsupported { at: u32, what: &'static str },
+    /// A jump or call target outside the program.
+    BadTarget { at: u32 },
+    /// The instruction stream could not be decoded. Should be unreachable —
+    /// the verifier decoded it already — so it means the image changed
+    /// underneath us.
+    Decode { at: u32 },
+}
+
+/// Whether this build has a native backend at all.
+///
+/// True on both supported architectures now that [`aarch64`] emits — spec §5's
+/// "aarch64 runs interpreted" no longer holds. Kept as a predicate rather than
+/// deleted: it is what lets a test tell "no backend on this architecture" — a
+/// legitimate skip — from "there is a backend and this program did not
+/// compile", which must stay a failure. Conflating the two is how a
+/// differential test starts passing vacuously, and a third architecture would
+/// bring the distinction straight back.
+#[must_use]
+pub const fn has_backend() -> bool {
+    cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+}
+
+/// Compile a verified program for the host architecture.
+///
+/// # Errors
+///
+/// [`JitError`]. `Unsupported` is not fatal to the caller — the interpreter
+/// remains a complete implementation, so an un-emittable instruction means
+/// "run this one interpreted", not "reject the program".
+pub fn compile(prog: &VerifiedProgram) -> Result<Compiled, JitError> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86_64::compile(prog)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::compile(prog)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        // Reported as `Unsupported` at instruction 0 so the caller's existing
+        // fallback path handles it with no special case.
+        let _ = prog;
+        Err(JitError::Unsupported {
+            at: 0,
+            what: "no native backend for this architecture",
+        })
+    }
+}

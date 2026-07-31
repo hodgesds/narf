@@ -190,3 +190,19 @@ argument = "Task creation validates caller-provided affinity against the online 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Post-poll requeue keeps the CPU that just executed the continuation whenever it remains online and allowed. Affinity.preferred is only an initial-placement hint; it cannot force an otherwise-unnecessary cross-core context migration or bypass the hard allowed mask."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The BPF memory work stays inside the existing frame/ + memory/ TCB and adds no new trusted subsystem. `bpf_text::reserve_kernel_slots` runs as a direct call from bare_main after the MMU handoff and before the first `new_user_pml4`, because `new_user_pml4_on` snapshot-copies PML4[256..511] by value with no propagation; a slot first populated after a user address space exists would leave that CR3 holding a zero entry and triple-fault. A `debug_assert` in `new_user_pml4_on` makes a future reordering fail loudly, and an in-kernel smoke reads the live root to assert both entries are present and both arena guard slots are absent."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Every BPF kernel-VA mapping is installed with USER clear at the leaf and at every intermediate level, so no CPL=3 / EL0 walk can reach BPF text, arena pages, or the per-CPU BPF stack. Arena frames are zeroed on population so a recycled frame cannot leak its previous owner's bytes to a program. The extable consults a per-image table keyed on the faulting PC and recovers only kernel-mode faults; it neither bypasses nor alters any capability check or domain tag."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "`CapKind::Jit` gates both executable-text allocation and the only mprotect path that can produce a W|X user mapping. Both entry points re-check liveness on every call rather than trusting possession, per invariant #5; the grant table is swept by the thread-scoped exit observer so an authority cannot outlive its task; and adding W to an already-executable mapping is refused regardless of the capability. `AddressSpace::mprotect_range` continues to reject W|X outright, so exactly one capability-gated function can construct such a mapping."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "W^X for kernel JIT text is recorded as incomplete rather than claimed. `memory/src/x86_64/mmu.rs` builds the low identity map PRESENT|WRITABLE|HUGE_PAGE with no NO_EXEC, so every frame mapped RX at a BPF text VA is simultaneously aliased RWX through the identity map. The RX mapping is still installed (it is the correct end state and makes the JIT's own pointer non-writable), the module documentation and `bpf/specification/spec.md` §4.2 state plainly that it is not yet a security boundary, and demoting the identity map to NX is tracked as §8.6. No temporary-alias publish mechanism was built, because it would add attack surface without closing that gap."

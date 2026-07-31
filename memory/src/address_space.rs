@@ -1766,7 +1766,7 @@ impl AddressSpace {
                     // SAFETY: TLBI VAE1 at EL1 is always legal; `v` is the
                     // page-aligned faulting VA owned by this AS.
                     unsafe {
-                        crate::aarch64::paging::tlb_invalidate_vae1(va);
+                        crate::aarch64::paging::tlb_invalidate_vae1is(va);
                     }
                     return Ok(());
                 }
@@ -2263,13 +2263,87 @@ impl AddressSpace {
         len: u64,
         new_perms: RegionPerms,
     ) -> Result<(), AddressSpaceError> {
-        // W^X: reject WRITE | EXEC outright. Used by sys_mprotect's
-        // cap-free fast path; CAP_JIT-gated RW→RX transitions go
-        // through a separate cap-checked entry.
+        // W^X: reject WRITE | EXEC outright. This is sys_mprotect's cap-free
+        // fast path; the `Cap<Jit, Grant>`-gated transitions go through
+        // `wx::jit_mprotect`, which classifies the change and then calls
+        // `mprotect_range_wx_checked` below.
         let prot = new_perms.prot_only();
         if prot.contains(RegionPerms::WRITE | RegionPerms::EXEC) {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
+        self.mprotect_range_wx_checked(base, len, new_perms)
+    }
+
+    /// Permissions of the region covering `[base, base + len)`, or `None` if
+    /// no single region covers the whole request.
+    ///
+    /// `wx::jit_mprotect` needs the *old* permission set to classify the
+    /// transition, and "one region or nothing" is the right shape for that:
+    /// a request straddling two regions with different permissions has no
+    /// single `old` to classify, and silently classifying against the first
+    /// one would let a JIT grant cover a region it was never meant to.
+    ///
+    /// **Not** a precondition for `mprotect(2)` in general — see
+    /// [`Self::perms_intersecting`]. Making it one narrowed the syscall to
+    /// single-region ranges and broke every multi-region `mprotect` that used
+    /// to work.
+    pub fn perms_covering(&self, base: VirtAddr, len: u64) -> Option<RegionPerms> {
+        let lo = base.as_u64();
+        let hi = lo.checked_add(len)?;
+        self.regions
+            .lock()
+            .iter()
+            .find(|r| {
+                let rb = r.base.as_u64();
+                rb <= lo && hi <= rb + r.len
+            })
+            .map(|r| r.perms)
+    }
+
+    /// Permissions of **every** region intersecting `[base, base + len)`.
+    ///
+    /// `mprotect_range` splits across every intersecting region, so the W^X
+    /// classification has to see every one of them too. Using
+    /// [`Self::perms_covering`] for that instead was a real regression: it
+    /// returns `None` unless a *single* region spans the whole request, so a
+    /// range crossing two adjacent mappings — or one an earlier `mprotect`
+    /// had already split — was refused outright rather than classified.
+    ///
+    /// Returns them in region order. An empty result means nothing is mapped
+    /// there, which is `mprotect_range`'s error to report, not this one's.
+    pub fn perms_intersecting(&self, base: VirtAddr, len: u64) -> alloc::vec::Vec<RegionPerms> {
+        let lo = base.as_u64();
+        let Some(hi) = lo.checked_add(len) else {
+            return alloc::vec::Vec::new();
+        };
+        self.regions
+            .lock()
+            .iter()
+            .filter(|r| {
+                let rb = r.base.as_u64();
+                let re = rb + r.len;
+                rb < hi && lo < re
+            })
+            .map(|r| r.perms)
+            .collect()
+    }
+
+    /// `mprotect_range` **without** the W^X end-state rejection.
+    ///
+    /// Not public: the only caller is `wx::jit_mprotect`, which has already
+    /// classified the `old → new` transition through
+    /// [`wx::classify_mprotect`](crate::wx::classify_mprotect) and verified a
+    /// live `Cap<Jit, Grant>`. Splitting it out this way keeps exactly one
+    /// place where a W|X mapping can come into existence, and that place is
+    /// capability-gated.
+    #[cfg(feature = "linux-compat")]
+    pub(crate) fn mprotect_range_wx_checked(
+        &self,
+        base: VirtAddr,
+        len: u64,
+        new_perms: RegionPerms,
+    ) -> Result<(), AddressSpaceError> {
+        let prot = new_perms.prot_only();
         // Page-align the request. Linux mprotect(2) requires
         // `addr` to be page-aligned; `len` is rounded up by the
         // libc caller but we reject silently-misaligned lengths
@@ -2336,6 +2410,21 @@ impl AddressSpace {
                     let _ = self.unmap_huge_leaf(va, region.size);
                     self.map_huge_leaf(va, frame.phys(), region.size, prot)?;
                 }
+                // LINUX-GAP: bare `prot` here drops the internal flags —
+                // LOCKED above all — where the 4 KiB path below preserves them
+                // (`prot | preserved_flags`). Linux keeps `VM_LOCKED` across an
+                // `mprotect`, so an `mlock`ed hugetlb mapping is silently
+                // unlocked by a later `mprotect` of part of it.
+                //
+                // Consequences are contained today only because nothing reads a
+                // *huge* region's LOCKED: the COW and fork paths consult
+                // `self.regions` alone, and `Drop` frees huge frames
+                // unconditionally (huge mappings never honour SHARED either).
+                // The moment a reclaim tier consults huge LOCKED this becomes a
+                // real unlock. Pinned for the 4 KiB path by
+                // `smoke_memory_mlock_survives_mprotect`; deliberately not
+                // "fixed" here because the flag has no consumer to be correct
+                // for yet, and a fix with no test would just be a claim.
                 rebuilt.push(HugeRegion {
                     base: VirtAddr::new(split_lo),
                     len: middle_frames.len() as u64 * page_size,

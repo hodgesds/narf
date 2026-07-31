@@ -300,7 +300,6 @@ fn smoke_userspace_stat_returns_size() -> TestResult {
     let _ = registry().mount(&auth, "/stat-test", StubFs);
 
     fd::__test_reset();
-    fd::init();
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD2);
     fn task_lookup() -> u64 {
         FAKE_TASK.load(Ordering::Relaxed)
@@ -594,7 +593,6 @@ fn smoke_userspace_memfd_create_returns_writable_fd() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
     crate::fd::__test_reset();
-    crate::fd::init();
 
     let name = "anon-1";
     let mut ctx = FakeCtx {
@@ -1134,7 +1132,6 @@ fn smoke_userspace_clock_nanosleep_abstime_returns_at_or_after_target() -> TestR
     }
 
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();

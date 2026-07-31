@@ -1,0 +1,57 @@
+[package]
+name        = "narf-bpf"
+description = "BPF kernel runtime: kfunc!/struct_ops! registries, the fuel-metered interpreter, and the attach adapters."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+# `bpf/isa`, `bpf/verifier`, and `bpf/jit` are nested packages inside this
+# package's directory. Turning off target auto-discovery keeps cargo from
+# walking into them looking for bins/examples/benches.
+autobins     = false
+autoexamples = false
+autotests    = false
+autobenches  = false
+
+[lib]
+name = "narf_bpf"
+path = "src/lib.rs"
+
+[features]
+default = []
+# In-kernel smokes, registered through `narf-kernel-test` into `narf.tests`.
+# The crate itself is always linked (the `bpf(2)` handler and
+# `register_initcalls()` are unconditional), so this gates only the tests.
+kernel-test = ["dep:narf-kernel-test"]
+# In-kernel benchmarks, registered through `narf-bpf-bench` and run only when
+# the kernel cmdline carries `bpf_bench`. Off by default because it compiles
+# `interp::Vm::run_fuel_hoisted` — a fuel policy that bounds iterations rather
+# than work, kept solely so the policy that replaced it can be measured against
+# it. A production kernel must not be able to name it.
+bench = ["dep:narf-bpf-bench"]
+# cgroup-v2 memory accounting for map storage. A map's whole footprint is
+# chosen by a `bpf(2)` argument, so without this an fd can pin kernel memory
+# outside any `memory.max`. Forwarded from `narf-userspace/cgroup` (which is
+# where `bpf(2)` lives) rather than enabled unconditionally, so that
+# `narf-memory`'s `cgroup` feature stays a real off switch.
+cgroup = ["narf-memory/cgroup"]
+
+[dependencies]
+narf-bpf-isa      = { path = "isa" }
+narf-bpf-verifier = { path = "verifier" }
+narf-bpf-jit      = { path = "jit" }
+narf-lib          = { path = "../lib" }
+narf-memory       = { path = "../memory" }
+narf-rcu          = { path = "../rcu" }
+narf-arch         = { path = "../arch" }
+narf-capabilities = { path = "../capabilities" }
+narf-filesystem   = { path = "../filesystem" }
+narf-net          = { path = "../net" }
+narf-tracing      = { path = "../tracing" }
+narf-init         = { path = "../init" }
+narf-kernel-test  = { path = "../verification/kernel-test", optional = true }
+narf-bpf-bench    = { path = "bench", optional = true }
+
+[lints]
+workspace = true

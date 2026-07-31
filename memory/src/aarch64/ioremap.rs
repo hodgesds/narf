@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::aarch64::paging::{
-    self, map_4kb, read_ttbr1_el1, tlb_invalidate_vae1, MapError, PtFlags,
+    self, map_4kb, read_ttbr1_el1, tlb_invalidate_vae1is, MapError, PtFlags,
 };
 use crate::vmalloc::{self, VmRange, VmallocError};
 use crate::{PhysAddr, VirtAddr};
@@ -138,7 +138,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
                 let v_j = VirtAddr::new(range.base + off_j);
                 // SAFETY: tlbi is always legal at EL1.
                 unsafe {
-                    tlb_invalidate_vae1(v_j);
+                    tlb_invalidate_vae1is(v_j);
                 }
                 // No unmap_4kb on aarch64 yet — leave the L3
                 // entry; the caller's vmalloc::free is enough
@@ -153,7 +153,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
         // system — same as the x86_64 INVLPG broadcast.
         // SAFETY: tlbi at EL1 always legal.
         unsafe {
-            tlb_invalidate_vae1(v);
+            tlb_invalidate_vae1is(v);
         }
     }
 
@@ -180,7 +180,7 @@ pub unsafe fn iounmap(m: IoMapping) {
         let v = VirtAddr::new(m.virt + off);
         // SAFETY: TLB invalidation is always safe.
         unsafe {
-            tlb_invalidate_vae1(v);
+            tlb_invalidate_vae1is(v);
         }
     }
     let _ = paging::translate; // silence unused

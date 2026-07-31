@@ -1335,7 +1335,7 @@ kernel_test_in!("userspace/mount", smoke_pivot_root_relative_paths);
 fn smoke_open_tree_move_mount() -> TestResult {
     let task: u64 = 0x71_09;
     set_task(task);
-    crate::fd::init();
+    crate::fd::__test_reset();
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
 
@@ -1407,7 +1407,7 @@ kernel_test_in!("userspace/mount", smoke_open_tree_move_mount);
 fn smoke_move_mount_overmount_no_ebusy() -> TestResult {
     let task: u64 = 0x71_20;
     set_task(task);
-    crate::fd::init();
+    crate::fd::__test_reset();
     crate::handlers::__test_root_dir_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
 

@@ -92,6 +92,8 @@ pub mod xdp_socket;
 
 mod abi_aio_tests;
 mod abi_async_tests;
+mod abi_bpf_btf_tests;
+mod abi_bpf_tests;
 mod abi_creds_tests;
 mod abi_fdio2_tests;
 mod abi_fdio_tests;

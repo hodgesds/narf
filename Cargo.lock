@@ -641,6 +641,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-bpf"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bpf-bench",
+ "narf-bpf-isa",
+ "narf-bpf-jit",
+ "narf-bpf-verifier",
+ "narf-capabilities",
+ "narf-filesystem",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-rcu",
+ "narf-tracing",
+]
+
+[[package]]
+name = "narf-bpf-bench"
+version = "0.0.0"
+dependencies = [
+ "narf-boot",
+ "narf-console",
+ "narf-init",
+ "narf-lib",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-bpf-btf"
+version = "0.0.0"
+
+[[package]]
+name = "narf-bpf-isa"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+]
+
+[[package]]
+name = "narf-bpf-jit"
+version = "0.0.0"
+dependencies = [
+ "narf-bpf-isa",
+ "narf-bpf-verifier",
+ "narf-kernel-test",
+]
+
+[[package]]
+name = "narf-bpf-verifier"
+version = "0.0.0"
+dependencies = [
+ "narf-bpf-isa",
+ "narf-kernel-test",
+]
+
+[[package]]
 name = "narf-bus"
 version = "0.0.0"
 dependencies = [
@@ -1527,6 +1586,7 @@ dependencies = [
  "narf-block",
  "narf-bluetooth",
  "narf-boot",
+ "narf-bpf",
  "narf-bus",
  "narf-console",
  "narf-crypto",
@@ -1986,6 +2046,10 @@ dependencies = [
  "narf-abi",
  "narf-arch",
  "narf-block",
+ "narf-bpf",
+ "narf-bpf-btf",
+ "narf-bpf-isa",
+ "narf-bpf-verifier",
  "narf-capabilities",
  "narf-console",
  "narf-drivers-fs-fat",
@@ -2018,6 +2082,7 @@ dependencies = [
  "narf-audio",
  "narf-block",
  "narf-boot",
+ "narf-bpf",
  "narf-bus",
  "narf-busybox",
  "narf-capabilities",

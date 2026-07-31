@@ -41,7 +41,7 @@ over that authority; it is not a second PMU subsystem.
 | `perf top` | sampling plus periodic display | partial (x86_64 and aarch64 PMUv3) | Uses the same genuine overflow and mmap-ring path as `perf record`, including CPU-scoped attribution for system-wide events. A bounded 64-snapshot per-CPU IRQ ring absorbs bursts and preserves each overflow's event identity and period; full rings report event-attributed loss. Symbolized kernel display remains unavailable while the Linux adapter intentionally restricts `/proc/kallsyms` pending capability authorization. |
 | probes (`kprobe`, `uprobe`) | probe PMUs, tracefs dynamic events | unsupported | Must be capability-gated when added. |
 | cgroup mode | `PERF_FLAG_PID_CGROUP`, cgroup scheduler hooks | unsupported | Deferred with scheduler attribution. |
-| BPF attachment | SET_BPF/QUERY_BPF ioctls, BPF runtime | unsupported | Returns `ENOTTY`; no BPF program loading, execution, attachment, query, or synthesized BPF records are implemented. Perf's `bpf_event` metadata selector is accepted only on its dummy sideband event; because no BPF objects can exist, that event domain is empty and perf may print its normal synthesis warning. |
+| BPF attachment | SET_BPF ioctl, BPF runtime | **SET_BPF supported** | Returns `ENOTTY`; no BPF program loading, execution, attachment, query, or synthesized BPF records are implemented. Perf's `bpf_event` metadata selector is accepted only on its dummy sideband event; because no BPF objects can exist, that event domain is empty and perf may print its normal synthesis warning. |
 
 ## `perf_event_open` audit
 

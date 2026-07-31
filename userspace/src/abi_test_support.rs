@@ -112,8 +112,15 @@ pub fn setup() {
     crate::handlers::__test_root_dir_reset();
     __test_clear_global();
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
+    // The no-AS baseline this harness promises is established above, by the
+    // save-clear-restore of `address_space_lookup()`. An earlier version of this
+    // file also installed a `None`-returning lookup here; upstream arrived at
+    // the same fix independently and scoped it properly (restored in
+    // `teardown`, so a test body that installs its own bridge still works),
+    // which makes the second mechanism redundant. Two mechanisms for one
+    // invariant is how invariants rot, so the duplicate is gone rather than
+    // left as belt-and-braces.
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);

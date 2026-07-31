@@ -161,7 +161,6 @@ fn smoke_smap_sys_write_kbuf_roundtrip() -> TestResult {
     }
 
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_w);
     let fd_n = fd::with_table(FAKE_TASK_W, |t| {
         t.open(FdEntry {
@@ -243,7 +242,6 @@ fn smoke_smap_sys_write_oversized_einval() -> TestResult {
     }
 
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_ov);
 
     __test_clear_global();
@@ -316,7 +314,6 @@ fn smoke_smap_sys_write_null_efault() -> TestResult {
     }
 
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_np);
 
     __test_clear_global();
@@ -411,7 +408,6 @@ fn smoke_smap_sys_read_kbuf_roundtrip() -> TestResult {
     }
 
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_r);
     let fd_n = fd::with_table(FAKE_TASK_R, |t| {
         t.open(FdEntry {

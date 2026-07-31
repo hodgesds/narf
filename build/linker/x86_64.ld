@@ -73,6 +73,14 @@ SECTIONS
         __narf_tests_start = .;
         KEEP(*(narf.tests))
         __narf_tests_end   = .;
+        . = ALIGN(8);
+        __narf_kfuncs_start = .;
+        KEEP(*(narf.kfuncs))
+        __narf_kfuncs_end   = .;
+        . = ALIGN(8);
+        __narf_structops_start = .;
+        KEEP(*(narf.structops))
+        __narf_structops_end   = .;
         __rodata_end = .;
     } :rodata
 

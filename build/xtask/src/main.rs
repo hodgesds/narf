@@ -20,6 +20,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// `verification/specification/spec.md` §8's statistics, split out because
+/// they are the only part of xtask with unit tests — a wrong t-distribution
+/// tail invalidates every number that passes through it, silently.
+mod bench_stats;
+/// The `bpf-bench` subcommand: boot the suite, harvest the samples, apply §8.
+mod bpf_bench;
+
 #[derive(Parser)]
 #[command(author, version, about = "NARF build orchestrator")]
 struct Cli {
@@ -104,6 +111,17 @@ enum Cmd {
     /// stock-musl-built ELF that requires `int 0x80` / `syscall`
     /// dual dispatch + CR4.OSFXSR.
     MuslDemo(BuildArgs),
+    /// BPF microbenchmark suite under the `verification/` §8 statistical
+    /// protocol. Boots the kernel with `narf-bpf/bench` + the `bpf_bench`
+    /// cmdline flag, harvests the raw samples the in-kernel harness emits,
+    /// and computes median + 95% bootstrap CI, Welch's t AND Mann-Whitney U
+    /// (both must agree), and a Benjamini-Hochberg correction across the
+    /// suite. Verifies §8.2's noise-control preconditions first and refuses
+    /// to run without `--allow-unverified-runner` when they fail.
+    ///
+    /// Not a test: it gates nothing and asserts nothing. It answers "what
+    /// does this cost".
+    BpfBench(bpf_bench::BpfBenchArgs),
     /// Produce a bootable image.
     Image(BuildArgs),
     /// Build removable media and boot it under OVMF/AAVMF UEFI.
@@ -7276,6 +7294,7 @@ fn main() -> Result<()> {
         Cmd::RedisBench(args) => redis_bench_cmd(&args),
         Cmd::MtEchoBench(args) => mt_echo_bench_cmd(&args),
         Cmd::MuslDemo(args) => musl_demo_cmd(&args),
+        Cmd::BpfBench(args) => bpf_bench::bpf_bench_cmd(&args),
         Cmd::Image(mut args) => {
             // Default-on boot-init for parity with `iso-boot`. An
             // image without it boots to the async-demo loop and
@@ -7328,7 +7347,31 @@ fn host_test_cmd() -> Result<()> {
     let suites: &[(&str, &[&str])] = &[
         (
             "kernel workspace host-safe crates",
-            &["test", "-p", "narf-lib", "-p", "narf-hid"],
+            &[
+                "test",
+                "-p",
+                "narf-lib",
+                "-p",
+                "narf-hid",
+                "-p",
+                "narf-bpf-isa",
+                "-p",
+                "narf-bpf-verifier",
+                "-p",
+                "narf-bpf-jit",
+                // The BTF parser. Its input comes straight from a syscall
+                // argument, so its negative tests are the whole point and CI
+                // must run them on every push, not only when a kernel boots.
+                "-p",
+                "narf-bpf-btf",
+                // xtask itself: `bench_stats` implements the §8 protocol, and
+                // its distribution functions are anchored on closed forms
+                // (Cauchy at ν=1, the ν=2 closed form, the normal at ±1.96).
+                // A wrong tail there does not fail loudly — it silently
+                // invalidates every perf conclusion drawn through it.
+                "-p",
+                "xtask",
+            ],
         ),
         (
             "isolated login-core workspace",

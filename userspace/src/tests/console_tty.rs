@@ -30,7 +30,6 @@ fn smoke_console_read_empty_buf_returns_zero() -> TestResult {
     narf_input::init_global_ring(256);
     narf_input::__reset_global_ring_for_test();
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -107,7 +106,6 @@ fn smoke_console_read_one_byte_in_ring() -> TestResult {
     narf_input::init_global_ring(256);
     narf_input::__reset_global_ring_for_test();
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -195,7 +193,6 @@ fn smoke_console_read_drains_burst() -> TestResult {
     narf_input::init_global_ring(256);
     narf_input::__reset_global_ring_for_test();
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -288,7 +285,6 @@ fn smoke_console_read_empty_ring_returns_zero() -> TestResult {
     narf_input::init_global_ring(256);
     narf_input::__reset_global_ring_for_test();
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -471,7 +467,6 @@ fn smoke_tty_background_read_raises_sigttin() -> TestResult {
     pgid_init();
     ctty_init();
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -593,7 +588,6 @@ fn smoke_echo_hello_world_end_to_end() -> TestResult {
     // independent of registration/execution order.
     narf_filesystem::console_tty::__test_reset_cooked();
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -774,7 +768,7 @@ fn smoke_console_ioctl_tiocgwinsz_default_80x24() -> TestResult {
 
     fd::__test_reset();
     fd::__test_reset_tty();
-    fd::init();
+    fd::__test_reset();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -854,7 +848,7 @@ fn smoke_console_ioctl_tiocswinsz_round_trip() -> TestResult {
 
     fd::__test_reset();
     fd::__test_reset_tty();
-    fd::init();
+    fd::__test_reset();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -948,7 +942,7 @@ fn smoke_console_ioctl_fionread_empty_ring_returns_zero() -> TestResult {
     narf_input::__reset_global_ring_for_test();
     fd::__test_reset();
     fd::__test_reset_tty();
-    fd::init();
+    fd::__test_reset();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -1027,7 +1021,7 @@ fn smoke_console_ioctl_tiocspgrp_round_trip() -> TestResult {
 
     fd::__test_reset();
     fd::__test_reset_tty();
-    fd::init();
+    fd::__test_reset();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -1172,7 +1166,7 @@ fn smoke_console_ioctl_unknown_cmd_returns_enotty() -> TestResult {
 
     fd::__test_reset();
     fd::__test_reset_tty();
-    fd::init();
+    fd::__test_reset();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -1246,7 +1240,7 @@ fn smoke_console_ioctl_kdsigaccept_ok() -> TestResult {
 
     fd::__test_reset();
     fd::__test_reset_tty();
-    fd::init();
+    fd::__test_reset();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();

@@ -1228,6 +1228,31 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
 
+                // BPF kernel-VA windows. MUST run here: after the MMU handoff
+                // (CR3 is the final kernel PML4) and BEFORE the first
+                // `new_user_pml4`, which `setup_pcid_domains()` immediately
+                // below is. `new_user_pml4_on` snapshot-copies PML4[256..511]
+                // BY VALUE and nothing propagates later changes, so a BPF slot
+                // first populated after a user address space exists leaves
+                // that AS's CR3 holding a zero entry — and the first BPF
+                // access taken while that task is current triple-faults. This
+                // is a direct call rather than a staged initcall precisely
+                // because the ordering is too load-bearing to delegate.
+                // `bpf/specification/spec.md` §4.1.
+                match narf_memory::bpf_text::reserve_kernel_slots() {
+                    Ok(()) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  bpf: kernel VA slots reserved (text {:#x}, arena {:#x})",
+                            narf_memory::bpf_text::BPF_TEXT_BASE,
+                            narf_memory::bpf_text::BPF_ARENA_BASE
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(console::Writer, "  bpf: slot reservation failed: {e:?}");
+                    }
+                }
+
                 // Per-domain PCID PML4s — deferred here, AFTER the MMU
                 // handoff (CR3 is now the final kernel PML4) and the buddy
                 // populate, so the clones snapshot the right PML4 from a live
@@ -1900,6 +1925,26 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
 
+                // BPF kernel-VA windows — same call as the x86_64 arm above.
+                // aarch64 does not have the PML4-snapshot hazard (user space
+                // lives in TTBR0, the kernel in TTBR1, separate roots), but the
+                // windows still have to exist before anything maps into them,
+                // and keeping one call site shape across arches means the
+                // ordering rule is stated once.
+                match narf_memory::bpf_text::reserve_kernel_slots() {
+                    Ok(()) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  bpf: kernel VA slots reserved (text {:#x}, arena {:#x})",
+                            narf_memory::bpf_text::BPF_TEXT_BASE,
+                            narf_memory::bpf_text::BPF_ARENA_BASE
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(console::Writer, "  bpf: slot reservation failed: {e:?}");
+                    }
+                }
+
                 // Bus enumeration. The DTB pointer comes through
                 // `BootInfo`; if QEMU's `-kernel` path didn't supply
                 // one, the walker falls back to the QEMU virt
@@ -2078,6 +2123,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_bus::set_probe_log_hook(_init_log);
             narf_bus::set_probe_log(true);
 
+            // BPF: collect and validate the `narf.kfuncs` link section.
+            // `Subsys` because collection allocates; the boot-order
+            // constraint that actually matters for BPF — reserving the
+            // kernel-VA slots *before* the first user address space
+            // (`bpf/specification/spec.md` §4.1) — is a direct call, not an
+            // initcall, and arrives with the arena work.
+            narf_bpf::register_initcalls();
             narf_input::register_initcalls();
             narf_drivers_nvme::register_initcalls();
             narf_drivers_virtio::register_initcalls();
@@ -3306,7 +3358,6 @@ fn boot_userspace_init() {
     sigaction_init();
     signal_init();
     narf_userspace::handlers::init_per_task_state();
-    narf_userspace::fd::init();
     // `trace_comm=<prefix>[,<prefix>...]` retargets the syscall-trace feature's
     // comm filter without a rebuild (default `systemd-executo`). No-op unless
     // the kernel was built with `--features syscall-trace`.

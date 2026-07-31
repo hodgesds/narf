@@ -116,6 +116,17 @@ impl PageTableEntry {
     pub const fn raw(self) -> u64 {
         self.0
     }
+
+    /// Rebuild an entry from a raw 64-bit value.
+    ///
+    /// The counterpart of [`PageTableEntry::raw`], for callers that
+    /// read-modify-write a live leaf in place — permission flips (`bpf_text`'s
+    /// RW→RX seal) rather than fresh mappings, where the address bits and the
+    /// PS bit must be preserved exactly as the hardware left them.
+    #[inline]
+    pub const fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
 }
 
 impl fmt::Debug for PageTableEntry {
@@ -190,6 +201,31 @@ pub unsafe fn new_user_pml4() -> Result<PhysAddr, PageTableAllocError> {
 /// # Safety
 /// Same as `new_user_pml4`.
 pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocError> {
+    // The PML4[256..511] copy below is BY VALUE and happens exactly once, so
+    // every kernel-shared top-level entry must already exist at this point.
+    // The BPF text and arena windows are the only entries created after
+    // `init_mmu` rather than by it, so they are the only ones that can be
+    // missing — and a missing one is not a soft failure: the first BPF text
+    // fetch or arena access taken while a task using this address space is
+    // current would page-fault on a not-present PML4 entry inside the fault
+    // handler's own working set, i.e. triple-fault with nothing left to print.
+    //
+    // Fail loudly here instead, so a future reordering of `bare_main` shows up
+    // as an assertion naming the cause rather than as a dead machine.
+    // See `bpf/specification/spec.md` §4.1.
+    //
+    // `assert!`, not `debug_assert!`: `[profile.release]` does not enable
+    // debug assertions and this tree builds `--release`, so a debug assertion
+    // here would be absent from every kernel anyone actually boots — guarding
+    // exactly nothing in the configuration that matters. The cost is one
+    // relaxed load per address-space creation, against a failure mode that is
+    // a triple fault with no output.
+    assert!(
+        crate::bpf_text::slots_reserved(),
+        "new_user_pml4_on ran before bpf_text::reserve_kernel_slots(); \
+         PML4[256..511] is snapshot-copied by value, so the BPF windows would \
+         be absent from this address space (bpf spec §4.1)"
+    );
     let frame = crate::frame::alloc_frame_on(node).map_err(|_| PageTableAllocError::NoFrame)?;
     let phys = frame.start_address();
 

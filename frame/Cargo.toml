@@ -92,6 +92,7 @@ narf-rcu             = { path = "../rcu" }
 narf-filesystem      = { path = "../filesystem" }
 narf-userspace       = { path = "../userspace" }
 narf-user-runtime    = { path = "../user-runtime" }
+narf-bpf             = { path = "../bpf" }
 narf-kernel-test     = { path = "../verification/kernel-test" }
 narf-verification    = { path = "../verification", optional = true }
 
@@ -162,7 +163,17 @@ mt-echo = ["qemu-net"]
 # implementations); `cgroup-all` turns on everything. A kernel image
 # only enforces a controller it was built with — `memory.max`
 # enforcement, for instance, requires `cgroup-memory`.
-cgroup = ["narf-userspace/cgroup", "narf-filesystem/cgroup"]
+# Forwards to `narf-scheduler/cgroup` as well, which is not optional: this
+# crate's `cross_crate_init::install_all_hooks` calls
+# `narf_scheduler::install_memory_pid_resolver` / `install_process_task_resolver`
+# under `#[cfg(feature = "cgroup")]`, and those items are themselves behind
+# scheduler's `cgroup`. Without the forward, `--features container,cgroup`
+# compiled the calls without the callees and failed to build; the combination
+# only worked via `cgroup-all`, which reaches scheduler through
+# `narf-filesystem/cgroup-memory`. CI never caught it because
+# `run_ci_locally.sh`'s feature checks only exercise `narf-userspace`, never
+# this crate.
+cgroup = ["narf-userspace/cgroup", "narf-filesystem/cgroup", "narf-scheduler/cgroup"]
 
 cgroup-pids   = ["cgroup", "narf-filesystem/cgroup-pids"]
 cgroup-misc   = ["cgroup", "narf-filesystem/cgroup-misc"]
@@ -256,7 +267,17 @@ kernel-test  = [
     "narf-fb/kernel-test",
     "narf-arch/kernel-test",
     "narf-scheduler/kernel-test",
+    "bpf",
 ]
+# In-kernel BPF smokes (`cargo xtask test --subsystem bpf`).
+#
+# The BPF *subsystem* is unconditional: `bpf(2)` is registered on every build
+# (cap-gated, so an unprivileged caller gains nothing) and
+# `narf_bpf::register_initcalls()` runs at boot. Gating the syscall behind a
+# feature would only add another feature-combination to check while changing
+# nothing an attacker sees. This feature turns on the smokes.
+bpf = ["narf-bpf/kernel-test"]
+
 # Chain into verification's opt-in user-mode smoke tests (round-trip,
 # yield_resume, poll_yield_exit, future yield_exit). These pass the
 # kernel through to subsequent tests without exiting.

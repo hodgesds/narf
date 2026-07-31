@@ -568,8 +568,9 @@ pub fn bootstrap_init() {
 ///   - sigaction + signal
 ///   - uid/gid + hostname + rlimit + nice + umask + prctl
 ///
-/// fd::init is kept separate (different module) but consumers
-/// almost always call it alongside.
+/// The fd table store needs no counterpart here — its shards are
+/// const-initialised and materialise a task's table on first touch
+/// (see `crate::fd::with_table`).
 pub fn init_per_task_state() {
     bootstrap_init();
     cwd_init();
@@ -583,6 +584,10 @@ pub fn init_per_task_state() {
     umask_init();
     prctl_init();
     sched_param_init();
+    // W^X JIT grants. `memory/src/wx.rs` has described this capability since
+    // it was written; `CapKind::Jit` and `wx::jit_mprotect` are what finally
+    // implement it. Swept per-task by `release_task_tables`.
+    narf_memory::wx::jit_grants_init();
     pgid_init();
     sid_init();
     wait_init();
@@ -4279,7 +4284,53 @@ fn mprotect_core(
     // `change_perms_range` is whole-region only.
     #[cfg(feature = "linux-compat")]
     {
-        as_ref.mprotect_range(base, len, perms).map_err(|_| ())
+        // W^X. `CapKind::Jit` gates the **RW → RX flip** — the transition
+        // `wx.rs` has described as the JIT exception since it was written —
+        // and *nothing* grants a W|X end state.
+        //
+        // This used to be the other way round: the cap was demanded only when
+        // the request contained W|X, which made `CAP_JIT` a licence to create
+        // a genuinely RWX mapping (something NARF had previously made
+        // impossible) while leaving the flip it exists for ungated. Since a
+        // task that can write a page and then make it executable has the same
+        // power as one holding RWX, gating the flip is what actually buys
+        // anything.
+        //
+        // Classified before any mutation so a capability-gated request is
+        // never partially applied by the ungated path first.
+        //
+        // Classified over *every* intersecting region, not a single covering
+        // one. Requiring one region to span the whole request narrowed
+        // `mprotect(2)` to single-region ranges: a range crossing two adjacent
+        // mappings, or one an earlier `mprotect` had already split, returned
+        // `Err` where it used to succeed. The fold takes the strictest verdict
+        // any region produces, so a request that would flip even one RW region
+        // to RX needs the capability and one that would produce W|X anywhere is
+        // refused — while an all-`Allow` range behaves exactly as before.
+        //
+        // An empty set means nothing is mapped in the range; that is
+        // `mprotect_range`'s error to report, and routing it there keeps the
+        // pre-existing errno rather than inventing one here.
+        let transition = narf_memory::wx::classify_mprotect_range(
+            as_ref.perms_intersecting(base, len).into_iter(),
+            perms.prot_only(),
+        );
+        match transition {
+            // Refusals, whatever the caller holds.
+            narf_memory::wx::WxTransition::DenyWX | narf_memory::wx::WxTransition::DenyXtoWX => {
+                Err(())
+            }
+            narf_memory::wx::WxTransition::NeedsCapJit => {
+                let Some(cap) = narf_memory::wx::jit_cap_default_policy(current_task_id())
+                else {
+                    return Err(());
+                };
+                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| ())
+            }
+            narf_memory::wx::WxTransition::Allow => {
+                as_ref.mprotect_range(base, len, perms).map_err(|_| ())
+            }
+        }
     }
     #[cfg(not(feature = "linux-compat"))]
     {
@@ -6441,6 +6492,10 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
 fn release_task_tables(tid: u64) {
     #[cfg(feature = "container")]
     crate::namespaces::release_task(tid);
+    // JIT (W^X) grant. Revoking bumps the object's epoch, so any capability
+    // copy that escaped this table fails its next `check_live` — the grant
+    // cannot outlive the task that was given it.
+    narf_memory::wx::revoke_jit(tid);
     // Signal state.
     if let Some(m) = SIGNAL_PENDING.lock().as_mut() {
         m.remove(&tid);

@@ -26,6 +26,10 @@ narf-memory       = { path = "../memory" }
 narf-scheduler    = { path = "../scheduler" }
 narf-time         = { path = "../time" }
 narf-tracing      = { path = "../tracing" }
+narf-bpf          = { path = "../bpf" }
+narf-bpf-btf      = { path = "../bpf/btf" }
+narf-bpf-isa      = { path = "../bpf/isa" }
+narf-bpf-verifier = { path = "../bpf/verifier" }
 narf-initramfs    = { path = "../initramfs" }
 narf-input        = { path = "../input" }
 narf-interrupts   = { path = "../interrupts" }
@@ -73,7 +77,7 @@ container = []
 # of process cgroup membership into the task lifecycle. Forwards to
 # narf-filesystem, which owns the cgroupfs tree. Orthogonal to
 # linux-compat and container.
-cgroup = ["narf-filesystem/cgroup"]
+cgroup = ["narf-filesystem/cgroup", "narf-bpf/cgroup"]
 
 [lints]
 workspace = true

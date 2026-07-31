@@ -174,6 +174,12 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
 
     const EC_SVC_AARCH64: u64 = 0b01_0101;
     const EC_DATA_ABORT_LOWER_EL: u64 = 0b10_0100;
+    /// Data Abort taken from the *current* EL — i.e. a kernel fault. Until the
+    /// BPF extable landed, this EC had no handler at all: it fell straight
+    /// through to `rust_aarch64_sync` and `exit_kernel(42)`. There is no
+    /// `arch/src/aarch64/probe.rs` either, so this is aarch64's first kernel
+    /// fault-recovery surface, not a re-wiring of an existing one.
+    const EC_DATA_ABORT_CURRENT_EL: u64 = 0b10_0101;
 
     if ec == EC_SVC_AARCH64 {
         // Convention: x8 = syscall number, x0..x5 = args. Return
@@ -266,8 +272,82 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         // surface on the existing diagnostic path.
     }
 
+    // BPF extable — aarch64's first kernel fault-recovery surface.
+    //
+    // Runs after the EL0 data-abort arm above (demand paging, stack grow, COW)
+    // and immediately before the fatal path, mirroring the x86_64 ordering
+    // rule: a legitimate recovery must never be stolen, and an unrecovered
+    // fault must still reach the diagnostic printer untouched.
+    //
+    // `EC = 0b100101` is by definition a kernel-mode abort, so there is no CS
+    // equivalent to gate on here.
+    if ec == EC_DATA_ABORT_CURRENT_EL {
+        // `frame.elr` is the address of the faulting instruction — `vec.S`
+        // saved it from ELR_EL1, and `RESTORE_ALL_GPRS` reloads ELR_EL1 from
+        // this same slot on the way out, so rewriting the field is what
+        // redirects the `eret`.
+        if let Some(rec) = narf_memory::bpf_extable::try_recover(frame.elr) {
+            // Same fixup shape as x86_64 and as Linux's `ex_handler_bpf`
+            // (`bpf_jit_comp.c:1479`): zero the destination register by
+            // mutating the saved GPR, resume at the fixup address. One label
+            // per program, no per-fault-site stub.
+            if !rec.zero_reg.is_none() {
+                zero_trap_frame_gpr(frame, rec.zero_reg.0);
+            }
+            frame.elr = rec.resume_pc;
+            return;
+        }
+        // No entry — fatal, by design (invariant §4.3). A missing entry is a
+        // JIT bug, and resuming anyway would turn it into a corrupt register.
+    }
+
     // Non-recoverable synchronous exception — fatal.
     rust_aarch64_sync(frame);
+}
+
+/// Zero one saved general-purpose register in a live trap frame.
+///
+/// `reg` is the aarch64 architectural register number, `0..=30` for
+/// `x0..x30` — the encoding the JIT already emitted for the faulting
+/// instruction's destination, so the BPF extable stores it verbatim.
+///
+/// `x31` is not a register here (it reads as XZR or SP depending on the
+/// instruction), so it is silently ignored rather than mapped anywhere.
+fn zero_trap_frame_gpr(frame: &mut TrapFrame, reg: u8) {
+    match reg {
+        0 => frame.x0 = 0,
+        1 => frame.x1 = 0,
+        2 => frame.x2 = 0,
+        3 => frame.x3 = 0,
+        4 => frame.x4 = 0,
+        5 => frame.x5 = 0,
+        6 => frame.x6 = 0,
+        7 => frame.x7 = 0,
+        8 => frame.x8 = 0,
+        9 => frame.x9 = 0,
+        10 => frame.x10 = 0,
+        11 => frame.x11 = 0,
+        12 => frame.x12 = 0,
+        13 => frame.x13 = 0,
+        14 => frame.x14 = 0,
+        15 => frame.x15 = 0,
+        16 => frame.x16 = 0,
+        17 => frame.x17 = 0,
+        18 => frame.x18 = 0,
+        19 => frame.x19 = 0,
+        20 => frame.x20 = 0,
+        21 => frame.x21 = 0,
+        22 => frame.x22 = 0,
+        23 => frame.x23 = 0,
+        24 => frame.x24 = 0,
+        25 => frame.x25 = 0,
+        26 => frame.x26 = 0,
+        27 => frame.x27 = 0,
+        28 => frame.x28 = 0,
+        29 => frame.x29 = 0,
+        30 => frame.x30 = 0,
+        _ => {}
+    }
 }
 
 #[unsafe(no_mangle)]

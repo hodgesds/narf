@@ -1,0 +1,16 @@
+[package]
+name = "narf-bpf-btf"
+description = "BTF blob parser and type graph: attacker-facing validation of a userspace-supplied BTF section. Zero dependencies, host-testable."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

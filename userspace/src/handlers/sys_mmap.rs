@@ -555,7 +555,6 @@ mod tests {
         install_task_id_lookup(task);
         CURRENT_TASK.store(TASK, Ordering::Relaxed);
         crate::fd::__test_reset();
-        crate::fd::init();
         crate::handlers::register_task_to_pid(TASK, PROCESS);
         crate::handlers::register_task_to_pid(WORKER_TASK, PROCESS);
 

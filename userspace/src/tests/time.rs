@@ -458,7 +458,6 @@ fn smoke_userspace_clock_gettime_monotonic_raw_and_boottime() -> TestResult {
     }
 
     fd::__test_reset();
-    fd::init();
     install_task_id_lookup(task_lookup);
     __test_clear_global();
     let mut t = SyscallTable::new();

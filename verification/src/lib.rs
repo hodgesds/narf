@@ -65,6 +65,14 @@ extern crate narf_crypto;
 #[used]
 static __FORCE_LINK_CRYPTO: fn() -> usize = || narf_crypto::blake3_hash(&[]).len();
 
+// narf-bpf contributes the `bpf` subsystem smokes. It also carries the only
+// writers of the `narf.kfuncs` and `narf.structops` link sections, so a
+// dropped compilation unit here costs more than a few tests: the kfunc
+// registry comes up empty and every program load fails to resolve a call.
+extern crate narf_bpf;
+#[used]
+static __FORCE_LINK_BPF: fn() -> (usize, usize) = narf_bpf::summary;
+
 use core::fmt::Write;
 
 use narf_console::Writer;
@@ -4793,7 +4801,6 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // Per-task fd table store needs initialising so SYS_OPEN from
     // the testbin can install a fd entry in its (task=0) table.
     narf_userspace::fd::__test_reset();
-    narf_userspace::fd::init();
     // Mount a stub FS under /testbin with a file "f" carrying a
     // known payload so the testbin's open + read can round-trip
     // a real VFS path from CPL=3.
@@ -5103,7 +5110,6 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     narf_userspace::handlers::__test_cwd_reset();
     narf_userspace::cwd_init();
     narf_userspace::fd::__test_reset();
-    narf_userspace::fd::init();
 
     // Mount a MemFs at /tmp seeded with one file so the validate
     // binary's unlink probe has a real target. The mount is allowed
@@ -5643,7 +5649,7 @@ fn smoke_fdtable_concurrent_open_close_per_task() -> TestResult {
     use narf_filesystem::FileOps;
     use narf_userspace::{fd, FdEntry};
 
-    fd::init();
+    fd::__test_reset();
 
     const TASKS: u64 = 6;
     const OPS: u32 = 8;
@@ -6370,7 +6376,7 @@ fn smoke_userspace_concurrent_fdtable_lazy_init() -> TestResult {
     use narf_lib::sync::IrqSafeSpinLock;
     use narf_userspace::fd;
 
-    fd::init();
+    fd::__test_reset();
 
     const TASKS: u64 = 6;
     static DONE: AtomicU32 = AtomicU32::new(0);
