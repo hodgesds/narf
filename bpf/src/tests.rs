@@ -1296,7 +1296,27 @@ fn diff_case(name: &str, items: &[Decoded], ctx: [u64; 4]) -> Result<(), &'stati
                 Err("native and interpreted results differ")
             }
         }
-        (Some(Outcome::Trapped(_)), Some(Outcome::Trapped(_))) => Ok(()),
+        // Two traps agree only if they are the *same kind* of trap.
+        //
+        // This arm used to be `(Trapped(_), Trapped(_)) => Ok(())`, which made
+        // the differential nearly vacuous for every failing program: `Trap` has
+        // eight variants, and collapsing them meant a native run that exhausted
+        // fuel matched an interpreted run that took a bad access. That is
+        // exactly the divergence class this sweep exists to catch — a review
+        // had already found the interpreter and JIT charging different fuel for
+        // an unconditional back-edge, and this harness would not have noticed.
+        //
+        // Compared by discriminant rather than by value because the payloads
+        // legitimately differ between backends: `at:` is a BPF instruction index
+        // the JIT does not always have to hand, and native fuel exhaustion
+        // synthesises `at: 0`. The *kind* is the part both must agree on.
+        (Some(Outcome::Trapped(a)), Some(Outcome::Trapped(b))) => {
+            if core::mem::discriminant(&a) == core::mem::discriminant(&b) {
+                Ok(())
+            } else {
+                Err("native and interpreted trapped differently")
+            }
+        }
         (None, _) | (_, None) => Err("a run was declined"),
         _ => Err("one path trapped and the other did not"),
     }
@@ -1841,3 +1861,32 @@ fn smoke_bpf_small_caller_big_callee_fits() -> TestResult {
     }
 }
 kernel_test_in!("bpf", smoke_bpf_small_caller_big_callee_fits);
+
+/// A program that traps on **both** paths must trap the *same way*.
+///
+/// The differential harness compares two traps by kind, and until this test
+/// existed nothing exercised that arm: every sweep case returned a value, so
+/// inverting the comparison to `!=` left the suite green. A check no test can
+/// reach is the "defensive machinery guarding a case that cannot arise" shape
+/// this design has already been burned by once (spec §9, the sizing fixpoint),
+/// so the arm gets a case rather than a rewrite.
+///
+/// An unbounded loop is the natural subject: the verifier accepts it by design
+/// (termination is a runtime property under fuel, §1.1), and both backends must
+/// stop it with `OutOfFuel` rather than one running out of fuel while the other
+/// takes a bad access. That is exactly the divergence class a review already
+/// found on the interpreter side, where an unconditional back-edge was charged
+/// twice interpreted and once natively.
+fn smoke_bpf_jit_diff_trapping_program_agrees() -> TestResult {
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    // r0 = 0; loop { r0 += 1 }  — never exits, so fuel decides.
+    let prog = [mov_imm(0, 0), alu_imm(AluOp::Add, 0, 1), ja(-2)];
+    match diff_case("difftrap", &prog, [0; 4]) {
+        Ok(()) => TestResult::Pass,
+        Err(e) if core::ptr::eq(e, NO_BACKEND) => TestResult::Skip(NO_BACKEND),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_jit_diff_trapping_program_agrees);
