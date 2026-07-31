@@ -47,4 +47,23 @@ cargo check -p narf-userspace --no-default-features --features 'linux-compat,con
 cargo check -p narf-userspace --no-default-features --features 'cgroup'
 cargo check -p narf-userspace --no-default-features --features 'linux-compat,container,cgroup'
 
+# The same sweep for the KERNEL crate, which the userspace-only checks above
+# cannot cover: `narf-frame` is where cross-crate hook installation lives, so a
+# feature that forwards to one dependency but not another breaks *here* and
+# nowhere else. `container,cgroup` did exactly that — `frame`'s `cgroup` reached
+# `narf-userspace` and `narf-filesystem` but not `narf-scheduler`, so
+# `cross_crate_init` compiled calls to items that were configured out. It built
+# under `cgroup-all` (which reaches scheduler via `narf-filesystem/cgroup-memory`)
+# and under `container` alone, so every gate we ran was green while the
+# documented Fedora/systemd boot command was broken.
+#
+# `cargo check` on the kernel target needs the build-std flags; these are the
+# same ones the clippy stages above use.
+KFLAGS="-Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128"
+for f in 'container' 'cgroup' 'container,cgroup' 'cgroup-all' 'container,cgroup-all,linux-compat'; do
+  echo "  narf-frame --features $f"
+  # shellcheck disable=SC2086
+  cargo check -p narf-frame --target x86_64-unknown-none $KFLAGS --features "$f"
+done
+
 echo "ALL CI TESTS PASSED"
