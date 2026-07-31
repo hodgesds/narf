@@ -202,6 +202,101 @@ pub fn reclaim_goal_pages() -> usize {
     high.saturating_sub(crate::frame_stats().free as u64) as usize
 }
 
+// ── Shrinker registry (Linux `struct shrinker`) ────────────────────
+//
+// The per-page frame LRU below (`register_page` / `reclaim_target_pages`)
+// reclaims frames whose owner handed the subsystem a PhysAddr. But most
+// NARF caches hold reclaimable state on the *heap* (e.g. the filesystem
+// page cache's `Arc<[u8; PAGE_SIZE]>` entries, dentry/inode caches), not
+// as registered frames. A shrinker is the general Linux mechanism for
+// those: a subsystem registers a `{count, scan}` pair; under pressure the
+// reclaimer asks each how much it holds and tells it to shed a slice,
+// applying pressure *proportional* to each shrinker's size so a big cache
+// gives back more than a small one.
+//
+// Callbacks are plain `fn` pointers (no captured state): a subsystem
+// registers module-level functions that act on its own global cache
+// registry. This keeps the registry `'static` and lock-simple.
+
+/// A registered reclaimable cache.
+#[derive(Copy, Clone, Debug)]
+pub struct Shrinker {
+    /// Stable identifier for diagnostics (`"page-cache"`, `"dentry"`, …).
+    pub name: &'static str,
+    /// Number of reclaimable objects the cache currently holds.
+    pub count: fn() -> usize,
+    /// Try to free up to `nr` objects; returns the number actually freed.
+    pub scan: fn(usize) -> usize,
+}
+
+static SHRINKERS: IrqSafeSpinLock<Vec<Shrinker>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Register a shrinker. Idempotent by name — re-registering the same
+/// name replaces the entry rather than duplicating it, so a subsystem
+/// that re-initialises doesn't get scanned twice.
+pub fn register_shrinker(s: Shrinker) {
+    let mut g = SHRINKERS.lock();
+    if let Some(slot) = g.iter_mut().find(|e| e.name == s.name) {
+        *slot = s;
+    } else {
+        g.push(s);
+    }
+}
+
+/// Total reclaimable objects across all registered shrinkers.
+pub fn shrinkable_objects() -> usize {
+    SHRINKERS
+        .lock()
+        .iter()
+        .map(|s| (s.count)())
+        .fold(0usize, |a, c| a.saturating_add(c))
+}
+
+/// Drive all shrinkers to free about `target` objects, distributing the
+/// pressure in proportion to each shrinker's current size (Linux's
+/// proportional-pressure model). Returns the total number of objects
+/// actually freed (which may exceed or fall short of `target`).
+///
+/// A snapshot of `{name, count}` is taken under the lock, then the lock
+/// is dropped before invoking any `scan` — a shrinker's `scan` may take
+/// its own locks (or, in future, block), and must never run while the
+/// registry lock is held.
+pub fn shrink_all(target: usize) -> usize {
+    if target == 0 {
+        return 0;
+    }
+    let snapshot: Vec<Shrinker> = SHRINKERS.lock().iter().copied().collect();
+    let total: usize = snapshot
+        .iter()
+        .map(|s| (s.count)())
+        .fold(0usize, |a, c| a.saturating_add(c));
+    if total == 0 {
+        return 0;
+    }
+    let mut freed = 0usize;
+    for s in &snapshot {
+        if freed >= target {
+            break;
+        }
+        let count = (s.count)();
+        if count == 0 {
+            continue;
+        }
+        // This shrinker's proportional share of the target, at least 1 so a
+        // small cache still contributes when it holds anything.
+        let share = ((target.saturating_mul(count)) / total).max(1);
+        freed = freed.saturating_add((s.scan)(share));
+    }
+    freed
+}
+
+/// Test-only: drop all registered shrinkers so a test's mock never
+/// leaks into another test's `shrink_all`.
+#[doc(hidden)]
+pub fn __reset_shrinkers_for_test() {
+    SHRINKERS.lock().clear();
+}
+
 /// Watermark-math tests. Always compiled (not `#[cfg(test)]`) so they
 /// register in the in-kernel `narf.tests` section and actually run under
 /// `cargo xtask test` — unlike the host-only `#[cfg(test)] mod tests`
@@ -267,6 +362,83 @@ mod watermark_tests {
         TestResult::Pass
     }
     kernel_test_in!("memory/reclaim", smoke_reclaim_watermarks_tunable_override);
+}
+
+/// Shrinker-registry tests. Always compiled so they register + run under
+/// `cargo xtask test`. A mock shrinker backed by an atomic object count
+/// exercises registration, proportional `shrink_all`, and idempotent
+/// re-registration; the registry is reset before/after so the mock never
+/// leaks into another test.
+mod shrinker_tests {
+    use super::{
+        __reset_shrinkers_for_test, register_shrinker, shrink_all, shrinkable_objects, Shrinker,
+    };
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    static MOCK_AVAIL: AtomicUsize = AtomicUsize::new(0);
+
+    fn mock_count() -> usize {
+        MOCK_AVAIL.load(Ordering::Relaxed)
+    }
+
+    fn mock_scan(nr: usize) -> usize {
+        let mut freed = 0usize;
+        while freed < nr {
+            let cur = MOCK_AVAIL.load(Ordering::Relaxed);
+            if cur == 0 {
+                break;
+            }
+            let take = core::cmp::min(nr - freed, cur);
+            if MOCK_AVAIL
+                .compare_exchange(cur, cur - take, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                freed += take;
+            }
+        }
+        freed
+    }
+
+    fn smoke_reclaim_shrinker_proportional() -> TestResult {
+        __reset_shrinkers_for_test();
+        MOCK_AVAIL.store(100, Ordering::Relaxed);
+        register_shrinker(Shrinker {
+            name: "mock",
+            count: mock_count,
+            scan: mock_scan,
+        });
+        let result = (|| {
+            if shrinkable_objects() != 100 {
+                return TestResult::Fail("registry should report the mock's 100 objects");
+            }
+            if shrink_all(30) != 30 || MOCK_AVAIL.load(Ordering::Relaxed) != 70 {
+                return TestResult::Fail("shrink_all(30) should free exactly 30");
+            }
+            // Re-register same name → replace, not duplicate.
+            register_shrinker(Shrinker {
+                name: "mock",
+                count: mock_count,
+                scan: mock_scan,
+            });
+            if shrinkable_objects() != 70 {
+                return TestResult::Fail("re-register by name must not duplicate the shrinker");
+            }
+            // Over-target request frees all that remains.
+            shrink_all(1000);
+            if MOCK_AVAIL.load(Ordering::Relaxed) != 0 {
+                return TestResult::Fail("over-target shrink should drain the cache");
+            }
+            // Nothing left → shrink_all is a no-op.
+            if shrink_all(10) != 0 {
+                return TestResult::Fail("empty cache should free nothing");
+            }
+            TestResult::Pass
+        })();
+        __reset_shrinkers_for_test();
+        result
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_shrinker_proportional);
 }
 
 /// Reclaim handler outcome. The owner reports back what happened
