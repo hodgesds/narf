@@ -1875,6 +1875,52 @@ fn an_atomic_on_a_scalar_is_rejected() {
     );
 }
 
+/// An atomic through `r3`, which `variable_frame_ptr` leaves pointing into the
+/// frame at an offset only known within a range.
+fn variable_atomic(size: Size) -> Decoded {
+    Decoded::Atomic {
+        size,
+        op: AtomicOp::Add { fetch: false },
+        dst: r(3),
+        src: r(4),
+        off: 0,
+    }
+}
+
+#[test]
+fn a_variable_stack_atomic_is_bounded_and_defines_nothing() {
+    // The atomic path resolves through the same `access` as a load and a store,
+    // so the bound is shared — but the *state* update is its own arm, and it is
+    // the arm no differential test can reach: the reference interpreter models
+    // loads and stores and answers `Unsupported` for atomics, so the concrete
+    // side of this is unit tests only. Said here rather than left implicit,
+    // because "covered by the fuzzer" is otherwise a reasonable assumption.
+
+    // In range: verifies.
+    let mut p = variable_frame_ptr(16, 8);
+    p.extend_from_slice(&[mov(4, 1), variable_atomic(Size::Dw), mov(0, 0), EXIT]);
+    check_ctx(&p, CTX1).expect("a bounded variable atomic is in the frame");
+
+    // Out of range at the top: rejected by the same interval check.
+    let mut p = variable_frame_ptr(16, 31);
+    p.extend_from_slice(&[mov(4, 1), variable_atomic(Size::Dw), mov(0, 0), EXIT]);
+    let e = check_ctx(&p, CTX1).unwrap_err();
+    assert!(matches!(e, VerifyError::OutOfBounds { .. }), "{e:?}");
+
+    // And it defines nothing: an atomic that might have landed anywhere in the
+    // range cannot stand in for initialising a particular slot.
+    let mut p = variable_frame_ptr(16, 8);
+    p.extend_from_slice(&[
+        mov(4, 1),
+        variable_atomic(Size::Dw),
+        ldx(Size::Dw, 5, 10, -16),
+        mov(0, 0),
+        EXIT,
+    ]);
+    let e = check_ctx(&p, CTX1).unwrap_err();
+    assert!(matches!(e, VerifyError::UninitStack { .. }), "{e:?}");
+}
+
 // ── Constructs that fail closed ─────────────────────────────────────
 
 #[test]
