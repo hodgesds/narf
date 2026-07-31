@@ -13,7 +13,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::page_cache::{
     default_capacity_pages, set_default_capacity_pages, set_free_pages_hook,
-    set_low_watermark_pages, Page, PageCache, PageKey, PAGE_SIZE,
+    set_low_watermark_pages, CachePage, Page, PageCache, PageKey,
 };
 
 fn key(page_off: u64) -> PageKey {
@@ -25,8 +25,10 @@ fn key(page_off: u64) -> PageKey {
 }
 
 fn clean_page(fill: u8) -> Page {
+    let mut cp = CachePage::alloc_zeroed().expect("cache page frame for test");
+    cp[..].fill(fill);
     Page {
-        data: Arc::new([fill; PAGE_SIZE]),
+        data: Arc::new(cp),
         dirty: false,
         gen: 0,
     }

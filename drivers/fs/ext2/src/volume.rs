@@ -21,7 +21,9 @@ use alloc::vec::Vec;
 use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
 use narf_capabilities::{Cap, Read, Write};
 use narf_driver_runtime::DomainId;
-use narf_filesystem::{DirOps, FsError, FsInstance, Page, PageCache, PageKey, PAGE_SIZE};
+use narf_filesystem::{
+    CachePage, DirOps, FsError, FsInstance, Page, PageCache, PageKey, PAGE_SIZE,
+};
 use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister, DmaBuffer};
 use narf_lib::mutex::Mutex;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -609,18 +611,30 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 dst.copy_from_slice(&page.data[in_page..in_page + bs]);
                 return Ok(());
             }
-            let mut data = [0u8; PAGE_SIZE];
             let byte_off = first_block * bs as u64;
-            self.read_byte_range(byte_off, &mut data).await?;
-            dst.copy_from_slice(&data[in_page..in_page + bs]);
-            self.page_cache.insert(
-                key,
-                Page {
-                    data: Arc::new(data),
-                    dirty: false,
-                    gen: 0,
-                },
-            );
+            // Read straight into a buddy-frame-backed cache page so cached
+            // data lives off the slab and returns to the buddy on reclaim.
+            // Under memory pressure the frame alloc fails — serve the read
+            // from a stack buffer without caching rather than error.
+            match CachePage::alloc_zeroed() {
+                Some(mut cp) => {
+                    self.read_byte_range(byte_off, &mut cp[..]).await?;
+                    dst.copy_from_slice(&cp[in_page..in_page + bs]);
+                    self.page_cache.insert(
+                        key,
+                        Page {
+                            data: Arc::new(cp),
+                            dirty: false,
+                            gen: 0,
+                        },
+                    );
+                }
+                None => {
+                    let mut data = [0u8; PAGE_SIZE];
+                    self.read_byte_range(byte_off, &mut data).await?;
+                    dst.copy_from_slice(&data[in_page..in_page + bs]);
+                }
+            }
             return Ok(());
         }
         let byte_off = block_no * bs as u64;

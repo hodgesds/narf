@@ -182,12 +182,73 @@ pub struct PageKey {
     pub page_off: u64,
 }
 
-/// Cached page entry. `data` is an `Arc<[u8; PAGE_SIZE]>` so readers
-/// never block a writer's RCU swap; dirty pages hold the write-half
-/// until writeback commits.
+/// A page-sized data frame the cache owns. The bytes live in a real
+/// buddy frame (reached through the kernel direct map), NOT the slab
+/// heap — so dropping a cached page returns memory DIRECTLY to the buddy
+/// allocator. That is what lets memory reclaim relieve large (multi-page)
+/// buddy allocations, and keeps hundreds of MiB of cached file data off
+/// the slab. The frame is node-local (`alloc_frame` prefers the current
+/// CPU's NUMA node) and freed to the buddy on drop.
+pub struct CachePage {
+    frame: narf_memory::PhysFrame,
+}
+
+impl CachePage {
+    /// Allocate a zeroed page frame, or `None` under memory pressure
+    /// (the caller then degrades — e.g. serves a read without caching).
+    pub fn alloc_zeroed() -> Option<Self> {
+        let frame = narf_memory::alloc_frame().ok()?;
+        // SAFETY: a freshly-allocated frame is exclusively owned here and is
+        // PAGE_SIZE bytes of RAM reachable via its kernel direct-map pointer.
+        unsafe {
+            core::ptr::write_bytes(frame.start_address().kernel_mut_ptr::<u8>(), 0, PAGE_SIZE);
+        }
+        Some(Self { frame })
+    }
+}
+
+impl core::ops::Deref for CachePage {
+    type Target = [u8; PAGE_SIZE];
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: the frame is owned for this CachePage's lifetime and is
+        // PAGE_SIZE bytes of RAM mapped in the kernel direct map.
+        unsafe { &*self.frame.start_address().kernel_ptr::<[u8; PAGE_SIZE]>() }
+    }
+}
+
+impl core::ops::DerefMut for CachePage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: as `Deref`; `&mut self` proves exclusive access (only held
+        // during construction, before the page is shared via `Arc`).
+        unsafe {
+            &mut *self
+                .frame
+                .start_address()
+                .kernel_mut_ptr::<[u8; PAGE_SIZE]>()
+        }
+    }
+}
+
+impl Drop for CachePage {
+    fn drop(&mut self) {
+        narf_memory::free_frame(self.frame);
+    }
+}
+
+impl core::fmt::Debug for CachePage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CachePage")
+            .field("frame", &self.frame.number())
+            .finish()
+    }
+}
+
+/// Cached page entry. `data` is an `Arc<CachePage>` (a buddy frame) so
+/// readers share one copy and the frame returns to the buddy on last
+/// drop; dirty pages hold the reference until writeback commits.
 #[derive(Clone, Debug)]
 pub struct Page {
-    pub data: Arc<[u8; PAGE_SIZE]>,
+    pub data: Arc<CachePage>,
     pub dirty: bool,
     /// Monotonic generation — bumps on every write so stale readers
     /// can detect they've raced.
@@ -195,9 +256,12 @@ pub struct Page {
 }
 
 impl Page {
+    /// A fresh zeroed cache page. Panics on frame-allocation failure —
+    /// a test/building-block constructor; production read paths use the
+    /// fallible [`CachePage::alloc_zeroed`] and degrade under pressure.
     pub fn zeroed() -> Self {
         Self {
-            data: Arc::new([0u8; PAGE_SIZE]),
+            data: Arc::new(CachePage::alloc_zeroed().expect("cache page frame")),
             dirty: false,
             gen: 0,
         }
