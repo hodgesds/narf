@@ -1142,6 +1142,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_filesystem::page_cache::set_default_capacity_pages(s.total / 2);
             narf_filesystem::page_cache::set_low_watermark_pages(s.total / 32);
 
+            // Install the central reclaim watermarks (min/low/high) from total
+            // RAM — the single free-memory pressure signal the reclaim
+            // subsystem (direct reclaim, future kswapd) keys off. See
+            // memory/src/reclaim.rs. Sized here for the same reason as above.
+            narf_memory::reclaim::init_watermarks(s.total);
+
             // MMU handoff per console/ §3.1. The three-step sequence
             // (print, swap, remap) is orchestrated here because
             // memory/ can't depend on console/ without creating a

@@ -99,6 +99,176 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::PhysAddr;
 
+// ── Free-memory watermarks (Linux-shaped) ──────────────────────────
+//
+// `min`/`low`/`high`, in pages, sized from total RAM at boot. They are
+// the single pressure signal a real reclaimer keys off:
+//   * free ≥ high  — comfortable; background reclaim (kswapd) stops here.
+//   * free < low   — reclaim should run (foreground/background).
+//   * free < min   — emergency: direct reclaim before an allocation may
+//                    fail; below this is OOM territory.
+// Zero until `init_watermarks` runs; the accessors treat an unset
+// watermark as "no reclaim" so a pre-boot / unconfigured kernel never
+// spuriously reclaims.
+//
+// Sizing mirrors Linux's shape (min scales with √RAM, clamped to a
+// band; low = 5/4·min; high = 3/2·min) without consulting its source.
+
+static WMARK_MIN: AtomicU64 = AtomicU64::new(0);
+static WMARK_LOW: AtomicU64 = AtomicU64::new(0);
+static WMARK_HIGH: AtomicU64 = AtomicU64::new(0);
+
+/// Lower clamp on `min` (pages): keep at least ~2 MiB free even on
+/// tiny memories so an allocation storm always has a little headroom.
+const WMARK_MIN_FLOOR_PAGES: u64 = 512;
+/// Upper clamp on `min` (pages): cap the reserve at ~256 MiB so a huge
+/// machine doesn't hold back an absurd amount of otherwise-usable RAM.
+const WMARK_MIN_CEIL_PAGES: u64 = 65_536;
+
+/// Compute + install the free-memory watermarks from the total usable
+/// page count. Call once, at boot, after the frame allocator reports
+/// its total. `min = clamp(4·√total, floor, ceil)`, `low = 5/4·min`,
+/// `high = 3/2·min`.
+pub fn init_watermarks(total_pages: usize) {
+    let (min, low, high) = compute_watermarks(total_pages);
+    WMARK_MIN.store(min, Ordering::Relaxed);
+    WMARK_LOW.store(low, Ordering::Relaxed);
+    WMARK_HIGH.store(high, Ordering::Relaxed);
+}
+
+/// Runtime override of the `min` free-page reserve — the analogue of
+/// Linux's `vm.min_free_kbytes` sysctl. `low`/`high` are re-derived
+/// from it (`low = 5/4·min`, `high = 3/2·min`), so tuning this one
+/// knob shifts the whole reclaim band, exactly as writing
+/// `min_free_kbytes` does. The value is clamped to the same
+/// [floor, ceil] band as the boot auto-sizing. Intended to back a
+/// future `/proc/sys/vm/min_free_kbytes` write.
+pub fn set_min_free_pages(min_pages: u64) {
+    let (min, low, high) = derive_watermarks(min_pages);
+    WMARK_MIN.store(min, Ordering::Relaxed);
+    WMARK_LOW.store(low, Ordering::Relaxed);
+    WMARK_HIGH.store(high, Ordering::Relaxed);
+}
+
+/// Pure watermark math (no global state) — `(min, low, high)` in pages
+/// sized from total RAM. Split out so it can be unit-tested without
+/// perturbing the live boot-installed watermarks.
+fn compute_watermarks(total_pages: usize) -> (u64, u64, u64) {
+    derive_watermarks((total_pages as u64).isqrt().saturating_mul(4))
+}
+
+/// Clamp a requested `min` to the sane band and derive `(min, low,
+/// high)`. Shared by the RAM auto-sizing and the runtime override so
+/// both produce an identically-shaped, ordered band.
+fn derive_watermarks(requested_min: u64) -> (u64, u64, u64) {
+    let min = requested_min.clamp(WMARK_MIN_FLOOR_PAGES, WMARK_MIN_CEIL_PAGES);
+    (min, min.saturating_mul(5) / 4, min.saturating_mul(3) / 2)
+}
+
+/// The `min` (emergency) free-page watermark, or 0 if unconfigured.
+pub fn watermark_min() -> u64 {
+    WMARK_MIN.load(Ordering::Relaxed)
+}
+/// The `low` (start-reclaim) free-page watermark, or 0 if unconfigured.
+pub fn watermark_low() -> u64 {
+    WMARK_LOW.load(Ordering::Relaxed)
+}
+/// The `high` (stop-reclaim) free-page watermark, or 0 if unconfigured.
+pub fn watermark_high() -> u64 {
+    WMARK_HIGH.load(Ordering::Relaxed)
+}
+
+/// `true` when free memory has fallen below the `low` watermark — the
+/// signal that reclaim should run. `false` when watermarks are unset.
+pub fn under_low_watermark() -> bool {
+    let low = WMARK_LOW.load(Ordering::Relaxed);
+    low != 0 && (crate::frame_stats().free as u64) < low
+}
+
+/// `true` when free memory is below the `min` (emergency) watermark —
+/// the point at which an allocation path should reclaim before failing.
+pub fn under_min_watermark() -> bool {
+    let min = WMARK_MIN.load(Ordering::Relaxed);
+    min != 0 && (crate::frame_stats().free as u64) < min
+}
+
+/// Pages a reclaim pass should aim to free to reach the `high`
+/// watermark, or 0 if already at/above it (or unconfigured).
+pub fn reclaim_goal_pages() -> usize {
+    let high = WMARK_HIGH.load(Ordering::Relaxed);
+    if high == 0 {
+        return 0;
+    }
+    high.saturating_sub(crate::frame_stats().free as u64) as usize
+}
+
+/// Watermark-math tests. Always compiled (not `#[cfg(test)]`) so they
+/// register in the in-kernel `narf.tests` section and actually run under
+/// `cargo xtask test` — unlike the host-only `#[cfg(test)] mod tests`
+/// below. They exercise the pure `compute_watermarks`, so they never
+/// touch the live boot-installed watermark globals.
+mod watermark_tests {
+    use super::{
+        compute_watermarks, derive_watermarks, WMARK_MIN_CEIL_PAGES, WMARK_MIN_FLOOR_PAGES,
+    };
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_reclaim_watermarks_ordered_and_scaled() -> TestResult {
+        // 1 GiB = 262144 pages: min = clamp(4·√262144, ..) = 4·512 = 2048.
+        let (min, low, high) = compute_watermarks(262_144);
+        if min != 2048 {
+            return TestResult::Fail("min for 1 GiB should be 2048 pages");
+        }
+        if low != min * 5 / 4 || high != min * 3 / 2 {
+            return TestResult::Fail("low/high must be 5/4·min and 3/2·min");
+        }
+        if !(min < low && low < high) {
+            return TestResult::Fail("watermarks must be strictly min<low<high");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_watermarks_ordered_and_scaled
+    );
+
+    fn smoke_reclaim_watermarks_clamped() -> TestResult {
+        // Tiny memory clamps min up to the floor.
+        let (min_small, _, _) = compute_watermarks(16);
+        if min_small != WMARK_MIN_FLOOR_PAGES {
+            return TestResult::Fail("tiny RAM must clamp min to the floor");
+        }
+        // Huge memory clamps min down to the ceiling.
+        let (min_huge, low_huge, high_huge) = compute_watermarks(usize::MAX);
+        if min_huge != WMARK_MIN_CEIL_PAGES {
+            return TestResult::Fail("huge RAM must clamp min to the ceiling");
+        }
+        if !(min_huge < low_huge && low_huge < high_huge) {
+            return TestResult::Fail("clamped watermarks must still be ordered");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_watermarks_clamped);
+
+    fn smoke_reclaim_watermarks_tunable_override() -> TestResult {
+        // The runtime override (vm.min_free_kbytes analogue) re-derives the
+        // whole band from the requested min, clamped to the same range.
+        let (min, low, high) = derive_watermarks(4096);
+        if min != 4096 || low != 5120 || high != 6144 {
+            return TestResult::Fail("override should derive low=5/4·min, high=3/2·min");
+        }
+        // Below the floor and above the ceiling clamp identically to boot.
+        if derive_watermarks(1).0 != WMARK_MIN_FLOOR_PAGES {
+            return TestResult::Fail("override below floor must clamp up");
+        }
+        if derive_watermarks(u64::MAX).0 != WMARK_MIN_CEIL_PAGES {
+            return TestResult::Fail("override above ceiling must clamp down");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_watermarks_tunable_override);
+}
+
 /// Reclaim handler outcome. The owner reports back what happened
 /// when we asked it to give the page up.
 ///
