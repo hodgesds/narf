@@ -4,7 +4,7 @@
 //! guards, and page population. It knows nothing about programs. This module is
 //! the seam: it binds an arena to a loaded [`BpfProg`](crate::prog::BpfProg),
 //! gives the interpreter a way to turn an in-program handle into a real address,
-//! and hands the same pages to userspace through `FileOps::mmap_frames`.
+//! and hands the same pages to userspace through `FileOps::mmap_fault`.
 //!
 //! ## What an in-program arena pointer is
 //!
@@ -23,25 +23,39 @@
 //!   and the context — see [`crate::interp`]'s address-model note, which says
 //!   exactly what that costs.
 //!
-//! ## Pre-populated, not demand-populated
+//! ## Live pages, reserved pages, and who may populate
 //!
-//! Every page of a [`ProgArena`] is backed at creation, and that is not a
-//! simplification that can be lifted where it stands. Two independent reasons:
+//! A [`ProgArena`] has two extents. **Reserved** is the VA it carved out of its
+//! slot and the ceiling it can ever grow to; **live** is the populated prefix,
+//! and it is the only part a program may touch. `ProgArena::new` makes them
+//! equal — an arena handed to a program is fully backed — and
+//! [`ProgArena::new_reserved`] leaves room above the live prefix.
 //!
-//! 1. Populating a page allocates a frame and walks page tables. Spec §4.6
-//!    forbids allocation on the program-run path, which is entered from an XDP
-//!    hook with a lock held and IRQs masked. So a program cannot fault a page in.
-//! 2. `FileOps::mmap_frames` is eager and snapshot-based: it returns the frame
-//!    list at `mmap` time and the syscall layer maps those frames SHARED. A page
-//!    the program populated afterwards would simply not exist in the userspace
-//!    mapping. `Arena::snapshot_frames` freezes the arena for exactly this
-//!    reason (spec §8.2).
+//! Growth is [`ProgArena::populate_through`], and the rule about who may call
+//! it is spec §4.6: **a running program may not allocate**, and populating a
+//! page allocates a frame and walks page tables. A program therefore cannot
+//! fault a page in — it is entered from an XDP hook with a lock held and IRQs
+//! masked, and the interpreter's arena access is a plain kernel dereference
+//! with no extable entry behind it, so an unbacked page would be a kernel
+//! fault rather than something recoverable. Everything *else* may grow the
+//! arena: `bpf(2)`, arena creation, and — the one that matters here — the
+//! demand-paging arm of the page-fault handler, reached through
+//! [`ArenaFile::mmap_fault`](narf_filesystem::FileOps::mmap_fault) when
+//! userspace first touches a page of its mapping.
 //!
-//! Full population at creation makes both moot *and* buys the access path a
-//! property it needs anyway: the accessible extent of an arena is a constant, so
-//! resolving a handle is two comparisons with no lock and no allocation. The
-//! `mmap_fault(offset)` hook spec §8.2 proposes is what would lift this, and it
-//! is a filesystem-layer change.
+//! That is what keeps `resolve` legal on the program-run path: the live extent
+//! is one atomic load, never a lock and never an allocation, and it only ever
+//! grows — so a handle a program proved good stays good.
+//!
+//! ## The userspace mapping tracks the arena
+//!
+//! It used to snapshot it. `FileOps::mmap_frames` is answered once, at `mmap`
+//! time, and the syscall layer maps those frames SHARED; a page populated
+//! afterwards simply did not exist in userspace, which is why
+//! `Arena::snapshot_frames` froze the arena and `populate` then returned
+//! `ArenaError::SnapshotTaken` (spec §8.2's interim behaviour). `mmap_fault` is
+//! answered per page on first touch instead, so the mapping follows the arena
+//! wherever it grows, and both the freeze and its error are gone.
 //!
 //! ## How a program gets its handle
 //!
@@ -118,25 +132,37 @@ pub fn kernel_arena_cap() -> &'static ArenaCap {
     g.expect("just installed")
 }
 
-/// A fully-populated arena bound to a program.
+/// An arena bound to a program.
 ///
 /// Wraps [`Arena`] and adds the two things a program needs from it: the handle
 /// range it answers to, and the guarantee that every byte in that range is
-/// backed — which is what lets [`ProgArena::resolve`] run with no lock on the
-/// program-run path.
+/// backed — which is what lets [`ProgArena::resolve`] run with no lock and no
+/// allocation on the program-run path.
 #[derive(Debug)]
 pub struct ProgArena {
     arena: Arena,
     /// Slot-relative handle of byte 0. Cached rather than re-derived so the
     /// access path does not chase into `Arena`.
     base: u64,
-    /// Accessible bytes. Equal to the declared size, because creation populates
-    /// everything or fails.
-    bytes: u64,
+    /// Bytes a program may reach: the **populated prefix**.
+    ///
+    /// An atomic rather than a plain field because it grows behind a running
+    /// program's back (a userspace fault populates through
+    /// [`ProgArena::populate_through`]) and because `resolve` reads it on the
+    /// program-run path, where a lock is forbidden by §4.6. Monotonic, so a
+    /// handle that resolved once keeps resolving.
+    live_bytes: core::sync::atomic::AtomicU64,
+    /// Bytes reserved in the slot: the ceiling `live_bytes` grows towards, and
+    /// the extent userspace may map.
+    reserved_bytes: u64,
 }
 
 impl ProgArena {
     /// Create and fully populate an arena of `pages` pages inside `slot`.
+    ///
+    /// The arena has no room to grow — live and reserved are the same — which
+    /// is the right default for one handed to a program, since a program
+    /// cannot populate a page itself (§4.6, module docs).
     ///
     /// # Errors
     ///
@@ -144,14 +170,40 @@ impl ProgArena {
     /// of memory partway — in which case nothing is returned and the partially
     /// populated arena is dropped, rather than a short arena being handed back.
     pub fn new(cap: &ArenaCap, slot: &ArenaSlot, pages: usize) -> Result<Arc<Self>, ArenaError> {
+        Self::new_reserved(cap, slot, pages, pages)
+    }
+
+    /// Reserve `reserved_pages` and populate the first `live_pages` of them.
+    ///
+    /// The pages above the live prefix exist as VA only until something off the
+    /// program-run path populates them — in practice a userspace fault through
+    /// [`ArenaFile`]. That is the shape that makes an arena grow behind a live
+    /// `MAP_SHARED` mapping.
+    ///
+    /// # Errors
+    ///
+    /// [`ArenaError::BadSize`] if `live_pages` exceeds `reserved_pages`;
+    /// otherwise as [`ProgArena::new`].
+    pub fn new_reserved(
+        cap: &ArenaCap,
+        slot: &ArenaSlot,
+        live_pages: usize,
+        reserved_pages: usize,
+    ) -> Result<Arc<Self>, ArenaError> {
         cap.check_live().map_err(|_| ArenaError::CapRevoked)?;
-        let arena = Arena::new_in(cap, slot, pages)?;
-        // All of it, up front. See the module docs on why demand population is
-        // not merely unimplemented but unreachable from a program.
-        arena.populate_range(0, pages)?;
+        if live_pages > reserved_pages {
+            return Err(ArenaError::BadSize);
+        }
+        let arena = Arena::new_in(cap, slot, reserved_pages)?;
+        arena.populate_range(0, live_pages)?;
         let base = arena.base_offset();
-        let bytes = arena.max_pages() * 4096;
-        Ok(Arc::new(Self { arena, base, bytes }))
+        let reserved_bytes = arena.max_pages() * 4096;
+        Ok(Arc::new(Self {
+            arena,
+            base,
+            live_bytes: core::sync::atomic::AtomicU64::new(live_pages as u64 * 4096),
+            reserved_bytes,
+        }))
     }
 
     /// The handle of this arena's first byte. Never zero.
@@ -161,11 +213,19 @@ impl ProgArena {
         self.base
     }
 
-    /// Accessible size in bytes.
+    /// Bytes a program may reach right now — the populated prefix.
     #[inline]
     #[must_use]
     pub fn len_bytes(&self) -> u64 {
-        self.bytes
+        self.live_bytes.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Bytes reserved: the extent userspace may map, and the ceiling
+    /// [`len_bytes`](Self::len_bytes) grows towards.
+    #[inline]
+    #[must_use]
+    pub fn reserved_bytes(&self) -> u64 {
+        self.reserved_bytes
     }
 
     /// Kernel VA of byte 0 — the kernel's own view, never handed to a program.
@@ -175,30 +235,66 @@ impl ProgArena {
         self.arena.kva()
     }
 
-    /// Resolve `handle..handle + len` to a kernel VA, or `None` if it is not
-    /// entirely inside this arena.
+    /// Populate every page up to and including `page`, and return the frame
+    /// backing `page` itself.
     ///
-    /// No lock and no allocation: the accessible extent is fixed at creation
-    /// (see the module docs), so this is arithmetic. That is what makes it legal
-    /// on the program-run path under §4.6.
+    /// A prefix rather than the single page, because the live extent is one
+    /// number — that is what keeps [`resolve`](Self::resolve) a single atomic
+    /// load, and a sparse extent would need a lock the program-run path may not
+    /// take. The cost is bounded by the reservation, which is the memory the
+    /// eager shape would have spent anyway.
+    ///
+    /// **Allocates**, so it is illegal on the program-run path (§4.6). Callers
+    /// are `bpf(2)`, arena creation, and the demand-fault path.
+    ///
+    /// # Errors
+    ///
+    /// [`ArenaError::OutOfRange`] past the reservation, [`ArenaError::NoFrame`]
+    /// if the allocator is exhausted partway — in which case the pages already
+    /// populated stay populated and the live extent is not advanced past them.
+    pub fn populate_through(&self, page: usize) -> Result<PhysAddr, ArenaError> {
+        use core::sync::atomic::Ordering;
+        if (page as u64 + 1) * 4096 > self.reserved_bytes {
+            return Err(ArenaError::OutOfRange);
+        }
+        let first = (self.live_bytes.load(Ordering::Acquire) / 4096) as usize;
+        // Empty when a peer already grew past `page`, which is exactly the
+        // wanted behaviour: `Arena::populate` is idempotent, but skipping is
+        // cheaper and the frame is fetched below either way.
+        for p in first..=page {
+            self.arena.populate(p)?;
+        }
+        // `fetch_max`, not `store`: two CPUs can be inside this function for
+        // different pages, and the later-starting one must not shrink the
+        // extent the other published. Release pairs with `resolve`'s Acquire so
+        // a program observing the extent also observes the mapping.
+        self.live_bytes
+            .fetch_max((page as u64 + 1) * 4096, Ordering::Release);
+        self.arena.frame_at(page).ok_or(ArenaError::OutOfRange)
+    }
+
+    /// The frame backing `page`, or `None` if it is not populated. Never
+    /// populates — for callers that want to look without growing.
+    #[must_use]
+    pub fn frame_at(&self, page: usize) -> Option<PhysAddr> {
+        self.arena.frame_at(page)
+    }
+
+    /// Resolve `handle..handle + len` to a kernel VA, or `None` if it is not
+    /// entirely inside this arena's **live** extent.
+    ///
+    /// No lock and no allocation: one acquire load and two comparisons. That is
+    /// what makes it legal on the program-run path under §4.6, and it is why
+    /// the live extent is a single number rather than a page map.
     #[inline]
     #[must_use]
     pub fn resolve(&self, handle: u64, len: usize) -> Option<u64> {
         let off = handle.checked_sub(self.base)?;
         let end = off.checked_add(len as u64)?;
-        if end > self.bytes {
+        if end > self.len_bytes() {
             return None;
         }
         Some(self.arena.kva() + off)
-    }
-
-    /// The backing frames, in page order.
-    ///
-    /// Freezes the arena against further population — harmless here, since
-    /// creation already populated everything.
-    #[must_use]
-    pub fn frames(&self) -> Vec<PhysAddr> {
-        self.arena.snapshot_frames()
     }
 }
 
@@ -265,7 +361,23 @@ impl ArenaGroup {
     /// [`ArenaError::SlotExhausted`] if the slot's usable region is full;
     /// otherwise as [`ProgArena::new`].
     pub fn add(&mut self, cap: &ArenaCap, pages: usize) -> Result<Arc<ProgArena>, ArenaError> {
-        let a = ProgArena::new(cap, &self.slot, pages)?;
+        self.add_reserved(cap, pages, pages)
+    }
+
+    /// Add an arena with room to grow: `live_pages` backed now,
+    /// `reserved_pages` of slot VA held for it.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArenaGroup::add`], plus [`ArenaError::BadSize`] if `live_pages`
+    /// exceeds `reserved_pages`.
+    pub fn add_reserved(
+        &mut self,
+        cap: &ArenaCap,
+        live_pages: usize,
+        reserved_pages: usize,
+    ) -> Result<Arc<ProgArena>, ArenaError> {
+        let a = ProgArena::new_reserved(cap, &self.slot, live_pages, reserved_pages)?;
         self.arenas.push(Arc::clone(&a));
         Ok(a)
     }
@@ -352,49 +464,49 @@ impl narf_filesystem::FileOps for ArenaFile {
         alloc::boxed::Box::pin(async { Err(narf_filesystem::FsError::Unsupported) })
     }
     fn stat(&self) -> narf_filesystem::Stat {
+        // The *reserved* extent, not the live one: that is what userspace may
+        // map, and every page of it is reachable — the ones above the live
+        // prefix fault in through `mmap_fault` on first touch.
+        let size = self.arena.reserved_bytes();
         narf_filesystem::Stat {
-            // So `fstat` tells userspace how much there is to map. The arena is
-            // fully populated, so this is also the mappable extent.
-            size: self.arena.len_bytes(),
-            blocks: self.arena.len_bytes().div_ceil(512),
+            size,
+            blocks: size.div_ceil(512),
             mode: narf_filesystem::Mode::FILE_RW,
             mtime_cycles: 0,
         }
     }
 
-    /// The frames backing `[offset, offset + len)`, for a `MAP_SHARED` mapping.
+    /// Back the arena page holding `offset` and return its frame, for a
+    /// demand-paged `MAP_SHARED` mapping.
     ///
-    /// The syscall layer maps these borrowed and never frees them on `munmap`,
-    /// which is correct here: the arena owns its frames for its whole life and
-    /// the program is still writing to them.
+    /// Deliberately the *only* mmap entry point this file has:
+    /// `FileOps::mmap_frames` would answer once at `mmap` time, and an arena is
+    /// exactly the file that grows afterwards. Answering per page on first
+    /// touch is what lets a program populate page `k` after userspace mapped
+    /// the arena and still have userspace see it — see the module docs.
     ///
-    /// Whole-range and eager, which is all this arena needs *because* it is
-    /// fully populated — see the module docs. An arena that grew after this
-    /// call would have pages missing from the mapping, which is why
-    /// `Arena::populate` refuses once the frames have been snapshotted.
-    fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, narf_filesystem::FsError> {
-        // The syscall layer page-aligns both, but this is a trust boundary for
-        // a `Vec` index below, so it is checked rather than assumed.
-        if offset % 4096 != 0 || len % 4096 != 0 || len == 0 {
+    /// The frame is mapped borrowed: the arena keeps owning it, and the
+    /// mapping's `Arc<dyn FileOps>` is what keeps the arena alive for at least
+    /// as long as the mapping (see `Arena::drop`).
+    fn mmap_fault(&self, offset: u64) -> Result<u64, narf_filesystem::FsError> {
+        // The syscall layer page-aligns this, but it is a trust boundary for
+        // the page index below, so it is checked rather than assumed.
+        if offset % 4096 != 0 {
             return Err(narf_filesystem::FsError::InvalidData);
         }
-        let end = offset
-            .checked_add(len as u64)
-            .ok_or(narf_filesystem::FsError::InvalidData)?;
-        if end > self.arena.len_bytes() {
+        if offset >= self.arena.reserved_bytes() {
             return Err(narf_filesystem::FsError::InvalidData);
         }
-        let frames = self.arena.frames();
-        let first = (offset / 4096) as usize;
-        let count = len / 4096;
-        // `frames()` is one entry per populated page in page order and the arena
-        // is fully populated, so this range exists — but a short list would mean
-        // handing userspace a mapping of somebody else's memory, so it is a
-        // check and not an `expect`.
-        let slice = frames
-            .get(first..first + count)
-            .ok_or(narf_filesystem::FsError::InvalidData)?;
-        Ok(slice.iter().map(|p| p.as_u64()).collect())
+        match self.arena.populate_through((offset / 4096) as usize) {
+            Ok(phys) => Ok(phys.as_u64()),
+            // Distinguished rather than collapsed: the syscall layer turns a
+            // failed fault into a SEGV either way, but "out of memory" and
+            // "out of range" are different bugs to chase.
+            Err(narf_memory::bpf_arena::ArenaError::NoFrame) => {
+                Err(narf_filesystem::FsError::NoSpace)
+            }
+            Err(_) => Err(narf_filesystem::FsError::InvalidData),
+        }
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {
@@ -500,8 +612,9 @@ mod smokes {
         }
     }
 
-    /// What userspace sees: the frame list `mmap_frames` handed out, plus the base
-    /// handle, and nothing else.
+    /// What userspace sees: frames obtained exactly the way the page-fault
+    /// handler obtains them — one `FileOps::mmap_fault` per page, on first
+    /// touch — plus the base handle, and nothing else.
     ///
     /// Reads deliberately go through those *frames* and the kernel direct map,
     /// never through the arena's own VA window. That is the whole demonstration:
@@ -509,23 +622,27 @@ mod smokes {
     /// program used, which is exactly what a userspace mapping at an arbitrary
     /// address does — and what Linux's truncated-absolute-address arena pointer
     /// makes impossible (`arena_map_mmap` returns `-EBUSY` for a second address).
-    struct SharedMapping {
-        frames: Vec<u64>,
+    ///
+    /// Faulting per read rather than snapshotting a frame list up front is not
+    /// incidental: it is what the mapping *is* now, and it is why a page the
+    /// program populated after the `mmap` shows up here at all.
+    struct SharedMapping<'a> {
+        file: &'a ArenaFile,
         base_handle: u64,
     }
 
-    impl SharedMapping {
+    impl SharedMapping<'_> {
         fn read_u64(&self, handle: u64) -> Option<u64> {
             let off = handle.checked_sub(self.base_handle)?;
-            let page = (off / 4096) as usize;
+            let page = off / 4096;
             let in_page = (off % 4096) as usize;
             if in_page + 8 > 4096 {
                 return None;
             }
-            let phys = *self.frames.get(page)?;
+            let phys = self.file.mmap_fault(page * 4096).ok()?;
             let p = PhysAddr::new(phys).kernel_ptr::<u8>();
             let mut buf = [0u8; 8];
-            // SAFETY: `phys` came from `mmap_frames`, so it is a frame this arena
+            // SAFETY: `phys` came from `mmap_fault`, so it is a frame this arena
             // owns for its whole life; `kernel_ptr` is the direct-map view of it,
             // and the bound above keeps the read inside that one page.
             unsafe {
@@ -588,15 +705,8 @@ mod smokes {
 
         // Now the userspace side, through the frames and nothing else.
         let file = ArenaFile::new(Arc::clone(&arena));
-        let frames = match file.mmap_frames(0, arena.len_bytes() as usize) {
-            Ok(f) => f,
-            Err(_) => return TestResult::Fail("mmap_frames refused the whole arena"),
-        };
-        if frames.len() != 2 {
-            return TestResult::Fail("mmap_frames returned the wrong number of frames");
-        }
         let view = SharedMapping {
-            frames,
+            file: &file,
             base_handle: base,
         };
         let mut handle = base;
@@ -828,12 +938,8 @@ mod smokes {
             return TestResult::Fail("the arena-atomic program did not complete");
         }
         let file = ArenaFile::new(arena);
-        let frames = match file.mmap_frames(0, 4096) {
-            Ok(f) => f,
-            Err(_) => return TestResult::Fail("mmap_frames refused the arena"),
-        };
         let view = SharedMapping {
-            frames,
+            file: &file,
             base_handle: ARENA_BASE_HANDLE,
         };
         match view.read_u64(ARENA_BASE_HANDLE) {
@@ -880,49 +986,155 @@ mod smokes {
     }
     kernel_test_in!("bpf", smoke_bpf_arena_misaligned_atomic_is_refused);
 
-    /// `mmap_frames` returns the right sub-range and refuses everything else.
-    fn smoke_bpf_arena_mmap_frames_bounds() -> TestResult {
+    /// `mmap_fault` names the right frame per page and refuses everything
+    /// outside the reservation.
+    fn smoke_bpf_arena_mmap_fault_bounds() -> TestResult {
         let cap = kernel_arena_cap();
         let group = match ArenaGroup::with_one(cap, 3) {
             Ok(g) => g,
             Err(_) => return TestResult::Fail("ArenaGroup::with_one failed"),
         };
-        let file = ArenaFile::new(Arc::clone(&group.arenas()[0]));
-        let all = match file.mmap_frames(0, 3 * 4096) {
-            Ok(f) => f,
-            Err(_) => return TestResult::Fail("mmap_frames refused the whole arena"),
-        };
-        if all.len() != 3 {
-            return TestResult::Fail("mmap_frames returned the wrong frame count");
+        let arena = Arc::clone(&group.arenas()[0]);
+        let file = ArenaFile::new(Arc::clone(&arena));
+        // Each page must resolve to *its own* frame, and to the same frame the
+        // arena reports — a mapping that showed userspace a neighbouring page
+        // would be silent corruption rather than a visible failure.
+        let mut seen = Vec::new();
+        for page in 0..3usize {
+            let phys = match file.mmap_fault(page as u64 * 4096) {
+                Ok(p) => p,
+                Err(_) => return TestResult::Fail("mmap_fault refused a page of the arena"),
+            };
+            if arena.frame_at(page).map(|p| p.as_u64()) != Some(phys) {
+                return TestResult::Fail("mmap_fault named a frame the arena does not own");
+            }
+            if seen.contains(&phys) {
+                return TestResult::Fail("two pages of one arena mapped to the same frame");
+            }
+            seen.push(phys);
         }
-        // A sub-range must be the matching slice of the whole, or a partial
-        // mapping shows userspace the wrong pages.
-        match file.mmap_frames(4096, 4096) {
-            Ok(one) if one.len() == 1 && one[0] == all[1] => {}
-            Ok(_) => return TestResult::Fail("a sub-range did not match the whole"),
-            Err(_) => return TestResult::Fail("mmap_frames refused a valid sub-range"),
+        // Idempotent: the demand path can ask twice for one page (two CPUs
+        // faulting it), and a second, different frame would be a second view of
+        // the same arena byte.
+        match file.mmap_fault(4096) {
+            Ok(p) if p == seen[1] => {}
+            Ok(_) => return TestResult::Fail("a repeated mmap_fault returned a different frame"),
+            Err(_) => return TestResult::Fail("a repeated mmap_fault failed"),
         }
-        // Past the end, misaligned, and empty are refused rather than clamped —
-        // clamping would hand userspace a mapping of a different length than it
-        // asked for, which the syscall layer treats as a contract violation.
-        if file.mmap_frames(0, 4 * 4096).is_ok() {
-            return TestResult::Fail("mmap_frames mapped past the end of the arena");
+        // Past the end and misaligned are refused rather than clamped — a
+        // clamped answer would map userspace onto a page it did not ask for.
+        if file.mmap_fault(3 * 4096).is_ok() {
+            return TestResult::Fail("mmap_fault backed a page past the end of the arena");
         }
-        if file.mmap_frames(3 * 4096, 4096).is_ok() {
-            return TestResult::Fail("mmap_frames mapped starting past the end");
-        }
-        if file.mmap_frames(1, 4096).is_ok() {
-            return TestResult::Fail("mmap_frames accepted a misaligned offset");
-        }
-        if file.mmap_frames(0, 0).is_ok() {
-            return TestResult::Fail("mmap_frames accepted an empty range");
+        if file.mmap_fault(1).is_ok() {
+            return TestResult::Fail("mmap_fault accepted a misaligned offset");
         }
         if file.stat().size != 3 * 4096 {
             return TestResult::Fail("stat does not report the mappable extent");
         }
         TestResult::Pass
     }
-    kernel_test_in!("bpf", smoke_bpf_arena_mmap_frames_bounds);
+    kernel_test_in!("bpf", smoke_bpf_arena_mmap_fault_bounds);
+
+    /// **Demand population, kernel side.** An arena grows after its mapping
+    /// exists, a program writes into the new page, and the mapping sees it.
+    ///
+    /// The two halves that make this the feature rather than a restatement of
+    /// the eager path:
+    ///
+    /// * page 1 is *not* backed when the mapping is taken. Under
+    ///   `mmap_frames` the mapping was a snapshot, so page 1 could never
+    ///   appear in it — which is why `Arena::populate` used to refuse to grow
+    ///   at all once the frames had been handed out (`SnapshotTaken`).
+    /// * the program can only reach page 1 *after* the growth, because
+    ///   `ProgArena::resolve` bounds against the live extent. Before it, the
+    ///   same store traps — and that arm is asserted here too, so a live
+    ///   extent that silently covered the whole reservation would go red.
+    ///
+    /// The userspace half of this — that a real `MAP_SHARED` mapping's page
+    /// faults route here — is
+    /// `sys_mmap.rs`'s `smoke_bpf_arena_demand_population_is_visible_in_a_live_mapping`.
+    fn smoke_bpf_arena_grows_under_a_live_mapping() -> TestResult {
+        let cap = kernel_arena_cap();
+        let mut g = match ArenaGroup::new(cap) {
+            Ok(g) => g,
+            Err(_) => return TestResult::Fail("ArenaGroup::new failed"),
+        };
+        // One live page, room for two.
+        let arena = match g.add_reserved(cap, 1, 2) {
+            Ok(a) => a,
+            Err(_) => return TestResult::Fail("add_reserved failed"),
+        };
+        if arena.len_bytes() != 4096 || arena.reserved_bytes() != 2 * 4096 {
+            return TestResult::Fail("add_reserved did not leave room to grow");
+        }
+        if arena.frame_at(1).is_some() {
+            return TestResult::Fail("the reserved-but-unpopulated page was backed at creation");
+        }
+        let group = Arc::new(g);
+
+        // A store at displacement 4096 — page 1. Loaded once and run twice,
+        // before and after the growth, so nothing but the arena's extent
+        // differs between the two outcomes.
+        let insns = asm(&[
+            call_arena_base(),
+            st_imm(0, 4096, 0xC0FFEE),
+            mov_imm(0, 1),
+            Decoded::Exit,
+        ]);
+        let prog = match BpfProg::load_with_arena(
+            load_cap(),
+            request("arena_grow", insns),
+            Some(Arc::clone(&group)),
+        ) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("loading the growing-arena program failed"),
+        };
+        match prog.run_atomic([0; 4], 4) {
+            Some(Outcome::Trapped(Trap::ArenaOutOfBounds { .. })) => {}
+            Some(Outcome::Returned(_)) => {
+                return TestResult::Fail("a program reached a page above the live extent")
+            }
+            _ => return TestResult::Fail("the pre-growth store trapped for the wrong reason"),
+        }
+
+        // The mapping exists from here on, and it is what grows the arena: this
+        // is exactly the call the page-fault handler makes on a first touch of
+        // page 1.
+        let file = ArenaFile::new(Arc::clone(&arena));
+        let grown = match file.mmap_fault(4096) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("mmap_fault could not grow the arena"),
+        };
+        if arena.len_bytes() != 2 * 4096 {
+            return TestResult::Fail("a demand fault did not publish the new live extent");
+        }
+
+        // Now the same program reaches it.
+        if prog.run_atomic([0; 4], 4) != Some(Outcome::Returned(1)) {
+            return TestResult::Fail("the program could not reach the newly populated page");
+        }
+
+        // And the mapping sees what the program wrote — through the frame the
+        // fault returned, not through the arena's kernel VA.
+        let view = SharedMapping {
+            file: &file,
+            base_handle: arena.base_handle(),
+        };
+        match view.read_u64(arena.base_handle() + 4096) {
+            Some(0xC0FFEE) => {}
+            Some(_) => return TestResult::Fail("the mapping read the wrong bytes from page 1"),
+            None => return TestResult::Fail("the mapping could not read the grown page"),
+        }
+        // Belt on the frame identity too: a `read_u64` that silently fell back
+        // to page 0 would have found 0 there, but pinning the frame makes the
+        // failure unambiguous.
+        if arena.frame_at(1).map(|p| p.as_u64()) != Some(grown) {
+            return TestResult::Fail("the grown page's frame is not the one mmap_fault returned");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bpf", smoke_bpf_arena_grows_under_a_live_mapping);
 
     /// A revoked `Cap<BpfArena, Grant>` can neither reserve a slot nor grow a
     /// group it already handed out.

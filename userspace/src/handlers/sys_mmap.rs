@@ -218,7 +218,55 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     ctx.set_return(SyscallReturn::invalid_op());
                     return;
                 }
-                crate::mapped_file::register_current(base, len, ops);
+                crate::mapped_file::register_current(base, len, offset, ops);
+                #[cfg(feature = "linux-compat")]
+                crate::perf_event::on_mmap(current_task_id(), fd, base, len, offset, prot, flags);
+                ctx.set_return(SyscallReturn::ok(base));
+                return;
+            }
+            // Demand-paged device mapping. `mmap_frames` is answered once, so
+            // a file that can grow behind a live mapping cannot use it — a page
+            // backed after this call would never appear. Such files implement
+            // `mmap_fault` instead and are mapped with every slot unbacked;
+            // each page's first touch routes through `mapped_file::demand_frame`
+            // to the file. A BPF arena is the first of these.
+            //
+            // The probe *is* the first fault: `mmap_fault` is idempotent per
+            // offset, so asking here costs nothing beyond backing a page the
+            // caller is about to touch anyway, and it means no second trait
+            // method exists purely to answer "do you support this?".
+            if ops.mmap_fault(offset).is_ok() {
+                // Installed here rather than at boot: a FILE_DEMAND region
+                // cannot exist before this line has run, so there is no window
+                // in which a fault could find the hook missing, and no
+                // boot-order constraint of the kind §4.1 imposes on the BPF
+                // page-table slots.
+                narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
+                if as_ref
+                    .map_region(Region {
+                        base: VirtAddr::new(base),
+                        len,
+                        // SHARED: the frames belong to the file, so teardown
+                        // clears PTEs and frees nothing. FILE_DEMAND: an
+                        // unbacked slot means "ask the file", not "allocate an
+                        // anonymous zero page".
+                        perms: perms | RegionPerms::SHARED | RegionPerms::FILE_DEMAND,
+                        phys: alloc::vec![narf_memory::PhysAddr::new(0); pages],
+                    })
+                    .is_err()
+                {
+                    ctx.set_return(SyscallReturn::invalid_op());
+                    return;
+                }
+                // No `materialize` call: every slot is unbacked, so it would
+                // install nothing. The PTEs arrive one demand fault at a time.
+                //
+                // Registering the mapping is what keeps `ops` alive, and it is
+                // load-bearing twice over: `demand_frame` finds the file
+                // through this table, and the frames the file hands out must
+                // not be returned to the allocator while this mapping can
+                // still reach them.
+                crate::mapped_file::register_current(base, len, offset, ops);
                 #[cfg(feature = "linux-compat")]
                 crate::perf_event::on_mmap(current_task_id(), fd, base, len, offset, prot, flags);
                 ctx.set_return(SyscallReturn::ok(base));
@@ -667,5 +715,313 @@ mod tests {
     kernel_test_in!(
         "userspace",
         smoke_mmap_shared_file_fsync_writes_back_from_thread_group_peer
+    );
+
+    // ── demand-paged device mappings, through a BPF arena ──────────────
+    //
+    // The arena is the first `FileOps` that both grows behind a live mapping
+    // and owns frames the buddy will hand out again, so it is where the two
+    // properties this section pins are reachable at all. Both tests drive the
+    // real `sys_mmap`, then call `demand_alloc_page` directly for the faults —
+    // the same shape `memory/src/tests.rs` uses, because the trap handler's own
+    // plumbing (CR2, the user-mode entry) is not reproducible from a kernel
+    // test and is not what is under test here.
+
+    const ARENA_TASK: u64 = 0x4152_454e;
+    const ARENA_PROCESS: u64 = 0x4152_4550;
+
+    /// Stand up a fresh user AS owned by `ARENA_TASK` and make the syscall
+    /// layer see it as current.
+    fn arena_test_setup() -> Option<Arc<AddressSpace>> {
+        // SAFETY: the syscall runs with paging active; this allocates an
+        // independent user address space without switching the active one.
+        let aspace = Arc::new(unsafe { AddressSpace::new_for_user() }.ok()?);
+        *USER_AS.lock() = Some(Arc::clone(&aspace));
+        install_address_space_lookup(address_space);
+        install_task_id_lookup(task);
+        CURRENT_TASK.store(ARENA_TASK, Ordering::Relaxed);
+        crate::fd::__test_reset();
+        crate::handlers::register_task_to_pid(ARENA_TASK, ARENA_PROCESS);
+        // Any owner left behind by an earlier run would answer this pid's
+        // demand faults from the wrong file.
+        crate::mapped_file::process_exit(ARENA_PROCESS, ARENA_PROCESS);
+        Some(aspace)
+    }
+
+    fn arena_test_teardown() {
+        crate::mapped_file::process_exit(ARENA_PROCESS, ARENA_PROCESS);
+        crate::fd::__test_reset();
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+        *USER_AS.lock() = None;
+    }
+
+    fn install_fd(ops: Arc<dyn FileOps>) -> Option<u32> {
+        crate::fd::with_table(ARENA_TASK, |table| {
+            table.open(crate::fd::FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            })
+        })
+    }
+
+    fn mmap_shared(fd: u32, len: u64) -> Option<u64> {
+        let mut call = TestCtx {
+            args: SyscallArgs {
+                arg1: len,
+                arg2: 3,    // PROT_READ | PROT_WRITE
+                arg3: 0x01, // MAP_SHARED
+                arg4: u64::from(fd),
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        sys_mmap(&mut call);
+        match call.ret {
+            Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) > 0 => Some(ret.value),
+            _ => None,
+        }
+    }
+
+    /// **The feature.** A page populated *after* `mmap` appears in the existing
+    /// mapping, in both directions: the kernel side grows the arena and
+    /// userspace sees the new page, and userspace faults a page the kernel had
+    /// not backed and the arena grows to cover it.
+    ///
+    /// Under `FileOps::mmap_frames` neither was possible. That hook is answered
+    /// once, at `mmap` time, so the mapping was a snapshot — which is why
+    /// `Arena::populate` used to refuse to grow at all once the frames had been
+    /// handed out (`ArenaError::SnapshotTaken`). The kernel-side half of this
+    /// lives in `bpf/src/arena.rs`
+    /// (`smoke_bpf_arena_grows_under_a_live_mapping`); what *this* one adds is
+    /// the clause that matters — that a real `MAP_SHARED` mapping's page faults
+    /// route to the file and land the arena's own frame in the user region.
+    fn smoke_bpf_arena_demand_population_is_visible_in_a_live_mapping() -> TestResult {
+        use narf_bpf::arena::{ArenaFile, ArenaGroup};
+
+        let Some(aspace) = arena_test_setup() else {
+            return TestResult::Fail("new_for_user failed");
+        };
+        let cap = narf_bpf::arena::kernel_arena_cap();
+        let mut group = match ArenaGroup::new(cap) {
+            Ok(g) => g,
+            Err(_) => return TestResult::Fail("ArenaGroup::new failed"),
+        };
+        // Nothing live, room for three pages: every page in the mapping has to
+        // be demand-populated, so a regression to eager backing cannot hide.
+        let arena = match group.add_reserved(cap, 0, 3) {
+            Ok(a) => a,
+            Err(_) => return TestResult::Fail("add_reserved failed"),
+        };
+        let file: Arc<dyn FileOps> = Arc::new(ArenaFile::new(Arc::clone(&arena)));
+        let Some(fd) = install_fd(Arc::clone(&file)) else {
+            return TestResult::Fail("could not install the arena fd");
+        };
+        let Some(base) = mmap_shared(fd, 3 * 4096) else {
+            arena_test_teardown();
+            return TestResult::Fail("MAP_SHARED mmap of the arena failed");
+        };
+
+        let unbacked = |page: usize| -> Option<bool> {
+            Some(
+                aspace
+                    .lookup(narf_memory::VirtAddr::new(base))?
+                    .phys
+                    .get(page)?
+                    .raw()
+                    == 0,
+            )
+        };
+        // `sys_mmap` probes support by faulting the first page, so page 0 is
+        // backed in the *arena* — but nothing is backed in the *region*, which
+        // is the point: the region is entirely demand-paged.
+        if unbacked(0) != Some(true) || unbacked(2) != Some(true) {
+            arena_test_teardown();
+            return TestResult::Fail("the arena mapping was eagerly backed");
+        }
+        if arena.len_bytes() != 4096 {
+            arena_test_teardown();
+            return TestResult::Fail("the mmap probe did not back exactly the first page");
+        }
+
+        // ── direction 1: the kernel grows the arena under the live mapping ──
+        if arena.populate_through(1).is_err() {
+            arena_test_teardown();
+            return TestResult::Fail("growing the arena under a live mapping failed");
+        }
+        // Stand in for a program's store — same kernel VA the interpreter uses.
+        // SAFETY: `populate_through(1)` just mapped this page RW in the arena
+        // window, and this test owns the arena.
+        unsafe {
+            ((arena.kva() + 4096) as *mut u64).write_volatile(0xFEED_FACE_0000_0001);
+        }
+        // SAFETY: `aspace` is a live user root built by `new_for_user`; the
+        // identity map is up (we are running with paging active).
+        if unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(base + 4096)) }.is_err() {
+            arena_test_teardown();
+            return TestResult::Fail("the mapping could not fault in a page the arena had grown");
+        }
+        let Some(region) = aspace.lookup(narf_memory::VirtAddr::new(base)) else {
+            arena_test_teardown();
+            return TestResult::Fail("the arena mapping vanished");
+        };
+        if region.phys.get(1).map(|p| Some(*p)) != Some(arena.frame_at(1)) {
+            arena_test_teardown();
+            return TestResult::Fail("the fault did not install the arena's own frame");
+        }
+        // What userspace reads through that mapping is what the kernel wrote.
+        // SAFETY: the frame is one the arena owns and holds for its whole life;
+        // `kernel_ptr` is the direct-map view of it.
+        let seen = unsafe { region.phys[1].kernel_ptr::<u64>().read_volatile() };
+        if seen != 0xFEED_FACE_0000_0001 {
+            arena_test_teardown();
+            return TestResult::Fail("the mapping did not show the bytes written after the mmap");
+        }
+
+        // ── direction 2: userspace faults a page the arena had not backed ──
+        if arena.frame_at(2).is_some() {
+            arena_test_teardown();
+            return TestResult::Fail("page 2 was backed before anything touched it");
+        }
+        // SAFETY: as above.
+        if unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(base + 2 * 4096)) }.is_err()
+        {
+            arena_test_teardown();
+            return TestResult::Fail("a first touch of an unpopulated arena page did not back it");
+        }
+        if arena.len_bytes() != 3 * 4096 {
+            arena_test_teardown();
+            return TestResult::Fail("a userspace fault did not grow the arena's live extent");
+        }
+        let Some(region) = aspace.lookup(narf_memory::VirtAddr::new(base)) else {
+            arena_test_teardown();
+            return TestResult::Fail("the arena mapping vanished");
+        };
+        if region.phys.get(2).map(|p| Some(*p)) != Some(arena.frame_at(2)) {
+            arena_test_teardown();
+            return TestResult::Fail("the second fault did not install the arena's own frame");
+        }
+        // A freshly populated page must be zeroed — arena memory is
+        // program-visible and must never carry the previous owner's bytes into
+        // a userspace mapping.
+        // SAFETY: as above.
+        if unsafe { region.phys[2].kernel_ptr::<u64>().read_volatile() } != 0 {
+            arena_test_teardown();
+            return TestResult::Fail("a demand-populated arena page reached userspace unzeroed");
+        }
+        // And the two pages are distinct frames, so neither read above was
+        // accidentally the other page.
+        if region.phys[1] == region.phys[2] {
+            arena_test_teardown();
+            return TestResult::Fail("two pages of the mapping resolved to one frame");
+        }
+
+        let _ = aspace.unmap_region(narf_memory::VirtAddr::new(base));
+        crate::mapped_file::unmap_current(base);
+        arena_test_teardown();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_bpf_arena_demand_population_is_visible_in_a_live_mapping
+    );
+
+    /// **The lifetime fix.** An arena's frames go back to the buddy exactly
+    /// when no mapping remains: not while one is live, and immediately once
+    /// `munmap` releases it.
+    ///
+    /// This replaces `smoke_bpf_arena_exposed_frames_are_not_returned_to_the_buddy`,
+    /// which pinned a deliberate leak — at the time a mapping kept nothing
+    /// alive, so freeing on drop handed userspace a writable window onto
+    /// whatever the buddy allocated next, and losing the memory was the
+    /// least-bad answer. The mapping now owns the `Arc<dyn FileOps>`, so the
+    /// leak is deleted and this is what has to hold instead.
+    ///
+    /// Asserted through the frame allocator, not through a flag: a test reading
+    /// a flag would pass even if `Arena::drop` ignored it. Both deltas are
+    /// measured across the drop that could return the frames and nothing else —
+    /// sampling before the allocation and expecting a rise afterwards is wrong
+    /// arithmetic, since allocate-then-free returns to the original count.
+    ///
+    /// Neither half is sufficient alone. An implementation that never frees
+    /// passes the first and fails the second; one that always frees passes the
+    /// second and fails the first.
+    fn smoke_bpf_arena_mapping_keeps_frames_alive_until_munmap() -> TestResult {
+        use narf_bpf::arena::{ArenaFile, ArenaGroup};
+        // Large enough that the assertions cannot be satisfied by unrelated
+        // frame traffic in either direction: a stray free during the live
+        // window has 15 frames of headroom, and 16 is far more than the noise
+        // a single-threaded kernel test sees between two adjacent samples.
+        const PAGES: usize = 16;
+
+        let Some(aspace) = arena_test_setup() else {
+            return TestResult::Fail("new_for_user failed");
+        };
+        let cap = narf_bpf::arena::kernel_arena_cap();
+        let mut group = match ArenaGroup::new(cap) {
+            Ok(g) => g,
+            Err(_) => return TestResult::Fail("ArenaGroup::new failed"),
+        };
+        let arena = match group.add(cap, PAGES) {
+            Ok(a) => a,
+            Err(_) => return TestResult::Fail("adding the arena failed"),
+        };
+        let file: Arc<dyn FileOps> = Arc::new(ArenaFile::new(Arc::clone(&arena)));
+        let Some(fd) = install_fd(Arc::clone(&file)) else {
+            return TestResult::Fail("could not install the arena fd");
+        };
+        let Some(base) = mmap_shared(fd, PAGES as u64 * 4096) else {
+            arena_test_teardown();
+            return TestResult::Fail("MAP_SHARED mmap of the arena failed");
+        };
+
+        // Everything userspace would do to strand the arena: close the fd, and
+        // let every kernel-side handle go. What remains is the mapping.
+        crate::fd::with_table(ARENA_TASK, |table| table.close(fd));
+        drop(file);
+        drop(arena);
+        let before = narf_memory::frame::stats().free;
+        drop(group);
+        let while_mapped = narf_memory::frame::stats().free.saturating_sub(before);
+        if while_mapped >= PAGES {
+            arena_test_teardown();
+            return TestResult::Fail(
+                "arena frames went back to the buddy while a userspace mapping still had them",
+            );
+        }
+
+        // Now release the mapping. Its `Arc<dyn FileOps>` was the last
+        // reference, so this is the drop that must free them.
+        let before = narf_memory::frame::stats().free;
+        let mut call = TestCtx {
+            args: SyscallArgs {
+                arg0: base,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        crate::handlers::sys_munmap(&mut call);
+        if !matches!(call.ret, Some(ret) if ret.status == SyscallReturn::OK && ret.value == 0) {
+            arena_test_teardown();
+            return TestResult::Fail("munmap of the arena mapping failed");
+        }
+        let after_munmap = narf_memory::frame::stats().free.saturating_sub(before);
+        if after_munmap < PAGES {
+            arena_test_teardown();
+            return TestResult::Fail("munmap did not return the arena's frames to the buddy");
+        }
+        // The region is gone too, so a later fault cannot reach the freed
+        // frames through a stale mapping.
+        if aspace.lookup(narf_memory::VirtAddr::new(base)).is_some() {
+            arena_test_teardown();
+            return TestResult::Fail("munmap left the arena region registered");
+        }
+        arena_test_teardown();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_bpf_arena_mapping_keeps_frames_alive_until_munmap
     );
 }
