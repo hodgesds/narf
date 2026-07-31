@@ -29,6 +29,65 @@ env:
   NARF_QEMU_MEM_MB: "2048"
 
 jobs:
+  # Change-based CI gate. Computes which jobs + kernel-test subsystems the
+  # diff can affect (crate reverse-dependency closure, see
+  # `cargo xtask affected`) and exports the decision as job outputs the
+  # downstream jobs gate on. On push-to-main / nightly / manual (and on a
+  # hub-crate / build-infra / unknown-path change), `full` is true and every
+  # job runs exactly as it did before this gate existed — the safety net.
+  # A `ci-full` PR label forces a full run.
+  changes:
+    name: compute affected
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.affected.outputs.full }}
+      run_clippy: ${{ steps.affected.outputs.run_clippy }}
+      clippy_arches: ${{ steps.affected.outputs.clippy_arches }}
+      run_boot_smoke: ${{ steps.affected.outputs.run_boot_smoke }}
+      run_kernel_test: ${{ steps.affected.outputs.run_kernel_test }}
+      run_musl_demo: ${{ steps.affected.outputs.run_musl_demo }}
+      run_net_smoke: ${{ steps.affected.outputs.run_net_smoke }}
+      run_feature_matrix: ${{ steps.affected.outputs.run_feature_matrix }}
+      subsystems: ${{ steps.affected.outputs.subsystems }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so `git merge-base <base> HEAD` resolves (the diff
+          # is against the merge-base, not the base tip).
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Compute affected jobs + subsystems
+        id: affected
+        run: |
+          set -eu
+          # For a pull_request, `base_ref` is the target branch; for
+          # push/schedule/dispatch it is empty and `affected` forces a full
+          # run via --event regardless of --base.
+          BASE_REF="${{ github.base_ref }}"
+          BASE_REF="${BASE_REF:-main}"
+          git fetch --no-tags origin "$BASE_REF" || true
+          FORCE=""
+          if [ "${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}" = "true" ]; then
+            FORCE="--force-full"
+          fi
+          # shellcheck disable=SC2086
+          cargo xtask affected --github \
+            --event "${{ github.event_name }}" \
+            --base "origin/$BASE_REF" \
+            $FORCE
+
   fmt:
     name: cargo fmt --check
     runs-on: ubuntu-latest
@@ -58,11 +117,15 @@ jobs:
 
   clippy-kernel:
     name: clippy-kernel / ${{ matrix.arch }}
+    needs: changes
+    if: needs.changes.outputs.run_clippy == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
+        # x86_64 always; aarch64 only when the diff touches arch-sensitive
+        # paths (arch/**, drivers/**, *aarch64*, asm) — see `xtask affected`.
+        arch: ${{ fromJSON(needs.changes.outputs.clippy_arches) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -121,11 +184,15 @@ jobs:
 
   boot-smoke:
     name: boot-smoke / ${{ matrix.arch }}
+    needs: changes
+    if: needs.changes.outputs.run_boot_smoke == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
+        # Same arch pruning as clippy: aarch64 boot only when the change is
+        # arch-sensitive; otherwise x86_64 alone.
+        arch: ${{ fromJSON(needs.changes.outputs.clippy_arches) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -175,13 +242,20 @@ jobs:
       - name: cargo xtask iso-boot (firmware UEFI)
         run: cargo xtask iso-boot --arch=${{ matrix.arch }}
 
-  musl-demo:
-    name: musl-demo (x86_64)
+  # ── musl-demo, split into a build-once job + a per-subsystem-group matrix ──
+  # The ~80 musl/linux-compat cases are bucketed into coarse subsystem groups
+  # (gui, net, signals, ipc, fs, mem, process, linux-compat). `musl-build`
+  # cross-builds the kernel once and uploads it; each `musl-demo` group job
+  # downloads that artifact and boots it (no rebuild), so a flaky case reddens
+  # only its group and reruns re-run only that group. See `xtask musl-demo`.
+  musl-build:
+    name: musl-demo build (x86_64)
+    needs: changes
+    if: needs.changes.outputs.run_musl_demo == 'true'
     runs-on: ubuntu-latest
-    # Generous job-level timeout: a cold-cache cargo build of the
-    # kernel + verification crates takes ~10-15 min on GHA's free
-    # runners, plus two TCG QEMU boots at ~30-60s each.
     timeout-minutes: 45
+    outputs:
+      groups: ${{ steps.groups.outputs.groups }}
     steps:
       - uses: actions/checkout@v4
 
@@ -191,25 +265,14 @@ jobs:
           rustup component add rust-src llvm-tools-preview rustfmt
 
       - name: Install host build deps
+        # musl-tools + clang/lld + linux-libc-dev so verification/build.rs can
+        # compile the musl smokes and bake ld-musl into the image at BUILD
+        # time (the per-group boot jobs then need none of this).
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 \
-            cpio \
-            mtools \
-            dosfstools \
-            e2fsprogs \
-            ovmf \
-            musl-tools \
-            clang \
-            lld \
-            linux-libc-dev
-
-      # Ubuntu's QEMU 8.2 crashes NARF on GHA (pervasive per-process-exit
-      # #UD/#GP that never reproduces on newer QEMU / locally); build a newer
-      # one so the guest matches local behaviour. Cached after first build.
-      - name: Set up newer QEMU (past the 8.2 instability)
-        uses: ./.github/actions/setup-qemu
+            cpio mtools dosfstools e2fsprogs ovmf \
+            musl-tools clang lld linux-libc-dev
 
       - name: Cache cargo registry + git
         uses: actions/cache@v4
@@ -227,46 +290,86 @@ jobs:
           key: target-${{ runner.os }}-x86_64-musl-demo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: target-${{ runner.os }}-x86_64-
 
-      # Boots QEMU six times — three musl smokes plus three
-      # busybox applets:
-      #   * `/bin/hello` (hand-rolled int 0x80 asm) → `hello`
-      #   * `/bin/hello_musl` (musl-static) → `hello from musl`
-      #   * `/bin/hello_musl_dyn` (musl-dyn via PT_INTERP →
-      #     ld-musl) → `hello from musl dyn`
-      #   * `busybox echo hello` → `hello`
-      #   * `busybox pwd` → `/`
-      #   * `busybox uname -a` → `Linux` (matches the trailing
-      #     `GNU/Linux\n` in `NARF narf 0.1 narf x86_64 GNU/Linux`)
-      #   * `hello_pthread` → `joined` — pthread_create + join
-      #     end-to-end. Catches regressions in clone(2) ABI,
-      #     syscall save-state, per-thread TLS programming, and
-      #     the CLONE_CHILD_CLEARTID exit-observer chain.
-      # Regressions in the loader (unaligned PT_LOAD), ABI
-      # dispatch (syscall instruction → raw handler),
-      # arch_prctl wiring, CR4.OSFXSR, SyscallReturn struct
-      # layout, brk shrink-bound, AT_PHDR/PhEnt/PhNum auxv,
-      # apply_relocations PT_INTERP gating, syscall-entry user
-      # arg-register preservation, or `writev(2)` handling all
-      # surface here.
-      #
-      # `musl-tools` (apt) supplies ld-musl-x86_64.so.1 (as
-      # `/usr/lib/x86_64-linux-musl/libc.so` — verification/build.rs
-      # walks a candidate list including Ubuntu's path). Without it
-      # `NARF_LD_MUSL` is empty, the kernel skips the /lib mount, and
-      # `hello_musl_dyn` fails to exec.
-      #
-      # GHA's TCG QEMU is ~5-10x slower than KVM-accelerated local
-      # runs; bump the per-boot prompt/echo timeouts so a slow cold
-      # boot under load doesn't fail the smoke. Local fast runs use
-      # the un-bumped defaults (60s prompt / 30s echo).
-      - name: cargo xtask musl-demo
+      # Build the same kernel image `xtask musl-demo` would boot (boot-init +
+      # firmware-allow-unsigned, with the demo binaries embedded).
+      - name: Build kernel image
+        run: cargo xtask build --arch=x86_64 --features boot-init,firmware-allow-unsigned
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: musl-kernel
+          path: target/x86_64-unknown-none/release/narf-frame
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enumerate subsystem groups
+        id: groups
+        run: echo "groups=$(cargo run -q -p xtask -- musl-demo --list-groups)" >> "$GITHUB_OUTPUT"
+
+  musl-demo:
+    name: musl-demo / ${{ matrix.group }}
+    needs: [changes, musl-build]
+    if: needs.changes.outputs.run_musl_demo == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.musl-build.outputs.groups) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+
+      # apt's qemu is shadowed by the newer build below, but installing it
+      # pulls the shared runtime libs (libslirp0, pixman, glib) the built
+      # qemu-system-x86_64 dynamically links — needed when setup-qemu is a
+      # cache hit and its build-deps step is skipped.
+      - name: Install QEMU runtime libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+
+      # Ubuntu's QEMU 8.2 crashes NARF on GHA (pervasive per-process-exit
+      # #UD/#GP that never reproduces on newer QEMU / locally); build a newer
+      # one so the guest matches local behaviour. Cached after first build.
+      - name: Set up newer QEMU (past the 8.2 instability)
+        uses: ./.github/actions/setup-qemu
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Download kernel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: musl-kernel
+          path: prebuilt
+
+      # Boot the prebuilt kernel and run only this group's cases (lightweight
+      # cases share one boot; GUI cases each get a fresh boot). GHA's TCG QEMU
+      # is ~5-10x slower than local KVM, so the per-boot timeouts are bumped.
+      - name: cargo xtask musl-demo --group ${{ matrix.group }}
         env:
           XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
           XTASK_RI_ECHO_TIMEOUT_SECS: "900"
-        run: cargo xtask musl-demo --arch=x86_64
+        run: |
+          cargo xtask musl-demo \
+            --group "${{ matrix.group }}" \
+            --prebuilt "$GITHUB_WORKSPACE/prebuilt/narf-frame"
 
   net-smoke:
     name: net-smoke (x86_64, off-box serving)
+    needs: changes
+    if: needs.changes.outputs.run_net_smoke == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -517,11 +620,16 @@ jobs:
 
   kernel-test:
     name: kernel-test (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.run_kernel_test == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
+        # Same arch pruning as clippy/boot-smoke. The build can't be pruned
+        # (frame links ~everything) but the SUBSYSTEM EXECUTION is filtered
+        # to the affected subsystems below.
+        arch: ${{ fromJSON(needs.changes.outputs.clippy_arches) }}
     # The full in-kernel smoke suite (~5100 tests) runs in one QEMU boot
     # under TCG (no KVM on GHA), plus a cold build of the kernel +
     # verification crates and the phase-2 boot-smoke pass. Generous.
@@ -535,7 +643,7 @@ jobs:
           rustup component add rust-src llvm-tools-preview rustfmt
 
       - name: Install host build deps
-        # Same set as the musl-demo job: `cargo xtask test` builds the
+        # Same set as the musl-demo build job: `cargo xtask test` builds the
         # kernel-test image, which pulls the verification crate whose
         # build.rs compiles the musl-demo smokes (needs musl-tools +
         # linux-libc-dev). QEMU + OVMF boot the image.
@@ -581,20 +689,31 @@ jobs:
       # GHA's TCG QEMU is far slower than local KVM; bump the per-phase
       # QEMU timeouts so a slow boot under load doesn't false-fail.
       #
+      # When the change is scoped, `needs.changes.outputs.subsystems` is a
+      # comma list of the affected subsystems and only those run (the build
+      # still links the whole kernel; only the execution is filtered).
+      # Empty (a full run) executes every subsystem.
+      #
       # The hardware tests that need capabilities GHA's old TCG qemu64
       # CPU lacks — x2APIC (the TLB-shootdown / IPI smokes) and the
-      # cache-topology CPUID leaf — detect their absence and Skip, so no
-      # accel tuning is needed here. (`XTASK_QEMU_ACCEL=tcg,thread=multi`
-      # is available as an escape hatch if a future runner exposes
-      # x2APIC under TCG and the shootdown smokes start running.)
+      # cache-topology CPUID leaf — detect their absence and Skip.
       - name: cargo xtask test --features cgroup-all
         env:
           XTASK_QEMU_TIMEOUT_SECS: "2400"
           XTASK_BOOT_SMOKE_TIMEOUT_SECS: "1200"
-        run: cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all
+        run: |
+          SUBS="${{ needs.changes.outputs.subsystems }}"
+          if [ -n "$SUBS" ]; then
+            echo "kernel-test: affected-subsystem filter = $SUBS"
+            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all --subsystem "$SUBS"
+          else
+            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all
+          fi
 
   feature-matrix:
     name: feature-check / ${{ matrix.features }}
+    needs: changes
+    if: needs.changes.outputs.run_feature_matrix == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
