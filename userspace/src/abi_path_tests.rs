@@ -43,6 +43,11 @@ kernel_test_in!("syscall_abi", smoke_abi_path_openat_neg);
 
 fn smoke_abi_path_openat_empty_is_enoent() -> TestResult {
     setup();
+    // Kernel-test fixture: hands the syscall entry point kernel `.rodata` /
+    // stack pointers as stand-in user buffers. See
+    // `handlers::kernel_buffers_guard` and `with_setup`, which does the same
+    // for the tests that use the closure form of this harness.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let path = b"\0";
     let result = match call(
         Syscall::Openat.raw(),

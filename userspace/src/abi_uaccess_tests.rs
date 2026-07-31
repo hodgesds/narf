@@ -51,33 +51,75 @@ fn vur(ptr: u64, len: usize) -> Result<(), u64> {
     crate::handlers::validate_user_range(ptr, len)
 }
 
-/// A canonical **kernel-half** VA that aliases the bytes at `p`, writable,
-/// or `None` if this build has no such window for that pointer.
+/// Distinctive fill for the canary, and its size. 64 bytes so a copy the
+/// tests size at 64 would overwrite all of it.
+const CANARY_BYTE: u8 = 0x5A;
+const CANARY_LEN: usize = 64;
+
+/// The kernel buffer the negative tests point a syscall at.
 ///
-/// This is what makes the negative tests below more than an errno check: a
-/// destination that is merely kernel-shaped would be rejected by the
-/// pointer predicate *or* fault harmlessly, and the test could not tell the
-/// two apart. An alias of a canary the test owns can.
+/// A **static**, deliberately: it lives in the kernel image's `.data`,
+/// which is in the kernel half on both architectures and writable at
+/// runtime — x86_64 links higher-half (`.data` at 0xFFFF_FFFF_821D_4000),
+/// aarch64 runs entirely out of TTBR1 (`KERNEL_VIRT_BASE =
+/// 0xFFFF_FF80_0000_0000`, `build/linker/aarch64.ld`). A heap or stack
+/// buffer would not do: on x86_64 those come back through the low
+/// identity map and are numerically in the *user* half, so a test aimed
+/// at one would pass the predicate and prove nothing.
 ///
-///  * aarch64 — every kernel VA is already in TTBR1's high half
-///    (`KERNEL_VIRT_BASE = 0xFFFF_FF80_0000_0000`, `build/linker/aarch64.ld`),
-///    so the pointer is its own alias.
-///  * x86_64 — the kernel image is identity-mapped low, but `init_mmu`
-///    (`memory/src/x86_64/mmu.rs`) also installs PML4[511]/PDPT[510] as one
-///    writable 1-GiB huge page mapping VA `0xFFFF_FFFF_8000_0000 + x` to
-///    phys `x`, and a low identity pointer *is* its physical address. RAM
-///    above 512 GiB instead comes back through the direct map and is
-///    already high-half.
-fn kernel_alias(p: *const u8) -> Option<u64> {
-    let v = p as u64;
-    if v >= KERNEL_FIRST_CANON {
-        return Some(v);
+/// This is what makes these tests more than errno checks. An errno alone
+/// cannot distinguish "the pointer was rejected" from "the copy faulted
+/// harmlessly"; bytes that are still `CANARY_BYTE` afterwards can.
+static CANARY: [core::sync::atomic::AtomicU8; CANARY_LEN] =
+    [const { core::sync::atomic::AtomicU8::new(CANARY_BYTE) }; CANARY_LEN];
+
+/// Address of [`CANARY`], as a syscall would see it. Asserted kernel-half
+/// by [`canary_arm`] before every use.
+fn canary_addr() -> u64 {
+    CANARY.as_ptr() as u64
+}
+
+/// Refill the canary and confirm it really is a kernel-half target. The
+/// smokes share one kernel image, so a previous run must not decide this
+/// one.
+fn canary_arm() -> Result<u64, &'static str> {
+    for b in CANARY.iter() {
+        b.store(CANARY_BYTE, core::sync::atomic::Ordering::Relaxed);
     }
-    #[cfg(target_arch = "x86_64")]
-    if v < (1u64 << 30) {
-        return Some(0xFFFF_FFFF_8000_0000u64 + v);
+    let a = canary_addr();
+    if a < KERNEL_FIRST_CANON {
+        return Err("the canary static is not in the kernel half — test is vacuous");
     }
-    None
+    Ok(a)
+}
+
+/// Can a test build a *fixture* — an `attr` block, a BTF blob — that the
+/// strict predicate will accept as a user pointer?
+///
+/// Only where this build's kernel stack and heap are numerically in the
+/// user half. On x86_64 they are: the frame allocator hands back physical
+/// addresses reached through the low identity map (`memory/src/addr.rs`,
+/// `LOW_IDENTITY_LIMIT`), so a stack array's address is < 2^47. On aarch64
+/// they are not — everything runs out of TTBR1 at
+/// `KERNEL_VIRT_BASE = 0xFFFF_FF80_0000_0000`.
+///
+/// Tests that need to *drive a syscall through its fixture* and have the
+/// same syscall reject a kernel destination cannot exist on aarch64: the
+/// opt-in is one flag, so admitting the fixture would admit the
+/// destination too. Those tests skip there with this as the reason, rather
+/// than passing vacuously because the fixture EFAULTed first. The
+/// predicate itself is still covered on aarch64 by the tests that pass a
+/// kernel address as a bare syscall *argument*, which needs no fixture.
+fn fixture_ptrs_are_user_half() -> bool {
+    let probe = [0u8; 8];
+    (probe.as_ptr() as u64) < (1u64 << 47)
+}
+
+/// Did anything write to the canary?
+fn canary_intact() -> bool {
+    CANARY
+        .iter()
+        .all(|b| b.load(core::sync::atomic::Ordering::Relaxed) == CANARY_BYTE)
 }
 
 // ── the predicate: positive ─────────────────────────────────────────
@@ -253,11 +295,6 @@ fn minimal_btf() -> alloc::vec::Vec<u8> {
     v
 }
 
-/// Canary the copy would land on: a distinctive fill the test can prove
-/// survived. 64 bytes so a `btf_size` of 64 would overwrite all of it.
-const CANARY_BYTE: u8 = 0x5A;
-const CANARY_LEN: usize = 64;
-
 /// `bpf(BPF_OBJ_GET_INFO_BY_FD)` on a BTF fd with `bpf_btf_info.btf`
 /// pointing into the kernel.
 ///
@@ -269,11 +306,17 @@ const CANARY_LEN: usize = 64;
 /// attacker address. It must be EFAULT, and the kernel bytes at that
 /// address must be exactly as they were.
 fn smoke_abi_uaccess_bpf_btf_info_kernel_dst_neg() -> TestResult {
-    let mut canary = alloc::vec![CANARY_BYTE; CANARY_LEN];
-    let Some(kdst) = kernel_alias(canary.as_ptr()) else {
-        return TestResult::Skip("no kernel-half alias window for the canary on this build");
+    if !fixture_ptrs_are_user_half() {
+        return TestResult::Skip(
+            "kernel stack/heap is not in the user half here: the fixture and the kernel destination cannot be distinguished by a single opt-in (see fixture_ptrs_are_user_half)",
+        );
+    }
+
+    let kdst = match canary_arm() {
+        Ok(a) => a,
+        Err(e) => return TestResult::Fail(e),
     };
-    with_setup_strict(|| {
+    let outcome = with_setup_strict(|| {
         let blob = minimal_btf();
         let mut attr = [0u8; ATTR_LEN];
         put_u64(&mut attr, BTF_DATA, blob.as_ptr() as u64);
@@ -310,16 +353,14 @@ fn smoke_abi_uaccess_bpf_btf_info_kernel_dst_neg() -> TestResult {
         }
         Ok(())
     });
-    // Checked after `with_setup` so the verdict is about the memory, not
-    // about which error string won the race to be returned.
-    if canary.iter().any(|&b| b != CANARY_BYTE) {
+    // The memory verdict comes first: an errno can be right for the wrong
+    // reason, bytes cannot.
+    if !canary_intact() {
         return TestResult::Fail(
             "BPF_OBJ_GET_INFO_BY_FD wrote BTF bytes into a kernel buffer (arbitrary kernel write)",
         );
     }
-    // Keep the canary alive across the syscall.
-    canary[0] = CANARY_BYTE;
-    TestResult::Pass
+    outcome
 }
 kernel_test_in!("syscall_abi", smoke_abi_uaccess_bpf_btf_info_kernel_dst_neg);
 
@@ -331,11 +372,17 @@ kernel_test_in!("syscall_abi", smoke_abi_uaccess_bpf_btf_info_kernel_dst_neg);
 /// a bad log buffer must not change the verdict), so the errno carries no
 /// information here. The canary is the whole assertion.
 fn smoke_abi_uaccess_bpf_btf_log_buf_kernel_dst_neg() -> TestResult {
-    let mut canary = alloc::vec![CANARY_BYTE; CANARY_LEN];
-    let Some(kdst) = kernel_alias(canary.as_ptr()) else {
-        return TestResult::Skip("no kernel-half alias window for the canary on this build");
+    if !fixture_ptrs_are_user_half() {
+        return TestResult::Skip(
+            "kernel stack/heap is not in the user half here: the fixture and the kernel destination cannot be distinguished by a single opt-in (see fixture_ptrs_are_user_half)",
+        );
+    }
+
+    let kdst = match canary_arm() {
+        Ok(a) => a,
+        Err(e) => return TestResult::Fail(e),
     };
-    with_setup_strict(|| {
+    let outcome = with_setup_strict(|| {
         // A blob that fails to parse, so the verifier has something to say.
         let bad = alloc::vec![0u8; 8];
         let mut attr = [0u8; ATTR_LEN];
@@ -344,17 +391,23 @@ fn smoke_abi_uaccess_bpf_btf_log_buf_kernel_dst_neg() -> TestResult {
         put_u64(&mut attr, BTF_LOG_BUF, kdst);
         put_u32(&mut attr, BTF_LOG_SIZE, CANARY_LEN as u32);
         put_u32(&mut attr, BTF_LOG_LEVEL, 1);
-        let _ = call(
+        let r = call(
             Syscall::Bpf.raw(),
             a2(BPF_BTF_LOAD, attr.as_ptr() as u64, ATTR_LEN as u64),
         );
+        // Precondition, not incidental: an intact canary proves nothing if
+        // the syscall rejected the *attr block* and never reached the
+        // verifier. EFAULT here means the fixture, not the log buffer, was
+        // refused — exactly the vacuous pass this check exists to catch.
+        if r == Some(EFAULT) {
+            return Err("BPF_BTF_LOAD refused the fixture attr block, so the log path never ran");
+        }
         Ok(())
     });
-    if canary.iter().any(|&b| b != CANARY_BYTE) {
+    if !canary_intact() {
         return TestResult::Fail("btf_log_buf wrote the verifier log into a kernel buffer");
     }
-    canary[0] = CANARY_BYTE;
-    TestResult::Pass
+    outcome
 }
 kernel_test_in!(
     "syscall_abi",
@@ -393,26 +446,37 @@ kernel_test_in!("syscall_abi", smoke_abi_uaccess_kernel_src_neg);
 /// The hole was never a BPF bug — `bpf(2)` was only the loudest gadget.
 /// One ordinary syscall stands in for the ~180 `copy_to_user` sites that
 /// share the helper.
+///
+/// LINUX-GAP: Linux `clock_gettime(2)` returns `-EFAULT` for an unwritable
+/// `struct timespec *`. NARF's handler turns the `copy_to_user` failure
+/// into `SyscallReturn::invalid_op()` — a non-`Ok` NARF status with no
+/// Linux errno at all — so a caller cannot tell EFAULT from EINVAL. That
+/// is a separate defect from the one this file is about; the assertion
+/// below is therefore "the call did not succeed", and
+/// `smoke_abi_uaccess_kernel_src_neg` carries the strict errno contract on
+/// a path that does map it (`write(2)` → `-EFAULT`). Tighten this to
+/// `EFAULT` when the handler is fixed.
 fn smoke_abi_uaccess_clock_gettime_kernel_dst_neg() -> TestResult {
-    let mut canary = alloc::vec![CANARY_BYTE; CANARY_LEN];
-    let Some(kdst) = kernel_alias(canary.as_ptr()) else {
-        return TestResult::Skip("no kernel-half alias window for the canary on this build");
+    let kdst = match canary_arm() {
+        Ok(a) => a,
+        Err(e) => return TestResult::Fail(e),
     };
-    with_setup_strict(|| {
-        let r = call(
+    let outcome = with_setup_strict(|| {
+        let r = call_raw(
             Syscall::ClockGetTime.raw(),
             a1(0 /* CLOCK_REALTIME */, kdst),
         );
-        if r != Some(EFAULT) {
-            return Err("clock_gettime(2) into a kernel-half timespec did not EFAULT");
+        if r.status == SyscallReturn::OK && (r.value as i64) >= 0 {
+            return Err("clock_gettime(2) into a kernel-half timespec reported success");
         }
         Ok(())
     });
-    if canary.iter().any(|&b| b != CANARY_BYTE) {
+    // The load-bearing half: whatever errno shape came back, no timespec
+    // may have landed in kernel memory.
+    if !canary_intact() {
         return TestResult::Fail("clock_gettime(2) wrote a timespec into a kernel buffer");
     }
-    canary[0] = CANARY_BYTE;
-    TestResult::Pass
+    outcome
 }
 kernel_test_in!(
     "syscall_abi",
