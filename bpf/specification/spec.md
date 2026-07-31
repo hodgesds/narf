@@ -116,10 +116,10 @@ impl Arena {
     pub fn new(cap: &ArenaCap, max_pages: usize) -> Result<Arena, ArenaError>;
     pub fn kva(&self) -> u64;                              // stable for the arena's life
     pub fn window_offset(&self) -> u64;                    // the base-relative pointer
-    pub fn populate(&self, page: usize) -> Result<u64, ArenaError>;
+    pub fn populate(&self, page: usize) -> Result<ArenaPage, ArenaError>;   // { kva, phys }
     pub fn populate_range(&self, from: usize, count: usize) -> Result<(), ArenaError>;
     pub fn first_unpopulated(&self, from: usize) -> Option<usize>;
-    pub fn snapshot_frames(&self) -> Vec<PhysAddr>;        // freezes the arena — §8.2
+    pub fn frame_at(&self, page: usize) -> Option<PhysAddr>;   // never populates
     pub fn resolve(&self, offset: u64) -> Option<u64>;
 }
 ```
@@ -302,16 +302,47 @@ and the perf event layer, all of which are closed.
 1. **Arena pointer width and truncation sequence.** A 32-bit in-program pointer
    costs one `mov eax,eax`; a wider one costs a shift pair but lifts the 4 GiB
    cap. Whether to keep a 32-bit fast path for small arenas is a Phase-3 call.
-2. **Demand-populated arenas need a new `FileOps` hook.** `mmap_frames` is
-   eager and whole-range, and takes its frame snapshot at mmap time — so a page
-   the *program* populates later is never visible to userspace. A
-   `mmap_fault(offset)` hook routed from the demand-paging arm of the trap
-   handler fixes this and would make every device node demand-pageable, not
-   just arenas. Roughly 40 lines; scope in Phase 3.
-   **Interim behaviour (landed):** `Arena::snapshot_frames` freezes the arena
-   and `Arena::populate` then returns `ArenaError::SnapshotTaken`, so the
-   mistake surfaces as a typed error at the call that makes it rather than as
-   a page that silently does not exist in userspace.
+2. ~~**Demand-populated arenas need a new `FileOps` hook.**~~ — **resolved.**
+   `FileOps::mmap_fault(offset) -> Result<u64, FsError>` is a defaulted trait
+   method returning the frame for one page, answered from the demand-paging arm
+   of the page-fault handler instead of once at `mmap` time. A userspace
+   `MAP_SHARED` mapping of an arena now **tracks** the arena rather than
+   snapshotting it: a page populated after the `mmap` appears on first touch.
+   `Arena::snapshot_frames` and `ArenaError::SnapshotTaken`, the interim typed
+   error that made the resulting hole loud, are deleted — there is no hole left
+   for them to name.
+
+   Routing, since it crosses three crates. `RegionPerms::FILE_DEMAND` marks a
+   region whose unbacked slots come from a file rather than from the frame
+   allocator; `AddressSpace::demand_alloc_page` resolves such a fault through
+   `install_file_fault_hook`, **with the regions lock dropped** (the hook
+   re-enters the filesystem, which allocates, takes its own locks, and for an
+   arena installs a kernel page-table entry), then publishes the frame into the
+   region's `phys` slot and falls through to the existing "backed but no leaf"
+   branch so the leaf install and its spurious-fault reasoning exist once.
+   `narf-memory` still holds no filesystem types: the hook is a `fn` pointer,
+   the same seam shape as `install_shared_frame_hooks` and `install_pager`, and
+   `userspace/src/mapped_file.rs` — which already knew which file a user address
+   belongs to — supplies it. `sys_mmap` installs it on the path that creates the
+   first `FILE_DEMAND` region, so unlike §4.1's page-table slots there is no
+   boot-order constraint. `mmap_frames` stays for files that are genuinely a
+   snapshot (`/dev/fb0`, perf's ring, `linux_compat`); `sys_mmap` tries it
+   first and falls to `mmap_fault`, probing by asking for the first page, which
+   is idempotent and about to be touched anyway.
+
+   **What is still not demand-populated: the program itself.** §4.6 forbids a
+   running program from allocating, and populating a page allocates a frame and
+   walks page tables — so a program cannot fault one in, and the interpreter's
+   arena access is a plain kernel dereference with no extable entry behind it,
+   which makes an unbacked page a kernel fault rather than something
+   recoverable. `ProgArena` therefore has a **live** extent (the populated
+   prefix, one atomic that only grows, which is what keeps `resolve`
+   allocation- and lock-free) and a **reserved** extent it may grow into.
+   Everything off the run path may grow it — `bpf(2)`, creation, and the
+   demand-fault path. Giving programs their own growth needs either a kfunc
+   over a pre-charged frame reserve with pre-populated page tables, or Linux's
+   answer (`bpf_arena_alloc_pages` over `kmalloc_nolock`, `arena.c:857`); both
+   are §4.6 amendments, not follow-ups to this item.
 3. **Nested locks.** v1 permits one live `Guard` at a time. Nesting under a
    declared lock-order lattice is deferred.
 4. **`struct_ops!` form.** Whether it re-declares traits or mirrors existing
@@ -492,38 +523,47 @@ and the perf event layer, all of which are closed.
     that appeared to hold a packet pointer while silently seeing zeroes would
     be worse than one that never had one.
 
-13. **A userspace `mmap` of an arena keeps nothing alive, so arena frames are
-    leaked rather than freed once exposed.** `sys_mmap` clones the `FileOps`
-    `Arc` only for the duration of the call, copies the physical addresses into
-    the `Region`, and drops it; `munmap` never calls back into the file. So this
-    sequence returned live user-mapped frames to the buddy: userspace `mmap`s
-    the arena `MAP_SHARED`, closes the fd, the program exits, the last
-    `Arc<ProgArena>` drops, and `Arena::drop` frees each frame — while userspace
-    still has them mapped read-write. A userspace-writable window onto arbitrary
-    recycled kernel memory.
+13. ~~**A userspace `mmap` of an arena keeps nothing alive, so arena frames are
+    leaked rather than freed once exposed.**~~ — **resolved: the mapping owns
+    the reference, and the leak branch is deleted.**
 
-    Arenas are the first `mmap_frames` user where this matters, which is why the
-    contract was never stressed: `/dev/fb0` hands out device memory that is never
-    in the buddy, and perf's ring lives as long as the task. Neither reason
-    generalises.
+    The defect. `Arena::drop` frees each frame; a userspace `MAP_SHARED` mapping
+    of those frames kept nothing alive; so `mmap` the arena, close the fd, let
+    the program exit, and the last `Arc<ProgArena>` drop returned live
+    user-mapped frames to the buddy — a userspace-writable window onto arbitrary
+    recycled kernel memory. Arenas were the first `mmap_frames` user where it
+    mattered, which is why the contract had never been stressed: `/dev/fb0`
+    hands out device memory that is never in the buddy, and perf's ring lives as
+    long as the task. Neither reason generalises.
 
-    **Current behaviour:** `Arena::drop` unmaps the kernel VA but *deliberately
-    leaks the frames* when `inner.snapshotted` is set — i.e. when `mmap_frames`
-    has handed the list out. Losing the memory is strictly better than handing
-    userspace a window onto whatever the buddy allocates next. The leak is
-    bounded by the arena's own size, only happens when userspace actually mapped
-    it, and is counted by `bpf_arena::leaked_exposed_arenas()`. Pinned by
-    `smoke_bpf_arena_exposed_frames_are_not_returned_to_the_buddy`, which asserts
-    through the frame allocator in *both* directions — an unexposed arena must
-    still return its frames, so "never free anything" cannot satisfy it.
+    The interim answer was to leak: `Arena::drop` kept the frames out of the
+    allocator whenever `inner.snapshotted` was set, counted by
+    `leaked_exposed_arenas()`. That branch, its counter, and its test are gone.
 
-    **The real fix** is for the mapping to own a reference: a keep-alive
-    `Arc<dyn FileOps>` on `Region`, or an `munmap` teardown hook. Either makes
-    the leak branch dead code, and it should then be **deleted** rather than
-    kept as belt-and-braces — this design already carries one cautionary example
-    of defensive machinery guarding a case that could not arise (§9, the sizing
-    fixpoint). Related to §8.2: the same missing hook is what forces arenas to be
-    pre-populated.
+    **The fix.** `userspace/src/mapped_file.rs`'s owner table — Linux's
+    VMA-held file reference, kept outside the memory TCB so regions stay free of
+    filesystem types — holds an `Arc<dyn FileOps>` per mapping, registered by
+    `sys_mmap` and released by `sys_munmap` and by process exit. For an arena
+    that `Arc` is an `ArenaFile`, which owns the `Arc<ProgArena>`, which owns the
+    `Arena`. So a live mapping makes `Arena::drop` unreachable, and reaching it
+    means no mapping remains. The table was already there for writeback; what
+    changed is that it is now load-bearing for *memory safety*, said so in its
+    own module docs, and `sys_munmap` releases it strictly after the unmap
+    (releasing first would reopen the same window).
+
+    Demand paging made this structural rather than incidental: `mmap_fault`
+    reaches the file *through* that same table, so a mapping that did not hold
+    the reference could not be faulted at all.
+
+    **Pinned in both directions**, through the frame allocator rather than a
+    flag, because a flag-reading test would pass even if `drop` ignored it:
+    `sys_mmap.rs`'s `smoke_bpf_arena_mapping_keeps_frames_alive_until_munmap`
+    drops every kernel-side handle under a live mapping and measures the
+    free-frame count across that drop, then measures it again across the
+    `munmap`; `memory/src/bpf_arena.rs`'s
+    `smoke_bpf_arena_drop_returns_frames_to_the_buddy` covers the memory-layer
+    half, which cannot see a mapping. An implementation that never frees passes
+    one and fails the other, and vice versa.
 
 ## 9. Post-review corrections
 
