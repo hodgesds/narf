@@ -20,6 +20,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// The `affected` subcommand: crate reverse-dependency closure → the set
+/// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
+mod affected;
 /// `verification/specification/spec.md` §8's statistics, split out because
 /// they are the only part of xtask with unit tests — a wrong t-distribution
 /// tail invalidates every number that passes through it, silently.
@@ -42,6 +45,12 @@ enum Cmd {
     /// kernel linker script, privileged instructions, or QEMU belong in
     /// `xtask test`, not in this gate.
     HostTest,
+    /// Compute which CI jobs and kernel-test subsystems a change can
+    /// affect, from the git diff against a base ref + the workspace
+    /// reverse-dependency closure. Emits JSON (default) or GitHub Actions
+    /// outputs (`--github`). Hub-crate / build-infra / unknown-path
+    /// changes and push-to-main / nightly events force a full run.
+    Affected(affected::AffectedArgs),
     /// Cross-compile the kernel.
     Build(BuildArgs),
     /// Cross-compile and boot under QEMU.
@@ -7230,6 +7239,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::HostTest => host_test_cmd(),
+        Cmd::Affected(args) => {
+            let root = workspace_root()?;
+            affected::affected_cmd(&args, &root)
+        }
         Cmd::Build(args) => {
             cargo_build(&args, &workspace_root()?)?;
             Ok(())
