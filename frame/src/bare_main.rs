@@ -46,6 +46,87 @@ static mut BOOT_INFO: Option<BootInfo> = None;
 #[global_allocator]
 static GLOBAL_ALLOC: BumpAllocator = BumpAllocator;
 
+/// Monotonic timestamp (ns) at/after which kswapd may run its next pass.
+/// The cadence is ADAPTIVE (set at the end of each pass), not a fixed
+/// timer: relaxed when memory is healthy, tight under pressure. This
+/// bounds how often the (buddy-locking) watermark probe runs when idle
+/// while letting reclaim run nearly continuously under pressure.
+static KSWAPD_NEXT_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Pages kswapd reclaims per online CPU per wake, as a floor. More CPUs
+/// means more concurrent allocators building pressure, so kswapd must
+/// shed a bigger batch to keep ahead of them.
+const KSWAPD_PAGES_PER_CPU: usize = 64;
+
+/// kswapd-analogue: proactive background page reclaim. Registered as a
+/// `sleep_pumps` callback so it runs in cooperative executor (task, NOT
+/// IRQ) context — safe to take the buddy lock while freeing reclaimed
+/// frames.
+///
+/// Linux's kswapd is event-driven (the allocator wakes it when a zone
+/// drops below its low watermark, and it reclaims until the zone is
+/// balanced at the high watermark). NARF's cooperative model has no
+/// wakeable kthread, so this polls from the executor's `sleep_pumps` —
+/// but the WATERMARK, not a fixed timer, is the gate, and the poll
+/// cadence adapts to pressure so behaviour approximates "reclaim until
+/// balanced":
+///
+/// * healthy (free >= low): relaxed ~100 ms poll, LRU aging only;
+/// * pressured (free < low): reclaim toward `high`, re-check in ~2 ms;
+/// * emergency (free < min): reclaim now and re-run next pass.
+///
+/// The reclaim target scales with BOTH the free-memory deficit
+/// (`reclaim_goal_pages` = high − free) and the online CPU count
+/// (`KSWAPD_PAGES_PER_CPU` floor). Lives here (not in `memory`) because
+/// the clock + CPU count come from `narf_scheduler`, which the low-level
+/// `memory` crate does not depend on.
+fn kswapd_pump() {
+    use core::sync::atomic::Ordering;
+    const IDLE_INTERVAL_NS: u64 = 100_000_000; // healthy: relax the poll
+    const PRESSURE_INTERVAL_NS: u64 = 2_000_000; // under pressure: re-check ~2 ms
+
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let next = KSWAPD_NEXT_NS.load(Ordering::Relaxed);
+    if now < next {
+        return;
+    }
+    // Claim this tick (optimistically set the pressured cadence) so
+    // concurrent executors don't all reclaim at once; the winner adjusts
+    // the next-run time below based on what it observes.
+    if KSWAPD_NEXT_NS
+        .compare_exchange(
+            next,
+            now.saturating_add(PRESSURE_INTERVAL_NS),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+
+    // Batch floor scales with the number of online CPUs (concurrent
+    // allocators); the actual target also tracks the free-memory deficit.
+    let cpu_floor =
+        (narf_scheduler::online_cpu_set().len() as usize).saturating_mul(KSWAPD_PAGES_PER_CPU);
+
+    if narf_memory::reclaim::under_min_watermark() {
+        // Emergency: reclaim hard and re-run on the very next pass.
+        let target = narf_memory::reclaim::reclaim_goal_pages().max(cpu_floor);
+        narf_memory::reclaim::try_to_free(target);
+        KSWAPD_NEXT_NS.store(now, Ordering::Relaxed);
+    } else if narf_memory::reclaim::under_low_watermark() {
+        // Pressured: reclaim toward the high watermark; the CAS above
+        // already scheduled a prompt (~2 ms) re-check.
+        let target = narf_memory::reclaim::reclaim_goal_pages().max(cpu_floor);
+        narf_memory::reclaim::try_to_free(target);
+    } else {
+        // Healthy: just age the LRU and relax the poll cadence.
+        narf_memory::reclaim::reclaim_sweep_pump();
+        KSWAPD_NEXT_NS.store(now.saturating_add(IDLE_INTERVAL_NS), Ordering::Relaxed);
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 
@@ -1147,6 +1228,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // subsystem (direct reclaim, future kswapd) keys off. See
             // memory/src/reclaim.rs. Sized here for the same reason as above.
             narf_memory::reclaim::init_watermarks(s.total);
+            // Start the kswapd-analogue: proactive background reclaim on the
+            // cooperative executor (sleep_pumps), rate-limited to ~100 ms, so
+            // memory pressure is relieved BEFORE an allocation fails rather
+            // than only reactively in the alloc-failure path.
+            narf_scheduler::sleep_pumps::register(kswapd_pump);
 
             // MMU handoff per console/ §3.1. The three-step sequence
             // (print, swap, remap) is orchestrated here because
