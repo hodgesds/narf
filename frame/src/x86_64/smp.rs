@@ -30,6 +30,12 @@ use narf_memory::alloc_pages_on;
 /// → linear address 0x8000.
 const TRAMPOLINE_PHYS: u64 = 0x0000_8000;
 
+/// The low identity map is NX apart from the kernel image's text and one
+/// window carved out for exactly this blob. If the two constants ever drift
+/// apart the APs fetch from an NX page after `mov cr0` and die with no console
+/// and no IDT, so tie them together at compile time.
+const _: () = assert!(TRAMPOLINE_PHYS == narf_memory::mmu::AP_TRAMPOLINE_EXEC_BASE);
+
 /// SIPI vector-page byte (vector_page << 12 = TRAMPOLINE_PHYS).
 const SIPI_VECTOR_PAGE: u8 = (TRAMPOLINE_PHYS >> 12) as u8;
 
@@ -78,6 +84,18 @@ unsafe fn install_trampoline() {
     // pointer subtraction is sound.
     // SAFETY: Valid memory or trusted environment
     let len = unsafe { end.offset_from(src) } as usize;
+
+    // The low identity map is NX apart from two windows, one of which is
+    // exactly `[AP_TRAMPOLINE_EXEC_BASE, +AP_TRAMPOLINE_EXEC_LEN)`
+    // (`memory/src/x86_64/mmu.rs`). A blob that outgrew that window would
+    // land its tail on an NX page and the AP would take an unrecoverable
+    // instruction-fetch fault somewhere between `mov cr0` and the far jump —
+    // on a CPU with no console and no IDT. Fail here instead, where there is
+    // still a serial port.
+    assert!(
+        (len as u64) <= narf_memory::mmu::AP_TRAMPOLINE_EXEC_LEN,
+        "AP trampoline blob outgrew the executable identity window"
+    );
 
     // Dest: identity-mapped phys 0x8000.
     let dst = TRAMPOLINE_PHYS as *mut u8;

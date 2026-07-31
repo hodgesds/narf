@@ -13,23 +13,37 @@
 //!    verbatim at `kernel/bpf/core.c:863`.
 //! 3. The RW→RX **publish** ([`seal`]).
 //!
-//! ## Why there is no temporary-alias mechanism here
+//! ## Why there is still no temporary-alias mechanism here
 //!
 //! Linux's prog pack keeps its text RO+X from creation and publishes through
-//! `text_poke_copy`, because Linux's direct map is NX and there is therefore no
-//! writable alias of the pack's frames. NARF's low identity map is
-//! `PRESENT | WRITABLE | HUGE_PAGE` with **no** `NO_EXEC`
-//! (`memory/src/x86_64/mmu.rs`), so every frame is already aliased RWX. We
-//! write through that alias ([`write`]) and skip the whole mechanism.
+//! `text_poke_copy`, because Linux's direct map is RO as well as NX and there
+//! is therefore no writable alias of the pack's frames at all. NARF is now
+//! half of the way there and it is worth being exact about which half.
 //!
-//! The honest consequence, recorded rather than papered over (spec §4.2): the
-//! RX mapping at the BPF text VA is **not a W^X boundary today**. It is the
-//! correct end state, and it makes the JIT's own view of its output
-//! non-writable, but an attacker with an arbitrary kernel write already has a
-//! writable alias of these bytes through the identity map. Kernel-text W^X
-//! becomes real only when the identity map is demoted to NX
-//! (`bpf/specification/spec.md` §8.6), which needs a huge-page demote helper
-//! that does not exist yet.
+//! Every kernel window `mmu::init_mmu` builds is **NX** apart from the kernel's
+//! own text and the AP trampoline (see `memory/src/x86_64/mmu.rs`, and
+//! `frame/src/aarch64/boot.S` for the PXN|UXN twin). So the pack's frames are
+//! aliased **RW+NX**, not RWX: nothing outside `BPF_TEXT_BASE` can execute
+//! them, and no kernel data anywhere can be executed at all. [`write`] still
+//! goes through that alias, which is why no publish primitive was needed.
+//!
+//! The half that remains, stated plainly rather than papered over (spec §4.2):
+//! the alias is still **writable**. An attacker with an arbitrary kernel write
+//! cannot manufacture new executable memory any more, but can still overwrite
+//! *these* bytes, which are executable at the pack's own VA. Strict W^X — no
+//! byte writable through any mapping while executable through another —
+//! therefore does **not** hold for JIT text yet. Closing it needs two more
+//! things, tracked as `bpf/specification/spec.md` §8.6:
+//!
+//!   1. `seal` must demote the identity/direct-map leaf covering the pack's
+//!      physical range and flip it read-only. That is a split of a **live**
+//!      mapping, unlike the boot-time demotion `init_mmu` performs, so it
+//!      needs the shootdown discipline in `tlb_shootdown.rs` and Linux's
+//!      `__split_large_page` argument for why replacing a huge leaf with an
+//!      identically-translating table is safe without break-before-make.
+//!   2. A `text_poke_copy` equivalent, because [`write`] into an
+//!      already-sealed pack (every allocation after the first) would then have
+//!      no writable address to use.
 //!
 //! ## Reclamation
 //!

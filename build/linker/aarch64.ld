@@ -82,6 +82,15 @@ SECTIONS
 
     __kernel_end = . - KERNEL_VIRT_BASE;
 
+    /* Physical end of `.text`. `boot.S` builds its L2 tables before the
+     * MMU is on, so it can only compare *physical* addresses; doing the
+     * `- KERNEL_VIRT_BASE` here keeps a 64-bit constant and a subtraction
+     * out of the assembly. Everything at or past this address — .rodata,
+     * .data, .bss, .got, and every frame the buddy later hands out — is
+     * mapped PXN|UXN in both the TTBR0 identity map and the TTBR1 kernel
+     * window, so it has no executable alias. */
+    __text_end_phys = __text_end - KERNEL_VIRT_BASE;
+
     /* Aliased high-VA view of the boot stack. The boot stack
      * itself lives in `.boot.data` at low-VA so boot.S's
      * pre-MMU `adrp` + `:lo12:` setup keeps working (adrp can't

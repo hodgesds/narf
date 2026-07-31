@@ -1,9 +1,16 @@
 //! MMU bring-up and the `console/` §3.1 handoff protocol.
 //!
-//! Stage 1 scope: build our own identity-mapped PML4 covering the
-//! first 4 GiB with 1-GiB huge pages, execute the handoff sequence in
-//! `console/` §3.1, and swap to it. Higher-half migration (`-2 GiB`
-//! kernel) is a Wave 2 follow-on.
+//! Builds the kernel's final PML4 — low identity map, high MMIO window,
+//! optional high-half direct map, and the `-2 GiB` kernel window — executes
+//! the handoff sequence in `console/` §3.1, and swaps CR3 to it.
+//!
+//! **Every leaf is `NO_EXEC` except the two ranges something demonstrably
+//! fetches from.** That is what makes an RX mapping elsewhere in the address
+//! space (BPF JIT text, most obviously) mean anything at all: before it, the
+//! same physical bytes were writable *and* executable at their identity
+//! address and again through the kernel window. The exceptions and how they
+//! were derived are on [`kernel_exec_phys_range`] and
+//! [`AP_TRAMPOLINE_EXEC_BASE`].
 //!
 //! The handoff sequence, verbatim from `console/` §3.1:
 //!
@@ -75,6 +82,14 @@ struct EarlyPageTables {
     pdpt_lo: PageTable,
     pdpt_hi_mmio: PageTable,
     pdpt_hi: PageTable,
+    /// Demotion of the low identity map's first 1 GiB into 2-MiB leaves.
+    pd_lo_0: PageTable,
+    /// Demotion of that PD's first 2 MiB into 4-KiB leaves, so the AP
+    /// trampoline window can be executable at page granularity.
+    pt_lo_0: PageTable,
+    /// Demotion of the higher-half kernel window (phys 0..1 GiB) into
+    /// 2-MiB leaves, so only the kernel's own text stays executable.
+    pd_hi_kernel: PageTable,
 }
 
 const ZERO_ENTRIES: [PageTableEntry; 512] = [PageTableEntry::EMPTY; 512];
@@ -91,18 +106,116 @@ static mut EARLY_PAGE_TABLES: EarlyPageTables = EarlyPageTables {
     pdpt_hi: PageTable {
         entries: ZERO_ENTRIES,
     },
+    pd_lo_0: PageTable {
+        entries: ZERO_ENTRIES,
+    },
+    pt_lo_0: PageTable {
+        entries: ZERO_ENTRIES,
+    },
+    pd_hi_kernel: PageTable {
+        entries: ZERO_ENTRIES,
+    },
 };
 
+/// Base of the executable window the SMP AP trampoline is copied into.
+///
+/// `frame/src/x86_64/smp.rs` copies the blob to physical `0x8000` (the SIPI
+/// vector page) and the AP, having just set `CR0.PG` with *this* PML4 in CR3,
+/// keeps fetching instructions from `0x8000 + off` through the `lgdt`, the far
+/// jump into `_ap_long_mode_start`, and the indirect `jmp rax` that finally
+/// leaves for the higher half. Those fetches walk the low identity map, so
+/// this window — and nothing else below 1 GiB outside the kernel image — must
+/// stay executable.
+pub const AP_TRAMPOLINE_EXEC_BASE: u64 = 0x8000;
+
+/// Bytes of the AP-trampoline executable window. Two 4-KiB pages; the blob is
+/// a few hundred bytes of code plus its parameter block and a 32-bit GDT.
+/// `install_trampoline` asserts the blob fits, so growing it past this fails
+/// loudly at boot instead of as an AP that never checks in.
+pub const AP_TRAMPOLINE_EXEC_LEN: u64 = 0x2000;
+
+/// Higher-half base the kernel image is linked at.
+const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+
+unsafe extern "C" {
+    /// First byte of the kernel image, as a *physical* address: the linker
+    /// script declares it before `. += KERNEL_VIRT_BASE`.
+    static __kernel_start: u8;
+    /// End of `.text`, as a *kernel-virtual* address.
+    static __text_end: u8;
+}
+
+/// The one physical range that must remain executable through *both* the low
+/// identity map and the higher-half kernel window: `[__kernel_start,
+/// __text_end)`.
+///
+/// It spans `.boot` (whose VMA equals its LMA, so `long_mode_start` and the
+/// `call _start_rust` return address live at identity addresses) and `.text`.
+/// `.text` needs its identity alias because the ACPI S3 wake vector is armed
+/// with `s3_wake_entry`'s *physical* address: firmware re-enters it in low
+/// memory and it keeps fetching there across its own `mov cr3` until the
+/// `longjmp` restores a higher-half RIP (`arch/src/x86_64/s3_resume.rs`).
+///
+/// Everything past `__text_end` — `.rodata`, `.data`, `.bss` (which holds the
+/// bootstrap heap arena), `.got` — and every frame the buddy ever hands out is
+/// outside this range and is therefore NX in every kernel mapping.
+fn kernel_exec_phys_range() -> (u64, u64) {
+    let start = core::ptr::addr_of!(__kernel_start) as u64;
+    let end = (core::ptr::addr_of!(__text_end) as u64).wrapping_sub(KERNEL_VIRT_BASE);
+    // Defensive: a linker-script edit that inverted these, or moved the image
+    // out of the first GiB, would otherwise silently produce an unbootable
+    // (or silently over-permissive) map. Clamp to "whole first GiB
+    // executable" — that boots, and `smoke_kernel_text_executable_bss_is_not`
+    // goes red so the regression is visible rather than latent.
+    if end <= start || end > (1u64 << 30) {
+        return (0, 1u64 << 30);
+    }
+    (start, end)
+}
+
+/// Does `[base, base + len)` overlap `[lo, hi)`?
+#[inline]
+const fn overlaps(base: u64, len: u64, lo: u64, hi: u64) -> bool {
+    base < hi && lo < base + len
+}
+
+/// True if a leaf covering `[phys, phys + len)` must be executable through the
+/// *kernel image* window — the higher-half `-2 GiB` map, where only the
+/// kernel's own text is ever fetched.
+fn kernel_window_leaf_needs_exec(phys: u64, len: u64) -> bool {
+    let (kstart, kend) = kernel_exec_phys_range();
+    overlaps(phys, len, kstart, kend)
+}
+
+/// True if a leaf covering `[phys, phys + len)` must be executable through the
+/// *low identity* map. Same set as the kernel window plus the AP trampoline
+/// window, which only exists at an identity address.
+fn identity_leaf_needs_exec(phys: u64, len: u64) -> bool {
+    kernel_window_leaf_needs_exec(phys, len)
+        || overlaps(
+            phys,
+            len,
+            AP_TRAMPOLINE_EXEC_BASE,
+            AP_TRAMPOLINE_EXEC_BASE + AP_TRAMPOLINE_EXEC_LEN,
+        )
+}
+
 /// Build a fresh PML4 with:
-///   * PML4[0] → PDPT covering the first 4 GiB identity-mapped via
-///     four 1-GiB huge pages. Keeps low-half addresses live for
-///     Stage-2-era kernel code that's still linked at low physical.
-///   * PML4[511] → a second PDPT with a 1-GiB huge page at PDPT[510]
-///     mapping `0xFFFF_FFFF_8000_0000..0xFFFF_FFFF_C000_0000` to
-///     physical `0x0..0x4000_0000`. This is the higher-half window a
-///     future linker script will place `.text/.rodata/.data/.bss`
-///     into — the same physical pages become reachable at both low
-///     and high virtual addresses.
+///   * PML4[0] → PDPT covering the low 512 GiB identity-mapped. Keeps
+///     low-half addresses live for the BSP boot stack, the AP stacks, and
+///     every kernel pointer derived from a `PhysAddr`. **NX everywhere
+///     except the kernel image's text and the AP trampoline window** — see
+///     [`identity_leaf_needs_exec`]; the first 1 GiB is demoted to 2-MiB
+///     leaves and its first 2 MiB again to 4-KiB leaves so those two
+///     exceptions can be stated at page granularity.
+///   * PML4[511] → a second PDPT whose PDPT[510] maps
+///     `0xFFFF_FFFF_8000_0000..0xFFFF_FFFF_C000_0000` to physical
+///     `0x0..0x4000_0000`. This is the higher-half window the linker
+///     script places `.text/.rodata/.data/.bss` into — the same physical
+///     pages become reachable at both low and high virtual addresses.
+///     Demoted to 2-MiB leaves and NX outside `[__kernel_start,
+///     __text_end)`, because a 1-GiB RWX block here aliases the whole of
+///     a small machine's buddy arena and would undo the identity map's NX.
 ///
 ///   * PML4[384 + i] → the high-half **kernel direct map**: one PDPT
 ///     per 512 GiB of installed RAM (`max_ram_phys`), each mapping
@@ -149,7 +262,6 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     //
     // SAFETY: single-threaded boot path; this is the only writer
     // to `EARLY_PAGE_TABLES`.
-    const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
     let tables_ptr = core::ptr::addr_of_mut!(EARLY_PAGE_TABLES);
     // SAFETY: MMIO access to the device's mapped register block; the offset lies within the mapped BAR.
     let pml4_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pml4) } as u64;
@@ -159,10 +271,19 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     let pdpt_hi_mmio_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_hi_mmio) } as u64;
     // SAFETY: single-threaded boot-time access to this static; no concurrent mutation is possible.
     let pdpt_hi_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_hi) } as u64;
+    // SAFETY: single-threaded boot-time access to this static; no concurrent mutation is possible.
+    let pd_lo_0_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pd_lo_0) } as u64;
+    // SAFETY: single-threaded boot-time access to this static; no concurrent mutation is possible.
+    let pt_lo_0_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pt_lo_0) } as u64;
+    // SAFETY: single-threaded boot-time access to this static; no concurrent mutation is possible.
+    let pd_hi_kernel_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pd_hi_kernel) } as u64;
     let pml4_addr = PhysAddr::new(pml4_virt.wrapping_sub(KERNEL_VIRT_BASE));
     let pdpt_lo_addr = PhysAddr::new(pdpt_lo_virt.wrapping_sub(KERNEL_VIRT_BASE));
     let pdpt_hi_mmio_addr = PhysAddr::new(pdpt_hi_mmio_virt.wrapping_sub(KERNEL_VIRT_BASE));
     let pdpt_hi_addr = PhysAddr::new(pdpt_hi_virt.wrapping_sub(KERNEL_VIRT_BASE));
+    let pd_lo_0_addr = PhysAddr::new(pd_lo_0_virt.wrapping_sub(KERNEL_VIRT_BASE));
+    let pt_lo_0_addr = PhysAddr::new(pt_lo_0_virt.wrapping_sub(KERNEL_VIRT_BASE));
+    let pd_hi_kernel_addr = PhysAddr::new(pd_hi_kernel_virt.wrapping_sub(KERNEL_VIRT_BASE));
 
     // These frames came from the allocator and are identity-mapped in
     // the boot.S page tables (the low 1 GiB huge page covers them),
@@ -171,10 +292,22 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     PageTable::zero_at(pdpt_lo_addr.as_mut_ptr::<PageTable>());
     PageTable::zero_at(pdpt_hi_mmio_addr.as_mut_ptr::<PageTable>());
     PageTable::zero_at(pdpt_hi_addr.as_mut_ptr::<PageTable>());
+    PageTable::zero_at(pd_lo_0_addr.as_mut_ptr::<PageTable>());
+    PageTable::zero_at(pt_lo_0_addr.as_mut_ptr::<PageTable>());
+    PageTable::zero_at(pd_hi_kernel_addr.as_mut_ptr::<PageTable>());
 
     // Step 2: populate.
+    //
+    // **Every leaf is NX unless something demonstrably executes there.**
+    // Before this, all four windows were `PRESENT | WRITABLE | HUGE_PAGE`,
+    // which made every physical frame simultaneously writable *and*
+    // executable at its identity address — so mapping BPF JIT text RX at a
+    // private kernel VA bought nothing, and any kernel data the attacker
+    // could write was directly runnable. `identity_leaf_needs_exec` /
+    // `kernel_window_leaf_needs_exec` derive the exceptions from the linker
+    // symbols and the SIPI vector, not from a guess.
     let flags_ptr = PtFlags::PRESENT | PtFlags::WRITABLE;
-    let flags_1gb = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::HUGE_PAGE;
+    let flags_1gb = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::HUGE_PAGE | PtFlags::NO_EXEC;
     // SAFETY: the PML4/PDPT storage is identity-mapped (low 1 GiB of
     // boot.S's table), so writes go to the intended physical memory.
     // SAFETY: Valid memory or trusted environment
@@ -195,11 +328,63 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
         // map is live.
         let pml4_lo_entry = PageTableEntry::new(pdpt_lo_addr, flags_ptr);
         write_identity::<PageTableEntry>(pml4_addr, pml4_lo_entry);
-        for gib in 0u64..512 {
+        // Slot 0 is the only 1-GiB slot with anything executable in it, so it
+        // is the only one that gets demoted. Slots 1..512 stay 1-GiB NX
+        // leaves: 511 huge pages, one iTLB-irrelevant entry each, exactly as
+        // before except for bit 63.
+        for gib in 1u64..512 {
             let phys = PhysAddr::new(gib << 30);
             let entry = PageTableEntry::new(phys, flags_1gb);
             let slot = PhysAddr::new(pdpt_lo_addr.raw() + gib * 8);
             write_identity::<PageTableEntry>(slot, entry);
+        }
+
+        // ── Demotion, level 1: identity 0..1 GiB, 1 GiB → 512 × 2 MiB ──
+        //
+        // Built here rather than by splitting a live mapping. `demote_page`
+        // in `address_space.rs` is unrelated (it is NUMA *tier* demotion —
+        // it moves a page to a slower node and never changes leaf size), and
+        // splitting the huge page the kernel is standing on, after the CR3
+        // swap and with APs running, would need a break-before-make on the
+        // window that holds the BSP stack. Constructing the table *before*
+        // the swap makes the whole hazard class disappear: the first CR3
+        // that ever sees these addresses already has them at 2-MiB / 4-KiB
+        // granularity, so there is no TLB entry of the old size to conflict
+        // with and no INVLPG to get wrong.
+        write_identity::<PageTableEntry>(
+            pdpt_lo_addr,
+            PageTableEntry::new(pd_lo_0_addr, flags_ptr),
+        );
+        // PD[0] is demoted again (below); PD[1..512] are 2-MiB leaves,
+        // executable only where the kernel image's text lives.
+        for two_mb in 1u64..512 {
+            let phys = two_mb << 21;
+            let mut flags = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::HUGE_PAGE;
+            if !identity_leaf_needs_exec(phys, 1 << 21) {
+                flags |= PtFlags::NO_EXEC;
+            }
+            let slot = PhysAddr::new(pd_lo_0_addr.raw() + two_mb * 8);
+            write_identity::<PageTableEntry>(slot, PageTableEntry::new(PhysAddr::new(phys), flags));
+        }
+
+        // ── Demotion, level 2: identity 0..2 MiB, 2 MiB → 512 × 4 KiB ──
+        //
+        // Only so the AP trampoline window can be executable at page
+        // granularity. Leaving the whole first 2 MiB executable would hand
+        // an attacker 2 MiB of RWX at a fixed, well-known address; this
+        // narrows it to the two pages the SIPI vector actually needs.
+        write_identity::<PageTableEntry>(
+            pd_lo_0_addr,
+            PageTableEntry::new(pt_lo_0_addr, flags_ptr),
+        );
+        for page in 0u64..512 {
+            let phys = page << 12;
+            let mut flags = PtFlags::PRESENT | PtFlags::WRITABLE;
+            if !identity_leaf_needs_exec(phys, 1 << 12) {
+                flags |= PtFlags::NO_EXEC;
+            }
+            let slot = PhysAddr::new(pt_lo_0_addr.raw() + page * 8);
+            write_identity::<PageTableEntry>(slot, PageTableEntry::new(PhysAddr::new(phys), flags));
         }
 
         // High-MMIO identity (PML4[1]: virt 512 GiB ≤ V < 1 TiB →
@@ -230,15 +415,39 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
             write_identity::<PageTableEntry>(slot, entry);
         }
 
-        // High-half PML4[511] + PDPT[510] → phys 0 (1 GiB huge page).
+        // High-half PML4[511] + PDPT[510] → phys 0..1 GiB.
         // Virtual 0xFFFF_FFFF_8000_0000 + x maps to physical 0 + x.
         let pml4_hi_entry = PageTableEntry::new(pdpt_hi_addr, flags_ptr);
         let pml4_hi_slot = PhysAddr::new(pml4_addr.raw() + (HIGHER_HALF_PML4_INDEX as u64) * 8);
         write_identity::<PageTableEntry>(pml4_hi_slot, pml4_hi_entry);
 
-        let hh_entry = PageTableEntry::new(PhysAddr::new(0), flags_1gb);
-        let hh_slot = PhysAddr::new(pdpt_hi_addr.raw() + (HIGHER_HALF_PDPT_INDEX as u64) * 8);
-        write_identity::<PageTableEntry>(hh_slot, hh_entry);
+        // This used to be one 1-GiB RWX huge page, and closing only the
+        // *identity* map would have left it as a complete replacement for
+        // it: it aliases phys 0..1 GiB — where a small-RAM boot does all of
+        // its buddy allocation, including BPF prog packs — writable and
+        // executable at `KERNEL_VIRT_BASE + phys`. Demoting it to 2-MiB
+        // leaves and marking every block outside `[__kernel_start,
+        // __text_end)` NX is what makes "no writable+executable alias of
+        // heap memory" true rather than true-of-one-window.
+        //
+        // The kernel's own text stays WRITABLE here on purpose: `patch_word`,
+        // alternatives patching and the static-key machinery all write kernel
+        // text through this window. Making kernel text read-only is a
+        // separate, larger change (it needs a text-poke path of its own) and
+        // is *not* claimed by this work.
+        write_identity::<PageTableEntry>(
+            PhysAddr::new(pdpt_hi_addr.raw() + (HIGHER_HALF_PDPT_INDEX as u64) * 8),
+            PageTableEntry::new(pd_hi_kernel_addr, flags_ptr),
+        );
+        for two_mb in 0u64..512 {
+            let phys = two_mb << 21;
+            let mut flags = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::HUGE_PAGE;
+            if !kernel_window_leaf_needs_exec(phys, 1 << 21) {
+                flags |= PtFlags::NO_EXEC;
+            }
+            let slot = PhysAddr::new(pd_hi_kernel_addr.raw() + two_mb * 8);
+            write_identity::<PageTableEntry>(slot, PageTableEntry::new(PhysAddr::new(phys), flags));
+        }
     }
 
     // High-half kernel direct map (PML4[384 + chunk]). Give the kernel a
