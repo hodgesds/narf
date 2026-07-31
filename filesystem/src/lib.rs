@@ -92,6 +92,7 @@ mod devfs_pty_tests;
 mod e2e_tests;
 mod fs_mount_e2e_tests;
 mod memfs_tests;
+mod page_cache_tests;
 mod procsys_e2e_tests;
 mod random_e2e_tests;
 mod sysfs_e2e_tests;
