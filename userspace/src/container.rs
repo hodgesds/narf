@@ -1,7 +1,7 @@
-//! Container-personality stub.
+//! Container-personality feature marker.
 //!
-//! Gated on `#[cfg(feature = "container")]`.  Waves 63-67 will land
-//! the real implementations here:
+//! Gated on `#[cfg(feature = "container")]`. The implementations live in
+//! their owning modules rather than this marker module:
 //!
 //! - PID namespace (clone CLONE_NEWPID, pid_ns_init)
 //! - Mount namespace (CLONE_NEWNS, pivot_root, mount propagation)
@@ -13,6 +13,6 @@
 //! Orthogonal to `linux-compat`: a native NARF container runtime can
 //! use namespaces without the full Linux syscall surface.
 //!
-//! Nothing is exported yet; the module exists so downstream crates can
-//! write `#[cfg(feature = "container")] use narf_userspace::container;`
-//! without a compile error.
+//! This module remains as a stable feature-presence import for downstream
+//! crates; namespace types and operations are exported by `namespaces`,
+//! `pid_ns`, the syscall handlers, and `narf_filesystem`.

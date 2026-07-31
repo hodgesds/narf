@@ -27,9 +27,9 @@ use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 use super::{
     hook_auxv, hook_coredump_get, hook_coredump_set, hook_cwd_path, hook_environ, hook_exe_path,
-    hook_fd_list, hook_fd_path, hook_fd_pidfd_pid, hook_nice, hook_ns_mountinfo_generation,
-    hook_oom_adj_get, hook_oom_adj_set, hook_oom_score, hook_rlimits, hook_root_path, slice_read,
-    task_info, ProcDirMarker,
+    hook_fd_info, hook_fd_list, hook_fd_path, hook_fd_pidfd_pid, hook_nice,
+    hook_ns_mountinfo_generation, hook_oom_adj_get, hook_oom_adj_set, hook_oom_score, hook_rlimits,
+    hook_root_path, slice_read, task_info, ProcDirMarker,
 };
 
 // ── Extended flat-file enum ─────────────────────────────────────────
@@ -203,14 +203,13 @@ impl FileOps for PidExtFile {
     }
     fn stat(&self) -> Stat {
         // Magic symlinks [[proc-magic-links]] must report S_IFLNK so that
-        // sys_readlink and the VFS walker treat them correctly.  size must
-        // equal the target length: sys_readlink sizes its staging buffer from
-        // st.size, so size:0 would make readlink return an empty string.
+        // sys_readlink and the VFS walker treat them correctly. Linux reports
+        // st_size == 0 for procfs magic links; readlink uses the caller's
+        // buffer length and does not depend on this hint.
         match self.field {
             PidExtField::Exe => {
-                let size = hook_exe_path(self.pid).map(|p| p.len()).unwrap_or(0) as u64;
                 return Stat {
-                    size,
+                    size: 0,
                     blocks: 0,
                     mode: Mode {
                         file_type: FileType::Symlink,
@@ -220,9 +219,8 @@ impl FileOps for PidExtFile {
                 };
             }
             PidExtField::Cwd => {
-                let size = hook_cwd_path(self.pid).map(|p| p.len()).unwrap_or(0) as u64;
                 return Stat {
-                    size,
+                    size: 0,
                     blocks: 0,
                     mode: Mode {
                         file_type: FileType::Symlink,
@@ -232,12 +230,8 @@ impl FileOps for PidExtFile {
                 };
             }
             PidExtField::Root => {
-                // Default size 1, matching read()'s "/" fallback for a
-                // task with no chroot — a 0 here makes readlink_impl size
-                // a 0-byte staging buffer and return an empty target.
-                let size = hook_root_path(self.pid).map(|p| p.len()).unwrap_or(1) as u64;
                 return Stat {
-                    size,
+                    size: 0,
                     blocks: 0,
                     mode: Mode {
                         file_type: FileType::Symlink,
@@ -795,13 +789,9 @@ impl FileOps for ProcFdFile {
         // Linux models /proc/<pid>/fd/<n> as a symlink to the backing path;
         // readlink() (used by musl realpath, lsof, …) requires the node to
         // report S_IFLNK or it returns EINVAL/EPERM. read() yields the target.
-        // size MUST equal the target length: sys_readlink sizes its staging
-        // buffer from st.size, so size:0 makes readlink return an empty link.
-        let size = hook_fd_path(self.pid, self.fd)
-            .map(|p| p.len())
-            .unwrap_or_else(|| "anon_inode:[unknown]".len()) as u64;
         Stat {
-            size,
+            // Linux procfs fd magic links report st_size == 0.
+            size: 0,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Symlink,
@@ -849,7 +839,8 @@ pub struct ProcFdInfoDir {
     pub pid: u64,
 }
 
-/// Single fdinfo file.  Renders `pos`, `flags`, `mnt_id` fields.
+/// Single fdinfo file. Renders Linux's baseline `pos`, `flags`, `mnt_id`,
+/// and `ino` fields.
 ///
 /// Linux ref: `fs/proc/fd.c:seq_show_fdinfo`.
 #[derive(Debug)]
@@ -864,14 +855,12 @@ impl FileOps for ProcFdInfoFile {
         let fd = self.fd;
         Box::pin(async move {
             let mut s = String::new();
-            // pos: file position offset.
-            // TODO: read offset from FdEntry once fd table exposes snapshot-of-pid.
-            let _ = writeln!(s, "pos:\t0");
-            // flags: open-file status flags.
-            // TODO: map FdEntry::flags to the O_* bitfield.
-            let _ = writeln!(s, "flags:\t0100002");
-            // mnt_id: mount-table ID. Always 1 until per-mount id allocator lands.
-            let _ = writeln!(s, "mnt_id:\t1");
+            let info = hook_fd_info(pid, fd).unwrap_or_default();
+            let _ = writeln!(s, "pos:\t{}", info.pos);
+            // Linux renders the open-file status flags in octal.
+            let _ = writeln!(s, "flags:\t0{:o}", info.flags);
+            let _ = writeln!(s, "mnt_id:\t{}", info.mnt_id);
+            let _ = writeln!(s, "ino:\t{}", info.ino);
             // pidfd fds carry `Pid:`/`NSpid:` lines (Linux
             // `fs/pidfs.c::pidfd_show_fdinfo`). Pre-pidfs userspace resolves
             // a pidfd to its process by parsing exactly these — systemd 258's
@@ -1317,7 +1306,7 @@ kernel_test_in!(
     smoke_coredump_filter_write_validation
 );
 
-/// Smoke: fdinfo file contains "pos:" and "flags:" lines.
+/// Smoke: fdinfo contains Linux's four baseline fields.
 fn smoke_fdinfo_has_pos_and_flags() -> TestResult {
     use super::poll_once;
     let f = ProcFdInfoFile { pid: 1, fd: 0 };
@@ -1325,10 +1314,14 @@ fn smoke_fdinfo_has_pos_and_flags() -> TestResult {
     match poll_once(f.read(0, &mut buf)) {
         Some(Ok(n)) if n > 0 => {
             let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
-            if s.contains("pos:") && s.contains("flags:") {
+            if s.contains("pos:")
+                && s.contains("flags:")
+                && s.contains("mnt_id:")
+                && s.contains("ino:")
+            {
                 TestResult::Pass
             } else {
-                TestResult::Fail("fdinfo missing 'pos:' or 'flags:'")
+                TestResult::Fail("fdinfo missing a baseline Linux field")
             }
         }
         _ => TestResult::Fail("fdinfo read failed"),

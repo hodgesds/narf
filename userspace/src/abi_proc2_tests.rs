@@ -1049,6 +1049,50 @@ fn smoke_abi_proc2_pid_fd_lists_and_symlinks() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_fd_lists_and_symlinks);
 
+fn smoke_abi_proc2_fdinfo_uses_live_fd_metadata() -> TestResult {
+    with_procfs(FAKE_TASK, "fdinfoproc", &["fdinfoproc"], 0, |base| {
+        let auth = bootstrap_mount_authority();
+        let fs = narf_filesystem::MemFs::with_seeds("fdinfo-mem", &[("f", b"hello")]);
+        let mh = registry()
+            .mount(&auth, "/fdinfo-mem", fs)
+            .map_err(|_| "fdinfo backing mount failed")?;
+        let result = (|| {
+            let path = b"/fdinfo-mem/f\0";
+            let fd = match call_open(path.as_ptr() as u64, 0o2) {
+                Some(fd) if fd >= 0 => fd as u32,
+                _ => return Err("fdinfo backing open failed"),
+            };
+            let ino = crate::fd::with_table(FAKE_TASK, |table| {
+                let entry = table.get_mut(fd)?;
+                entry.offset = 37;
+                entry.status_flags = 0o2002;
+                Some(entry.ops.ino())
+            })
+            .flatten()
+            .ok_or("fdinfo entry disappeared")?;
+            let mnt_id = crate::mqueue::fd_mount_id(FAKE_TASK, fd)
+                .ok_or("fdinfo mount identity was not recorded")?;
+
+            let fdinfo_path = alloc::format!("{}/{}/fdinfo/{}\0", base, FAKE_TASK, fd);
+            let mut buf = [0u8; 512];
+            let n = read_proc_file(fdinfo_path.as_bytes(), &mut buf)?;
+            let text = core::str::from_utf8(&buf[..n]).map_err(|_| "fdinfo not utf-8")?;
+            if !text.contains("pos:\t37\n") || !text.contains("flags:\t02002\n") {
+                return Err("fdinfo did not expose live offset/status flags");
+            }
+            if !text.contains(&alloc::format!("mnt_id:\t{}\n", mnt_id))
+                || !text.contains(&alloc::format!("ino:\t{}\n", ino))
+            {
+                return Err("fdinfo did not expose live mount/inode identity");
+            }
+            Ok(())
+        })();
+        let _ = registry().unmount(&mh, "/fdinfo-mem");
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_fdinfo_uses_live_fd_metadata);
+
 // ── /proc/self resolves to the calling pid ──
 
 fn smoke_abi_proc2_proc_self_is_caller() -> TestResult {
@@ -1070,6 +1114,22 @@ fn smoke_abi_proc2_proc_self_is_caller() -> TestResult {
         let pid_field = st.split(' ').next().unwrap_or("");
         if pid_field != alloc::format!("{}", FAKE_TASK) {
             return Err("/proc/self/stat pid field is not the caller's pid");
+        }
+        // Linux procfs magic links report st_size == 0. readlink must still
+        // use the caller's buffer and return the complete target.
+        let self_path = alloc::format!("{}/self\0", base);
+        let mut link_buf = [0u8; 32];
+        let link_len = call_readlink(
+            self_path.as_ptr() as u64,
+            link_buf.as_mut_ptr() as u64,
+            link_buf.len() as u64,
+        );
+        let link_len = match link_len {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("readlink of zero-size /proc/self failed"),
+        };
+        if &link_buf[..link_len] != alloc::format!("{}", FAKE_TASK).as_bytes() {
+            return Err("/proc/self readlink target is not the caller's pid");
         }
         Ok(())
     })

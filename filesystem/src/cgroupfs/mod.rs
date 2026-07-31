@@ -511,10 +511,38 @@ pub fn task_exited(pid: u64) {
 
 // ── cgroup namespace (CLONE_NEWCGROUP) ──────────────────────────────
 
-/// pid → its cgroup-namespace root. A process appears here once it
-/// unshares the cgroup namespace; absent ⇒ the root-namespace view
-/// (paths are absolute).
-static TASK_NS_ROOT: IrqSafeSpinLock<BTreeMap<u64, Arc<Cgroup>>> =
+/// A cgroup namespace has its own nsfs identity even when two namespaces
+/// happen to use the same cgroup directory as their visible root.
+#[derive(Debug)]
+pub struct CgroupNamespace {
+    id: u64,
+    root: Arc<Cgroup>,
+}
+
+impl CgroupNamespace {
+    fn new(root: Arc<Cgroup>) -> Arc<Self> {
+        Arc::new(Self {
+            id: crate::alloc_mount_ns_id(),
+            root,
+        })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+static INITIAL_CGROUP_NS: OnceLock<Arc<CgroupNamespace>> = OnceLock::new();
+
+fn initial_cgroup_namespace() -> Arc<CgroupNamespace> {
+    INITIAL_CGROUP_NS
+        .get_or_init(|| CgroupNamespace::new(root()))
+        .clone()
+}
+
+/// pid → its cgroup namespace. A process appears here once it unshares or
+/// joins a namespace; absent means the shared initial namespace.
+static TASK_NS_ROOT: IrqSafeSpinLock<BTreeMap<u64, Arc<CgroupNamespace>>> =
     IrqSafeSpinLock::new(BTreeMap::new());
 
 /// `CLONE_NEWCGROUP`: make `pid`'s *current* cgroup its
@@ -522,7 +550,21 @@ static TASK_NS_ROOT: IrqSafeSpinLock<BTreeMap<u64, Arc<Cgroup>>> =
 /// render relative to it (the v2 cgroup-namespace contract).
 pub fn unshare_cgroup_ns(pid: u64) {
     let cur = cgroup_of(pid);
-    TASK_NS_ROOT.lock().insert(pid, cur);
+    TASK_NS_ROOT.lock().insert(pid, CgroupNamespace::new(cur));
+}
+
+/// Namespace object named by `/proc/<pid>/ns/cgroup`.
+pub fn cgroup_namespace_of(pid: u64) -> Arc<CgroupNamespace> {
+    TASK_NS_ROOT
+        .lock()
+        .get(&pid)
+        .cloned()
+        .unwrap_or_else(initial_cgroup_namespace)
+}
+
+/// Join an existing cgroup namespace through `setns(2)`.
+pub fn install_cgroup_namespace(pid: u64, ns: Arc<CgroupNamespace>) {
+    TASK_NS_ROOT.lock().insert(pid, ns);
 }
 
 /// Inherit the cgroup-namespace root from parent to child at fork.
@@ -578,7 +620,7 @@ fn cgroup_path_relative(cg: &Arc<Cgroup>, nsroot: &Arc<Cgroup>) -> String {
 pub fn proc_pid_cgroup(pid: u64, reader_pid: u64) -> Vec<u8> {
     let cg = cgroup_of(pid);
     let path = match TASK_NS_ROOT.lock().get(&reader_pid).cloned() {
-        Some(nsroot) => cgroup_path_relative(&cg, &nsroot),
+        Some(namespace) => cgroup_path_relative(&cg, &namespace.root),
         None => cgroup_path(&cg),
     };
     format!("0::{path}\n").into_bytes()
