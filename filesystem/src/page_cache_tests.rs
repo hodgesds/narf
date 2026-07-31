@@ -182,6 +182,39 @@ kernel_test_in!(
     smoke_page_cache_new_follows_global_default
 );
 
+/// The shrinker path (`reclaimable` / `shrink`) sheds clean pages under
+/// memory pressure but never a dirty page (which still owes a writeback).
+fn smoke_page_cache_shrink_evicts_clean_keeps_dirty() -> TestResult {
+    reset_globals();
+    let cache = PageCache::with_capacity(0); // unbounded: isolate shrink()
+    for i in 0..10 {
+        cache.insert(key(i), clean_page(0));
+    }
+    cache.mark_dirty(key(3));
+    cache.mark_dirty(key(7));
+    if cache.reclaimable() != 8 {
+        return TestResult::Fail("reclaimable must count only the 8 clean pages");
+    }
+    if cache.shrink(5) != 5 || cache.len() != 5 {
+        return TestResult::Fail("shrink(5) should evict exactly 5 clean pages");
+    }
+    if cache.lookup(key(3)).is_none() || cache.lookup(key(7)).is_none() {
+        return TestResult::Fail("dirty pages must survive shrink");
+    }
+    // Over-ask: evicts the 3 remaining clean pages, keeps both dirty.
+    if cache.shrink(100) != 3 {
+        return TestResult::Fail("shrink should evict the remaining clean pages");
+    }
+    if cache.len() != 2 || cache.reclaimable() != 0 {
+        return TestResult::Fail("only the 2 dirty pages should remain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/page_cache",
+    smoke_page_cache_shrink_evicts_clean_keeps_dirty
+);
+
 /// A hard capacity of 0 with no watermark set is unbounded — the
 /// escape hatch for callers that manage lifetime themselves.
 fn smoke_page_cache_zero_capacity_unbounded() -> TestResult {

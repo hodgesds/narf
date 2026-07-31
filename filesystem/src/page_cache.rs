@@ -24,9 +24,9 @@
 //! correctness-preserving.
 
 use alloc::collections::{BTreeMap, VecDeque};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -107,6 +107,70 @@ fn free_pages_available() -> Option<usize> {
         return Some(f());
     }
     Some(narf_memory::frame_stats().free)
+}
+
+// ── Central-reclaim integration (one shrinker for all page caches) ──
+//
+// Every live page cache registers itself here (a `Weak` so a dropped
+// filesystem's cache falls out). A single `page-cache` shrinker is
+// registered with `narf_memory::reclaim` the first time any cache
+// appears; its count/scan iterate this registry. The scan/count paths
+// are allocation-free (iterate + upgrade under the registry lock, no
+// `Vec`) so they are safe to drive from the memory-reclaim / OOM path.
+// Lock order is always REGISTRY → cache-inner (register only takes the
+// registry lock; lookup/insert/shrink only take the cache-inner lock),
+// so holding the registry lock across `shrink` cannot deadlock.
+
+static PAGE_CACHE_REGISTRY: IrqSafeSpinLock<Vec<Weak<PageCache>>> =
+    IrqSafeSpinLock::new(Vec::new());
+static SHRINKER_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Register `cache` with the central memory reclaimer so its clean pages
+/// can be shed under pressure. Call once per cache after it is wrapped in
+/// its owning `Arc` (e.g. at filesystem mount). Registration allocates
+/// (registry push) but happens off the reclaim path.
+pub fn register_for_reclaim(cache: &Arc<PageCache>) {
+    {
+        let mut g = PAGE_CACHE_REGISTRY.lock();
+        g.retain(|w| w.strong_count() > 0);
+        g.push(Arc::downgrade(cache));
+    }
+    if !SHRINKER_REGISTERED.swap(true, Ordering::AcqRel) {
+        narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+            name: "page-cache",
+            count: page_cache_shrinker_count,
+            scan: page_cache_shrinker_scan,
+        });
+    }
+}
+
+/// Shrinker `count`: total clean, evictable pages across all live caches.
+/// Allocation-free.
+fn page_cache_shrinker_count() -> usize {
+    let g = PAGE_CACHE_REGISTRY.lock();
+    let mut n = 0usize;
+    for w in g.iter() {
+        if let Some(c) = w.upgrade() {
+            n = n.saturating_add(c.reclaimable());
+        }
+    }
+    n
+}
+
+/// Shrinker `scan`: shed up to `nr` clean pages across live caches.
+/// Allocation-free (upgrades a `Weak` — no heap — and evicts in place).
+fn page_cache_shrinker_scan(nr: usize) -> usize {
+    let g = PAGE_CACHE_REGISTRY.lock();
+    let mut freed = 0usize;
+    for w in g.iter() {
+        if freed >= nr {
+            break;
+        }
+        if let Some(c) = w.upgrade() {
+            freed = freed.saturating_add(c.shrink(nr - freed));
+        }
+    }
+    freed
 }
 
 /// Cache key: filesystem + inode + page offset (in pages, not
@@ -369,6 +433,31 @@ impl PageCache {
         let mut g = self.inner.lock();
         g.pages.clear();
         g.clock.clear();
+    }
+
+    /// Number of clean (evictable) resident pages — what this cache can
+    /// hand back to memory reclaim without a writeback. Dirty pages still
+    /// owe a writeback and are excluded. This is the shrinker `count`.
+    pub fn reclaimable(&self) -> usize {
+        let g = self.inner.lock();
+        g.pages.values().filter(|slot| !slot.page.dirty).count()
+    }
+
+    /// Evict up to `nr` cold, clean pages in CLOCK order and return the
+    /// number actually evicted. Dirty pages are never touched. This is the
+    /// shrinker `scan`: memory reclaim calls it under pressure. Allocation-
+    /// free (eviction only removes entries), so it is safe on the reclaim
+    /// path.
+    pub fn shrink(&self, nr: usize) -> usize {
+        let mut g = self.inner.lock();
+        let mut freed = 0;
+        while freed < nr {
+            if !Self::evict_one_cold_clean(&mut g) {
+                break;
+            }
+            freed += 1;
+        }
+        freed
     }
 }
 
