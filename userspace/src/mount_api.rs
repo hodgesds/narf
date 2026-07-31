@@ -137,10 +137,11 @@ fn real_cgroupfs() -> Option<Arc<dyn FsInstance>> {
 ///
 /// Three classes of fstype are handled:
 ///   * real NARF backends — tmpfs/ramfs → `MemFs`, proc → `ProcFs`,
-///     sysfs → `SysFs`, devtmpfs → `DevFs`, cgroup2 → `CgroupFs`.
+///     sysfs → `SysFs`, devtmpfs → `DevFs`, cgroup2 → `CgroupFs`,
+///     bpf → `BpfFs`.
 ///   * pseudo-filesystems systemd mounts during early boot for which NARF has
 ///     no real semantics (securityfs, debugfs, tracefs, configfs, mqueue,
-///     devpts, fusectl, pstore, efivarfs, hugetlbfs, bpf, …). These get a
+///     devpts, fusectl, pstore, efivarfs, hugetlbfs, …). These get a
 ///     minimal empty in-memory directory so the mountpoint exists and is
 ///     statable/traversable; systemd degrades gracefully when the contents
 ///     are absent.
@@ -164,6 +165,10 @@ pub fn build_fs(fsname: &str) -> Option<Arc<dyn FsInstance>> {
         "sysfs" => real_sysfs(),
         "devtmpfs" | "devfs" => Some(Arc::new(narf_filesystem::DevFs::new())),
         "cgroup2" | "cgroup" => real_cgroupfs(),
+        // bpffs: a real filesystem, not an empty directory. `BPF_OBJ_PIN`
+        // refuses any parent that is not one, so mounting a `MemFs` here would
+        // make `mount -t bpf` succeed and every pin into it fail with EPERM.
+        "bpf" | "bpffs" => Some(Arc::new(narf_filesystem::bpffs::BpfFs::new())),
 
         // Pseudo-filesystems with no NARF semantics: an empty, statable,
         // writable directory is enough for systemd's mount unit to succeed.

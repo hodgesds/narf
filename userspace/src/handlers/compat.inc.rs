@@ -7863,6 +7863,8 @@ mod handler_sys_bpf_btf;
 mod handler_sys_bpf_info;
 #[path = "sys_bpf_attach.rs"]
 mod handler_sys_bpf_attach;
+#[path = "sys_bpf_pin.rs"]
+mod handler_sys_bpf_pin;
 #[path = "sys_brk.rs"]
 mod handler_sys_brk;
 #[path = "sys_capget.rs"]
@@ -8448,6 +8450,7 @@ pub(crate) use handler_sys_bpf::*;
 pub(crate) use handler_sys_bpf_btf::*;
 pub(crate) use handler_sys_bpf_info::*;
 pub(crate) use handler_sys_bpf_attach::*;
+pub(crate) use handler_sys_bpf_pin::*;
 #[allow(unused_imports)]
 pub use handler_sys_chdir_for_test::*;
 #[allow(unused_imports)]

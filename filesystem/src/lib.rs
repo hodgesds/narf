@@ -60,6 +60,7 @@
 
 extern crate alloc;
 
+pub mod bpffs;
 #[cfg(feature = "cgroup")]
 pub mod cgroupfs;
 pub mod console_tty;

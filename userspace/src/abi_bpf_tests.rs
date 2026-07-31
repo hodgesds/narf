@@ -15,7 +15,11 @@ use crate::abi_test_support::*;
 const BPF_MAP_CREATE: u64 = 0;
 const BPF_PROG_LOAD: u64 = 5;
 const BPF_OBJ_PIN: u64 = 6;
+const BPF_OBJ_GET: u64 = 7;
 const BPF_PROG_TEST_RUN: u64 = 10;
+/// `BPF_PROG_QUERY` — still unimplemented, and the stand-in for `BPF_OBJ_PIN`
+/// in the "deliberately absent" list now that pinning has landed.
+const BPF_PROG_QUERY: u64 = 16;
 const BPF_BTF_LOAD: u64 = 18;
 
 const EOPNOTSUPP: i64 = -95;
@@ -220,8 +224,9 @@ fn smoke_abi_bpf_unimplemented_cmds() -> TestResult {
     with_setup(|| {
         let attr = [0u8; ATTR_LEN];
         // `BPF_BTF_LOAD` used to be in this list; it is implemented now, and
-        // its own conformance group lives in `abi_bpf_btf_tests.rs`.
-        for cmd in [BPF_OBJ_PIN, 9999] {
+        // its own conformance group lives in `abi_bpf_btf_tests.rs`. So were
+        // `BPF_OBJ_PIN` / `BPF_OBJ_GET`, whose group is at the end of this file.
+        for cmd in [BPF_PROG_QUERY, 9999] {
             let r = call(
                 Syscall::Bpf.raw(),
                 a2(cmd, attr.as_ptr() as u64, ATTR_LEN as u64),
@@ -2766,6 +2771,73 @@ fn put_info_u32(buf: &mut [u8; INFO_BUF], off: usize, v: u32) {
 /// Hand-encoded, and a second copy of the one in `abi_bpf_btf_tests.rs`: a
 /// fixture shared between two conformance files would let one change move both
 /// at once, which is the coupling these ABI files exist to avoid.
+// bpffs — `BPF_OBJ_PIN` (6) and `BPF_OBJ_GET` (7).
+//
+// Three things are pinned here, in rising order of importance:
+//
+//  1. the errno vocabulary, positive and negative per command;
+//  2. that `OBJ_GET` returns a *working* fd on the *same* object rather than a
+//     lookalike — proved by mutating a map through one fd and reading the
+//     mutation back through the other, and by running a program through a
+//     reopened fd;
+//  3. **lifetime** — the object survives the creating fd's close while a pin
+//     exists, and is freed when the last pin and fd go. The oracle for "is it
+//     still alive" is `BPF_MAP_GET_FD_BY_ID`, because `narf_bpf::idreg` holds
+//     `Weak`s and `Drop for BpfMap` prunes its entry: an id whose object has
+//     been dropped is `ENOENT`, one whose object lives resolves. That makes
+//     "a pin is a strong reference" an observable claim rather than a comment.
+// ════════════════════════════════════════════════════════════════════
+
+// `struct { … }` (BPF_OBJ_* commands) offsets within `union bpf_attr`.
+const OB_PATHNAME: usize = 0;
+const OB_BPF_FD: usize = 8;
+const OB_FILE_FLAGS: usize = 12;
+const OB_PATH_FD: usize = 16;
+/// `offsetofend(union bpf_attr, path_fd)` — where `CHECK_ATTR(BPF_OBJ)` starts
+/// demanding zeroes.
+const OB_END: usize = 20;
+
+const BPF_F_RDONLY_FLAG: u32 = 1 << 3;
+const BPF_F_PATH_FD: u32 = 1 << 14;
+
+/// `F_GETFD`.
+const F_GETFD: u64 = 1;
+
+/// A NUL-terminated path in a fixed buffer, so the handler's `copy_user_cstr`
+/// sees the shape a real C caller hands it.
+struct CPath([u8; 96]);
+
+impl CPath {
+    fn new(s: &str) -> Self {
+        let mut b = [0u8; 96];
+        b[..s.len()].copy_from_slice(s.as_bytes());
+        Self(b)
+    }
+    fn ptr(&self) -> u64 {
+        self.0.as_ptr() as u64
+    }
+}
+
+fn obj_attr(path_ptr: u64, bpf_fd: u32, file_flags: u32, path_fd: u32) -> [u8; ATTR_LEN] {
+    let mut a = [0u8; ATTR_LEN];
+    put_u64(&mut a, OB_PATHNAME, path_ptr);
+    put_u32(&mut a, OB_BPF_FD, bpf_fd);
+    put_u32(&mut a, OB_FILE_FLAGS, file_flags);
+    put_u32(&mut a, OB_PATH_FD, path_fd);
+    a
+}
+
+fn obj_pin(fd: i64, path: &CPath) -> Option<i64> {
+    bpf(BPF_OBJ_PIN, &obj_attr(path.ptr(), fd as u32, 0, 0))
+}
+
+fn obj_get(path: &CPath) -> Option<i64> {
+    bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 0, 0))
+}
+
+/// A minimal well-formed BTF blob — one `int` type. Copied rather than shared
+/// with `abi_bpf_btf_tests.rs`: the only use here is to obtain a BTF fd, and a
+/// shared fixture would couple two independent conformance groups.
 fn minimal_btf() -> alloc::vec::Vec<u8> {
     let mut v = alloc::vec::Vec::new();
     v.extend_from_slice(&0xeb9fu16.to_le_bytes()); // magic
@@ -3480,3 +3552,499 @@ fn smoke_bpf_syscall_link_info_xdp() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_bpf_syscall_link_info_xdp);
+/// The mount authority every bpffs test mount is created under.
+///
+/// Minted once and cached: `Cap::bootstrap()` allocates an object-table slot
+/// per call, so a per-test `bootstrap_mount_authority()` would leak one slot
+/// per smoke. `registry().mount_arc` runs `check_live()` on it at every use,
+/// which is the part that proves the grant is still valid — possession alone
+/// proves only that it was granted once.
+fn mount_authority() -> &'static Cap<MountPoint, Grant> {
+    use narf_lib::sync::IrqSafeSpinLock;
+    static SLOT: IrqSafeSpinLock<Option<&'static Cap<MountPoint, Grant>>> =
+        IrqSafeSpinLock::new(None);
+    let mut g = SLOT.lock();
+    if g.is_none() {
+        let c: &'static _ =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(bootstrap_mount_authority()));
+        *g = Some(c);
+    }
+    g.expect("just installed")
+}
+
+type MountHandle = Cap<MountPoint, narf_capabilities::Write>;
+
+/// Mount a private bpffs at `at`. Every test uses its own path and unmounts
+/// before returning, so no smoke can see another's pins.
+fn mount_bpffs(at: &str) -> Option<MountHandle> {
+    registry()
+        .mount_arc(
+            mount_authority(),
+            at,
+            alloc::sync::Arc::new(narf_filesystem::bpffs::BpfFs::new()),
+        )
+        .ok()
+}
+
+fn mount_tmpfs(at: &str) -> Option<MountHandle> {
+    registry()
+        .mount_arc(
+            mount_authority(),
+            at,
+            alloc::sync::Arc::new(MemFs::new("tmpfs")),
+        )
+        .ok()
+}
+
+/// Run `body` with a bpffs mounted at `at`, unmounting whatever the outcome.
+fn with_bpffs(
+    at: &str,
+    body: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let handle = mount_bpffs(at).ok_or("mounting bpffs failed")?;
+    let outcome = body();
+    let _ = registry().unmount(&handle, at);
+    outcome
+}
+
+// ── BPF_OBJ_PIN / BPF_OBJ_GET: positive ─────────────────────────────
+
+fn smoke_abi_bpf_obj_pin_pos() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-pin-pos";
+        with_bpffs(AT, || {
+            let fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_MAP_CREATE failed");
+            }
+            let path = CPath::new("/bpf-pin-pos/m");
+            if obj_pin(fd, &path) != Some(0) {
+                return Err("BPF_OBJ_PIN of a map into bpffs failed");
+            }
+            let reopened = obj_get(&path).ok_or("bpf() not Ok")?;
+            if reopened < 0 {
+                return Err("BPF_OBJ_GET of a live pin failed");
+            }
+            if reopened == fd {
+                return Err("BPF_OBJ_GET returned the caller's own fd, not a new one");
+            }
+            // Linux's `bpf_map_new_fd` passes `O_CLOEXEC`: a leaked bpf fd is a
+            // leaked capability, and `OBJ_GET` is a way to obtain one.
+            let flags = call(Syscall::Fcntl.raw(), a2(reopened as u64, F_GETFD, 0))
+                .ok_or("fcntl not Ok")?;
+            if flags & 1 == 0 {
+                return Err("the fd from BPF_OBJ_GET is not close-on-exec");
+            }
+
+            // The same object, not a lookalike: write through one fd and read
+            // the write back through the other. An implementation that pinned a
+            // *copy* passes every errno check above and fails here.
+            let key: u32 = 2;
+            let kptr = (&key) as *const u32 as u64;
+            let value: u64 = 0xFEED_FACE_C0DE_1234;
+            let vptr = (&value) as *const u64 as u64;
+            if elem(BPF_MAP_UPDATE_ELEM, fd, kptr, vptr, BPF_ANY) != Some(0) {
+                return Err("update through the original fd failed");
+            }
+            let mut back: u64 = 0;
+            let bptr = (&mut back) as *mut u64 as u64;
+            if elem(BPF_MAP_LOOKUP_ELEM, reopened, kptr, bptr, 0) != Some(0) {
+                return Err("lookup through the reopened fd failed");
+            }
+            if back != value {
+                return Err("the reopened fd addressed a different map");
+            }
+            // The ids agree too — the strongest single statement that one
+            // object wears both fds.
+            if map_id_of(fd)? != map_id_of(reopened)? {
+                return Err("the reopened fd reports a different map id");
+            }
+
+            let _ = call(Syscall::Close.raw(), a0(reopened as u64));
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_pin_pos);
+
+/// A program is pinnable too, and one reopened by path still *runs* — an fd
+/// that resolved to the right object but a broken image would pass every check
+/// in the map test above.
+fn smoke_abi_bpf_obj_pin_prog_pos() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-pin-prog-pos";
+        with_bpffs(AT, || {
+            let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(0x5A)).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_PROG_LOAD failed");
+            }
+            let path = CPath::new("/bpf-pin-prog-pos/p");
+            if obj_pin(fd, &path) != Some(0) {
+                return Err("BPF_OBJ_PIN of a program failed");
+            }
+            // Close the creating fd: from here the pin is the only reference.
+            if call(Syscall::Close.raw(), a0(fd as u64)) != Some(0) {
+                return Err("closing the program fd failed");
+            }
+            let reopened = obj_get(&path).ok_or("bpf() not Ok")?;
+            if reopened < 0 {
+                return Err("BPF_OBJ_GET failed after the creating fd was closed");
+            }
+            let mut attr = [0u8; ATTR_LEN];
+            put_u32(&mut attr, 0, reopened as u32);
+            if call(
+                Syscall::Bpf.raw(),
+                a2(BPF_PROG_TEST_RUN, attr.as_ptr() as u64, ATTR_LEN as u64),
+            ) != Some(0)
+            {
+                return Err("BPF_PROG_TEST_RUN on a reopened program fd failed");
+            }
+            if get_u32(&attr, 4) != 0x5A {
+                return Err("the reopened program returned the wrong value");
+            }
+            let _ = call(Syscall::Close.raw(), a0(reopened as u64));
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_pin_prog_pos);
+
+// ── BPF_OBJ_PIN: negative ───────────────────────────────────────────
+
+fn smoke_abi_bpf_obj_pin_neg() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-pin-neg";
+        const TMP: &str = "/bpf-pin-neg-tmp";
+        let tmp = mount_tmpfs(TMP).ok_or("mounting the control tmpfs failed")?;
+        let outcome = with_bpffs(AT, || {
+            let fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_MAP_CREATE failed");
+            }
+            let good = CPath::new("/bpf-pin-neg/m");
+
+            // Attribute-block shape.
+            if call(Syscall::Bpf.raw(), a2(BPF_OBJ_PIN, 0, ATTR_LEN as u64)) != Some(EINVAL) {
+                return Err("BPF_OBJ_PIN with a null attr did not return EINVAL");
+            }
+            let attr = obj_attr(good.ptr(), fd as u32, 0, 0);
+            if call(Syscall::Bpf.raw(), a2(BPF_OBJ_PIN, attr.as_ptr() as u64, 0)) != Some(EINVAL) {
+                return Err("BPF_OBJ_PIN with size 0 did not return EINVAL");
+            }
+            if call(
+                Syscall::Bpf.raw(),
+                a2(BPF_OBJ_PIN, attr.as_ptr() as u64, OB_BPF_FD as u64),
+            ) != Some(EINVAL)
+            {
+                return Err("BPF_OBJ_PIN with a truncated bpf_attr did not return EINVAL");
+            }
+
+            // The fd, checked before the path — `bpf_obj_pin_user` resolves the
+            // object first, so a caller probing with a bad fd hears about it.
+            if bpf(BPF_OBJ_PIN, &obj_attr(good.ptr(), 4095, 0, 0)) != Some(EBADF) {
+                return Err("BPF_OBJ_PIN with an unopened fd did not return EBADF");
+            }
+            let mut pipefds = [0u8; 8];
+            let _ = call(Syscall::Pipe.raw(), a0(pipefds.as_mut_ptr() as u64));
+            let readfd = u32::from_le_bytes([pipefds[0], pipefds[1], pipefds[2], pipefds[3]]);
+            if bpf(BPF_OBJ_PIN, &obj_attr(good.ptr(), readfd, 0, 0)) != Some(EINVAL) {
+                return Err("BPF_OBJ_PIN of a non-BPF fd did not return EINVAL");
+            }
+            // A BTF fd is NOT pinnable: Linux's `bpf_fd_probe_obj` tries
+            // program, map and link only, so it answers EINVAL here as well.
+            // The bar this clears is a `is_pinnable` written as "anything with
+            // an `as_any`", which every BPF fd wrapper has.
+            let blob = minimal_btf();
+            let mut btf_attr = [0u8; ATTR_LEN];
+            put_u64(&mut btf_attr, 0, blob.as_ptr() as u64);
+            put_u32(&mut btf_attr, 16, blob.len() as u32);
+            let btf = bpf(BPF_BTF_LOAD, &btf_attr).ok_or("bpf() not Ok")?;
+            if btf < 0 {
+                return Err("BPF_BTF_LOAD rejected a minimal blob");
+            }
+            if bpf(BPF_OBJ_PIN, &obj_attr(good.ptr(), btf as u32, 0, 0)) != Some(EINVAL) {
+                return Err("BPF_OBJ_PIN of a BTF fd did not return EINVAL");
+            }
+
+            // A valid fd with a null pathname faults where `getname` does.
+            if bpf(BPF_OBJ_PIN, &obj_attr(0, fd as u32, 0, 0)) != Some(EFAULT) {
+                return Err("BPF_OBJ_PIN with a null pathname did not return EFAULT");
+            }
+
+            // Flags.
+            if bpf(
+                BPF_OBJ_PIN,
+                &obj_attr(good.ptr(), fd as u32, BPF_F_RDONLY_FLAG, 0),
+            ) != Some(EINVAL)
+            {
+                return Err("BPF_OBJ_PIN accepted a flag outside its mask");
+            }
+            if bpf(
+                BPF_OBJ_PIN,
+                &obj_attr(good.ptr(), fd as u32, BPF_F_PATH_FD, 0),
+            ) != Some(EOPNOTSUPP)
+            {
+                return Err("BPF_OBJ_PIN with BPF_F_PATH_FD did not return EOPNOTSUPP");
+            }
+            if bpf(BPF_OBJ_PIN, &obj_attr(good.ptr(), fd as u32, 0, 3)) != Some(EINVAL) {
+                return Err("a path_fd without BPF_F_PATH_FD was not rejected");
+            }
+            let mut tail = obj_attr(good.ptr(), fd as u32, 0, 0);
+            tail[OB_END] = 1;
+            if bpf(BPF_OBJ_PIN, &tail) != Some(EINVAL) {
+                return Err("BPF_OBJ_PIN ignored a non-zero byte past its last field");
+            }
+
+            // Paths.
+            let missing = CPath::new("/bpf-pin-neg/no/such/dir/m");
+            if bpf(BPF_OBJ_PIN, &obj_attr(missing.ptr(), fd as u32, 0, 0)) != Some(ENOENT) {
+                return Err("BPF_OBJ_PIN under a missing directory did not return ENOENT");
+            }
+            let not_bpffs = CPath::new("/bpf-pin-neg-tmp/m");
+            if bpf(BPF_OBJ_PIN, &obj_attr(not_bpffs.ptr(), fd as u32, 0, 0)) != Some(EPERM) {
+                return Err("BPF_OBJ_PIN into a non-bpffs directory did not return EPERM");
+            }
+
+            // …and only now the happy path, so the duplicate below is the one
+            // thing in this test that can produce EEXIST.
+            if obj_pin(fd, &good) != Some(0) {
+                return Err("BPF_OBJ_PIN failed on a clean name");
+            }
+            if obj_pin(fd, &good) != Some(EEXIST) {
+                return Err("a second BPF_OBJ_PIN at a live name did not return EEXIST");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            let _ = call(Syscall::Close.raw(), a0(btf as u64));
+            Ok(())
+        });
+        let _ = registry().unmount(&tmp, TMP);
+        outcome
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_pin_neg);
+
+// ── BPF_OBJ_GET: negative ───────────────────────────────────────────
+
+fn smoke_abi_bpf_obj_get_neg() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-get-neg";
+        const TMP: &str = "/bpf-get-neg-tmp";
+        let tmp = mount_tmpfs(TMP).ok_or("mounting the control tmpfs failed")?;
+        let outcome = with_bpffs(AT, || {
+            if bpf(BPF_OBJ_GET, &[0u8; ATTR_LEN]) != Some(EFAULT) {
+                return Err("BPF_OBJ_GET with a null pathname did not return EFAULT");
+            }
+            let absent = CPath::new("/bpf-get-neg/nothing");
+            if obj_get(&absent) != Some(ENOENT) {
+                return Err("BPF_OBJ_GET of an absent name did not return ENOENT");
+            }
+            let no_parent = CPath::new("/bpf-get-neg/no/such/dir/x");
+            if obj_get(&no_parent) != Some(ENOENT) {
+                return Err("BPF_OBJ_GET under a missing directory did not return ENOENT");
+            }
+
+            // `bpf_fd` is not a field of this command; a non-zero one means the
+            // caller filled in the wrong union member.
+            let path = CPath::new("/bpf-get-neg/m");
+            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 3, 0, 0)) != Some(EINVAL) {
+                return Err("BPF_OBJ_GET with a non-zero bpf_fd did not return EINVAL");
+            }
+            // Flags: outside the mask is EINVAL, inside-but-unimplemented is
+            // EOPNOTSUPP. Collapsing the two makes feature detection guesswork.
+            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 1, 0)) != Some(EINVAL) {
+                return Err("BPF_OBJ_GET accepted a flag outside its mask");
+            }
+            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, BPF_F_RDONLY_FLAG, 0)) != Some(EOPNOTSUPP)
+            {
+                return Err("BPF_OBJ_GET with BPF_F_RDONLY did not return EOPNOTSUPP");
+            }
+            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, BPF_F_PATH_FD, 0)) != Some(EOPNOTSUPP) {
+                return Err("BPF_OBJ_GET with BPF_F_PATH_FD did not return EOPNOTSUPP");
+            }
+            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 0, 3)) != Some(EINVAL) {
+                return Err("a path_fd without BPF_F_PATH_FD was not rejected");
+            }
+            let mut tail = obj_attr(path.ptr(), 0, 0, 0);
+            tail[OB_END] = 1;
+            if bpf(BPF_OBJ_GET, &tail) != Some(EINVAL) {
+                return Err("BPF_OBJ_GET ignored a non-zero byte past its last field");
+            }
+
+            // A path that exists but is not a BPF object is EACCES, not ENOENT
+            // — Linux's `bpf_inode_type`. Both halves matter: a loader probing
+            // for a pin has to tell "no such path" from "that is not a pin".
+            let tmp_missing = CPath::new("/bpf-get-neg-tmp/absent");
+            if obj_get(&tmp_missing) != Some(ENOENT) {
+                return Err("BPF_OBJ_GET of an absent non-bpffs path was not ENOENT");
+            }
+            let tmp_file = CPath::new("/bpf-get-neg-tmp/plain");
+            let created = call_creat(tmp_file.ptr(), 0o644).ok_or("creat not Ok")?;
+            if created < 0 {
+                return Err("could not create a control file on tmpfs");
+            }
+            let _ = call(Syscall::Close.raw(), a0(created as u64));
+            if obj_get(&tmp_file) != Some(EACCES) {
+                return Err("BPF_OBJ_GET of a plain file did not return EACCES");
+            }
+
+            // A bpffs *directory* is present but is not an object either.
+            let sub = CPath::new("/bpf-get-neg/dir");
+            if call_mkdir(sub.ptr(), 0o755) != Some(0) {
+                return Err("mkdir inside bpffs failed");
+            }
+            if obj_get(&sub) != Some(EACCES) {
+                return Err("BPF_OBJ_GET of a bpffs directory did not return EACCES");
+            }
+            Ok(())
+        });
+        let _ = registry().unmount(&tmp, TMP);
+        outcome
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_neg);
+
+// ════════════════════════════════════════════════════════════════════
+// The lifetime contract, in the `bpf` subsystem.
+//
+//   pin, then close every fd     → still alive   (the pin is a STRONG ref)
+//   unlink the pin, no fd open   → gone          (and the pin was the last)
+//
+// A pin holding a `Weak` fails the first; a pin that never dropped fails the
+// second. `BPF_MAP_GET_FD_BY_ID` is the only oracle either assertion consults,
+// and it answers from `idreg`'s `Weak` table, so neither can pass for another
+// reason.
+// ════════════════════════════════════════════════════════════════════
+
+fn smoke_bpf_obj_pin_outlives_its_fd() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-pin-life";
+        with_bpffs(AT, || {
+            let fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_MAP_CREATE failed");
+            }
+            let id = map_id_of(fd)?;
+            let path = CPath::new("/bpf-pin-life/m");
+            if obj_pin(fd, &path) != Some(0) {
+                return Err("BPF_OBJ_PIN failed");
+            }
+
+            // Close the creating fd. The pin is now the *only* reference.
+            if call(Syscall::Close.raw(), a0(fd as u64)) != Some(0) {
+                return Err("closing the map fd failed");
+            }
+            let by_id = fd_by_id(BPF_MAP_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+            if by_id < 0 {
+                return Err("the pinned map died when its creating fd closed");
+            }
+            if call(Syscall::Close.raw(), a0(by_id as u64)) != Some(0) {
+                return Err("closing the by-id fd failed");
+            }
+            // Zero fds, one pin: still alive.
+            let again = fd_by_id(BPF_MAP_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+            if again < 0 {
+                return Err("the pinned map died with no fd open");
+            }
+            let _ = call(Syscall::Close.raw(), a0(again as u64));
+            // …and reachable BY PATH, not merely alive.
+            let reopened = obj_get(&path).ok_or("bpf() not Ok")?;
+            if reopened < 0 {
+                return Err("BPF_OBJ_GET failed with only the pin holding the map");
+            }
+            let _ = call(Syscall::Close.raw(), a0(reopened as u64));
+
+            // Removing the pin removes the last reference.
+            if call_unlink(path.ptr()) != Some(0) {
+                return Err("unlinking the pin failed");
+            }
+            if fd_by_id(BPF_MAP_GET_FD_BY_ID, id) != Some(ENOENT) {
+                return Err("the map outlived its last pin — the reference leaked");
+            }
+            if obj_get(&path) != Some(ENOENT) {
+                return Err("the unlinked path still resolves");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_obj_pin_outlives_its_fd);
+
+/// The other end of the same contract: an fd from `BPF_OBJ_GET` is a full
+/// reference in its own right, so unlinking the pin while it is open does not
+/// free the object — and closing it afterwards does.
+fn smoke_bpf_obj_get_fd_is_a_real_reference() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-get-life";
+        with_bpffs(AT, || {
+            let fd = create_map(BPF_MAP_TYPE_HASH, 4, 8, 4).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_MAP_CREATE failed");
+            }
+            let id = map_id_of(fd)?;
+            let path = CPath::new("/bpf-get-life/m");
+            if obj_pin(fd, &path) != Some(0) {
+                return Err("BPF_OBJ_PIN failed");
+            }
+            let reopened = obj_get(&path).ok_or("bpf() not Ok")?;
+            if reopened < 0 {
+                return Err("BPF_OBJ_GET failed");
+            }
+            if call(Syscall::Close.raw(), a0(fd as u64)) != Some(0) {
+                return Err("closing the creating fd failed");
+            }
+            // Pin gone, one OBJ_GET fd left: the object must survive.
+            if call_unlink(path.ptr()) != Some(0) {
+                return Err("unlinking the pin failed");
+            }
+            let still = fd_by_id(BPF_MAP_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+            if still < 0 {
+                return Err("unlinking the pin freed a map an open fd still held");
+            }
+            if call(Syscall::Close.raw(), a0(still as u64)) != Some(0) {
+                return Err("closing the by-id fd failed");
+            }
+            // Now the last holder goes.
+            if call(Syscall::Close.raw(), a0(reopened as u64)) != Some(0) {
+                return Err("closing the reopened fd failed");
+            }
+            if fd_by_id(BPF_MAP_GET_FD_BY_ID, id) != Some(ENOENT) {
+                return Err("the map outlived every pin and fd");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_obj_get_fd_is_a_real_reference);
+
+/// Unmounting a bpffs drops every pin it held — otherwise a mount/umount cycle
+/// would strand objects for the boot with no path left to reach them by.
+fn smoke_bpf_unmounting_bpffs_drops_its_pins() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-unmount-life";
+        let fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let id = map_id_of(fd)?;
+        let handle = mount_bpffs(AT).ok_or("mounting bpffs failed")?;
+        let path = CPath::new("/bpf-unmount-life/m");
+        let pinned = obj_pin(fd, &path);
+        let closed = call(Syscall::Close.raw(), a0(fd as u64));
+        let unmounted = registry().unmount(&handle, AT);
+        if pinned != Some(0) {
+            return Err("BPF_OBJ_PIN failed");
+        }
+        if closed != Some(0) {
+            return Err("closing the map fd failed");
+        }
+        if unmounted.is_err() {
+            return Err("unmounting bpffs failed");
+        }
+        if fd_by_id(BPF_MAP_GET_FD_BY_ID, id) != Some(ENOENT) {
+            return Err("unmounting bpffs stranded its pinned objects");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_unmounting_bpffs_drops_its_pins);
