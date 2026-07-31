@@ -229,25 +229,43 @@ pub struct Shrinker {
     pub scan: fn(usize) -> usize,
 }
 
-static SHRINKERS: IrqSafeSpinLock<Vec<Shrinker>> = IrqSafeSpinLock::new(Vec::new());
+/// Max concurrently-registered shrinkers. A fixed array (not a `Vec`)
+/// keeps the whole registry — registration AND reclaim — allocation-free
+/// so `shrink_all` is safe to call from the allocation-failure / OOM
+/// path, where allocating (as a `Vec` snapshot would) is exactly what
+/// must not happen. The kernel has a handful of caches; 16 is ample.
+const MAX_SHRINKERS: usize = 16;
+
+static SHRINKERS: IrqSafeSpinLock<[Option<Shrinker>; MAX_SHRINKERS]> =
+    IrqSafeSpinLock::new([None; MAX_SHRINKERS]);
 
 /// Register a shrinker. Idempotent by name — re-registering the same
 /// name replaces the entry rather than duplicating it, so a subsystem
-/// that re-initialises doesn't get scanned twice.
+/// that re-initialises doesn't get scanned twice. Silently ignored if
+/// the fixed registry is full (raise `MAX_SHRINKERS` if that ever bites).
 pub fn register_shrinker(s: Shrinker) {
     let mut g = SHRINKERS.lock();
-    if let Some(slot) = g.iter_mut().find(|e| e.name == s.name) {
-        *slot = s;
-    } else {
-        g.push(s);
+    // Replace a same-named entry if present.
+    for slot in g.iter_mut() {
+        if matches!(slot, Some(e) if e.name == s.name) {
+            *slot = Some(s);
+            return;
+        }
+    }
+    // Otherwise take the first empty slot.
+    for slot in g.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(s);
+            return;
+        }
     }
 }
 
 /// Total reclaimable objects across all registered shrinkers.
 pub fn shrinkable_objects() -> usize {
-    SHRINKERS
-        .lock()
-        .iter()
+    let snap = *SHRINKERS.lock();
+    snap.iter()
+        .flatten()
         .map(|s| (s.count)())
         .fold(0usize, |a, c| a.saturating_add(c))
 }
@@ -257,24 +275,26 @@ pub fn shrinkable_objects() -> usize {
 /// proportional-pressure model). Returns the total number of objects
 /// actually freed (which may exceed or fall short of `target`).
 ///
-/// A snapshot of `{name, count}` is taken under the lock, then the lock
-/// is dropped before invoking any `scan` — a shrinker's `scan` may take
-/// its own locks (or, in future, block), and must never run while the
-/// registry lock is held.
+/// Allocation-free: the registry array is copied out under the lock
+/// (it is `Copy`), then the lock is dropped before invoking any `scan`
+/// — a shrinker's `scan` may take its own locks, and must never run
+/// while the registry lock is held. This is why the whole path avoids
+/// `Vec`: `shrink_all` is callable from the allocation-failure path.
 pub fn shrink_all(target: usize) -> usize {
     if target == 0 {
         return 0;
     }
-    let snapshot: Vec<Shrinker> = SHRINKERS.lock().iter().copied().collect();
-    let total: usize = snapshot
+    let snap = *SHRINKERS.lock();
+    let total: usize = snap
         .iter()
+        .flatten()
         .map(|s| (s.count)())
         .fold(0usize, |a, c| a.saturating_add(c));
     if total == 0 {
         return 0;
     }
     let mut freed = 0usize;
-    for s in &snapshot {
+    for s in snap.iter().flatten() {
         if freed >= target {
             break;
         }
@@ -294,7 +314,7 @@ pub fn shrink_all(target: usize) -> usize {
 /// leaks into another test's `shrink_all`.
 #[doc(hidden)]
 pub fn __reset_shrinkers_for_test() {
-    SHRINKERS.lock().clear();
+    *SHRINKERS.lock() = [None; MAX_SHRINKERS];
 }
 
 /// Watermark-math tests. Always compiled (not `#[cfg(test)]`) so they
