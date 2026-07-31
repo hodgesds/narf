@@ -119,7 +119,7 @@ enum Cmd {
     /// either binary regresses. x86_64 only — `hello_musl` is a
     /// stock-musl-built ELF that requires `int 0x80` / `syscall`
     /// dual dispatch + CR4.OSFXSR.
-    MuslDemo(BuildArgs),
+    MuslDemo(MuslDemoArgs),
     /// BPF microbenchmark suite under the `verification/` §8 statistical
     /// protocol. Boots the kernel with `narf-bpf/bench` + the `bpf_bench`
     /// cmdline flag, harvests the raw samples the in-kernel harness emits,
@@ -418,6 +418,32 @@ struct RunInteractiveArgs {
     /// uploads it, and each case job boots the downloaded artifact — no N×
     /// rebuilds. When set, `--features`/`--package` are ignored (the
     /// prebuilt image already baked them in).
+    #[arg(long, value_name = "PATH")]
+    prebuilt: Option<String>,
+}
+
+/// Args for `xtask musl-demo`. Inherits BuildArgs; adds subsystem-group
+/// sharding (`--group`/`--list-groups`) and prebuilt-kernel boot so CI can
+/// build once and fan the cases out across a handful of parallel jobs by
+/// subsystem rather than one slow ~80-case boot.
+#[derive(Parser, Clone)]
+struct MuslDemoArgs {
+    #[command(flatten)]
+    build: BuildArgs,
+
+    /// Run only the cases in this subsystem group (see `--list-groups`).
+    /// Omitted ⇒ run every group in this invocation (the local full run).
+    #[arg(long)]
+    group: Option<String>,
+
+    /// Print the JSON array of subsystem groups (the CI matrix consumes
+    /// this) and exit without booting.
+    #[arg(long)]
+    list_groups: bool,
+
+    /// Boot this already-built kernel instead of cross-building. The
+    /// per-group CI jobs download the artifact the build job produced and
+    /// boot it, so no group re-compiles the kernel.
     #[arg(long, value_name = "PATH")]
     prebuilt: Option<String>,
 }
@@ -2100,16 +2126,105 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
 /// x86_64 only: `hello_musl` is a stock musl-built ELF and the
 /// CR4.OSFXSR / arch_prctl / int 0x80-vs-syscall plumbing is all
 /// x86-specific; the aarch64 mirror is a separate sub-wave.
-fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
-    if !matches!(args.arch, Arch::X86_64) {
+/// Bucket a musl-demo case into a coarse subsystem group, so CI can fan
+/// the ~80 cases out across a handful of parallel jobs by subsystem
+/// (`--group`) rather than one long serial boot. This is a total function
+/// — every case maps to exactly one group, so the union of all groups is
+/// the whole suite regardless of how a given case is bucketed (an
+/// imprecise match only shifts load, never drops coverage). First match
+/// wins; order matters.
+fn musl_case_group(cmd: &str) -> &'static str {
+    let has = |needles: &[&str]| needles.iter().any(|n| cmd.contains(n));
+    if has(&[
+        "wl_",
+        "mini_compositor",
+        "drm_smoke",
+        "modetest",
+        "fb_smoke",
+        "kms",
+        "tfd_epoll",
+    ]) {
+        "gui"
+    } else if has(&[
+        "net_smoke",
+        "net6",
+        "unix_smoke",
+        "epoll_smoke",
+        "sockpair",
+        "accept4",
+        "mmsg",
+        "ppoll_smoke",
+        "scm_smoke",
+    ]) {
+        "net"
+    } else if has(&["sig", "alarmloop", "preemptsched"]) {
+        "signals"
+    } else if has(&[
+        "futex",
+        "cond",
+        "barrier",
+        "robust",
+        "notify_epoll",
+        "sysvipc",
+        "shm_smoke",
+        "eventfd",
+        "keyring",
+    ]) {
+        "ipc"
+    } else if has(&[
+        "fs_smoke",
+        "navfs",
+        "relpaths",
+        "pipeof",
+        "pipeblk",
+        "xattr",
+        "renameat2",
+        "mountapi",
+        "fhandle",
+        "inotify",
+        "fanotify",
+        "splice",
+        "sendfile",
+        "sync_smoke",
+        "fsmisc",
+        "landlock",
+        "lsm",
+    ]) {
+        "fs"
+    } else if has(&["mremap", "mcore", "mem2", "mempolicy", "pkey", "pvm"]) {
+        "mem"
+    } else if has(&[
+        "hello",
+        "busybox",
+        "fork",
+        "sh -c",
+        "pty",
+        "jobctl",
+        "creds",
+        "waitid",
+        "pidfd",
+        "strace",
+        "sched",
+        "closerange",
+        "dup3",
+        "fd_cloexec",
+        "oci",
+    ]) {
+        "process"
+    } else {
+        "linux-compat"
+    }
+}
+
+fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
+    if !matches!(args.build.arch, Arch::X86_64) {
         bail!("musl-demo is x86_64 only (hello_musl is not built for aarch64)");
     }
 
-    // Two `run-interactive` invocations, sharing the same build
-    // args. The boot itself is the slow part (~30-60s on CI); each
-    // invocation re-builds nothing because Cargo's incremental build
-    // is warm after the first.
-    let cases: &[(&str, &str)] = &[
+    // Lightweight cases run in a SINGLE shared boot (the TCG boot dwarfs
+    // per-command runtime, so amortizing across commands is the win). The
+    // heavy GUI cases each need their own fresh boot (see GUI_FRESH_BOOT).
+    let lightweight: &[(&str, &str)] = &[
         ("hello", "hello"),
         ("hello_musl", "hello from musl"),
         ("hello_musl_dyn", "hello from musl dyn"),
@@ -2367,40 +2482,12 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // per-DSO TLS: thread-locals in a shared library (libtls).
         ("tls_smoke", "tls-ok"),
     ];
-    // Run every case in a SINGLE QEMU boot rather than one boot per
-    // command — the TCG boot (especially on CI) dwarfs the per-command
-    // runtime, so amortizing it across all commands is the big win.
-    // The VM keeps its full multi-vCPU/NUMA topology so concurrency
-    // bugs still surface.
-    let (mut passed, mut failed, main_failed) = run_interactive_multi(args, cases)?;
-
-    // Retry any shared-boot case that failed once, alone in a fresh boot: a
-    // genuinely-broken case still fails (it fails both times and stays
-    // counted), but a one-off environmental flake (host scheduling jitter
-    // on a loaded runner, SLIRP timing) clears. The SMP scheduler-resume
-    // strand class this retry originally absorbed is fixed (FUTEX_REQUEUE +
-    // park-loop futex-word re-validation + spawn→idle-AP resched kick); the
-    // retry is kept as a cheap general flake bound for the long shared-boot
-    // batch.
-    for (cmdline, expect) in &main_failed {
-        eprintln!("\nmusl-demo (retry after strand): {cmdline}");
-        let (p, _f, _) = run_interactive_multi(
-            args,
-            core::slice::from_ref(&(cmdline.as_str(), expect.as_str())),
-        )?;
-        if p > 0 {
-            // Cleared on the isolated retry → reclassify as a pass.
-            passed += 1;
-            failed -= 1;
-        }
-    }
 
     // Heavy multi-process Wayland compositor cases — each forks a compositor
     // + client(s) and maps the framebuffer. That per-process state accumulates
     // across a single long-lived VM and makes a later case hang
     // nondeterministically, so each gets its OWN fresh boot. They pass
-    // reliably in isolation. The TCG boot is amortized for the ~80 lightweight
-    // cases above; these few extra boots are the price of robust GUI coverage.
+    // reliably in isolation.
     const GUI_FRESH_BOOT: &[(&str, &str)] = &[
         ("mini_compositor", "px=00c0ffee"),
         ("wl_2proc", "2proc-ok 1280x800 px=00c0ffee"),
@@ -2414,20 +2501,92 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("wl_evdev", "evdev-ok 1280x800 key=30"),
         ("wl_app", "app-ok 1280x800 win=250x250"),
     ];
-    for case in GUI_FRESH_BOOT {
+
+    // `--list-groups`: emit the distinct subsystem groups over ALL cases so
+    // the CI matrix runs exactly the non-empty groups (no drift, no gaps).
+    if args.list_groups {
+        let mut groups: Vec<&str> = lightweight
+            .iter()
+            .chain(GUI_FRESH_BOOT.iter())
+            .map(|(cmd, _)| musl_case_group(cmd))
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let json = groups
+            .iter()
+            .map(|g| format!("{g:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("[{json}]");
+        return Ok(());
+    }
+
+    // Resolve the kernel once: a prebuilt artifact (the per-group CI jobs
+    // boot the same downloaded image) or a fresh build (run_interactive_multi
+    // builds on the first call, warm-incremental after).
+    let prebuilt: Option<PathBuf> = match &args.prebuilt {
+        Some(p) => {
+            let k = PathBuf::from(p);
+            if !k.exists() {
+                bail!("--prebuilt kernel not found at {}", k.display());
+            }
+            Some(k)
+        }
+        None => None,
+    };
+    let kernel_override = prebuilt.as_deref();
+
+    // Select this invocation's group (or all groups when unset).
+    let want = |cmd: &str| {
+        args.group
+            .as_deref()
+            .is_none_or(|g| musl_case_group(cmd) == g)
+    };
+    if let Some(g) = &args.group {
+        eprintln!("xtask musl-demo: running subsystem group `{g}`");
+    }
+
+    // Lightweight cases in this group → one shared boot.
+    let selected: Vec<(&str, &str)> = lightweight.iter().copied().filter(|t| want(t.0)).collect();
+    let (mut passed, mut failed, main_failed) = if selected.is_empty() {
+        (0usize, 0usize, Vec::new())
+    } else {
+        run_interactive_multi(&args.build, &selected, kernel_override)?
+    };
+
+    // Retry any shared-boot case that failed once, alone in a fresh boot: a
+    // genuinely-broken case still fails (and stays counted), but a one-off
+    // environmental flake (host scheduling jitter on a loaded runner, SLIRP
+    // timing) clears.
+    for (cmdline, expect) in &main_failed {
+        eprintln!("\nmusl-demo (retry): {cmdline}");
+        let (p, _f, _) = run_interactive_multi(
+            &args.build,
+            core::slice::from_ref(&(cmdline.as_str(), expect.as_str())),
+            kernel_override,
+        )?;
+        if p > 0 {
+            // Cleared on the isolated retry → reclassify as a pass.
+            passed += 1;
+            failed -= 1;
+        }
+    }
+
+    // GUI cases in this group → one fresh boot each.
+    for case in GUI_FRESH_BOOT.iter().filter(|t| want(t.0)) {
         eprintln!("\nmusl-demo (fresh boot): {}", case.0);
-        let (p, f, _) = run_interactive_multi(args, core::slice::from_ref(case))?;
+        let (p, f, _) =
+            run_interactive_multi(&args.build, core::slice::from_ref(case), kernel_override)?;
         passed += p;
         failed += f;
     }
 
-    // (The former SMP_REDUCED_FRESH_BOOT SMP=1 pin for `futex_contend_smoke`
-    // is retired: the SMP scheduler-resume strand class it worked around is
-    // fixed — FUTEX_REQUEUE implemented, park-loop futex-word re-validation,
-    // spawn→idle-AP resched kick — and the case now runs in the shared-boot
-    // batch above at the full 16-vCPU/2-socket-NUMA topology.)
-
-    eprintln!("\nmusl-demo summary: {} passed, {} failed", passed, failed);
+    eprintln!(
+        "\nmusl-demo summary ({}): {} passed, {} failed",
+        args.group.as_deref().unwrap_or("all"),
+        passed,
+        failed
+    );
     if failed > 0 {
         bail!("musl-demo failed ({} errors)", failed);
     }
@@ -5001,6 +5160,7 @@ fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
 fn run_interactive_multi(
     build_in: &BuildArgs,
     cases: &[(&str, &str)],
+    kernel_override: Option<&Path>,
 ) -> Result<(usize, usize, Vec<(String, String)>)> {
     use std::io::{Read, Write};
     use std::sync::mpsc::{self, RecvTimeoutError};
@@ -5011,18 +5171,30 @@ fn run_interactive_multi(
     }
 
     let mut build = build_in.clone();
-    ensure_feature(&mut build.features, "boot-init");
-    ensure_feature(&mut build.features, "firmware-allow-unsigned");
-
-    let root = workspace_root()?;
-    let out_dir = cargo_build(&build, &root)?;
-    let kernel = out_dir.join(&build.package);
-    if !kernel.exists() {
-        bail!(
-            "expected kernel binary at {} — did `cargo build` succeed?",
-            kernel.display()
-        );
-    }
+    // A prebuilt kernel (the sharded musl-demo CI jobs download one and
+    // boot it) skips the cross-build entirely.
+    let kernel = match kernel_override {
+        Some(k) => {
+            if !k.exists() {
+                bail!("--prebuilt kernel not found at {}", k.display());
+            }
+            k.to_path_buf()
+        }
+        None => {
+            ensure_feature(&mut build.features, "boot-init");
+            ensure_feature(&mut build.features, "firmware-allow-unsigned");
+            let root = workspace_root()?;
+            let out_dir = cargo_build(&build, &root)?;
+            let kernel = out_dir.join(&build.package);
+            if !kernel.exists() {
+                bail!(
+                    "expected kernel binary at {} — did `cargo build` succeed?",
+                    kernel.display()
+                );
+            }
+            kernel
+        }
+    };
 
     let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
