@@ -440,6 +440,18 @@ published until derived from the detected PMU. `narf_trace` publishes Linux
 tracepoint type 2 and a 64-bit `id` config field for authoritative typed-event
 or dynamic-probe IDs.
 
+Procfs advertises the Linux filesystem type `proc`. Its magic links
+(`/proc/self`, `/proc/thread-self`, and per-task `exe`, `cwd`, `root`, `fd`,
+and namespace links) report symlink mode with `st_size == 0`, matching Linux;
+callers must use `readlink(2)` rather than infer a target length from stat
+metadata. `/proc/filesystems` uses the `nodev NAME` form for synthetic
+filesystems. `/proc/uptime` reports aggregate idle time across CPUs, and
+per-task status memory fields are derived from VMA extents and resident page
+counts. Procfs values that have no authoritative NARF provider remain absent
+or explicitly documented placeholders rather than fabricated measurements.
+The supported surface and known partial projections are tracked in
+`filesystem/PROCFS_LINUX_COMPAT_AUDIT.md`.
+
 ## 4. Invariants & safety properties
 
 - **No ambient root.** A task that holds no `Cap<FileNode, _>` can

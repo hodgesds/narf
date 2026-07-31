@@ -193,6 +193,10 @@ contract.
 The procfs task snapshot includes both base-page and hardware huge-page
 regions with effective policy and per-node residency for
 `/proc/<pid>/numa_maps`.
+Linux `readlink(2)` and `readlinkat(2)` size their kernel staging read from
+the caller's `bufsiz`; they never treat `st_size` as the target length.
+This is required for procfs magic links, whose Linux-compatible stat metadata
+has a zero size even when `readlink` returns a non-empty target.
 Sysfs exposes Linux memory blocks under `/sys/devices/system/memory/memoryN`
 and each block's `nodeN/memoryN` membership from allocator RAM ranges
 classified by SRAT; CPU topology is never used to infer memory membership.

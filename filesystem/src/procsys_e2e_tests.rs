@@ -820,10 +820,8 @@ kernel_test_in!("procsys_e2e/global", e2e_global_loadavg_five_field_shape);
 
 // ── /proc/filesystems ────────────────────────────────────────────────────────
 
-/// `/proc/filesystems` lists the mounted fs-type tokens; `proc` and `tmpfs`
-/// (both mounted in a booted NARF) must appear. Bare `mount` scans this for
-/// the fs-type token. NARF omits the Linux "nodev" prefix, so each line is a
-/// tab followed by the bare type name.
+/// `/proc/filesystems` lists registered fs-type tokens and uses Linux's
+/// `nodev` prefix for filesystems that do not require a block device.
 #[cfg(feature = "linux-compat")]
 fn e2e_global_filesystems_lists_known_types() -> TestResult {
     let body = match read_root_file("filesystems") {
@@ -833,17 +831,26 @@ fn e2e_global_filesystems_lists_known_types() -> TestResult {
     // The set of type tokens is the trailing token of each line.
     let has = |ty: &str| {
         body.lines()
-            .any(|l| l.split_whitespace().next() == Some(ty))
+            .any(|l| l.split_whitespace().last() == Some(ty))
     };
     // procfs is always mounted (we are reading it), so "proc" must be present.
     if !has("proc") {
         return TestResult::Fail("/proc/filesystems missing 'proc' type");
     }
-    // Every rendered line must be a single non-empty type token.
+    if !body
+        .lines()
+        .any(|line| line.split_whitespace().eq(["nodev", "proc"]))
+    {
+        return TestResult::Fail("/proc/filesystems must mark proc as nodev");
+    }
+    // Every line is either "<type>" or "nodev <type>".
     for l in body.lines() {
         let toks: Vec<&str> = l.split_whitespace().collect();
-        if toks.len() != 1 || toks[0].is_empty() {
-            return TestResult::Fail("/proc/filesystems line is not a single type token");
+        if toks.is_empty()
+            || toks.len() > 2
+            || (toks.len() == 2 && toks.first().copied() != Some("nodev"))
+        {
+            return TestResult::Fail("/proc/filesystems line has a non-Linux shape");
         }
     }
     TestResult::Pass
@@ -865,6 +872,7 @@ fn e2e_global_mounts_six_column_shape() -> TestResult {
         None => return TestResult::Fail("/proc/mounts did not resolve/read"),
     };
     let mut lines = 0usize;
+    let mut saw_proc_mount = false;
     for l in body.lines() {
         if l.is_empty() {
             continue;
@@ -878,9 +886,15 @@ fn e2e_global_mounts_six_column_shape() -> TestResult {
         if cols[4] != "0" || cols[5] != "0" {
             return TestResult::Fail("/proc/mounts trailing columns are not '0 0'");
         }
+        if cols[1] == "/proc" && cols[2] == "proc" {
+            saw_proc_mount = true;
+        }
     }
     if lines == 0 {
         return TestResult::Fail("/proc/mounts rendered no mount lines");
+    }
+    if !saw_proc_mount {
+        return TestResult::Fail("/proc mount must advertise fstype 'proc'");
     }
     TestResult::Pass
 }
@@ -973,9 +987,10 @@ fn e2e_global_self_is_symlink_to_pid() -> TestResult {
         Some(f) => f,
         None => return TestResult::Fail("/proc/self did not resolve"),
     };
-    // Must stat as a symlink so readlink(2)/lstat(2) treat it correctly.
-    if f.stat().mode.file_type != FileType::Symlink {
-        return TestResult::Fail("/proc/self is not a Symlink");
+    // Linux procfs magic links are symlinks with a zero st_size hint.
+    let st = f.stat();
+    if st.mode.file_type != FileType::Symlink || st.size != 0 {
+        return TestResult::Fail("/proc/self is not a zero-size Symlink");
     }
     // readlink target is the caller pid as decimal.
     let expected = crate::procfs::current_pid().to_string();

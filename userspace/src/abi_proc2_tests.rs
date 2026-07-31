@@ -1071,6 +1071,22 @@ fn smoke_abi_proc2_proc_self_is_caller() -> TestResult {
         if pid_field != alloc::format!("{}", FAKE_TASK) {
             return Err("/proc/self/stat pid field is not the caller's pid");
         }
+        // Linux procfs magic links report st_size == 0. readlink must still
+        // use the caller's buffer and return the complete target.
+        let self_path = alloc::format!("{}/self\0", base);
+        let mut link_buf = [0u8; 32];
+        let link_len = call_readlink(
+            self_path.as_ptr() as u64,
+            link_buf.as_mut_ptr() as u64,
+            link_buf.len() as u64,
+        );
+        let link_len = match link_len {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("readlink of zero-size /proc/self failed"),
+        };
+        if &link_buf[..link_len] != alloc::format!("{}", FAKE_TASK).as_bytes() {
+            return Err("/proc/self readlink target is not the caller's pid");
+        }
         Ok(())
     })
 }

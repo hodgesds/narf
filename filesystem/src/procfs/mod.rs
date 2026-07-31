@@ -849,9 +849,10 @@ impl FileOps for ProcSelfSymlink {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
     fn stat(&self) -> Stat {
-        let pid = current_pid();
         Stat {
-            size: pid.to_string().len() as u64,
+            // Linux procfs magic symlinks report st_size == 0. readlink(2)
+            // must use its caller-provided buffer rather than this hint.
+            size: 0,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Symlink,
@@ -904,12 +905,9 @@ impl FileOps for ProcThreadSelf {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
     fn stat(&self) -> Stat {
-        // size MUST equal the readlink target length — sys_readlink sizes
-        // its staging buffer from st.size, so 0 returns an empty string
-        // (the same trap the per-pid `root` link hit).
-        let pid = current_pid();
         Stat {
-            size: format!("{}/task/{}", pid, pid).len() as u64,
+            // Linux procfs magic symlinks report st_size == 0.
+            size: 0,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Symlink,
@@ -1725,12 +1723,16 @@ impl DirOps for ProcRoot {
                 file_type: FileType::File
             },
             DirEntry {
+                name: "stat",
+                file_type: FileType::File
+            },
+            DirEntry {
                 name: "pressure",
                 file_type: FileType::Dir
             },
             DirEntry {
                 name: "self",
-                file_type: FileType::Dir
+                file_type: FileType::Symlink
             },
             DirEntry {
                 name: "thread-self",
@@ -1870,7 +1872,9 @@ impl FsInstance for ProcFs {
         Arc::new(ProcRoot)
     }
     fn name(&self) -> &str {
-        "procfs"
+        // Linux exposes "proc" as the filesystem type in mountinfo,
+        // /proc/mounts, and statfs-facing tooling.
+        "proc"
     }
 }
 
@@ -2073,7 +2077,10 @@ fn gen_loadavg() -> String {
     // renders 0/T), and a momentarily all-contended try_lock sample
     // would otherwise show 0.
     let running = narf_scheduler::runnable_task_count().max(1);
-    let last_pid = total;
+    // Linux reports the most recently allocated PID, not the live-task
+    // count. NARF does not yet retain a high-water mark, so the greatest
+    // currently visible PID is the closest non-fabricated approximation.
+    let last_pid = list_pids().into_iter().max().unwrap_or(0);
     format!(
         "{}.{:02} {}.{:02} {}.{:02} {}/{} {}\n",
         i1, f1, i5, f5, i15, f15, running, total, last_pid
@@ -2084,10 +2091,6 @@ fn gen_filesystems() -> String {
     use alloc::collections::BTreeSet;
     use core::fmt::Write as _;
     // Distinct fs.name() values from currently-mounted instances.
-    // Linux's /proc/filesystems prefixes "nodev" for FS types that
-    // can't back a block device; our mount surface doesn't track
-    // that today, so omit the prefix — bare `mount` (no -t) only
-    // checks for the FS-type token.
     let mut names: BTreeSet<String> = crate::registry()
         .list_with_names()
         .into_iter()
@@ -2099,9 +2102,14 @@ fn gen_filesystems() -> String {
     for n in ["sysfs", "proc", "devtmpfs", "devpts", "tmpfs", "9p"] {
         names.insert(String::from(n));
     }
+    let nodev = ["sysfs", "proc", "devtmpfs", "devpts", "tmpfs", "9p"];
     let mut s = String::new();
     for n in names {
-        let _ = writeln!(s, "\t{}", n);
+        if nodev.contains(&n.as_str()) {
+            let _ = writeln!(s, "nodev\t{}", n);
+        } else {
+            let _ = writeln!(s, "\t{}", n);
+        }
     }
     s
 }
@@ -2112,6 +2120,8 @@ fn gen_filesystems() -> String {
 /// (the TCG system is mostly idle); the structure is what tools parse.
 fn gen_stat() -> String {
     use core::fmt::Write as _;
+    use narf_interrupts::snapshot_counters;
+
     let mut s = String::new();
     let up_ns = narf_time::monotonic_ns();
     // USER_HZ = 100 → jiffies are centiseconds.
@@ -2135,7 +2145,17 @@ fn gen_stat() -> String {
     }
     let _ = writeln!(s, "cpu  {} 0 0 {} 0 0 0 0 0 0", busy_sum, idle_sum);
     s.push_str(&cpu_lines);
-    let _ = writeln!(s, "intr 0");
+    let irq_snapshots = snapshot_counters();
+    let total_intr: u64 = irq_snapshots.iter().map(|snapshot| snapshot.total).sum();
+    let mut per_vector = [0u64; 256];
+    for snapshot in irq_snapshots {
+        per_vector[snapshot.vector as usize] = snapshot.total;
+    }
+    let _ = write!(s, "intr {}", total_intr);
+    for count in per_vector {
+        let _ = write!(s, " {}", count);
+    }
+    s.push('\n');
     let _ = writeln!(s, "ctxt 0");
     // btime = wall-now minus uptime (UNIX seconds the system booted).
     let btime = (narf_time::now_wall().secs as u64).saturating_sub(up_ns / 1_000_000_000);
@@ -2145,6 +2165,8 @@ fn gen_stat() -> String {
     let running: usize = depths.iter().map(|(_, n)| *n).sum();
     let _ = writeln!(s, "procs_running {}", running.max(1));
     let _ = writeln!(s, "procs_blocked 0");
+    // HI TIMER NET_TX NET_RX BLOCK IRQ_POLL TASKLET SCHED HRTIMER RCU.
+    let _ = writeln!(s, "softirq 0 0 0 0 0 0 0 0 0 0 0");
     s
 }
 
@@ -2183,7 +2205,18 @@ fn gen_uptime() -> String {
     let now_ns = narf_time::monotonic_ns();
     let seconds = now_ns / 1_000_000_000;
     let frac_centi = (now_ns / 10_000_000) % 100;
-    format!("{}.{:02} 0.00\n", seconds, frac_centi)
+    // Linux's second field is the combined idle time of all CPUs, so it
+    // legitimately grows faster than wall uptime on SMP systems.
+    let idle_ns: u64 = narf_scheduler::cpu_queue_depths()
+        .iter()
+        .map(|(cpu, _)| narf_scheduler::cpu_idle_ns(*cpu as usize))
+        .sum();
+    let idle_seconds = idle_ns / 1_000_000_000;
+    let idle_frac_centi = (idle_ns / 10_000_000) % 100;
+    format!(
+        "{}.{:02} {}.{:02}\n",
+        seconds, frac_centi, idle_seconds, idle_frac_centi
+    )
 }
 
 fn gen_version() -> String {
@@ -2269,26 +2302,37 @@ fn render_status(info: &ProcTaskInfo) -> String {
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSpid:\t{}\n", info.pid));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSpgid:\t{}\n", info.pgrp));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSsid:\t{}\n", info.session));
-    // Total mapped size from the VMA list. NARF doesn't separate resident
-    // from virtual, so VmRSS/VmPeak/VmHWM mirror VmSize (best-effort, but
-    // enough for ps/top to sort and display).
+    // Total mapped and resident sizes from the VMA snapshot. VmPeak/VmHWM
+    // still mirror the current values until NARF retains high-water marks,
+    // but VmRSS uses live resident page counts rather than virtual size.
     let vm_kb: u64 = info
         .vmas
         .iter()
         .map(|v| v.end.saturating_sub(v.start) / 1024)
         .sum();
+    let rss_kb: u64 = info
+        .vmas
+        .iter()
+        .map(|v| v.resident_pages.saturating_mul(4))
+        .sum();
+    let data_kb: u64 = info
+        .vmas
+        .iter()
+        .filter(|v| v.writable && !v.executable && v.label != "[stack]")
+        .map(|v| v.end.saturating_sub(v.start) / 1024)
+        .sum();
+    let stack_kb: u64 = info
+        .vmas
+        .iter()
+        .filter(|v| v.label == "[stack]")
+        .map(|v| v.end.saturating_sub(v.start) / 1024)
+        .sum();
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmPeak:\t{} kB\n", vm_kb));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmSize:\t{} kB\n", vm_kb));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmHWM:\t{} kB\n", vm_kb));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmRSS:\t{} kB\n", vm_kb));
-    let _ = core::fmt::Write::write_fmt(
-        &mut s,
-        format_args!("VmData:\t{} kB\n", info.brk_top / 1024),
-    );
-    let _ = core::fmt::Write::write_fmt(
-        &mut s,
-        format_args!("VmStk:\t{} kB\n", info.stack_top / 1024),
-    );
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmHWM:\t{} kB\n", rss_kb));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmRSS:\t{} kB\n", rss_kb));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmData:\t{} kB\n", data_kb));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmStk:\t{} kB\n", stack_kb));
     let _ = core::fmt::Write::write_fmt(
         &mut s,
         format_args!("Threads:\t{}\n", info.num_threads.max(1)),
@@ -2509,15 +2553,30 @@ fn smoke_root_iter_lists_dynamic_top_level() -> TestResult {
     let root = ProcRoot;
     let names: Vec<String> = root.iter().map(|e| String::from(e.name)).collect();
     let saw_cpuinfo = names.iter().any(|n| n == "cpuinfo");
+    let saw_stat = names.iter().any(|n| n == "stat");
+    let self_is_symlink = root
+        .iter()
+        .find(|entry| entry.name == "self")
+        .is_some_and(|entry| entry.file_type == FileType::Symlink);
     let saw_dynamic = names.iter().any(|n| n == "tests_iter_topdir");
     unregister_proc("tests_iter_topdir/leaf");
-    if saw_cpuinfo && saw_dynamic {
+    if saw_cpuinfo && saw_stat && self_is_symlink && saw_dynamic {
         TestResult::Pass
     } else {
-        TestResult::Fail("root iter missing static or dynamic entries")
+        TestResult::Fail("root iter missing or mistyping static/dynamic entries")
     }
 }
 kernel_test_in!("filesystem/procfs", smoke_root_iter_lists_dynamic_top_level);
+
+/// ProcFs must advertise Linux's mount-table filesystem type.
+fn smoke_procfs_name_is_proc() -> TestResult {
+    if ProcFs.name() == "proc" {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("ProcFs name must be 'proc'")
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_procfs_name_is_proc);
 
 /// Smoke: `/proc/<pid>/comm` stat() reports FILE_RW mode.
 fn smoke_comm_file_is_rw() -> TestResult {
@@ -2863,6 +2922,47 @@ fn smoke_pid_status_has_uid_gid_ppid_lines() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/procfs", smoke_pid_status_has_uid_gid_ppid_lines);
+
+/// Status memory fields use VMA extents/residency, never absolute virtual
+/// addresses such as brk_top or stack_top.
+fn smoke_pid_status_memory_fields_use_vma_sizes() -> TestResult {
+    let mut info = sample_info();
+    info.brk_top = 0x7fff_ffff_0000;
+    info.stack_top = 0x7fff_ffff_f000;
+    info.vmas = alloc::vec![
+        ProcVma {
+            start: 0x1000,
+            end: 0x5000,
+            writable: true,
+            resident_pages: 2,
+            ..ProcVma::default()
+        },
+        ProcVma {
+            start: 0x8000,
+            end: 0xc000,
+            writable: true,
+            label: "[stack]",
+            resident_pages: 1,
+            ..ProcVma::default()
+        },
+    ];
+    let status = render_status(&info);
+    for expected in [
+        "VmSize:\t32 kB",
+        "VmRSS:\t12 kB",
+        "VmData:\t16 kB",
+        "VmStk:\t16 kB",
+    ] {
+        if !status.lines().any(|line| line == expected) {
+            return TestResult::Fail("status memory field does not reflect VMA accounting");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_pid_status_memory_fields_use_vma_sizes
+);
 
 /// /proc/<pid>/attr/current stat() is a regular RW file that reads
 /// empty (no active LSM) — the "unconfined" answer systemd expects.

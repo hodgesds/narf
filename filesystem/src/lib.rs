@@ -3130,6 +3130,8 @@ pub fn register_initcalls() {
         procfs::sys_kernel::register_all();
         procfs::sys_vm::register_all();
         procfs::aggregate::register_all();
+        procfs::stubs::register_all();
+        procfs::bus::register_bus_proc();
         InitResult::Ok
     });
 

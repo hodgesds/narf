@@ -2603,11 +2603,11 @@ fn readlink_impl(
         ctx.set_return(einval);
         return;
     }
-    // Allocate staging buffer at min(buf_len, target_len). MemSymlink
-    // reads the target verbatim from offset 0; n is the byte count.
-    let target_len = st.size as usize;
-    let len = core::cmp::min(buf_len, target_len);
-    let mut staging = alloc::vec![0u8; len];
+    // `st_size` is only a hint for symlinks and is deliberately zero for
+    // Linux procfs magic links such as /proc/self and /proc/<pid>/ns/mnt.
+    // readlink(2) is defined by the caller's buffer length, so read directly
+    // into a buffer of that size and let FileOps return the actual byte count.
+    let mut staging = alloc::vec![0u8; buf_len];
     let n = match poll_blocking(file.read(0, &mut staging)) {
         Some(Ok(n)) => n,
         _ => {

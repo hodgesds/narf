@@ -9,18 +9,18 @@
 //!
 //! | path                               | value     | reason |
 //! |------------------------------------|-----------|--------|
-//! | /proc/cgroups                      | hdr-only  | no cgroup hierarchy |
+//! | /proc/cgroups                      | hdr/live  | controller list when enabled |
 //! | /proc/keys                         | ""        | no keyring subsystem |
 //! | /proc/key-users                    | ""        | no keyring subsystem |
-//! | /proc/sys/kernel/ns_last_pid       | "0\n"     | no PID namespaces |
+//! | /proc/sys/kernel/ns_last_pid       | "0\n"     | no PID namespaces in this build |
 //! | /proc/sys/kernel/keys/maxkeys      | "200\n"   | no keyring subsystem |
-//! | /proc/sys/user/max_user_namespaces | "0\n"     | no user namespaces |
-//! | /proc/sys/user/max_pid_namespaces  | "0\n"     | no PID namespaces |
-//! | /proc/sys/user/max_net_namespaces  | "0\n"     | no network namespaces |
-//! | /proc/sys/user/max_mnt_namespaces  | "0\n"     | no mount namespaces |
-//! | /proc/sys/user/max_ipc_namespaces  | "0\n"     | no IPC namespaces |
-//! | /proc/sys/user/max_uts_namespaces  | "0\n"     | no UTS namespaces |
-//! | /proc/sys/user/max_cgroup_namespaces | "0\n"   | no cgroup namespaces |
+//! | /proc/sys/user/max_user_namespaces | "0\n"     | no user namespaces in this build |
+//! | /proc/sys/user/max_pid_namespaces  | "0\n"     | no PID namespaces in this build |
+//! | /proc/sys/user/max_net_namespaces  | "0\n"     | no network namespaces in this build |
+//! | /proc/sys/user/max_mnt_namespaces  | "0\n"     | no mount namespaces in this build |
+//! | /proc/sys/user/max_ipc_namespaces  | "0\n"     | no IPC namespaces in this build |
+//! | /proc/sys/user/max_uts_namespaces  | "0\n"     | no UTS namespaces in this build |
+//! | /proc/sys/user/max_cgroup_namespaces | "0\n"   | no cgroup namespaces in this build |
 //!
 //! NOTE: `/proc/<pid>/cgroup`, `/proc/<pid>/personality`, and
 //! `/proc/<pid>/wchan` are per-task stubs that live in `pid_ext.rs`
@@ -111,6 +111,7 @@ impl ProcFile for KeyUsersFile {
 // When PID namespaces land, surface the real last-allocated PID from
 // the scheduler.
 
+#[cfg(not(feature = "container"))]
 fn read_ns_last_pid() -> String {
     // No PID namespaces in NARF; 0 is the sentinel for "not yet
     // allocated in any namespace".  Linux ref: kernel/pid.c::
@@ -145,6 +146,7 @@ fn read_maxkeys() -> String {
 //
 // Linux ref: kernel/ucount.c::create_user_ns_sysctl_table.
 
+#[cfg(not(feature = "container"))]
 fn read_zero() -> String {
     String::from("0\n")
 }
@@ -159,13 +161,19 @@ pub fn register_all() {
     register_proc("keys", Arc::new(KeysFile));
     register_proc("key-users", Arc::new(KeyUsersFile));
 
-    // /proc/sys/kernel/ns_last_pid — no PID namespace layer.
-    register_sysctl(SysctlEntry {
-        path: "kernel/ns_last_pid",
-        read: read_ns_last_pid,
-        write: None,
-        perms: 0o444,
-    });
+    // Do not publish a zero namespace limit in a container-enabled build:
+    // zero means "disabled" to Linux userspace, while those namespaces are
+    // actually usable. Until the namespace layer exposes authoritative
+    // limits/high-water marks, absence is the honest older-kernel shape.
+    #[cfg(not(feature = "container"))]
+    {
+        register_sysctl(SysctlEntry {
+            path: "kernel/ns_last_pid",
+            read: read_ns_last_pid,
+            write: None,
+            perms: 0o444,
+        });
+    }
 
     // /proc/sys/kernel/keys/maxkeys — no keyring subsystem.
     register_sysctl(SysctlEntry {
@@ -175,49 +183,51 @@ pub fn register_all() {
         perms: 0o444,
     });
 
-    // /proc/sys/user/* — no namespace layer of any kind.
-    register_sysctl(SysctlEntry {
-        path: "user/max_user_namespaces",
-        read: read_zero,
-        write: None,
-        perms: 0o444,
-    });
-    register_sysctl(SysctlEntry {
-        path: "user/max_pid_namespaces",
-        read: read_zero,
-        write: None,
-        perms: 0o444,
-    });
-    register_sysctl(SysctlEntry {
-        path: "user/max_net_namespaces",
-        read: read_zero,
-        write: None,
-        perms: 0o444,
-    });
-    register_sysctl(SysctlEntry {
-        path: "user/max_mnt_namespaces",
-        read: read_zero,
-        write: None,
-        perms: 0o444,
-    });
-    register_sysctl(SysctlEntry {
-        path: "user/max_ipc_namespaces",
-        read: read_zero,
-        write: None,
-        perms: 0o444,
-    });
-    register_sysctl(SysctlEntry {
-        path: "user/max_uts_namespaces",
-        read: read_zero,
-        write: None,
-        perms: 0o444,
-    });
-    register_sysctl(SysctlEntry {
-        path: "user/max_cgroup_namespaces",
-        read: read_zero,
-        write: None,
-        perms: 0o444,
-    });
+    #[cfg(not(feature = "container"))]
+    {
+        register_sysctl(SysctlEntry {
+            path: "user/max_user_namespaces",
+            read: read_zero,
+            write: None,
+            perms: 0o444,
+        });
+        register_sysctl(SysctlEntry {
+            path: "user/max_pid_namespaces",
+            read: read_zero,
+            write: None,
+            perms: 0o444,
+        });
+        register_sysctl(SysctlEntry {
+            path: "user/max_net_namespaces",
+            read: read_zero,
+            write: None,
+            perms: 0o444,
+        });
+        register_sysctl(SysctlEntry {
+            path: "user/max_mnt_namespaces",
+            read: read_zero,
+            write: None,
+            perms: 0o444,
+        });
+        register_sysctl(SysctlEntry {
+            path: "user/max_ipc_namespaces",
+            read: read_zero,
+            write: None,
+            perms: 0o444,
+        });
+        register_sysctl(SysctlEntry {
+            path: "user/max_uts_namespaces",
+            read: read_zero,
+            write: None,
+            perms: 0o444,
+        });
+        register_sysctl(SysctlEntry {
+            path: "user/max_cgroup_namespaces",
+            read: read_zero,
+            write: None,
+            perms: 0o444,
+        });
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -244,6 +254,7 @@ fn smoke_cgroups_header_only() -> TestResult {
 }
 kernel_test_in!("filesystem/procfs/stubs", smoke_cgroups_header_only);
 
+#[cfg(not(feature = "container"))]
 fn smoke_sys_user_max_user_namespaces_zero() -> TestResult {
     register_all();
     let snap = lookup_registry(&["sys", "user", "max_user_namespaces"]);
@@ -254,6 +265,7 @@ fn smoke_sys_user_max_user_namespaces_zero() -> TestResult {
         TestResult::Fail("max_user_namespaces did not return '0\\n'")
     }
 }
+#[cfg(not(feature = "container"))]
 kernel_test_in!(
     "filesystem/procfs/stubs",
     smoke_sys_user_max_user_namespaces_zero
