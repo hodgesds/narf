@@ -4,6 +4,12 @@
 use super::*;
 
 fn smoke_userspace_clock_gettime_writes_timespec() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // ClockGetTime: writes monotonic { tv_sec, tv_nsec } to the
     // user buffer. We don't have a true user AS active here — the
     // handler writes through whatever vaddr it gets — so we point
@@ -142,6 +148,12 @@ fn smoke_userspace_sleep_advances_time() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_sleep_advances_time);
 
 fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // ClockGetTime now honours arg0:
     //   0 = CLOCK_REALTIME  (wall via time::now_wall)
     //   1 = CLOCK_MONOTONIC (monotonic_ns)
@@ -256,6 +268,12 @@ kernel_test_in!(
 );
 
 fn smoke_userspace_times_writes_tms_struct() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
         Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
@@ -330,6 +348,12 @@ fn smoke_userspace_times_writes_tms_struct() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_times_writes_tms_struct);
 
 fn smoke_userspace_clock_settime_pushes_wall_offset() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
         Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
@@ -443,6 +467,12 @@ kernel_test_in!(
 
 #[cfg(feature = "linux-compat")]
 fn smoke_userspace_clock_gettime_monotonic_raw_and_boottime() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // CLOCK_MONOTONIC_RAW(4) and CLOCK_BOOTTIME(7) both return sane
     // timespec values and two consecutive readings are non-decreasing.
     use crate::{

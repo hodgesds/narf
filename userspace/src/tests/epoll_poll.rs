@@ -190,6 +190,12 @@ kernel_test_in!("userspace", smoke_poll_multiple_fds_partial_ready);
 
 /// select: 3 fds in readfds, only 1 is ready → only that bit set in output
 fn smoke_select_readfds_partial_ready() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
     let fd_ready = install_ready_file(task, narf_filesystem::POLL_IN);
     let fd_a = install_ready_file(task, 0);
@@ -238,6 +244,12 @@ kernel_test_in!("userspace", smoke_select_readfds_partial_ready);
 
 /// pselect6: sigmask pointer accepted (silently ignored)
 fn smoke_pselect6_sigmask_accepted() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
     let fd_ready = install_ready_file(task, narf_filesystem::POLL_IN);
     let nfds = (fd_ready + 1) as usize;
@@ -272,6 +284,12 @@ kernel_test_in!("userspace", smoke_pselect6_sigmask_accepted);
 
 /// select: no fds ready, timeout=0 → returns 0
 fn smoke_select_no_ready_returns_zero() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
     let fd = install_ready_file(task, 0); // not ready
     let nfds = (fd + 1) as usize;
@@ -330,6 +348,12 @@ kernel_test_in!("userspace", smoke_epoll_create1_returns_valid_fd);
 
 /// epoll_ctl ADD then DEL — item removed from interest set
 fn smoke_epoll_ctl_add_then_del() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
 
     // Create epoll fd.
@@ -390,6 +414,12 @@ kernel_test_in!("userspace", smoke_epoll_ctl_add_then_del);
 /// An epoll registration is tied to the watched open file, not whatever
 /// object later reuses the same descriptor number.
 fn smoke_epoll_fd_reuse_does_not_alias_stale_interest() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
     let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
     let watched = install_ready_file(task, 0);
@@ -467,6 +497,12 @@ kernel_test_in!(
 /// Closing the descriptor used for ADD does not kill the watch while a dup
 /// still retains the same open file description.
 fn smoke_epoll_watch_survives_original_close_with_dup() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
     let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
     let watched = install_ready_file(task, narf_filesystem::POLL_IN);
@@ -521,6 +557,12 @@ kernel_test_in!(
 
 /// EPOLLERR and EPOLLHUP are returned regardless of the requested mask.
 fn smoke_epoll_hup_is_reported_without_explicit_interest() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
     let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
     let watched = install_ready_file(task, narf_filesystem::POLL_HUP);
@@ -562,6 +604,12 @@ kernel_test_in!(
 /// A peer shutdown must wake epoll and report readable EOF plus implicit HUP,
 /// even when the registration requested only EPOLLIN.
 fn smoke_epoll_socket_shutdown_reports_in_and_hup() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     setup_poll_test();
 
     let mut sv = [0i32; 2];
@@ -707,6 +755,12 @@ kernel_test_in!("userspace", smoke_epoll_wait_no_ready_returns_zero);
 
 /// epoll_wait: 0 timeout, 1 ready → returns 1 with correct .data
 fn smoke_epoll_wait_one_ready_returns_one() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
 
     let epfd_r = call(
@@ -763,6 +817,12 @@ kernel_test_in!("userspace", smoke_epoll_wait_one_ready_returns_one);
 
 /// EPOLLET edge-triggered: first wake delivered; same-state call returns 0
 fn smoke_epoll_epollet_edge_triggered() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
 
     let epfd_r = call(
@@ -834,6 +894,12 @@ kernel_test_in!("userspace", smoke_epoll_epollet_edge_triggered);
 /// EPOLLET must retain an enqueue edge that occurs after a drain but before
 /// the next epoll_wait samples the socket.
 fn smoke_epoll_epollet_dgram_drain_refill_before_wait() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     setup_poll_test();
 
     let mut sv = [0i32; 2];
@@ -929,6 +995,12 @@ kernel_test_in!(
 /// EPOLLET on an AF_UNIX datagram socket must report a rising edge when a second
 /// datagram arrives, even if the inbox was already non-empty (not drained to empty).
 fn smoke_epoll_epollet_dgram_consecutive_refill_without_empty_drain() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     setup_poll_test();
 
     let mut sv = [0i32; 2];
@@ -1048,6 +1120,12 @@ kernel_test_in!(
 /// EPOLLET on an AF_NETLINK socket (NETLINK_KOBJECT_UEVENT) must report rising
 /// edges when new uevents arrive, even if the queue was already non-empty.
 fn smoke_epoll_epollet_netlink_uevent_token_advances_on_new_uevents() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     setup_poll_test();
 
     let sock_fd = call(
@@ -1144,6 +1222,12 @@ kernel_test_in!(
 /// Consuming readable data must not manufacture a new EPOLLOUT edge when
 /// the stream was writable before and after the read.
 fn smoke_epoll_epollet_read_does_not_retrigger_writable() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     setup_poll_test();
 
     let mut sv = [0i32; 2];
@@ -1249,6 +1333,12 @@ kernel_test_in!(
 /// the readable-edge token. It must not be misreported as a new EPOLLOUT edge
 /// just because the socket remains writable.
 fn smoke_epoll_epollet_hidden_read_edge_does_not_retrigger_out() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     setup_poll_test();
 
     let mut sv = [0i32; 2];
@@ -1350,6 +1440,12 @@ kernel_test_in!(
 /// second EPOLLIN edge. The consumer has already been told to drain to
 /// EAGAIN.
 fn smoke_epoll_epollet_write_does_not_retrigger_readable() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     setup_poll_test();
 
     let mut sv = [0i32; 2];
@@ -1432,6 +1528,12 @@ kernel_test_in!(
 /// A full stream is not writable; consuming one byte must publish exactly one
 /// EPOLLOUT edge for the full-to-space transition.
 fn smoke_epoll_epollet_full_to_space_writable_edge() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     setup_poll_test();
 
     let mut sv = [0i32; 2];
@@ -1528,6 +1630,12 @@ kernel_test_in!("userspace", smoke_epoll_epollet_full_to_space_writable_edge);
 
 /// EPOLLONESHOT: fires once; re-arm via MOD; fires again
 fn smoke_epoll_oneshot_fires_once_rearm_fires_again() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
 
     let epfd_r = call(
@@ -1630,6 +1738,12 @@ kernel_test_in!(
 
 /// 1000 fds in one epoll set, 1 becomes ready → wait returns exactly 1
 fn smoke_epoll_1000_fds_one_ready() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
 
     let epfd_r = call(
@@ -1714,6 +1828,12 @@ kernel_test_in!("userspace", smoke_epoll_1000_fds_one_ready);
 /// Same-process sibling (CLONE_FILES fd-table share): epoll created
 /// under one task id must be waitable/ctl-able under the sibling's.
 fn smoke_epoll_shared_fd_table_cross_thread_wait() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // Own the current-task switch: setup_poll_test pins a fixed id.
     crate::syscall::__test_clear_global();
     crate::fd::__test_reset();
@@ -1789,6 +1909,12 @@ kernel_test_in!("userspace", smoke_epoll_shared_fd_table_cross_thread_wait);
 /// dup'd epfd aliases the same instance: ctl through the dup, wait
 /// through the original.
 fn smoke_epoll_dup_fd_aliases_same_instance() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
 
     let r = call(Syscall::EpollCreate, SyscallArgs::default());
@@ -1847,6 +1973,12 @@ kernel_test_in!("userspace", smoke_epoll_dup_fd_aliases_same_instance);
 /// ep_eventpoll_poll reflects the ready list). Divergence here makes a
 /// poll-over-epoll event loop spin: poll says ready, wait delivers 0.
 fn smoke_epoll_fd_poll_readiness_matches_epoll_wait_et() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
 
     let r = call(Syscall::EpollCreate, SyscallArgs::default());
@@ -1924,6 +2056,12 @@ kernel_test_in!(
 /// epoll_ctl must refuse self-add and 2-cycles (Linux: ELOOP) while
 /// still allowing legitimate finite nesting (libwayland nests 2-3).
 fn smoke_epoll_ctl_rejects_cycles_allows_finite_nesting() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
     let _ = task;
 
@@ -1980,6 +2118,12 @@ kernel_test_in!(
 /// wake-up to the timer instead of sleeping forever (a timerfd expiry
 /// fires no readiness notify).
 fn smoke_epoll_fd_forwards_nested_timerfd_poll_deadline() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
 
     let r = call(Syscall::EpollCreate, SyscallArgs::default());
@@ -2120,6 +2264,12 @@ kernel_test_in!("userspace", smoke_wave64_eventfd_write_read_roundtrip);
 /// deadline passes, poll_readiness reports POLL_IN.
 #[cfg(feature = "linux-compat")]
 fn smoke_wave64_timerfd_create_settime_fires() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let _task = setup_poll_test();
     let r = call(
         Syscall::TimerfdCreate,
@@ -2180,6 +2330,12 @@ kernel_test_in!("userspace", smoke_wave64_timerfd_create_settime_fires);
 /// one-shot, then gettime and check the remaining is ≤ 1 s.
 #[cfg(feature = "linux-compat")]
 fn smoke_wave64_timerfd_gettime_reports_remaining() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let _task = setup_poll_test();
     let r = call(Syscall::TimerfdCreate, SyscallArgs::default());
     if r.status != SyscallReturn::OK || r.value == (-1i64 as u64) {
@@ -2247,6 +2403,12 @@ kernel_test_in!("userspace", smoke_wave64_timerfd_gettime_reports_remaining);
 /// epoll variant).
 #[cfg(feature = "linux-compat")]
 fn smoke_wave64_epoll_watches_eventfd() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
     // 1. epoll_create1
     let r = call(Syscall::EpollCreate, SyscallArgs::default());
@@ -2360,6 +2522,12 @@ kernel_test_in!("userspace", smoke_wave64_epoll_watches_eventfd);
 /// provider's readable transition token is the only evidence of the new edge.
 #[cfg(feature = "linux-compat")]
 fn smoke_epoll_epollet_eventfd_hidden_refill_edge() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     setup_poll_test();
     let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
     let efd = call(
@@ -2462,6 +2630,12 @@ kernel_test_in!("userspace", smoke_epoll_epollet_eventfd_hidden_refill_edge);
 
 #[cfg(feature = "linux-compat")]
 fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::handlers::__test_signal_reset;
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
