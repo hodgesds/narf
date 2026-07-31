@@ -377,7 +377,9 @@ struct TestArgs {
     #[command(flatten)]
     build: BuildArgs,
 
-    /// Run only kernel tests registered under this exact subsystem.
+    /// Run only kernel tests under these subsystems. Comma-separated;
+    /// each is prefix-matched in-kernel (`filesystem` also selects
+    /// `filesystem/page_cache`). Empty/absent runs the whole suite.
     #[arg(long)]
     subsystem: Option<String>,
 }
@@ -7252,12 +7254,20 @@ fn main() -> Result<()> {
             let mut args = test.build;
             let prior_append = std::env::var_os("XTASK_QEMU_APPEND");
             if let Some(subsystem) = &test.subsystem {
-                if subsystem.is_empty()
-                    || !subsystem
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
+                // Comma-separated list of subsystem filters (prefix-matched
+                // in-kernel). Each part is validated; the whole list is
+                // threaded onto the cmdline as `test_subsystem=a,b,c`.
+                let parts: Vec<&str> = subsystem.split(',').filter(|s| !s.is_empty()).collect();
+                if parts.is_empty()
+                    || parts.iter().any(|part| {
+                        !part
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
+                    })
                 {
-                    bail!("--subsystem must contain only letters, digits, '/', '_', '-', or '.'");
+                    bail!(
+                        "--subsystem parts must contain only letters, digits, '/', '_', '-', or '.'"
+                    );
                 }
                 let mut append = prior_append
                     .as_ref()
