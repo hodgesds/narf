@@ -16,17 +16,32 @@
 //!
 //! R0 → `rax` and R1..R5 → the SysV argument registers is deliberate: a kfunc
 //! call then needs almost no shuffling, which is the hot path this exists for.
-//! `rcx`, `r10`, `r11` and `r12` are deliberately left out of the map and stay
-//! scratch — `rcx` because variable shifts require it, `r12` because an arena
-//! program pins it to the window base, and `r10`/`r11` for address
-//! computation. They gain named constants when the code that needs them
-//! lands; an unused constant reserving a register is a claim nothing checks.
+//! `rcx`, `r10`, `r11` and `r12` are deliberately left out of the map — `rcx`
+//! because variable shifts require it, `r12` because it holds the fuel counter
+//! (see [`hr::R12`]), and `r10`/`r11` for address computation. They gain named
+//! constants when the code that needs them lands; an unused constant reserving
+//! a register is a claim nothing checks.
+//!
+//! This paragraph used to say `r12` was reserved "because an arena program pins
+//! it to the window base", contradicting [`hr::R12`] two screens down. Worth
+//! recording *why* that is not merely a typo to swap back: the map leaves **no
+//! callee-saved register free**. rbx, rbp and r13..r15 are BPF R6..R10, r12 is
+//! fuel, and Linux's choice of `r12` for the arena base is unavailable here for
+//! exactly that reason. A pinned arena base therefore has to come from
+//! somewhere — a seventh saved slot reloaded per access, or a re-balanced map —
+//! and that decision belongs with the code that needs it, not with a comment
+//! claiming a register is already spoken for.
 //!
 //! ## What is emitted, and what is not
 //!
 //! Enough of the ISA to run the corpus the interpreter runs: ALU, MOV, loads
-//! and stores against the frame, conditional and unconditional jumps, kfunc
-//! calls, and exit. Everything else returns [`JitError::Unsupported`], which
+//! and stores against the frame, conditional and unconditional jumps, and
+//! exit. **Not kfunc calls**, which this list claimed for a while and which is
+//! worth correcting rather than quietly dropping: `Decoded::Call` has no arm in
+//! `emit_insn` on either backend, and because a kfunc return is the verifier's
+//! only producer of `PtrClass::Arena`, that absence is what actually keeps
+//! arena programs interpreted — not `jit_glue` gate 2. See that module's
+//! "Lifting gate 2". Everything else returns [`JitError::Unsupported`], which
 //! the caller answers by interpreting — the interpreter is a complete
 //! implementation, so an unemitted instruction costs speed and not
 //! correctness. That is the property that makes it safe to grow this file
@@ -46,9 +61,11 @@ mod hr {
     /// Holds the remaining fuel for the whole program.
     ///
     /// Callee-saved and absent from [`super::REGS`], so no BPF register aliases
-    /// it. Note spec §5 earmarks a pinned register for the arena window base;
-    /// arena programs are not compiled yet (gate 2), and whichever lands second
-    /// picks a different one — `r10`/`r11` are still free.
+    /// it. Spec §5 earmarks a pinned register for the arena window base and
+    /// Linux uses `r12` for it, but here `r12` is taken and every other
+    /// callee-saved register is a BPF register — see the module docs. `r10` and
+    /// `r11` are free but caller-saved, so they survive an arena access and not
+    /// a kfunc call.
     pub const R12: u8 = 12;
     /// Scratch. Variable shifts require the count in `cl`, and `rcx` is
     /// deliberately absent from [`super::REGS`] so no BPF register can alias

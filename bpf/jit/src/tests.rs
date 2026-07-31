@@ -128,6 +128,134 @@ fn reports_unsupported_rather_than_emitting_wrong_code() {
     ));
 }
 
+/// As [`verified`], but describing a program the verifier saw touch an arena.
+///
+/// `fault_at` is the instruction index of the arena access, which the verifier
+/// records because an in-window arena page may simply not be populated. Both
+/// halves matter: `uses_arena` is what `jit_glue` gate 2 tests, and the fault
+/// site is what gate 3 tests, and an arena access sets *both*.
+pub(crate) fn verified_arena(
+    items: &[Decoded],
+    fault_at: u32,
+    dst_reg: Option<u8>,
+) -> VerifiedProgram {
+    let mut v = verified(items);
+    v.uses_arena = true;
+    v.fault_sites = vec![narf_bpf_verifier::FaultSite {
+        insn_index: fault_at,
+        dst_reg,
+        arena: true,
+    }];
+    v
+}
+
+#[test]
+fn an_arena_program_is_refused_at_the_call_that_produces_the_handle() {
+    // Lifting `jit_glue` gate 2 on its own compiles **nothing**, and this is
+    // the test that says so rather than leaving it to be discovered.
+    //
+    // `PtrClass::Arena` has exactly one producer in the verifier
+    // (`fixpoint.rs`'s `value_of`, reached from a kfunc's return descriptor),
+    // so every program that touches an arena contains a `call`. No backend
+    // emits `Decoded::Call`, so an arena program is refused *there* — at
+    // instruction 0 — before any arena-specific lowering is reached. A
+    // differential test written against a lifted gate 2 would therefore
+    // compare the interpreter with itself and pass for free.
+    let prog = verified_arena(
+        &[
+            Decoded::Call(narf_bpf_isa::CallTarget::Kfunc(1)),
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(0),
+                off: 0,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        1,
+        None,
+    );
+    assert!(
+        matches!(compile(&prog), Err(JitError::Unsupported { at: 0, .. })),
+        "the call, not the arena access, is what an arena program hits first"
+    );
+}
+
+#[test]
+fn the_emitter_discards_the_verifiers_arena_fault_sites() {
+    // Why gate 3 has to stay closed for arena programs, stated as a property
+    // of the emitter instead of as a comment.
+    //
+    // Handed a program the verifier flagged as needing exception-table
+    // coverage, the emitter returns an **empty** `FaultTable`. `jit_glue`
+    // registers exactly what codegen hands it, so a lifted gate 3 would seal
+    // executable text with no entry for an instruction the verifier said can
+    // fault — and `bpf_extable`'s contract makes an unregistered fault fatal by
+    // design.
+    let prog = verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(1),
+                off: 8,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&prog).expect("the store alone is an ordinary encoding");
+    assert_eq!(
+        prog.fault_sites.len(),
+        1,
+        "premise: the verifier recorded a site to cover"
+    );
+    assert!(
+        c.faults.0.is_empty(),
+        "codegen must be taught to record arena fault sites before gate 3 lifts"
+    );
+}
+
+#[test]
+fn an_arena_access_lowers_to_a_bare_dereference_of_the_handle() {
+    // Why gate 2 has to stay closed, as bytes rather than as prose.
+    //
+    // An in-program arena pointer is a *slot-relative handle*, so the address
+    // is `slot_base + handle + off16` — Linux's `[r12 + reg + off]` shape. The
+    // emitter has no pinned base register, so the same instruction lowers to
+    // `[rsi + 8]`: the handle dereferenced as if it were an absolute address.
+    // With `ARENA_BASE_HANDLE` at 4096 that is a near-null kernel write.
+    //
+    // The golden bytes are the point. When the arena lowering lands this test
+    // goes red, and its replacement must show a base register in the encoding.
+    let prog = verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(2),
+                off: 8,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&prog).expect("compiles today");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..8],
+        // 48 C7 46 08 01 00 00 00 — mov qword [rsi+8], 1. R2 maps to rsi; no
+        // index register, no arena base.
+        &[0x48, 0xC7, 0x46, 0x08, 0x01, 0x00, 0x00, 0x00],
+        "an arena store must not lower to a bare dereference of the handle"
+    );
+}
+
 /// The prologue, hand-derived from the Intel SDM.
 ///
 /// `push rbp/rbx/r12/r13/r14/r15; mov r12, rdx; mov rbp, rdi; mov rdi, rsi`

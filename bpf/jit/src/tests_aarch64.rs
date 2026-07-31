@@ -809,6 +809,70 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
     }
 }
 
+#[test]
+fn a64_an_arena_program_is_refused_at_the_call_that_produces_the_handle() {
+    // The aarch64 half of the x86-64 test of the same name. `jit_glue`'s
+    // "Lifting gate 2" note claims **neither** backend emits `Decoded::Call`,
+    // and a kfunc return is the verifier's only producer of `PtrClass::Arena`
+    // — so that claim is what makes gate 2 vacuous on both architectures, and
+    // a claim about both needs testing on both. Tested through
+    // `aarch64::compile` rather than `compile`, which dispatches to the host.
+    let prog = crate::tests::verified_arena(
+        &[
+            Decoded::Call(narf_bpf_isa::CallTarget::Kfunc(1)),
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(0),
+                off: 0,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        1,
+        None,
+    );
+    assert!(
+        matches!(
+            aarch64::compile(&prog),
+            Err(JitError::Unsupported { at: 0, .. })
+        ),
+        "the call, not the arena access, is what an arena program hits first"
+    );
+}
+
+#[test]
+fn a64_the_emitter_discards_the_verifiers_arena_fault_sites() {
+    // As the x86-64 test of the same name: gate 3 has to stay closed because
+    // codegen hands `jit_glue` an empty table for a program the verifier said
+    // needs coverage. Stated per backend because `FaultTable` is built
+    // per backend, so one of them could grow entries without the other.
+    let prog = crate::tests::verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(1),
+                off: 8,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = aarch64::compile(&prog).expect("the store alone is an ordinary encoding");
+    assert_eq!(
+        prog.fault_sites.len(),
+        1,
+        "premise: the verifier recorded a site to cover"
+    );
+    assert!(
+        c.faults.0.is_empty(),
+        "codegen must be taught to record arena fault sites before gate 3 lifts"
+    );
+}
+
 // ── differential: reference evaluator vs. emulated native code ───────
 
 /// Base of the flat memory region both sides share the layout of.

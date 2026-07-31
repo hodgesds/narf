@@ -170,10 +170,14 @@ impl BpfProg {
     /// it will accept a program that walks past the end of its own arenas. What
     /// makes that safe is the runtime: the interpreter resolves every handle
     /// against exactly this slice and traps
-    /// [`crate::interp::Trap::ArenaOutOfBounds`] otherwise, and the slot's tail
-    /// guard means even an unchecked access could not reach another program's
-    /// arenas. It is also why `crate::jit_glue` still refuses arena programs —
-    /// native code performs neither check.
+    /// [`crate::interp::Trap::ArenaOutOfBounds`] otherwise, and the slot's
+    /// guards mean even an unchecked access could not reach another program's
+    /// arenas — including *below* the slot base, which is reachable and which
+    /// `narf_memory::bpf_arena::ARENA_MAX_UNDERSHOOT_BYTES` is the assertion
+    /// about. It is also why `crate::jit_glue` still refuses arena programs:
+    /// native code performs neither check, and would need the extable and a
+    /// pinned base register in their place. See that module's "Lifting gate 2"
+    /// for what is actually in the way, which is not the arena.
     ///
     /// # Errors
     ///
