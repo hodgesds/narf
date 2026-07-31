@@ -57,6 +57,7 @@ const BPF_MAP_DELETE_ELEM: u32 = 3;
 const BPF_MAP_GET_NEXT_KEY: u32 = 4;
 const BPF_PROG_LOAD: u32 = 5;
 const BPF_PROG_TEST_RUN: u32 = 10;
+const BPF_BTF_LOAD: u32 = 18;
 
 /// `union bpf_attr` is 120+ bytes and grows with every kernel release. Linux
 /// accepts any size and zero-extends, so that an older binary works on a newer
@@ -165,12 +166,18 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         BPF_MAP_DELETE_ELEM => map_delete_elem(attr_uptr, size),
         BPF_MAP_GET_NEXT_KEY => map_get_next_key(attr_uptr, size),
 
+        // `sys_bpf_btf.rs`. Kept out of this file because three commands'
+        // worth of BTF glue does not belong in the dispatcher, and because
+        // this file is edited concurrently.
+        BPF_BTF_LOAD => btf_load(attr_uptr, size),
+
         // LINUX-GAP: everything else — `BPF_OBJ_PIN`/`BPF_OBJ_GET` (bpffs
         // pinning), `BPF_PROG_ATTACH`/`DETACH` and `LINK_CREATE` (attach is
-        // Phase 6), `BPF_BTF_LOAD` and the `*_GET_FD_BY_ID` family, and the
-        // token/iterator commands. `ENOTSUP` rather than `EINVAL` so a probing
-        // loader can tell "this kernel does not do that" from "you passed
-        // nonsense".
+        // Phase 6), the `*_GET_FD_BY_ID` and `*_GET_NEXT_ID` families
+        // (including BTF's — they need a kernel-wide id registry that does not
+        // exist yet), and the token/iterator commands. `ENOTSUP` rather than
+        // `EINVAL` so a probing loader can tell "this kernel does not do that"
+        // from "you passed nonsense".
         _ => -ENOTSUP,
     };
     ctx.set_return(SyscallReturn::ok(ret as u64));

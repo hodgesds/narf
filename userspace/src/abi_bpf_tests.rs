@@ -219,7 +219,9 @@ kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_test_run_neg);
 fn smoke_abi_bpf_unimplemented_cmds() -> TestResult {
     with_setup(|| {
         let attr = [0u8; ATTR_LEN];
-        for cmd in [BPF_OBJ_PIN, BPF_BTF_LOAD, 9999] {
+        // `BPF_BTF_LOAD` used to be in this list; it is implemented now, and
+        // its own conformance group lives in `abi_bpf_btf_tests.rs`.
+        for cmd in [BPF_OBJ_PIN, 9999] {
             let r = call(
                 Syscall::Bpf.raw(),
                 a2(cmd, attr.as_ptr() as u64, ATTR_LEN as u64),

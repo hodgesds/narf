@@ -14,6 +14,7 @@ Reading list: [`research/README.md`](research/README.md).
 
 | Crate | Role |
 |---|---|
+| `btf/` | BTF blob parser for `BPF_BTF_LOAD` — a loader-compatibility surface, not NARF's type system. Zero deps, `forbid(unsafe_code)`, host-testable |
 | `isa/` | instruction encode/decode/disassemble — zero deps, host-testable |
 | `verifier/` | type graph, IR, abstract interpretation — zero kernel deps, host-testable |
 | `jit/` | x86_64 and aarch64 emitters — host-testable against golden disassembly |

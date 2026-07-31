@@ -2047,6 +2047,7 @@ dependencies = [
  "narf-arch",
  "narf-block",
  "narf-bpf",
+ "narf-bpf-btf",
  "narf-bpf-isa",
  "narf-bpf-verifier",
  "narf-capabilities",

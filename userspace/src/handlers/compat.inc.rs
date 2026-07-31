@@ -7857,6 +7857,8 @@ mod handler_sys_at2_reshape;
 mod handler_sys_bootstrap;
 #[path = "sys_bpf.rs"]
 mod handler_sys_bpf;
+#[path = "sys_bpf_btf.rs"]
+mod handler_sys_bpf_btf;
 #[path = "sys_brk.rs"]
 mod handler_sys_brk;
 #[path = "sys_capget.rs"]
@@ -8438,6 +8440,8 @@ mod handler_sys_yield;
 pub(crate) use handler_sys_arch_prctl::*;
 #[allow(unused_imports)]
 pub(crate) use handler_sys_bpf::*;
+#[allow(unused_imports)]
+pub(crate) use handler_sys_bpf_btf::*;
 #[allow(unused_imports)]
 pub use handler_sys_chdir_for_test::*;
 #[allow(unused_imports)]
