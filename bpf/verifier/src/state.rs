@@ -494,12 +494,42 @@ impl Stack {
     }
 
     /// Whether every byte in `[off, off + len)` has been written.
+    ///
+    /// Walks slots, not bytes. That was a wash while every caller asked about
+    /// at most eight bytes; a variable-offset access asks about its whole
+    /// possible range, which can be the entire frame, and this runs once per
+    /// such access per fixpoint round inside a syscall that does not yield.
+    /// Eight bytes per iteration instead of one is not an optimisation there so
+    /// much as the difference between a slow load and a stall.
+    ///
+    /// It still costs `O(slots in range)` in the worst case — but only when the
+    /// program actually initialised the whole range, which it had to execute
+    /// stores to do. A range with any uninitialised slot bails at that slot,
+    /// and an absent slot is uninitialised by construction.
     #[must_use]
     pub fn is_initialized(&self, off: i64, len: u64) -> bool {
-        (off..off + len as i64).all(|b| {
-            let s = self.slot(Stack::slot_index(b));
-            (s.init & (1u8 << Stack::byte_in_slot(b))) != 0
-        })
+        if len == 0 {
+            return true;
+        }
+        let end = off + len as i64;
+        // Slot indices count upwards as offsets go down, so the last byte names
+        // the first slot.
+        let first = Stack::slot_index(end - 1);
+        let last = Stack::slot_index(off);
+        for idx in first..=last {
+            // The byte range this slot covers, and the part of it the query
+            // covers. Both are contiguous, so the required mask is one run of
+            // bits — which is the whole reason a slot-at-a-time walk is
+            // possible at all.
+            let base = -(SLOT_BYTES as i64) * (i64::from(idx) + 1);
+            let lo = off.max(base) - base;
+            let hi = end.min(base + SLOT_BYTES as i64) - base;
+            let want = (((1u16 << hi) - 1) & !((1u16 << lo) - 1)) as u8;
+            if self.slot(idx).init & want != want {
+                return false;
+            }
+        }
+        true
     }
 
     /// Read `size` bytes at `off`, assuming [`Stack::is_initialized`] holds.

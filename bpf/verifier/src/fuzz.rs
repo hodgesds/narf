@@ -15,8 +15,11 @@ use alloc::vec::Vec;
 
 use narf_bpf_isa::{AluOp, ByteOrder, CondOp};
 
+use narf_bpf_isa::Size;
+
 use crate::domain::{Scalar, Tnum};
 use crate::interp;
+use crate::state::{AbsValue, Stack};
 
 /// xorshift64*, so the corpus is reproducible without a dependency.
 struct Rng(u64);
@@ -730,4 +733,81 @@ fn reference_interpreter_agrees_with_the_isa_on_32_bit_zero_extension() {
     let a = Scalar::constant(-1);
     let out = a.add(&Scalar::constant(1)).zext32();
     assert!(out.contains(0));
+}
+
+// ── the stack's per-byte initialisation model ───────────────────────
+
+/// The obvious, slow definition of "every byte in the range was written".
+///
+/// [`Stack::is_initialized`] walks slots rather than bytes, because a
+/// variable-offset access asks about a range that can be the whole frame and
+/// the walk happens once per access per fixpoint round. This is what it is
+/// supposed to compute, written the way nobody would get wrong — mask
+/// arithmetic over a partially-covered slot at each end of the range is
+/// exactly the kind of thing that is right for every case anyone thinks to
+/// write a unit test for.
+fn is_initialized_bytewise(s: &Stack, off: i64, len: u64) -> bool {
+    (off..off + len as i64).all(|b| {
+        let slot = s.slot(Stack::slot_index(b));
+        (slot.init & (1u8 << Stack::byte_in_slot(b))) != 0
+    })
+}
+
+#[test]
+fn the_slotwise_initialisation_check_agrees_with_the_bytewise_one() {
+    let mut rng = Rng::new(0x1517_C0DE_5EED_0001);
+    let mut any_true = 0usize;
+    let mut any_false = 0usize;
+    for _ in 0..20_000 {
+        // A frame with a handful of partially-written regions, so the boundary
+        // cases — a range starting or ending mid-slot, a hole in the middle,
+        // a slot that exists but is only half written — all occur.
+        let mut s = Stack::default();
+        for _ in 0..rng.below(6) {
+            let off = -(rng.below(160) as i64) - 1;
+            let size = match rng.below(4) {
+                0 => Size::B,
+                1 => Size::H,
+                2 => Size::W,
+                _ => Size::Dw,
+            };
+            if off + size.bytes() as i64 <= 0 {
+                s.write(off, size, AbsValue::UNKNOWN_SCALAR);
+            }
+        }
+        let off = -(rng.below(200) as i64) - 1;
+        let len = rng.below(40);
+        if off + len as i64 > 0 {
+            continue;
+        }
+        let fast = s.is_initialized(off, len);
+        let slow = is_initialized_bytewise(&s, off, len);
+        assert_eq!(
+            fast, slow,
+            "is_initialized({off}, {len}) disagreed with the byte-wise oracle"
+        );
+        if fast {
+            any_true += 1;
+        } else {
+            any_false += 1;
+        }
+    }
+    // Agreement is trivial if one answer never occurs.
+    assert!(
+        any_true > 100 && any_false > 100,
+        "corpus was one-sided: {any_true} true, {any_false} false"
+    );
+}
+
+#[test]
+fn an_empty_range_is_initialised_and_a_whole_frame_range_is_not() {
+    let s = Stack::default();
+    assert!(s.is_initialized(-8, 0), "an empty range asks nothing");
+    assert!(
+        !s.is_initialized(
+            -(crate::MAX_STACK_BYTES as i64),
+            crate::MAX_STACK_BYTES as u64
+        ),
+        "an untouched frame has nothing initialised"
+    );
 }
