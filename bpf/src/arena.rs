@@ -4,7 +4,7 @@
 //! guards, and page population. It knows nothing about programs. This module is
 //! the seam: it binds an arena to a loaded [`BpfProg`](crate::prog::BpfProg),
 //! gives the interpreter a way to turn an in-program handle into a real address,
-//! and hands the same pages to userspace through `FileOps::mmap_frames`.
+//! and hands the same pages to userspace through `FileOps::mmap_fault`.
 //!
 //! ## What an in-program arena pointer is
 //!
