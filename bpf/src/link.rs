@@ -20,6 +20,16 @@
 //!    `Arc<BpfProg>` for exactly as long as it is attached, so closing the
 //!    *program* fd while a link is live cannot free a running program.
 //!
+//! ## Ids
+//!
+//! Every link also gets a boot-unique `u32` id and an entry in
+//! [`crate::idreg::links`], which is what `BPF_LINK_GET_NEXT_ID` walks and
+//! `BPF_LINK_GET_FD_BY_ID` resolves. The registry holds a `Weak`, so the id
+//! never keeps a link — and therefore never keeps an *attach* — alive; the
+//! entry is pruned in [`BpfLink::drop`], which is the same place the detach
+//! happens. A link fetched by id holds its own `Arc`, so it too must be closed
+//! before the attach comes down, exactly as a `dup`ed fd would.
+//!
 //! ## Why there is an owner table
 //!
 //! Every NARF hook this module can reach is single-slot and its detach is
@@ -40,7 +50,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use narf_capabilities::{Cap, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -112,12 +122,17 @@ pub struct LinkCaps {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Owner {
     /// A [`BpfLink`], by id. Detaching it is the link's job (or its drop's).
-    Link(u64),
+    Link(u32),
     /// A bare `BPF_PROG_ATTACH`, undone only by `BPF_PROG_DETACH`.
     Prog,
 }
 
-static NEXT_LINK_ID: AtomicU64 = AtomicU64::new(1);
+/// Boot-lifetime, monotone, and never handed back — the same discipline
+/// `prog.rs` and `map.rs` use, and for the same reason: a loader that cached a
+/// link id must never find it addressing a different attach. 1, because 0 is
+/// "no link" everywhere in the `bpf(2)` ABI. `u32` because that is the width
+/// `bpf_attr.link_id` and `bpf_link_info.id` have.
+static NEXT_LINK_ID: AtomicU32 = AtomicU32::new(1);
 static OWNERS: IrqSafeSpinLock<Vec<(LinkTarget, Owner)>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Take the claim on `target` for `owner`. `false` if it is already claimed.
@@ -248,7 +263,7 @@ fn do_detach(caps: &LinkCaps, target: &LinkTarget) -> Result<(), LinkError> {
 /// An owning handle on one attach.
 #[derive(Debug)]
 pub struct BpfLink {
-    id: u64,
+    id: u32,
     target: LinkTarget,
     caps: LinkCaps,
     /// The attached program, and the "still attached" flag in one: `take()`ing
@@ -285,17 +300,24 @@ impl BpfLink {
             unclaim(&target, Owner::Link(id));
             return Err(e);
         }
-        Ok(Arc::new(Self {
+        let link = Arc::new(Self {
             id,
             target,
             caps,
             prog: IrqSafeSpinLock::new(Some(prog)),
-        }))
+        });
+        // Registered only once the attach has actually happened, and only from
+        // the `Arc` that will be handed out — the registry holds a `Weak`, so
+        // an entry made before there is an `Arc` to downgrade could not exist,
+        // and one made before the attach succeeded would be reachable by
+        // `BPF_LINK_GET_FD_BY_ID` while naming nothing.
+        crate::idreg::links().insert(id, &link);
+        Ok(link)
     }
 
     /// This link's id. Unique for the life of the kernel.
     #[must_use]
-    pub fn id(&self) -> u64 {
+    pub fn id(&self) -> u32 {
         self.id
     }
 
@@ -393,6 +415,13 @@ impl Drop for BpfLink {
         // last `Arc<BpfLink>`, and *this* is what makes that a detach. There is
         // no `release` hook on `FileOps` to do it anywhere else.
         let _ = self.detach();
+        // The other half of `idreg`'s contract. The `Weak` already makes a
+        // stale id a failed lookup rather than a dangling handle; this stops
+        // the entry — and the `Arc` control block it pins — outliving the link.
+        // Safe to call from here precisely because `IdRegistry::remove` never
+        // materialises an `Arc<BpfLink>` under its lock: doing so would re-enter
+        // this `Drop`.
+        crate::idreg::links().remove(self.id);
     }
 }
 
@@ -938,6 +967,161 @@ mod smokes {
         TestResult::Pass
     }
     kernel_test_in!("bpf", smoke_bpf_link_update_swaps_the_xdp_program);
+
+    // ── link ids ────────────────────────────────────────────────────
+
+    /// Whether an id-walk from 0 reaches `want`.
+    ///
+    /// Bounded: an id table that never ends is an infinite loop in every
+    /// enumerating tool, and this walk is the same shape one performs.
+    fn link_walk_reaches(want: u32) -> Option<bool> {
+        let mut cur = 0u32;
+        for _ in 0..100_000 {
+            let n = crate::idreg::links().next_id(cur)?;
+            if n == want {
+                return Some(true);
+            }
+            if n <= cur {
+                return None;
+            }
+            cur = n;
+        }
+        None
+    }
+
+    /// A live link is reachable by id and by walk; a dropped one is neither,
+    /// and its table entry is gone rather than merely dead.
+    ///
+    /// The pruning half is the one that rots silently: a `Weak` entry left
+    /// behind still answers `get` with `None`, so nothing *visible* breaks
+    /// until the table has one stale slot per link this boot ever made. `len()`
+    /// is the only way to see it.
+    fn smoke_bpf_link_id_registered_and_pruned() -> TestResult {
+        let Some(prog) = ret_prog("linkidreg", 1, Context::Atomic) else {
+            return TestResult::Fail("load rejected a trivial atomic program");
+        };
+        let probe_id = dispatch::reserve_probe_id();
+        let link = match BpfLink::create(caps(), LinkTarget::Probe(probe_id), prog) {
+            Ok(l) => l,
+            Err(_) => return TestResult::Fail("BpfLink::create failed on a fresh probe id"),
+        };
+        let id = link.id();
+        if id == 0 {
+            return TestResult::Fail("a link was assigned id 0, which means 'no link'");
+        }
+        let before = crate::idreg::links().len();
+        match crate::idreg::links().get(id) {
+            Some(found) if Arc::ptr_eq(&found, &link) => {}
+            Some(_) => return TestResult::Fail("the link id resolved to a different link"),
+            None => return TestResult::Fail("a created link is not reachable by its id"),
+        }
+        if link_walk_reaches(id) != Some(true) {
+            return TestResult::Fail("a created link is not reachable by walking GET_NEXT_ID");
+        }
+
+        drop(link);
+
+        if crate::idreg::links().get(id).is_some() {
+            return TestResult::Fail("a dropped link is still reachable by its id");
+        }
+        if crate::idreg::links().len() != before - 1 {
+            return TestResult::Fail(
+                "dropping a link did not prune its id entry — the table leaks",
+            );
+        }
+        if link_walk_reaches(id) == Some(true) {
+            return TestResult::Fail("GET_NEXT_ID still walks over a dropped link's id");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bpf", smoke_bpf_link_id_registered_and_pruned);
+
+    /// A link fetched out of the registry keeps the attach alive — and, when it
+    /// is the last holder, still detaches.
+    ///
+    /// This is the property `BPF_LINK_GET_FD_BY_ID` sells: the second handle is
+    /// independent of the first. If it were not, closing the creating fd would
+    /// tear the hook down under a caller that had just reopened it.
+    fn smoke_bpf_link_id_holder_detaches_on_last_drop() -> TestResult {
+        let Some(prog) = ret_prog("linkidhold", 1, Context::Atomic) else {
+            return TestResult::Fail("load rejected a trivial atomic program");
+        };
+        let probe_id = dispatch::reserve_probe_id();
+        let link = match BpfLink::create(caps(), LinkTarget::Probe(probe_id), Arc::clone(&prog)) {
+            Ok(l) => l,
+            Err(_) => return TestResult::Fail("BpfLink::create failed"),
+        };
+        let id = link.id();
+        let Some(by_id) = crate::idreg::links().get(id) else {
+            return TestResult::Fail("a live link did not resolve by id");
+        };
+
+        // Release the original. The attach must survive, because `by_id` is a
+        // reference of its own.
+        drop(link);
+        dispatch::fire(probe_id, ProbeArgs::none());
+        if prog.runs() != 1 {
+            return TestResult::Fail("the attach came down when a second reference was still held");
+        }
+        if crate::idreg::links().get(id).is_none() {
+            return TestResult::Fail("the id stopped resolving while a reference was still held");
+        }
+
+        // Now the last one. `BpfLink::drop` is what makes this a detach, and
+        // an id-obtained handle must run it just like the creating fd would.
+        drop(by_id);
+        dispatch::fire(probe_id, ProbeArgs::none());
+        if prog.runs() != 1 {
+            return TestResult::Fail("dropping the id-obtained link did not detach the probe");
+        }
+        if is_claimed(&LinkTarget::Probe(probe_id)) {
+            return TestResult::Fail("the id-obtained link's drop left the claim behind");
+        }
+        if crate::idreg::links().get(id).is_some() {
+            return TestResult::Fail("the id still resolved after the last reference went away");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bpf", smoke_bpf_link_id_holder_detaches_on_last_drop);
+
+    /// Ids are monotone and never reused — the property that stops a cached id
+    /// from silently addressing someone else's attach.
+    fn smoke_bpf_link_ids_are_not_reused() -> TestResult {
+        let mk = |name: &str| -> Option<Arc<BpfLink>> {
+            let prog = ret_prog(name, 1, Context::Atomic)?;
+            BpfLink::create(
+                caps(),
+                LinkTarget::Probe(dispatch::reserve_probe_id()),
+                prog,
+            )
+            .ok()
+        };
+        let Some(first) = mk("linkidre1") else {
+            return TestResult::Fail("BpfLink::create failed");
+        };
+        let dead = first.id();
+        drop(first);
+        let Some(second) = mk("linkidre2") else {
+            return TestResult::Fail("BpfLink::create failed");
+        };
+        let Some(third) = mk("linkidre3") else {
+            return TestResult::Fail("BpfLink::create failed");
+        };
+        let (a, b) = (second.id(), third.id());
+        drop(second);
+        drop(third);
+        if a == dead {
+            return TestResult::Fail("a freed link's id was handed to the next link");
+        }
+        if b == a {
+            return TestResult::Fail("two live links share an id");
+        }
+        if a <= dead || b <= a {
+            return TestResult::Fail("link ids are not monotonically increasing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bpf", smoke_bpf_link_ids_are_not_reused);
 
     // ── BPF_PROG_ATTACH (no link) ───────────────────────────────────
 
