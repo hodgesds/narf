@@ -405,6 +405,21 @@ struct RunInteractiveArgs {
     /// `--cmd "ls /bin" --expect "cat"`, etc.
     #[arg(long, default_value = "hello world")]
     expect: String,
+
+    /// Re-boot and retry this many times if the boot/echo fails or times
+    /// out (each attempt is a fresh QEMU). The reliability primitive for
+    /// the flaky-under-TCG cases: a genuine break still fails after all
+    /// attempts, a flake passes on retry. Default 0 (no retry).
+    #[arg(long, default_value_t = 0)]
+    retries: u32,
+
+    /// Boot this already-built kernel binary instead of compiling. Used by
+    /// the split per-case `musl-demo` CI jobs: one job builds the kernel,
+    /// uploads it, and each case job boots the downloaded artifact — no N×
+    /// rebuilds. When set, `--features`/`--package` are ignored (the
+    /// prebuilt image already baked them in).
+    #[arg(long, value_name = "PATH")]
+    prebuilt: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum, Default, Debug)]
@@ -2420,33 +2435,46 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
 }
 
 fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
-    use std::io::Write;
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    use std::sync::{Arc, Mutex};
-
     if !matches!(args.build.arch, Arch::X86_64) {
         // The shell + boot_userspace_init are x86_64-only today
         // (`cfg(all(feature = "boot-init", target_arch = "x86_64"))`).
         bail!("xtask run-interactive: only x86_64 is wired (aarch64 boot-init is a stub)");
     }
 
-    let mut build = args.build.clone();
-    ensure_feature(&mut build.features, "boot-init");
-    // Bring up at least the firmware ack the boot-init flow assumes;
-    // matches `Cmd::IsoBoot` / `Cmd::Image` defaults so the shell
-    // actually loads.
-    ensure_feature(&mut build.features, "firmware-allow-unsigned");
-
     let root = workspace_root()?;
-    let out_dir = cargo_build(&build, &root)?;
 
-    let kernel = out_dir.join(&build.package);
-    if !kernel.exists() {
-        bail!(
-            "expected kernel binary at {} — did `cargo build` succeed?",
-            kernel.display()
-        );
-    }
+    // Resolve the kernel image: a prebuilt artifact (the split per-case
+    // `musl-demo` jobs download one and boot it) or a fresh cross-build.
+    let (kernel, out_dir) = match &args.prebuilt {
+        Some(path) => {
+            let kernel = PathBuf::from(path);
+            if !kernel.exists() {
+                bail!("--prebuilt kernel not found at {}", kernel.display());
+            }
+            let out_dir = kernel
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.clone());
+            (kernel, out_dir)
+        }
+        None => {
+            let mut build = args.build.clone();
+            ensure_feature(&mut build.features, "boot-init");
+            // Bring up at least the firmware ack the boot-init flow assumes;
+            // matches `Cmd::IsoBoot` / `Cmd::Image` defaults so the shell
+            // actually loads.
+            ensure_feature(&mut build.features, "firmware-allow-unsigned");
+            let out_dir = cargo_build(&build, &root)?;
+            let kernel = out_dir.join(&build.package);
+            if !kernel.exists() {
+                bail!(
+                    "expected kernel binary at {} — did `cargo build` succeed?",
+                    kernel.display()
+                );
+            }
+            (kernel, out_dir)
+        }
+    };
 
     let fw_dir = root.join("target").join("firmware");
     let (fw_initramfs, _) = collect_firmware_blobs(&fw_dir, &args.build.initramfs_firmware)?;
@@ -2463,11 +2491,56 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
         cpio_path = Some(p);
     }
 
-    let qemu = build.arch.qemu_bin();
+    // Retry loop: each attempt is a fresh QEMU boot. A flake (e.g. a
+    // TCG-timing echo miss) passes on a re-boot; a genuine break fails
+    // after every attempt. `--retries 0` (default) means a single boot.
+    let attempts = args.retries + 1;
+    let mut last_err = None;
+    for attempt in 1..=attempts {
+        if attempts > 1 {
+            eprintln!(
+                "xtask run-interactive: attempt {attempt}/{attempts} for `{}`",
+                args.cmd
+            );
+        }
+        match run_interactive_boot(
+            &kernel,
+            cpio_path.as_ref(),
+            args.build.arch,
+            &args.build.display,
+            args.build.hw_profile,
+            &args.cmd,
+            &args.expect,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("xtask run-interactive: attempt {attempt} failed: {e:#}");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("run-interactive: no attempts made")))
+}
+
+/// Boot `kernel` under QEMU, log in as root, type `typed_cmd`, and assert
+/// `expect` appears on the serial console. One attempt; the caller retries.
+#[allow(clippy::too_many_arguments)]
+fn run_interactive_boot(
+    kernel: &Path,
+    cpio_path: Option<&PathBuf>,
+    arch: Arch,
+    display: &str,
+    hw_profile: HwProfile,
+    typed_cmd: &str,
+    expect: &str,
+) -> Result<()> {
+    use std::io::Write;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::{Arc, Mutex};
+
+    let qemu = arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    let mut qemu_args = build
-        .arch
-        .qemu_args(&kernel, &build.display, build.hw_profile);
+    let mut qemu_args = arch.qemu_args(kernel, display, hw_profile);
     if let Some(cpio) = cpio_path {
         qemu_args.push("-initrd".into());
         qemu_args.push(cpio.display().to_string());
@@ -2683,7 +2756,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 
     println!(
         "\nxtask run-interactive: prompt seen, typing `{}`...",
-        args.cmd
+        typed_cmd
     );
 
     // Drain the kernel's late-boot log noise (USB-HID enumeration
@@ -2704,10 +2777,8 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
     // to consider bytes from here onwards.
     let pre_type_pos = captured.lock().map(|g| g.len()).unwrap_or(0);
 
-    // Wave-49: typed line is the configurable `args.cmd` with a
-    // trailing newline. Default is "echo hello world" for parity
-    // with the Wave-45 echo smoke.
-    let mut typed: Vec<u8> = args.cmd.as_bytes().to_vec();
+    // Typed line is the configurable command with a trailing newline.
+    let mut typed: Vec<u8> = typed_cmd.as_bytes().to_vec();
     typed.push(b'\n');
     for &b in &typed {
         if stdin.write_all(&[b]).is_err() {
@@ -2743,9 +2814,8 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
     // local-echo copy when it arrives intact, which only happens
     // when the keystroke→shell→UART loop is working end to end
     // anyway. Either way, the test asserts what it claims to.
-    // Wave-49: the expected substring is configurable via
-    // `args.expect`. Default is "hello world".
-    let needle: Vec<u8> = args.expect.as_bytes().to_vec();
+    // The expected substring is configurable via `expect`.
+    let needle: Vec<u8> = expect.as_bytes().to_vec();
     let echo_deadline = Duration::from_secs(echo_secs);
     let echo_start = std::time::Instant::now();
     let mut got_echo = false;
@@ -2842,15 +2912,15 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
         bail!(
             "xtask run-interactive: typed `{}` but did not \
              see `{}` echoed back within {}s",
-            args.cmd,
-            args.expect,
+            typed_cmd,
+            expect,
             echo_secs
         );
     }
 
     println!(
         "\nxtask run-interactive: ok — typed `{}`, saw `{}`",
-        args.cmd, args.expect,
+        typed_cmd, expect,
     );
     Ok(())
 }
