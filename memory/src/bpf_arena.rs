@@ -570,15 +570,65 @@ impl Arena {
 impl Drop for Arena {
     fn drop(&mut self) {
         let mut inner = self.inner.lock();
+        // Once the frame list has been handed to the mmap layer, userspace may
+        // still have these frames mapped `MAP_SHARED` — and **the mapping keeps
+        // nothing alive**. `sys_mmap` clones the `FileOps` `Arc` only for the
+        // duration of the call, copies the physical addresses into the
+        // `Region`, and drops the `Arc`; `munmap` never calls back here. So
+        // this sequence returns live user-mapped frames to the buddy:
+        //
+        //   1. userspace opens the arena fd and `mmap`s it `MAP_SHARED`
+        //   2. it closes the fd; the program exits; the last `Arc<ProgArena>`
+        //      drops and we run
+        //   3. we `free_frame` each one — and the buddy hands them to somebody
+        //      else while userspace still has them mapped read-write
+        //
+        // That is a userspace-writable window onto arbitrary recycled kernel
+        // memory, which is strictly worse than losing the memory. So when the
+        // frames have been exposed we **leak them deliberately**: unmap the
+        // kernel VA (the kernel side genuinely is done with it) and keep the
+        // frames out of the allocator forever.
+        //
+        // Arenas are the first `mmap_frames` user where this matters. The
+        // existing ones are safe for reasons that do not generalise: `/dev/fb0`
+        // hands out device memory that is never in the buddy, and perf's ring
+        // lives as long as the task. That is why the contract was never
+        // stressed before.
+        //
+        // The real fix is for the mapping to own a reference — a keep-alive
+        // `Arc<dyn FileOps>` on `Region`, or an `munmap` teardown hook — at
+        // which point this branch becomes dead and should be deleted rather
+        // than kept as belt-and-braces. Recorded in `bpf/specification/spec.md`
+        // §8. Until then the leak is bounded by the arena's own size and only
+        // happens when userspace actually mapped it.
+        let exposed = inner.snapshotted;
         for (page, frame) in core::mem::take(&mut inner.frames) {
             let va = self.kva + page * 4096;
-            // SAFETY: the arena is being destroyed, so no program holds a
-            // pointer into it; the VA is never reissued (bump cursor), so a
+            // SAFETY: the arena is being destroyed, so no *program* holds a
+            // pointer into it, and the VA is never reissued (bump cursor), so a
             // stale TLB entry on a peer CPU cannot alias a later mapping.
+            // Note this says nothing about a *userspace* mapping of the same
+            // frames, which is what `exposed` is for.
             unsafe { unmap_arena_page(va) };
-            crate::frame::free_frame(frame);
+            if !exposed {
+                crate::frame::free_frame(frame);
+            }
+        }
+        if exposed {
+            LEAKED_EXPOSED_ARENAS.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Arenas dropped while their frames were still exposed to a userspace
+/// mapping, and whose frames were therefore leaked rather than returned to the
+/// buddy. Diagnostic only — see [`Arena::drop`] for why the leak is deliberate.
+pub static LEAKED_EXPOSED_ARENAS: AtomicU64 = AtomicU64::new(0);
+
+/// How many arenas have been leaked because they were dropped while mapped.
+#[must_use]
+pub fn leaked_exposed_arenas() -> u64 {
+    LEAKED_EXPOSED_ARENAS.load(Ordering::Relaxed)
 }
 
 // ── Mapping ────────────────────────────────────────────────────────────
@@ -981,3 +1031,72 @@ mod tests {
         }
     }
 }
+
+/// An arena whose frames were exposed to userspace must **not** return them to
+/// the buddy on drop.
+///
+/// The dangerous sequence is not hypothetical: `sys_mmap` clones the `FileOps`
+/// `Arc` only for the duration of the call, copies the physical addresses into
+/// the `Region`, and drops the `Arc`; `munmap` never calls back. So a mapping
+/// keeps nothing alive, and freeing here would hand userspace a writable window
+/// onto whatever the buddy allocates next. See [`Arena::drop`].
+///
+/// Asserted through the frame allocator rather than through the flag: a test
+/// that only checked `snapshotted` would pass even if `drop` ignored it, which
+/// is the failure mode that matters. The free count must not move across a drop
+/// whose frames were snapshotted, and *must* move for one that was not — both
+/// directions, so "never frees anything" cannot satisfy it either.
+fn smoke_bpf_arena_exposed_frames_are_not_returned_to_the_buddy() -> TestResult {
+    let cap = ArenaCap::bootstrap();
+
+    // Measure across the *drop only*. An earlier version sampled the free count
+    // before allocating and expected it to rise by 4 afterwards, which is simply
+    // wrong arithmetic — allocating and then freeing returns to the original
+    // count, so the control arm failed for a reason that had nothing to do with
+    // the behaviour under test. Bracketing the drop is what makes the delta mean
+    // "frames this drop returned".
+    let drop_delta = |snapshot: bool| -> Option<usize> {
+        let mut arena = match Arena::new(&cap, 4) {
+            Ok(a) => Some(a),
+            Err(_) => return None,
+        };
+        if arena.as_ref()?.populate_range(0, 4).is_err() {
+            return None;
+        }
+        if snapshot && arena.as_ref()?.snapshot_frames().len() != 4 {
+            return None;
+        }
+        let before = crate::frame::stats().free;
+        drop(arena.take());
+        Some(crate::frame::stats().free.saturating_sub(before))
+    };
+
+    // Control: an arena nobody mapped gives its four frames back.
+    match drop_delta(false) {
+        None => return TestResult::Fail("arena setup failed (control)"),
+        Some(d) if d < 4 => {
+            return TestResult::Fail("an unexposed arena did not return its frames to the buddy")
+        }
+        Some(_) => {}
+    }
+
+    // Subject: once the frame list has been snapshotted — which is exactly what
+    // `mmap_frames` does — the frames must stay out of the allocator, because a
+    // userspace MAP_SHARED mapping of them keeps nothing alive.
+    let leaked_before = leaked_exposed_arenas();
+    match drop_delta(true) {
+        None => return TestResult::Fail("arena setup failed (exposed)"),
+        Some(0) => {}
+        Some(_) => return TestResult::Fail(
+            "a snapshotted arena returned frames to the buddy while userspace could still map them",
+        ),
+    }
+    if leaked_exposed_arenas() != leaked_before + 1 {
+        return TestResult::Fail("the deliberate leak was not accounted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_bpf_arena_exposed_frames_are_not_returned_to_the_buddy
+);

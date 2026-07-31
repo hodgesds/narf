@@ -492,6 +492,39 @@ and the perf event layer, all of which are closed.
     that appeared to hold a packet pointer while silently seeing zeroes would
     be worse than one that never had one.
 
+13. **A userspace `mmap` of an arena keeps nothing alive, so arena frames are
+    leaked rather than freed once exposed.** `sys_mmap` clones the `FileOps`
+    `Arc` only for the duration of the call, copies the physical addresses into
+    the `Region`, and drops it; `munmap` never calls back into the file. So this
+    sequence returned live user-mapped frames to the buddy: userspace `mmap`s
+    the arena `MAP_SHARED`, closes the fd, the program exits, the last
+    `Arc<ProgArena>` drops, and `Arena::drop` frees each frame — while userspace
+    still has them mapped read-write. A userspace-writable window onto arbitrary
+    recycled kernel memory.
+
+    Arenas are the first `mmap_frames` user where this matters, which is why the
+    contract was never stressed: `/dev/fb0` hands out device memory that is never
+    in the buddy, and perf's ring lives as long as the task. Neither reason
+    generalises.
+
+    **Current behaviour:** `Arena::drop` unmaps the kernel VA but *deliberately
+    leaks the frames* when `inner.snapshotted` is set — i.e. when `mmap_frames`
+    has handed the list out. Losing the memory is strictly better than handing
+    userspace a window onto whatever the buddy allocates next. The leak is
+    bounded by the arena's own size, only happens when userspace actually mapped
+    it, and is counted by `bpf_arena::leaked_exposed_arenas()`. Pinned by
+    `smoke_bpf_arena_exposed_frames_are_not_returned_to_the_buddy`, which asserts
+    through the frame allocator in *both* directions — an unexposed arena must
+    still return its frames, so "never free anything" cannot satisfy it.
+
+    **The real fix** is for the mapping to own a reference: a keep-alive
+    `Arc<dyn FileOps>` on `Region`, or an `munmap` teardown hook. Either makes
+    the leak branch dead code, and it should then be **deleted** rather than
+    kept as belt-and-braces — this design already carries one cautionary example
+    of defensive machinery guarding a case that could not arise (§9, the sizing
+    fixpoint). Related to §8.2: the same missing hook is what forces arenas to be
+    pre-populated.
+
 ## 9. Post-review corrections
 
 A Fable review of the merged subsystem returned **do not land** with three
