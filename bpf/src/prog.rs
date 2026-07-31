@@ -239,11 +239,12 @@ impl BpfProg {
                 subprogs = v.subprogs;
                 v.max_stack_bytes.max(1)
             }
-            // Phase 2 is not here yet: the abstract interpreter reports
-            // `NotImplemented` for everything it decoded successfully. Fall
-            // through to `provisional`, which is a *structural* check plus the
-            // interpreter's runtime bounds checks — see that module for why
-            // this is not fail-open.
+            // The abstract interpreter models this program's *shape* but not
+            // some construct in it, so it fails closed with `NotImplemented`
+            // rather than guessing. Fall through to `provisional`, which is a
+            // *structural* check plus the interpreter's runtime bounds checks
+            // — see that module for why this is not fail-open. `jit` stays
+            // `None`, so such a program is interpreted for its whole life.
             Err(VerifyError::NotImplemented(_)) => {
                 crate::provisional::accept(&req.insns, req.context, registry)
                     .map_err(LoadError::Rejected)?;

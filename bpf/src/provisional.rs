@@ -1,11 +1,17 @@
-//! Phase-1 provisional acceptance. **Delete when Stream A's abstract
-//! interpreter lands.**
+//! Provisional acceptance — the fallback for what the verifier cannot yet
+//! reason about. **Delete when `NotImplemented` is unreachable.**
 //!
-//! `narf_bpf_verifier::verify` currently decodes the image, checks it cannot
-//! run off the end, and then returns `VerifyError::NotImplemented` — it fails
-//! closed, deliberately, so nothing accidentally ships on a half-verifier.
-//! That leaves Phase 1 needing *some* acceptance rule to be able to run a
-//! program at all.
+//! The abstract interpreter has landed: `narf_bpf_verifier::verify` runs
+//! `fixpoint::run` and returns a real [`VerifiedProgram`] for the constructs it
+//! models. It still reports `VerifyError::NotImplemented` for the ones it does
+//! not — failing closed, deliberately, so nothing ships on a half-verifier —
+//! and those programs need *some* acceptance rule to run at all. This is it.
+//!
+//! So this module's reach shrinks as the verifier grows, and every program that
+//! lands here is also permanently interpreted: `crate::jit_glue` gate 1 refuses
+//! to compile anything not fully verified, for the reason below.
+//!
+//! [`VerifiedProgram`]: narf_bpf_verifier::VerifiedProgram
 //!
 //! ## Why this is not fail-open
 //!
