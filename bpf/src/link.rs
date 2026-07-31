@@ -599,6 +599,12 @@ mod smokes {
 
     /// Two links cannot share one target, and the refusal does not disturb the
     /// first.
+    ///
+    /// For a *probe* target the duplicate is caught twice over — the owner
+    /// table refuses the claim, and `HandlerTable::register` would refuse the
+    /// duplicate probe id anyway. `smoke_bpf_link_second_link_on_an_xdp_target_is_busy`
+    /// is the one that pins the owner table itself, because `install_xdp` has
+    /// no such backstop.
     fn smoke_bpf_link_second_link_on_a_target_is_busy() -> TestResult {
         let (Some(a), Some(b)) = (
             ret_prog("linkbusy_a", 1, Context::Atomic),
@@ -788,6 +794,53 @@ mod smokes {
         TestResult::Pass
     }
     kernel_test_in!("bpf", smoke_bpf_link_drop_detaches_xdp);
+
+    /// Two links cannot share an interface either — and here the owner table is
+    /// the *only* thing enforcing it.
+    ///
+    /// `install_xdp` replaces the interface's slot silently (that is what
+    /// `remove_xdp`-then-`install` would have to do, and it does it under one
+    /// lock). So without a claim the second link would take the interface, and
+    /// then whichever link dropped first would remove the *other* one's
+    /// program. The tail of this test is what catches that: after dropping the
+    /// second (refused) attempt's handle, the first link's program must still be
+    /// the one deciding.
+    fn smoke_bpf_link_second_link_on_an_xdp_target_is_busy() -> TestResult {
+        const IFACE: &str = "bpf-link-xdp3";
+        let (Some(dropper), Some(passer)) = (
+            ret_prog("linkxdpbusy_d", 1, Context::Atomic),
+            ret_prog("linkxdpbusy_p", 2, Context::Atomic),
+        ) else {
+            return TestResult::Fail("load rejected a trivial atomic program");
+        };
+        let link = match BpfLink::create(
+            caps(),
+            LinkTarget::Xdp(String::from(IFACE)),
+            Arc::clone(&dropper),
+        ) {
+            Ok(l) => l,
+            Err(_) => return TestResult::Fail("BpfLink::create failed for an XDP target"),
+        };
+        let second = BpfLink::create(caps(), LinkTarget::Xdp(String::from(IFACE)), passer);
+        let second_taken = second.is_ok();
+        // Drop the interloper's handle before asserting, so that if it *did*
+        // attach, its drop has had the chance to strip the interface — which is
+        // the damage this test exists to detect.
+        drop(second);
+        let still_dropping = dropped(classify(IFACE, &[0u8; 64]));
+        drop(link);
+        if second_taken {
+            return TestResult::Fail("a second link took an interface a link already held");
+        }
+        if !still_dropping {
+            return TestResult::Fail("the first link's program is no longer on the interface");
+        }
+        if !passed_through(classify(IFACE, &[0u8; 64])) {
+            return TestResult::Fail("dropping the surviving link left a program behind");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bpf", smoke_bpf_link_second_link_on_an_xdp_target_is_busy);
 
     /// The XDP hook is `Atomic` too, and this is the check whose absence was
     /// worst.
