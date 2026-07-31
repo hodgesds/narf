@@ -294,8 +294,7 @@ fn smoke_e2e_enable_slot_trb_encode() -> TestResult {
     let slot_id: u8 = 1;
     let completion_code: u8 = 1;
     let cce_d2 = (completion_code as u32) << 24;
-    let cce_d3 =
-        ((EVT_CMD_COMPLETION as u32) << TRB_TYPE_SHIFT) | ((slot_id as u32) << 24) | TRB_CYCLE_BIT;
+    let cce_d3 = (EVT_CMD_COMPLETION << TRB_TYPE_SHIFT) | ((slot_id as u32) << 24) | TRB_CYCLE_BIT;
     let raw: [u32; 4] = [0, 0, cce_d2, cce_d3];
     let decoded = DecodedEvent::from_dwords(raw);
     match decoded {
@@ -647,8 +646,8 @@ fn smoke_e2e_bulk_out_normal_trb_and_transfer_event() -> TestResult {
     // Synthetic Transfer Event: slot=1, DCI=4, bytes_remaining=0, code=1.
     let slot_id: u8 = 1;
     let completion_code: u8 = 1;
-    let te_d2 = ((completion_code as u32) << 24) | 0u32; // residue = 0
-    let te_d3 = ((EVT_TRANSFER as u32) << TRB_TYPE_SHIFT)
+    let te_d2 = (completion_code as u32) << 24; // residue = 0
+    let te_d3 = (EVT_TRANSFER << TRB_TYPE_SHIFT)
         | ((slot_id as u32) << 24)
         | ((dci as u32) << 16)
         | TRB_CYCLE_BIT;
@@ -722,8 +721,8 @@ fn smoke_e2e_bulk_in_roundtrip() -> TestResult {
 
     // Synthetic Transfer Event: bytes_remaining=0, code=1.
     let slot_id: u8 = 1;
-    let te_d2 = (1u32 << 24) | 0u32;
-    let te_d3 = ((crate::xhci::event_ring::EVT_TRANSFER as u32) << TRB_TYPE_SHIFT)
+    let te_d2 = 1u32 << 24; // residue = 0
+    let te_d3 = (crate::xhci::event_ring::EVT_TRANSFER << TRB_TYPE_SHIFT)
         | ((slot_id as u32) << 24)
         | ((dci as u32) << 16)
         | 1u32;
@@ -792,11 +791,9 @@ fn smoke_e2e_interrupt_in_polling() -> TestResult {
 
     // Synthetic Transfer Event: 8 bytes delivered (residue=0), code=1.
     let slot_id: u8 = 1;
-    let te_d2 = (1u32 << 24) | 0u32; // cc=1, residue=0
-    let te_d3 = ((EVT_TRANSFER as u32) << TRB_TYPE_SHIFT)
-        | ((slot_id as u32) << 24)
-        | ((dci as u32) << 16)
-        | 1u32;
+    let te_d2 = 1u32 << 24; // cc=1, residue=0
+    let te_d3 =
+        (EVT_TRANSFER << TRB_TYPE_SHIFT) | ((slot_id as u32) << 24) | ((dci as u32) << 16) | 1u32;
     let raw: [u32; 4] = [0, 0, te_d2, te_d3];
     let decoded = DecodedEvent::from_dwords(raw);
 
@@ -1106,10 +1103,8 @@ fn smoke_e2e_transfer_event_slot_endpoint_filter() -> TestResult {
     // Build four Transfer Events: two slots (1, 2) × two DCIs (3, 5).
     let make_te = |slot: u8, dci: u8, code: u8| -> [u32; 4] {
         let d2 = (code as u32) << 24;
-        let d3 = ((EVT_TRANSFER as u32) << TRB_TYPE_SHIFT)
-            | ((slot as u32) << 24)
-            | ((dci as u32) << 16)
-            | 1u32;
+        let d3 =
+            (EVT_TRANSFER << TRB_TYPE_SHIFT) | ((slot as u32) << 24) | ((dci as u32) << 16) | 1u32;
         [0, 0, d2, d3]
     };
 
@@ -1119,7 +1114,7 @@ fn smoke_e2e_transfer_event_slot_endpoint_filter() -> TestResult {
     let ev22 = make_te(2, 5, 1); // slot=2, DCI=5
 
     // The predicate used by bulk_in for slot=1, DCI=3.
-    let xfer = (crate::xhci::event_ring::EVT_TRANSFER as u32) << TRB_TYPE_SHIFT;
+    let xfer = crate::xhci::event_ring::EVT_TRANSFER << TRB_TYPE_SHIFT;
     let want_slot_1 = (1u32) << 24;
     let want_ep_3 = (3u32) << 16;
     let pred = |t: &[u32; 4]| -> bool {
@@ -1172,7 +1167,7 @@ fn smoke_e2e_command_completion_codes() -> TestResult {
 
     let make_cce = |code: u8, slot: u8| -> [u32; 4] {
         let d2 = (code as u32) << 24;
-        let d3 = ((EVT_CMD_COMPLETION as u32) << TRB_TYPE_SHIFT) | ((slot as u32) << 24) | 1u32;
+        let d3 = (EVT_CMD_COMPLETION << TRB_TYPE_SHIFT) | ((slot as u32) << 24) | 1u32;
         [0, 0, d2, d3]
     };
 

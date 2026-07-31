@@ -29,9 +29,9 @@ struct FakeMmio {
 #[allow(dead_code)]
 impl FakeMmio {
     fn new(size_bytes: usize) -> Self {
-        let mut data = alloc::vec::Vec::new();
-        data.resize(size_bytes, 0u8);
-        Self { data }
+        Self {
+            data: alloc::vec![0u8; size_bytes],
+        }
     }
 
     fn write16(&mut self, offset: usize, value: u16) {
@@ -72,7 +72,7 @@ impl FakeMmio {
 // ── Bochs VBE Dispi constants (mirrors bochs.rs) ─────────────────────────
 
 const VBE_BASE: usize = 0x500;
-const VBE_ID_OFF: usize = VBE_BASE + 0x00;
+const VBE_ID_OFF: usize = VBE_BASE;
 const VBE_XRES_OFF: usize = VBE_BASE + 0x02;
 const VBE_YRES_OFF: usize = VBE_BASE + 0x04;
 const VBE_BPP_OFF: usize = VBE_BASE + 0x06;

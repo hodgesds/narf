@@ -311,7 +311,7 @@ mod tests {
             return Err("insert did not add an entry");
         }
         r.remove(1);
-        if r.len() != 0 {
+        if !r.is_empty() {
             return Err("remove did not drop the entry — the table leaks one slot per object");
         }
         // Idempotent: a create that failed after assigning an id, or a double

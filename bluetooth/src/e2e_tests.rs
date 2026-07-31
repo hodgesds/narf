@@ -265,7 +265,7 @@ fn smoke_e2e_le_advertising_report_decode() -> TestResult {
     }
     // AD type 0x09 = Complete Local Name; the encoded slice carries
     // the AD record verbatim, so just check the bytes match.
-    if &rep.data[..] != &ad[..] {
+    if rep.data[..] != ad[..] {
         return TestResult::Fail("AD payload mismatch");
     }
     TestResult::Pass
@@ -460,8 +460,8 @@ fn smoke_e2e_smp_public_key_exchange() -> TestResult {
 
     // Peer sends a 64-byte ECDH P-256 public key (X || Y).
     let mut pk_payload = Vec::with_capacity(64);
-    pk_payload.extend(core::iter::repeat(0xAAu8).take(32));
-    pk_payload.extend(core::iter::repeat(0xBBu8).take(32));
+    pk_payload.extend(core::iter::repeat_n(0xAAu8, 32));
+    pk_payload.extend(core::iter::repeat_n(0xBBu8, 32));
     let pk = Pdu {
         code: SMP_PAIRING_PUBLIC_KEY,
         payload: pk_payload,

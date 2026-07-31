@@ -2765,12 +2765,6 @@ fn put_info_u32(buf: &mut [u8; INFO_BUF], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-/// The smallest well-formed blob: a header, one `BTF_KIND_INT` named "int",
-/// and a five-byte string section.
-///
-/// Hand-encoded, and a second copy of the one in `abi_bpf_btf_tests.rs`: a
-/// fixture shared between two conformance files would let one change move both
-/// at once, which is the coupling these ABI files exist to avoid.
 // bpffs — `BPF_OBJ_PIN` (6) and `BPF_OBJ_GET` (7).
 //
 // Three things are pinned here, in rising order of importance:
@@ -2835,9 +2829,13 @@ fn obj_get(path: &CPath) -> Option<i64> {
     bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 0, 0))
 }
 
-/// A minimal well-formed BTF blob — one `int` type. Copied rather than shared
-/// with `abi_bpf_btf_tests.rs`: the only use here is to obtain a BTF fd, and a
-/// shared fixture would couple two independent conformance groups.
+/// The smallest well-formed BTF blob: a header, one `BTF_KIND_INT` named
+/// "int", and a five-byte string section. The only use here is to obtain a
+/// BTF fd.
+///
+/// Hand-encoded, and a second copy of the one in `abi_bpf_btf_tests.rs`: a
+/// fixture shared between two conformance files would let one change move both
+/// at once, which is the coupling these ABI files exist to avoid.
 fn minimal_btf() -> alloc::vec::Vec<u8> {
     let mut v = alloc::vec::Vec::new();
     v.extend_from_slice(&0xeb9fu16.to_le_bytes()); // magic
