@@ -41,7 +41,21 @@ pub fn cmdline() -> &'static str {
     x86_64::cmdline()
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+pub fn cmdline() -> &'static str {
+    aarch64::cmdline()
+}
+
+/// Architectures with no cmdline source yet.
+///
+/// aarch64 got a real one above: it always parsed `/chosen/bootargs` into a
+/// static buffer for `BootInfo::cmdline`, but this dispatcher had no aarch64 arm
+/// and returned `""`, so every cmdline flag was inert there. `stop_at=` and
+/// `safe_mode` silently did nothing, and `cargo xtask test --subsystem <name>`
+/// appeared to filter nothing — the harness passes the filter through
+/// `-append`, the kernel read an empty string, and `run_all_and_exit()` ran the
+/// whole suite while still reporting success.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn cmdline() -> &'static str {
     ""
 }

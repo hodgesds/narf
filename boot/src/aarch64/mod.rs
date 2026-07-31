@@ -31,6 +31,32 @@ const CMDLINE_CAP: usize = 256;
 static mut CMDLINE_BYTES: [u8; CMDLINE_CAP] = [0; CMDLINE_CAP];
 static mut CMDLINE_LEN: usize = 0;
 
+/// Borrow the DTB-supplied command line as a `&'static str`.
+///
+/// The bytes come from `/chosen/bootargs`, which is where QEMU's `-append`
+/// lands on aarch64 — `parse_raw` already copies them into [`CMDLINE_BYTES`]
+/// for `BootInfo::cmdline`. This accessor exists because the crate-level
+/// [`crate::cmdline`] had no aarch64 arm and returned `""` unconditionally, so
+/// every cmdline-driven feature was silently inert on this architecture even
+/// though the parsing worked. The visible symptom was
+/// `cargo xtask test --subsystem <name>` filtering nothing on aarch64: xtask
+/// passes the filter as `test_subsystem=` via `-append`, the kernel read an
+/// empty cmdline, and `run_all_and_exit()` was taken every time — quietly, with
+/// the run still reporting success.
+///
+/// Empty before `parse_raw` runs, or when the DTB carried no `bootargs`.
+#[must_use]
+pub fn cmdline() -> &'static str {
+    // SAFETY: written once by `parse_raw` on the single-threaded boot path,
+    // immutable afterwards — the same contract the x86_64 arm documents.
+    unsafe {
+        let len = *core::ptr::addr_of!(CMDLINE_LEN);
+        let bytes =
+            core::slice::from_raw_parts(core::ptr::addr_of!(CMDLINE_BYTES).cast::<u8>(), len);
+        core::str::from_utf8(bytes).unwrap_or("")
+    }
+}
+
 /// Parse a Linux-compatible U-Boot-style FDT handoff.
 ///
 /// Tolerates a null or bogus DTB pointer: when QEMU's `-kernel` path
