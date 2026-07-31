@@ -233,6 +233,23 @@ fn topological_order(ir: &Ir) -> Result<Vec<u32>, VerifyError> {
     Ok(order)
 }
 
+/// What [`Analysis::access`] proved about *where* an in-bounds access lands.
+///
+/// Only the frame and the context have a per-offset model, so only they have
+/// anything to say here; every other class is bounds-checked and then opaque.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Resolved {
+    /// One known frame or context offset.
+    Const(i64),
+    /// A frame access whose exact offset is unknown, but whose every possible
+    /// byte lies in `[lo, hi)` — and that range lies inside the frame.
+    StackRange { lo: i64, hi: i64 },
+    /// In bounds, with no offset the caller can act on: a faulting class whose
+    /// safety comes from the exception table, or a sized region with no
+    /// per-byte state to update.
+    Opaque,
+}
+
 /// A jump predicate, extended with the one the ISA cannot spell.
 ///
 /// `JSET`'s negation — "no bits in common" — is not an opcode, but it is the
@@ -820,10 +837,18 @@ impl Analysis<'_, '_> {
         // Only the arena's two casts exist: address space 1 is the arena,
         // address space 0 the kernel. Anything else is an encoding LLVM does
         // not emit and NARF has no meaning for.
+        //
+        // That makes it *malformed*, not unimplemented, and the distinction is
+        // load-bearing rather than cosmetic. `NotImplemented` is the one error
+        // `narf-bpf`'s loader answers by falling through to `crate::provisional`
+        // — a structural check that proves nothing about values — so labelling a
+        // meaningless operand pair "not implemented yet" put a malformed
+        // instruction on the one path that exists for programs the verifier
+        // merely cannot reason about. `provisional` happens to reject every
+        // `AddrSpaceCast` today, so nothing got through; the fix is to not
+        // depend on that, because it is a property of a different module.
         if !matches!((dst_as, src_as), (0, 1) | (1, 0)) {
-            return Err(VerifyError::NotImplemented(
-                "address-space cast outside the arena pair",
-            ));
+            return Err(VerifyError::BadAddrSpaceCast { at, dst_as, src_as });
         }
         let p = self.get_ptr(st, at, src)?;
         if p.class != PtrClass::Arena {
@@ -850,9 +875,9 @@ impl Analysis<'_, '_> {
 
     /// Resolve an access, checking bounds and recording fault sites.
     ///
-    /// Returns the resolved offset for regions the caller can model — the
-    /// constant frame offset for a stack access — and `None` for the faulting
-    /// classes, whose safety comes from the exception table instead.
+    /// Returns what the caller can *model* about where the access lands, which
+    /// is a different question from whether it is in bounds — that has already
+    /// been decided by the time this returns.
     #[allow(clippy::too_many_arguments)]
     fn access(
         &mut self,
@@ -863,7 +888,7 @@ impl Analysis<'_, '_> {
         size: Size,
         write: bool,
         fault_dst: Option<u8>,
-    ) -> Result<Option<i64>, VerifyError> {
+    ) -> Result<Resolved, VerifyError> {
         let p = self.get_ptr(st, at, reg)?;
         if p.nullable || p.class == PtrClass::Null {
             return Err(VerifyError::PossiblyNull {
@@ -936,24 +961,40 @@ impl Analysis<'_, '_> {
                 dst_reg: fault_dst,
                 arena: p.class == PtrClass::Arena,
             });
-            return Ok(None);
+            return Ok(Resolved::Opaque);
         }
 
         if p.class == PtrClass::Stack {
-            // // LINUX-GAP: a variable stack offset is rejected. Linux permits
-            // it within proved bounds in some cases; here a non-constant frame
-            // offset means the access could touch any slot, and tracking that
-            // would mean joining every slot it might reach. LLVM emits
-            // constant frame offsets for spills, which is the case that
-            // matters; a variable one means an array on the stack, which
-            // belongs in an arena.
-            let Some(a) = addr.as_const() else {
+            // The whole byte range the access could touch, `[lo, hi)`. For a
+            // constant offset the two collapse to one slot's worth and this is
+            // the check that was always here; for a variable one it is the
+            // generalisation, and the *only* thing that makes the variable case
+            // safe. The concrete address is some `a` in `[addr.min, addr.max]`
+            // — that is the domain's soundness invariant, and what
+            // `fuzz.rs` differentially tests — so the concrete bytes
+            // `[a, a + bytes)` are contained in `[lo, hi)` and proving that
+            // range inside the frame proves the access inside the frame.
+            let lo = addr.min;
+            // `addr.max` is `i64::MAX` for a wholly unknown offset, so the sum
+            // is where this would wrap into a *negative* `hi` and pass the
+            // bound. Checked, not saturating: saturating to `i64::MAX` would
+            // also be rejected by `hi > 0`, but only by accident.
+            let Some(hi) = addr.max.checked_add(bytes as i64) else {
                 return Err(VerifyError::OutOfBounds { at });
             };
-            if a >= 0 || a < -i64::from(MAX_STACK_BYTES) || a + bytes as i64 > 0 {
+            if lo >= 0 || lo < -i64::from(MAX_STACK_BYTES) || hi > 0 {
                 return Err(VerifyError::OutOfBounds { at });
             }
-            return Ok(Some(a));
+            return Ok(match addr.as_const() {
+                Some(a) => Resolved::Const(a),
+                // // LINUX-GAP: the range is proved, but nothing narrower is
+                // modelled — a variable-offset read yields the access width and
+                // a variable-offset write yields no value at all. Linux tracks
+                // the same access against per-slot state and can sometimes keep
+                // more. What it cannot do, and this does, is stay a single
+                // interval check.
+                None => Resolved::StackRange { lo, hi },
+            });
         }
 
         let Some(region) = p.size else {
@@ -968,10 +1009,10 @@ impl Analysis<'_, '_> {
             // identify and would have to type as the join of all of them.
             return addr
                 .as_const()
-                .map(Some)
+                .map(Resolved::Const)
                 .ok_or(VerifyError::OutOfBounds { at });
         }
-        Ok(Some(addr.min))
+        Ok(Resolved::Opaque)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -989,13 +1030,34 @@ impl Analysis<'_, '_> {
         let resolved = self.access(st, at, src, off, size, false, Some(dst.index()))?;
 
         let value = match (class, resolved) {
-            (PtrClass::Stack, Some(a)) => {
+            (PtrClass::Stack, Resolved::Const(a)) => {
                 if !st.stack.is_initialized(a, size.bytes()) {
                     return Err(VerifyError::UninitStack { at, off: a });
                 }
                 st.stack.read(a, size)
             }
-            (PtrClass::Ctx, Some(a)) => self.ctx_field(at, a, size)?,
+            (PtrClass::Stack, Resolved::StackRange { lo, hi }) => {
+                // Any byte in the range could be one of the bytes read, so
+                // every byte in it has to be defined. Checking only `[lo, lo +
+                // bytes)` would be the hole: the concrete offset is free to be
+                // `addr.max`, and nothing said those bytes were written.
+                let len = (hi - lo) as u64;
+                if !st.stack.is_initialized(lo, len) {
+                    return Err(VerifyError::UninitStack { at, off: lo });
+                }
+                // The frame has to be deep enough for every byte the load
+                // could reach. Ordinarily the writes that initialised the range
+                // already said so, but that is a fact about a *different*
+                // instruction and, for a range initialised in another block,
+                // about a different `Stack` — so it is asserted here rather
+                // than inferred.
+                self.note_depth((-lo) as u32);
+                // No slot's value survives being read at an unknown offset: a
+                // spilled pointer read from "one of these eight slots" is not
+                // that pointer. Nothing but the width is left.
+                AbsValue::Scalar(Scalar::unsigned_bits(size.bits()))
+            }
+            (PtrClass::Ctx, Resolved::Const(a)) => self.ctx_field(at, a, size)?,
             // // LINUX-GAP: Linux types a load through a `PTR_TO_BTF_ID` using
             // in-kernel BTF, so `task->pid` comes back as a `u32` and a nested
             // pointer field comes back as another typed pointer. NARF has no
@@ -1030,9 +1092,19 @@ impl Analysis<'_, '_> {
         };
         let class = self.get_ptr(st, at, dst)?.class;
         let resolved = self.access(st, at, dst, off, size, true, None)?;
-        if let (PtrClass::Stack, Some(a)) = (class, resolved) {
-            st.stack.write(a, size, value);
-            self.note_depth(st.stack.depth);
+        match (class, resolved) {
+            (PtrClass::Stack, Resolved::Const(a)) => {
+                st.stack.write(a, size, value);
+                self.note_depth(st.stack.depth);
+            }
+            (PtrClass::Stack, Resolved::StackRange { lo, hi }) => {
+                // A store nobody can place defines nothing and preserves
+                // nothing — see `Stack::write_maybe` for why those are two
+                // separate statements and why only one of them is obvious.
+                st.stack.write_maybe(lo, hi);
+                self.note_depth(st.stack.depth);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1060,9 +1132,16 @@ impl Analysis<'_, '_> {
         let class = self.get_ptr(st, at, dst)?.class;
         let resolved = self.access(st, at, dst, off, size, true, None)?;
         let width = AbsValue::Scalar(Scalar::unsigned_bits(size.bits()));
-        if let (PtrClass::Stack, Some(a)) = (class, resolved) {
-            st.stack.write(a, size, width);
-            self.note_depth(st.stack.depth);
+        match (class, resolved) {
+            (PtrClass::Stack, Resolved::Const(a)) => {
+                st.stack.write(a, size, width);
+                self.note_depth(st.stack.depth);
+            }
+            (PtrClass::Stack, Resolved::StackRange { lo, hi }) => {
+                st.stack.write_maybe(lo, hi);
+                self.note_depth(st.stack.depth);
+            }
+            _ => {}
         }
         if op.writes_src() {
             self.set(st, at, src, width)?;

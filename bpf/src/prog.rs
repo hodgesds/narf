@@ -170,14 +170,10 @@ impl BpfProg {
     /// it will accept a program that walks past the end of its own arenas. What
     /// makes that safe is the runtime: the interpreter resolves every handle
     /// against exactly this slice and traps
-    /// [`crate::interp::Trap::ArenaOutOfBounds`] otherwise, and the slot's
-    /// guards mean even an unchecked access could not reach another program's
-    /// arenas — including *below* the slot base, which is reachable and which
-    /// `narf_memory::bpf_arena::ARENA_MAX_UNDERSHOOT_BYTES` is the assertion
-    /// about. It is also why `crate::jit_glue` still refuses arena programs:
-    /// native code performs neither check, and would need the extable and a
-    /// pinned base register in their place. See that module's "Lifting gate 2"
-    /// for what is actually in the way, which is not the arena.
+    /// [`crate::interp::Trap::ArenaOutOfBounds`] otherwise, and the slot's tail
+    /// guard means even an unchecked access could not reach another program's
+    /// arenas. It is also why `crate::jit_glue` still refuses arena programs —
+    /// native code performs neither check.
     ///
     /// # Errors
     ///
@@ -243,12 +239,20 @@ impl BpfProg {
                 subprogs = v.subprogs;
                 v.max_stack_bytes.max(1)
             }
-            // The abstract interpreter models this program's *shape* but not
-            // some construct in it, so it fails closed with `NotImplemented`
-            // rather than guessing. Fall through to `provisional`, which is a
-            // *structural* check plus the interpreter's runtime bounds checks
-            // — see that module for why this is not fail-open. `jit` stays
-            // `None`, so such a program is interpreted for its whole life.
+            // The abstract interpreter is live, so this arm no longer catches
+            // "everything" — it catches the two constructs `narf-bpf-verifier`
+            // still declines to reason about, both `LD_IMM64` pseudo-forms: a
+            // BTF-id kernel-variable address, and a subprogram address taken as
+            // a value for a callback-style kfunc.
+            //
+            // Worth stating plainly, because the shape is misleading: this
+            // fallthrough currently accepts **nothing**. `provisional` rejects
+            // every non-`Value` `LD_IMM64` itself, so both constructs are
+            // rejected either way — and `interp.rs` cannot execute either one,
+            // so an acceptance here would produce a program that traps on its
+            // first run. Reaching `provisional` is not the same as being
+            // admitted by it, and the difference is the whole of why this is
+            // not fail-open.
             Err(VerifyError::NotImplemented(_)) => {
                 crate::provisional::accept(&req.insns, req.context, registry)
                     .map_err(LoadError::Rejected)?;

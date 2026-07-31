@@ -1,17 +1,22 @@
-//! Provisional acceptance — the fallback for what the verifier cannot yet
-//! reason about. **Delete when `NotImplemented` is unreachable.**
+//! Phase-1 provisional acceptance. **Now accepts nothing; delete it.**
 //!
-//! The abstract interpreter has landed: `narf_bpf_verifier::verify` runs
-//! `fixpoint::run` and returns a real [`VerifiedProgram`] for the constructs it
-//! models. It still reports `VerifyError::NotImplemented` for the ones it does
-//! not — failing closed, deliberately, so nothing ships on a half-verifier —
-//! and those programs need *some* acceptance rule to run at all. This is it.
+//! This existed because `narf_bpf_verifier::verify` returned
+//! `VerifyError::NotImplemented` for everything it decoded, leaving Phase 1
+//! needing *some* rule to be able to run a program at all. The abstract
+//! interpreter has landed, and `NotImplemented` now names exactly two
+//! constructs — a `LD_IMM64` BTF-id kernel-variable address, and a subprogram
+//! address taken as a value. Both are `LD_IMM64` pseudo-forms, and the check
+//! below rejects **every** non-`Value` `LD_IMM64` itself.
 //!
-//! So this module's reach shrinks as the verifier grows, and every program that
-//! lands here is also permanently interpreted: `crate::jit_glue` gate 1 refuses
-//! to compile anything not fully verified, for the reason below.
+//! So every path that reaches this function also leaves it with an error. It
+//! is reachable, and it admits nothing. That is worth stating rather than
+//! leaving to be rediscovered, because the shape of `BpfProg::load` reads as a
+//! live fallback and is not one — and because "does anything get in this way"
+//! is the first question anyone auditing the JIT gate will ask.
 //!
-//! [`VerifiedProgram`]: narf_bpf_verifier::VerifiedProgram
+//! Deleting it is a change to `BpfProg::load`'s error paths rather than to the
+//! set of programs that load, and belongs with whoever next touches that
+//! function.
 //!
 //! ## Why this is not fail-open
 //!

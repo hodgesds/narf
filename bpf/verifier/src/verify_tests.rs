@@ -570,26 +570,217 @@ fn stack_access_beyond_the_budget_is_rejected() {
     );
 }
 
+// ── variable frame offsets ──────────────────────────────────────────
+//
+// A stack access whose offset is not a constant. `r10 - K + i` for a bounded
+// `i` is what an array on the stack compiles to, and rejecting it used to
+// reject that whole shape. What makes it safe is one interval check: the
+// concrete offset lies in `[addr.min, addr.max]` — the domain's soundness
+// invariant, which `fuzz.rs` tests directly — so proving `[addr.min,
+// addr.max + width)` inside the frame proves the access inside the frame.
+//
+// Every test below is a statement about *one* of the two halves: the bound
+// that makes it safe, or the per-byte state that makes it useless to lie
+// about.
+
+/// `r3 = r10 - depth + (ctx[0] & mask)`, ready for an access at offset zero.
+///
+/// The mask, not a branch, is what bounds the index — the shape LLVM emits for
+/// `buf[i & N]` and the one that survives being written twice in these tests.
+fn variable_frame_ptr(depth: i32, mask: i32) -> Vec<Decoded> {
+    vec![
+        ldx(Size::Dw, 2, 1, 0), // r2 = ctx[0], wholly unknown
+        alu(AluOp::And, 2, mask),
+        movr(3, 10),
+        alu(AluOp::Sub, 3, depth),
+        alur(AluOp::Add, 3, 2),
+    ]
+}
+
+static CTX1: &[ArgDesc] = &[ArgDesc::SCALAR64];
+
 #[test]
-fn a_variable_stack_offset_is_rejected() {
-    // // LINUX-GAP: Linux permits a variable frame offset within proved
-    // bounds in some cases. Here it is rejected — an offset the verifier
-    // cannot pin names a slot it cannot type.
-    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
-    let e = check_ctx(
-        &[
-            ldx(Size::Dw, 2, 1, 0),
-            jmp(CondOp::Gt, 2, 8, 4),
-            movr(3, 10),
-            alu(AluOp::Sub, 3, 16),
-            alur(AluOp::Add, 3, 2),
-            st(Size::Dw, 3, 0, 1),
-            mov(0, 0),
-            EXIT,
+fn a_variable_stack_offset_inside_the_frame_is_accepted() {
+    // r3 ranges over [r10-16, r10-8]; an 8-byte store from there covers
+    // [-16, 0), which is inside the frame.
+    let mut p = variable_frame_ptr(16, 8);
+    p.extend_from_slice(&[st(Size::Dw, 3, 0, 1), mov(0, 0), EXIT]);
+    let v = check_ctx(&p, CTX1).expect("a bounded variable frame offset is safe");
+    // The frame must be deep enough for the *lowest* byte the store could
+    // reach, not for the one it happens to reach on some path.
+    assert!(
+        v.max_stack_bytes >= 16,
+        "frame is {} bytes, store could reach 16 deep",
+        v.max_stack_bytes
+    );
+}
+
+#[test]
+fn a_variable_stack_offset_that_could_cross_the_frame_pointer_is_rejected() {
+    // Same shape, but the index reaches 16 while the base is only 16 down, so
+    // the top of the range is `r10` itself — above the frame.
+    let mut p = variable_frame_ptr(16, 31);
+    p.extend_from_slice(&[st(Size::Dw, 3, 0, 1), mov(0, 0), EXIT]);
+    let e = check_ctx(&p, CTX1).unwrap_err();
+    assert!(matches!(e, VerifyError::OutOfBounds { .. }), "{e:?}");
+}
+
+#[test]
+fn a_variable_stack_offset_that_could_undershoot_the_budget_is_rejected() {
+    // The *bottom* edge: base deeper than the budget, index bounded.
+    let mut p = variable_frame_ptr(20_000, 8);
+    p.extend_from_slice(&[st(Size::Dw, 3, 0, 1), mov(0, 0), EXIT]);
+    let e = check_ctx(&p, CTX1).unwrap_err();
+    assert!(matches!(e, VerifyError::OutOfBounds { .. }), "{e:?}");
+}
+
+#[test]
+fn an_unbounded_stack_offset_is_still_rejected() {
+    // No mask: `addr.max` is `i64::MAX`, which is the case the width check has
+    // to add to without wrapping into a negative — the one arithmetic mistake
+    // that would admit everything.
+    let p = vec![
+        ldx(Size::Dw, 2, 1, 0),
+        movr(3, 10),
+        alu(AluOp::Sub, 3, 16),
+        alur(AluOp::Add, 3, 2),
+        st(Size::Dw, 3, 0, 1),
+        mov(0, 0),
+        EXIT,
+    ];
+    let e = check_ctx(&p, CTX1).unwrap_err();
+    assert!(matches!(e, VerifyError::OutOfBounds { .. }), "{e:?}");
+}
+
+#[test]
+fn a_variable_stack_read_needs_every_byte_it_could_reach() {
+    // The range is [-16, 0); only [-8, 0) was written. The read is admitted
+    // against `addr.min` alone if the initialisation check follows the
+    // constant path, and that is the hole this pins.
+    //
+    // The written half is the *deep* one on purpose. Writing the shallow half
+    // instead would leave `addr.min` uninitialised, so a check that only
+    // looked at `addr.min` would reject too and the test would pass while
+    // proving nothing — which is exactly what it did before the mutation table
+    // caught it.
+    let mut p = vec![st(Size::Dw, 10, -16, 0)];
+    p.extend(variable_frame_ptr(16, 8));
+    p.extend_from_slice(&[ldx(Size::Dw, 4, 3, 0), mov(0, 0), EXIT]);
+    let e = check_ctx(&p, CTX1).unwrap_err();
+    assert!(matches!(e, VerifyError::UninitStack { .. }), "{e:?}");
+
+    // …and the mirror, so neither edge can be the only one checked.
+    let mut p = vec![st(Size::Dw, 10, -8, 0)];
+    p.extend(variable_frame_ptr(16, 8));
+    p.extend_from_slice(&[ldx(Size::Dw, 4, 3, 0), mov(0, 0), EXIT]);
+    let e = check_ctx(&p, CTX1).unwrap_err();
+    assert!(matches!(e, VerifyError::UninitStack { .. }), "{e:?}");
+}
+
+#[test]
+fn a_variable_stack_read_of_a_fully_written_range_is_accepted() {
+    let mut p = vec![st(Size::Dw, 10, -8, 0), st(Size::Dw, 10, -16, 0)];
+    p.extend(variable_frame_ptr(16, 8));
+    p.extend_from_slice(&[ldx(Size::Dw, 4, 3, 0), mov(0, 0), EXIT]);
+    check_ctx(&p, CTX1).expect("every byte the load could reach was written");
+}
+
+#[test]
+fn a_variable_stack_write_does_not_initialise_the_range() {
+    // The soundness statement for `Stack::write_maybe`, and the one that is
+    // wrong in the tempting direction: a store at an unknown offset lands on
+    // *one* width's worth of bytes somewhere in the range, so it defines no
+    // particular byte. If it set the init bits for the whole range, this
+    // constant read of a byte the store may never have touched would verify —
+    // and the concrete machine would hand back whatever was in the frame.
+    let mut p = variable_frame_ptr(16, 8);
+    p.extend_from_slice(&[
+        st(Size::Dw, 3, 0, 1),     // maybe-writes somewhere in [-16, 0)
+        ldx(Size::Dw, 4, 10, -16), // definitely reads [-16, -8)
+        mov(0, 0),
+        EXIT,
+    ]);
+    let e = check_ctx(&p, CTX1).unwrap_err();
+    assert!(matches!(e, VerifyError::UninitStack { .. }), "{e:?}");
+}
+
+#[test]
+fn a_variable_stack_write_destroys_a_spilled_pointer_it_could_hit() {
+    // R10 spilled to [-16, -8), then a store that might land on it. The slot
+    // afterwards holds either the frame pointer or `1`, which is not a
+    // pointer — so using it as a base must be rejected.
+    let mut p = vec![stx(Size::Dw, 10, -16, 10)];
+    p.extend(variable_frame_ptr(16, 8));
+    p.extend_from_slice(&[
+        st(Size::Dw, 3, 0, 1),
+        ldx(Size::Dw, 5, 10, -16),
+        st(Size::Dw, 5, 0, 7), // store through what used to be a pointer
+        mov(0, 0),
+        EXIT,
+    ]);
+    let e = check_ctx(&p, CTX1).unwrap_err();
+    assert!(matches!(e, VerifyError::NotAPointer { .. }), "{e:?}");
+}
+
+#[test]
+fn a_variable_stack_write_leaves_slots_outside_its_range_alone() {
+    // The other side of the same coin: `write_maybe` must not be a blanket
+    // clobber. The spill at [-8, 0) is above everything the store can reach,
+    // so it is still a frame pointer afterwards.
+    let mut p = vec![stx(Size::Dw, 10, -8, 10)];
+    p.extend(variable_frame_ptr(32, 8));
+    p.extend_from_slice(&[
+        st(Size::Dw, 3, 0, 1), // reaches [-32, -16)
+        ldx(Size::Dw, 5, 10, -8),
+        st(Size::Dw, 5, -40, 7), // still a frame pointer, so this is fine
+        mov(0, 0),
+        EXIT,
+    ]);
+    check_ctx(&p, CTX1).expect("a spill outside the maybe-written range survives");
+}
+
+#[test]
+fn a_variable_stack_offset_from_a_branch_bound_is_accepted() {
+    // The other way a bound arrives: a comparison rather than a mask. Same
+    // interval, reached through `refine` instead of `alu`.
+    let p = vec![
+        ldx(Size::Dw, 2, 1, 0),
+        jmp(CondOp::Gt, 2, 8, 4), // if r2 > 8, skip the access
+        movr(3, 10),
+        alu(AluOp::Sub, 3, 16),
+        alur(AluOp::Add, 3, 2),
+        st(Size::Dw, 3, 0, 1),
+        mov(0, 0),
+        EXIT,
+    ];
+    check_ctx(&p, CTX1).expect("a branch-bounded variable frame offset is safe");
+}
+
+#[test]
+fn a_variable_stack_offset_kfunc_region_is_still_rejected() {
+    // // LINUX-GAP: `check_mem_arg` still requires a constant frame offset for
+    // a `&[u8]`/`&mut [u8]` argument. Deliberately untouched: a byte region
+    // combines an unknown offset with an unknown *length*, which is a second
+    // interval and a different proof, and nothing needed it yet.
+    static KF: &[KfuncDesc] = &[KfuncDesc {
+        id: 0,
+        name: "take_bytes",
+        addr: 0x1000,
+        args: &[
+            ptr_desc(
+                PtrKind::Mem,
+                ValidityDomain::Static,
+                ArgFlags::SIZED_BY_NEXT,
+            ),
+            ArgDesc::SCALAR64,
         ],
-        CTX,
-    )
-    .unwrap_err();
+        ret: ArgDesc::SCALAR64,
+        context: Context::Atomic,
+    }];
+    let mut p = vec![st(Size::Dw, 10, -8, 0), st(Size::Dw, 10, -16, 0)];
+    p.extend(variable_frame_ptr(16, 8));
+    p.extend_from_slice(&[movr(1, 3), mov(2, 8), call(0), mov(0, 0), EXIT]);
+    let e = check_all(&p, CTX1, KF, &[], Context::Atomic).unwrap_err();
     assert!(matches!(e, VerifyError::OutOfBounds { .. }), "{e:?}");
 }
 
@@ -1523,6 +1714,110 @@ fn arena_arithmetic_is_bounded_and_records_arena_fault_sites() {
     );
 }
 
+// ── Address-space casts ─────────────────────────────────────────────
+
+fn cast(dst: u8, src: u8, dst_as: u16, src_as: u16) -> Decoded {
+    Decoded::AddrSpaceCast {
+        dst: r(dst),
+        src: r(src),
+        dst_as,
+        src_as,
+    }
+}
+
+#[test]
+fn the_two_arena_casts_are_accepted() {
+    let k = [kfunc(
+        "arena_base",
+        NO_ARGS,
+        ptr_desc(PtrKind::Arena, ValidityDomain::Static, ArgFlags::NONE),
+        Context::Atomic,
+    )];
+    for (dst_as, src_as) in [(0u16, 1u16), (1, 0)] {
+        check_full(
+            &[call(0), cast(1, 0, dst_as, src_as), mov(0, 0), EXIT],
+            &[],
+            &k,
+            Context::Atomic,
+        )
+        .unwrap_or_else(|e| panic!("cast ({dst_as}, {src_as}) must verify, got {e:?}"));
+    }
+}
+
+#[test]
+fn an_address_space_cast_outside_the_arena_pair_is_malformed_not_unimplemented() {
+    // Address space 1 is the arena and 0 is the kernel; there is no third one,
+    // so no compiler emits this and no runtime could execute it. That makes it
+    // a *malformed* operand pair, and it must not be reported as
+    // `NotImplemented` — that is the one error `narf-bpf`'s loader answers by
+    // retrying under a structural check, and a meaningless operand has no
+    // business on the path reserved for programs the verifier merely cannot
+    // reason about yet.
+    let k = [kfunc(
+        "arena_base",
+        NO_ARGS,
+        ptr_desc(PtrKind::Arena, ValidityDomain::Static, ArgFlags::NONE),
+        Context::Atomic,
+    )];
+    for (dst_as, src_as) in [(0u16, 0u16), (1, 1), (0, 2), (2, 0), (3, 7)] {
+        let e = check_full(
+            &[call(0), cast(1, 0, dst_as, src_as), mov(0, 0), EXIT],
+            &[],
+            &k,
+            Context::Atomic,
+        )
+        .expect_err("a cast outside the arena pair must be rejected");
+        assert_eq!(
+            e,
+            VerifyError::BadAddrSpaceCast {
+                at: 1,
+                dst_as,
+                src_as
+            },
+            "cast ({dst_as}, {src_as})"
+        );
+    }
+}
+
+#[test]
+fn a_bad_address_space_cast_names_its_operands() {
+    let k = [kfunc(
+        "arena_base",
+        NO_ARGS,
+        ptr_desc(PtrKind::Arena, ValidityDomain::Static, ArgFlags::NONE),
+        Context::Atomic,
+    )];
+    let e = check_full(
+        &[call(0), cast(1, 0, 3, 7), mov(0, 0), EXIT],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect_err("a meaningless address-space pair must be rejected");
+    assert_eq!(
+        e,
+        VerifyError::BadAddrSpaceCast {
+            at: 1,
+            dst_as: 3,
+            src_as: 7
+        },
+        "the diagnostic must name the pair that made no sense"
+    );
+    assert!(
+        !matches!(e, VerifyError::NotImplemented(_)),
+        "a malformed operand is not an unimplemented construct"
+    );
+}
+
+#[test]
+fn casting_something_that_is_not_an_arena_pointer_is_rejected() {
+    // The pair is legal; the operand is not. Two separate checks, and the
+    // operand one must still fire.
+    let e = check(&[mov(1, 0), cast(2, 1, 0, 1), mov(0, 0), EXIT])
+        .expect_err("a scalar is not an arena pointer");
+    assert!(matches!(e, VerifyError::NotAPointer { .. }), "{e:?}");
+}
+
 // ── Atomics ─────────────────────────────────────────────────────────
 
 #[test]
@@ -1578,6 +1873,52 @@ fn an_atomic_on_a_scalar_is_rejected() {
         ]),
         VerifyError::NotAPointer { at: 2, reg: 2 }
     );
+}
+
+/// An atomic through `r3`, which `variable_frame_ptr` leaves pointing into the
+/// frame at an offset only known within a range.
+fn variable_atomic(size: Size) -> Decoded {
+    Decoded::Atomic {
+        size,
+        op: AtomicOp::Add { fetch: false },
+        dst: r(3),
+        src: r(4),
+        off: 0,
+    }
+}
+
+#[test]
+fn a_variable_stack_atomic_is_bounded_and_defines_nothing() {
+    // The atomic path resolves through the same `access` as a load and a store,
+    // so the bound is shared — but the *state* update is its own arm, and it is
+    // the arm no differential test can reach: the reference interpreter models
+    // loads and stores and answers `Unsupported` for atomics, so the concrete
+    // side of this is unit tests only. Said here rather than left implicit,
+    // because "covered by the fuzzer" is otherwise a reasonable assumption.
+
+    // In range: verifies.
+    let mut p = variable_frame_ptr(16, 8);
+    p.extend_from_slice(&[mov(4, 1), variable_atomic(Size::Dw), mov(0, 0), EXIT]);
+    check_ctx(&p, CTX1).expect("a bounded variable atomic is in the frame");
+
+    // Out of range at the top: rejected by the same interval check.
+    let mut p = variable_frame_ptr(16, 31);
+    p.extend_from_slice(&[mov(4, 1), variable_atomic(Size::Dw), mov(0, 0), EXIT]);
+    let e = check_ctx(&p, CTX1).unwrap_err();
+    assert!(matches!(e, VerifyError::OutOfBounds { .. }), "{e:?}");
+
+    // And it defines nothing: an atomic that might have landed anywhere in the
+    // range cannot stand in for initialising a particular slot.
+    let mut p = variable_frame_ptr(16, 8);
+    p.extend_from_slice(&[
+        mov(4, 1),
+        variable_atomic(Size::Dw),
+        ldx(Size::Dw, 5, 10, -16),
+        mov(0, 0),
+        EXIT,
+    ]);
+    let e = check_ctx(&p, CTX1).unwrap_err();
+    assert!(matches!(e, VerifyError::UninitStack { .. }), "{e:?}");
 }
 
 // ── Constructs that fail closed ─────────────────────────────────────
@@ -2185,6 +2526,7 @@ fn every_program_the_verifier_accepts_runs_without_an_out_of_bounds_access() {
             Err(interp::Trap::OutOfFuel) => {}
             Err(t) => panic!("verified program trapped with {t:?}:\n{prog:#?}"),
         }
+        assert_frame_fits(&m, verified.max_stack_bytes, &prog);
     }
     // If the generator drifted into producing nothing acceptable, the test
     // above would pass vacuously. It must not be allowed to.
@@ -2192,6 +2534,145 @@ fn every_program_the_verifier_accepts_runs_without_an_out_of_bounds_access() {
         accepted > 200,
         "only {accepted} of 20000 generated programs verified — the corpus has \
          stopped exercising anything"
+    );
+}
+
+/// Assert the run stayed inside the frame the verifier asked the runtime for.
+///
+/// `max_stack_bytes` is not a diagnostic — it is how much stack the runtime
+/// allocates — so a program that writes below it corrupts whatever is there.
+/// The reference machine has the *whole* budget, so this is invisible to a
+/// plain trap check: every byte below the claimed frame is still perfectly
+/// addressable and the run comes back `Ok`. Only the `defined` shadow can see
+/// it, which is the second reason that shadow exists.
+fn assert_frame_fits(m: &interp::Machine, max_stack_bytes: u32, prog: &[Decoded]) {
+    let below = interp::STACK_BYTES - max_stack_bytes as usize;
+    if let Some(i) = m.defined[..below].iter().position(|&d| d) {
+        panic!(
+            "wrote {} bytes below R10 but the verified frame is only {max_stack_bytes}:\n{prog:#?}",
+            interp::STACK_BYTES - i
+        );
+    }
+}
+
+// ── differential: a variable frame offset, over every index it admits ──
+
+/// One randomly-shaped program built around a bounded variable frame offset.
+///
+/// The knobs are the ones that can each independently break the bound: how
+/// deep the base is, how far the index can reach, how wide the access is,
+/// *which window* of the frame was written first, and which direction the
+/// access goes.
+///
+/// `init_from` is not decoration. Always pre-writing the frame from R10
+/// downwards means the deep end of a read's range is the uninitialised end, so
+/// an initialisation check that looked only at `addr.min` would reject the same
+/// programs the correct one does and the differential would agree with a broken
+/// verifier. A window that can start anywhere makes both ends reachable.
+#[allow(clippy::too_many_arguments)]
+fn variable_offset_program(
+    depth: i32,
+    mask: i32,
+    disp: i16,
+    size: Size,
+    init_from: u32,
+    init_words: u32,
+    write: bool,
+) -> Vec<Decoded> {
+    let mut p = Vec::new();
+    for j in init_from..init_from + init_words {
+        p.push(st(Size::Dw, 10, -8 * (j as i16 + 1), 0));
+    }
+    p.push(ldx(Size::Dw, 2, 1, 0)); // r2 = ctx[0] — the unknown
+    p.push(alu(AluOp::And, 2, mask));
+    p.push(movr(3, 10));
+    p.push(alu(AluOp::Sub, 3, depth));
+    p.push(alur(AluOp::Add, 3, 2));
+    p.push(if write {
+        st(size, 3, disp, 0x5A)
+    } else {
+        ldx(size, 4, 3, disp)
+    });
+    p.push(mov(0, 0));
+    p.push(EXIT);
+    p
+}
+
+#[test]
+fn a_verified_variable_frame_access_is_safe_for_every_index_it_admits() {
+    // The differential for the transfer function this change added. A random
+    // *program* is not enough here: the whole point of a variable offset is
+    // that one program has many concrete behaviours, so each accepted program
+    // is run once per value the mask admits — exhaustively, not sampled. If
+    // the abstract range is wrong at either edge, the run at that edge traps.
+    //
+    // Three separate claims are checked per run, and they fail in different
+    // ways: `BadAccess` means the range escaped the frame, `UninitRead` means
+    // the initialisation check trusted bytes nothing wrote, and
+    // `assert_frame_fits` means `note_depth` under-reported the frame the
+    // runtime has to allocate — which no trap can catch, because the reference
+    // machine always has the whole budget.
+    let mut rng = Rng(0xB0FF_1234_ABCD_0001);
+    let mut accepted = 0usize;
+    let mut accepted_variable = 0usize;
+    for _ in 0..3_000 {
+        // Capped at 255 so every index can be enumerated rather than sampled.
+        let mask = rng.below(256) as i32;
+        let depth = match rng.below(4) {
+            0 => rng.below(40) as i32,
+            1 => rng.below(300) as i32,
+            2 => 16_384 - rng.below(64) as i32,
+            _ => rng.below(20_000) as i32,
+        };
+        let disp = match rng.below(3) {
+            0 => 0,
+            1 => rng.below(24) as i16,
+            _ => -(rng.below(24) as i16),
+        };
+        let size = random_size(&mut rng);
+        // The window starts anywhere in the shallow end of the frame and runs
+        // downwards, so a read's range can be initialised at its deep end, its
+        // shallow end, both, or neither.
+        let init_from = rng.below(8) as u32;
+        let init_words = rng.below(6) as u32;
+        let write = rng.below(2) == 0;
+        let prog = variable_offset_program(depth, mask, disp, size, init_from, init_words, write);
+        let image = encode_all(&prog);
+        let Ok(verified) = verify(&Program {
+            insns: &image,
+            context: Context::Atomic,
+            ctx_fields: CTX1,
+            kfuncs: &[],
+            maps: &[],
+        }) else {
+            continue;
+        };
+        accepted += 1;
+        if mask != 0 {
+            accepted_variable += 1;
+        }
+        assert!(verified.max_stack_bytes <= crate::MAX_STACK_BYTES);
+        for i in 0..=(mask as u64) {
+            let mut m = interp::Machine::with_ctx(&[i]);
+            match interp::run(&image, &mut m) {
+                Ok(_) | Err(interp::Trap::OutOfFuel) => {}
+                Err(t) => panic!("index {i} trapped with {t:?}:\n{prog:#?}"),
+            }
+            assert_frame_fits(&m, verified.max_stack_bytes, &prog);
+        }
+    }
+    assert!(
+        accepted > 300,
+        "only {accepted} programs verified — the generator has stopped \
+         producing provable ones"
+    );
+    // A mask of zero collapses to a constant offset, which is the *old* path.
+    // Without this the whole test could pass while proving nothing about the
+    // one it was written for.
+    assert!(
+        accepted_variable > 200,
+        "only {accepted_variable} accepted programs had a genuinely variable \
+         offset — this test is measuring the constant path"
     );
 }
 

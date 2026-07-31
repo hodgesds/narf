@@ -454,13 +454,103 @@ impl Stack {
         }
     }
 
+    /// Record a store that certainly landed somewhere inside `[lo, hi)` but
+    /// whose exact offset is unknown.
+    ///
+    /// What a *maybe*-write does to a slot is the whole content of this
+    /// function, and it is not what either [`Stack::write`] or
+    /// [`Stack::write_unspecified`] does:
+    ///
+    ///   * any spilled value dies. After the store the slot holds either what
+    ///     it held before or what was just written, and "either of two things"
+    ///     is not a value this domain can spell — so it records none.
+    ///   * the initialisation bits are left **exactly** as they were. The store
+    ///     cannot *define* a byte, because it may not have landed on that byte;
+    ///     and it cannot *undefine* one, because a byte that was already
+    ///     written is still written whether or not this store touched it.
+    ///
+    /// Setting the init bits here would be the unsound direction and is worth
+    /// naming: it would let `*(u64 *)(r1 + 0) = 0` at an unknown offset stand
+    /// in for initialising the whole range, and a later read would be admitted
+    /// against bytes nothing wrote.
+    ///
+    /// Slots with no entry are already `EMPTY` — nothing initialised, no
+    /// value — which is what this would write to them, so they are skipped and
+    /// a store spanning a wide range stays proportional to the slots actually
+    /// in use rather than to the range.
+    pub fn write_maybe(&mut self, lo: i64, hi: i64) {
+        debug_assert!(lo < hi, "an empty maybe-write range is a caller bug");
+        // `lo` is the lowest address the store could reach, so it is what the
+        // frame has to be deep enough for.
+        self.note_depth(lo);
+        // Slot indices count *upwards* as offsets go down, so the range runs
+        // from the highest address to the lowest.
+        let first = Stack::slot_index(hi - 1);
+        let last = Stack::slot_index(lo);
+        for (_, s) in self.slots.range_mut(first..=last) {
+            s.whole = false;
+            s.value = AbsValue::NotInit;
+        }
+    }
+
     /// Whether every byte in `[off, off + len)` has been written.
+    ///
+    /// Walks slots, not bytes. That was a wash while every caller asked about
+    /// at most eight bytes; a variable-offset access asks about its whole
+    /// possible range, which can be the entire frame, and this runs once per
+    /// such access per fixpoint round inside a syscall that does not yield.
+    /// Eight bytes per iteration instead of one is not an optimisation there so
+    /// much as the difference between a slow load and a stall.
+    ///
+    /// It still costs `O(slots in range)` in the worst case — but only when the
+    /// program actually initialised the whole range, which it had to execute
+    /// stores to do. A range with any uninitialised slot bails at that slot,
+    /// and an absent slot is uninitialised by construction.
+    ///
+    /// A range that is not a frame range at all answers **false**. Every caller
+    /// bounds `off` and `len` against the frame before asking, so this is
+    /// unreachable — but it is worth spelling out, because the previous
+    /// byte-wise form answered *true* for one: `len as i64` on a `u64` near
+    /// `u64::MAX` is negative, `off..off + negative` is empty, and `all` on an
+    /// empty iterator is vacuously true. "Everything is initialised" is the
+    /// wrong direction for this function to be wrong in, whatever the caller
+    /// does.
     #[must_use]
     pub fn is_initialized(&self, off: i64, len: u64) -> bool {
-        (off..off + len as i64).all(|b| {
-            let s = self.slot(Stack::slot_index(b));
-            (s.init & (1u8 << Stack::byte_in_slot(b))) != 0
-        })
+        if len == 0 {
+            return true;
+        }
+        let Ok(len) = i64::try_from(len) else {
+            return false;
+        };
+        let Some(end) = off.checked_add(len) else {
+            return false;
+        };
+        // Offsets are negative and measured down from R10; `end == 0` is the
+        // byte just below it and is in range, `end > 0` is not. The floor is
+        // not merely tidiness — `slot_index` negates its argument, so
+        // `i64::MIN` panics the verifier rather than answering anything.
+        if off >= 0 || end > 0 || off < -i64::from(crate::MAX_STACK_BYTES) {
+            return false;
+        }
+        // Slot indices count upwards as offsets go down, so the last byte names
+        // the first slot.
+        let first = Stack::slot_index(end - 1);
+        let last = Stack::slot_index(off);
+        for idx in first..=last {
+            // The byte range this slot covers, and the part of it the query
+            // covers. Both are contiguous, so the required mask is one run of
+            // bits — which is the whole reason a slot-at-a-time walk is
+            // possible at all.
+            let base = -(SLOT_BYTES as i64) * (i64::from(idx) + 1);
+            let lo = off.max(base) - base;
+            let hi = end.min(base + SLOT_BYTES as i64) - base;
+            let want = (((1u16 << hi) - 1) & !((1u16 << lo) - 1)) as u8;
+            if self.slot(idx).init & want != want {
+                return false;
+            }
+        }
+        true
     }
 
     /// Read `size` bytes at `off`, assuming [`Stack::is_initialized`] holds.
