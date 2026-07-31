@@ -21,12 +21,17 @@
 //! **R10 is `x25`, deliberately not `x29`.** The x86-64 backend maps R10 to
 //! `rbp`, which is tempting to mirror as `x29`. It is not mirrored, because
 //! `x29` is architecturally the frame-record pointer that AAPCS64 backtraces
-//! follow, and aarch64 has *no kernel fault recovery* for current-EL data
-//! aborts (`frame/src/aarch64/trap.rs` handles lower-EL aborts only; a
-//! current-EL abort falls through to `exit_kernel(42)`). A fault anywhere near
-//! JITed code therefore ends in a fatal dump, and an intact frame chain is
-//! exactly what makes that dump readable. `x25` is a plain callee-saved
-//! register with none of that meaning.
+//! follow, and a fault in JITed code that the BPF extable does not cover ends
+//! in `rust_aarch64_sync`'s diagnostic dump — an intact frame chain is exactly
+//! what makes that dump readable. `x25` is a plain callee-saved register with
+//! none of that meaning.
+//!
+//! The original wording said aarch64 had *no* kernel fault recovery at all, and
+//! that has not been true since `frame/src/aarch64/trap.rs` grew its
+//! `EC = 0b100101` arm. The conclusion survives the correction — an
+//! unregistered fault is still fatal by design (`bpf_extable` invariant §4.3),
+//! so a readable dump is still the thing `x29` buys — but see the fault-site
+//! note at the end of this block, which the old wording made look impossible.
 //!
 //! `x24` holds the fuel counter. `x16`/`x17` (IP0/IP1) are the scratch pair:
 //! `x16` carries materialised immediates, `x17` carries computed addresses.
@@ -84,11 +89,20 @@
 //! interpreted, which is a complete implementation — so an unemitted
 //! instruction costs speed, not correctness.
 //!
-//! Nothing here records a [`FaultEntry`]. That is not an omission to fill in
-//! later on this architecture: with no current-EL data-abort recovery, a
-//! faulting access in emitted code is fatal rather than fixable, so a fault
-//! site would have nothing to resume to. Emitting one would need the trap
-//! handler taught to recover first.
+//! Nothing here records a [`FaultEntry`], and the reason has changed. It used
+//! to be architectural: aarch64 had *no* current-EL data-abort recovery, so a
+//! faulting access in emitted code was fatal rather than fixable and a fault
+//! site would have had nothing to resume to.
+//!
+//! That is no longer true. `frame/src/aarch64/trap.rs` handles
+//! `EC = 0b100101` (Data Abort from the current EL) by consulting
+//! `narf_memory::bpf_extable::try_recover` and rewriting `frame.elr`, which is
+//! the same fixup shape x86-64 uses. Both architectures can therefore carry
+//! fault sites, and the remaining reason this file records none is simply that
+//! nothing here emits a faulting access yet — `jit_glue` gates them out
+//! (gate 3) and the arena lowering that would produce them does not exist on
+//! either backend. Do not read this paragraph as "aarch64 cannot"; it says
+//! "aarch64 does not, yet".
 
 use alloc::vec::Vec;
 

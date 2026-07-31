@@ -800,6 +800,96 @@ mod smokes {
     }
     kernel_test_in!("bpf", smoke_bpf_arena_one_handle_reaches_two_arenas);
 
+    /// An access *straddling* the boundary between two adjacent arenas is
+    /// refused, even though every byte of it is mapped.
+    ///
+    /// The negative half of the test above, and the one case where the
+    /// interpreter's bound is not merely a cheaper version of what the memory
+    /// layer would enforce anyway. [`Arena::new_in`] sets `kva = slot.base +
+    /// off` and [`ArenaSlot::carve`] hands out consecutive offsets, so two
+    /// one-page arenas are *contiguous in kernel VA*: a doubleword at
+    /// displacement 4092 lies entirely inside mapped, writable, program-owned
+    /// memory. It is refused anyway, because [`resolve_in`] admits a range only
+    /// if it fits inside a single arena.
+    ///
+    /// That distinction is why `crate::jit_glue`'s arena work will have to
+    /// require a *single* arena rather than merely bound the slot. A JIT lowers
+    /// this to `slot_base + handle + off16` with no per-access check, so it
+    /// would complete the store and return — same program, two verdicts,
+    /// decided by whether the program cleared the gates. The contiguity
+    /// assertion below is what stops this test passing for the wrong reason: if
+    /// the two arenas were ever placed with a gap, an unmapped-page refusal
+    /// would look identical from here and the JIT would agree after all.
+    fn smoke_bpf_arena_straddling_two_arenas_is_refused() -> TestResult {
+        let cap = kernel_arena_cap();
+        let mut g = match ArenaGroup::new(cap) {
+            Ok(g) => g,
+            Err(_) => return TestResult::Fail("ArenaGroup::new failed"),
+        };
+        let first = match g.add(cap, 1) {
+            Ok(a) => a,
+            Err(_) => return TestResult::Fail("adding the first arena failed"),
+        };
+        let second = match g.add(cap, 1) {
+            Ok(a) => a,
+            Err(_) => return TestResult::Fail("adding the second arena failed"),
+        };
+        // The premise. Without it the refusal below could be an unmapped page.
+        if second.kva() != first.kva() + 4096 {
+            return TestResult::Fail(
+                "the two arenas are not contiguous in kernel VA, so the straddling \
+                 access is not the case this test means to cover",
+            );
+        }
+        if resolve_in(g.arenas(), ARENA_BASE_HANDLE + 4092, 8).is_some() {
+            return TestResult::Fail("a doubleword straddling two adjacent arenas resolved");
+        }
+        // Both halves resolve on their own, so the refusal is about the
+        // straddle and not about either arena being unreachable.
+        if resolve_in(g.arenas(), ARENA_BASE_HANDLE + 4088, 8).is_none() {
+            return TestResult::Fail("the first arena's last doubleword did not resolve");
+        }
+        if resolve_in(g.arenas(), ARENA_BASE_HANDLE + 4096, 8).is_none() {
+            return TestResult::Fail("the second arena's first doubleword did not resolve");
+        }
+
+        // And end to end, because `resolve_in` agreeing is not the same claim
+        // as a program being stopped: the verifier accepts this program (4092 +
+        // 8 is well inside the 4 GiB window), so only the runtime bound refuses
+        // it.
+        let group = Arc::new(g);
+        let insns = asm(&[
+            call_arena_base(),
+            st_imm(0, 4092, 0xBAD),
+            mov_imm(0, 1),
+            Decoded::Exit,
+        ]);
+        let prog =
+            match BpfProg::load_with_arena(
+                load_cap(),
+                request("straddle", insns),
+                Some(Arc::clone(&group)),
+            ) {
+                Ok(p) => p,
+                Err(_) => return TestResult::Fail(
+                    "the verifier rejected the program, so this no longer tests the runtime bound",
+                ),
+            };
+        match prog.run_atomic([0; 4], 4) {
+            Some(Outcome::Trapped(Trap::ArenaOutOfBounds { handle, .. })) => {
+                if handle != ARENA_BASE_HANDLE + 4092 {
+                    return TestResult::Fail("the trap named the wrong handle");
+                }
+                TestResult::Pass
+            }
+            Some(Outcome::Returned(_)) => {
+                TestResult::Fail("a store straddling two arenas was allowed")
+            }
+            _ => TestResult::Fail("the straddling store trapped for the wrong reason"),
+        }
+    }
+    kernel_test_in!("bpf", smoke_bpf_arena_straddling_two_arenas_is_refused);
+
     /// A displacement past the end of the program's arenas traps diagnosably.
     ///
     /// The negative half of the two above, and the one that pins the runtime

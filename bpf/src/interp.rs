@@ -41,8 +41,13 @@
 //! this interpreter, and would make the interpreter and the JIT disagree about
 //! the bytes in shared memory. What replaces the fabricated base is a bound:
 //! [`crate::arena::resolve_in`] admits a handle only if it lies entirely inside
-//! one of *the running program's own* arenas, all of which are fully populated,
-//! and traps [`Trap::ArenaOutOfBounds`] otherwise. So the reachable set is
+//! the **live** extent of one of *the running program's own* arenas, and traps
+//! [`Trap::ArenaOutOfBounds`] otherwise. Live rather than reserved, and the
+//! distinction is not cosmetic: `ProgArena::new_reserved` leaves VA above the
+//! populated prefix, so "all of which are fully populated" — what this
+//! paragraph used to say — stopped being true when demand population landed.
+//! The bound reads the live extent with one acquire load, and it only grows, so
+//! a handle that resolved once keeps resolving. So the reachable set is
 //! exactly this program's arena bytes — never kernel memory, never another
 //! program's arena — but it is reached by a real dereference and not by an index
 //! into a slice. A program with no arena bound reaches nothing this way and gets

@@ -20,7 +20,10 @@
 //!    This is the load-bearing gate; the other two are narrower.
 //! 2. **No arena use.** The emitter does not pin a base register for the arena
 //!    window, so an arena access would lower to a bare dereference of a
-//!    32-bit-ish offset.
+//!    32-bit-ish offset — `an_arena_access_lowers_to_a_bare_dereference_of_the_handle`
+//!    in `narf-bpf-jit` shows the actual bytes. See "Lifting gate 2" below,
+//!    which is where the analysis lives, because gate 2 is *not* the binding
+//!    constraint and lifting it alone changes nothing.
 //! 3. **No fault sites.** The emitter does not record any, so a program with
 //!    faulting accesses would have them unregistered — and `seal` requires a
 //!    registered image, so this would fail closed anyway. Checked explicitly
@@ -41,6 +44,96 @@
 //!    holding. An explicit check fails closed instead.
 //!
 //! Anything gated out runs interpreted, which is a complete implementation.
+//!
+//! ## Lifting gate 2
+//!
+//! Written down here because the analysis is most of the work and the
+//! conclusion is counter-intuitive: **gate 2 is not what stops arena programs
+//! being compiled, and lifting it on its own would compile nothing.**
+//!
+//! ### The blocker is `Decoded::Call`, not the arena
+//!
+//! `PtrClass::Arena` has exactly one producer in the verifier — a kfunc's
+//! return descriptor, through `fixpoint.rs`'s `value_of`. Arithmetic and
+//! `addr_space_cast` propagate the class but cannot create it, and no context
+//! field or map value carries it. So *every* program that touches an arena
+//! contains a `call`, and neither backend emits `Decoded::Call`: an arena
+//! program is refused as `Unsupported` at the call, before any arena-specific
+//! lowering is reached. `an_arena_program_is_refused_at_the_call_that_produces_the_handle`
+//! pins that, so this stops being true loudly rather than silently.
+//!
+//! The consequence for anyone lifting gate 2: a differential test written
+//! against a lifted gate 2 would find its subject not compiled, fall back to
+//! the interpreter, and compare the interpreter with itself — the exact
+//! vacuity `diff_case` refuses for every other sweep. Call emission is the
+//! prerequisite, and it is a feature in its own right (register shuffling for
+//! R4/R5, `x30` save on aarch64 which the prologue does not do today, SysV
+//! stack alignment which six pushes get wrong, a kfunc-address table the JIT
+//! is not given, and a context check the interpreter does at runtime).
+//!
+//! ### What the lowering has to be
+//!
+//! An in-program arena pointer is a slot-relative handle (`crate::arena`), so
+//! the access is `slot_base + handle + off16` — Linux's `[r12 + reg + off]`
+//! shape, with the base pinned for the program's whole body and supplied at
+//! entry, since the same image must run against whatever slot the program was
+//! given. That is a fourth entry argument on [`JitEntry`].
+//!
+//! Every address such an access can compute lies in
+//! `[slot_base - ARENA_MAX_UNDERSHOOT_BYTES, slot_base + ARENA_SLOT_STRIDE)` —
+//! see that constant in `memory::bpf_arena`, which is asserted against the
+//! guards rather than argued. So no verified arena access can reach another
+//! program's arenas, whatever it computes. Cross-program isolation is
+//! structural and needs no per-access check, which is the whole bargain.
+//!
+//! ### The extable is mandatory, not an option
+//!
+//! Gate 3 cannot simply be kept: the verifier records an arena access *as* a
+//! fault site (`fixpoint.rs`'s `access`), so gate 3 refuses every arena program
+//! by itself. Nor can "require the arena fully populated" replace the extable.
+//! Full population is already the default (`ProgArena::new` makes live equal
+//! reserved) and it is not sufficient, because the verifier bounds a
+//! displacement against a fixed 4 GiB window and not against the arena's
+//! extent: the slot's null guard, the space past the last arena, and any gap
+//! are all inside a verified access's reach and all unmapped. A JITed arena
+//! access can therefore fault no matter how the arena is populated, so it
+//! needs an `ExEntry` — which also means gate 3 must relax to "no *non-arena*
+//! fault sites" rather than lift outright, since probe reads have no lowering
+//! either.
+//!
+//! ### Where the fixup must resume, and why not "zero and continue"
+//!
+//! `bpf_extable`'s fixup zeroes a register and resumes at the next instruction,
+//! which is what Linux's `ex_handler_bpf` does. Taking that shape verbatim
+//! would make an out-of-bounds arena access *return a value* under the JIT and
+//! `Trap::ArenaOutOfBounds` under the interpreter — the same program, two
+//! verdicts, decided by whether it happened to clear these gates. That is
+//! precisely the divergence class `crate::jit_glue`'s fuel accounting and
+//! `run_atomic_native`'s ctx zero-fill were both fixed to avoid, and the
+//! differential harness compares trap discriminants specifically to catch it.
+//!
+//! So the fixup should resume at a dedicated arena-fault epilogue that returns
+//! with a distinct out-of-band status, and `run_atomic_native` should turn that
+//! into `Trap::ArenaOutOfBounds`. This costs nothing in the extable — the entry
+//! already carries an arbitrary `fixup_pc` — and satisfies the acceptance
+//! criterion that a wild arena access be a diagnostic rather than a panic:
+//! recovered by the extable, so not fatal, and stopped with a named trap, so
+//! not silent.
+//!
+//! ### One arena, or the two paths still disagree
+//!
+//! With that fixup, the JIT's reachable-and-mapped set is the slot's mapped
+//! pages and the interpreter's is `arena::resolve_in`'s admitted set. They are
+//! equal for a program with **one** arena and not otherwise: `ArenaSlot::carve`
+//! places arenas contiguously, so with two adjacent arenas an 8-byte access
+//! straddling the boundary succeeds natively and traps interpreted
+//! (`resolve_in` admits a range only if it lies inside a single arena — see
+//! `smoke_bpf_arena_straddling_two_arenas_is_refused`, which asserts the two
+//! arenas are VA-contiguous first, so the refusal is the bound and not an
+//! unmapped page). One arena is also the
+//! only program-visible shape, since `narf_arena_base()` names the first and
+//! nothing publishes the rest, so requiring it costs no capability. It does
+//! mean the arena count has to reach this function, which today it does not.
 
 use narf_bpf_verifier::VerifiedProgram;
 use narf_capabilities::{Cap, Grant};

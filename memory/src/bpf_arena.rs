@@ -68,6 +68,15 @@
 //! * `[ARENA_USABLE_BYTES, ARENA_SLOT_STRIDE)` — the tail guard described
 //!   above.
 //!
+//! ## The reachable set is not `[slot_base, slot_base + STRIDE)`
+//!
+//! A JIT lowers an arena access to `slot_base + handle + off16` — Linux's
+//! `[r12 + reg + off]` shape — so the addresses a *verified* access can compute
+//! are what the guards have to cover, and that set extends **below** the slot
+//! base. See [`ARENA_MAX_UNDERSHOOT_BYTES`], which is asserted against the tail
+//! guard rather than described: the null guard alone does not cover the low
+//! end, and the reason it does not is four inferential steps away from here.
+//!
 //! ## Multiple arenas per program
 //!
 //! Supported by the *addressing*: several arenas are placed in one slot by
@@ -145,6 +154,56 @@ pub const ARENA_NULL_GUARD_BYTES: u64 = 4096;
 /// which is the largest arena that can start at [`ARENA_NULL_GUARD_BYTES`] and
 /// still end inside the usable region.
 pub const ARENA_MAX_BYTES: u64 = ARENA_USABLE_BYTES - ARENA_NULL_GUARD_BYTES;
+
+/// Furthest *below* a slot's base that a verified arena access can address.
+///
+/// Zero would be the intuitive answer and it is wrong, which is why this is a
+/// named constant with an assertion under it rather than a remark.
+///
+/// A JIT lowers an arena access to `slot_base + handle + off16`. For a handle
+/// produced by 64-bit arithmetic the low end is safe by construction: the
+/// verifier bounds `p.off + off16` into `[0, ARENA_USABLE_BYTES)` and the
+/// handle sits [`ARENA_NULL_GUARD_BYTES`] above the slot base, so the sum is
+/// never negative. The 32-bit ALU path breaks that. `narf-bpf-verifier`'s
+/// `ARENA_WINDOW_BYTES` note spells out the mechanism: a 32-bit op on an arena
+/// pointer keeps the *abstract* offset at full width while the register keeps
+/// `sum mod 2^32`. The two coincide on `[0, 2^32)` — for the offset. They do
+/// not coincide for the *handle*, which is the offset plus 4096, so a program
+/// can verify `off = 2^32 - ARENA_NULL_GUARD_BYTES` (accepted: `off + off16`
+/// is still inside the window) while the register concretely holds `0`. A
+/// `-32768` displacement on top of that names `slot_base - 32768`.
+///
+/// What catches it is therefore the **previous** slot's tail guard, and for the
+/// first slot the unmapped PML4 slot below [`BPF_ARENA_BASE`]. Both are
+/// asserted below. This is not slack: shrink the tail guard to the 64 KiB
+/// Linux derives from the ISA (`arena.c:45`) and the bound still holds, but
+/// shrink it to zero — a 4 GiB stride — and an undershoot lands in the
+/// neighbour's arena.
+pub const ARENA_MAX_UNDERSHOOT_BYTES: u64 = 1 << 15;
+
+// `off16` is the ISA's signed 16-bit displacement field, so the deepest
+// undershoot is `-i16::MIN`. Asserted rather than written as a literal twice.
+const _: () = assert!(
+    ARENA_MAX_UNDERSHOOT_BYTES == i16::MIN.unsigned_abs() as u64,
+    "the undershoot is the ISA's most negative displacement, nothing else"
+);
+const _: () = assert!(
+    ARENA_MAX_UNDERSHOOT_BYTES <= ARENA_SLOT_STRIDE - ARENA_USABLE_BYTES,
+    "a slot's tail guard must absorb an undershoot from the slot above it, or a \
+     32-bit-truncated handle with a negative displacement reaches the previous \
+     program's arenas"
+);
+// And the first slot has no predecessor inside the window, so its undershoot
+// leaves the window entirely. That is only safe because the window starts at a
+// PML4 boundary whose lower neighbour is an unmapped guard slot — the property
+// `bpf_text`'s `BPF_ARENA_PML4_SLOT - 1` check enforces at runtime, which says
+// nothing unless the window base is that slot's first byte.
+const _: () = assert!(
+    BPF_ARENA_BASE % SLOT_SPAN == 0,
+    "the arena window must begin at its PML4 slot's base, or an undershoot from \
+     the first arena slot lands in whatever precedes the window instead of in \
+     the guard slot below it"
+);
 
 // The guards are the neighbouring PML4 slots. Assert here rather than
 // commenting, so a future edit to the slot constants breaks the build.
