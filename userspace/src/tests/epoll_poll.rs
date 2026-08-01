@@ -7,6 +7,12 @@ use super::*;
 
 /// poll: 1 fd, 0 timeout, data ready → returns 1
 fn smoke_poll_one_fd_ready_returns_one() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // hands it a kernel-stack `pollfd` array as a stand-in user buffer.
+    // `poll_common` confines the array to the user half, so the scoped opt-in
+    // is what keeps the fixture working without weakening the production
+    // predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
     let fd = install_ready_file(task, narf_filesystem::POLL_IN);
 
@@ -42,6 +48,12 @@ kernel_test_in!("userspace", smoke_poll_one_fd_ready_returns_one);
 
 /// poll: 1 fd, 0 timeout, no data → returns 0 immediately
 fn smoke_poll_one_fd_not_ready_returns_zero() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // hands it a kernel-stack `pollfd` array as a stand-in user buffer.
+    // `poll_common` confines the array to the user half, so the scoped opt-in
+    // is what keeps the fixture working without weakening the production
+    // predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
     let fd = install_ready_file(task, 0); // not ready
 
@@ -71,6 +83,12 @@ kernel_test_in!("userspace", smoke_poll_one_fd_not_ready_returns_zero);
 
 /// poll: invalid fd gives POLLNVAL in revents, returns 1
 fn smoke_poll_invalid_fd_returns_pollnval() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // hands it a kernel-stack `pollfd` array as a stand-in user buffer.
+    // `poll_common` confines the array to the user half, so the scoped opt-in
+    // is what keeps the fixture working without weakening the production
+    // predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let _task = setup_poll_test();
 
     let mut pfd: [u8; 8] = [0; 8];
@@ -104,6 +122,12 @@ kernel_test_in!("userspace", smoke_poll_invalid_fd_returns_pollnval);
 
 /// poll: POLLHUP signalled when closed-pipe end is ready
 fn smoke_poll_pollhup_on_closed_read_end() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // hands it a kernel-stack `pollfd` array as a stand-in user buffer.
+    // `poll_common` confines the array to the user half, so the scoped opt-in
+    // is what keeps the fixture working without weakening the production
+    // predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
     // Simulate a half-closed pipe: the read end has POLL_HUP set.
     let fd = install_ready_file(task, narf_filesystem::POLL_HUP);
@@ -156,6 +180,12 @@ kernel_test_in!("userspace", smoke_poll_zero_fds_returns_zero);
 
 /// poll: multiple fds, only some ready → correct count
 fn smoke_poll_multiple_fds_partial_ready() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // hands it a kernel-stack `pollfd` array as a stand-in user buffer.
+    // `poll_common` confines the array to the user half, so the scoped opt-in
+    // is what keeps the fixture working without weakening the production
+    // predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
     let fd_ready = install_ready_file(task, narf_filesystem::POLL_IN);
     let fd_notready = install_ready_file(task, 0);
