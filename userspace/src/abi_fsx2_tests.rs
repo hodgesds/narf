@@ -11,8 +11,8 @@
 //!   - open_by_handle_at: EINVAL (right handle type, zero handle_bytes),
 //!     EFAULT (unreadable handle pointer).
 //!   - mount: bind-mount success path; -1 sentinel on an unreadable target.
-//!   - new-mount-API: fsconfig ENODEV (un-buildable fsname) + FSCONFIG_SET_STRING
-//!     no-op success; move_mount EINVAL (valid fd, relative target);
+//!   - new-mount-API: fsconfig ENODEV (un-buildable fsname) + tmpfs
+//!     FSCONFIG_SET_STRING application; move_mount EINVAL (valid fd, relative target);
 //!     open_tree ENOENT (absolute path, no mount); fspick EINVAL (relative);
 //!     mount_setattr EINVAL on the size>64 upper bound.
 //!
@@ -1341,10 +1341,10 @@ fn smoke_abi_fsx2_fsconfig_enodev_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_fsconfig_enodev_neg);
 
-// ── fsconfig: FSCONFIG_SET_STRING is accepted (no-op success) ─────────
+// ── fsconfig: FSCONFIG_SET_STRING reaches tmpfs creation ──────────────
 //
-// The SET_STRING arm validates the key/value strings are readable and
-// returns 0. Distinct command arm from the first file's CMD_CREATE.
+// The SET_STRING arm retains the key/value for CMD_CREATE. A supported value
+// builds successfully; an unsupported THP policy is rejected by TmpFs.
 
 fn smoke_abi_fsx2_fsconfig_set_string_pos() -> TestResult {
     with_setup(|| {
@@ -1362,13 +1362,58 @@ fn smoke_abi_fsx2_fsconfig_set_string_pos() -> TestResult {
             arg3: val.as_ptr() as u64,
             ..Default::default()
         };
-        match call(Syscall::Fsconfig.raw(), args) {
+        if call(Syscall::Fsconfig.raw(), args) != Some(0) {
+            return Err("fsconfig(SET_STRING) should retain a readable tmpfs option");
+        }
+        let create = SyscallArgs {
+            arg0: fd,
+            arg1: FSCONFIG_CMD_CREATE,
+            ..Default::default()
+        };
+        match call(Syscall::Fsconfig.raw(), create) {
             Some(0) => Ok(()),
-            _ => Err("fsconfig(SET_STRING) should accept a readable key/value and return 0"),
+            _ => Err("fsconfig(CMD_CREATE) rejected a supported tmpfs size option"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_fsconfig_set_string_pos);
+
+fn smoke_abi_fsx2_fsconfig_tmpfs_option_rejected() -> TestResult {
+    with_setup(|| {
+        let fsname = b"tmpfs\0";
+        let fd = match call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("fsopen setup failed"),
+        };
+        let key = b"huge\0";
+        let val = b"always\0";
+        if call(
+            Syscall::Fsconfig.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: FSCONFIG_SET_STRING,
+                arg2: key.as_ptr() as u64,
+                arg3: val.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("fsconfig(SET_STRING) setup failed");
+        }
+        match call(
+            Syscall::Fsconfig.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: FSCONFIG_CMD_CREATE,
+                ..Default::default()
+            },
+        ) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("tmpfs must reject an unsupported huge policy at CMD_CREATE"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_fsconfig_tmpfs_option_rejected);
 
 // ── move_mount: EINVAL on a relative target (valid from_dfd) ──────────
 //

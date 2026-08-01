@@ -19,7 +19,7 @@
 //!   3. `smoke_memfs_nested_dirs_lookup`     — mkdir a/b/c; lookup_dir traverses; miss → None
 //!   4. `smoke_memfs_dir_listing_enumerate`  — enumerate returns created entries
 //!   5. `smoke_memfs_unlink_rmdir_semantics` — unlink removes; rmdir empty ok; rmdir non-empty fails
-//!   6. `smoke_memfs_rename_within_and_cross`— rename within-dir overwrites; cross-dir Unsupported
+//!   6. `smoke_memfs_rename_within_and_cross`— rename within-dir overwrites; cross-dir moves
 //!   7. `smoke_memfs_mode_perms_roundtrip`   — create mode, stat shows it; set_perms/chmod round-trip
 //!   8. `smoke_memfs_truncate_grow_shrink`   — truncate grows (zero-fill) / shrinks; stat reflects
 //!   9. `smoke_memfs_distinct_inodes`        — distinct files, and dir vs parent, have distinct ino()
@@ -33,7 +33,10 @@ use alloc::vec;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::{bootstrap_mount_authority, registry, resolve, FileType, FsError, FsInstance, MemFs};
+use crate::{
+    bootstrap_mount_authority, registry, resolve, FileType, FsError, FsInstance, MemFs, RamFs,
+    RamFsOptions, TmpFs, TmpFsOptions,
+};
 
 // ── poll_once helper ──────────────────────────────────────────────────
 //
@@ -333,8 +336,8 @@ kernel_test_in!("filesystem/memfs", smoke_memfs_unlink_rmdir_semantics);
 //
 // MemFs `DirOps::rename` renames within the SAME directory and ATOMICALLY
 // REPLACES an existing destination (the write-temp-then-rename save idiom).
-// Cross-directory rename goes through `rename_to`, which MemDir does not
-// override → the trait default returns `Unsupported`. Both facts are pinned.
+// Cross-directory rename goes through `rename_to` and must move the same
+// inode into the destination directory.
 
 fn smoke_memfs_rename_within_and_cross() -> TestResult {
     const OLD: &[u8] = b"original contents";
@@ -396,16 +399,26 @@ fn smoke_memfs_rename_within_and_cross() -> TestResult {
         return TestResult::Fail("dst was not replaced by overwriting rename");
     }
 
-    // Cross-directory rename via rename_to is not implemented by MemDir →
-    // the DirOps trait default returns Unsupported.
+    // Cross-directory rename preserves the inode and contents.
     let subdir = match poll_once(root.mkdir("dir2")) {
         Some(Ok(d)) => d,
         _ => return TestResult::Fail("mkdir dir2 failed"),
     };
-    let cross = poll_once(root.rename_to("dst", subdir.as_ref(), "moved", 0));
-    match cross {
-        Some(Err(FsError::Unsupported)) => {}
-        _ => return TestResult::Fail("cross-dir rename_to did not report Unsupported"),
+    let moved_ino = dst2.ino();
+    if poll_once(root.rename_to("dst", subdir.as_ref(), "moved", 0)).map(|result| result.is_ok())
+        != Some(true)
+    {
+        return TestResult::Fail("cross-dir rename_to failed");
+    }
+    if root.lookup("dst").is_some() {
+        return TestResult::Fail("cross-dir rename left the old name behind");
+    }
+    let moved = match subdir.lookup("moved") {
+        Some(file) => file,
+        None => return TestResult::Fail("cross-dir rename did not create destination"),
+    };
+    if moved.ino() != moved_ino {
+        return TestResult::Fail("cross-dir rename changed inode identity");
     }
 
     TestResult::Pass
@@ -642,3 +655,311 @@ fn smoke_memfs_registry_mount_roundtrip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/memfs", smoke_memfs_registry_mount_roundtrip);
+
+fn smoke_tmpfs_linux_mount_options() -> TestResult {
+    let parsed = match TmpFsOptions::parse(
+        "size=25%,nr_inodes=2K,mode=0710,uid=12,gid=34,noswap,inode32,huge=never",
+        4096,
+        1,
+        2,
+    ) {
+        Ok(parsed) => parsed,
+        Err(_) => return TestResult::Fail("valid Linux tmpfs options were rejected"),
+    };
+    if parsed.max_blocks != Some(1024)
+        || parsed.max_inodes != Some(2048)
+        || parsed.root_mode != 0o710
+        || parsed.root_uid != 12
+        || parsed.root_gid != 34
+        || !parsed.noswap
+        || parsed.inode64
+    {
+        return TestResult::Fail("tmpfs option values were parsed incorrectly");
+    }
+    if TmpFsOptions::parse("huge=always", 4096, 0, 0).is_ok()
+        || TmpFsOptions::parse("size=101%", 4096, 0, 0).is_ok()
+        || TmpFsOptions::parse("mode=888", 4096, 0, 0).is_ok()
+    {
+        return TestResult::Fail("unsupported or malformed tmpfs option was accepted");
+    }
+    let ramfs = match RamFsOptions::parse("size=1M,unknown=value,mode=0701", 9, 10) {
+        Ok(parsed) => parsed,
+        Err(_) => return TestResult::Fail("ramfs rejected historically ignored options"),
+    };
+    if ramfs.root_mode != 0o701 || ramfs.root_uid != 9 || ramfs.root_gid != 10 {
+        return TestResult::Fail("ramfs mode/owner options were parsed incorrectly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_linux_mount_options);
+
+fn smoke_tmpfs_sparse_block_and_inode_limits() -> TestResult {
+    let fs = match TmpFs::from_options_with_total("size=8K,nr_inodes=3", 1024, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+    let initial = match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat,
+        _ => return TestResult::Fail("initial tmpfs statfs failed"),
+    };
+    if initial.blocks != 2 || initial.blocks_free != 2 || initial.files_free != 2 {
+        return TestResult::Fail("initial tmpfs statfs limits are wrong");
+    }
+    let file = match poll_once(root.create("sparse")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs file creation failed"),
+    };
+    if poll_once(file.truncate(1 << 30)).map(|result| result.is_ok()) != Some(true) {
+        return TestResult::Fail("sparse truncate failed");
+    }
+    let after_hole = match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat,
+        _ => return TestResult::Fail("tmpfs statfs after hole failed"),
+    };
+    if after_hole.blocks_free != 2 || file.stat().blocks != 0 {
+        return TestResult::Fail("sparse truncate consumed tmpfs blocks");
+    }
+    if poll_once(file.write(0, b"a")).map(|result| result.is_ok()) != Some(true)
+        || poll_once(file.write(8192, b"b")).map(|result| result.is_ok()) != Some(true)
+    {
+        return TestResult::Fail("writes within tmpfs block limit failed");
+    }
+    if !matches!(
+        poll_once(file.write(16384, b"c")),
+        Some(Err(FsError::NoSpace))
+    ) {
+        return TestResult::Fail("tmpfs block limit did not return NoSpace");
+    }
+    let full = match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat,
+        _ => return TestResult::Fail("tmpfs full statfs failed"),
+    };
+    if full.blocks_free != 0 || file.stat().blocks != 16 {
+        return TestResult::Fail("tmpfs allocated-page accounting is wrong");
+    }
+    if poll_once(file.truncate(4096)).map(|result| result.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs shrink failed");
+    }
+    let shrunk = match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat,
+        _ => return TestResult::Fail("tmpfs shrunk statfs failed"),
+    };
+    if shrunk.blocks_free != 1 || file.stat().blocks != 8 {
+        return TestResult::Fail("tmpfs shrink did not release blocks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/tmpfs",
+    smoke_tmpfs_sparse_block_and_inode_limits
+);
+
+fn smoke_tmpfs_unlinked_open_inode_lifetime() -> TestResult {
+    let fs = match TmpFs::from_options_with_total("size=16K,nr_inodes=2", 1024, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+    let held = match poll_once(root.create("held")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("first inode reservation failed"),
+    };
+    if !matches!(poll_once(root.create("full")), Some(Err(FsError::NoSpace))) {
+        return TestResult::Fail("tmpfs inode limit was not enforced");
+    }
+    if poll_once(root.unlink("held")).map(|result| result.is_ok()) != Some(true) {
+        return TestResult::Fail("unlink of held tmpfs file failed");
+    }
+    if !matches!(
+        poll_once(root.create("still-full")),
+        Some(Err(FsError::NoSpace))
+    ) {
+        return TestResult::Fail("unlink released an inode still held open");
+    }
+    drop(held);
+    if poll_once(root.create("reused")).map(|result| result.is_ok()) != Some(true) {
+        return TestResult::Fail("last close did not release tmpfs inode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_unlinked_open_inode_lifetime);
+
+fn smoke_tmpfs_unlinked_open_fifo_inode_lifetime() -> TestResult {
+    let fs = match TmpFs::from_options_with_total("size=16K,nr_inodes=2", 1024, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+    let node = match poll_once(root.mknod("fifo", FileType::Fifo, 0)) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("tmpfs FIFO creation failed"),
+    };
+    let shared = match node.fifo_shared() {
+        Some(shared) => shared,
+        None => return TestResult::Fail("tmpfs FIFO has no shared state"),
+    };
+    let handle = crate::fifo::FifoHandle::open_owned(
+        shared,
+        node.clone(),
+        node.ino(),
+        node.stat().mode.perms,
+        0,
+        0,
+        true,
+        true,
+    );
+    drop(node);
+    if poll_once(root.unlink("fifo")).map(|result| result.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs FIFO unlink failed");
+    }
+    if !matches!(
+        poll_once(root.create("still-full")),
+        Some(Err(FsError::NoSpace))
+    ) {
+        return TestResult::Fail("open FIFO did not retain its tmpfs inode charge");
+    }
+    drop(handle);
+    if poll_once(root.create("reused")).map(|result| result.is_ok()) != Some(true) {
+        return TestResult::Fail("closing unlinked FIFO did not release inode charge");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/tmpfs",
+    smoke_tmpfs_unlinked_open_fifo_inode_lifetime
+);
+
+fn smoke_tmpfs_fallocate_seek_and_hole_punch() -> TestResult {
+    const KEEP_SIZE: u32 = 0x01;
+    const PUNCH_HOLE: u32 = 0x02;
+    const SEEK_DATA: u32 = 3;
+    const SEEK_HOLE: u32 = 4;
+    let fs = match TmpFs::from_options_with_total("size=16K,nr_inodes=3", 1024, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let file = match poll_once(fs.root().create("allocated")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs file creation failed"),
+    };
+    if poll_once(file.truncate(16 * 1024)).map(|result| result.is_ok()) != Some(true)
+        || poll_once(file.fallocate(KEEP_SIZE, 4096, 4096)).map(|result| result.is_ok())
+            != Some(true)
+        || poll_once(file.seek(0, SEEK_DATA)) != Some(Ok(4096))
+        || poll_once(file.seek(4096, SEEK_HOLE)) != Some(Ok(8192))
+    {
+        return TestResult::Fail("tmpfs fallocate or sparse seek semantics are wrong");
+    }
+    if poll_once(file.fallocate(PUNCH_HOLE | KEEP_SIZE, 4096, 4096)).map(|result| result.is_ok())
+        != Some(true)
+        || poll_once(file.seek(0, SEEK_DATA)).is_none()
+    {
+        return TestResult::Fail("tmpfs hole punch failed");
+    }
+    if !matches!(
+        poll_once(file.seek(0, SEEK_DATA)),
+        Some(Err(FsError::NoSpace))
+    ) || file.stat().size != 16 * 1024
+        || file.stat().blocks != 0
+    {
+        return TestResult::Fail("tmpfs punched file did not become a sparse hole");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/tmpfs",
+    smoke_tmpfs_fallocate_seek_and_hole_punch
+);
+
+fn smoke_tmpfs_cross_dir_link_and_special_node() -> TestResult {
+    let fs = match TmpFs::from_options_with_total("size=16K,nr_inodes=8", 1024, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+    let dir = match poll_once(root.mkdir("dir")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("tmpfs mkdir failed"),
+    };
+    let file = match poll_once(root.create("source")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if poll_once(root.link_to("source", dir.as_ref(), "linked")).map(|result| result.is_ok())
+        != Some(true)
+    {
+        return TestResult::Fail("cross-directory tmpfs hard link failed");
+    }
+    if dir.lookup("linked").map(|linked| linked.ino()) != Some(file.ino()) {
+        return TestResult::Fail("tmpfs hard link did not preserve inode");
+    }
+    let node = match poll_once(root.mknod("ttyX", FileType::Special, (4 << 8) | 1)) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("tmpfs character-device mknod failed"),
+    };
+    if node.stat().mode.file_type != FileType::Special || node.rdev() != ((4 << 8) | 1) {
+        return TestResult::Fail("tmpfs special node lost type or rdev");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/tmpfs",
+    smoke_tmpfs_cross_dir_link_and_special_node
+);
+
+fn smoke_tmpfs_xattrs_and_reconfigure() -> TestResult {
+    let fs = match TmpFs::from_options_with_total("size=16K,nr_inodes=8", 1024, 7, 8) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+    if root.dir_mode() != 0o1777 || root.dir_owners() != (7, 8) {
+        return TestResult::Fail("tmpfs default root metadata is not Linux-shaped");
+    }
+    let file = match poll_once(root.create("xattr")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if poll_once(file.set_xattr("user.test", b"value", 1)).map(|result| result.is_ok())
+        != Some(true)
+        || poll_once(file.get_xattr("user.test")) != Some(Ok(b"value".to_vec()))
+        || poll_once(file.list_xattr()) != Some(Ok(b"user.test\0".to_vec()))
+    {
+        return TestResult::Fail("tmpfs xattr round-trip failed");
+    }
+    if fs.reconfigure("size=4K,nr_inodes=4").is_err() {
+        return TestResult::Fail("valid tmpfs shrink remount failed");
+    }
+    let resized = match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat,
+        _ => return TestResult::Fail("tmpfs statfs after reconfigure failed"),
+    };
+    if resized.blocks != 1 || resized.files != 4 {
+        return TestResult::Fail("tmpfs reconfigure did not update statfs limits");
+    }
+    if fs.reconfigure("nr_inodes=1").is_ok() {
+        return TestResult::Fail("tmpfs remount accepted an inode limit below usage");
+    }
+
+    let ramfs = match RamFs::from_options("size=1,mode=0700", 3, 4) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("ramfs construction failed"),
+    };
+    let ram_root = ramfs.root();
+    let ram_stat = match poll_once(ramfs.statfs()) {
+        Some(Ok(stat)) => stat,
+        _ => return TestResult::Fail("ramfs statfs failed"),
+    };
+    if ramfs.name() != "ramfs"
+        || ram_root.dir_mode() != 0o700
+        || ram_root.dir_owners() != (3, 4)
+        || ram_stat.blocks != 0
+        || ram_stat.files != 0
+        || ramfs.reconfigure("size=1M").is_ok()
+    {
+        return TestResult::Fail("ramfs identity/options/statfs semantics are wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_xattrs_and_reconfigure);

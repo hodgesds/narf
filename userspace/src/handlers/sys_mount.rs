@@ -50,8 +50,18 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         copy_user_cstr(args.arg2, 256).unwrap_or_default()
     };
     let flags = args.arg3;
-    // arg4 = fs-specific `data` (e.g. tmpfs "mode=0700,size=…"); accepted but
-    // not parsed — NARF's MemFs has no per-mount options yet.
+    // arg4 = fs-specific `data` (e.g. tmpfs "mode=0700,size=64M").
+    let data = if args.arg4 == 0 {
+        alloc::string::String::new()
+    } else {
+        match copy_user_cstr(args.arg4, 4096) {
+            Some(data) => data,
+            None => {
+                ctx.set_return(efault);
+                return;
+            }
+        }
+    };
 
     // Propagation-only change (MS_SLAVE/MS_SHARED/MS_PRIVATE/MS_UNBINDABLE,
     // optionally |MS_REC): change the propagation type of the mount at
@@ -116,11 +126,27 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // a request to create another bind. systemd uses this after constructing
     // each service's private mount namespace. NARF does not yet persist
     // per-mount VFS flags, so validate the target and accept the flag update.
-    if (flags & MS_REMOUNT) != 0 && fstype.is_empty() {
+    if (flags & MS_REMOUNT) != 0 {
         let exists = current_mount_list().iter().any(|mount| mount == &target)
             || resolve_dir_absolute(target.as_str()).is_some()
             || current_file_exists(target.as_str());
-        ctx.set_return(if exists { SyscallReturn::ok(0) } else { enoent });
+        if !exists {
+            ctx.set_return(enoent);
+            return;
+        }
+        if !data.is_empty() {
+            let result = current_fs_arc_at(&target).map(|fs| fs.reconfigure(&data));
+            ctx.set_return(match result {
+                Some(Ok(())) => SyscallReturn::ok(0),
+                Some(Err(narf_filesystem::FsError::NoSpace)) => {
+                    SyscallReturn::ok((-28i64) as u64)
+                }
+                Some(Err(_)) => einval,
+                None => enoent,
+            });
+            return;
+        }
+        ctx.set_return(SyscallReturn::ok(0));
         return;
     }
 
@@ -137,7 +163,21 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // the mount(2) syscall itself is only wired under linux-compat, so the
     // non-linux-compat build just needs this to compile (no pseudo-fs there).
     #[cfg(feature = "linux-compat")]
-    let is_pseudo_fs = crate::mount_api::build_fs(fstype.as_str()).is_some();
+    let is_pseudo_fs = {
+        let (uid, gid) = current_fs_ids();
+        match crate::mount_api::build_fs_with_options(fstype.as_str(), data.as_str(), uid, gid) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(narf_filesystem::FsError::NoSpace) => {
+                ctx.set_return(SyscallReturn::ok((-28i64) as u64));
+                return;
+            }
+            Err(_) => {
+                ctx.set_return(einval);
+                return;
+            }
+        }
+    };
     #[cfg(not(feature = "linux-compat"))]
     let is_pseudo_fs = false;
     if is_pseudo_fs && current_mount_list().iter().any(|m| m == &target) {
@@ -232,10 +272,29 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // fstypes (fat/vfat/ext…) fall through below because build_fs can't
     // synthesize them without a device.
     #[cfg(feature = "linux-compat")]
-    if let Some(fs) = crate::mount_api::build_fs(fstype.as_str()) {
-        return match current_mount_arc(&auth, target.as_str(), fs) {
-            Ok(_) | Err(_) => ctx.set_return(SyscallReturn::ok(0)),
-        };
+    {
+        let (mount_uid, mount_gid) = current_fs_ids();
+        match crate::mount_api::build_fs_with_options(
+            fstype.as_str(),
+            data.as_str(),
+            mount_uid,
+            mount_gid,
+        ) {
+            Ok(Some(fs)) => {
+                return match current_mount_arc(&auth, target.as_str(), fs) {
+                    Ok(_) | Err(_) => ctx.set_return(SyscallReturn::ok(0)),
+                };
+            }
+            Err(narf_filesystem::FsError::NoSpace) => {
+                ctx.set_return(SyscallReturn::ok((-28i64) as u64));
+                return;
+            }
+            Err(_) => {
+                ctx.set_return(einval);
+                return;
+            }
+            Ok(None) => {}
+        }
     }
 
     // overlayfs (union mount). Linux passes the layer paths in the mount(2)

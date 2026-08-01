@@ -2130,10 +2130,14 @@ fn gen_filesystems() -> String {
     // Linux lists *registered* filesystem types, not just mounted ones. The
     // pseudo-filesystems NARF always provides are present whether or not an
     // instance happens to be mounted in this address space.
-    for n in ["sysfs", "proc", "devtmpfs", "devpts", "tmpfs", "9p"] {
+    for n in [
+        "sysfs", "proc", "devtmpfs", "devpts", "tmpfs", "ramfs", "9p",
+    ] {
         names.insert(String::from(n));
     }
-    let nodev = ["sysfs", "proc", "devtmpfs", "devpts", "tmpfs", "9p"];
+    let nodev = [
+        "sysfs", "proc", "devtmpfs", "devpts", "tmpfs", "ramfs", "9p",
+    ];
     let mut s = String::new();
     for n in names {
         if nodev.contains(&n.as_str()) {

@@ -76,6 +76,18 @@ fn mount_args(source: &[u8], target: &[u8], fstype: &[u8], flags: u64) -> Syscal
     }
 }
 
+fn mount_args_with_data(
+    source: &[u8],
+    target: &[u8],
+    fstype: &[u8],
+    flags: u64,
+    data: &[u8],
+) -> SyscallArgs {
+    let mut args = mount_args(source, target, fstype, flags);
+    args.arg4 = data.as_ptr() as u64;
+    args
+}
+
 // Linux umount2(2) ABI: (target, flags), NUL-terminated target.
 fn unmount_args(target: &[u8], flags: u64) -> SyscallArgs {
     SyscallArgs {
@@ -155,6 +167,93 @@ fn smoke_mount_tmpfs() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/mount", smoke_mount_tmpfs);
+
+// Classic mount(2) must carry its filesystem-specific data string all the way
+// through sys_mount -> build_fs_with_options -> TmpFs, rather than accepting
+// and discarding Linux's tmpfs limits and root metadata.
+fn smoke_mount_tmpfs_applies_linux_options() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_0a);
+    crate::handlers::__test_root_dir_reset();
+    const TARGET: &str = "/tmpfs-linux-options";
+    let _ = unmount_for_test(TARGET);
+
+    let mut ctx = StubCtx {
+        args: mount_args_with_data(
+            b"tmpfs\0",
+            b"/tmpfs-linux-options\0",
+            b"tmpfs\0",
+            0,
+            b"size=8K,nr_inodes=4,mode=0710,uid=12,gid=34,noswap\0",
+        ),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("tmpfs mount with Linux options failed");
+    }
+
+    let checked = narf_filesystem::registry()
+        .fs_arc_at(TARGET)
+        .and_then(|fs| {
+            let root = fs.root();
+            let stat = crate::handlers::poll_blocking(fs.statfs())?.ok()?;
+            Some((
+                fs.name() == "tmpfs",
+                root.dir_mode(),
+                root.dir_owners(),
+                stat.blocks,
+                stat.blocks_free,
+                stat.files,
+                stat.files_free,
+            ))
+        });
+    let _ = unmount_for_test(TARGET);
+    match checked {
+        Some((true, 0o710, (12, 34), 2, 2, 4, 3)) => TestResult::Pass,
+        _ => TestResult::Fail("tmpfs mount options did not reach the filesystem instance"),
+    }
+}
+kernel_test_in!("userspace/mount", smoke_mount_tmpfs_applies_linux_options);
+
+fn smoke_mount_ramfs_has_linux_identity() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_0b);
+    crate::handlers::__test_root_dir_reset();
+    const TARGET: &str = "/ramfs-linux-options";
+    let _ = unmount_for_test(TARGET);
+    let mut ctx = StubCtx {
+        args: mount_args_with_data(
+            b"ramfs\0",
+            b"/ramfs-linux-options\0",
+            b"ramfs\0",
+            0,
+            b"size=1M,unknown=ignored,mode=0701\0",
+        ),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("ramfs mount failed");
+    }
+    let checked = narf_filesystem::registry()
+        .fs_arc_at(TARGET)
+        .and_then(|fs| {
+            let stat = crate::handlers::poll_blocking(fs.statfs())?.ok()?;
+            Some((
+                fs.name() == "ramfs",
+                fs.root().dir_mode(),
+                stat.blocks,
+                stat.files,
+            ))
+        });
+    let _ = unmount_for_test(TARGET);
+    match checked {
+        Some((true, 0o701, 0, 0)) => TestResult::Pass,
+        _ => TestResult::Fail("ramfs identity, mode, or unlimited statfs is wrong"),
+    }
+}
+kernel_test_in!("userspace/mount", smoke_mount_ramfs_has_linux_identity);
 
 // ── Smoke 2: umount2 /tmp ─────────────────────────────────────────
 fn smoke_umount_tmpfs() -> TestResult {

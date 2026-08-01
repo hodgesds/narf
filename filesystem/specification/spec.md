@@ -197,18 +197,60 @@ pub fn create_file(d: &DirCap, name: &str, cap: …) -> impl Future<Output = Fil
 pub fn mkdir(d: &DirCap, name: &str, cap: …)       -> impl Future<Output = DirCap>;
 pub fn unlink(d: &DirCap, name: &str, cap: …)      -> impl Future<Output = ()>;
 pub fn rename(src: &DirCap, src_name: &str, dst: &DirCap, dst_name: &str, cap: …) -> impl Future<Output = ()>;
+
+pub trait DirOps {
+    fn dir_owners(&self) -> (u32, u32);
+    fn set_dir_owners(&self, uid: u32, gid: u32);
+}
 ```
+
+Directory-owner accessors default to root ownership and a no-op setter for
+read-only/synthetic filesystems. Writable in-memory filesystems preserve the
+values through mount-root `uid=`/`gid=`, mkdir inheritance, path stat,
+directory-fd stat, and access checks.
 
 ### 3.5 Mount
 
 ```rust
 pub fn mount(on: &DirCap, fs: Cap<FsInstance, Attach>, opts: MountOpts) -> Cap<MountPoint, _>;
 pub fn unmount(mp: Cap<MountPoint, Own>) -> impl Future<Output = ()>;
+
+pub trait FsInstance {
+    fn statfs(&self) -> impl Future<Output = Result<FsStat, FsError>>;
+    fn reconfigure(&self, options: &str) -> Result<(), FsError>;
+}
 ```
 
 A mount is just another capability; removing it closes access via
 that path. Existing open caps on nodes across the mount continue to
 work (refcount-style) until they too are released.
+
+#### 3.5.1 Linux tmpfs and ramfs
+
+`TmpFs` is a distinct Linux-compatible in-memory filesystem instance, rather
+than an alias for unlimited `MemFs`. `TmpFsOptions` parses `size=`,
+`nr_blocks=`, `nr_inodes=`, `mode=`, `uid=`, `gid=`, `noswap`, `inode32`,
+`inode64`, `huge=never`, and the allocation policies NARF can truthfully
+honour (`mpol=default|local`). Default block and inode limits are half of
+managed RAM pages; a zero limit means unlimited. Files are sparse page-indexed
+objects: truncate growth creates holes, allocated pages drive `stat.blocks`
+and `statfs`, and the mount enforces block/inode limits with
+`FsError::NoSpace`. `reconfigure` permits supported live limit changes but
+rejects a limit below current use. Since NARF has no swap-backed shmem path,
+all mounts have `noswap` behaviour even when the option is omitted.
+
+`RamFs` shares the in-memory inode and sparse-data semantics but is always
+unlimited, unswappable, and non-resizable. It accepts `mode=` and, matching
+Linux ramfs's historical parser, ignores unknown mount parameters. Its
+filesystem name and magic remain distinct from tmpfs (`ramfs`, 0x858458f6;
+tmpfs, 0x01021994).
+
+Both filesystems support regular files, directories, symlinks, FIFOs,
+character/block special nodes, sockets, hard links and cross-directory atomic
+rename within one instance, `O_TMPFILE`, sparse `SEEK_DATA`/`SEEK_HOLE`, hole
+punch/zero-range/preallocation, and regular-file `user.*`, `trusted.*`, and
+`security.*` xattrs. Inodes and allocated pages remain charged until the last
+directory entry/open reference drops.
 
 Linux-compat mount namespaces hold a private snapshot of the mount table.
 Mount, bind-mount, and unmount operations after `CLONE_NEWNS` mutate that
@@ -259,6 +301,8 @@ pub trait Filesystem: Send + Sync {
 }
 
 pub trait DirOps: Send + Sync {
+    fn dir_owners(&self) -> (u32, u32);
+    fn set_dir_owners(&self, uid: u32, gid: u32);
     async fn fsync(&self, data_only: bool) -> Result<(), FsError>;
     async fn syncfs(&self) -> Result<(), FsError>;
     /* … */
@@ -268,6 +312,8 @@ pub trait FsInstance: Send + Sync {
     fn root(&self) -> Arc<dyn DirOps>;
     fn name(&self) -> &str;
     fn backing_identity(&self) -> usize;
+    async fn statfs(&self) -> Result<FsStat, FsError>;
+    fn reconfigure(&self, options: &str) -> Result<(), FsError>;
 }
 ```
 

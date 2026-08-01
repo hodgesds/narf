@@ -181,6 +181,9 @@ impl FileOps for FifoNode {
 /// shared ring, with EOF and broken-pipe keyed on the peer counts.
 pub struct FifoHandle {
     shared: Arc<FifoShared>,
+    /// Retains a named VFS inode after unlink until this open description
+    /// closes. Anonymous/test handles leave this empty.
+    _inode_owner: Option<Arc<dyn FileOps>>,
     ino: u64,
     perms: u16,
     uid: u32,
@@ -212,6 +215,44 @@ impl FifoHandle {
         can_read: bool,
         can_write: bool,
     ) -> Self {
+        Self::open_inner(shared, None, ino, perms, uid, gid, can_read, can_write)
+    }
+
+    /// Open a named FIFO and retain the filesystem node that owns its inode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_owned(
+        shared: Arc<FifoShared>,
+        inode_owner: Arc<dyn FileOps>,
+        ino: u64,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+        can_read: bool,
+        can_write: bool,
+    ) -> Self {
+        Self::open_inner(
+            shared,
+            Some(inode_owner),
+            ino,
+            perms,
+            uid,
+            gid,
+            can_read,
+            can_write,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_inner(
+        shared: Arc<FifoShared>,
+        inode_owner: Option<Arc<dyn FileOps>>,
+        ino: u64,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+        can_read: bool,
+        can_write: bool,
+    ) -> Self {
         if can_read {
             shared.readers.fetch_add(1, Ordering::AcqRel);
         }
@@ -220,6 +261,7 @@ impl FifoHandle {
         }
         FifoHandle {
             shared,
+            _inode_owner: inode_owner,
             ino,
             perms,
             uid,

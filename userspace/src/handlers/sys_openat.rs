@@ -12,7 +12,7 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
     let dirfd = args.arg0 as i64;
     let path_uptr = args.arg1;
     let flags = args.arg2;
-    let _mode = args.arg3;
+    let mode = args.arg3 as u32;
     let path_str = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {
@@ -64,7 +64,7 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
         let task = current_task_id();
         // Prefer reopening the fd's real backing path with the caller's flags.
         if let Some(p) = fd_path_for_task(task, n).filter(|p| p.starts_with('/')) {
-            open_impl(ctx, p, flags, 0, 0);
+            open_impl(ctx, p, flags, 0, 0, mode);
             return;
         }
         // Pathless fd (memfd, pipe, socket, eventfd) → share its FileOps in a
@@ -89,7 +89,7 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-2i64) as u64));
         return;
     }
-    open_impl(ctx, effective, flags, 0, 0);
+    open_impl(ctx, effective, flags, 0, 0, mode);
 }
 
 /// Re-enter `openat` with the pathname and directory fd from `ctx`, but a

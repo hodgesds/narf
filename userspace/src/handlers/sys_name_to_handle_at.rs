@@ -104,7 +104,7 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
     // resolve alone reports ENOENT for exactly the paths systemd's
     // cg_path_get_cgroupid asks about (/sys/fs/cgroup/.../<svc>.service).
     let path_ino = match stat_ino_path_dir_aware(&path) {
-        Some((_, ino, _)) => ino,
+        Some((_, ino, _, _, _)) => ino,
         None => {
             ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
             return;

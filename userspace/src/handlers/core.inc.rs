@@ -821,7 +821,10 @@ fn open_impl(
     flags: u64,
     mnt_ptr: u64,
     mnt_len: usize,
+    create_mode: u32,
 ) {
+    #[cfg(not(feature = "linux-compat"))]
+    let _ = create_mode;
     // FIFO open-peer rendezvous re-entry: a blocking FIFO `open()` installed
     // its fd and parked waiting for the peer direction (see `open_fifo`); the
     // park RIP-rewound and re-executed this syscall. Resume the peer-check for
@@ -1125,6 +1128,10 @@ fn open_impl(
                     }
                     o
                 }
+                Some(Some(Err(narf_filesystem::FsError::NoSpace))) => {
+                    ctx.set_return(SyscallReturn::ok((-28i64) as u64));
+                    return;
+                }
                 _ => {
                     ctx.set_return(fail);
                     return;
@@ -1141,6 +1148,14 @@ fn open_impl(
             return;
         }
     };
+
+    #[cfg(feature = "linux-compat")]
+    if created {
+        let accessor = current_accessor(task);
+        let _ = poll_blocking(ops.set_owners(accessor.uid, accessor.gid));
+        let permissions = (create_mode & !current_umask() & 0o777) as u16;
+        let _ = poll_blocking(ops.set_perms(permissions));
+    }
 
     // O_PATH: install a bare path-reference fd. Per Linux `do_dentry_open`,
     // an O_PATH open resolves the node but invokes NO file operation — no
@@ -1283,6 +1298,7 @@ fn open_impl(
         open_fifo(
             ctx,
             shared,
+            Arc::clone(&ops),
             node_ino,
             perms,
             fifo_uid,
@@ -1344,6 +1360,7 @@ fn open_impl(
 fn open_fifo(
     ctx: &mut dyn TrapContext,
     shared: Arc<narf_filesystem::fifo::FifoShared>,
+    inode_owner: Arc<dyn narf_filesystem::FileOps>,
     node_ino: u64,
     perms: u16,
     uid: u32,
@@ -1367,8 +1384,9 @@ fn open_fifo(
 
     // Build + install the per-open handle. This registers the direction's
     // open count, which is exactly what the peer rendezvous observes.
-    let handle = Arc::new(narf_filesystem::fifo::FifoHandle::open(
+    let handle = Arc::new(narf_filesystem::fifo::FifoHandle::open_owned(
         shared.clone(),
+        inode_owner,
         node_ino,
         perms,
         uid,
@@ -2139,8 +2157,8 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // `/tmp`, …) rel is empty and `resolve(_, "")` rejects with
     // InvalidPath. busybox `ls /bin` lands here, so synthesise a
     // directory-shaped stat for the mount root.
-    let (s, ino, rdev) = match stat_ino_path_dir_aware_ext(path, follow_final) {
-        Some(triple) => triple,
+    let (s, ino, rdev, uid, gid) = match stat_ino_path_dir_aware_ext(path, follow_final) {
+        Some(tuple) => tuple,
         None => {
             // Missing file → ENOENT, not the bare -1 (musl → EPERM). Probes
             // like libwayland's wl_socket_lock require the real errno.
@@ -2151,8 +2169,7 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // Report the device node's rdev (major:minor) for PATH stat too: seatd /
     // libudev validate a device's type from a path stat before opening it, so
     // a 0 rdev makes them reject evdev nodes (weston input never opens).
-    // Path stat has no fd handle to read owners from; owners default to root.
-    let out = linux_stat_from_fs(s, 0, 0, rdev, ino);
+    let out = linux_stat_from_fs(s, uid, gid, rdev, ino);
     // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
     // and borrows it for the duration of the copy below.
     // SAFETY: Valid memory or trusted environment

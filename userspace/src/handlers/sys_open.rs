@@ -20,5 +20,5 @@ pub(crate) fn sys_open(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    open_impl(ctx, path_owned_raw, flags, mnt_ptr, mnt_len);
+    open_impl(ctx, path_owned_raw, flags, mnt_ptr, mnt_len, 0o666);
 }

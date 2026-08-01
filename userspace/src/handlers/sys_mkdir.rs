@@ -12,10 +12,10 @@ pub(crate) fn sys_mkdir(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    mkdir_path(ctx, &path);
+    mkdir_path(ctx, &path, args.arg1 as u32);
 }
 
-pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str) {
+pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
     let path = resolve_cwd_path(current_task_id(), raw_path);
     // Normalise trailing slashes; `mkdir("/")` (or any path that resolves
     // to the root) always already exists.
@@ -76,9 +76,16 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str) {
         return;
     }
     match poll_blocking(parent.mkdir(&leaf)) {
-        Some(Ok(_)) => {
+        Some(Ok(directory)) => {
             #[cfg(feature = "linux-compat")]
-            crate::mqueue::notify_create(&path, true);
+            {
+                let (uid, gid) = current_fs_ids();
+                directory.set_dir_owners(uid, gid);
+                directory.set_dir_mode((mode & !current_umask() & 0o7777) as u16);
+                crate::mqueue::notify_create(&path, true);
+            }
+            #[cfg(not(feature = "linux-compat"))]
+            let _ = (directory, mode);
             ctx.set_return(SyscallReturn::ok(0));
         }
         // A racing create of the same leaf → EEXIST (matches the exists check
@@ -90,6 +97,9 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str) {
         }
         Some(Err(narf_filesystem::FsError::ReadOnly)) => {
             ctx.set_return(SyscallReturn::ok((-30i64) as u64)) // -EROFS
+        }
+        Some(Err(narf_filesystem::FsError::NoSpace)) => {
+            ctx.set_return(SyscallReturn::ok((-28i64) as u64)) // -ENOSPC
         }
         _ => ctx.set_return(SyscallReturn::ok((-1i64) as u64)), // -EPERM (fs refused)
     }

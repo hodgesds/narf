@@ -29,14 +29,18 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
         return;
     }
     let outcome = fd::with_table(task, |t| {
-        let entry = t.get(fd)?;
+        let entry = t
+            .get(fd)
+            .ok_or(narf_filesystem::FsError::ReadOnly)?;
         let ops = entry.ops.clone();
-        let res = poll_blocking(ops.write(offset, &kbuf))
-            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
-        res.ok()
+        poll_blocking(ops.write(offset, &kbuf))
+            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
     });
     match outcome {
-        Some(Some(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        Some(Ok(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        Some(Err(narf_filesystem::FsError::NoSpace)) => {
+            ctx.set_return(SyscallReturn::ok((-28i64) as u64))
+        }
         _ => ctx.set_return(fail),
     }
 }

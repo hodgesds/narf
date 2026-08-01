@@ -549,11 +549,10 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_fallocate_pos);
 fn smoke_abi_fdio_fallocate_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"")], || {
         let fd = open_fd(b"/abi/f\0")?;
-        // An unsupported mode (not 0 / FALLOC_FL_ZERO_RANGE) → -1.
-        // LINUX-GAP: Linux returns -EOPNOTSUPP / -EINVAL for a bad mode.
+        // An unsupported mode returns Linux -EOPNOTSUPP.
         match call(Syscall::Fallocate.raw(), a3(fd as u64, 0x40, 0, 16)) {
-            Some(-1) => Ok(()),
-            _ => Err("fallocate bad mode was not -1"),
+            Some(-95) => Ok(()),
+            _ => Err("fallocate bad mode was not -EOPNOTSUPP"),
         }
     })
 }

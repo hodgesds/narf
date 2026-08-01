@@ -95,7 +95,8 @@ fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
     // every directory (especially a mount root) as ENOENT makes systemd undo
     // the successful mount and abort PID 1.
     if let Some(dir) = resolve_dir_absolute(path) {
-        set_access_result(ctx, mode, dir.dir_mode(), 0, 0);
+        let (uid, gid) = dir.dir_owners();
+        set_access_result(ctx, mode, dir.dir_mode(), uid, gid);
     } else {
         ctx.set_return(SyscallReturn::ok((-2i64) as u64));
     }

@@ -119,7 +119,7 @@ pub use fuse::{
 };
 pub use memfs::{
     new_anon_file as new_anon_memfile, new_file_with_perms_owner as new_memfile_with_perms_owner,
-    MemFs,
+    MemFs, RamFs, RamFsOptions, TmpFs, TmpFsOptions,
 };
 #[cfg(feature = "linux-compat")]
 pub use mqueuefs::{MqueueAttr, MqueueError, MqueueFs, MqueueNotification, MqueueOpenOptions};
@@ -1097,6 +1097,17 @@ pub trait DirOps: Send + Sync {
     /// filesystems ignore it); memfs stores it so `dir_mode` reflects it.
     fn set_dir_mode(&self, _perms: u16) {}
 
+    /// POSIX owner ids for a directory inode. Writable filesystems override
+    /// this so mount-root `uid=`/`gid=` and directory chown round-trip through
+    /// path stat, fstat on directory fds, and access checks.
+    fn dir_owners(&self) -> (u32, u32) {
+        (0, 0)
+    }
+
+    /// Update a directory inode's POSIX owner ids. Read-only/synthetic
+    /// filesystems retain the no-op default.
+    fn set_dir_owners(&self, _uid: u32, _gid: u32) {}
+
     /// Commit directory entries and metadata (`data_only` models
     /// `fdatasync(2)` on an open directory descriptor).
     fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
@@ -1282,6 +1293,12 @@ pub trait FsInstance: Send + Sync + 'static {
                 ..FsStat::default()
             })
         })
+    }
+
+    /// Reconfigure a live filesystem from its filesystem-specific option
+    /// string (`mount -o remount` / `fsconfig(CMD_RECONFIGURE)`).
+    fn reconfigure(&self, _options: &str) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
     }
 }
 

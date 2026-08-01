@@ -9,7 +9,8 @@
 //!
 //! ```text
 //!   fsopen("tmpfs")            → fs-context fd
-//!   fsconfig(fd, CMD_CREATE)   → builds the MemFs in the context
+//!   fsconfig(fd, SET_STRING, "size", "64M") → retains a tmpfs option
+//!   fsconfig(fd, CMD_CREATE)   → builds the configured TmpFs in the context
 //!   fsmount(fd)                → detached-mount fd holding that fs
 //!   move_mount(mfd, "", AT_FDCWD, "/mnt/x")  → registry().mount_arc(...)
 //! ```
@@ -24,7 +25,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use narf_filesystem::{FileOps, FsError, FsFuture, FsInstance, MemFs, Mode, Stat};
+use narf_filesystem::{FileOps, FsError, FsFuture, FsInstance, MemFs, Mode, RamFs, Stat, TmpFs};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fd;
@@ -40,6 +41,7 @@ const EBADF: i64 = 9;
 const EBUSY: i64 = 16;
 const EINVAL: i64 = 22;
 const ENODEV: i64 = 19;
+const ENOSPC: i64 = 28;
 
 fn err(e: i64) -> SyscallReturn {
     SyscallReturn::ok((-e) as u64)
@@ -67,6 +69,9 @@ const OPEN_TREE_CLONE: u64 = 0x0000_0001;
 struct FsContext {
     fsname: String,
     created: Option<Arc<dyn FsInstance>>,
+    options: BTreeMap<String, Option<String>>,
+    uid: u32,
+    gid: u32,
 }
 
 /// A detached mount (fsmount / open_tree) awaiting move_mount.
@@ -136,7 +141,7 @@ fn real_cgroupfs() -> Option<Arc<dyn FsInstance>> {
 /// entry points recognize exactly the same set of filesystems.
 ///
 /// Three classes of fstype are handled:
-///   * real NARF backends — tmpfs/ramfs → `MemFs`, proc → `ProcFs`,
+///   * real NARF backends — tmpfs → `TmpFs`, ramfs → `RamFs`, proc → `ProcFs`,
 ///     sysfs → `SysFs`, devtmpfs → `DevFs`, cgroup2 → `CgroupFs`,
 ///     devpts → `DevPtsFs`, bpf → `BpfFs`.
 ///   * pseudo-filesystems systemd mounts during early boot for which NARF has
@@ -147,16 +152,27 @@ fn real_cgroupfs() -> Option<Arc<dyn FsInstance>> {
 ///     are absent.
 ///   * everything else — `None` → `-ENODEV`.
 pub fn build_fs(fsname: &str) -> Option<Arc<dyn FsInstance>> {
+    build_fs_with_options(fsname, "", 0, 0).ok().flatten()
+}
+
+/// Build a filesystem while applying its Linux filesystem-specific mount
+/// options and mount-creator ownership.
+pub fn build_fs_with_options(
+    fsname: &str,
+    options: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<Option<Arc<dyn FsInstance>>, FsError> {
     // Map a known pseudo-fstype to a stable &'static str name so `MemFs::new`
     // (which takes &'static str) reflects the requested type in listings.
     let empty =
         |name: &'static str| -> Option<Arc<dyn FsInstance>> { Some(Arc::new(MemFs::new(name))) };
-    match fsname {
+    Ok(match fsname {
         // In-memory data filesystems.
-        "tmpfs" => empty("tmpfs"),
-        "ramfs" => empty("ramfs"),
+        "tmpfs" => Some(Arc::new(TmpFs::from_options(options, uid, gid)?)),
+        "ramfs" => Some(Arc::new(RamFs::from_options(options, uid, gid)?)),
         "memfs" => empty("memfs"),
-        "shmfs" | "shm" => empty("shm"),
+        "shmfs" | "shm" => Some(Arc::new(TmpFs::from_options(options, uid, gid)?)),
 
         // Real synthetic backends. procfs/sysfs/cgroupfs are compiled only
         // with their respective features; without them the mount still
@@ -191,7 +207,22 @@ pub fn build_fs(fsname: &str) -> Option<Arc<dyn FsInstance>> {
         "autofs" => empty("autofs"),
 
         _ => None,
+    })
+}
+
+fn context_options(context: &FsContext) -> String {
+    let mut rendered = String::new();
+    for (key, value) in &context.options {
+        if !rendered.is_empty() {
+            rendered.push(',');
+        }
+        rendered.push_str(key);
+        if let Some(value) = value {
+            rendered.push('=');
+            rendered.push_str(value);
+        }
     }
+    rendered
 }
 
 // ── fd-backed handles ───────────────────────────────────────────────
@@ -273,12 +304,16 @@ pub fn sys_fsopen(ctx: &mut dyn TrapContext) {
         }
     };
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let (uid, gid) = crate::handlers::current_fs_ids();
     with_contexts(|m| {
         m.insert(
             id,
             FsContext {
                 fsname,
                 created: None,
+                options: BTreeMap::new(),
+                uid,
+                gid,
             },
         )
     });
@@ -304,45 +339,67 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
             // Materialize the filesystem named by fsopen.
             let r = with_contexts(|m| {
                 let c = m.get_mut(&id)?;
-                match build_fs(&c.fsname) {
-                    Some(fs) => {
+                let options = context_options(c);
+                match build_fs_with_options(&c.fsname, &options, c.uid, c.gid) {
+                    Ok(Some(fs)) => {
                         c.created = Some(fs);
-                        Some(true)
+                        Some(Ok(true))
                     }
-                    None => Some(false),
+                    Ok(None) => Some(Ok(false)),
+                    Err(error) => Some(Err(error)),
                 }
             });
             match r {
-                Some(true) => ctx.set_return(ok(0)),
-                Some(false) => ctx.set_return(err(ENODEV)),
+                Some(Ok(true)) => ctx.set_return(ok(0)),
+                Some(Ok(false)) => ctx.set_return(err(ENODEV)),
+                Some(Err(FsError::NoSpace)) => ctx.set_return(err(ENOSPC)),
+                Some(Err(_)) => ctx.set_return(err(EINVAL)),
                 None => ctx.set_return(err(EBADF)),
             }
         }
-        // CMD_RECONFIGURE — re-materialize the fs for an already instantiated
-        // context (fspick reconfigure flow). NARF's in-memory FSes carry no
-        // live options, so validate the context exists and succeed.
+        // CMD_RECONFIGURE applies retained options to the selected live fs.
         FSCONFIG_CMD_RECONFIGURE => {
-            let ok_ctx = with_contexts(|m| m.contains_key(&id));
-            if ok_ctx {
-                ctx.set_return(ok(0));
-            } else {
-                ctx.set_return(err(EBADF));
+            let result = with_contexts(|m| {
+                let context = m.get(&id)?;
+                let fs = context.created.as_ref()?;
+                Some(fs.reconfigure(&context_options(context)))
+            });
+            match result {
+                Some(Ok(())) => ctx.set_return(ok(0)),
+                Some(Err(FsError::NoSpace)) => ctx.set_return(err(ENOSPC)),
+                Some(Err(_)) => ctx.set_return(err(EINVAL)),
+                None => ctx.set_return(err(EBADF)),
             }
         }
-        // Configuration options are accepted; NARF's in-memory FSes have none
-        // that change behaviour (source/size/mode/nsdelegate are no-ops). The
-        // string / path / binary forms still validate that any user pointers
-        // are readable.
+        // Retain configuration options for CMD_CREATE/CMD_RECONFIGURE. The
+        // string/path/binary forms validate that user pointers are readable.
         FSCONFIG_SET_STRING | FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY | FSCONFIG_SET_BINARY => {
-            let _key = copy_user_cstr(a.arg2, 256);
-            let _val = copy_user_cstr(a.arg3, 4096);
-            ctx.set_return(ok(0));
+            let key = copy_user_cstr(a.arg2, 256);
+            let value = copy_user_cstr(a.arg3, 4096);
+            if let (Some(key), Some(value)) = (key, value) {
+                let found = with_contexts(|m| {
+                    m.get_mut(&id)
+                        .map(|context| context.options.insert(key, Some(value)))
+                        .is_some()
+                });
+                ctx.set_return(if found { ok(0) } else { err(EBADF) });
+            } else {
+                ctx.set_return(err(EINVAL));
+            }
         }
         // FSCONFIG_SET_FLAG (value-less key) and FSCONFIG_SET_FD (numeric aux)
         // carry no user string to validate; accept them.
         FSCONFIG_SET_FLAG | FSCONFIG_SET_FD => {
-            let _key = copy_user_cstr(a.arg2, 256);
-            ctx.set_return(ok(0));
+            if let Some(key) = copy_user_cstr(a.arg2, 256) {
+                let found = with_contexts(|m| {
+                    m.get_mut(&id)
+                        .map(|context| context.options.insert(key, None))
+                        .is_some()
+                });
+                ctx.set_return(if found { ok(0) } else { err(EBADF) });
+            } else {
+                ctx.set_return(err(EINVAL));
+            }
         }
         _ => ctx.set_return(ok(0)),
     }
@@ -609,6 +666,9 @@ pub fn sys_fspick(ctx: &mut dyn TrapContext) {
             FsContext {
                 fsname,
                 created: Some(fs),
+                options: BTreeMap::new(),
+                uid: 0,
+                gid: 0,
             },
         )
     });
