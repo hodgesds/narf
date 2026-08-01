@@ -55,10 +55,20 @@
 //!
 //! That bound is a *runtime* check, so it holds even if the verifier is wrong,
 //! which is what matters while the abstract interpreter is still being trusted.
-//! The JIT trades these checks for the extable and the arena guard slots — that
-//! is the same bargain Linux strikes at `verifier.c:16186`, and it is only sound
-//! once the verifier is real. `crate::jit_glue` gate 2 still refuses arena
-//! programs for that reason.
+//! The JIT trades these checks for the extable and the arena guard slots — the
+//! same bargain Linux strikes at `verifier.c:16186` — and it now takes that
+//! trade: `crate::jit_glue` gate 2 admits a program with exactly one arena.
+//!
+//! The two paths reach the same verdict by different routes, which is the thing
+//! to hold on to when reading either. Here, a handle that names no live arena
+//! byte is refused by comparison and never dereferenced. There, it *is*
+//! dereferenced, lands on a page the slot's guards and the arena's own extent
+//! leave unmapped, and the exception table turns the fault into the same
+//! [`Trap::ArenaOutOfBounds`] — carrying the same handle, because the emitter
+//! folds the displacement into the index register so the fault epilogue can
+//! return it. `smoke_bpf_jit_diff_arena_out_of_bounds_traps_like_the_interpreter`
+//! is what holds the two together; the JIT's set is only equal to this one for a
+//! program with a *single* arena, which is gate 2's remaining job.
 
 use core::future::Future;
 use core::pin::Pin;

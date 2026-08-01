@@ -18,19 +18,17 @@
 //!    fallthrough — provisional acceptance is *defined* as leaning on the
 //!    interpreter's runtime bounds checks, which JITed code does not perform.
 //!    This is the load-bearing gate; the other two are narrower.
-//! 2. **No arena use.** The emitter does not pin a base register for the arena
-//!    window, so an arena access would lower to a bare dereference of a
-//!    32-bit-ish offset — `an_arena_access_lowers_to_a_bare_dereference_of_the_handle`
-//!    in `narf-bpf-jit` shows the actual bytes. See "Lifting gate 2" below,
-//!    which is where the analysis lives. It used to add that gate 2 was *not*
-//!    the binding constraint and that lifting it alone would change nothing —
-//!    true while no backend emitted `Decoded::Call`, and no longer: both do,
-//!    so this gate is now the only thing between an arena program and that bare
-//!    dereference.
-//! 3. **No fault sites.** The emitter does not record any, so a program with
-//!    faulting accesses would have them unregistered — and `seal` requires a
-//!    registered image, so this would fail closed anyway. Checked explicitly
-//!    so the reason is visible rather than inferred from an error.
+//! 2. ~~No arena use.~~ **Relaxed to "at most one arena".** The emitter now
+//!    lowers an arena access to `slot_base + handle + off16` with the base
+//!    supplied at entry, so the gate is no longer about a missing capability —
+//!    it is about the *one* place the JIT's reachable set and the interpreter's
+//!    admitted set differ. See "Lifting gate 2" below, and
+//!    [`JitSkip::UsesArena`], which now means "more than one arena".
+//! 3. **No non-arena fault sites.** Relaxed rather than lifted: the verifier
+//!    records an arena access *as* a fault site, so the original gate refused
+//!    every arena program by itself. Probe reads still have no lowering, so a
+//!    fault site that is not an arena access is still a refusal — checked
+//!    explicitly so the reason is visible rather than inferred from an error.
 //! 4. ~~No back-edge.~~ **Lifted.** This gate stood in for missing fuel
 //!    emission: the verifier deliberately does not prove termination
 //!    (`an_unbounded_loop_verifies` is a passing test) because fuel bounds work
@@ -53,24 +51,44 @@
 //!      arena handle or a map-value pointer in R0, `r1 = r0` is an ordinary
 //!      move, and the verifier will happily prove the resulting access
 //!      in-bounds *for that class* — while native code would dereference the
-//!      register verbatim. Gate 2 catches the arena case and nothing catches
-//!      the rest, so R1 stops being admissible wholesale.
+//!      register verbatim. Nothing catches that, so R1 stops being admissible
+//!      wholesale.
+//!    * **An arena access is exempt**, whatever its base, because it does not
+//!      lower to a bare dereference at all — it lowers to the slot-relative
+//!      shape, whose reachable set is the slot's guards. "Which accesses are
+//!      arena accesses" is
+//!      [`narf_bpf_jit::arena_access_map`](narf_bpf_jit::arena_access_map), the
+//!      same function the emitter uses, so the gate and the lowering cannot
+//!      disagree about a single instruction.
 //!
-//!    This is deliberately conservative: it also refuses programs that read
-//!    their context before calling anything, which is sound but slower than it
-//!    needs to be. Making it precise means the verifier publishing the pointer
-//!    *class* at each access, which it does not today — and until it does,
-//!    "refuse and interpret" is the only answer that cannot be wrong.
+//!    That last exemption is where this gate stops being merely conservative
+//!    and starts being a **second, independent brace** on the arena lowering.
+//!    The dangerous direction is an arena access the fault-site map *misses*,
+//!    which would lower as a bare dereference of a small integer. It cannot
+//!    happen, and not because the map is trusted: a missed site is subject to
+//!    the ordinary rule, so its base would have to be R10 — and R10 is the frame
+//!    pointer, which the verifier refuses to let a program write, so it can
+//!    never hold an arena handle. (R1 is not a way out either: `PtrClass::Arena`
+//!    has only a kfunc return as a producer, so an arena program always contains
+//!    a call, and a call is what withdraws R1.)
+//!
+//!    This is otherwise deliberately conservative: it also refuses programs that
+//!    read their context before calling anything, which is sound but slower than
+//!    it needs to be. Making it precise means the verifier publishing the
+//!    pointer *class* at each access, which it does not today — and until it
+//!    does, "refuse and interpret" is the only answer that cannot be wrong.
 //!
 //! Anything gated out runs interpreted, which is a complete implementation.
 //!
-//! ## Lifting gate 2
+//! ## Lifting gate 2 — **landed**
 //!
 //! Written down here because the analysis is most of the work and the
 //! conclusion was counter-intuitive: **gate 2 was never what stopped arena
 //! programs being compiled.** The prerequisite it was waiting on — call
-//! emission — has since landed, so this section now has a *before* and an
-//! *after*, and the after is where the remaining work is.
+//! emission — landed first, and the lowering this section specifies has now
+//! landed too. What follows is kept in the present tense because every clause
+//! of it is a property the code must still have; each subsection names what
+//! discharges it.
 //!
 //! ### The blocker was `Decoded::Call`, not the arena — and it has gone
 //!
@@ -93,10 +111,10 @@
 //! is what used to pin the old claim and now pins the new one, in bytes: an
 //! arena program walks past its call into a **bare dereference of the handle**.
 //!
-//! So gate 2 has gone from the second of two refusals to the only one, which
-//! makes it *more* load-bearing than it was, not less. A differential test
-//! written against a lifted gate 2 would now find its subject genuinely
-//! compiled — which removes the vacuity hazard and leaves the real work below.
+//! So gate 2 went from the second of two refusals to the only one, which made
+//! it *more* load-bearing than it was, not less. A differential test written
+//! against a lifted gate 2 now finds its subject genuinely compiled — which is
+//! what removed the vacuity hazard and made the work below testable.
 //!
 //! ### What the lowering has to be
 //!
@@ -106,12 +124,25 @@
 //! entry, since the same image must run against whatever slot the program was
 //! given. That is a fourth entry argument on [`JitEntry`].
 //!
+//! Discharged by `narf_bpf_jit`'s `emit_arena_addr` on both backends. Neither
+//! *pins* a register — x86-64 has no callee-saved one spare and aarch64 would
+//! have had to grow every program's frame — so the base is parked in the
+//! prologue's existing alignment padding and reloaded per access. That is
+//! observationally the same thing: the base is available at every access in the
+//! body, which is all "pinned" was ever asking for.
+//!
 //! Every address such an access can compute lies in
 //! `[slot_base - ARENA_MAX_UNDERSHOOT_BYTES, slot_base + ARENA_SLOT_STRIDE)` —
 //! see that constant in `memory::bpf_arena`, which is asserted against the
 //! guards rather than argued. So no verified arena access can reach another
 //! program's arenas, whatever it computes. Cross-program isolation is
 //! structural and needs no per-access check, which is the whole bargain.
+//!
+//! The emitted sequence strengthens that from "no *verified* access" to "no
+//! access": it zero-extends the handle from 32 bits, so the index is in
+//! `[0, 2^32)` by construction and the reachable set is a property of the bytes
+//! rather than of the verifier's bounds. No legitimate handle is affected —
+//! every byte an arena can occupy is below `ARENA_USABLE_BYTES`, which is 4 GiB.
 //!
 //! ### The extable is mandatory, not an option
 //!
@@ -127,6 +158,10 @@
 //! needs an `ExEntry` — which also means gate 3 must relax to "no *non-arena*
 //! fault sites" rather than lift outright, since probe reads have no lowering
 //! either.
+//!
+//! Discharged by [`try_compile`]'s `fault_sites.iter().any(|f| !f.arena)` test,
+//! and by the `ExEntry` vector it now builds from `compiled.faults` — where it
+//! used to register an empty one and assert that codegen had produced nothing.
 //!
 //! ### Where the fixup must resume, and why not "zero and continue"
 //!
@@ -147,6 +182,17 @@
 //! recovered by the extable, so not fatal, and stopped with a named trap, so
 //! not silent.
 //!
+//! Discharged by `emit_arena_epilogue` on both backends, by `emit_pass`
+//! rewriting every arena entry's `fixup_off` to it unconditionally, and by
+//! `crate::prog::run_atomic_native` mapping `narf_bpf_jit::status::ARENA_FAULT`
+//! to `Trap::ArenaOutOfBounds`. The epilogue also returns the offending
+//! **handle** in the value half — the emitter folds the displacement into the
+//! index register precisely so that it can — because
+//! [`Trap::ArenaOutOfBounds`](crate::interp::Trap::ArenaOutOfBounds) exists to
+//! name the value rather than leave it inferred. `at` and `len` are not
+//! recoverable without a side table and are reported as zero, the same
+//! concession `Trap::OutOfFuel { at: 0 }` already makes.
+//!
 //! ### One arena, or the two paths still disagree
 //!
 //! With that fixup, the JIT's reachable-and-mapped set is the slot's mapped
@@ -160,7 +206,13 @@
 //! unmapped page). One arena is also the
 //! only program-visible shape, since `narf_arena_base()` names the first and
 //! nothing publishes the rest, so requiring it costs no capability. It does
-//! mean the arena count has to reach this function, which today it does not.
+//! mean the arena count has to reach this function.
+//!
+//! Discharged by [`try_compile`]'s `arena_count` parameter, which
+//! `crate::prog::BpfProg::load_with_arena` fills from the [`ArenaGroup`] it was
+//! handed — the same group the program will run against, so the number cannot
+//! describe a different one. A program that touches an arena and has anything
+//! other than exactly one is [`JitSkip::UsesArena`] and runs interpreted.
 
 use narf_bpf_verifier::VerifiedProgram;
 use narf_capabilities::{Cap, Grant};
@@ -169,24 +221,39 @@ use narf_memory::bpf_text::{self, Jit, TextAlloc};
 
 /// The ABI of a compiled program.
 ///
-/// `(frame_top, ctx_ptr, fuel) -> (value, exhausted)`.
+/// `(frame_top, ctx_ptr, fuel, arena_slot_base) -> (value, status)`.
 ///
 /// The prologue moves `frame_top` into the host register R10 maps to and
 /// `ctx_ptr` into R1's, so the same image runs on the per-CPU region and on a
-/// sleepable program's heap stack with no recompilation.
+/// sleepable program's heap stack with no recompilation. `arena_slot_base` is
+/// the fourth argument for the same reason: the image must run against whatever
+/// slot the program was given, so the base is passed rather than baked in. It is
+/// parked in the prologue's alignment padding and read back at each arena
+/// access; a program with no arena access never reads it, and passing zero for
+/// one is harmless.
 ///
 /// The `u128` return is SysV's `rax:rdx` pair: the low half is R0, the high half
-/// is non-zero if the program ran out of fuel. Out of band deliberately — an
-/// in-band sentinel was tried and removed, because the obvious choice
-/// (`u64::MAX`) is exactly what `r0 = -1; exit` returns, so "exhausted" and
-/// "returned -1" would have been the same answer.
-pub type JitEntry = unsafe extern "C" fn(u64, u64, u64) -> u128;
+/// is a [`narf_bpf_jit::status`] code. Out of band deliberately — an in-band
+/// sentinel was tried and removed, because the obvious choice (`u64::MAX`) is
+/// exactly what `r0 = -1; exit` returns, so "exhausted" and "returned -1" would
+/// have been the same answer. A code rather than a boolean since the arena
+/// lowering landed: on `ARENA_FAULT` the low half carries the offending handle,
+/// which is the one case where it means something other than R0.
+pub type JitEntry = unsafe extern "C" fn(u64, u64, u64, u64) -> u128;
 
 /// A compiled program's text, freed on drop.
 #[derive(Debug)]
 pub struct JitImage {
     alloc: Option<TextAlloc>,
     entry: u64,
+    /// Whether the image contains any arena access.
+    ///
+    /// Read by `crate::prog::run_atomic` as the belt to gate 2's brace: an image
+    /// that dereferences the slot base must never be entered with a slot base it
+    /// was not compiled against. Derived from the emitted fault table rather than
+    /// from `VerifiedProgram::uses_arena`, because it is the *emitted code* that
+    /// will do the dereferencing.
+    arena: bool,
 }
 
 impl JitImage {
@@ -209,6 +276,13 @@ impl JitImage {
     #[must_use]
     pub fn text_len(&self) -> usize {
         self.alloc.as_ref().map_or(0, |a| a.len)
+    }
+
+    /// Whether the emitted code dereferences the arena slot base.
+    #[inline]
+    #[must_use]
+    pub fn uses_arena(&self) -> bool {
+        self.arena
     }
 }
 
@@ -258,9 +332,17 @@ pub enum JitSkip {
     /// it structurally instead, and that acceptance depends on the
     /// interpreter's bounds checks.
     NotFullyVerified,
-    /// Uses an arena; the emitter does not pin the window base.
+    /// Touches an arena and does not have exactly one.
+    ///
+    /// Not "uses an arena" any more — that is compiled. With two arenas the
+    /// JIT's reachable-and-mapped set stops equalling the interpreter's, because
+    /// `ArenaSlot::carve` places them contiguously and an access straddling the
+    /// boundary succeeds natively while `arena::resolve_in` refuses it. Zero
+    /// arenas is refused for the mirror-image reason: there would be no slot base
+    /// to enter the image with.
     UsesArena,
-    /// Has faulting accesses; the emitter does not record fault sites.
+    /// Has faulting accesses that are not arena accesses — a probe read, which
+    /// has no lowering on either backend.
     HasFaultSites,
     /// The emitter declined an instruction.
     Unsupported,
@@ -297,9 +379,10 @@ fn contains_a_call(insns: &[narf_bpf_isa::Insn]) -> Result<bool, JitSkip> {
 /// Deliberately a positive check. Both properties currently hold as a
 /// consequence of which instructions the emitter refuses, and both would stop
 /// holding silently the first time that set grows.
-fn scan_program(insns: &[narf_bpf_isa::Insn]) -> Result<(), JitSkip> {
+fn scan_program(v: &VerifiedProgram) -> Result<(), JitSkip> {
     use narf_bpf_isa::{Decoded, Reg};
 
+    let insns = &v.insns;
     // Whether R1 is still admissible as a dereference base. It is the context
     // pointer on entry and stays so as long as nothing can produce another
     // pointer class — and a kfunc return is exactly that. Whole-program rather
@@ -308,6 +391,10 @@ fn scan_program(insns: &[narf_bpf_isa::Insn]) -> Result<(), JitSkip> {
     // property the instruction order can establish.
     let ctx_base_ok = !contains_a_call(insns)?;
     let base_ok = |r: Reg| r == Reg::R10 || (r == Reg::R1 && ctx_base_ok);
+    // Which accesses the emitter will give the slot-relative shape. The *same*
+    // function the emitter calls, so an instruction cannot be exempt here and
+    // lowered as a bare dereference there.
+    let arena = narf_bpf_jit::arena_access_map(v);
 
     let mut i = 0usize;
     while i < insns.len() {
@@ -316,6 +403,11 @@ fn scan_program(insns: &[narf_bpf_isa::Insn]) -> Result<(), JitSkip> {
         let Ok((d, width)) = narf_bpf_isa::decode(insns, i) else {
             return Err(JitSkip::Unsupported);
         };
+        // An arena access needs no certified base: it is not lowered to
+        // `[base + disp]` at all, and its reachable set is the slot's guards
+        // whatever the register holds. See the gate-5 note in the module docs
+        // for why a *missed* arena site cannot slip through this exemption.
+        let arena_here = arena[i];
         match d {
             // `may_goto` still declines: it carries a hidden counter the
             // emitter does not model, which is separate from fuel.
@@ -323,10 +415,10 @@ fn scan_program(insns: &[narf_bpf_isa::Insn]) -> Result<(), JitSkip> {
             // A load or store base must be one the emitter can certify. Any
             // other register could hold a class it would lower to a bare
             // dereference.
-            Decoded::Load { src, .. } if !base_ok(src) => {
+            Decoded::Load { src, .. } if !arena_here && !base_ok(src) => {
                 return Err(JitSkip::UncheckedPointerBase)
             }
-            Decoded::Store { dst, .. } if !base_ok(dst) => {
+            Decoded::Store { dst, .. } if !arena_here && !base_ok(dst) => {
                 return Err(JitSkip::UncheckedPointerBase)
             }
             _ => {}
@@ -341,20 +433,36 @@ fn scan_program(insns: &[narf_bpf_isa::Insn]) -> Result<(), JitSkip> {
 /// `fully_verified` must be `false` when the program reached
 /// `crate::provisional` rather than a clean `verify()` — see gate 1.
 ///
+/// `arena_count` is how many arenas the program will actually run against — the
+/// length of its [`ArenaGroup`](crate::arena::ArenaGroup), or zero if it has
+/// none. Gate 2 needs it and the verifier does not have it: `narf-bpf-verifier`
+/// bounds an arena displacement against a fixed window, never against a
+/// particular program's extent, so the count can only come from the loader.
+///
 /// # Errors
 ///
 /// [`JitSkip`], all of which mean "run this interpreted".
-pub fn try_compile(v: &VerifiedProgram, fully_verified: bool) -> Result<JitImage, JitSkip> {
+pub fn try_compile(
+    v: &VerifiedProgram,
+    fully_verified: bool,
+    arena_count: usize,
+) -> Result<JitImage, JitSkip> {
     if !fully_verified {
         return Err(JitSkip::NotFullyVerified);
     }
-    if v.uses_arena {
+    // Gate 2, relaxed: exactly one arena, or none of the program's business.
+    // See "One arena, or the two paths still disagree" in the module docs —
+    // with two, an access straddling the boundary between two contiguously
+    // placed arenas succeeds natively and traps interpreted.
+    if v.uses_arena && arena_count != 1 {
         return Err(JitSkip::UsesArena);
     }
-    if !v.fault_sites.is_empty() {
+    // Gate 3, relaxed: an arena access *is* a fault site, so refusing all of
+    // them refuses every arena program. A probe read still has no lowering.
+    if v.fault_sites.iter().any(|f| !f.arena) {
         return Err(JitSkip::HasFaultSites);
     }
-    scan_program(&v.insns)?;
+    scan_program(v)?;
 
     let compiled = narf_bpf_jit::compile(v).map_err(|_| JitSkip::Unsupported)?;
     let cap = jit_cap();
@@ -372,18 +480,38 @@ pub fn try_compile(v: &VerifiedProgram, fully_verified: bool) -> Result<JitImage
     // afterwards could not take that back. `bpf_text::write` now refuses in
     // that situation, so this order is enforced rather than merely documented.
     //
-    // The table is empty by gate 3; registering it anyway is the point, since
-    // neither `write` nor `seal` can tell an image with no faulting instructions
-    // from one whose producer forgot.
+    // The table is registered even when it is empty, since neither `write` nor
+    // `seal` can tell an image with no faulting instructions from one whose
+    // producer forgot.
     let lo = a.va;
     let hi = a.va + a.len as u64;
-    // The assertion catches the day `record_fault` gains a caller and this
-    // silently starts discarding a real table.
+    // Gate 3 admits only arena fault sites, so anything else here means the two
+    // have drifted — and the consequence would be a probe fault recovering into
+    // the arena epilogue, which is a wrong answer rather than a crash and so is
+    // exactly the kind that goes unnoticed.
     debug_assert!(
-        compiled.faults.0.is_empty(),
-        "codegen produced fault entries that this path would discard"
+        compiled.faults.0.iter().all(|f| f.arena),
+        "codegen produced a non-arena fault entry that gate 3 should have refused"
     );
-    if narf_memory::bpf_extable::register_image(lo, lo, hi, alloc::vec::Vec::new()).is_err() {
+    // An arena entry resumes at the arena epilogue and zeroes nothing: the
+    // program stops. `GpReg::NONE` is what says so — see `emit_arena_epilogue`
+    // and the "why not zero and continue" note in the module docs.
+    let entries: alloc::vec::Vec<_> = compiled
+        .faults
+        .0
+        .iter()
+        .map(|f| narf_memory::bpf_extable::ExEntry {
+            fault_pc: lo + u64::from(f.fault_off),
+            fixup_pc: lo + u64::from(f.fixup_off),
+            dst: f
+                .dst_host_reg
+                .map_or(narf_memory::bpf_extable::GpReg::NONE, |r| {
+                    narf_memory::bpf_extable::GpReg(r)
+                }),
+        })
+        .collect();
+    let arena = compiled.faults.0.iter().any(|f| f.arena);
+    if narf_memory::bpf_extable::register_image(lo, lo, hi, entries).is_err() {
         bpf_text::free(a);
         return Err(JitSkip::TextUnavailable);
     }
@@ -402,5 +530,6 @@ pub fn try_compile(v: &VerifiedProgram, fully_verified: bool) -> Result<JitImage
     Ok(JitImage {
         alloc: Some(a),
         entry,
+        arena,
     })
 }

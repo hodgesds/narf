@@ -1279,6 +1279,18 @@ const NO_BACKEND: &str = "no native backend on this architecture";
 /// Load, require compilation, run both ways, compare.
 fn diff_case(name: &str, items: &[Decoded], ctx: [u64; 4]) -> Result<(), &'static str> {
     let p = load(name, asm(items), Context::Atomic).map_err(|_| "load rejected")?;
+    diff_run(&p, ctx)
+}
+
+/// Run an already-loaded program both ways and compare, requiring that it
+/// actually compiled.
+///
+/// Split out of [`diff_case`] so the arena cases — which need
+/// `BpfProg::load_with_arena` and therefore cannot go through `load` — compare
+/// by exactly the same rule, including the `is_jited` assertion. A second copy
+/// of this comparison is how one of the two would quietly stop checking trap
+/// discriminants.
+fn diff_run(p: &BpfProg, ctx: [u64; 4]) -> Result<(), &'static str> {
     if !p.is_jited() {
         // On an architecture with a backend this is a real failure: a
         // differential test whose subject fell back compares the interpreter
@@ -1323,6 +1335,453 @@ fn diff_case(name: &str, items: &[Decoded], ctx: [u64; 4]) -> Result<(), &'stati
         _ => Err("one path trapped and the other did not"),
     }
 }
+
+// ── differential: arena programs ────────────────────────────────────
+//
+// `jit_glue` gate 2 used to refuse every arena program, so the sweep above has
+// never covered the one lowering that has no bounds check in it at all. These
+// are that coverage.
+//
+// Two things make them worth more than the ALU sweep per case. The subject is
+// asserted `is_jited()` like every other differential case, and for an arena
+// program that assertion is the *gate* under test — if gate 2 ever closes again
+// these fail rather than silently comparing the interpreter with itself. And
+// the comparison includes the trap discriminant, which is what catches the
+// tempting-but-wrong fixup: Linux's `ex_handler_bpf` zeroes the destination and
+// resumes, which would make an out-of-bounds arena access *return a value*
+// natively and `Trap::ArenaOutOfBounds` interpreted.
+
+use crate::arena::{kernel_arena_cap, ArenaGroup, ARENA_BASE_HANDLE};
+
+/// `call narf_arena_base` — the only producer of an in-program arena handle.
+fn call_arena_base() -> Decoded {
+    call("narf_arena_base")
+}
+
+/// Build a group of `pages`-page arenas, one per entry, and load `items`
+/// against it.
+fn arena_prog(
+    name: &str,
+    items: &[Decoded],
+    pages: &[usize],
+) -> Result<alloc::sync::Arc<BpfProg>, &'static str> {
+    let cap = kernel_arena_cap();
+    let mut g = ArenaGroup::new(cap).map_err(|_| "ArenaGroup::new failed")?;
+    for &p in pages {
+        g.add(cap, p).map_err(|_| "adding an arena failed")?;
+    }
+    BpfProg::load_with_arena(
+        load_cap(),
+        LoadRequest {
+            name: alloc::string::String::from(name),
+            insns: asm(items),
+            context: Context::Atomic,
+            maps: alloc::vec::Vec::new(),
+        },
+        Some(alloc::sync::Arc::new(g)),
+    )
+    .map_err(|_| "load rejected")
+}
+
+fn smoke_bpf_jit_diff_arena_store_then_load() -> TestResult {
+    // The positive case: a store and a load back through the same handle, at
+    // three displacements including zero — zero being the one the emitter
+    // shortens by skipping the fold into the index register.
+    //
+    // `r0` is the handle; the program writes 0x5A5A at `off`, reads it back and
+    // returns it, so a lowering that addressed the wrong place would return
+    // something other than the value it just wrote *and* disagree with the
+    // interpreter.
+    for off in [0i16, 8, 4088] {
+        let items = [
+            call_arena_base(),
+            mov_reg(6, 0),
+            st_imm(6, off, 0x5A5A),
+            ldx(0, 6, off),
+            EXIT,
+        ];
+        let p = match arena_prog("arena_diff_rw", &items, &[1]) {
+            Ok(p) => p,
+            Err(e) => return TestResult::Fail(e),
+        };
+        match diff_run(&p, [0; 4]) {
+            Ok(()) => {}
+            Err(e) if core::ptr::eq(e, NO_BACKEND) => return TestResult::Skip(NO_BACKEND),
+            Err(e) => return TestResult::Fail(e),
+        }
+        // …and the value is the one written, so "both agree" is not two paths
+        // agreeing on a wrong answer.
+        if p.run_atomic([0; 4], 4) != Some(Outcome::Returned(0x5A5A)) {
+            return TestResult::Fail("the arena round trip did not return what it wrote");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_diff_arena_store_then_load);
+
+fn smoke_bpf_jit_diff_arena_out_of_bounds_traps_like_the_interpreter() -> TestResult {
+    // **The acceptance criterion.** A wild arena access must produce a
+    // diagnostic and not a kernel panic: recovered by the exception table so it
+    // is not fatal, and stopped with a named trap so it is not silent.
+    //
+    // Every case here is *accepted by the verifier* — it bounds a displacement
+    // against a fixed 4 GiB window, never against this program's extent — so
+    // reaching the runtime is the premise and not an accident.
+    //
+    // Mutation: make the fixup zero-and-continue (resume at the next
+    // instruction, zero the destination) and the native run returns instead of
+    // trapping, which `diff_run`'s discriminant comparison catches here.
+    let cases: [(&str, i16, i32); 4] = [
+        // Just past the end of a one-page arena.
+        ("one page past", 4096, 0),
+        // Two pages past — well clear of any rounding.
+        ("two pages past", 8192, 0),
+        // The far end of the `off16` reach, still inside the slot.
+        ("off16 maximum", 32760, 0),
+        // Far past the arena by *arithmetic* rather than by displacement: one
+        // gibibyte up the slot, which the verifier accepts and nothing maps.
+        // This is the wildest address a verified program can name, and it is
+        // the one that shows the recovery is not a property of being near the
+        // arena.
+        ("a gibibyte up the slot", 0, 1 << 30),
+    ];
+    for (what, off, bump) in cases {
+        let mut items = alloc::vec![call_arena_base()];
+        if bump != 0 {
+            items.push(alu_imm(AluOp::Add, 0, bump));
+        }
+        items.push(st_imm(0, off, 0xBAD));
+        items.push(mov_imm(0, 1));
+        items.push(EXIT);
+        let p =
+            match arena_prog("arena_diff_oob", &items, &[1]) {
+                Ok(p) => p,
+                Err(_) => return TestResult::Fail(
+                    "the verifier rejected the program, so this no longer tests the runtime bound",
+                ),
+            };
+        match diff_run(&p, [0; 4]) {
+            Ok(()) => {}
+            Err(e) if core::ptr::eq(e, NO_BACKEND) => return TestResult::Skip(NO_BACKEND),
+            Err(_) => return TestResult::Fail(what),
+        }
+        // Not merely "the same kind of trap": the *right* kind, and naming the
+        // handle. Without this the case would pass if both paths happened to
+        // report, say, `BadAccess`.
+        let want = ARENA_BASE_HANDLE
+            .wrapping_add(bump as u64)
+            .wrapping_add(off as u64);
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Trapped(Trap::ArenaOutOfBounds { handle, .. })) => {
+                if handle != want {
+                    return TestResult::Fail("the native trap named the wrong handle");
+                }
+            }
+            Some(Outcome::Returned(_)) => {
+                return TestResult::Fail("an out-of-bounds arena write was allowed natively")
+            }
+            _ => {
+                return TestResult::Fail(
+                    "the native out-of-bounds write trapped for the wrong reason",
+                )
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_jit_diff_arena_out_of_bounds_traps_like_the_interpreter
+);
+
+fn smoke_bpf_jit_arena_recovers_and_keeps_running() -> TestResult {
+    // The "not fatal" half of the acceptance criterion, stated so that only
+    // recovery can satisfy it: the program is run twice and a *third* program
+    // runs afterwards. A fixup that did not actually return through the
+    // epilogue — a wrong resume address, an unbalanced stack — would take the
+    // kernel down here rather than producing a trap, and a leaked extable
+    // registration would stop the later program compiling at all.
+    let items = [
+        call_arena_base(),
+        st_imm(0, 8192, 0xBAD),
+        mov_imm(0, 1),
+        EXIT,
+    ];
+    let p = match arena_prog("arena_recover", &items, &[1]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if !p.is_jited() {
+        return if narf_bpf_jit::has_backend() {
+            TestResult::Fail("the arena program did not compile, so nothing was recovered")
+        } else {
+            TestResult::Skip(NO_BACKEND)
+        };
+    }
+    for _ in 0..2 {
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Trapped(Trap::ArenaOutOfBounds { .. })) => {}
+            _ => return TestResult::Fail("the recovered fault did not surface as a trap"),
+        }
+    }
+    // Something ordinary still works afterwards, which is what says the kernel
+    // survived rather than that this test was simply not reached.
+    let after = match arena_prog(
+        "arena_after",
+        &[call_arena_base(), st_imm(0, 0, 7), ldx(0, 0, 0), EXIT],
+        &[1],
+    ) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if after.run_atomic([0; 4], 4) != Some(Outcome::Returned(7)) {
+        return TestResult::Fail("a later arena program did not run after a recovered fault");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_arena_recovers_and_keeps_running);
+
+fn smoke_bpf_jit_arena_unpopulated_pages_trap_natively() -> TestResult {
+    // The extable's own reason for existing, isolated: an address inside the
+    // program's *reserved* arena that is not *live*. The interpreter refuses it
+    // by comparing against `live_bytes`; native code has no such comparison and
+    // reaches the same verdict only because the page is unmapped and the fixup
+    // catches the fault.
+    //
+    // "Require the arena fully populated" was the alternative to an extable, and
+    // this is the case that shows it would not have been enough on its own —
+    // though here it is arranged deliberately, since `ProgArena::new` makes live
+    // equal reserved.
+    let cap = kernel_arena_cap();
+    let mut g = match ArenaGroup::new(cap) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("ArenaGroup::new failed"),
+    };
+    // One live page, four reserved: handles into pages 1..4 are inside the
+    // arena's declared extent and are not backed.
+    if g.add_reserved(cap, 1, 4).is_err() {
+        return TestResult::Fail("add_reserved failed");
+    }
+    let p = match BpfProg::load_with_arena(
+        load_cap(),
+        LoadRequest {
+            name: alloc::string::String::from("arena_unpopulated"),
+            insns: asm(&[
+                call_arena_base(),
+                st_imm(0, 4096, 0xBAD),
+                mov_imm(0, 1),
+                EXIT,
+            ]),
+            context: Context::Atomic,
+            maps: alloc::vec::Vec::new(),
+        },
+        Some(alloc::sync::Arc::new(g)),
+    ) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load rejected"),
+    };
+    match diff_run(&p, [0; 4]) {
+        Ok(()) => TestResult::Pass,
+        Err(e) if core::ptr::eq(e, NO_BACKEND) => TestResult::Skip(NO_BACKEND),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_jit_arena_unpopulated_pages_trap_natively);
+
+fn smoke_bpf_jit_refuses_a_program_with_two_arenas() -> TestResult {
+    // Gate 2 in its relaxed form. With two arenas the JIT's reachable-and-mapped
+    // set stops equalling the interpreter's admitted set: `ArenaSlot::carve`
+    // places them contiguously, so an 8-byte access straddling the boundary is
+    // entirely inside mapped, writable, program-owned memory and would *succeed*
+    // natively while `arena::resolve_in` refuses it — one program, two verdicts.
+    //
+    // Mutation: drop the `arena_count != 1` test in `try_compile` and this goes
+    // red, because the straddling store below completes and returns 1.
+    //
+    // See `smoke_bpf_arena_straddling_two_arenas_is_refused`, which asserts the
+    // two arenas really are VA-contiguous first — without that premise the
+    // refusal could be an unmapped page and the JIT would agree after all.
+    let items = [
+        call_arena_base(),
+        st_imm(0, 4092, 0xBAD),
+        mov_imm(0, 1),
+        EXIT,
+    ];
+    let p = match arena_prog("two_arena_straddle", &items, &[1, 1]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if p.is_jited() {
+        return TestResult::Fail("a two-arena program was compiled; the straddling case diverges");
+    }
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Trapped(Trap::ArenaOutOfBounds { handle, .. })) => {
+            if handle != ARENA_BASE_HANDLE + 4092 {
+                return TestResult::Fail("the trap named the wrong handle");
+            }
+        }
+        Some(Outcome::Returned(_)) => {
+            return TestResult::Fail("a store straddling two arenas was allowed")
+        }
+        _ => return TestResult::Fail("the straddling store trapped for the wrong reason"),
+    }
+    // The single-arena form of the *same* program does compile, so the refusal
+    // is about the count and not about arena programs in general. A gate that
+    // refuses everything is not a gate.
+    let one = match arena_prog("one_arena_straddle", &items, &[2]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if !one.is_jited() && narf_bpf_jit::has_backend() {
+        return TestResult::Fail("the one-arena form must still compile");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_refuses_a_program_with_two_arenas);
+
+fn smoke_bpf_jit_arena_reachable_set_is_inside_the_slot_guards() -> TestResult {
+    // The boundary arithmetic, at the layer where it is expressible.
+    //
+    // Two of the three boundaries — the slot's null guard, and
+    // `ARENA_MAX_UNDERSHOOT_BYTES` below the slot base — are **not reachable by
+    // a verified program**: the verifier refuses an arena access whose offset
+    // domain can go negative (`fixpoint.rs`'s `addr.min < 0`), and both require
+    // exactly that. So they cannot be tested by running a program, and are
+    // tested here as what they actually are: an arithmetic property of the
+    // address the emitter computes, checked against the guards the memory layer
+    // asserts, plus the agreement of the two paths' admitted sets.
+    //
+    // The third — past the last arena — *is* reachable, and
+    // `smoke_bpf_jit_diff_arena_out_of_bounds_traps_like_the_interpreter` runs
+    // it.
+    use narf_memory::bpf_arena::{
+        ARENA_MAX_UNDERSHOOT_BYTES, ARENA_SLOT_STRIDE, ARENA_USABLE_BYTES,
+    };
+    let cap = kernel_arena_cap();
+    let g = match ArenaGroup::with_one(cap, 1) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("ArenaGroup::with_one failed"),
+    };
+    let base = g.slot_base();
+
+    // The emitted sequence is `slot_base + zx32(handle) + sext(off16)`, with the
+    // displacement folded into the index. Modelled here exactly as the emitter
+    // computes it, over the extremes of both fields.
+    let addr = |handle: u64, off: i16| -> u64 {
+        base.wrapping_add((handle as u32 as u64).wrapping_add(off as i64 as u64))
+    };
+    let lo = base - ARENA_MAX_UNDERSHOOT_BYTES;
+    let hi = base + ARENA_SLOT_STRIDE;
+    for &handle in &[0u64, 1, ARENA_BASE_HANDLE, ARENA_USABLE_BYTES - 8, u64::MAX] {
+        for &off in &[i16::MIN, -1, 0, 1, i16::MAX] {
+            let a = addr(handle, off);
+            if a < lo || a >= hi {
+                return TestResult::Fail(
+                    "an address the emitted sequence can compute escapes the slot's guards",
+                );
+            }
+        }
+    }
+    // The zero-extension is what makes that hold for `u64::MAX`, and it is not
+    // free: without it the address would be `base - 1 + off`, which is `lo` only
+    // by luck. Stated as its own check so the case above cannot pass by an
+    // accident of the chosen constants.
+    if addr(u64::MAX, 0) != base + u64::from(u32::MAX) {
+        return TestResult::Fail("the handle is not zero-extended to 32 bits");
+    }
+
+    // And the two paths' *admitted* sets agree at the boundaries that are
+    // reachable: `resolve_in` refuses exactly what the guards leave unmapped.
+    let arenas = g.arenas();
+    for &h in &[0u64, 1, ARENA_BASE_HANDLE - 8, ARENA_BASE_HANDLE + 4096] {
+        if crate::arena::resolve_in(arenas, h, 8).is_some() {
+            return TestResult::Fail("a handle outside the arena resolved");
+        }
+    }
+    if crate::arena::resolve_in(arenas, ARENA_BASE_HANDLE, 8).is_none() {
+        return TestResult::Fail("the arena's first doubleword did not resolve");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_jit_arena_reachable_set_is_inside_the_slot_guards
+);
+
+fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
+    // `try_compile`'s relaxed predicates, tested directly rather than through a
+    // program — because one of them is **not reachable through a program at
+    // all**, and a gate nothing can exercise is a gate nothing is testing.
+    //
+    // Gate 3 now reads "no *non*-arena fault site". Today every fault site the
+    // verifier can emit is an arena one: `fixpoint.rs` pushes a `FaultSite` only
+    // under `p.class.is_faulting()`, and the other faulting class,
+    // `PtrClass::Object`, returns `OpaqueDeref` before reaching the push. So the
+    // `!f.arena` clause is dead through the verifier and stays correct only if
+    // something checks it. Probe reads are what will make it live, and they have
+    // no lowering on either backend — a fault site the emitter did not produce
+    // would be sealed as executable text with no extable entry covering it,
+    // which `bpf_extable`'s contract makes fatal by design.
+    //
+    // Mutation: delete the `!f.arena` filter and the first case goes red. Delete
+    // the `arena_count != 1` test and the last two do.
+    use narf_bpf_verifier::{FaultSite, VerifiedProgram};
+    let base = |arena: bool| VerifiedProgram {
+        // A doubleword store through R1, which is an admissible base in a
+        // program with no `call` — so gate 5 is not what refuses any of the
+        // cases below, and each one isolates the gate it names.
+        insns: asm(&[st_imm(1, 0, 5), mov_imm(0, 1), EXIT]),
+        context: Context::Atomic,
+        max_stack_bytes: 8,
+        initial_fuel: 64,
+        fault_sites: alloc::vec![FaultSite {
+            insn_index: 0,
+            dst_reg: Some(0),
+            arena,
+        }],
+        subprogs: alloc::vec::Vec::new(),
+        uses_arena: arena,
+        kfunc_calls: alloc::vec::Vec::new(),
+    };
+
+    // Gate 3: a probe read — a fault site that is not an arena access — is
+    // refused, and named as such.
+    if crate::jit_glue::try_compile(&base(false), true, 0).err()
+        != Some(crate::jit_glue::JitSkip::HasFaultSites)
+    {
+        return TestResult::Fail("a non-arena fault site must still be refused by gate 3");
+    }
+    // Gate 2: an arena program with no arena has no slot base to be entered
+    // with, and one with two has the straddling divergence.
+    for n in [0usize, 2, 3] {
+        if crate::jit_glue::try_compile(&base(true), true, n).err()
+            != Some(crate::jit_glue::JitSkip::UsesArena)
+        {
+            return TestResult::Fail("gate 2 must refuse any arena count other than one");
+        }
+    }
+    // And a gate that refuses everything is not a gate: the same program with
+    // exactly one arena is accepted, so the two refusals above are about the
+    // count and the flag rather than about arena programs in general.
+    match crate::jit_glue::try_compile(&base(true), true, 1) {
+        Ok(image) => {
+            // …and the emitted image really does contain the arena shape, so
+            // `run_atomic`'s belt will demand a slot base for it. An `Ok` whose
+            // image had no arena access would mean the emitter had quietly
+            // lowered the store as a bare dereference.
+            if !image.uses_arena() {
+                return TestResult::Fail("the compiled image contains no arena access");
+            }
+        }
+        Err(_) if !narf_bpf_jit::has_backend() => return TestResult::Skip(NO_BACKEND),
+        Err(_) => return TestResult::Fail("exactly one arena must be accepted"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_jit_gates_two_and_three_refuse_what_they_name
+);
 
 /// Immediates chosen for sign-extension and shift-count boundaries.
 const SWEEP_IMMS: [i32; 10] = [0, 1, -1, 2, -2, 7, 31, 32, 63, 64];
