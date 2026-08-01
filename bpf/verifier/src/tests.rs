@@ -499,3 +499,67 @@ fn accepts_const_on_a_scalar_argument() {
         Ok(())
     );
 }
+
+// ── the sentinel that makes the release guard belt to a brace ────────
+
+/// `release(NO_REF)` never discharges a real reference.
+///
+/// This is the invariant behind an otherwise puzzling piece of `check_args`:
+///
+/// ```ignore
+/// if p.ref_id == NO_REF || !st.release(p.ref_id) {
+///     return Err(VerifyError::ReleaseOfUnacquired { .. });
+/// }
+/// ```
+///
+/// The first disjunct is currently *unreachable as a distinguishing test* —
+/// deleting it changes no verdict, and mutation testing duly reports it as
+/// surviving. That is not a hole in the tests; it is a fact about the values
+/// involved, and the fact deserved to be written down rather than rediscovered:
+/// a [`Ref`] is keyed by its acquisition site's **instruction index**, and
+/// [`NO_REF`] is `u32::MAX`, which no program can index (`BpfProg::MAX_INSNS`
+/// is `1 << 16`). So `release(NO_REF)` finds nothing, the second disjunct fires
+/// on its own, and the first is belt to that brace.
+///
+/// What this test guards is the change that would make it load-bearing again:
+/// a sentinel inside the index range. With `NO_REF == 0`, a program whose
+/// *first* instruction acquires would let a pointer that never carried a
+/// reference — `ref_id == NO_REF == 0` — release the one instruction 0 took,
+/// and the verifier would then report a leak on the real holder or, worse,
+/// accept a use-after-release. Keep the disjunct; keep this.
+#[test]
+fn releasing_the_no_ref_sentinel_never_discharges_a_reference() {
+    use crate::state::{AbsState, Ref, NO_REF};
+
+    let mut st = AbsState::entry(32);
+    // Instruction 0 is the lowest acquisition site there is, and therefore the
+    // one a sentinel is likeliest to collide with.
+    st.acquire(Ref {
+        id: 0,
+        is_lock: false,
+        domain: ValidityDomain::Owned,
+    });
+    assert!(
+        !st.release(NO_REF),
+        "releasing the NO_REF sentinel discharged a reference: the sentinel \
+         collides with a real acquisition-site index, and `check_args`' \
+         `p.ref_id == NO_REF` arm is now the only thing standing between a \
+         never-acquired pointer and someone else's reference"
+    );
+    assert!(
+        st.holds(0),
+        "the reference acquired at instruction 0 is gone after releasing the \
+         sentinel"
+    );
+    // And the sentinel is outside the index range in the first place, which is
+    // the actual reason. `MAX_INSNS` lives in `narf-bpf`, which this crate
+    // cannot name, so assert the property that matters: no index a `u32`-sized
+    // instruction stream can produce reaches the sentinel without the stream
+    // itself being `u32::MAX` slots long.
+    assert_eq!(
+        NO_REF,
+        u32::MAX,
+        "NO_REF is no longer u32::MAX, so an acquisition site can collide with \
+         it — see this test's doc comment"
+    );
+}

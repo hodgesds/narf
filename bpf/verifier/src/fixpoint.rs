@@ -1500,6 +1500,19 @@ impl Analysis<'_, '_> {
                     // position releases what the same type in return position
                     // acquired, which is why there is no way to declare an
                     // acquire whose release was forgotten.
+                    //
+                    // The `p.ref_id == NO_REF` disjunct is belt to the second
+                    // one's brace, and deliberately kept: a `Ref` is keyed by
+                    // its acquisition site's *instruction index* and `NO_REF`
+                    // is `u32::MAX`, so `release(NO_REF)` finds nothing and the
+                    // second test would fire on its own. Deleting the first
+                    // therefore changes no verdict — mutation testing reports
+                    // it as an equivalent mutant, and that is a fact about the
+                    // sentinel's value rather than a gap in the tests. Change
+                    // the sentinel to something inside the index range and it
+                    // becomes load-bearing immediately;
+                    // `releasing_the_no_ref_sentinel_never_discharges_a_reference`
+                    // in `tests.rs` is what says so.
                     if arg.consumes_in_arg_position() {
                         if p.ref_id == NO_REF || !st.release(p.ref_id) {
                             return Err(VerifyError::ReleaseOfUnacquired { at, reg: r.index() });
