@@ -2002,6 +2002,110 @@ fn a_map_fd_immediate_with_an_empty_map_set_is_rejected() {
     );
 }
 
+/// `fn release(Owned<BpfMap>)`, keyed to the *map handle's* type.
+///
+/// The key matters: [`release_kfunc`] wants `TypeKey(1)`, so handing it a map
+/// handle is rejected as a signature mismatch and never reaches the reference
+/// check at all. Only a release keyed to `MAP_HANDLE_TYPE_KEY` gets far enough
+/// to exercise it.
+static MAP_OWNED_ARG: &[ArgDesc] = &[ArgDesc {
+    kind: TypeKind::Ptr {
+        kind: PtrKind::Object,
+        key: crate::MAP_HANDLE_TYPE_KEY,
+    },
+    domain: ValidityDomain::Owned,
+    flags: ArgFlags::NONE,
+}];
+
+#[test]
+fn releasing_a_map_handle_that_was_never_acquired_is_rejected() {
+    // The sharpest witness there is for `PtrVal::ref_id`, because a map handle
+    // passes every *other* check on the way in: it is a real `PtrClass::Object`
+    // with the right `TypeKey`, at offset zero, non-null, and its `Static`
+    // domain is strictly *stronger* than the `Owned` the parameter asks for, so
+    // `weaker_domain` waves it through. The only thing standing between a
+    // two-instruction program and a refcount underflow on a live map is the
+    // `ref_id == NO_REF` arm — "this pointer is not a reference you took".
+    //
+    // `releasing_something_never_acquired_is_rejected` above cannot pin that:
+    // it loads its pointer from the context, which types as an opaque scalar,
+    // so it is caught one check earlier as a signature mismatch and would stay
+    // green with the reference arm deleted.
+    let k = [kfunc(
+        "narf_map_release",
+        MAP_OWNED_ARG,
+        ArgDesc::VOID,
+        Context::Atomic,
+    )];
+    let e = check_all(
+        &[ld_map_fd(1, 3), call(0), mov(0, 0), EXIT],
+        &[],
+        &k,
+        &[MAP8],
+        Context::Atomic,
+    )
+    .expect_err("releasing a map handle nobody acquired must be rejected");
+    // `at: 2`, not 1 — `LD_IMM64` is two slots wide.
+    assert_eq!(e, VerifyError::ReleaseOfUnacquired { at: 2, reg: 1 });
+}
+
+#[test]
+fn acquiring_from_a_map_handle_and_releasing_verifies() {
+    // The control for the test above, and the shape `narf_map_acquire` /
+    // `narf_map_release` actually have: the handle goes *in* as a `Trusted<T>`
+    // parameter — its `Static` domain satisfies that too — and what comes back
+    // is the thing with a `ref_id`, which is the thing the release accepts.
+    //
+    // Without this, "map handles cannot be released" would be satisfiable by
+    // rejecting every map-typed release, and the negative above would prove
+    // nothing about `ref_id`.
+    static MAP_TRUSTED_ARG: &[ArgDesc] = &[ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::Object,
+            key: crate::MAP_HANDLE_TYPE_KEY,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::NONE,
+    }];
+    let k = [
+        kfunc(
+            "narf_map_acquire",
+            MAP_TRUSTED_ARG,
+            ArgDesc {
+                kind: TypeKind::Ptr {
+                    kind: PtrKind::Object,
+                    key: crate::MAP_HANDLE_TYPE_KEY,
+                },
+                domain: ValidityDomain::Owned,
+                flags: ArgFlags::NULLABLE,
+            },
+            Context::Atomic,
+        ),
+        kfunc(
+            "narf_map_release",
+            MAP_OWNED_ARG,
+            ArgDesc::VOID,
+            Context::Atomic,
+        ),
+    ];
+    check_all(
+        &[
+            ld_map_fd(1, 3),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 2),
+            movr(1, 0),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        &[MAP8],
+        Context::Atomic,
+    )
+    .expect("acquire from a map handle, test, release");
+}
+
 #[test]
 fn a_map_handle_may_not_be_dereferenced() {
     // Linux's `CONST_PTR_TO_MAP` is equally undereferenceable. Here it falls out

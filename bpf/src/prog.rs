@@ -397,7 +397,7 @@ impl BpfProg {
             // indexing off a zero base — structurally impossible rather than
             // merely currently absent.
             let slot_base = self.arenas.as_ref().map_or(0, |g| g.slot_base());
-            if !image.uses_arena() || (slot_base != 0 && self.arenas().len() == 1) {
+            if self.native_path_admits(image, slot_base) {
                 return self.run_atomic_native(ctx, ctx_len, slot_base);
             }
         }
@@ -571,7 +571,34 @@ impl BpfProg {
     #[inline]
     #[must_use]
     pub fn is_jited(&self) -> bool {
-        self.jit.is_some()
+        match self.jit.as_ref() {
+            None => false,
+            Some(image) => {
+                let slot_base = self.arenas.as_ref().map_or(0, |g| g.slot_base());
+                self.native_path_admits(image, slot_base)
+            }
+        }
+    }
+
+    /// Whether `run_atomic` would actually enter native code.
+    ///
+    /// Holding a `JitImage` is necessary but **not** sufficient: the run path
+    /// also re-checks, per invocation, that an image whose emitted code
+    /// dereferences the arena slot base is only ever entered with a non-zero
+    /// base and exactly one arena.
+    ///
+    /// This exists as one predicate, consulted by both the run path and
+    /// [`Self::is_jited`], because they were two. `is_jited` answered
+    /// `self.jit.is_some()` while the run path applied the extra clause — so
+    /// breaking that clause would have sent every arena program down the
+    /// interpreter while `is_jited` still reported `true`, and
+    /// `tests::diff_run`'s non-vacuity assertion is built on `is_jited`. All
+    /// seven arena differential tests would have compared the interpreter with
+    /// itself and stayed green, with the arena lowering — the one lowering
+    /// carrying no bounds check — not executing at all.
+    #[inline]
+    fn native_path_admits(&self, image: &crate::jit_glue::JitImage, slot_base: u64) -> bool {
+        !image.uses_arena() || (slot_base != 0 && self.arenas().len() == 1)
     }
 
     /// Bytes of emitted native code, or 0 when the program runs interpreted.
