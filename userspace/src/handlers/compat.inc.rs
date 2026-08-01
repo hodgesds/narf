@@ -1607,6 +1607,7 @@ struct StatfsBuf {
 const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 const SYSFS_MAGIC: u64 = 0x6265_6572;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+const MQUEUE_MAGIC: u64 = 0x1980_0202;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
 const EXT2_SUPER_MAGIC: u64 = 0xEF53;
 
@@ -1630,6 +1631,7 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
         "cgroup2" | "cgroup" => CGROUP2_SUPER_MAGIC,
         "sysfs" => SYSFS_MAGIC,
         "procfs" | "proc" => PROC_SUPER_MAGIC,
+        "mqueue" => MQUEUE_MAGIC,
         n if n.starts_with("ext") => EXT2_SUPER_MAGIC,
         _ => TMPFS_MAGIC, // tmpfs / devtmpfs / shm / other memfs-backed
     };
@@ -6945,6 +6947,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             Syscall::MqTimedreceive,
             "mq_timedreceive",
             RawFnHandler(crate::mqueue::sys_mq_timedreceive),
+        );
+        table.install_raw(
+            Syscall::MqNotify,
+            "mq_notify",
+            RawFnHandler(crate::mqueue::sys_mq_notify),
         );
         table.install_raw(
             Syscall::MqGetsetattr,

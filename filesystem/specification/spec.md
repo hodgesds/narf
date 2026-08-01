@@ -139,6 +139,19 @@ multiplexer: it selects the recorded console or PTY slave, preserves the 5:0
 path-node identity, and reports `ENXIO` for a detached session. `O_PATH`
 continues to open only the side-effect-free path node.
 
+With `linux-compat`, `MqueueFs::new(ipc_namespace_id)` exposes the same live
+queue objects used by `mq_open`/`mq_unlink`/send/receive/notify/getsetattr.
+Queue names are scoped by IPC namespace; every mount captures the namespace
+visible to its creator. The root is mode 01777 and queue nodes retain stable
+inode, owner, creation mode, Linux's fixed 80-byte stat size, exact status-file
+text, and poll readiness. An unlink removes only the name; open descriptions
+retain the queue until their final reference drops. `O_NONBLOCK` and access
+mode belong to each open description and therefore remain shared across
+dup/fork but independent across separate `mq_open` calls. The public typed
+surface is `MqueueFs`, `MqueueOpenOptions`, `MqueueAttr`,
+`MqueueNotification`, and `MqueueError` plus the operations in
+`filesystem::mqueuefs`.
+
 ### 3.3.1 cgroup-v2 cpuset placement
 
 `cpuset.cpus.effective` is pushed into scheduler CPU affinity.

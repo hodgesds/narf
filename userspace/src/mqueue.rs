@@ -5,9 +5,9 @@
 //! object goes through the `FileOps::mq_queue_id` / `inotify_instance`
 //! hooks (mirroring `pidfd_target_pid`) rather than a downcast.
 //!
-//! Message queues are named priority FIFOs held in a global side table
-//! keyed by an opaque queue id; `mq_open` maps a name to an id and
-//! installs a `MqFile` carrying the id. inotify instances each own a
+//! Message queues are Linux-shaped mqueuefs inodes held by
+//! `narf_filesystem::mqueuefs`; `mq_open` and mounted `mqueue` instances share
+//! those namespace-keyed objects. inotify instances each own a
 //! watch-descriptor table plus a queue of serialized `struct
 //! inotify_event` records; the syscall handlers call the `notify_*`
 //! entry points here after a successful filesystem mutation, which fan
@@ -23,7 +23,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
+use narf_filesystem::{
+    mqueuefs, FileOps, FsError, FsFuture, Mode, MqueueAttr, MqueueOpenOptions, Stat,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fd;
@@ -34,87 +36,155 @@ use crate::syscall::{SyscallReturn, TrapContext};
 const ENOENT: i64 = 2;
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
+const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
+const ENOSPC: i64 = 28;
+const ENAMETOOLONG: i64 = 36;
 const EMSGSIZE: i64 = 90;
+const ETIMEDOUT: i64 = 110;
 
 fn err(e: i64) -> SyscallReturn {
     SyscallReturn::ok((-e) as u64)
 }
 
 // open-flag bits we honour (shared with the generic open path).
-const O_CREAT: u64 = 0o100;
-const O_EXCL: u64 = 0o200;
 const O_NONBLOCK: u64 = 0o4000;
-const O_CLOEXEC: u64 = 0o2000000;
 
 // ════════════════════════════════════════════════════════════════════
 // POSIX message queues
 // ════════════════════════════════════════════════════════════════════
 
-const MQ_DEFAULT_MAXMSG: i64 = 10;
-const MQ_DEFAULT_MSGSIZE: i64 = 8192;
-
-struct MqMessage {
-    prio: u32,
-    bytes: Vec<u8>,
-}
-
-struct MqQueue {
-    messages: Vec<MqMessage>,
-    maxmsg: i64,
-    msgsize: i64,
-    /// `mq_flags` O_NONBLOCK bit, settable via `mq_setattr`.
-    nonblock: bool,
-}
-
-static MQ_QUEUES: IrqSafeSpinLock<Option<BTreeMap<u64, MqQueue>>> = IrqSafeSpinLock::new(None);
-static MQ_NAMES: IrqSafeSpinLock<Option<BTreeMap<String, u64>>> = IrqSafeSpinLock::new(None);
-static MQ_NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-fn with_queues<R>(f: impl FnOnce(&mut BTreeMap<u64, MqQueue>) -> R) -> R {
-    let mut g = MQ_QUEUES.lock();
-    f(g.get_or_insert_with(BTreeMap::new))
-}
-
-fn with_names<R>(f: impl FnOnce(&mut BTreeMap<String, u64>) -> R) -> R {
-    let mut g = MQ_NAMES.lock();
-    f(g.get_or_insert_with(BTreeMap::new))
-}
-
-/// fd-table descriptor for an open message queue.
-struct MqFile {
-    id: u64,
-}
-
-impl FileOps for MqFile {
-    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        // A message queue is not byte-readable; use mq_timedreceive.
-        Box::pin(async { Err(FsError::InvalidData) })
-    }
-    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async { Err(FsError::InvalidData) })
-    }
-    fn stat(&self) -> Stat {
-        Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode::FILE_RW,
-            mtime_cycles: 0,
-        }
-    }
-    fn mq_queue_id(&self) -> Option<u64> {
-        Some(self.id)
-    }
-}
-
-/// Resolve an mqd to its queue id via the FileOps hook.
+/// Resolve an mqd to its open-description id via the FileOps hook.
 fn queue_id_of(task: u64, mqd: u32) -> Option<u64> {
     fd::with_table(task, |t| t.get(mqd).and_then(|e| e.ops.mq_queue_id())).flatten()
 }
 
+pub(crate) fn set_fd_nonblock(task: u64, mqd: u32, enabled: bool) {
+    if let Some(id) = queue_id_of(task, mqd) {
+        let _ = mqueuefs::set_nonblock(id, enabled);
+    }
+}
+
+pub(crate) fn fd_nonblock(task: u64, mqd: u32) -> Option<bool> {
+    queue_id_of(task, mqd).and_then(|id| mqueuefs::is_nonblock(id).ok())
+}
+
 fn read_i64(buf: &[u8]) -> i64 {
     i64::from_le_bytes(buf[..8].try_into().unwrap())
+}
+
+fn namespace_id(task: u64) -> u64 {
+    #[cfg(feature = "container")]
+    {
+        return crate::namespaces::current_ipc_ns(task)
+            .map(|namespace| namespace.id())
+            .unwrap_or(0);
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = task;
+        0
+    }
+}
+
+/// Build a mount of the IPC namespace visible to the calling task.
+pub fn mount_current_namespace() -> Arc<dyn narf_filesystem::FsInstance> {
+    Arc::new(narf_filesystem::MqueueFs::new(namespace_id(
+        current_task_id(),
+    )))
+}
+
+fn mq_errno(error: narf_filesystem::MqueueError) -> i64 {
+    use narf_filesystem::MqueueError;
+    match error {
+        MqueueError::NotFound => ENOENT,
+        MqueueError::Exists => EEXIST,
+        MqueueError::Invalid => EINVAL,
+        MqueueError::NameTooLong => ENAMETOOLONG,
+        MqueueError::PermissionDenied => 13,
+        MqueueError::NoSpace => ENOSPC,
+        MqueueError::BadDescriptor => EBADF,
+        MqueueError::MessageTooLarge => EMSGSIZE,
+        MqueueError::WouldBlock => EAGAIN,
+        MqueueError::Busy => 16,
+    }
+}
+
+fn timeout_deadline(timeout_ptr: u64) -> Result<Option<u64>, i64> {
+    if timeout_ptr == 0 {
+        return Ok(None);
+    }
+    let mut bytes = [0u8; 16];
+    // SAFETY: the syscall supplied a `const struct timespec *`; the uaccess
+    // helper validates and SMAP-brackets the fixed-size read.
+    unsafe { crate::handlers::copy_from_user(&mut bytes, timeout_ptr) }.map_err(|_| EFAULT)?;
+    let seconds = i64::from_ne_bytes(bytes[0..8].try_into().unwrap());
+    let nanoseconds = i64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
+        return Err(EINVAL);
+    }
+    let absolute = i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds);
+    let wall_now = narf_scheduler::narf_time::now_wall().as_nanos();
+    let monotonic_now = narf_scheduler::narf_time::monotonic_ns();
+    if absolute <= wall_now {
+        return Ok(Some(monotonic_now));
+    }
+    let remaining = u64::try_from(absolute - wall_now).unwrap_or(u64::MAX);
+    Ok(Some(monotonic_now.saturating_add(remaining)))
+}
+
+/// Handle the full/empty slow path. Linux interprets the supplied timeout as
+/// an absolute CLOCK_REALTIME deadline. NARF parks and re-executes the syscall;
+/// queue state is rechecked after a readiness wake or a 1ms safety deadline.
+fn park_would_block(ctx: &mut dyn TrapContext, handle_id: u64, timeout_ptr: u64) {
+    if mqueuefs::is_nonblock(handle_id).unwrap_or(true) {
+        ctx.set_return(err(EAGAIN));
+        return;
+    }
+    let absolute_deadline = match timeout_deadline(timeout_ptr) {
+        Ok(deadline) => deadline,
+        Err(errno) => {
+            ctx.set_return(err(errno));
+            return;
+        }
+    };
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    if absolute_deadline.is_some_and(|deadline| deadline <= now) {
+        ctx.set_return(err(ETIMEDOUT));
+        return;
+    }
+    if let (Some(user_task), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
+        let deadline = absolute_deadline
+            .unwrap_or(u64::MAX)
+            .min(now.saturating_add(1_000_000));
+        #[cfg(target_arch = "x86_64")]
+        let resume_rip = ctx.rip().wrapping_sub(2);
+        #[cfg(target_arch = "aarch64")]
+        let resume_rip = ctx.rip().wrapping_sub(4);
+        ctx.set_rip(resume_rip);
+        // SAFETY: `user_task` is the live task context. State is published
+        // before the scheduler handoff, and no filesystem lock is held here.
+        unsafe {
+            let user = &*user_task;
+            user.sleep_deadline_ns.store(deadline, Ordering::Release);
+            user.net_io_wait.store(true, Ordering::Release);
+            user.epoll_park_gen
+                .store(narf_net::readiness::generation(), Ordering::Release);
+            ctx.save_user_state(user.state.get() as *mut u8);
+            *user.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                crate::handlers::own_stack_block(ctx);
+                return;
+            }
+            hook(user_task);
+        }
+    }
+    // The kernel-test harness has no runnable user task to park.
+    ctx.set_return(err(EAGAIN));
 }
 
 /// `mq_open(name, oflag, mode, attr)`.
@@ -122,75 +192,61 @@ pub fn sys_mq_open(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let name = match copy_user_cstr(a.arg0, 256) {
         Some(n) if !n.is_empty() => n,
-        _ => {
+        Some(_) => {
             ctx.set_return(err(EINVAL));
             return;
         }
+        None => {
+            ctx.set_return(err(EFAULT));
+            return;
+        }
     };
-    let oflag = a.arg1;
+    let oflag = a.arg1 as u32;
     let attr_ptr = a.arg3;
 
-    let existing = with_names(|m| m.get(&name).copied());
-    let id = match existing {
-        Some(id) => {
-            if oflag & O_CREAT != 0 && oflag & O_EXCL != 0 {
-                ctx.set_return(err(EEXIST));
-                return;
-            }
-            id
+    let attr = if attr_ptr != 0 {
+        let mut buf = [0u8; 64];
+        // SAFETY: attr_ptr is non-zero; copy_from_user range-validates and
+        // SMAP-brackets the mq_attr prefix consumed by the kernel.
+        if unsafe { crate::handlers::copy_from_user(&mut buf, attr_ptr) }.is_err() {
+            ctx.set_return(err(EFAULT));
+            return;
         }
-        None => {
-            if oflag & O_CREAT == 0 {
-                ctx.set_return(err(ENOENT));
-                return;
-            }
-            let (maxmsg, msgsize) = if attr_ptr != 0 {
-                let mut buf = [0u8; 32];
-                // SAFETY: attr_ptr is non-zero; copy_from_user range-validates
-                // and SMAP-brackets the 32-byte struct mq_attr read.
-                if unsafe { crate::handlers::copy_from_user(&mut buf, attr_ptr) }.is_err() {
-                    ctx.set_return(err(EINVAL));
-                    return;
-                }
-                let maxmsg = read_i64(&buf[8..16]);
-                let msgsize = read_i64(&buf[16..24]);
-                if maxmsg <= 0 || msgsize <= 0 {
-                    ctx.set_return(err(EINVAL));
-                    return;
-                }
-                (maxmsg, msgsize)
-            } else {
-                (MQ_DEFAULT_MAXMSG, MQ_DEFAULT_MSGSIZE)
-            };
-            let id = MQ_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            with_queues(|m| {
-                m.insert(
-                    id,
-                    MqQueue {
-                        messages: Vec::new(),
-                        maxmsg,
-                        msgsize,
-                        nonblock: oflag & O_NONBLOCK != 0,
-                    },
-                )
-            });
-            with_names(|m| m.insert(name.clone(), id));
-            id
+        Some(MqueueAttr {
+            flags: read_i64(&buf[0..8]),
+            maxmsg: read_i64(&buf[8..16]),
+            msgsize: read_i64(&buf[16..24]),
+            curmsgs: read_i64(&buf[24..32]),
+        })
+    } else {
+        None
+    };
+    let task = current_task_id();
+    let (uid, gid) = crate::handlers::current_fs_ids();
+    let mode = a.arg2 as u16;
+    let file = match mqueuefs::open(
+        namespace_id(task),
+        &name,
+        MqueueOpenOptions {
+            flags: oflag,
+            mode,
+            umask: crate::handlers::current_umask() as u16,
+            uid,
+            gid,
+            attr,
+        },
+    ) {
+        Ok(file) => file,
+        Err(error) => {
+            ctx.set_return(err(mq_errno(error)));
+            return;
         }
     };
 
-    let file: Arc<dyn FileOps> = Arc::new(MqFile { id });
-    let flags = if oflag & O_CLOEXEC != 0 {
-        fd::FD_CLOEXEC
-    } else {
-        0
-    };
-    let status_flags = if oflag & O_NONBLOCK != 0 {
-        fd::O_NONBLOCK
-    } else {
-        0
-    };
-    match task_open_call(task_open(file, flags, status_flags)) {
+    // Linux do_mq_open installs every mqd with O_CLOEXEC, independent of the
+    // caller's flags (`FD_ADD(O_CLOEXEC, ...)`).
+    let status_flags = oflag & (fd::O_ACCMODE | fd::O_NONBLOCK);
+    match task_open_call(task_open(file, fd::FD_CLOEXEC, status_flags)) {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
         None => ctx.set_return(err(EBADF)),
     }
@@ -223,18 +279,20 @@ pub fn sys_mq_unlink(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let name = match copy_user_cstr(a.arg0, 256) {
         Some(n) if !n.is_empty() => n,
-        _ => {
+        Some(_) => {
             ctx.set_return(err(EINVAL));
             return;
         }
-    };
-    let id = with_names(|m| m.remove(&name));
-    match id {
-        Some(id) => {
-            with_queues(|m| m.remove(&id));
-            ctx.set_return(SyscallReturn::ok(0));
+        None => {
+            ctx.set_return(err(EFAULT));
+            return;
         }
-        None => ctx.set_return(err(ENOENT)),
+    };
+    let task = current_task_id();
+    let (uid, _) = crate::handlers::current_fs_ids();
+    match mqueuefs::unlink(namespace_id(task), &name, uid) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(error) => ctx.set_return(err(mq_errno(error))),
     }
 }
 
@@ -252,28 +310,8 @@ pub fn sys_mq_timedsend(ctx: &mut dyn TrapContext) {
     let msg_ptr = a.arg1;
     let msg_len = a.arg2 as usize;
     let prio = a.arg3 as u32;
-
-    // Validate against the queue's msgsize / fullness before copying.
-    let too_big = with_queues(|m| m.get(&id).map(|q| msg_len as i64 > q.msgsize));
-    match too_big {
-        Some(true) => {
-            ctx.set_return(err(EMSGSIZE));
-            return;
-        }
-        None => {
-            ctx.set_return(err(EBADF));
-            return;
-        }
-        _ => {}
-    }
-    let full = with_queues(|m| {
-        m.get(&id)
-            .map(|q| q.messages.len() as i64 >= q.maxmsg)
-            .unwrap_or(true)
-    });
-    if full {
-        // Non-blocking semantics: a full queue is EAGAIN (we don't park).
-        ctx.set_return(err(EAGAIN));
+    if let Err(errno) = timeout_deadline(a.arg4) {
+        ctx.set_return(err(errno));
         return;
     }
     // SAFETY: msg_ptr is the user message buffer; copy_from_user_vec
@@ -281,16 +319,71 @@ pub fn sys_mq_timedsend(ctx: &mut dyn TrapContext) {
     let bytes = match unsafe { crate::handlers::copy_from_user_vec(msg_ptr, msg_len) } {
         Ok(b) => b,
         Err(_) => {
-            ctx.set_return(err(EINVAL));
+            ctx.set_return(err(EFAULT));
             return;
         }
     };
-    with_queues(|m| {
-        if let Some(q) = m.get_mut(&id) {
-            q.messages.push(MqMessage { prio, bytes });
+    match mqueuefs::send(id, bytes, prio) {
+        Ok(notification) => {
+            if let Some(notification) = notification {
+                if notification.method == 0 {
+                    crate::handlers::raise_signal_pending(
+                        notification.task_id,
+                        notification.signal as u32,
+                    );
+                }
+            }
+            narf_net::readiness::notify(0);
+            ctx.set_return(SyscallReturn::ok(0));
         }
-    });
-    ctx.set_return(SyscallReturn::ok(0));
+        Err(narf_filesystem::MqueueError::WouldBlock) => park_would_block(ctx, id, a.arg4),
+        Err(error) => ctx.set_return(err(mq_errno(error))),
+    }
+}
+
+/// `mq_notify(mqd, sigevent*)` — one-shot SIGEV_SIGNAL/SIGEV_NONE support.
+/// SIGEV_THREAD remains a libc/netlink protocol and is rejected until NARF's
+/// netlink layer exposes the Linux notification-cookie path.
+pub fn sys_mq_notify(ctx: &mut dyn TrapContext) {
+    const SIGEV_SIGNAL: i32 = 0;
+    const SIGEV_NONE: i32 = 1;
+    let args = *ctx.args();
+    let task = current_task_id();
+    let id = match queue_id_of(task, args.arg0 as u32) {
+        Some(id) => id,
+        None => {
+            ctx.set_return(err(EBADF));
+            return;
+        }
+    };
+    let notification = if args.arg1 == 0 {
+        None
+    } else {
+        let mut bytes = [0u8; 64];
+        // SAFETY: Linux copies the complete native `struct sigevent` before
+        // validating its sigval/signo/notify preamble.
+        if unsafe { crate::handlers::copy_from_user(&mut bytes, args.arg1) }.is_err() {
+            ctx.set_return(err(EFAULT));
+            return;
+        }
+        let signal = i32::from_ne_bytes(bytes[8..12].try_into().unwrap());
+        let method = i32::from_ne_bytes(bytes[12..16].try_into().unwrap());
+        if !matches!(method, SIGEV_SIGNAL | SIGEV_NONE)
+            || (method == SIGEV_SIGNAL && !(0..=64).contains(&signal))
+        {
+            ctx.set_return(err(EINVAL));
+            return;
+        }
+        Some(narf_filesystem::MqueueNotification {
+            task_id: task,
+            method,
+            signal: if method == SIGEV_SIGNAL { signal } else { 0 },
+        })
+    };
+    match mqueuefs::notify(id, task, notification) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(error) => ctx.set_return(err(mq_errno(error))),
+    }
 }
 
 /// `mq_timedreceive(mqd, msg_ptr, msg_len, prio_ptr, timeout)`.
@@ -307,58 +400,38 @@ pub fn sys_mq_timedreceive(ctx: &mut dyn TrapContext) {
     let msg_ptr = a.arg1;
     let msg_len = a.arg2 as usize;
     let prio_ptr = a.arg3;
-
-    // POSIX: the receive buffer must be at least mq_msgsize.
-    let too_small = with_queues(|m| m.get(&id).map(|q| (msg_len as i64) < q.msgsize));
-    match too_small {
-        Some(true) => {
-            ctx.set_return(err(EMSGSIZE));
-            return;
-        }
-        None => {
-            ctx.set_return(err(EBADF));
-            return;
-        }
-        _ => {}
+    if let Err(errno) = timeout_deadline(a.arg4) {
+        ctx.set_return(err(errno));
+        return;
     }
 
-    // Pop the highest-priority message (lowest index wins a tie → FIFO).
-    let popped = with_queues(|m| {
-        let q = m.get_mut(&id)?;
-        if q.messages.is_empty() {
-            return Some(None);
-        }
-        let mut best = 0usize;
-        for i in 1..q.messages.len() {
-            if q.messages[i].prio > q.messages[best].prio {
-                best = i;
-            }
-        }
-        Some(Some(q.messages.remove(best)))
-    });
-    let msg = match popped {
-        Some(Some(m)) => m,
-        Some(None) => {
-            ctx.set_return(err(EAGAIN));
+    let (bytes, priority) = match mqueuefs::receive(id, msg_len) {
+        Ok(message) => message,
+        Err(narf_filesystem::MqueueError::WouldBlock) => {
+            park_would_block(ctx, id, a.arg4);
             return;
         }
-        None => {
-            ctx.set_return(err(EBADF));
+        Err(error) => {
+            ctx.set_return(err(mq_errno(error)));
             return;
         }
     };
 
     // SAFETY: msg_ptr is the user receive buffer; copy_to_user range-validates
     // and SMAP-brackets the write of the message payload.
-    if unsafe { crate::handlers::copy_to_user(msg_ptr, &msg.bytes) }.is_err() {
-        ctx.set_return(err(EINVAL));
+    if unsafe { crate::handlers::copy_to_user(msg_ptr, &bytes) }.is_err() {
+        ctx.set_return(err(EFAULT));
         return;
     }
     if prio_ptr != 0 {
         // SAFETY: prio_ptr is a user u32 out-pointer; copy_to_user validates it.
-        let _ = unsafe { crate::handlers::copy_to_user(prio_ptr, &msg.prio.to_le_bytes()) };
+        if unsafe { crate::handlers::copy_to_user(prio_ptr, &priority.to_le_bytes()) }.is_err() {
+            ctx.set_return(err(EFAULT));
+            return;
+        }
     }
-    ctx.set_return(SyscallReturn::ok(msg.bytes.len() as u64));
+    narf_net::readiness::notify(0);
+    ctx.set_return(SyscallReturn::ok(bytes.len() as u64));
 }
 
 /// `mq_getsetattr(mqd, newattr_ptr, oldattr_ptr)`.
@@ -375,43 +448,56 @@ pub fn sys_mq_getsetattr(ctx: &mut dyn TrapContext) {
     let new_ptr = a.arg1;
     let old_ptr = a.arg2;
 
-    // Snapshot the old attrs first (for old_ptr).
-    let snap = with_queues(|m| {
-        m.get(&id)
-            .map(|q| (q.nonblock, q.maxmsg, q.msgsize, q.messages.len() as i64))
-    });
-    let (nonblock, maxmsg, msgsize, curmsgs) = match snap {
-        Some(s) => s,
-        None => {
-            ctx.set_return(err(EBADF));
+    let new_flags = if new_ptr != 0 {
+        let mut buf = [0u8; 64];
+        // SAFETY: new_ptr non-zero; copy_from_user validates + SMAP-brackets the read.
+        if unsafe { crate::handlers::copy_from_user(&mut buf, new_ptr) }.is_err() {
+            ctx.set_return(err(EFAULT));
+            return;
+        }
+        let flags = read_i64(&buf[0..8]);
+        if flags & !(O_NONBLOCK as i64) != 0 {
+            ctx.set_return(err(EINVAL));
+            return;
+        }
+        Some(flags)
+    } else {
+        None
+    };
+
+    let attr = match mqueuefs::attributes(id) {
+        Ok(attr) => attr,
+        Err(error) => {
+            ctx.set_return(err(mq_errno(error)));
             return;
         }
     };
 
     if old_ptr != 0 {
-        let mut out = [0u8; 32];
-        let flags: i64 = if nonblock { O_NONBLOCK as i64 } else { 0 };
-        out[0..8].copy_from_slice(&flags.to_le_bytes());
-        out[8..16].copy_from_slice(&maxmsg.to_le_bytes());
-        out[16..24].copy_from_slice(&msgsize.to_le_bytes());
-        out[24..32].copy_from_slice(&curmsgs.to_le_bytes());
+        let mut out = [0u8; 64];
+        out[0..8].copy_from_slice(&attr.flags.to_le_bytes());
+        out[8..16].copy_from_slice(&attr.maxmsg.to_le_bytes());
+        out[16..24].copy_from_slice(&attr.msgsize.to_le_bytes());
+        out[24..32].copy_from_slice(&attr.curmsgs.to_le_bytes());
         // SAFETY: old_ptr is the user struct mq_attr out-pointer; validated by copy_to_user.
         if unsafe { crate::handlers::copy_to_user(old_ptr, &out) }.is_err() {
-            ctx.set_return(err(EINVAL));
+            ctx.set_return(err(EFAULT));
             return;
         }
     }
-    if new_ptr != 0 {
-        let mut buf = [0u8; 32];
-        // SAFETY: new_ptr non-zero; copy_from_user validates + SMAP-brackets the read.
-        if unsafe { crate::handlers::copy_from_user(&mut buf, new_ptr) }.is_err() {
-            ctx.set_return(err(EINVAL));
+    if let Some(flags) = new_flags {
+        if let Err(error) = mqueuefs::set_nonblock(id, flags & O_NONBLOCK as i64 != 0) {
+            ctx.set_return(err(mq_errno(error)));
             return;
         }
-        let new_flags = read_i64(&buf[0..8]);
-        with_queues(|m| {
-            if let Some(q) = m.get_mut(&id) {
-                q.nonblock = (new_flags & O_NONBLOCK as i64) != 0;
+        let _ = fd::with_table(task, |table| {
+            if let Some(entry) = table.get_mut(a.arg0 as u32) {
+                entry.status_flags = (entry.status_flags & !fd::O_NONBLOCK)
+                    | if flags & O_NONBLOCK as i64 != 0 {
+                        fd::O_NONBLOCK
+                    } else {
+                        0
+                    };
             }
         });
     }
@@ -671,6 +757,9 @@ pub(crate) fn notify_modify_fd(task: u64, fd: u32) {
 
 /// IN_CLOSE_WRITE for the file behind `fd`.
 pub(crate) fn notify_close_fd(task: u64, fd: u32) {
+    if let Some(handle_id) = queue_id_of(task, fd) {
+        mqueuefs::close_notification(handle_id, task);
+    }
     let path = fd_path(task, fd);
     if let Some(p) = path {
         fs_notify(&p, IN_CLOSE_WRITE, false);

@@ -179,7 +179,7 @@ Delivery model and mask width are detailed in §3.2.
 | SysV sem: `semget`, `semop`, `semtimedop`, `semctl` | implemented | full impl under `linux-compat`; `semget` id-by-key under `container` | `handlers.rs:~21493` |
 | SysV msg: `msgget`, `msgsnd`, `msgrcv`, `msgctl` | implemented | as above | |
 | SysV shm: `shmget`, `shmat`, `shmdt`, `shmctl` | implemented | as above (`shmget` table entry `syscall.rs:2508`) | |
-| POSIX mq: `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_getsetattr` | implemented | `linux-compat` | `handlers.rs:~21342` |
+| POSIX mq + mqueuefs: `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr`; mounted queue namespace | implemented | `linux-compat`; SIGEV_SIGNAL/NONE (SIGEV_THREAD netlink remains) | `filesystem/src/mqueuefs.rs`, `userspace/src/mqueue.rs` |
 | `set_robust_list`/`get_robust_list` | **structural no-op** | — | accepted, does nothing (`handlers.rs:~21766`) |
 
 ### 2.8 cgroup v2 / namespaces / misc

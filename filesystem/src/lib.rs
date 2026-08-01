@@ -76,6 +76,8 @@ pub mod fs_registry;
 pub mod fuse;
 pub mod fuse_conn;
 pub mod memfs;
+#[cfg(feature = "linux-compat")]
+pub mod mqueuefs;
 pub mod ntty;
 pub mod overlayfs;
 pub mod page_cache;
@@ -93,6 +95,8 @@ mod devfs_pty_tests;
 mod e2e_tests;
 mod fs_mount_e2e_tests;
 mod memfs_tests;
+#[cfg(feature = "linux-compat")]
+mod mqueuefs_tests;
 mod page_cache_tests;
 mod procsys_e2e_tests;
 mod random_e2e_tests;
@@ -117,6 +121,8 @@ pub use memfs::{
     new_anon_file as new_anon_memfile, new_file_with_perms_owner as new_memfile_with_perms_owner,
     MemFs,
 };
+#[cfg(feature = "linux-compat")]
+pub use mqueuefs::{MqueueAttr, MqueueError, MqueueFs, MqueueNotification, MqueueOpenOptions};
 pub use overlayfs::{OverlayFs, WHITEOUT_PREFIX};
 pub use page_cache::{CachePage, Page, PageCache, PageKey, PAGE_SIZE};
 #[cfg(feature = "linux-compat")]

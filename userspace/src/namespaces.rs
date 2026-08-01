@@ -300,8 +300,8 @@ impl Drop for NetNamespace {
 
 // ── IPC namespace ────────────────────────────────────────────────
 
-/// Per-namespace SysV IPC + POSIX mqueue keyspace. Today this is
-/// a counter + key→id BTreeMap; the SysV IPC subsystem itself is
+/// Per-namespace SysV IPC keyspace. Today this is a counter + key→id
+/// BTreeMap; the SysV IPC subsystem itself is
 /// largely stubbed in NARF so we mint distinct ids per-ns and
 /// leave segment storage to the follow-up that lights up shm/sem/msg
 /// for real.
@@ -317,7 +317,6 @@ struct IpcInner {
     shm: BTreeMap<u32, u32>, // key → id
     sem: BTreeMap<u32, u32>,
     msg: BTreeMap<u32, u32>,
-    mq: BTreeMap<String, u32>, // POSIX mqueue name → id
 }
 
 impl IpcNamespace {
@@ -369,17 +368,6 @@ impl IpcNamespace {
         }
         let id = self.alloc_id();
         g.msg.insert(key, id);
-        id
-    }
-
-    /// POSIX `mq_open` resolution — distinct keyspace from SysV.
-    pub fn mq_open(&self, name: &str) -> u32 {
-        let mut g = self.inner.lock();
-        if let Some(&id) = g.mq.get(name) {
-            return id;
-        }
-        let id = self.alloc_id();
-        g.mq.insert(String::from(name), id);
         id
     }
 }
