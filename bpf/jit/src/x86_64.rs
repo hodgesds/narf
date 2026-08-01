@@ -18,9 +18,9 @@
 //! call then needs almost no shuffling, which is the hot path this exists for.
 //! `rcx`, `r10`, `r11` and `r12` are deliberately left out of the map — `rcx`
 //! because variable shifts require it, `r12` because it holds the fuel counter
-//! (see [`hr::R12`]), and `r10`/`r11` for address computation. They gain named
-//! constants when the code that needs them lands; an unused constant reserving
-//! a register is a claim nothing checks.
+//! (see [`hr::R12`]), and `r11` because a call target's absolute address has to
+//! be materialised somewhere ([`hr::R11`]). `r10` still has no named constant;
+//! an unused constant reserving a register is a claim nothing checks.
 //!
 //! This paragraph used to say `r12` was reserved "because an arena program pins
 //! it to the window base", contradicting [`hr::R12`] two screens down. Worth
@@ -32,28 +32,73 @@
 //! and that decision belongs with the code that needs it, not with a comment
 //! claiming a register is already spoken for.
 //!
+//! **It came from the first of those.** The arena base arrives as the fourth
+//! entry argument in `rcx` and the prologue parks it in the 8-byte slot it
+//! already claims for SysV alignment ([`STACK_ALIGN_PAD`]); an arena access
+//! reloads it into `r11` and uses `rcx` as the index. Both are caller-saved,
+//! which would be fatal for a *pinned* base and is irrelevant for one reloaded
+//! per access — and it is why the frame shape does not change at all, so a
+//! program with no arena pays nothing.
+//!
+//! **Kfunc calls needed none of that.** The register pressure that blocks a
+//! pinned arena base does not touch call emission, and the reason is worth
+//! stating because the two look like the same problem: a call needs *scratch*,
+//! which is caller-saved and plentiful, while an arena base needs a value that
+//! survives a call, which is callee-saved and exhausted. BPF's own ABI then
+//! does the rest — R1..R5 are caller-saved by definition and R0 takes the
+//! result, and those are exactly the registers SysV lets a callee destroy. So
+//! nothing is saved around a call and nothing is reloaded after one.
+//!
 //! ## What is emitted, and what is not
 //!
 //! Enough of the ISA to run the corpus the interpreter runs: ALU, MOV, loads
-//! and stores against the frame, conditional and unconditional jumps, and
-//! exit. **Not kfunc calls**, which this list claimed for a while and which is
-//! worth correcting rather than quietly dropping: `Decoded::Call` has no arm in
-//! `emit_insn` on either backend, and because a kfunc return is the verifier's
-//! only producer of `PtrClass::Arena`, that absence is what actually keeps
-//! arena programs interpreted — not `jit_glue` gate 2. See that module's
-//! "Lifting gate 2". Everything else returns [`JitError::Unsupported`], which
-//! the caller answers by interpreting — the interpreter is a complete
-//! implementation, so an unemitted instruction costs speed and not
-//! correctness. That is the property that makes it safe to grow this file
-//! incrementally instead of all at once.
+//! and stores against the frame, conditional and unconditional jumps, exit, and
+//! **kfunc calls**. Subprogram calls (`CallTarget::Subprog`) are still refused:
+//! they need the BPF frame push the interpreter does in `push_frame`, which is
+//! a different feature from entering a C function.
+//!
+//! Everything else returns [`JitError::Unsupported`], which the caller answers
+//! by interpreting — the interpreter is a complete implementation, so an
+//! unemitted instruction costs speed and not correctness. That is the property
+//! that makes it safe to grow this file incrementally instead of all at once.
+//!
+//! ## The arena access shape
+//!
+//! A kfunc return is the verifier's only producer of `PtrClass::Arena`, so
+//! until call emission landed *no* arena program reached any arena lowering — it
+//! was refused at the call — and `jit_glue`'s gate 2 was then the only thing
+//! between an arena program and a bare dereference of a slot-relative handle.
+//! Both are now gone, and this is what replaced them:
+//!
+//! ```text
+//!   mov  r11, [rsp]              ; the slot base the prologue parked
+//!   mov  ecx, <handle>d          ; zero-extend — see below
+//!   add  rcx, <off16>            ; fold the displacement into the index
+//!   mov  <dst>, [r11 + rcx]      ; the faulting instruction
+//! ```
+//!
+//! The 32-bit `mov` is not an optimisation. It bounds the index to `[0, 2^32)`
+//! *in the emitted bytes*, so the address is inside the slot's guards whatever
+//! the register holds — the reachable-set argument becomes a property of this
+//! sequence rather than one inherited from the verifier. `ARENA_USABLE_BYTES`
+//! is 4 GiB, so no handle that names a real arena byte is affected.
+//!
+//! Folding the displacement into `rcx` rather than leaving it in the ModRM
+//! displacement costs one instruction and buys the diagnostic: at the fault,
+//! `rcx` holds exactly the handle the interpreter would have computed, and
+//! [`emit_arena_epilogue`] returns it. Without that the trap could only report a
+//! zero, and `Trap::ArenaOutOfBounds` exists to name the offending value.
+//!
+//! `an_arena_program_reaches_its_arena_access_once_the_call_is_emitted` used to
+//! show the bare dereference in bytes and now shows this shape instead.
 
 use alloc::vec::Vec;
 
-use narf_bpf_isa::{decode, AluOp, CondOp, Decoded, Reg, Size, Source};
-use narf_bpf_verifier::VerifiedProgram;
+use narf_bpf_isa::{decode, AluOp, CallTarget, CondOp, Decoded, Reg, Size, Source};
+use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
 use crate::blocks::{block_len, block_starts};
-use crate::{Compiled, FaultEntry, FaultTable, JitError};
+use crate::{status, Compiled, FaultEntry, FaultTable, JitError};
 
 /// Host register numbers, in ModRM/REX encoding order.
 mod hr {
@@ -63,10 +108,19 @@ mod hr {
     /// Callee-saved and absent from [`super::REGS`], so no BPF register aliases
     /// it. Spec §5 earmarks a pinned register for the arena window base and
     /// Linux uses `r12` for it, but here `r12` is taken and every other
-    /// callee-saved register is a BPF register — see the module docs. `r10` and
-    /// `r11` are free but caller-saved, so they survive an arena access and not
-    /// a kfunc call.
+    /// callee-saved register is a BPF register — see the module docs. `r10` is
+    /// free but caller-saved, so it would survive an arena access and not a
+    /// kfunc call; `r11` is likewise caller-saved and now spoken for by
+    /// [`R11`].
     pub const R12: u8 = 12;
+    /// Scratch for a call target's absolute address.
+    ///
+    /// Caller-saved, which is exactly right here: its value is consumed by the
+    /// `call` that reads it and is never wanted afterwards, so the callee is
+    /// welcome to destroy it. Absent from [`super::REGS`], so materialising an
+    /// address into it cannot be clobbering a BPF register — the same argument
+    /// [`RCX`] rests on.
+    pub const R11: u8 = 11;
     /// Scratch. Variable shifts require the count in `cl`, and `rcx` is
     /// deliberately absent from [`super::REGS`] so no BPF register can alias
     /// it — which is what makes moving a count into it unconditionally safe.
@@ -193,6 +247,31 @@ impl Emit {
         } else if md == 0x80 {
             self.d32(disp);
         }
+    }
+
+    /// ModRM + SIB for `[base + index]`, scale 1, no displacement.
+    ///
+    /// The arena addressing mode, and the only place this backend emits an
+    /// index. `mod = 00` with `rm = 100` selects a SIB byte; the SIB's own
+    /// `base = 101` would mean "no base, disp32", so a base whose low three
+    /// bits are `rbp`'s cannot be encoded this way — which is fine and asserted
+    /// rather than assumed, because [`emit_arena_addr`] always passes
+    /// [`hr::R11`].
+    fn modrm_sib_index(&mut self, reg: u8, base: u8, index: u8) {
+        debug_assert!(
+            (base & 7) != (hr::RBP & 7),
+            "mod=00 SIB cannot encode an rbp/r13 base"
+        );
+        debug_assert!(
+            (index & 7) != (hr::RSP & 7),
+            "SIB index 100 means no index at all"
+        );
+        // `rex` has no X bit, so an index of 8..15 would silently encode as its
+        // low three bits. Never reached — the index is always `rcx` — but a
+        // future second caller must not discover that the hard way.
+        debug_assert!(index < 8, "REX.X is not emitted, so the index must be 0..7");
+        self.b(((reg & 7) << 3) | 0x04);
+        self.b(((index & 7) << 3) | (base & 7));
     }
 }
 
@@ -333,6 +412,19 @@ const EPILOGUE: u32 = u32::MAX;
 /// Reloc target meaning "the out-of-fuel epilogue".
 const OOF_EPILOGUE: u32 = u32::MAX - 1;
 
+/// Where the prologue parks the arena slot base, relative to `rsp`.
+///
+/// The [`STACK_ALIGN_PAD`] slot, reused rather than added to. A second 8-byte
+/// slot would move `rsp` by 64 instead of 56 across the prologue, which is
+/// `0 mod 16` again and would put the residue back where SysV does not want it —
+/// so a dedicated slot would have cost 16 bytes and a re-derivation of the
+/// alignment argument, for a value that is read at most once per arena access.
+///
+/// `rsp` does not move between the prologue and any access: a `call` pushes its
+/// return address *below* this slot and the callee's whole frame is below that,
+/// so the parked base survives a kfunc call untouched.
+const ARENA_BASE_SLOT: i32 = 0;
+
 /// A branch whose target is a BPF instruction index, resolved once every
 /// instruction's offset is known.
 #[derive(Copy, Clone, Debug)]
@@ -408,6 +500,10 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
     let mut relocs: Vec<Reloc> = Vec::new();
     let mut out = Vec::with_capacity(prog.insns.len() + 1);
     let starts = block_starts(prog)?;
+    // Which accesses take the arena shape. Built from the verifier's fault
+    // sites by the same function `jit_glue`'s gate 5 uses, so the gate and the
+    // emitter cannot disagree — see [`crate::arena_access_map`].
+    let arena = crate::arena_access_map(prog);
 
     emit_prologue(&mut e, prog);
 
@@ -423,7 +519,14 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
         }
         let (insn, width) =
             decode(&prog.insns, i).map_err(|_| JitError::Decode { at: i as u32 })?;
-        emit_insn(&mut e, &insn, i as u32, &mut relocs)?;
+        emit_insn(
+            &mut e,
+            &insn,
+            i as u32,
+            &mut relocs,
+            &prog.kfunc_calls,
+            arena[i],
+        )?;
         i += width;
         // A wide instruction occupies two slots. This records the *following*
         // instruction's offset for the trailing slot, not the wide
@@ -442,6 +545,21 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
     emit_epilogue(&mut e);
     let oof_at = e.len();
     emit_oof_epilogue(&mut e);
+    let arena_at = e.len();
+    emit_arena_epilogue(&mut e);
+
+    // An arena fault site resumes at the arena epilogue, never at the next
+    // instruction. Patched here, unconditionally, rather than recorded at the
+    // access: the epilogue's offset is not known until the body is emitted, and
+    // a per-site "remember to fix this up" is the kind of step that gets
+    // forgotten. Anything left holding a next-instruction fixup would be a
+    // zero-and-continue, which is the exact divergence the arena shape exists to
+    // avoid.
+    for f in &mut e.faults {
+        if f.arena {
+            f.fixup_off = arena_at;
+        }
+    }
 
     // Patch branch displacements now that every offset is known.
     for r in &relocs {
@@ -470,6 +588,36 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
     Ok((e, out))
 }
 
+/// Bytes the prologue subtracts from `rsp` purely to satisfy SysV's alignment
+/// rule, on top of the register saves.
+///
+/// SysV requires `rsp % 16 == 0` **at the point a `call` executes**, so a
+/// function sees `rsp % 16 == 8` on entry. This image is such a function: it is
+/// entered at 8, and the six pushes below move `rsp` by 48 — a multiple of 16 —
+/// so they leave it at 8. A `call` from the body would then enter a kfunc with
+/// the alignment inverted, which is the class of bug that shows up as a
+/// `movaps` fault somewhere inside the callee rather than anywhere near here.
+/// One more 8-byte step puts the whole body at 0.
+///
+/// Derived, not copied: a note this work started from claimed six pushes were
+/// wrong and that "+48" fixed it. 48 is what the pushes already move `rsp` by
+/// and it is `0 mod 16`, so it changes nothing. The residue is what matters, and
+/// `the_prologue_leaves_the_stack_aligned_for_a_sysv_call` re-derives it from
+/// the emitted bytes rather than trusting either number.
+///
+/// Emitted unconditionally rather than only for programs containing a call: a
+/// prologue whose frame shape depends on the body is two shapes to reason about
+/// and two to test, for one instruction that executes once per invocation.
+const STACK_ALIGN_PAD: i32 = 8;
+
+/// `sub rsp, imm8` / `add rsp, imm8` — the group-1 sign-extended-imm8 forms.
+fn emit_rsp_adjust(e: &mut Emit, slash: u8, imm: i32) {
+    e.rex(true, 0, hr::RSP);
+    e.b(0x83);
+    e.modrm_rr(slash, hr::RSP);
+    e.b(imm as u8);
+}
+
 /// `push rbx; push r13; push r14; push r15; mov rbp, rdi` and the fuel setup.
 ///
 /// R6..R9 map to callee-saved host registers, so they must be preserved for
@@ -488,6 +636,16 @@ fn emit_prologue(e: &mut Emit, _prog: &VerifiedProgram) {
         }
         e.b(0x50 | (r & 7));
     }
+    // `sub rsp, 8` — see [`STACK_ALIGN_PAD`]. Released by `emit_restore`.
+    emit_rsp_adjust(e, 5, STACK_ALIGN_PAD);
+    // Park the arena slot base (SysV arg 4, `rcx`) in that slot, **before**
+    // anything writes `rcx` — `emit_shift` and `emit_kfunc_call` both do. See
+    // [`ARENA_BASE_SLOT`]. Emitted unconditionally, for the same reason the pad
+    // itself is: one store per invocation is cheaper than two prologue shapes to
+    // reason about, and a program with no arena simply never reads it back.
+    e.rex(true, hr::RCX, hr::RSP);
+    e.b(0x89);
+    e.modrm_mem(hr::RCX, hr::RSP, ARENA_BASE_SLOT);
     // r12 := rdx (fuel) **before** anything writes rdx, which R3 maps to.
     // Ordering matters for the same reason as the rdi/rsi pair below.
     mov_rr(e, true, hr::R12, hr::RDX);
@@ -509,11 +667,33 @@ fn emit_epilogue(e: &mut Emit) {
 
 /// The out-of-fuel epilogue: `rdx = 1`, and `rax` is left as-is (meaningless).
 fn emit_oof_epilogue(e: &mut Emit) {
-    mov_reg_imm64(e, hr::RDX, 1);
+    mov_reg_imm64(e, hr::RDX, status::OUT_OF_FUEL as i64);
+    emit_restore(e);
+}
+
+/// The arena-fault epilogue: `rdx = 2`, `rax = rcx` (the offending handle).
+///
+/// Reached only through the exception table — nothing branches here — so the
+/// stack is exactly as the faulting instruction left it, which is the state
+/// [`emit_restore`] expects. That is the whole reason the fixup can be a plain
+/// resume address with no per-site stub: the body never moves `rsp`.
+///
+/// **Not** Linux's `ex_handler_bpf` shape, and deliberately. Zeroing the
+/// destination and resuming would make an out-of-bounds arena access *return a
+/// value* natively and `Trap::ArenaOutOfBounds` interpreted — the same program
+/// with two verdicts, decided by whether it happened to clear `jit_glue`'s
+/// gates. `rcx` still holds the handle because [`emit_arena_addr`] folded the
+/// displacement into it, so the trap names the value instead of inferring it.
+fn emit_arena_epilogue(e: &mut Emit) {
+    mov_rr(e, true, hr::RAX, hr::RCX);
+    mov_reg_imm64(e, hr::RDX, status::ARENA_FAULT as i64);
     emit_restore(e);
 }
 
 fn emit_restore(e: &mut Emit) {
+    // `add rsp, 8` — undo [`STACK_ALIGN_PAD`] before the pops, or every one of
+    // them would read the wrong slot.
+    emit_rsp_adjust(e, 0, STACK_ALIGN_PAD);
     for r in [hr::R15, hr::R14, hr::R13, hr::R12, hr::RBX, hr::RBP] {
         if r >= 8 {
             e.b(0x41);
@@ -523,13 +703,186 @@ fn emit_restore(e: &mut Emit) {
     e.b(0xC3); // ret
 }
 
+/// The whole of a kfunc call: the SysV shuffle, the target, and the `call`.
+///
+/// BPF passes arguments in R1..R5; SysV passes them in `rdi`, `rsi`, `rdx`,
+/// `rcx`, `r8`. The register map lines the first three up exactly — that is the
+/// reason it was chosen — so only the last two move, and the order they move in
+/// is load-bearing: `rcx` must take `r8`'s value **before** `r8` takes `r9`'s,
+/// or R4 is overwritten by R5 and lost. Writing the two moves the other way
+/// round produces code that assembles, runs, and passes the wrong argument.
+///
+/// Nothing is saved. Every register SysV lets the callee destroy —
+/// `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`..`r11` — holds either a BPF register
+/// the BPF ABI *also* declares caller-saved (R0..R5) or nothing. R6..R10 and
+/// the fuel counter live in `rbx`, `r13`..`r15`, `rbp` and `r12`, all of which
+/// SysV requires the callee to preserve.
+///
+/// The address is materialised into `r11` rather than encoded as a `call rel32`
+/// displacement, because the JIT does not know where its own text will land
+/// when it emits — `bpf_text::alloc` chooses the VA afterwards — so a
+/// PC-relative target is not expressible at emission time and a fixup pass would
+/// buy nothing but a fixup pass.
+fn emit_kfunc_call(e: &mut Emit, addr: usize) {
+    mov_rr(e, true, hr::RCX, hr::R8); // SysV arg3 := BPF R4
+    mov_rr(e, true, hr::R8, hr::R9); // SysV arg4 := BPF R5
+    mov_reg_imm64(e, hr::R11, addr as i64);
+    // `call r11` — FF /2. REX.B for the high register; no REX.W, because a
+    // near call is 64-bit by default in long mode.
+    e.rex(false, 0, hr::R11);
+    e.b(0xFF);
+    e.modrm_rr(2, hr::R11);
+}
+
+/// The call site the verifier resolved for the `call` at `at`, or a refusal.
+///
+/// Every arm here is fail-closed and every one is reachable through a
+/// `VerifiedProgram` that some caller could hand this crate, so none of them is
+/// a `debug_assert`:
+///
+/// * **no entry** — the fixpoint never reached this instruction, so nobody
+///   type-checked its arguments. Dead code, and there is no target to invent.
+/// * **id mismatch** — the table describes a different callee than the
+///   instruction names. Emitting either one would be a guess.
+/// * **sleepable** — that kfunc's shim returns a boxed future rather than a
+///   `u64` (see `narf_bpf::kfunc::KfuncShim`), so entering it through the
+///   uniform ABI would reinterpret a `Pin<Box<dyn Future>>` as a return value.
+///   The *program's* context does not decide this; the callee's does.
+/// * **null address** — no shim to enter.
+fn resolve_call(calls: &[KfuncCallSite], at: u32, id: i32) -> Result<KfuncCallSite, JitError> {
+    let site = calls
+        .binary_search_by_key(&at, |c| c.insn_index)
+        .map(|k| calls[k])
+        .map_err(|_| JitError::Unsupported {
+            at,
+            what: "kfunc call the verifier never resolved",
+        })?;
+    if site.id != id {
+        return Err(JitError::Unsupported {
+            at,
+            what: "kfunc call site disagrees with the instruction's immediate",
+        });
+    }
+    if site.context != Context::Atomic {
+        return Err(JitError::Unsupported {
+            at,
+            what: "a sleepable kfunc's shim does not use the uniform u64 ABI",
+        });
+    }
+    if site.addr == 0 {
+        return Err(JitError::Unsupported {
+            at,
+            what: "kfunc shim address is null",
+        });
+    }
+    Ok(site)
+}
+
+/// Set up `[r11 + rcx]` to address `slot_base + zx32(handle) + off`.
+///
+/// Leaves `rcx` holding the handle itself — zero-extended and with the
+/// displacement folded in — which is what [`emit_arena_epilogue`] returns and
+/// what makes the JIT's `Trap::ArenaOutOfBounds` name the same value the
+/// interpreter's does.
+///
+/// Neither scratch can alias a BPF register: `rcx` and `r11` are both absent
+/// from [`REGS`], which is the same argument variable shifts and call targets
+/// already rest on.
+fn emit_arena_addr(e: &mut Emit, handle: u8, off: i16) {
+    debug_assert!(
+        handle != hr::RCX && handle != hr::R11,
+        "the arena scratch registers must not be a BPF register"
+    );
+    // mov r11, [rsp] — the slot base the prologue parked.
+    e.rex(true, hr::R11, hr::RSP);
+    e.b(0x8B);
+    e.modrm_mem(hr::R11, hr::RSP, ARENA_BASE_SLOT);
+    // mov ecx, <handle>d. The 32-bit form zero-extends, which is what bounds
+    // the index to `[0, 2^32)` in the bytes rather than by inheritance from the
+    // verifier. See the module docs.
+    mov_rr(e, false, hr::RCX, handle);
+    if off != 0 {
+        // add rcx, imm32 (sign-extended by REX.W), so `rcx` is the handle and
+        // the access itself needs no displacement.
+        alu_ri(e, true, 0, hr::RCX, i32::from(off));
+    }
+}
+
 fn emit_insn(
     e: &mut Emit,
     insn: &Decoded,
     at: u32,
     relocs: &mut Vec<Reloc>,
+    calls: &[KfuncCallSite],
+    arena: bool,
 ) -> Result<(), JitError> {
+    // The arena forms first: same instructions, different addressing, and a
+    // recorded fault site. Only the doubleword width is emitted, matching the
+    // non-arena arms — anything else falls through to `Unsupported` and runs
+    // interpreted.
+    if arena {
+        match *insn {
+            Decoded::Load {
+                size: Size::Dw,
+                sign_extend: false,
+                dst,
+                src,
+                off,
+            } => {
+                emit_arena_addr(e, host(src), off);
+                let fault_off = e.len();
+                e.rex(true, host(dst), hr::R11);
+                e.b(0x8B);
+                e.modrm_sib_index(host(dst), hr::R11, hr::RCX);
+                record_fault(e, fault_off);
+                return Ok(());
+            }
+            Decoded::Store {
+                size: Size::Dw,
+                dst,
+                off,
+                src: Source::Reg(s),
+            } => {
+                emit_arena_addr(e, host(dst), off);
+                let fault_off = e.len();
+                e.rex(true, host(s), hr::R11);
+                e.b(0x89);
+                e.modrm_sib_index(host(s), hr::R11, hr::RCX);
+                record_fault(e, fault_off);
+                return Ok(());
+            }
+            Decoded::Store {
+                size: Size::Dw,
+                dst,
+                off,
+                src: Source::Imm(v),
+            } => {
+                emit_arena_addr(e, host(dst), off);
+                let fault_off = e.len();
+                e.rex(true, 0, hr::R11);
+                e.b(0xC7);
+                e.modrm_sib_index(0, hr::R11, hr::RCX);
+                e.d32(v);
+                record_fault(e, fault_off);
+                return Ok(());
+            }
+            // An arena atomic, an arena access of any narrower width, or a
+            // sign-extending one. Refused rather than lowered as a *non*-arena
+            // access, which is the failure this whole branch exists to prevent.
+            _ => {
+                return Err(JitError::Unsupported {
+                    at,
+                    what: "arena access shape not yet emitted by the x86_64 backend",
+                })
+            }
+        }
+    }
     match *insn {
+        Decoded::Call(CallTarget::Kfunc(id)) => {
+            let site = resolve_call(calls, at, id)?;
+            emit_kfunc_call(e, site.addr);
+        }
+
         Decoded::Mov {
             wide,
             dst,
@@ -693,6 +1046,9 @@ fn emit_insn(
             });
         }
 
+        // Including `CallTarget::Subprog`: a BPF-to-BPF call needs the frame
+        // push the interpreter does in `push_frame` — saving R6..R9, moving
+        // the frame base, and a return path — none of which this emits.
         _ => {
             return Err(JitError::Unsupported {
                 at,
@@ -703,16 +1059,18 @@ fn emit_insn(
     Ok(())
 }
 
-/// Reserved so the fault-recording path has a home once probe loads and arena
-/// accesses are emitted. Present now to keep [`FaultEntry`]'s shape honest:
-/// the table is produced by codegen, not bolted on afterwards.
-#[allow(dead_code)]
-fn record_fault(e: &mut Emit, fault_off: u32, dst: Option<u8>, arena: bool) {
-    let fixup_off = e.len();
+/// Record the arena access that begins at `fault_off` as a recoverable site.
+///
+/// `fixup_off` is left at zero and patched to the arena epilogue by
+/// [`emit_pass`], because that offset is not known until the body is emitted.
+/// `dst_host_reg` is `None`: an arena fault does not resume into the program, so
+/// there is no destination whose value would ever be read — zeroing one would be
+/// the "zero and continue" shape this deliberately is not.
+fn record_fault(e: &mut Emit, fault_off: u32) {
     e.faults.push(FaultEntry {
         fault_off,
-        fixup_off,
-        dst_host_reg: dst,
-        arena,
+        fixup_off: 0,
+        dst_host_reg: None,
+        arena: true,
     });
 }

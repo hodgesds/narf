@@ -28,8 +28,10 @@
 
 use narf_bpf_isa::{AluOp, CondOp, Decoded, Size, Source};
 
+use narf_bpf_verifier::Context;
+
 use crate::aarch64;
-use crate::tests::{mov, r, verified, EXIT};
+use crate::tests::{kcall, mov, r, verified, verified_calling, EXIT};
 use crate::JitError;
 
 /// The emitted image as instruction words. Every aarch64 instruction is four
@@ -44,9 +46,11 @@ fn a64_words(code: &[u8]) -> Vec<u32> {
 /// The prologue:
 ///
 /// ```text
-///   stp x19, x20, [sp, #-48]!
-///   stp x21, x22, [sp, #16]
-///   stp x24, x25, [sp, #32]
+///   stp  x19, x20, [sp, #-64]!
+///   stp  x21, x22, [sp, #16]
+///   stp  x24, x25, [sp, #32]
+///   stur x30, [sp, #48]      ; the link register, which BLR clobbers
+///   stur x3,  [sp, #56]      ; the arena slot base, in the frame's padding
 ///   mov x24, x2      ; fuel, before anything writes x2 (R2)
 ///   mov x25, x0      ; frame top, before anything writes x0 (R0)
 ///   mov x0, xzr      ; R0 := 0, so an unset R0 cannot return frame_top
@@ -63,34 +67,61 @@ fn a64_words(code: &[u8]) -> Vec<u32> {
 /// by *executing* it rather than by matching these bytes, because a golden
 /// constant pins a bug as faithfully as it pins a fix — which is exactly how
 /// the x86-64 prologue once shipped without `push rbp` and its test passed.
-const A64_PROLOGUE: [u32; 6] = [
-    0xa9bd_53f3,
+const A64_PROLOGUE: [u32; 8] = [
+    0xa9bc_53f3,
     0xa901_5bf5,
     0xa902_67f8,
+    0xf803_03fe,
+    0xf803_83e3,
     0xaa02_03f8,
     0xaa00_03f9,
     0xaa1f_03e0,
 ];
 
-/// `ldp x21,x22,[sp,#16]; ldp x24,x25,[sp,#32]; ldp x19,x20,[sp],#48; ret`
-const A64_RESTORE: [u32; 4] = [0xa941_5bf5, 0xa942_67f8, 0xa8c3_53f3, 0xd65f_03c0];
+/// `ldp x21,x22,[sp,#16]; ldp x24,x25,[sp,#32]; ldur x30,[sp,#48];`
+/// `ldp x19,x20,[sp],#64; ret`
+const A64_RESTORE: [u32; 5] = [
+    0xa941_5bf5,
+    0xa942_67f8,
+    0xf843_03fe,
+    0xa8c4_53f3,
+    0xd65f_03c0,
+];
 
 /// The normal epilogue: `mov x1, xzr` (exhaustion flag clear) then the restore.
-const A64_EPILOGUE: [u32; 5] = [
+const A64_EPILOGUE: [u32; 6] = [
     0xaa1f_03e1,
     A64_RESTORE[0],
     A64_RESTORE[1],
     A64_RESTORE[2],
     A64_RESTORE[3],
+    A64_RESTORE[4],
 ];
 
 /// The out-of-fuel epilogue: `mov x1, #1` then the same restore.
-const A64_OOF_EPILOGUE: [u32; 5] = [
+const A64_OOF_EPILOGUE: [u32; 6] = [
     0xd280_0021,
     A64_RESTORE[0],
     A64_RESTORE[1],
     A64_RESTORE[2],
     A64_RESTORE[3],
+    A64_RESTORE[4],
+];
+
+/// The arena-fault epilogue: `mov x0, x9` (the offending handle), `mov x1, #2`
+/// (`status::ARENA_FAULT`), then the same restore.
+///
+/// Last in the image, and reached only through the exception table — nothing
+/// branches here. Returning the handle is why the emitter folds `off16` into
+/// `x9` instead of leaving it in the `LDUR`.
+const A64_ARENA_EPILOGUE: [u32; 7] = [
+    0xaa09_03e0,
+    0xd280_0041,
+    A64_RESTORE[0],
+    A64_RESTORE[1],
+    A64_RESTORE[2],
+    A64_RESTORE[3],
+    A64_RESTORE[4],
 ];
 
 /// `subs x24, x24, #n` — the per-block fuel charge. The immediate is bits
@@ -117,7 +148,7 @@ fn a64_image(items: &[Decoded]) -> (Vec<u32>, core::ops::Range<usize>) {
     assert_eq!(c.entry_off, 0);
     assert!(
         c.faults.0.is_empty(),
-        "aarch64 emits no fault sites: a current-EL data abort is fatal, not fixable"
+        "a program with no arena access has nothing to record"
     );
     let w = a64_words(&c.code);
     assert_eq!(
@@ -127,9 +158,9 @@ fn a64_image(items: &[Decoded]) -> (Vec<u32>, core::ops::Range<usize>) {
         &w[..A64_PROLOGUE.len()]
     );
     assert_eq!(
-        &w[w.len() - A64_OOF_EPILOGUE.len()..],
-        &A64_OOF_EPILOGUE,
-        "the image must end with the out-of-fuel epilogue"
+        &w[w.len() - A64_ARENA_EPILOGUE.len()..],
+        &A64_ARENA_EPILOGUE,
+        "the image must end with the arena-fault epilogue"
     );
     let start = A64_PROLOGUE.len() + 2; // the first block's `subs` + `b.lo`
     let end = w
@@ -508,7 +539,7 @@ fn a64_golden_conditional_branch_is_an_inverted_skip_over_a_long_branch() {
             // insn 1 follows a branch, so it opens a block of its own: one
             // instruction, charged one unit.
             0xf100_0718, // subs x24, x24, #1
-            0x5400_0223, // b.lo -> the out-of-fuel epilogue
+            0x5400_0243, // b.lo -> the out-of-fuel epilogue
             0xd280_0020, // mov  x0, #1
             0xf2a0_0000,
             0xf2c0_0000,
@@ -516,7 +547,7 @@ fn a64_golden_conditional_branch_is_an_inverted_skip_over_a_long_branch() {
             // insn 2 is a branch target, so it opens a block too: itself plus
             // `exit`, charged two.
             0xf100_0b18, // subs x24, x24, #2
-            0x5400_0163,
+            0x5400_0183,
             0xd280_0000, // mov  x0, #0
             0xf2a0_0000,
             0xf2c0_0000,
@@ -547,7 +578,7 @@ fn a64_golden_jset_uses_tst_not_cmp() {
             0x5400_0040, // b.eq #8   (inverted NE)
             0x1400_0001, // b -> insn 1 (the next word: `off: 0` falls through)
             0xf100_0718, // insn 1 opens a block
-            0x5400_00e3,
+            0x5400_0103,
             0x1400_0001, // b -> epilogue
         ],
     );
@@ -809,45 +840,32 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
     }
 }
 
-#[test]
-fn a64_an_arena_program_is_refused_at_the_call_that_produces_the_handle() {
-    // The aarch64 half of the x86-64 test of the same name. `jit_glue`'s
-    // "Lifting gate 2" note claims **neither** backend emits `Decoded::Call`,
-    // and a kfunc return is the verifier's only producer of `PtrClass::Arena`
-    // — so that claim is what makes gate 2 vacuous on both architectures, and
-    // a claim about both needs testing on both. Tested through
-    // `aarch64::compile` rather than `compile`, which dispatches to the host.
-    let prog = crate::tests::verified_arena(
-        &[
-            Decoded::Call(narf_bpf_isa::CallTarget::Kfunc(1)),
-            Decoded::Store {
-                size: Size::Dw,
-                dst: r(0),
-                off: 0,
-                src: Source::Imm(1),
-            },
-            mov(0, 0),
-            EXIT,
-        ],
-        1,
-        None,
-    );
-    assert!(
-        matches!(
-            aarch64::compile(&prog),
-            Err(JitError::Unsupported { at: 0, .. })
-        ),
-        "the call, not the arena access, is what an arena program hits first"
-    );
+/// Compile an arena program on this backend and return its words.
+///
+/// Through `aarch64::compile` rather than `compile`, which dispatches to the
+/// *host* — so these run on an x86-64 developer machine too, which is the whole
+/// reason this file exists.
+#[track_caller]
+fn a64_arena_words(
+    items: &[Decoded],
+    fault_at: u32,
+    dst: Option<u8>,
+) -> (Vec<u32>, crate::Compiled) {
+    let prog = crate::tests::verified_arena(items, fault_at, dst);
+    let c = aarch64::compile(&prog).expect("the arena shape is emitted now");
+    (a64_words(&c.code), c)
 }
 
 #[test]
-fn a64_the_emitter_discards_the_verifiers_arena_fault_sites() {
-    // As the x86-64 test of the same name: gate 3 has to stay closed because
-    // codegen hands `jit_glue` an empty table for a program the verifier said
-    // needs coverage. Stated per backend because `FaultTable` is built
-    // per backend, so one of them could grow entries without the other.
-    let prog = crate::tests::verified_arena(
+fn a64_an_arena_store_takes_the_slot_relative_shape() {
+    // The aarch64 half of `an_arena_access_lowers_to_the_slot_relative_shape`.
+    // Stated per backend because the lowering is written per backend, so one of
+    // them could regress without the other.
+    //
+    // Every word below was cross-checked against `llvm-mc -triple=aarch64
+    // -show-encoding` rather than read off the manual, which is the same rule
+    // the rest of this file's constants follow.
+    let (w, c) = a64_arena_words(
         &[
             Decoded::Store {
                 size: Size::Dw,
@@ -861,16 +879,185 @@ fn a64_the_emitter_discards_the_verifiers_arena_fault_sites() {
         0,
         None,
     );
-    let c = aarch64::compile(&prog).expect("the store alone is an ordinary encoding");
+    let body = &w[A64_PROLOGUE.len() + 2..];
     assert_eq!(
-        prog.fault_sites.len(),
-        1,
-        "premise: the verifier recorded a site to cover"
+        &body[..14],
+        &[
+            0x2a01_03e9, // mov  w9, w1        — zero-extend the handle
+            0xd280_0110, // movz x16, #8       — the displacement, sign-extended
+            0xf2a0_0010, // movk x16, #0, lsl #16
+            0xf2c0_0010, // movk x16, #0, lsl #32
+            0xf2e0_0010, // movk x16, #0, lsl #48
+            0x8b10_0129, // add  x9, x9, x16   — x9 is now the handle
+            0xf843_83f1, // ldur x17, [sp,#56] — the parked slot base
+            0x8b09_0231, // add  x17, x17, x9  — the address
+            0xd280_0030, // movz x16, #1       — the stored value
+            0xf2a0_0010, // movk x16, #0, lsl #16
+            0xf2c0_0010, // movk x16, #0, lsl #32
+            0xf2e0_0010, // movk x16, #0, lsl #48
+            0xf800_0230, // stur x16, [x17]    — the faulting instruction
+            0xd280_0000, // (mov x0, #0 — the next BPF instruction)
+        ],
+        "\n got {:08x?}",
+        &body[..14]
     );
-    assert!(
-        c.faults.0.is_empty(),
-        "codegen must be taught to record arena fault sites before gate 3 lifts"
+    // The value is materialised *after* the address, because `emit_arena_addr`
+    // uses x16 as scratch for the displacement. Reversing the two would store a
+    // displacement instead of a value, and the golden above is what says so.
+    assert_eq!(c.faults.0.len(), 1);
+    assert!(c.faults.0[0].arena);
+    assert_eq!(c.faults.0[0].dst_host_reg, None);
+    // The faulting word is the `stur`, not the address arithmetic before it.
+    assert_eq!(
+        c.faults.0[0].fault_off as usize,
+        (A64_PROLOGUE.len() + 2 + 12) * 4
     );
+}
+
+#[test]
+fn a64_the_arena_fixup_is_the_epilogue_and_not_the_next_instruction() {
+    // The property that separates this from Linux's `ex_handler_bpf`: a probe
+    // read zeroes its destination and carries on, an arena fault *stops*.
+    //
+    // Mutation: point `fixup_off` at the next instruction and this goes red.
+    let (w, c) = a64_arena_words(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(1),
+                off: 0,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let arena_epi = w.len() - A64_ARENA_EPILOGUE.len();
+    assert_eq!(
+        &w[arena_epi..],
+        &A64_ARENA_EPILOGUE,
+        "the image must end with the arena-fault epilogue"
+    );
+    assert_eq!(
+        c.faults.0[0].fixup_off as usize,
+        arena_epi * 4,
+        "the fixup must name the arena epilogue, not the next instruction"
+    );
+}
+
+#[test]
+fn a64_an_arena_load_and_a_register_store_take_the_same_shape() {
+    // The other two arena forms, and the zero-displacement path — which skips
+    // the four-word immediate materialisation entirely.
+    let (w, _) = a64_arena_words(
+        &[
+            Decoded::Load {
+                size: Size::Dw,
+                sign_extend: false,
+                dst: r(3),
+                src: r(2),
+                off: 0,
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        Some(3),
+    );
+    let body = &w[A64_PROLOGUE.len() + 2..];
+    assert_eq!(
+        &body[..4],
+        &[
+            0x2a02_03e9, // mov  w9, w2
+            0xf843_83f1, // ldur x17, [sp,#56]
+            0x8b09_0231, // add  x17, x17, x9
+            0xf840_0223, // ldur x3, [x17]
+        ],
+        "\n got {:08x?}",
+        &body[..4]
+    );
+
+    let (w, _) = a64_arena_words(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(2),
+                off: 0,
+                src: Source::Reg(r(3)),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let body = &w[A64_PROLOGUE.len() + 2..];
+    assert_eq!(
+        &body[..4],
+        &[
+            0x2a02_03e9, // mov  w9, w2
+            0xf843_83f1, // ldur x17, [sp,#56]
+            0x8b09_0231, // add  x17, x17, x9
+            0xf800_0223, // stur x3, [x17]
+        ],
+        "\n got {:08x?}",
+        &body[..4]
+    );
+}
+
+#[test]
+fn a64_a_non_arena_access_keeps_the_plain_shape() {
+    // Lifting gate 2 must not give *every* access the arena shape. Same
+    // instruction, no fault site, plain `[base, #disp]` — and no fault entry.
+    //
+    // Without this, an emitter that ignored `arena_access_map` and always took
+    // the arena path would pass every arena test above.
+    let c = aarch64::compile(&verified(&[
+        Decoded::Store {
+            size: Size::Dw,
+            dst: r(1),
+            off: 8,
+            src: Source::Imm(1),
+        },
+        mov(0, 0),
+        EXIT,
+    ]))
+    .expect("compiles");
+    let w = a64_words(&c.code);
+    let body = &w[A64_PROLOGUE.len() + 2..];
+    // `movz x16, #1` + three `movk`, then `stur x16, [x1, #8]`.
+    assert_eq!(
+        body[4], 0xf800_8030,
+        "a non-arena store must keep the plain addressing shape, got {:08x}",
+        body[4]
+    );
+    assert!(c.faults.0.is_empty());
+}
+
+#[test]
+fn a64_an_arena_access_the_emitter_cannot_shape_is_refused() {
+    // Fail-closed, and specifically not by falling through to the plain
+    // lowering — which would be a bare dereference of a handle.
+    let prog = crate::tests::verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::W,
+                dst: r(1),
+                off: 8,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    assert!(matches!(
+        aarch64::compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
 }
 
 // ── differential: reference evaluator vs. emulated native code ───────
@@ -1946,4 +2133,178 @@ fn a64_diff_multiple_exits_share_one_epilogue() {
             64,
         );
     }
+}
+
+// ── kfunc calls ─────────────────────────────────────────────────────
+
+/// A shim address with a bit set in every 16-bit lane, so a `MOVZ`/`MOVK`
+/// sequence that dropped or misplaced a lane cannot look right by accident.
+const A64_SHIM: usize = 0xDEAD_BEEF_1234_5678;
+
+/// Compile with a resolved call table and return the body words.
+#[track_caller]
+fn a64_call_body(items: &[Decoded], sites: &[(u32, i32, usize)], want: &[u32]) {
+    let c = aarch64::compile(&verified_calling(items, sites)).expect("should compile");
+    let w = a64_words(&c.code);
+    let start = A64_PROLOGUE.len() + 2; // the first block's `subs` + `b.lo`
+    let end = w
+        .windows(A64_EPILOGUE.len())
+        .position(|x| x == A64_EPILOGUE)
+        .expect("the normal epilogue must appear after the body");
+    assert_eq!(
+        &w[start..end],
+        want,
+        "\n got {:08x?}\nwant {want:08x?}",
+        &w[start..end]
+    );
+}
+
+#[test]
+fn a64_golden_kfunc_call_sequence() {
+    // AAPCS64 takes arguments in x0..x4 and BPF supplies them in x1..x5, so
+    // every one moves and the map is off by exactly one register. The moves go
+    // *forward*: each source is read before anything writes it, and `x0`'s old
+    // value is R0, which a call clobbers by definition. Emitting them in
+    // reverse smears R5 across all five argument registers — code that
+    // assembles, runs, and passes garbage.
+    a64_call_body(
+        &[kcall(7), EXIT],
+        &[(0, 7, A64_SHIM)],
+        &[
+            0xaa01_03e0, // mov x0, x1
+            0xaa02_03e1, // mov x1, x2
+            0xaa03_03e2, // mov x2, x3
+            0xaa04_03e3, // mov x3, x4
+            0xaa05_03e4, // mov x4, x5
+            0xd28a_cf10, // mov  x16, #0x5678
+            0xf2a2_4690, // movk x16, #0x1234, lsl #16
+            0xf2d7_ddf0, // movk x16, #0xbeef, lsl #32
+            0xf2fb_d5b0, // movk x16, #0xdead, lsl #48
+            0xd63f_0200, // blr  x16
+            0x1400_0001, // b -> epilogue
+        ],
+    );
+}
+
+/// Decode the pre-indexed `STP`'s byte displacement — the frame the prologue
+/// claims. Signed 7-bit field, scaled by 8.
+fn a64_stp_pre_bytes(w: u32) -> i32 {
+    let imm7 = ((w >> 15) & 0x7F) as i32;
+    let signed = if imm7 >= 64 { imm7 - 128 } else { imm7 };
+    signed * 8
+}
+
+/// Decode an unscaled `LDUR`/`STUR` displacement. Signed 9-bit field.
+fn a64_ldst_ur_bytes(w: u32) -> i32 {
+    let imm9 = ((w >> 12) & 0x1FF) as i32;
+    if imm9 >= 256 {
+        imm9 - 512
+    } else {
+        imm9
+    }
+}
+
+#[test]
+fn a64_the_prologue_saves_x30_because_blr_clobbers_it() {
+    // The one thing emitting a call cost this backend that x86-64 did not need.
+    // `BLR` writes `x30`, so without this save the first kfunc call would
+    // overwrite the address the epilogue's `RET` branches to — and the program
+    // would return into the middle of itself.
+    //
+    // Read out of the *emitted image* rather than out of [`A64_PROLOGUE`], and
+    // located by searching for the register rather than by index: a golden
+    // constant pins whatever the emitter does, so a test comparing only against
+    // one would agree with an emitter that had stopped saving `x30`, provided
+    // someone updated the constant to match.
+    let c = aarch64::compile(&verified(&[mov(0, 42), EXIT])).expect("compiles");
+    let w = a64_words(&c.code);
+    let x30_ur = |load: bool| {
+        let base = if load { 0xF840_0000u32 } else { 0xF800_0000 };
+        w.iter()
+            .copied()
+            .filter(move |&x| {
+                (x & 0xFFE0_0000) == base && (x & 0x1F) == 30 && ((x >> 5) & 0x1F) == 31
+            })
+            .map(a64_ldst_ur_bytes)
+            .collect::<Vec<i32>>()
+    };
+    let saves = x30_ur(false);
+    let loads = x30_ur(true);
+    assert_eq!(
+        saves.len(),
+        1,
+        "expected exactly one x30 save, got {saves:?}"
+    );
+    assert!(!loads.is_empty(), "no epilogue reloads x30");
+    assert!(
+        loads.iter().all(|&o| o == saves[0]),
+        "x30 saved at {saves:?} and reloaded from {loads:?}"
+    );
+}
+
+#[test]
+fn a64_the_claimed_frame_is_sixteen_byte_aligned_and_holds_every_saved_slot() {
+    // AAPCS64 requires `sp` 16-aligned at *every* instruction boundary, not
+    // merely at a call, and the architecture can be configured to fault on a
+    // misaligned `sp` outright — so this is stricter than SysV's rule and
+    // cheaper to get wrong, since the frame grew by a register that does not
+    // pair with anything.
+    let c = aarch64::compile(&verified(&[mov(0, 42), EXIT])).expect("compiles");
+    let w = a64_words(&c.code);
+    let frame = -a64_stp_pre_bytes(w[0]);
+    assert_eq!(frame % 16, 0, "frame of {frame} bytes is not 16-aligned");
+    // Every byte the prologue writes has to be inside it. The deepest is the
+    // `x30` slot, which is the one with no `STP` partner to bound it.
+    let x30_off = w
+        .iter()
+        .copied()
+        .find(|&x| (x & 0xFFE0_0000) == 0xF800_0000 && (x & 0x1F) == 30)
+        .map(a64_ldst_ur_bytes)
+        .expect("the prologue must store x30");
+    assert!(
+        x30_off + 8 <= frame,
+        "x30 is stored at {x30_off}, past the {frame}-byte frame"
+    );
+}
+
+#[test]
+fn a64_a_call_the_verifier_never_reached_is_refused_rather_than_guessed() {
+    let prog = verified(&[kcall(7), EXIT]);
+    assert!(prog.kfunc_calls.is_empty(), "premise: no table");
+    assert!(matches!(
+        aarch64::compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
+}
+
+#[test]
+fn a64_a_call_site_that_names_a_different_kfunc_is_refused() {
+    let prog = verified_calling(&[kcall(7), EXIT], &[(0, 9, A64_SHIM)]);
+    assert!(matches!(
+        aarch64::compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
+}
+
+#[test]
+fn a64_a_sleepable_kfuncs_shim_is_never_entered_from_native_code() {
+    let mut prog = verified_calling(&[kcall(7), EXIT], &[(0, 7, A64_SHIM)]);
+    prog.kfunc_calls[0].context = Context::Sleepable;
+    assert!(matches!(
+        aarch64::compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
+}
+
+#[test]
+fn a64_a_subprogram_call_is_still_unsupported() {
+    let prog = verified(&[
+        Decoded::Call(narf_bpf_isa::CallTarget::Subprog(1)),
+        mov(0, 0),
+        EXIT,
+    ]);
+    assert!(matches!(
+        aarch64::compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
 }

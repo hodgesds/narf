@@ -172,6 +172,37 @@ pub struct FaultSite {
     pub arena: bool,
 }
 
+/// A `call` to a kfunc, as resolved during verification.
+///
+/// The verifier resolves each `call`'s immediate against [`Program::kfuncs`]
+/// already — it has to, to type-check the arguments — and this records the
+/// answer so codegen does not have to resolve it a second time against a
+/// registry it has no access to. `narf-bpf-jit` deliberately depends on nothing
+/// kernel-side, so a shim address can only reach it through this struct.
+///
+/// Per *call site*, not per kfunc, and that is the point: an emitter walks
+/// instructions, so "what does the call at index `i` target" is the question it
+/// actually asks. A site with no entry here is one the fixpoint never reached
+/// (dead code), and an emitter must refuse it rather than invent a target.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct KfuncCallSite {
+    /// Index of the `call` instruction.
+    pub insn_index: u32,
+    /// The id the instruction's `imm` carried, i.e. [`KfuncDesc::id`].
+    pub id: i32,
+    /// Address of the `extern "C"` shim — [`KfuncDesc::addr`], copied so the
+    /// JIT needs no descriptor lifetime.
+    pub addr: usize,
+    /// The weakest context this kfunc may be entered from.
+    ///
+    /// Carried because it is what distinguishes the two shim ABIs: a
+    /// [`Context::Sleepable`] kfunc's shim returns a boxed future, not a `u64`,
+    /// so native code must not call it through the uniform ABI. Recording the
+    /// context rather than a "callable" boolean keeps the decision with the
+    /// backend that has to make it.
+    pub context: Context,
+}
+
 /// One subprogram's static properties.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SubprogInfo {
@@ -206,6 +237,13 @@ pub struct VerifiedProgram {
     /// Whether the program touches an arena, and so needs the arena base
     /// register pinned for its whole body.
     pub uses_arena: bool,
+    /// Every reachable kfunc `call`, sorted by instruction index.
+    ///
+    /// Additive: nothing that existed before this field depends on it, and a
+    /// backend that ignores it behaves exactly as it did — which is what makes
+    /// "the emitter refuses `Decoded::Call`" and "the emitter emits it" both
+    /// expressible against the same struct.
+    pub kfunc_calls: Vec<KfuncCallSite>,
 }
 
 /// Why verification failed.

@@ -61,7 +61,8 @@ use crate::kfunc::{
 use crate::liveness::{self, Masks};
 use crate::state::{weaker_domain, AbsState, AbsValue, PtrClass, PtrVal, Ref, Stack, NO_REF};
 use crate::{
-    FaultSite, MapDesc, Program, SubprogInfo, VerifiedProgram, VerifyError, MAX_STACK_BYTES,
+    FaultSite, KfuncCallSite, MapDesc, Program, SubprogInfo, VerifiedProgram, VerifyError,
+    MAX_STACK_BYTES,
 };
 
 /// Everything the fixpoint accumulates that outlives a single block.
@@ -71,6 +72,10 @@ struct Analysis<'a, 'p> {
     live: Masks,
     prec: Masks,
     fault_sites: Vec<FaultSite>,
+    /// Every kfunc `call` the fixpoint resolved. Appended per visit, so the
+    /// same site lands here once per worklist round; deduped at the end, as
+    /// `fault_sites` is.
+    kfunc_calls: Vec<KfuncCallSite>,
     uses_arena: bool,
     /// Entry state per subprogram, built up from call sites.
     entry: Vec<Option<AbsState>>,
@@ -96,6 +101,7 @@ pub fn run(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
         ir: &ir,
         prog,
         fault_sites: Vec::new(),
+        kfunc_calls: Vec::new(),
         uses_arena: false,
         entry: vec![None; ir.subprogs.len()],
         depth: vec![0; ir.subprogs.len()],
@@ -160,6 +166,15 @@ pub fn run(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
     fault_sites.sort_unstable_by_key(|f| f.insn_index);
     fault_sites.dedup_by_key(|f| f.insn_index);
 
+    // Same shape as `fault_sites`: a block can be re-analysed several times
+    // before the fixpoint settles, so a call site is recorded once per visit
+    // and collapsed here. `sort_unstable` is fine — every duplicate of a given
+    // index is byte-identical, because resolution is a pure function of the
+    // instruction's immediate and `Program::kfuncs`.
+    let mut kfunc_calls = a.kfunc_calls;
+    kfunc_calls.sort_unstable_by_key(|c| c.insn_index);
+    kfunc_calls.dedup_by_key(|c| c.insn_index);
+
     let subprogs = ir
         .subprogs
         .iter()
@@ -178,6 +193,7 @@ pub fn run(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
         fault_sites,
         subprogs,
         uses_arena: a.uses_arena,
+        kfunc_calls,
     })
 }
 
@@ -1324,6 +1340,17 @@ impl Analysis<'_, '_> {
         }
 
         self.check_args(st, at, &desc)?;
+
+        // Record the resolution for codegen. After `check_args`, so a site only
+        // lands here once the call itself is well-typed — a program that fails
+        // verification produces no `VerifiedProgram` at all, but keeping the
+        // order means the list can never describe a call the verifier rejected.
+        self.kfunc_calls.push(KfuncCallSite {
+            insn_index: at,
+            id: desc.id,
+            addr: desc.addr,
+            context: desc.context,
+        });
 
         // A kfunc that may sleep is an await point. Everything whose validity
         // domain does not survive it dies here — spec §4.4, the single rule

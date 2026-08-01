@@ -39,6 +39,12 @@
 //! which is what makes writing them unconditionally safe. `x18` is left alone
 //! entirely (it is the platform register).
 //!
+//! [`hr::AHANDLE`] (`x9`) is the third scratch, and it exists only for the
+//! arena shape: `x16` is unavailable there because a `ST` immediate needs it for
+//! the stored value, and the handle has to survive to the faulting instruction
+//! so the arena-fault epilogue can name it. `x9` is a plain caller-saved
+//! temporary, absent from the map and never live across a call.
+//!
 //! ## Immediates always go through a register
 //!
 //! Every immediate operand is materialised into `x16` with a MOVZ/MOVK
@@ -84,33 +90,60 @@
 //! ## What is emitted, and what is not
 //!
 //! The subset `narf_bpf::jit_glue`'s gates admit: ALU (32 and 64 bit), `MOV`,
-//! doubleword loads and stores through R10/R1, jumps, conditional jumps, and
-//! `exit`. Everything else returns [`JitError::Unsupported`] and runs
-//! interpreted, which is a complete implementation — so an unemitted
-//! instruction costs speed, not correctness.
+//! doubleword loads and stores through R10/R1, jumps, conditional jumps,
+//! `exit`, and **kfunc calls**. Subprogram calls are still refused — they need
+//! a BPF frame push, which is a different feature from entering a C function.
+//! Everything else returns [`JitError::Unsupported`] and runs interpreted,
+//! which is a complete implementation — so an unemitted instruction costs
+//! speed, not correctness.
 //!
-//! Nothing here records a [`FaultEntry`], and the reason has changed. It used
-//! to be architectural: aarch64 had *no* current-EL data-abort recovery, so a
-//! faulting access in emitted code was fatal rather than fixable and a fault
-//! site would have had nothing to resume to.
+//! Emitting a call cost this backend one thing the x86-64 one did not need: an
+//! `x30` save. `BLR` writes the link register, and the prologue had no reason
+//! to preserve it while nothing here branched with link. See [`hr::LR`].
 //!
-//! That is no longer true. `frame/src/aarch64/trap.rs` handles
-//! `EC = 0b100101` (Data Abort from the current EL) by consulting
-//! `narf_memory::bpf_extable::try_recover` and rewriting `frame.elr`, which is
-//! the same fixup shape x86-64 uses. Both architectures can therefore carry
-//! fault sites, and the remaining reason this file records none is simply that
-//! nothing here emits a faulting access yet — `jit_glue` gates them out
-//! (gate 3) and the arena lowering that would produce them does not exist on
-//! either backend. Do not read this paragraph as "aarch64 cannot"; it says
-//! "aarch64 does not, yet".
+//! ## Fault sites, and the arena shape that produces them
+//!
+//! This file records [`FaultEntry`]s now. It used not to for an architectural
+//! reason — aarch64 had *no* current-EL data-abort recovery, so a faulting
+//! access in emitted code was fatal rather than fixable — and that stopped being
+//! true when `frame/src/aarch64/trap.rs` grew its `EC = 0b100101` (Data Abort
+//! from the current EL) arm: it consults
+//! `narf_memory::bpf_extable::try_recover` and rewrites `frame.elr`, the same
+//! fixup shape x86-64 uses.
+//!
+//! The only faulting access emitted is the arena one, whose address is
+//! `slot_base + handle + off16`:
+//!
+//! ```text
+//!   mov  w9, w<handle>          ; zero-extend into the handle scratch
+//!   [movz/movk x16, #off16 ; add x9, x9, x16]   ; only when off16 != 0
+//!   ldur x17, [sp, #56]         ; the slot base the prologue parked
+//!   add  x17, x17, x9           ; the address
+//!   ldur <dst>, [x17]           ; the faulting instruction
+//! ```
+//!
+//! The slot base arrives as the fourth entry argument in `x3` and the prologue
+//! parks it in the 8 bytes of padding [`FRAME_BYTES`] already claims — see
+//! [`ARENA_BASE_SLOT`]. Reloaded per access rather than pinned: `x23`/`x26`..`x28`
+//! *are* free here, unlike on x86-64, but a pinned base would mean a
+//! seventh saved register, an odd [`SAVED`] count, and a larger frame for every
+//! program including the ones with no arena.
+//!
+//! Two details are load-bearing rather than incidental, and both are pinned by
+//! golden encodings. The `W`-register move **zero-extends**, which bounds the
+//! index to `[0, 2^32)` in the emitted words rather than by inheriting a
+//! verifier invariant; and the displacement is folded into `x9` rather than left
+//! in the `LDUR`, so at the fault `x9` holds exactly the handle the interpreter
+//! would have computed and [`emit_arena_epilogue`] can return it. Folding it
+//! also sidesteps `LDUR`'s `simm9` reach with no second addressing shape.
 
 use alloc::vec::Vec;
 
-use narf_bpf_isa::{decode, AluOp, CondOp, Decoded, Reg, Size, Source};
-use narf_bpf_verifier::VerifiedProgram;
+use narf_bpf_isa::{decode, AluOp, CallTarget, CondOp, Decoded, Reg, Size, Source};
+use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
 use crate::blocks::{block_len, block_starts};
-use crate::{Compiled, FaultEntry, FaultTable, JitError};
+use crate::{status, Compiled, FaultEntry, FaultTable, JitError};
 
 /// Host register numbers.
 mod hr {
@@ -124,6 +157,18 @@ mod hr {
     pub const IMM: u8 = 16;
     /// Scratch for computed addresses (IP1).
     pub const ADDR: u8 = 17;
+    /// Scratch holding an arena access's **handle** — zero-extended, with the
+    /// displacement folded in — from the address computation to the access
+    /// itself, and read by the arena-fault epilogue.
+    ///
+    /// A third scratch rather than reusing [`IMM`], because a `ST` immediate
+    /// needs `IMM` for the value it stores and the handle has to outlive that.
+    /// `x9` is a caller-saved temporary, absent from [`super::REGS`], and never
+    /// live across a call — the arena sequence has none in it.
+    pub const AHANDLE: u8 = 9;
+    /// The link register. `BLR` writes it, so the prologue has to save it —
+    /// which it did not need to do while nothing here emitted a call.
+    pub const LR: u8 = 30;
     /// `sp` and `xzr` share encoding 31; which one an instruction means is
     /// fixed by the instruction, not by the field.
     pub const SP: u8 = 31;
@@ -155,8 +200,33 @@ const fn host(r: Reg) -> u8 {
 /// them. Three `STP` pairs, so the count must stay even.
 const SAVED: [u8; 6] = [19, 20, 21, 22, hr::FUEL, hr::FP];
 
-/// Bytes of stack the prologue claims for [`SAVED`].
-const FRAME_BYTES: i32 = 48;
+/// Bytes of stack the prologue claims for [`SAVED`] and [`hr::LR`].
+///
+/// 48 for the three pairs, 8 for `x30`, and 8 of padding to keep the total a
+/// multiple of 16 — AAPCS64 requires `sp` 16-aligned at every instruction
+/// boundary, not merely at a call, and the architecture can be configured to
+/// fault on a misaligned `sp` outright.
+const FRAME_BYTES: i32 = 64;
+
+/// Offset of the saved [`hr::LR`] within the claimed frame.
+const LR_SLOT: i32 = 48;
+
+/// Offset within the claimed frame where the prologue parks the arena slot base.
+///
+/// The 8 bytes [`FRAME_BYTES`] already spends on 16-alignment, reused rather
+/// than added to: a dedicated slot would grow every program's frame by 16 (the
+/// alignment quantum) for a value read at most once per arena access.
+///
+/// `sp` does not move between the prologue and any access — nothing in the body
+/// adjusts it, and a `BLR`'s callee builds its frame below — so the parked base
+/// survives a kfunc call untouched.
+const ARENA_BASE_SLOT: i32 = 56;
+
+// The pad slot must be inside the claimed frame and must not overlap `x30`'s.
+const _: () = assert!(
+    ARENA_BASE_SLOT == LR_SLOT + 8 && ARENA_BASE_SLOT + 8 == FRAME_BYTES,
+    "the arena base slot must be the frame's alignment padding, not a saved register"
+);
 
 // ── instruction encoders ─────────────────────────────────────────────
 //
@@ -250,6 +320,12 @@ const LDP_POST: u32 = 0xA8C0_0000;
 
 /// `RET` (to `x30`).
 const RET: u32 = 0xD65F_03C0;
+
+/// `BLR Rn` — branch with link to an absolute address in a register.
+#[inline]
+const fn blr(rn: u8) -> u32 {
+    0xD63F_0000 | ((rn as u32) << 5)
+}
 
 /// The AAPCS64 condition codes this backend uses. Inverting any of them is
 /// `code ^ 1`, which the architecture guarantees for every code except
@@ -473,6 +549,9 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
     let mut relocs: Vec<Reloc> = Vec::new();
     let mut out = Vec::with_capacity(prog.insns.len() + 1);
     let starts = block_starts(prog)?;
+    // Which accesses take the arena shape — the same function `jit_glue`'s
+    // gate 5 consults, so the gate and the emitter cannot disagree.
+    let arena = crate::arena_access_map(prog);
 
     emit_prologue(&mut e);
 
@@ -489,7 +568,14 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
         }
         let (insn, width) =
             decode(&prog.insns, i).map_err(|_| JitError::Decode { at: i as u32 })?;
-        emit_insn(&mut e, &insn, i as u32, &mut relocs)?;
+        emit_insn(
+            &mut e,
+            &insn,
+            i as u32,
+            &mut relocs,
+            &prog.kfunc_calls,
+            arena[i],
+        )?;
         i += width;
         // A wide instruction occupies two slots. `LD_IMM64` is the only one and
         // it is `Unsupported` here, so `width` is always 1 today; the trailing
@@ -504,6 +590,19 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
     emit_epilogue(&mut e);
     let oof_at = e.len();
     emit_oof_epilogue(&mut e);
+    let arena_at = e.len();
+    emit_arena_epilogue(&mut e);
+
+    // An arena fault site resumes at the arena epilogue, never at the next
+    // instruction. Patched unconditionally here rather than recorded at the
+    // access, because the epilogue's offset is not known until the body is
+    // emitted — and anything left holding a next-instruction fixup would be the
+    // zero-and-continue shape the arena lowering exists to avoid.
+    for f in &mut e.faults {
+        if f.arena {
+            f.fixup_off = arena_at;
+        }
+    }
 
     for r in &relocs {
         let target = if r.target == OOF_EPILOGUE {
@@ -552,6 +651,17 @@ fn emit_prologue(e: &mut Emit) {
     e.w(pair(STP_PRE, SAVED[0], SAVED[1], hr::SP, -FRAME_BYTES));
     e.w(pair(STP_OFF, SAVED[2], SAVED[3], hr::SP, 16));
     e.w(pair(STP_OFF, SAVED[4], SAVED[5], hr::SP, 32));
+    // `x30` is saved alone rather than paired, because [`SAVED`] has an even
+    // count and pairing it with `xzr` would store a word nothing reads back.
+    // A `BLR` overwrites it, so without this the first kfunc call would return
+    // the *program* into the middle of itself.
+    e.w(stur(hr::LR, hr::SP, LR_SLOT));
+    // Park the arena slot base (AAPCS64 arg 4, `x3`) in the frame's padding,
+    // **before** anything writes `x3`, which R3 maps to. See
+    // [`ARENA_BASE_SLOT`]. Emitted unconditionally: one store per invocation
+    // beats two prologue shapes to reason about, and a program with no arena
+    // simply never reads it back.
+    e.w(stur(3, hr::SP, ARENA_BASE_SLOT));
     // Fuel out of `x2` **before** anything writes `x2`, which R2 maps to.
     e.w(mov_rr(true, hr::FUEL, 2));
     // Frame top out of `x0` before anything writes `x0`, which R0 maps to.
@@ -581,13 +691,32 @@ fn emit_epilogue(e: &mut Emit) {
 
 /// The out-of-fuel epilogue: flag set, and `x0` left as-is (meaningless).
 fn emit_oof_epilogue(e: &mut Emit) {
-    e.w(movz(true, 1, 0, 1));
+    e.w(movz(true, 1, 0, status::OUT_OF_FUEL as u16));
+    emit_restore(e);
+}
+
+/// The arena-fault epilogue: status 2 in `x1`, the offending handle in `x0`.
+///
+/// Reached only through the exception table — nothing branches here — so `sp` is
+/// exactly as the faulting instruction left it, which is the state
+/// [`emit_restore`] expects. That is why the fixup can be a plain resume address
+/// with no per-site stub: nothing in the body moves `sp`.
+///
+/// **Not** Linux's `ex_handler_bpf` shape. Zeroing the destination and resuming
+/// would make an out-of-bounds arena access return a value natively and
+/// `Trap::ArenaOutOfBounds` interpreted — one program, two verdicts, decided by
+/// whether it cleared `jit_glue`'s gates. [`hr::AHANDLE`] still holds the handle
+/// because [`emit_arena_addr`] folded the displacement into it.
+fn emit_arena_epilogue(e: &mut Emit) {
+    e.w(mov_rr(true, 0, hr::AHANDLE));
+    e.w(movz(true, 1, 0, status::ARENA_FAULT as u16));
     emit_restore(e);
 }
 
 fn emit_restore(e: &mut Emit) {
     e.w(pair(LDP_OFF, SAVED[2], SAVED[3], hr::SP, 16));
     e.w(pair(LDP_OFF, SAVED[4], SAVED[5], hr::SP, 32));
+    e.w(ldur(hr::LR, hr::SP, LR_SLOT));
     // Post-indexed, releasing the frame as it loads the first pair.
     e.w(pair(LDP_POST, SAVED[0], SAVED[1], hr::SP, FRAME_BYTES));
     e.w(RET);
@@ -666,13 +795,162 @@ fn addr_operand(e: &mut Emit, base: u8, off: i16) -> (u8, i32) {
     }
 }
 
+/// The whole of a kfunc call: the AAPCS64 shuffle, the target, and the `BLR`.
+///
+/// BPF passes arguments in R1..R5 and AAPCS64 in `x0`..`x4`, so the map is
+/// off by exactly one register and every argument moves. The moves go
+/// **forward** — `x0 := x1`, then `x1 := x2`, and so on — which is the order
+/// that works: each source is read before anything writes it, and `x0`'s old
+/// value is R0, which a call clobbers by definition. Walking the other way
+/// would smear R5 across all five argument registers.
+///
+/// Nothing is saved around the call. R0..R5 live in `x0`..`x5`, which AAPCS64
+/// lets the callee destroy and the BPF ABI likewise declares caller-saved;
+/// R6..R10 and the fuel counter live in `x19`..`x22`, `x24` and `x25`, which
+/// AAPCS64 requires the callee to preserve. `x30` is the one exception, and the
+/// prologue saves it — see [`hr::LR`].
+fn emit_kfunc_call(e: &mut Emit, addr: usize) {
+    for k in 0..5u8 {
+        e.w(mov_rr(true, k, k + 1));
+    }
+    // Through `x16` (IP0): it is the scratch register the platform reserves for
+    // exactly this, absent from [`REGS`], and caller-saved, so the callee is
+    // welcome to destroy it.
+    mov_imm64(e, hr::IMM, addr as i64);
+    e.w(blr(hr::IMM));
+}
+
+/// The call site the verifier resolved for the `call` at `at`, or a refusal.
+///
+/// Byte-identical reasoning to the x86-64 backend's `resolve_call`, and
+/// deliberately duplicated rather than shared: the two backends already
+/// duplicate `emit_pass`, `emit_prologue` and the reloc patcher, and a
+/// three-line shared helper would be the only cross-backend coupling in the
+/// crate. Every arm is fail-closed — see that function for what each means.
+fn resolve_call(calls: &[KfuncCallSite], at: u32, id: i32) -> Result<KfuncCallSite, JitError> {
+    let site = calls
+        .binary_search_by_key(&at, |c| c.insn_index)
+        .map(|k| calls[k])
+        .map_err(|_| JitError::Unsupported {
+            at,
+            what: "kfunc call the verifier never resolved",
+        })?;
+    if site.id != id {
+        return Err(JitError::Unsupported {
+            at,
+            what: "kfunc call site disagrees with the instruction's immediate",
+        });
+    }
+    if site.context != Context::Atomic {
+        return Err(JitError::Unsupported {
+            at,
+            what: "a sleepable kfunc's shim does not use the uniform u64 ABI",
+        });
+    }
+    if site.addr == 0 {
+        return Err(JitError::Unsupported {
+            at,
+            what: "kfunc shim address is null",
+        });
+    }
+    Ok(site)
+}
+
+/// Compute `slot_base + zx32(handle) + off` into [`hr::ADDR`], leaving the
+/// handle itself in [`hr::AHANDLE`].
+///
+/// Returns nothing: the access that follows always uses `[ADDR]` with a zero
+/// displacement, because the displacement is folded in here. That is one
+/// addressing shape for every arena access whatever `off16` holds, where
+/// [`addr_operand`] needs two.
+///
+/// [`hr::IMM`] is left free on exit, which a `ST` immediate depends on.
+fn emit_arena_addr(e: &mut Emit, handle: u8, off: i16) {
+    debug_assert!(
+        handle != hr::AHANDLE && handle != hr::IMM && handle != hr::ADDR,
+        "the arena scratch registers must not be a BPF register"
+    );
+    // `W`-register move: zero-extends, which is what bounds the index to
+    // `[0, 2^32)` in the emitted words. See the module docs.
+    e.w(mov_rr(false, hr::AHANDLE, handle));
+    if off != 0 {
+        // Sign-extended to 64 bits, matching the ISA's signed `off` field.
+        mov_imm64(e, hr::IMM, i64::from(off));
+        e.w(shifted_reg(ADD_X, true, hr::AHANDLE, hr::AHANDLE, hr::IMM));
+    }
+    e.w(ldur(hr::ADDR, hr::SP, ARENA_BASE_SLOT));
+    e.w(shifted_reg(ADD_X, true, hr::ADDR, hr::ADDR, hr::AHANDLE));
+}
+
 fn emit_insn(
     e: &mut Emit,
     insn: &Decoded,
     at: u32,
     relocs: &mut Vec<Reloc>,
+    calls: &[KfuncCallSite],
+    arena: bool,
 ) -> Result<(), JitError> {
+    // The arena forms first: same instructions, different addressing, and a
+    // recorded fault site. Only the doubleword width is emitted, matching the
+    // non-arena arms — anything else falls through to `Unsupported` and runs
+    // interpreted rather than being lowered as a bare dereference.
+    if arena {
+        match *insn {
+            Decoded::Load {
+                size: Size::Dw,
+                sign_extend: false,
+                dst,
+                src,
+                off,
+            } => {
+                emit_arena_addr(e, host(src), off);
+                let fault_off = e.len();
+                e.w(ldur(host(dst), hr::ADDR, 0));
+                record_fault(e, fault_off);
+                return Ok(());
+            }
+            Decoded::Store {
+                size: Size::Dw,
+                dst,
+                off,
+                src: Source::Reg(s),
+            } => {
+                emit_arena_addr(e, host(dst), off);
+                let fault_off = e.len();
+                e.w(stur(host(s), hr::ADDR, 0));
+                record_fault(e, fault_off);
+                return Ok(());
+            }
+            Decoded::Store {
+                size: Size::Dw,
+                dst,
+                off,
+                src: Source::Imm(v),
+            } => {
+                // Address first, value second: [`emit_arena_addr`] uses
+                // [`hr::IMM`] as scratch for the displacement, so materialising
+                // the stored value into it beforehand would be destroyed.
+                emit_arena_addr(e, host(dst), off);
+                mov_imm64(e, hr::IMM, i64::from(v));
+                let fault_off = e.len();
+                e.w(stur(hr::IMM, hr::ADDR, 0));
+                record_fault(e, fault_off);
+                return Ok(());
+            }
+            _ => {
+                return Err(JitError::Unsupported {
+                    at,
+                    what: "arena access shape not yet emitted by the aarch64 backend",
+                })
+            }
+        }
+    }
     match *insn {
+        Decoded::Call(CallTarget::Kfunc(id)) => {
+            let site = resolve_call(calls, at, id)?;
+            emit_kfunc_call(e, site.addr);
+        }
+
         Decoded::Mov {
             wide,
             dst,
@@ -825,6 +1103,9 @@ fn emit_insn(
             });
         }
 
+        // Including `CallTarget::Subprog`: a BPF-to-BPF call needs the frame
+        // push the interpreter does in `push_frame`, which is a different
+        // feature from entering a C function.
         _ => {
             return Err(JitError::Unsupported {
                 at,
@@ -833,4 +1114,19 @@ fn emit_insn(
         }
     }
     Ok(())
+}
+
+/// Record the arena access at `fault_off` as a recoverable site.
+///
+/// `fixup_off` is zero here and patched to the arena epilogue by [`emit_pass`],
+/// which is the only place that knows where it landed. `dst_host_reg` is `None`:
+/// an arena fault does not resume into the program, so no destination's value is
+/// ever read — zeroing one would be exactly the shape this avoids.
+fn record_fault(e: &mut Emit, fault_off: u32) {
+    e.faults.push(FaultEntry {
+        fault_off,
+        fixup_off: 0,
+        dst_host_reg: None,
+        arena: true,
+    });
 }

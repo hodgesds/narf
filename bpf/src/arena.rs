@@ -694,10 +694,14 @@ mod smokes {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("loading an arena program failed"),
         };
-        // `jit_glue` gate 2: an arena program is never JITed, so the run below is
-        // the interpreter's arena path and not native code's.
-        if prog.is_jited() {
-            return TestResult::Fail("an arena program must not be JITed");
+        // `jit_glue` gate 2, in its relaxed form: an arena program with exactly
+        // one arena *is* JITed, so the run below is native code's arena path.
+        // This assertion used to be the exact opposite, and inverting it is what
+        // keeps the test honest — the linked list is built by three pairs of
+        // slot-relative stores, and if the gate ever closes again this stops
+        // covering the lowering at all.
+        if !prog.is_jited() && narf_bpf_jit::has_backend() {
+            return TestResult::Fail("a one-arena program must be JITed");
         }
         if prog.run_atomic([0; 4], 4) != Some(Outcome::Returned(3)) {
             return TestResult::Fail("the arena program did not run to completion");

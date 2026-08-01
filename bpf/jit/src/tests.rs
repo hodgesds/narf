@@ -11,8 +11,8 @@
 //! host cannot execute the bytes it emits.
 
 use narf_bpf_isa::encode::encode;
-use narf_bpf_isa::{AluOp, CondOp, Decoded, Insn, Reg, Size, Source};
-use narf_bpf_verifier::{Context, VerifiedProgram};
+use narf_bpf_isa::{AluOp, CallTarget, CondOp, Decoded, Insn, Reg, Size, Source};
+use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
 use crate::{compile, JitError};
 
@@ -37,7 +37,34 @@ pub(crate) fn verified(items: &[Decoded]) -> VerifiedProgram {
         fault_sites: Vec::new(),
         subprogs: Vec::new(),
         uses_arena: false,
+        kfunc_calls: Vec::new(),
     }
+}
+
+/// A `call` to a kfunc whose id and shim address the test chooses.
+pub(crate) fn kcall(id: i32) -> Decoded {
+    Decoded::Call(CallTarget::Kfunc(id))
+}
+
+/// As [`verified`], plus the resolved call table the verifier would have built.
+///
+/// `sites` is `(insn_index, id, addr)`; the context is [`Context::Atomic`],
+/// which is the only one whose shim uses the uniform `u64` ABI. Kept sorted by
+/// index, because `resolve_call` binary-searches — an unsorted table is a
+/// malformed `VerifiedProgram`, not an input the emitter must tolerate.
+pub(crate) fn verified_calling(items: &[Decoded], sites: &[(u32, i32, usize)]) -> VerifiedProgram {
+    let mut v = verified(items);
+    v.kfunc_calls = sites
+        .iter()
+        .map(|&(insn_index, id, addr)| KfuncCallSite {
+            insn_index,
+            id,
+            addr,
+            context: Context::Atomic,
+        })
+        .collect();
+    v.kfunc_calls.sort_by_key(|c| c.insn_index);
+    v
 }
 
 pub(crate) const EXIT: Decoded = Decoded::Exit;
@@ -150,87 +177,82 @@ pub(crate) fn verified_arena(
 }
 
 #[test]
-fn an_arena_program_is_refused_at_the_call_that_produces_the_handle() {
-    // Lifting `jit_glue` gate 2 on its own compiles **nothing**, and this is
-    // the test that says so rather than leaving it to be discovered.
+fn an_arena_program_reaches_its_arena_access_once_the_call_is_emitted() {
+    // This test has now asserted three different things, and the sequence is
+    // the point.
     //
     // `PtrClass::Arena` has exactly one producer in the verifier
     // (`fixpoint.rs`'s `value_of`, reached from a kfunc's return descriptor),
-    // so every program that touches an arena contains a `call`. No backend
-    // emits `Decoded::Call`, so an arena program is refused *there* — at
-    // instruction 0 — before any arena-specific lowering is reached. A
-    // differential test written against a lifted gate 2 would therefore
-    // compare the interpreter with itself and pass for free.
-    let prog = verified_arena(
-        &[
-            Decoded::Call(narf_bpf_isa::CallTarget::Kfunc(1)),
-            Decoded::Store {
-                size: Size::Dw,
-                dst: r(0),
-                off: 0,
-                src: Source::Imm(1),
-            },
-            mov(0, 0),
-            EXIT,
-        ],
-        1,
-        None,
-    );
-    assert!(
-        matches!(compile(&prog), Err(JitError::Unsupported { at: 0, .. })),
-        "the call, not the arena access, is what an arena program hits first"
-    );
-}
-
-#[test]
-fn the_emitter_discards_the_verifiers_arena_fault_sites() {
-    // Why gate 3 has to stay closed for arena programs, stated as a property
-    // of the emitter instead of as a comment.
+    // so every program that touches an arena contains a `call`. While no
+    // backend emitted `Decoded::Call`, an arena program was refused *there* —
+    // at instruction 0 — before any arena lowering was reached, which is why
+    // lifting `jit_glue` gate 2 alone would have compiled nothing.
     //
-    // Handed a program the verifier flagged as needing exception-table
-    // coverage, the emitter returns an **empty** `FaultTable`. `jit_glue`
-    // registers exactly what codegen hands it, so a lifted gate 3 would seal
-    // executable text with no entry for an instruction the verifier said can
-    // fault — and `bpf_extable`'s contract makes an unregistered fault fatal by
-    // design.
-    let prog = verified_arena(
-        &[
-            Decoded::Store {
-                size: Size::Dw,
-                dst: r(1),
-                off: 8,
-                src: Source::Imm(1),
-            },
-            mov(0, 0),
-            EXIT,
-        ],
-        0,
-        None,
-    );
-    let c = compile(&prog).expect("the store alone is an ordinary encoding");
+    // Then the call landed and this asserted the next failure along: the store
+    // lowered to `mov qword [rax], 1`, a **bare dereference of the handle**,
+    // which with `ARENA_BASE_HANDLE` at 4096 is a near-null kernel write. Gate 2
+    // was the only thing standing between an arena program and it.
+    //
+    // Now the lowering exists, and this pins it: the slot base is reloaded, the
+    // handle is zero-extended into the index, and the access is
+    // `[r11 + rcx]` — with no displacement, because the emitter folds `off16`
+    // into `rcx` so the arena-fault epilogue can return the handle.
+    let prog = {
+        let mut v = verified_arena(
+            &[
+                kcall(1),
+                Decoded::Store {
+                    size: Size::Dw,
+                    dst: r(0),
+                    off: 0,
+                    src: Source::Imm(1),
+                },
+                mov(0, 0),
+                EXIT,
+            ],
+            1,
+            None,
+        );
+        v.kfunc_calls = verified_calling(&[], &[(0, 1, SHIM)]).kfunc_calls;
+        v
+    };
+    let c = compile(&prog).expect("the call is emitted now, and the store always was");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    // 19 bytes of call sequence, then the arena store.
     assert_eq!(
-        prog.fault_sites.len(),
-        1,
-        "premise: the verifier recorded a site to cover"
+        &body[19..33],
+        &[
+            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]  — the parked slot base
+            0x89, 0xC1, // mov ecx, eax    — zero-extend the handle
+            // 49 C7 04 0B 01 00 00 00 — mov qword [r11 + rcx*1], 1
+            0x49, 0xC7, 0x04, 0x0B, 0x01, 0x00, 0x00, 0x00,
+        ],
+        "an arena store must lower to the slot-relative shape, never a bare \
+         dereference of the handle"
     );
+    // …and it is covered, resuming at the arena epilogue rather than at the
+    // next instruction.
+    assert_eq!(c.faults.0.len(), 1, "the arena store must be a fault site");
+    let f = c.faults.0[0];
+    assert!(f.arena);
+    assert_eq!(f.dst_host_reg, None, "a store has no destination to zero");
     assert!(
-        c.faults.0.is_empty(),
-        "codegen must be taught to record arena fault sites before gate 3 lifts"
+        f.fixup_off > f.fault_off,
+        "the fixup must be the arena epilogue, which follows the body"
     );
 }
 
 #[test]
-fn an_arena_access_lowers_to_a_bare_dereference_of_the_handle() {
-    // Why gate 2 has to stay closed, as bytes rather than as prose.
+fn the_arena_fixup_is_the_epilogue_and_not_the_next_instruction() {
+    // The property that separates this from Linux's `ex_handler_bpf`, as an
+    // offset rather than as prose: a probe read zeroes and continues, an arena
+    // fault *stops*. Resuming at the next instruction would make an
+    // out-of-bounds arena access return a value natively and
+    // `Trap::ArenaOutOfBounds` interpreted — the divergence the differential
+    // harness compares trap discriminants to catch.
     //
-    // An in-program arena pointer is a *slot-relative handle*, so the address
-    // is `slot_base + handle + off16` — Linux's `[r12 + reg + off]` shape. The
-    // emitter has no pinned base register, so the same instruction lowers to
-    // `[rsi + 8]`: the handle dereferenced as if it were an absolute address.
-    // With `ARENA_BASE_HANDLE` at 4096 that is a near-null kernel write.
-    //
-    // The golden bytes are the point. When the arena lowering lands this test
-    // goes red, and its replacement must show a base register in the encoding.
+    // Mutation: set `fixup_off` to the instruction after the access and this
+    // goes red, as does `smoke_bpf_jit_diff_arena_out_of_bounds_traps_like_the_interpreter`.
     let prog = verified_arena(
         &[
             Decoded::Store {
@@ -245,15 +267,185 @@ fn an_arena_access_lowers_to_a_bare_dereference_of_the_handle() {
         0,
         None,
     );
-    let c = compile(&prog).expect("compiles today");
+    let c = compile(&prog).expect("the arena store is emitted now");
+    assert_eq!(c.faults.0.len(), 1);
+    let f = c.faults.0[0];
+    // The last instruction of the image is the arena epilogue's `ret`, and the
+    // epilogue is `mov rax, rcx; mov rdx, 2; RESTORE`.
+    let arena_epi = c.code.len() - (3 + 10 + RESTORE.len());
+    assert_eq!(
+        f.fixup_off as usize, arena_epi,
+        "the fixup must name the arena epilogue"
+    );
+    assert_eq!(
+        &c.code[arena_epi..arena_epi + 13],
+        &[
+            0x48, 0x89, 0xC8, // mov rax, rcx  — the offending handle
+            0x48, 0xBA, 0x02, 0, 0, 0, 0, 0, 0, 0, // mov rdx, 2 (ARENA_FAULT)
+        ],
+        "the arena epilogue must return the handle and the arena status"
+    );
+}
+
+#[test]
+fn an_arena_access_lowers_to_the_slot_relative_shape() {
+    // The counterpart of the test above, in bytes, for a *non*-zero
+    // displacement — which is the case that shows the fold into `rcx`.
+    //
+    // An in-program arena pointer is a slot-relative handle, so the address is
+    // `slot_base + handle + off16`. `off16` could have stayed in the ModRM
+    // displacement; folding it into the index costs one instruction and is what
+    // lets the arena-fault epilogue name the handle the interpreter would have
+    // computed, rather than the handle-minus-displacement.
+    let prog = verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(2),
+                off: 8,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..21],
+        &[
+            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x89, 0xF1, // mov ecx, esi   — R2 is rsi; zero-extended
+            0x48, 0x81, 0xC1, 0x08, 0x00, 0x00, 0x00, // add rcx, 8
+            // 49 C7 04 0B 01 00 00 00 — mov qword [r11 + rcx*1], 1
+            0x49, 0xC7, 0x04, 0x0B, 0x01, 0x00, 0x00, 0x00,
+        ],
+        "the displacement must be folded into the index register"
+    );
+}
+
+#[test]
+fn a_non_arena_access_keeps_the_plain_shape() {
+    // The other half: lifting gate 2 must not give *every* access the arena
+    // shape. Same instruction, same registers, no fault site — and it lowers to
+    // the ordinary `[base + disp]` with no slot base in sight.
+    //
+    // Without this, an emitter that ignored `arena_access_map` and always took
+    // the arena path would pass every test above.
+    let prog = verified(&[
+        Decoded::Store {
+            size: Size::Dw,
+            dst: r(2),
+            off: 8,
+            src: Source::Imm(1),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
     let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
     assert_eq!(
         &body[..8],
-        // 48 C7 46 08 01 00 00 00 — mov qword [rsi+8], 1. R2 maps to rsi; no
-        // index register, no arena base.
+        // 48 C7 46 08 01 00 00 00 — mov qword [rsi+8], 1
         &[0x48, 0xC7, 0x46, 0x08, 0x01, 0x00, 0x00, 0x00],
-        "an arena store must not lower to a bare dereference of the handle"
+        "a non-arena store must keep the plain addressing shape"
     );
+    assert!(
+        c.faults.0.is_empty(),
+        "a non-arena access is not a fault site"
+    );
+}
+
+#[test]
+fn an_arena_load_and_a_register_store_take_the_same_shape() {
+    // The two remaining arena forms, so the golden coverage is the whole set
+    // rather than the one form the smoke tests happen to use.
+    let load = verified_arena(
+        &[
+            Decoded::Load {
+                size: Size::Dw,
+                sign_extend: false,
+                dst: r(3),
+                src: r(2),
+                off: 0,
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        Some(3),
+    );
+    let c = compile(&load).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..9],
+        &[
+            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x89, 0xF1, // mov ecx, esi
+            0x49, 0x8B, 0x14, // mov rdx, [r11 + rcx*1] — R3 is rdx
+        ],
+        "an arena load must take the slot-relative shape"
+    );
+    assert_eq!(body[9], 0x0B, "SIB: index rcx, base r11");
+    // The destination is *not* recorded for zeroing: an arena fault stops the
+    // program, so nothing would ever read it. The verifier's `dst_reg` is
+    // deliberately dropped here.
+    assert_eq!(c.faults.0.len(), 1);
+    assert_eq!(c.faults.0[0].dst_host_reg, None);
+
+    let store = verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(2),
+                off: 0,
+                src: Source::Reg(r(3)),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&store).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..10],
+        &[
+            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x89, 0xF1, // mov ecx, esi
+            0x49, 0x89, 0x14, 0x0B, // mov [r11 + rcx*1], rdx
+        ],
+        "an arena register store must take the slot-relative shape"
+    );
+}
+
+#[test]
+fn an_arena_access_the_emitter_cannot_shape_is_refused() {
+    // Fail-closed, and specifically *not* by falling through to the plain
+    // lowering. A word-sized arena store has no arena encoding here, and the
+    // wrong answer would be `mov dword [rsi+8], 1` — a bare dereference of a
+    // handle, which is the whole hazard.
+    let prog = verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::W,
+                dst: r(2),
+                off: 8,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    assert!(matches!(
+        compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
 }
 
 /// The prologue, hand-derived from the Intel SDM.
@@ -268,6 +460,10 @@ fn an_arena_access_lowers_to_a_bare_dereference_of_the_handle() {
 ///
 /// `r12` holds the fuel counter and is likewise callee-saved. `mov r12, rdx`
 /// runs before anything can write rdx, which R3 maps to.
+///
+/// `mov [rsp], rcx` parks the arena slot base in the alignment padding, and
+/// likewise has to run before anything writes `rcx` — a variable shift and a
+/// kfunc call both do.
 const PROLOGUE: &[u8] = &[
     0x55, // push rbp
     0x53, // push rbx
@@ -275,6 +471,8 @@ const PROLOGUE: &[u8] = &[
     0x41, 0x55, // push r13
     0x41, 0x56, // push r14
     0x41, 0x57, // push r15
+    0x48, 0x83, 0xEC, 0x08, // sub rsp, 8     (SysV alignment; see STACK_ALIGN_PAD)
+    0x48, 0x89, 0x0C, 0x24, // mov [rsp], rcx (the arena slot base; ARENA_BASE_SLOT)
     0x49, 0x89, 0xD4, // mov r12, rdx   (fuel)
     0x48, 0x89, 0xFD, // mov rbp, rdi
     0x48, 0x89, 0xF7, // mov rdi, rsi
@@ -284,9 +482,10 @@ const PROLOGUE: &[u8] = &[
 /// out-of-fuel epilogue. Thirteen bytes; the immediate and displacement vary.
 const FUEL_BURN_LEN: usize = 13;
 
-/// `pop r15; pop r14; pop r13; pop rbx; ret`
-/// Pops and `ret`, shared by both epilogues.
+/// `add rsp, 8; pop r15; pop r14; pop r13; pop r12; pop rbx; pop rbp; ret`
+/// The alignment release, the pops, and `ret`, shared by both epilogues.
 const RESTORE: &[u8] = &[
+    0x48, 0x83, 0xC4, 0x08, // add rsp, 8
     0x41, 0x5F, // pop r15
     0x41, 0x5E, // pop r14
     0x41, 0x5D, // pop r13
@@ -300,6 +499,7 @@ const RESTORE: &[u8] = &[
 /// [`RESTORE`] but sets the flag instead of clearing it.
 const EPILOGUE: &[u8] = &[
     0x48, 0x31, 0xD2, // xor rdx, rdx  — the exhaustion flag, cleared
+    0x48, 0x83, 0xC4, 0x08, // add rsp, 8
     0x41, 0x5F, // pop r15
     0x41, 0x5E, // pop r14
     0x41, 0x5D, // pop r13
@@ -668,5 +868,257 @@ fn golden_r13_base_needs_a_displacement_byte() {
             EXIT,
         ],
         &[0x49, 0x8B, 0x45, 0x00, 0xE9, 0, 0, 0, 0],
+    );
+}
+
+// ── kfunc calls ─────────────────────────────────────────────────────
+//
+// The emitter's only entry into kernel code. Golden bytes rather than
+// execution, as everywhere in this file: the in-kernel differential smoke in
+// `bpf/src/tests.rs` is what proves the sequence *runs*, and it can only be
+// trusted to prove that if the bytes here are the ones intended.
+
+/// A shim address with a bit set in every byte, so a truncated or
+/// wrong-endian materialisation cannot look right by accident.
+const SHIM: usize = 0xDEAD_BEEF_1234_5678;
+
+#[test]
+fn golden_kfunc_call_sequence() {
+    // R4 → r8 and R5 → r9 in the BPF map; SysV wants arg3 in rcx and arg4 in
+    // r8. So `rcx := r8` must run **first** — the other order overwrites R4
+    // with R5 and passes it twice. That is the bug this golden exists for; the
+    // rest of the sequence is uncontroversial.
+    assert_call_body(
+        &[kcall(7), EXIT],
+        &[(0, 7, SHIM)],
+        &[
+            0x4C, 0x89, 0xC1, // mov rcx, r8        SysV arg3 := BPF R4
+            0x4D, 0x89, 0xC8, // mov r8, r9         SysV arg4 := BPF R5
+            0x49, 0xBB, 0x78, 0x56, 0x34, 0x12, 0xEF, 0xBE, 0xAD, 0xDE, // movabs r11, SHIM
+            0x41, 0xFF, 0xD3, // call r11
+            0xE9, 0, 0, 0, 0, // jmp -> epilogue
+        ],
+    );
+}
+
+/// `assert_body` compiles through [`verified`], which has no call table. The
+/// call goldens need one, so they go through this instead.
+#[track_caller]
+fn assert_call_body(items: &[Decoded], sites: &[(u32, i32, usize)], want: &[u8]) {
+    let c = compile(&verified_calling(items, sites)).expect("should compile");
+    let rest = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    let end = rest
+        .windows(EPILOGUE.len())
+        .position(|w| w == EPILOGUE)
+        .expect("the normal epilogue must appear after the body");
+    assert_eq!(
+        &rest[..end],
+        want,
+        "\n got {:02X?}\nwant {want:02X?}",
+        &rest[..end]
+    );
+}
+
+#[test]
+fn a_call_the_verifier_never_reached_is_refused_rather_than_guessed() {
+    // The verifier's table covers *reachable* call sites only — see
+    // `narf_bpf_verifier`'s
+    // `an_unreachable_call_is_not_recorded_so_the_emitter_must_fail_closed`.
+    // An emitter walking instructions linearly therefore meets calls with no
+    // entry, and the only safe answer is to refuse the whole program: there is
+    // no address to emit and no way to tell "dead code" from "the table is
+    // wrong" from inside this crate.
+    let prog = verified(&[kcall(7), EXIT]);
+    assert!(prog.kfunc_calls.is_empty(), "premise: no table");
+    assert!(
+        matches!(compile(&prog), Err(JitError::Unsupported { at: 0, .. })),
+        "an unresolved call must not compile"
+    );
+
+    // The harder half: a **non-empty** table with nothing at this index, and
+    // the same kfunc at another one. An emitter that fell back to "whatever
+    // entry is nearest" would pass the empty case and this is where it would
+    // be caught — the ids match, so nothing downstream of the index lookup can
+    // tell the two sites apart.
+    let prog = verified_calling(&[kcall(2), kcall(2), EXIT], &[(1, 2, SHIM)]);
+    assert_eq!(prog.kfunc_calls.len(), 1, "premise: only one site resolved");
+    assert!(
+        matches!(compile(&prog), Err(JitError::Unsupported { at: 0, .. })),
+        "a call at an index the table does not cover must not borrow another site's address"
+    );
+}
+
+#[test]
+fn a_call_site_that_names_a_different_kfunc_is_refused() {
+    // Belt to the verifier's brace. The table is built by resolving the same
+    // immediate this instruction carries, so a disagreement is impossible
+    // today — which is exactly why it must fail closed rather than pick one:
+    // if the two ever *do* disagree, whichever the emitter trusts is a guess,
+    // and the wrong guess is an indirect call to an arbitrary kfunc.
+    let prog = verified_calling(&[kcall(7), EXIT], &[(0, 9, SHIM)]);
+    assert!(matches!(
+        compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
+}
+
+#[test]
+fn a_sleepable_kfuncs_shim_is_never_entered_from_native_code() {
+    // `KfuncShim::Sleepable` is `fn(..) -> Pin<Box<dyn Future>>`, not
+    // `extern "C" fn(..) -> u64`. Calling it through the uniform ABI would
+    // reinterpret a boxed future as the program's R0 and leak it, and no
+    // amount of correct register shuffling would help.
+    let mut prog = verified_calling(&[kcall(7), EXIT], &[(0, 7, SHIM)]);
+    prog.kfunc_calls[0].context = Context::Sleepable;
+    assert!(matches!(
+        compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
+}
+
+#[test]
+fn a_null_shim_address_is_refused() {
+    let prog = verified_calling(&[kcall(7), EXIT], &[(0, 7, 0)]);
+    assert!(matches!(
+        compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
+}
+
+#[test]
+fn a_subprogram_call_is_still_unsupported() {
+    // Kfunc calls landing does not make BPF-to-BPF calls land. A subprogram
+    // call needs the frame push the interpreter does in `push_frame` — saving
+    // R6..R9, moving the frame base, and a return path — and emitting a bare
+    // `call` for one would run the callee on the *caller's* BPF frame.
+    let prog = verified(&[Decoded::Call(CallTarget::Subprog(1)), mov(0, 0), EXIT]);
+    assert!(matches!(
+        compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
+}
+
+#[test]
+fn each_call_site_gets_its_own_address() {
+    // Resolution is per site, so two calls to two kfuncs must materialise two
+    // different addresses. A backend that resolved by looking up the *first*
+    // entry, or by id-with-a-linear-scan-of-a-stale-table, passes the
+    // single-call golden and fails here.
+    assert_call_body(
+        &[kcall(1), kcall(2), EXIT],
+        &[(0, 1, 0x1111_2222_3333_4444), (1, 2, 0x5555_6666_7777_8888)],
+        &[
+            0x4C, 0x89, 0xC1, 0x4D, 0x89, 0xC8, //
+            0x49, 0xBB, 0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11, 0x11, //
+            0x41, 0xFF, 0xD3, //
+            0x4C, 0x89, 0xC1, 0x4D, 0x89, 0xC8, //
+            0x49, 0xBB, 0x88, 0x88, 0x77, 0x77, 0x66, 0x66, 0x55, 0x55, //
+            0x41, 0xFF, 0xD3, //
+            0xE9, 0, 0, 0, 0,
+        ],
+    );
+}
+
+// ── stack discipline ────────────────────────────────────────────────
+
+/// How far a straight-line run of bytes moves `rsp`.
+///
+/// Deliberately a *decoder* rather than a restatement of the constants the
+/// emitter uses: the question is what the emitted image does, and a test that
+/// recomputed `6 * 8 + STACK_ALIGN_PAD` would agree with any value of either.
+/// Panics on an unrecognised encoding, so a prologue that grows a new shape
+/// cannot silently fall out of the accounting.
+fn rsp_delta(bytes: &[u8]) -> i64 {
+    let mut delta = 0i64;
+    let mut k = 0usize;
+    while k < bytes.len() {
+        let b = bytes[k];
+        match b {
+            // push r8..r15 / pop r8..r15 — REX.B then the short form.
+            0x41 if (0x50..0x58).contains(&bytes[k + 1]) => {
+                delta -= 8;
+                k += 2;
+            }
+            0x41 if (0x58..0x60).contains(&bytes[k + 1]) => {
+                delta += 8;
+                k += 2;
+            }
+            0x50..=0x57 => {
+                delta -= 8;
+                k += 1;
+            }
+            0x58..=0x5F => {
+                delta += 8;
+                k += 1;
+            }
+            // 48 83 /digit rsp, imm8 — the only rsp arithmetic emitted.
+            0x48 if bytes[k + 1] == 0x83 && bytes[k + 2] == 0xEC => {
+                delta -= i64::from(bytes[k + 3]);
+                k += 4;
+            }
+            0x48 if bytes[k + 1] == 0x83 && bytes[k + 2] == 0xC4 => {
+                delta += i64::from(bytes[k + 3]);
+                k += 4;
+            }
+            // REX + 89 /r with mod=00, rm=100 — a store *through* rsp, which is
+            // the arena-base park (`mov [rsp], rcx`). It reads rsp and does not
+            // move it, so it contributes nothing to the delta; the SIB byte is
+            // what makes it four bytes long. Matched before the register-move
+            // arm below, which would otherwise mistake the ModRM for one naming
+            // rsp as a destination.
+            0x48..=0x4F
+                if bytes[k + 1] == 0x89
+                    && bytes[k + 2] & 0xC0 == 0x00
+                    && bytes[k + 2] & 7 == 4
+                    && bytes[k + 3] == 0x24 =>
+            {
+                k += 4;
+            }
+            // REX + 89 /r — a register move. Cannot touch rsp: rsp is r/m
+            // field 4, and `modrm_rr` puts the destination there.
+            0x48..=0x4F if bytes[k + 1] == 0x89 => {
+                // rsp is r/m field 4 *with REX.B clear*; with it set the same
+                // field is r12, which the prologue really does write.
+                assert!(
+                    !(bytes[k + 2] & 7 == 4 && b & 1 == 0),
+                    "a mov wrote rsp; the accounting above is wrong"
+                );
+                k += 3;
+            }
+            // 48 31 /r — `xor rdx, rdx` in the normal epilogue.
+            0x48 if bytes[k + 1] == 0x31 => k += 3,
+            0xC3 => k += 1, // ret
+            _ => panic!("rsp_delta cannot decode {b:02X} at {k} in {bytes:02X?}"),
+        }
+    }
+    delta
+}
+
+#[test]
+fn the_prologue_leaves_the_stack_aligned_for_a_sysv_call() {
+    // SysV requires `rsp % 16 == 0` at the instant a `call` executes, so a
+    // function is entered at 8. This image is such a function, and its body
+    // contains `call`s now.
+    //
+    // Six pushes move `rsp` by 48, which is `0 mod 16` and therefore leaves the
+    // entry residue untouched — a note this work started from claimed "+48"
+    // fixed the alignment, and it does nothing at all. The residue is the whole
+    // question, so it is computed here from the emitted bytes.
+    assert_eq!(
+        (8 + rsp_delta(PROLOGUE)).rem_euclid(16),
+        0,
+        "a kfunc would be entered with SysV's alignment inverted"
+    );
+}
+
+#[test]
+fn the_epilogue_releases_exactly_what_the_prologue_claimed() {
+    // The other half, and the one whose failure is unmissable: an imbalance
+    // makes `ret` pop something that is not the return address. Stated as a
+    // sum over the two sequences so neither can be edited alone.
+    assert_eq!(
+        rsp_delta(PROLOGUE) + rsp_delta(RESTORE),
+        0,
+        "prologue and epilogue disagree about the frame size"
     );
 }

@@ -172,8 +172,14 @@ impl BpfProg {
     /// against exactly this slice and traps
     /// [`crate::interp::Trap::ArenaOutOfBounds`] otherwise, and the slot's tail
     /// guard means even an unchecked access could not reach another program's
-    /// arenas. It is also why `crate::jit_glue` still refuses arena programs —
-    /// native code performs neither check.
+    /// arenas.
+    ///
+    /// Native code performs neither check and reaches the same verdict a
+    /// different way: the access is lowered slot-relative, the unmapped pages
+    /// the guards and the arena's own extent leave behind make a wild handle
+    /// *fault*, and the exception table turns that fault into the same trap.
+    /// The group's **length** is what makes the two agree, which is why it is
+    /// passed to `crate::jit_glue::try_compile` — see gate 2 there.
     ///
     /// # Errors
     ///
@@ -235,7 +241,13 @@ impl BpfProg {
                         limit: MAX_STACK_BYTES,
                     });
                 }
-                jit = crate::jit_glue::try_compile(&v, true).ok();
+                // The arena count is gate 2's input and the verifier does not
+                // have it — it bounds a displacement against a fixed window,
+                // never against this program's extent. Taken from the very
+                // group the program will run against, so the number cannot
+                // describe a different one.
+                let arena_count = arenas.as_ref().map_or(0, |g| g.arenas().len());
+                jit = crate::jit_glue::try_compile(&v, true, arena_count).ok();
                 subprogs = v.subprogs;
                 v.max_stack_bytes.max(1)
             }
@@ -372,14 +384,22 @@ impl BpfProg {
     /// counter, so depth N+1 loses its invocation rather than corrupting the
     /// frame below it.
     pub fn run_atomic(&self, ctx: [u64; MAX_CTX_WORDS], ctx_len: usize) -> Option<Outcome> {
-        // The arena test is the belt to `jit_glue`'s gate-2 brace. That gate
-        // already means `jit` is `None` for any program the verifier saw touch an
-        // arena, so this can only fire if the two ever disagree — and the failure
-        // mode if they do is native code dereferencing a handle with no bound
-        // whatsoever, which is worth one comparison per invocation to make
-        // structurally impossible rather than merely currently true.
-        if self.jit.is_some() && self.arenas().is_empty() {
-            return self.run_atomic_native(ctx, ctx_len);
+        if let Some(image) = self.jit.as_ref() {
+            // The belt to `jit_glue`'s gate-2 brace, in the shape the lifted gate
+            // needs. It used to read "native only if the program has no arena",
+            // which the gate already guaranteed; now the gate admits exactly one
+            // arena, so the belt is that an image which *dereferences* the slot
+            // base is only ever entered with the slot base it was compiled for.
+            //
+            // Tested against the image rather than against `uses_arena`, because
+            // it is the emitted code that will do the dereferencing, and one
+            // comparison per invocation makes the failure mode — native code
+            // indexing off a zero base — structurally impossible rather than
+            // merely currently absent.
+            let slot_base = self.arenas.as_ref().map_or(0, |g| g.slot_base());
+            if !image.uses_arena() || (slot_base != 0 && self.arenas().len() == 1) {
+                return self.run_atomic_native(ctx, ctx_len, slot_base);
+            }
         }
         self.run_atomic_interpreted(ctx, ctx_len)
     }
@@ -443,11 +463,23 @@ impl BpfProg {
     ///
     /// Only reachable when [`crate::jit_glue::try_compile`] accepted the
     /// program, which means: the verifier proved it (not the `provisional`
-    /// path), it uses no arena, it has no faulting accesses, it contains no
-    /// back-edge, and it dereferences only R10 and R1. Those five gates are why
-    /// this can hand control to generated code without the interpreter's
-    /// per-access bounds checks.
-    fn run_atomic_native(&self, ctx: [u64; MAX_CTX_WORDS], ctx_len: usize) -> Option<Outcome> {
+    /// path), it touches at most one arena, it has no *non-arena* faulting
+    /// accesses, and every non-arena dereference is through the frame — or the
+    /// frame and the context, if it contains no `call`. Those gates are why this
+    /// can hand control to generated code without the interpreter's per-access
+    /// bounds checks. ("No back-edge" was lifted when the emitter learned to
+    /// burn fuel per block; "no arena" when it learned the slot-relative access
+    /// shape and the exception table behind it.)
+    ///
+    /// `slot_base` is the program's arena slot, or zero when it has none. The
+    /// caller establishes that an image containing arena accesses is never
+    /// entered with a zero — see [`BpfProg::run_atomic`].
+    fn run_atomic_native(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+        slot_base: u64,
+    ) -> Option<Outcome> {
         if self.context != Context::Atomic {
             return None;
         }
@@ -485,24 +517,51 @@ impl BpfProg {
         let entry = image.entry();
         // SAFETY: `entry` points at sealed, executable text emitted for this
         // program, entered with the ABI its prologue expects — `top` is the
-        // frame's highest address (R10) and `ctx.as_ptr()` a live `[u64; 4]`
-        // (R1). `ctx` outlives the call; `frame` is held across it so the
-        // memory R10 addresses stays leased. The five gates above are what make
-        // the absence of runtime bounds checks sound.
-        let packed = unsafe { entry(top, ctx.as_ptr() as u64, self.initial_fuel) };
-        // SysV's rax:rdx pair: low half is R0, high half is the exhaustion
-        // flag. Reported out of band because no in-band sentinel works — the
-        // obvious one, u64::MAX, is exactly what `r0 = -1; exit` returns.
+        // frame's highest address (R10), `ctx.as_ptr()` a live `[u64; 4]` (R1),
+        // and `slot_base` this program's own arena slot, which the caller has
+        // established is non-zero whenever the image dereferences it. `ctx`
+        // outlives the call; `frame` is held across it so the memory R10
+        // addresses stays leased. The gates above are what make the absence of
+        // runtime bounds checks sound; for arena accesses specifically it is the
+        // slot's guards plus the exception table registered before the text was
+        // sealed.
+        let packed = unsafe { entry(top, ctx.as_ptr() as u64, self.initial_fuel, slot_base) };
+        // SysV's rax:rdx pair: low half is R0 (or, on an arena fault, the
+        // offending handle), high half a status code. Reported out of band
+        // because no in-band sentinel works — the obvious one, u64::MAX, is
+        // exactly what `r0 = -1; exit` returns.
         let value = packed as u64;
-        let exhausted = (packed >> 64) as u64 != 0;
-        let outcome = if exhausted {
+        let outcome = match (packed >> 64) as u64 {
+            narf_bpf_jit::status::OK => Outcome::Returned(value),
             // Matches the interpreter: exhaustion stops the program with a
             // diagnostic rather than a fault, and the return value is
             // meaningless (§4.9). `at` is not recoverable from native code
             // without a side table, so it names the entry.
-            Outcome::Trapped(crate::interp::Trap::OutOfFuel { at: 0 })
-        } else {
-            Outcome::Returned(value)
+            narf_bpf_jit::status::OUT_OF_FUEL => {
+                Outcome::Trapped(crate::interp::Trap::OutOfFuel { at: 0 })
+            }
+            // An arena access faulted and the exception table recovered it into
+            // the arena epilogue. The same trap the interpreter raises for the
+            // same handle — deliberately not a zeroed register and a resumed
+            // program, which would make the two paths disagree. `at` and `len`
+            // are not recoverable without a side table; the handle is, because
+            // the emitter folds the displacement into the index register so the
+            // epilogue can return it.
+            narf_bpf_jit::status::ARENA_FAULT => {
+                Outcome::Trapped(crate::interp::Trap::ArenaOutOfBounds {
+                    at: 0,
+                    handle: value,
+                    len: 0,
+                })
+            }
+            // Unreachable: the emitters return one of the three above and
+            // nothing else. Treated as a stop rather than a value, because the
+            // one thing that must not happen is a status nobody understands
+            // being read as a successful return.
+            _ => Outcome::Trapped(crate::interp::Trap::Unsupported {
+                at: 0,
+                what: "compiled program returned an unknown status",
+            }),
         };
         self.record(outcome);
         Some(outcome)
