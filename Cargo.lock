@@ -1534,6 +1534,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-efi",
  "narf-init",
  "narf-input",
  "narf-interrupts",

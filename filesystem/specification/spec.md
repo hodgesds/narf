@@ -571,6 +571,23 @@ fabricated measurements.
 The supported surface and known partial projections are tracked in
 `filesystem/PROCFS_LINUX_COMPAT_AUDIT.md`.
 
+Efivarfs exposes firmware variables as
+`VariableName-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. Each regular file has
+mode 0644 and its byte stream begins with the little-endian four-byte EFI
+attribute word followed by the variable data. Complete-file writes preserve
+append and authenticated-write attribute bits and are serialized with the
+firmware backend. Directory enumeration, create, unlink, `uid=`/`gid=`,
+`QueryVariableInfo`-backed `statfs`, stable inode identities, GUID
+case-insensitive lookup, and Linux's default-immutable protection for unknown
+variables are supported. `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` expose and change
+`FS_IMMUTABLE_FL`.
+
+An efivarfs mount is rejected when EFI Runtime Services and their persistent
+memory mappings were not installed by the boot path. NARF never substitutes a
+volatile in-memory store for firmware persistence. The audited behavior and
+the boot/runtime-service dependency are tracked in
+`filesystem/EFIVARFS_LINUX_COMPAT_AUDIT.md`.
+
 ### 3.10 Overlay filesystem compatibility
 
 `OverlayFs::new(name, upper, lowers)` constructs a writable Linux-style
