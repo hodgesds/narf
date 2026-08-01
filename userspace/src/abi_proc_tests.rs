@@ -1001,6 +1001,29 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_setns_neg);
 #[cfg(feature = "container")]
 fn smoke_abi_proc_namespace_open_mints_setns_fd() -> TestResult {
     with_setup(|| {
+        // TASK_INFO / CURRENT_PID / LIST_PIDS. `procfs`'s hooks start at 0 and
+        // are wired for a real boot by `cross_crate_init::install_all_hooks`,
+        // which a kernel-test image never reaches — so in this build they are
+        // installed only as a side effect of whichever *other* smoke happened
+        // to run first (there are five such donors, in `abi_fsx2_tests.rs` and
+        // `abi_proc2_tests.rs`, none of which restores them).
+        //
+        // Without them `task_info()` returns `None`, so `ProcRootDir::
+        // lookup_dir`'s liveness gate rejects `/proc/<pid>` and the O_PATH open
+        // below is ENOENT. That made this test's verdict a function of
+        // `kernel_test_in!` registration order — which is *link* order, so
+        // linking any unrelated module could flip it. It did: adding a BPF test
+        // module turned this red on aarch64 with the body untouched.
+        //
+        // Installing them here puts the fix on the causal path instead of
+        // relying on a donor. Idempotent, and safe against the hook-absence
+        // assertions elsewhere, which cover FD_PATH / EXE_PATH / CWD_PATH /
+        // ENVIRON only — never these three.
+        narf_filesystem::procfs::install_proc_hooks(
+            crate::handlers::proc_current_pid,
+            crate::handlers::proc_list_pids,
+            crate::handlers::proc_task_info,
+        );
         let path = b"/proc/self/ns/uts\0";
         let fd = match call_open(path.as_ptr() as u64, 0) {
             Some(fd) if fd >= 0 => fd as u32,
