@@ -1892,6 +1892,243 @@ fn smoke_bpf_jit_diff_trapping_program_agrees() -> TestResult {
     }
 }
 kernel_test_in!("bpf", smoke_bpf_jit_diff_trapping_program_agrees);
+
+// ── kfunc calls, natively ───────────────────────────────────────────
+//
+// The only place the emitted call sequence is *executed* against the
+// interpreter. The golden tests in `narf-bpf-jit` prove the bytes are the ones
+// intended; only this proves the intention was right — and only in-kernel,
+// because the subject is a real kfunc shim at a real address.
+//
+// Every case goes through `diff_case`, which refuses to compare unless the
+// subject actually compiled. That is not boilerplate here: before call emission
+// landed, *every* program below fell back to the interpreter, so a version of
+// these tests without that assertion would have passed on unmodified `main`.
+
+/// `r1..r5 = args; call narf_test_arg_mix; exit`.
+///
+/// Distinct values per register, because the failure mode being hunted is a
+/// *permutation* — R4 and R5 land in the two host registers that do not line up
+/// between the BPF and C ABIs on either architecture.
+fn arg_mix_prog(args: [i32; 5]) -> Vec<Decoded> {
+    let mut p: Vec<Decoded> = Vec::new();
+    for (k, v) in args.iter().enumerate() {
+        p.push(mov_imm((k + 1) as u8, *v));
+    }
+    p.push(call("narf_test_arg_mix"));
+    p.push(EXIT);
+    p
+}
+
+fn smoke_bpf_jit_diff_kfunc_argument_registers() -> TestResult {
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    for args in [
+        [1, 2, 3, 4, 5],
+        [5, 4, 3, 2, 1],
+        [0, -1, i32::MAX, i32::MIN, 0x5A5A_5A5A],
+        [11, 13, 17, 19, 23],
+        [-7, -11, -13, -17, -19],
+    ] {
+        match diff_case("kfunc_args", &arg_mix_prog(args), [0; 4]) {
+            Ok(()) => {}
+            Err(e) if core::ptr::eq(e, NO_BACKEND) => return TestResult::Skip(NO_BACKEND),
+            Err(e) => return TestResult::Fail(e),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_diff_kfunc_argument_registers);
+
+fn smoke_bpf_jit_kfunc_call_returns_the_shims_own_answer() -> TestResult {
+    // "Both paths agree" cannot distinguish "both are right" from "both call
+    // the same wrong kfunc", so this one pins the absolute value. The multipliers
+    // are `narf_test_arg_mix`'s, restated here on purpose: if that kfunc's body
+    // changes, this should go red and be re-derived rather than silently follow.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let args = [3i32, 5, 7, 11, 13];
+    let want = 3u64 + 5 * 3 + 7 * 5 + 11 * 7 + 13 * 11;
+    let Ok(p) = load("kfunc_val", asm(&arg_mix_prog(args)), Context::Atomic) else {
+        return TestResult::Fail("load rejected");
+    };
+    if !p.is_jited() {
+        return TestResult::Fail("the call did not compile; this would test nothing");
+    }
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Returned(v)) if v == want => TestResult::Pass,
+        Some(Outcome::Returned(_)) => TestResult::Fail("native call returned the wrong value"),
+        _ => TestResult::Fail("native call did not return"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_jit_kfunc_call_returns_the_shims_own_answer);
+
+fn smoke_bpf_jit_kfunc_call_keeps_the_c_stack_aligned() -> TestResult {
+    // SysV wants `rsp % 16 == 0` at the call and AAPCS64 wants `sp % 16 == 0`
+    // always. Neither is observable from BPF directly, so `narf_test_stack_residue`
+    // reports the shim's own stack residue and the two callers are compared:
+    // the interpreter enters it from ordinary Rust, where the rule holds by
+    // construction.
+    //
+    // This is the test that fails if the prologue's alignment step is removed —
+    // a misaligned SysV call otherwise shows up as a fault on an aligned SSE
+    // spill inside some unrelated callee, arbitrarily far away.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let prog = [call("narf_test_stack_residue"), EXIT];
+    match diff_case("kfunc_align", &prog, [0; 4]) {
+        Ok(()) => TestResult::Pass,
+        Err(e) if core::ptr::eq(e, NO_BACKEND) => TestResult::Skip(NO_BACKEND),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_jit_kfunc_call_keeps_the_c_stack_aligned);
+
+fn smoke_bpf_jit_diff_kfunc_call_preserves_callee_saved_state() -> TestResult {
+    // R6..R9 and R10 must survive a call — that is the BPF ABI, and it is what
+    // the register maps buy by putting them in callee-saved host registers.
+    // Checked by *observing* them afterwards rather than by reading the map:
+    // values go into R6..R9 and the frame, a call happens, and everything is
+    // summed into R0. A backend that mapped one of them to a caller-saved
+    // register passes every other test here and fails this one.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let mut p: Vec<Decoded> = alloc::vec![
+        mov_imm(6, 0x0011),
+        mov_imm(7, 0x0220),
+        mov_imm(8, 0x4400),
+        mov_imm(9, 0x8000),
+        st_imm(10, -8, 0x1234),
+    ];
+    p.extend_from_slice(&arg_mix_prog([1, 2, 3, 4, 5])[..6]); // args + the call
+    p.extend_from_slice(&[
+        alu_reg(AluOp::Add, 0, 6),
+        alu_reg(AluOp::Add, 0, 7),
+        alu_reg(AluOp::Add, 0, 8),
+        alu_reg(AluOp::Add, 0, 9),
+        ldx(1, 10, -8),
+        alu_reg(AluOp::Add, 0, 1),
+        EXIT,
+    ]);
+    match diff_case("kfunc_saved", &p, [0; 4]) {
+        Ok(()) => TestResult::Pass,
+        Err(e) if core::ptr::eq(e, NO_BACKEND) => TestResult::Skip(NO_BACKEND),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_jit_diff_kfunc_call_preserves_callee_saved_state
+);
+
+fn smoke_bpf_jit_diff_kfunc_call_in_a_loop_agrees_on_fuel() -> TestResult {
+    // The JIT charges fuel per basic block and the interpreter per instruction,
+    // and a call sits inside a block on one side and is its own charge on the
+    // other. A loop whose body contains a call is where those two accountings
+    // would diverge, and the harness compares the *kind* of stop, so
+    // "completed" versus "OutOfFuel" is a failure and not a near-miss.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    for (name, trips) in [("kfunc_loop_short", 64i32), ("kfunc_loop_long", 1_000_000)] {
+        let mut p: Vec<Decoded> = alloc::vec![mov_imm(6, 0)];
+        p.extend_from_slice(&arg_mix_prog([1, 2, 3, 4, 5])[..6]);
+        p.extend_from_slice(&[
+            alu_imm(AluOp::Add, 6, 1),
+            jne_imm(6, trips, -8),
+            mov_reg(0, 6),
+            EXIT,
+        ]);
+        match diff_case(name, &p, [0; 4]) {
+            Ok(()) => {}
+            Err(e) if core::ptr::eq(e, NO_BACKEND) => return TestResult::Skip(NO_BACKEND),
+            Err(e) => return TestResult::Fail(e),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_jit_diff_kfunc_call_in_a_loop_agrees_on_fuel
+);
+
+// ── negatives: what must *not* be compiled ──────────────────────────
+
+fn smoke_bpf_jit_refuses_a_sleepable_kfunc_call() -> TestResult {
+    // `narf_yield`'s shim is `fn(..) -> Pin<Box<dyn Future>>`, not
+    // `extern "C" fn(..) -> u64`. Entering it through the uniform ABI would
+    // reinterpret a boxed future as R0 and leak it, so the emitter must refuse
+    // on the *callee's* context — not on the program's, which here is
+    // `Sleepable` and permits the call perfectly legally.
+    let Ok(p) = load(
+        "sleepy_call",
+        asm(&[call("narf_yield"), EXIT]),
+        Context::Sleepable,
+    ) else {
+        return TestResult::Fail("load rejected");
+    };
+    if p.is_jited() {
+        return TestResult::Fail("a sleepable kfunc's shim was compiled into native code");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_refuses_a_sleepable_kfunc_call);
+
+fn smoke_bpf_jit_refuses_a_context_dereference_in_a_calling_program() -> TestResult {
+    // `jit_glue` gate 5. R1 is the context on entry and stays so as long as
+    // nothing can produce another pointer class — but a kfunc return can, and
+    // `r1 = r0` is an ordinary move the verifier will type-check happily
+    // against whatever class R0 holds. Native code would dereference R1
+    // verbatim, so a program containing *any* call loses R1 as a base.
+    //
+    // Both halves, because a gate that refuses everything is not a gate: the
+    // same load must still compile when there is no call to worry about.
+    let with_ctx_load = [ldx(0, 1, 0), EXIT];
+    let Ok(a) = load("ctx_nocall", asm(&with_ctx_load), Context::Atomic) else {
+        return TestResult::Fail("load rejected");
+    };
+    if !a.is_jited() && narf_bpf_jit::has_backend() {
+        return TestResult::Fail("a context load with no call must still compile");
+    }
+
+    let mut b_prog: Vec<Decoded> = alloc::vec![ldx(6, 1, 0)];
+    b_prog.extend_from_slice(&arg_mix_prog([1, 2, 3, 4, 5]));
+    let Ok(b) = load("ctx_call", asm(&b_prog), Context::Atomic) else {
+        return TestResult::Fail("load rejected");
+    };
+    if b.is_jited() {
+        return TestResult::Fail("a context dereference survived into a calling program");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_jit_refuses_a_context_dereference_in_a_calling_program
+);
+
+fn smoke_bpf_jit_refuses_a_subprogram_call() -> TestResult {
+    // Kfunc calls landing does not make BPF-to-BPF calls land: a subprogram
+    // call needs the frame push the interpreter does in `push_frame`, and a
+    // bare native `call` would run the callee on the caller's BPF frame.
+    let prog = [subprog_call(1), EXIT, mov_imm(0, 7), EXIT];
+    let Ok(p) = load("subcall", asm(&prog), Context::Atomic) else {
+        return TestResult::Fail("load rejected");
+    };
+    if p.is_jited() {
+        return TestResult::Fail("a subprogram call was compiled");
+    }
+    // …and it still runs, interpreted, which is the whole reason refusing is
+    // safe.
+    match p.run_atomic([0; 4], 4) {
+        Some(Outcome::Returned(7)) => TestResult::Pass,
+        _ => TestResult::Fail("the refused program did not run interpreted"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_jit_refuses_a_subprogram_call);
 // ════════════════════════════════════════════════════════════════════
 // Maps (`crate::map`).
 //

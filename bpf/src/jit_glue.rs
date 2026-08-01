@@ -22,8 +22,11 @@
 //!    window, so an arena access would lower to a bare dereference of a
 //!    32-bit-ish offset — `an_arena_access_lowers_to_a_bare_dereference_of_the_handle`
 //!    in `narf-bpf-jit` shows the actual bytes. See "Lifting gate 2" below,
-//!    which is where the analysis lives, because gate 2 is *not* the binding
-//!    constraint and lifting it alone changes nothing.
+//!    which is where the analysis lives. It used to add that gate 2 was *not*
+//!    the binding constraint and that lifting it alone would change nothing —
+//!    true while no backend emitted `Decoded::Call`, and no longer: both do,
+//!    so this gate is now the only thing between an arena program and that bare
+//!    dereference.
 //! 3. **No fault sites.** The emitter does not record any, so a program with
 //!    faulting accesses would have them unregistered — and `seal` requires a
 //!    registered image, so this would fail closed anyway. Checked explicitly
@@ -35,41 +38,65 @@
 //!    `loop: r0 += 1; goto loop` forever. The emitter now burns fuel per basic
 //!    block, so loops compile — which matters, because a loop is the only shape
 //!    where native code is meaningfully faster than interpreting.
-//! 5. **Only stack and context pointers are dereferenced.** Checked
+//! 5. **Only pointers the emitter can certify are dereferenced.** Checked
 //!    positively, by walking the program, rather than inferred from the set of
-//!    instructions the emitter happens to refuse. Today gates 1–3 already
-//!    imply it — every pointer-producing instruction is `Unsupported`, so only
-//!    R10 and R1 can be a load base — but that is an emergent property, and
-//!    the day someone teaches the emitter to emit `Call` it silently stops
-//!    holding. An explicit check fails closed instead.
+//!    instructions the emitter happens to refuse. That distinction stopped
+//!    being academic the day the emitter learned `Call`, which is exactly the
+//!    day this gate's own doc-comment predicted:
+//!
+//!    * In a program with **no call**, R10 and R1 are both safe bases. R10 is
+//!      the frame and cannot be written at all (the verifier rejects it), and
+//!      with no call there is no producer of any pointer class other than the
+//!      entry ones — so R1 is the context, or an offset from the frame copied
+//!      into it, and either lowers correctly to a bare `[base + disp]`.
+//!    * In a program **with** a call, only R10 is. A kfunc return can put an
+//!      arena handle or a map-value pointer in R0, `r1 = r0` is an ordinary
+//!      move, and the verifier will happily prove the resulting access
+//!      in-bounds *for that class* — while native code would dereference the
+//!      register verbatim. Gate 2 catches the arena case and nothing catches
+//!      the rest, so R1 stops being admissible wholesale.
+//!
+//!    This is deliberately conservative: it also refuses programs that read
+//!    their context before calling anything, which is sound but slower than it
+//!    needs to be. Making it precise means the verifier publishing the pointer
+//!    *class* at each access, which it does not today — and until it does,
+//!    "refuse and interpret" is the only answer that cannot be wrong.
 //!
 //! Anything gated out runs interpreted, which is a complete implementation.
 //!
 //! ## Lifting gate 2
 //!
 //! Written down here because the analysis is most of the work and the
-//! conclusion is counter-intuitive: **gate 2 is not what stops arena programs
-//! being compiled, and lifting it on its own would compile nothing.**
+//! conclusion was counter-intuitive: **gate 2 was never what stopped arena
+//! programs being compiled.** The prerequisite it was waiting on — call
+//! emission — has since landed, so this section now has a *before* and an
+//! *after*, and the after is where the remaining work is.
 //!
-//! ### The blocker is `Decoded::Call`, not the arena
+//! ### The blocker was `Decoded::Call`, not the arena — and it has gone
 //!
 //! `PtrClass::Arena` has exactly one producer in the verifier — a kfunc's
 //! return descriptor, through `fixpoint.rs`'s `value_of`. Arithmetic and
 //! `addr_space_cast` propagate the class but cannot create it, and no context
 //! field or map value carries it. So *every* program that touches an arena
-//! contains a `call`, and neither backend emits `Decoded::Call`: an arena
-//! program is refused as `Unsupported` at the call, before any arena-specific
-//! lowering is reached. `an_arena_program_is_refused_at_the_call_that_produces_the_handle`
-//! pins that, so this stops being true loudly rather than silently.
+//! contains a `call`; while no backend emitted `Decoded::Call`, an arena
+//! program was refused as `Unsupported` at the call, before any arena-specific
+//! lowering was reached, and lifting gate 2 alone would have compiled nothing.
 //!
-//! The consequence for anyone lifting gate 2: a differential test written
-//! against a lifted gate 2 would find its subject not compiled, fall back to
-//! the interpreter, and compare the interpreter with itself — the exact
-//! vacuity `diff_case` refuses for every other sweep. Call emission is the
-//! prerequisite, and it is a feature in its own right (register shuffling for
-//! R4/R5, `x30` save on aarch64 which the prologue does not do today, SysV
-//! stack alignment which six pushes get wrong, a kfunc-address table the JIT
-//! is not given, and a context check the interpreter does at runtime).
+//! Both backends emit kfunc calls now. Each of the pieces that made it a
+//! feature in its own right is in place: the R4/R5 shuffle on x86-64 and the
+//! whole-argument-list rotation on aarch64, the `x30` save the aarch64
+//! prologue did not do, the SysV alignment step (the six pushes move `rsp` by
+//! 48, which is `0 mod 16` and therefore changes nothing — the residue is what
+//! was wrong), the kfunc-address table now on
+//! [`VerifiedProgram::kfunc_calls`](narf_bpf_verifier::VerifiedProgram::kfunc_calls),
+//! and the callee-context check. `an_arena_program_reaches_its_arena_access_once_the_call_is_emitted`
+//! is what used to pin the old claim and now pins the new one, in bytes: an
+//! arena program walks past its call into a **bare dereference of the handle**.
+//!
+//! So gate 2 has gone from the second of two refusals to the only one, which
+//! makes it *more* load-bearing than it was, not less. A differential test
+//! written against a lifted gate 2 would now find its subject genuinely
+//! compiled — which removes the vacuity hazard and leaves the real work below.
 //!
 //! ### What the lowering has to be
 //!
@@ -241,8 +268,28 @@ pub enum JitSkip {
     TextUnavailable,
     /// Contains a back-edge, and no fuel is emitted to bound it.
     Unbounded,
-    /// Dereferences something other than the frame or the context.
+    /// Dereferences a register whose pointer class the emitter cannot certify:
+    /// anything but the frame, or — in a program with no `call` — the context.
     UncheckedPointerBase,
+}
+
+/// Whether the program contains any `call`.
+///
+/// Load and store bases are admitted differently either side of this, because
+/// a kfunc return is the only way a *new* pointer class enters a register —
+/// see gate 5 in the module docs.
+fn contains_a_call(insns: &[narf_bpf_isa::Insn]) -> Result<bool, JitSkip> {
+    let mut i = 0usize;
+    while i < insns.len() {
+        let Ok((d, width)) = narf_bpf_isa::decode(insns, i) else {
+            return Err(JitSkip::Unsupported);
+        };
+        if matches!(d, narf_bpf_isa::Decoded::Call(_)) {
+            return Ok(true);
+        }
+        i += width;
+    }
+    Ok(false)
 }
 
 /// Gates 4 and 5, as a single walk.
@@ -252,6 +299,16 @@ pub enum JitSkip {
 /// holding silently the first time that set grows.
 fn scan_program(insns: &[narf_bpf_isa::Insn]) -> Result<(), JitSkip> {
     use narf_bpf_isa::{Decoded, Reg};
+
+    // Whether R1 is still admissible as a dereference base. It is the context
+    // pointer on entry and stays so as long as nothing can produce another
+    // pointer class — and a kfunc return is exactly that. Whole-program rather
+    // than flow-sensitive: a back-edge can route a call around to an
+    // earlier-indexed access, so "no call *before* this instruction" is not a
+    // property the instruction order can establish.
+    let ctx_base_ok = !contains_a_call(insns)?;
+    let base_ok = |r: Reg| r == Reg::R10 || (r == Reg::R1 && ctx_base_ok);
+
     let mut i = 0usize;
     while i < insns.len() {
         // Undecodable is impossible here — the verifier decoded it — so treat
@@ -263,13 +320,13 @@ fn scan_program(insns: &[narf_bpf_isa::Insn]) -> Result<(), JitSkip> {
             // `may_goto` still declines: it carries a hidden counter the
             // emitter does not model, which is separate from fuel.
             Decoded::MayGoto { .. } => return Err(JitSkip::Unbounded),
-            // A load or store base must be the frame pointer or the context.
-            // Any other register could hold a class the emitter would lower to
-            // a bare dereference.
-            Decoded::Load { src, .. } if src != Reg::R10 && src != Reg::R1 => {
+            // A load or store base must be one the emitter can certify. Any
+            // other register could hold a class it would lower to a bare
+            // dereference.
+            Decoded::Load { src, .. } if !base_ok(src) => {
                 return Err(JitSkip::UncheckedPointerBase)
             }
-            Decoded::Store { dst, .. } if dst != Reg::R10 && dst != Reg::R1 => {
+            Decoded::Store { dst, .. } if !base_ok(dst) => {
                 return Err(JitSkip::UncheckedPointerBase)
             }
             _ => {}

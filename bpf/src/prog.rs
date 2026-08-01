@@ -443,10 +443,11 @@ impl BpfProg {
     ///
     /// Only reachable when [`crate::jit_glue::try_compile`] accepted the
     /// program, which means: the verifier proved it (not the `provisional`
-    /// path), it uses no arena, it has no faulting accesses, it contains no
-    /// back-edge, and it dereferences only R10 and R1. Those five gates are why
-    /// this can hand control to generated code without the interpreter's
-    /// per-access bounds checks.
+    /// path), it uses no arena, it has no faulting accesses, and it dereferences
+    /// only the frame — or the frame and the context, if it contains no `call`.
+    /// Those gates are why this can hand control to generated code without the
+    /// interpreter's per-access bounds checks. ("No back-edge" used to be on the
+    /// list and was lifted when the emitter learned to burn fuel per block.)
     fn run_atomic_native(&self, ctx: [u64; MAX_CTX_WORDS], ctx_len: usize) -> Option<Outcome> {
         if self.context != Context::Atomic {
             return None;
