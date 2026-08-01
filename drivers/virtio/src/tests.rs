@@ -993,18 +993,24 @@ fn smoke_virtio_snd_pci_probe() -> TestResult {
     if !has {
         return TestResult::Skip("no virtio-snd-pci");
     }
-    __reset_for_test();
-    snd_pci::__reset_for_test();
-    snd_pci::register_pci_driver();
     let authority = bootstrap_registry_authority();
-    if probe_all_pci(&authority).is_err() {
-        return TestResult::Fail("probe_all_pci");
-    }
-    if !snd_pci::is_probed() {
-        return TestResult::Fail("snd probe didn't install controller");
-    }
-    if snd_pci::topology().is_none() {
-        return TestResult::Fail("topology missing after probe");
+    // Exercise teardown/re-probe explicitly. The full suite probes this same
+    // live QEMU device from the audio tests too; dropping queue DMA without a
+    // completed device reset used to leave stale host-side queue pointers and
+    // intermittently SIGSEGV QEMU on a later probe.
+    for _ in 0..4 {
+        snd_pci::__reset_for_test();
+        __reset_for_test();
+        snd_pci::register_pci_driver();
+        if probe_all_pci(&authority).is_err() {
+            return TestResult::Fail("probe_all_pci");
+        }
+        if !snd_pci::is_probed() {
+            return TestResult::Fail("snd probe didn't install controller");
+        }
+        if snd_pci::topology().is_none() {
+            return TestResult::Fail("topology missing after probe");
+        }
     }
     TestResult::Pass
 }
