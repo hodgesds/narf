@@ -84,10 +84,16 @@
 //! ## What is emitted, and what is not
 //!
 //! The subset `narf_bpf::jit_glue`'s gates admit: ALU (32 and 64 bit), `MOV`,
-//! doubleword loads and stores through R10/R1, jumps, conditional jumps, and
-//! `exit`. Everything else returns [`JitError::Unsupported`] and runs
-//! interpreted, which is a complete implementation — so an unemitted
-//! instruction costs speed, not correctness.
+//! doubleword loads and stores through R10/R1, jumps, conditional jumps,
+//! `exit`, and **kfunc calls**. Subprogram calls are still refused — they need
+//! a BPF frame push, which is a different feature from entering a C function.
+//! Everything else returns [`JitError::Unsupported`] and runs interpreted,
+//! which is a complete implementation — so an unemitted instruction costs
+//! speed, not correctness.
+//!
+//! Emitting a call cost this backend one thing the x86-64 one did not need: an
+//! `x30` save. `BLR` writes the link register, and the prologue had no reason
+//! to preserve it while nothing here branched with link. See [`hr::LR`].
 //!
 //! Nothing here records a [`FaultEntry`], and the reason has changed. It used
 //! to be architectural: aarch64 had *no* current-EL data-abort recovery, so a
@@ -106,8 +112,8 @@
 
 use alloc::vec::Vec;
 
-use narf_bpf_isa::{decode, AluOp, CondOp, Decoded, Reg, Size, Source};
-use narf_bpf_verifier::VerifiedProgram;
+use narf_bpf_isa::{decode, AluOp, CallTarget, CondOp, Decoded, Reg, Size, Source};
+use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
 use crate::blocks::{block_len, block_starts};
 use crate::{Compiled, FaultEntry, FaultTable, JitError};
@@ -124,6 +130,9 @@ mod hr {
     pub const IMM: u8 = 16;
     /// Scratch for computed addresses (IP1).
     pub const ADDR: u8 = 17;
+    /// The link register. `BLR` writes it, so the prologue has to save it —
+    /// which it did not need to do while nothing here emitted a call.
+    pub const LR: u8 = 30;
     /// `sp` and `xzr` share encoding 31; which one an instruction means is
     /// fixed by the instruction, not by the field.
     pub const SP: u8 = 31;
@@ -155,8 +164,16 @@ const fn host(r: Reg) -> u8 {
 /// them. Three `STP` pairs, so the count must stay even.
 const SAVED: [u8; 6] = [19, 20, 21, 22, hr::FUEL, hr::FP];
 
-/// Bytes of stack the prologue claims for [`SAVED`].
-const FRAME_BYTES: i32 = 48;
+/// Bytes of stack the prologue claims for [`SAVED`] and [`hr::LR`].
+///
+/// 48 for the three pairs, 8 for `x30`, and 8 of padding to keep the total a
+/// multiple of 16 — AAPCS64 requires `sp` 16-aligned at every instruction
+/// boundary, not merely at a call, and the architecture can be configured to
+/// fault on a misaligned `sp` outright.
+const FRAME_BYTES: i32 = 64;
+
+/// Offset of the saved [`hr::LR`] within the claimed frame.
+const LR_SLOT: i32 = 48;
 
 // ── instruction encoders ─────────────────────────────────────────────
 //
@@ -250,6 +267,12 @@ const LDP_POST: u32 = 0xA8C0_0000;
 
 /// `RET` (to `x30`).
 const RET: u32 = 0xD65F_03C0;
+
+/// `BLR Rn` — branch with link to an absolute address in a register.
+#[inline]
+const fn blr(rn: u8) -> u32 {
+    0xD63F_0000 | ((rn as u32) << 5)
+}
 
 /// The AAPCS64 condition codes this backend uses. Inverting any of them is
 /// `code ^ 1`, which the architecture guarantees for every code except
@@ -489,7 +512,7 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
         }
         let (insn, width) =
             decode(&prog.insns, i).map_err(|_| JitError::Decode { at: i as u32 })?;
-        emit_insn(&mut e, &insn, i as u32, &mut relocs)?;
+        emit_insn(&mut e, &insn, i as u32, &mut relocs, &prog.kfunc_calls)?;
         i += width;
         // A wide instruction occupies two slots. `LD_IMM64` is the only one and
         // it is `Unsupported` here, so `width` is always 1 today; the trailing
@@ -552,6 +575,11 @@ fn emit_prologue(e: &mut Emit) {
     e.w(pair(STP_PRE, SAVED[0], SAVED[1], hr::SP, -FRAME_BYTES));
     e.w(pair(STP_OFF, SAVED[2], SAVED[3], hr::SP, 16));
     e.w(pair(STP_OFF, SAVED[4], SAVED[5], hr::SP, 32));
+    // `x30` is saved alone rather than paired, because [`SAVED`] has an even
+    // count and pairing it with `xzr` would store a word nothing reads back.
+    // A `BLR` overwrites it, so without this the first kfunc call would return
+    // the *program* into the middle of itself.
+    e.w(stur(hr::LR, hr::SP, LR_SLOT));
     // Fuel out of `x2` **before** anything writes `x2`, which R2 maps to.
     e.w(mov_rr(true, hr::FUEL, 2));
     // Frame top out of `x0` before anything writes `x0`, which R0 maps to.
@@ -588,6 +616,7 @@ fn emit_oof_epilogue(e: &mut Emit) {
 fn emit_restore(e: &mut Emit) {
     e.w(pair(LDP_OFF, SAVED[2], SAVED[3], hr::SP, 16));
     e.w(pair(LDP_OFF, SAVED[4], SAVED[5], hr::SP, 32));
+    e.w(ldur(hr::LR, hr::SP, LR_SLOT));
     // Post-indexed, releasing the frame as it loads the first pair.
     e.w(pair(LDP_POST, SAVED[0], SAVED[1], hr::SP, FRAME_BYTES));
     e.w(RET);
@@ -666,13 +695,80 @@ fn addr_operand(e: &mut Emit, base: u8, off: i16) -> (u8, i32) {
     }
 }
 
+/// The whole of a kfunc call: the AAPCS64 shuffle, the target, and the `BLR`.
+///
+/// BPF passes arguments in R1..R5 and AAPCS64 in `x0`..`x4`, so the map is
+/// off by exactly one register and every argument moves. The moves go
+/// **forward** — `x0 := x1`, then `x1 := x2`, and so on — which is the order
+/// that works: each source is read before anything writes it, and `x0`'s old
+/// value is R0, which a call clobbers by definition. Walking the other way
+/// would smear R5 across all five argument registers.
+///
+/// Nothing is saved around the call. R0..R5 live in `x0`..`x5`, which AAPCS64
+/// lets the callee destroy and the BPF ABI likewise declares caller-saved;
+/// R6..R10 and the fuel counter live in `x19`..`x22`, `x24` and `x25`, which
+/// AAPCS64 requires the callee to preserve. `x30` is the one exception, and the
+/// prologue saves it — see [`hr::LR`].
+fn emit_kfunc_call(e: &mut Emit, addr: usize) {
+    for k in 0..5u8 {
+        e.w(mov_rr(true, k, k + 1));
+    }
+    // Through `x16` (IP0): it is the scratch register the platform reserves for
+    // exactly this, absent from [`REGS`], and caller-saved, so the callee is
+    // welcome to destroy it.
+    mov_imm64(e, hr::IMM, addr as i64);
+    e.w(blr(hr::IMM));
+}
+
+/// The call site the verifier resolved for the `call` at `at`, or a refusal.
+///
+/// Byte-identical reasoning to the x86-64 backend's `resolve_call`, and
+/// deliberately duplicated rather than shared: the two backends already
+/// duplicate `emit_pass`, `emit_prologue` and the reloc patcher, and a
+/// three-line shared helper would be the only cross-backend coupling in the
+/// crate. Every arm is fail-closed — see that function for what each means.
+fn resolve_call(calls: &[KfuncCallSite], at: u32, id: i32) -> Result<KfuncCallSite, JitError> {
+    let site = calls
+        .binary_search_by_key(&at, |c| c.insn_index)
+        .map(|k| calls[k])
+        .map_err(|_| JitError::Unsupported {
+            at,
+            what: "kfunc call the verifier never resolved",
+        })?;
+    if site.id != id {
+        return Err(JitError::Unsupported {
+            at,
+            what: "kfunc call site disagrees with the instruction's immediate",
+        });
+    }
+    if site.context != Context::Atomic {
+        return Err(JitError::Unsupported {
+            at,
+            what: "a sleepable kfunc's shim does not use the uniform u64 ABI",
+        });
+    }
+    if site.addr == 0 {
+        return Err(JitError::Unsupported {
+            at,
+            what: "kfunc shim address is null",
+        });
+    }
+    Ok(site)
+}
+
 fn emit_insn(
     e: &mut Emit,
     insn: &Decoded,
     at: u32,
     relocs: &mut Vec<Reloc>,
+    calls: &[KfuncCallSite],
 ) -> Result<(), JitError> {
     match *insn {
+        Decoded::Call(CallTarget::Kfunc(id)) => {
+            let site = resolve_call(calls, at, id)?;
+            emit_kfunc_call(e, site.addr);
+        }
+
         Decoded::Mov {
             wide,
             dst,
@@ -825,6 +921,9 @@ fn emit_insn(
             });
         }
 
+        // Including `CallTarget::Subprog`: a BPF-to-BPF call needs the frame
+        // push the interpreter does in `push_frame`, which is a different
+        // feature from entering a C function.
         _ => {
             return Err(JitError::Unsupported {
                 at,

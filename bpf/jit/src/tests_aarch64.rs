@@ -28,8 +28,10 @@
 
 use narf_bpf_isa::{AluOp, CondOp, Decoded, Size, Source};
 
+use narf_bpf_verifier::Context;
+
 use crate::aarch64;
-use crate::tests::{mov, r, verified, EXIT};
+use crate::tests::{kcall, mov, r, verified, verified_calling, EXIT};
 use crate::JitError;
 
 /// The emitted image as instruction words. Every aarch64 instruction is four
@@ -44,9 +46,10 @@ fn a64_words(code: &[u8]) -> Vec<u32> {
 /// The prologue:
 ///
 /// ```text
-///   stp x19, x20, [sp, #-48]!
-///   stp x21, x22, [sp, #16]
-///   stp x24, x25, [sp, #32]
+///   stp  x19, x20, [sp, #-64]!
+///   stp  x21, x22, [sp, #16]
+///   stp  x24, x25, [sp, #32]
+///   stur x30, [sp, #48]      ; the link register, which BLR clobbers
 ///   mov x24, x2      ; fuel, before anything writes x2 (R2)
 ///   mov x25, x0      ; frame top, before anything writes x0 (R0)
 ///   mov x0, xzr      ; R0 := 0, so an unset R0 cannot return frame_top
@@ -63,34 +66,44 @@ fn a64_words(code: &[u8]) -> Vec<u32> {
 /// by *executing* it rather than by matching these bytes, because a golden
 /// constant pins a bug as faithfully as it pins a fix — which is exactly how
 /// the x86-64 prologue once shipped without `push rbp` and its test passed.
-const A64_PROLOGUE: [u32; 6] = [
-    0xa9bd_53f3,
+const A64_PROLOGUE: [u32; 7] = [
+    0xa9bc_53f3,
     0xa901_5bf5,
     0xa902_67f8,
+    0xf803_03fe,
     0xaa02_03f8,
     0xaa00_03f9,
     0xaa1f_03e0,
 ];
 
-/// `ldp x21,x22,[sp,#16]; ldp x24,x25,[sp,#32]; ldp x19,x20,[sp],#48; ret`
-const A64_RESTORE: [u32; 4] = [0xa941_5bf5, 0xa942_67f8, 0xa8c3_53f3, 0xd65f_03c0];
+/// `ldp x21,x22,[sp,#16]; ldp x24,x25,[sp,#32]; ldur x30,[sp,#48];`
+/// `ldp x19,x20,[sp],#64; ret`
+const A64_RESTORE: [u32; 5] = [
+    0xa941_5bf5,
+    0xa942_67f8,
+    0xf843_03fe,
+    0xa8c4_53f3,
+    0xd65f_03c0,
+];
 
 /// The normal epilogue: `mov x1, xzr` (exhaustion flag clear) then the restore.
-const A64_EPILOGUE: [u32; 5] = [
+const A64_EPILOGUE: [u32; 6] = [
     0xaa1f_03e1,
     A64_RESTORE[0],
     A64_RESTORE[1],
     A64_RESTORE[2],
     A64_RESTORE[3],
+    A64_RESTORE[4],
 ];
 
 /// The out-of-fuel epilogue: `mov x1, #1` then the same restore.
-const A64_OOF_EPILOGUE: [u32; 5] = [
+const A64_OOF_EPILOGUE: [u32; 6] = [
     0xd280_0021,
     A64_RESTORE[0],
     A64_RESTORE[1],
     A64_RESTORE[2],
     A64_RESTORE[3],
+    A64_RESTORE[4],
 ];
 
 /// `subs x24, x24, #n` — the per-block fuel charge. The immediate is bits
@@ -508,7 +521,7 @@ fn a64_golden_conditional_branch_is_an_inverted_skip_over_a_long_branch() {
             // insn 1 follows a branch, so it opens a block of its own: one
             // instruction, charged one unit.
             0xf100_0718, // subs x24, x24, #1
-            0x5400_0223, // b.lo -> the out-of-fuel epilogue
+            0x5400_0243, // b.lo -> the out-of-fuel epilogue
             0xd280_0020, // mov  x0, #1
             0xf2a0_0000,
             0xf2c0_0000,
@@ -516,7 +529,7 @@ fn a64_golden_conditional_branch_is_an_inverted_skip_over_a_long_branch() {
             // insn 2 is a branch target, so it opens a block too: itself plus
             // `exit`, charged two.
             0xf100_0b18, // subs x24, x24, #2
-            0x5400_0163,
+            0x5400_0183,
             0xd280_0000, // mov  x0, #0
             0xf2a0_0000,
             0xf2c0_0000,
@@ -547,7 +560,7 @@ fn a64_golden_jset_uses_tst_not_cmp() {
             0x5400_0040, // b.eq #8   (inverted NE)
             0x1400_0001, // b -> insn 1 (the next word: `off: 0` falls through)
             0xf100_0718, // insn 1 opens a block
-            0x5400_00e3,
+            0x5400_0103,
             0x1400_0001, // b -> epilogue
         ],
     );
@@ -1946,4 +1959,178 @@ fn a64_diff_multiple_exits_share_one_epilogue() {
             64,
         );
     }
+}
+
+// ── kfunc calls ─────────────────────────────────────────────────────
+
+/// A shim address with a bit set in every 16-bit lane, so a `MOVZ`/`MOVK`
+/// sequence that dropped or misplaced a lane cannot look right by accident.
+const A64_SHIM: usize = 0xDEAD_BEEF_1234_5678;
+
+/// Compile with a resolved call table and return the body words.
+#[track_caller]
+fn a64_call_body(items: &[Decoded], sites: &[(u32, i32, usize)], want: &[u32]) {
+    let c = aarch64::compile(&verified_calling(items, sites)).expect("should compile");
+    let w = a64_words(&c.code);
+    let start = A64_PROLOGUE.len() + 2; // the first block's `subs` + `b.lo`
+    let end = w
+        .windows(A64_EPILOGUE.len())
+        .position(|x| x == A64_EPILOGUE)
+        .expect("the normal epilogue must appear after the body");
+    assert_eq!(
+        &w[start..end],
+        want,
+        "\n got {:08x?}\nwant {want:08x?}",
+        &w[start..end]
+    );
+}
+
+#[test]
+fn a64_golden_kfunc_call_sequence() {
+    // AAPCS64 takes arguments in x0..x4 and BPF supplies them in x1..x5, so
+    // every one moves and the map is off by exactly one register. The moves go
+    // *forward*: each source is read before anything writes it, and `x0`'s old
+    // value is R0, which a call clobbers by definition. Emitting them in
+    // reverse smears R5 across all five argument registers — code that
+    // assembles, runs, and passes garbage.
+    a64_call_body(
+        &[kcall(7), EXIT],
+        &[(0, 7, A64_SHIM)],
+        &[
+            0xaa01_03e0, // mov x0, x1
+            0xaa02_03e1, // mov x1, x2
+            0xaa03_03e2, // mov x2, x3
+            0xaa04_03e3, // mov x3, x4
+            0xaa05_03e4, // mov x4, x5
+            0xd28a_cf10, // mov  x16, #0x5678
+            0xf2a2_4690, // movk x16, #0x1234, lsl #16
+            0xf2d7_ddf0, // movk x16, #0xbeef, lsl #32
+            0xf2fb_d5b0, // movk x16, #0xdead, lsl #48
+            0xd63f_0200, // blr  x16
+            0x1400_0001, // b -> epilogue
+        ],
+    );
+}
+
+/// Decode the pre-indexed `STP`'s byte displacement — the frame the prologue
+/// claims. Signed 7-bit field, scaled by 8.
+fn a64_stp_pre_bytes(w: u32) -> i32 {
+    let imm7 = ((w >> 15) & 0x7F) as i32;
+    let signed = if imm7 >= 64 { imm7 - 128 } else { imm7 };
+    signed * 8
+}
+
+/// Decode an unscaled `LDUR`/`STUR` displacement. Signed 9-bit field.
+fn a64_ldst_ur_bytes(w: u32) -> i32 {
+    let imm9 = ((w >> 12) & 0x1FF) as i32;
+    if imm9 >= 256 {
+        imm9 - 512
+    } else {
+        imm9
+    }
+}
+
+#[test]
+fn a64_the_prologue_saves_x30_because_blr_clobbers_it() {
+    // The one thing emitting a call cost this backend that x86-64 did not need.
+    // `BLR` writes `x30`, so without this save the first kfunc call would
+    // overwrite the address the epilogue's `RET` branches to — and the program
+    // would return into the middle of itself.
+    //
+    // Read out of the *emitted image* rather than out of [`A64_PROLOGUE`], and
+    // located by searching for the register rather than by index: a golden
+    // constant pins whatever the emitter does, so a test comparing only against
+    // one would agree with an emitter that had stopped saving `x30`, provided
+    // someone updated the constant to match.
+    let c = aarch64::compile(&verified(&[mov(0, 42), EXIT])).expect("compiles");
+    let w = a64_words(&c.code);
+    let x30_ur = |load: bool| {
+        let base = if load { 0xF840_0000u32 } else { 0xF800_0000 };
+        w.iter()
+            .copied()
+            .filter(move |&x| {
+                (x & 0xFFE0_0000) == base && (x & 0x1F) == 30 && ((x >> 5) & 0x1F) == 31
+            })
+            .map(a64_ldst_ur_bytes)
+            .collect::<Vec<i32>>()
+    };
+    let saves = x30_ur(false);
+    let loads = x30_ur(true);
+    assert_eq!(
+        saves.len(),
+        1,
+        "expected exactly one x30 save, got {saves:?}"
+    );
+    assert!(!loads.is_empty(), "no epilogue reloads x30");
+    assert!(
+        loads.iter().all(|&o| o == saves[0]),
+        "x30 saved at {saves:?} and reloaded from {loads:?}"
+    );
+}
+
+#[test]
+fn a64_the_claimed_frame_is_sixteen_byte_aligned_and_holds_every_saved_slot() {
+    // AAPCS64 requires `sp` 16-aligned at *every* instruction boundary, not
+    // merely at a call, and the architecture can be configured to fault on a
+    // misaligned `sp` outright — so this is stricter than SysV's rule and
+    // cheaper to get wrong, since the frame grew by a register that does not
+    // pair with anything.
+    let c = aarch64::compile(&verified(&[mov(0, 42), EXIT])).expect("compiles");
+    let w = a64_words(&c.code);
+    let frame = -a64_stp_pre_bytes(w[0]);
+    assert_eq!(frame % 16, 0, "frame of {frame} bytes is not 16-aligned");
+    // Every byte the prologue writes has to be inside it. The deepest is the
+    // `x30` slot, which is the one with no `STP` partner to bound it.
+    let x30_off = w
+        .iter()
+        .copied()
+        .find(|&x| (x & 0xFFE0_0000) == 0xF800_0000 && (x & 0x1F) == 30)
+        .map(a64_ldst_ur_bytes)
+        .expect("the prologue must store x30");
+    assert!(
+        x30_off + 8 <= frame,
+        "x30 is stored at {x30_off}, past the {frame}-byte frame"
+    );
+}
+
+#[test]
+fn a64_a_call_the_verifier_never_reached_is_refused_rather_than_guessed() {
+    let prog = verified(&[kcall(7), EXIT]);
+    assert!(prog.kfunc_calls.is_empty(), "premise: no table");
+    assert!(matches!(
+        aarch64::compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
+}
+
+#[test]
+fn a64_a_call_site_that_names_a_different_kfunc_is_refused() {
+    let prog = verified_calling(&[kcall(7), EXIT], &[(0, 9, A64_SHIM)]);
+    assert!(matches!(
+        aarch64::compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
+}
+
+#[test]
+fn a64_a_sleepable_kfuncs_shim_is_never_entered_from_native_code() {
+    let mut prog = verified_calling(&[kcall(7), EXIT], &[(0, 7, A64_SHIM)]);
+    prog.kfunc_calls[0].context = Context::Sleepable;
+    assert!(matches!(
+        aarch64::compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
+}
+
+#[test]
+fn a64_a_subprogram_call_is_still_unsupported() {
+    let prog = verified(&[
+        Decoded::Call(narf_bpf_isa::CallTarget::Subprog(1)),
+        mov(0, 0),
+        EXIT,
+    ]);
+    assert!(matches!(
+        aarch64::compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
 }

@@ -18,9 +18,9 @@
 //! call then needs almost no shuffling, which is the hot path this exists for.
 //! `rcx`, `r10`, `r11` and `r12` are deliberately left out of the map — `rcx`
 //! because variable shifts require it, `r12` because it holds the fuel counter
-//! (see [`hr::R12`]), and `r10`/`r11` for address computation. They gain named
-//! constants when the code that needs them lands; an unused constant reserving
-//! a register is a claim nothing checks.
+//! (see [`hr::R12`]), and `r11` because a call target's absolute address has to
+//! be materialised somewhere ([`hr::R11`]). `r10` still has no named constant;
+//! an unused constant reserving a register is a claim nothing checks.
 //!
 //! This paragraph used to say `r12` was reserved "because an arena program pins
 //! it to the window base", contradicting [`hr::R12`] two screens down. Worth
@@ -32,25 +32,43 @@
 //! and that decision belongs with the code that needs it, not with a comment
 //! claiming a register is already spoken for.
 //!
+//! **Kfunc calls needed none of that.** The register pressure that blocks a
+//! pinned arena base does not touch call emission, and the reason is worth
+//! stating because the two look like the same problem: a call needs *scratch*,
+//! which is caller-saved and plentiful, while an arena base needs a value that
+//! survives a call, which is callee-saved and exhausted. BPF's own ABI then
+//! does the rest — R1..R5 are caller-saved by definition and R0 takes the
+//! result, and those are exactly the registers SysV lets a callee destroy. So
+//! nothing is saved around a call and nothing is reloaded after one.
+//!
 //! ## What is emitted, and what is not
 //!
 //! Enough of the ISA to run the corpus the interpreter runs: ALU, MOV, loads
-//! and stores against the frame, conditional and unconditional jumps, and
-//! exit. **Not kfunc calls**, which this list claimed for a while and which is
-//! worth correcting rather than quietly dropping: `Decoded::Call` has no arm in
-//! `emit_insn` on either backend, and because a kfunc return is the verifier's
-//! only producer of `PtrClass::Arena`, that absence is what actually keeps
-//! arena programs interpreted — not `jit_glue` gate 2. See that module's
-//! "Lifting gate 2". Everything else returns [`JitError::Unsupported`], which
-//! the caller answers by interpreting — the interpreter is a complete
-//! implementation, so an unemitted instruction costs speed and not
-//! correctness. That is the property that makes it safe to grow this file
-//! incrementally instead of all at once.
+//! and stores against the frame, conditional and unconditional jumps, exit, and
+//! **kfunc calls**. Subprogram calls (`CallTarget::Subprog`) are still refused:
+//! they need the BPF frame push the interpreter does in `push_frame`, which is
+//! a different feature from entering a C function.
+//!
+//! Everything else returns [`JitError::Unsupported`], which the caller answers
+//! by interpreting — the interpreter is a complete implementation, so an
+//! unemitted instruction costs speed and not correctness. That is the property
+//! that makes it safe to grow this file incrementally instead of all at once.
+//!
+//! ## Why emitting a call is not the same as lifting `jit_glue` gate 2
+//!
+//! A kfunc return is the verifier's only producer of `PtrClass::Arena`, so
+//! until this arm existed *no* arena program reached any arena lowering — it
+//! was refused at the call. That is no longer true, and the consequence runs
+//! the other way from the intuitive one: an arena program now gets **further**
+//! through this emitter, and `narf_bpf::jit_glue`'s gate 2 is what stands
+//! between it and a bare dereference of a slot-relative handle. See
+//! `an_arena_program_reaches_its_arena_access_once_the_call_is_emitted`, which
+//! shows the bytes.
 
 use alloc::vec::Vec;
 
-use narf_bpf_isa::{decode, AluOp, CondOp, Decoded, Reg, Size, Source};
-use narf_bpf_verifier::VerifiedProgram;
+use narf_bpf_isa::{decode, AluOp, CallTarget, CondOp, Decoded, Reg, Size, Source};
+use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
 use crate::blocks::{block_len, block_starts};
 use crate::{Compiled, FaultEntry, FaultTable, JitError};
@@ -63,10 +81,19 @@ mod hr {
     /// Callee-saved and absent from [`super::REGS`], so no BPF register aliases
     /// it. Spec §5 earmarks a pinned register for the arena window base and
     /// Linux uses `r12` for it, but here `r12` is taken and every other
-    /// callee-saved register is a BPF register — see the module docs. `r10` and
-    /// `r11` are free but caller-saved, so they survive an arena access and not
-    /// a kfunc call.
+    /// callee-saved register is a BPF register — see the module docs. `r10` is
+    /// free but caller-saved, so it would survive an arena access and not a
+    /// kfunc call; `r11` is likewise caller-saved and now spoken for by
+    /// [`R11`].
     pub const R12: u8 = 12;
+    /// Scratch for a call target's absolute address.
+    ///
+    /// Caller-saved, which is exactly right here: its value is consumed by the
+    /// `call` that reads it and is never wanted afterwards, so the callee is
+    /// welcome to destroy it. Absent from [`super::REGS`], so materialising an
+    /// address into it cannot be clobbering a BPF register — the same argument
+    /// [`RCX`] rests on.
+    pub const R11: u8 = 11;
     /// Scratch. Variable shifts require the count in `cl`, and `rcx` is
     /// deliberately absent from [`super::REGS`] so no BPF register can alias
     /// it — which is what makes moving a count into it unconditionally safe.
@@ -423,7 +450,7 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
         }
         let (insn, width) =
             decode(&prog.insns, i).map_err(|_| JitError::Decode { at: i as u32 })?;
-        emit_insn(&mut e, &insn, i as u32, &mut relocs)?;
+        emit_insn(&mut e, &insn, i as u32, &mut relocs, &prog.kfunc_calls)?;
         i += width;
         // A wide instruction occupies two slots. This records the *following*
         // instruction's offset for the trailing slot, not the wide
@@ -470,6 +497,36 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
     Ok((e, out))
 }
 
+/// Bytes the prologue subtracts from `rsp` purely to satisfy SysV's alignment
+/// rule, on top of the register saves.
+///
+/// SysV requires `rsp % 16 == 0` **at the point a `call` executes**, so a
+/// function sees `rsp % 16 == 8` on entry. This image is such a function: it is
+/// entered at 8, and the six pushes below move `rsp` by 48 — a multiple of 16 —
+/// so they leave it at 8. A `call` from the body would then enter a kfunc with
+/// the alignment inverted, which is the class of bug that shows up as a
+/// `movaps` fault somewhere inside the callee rather than anywhere near here.
+/// One more 8-byte step puts the whole body at 0.
+///
+/// Derived, not copied: a note this work started from claimed six pushes were
+/// wrong and that "+48" fixed it. 48 is what the pushes already move `rsp` by
+/// and it is `0 mod 16`, so it changes nothing. The residue is what matters, and
+/// `the_prologue_leaves_the_stack_aligned_for_a_sysv_call` re-derives it from
+/// the emitted bytes rather than trusting either number.
+///
+/// Emitted unconditionally rather than only for programs containing a call: a
+/// prologue whose frame shape depends on the body is two shapes to reason about
+/// and two to test, for one instruction that executes once per invocation.
+const STACK_ALIGN_PAD: i32 = 8;
+
+/// `sub rsp, imm8` / `add rsp, imm8` — the group-1 sign-extended-imm8 forms.
+fn emit_rsp_adjust(e: &mut Emit, slash: u8, imm: i32) {
+    e.rex(true, 0, hr::RSP);
+    e.b(0x83);
+    e.modrm_rr(slash, hr::RSP);
+    e.b(imm as u8);
+}
+
 /// `push rbx; push r13; push r14; push r15; mov rbp, rdi` and the fuel setup.
 ///
 /// R6..R9 map to callee-saved host registers, so they must be preserved for
@@ -488,6 +545,8 @@ fn emit_prologue(e: &mut Emit, _prog: &VerifiedProgram) {
         }
         e.b(0x50 | (r & 7));
     }
+    // `sub rsp, 8` — see [`STACK_ALIGN_PAD`]. Released by `emit_restore`.
+    emit_rsp_adjust(e, 5, STACK_ALIGN_PAD);
     // r12 := rdx (fuel) **before** anything writes rdx, which R3 maps to.
     // Ordering matters for the same reason as the rdi/rsi pair below.
     mov_rr(e, true, hr::R12, hr::RDX);
@@ -514,6 +573,9 @@ fn emit_oof_epilogue(e: &mut Emit) {
 }
 
 fn emit_restore(e: &mut Emit) {
+    // `add rsp, 8` — undo [`STACK_ALIGN_PAD`] before the pops, or every one of
+    // them would read the wrong slot.
+    emit_rsp_adjust(e, 0, STACK_ALIGN_PAD);
     for r in [hr::R15, hr::R14, hr::R13, hr::R12, hr::RBX, hr::RBP] {
         if r >= 8 {
             e.b(0x41);
@@ -523,13 +585,94 @@ fn emit_restore(e: &mut Emit) {
     e.b(0xC3); // ret
 }
 
+/// The whole of a kfunc call: the SysV shuffle, the target, and the `call`.
+///
+/// BPF passes arguments in R1..R5; SysV passes them in `rdi`, `rsi`, `rdx`,
+/// `rcx`, `r8`. The register map lines the first three up exactly — that is the
+/// reason it was chosen — so only the last two move, and the order they move in
+/// is load-bearing: `rcx` must take `r8`'s value **before** `r8` takes `r9`'s,
+/// or R4 is overwritten by R5 and lost. Writing the two moves the other way
+/// round produces code that assembles, runs, and passes the wrong argument.
+///
+/// Nothing is saved. Every register SysV lets the callee destroy —
+/// `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`..`r11` — holds either a BPF register
+/// the BPF ABI *also* declares caller-saved (R0..R5) or nothing. R6..R10 and
+/// the fuel counter live in `rbx`, `r13`..`r15`, `rbp` and `r12`, all of which
+/// SysV requires the callee to preserve.
+///
+/// The address is materialised into `r11` rather than encoded as a `call rel32`
+/// displacement, because the JIT does not know where its own text will land
+/// when it emits — `bpf_text::alloc` chooses the VA afterwards — so a
+/// PC-relative target is not expressible at emission time and a fixup pass would
+/// buy nothing but a fixup pass.
+fn emit_kfunc_call(e: &mut Emit, addr: usize) {
+    mov_rr(e, true, hr::RCX, hr::R8); // SysV arg3 := BPF R4
+    mov_rr(e, true, hr::R8, hr::R9); // SysV arg4 := BPF R5
+    mov_reg_imm64(e, hr::R11, addr as i64);
+    // `call r11` — FF /2. REX.B for the high register; no REX.W, because a
+    // near call is 64-bit by default in long mode.
+    e.rex(false, 0, hr::R11);
+    e.b(0xFF);
+    e.modrm_rr(2, hr::R11);
+}
+
+/// The call site the verifier resolved for the `call` at `at`, or a refusal.
+///
+/// Every arm here is fail-closed and every one is reachable through a
+/// `VerifiedProgram` that some caller could hand this crate, so none of them is
+/// a `debug_assert`:
+///
+/// * **no entry** — the fixpoint never reached this instruction, so nobody
+///   type-checked its arguments. Dead code, and there is no target to invent.
+/// * **id mismatch** — the table describes a different callee than the
+///   instruction names. Emitting either one would be a guess.
+/// * **sleepable** — that kfunc's shim returns a boxed future rather than a
+///   `u64` (see `narf_bpf::kfunc::KfuncShim`), so entering it through the
+///   uniform ABI would reinterpret a `Pin<Box<dyn Future>>` as a return value.
+///   The *program's* context does not decide this; the callee's does.
+/// * **null address** — no shim to enter.
+fn resolve_call(calls: &[KfuncCallSite], at: u32, id: i32) -> Result<KfuncCallSite, JitError> {
+    let site = calls
+        .binary_search_by_key(&at, |c| c.insn_index)
+        .map(|k| calls[k])
+        .map_err(|_| JitError::Unsupported {
+            at,
+            what: "kfunc call the verifier never resolved",
+        })?;
+    if site.id != id {
+        return Err(JitError::Unsupported {
+            at,
+            what: "kfunc call site disagrees with the instruction's immediate",
+        });
+    }
+    if site.context != Context::Atomic {
+        return Err(JitError::Unsupported {
+            at,
+            what: "a sleepable kfunc's shim does not use the uniform u64 ABI",
+        });
+    }
+    if site.addr == 0 {
+        return Err(JitError::Unsupported {
+            at,
+            what: "kfunc shim address is null",
+        });
+    }
+    Ok(site)
+}
+
 fn emit_insn(
     e: &mut Emit,
     insn: &Decoded,
     at: u32,
     relocs: &mut Vec<Reloc>,
+    calls: &[KfuncCallSite],
 ) -> Result<(), JitError> {
     match *insn {
+        Decoded::Call(CallTarget::Kfunc(id)) => {
+            let site = resolve_call(calls, at, id)?;
+            emit_kfunc_call(e, site.addr);
+        }
+
         Decoded::Mov {
             wide,
             dst,
@@ -693,6 +836,9 @@ fn emit_insn(
             });
         }
 
+        // Including `CallTarget::Subprog`: a BPF-to-BPF call needs the frame
+        // push the interpreter does in `push_frame` — saving R6..R9, moving
+        // the frame base, and a return path — none of which this emits.
         _ => {
             return Err(JitError::Unsupported {
                 at,
