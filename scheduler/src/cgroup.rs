@@ -46,7 +46,7 @@
 //! mask immediately through queries and is re-homed when it returns
 //! `Poll::Pending`. Priority updates remain parked-slot updates.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::affinity::{CpuId, CpuSet};
 use crate::priority::Priority;
@@ -78,6 +78,11 @@ static PROCESS_TASK_RESOLVER: AtomicUsize = AtomicUsize::new(0);
 /// when the userspace process table becomes available after the scheduler.
 pub fn install_memory_pid_resolver(resolver: fn(u64) -> Option<u64>) {
     MEMORY_PID_RESOLVER.store(resolver as usize, Ordering::Release);
+    // A new resolver can map the same task id to a different pid (bootstrap
+    // hand-off; test resolver swaps), so drop every per-CPU memo entry.
+    for memo in CHARGE_PID_MEMO.iter() {
+        memo.task.store(CHARGE_MEMO_EMPTY, Ordering::Relaxed);
+    }
 }
 
 /// Install the reverse ProcessId-to-TaskId resolver used by cgroup controller
@@ -126,11 +131,62 @@ fn current_charge_pid() -> Option<u64> {
     if ptr == 0 {
         return None;
     }
+    // Per-CPU memo of the last task->charge-pid resolution. This runs on EVERY
+    // heap allocation, and the resolver (`task_to_pid_raw`) takes a GLOBAL
+    // spinlock + BTreeMap lookup — so without this, the per-CPU slab's fast
+    // path is serialised behind one lock on every alloc (it dominated the CPU
+    // when a Wayland compositor faulted in its DSOs, and would collapse under
+    // SMP as every CPU contends the same lock). Allocations come in long bursts
+    // within a single task, so a per-CPU (task,pid) cache hits almost always,
+    // reducing the hot path to two relaxed loads + a compare. A task's pid is
+    // stable for its lifetime; a rare stale hit after task-id reuse only
+    // mis-attributes accounting (never unsafe).
+    let raw = id.raw();
+    let cpu = narf_lib::percpu::current_cpu();
+    let memo = &CHARGE_PID_MEMO[if cpu < narf_lib::percpu::MAX_CPUS {
+        cpu
+    } else {
+        0
+    }];
+    if memo.task.load(Ordering::Relaxed) == raw {
+        let p = memo.pid.load(Ordering::Relaxed);
+        return if p == CHARGE_MEMO_NONE { None } else { Some(p) };
+    }
     // SAFETY: `ptr` is non-zero (checked) and was produced by
     // `install_memory_pid_resolver` from the exact function-pointer type.
     let resolve: fn(u64) -> Option<u64> = unsafe { core::mem::transmute(ptr) };
-    resolve(id.raw())
+    let pid = resolve(raw);
+    // Publish pid before task so a same-CPU IRQ allocation that sees the new
+    // task also sees the matching pid (a miss before both stores just
+    // re-resolves — safe).
+    memo.pid
+        .store(pid.unwrap_or(CHARGE_MEMO_NONE), Ordering::Relaxed);
+    memo.task.store(raw, Ordering::Relaxed);
+    pid
 }
+
+/// A resolver returned `None` (kernel-internal task, no process mapping) — a
+/// real sentinel stored in the memo so the miss isn't re-resolved every alloc.
+const CHARGE_MEMO_NONE: u64 = u64::MAX;
+/// Task slot that has never been populated. Distinct from any real task id
+/// (a small monotonic counter) and from `CHARGE_MEMO_NONE`.
+const CHARGE_MEMO_EMPTY: u64 = u64::MAX - 1;
+
+#[repr(align(64))]
+struct ChargePidMemo {
+    task: AtomicU64,
+    pid: AtomicU64,
+}
+
+/// Per-CPU cache of `current_charge_pid`, cache-line padded to avoid false
+/// sharing between CPUs.
+static CHARGE_PID_MEMO: [ChargePidMemo; narf_lib::percpu::MAX_CPUS] = [const {
+    ChargePidMemo {
+        task: AtomicU64::new(CHARGE_MEMO_EMPTY),
+        pid: AtomicU64::new(CHARGE_MEMO_NONE),
+    }
+};
+    narf_lib::percpu::MAX_CPUS];
 
 /// Install the `memory`-controller charge-PID provider into
 /// `narf-memory`. Idempotent at the allocator side (a second install
