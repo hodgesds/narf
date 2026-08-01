@@ -3160,3 +3160,121 @@ fn every_cycle_has_a_widening_point() {
         }
     }
 }
+
+// ── Kfunc call sites, as codegen sees them ──────────────────────────
+//
+// `VerifiedProgram::kfunc_calls` is the only path by which a shim address
+// reaches `narf-bpf-jit`, which depends on nothing kernel-side and therefore
+// cannot consult the registry itself. Its shape is a contract with the
+// emitter: one entry per *reachable* call site, sorted, deduped, and carrying
+// the address the verifier resolved rather than one codegen guessed.
+
+/// A scalar-returning atomic kfunc with an explicit address, so a test can
+/// tell two of them apart.
+fn kfunc_at(name: &'static str, addr: usize) -> KfuncDesc {
+    KfuncDesc {
+        addr,
+        ..kfunc(name, NO_ARGS, ArgDesc::SCALAR64, Context::Atomic)
+    }
+}
+
+#[test]
+fn a_resolved_kfunc_call_records_the_site_the_emitter_will_ask_about() {
+    let k = [kfunc_at("k0", 0xDEAD_0000)];
+    let v = check_full(&[call(0), EXIT], &[], &k, Context::Atomic)
+        .expect("a scalar-returning kfunc initialises R0");
+    assert_eq!(
+        v.kfunc_calls,
+        alloc::vec![crate::KfuncCallSite {
+            insn_index: 0,
+            id: 0,
+            addr: 0xDEAD_0000,
+            context: Context::Atomic,
+        }],
+    );
+}
+
+#[test]
+fn each_call_site_gets_its_own_entry_with_its_own_address() {
+    // Two different kfuncs, and the same one twice. Keyed by *site*, because
+    // that is the question an emitter walking instructions actually asks —
+    // keying by kfunc would make the third call indistinguishable from the
+    // first and force the emitter to re-resolve the immediate itself.
+    let k = [kfunc_at("k0", 0x1111_0000), kfunc_at("k1", 0x2222_0000)];
+    let v =
+        check_full(&[call(0), call(1), call(0), EXIT], &[], &k, Context::Atomic).expect("verifies");
+    let got: Vec<(u32, i32, usize)> = v
+        .kfunc_calls
+        .iter()
+        .map(|c| (c.insn_index, c.id, c.addr))
+        .collect();
+    assert_eq!(
+        got,
+        alloc::vec![
+            (0, 0, 0x1111_0000),
+            (1, 1, 0x2222_0000),
+            (2, 0, 0x1111_0000)
+        ],
+    );
+}
+
+#[test]
+fn a_call_inside_a_loop_is_recorded_once_however_often_the_block_is_reanalysed() {
+    // The fixpoint re-enters a block until its input state stops changing, and
+    // the recording happens inside the transfer function. Without the dedup an
+    // emitter would see the same site several times — harmless if it looks the
+    // site up, and a silent duplicate-emission bug if it walks the list. Pinned
+    // rather than left to the reader.
+    let k = [kfunc_at("k0", 0x3333_0000)];
+    let v = check_full(
+        &[
+            mov(0, 0),
+            call(0),                        // 1
+            jmp(CondOp::Eq, 0, 12_345, -2), // 2 -> back to 1
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("a call in a loop verifies; fuel bounds it at runtime");
+    assert_eq!(v.kfunc_calls.len(), 1, "{:?}", v.kfunc_calls);
+    assert_eq!(v.kfunc_calls[0].insn_index, 1);
+}
+
+#[test]
+fn the_recorded_context_is_the_kfuncs_and_not_the_programs() {
+    // A sleepable kfunc's shim returns a boxed future rather than a `u64`, so
+    // native code must not enter it through the uniform ABI. The emitter's only
+    // evidence for that is this field, and it must describe the *callee* — a
+    // sleepable program calling an atomic kfunc is legal, and recording the
+    // program's context would make that call look uncallable.
+    let k = [
+        kfunc_at("atomic_one", 0x4444_0000),
+        kfunc("sleepy", NO_ARGS, ArgDesc::SCALAR64, Context::Sleepable),
+    ];
+    let v = check_full(&[call(0), call(1), EXIT], &[], &k, Context::Sleepable)
+        .expect("a sleepable program may call either");
+    assert_eq!(v.kfunc_calls[0].context, Context::Atomic);
+    assert_eq!(v.kfunc_calls[1].context, Context::Sleepable);
+}
+
+#[test]
+fn an_unreachable_call_is_not_recorded_so_the_emitter_must_fail_closed() {
+    // The fixpoint only walks reachable blocks, so a call the program can
+    // never execute resolves to nothing. That is the right answer — there is
+    // no state in which to type-check its arguments — but it means the table
+    // is *not* total over the instruction stream, and an emitter that walks
+    // instructions linearly will meet a call with no entry. It must refuse
+    // rather than invent a target; `narf_bpf_jit`'s
+    // `a_call_the_verifier_never_reached_is_refused_rather_than_guessed` is the
+    // other half of this contract.
+    let k = [kfunc_at("k0", 0x5555_0000)];
+    let v = check_full(&[mov(0, 0), EXIT, call(0), EXIT], &[], &k, Context::Atomic)
+        .expect("dead code after an exit does not stop verification");
+    assert!(
+        v.kfunc_calls.is_empty(),
+        "an unreachable call was resolved: {:?}",
+        v.kfunc_calls
+    );
+}
