@@ -159,10 +159,32 @@ surface is `MqueueFs`, `MqueueOpenOptions`, `MqueueAttr`,
 and is pushed into the scheduler's per-task allowed-node table on attach
 and every local policy update. Empty requests inherit the parent; an
 explicit request with an empty intersection is rejected.
-`cpuset.memory_migrate` accepts `0` or `1`. When enabled, attach and
-effective-memory-mask changes migrate each member address space's resident
-private base pages and complete hardware huge leaves away from disallowed
-nodes; shared mappings remain unmoved without explicit MOVE_ALL authority.
+The legacy cgroup-v1 `cpuset.memory_migrate` file is not exposed on the
+cgroup-v2 mount. Effective-memory-mask changes affect subsequent placement;
+they do not implicitly migrate already-resident pages.
+
+### 3.3.2 cgroup-v2 compatibility surface
+
+`CgroupFs` exposes one unified hierarchy. Core and controller attributes use
+stable, non-zero inode identities, kernfs-style zero `st_size`, Linux file
+modes, and identical synchronous/asynchronous directory snapshots. Root-only
+and non-root-only controller files follow the Linux cftype placement rules.
+The root owns state for every registered controller even before delegation, so
+hierarchical accounting reaches the root while limit files remain absent there.
+
+`cgroup.subtree_control` validates a write atomically, applies repeated
+controller operations in input order (the last operation wins), enforces the
+no-internal-process rule, and refuses to withdraw a controller still delegated
+by a child. Cgroup-namespace paths are relative to the namespace root and use
+`..` components for visible sibling cgroups. The writable `cgroup.type`
+transition rejects populated groups and domain-controller conflicts; complete
+per-thread placement and threaded-subtree propagation are not yet provided.
+
+Pressure Stall Information is optional. The `cgroup-psi` feature exposes
+`cgroup.pressure` plus `cpu.pressure`, `memory.pressure`, and `io.pressure`;
+without it, no PSI cgroup ABI is present. The current PSI implementation
+reports Linux-shaped zero counters and does not yet implement pressure-trigger
+writes or poll notifications.
 
 `/proc/numastat` exposes live per-node allocation events supplied by
 `memory/`: hit, miss, foreign, interleave-hit, local, and other counters.

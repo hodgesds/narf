@@ -544,6 +544,7 @@ kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_base_cpu_stat);
 
 // ── 10. cgroup.pressure round-trip ──────────────────────────────────
 
+#[cfg(feature = "cgroup-psi")]
 fn smoke_cgroup_pressure_toggle() -> TestResult {
     let root = root_dir();
     let name = "t_press";
@@ -569,7 +570,33 @@ fn smoke_cgroup_pressure_toggle() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "cgroup-psi")]
 kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_pressure_toggle);
+
+#[cfg(not(feature = "cgroup-psi"))]
+fn smoke_cgroup_pressure_absent_without_psi() -> TestResult {
+    let root = root_dir();
+    let name = "t_no_psi";
+    let child = match poll_once(root.mkdir(name)) {
+        Some(Ok(c)) => c,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    let absent = child.lookup("cgroup.pressure").is_none()
+        && child.lookup("cpu.pressure").is_none()
+        && child.lookup("memory.pressure").is_none()
+        && child.lookup("io.pressure").is_none();
+    let _ = poll_once(root.rmdir(name));
+    if absent {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("pressure ABI leaked without cgroup-psi")
+    }
+}
+#[cfg(not(feature = "cgroup-psi"))]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_pressure_absent_without_psi
+);
 
 // ── 11. Effective frozen state in cgroup.events ─────────────────────
 
@@ -999,6 +1026,9 @@ fn smoke_cgroup_cpuset() -> TestResult {
         if cg.lookup("cpuset.cpus").is_none() || cg.lookup("cpuset.cpus.effective").is_none() {
             return TestResult::Fail("cpuset.* files absent after enabling cpuset");
         }
+        if cg.lookup("cpuset.memory_migrate").is_some() {
+            return TestResult::Fail("legacy cpuset.memory_migrate present on cgroup2");
+        }
         // CPU 0 is always online, so requesting it yields a non-empty
         // effective set regardless of the machine's CPU count.
         if write_attr(cg, "cpuset.cpus", b"0").is_err() {
@@ -1170,10 +1200,11 @@ kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_memory_max_two_phase);
 // ── with_chain_states walks the cgroup + every ancestor ─────────────
 //
 // Enable memory on the root AND on a mid-level cgroup, so a leaf pid's
-// chain has memory state at two levels (leaf + mid). `with_chain_states`
+// chain has memory state at three levels (leaf + mid + root). The root css
+// exists independently of delegation, as it does on Linux. `with_chain_states`
 // must visit each level that carries the named state, bottom-up to the
 // root, exactly once. We verify coverage and per-level accounting by
-// charging the leaf and confirming BOTH levels' `memory.current` moved.
+// charging the leaf and confirming all three levels' `memory.current` moved.
 #[cfg(feature = "cgroup-memory")]
 fn smoke_cgroup_with_chain_states_walk() -> TestResult {
     use crate::cgroupfs::{memory, with_chain_states, ControllerState};
@@ -1226,31 +1257,39 @@ fn smoke_cgroup_with_chain_states_walk() -> TestResult {
         return TestResult::Fail("attach pid to leaf failed");
     }
 
-    // The chain must carry memory state at exactly two levels: leaf and
-    // mid (root has no memory state — memory is only enabled for its
-    // children, not on the root itself). Order is bottom-up.
+    // The chain carries state at leaf, mid, and root. Root limit files remain
+    // hidden by their Linux CFTYPE_NOT_ON_ROOT placement, but the root state is
+    // still the hierarchy-wide accounting endpoint. Order is bottom-up.
     let mut visited = 0usize;
     let mut currents = alloc::vec::Vec::new();
     with_chain_states(pid, "memory", |s: &Arc<dyn ControllerState>| {
         visited += 1;
         currents.push(s.read("memory.current"));
     });
-    if visited != 2 {
+    if visited != 3 {
         teardown(pid);
-        return TestResult::Fail("with_chain_states did not visit leaf+mid exactly");
+        return TestResult::Fail("with_chain_states did not visit leaf+mid+root exactly");
     }
 
-    // Charge the leaf's chain: both levels must move (chain-wide charge).
+    // Charge the leaf's chain: all three levels must move (chain-wide charge).
     if !memory::charge_hook_for_test(pid, 4096) {
         teardown(pid);
         return TestResult::Fail("chain charge denied");
     }
     let leaf_cur = read_current(&leaf);
     let mid_cur = read_current(&mid);
+    let mut charged_chain = alloc::vec::Vec::new();
+    with_chain_states(pid, "memory", |s: &Arc<dyn ControllerState>| {
+        charged_chain.push(s.read("memory.current"));
+    });
     let _ = memory::charge_hook_for_test(pid, -4096);
     teardown(pid);
-    if leaf_cur != 4096 || mid_cur != 4096 {
-        return TestResult::Fail("chain walk did not charge both leaf and mid");
+    if leaf_cur != 4096
+        || mid_cur != 4096
+        || charged_chain.len() != 3
+        || charged_chain.iter().any(|current| current != "4096\n")
+    {
+        return TestResult::Fail("chain walk did not charge leaf, mid, and root");
     }
     TestResult::Pass
 }
@@ -1433,6 +1472,16 @@ fn smoke_cgroup_cpu_nice_and_stat_fields() -> TestResult {
         if read_attr(cg, "cpu.max").unwrap_or_default().trim() != "max 100000" {
             return TestResult::Fail("cpu.max=max did not render 'max 100000'");
         }
+        // Linux validates the complete quota/period line atomically.
+        if write_attr(cg, "cpu.max", b"2000 999").is_ok()
+            || write_attr(cg, "cpu.max", b"2000 100000 trailing").is_ok()
+            || read_attr(cg, "cpu.max").unwrap_or_default().trim() != "max 100000"
+        {
+            return TestResult::Fail("invalid cpu.max write was accepted or mutated state");
+        }
+        if write_attr(cg, "cpu.idle", b"2").is_ok() {
+            return TestResult::Fail("cpu.idle accepted a non-boolean value");
+        }
         // cpu.stat exposes the full v2 field set; the bandwidth counters
         // are zero because cpu.max is not enforced.
         let stat = read_attr(cg, "cpu.stat").unwrap_or_default();
@@ -1549,6 +1598,12 @@ fn smoke_cgroup_io_stat_and_max_merge() -> TestResult {
         if write_attr(cg, "io.max", b"8:16 bogus=1").is_ok() {
             return TestResult::Fail("io.max accepted an unknown field key");
         }
+        if write_attr(cg, "io.max", b"8:16").is_ok() {
+            return TestResult::Fail("io.max accepted a device with no limits");
+        }
+        if write_attr(cg, "io.weight", b"bogus 100").is_ok() {
+            return TestResult::Fail("io.weight accepted an arbitrary prefix");
+        }
         TestResult::Pass
     })
 }
@@ -1565,9 +1620,12 @@ fn smoke_cgroup_misc_max_unset_and_current() -> TestResult {
     crate::cgroupfs::register_controller(Arc::new(crate::cgroupfs::misc::MiscController));
     crate::cgroupfs::misc::register_misc_resource("t_res_b", 4096);
     with_root_controller("misc", "t_misc_unset", |cg| {
-        // misc.current is well-formed (no usage accounted → empty).
-        if !read_attr(cg, "misc.current").unwrap_or_default().is_empty() {
-            return TestResult::Fail("fresh misc.current not empty");
+        // Linux lists every registered resource even at zero usage.
+        if !read_attr(cg, "misc.current")
+            .unwrap_or_default()
+            .contains("t_res_b 0")
+        {
+            return TestResult::Fail("fresh misc.current missing zero-valued resource");
         }
         // Set a numeric limit; it round-trips as "<key> <n>".
         if write_attr(cg, "misc.max", b"t_res_b 512").is_err() {
@@ -1579,15 +1637,16 @@ fn smoke_cgroup_misc_max_unset_and_current() -> TestResult {
         {
             return TestResult::Fail("misc.max did not round-trip");
         }
-        // Writing "max" unsets the limit (row is dropped).
+        // Writing "max" unsets the limit and renders the Linux `key max`
+        // row rather than hiding the registered resource.
         if write_attr(cg, "misc.max", b"t_res_b max").is_err() {
             return TestResult::Fail("misc.max 'max' unset failed");
         }
-        if read_attr(cg, "misc.max")
+        if !read_attr(cg, "misc.max")
             .unwrap_or_default()
-            .contains("t_res_b")
+            .contains("t_res_b max")
         {
-            return TestResult::Fail("misc.max row not dropped after 'max'");
+            return TestResult::Fail("misc.max did not render 'max' after unset");
         }
         TestResult::Pass
     })
@@ -1643,6 +1702,7 @@ kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_psi_shape_all_axes);
 fn smoke_cgroup_type_threaded() -> TestResult {
     let root = root_dir();
     let name = "t_type";
+    let pid = 3_300_000_070;
     let cg = match poll_once(root.mkdir(name)) {
         Some(Ok(c)) => c,
         _ => return TestResult::Fail("mkdir failed"),
@@ -1661,12 +1721,28 @@ fn smoke_cgroup_type_threaded() -> TestResult {
     if read_attr(&cg, "cgroup.type").unwrap_or_default().trim() != "domain" {
         return fail("rejected cgroup.type write mutated the type");
     }
+    // Linux refuses the transition while this cgroup or its descendants are
+    // populated. The failed write must leave the type unchanged.
+    if attach_pid(&cg, pid).is_err() {
+        return fail("could not populate cgroup for threaded rejection test");
+    }
+    if write_attr(&cg, "cgroup.type", b"threaded").is_ok() {
+        task_exited(pid);
+        return fail("populated cgroup became threaded");
+    }
+    task_exited(pid);
+    if read_attr(&cg, "cgroup.type").unwrap_or_default().trim() != "domain" {
+        return fail("failed populated transition mutated cgroup.type");
+    }
     // The domain→threaded transition is accepted and reads back.
     if write_attr(&cg, "cgroup.type", b"threaded").is_err() {
         return fail("cgroup.type 'threaded' transition rejected");
     }
     if read_attr(&cg, "cgroup.type").unwrap_or_default().trim() != "threaded" {
         return fail("cgroup.type did not become 'threaded'");
+    }
+    if write_attr(&cg, "cgroup.kill", b"1").is_ok() {
+        return fail("cgroup.kill accepted a threaded cgroup");
     }
     let _ = poll_once(root.rmdir(name));
     TestResult::Pass
@@ -1804,4 +1880,227 @@ fn smoke_cgroup_subtree_control_delegates() -> TestResult {
 kernel_test_in!(
     "filesystem/cgroupfs",
     smoke_cgroup_subtree_control_delegates
+);
+
+// ── Linux kernfs metadata + async enumeration parity ────────────────
+
+fn smoke_cgroup_kernfs_metadata_and_async_readdir() -> TestResult {
+    let root = root_dir();
+    let first = match root.lookup("cgroup.procs") {
+        Some(file) => file,
+        None => return TestResult::Fail("root missing cgroup.procs"),
+    };
+    let second = match root.lookup("cgroup.procs") {
+        Some(file) => file,
+        None => return TestResult::Fail("second cgroup.procs lookup failed"),
+    };
+    let stat = first.stat();
+    if first.ino() == 0 || first.ino() != second.ino() {
+        return TestResult::Fail("cgroup attribute inode is zero or unstable");
+    }
+    if stat.size != 0 || stat.mode.perms != 0o644 {
+        return TestResult::Fail("cgroup.procs metadata does not match kernfs");
+    }
+
+    let name = "t_kernfs_meta";
+    let child = match poll_once(root.mkdir(name)) {
+        Some(Ok(child)) => child,
+        _ => return TestResult::Fail("metadata test mkdir failed"),
+    };
+    let kill = match child.lookup("cgroup.kill") {
+        Some(file) => file,
+        None => {
+            let _ = poll_once(root.rmdir(name));
+            return TestResult::Fail("child missing cgroup.kill");
+        }
+    };
+    if kill.stat().size != 0 || kill.stat().mode.perms != 0o200 {
+        let _ = poll_once(root.rmdir(name));
+        return TestResult::Fail("cgroup.kill is not a write-only kernfs file");
+    }
+
+    let entries = match poll_once(child.enumerate_async(0, 256)) {
+        Some(Ok(entries)) => entries,
+        _ => {
+            let _ = poll_once(root.rmdir(name));
+            return TestResult::Fail("cgroup async enumeration failed");
+        }
+    };
+    let has_local = entries
+        .iter()
+        .any(|(entry, ty)| entry == "cgroup.stat.local" && *ty == FileType::File)
+        && entries
+            .iter()
+            .any(|(entry, ty)| entry == "cpu.stat.local" && *ty == FileType::File);
+    let _ = poll_once(root.rmdir(name));
+    if !has_local {
+        return TestResult::Fail("async enumeration omitted Linux local-stat files");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_kernfs_metadata_and_async_readdir
+);
+
+// ── subtree_control ordering + top-down disable constraint ─────────
+
+#[cfg(feature = "cgroup-pids")]
+fn smoke_cgroup_subtree_control_order_and_dependency() -> TestResult {
+    crate::cgroupfs::register_controller(Arc::new(crate::cgroupfs::pids::PidsController));
+    let root = root_dir();
+    let parent_name = "t_sc_order";
+    let cleanup = || {
+        let root = root_dir();
+        if let Some(parent) = root.lookup_dir(parent_name) {
+            if let Some(child) = parent.lookup_dir("child") {
+                let _ = write_attr(&child, "cgroup.subtree_control", b"-pids");
+            }
+            let _ = poll_once(parent.rmdir("child"));
+            let _ = write_attr(&parent, "cgroup.subtree_control", b"-pids");
+        }
+        let _ = poll_once(root.rmdir(parent_name));
+        let _ = write_attr(&root, "cgroup.subtree_control", b"-pids");
+    };
+
+    // Last token wins, matching Linux's ordered enable/disable masks.
+    if write_attr(&root, "cgroup.subtree_control", b"-pids +pids").is_err()
+        || !read_attr(&root, "cgroup.subtree_control")
+            .unwrap_or_default()
+            .contains("pids")
+    {
+        cleanup();
+        return TestResult::Fail("ordered -pids +pids did not enable pids");
+    }
+    let parent = match poll_once(root.mkdir(parent_name)) {
+        Some(Ok(parent)) => parent,
+        _ => {
+            cleanup();
+            return TestResult::Fail("subtree ordering mkdir failed");
+        }
+    };
+    if write_attr(&parent, "cgroup.subtree_control", b"+pids").is_err() {
+        cleanup();
+        return TestResult::Fail("parent +pids failed");
+    }
+    let child = match poll_once(parent.mkdir("child")) {
+        Some(Ok(child)) => child,
+        _ => {
+            cleanup();
+            return TestResult::Fail("subtree ordering child mkdir failed");
+        }
+    };
+    if write_attr(&child, "cgroup.subtree_control", b"+pids").is_err() {
+        cleanup();
+        return TestResult::Fail("child +pids failed");
+    }
+    if write_attr(&parent, "cgroup.subtree_control", b"-pids").is_ok() {
+        cleanup();
+        return TestResult::Fail("disabled controller still delegated by child");
+    }
+
+    // Once the child stops delegating, the parent's disable succeeds. A
+    // repeated + then - write must finish disabled.
+    if write_attr(&child, "cgroup.subtree_control", b"-pids").is_err()
+        || write_attr(&parent, "cgroup.subtree_control", b"+pids -pids").is_err()
+        || read_attr(&parent, "cgroup.subtree_control")
+            .unwrap_or_default()
+            .contains("pids")
+    {
+        cleanup();
+        return TestResult::Fail("ordered +pids -pids did not disable pids");
+    }
+    cleanup();
+    TestResult::Pass
+}
+#[cfg(feature = "cgroup-pids")]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_subtree_control_order_and_dependency
+);
+
+// ── root-only/non-root-only controller-file placement ───────────────
+
+#[cfg(all(feature = "cgroup-misc", feature = "cgroup-pids"))]
+fn smoke_cgroup_root_controller_file_placement() -> TestResult {
+    crate::cgroupfs::register_controller(Arc::new(crate::cgroupfs::misc::MiscController));
+    crate::cgroupfs::register_controller(Arc::new(crate::cgroupfs::pids::PidsController));
+    crate::cgroupfs::misc::register_misc_resource("t_root_capacity", 77);
+    let root = root_dir();
+
+    if root.lookup("pids.max").is_some() || root.lookup("misc.max").is_some() {
+        return TestResult::Fail("non-root controller file leaked onto root");
+    }
+    if !read_attr(&root, "misc.capacity")
+        .unwrap_or_default()
+        .contains("t_root_capacity 77")
+    {
+        return TestResult::Fail("root missing misc.capacity");
+    }
+    if !read_attr(&root, "misc.current")
+        .unwrap_or_default()
+        .contains("t_root_capacity 0")
+    {
+        return TestResult::Fail("root missing zero-valued misc.current resource");
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "cgroup-misc", feature = "cgroup-pids"))]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_root_controller_file_placement
+);
+
+// ── sibling cgroup-namespace path projection ────────────────────────
+
+fn smoke_cgroup_namespace_sibling_relative_path() -> TestResult {
+    use crate::cgroupfs::{proc_pid_cgroup, unshare_cgroup_ns};
+
+    let root = root_dir();
+    let reader_group = match poll_once(root.mkdir("t_ns_reader")) {
+        Some(Ok(group)) => group,
+        _ => return TestResult::Fail("reader cgroup mkdir failed"),
+    };
+    let target_group = match poll_once(root.mkdir("t_ns_target")) {
+        Some(Ok(group)) => group,
+        _ => {
+            let _ = poll_once(root.rmdir("t_ns_reader"));
+            return TestResult::Fail("target cgroup mkdir failed");
+        }
+    };
+    let nested = match poll_once(target_group.mkdir("nested")) {
+        Some(Ok(group)) => group,
+        _ => {
+            let _ = poll_once(root.rmdir("t_ns_target"));
+            let _ = poll_once(root.rmdir("t_ns_reader"));
+            return TestResult::Fail("target nested cgroup mkdir failed");
+        }
+    };
+    let reader = 3_300_000_080;
+    let target = 3_300_000_081;
+    if attach_pid(&reader_group, reader).is_err() || attach_pid(&nested, target).is_err() {
+        task_exited(reader);
+        task_exited(target);
+        let _ = poll_once(target_group.rmdir("nested"));
+        let _ = poll_once(root.rmdir("t_ns_target"));
+        let _ = poll_once(root.rmdir("t_ns_reader"));
+        return TestResult::Fail("namespace test membership setup failed");
+    }
+    unshare_cgroup_ns(reader);
+    let rendered = proc_pid_cgroup(target, reader);
+
+    task_exited(reader);
+    task_exited(target);
+    let _ = poll_once(target_group.rmdir("nested"));
+    let _ = poll_once(root.rmdir("t_ns_target"));
+    let _ = poll_once(root.rmdir("t_ns_reader"));
+    if rendered == b"0::/../t_ns_target/nested\n" {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("sibling cgroup namespace path was not relative")
+    }
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_namespace_sibling_relative_path
 );

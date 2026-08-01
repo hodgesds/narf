@@ -1897,6 +1897,11 @@ pub fn namespace_fd_for_task(
         NsFlavour::Cgroup => {
             #[cfg(feature = "cgroup")]
             {
+                // Procfs namespace fds are also exercised before the normal
+                // cross-crate init path in host tests.  Install the shared
+                // allocator here as well so the initial cgroup namespace can
+                // never be minted with the filesystem fallback identity 0.
+                narf_filesystem::install_ns_id_alloc_hook(crate::namespaces::alloc_ns_id);
                 let pid = task_to_pid_raw(task).unwrap_or(task);
                 HeldNs::Cgroup(narf_filesystem::cgroupfs::cgroup_namespace_of(pid))
             }

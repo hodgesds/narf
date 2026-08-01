@@ -110,6 +110,8 @@ pub fn setup() {
     // harness promises a fresh task view to every test.
     crate::handlers::__test_mount_namespaces_reset();
     crate::handlers::__test_root_dir_reset();
+    #[cfg(feature = "container")]
+    crate::pid_ns::__test_reset();
     __test_clear_global();
     fd::__test_reset();
     install_task_id_lookup(task_lookup);
@@ -142,6 +144,8 @@ pub fn setup() {
 pub fn teardown() {
     crate::handlers::__test_mount_namespaces_reset();
     crate::handlers::__test_root_dir_reset();
+    #[cfg(feature = "container")]
+    crate::pid_ns::__test_reset();
     __test_clear_global();
     fd::__test_reset();
     crate::handlers::restore_address_space_lookup(*SAVED_AS_LOOKUP.lock());

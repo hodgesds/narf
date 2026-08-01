@@ -11,8 +11,10 @@
 //!
 //! Interface files:
 //!   * `misc.current` (ro) — `<key> <usage>` lines
+//!   * `misc.peak`    (ro) — `<key> <high-water>` lines
 //!   * `misc.max`     (rw) — `<key> <max>` lines; write `"key max"` to unset
-//!   * `misc.events`  (ro) — `<key>.max <n>` lines
+//!   * `misc.capacity` (root, ro) — host capacity by key
+//!   * `misc.events[.local]` (ro) — `<key>.max <n>` lines
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -25,7 +27,14 @@ use narf_lib::sync::IrqSafeSpinLock;
 use super::controller::{Controller, ControllerState};
 use crate::FsError;
 
-const FILES: &[&str] = &["misc.current", "misc.max", "misc.events"];
+const FILES: &[&str] = &[
+    "misc.current",
+    "misc.peak",
+    "misc.max",
+    "misc.capacity",
+    "misc.events",
+    "misc.events.local",
+];
 
 /// Global registry of misc resource keys → capacity. Populated by the
 /// platform when it exposes a misc resource; empty otherwise.
@@ -50,6 +59,7 @@ impl Controller for MiscController {
         Arc::new(MiscState {
             max: IrqSafeSpinLock::new(BTreeMap::new()),
             current: IrqSafeSpinLock::new(BTreeMap::new()),
+            peak: IrqSafeSpinLock::new(BTreeMap::new()),
         })
     }
 }
@@ -60,6 +70,9 @@ pub struct MiscState {
     max: IrqSafeSpinLock<BTreeMap<&'static str, u64>>,
     /// Per-key current usage.
     current: IrqSafeSpinLock<BTreeMap<&'static str, u64>>,
+    /// Per-key high-water mark. NARF has no misc-resource charging seam yet,
+    /// so registered resources truthfully remain at zero.
+    peak: IrqSafeSpinLock<BTreeMap<&'static str, u64>>,
 }
 
 impl ControllerState for MiscState {
@@ -72,20 +85,48 @@ impl ControllerState for MiscState {
             "misc.current" => {
                 let cur = self.current.lock();
                 let mut s = String::new();
-                for (k, v) in cur.iter() {
-                    s.push_str(&format_line(k, *v));
+                for &key in CAPACITY.lock().keys() {
+                    s.push_str(&format_line(key, cur.get(key).copied().unwrap_or(0)));
+                }
+                s
+            }
+            "misc.peak" => {
+                let peak = self.peak.lock();
+                let mut s = String::new();
+                for &key in CAPACITY.lock().keys() {
+                    s.push_str(&format_line(key, peak.get(key).copied().unwrap_or(0)));
                 }
                 s
             }
             "misc.max" => {
                 let max = self.max.lock();
                 let mut s = String::new();
-                for (k, v) in max.iter() {
-                    s.push_str(&format_line(k, *v));
+                for &key in CAPACITY.lock().keys() {
+                    match max.get(key) {
+                        Some(value) => s.push_str(&format_line(key, *value)),
+                        None => {
+                            s.push_str(key);
+                            s.push_str(" max\n");
+                        }
+                    }
                 }
                 s
             }
-            "misc.events" => String::new(),
+            "misc.capacity" => {
+                let mut s = String::new();
+                for (&key, &capacity) in CAPACITY.lock().iter() {
+                    s.push_str(&format_line(key, capacity));
+                }
+                s
+            }
+            "misc.events" | "misc.events.local" => {
+                let mut s = String::new();
+                for &key in CAPACITY.lock().keys() {
+                    s.push_str(key);
+                    s.push_str(".max 0\n");
+                }
+                s
+            }
             _ => String::new(),
         }
     }
@@ -99,6 +140,9 @@ impl ControllerState for MiscState {
         let mut parts = text.split_whitespace();
         let key = parts.next().ok_or(FsError::InvalidData)?;
         let val = parts.next().ok_or(FsError::InvalidData)?;
+        if parts.next().is_some() {
+            return Err(FsError::InvalidData);
+        }
         // Resolve to a registered &'static key.
         let canon = {
             let cap = CAPACITY.lock();

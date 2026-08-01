@@ -159,13 +159,15 @@ impl ControllerState for IoState {
             .trim();
         match file {
             "io.weight" => {
-                // Accept "default <n>" or bare "<n>".
-                let n = text
-                    .split_whitespace()
-                    .next_back()
-                    .ok_or(FsError::InvalidData)?
-                    .parse::<u64>()
-                    .map_err(|_| FsError::InvalidData)?;
+                // NARF implements the default weight, not per-device weight
+                // overrides. Accept the Linux `default N` form and the
+                // single-value shorthand, but reject arbitrary prefixes.
+                let fields: alloc::vec::Vec<&str> = text.split_whitespace().collect();
+                let value = match fields.as_slice() {
+                    [value] | ["default", value] => *value,
+                    _ => return Err(FsError::InvalidData),
+                };
+                let n = value.parse::<u64>().map_err(|_| FsError::InvalidData)?;
                 if !(1..=10000).contains(&n) {
                     return Err(FsError::InvalidData);
                 }
@@ -308,6 +310,7 @@ fn parse_max_line(text: &str) -> Result<(u64, DevLimitUpdate), FsError> {
     let dev = parse_dev(dev)?;
 
     let mut update = DevLimitUpdate::default();
+    let mut any = false;
     for tok in it {
         let (key, val) = tok.split_once('=').ok_or(FsError::InvalidData)?;
         let parsed = parse_limit_val(val)?;
@@ -318,6 +321,10 @@ fn parse_max_line(text: &str) -> Result<(u64, DevLimitUpdate), FsError> {
             "wiops" => update.wiops = Some(parsed),
             _ => return Err(FsError::InvalidData),
         }
+        any = true;
+    }
+    if !any {
+        return Err(FsError::InvalidData);
     }
     Ok((dev, update))
 }
