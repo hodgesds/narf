@@ -42,12 +42,14 @@ const O_NONBLOCK: u64 = 0o4000;
 
 // ── MqOpen ──────────────────────────────────────────────────────────
 //
-// mq_open(name, oflag, mode, attr). arg0 = NUL-terminated name, arg1 =
-// oflag. O_CREAT with no attr → default 10 x 8192 queue; returns an fd.
+// mq_open(name, oflag, mode, attr). The Linux syscall ABI receives the leaf
+// name after libc validates and strips the POSIX leading slash. arg0 is that
+// NUL-terminated leaf and arg1 is oflag. O_CREAT with no attr → default
+// 10 x 8192 queue; returns an fd.
 
 fn smoke_abi_ipc_mq_open_pos() -> TestResult {
     with_setup(|| {
-        let name = b"/abi_mq_open_pos\0";
+        let name = b"abi_mq_open_pos\0";
         // O_CREAT, no attr (arg3 = 0) → fresh queue, real fd >= 0.
         let r = call(
             Syscall::MqOpen.raw(),
@@ -65,7 +67,7 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_open_pos);
 fn smoke_abi_ipc_mq_open_neg() -> TestResult {
     with_setup(|| {
         // No O_CREAT and the name does not exist → ENOENT.
-        let name = b"/abi_mq_open_missing\0";
+        let name = b"abi_mq_open_missing\0";
         match call(Syscall::MqOpen.raw(), a1(name.as_ptr() as u64, 0)) {
             Some(v) if v == ENOENT => Ok(()),
             other => {
@@ -81,7 +83,7 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_open_neg);
 
 fn smoke_abi_ipc_mq_unlink_pos() -> TestResult {
     with_setup(|| {
-        let name = b"/abi_mq_unlink_pos\0";
+        let name = b"abi_mq_unlink_pos\0";
         // Create then unlink the name → 0.
         let _ = call(
             Syscall::MqOpen.raw(),
@@ -97,7 +99,7 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_unlink_pos);
 
 fn smoke_abi_ipc_mq_unlink_neg() -> TestResult {
     with_setup(|| {
-        let name = b"/abi_mq_unlink_missing\0";
+        let name = b"abi_mq_unlink_missing\0";
         match call(Syscall::MqUnlink.raw(), a0(name.as_ptr() as u64)) {
             Some(v) if v == ENOENT => Ok(()),
             _ => Err("mq_unlink of a missing name must be ENOENT"),
@@ -124,7 +126,7 @@ fn open_mq(name: &[u8]) -> Result<u64, &'static str> {
 
 fn smoke_abi_ipc_mq_timedsend_pos() -> TestResult {
     with_setup(|| {
-        let fd = open_mq(b"/abi_mq_send_pos\0")?;
+        let fd = open_mq(b"abi_mq_send_pos\0")?;
         let payload = b"hello-mq";
         let r = call(
             Syscall::MqTimedsend.raw(),
@@ -161,7 +163,7 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_timedsend_neg);
 
 fn smoke_abi_ipc_mq_timedreceive_pos() -> TestResult {
     with_setup(|| {
-        let fd = open_mq(b"/abi_mq_recv_pos\0")?;
+        let fd = open_mq(b"abi_mq_recv_pos\0")?;
         let payload = b"abcd";
         let s = call(
             Syscall::MqTimedsend.raw(),
@@ -212,7 +214,7 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_timedreceive_neg);
 
 fn smoke_abi_ipc_mq_getsetattr_pos() -> TestResult {
     with_setup(|| {
-        let fd = open_mq(b"/abi_mq_attr_pos\0")?;
+        let fd = open_mq(b"abi_mq_attr_pos\0")?;
         let mut oldattr = [0u8; 64];
         let r = call(
             Syscall::MqGetsetattr.raw(),
@@ -261,7 +263,7 @@ fn smoke_abi_ipc_mq_linux_descriptor_semantics() -> TestResult {
     with_setup(|| {
         const F_GETFD: u64 = 1;
         const FD_CLOEXEC: i64 = 1;
-        let name = b"/abi_mq_linux_fd\0";
+        let name = b"abi_mq_linux_fd\0";
         let fd = match call(
             Syscall::MqOpen.raw(),
             a1(name.as_ptr() as u64, O_CREAT | O_RDONLY | O_NONBLOCK),
@@ -287,7 +289,7 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_linux_descriptor_semantics);
 
 fn smoke_abi_ipc_mq_priority_and_expired_timeout() -> TestResult {
     with_setup(|| {
-        let fd = open_mq(b"/abi_mq_timeout\0")?;
+        let fd = open_mq(b"abi_mq_timeout\0")?;
         let payload = b"priority";
         if call(
             Syscall::MqTimedsend.raw(),
@@ -315,7 +317,7 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_priority_and_expired_timeout);
 
 fn smoke_abi_ipc_mq_notify_signal_once() -> TestResult {
     with_setup(|| {
-        let fd = open_mq(b"/abi_mq_notify\0")?;
+        let fd = open_mq(b"abi_mq_notify\0")?;
         let mut event = [0u8; 64];
         event[8..12].copy_from_slice(&10i32.to_ne_bytes()); // SIGUSR1
         event[12..16].copy_from_slice(&0i32.to_ne_bytes()); // SIGEV_SIGNAL
@@ -333,7 +335,7 @@ fn smoke_abi_ipc_mq_notify_signal_once() -> TestResult {
         if crate::handlers::signal_pending_bits(FAKE_TASK) & crate::handlers::sig_bit(10) == 0 {
             return Err("mq_notify did not queue its signal");
         }
-        let zero_fd = open_mq(b"/abi_mq_notify_zero\0")?;
+        let zero_fd = open_mq(b"abi_mq_notify_zero\0")?;
         let mut zero_event = [0u8; 64];
         zero_event[12..16].copy_from_slice(&0i32.to_ne_bytes()); // SIGEV_SIGNAL
         if call(

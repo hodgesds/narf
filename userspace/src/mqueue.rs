@@ -111,6 +111,17 @@ fn mq_errno(error: narf_filesystem::MqueueError) -> i64 {
     }
 }
 
+/// Convert the Linux syscall ABI's leaf name into the POSIX-shaped name used
+/// by the typed mqueue backend.  libc validates the public leading slash and
+/// removes it before issuing `mq_open(2)` / `mq_unlink(2)`; Linux therefore
+/// receives `"queue"`, not `"/queue"`, at this boundary.
+fn backend_mq_name(syscall_name: &str) -> String {
+    let mut name = String::with_capacity(syscall_name.len() + 1);
+    name.push('/');
+    name.push_str(syscall_name);
+    name
+}
+
 fn timeout_deadline(timeout_ptr: u64) -> Result<Option<u64>, i64> {
     if timeout_ptr == 0 {
         return Ok(None);
@@ -224,6 +235,7 @@ pub fn sys_mq_open(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let (uid, gid) = crate::handlers::current_fs_ids();
     let mode = a.arg2 as u16;
+    let name = backend_mq_name(&name);
     let file = match mqueuefs::open(
         namespace_id(task),
         &name,
@@ -290,6 +302,7 @@ pub fn sys_mq_unlink(ctx: &mut dyn TrapContext) {
     };
     let task = current_task_id();
     let (uid, _) = crate::handlers::current_fs_ids();
+    let name = backend_mq_name(&name);
     match mqueuefs::unlink(namespace_id(task), &name, uid) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(error) => ctx.set_return(err(mq_errno(error))),
