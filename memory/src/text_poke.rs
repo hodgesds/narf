@@ -725,6 +725,16 @@ unsafe fn poke_run(
         let off = (p & (FOUR_KB - 1)) as usize;
         let run = core::cmp::min(FOUR_KB as usize - off, len - done);
 
+        // Tear down anything left here first. `map_4kb` refuses a present leaf
+        // (`AlreadyMapped`), so a single leaked window — an `unmap` that failed
+        // on some earlier call — would otherwise wedge every subsequent poke on
+        // this CPU *and* leave a permanently writable alias of whatever it last
+        // pointed at. Self-healing is cheap; the failure it prevents is not.
+        // SAFETY: unmapping this CPU's own scratch VA; the error case (nothing
+        // was mapped) is the expected one and is discarded.
+        unsafe {
+            let _ = unmap_poke_page(root, va);
+        }
         // SAFETY: `va` is this CPU's private scratch page inside the reserved
         // BPF text slot; nothing else maps it. `map_4kb` INVLPGs locally, and
         // a fresh mapping needs nothing more — no peer has a translation for
