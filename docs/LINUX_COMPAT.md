@@ -374,13 +374,30 @@ Kobject tree: `class/block/<dev>/` (`size`, `removable`, `queue/scheduler`),
 
 ### `/dev` (devfs — `filesystem/src/devfs.rs`)
 
-`null`, `zero`, `full`, `random`/`urandom` (ChaCha20, identical post-5.18),
-`kmsg`, `console`/`tty`/`tty0` (line discipline + job control),
-`ptmx` (clone-on-open) + `pts/<N>` (Unix98 PTYs with TIOCGWINSZ, TIOCGPGRP,
-TCGETS, ISIG signal chars), `fb0`, `uinput`, `input/event<N>`, `disk/` +
-`by-label`/`by-partuuid`, driver-installed `snd/` and `dri/`, and hook-installed
-`ttyUSB<N>`/`video<N>`/`fp0`/`tpm0` (`devfs.rs:835`–`886`). `/dev/fd` symlinks
-present per bring-up notes.
+The filesystem identifies as `devtmpfs` and has a writable runtime hierarchy:
+`mkdir`, char/block `mknod`, symlink, rename, unlink, and rmdir preserve stable
+inode identity and mutable mode/uid/gid metadata. Character devices translate
+to `S_IFCHR`/`DT_CHR`; block devices remain distinct as `S_IFBLK`/`DT_BLK`.
+
+Static nodes include `null`, `zero`, `full`, `random`/`urandom` (ChaCha20,
+identical byte behavior after initialization but distinct Linux 1:8/1:9 device
+IDs), `kmsg`, `console`/`tty`/`tty0`/`tty1`, `uinput`, `fuse`, and `rtc0`.
+Optional hardware nodes (`fb0`, `fp0`, `tpm*`, `snd/`, `dri/`) appear only
+after a backing driver registers them. `/dev/ptmx` is the `pts/ptmx` symlink;
+mounting `devpts` preserves the live `pts/<N>` Unix98 slaves and the 5:2
+clone-on-open node. `/dev/fuse` also clones per successful open, so path probes
+do not create connections. Registered block devices are block nodes, while
+`disk/by-label` and `disk/by-partuuid` contain Linux-shaped relative symlinks.
+`/dev/fd`, `stdin`, `stdout`, and `stderr` have their conventional procfs
+targets.
+
+Known devfs-specific gaps are tracked in
+[`filesystem/DEVFS_LINUX_COMPAT_AUDIT.md`](../filesystem/DEVFS_LINUX_COMPAT_AUDIT.md):
+devpts mount instances/options, Linux record-oriented `/dev/kmsg`,
+filesystem-UUID discovery, and authoritative driver-assigned block major/minor
+numbers. A real open of `/dev/tty` selects the caller's controlling console or
+PTY and reports `ENXIO` when the session is detached, while retaining the 5:0
+path-device identity.
 
 ### cgroup v2 (`filesystem/src/cgroupfs/`)
 

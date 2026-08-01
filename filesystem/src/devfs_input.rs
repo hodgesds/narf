@@ -398,9 +398,7 @@ impl FileOps for InputEventFile {
     /// Ref: Linux `drivers/input/evdev.c` — evdev uses major 13.
     fn stat(&self) -> Stat {
         Stat {
-            // Size = minor number packed as 32-bit; not meaningful for
-            // char devices but harmless to report.
-            size: self.event_num as u64,
+            size: 0,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
@@ -419,6 +417,10 @@ impl FileOps for InputEventFile {
         let major = 13u64;
         let minor = 64 + self.event_num as u64;
         (major << 8) | minor
+    }
+
+    fn ino(&self) -> u64 {
+        0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
     }
 
     /// Poll readiness: `POLL_IN` if the ring has any events queued.
@@ -730,6 +732,14 @@ impl FileOps for UinputControlFile {
         }
     }
 
+    fn rdev(&self) -> u64 {
+        crate::devfs::linux_makedev(10, 223)
+    }
+
+    fn ino(&self) -> u64 {
+        0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
+    }
+
     /// uinput control ioctls.
     ///
     /// Decodes the `_IOC` word; only the `'U'` (0x55) type is handled.
@@ -811,6 +821,10 @@ impl FileOps for UinputControlFile {
 pub struct DevInputDir;
 
 impl DirOps for DevInputDir {
+    fn ino(&self) -> u64 {
+        20
+    }
+
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         // Accept "eventN" where N is the 0-based device index.
         let n_str = name.strip_prefix("event")?;

@@ -140,7 +140,7 @@ fn real_cgroupfs() -> Option<Arc<dyn FsInstance>> {
 ///     sysfs → `SysFs`, devtmpfs → `DevFs`, cgroup2 → `CgroupFs`.
 ///   * pseudo-filesystems systemd mounts during early boot for which NARF has
 ///     no real semantics (securityfs, debugfs, tracefs, configfs, mqueue,
-///     devpts, fusectl, pstore, efivarfs, hugetlbfs, bpf, …). These get a
+///     fusectl, pstore, efivarfs, hugetlbfs, bpf, …). These get a
 ///     minimal empty in-memory directory so the mountpoint exists and is
 ///     statable/traversable; systemd degrades gracefully when the contents
 ///     are absent.
@@ -165,9 +165,11 @@ pub fn build_fs(fsname: &str) -> Option<Arc<dyn FsInstance>> {
         "devtmpfs" | "devfs" => Some(Arc::new(narf_filesystem::DevFs::new())),
         "cgroup2" | "cgroup" => real_cgroupfs(),
 
+        // devpts shares the live Unix98 PTY registry with /dev/pts.
+        "devpts" => Some(Arc::new(narf_filesystem::devfs_pty::DevPtsFs)),
+
         // Pseudo-filesystems with no NARF semantics: an empty, statable,
         // writable directory is enough for systemd's mount unit to succeed.
-        "devpts" => empty("devpts"),
         "mqueue" => empty("mqueue"),
         "securityfs" => empty("securityfs"),
         "debugfs" => empty("debugfs"),

@@ -49,9 +49,8 @@ fn smoke_pty_ptmx_open_returns_master() -> TestResult {
     __reset_for_test();
     let master = open_ptmx();
     let stat = master.stat();
-    // index is encoded in stat.size
-    if stat.size > 1_000_000 {
-        return TestResult::Fail("ptmx stat.size (index) unreasonably large");
+    if stat.size != 0 || stat.mode.file_type != crate::FileType::Special {
+        return TestResult::Fail("PTY master metadata is not Linux-shaped");
     }
     TestResult::Pass
 }
@@ -625,12 +624,9 @@ fn smoke_pty_gptpeer_respects_lock() -> TestResult {
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_gptpeer_respects_lock);
 
-// `DevPtmx` is the singleton FileOps that `DevDir::lookup("ptmx")`
-// returns. `sys_open` checks `is_ptmx_clone()` and, when true,
-// allocates a fresh `Pty` pair via `open_ptmx()` and installs the
-// master in the caller's fd table instead. The singleton itself is
-// never the fd's FileOps; this test pins the bit so a future refactor
-// of `DevDir::lookup` doesn't silently break musl's `open("/dev/ptmx")`.
+// `DevPtmx` is the clone node at `/dev/pts/ptmx` (the root `/dev/ptmx`
+// path is a symlink to it). `sys_open` uses `open_instance()` to allocate
+// the pair; keep the legacy marker pinned until all out-of-tree users migrate.
 #[cfg(feature = "linux-compat")]
 fn smoke_pty_devptmx_is_ptmx_clone() -> TestResult {
     use crate::devfs_pty::DevPtmx;
@@ -650,6 +646,51 @@ fn smoke_pty_devptmx_is_ptmx_clone() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_devptmx_is_ptmx_clone);
+
+/// Linux exposes `/dev/ptmx` as the relative symlink `pts/ptmx`, while the
+/// mounted devpts instance owns the clone device and shares the live PTY table.
+#[cfg(feature = "linux-compat")]
+fn smoke_pty_linux_devpts_mount_shape() -> TestResult {
+    use crate::devfs::{linux_makedev, DevFs};
+    use crate::devfs_pty::DevPtsFs;
+    use crate::{FileType, FsInstance};
+
+    __reset_for_test();
+    let dev_root = DevFs::new().root();
+    let ptmx_link = match dev_root.lookup("ptmx") {
+        Some(link) => link,
+        None => return TestResult::Fail("/dev/ptmx symlink is missing"),
+    };
+    if ptmx_link.stat().mode.file_type != FileType::Symlink {
+        return TestResult::Fail("/dev/ptmx is not a symlink");
+    }
+    let mut target = [0u8; 16];
+    match poll_once(ptmx_link.read(0, &mut target)) {
+        Some(Ok(n)) if &target[..n] == b"pts/ptmx" => {}
+        _ => return TestResult::Fail("/dev/ptmx has the wrong target"),
+    }
+
+    let master = open_ptmx();
+    let index = master.index();
+    let pts = DevPtsFs.root();
+    if !pts
+        .enumerate(0, 64)
+        .iter()
+        .any(|(name, ty)| name == &alloc::format!("{index}") && *ty == FileType::Special)
+    {
+        return TestResult::Fail("mounted devpts lost a live PTY slave");
+    }
+    let clone_node = match pts.lookup("ptmx") {
+        Some(node) => node,
+        None => return TestResult::Fail("mounted devpts has no ptmx clone node"),
+    };
+    if clone_node.rdev() != linux_makedev(5, 2) || clone_node.open_instance().is_none() {
+        return TestResult::Fail("devpts/ptmx metadata or clone-on-open is wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem/pty", smoke_pty_linux_devpts_mount_shape);
 
 // TIOCGWINSZ / TIOCSWINSZ round-trip on a master fd. The window
 // state is per-pair (master + slave share one `WinSize` slot), so

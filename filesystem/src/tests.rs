@@ -4226,16 +4226,23 @@ fn smoke_fs_fuse_dev_node() -> TestResult {
         Some(n) => n,
         None => return TestResult::Fail("/dev/fuse not found in devfs"),
     };
-    // The node must be recoverable as a DevFuse connection.
-    let conn = match DevFuse::connection_of(&node) {
+    // Merely looking up/statting the path must not allocate a connection.
+    if DevFuse::connection_of(&node).is_some() {
+        return TestResult::Fail("/dev/fuse lookup allocated a connection");
+    }
+    let opened = match node.open_instance() {
+        Some(opened) => opened,
+        None => return TestResult::Fail("/dev/fuse is not clone-on-open"),
+    };
+    let conn = match DevFuse::connection_of(&opened) {
         Some(c) => c,
-        None => return TestResult::Fail("/dev/fuse node is not a DevFuse"),
+        None => return TestResult::Fail("opened /dev/fuse is not a DevFuse"),
     };
     if !conn.is_connected() {
         return TestResult::Fail("fresh connection reports disconnected");
     }
     // Each open() mints a *distinct* connection (Linux clones per-open).
-    let node2 = root.lookup("fuse").unwrap();
+    let node2 = node.open_instance().unwrap();
     let conn2 = DevFuse::connection_of(&node2).unwrap();
     if Arc::ptr_eq(&conn, &conn2) {
         return TestResult::Fail("two opens shared one connection");

@@ -8,8 +8,9 @@
 //!
 //! Each `open("/dev/ptmx")` allocates a `Pty` and returns a `PtyMaster`
 //! `FileOps` handle.  A `PtySlave` `FileOps` handle is then reachable
-//! via `/dev/pts/<N>` where N is the index reported in the master's
-//! `stat().size` field (and via `PtyMaster::index()`).
+//! via `/dev/pts/<N>` where N is available internally through
+//! `PtyMaster::index()` and to Linux callers through PTY ioctls. As on Linux,
+//! `stat().size` remains zero and does not encode private state.
 //!
 //! Both handles share one `Arc<Pty>`.  The pair is registered in
 //! `PTY_TABLE` on allocation and removed when **both** handles have been
@@ -31,13 +32,12 @@
 //!                                         v   PtyMaster::read
 //! ```
 //!
-//! ## Limitations / deferred items (v1)
+//! ## Remaining differences
 //!
-//! - `ioctl()` not yet in NARF; PTY index is exposed via `stat().size`.
-//! - Window-size (`TIOCSWINSZ` / `TIOCGWINSZ`) deferred.
-//! - `^C` → SIGINT signal delivery to pgid deferred.
-//! - Raw mode (ICANON=0) not switchable without ioctl.
-//! - Only `^D` (0x04) is treated as EOF on slave reads.
+//! NARF currently has one global PTY registry. Separate devpts mounts expose
+//! that registry rather than allocating Linux-style independent instances,
+//! and devpts mount options (`newinstance`, `gid`, `mode`, `ptmxmode`, `max`)
+//! are not yet applied.
 
 extern crate alloc;
 
@@ -50,7 +50,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
+use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
 
 // ── Terminal ioctl numbers (Linux ABI) ────────────────────────────────────────
 //
@@ -895,12 +895,9 @@ impl FileOps for PtyMaster {
         Box::pin(async move { Ok(n) })
     }
 
-    /// `stat().size` carries the PTY index so userspace can construct
-    /// `/dev/pts/<N>` without ioctl.  This is a NARF-specific
-    /// extension; on Linux the index comes from `ioctl(TIOCGPTN)`.
     fn stat(&self) -> Stat {
         Stat {
-            size: self.pty.index as u64,
+            size: 0,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
@@ -908,6 +905,18 @@ impl FileOps for PtyMaster {
             },
             mtime_cycles: 0,
         }
+    }
+
+    fn rdev(&self) -> u64 {
+        crate::devfs::linux_makedev(5, 2)
+    }
+
+    fn ino(&self) -> u64 {
+        0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        (0, 5)
     }
 
     /// Wave-76: PtyMaster identifies itself via the FileOps hook so
@@ -1103,6 +1112,18 @@ impl FileOps for PtySlave {
         }
     }
 
+    fn rdev(&self) -> u64 {
+        crate::devfs::linux_makedev(136, self.pty.index)
+    }
+
+    fn ino(&self) -> u64 {
+        0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        (0, 5)
+    }
+
     /// Wave-76: slave-side ioctls.
     ///
     /// - `TIOCGPTN`   — returns this slave's index (Linux extension; harmless)
@@ -1248,14 +1269,9 @@ pub fn set_controlling_tty_hook(hook: CttyHook) {
 
 // ── DevPtmx FileOps ───────────────────────────────────────────────────────────
 
-/// `/dev/ptmx` itself.  Each `open()` (i.e. each call to `read()` in
-/// NARF's simplified open model) is not directly modelled — instead the
-/// VFS caller calls `DevPtmx::open_master()` to get a fresh `PtyMaster`.
-///
-/// In NARF's current VFS, there is no `open()` method on `FileOps`.
-/// Callers that need a PTY call `open_ptmx()` directly.  The `FileOps`
-/// impl here satisfies the trait surface: stat reports cdev major/minor,
-/// read/write are pass-through stubs that return 0/Unsupported.
+/// The devpts `ptmx` clone node. Path lookup and stat are side-effect free;
+/// `FileOps::open_instance` allocates a fresh master/slave pair only after a
+/// successful open has passed permission checks.
 pub struct DevPtmx;
 
 impl core::fmt::Debug for DevPtmx {
@@ -1293,6 +1309,18 @@ impl FileOps for DevPtmx {
     fn is_ptmx_clone(&self) -> bool {
         true
     }
+
+    fn open_instance(&self) -> Option<Arc<dyn FileOps>> {
+        Some(open_ptmx() as Arc<dyn FileOps>)
+    }
+
+    fn rdev(&self) -> u64 {
+        crate::devfs::linux_makedev(5, 2)
+    }
+
+    fn ino(&self) -> u64 {
+        0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
+    }
 }
 
 /// Open a new PTY master.  This is the programmatic equivalent of
@@ -1320,7 +1348,14 @@ impl core::fmt::Debug for DevPts {
 }
 
 impl DirOps for DevPts {
+    fn ino(&self) -> u64 {
+        3
+    }
+
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        if name == "ptmx" {
+            return Some(Arc::new(DevPtmx) as Arc<dyn FileOps>);
+        }
         let idx: u32 = name.parse().ok()?;
         let pty = pts_lookup(idx)?;
         // Wave-76: a locked slave is invisible to `lookup()` — the
@@ -1336,6 +1371,9 @@ impl DirOps for DevPts {
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
+            if name == "ptmx" {
+                return Ok(Arc::new(DevPtmx) as Arc<dyn FileOps>);
+            }
             let idx: u32 = name.parse().map_err(|_| FsError::NotFound)?;
             let pty = pts_lookup(idx).ok_or(FsError::NotFound)?;
             #[cfg(feature = "linux-compat")]
@@ -1354,18 +1392,16 @@ impl DirOps for DevPts {
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
-        pts_indices()
-            .into_iter()
-            .skip(cursor)
-            .take(max)
-            .map(|idx| {
+        core::iter::once((String::from("ptmx"), FileType::Special))
+            .chain(pts_indices().into_iter().map(|idx| {
                 let mut s = String::new();
-                // Format `idx` into `s` without std::fmt.
                 let mut tmp = [0u8; 10];
                 let digits = u32_to_str(idx, &mut tmp);
                 s.push_str(digits);
                 (s, FileType::Special)
-            })
+            }))
+            .skip(cursor)
+            .take(max)
             .collect()
     }
 
@@ -1375,6 +1411,22 @@ impl DirOps for DevPts {
         max: usize,
     ) -> FsFuture<'a, Vec<(String, FileType)>> {
         Box::pin(async move { Ok(self.enumerate(cursor, max)) })
+    }
+}
+
+/// Mountable Linux `devpts` filesystem. It shares NARF's PTY registry with
+/// the built-in `/dev/pts` view, so mounting `devpts` over that path preserves
+/// live Unix98 slave nodes instead of replacing them with an empty tmpfs.
+#[derive(Debug, Default)]
+pub struct DevPtsFs;
+
+impl FsInstance for DevPtsFs {
+    fn root(&self) -> Arc<dyn DirOps> {
+        Arc::new(DevPts)
+    }
+
+    fn name(&self) -> &str {
+        "devpts"
     }
 }
 
