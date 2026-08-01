@@ -5284,21 +5284,44 @@ pub fn __test_parse_hpet_body(body: &[u8]) {
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct FacsInfo {
+    /// Total FACS length in bytes, from the header. Decides which of
+    /// the later fields physically exist.
+    pub length: u32,
     pub hardware_signature: u32,
     pub firmware_waking_vector_32: u32,
     pub firmware_waking_vector_64: u64,
     pub global_lock: u32,
     pub flags: u32,
     pub version: u8,
+    /// `OspmFlags` (+36). OSPM-owned; bit 0 is
+    /// [`FACS_OSPM_FLAG_64BIT_WAKE`]. Zero when the FACS is too
+    /// short to contain the field.
+    pub ospm_flags: u32,
 }
 
+/// FACS `Flags` bit 1 — `64BIT_WAKE_SUPPORTED_F` (ACPI 4.0+).
+/// Firmware-owned: set when the platform can hand control to
+/// `XFirmwareWakingVector` in a 64-bit environment.
+pub const FACS_FLAG_64BIT_WAKE_SUPPORTED: u32 = 1 << 1;
+
+/// FACS `OspmFlags` bit 0 — `64BIT_WAKE_F` (ACPI 4.0+).
+/// OSPM-owned: set by us to tell firmware we require the 64-bit
+/// wake environment, i.e. use `XFirmwareWakingVector`.
+pub const FACS_OSPM_FLAG_64BIT_WAKE: u32 = 1;
+
+/// Smallest FACS `Length` that contains both `XFirmwareWakingVector`
+/// (+24..32) and `OspmFlags` (+36..40).
+pub const FACS_MIN_LEN_64BIT_WAKE: u32 = 40;
+
 static FACS_DATA: IrqSafeSpinLock<FacsInfo> = IrqSafeSpinLock::new(FacsInfo {
+    length: 0,
     hardware_signature: 0,
     firmware_waking_vector_32: 0,
     firmware_waking_vector_64: 0,
     global_lock: 0,
     flags: 0,
     version: 0,
+    ospm_flags: 0,
 });
 static FACS_PARSED: AtomicBool = AtomicBool::new(false);
 /// FACS body phys address — cached by `parse_facs` so
@@ -5316,9 +5339,12 @@ fn parse_facs_body(body: &[u8]) {
     //   20..24 Flags
     //   24..32 XFirmwareWakingVector
     //   32     Version
+    //   33..36 Reserved
+    //   36..40 OspmFlags
     if body.len() < 33 {
         return;
     }
+    let length = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
     let hardware_signature = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
     let firmware_waking_vector_32 = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
     let global_lock = u32::from_le_bytes([body[16], body[17], body[18], body[19]]);
@@ -5327,13 +5353,23 @@ fn parse_facs_body(body: &[u8]) {
         body[24], body[25], body[26], body[27], body[28], body[29], body[30], body[31],
     ]);
     let version = body[32];
+    // OspmFlags only exists from FACS length 40 onward; keep 0 when
+    // the table is shorter rather than reading past the fields the
+    // firmware actually published.
+    let ospm_flags = if body.len() >= 40 {
+        u32::from_le_bytes([body[36], body[37], body[38], body[39]])
+    } else {
+        0
+    };
     *FACS_DATA.lock() = FacsInfo {
+        length,
         hardware_signature,
         firmware_waking_vector_32,
         firmware_waking_vector_64,
         global_lock,
         flags,
         version,
+        ospm_flags,
     };
 }
 
@@ -5411,23 +5447,82 @@ pub fn facs_info() -> Option<FacsInfo> {
 pub enum WakeVectorError {
     /// FACS hasn't been parsed yet — no phys address to write to.
     FacsNotParsed,
-    /// Caller-supplied wake-entry phys is in the high 4 GiB but
-    /// the FACS reports `Version < 1`, which means the 64-bit
-    /// `XFirmwareWakingVector` slot doesn't exist.
-    EntryAbove4GButFacsV0,
+    /// FACS `Length` is under [`FACS_MIN_LEN_64BIT_WAKE`], so the
+    /// table has no `XFirmwareWakingVector` / `OspmFlags` fields to
+    /// write.
+    FacsTooShort,
+    /// FACS `Version` is 0 (ACPI 1.0 FACS): the 64-bit
+    /// `XFirmwareWakingVector` slot is not defined on this firmware.
+    FacsVersionTooOld,
+    /// Firmware does not advertise `64BIT_WAKE_SUPPORTED_F`
+    /// (FACS `Flags` bit 1), so it will only ever enter the legacy
+    /// real-mode 32-bit `FirmwareWakingVector` — for which NARF has
+    /// no trampoline. See [`arm_s3_waking_vector`].
+    NoSixtyFourBitWake,
 }
 
-/// Program the FACS firmware-waking-vector(s). After S3 entry,
-/// the platform firmware jumps to this phys on resume — for
-/// modern 64-bit BIOSes this is the long-mode entry point
-/// (written to `XFirmwareWakingVector`); for legacy 32-bit
-/// BIOSes it's the real-mode entry (written to
-/// `FirmwareWakingVector`).
+/// Program the FACS firmware waking vector for S3 resume.
 ///
-/// We populate both slots so the same kernel image works on
-/// either firmware. The 32-bit slot expects a phys address
-/// below 1 MiB pointing at a real-mode trampoline; the 64-bit
-/// slot accepts any address and the CPU enters in long mode.
+/// # Which slot, and why
+///
+/// The FACS has two waking-vector slots and they are **not**
+/// interchangeable:
+///
+/// - `FirmwareWakingVector` (+12, 32-bit) is entered by firmware in
+///   **real mode**. It must be a sub-1 MiB physical address pointing
+///   at a 16-bit trampoline that establishes protected mode, then
+///   long mode, itself.
+/// - `XFirmwareWakingVector` (+24, 64-bit, ACPI 2.0+ / FACS
+///   `Version >= 1`) is the slot that takes a **long-mode** address.
+///   Firmware only honours it when it advertises
+///   `64BIT_WAKE_SUPPORTED_F` (`Flags` bit 1, ACPI 4.0) and OSPM
+///   requests the 64-bit environment via `64BIT_WAKE_F`
+///   (`OspmFlags` bit 0).
+///
+/// NARF's wake entry (`narf_arch::x86_64::s3_resume::s3_wake_entry`)
+/// is a long-mode entry point living wherever the kernel was loaded.
+/// There is no real-mode trampoline, so this function:
+///
+/// 1. **refuses** unless the firmware advertises 64-bit wake,
+/// 2. writes `entry_phys` to `XFirmwareWakingVector` only,
+/// 3. sets `OspmFlags.64BIT_WAKE_F` to select that path, and
+/// 4. writes **zero** to the 32-bit `FirmwareWakingVector`.
+///
+/// Point 4 is the fix for the original defect: the old code put
+/// `entry_phys as u32` — a truncated long-mode address — into a slot
+/// firmware enters in real mode. On a machine that used it, that is
+/// a jump to an arbitrary 20-bit-addressable location with no
+/// paging, i.e. an unrecoverable resume.
+///
+/// # What this does and does not support
+///
+/// - **Supported:** firmware that sets `64BIT_WAKE_SUPPORTED_F` and
+///   honours `OspmFlags.64BIT_WAKE_F` + `XFirmwareWakingVector`
+///   (the ACPI 4.0+ 64-bit wake environment). `entry_phys` may be
+///   anywhere in the 64-bit physical space.
+/// - **Not supported:** firmware that implements only the legacy
+///   real-mode 32-bit vector — which is most real x86 firmware.
+///   Those now get [`WakeVectorError::NoSixtyFourBitWake`] and the
+///   caller refuses to sleep, instead of sleeping into a machine
+///   that cannot come back. Closing this gap needs a real sub-1 MiB
+///   real-mode trampoline (allocate low memory, relocate a 16-bit
+///   stub into it, build transient GDT + page tables, enter long
+///   mode, then jump to `s3_wake_entry`) — not a different address
+///   in the same slot.
+/// - **Not supported:** FACS `Version == 0`, or a FACS shorter than
+///   [`FACS_MIN_LEN_64BIT_WAKE`].
+///
+/// // LINUX-GAP: Linux takes the opposite branch. `acpi_set_waking_vector`
+/// // (`drivers/acpi/sleep.h`) always passes `physical_address64 = 0`, and
+/// // `acpi_hw_set_firmware_waking_vector` (`drivers/acpi/acpica/hwxfsleep.c`)
+/// // writes the 32-bit slot unconditionally, because x86 Linux ships a real
+/// // sub-1 MiB real-mode trampoline: `acpi_get_wakeup_address()`
+/// // (`arch/x86/kernel/acpi/sleep.c`) returns `real_mode_header->wakeup_start`,
+/// // allocated by `reserve_real_mode()` from `[0, 1<<20)`, and
+/// // `arch/x86/realmode/rm/wakeup_asm.S` is `.code16`. Linux never reads
+/// // `64BIT_WAKE_SUPPORTED_F` or writes `OspmFlags` at all. NARF diverges
+/// // because it has no such trampoline; until it does, the 64-bit wake
+/// // environment is the only slot it can honestly arm.
 ///
 /// FACS must have been parsed via [`parse_facs`] beforehand.
 ///
@@ -5440,32 +5535,57 @@ pub unsafe fn arm_s3_waking_vector(entry_phys: u64) -> Result<(), WakeVectorErro
     if facs == 0 || !FACS_PARSED.load(Ordering::Acquire) {
         return Err(WakeVectorError::FacsNotParsed);
     }
-    let version = FACS_DATA.lock().version;
-    if entry_phys > 0xFFFF_FFFF && version < 1 {
-        return Err(WakeVectorError::EntryAbove4GButFacsV0);
+    let (length, flags, version) = {
+        let g = FACS_DATA.lock();
+        (g.length, g.flags, g.version)
+    };
+    // Validate everything before writing anything: a refused arm
+    // must leave the firmware's FACS byte-for-byte untouched, so a
+    // caller that goes on to sleep anyway is no worse off than if
+    // this had never been called.
+    if length < FACS_MIN_LEN_64BIT_WAKE {
+        return Err(WakeVectorError::FacsTooShort);
     }
-    // 32-bit `FirmwareWakingVector` at offset +12.
-    // SAFETY: FACS is identity-mapped at `facs`; offset within the
-    // declared layout. Write low-32 of entry; high bits ignored
-    // by 32-bit-only firmware.
+    if version < 1 {
+        return Err(WakeVectorError::FacsVersionTooOld);
+    }
+    if flags & FACS_FLAG_64BIT_WAKE_SUPPORTED == 0 {
+        return Err(WakeVectorError::NoSixtyFourBitWake);
+    }
+    // 64-bit `XFirmwareWakingVector` at +24 — the only slot that can
+    // hold a long-mode entry.
+    // SAFETY: FACS is identity-mapped at `facs`, `Length` was checked
+    // to cover +24..32, and the ACPI-mandated FACS alignment makes
+    // `facs + 24` 8-aligned.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_volatile((facs + 12) as *mut u32, entry_phys as u32);
+        core::ptr::write_volatile((facs + 24) as *mut u64, entry_phys);
     }
-    if version >= 1 {
-        // 64-bit `XFirmwareWakingVector` at offset +24.
-        // SAFETY: same.
-        unsafe {
-            core::ptr::write_volatile((facs + 24) as *mut u64, entry_phys);
-        }
+    // 32-bit `FirmwareWakingVector` at +12 stays ZERO. It is a
+    // real-mode entry point; `entry_phys as u32` would be a
+    // truncated long-mode address and entering it would be fatal.
+    // SAFETY: as above, for +12..16.
+    // SAFETY: Valid memory or trusted environment
+    unsafe {
+        core::ptr::write_volatile((facs + 12) as *mut u32, 0u32);
     }
+    // `OspmFlags` at +36: assert 64BIT_WAKE_F so firmware knows to
+    // take the 64-bit vector. Read-modify-write — the field is
+    // OSPM-owned but other bits may be defined by later revisions.
+    // SAFETY: as above, for +36..40.
+    // SAFETY: Valid memory or trusted environment
+    let ospm_flags = unsafe {
+        let p = (facs + 36) as *mut u32;
+        let updated = core::ptr::read_volatile(p) | FACS_OSPM_FLAG_64BIT_WAKE;
+        core::ptr::write_volatile(p, updated);
+        updated
+    };
     // Reflect into the parsed snapshot so facs_info() agrees with
     // the post-arm state.
     let mut g = FACS_DATA.lock();
-    g.firmware_waking_vector_32 = entry_phys as u32;
-    if version >= 1 {
-        g.firmware_waking_vector_64 = entry_phys;
-    }
+    g.firmware_waking_vector_32 = 0;
+    g.firmware_waking_vector_64 = entry_phys;
+    g.ospm_flags = ospm_flags;
     Ok(())
 }
 
