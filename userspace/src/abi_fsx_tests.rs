@@ -852,6 +852,11 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_name_to_handle_at_neg);
 #[cfg(feature = "cgroup")]
 fn smoke_abi_fsx_name_to_handle_at_cgroup_dir_id() -> TestResult {
     setup();
+    // Kernel-test fixture: hands the syscall entry point kernel `.rodata` /
+    // stack pointers as stand-in user buffers. See
+    // `handlers::kernel_buffers_guard` and `with_setup`, which does the same
+    // for the tests that use the closure form of this harness.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
     let mnt = match registry().mount(&auth, "/abicg", narf_filesystem::cgroupfs::CgroupFs::new()) {
         Ok(h) => h,

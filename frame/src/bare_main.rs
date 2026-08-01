@@ -137,6 +137,11 @@ mod canary;
 mod cross_crate_init;
 mod measure;
 mod secure_boot;
+/// SMP exercise for the JIT-text W^X seal. Lives here rather than in
+/// `memory/` because it needs to pin a task to a peer CPU and the scheduler
+/// sits above `narf-memory` in the dependency graph.
+#[cfg(feature = "kernel-test")]
+mod wx_smp;
 
 /// Called from the arch-specific boot stub once the CPU is in a state
 /// capable of executing Rust: stack set up, appropriate privilege level,
@@ -1267,6 +1272,21 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  mmu: installed, PML4 @ {:?}, console remapped",
                             pml4
                         );
+                        // Supervisor stores ignore the read-only bit unless
+                        // CR0.WP is set (Intel SDM Vol 3 §4.6.1), and boot.S
+                        // only ever set CR0.PG — measured CR0 at this point
+                        // was 0x80000011, WP=0. Every read-only kernel
+                        // mapping in this tree was therefore advisory. Set it
+                        // here, on the BSP, immediately after the CR3 handoff
+                        // and while the console is live, so a latent write
+                        // through a read-only mapping surfaces as a
+                        // diagnosable fault rather than silent corruption.
+                        // `_ap_start_rust` does the same for each AP — WP is
+                        // per-CPU state.
+                        // SAFETY: CPL=0, on the BSP, single-threaded.
+                        unsafe {
+                            narf_memory::text_poke::enable_write_protect();
+                        }
 
                         // The kernel direct map now covers all installed
                         // RAM (the low 512 GiB identity window), so the

@@ -119,8 +119,8 @@ fn smoke_atombios_extract_version_correct() -> TestResult {
             ))
         }
     };
-    match &atom.version {
-        Some(v) if v == "FAKE BIOS VERSION 1.0" => TestResult::Pass,
+    match atom.version.as_deref() {
+        Some("FAKE BIOS VERSION 1.0") => TestResult::Pass,
         Some(v) => TestResult::Fail(alloc::boxed::Box::leak(
             alloc::format!("wrong version: {:?}", v).into_boxed_str(),
         )),
@@ -188,7 +188,7 @@ fn smoke_atombios_drm_card_vbios_version() -> TestResult {
         atom.version.clone(),
     );
     match card.vbios_version() {
-        Some(v) if v == "FAKE BIOS VERSION 1.0" => TestResult::Pass,
+        Some("FAKE BIOS VERSION 1.0") => TestResult::Pass,
         Some(v) => TestResult::Fail(alloc::boxed::Box::leak(
             alloc::format!("wrong vbios_version: {:?}", v).into_boxed_str(),
         )),

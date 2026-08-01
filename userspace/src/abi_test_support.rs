@@ -600,7 +600,7 @@ pub fn with_memfs(
             return TestResult::Fail("memfs mount failed");
         }
     };
-    let outcome = body();
+    let outcome = crate::handlers::with_kernel_buffers(body);
     let _ = registry().unmount(&handle, mount);
     teardown();
     match outcome {
@@ -611,7 +611,40 @@ pub fn with_memfs(
 
 /// Run `body` with just the syscall table + fake task + fresh fd table
 /// (no mount). Teardown is automatic.
+///
+/// The body runs inside [`crate::handlers::with_kernel_buffers`]. These
+/// smokes have no user address space by construction — they call
+/// `kernel_syscall_entry` directly and hand it pointers to kernel `.rodata`
+/// string literals and kernel stack/heap scratch buffers, all of which sit
+/// in the kernel half on both architectures (x86_64 links higher-half:
+/// `.rodata` at 0xFFFF_FFFF_81E2_E000; aarch64 runs entirely out of
+/// TTBR1). `validate_user_range` confines a real syscall's ranges to the
+/// user half, so without the opt-in 339 of these smokes would EFAULT on
+/// their own fixture rather than on the behaviour they test.
+///
+/// The opt-in is dynamically scoped and keyed on the CPU, so it covers
+/// exactly this harness — not the rest of the `kernel-test` suite, not a
+/// concurrent task, and it is not compiled at all outside `kernel-test`.
+/// Tests whose subject *is* the boundary use [`with_setup_strict`].
 pub fn with_setup(body: impl FnOnce() -> Result<(), &'static str>) -> TestResult {
+    setup();
+    let outcome = crate::handlers::with_kernel_buffers(body);
+    teardown();
+    match outcome {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+
+/// [`with_setup`] **without** the kernel-buffer opt-in: the syscalls the
+/// body issues see the same `validate_user_range` predicate a real user
+/// task does.
+///
+/// Use this for any test whose subject *is* the user/kernel address
+/// boundary — `abi_uaccess_tests.rs`. A test asserting that a kernel-half
+/// pointer is rejected would be vacuous under `with_setup`, which opens
+/// the opt-in precisely so kernel scratch buffers pass.
+pub fn with_setup_strict(body: impl FnOnce() -> Result<(), &'static str>) -> TestResult {
     setup();
     let outcome = body();
     teardown();

@@ -90,10 +90,23 @@ _ap_protected_start:
     or  eax, 0x20
     mov cr4, eax
 
-    /* IA32_EFER.LME = 1. */
+    /* IA32_EFER.LME = 1 (bit 8) and IA32_EFER.NXE = 1 (bit 11).
+     *
+     * NXE must be set HERE, before CR0.PG, not in `_ap_start_rust`.
+     * The BSP's PML4 — which this AP is about to load — marks almost
+     * every leaf NO_EXEC (PTE bit 63) so that no kernel data has an
+     * executable alias. With NXE clear, bit 63 is a RESERVED bit, and
+     * the very first instruction fetch after `mov cr0` takes a
+     * reserved-bit #PF with no IDT loaded: a triple fault at a point
+     * where the AP has no console. `enable_nxe()` in `_ap_start_rust`
+     * is far too late — the AP has to survive the walk to get there.
+     *
+     * Unconditional because the BSP already hard-failed the boot if
+     * CPUID did not report NX (`bare_main.rs`, "EFER.NXE not enabled"),
+     * so by the time any AP runs, NX is known present. */
     mov ecx, 0xC0000080
     rdmsr
-    or  eax, 0x100
+    or  eax, 0x900
     wrmsr
 
     /* CR0.PG = 1 (bit 31). PE is already set. */

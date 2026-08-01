@@ -15,7 +15,11 @@ use crate::abi_test_support::*;
 const BPF_MAP_CREATE: u64 = 0;
 const BPF_PROG_LOAD: u64 = 5;
 const BPF_OBJ_PIN: u64 = 6;
+const BPF_OBJ_GET: u64 = 7;
 const BPF_PROG_TEST_RUN: u64 = 10;
+/// `BPF_PROG_QUERY` — still unimplemented, and the stand-in for `BPF_OBJ_PIN`
+/// in the "deliberately absent" list now that pinning has landed.
+const BPF_PROG_QUERY: u64 = 16;
 const BPF_BTF_LOAD: u64 = 18;
 
 const EOPNOTSUPP: i64 = -95;
@@ -220,8 +224,9 @@ fn smoke_abi_bpf_unimplemented_cmds() -> TestResult {
     with_setup(|| {
         let attr = [0u8; ATTR_LEN];
         // `BPF_BTF_LOAD` used to be in this list; it is implemented now, and
-        // its own conformance group lives in `abi_bpf_btf_tests.rs`.
-        for cmd in [BPF_OBJ_PIN, 9999] {
+        // its own conformance group lives in `abi_bpf_btf_tests.rs`. So were
+        // `BPF_OBJ_PIN` / `BPF_OBJ_GET`, whose group is at the end of this file.
+        for cmd in [BPF_PROG_QUERY, 9999] {
             let r = call(
                 Syscall::Bpf.raw(),
                 a2(cmd, attr.as_ptr() as u64, ATTR_LEN as u64),
@@ -381,6 +386,78 @@ fn smoke_abi_perf_set_bpf_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_perf_set_bpf_neg);
+
+/// `SET_BPF` is an entry point into running a BPF program, so it takes the same
+/// privilege gate `bpf(2)` does.
+///
+/// It did not. `bpf(2)` checks euid on every command, but `perf_event_open`
+/// takes no credential at all and this ioctl took none either — so a program fd
+/// that left its privileged loader, inherited across `fork` (`FD_CLOEXEC` is
+/// consumed only on the exec path) or passed deliberately over `SCM_RIGHTS`,
+/// let an unprivileged task attach it to a tracepoint it opened and then fire
+/// it at will. Each fire runs up to `DEFAULT_FUEL` instructions from the perf
+/// drain with IRQs masked and two locks held.
+///
+/// Both arms are gated, and both are checked here: the *clear* arm matters
+/// independently, because without it any holder of the event fd could silently
+/// remove a filter a privileged task installed.
+fn smoke_abi_perf_set_bpf_requires_privilege() -> TestResult {
+    with_setup(|| {
+        // Set up privileged, exactly as the legitimate loader would.
+        let insns = ret_imm(1);
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &insns).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a filter program");
+        }
+        let ev = open_tracepoint_event().ok_or("could not open a tracepoint event")?;
+
+        // Drop privilege. The fds survive — that is the whole point.
+        //
+        // LINUX-GAP: Linux returns EPERM here — `perf_allow_tracepoint()`
+        // (include/linux/perf_event.h) is `-EPERM`, distinct from
+        // `perf_allow_cpu()`'s `-EACCES`. NARF reports EACCES, because
+        // `sys_ioctl` maps every `FsError::PermissionDenied` to `-13` and
+        // `FsError` has no variant that reaches EPERM through that path.
+        // Asserted as EACCES rather than left unpinned, so the divergence is a
+        // recorded fact and a future `FsError` split flips this one line
+        // instead of discovering the gap. The refusal itself — which is the
+        // security property — is identical either way.
+        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, prog_fd as u64),
+        ) != Some(EACCES)
+        {
+            return Err("unprivileged SET_BPF was not refused");
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, u64::from(u32::MAX)),
+        ) != Some(EACCES)
+        {
+            return Err("unprivileged SET_BPF clear was not refused");
+        }
+
+        // Privileged again: the same calls work, so this is a privilege gate
+        // and not a blanket refusal.
+        crate::handlers::__test_set_fsids(FAKE_TASK, 0, 0);
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, prog_fd as u64),
+        ) != Some(0)
+        {
+            return Err("privileged SET_BPF was refused");
+        }
+        let _ = call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, u64::from(u32::MAX)),
+        );
+        let _ = call(Syscall::Close.raw(), a0(ev as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_perf_set_bpf_requires_privilege);
 
 fn smoke_abi_perf_set_bpf_wrong_event_type() -> TestResult {
     // NARF wires only the tracepoint type to its trace events, so attaching to
@@ -2052,21 +2129,71 @@ kernel_test_in!(
 
 // ── links ───────────────────────────────────────────────────────────
 
-/// LINUX-GAP: `BPF_LINK_GET_NEXT_ID` / `BPF_LINK_GET_FD_BY_ID`. NARF has no
-/// link object to assign ids to, so these stay `ENOTSUP` — worth pinning,
-/// because the failure mode when a link type does arrive is these arms being
-/// forgotten and a probing loader concluding the kernel has no links at all.
+/// The errno vocabulary of the link id commands.
+///
+/// This test used to pin both commands at `ENOTSUP`, because there was no link
+/// object to assign ids to. There is now, so the contract has inverted: an
+/// unknown id is `ENOENT` (not `ENOTSUP`, which would tell a probing loader the
+/// kernel has no links at all) and a malformed `bpf_attr` is `EINVAL`.
 fn smoke_abi_bpf_link_id_cmds_neg() -> TestResult {
     with_setup(|| {
+        // Id 0 is never assigned — the counter starts at 1.
+        if fd_by_id(BPF_LINK_GET_FD_BY_ID, 0) != Some(ENOENT) {
+            return Err("BPF_LINK_GET_FD_BY_ID(0) did not return ENOENT");
+        }
+        // An id far past anything this boot assigned.
+        if fd_by_id(BPF_LINK_GET_FD_BY_ID, u32::MAX) != Some(ENOENT) {
+            return Err("BPF_LINK_GET_FD_BY_ID on an unassigned id did not return ENOENT");
+        }
+        // Past the last possible id there is nothing, and the answer is ENOENT
+        // rather than a zero id reported as success.
+        if next_id(BPF_LINK_GET_NEXT_ID, u32::MAX).0 != Some(ENOENT) {
+            return Err("BPF_LINK_GET_NEXT_ID past the end did not return ENOENT");
+        }
+        // A `bpf_attr` shorter than the command's own fields.
         let mut attr = [0u8; ATTR_LEN];
-        for cmd in [BPF_LINK_GET_NEXT_ID, BPF_LINK_GET_FD_BY_ID] {
-            if call(
-                Syscall::Bpf.raw(),
-                a2(cmd, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
-            ) != Some(EOPNOTSUPP)
-            {
-                return Err("a link id command did not return ENOTSUP");
-            }
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_LINK_GET_NEXT_ID, attr.as_mut_ptr() as u64, 4),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_LINK_GET_NEXT_ID with a truncated bpf_attr did not return EINVAL");
+        }
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_LINK_GET_FD_BY_ID, attr.as_mut_ptr() as u64, 2),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_LINK_GET_FD_BY_ID with a truncated bpf_attr did not return EINVAL");
+        }
+        // `CHECK_ATTR`: `BPF_LINK_GET_FD_BY_ID_LAST_FIELD` is `link_id`, so a
+        // link fd takes no `open_flags` — a caller that set one is relying on
+        // behaviour this kernel does not implement.
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 8, 1);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_LINK_GET_FD_BY_ID,
+                attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_LINK_GET_FD_BY_ID ignored a non-zero byte past its last field");
+        }
+        // `BPF_LINK_GET_NEXT_ID_LAST_FIELD` is `next_id`, so `open_flags` is
+        // past it here too.
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_LINK_GET_NEXT_ID,
+                attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_LINK_GET_NEXT_ID ignored a non-zero byte past its last field");
         }
         Ok(())
     })
@@ -2652,3 +2779,1342 @@ fn smoke_bpf_syscall_link_close_detaches_xdp() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_bpf_syscall_link_close_detaches_xdp);
+
+// ════════════════════════════════════════════════════════════════════
+// The link and BTF id commands — BPF_LINK_GET_NEXT_ID (33) /
+// BPF_LINK_GET_FD_BY_ID (32) / BPF_BTF_GET_NEXT_ID (23) /
+// BPF_BTF_GET_FD_BY_ID (19), and the `bpf_link_info` / `bpf_btf_info`
+// arms of BPF_OBJ_GET_INFO_BY_FD.
+//
+// The interesting half is id *lifetime*, not the happy path:
+//
+//  * an fd obtained by id holds its own reference, so the object outlives
+//    the fd it was created through;
+//  * for a link that reference is also an *attach*, so the id-obtained fd
+//    must still detach when it is the last one closed — `BpfLink::drop`
+//    exists for exactly that, and
+//    `smoke_bpf_syscall_link_by_id_still_detaches` is the pin;
+//  * a freed object's id is `ENOENT`, never a dangling handle, and is
+//    never handed to a later object.
+// ════════════════════════════════════════════════════════════════════
+
+const BPF_BTF_GET_FD_BY_ID: u64 = 19;
+const BPF_BTF_GET_NEXT_ID: u64 = 23;
+
+/// `enum bpf_link_type`. The two NARF can produce.
+const BPF_LINK_TYPE_TRACING: u32 = 2;
+const BPF_LINK_TYPE_XDP: u32 = 6;
+
+// `struct bpf_link_info` field offsets.
+const LI_TYPE: usize = 0;
+const LI_ID: usize = 4;
+const LI_PROG_ID: usize = 8;
+/// The union: `tracing.attach_type`, or `xdp.ifindex`.
+const LI_UNION: usize = 16;
+/// What NARF fills of `struct bpf_link_info` — short of Linux's 64, because
+/// every union member NARF can produce ends before it. The truncation contract
+/// reports this number back, so a caller compiled against the full struct knows
+/// the tail is untouched.
+const LINK_INFO_LEN: usize = 32;
+
+// `struct bpf_btf_info` field offsets.
+const BI_BTF: usize = 0;
+const BI_BTF_SIZE: usize = 8;
+const BI_ID: usize = 12;
+const BI_NAME: usize = 16;
+const BI_NAME_LEN: usize = 24;
+const BI_KERNEL_BTF: usize = 28;
+/// `sizeof(struct bpf_btf_info)`. Spelled out here rather than imported from
+/// `sys_bpf_info.rs`, so a test cannot agree with the implementation by
+/// construction while both drift from the uapi header.
+const BTF_INFO_LEN: usize = 32;
+
+// `struct { … } btf` offsets within `union bpf_attr`, for BPF_BTF_LOAD.
+const BTF_DATA: usize = 0;
+const BTF_SIZE: usize = 16;
+
+fn put_info_u32(buf: &mut [u8; INFO_BUF], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+// bpffs — `BPF_OBJ_PIN` (6) and `BPF_OBJ_GET` (7).
+//
+// Three things are pinned here, in rising order of importance:
+//
+//  1. the errno vocabulary, positive and negative per command;
+//  2. that `OBJ_GET` returns a *working* fd on the *same* object rather than a
+//     lookalike — proved by mutating a map through one fd and reading the
+//     mutation back through the other, and by running a program through a
+//     reopened fd;
+//  3. **lifetime** — the object survives the creating fd's close while a pin
+//     exists, and is freed when the last pin and fd go. The oracle for "is it
+//     still alive" is `BPF_MAP_GET_FD_BY_ID`, because `narf_bpf::idreg` holds
+//     `Weak`s and `Drop for BpfMap` prunes its entry: an id whose object has
+//     been dropped is `ENOENT`, one whose object lives resolves. That makes
+//     "a pin is a strong reference" an observable claim rather than a comment.
+// ════════════════════════════════════════════════════════════════════
+
+// `struct { … }` (BPF_OBJ_* commands) offsets within `union bpf_attr`.
+const OB_PATHNAME: usize = 0;
+const OB_BPF_FD: usize = 8;
+const OB_FILE_FLAGS: usize = 12;
+const OB_PATH_FD: usize = 16;
+/// `offsetofend(union bpf_attr, path_fd)` — where `CHECK_ATTR(BPF_OBJ)` starts
+/// demanding zeroes.
+const OB_END: usize = 20;
+
+const BPF_F_RDONLY_FLAG: u32 = 1 << 3;
+const BPF_F_PATH_FD: u32 = 1 << 14;
+
+/// `F_GETFD`.
+const F_GETFD: u64 = 1;
+
+/// A NUL-terminated path in a fixed buffer, so the handler's `copy_user_cstr`
+/// sees the shape a real C caller hands it.
+struct CPath([u8; 96]);
+
+impl CPath {
+    fn new(s: &str) -> Self {
+        let mut b = [0u8; 96];
+        b[..s.len()].copy_from_slice(s.as_bytes());
+        Self(b)
+    }
+    fn ptr(&self) -> u64 {
+        self.0.as_ptr() as u64
+    }
+}
+
+fn obj_attr(path_ptr: u64, bpf_fd: u32, file_flags: u32, path_fd: u32) -> [u8; ATTR_LEN] {
+    let mut a = [0u8; ATTR_LEN];
+    put_u64(&mut a, OB_PATHNAME, path_ptr);
+    put_u32(&mut a, OB_BPF_FD, bpf_fd);
+    put_u32(&mut a, OB_FILE_FLAGS, file_flags);
+    put_u32(&mut a, OB_PATH_FD, path_fd);
+    a
+}
+
+fn obj_pin(fd: i64, path: &CPath) -> Option<i64> {
+    bpf(BPF_OBJ_PIN, &obj_attr(path.ptr(), fd as u32, 0, 0))
+}
+
+fn obj_get(path: &CPath) -> Option<i64> {
+    bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 0, 0))
+}
+
+/// The smallest well-formed BTF blob: a header, one `BTF_KIND_INT` named
+/// "int", and a five-byte string section. The only use here is to obtain a
+/// BTF fd.
+///
+/// Hand-encoded, and a second copy of the one in `abi_bpf_btf_tests.rs`: a
+/// fixture shared between two conformance files would let one change move both
+/// at once, which is the coupling these ABI files exist to avoid.
+fn minimal_btf() -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::new();
+    v.extend_from_slice(&0xeb9fu16.to_le_bytes()); // magic
+    v.push(1); // version
+    v.push(0); // flags
+    v.extend_from_slice(&24u32.to_le_bytes()); // hdr_len
+    v.extend_from_slice(&0u32.to_le_bytes()); // type_off
+    v.extend_from_slice(&16u32.to_le_bytes()); // type_len
+    v.extend_from_slice(&16u32.to_le_bytes()); // str_off
+    v.extend_from_slice(&5u32.to_le_bytes()); // str_len
+    v.extend_from_slice(&1u32.to_le_bytes()); // btf_type.name_off
+    v.extend_from_slice(&(1u32 << 24).to_le_bytes()); // btf_type.info: KIND_INT
+    v.extend_from_slice(&4u32.to_le_bytes()); // btf_type.size
+    v.extend_from_slice(&32u32.to_le_bytes()); // int_data: 32 bits
+    v.extend_from_slice(b"\0int\0");
+    v
+}
+
+fn btf_load(blob: &[u8]) -> Option<i64> {
+    let mut attr = [0u8; ATTR_LEN];
+    put_u64(&mut attr, BTF_DATA, blob.as_ptr() as u64);
+    put_u32(&mut attr, BTF_SIZE, blob.len() as u32);
+    call(
+        Syscall::Bpf.raw(),
+        a2(BPF_BTF_LOAD, attr.as_ptr() as u64, ATTR_LEN as u64),
+    )
+}
+
+/// A link fd on a fresh probe, the program fd behind it, and the probe id.
+fn make_link() -> Result<(i64, i64, u32), &'static str> {
+    let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+    if prog_fd < 0 {
+        return Err("BPF_PROG_LOAD failed");
+    }
+    let probe = fresh_probe();
+    let link_fd = bpf(
+        BPF_LINK_CREATE,
+        &link_attr(prog_fd as u32, probe, BPF_TRACE_FENTRY),
+    )
+    .ok_or("bpf() not Ok")?;
+    if link_fd < 0 {
+        return Err("BPF_LINK_CREATE failed");
+    }
+    Ok((link_fd, prog_fd, probe))
+}
+
+/// A link's `bpf_link_info`, read through the syscall. Also pins the reported
+/// length, which is the half of the truncation contract a field-value check
+/// would never look at.
+fn link_info_of(fd: i64) -> Result<[u8; INFO_BUF], &'static str> {
+    let mut info = [0u8; INFO_BUF];
+    let (r, back) = obj_info(fd, &mut info, LINK_INFO_LEN as u32);
+    if r != Some(0) {
+        return Err("BPF_OBJ_GET_INFO_BY_FD failed on a link fd");
+    }
+    if back != LINK_INFO_LEN as u32 {
+        return Err("BPF_OBJ_GET_INFO_BY_FD reported the wrong bpf_link_info length");
+    }
+    Ok(info)
+}
+
+/// A blob's `bpf_btf_info`, with no request to copy the blob out.
+fn btf_info_of(fd: i64) -> Result<[u8; INFO_BUF], &'static str> {
+    let mut info = [0u8; INFO_BUF];
+    let (r, back) = obj_info(fd, &mut info, BTF_INFO_LEN as u32);
+    if r != Some(0) {
+        return Err("BPF_OBJ_GET_INFO_BY_FD failed on a btf fd");
+    }
+    if back != BTF_INFO_LEN as u32 {
+        return Err("BPF_OBJ_GET_INFO_BY_FD reported the wrong bpf_btf_info length");
+    }
+    Ok(info)
+}
+
+/// `BPF_*_GET_FD_BY_ID`, asserting success and closing the fd it produced.
+///
+/// For the "does this id still resolve?" checks, where leaving the fd open
+/// would change what the *next* assertion is looking at.
+fn id_resolves(cmd: u64, id: u32) -> bool {
+    match fd_by_id(cmd, id) {
+        Some(fd) if fd >= 0 => {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            true
+        }
+        _ => false,
+    }
+}
+
+// ── BPF_OBJ_GET_INFO_BY_FD: links ───────────────────────────────────
+
+fn smoke_abi_bpf_obj_get_info_link_pos() -> TestResult {
+    with_setup(|| {
+        let (link_fd, prog_fd, _probe) = make_link()?;
+        let prog_id = id_of(prog_fd)?;
+        let info = link_info_of(link_fd)?;
+
+        if info_u32(&info, LI_TYPE) != BPF_LINK_TYPE_TRACING {
+            return Err("a probe link did not report BPF_LINK_TYPE_TRACING");
+        }
+        if info_u32(&info, LI_ID) == 0 {
+            return Err("a live link reported id 0, which means 'no link'");
+        }
+        if info_u32(&info, LI_PROG_ID) != prog_id {
+            return Err("bpf_link_info.prog_id is not the id of the attached program");
+        }
+        if info_u32(&info, LI_UNION) != BPF_TRACE_FENTRY {
+            return Err("bpf_link_info.tracing.attach_type is not BPF_TRACE_FENTRY");
+        }
+
+        // A detached link keeps its fd and its id but reports no program:
+        // saying otherwise would claim an attach that is gone.
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, link_fd as u32);
+        if bpf(BPF_LINK_DETACH, &attr) != Some(0) {
+            return Err("BPF_LINK_DETACH failed");
+        }
+        let info = link_info_of(link_fd)?;
+        if info_u32(&info, LI_PROG_ID) != 0 {
+            return Err("a detached link still reports a prog_id");
+        }
+        if info_u32(&info, LI_ID) == 0 {
+            return Err("a detached link lost its id");
+        }
+        let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_link_pos);
+
+/// `BPF_OBJ_GET_INFO_BY_FD` picks its info struct from the *object*, not from
+/// the length the caller asked for.
+///
+/// A caller compiled for `bpf_prog_info` that hands over a link fd must get
+/// link info truncated to what NARF fills, and be told so — not 232 bytes of
+/// program-shaped nonsense. This is the assertion that catches the four
+/// downcast arms being tried in an order that lets one shadow another.
+fn smoke_abi_bpf_obj_get_info_dispatches_on_object_neg() -> TestResult {
+    with_setup(|| {
+        let (link_fd, prog_fd, _probe) = make_link()?;
+        let blob = minimal_btf();
+        let btf_fd = btf_load(&blob).ok_or("bpf() not Ok")?;
+        if btf_fd < 0 {
+            return Err("BPF_BTF_LOAD rejected a well-formed blob");
+        }
+
+        let mut info = [0u8; INFO_BUF];
+        let (r, back) = obj_info(link_fd, &mut info, PROG_INFO_LEN as u32);
+        if r != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD on a link fd with a prog-sized buffer failed");
+        }
+        if back != LINK_INFO_LEN as u32 {
+            return Err("a link fd answered with a program-sized info struct");
+        }
+
+        let mut info = [0u8; INFO_BUF];
+        let (r, back) = obj_info(btf_fd, &mut info, MAP_INFO_LEN as u32);
+        if r != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD on a btf fd with a map-sized buffer failed");
+        }
+        if back != BTF_INFO_LEN as u32 {
+            return Err("a btf fd answered with a map-sized info struct");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(btf_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_bpf_obj_get_info_dispatches_on_object_neg
+);
+
+// ── BPF_OBJ_GET_INFO_BY_FD: BTF ─────────────────────────────────────
+
+fn smoke_abi_bpf_obj_get_info_btf_pos() -> TestResult {
+    with_setup(|| {
+        let blob = minimal_btf();
+        let fd = btf_load(&blob).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_BTF_LOAD rejected a well-formed blob");
+        }
+
+        // Capacity 0 — the size probe every loader does first. Nothing is
+        // written to the (absent) buffer and the true size comes back.
+        let info = btf_info_of(fd)?;
+        if info_u32(&info, BI_BTF_SIZE) as usize != blob.len() {
+            return Err("bpf_btf_info.btf_size is not the blob's true size");
+        }
+        if info_u32(&info, BI_ID) == 0 {
+            return Err("a loaded blob reported id 0, which means 'no BTF'");
+        }
+        if info_u32(&info, BI_KERNEL_BTF) != 0 {
+            return Err("a userspace-loaded blob claimed to be kernel BTF");
+        }
+        // LINUX-GAP: NARF records no BTF name, so `name_len` is 0 and the
+        // caller's name buffer is left untouched rather than invented.
+        if info_u32(&info, BI_NAME_LEN) != 0 {
+            return Err("bpf_btf_info.name_len is not 0");
+        }
+
+        // The copy-out, which is how `bpftool btf dump` reads a blob.
+        let mut sink = [0xAAu8; 64];
+        let mut info = [0u8; INFO_BUF];
+        put_info_u64(&mut info, BI_BTF, sink.as_mut_ptr() as u64);
+        put_info_u32(&mut info, BI_BTF_SIZE, sink.len() as u32);
+        let (r, _) = obj_info(fd, &mut info, BTF_INFO_LEN as u32);
+        if r != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD with a btf buffer failed");
+        }
+        if info_u32(&info, BI_BTF_SIZE) as usize != blob.len() {
+            return Err("the copy-out call did not report the blob's true size");
+        }
+        if info_u64(&info, BI_BTF) != sink.as_mut_ptr() as u64 {
+            return Err("bpf_btf_info.btf was not echoed back");
+        }
+        if sink[..blob.len()] != blob[..] {
+            return Err("the blob copied out is not the blob that was loaded");
+        }
+        if sink[blob.len()..].iter().any(|b| *b != 0xAA) {
+            return Err("the copy-out wrote past the blob's own length");
+        }
+
+        // A capacity smaller than the blob truncates rather than overruns, and
+        // still reports the true size so the caller can size a buffer and retry.
+        let mut sink = [0xAAu8; 64];
+        let mut info = [0u8; INFO_BUF];
+        put_info_u64(&mut info, BI_BTF, sink.as_mut_ptr() as u64);
+        put_info_u32(&mut info, BI_BTF_SIZE, 8);
+        let (r, _) = obj_info(fd, &mut info, BTF_INFO_LEN as u32);
+        if r != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD with a short btf buffer failed");
+        }
+        if info_u32(&info, BI_BTF_SIZE) as usize != blob.len() {
+            return Err("a short copy-out did not report the blob's true size");
+        }
+        if sink[..8] != blob[..8] {
+            return Err("a short copy-out did not write the leading bytes");
+        }
+        if sink[8..].iter().any(|b| *b != 0xAA) {
+            return Err("a short copy-out wrote past the capacity the caller declared");
+        }
+        // The name pointer is echoed but never followed, since `name_len` is 0.
+        if info_u64(&info, BI_NAME) != 0 {
+            return Err("bpf_btf_info.name was not echoed back unchanged");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_btf_pos);
+
+// ── BPF_LINK_GET_FD_BY_ID / BPF_LINK_GET_NEXT_ID ────────────────────
+
+fn smoke_abi_bpf_link_get_fd_by_id_pos() -> TestResult {
+    with_setup(|| {
+        let (link_fd, prog_fd, _probe) = make_link()?;
+        let id = info_u32(&link_info_of(link_fd)?, LI_ID);
+
+        let fd2 = fd_by_id(BPF_LINK_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+        if fd2 < 0 {
+            return Err("BPF_LINK_GET_FD_BY_ID failed for a live link");
+        }
+        if fd2 == link_fd {
+            return Err("BPF_LINK_GET_FD_BY_ID handed back the same fd, not a new one");
+        }
+        let info = link_info_of(fd2)?;
+        if info_u32(&info, LI_ID) != id {
+            return Err("the fd obtained by id names a different link");
+        }
+        if info_u32(&info, LI_TYPE) != BPF_LINK_TYPE_TRACING {
+            return Err("the fd obtained by id reports the wrong link type");
+        }
+        // Linux sets close-on-exec on every bpf fd, this one included — and a
+        // leaked link fd is a leaked *attach*.
+        let flags = call(Syscall::Fcntl.raw(), a2(fd2 as u64, 1, 0)).ok_or("fcntl not Ok")?;
+        if flags & 1 == 0 {
+            return Err("BPF_LINK_GET_FD_BY_ID did not set close-on-exec");
+        }
+        // The id-obtained fd is a full link fd, not a read-only view: it must
+        // answer the link commands too.
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, fd2 as u32);
+        if bpf(BPF_LINK_DETACH, &attr) != Some(0) {
+            return Err("BPF_LINK_DETACH through an id-obtained link fd failed");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd2 as u64));
+        let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_link_get_fd_by_id_pos);
+
+fn smoke_abi_bpf_link_get_next_id_pos() -> TestResult {
+    with_setup(|| {
+        let (link_fd, prog_fd, _probe) = make_link()?;
+        let want = info_u32(&link_info_of(link_fd)?, LI_ID);
+
+        // A walk from 0 must reach the link just made, and must terminate. The
+        // step bound is generous but finite: an id table that never says ENOENT
+        // is an infinite loop in every enumerating tool.
+        let mut cur = 0u32;
+        let mut found = false;
+        let mut steps = 0;
+        loop {
+            let (r, id) = next_id(BPF_LINK_GET_NEXT_ID, cur);
+            if r == Some(ENOENT) {
+                break;
+            }
+            if r != Some(0) {
+                return Err("BPF_LINK_GET_NEXT_ID returned neither 0 nor ENOENT");
+            }
+            if id <= cur {
+                return Err("BPF_LINK_GET_NEXT_ID did not advance strictly — a walk would loop");
+            }
+            if id == want {
+                found = true;
+            }
+            cur = id;
+            steps += 1;
+            if steps > 100_000 {
+                return Err("BPF_LINK_GET_NEXT_ID never terminated");
+            }
+        }
+        if !found {
+            return Err("a freshly created link was not reachable by BPF_LINK_GET_NEXT_ID");
+        }
+        // "Strictly greater" is what makes feeding each answer back in
+        // terminate rather than repeat.
+        let (r, id) = next_id(BPF_LINK_GET_NEXT_ID, want);
+        if r == Some(0) && id == want {
+            return Err("BPF_LINK_GET_NEXT_ID returned the id it was given");
+        }
+        let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_link_get_next_id_pos);
+
+/// A link's id stops resolving once its last fd closes, and is never reused.
+///
+/// Stronger here than for a map: an entry that kept a link alive would keep its
+/// *attach* alive too, because `BpfLink::drop` is the only thing that undoes
+/// one — so a leaked id entry is a hook armed for the rest of the boot.
+fn smoke_abi_bpf_link_id_not_reused_after_teardown_neg() -> TestResult {
+    with_setup(|| {
+        let (link_fd, prog_fd, _probe) = make_link()?;
+        let dead = info_u32(&link_info_of(link_fd)?, LI_ID);
+        let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
+
+        if fd_by_id(BPF_LINK_GET_FD_BY_ID, dead) != Some(ENOENT) {
+            return Err("BPF_LINK_GET_FD_BY_ID resolved a link whose last fd was closed");
+        }
+        // …and the walk no longer visits it.
+        let (r, id) = next_id(BPF_LINK_GET_NEXT_ID, dead - 1);
+        if r == Some(0) && id == dead {
+            return Err("BPF_LINK_GET_NEXT_ID still walks over a freed link's id");
+        }
+
+        let (link2, prog2, _p2) = make_link()?;
+        let fresh = info_u32(&link_info_of(link2)?, LI_ID);
+        if fresh == dead {
+            return Err("a freed link's id was reused — a cached id now names a different attach");
+        }
+        if fresh < dead {
+            return Err("link ids went backwards");
+        }
+        let _ = call(Syscall::Close.raw(), a0(link2 as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog2 as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_bpf_link_id_not_reused_after_teardown_neg
+);
+
+// ── BPF_BTF_GET_FD_BY_ID / BPF_BTF_GET_NEXT_ID ──────────────────────
+
+fn smoke_abi_bpf_btf_get_fd_by_id_pos() -> TestResult {
+    with_setup(|| {
+        let blob = minimal_btf();
+        let fd = btf_load(&blob).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_BTF_LOAD rejected a well-formed blob");
+        }
+        let id = info_u32(&btf_info_of(fd)?, BI_ID);
+
+        let fd2 = fd_by_id(BPF_BTF_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+        if fd2 < 0 {
+            return Err("BPF_BTF_GET_FD_BY_ID failed for a live blob");
+        }
+        if fd2 == fd {
+            return Err("BPF_BTF_GET_FD_BY_ID handed back the same fd, not a new one");
+        }
+        if info_u32(&btf_info_of(fd2)?, BI_ID) != id {
+            return Err("the fd obtained by id names a different blob");
+        }
+        let flags = call(Syscall::Fcntl.raw(), a2(fd2 as u64, 1, 0)).ok_or("fcntl not Ok")?;
+        if flags & 1 == 0 {
+            return Err("BPF_BTF_GET_FD_BY_ID did not set close-on-exec");
+        }
+
+        // A walk must reach it, and must terminate.
+        let mut cur = 0u32;
+        let mut found = false;
+        let mut steps = 0;
+        loop {
+            let (r, got) = next_id(BPF_BTF_GET_NEXT_ID, cur);
+            if r == Some(ENOENT) {
+                break;
+            }
+            if r != Some(0) {
+                return Err("BPF_BTF_GET_NEXT_ID returned neither 0 nor ENOENT");
+            }
+            if got <= cur {
+                return Err("BPF_BTF_GET_NEXT_ID did not advance strictly");
+            }
+            if got == id {
+                found = true;
+            }
+            cur = got;
+            steps += 1;
+            if steps > 100_000 {
+                return Err("BPF_BTF_GET_NEXT_ID never terminated");
+            }
+        }
+        if !found {
+            return Err("a freshly loaded blob was not reachable by BPF_BTF_GET_NEXT_ID");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd2 as u64));
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_btf_get_fd_by_id_pos);
+
+/// An fd obtained by id holds its own reference to the blob, and the id stops
+/// resolving only when the last one goes.
+///
+/// `live_btf_count` counts blobs rather than fds, so it distinguishes "the
+/// second handle kept the one allocation" from "the second handle leaked a
+/// second copy" — a distinction an id-only check cannot make.
+fn smoke_abi_bpf_btf_fd_by_id_keeps_blob_alive_pos() -> TestResult {
+    with_setup(|| {
+        let before = crate::handlers::live_btf_count();
+        let blob = minimal_btf();
+        let fd = btf_load(&blob).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_BTF_LOAD rejected a well-formed blob");
+        }
+        let id = info_u32(&btf_info_of(fd)?, BI_ID);
+        let fd2 = fd_by_id(BPF_BTF_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+        if fd2 < 0 {
+            return Err("BPF_BTF_GET_FD_BY_ID failed");
+        }
+        if crate::handlers::live_btf_count() != before + 1 {
+            return Err("a second fd on one blob was counted as a second blob");
+        }
+
+        // Drop the loading fd. Everything below runs against `fd2` alone.
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        if crate::handlers::live_btf_count() != before + 1 {
+            return Err("closing the loading fd freed a blob another fd still holds");
+        }
+        let info = btf_info_of(fd2)?;
+        if info_u32(&info, BI_ID) != id {
+            return Err("the id-obtained fd stopped naming its blob once the loading fd closed");
+        }
+        if info_u32(&info, BI_BTF_SIZE) as usize != blob.len() {
+            return Err("the id-obtained fd reports the wrong blob size");
+        }
+        if !id_resolves(BPF_BTF_GET_FD_BY_ID, id) {
+            return Err("the id stopped resolving while an id-obtained fd was still open");
+        }
+
+        // Now the last one.
+        let _ = call(Syscall::Close.raw(), a0(fd2 as u64));
+        if crate::handlers::live_btf_count() != before {
+            return Err("closing every fd on a blob did not free it");
+        }
+        if fd_by_id(BPF_BTF_GET_FD_BY_ID, id) != Some(ENOENT) {
+            return Err("a blob's id still resolved after its last reference went away");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_bpf_btf_fd_by_id_keeps_blob_alive_pos
+);
+
+/// The teardown half for BTF, and the "never reused" half.
+///
+/// The `btf_ids().len()` check is the part that rots silently. A registry entry
+/// left behind after the blob dies still answers `get` with `None`, so every
+/// errno above stays right while the table grows one dead slot per blob the
+/// boot ever loaded — and pins the `Arc` control block with it. Nothing
+/// observable through the syscall can see that, so the test reaches into the
+/// table directly.
+fn smoke_abi_bpf_btf_id_not_reused_after_teardown_neg() -> TestResult {
+    with_setup(|| {
+        let blob = minimal_btf();
+        let entries_before = crate::handlers::btf_ids().len();
+        let fd = btf_load(&blob).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_BTF_LOAD rejected a well-formed blob");
+        }
+        if crate::handlers::btf_ids().len() != entries_before + 1 {
+            return Err("loading a blob did not add an id entry");
+        }
+        let dead = info_u32(&btf_info_of(fd)?, BI_ID);
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+        if crate::handlers::btf_ids().len() != entries_before {
+            return Err("freeing a blob did not prune its id entry — the table leaks a slot");
+        }
+        if fd_by_id(BPF_BTF_GET_FD_BY_ID, dead) != Some(ENOENT) {
+            return Err("BPF_BTF_GET_FD_BY_ID resolved a blob whose last fd was closed");
+        }
+        let (r, id) = next_id(BPF_BTF_GET_NEXT_ID, dead - 1);
+        if r == Some(0) && id == dead {
+            return Err("BPF_BTF_GET_NEXT_ID still walks over a freed blob's id");
+        }
+
+        let again = btf_load(&blob).ok_or("bpf() not Ok")?;
+        if again < 0 {
+            return Err("BPF_BTF_LOAD rejected a well-formed blob");
+        }
+        let fresh = info_u32(&btf_info_of(again)?, BI_ID);
+        if fresh == dead {
+            return Err("a freed blob's id was reused — a cached id now names a different blob");
+        }
+        if fresh < dead {
+            return Err("btf ids went backwards");
+        }
+        let _ = call(Syscall::Close.raw(), a0(again as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_bpf_btf_id_not_reused_after_teardown_neg
+);
+
+fn smoke_abi_bpf_btf_id_cmds_neg() -> TestResult {
+    with_setup(|| {
+        // Id 0 is never assigned — the counter starts at 1, and 0 means "no
+        // BTF" everywhere in the ABI.
+        if fd_by_id(BPF_BTF_GET_FD_BY_ID, 0) != Some(ENOENT) {
+            return Err("BPF_BTF_GET_FD_BY_ID(0) did not return ENOENT");
+        }
+        if fd_by_id(BPF_BTF_GET_FD_BY_ID, u32::MAX) != Some(ENOENT) {
+            return Err("BPF_BTF_GET_FD_BY_ID on an unassigned id did not return ENOENT");
+        }
+        if next_id(BPF_BTF_GET_NEXT_ID, u32::MAX).0 != Some(ENOENT) {
+            return Err("BPF_BTF_GET_NEXT_ID past the end did not return ENOENT");
+        }
+        // A `bpf_attr` shorter than the command's own fields.
+        let mut attr = [0u8; ATTR_LEN];
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_BTF_GET_FD_BY_ID, attr.as_mut_ptr() as u64, 2),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_BTF_GET_FD_BY_ID with a truncated bpf_attr did not return EINVAL");
+        }
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_BTF_GET_NEXT_ID, attr.as_mut_ptr() as u64, 4),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_BTF_GET_NEXT_ID with a truncated bpf_attr did not return EINVAL");
+        }
+        // `CHECK_ATTR`: `BPF_BTF_GET_FD_BY_ID_LAST_FIELD` is `btf_id`, so a
+        // blob fd takes no `open_flags` either.
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 8, 1);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_BTF_GET_FD_BY_ID,
+                attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_BTF_GET_FD_BY_ID ignored a non-zero byte past its last field");
+        }
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_BTF_GET_NEXT_ID,
+                attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_BTF_GET_NEXT_ID ignored a non-zero byte past its last field");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_btf_id_cmds_neg);
+
+/// The keystone: a link fetched by id still **detaches on close**.
+///
+/// In the `bpf` group rather than `syscall_abi` because it fires the real probe
+/// dispatcher — the only way to tell "the attach is still installed" from "the
+/// fd still exists". An id-obtained link fd that did not run `BpfLink::drop`
+/// would leave the hook armed for the rest of the boot with no handle left to
+/// undo it, and every errno above would still be right.
+fn smoke_bpf_syscall_link_by_id_still_detaches() -> TestResult {
+    with_setup(|| {
+        let (link_fd, prog_fd, probe) = make_link()?;
+        let prog = prog_behind_fd(prog_fd).ok_or("could not recover the program behind its fd")?;
+        let id = info_u32(&link_info_of(link_fd)?, LI_ID);
+
+        let by_id = fd_by_id(BPF_LINK_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+        if by_id < 0 {
+            return Err("BPF_LINK_GET_FD_BY_ID failed for a live link");
+        }
+        narf_tracing::dispatch::fire(probe, narf_tracing::dispatch::ProbeArgs::none());
+        if prog.runs() != 1 {
+            return Err("the linked program did not run when the probe fired");
+        }
+
+        // Close the fd the link was created through. The attach must survive,
+        // because the id-obtained fd is an owner in its own right — that is the
+        // whole promise of GET_FD_BY_ID.
+        if call(Syscall::Close.raw(), a0(link_fd as u64)) != Some(0) {
+            return Err("closing the creating link fd failed");
+        }
+        narf_tracing::dispatch::fire(probe, narf_tracing::dispatch::ProbeArgs::none());
+        if prog.runs() != 2 {
+            return Err("closing the creating fd detached a link another fd still held");
+        }
+        if !id_resolves(BPF_LINK_GET_FD_BY_ID, id) {
+            return Err("the link's id stopped resolving while an fd still held it");
+        }
+
+        // The keystone: the last close is the detach, whichever fd it came
+        // through.
+        if call(Syscall::Close.raw(), a0(by_id as u64)) != Some(0) {
+            return Err("closing the id-obtained link fd failed");
+        }
+        narf_tracing::dispatch::fire(probe, narf_tracing::dispatch::ProbeArgs::none());
+        if prog.runs() != 2 {
+            return Err("closing the id-obtained link fd did not detach the probe");
+        }
+        if fd_by_id(BPF_LINK_GET_FD_BY_ID, id) != Some(ENOENT) {
+            return Err("the link's id still resolved after its last fd closed");
+        }
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_syscall_link_by_id_still_detaches);
+
+/// `bpf_link_info` for an XDP link, including the ifindex round-trip.
+///
+/// In the `bpf` group because it needs a registered interface. The ifindex is
+/// derived here from `iface::snapshot_all` the way `netlink_route`'s dump
+/// derives it, so this pins `sys_bpf_attach.rs`'s `ifindex_for_iface` against
+/// the same public source its inverse consumes — the cross-crate convention
+/// that would otherwise stay correct-looking after the other side changed.
+fn smoke_bpf_syscall_link_info_xdp() -> TestResult {
+    with_setup(|| {
+        const IFACE: &str = "bpf-abi-xdp1";
+        fn discard(_frame: &[u8]) -> Result<(), ()> {
+            Ok(())
+        }
+        narf_net::iface::register(IFACE, [0x02, 0, 0, 0, 0xB9, 2], discard);
+        let ifindex = narf_net::iface::snapshot_all()
+            .iter()
+            .position(|nic| nic.name == IFACE)
+            .map(|i| i as u32 + 2)
+            .ok_or("the registered interface is not in the snapshot")?;
+
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        let link_fd =
+            bpf(BPF_LINK_CREATE, &link_attr(fd as u32, ifindex, BPF_XDP)).ok_or("bpf() not Ok")?;
+        if link_fd < 0 {
+            return Err("BPF_LINK_CREATE on a registered interface's ifindex failed");
+        }
+        let info = link_info_of(link_fd)?;
+        if info_u32(&info, LI_TYPE) != BPF_LINK_TYPE_XDP {
+            return Err("an XDP link did not report BPF_LINK_TYPE_XDP");
+        }
+        if info_u32(&info, LI_UNION) != ifindex {
+            return Err("bpf_link_info.xdp.ifindex is not the ifindex the link was created with");
+        }
+        if info_u32(&info, LI_PROG_ID) != id_of(fd)? {
+            return Err("an XDP link reports the wrong prog_id");
+        }
+        // Reachable by id, like any other link.
+        let id = info_u32(&info, LI_ID);
+        if !id_resolves(BPF_LINK_GET_FD_BY_ID, id) {
+            return Err("an XDP link was not reachable by BPF_LINK_GET_FD_BY_ID");
+        }
+        let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_syscall_link_info_xdp);
+/// The mount authority every bpffs test mount is created under.
+///
+/// Minted once and cached: `Cap::bootstrap()` allocates an object-table slot
+/// per call, so a per-test `bootstrap_mount_authority()` would leak one slot
+/// per smoke. `registry().mount_arc` runs `check_live()` on it at every use,
+/// which is the part that proves the grant is still valid — possession alone
+/// proves only that it was granted once.
+fn mount_authority() -> &'static Cap<MountPoint, Grant> {
+    use narf_lib::sync::IrqSafeSpinLock;
+    static SLOT: IrqSafeSpinLock<Option<&'static Cap<MountPoint, Grant>>> =
+        IrqSafeSpinLock::new(None);
+    let mut g = SLOT.lock();
+    if g.is_none() {
+        let c: &'static _ =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(bootstrap_mount_authority()));
+        *g = Some(c);
+    }
+    g.expect("just installed")
+}
+
+type MountHandle = Cap<MountPoint, narf_capabilities::Write>;
+
+/// Mount a private bpffs at `at`. Every test uses its own path and unmounts
+/// before returning, so no smoke can see another's pins.
+fn mount_bpffs(at: &str) -> Option<MountHandle> {
+    registry()
+        .mount_arc(
+            mount_authority(),
+            at,
+            alloc::sync::Arc::new(narf_filesystem::bpffs::BpfFs::new()),
+        )
+        .ok()
+}
+
+fn mount_tmpfs(at: &str) -> Option<MountHandle> {
+    registry()
+        .mount_arc(
+            mount_authority(),
+            at,
+            alloc::sync::Arc::new(MemFs::new("tmpfs")),
+        )
+        .ok()
+}
+
+/// Run `body` with a bpffs mounted at `at`, unmounting whatever the outcome.
+fn with_bpffs(
+    at: &str,
+    body: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let handle = mount_bpffs(at).ok_or("mounting bpffs failed")?;
+    let outcome = body();
+    let _ = registry().unmount(&handle, at);
+    outcome
+}
+
+// ── BPF_OBJ_PIN / BPF_OBJ_GET: positive ─────────────────────────────
+
+fn smoke_abi_bpf_obj_pin_pos() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-pin-pos";
+        with_bpffs(AT, || {
+            let fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_MAP_CREATE failed");
+            }
+            let path = CPath::new("/bpf-pin-pos/m");
+            if obj_pin(fd, &path) != Some(0) {
+                return Err("BPF_OBJ_PIN of a map into bpffs failed");
+            }
+            let reopened = obj_get(&path).ok_or("bpf() not Ok")?;
+            if reopened < 0 {
+                return Err("BPF_OBJ_GET of a live pin failed");
+            }
+            if reopened == fd {
+                return Err("BPF_OBJ_GET returned the caller's own fd, not a new one");
+            }
+            // Linux's `bpf_map_new_fd` passes `O_CLOEXEC`: a leaked bpf fd is a
+            // leaked capability, and `OBJ_GET` is a way to obtain one.
+            let flags = call(Syscall::Fcntl.raw(), a2(reopened as u64, F_GETFD, 0))
+                .ok_or("fcntl not Ok")?;
+            if flags & 1 == 0 {
+                return Err("the fd from BPF_OBJ_GET is not close-on-exec");
+            }
+
+            // The same object, not a lookalike: write through one fd and read
+            // the write back through the other. An implementation that pinned a
+            // *copy* passes every errno check above and fails here.
+            let key: u32 = 2;
+            let kptr = (&key) as *const u32 as u64;
+            let value: u64 = 0xFEED_FACE_C0DE_1234;
+            let vptr = (&value) as *const u64 as u64;
+            if elem(BPF_MAP_UPDATE_ELEM, fd, kptr, vptr, BPF_ANY) != Some(0) {
+                return Err("update through the original fd failed");
+            }
+            let mut back: u64 = 0;
+            let bptr = (&mut back) as *mut u64 as u64;
+            if elem(BPF_MAP_LOOKUP_ELEM, reopened, kptr, bptr, 0) != Some(0) {
+                return Err("lookup through the reopened fd failed");
+            }
+            if back != value {
+                return Err("the reopened fd addressed a different map");
+            }
+            // The ids agree too — the strongest single statement that one
+            // object wears both fds.
+            if map_id_of(fd)? != map_id_of(reopened)? {
+                return Err("the reopened fd reports a different map id");
+            }
+
+            let _ = call(Syscall::Close.raw(), a0(reopened as u64));
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_pin_pos);
+
+/// A program is pinnable too, and one reopened by path still *runs* — an fd
+/// that resolved to the right object but a broken image would pass every check
+/// in the map test above.
+fn smoke_abi_bpf_obj_pin_prog_pos() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-pin-prog-pos";
+        with_bpffs(AT, || {
+            let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(0x5A)).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_PROG_LOAD failed");
+            }
+            let path = CPath::new("/bpf-pin-prog-pos/p");
+            if obj_pin(fd, &path) != Some(0) {
+                return Err("BPF_OBJ_PIN of a program failed");
+            }
+            // Close the creating fd: from here the pin is the only reference.
+            if call(Syscall::Close.raw(), a0(fd as u64)) != Some(0) {
+                return Err("closing the program fd failed");
+            }
+            let reopened = obj_get(&path).ok_or("bpf() not Ok")?;
+            if reopened < 0 {
+                return Err("BPF_OBJ_GET failed after the creating fd was closed");
+            }
+            let mut attr = [0u8; ATTR_LEN];
+            put_u32(&mut attr, 0, reopened as u32);
+            if call(
+                Syscall::Bpf.raw(),
+                a2(BPF_PROG_TEST_RUN, attr.as_ptr() as u64, ATTR_LEN as u64),
+            ) != Some(0)
+            {
+                return Err("BPF_PROG_TEST_RUN on a reopened program fd failed");
+            }
+            if get_u32(&attr, 4) != 0x5A {
+                return Err("the reopened program returned the wrong value");
+            }
+            let _ = call(Syscall::Close.raw(), a0(reopened as u64));
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_pin_prog_pos);
+
+// ── BPF_OBJ_PIN: negative ───────────────────────────────────────────
+
+fn smoke_abi_bpf_obj_pin_neg() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-pin-neg";
+        const TMP: &str = "/bpf-pin-neg-tmp";
+        let tmp = mount_tmpfs(TMP).ok_or("mounting the control tmpfs failed")?;
+        let outcome = with_bpffs(AT, || {
+            let fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_MAP_CREATE failed");
+            }
+            let good = CPath::new("/bpf-pin-neg/m");
+
+            // Attribute-block shape.
+            if call(Syscall::Bpf.raw(), a2(BPF_OBJ_PIN, 0, ATTR_LEN as u64)) != Some(EINVAL) {
+                return Err("BPF_OBJ_PIN with a null attr did not return EINVAL");
+            }
+            let attr = obj_attr(good.ptr(), fd as u32, 0, 0);
+            if call(Syscall::Bpf.raw(), a2(BPF_OBJ_PIN, attr.as_ptr() as u64, 0)) != Some(EINVAL) {
+                return Err("BPF_OBJ_PIN with size 0 did not return EINVAL");
+            }
+            if call(
+                Syscall::Bpf.raw(),
+                a2(BPF_OBJ_PIN, attr.as_ptr() as u64, OB_BPF_FD as u64),
+            ) != Some(EINVAL)
+            {
+                return Err("BPF_OBJ_PIN with a truncated bpf_attr did not return EINVAL");
+            }
+
+            // The fd, checked before the path — `bpf_obj_pin_user` resolves the
+            // object first, so a caller probing with a bad fd hears about it.
+            if bpf(BPF_OBJ_PIN, &obj_attr(good.ptr(), 4095, 0, 0)) != Some(EBADF) {
+                return Err("BPF_OBJ_PIN with an unopened fd did not return EBADF");
+            }
+            let mut pipefds = [0u8; 8];
+            let _ = call(Syscall::Pipe.raw(), a0(pipefds.as_mut_ptr() as u64));
+            let readfd = u32::from_le_bytes([pipefds[0], pipefds[1], pipefds[2], pipefds[3]]);
+            if bpf(BPF_OBJ_PIN, &obj_attr(good.ptr(), readfd, 0, 0)) != Some(EINVAL) {
+                return Err("BPF_OBJ_PIN of a non-BPF fd did not return EINVAL");
+            }
+            // A BTF fd is NOT pinnable: Linux's `bpf_fd_probe_obj` tries
+            // program, map and link only, so it answers EINVAL here as well.
+            // The bar this clears is a `is_pinnable` written as "anything with
+            // an `as_any`", which every BPF fd wrapper has.
+            let blob = minimal_btf();
+            let mut btf_attr = [0u8; ATTR_LEN];
+            put_u64(&mut btf_attr, 0, blob.as_ptr() as u64);
+            put_u32(&mut btf_attr, 16, blob.len() as u32);
+            let btf = bpf(BPF_BTF_LOAD, &btf_attr).ok_or("bpf() not Ok")?;
+            if btf < 0 {
+                return Err("BPF_BTF_LOAD rejected a minimal blob");
+            }
+            if bpf(BPF_OBJ_PIN, &obj_attr(good.ptr(), btf as u32, 0, 0)) != Some(EINVAL) {
+                return Err("BPF_OBJ_PIN of a BTF fd did not return EINVAL");
+            }
+
+            // A valid fd with a null pathname faults where `getname` does.
+            if bpf(BPF_OBJ_PIN, &obj_attr(0, fd as u32, 0, 0)) != Some(EFAULT) {
+                return Err("BPF_OBJ_PIN with a null pathname did not return EFAULT");
+            }
+
+            // Flags.
+            if bpf(
+                BPF_OBJ_PIN,
+                &obj_attr(good.ptr(), fd as u32, BPF_F_RDONLY_FLAG, 0),
+            ) != Some(EINVAL)
+            {
+                return Err("BPF_OBJ_PIN accepted a flag outside its mask");
+            }
+            if bpf(
+                BPF_OBJ_PIN,
+                &obj_attr(good.ptr(), fd as u32, BPF_F_PATH_FD, 0),
+            ) != Some(EOPNOTSUPP)
+            {
+                return Err("BPF_OBJ_PIN with BPF_F_PATH_FD did not return EOPNOTSUPP");
+            }
+            if bpf(BPF_OBJ_PIN, &obj_attr(good.ptr(), fd as u32, 0, 3)) != Some(EINVAL) {
+                return Err("a path_fd without BPF_F_PATH_FD was not rejected");
+            }
+            let mut tail = obj_attr(good.ptr(), fd as u32, 0, 0);
+            tail[OB_END] = 1;
+            if bpf(BPF_OBJ_PIN, &tail) != Some(EINVAL) {
+                return Err("BPF_OBJ_PIN ignored a non-zero byte past its last field");
+            }
+
+            // Paths.
+            let missing = CPath::new("/bpf-pin-neg/no/such/dir/m");
+            if bpf(BPF_OBJ_PIN, &obj_attr(missing.ptr(), fd as u32, 0, 0)) != Some(ENOENT) {
+                return Err("BPF_OBJ_PIN under a missing directory did not return ENOENT");
+            }
+            let not_bpffs = CPath::new("/bpf-pin-neg-tmp/m");
+            if bpf(BPF_OBJ_PIN, &obj_attr(not_bpffs.ptr(), fd as u32, 0, 0)) != Some(EPERM) {
+                return Err("BPF_OBJ_PIN into a non-bpffs directory did not return EPERM");
+            }
+
+            // …and only now the happy path, so the duplicate below is the one
+            // thing in this test that can produce EEXIST.
+            if obj_pin(fd, &good) != Some(0) {
+                return Err("BPF_OBJ_PIN failed on a clean name");
+            }
+            if obj_pin(fd, &good) != Some(EEXIST) {
+                return Err("a second BPF_OBJ_PIN at a live name did not return EEXIST");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            let _ = call(Syscall::Close.raw(), a0(btf as u64));
+            Ok(())
+        });
+        let _ = registry().unmount(&tmp, TMP);
+        outcome
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_pin_neg);
+
+// ── BPF_OBJ_GET: negative ───────────────────────────────────────────
+
+fn smoke_abi_bpf_obj_get_neg() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-get-neg";
+        const TMP: &str = "/bpf-get-neg-tmp";
+        let tmp = mount_tmpfs(TMP).ok_or("mounting the control tmpfs failed")?;
+        let outcome = with_bpffs(AT, || {
+            if bpf(BPF_OBJ_GET, &[0u8; ATTR_LEN]) != Some(EFAULT) {
+                return Err("BPF_OBJ_GET with a null pathname did not return EFAULT");
+            }
+            let absent = CPath::new("/bpf-get-neg/nothing");
+            if obj_get(&absent) != Some(ENOENT) {
+                return Err("BPF_OBJ_GET of an absent name did not return ENOENT");
+            }
+            let no_parent = CPath::new("/bpf-get-neg/no/such/dir/x");
+            if obj_get(&no_parent) != Some(ENOENT) {
+                return Err("BPF_OBJ_GET under a missing directory did not return ENOENT");
+            }
+
+            // `bpf_fd` is not a field of this command; a non-zero one means the
+            // caller filled in the wrong union member.
+            let path = CPath::new("/bpf-get-neg/m");
+            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 3, 0, 0)) != Some(EINVAL) {
+                return Err("BPF_OBJ_GET with a non-zero bpf_fd did not return EINVAL");
+            }
+            // Flags: outside the mask is EINVAL, inside-but-unimplemented is
+            // EOPNOTSUPP. Collapsing the two makes feature detection guesswork.
+            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 1, 0)) != Some(EINVAL) {
+                return Err("BPF_OBJ_GET accepted a flag outside its mask");
+            }
+            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, BPF_F_RDONLY_FLAG, 0)) != Some(EOPNOTSUPP)
+            {
+                return Err("BPF_OBJ_GET with BPF_F_RDONLY did not return EOPNOTSUPP");
+            }
+            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, BPF_F_PATH_FD, 0)) != Some(EOPNOTSUPP) {
+                return Err("BPF_OBJ_GET with BPF_F_PATH_FD did not return EOPNOTSUPP");
+            }
+            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 0, 3)) != Some(EINVAL) {
+                return Err("a path_fd without BPF_F_PATH_FD was not rejected");
+            }
+            let mut tail = obj_attr(path.ptr(), 0, 0, 0);
+            tail[OB_END] = 1;
+            if bpf(BPF_OBJ_GET, &tail) != Some(EINVAL) {
+                return Err("BPF_OBJ_GET ignored a non-zero byte past its last field");
+            }
+
+            // A path that exists but is not a BPF object is EACCES, not ENOENT
+            // — Linux's `bpf_inode_type`. Both halves matter: a loader probing
+            // for a pin has to tell "no such path" from "that is not a pin".
+            let tmp_missing = CPath::new("/bpf-get-neg-tmp/absent");
+            if obj_get(&tmp_missing) != Some(ENOENT) {
+                return Err("BPF_OBJ_GET of an absent non-bpffs path was not ENOENT");
+            }
+            let tmp_file = CPath::new("/bpf-get-neg-tmp/plain");
+            let created = call_creat(tmp_file.ptr(), 0o644).ok_or("creat not Ok")?;
+            if created < 0 {
+                return Err("could not create a control file on tmpfs");
+            }
+            let _ = call(Syscall::Close.raw(), a0(created as u64));
+            if obj_get(&tmp_file) != Some(EACCES) {
+                return Err("BPF_OBJ_GET of a plain file did not return EACCES");
+            }
+
+            // A bpffs *directory* is present but is not an object either.
+            let sub = CPath::new("/bpf-get-neg/dir");
+            if call_mkdir(sub.ptr(), 0o755) != Some(0) {
+                return Err("mkdir inside bpffs failed");
+            }
+            if obj_get(&sub) != Some(EACCES) {
+                return Err("BPF_OBJ_GET of a bpffs directory did not return EACCES");
+            }
+            Ok(())
+        });
+        let _ = registry().unmount(&tmp, TMP);
+        outcome
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_neg);
+
+// ════════════════════════════════════════════════════════════════════
+// The lifetime contract, in the `bpf` subsystem.
+//
+//   pin, then close every fd     → still alive   (the pin is a STRONG ref)
+//   unlink the pin, no fd open   → gone          (and the pin was the last)
+//
+// A pin holding a `Weak` fails the first; a pin that never dropped fails the
+// second. `BPF_MAP_GET_FD_BY_ID` is the only oracle either assertion consults,
+// and it answers from `idreg`'s `Weak` table, so neither can pass for another
+// reason.
+// ════════════════════════════════════════════════════════════════════
+
+fn smoke_bpf_obj_pin_outlives_its_fd() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-pin-life";
+        with_bpffs(AT, || {
+            let fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_MAP_CREATE failed");
+            }
+            let id = map_id_of(fd)?;
+            let path = CPath::new("/bpf-pin-life/m");
+            if obj_pin(fd, &path) != Some(0) {
+                return Err("BPF_OBJ_PIN failed");
+            }
+
+            // Close the creating fd. The pin is now the *only* reference.
+            if call(Syscall::Close.raw(), a0(fd as u64)) != Some(0) {
+                return Err("closing the map fd failed");
+            }
+            let by_id = fd_by_id(BPF_MAP_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+            if by_id < 0 {
+                return Err("the pinned map died when its creating fd closed");
+            }
+            if call(Syscall::Close.raw(), a0(by_id as u64)) != Some(0) {
+                return Err("closing the by-id fd failed");
+            }
+            // Zero fds, one pin: still alive.
+            let again = fd_by_id(BPF_MAP_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+            if again < 0 {
+                return Err("the pinned map died with no fd open");
+            }
+            let _ = call(Syscall::Close.raw(), a0(again as u64));
+            // …and reachable BY PATH, not merely alive.
+            let reopened = obj_get(&path).ok_or("bpf() not Ok")?;
+            if reopened < 0 {
+                return Err("BPF_OBJ_GET failed with only the pin holding the map");
+            }
+            let _ = call(Syscall::Close.raw(), a0(reopened as u64));
+
+            // Removing the pin removes the last reference.
+            if call_unlink(path.ptr()) != Some(0) {
+                return Err("unlinking the pin failed");
+            }
+            if fd_by_id(BPF_MAP_GET_FD_BY_ID, id) != Some(ENOENT) {
+                return Err("the map outlived its last pin — the reference leaked");
+            }
+            if obj_get(&path) != Some(ENOENT) {
+                return Err("the unlinked path still resolves");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_obj_pin_outlives_its_fd);
+
+/// The other end of the same contract: an fd from `BPF_OBJ_GET` is a full
+/// reference in its own right, so unlinking the pin while it is open does not
+/// free the object — and closing it afterwards does.
+fn smoke_bpf_obj_get_fd_is_a_real_reference() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-get-life";
+        with_bpffs(AT, || {
+            let fd = create_map(BPF_MAP_TYPE_HASH, 4, 8, 4).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_MAP_CREATE failed");
+            }
+            let id = map_id_of(fd)?;
+            let path = CPath::new("/bpf-get-life/m");
+            if obj_pin(fd, &path) != Some(0) {
+                return Err("BPF_OBJ_PIN failed");
+            }
+            let reopened = obj_get(&path).ok_or("bpf() not Ok")?;
+            if reopened < 0 {
+                return Err("BPF_OBJ_GET failed");
+            }
+            if call(Syscall::Close.raw(), a0(fd as u64)) != Some(0) {
+                return Err("closing the creating fd failed");
+            }
+            // Pin gone, one OBJ_GET fd left: the object must survive.
+            if call_unlink(path.ptr()) != Some(0) {
+                return Err("unlinking the pin failed");
+            }
+            let still = fd_by_id(BPF_MAP_GET_FD_BY_ID, id).ok_or("bpf() not Ok")?;
+            if still < 0 {
+                return Err("unlinking the pin freed a map an open fd still held");
+            }
+            if call(Syscall::Close.raw(), a0(still as u64)) != Some(0) {
+                return Err("closing the by-id fd failed");
+            }
+            // Now the last holder goes.
+            if call(Syscall::Close.raw(), a0(reopened as u64)) != Some(0) {
+                return Err("closing the reopened fd failed");
+            }
+            if fd_by_id(BPF_MAP_GET_FD_BY_ID, id) != Some(ENOENT) {
+                return Err("the map outlived every pin and fd");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_obj_get_fd_is_a_real_reference);
+
+/// Unmounting a bpffs drops every pin it held — otherwise a mount/umount cycle
+/// would strand objects for the boot with no path left to reach them by.
+fn smoke_bpf_unmounting_bpffs_drops_its_pins() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-unmount-life";
+        let fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let id = map_id_of(fd)?;
+        let handle = mount_bpffs(AT).ok_or("mounting bpffs failed")?;
+        let path = CPath::new("/bpf-unmount-life/m");
+        let pinned = obj_pin(fd, &path);
+        let closed = call(Syscall::Close.raw(), a0(fd as u64));
+        let unmounted = registry().unmount(&handle, AT);
+        if pinned != Some(0) {
+            return Err("BPF_OBJ_PIN failed");
+        }
+        if closed != Some(0) {
+            return Err("closing the map fd failed");
+        }
+        if unmounted.is_err() {
+            return Err("unmounting bpffs failed");
+        }
+        if fd_by_id(BPF_MAP_GET_FD_BY_ID, id) != Some(ENOENT) {
+            return Err("unmounting bpffs stranded its pinned objects");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_unmounting_bpffs_drops_its_pins);

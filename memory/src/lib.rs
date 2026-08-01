@@ -52,6 +52,7 @@ pub mod ro_after_init;
 pub mod slab;
 pub mod spd5;
 pub mod swap;
+pub mod text_poke;
 pub mod tlb_shootdown;
 pub mod vmalloc;
 pub mod wx;
@@ -60,8 +61,8 @@ pub mod zpool;
 mod tests;
 
 pub use address_space::{
-    install_shared_frame_hooks, with_shared_mapping_transaction, AddressSpace, AddressSpaceError,
-    HugeRegion, NumaRegionSnapshot, Region, RegionPerms,
+    install_file_fault_hook, install_shared_frame_hooks, with_shared_mapping_transaction,
+    AddressSpace, AddressSpaceError, HugeRegion, NumaRegionSnapshot, Region, RegionPerms,
 };
 
 #[cfg(target_arch = "x86_64")]

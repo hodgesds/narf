@@ -228,6 +228,21 @@ fn iface_for_ifindex(ifindex: u32) -> Option<String> {
         .map(|nic| nic.name.clone())
 }
 
+/// The inverse of [`iface_for_ifindex`], for `bpf_link_info.xdp.ifindex`.
+///
+/// Kept beside its inverse deliberately: the numbering convention is a
+/// cross-crate one (`netlink_route`'s dump order), and two independent
+/// derivations of it in two files is how one of them silently stops agreeing.
+/// `None` for a name no longer registered — an interface can be removed while a
+/// link on it is still held, and reporting a stale index would be worse than
+/// reporting none.
+pub(crate) fn ifindex_for_iface(name: &str) -> Option<u32> {
+    narf_net::iface::snapshot_all()
+        .iter()
+        .position(|nic| nic.name == name)
+        .and_then(|pos| u32::try_from(pos + 2).ok())
+}
+
 /// Translate `(attach_type, target)` into the hook it names.
 ///
 /// `Err` carries the errno directly, because the two failure modes are

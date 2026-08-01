@@ -53,9 +53,9 @@ struct FakeMmio {
 
 impl FakeMmio {
     fn new(size_bytes: usize) -> Self {
-        let mut data = Vec::new();
-        data.resize(size_bytes, 0u8);
-        Self { data }
+        Self {
+            data: alloc::vec![0u8; size_bytes],
+        }
     }
 
     fn write16(&mut self, offset: usize, value: u16) {
@@ -805,7 +805,7 @@ fn smoke_atomic_property_range() -> TestResult {
     };
 
     match prop.set(50) {
-        Ok(v) if v == 50 => {}
+        Ok(50) => {}
         Ok(_) => return TestResult::Fail("range set returned wrong value"),
         Err(_) => return TestResult::Fail("valid value 50 rejected by range property"),
     }
@@ -1018,7 +1018,7 @@ fn smoke_atomic_syncobj_signalled_after_commit() -> TestResult {
 
     // Destroy to clean up.
     table.destroy(handle).expect("destroy failed");
-    if table.len() != 0 {
+    if !table.is_empty() {
         return TestResult::Fail("syncobj table not empty after destroy");
     }
 

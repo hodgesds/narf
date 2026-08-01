@@ -165,6 +165,7 @@ fn w_at<T>(id: u32, w: Weak<T>) -> (u32, Weak<T>) {
 
 static PROGS: IdRegistry<crate::prog::BpfProg> = IdRegistry::new();
 static MAPS: IdRegistry<crate::map::BpfMap> = IdRegistry::new();
+static LINKS: IdRegistry<crate::link::BpfLink> = IdRegistry::new();
 
 /// The program id table.
 #[must_use]
@@ -176,6 +177,20 @@ pub fn progs() -> &'static IdRegistry<crate::prog::BpfProg> {
 #[must_use]
 pub fn maps() -> &'static IdRegistry<crate::map::BpfMap> {
     &MAPS
+}
+
+/// The link id table — what `BPF_LINK_GET_NEXT_ID` walks and
+/// `BPF_LINK_GET_FD_BY_ID` resolves.
+///
+/// A link is the one object class here whose teardown has an *external* effect:
+/// `Drop for BpfLink` detaches the hook. So the pruning half of this module is
+/// not merely an anti-leak measure for links — an entry that outlived its link
+/// would hand `GET_FD_BY_ID` a handle to an attach that no longer exists. The
+/// `Weak` makes that impossible and `BpfLink`'s drop keeps the table tidy;
+/// `smoke_bpf_link_id_*` in `link.rs` pins both halves against the real object.
+#[must_use]
+pub fn links() -> &'static IdRegistry<crate::link::BpfLink> {
+    &LINKS
 }
 
 #[cfg(feature = "kernel-test")]
@@ -296,7 +311,7 @@ mod tests {
             return Err("insert did not add an entry");
         }
         r.remove(1);
-        if r.len() != 0 {
+        if !r.is_empty() {
             return Err("remove did not drop the entry — the table leaks one slot per object");
         }
         // Idempotent: a create that failed after assigning an id, or a double

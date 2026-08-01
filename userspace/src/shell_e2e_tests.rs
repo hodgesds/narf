@@ -522,6 +522,12 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_classify);
 // Linux ref: fs/pipe.c::do_pipe_flags, fs/read_write.c::sys_write.
 
 fn smoke_shell_pipe_round_trip() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     crate::syscall::__test_clear_global();
     fd::__test_reset();
 
@@ -615,6 +621,12 @@ kernel_test_in!("userspace/shell", smoke_shell_pipe_round_trip);
 // Linux ref: fs/fcntl.c::sys_dup2.
 
 fn smoke_shell_dup2_stdout_to_pipe() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     crate::syscall::__test_clear_global();
     fd::__test_reset();
 
@@ -723,6 +735,12 @@ kernel_test_in!("userspace/shell", smoke_shell_dup2_stdout_to_pipe);
 // This is the right-hand child of `echo hello | cat`.
 
 fn smoke_shell_dup2_stdin_from_pipe() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     crate::syscall::__test_clear_global();
     fd::__test_reset();
 
@@ -940,6 +958,12 @@ kernel_test_in!("userspace/shell", smoke_shell_fork_wait4_exit_status);
 // capacity path inside PipeWrite::write and confirms no truncation.
 
 fn smoke_shell_pipe_full_ring() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     crate::syscall::__test_clear_global();
     fd::__test_reset();
 
@@ -1029,6 +1053,12 @@ kernel_test_in!("userspace/shell", smoke_shell_pipe_full_ring);
 // Linux ref: fs/fcntl.c::sys_dup2 — "If oldfd == newfd ... return fd."
 
 fn smoke_shell_dup2_same_fd_noop() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     crate::syscall::__test_clear_global();
     fd::__test_reset();
 
@@ -1112,6 +1142,12 @@ kernel_test_in!("userspace/shell", smoke_shell_dup2_same_fd_noop);
 // This is the ordering property `ls | grep foo` depends on.
 
 fn smoke_shell_pipe_sequential_writes() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     crate::syscall::__test_clear_global();
     fd::__test_reset();
 
@@ -1800,6 +1836,12 @@ kernel_test_in!("userspace/shell", smoke_shell_parser_complex_pipeline);
 // calls actually compose correctly for a single-pipe command.
 
 fn smoke_shell_pipe_exec_wiring() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     crate::syscall::__test_clear_global();
     fd::__test_reset();
 

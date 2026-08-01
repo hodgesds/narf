@@ -1585,6 +1585,12 @@ kernel_test_in!(
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_fork_inherits_cwd() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // fork(2) inheritance contract: the child's cwd starts at the
     // parent's cwd at fork time. sys_fork calls `cwd_fork(parent, child)`
     // which copies the entry under the parent_pid key to the child_pid
@@ -1775,6 +1781,12 @@ kernel_test_in!(
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_execve_sets_comm_to_argv0_basename() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // sys_execve takes the basename of argv[0] (the substring after
     // the last '/') and stores it as /proc/[pid]/comm via
     // `set_proc_comm`. Trigger a load with argv[0] = "/usr/bin/foo"
@@ -1883,6 +1895,12 @@ kernel_test_in!("userspace", smoke_userspace_proc_comm_prefix_filter);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_execve_publishes_cmdline_argv_pack() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // After load, /proc/[pid]/cmdline holds the NUL-separated argv
     // bytes the user passed. Confirms `set_proc_argv` ran and the
     // recorded shape matches the wire format.

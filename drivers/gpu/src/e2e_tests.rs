@@ -29,9 +29,9 @@ struct FakeMmio {
 #[allow(dead_code)]
 impl FakeMmio {
     fn new(size_bytes: usize) -> Self {
-        let mut data = alloc::vec::Vec::new();
-        data.resize(size_bytes, 0u8);
-        Self { data }
+        Self {
+            data: alloc::vec![0u8; size_bytes],
+        }
     }
 
     fn write16(&mut self, offset: usize, value: u16) {
@@ -72,7 +72,7 @@ impl FakeMmio {
 // ── Bochs VBE Dispi constants (mirrors bochs.rs) ─────────────────────────
 
 const VBE_BASE: usize = 0x500;
-const VBE_ID_OFF: usize = VBE_BASE + 0x00;
+const VBE_ID_OFF: usize = VBE_BASE;
 const VBE_XRES_OFF: usize = VBE_BASE + 0x02;
 const VBE_YRES_OFF: usize = VBE_BASE + 0x04;
 const VBE_BPP_OFF: usize = VBE_BASE + 0x06;
@@ -545,6 +545,20 @@ kernel_test_in!("drivers/gpu/e2e", smoke_drm_card_invalid_mode_rejected);
 // v_blanking=45, h_sync_offset=16, h_sync_width=96, v_sync_offset=10,
 // v_sync_width=2.
 
+/// The EDID detailed-timing byte that packs two 12-bit fields' high nibbles:
+/// `active[11:8]` in the top nibble, `blanking[11:8]` in the bottom.
+///
+/// A helper rather than the expression written inline twice, because for the
+/// values these fixtures use (`h_blanking = 160`, `v_blanking = 45`) the low
+/// nibble is *always* zero, and clippy correctly says so — "this operation will
+/// always return zero". Hard-coding the shifted constant would silence it while
+/// throwing away the one thing the expression is for: showing which EDID field
+/// each nibble belongs to. Taking the values as arguments keeps the layout
+/// legible and makes the zero a property of the fixture rather than of the code.
+fn dtd_high_nibbles(active: u32, blanking: u32) -> u8 {
+    ((((active >> 8) & 0xF) << 4) | ((blanking >> 8) & 0xF)) as u8
+}
+
 fn smoke_edid_parse_640x480_preferred_timing() -> TestResult {
     use narf_graphics::edid::{Edid, EdidError};
 
@@ -570,11 +584,11 @@ fn smoke_edid_parse_640x480_preferred_timing() -> TestResult {
     // h_active=640, h_blanking=160.
     edid[0x38] = (640 & 0xFF) as u8; // h_active[7:0]
     edid[0x39] = (160 & 0xFF) as u8; // h_blanking[7:0]
-    edid[0x3A] = (((640 >> 8) & 0xF) << 4 | ((160 >> 8) & 0xF)) as u8;
+    edid[0x3A] = dtd_high_nibbles(640, 160);
     // v_active=480, v_blanking=45.
     edid[0x3B] = (480 & 0xFF) as u8;
     edid[0x3C] = (45 & 0xFF) as u8;
-    edid[0x3D] = (((480 >> 8) & 0xF) << 4 | ((45 >> 8) & 0xF)) as u8;
+    edid[0x3D] = dtd_high_nibbles(480, 45);
     // h_sync_offset=16, h_sync_width=96.
     edid[0x3E] = 16u8;
     edid[0x3F] = 96u8;

@@ -47,7 +47,7 @@ const PM4_OP_EVENT_WRITE_EOP: u8 = 0x47;
 
 #[inline]
 fn pm4_header(opcode: u8, data_word_count: usize) -> u32 {
-    debug_assert!(data_word_count >= 1 && data_word_count <= 0x4000);
+    debug_assert!((1..=0x4000).contains(&data_word_count));
     let count_minus_one = (data_word_count as u32 - 1) & 0x3FFF;
     PM4_TYPE3 << 30 | count_minus_one << 16 | (opcode as u32) << 8
 }
@@ -345,22 +345,20 @@ fn fence_wait_with_pump(
 fn build_nop(payload_dws: usize) -> Vec<u32> {
     let mut p = Vec::with_capacity(payload_dws + 1);
     p.push(pm4_header(PM4_OP_NOP, payload_dws));
-    for _ in 0..payload_dws {
-        p.push(0);
-    }
+    p.resize(payload_dws + 1, 0);
     p
 }
 
 fn build_write_data(dst_addr: u64, value: u32) -> Vec<u32> {
     // 4 payload dwords: ctrl, addr_lo, addr_hi, value.
-    let mut p = Vec::with_capacity(5);
-    p.push(pm4_header(PM4_OP_WRITE_DATA, 4));
-    // Match `Pm4Builder::write_data`: DST_MEM (5<<8) | WR_CONFIRM (1<<20).
-    p.push((5u32 << 8) | (1u32 << 20));
-    p.push(dst_addr as u32);
-    p.push((dst_addr >> 32) as u32);
-    p.push(value);
-    p
+    alloc::vec![
+        pm4_header(PM4_OP_WRITE_DATA, 4),
+        // Match `Pm4Builder::write_data`: DST_MEM (5<<8) | WR_CONFIRM (1<<20).
+        (5u32 << 8) | (1u32 << 20),
+        dst_addr as u32,
+        (dst_addr >> 32) as u32,
+        value,
+    ]
 }
 
 fn build_event_write_eop(fence_addr: u64, seq: u32) -> Vec<u32> {
@@ -368,29 +366,29 @@ fn build_event_write_eop(fence_addr: u64, seq: u32) -> Vec<u32> {
     // The encoding here is internal to the test (the driver has no
     // builder for this opcode yet — see "deferred" note in final
     // report).
-    let mut p = Vec::with_capacity(6);
-    p.push(pm4_header(PM4_OP_EVENT_WRITE_EOP, 5));
-    // event_cntl: BOTTOM_OF_PIPE_TS (0x14) << 0 | EVENT_INDEX(5) << 8.
-    p.push(0x14 | (5 << 8));
-    p.push(fence_addr as u32);
-    p.push((fence_addr >> 32) as u32);
-    p.push(seq);
-    p.push(0);
-    p
+    alloc::vec![
+        pm4_header(PM4_OP_EVENT_WRITE_EOP, 5),
+        // event_cntl: BOTTOM_OF_PIPE_TS (0x14) << 0 | EVENT_INDEX(5) << 8.
+        0x14 | (5 << 8),
+        fence_addr as u32,
+        (fence_addr >> 32) as u32,
+        seq,
+        0,
+    ]
 }
 
 fn build_wait_reg_mem_eq(mem_addr: u64, reference: u32, mask: u32) -> Vec<u32> {
-    let mut p = Vec::with_capacity(7);
-    p.push(pm4_header(PM4_OP_WAIT_REG_MEM, 6));
-    // info: mem_space=1 (MEM) | function=3 (EQ). Mirrors
-    // `Pm4Builder::wait_reg_mem_eq`.
-    p.push((1u32 << 4) | 3);
-    p.push(mem_addr as u32);
-    p.push((mem_addr >> 32) as u32);
-    p.push(reference);
-    p.push(mask);
-    p.push(4);
-    p
+    alloc::vec![
+        pm4_header(PM4_OP_WAIT_REG_MEM, 6),
+        // info: mem_space=1 (MEM) | function=3 (EQ). Mirrors
+        // `Pm4Builder::wait_reg_mem_eq`.
+        (1u32 << 4) | 3,
+        mem_addr as u32,
+        (mem_addr >> 32) as u32,
+        reference,
+        mask,
+        4,
+    ]
 }
 
 // ── Ring submission helper ───────────────────────────────────────────
@@ -663,7 +661,7 @@ fn smoke_amdgpu_pm4_event_write_eop_fence_ready() -> TestResult {
         return TestResult::Fail("EVENT_WRITE_EOP not parsed");
     }
     match fence.poll(&vram) {
-        FencePoll::Ready(v) if v == 7 => {}
+        FencePoll::Ready(7) => {}
         FencePoll::Ready(v) => {
             let _ = v;
             return TestResult::Fail("fence ready but observed seq != 7");
@@ -711,7 +709,7 @@ fn smoke_amdgpu_fence_wait_timeout_then_ready() -> TestResult {
     // Now pump kicks in at tick 2 within a 10-tick window — must resolve.
     let result = fence_wait_with_pump(&fence, &mut vram, &mut ring, 2, 10);
     match result {
-        FencePoll::Ready(v) if v == 5 => {}
+        FencePoll::Ready(5) => {}
         FencePoll::Ready(_) => return TestResult::Fail("fence ready but wrong seq"),
         FencePoll::Pending => return TestResult::Fail("fence did not resolve after pump"),
     }

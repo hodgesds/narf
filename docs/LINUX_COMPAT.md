@@ -192,7 +192,7 @@ Delivery model and mask width are detailed in §3.2.
 | `perf_event_open` | implemented | `linux-compat` | `handlers.rs:~21949` |
 | `init_module`/`finit_module`/`delete_module` | present | — | NARF has no out-of-tree module model; treat as stubs unless verified **(unverified)** |
 | `io_uring_setup`/`enter`/`register` | **not present** | — | intentional non-goal (§6) |
-| `bpf` | partial | — | x86_64 321 / aarch64 280. `BPF_PROG_LOAD` + `BPF_PROG_TEST_RUN`; every other command `ENOTSUP`. `handlers/sys_bpf.rs` |
+| `bpf` | partial | — | x86_64 321 / aarch64 280. Programs (`PROG_LOAD`, `PROG_TEST_RUN`), maps (`MAP_CREATE`, `MAP_{LOOKUP,UPDATE,DELETE}_ELEM`, `MAP_GET_NEXT_KEY`), BTF (`BTF_LOAD`), introspection (`OBJ_GET_INFO_BY_FD`, `{PROG,MAP,LINK,BTF}_GET_NEXT_ID`, `{PROG,MAP,LINK,BTF}_GET_FD_BY_ID`), bpffs pinning (`OBJ_PIN`, `OBJ_GET`), attach (`PROG_{ATTACH,DETACH}`, `LINK_{CREATE,UPDATE,DETACH}`). `ENOTSUP`: `PROG_QUERY`, `TASK_FD_QUERY`, the `MAP_*_BATCH` commands, `BPF_TOKEN_CREATE` (NARF has no delegable token — the privilege gate is a credential check), `BPF_ITER_CREATE` (needs a seq_file-shaped read surface no NARF fd provides). `handlers/sys_bpf.rs` |
 
 ---
 

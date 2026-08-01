@@ -504,12 +504,28 @@ fn smoke_uaccess_validate_canonical_holes() -> TestResult {
     if validate_user_range(0x0000_7FFF_FFFF_F000, 0x1000).is_err() {
         return TestResult::Fail("range ending exactly at the canonical edge rejected");
     }
-    // Canonical kernel pointers stay allowed — kernel-test code
-    // legitimately passes kernel buffers through this path.
+    // Canonical KERNEL pointers must be rejected. This assertion used to
+    // run the other way — "kernel-test code legitimately passes kernel
+    // buffers through this path" — which is what made every syscall with a
+    // caller-supplied (address, length, content) triple an arbitrary
+    // kernel-write primitive: SMAP does not police a kernel page (PTE.U=0)
+    // and the STAC bracket disables it anyway, so the copy landed silently
+    // and returned Ok. See `validate_user_range` and
+    // `abi_uaccess_tests.rs`. Kernel-test buffers now go through the
+    // dynamically-scoped `kernel_buffers_guard()` opt-in instead, which is
+    // deliberately NOT held here.
     let k_buf = 0u64;
     let k = &k_buf as *const u64 as u64;
-    if validate_user_range(k, 8).is_err() {
-        return TestResult::Fail("canonical kernel pointer rejected");
+    if k >= 0xFFFF_8000_0000_0000 && validate_user_range(k, 8).is_ok() {
+        return TestResult::Fail("canonical kernel pointer accepted as a user range");
+    }
+    // Both ends of the kernel half, independent of where this build's
+    // stack happens to live.
+    if validate_user_range(0xFFFF_8000_0000_0000, 8).is_ok() {
+        return TestResult::Fail("the first canonical kernel address passed validation");
+    }
+    if validate_user_range(0xFFFF_FFFF_FFFF_FFF0, 8).is_ok() {
+        return TestResult::Fail("the top of the kernel half passed validation");
     }
     TestResult::Pass
 }

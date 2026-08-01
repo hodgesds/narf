@@ -731,6 +731,11 @@ fn with_procfs(
     body: impl FnOnce(&str) -> Result<(), &'static str>,
 ) -> TestResult {
     setup();
+    // Kernel-test fixture: hands the syscall entry point kernel `.rodata` /
+    // stack pointers as stand-in user buffers. See
+    // `handlers::kernel_buffers_guard` and `with_setup`, which does the same
+    // for the tests that use the closure form of this harness.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // TASK_INFO / CURRENT_PID / LIST_PIDS — needed by every renderer and by
     // `/proc/self` resolution; none has a hook-absent assertion elsewhere.
     narf_filesystem::procfs::install_proc_hooks(

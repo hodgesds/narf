@@ -80,6 +80,21 @@ if should "$RUN_CLIPPY"; then
     echo "Running clippy (aarch64)"
     cargo clippy -p narf-frame --target aarch64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128 --features boot-smoke,cgroup-all -- -D warnings
   fi
+
+  # Clippy the TEST code too. The two stages above build with
+  # `boot-smoke,cgroup-all`, which compiles none of the `kernel-test`-gated
+  # modules — and in a project where the in-kernel test suites are a first-class
+  # deliverable, that left the majority of the test code unlinted. It had
+  # already drifted: `bpf/src/idreg.rs` plus sites across `drivers/gpu`,
+  # `drivers/usb`, `drivers/wireless` and `bluetooth` were failing `-D warnings`
+  # under this feature set while every gate we ran stayed green.
+  echo "Running clippy (x86_64, kernel-test)"
+  cargo clippy -p narf-frame --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128 --features kernel-test,cgroup-all -- -D warnings
+
+  if arch_on aarch64; then
+    echo "Running clippy (aarch64, kernel-test)"
+    cargo clippy -p narf-frame --target aarch64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128 --features kernel-test,cgroup-all -- -D warnings
+  fi
 fi
 
 if should "$RUN_BOOT_SMOKE"; then

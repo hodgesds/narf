@@ -373,6 +373,12 @@ fn smoke_userspace_stat_returns_size() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_stat_returns_size);
 
 fn smoke_userspace_hostname_round_trip() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         hostname_init, install_core_syscalls, install_global, kernel_syscall_entry,
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
@@ -489,6 +495,12 @@ fn smoke_userspace_hostname_round_trip() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_hostname_round_trip);
 
 fn smoke_userspace_getcpu_returns_zero() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
         Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
@@ -560,6 +572,12 @@ fn smoke_userspace_getcpu_returns_zero() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_getcpu_returns_zero);
 
 fn smoke_userspace_memfd_create_returns_writable_fd() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
         Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
@@ -1117,6 +1135,12 @@ kernel_test_in!("userspace", smoke_wave72_sys_unshare_honours_new_flags);
 
 #[cfg(feature = "linux-compat")]
 fn smoke_userspace_clock_nanosleep_abstime_returns_at_or_after_target() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // clock_gettime → build target = now + 10ms →
     // clock_nanosleep(ABSTIME, target) → assert monotonic_ns >= target.
     use crate::{

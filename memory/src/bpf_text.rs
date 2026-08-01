@@ -13,23 +13,57 @@
 //!    verbatim at `kernel/bpf/core.c:863`.
 //! 3. The RW→RX **publish** ([`seal`]).
 //!
-//! ## Why there is no temporary-alias mechanism here
+//! ## W^X for the pack's frames
 //!
 //! Linux's prog pack keeps its text RO+X from creation and publishes through
-//! `text_poke_copy`, because Linux's direct map is NX and there is therefore no
-//! writable alias of the pack's frames. NARF's low identity map is
-//! `PRESENT | WRITABLE | HUGE_PAGE` with **no** `NO_EXEC`
-//! (`memory/src/x86_64/mmu.rs`), so every frame is already aliased RWX. We
-//! write through that alias ([`write`]) and skip the whole mechanism.
+//! `text_poke_copy`, because Linux's direct map is RO as well as NX and there
+//! is therefore no writable alias of the pack's frames at all. NARF now has
+//! both halves of that, and it is worth being exact about which piece does
+//! what.
 //!
-//! The honest consequence, recorded rather than papered over (spec §4.2): the
-//! RX mapping at the BPF text VA is **not a W^X boundary today**. It is the
-//! correct end state, and it makes the JIT's own view of its output
-//! non-writable, but an attacker with an arbitrary kernel write already has a
-//! writable alias of these bytes through the identity map. Kernel-text W^X
-//! becomes real only when the identity map is demoted to NX
-//! (`bpf/specification/spec.md` §8.6), which needs a huge-page demote helper
-//! that does not exist yet.
+//! Every kernel window `mmu::init_mmu` builds is **NX** apart from the kernel's
+//! own text and the AP trampoline (see `memory/src/x86_64/mmu.rs`, and
+//! `frame/src/aarch64/boot.S` for the PXN|UXN twin), so nothing outside
+//! `BPF_TEXT_BASE` can execute a pack's bytes and no kernel data anywhere can
+//! be executed at all. That was the first half, and on its own it left the
+//! pack's frames aliased **RW**+NX: an attacker with an arbitrary kernel write
+//! could no longer manufacture executable memory, but could still overwrite
+//! *these* bytes, which are executable at the pack's own VA.
+//!
+//! [`seal`] now closes that too, via [`crate::text_poke`]:
+//!
+//!   1. Every kernel window aliasing the pack's frames is made **read-only**,
+//!      demoting a live huge leaf where one is in the way. That is a split of
+//!      a **live** mapping, unlike the boot-time demotion `init_mmu` performs,
+//!      so it follows Linux's `__split_large_page` ordering — install an
+//!      identically-translating table, flush every CPU synchronously, and only
+//!      then change an attribute. `x86_64` additionally needs `CR0.WP`, which
+//!      NARF's boot path never set; `text_poke::enable_write_protect` does.
+//!   2. [`write`] into an already-sealed pack — every allocation after the
+//!      first — therefore has no writable address, and goes through
+//!      `text_poke::poke_copy` instead: a transient, per-CPU RW+NX alias of one
+//!      4 KiB frame, torn down before the call returns.
+//!
+//! Neither is useful alone, which is why they landed together: (1) without (2)
+//! breaks program loading and (2) without (1) guards nothing.
+//!
+//! **What is still open**, and why. A *fallback* pack — [`PACK_SMALL_BYTES`]
+//! of scattered 4 KiB frames, built when the hugepage pool is empty — sits
+//! inside 2 MiB block descriptors in the kernel's linear map. On x86_64 that
+//! is protected anyway, with one extra 2 MiB → 4 KiB demotion. On aarch64 it
+//! is not: making one frame read-only would mean splitting a live block, ARMv8
+//! requires break-before-make for that, and a BBM on the linear map would
+//! unmap live kernel memory on every other CPU. `text_poke::can_protect`
+//! refuses, [`seal`] leaves `alias_ro` false, and the pack keeps its writable
+//! alias rather than the kernel taking a TLB conflict abort. Linux arm64
+//! declines the same split for the same reason.
+//!
+//! Note how wide that is in practice: the hugepage pool is filled only by
+//! `hugepages_2m=N` on the cmdline, so on a default aarch64 boot **every** pack
+//! is a fallback pack and the protection never engages. `bpf/specification/
+//! spec.md` §8.6 records this and the cheap fix — give the fallback pack a
+//! 2 MiB-aligned contiguous buddy block instead of scattered frames, so it too
+//! lands on exactly one block descriptor.
 //!
 //! ## Reclamation
 //!
@@ -399,6 +433,18 @@ struct Pack {
     used: usize,
     /// `true` once the leaf mapping has been flipped to RX by [`seal`].
     sealed: bool,
+    /// `true` once every kernel window aliasing this pack's frames has been
+    /// made read-only ([`crate::text_poke::protect_ro`]). Tracked separately
+    /// from [`Self::sealed`] because the two can legitimately disagree:
+    /// `can_protect` is a permanent "no" for a sub-block range on aarch64, and
+    /// a pack that cannot have its alias protected must still be sealable
+    /// (with the gap recorded) rather than unloadable.
+    ///
+    /// It is also what [`write`] switches on. While this is false the pack's
+    /// frames are reachable RW through the linear map and a plain
+    /// `copy_nonoverlapping` is correct; once it is true the only writable
+    /// address is the transient poke window.
+    alias_ro: bool,
 }
 
 impl Pack {
@@ -467,6 +513,92 @@ impl Pack {
             Backing::Small(_) => 4096 - (off % 4096),
         }
     }
+
+    /// Physical address of the byte at pack offset `off`.
+    ///
+    /// The counterpart of [`Self::alias_at`] for the sealed path, which has no
+    /// writable VA to hand out and must name the frame instead.
+    fn phys_at(&self, off: u64) -> u64 {
+        match &self.backing {
+            Backing::Huge(h) => h.phys() + off,
+            Backing::Small(frames) => {
+                frames[(off / 4096) as usize].start_address().raw() + (off % 4096)
+            }
+        }
+    }
+
+    /// The pack's backing as `(phys, len)` extents, in the units alias
+    /// protection works on: one 2 MiB extent for a hugepage pack, one 4 KiB
+    /// extent per frame for a fallback pack.
+    fn phys_extents(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let huge = match &self.backing {
+            Backing::Huge(h) => Some((h.phys(), self.len)),
+            Backing::Small(_) => None,
+        };
+        let small = match &self.backing {
+            Backing::Huge(_) => None,
+            Backing::Small(frames) => {
+                Some(frames.iter().map(|f| (f.start_address().raw(), 4096u64)))
+            }
+        };
+        huge.into_iter().chain(small.into_iter().flatten())
+    }
+
+    /// Can every extent of this pack have its kernel alias made read-only?
+    ///
+    /// All-or-nothing on purpose: a pack half of whose frames stayed writable
+    /// would still hand an attacker a writable alias of executable text, so
+    /// there is no partial credit to bank.
+    fn alias_protectable(&self) -> bool {
+        self.phys_extents()
+            .all(|(p, l)| crate::text_poke::can_protect(p, l))
+    }
+
+    /// Write `bytes` at pack offset `off`, through whichever path this pack's
+    /// alias state permits.
+    ///
+    /// Before [`seal`] the linear alias is writable and this is a plain copy.
+    /// After it, the linear alias is read-only and the bytes go through the
+    /// transient per-CPU poke window — the `text_poke_copy` equivalent, and
+    /// the reason `seal` making the alias read-only does not break the second
+    /// and subsequent allocations in a pack.
+    fn write_at(&self, off: u64, bytes: &[u8]) -> Result<(), TextError> {
+        if self.alias_ro {
+            let mut done = 0usize;
+            let mut cur = off;
+            while done < bytes.len() {
+                let run = self.contig_from(cur).min((bytes.len() - done) as u64) as usize;
+                // SAFETY: `[cur, cur + run)` lies inside the pack and does not
+                // cross a physical discontinuity (`contig_from`), so
+                // `phys_at(cur)` names `run` contiguous bytes this pack owns.
+                // Callers hold `PACKS`, an `IrqSafeSpinLock`, so interrupts are
+                // masked for the whole poke — the per-CPU scratch VA cannot be
+                // re-entered.
+                unsafe {
+                    crate::text_poke::poke_copy(self.phys_at(cur), &bytes[done..done + run])
+                        .map_err(|_| TextError::MapFailed)?;
+                }
+                done += run;
+                cur += run as u64;
+            }
+            return Ok(());
+        }
+        let mut done = 0usize;
+        let mut cur = off;
+        while done < bytes.len() {
+            let run = self.contig_from(cur).min((bytes.len() - done) as u64) as usize;
+            let dst = self.alias_at(cur);
+            // SAFETY: `[cur, cur + run)` lies inside the pack and does not
+            // cross a physical discontinuity (`contig_from`); `alias_at`
+            // returns the kernel-reachable, still-writable alias of that byte.
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes[done..].as_ptr(), dst, run);
+            }
+            done += run;
+            cur += run as u64;
+        }
+        Ok(())
+    }
 }
 
 /// Registry of live packs. Not a hot path — every entry point here runs at
@@ -511,8 +643,11 @@ impl TextAlloc {
 
 /// Reserve `len` bytes of kernel text.
 ///
-/// The bytes come back **writable through the identity alias and not yet
-/// executable at `va`** — write with [`write`], register every faulting
+/// In a fresh pack the bytes come back **writable through the identity alias
+/// and not yet executable at `va`**; in a pack another program already sealed
+/// they come back executable and *not* writable through any alias, and
+/// [`write`] routes through the poke window. Either way the sequence is the
+/// same — write with [`write`], register every faulting
 /// instruction's extable entry (invariant §4.3), then [`seal`].
 ///
 /// `node` steers the hugepage allocation; pass the NUMA node the program will
@@ -574,11 +709,14 @@ pub fn alloc(cap: &JitCap, len: usize, node: usize) -> Result<TextAlloc, TextErr
     Ok(out)
 }
 
-/// Copy `bytes` into the allocation at `off`, through the identity alias.
+/// Copy `bytes` into the allocation at `off`.
 ///
-/// Legal both before and after [`seal`] — see the module docs. After a seal
-/// the caller is responsible for a fresh `seal` (or an arch icache flush) if
-/// the bytes may already have been fetched.
+/// Legal both before and after [`seal`] — see the module docs. Before the
+/// pack's alias is protected this goes through the writable linear alias;
+/// after, through `text_poke`'s transient per-CPU window, which is what keeps
+/// the second and subsequent allocations in a pack loadable once the alias is
+/// read-only. After a seal the caller is responsible for a fresh `seal` (or an
+/// arch icache flush) if the bytes may already have been fetched.
 pub fn write(a: &TextAlloc, off: usize, bytes: &[u8]) -> Result<(), TextError> {
     if off.saturating_add(bytes.len()) > a.len {
         return Err(TextError::OutOfBounds);
@@ -615,23 +753,12 @@ pub fn write(a: &TextAlloc, off: usize, bytes: &[u8]) -> Result<(), TextError> {
         return Err(TextError::ExtableMissing);
     }
 
-    let mut pack_off = (a.chunk * CHUNK_BYTES) as u64 + off as u64;
-    let mut done = 0usize;
-    while done < bytes.len() {
-        let run = p.contig_from(pack_off).min((bytes.len() - done) as u64) as usize;
-        let dst = p.alias_at(pack_off);
-        // SAFETY: `pack_off + run` stays inside the pack (bounds-checked
-        // against `a.len` above, and the allocation lies inside the pack), and
-        // `alias_at` returns the kernel-reachable alias of that physical byte.
-        // `run` never crosses a physical discontinuity — `contig_from` is what
-        // caps it.
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes[done..].as_ptr(), dst, run);
-        }
-        done += run;
-        pack_off += run as u64;
-    }
-    Ok(())
+    // `pack_off + bytes.len()` stays inside the pack: bounds-checked against
+    // `a.len` above, and the allocation lies inside the pack. `write_at` picks
+    // the linear alias or the poke window depending on whether `seal` has
+    // already made the alias read-only.
+    let pack_off = (a.chunk * CHUNK_BYTES) as u64 + off as u64;
+    p.write_at(pack_off, bytes)
 }
 
 /// Publish: flip the containing pack's leaf mapping from RW+NX to RX and make
@@ -677,6 +804,52 @@ pub fn seal(cap: &JitCap, a: &TextAlloc) -> Result<(), TextError> {
         .ok_or(TextError::Stale)?;
 
     if !p.sealed {
+        // Close the *writable* half first (spec §8.6 item 1). Ordering is not
+        // arbitrary: the alias flip is the step that can fail for a structural
+        // reason, and doing it before `seal_mapping` means a failure leaves the
+        // pack exactly as it was — RW+NX at its own VA, nothing published, the
+        // caller's `Err` truthful. The other order would publish executable
+        // text and then discover it could not protect the alias, with no way to
+        // un-publish.
+        //
+        // `alias_protectable` is checked separately from the call succeeding
+        // because the two failures mean different things: a `false` here is
+        // architectural (an aarch64 fallback pack is 4 KiB-grained inside a
+        // 2 MiB block, and splitting a live block would need break-before-make
+        // on the kernel's own linear map — see `text_poke`'s module docs and
+        // §8.6), whereas an `Err` from `protect_ro` on a pack we *said* was
+        // protectable is a bug and must not be swallowed.
+        if p.alias_protectable() {
+            let mut protected = 0usize;
+            let mut failed = false;
+            for (phys, len) in p.phys_extents() {
+                // SAFETY: the pack owns these frames outright — the hugepage
+                // pool / buddy handed them to `new_pack` and nothing else has a
+                // pointer to them. `PACKS` is held, which serialises this
+                // against every other page-table write in this module.
+                if unsafe { crate::text_poke::protect_ro(phys, len) }.is_err() {
+                    failed = true;
+                    break;
+                }
+                protected += 1;
+            }
+            if failed {
+                // Put back exactly what we took. A fallback pack has one extent
+                // per frame, so a mid-loop failure would otherwise leave a
+                // handful of frames read-only with `alias_ro` false — nothing
+                // would ever restore them, and the buddy would eventually hand
+                // an unwritable frame to somebody else.
+                for (phys, len) in p.phys_extents().take(protected) {
+                    // SAFETY: these are exactly the extents `protect_ro` just
+                    // succeeded on, under the same lock.
+                    unsafe {
+                        let _ = crate::text_poke::protect_rw(phys, len);
+                    }
+                }
+                return Err(TextError::MapFailed);
+            }
+            p.alias_ro = true;
+        }
         // SAFETY: `root` is the recorded kernel root; the pack's mapping was
         // installed through the same root by `new_pack`, so every level of the
         // walk exists and the leaf is ours to rewrite.
@@ -745,6 +918,21 @@ pub fn reclaim(a: TextAlloc) {
     // so unmapping the leaves cannot pull the ground out from under a running
     // program.
     unsafe { unmap_pack(&pack) };
+    // Give the frames their writable linear alias back *before* they go to the
+    // buddy. Skipping this is the sharpest failure mode in the whole feature:
+    // the next owner of the frame — a slab, a page table, a user page — would
+    // find its own kernel pointer read-only, and with `CR0.WP` now set that is
+    // a `#PF` in whatever unrelated subsystem drew the frame next.
+    if pack.alias_ro {
+        for (phys, len) in pack.phys_extents() {
+            // SAFETY: exactly the extents `seal` protected, and the pack is no
+            // longer reachable from `PACKS` (still holding the lock).
+            unsafe {
+                let _ = crate::text_poke::protect_rw(phys, len);
+            }
+        }
+        pack.alias_ro = false;
+    }
     release_pack_backing(&mut pack);
 }
 
@@ -784,6 +972,49 @@ pub fn take_reclaim_hook() -> Option<ReclaimHook> {
     RECLAIM_HOOK.lock().take()
 }
 
+/// Test hook: the state a W^X smoke needs about the pack based at `pack_base`.
+///
+/// The smokes below need the *physical* address of sealed text to check that
+/// its kernel alias is unwritable, and nothing else has a legitimate reason to
+/// ask — the whole point of the pack allocator is that callers speak in `va`.
+///
+/// `protectable` is reported separately from `alias_ro` on purpose, and it is
+/// what stops these tests from rotting into vacuous skips. "The alias was not
+/// protected" has two very different causes: an architectural refusal
+/// (`protectable == false`, e.g. an aarch64 fallback pack, where skipping is
+/// the honest answer) and a seal that simply did not do its job
+/// (`protectable == true`, which must be a failure). Reporting only `alias_ro`
+/// would collapse the two, and deleting the `protect_ro` call would turn the
+/// whole suite green-by-skipping.
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug)]
+pub struct PackTestState {
+    /// Physical base of the pack's first extent.
+    pub phys: u64,
+    /// Length of that extent.
+    pub len: u64,
+    /// [`seal`] has flipped the pack's own VA to RX.
+    pub sealed: bool,
+    /// Every kernel alias of the pack's frames is read-only.
+    pub alias_ro: bool,
+    /// This arch/config *can* protect this pack's alias.
+    pub protectable: bool,
+}
+
+#[doc(hidden)]
+pub fn __pack_state_for_test(pack_base: u64) -> Option<PackTestState> {
+    let packs = PACKS.lock();
+    let p = packs.iter().find(|p| p.base == pack_base)?;
+    let (phys, len) = p.phys_extents().next()?;
+    Some(PackTestState {
+        phys,
+        len,
+        sealed: p.sealed,
+        alias_ro: p.alias_ro,
+        protectable: p.alias_protectable(),
+    })
+}
+
 /// Diagnostics: (live packs, allocated chunks, quarantined allocations).
 pub fn stats() -> (usize, usize, usize) {
     // Deliberately not holding both locks at once. `reclaim_all_quarantined`
@@ -813,6 +1044,25 @@ fn fill_traps(a: &TextAlloc) -> Result<(), TextError> {
 }
 
 fn fill_traps_raw(p: &Pack, start: u64, span: u64) {
+    if p.alias_ro {
+        // A freed program in a sealed pack still has to be poisoned, and by
+        // then the linear alias is read-only — so this goes through the same
+        // transient window `write` uses. Best-effort, like the rest of the
+        // trap fill: the caller (`free`) already tolerates failure.
+        let mut off = start;
+        let end = start + span;
+        while off < end {
+            let run = p.contig_from(off).min(end - off) as usize;
+            // SAFETY: `[off, off + run)` lies inside the pack and does not
+            // cross a physical discontinuity (`contig_from`). Callers hold
+            // `PACKS`, so interrupts are masked across the poke.
+            unsafe {
+                let _ = crate::text_poke::poke_fill(p.phys_at(off), run, TRAP_FILL);
+            }
+            off += run as u64;
+        }
+        return;
+    }
     let mut off = start;
     let end = start + span;
     while off < end {
@@ -857,6 +1107,7 @@ unsafe fn new_pack(root: PhysAddr, node: usize, need: u64) -> Result<Pack, TextE
                 bitmap: alloc_crate::vec![0u64; (PACK_HUGE_BYTES as usize / CHUNK_BYTES).div_ceil(64)],
                 used: 0,
                 sealed: false,
+                alias_ro: false,
             };
             fill_traps_raw(&p, 0, p.len);
             Ok(p)
@@ -923,6 +1174,7 @@ unsafe fn new_pack(root: PhysAddr, node: usize, need: u64) -> Result<Pack, TextE
                 ],
                 used: 0,
                 sealed: false,
+                alias_ro: false,
             };
             fill_traps_raw(&p, 0, p.len);
             Ok(p)
@@ -1700,6 +1952,339 @@ fn smoke_bpf_text_revoked_cap_cannot_allocate() -> TestResult {
     }
 }
 kernel_test_in!("memory", smoke_bpf_text_revoked_cap_cannot_allocate);
+
+/// Seal an allocation of `RET42` and hand the caller the pack it landed in.
+/// Shared by the W^X smokes below, which all need the same five-step preamble
+/// and the same cleanup.
+fn seal_a_stub(cap: &JitCap) -> Result<TextAlloc, &'static str> {
+    let a = alloc(cap, RET42.len(), 0).map_err(|_| "bpf_text::alloc failed")?;
+    let token = a.va;
+    if crate::bpf_extable::register_image(token, a.va, a.va + a.len as u64, Vec::new()).is_err() {
+        free(a);
+        return Err("register_image failed");
+    }
+    if write(&a, 0, RET42).is_err() {
+        crate::bpf_extable::unregister_image(token);
+        free(a);
+        return Err("bpf_text::write failed");
+    }
+    if seal(cap, &a).is_err() {
+        crate::bpf_extable::unregister_image(token);
+        free(a);
+        return Err("bpf_text::seal failed");
+    }
+    Ok(a)
+}
+
+fn drop_stub(a: TextAlloc) {
+    crate::bpf_extable::unregister_image(a.va);
+    free(a);
+}
+
+/// **Spec §8.6 item 1.** Sealed JIT text must not be writable through *any*
+/// kernel window.
+///
+/// This is the property the whole feature exists for, checked structurally so
+/// it holds on both arches: `alias_is_writable` walks every window that
+/// aliases the pack's frames — the low identity map, the higher-half kernel
+/// window, and the direct map when it is built — and reports `true` if any one
+/// of them still carries `WRITABLE` / `AP_RW_EL1`. Before this work it
+/// returned `true` on every boot.
+fn smoke_bpf_text_sealed_alias_is_unwritable() -> TestResult {
+    let cap = JitCap::bootstrap();
+    let a = match seal_a_stub(&cap) {
+        Ok(a) => a,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let Some(st) = __pack_state_for_test(a.pack_base) else {
+        drop_stub(a);
+        return TestResult::Fail("sealed pack vanished from the registry");
+    };
+    if !st.sealed {
+        drop_stub(a);
+        return TestResult::Fail("seal() returned Ok without marking the pack sealed");
+    }
+    if !st.protectable {
+        drop_stub(a);
+        // Not a pass by luck, and not a skip by luck either. On aarch64 a
+        // fallback (4 KiB-grained) pack cannot have its alias protected
+        // without a break-before-make on a live block — see `text_poke`'s
+        // module docs and spec §8.6 — so skipping is the honest answer *only*
+        // in that case, which is why it is keyed on `protectable` and not on
+        // whether the protection happened.
+        return TestResult::Skip("this pack's alias is not protectable on this arch");
+    }
+    if !st.alias_ro {
+        drop_stub(a);
+        return TestResult::Fail("seal() left a protectable pack's alias unprotected");
+    }
+    let writable = crate::text_poke::alias_is_writable(st.phys);
+    drop_stub(a);
+    match writable {
+        Some(false) => TestResult::Pass,
+        Some(true) => TestResult::Fail("sealed JIT text is still writable through a kernel alias"),
+        None => TestResult::Fail("could not walk the kernel alias of sealed text"),
+    }
+}
+kernel_test_in!("memory", smoke_bpf_text_sealed_alias_is_unwritable);
+
+/// The behavioural half of the test above: perform the write that worked
+/// before this change and require the hardware to stop it.
+///
+/// x86_64 only — `narf_arch::x86_64::probe` is what makes a deliberate #PF
+/// survivable, and aarch64 has no equivalent, so there the structural check
+/// above stands alone.
+///
+/// Two things are asserted, not one. The fault must be a **write** to a
+/// **present** page (error code bits 0 and 1), which is what distinguishes
+/// "read-only alias" from "the test picked an unmapped address"; and the byte
+/// must be unchanged afterwards, which is what distinguishes a real refusal
+/// from a fault taken after the store retired.
+#[cfg(target_arch = "x86_64")]
+fn smoke_bpf_text_sealed_alias_write_faults() -> TestResult {
+    use core::arch::asm;
+    use narf_arch::x86_64::probe;
+
+    if !crate::text_poke::write_protect_enabled() {
+        return TestResult::Fail("CR0.WP is clear — read-only kernel mappings are advisory");
+    }
+
+    let cap = JitCap::bootstrap();
+    let a = match seal_a_stub(&cap) {
+        Ok(a) => a,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let Some(st) = __pack_state_for_test(a.pack_base) else {
+        drop_stub(a);
+        return TestResult::Fail("sealed pack vanished from the registry");
+    };
+    if !st.protectable {
+        drop_stub(a);
+        return TestResult::Skip("this pack's alias is not protectable on this arch");
+    }
+    if !st.alias_ro {
+        drop_stub(a);
+        return TestResult::Fail("seal() left a protectable pack's alias unprotected");
+    }
+
+    // The identity alias of the pack's first byte — the address an arbitrary
+    // kernel write would use, and the address `Pack::alias_at` used to hand
+    // out for `write`.
+    let target = PhysAddr::new(st.phys).kernel_ptr::<u8>();
+    // SAFETY: the alias is present and readable; only the write is expected to
+    // fault.
+    let before = unsafe { core::ptr::read_volatile(target) };
+
+    let recovery: u64;
+    // SAFETY: LEA of a local label is always safe.
+    unsafe {
+        asm!(
+            "lea {r}, [55f + rip]",
+            r = out(reg) recovery,
+            options(nostack, preserves_flags),
+        );
+    }
+    probe::arm(recovery);
+    // SAFETY: the store is expected to #PF; the armed probe redirects to `55:`.
+    // If the protection has regressed and it succeeds, it writes one byte into
+    // a program this test is about to free, and the test reports the failure.
+    unsafe {
+        asm!(
+            "mov byte ptr [{p}], 0x90",
+            "55:",
+            p = in(reg) target,
+            options(nostack),
+        );
+    }
+    let caught = probe::disarm();
+    // SAFETY: still mapped read-only; reading is legal either way.
+    let after = unsafe { core::ptr::read_volatile(target) };
+
+    drop_stub(a);
+
+    match caught.vector {
+        None => return TestResult::Fail("write through the alias of sealed text was allowed"),
+        Some(14) => {}
+        Some(_) => return TestResult::Fail("wrong vector caught (not #PF)"),
+    }
+    if caught.error_code & 0b1 == 0 {
+        return TestResult::Fail("faulted, but on a non-present page — wrong address, not W^X");
+    }
+    if caught.error_code & 0b10 == 0 {
+        return TestResult::Fail("faulted, but not on a write — wrong cause");
+    }
+    if after != before {
+        return TestResult::Fail("the store landed despite the fault");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_bpf_text_sealed_alias_write_faults);
+
+/// **Spec §8.6 item 2.** The allocation *after* the first in a pack is written
+/// into text that is already sealed and whose alias is already read-only, so
+/// it has no writable address left. It must still load and run.
+///
+/// This is the case that breaks if item 1 lands without item 2, which is why
+/// the spec insists they land together — and running *both* programs is what
+/// makes it a test of the poke path rather than of the return codes.
+fn smoke_bpf_text_second_alloc_in_sealed_pack_runs() -> TestResult {
+    let cap = JitCap::bootstrap();
+    let first = match seal_a_stub(&cap) {
+        Ok(a) => a,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let alias_ro = __pack_state_for_test(first.pack_base)
+        .map(|st| st.alias_ro)
+        .unwrap_or(false);
+
+    let second = match seal_a_stub(&cap) {
+        Ok(a) => a,
+        Err(e) => {
+            drop_stub(first);
+            return TestResult::Fail(e);
+        }
+    };
+    let same_pack = second.pack_base == first.pack_base;
+
+    // Read the sealed text back at its own (RX) VA and compare *before*
+    // entering it. A poke that copied the wrong bytes would otherwise be
+    // diagnosed by executing them, which on x86_64 means running whatever
+    // 0xCC-filled tail followed — a fatal `int3`, not a red test. Checking the
+    // bytes first turns a broken poke into a named failure.
+    // SAFETY: both allocations are mapped and readable at their own VA for
+    // `len` bytes.
+    let bytes_ok = unsafe {
+        core::slice::from_raw_parts(first.va as *const u8, first.len) == RET42
+            && core::slice::from_raw_parts(second.va as *const u8, second.len) == RET42
+    };
+    let poked = crate::text_poke::poke_used();
+
+    if !bytes_ok {
+        drop_stub(second);
+        drop_stub(first);
+        return TestResult::Fail("sealed text does not match what was written");
+    }
+
+    // SAFETY: both hold sealed, executable `extern "C"` stubs that take no
+    // arguments, clobber only the return register, and return — and the byte
+    // comparison above has just confirmed the instruction stream.
+    let f1: extern "C" fn() -> u64 = unsafe { core::mem::transmute::<u64, _>(first.va) };
+    // SAFETY: as above, for the second allocation.
+    let f2: extern "C" fn() -> u64 = unsafe { core::mem::transmute::<u64, _>(second.va) };
+    let got1 = f1();
+    let got2 = f2();
+
+    drop_stub(second);
+    drop_stub(first);
+
+    if !same_pack {
+        return TestResult::Skip("second allocation did not land in the sealed pack");
+    }
+    if got1 != 42 || got2 != 42 {
+        return TestResult::Fail("a program in a re-used sealed pack returned the wrong value");
+    }
+    if alias_ro && !poked {
+        // The second write went somewhere. If the alias was read-only it
+        // cannot have been the linear map, so the poke window must have run;
+        // a green here without it would mean the test proved nothing about
+        // item 2.
+        return TestResult::Fail("second write into a protected pack bypassed the poke window");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_bpf_text_second_alloc_in_sealed_pack_runs);
+
+/// Reclaim must hand the frames back to the buddy **writable**.
+///
+/// This is the failure mode with the widest blast radius in the whole feature:
+/// a frame released still carrying a read-only alias is a `#PF` in whichever
+/// unrelated subsystem draws it next, arbitrarily far from here.
+fn smoke_bpf_text_reclaim_restores_writable_alias() -> TestResult {
+    let cap = JitCap::bootstrap();
+    // Route `free` through the quarantine so this test controls when the pack
+    // is actually released, exactly as the sibling reclaim smoke does.
+    let saved = take_reclaim_hook();
+    reclaim_all_quarantined();
+
+    let outcome = reclaim_restores_alias_body(&cap);
+
+    if let Some(h) = saved {
+        install_reclaim_hook(h);
+    }
+    outcome
+}
+
+fn reclaim_restores_alias_body(cap: &JitCap) -> TestResult {
+    // Claim a **whole pack**, not a stub-sized run. `alloc` first-fits into
+    // existing packs, so a small allocation lands next to some sibling smoke's
+    // still-live program and `reclaim` never reaches the release path — which
+    // is exactly what this test needs to observe. Being the pack's only
+    // allocation is what makes freeing it release the backing.
+    //
+    // `PACK_SMALL_BYTES`, not `PACK_HUGE_BYTES`, because the hugepage pool is
+    // only populated by `hugepages_2m=N` on the cmdline and the test runner
+    // does not pass it — so every pack here is a fallback pack, a 2 MiB request
+    // is unsatisfiable, and asking for one made this test skip on every run.
+    // A request for exactly one fallback pack's worth cannot fit in any pack
+    // that already has an allocation, so it forces a fresh one and fills it.
+    let a = match alloc(cap, PACK_SMALL_BYTES as usize, 0) {
+        Ok(a) => a,
+        Err(TextError::Exhausted) => return TestResult::Skip("no room for a private pack"),
+        Err(_) => return TestResult::Fail("whole-pack alloc failed"),
+    };
+    let token = a.va;
+    if crate::bpf_extable::register_image(token, a.va, a.va + a.len as u64, Vec::new()).is_err() {
+        free(a);
+        return TestResult::Fail("register_image failed");
+    }
+    if write(&a, 0, RET42).is_err() {
+        crate::bpf_extable::unregister_image(token);
+        free(a);
+        return TestResult::Fail("bpf_text::write failed");
+    }
+    if seal(cap, &a).is_err() {
+        crate::bpf_extable::unregister_image(token);
+        free(a);
+        return TestResult::Fail("bpf_text::seal failed");
+    }
+    let pack_base = a.pack_base;
+    let Some(st) = __pack_state_for_test(pack_base) else {
+        drop_stub(a);
+        return TestResult::Fail("sealed pack vanished from the registry");
+    };
+    let phys = st.phys;
+    if !st.protectable {
+        drop_stub(a);
+        return TestResult::Skip("this pack's alias is not protectable on this arch");
+    }
+    if !st.alias_ro {
+        drop_stub(a);
+        return TestResult::Fail("seal() left a protectable pack's alias unprotected");
+    }
+    if crate::text_poke::alias_is_writable(phys) != Some(false) {
+        drop_stub(a);
+        return TestResult::Fail("alias was not read-only after seal — nothing to restore");
+    }
+
+    drop_stub(a);
+    reclaim_all_quarantined();
+
+    if __pack_state_for_test(pack_base).is_some() {
+        // The whole-pack allocation above is supposed to make this impossible:
+        // if the pack survived its only allocation being reclaimed, the release
+        // path did not run and the restore never happened.
+        return TestResult::Fail("pack outlived its only allocation — release path never ran");
+    }
+    match crate::text_poke::alias_is_writable(phys) {
+        Some(true) => TestResult::Pass,
+        Some(false) => {
+            TestResult::Fail("reclaim released frames still carrying a read-only kernel alias")
+        }
+        None => TestResult::Fail("could not walk the kernel alias after reclaim"),
+    }
+}
+kernel_test_in!("memory", smoke_bpf_text_reclaim_restores_writable_alias);
 
 // ── Tests ──────────────────────────────────────────────────────────────
 

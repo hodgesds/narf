@@ -37,11 +37,15 @@ lowering of sleepable programs (§8.5).
    kinds of call.
 2. **Programs are hostile.** Every guarantee is enforced, never assumed.
 3. **`alloc` is available**, but a *running* program may not use it — see §4.6.
-4. **The kernel address space is currently RWX.** `memory/src/x86_64/mmu.rs`
-   maps the low identity window `PRESENT | WRITABLE | HUGE_PAGE` with no
-   `NO_EXEC`, and there is no huge-page demote helper. JIT text mapped RX at
-   its own VA is therefore *simultaneously aliased RWX* through the identity
-   map. See §4.2 — this is stated as a limitation, not claimed as a boundary.
+4. **The kernel address space is NX outside kernel text, but not read-only.**
+   `memory/src/x86_64/mmu.rs` now builds every window — low identity, high
+   MMIO, kernel direct map, and the higher-half kernel window — with
+   `NO_EXEC`, demoting 1 GiB leaves to 2 MiB and 4 KiB where a narrower
+   exception is needed; `frame/src/aarch64/boot.S` does the same with
+   `PXN|UXN`. The only executable ranges are `[__kernel_start, __text_end)`
+   and the 8 KiB AP-trampoline window at physical `0x8000`. JIT text is
+   therefore no longer *aliased RWX* — but the alias is still **writable**,
+   so an arbitrary kernel write can still overwrite live JIT text. See §4.2.
 5. **BPF kernel-VA slots must exist before the first user address space.**
    `new_user_pml4_on` (`memory/src/x86_64/paging.rs:239`) snapshot-copies
    PML4[256..511] *by value*, and nothing propagates later changes. See §4.1.
@@ -116,10 +120,10 @@ impl Arena {
     pub fn new(cap: &ArenaCap, max_pages: usize) -> Result<Arena, ArenaError>;
     pub fn kva(&self) -> u64;                              // stable for the arena's life
     pub fn window_offset(&self) -> u64;                    // the base-relative pointer
-    pub fn populate(&self, page: usize) -> Result<u64, ArenaError>;
+    pub fn populate(&self, page: usize) -> Result<ArenaPage, ArenaError>;   // { kva, phys }
     pub fn populate_range(&self, from: usize, count: usize) -> Result<(), ArenaError>;
     pub fn first_unpopulated(&self, from: usize) -> Option<usize>;
-    pub fn snapshot_frames(&self) -> Vec<PhysAddr>;        // freezes the arena — §8.2
+    pub fn frame_at(&self, page: usize) -> Option<PhysAddr>;   // never populates
     pub fn resolve(&self, offset: u64) -> Option<u64>;
 }
 ```
@@ -186,13 +190,24 @@ call from `bare_main.rs` after MMU init, *not* a staged initcall. A
 `debug_assert` in `new_user_pml4_on` checks both slots are present so a future
 reordering fails loudly.
 
-**4.2 — JIT text is mapped RX at its own VA, and this is not yet a security
-boundary.** Per assumption 2.4 the identity map aliases the same frames RWX.
-The RX mapping is still correct and worth doing, but W^X for kernel text is
-incomplete until the identity map is demoted to NX (tracked; §8.6).
-Consequence: the RW→RX publish writes *through the identity alias*. Do **not**
-build Linux's temporary-alias mechanism — it exists because Linux's direct map
-is NX, and here it would add attack surface for nothing.
+**4.2 — JIT text is mapped RX at its own VA, with no writable and no
+executable alias.** Per assumption 2.4 every kernel window is NX apart from
+kernel text and the AP trampoline, so the bytes are executable at exactly one
+address; and `seal` makes every kernel window that aliases the pack's frames
+read-only, so they are writable at none. An attacker with an arbitrary kernel
+write can neither turn heap, stack or buddy memory into code nor overwrite live
+JIT text.
+
+Consequence for the code: the RW→RX publish can no longer write *through the
+alias*, so a `text_poke_copy` equivalent exists — `text_poke::poke_copy`, a
+transient per-CPU RW+NX window over one frame at a time. §8.6's item 1 and
+item 2 landed together for exactly that reason.
+
+The one range where this is weaker: an aarch64 **fallback** pack (scattered
+4 KiB frames, built only when the hugepage pool is empty) keeps its writable
+alias, because making it read-only would mean a break-before-make on a live
+block descriptor in the kernel's own linear map. §8.6 states the trade and what
+closing it would cost.
 
 **4.3 — Extable registration precedes execution.** Every faulting instruction
 the JIT emits has an `ExEntry` registered *before* `seal()` publishes the text
@@ -302,24 +317,152 @@ and the perf event layer, all of which are closed.
 1. **Arena pointer width and truncation sequence.** A 32-bit in-program pointer
    costs one `mov eax,eax`; a wider one costs a shift pair but lifts the 4 GiB
    cap. Whether to keep a 32-bit fast path for small arenas is a Phase-3 call.
-2. **Demand-populated arenas need a new `FileOps` hook.** `mmap_frames` is
-   eager and whole-range, and takes its frame snapshot at mmap time — so a page
-   the *program* populates later is never visible to userspace. A
-   `mmap_fault(offset)` hook routed from the demand-paging arm of the trap
-   handler fixes this and would make every device node demand-pageable, not
-   just arenas. Roughly 40 lines; scope in Phase 3.
-   **Interim behaviour (landed):** `Arena::snapshot_frames` freezes the arena
-   and `Arena::populate` then returns `ArenaError::SnapshotTaken`, so the
-   mistake surfaces as a typed error at the call that makes it rather than as
-   a page that silently does not exist in userspace.
+2. ~~**Demand-populated arenas need a new `FileOps` hook.**~~ — **resolved.**
+   `FileOps::mmap_fault(offset) -> Result<u64, FsError>` is a defaulted trait
+   method returning the frame for one page, answered from the demand-paging arm
+   of the page-fault handler instead of once at `mmap` time. A userspace
+   `MAP_SHARED` mapping of an arena now **tracks** the arena rather than
+   snapshotting it: a page populated after the `mmap` appears on first touch.
+   `Arena::snapshot_frames` and `ArenaError::SnapshotTaken`, the interim typed
+   error that made the resulting hole loud, are deleted — there is no hole left
+   for them to name.
+
+   Routing, since it crosses three crates. `RegionPerms::FILE_DEMAND` marks a
+   region whose unbacked slots come from a file rather than from the frame
+   allocator; `AddressSpace::demand_alloc_page` resolves such a fault through
+   `install_file_fault_hook`, **with the regions lock dropped** (the hook
+   re-enters the filesystem, which allocates, takes its own locks, and for an
+   arena installs a kernel page-table entry), then publishes the frame into the
+   region's `phys` slot and falls through to the existing "backed but no leaf"
+   branch so the leaf install and its spurious-fault reasoning exist once.
+   `narf-memory` still holds no filesystem types: the hook is a `fn` pointer,
+   the same seam shape as `install_shared_frame_hooks` and `install_pager`, and
+   `userspace/src/mapped_file.rs` — which already knew which file a user address
+   belongs to — supplies it. `sys_mmap` installs it on the path that creates the
+   first `FILE_DEMAND` region, so unlike §4.1's page-table slots there is no
+   boot-order constraint. `mmap_frames` stays for files that are genuinely a
+   snapshot (`/dev/fb0`, perf's ring, `linux_compat`); `sys_mmap` tries it
+   first and falls to `mmap_fault`, probing by asking for the first page, which
+   is idempotent and about to be touched anyway.
+
+   **What is still not demand-populated: the program itself.** §4.6 forbids a
+   running program from allocating, and populating a page allocates a frame and
+   walks page tables — so a program cannot fault one in, and the interpreter's
+   arena access is a plain kernel dereference with no extable entry behind it,
+   which makes an unbacked page a kernel fault rather than something
+   recoverable. `ProgArena` therefore has a **live** extent (the populated
+   prefix, one atomic that only grows, which is what keeps `resolve`
+   allocation- and lock-free) and a **reserved** extent it may grow into.
+   Everything off the run path may grow it — `bpf(2)`, creation, and the
+   demand-fault path. Giving programs their own growth needs either a kfunc
+   over a pre-charged frame reserve with pre-populated page tables, or Linux's
+   answer (`bpf_arena_alloc_pages` over `kmalloc_nolock`, `arena.c:857`); both
+   are §4.6 amendments, not follow-ups to this item.
 3. **Nested locks.** v1 permits one live `Guard` at a time. Nesting under a
    declared lock-order lattice is deferred.
 4. **`struct_ops!` form.** Whether it re-declares traits or mirrors existing
    ones via `struct_ops_for!(path::Trait { … })`.
 5. **Continuation-style JIT lowering for sleepable programs**, replacing "
    sleepable ⇒ interpreted".
-6. **Demoting the low identity map to NX**, which is what would make §4.2 an
-   actual W^X boundary. Needs a huge-page demote helper that does not exist.
+6. **Making JIT text unwritable, not merely un-aliased-executable.** The first
+   half of this is **done**: `mmu::init_mmu` and `frame/src/aarch64/boot.S`
+   build every kernel window NX/`PXN|UXN` except `[__kernel_start,
+   __text_end)` and the AP-trampoline window, demoting 1 GiB → 2 MiB → 4 KiB
+   at boot so those exceptions are stated at the granularity they need. The
+   demotion is built *before* the CR3/`sctlr_el1` handoff, so it never splits
+   a live mapping. `memory/src/tests.rs` pins it: a buddy frame written
+   through its identity alias and through the higher-half kernel window is
+   proved to `#PF` with the instruction-fetch bit set, and the AP-trampoline
+   window is proved executable at 4 KiB granularity with the next page NX.
+
+   The *writable* half is now **done for hugepage-backed packs on both
+   arches**, which is every pack the allocator builds unless the boot-time
+   hugepage reservation came up empty. `memory/src/text_poke.rs` carries both
+   halves, and they landed together because neither is useful alone — (1)
+   without (2) breaks program loading, and (2) without (1) is a mechanism
+   guarding nothing.
+
+   1. **`seal` makes the pack's alias read-only.** `text_poke::protect_ro`
+      walks every kernel window that aliases the pack's frames — the low
+      identity map, the higher-half kernel window (phys 0..1 GiB), and the
+      direct map when a >512 GiB machine has one — and clears `WRITABLE` /
+      sets `AP_RO_EL1` on each. Where a live huge leaf is in the way on
+      x86_64 it is split, following `__split_large_page`
+      (`arch/x86/mm/pat/set_memory.c:1121`): the replacement table is filled
+      with translations *identical* to the leaf it replaces, so Intel's TLB
+      application note — which makes behaviour undefined only when the large
+      and small translations **differ** — does not bite, and the swap is one
+      naturally-aligned 8-byte store. The attribute change happens only after
+      a **synchronous** global flush (`flush_user_tlb_all_cpus`, which spins
+      for every peer's ack via `shoot_full`), exactly Linux's
+      split → `flush_tlb_all()` → change ordering. `bpf_text`'s `PACKS` lock
+      plays the part of `cpa_lock`.
+
+      x86_64 additionally needed **`CR0.WP`**, which NARF's boot path never
+      set — measured `CR0` was `0x80000011`. Without it a supervisor store
+      ignores the R/W bit (Intel SDM Vol 3 §4.6.1) and a read-only alias is
+      decoration. `text_poke::enable_write_protect` sets it on the BSP
+      (`bare_main`, right after the MMU handoff) and on every AP
+      (`_ap_start_rust`), because `WP` is per-CPU state.
+
+   2. **A `text_poke_copy` equivalent.** `text_poke::poke_copy` maps **one
+      4 KiB frame at a time** RW+NX at a **per-CPU** scratch VA above the pack
+      region in the BPF text slot, copies, and unmaps before returning. Per-CPU
+      rather than global so only its owner can ever form a translation for it,
+      which is what makes a local `INVLPG` sufficient — the same reason Linux's
+      `text_poke` uses a per-CPU fixmap slot. `write` and the freed-program
+      trap fill both route through it once the pack's alias is protected.
+      `reclaim` calls `protect_rw` before releasing the frames, or the next
+      owner of the frame would inherit a read-only alias.
+
+   **What remains open: aarch64 fallback packs — which in the default
+   configuration is *every* aarch64 pack.** State it that way rather than as a
+   corner case, because the hugepage pool is populated only by `hugepages_2m=N`
+   on the cmdline (`bare_main.rs`), and neither the test runner nor a default
+   boot passes it. So `alloc_hugepage_2m_on` fails, `new_pack` takes the
+   `PACK_SMALL_BYTES` arm, and every pack is 16 scattered 4 KiB frames.
+
+   On x86_64 that is fine — those frames *are* protected, via one extra
+   2 MiB → 4 KiB demotion, which is the same mechanism as the 1 GiB → 2 MiB one
+   and carries no additional architectural risk. On aarch64 it is not: NARF's
+   linear map is built by `boot.S` at 2 MiB block granularity, so protecting one
+   4 KiB frame would mean splitting a live block, and ARMv8 requires
+   break-before-make when a translation's block size changes. A BBM on the
+   linear map would unmap live kernel memory on every other CPU for the
+   duration — far worse than the gap. Linux arm64 declines the identical split
+   for the identical reason: it does not split the linear map, it boots it
+   page-mapped up front when it knows it will need to change permissions
+   (`rodata_full` / `can_set_direct_map()`). `text_poke::can_protect` therefore
+   refuses sub-block ranges on aarch64, `seal` leaves `Pack::alias_ro` false,
+   and the pack keeps its writable alias rather than the kernel taking a TLB
+   conflict abort.
+
+   Net effect today: **on aarch64 the pack-level protection engages only for
+   hugepage-backed packs, i.e. only when the kernel is booted with
+   `hugepages_2m=N`.** The mechanism itself is verified on aarch64 regardless —
+   `smoke_text_poke_protect_round_trip` protects and restores a 2 MiB-aligned
+   buddy block directly — but the `bpf_text` smokes skip there, and they say so
+   rather than passing.
+
+   Two ways to close it, in increasing order of cost. The cheap one is to make
+   the fallback pack a **2 MiB-aligned, 2 MiB contiguous buddy block**
+   (`frame::alloc_pages_on(node, 9)` / `free_pages`, a new `Backing` variant
+   mapped with `map_2mb`) instead of 16 scattered 4 KiB frames: every pack then
+   lands on exactly one block descriptor, aarch64 needs no split at all, and
+   x86_64 stops needing the 2 MiB → 4 KiB level too. The thorough one is to
+   build the aarch64 kernel RAM window at 4 KiB granularity at boot — the trade
+   Linux makes — which is a change to `boot.S`, not to this module.
+
+   Pinned by `memory/src/bpf_text.rs`
+   (`smoke_bpf_text_sealed_alias_is_unwritable`,
+   `smoke_bpf_text_sealed_alias_write_faults`,
+   `smoke_bpf_text_second_alloc_in_sealed_pack_runs`,
+   `smoke_bpf_text_reclaim_restores_writable_alias`) and
+   `memory/src/text_poke.rs` (`smoke_text_poke_write_protect_is_on`,
+   `smoke_text_poke_window_is_transient`). The first pair is the load-bearing
+   one: the write that worked before this change is performed through the
+   linear alias and required to `#PF` with the present+write error bits set,
+   with the byte proved unchanged afterwards.
 7. ~~**Fuel accounting granularity**~~ — **resolved: per instruction.** Per
    back-edge bounds iterations rather than work: 65536 straight-line
    instructions cost one unit, so the default tank permitted ~7e10
@@ -492,38 +635,47 @@ and the perf event layer, all of which are closed.
     that appeared to hold a packet pointer while silently seeing zeroes would
     be worse than one that never had one.
 
-13. **A userspace `mmap` of an arena keeps nothing alive, so arena frames are
-    leaked rather than freed once exposed.** `sys_mmap` clones the `FileOps`
-    `Arc` only for the duration of the call, copies the physical addresses into
-    the `Region`, and drops it; `munmap` never calls back into the file. So this
-    sequence returned live user-mapped frames to the buddy: userspace `mmap`s
-    the arena `MAP_SHARED`, closes the fd, the program exits, the last
-    `Arc<ProgArena>` drops, and `Arena::drop` frees each frame — while userspace
-    still has them mapped read-write. A userspace-writable window onto arbitrary
-    recycled kernel memory.
+13. ~~**A userspace `mmap` of an arena keeps nothing alive, so arena frames are
+    leaked rather than freed once exposed.**~~ — **resolved: the mapping owns
+    the reference, and the leak branch is deleted.**
 
-    Arenas are the first `mmap_frames` user where this matters, which is why the
-    contract was never stressed: `/dev/fb0` hands out device memory that is never
-    in the buddy, and perf's ring lives as long as the task. Neither reason
-    generalises.
+    The defect. `Arena::drop` frees each frame; a userspace `MAP_SHARED` mapping
+    of those frames kept nothing alive; so `mmap` the arena, close the fd, let
+    the program exit, and the last `Arc<ProgArena>` drop returned live
+    user-mapped frames to the buddy — a userspace-writable window onto arbitrary
+    recycled kernel memory. Arenas were the first `mmap_frames` user where it
+    mattered, which is why the contract had never been stressed: `/dev/fb0`
+    hands out device memory that is never in the buddy, and perf's ring lives as
+    long as the task. Neither reason generalises.
 
-    **Current behaviour:** `Arena::drop` unmaps the kernel VA but *deliberately
-    leaks the frames* when `inner.snapshotted` is set — i.e. when `mmap_frames`
-    has handed the list out. Losing the memory is strictly better than handing
-    userspace a window onto whatever the buddy allocates next. The leak is
-    bounded by the arena's own size, only happens when userspace actually mapped
-    it, and is counted by `bpf_arena::leaked_exposed_arenas()`. Pinned by
-    `smoke_bpf_arena_exposed_frames_are_not_returned_to_the_buddy`, which asserts
-    through the frame allocator in *both* directions — an unexposed arena must
-    still return its frames, so "never free anything" cannot satisfy it.
+    The interim answer was to leak: `Arena::drop` kept the frames out of the
+    allocator whenever `inner.snapshotted` was set, counted by
+    `leaked_exposed_arenas()`. That branch, its counter, and its test are gone.
 
-    **The real fix** is for the mapping to own a reference: a keep-alive
-    `Arc<dyn FileOps>` on `Region`, or an `munmap` teardown hook. Either makes
-    the leak branch dead code, and it should then be **deleted** rather than
-    kept as belt-and-braces — this design already carries one cautionary example
-    of defensive machinery guarding a case that could not arise (§9, the sizing
-    fixpoint). Related to §8.2: the same missing hook is what forces arenas to be
-    pre-populated.
+    **The fix.** `userspace/src/mapped_file.rs`'s owner table — Linux's
+    VMA-held file reference, kept outside the memory TCB so regions stay free of
+    filesystem types — holds an `Arc<dyn FileOps>` per mapping, registered by
+    `sys_mmap` and released by `sys_munmap` and by process exit. For an arena
+    that `Arc` is an `ArenaFile`, which owns the `Arc<ProgArena>`, which owns the
+    `Arena`. So a live mapping makes `Arena::drop` unreachable, and reaching it
+    means no mapping remains. The table was already there for writeback; what
+    changed is that it is now load-bearing for *memory safety*, said so in its
+    own module docs, and `sys_munmap` releases it strictly after the unmap
+    (releasing first would reopen the same window).
+
+    Demand paging made this structural rather than incidental: `mmap_fault`
+    reaches the file *through* that same table, so a mapping that did not hold
+    the reference could not be faulted at all.
+
+    **Pinned in both directions**, through the frame allocator rather than a
+    flag, because a flag-reading test would pass even if `drop` ignored it:
+    `sys_mmap.rs`'s `smoke_bpf_arena_mapping_keeps_frames_alive_until_munmap`
+    drops every kernel-side handle under a live mapping and measures the
+    free-frame count across that drop, then measures it again across the
+    `munmap`; `memory/src/bpf_arena.rs`'s
+    `smoke_bpf_arena_drop_returns_frames_to_the_buddy` covers the memory-layer
+    half, which cannot see a mapping. An implementation that never frees passes
+    one and fails the other, and vice versa.
 
 ## 9. Post-review corrections
 

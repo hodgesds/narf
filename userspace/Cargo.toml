@@ -54,6 +54,14 @@ default = ["linux-compat"]
 # default.
 syscall-trace = []
 
+# In-kernel test harness build. The `abi_*_tests.rs` modules are compiled
+# unconditionally (they register into the `narf.tests` link section), so
+# this feature does NOT gate them. What it gates is
+# `handlers::with_kernel_buffers` — the narrowly-scoped opt-in that lets a
+# test hand a kernel-half pointer to a syscall handler. Off (and therefore
+# a no-op, with no bypass code compiled at all) in every production build.
+kernel-test = []
+
 # Declared so `#[cfg(feature = "user-mode-e2e")]` in tests
 # don't trip the unexpected_cfgs lint. The frame crate's
 # `user-mode-e2e` feature drives the test-bin runner; this

@@ -68,6 +68,15 @@
 //! * `[ARENA_USABLE_BYTES, ARENA_SLOT_STRIDE)` — the tail guard described
 //!   above.
 //!
+//! ## The reachable set is not `[slot_base, slot_base + STRIDE)`
+//!
+//! A JIT lowers an arena access to `slot_base + handle + off16` — Linux's
+//! `[r12 + reg + off]` shape — so the addresses a *verified* access can compute
+//! are what the guards have to cover, and that set extends **below** the slot
+//! base. See [`ARENA_MAX_UNDERSHOOT_BYTES`], which is asserted against the tail
+//! guard rather than described: the null guard alone does not cover the low
+//! end, and the reason it does not is four inferential steps away from here.
+//!
 //! ## Multiple arenas per program
 //!
 //! Supported by the *addressing*: several arenas are placed in one slot by
@@ -79,19 +88,23 @@
 //! that exists, treat multi-arena as a layout property rather than a program
 //! -visible feature.
 //!
-//! ## Userspace visibility (open question §8.2 — read this before using it)
+//! ## Userspace visibility
 //!
-//! `FileOps::mmap_frames` is **eager and snapshot-based**: it returns the list
-//! of physical frames at `mmap` time and the syscall layer maps them SHARED.
-//! A page that the *program* populates later therefore does not appear in the
-//! userspace mapping at all. [`Arena::snapshot_frames`] exists for the
-//! pre-populated case and [`Arena::populate`] deliberately refuses to grow an
-//! arena that has already been snapshotted, so the failure is a typed error at
-//! the point of the mistake rather than a silently missing page in userspace.
+//! A userspace `MAP_SHARED` mapping of an arena **tracks** the arena rather
+//! than snapshotting it: a page populated *after* the `mmap` still appears,
+//! on the first user access to it. That works because the mapping is
+//! demand-paged through `FileOps::mmap_fault` — see `bpf/src/arena.rs` — and
+//! not through `FileOps::mmap_frames`, which is answered once at `mmap` time
+//! and so could only ever expose what was already there.
 //!
-//! The real fix is the `mmap_fault(offset)` hook §8.2 proposes, routed from
-//! the demand-paging arm of the trap handler; that is a filesystem-layer
-//! change and is not in this module's scope.
+//! Two things went away with that change and are worth naming, because
+//! comments elsewhere in the tree referred to them: `Arena::snapshot_frames`,
+//! which froze the arena so a later [`populate`](Arena::populate) could not
+//! produce a page userspace would never see, and the `SnapshotTaken` error it
+//! produced. There is no longer a hole for them to guard.
+//!
+//! The frames stay alive under a live mapping because the mapping owns a
+//! reference to the file — see [`Arena::drop`], which says exactly where.
 
 extern crate alloc as alloc_crate;
 
@@ -142,6 +155,56 @@ pub const ARENA_NULL_GUARD_BYTES: u64 = 4096;
 /// still end inside the usable region.
 pub const ARENA_MAX_BYTES: u64 = ARENA_USABLE_BYTES - ARENA_NULL_GUARD_BYTES;
 
+/// Furthest *below* a slot's base that a verified arena access can address.
+///
+/// Zero would be the intuitive answer and it is wrong, which is why this is a
+/// named constant with an assertion under it rather than a remark.
+///
+/// A JIT lowers an arena access to `slot_base + handle + off16`. For a handle
+/// produced by 64-bit arithmetic the low end is safe by construction: the
+/// verifier bounds `p.off + off16` into `[0, ARENA_USABLE_BYTES)` and the
+/// handle sits [`ARENA_NULL_GUARD_BYTES`] above the slot base, so the sum is
+/// never negative. The 32-bit ALU path breaks that. `narf-bpf-verifier`'s
+/// `ARENA_WINDOW_BYTES` note spells out the mechanism: a 32-bit op on an arena
+/// pointer keeps the *abstract* offset at full width while the register keeps
+/// `sum mod 2^32`. The two coincide on `[0, 2^32)` — for the offset. They do
+/// not coincide for the *handle*, which is the offset plus 4096, so a program
+/// can verify `off = 2^32 - ARENA_NULL_GUARD_BYTES` (accepted: `off + off16`
+/// is still inside the window) while the register concretely holds `0`. A
+/// `-32768` displacement on top of that names `slot_base - 32768`.
+///
+/// What catches it is therefore the **previous** slot's tail guard, and for the
+/// first slot the unmapped PML4 slot below [`BPF_ARENA_BASE`]. Both are
+/// asserted below. This is not slack: shrink the tail guard to the 64 KiB
+/// Linux derives from the ISA (`arena.c:45`) and the bound still holds, but
+/// shrink it to zero — a 4 GiB stride — and an undershoot lands in the
+/// neighbour's arena.
+pub const ARENA_MAX_UNDERSHOOT_BYTES: u64 = 1 << 15;
+
+// `off16` is the ISA's signed 16-bit displacement field, so the deepest
+// undershoot is `-i16::MIN`. Asserted rather than written as a literal twice.
+const _: () = assert!(
+    ARENA_MAX_UNDERSHOOT_BYTES == i16::MIN.unsigned_abs() as u64,
+    "the undershoot is the ISA's most negative displacement, nothing else"
+);
+const _: () = assert!(
+    ARENA_MAX_UNDERSHOOT_BYTES <= ARENA_SLOT_STRIDE - ARENA_USABLE_BYTES,
+    "a slot's tail guard must absorb an undershoot from the slot above it, or a \
+     32-bit-truncated handle with a negative displacement reaches the previous \
+     program's arenas"
+);
+// And the first slot has no predecessor inside the window, so its undershoot
+// leaves the window entirely. That is only safe because the window starts at a
+// PML4 boundary whose lower neighbour is an unmapped guard slot — the property
+// `bpf_text`'s `BPF_ARENA_PML4_SLOT - 1` check enforces at runtime, which says
+// nothing unless the window base is that slot's first byte.
+const _: () = assert!(
+    BPF_ARENA_BASE % SLOT_SPAN == 0,
+    "the arena window must begin at its PML4 slot's base, or an undershoot from \
+     the first arena slot lands in whatever precedes the window instead of in \
+     the guard slot below it"
+);
+
 // The guards are the neighbouring PML4 slots. Assert here rather than
 // commenting, so a future edit to the slot constants breaks the build.
 const _: () = assert!(
@@ -190,10 +253,6 @@ pub enum ArenaError {
     MapFailed,
     /// The capability was revoked between grant and use.
     CapRevoked,
-    /// The arena's frame list has already been snapshotted for a userspace
-    /// mapping, so a newly populated page would be invisible there. See the
-    /// module docs on §8.2.
-    SnapshotTaken,
 }
 
 /// Bump cursor over the arena window, in slot units. Arena VA is never
@@ -362,8 +421,21 @@ struct Inner {
     /// Populated pages, in population order. Indexed by nothing in
     /// particular — this is the backing store, `free` is the index.
     frames: Vec<(u64, crate::frame::PhysFrame)>,
-    /// Set once `snapshot_frames` has handed a frame list to the mmap layer.
-    snapshotted: bool,
+}
+
+/// A populated arena page: where the kernel sees it, and which frame is under
+/// it.
+///
+/// Both facts have exactly one consumer each — the kernel VA is what a program
+/// dereferences, the frame is what a userspace mapping aliases — and returning
+/// them together is what keeps [`Arena::populate`] a single idempotent entry
+/// point rather than two that could disagree about which page was backed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ArenaPage {
+    /// Kernel VA of the page's first byte.
+    pub kva: u64,
+    /// The frame backing it.
+    pub phys: PhysAddr,
 }
 
 /// A BPF arena: a stable kernel VA window with demand-populated pages.
@@ -423,7 +495,6 @@ impl Arena {
             inner: IrqSafeSpinLock::new(Inner {
                 free: FreeRanges::new(max_pages),
                 frames: Vec::new(),
-                snapshotted: false,
             }),
         })
     }
@@ -461,26 +532,38 @@ impl Arena {
         self.max_pages
     }
 
-    /// Back page `page` and return its kernel VA.
+    /// Back page `page`, returning where the kernel sees it and which frame is
+    /// under it.
     ///
-    /// Idempotent: populating an already-populated page returns its VA
-    /// without allocating.
-    pub fn populate(&self, page: usize) -> Result<u64, ArenaError> {
+    /// Idempotent: populating an already-populated page returns the same
+    /// answer without allocating. The demand-paging path relies on that —
+    /// `FileOps::mmap_fault` may be asked for one page by two CPUs at once,
+    /// and the address space keeps whichever answer it records first.
+    ///
+    /// **Allocates**, so it is illegal on the program-run path (spec §4.6).
+    /// The callers are `bpf(2)`, arena creation, and the demand-fault path,
+    /// none of which is one.
+    pub fn populate(&self, page: usize) -> Result<ArenaPage, ArenaError> {
         let page = page as u64;
         if page >= self.max_pages {
             return Err(ArenaError::OutOfRange);
         }
-        let va = self.kva + page * 4096;
+        let kva = self.kva + page * 4096;
 
         let mut inner = self.inner.lock();
         if !inner.free.is_free(page) {
-            return Ok(va);
-        }
-        // §8.2: once the frame list has been handed to `mmap_frames`, a page
-        // populated afterwards is invisible in the userspace mapping. Refuse
-        // loudly instead of producing a hole nobody can explain later.
-        if inner.snapshotted {
-            return Err(ArenaError::SnapshotTaken);
+            let phys = inner
+                .frames
+                .iter()
+                .find(|(p, _)| *p == page)
+                .map(|(_, f)| f.start_address())
+                // A page that is not free must be in `frames`: `take` and the
+                // push below happen under this one lock, and nothing else
+                // writes either. Surfacing it as a typed error rather than an
+                // `expect` keeps a bookkeeping bug from panicking the kernel
+                // from a page-fault handler.
+                .ok_or(ArenaError::OutOfRange)?;
+            return Ok(ArenaPage { kva, phys });
         }
         let frame = crate::frame::alloc_frame().map_err(|_| ArenaError::NoFrame)?;
         // Zero on populate: arena memory is program-visible and must not leak
@@ -490,19 +573,19 @@ impl Arena {
         unsafe {
             core::ptr::write_bytes(frame.start_address().kernel_mut_ptr::<u8>(), 0, 4096);
         }
-        // SAFETY: `va` is a fresh page-aligned VA inside the arena window,
+        // SAFETY: `kva` is a fresh page-aligned VA inside the arena window,
         // whose top-level table `reserve_kernel_slots` installed at boot.
-        if let Err(e) = unsafe { map_arena_page(va, frame.start_address()) } {
+        if let Err(e) = unsafe { map_arena_page(kva, frame.start_address()) } {
             crate::frame::free_frame(frame);
             return Err(e);
         }
+        let phys = frame.start_address();
         inner.free.take(page);
         inner.frames.push((page, frame));
-        Ok(va)
+        Ok(ArenaPage { kva, phys })
     }
 
-    /// Populate `count` pages starting at `from`. Convenience for the
-    /// pre-populated shape that `mmap_frames` can actually serve.
+    /// Populate `count` pages starting at `from`.
     pub fn populate_range(&self, from: usize, count: usize) -> Result<(), ArenaError> {
         for i in 0..count {
             self.populate(from + i)?;
@@ -529,26 +612,19 @@ impl Arena {
         self.inner.lock().free.free_pages()
     }
 
-    /// Snapshot the backing frames, in page order, for `FileOps::mmap_frames`.
+    /// The frame backing `page`, or `None` if it is not populated.
     ///
-    /// **Freezes the arena.** `mmap_frames` is eager and snapshot-based, so
-    /// after this call a newly populated page would never appear in the
-    /// userspace mapping; [`populate`](Self::populate) therefore returns
-    /// [`ArenaError::SnapshotTaken`] from here on. Populate everything the
-    /// program and userspace will share *before* calling this.
-    ///
-    /// The precise limitation, and the `mmap_fault(offset)` hook that would
-    /// lift it, are open question §8.2.
-    pub fn snapshot_frames(&self) -> Vec<PhysAddr> {
-        let mut inner = self.inner.lock();
-        inner.snapshotted = true;
-        let mut v: Vec<(u64, PhysAddr)> = inner
+    /// Read-only, so unlike [`populate`](Self::populate) it never allocates —
+    /// which is what makes it usable from a caller that only wants to *check*
+    /// whether a page is backed.
+    pub fn frame_at(&self, page: usize) -> Option<PhysAddr> {
+        let page = page as u64;
+        self.inner
+            .lock()
             .frames
             .iter()
-            .map(|(p, f)| (*p, f.start_address()))
-            .collect();
-        v.sort_unstable_by_key(|(p, _)| *p);
-        v.into_iter().map(|(_, a)| a).collect()
+            .find(|(p, _)| *p == page)
+            .map(|(_, f)| f.start_address())
     }
 
     /// Convert a program-visible base-relative offset to a kernel VA, or
@@ -570,65 +646,42 @@ impl Arena {
 impl Drop for Arena {
     fn drop(&mut self) {
         let mut inner = self.inner.lock();
-        // Once the frame list has been handed to the mmap layer, userspace may
-        // still have these frames mapped `MAP_SHARED` — and **the mapping keeps
-        // nothing alive**. `sys_mmap` clones the `FileOps` `Arc` only for the
-        // duration of the call, copies the physical addresses into the
-        // `Region`, and drops the `Arc`; `munmap` never calls back here. So
-        // this sequence returns live user-mapped frames to the buddy:
+        // Every frame goes back to the buddy, including frames a userspace
+        // `MAP_SHARED` mapping aliased — and the reason that is safe is **not
+        // local to this module**, so it is spelled out rather than assumed.
         //
-        //   1. userspace opens the arena fd and `mmap`s it `MAP_SHARED`
-        //   2. it closes the fd; the program exits; the last `Arc<ProgArena>`
-        //      drops and we run
-        //   3. we `free_frame` each one — and the buddy hands them to somebody
-        //      else while userspace still has them mapped read-write
+        // A userspace mapping of an arena owns an `Arc<dyn FileOps>` for as
+        // long as the mapping exists: `sys_mmap` hands it to
+        // `mapped_file::register_current`, `sys_munmap` and process exit are
+        // what release it. That `Arc` is an `ArenaFile`, which owns an
+        // `Arc<ProgArena>`, which owns this `Arena`. So a live mapping makes
+        // this drop unreachable, and reaching it means no mapping remains.
         //
-        // That is a userspace-writable window onto arbitrary recycled kernel
-        // memory, which is strictly worse than losing the memory. So when the
-        // frames have been exposed we **leak them deliberately**: unmap the
-        // kernel VA (the kernel side genuinely is done with it) and keep the
-        // frames out of the allocator forever.
+        // This used to leak the frames instead, because that reasoning was
+        // false at the time: nothing kept the file alive, so `munmap`-less
+        // teardown could return user-mapped frames to the buddy — a
+        // userspace-writable window onto whatever was allocated next. Arenas
+        // were the first `mmap_frames` user where it mattered (`/dev/fb0`
+        // hands out device memory that is never in the buddy; perf's ring
+        // lives as long as the task), which is why the contract had never
+        // been stressed.
         //
-        // Arenas are the first `mmap_frames` user where this matters. The
-        // existing ones are safe for reasons that do not generalise: `/dev/fb0`
-        // hands out device memory that is never in the buddy, and perf's ring
-        // lives as long as the task. That is why the contract was never
-        // stressed before.
-        //
-        // The real fix is for the mapping to own a reference — a keep-alive
-        // `Arc<dyn FileOps>` on `Region`, or an `munmap` teardown hook — at
-        // which point this branch becomes dead and should be deleted rather
-        // than kept as belt-and-braces. Recorded in `bpf/specification/spec.md`
-        // §8. Until then the leak is bounded by the arena's own size and only
-        // happens when userspace actually mapped it.
-        let exposed = inner.snapshotted;
+        // A cross-crate invariant stated in a comment on one side of the seam
+        // is exactly the defect class spec §9 records four of, so this one is
+        // a test and not only a paragraph:
+        // `sys_mmap.rs`'s `smoke_bpf_arena_mapping_keeps_frames_alive_until_munmap`
+        // drops every kernel-side handle under a live mapping and measures the
+        // free-frame count, then measures it again across the `munmap`.
         for (page, frame) in core::mem::take(&mut inner.frames) {
             let va = self.kva + page * 4096;
-            // SAFETY: the arena is being destroyed, so no *program* holds a
-            // pointer into it, and the VA is never reissued (bump cursor), so a
-            // stale TLB entry on a peer CPU cannot alias a later mapping.
-            // Note this says nothing about a *userspace* mapping of the same
-            // frames, which is what `exposed` is for.
+            // SAFETY: the arena is being destroyed, so no program and no
+            // userspace mapping holds a pointer into it (see above), and the
+            // VA is never reissued (bump cursor), so a stale TLB entry on a
+            // peer CPU cannot alias a later mapping.
             unsafe { unmap_arena_page(va) };
-            if !exposed {
-                crate::frame::free_frame(frame);
-            }
-        }
-        if exposed {
-            LEAKED_EXPOSED_ARENAS.fetch_add(1, Ordering::Relaxed);
+            crate::frame::free_frame(frame);
         }
     }
-}
-
-/// Arenas dropped while their frames were still exposed to a userspace
-/// mapping, and whose frames were therefore leaked rather than returned to the
-/// buddy. Diagnostic only — see [`Arena::drop`] for why the leak is deliberate.
-pub static LEAKED_EXPOSED_ARENAS: AtomicU64 = AtomicU64::new(0);
-
-/// How many arenas have been leaked because they were dropped while mapped.
-#[must_use]
-pub fn leaked_exposed_arenas() -> u64 {
-    LEAKED_EXPOSED_ARENAS.load(Ordering::Relaxed)
 }
 
 // ── Mapping ────────────────────────────────────────────────────────────
@@ -705,12 +758,21 @@ fn smoke_bpf_arena_populate_and_roundtrip() -> TestResult {
     if arena.populated_pages() != 0 {
         return TestResult::Fail("a fresh arena should have no backed pages");
     }
-    let va = match arena.populate(3) {
-        Ok(v) => v,
+    let page = match arena.populate(3) {
+        Ok(p) => p,
         Err(_) => return TestResult::Fail("populate failed"),
     };
+    let va = page.kva;
     if va != arena.kva() + 3 * 4096 {
         return TestResult::Fail("populate returned the wrong VA");
+    }
+    // The frame it reports is what a userspace mapping will alias, so it must
+    // be the frame actually under that VA — not merely *a* frame.
+    if arena.frame_at(3) != Some(page.phys) {
+        return TestResult::Fail("populate and frame_at disagree about the backing frame");
+    }
+    if arena.frame_at(4).is_some() {
+        return TestResult::Fail("frame_at reported a frame for an unpopulated page");
     }
     // Freshly populated pages must be zeroed — arena memory is
     // program-visible and must never leak the previous owner's bytes.
@@ -725,9 +787,11 @@ fn smoke_bpf_arena_populate_and_roundtrip() -> TestResult {
             return TestResult::Fail("arena page did not read back what was written");
         }
     }
-    // Idempotent.
-    if arena.populate(3) != Ok(va) {
-        return TestResult::Fail("re-populating a backed page changed its VA");
+    // Idempotent, in both fields: the demand-fault path can be entered twice
+    // for one page by two CPUs, and a second frame would be a second view of
+    // the same arena byte.
+    if arena.populate(3) != Ok(page) {
+        return TestResult::Fail("re-populating a backed page changed its VA or frame");
     }
     if arena.populated_pages() != 1 {
         return TestResult::Fail("re-populating a backed page allocated a second frame");
@@ -742,11 +806,16 @@ fn smoke_bpf_arena_populate_and_roundtrip() -> TestResult {
 }
 kernel_test_in!("memory", smoke_bpf_arena_populate_and_roundtrip);
 
-/// Once the frame list has been handed to the mmap layer, growing the arena
-/// must fail loudly. `FileOps::mmap_frames` is eager and snapshot-based, so a
-/// page populated afterwards would simply not exist in the userspace mapping —
-/// a hole nobody could explain later. Open question §8.2 is the real fix.
-fn smoke_bpf_arena_snapshot_freezes_population() -> TestResult {
+/// An arena grows *after* its frames have been handed out, and every frame it
+/// hands out afterwards is the live one.
+///
+/// This is the property `ArenaError::SnapshotTaken` used to exist to refuse.
+/// `FileOps::mmap_frames` was answered once at `mmap` time, so a page populated
+/// later could never appear in userspace and the least-bad answer was to refuse
+/// the growth. `FileOps::mmap_fault` is answered per page at first touch, so
+/// growth is now ordinary — and this test is what would go red if population
+/// were ever frozen again.
+fn smoke_bpf_arena_grows_after_its_frames_are_exposed() -> TestResult {
     let cap = ArenaCap::bootstrap();
     let arena = match Arena::new(&cap, 8) {
         Ok(a) => a,
@@ -755,22 +824,37 @@ fn smoke_bpf_arena_snapshot_freezes_population() -> TestResult {
     if arena.populate_range(0, 4).is_err() {
         return TestResult::Fail("populate_range failed");
     }
-    let frames = arena.snapshot_frames();
-    if frames.len() != 4 {
-        return TestResult::Fail("snapshot did not return one frame per populated page");
+    // What a mapping of the first four pages would have aliased.
+    let exposed: Vec<PhysAddr> = (0..4).filter_map(|p| arena.frame_at(p)).collect();
+    if exposed.len() != 4 {
+        return TestResult::Fail("frame_at did not report one frame per populated page");
     }
-    match arena.populate(5) {
-        Err(ArenaError::SnapshotTaken) => {}
-        _ => return TestResult::Fail("populate after snapshot must fail with SnapshotTaken"),
+    // Grow past them. Under the old contract this was `SnapshotTaken`.
+    let grown = match arena.populate(5) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("an arena whose frames were exposed refused to grow"),
+    };
+    if arena.populated_pages() != 5 {
+        return TestResult::Fail("the grown page was not recorded");
     }
-    // An already-backed page is still resolvable, though — freezing growth is
-    // not the same as breaking what exists.
-    if arena.populate(0).is_err() {
-        return TestResult::Fail("snapshot broke access to already-backed pages");
+    if grown.kva != arena.kva() + 5 * 4096 {
+        return TestResult::Fail("the grown page landed at the wrong kernel VA");
+    }
+    // The new page must be a *new* frame, not an alias of an exposed one —
+    // otherwise growth would silently corrupt what userspace already maps.
+    if exposed.contains(&grown.phys) {
+        return TestResult::Fail("a grown page aliased a frame already handed out");
+    }
+    // And the already-exposed pages still report the same frames, so a mapping
+    // taken before the growth still names live memory.
+    for (page, phys) in exposed.iter().enumerate() {
+        if arena.frame_at(page) != Some(*phys) {
+            return TestResult::Fail("growing the arena moved an already-exposed page's frame");
+        }
     }
     TestResult::Pass
 }
-kernel_test_in!("memory", smoke_bpf_arena_snapshot_freezes_population);
+kernel_test_in!("memory", smoke_bpf_arena_grows_after_its_frames_are_exposed);
 
 /// Several arenas share one slot, at disjoint handle ranges, and every handle
 /// clears the null guard.
@@ -1032,71 +1116,53 @@ mod tests {
     }
 }
 
-/// An arena whose frames were exposed to userspace must **not** return them to
-/// the buddy on drop.
+/// Dropping an arena returns **every** frame it populated to the buddy,
+/// including frames it had already handed out to a mapping.
 ///
-/// The dangerous sequence is not hypothetical: `sys_mmap` clones the `FileOps`
-/// `Arc` only for the duration of the call, copies the physical addresses into
-/// the `Region`, and drops the `Arc`; `munmap` never calls back. So a mapping
-/// keeps nothing alive, and freeing here would hand userspace a writable window
-/// onto whatever the buddy allocates next. See [`Arena::drop`].
+/// This replaces `smoke_bpf_arena_exposed_frames_are_not_returned_to_the_buddy`,
+/// which asserted the opposite because a userspace mapping used to keep nothing
+/// alive: freeing here would have handed userspace a writable window onto
+/// whatever the buddy allocated next, so the frames were leaked instead. The
+/// mapping now owns an `Arc<dyn FileOps>` (see [`Arena::drop`]), so reaching
+/// this drop *means* no mapping remains and the leak has been deleted rather
+/// than kept as belt-and-braces.
 ///
-/// Asserted through the frame allocator rather than through the flag: a test
-/// that only checked `snapshotted` would pass even if `drop` ignored it, which
-/// is the failure mode that matters. The free count must not move across a drop
-/// whose frames were snapshotted, and *must* move for one that was not — both
-/// directions, so "never frees anything" cannot satisfy it either.
-fn smoke_bpf_arena_exposed_frames_are_not_returned_to_the_buddy() -> TestResult {
+/// The half of "exactly when no mapping remains" that needs a real mapping —
+/// that a live one keeps the frames out of the buddy — cannot be written here:
+/// this crate is below both the syscall layer and `narf-bpf`. It lives in
+/// `userspace/src/handlers/sys_mmap.rs` as
+/// `smoke_bpf_arena_mapping_keeps_frames_alive_until_munmap`, and neither half
+/// is sufficient alone: this one passes for an implementation that frees
+/// unconditionally, that one passes for an implementation that never frees.
+///
+/// Measured across the **drop alone**. An earlier version sampled the free
+/// count before allocating and expected it to rise afterwards, which is wrong
+/// arithmetic — allocate-then-free returns to the original count. Bracketing
+/// the drop is what makes the delta mean "frames this drop returned".
+fn smoke_bpf_arena_drop_returns_frames_to_the_buddy() -> TestResult {
     let cap = ArenaCap::bootstrap();
-
-    // Measure across the *drop only*. An earlier version sampled the free count
-    // before allocating and expected it to rise by 4 afterwards, which is simply
-    // wrong arithmetic — allocating and then freeing returns to the original
-    // count, so the control arm failed for a reason that had nothing to do with
-    // the behaviour under test. Bracketing the drop is what makes the delta mean
-    // "frames this drop returned".
-    let drop_delta = |snapshot: bool| -> Option<usize> {
-        let mut arena = match Arena::new(&cap, 4) {
-            Ok(a) => Some(a),
-            Err(_) => return None,
-        };
-        if arena.as_ref()?.populate_range(0, 4).is_err() {
-            return None;
-        }
-        if snapshot && arena.as_ref()?.snapshot_frames().len() != 4 {
-            return None;
-        }
-        let before = crate::frame::stats().free;
-        drop(arena.take());
-        Some(crate::frame::stats().free.saturating_sub(before))
+    let mut arena = match Arena::new(&cap, 4) {
+        Ok(a) => Some(a),
+        Err(_) => return TestResult::Fail("Arena::new failed"),
     };
-
-    // Control: an arena nobody mapped gives its four frames back.
-    match drop_delta(false) {
-        None => return TestResult::Fail("arena setup failed (control)"),
-        Some(d) if d < 4 => {
-            return TestResult::Fail("an unexposed arena did not return its frames to the buddy")
-        }
-        Some(_) => {}
+    let Some(a) = arena.as_ref() else {
+        return TestResult::Fail("arena setup failed");
+    };
+    if a.populate_range(0, 4).is_err() {
+        return TestResult::Fail("populate_range failed");
     }
-
-    // Subject: once the frame list has been snapshotted — which is exactly what
-    // `mmap_frames` does — the frames must stay out of the allocator, because a
-    // userspace MAP_SHARED mapping of them keeps nothing alive.
-    let leaked_before = leaked_exposed_arenas();
-    match drop_delta(true) {
-        None => return TestResult::Fail("arena setup failed (exposed)"),
-        Some(0) => {}
-        Some(_) => return TestResult::Fail(
-            "a snapshotted arena returned frames to the buddy while userspace could still map them",
-        ),
+    // Hand the frames out, exactly as a `MAP_SHARED` mapping's first faults
+    // would: the old contract made *this* the point of no return.
+    let exposed: Vec<PhysAddr> = (0..4).filter_map(|p| a.frame_at(p)).collect();
+    if exposed.len() != 4 {
+        return TestResult::Fail("frame_at did not report one frame per populated page");
     }
-    if leaked_exposed_arenas() != leaked_before + 1 {
-        return TestResult::Fail("the deliberate leak was not accounted");
+    let before = crate::frame::stats().free;
+    drop(arena.take());
+    let returned = crate::frame::stats().free.saturating_sub(before);
+    if returned < 4 {
+        return TestResult::Fail("dropping an arena did not return its frames to the buddy");
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "memory",
-    smoke_bpf_arena_exposed_frames_are_not_returned_to_the_buddy
-);
+kernel_test_in!("memory", smoke_bpf_arena_drop_returns_frames_to_the_buddy);

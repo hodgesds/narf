@@ -66,7 +66,7 @@ _start:
     mov  x1, #0
 1:  str  xzr, [x0, x1]
     add  x1, x1, #8
-    cmp  x1, #(4096 * 4)    /* lo_L0, lo_L1, hi_L0, hi_L1 */
+    cmp  x1, #(4096 * 6)    /* lo_L0, lo_L1, hi_L0, hi_L1, l2_lo_1, l2_hi_1 */
     b.ne 1b
 
     /* lo_L0[0] -> lo_L1 */
@@ -91,10 +91,13 @@ _start:
      */
     add  x0, x0, #4096      /* x0 = &lo_L1 */
     mov  x1, #0x401         /* valid block, AttrIndx=0 (Device), PA 0x0 */
+    mov  x5, #0x60
+    orr  x1, x1, x5, lsl #48    /* PXN (53) | UXN (54) — see below */
     str  x1, [x0, #0]
-    mov  x1, #0x405         /* valid block, AttrIndx=1 (Normal), PA 0x4000_0000 */
-    movk x1, #0x4000, lsl #16
-    str  x1, [x0, #8]
+    /* lo_L1[1] (PA 0x4000_0000, all of RAM the kernel can reach) is
+     * filled in further down, after the L2 demotion, so that only
+     * `.boot` — the one thing that executes at a TTBR0 identity address
+     * after the MMU comes up — stays executable. */
 
     /* hi_L0[511] -> hi_L1 */
     adrp x0, l0_hi
@@ -114,9 +117,7 @@ _start:
      * convention; aarch64 with this KERNEL_VIRT_BASE wants L1[1],
      * and 510 GiB past the L0 base overflows T1SZ entirely. */
     add  x0, x0, #4096      /* x0 = &hi_L1 */
-    mov  x1, #0x405
-    movk x1, #0x4000, lsl #16
-    str  x1, [x0, #(1 * 8)]
+    /* hi_L1[1] is filled in further down, after the L2 demotion. */
 
     /* hi_L1[0] = 0x0000_0000 (Device, virt 0xFFFFFF80_00000000).
      *
@@ -129,7 +130,58 @@ _start:
      *
      * 0x401 = valid block, AttrIndx=0 (Device, per MAIR_EL1). */
     mov  x1, #0x401
+    mov  x5, #0x60
+    orr  x1, x1, x5, lsl #48    /* PXN (53) | UXN (54) */
     str  x1, [x0, #(0 * 8)]
+
+    /* ── Demote both 1 GiB RAM blocks to 2 MiB, NX outside kernel text ──
+     *
+     * These two blocks used to be plain `0x405`: valid, Normal, AF, and
+     * — because bits 53/54 were clear — **executable at EL1**. Between
+     * them they alias every physical page the kernel can reach (the
+     * TTBR1 window at PA 0x4000_0000 is what `PhysAddr::kernel_ptr`
+     * resolves to, so it covers the whole heap, the buddy arena, and
+     * every BPF prog pack) as simultaneously writable and executable.
+     * An RX mapping of JIT text elsewhere in the address space is not a
+     * W^X boundary while that is true.
+     *
+     * Each 1 GiB block becomes a table pointing at 512 × 2 MiB blocks,
+     * PXN|UXN except where the block overlaps the range that genuinely
+     * executes there:
+     *
+     *   TTBR0 identity : [__kernel_start, __boot_end) — `.boot` runs at
+     *     its identity address after the MMU comes up, both on the BSP
+     *     (`_start_rust_entry`, below) and on every AP (`smp_entry.S`
+     *     does its whole bring-up and `br x1` at a low VA).
+     *   TTBR1 window   : [__kernel_start, __text_end_phys) — the kernel
+     *     proper.
+     *
+     * Built here, before `msr sctlr_el1` turns the MMU on, so there is
+     * never a live block descriptor to break-before-make against.
+     */
+    adrp x0, l2_lo_1
+    add  x0, x0, #:lo12:l2_lo_1
+    ldr  x1, =__kernel_start
+    ldr  x2, =__boot_end
+    bl   build_ram_l2
+    adrp x3, l1_lo
+    add  x3, x3, #:lo12:l1_lo
+    adrp x0, l2_lo_1
+    add  x0, x0, #:lo12:l2_lo_1
+    orr  x0, x0, #0x3           /* valid + table descriptor */
+    str  x0, [x3, #(1 * 8)]
+
+    adrp x0, l2_hi_1
+    add  x0, x0, #:lo12:l2_hi_1
+    ldr  x1, =__kernel_start
+    ldr  x2, =__text_end_phys
+    bl   build_ram_l2
+    adrp x3, l1_hi
+    add  x3, x3, #:lo12:l1_hi
+    adrp x0, l2_hi_1
+    add  x0, x0, #:lo12:l2_hi_1
+    orr  x0, x0, #0x3
+    str  x0, [x3, #(1 * 8)]
 
     dsb sy
 
@@ -205,6 +257,39 @@ _start_rust_entry:
     b 1b
 .size _start, . - _start
 
+/* Fill a 512-entry L2 table covering PA 0x4000_0000..0x8000_0000 with
+ * 2 MiB block descriptors, PXN|UXN except where the block overlaps
+ * [x1, x2).
+ *
+ *   x0 = &l2 table
+ *   x1 = exec_start (physical, inclusive)
+ *   x2 = exec_end   (physical, exclusive)
+ *
+ * Clobbers x3-x7. Runs pre-MMU at a low PA, so it must stay in `.boot`.
+ */
+build_ram_l2:
+    mov  x3, #0                 /* i */
+    movz x4, #0x4000, lsl #16   /* pa = 0x4000_0000 */
+2:
+    mov  x5, #0x405             /* valid block | AttrIndx=1 (Normal) | AF */
+    add  x6, x4, #0x200000      /* pa_end */
+    /* Overlap iff  pa < exec_end  &&  exec_start < pa_end. */
+    cmp  x4, x2
+    b.hs 3f
+    cmp  x1, x6
+    b.lo 4f
+3:
+    mov  x7, #0x60
+    orr  x5, x5, x7, lsl #48    /* PXN (53) | UXN (54) */
+4:
+    orr  x5, x5, x4             /* | output PA */
+    str  x5, [x0, x3, lsl #3]
+    mov  x4, x6
+    add  x3, x3, #1
+    cmp  x3, #512
+    b.ne 2b
+    ret
+
 .section .boot.data, "aw"
 .align 12
 l0_lo:
@@ -214,6 +299,12 @@ l1_lo:
 l0_hi:
     .skip 4096
 l1_hi:
+    .skip 4096
+/* L2 demotions of the two 1 GiB RAM blocks. Zeroed by the same loop at
+ * the top of `_start`, which is why its bound says `4096 * 6`. */
+l2_lo_1:
+    .skip 4096
+l2_hi_1:
     .skip 4096
 
 .align 4

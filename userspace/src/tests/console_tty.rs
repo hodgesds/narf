@@ -88,6 +88,12 @@ fn smoke_console_read_empty_buf_returns_zero() -> TestResult {
 kernel_test_in!("userspace", smoke_console_read_empty_buf_returns_zero);
 
 fn smoke_console_read_one_byte_in_ring() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // ConsoleFile::read with one byte pre-loaded into the BYTE_RING must
     // return Ok(1) and the exact byte value.
     use crate::{
@@ -175,6 +181,12 @@ fn smoke_console_read_one_byte_in_ring() -> TestResult {
 kernel_test_in!("userspace", smoke_console_read_one_byte_in_ring);
 
 fn smoke_console_read_drains_burst() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // ConsoleFile::read with 3 bytes pre-loaded must return Ok(3) and
     // deliver all three bytes in order (paste-burst drain path).
     use crate::{
@@ -266,6 +278,12 @@ fn smoke_console_read_drains_burst() -> TestResult {
 kernel_test_in!("userspace", smoke_console_read_drains_burst);
 
 fn smoke_console_read_empty_ring_returns_zero() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // ConsoleFile::read with an empty ring and a non-zero buffer must return
     // Ok(0) — no bytes available yet. The shell's usleep-retry loop handles
     // the backoff; returning 0 is the non-blocking "try again later" signal.
@@ -409,6 +427,12 @@ kernel_test_in!("userspace", smoke_console_ctrlc_signals_foreground_pgrp);
 
 #[cfg(feature = "linux-compat")]
 fn smoke_tty_background_read_raises_sigttin() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     // A process in a BACKGROUND process group that reads its controlling
     // terminal must be sent SIGTTIN (default action: stop) and the read
     // interrupted with -EINTR. Install a synthetic controlling-tty fd whose
@@ -568,6 +592,12 @@ kernel_test_in!("userspace", smoke_tty_background_read_raises_sigttin);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_echo_hello_world_end_to_end() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel `.rodata` / stack / heap pointers as stand-in user
+    // buffers. `validate_user_range` confines a real syscall to the user half,
+    // so the scoped opt-in is what keeps the fixture working without weakening
+    // the production predicate. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,

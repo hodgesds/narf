@@ -36,6 +36,47 @@ fn smoke_abi_async_poll_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_poll_neg);
 
+/// `poll(2)` must refuse a kernel-half `pollfd*` — it was an unprivileged
+/// arbitrary kernel write.
+///
+/// `poll_common` took `args.arg0` straight to `parse_pollfds` /
+/// `write_pollfds` on a `// SAFETY: user pointer in the active AS` comment that
+/// nothing enforced. Both open a SMAP bracket, so with `EFLAGS.AC` set a
+/// `CPL=0` access to a kernel page succeeds *silently* — SMAP only guards
+/// `PTE.U=1`. That made the parse an arbitrary kernel read and `revents` —
+/// two bytes at `ptr + i*8 + 6`, once per entry — an arbitrary kernel write.
+///
+/// Worse than the `bpf(2)` gadget of the same class, which needs euid 0:
+/// `poll(2)` and `ppoll(2)` take no credential at all.
+///
+/// `with_setup_strict`, not `with_setup`: the ordinary harness holds the
+/// kernel-buffers guard so its tests can hand kernel pointers to syscalls, and
+/// under it this test would pass no matter what the code did.
+fn smoke_abi_async_poll_kernel_ptr_neg() -> TestResult {
+    with_setup_strict(|| {
+        // A canonical kernel-half address. Never dereferenced: the point is
+        // that validation rejects it before anything touches it.
+        const KERNEL_PTR: u64 = 0xFFFF_8000_0000_0000;
+        if call(Syscall::Poll.raw(), a2(KERNEL_PTR, 1, 0)) != Some(EFAULT) {
+            return Err("poll() with a kernel-half pollfd array was not EFAULT");
+        }
+        // The last byte matters as much as the first: a base one entry below
+        // the boundary whose array crosses it must go too.
+        const NEAR_TOP: u64 = (1u64 << 47) - 8;
+        if call(Syscall::Poll.raw(), a2(NEAR_TOP, 4, 0)) != Some(EFAULT) {
+            return Err("poll() with an array crossing out of the user half was not EFAULT");
+        }
+        // ppoll(2) shares `poll_common`, so it inherits the check. Four args
+        // is all the harness carries and all this needs: sigsetsize (arg4) is
+        // only consulted when sigmask (arg3) is non-null.
+        if call(Syscall::Ppoll.raw(), a3(KERNEL_PTR, 1, 0, 0)) != Some(EFAULT) {
+            return Err("ppoll() with a kernel-half pollfd array was not EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_poll_kernel_ptr_neg);
+
 // ════════════════════════════════════════════════════════════════════
 // ppoll(2) — sys_ppoll(fds, nfds, timespec*, sigmask, sigsetsize)
 //

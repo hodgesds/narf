@@ -51,6 +51,45 @@ pub fn with_shared_mapping_transaction<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Resolves a fault on an unbacked page of a `RegionPerms::FILE_DEMAND`
+/// mapping to the frame the backing file wants there. Takes the faulting
+/// (page-aligned) user VA, returns a page-aligned physical address.
+///
+/// A `fn` pointer rather than a filesystem dependency: `narf-memory` sits
+/// below `narf-filesystem`, and the region table deliberately holds frames
+/// and no file objects (see `userspace/src/mapped_file.rs`). This is the same
+/// seam shape as [`install_shared_frame_hooks`] and `install_pager`.
+type FileFaultHook = fn(u64) -> Option<u64>;
+static FILE_FAULT_HOOK: IrqSafeSpinLock<Option<FileFaultHook>> = IrqSafeSpinLock::new(None);
+
+/// Install the demand-paging callback for `RegionPerms::FILE_DEMAND` regions,
+/// returning whatever it displaced.
+///
+/// Idempotent, and callable at any time: a `FILE_DEMAND` region cannot exist
+/// before the syscall layer creates one, and the syscall layer installs this
+/// on the same path. There is therefore no boot-order requirement — unlike
+/// `bpf_text::reserve_kernel_slots`, whose top-level page-table entries must
+/// predate the first user address space.
+///
+/// The displaced hook is returned so a test can chain to it rather than
+/// silently blackholing a real mapping's faults for the duration.
+pub fn install_file_fault_hook(hook: FileFaultHook) -> Option<FileFaultHook> {
+    FILE_FAULT_HOOK.lock().replace(hook)
+}
+
+/// Ask the backing file for the frame at `vaddr`. Must be called with **no**
+/// address-space lock held — the hook re-enters the filesystem, which
+/// allocates, takes its own locks, and (for a BPF arena) installs a kernel
+/// page-table entry.
+fn file_fault_frame(vaddr: u64) -> Option<u64> {
+    let hook = (*FILE_FAULT_HOOK.lock())?;
+    let phys = hook(vaddr)?;
+    // A zero or misaligned answer would be stored in a `phys` slot where zero
+    // *means* "unbacked" and every consumer assumes page alignment, so it is
+    // rejected here rather than corrupting the region table.
+    (phys != 0 && phys & 0xFFF == 0).then_some(phys)
+}
+
 use crate::addr::{PhysAddr, VirtAddr};
 
 /// Region permission flags. Mirrors ELF `PF_*` so the loader doesn't
@@ -95,6 +134,19 @@ impl RegionPerms {
     /// process-exit). Bit 10; stripped by the POSIX prot mask like the
     /// other internal flags.
     pub const SHARED: RegionPerms = RegionPerms(1 << 10);
+
+    /// Internal flag: this region's unbacked pages are filled by the *backing
+    /// file*, not by the frame allocator.
+    ///
+    /// A zero `phys[i]` normally means "anonymous, demand-allocate a fresh
+    /// zeroed frame". In a `FILE_DEMAND` region it instead means "ask
+    /// [`install_file_fault_hook`]'s callback", which is what makes a
+    /// `MAP_SHARED` device mapping *track* its file rather than snapshot it:
+    /// pages the file backs after `mmap` still appear. Always set together
+    /// with [`SHARED`](Self::SHARED) — the frames belong to the file, so
+    /// teardown must clear PTEs and free nothing. Bit 11; stripped by the
+    /// POSIX prot mask like the other internal flags.
+    pub const FILE_DEMAND: RegionPerms = RegionPerms(1 << 11);
 
     /// Mask isolating the POSIX prot bits (READ | WRITE | EXEC).
     /// Used by callers that want to compare permissions without
@@ -1599,6 +1651,57 @@ impl AddressSpace {
         out
     }
 
+    /// Is the page at `v` an unbacked page of a demand-paged *file* mapping?
+    ///
+    /// Split out of `demand_alloc_page` because the hook this gates **must**
+    /// run with the regions lock dropped: it re-enters the filesystem, which
+    /// allocates, takes its own locks, and — for a BPF arena — installs a
+    /// kernel page-table entry. Calling it under the regions lock would nest
+    /// this address space's lock beneath every lock a demand-pageable file
+    /// might take, on a path that runs from the page-fault handler.
+    fn file_demand_miss(&self, v: u64) -> bool {
+        let regions = self.regions.lock();
+        regions.iter().any(|r| {
+            let rb = r.base.as_u64();
+            let re = rb.saturating_add(r.len);
+            if v < rb || v >= re || !r.perms.contains(RegionPerms::FILE_DEMAND) {
+                return false;
+            }
+            // PROT_NONE is a real access violation, not a miss — same rule as
+            // the anonymous path below, and checked here too so a PROT_NONE
+            // window over a file mapping never reaches the file at all.
+            if r.perms.prot_only().0 == 0 {
+                return false;
+            }
+            let i = ((v - rb) >> 12) as usize;
+            r.phys.get(i).is_some_and(|p| p.raw() == 0)
+        })
+    }
+
+    /// Record a frame the backing file supplied for the page at `v`.
+    ///
+    /// Keeps the first answer: a peer CPU that faulted the same page while
+    /// this one was inside the file has already published an equivalent frame
+    /// (`FileOps::mmap_fault` is idempotent per offset), and overwriting it
+    /// would strand the alias the peer may already have installed in a PTE.
+    fn record_file_demand_frame(&self, v: u64, phys: PhysAddr) {
+        let mut regions = self.regions.lock();
+        for r in regions.iter_mut() {
+            let rb = r.base.as_u64();
+            let re = rb.saturating_add(r.len);
+            if v < rb || v >= re || !r.perms.contains(RegionPerms::FILE_DEMAND) {
+                continue;
+            }
+            let i = ((v - rb) >> 12) as usize;
+            if let Some(slot) = r.phys.get_mut(i) {
+                if slot.raw() == 0 {
+                    *slot = phys;
+                }
+            }
+            return;
+        }
+    }
+
     /// Demand-paging entry point — called from the user-mode #PF
     /// handler when CR2 (x86_64) / FAR_EL1 (aarch64) lands inside
     /// a known region whose `phys[i]` is the zero sentinel
@@ -1606,10 +1709,15 @@ impl AddressSpace {
     /// it in the region's `phys` slot, and installs the leaf PTE
     /// with the region's perms.
     ///
+    /// In a [`RegionPerms::FILE_DEMAND`] region the frame comes from the
+    /// backing file instead — see [`install_file_fault_hook`] — and the
+    /// region does not own it.
+    ///
     /// Returns `Ok(())` on a successful page-in (caller resumes
     /// the faulting instruction). Returns `Unmapped` if no
     /// region contains `vaddr` (genuine SEGV — caller falls
-    /// through to its panic / signal path). Returns
+    /// through to its panic / signal path), which is also how a
+    /// file that refuses the fault surfaces. Returns
     /// `AlignmentMismatch` if the slot was already backed
     /// (spurious fault — usually a TLB shootdown race; safe to
     /// retry from the trap).
@@ -1624,6 +1732,18 @@ impl AddressSpace {
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         use crate::x86_64::paging::{map_4kb, MapError, PtFlags};
         let v = vaddr.as_u64() & !0xFFFu64;
+        // Demand-paged file mapping: the frame comes from the backing file,
+        // not from the frame allocator. Resolved with no lock held (see
+        // `file_demand_miss`), then published into the region's `phys` slot,
+        // after which the walk below takes its "backed but no leaf" branch and
+        // installs the PTE with the region's own permissions. Routing it that
+        // way rather than duplicating the leaf install is deliberate: the
+        // spurious-fault and racing-teardown reasoning in that branch is
+        // subtle, hard-won, and must not exist twice.
+        if self.file_demand_miss(v) {
+            let phys = file_fault_frame(v).ok_or(AddressSpaceError::Unmapped)?;
+            self.record_file_demand_frame(v, PhysAddr::new(phys));
+        }
         let mut regions = self.regions.lock();
         for r in regions.iter_mut() {
             let rb = r.base.as_u64();
@@ -1737,6 +1857,12 @@ impl AddressSpace {
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
         let v = vaddr.as_u64() & !0xFFFu64;
+        // See the x86_64 twin: the backing file supplies the frame, resolved
+        // with no lock held, then the walk below installs the leaf.
+        if self.file_demand_miss(v) {
+            let phys = file_fault_frame(v).ok_or(AddressSpaceError::Unmapped)?;
+            self.record_file_demand_frame(v, PhysAddr::new(phys));
+        }
         let mut regions = self.regions.lock();
         for r in regions.iter_mut() {
             let rb = r.base.as_u64();
@@ -4000,3 +4126,227 @@ impl Drop for AddressSpace {
         }
     }
 }
+
+// ── In-kernel smokes: FILE_DEMAND routing ──────────────────────────────
+//
+// The arena's end-to-end tests live where the file is (`bpf/src/arena.rs`,
+// `userspace/src/handlers/sys_mmap.rs`). These pin the *routing* — the part
+// that lives here and is identical for any demand-pageable file — and they are
+// arch-generic on purpose: the leaf install and its invalidation differ per
+// architecture, and the syscall-layer tests that would exercise them are
+// x86_64-only, so without these the aarch64 arm would ship unrun.
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// Chained behind the test hook so a real demand mapping faulting while a test
+/// holds the slot is still served.
+///
+/// **Never the test hook itself.** It was, briefly: the first test's restore
+/// was `if let Some(prev)`, which does nothing when nothing had been installed
+/// yet, so the test hook stayed in the slot and the second test's install
+/// chained it to itself — an unconditional infinite recursion the moment it
+/// was asked about an address it did not own. It hung the aarch64 memory run
+/// (`qemu-system-aarch64 timed out after 600s`) and would have hung any
+/// arch. [`arm_test_file_fault_hook`] is now the only way to set this.
+static FILE_FAULT_HOOK_UNDER_TEST: IrqSafeSpinLock<Option<FileFaultHook>> =
+    IrqSafeSpinLock::new(None);
+/// Page the test hook answers for, and the frame it answers with.
+static TEST_FAULT_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TEST_FAULT_FRAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TEST_FAULT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn test_file_fault_hook(vaddr: u64) -> Option<u64> {
+    use core::sync::atomic::Ordering;
+    let page = TEST_FAULT_PAGE.load(Ordering::Relaxed);
+    if page != 0 && vaddr == page {
+        TEST_FAULT_CALLS.fetch_add(1, Ordering::Relaxed);
+        return Some(TEST_FAULT_FRAME.load(Ordering::Relaxed));
+    }
+    let chained = *FILE_FAULT_HOOK_UNDER_TEST.lock();
+    chained.and_then(|h| h(vaddr))
+}
+
+/// Put the test hook in front of whatever is installed, chaining to it.
+///
+/// The chain is only updated when the displaced hook is *not* the test hook,
+/// which is what keeps the recursion above impossible however many times this
+/// is called and whatever the syscall layer installed in between. Nothing
+/// restores the previous hook: with `TEST_FAULT_PAGE` back at zero the test
+/// hook is a pure delegate, and `sys_mmap` reinstalls the real hook on every
+/// path that can create a region needing it — so leaving it in front is inert,
+/// while a restore has to get an `Option` right in a teardown that also runs on
+/// the failure paths.
+fn arm_test_file_fault_hook() {
+    if let Some(displaced) = install_file_fault_hook(test_file_fault_hook) {
+        if !core::ptr::fn_addr_eq(displaced, test_file_fault_hook as FileFaultHook) {
+            *FILE_FAULT_HOOK_UNDER_TEST.lock() = Some(displaced);
+        }
+    }
+}
+
+/// Does `v` have a leaf translation in `a`? Per-arch because the walkers are.
+fn translate_is_mapped(a: &AddressSpace, v: VirtAddr) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `a.root` is a valid user root; `translate` only reads the tables
+    // through the identity map.
+    unsafe {
+        crate::x86_64::paging::translate(a.root, v).is_some()
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: same.
+    unsafe {
+        crate::aarch64::paging::translate(a.root, v).is_some()
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (a, v);
+        true
+    }
+}
+
+/// A `FILE_DEMAND` region's unbacked page is filled by the installed hook, not
+/// by the frame allocator, and the frame it names is the one that lands in the
+/// region and in the page tables.
+///
+/// The distinction is the whole point: an ordinary lazy region gets a *fresh
+/// zeroed* frame here, which for a file-backed mapping would mean userspace
+/// looking at a blank page instead of the file's data. The test therefore
+/// primes the hook's frame with a marker and reads it back through the
+/// mapping — an implementation that fell through to `alloc_frame_policied`
+/// passes every structural check and fails on the marker.
+fn smoke_memory_file_demand_page_comes_from_the_hook() -> TestResult {
+    use core::sync::atomic::Ordering;
+    const MARKER: u64 = 0x0FD0_0FD0_1234_5678;
+
+    // SAFETY: the syscall/trap path runs with paging active; this allocates an
+    // independent user address space without switching the active one.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let frame = match crate::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    let phys = frame.start_address();
+    // SAFETY: a freshly-allocated frame is exclusively ours and reachable
+    // through the kernel RAM accessor.
+    unsafe {
+        phys.kernel_mut_ptr::<u64>().write_volatile(MARKER);
+    }
+
+    let vbase = 0x0000_0080_0000_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x2000,
+        perms: RegionPerms::READ
+            | RegionPerms::WRITE
+            | RegionPerms::SHARED
+            | RegionPerms::FILE_DEMAND,
+        phys: alloc::vec![PhysAddr::new(0); 2],
+    })
+    .is_err()
+    {
+        crate::frame::free_frame(frame);
+        return TestResult::Fail("map_region rejected a FILE_DEMAND region");
+    }
+
+    TEST_FAULT_PAGE.store(vbase, Ordering::Relaxed);
+    TEST_FAULT_FRAME.store(phys.raw(), Ordering::Relaxed);
+    TEST_FAULT_CALLS.store(0, Ordering::Relaxed);
+    arm_test_file_fault_hook();
+
+    // SAFETY: `a` is a live user root from `new_for_user`; the identity map is
+    // up and the frame allocator is initialised.
+    let served = unsafe { a.demand_alloc_page(VirtAddr::new(vbase + 0x40)) };
+    let slot = a
+        .lookup(VirtAddr::new(vbase))
+        .and_then(|r| r.phys.first().copied());
+    let mapped = translate_is_mapped(&a, VirtAddr::new(vbase));
+    let untouched = a
+        .lookup(VirtAddr::new(vbase))
+        .and_then(|r| r.phys.get(1).copied());
+
+    let mut verdict = if served.is_err() {
+        TestResult::Fail("a FILE_DEMAND fault was not served by the hook")
+    } else if TEST_FAULT_CALLS.load(Ordering::Relaxed) != 1 {
+        TestResult::Fail("the fault did not reach the file-fault hook exactly once")
+    } else if slot != Some(phys) {
+        TestResult::Fail("the region does not hold the frame the hook named")
+    } else if !mapped {
+        TestResult::Fail("the fault installed no leaf PTE")
+    } else if untouched != Some(PhysAddr::new(0)) {
+        // A routing that populated the whole region would defeat demand paging.
+        TestResult::Fail("an untouched page of the region was backed anyway")
+    } else {
+        TestResult::Pass
+    };
+    // Reading the marker is what separates "the hook was consulted" from "a
+    // fresh zeroed frame was installed anyway".
+    if matches!(verdict, TestResult::Pass) {
+        // SAFETY: `phys` is the frame this test allocated and still owns.
+        let seen = unsafe { phys.kernel_ptr::<u64>().read_volatile() };
+        if seen != MARKER {
+            verdict = TestResult::Fail("the mapped page is not the hook's frame contents");
+        }
+    }
+
+    // Disarm by address, not by uninstalling: the hook stays in front as a
+    // pure delegate. See `arm_test_file_fault_hook`.
+    TEST_FAULT_PAGE.store(0, Ordering::Relaxed);
+    // The region is SHARED, so teardown clears PTEs and frees nothing: this
+    // frame is ours to return, exactly as a file's would be its own.
+    drop(a);
+    crate::frame::free_frame(frame);
+    verdict
+}
+kernel_test_in!("memory", smoke_memory_file_demand_page_comes_from_the_hook);
+
+/// A `FILE_DEMAND` fault the file refuses is a clean `Unmapped` — the caller's
+/// SEGV path — and must not fall back to allocating an anonymous page.
+///
+/// A fallback would be the fail-open shape: userspace would get a blank
+/// writable page where it asked for file data, and never learn the file said
+/// no.
+fn smoke_memory_file_demand_refusal_is_a_segv() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    // SAFETY: as the test above.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0000_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x1000,
+        perms: RegionPerms::READ
+            | RegionPerms::WRITE
+            | RegionPerms::SHARED
+            | RegionPerms::FILE_DEMAND,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .is_err()
+    {
+        return TestResult::Fail("map_region rejected a FILE_DEMAND region");
+    }
+
+    // The hook answers for nothing, so this page is a refusal.
+    TEST_FAULT_PAGE.store(0, Ordering::Relaxed);
+    arm_test_file_fault_hook();
+
+    // SAFETY: as the test above.
+    let r = unsafe { a.demand_alloc_page(VirtAddr::new(vbase)) };
+    let slot = a
+        .lookup(VirtAddr::new(vbase))
+        .and_then(|r| r.phys.first().copied());
+    match r {
+        Err(AddressSpaceError::Unmapped) if slot == Some(PhysAddr::new(0)) => TestResult::Pass,
+        Err(AddressSpaceError::Unmapped) => {
+            TestResult::Fail("a refused file fault backed the page anyway")
+        }
+        Ok(()) => TestResult::Fail("a refused file fault was served anyway"),
+        Err(_) => TestResult::Fail("a refused file fault failed for the wrong reason"),
+    }
+}
+kernel_test_in!("memory", smoke_memory_file_demand_refusal_is_a_segv);

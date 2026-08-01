@@ -7,10 +7,14 @@
 //! Implemented here:
 //!
 //! * `BPF_OBJ_GET_INFO_BY_FD` (15) — `struct bpf_prog_info` / `struct
-//!   bpf_map_info`, for the fields NARF genuinely knows.
-//! * `BPF_PROG_GET_NEXT_ID` (11) / `BPF_MAP_GET_NEXT_ID` (12) — walk the id
-//!   tables in [`narf_bpf::idreg`].
-//! * `BPF_PROG_GET_FD_BY_ID` (13) / `BPF_MAP_GET_FD_BY_ID` (14) — reopen an
+//!   bpf_map_info` / `struct bpf_link_info` / `struct bpf_btf_info`, for the
+//!   fields NARF genuinely knows.
+//! * `BPF_PROG_GET_NEXT_ID` (11) / `BPF_MAP_GET_NEXT_ID` (12) /
+//!   `BPF_BTF_GET_NEXT_ID` (23) / `BPF_LINK_GET_NEXT_ID` (33) — walk the id
+//!   tables in [`narf_bpf::idreg`] (BTF's lives in `sys_bpf_btf.rs`; see that
+//!   file's header for why).
+//! * `BPF_PROG_GET_FD_BY_ID` (13) / `BPF_MAP_GET_FD_BY_ID` (14) /
+//!   `BPF_BTF_GET_FD_BY_ID` (19) / `BPF_LINK_GET_FD_BY_ID` (32) — reopen an
 //!   object by id, with a *fresh* reference.
 //!
 //! ## The `info_len` contract
@@ -43,6 +47,7 @@
 #[allow(unused_imports)]
 use super::*;
 
+use narf_bpf::link::{LinkFile, LinkTarget};
 use narf_bpf::map::MapFile;
 use narf_bpf::prog::ProgFile;
 use narf_bpf_verifier::kfunc::Context;
@@ -79,6 +84,11 @@ const GI_OPEN_FLAGS: usize = 8;
 /// `BPF_*_GET_NEXT_ID_LAST_FIELD` is `next_id`.
 const GI_NEXT_ID_END: usize = 8;
 /// `BPF_PROG_GET_FD_BY_ID_LAST_FIELD` is `prog_id` — a prog fd takes no flags.
+///
+/// The same 4 bytes cover `BPF_BTF_GET_FD_BY_ID_LAST_FIELD` (`btf_id`) and
+/// `BPF_LINK_GET_FD_BY_ID_LAST_FIELD` (`link_id`): all three are the bare id at
+/// offset 0 of the same anonymous struct, and only the *map* command has an
+/// `open_flags`.
 const GI_PROG_FD_END: usize = 4;
 /// `BPF_MAP_GET_FD_BY_ID_LAST_FIELD` is `open_flags`.
 const GI_MAP_FD_END: usize = 12;
@@ -178,6 +188,46 @@ const MI_NAME: usize = 24;
 /// gets `88` reported back and knows the tail is unfilled — which is more
 /// honest than claiming a size whose extra bytes are all zero anyway.
 const MAP_INFO_LEN: usize = 88;
+
+// `struct bpf_link_info` offsets. The three common fields, then an 8-aligned
+// union whose largest member (`uprobe_multi`) makes Linux's `sizeof` 64.
+const LI_TYPE: usize = 0;
+const LI_ID: usize = 4;
+const LI_PROG_ID: usize = 8;
+/// `tracing.attach_type`, and `xdp.ifindex` — the union starts here.
+const LI_UNION: usize = 16;
+/// `tracing.target_obj_id`.
+const LI_TRACING_TARGET_OBJ_ID: usize = 20;
+/// `tracing.target_btf_id`.
+const LI_TRACING_TARGET_BTF_ID: usize = 24;
+/// How much of `struct bpf_link_info` NARF fills.
+///
+/// Short of Linux's 64, and deliberately so — the same call the `MAP_INFO_LEN`
+/// note above makes. Every union member NARF can produce (`tracing`'s three
+/// `__u32`s, `xdp`'s one) ends by offset 28; the rest of the union describes
+/// link types NARF has no surface for, and a caller told "64 bytes filled"
+/// would read a `cookie` or a `kprobe_multi.count` that was never written.
+/// Reporting 32 says exactly which prefix is real.
+const LINK_INFO_LEN: usize = 32;
+
+/// `enum bpf_link_type`. Only the two NARF has surfaces for.
+const BPF_LINK_TYPE_TRACING: u32 = 2;
+const BPF_LINK_TYPE_XDP: u32 = 6;
+/// `enum bpf_attach_type`'s `BPF_TRACE_FENTRY`, echoed into
+/// `bpf_link_info.tracing.attach_type`. Spelled here rather than imported from
+/// `sys_bpf_attach.rs`, whose copy is a private constant of a file another
+/// agent edits.
+const BPF_TRACE_FENTRY: u32 = 24;
+
+// `struct bpf_btf_info` offsets. `sizeof` is 32 and NARF fills all of it.
+const BI_BTF: usize = 0;
+const BI_BTF_SIZE: usize = 8;
+const BI_ID: usize = 12;
+const BI_NAME: usize = 16;
+const BI_NAME_LEN: usize = 24;
+const BI_KERNEL_BTF: usize = 28;
+/// `sizeof(struct bpf_btf_info)`.
+const BTF_INFO_LEN: usize = 32;
 
 /// Copy `name` into a fixed `BPF_OBJ_NAME_LEN` NUL-padded field.
 ///
@@ -306,12 +356,16 @@ pub(crate) fn bpf_obj_get_info_by_fd(attr_uptr: u64, size: usize) -> i64 {
     if let Some(f) = any.downcast_ref::<MapFile>() {
         return map_info(attr_uptr, uinfo, user_len, &f.map());
     }
-    // LINUX-GAP: `BPF_OBJ_GET_INFO_BY_FD` also serves link and BTF fds on
-    // Linux. NARF has neither object here (a sibling stream is adding them), so
-    // an fd that is not a program or a map is not a BPF object at all — which
-    // is `EINVAL`, matching what Linux returns for a non-BPF fd. It is *not*
-    // `ENOTSUP`, because that would claim the kernel understood the object and
-    // declined; it did not recognise it.
+    if let Some(f) = any.downcast_ref::<LinkFile>() {
+        return link_info(attr_uptr, uinfo, user_len, &f.link());
+    }
+    if let Some(f) = any.downcast_ref::<super::BtfFile>() {
+        return btf_info(attr_uptr, uinfo, user_len, f);
+    }
+    // An fd that is none of the four is not a BPF object at all — `EINVAL`,
+    // matching what Linux returns for a non-BPF fd. It is *not* `ENOTSUP`,
+    // because that would claim the kernel understood the object and declined;
+    // it did not recognise one.
     -EINVAL
 }
 
@@ -465,6 +519,99 @@ fn map_info(
     write_info(attr_uptr, uinfo, user_len, &out, MAP_INFO_LEN)
 }
 
+fn link_info(
+    attr_uptr: u64,
+    uinfo: u64,
+    user_len: usize,
+    link: &alloc::sync::Arc<narf_bpf::link::BpfLink>,
+) -> i64 {
+    let mut out = [0u8; LINK_INFO_LEN];
+    put_u32(&mut out, LI_ID, link.id());
+    // `prog_id` is 0 once the link has been detached — `BPF_LINK_DETACH` leaves
+    // the fd valid and the link dead, and reporting the last program it held
+    // would say the attach is still in place. Linux's dead links report 0 for
+    // the same reason.
+    if let Some(p) = link.prog() {
+        put_u32(&mut out, LI_PROG_ID, p.id);
+    }
+    match link.target() {
+        LinkTarget::Probe(_) => {
+            put_u32(&mut out, LI_TYPE, BPF_LINK_TYPE_TRACING);
+            put_u32(&mut out, LI_UNION, BPF_TRACE_FENTRY);
+            // LINUX-GAP: `tracing.target_obj_id` / `tracing.target_btf_id`.
+            // Linux names an fentry target by BTF id; NARF names it by
+            // `narf_tracing::dispatch` probe id, and nothing joins the two
+            // (see `sys_bpf_attach.rs`'s header). Writing the probe id into a
+            // field documented as a BTF type id would be a value that looks
+            // resolvable and is not, so both stay 0 — which for
+            // `target_btf_id` already means "none".
+            put_u32(&mut out, LI_TRACING_TARGET_OBJ_ID, 0);
+            put_u32(&mut out, LI_TRACING_TARGET_BTF_ID, 0);
+        }
+        LinkTarget::Xdp(iface) => {
+            put_u32(&mut out, LI_TYPE, BPF_LINK_TYPE_XDP);
+            // 0 for an interface that has since been unregistered: `ifindex`
+            // has no "unknown" encoding other than 0, and a stale index would
+            // name whichever interface now sits at that position.
+            put_u32(
+                &mut out,
+                LI_UNION,
+                super::ifindex_for_iface(iface).unwrap_or(0),
+            );
+        }
+    }
+    write_info(attr_uptr, uinfo, user_len, &out, LINK_INFO_LEN)
+}
+
+fn btf_info(attr_uptr: u64, uinfo: u64, user_len: usize, file: &super::BtfFile) -> i64 {
+    let mut uin = [0u8; BTF_INFO_LEN];
+    if let Err(e) = read_user_info(uinfo, user_len, &mut uin) {
+        return e;
+    }
+    let btf = file.btf();
+    let raw = btf.raw();
+
+    // `btf` / `btf_size` are the in/out pair `bpftool btf dump` uses: in, a
+    // buffer and its capacity; out, the blob's true size. A caller sizing its
+    // buffer calls once with capacity 0 to learn the size, then again.
+    let ubtf = if user_len >= BI_BTF + 8 {
+        u64_at(&uin, BI_BTF)
+    } else {
+        0
+    };
+    let cap = if user_len >= BI_BTF_SIZE + 4 {
+        u32_at(&uin, BI_BTF_SIZE) as usize
+    } else {
+        0
+    };
+    if ubtf != 0 && cap > 0 {
+        let n = cap.min(raw.len());
+        // SAFETY: range-validated inside `copy_to_user`, which brackets SMAP
+        // and turns a fault into `Err(EFAULT)`. `n` never exceeds the capacity
+        // the caller itself declared in `btf_size`.
+        if let Err(e) = unsafe { copy_to_user(ubtf, &raw[..n]) } {
+            return -(e as i64);
+        }
+    }
+
+    let mut out = [0u8; BTF_INFO_LEN];
+    // Echoed back unchanged: it is the caller's own pointer, and a zero here
+    // would tell a caller that re-reads the struct that it never passed one.
+    put_u64(&mut out, BI_BTF, ubtf);
+    put_u32(&mut out, BI_BTF_SIZE, raw.len() as u32);
+    put_u32(&mut out, BI_ID, file.id());
+    put_u64(&mut out, BI_NAME, u64_at(&uin, BI_NAME));
+    // LINUX-GAP: `name` / `name_len`. Linux names the vmlinux and module BTFs;
+    // a blob loaded through `BPF_BTF_LOAD` is anonymous there too, and NARF has
+    // no kernel BTF to name. 0 is "no name", and the caller's buffer is left
+    // untouched rather than filled with something invented.
+    put_u32(&mut out, BI_NAME_LEN, 0);
+    // Not kernel BTF: NARF has none. This one is load-bearing rather than a
+    // gap — a loader uses it to decide whether the blob may be freed.
+    put_u32(&mut out, BI_KERNEL_BTF, 0);
+    write_info(attr_uptr, uinfo, user_len, &out, BTF_INFO_LEN)
+}
+
 // ── the id family ───────────────────────────────────────────────────
 
 /// Shared body of `BPF_PROG_GET_NEXT_ID` / `BPF_MAP_GET_NEXT_ID`.
@@ -512,6 +659,16 @@ pub(crate) fn bpf_map_get_next_id(attr_uptr: u64, size: usize) -> i64 {
     })
 }
 
+pub(crate) fn bpf_link_get_next_id(attr_uptr: u64, size: usize) -> i64 {
+    get_next_id(attr_uptr, size, |after| {
+        narf_bpf::idreg::links().next_id(after)
+    })
+}
+
+pub(crate) fn bpf_btf_get_next_id(attr_uptr: u64, size: usize) -> i64 {
+    get_next_id(attr_uptr, size, |after| super::btf_ids().next_id(after))
+}
+
 /// Install a freshly built anon-fd file in the caller's table.
 ///
 /// The `FileOps` handed in holds its **own** `Arc` to the object, cloned out of
@@ -534,20 +691,28 @@ fn install_fd(ops: alloc::sync::Arc<dyn narf_filesystem::FileOps>) -> i64 {
     }
 }
 
+/// The shared prologue of every `GET_FD_BY_ID` whose last field is the bare id:
+/// `BPF_PROG_GET_FD_BY_ID`, `BPF_BTF_GET_FD_BY_ID`, `BPF_LINK_GET_FD_BY_ID`.
+///
+/// One function because the three differ only in which table they consult, and
+/// three copies of "reject a short `bpf_attr`, then `CHECK_ATTR` the tail" is
+/// how one of them ends up silently accepting an `open_flags` it does not
+/// honour. `BPF_MAP_GET_FD_BY_ID` is not one of them — it *does* take
+/// `open_flags` — and keeps its own body below.
+fn id_arg(attr_uptr: u64, size: usize) -> Result<u32, i64> {
+    let attr = read_attr(attr_uptr, size)?;
+    if size < GI_PROG_FD_END {
+        return Err(-EINVAL);
+    }
+    check_attr_tail(&attr, GI_PROG_FD_END, size)?;
+    Ok(u32_at(&attr, GI_START_ID))
+}
+
 pub(crate) fn bpf_prog_get_fd_by_id(attr_uptr: u64, size: usize) -> i64 {
-    let attr = match read_attr(attr_uptr, size) {
-        Ok(a) => a,
+    let id = match id_arg(attr_uptr, size) {
+        Ok(i) => i,
         Err(e) => return e,
     };
-    if size < GI_PROG_FD_END {
-        return -EINVAL;
-    }
-    // A prog fd takes no `open_flags` on Linux either — `next_id` and
-    // `open_flags` are both past this command's last field.
-    if let Err(e) = check_attr_tail(&attr, GI_PROG_FD_END, size) {
-        return e;
-    }
-    let id = u32_at(&attr, GI_START_ID);
     // `ENOENT` covers both "never existed" and "existed and was freed", and
     // they are genuinely the same answer: the registry holds a `Weak`, so a
     // freed program's entry cannot upgrade. That is the property that makes a
@@ -582,4 +747,35 @@ pub(crate) fn bpf_map_get_fd_by_id(attr_uptr: u64, size: usize) -> i64 {
         return -ENOENT;
     };
     install_fd(alloc::sync::Arc::new(MapFile::new(map)))
+}
+
+pub(crate) fn bpf_link_get_fd_by_id(attr_uptr: u64, size: usize) -> i64 {
+    let id = match id_arg(attr_uptr, size) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    // As for programs: `ENOENT` for an id that never existed and for one whose
+    // link is gone, because the registry's `Weak` cannot upgrade a dead link.
+    // For links that matters more than for any other object here — a strong
+    // entry would hold the *attach* open for the rest of the boot, since
+    // `BpfLink::drop` is the only thing that undoes one.
+    let Some(link) = narf_bpf::idreg::links().get(id) else {
+        return -ENOENT;
+    };
+    // `LinkFile::new` takes the `Arc` we just cloned out of the registry, so
+    // this fd is an owner in its own right: closing the fd the link was created
+    // through leaves the attach in place, and closing *this* one — when it is
+    // the last — detaches.
+    install_fd(alloc::sync::Arc::new(LinkFile::new(link)))
+}
+
+pub(crate) fn bpf_btf_get_fd_by_id(attr_uptr: u64, size: usize) -> i64 {
+    let id = match id_arg(attr_uptr, size) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let Some(blob) = super::btf_ids().get(id) else {
+        return -ENOENT;
+    };
+    install_fd(alloc::sync::Arc::new(super::BtfFile::from_blob(blob)))
 }

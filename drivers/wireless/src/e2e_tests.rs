@@ -157,7 +157,7 @@ fn smoke_e2e_mt7921_mcu_init_sequence_layout() -> TestResult {
     // INFO TLV hdr (4) + omac_idx(1) + band_idx(1) + rsv(2) = +16 inside the UNI body.
     let uni_off = PM_STATE_CTRL_SIZE + INIT_RA_CFG_SIZE;
     let mac_off = uni_off + 8 /*hdr*/ + 8 /*ACTIVE TLV*/ + 8 /*INFO TLV up to MAC*/;
-    if &seq[mac_off..mac_off + 6] != &cfg.own_mac {
+    if seq[mac_off..mac_off + 6] != cfg.own_mac {
         return TestResult::Fail("UNI DEV_INFO_UPDATE didn't carry own_mac");
     }
     TestResult::Pass
@@ -187,7 +187,7 @@ fn smoke_e2e_mt7921_mac_vif_setup_three_bodies() -> TestResult {
         return TestResult::Fail("MAC vif setup body total length wrong");
     }
     // DEV_INFO_UPDATE carries own_mac at offset 8 (skip tag/len/active/dbdc/omac/rsv).
-    if &body[8..14] != &cfg.own_mac {
+    if body[8..14] != cfg.own_mac {
         return TestResult::Fail("DEV_INFO_UPDATE did not carry own_mac");
     }
     // BSS_INFO_BASIC TLV starts at DEV_INFO_UPDATE_SIZE.
@@ -201,7 +201,7 @@ fn smoke_e2e_mt7921_mac_vif_setup_three_bodies() -> TestResult {
     if net_type != NETWORK_TYPE_INFRA {
         return TestResult::Fail("BSS_INFO_BASIC network_type not INFRA");
     }
-    if &body[bss_off + 12..bss_off + 18] != &bssid {
+    if body[bss_off + 12..bss_off + 18] != bssid {
         return TestResult::Fail("BSS_INFO_BASIC bssid wrong");
     }
     // STA_REC_BASIC TLV: conn_type at +4 should be STA_INFRA.
@@ -456,7 +456,7 @@ fn smoke_e2e_iwlwifi_probe_and_mac_context_cmd() -> TestResult {
         return TestResult::Fail("MAC_CONTEXT_CMD cmd_id byte wrong");
     }
     // node_addr lives at offset 4 (cmd_hdr) + 4 + 4 + 4 + 4 = 20.
-    if &buf[20..26] != &node {
+    if buf[20..26] != node {
         return TestResult::Fail("MAC_CONTEXT_CMD did not carry node_addr at expected offset");
     }
     TestResult::Pass

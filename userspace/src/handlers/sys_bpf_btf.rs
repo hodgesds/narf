@@ -18,17 +18,25 @@
 //! is only the syscall glue: copy in, parse, wrap in an fd, report the reason
 //! through `btf_log_buf`.
 //!
-//! Not here: `BPF_BTF_GET_FD_BY_ID` (19) and `BPF_BTF_GET_NEXT_ID` (23). Both
-//! need a kernel-wide id registry, which is a separate piece of work; they
-//! stay `ENOTSUP` through `sys_bpf`'s default arm rather than getting a second,
-//! competing registry here.
+//! ## Ids
+//!
+//! A loaded blob also gets a boot-unique `u32` id and an entry in an
+//! [`narf_bpf::idreg::IdRegistry`], which is what `BPF_BTF_GET_NEXT_ID` walks
+//! and `BPF_BTF_GET_FD_BY_ID` resolves (both live in `sys_bpf_info.rs`, with
+//! the rest of the id family). The table is *here* rather than beside
+//! `idreg::progs()`/`maps()` for one reason: `narf-bpf` does not depend on
+//! `narf-bpf-btf` and must not start to — the parser is deliberately a leaf
+//! crate with no kernel dependencies, and `narf-bpf` is what the interpreter
+//! and the attach adapters live in. The registry is generic precisely so a
+//! table can sit next to its object; only the `IdRegistry` type is borrowed.
 
 #[allow(unused_imports)]
 use super::*;
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use alloc::sync::Arc;
+use narf_bpf::idreg::IdRegistry;
 use narf_bpf_btf::{Btf, BtfError, Errno};
 
 const E2BIG: i64 = 7;
@@ -57,57 +65,130 @@ const BTF_FLAGS: usize = 32;
 /// `BPF_LOG_LEVEL1 | BPF_LOG_LEVEL2 | BPF_LOG_STATS | BPF_LOG_FIXED`.
 const BPF_LOG_MASK: u32 = 15;
 
-/// How many BTF blobs are currently held by an fd.
+/// How many parsed BTF blobs are currently alive.
 ///
 /// Exists so that "closing the fd frees the blob" is a testable claim rather
-/// than an assertion in a comment. Incremented when a `BtfFile` is created,
-/// decremented in its `Drop`, which the fd table runs when the last reference
-/// to the `Arc<dyn FileOps>` goes away.
+/// than an assertion in a comment. It counts **blobs, not fds**: the counter
+/// lives on [`BtfBlob`], so two fds naming one blob (which is exactly what
+/// `BPF_BTF_GET_FD_BY_ID` produces) count once, and the number only falls when
+/// the allocation is actually freed. Counting fds would have made this smoke
+/// go green on a leak the moment a second handle existed.
 static LIVE_BTF: AtomicUsize = AtomicUsize::new(0);
 
-/// The number of loaded BTF blobs still referenced by an fd.
+/// The number of loaded BTF blobs still alive.
 #[must_use]
 pub(crate) fn live_btf_count() -> usize {
     LIVE_BTF.load(Ordering::Relaxed)
 }
 
-/// The fd a successful `BPF_BTF_LOAD` returns.
+/// Boot-lifetime and never handed back, as for programs, maps and links: a
+/// reused id is how a loader that cached one silently starts naming a different
+/// blob. 1, because `bpf_prog_info.btf_id == 0` means "no BTF".
+static NEXT_BTF_ID: AtomicU32 = AtomicU32::new(1);
+
+static BTF_IDS: IdRegistry<BtfBlob> = IdRegistry::new();
+
+/// The BTF id table. See the module header for why it lives here.
+#[must_use]
+pub(crate) fn btf_ids() -> &'static IdRegistry<BtfBlob> {
+    &BTF_IDS
+}
+
+/// A loaded blob and its id.
 ///
-/// Holds the parsed blob and nothing else. `as_any` is the hook a future
-/// `BPF_OBJ_GET_INFO_BY_FD` or `BPF_BTF_GET_FD_BY_ID` recovers it through —
-/// the same shape `ProgFile` and `MapFile` use.
-pub(crate) struct BtfFile {
+/// The id has to live on the *object* rather than on the fd, because the
+/// registry's pruning half runs from `Drop` and there is exactly one drop that
+/// means "this blob is gone". A `BtfFile` is a handle; several may name one
+/// `BtfBlob`.
+pub(crate) struct BtfBlob {
+    id: u32,
     btf: Arc<Btf>,
 }
 
-impl BtfFile {
-    fn new(btf: Btf) -> Self {
-        LIVE_BTF.fetch_add(1, Ordering::Relaxed);
-        Self { btf: Arc::new(btf) }
+impl BtfBlob {
+    /// The blob's id, as `BPF_BTF_GET_FD_BY_ID` takes and `bpf_btf_info.id`
+    /// reports.
+    #[must_use]
+    pub(crate) fn id(&self) -> u32 {
+        self.id
     }
 
-    /// The blob behind this fd.
-    ///
-    /// No caller yet: the commands that would use it — `BPF_BTF_GET_FD_BY_ID`
-    /// and `BPF_OBJ_GET_INFO_BY_FD` — need an id registry NARF does not have.
-    /// Kept because `as_any` without it is a downcast to nothing, and the
-    /// alternative is deleting half the recovery path and rediscovering it.
-    #[allow(dead_code)]
-    pub(crate) fn btf(&self) -> Arc<Btf> {
-        Arc::clone(&self.btf)
+    /// The parsed blob.
+    #[must_use]
+    pub(crate) fn btf(&self) -> &Arc<Btf> {
+        &self.btf
     }
 }
 
-impl Drop for BtfFile {
+impl Drop for BtfBlob {
     fn drop(&mut self) {
         LIVE_BTF.fetch_sub(1, Ordering::Relaxed);
+        // The registry's anti-leak half. `IdRegistry::remove` never
+        // materialises an `Arc<BtfBlob>` under its lock, so calling it from a
+        // `Drop` cannot re-enter this function.
+        BTF_IDS.remove(self.id);
+    }
+}
+
+impl core::fmt::Debug for BtfBlob {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BtfBlob")
+            .field("id", &self.id)
+            .field("nr_types", &self.btf.nr_types())
+            .finish()
+    }
+}
+
+/// The fd a successful `BPF_BTF_LOAD` returns.
+///
+/// Holds a reference to the blob and nothing else. `as_any` is the hook
+/// `BPF_OBJ_GET_INFO_BY_FD` recovers it through — the same shape `ProgFile` and
+/// `MapFile` use.
+pub(crate) struct BtfFile {
+    blob: Arc<BtfBlob>,
+}
+
+impl BtfFile {
+    /// Parse-and-register: assigns the id, records it, and returns the first
+    /// handle. The registry holds a `Weak`, so the entry is made from the `Arc`
+    /// that is about to be handed out rather than before it exists.
+    fn load(btf: Btf) -> Self {
+        LIVE_BTF.fetch_add(1, Ordering::Relaxed);
+        let id = NEXT_BTF_ID.fetch_add(1, Ordering::Relaxed);
+        let blob = Arc::new(BtfBlob {
+            id,
+            btf: Arc::new(btf),
+        });
+        BTF_IDS.insert(id, &blob);
+        Self { blob }
+    }
+
+    /// A second handle on an already-registered blob, for
+    /// `BPF_BTF_GET_FD_BY_ID`. Its own `Arc`, so it keeps the blob alive
+    /// independently of the fd that loaded it.
+    #[must_use]
+    pub(crate) fn from_blob(blob: Arc<BtfBlob>) -> Self {
+        Self { blob }
+    }
+
+    /// The blob behind this fd.
+    #[must_use]
+    pub(crate) fn btf(&self) -> Arc<Btf> {
+        Arc::clone(self.blob.btf())
+    }
+
+    /// The blob's id.
+    #[must_use]
+    pub(crate) fn id(&self) -> u32 {
+        self.blob.id()
     }
 }
 
 impl core::fmt::Debug for BtfFile {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BtfFile")
-            .field("nr_types", &self.btf.nr_types())
+            .field("id", &self.blob.id)
+            .field("nr_types", &self.blob.btf.nr_types())
             .finish()
     }
 }
@@ -325,7 +406,7 @@ pub(crate) fn btf_load(attr_uptr: u64, size: usize) -> i64 {
         btf.header().str_len
     ));
 
-    let ops: Arc<dyn narf_filesystem::FileOps> = Arc::new(BtfFile::new(btf));
+    let ops: Arc<dyn narf_filesystem::FileOps> = Arc::new(BtfFile::load(btf));
     let task = current_task_id();
     match fd::with_table(task, |t| {
         t.open(crate::fd::FdEntry {
