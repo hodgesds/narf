@@ -50,6 +50,7 @@ fn a64_words(code: &[u8]) -> Vec<u32> {
 ///   stp  x21, x22, [sp, #16]
 ///   stp  x24, x25, [sp, #32]
 ///   stur x30, [sp, #48]      ; the link register, which BLR clobbers
+///   stur x3,  [sp, #56]      ; the arena slot base, in the frame's padding
 ///   mov x24, x2      ; fuel, before anything writes x2 (R2)
 ///   mov x25, x0      ; frame top, before anything writes x0 (R0)
 ///   mov x0, xzr      ; R0 := 0, so an unset R0 cannot return frame_top
@@ -66,11 +67,12 @@ fn a64_words(code: &[u8]) -> Vec<u32> {
 /// by *executing* it rather than by matching these bytes, because a golden
 /// constant pins a bug as faithfully as it pins a fix — which is exactly how
 /// the x86-64 prologue once shipped without `push rbp` and its test passed.
-const A64_PROLOGUE: [u32; 7] = [
+const A64_PROLOGUE: [u32; 8] = [
     0xa9bc_53f3,
     0xa901_5bf5,
     0xa902_67f8,
     0xf803_03fe,
+    0xf803_83e3,
     0xaa02_03f8,
     0xaa00_03f9,
     0xaa1f_03e0,
@@ -106,6 +108,22 @@ const A64_OOF_EPILOGUE: [u32; 6] = [
     A64_RESTORE[4],
 ];
 
+/// The arena-fault epilogue: `mov x0, x9` (the offending handle), `mov x1, #2`
+/// (`status::ARENA_FAULT`), then the same restore.
+///
+/// Last in the image, and reached only through the exception table — nothing
+/// branches here. Returning the handle is why the emitter folds `off16` into
+/// `x9` instead of leaving it in the `LDUR`.
+const A64_ARENA_EPILOGUE: [u32; 7] = [
+    0xaa09_03e0,
+    0xd280_0041,
+    A64_RESTORE[0],
+    A64_RESTORE[1],
+    A64_RESTORE[2],
+    A64_RESTORE[3],
+    A64_RESTORE[4],
+];
+
 /// `subs x24, x24, #n` — the per-block fuel charge. The immediate is bits
 /// 10..21.
 fn a64_subs_fuel(n: u32) -> u32 {
@@ -130,7 +148,7 @@ fn a64_image(items: &[Decoded]) -> (Vec<u32>, core::ops::Range<usize>) {
     assert_eq!(c.entry_off, 0);
     assert!(
         c.faults.0.is_empty(),
-        "aarch64 emits no fault sites: a current-EL data abort is fatal, not fixable"
+        "a program with no arena access has nothing to record"
     );
     let w = a64_words(&c.code);
     assert_eq!(
@@ -140,9 +158,9 @@ fn a64_image(items: &[Decoded]) -> (Vec<u32>, core::ops::Range<usize>) {
         &w[..A64_PROLOGUE.len()]
     );
     assert_eq!(
-        &w[w.len() - A64_OOF_EPILOGUE.len()..],
-        &A64_OOF_EPILOGUE,
-        "the image must end with the out-of-fuel epilogue"
+        &w[w.len() - A64_ARENA_EPILOGUE.len()..],
+        &A64_ARENA_EPILOGUE,
+        "the image must end with the arena-fault epilogue"
     );
     let start = A64_PROLOGUE.len() + 2; // the first block's `subs` + `b.lo`
     let end = w
@@ -822,45 +840,32 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
     }
 }
 
-#[test]
-fn a64_an_arena_program_is_refused_at_the_call_that_produces_the_handle() {
-    // The aarch64 half of the x86-64 test of the same name. `jit_glue`'s
-    // "Lifting gate 2" note claims **neither** backend emits `Decoded::Call`,
-    // and a kfunc return is the verifier's only producer of `PtrClass::Arena`
-    // — so that claim is what makes gate 2 vacuous on both architectures, and
-    // a claim about both needs testing on both. Tested through
-    // `aarch64::compile` rather than `compile`, which dispatches to the host.
-    let prog = crate::tests::verified_arena(
-        &[
-            Decoded::Call(narf_bpf_isa::CallTarget::Kfunc(1)),
-            Decoded::Store {
-                size: Size::Dw,
-                dst: r(0),
-                off: 0,
-                src: Source::Imm(1),
-            },
-            mov(0, 0),
-            EXIT,
-        ],
-        1,
-        None,
-    );
-    assert!(
-        matches!(
-            aarch64::compile(&prog),
-            Err(JitError::Unsupported { at: 0, .. })
-        ),
-        "the call, not the arena access, is what an arena program hits first"
-    );
+/// Compile an arena program on this backend and return its words.
+///
+/// Through `aarch64::compile` rather than `compile`, which dispatches to the
+/// *host* — so these run on an x86-64 developer machine too, which is the whole
+/// reason this file exists.
+#[track_caller]
+fn a64_arena_words(
+    items: &[Decoded],
+    fault_at: u32,
+    dst: Option<u8>,
+) -> (Vec<u32>, crate::Compiled) {
+    let prog = crate::tests::verified_arena(items, fault_at, dst);
+    let c = aarch64::compile(&prog).expect("the arena shape is emitted now");
+    (a64_words(&c.code), c)
 }
 
 #[test]
-fn a64_the_emitter_discards_the_verifiers_arena_fault_sites() {
-    // As the x86-64 test of the same name: gate 3 has to stay closed because
-    // codegen hands `jit_glue` an empty table for a program the verifier said
-    // needs coverage. Stated per backend because `FaultTable` is built
-    // per backend, so one of them could grow entries without the other.
-    let prog = crate::tests::verified_arena(
+fn a64_an_arena_store_takes_the_slot_relative_shape() {
+    // The aarch64 half of `an_arena_access_lowers_to_the_slot_relative_shape`.
+    // Stated per backend because the lowering is written per backend, so one of
+    // them could regress without the other.
+    //
+    // Every word below was cross-checked against `llvm-mc -triple=aarch64
+    // -show-encoding` rather than read off the manual, which is the same rule
+    // the rest of this file's constants follow.
+    let (w, c) = a64_arena_words(
         &[
             Decoded::Store {
                 size: Size::Dw,
@@ -874,16 +879,185 @@ fn a64_the_emitter_discards_the_verifiers_arena_fault_sites() {
         0,
         None,
     );
-    let c = aarch64::compile(&prog).expect("the store alone is an ordinary encoding");
+    let body = &w[A64_PROLOGUE.len() + 2..];
     assert_eq!(
-        prog.fault_sites.len(),
-        1,
-        "premise: the verifier recorded a site to cover"
+        &body[..14],
+        &[
+            0x2a01_03e9, // mov  w9, w1        — zero-extend the handle
+            0xd280_0110, // movz x16, #8       — the displacement, sign-extended
+            0xf2a0_0010, // movk x16, #0, lsl #16
+            0xf2c0_0010, // movk x16, #0, lsl #32
+            0xf2e0_0010, // movk x16, #0, lsl #48
+            0x8b10_0129, // add  x9, x9, x16   — x9 is now the handle
+            0xf843_83f1, // ldur x17, [sp,#56] — the parked slot base
+            0x8b09_0231, // add  x17, x17, x9  — the address
+            0xd280_0030, // movz x16, #1       — the stored value
+            0xf2a0_0010, // movk x16, #0, lsl #16
+            0xf2c0_0010, // movk x16, #0, lsl #32
+            0xf2e0_0010, // movk x16, #0, lsl #48
+            0xf800_0230, // stur x16, [x17]    — the faulting instruction
+            0xd280_0000, // (mov x0, #0 — the next BPF instruction)
+        ],
+        "\n got {:08x?}",
+        &body[..14]
     );
-    assert!(
-        c.faults.0.is_empty(),
-        "codegen must be taught to record arena fault sites before gate 3 lifts"
+    // The value is materialised *after* the address, because `emit_arena_addr`
+    // uses x16 as scratch for the displacement. Reversing the two would store a
+    // displacement instead of a value, and the golden above is what says so.
+    assert_eq!(c.faults.0.len(), 1);
+    assert!(c.faults.0[0].arena);
+    assert_eq!(c.faults.0[0].dst_host_reg, None);
+    // The faulting word is the `stur`, not the address arithmetic before it.
+    assert_eq!(
+        c.faults.0[0].fault_off as usize,
+        (A64_PROLOGUE.len() + 2 + 12) * 4
     );
+}
+
+#[test]
+fn a64_the_arena_fixup_is_the_epilogue_and_not_the_next_instruction() {
+    // The property that separates this from Linux's `ex_handler_bpf`: a probe
+    // read zeroes its destination and carries on, an arena fault *stops*.
+    //
+    // Mutation: point `fixup_off` at the next instruction and this goes red.
+    let (w, c) = a64_arena_words(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(1),
+                off: 0,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let arena_epi = w.len() - A64_ARENA_EPILOGUE.len();
+    assert_eq!(
+        &w[arena_epi..],
+        &A64_ARENA_EPILOGUE,
+        "the image must end with the arena-fault epilogue"
+    );
+    assert_eq!(
+        c.faults.0[0].fixup_off as usize,
+        arena_epi * 4,
+        "the fixup must name the arena epilogue, not the next instruction"
+    );
+}
+
+#[test]
+fn a64_an_arena_load_and_a_register_store_take_the_same_shape() {
+    // The other two arena forms, and the zero-displacement path — which skips
+    // the four-word immediate materialisation entirely.
+    let (w, _) = a64_arena_words(
+        &[
+            Decoded::Load {
+                size: Size::Dw,
+                sign_extend: false,
+                dst: r(3),
+                src: r(2),
+                off: 0,
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        Some(3),
+    );
+    let body = &w[A64_PROLOGUE.len() + 2..];
+    assert_eq!(
+        &body[..4],
+        &[
+            0x2a02_03e9, // mov  w9, w2
+            0xf843_83f1, // ldur x17, [sp,#56]
+            0x8b09_0231, // add  x17, x17, x9
+            0xf840_0223, // ldur x3, [x17]
+        ],
+        "\n got {:08x?}",
+        &body[..4]
+    );
+
+    let (w, _) = a64_arena_words(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(2),
+                off: 0,
+                src: Source::Reg(r(3)),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let body = &w[A64_PROLOGUE.len() + 2..];
+    assert_eq!(
+        &body[..4],
+        &[
+            0x2a02_03e9, // mov  w9, w2
+            0xf843_83f1, // ldur x17, [sp,#56]
+            0x8b09_0231, // add  x17, x17, x9
+            0xf800_0223, // stur x3, [x17]
+        ],
+        "\n got {:08x?}",
+        &body[..4]
+    );
+}
+
+#[test]
+fn a64_a_non_arena_access_keeps_the_plain_shape() {
+    // Lifting gate 2 must not give *every* access the arena shape. Same
+    // instruction, no fault site, plain `[base, #disp]` — and no fault entry.
+    //
+    // Without this, an emitter that ignored `arena_access_map` and always took
+    // the arena path would pass every arena test above.
+    let c = aarch64::compile(&verified(&[
+        Decoded::Store {
+            size: Size::Dw,
+            dst: r(1),
+            off: 8,
+            src: Source::Imm(1),
+        },
+        mov(0, 0),
+        EXIT,
+    ]))
+    .expect("compiles");
+    let w = a64_words(&c.code);
+    let body = &w[A64_PROLOGUE.len() + 2..];
+    // `movz x16, #1` + three `movk`, then `stur x16, [x1, #8]`.
+    assert_eq!(
+        body[4], 0xf800_8030,
+        "a non-arena store must keep the plain addressing shape, got {:08x}",
+        body[4]
+    );
+    assert!(c.faults.0.is_empty());
+}
+
+#[test]
+fn a64_an_arena_access_the_emitter_cannot_shape_is_refused() {
+    // Fail-closed, and specifically not by falling through to the plain
+    // lowering — which would be a bare dereference of a handle.
+    let prog = crate::tests::verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::W,
+                dst: r(1),
+                off: 8,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    assert!(matches!(
+        aarch64::compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
 }
 
 // ── differential: reference evaluator vs. emulated native code ───────

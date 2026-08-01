@@ -178,8 +178,8 @@ pub(crate) fn verified_arena(
 
 #[test]
 fn an_arena_program_reaches_its_arena_access_once_the_call_is_emitted() {
-    // This test used to assert the opposite, and the reversal is the whole
-    // point of recording it.
+    // This test has now asserted three different things, and the sequence is
+    // the point.
     //
     // `PtrClass::Arena` has exactly one producer in the verifier
     // (`fixpoint.rs`'s `value_of`, reached from a kfunc's return descriptor),
@@ -188,15 +188,15 @@ fn an_arena_program_reaches_its_arena_access_once_the_call_is_emitted() {
     // at instruction 0 — before any arena lowering was reached, which is why
     // lifting `jit_glue` gate 2 alone would have compiled nothing.
     //
-    // That is no longer true. The call is emitted, so the emitter now walks
-    // straight past it into the arena store and lowers that store to a **bare
-    // dereference of the handle** — `mov qword [rax + 0], 1`, where `rax` holds
-    // a slot-relative handle and not an address. With `ARENA_BASE_HANDLE` at
-    // 4096 that is a near-null kernel write.
+    // Then the call landed and this asserted the next failure along: the store
+    // lowered to `mov qword [rax], 1`, a **bare dereference of the handle**,
+    // which with `ARENA_BASE_HANDLE` at 4096 is a near-null kernel write. Gate 2
+    // was the only thing standing between an arena program and it.
     //
-    // So gate 2 in `narf_bpf::jit_glue` is now the only thing between an arena
-    // program and that write, where before it was the second of two. Keeping it
-    // closed is load-bearing, and this is the test that says why.
+    // Now the lowering exists, and this pins it: the slot base is reloaded, the
+    // handle is zero-extended into the index, and the access is
+    // `[r11 + rcx]` — with no displacement, because the emitter folds `off16`
+    // into `rcx` so the arena-fault epilogue can return the handle.
     let prog = {
         let mut v = verified_arena(
             &[
@@ -218,65 +218,41 @@ fn an_arena_program_reaches_its_arena_access_once_the_call_is_emitted() {
     };
     let c = compile(&prog).expect("the call is emitted now, and the store always was");
     let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
-    // 19 bytes of call sequence, then the store.
+    // 19 bytes of call sequence, then the arena store.
     assert_eq!(
-        &body[19..26],
-        // 48 C7 00 01 00 00 00 — mov qword [rax], 1. R0 maps to rax; no
-        // displacement, no index register, no arena base.
-        &[0x48, 0xC7, 0x00, 0x01, 0x00, 0x00, 0x00],
-        "an arena store must not lower to a bare dereference of the handle"
-    );
-}
-
-#[test]
-fn the_emitter_discards_the_verifiers_arena_fault_sites() {
-    // Why gate 3 has to stay closed for arena programs, stated as a property
-    // of the emitter instead of as a comment.
-    //
-    // Handed a program the verifier flagged as needing exception-table
-    // coverage, the emitter returns an **empty** `FaultTable`. `jit_glue`
-    // registers exactly what codegen hands it, so a lifted gate 3 would seal
-    // executable text with no entry for an instruction the verifier said can
-    // fault — and `bpf_extable`'s contract makes an unregistered fault fatal by
-    // design.
-    let prog = verified_arena(
+        &body[19..33],
         &[
-            Decoded::Store {
-                size: Size::Dw,
-                dst: r(1),
-                off: 8,
-                src: Source::Imm(1),
-            },
-            mov(0, 0),
-            EXIT,
+            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]  — the parked slot base
+            0x89, 0xC1, // mov ecx, eax    — zero-extend the handle
+            // 49 C7 04 0B 01 00 00 00 — mov qword [r11 + rcx*1], 1
+            0x49, 0xC7, 0x04, 0x0B, 0x01, 0x00, 0x00, 0x00,
         ],
-        0,
-        None,
+        "an arena store must lower to the slot-relative shape, never a bare \
+         dereference of the handle"
     );
-    let c = compile(&prog).expect("the store alone is an ordinary encoding");
-    assert_eq!(
-        prog.fault_sites.len(),
-        1,
-        "premise: the verifier recorded a site to cover"
-    );
+    // …and it is covered, resuming at the arena epilogue rather than at the
+    // next instruction.
+    assert_eq!(c.faults.0.len(), 1, "the arena store must be a fault site");
+    let f = c.faults.0[0];
+    assert!(f.arena);
+    assert_eq!(f.dst_host_reg, None, "a store has no destination to zero");
     assert!(
-        c.faults.0.is_empty(),
-        "codegen must be taught to record arena fault sites before gate 3 lifts"
+        f.fixup_off > f.fault_off,
+        "the fixup must be the arena epilogue, which follows the body"
     );
 }
 
 #[test]
-fn an_arena_access_lowers_to_a_bare_dereference_of_the_handle() {
-    // Why gate 2 has to stay closed, as bytes rather than as prose.
+fn the_arena_fixup_is_the_epilogue_and_not_the_next_instruction() {
+    // The property that separates this from Linux's `ex_handler_bpf`, as an
+    // offset rather than as prose: a probe read zeroes and continues, an arena
+    // fault *stops*. Resuming at the next instruction would make an
+    // out-of-bounds arena access return a value natively and
+    // `Trap::ArenaOutOfBounds` interpreted — the divergence the differential
+    // harness compares trap discriminants to catch.
     //
-    // An in-program arena pointer is a *slot-relative handle*, so the address
-    // is `slot_base + handle + off16` — Linux's `[r12 + reg + off]` shape. The
-    // emitter has no pinned base register, so the same instruction lowers to
-    // `[rsi + 8]`: the handle dereferenced as if it were an absolute address.
-    // With `ARENA_BASE_HANDLE` at 4096 that is a near-null kernel write.
-    //
-    // The golden bytes are the point. When the arena lowering lands this test
-    // goes red, and its replacement must show a base register in the encoding.
+    // Mutation: set `fixup_off` to the instruction after the access and this
+    // goes red, as does `smoke_bpf_jit_diff_arena_out_of_bounds_traps_like_the_interpreter`.
     let prog = verified_arena(
         &[
             Decoded::Store {
@@ -291,15 +267,185 @@ fn an_arena_access_lowers_to_a_bare_dereference_of_the_handle() {
         0,
         None,
     );
-    let c = compile(&prog).expect("compiles today");
+    let c = compile(&prog).expect("the arena store is emitted now");
+    assert_eq!(c.faults.0.len(), 1);
+    let f = c.faults.0[0];
+    // The last instruction of the image is the arena epilogue's `ret`, and the
+    // epilogue is `mov rax, rcx; mov rdx, 2; RESTORE`.
+    let arena_epi = c.code.len() - (3 + 10 + RESTORE.len());
+    assert_eq!(
+        f.fixup_off as usize, arena_epi,
+        "the fixup must name the arena epilogue"
+    );
+    assert_eq!(
+        &c.code[arena_epi..arena_epi + 13],
+        &[
+            0x48, 0x89, 0xC8, // mov rax, rcx  — the offending handle
+            0x48, 0xBA, 0x02, 0, 0, 0, 0, 0, 0, 0, // mov rdx, 2 (ARENA_FAULT)
+        ],
+        "the arena epilogue must return the handle and the arena status"
+    );
+}
+
+#[test]
+fn an_arena_access_lowers_to_the_slot_relative_shape() {
+    // The counterpart of the test above, in bytes, for a *non*-zero
+    // displacement — which is the case that shows the fold into `rcx`.
+    //
+    // An in-program arena pointer is a slot-relative handle, so the address is
+    // `slot_base + handle + off16`. `off16` could have stayed in the ModRM
+    // displacement; folding it into the index costs one instruction and is what
+    // lets the arena-fault epilogue name the handle the interpreter would have
+    // computed, rather than the handle-minus-displacement.
+    let prog = verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(2),
+                off: 8,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..21],
+        &[
+            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x89, 0xF1, // mov ecx, esi   — R2 is rsi; zero-extended
+            0x48, 0x81, 0xC1, 0x08, 0x00, 0x00, 0x00, // add rcx, 8
+            // 49 C7 04 0B 01 00 00 00 — mov qword [r11 + rcx*1], 1
+            0x49, 0xC7, 0x04, 0x0B, 0x01, 0x00, 0x00, 0x00,
+        ],
+        "the displacement must be folded into the index register"
+    );
+}
+
+#[test]
+fn a_non_arena_access_keeps_the_plain_shape() {
+    // The other half: lifting gate 2 must not give *every* access the arena
+    // shape. Same instruction, same registers, no fault site — and it lowers to
+    // the ordinary `[base + disp]` with no slot base in sight.
+    //
+    // Without this, an emitter that ignored `arena_access_map` and always took
+    // the arena path would pass every test above.
+    let prog = verified(&[
+        Decoded::Store {
+            size: Size::Dw,
+            dst: r(2),
+            off: 8,
+            src: Source::Imm(1),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
     let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
     assert_eq!(
         &body[..8],
-        // 48 C7 46 08 01 00 00 00 — mov qword [rsi+8], 1. R2 maps to rsi; no
-        // index register, no arena base.
+        // 48 C7 46 08 01 00 00 00 — mov qword [rsi+8], 1
         &[0x48, 0xC7, 0x46, 0x08, 0x01, 0x00, 0x00, 0x00],
-        "an arena store must not lower to a bare dereference of the handle"
+        "a non-arena store must keep the plain addressing shape"
     );
+    assert!(
+        c.faults.0.is_empty(),
+        "a non-arena access is not a fault site"
+    );
+}
+
+#[test]
+fn an_arena_load_and_a_register_store_take_the_same_shape() {
+    // The two remaining arena forms, so the golden coverage is the whole set
+    // rather than the one form the smoke tests happen to use.
+    let load = verified_arena(
+        &[
+            Decoded::Load {
+                size: Size::Dw,
+                sign_extend: false,
+                dst: r(3),
+                src: r(2),
+                off: 0,
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        Some(3),
+    );
+    let c = compile(&load).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..9],
+        &[
+            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x89, 0xF1, // mov ecx, esi
+            0x49, 0x8B, 0x14, // mov rdx, [r11 + rcx*1] — R3 is rdx
+        ],
+        "an arena load must take the slot-relative shape"
+    );
+    assert_eq!(body[9], 0x0B, "SIB: index rcx, base r11");
+    // The destination is *not* recorded for zeroing: an arena fault stops the
+    // program, so nothing would ever read it. The verifier's `dst_reg` is
+    // deliberately dropped here.
+    assert_eq!(c.faults.0.len(), 1);
+    assert_eq!(c.faults.0[0].dst_host_reg, None);
+
+    let store = verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(2),
+                off: 0,
+                src: Source::Reg(r(3)),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&store).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..10],
+        &[
+            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x89, 0xF1, // mov ecx, esi
+            0x49, 0x89, 0x14, 0x0B, // mov [r11 + rcx*1], rdx
+        ],
+        "an arena register store must take the slot-relative shape"
+    );
+}
+
+#[test]
+fn an_arena_access_the_emitter_cannot_shape_is_refused() {
+    // Fail-closed, and specifically *not* by falling through to the plain
+    // lowering. A word-sized arena store has no arena encoding here, and the
+    // wrong answer would be `mov dword [rsi+8], 1` — a bare dereference of a
+    // handle, which is the whole hazard.
+    let prog = verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::W,
+                dst: r(2),
+                off: 8,
+                src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    assert!(matches!(
+        compile(&prog),
+        Err(JitError::Unsupported { at: 0, .. })
+    ));
 }
 
 /// The prologue, hand-derived from the Intel SDM.
@@ -314,6 +460,10 @@ fn an_arena_access_lowers_to_a_bare_dereference_of_the_handle() {
 ///
 /// `r12` holds the fuel counter and is likewise callee-saved. `mov r12, rdx`
 /// runs before anything can write rdx, which R3 maps to.
+///
+/// `mov [rsp], rcx` parks the arena slot base in the alignment padding, and
+/// likewise has to run before anything writes `rcx` — a variable shift and a
+/// kfunc call both do.
 const PROLOGUE: &[u8] = &[
     0x55, // push rbp
     0x53, // push rbx
@@ -322,6 +472,7 @@ const PROLOGUE: &[u8] = &[
     0x41, 0x56, // push r14
     0x41, 0x57, // push r15
     0x48, 0x83, 0xEC, 0x08, // sub rsp, 8     (SysV alignment; see STACK_ALIGN_PAD)
+    0x48, 0x89, 0x0C, 0x24, // mov [rsp], rcx (the arena slot base; ARENA_BASE_SLOT)
     0x49, 0x89, 0xD4, // mov r12, rdx   (fuel)
     0x48, 0x89, 0xFD, // mov rbp, rdi
     0x48, 0x89, 0xF7, // mov rdi, rsi
@@ -907,6 +1058,20 @@ fn rsp_delta(bytes: &[u8]) -> i64 {
             }
             0x48 if bytes[k + 1] == 0x83 && bytes[k + 2] == 0xC4 => {
                 delta += i64::from(bytes[k + 3]);
+                k += 4;
+            }
+            // REX + 89 /r with mod=00, rm=100 — a store *through* rsp, which is
+            // the arena-base park (`mov [rsp], rcx`). It reads rsp and does not
+            // move it, so it contributes nothing to the delta; the SIB byte is
+            // what makes it four bytes long. Matched before the register-move
+            // arm below, which would otherwise mistake the ModRM for one naming
+            // rsp as a destination.
+            0x48..=0x4F
+                if bytes[k + 1] == 0x89
+                    && bytes[k + 2] & 0xC0 == 0x00
+                    && bytes[k + 2] & 7 == 4
+                    && bytes[k + 3] == 0x24 =>
+            {
                 k += 4;
             }
             // REX + 89 /r — a register move. Cannot touch rsp: rsp is r/m
