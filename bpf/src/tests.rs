@@ -1708,6 +1708,81 @@ kernel_test_in!(
     smoke_bpf_jit_arena_reachable_set_is_inside_the_slot_guards
 );
 
+fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
+    // `try_compile`'s relaxed predicates, tested directly rather than through a
+    // program — because one of them is **not reachable through a program at
+    // all**, and a gate nothing can exercise is a gate nothing is testing.
+    //
+    // Gate 3 now reads "no *non*-arena fault site". Today every fault site the
+    // verifier can emit is an arena one: `fixpoint.rs` pushes a `FaultSite` only
+    // under `p.class.is_faulting()`, and the other faulting class,
+    // `PtrClass::Object`, returns `OpaqueDeref` before reaching the push. So the
+    // `!f.arena` clause is dead through the verifier and stays correct only if
+    // something checks it. Probe reads are what will make it live, and they have
+    // no lowering on either backend — a fault site the emitter did not produce
+    // would be sealed as executable text with no extable entry covering it,
+    // which `bpf_extable`'s contract makes fatal by design.
+    //
+    // Mutation: delete the `!f.arena` filter and the first case goes red. Delete
+    // the `arena_count != 1` test and the last two do.
+    use narf_bpf_verifier::{FaultSite, VerifiedProgram};
+    let base = |arena: bool| VerifiedProgram {
+        // A doubleword store through R1, which is an admissible base in a
+        // program with no `call` — so gate 5 is not what refuses any of the
+        // cases below, and each one isolates the gate it names.
+        insns: asm(&[st_imm(1, 0, 5), mov_imm(0, 1), EXIT]),
+        context: Context::Atomic,
+        max_stack_bytes: 8,
+        initial_fuel: 64,
+        fault_sites: alloc::vec![FaultSite {
+            insn_index: 0,
+            dst_reg: Some(0),
+            arena,
+        }],
+        subprogs: alloc::vec::Vec::new(),
+        uses_arena: arena,
+        kfunc_calls: alloc::vec::Vec::new(),
+    };
+
+    // Gate 3: a probe read — a fault site that is not an arena access — is
+    // refused, and named as such.
+    if crate::jit_glue::try_compile(&base(false), true, 0).err()
+        != Some(crate::jit_glue::JitSkip::HasFaultSites)
+    {
+        return TestResult::Fail("a non-arena fault site must still be refused by gate 3");
+    }
+    // Gate 2: an arena program with no arena has no slot base to be entered
+    // with, and one with two has the straddling divergence.
+    for n in [0usize, 2, 3] {
+        if crate::jit_glue::try_compile(&base(true), true, n).err()
+            != Some(crate::jit_glue::JitSkip::UsesArena)
+        {
+            return TestResult::Fail("gate 2 must refuse any arena count other than one");
+        }
+    }
+    // And a gate that refuses everything is not a gate: the same program with
+    // exactly one arena is accepted, so the two refusals above are about the
+    // count and the flag rather than about arena programs in general.
+    match crate::jit_glue::try_compile(&base(true), true, 1) {
+        Ok(image) => {
+            // …and the emitted image really does contain the arena shape, so
+            // `run_atomic`'s belt will demand a slot base for it. An `Ok` whose
+            // image had no arena access would mean the emitter had quietly
+            // lowered the store as a bare dereference.
+            if !image.uses_arena() {
+                return TestResult::Fail("the compiled image contains no arena access");
+            }
+        }
+        Err(_) if !narf_bpf_jit::has_backend() => return TestResult::Skip(NO_BACKEND),
+        Err(_) => return TestResult::Fail("exactly one arena must be accepted"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_jit_gates_two_and_three_refuse_what_they_name
+);
+
 /// Immediates chosen for sign-extension and shift-count boundaries.
 const SWEEP_IMMS: [i32; 10] = [0, 1, -1, 2, -2, 7, 31, 32, 63, 64];
 /// Wider boundaries, for the operands rather than the counts.
