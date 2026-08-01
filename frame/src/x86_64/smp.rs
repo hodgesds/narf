@@ -173,6 +173,16 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         narf_arch::x86_64::cpu::set_current_cpu(id);
     }
 
+    // 1.1 CR0.WP is per-CPU state: an AP that skipped this would keep
+    //     ignoring read-only kernel mappings, so a BPF prog pack sealed by the
+    //     BSP would still be writable from here. Set it before anything else
+    //     on this AP runs. The BSP's twin is in `bare_main` right after the
+    //     MMU handoff.
+    // SAFETY: CPL=0, during this AP's own bring-up.
+    unsafe {
+        narf_memory::text_poke::enable_write_protect();
+    }
+
     // 1.5 Load the BSP-built IDT *before* any per-silicon errata. The errata
     //     apply path writes AMD DE_CFG chicken bits via `wrmsr_or_gp`, a
     //     recoverable write that arms a per-CPU #GP probe (keyed by

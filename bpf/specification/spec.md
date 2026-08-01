@@ -190,19 +190,24 @@ call from `bare_main.rs` after MMU init, *not* a staged initcall. A
 `debug_assert` in `new_user_pml4_on` checks both slots are present so a future
 reordering fails loudly.
 
-**4.2 — JIT text is mapped RX at its own VA, and it is a *partial* security
-boundary: no executable alias, but still a writable one.** Per assumption 2.4
-every kernel window is NX apart from kernel text and the AP trampoline, so the
-pack's frames are aliased RW+NX and the bytes are executable at exactly one
-address. What that buys: an attacker with an arbitrary kernel write can no
-longer turn heap, stack or buddy memory into code anywhere in the kernel. What
-it does not buy: the same attacker can still overwrite the pack's bytes
-through the alias, and they are live text. Strict W^X for JIT text is
-therefore still incomplete — see §8.6 for exactly what is missing.
+**4.2 — JIT text is mapped RX at its own VA, with no writable and no
+executable alias.** Per assumption 2.4 every kernel window is NX apart from
+kernel text and the AP trampoline, so the bytes are executable at exactly one
+address; and `seal` makes every kernel window that aliases the pack's frames
+read-only, so they are writable at none. An attacker with an arbitrary kernel
+write can neither turn heap, stack or buddy memory into code nor overwrite live
+JIT text.
 
-Consequence for the code: the RW→RX publish still writes *through the alias*,
-so no `text_poke_copy` equivalent exists. That stays true only while the alias
-is writable; §8.6's item 1 and item 2 have to land together.
+Consequence for the code: the RW→RX publish can no longer write *through the
+alias*, so a `text_poke_copy` equivalent exists — `text_poke::poke_copy`, a
+transient per-CPU RW+NX window over one frame at a time. §8.6's item 1 and
+item 2 landed together for exactly that reason.
+
+The one range where this is weaker: an aarch64 **fallback** pack (scattered
+4 KiB frames, built only when the hugepage pool is empty) keeps its writable
+alias, because making it read-only would mean a break-before-make on a live
+block descriptor in the kernel's own linear map. §8.6 states the trade and what
+closing it would cost.
 
 **4.3 — Extable registration precedes execution.** Every faulting instruction
 the JIT emits has an `ExEntry` registered *before* `seal()` publishes the text
@@ -370,23 +375,94 @@ and the perf event layer, all of which are closed.
    proved to `#PF` with the instruction-fetch bit set, and the AP-trampoline
    window is proved executable at 4 KiB granularity with the next page NX.
 
-   What is left is the *writable* half, which the NX work does not touch:
+   The *writable* half is now **done for hugepage-backed packs on both
+   arches**, which is every pack the allocator builds unless the boot-time
+   hugepage reservation came up empty. `memory/src/text_poke.rs` carries both
+   halves, and they landed together because neither is useful alone — (1)
+   without (2) breaks program loading, and (2) without (1) is a mechanism
+   guarding nothing.
 
-   1. **`seal` must make the pack's alias read-only.** That is a split of a
-      **live** identity leaf (the pack's frames can be anywhere in RAM), so
-      unlike the boot-time demotion it needs a shootdown — `tlb_shootdown.rs`
-      `shootdown_range` — and Linux's `__split_large_page`
-      (`arch/x86/mm/pageattr.c`) argument for why installing a table that
-      translates identically to the huge leaf it replaces is safe without
-      break-before-make.
-   2. **A `text_poke_copy` equivalent**, because every allocation after the
-      first in a pack is written into already-sealed text, and once (1) lands
-      `write` has no writable address left to use. A temporary RW+NX alias of
-      the pack's frames at a scratch kernel VA, torn down before the call
-      returns, is the narrow form.
+   1. **`seal` makes the pack's alias read-only.** `text_poke::protect_ro`
+      walks every kernel window that aliases the pack's frames — the low
+      identity map, the higher-half kernel window (phys 0..1 GiB), and the
+      direct map when a >512 GiB machine has one — and clears `WRITABLE` /
+      sets `AP_RO_EL1` on each. Where a live huge leaf is in the way on
+      x86_64 it is split, following `__split_large_page`
+      (`arch/x86/mm/pat/set_memory.c:1121`): the replacement table is filled
+      with translations *identical* to the leaf it replaces, so Intel's TLB
+      application note — which makes behaviour undefined only when the large
+      and small translations **differ** — does not bite, and the swap is one
+      naturally-aligned 8-byte store. The attribute change happens only after
+      a **synchronous** global flush (`flush_user_tlb_all_cpus`, which spins
+      for every peer's ack via `shoot_full`), exactly Linux's
+      split → `flush_tlb_all()` → change ordering. `bpf_text`'s `PACKS` lock
+      plays the part of `cpa_lock`.
 
-   Neither is useful alone: (1) without (2) breaks program loading, and (2)
-   without (1) is a mechanism guarding nothing.
+      x86_64 additionally needed **`CR0.WP`**, which NARF's boot path never
+      set — measured `CR0` was `0x80000011`. Without it a supervisor store
+      ignores the R/W bit (Intel SDM Vol 3 §4.6.1) and a read-only alias is
+      decoration. `text_poke::enable_write_protect` sets it on the BSP
+      (`bare_main`, right after the MMU handoff) and on every AP
+      (`_ap_start_rust`), because `WP` is per-CPU state.
+
+   2. **A `text_poke_copy` equivalent.** `text_poke::poke_copy` maps **one
+      4 KiB frame at a time** RW+NX at a **per-CPU** scratch VA above the pack
+      region in the BPF text slot, copies, and unmaps before returning. Per-CPU
+      rather than global so only its owner can ever form a translation for it,
+      which is what makes a local `INVLPG` sufficient — the same reason Linux's
+      `text_poke` uses a per-CPU fixmap slot. `write` and the freed-program
+      trap fill both route through it once the pack's alias is protected.
+      `reclaim` calls `protect_rw` before releasing the frames, or the next
+      owner of the frame would inherit a read-only alias.
+
+   **What remains open: aarch64 fallback packs — which in the default
+   configuration is *every* aarch64 pack.** State it that way rather than as a
+   corner case, because the hugepage pool is populated only by `hugepages_2m=N`
+   on the cmdline (`bare_main.rs`), and neither the test runner nor a default
+   boot passes it. So `alloc_hugepage_2m_on` fails, `new_pack` takes the
+   `PACK_SMALL_BYTES` arm, and every pack is 16 scattered 4 KiB frames.
+
+   On x86_64 that is fine — those frames *are* protected, via one extra
+   2 MiB → 4 KiB demotion, which is the same mechanism as the 1 GiB → 2 MiB one
+   and carries no additional architectural risk. On aarch64 it is not: NARF's
+   linear map is built by `boot.S` at 2 MiB block granularity, so protecting one
+   4 KiB frame would mean splitting a live block, and ARMv8 requires
+   break-before-make when a translation's block size changes. A BBM on the
+   linear map would unmap live kernel memory on every other CPU for the
+   duration — far worse than the gap. Linux arm64 declines the identical split
+   for the identical reason: it does not split the linear map, it boots it
+   page-mapped up front when it knows it will need to change permissions
+   (`rodata_full` / `can_set_direct_map()`). `text_poke::can_protect` therefore
+   refuses sub-block ranges on aarch64, `seal` leaves `Pack::alias_ro` false,
+   and the pack keeps its writable alias rather than the kernel taking a TLB
+   conflict abort.
+
+   Net effect today: **on aarch64 the pack-level protection engages only for
+   hugepage-backed packs, i.e. only when the kernel is booted with
+   `hugepages_2m=N`.** The mechanism itself is verified on aarch64 regardless —
+   `smoke_text_poke_protect_round_trip` protects and restores a 2 MiB-aligned
+   buddy block directly — but the `bpf_text` smokes skip there, and they say so
+   rather than passing.
+
+   Two ways to close it, in increasing order of cost. The cheap one is to make
+   the fallback pack a **2 MiB-aligned, 2 MiB contiguous buddy block**
+   (`frame::alloc_pages_on(node, 9)` / `free_pages`, a new `Backing` variant
+   mapped with `map_2mb`) instead of 16 scattered 4 KiB frames: every pack then
+   lands on exactly one block descriptor, aarch64 needs no split at all, and
+   x86_64 stops needing the 2 MiB → 4 KiB level too. The thorough one is to
+   build the aarch64 kernel RAM window at 4 KiB granularity at boot — the trade
+   Linux makes — which is a change to `boot.S`, not to this module.
+
+   Pinned by `memory/src/bpf_text.rs`
+   (`smoke_bpf_text_sealed_alias_is_unwritable`,
+   `smoke_bpf_text_sealed_alias_write_faults`,
+   `smoke_bpf_text_second_alloc_in_sealed_pack_runs`,
+   `smoke_bpf_text_reclaim_restores_writable_alias`) and
+   `memory/src/text_poke.rs` (`smoke_text_poke_write_protect_is_on`,
+   `smoke_text_poke_window_is_transient`). The first pair is the load-bearing
+   one: the write that worked before this change is performed through the
+   linear alias and required to `#PF` with the present+write error bits set,
+   with the byte proved unchanged afterwards.
 7. ~~**Fuel accounting granularity**~~ — **resolved: per instruction.** Per
    back-edge bounds iterations rather than work: 65536 straight-line
    instructions cost one unit, so the default tank permitted ~7e10
