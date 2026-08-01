@@ -56,6 +56,30 @@ pub trait BpfObject: 'static {
 
     /// Stable identity, derived from [`Self::TYPE_NAME`].
     const TYPE_KEY: TypeKey = TypeKey(fnv1a32_nonzero(Self::TYPE_NAME));
+
+    /// Give back one reference an acquiring kfunc took.
+    ///
+    /// Required rather than defaulted, and here rather than beside the kfunc
+    /// that acquires: [`Owned<T>`]'s `Drop` is the only caller, so "a type BPF
+    /// can hold a reference to" and "a type that has said how to give one
+    /// back" are the same statement. That is what stops the verifier's model
+    /// — *an `Owned<T>` in argument position is consumed* — and the kernel's
+    /// behaviour from being two facts someone has to keep in step: consuming
+    /// the handle **is** releasing the reference.
+    ///
+    /// A defaulted no-op would have been the worst of both: every acquire
+    /// would leak a refcount, and the verifier would go on cheerfully proving
+    /// that each one was released.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be non-null and must carry a reference the caller owns and
+    /// is giving up, and must not already have been released. That is exactly
+    /// the obligation the verifier discharges at a release site — the register
+    /// holds a `ref_id` it has seen acquired and not yet released — which is
+    /// why this is sound to call from a kfunc shim and nowhere else without an
+    /// argument of its own.
+    unsafe fn release_owned(ptr: *mut Self);
 }
 
 /// FNV-1a over the name, forced non-zero because `TypeKey(0)` is reserved for
@@ -234,6 +258,27 @@ unsafe impl<T: BpfObject> BpfType for Trusted<T> {
 /// `KF_RELEASE` pair to keep in sync: in return position this acquires a
 /// reference, in argument position it consumes one. See
 /// `ArgDesc::consumes_in_arg_position`.
+///
+/// ## Linear on this side too
+///
+/// The verifier's half of that story is bookkeeping — `st.refs`, a `ref_id`
+/// per pointer, [`VerifyError::LeakedReference`] at exit. This type is the
+/// other half, and it is a *type* rather than a second piece of bookkeeping:
+/// dropping an `Owned<T>` calls [`BpfObject::release_owned`], so
+///
+///   * a release kfunc whose body forgot to do anything still releases, and
+///   * a kfunc that takes an `Owned<T>` and does *not* mean to release one
+///     cannot be written — which is precisely what the verifier's positional
+///     rule assumes when it strikes the reference off at that call site.
+///
+/// The one place the release must **not** happen is on the way out to a
+/// program, which is why [`BpfType::into_raw`] goes through
+/// [`Owned::into_owned_ptr`] rather than letting `self` fall off the end of
+/// the function. Getting that backwards would hand every program a reference
+/// that had already been given back — a use-after-free the verifier cannot
+/// see, because from its side the program did everything right.
+///
+/// [`VerifyError::LeakedReference`]: narf_bpf_verifier::VerifyError::LeakedReference
 #[derive(Debug)]
 pub struct Owned<T: BpfObject> {
     ptr: NonNull<T>,
@@ -245,7 +290,8 @@ impl<T: BpfObject> Owned<T> {
     /// # Safety
     ///
     /// `ptr` must be non-null and must carry a reference the caller owns and
-    /// is transferring.
+    /// is transferring. The reference is now this handle's, and dropping the
+    /// handle gives it back.
     #[inline]
     pub unsafe fn from_owned_ptr(ptr: *mut T) -> Self {
         Self {
@@ -259,6 +305,36 @@ impl<T: BpfObject> Owned<T> {
     #[must_use]
     pub fn as_ptr(&self) -> *mut T {
         self.ptr.as_ptr()
+    }
+
+    /// Give the reference away without releasing it.
+    ///
+    /// The inverse of [`Owned::from_owned_ptr`], and the only way out of the
+    /// linearity: the caller takes on the obligation to release exactly once.
+    /// [`BpfType::into_raw`] is the sole in-tree caller, and the party it
+    /// hands the obligation to is the *program*, which the verifier then holds
+    /// to it.
+    #[inline]
+    #[must_use]
+    pub fn into_owned_ptr(self) -> *mut T {
+        // `ManuallyDrop`, not `mem::forget(self)` after reading the field:
+        // reading a field out of a `Drop` type is what needs the dance, and
+        // this way there is no window in which both a copy of the pointer and
+        // a live `Owned` exist.
+        let me = core::mem::ManuallyDrop::new(self);
+        me.ptr.as_ptr()
+    }
+}
+
+impl<T: BpfObject> Drop for Owned<T> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: the type's invariant — an `Owned<T>` exists only where a
+        // reference was transferred into it (`from_owned_ptr`, or `from_raw`
+        // at a call site the verifier proved still holds one) and has not been
+        // given away (`into_owned_ptr` consumes `self`). So this runs exactly
+        // once per acquire, on a pointer that is still non-null and live.
+        unsafe { T::release_owned(self.ptr.as_ptr()) }
     }
 }
 
@@ -276,13 +352,19 @@ unsafe impl<T: BpfObject> BpfType for Owned<T> {
     unsafe fn from_raw(raw: u64, _next: u64) -> Self {
         Self {
             // SAFETY: the verifier tracks acquired references and proves this
-            // register still holds one at the release site.
+            // register still holds one at the release site. Reconstituting the
+            // handle here is what *takes* that reference back into Rust's
+            // hands, which is why the kfunc body need not do anything: the
+            // handle's `Drop` releases it.
             ptr: unsafe { NonNull::new_unchecked(raw as *mut T) },
         }
     }
     #[inline]
     fn into_raw(self) -> u64 {
-        self.ptr.as_ptr() as u64
+        // Must not release: this is the acquiring shim on its way to R0, and
+        // the reference is what it is handing the program. See the note on
+        // [`Owned`].
+        self.into_owned_ptr() as u64
     }
 }
 

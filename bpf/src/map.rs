@@ -959,7 +959,32 @@ pub struct BpfMap {
     ops: MapImpl,
     /// Bytes charged to the creating task's cgroup, to uncharge on drop.
     charged: u64,
+    /// References currently held by running BPF programs — see
+    /// [`MAX_BPF_PINS`] and [`narf_map_acquire`].
+    bpf_pins: AtomicU32,
 }
+
+/// How many references one map may have out to BPF programs at once.
+///
+/// A program can call [`narf_map_acquire`] in a loop, and every call is an
+/// `Arc` increment. Unbounded, a long-running program overflows the refcount
+/// and the wrap frees a live map — the shape of a whole family of Linux
+/// refcount bugs, and why `bpf_map_inc_not_zero` and its neighbours are
+/// bounded there too.
+///
+/// The bound is what makes the acquire *fallible*, and therefore what makes
+/// `Option<Owned<BpfMap>>` — and the null-check obligation the verifier hangs
+/// on it — honest rather than decorative. An infallible acquire would have
+/// wanted a bare `Owned<BpfMap>` return, and the program would have had
+/// nothing to test.
+///
+/// // LINUX-GAP: Linux's bound is `INT_MAX`-ish and enforced by refusing to
+/// increment past it; this is far lower, because the only legitimate holder
+/// of a BPF pin is a program that is *currently running* and the verifier
+/// requires it to release before exit. A program needing a thousand
+/// simultaneous references to one map is doing something the reference model
+/// does not have in mind.
+pub const MAX_BPF_PINS: u32 = 1024;
 
 /// Static dispatch over the four kinds.
 ///
@@ -1023,6 +1048,7 @@ impl BpfMap {
             name,
             ops,
             charged,
+            bpf_pins: AtomicU32::new(0),
         });
         // Publish the id → map direction for `BPF_MAP_GET_FD_BY_ID`. Same
         // reasoning as `BpfProg::load_with_arena`: registering here rather than
@@ -1046,6 +1072,31 @@ impl BpfMap {
     pub fn attr(&self) -> MapAttr {
         self.ops().attr()
     }
+
+    /// How many references running BPF programs currently hold.
+    ///
+    /// Separate from the `Arc` strong count, which also moves for fds and for
+    /// `BpfProg::maps` and so cannot distinguish "the program released" from
+    /// "someone closed an fd". This one counts exactly the acquires that must
+    /// be matched by a release, which is what makes the pair observable from a
+    /// test at all.
+    #[must_use]
+    pub fn bpf_pins(&self) -> u32 {
+        self.bpf_pins.load(Ordering::Relaxed)
+    }
+
+    /// Claim one BPF pin, refusing at [`MAX_BPF_PINS`].
+    ///
+    /// A CAS loop rather than a `fetch_add` with an after-the-fact check: an
+    /// unconditional add is momentarily over the cap, and a concurrent reader
+    /// of `bpf_pins()` would see a count the invariant says cannot happen.
+    fn pin(&self) -> bool {
+        self.bpf_pins
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_BPF_PINS).then_some(n + 1)
+            })
+            .is_ok()
+    }
 }
 
 /// A map is the pointee of the opaque handle `LD_IMM64`'s map pseudo-forms
@@ -1057,6 +1108,23 @@ impl BpfMap {
 /// silently unresolvable kfunc argument.
 impl crate::types::BpfObject for BpfMap {
     const TYPE_NAME: &'static str = narf_bpf_verifier::MAP_HANDLE_TYPE_NAME;
+
+    unsafe fn release_owned(ptr: *mut Self) {
+        // The pin comes off *before* the strong count, because the strong
+        // count is what keeps `ptr` dereferenceable — touching `bpf_pins`
+        // afterwards would be a use-after-free in exactly the case
+        // `narf_map_acquire`'s note argues cannot arise, which is not a good
+        // enough reason to write it in that order.
+        //
+        // SAFETY: the caller transfers a reference it owns, so the map is live
+        // for the duration of this call.
+        unsafe { (*ptr).bpf_pins.fetch_sub(1, Ordering::AcqRel) };
+        // SAFETY: `ptr` is the data pointer of the same `Arc<BpfMap>`
+        // allocation `narf_map_acquire` incremented — `Vm::map_addr` hands out
+        // `Arc::as_ptr`, which is the pointer `Arc::into_raw` would produce —
+        // and it carries the strong reference that increment took.
+        unsafe { Arc::decrement_strong_count(ptr.cast_const()) };
+    }
 }
 
 const _: () = assert!(
@@ -1317,5 +1385,79 @@ crate::kfunc! {
             Ok(()) => 0,
             Err(e) => kfunc_err(e),
         }
+    }
+}
+
+// ── acquire / release ───────────────────────────────────────────────
+
+crate::kfunc! {
+    /// Take a reference to `map` that outlives the current non-preemptible
+    /// region.
+    ///
+    /// This is the acquiring half of NARF's reference story, and the whole of
+    /// its declaration is the signature. `Owned<T>` in *return* position is
+    /// Linux's `KF_ACQUIRE`; `Option<_>` is `KF_RET_NULL`. There is no flag
+    /// here to forget and no BTF parameter-name suffix to misspell —
+    /// `kfunc!` writes down `<Option<Owned<BpfMap>> as BpfType>::DESC` and the
+    /// verifier reads that same descriptor back out of the registry.
+    ///
+    /// `None` when the map already has [`MAX_BPF_PINS`] BPF references out;
+    /// see there for why the cap is what makes the `Option` mean something.
+    ///
+    /// ## Why the matching release can never free
+    ///
+    /// `bpf/specification/spec.md` §4.6 forbids the global allocator on the
+    /// program-run path, and dropping the *last* `Arc<BpfMap>` would call it.
+    /// It cannot be the last one here. The only pointer the verifier admits
+    /// for this parameter is `LD_IMM64`'s map pseudo-form, which it resolves
+    /// against `Program::maps` and the interpreter resolves against
+    /// `BpfProg::maps` — a strong `Arc` the program holds for its whole life,
+    /// not merely for this run. So whenever a program can reach either half of
+    /// the pair, at least one other strong reference is live, and both halves
+    /// are a bare `fetch_add`/`fetch_sub` with no deallocation reachable.
+    ///
+    /// That argument is a property of *which pointers the verifier lets in*,
+    /// so it is stated here rather than assumed: a future kfunc that acquired
+    /// a map from, say, its id would not inherit it, and would need a deferred
+    /// free instead.
+    ///
+    /// // LINUX-GAP: Linux has no `bpf_map_acquire` kfunc — a program's maps
+    /// are pinned by the program and a BPF-visible refcount on one has no use
+    /// there. The pair exists here because the reference *rules* need a
+    /// production caller: before it, `ValidityDomain::Owned`,
+    /// `ArgDesc::consumes_in_arg_position`, `AbsState::refs` and
+    /// `VerifyError::LeakedReference` were exercised only against descriptors
+    /// hand-written in the verifier's own tests, and nothing proved the
+    /// `kfunc!` macro derived the same shape from a real signature.
+    #[context(Atomic)]
+    pub fn narf_map_acquire(map: crate::types::Trusted<BpfMap>) -> Option<crate::types::Owned<BpfMap>> {
+        let ptr = map.as_ptr();
+        // SAFETY: as `map_of` — the verifier proved this register holds a map
+        // handle at offset zero, and `BpfProg::maps` keeps the pointee alive
+        // for the whole run.
+        if !unsafe { &*ptr }.pin() {
+            return None;
+        }
+        // SAFETY: `ptr` is `Arc::as_ptr` of a live `Arc<BpfMap>` (same
+        // argument), which is the pointer `Arc::into_raw` would have produced,
+        // and the strong count is at least one for the duration.
+        unsafe { Arc::increment_strong_count(ptr.cast_const()) };
+        // SAFETY: the increment above is precisely the reference this handle
+        // carries, and it has not been given to anyone else.
+        Some(unsafe { crate::types::Owned::from_owned_ptr(ptr) })
+    }
+
+    /// Give back a reference [`narf_map_acquire`] took.
+    ///
+    /// The body drops the handle and does nothing else, and that is the point
+    /// rather than an omission: `Owned<T>` is linear on the kernel side, so
+    /// *consuming* it is what releases. A release kfunc whose author forgot
+    /// the refcount would still be correct, and a kfunc that took an
+    /// `Owned<T>` without meaning to release one could not be written — which
+    /// is exactly what the verifier assumes when `consumes_in_arg_position()`
+    /// strikes the reference off at this call site.
+    #[context(Atomic)]
+    pub fn narf_map_release(map: crate::types::Owned<BpfMap>) -> () {
+        drop(map);
     }
 }
