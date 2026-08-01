@@ -14,19 +14,25 @@ UEFI Runtime Services + variable + time codecs.
   - §8.5 — `ResetSystem` + `EFI_RESET_TYPE`.
   - §32.4.1 — `EFI_SIGNATURE_LIST` (Secure Boot db / dbx).
 
-No GPL / Linux source consulted.
+- Linux `/usr/src/linux/drivers/firmware/efi/runtime-wrappers.c`,
+  `/usr/src/linux/drivers/firmware/efi/vars.c`, and
+  `/usr/src/linux/fs/efivarfs/` for runtime serialization, status mapping,
+  enumeration bounds, and the filesystem-visible variable ABI.
 
 ## Surface
 
 - `time::EfiTime` / `EfiTimeCapabilities` decoders.
 - `reset::EfiResetType` enum + EFI_STATUS constants.
-- `variable::{attr, encode_name, decode_name, parse_signature_list,
+- `variable::{attr, encode_name, encode_name_ucs2, decode_name,
+  decode_name_ucs2, parse_signature_list,
   Guid, EFI_GLOBAL_VARIABLE, EFI_IMAGE_SECURITY_DATABASE_GUID,
   EFI_CERT_X509_GUID, EFI_CERT_SHA256_GUID}`.
 - `system_table::{TableHeader, signature::*, crc32_ieee,
   decode_configuration_table}`.
 - `runtime::{install, is_available, get_time, get_variable,
-  set_variable, reset_system}` provides the validated dispatch surface.
+  get_variable_with_attributes, get_next_variable, list_variables,
+  set_variable, query_variable_info, reset_system}` provides the validated
+  and allocation-bounded dispatch surface.
   It is currently dormant in production: no supported boot path preserves
   and installs the runtime-services table plus its memory descriptors.
 

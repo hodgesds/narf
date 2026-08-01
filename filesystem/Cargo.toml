@@ -27,6 +27,7 @@ narf-bus          = { path = "../bus" }
 narf-console      = { path = "../console" }
 narf-interrupts   = { path = "../interrupts" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
+narf-efi          = { path = "../efi" }
 
 [features]
 # Linux-shaped mount/bind-mount/overlayfs plumbing.  Stub for Waves 63-67.

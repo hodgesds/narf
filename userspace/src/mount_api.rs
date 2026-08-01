@@ -41,6 +41,7 @@ const EBADF: i64 = 9;
 const EBUSY: i64 = 16;
 const EINVAL: i64 = 22;
 const ENODEV: i64 = 19;
+const EOPNOTSUPP: i64 = 95;
 const ENOSPC: i64 = 28;
 
 fn err(e: i64) -> SyscallReturn {
@@ -146,7 +147,7 @@ fn real_cgroupfs() -> Option<Arc<dyn FsInstance>> {
 ///     devpts → `DevPtsFs`, bpf → `BpfFs`.
 ///   * pseudo-filesystems systemd mounts during early boot for which NARF has
 ///     no real semantics (securityfs, debugfs, tracefs, configfs, fusectl,
-///     pstore, efivarfs, hugetlbfs, …). These get a
+///     pstore, hugetlbfs, …). These get a
 ///     minimal empty in-memory directory so the mountpoint exists and is
 ///     statable/traversable; systemd degrades gracefully when the contents
 ///     are absent.
@@ -201,7 +202,11 @@ pub fn build_fs_with_options(
         "configfs" => empty("configfs"),
         "fusectl" => empty("fusectl"),
         "pstore" => empty("pstore"),
-        "efivarfs" => empty("efivarfs"),
+        // Do not fake EFI persistence: Linux rejects this mount when no EFI
+        // variable backend is available, and so does NARF.
+        "efivarfs" => Some(Arc::new(narf_filesystem::EfivarFs::from_options(
+            options, uid, gid,
+        )?)),
         "hugetlbfs" => empty("hugetlbfs"),
         "binfmt_misc" => empty("binfmt_misc"),
         "autofs" => empty("autofs"),
@@ -353,6 +358,7 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
                 Some(Ok(true)) => ctx.set_return(ok(0)),
                 Some(Ok(false)) => ctx.set_return(err(ENODEV)),
                 Some(Err(FsError::NoSpace)) => ctx.set_return(err(ENOSPC)),
+                Some(Err(FsError::Unsupported)) => ctx.set_return(err(EOPNOTSUPP)),
                 Some(Err(_)) => ctx.set_return(err(EINVAL)),
                 None => ctx.set_return(err(EBADF)),
             }

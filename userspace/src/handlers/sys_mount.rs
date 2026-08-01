@@ -200,6 +200,10 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok((-28i64) as u64));
                 return;
             }
+            Err(narf_filesystem::FsError::Unsupported) => {
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                return;
+            }
             Err(_) => {
                 ctx.set_return(einval);
                 return;
@@ -315,6 +319,10 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             }
             Err(narf_filesystem::FsError::NoSpace) => {
                 ctx.set_return(SyscallReturn::ok((-28i64) as u64));
+                return;
+            }
+            Err(narf_filesystem::FsError::Unsupported) => {
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64));
                 return;
             }
             Err(_) => {

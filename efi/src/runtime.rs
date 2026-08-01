@@ -52,13 +52,16 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::reset::EfiResetType;
 use crate::system_table::{signature, TableHeader, TableHeaderError};
 use crate::time::EfiTime;
-use crate::variable::{encode_name, EFI_GLOBAL_VARIABLE, EFI_IMAGE_SECURITY_DATABASE_GUID};
+use crate::variable::{
+    decode_name_ucs2, encode_name_ucs2, EFI_GLOBAL_VARIABLE, EFI_IMAGE_SECURITY_DATABASE_GUID,
+};
 
 // ── EFI_STATUS ─────────────────────────────────────────────────────
 
@@ -82,8 +85,22 @@ pub const EFI_BUFFER_TOO_SMALL: EfiStatus = (1u64 << 63) | 5;
 pub const EFI_NOT_READY: EfiStatus = (1u64 << 63) | 6;
 /// EFI_DEVICE_ERROR.
 pub const EFI_DEVICE_ERROR: EfiStatus = (1u64 << 63) | 7;
+/// EFI_WRITE_PROTECTED.
+pub const EFI_WRITE_PROTECTED: EfiStatus = (1u64 << 63) | 8;
+/// EFI_OUT_OF_RESOURCES.
+pub const EFI_OUT_OF_RESOURCES: EfiStatus = (1u64 << 63) | 9;
+/// EFI_VOLUME_FULL.
+pub const EFI_VOLUME_FULL: EfiStatus = (1u64 << 63) | 11;
 /// EFI_NOT_FOUND.
 pub const EFI_NOT_FOUND: EfiStatus = (1u64 << 63) | 14;
+/// EFI_ACCESS_DENIED.
+pub const EFI_ACCESS_DENIED: EfiStatus = (1u64 << 63) | 15;
+/// EFI_SECURITY_VIOLATION.
+pub const EFI_SECURITY_VIOLATION: EfiStatus = (1u64 << 63) | 26;
+
+/// Hard upper bounds for data copied from firmware-owned size fields.
+pub const MAX_VARIABLE_DATA_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_VARIABLE_NAME_BYTES: usize = 64 * 1024;
 
 /// True iff `status` indicates an error.
 #[inline]
@@ -179,6 +196,13 @@ type EfiGetVariableFn = unsafe extern "efiapi" fn(
     data: *mut u8,
 ) -> EfiStatus;
 
+/// `EFI_GET_NEXT_VARIABLE_NAME` — UEFI 2.10 §8.2.2.
+type EfiGetNextVariableNameFn = unsafe extern "efiapi" fn(
+    variable_name_size: *mut usize,
+    variable_name: *mut u16,
+    vendor_guid: *mut [u8; 16],
+) -> EfiStatus;
+
 /// `EFI_SET_VARIABLE` — UEFI 2.10 §8.2.3.
 type EfiSetVariableFn = unsafe extern "efiapi" fn(
     variable_name: *const u16,
@@ -186,6 +210,14 @@ type EfiSetVariableFn = unsafe extern "efiapi" fn(
     attributes: u32,
     data_size: usize,
     data: *const u8,
+) -> EfiStatus;
+
+/// `EFI_QUERY_VARIABLE_INFO` — UEFI 2.10 §8.2.4.
+type EfiQueryVariableInfoFn = unsafe extern "efiapi" fn(
+    attributes: u32,
+    maximum_variable_storage_size: *mut u64,
+    remaining_variable_storage_size: *mut u64,
+    maximum_variable_size: *mut u64,
 ) -> EfiStatus;
 
 /// `EFI_RESET_SYSTEM` — UEFI 2.10 §8.5.1.
@@ -307,7 +339,29 @@ pub unsafe fn get_time() -> Result<EfiTime, EfiStatus> {
 
 // ── get_variable ───────────────────────────────────────────────────
 
-/// Call EFI `GetVariable()`. Returns the raw data bytes.
+/// A value returned by EFI `GetVariable()`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EfiVariableValue {
+    pub attributes: u32,
+    pub data: Vec<u8>,
+}
+
+/// A name/vendor pair returned by EFI `GetNextVariableName()`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EfiVariableId {
+    pub name: String,
+    pub vendor: EfiGuid,
+}
+
+/// Capacity information returned by EFI `QueryVariableInfo()`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EfiVariableInfo {
+    pub storage_bytes: u64,
+    pub remaining_bytes: u64,
+    pub max_variable_bytes: u64,
+}
+
+/// Call EFI `GetVariable()`. Returns attributes and raw data bytes.
 ///
 /// Handles the two-call pattern: first call with a zero-length
 /// buffer to discover the size, then a second call with the
@@ -316,7 +370,10 @@ pub unsafe fn get_time() -> Result<EfiTime, EfiStatus> {
 ///
 /// # Safety
 /// Same as `get_time`. Not interrupt-safe.
-pub unsafe fn get_variable(name: &str, guid: &EfiGuid) -> Result<Vec<u8>, EfiStatus> {
+pub unsafe fn get_variable_with_attributes(
+    name: &str,
+    guid: &EfiGuid,
+) -> Result<EfiVariableValue, EfiStatus> {
     let rt = table().ok_or(EFI_NOT_FOUND)?;
     // SAFETY: validated in `install`.
     let fn_ptr_addr = unsafe { (*rt).get_variable };
@@ -326,11 +383,8 @@ pub unsafe fn get_variable(name: &str, guid: &EfiGuid) -> Result<Vec<u8>, EfiSta
     // SAFETY: transmute from validated EFI table entry.
     let gv: EfiGetVariableFn = unsafe { core::mem::transmute(fn_ptr_addr) };
 
-    // Encode the variable name as UCS-2 LE (NUL-terminated). The
-    // buffer is u8 but we pass *const u16 to firmware — the layout is
-    // identical since each u16 is 2 bytes LE.
-    let name_ucs2 = encode_name(name);
-    let name_ptr = name_ucs2.as_ptr() as *const u16;
+    let name_ucs2 = encode_name_ucs2(name);
+    let name_ptr = name_ucs2.as_ptr();
 
     let mut size: usize = 0;
     let mut attrs: u32 = 0;
@@ -354,7 +408,13 @@ pub unsafe fn get_variable(name: &str, guid: &EfiGuid) -> Result<Vec<u8>, EfiSta
         }
     }
     if size == 0 {
-        return Ok(Vec::new());
+        return Ok(EfiVariableValue {
+            attributes: attrs,
+            data: Vec::new(),
+        });
+    }
+    if size > MAX_VARIABLE_DATA_BYTES {
+        return Err(EFI_BAD_BUFFER_SIZE);
     }
 
     // Second call: retrieve the data.
@@ -364,8 +424,100 @@ pub unsafe fn get_variable(name: &str, guid: &EfiGuid) -> Result<Vec<u8>, EfiSta
     if efi_error(status2) {
         return Err(status2);
     }
+    if size > buf.len() {
+        return Err(EFI_BAD_BUFFER_SIZE);
+    }
     buf.truncate(size);
-    Ok(buf)
+    Ok(EfiVariableValue {
+        attributes: attrs,
+        data: buf,
+    })
+}
+
+/// Call EFI `GetVariable()` and return only the data payload.
+///
+/// # Safety
+/// Same as [`get_variable_with_attributes`].
+pub unsafe fn get_variable(name: &str, guid: &EfiGuid) -> Result<Vec<u8>, EfiStatus> {
+    // SAFETY: forwarded caller contract.
+    unsafe { get_variable_with_attributes(name, guid) }.map(|value| value.data)
+}
+
+/// Enumerate the variable following `current`. Pass `None` to begin.
+///
+/// # Safety
+/// Same runtime-service lifetime and context requirements as [`get_variable`].
+pub unsafe fn get_next_variable(
+    current: Option<&EfiVariableId>,
+) -> Result<Option<EfiVariableId>, EfiStatus> {
+    let rt = table().ok_or(EFI_NOT_FOUND)?;
+    // SAFETY: validated in `install`.
+    let fn_ptr_addr = unsafe { (*rt).get_next_variable_name };
+    if fn_ptr_addr == 0 {
+        return Err(EFI_UNSUPPORTED);
+    }
+    // SAFETY: transmute from a validated EFI table entry.
+    let next: EfiGetNextVariableNameFn = unsafe { core::mem::transmute(fn_ptr_addr) };
+    let mut name = current
+        .map(|id| encode_name_ucs2(&id.name))
+        .unwrap_or_else(|| alloc::vec![0u16]);
+    let mut vendor = current.map(|id| id.vendor.0).unwrap_or([0u8; 16]);
+
+    loop {
+        let mut size = name.len() * core::mem::size_of::<u16>();
+        // SAFETY: `name` and `vendor` are writable buffers of the advertised sizes.
+        let status = unsafe { next(&mut size, name.as_mut_ptr(), &mut vendor) };
+        if status == EFI_NOT_FOUND {
+            return Ok(None);
+        }
+        if status == EFI_BUFFER_TOO_SMALL {
+            if size == 0 || size > MAX_VARIABLE_NAME_BYTES {
+                return Err(EFI_BAD_BUFFER_SIZE);
+            }
+            let units = size.div_ceil(core::mem::size_of::<u16>());
+            name.resize(units, 0);
+            continue;
+        }
+        if efi_error(status) {
+            return Err(status);
+        }
+        if size < 2 || size > name.len() * 2 || size % 2 != 0 {
+            return Err(EFI_BAD_BUFFER_SIZE);
+        }
+        let units = &name[..size / 2];
+        if units.last() != Some(&0) || units.first() == Some(&0) {
+            return Err(EFI_DEVICE_ERROR);
+        }
+        return Ok(Some(EfiVariableId {
+            name: decode_name_ucs2(units),
+            vendor: EfiGuid(vendor),
+        }));
+    }
+}
+
+/// Enumerate at most `limit` firmware variables, rejecting duplicate entries
+/// rather than looping forever on broken firmware.
+///
+/// # Safety
+/// Same as [`get_next_variable`].
+pub unsafe fn list_variables(limit: usize) -> Result<Vec<EfiVariableId>, EfiStatus> {
+    let mut variables = Vec::new();
+    let mut current = None;
+    loop {
+        // SAFETY: forwarded caller contract.
+        let next = unsafe { get_next_variable(current.as_ref()) }?;
+        let Some(next) = next else {
+            return Ok(variables);
+        };
+        if variables.contains(&next) {
+            return Err(EFI_DEVICE_ERROR);
+        }
+        if variables.len() >= limit {
+            return Err(EFI_OUT_OF_RESOURCES);
+        }
+        current = Some(next.clone());
+        variables.push(next);
+    }
 }
 
 // ── set_variable ───────────────────────────────────────────────────
@@ -395,8 +547,8 @@ pub unsafe fn set_variable(
     // SAFETY: transmute from validated EFI table entry.
     let sv: EfiSetVariableFn = unsafe { core::mem::transmute(fn_ptr_addr) };
 
-    let name_ucs2 = encode_name(name);
-    let name_ptr = name_ucs2.as_ptr() as *const u16;
+    let name_ucs2 = encode_name_ucs2(name);
+    let name_ptr = name_ucs2.as_ptr();
 
     // SAFETY: `data` slice is caller-supplied; `sv` reads at most
     // `data.len()` bytes from `data.as_ptr()`.
@@ -407,6 +559,41 @@ pub unsafe fn set_variable(
     } else {
         Ok(())
     }
+}
+
+/// Call EFI `QueryVariableInfo()` for one attribute combination.
+///
+/// # Safety
+/// Same as [`get_variable`].
+pub unsafe fn query_variable_info(attributes: u32) -> Result<EfiVariableInfo, EfiStatus> {
+    let rt = table().ok_or(EFI_NOT_FOUND)?;
+    // SAFETY: validated in `install`.
+    let fn_ptr_addr = unsafe { (*rt).query_variable_info };
+    if fn_ptr_addr == 0 {
+        return Err(EFI_UNSUPPORTED);
+    }
+    // SAFETY: transmute from a validated EFI table entry.
+    let query: EfiQueryVariableInfoFn = unsafe { core::mem::transmute(fn_ptr_addr) };
+    let mut storage_bytes = 0;
+    let mut remaining_bytes = 0;
+    let mut max_variable_bytes = 0;
+    // SAFETY: all output pointers refer to initialized writable u64 values.
+    let status = unsafe {
+        query(
+            attributes,
+            &mut storage_bytes,
+            &mut remaining_bytes,
+            &mut max_variable_bytes,
+        )
+    };
+    if efi_error(status) {
+        return Err(status);
+    }
+    Ok(EfiVariableInfo {
+        storage_bytes,
+        remaining_bytes,
+        max_variable_bytes,
+    })
 }
 
 // ── reset_system ───────────────────────────────────────────────────
@@ -632,7 +819,7 @@ mod tests {
         unsafe { *data = 1 };
         if !attrs_out.is_null() {
             // SAFETY: Valid memory or trusted environment
-            unsafe { *attrs_out = 0 };
+            unsafe { *attrs_out = 7 };
         }
         EFI_SUCCESS
     }
@@ -670,6 +857,85 @@ mod tests {
         }
     }
     kernel_test_in!("efi/runtime", smoke_efi_get_variable_fake_rt);
+
+    unsafe extern "efiapi" fn fake_get_next_variable(
+        size: *mut usize,
+        name: *mut u16,
+        guid: *mut [u8; 16],
+    ) -> EfiStatus {
+        let encoded = encode_name_ucs2("BootOrder");
+        // SAFETY: the test wrapper always supplies a non-null name buffer.
+        if unsafe { *name } != 0 {
+            return EFI_NOT_FOUND;
+        }
+        let needed = encoded.len() * 2;
+        // SAFETY: `size` is a live in/out parameter.
+        if unsafe { *size } < needed {
+            // SAFETY: same live in/out parameter.
+            unsafe { *size = needed };
+            return EFI_BUFFER_TOO_SMALL;
+        }
+        // SAFETY: the caller advertised at least `needed` bytes.
+        unsafe { core::ptr::copy_nonoverlapping(encoded.as_ptr(), name, encoded.len()) };
+        // SAFETY: `guid` points to one writable GUID.
+        unsafe { *guid = EFI_GLOBAL_VARIABLE.0 };
+        // SAFETY: live size output.
+        unsafe { *size = needed };
+        EFI_SUCCESS
+    }
+
+    unsafe extern "efiapi" fn fake_query_variable_info(
+        _attributes: u32,
+        storage: *mut u64,
+        remaining: *mut u64,
+        max_variable: *mut u64,
+    ) -> EfiStatus {
+        // SAFETY: the wrapper supplies three writable output pointers.
+        unsafe {
+            *storage = 65_536;
+            *remaining = 32_768;
+            *max_variable = 8_192;
+        }
+        EFI_SUCCESS
+    }
+
+    fn smoke_efi_variable_enumeration_and_capacity() -> TestResult {
+        let hdr = make_header(signature::RUNTIME_SERVICES, 1u32 << 16);
+        // SAFETY: zero is the correct absent-function encoding.
+        let mut table: EfiRuntimeServicesTable = unsafe { core::mem::zeroed() };
+        table.hdr.copy_from_slice(&hdr);
+        table.get_next_variable_name = fake_get_next_variable as usize;
+        table.query_variable_info = fake_query_variable_info as usize;
+        // SAFETY: `table` remains live until the installed pointer is reset.
+        if unsafe { install(&table) }.is_err() {
+            RT_TABLE_PTR.store(0, Ordering::Release);
+            return TestResult::Fail("fake runtime table install failed");
+        }
+        // SAFETY: only invokes the two local fake functions above.
+        let variables = unsafe { list_variables(8) };
+        // SAFETY: only invokes the local fake query function above.
+        let info = unsafe { query_variable_info(7) };
+        RT_TABLE_PTR.store(0, Ordering::Release);
+        if variables
+            != Ok(vec![EfiVariableId {
+                name: String::from("BootOrder"),
+                vendor: EFI_GLOBAL_VARIABLE,
+            }])
+        {
+            return TestResult::Fail("GetNextVariableName enumeration mismatch");
+        }
+        if info
+            != Ok(EfiVariableInfo {
+                storage_bytes: 65_536,
+                remaining_bytes: 32_768,
+                max_variable_bytes: 8_192,
+            })
+        {
+            return TestResult::Fail("QueryVariableInfo projection mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("efi/runtime", smoke_efi_variable_enumeration_and_capacity);
 
     // ── install with null pointer ─────────────────────────────────
 

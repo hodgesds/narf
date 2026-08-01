@@ -5,6 +5,7 @@
 //! the kernel needs to inspect Secure Boot's `db` / `dbx`.
 
 extern crate alloc;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Variable Attributes bitfield (UEFI 2.10 §8.2.1).
@@ -90,9 +91,8 @@ pub const EFI_CERT_SHA256_GUID: Guid = Guid::new(
 );
 
 /// Encode a Rust `&str` into the UCS-2 little-endian form UEFI
-/// variable names use, NUL-terminated. ASCII subset only — non-ASCII
-/// chars produce a single replacement `?` codepoint to keep the
-/// codec safe + total.
+/// variable names use, NUL-terminated. Supplementary-plane characters
+/// produce a single replacement `?` codepoint to keep the codec total.
 pub fn encode_name(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len() * 2 + 2);
     for c in s.chars() {
@@ -108,22 +108,43 @@ pub fn encode_name(s: &str) -> Vec<u8> {
     out
 }
 
-/// Decode a UCS-2 LE NUL-terminated name back to ASCII (replacing
-/// non-ASCII with '?' for safety).
-pub fn decode_name(buf: &[u8]) -> alloc::string::String {
-    let mut out = alloc::string::String::new();
+/// Encode a Rust string as the NUL-terminated `CHAR16` array consumed by
+/// EFI Runtime Services. UEFI variable names use UCS-2 rather than UTF-16,
+/// so supplementary-plane characters are replaced with `?`.
+pub fn encode_name_ucs2(s: &str) -> Vec<u16> {
+    let mut out = Vec::with_capacity(s.chars().count() + 1);
+    out.extend(
+        s.chars()
+            .map(|c| u16::try_from(c as u32).unwrap_or(u16::from(b'?'))),
+    );
+    out.push(0);
+    out
+}
+
+/// Decode a UCS-2 LE NUL-terminated name to UTF-8. Invalid UCS-2 code
+/// points are replaced with U+FFFD.
+pub fn decode_name(buf: &[u8]) -> String {
+    let mut out = String::new();
     let mut i = 0;
     while i + 2 <= buf.len() {
         let cp = u16::from_le_bytes([buf[i], buf[i + 1]]);
         if cp == 0 {
             break;
         }
-        if cp <= 0x7F {
-            out.push(cp as u8 as char);
-        } else {
-            out.push('?');
-        }
+        out.push(char::from_u32(u32::from(cp)).unwrap_or('\u{fffd}'));
         i += 2;
+    }
+    out
+}
+
+/// Decode a NUL-terminated EFI `CHAR16` variable name to UTF-8.
+pub fn decode_name_ucs2(buf: &[u16]) -> String {
+    let mut out = String::new();
+    for &cp in buf {
+        if cp == 0 {
+            break;
+        }
+        out.push(char::from_u32(u32::from(cp)).unwrap_or('\u{fffd}'));
     }
     out
 }
