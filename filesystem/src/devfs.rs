@@ -409,7 +409,11 @@ struct DevKmsg;
 
 impl FileOps for DevKmsg {
     fn poll_readiness_at(&self, offset: u64) -> u32 {
-        let readable = (offset as usize) < narf_console::klog::snapshot().len();
+        // Use the O(1) length, not `snapshot().len()`: epoll re-polls this on
+        // every wait iteration, and a snapshot here reallocates the whole klog
+        // ring each time — enough allocator churn to peg the CPU and starve
+        // the rest of boot (journald drains /dev/kmsg via epoll).
+        let readable = (offset as usize) < narf_console::klog::live_len();
         if readable {
             crate::POLL_IN | crate::POLL_OUT
         } else {
@@ -418,16 +422,9 @@ impl FileOps for DevKmsg {
     }
 
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        let snap = narf_console::klog::snapshot();
-        let off = offset as usize;
-        let n = if off >= snap.len() {
-            0
-        } else {
-            let avail = snap.len() - off;
-            let n = avail.min(buf.len());
-            buf[..n].copy_from_slice(&snap[off..off + n]);
-            n
-        };
+        // Copy only the requested window straight from the ring (no full-log
+        // Vec snapshot per read — see poll_readiness_at).
+        let n = narf_console::klog::read_at(offset as usize, buf);
         Box::pin(async move { Ok(n) })
     }
 
@@ -2566,3 +2563,46 @@ fn smoke_dev_random_rnd_ioctls_ok() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_random_rnd_ioctls_ok);
+
+/// `/dev/kmsg`'s poll/read fast-path (`klog::live_len` + `klog::read_at`)
+/// must agree byte-for-byte with the allocating `klog::snapshot()` it
+/// replaces. This guards the hot path that epoll/journald hammer: a
+/// regression back to `snapshot()` per poll/read reintroduces the
+/// whole-ring reallocation that starved the desktop boot.
+fn smoke_kmsg_read_at_matches_snapshot() -> TestResult {
+    // Seed a known record so the live region is non-empty and spans a wrap
+    // boundary in content terms; operate read-only against the live ring.
+    narf_console::klog::record("kmsg-fastpath-probe\n");
+    let snap = narf_console::klog::snapshot();
+    if narf_console::klog::live_len() != snap.len() {
+        return TestResult::Fail("live_len() disagrees with snapshot().len()");
+    }
+    let mut buf = [0u8; 512];
+    // Full-window, mid-window, and boundary reads must equal the snapshot slice.
+    let offsets = [
+        0usize,
+        snap.len() / 2,
+        snap.len().saturating_sub(7),
+        snap.len(),
+    ];
+    for &off in &offsets {
+        if off > snap.len() {
+            continue;
+        }
+        let cap = buf.len().min(snap.len().saturating_sub(off));
+        let n = narf_console::klog::read_at(off, &mut buf[..cap.max(1)]);
+        let expect = &snap[off..off + cap];
+        if n != expect.len() || buf[..n] != *expect {
+            return TestResult::Fail("read_at() window differs from snapshot()");
+        }
+    }
+    // At or past the end yields 0 (no readable bytes).
+    if narf_console::klog::read_at(snap.len(), &mut buf) != 0 {
+        return TestResult::Fail("read_at() at end should return 0");
+    }
+    if narf_console::klog::read_at(snap.len() + 4096, &mut buf) != 0 {
+        return TestResult::Fail("read_at() past end should return 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_kmsg_read_at_matches_snapshot);
