@@ -14,6 +14,34 @@ fn current_file_exists(path: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Split legacy overlayfs `lowerdir=` values. Linux treats an unescaped colon
+/// as a layer separator and permits `\:` and `\\` in pathnames.
+fn parse_overlay_lowerdirs(value: &str) -> Option<alloc::vec::Vec<alloc::string::String>> {
+    let mut layers = alloc::vec::Vec::new();
+    let mut layer = alloc::string::String::new();
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            layer.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == ':' {
+            if layer.is_empty() {
+                return None;
+            }
+            layers.push(core::mem::take(&mut layer));
+        } else {
+            layer.push(ch);
+        }
+    }
+    if escaped || layer.is_empty() {
+        return None;
+    }
+    layers.push(layer);
+    Some(layers)
+}
+
 pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // errno replies (negated-long convention). Every failure carries a
@@ -297,55 +325,121 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         }
     }
 
-    // overlayfs (union mount). Linux passes the layer paths in the mount(2)
-    // `data` string (lowerdir=/a:/b,upperdir=/u,workdir=/w). NARF's mount ABI
-    // has no register left for a `data` pointer, so the options string is
-    // accepted via `source` instead (the conventional overlay source is the
-    // information-free literal "overlay"). `workdir` is parsed but ignored —
-    // copy-up/whiteout ops act directly on the upper dir.
+    // overlayfs (union mount). Prefer Linux's `data` argument. The old NARF
+    // ABI placed options in `source`, so retain that as a compatibility
+    // fallback when `data` is empty.
     if fstype == "overlay" || fstype == "overlayfs" {
-        let opts = source.as_str();
-        let mut lowerdirs: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+        let opts = if data.is_empty() {
+            source.as_str()
+        } else {
+            data.as_str()
+        };
+        let mut lowerdirs: Option<alloc::vec::Vec<alloc::string::String>> = None;
         let mut upperdir: Option<&str> = None;
+        let mut workdir: Option<&str> = None;
+        let mut valid_options = true;
         for kv in opts.split(',') {
             let kv = kv.trim();
             if let Some(v) = kv.strip_prefix("lowerdir=") {
                 // Colon-separated, highest-priority first (Linux order).
-                lowerdirs = v.split(':').filter(|s| !s.is_empty()).collect();
+                if lowerdirs.is_some() {
+                    valid_options = false;
+                    break;
+                }
+                lowerdirs = parse_overlay_lowerdirs(v);
+                if lowerdirs.is_none() {
+                    valid_options = false;
+                    break;
+                }
             } else if let Some(v) = kv.strip_prefix("upperdir=") {
+                if upperdir.is_some() || v.is_empty() {
+                    valid_options = false;
+                    break;
+                }
                 upperdir = Some(v);
-            } else if kv.starts_with("workdir=") {
-                // Accepted-and-ignored (documented above).
+            } else if let Some(v) = kv.strip_prefix("workdir=") {
+                if workdir.is_some() || v.is_empty() {
+                    valid_options = false;
+                    break;
+                }
+                workdir = Some(v);
+            } else if !kv.is_empty() {
+                // Do not silently claim support for overlay features whose
+                // persistence/security semantics NARF does not implement.
+                valid_options = false;
+                break;
             }
         }
-        let upper_path = match upperdir {
-            Some(p) => apply_chroot(p),
-            None => {
-                ctx.set_return(fail);
+        let lowerdirs = match (valid_options, lowerdirs) {
+            (true, Some(layers)) if !layers.is_empty() => layers,
+            _ => {
+                ctx.set_return(einval);
                 return;
             }
         };
-        let upper = match resolve_dir_absolute(upper_path.as_str()) {
-            Some(d) => d,
-            None => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
+        if upperdir.is_some() != workdir.is_some() {
+            ctx.set_return(einval);
+            return;
+        }
+
         let mut lowers: alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::DirOps>> =
             alloc::vec::Vec::new();
+        let mut resolved_lower_paths = alloc::vec::Vec::new();
         for lp in &lowerdirs {
-            let abs = apply_chroot(lp);
+            let abs = apply_chroot(lp.as_str());
             match resolve_dir_absolute(abs.as_str()) {
-                Some(d) => lowers.push(d),
+                Some(d) => {
+                    resolved_lower_paths.push(abs);
+                    lowers.push(d);
+                }
                 None => {
-                    ctx.set_return(fail);
+                    ctx.set_return(enoent);
                     return;
                 }
             }
         }
-        let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
-            alloc::sync::Arc::new(narf_filesystem::OverlayFs::new("overlay", upper, lowers));
+        let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> = match (upperdir, workdir) {
+            (Some(upper_path), Some(work_path)) => {
+                let upper_path = apply_chroot(upper_path);
+                let work_path = apply_chroot(work_path);
+                // Linux requires separate work/upper subtrees. NARF does not
+                // yet expose a filesystem identity through DirOps, so the
+                // stronger same-superblock check remains an audited gap.
+                if upper_path == work_path
+                    || resolved_lower_paths
+                        .iter()
+                        .any(|lower| lower == &upper_path || lower == &work_path)
+                {
+                    ctx.set_return(einval);
+                    return;
+                }
+                let upper = match resolve_dir_absolute(upper_path.as_str()) {
+                    Some(dir) => dir,
+                    None => {
+                        ctx.set_return(enoent);
+                        return;
+                    }
+                };
+                let work = match resolve_dir_absolute(work_path.as_str()) {
+                    Some(dir) => dir,
+                    None => {
+                        ctx.set_return(enoent);
+                        return;
+                    }
+                };
+                if !work.enumerate(0, 1).is_empty() {
+                    ctx.set_return(einval);
+                    return;
+                }
+                alloc::sync::Arc::new(narf_filesystem::OverlayFs::new(
+                    "overlay", upper, lowers,
+                ))
+            }
+            (None, None) => alloc::sync::Arc::new(
+                narf_filesystem::OverlayFs::new_read_only("overlay", lowers),
+            ),
+            _ => unreachable!(),
+        };
         return match current_mount_arc(&auth, target.as_str(), fs) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
             Err(_) => ctx.set_return(fail),

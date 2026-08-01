@@ -571,6 +571,32 @@ fabricated measurements.
 The supported surface and known partial projections are tracked in
 `filesystem/PROCFS_LINUX_COMPAT_AUDIT.md`.
 
+### 3.10 Overlay filesystem compatibility
+
+`OverlayFs::new(name, upper, lowers)` constructs a writable Linux-style
+overlay, with `lowers[0]` the highest-priority lower layer.
+`OverlayFs::new_read_only(name, lowers)` constructs the lower-only read-only
+form; every mutation through it returns `FsError::ReadOnly`. Lookups and
+directory enumeration apply top-down object-type masking, merge directories,
+consume whiteouts from every layer, and stop below an opaque directory.
+
+Writable overlays lazily copy missing upper parent directories before the
+first descendant mutation. Regular-file copy-up is chunked and preserves
+data, owner, mode, mtime, and supported xattrs. Lower-file rename and hard
+link copy the source up first; unlink/rmdir/rename retain a whiteout whenever
+a lower object would otherwise reappear. With redirect directories disabled,
+renaming a lower or merged directory returns `FsError::CrossDevice` (EXDEV),
+matching Linux's default behavior.
+
+NARF backing filesystems encode a whiteout as a hidden zero-length
+`.wh.<name>` file and opacity as `.wh..wh..opq`; these are internal storage
+details and never appear through `DirOps`. The mount handler consumes Linux's
+`mount(2)` data string (`lowerdir=`, `upperdir=`, `workdir=`), retains the old
+source-string ABI only as a fallback, supports escaped colons in legacy
+`lowerdir=`, requires upper/work together, and supports a lower-only
+read-only mount. The audited compatibility matrix and explicit remaining
+gaps live in `filesystem/OVERLAYFS_LINUX_COMPAT_AUDIT.md`.
+
 ## 4. Invariants & safety properties
 
 - **No ambient root.** A task that holds no `Cap<FileNode, _>` can

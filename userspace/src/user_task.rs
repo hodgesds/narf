@@ -1899,7 +1899,7 @@ impl core::future::Future for UserTaskFuture {
                     // never takes its SIGALRM — the SMP chroot_run/stress-ng
                     // hang.
                     crate::handlers::register_signal_waker(task_pid, cx.waker().clone());
-                    if crate::handlers::is_signal_pending(task_pid) {
+                    if crate::handlers::has_interrupting_signal(task_pid) {
                         drop_wait_child_waker(task_pid);
                         // SAFETY: `state.get()` is the `*mut UserState` backing
                         // this future's saved frame; we own it (Pin-stable) and
@@ -2517,7 +2517,7 @@ impl core::future::Future for UserTaskFuture {
                     // abandon the wait with EINTR and fall through to deliver.
                     // See the x86_64 poll for the full rationale.
                     crate::handlers::register_signal_waker(task_pid, cx.waker().clone());
-                    if crate::handlers::is_signal_pending(task_pid) {
+                    if crate::handlers::has_interrupting_signal(task_pid) {
                         drop_wait_child_waker(task_pid);
                         // SAFETY: `state.get()` is the `*mut UserState` backing
                         // this future's saved frame; we own it (Pin-stable) and

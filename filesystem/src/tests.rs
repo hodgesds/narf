@@ -4773,6 +4773,511 @@ fn smoke_overlay_copy_up_on_write() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_overlay_copy_up_on_write);
 
+/// Mutating below a lower-only directory creates the complete missing upper
+/// parent chain and preserves the lower directory's merged contents.
+fn smoke_overlay_lower_only_parent_copy_up() -> TestResult {
+    use crate::{FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::new("ov-parent-lower"));
+    let upper = Arc::new(MemFs::new("ov-parent-upper"));
+    let lower_root = lower.root();
+    let etc = match poll_once_overlay(lower_root.mkdir("etc")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("could not seed lower etc directory"),
+    };
+    let conf = match poll_once_overlay(etc.mkdir("conf")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("could not seed lower conf directory"),
+    };
+    if !matches!(poll_once_overlay(conf.create("base")), Some(Ok(_))) {
+        return TestResult::Fail("could not seed lower base file");
+    }
+
+    let ov = OverlayFs::new("ov-parent", upper.root(), vec![lower_root]);
+    let root = ov.root();
+    let etc = match root.lookup_dir("etc") {
+        Some(dir) => dir,
+        None => return TestResult::Fail("lower-only etc missing from overlay"),
+    };
+    let conf = match etc.lookup_dir("conf") {
+        Some(dir) => dir,
+        None => return TestResult::Fail("lower-only conf missing from overlay"),
+    };
+    if !matches!(poll_once_overlay(conf.create("local")), Some(Ok(_))) {
+        return TestResult::Fail("create below lower-only parent did not copy parents up");
+    }
+    if conf.lookup("base").is_none() || conf.lookup("local").is_none() {
+        return TestResult::Fail("copied-up directory stopped merging lower contents");
+    }
+    let raw_upper_conf = match upper
+        .root()
+        .lookup_dir("etc")
+        .and_then(|dir| dir.lookup_dir("conf"))
+    {
+        Some(dir) => dir,
+        None => return TestResult::Fail("missing upper parent chain after copy-up"),
+    };
+    if raw_upper_conf.lookup("local").is_none() {
+        return TestResult::Fail("nested create did not land in upper");
+    }
+    if lower
+        .root()
+        .lookup_dir("etc")
+        .and_then(|dir| dir.lookup_dir("conf"))
+        .and_then(|dir| dir.lookup("local"))
+        .is_some()
+    {
+        return TestResult::Fail("nested create mutated lower");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_lower_only_parent_copy_up);
+
+/// Whiteouts in a higher lower layer hide lower-priority entries just as
+/// upper whiteouts do.
+fn smoke_overlay_lower_layer_whiteout() -> TestResult {
+    use crate::{DirOps, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let top = Arc::new(MemFs::with_seeds("ov-wh-top", &[(".wh.hidden", b"")]));
+    let bottom = Arc::new(MemFs::with_seeds(
+        "ov-wh-bottom",
+        &[("hidden", b"old"), ("visible", b"yes")],
+    ));
+    let upper = Arc::new(MemFs::new("ov-wh-upper"));
+    let ov = OverlayFs::new(
+        "ov-wh-lower",
+        upper.root(),
+        vec![top.root() as Arc<dyn DirOps>, bottom.root()],
+    );
+    let root = ov.root();
+    if root.lookup("hidden").is_some() {
+        return TestResult::Fail("lower-layer whiteout did not mask deeper file");
+    }
+    let names = root.enumerate(0, 16);
+    if names.iter().any(|(name, _)| name == "hidden")
+        || !names.iter().any(|(name, _)| name == "visible")
+    {
+        return TestResult::Fail("lower-layer whiteout merge result is wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_lower_layer_whiteout);
+
+/// An opaque upper directory suppresses every matching lower directory while
+/// still exposing its own entries; its marker remains internal.
+fn smoke_overlay_opaque_directory() -> TestResult {
+    use crate::{DirOps, FsInstance, MemFs, OverlayFs, OPAQUE_MARKER};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::new("ov-opq-lower"));
+    let lower_dir = match poll_once_overlay(lower.root().mkdir("merged")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("could not seed opaque lower directory"),
+    };
+    if !matches!(poll_once_overlay(lower_dir.create("lower")), Some(Ok(_))) {
+        return TestResult::Fail("could not seed opaque lower file");
+    }
+    let upper = Arc::new(MemFs::new("ov-opq-upper"));
+    let upper_dir = match poll_once_overlay(upper.root().mkdir("merged")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("could not seed opaque upper directory"),
+    };
+    if !matches!(poll_once_overlay(upper_dir.create("upper")), Some(Ok(_)))
+        || !matches!(
+            poll_once_overlay(upper_dir.create(OPAQUE_MARKER)),
+            Some(Ok(_))
+        )
+    {
+        return TestResult::Fail("could not seed opaque upper entries");
+    }
+
+    let ov = OverlayFs::new(
+        "ov-opq",
+        upper.root(),
+        vec![lower.root() as Arc<dyn DirOps>],
+    );
+    let merged = match ov.root().lookup_dir("merged") {
+        Some(dir) => dir,
+        None => return TestResult::Fail("opaque directory lookup failed"),
+    };
+    if merged.lookup("lower").is_some() || merged.lookup("upper").is_none() {
+        return TestResult::Fail("opaque directory did not suppress lower contents");
+    }
+    if merged
+        .enumerate(0, 16)
+        .iter()
+        .any(|(name, _)| name.starts_with(".wh."))
+    {
+        return TestResult::Fail("opaque marker escaped into merged readdir");
+    }
+
+    let opaque_root = Arc::new(MemFs::with_seeds(
+        "ov-opq-root-high",
+        &[(OPAQUE_MARKER, b"")],
+    ));
+    let deep_root = Arc::new(MemFs::with_seeds(
+        "ov-opq-root-low",
+        &[("hidden", b"lower")],
+    ));
+    let root_opaque = OverlayFs::new_read_only(
+        "ov-opq-root",
+        vec![opaque_root.root() as Arc<dyn DirOps>, deep_root.root()],
+    );
+    if root_opaque.root().lookup("hidden").is_some()
+        || root_opaque
+            .root()
+            .enumerate(0, 16)
+            .iter()
+            .any(|(name, _)| name == "hidden" || name.starts_with(".wh."))
+    {
+        return TestResult::Fail("opaque lower root did not suppress deeper layers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_opaque_directory);
+
+/// A higher-priority object masks a different-type object in every deeper
+/// layer instead of allowing lookup and lookup_dir to disagree.
+fn smoke_overlay_cross_layer_type_masking() -> TestResult {
+    use crate::{DirOps, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let high = Arc::new(MemFs::new("ov-type-high"));
+    if !matches!(poll_once_overlay(high.root().mkdir("node")), Some(Ok(_))) {
+        return TestResult::Fail("could not seed high directory");
+    }
+    let low = Arc::new(MemFs::with_seeds("ov-type-low", &[("node", b"file")]));
+    let ov = OverlayFs::new(
+        "ov-type",
+        Arc::new(MemFs::new("ov-type-upper")).root(),
+        vec![high.root() as Arc<dyn DirOps>, low.root()],
+    );
+    if ov.root().lookup_dir("node").is_none() || ov.root().lookup("node").is_some() {
+        return TestResult::Fail("high directory did not mask low file");
+    }
+
+    let high_file = Arc::new(MemFs::with_seeds("ov-type-high-file", &[("node", b"file")]));
+    let low_dir = Arc::new(MemFs::new("ov-type-low-dir"));
+    if !matches!(poll_once_overlay(low_dir.root().mkdir("node")), Some(Ok(_))) {
+        return TestResult::Fail("could not seed low directory");
+    }
+    let ov = OverlayFs::new(
+        "ov-type-2",
+        Arc::new(MemFs::new("ov-type-upper-2")).root(),
+        vec![high_file.root() as Arc<dyn DirOps>, low_dir.root()],
+    );
+    if ov.root().lookup("node").is_none() || ov.root().lookup_dir("node").is_some() {
+        return TestResult::Fail("high file did not mask low directory");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_cross_layer_type_masking);
+
+/// Removing an upper entry that shadows a lower entry must leave a whiteout;
+/// otherwise the lower object incorrectly reappears.
+fn smoke_overlay_unlink_upper_with_lower_origin() -> TestResult {
+    use crate::{DirOps, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::with_seeds("ov-rm-lower", &[("same", b"low")]));
+    let upper = Arc::new(MemFs::with_seeds("ov-rm-upper", &[("same", b"up")]));
+    let ov = OverlayFs::new("ov-rm", upper.root(), vec![lower.root() as Arc<dyn DirOps>]);
+    let root = ov.root();
+    if !matches!(poll_once_overlay(root.unlink("same")), Some(Ok(()))) {
+        return TestResult::Fail("unlink of upper-over-lower failed");
+    }
+    if root.lookup("same").is_some() || upper.root().lookup(".wh.same").is_none() {
+        return TestResult::Fail("lower entry reappeared after upper unlink");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_unlink_upper_with_lower_origin);
+
+/// A merged directory is non-empty when any visible layer has children.
+fn smoke_overlay_rmdir_checks_merged_contents() -> TestResult {
+    use crate::{DirOps, FsError, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::new("ov-rmdir-lower"));
+    let child = match poll_once_overlay(lower.root().mkdir("dir")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("could not seed rmdir lower directory"),
+    };
+    if !matches!(poll_once_overlay(child.create("child")), Some(Ok(_))) {
+        return TestResult::Fail("could not seed rmdir lower child");
+    }
+    let upper = Arc::new(MemFs::new("ov-rmdir-upper"));
+    if !matches!(poll_once_overlay(upper.root().mkdir("dir")), Some(Ok(_))) {
+        return TestResult::Fail("could not seed rmdir upper directory");
+    }
+    let ov = OverlayFs::new(
+        "ov-rmdir",
+        upper.root(),
+        vec![lower.root() as Arc<dyn DirOps>],
+    );
+    if !matches!(
+        poll_once_overlay(ov.root().rmdir("dir")),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("rmdir accepted a non-empty merged directory");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_rmdir_checks_merged_contents);
+
+/// The lower-only mount form remains readable and consistently rejects every
+/// mutation with EROFS at the filesystem boundary.
+fn smoke_overlay_read_only_layers() -> TestResult {
+    use crate::{DirOps, FsError, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::with_seeds("ov-ro-lower", &[("base", b"read")])) as Arc<MemFs>;
+    if !matches!(poll_once_overlay(lower.root().mkdir("dir")), Some(Ok(_))) {
+        return TestResult::Fail("could not seed read-only lower directory");
+    }
+    let ov = OverlayFs::new_read_only("ov-ro", vec![lower.root() as Arc<dyn DirOps>]);
+    let root = ov.root();
+    if root.lookup("base").is_none() {
+        return TestResult::Fail("read-only overlay hid lower content");
+    }
+    if !matches!(
+        poll_once_overlay(root.create("new")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("read-only overlay create did not return ReadOnly");
+    }
+    let base = match root.lookup("base") {
+        Some(file) => file,
+        None => return TestResult::Fail("read-only lower file disappeared"),
+    };
+    if !matches!(
+        poll_once_overlay(base.write(0, b"x")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("read-only overlay write did not return ReadOnly");
+    }
+    if !matches!(
+        poll_once_overlay(root.rename("dir", "renamed")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("read-only directory rename did not return ReadOnly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_read_only_layers);
+
+/// Renaming a lower regular file performs copy-up, moves the upper copy, and
+/// whiteouts the old lower name.
+fn smoke_overlay_rename_lower_file() -> TestResult {
+    use crate::{DirOps, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::with_seeds("ov-ren-lower", &[("old", b"payload")]));
+    let upper = Arc::new(MemFs::new("ov-ren-upper"));
+    let ov = OverlayFs::new(
+        "ov-ren",
+        upper.root(),
+        vec![lower.root() as Arc<dyn DirOps>],
+    );
+    let root = ov.root();
+    if !matches!(poll_once_overlay(root.rename("old", "new")), Some(Ok(()))) {
+        return TestResult::Fail("lower-file rename failed");
+    }
+    if root.lookup("old").is_some()
+        || root.lookup("new").is_none()
+        || upper.root().lookup(".wh.old").is_none()
+    {
+        return TestResult::Fail("lower-file rename did not move-and-whiteout");
+    }
+    let file = root.lookup("new").expect("checked above");
+    let mut bytes = [0u8; 16];
+    if !matches!(poll_once_overlay(file.read(0, &mut bytes)), Some(Ok(7)))
+        || &bytes[..7] != b"payload"
+    {
+        return TestResult::Fail("renamed copy-up lost file data");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_rename_lower_file);
+
+/// Cross-parent rename uses the two-directory VFS primitive, materializes both
+/// missing upper parents, and honors RENAME_NOREPLACE against lower targets.
+fn smoke_overlay_cross_parent_rename() -> TestResult {
+    use crate::{DirOps, FsError, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::new("ov-cross-ren-lower"));
+    let from_raw = match poll_once_overlay(lower.root().mkdir("from")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("could not seed cross-rename source directory"),
+    };
+    let to_raw = match poll_once_overlay(lower.root().mkdir("to")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("could not seed cross-rename target directory"),
+    };
+    if !matches!(poll_once_overlay(from_raw.create("old")), Some(Ok(_)))
+        || !matches!(poll_once_overlay(from_raw.create("blocked")), Some(Ok(_)))
+        || !matches!(poll_once_overlay(to_raw.create("exists")), Some(Ok(_)))
+    {
+        return TestResult::Fail("could not seed cross-rename files");
+    }
+    let upper = Arc::new(MemFs::new("ov-cross-ren-upper"));
+    let ov = OverlayFs::new(
+        "ov-cross-ren",
+        upper.root(),
+        vec![lower.root() as Arc<dyn DirOps>],
+    );
+    let root = ov.root();
+    let from = root.lookup_dir("from").expect("overlay source dir missing");
+    let to = root.lookup_dir("to").expect("overlay target dir missing");
+    if !matches!(
+        poll_once_overlay(from.rename_to("old", to.as_ref(), "moved", 0)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("cross-parent lower-file rename failed");
+    }
+    if from.lookup("old").is_some()
+        || to.lookup("moved").is_none()
+        || upper
+            .root()
+            .lookup_dir("from")
+            .and_then(|dir| dir.lookup(".wh.old"))
+            .is_none()
+    {
+        return TestResult::Fail("cross-parent rename did not move-and-whiteout");
+    }
+    if !matches!(
+        poll_once_overlay(from.rename_to("blocked", to.as_ref(), "exists", 1)),
+        Some(Err(FsError::Busy))
+    ) || from.lookup("blocked").is_none()
+    {
+        return TestResult::Fail("RENAME_NOREPLACE ignored a lower destination");
+    }
+    let other = OverlayFs::new(
+        "ov-cross-ren-other",
+        Arc::new(MemFs::new("ov-cross-ren-other-upper")).root(),
+        vec![],
+    );
+    if !matches!(
+        poll_once_overlay(from.rename_to("blocked", other.root().as_ref(), "elsewhere", 0)),
+        Some(Err(FsError::CrossDevice))
+    ) {
+        return TestResult::Fail("cross-mount rename did not return CrossDevice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_cross_parent_rename);
+
+/// Hard-linking a lower file first copies it up; both upper names then alias
+/// the same inode and the lower remains unchanged.
+fn smoke_overlay_link_lower_file() -> TestResult {
+    use crate::{DirOps, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::with_seeds("ov-link-lower", &[("old", b"abc")]));
+    let upper = Arc::new(MemFs::new("ov-link-upper"));
+    let ov = OverlayFs::new(
+        "ov-link",
+        upper.root(),
+        vec![lower.root() as Arc<dyn DirOps>],
+    );
+    let root = ov.root();
+    if !matches!(poll_once_overlay(root.link("old", "alias")), Some(Ok(()))) {
+        return TestResult::Fail("hard link of lower file failed");
+    }
+    let alias = match root.lookup("alias") {
+        Some(file) => file,
+        None => return TestResult::Fail("hard-link alias missing"),
+    };
+    if !matches!(poll_once_overlay(alias.write(0, b"X")), Some(Ok(1))) {
+        return TestResult::Fail("write through hard-link alias failed");
+    }
+    let original = root.lookup("old").expect("hard-link source disappeared");
+    let mut bytes = [0u8; 4];
+    if !matches!(poll_once_overlay(original.read(0, &mut bytes)), Some(Ok(3)))
+        || &bytes[..3] != b"Xbc"
+    {
+        return TestResult::Fail("hard-link names do not alias one upper inode");
+    }
+    let lower_file = lower
+        .root()
+        .lookup("old")
+        .expect("lower source disappeared");
+    if !matches!(
+        poll_once_overlay(lower_file.read(0, &mut bytes)),
+        Some(Ok(3))
+    ) || &bytes[..3] != b"abc"
+    {
+        return TestResult::Fail("hard-link copy-up mutated lower inode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_link_lower_file);
+
+/// Copy-up carries mode, owners, mtime, and ordinary xattrs with file data.
+fn smoke_overlay_copy_up_metadata() -> TestResult {
+    use crate::{DirOps, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::with_seeds("ov-meta-lower", &[("file", b"data")]));
+    let lower_file = lower
+        .root()
+        .lookup("file")
+        .expect("seeded lower file missing");
+    if !matches!(
+        poll_once_overlay(lower_file.set_owners(12, 34)),
+        Some(Ok(()))
+    ) || !matches!(poll_once_overlay(lower_file.set_perms(0o640)), Some(Ok(())))
+        || lower_file.set_times(None, Some(123_456)).is_err()
+        || !matches!(
+            poll_once_overlay(lower_file.set_xattr("user.test", b"value", 0)),
+            Some(Ok(()))
+        )
+    {
+        return TestResult::Fail("could not seed lower metadata");
+    }
+    let upper = Arc::new(MemFs::new("ov-meta-upper"));
+    let ov = OverlayFs::new(
+        "ov-meta",
+        upper.root(),
+        vec![lower.root() as Arc<dyn DirOps>],
+    );
+    if !matches!(
+        poll_once_overlay(ov.root().link("file", "linked")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("metadata copy-up link failed");
+    }
+    let copied = upper.root().lookup("file").expect("upper copy missing");
+    if copied.owners() != (12, 34)
+        || copied.stat().mode.perms != 0o640
+        || copied.stat().mtime_cycles != lower_file.stat().mtime_cycles
+    {
+        return TestResult::Fail("copy-up lost ownership, mode, or mtime");
+    }
+    if !matches!(
+        poll_once_overlay(copied.get_xattr("user.test")),
+        Some(Ok(value)) if value == b"value"
+    ) {
+        return TestResult::Fail("copy-up lost xattr");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_copy_up_metadata);
+
 // ── /dev/console + /dev/tty1 terminal ioctls (getty/agetty path) ────────
 //
 // A distro getty/agetty on the console opens `/dev/tty1` (or /dev/console),

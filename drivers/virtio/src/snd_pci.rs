@@ -76,6 +76,9 @@ pub struct VirtioSndConfig {
 
 #[derive(Debug)]
 pub struct VirtioSoundPci {
+    /// Common configuration window retained so teardown can reset the
+    /// transport before any queue-backed DMA memory is released.
+    common: VirtioRegion,
     control_q: IrqSafeSpinLock<Option<Virtqueue>>,
     #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     event_q: IrqSafeSpinLock<Option<Virtqueue>>,
@@ -111,6 +114,27 @@ pub struct VirtioSoundPci {
 }
 
 impl VirtioSoundPci {
+    /// Reset the device and wait until it can no longer access the old
+    /// virtqueues.
+    ///
+    /// VirtIO 1.2 section 2.4.2 requires the driver to observe
+    /// `device_status == 0` before reinitializing a device. Linux's modern
+    /// virtio-pci reset path follows the same ordering before freeing queues.
+    fn reset_device(&self) -> bool {
+        // SAFETY: `common` remains mapped for the controller's lifetime and
+        // this controller exclusively owns the device.
+        unsafe {
+            self.common.write8(CC_DEVICE_STATUS, 0);
+        }
+        narf_scheduler::responsive_spin_until(
+            || {
+                // SAFETY: same live common-cfg mapping as the reset write.
+                unsafe { self.common.read8(CC_DEVICE_STATUS) == 0 }
+            },
+            narf_time::Deadline::after_ms(1_000),
+        )
+    }
+
     /// # Safety
     /// Caller owns the device exclusively.
     pub unsafe fn bring_up(
@@ -122,10 +146,26 @@ impl VirtioSoundPci {
         // SAFETY: caller-owned.
         let common = unsafe { map_cap(device, &caps.common) }?;
 
-        // Reset + ACK + DRIVER.
+        // Reset + ACK + DRIVER. The specification requires observing zero
+        // before reinitializing; in particular, that observation guarantees
+        // that the device has stopped using queue memory from a prior driver.
         // SAFETY: identity-mapped MMIO.
         unsafe {
             common.write8(CC_DEVICE_STATUS, 0);
+        }
+        let reset = narf_scheduler::responsive_spin_until(
+            || {
+                // SAFETY: caller-owned, live common-cfg mapping.
+                unsafe { common.read8(CC_DEVICE_STATUS) == 0 }
+            },
+            narf_time::Deadline::after_ms(1_000),
+        );
+        if !reset {
+            return Err(VirtioPciError::CompletionTimeout);
+        }
+        // SAFETY: reset completion was observed above; status negotiation may
+        // now begin on the same caller-owned common-cfg mapping.
+        unsafe {
             common.write8(CC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE as u8);
             common.write8(
                 CC_DEVICE_STATUS,
@@ -263,6 +303,7 @@ impl VirtioSoundPci {
         // SAFETY: same.
         let rx_q = unsafe { Virtqueue::new(rx_layout) };
         Ok(Self {
+            common,
             control_q: IrqSafeSpinLock::new(Some(control_q)),
             event_q: IrqSafeSpinLock::new(Some(event_q)),
             tx_q: IrqSafeSpinLock::new(Some(tx_q)),
@@ -658,5 +699,16 @@ pub fn play_buffer_phys(
 
 #[doc(hidden)]
 pub fn __reset_for_test() {
-    *CONTROLLER.lock() = None;
+    let mut controller = CONTROLLER.lock();
+    let Some(current) = controller.as_ref() else {
+        return;
+    };
+    // Do not release queue-backed DMA while the device may still access it.
+    // Failing loudly is preferable to either hiding a stale controller or
+    // manufacturing a use-after-free in the host device model.
+    assert!(
+        current.reset_device(),
+        "virtio-snd device did not acknowledge reset"
+    );
+    *controller = None;
 }
