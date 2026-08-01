@@ -680,28 +680,31 @@ impl AddressSpace {
             if region.base.as_u64() < r_end && r.base.as_u64() < end {
                 return Err(AddressSpaceError::Overlap);
             }
-            // Diagnostic: catch the source of the double-free we
-            // see in `AddressSpace::drop` — two regions in the
-            // same AS pointing at the same physical frame would
-            // be unmapped twice, double-freeing the phys. SHARED
-            // regions borrow their frames (the registry owns them and
-            // never lets the AS free them), so aliasing is expected and
-            // safe — skip the guard for them.
-            if region.perms.contains(RegionPerms::SHARED) {
-                continue;
-            }
-            for new_p in &region.phys {
-                if new_p.raw() == 0 {
-                    continue;
-                }
-                for existing_p in &r.phys {
-                    if existing_p.raw() == new_p.raw() {
-                        panic!(
-                            "map_region: duplicate phys {:#x} new-base={:#x} existing-base={:#x}",
-                            new_p.raw(),
-                            region.base.as_u64(),
-                            r.base.as_u64(),
-                        );
+            // Diagnostic double-free guard (debug builds only): a non-SHARED
+            // region must not point at a phys frame already mapped by another
+            // region in this AS, or `AddressSpace::drop` would unmap it twice
+            // and double-free the phys. This is O(pages^2) per region pair —
+            // catastrophic on an mmap-heavy workload where one AS faults in
+            // hundreds of DSOs (a Plasma/Wayland session), which dominated the
+            // CPU and stalled `narf-plasma` startup. The double-free it hunted
+            // is fixed (frame-zero-on-free repro), so it is now debug-only; the
+            // overlap check above stays in every build. SHARED regions borrow
+            // registry-owned frames (aliasing is expected + safe), so skip them.
+            #[cfg(debug_assertions)]
+            if !region.perms.contains(RegionPerms::SHARED) {
+                for new_p in &region.phys {
+                    if new_p.raw() == 0 {
+                        continue;
+                    }
+                    for existing_p in &r.phys {
+                        if existing_p.raw() == new_p.raw() {
+                            panic!(
+                                "map_region: duplicate phys {:#x} new-base={:#x} existing-base={:#x}",
+                                new_p.raw(),
+                                region.base.as_u64(),
+                                r.base.as_u64(),
+                            );
+                        }
                     }
                 }
             }
