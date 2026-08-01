@@ -58,8 +58,11 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         }
     };
     let nonblock = status_flags & crate::fd::O_NONBLOCK != 0;
-    // Closure error channel: `Err(true)` ⇒ broken pipe (raise SIGPIPE +
-    // return -EPIPE), `Err(false)` ⇒ generic write failure / bad fd.
+    enum WriteError {
+        BrokenPipe,
+        NoSpace,
+        Other,
+    }
     let outcome = Some({
         let res =
             poll_blocking(ops.write(off, &kbuf)).unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
@@ -73,8 +76,9 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
                 Ok(written)
             }
             // A write to a FIFO / pipe with no remaining readers: SIGPIPE + EPIPE.
-            Err(narf_filesystem::FsError::BrokenPipe) => Err(true),
-            Err(_) => Err(false),
+            Err(narf_filesystem::FsError::BrokenPipe) => Err(WriteError::BrokenPipe),
+            Err(narf_filesystem::FsError::NoSpace) => Err(WriteError::NoSpace),
+            Err(_) => Err(WriteError::Other),
         }
     });
     // A write that made no progress on a full pipe (reader still open) must
@@ -134,9 +138,12 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         }
         // Broken pipe: POSIX raises SIGPIPE on the writer (default action
         // terminates unless it's caught/ignored) AND the write returns -EPIPE.
-        Some(Err(true)) => {
+        Some(Err(WriteError::BrokenPipe)) => {
             raise_signal_pending(task, 13); // SIGPIPE
             ctx.set_return(SyscallReturn::ok((-32i64) as u64)); // -EPIPE
+        }
+        Some(Err(WriteError::NoSpace)) => {
+            ctx.set_return(SyscallReturn::ok((-28i64) as u64)); // -ENOSPC
         }
         // TODO(linux-gap): bad fd should be -EBADF, but this `_` also catches
         // write rejections (e.g. sealed memfd → -EPERM) — needs a split.

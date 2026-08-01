@@ -8,9 +8,14 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
     let offset = args.arg2;
     let len = args.arg3;
     let fail = SyscallReturn::ok((-1i64) as u64);
-
-    if mode != 0 && mode != FALLOC_FL_ZERO_RANGE {
-        ctx.set_return(fail);
+    const KEEP_SIZE: u64 = 0x01;
+    const PUNCH_HOLE: u64 = 0x02;
+    const ZERO_RANGE: u64 = 0x10;
+    if len == 0
+        || mode & !(KEEP_SIZE | PUNCH_HOLE | ZERO_RANGE) != 0
+        || mode & PUNCH_HOLE != 0 && mode != PUNCH_HOLE | KEEP_SIZE
+    {
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
         return;
     }
     let target_end = offset.saturating_add(len);
@@ -19,9 +24,12 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
         let entry = t.get(fd)?;
         let ops = entry.ops.clone();
         match poll_blocking(ops.fallocate(mode as u32, offset, len)) {
-            Some(Ok(())) => return Some(true),
+            Some(Ok(())) => return Some(Ok(())),
             Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
-            _ => return Some(false),
+            Some(Err(error)) => return Some(Err(error)),
+        }
+        if mode != 0 && mode != FALLOC_FL_ZERO_RANGE {
+            return Some(Err(narf_filesystem::FsError::Unsupported));
         }
         let cur_size = ops.stat().size;
         // Always ensure size >= offset + len. truncate handles
@@ -31,7 +39,7 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
                 .and_then(|r| r.ok())
                 .is_none()
         {
-            return Some(false);
+            return Some(Err(narf_filesystem::FsError::NoSpace));
         }
         if mode == FALLOC_FL_ZERO_RANGE && len > 0 && offset < cur_size {
             // Zero existing bytes in [offset, min(target_end, old size)].
@@ -50,10 +58,16 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
                 cur += n as u64;
             }
         }
-        Some(true)
+        Some(Ok(()))
     });
     match outcome {
-        Some(Some(true)) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Err(narf_filesystem::FsError::NoSpace))) => {
+            ctx.set_return(SyscallReturn::ok((-28i64) as u64))
+        }
+        Some(Some(Err(narf_filesystem::FsError::Unsupported))) => {
+            ctx.set_return(SyscallReturn::ok((-95i64) as u64))
+        }
         _ => ctx.set_return(fail),
     }
 }

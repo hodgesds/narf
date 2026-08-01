@@ -837,11 +837,22 @@ fn e2e_global_filesystems_lists_known_types() -> TestResult {
     if !has("proc") {
         return TestResult::Fail("/proc/filesystems missing 'proc' type");
     }
+    if !has("tmpfs") || !has("ramfs") {
+        return TestResult::Fail("/proc/filesystems missing tmpfs or ramfs type");
+    }
     if !body
         .lines()
         .any(|line| line.split_whitespace().eq(["nodev", "proc"]))
     {
         return TestResult::Fail("/proc/filesystems must mark proc as nodev");
+    }
+    for ty in ["tmpfs", "ramfs"] {
+        if !body
+            .lines()
+            .any(|line| line.split_whitespace().eq(["nodev", ty]))
+        {
+            return TestResult::Fail("tmpfs/ramfs must be marked nodev");
+        }
     }
     // Every line is either "<type>" or "nodev <type>".
     for l in body.lines() {

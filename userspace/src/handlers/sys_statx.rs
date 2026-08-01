@@ -48,8 +48,10 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         }
         let task = current_task_id();
         let st = fd::with_table(task, |t| {
-            t.get(dirfd as u32)
-                .map(|e| (e.ops.stat(), e.ops.ino(), e.ops.rdev()))
+            t.get(dirfd as u32).map(|e| {
+                let (uid, gid) = e.ops.owners();
+                (e.ops.stat(), e.ops.ino(), e.ops.rdev(), uid, gid)
+            })
         })
         .flatten();
         // The mount id of the mount this fd resides on. systemd's
@@ -94,8 +96,8 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         (st, current_mount_id_at(&path_owned))
     };
 
-    let (s, ino, rdev) = match fs_stat {
-        Some(triple) => triple,
+    let (s, ino, rdev, uid, gid) = match fs_stat {
+        Some(tuple) => tuple,
         None => {
             // File doesn't exist — report ENOENT, not the bare -1 sentinel
             // (which musl maps to EPERM). Callers that probe for a path's
@@ -138,6 +140,8 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     let filled = STATX_TYPE
         | STATX_MODE
         | STATX_NLINK
+        | STATX_UID
+        | STATX_GID
         | STATX_INO
         | STATX_SIZE
         | STATX_BLOCKS
@@ -157,6 +161,8 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
             (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff
         },
         stx_nlink: 1,
+        stx_uid: uid,
+        stx_gid: gid,
         stx_rdev_major: rdev_major,
         stx_rdev_minor: rdev_minor,
         stx_mnt_id: mnt_id.unwrap_or(0),

@@ -7,7 +7,7 @@ pub(crate) fn sys_mkdirat(ctx: &mut dyn TrapContext) {
     // mode_t mode)`. arg2 is mode, not path_len.
     let dirfd = args.arg0 as i64;
     let path_uptr = args.arg1;
-    let mode = args.arg2;
+    let mode = args.arg2 as u32;
     let path_str = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {
@@ -15,7 +15,6 @@ pub(crate) fn sys_mkdirat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let _ = mode;
     const AT_FDCWD: i64 = -100;
     let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD {
         path_str
@@ -33,5 +32,5 @@ pub(crate) fn sys_mkdirat(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
         return;
     };
-    crate::handlers::handler_sys_mkdir::mkdir_path(ctx, &effective);
+    crate::handlers::handler_sys_mkdir::mkdir_path(ctx, &effective, mode);
 }

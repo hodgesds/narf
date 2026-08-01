@@ -237,14 +237,14 @@ fn resolve_dir_absolute(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesyst
 /// sub-directories alike) synthesise a `DIR_RW`-shaped stat so callers
 /// see `S_IFDIR`. Returns `None` only when the path names nothing.
 fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
-    stat_ino_path_dir_aware(path).map(|(s, _ino, _rdev)| s)
+    stat_ino_path_dir_aware(path).map(|(s, _ino, _rdev, _uid, _gid)| s)
 }
 
 // Same resolution as `stat_path_dir_aware`, but also returns the file's
 // real inode number (0 for synthetic FS / dir-root synthesis). Used by
 // the stat/statx handlers so the Linux `st_ino` is a stable per-file id
 // rather than a size-derived hash that aliases same-size DSOs.
-fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u64)> {
+fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u64, u32, u32)> {
     stat_ino_path_dir_aware_ext(path, true)
 }
 
@@ -256,14 +256,17 @@ fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u6
 fn stat_ino_path_dir_aware_ext(
     path: &str,
     follow_final: bool,
-) -> Option<(narf_filesystem::Stat, u64, u64)> {
+) -> Option<(narf_filesystem::Stat, u64, u64, u32, u32)> {
     let file = current_resolve_absolute(path, |fs, rel| {
         if rel.is_empty() {
             // A file-rooted mount (mount --bind of a file, e.g. systemd's
             // read-only /proc/sys/kernel/domainname protection) IS the file at
             // its own path — stat it directly. A directory-rooted mount falls
             // through to the resolve_dir_absolute path below.
-            fs.root_file().map(|f| (f.stat(), f.ino(), f.rdev()))
+            fs.root_file().map(|f| {
+                let (uid, gid) = f.owners();
+                (f.stat(), f.ino(), f.rdev(), uid, gid)
+            })
         } else {
             // Drive the ASYNC resolver (same as the open/execve path):
             // on-disk filesystems like ext2 implement `lookup_async` but
@@ -283,7 +286,10 @@ fn stat_ino_path_dir_aware_ext(
             // device node's type via the MAJOR:MINOR from a PATH
             // stat (not just fstat) — a 0 rdev reads as "not an
             // evdev/drm device" and they refuse to open it.
-            .map(|ops| (ops.stat(), ops.ino(), ops.rdev()))
+            .map(|ops| {
+                let (uid, gid) = ops.owners();
+                (ops.stat(), ops.ino(), ops.rdev(), uid, gid)
+            })
         }
     })
     .flatten();
@@ -291,6 +297,7 @@ fn stat_ino_path_dir_aware_ext(
         return file;
     }
     if let Some(dir) = resolve_dir_absolute(path) {
+        let (uid, gid) = dir.dir_owners();
         // Report the directory's real (chmod-settable) mode, not a
         // hardcoded 0o777 — dbus/systemd reject XDG_RUNTIME_DIR unless
         // it is not group/other-writable, so `chmod 0700` must show.
@@ -310,6 +317,8 @@ fn stat_ino_path_dir_aware_ext(
             },
             dir.ino(),
             0,
+            uid,
+            gid,
         ));
     }
     // A path that is an ancestor of a mount point (e.g. /sys/fs when
@@ -333,6 +342,8 @@ fn stat_ino_path_dir_aware_ext(
                 mtime_cycles: 0,
             },
             ino,
+            0,
+            0,
             0,
         ));
     }
@@ -380,6 +391,9 @@ impl narf_filesystem::FileOps for DirFdFile {
             },
             mtime_cycles: 0,
         }
+    }
+    fn owners(&self) -> (u32, u32) {
+        self.dir.dir_owners()
     }
     fn as_dir(&self) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
         Some(self.dir.clone())
@@ -1609,6 +1623,7 @@ const SYSFS_MAGIC: u64 = 0x6265_6572;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const MQUEUE_MAGIC: u64 = 0x1980_0202;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
+const RAMFS_MAGIC: u64 = 0x8584_58f6;
 const EXT2_SUPER_MAGIC: u64 = 0xEF53;
 
 fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
@@ -1632,6 +1647,7 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
         "sysfs" => SYSFS_MAGIC,
         "procfs" | "proc" => PROC_SUPER_MAGIC,
         "mqueue" => MQUEUE_MAGIC,
+        "ramfs" => RAMFS_MAGIC,
         n if n.starts_with("ext") => EXT2_SUPER_MAGIC,
         _ => TMPFS_MAGIC, // tmpfs / devtmpfs / shm / other memfs-backed
     };

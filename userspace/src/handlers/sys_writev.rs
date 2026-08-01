@@ -55,7 +55,7 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
             }
         };
         let outcome = fd::with_table(task, |t| {
-            let entry = t.get_mut(fd).ok_or(())?;
+            let entry = t.get_mut(fd).ok_or(9i32)?;
             let cur_off = entry.offset;
             let res = poll_blocking(entry.ops.write(cur_off, &kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
@@ -64,7 +64,8 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
                     entry.offset = cur_off.saturating_add(written as u64);
                     Ok(written)
                 }
-                Err(_) => Err(()),
+                Err(narf_filesystem::FsError::NoSpace) => Err(28),
+                Err(_) => Err(1),
             }
         });
         match outcome {
@@ -73,6 +74,10 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
                 if n < kbuf.len() {
                     break;
                 }
+            }
+            Some(Err(errno)) if total == 0 => {
+                ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                return;
             }
             _ => {
                 if total == 0 {
