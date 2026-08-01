@@ -3053,12 +3053,22 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
     #[cfg(feature = "kernel-test")]
     {
+        // `test_subsystem=a,b,c` selects those subsystems (prefix-matched:
+        // `filesystem` selects `filesystem/page_cache` too). This is the
+        // change-based CI path — `cargo xtask affected` computes the
+        // affected set and CI threads it here. Absent/empty ⇒ run all.
         let selected = narf_boot::cmdline()
             .split_ascii_whitespace()
             .find_map(|arg| arg.strip_prefix("test_subsystem="));
         match selected {
-            Some(subsystem) if !subsystem.is_empty() => {
-                narf_verification::run_subsystem_and_exit(subsystem)
+            Some(list) if !list.is_empty() => {
+                let wanted: alloc::vec::Vec<&str> =
+                    list.split(',').filter(|s| !s.is_empty()).collect();
+                if wanted.is_empty() {
+                    narf_verification::run_all_and_exit()
+                } else {
+                    narf_verification::run_subsystems_and_exit(&wanted)
+                }
             }
             _ => narf_verification::run_all_and_exit(),
         }

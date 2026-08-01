@@ -20,6 +20,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// The `affected` subcommand: crate reverse-dependency closure → the set
+/// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
+mod affected;
 /// `verification/specification/spec.md` §8's statistics, split out because
 /// they are the only part of xtask with unit tests — a wrong t-distribution
 /// tail invalidates every number that passes through it, silently.
@@ -42,6 +45,12 @@ enum Cmd {
     /// kernel linker script, privileged instructions, or QEMU belong in
     /// `xtask test`, not in this gate.
     HostTest,
+    /// Compute which CI jobs and kernel-test subsystems a change can
+    /// affect, from the git diff against a base ref + the workspace
+    /// reverse-dependency closure. Emits JSON (default) or GitHub Actions
+    /// outputs (`--github`). Hub-crate / build-infra / unknown-path
+    /// changes and push-to-main / nightly events force a full run.
+    Affected(affected::AffectedArgs),
     /// Cross-compile the kernel.
     Build(BuildArgs),
     /// Cross-compile and boot under QEMU.
@@ -110,7 +119,7 @@ enum Cmd {
     /// either binary regresses. x86_64 only — `hello_musl` is a
     /// stock-musl-built ELF that requires `int 0x80` / `syscall`
     /// dual dispatch + CR4.OSFXSR.
-    MuslDemo(BuildArgs),
+    MuslDemo(MuslDemoArgs),
     /// BPF microbenchmark suite under the `verification/` §8 statistical
     /// protocol. Boots the kernel with `narf-bpf/bench` + the `bpf_bench`
     /// cmdline flag, harvests the raw samples the in-kernel harness emits,
@@ -368,7 +377,9 @@ struct TestArgs {
     #[command(flatten)]
     build: BuildArgs,
 
-    /// Run only kernel tests registered under this exact subsystem.
+    /// Run only kernel tests under these subsystems. Comma-separated;
+    /// each is prefix-matched in-kernel (`filesystem` also selects
+    /// `filesystem/page_cache`). Empty/absent runs the whole suite.
     #[arg(long)]
     subsystem: Option<String>,
 }
@@ -394,6 +405,47 @@ struct RunInteractiveArgs {
     /// `--cmd "ls /bin" --expect "cat"`, etc.
     #[arg(long, default_value = "hello world")]
     expect: String,
+
+    /// Re-boot and retry this many times if the boot/echo fails or times
+    /// out (each attempt is a fresh QEMU). The reliability primitive for
+    /// the flaky-under-TCG cases: a genuine break still fails after all
+    /// attempts, a flake passes on retry. Default 0 (no retry).
+    #[arg(long, default_value_t = 0)]
+    retries: u32,
+
+    /// Boot this already-built kernel binary instead of compiling. Used by
+    /// the split per-case `musl-demo` CI jobs: one job builds the kernel,
+    /// uploads it, and each case job boots the downloaded artifact — no N×
+    /// rebuilds. When set, `--features`/`--package` are ignored (the
+    /// prebuilt image already baked them in).
+    #[arg(long, value_name = "PATH")]
+    prebuilt: Option<String>,
+}
+
+/// Args for `xtask musl-demo`. Inherits BuildArgs; adds subsystem-group
+/// sharding (`--group`/`--list-groups`) and prebuilt-kernel boot so CI can
+/// build once and fan the cases out across a handful of parallel jobs by
+/// subsystem rather than one slow ~80-case boot.
+#[derive(Parser, Clone)]
+struct MuslDemoArgs {
+    #[command(flatten)]
+    build: BuildArgs,
+
+    /// Run only the cases in this subsystem group (see `--list-groups`).
+    /// Omitted ⇒ run every group in this invocation (the local full run).
+    #[arg(long)]
+    group: Option<String>,
+
+    /// Print the JSON array of subsystem groups (the CI matrix consumes
+    /// this) and exit without booting.
+    #[arg(long)]
+    list_groups: bool,
+
+    /// Boot this already-built kernel instead of cross-building. The
+    /// per-group CI jobs download the artifact the build job produced and
+    /// boot it, so no group re-compiles the kernel.
+    #[arg(long, value_name = "PATH")]
+    prebuilt: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum, Default, Debug)]
@@ -2074,16 +2126,105 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
 /// x86_64 only: `hello_musl` is a stock musl-built ELF and the
 /// CR4.OSFXSR / arch_prctl / int 0x80-vs-syscall plumbing is all
 /// x86-specific; the aarch64 mirror is a separate sub-wave.
-fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
-    if !matches!(args.arch, Arch::X86_64) {
+/// Bucket a musl-demo case into a coarse subsystem group, so CI can fan
+/// the ~80 cases out across a handful of parallel jobs by subsystem
+/// (`--group`) rather than one long serial boot. This is a total function
+/// — every case maps to exactly one group, so the union of all groups is
+/// the whole suite regardless of how a given case is bucketed (an
+/// imprecise match only shifts load, never drops coverage). First match
+/// wins; order matters.
+fn musl_case_group(cmd: &str) -> &'static str {
+    let has = |needles: &[&str]| needles.iter().any(|n| cmd.contains(n));
+    if has(&[
+        "wl_",
+        "mini_compositor",
+        "drm_smoke",
+        "modetest",
+        "fb_smoke",
+        "kms",
+        "tfd_epoll",
+    ]) {
+        "gui"
+    } else if has(&[
+        "net_smoke",
+        "net6",
+        "unix_smoke",
+        "epoll_smoke",
+        "sockpair",
+        "accept4",
+        "mmsg",
+        "ppoll_smoke",
+        "scm_smoke",
+    ]) {
+        "net"
+    } else if has(&["sig", "alarmloop", "preemptsched"]) {
+        "signals"
+    } else if has(&[
+        "futex",
+        "cond",
+        "barrier",
+        "robust",
+        "notify_epoll",
+        "sysvipc",
+        "shm_smoke",
+        "eventfd",
+        "keyring",
+    ]) {
+        "ipc"
+    } else if has(&[
+        "fs_smoke",
+        "navfs",
+        "relpaths",
+        "pipeof",
+        "pipeblk",
+        "xattr",
+        "renameat2",
+        "mountapi",
+        "fhandle",
+        "inotify",
+        "fanotify",
+        "splice",
+        "sendfile",
+        "sync_smoke",
+        "fsmisc",
+        "landlock",
+        "lsm",
+    ]) {
+        "fs"
+    } else if has(&["mremap", "mcore", "mem2", "mempolicy", "pkey", "pvm"]) {
+        "mem"
+    } else if has(&[
+        "hello",
+        "busybox",
+        "fork",
+        "sh -c",
+        "pty",
+        "jobctl",
+        "creds",
+        "waitid",
+        "pidfd",
+        "strace",
+        "sched",
+        "closerange",
+        "dup3",
+        "fd_cloexec",
+        "oci",
+    ]) {
+        "process"
+    } else {
+        "linux-compat"
+    }
+}
+
+fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
+    if !matches!(args.build.arch, Arch::X86_64) {
         bail!("musl-demo is x86_64 only (hello_musl is not built for aarch64)");
     }
 
-    // Two `run-interactive` invocations, sharing the same build
-    // args. The boot itself is the slow part (~30-60s on CI); each
-    // invocation re-builds nothing because Cargo's incremental build
-    // is warm after the first.
-    let cases: &[(&str, &str)] = &[
+    // Lightweight cases run in a SINGLE shared boot (the TCG boot dwarfs
+    // per-command runtime, so amortizing across commands is the win). The
+    // heavy GUI cases each need their own fresh boot (see GUI_FRESH_BOOT).
+    let lightweight: &[(&str, &str)] = &[
         ("hello", "hello"),
         ("hello_musl", "hello from musl"),
         ("hello_musl_dyn", "hello from musl dyn"),
@@ -2341,40 +2482,12 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // per-DSO TLS: thread-locals in a shared library (libtls).
         ("tls_smoke", "tls-ok"),
     ];
-    // Run every case in a SINGLE QEMU boot rather than one boot per
-    // command — the TCG boot (especially on CI) dwarfs the per-command
-    // runtime, so amortizing it across all commands is the big win.
-    // The VM keeps its full multi-vCPU/NUMA topology so concurrency
-    // bugs still surface.
-    let (mut passed, mut failed, main_failed) = run_interactive_multi(args, cases)?;
-
-    // Retry any shared-boot case that failed once, alone in a fresh boot: a
-    // genuinely-broken case still fails (it fails both times and stays
-    // counted), but a one-off environmental flake (host scheduling jitter
-    // on a loaded runner, SLIRP timing) clears. The SMP scheduler-resume
-    // strand class this retry originally absorbed is fixed (FUTEX_REQUEUE +
-    // park-loop futex-word re-validation + spawn→idle-AP resched kick); the
-    // retry is kept as a cheap general flake bound for the long shared-boot
-    // batch.
-    for (cmdline, expect) in &main_failed {
-        eprintln!("\nmusl-demo (retry after strand): {cmdline}");
-        let (p, _f, _) = run_interactive_multi(
-            args,
-            core::slice::from_ref(&(cmdline.as_str(), expect.as_str())),
-        )?;
-        if p > 0 {
-            // Cleared on the isolated retry → reclassify as a pass.
-            passed += 1;
-            failed -= 1;
-        }
-    }
 
     // Heavy multi-process Wayland compositor cases — each forks a compositor
     // + client(s) and maps the framebuffer. That per-process state accumulates
     // across a single long-lived VM and makes a later case hang
     // nondeterministically, so each gets its OWN fresh boot. They pass
-    // reliably in isolation. The TCG boot is amortized for the ~80 lightweight
-    // cases above; these few extra boots are the price of robust GUI coverage.
+    // reliably in isolation.
     const GUI_FRESH_BOOT: &[(&str, &str)] = &[
         ("mini_compositor", "px=00c0ffee"),
         ("wl_2proc", "2proc-ok 1280x800 px=00c0ffee"),
@@ -2388,20 +2501,92 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("wl_evdev", "evdev-ok 1280x800 key=30"),
         ("wl_app", "app-ok 1280x800 win=250x250"),
     ];
-    for case in GUI_FRESH_BOOT {
+
+    // `--list-groups`: emit the distinct subsystem groups over ALL cases so
+    // the CI matrix runs exactly the non-empty groups (no drift, no gaps).
+    if args.list_groups {
+        let mut groups: Vec<&str> = lightweight
+            .iter()
+            .chain(GUI_FRESH_BOOT.iter())
+            .map(|(cmd, _)| musl_case_group(cmd))
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let json = groups
+            .iter()
+            .map(|g| format!("{g:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("[{json}]");
+        return Ok(());
+    }
+
+    // Resolve the kernel once: a prebuilt artifact (the per-group CI jobs
+    // boot the same downloaded image) or a fresh build (run_interactive_multi
+    // builds on the first call, warm-incremental after).
+    let prebuilt: Option<PathBuf> = match &args.prebuilt {
+        Some(p) => {
+            let k = PathBuf::from(p);
+            if !k.exists() {
+                bail!("--prebuilt kernel not found at {}", k.display());
+            }
+            Some(k)
+        }
+        None => None,
+    };
+    let kernel_override = prebuilt.as_deref();
+
+    // Select this invocation's group (or all groups when unset).
+    let want = |cmd: &str| {
+        args.group
+            .as_deref()
+            .is_none_or(|g| musl_case_group(cmd) == g)
+    };
+    if let Some(g) = &args.group {
+        eprintln!("xtask musl-demo: running subsystem group `{g}`");
+    }
+
+    // Lightweight cases in this group → one shared boot.
+    let selected: Vec<(&str, &str)> = lightweight.iter().copied().filter(|t| want(t.0)).collect();
+    let (mut passed, mut failed, main_failed) = if selected.is_empty() {
+        (0usize, 0usize, Vec::new())
+    } else {
+        run_interactive_multi(&args.build, &selected, kernel_override)?
+    };
+
+    // Retry any shared-boot case that failed once, alone in a fresh boot: a
+    // genuinely-broken case still fails (and stays counted), but a one-off
+    // environmental flake (host scheduling jitter on a loaded runner, SLIRP
+    // timing) clears.
+    for (cmdline, expect) in &main_failed {
+        eprintln!("\nmusl-demo (retry): {cmdline}");
+        let (p, _f, _) = run_interactive_multi(
+            &args.build,
+            core::slice::from_ref(&(cmdline.as_str(), expect.as_str())),
+            kernel_override,
+        )?;
+        if p > 0 {
+            // Cleared on the isolated retry → reclassify as a pass.
+            passed += 1;
+            failed -= 1;
+        }
+    }
+
+    // GUI cases in this group → one fresh boot each.
+    for case in GUI_FRESH_BOOT.iter().filter(|t| want(t.0)) {
         eprintln!("\nmusl-demo (fresh boot): {}", case.0);
-        let (p, f, _) = run_interactive_multi(args, core::slice::from_ref(case))?;
+        let (p, f, _) =
+            run_interactive_multi(&args.build, core::slice::from_ref(case), kernel_override)?;
         passed += p;
         failed += f;
     }
 
-    // (The former SMP_REDUCED_FRESH_BOOT SMP=1 pin for `futex_contend_smoke`
-    // is retired: the SMP scheduler-resume strand class it worked around is
-    // fixed — FUTEX_REQUEUE implemented, park-loop futex-word re-validation,
-    // spawn→idle-AP resched kick — and the case now runs in the shared-boot
-    // batch above at the full 16-vCPU/2-socket-NUMA topology.)
-
-    eprintln!("\nmusl-demo summary: {} passed, {} failed", passed, failed);
+    eprintln!(
+        "\nmusl-demo summary ({}): {} passed, {} failed",
+        args.group.as_deref().unwrap_or("all"),
+        passed,
+        failed
+    );
     if failed > 0 {
         bail!("musl-demo failed ({} errors)", failed);
     }
@@ -2409,33 +2594,46 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
 }
 
 fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
-    use std::io::Write;
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    use std::sync::{Arc, Mutex};
-
     if !matches!(args.build.arch, Arch::X86_64) {
         // The shell + boot_userspace_init are x86_64-only today
         // (`cfg(all(feature = "boot-init", target_arch = "x86_64"))`).
         bail!("xtask run-interactive: only x86_64 is wired (aarch64 boot-init is a stub)");
     }
 
-    let mut build = args.build.clone();
-    ensure_feature(&mut build.features, "boot-init");
-    // Bring up at least the firmware ack the boot-init flow assumes;
-    // matches `Cmd::IsoBoot` / `Cmd::Image` defaults so the shell
-    // actually loads.
-    ensure_feature(&mut build.features, "firmware-allow-unsigned");
-
     let root = workspace_root()?;
-    let out_dir = cargo_build(&build, &root)?;
 
-    let kernel = out_dir.join(&build.package);
-    if !kernel.exists() {
-        bail!(
-            "expected kernel binary at {} — did `cargo build` succeed?",
-            kernel.display()
-        );
-    }
+    // Resolve the kernel image: a prebuilt artifact (the split per-case
+    // `musl-demo` jobs download one and boot it) or a fresh cross-build.
+    let (kernel, out_dir) = match &args.prebuilt {
+        Some(path) => {
+            let kernel = PathBuf::from(path);
+            if !kernel.exists() {
+                bail!("--prebuilt kernel not found at {}", kernel.display());
+            }
+            let out_dir = kernel
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.clone());
+            (kernel, out_dir)
+        }
+        None => {
+            let mut build = args.build.clone();
+            ensure_feature(&mut build.features, "boot-init");
+            // Bring up at least the firmware ack the boot-init flow assumes;
+            // matches `Cmd::IsoBoot` / `Cmd::Image` defaults so the shell
+            // actually loads.
+            ensure_feature(&mut build.features, "firmware-allow-unsigned");
+            let out_dir = cargo_build(&build, &root)?;
+            let kernel = out_dir.join(&build.package);
+            if !kernel.exists() {
+                bail!(
+                    "expected kernel binary at {} — did `cargo build` succeed?",
+                    kernel.display()
+                );
+            }
+            (kernel, out_dir)
+        }
+    };
 
     let fw_dir = root.join("target").join("firmware");
     let (fw_initramfs, _) = collect_firmware_blobs(&fw_dir, &args.build.initramfs_firmware)?;
@@ -2452,11 +2650,56 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
         cpio_path = Some(p);
     }
 
-    let qemu = build.arch.qemu_bin();
+    // Retry loop: each attempt is a fresh QEMU boot. A flake (e.g. a
+    // TCG-timing echo miss) passes on a re-boot; a genuine break fails
+    // after every attempt. `--retries 0` (default) means a single boot.
+    let attempts = args.retries + 1;
+    let mut last_err = None;
+    for attempt in 1..=attempts {
+        if attempts > 1 {
+            eprintln!(
+                "xtask run-interactive: attempt {attempt}/{attempts} for `{}`",
+                args.cmd
+            );
+        }
+        match run_interactive_boot(
+            &kernel,
+            cpio_path.as_ref(),
+            args.build.arch,
+            &args.build.display,
+            args.build.hw_profile,
+            &args.cmd,
+            &args.expect,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("xtask run-interactive: attempt {attempt} failed: {e:#}");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("run-interactive: no attempts made")))
+}
+
+/// Boot `kernel` under QEMU, log in as root, type `typed_cmd`, and assert
+/// `expect` appears on the serial console. One attempt; the caller retries.
+#[allow(clippy::too_many_arguments)]
+fn run_interactive_boot(
+    kernel: &Path,
+    cpio_path: Option<&PathBuf>,
+    arch: Arch,
+    display: &str,
+    hw_profile: HwProfile,
+    typed_cmd: &str,
+    expect: &str,
+) -> Result<()> {
+    use std::io::Write;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::{Arc, Mutex};
+
+    let qemu = arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    let mut qemu_args = build
-        .arch
-        .qemu_args(&kernel, &build.display, build.hw_profile);
+    let mut qemu_args = arch.qemu_args(kernel, display, hw_profile);
     if let Some(cpio) = cpio_path {
         qemu_args.push("-initrd".into());
         qemu_args.push(cpio.display().to_string());
@@ -2672,7 +2915,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 
     println!(
         "\nxtask run-interactive: prompt seen, typing `{}`...",
-        args.cmd
+        typed_cmd
     );
 
     // Drain the kernel's late-boot log noise (USB-HID enumeration
@@ -2693,10 +2936,8 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
     // to consider bytes from here onwards.
     let pre_type_pos = captured.lock().map(|g| g.len()).unwrap_or(0);
 
-    // Wave-49: typed line is the configurable `args.cmd` with a
-    // trailing newline. Default is "echo hello world" for parity
-    // with the Wave-45 echo smoke.
-    let mut typed: Vec<u8> = args.cmd.as_bytes().to_vec();
+    // Typed line is the configurable command with a trailing newline.
+    let mut typed: Vec<u8> = typed_cmd.as_bytes().to_vec();
     typed.push(b'\n');
     for &b in &typed {
         if stdin.write_all(&[b]).is_err() {
@@ -2732,9 +2973,8 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
     // local-echo copy when it arrives intact, which only happens
     // when the keystroke→shell→UART loop is working end to end
     // anyway. Either way, the test asserts what it claims to.
-    // Wave-49: the expected substring is configurable via
-    // `args.expect`. Default is "hello world".
-    let needle: Vec<u8> = args.expect.as_bytes().to_vec();
+    // The expected substring is configurable via `expect`.
+    let needle: Vec<u8> = expect.as_bytes().to_vec();
     let echo_deadline = Duration::from_secs(echo_secs);
     let echo_start = std::time::Instant::now();
     let mut got_echo = false;
@@ -2831,15 +3071,15 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
         bail!(
             "xtask run-interactive: typed `{}` but did not \
              see `{}` echoed back within {}s",
-            args.cmd,
-            args.expect,
+            typed_cmd,
+            expect,
             echo_secs
         );
     }
 
     println!(
         "\nxtask run-interactive: ok — typed `{}`, saw `{}`",
-        args.cmd, args.expect,
+        typed_cmd, expect,
     );
     Ok(())
 }
@@ -4920,6 +5160,7 @@ fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
 fn run_interactive_multi(
     build_in: &BuildArgs,
     cases: &[(&str, &str)],
+    kernel_override: Option<&Path>,
 ) -> Result<(usize, usize, Vec<(String, String)>)> {
     use std::io::{Read, Write};
     use std::sync::mpsc::{self, RecvTimeoutError};
@@ -4930,18 +5171,30 @@ fn run_interactive_multi(
     }
 
     let mut build = build_in.clone();
-    ensure_feature(&mut build.features, "boot-init");
-    ensure_feature(&mut build.features, "firmware-allow-unsigned");
-
-    let root = workspace_root()?;
-    let out_dir = cargo_build(&build, &root)?;
-    let kernel = out_dir.join(&build.package);
-    if !kernel.exists() {
-        bail!(
-            "expected kernel binary at {} — did `cargo build` succeed?",
-            kernel.display()
-        );
-    }
+    // A prebuilt kernel (the sharded musl-demo CI jobs download one and
+    // boot it) skips the cross-build entirely.
+    let kernel = match kernel_override {
+        Some(k) => {
+            if !k.exists() {
+                bail!("--prebuilt kernel not found at {}", k.display());
+            }
+            k.to_path_buf()
+        }
+        None => {
+            ensure_feature(&mut build.features, "boot-init");
+            ensure_feature(&mut build.features, "firmware-allow-unsigned");
+            let root = workspace_root()?;
+            let out_dir = cargo_build(&build, &root)?;
+            let kernel = out_dir.join(&build.package);
+            if !kernel.exists() {
+                bail!(
+                    "expected kernel binary at {} — did `cargo build` succeed?",
+                    kernel.display()
+                );
+            }
+            kernel
+        }
+    };
 
     let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
@@ -7230,6 +7483,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::HostTest => host_test_cmd(),
+        Cmd::Affected(args) => {
+            let root = workspace_root()?;
+            affected::affected_cmd(&args, &root)
+        }
         Cmd::Build(args) => {
             cargo_build(&args, &workspace_root()?)?;
             Ok(())
@@ -7239,12 +7496,20 @@ fn main() -> Result<()> {
             let mut args = test.build;
             let prior_append = std::env::var_os("XTASK_QEMU_APPEND");
             if let Some(subsystem) = &test.subsystem {
-                if subsystem.is_empty()
-                    || !subsystem
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
+                // Comma-separated list of subsystem filters (prefix-matched
+                // in-kernel). Each part is validated; the whole list is
+                // threaded onto the cmdline as `test_subsystem=a,b,c`.
+                let parts: Vec<&str> = subsystem.split(',').filter(|s| !s.is_empty()).collect();
+                if parts.is_empty()
+                    || parts.iter().any(|part| {
+                        !part
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
+                    })
                 {
-                    bail!("--subsystem must contain only letters, digits, '/', '_', '-', or '.'");
+                    bail!(
+                        "--subsystem parts must contain only letters, digits, '/', '_', '-', or '.'"
+                    );
                 }
                 let mut append = prior_append
                     .as_ref()

@@ -20,6 +20,9 @@ wait-timeout = "0.2"
 # compressed; Linux kernel decompresses at load time, NARF unpacks
 # at build-time and stores the raw payload).
 zstd = "0.13"
+# `cargo xtask affected` parses `cargo metadata --no-deps` JSON to build
+# the workspace dependency graph for change-based CI job selection.
+serde_json = "1.0"
 
 [lints]
 workspace = true
