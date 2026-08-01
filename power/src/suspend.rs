@@ -572,9 +572,15 @@ pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), 
     // identity-maps that page through the wake handoff.
     // SAFETY: Valid memory or trusted environment
     if unsafe { narf_acpi::arm_s3_waking_vector(entry_phys) }.is_err() {
-        // FACS hasn't been parsed (no `\_S3_` chain on this
-        // platform) or the entry phys is >4 GiB on a FACS v0
-        // firmware. Either way, we can't wake — refuse to sleep.
+        // Either the FACS hasn't been parsed (no `\_S3_` chain on
+        // this platform), or the firmware does not advertise the
+        // ACPI 4.0 64-bit wake environment
+        // (`FACS.Flags.64BIT_WAKE_SUPPORTED_F`). `s3_wake_entry` is
+        // a long-mode entry and NARF ships no real-mode trampoline,
+        // so the legacy 32-bit `FirmwareWakingVector` is not a
+        // fallback we can take. Either way we cannot wake — refuse
+        // to sleep. `arm_s3_waking_vector` leaves the FACS untouched
+        // when it errors.
         return Err(SuspendError::Aborted);
     }
     // Fan out device suspend handlers in reverse-registration order.

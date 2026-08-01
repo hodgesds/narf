@@ -2867,3 +2867,172 @@ kernel_test_in!(
     "acpi/wake_vector",
     smoke_acpi_arm_s3_waking_vector_requires_facs
 );
+
+/// A 64-byte FACS image, aligned as firmware would publish it, that
+/// `arm_s3_waking_vector` can be pointed at with `__test_set_facs_phys`
+/// so the writes land in test-owned memory instead of real firmware
+/// tables.
+///
+/// Alignment matters: the arming code writes `XFirmwareWakingVector`
+/// as an 8-byte store at +24, so the base must be at least 8-aligned.
+#[repr(C, align(64))]
+struct TestFacs([u8; 64]);
+
+/// Build a synthetic FACS body. `flags` / `version` / `ospm_flags`
+/// vary per case; the 32-bit `FirmwareWakingVector` is preloaded with
+/// a sentinel so a test can tell "written zero" apart from "not
+/// written at all".
+const FWV32_SENTINEL: u32 = 0xDEAD_BEEF;
+
+fn build_test_facs(flags: u32, version: u8, len: u32) -> alloc::boxed::Box<TestFacs> {
+    let mut f = alloc::boxed::Box::new(TestFacs([0u8; 64]));
+    f.0[0..4].copy_from_slice(b"FACS");
+    f.0[4..8].copy_from_slice(&len.to_le_bytes());
+    f.0[8..12].copy_from_slice(&0xABCD_1234u32.to_le_bytes()); // hardware sig
+    f.0[12..16].copy_from_slice(&FWV32_SENTINEL.to_le_bytes()); // FirmwareWakingVector
+    f.0[16..20].copy_from_slice(&0u32.to_le_bytes()); // GlobalLock
+    f.0[20..24].copy_from_slice(&flags.to_le_bytes()); // Flags
+    f.0[24..32].copy_from_slice(&0u64.to_le_bytes()); // XFirmwareWakingVector
+    f.0[32] = version;
+    f.0[36..40].copy_from_slice(&0u32.to_le_bytes()); // OspmFlags
+    f
+}
+
+fn facs_u32(f: &TestFacs, off: usize) -> u32 {
+    u32::from_le_bytes([f.0[off], f.0[off + 1], f.0[off + 2], f.0[off + 3]])
+}
+
+fn facs_u64(f: &TestFacs, off: usize) -> u64 {
+    u64::from_le_bytes([
+        f.0[off],
+        f.0[off + 1],
+        f.0[off + 2],
+        f.0[off + 3],
+        f.0[off + 4],
+        f.0[off + 5],
+        f.0[off + 6],
+        f.0[off + 7],
+    ])
+}
+
+/// Point the global FACS state at `f` and arm `entry`. Restores
+/// `FACS_PHYS` to 0 before returning so no later test can write
+/// through a dangling pointer to a freed `TestFacs`.
+fn arm_against(f: &mut TestFacs, entry: u64) -> Result<(), crate::WakeVectorError> {
+    crate::__test_parse_facs_body(&f.0);
+    crate::__test_set_facs_phys(f.0.as_mut_ptr() as u64);
+    // SAFETY: FACS_PHYS points at this test's own 64-byte, 64-aligned
+    // buffer, so every write the arming code performs (+12, +24, +36)
+    // lands inside it. `entry` is never dereferenced or jumped to —
+    // it is only stored into the table — so it need not be live code.
+    // SAFETY: Valid memory or trusted environment
+    let r = unsafe { crate::arm_s3_waking_vector(entry) };
+    crate::__test_set_facs_phys(0);
+    r
+}
+
+/// The 32-bit `FirmwareWakingVector` is entered by firmware in real
+/// mode, so a long-mode `entry_phys` must NEVER land there — not
+/// truncated, not at all. Only `XFirmwareWakingVector` may carry it,
+/// and `OspmFlags.64BIT_WAKE_F` must be asserted to select that path.
+fn smoke_acpi_arm_s3_waking_vector_uses_64bit_slot_only() -> TestResult {
+    // Entry addresses that all fail the 32-bit slot's requirements
+    // in different ways: above 4 GiB (untruncatable), above 1 MiB
+    // but 32-bit representable (truncation is lossless yet the value
+    // is still unreachable from real mode), and a typical
+    // higher-half-kernel-backing phys.
+    let entries: [u64; 3] = [0x1_0000_1234, 0x8000_0000, 0x0000_0001_2345_6000];
+    for entry in entries {
+        let mut f = build_test_facs(crate::FACS_FLAG_64BIT_WAKE_SUPPORTED, 2, 64);
+        match arm_against(&mut f, entry) {
+            Ok(()) => {}
+            _ => return TestResult::Fail("64bit-wake-capable FACS must arm"),
+        }
+        if facs_u64(&f, 24) != entry {
+            return TestResult::Fail("XFirmwareWakingVector did not receive entry_phys");
+        }
+        if facs_u32(&f, 12) != 0 {
+            return TestResult::Fail(
+                "32-bit real-mode FirmwareWakingVector must be zero, not a long-mode address",
+            );
+        }
+        if facs_u32(&f, 36) & crate::FACS_OSPM_FLAG_64BIT_WAKE == 0 {
+            return TestResult::Fail("OspmFlags.64BIT_WAKE_F not set to select the 64-bit vector");
+        }
+        // The parsed snapshot must agree with the bytes.
+        let info = match crate::facs_info() {
+            Some(i) => i,
+            None => return TestResult::Fail("facs_info() empty after arm"),
+        };
+        if info.firmware_waking_vector_64 != entry || info.firmware_waking_vector_32 != 0 {
+            return TestResult::Fail("facs_info() disagrees with the armed FACS bytes");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "acpi/wake_vector",
+    smoke_acpi_arm_s3_waking_vector_uses_64bit_slot_only
+);
+
+/// Firmware that does not advertise `64BIT_WAKE_SUPPORTED_F` will
+/// only ever enter the real-mode 32-bit vector. NARF has no
+/// real-mode trampoline, so arming must be refused — and must leave
+/// the FACS byte-for-byte untouched, so the caller's refusal to
+/// sleep is the only consequence.
+fn smoke_acpi_arm_s3_waking_vector_refuses_unsupported_firmware() -> TestResult {
+    use crate::WakeVectorError;
+    let entry: u64 = 0x1_0000_1234;
+    // (flags, version, length, expected error, label)
+    let cases: [(u32, u8, u32, WakeVectorError, &str); 4] = [
+        (
+            0,
+            2,
+            64,
+            WakeVectorError::NoSixtyFourBitWake,
+            "flags without 64BIT_WAKE_SUPPORTED_F",
+        ),
+        (
+            crate::FACS_FLAG_64BIT_WAKE_SUPPORTED,
+            0,
+            64,
+            WakeVectorError::FacsVersionTooOld,
+            "FACS version 0",
+        ),
+        (
+            crate::FACS_FLAG_64BIT_WAKE_SUPPORTED,
+            2,
+            32,
+            WakeVectorError::FacsTooShort,
+            "FACS length 32",
+        ),
+        (
+            1, // S4BIOS_F only — adjacent bit, must not be mistaken
+            2,
+            64,
+            WakeVectorError::NoSixtyFourBitWake,
+            "S4BIOS_F must not be read as 64BIT_WAKE_SUPPORTED_F",
+        ),
+    ];
+    for (flags, version, len, want, label) in cases {
+        let mut f = build_test_facs(flags, version, len);
+        match arm_against(&mut f, entry) {
+            Err(e) if e == want => {}
+            _ => return TestResult::Fail(label),
+        }
+        if facs_u32(&f, 12) != FWV32_SENTINEL {
+            return TestResult::Fail("refused arm still wrote FirmwareWakingVector");
+        }
+        if facs_u64(&f, 24) != 0 {
+            return TestResult::Fail("refused arm still wrote XFirmwareWakingVector");
+        }
+        if facs_u32(&f, 36) != 0 {
+            return TestResult::Fail("refused arm still wrote OspmFlags");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "acpi/wake_vector",
+    smoke_acpi_arm_s3_waking_vector_refuses_unsupported_firmware
+);
