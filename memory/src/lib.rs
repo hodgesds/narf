@@ -52,6 +52,7 @@ pub mod ro_after_init;
 pub mod slab;
 pub mod spd5;
 pub mod swap;
+pub mod text_poke;
 pub mod tlb_shootdown;
 pub mod vmalloc;
 pub mod wx;
