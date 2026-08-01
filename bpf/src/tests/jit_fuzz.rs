@@ -57,7 +57,24 @@
 //! The base seed is a constant, so an unmodified tree fuzzes the *same* corpus
 //! every boot — a CI failure is reproducible by definition. `bpf_fuzz_seed=`
 //! and `bpf_fuzz_n=` on the kernel cmdline move it off that corpus for a soak
-//! run without changing what CI does.
+//! run without changing what CI does:
+//!
+//! ```text
+//! XTASK_QEMU_APPEND='bpf_fuzz_n=4000' cargo xtask test --arch=x86_64 \
+//!     --subsystem bpf/fuzz
+//! ```
+//!
+//! These register under `bpf/fuzz` rather than `bpf` so that soak is one boot
+//! of five tests rather than the whole subsystem. `subsystem_selected` matches
+//! on `/` boundaries, so `--subsystem bpf` still picks them up and the default
+//! suite is unchanged.
+//!
+//! `bpf_fuzz_trace` prints each seed *before* its program runs. That is for the
+//! one failure class a differential cannot report at all: a miscompile that
+//! corrupts control flow rather than a value takes the kernel down inside the
+//! native run, so nothing is left to compare and nothing is printed afterwards.
+//! Dropping the aarch64 `x30` save does exactly that — the mutation is caught,
+//! in that the suite dies, but only the trace says on which seed.
 
 use alloc::vec::Vec;
 
@@ -156,6 +173,21 @@ fn cmdline_seed() -> Option<u64> {
         Some(hex) => u64::from_str_radix(hex, 16).ok(),
         None => v.parse::<u64>().ok(),
     }
+}
+
+/// Whether the cmdline asked for a seed to be printed *before* each program
+/// runs (`bpf_fuzz_trace`).
+///
+/// Off by default because it is one console line per iteration. On for the
+/// failure class a differential cannot report: a miscompile that corrupts
+/// *control flow* rather than a value — a dropped `x30` save on aarch64 is the
+/// canonical one — takes the kernel down inside `run_atomic`, so there is no
+/// comparison left to fail and no seed printed afterwards. With this, the last
+/// seed on the console is the one that did it.
+fn cmdline_trace() -> bool {
+    narf_boot::cmdline()
+        .split_ascii_whitespace()
+        .any(|t| t == "bpf_fuzz_trace")
 }
 
 // ── PRNG ────────────────────────────────────────────────────────────
@@ -814,8 +846,12 @@ struct Tally {
 fn fuzz(base: u64, iters: u32) -> (Tally, Classes) {
     let mut tally = Tally::default();
     let mut cls = Classes::default();
+    let trace = cmdline_trace();
     for k in 0..iters {
         let seed = seed_for(base, k);
+        if trace {
+            note!("bpf-fuzz: trying seed={seed:#018x}");
+        }
         let (items, c) = generate(seed);
         cls.merge(&c);
         tally.generated += 1;
@@ -921,7 +957,7 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "bpf",
+    "bpf/fuzz",
     smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter
 );
 
@@ -981,7 +1017,7 @@ fn smoke_bpf_jit_fuzz_replays_pinned_seeds() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bpf", smoke_bpf_jit_fuzz_replays_pinned_seeds);
+kernel_test_in!("bpf/fuzz", smoke_bpf_jit_fuzz_replays_pinned_seeds);
 
 // ── arena fuzzing ───────────────────────────────────────────────────
 
@@ -1145,8 +1181,12 @@ fn smoke_bpf_jit_fuzz_generated_arena_programs_match_the_interpreter() -> TestRe
         }
     }
 
+    let trace = cmdline_trace();
     for k in 0..iters {
         let seed = seed_for(base, k);
+        if trace {
+            note!("bpf-fuzz: trying arena seed={seed:#018x}");
+        }
         let (group, pages) = &groups[(k as usize) % groups.len()];
         let items = generate_arena(seed, *pages);
         generated += 1;
@@ -1160,6 +1200,7 @@ fn smoke_bpf_jit_fuzz_generated_arena_programs_match_the_interpreter() -> TestRe
             Err(e) if e == NOT_COMPILED => {}
             Err(e) => {
                 note!("bpf-fuzz: ARENA DIVERGENCE base={base:#018x} seed={seed:#018x} — {e}");
+                note!("bpf-fuzz: replay by adding ({seed:#018x}, {pages}) to PINNED_ARENA_SEEDS");
                 for (i, d) in items.iter().enumerate() {
                     note!("bpf-fuzz:   [{i:3}] {d:?}");
                 }
@@ -1203,9 +1244,63 @@ fn smoke_bpf_jit_fuzz_generated_arena_programs_match_the_interpreter() -> TestRe
     TestResult::Pass
 }
 kernel_test_in!(
-    "bpf",
+    "bpf/fuzz",
     smoke_bpf_jit_fuzz_generated_arena_programs_match_the_interpreter
 );
+
+/// Arena seeds to replay every boot, each with the arena size it was found on.
+///
+/// The arena counterpart of [`PINNED_SEEDS`]. Separate because an arena
+/// program's in-bounds displacements are chosen against a page count, so a seed
+/// on its own does not reproduce the program.
+const PINNED_ARENA_SEEDS: &[(u64, usize)] = &[
+    // Not divergences — two arbitrary seeds, so the replay path is exercised on
+    // a tree where the arena fuzzer has found nothing.
+    (0x0000_0000_0000_0002, 4),
+    (0xD239_2D50_5322_34FF, 4),
+];
+
+fn smoke_bpf_jit_fuzz_replays_pinned_arena_seeds() -> TestResult {
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    // One group for the whole test, at the largest size any pinned entry uses,
+    // because arena slot VA is never recycled — see `load_against`. A seed
+    // pinned against a smaller arena is replayed against this one; the
+    // generator was given that seed's page count, so the *program* is identical
+    // and only the arena behind it is larger, which changes nothing about what
+    // the two backends do with it.
+    let cap = crate::arena::kernel_arena_cap();
+    let widest = PINNED_ARENA_SEEDS.iter().map(|e| e.1).max().unwrap_or(1);
+    let group = match crate::arena::ArenaGroup::with_one(cap, widest) {
+        Ok(g) => alloc::sync::Arc::new(g),
+        Err(_) => return TestResult::Fail("could not reserve an arena for the replay"),
+    };
+    let mut compiled = 0u32;
+    for &(seed, pages) in PINNED_ARENA_SEEDS {
+        let items = generate_arena(seed, pages);
+        let Some(p) = load_against(&group, &items) else {
+            note!("bpf-fuzz: pinned arena seed {seed:#018x} no longer verifies");
+            return TestResult::Fail("a pinned arena seed no longer produces a valid program");
+        };
+        match diff_run(&p, [0; 4]) {
+            Ok(()) => compiled += 1,
+            Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+            Err(e) => {
+                note!("bpf-fuzz: pinned arena seed {seed:#018x} diverged — {e}");
+                for (i, d) in items.iter().enumerate() {
+                    note!("bpf-fuzz:   [{i:3}] {d:?}");
+                }
+                return TestResult::Fail("a pinned arena seed diverged");
+            }
+        }
+    }
+    if compiled == 0 {
+        return TestResult::Fail("no pinned arena seed compiled, so nothing was replayed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf/fuzz", smoke_bpf_jit_fuzz_replays_pinned_arena_seeds);
 
 // ── the repertoire boundary ─────────────────────────────────────────
 
@@ -1320,4 +1415,7 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bpf", smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back);
+kernel_test_in!(
+    "bpf/fuzz",
+    smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back
+);
