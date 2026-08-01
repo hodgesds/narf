@@ -48,6 +48,8 @@ pub mod structops;
 pub mod types;
 
 #[cfg(feature = "kernel-test")]
+mod kfunc_tests;
+#[cfg(feature = "kernel-test")]
 mod tests;
 
 /// Types the `kfunc!` and `struct_ops!` macros name in their expansions.
