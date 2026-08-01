@@ -119,6 +119,55 @@ pub fn snapshot() -> Vec<u8> {
     out
 }
 
+/// Length of the live region, in bytes, without copying it. This is the
+/// same value as `snapshot().len()` but costs a single lock + read instead
+/// of linearising up to `RING_CAPACITY` bytes into a fresh `Vec`. Readiness
+/// checks (`/dev/kmsg` poll) that only need the length must use this — a
+/// `snapshot().len()` there reallocates the whole ring on every poll.
+pub fn live_len() -> usize {
+    let g = RING.lock();
+    if g.written < RING_CAPACITY as u64 {
+        g.written as usize
+    } else {
+        RING_CAPACITY
+    }
+}
+
+/// Copy the live region starting at chronological byte `offset` into `out`,
+/// returning the number of bytes copied (0 at or past the end). Equivalent
+/// to `snapshot()[offset..][..n]` but without allocating: it reads the
+/// requested window directly out of the ring, stitching across the wrap
+/// point when needed. `/dev/kmsg` reads use this so a sequential drain of
+/// the log costs O(bytes read), not O(RING_CAPACITY) per read.
+pub fn read_at(offset: usize, out: &mut [u8]) -> usize {
+    let g = RING.lock();
+    let written = g.written;
+    let head = g.head;
+    let live_len = if written < RING_CAPACITY as u64 {
+        written as usize
+    } else {
+        RING_CAPACITY
+    };
+    if offset >= live_len || out.is_empty() {
+        return 0;
+    }
+    let n = out.len().min(live_len - offset);
+    if (written as usize) < RING_CAPACITY {
+        // Pre-wrap: the live region is buf[..live_len] (live_len == head).
+        out[..n].copy_from_slice(&g.buf[offset..offset + n]);
+    } else {
+        // Post-wrap: chronological index i maps to buf[(head + i) % CAP];
+        // the window may straddle the wrap, so copy in up to two segments.
+        let start = (head + offset) % RING_CAPACITY;
+        let first = n.min(RING_CAPACITY - start);
+        out[..first].copy_from_slice(&g.buf[start..start + first]);
+        if first < n {
+            out[first..n].copy_from_slice(&g.buf[..n - first]);
+        }
+    }
+    n
+}
+
 /// Iterate every `\n`-terminated line in the live ring, oldest
 /// first. Bytes between newlines are passed verbatim (no UTF-8
 /// validation — caller decides). Trailing partial line (no
