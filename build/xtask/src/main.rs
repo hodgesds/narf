@@ -2531,11 +2531,18 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
 
     // `--list-groups`: emit the distinct subsystem groups over ALL cases so
     // the CI matrix runs exactly the non-empty groups (no drift, no gaps).
+    // CI_EXCLUDED_GROUPS are omitted from the matrix but still runnable
+    // locally via `--group <name>`: the GUI/Wayland compositor cases are
+    // boot-flaky under GHA's TCG (multi-process fresh boots that
+    // occasionally die before login), so they don't gate CI for now. Run
+    // them by hand with `cargo xtask musl-demo --group gui`.
+    const CI_EXCLUDED_GROUPS: &[&str] = &["gui"];
     if args.list_groups {
         let mut groups: Vec<&str> = lightweight
             .iter()
             .chain(GUI_FRESH_BOOT.iter())
             .map(|(cmd, _)| musl_case_group(cmd))
+            .filter(|g| !CI_EXCLUDED_GROUPS.contains(g))
             .collect();
         groups.sort_unstable();
         groups.dedup();
