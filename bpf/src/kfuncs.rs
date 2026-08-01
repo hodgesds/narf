@@ -70,6 +70,57 @@ crate::kfunc! {
 
 }
 
+// ── test-only kfuncs ────────────────────────────────────────────────
+//
+// Compiled only under `kernel-test`, so a production kernel cannot name them.
+// They exist because no *production* kfunc makes a calling convention
+// observable from a BPF program: `narf_counter_add` and `narf_counter_read`
+// take two arguments and one respectively, so neither the R4/R5 shuffle nor
+// the callee's stack alignment shows up in any comparison against the
+// interpreter — and `narf_counter_add` has a side effect, so running the same
+// program twice (once JITed, once interpreted) does not even return the same
+// value. Both of these are pure, which is what a differential comparison
+// requires; one is five arguments wide and the other reports the callee's own
+// stack alignment.
+#[cfg(feature = "kernel-test")]
+crate::kfunc! {
+    /// Combine all five argument registers, distinguishably.
+    ///
+    /// Distinct odd multipliers, so *any* permutation of distinct arguments
+    /// gives a different answer. That is the property that makes the
+    /// interpreter a real oracle for the JIT's argument shuffling: swapping R4
+    /// and R5, or dropping one and passing another twice, changes the result
+    /// rather than happening to agree. Wrapping arithmetic, so no input traps.
+    #[context(Atomic)]
+    pub fn narf_test_arg_mix(a: u64, b: u64, c: u64, d: u64, e: u64) -> u64 {
+        a.wrapping_add(b.wrapping_mul(3))
+            .wrapping_add(c.wrapping_mul(5))
+            .wrapping_add(d.wrapping_mul(7))
+            .wrapping_add(e.wrapping_mul(11))
+    }
+
+    /// This shim's own stack alignment, as a residue mod 16.
+    ///
+    /// A local's address is a fixed offset from the stack pointer the shim was
+    /// entered with, so the residue is a pure function of the *caller's*
+    /// alignment at the call instruction. It means nothing on its own — nobody
+    /// knows what that fixed offset is — and everything when compared between
+    /// callers: the interpreter enters the shim from ordinary Rust, where the
+    /// ABI's alignment rule holds by construction, so a JIT whose `call` is
+    /// eight bytes out returns a different residue and the differential harness
+    /// says so.
+    ///
+    /// Worth the indirection because the failure it catches is otherwise
+    /// invisible from BPF: a misaligned SysV call does not fault at the call,
+    /// it faults on the first aligned SSE spill somewhere inside a callee that
+    /// has nothing to do with BPF.
+    #[context(Atomic)]
+    pub fn narf_test_stack_residue() -> u64 {
+        let probe: u64 = 0;
+        (core::ptr::addr_of!(probe) as u64) & 0xF
+    }
+}
+
 // A separate `kfunc!` invocation: every item in one invocation must match the
 // same rule, and this one is the sleepable (`async fn`) form.
 crate::kfunc! {
