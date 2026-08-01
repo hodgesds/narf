@@ -143,6 +143,23 @@ impl<T: ?Sized> SpinLock<T> {
         }
     }
 
+    /// Raw pointer to the guarded value, without acquiring the lock.
+    ///
+    /// The only supported use is handing a *stable address* of the
+    /// guarded data to code that cannot take the lock — hand-written
+    /// asm that runs with no Rust runtime (an S3 wake trampoline, a
+    /// CPU bring-up stub). Callers must not form a `&T`/`&mut T`
+    /// through it while the lock is held elsewhere.
+    ///
+    /// This exists so such callers never have to *assume* the guarded
+    /// value sits at offset 0 of the lock: neither `SpinLock` nor
+    /// `IrqSafeSpinLock` is `repr(C)`, so field order is entirely up
+    /// to the compiler and any hard-coded offset is a latent bug.
+    #[inline]
+    pub const fn as_ptr(&self) -> *mut T {
+        self.data.get()
+    }
+
     /// Attempt to acquire without blocking; returns `None` on contention.
     #[inline]
     pub fn try_lock(&self, _: IrqsEnabled) -> Option<SpinLockGuard<'_, T, IrqsEnabled>> {
@@ -246,6 +263,14 @@ impl<T> IrqSafeSpinLock<T> {
 }
 
 impl<T: ?Sized> IrqSafeSpinLock<T> {
+    /// Raw pointer to the guarded value, without acquiring the lock.
+    /// See [`SpinLock::as_ptr`] for the (narrow) supported use and the
+    /// reason a hard-coded "offset 0 of the lock" is not one.
+    #[inline]
+    pub const fn as_ptr(&self) -> *mut T {
+        self.inner.as_ptr()
+    }
+
     #[inline]
     pub fn lock(&self) -> IrqSafeSpinLockGuard<'_, T> {
         // SAFETY: save+disable inline asm is the canonical local IRQ-

@@ -4350,3 +4350,193 @@ fn smoke_pmuv3_programmable_counter_round_trip() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/pmu", smoke_pmuv3_programmable_counter_round_trip);
+
+// ── arch/s3 — S3 resume-context layout + EFER capture ──────────────
+//
+// The wake trampoline in `x86_64::s3_resume` runs with no Rust
+// runtime: it indexes the saved `ResumeContext` as raw `[r8 + N]`
+// displacements and replays control registers and IA32_EFER by hand.
+// None of that is exercisable by actually suspending — S3 is gated
+// off and QEMU/TCG gives us no real S3 cycle — so these smokes pin
+// the two things that would otherwise silently rot: the offsets the
+// asm indexes, and the contents of the EFER slot the asm replays.
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_s3_resume_context_offsets_match_trampoline() -> TestResult {
+    use crate::x86_64::s3_resume::ctx_offset;
+    // These are the exact displacements the naked asm emits (it
+    // consumes `ctx_offset::*` as `const` operands, so it cannot
+    // disagree with the struct — but a field reorder would move all
+    // of them together and invalidate the documented layout).
+    let want: [(usize, usize, &'static str); 10] = [
+        (ctx_offset::CR0, 0, "ResumeContext.cr0 moved off +0"),
+        (ctx_offset::CR3, 8, "ResumeContext.cr3 moved off +8"),
+        (ctx_offset::CR4, 16, "ResumeContext.cr4 moved off +16"),
+        (ctx_offset::RFLAGS, 24, "ResumeContext.rflags moved off +24"),
+        (
+            ctx_offset::GDT_BASE,
+            32,
+            "ResumeContext.gdt_base moved off +32",
+        ),
+        (
+            ctx_offset::GDT_LIMIT,
+            40,
+            "ResumeContext.gdt_limit moved off +40",
+        ),
+        (
+            ctx_offset::IDT_BASE,
+            48,
+            "ResumeContext.idt_base moved off +48",
+        ),
+        (
+            ctx_offset::IDT_LIMIT,
+            56,
+            "ResumeContext.idt_limit moved off +56",
+        ),
+        (ctx_offset::RSP, 64, "ResumeContext.rsp moved off +64"),
+        (ctx_offset::EFER, 72, "ResumeContext.efer moved off +72"),
+    ];
+    for (got, expect, msg) in want {
+        if got != expect {
+            return TestResult::Fail(msg);
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/s3", smoke_s3_resume_context_offsets_match_trampoline);
+
+/// The trampoline is handed `resume_context_static_addr()` (resolved
+/// to a phys) and reads fields at `base + ctx_offset::*`. Walk that
+/// exact arithmetic from Rust and check every field lands on the
+/// value `captured_context()` reports.
+///
+/// This ties the three pieces together: the accessor must yield the
+/// address of the *guarded value* (neither `IrqSafeSpinLock` nor
+/// `SpinLock` is `repr(C)`, so "offset 0 of the lock" is not a layout
+/// guarantee), and the offsets must select the fields the asm
+/// believes they select.
+#[cfg(target_arch = "x86_64")]
+fn smoke_s3_resume_context_addr_selects_the_right_fields() -> TestResult {
+    use crate::x86_64::s3_resume::{
+        captured_context, ctx_offset, resume_context_static_addr, save_resume_context,
+    };
+    // SAFETY: CPL=0. `save_resume_context` only reads control /
+    // system registers and stores the snapshot; S3 is gated off, so
+    // overwriting the snapshot has no effect on anything live.
+    unsafe {
+        save_resume_context();
+    }
+    let ctx = match captured_context() {
+        Some(c) => c,
+        None => return TestResult::Fail("save_resume_context did not mark the context captured"),
+    };
+    let base = resume_context_static_addr() as *const u8;
+    if base.is_null() {
+        return TestResult::Fail("resume_context_static_addr returned null");
+    }
+    // SAFETY: `base` is the address of the live `ResumeContext`
+    // guarded value and every offset below is within its size; the
+    // reads are unaligned-tolerant and no reference is formed.
+    let at64 = |off: usize| unsafe { core::ptr::read_unaligned(base.add(off) as *const u64) };
+    // SAFETY: as above, for the 2-byte limit fields.
+    let at16 = |off: usize| unsafe { core::ptr::read_unaligned(base.add(off) as *const u16) };
+
+    let checks: [(u64, u64, &'static str); 8] = [
+        (at64(ctx_offset::CR0), ctx.cr0, "[+CR0] is not ctx.cr0"),
+        (at64(ctx_offset::CR3), ctx.cr3, "[+CR3] is not ctx.cr3"),
+        (at64(ctx_offset::CR4), ctx.cr4, "[+CR4] is not ctx.cr4"),
+        (
+            at64(ctx_offset::RFLAGS),
+            ctx.rflags,
+            "[+RFLAGS] is not ctx.rflags",
+        ),
+        (
+            at64(ctx_offset::GDT_BASE),
+            ctx.gdt_base,
+            "[+GDT_BASE] is not ctx.gdt_base",
+        ),
+        (
+            at64(ctx_offset::IDT_BASE),
+            ctx.idt_base,
+            "[+IDT_BASE] is not ctx.idt_base",
+        ),
+        (at64(ctx_offset::RSP), ctx.rsp, "[+RSP] is not ctx.rsp"),
+        (at64(ctx_offset::EFER), ctx.efer, "[+EFER] is not ctx.efer"),
+    ];
+    for (got, want, msg) in checks {
+        if got != want {
+            return TestResult::Fail(msg);
+        }
+    }
+    if at16(ctx_offset::GDT_LIMIT) != ctx.gdt_limit {
+        return TestResult::Fail("[+GDT_LIMIT] is not ctx.gdt_limit");
+    }
+    if at16(ctx_offset::IDT_LIMIT) != ctx.idt_limit {
+        return TestResult::Fail("[+IDT_LIMIT] is not ctx.idt_limit");
+    }
+    // A saved CR3 of 0 would mean the trampoline reloads a null page
+    // table; catches "we read the lock byte instead of the data".
+    if ctx.cr3 == 0 {
+        return TestResult::Fail("saved CR3 is zero — snapshot did not capture live state");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "arch/s3",
+    smoke_s3_resume_context_addr_selects_the_right_fields
+);
+
+/// Defect this pins: the resume path used to restore CR0 and CR4 and
+/// never touch IA32_EFER, with a comment claiming NXE lived in CR4.
+/// NXE is EFER bit 11. Every kernel window is NX, so resuming with
+/// NXE clear makes PTE bit 63 reserved and the first access after the
+/// CR3 load takes a reserved-bit `#PF` with no IDT loaded.
+///
+/// Assert the EFER slot holds a *replayable* EFER: LMA masked off
+/// (AMD `#GP(0)`s on a wrmsr that changes it), LME set (or the
+/// restore would drop us out of long mode), and NXE set (the reason
+/// the restore has to exist at all).
+#[cfg(target_arch = "x86_64")]
+fn smoke_s3_resume_context_saves_replayable_efer() -> TestResult {
+    use crate::x86_64::msr::rdmsr_or_gp;
+    use crate::x86_64::s3_resume::{captured_context, save_resume_context};
+    const IA32_EFER: u32 = 0xC000_0080;
+    const LME: u64 = 1 << 8;
+    const LMA: u64 = 1 << 10;
+    const NXE: u64 = 1 << 11;
+
+    let live = match rdmsr_or_gp(IA32_EFER) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Skip("IA32_EFER unreadable on this CPU"),
+    };
+    // SAFETY: CPL=0; see the sibling smoke.
+    unsafe {
+        save_resume_context();
+    }
+    let ctx = match captured_context() {
+        Some(c) => c,
+        None => return TestResult::Fail("save_resume_context did not mark the context captured"),
+    };
+    if ctx.efer == 0 {
+        return TestResult::Fail("EFER slot is zero — nothing would be restored on resume");
+    }
+    if ctx.efer & LMA != 0 {
+        return TestResult::Fail("saved EFER kept LMA set — restore wrmsr would #GP(0) on AMD");
+    }
+    if ctx.efer != live & !LMA {
+        return TestResult::Fail("saved EFER is not the live EFER with LMA masked off");
+    }
+    if ctx.efer & LME == 0 {
+        return TestResult::Fail("saved EFER has LME clear — restoring it would leave long mode");
+    }
+    if ctx.efer & NXE == 0 {
+        return TestResult::Fail(
+            "saved EFER has NXE clear — kernel windows are NX, so PTE bit 63 would be reserved",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/s3", smoke_s3_resume_context_saves_replayable_efer);
