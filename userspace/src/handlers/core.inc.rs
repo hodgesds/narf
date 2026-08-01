@@ -7736,6 +7736,14 @@ pub(crate) fn task_may_use_bpf() -> bool {
     read_uidgid(current_task_id()).euid == 0
 }
 
+/// Filesystem identity used when creating Linux-visible inodes outside the
+/// generic open path (notably POSIX message queues).
+#[cfg(feature = "linux-compat")]
+pub(crate) fn current_fs_ids() -> (u32, u32) {
+    let ids = read_uidgid(current_task_id());
+    (ids.fsuid, ids.fsgid)
+}
+
 /// The calling task's socket credentials (`struct ucred` shape): its
 /// visible pid plus effective uid/gid. Stamped onto every socket end at
 /// creation so `SO_PEERCRED` / `SCM_CREDENTIALS` report a real identity.
@@ -8229,6 +8237,16 @@ pub fn umask_init() {
 #[doc(hidden)]
 pub fn __test_umask_reset() {
     *UMASK_TABLE.lock() = Some(BTreeMap::new());
+}
+
+/// Current task's file-creation mask, including Linux's default 0022.
+#[cfg(feature = "linux-compat")]
+pub(crate) fn current_umask() -> u32 {
+    UMASK_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&current_task_id()).copied())
+        .unwrap_or(UMASK_DEFAULT)
 }
 
 const UMASK_DEFAULT: u32 = 0o022;

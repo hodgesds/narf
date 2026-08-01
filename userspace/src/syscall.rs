@@ -1930,6 +1930,10 @@ pub enum Syscall {
     /// highest-priority message. Linux (x86_64=243, aarch64=183).
     MqTimedreceive,
 
+    /// `mq_notify(mqd, sigevent)` — register one-shot queue notification.
+    /// Linux (x86_64=244, aarch64=184).
+    MqNotify,
+
     /// `mq_getsetattr(mqd, newattr, oldattr)` — read/replace queue attrs.
     /// Linux (x86_64=245, aarch64=185).
     MqGetsetattr,
@@ -2450,6 +2454,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::MqUnlink, 241),
     (Syscall::MqTimedsend, 242),
     (Syscall::MqTimedreceive, 243),
+    (Syscall::MqNotify, 244),
     (Syscall::MqGetsetattr, 245),
     (Syscall::InotifyInit1, 294),
     (Syscall::InotifyAddWatch, 254),
@@ -2930,6 +2935,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::MqUnlink, 181),
     (Syscall::MqTimedsend, 182),
     (Syscall::MqTimedreceive, 183),
+    (Syscall::MqNotify, 184),
     (Syscall::MqGetsetattr, 185),
     (Syscall::InotifyInit1, 26),
     (Syscall::InotifyAddWatch, 27),

@@ -30,6 +30,8 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         if let Some(sock) = current_socket(fd) {
             sock.set_nonblock((arg as u32) & crate::socket::O_NONBLOCK != 0);
         }
+        #[cfg(feature = "linux-compat")]
+        crate::mqueue::set_fd_nonblock(task, fd, (arg as u32) & crate::fd::O_NONBLOCK != 0);
     }
 
     // F_DUPFD / F_DUPFD_CLOEXEC: dup oldfd into the lowest free slot
@@ -322,6 +324,10 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     // closure — `current_socket` itself locks the table, which would
     // re-enter and deadlock if called from inside `with_table`.
     let sock_nb = current_socket(fd).map(|s| s.is_nonblock());
+    #[cfg(feature = "linux-compat")]
+    let mq_nb = crate::mqueue::fd_nonblock(task, fd);
+    #[cfg(not(feature = "linux-compat"))]
+    let mq_nb: Option<bool> = None;
 
     let outcome = fd::with_table(task, |t| {
         let entry = t.get_mut(fd)?;
@@ -341,6 +347,13 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                         v |= crate::socket::O_NONBLOCK as u64;
                     } else {
                         v &= !(crate::socket::O_NONBLOCK as u64);
+                    }
+                }
+                if let Some(nb) = mq_nb {
+                    if nb {
+                        v |= crate::fd::O_NONBLOCK as u64;
+                    } else {
+                        v &= !(crate::fd::O_NONBLOCK as u64);
                     }
                 }
                 SyscallReturn::ok(v)
