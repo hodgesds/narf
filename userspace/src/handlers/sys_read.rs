@@ -29,9 +29,25 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     // ring later observes ^C, this is the task SIGINT goes to.
     note_console_reader(current_task_id());
 
-    // Read into a kernel-owned buffer; copy back with SMAP bracket
-    // after the FileOps call, so FileOps never touches user memory.
-    let mut kbuf = alloc::vec![0u8; len];
+    // Read into a kernel-owned staging buffer, then copy back with the SMAP
+    // bracket (FileOps never touches user memory). A read() completes in this
+    // frame — `poll_blocking` busy-polls in place and FileOps futures are
+    // heap-boxed, so the kernel stack stays shallow — so the common small read
+    // can stage through a stack buffer and skip a heap alloc+zero on every
+    // call. That per-read churn (slab alloc/free + zero-fill + per-CPU RDTSCP,
+    // ×thousands of small sysfs reads) is what made udev coldplug crawl.
+    const READ_STACK_BUF: usize = 4096;
+    let mut stack_buf = [0u8; READ_STACK_BUF];
+    // Deferred init (no throwaway `Vec::new()` to satisfy -D unused-assignments):
+    // the heap buffer is only assigned — and only borrowed — on the large-read
+    // branch; small reads never touch it.
+    let mut heap_buf: alloc::vec::Vec<u8>;
+    let kbuf: &mut [u8] = if len <= READ_STACK_BUF {
+        &mut stack_buf[..len]
+    } else {
+        heap_buf = alloc::vec![0u8; len];
+        heap_buf.as_mut_slice()
+    };
     let task = current_task_id();
 
     // fanotify groups deliver fixed-size metadata records, each carrying a
@@ -42,7 +58,7 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     #[cfg(feature = "linux-compat")]
     if crate::mqueue::fanotify_active() {
         if let Some(gid) = crate::mqueue::fanotify_instance_of(task, fd) {
-            let n = fanotify_read_into(task, gid, &mut kbuf);
+            let n = fanotify_read_into(task, gid, &mut kbuf[..]);
             // SAFETY: ptr validated above; AS still active.
             match unsafe { copy_to_user(ptr, &kbuf[..n]) } {
                 Ok(()) => ctx.set_return(SyscallReturn::ok(n as u64)),
@@ -115,7 +131,7 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
         // the device, so the pointer goes dead. Surfacing EAGAIN here (what an
         // evdev node is *for*) fixes that and matches how these devices are used.
         if entry.nonblock_read_eagain() {
-            return match poll_once(entry.read(off, &mut kbuf)) {
+            return match poll_once(entry.read(off, &mut kbuf[..])) {
                 Some(Ok(n)) if n > 0 => {
                     advance(n);
                     Ok((n, false, false))
@@ -125,7 +141,7 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
                 Some(Err(_)) => Err(false),
             };
         }
-        let res = poll_blocking(entry.read(off, &mut kbuf))
+        let res = poll_blocking(entry.read(off, &mut kbuf[..]))
             .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
         match res {
             Ok(n) => {
