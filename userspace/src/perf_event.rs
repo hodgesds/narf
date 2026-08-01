@@ -2499,6 +2499,15 @@ fn ensure_pmi_route() -> Result<(), ()> {
 /// syscall context. The IRQ handler captures IP/task/time and rearms hardware;
 /// record encoding and readiness wakeups happen here where allocation is safe.
 pub(crate) fn drain_irq_samples() {
+    // Fast path: with no perf event attached anywhere, no producer can stage a
+    // sample, so the per-CPU pending rings are all empty. Skip before touching
+    // the registry lock or scanning MAX_CPUS * ring-depth slots — this runs on
+    // every syscall dispatch, so an unconditional scan taxes the whole system
+    // (and monopolizes the CPU) even when nobody is profiling. `enabled()` is a
+    // single read-mostly load flipped only on the first attach / last detach.
+    if !narf_lib::perf::enabled() {
+        return;
+    }
     let mut notify = false;
     {
         let registry = PERF_EVENT_REGISTRY.lock();
@@ -4095,3 +4104,54 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
         _ => false,
     }
 }
+
+/// The syscall-return drain must be a no-op when no perf event is attached.
+///
+/// `drain_irq_samples` runs on every syscall dispatch. With the `enabled()`
+/// gate it returns before locking the registry or scanning MAX_CPUS * depth
+/// pending slots when nobody is profiling; without it, that scan taxes every
+/// syscall and monopolizes the CPU. This proves a staged slot is left
+/// untouched while perf is disabled and is consumed once perf is enabled.
+fn smoke_perf_drain_skips_when_disabled() -> narf_kernel_test::TestResult {
+    let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
+    // Use a quiescent slot so a concurrently-staged real sample is never eaten.
+    let ring = &PENDING_TRACES[cpu];
+    let Some(slot) = ring.iter().find(|s| s.state.load(Ordering::Acquire) == 0) else {
+        // Whole ring busy (not expected at rest) — nothing safe to probe.
+        return narf_kernel_test::TestResult::Skip("PENDING_TRACES ring busy");
+    };
+
+    let saved_enabled = narf_lib::perf::enabled();
+
+    // Stage a bogus trace whose type_id matches no event.
+    slot.type_id.store(0xDEAD_BEEF_0000_0001, Ordering::Relaxed);
+    slot.len.store(0, Ordering::Relaxed);
+    slot.state.store(2, Ordering::Release);
+
+    // Disabled: the fast path must return before touching the rings.
+    narf_lib::perf::set_enabled(false);
+    drain_irq_samples();
+    let after_disabled = slot.state.load(Ordering::Acquire);
+
+    // Enabled: the same drain must consume the slot (no matching event, so it
+    // is simply cleared to state 0).
+    narf_lib::perf::set_enabled(true);
+    drain_irq_samples();
+    let after_enabled = slot.state.load(Ordering::Acquire);
+
+    // Restore global + slot state regardless of the outcome.
+    slot.state.store(0, Ordering::Release);
+    slot.type_id.store(0, Ordering::Relaxed);
+    narf_lib::perf::set_enabled(saved_enabled);
+
+    if after_disabled != 2 {
+        return narf_kernel_test::TestResult::Fail("disabled drain consumed a pending slot");
+    }
+    if after_enabled != 0 {
+        return narf_kernel_test::TestResult::Fail(
+            "enabled drain did not consume the pending slot",
+        );
+    }
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!("syscall_abi", smoke_perf_drain_skips_when_disabled);
