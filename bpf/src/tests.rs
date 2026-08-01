@@ -17,6 +17,13 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use crate::interp::{Outcome, Trap};
 use crate::prog::{BpfProg, BpfProgLoad, LoadRequest};
 
+/// Generated differential fuzzing of the JIT, built on the `diff_run` below.
+///
+/// A child module rather than a sibling of `tests`, so it reaches the same
+/// `load`/`asm`/`diff_run` helpers the hand-written cases use — there is one
+/// comparison in this crate and the fuzzer goes through it.
+mod jit_fuzz;
+
 // Minted once, at first use, and cached — `Cap::bootstrap()` allocates an
 // object-table slot per call, so calling it per test would leak a slot per
 // smoke run.
@@ -1276,6 +1283,19 @@ kernel_test_in!("bpf", smoke_bpf_jit_bounded_loop_completes);
 /// skips rather than failing. Compared by pointer-equal `&'static str`.
 const NO_BACKEND: &str = "no native backend on this architecture";
 
+/// Sentinel meaning "a gate refused this program, so there is nothing native to
+/// compare against". Compared by pointer-equal `&'static str`, like
+/// [`NO_BACKEND`].
+///
+/// Named rather than inlined because a *generated* subject legitimately falls
+/// back sometimes — the verifier's fixpoint does not analyse code it proves
+/// unreachable, so a `call` in a dead arm has no resolved call site — and the
+/// fuzzer needs to count that separately from a divergence in order to report
+/// the compiled/generated ratio at all. Every hand-written caller keeps
+/// treating it as the failure it is for them: a named case that stops
+/// compiling has stopped testing anything.
+const NOT_COMPILED: &str = "not compiled — the comparison would be vacuous";
+
 /// Load, require compilation, run both ways, compare.
 fn diff_case(name: &str, items: &[Decoded], ctx: [u64; 4]) -> Result<(), &'static str> {
     let p = load(name, asm(items), Context::Atomic).map_err(|_| "load rejected")?;
@@ -1297,7 +1317,7 @@ fn diff_run(p: &BpfProg, ctx: [u64; 4]) -> Result<(), &'static str> {
         // with itself. Where there is no backend at all there is nothing to
         // compare, and the caller skips.
         return Err(if narf_bpf_jit::has_backend() {
-            "not compiled — the comparison would be vacuous"
+            NOT_COMPILED
         } else {
             NO_BACKEND
         });

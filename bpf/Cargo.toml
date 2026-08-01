@@ -23,7 +23,13 @@ default = []
 # In-kernel smokes, registered through `narf-kernel-test` into `narf.tests`.
 # The crate itself is always linked (the `bpf(2)` handler and
 # `register_initcalls()` are unconditional), so this gates only the tests.
-kernel-test = ["dep:narf-kernel-test"]
+#
+# `narf-boot` and `narf-console` come with it, for the generated JIT
+# differential in `src/tests/jit_fuzz.rs`: `TestResult::Fail` carries a
+# `&'static str`, so the seed that reproduces a generated failure has nowhere to
+# go except the console, and the cmdline is how a soak run asks for more
+# iterations without changing what CI fuzzes.
+kernel-test = ["dep:narf-kernel-test", "dep:narf-boot", "dep:narf-console"]
 # In-kernel benchmarks, registered through `narf-bpf-bench` and run only when
 # the kernel cmdline carries `bpf_bench`. Off by default because it compiles
 # `interp::Vm::run_fuel_hoisted` — a fuel policy that bounds iterations rather
@@ -51,6 +57,8 @@ narf-net          = { path = "../net" }
 narf-tracing      = { path = "../tracing" }
 narf-init         = { path = "../init" }
 narf-kernel-test  = { path = "../verification/kernel-test", optional = true }
+narf-boot         = { path = "../boot", optional = true }
+narf-console      = { path = "../console", optional = true }
 narf-bpf-bench    = { path = "bench", optional = true }
 
 [lints]
