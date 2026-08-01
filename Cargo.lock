@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -525,6 +531,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
 name = "narf-abi"
 version = "0.0.0"
 dependencies = [
@@ -995,6 +1010,23 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+]
+
+[[package]]
+name = "narf-drivers-fs-squashfs"
+version = "0.0.0"
+dependencies = [
+ "miniz_oxide",
+ "narf-block",
+ "narf-capabilities",
+ "narf-driver-runtime",
+ "narf-filesystem",
+ "narf-init",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -1616,6 +1648,7 @@ dependencies = [
  "narf-drivers-fs-fat",
  "narf-drivers-fs-iso9660",
  "narf-drivers-fs-minix",
+ "narf-drivers-fs-squashfs",
  "narf-drivers-fs-udf",
  "narf-drivers-gpio",
  "narf-drivers-gpu",

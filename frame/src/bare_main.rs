@@ -25,6 +25,7 @@ extern crate narf_drivers_fs_ext2;
 extern crate narf_drivers_fs_fat;
 extern crate narf_drivers_fs_iso9660 as _;
 extern crate narf_drivers_fs_minix as _;
+extern crate narf_drivers_fs_squashfs;
 extern crate narf_drivers_fs_udf as _;
 extern crate narf_drivers_psp as _;
 extern crate narf_edid as _;
@@ -2260,6 +2261,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_fs_ext2::register_initcalls();
             narf_drivers_fs_ext4::register_initcalls();
             narf_drivers_fs_fat::register_initcalls();
+            narf_drivers_fs_squashfs::register_initcalls();
             narf_drivers_platform::register_initcalls();
             // Bridge: ACPI power-button events (delivered by the
             // SCI dispatcher in narf-drivers-platform::ec) into

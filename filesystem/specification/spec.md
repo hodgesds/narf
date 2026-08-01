@@ -614,6 +614,23 @@ source-string ABI only as a fallback, supports escaped colons in legacy
 read-only mount. The audited compatibility matrix and explicit remaining
 gaps live in `filesystem/OVERLAYFS_LINUX_COMPAT_AUDIT.md`.
 
+### 3.11 SquashFS compatibility
+
+The `narf-drivers-fs-squashfs` crate provides a read-only, block-backed
+SquashFS 4.0 `FsInstance`. It registers the existing
+`narf_block::fs_detect::FsType::SquashFs` for root auto-mount and the
+`squashfs` token for classic Linux mount dispatch. Compact and extended
+inodes, directories, symlinks, sparse data blocks, packed fragments, ID
+metadata, xattrs, stable inode identities, statx and statfs are decoded with
+strict `s_bytes_used` and decompression bounds. Every fallible mutation hook
+returns `FsError::ReadOnly`.
+
+Zlib and legacy LZ4 images are supported. LZMA, LZO, XZ and Zstandard images
+are rejected at mount with `FsError::Unsupported` until bounded no_std
+decoders are available. The complete compatibility matrix and fixture
+coverage are recorded in
+`drivers/fs/squashfs/SQUASHFS_LINUX_COMPAT_AUDIT.md`.
+
 ## 4. Invariants & safety properties
 
 - **No ambient root.** A task that holds no `Cap<FileNode, _>` can

@@ -507,7 +507,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // keep priority; consulted only for otherwise-unknown types, before the
     // block-device fallthrough. Options are passed via source/data.
     if let Some(builder) = narf_filesystem::lookup_fstype(fstype.as_str()) {
-        return match builder(source_resolved.as_str(), source_resolved.as_str()) {
+        return match builder(source_resolved.as_str(), data.as_str()) {
             Ok(fs) => match current_mount_arc(&auth, target.as_str(), fs) {
                 Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
                 Err(_) => ctx.set_return(fail),
@@ -531,7 +531,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             // unknown fstype is ENODEV (matching Linux, never a bare -1).
             match fstype.as_str() {
                 "fat" | "vfat" | "fat16" | "fat32" | "ext2" | "ext3" | "ext4" | "xfs" | "btrfs"
-                | "iso9660" | "9p" | "virtiofs" => ctx.set_return(enoent),
+                | "iso9660" | "squashfs" | "9p" | "virtiofs" => ctx.set_return(enoent),
                 _ => ctx.set_return(enodev),
             }
             return;

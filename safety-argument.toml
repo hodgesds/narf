@@ -161,6 +161,10 @@ argument = "The cgroup memory-charge resolver maps an executor-private TaskId to
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
+argument = "The frame edit only links the untrusted SquashFS driver crate and invokes its initcall-registration function alongside existing filesystem drivers. Parsing and block I/O remain in DomainId::DRIVER_0 behind the existing filesystem/block interfaces; no capability, domain transition, frame ownership, scheduler state, or TCB boundary changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
 argument = "The frame edit embeds a verification-only static test binary in the existing boot-init fixture. It adds no production execution path, authority, mapping, capability, domain transition, or ownership change."
 
 [[invariants_preserved]]
