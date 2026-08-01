@@ -74,14 +74,17 @@ pub fn file_names() -> &'static [&'static str] {
 }
 
 /// Resolve a pressure filename to a `FileOps`, if it is one.
-pub fn pressure_file(name: &str) -> Option<Arc<dyn FileOps>> {
-    let resource = match name {
-        "cpu.pressure" => Resource::Cpu,
-        "memory.pressure" => Resource::Memory,
-        "io.pressure" => Resource::Io,
+pub fn pressure_file(name: &str, cgroup_ino: u64) -> Option<Arc<dyn FileOps>> {
+    let (resource, stable_name) = match name {
+        "cpu.pressure" => (Resource::Cpu, "cpu.pressure"),
+        "memory.pressure" => (Resource::Memory, "memory.pressure"),
+        "io.pressure" => (Resource::Io, "io.pressure"),
         _ => return None,
     };
-    Some(Arc::new(PsiFile { resource }))
+    Some(Arc::new(PsiFile {
+        resource,
+        ino: super::cgroup_attr_ino(cgroup_ino, stable_name),
+    }))
 }
 
 /// A `*.pressure` interface file. Writable in Linux (poll triggers);
@@ -89,9 +92,14 @@ pub fn pressure_file(name: &str) -> Option<Arc<dyn FileOps>> {
 #[derive(Debug)]
 struct PsiFile {
     resource: Resource,
+    ino: u64,
 }
 
 impl FileOps for PsiFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let content = render(self.resource);
         Box::pin(async move {
@@ -114,7 +122,7 @@ impl FileOps for PsiFile {
 
     fn stat(&self) -> Stat {
         Stat {
-            size: render(self.resource).len() as u64,
+            size: 0,
             blocks: 0,
             mode: Mode::FILE_RO,
             mtime_cycles: 0,

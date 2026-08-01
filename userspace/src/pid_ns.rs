@@ -275,4 +275,5 @@ pub fn resolve_inner_pid(task: u64, inner_pid: u64) -> Option<u64> {
 #[doc(hidden)]
 pub fn __test_reset() {
     *TASK_PID_NS.lock() = Some(BTreeMap::new());
+    *TASK_PID_NS_FOR_CHILDREN.lock() = Some(BTreeMap::new());
 }

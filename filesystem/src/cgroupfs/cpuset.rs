@@ -29,9 +29,8 @@
 //!   published as a hard per-task constraint through `narf-scheduler`.
 //!   The fault-time mempolicy resolver intersects placement policy
 //!   with this mask before asking the buddy allocator.
-//! - **`cpuset.memory_migrate`**: REAL — when enabled, narrowing the
-//!   effective memory mask or attaching a task migrates its resident private
-//!   base and huge pages off disallowed nodes before old backing is reused.
+//! - Linux's legacy-v1 `cpuset.memory_migrate` is deliberately absent from
+//!   this cgroup-v2 surface.
 //!
 //! Linux ref: `kernel/cgroup/cpuset.c`,
 //! `Documentation/admin-guide/cgroup-v2.rst` §"Cpuset".
@@ -51,7 +50,6 @@ const FILES: &[&str] = &[
     "cpuset.cpus.effective",
     "cpuset.mems",
     "cpuset.mems.effective",
-    "cpuset.memory_migrate",
     "cpuset.cpus.partition",
 ];
 
@@ -209,7 +207,6 @@ impl Controller for CpuSetController {
             // Requested mask 0 ("inherit") ⇒ effective == parent's.
             effective_cpus: IrqSafeSpinLock::new(parent_effective),
             effective_mems: IrqSafeSpinLock::new(parent_effective_mems),
-            memory_migrate: IrqSafeSpinLock::new(false),
             parent_effective_cpus: IrqSafeSpinLock::new(parent_effective),
             parent_effective_mems: IrqSafeSpinLock::new(parent_effective_mems),
             members: IrqSafeSpinLock::new(alloc::collections::BTreeSet::new()),
@@ -228,8 +225,6 @@ pub struct CpuSetState {
     effective_cpus: IrqSafeSpinLock<u64>,
     /// Effective memory-node mask, enforced at page-fault allocation.
     effective_mems: IrqSafeSpinLock<u64>,
-    /// Whether membership/policy changes migrate resident private memory.
-    memory_migrate: IrqSafeSpinLock<bool>,
     /// Snapshot of the parent's effective cpu mask captured at
     /// `new_state`. Used to recompute our effective set on a local
     /// `cpuset.cpus` write without a parent back-reference.
@@ -275,24 +270,7 @@ impl CpuSetState {
         for pid in members {
             narf_scheduler::set_task_mems_allowed(pid, effective);
         }
-        if *self.memory_migrate.lock() {
-            self.migrate_members_outside(effective);
-        }
         Ok(())
-    }
-
-    fn migrate_members_outside(&self, effective: u64) {
-        let members: Vec<u64> = self.members.lock().iter().copied().collect();
-        for pid in members {
-            let Some(address_space) = narf_scheduler::address_space_of(narf_scheduler::TaskId(pid))
-            else {
-                continue;
-            };
-            // SAFETY: scheduler address-space registration keeps this Arc's
-            // root alive for the operation; AddressSpace serializes backing
-            // replacement and performs the required peer TLB invalidation.
-            let _ = unsafe { address_space.migrate_pages_between(!effective, effective) };
-        }
     }
 }
 
@@ -320,11 +298,6 @@ impl ControllerState for CpuSetState {
             "cpuset.cpus.effective" => line(&format_cpulist(*self.effective_cpus.lock())),
             "cpuset.mems" => line(&self.mems.lock()),
             "cpuset.mems.effective" => line(&format_cpulist(*self.effective_mems.lock())),
-            "cpuset.memory_migrate" => line(if *self.memory_migrate.lock() {
-                "1"
-            } else {
-                "0"
-            }),
             "cpuset.cpus.partition" => line(&self.partition.lock()),
             _ => String::new(),
         }
@@ -348,18 +321,6 @@ impl ControllerState for CpuSetState {
                 *self.mems.lock() = String::from(text);
                 Ok(())
             }
-            "cpuset.memory_migrate" => {
-                let enabled = match text {
-                    "0" => false,
-                    "1" => true,
-                    _ => return Err(FsError::InvalidData),
-                };
-                *self.memory_migrate.lock() = enabled;
-                if enabled {
-                    self.migrate_members_outside(*self.effective_mems.lock());
-                }
-                Ok(())
-            }
             "cpuset.cpus.partition" => {
                 // v2 accepts "member" | "root" | "isolated". We store
                 // the string verbatim; partition semantics (exclusive
@@ -378,7 +339,7 @@ impl ControllerState for CpuSetState {
     fn writable(&self, file: &str) -> bool {
         matches!(
             file,
-            "cpuset.cpus" | "cpuset.mems" | "cpuset.memory_migrate" | "cpuset.cpus.partition"
+            "cpuset.cpus" | "cpuset.mems" | "cpuset.cpus.partition"
         )
     }
 
@@ -390,9 +351,6 @@ impl ControllerState for CpuSetState {
         push_affinity(pid, effective);
         let effective_mems = *self.effective_mems.lock();
         narf_scheduler::set_task_mems_allowed(pid, effective_mems);
-        if *self.memory_migrate.lock() {
-            self.migrate_members_outside(effective_mems);
-        }
     }
 
     fn on_detach(&self, pid: u64) {
@@ -410,12 +368,10 @@ fn smoke_cpuset_mems_propagates_to_task() -> narf_kernel_test::TestResult {
 
     const TASK: u64 = 0x4350_5553_4554;
     let state = CpuSetController.new_state(None);
-    if state.read("cpuset.memory_migrate") != "0\n"
-        || state.write("cpuset.memory_migrate", b"2").is_ok()
-        || state.write("cpuset.memory_migrate", b"1").is_err()
-        || state.read("cpuset.memory_migrate") != "1\n"
+    if state.files().contains(&"cpuset.memory_migrate")
+        || state.write("cpuset.memory_migrate", b"1").is_ok()
     {
-        return TestResult::Fail("cpuset.memory_migrate boolean ABI mismatch");
+        return TestResult::Fail("legacy cpuset.memory_migrate leaked into cgroup2");
     }
     if state.write("cpuset.mems", b"0").is_err() {
         return TestResult::Fail("cpuset.mems rejected online node 0");

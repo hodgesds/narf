@@ -255,26 +255,47 @@ impl ControllerState for CpuState {
             "cpu.max" => {
                 // "<quota|max> [period]"
                 let mut parts = text.split_whitespace();
-                let quota = parts.next().ok_or(FsError::InvalidData)?;
-                if let Some(p) = parts.next() {
-                    *self.period.lock() = p.parse::<u64>().map_err(|_| FsError::InvalidData)?;
+                let quota_text = parts.next().ok_or(FsError::InvalidData)?;
+                let period = match parts.next() {
+                    Some(period) => period.parse::<u64>().map_err(|_| FsError::InvalidData)?,
+                    None => *self.period.lock(),
+                };
+                if parts.next().is_some() || !(1_000..=1_000_000).contains(&period) {
+                    return Err(FsError::InvalidData);
                 }
-                *self.quota.lock() = if quota == "max" {
+                let quota = if quota_text == "max" {
                     None
                 } else {
-                    Some(quota.parse::<u64>().map_err(|_| FsError::InvalidData)?)
+                    let quota = quota_text
+                        .parse::<u64>()
+                        .map_err(|_| FsError::InvalidData)?;
+                    if quota < 1_000 || *self.burst.lock() > quota {
+                        return Err(FsError::InvalidData);
+                    }
+                    Some(quota)
                 };
+                // Commit only after the complete line validates.
+                *self.period.lock() = period;
+                *self.quota.lock() = quota;
                 // NOTE: cpu.max is accepted and round-trips through
                 // read, but the cooperative executor has no throttle
                 // seam, so no member task is actually bandwidth-capped.
                 Ok(())
             }
             "cpu.max.burst" => {
-                *self.burst.lock() = text.parse::<u64>().map_err(|_| FsError::InvalidData)?;
+                let burst = text.parse::<u64>().map_err(|_| FsError::InvalidData)?;
+                if self.quota.lock().is_some_and(|quota| burst > quota) {
+                    return Err(FsError::InvalidData);
+                }
+                *self.burst.lock() = burst;
                 Ok(())
             }
             "cpu.idle" => {
-                *self.idle.lock() = text.parse::<u64>().map_err(|_| FsError::InvalidData)?;
+                let idle = text.parse::<u64>().map_err(|_| FsError::InvalidData)?;
+                if idle > 1 {
+                    return Err(FsError::InvalidData);
+                }
+                *self.idle.lock() = idle;
                 Ok(())
             }
             _ => Err(FsError::ReadOnly),

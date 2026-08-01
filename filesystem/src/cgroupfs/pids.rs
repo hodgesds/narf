@@ -13,6 +13,7 @@
 //!   * `pids.peak`    (ro) — high-water mark of `pids.current`
 //!   * `pids.max`     (rw) — limit; `"max"` for unlimited
 //!   * `pids.events`  (ro) — `max <n>`: times a fork/attach was denied
+//!   * `pids.events.local` (ro) — the non-hierarchical event view
 
 use alloc::format;
 use alloc::string::String;
@@ -25,7 +26,13 @@ use narf_lib::sync::IrqSafeSpinLock;
 use super::controller::{Controller, ControllerState};
 use crate::FsError;
 
-const FILES: &[&str] = &["pids.current", "pids.peak", "pids.max", "pids.events"];
+const FILES: &[&str] = &[
+    "pids.current",
+    "pids.peak",
+    "pids.max",
+    "pids.events",
+    "pids.events.local",
+];
 
 #[derive(Debug)]
 pub struct PidsController;
@@ -68,7 +75,9 @@ impl ControllerState for PidsState {
                 None => "max\n".into(),
                 Some(n) => format!("{n}\n"),
             },
-            "pids.events" => format!("max {}\n", self.events_max.load(Ordering::Acquire)),
+            "pids.events" | "pids.events.local" => {
+                format!("max {}\n", self.events_max.load(Ordering::Acquire))
+            }
             _ => String::new(),
         }
     }

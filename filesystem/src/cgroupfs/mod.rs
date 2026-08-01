@@ -113,9 +113,23 @@ impl CgroupType {
 /// `st_dev` space.
 static NEXT_CGROUP_INO: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0x2000_0000);
+static NEXT_CGROUP_ATTR_INO: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0x3000_0000);
+static CGROUP_ATTR_INOS: IrqSafeSpinLock<BTreeMap<(u64, &'static str), u64>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
 
 fn alloc_cgroup_ino() -> u64 {
     NEXT_CGROUP_INO.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Stable kernfs-style inode identity for one named attribute in one cgroup.
+/// Lookup creates fresh `FileOps` objects, so the identity must live outside
+/// the open object to remain stable across path walks.
+pub(crate) fn cgroup_attr_ino(cgroup_ino: u64, name: &'static str) -> u64 {
+    let mut inos = CGROUP_ATTR_INOS.lock();
+    *inos
+        .entry((cgroup_ino, name))
+        .or_insert_with(|| NEXT_CGROUP_ATTR_INO.fetch_add(1, Ordering::Relaxed))
 }
 
 /// One node in the cgroup-v2 hierarchy. The root has an empty `name`
@@ -152,6 +166,7 @@ pub struct Cgroup {
     /// (Linux 6.1+; default on). NARF's PSI is scaffold-zeroes, so this
     /// is a stored toggle only — kept so systemd's
     /// `MemoryPressureWatch=` probe writes round-trip.
+    #[cfg(feature = "cgroup-psi")]
     psi_enabled: AtomicBool,
     /// `cgroup.events` change generation. Bumped on every transition of
     /// a field reported by `cgroup.events` (`populated`, `frozen`). An
@@ -193,6 +208,7 @@ impl Cgroup {
             ctrl_state: IrqSafeSpinLock::new(BTreeMap::new()),
             max_depth: IrqSafeSpinLock::new(None),
             max_descendants: IrqSafeSpinLock::new(None),
+            #[cfg(feature = "cgroup-psi")]
             psi_enabled: AtomicBool::new(true),
             events_gen: AtomicU64::new(0),
             last_populated: AtomicBool::new(false),
@@ -229,6 +245,7 @@ impl Cgroup {
             ctrl_state: IrqSafeSpinLock::new(state),
             max_depth: IrqSafeSpinLock::new(None),
             max_descendants: IrqSafeSpinLock::new(None),
+            #[cfg(feature = "cgroup-psi")]
             psi_enabled: AtomicBool::new(true),
             events_gen: AtomicU64::new(0),
             last_populated: AtomicBool::new(false),
@@ -320,7 +337,23 @@ static TASK_CGROUP: IrqSafeSpinLock<BTreeMap<u64, Arc<Cgroup>>> =
     IrqSafeSpinLock::new(BTreeMap::new());
 
 fn root() -> Arc<Cgroup> {
-    CGROUP_ROOT.get_or_init(Cgroup::new_root).clone()
+    let root = CGROUP_ROOT.get_or_init(Cgroup::new_root).clone();
+
+    // Linux creates a css for every available controller on the root even
+    // before that controller is delegated through cgroup.subtree_control.
+    // Besides making root-only/statistical files truthful, this is what lets
+    // accounting from a descendant continue all the way to the hierarchy
+    // root.  Reconcile here as well as at boot because tests and optional
+    // controller registrations may add a controller after the root exists.
+    for controller in controller::registered() {
+        let name = controller.name();
+        let mut states = root.ctrl_state.lock();
+        states
+            .entry(name)
+            .or_insert_with(|| controller.new_state(None));
+    }
+
+    root
 }
 
 /// Resolve the cgroup a pid currently belongs to (root if unplaced).
@@ -576,32 +609,29 @@ pub fn fork_inherit_ns(parent_pid: u64, child_pid: u64) {
 }
 
 /// Path of `cg` relative to a cgroup-namespace root (`/` when `cg` is
-/// the root). Falls back to the absolute path if `cg` is not within
-/// `nsroot`'s subtree.
+/// the root). Linux preserves sibling visibility using `..` components rather
+/// than leaking an absolute host-hierarchy path.
 fn cgroup_path_relative(cg: &Arc<Cgroup>, nsroot: &Arc<Cgroup>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut cur = cg.clone();
-    loop {
-        if Arc::ptr_eq(&cur, nsroot) {
-            if parts.is_empty() {
-                return "/".to_string();
-            }
-            parts.reverse();
-            let mut s = String::new();
-            for p in parts {
-                s.push('/');
-                s.push_str(&p);
-            }
-            return s;
-        }
-        match cur.parent.clone() {
-            Some(p) => {
-                parts.push(cur.name.clone());
-                cur = p;
-            }
-            None => return cgroup_path(cg), // not under nsroot
-        }
+    let target = cgroup_components(cg);
+    let namespace = cgroup_components(nsroot);
+    let common = target
+        .iter()
+        .zip(namespace.iter())
+        .take_while(|(target, namespace)| target == namespace)
+        .count();
+
+    let mut relative = String::new();
+    for _ in common..namespace.len() {
+        relative.push_str("/..");
     }
+    for component in &target[common..] {
+        relative.push('/');
+        relative.push_str(component);
+    }
+    if relative.is_empty() {
+        relative.push('/');
+    }
+    relative
 }
 
 /// `/proc/[pid]/cgroup` content: the v2 single-line form `0::<path>\n`.
@@ -639,22 +669,27 @@ pub fn proc_cgroups() -> Vec<u8> {
 
 /// Absolute path of a cgroup within the hierarchy (`/` for root).
 fn cgroup_path(cg: &Arc<Cgroup>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut cur = cg.clone();
-    while let Some(p) = cur.parent.clone() {
-        parts.push(cur.name.clone());
-        cur = p;
-    }
+    let parts = cgroup_components(cg);
     if parts.is_empty() {
         return "/".to_string();
     }
-    parts.reverse();
     let mut s = String::new();
     for part in parts {
         s.push('/');
         s.push_str(&part);
     }
     s
+}
+
+fn cgroup_components(cg: &Arc<Cgroup>) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = cg.clone();
+    while let Some(p) = cur.parent.clone() {
+        parts.push(cur.name.clone());
+        cur = p;
+    }
+    parts.reverse();
+    parts
 }
 
 // ── Core control files ──────────────────────────────────────────────
@@ -669,6 +704,7 @@ enum CoreFile {
     Events,
     Type,
     Stat,
+    StatLocal,
     Freeze,
     Kill,
     MaxDepth,
@@ -677,7 +713,9 @@ enum CoreFile {
     /// 6.1+, present on every cgroup including the root). NARF stores
     /// the bit so probe writes round-trip; the pressure numbers
     /// themselves are the psi module's scaffold zeroes.
+    #[cfg(feature = "cgroup-psi")]
     Pressure,
+    CpuStatLocal,
 }
 
 impl CoreFile {
@@ -690,11 +728,14 @@ impl CoreFile {
             CoreFile::Events => "cgroup.events",
             CoreFile::Type => "cgroup.type",
             CoreFile::Stat => "cgroup.stat",
+            CoreFile::StatLocal => "cgroup.stat.local",
             CoreFile::Freeze => "cgroup.freeze",
             CoreFile::Kill => "cgroup.kill",
             CoreFile::MaxDepth => "cgroup.max.depth",
             CoreFile::MaxDescendants => "cgroup.max.descendants",
+            #[cfg(feature = "cgroup-psi")]
             CoreFile::Pressure => "cgroup.pressure",
+            CoreFile::CpuStatLocal => "cpu.stat.local",
         }
     }
 
@@ -707,28 +748,32 @@ impl CoreFile {
             "cgroup.events" => CoreFile::Events,
             "cgroup.type" => CoreFile::Type,
             "cgroup.stat" => CoreFile::Stat,
+            "cgroup.stat.local" => CoreFile::StatLocal,
             "cgroup.freeze" => CoreFile::Freeze,
             "cgroup.kill" => CoreFile::Kill,
             "cgroup.max.depth" => CoreFile::MaxDepth,
             "cgroup.max.descendants" => CoreFile::MaxDescendants,
+            #[cfg(feature = "cgroup-psi")]
             "cgroup.pressure" => CoreFile::Pressure,
+            "cpu.stat.local" => CoreFile::CpuStatLocal,
             _ => return None,
         })
     }
 
     fn writable(self) -> bool {
-        matches!(
-            self,
+        match self {
             CoreFile::SubtreeControl
-                | CoreFile::Procs
-                | CoreFile::Threads
-                | CoreFile::Type
-                | CoreFile::Freeze
-                | CoreFile::Kill
-                | CoreFile::MaxDepth
-                | CoreFile::MaxDescendants
-                | CoreFile::Pressure
-        )
+            | CoreFile::Procs
+            | CoreFile::Threads
+            | CoreFile::Type
+            | CoreFile::Freeze
+            | CoreFile::Kill
+            | CoreFile::MaxDepth
+            | CoreFile::MaxDescendants => true,
+            #[cfg(feature = "cgroup-psi")]
+            CoreFile::Pressure => true,
+            _ => false,
+        }
     }
 }
 
@@ -745,7 +790,9 @@ fn core_files_for(cg: &Cgroup) -> &'static [CoreFile] {
             CoreFile::Stat,
             CoreFile::MaxDepth,
             CoreFile::MaxDescendants,
+            #[cfg(feature = "cgroup-psi")]
             CoreFile::Pressure,
+            CoreFile::CpuStatLocal,
         ]
     } else {
         &[
@@ -758,9 +805,12 @@ fn core_files_for(cg: &Cgroup) -> &'static [CoreFile] {
             CoreFile::Freeze,
             CoreFile::Kill,
             CoreFile::Stat,
+            CoreFile::StatLocal,
             CoreFile::MaxDepth,
             CoreFile::MaxDescendants,
+            #[cfg(feature = "cgroup-psi")]
             CoreFile::Pressure,
+            CoreFile::CpuStatLocal,
         ]
     }
 }
@@ -777,7 +827,12 @@ fn parse_max(text: &str) -> Result<Option<u64>, FsError> {
     if t == "max" {
         Ok(None)
     } else {
-        t.parse::<u64>().map(Some).map_err(|_| FsError::InvalidData)
+        let value = t.parse::<u64>().map_err(|_| FsError::InvalidData)?;
+        // Linux stores both limits as non-negative `int` values.
+        if value > i32::MAX as u64 {
+            return Err(FsError::InvalidData);
+        }
+        Ok(Some(value))
     }
 }
 
@@ -868,15 +923,23 @@ fn render_core(cg: &Arc<Cgroup>, f: CoreFile) -> String {
             "nr_descendants {}\nnr_dying_descendants 0\n",
             cg.nr_descendants()
         ),
+        // NARF does not yet retain freezer-duration accounting, so the
+        // Linux 6.17 local-stat shape is present with an honest zero.
+        CoreFile::StatLocal => "frozen_usec 0\n".to_string(),
         CoreFile::Freeze => {
             format!("{}\n", u8::from(cg.frozen.load(Ordering::Acquire)))
         }
         CoreFile::Kill => "0\n".to_string(),
         CoreFile::MaxDepth => max_str(&cg.max_depth.lock()),
         CoreFile::MaxDescendants => max_str(&cg.max_descendants.lock()),
+        #[cfg(feature = "cgroup-psi")]
         CoreFile::Pressure => {
             format!("{}\n", u8::from(cg.psi_enabled.load(Ordering::Acquire)))
         }
+        // Linux's cpu.stat.local currently reports the local (rather than
+        // hierarchical) CFS throttle time. NARF does not enforce cpu.max,
+        // therefore its only truthful value is zero.
+        CoreFile::CpuStatLocal => "throttled_usec 0\n".to_string(),
     }
 }
 
@@ -912,6 +975,9 @@ fn store_core(cg: &Arc<Cgroup>, f: CoreFile, buf: &[u8]) -> Result<usize, FsErro
             Ok(buf.len())
         }
         CoreFile::Kill => {
+            if *cg.cg_type.lock() == CgroupType::Threaded {
+                return Err(FsError::Unsupported);
+            }
             if text.trim() == "1" {
                 kill_subtree(cg);
                 Ok(buf.len())
@@ -920,9 +986,8 @@ fn store_core(cg: &Arc<Cgroup>, f: CoreFile, buf: &[u8]) -> Result<usize, FsErro
             }
         }
         CoreFile::Type => {
-            // Only the domain→threaded transition is accepted.
             if text.trim() == "threaded" {
-                *cg.cg_type.lock() = CgroupType::Threaded;
+                enable_threaded(cg)?;
                 Ok(buf.len())
             } else {
                 Err(FsError::InvalidData)
@@ -936,6 +1001,7 @@ fn store_core(cg: &Arc<Cgroup>, f: CoreFile, buf: &[u8]) -> Result<usize, FsErro
             *cg.max_descendants.lock() = parse_max(text)?;
             Ok(buf.len())
         }
+        #[cfg(feature = "cgroup-psi")]
         CoreFile::Pressure => {
             let want = match text.trim() {
                 "0" => false,
@@ -945,8 +1011,44 @@ fn store_core(cg: &Arc<Cgroup>, f: CoreFile, buf: &[u8]) -> Result<usize, FsErro
             cg.psi_enabled.store(want, Ordering::Release);
             Ok(buf.len())
         }
-        CoreFile::Controllers | CoreFile::Events | CoreFile::Stat => Err(FsError::ReadOnly),
+        CoreFile::Controllers
+        | CoreFile::Events
+        | CoreFile::Stat
+        | CoreFile::StatLocal
+        | CoreFile::CpuStatLocal => Err(FsError::ReadOnly),
     }
+}
+
+/// Apply Linux's load-bearing checks for the one writable cgroup.type
+/// transition. Full per-thread placement is not yet implemented, but NARF must
+/// not enter a threaded state Linux would reject: a populated cgroup or one
+/// distributing a domain-only controller cannot become threaded.
+fn enable_threaded(cg: &Arc<Cgroup>) -> Result<(), FsError> {
+    if *cg.cg_type.lock() == CgroupType::Threaded {
+        return Ok(());
+    }
+    if cg.populated() {
+        return Err(FsError::Unsupported);
+    }
+    if cg
+        .enabled
+        .lock()
+        .iter()
+        .any(|name| matches!(*name, "memory" | "io" | "misc"))
+    {
+        return Err(FsError::Unsupported);
+    }
+
+    let parent = cg.parent.as_ref().ok_or(FsError::Unsupported)?;
+    let mut parent_type = parent.cg_type.lock();
+    match *parent_type {
+        CgroupType::Domain => *parent_type = CgroupType::DomainThreaded,
+        CgroupType::DomainThreaded | CgroupType::Threaded => {}
+        CgroupType::DomainInvalid => return Err(FsError::Unsupported),
+    }
+    drop(parent_type);
+    *cg.cg_type.lock() = CgroupType::Threaded;
+    Ok(())
 }
 
 /// Parse and apply a `cgroup.subtree_control` write: `+ctrl`/`-ctrl`
@@ -956,25 +1058,24 @@ fn store_core(cg: &Arc<Cgroup>, f: CoreFile, buf: &[u8]) -> Result<usize, FsErro
 fn store_subtree_control(cg: &Arc<Cgroup>, text: &str) -> Result<(), FsError> {
     let available: BTreeSet<&'static str> = cg.available_controllers().into_iter().collect();
     // Validate the whole write first (atomic: reject without applying).
-    let mut adds: Vec<&'static str> = Vec::new();
-    let mut dels: Vec<&'static str> = Vec::new();
+    // Linux resolves repeated operations in input order: the final token for
+    // a controller wins ("-cpu +cpu" enables, "+cpu -cpu" disables).
+    let mut changes: BTreeMap<&'static str, bool> = BTreeMap::new();
     for tok in text.split_whitespace() {
         let (sign, name) = tok.split_at(1.min(tok.len()));
+        let canon = controller::find(name)
+            .map(|controller| controller.name())
+            .ok_or(FsError::InvalidData)?;
         match sign {
             "+" => {
-                let canon = available
-                    .iter()
-                    .copied()
-                    .find(|c| *c == name)
-                    .ok_or(FsError::InvalidData)?;
-                adds.push(canon);
+                if !available.contains(canon) {
+                    return Err(FsError::NotFound);
+                }
+                changes.insert(canon, true);
             }
             "-" => {
-                // Disabling a controller that isn't available is a no-op
-                // rather than an error; only act on known names.
-                if let Some(canon) = available.iter().copied().find(|c| *c == name) {
-                    dels.push(canon);
-                }
+                // A known controller which is not enabled here is a no-op.
+                changes.insert(canon, false);
             }
             _ => return Err(FsError::InvalidData),
         }
@@ -983,14 +1084,31 @@ fn store_subtree_control(cg: &Arc<Cgroup>, text: &str) -> Result<(), FsError> {
     // No-internal-process constraint: can't start distributing
     // resources to children while this (non-root) cgroup still holds
     // member processes.
-    if !cg.is_root() && !adds.is_empty() && !cg.members.lock().is_empty() {
+    if !cg.is_root()
+        && changes.values().any(|enable| *enable)
+        && (!cg.members.lock().is_empty() || !cg.threads.lock().is_empty())
+    {
         return Err(FsError::Busy);
     }
 
     let mut enabled = cg.enabled.lock();
     let children = cg.children.lock();
-    for name in adds {
-        if enabled.insert(name) {
+    // Linux refuses to withdraw a controller while a child still delegates
+    // it to its own descendants. Otherwise that child would advertise an
+    // enabled controller which is no longer available from its parent.
+    for (&name, &enable) in &changes {
+        if !enable
+            && enabled.contains(name)
+            && children
+                .values()
+                .any(|child| child.enabled.lock().contains(name))
+        {
+            return Err(FsError::Busy);
+        }
+    }
+
+    for (name, enable) in changes {
+        if enable && enabled.insert(name) {
             if let Some(ctrl) = controller::find(name) {
                 let parent_cs = cg.ctrl_state.lock().get(name).cloned();
                 for child in children.values() {
@@ -1001,10 +1119,7 @@ fn store_subtree_control(cg: &Arc<Cgroup>, text: &str) -> Result<(), FsError> {
                         .or_insert_with(|| ctrl.new_state(parent_cs.clone()));
                 }
             }
-        }
-    }
-    for name in dels {
-        if enabled.remove(name) {
+        } else if !enable && enabled.remove(name) {
             for child in children.values() {
                 child.ctrl_state.lock().remove(name);
             }
@@ -1127,6 +1242,7 @@ fn render_cpu_stat_base(cg: &Arc<Cgroup>) -> String {
 struct CgroupAttrFile {
     cg: Arc<Cgroup>,
     kind: FileKind,
+    ino: u64,
     /// For `cgroup.events`: the change generation this fd has observed.
     /// Captured at open from `cg.events_gen` and re-synced on every
     /// read; `poll_readiness` reports `POLLPRI` while `cg.events_gen` is
@@ -1140,7 +1256,18 @@ impl CgroupAttrFile {
     /// spurious POLLPRI on the first poll after open).
     fn open(cg: Arc<Cgroup>, kind: FileKind) -> Arc<dyn FileOps> {
         let seen_gen = AtomicU64::new(cg.events_gen.load(Ordering::Acquire));
-        Arc::new(CgroupAttrFile { cg, kind, seen_gen })
+        let name = match &kind {
+            FileKind::Core(file) => file.file_name(),
+            FileKind::Ctrl(_, file) => file,
+            FileKind::CpuStatBase => "cpu.stat",
+        };
+        let ino = cgroup_attr_ino(cg.ino, name);
+        Arc::new(CgroupAttrFile {
+            cg,
+            kind,
+            ino,
+            seen_gen,
+        })
     }
 
     /// True for the one file with edge-poll semantics (`cgroup.events`).
@@ -1180,6 +1307,10 @@ impl CgroupAttrFile {
 }
 
 impl FileOps for CgroupAttrFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         // Reading `cgroup.events` consumes the pending edge: re-sync this
         // fd's observed generation to the live one so `poll_readiness`
@@ -1221,13 +1352,20 @@ impl FileOps for CgroupAttrFile {
     }
 
     fn stat(&self) -> Stat {
+        let perms = match &self.kind {
+            // Linux exposes these command files as write-only.
+            FileKind::Core(CoreFile::Kill) | FileKind::Ctrl(_, "memory.reclaim") => 0o200,
+            _ if self.is_writable() => 0o644,
+            _ => 0o444,
+        };
         Stat {
-            size: self.content().len() as u64,
+            // cgroupfs is kernfs-backed on Linux; virtual attribute files
+            // report st_size == 0 regardless of their current rendered text.
+            size: 0,
             blocks: 0,
-            mode: if self.is_writable() {
-                Mode::FILE_RW
-            } else {
-                Mode::FILE_RO
+            mode: Mode {
+                file_type: FileType::File,
+                perms,
             },
             mtime_cycles: 0,
         }
@@ -1270,12 +1408,50 @@ impl CgroupDir {
     fn ctrl_file(&self, name: &str) -> Option<(&'static str, &'static str)> {
         let states = self.cg.ctrl_state.lock();
         for (cname, state) in states.iter() {
-            if let Some(f) = state.files().iter().copied().find(|f| *f == name) {
+            if let Some(f) = state
+                .files()
+                .iter()
+                .copied()
+                .find(|f| *f == name && controller_file_visible(&self.cg, f))
+            {
                 return Some((cname, f));
             }
         }
         None
     }
+}
+
+/// Linux controller cftypes can be root-only, non-root-only, or present at
+/// every level. `ControllerState::files()` describes the controller's stable
+/// superset, while this kernfs-shaped filter selects the files visible at the
+/// current hierarchy level.
+fn controller_file_visible(cg: &Cgroup, file: &str) -> bool {
+    if cg.is_root() {
+        return matches!(
+            file,
+            // Base/statistical files which Linux publishes on the root.
+            "cpu.stat"
+                | "memory.stat"
+                | "memory.numa_stat"
+                | "memory.reclaim"
+                | "memory.zswap.writeback"
+                | "io.stat"
+                | "cpuset.cpus.effective"
+                | "cpuset.mems.effective"
+                | "cpuset.cpus.subpartitions"
+                | "cpuset.cpus.isolated"
+                | "misc.current"
+                | "misc.peak"
+                | "misc.capacity"
+        );
+    }
+
+    // These two cpuset diagnostics are root-only in Linux. Every other file
+    // in a state belongs to a non-root cgroup.
+    !matches!(
+        file,
+        "cpuset.cpus.subpartitions" | "cpuset.cpus.isolated" | "misc.capacity"
+    )
 }
 
 /// Reject cgroup directory names that would break the tree or collide
@@ -1305,7 +1481,7 @@ impl DirOps for CgroupDir {
         // included (Linux mirrors /proc/pressure there) — independent
         // of subtree_control.
         #[cfg(feature = "cgroup-psi")]
-        if let Some(f) = psi::pressure_file(name) {
+        if let Some(f) = psi::pressure_file(name, self.cg.ino) {
             return Some(f);
         }
         if let Some((ctrl, file)) = self.ctrl_file(name) {
@@ -1343,7 +1519,9 @@ impl DirOps for CgroupDir {
             let states = self.cg.ctrl_state.lock();
             for state in states.values() {
                 for f in state.files() {
-                    out.push((f.to_string(), FileType::File));
+                    if controller_file_visible(&self.cg, f) {
+                        out.push((f.to_string(), FileType::File));
+                    }
                 }
             }
             // Base cpu.stat when the cpu controller isn't active here.
@@ -1359,6 +1537,15 @@ impl DirOps for CgroupDir {
             out.push((name.clone(), FileType::Dir));
         }
         out.into_iter().skip(cursor).take(max).collect()
+    }
+
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> FsFuture<'a, Vec<(String, FileType)>> {
+        let entries = self.enumerate(cursor, max);
+        Box::pin(async move { Ok(entries) })
     }
 
     fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
