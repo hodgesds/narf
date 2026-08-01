@@ -399,6 +399,108 @@ impl narf_filesystem::FileOps for DirFdFile {
     }
 }
 
+/// One successful open of `/dev/tty`. Linux keeps the 5:0 device-node
+/// identity while dispatching operations to the caller's current controlling
+/// terminal. The wrapper preserves that path metadata and forwards tty I/O,
+/// readiness, and job-control state to the selected console or PTY slave.
+#[cfg(feature = "linux-compat")]
+struct CurrentTtyFile {
+    inner: alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    inode: u64,
+}
+
+#[cfg(feature = "linux-compat")]
+impl narf_filesystem::FileOps for CurrentTtyFile {
+    fn read<'a>(
+        &'a self,
+        offset: u64,
+        buf: &'a mut [u8],
+    ) -> narf_filesystem::FsFuture<'a, usize> {
+        self.inner.read(offset, buf)
+    }
+
+    fn write<'a>(
+        &'a self,
+        offset: u64,
+        buf: &'a [u8],
+    ) -> narf_filesystem::FsFuture<'a, usize> {
+        self.inner.write(offset, buf)
+    }
+
+    fn stat(&self) -> narf_filesystem::Stat {
+        narf_filesystem::Stat {
+            size: 0,
+            blocks: 0,
+            mode: narf_filesystem::Mode {
+                file_type: narf_filesystem::FileType::Special,
+                perms: 0o666,
+            },
+            mtime_cycles: 0,
+        }
+    }
+
+    fn ino(&self) -> u64 {
+        self.inode
+    }
+
+    fn rdev(&self) -> u64 {
+        // Linux alternate TTY device `/dev/tty`.
+        (5 << 8) as u64
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, narf_filesystem::FsError> {
+        self.inner.ioctl(cmd, arg)
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        self.inner.poll_readiness()
+    }
+
+    fn poll_readiness_at(&self, offset: u64) -> u32 {
+        self.inner.poll_readiness_at(offset)
+    }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        self.inner.poll_edge_token()
+    }
+
+    fn acknowledge_poll_readiness(&self, readiness: u32) {
+        self.inner.acknowledge_poll_readiness(readiness);
+    }
+
+    fn tty_id(&self) -> Option<u32> {
+        self.inner.tty_id()
+    }
+
+    fn tty_fg_pgrp(&self) -> Option<u64> {
+        self.inner.tty_fg_pgrp()
+    }
+
+    fn tty_tostop(&self) -> bool {
+        self.inner.tty_tostop()
+    }
+
+    fn read_should_block(&self) -> bool {
+        self.inner.read_should_block()
+    }
+
+    fn write_should_block(&self) -> bool {
+        self.inner.write_should_block()
+    }
+
+    fn is_stream(&self) -> bool {
+        self.inner.is_stream()
+    }
+
+    fn block_on_input(&self) -> bool {
+        self.inner.block_on_input()
+    }
+
+    fn nonblock_read_eagain(&self) -> bool {
+        self.inner.nonblock_read_eagain()
+    }
+}
+
 /// Test-only: install a directory fd for `path` in `task`'s fd table
 /// and return it. Mirrors `sys_open`'s directory-fd fallback without
 /// going through the open syscall (whose native-vs-linux ABI differs by
@@ -567,7 +669,7 @@ fn do_execve_resolved(
             // into a memfd and fexecve's /proc/self/fd/N — whose recorded "path"
             // is the "anon_inode:[FileOps]" placeholder) must be exec'd from the
             // fd's own bytes instead.
-            let fs_path = fd_path_of(t, n).filter(|p| p.starts_with('/'));
+            let fs_path = fd_path_string_of(t, n).filter(|p| p.starts_with('/'));
             if let Some(real) = fs_path {
                 path_owned = real;
             } else if let Some(bytes) = read_fd_image(t, n) {
@@ -1743,6 +1845,61 @@ pub fn mount_namespace_of(task: u64) -> Option<alloc::sync::Arc<narf_filesystem:
     g.as_ref().and_then(|m| m.get(&task).cloned())
 }
 
+/// Stable nsfs identity for the shared initial mount namespace. Unlike a
+/// private `MountNamespace`, this namespace is backed directly by the global
+/// registry and therefore has no snapshot object to hold.
+#[cfg(feature = "container")]
+fn initial_mount_namespace_id() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static ID: AtomicU64 = AtomicU64::new(0);
+    let current = ID.load(Ordering::Acquire);
+    if current != 0 {
+        return current;
+    }
+    let fresh = crate::namespaces::alloc_ns_id();
+    match ID.compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => fresh,
+        Err(existing) => existing,
+    }
+}
+
+/// Mint the real namespace fd named by `/proc/<pid>/ns/<flavour>` or the
+/// equivalent pidfd ioctl. Mount and cgroup namespaces are bridged here
+/// because their backing objects live outside `userspace::namespaces`.
+#[cfg(feature = "container")]
+pub fn namespace_fd_for_task(
+    task: u64,
+    flavour: crate::namespaces::NsFlavour,
+) -> Option<alloc::sync::Arc<crate::namespaces::NsFd>> {
+    use crate::namespaces::{HeldNs, NsFd, NsFlavour};
+    let held = match flavour {
+        NsFlavour::Mnt => mount_namespace_of(task)
+            .map(HeldNs::Mnt)
+            .unwrap_or_else(|| HeldNs::MntGlobal(initial_mount_namespace_id())),
+        NsFlavour::Cgroup => {
+            #[cfg(feature = "cgroup")]
+            {
+                let pid = task_to_pid_raw(task).unwrap_or(task);
+                HeldNs::Cgroup(narf_filesystem::cgroupfs::cgroup_namespace_of(pid))
+            }
+            #[cfg(not(feature = "cgroup"))]
+            {
+                return None;
+            }
+        }
+        other => return crate::namespaces::ns_fd_for(task, other),
+    };
+    Some(NsFd::new(held))
+}
+
+/// Rejoin the shared initial mount namespace represented by `MntGlobal`.
+#[cfg(feature = "container")]
+pub fn install_initial_mount_namespace(task: u64) {
+    if let Some(namespaces) = TASK_MOUNT_NS.lock().as_mut() {
+        namespaces.remove(&task);
+    }
+}
+
 /// Wave-67 — install a private mount namespace for `task`. Replaces
 /// any existing entry. Used by `setns` and the fork-inheritance
 /// path.
@@ -1780,20 +1937,17 @@ pub(crate) fn mount_ns_inherit(parent_task: u64, child_task: u64) {
 pub fn proc_ns_readlink(pid: u64, tag: u8) -> Option<alloc::string::String> {
     use narf_filesystem::procfs::ns_tag;
     let task = pid_to_task_raw(pid).unwrap_or(pid);
-    let (label, id) = match tag {
-        ns_tag::UTS => ("uts", crate::namespaces::current_uts_ns(task).id()),
-        ns_tag::NET => ("net", crate::namespaces::current_net_ns(task)?.id()),
-        ns_tag::IPC => ("ipc", crate::namespaces::current_ipc_ns(task)?.id()),
-        ns_tag::PID => ("pid", crate::pid_ns::ns_of(task)?.id()),
-        ns_tag::MNT => ("mnt", mount_namespace_of(task)?.id()),
-        ns_tag::USER => ("user", crate::namespaces::current_user_ns(task).id()),
-        ns_tag::CGROUP => return None,
+    let flavour = match tag {
+        ns_tag::UTS => crate::namespaces::NsFlavour::Uts,
+        ns_tag::NET => crate::namespaces::NsFlavour::Net,
+        ns_tag::IPC => crate::namespaces::NsFlavour::Ipc,
+        ns_tag::PID => crate::namespaces::NsFlavour::Pid,
+        ns_tag::MNT => crate::namespaces::NsFlavour::Mnt,
+        ns_tag::USER => crate::namespaces::NsFlavour::User,
+        ns_tag::CGROUP => crate::namespaces::NsFlavour::Cgroup,
         _ => return None,
     };
-    let mut s = alloc::string::String::new();
-    use core::fmt::Write as _;
-    let _ = write!(s, "{}:[{}]", label, id);
-    Some(s)
+    namespace_fd_for_task(task, flavour).map(|fd| fd.link_text())
 }
 
 /// `/proc/<pid>/mountinfo` in the task's visible mount and chroot view.
@@ -1897,12 +2051,9 @@ pub fn proc_ns_idmap_write(
 
 // ── Wave-67: setns(target, nstype) ─────────────────────────────────
 //
-// Linux setns takes a fd referring to /proc/[pid]/ns/<type>. NARF
-// doesn't yet expose those symlinks; the interim NARF surface
-// accepts `target` as the outer TaskId / outer ProcessId of a task
-// whose namespace family we want to join. Once /proc/[pid]/ns/* is
-// plumbed, we'll add an inner branch that resolves the fd via the
-// fd table.
+// Linux setns takes a namespace fd opened from /proc/[pid]/ns/<type> (or
+// returned by a pidfd namespace ioctl). NARF supports that primary path and
+// retains the older TaskId/ProcessId form only for compatibility tests.
 
 // ── Wave-71: Per-task chroot table ────────────────────────────────
 //
@@ -3377,35 +3528,55 @@ pub fn proc_fd_pidfd_pid(pid: u64, n: u32) -> Option<u64> {
         .map(|outer| report_pid_to(current_task_id(), outer))
 }
 
-pub fn fd_path_of(pid: u64, n: u32) -> Option<alloc::string::String> {
+fn fd_path_string_of(pid: u64, n: u32) -> Option<alloc::string::String> {
     // `pid` is the outer ProcessId; the fd/path tables key on TaskId, so
     // resolve pid→tid. Getting this wrong made /proc/self/fd/<n> unresolvable —
     // systemd execs its executor via `execve("/proc/self/fd/N")`, so an empty
     // resolution turned every service spawn into EBADF (project_pidns_flow_model).
     let tid = proc_pid_to_tid(pid);
-    // Preferred: the real backing path recorded at open() time (the same
-    // fd→path table inotify/landlock use). This is what /proc/<pid>/fd/<n>
-    // readlinks to — musl's realpath() opens O_PATH then readlinks here.
-    // Report it chroot-relative so a chrooted process (e.g. udev in a
-    // distro chroot) can re-open the link target in its own namespace.
     #[cfg(feature = "linux-compat")]
-    if let Some(p) = crate::mqueue::fd_path(tid, n) {
-        return Some(strip_chroot_prefix(tid, &p));
+    if let Some(path) = crate::mqueue::fd_path(tid, n) {
+        // Validate that the slot still exists before trusting the separately
+        // maintained fd→path table (fd numbers may be closed and reused).
+        if crate::fd::with_table(tid, |table| table.get(n).is_some()).unwrap_or(false) {
+            return Some(strip_chroot_prefix(tid, &path));
+        }
     }
-    crate::fd::with_table(tid, |t| {
-        let entry = t.get(n)?;
-        // Use the type_name as a fallback for fds with no path (pipes,
-        // sockets, eventfd, …) until FileOps grows a path() method.
+    crate::fd::with_table(tid, |table| {
+        let entry = table.get(n)?;
         let name = core::any::type_name_of_val(&*entry.ops);
-        // Extract the last component (e.g. "PipeRead" from "crate::pipe::PipeRead").
         let short = name.rsplit("::").next().unwrap_or(name);
         Some(alloc::format!("anon_inode:[{}]", short))
     })
     .flatten()
 }
 
+#[cfg(feature = "linux-compat")]
+pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSnapshot> {
+    let tid = proc_pid_to_tid(pid);
+    let (pos, flags, ino) = crate::fd::with_table(tid, |table| {
+        let entry = table.get(n)?;
+        Some((entry.offset, entry.status_flags, entry.ops.ino()))
+    })
+    .flatten()?;
+    // Preferred: the real backing path recorded at open() time (the same
+    // fd→path table inotify/landlock use). This is what /proc/<pid>/fd/<n>
+    // readlinks to — musl's realpath() opens O_PATH then readlinks here.
+    // Report it chroot-relative so a chrooted process (e.g. udev in a
+    // distro chroot) can re-open the link target in its own namespace.
+    Some(narf_filesystem::procfs::ProcFdSnapshot {
+        path: fd_path_string_of(pid, n)?,
+        info: narf_filesystem::procfs::ProcFdInfo {
+            pos,
+            flags,
+            mnt_id: crate::mqueue::fd_mount_id(tid, n).unwrap_or(0),
+            ino,
+        },
+    })
+}
+
 /// Return an fd path for an internal scheduler TaskId. Syscall handlers must
-/// use this rather than [`fd_path_of`]: the latter intentionally interprets
+/// use this rather than `fd_path_of`: the latter intentionally interprets
 /// its first argument as a Linux PID for procfs. Treating a TaskId as a PID
 /// misroutes a lookup whenever it numerically collides with another process's
 /// PID (as systemd's forked mount helpers routinely do).

@@ -998,6 +998,83 @@ fn smoke_abi_proc_setns_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_setns_neg);
 
+#[cfg(feature = "container")]
+fn smoke_abi_proc_namespace_open_mints_setns_fd() -> TestResult {
+    with_setup(|| {
+        let path = b"/proc/self/ns/uts\0";
+        let fd = match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("open of /proc/self/ns/uts failed"),
+        };
+        let task = crate::handlers::current_task_id();
+        let is_nsfd = crate::fd::with_table(task, |table| {
+            table.get(fd).is_some_and(|entry| {
+                entry
+                    .ops
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<crate::namespaces::NsFd>())
+                    .is_some()
+            })
+        })
+        .unwrap_or(false);
+        if !is_nsfd {
+            return Err("proc namespace open installed a symlink file, not an NsFd");
+        }
+        match call(
+            Syscall::Setns.raw(),
+            a1(fd as u64, crate::namespaces::CLONE_NEWUTS),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("setns rejected the fd opened from /proc/self/ns/uts"),
+        }?;
+
+        // Use the numeric proc path here: the generic nofollow resolver must
+        // preserve only the final namespace link, whereas `/proc/self` is an
+        // intermediate magic link that this focused test need not exercise.
+        let visible_pid = crate::handlers::proc_current_pid();
+        if visible_pid != FAKE_TASK {
+            return Err("proc current pid did not match the ABI harness task");
+        }
+        if crate::handlers::proc_task_info(visible_pid).is_none() {
+            return Err("proc task provider could not see the ABI harness task");
+        }
+        let link_path = alloc::format!("/proc/{visible_pid}/ns/uts\0");
+        let mounted_proc =
+            crate::handlers::current_resolve_absolute(link_path.trim_end_matches('\0'), |fs, _| {
+                fs.name() == "proc"
+            });
+        if mounted_proc != Some(true) {
+            return Err("ABI harness path did not resolve through the proc mount");
+        }
+        let link_fd = match call_open(link_path.as_ptr() as u64, 0o10000000 | 0o400000) {
+            Some(fd) if fd >= 0 => fd as u32,
+            Some(-1) => return Err("O_PATH|O_NOFOLLOW namespace open returned generic failure"),
+            Some(-2) => return Err("O_PATH|O_NOFOLLOW namespace open returned ENOENT"),
+            Some(-40) => return Err("O_PATH|O_NOFOLLOW namespace open returned ELOOP"),
+            Some(_) => return Err("O_PATH|O_NOFOLLOW namespace open returned another errno"),
+            None => return Err("O_PATH|O_NOFOLLOW namespace open returned invalid-op"),
+        };
+        let preserved_link = crate::fd::with_table(task, |table| {
+            table.get(link_fd).is_some_and(|entry| {
+                entry.ops.stat().mode.file_type == narf_filesystem::FileType::Symlink
+                    && entry
+                        .ops
+                        .as_any()
+                        .and_then(|any| any.downcast_ref::<crate::namespaces::NsFd>())
+                        .is_none()
+            })
+        })
+        .unwrap_or(false);
+        if preserved_link {
+            Ok(())
+        } else {
+            Err("O_PATH|O_NOFOLLOW followed the namespace magic link")
+        }
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!("syscall_abi", smoke_abi_proc_namespace_open_mints_setns_fd);
+
 // ── read(2) must not hold the fd-table lock across FileOps ────────
 //
 // `sys_read` used to call `FileOps::read` while holding the caller's

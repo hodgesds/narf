@@ -777,6 +777,44 @@ pub const O_CREAT: u64 = 0o100;
 /// reuse the exact same resolution / permission / O_CREAT / directory-fd /
 /// inotify logic — a real `dirfd` is what sd-device's `chase_symlinks` (behind
 /// libudev / elogind seat enumeration) walks with, one `openat` per component.
+#[cfg(feature = "container")]
+fn proc_namespace_fd_from_path(
+    caller: u64,
+    path: &str,
+    proc_prefix: &str,
+) -> Option<alloc::sync::Arc<crate::namespaces::NsFd>> {
+    use crate::namespaces::NsFlavour;
+
+    let relative = path.strip_prefix(proc_prefix)?.strip_prefix('/')?;
+    let mut components = relative.split('/');
+    let process = components.next()?;
+    if components.next()? != "ns" {
+        return None;
+    }
+    let flavour = match components.next()? {
+        "uts" => NsFlavour::Uts,
+        "net" => NsFlavour::Net,
+        "ipc" => NsFlavour::Ipc,
+        "pid" => NsFlavour::Pid,
+        "mnt" => NsFlavour::Mnt,
+        "cgroup" => NsFlavour::Cgroup,
+        "user" => NsFlavour::User,
+        _ => return None,
+    };
+    if components.next().is_some() {
+        return None;
+    }
+    let target_task = match process {
+        "self" | "thread-self" => caller,
+        visible => {
+            let inner = visible.parse::<u64>().ok()?;
+            let outer = accept_pid_from(caller, inner)?;
+            pid_to_task_raw(outer)?
+        }
+    };
+    namespace_fd_for_task(target_task, flavour)
+}
+
 fn open_impl(
     ctx: &mut dyn TrapContext,
     path_owned_raw: alloc::string::String,
@@ -859,6 +897,33 @@ fn open_impl(
         let nofile_cur = rlimits_of(task)[7].0;
         if crate::fd::open_fds(task).len() as u64 >= nofile_cur {
             ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            return;
+        }
+    }
+
+    // Following a proc namespace magic link yields an nsfs-like fd whose
+    // held namespace can be consumed by setns(2). O_PATH|O_NOFOLLOW must
+    // still open the symlink itself, so leave that case to the nofollow path.
+    #[cfg(feature = "container")]
+    if mnt_len == 0 && flags & 0o400000 == 0 {
+        if let Some(nsfd) = proc_namespace_fd_from_path(task, path, &proc_prefix) {
+            let ops: Arc<dyn narf_filesystem::FileOps> = nsfd;
+            let new_fd = fd::with_table(task, |table| {
+                table.open(crate::fd::FdEntry {
+                    ops,
+                    offset: 0,
+                    flags: 0,
+                    status_flags: open_status_flags,
+                })
+            });
+            match new_fd {
+                Some(n) => {
+                    #[cfg(feature = "linux-compat")]
+                    crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
+                    ctx.set_return(SyscallReturn::ok(n as u64));
+                }
+                None => ctx.set_return(fail),
+            }
             return;
         }
     }
@@ -1113,6 +1178,34 @@ fn open_impl(
         return;
     }
 
+    // `/dev/tty` is the calling process's controlling terminal, not an alias
+    // for the system console. Preserve O_PATH's side-effect-free path inode
+    // above; a real open selects the console or live PTY slave recorded by
+    // TIOCSCTTY. A session with no controlling terminal gets Linux ENXIO.
+    #[cfg(feature = "linux-compat")]
+    let ops = if mnt_len == 0 && path == apply_chroot("/dev/tty") {
+        let selected: Arc<dyn narf_filesystem::FileOps> = match task_ctty(task) {
+            Some(CTTY_CONSOLE) => ops.clone(),
+            Some(index) => match narf_filesystem::devfs_pty::pts_lookup(index) {
+                Some(pty) => Arc::new(narf_filesystem::devfs_pty::PtySlave::new(pty)),
+                None => {
+                    ctx.set_return(SyscallReturn::ok((-6i64) as u64)); // -ENXIO
+                    return;
+                }
+            },
+            None => {
+                ctx.set_return(SyscallReturn::ok((-6i64) as u64)); // -ENXIO
+                return;
+            }
+        };
+        Arc::new(CurrentTtyFile {
+            inner: selected,
+            inode: ops.ino(),
+        }) as Arc<dyn narf_filesystem::FileOps>
+    } else {
+        ops
+    };
+
     // POSIX-2017 permission check. The accessor's UID/GID come from
     // the per-task uidgid table; the file's owners + perms come from
     // its FileOps trait. UID 0 (root) shortcuts; non-root must own
@@ -1155,14 +1248,11 @@ fn open_impl(
         return;
     }
 
-    // PTY clone-on-open: `/dev/ptmx` is a singleton FileOps that exists
-    // only to be a lookup target; each `open()` allocates a fresh `Pty`
-    // pair via `open_ptmx()` and installs the master here. Linux:
-    // `drivers/tty/pty.c::ptmx_open`. The `is_ptmx_clone()` trait hook
-    // keeps the filesystem crate free of any fd-table awareness.
-    let ops = if ops.is_ptmx_clone() {
-        let master = narf_filesystem::devfs_pty::open_ptmx();
-        master as Arc<dyn narf_filesystem::FileOps>
+    // Clone devices keep path lookup/stat side-effect free and allocate their
+    // per-open state only here after permissions have passed. This covers
+    // PTY masters and independent FUSE daemon connections.
+    let ops = if let Some(instance) = ops.open_instance() {
+        instance
     } else {
         ops
     };
@@ -1594,6 +1684,7 @@ impl StatBuf {
             narf_filesystem::FileType::Dir => 0o040000,
             narf_filesystem::FileType::Symlink => 0o120000,
             narf_filesystem::FileType::Special => 0o020000,
+            narf_filesystem::FileType::Block => 0o060000,
             narf_filesystem::FileType::Socket => 0o140000,
             narf_filesystem::FileType::Fifo => 0o010000,
         };
@@ -1732,7 +1823,12 @@ fn mknod_common(path_uptr: u64, mode: u64, dev: u64) -> SyscallReturn {
         // that don't support device nodes fall back to a plain file so the node
         // at least EXISTS (matching the old behaviour for the elogind sandbox
         // nodes). `dev` is the Linux dev_t as passed by userspace.
-        match poll_blocking(parent.mknod(&leaf, narf_filesystem::FileType::Special, dev)) {
+        let file_type = if fmt == S_IFBLK {
+            narf_filesystem::FileType::Block
+        } else {
+            narf_filesystem::FileType::Special
+        };
+        match poll_blocking(parent.mknod(&leaf, file_type, dev)) {
             Some(Ok(n)) => Some(n),
             _ => poll_blocking(parent.create(&leaf)).and_then(|r| r.ok()),
         }
@@ -1950,6 +2046,7 @@ fn linux_stat_from_fs(
         narf_filesystem::FileType::Dir => 0o040000,
         narf_filesystem::FileType::Symlink => 0o120000,
         narf_filesystem::FileType::Special => 0o020000,
+        narf_filesystem::FileType::Block => 0o060000,
         narf_filesystem::FileType::Socket => 0o140000,
         narf_filesystem::FileType::Fifo => 0o010000,
     };
@@ -2603,11 +2700,11 @@ fn readlink_impl(
         ctx.set_return(einval);
         return;
     }
-    // Allocate staging buffer at min(buf_len, target_len). MemSymlink
-    // reads the target verbatim from offset 0; n is the byte count.
-    let target_len = st.size as usize;
-    let len = core::cmp::min(buf_len, target_len);
-    let mut staging = alloc::vec![0u8; len];
+    // `st_size` is only a hint for symlinks and is deliberately zero for
+    // Linux procfs magic links such as /proc/self and /proc/<pid>/ns/mnt.
+    // readlink(2) is defined by the caller's buffer length, so read directly
+    // into a buffer of that size and let FileOps return the actual byte count.
+    let mut staging = alloc::vec![0u8; buf_len];
     let n = match poll_blocking(file.read(0, &mut staging)) {
         Some(Ok(n)) => n,
         _ => {
@@ -3023,7 +3120,7 @@ fn xattr_user_path(ptr: u64) -> Option<alloc::string::String> {
 /// against each other on the same fd, but do NOT share storage with the
 /// path-keyed `*xattr` family (a documented limitation).
 fn xattr_fd_key(fd: u32) -> Option<alloc::string::String> {
-    fd_path_of(current_task_id(), fd)
+    fd_path_string_of(current_task_id(), fd)
 }
 
 fn xattr_file(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {

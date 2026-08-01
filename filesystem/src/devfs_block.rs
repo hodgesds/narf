@@ -59,6 +59,9 @@ pub struct BlockFile {
     pub block_size: u32,
     /// Low-9-bit POSIX permission word.  Default: 0o660 (root:disk).
     pub perms: u16,
+    /// Linux device number (`st_rdev`). Registry-backed disks use block
+    /// extended major 259 and a stable enumeration minor.
+    pub rdev: u64,
 }
 
 impl core::fmt::Debug for BlockFile {
@@ -68,6 +71,7 @@ impl core::fmt::Debug for BlockFile {
             .field("lba_count", &self.lba_count)
             .field("block_size", &self.block_size)
             .field("perms", &self.perms)
+            .field("rdev", &self.rdev)
             .finish_non_exhaustive()
     }
 }
@@ -83,6 +87,7 @@ impl BlockFile {
             lba_count,
             block_size,
             perms: 0o660,
+            rdev: 0,
         }
     }
 
@@ -228,7 +233,7 @@ impl FileOps for BlockFile {
             // 0o060000 = block-device file type bits (S_IFBLK).
             // Combined with perms (0o660 default) → 0o060660.
             mode: Mode {
-                file_type: FileType::Special,
+                file_type: FileType::Block,
                 perms: self.perms,
             },
             mtime_cycles: 0,
@@ -240,6 +245,14 @@ impl FileOps for BlockFile {
         // udev default (see udev rules in
         // /usr/lib/udev/rules.d/50-udev-default.rules).
         (0, 6)
+    }
+
+    fn rdev(&self) -> u64 {
+        self.rdev
+    }
+
+    fn ino(&self) -> u64 {
+        0xd002_0000_0000_0000 | self.rdev.wrapping_add(1)
     }
 
     fn poll_readiness(&self) -> u32 {
@@ -257,17 +270,24 @@ impl FileOps for BlockFile {
 ///
 /// Called from `DevDir::lookup` after the static table misses.
 pub fn lookup_block_file(name: &str) -> Option<Arc<dyn FileOps>> {
-    narf_block::find_block_device(name)
-        .map(|dev| Arc::new(BlockFile::from_dev(dev)) as Arc<dyn FileOps>)
+    narf_block::block_devices()
+        .into_iter()
+        .enumerate()
+        .find(|(_, registered)| registered.name == name)
+        .map(|(minor, registered)| {
+            let mut file = BlockFile::from_dev(registered.dev);
+            file.rdev = crate::devfs::linux_makedev(259, minor as u32);
+            Arc::new(file) as Arc<dyn FileOps>
+        })
 }
 
-/// All registered block devices as `(name, FileType::Special)` pairs.
+/// All registered block devices as `(name, FileType::Block)` pairs.
 ///
 /// Called from `DevDir::enumerate` after the static entries.
 pub fn enumerate_block_devices() -> Vec<(alloc::string::String, FileType)> {
     narf_block::block_devices()
         .into_iter()
-        .map(|r| (alloc::string::String::from(r.name), FileType::Special))
+        .map(|r| (alloc::string::String::from(r.name), FileType::Block))
         .collect()
 }
 
@@ -287,6 +307,9 @@ impl core::fmt::Debug for DevDiskDir {
 }
 
 impl DirOps for DevDiskDir {
+    fn ino(&self) -> u64 {
+        10
+    }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let _ = name;
         None // all children are directories
@@ -337,6 +360,10 @@ impl core::fmt::Debug for DevDiskByLabel {
 }
 
 impl DirOps for DevDiskByLabel {
+    fn ino(&self) -> u64 {
+        11
+    }
+
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         narf_block::block_devices()
             .into_iter()
@@ -346,7 +373,7 @@ impl DirOps for DevDiskByLabel {
                     .map(|p| p.partlabel == name)
                     .unwrap_or(false)
             })
-            .map(|r| Arc::new(BlockFile::from_dev(r.dev)) as Arc<dyn FileOps>)
+            .map(|r| crate::devfs::symlink_file(name, alloc::format!("../../{}", r.name)))
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -369,7 +396,7 @@ impl DirOps for DevDiskByLabel {
             })
             .skip(cursor)
             .take(max)
-            .map(|label| (label, FileType::Special))
+            .map(|label| (label, FileType::Symlink))
             .collect()
     }
 
@@ -401,6 +428,9 @@ impl core::fmt::Debug for DevDiskByUuid {
 }
 
 impl DirOps for DevDiskByUuid {
+    fn ino(&self) -> u64 {
+        12
+    }
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         None
     }
@@ -422,6 +452,10 @@ impl core::fmt::Debug for DevDiskByPartUuid {
 }
 
 impl DirOps for DevDiskByPartUuid {
+    fn ino(&self) -> u64 {
+        13
+    }
+
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         narf_block::block_devices()
             .into_iter()
@@ -431,7 +465,7 @@ impl DirOps for DevDiskByPartUuid {
                     .map(|p| p.partuuid == name)
                     .unwrap_or(false)
             })
-            .map(|r| Arc::new(BlockFile::from_dev(r.dev)) as Arc<dyn FileOps>)
+            .map(|r| crate::devfs::symlink_file(name, alloc::format!("../../{}", r.name)))
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -452,7 +486,7 @@ impl DirOps for DevDiskByPartUuid {
             })
             .skip(cursor)
             .take(max)
-            .map(|uuid| (uuid, FileType::Special))
+            .map(|uuid| (uuid, FileType::Symlink))
             .collect()
     }
 

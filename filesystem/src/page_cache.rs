@@ -24,9 +24,9 @@
 //! correctness-preserving.
 
 use alloc::collections::{BTreeMap, VecDeque};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -109,6 +109,70 @@ fn free_pages_available() -> Option<usize> {
     Some(narf_memory::frame_stats().free)
 }
 
+// ── Central-reclaim integration (one shrinker for all page caches) ──
+//
+// Every live page cache registers itself here (a `Weak` so a dropped
+// filesystem's cache falls out). A single `page-cache` shrinker is
+// registered with `narf_memory::reclaim` the first time any cache
+// appears; its count/scan iterate this registry. The scan/count paths
+// are allocation-free (iterate + upgrade under the registry lock, no
+// `Vec`) so they are safe to drive from the memory-reclaim / OOM path.
+// Lock order is always REGISTRY → cache-inner (register only takes the
+// registry lock; lookup/insert/shrink only take the cache-inner lock),
+// so holding the registry lock across `shrink` cannot deadlock.
+
+static PAGE_CACHE_REGISTRY: IrqSafeSpinLock<Vec<Weak<PageCache>>> =
+    IrqSafeSpinLock::new(Vec::new());
+static SHRINKER_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Register `cache` with the central memory reclaimer so its clean pages
+/// can be shed under pressure. Call once per cache after it is wrapped in
+/// its owning `Arc` (e.g. at filesystem mount). Registration allocates
+/// (registry push) but happens off the reclaim path.
+pub fn register_for_reclaim(cache: &Arc<PageCache>) {
+    {
+        let mut g = PAGE_CACHE_REGISTRY.lock();
+        g.retain(|w| w.strong_count() > 0);
+        g.push(Arc::downgrade(cache));
+    }
+    if !SHRINKER_REGISTERED.swap(true, Ordering::AcqRel) {
+        narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+            name: "page-cache",
+            count: page_cache_shrinker_count,
+            scan: page_cache_shrinker_scan,
+        });
+    }
+}
+
+/// Shrinker `count`: total clean, evictable pages across all live caches.
+/// Allocation-free.
+fn page_cache_shrinker_count() -> usize {
+    let g = PAGE_CACHE_REGISTRY.lock();
+    let mut n = 0usize;
+    for w in g.iter() {
+        if let Some(c) = w.upgrade() {
+            n = n.saturating_add(c.reclaimable());
+        }
+    }
+    n
+}
+
+/// Shrinker `scan`: shed up to `nr` clean pages across live caches.
+/// Allocation-free (upgrades a `Weak` — no heap — and evicts in place).
+fn page_cache_shrinker_scan(nr: usize) -> usize {
+    let g = PAGE_CACHE_REGISTRY.lock();
+    let mut freed = 0usize;
+    for w in g.iter() {
+        if freed >= nr {
+            break;
+        }
+        if let Some(c) = w.upgrade() {
+            freed = freed.saturating_add(c.shrink(nr - freed));
+        }
+    }
+    freed
+}
+
 /// Cache key: filesystem + inode + page offset (in pages, not
 /// bytes).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -118,12 +182,73 @@ pub struct PageKey {
     pub page_off: u64,
 }
 
-/// Cached page entry. `data` is an `Arc<[u8; PAGE_SIZE]>` so readers
-/// never block a writer's RCU swap; dirty pages hold the write-half
-/// until writeback commits.
+/// A page-sized data frame the cache owns. The bytes live in a real
+/// buddy frame (reached through the kernel direct map), NOT the slab
+/// heap — so dropping a cached page returns memory DIRECTLY to the buddy
+/// allocator. That is what lets memory reclaim relieve large (multi-page)
+/// buddy allocations, and keeps hundreds of MiB of cached file data off
+/// the slab. The frame is node-local (`alloc_frame` prefers the current
+/// CPU's NUMA node) and freed to the buddy on drop.
+pub struct CachePage {
+    frame: narf_memory::PhysFrame,
+}
+
+impl CachePage {
+    /// Allocate a zeroed page frame, or `None` under memory pressure
+    /// (the caller then degrades — e.g. serves a read without caching).
+    pub fn alloc_zeroed() -> Option<Self> {
+        let frame = narf_memory::alloc_frame().ok()?;
+        // SAFETY: a freshly-allocated frame is exclusively owned here and is
+        // PAGE_SIZE bytes of RAM reachable via its kernel direct-map pointer.
+        unsafe {
+            core::ptr::write_bytes(frame.start_address().kernel_mut_ptr::<u8>(), 0, PAGE_SIZE);
+        }
+        Some(Self { frame })
+    }
+}
+
+impl core::ops::Deref for CachePage {
+    type Target = [u8; PAGE_SIZE];
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: the frame is owned for this CachePage's lifetime and is
+        // PAGE_SIZE bytes of RAM mapped in the kernel direct map.
+        unsafe { &*self.frame.start_address().kernel_ptr::<[u8; PAGE_SIZE]>() }
+    }
+}
+
+impl core::ops::DerefMut for CachePage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: as `Deref`; `&mut self` proves exclusive access (only held
+        // during construction, before the page is shared via `Arc`).
+        unsafe {
+            &mut *self
+                .frame
+                .start_address()
+                .kernel_mut_ptr::<[u8; PAGE_SIZE]>()
+        }
+    }
+}
+
+impl Drop for CachePage {
+    fn drop(&mut self) {
+        narf_memory::free_frame(self.frame);
+    }
+}
+
+impl core::fmt::Debug for CachePage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CachePage")
+            .field("frame", &self.frame.number())
+            .finish()
+    }
+}
+
+/// Cached page entry. `data` is an `Arc<CachePage>` (a buddy frame) so
+/// readers share one copy and the frame returns to the buddy on last
+/// drop; dirty pages hold the reference until writeback commits.
 #[derive(Clone, Debug)]
 pub struct Page {
-    pub data: Arc<[u8; PAGE_SIZE]>,
+    pub data: Arc<CachePage>,
     pub dirty: bool,
     /// Monotonic generation — bumps on every write so stale readers
     /// can detect they've raced.
@@ -131,9 +256,12 @@ pub struct Page {
 }
 
 impl Page {
+    /// A fresh zeroed cache page. Panics on frame-allocation failure —
+    /// a test/building-block constructor; production read paths use the
+    /// fallible [`CachePage::alloc_zeroed`] and degrade under pressure.
     pub fn zeroed() -> Self {
         Self {
-            data: Arc::new([0u8; PAGE_SIZE]),
+            data: Arc::new(CachePage::alloc_zeroed().expect("cache page frame")),
             dirty: false,
             gen: 0,
         }
@@ -369,6 +497,31 @@ impl PageCache {
         let mut g = self.inner.lock();
         g.pages.clear();
         g.clock.clear();
+    }
+
+    /// Number of clean (evictable) resident pages — what this cache can
+    /// hand back to memory reclaim without a writeback. Dirty pages still
+    /// owe a writeback and are excluded. This is the shrinker `count`.
+    pub fn reclaimable(&self) -> usize {
+        let g = self.inner.lock();
+        g.pages.values().filter(|slot| !slot.page.dirty).count()
+    }
+
+    /// Evict up to `nr` cold, clean pages in CLOCK order and return the
+    /// number actually evicted. Dirty pages are never touched. This is the
+    /// shrinker `scan`: memory reclaim calls it under pressure. Allocation-
+    /// free (eviction only removes entries), so it is safe on the reclaim
+    /// path.
+    pub fn shrink(&self, nr: usize) -> usize {
+        let mut g = self.inner.lock();
+        let mut freed = 0;
+        while freed < nr {
+            if !Self::evict_one_cold_clean(&mut g) {
+                break;
+            }
+            freed += 1;
+        }
+        freed
     }
 }
 

@@ -1377,6 +1377,51 @@ fn smoke_ns_fd_setns_roundtrip() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("userspace", smoke_ns_fd_setns_roundtrip);
 
+/// Tasks in initial namespaces still have openable `/proc/<pid>/ns/*`
+/// entries. The initial namespace is shared and therefore must return a
+/// stable identity across repeated opens rather than `None`.
+#[cfg(feature = "container")]
+fn smoke_initial_namespace_fds_are_stable() -> TestResult {
+    let task = 0x01A1_71A1;
+    let flavours = [
+        crate::namespaces::NsFlavour::Uts,
+        crate::namespaces::NsFlavour::Net,
+        crate::namespaces::NsFlavour::Ipc,
+        crate::namespaces::NsFlavour::Pid,
+        crate::namespaces::NsFlavour::Mnt,
+        crate::namespaces::NsFlavour::User,
+    ];
+    for flavour in flavours {
+        let first = match crate::handlers::namespace_fd_for_task(task, flavour) {
+            Some(fd) => fd,
+            None => return TestResult::Fail("initial namespace fd was absent"),
+        };
+        let second = crate::handlers::namespace_fd_for_task(task, flavour).unwrap();
+        if first.held().id() == 0 || first.held().id() != second.held().id() {
+            return TestResult::Fail("initial namespace fd identity was zero or unstable");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_initial_namespace_fds_are_stable);
+
+#[cfg(all(feature = "container", feature = "cgroup"))]
+fn smoke_initial_cgroup_namespace_fd_is_stable() -> TestResult {
+    let task = 0xC6_001;
+    let first =
+        crate::handlers::namespace_fd_for_task(task, crate::namespaces::NsFlavour::Cgroup).unwrap();
+    let second =
+        crate::handlers::namespace_fd_for_task(task, crate::namespaces::NsFlavour::Cgroup).unwrap();
+    if first.held().id() != 0 && first.held().id() == second.held().id() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("initial cgroup namespace identity was zero or unstable")
+    }
+}
+#[cfg(all(feature = "container", feature = "cgroup"))]
+kernel_test_in!("userspace", smoke_initial_cgroup_namespace_fd_is_stable);
+
 /// An open ns-fd keeps the namespace alive after the originating task
 /// exits: dropping A's per-task entry leaves the ns reachable through
 /// the held Arc, and a later joiner sees the same id + state.

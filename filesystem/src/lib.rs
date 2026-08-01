@@ -118,7 +118,7 @@ pub use memfs::{
     MemFs,
 };
 pub use overlayfs::{OverlayFs, WHITEOUT_PREFIX};
-pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
+pub use page_cache::{CachePage, Page, PageCache, PageKey, PAGE_SIZE};
 #[cfg(feature = "linux-compat")]
 pub use sysfs::{
     class_device_register, class_register, get_or_create_child, get_root,
@@ -182,14 +182,17 @@ impl CapType for FsInstanceMarker {
 
 // ── Stat / FileType ─────────────────────────────────────────────────
 
-/// File-type discriminant. Stage 3 only ever produces `File` or `Dir`;
-/// `Symlink` and `Special` are reserved for Stage 4.
+/// File-type discriminant. Character and block devices are distinct because
+/// Linux exposes them as `S_IFCHR`/`DT_CHR` and `S_IFBLK`/`DT_BLK`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FileType {
     File,
     Dir,
     Symlink,
+    /// Character device (`S_IFCHR`).
     Special,
+    /// Block device (`S_IFBLK`).
+    Block,
     /// AF_UNIX / AF_INET socket fd. Reported as `S_IFSOCK` so that
     /// `S_ISSOCK(st_mode)` consumers — notably systemd/sd-bus's
     /// `sd_is_socket()`, which gates SCM_RIGHTS fd-passing negotiation
@@ -887,6 +890,13 @@ pub trait FileOps: Send + Sync {
     /// the equivalent path `ptmx_open` in `drivers/tty/pty.c`.
     fn is_ptmx_clone(&self) -> bool {
         false
+    }
+
+    /// Return a fresh open-file instance for clone devices such as
+    /// `/dev/ptmx` and `/dev/fuse`. Path lookup and stat operate on a stable
+    /// device inode; only a successful `open(2)` allocates per-open state.
+    fn open_instance(&self) -> Option<Arc<dyn FileOps>> {
+        None
     }
 
     /// If this file is a named-pipe (FIFO) inode — created by
@@ -3168,6 +3178,8 @@ pub fn register_initcalls() {
         procfs::sys_kernel::register_all();
         procfs::sys_vm::register_all();
         procfs::aggregate::register_all();
+        procfs::stubs::register_all();
+        procfs::bus::register_bus_proc();
         InitResult::Ok
     });
 

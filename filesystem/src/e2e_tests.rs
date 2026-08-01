@@ -16,7 +16,7 @@
 //!   Smoke 5  — GPT-style partition table label/partuuid resolution
 //!   Smoke 6  — device unregister cleanup
 //!   Smoke 7  — poll_readiness returns POLL_IN | POLL_OUT
-//!   Smoke 8  — stat().size == 1024*1024, FileType::Special
+//!   Smoke 8  — stat().size == 1024*1024, FileType::Block
 
 extern crate alloc;
 
@@ -275,10 +275,12 @@ kernel_test_in!("filesystem/e2e", smoke_e2e_full_path_register_lookup_read);
 //    partuuid "11111111-2222-3333-4444-555555555555".
 // 2. Register the partition slice (start_lba=34, capacity=2014 LBAs)
 //    with PartitionMetadata carrying the label/uuid.
-// 3. Verify DevDiskByLabel::lookup("TESTPART") resolves correctly.
-// 4. Verify DevDiskByPartUuid::lookup("11111111-2222-3333-4444-555555555555") resolves.
-// 5. Read LBA 0 of the partition (= LBA 34 of the parent backing) and
-//    verify the bytes match what was written there.
+// 3. Verify DevDiskByLabel::lookup("TESTPART") resolves to the Linux-style
+//    ../../fake0p1 symlink.
+// 4. Verify DevDiskByPartUuid::lookup("11111111-2222-3333-4444-555555555555")
+//    resolves to the same target.
+// 5. Resolve the target block node and read LBA 0 of the partition
+//    (= LBA 34 of the parent backing), then verify its bytes.
 
 fn smoke_e2e_gpt_partition_label_partuuid_resolution() -> TestResult {
     use crate::devfs_block::{DevDiskByLabel, DevDiskByPartUuid};
@@ -333,17 +335,40 @@ fn smoke_e2e_gpt_partition_label_partuuid_resolution() -> TestResult {
             None => return TestResult::Fail("by-partuuid lookup returned None"),
         };
 
-        // Both lookups must return a BlockFile-shaped FileOps.
+        // Linux exposes persistent-name aliases as symlinks, not as
+        // duplicate block-device inodes.
         let stat_label = f_label.stat();
         let stat_uuid = f_uuid.stat();
-        if stat_label.size != stat_uuid.size {
-            return TestResult::Fail("by-label and by-partuuid sizes differ");
+        if stat_label.mode.file_type != crate::FileType::Symlink
+            || stat_uuid.mode.file_type != crate::FileType::Symlink
+        {
+            return TestResult::Fail("persistent block aliases are not symlinks");
         }
+        let mut label_target = [0u8; 32];
+        let mut uuid_target = [0u8; 32];
+        let label_len = match poll_once(f_label.read(0, &mut label_target)) {
+            Some(Ok(n)) => n,
+            _ => return TestResult::Fail("by-label symlink target read failed"),
+        };
+        let uuid_len = match poll_once(f_uuid.read(0, &mut uuid_target)) {
+            Some(Ok(n)) => n,
+            _ => return TestResult::Fail("by-partuuid symlink target read failed"),
+        };
+        if &label_target[..label_len] != b"../../fake0p1"
+            || &uuid_target[..uuid_len] != b"../../fake0p1"
+        {
+            return TestResult::Fail("persistent block alias target is incorrect");
+        }
+
+        let partition = match crate::devfs_block::lookup_block_file("fake0p1") {
+            Some(file) => file,
+            None => return TestResult::Fail("persistent alias target did not resolve"),
+        };
 
         // Read LBA 0 of the partition (= LBA 34 of the parent).
         // PartitionBlockDevice translates lba=0 → parent lba=34.
         let mut buf = vec![0u8; 512];
-        match poll_once(f_label.read(0, &mut buf)) {
+        match poll_once(partition.read(0, &mut buf)) {
             Some(Ok(512)) => {}
             other => {
                 let _ = other;
@@ -440,11 +465,11 @@ fn smoke_e2e_block_file_poll_readiness() -> TestResult {
 }
 kernel_test_in!("filesystem/e2e", smoke_e2e_block_file_poll_readiness);
 
-// ── Smoke 8: stat returns correct size and FileType::Special ──────────
+// ── Smoke 8: stat returns correct size and FileType::Block ────────────
 //
 // 1 MiB FakeBlockDevice → BlockFile::stat() must report:
 //   - size == 1024 * 1024
-//   - mode.file_type == FileType::Special
+//   - mode.file_type == FileType::Block
 
 fn smoke_e2e_block_file_stat_size_and_type() -> TestResult {
     use crate::devfs_block::BlockFile;
@@ -458,8 +483,8 @@ fn smoke_e2e_block_file_stat_size_and_type() -> TestResult {
     if stat.size != 1024 * 1024 {
         return TestResult::Fail("stat.size != 1 MiB for 1 MiB device");
     }
-    if stat.mode.file_type != FileType::Special {
-        return TestResult::Fail("stat.mode.file_type != FileType::Special");
+    if stat.mode.file_type != FileType::Block {
+        return TestResult::Fail("stat.mode.file_type != FileType::Block");
     }
     TestResult::Pass
 }

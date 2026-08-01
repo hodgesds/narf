@@ -317,8 +317,8 @@ fn smoke_devfs_block_stat_size() -> TestResult {
     if stat.blocks != 8 {
         return TestResult::Fail("stat.blocks != 8");
     }
-    if stat.mode.file_type != FileType::Special {
-        return TestResult::Fail("stat.mode.file_type != Special");
+    if stat.mode.file_type != FileType::Block {
+        return TestResult::Fail("stat.mode.file_type != Block");
     }
     if stat.mode.perms != 0o660 {
         return TestResult::Fail("stat.mode.perms != 0o660");
@@ -361,8 +361,8 @@ fn smoke_devfs_block_devdir_lookup_nvme0() -> TestResult {
     match ops {
         Some(f) => {
             let stat = f.stat();
-            if stat.mode.file_type != FileType::Special {
-                return TestResult::Fail("nvme0-test node is not Special");
+            if stat.mode.file_type != FileType::Block {
+                return TestResult::Fail("nvme0-test node is not Block");
             }
             TestResult::Pass
         }
@@ -433,10 +433,14 @@ fn smoke_devfs_block_disk_by_label_lookup() -> TestResult {
 
     match result {
         Some(f) => {
-            if f.stat().mode.file_type != FileType::Special {
-                return TestResult::Fail("by-label node not Special");
+            if f.stat().mode.file_type != FileType::Symlink {
+                return TestResult::Fail("by-label node is not a symlink");
             }
-            TestResult::Pass
+            let mut target = [0u8; 64];
+            match poll_once(f.read(0, &mut target)) {
+                Some(Ok(n)) if &target[..n] == b"../../nvme0p1-lbltest2" => TestResult::Pass,
+                _ => TestResult::Fail("by-label symlink has the wrong target"),
+            }
         }
         None => TestResult::Fail("by-label lookup of NARF_ROOT_TEST returned None"),
     }

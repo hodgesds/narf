@@ -32,8 +32,9 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 # Linux-shaped mount/bind-mount/overlayfs plumbing.  Stub for Waves 63-67.
 linux-compat = []
 
-# Per-namespace mount trees.  Orthogonal to linux-compat.
-# Stub for Waves 63-67.
+# Namespace-aware filesystem and procfs behavior. Enabled transitively by
+# narf-userspace/container so procfs never advertises disabled namespace
+# limits while the syscall layer has namespaces enabled.
 container = []
 
 # cgroup-v2 unified hierarchy (`cgroupfs`, mounted at /sys/fs/cgroup).

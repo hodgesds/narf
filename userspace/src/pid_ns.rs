@@ -248,19 +248,12 @@ pub fn self_inner_pid(task: u64, outer_pid: u64) -> u64 {
         Some(ns) => {
             if let Some(inner) = ns.outer_to_inner(outer_pid) {
                 inner
-            } else if let Some(inner) = ns.outer_to_inner(task) {
+            } else {
                 // Some callers pass the caller's own TaskId in the `outer_pid`
                 // slot; accept a direct TaskId→inner binding too.
-                inner
-            } else {
-                // The outer pid is NOT mapped into this namespace (an ancestor,
-                // or a process in an un-nested namespace). Linux reports 0 for
-                // such peer/SCM credentials rather than leaking a host pid — and
-                // MUST NOT substitute an unrelated inner pid. A previous
-                // single-entry fallback returned the namespace's sole inner pid
-                // here, which leaked into SO_PEERCRED / SCM_CREDENTIALS (see
-                // smoke_pid_ns_unmapped_outer_pid_reports_zero).
-                0
+                // If that is not mapped either, Linux reports 0 for an
+                // ancestor or un-nested peer rather than leaking a host pid.
+                ns.outer_to_inner(task).unwrap_or_default()
             }
         }
         None => outer_pid,

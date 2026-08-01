@@ -4,7 +4,6 @@
 //! tools (top, ps, procps-ng, Python's psutil, etc.) read to understand
 //! system health:
 //!
-//!   /proc/stat          — aggregate CPU time + context-switches + forks
 //!   /proc/diskstats     — per-block-device I/O counters
 //!   /proc/interrupts    — per-IRQ per-CPU fire counts
 //!   /proc/softirqs      — per-softirq-type per-CPU counters (stub)
@@ -20,7 +19,6 @@
 //!   /proc/timer_list    — pending high-resolution timers
 //!   /proc/locks         — POSIX file lock list (header only)
 //!   /proc/devices       — character + block major-number table
-//!   /proc/filesystems   — registered filesystem types (extends gen_filesystems)
 //!   /proc/consoles      — registered console devices
 //!   /proc/misc          — misc character device registrations
 //!   /proc/tty/drivers   — TTY driver table
@@ -106,7 +104,6 @@ fn agg(gen: fn() -> Vec<u8>) -> Arc<dyn ProcFile> {
 /// is available. Safe to call multiple times (hard cutover: the second
 /// call replaces the first).
 pub fn register_all() {
-    register_proc("stat", agg(gen_stat));
     register_proc("diskstats", agg(gen_diskstats));
     register_proc("interrupts", agg(gen_interrupts));
     register_proc("softirqs", agg(gen_softirqs));
@@ -128,88 +125,6 @@ pub fn register_all() {
     register_proc("tty/drivers", agg(gen_tty_drivers));
     register_proc("fb", agg(gen_fb));
     register_proc("crypto", agg(gen_crypto));
-    // /proc/filesystems is already served from ProcRoot::lookup as a
-    // static file; the aggregate version here extends it with the
-    // nodev annotations Linux tools expect (procps-ng checks "nodev"
-    // on "proc" and "sysfs"). A second register_proc hard-cuts over
-    // the old entry — correct per the registry's replacement contract.
-    register_proc("filesystems", agg(gen_filesystems_annotated));
-}
-
-// ── /proc/stat ──────────────────────────────────────────────────────
-//
-// Linux format (kernel/time/cpufreq.c, fs/proc/stat.c):
-//   cpu  <user> <nice> <system> <idle> <iowait> <irq> <softirq> <steal> <guest> <guest_nice>
-//   cpu0 …
-//   intr <total> [per-irq counts…]
-//   ctxt <total>
-//   btime <unix-seconds-at-boot>
-//   processes <total forks>
-//   procs_running <nr>
-//   procs_blocked <nr>
-//   softirq <total> [per-type]
-
-fn gen_stat() -> Vec<u8> {
-    let mut s = String::new();
-
-    let ncpus = cpu_count().max(1) as usize;
-
-    // Aggregate CPU line (all-zero jiffies: NARF doesn't track
-    // jiffies-split today; the line is syntactically correct for
-    // parsers that only need the field count).
-    let _ = writeln!(s, "cpu  0 0 0 0 0 0 0 0 0 0");
-    for i in 0..ncpus {
-        let _ = writeln!(s, "cpu{} 0 0 0 0 0 0 0 0 0 0", i);
-    }
-
-    // intr — total plus per-vector counts for every armed vector.
-    let snaps = snapshot_counters();
-    let total_intr: u64 = snaps.iter().map(|s| s.total).sum();
-    let _ = write!(s, "intr {}", total_intr);
-    // Emit per-vector counts for vectors 0..=255 with sparse gaps as 0.
-    {
-        let mut per_vec = [0u64; 256];
-        for snap in &snaps {
-            per_vec[snap.vector as usize] = snap.total;
-        }
-        for count in &per_vec {
-            let _ = write!(s, " {}", count);
-        }
-    }
-    let _ = writeln!(s);
-
-    // ctxt: total context switches — scheduler doesn't track this yet.
-    // Deferred: add a context_switch_counter atomic to narf-scheduler.
-    let _ = writeln!(s, "ctxt 0");
-
-    // btime: Unix timestamp of boot. Use wall-clock minus uptime.
-    // If the wall clock hasn't been set (offset == 0) we report 0,
-    // which is how a newly-booted Linux system looks before NTP sync.
-    let uptime_ns = narf_time::monotonic_ns();
-    let wall = narf_time::now_wall();
-    let boot_secs = if wall.secs > 0 {
-        let uptime_secs = (uptime_ns / 1_000_000_000) as i64;
-        (wall.secs - uptime_secs).max(0)
-    } else {
-        0i64
-    };
-    let _ = writeln!(s, "btime {}", boot_secs);
-
-    // processes: total forks since boot (scheduler doesn't expose
-    // this counter today — deferred).
-    let _ = writeln!(s, "processes 0");
-
-    // procs_running / procs_blocked: live running/blocked task counts.
-    // Use all_task_ids().len() as a conservative estimate for running.
-    let nr_tasks = narf_scheduler::all_task_ids().len();
-    let _ = writeln!(s, "procs_running {}", nr_tasks);
-    let _ = writeln!(s, "procs_blocked 0");
-
-    // softirq: total + per-type (all zeroed — deferred).
-    // HI TIMER NET_TX NET_RX BLOCK IRQ_POLL TASKLET SCHED HRTIMER RCU
-    let _ = writeln!(s, "softirq 0 0 0 0 0 0 0 0 0 0 0");
-
-    s.into_bytes()
 }
 
 // ── /proc/diskstats ──────────────────────────────────────────────────
@@ -847,36 +762,6 @@ fn gen_devices() -> Vec<u8> {
 // Extends the basic version in mod.rs by adding the "nodev" annotation
 // that procps-ng, mount(8), and findmnt(8) rely on.
 
-fn gen_filesystems_annotated() -> Vec<u8> {
-    use alloc::collections::BTreeSet;
-
-    let names: BTreeSet<String> = crate::registry()
-        .list_with_names()
-        .into_iter()
-        .map(|(_p, n)| n)
-        .collect();
-
-    let mut s = String::new();
-    // Always include the standard NARF FS types as nodev.
-    let nodev_always = &["sysfs", "proc", "devtmpfs", "devpts", "tmpfs", "9p"];
-    for n in nodev_always {
-        let _ = writeln!(s, "nodev\t{}", n);
-    }
-    // Mounted instances.
-    for n in &names {
-        if nodev_always.contains(&n.as_str()) {
-            continue;
-        }
-        // Block-backed FS types get no "nodev" prefix.
-        if n == "ext2" || n == "ext4" || n == "fat" || n == "vfat" || n == "minix" {
-            let _ = writeln!(s, "\t{}", n);
-        } else {
-            let _ = writeln!(s, "nodev\t{}", n);
-        }
-    }
-    s.into_bytes()
-}
-
 // ── /proc/consoles ───────────────────────────────────────────────────
 //
 // Linux: kernel/printk/printk.c console_show
@@ -1185,15 +1070,8 @@ kernel_test_in!(
 
 /// /proc/stat: has cpu aggregate line + per-cpu line + ctxt + btime.
 fn smoke_stat_has_cpu_and_ctxt_btime() -> TestResult {
-    register_all();
-    let body = match read_registered(&["stat"]) {
-        Some(b) => b,
-        None => return TestResult::Fail("stat not registered"),
-    };
-    let text = match String::from_utf8(body) {
-        Ok(t) => t,
-        Err(_) => return TestResult::Fail("stat not utf-8"),
-    };
+    // /proc/stat is a built-in ProcRoot file, not a dynamic registration.
+    let text = super::gen_stat();
     let has_cpu = text.lines().any(|l| l.starts_with("cpu "));
     let has_cpu0 = text.lines().any(|l| l.starts_with("cpu0 "));
     let has_ctxt = text.lines().any(|l| l.starts_with("ctxt "));
@@ -1269,17 +1147,9 @@ kernel_test_in!(
     smoke_devices_has_both_sections
 );
 
-/// /proc/filesystems (annotated): contains both "proc" and "sysfs".
+/// /proc/filesystems: contains both "proc" and "sysfs".
 fn smoke_filesystems_contains_proc_and_sysfs() -> TestResult {
-    register_all();
-    let body = match read_registered(&["filesystems"]) {
-        Some(b) => b,
-        None => return TestResult::Fail("filesystems not registered"),
-    };
-    let text = match String::from_utf8(body) {
-        Ok(t) => t,
-        Err(_) => return TestResult::Fail("filesystems not utf-8"),
-    };
+    let text = super::gen_filesystems();
     if text.contains("proc") && text.contains("sysfs") {
         TestResult::Pass
     } else {

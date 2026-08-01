@@ -266,6 +266,72 @@ pub fn run_subsystem_and_exit(wanted: &str) -> ! {
     unsafe { narf_arch::exit_kernel(code) }
 }
 
+/// True if test subsystem `have` is selected by filter `want`: an exact
+/// match, or `want` is a parent path of `have` on a `/` boundary — so the
+/// filter `filesystem` selects `filesystem`, `filesystem/page_cache`, and
+/// `filesystem/procfs`, but not `filesystemx`.
+fn subsystem_selected(have: &str, want: &str) -> bool {
+    have == want
+        || (have.len() > want.len()
+            && have.as_bytes()[want.len()] == b'/'
+            && have.starts_with(want))
+}
+
+/// Run every test whose subsystem is selected (see [`subsystem_selected`])
+/// by ANY of the `wanted` filters. This is the change-based CI path: the
+/// `affected` command computes the affected subsystem set and CI passes it
+/// as a comma list, so a PR runs only the subsystems its diff can touch.
+///
+/// An empty `wanted` selects nothing; callers that want the whole suite
+/// call [`run_all`] instead.
+pub fn run_subsystems(wanted: &[&str]) -> Summary {
+    let _ = writeln!(Writer);
+    let _ = writeln!(Writer, "── kernel_test (filtered: {}) ──", wanted.len());
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut skip = 0usize;
+    for t in tests() {
+        if !wanted.iter().any(|w| subsystem_selected(t.subsystem, w)) {
+            continue;
+        }
+        match (t.run)() {
+            TestResult::Pass => {
+                let _ = writeln!(Writer, "  [ OK ] {} / {}", t.subsystem, t.name);
+                pass += 1;
+            }
+            TestResult::Fail(why) => {
+                let _ = writeln!(Writer, "  [FAIL] {} / {}: {}", t.subsystem, t.name, why);
+                fail += 1;
+            }
+            TestResult::Skip(why) => {
+                let _ = writeln!(Writer, "  [skip] {} / {}: {}", t.subsystem, t.name, why);
+                skip += 1;
+            }
+        }
+    }
+    let _ = writeln!(
+        Writer,
+        "── summary: {} pass, {} fail, {} skip ──",
+        pass, fail, skip
+    );
+    if fail == 0 {
+        Summary::AllOk
+    } else {
+        Summary::SomeFailed
+    }
+}
+
+/// Run the selected subsystems (prefix-matched, comma list) and exit with
+/// the mapped status.
+pub fn run_subsystems_and_exit(wanted: &[&str]) -> ! {
+    let code = match run_subsystems(wanted) {
+        Summary::AllOk => 0,
+        Summary::SomeFailed => 1,
+    };
+    // SAFETY: this is the terminal action of the kernel-test boot.
+    unsafe { narf_arch::exit_kernel(code) }
+}
+
 // ── built-in smoke tests that always register ──────────────────
 //
 // These live in the library so any binary linking `narf-verification`
@@ -337,6 +403,32 @@ fn smoke_arch_mmio_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_arch_mmio_round_trip);
+
+/// The prefix-matching that drives change-based kernel-test sharding:
+/// a filter selects its exact subsystem and any child on a `/` boundary,
+/// but not an unrelated one or a same-prefix-different-name sibling.
+fn smoke_subsystem_prefix_selection() -> TestResult {
+    if !subsystem_selected("filesystem", "filesystem") {
+        return TestResult::Fail("exact match must select");
+    }
+    if !subsystem_selected("filesystem/page_cache", "filesystem") {
+        return TestResult::Fail("parent path must select child");
+    }
+    if subsystem_selected("filesystemx", "filesystem") {
+        return TestResult::Fail("must not select a non-`/`-boundary prefix");
+    }
+    if subsystem_selected("net/tcp", "filesystem") {
+        return TestResult::Fail("unrelated subsystem must not select");
+    }
+    // Multi-filter: run_subsystems ORs the filters.
+    let wanted = ["memory", "filesystem"];
+    let sel = |s: &str| wanted.iter().any(|w| subsystem_selected(s, w));
+    if !sel("memory") || !sel("filesystem/page_cache") || sel("net/tcp") {
+        return TestResult::Fail("multi-filter OR semantics wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("verification", smoke_subsystem_prefix_selection);
 
 // `smoke_arch_percpu_basic` migrated to arch/src/tests.rs (subsystem `"arch"`).
 

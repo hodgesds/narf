@@ -73,7 +73,8 @@ pub(crate) fn sys_listdir(ctx: &mut dyn TrapContext) {
         return;
     }
     // Encode FileType to the wire ordinal: 0=File, 1=Dir, 2=Symlink,
-    // 3=Special, 4=Socket, 5=Fifo.
+    // 3=Special, 4=Socket, 5=Fifo, 6=Block. New values append so the
+    // existing NARF-native wire ordinals remain stable.
     let ftype_wire: u32 = match ftype {
         narf_filesystem::FileType::File => 0,
         narf_filesystem::FileType::Dir => 1,
@@ -81,6 +82,7 @@ pub(crate) fn sys_listdir(ctx: &mut dyn TrapContext) {
         narf_filesystem::FileType::Special => 3,
         narf_filesystem::FileType::Socket => 4,
         narf_filesystem::FileType::Fifo => 5,
+        narf_filesystem::FileType::Block => 6,
     };
     // Build the 8-byte header in kernel memory, then copy the whole
     // record (header + name) into user space under the SMAP bracket.

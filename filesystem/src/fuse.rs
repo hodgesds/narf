@@ -823,6 +823,7 @@ pub const FUSE_ROOT_ID: u64 = 1;
 pub const S_IFMT: u32 = 0o170_000;
 pub const S_IFDIR: u32 = 0o040_000;
 pub const S_IFCHR: u32 = 0o020_000;
+pub const S_IFBLK: u32 = 0o060_000;
 pub const S_IFIFO: u32 = 0o010_000;
 pub const S_IFREG: u32 = 0o100_000;
 pub const S_IFLNK: u32 = 0o120_000;

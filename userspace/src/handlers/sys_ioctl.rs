@@ -246,15 +246,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 _ => None,
             };
             let target_task = pid_to_task_raw(target).unwrap_or(target);
-            if let Some(nsfd) = flavour.and_then(|f| {
-                // Mount-ns fds are minted at the handlers layer (the
-                // mount-ns table lives here, not in `namespaces`).
-                if matches!(f, NsFlavour::Mnt) {
-                    None
-                } else {
-                    crate::namespaces::ns_fd_for(target_task, f)
-                }
-            }) {
+            if let Some(nsfd) = flavour.and_then(|f| namespace_fd_for_task(target_task, f)) {
                 let ops_dyn: Arc<dyn narf_filesystem::FileOps> = nsfd;
                 // Linux mints these O_CLOEXEC (pidfs open_namespace).
                 let new_fd = fd::with_table(task, |t| {

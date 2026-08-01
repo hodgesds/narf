@@ -94,6 +94,7 @@ pub(crate) fn sys_getdents64(ctx: &mut dyn TrapContext) {
             narf_filesystem::FileType::Dir => 4,      // DT_DIR
             narf_filesystem::FileType::Symlink => 10, // DT_LNK
             narf_filesystem::FileType::Special => 2,  // DT_CHR
+            narf_filesystem::FileType::Block => 6,    // DT_BLK
             narf_filesystem::FileType::Socket => 12,  // DT_SOCK
             narf_filesystem::FileType::Fifo => 1,     // DT_FIFO
         };
