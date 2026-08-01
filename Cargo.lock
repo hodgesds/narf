@@ -657,11 +657,13 @@ name = "narf-bpf"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-boot",
  "narf-bpf-bench",
  "narf-bpf-isa",
  "narf-bpf-jit",
  "narf-bpf-verifier",
  "narf-capabilities",
+ "narf-console",
  "narf-filesystem",
  "narf-init",
  "narf-kernel-test",
