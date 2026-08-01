@@ -38,7 +38,10 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     // ×thousands of small sysfs reads) is what made udev coldplug crawl.
     const READ_STACK_BUF: usize = 4096;
     let mut stack_buf = [0u8; READ_STACK_BUF];
-    let mut heap_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    // Deferred init (no throwaway `Vec::new()` to satisfy -D unused-assignments):
+    // the heap buffer is only assigned — and only borrowed — on the large-read
+    // branch; small reads never touch it.
+    let mut heap_buf: alloc::vec::Vec<u8>;
     let kbuf: &mut [u8] = if len <= READ_STACK_BUF {
         &mut stack_buf[..len]
     } else {
