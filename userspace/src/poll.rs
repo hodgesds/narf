@@ -133,8 +133,16 @@ pub fn do_poll(task_id: u64, fds: &mut [PollFd], timeout_ms: i64) -> usize {
 /// a kernel `Vec<PollFd>`.  Returns `None` on null/zero-length input.
 ///
 /// # Safety
-/// Caller must guarantee `ptr` points to `nfds * 8` readable bytes
-/// in the currently-active user address space.
+/// Caller must guarantee `ptr` points to `nfds * 8` readable bytes in the
+/// currently-active user address space, **and that the range is in the user
+/// half** — pass it through `handlers::validate_user_range` first.
+///
+/// That second clause is not pedantry. This function opens a SMAP bracket, so
+/// `EFLAGS.AC` is set for the duration and a `CPL=0` read of a kernel page
+/// succeeds silently: SMAP only guards pages with `PTE.U=1`. An unvalidated
+/// kernel-half `ptr` is therefore an arbitrary kernel *read*, not a fault. The
+/// only caller (`poll_common`) validates; a second caller that forgets would
+/// reintroduce that.
 pub unsafe fn parse_pollfds(ptr: *const u8, nfds: usize) -> Option<Vec<PollFd>> {
     if ptr.is_null() || nfds == 0 {
         return None;
@@ -187,7 +195,11 @@ pub unsafe fn parse_pollfds(ptr: *const u8, nfds: usize) -> Option<Vec<PollFd>> 
 /// Write `revents` back to the user `pollfd` array at `ptr`.
 ///
 /// # Safety
-/// Same pointer-validity contract as `parse_pollfds`.
+/// Same pointer-validity contract as `parse_pollfds`, and the same reason for
+/// it — except that this direction is worse: each entry's `revents` is two
+/// bytes written at `ptr + i*8 + 6`, so an unvalidated kernel-half `ptr` is an
+/// arbitrary kernel *write*. `poll(2)` and `ppoll(2)` take no credential, so
+/// that would be reachable by any task.
 pub unsafe fn write_pollfds(ptr: *mut u8, fds: &[PollFd]) {
     // Same SMAP rationale as `parse_pollfds`: a CPL=0 write to a
     // user-only PTE faults without STAC.
@@ -378,7 +390,33 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         return;
     }
 
-    // SAFETY: user pointer in the active AS; length bounded above.
+    // Validate the whole `struct pollfd[nfds]` before touching a byte of it.
+    //
+    // This is the one thing `parse_pollfds` / `write_pollfds` cannot do for
+    // themselves: both open a SMAP bracket and then `read_unaligned` /
+    // `write_unaligned`, so with `EFLAGS.AC` set a `CPL=0` access to a kernel
+    // page succeeds silently. The old comment here asserted "user pointer in
+    // the active AS" and nothing checked it, which made `revents` — two bytes
+    // written at `ptr + i*8 + 6` for every `i` — an arbitrary kernel write, and
+    // the parse an arbitrary kernel read. `poll(2)` and `ppoll(2)` take no
+    // credential, so unlike the `bpf(2)` gadget of the same class this was
+    // reachable by any task.
+    //
+    // One check covers both directions: the parse reads `[ptr, ptr + nfds*8)`
+    // and every write lands inside it. `nfds` is already bounded above, so the
+    // multiply cannot wrap, and `validate_user_range` rejects the kernel half,
+    // the canonical hole, a null base, and an end-overflow.
+    let Some(bytes) = nfds.checked_mul(8) else {
+        ctx.set_return(fail);
+        return;
+    };
+    if crate::handlers::validate_user_range(ptr as u64, bytes).is_err() {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        return;
+    }
+
+    // SAFETY: the range was just validated as `nfds * 8` bytes wholly inside
+    // the user half, which is exactly the contract `parse_pollfds` documents.
     let mut fds = match unsafe { parse_pollfds(ptr, nfds) } {
         Some(v) => v,
         None => {
