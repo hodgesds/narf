@@ -48,7 +48,7 @@ The audit followed both directions of the interface:
 | Blocking/timeouts | Blocking descriptors sleep; timeout is absolute CLOCK_REALTIME; nonblock returns EAGAIN | Full/empty operations park without holding an IRQ-safe lock, wake on readiness, recheck state, and return ETIMEDOUT at the absolute deadline. |
 | Poll | Readable when nonempty, writable below max | Queue files return POLLIN/POLLOUT and advance edge tokens on empty/full transitions. |
 | Notification | One registration per queue; empty-to-nonempty is one-shot | `mq_notify` supports cancellation, EBUSY arbitration, SIGEV_NONE, and one-shot SIGEV_SIGNAL delivery; close removes an owned registration. |
-| Error paths | Linux errno for bad fd, size, priority, names, permissions, and uaccess | Typed backend errors map to EBADF/EMSGSIZE/EINVAL/ENOENT/EEXIST/EACCES/ENOSPC; uaccess failures use EFAULT. |
+| Error paths | Linux errno for bad fd, size, priority, names, permissions, and uaccess | Typed backend errors map to EBADF/EMSGSIZE/EINVAL/ENOENT/EEXIST/EACCES/ENOSPC; uaccess failures use EFAULT. The syscall boundary accepts the slashless leaf name that libc passes after validating the POSIX name. |
 
 ## Remaining differences
 
@@ -88,7 +88,8 @@ These are explicit gaps rather than a blanket conformance claim.
 
 ## Regression coverage
 
-Kernel smokes cover shared syscall/mount visibility, stable inode and 80-byte
+Kernel smokes cover the libc-to-kernel slashless-name ABI, shared
+syscall/mount visibility, stable inode and 80-byte
 metadata, exact status text, poll readiness, priority/FIFO ordering,
 unlink-while-open lifetime, mode/umask/ownership, access modes, CLOEXEC,
 per-open attributes/nonblocking state, priority bounds, expired absolute
