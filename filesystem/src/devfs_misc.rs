@@ -55,4 +55,12 @@ impl FileOps for DevFull {
             mtime_cycles: 0,
         }
     }
+
+    fn rdev(&self) -> u64 {
+        crate::devfs::linux_makedev(1, 7)
+    }
+
+    fn ino(&self) -> u64 {
+        0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
+    }
 }

@@ -114,6 +114,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         narf_filesystem::FileType::Dir => 0o040000,
         narf_filesystem::FileType::Symlink => 0o120000,
         narf_filesystem::FileType::Special => 0o020000,
+        narf_filesystem::FileType::Block => 0o060000,
         narf_filesystem::FileType::Socket => 0o140000,
         narf_filesystem::FileType::Fifo => 0o010000,
     };

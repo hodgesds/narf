@@ -88,6 +88,17 @@ pub trait FileOps {
     fn poll_readiness_at(&self, offset: u64) -> u32;
     fn poll_edge_token(&self) -> (u64, u64);
     fn acknowledge_poll_readiness(&self, readiness: u32);
+    fn open_instance(&self) -> Option<Arc<dyn FileOps>>;
+}
+
+pub enum FileType {
+    File,
+    Dir,
+    Symlink,
+    Special, // Linux character device: S_IFCHR / DT_CHR
+    Block,   // Linux block device: S_IFBLK / DT_BLK
+    Socket,
+    Fifo,
 }
 ```
 
@@ -102,10 +113,31 @@ lose a drain/refill transition between readiness scans.
 epoll instance accepts an event for delivery. It lets a source retire a
 per-open-file change edge without allowing a passive nested-epoll readiness
 query to consume an event owned by its inner monitor.
+`open_instance` defaults to `None`. Clone devices return a fresh open-file
+object so lookup/stat and `O_PATH` remain side-effect free; the Linux open path
+calls it only after access checks. `/dev/pts/ptmx` returns a fresh PTY master
+and `/dev/fuse` returns a fresh FUSE daemon connection.
 
-The devtmpfs-compatible root accepts runtime symlink creation and removal.
-This includes journald's `/dev/log -> /run/systemd/journal/dev-log` alias;
-static device aliases retain precedence over dynamic names.
+`DevFs` identifies itself as `devtmpfs`. Character and block nodes remain
+distinct through VFS stat and readdir translation, carry Linux `st_rdev`
+values, and expose stable non-zero inode identities. The root accepts runtime
+device-node, directory, and symlink creation plus rename/removal. Dynamic
+device nodes preserve type, mode, uid/gid, rdev, and inode across lookups;
+dynamic directories preserve mode and inode identity. This covers
+udev coldplug nodes, `/dev/{char,block}/MAJOR:MINOR`, and journald's
+`/dev/log -> /run/systemd/journal/dev-log`; static device aliases retain
+precedence over dynamic names and absent optional hardware nodes are not
+advertised by readdir.
+
+The root `/dev/ptmx` is the relative symlink `pts/ptmx`. Mounting `devpts`
+installs `DevPtsFs`, whose root exposes the live Unix98 slave registry and a
+5:2 clone node rather than an empty in-memory filesystem. The current devpts
+implementation uses one global registry; per-mount instances and mount-option
+policy are not part of this interface yet.
+The Linux open path treats `/dev/tty` as the caller's controlling-terminal
+multiplexer: it selects the recorded console or PTY slave, preserves the 5:0
+path-node identity, and reports `ENXIO` for a detached session. `O_PATH`
+continues to open only the side-effect-free path node.
 
 ### 3.3.1 cgroup-v2 cpuset placement
 

@@ -63,7 +63,7 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
                 path == target
                     && matches!(
                         name.as_str(),
-                        "procfs" | "sysfs" | "devfs" | "cgroup2" | "cgroupfs"
+                        "procfs" | "sysfs" | "devfs" | "devtmpfs" | "cgroup2" | "cgroupfs"
                     )
             });
     if protected {

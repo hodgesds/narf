@@ -1,4 +1,4 @@
-//! `DevFs` — minimal `/dev/null` + `/dev/zero` virtual filesystem.
+//! `DevFs` — Linux-compatible writable `devtmpfs` surface.
 //!
 //! Real C programs reach for these almost universally — discarding
 //! debug output via `> /dev/null`, zero-filling buffers via `dd
@@ -7,8 +7,10 @@
 //! the open call surfaces a NotFound that the caller doesn't
 //! distinguish from a real failure).
 //!
-//! Layout: a single `DevFs::new()` returns an `FsInstance` whose
-//! root holds two read-only special files.
+//! `DevFs::new()` returns an `FsInstance` named `devtmpfs`. Its root contains
+//! the standard NARF device nodes, driver-installed nodes, Unix98 PTYs, block
+//! device aliases, and a writable runtime tree for udev-created device nodes,
+//! directories, and symlinks.
 //!
 //! Semantics:
 //!   - `/dev/null`: read returns 0 (immediate EOF); write returns
@@ -16,14 +18,15 @@
 //!   - `/dev/zero`: read fills the user buffer with zeros and
 //!     returns the requested length; write discards.
 //!
-//! Stat reports `FileType::Special` so `S_ISCHR(...)` consumers see
-//! the right shape.
+//! Character and block devices report distinct `FileType::Special` and
+//! `FileType::Block` values so Linux `stat` and `getdents` consumers see
+//! `S_IFCHR`/`DT_CHR` and `S_IFBLK`/`DT_BLK` respectively.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{
@@ -41,30 +44,64 @@ use crate::{
 // `enumerate` surface them alongside the static entries. Linux ref:
 // `drivers/base/devtmpfs.c` (the kernel's own devtmpfs mknod bookkeeping).
 
-/// One `mknod`-created device node: a char/block special with a fixed
-/// `dev_t`. Read/write are no-ops (there is no backing driver — the node
-/// exists so `stat`/`open` behave), which matches how a bare `mknod` node
-/// with no registered driver behaves until a driver claims the major.
-#[derive(Clone)]
-struct MknodEntry {
+/// Linux's compact dev_t encoding for majors below 4096. The high minor bits
+/// occupy bits 20+, matching `new_encode_dev()`.
+pub(crate) const fn linux_makedev(major: u32, minor: u32) -> u64 {
+    ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64
+}
+
+fn device_inode(rdev: u64, kind: u64) -> u64 {
+    0xd000_0000_0000_0000 | (kind << 48) | rdev.wrapping_add(1)
+}
+
+fn named_inode(name: &str, kind: u64) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ kind;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash | (1 << 63)
+}
+
+#[derive(Copy, Clone)]
+struct MknodMetadata {
     file_type: FileType,
     rdev: u64,
     perms: u16,
+    uid: u32,
+    gid: u32,
 }
 
-static MKNOD_NODES: IrqSafeSpinLock<alloc::collections::BTreeMap<String, MknodEntry>> =
+struct MknodNode {
+    inode: u64,
+    metadata: IrqSafeSpinLock<MknodMetadata>,
+}
+
+#[derive(Clone)]
+enum DynamicNode {
+    Device(Arc<MknodNode>),
+    Symlink { target: String, inode: u64 },
+    Directory(Arc<DynamicDirectory>),
+}
+
+type DynamicMap = alloc::collections::BTreeMap<String, DynamicNode>;
+
+struct DynamicDirectory {
+    inode: u64,
+    perms: IrqSafeSpinLock<u16>,
+    entries: IrqSafeSpinLock<DynamicMap>,
+}
+
+/// Runtime-created devtmpfs entries. Keeping devices and symlinks in one map
+/// makes name creation, replacement, rename, and unlink atomic across types.
+static DYNAMIC_NODES: IrqSafeSpinLock<DynamicMap> =
     IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
 
-/// Runtime-created devtmpfs symlinks (for example journald's
-/// `/dev/log -> /run/systemd/journal/dev-log`). Static aliases remain in the
-/// match table below; this registry supplies the writable devtmpfs surface
-/// expected by systemd and udev.
-static SYMLINK_NODES: IrqSafeSpinLock<alloc::collections::BTreeMap<String, String>> =
-    IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+static NEXT_DYNAMIC_INO: AtomicU64 = AtomicU64::new(0x1000);
 
 /// FileOps for a `mknod`-created char/block node.
 struct MknodFile {
-    entry: MknodEntry,
+    node: Arc<MknodNode>,
 }
 
 impl FileOps for MknodFile {
@@ -77,55 +114,72 @@ impl FileOps for MknodFile {
         Box::pin(async move { Ok(len) })
     }
     fn stat(&self) -> Stat {
+        let metadata = *self.node.metadata.lock();
         Stat {
             size: 0,
             blocks: 0,
             mode: Mode {
-                file_type: self.entry.file_type,
-                perms: self.entry.perms,
+                file_type: metadata.file_type,
+                perms: metadata.perms,
             },
             mtime_cycles: 0,
         }
     }
     fn rdev(&self) -> u64 {
-        self.entry.rdev
+        self.node.metadata.lock().rdev
+    }
+    fn ino(&self) -> u64 {
+        self.node.inode
+    }
+    fn owners(&self) -> (u32, u32) {
+        let metadata = *self.node.metadata.lock();
+        (metadata.uid, metadata.gid)
+    }
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        let mut metadata = self.node.metadata.lock();
+        metadata.uid = uid;
+        metadata.gid = gid;
+        Box::pin(async { Ok(()) })
+    }
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        self.node.metadata.lock().perms = perms & 0o7777;
+        Box::pin(async { Ok(()) })
     }
 }
 
-/// Register a `mknod`-created node. `file_type` is `Special` (char) or
-/// `Socket`/etc; only char/block are meaningful here. Overwrites any prior
-/// dynamic node of the same name (a caller is expected to have unlink'd first,
-/// but tolerating a re-mknod keeps udev's re-trigger idempotent).
-fn mknod_register(name: &str, file_type: FileType, rdev: u64, perms: u16) {
-    MKNOD_NODES.lock().insert(
-        name.into(),
-        MknodEntry {
+fn mknod_register(
+    nodes: &IrqSafeSpinLock<DynamicMap>,
+    name: &str,
+    file_type: FileType,
+    rdev: u64,
+    perms: u16,
+) -> Result<Arc<MknodNode>, FsError> {
+    if !valid_leaf_name(name) {
+        return Err(FsError::InvalidPath);
+    }
+    let mut nodes = nodes.lock();
+    if nodes.contains_key(name) {
+        return Err(FsError::Busy);
+    }
+    let node = Arc::new(MknodNode {
+        inode: NEXT_DYNAMIC_INO.fetch_add(1, Ordering::Relaxed),
+        metadata: IrqSafeSpinLock::new(MknodMetadata {
             file_type,
             rdev,
             perms,
-        },
-    );
-}
-
-/// Look up a `mknod`-created node by name.
-fn mknod_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
-    let entry = MKNOD_NODES.lock().get(name).cloned()?;
-    Some(Arc::new(MknodFile { entry }) as Arc<dyn FileOps>)
-}
-
-/// Snapshot the dynamic-node names for `enumerate`.
-fn mknod_enumerate() -> Vec<(String, FileType)> {
-    MKNOD_NODES
-        .lock()
-        .iter()
-        .map(|(n, e)| (n.clone(), e.file_type))
-        .collect()
+            uid: 0,
+            gid: 0,
+        }),
+    });
+    nodes.insert(name.into(), DynamicNode::Device(node.clone()));
+    Ok(node)
 }
 
 /// Reset the dynamic-node registry (test isolation).
 #[doc(hidden)]
 pub fn __reset_mknod_for_test() {
-    MKNOD_NODES.lock().clear();
+    DYNAMIC_NODES.lock().clear();
+    NEXT_DYNAMIC_INO.store(0x1000, Ordering::Relaxed);
 }
 
 /// `/dev/null` — read = EOF, write = discard.
@@ -151,6 +205,12 @@ impl FileOps for DevNull {
             },
             mtime_cycles: 0,
         }
+    }
+    fn rdev(&self) -> u64 {
+        linux_makedev(1, 3)
+    }
+    fn ino(&self) -> u64 {
+        device_inode(self.rdev(), 1)
     }
 }
 
@@ -228,6 +288,39 @@ impl FileOps for DevRandom {
             mtime_cycles: 0,
         }
     }
+
+    fn rdev(&self) -> u64 {
+        linux_makedev(1, 9)
+    }
+
+    fn ino(&self) -> u64 {
+        device_inode(self.rdev(), 1)
+    }
+}
+
+/// `/dev/random` has the same CSPRNG behavior as urandom after Linux 5.18,
+/// but retains its historical device identity (1:8).
+struct DevBlockingRandom;
+
+impl FileOps for DevBlockingRandom {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        DevRandom.read(offset, buf)
+    }
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        DevRandom.write(offset, buf)
+    }
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        DevRandom.ioctl(cmd, arg)
+    }
+    fn stat(&self) -> Stat {
+        DevRandom.stat()
+    }
+    fn rdev(&self) -> u64 {
+        linux_makedev(1, 8)
+    }
+    fn ino(&self) -> u64 {
+        device_inode(self.rdev(), 1)
+    }
 }
 
 /// `/dev/zero` — read = zero-fill the buffer, write = discard.
@@ -260,6 +353,12 @@ impl FileOps for DevZero {
             },
             mtime_cycles: 0,
         }
+    }
+    fn rdev(&self) -> u64 {
+        linux_makedev(1, 5)
+    }
+    fn ino(&self) -> u64 {
+        device_inode(self.rdev(), 1)
     }
 }
 
@@ -350,16 +449,56 @@ impl FileOps for DevKmsg {
     }
 
     fn stat(&self) -> Stat {
-        let len = narf_console::klog::snapshot().len();
         Stat {
-            size: len as u64,
-            blocks: len.div_ceil(512) as u64,
+            // Character devices have no seekable file size even though the
+            // underlying ring currently contains bytes.
+            size: 0,
+            blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                perms: 0o444,
+                perms: 0o600,
             },
             mtime_cycles: 0,
         }
+    }
+    fn rdev(&self) -> u64 {
+        linux_makedev(1, 11)
+    }
+    fn ino(&self) -> u64 {
+        device_inode(self.rdev(), 1)
+    }
+}
+
+/// Stable `/dev/fuse` path inode. Each successful open clones a fresh daemon
+/// connection; lookup/stat alone must not allocate one.
+struct DevFuseNode;
+
+impl FileOps for DevFuseNode {
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        }
+    }
+    fn rdev(&self) -> u64 {
+        linux_makedev(10, 229)
+    }
+    fn ino(&self) -> u64 {
+        device_inode(self.rdev(), 1)
+    }
+    fn open_instance(&self) -> Option<Arc<dyn FileOps>> {
+        Some(crate::fuse_conn::DevFuse::open_new())
     }
 }
 
@@ -593,15 +732,32 @@ impl FileOps for DevFp {
     }
 
     fn stat(&self) -> Stat {
-        Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode {
-                file_type: FileType::Special,
-                perms: 0o660,
-            },
-            mtime_cycles: 0,
-        }
+        FP_NODE
+            .lock()
+            .as_ref()
+            .map(|node| node.stat())
+            .unwrap_or(Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::Special,
+                    perms: 0o660,
+                },
+                mtime_cycles: 0,
+            })
+    }
+    fn rdev(&self) -> u64 {
+        FP_NODE.lock().as_ref().map(|node| node.rdev()).unwrap_or(0)
+    }
+    fn ino(&self) -> u64 {
+        named_inode("fp0", 1)
+    }
+    fn owners(&self) -> (u32, u32) {
+        FP_NODE
+            .lock()
+            .as_ref()
+            .map(|node| node.owners())
+            .unwrap_or((0, 0))
     }
 }
 
@@ -653,6 +809,23 @@ impl FileOps for DevFb0Proxy {
             Some(n) => n.ioctl(cmd, arg),
             None => Err(FsError::Unsupported),
         }
+    }
+    fn rdev(&self) -> u64 {
+        FB0_NODE
+            .lock()
+            .as_ref()
+            .map(|node| node.rdev())
+            .unwrap_or(0)
+    }
+    fn ino(&self) -> u64 {
+        named_inode("fb0", 1)
+    }
+    fn owners(&self) -> (u32, u32) {
+        FB0_NODE
+            .lock()
+            .as_ref()
+            .map(|node| node.owners())
+            .unwrap_or((0, 0))
     }
 }
 
@@ -706,15 +879,19 @@ impl FileOps for DevTpm0Proxy {
     }
 
     fn stat(&self) -> Stat {
-        Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode {
-                file_type: FileType::Special,
-                perms: 0o600,
-            },
-            mtime_cycles: 0,
-        }
+        TPM0_NODE
+            .lock()
+            .as_ref()
+            .map(|node| node.stat())
+            .unwrap_or(Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::Special,
+                    perms: 0o600,
+                },
+                mtime_cycles: 0,
+            })
     }
 
     fn poll_readiness(&self) -> u32 {
@@ -723,6 +900,16 @@ impl FileOps for DevTpm0Proxy {
             Some(n) => n.poll_readiness(),
             None => POLL_OUT,
         }
+    }
+    fn rdev(&self) -> u64 {
+        TPM0_NODE
+            .lock()
+            .as_ref()
+            .map(|node| node.rdev())
+            .unwrap_or(0)
+    }
+    fn ino(&self) -> u64 {
+        named_inode("tpm0", 1)
     }
 }
 
@@ -751,15 +938,19 @@ impl FileOps for DevTpmRm0Proxy {
     }
 
     fn stat(&self) -> Stat {
-        Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode {
-                file_type: FileType::Special,
-                perms: 0o600,
-            },
-            mtime_cycles: 0,
-        }
+        TPMRM0_NODE
+            .lock()
+            .as_ref()
+            .map(|node| node.stat())
+            .unwrap_or(Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::Special,
+                    perms: 0o600,
+                },
+                mtime_cycles: 0,
+            })
     }
 
     fn poll_readiness(&self) -> u32 {
@@ -768,6 +959,16 @@ impl FileOps for DevTpmRm0Proxy {
             Some(n) => n.poll_readiness(),
             None => POLL_OUT,
         }
+    }
+    fn rdev(&self) -> u64 {
+        TPMRM0_NODE
+            .lock()
+            .as_ref()
+            .map(|node| node.rdev())
+            .unwrap_or(0)
+    }
+    fn ino(&self) -> u64 {
+        named_inode("tpmrm0", 1)
     }
 }
 
@@ -785,7 +986,16 @@ impl FileOps for DevTpmRm0Proxy {
 /// installed) so user code can `write(open("/dev/console"))` for
 /// stdout-equivalent output without an explicit fd-table lookup
 /// against fd 1/2.
-struct DevConsole;
+#[derive(Copy, Clone)]
+enum ConsoleNodeKind {
+    Console,
+    CurrentTty,
+    Virtual(u32),
+}
+
+struct DevConsole {
+    kind: ConsoleNodeKind,
+}
 
 /// Install the console's signal-character hook. Compatibility shim —
 /// the hook now lives in the unified `console_tty` module (one console,
@@ -929,14 +1139,38 @@ impl FileOps for DevConsole {
     }
 
     fn stat(&self) -> Stat {
+        let perms = match self.kind {
+            ConsoleNodeKind::Console => 0o600,
+            ConsoleNodeKind::CurrentTty => 0o666,
+            ConsoleNodeKind::Virtual(_) => 0o620,
+        };
         Stat {
             size: 0,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                perms: 0o666,
+                perms,
             },
             mtime_cycles: 0,
+        }
+    }
+
+    fn rdev(&self) -> u64 {
+        match self.kind {
+            ConsoleNodeKind::Console => linux_makedev(5, 1),
+            ConsoleNodeKind::CurrentTty => linux_makedev(5, 0),
+            ConsoleNodeKind::Virtual(index) => linux_makedev(4, index),
+        }
+    }
+
+    fn ino(&self) -> u64 {
+        device_inode(self.rdev(), 1)
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        match self.kind {
+            ConsoleNodeKind::Virtual(_) => (0, 5), // root:tty
+            _ => (0, 0),
         }
     }
 
@@ -1099,6 +1333,14 @@ impl FileOps for DevConsole {
 struct DevSymlink {
     /// Symlink target (absolute path).
     target: String,
+    inode: u64,
+}
+
+pub(crate) fn symlink_file(name: &str, target: String) -> Arc<dyn FileOps> {
+    Arc::new(DevSymlink {
+        target,
+        inode: named_inode(name, 2),
+    })
 }
 
 impl FileOps for DevSymlink {
@@ -1132,6 +1374,9 @@ impl FileOps for DevSymlink {
             mtime_cycles: 0,
         }
     }
+    fn ino(&self) -> u64 {
+        self.inode
+    }
 }
 
 /// An empty directory node used purely as a **mountpoint stub** under
@@ -1140,9 +1385,14 @@ impl FileOps for DevSymlink {
 /// mounts tmpfs / mqueue / hugetlbfs over them; the mount is tracked by the
 /// registry at that path, so this stub's (empty) contents are shadowed and
 /// never observed once mounted.
-struct DevEmptyDir;
+struct DevEmptyDir {
+    inode: u64,
+}
 
 impl DirOps for DevEmptyDir {
+    fn ino(&self) -> u64 {
+        self.inode
+    }
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
         None
     }
@@ -1157,33 +1407,295 @@ impl DirOps for DevEmptyDir {
     }
 }
 
-/// `DevFs` root directory — exposes `null` and `zero` as fixed
-/// children. No mutation surface (the trait defaults return
-/// `Unsupported` on every override-able method).
-struct DevDir;
+fn valid_leaf_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
+}
 
-impl DirOps for DevDir {
-    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        if self.lookup(name).is_some() {
-            Box::pin(async move { Err(FsError::Busy) })
-        } else {
-            SYMLINK_NODES.lock().insert(name.into(), target.into());
-            let file = Arc::new(DevSymlink {
-                target: target.into(),
-            }) as Arc<dyn FileOps>;
-            Box::pin(async move { Ok(file) })
+fn dynamic_lookup_file(
+    nodes: &IrqSafeSpinLock<DynamicMap>,
+    name: &str,
+) -> Option<Arc<dyn FileOps>> {
+    match nodes.lock().get(name).cloned()? {
+        DynamicNode::Device(node) => Some(Arc::new(MknodFile { node }) as Arc<dyn FileOps>),
+        DynamicNode::Symlink { target, inode } => {
+            Some(Arc::new(DevSymlink { target, inode }) as Arc<dyn FileOps>)
         }
+        DynamicNode::Directory(_) => None,
+    }
+}
+
+fn dynamic_lookup_dir(nodes: &IrqSafeSpinLock<DynamicMap>, name: &str) -> Option<Arc<dyn DirOps>> {
+    match nodes.lock().get(name).cloned()? {
+        DynamicNode::Directory(dir) => Some(dir as Arc<dyn DirOps>),
+        DynamicNode::Device(_) | DynamicNode::Symlink { .. } => None,
+    }
+}
+
+fn dynamic_enumerate(nodes: &IrqSafeSpinLock<DynamicMap>) -> Vec<(String, FileType)> {
+    nodes
+        .lock()
+        .iter()
+        .map(|(name, node)| {
+            let file_type = match node {
+                DynamicNode::Device(node) => node.metadata.lock().file_type,
+                DynamicNode::Symlink { .. } => FileType::Symlink,
+                DynamicNode::Directory(_) => FileType::Dir,
+            };
+            (name.clone(), file_type)
+        })
+        .collect()
+}
+
+fn dynamic_symlink(
+    nodes: &IrqSafeSpinLock<DynamicMap>,
+    name: &str,
+    target: &str,
+) -> Result<Arc<dyn FileOps>, FsError> {
+    if !valid_leaf_name(name) {
+        return Err(FsError::InvalidPath);
+    }
+    let mut entries = nodes.lock();
+    if entries.contains_key(name) {
+        return Err(FsError::Busy);
+    }
+    let inode = NEXT_DYNAMIC_INO.fetch_add(1, Ordering::Relaxed);
+    entries.insert(
+        name.into(),
+        DynamicNode::Symlink {
+            target: target.into(),
+            inode,
+        },
+    );
+    Ok(Arc::new(DevSymlink {
+        target: target.into(),
+        inode,
+    }) as Arc<dyn FileOps>)
+}
+
+fn dynamic_mkdir(
+    nodes: &IrqSafeSpinLock<DynamicMap>,
+    name: &str,
+    perms: u16,
+) -> Result<Arc<dyn DirOps>, FsError> {
+    if !valid_leaf_name(name) {
+        return Err(FsError::InvalidPath);
+    }
+    let mut entries = nodes.lock();
+    if entries.contains_key(name) {
+        return Err(FsError::Busy);
+    }
+    let dir = Arc::new(DynamicDirectory {
+        inode: NEXT_DYNAMIC_INO.fetch_add(1, Ordering::Relaxed),
+        perms: IrqSafeSpinLock::new(perms & 0o7777),
+        entries: IrqSafeSpinLock::new(alloc::collections::BTreeMap::new()),
+    });
+    entries.insert(name.into(), DynamicNode::Directory(dir.clone()));
+    Ok(dir as Arc<dyn DirOps>)
+}
+
+fn dynamic_unlink(nodes: &IrqSafeSpinLock<DynamicMap>, name: &str) -> Result<(), FsError> {
+    let mut entries = nodes.lock();
+    match entries.get(name) {
+        Some(DynamicNode::Directory(_)) => Err(FsError::Busy),
+        Some(_) => {
+            entries.remove(name);
+            Ok(())
+        }
+        None => Err(FsError::NotFound),
+    }
+}
+
+fn dynamic_rmdir(nodes: &IrqSafeSpinLock<DynamicMap>, name: &str) -> Result<(), FsError> {
+    let mut entries = nodes.lock();
+    match entries.get(name) {
+        Some(DynamicNode::Directory(dir)) if dir.entries.lock().is_empty() => {
+            entries.remove(name);
+            Ok(())
+        }
+        Some(DynamicNode::Directory(_)) => Err(FsError::Busy),
+        Some(_) => Err(FsError::InvalidPath),
+        None => Err(FsError::NotFound),
+    }
+}
+
+fn dynamic_rename(
+    nodes: &IrqSafeSpinLock<DynamicMap>,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), FsError> {
+    if !valid_leaf_name(new_name) {
+        return Err(FsError::InvalidPath);
+    }
+    let mut entries = nodes.lock();
+    if old_name == new_name {
+        return if entries.contains_key(old_name) {
+            Ok(())
+        } else {
+            Err(FsError::NotFound)
+        };
+    }
+    let source = entries.get(old_name).cloned().ok_or(FsError::NotFound)?;
+    if let Some(target) = entries.get(new_name) {
+        let source_is_dir = matches!(source, DynamicNode::Directory(_));
+        let target_is_dir = matches!(target, DynamicNode::Directory(_));
+        if source_is_dir != target_is_dir {
+            return Err(FsError::Busy);
+        }
+        if let DynamicNode::Directory(dir) = target {
+            if !dir.entries.lock().is_empty() {
+                return Err(FsError::Busy);
+            }
+        }
+    }
+    entries.remove(old_name);
+    entries.insert(new_name.into(), source);
+    Ok(())
+}
+
+impl DirOps for DynamicDirectory {
+    fn ino(&self) -> u64 {
+        self.inode
+    }
+
+    fn dir_mode(&self) -> u16 {
+        *self.perms.lock()
+    }
+
+    fn set_dir_mode(&self, perms: u16) {
+        *self.perms.lock() = perms & 0o7777;
+    }
+
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        dynamic_lookup_file(&self.entries, name)
+    }
+
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        dynamic_lookup_dir(&self.entries, name)
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
+        Box::new(core::iter::empty())
+    }
+
+    fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
+        dynamic_enumerate(&self.entries)
+            .into_iter()
+            .skip(cursor)
+            .take(max)
+            .collect()
+    }
+
+    fn mknod<'a>(
+        &'a self,
+        name: &'a str,
+        file_type: FileType,
+        rdev: u64,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            if !matches!(file_type, FileType::Special | FileType::Block) {
+                return Err(FsError::Unsupported);
+            }
+            let node = mknod_register(&self.entries, name, file_type, rdev, 0o600)?;
+            Ok(Arc::new(MknodFile { node }) as Arc<dyn FileOps>)
+        })
+    }
+
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        let result = dynamic_symlink(&self.entries, name, target);
+        Box::pin(async move { result })
+    }
+
+    fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        let result = dynamic_mkdir(&self.entries, name, 0o755);
+        Box::pin(async move { result })
     }
 
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
-        let removed = SYMLINK_NODES.lock().remove(name).is_some();
-        Box::pin(async move {
-            if removed {
-                Ok(())
-            } else {
-                Err(FsError::NotFound)
-            }
-        })
+        let result = dynamic_unlink(&self.entries, name);
+        Box::pin(async move { result })
+    }
+
+    fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        let result = dynamic_rmdir(&self.entries, name);
+        Box::pin(async move { result })
+    }
+
+    fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        let result = dynamic_rename(&self.entries, old_name, new_name);
+        Box::pin(async move { result })
+    }
+}
+
+fn static_entry_type(name: &str) -> Option<FileType> {
+    match name {
+        "fd" | "stdin" | "stdout" | "stderr" | "rtc" | "ptmx" => Some(FileType::Symlink),
+        "null" | "zero" | "full" | "random" | "urandom" | "kmsg" | "console" | "tty" | "tty0"
+        | "tty1" | "uinput" | "fuse" | "fp0" | "fb0" | "tpm0" | "tpmrm0" | "rtc0" => {
+            Some(FileType::Special)
+        }
+        "pts" | "shm" | "mqueue" | "hugepages" | "disk" | "input" | "snd" | "dri" => {
+            Some(FileType::Dir)
+        }
+        _ => None,
+    }
+}
+
+fn static_entry_visible(name: &str) -> bool {
+    match name {
+        "fp0" => FP_NODE.lock().is_some(),
+        "fb0" => FB0_NODE.lock().is_some(),
+        "tpm0" => TPM0_NODE.lock().is_some(),
+        "tpmrm0" => TPMRM0_NODE.lock().is_some(),
+        "snd" => SND_DIR.lock().is_some(),
+        "dri" => DRI_DIR.lock().is_some(),
+        _ => true,
+    }
+}
+
+/// `DevFs` root directory. Static device paths have precedence, while the
+/// runtime tree accepts udev-style device nodes, directories, and symlinks.
+struct DevDir;
+
+impl DirOps for DevDir {
+    fn ino(&self) -> u64 {
+        2
+    }
+
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        if !valid_leaf_name(name) || static_entry_type(name).is_some() {
+            return Box::pin(async move { Err(FsError::Busy) });
+        }
+        let result = dynamic_symlink(&DYNAMIC_NODES, name, target);
+        Box::pin(async move { result })
+    }
+
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        let result = dynamic_unlink(&DYNAMIC_NODES, name);
+        Box::pin(async move { result })
+    }
+
+    fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        if !valid_leaf_name(new_name) || static_entry_type(new_name).is_some() {
+            return Box::pin(async { Err(FsError::Busy) });
+        }
+        let result = dynamic_rename(&DYNAMIC_NODES, old_name, new_name);
+        Box::pin(async move { result })
+    }
+
+    fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        if !valid_leaf_name(name) || static_entry_type(name).is_some() {
+            return Box::pin(async { Err(FsError::Busy) });
+        }
+        let result = dynamic_mkdir(&DYNAMIC_NODES, name, 0o755);
+        Box::pin(async move { result })
+    }
+
+    fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        if static_entry_type(name).is_some() {
+            return Box::pin(async { Err(FsError::Busy) });
+        }
+        let result = dynamic_rmdir(&DYNAMIC_NODES, name);
+        Box::pin(async move { result })
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
@@ -1191,28 +1703,43 @@ impl DirOps for DevDir {
             // Static symlinks [[devfs-symlinks]].
             "fd" => Some(Arc::new(DevSymlink {
                 target: "/proc/self/fd".into(),
+                inode: named_inode("fd", 2),
             }) as Arc<dyn FileOps>),
             "stdin" => Some(Arc::new(DevSymlink {
                 target: "/proc/self/fd/0".into(),
+                inode: named_inode("stdin", 2),
             }) as Arc<dyn FileOps>),
             "stdout" => Some(Arc::new(DevSymlink {
                 target: "/proc/self/fd/1".into(),
+                inode: named_inode("stdout", 2),
             }) as Arc<dyn FileOps>),
             "stderr" => Some(Arc::new(DevSymlink {
                 target: "/proc/self/fd/2".into(),
+                inode: named_inode("stderr", 2),
             }) as Arc<dyn FileOps>),
             "null" => Some(Arc::new(DevNull) as Arc<dyn FileOps>),
             "zero" => Some(Arc::new(DevZero) as Arc<dyn FileOps>),
             "full" => Some(Arc::new(crate::devfs_misc::DevFull) as Arc<dyn FileOps>),
-            "random" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
+            "random" => Some(Arc::new(DevBlockingRandom) as Arc<dyn FileOps>),
             "urandom" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
             "kmsg" => Some(Arc::new(DevKmsg) as Arc<dyn FileOps>),
             // `tty1` is the conventional first VT node — `getty@tty1.service`
             // (and login on it) opens it. NARF has one console, so it and the
             // `tty0`/`console` aliases all resolve to the same singleton tty.
-            "console" | "tty" | "tty0" | "tty1" => Some(Arc::new(DevConsole) as Arc<dyn FileOps>),
-            "ptmx" => Some(Arc::new(crate::devfs_pty::DevPtmx) as Arc<dyn FileOps>),
-            "fb0" => Some(Arc::new(DevFb0Proxy) as Arc<dyn FileOps>),
+            "console" => Some(Arc::new(DevConsole {
+                kind: ConsoleNodeKind::Console,
+            }) as Arc<dyn FileOps>),
+            "tty" => Some(Arc::new(DevConsole {
+                kind: ConsoleNodeKind::CurrentTty,
+            }) as Arc<dyn FileOps>),
+            "tty0" => Some(Arc::new(DevConsole {
+                kind: ConsoleNodeKind::Virtual(0),
+            }) as Arc<dyn FileOps>),
+            "tty1" => Some(Arc::new(DevConsole {
+                kind: ConsoleNodeKind::Virtual(1),
+            }) as Arc<dyn FileOps>),
+            "ptmx" => Some(symlink_file("ptmx", "pts/ptmx".into())),
+            "fb0" if FB0_NODE.lock().is_some() => Some(Arc::new(DevFb0Proxy) as Arc<dyn FileOps>),
             // Userspace input-injection control device.
             // Linux ref: `drivers/input/misc/uinput.c`.
             "uinput" => {
@@ -1220,10 +1747,14 @@ impl DirOps for DevDir {
             }
             // FUSE control device: each open mints a fresh connection.
             // Linux ref: `fs/fuse/dev.c` — /dev/fuse (misc char, minor 229).
-            "fuse" => Some(crate::fuse_conn::DevFuse::open_new()),
-            "fp0" => Some(Arc::new(DevFp) as Arc<dyn FileOps>),
-            "tpm0" => Some(Arc::new(DevTpm0Proxy) as Arc<dyn FileOps>),
-            "tpmrm0" => Some(Arc::new(DevTpmRm0Proxy) as Arc<dyn FileOps>),
+            "fuse" => Some(Arc::new(DevFuseNode) as Arc<dyn FileOps>),
+            "fp0" if FP_NODE.lock().is_some() => Some(Arc::new(DevFp) as Arc<dyn FileOps>),
+            "tpm0" if TPM0_NODE.lock().is_some() => {
+                Some(Arc::new(DevTpm0Proxy) as Arc<dyn FileOps>)
+            }
+            "tpmrm0" if TPMRM0_NODE.lock().is_some() => {
+                Some(Arc::new(DevTpmRm0Proxy) as Arc<dyn FileOps>)
+            }
             // Real-time clock char device. `hwclock --show` reads it via
             // ioctl(RTC_RD_TIME). Linux ref: `drivers/rtc/dev.c`. `/dev/rtc`
             // is the conventional first-RTC alias — a symlink to rtc0 (this
@@ -1231,6 +1762,7 @@ impl DirOps for DevDir {
             "rtc0" => Some(Arc::new(crate::devfs_rtc::DevRtc) as Arc<dyn FileOps>),
             "rtc" => Some(Arc::new(DevSymlink {
                 target: "/dev/rtc0".into(),
+                inode: named_inode("rtc", 2),
             }) as Arc<dyn FileOps>),
             // Dynamic: ttyUSB<N> USB-to-serial ports.
             // Linux ref: `drivers/usb/serial/usb-serial.c:tty_port_register_device`.
@@ -1250,16 +1782,8 @@ impl DirOps for DevDir {
             // Dynamic: query the block-device registry after static names miss.
             // Covers registered names like "nvme0", "sata0p1", "vblk0", etc.
             _ => crate::devfs_block::lookup_block_file(name)
-                // Then any node udev created via mknod (coldplug /dev nodes).
-                .or_else(|| mknod_lookup(name))
-                // Finally runtime-created devtmpfs symlinks.
-                .or_else(|| {
-                    SYMLINK_NODES
-                        .lock()
-                        .get(name)
-                        .cloned()
-                        .map(|target| Arc::new(DevSymlink { target }) as Arc<dyn FileOps>)
-                }),
+                // Then any node or symlink created in the writable devtmpfs.
+                .or_else(|| dynamic_lookup_file(&DYNAMIC_NODES, name)),
         }
     }
 
@@ -1272,7 +1796,9 @@ impl DirOps for DevDir {
             "pts" => Some(Arc::new(crate::devfs_pty::DevPts) as Arc<dyn DirOps>),
             // Mountpoint stubs: an init mounts tmpfs/mqueue/hugetlbfs over
             // these; they only need to exist so the O_PATH target open works.
-            "shm" | "mqueue" | "hugepages" => Some(Arc::new(DevEmptyDir) as Arc<dyn DirOps>),
+            "shm" => Some(Arc::new(DevEmptyDir { inode: 4 }) as Arc<dyn DirOps>),
+            "mqueue" => Some(Arc::new(DevEmptyDir { inode: 5 }) as Arc<dyn DirOps>),
+            "hugepages" => Some(Arc::new(DevEmptyDir { inode: 6 }) as Arc<dyn DirOps>),
             "disk" => Some(Arc::new(crate::devfs_block::DevDiskDir) as Arc<dyn DirOps>),
             "input" => Some(Arc::new(crate::devfs_input::DevInputDir) as Arc<dyn DirOps>),
             // Sound subsystem — delegate installed by narf-drivers-sound.
@@ -1280,7 +1806,7 @@ impl DirOps for DevDir {
             // DRM/DRI subsystem — delegate installed by narf-drivers-gpu.
             // Linux ref: `drivers/gpu/drm/drm_drv.c::drm_dev_register`.
             "dri" => DRI_DIR.lock().clone(),
-            _ => None,
+            _ => dynamic_lookup_dir(&DYNAMIC_NODES, name),
         }
     }
 
@@ -1306,12 +1832,16 @@ impl DirOps for DevDir {
         Box::pin(async move {
             // Char/block only — a FIFO/socket/regular mknod under /dev is not a
             // device node; reject so the caller falls back to a plain file.
-            if !matches!(file_type, FileType::Special) {
+            if !matches!(file_type, FileType::Special | FileType::Block) {
                 return Err(FsError::Unsupported);
             }
-            // 0o660 (root:disk-style) is the conventional device-node mode.
-            mknod_register(name, file_type, rdev, 0o660);
-            mknod_lookup(name).ok_or(FsError::Io(narf_block::BlockError::IOError))
+            if !valid_leaf_name(name) || static_entry_type(name).is_some() {
+                return Err(FsError::Busy);
+            }
+            // mknod_common immediately applies the caller's mode and owners;
+            // use Linux devtmpfs's conservative initial root-owned mode.
+            let node = mknod_register(&DYNAMIC_NODES, name, file_type, rdev, 0o600)?;
+            Ok(Arc::new(MknodFile { node }) as Arc<dyn FileOps>)
         })
     }
 
@@ -1379,7 +1909,7 @@ impl DirOps for DevDir {
             },
             DirEntry {
                 name: "ptmx",
-                file_type: FileType::Special,
+                file_type: FileType::Symlink,
             },
             DirEntry {
                 name: "fb0",
@@ -1418,6 +1948,18 @@ impl DirOps for DevDir {
                 file_type: FileType::Dir,
             },
             DirEntry {
+                name: "shm",
+                file_type: FileType::Dir,
+            },
+            DirEntry {
+                name: "mqueue",
+                file_type: FileType::Dir,
+            },
+            DirEntry {
+                name: "hugepages",
+                file_type: FileType::Dir,
+            },
+            DirEntry {
                 name: "disk",
                 file_type: FileType::Dir,
             },
@@ -1434,7 +1976,12 @@ impl DirOps for DevDir {
                 file_type: FileType::Dir,
             },
         ];
-        Box::new(ENTRIES.iter().copied())
+        Box::new(
+            ENTRIES
+                .iter()
+                .copied()
+                .filter(|entry| static_entry_visible(entry.name)),
+        )
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
@@ -1452,11 +1999,12 @@ impl DirOps for DevDir {
             ("full", FileType::Special),
             ("random", FileType::Special),
             ("urandom", FileType::Special),
+            ("kmsg", FileType::Special),
             ("console", FileType::Special),
             ("tty", FileType::Special),
             ("tty0", FileType::Special),
             ("tty1", FileType::Special),
-            ("ptmx", FileType::Special),
+            ("ptmx", FileType::Symlink),
             ("fb0", FileType::Special),
             ("uinput", FileType::Special),
             ("fuse", FileType::Special),
@@ -1483,27 +2031,22 @@ impl DirOps for DevDir {
         let rfcomm_extras = rfcomm_enumerate();
         let tty_usb_extras = tty_usb_enumerate();
         let video_extras = video_enumerate();
-        // mknod-created nodes that don't collide with a static name.
-        let mknod_extras: Vec<(String, FileType)> = mknod_enumerate()
+        // Runtime-created files, symlinks, and directories that don't collide
+        // with a static name.
+        let dynamic_extras: Vec<(String, FileType)> = dynamic_enumerate(&DYNAMIC_NODES)
             .into_iter()
             .filter(|(name, _)| !static_names.iter().any(|s| s == name))
-            .collect();
-        let symlink_extras: Vec<(String, FileType)> = SYMLINK_NODES
-            .lock()
-            .keys()
-            .filter(|name| !static_names.iter().any(|s| s == *name))
-            .map(|name| (name.clone(), FileType::Symlink))
             .collect();
 
         static_entries
             .iter()
+            .filter(|(name, _)| static_entry_visible(name))
             .map(|(n, t)| ((*n).into(), *t))
             .chain(block_extras)
             .chain(rfcomm_extras)
             .chain(tty_usb_extras)
             .chain(video_extras)
-            .chain(mknod_extras)
-            .chain(symlink_extras)
+            .chain(dynamic_extras)
             .skip(cursor)
             .take(max)
             .collect()
@@ -1529,7 +2072,7 @@ pub struct DevFs {
 impl DevFs {
     pub fn new() -> Self {
         Self {
-            name: "devfs".into(),
+            name: "devtmpfs".into(),
         }
     }
 }
@@ -1709,6 +2252,176 @@ fn smoke_dev_mknod_char_node() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_mknod_char_node);
+
+/// Linux devtmpfs keeps char/block identity, `st_rdev`, ownership, mode, and
+/// inode identity on dynamically-created device nodes. It also applies the
+/// usual single-directory rename/unlink rules atomically.
+fn smoke_dev_mknod_linux_metadata_and_mutation() -> TestResult {
+    __reset_mknod_for_test();
+    let dir = DevDir;
+    let rdev = linux_makedev(259, 513);
+    let node = match poll_once_devfs(dir.mknod("coldplug-block0", FileType::Block, rdev)) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("mknod block node failed"),
+    };
+    if node.stat().mode.file_type != FileType::Block || node.rdev() != rdev || node.ino() == 0 {
+        return TestResult::Fail("block node identity is not Linux-shaped");
+    }
+    if !matches!(poll_once_devfs(node.set_perms(0o640)), Some(Ok(())))
+        || !matches!(poll_once_devfs(node.set_owners(12, 34)), Some(Ok(())))
+    {
+        return TestResult::Fail("block node metadata update failed");
+    }
+    let inode = node.ino();
+    let looked_up = match dir.lookup("coldplug-block0") {
+        Some(node) => node,
+        None => return TestResult::Fail("block node disappeared after metadata update"),
+    };
+    if looked_up.stat().mode.perms != 0o640
+        || looked_up.owners() != (12, 34)
+        || looked_up.ino() != inode
+    {
+        return TestResult::Fail("block node metadata did not persist across lookup");
+    }
+    if !matches!(
+        poll_once_devfs(dir.mknod("coldplug-block0", FileType::Block, rdev)),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("duplicate mknod did not report EEXIST/Busy");
+    }
+    if !matches!(
+        poll_once_devfs(dir.rename("coldplug-block0", "coldplug-block1")),
+        Some(Ok(()))
+    ) || dir.lookup("coldplug-block0").is_some()
+    {
+        return TestResult::Fail("dynamic device rename failed");
+    }
+    match dir.lookup("coldplug-block1") {
+        Some(node) if node.ino() == inode && node.stat().mode.file_type == FileType::Block => {}
+        _ => return TestResult::Fail("renamed block node lost identity"),
+    }
+    if !matches!(poll_once_devfs(dir.unlink("coldplug-block1")), Some(Ok(())))
+        || dir.lookup("coldplug-block1").is_some()
+    {
+        return TestResult::Fail("dynamic device unlink failed");
+    }
+    __reset_mknod_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs",
+    smoke_dev_mknod_linux_metadata_and_mutation
+);
+
+/// udev creates hierarchy such as `/dev/{char,block}/MAJOR:MINOR` at runtime.
+/// Pin nested mkdir, symlink, readdir, non-empty-rmdir, and cleanup behavior.
+fn smoke_dev_dynamic_directory_tree() -> TestResult {
+    __reset_mknod_for_test();
+    let root = DevDir;
+    let char_dir = match poll_once_devfs(root.mkdir("char-test")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("devtmpfs mkdir failed"),
+    };
+    if char_dir.ino() == 0 || char_dir.dir_mode() != 0o755 {
+        return TestResult::Fail("dynamic directory metadata mismatch");
+    }
+    match poll_once_devfs(char_dir.symlink("1:3", "../null")) {
+        Some(Ok(link)) if link.stat().mode.file_type == FileType::Symlink => {}
+        _ => return TestResult::Fail("nested devtmpfs symlink failed"),
+    }
+    if !char_dir
+        .enumerate(0, 16)
+        .iter()
+        .any(|(name, ty)| name == "1:3" && *ty == FileType::Symlink)
+    {
+        return TestResult::Fail("nested devtmpfs entry not enumerated");
+    }
+    if !matches!(
+        poll_once_devfs(root.rmdir("char-test")),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("non-empty dynamic directory was removed");
+    }
+    if !matches!(poll_once_devfs(char_dir.unlink("1:3")), Some(Ok(())))
+        || !matches!(poll_once_devfs(root.rmdir("char-test")), Some(Ok(())))
+        || root.lookup_dir("char-test").is_some()
+    {
+        return TestResult::Fail("dynamic directory cleanup failed");
+    }
+    __reset_mknod_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_dynamic_directory_tree);
+
+/// Pin the Linux device identities and stable path inodes used by libc,
+/// udev, and init-system probes.
+fn smoke_dev_static_linux_metadata() -> TestResult {
+    let dir = DevDir;
+    let expected = [
+        ("null", linux_makedev(1, 3), 0o666),
+        ("zero", linux_makedev(1, 5), 0o666),
+        ("full", linux_makedev(1, 7), 0o666),
+        ("random", linux_makedev(1, 8), 0o666),
+        ("urandom", linux_makedev(1, 9), 0o666),
+        ("kmsg", linux_makedev(1, 11), 0o600),
+        ("console", linux_makedev(5, 1), 0o600),
+        ("tty", linux_makedev(5, 0), 0o666),
+        ("uinput", linux_makedev(10, 223), 0o660),
+        ("fuse", linux_makedev(10, 229), 0o600),
+    ];
+    for (name, rdev, perms) in expected {
+        let node = match dir.lookup(name) {
+            Some(node) => node,
+            None => return TestResult::Fail("required static /dev node missing"),
+        };
+        let stat = node.stat();
+        if stat.mode.file_type != FileType::Special
+            || stat.mode.perms != perms
+            || node.rdev() != rdev
+            || node.ino() == 0
+        {
+            return TestResult::Fail("static /dev node metadata mismatch");
+        }
+    }
+    if dir.lookup("random").unwrap().rdev() == dir.lookup("urandom").unwrap().rdev() {
+        return TestResult::Fail("random and urandom share st_rdev");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_static_linux_metadata);
+
+/// Readdir must agree with lookup and must not advertise optional hardware
+/// nodes until their driver has actually registered a backing object.
+fn smoke_dev_enumeration_has_no_phantom_nodes() -> TestResult {
+    let dir = DevDir;
+    let entries = dir.enumerate(0, 512);
+    for required in ["kmsg", "pts", "shm", "mqueue", "hugepages"] {
+        if !entries.iter().any(|(name, _)| name == required) {
+            return TestResult::Fail("required devtmpfs entry absent from readdir");
+        }
+    }
+    for optional in ["fb0", "fp0", "tpm0", "tpmrm0", "snd", "dri"] {
+        let advertised = entries.iter().any(|(name, _)| name == optional);
+        let present = dir.lookup(optional).is_some() || dir.lookup_dir(optional).is_some();
+        if advertised != present {
+            return TestResult::Fail("optional devtmpfs entry disagrees with lookup");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs",
+    smoke_dev_enumeration_has_no_phantom_nodes
+);
+
+fn smoke_devfs_reports_devtmpfs_name() -> TestResult {
+    if DevFs::new().name() == "devtmpfs" {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("DevFs does not identify as Linux devtmpfs")
+    }
+}
+kernel_test_in!("filesystem/devfs", smoke_devfs_reports_devtmpfs_name);
 
 /// Smoke: /dev/stdin resolves to /proc/self/fd/0.
 fn smoke_dev_stdin_target() -> TestResult {

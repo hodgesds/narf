@@ -181,14 +181,17 @@ impl CapType for FsInstanceMarker {
 
 // ── Stat / FileType ─────────────────────────────────────────────────
 
-/// File-type discriminant. Stage 3 only ever produces `File` or `Dir`;
-/// `Symlink` and `Special` are reserved for Stage 4.
+/// File-type discriminant. Character and block devices are distinct because
+/// Linux exposes them as `S_IFCHR`/`DT_CHR` and `S_IFBLK`/`DT_BLK`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FileType {
     File,
     Dir,
     Symlink,
+    /// Character device (`S_IFCHR`).
     Special,
+    /// Block device (`S_IFBLK`).
+    Block,
     /// AF_UNIX / AF_INET socket fd. Reported as `S_IFSOCK` so that
     /// `S_ISSOCK(st_mode)` consumers — notably systemd/sd-bus's
     /// `sd_is_socket()`, which gates SCM_RIGHTS fd-passing negotiation
@@ -849,6 +852,13 @@ pub trait FileOps: Send + Sync {
     /// the equivalent path `ptmx_open` in `drivers/tty/pty.c`.
     fn is_ptmx_clone(&self) -> bool {
         false
+    }
+
+    /// Return a fresh open-file instance for clone devices such as
+    /// `/dev/ptmx` and `/dev/fuse`. Path lookup and stat operate on a stable
+    /// device inode; only a successful `open(2)` allocates per-open state.
+    fn open_instance(&self) -> Option<Arc<dyn FileOps>> {
+        None
     }
 
     /// If this file is a named-pipe (FIFO) inode — created by

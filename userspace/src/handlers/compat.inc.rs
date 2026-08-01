@@ -399,6 +399,108 @@ impl narf_filesystem::FileOps for DirFdFile {
     }
 }
 
+/// One successful open of `/dev/tty`. Linux keeps the 5:0 device-node
+/// identity while dispatching operations to the caller's current controlling
+/// terminal. The wrapper preserves that path metadata and forwards tty I/O,
+/// readiness, and job-control state to the selected console or PTY slave.
+#[cfg(feature = "linux-compat")]
+struct CurrentTtyFile {
+    inner: alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    inode: u64,
+}
+
+#[cfg(feature = "linux-compat")]
+impl narf_filesystem::FileOps for CurrentTtyFile {
+    fn read<'a>(
+        &'a self,
+        offset: u64,
+        buf: &'a mut [u8],
+    ) -> narf_filesystem::FsFuture<'a, usize> {
+        self.inner.read(offset, buf)
+    }
+
+    fn write<'a>(
+        &'a self,
+        offset: u64,
+        buf: &'a [u8],
+    ) -> narf_filesystem::FsFuture<'a, usize> {
+        self.inner.write(offset, buf)
+    }
+
+    fn stat(&self) -> narf_filesystem::Stat {
+        narf_filesystem::Stat {
+            size: 0,
+            blocks: 0,
+            mode: narf_filesystem::Mode {
+                file_type: narf_filesystem::FileType::Special,
+                perms: 0o666,
+            },
+            mtime_cycles: 0,
+        }
+    }
+
+    fn ino(&self) -> u64 {
+        self.inode
+    }
+
+    fn rdev(&self) -> u64 {
+        // Linux alternate TTY device `/dev/tty`.
+        (5 << 8) as u64
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, narf_filesystem::FsError> {
+        self.inner.ioctl(cmd, arg)
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        self.inner.poll_readiness()
+    }
+
+    fn poll_readiness_at(&self, offset: u64) -> u32 {
+        self.inner.poll_readiness_at(offset)
+    }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        self.inner.poll_edge_token()
+    }
+
+    fn acknowledge_poll_readiness(&self, readiness: u32) {
+        self.inner.acknowledge_poll_readiness(readiness);
+    }
+
+    fn tty_id(&self) -> Option<u32> {
+        self.inner.tty_id()
+    }
+
+    fn tty_fg_pgrp(&self) -> Option<u64> {
+        self.inner.tty_fg_pgrp()
+    }
+
+    fn tty_tostop(&self) -> bool {
+        self.inner.tty_tostop()
+    }
+
+    fn read_should_block(&self) -> bool {
+        self.inner.read_should_block()
+    }
+
+    fn write_should_block(&self) -> bool {
+        self.inner.write_should_block()
+    }
+
+    fn is_stream(&self) -> bool {
+        self.inner.is_stream()
+    }
+
+    fn block_on_input(&self) -> bool {
+        self.inner.block_on_input()
+    }
+
+    fn nonblock_read_eagain(&self) -> bool {
+        self.inner.nonblock_read_eagain()
+    }
+}
+
 /// Test-only: install a directory fd for `path` in `task`'s fd table
 /// and return it. Mirrors `sys_open`'s directory-fd fallback without
 /// going through the open syscall (whose native-vs-linux ABI differs by

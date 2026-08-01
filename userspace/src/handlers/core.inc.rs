@@ -1178,6 +1178,34 @@ fn open_impl(
         return;
     }
 
+    // `/dev/tty` is the calling process's controlling terminal, not an alias
+    // for the system console. Preserve O_PATH's side-effect-free path inode
+    // above; a real open selects the console or live PTY slave recorded by
+    // TIOCSCTTY. A session with no controlling terminal gets Linux ENXIO.
+    #[cfg(feature = "linux-compat")]
+    let ops = if mnt_len == 0 && path == apply_chroot("/dev/tty") {
+        let selected: Arc<dyn narf_filesystem::FileOps> = match task_ctty(task) {
+            Some(CTTY_CONSOLE) => ops.clone(),
+            Some(index) => match narf_filesystem::devfs_pty::pts_lookup(index) {
+                Some(pty) => Arc::new(narf_filesystem::devfs_pty::PtySlave::new(pty)),
+                None => {
+                    ctx.set_return(SyscallReturn::ok((-6i64) as u64)); // -ENXIO
+                    return;
+                }
+            },
+            None => {
+                ctx.set_return(SyscallReturn::ok((-6i64) as u64)); // -ENXIO
+                return;
+            }
+        };
+        Arc::new(CurrentTtyFile {
+            inner: selected,
+            inode: ops.ino(),
+        }) as Arc<dyn narf_filesystem::FileOps>
+    } else {
+        ops
+    };
+
     // POSIX-2017 permission check. The accessor's UID/GID come from
     // the per-task uidgid table; the file's owners + perms come from
     // its FileOps trait. UID 0 (root) shortcuts; non-root must own
@@ -1220,14 +1248,11 @@ fn open_impl(
         return;
     }
 
-    // PTY clone-on-open: `/dev/ptmx` is a singleton FileOps that exists
-    // only to be a lookup target; each `open()` allocates a fresh `Pty`
-    // pair via `open_ptmx()` and installs the master here. Linux:
-    // `drivers/tty/pty.c::ptmx_open`. The `is_ptmx_clone()` trait hook
-    // keeps the filesystem crate free of any fd-table awareness.
-    let ops = if ops.is_ptmx_clone() {
-        let master = narf_filesystem::devfs_pty::open_ptmx();
-        master as Arc<dyn narf_filesystem::FileOps>
+    // Clone devices keep path lookup/stat side-effect free and allocate their
+    // per-open state only here after permissions have passed. This covers
+    // PTY masters and independent FUSE daemon connections.
+    let ops = if let Some(instance) = ops.open_instance() {
+        instance
     } else {
         ops
     };
@@ -1659,6 +1684,7 @@ impl StatBuf {
             narf_filesystem::FileType::Dir => 0o040000,
             narf_filesystem::FileType::Symlink => 0o120000,
             narf_filesystem::FileType::Special => 0o020000,
+            narf_filesystem::FileType::Block => 0o060000,
             narf_filesystem::FileType::Socket => 0o140000,
             narf_filesystem::FileType::Fifo => 0o010000,
         };
@@ -1797,7 +1823,12 @@ fn mknod_common(path_uptr: u64, mode: u64, dev: u64) -> SyscallReturn {
         // that don't support device nodes fall back to a plain file so the node
         // at least EXISTS (matching the old behaviour for the elogind sandbox
         // nodes). `dev` is the Linux dev_t as passed by userspace.
-        match poll_blocking(parent.mknod(&leaf, narf_filesystem::FileType::Special, dev)) {
+        let file_type = if fmt == S_IFBLK {
+            narf_filesystem::FileType::Block
+        } else {
+            narf_filesystem::FileType::Special
+        };
+        match poll_blocking(parent.mknod(&leaf, file_type, dev)) {
             Some(Ok(n)) => Some(n),
             _ => poll_blocking(parent.create(&leaf)).and_then(|r| r.ok()),
         }
@@ -2015,6 +2046,7 @@ fn linux_stat_from_fs(
         narf_filesystem::FileType::Dir => 0o040000,
         narf_filesystem::FileType::Symlink => 0o120000,
         narf_filesystem::FileType::Special => 0o020000,
+        narf_filesystem::FileType::Block => 0o060000,
         narf_filesystem::FileType::Socket => 0o140000,
         narf_filesystem::FileType::Fifo => 0o010000,
     };

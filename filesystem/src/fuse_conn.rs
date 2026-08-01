@@ -1070,6 +1070,14 @@ impl FileOps for DevFuse {
         }
     }
 
+    fn rdev(&self) -> u64 {
+        crate::devfs::linux_makedev(10, 229)
+    }
+
+    fn ino(&self) -> u64 {
+        0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
+    }
+
     /// Readable whenever a request is queued for the daemon; always
     /// writable (replies are accepted at once).
     fn poll_readiness(&self) -> u32 {
@@ -1110,6 +1118,7 @@ impl NodeAttr {
             S_IFREG => FileType::File,
             S_IFIFO => FileType::Fifo,
             S_IFSOCK => FileType::Socket,
+            S_IFBLK => FileType::Block,
             _ => FileType::Special,
         }
     }
@@ -2217,6 +2226,7 @@ impl DirOps for FuseDir {
                 FileType::File => S_IFREG,
                 FileType::Symlink => S_IFLNK,
                 FileType::Special => S_IFCHR,
+                FileType::Block => S_IFBLK,
                 FileType::Socket => S_IFSOCK,
                 FileType::Fifo => S_IFIFO,
                 FileType::Dir => return Err(FsError::InvalidData),

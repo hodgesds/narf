@@ -273,6 +273,14 @@ impl FileOps for DevRtc {
         }
     }
 
+    fn rdev(&self) -> u64 {
+        crate::devfs::linux_makedev(254, 0)
+    }
+
+    fn ino(&self) -> u64 {
+        0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
+    }
+
     /// RTC ioctls. Unknown requests return `Unsupported` → `-ENOTTY`,
     /// the Linux convention (`rtc_dev_ioctl` default). `hwclock` probes
     /// `RTC_UIE_ON`/`OFF` and tolerates failure, but returning 0 is
