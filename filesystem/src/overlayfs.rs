@@ -1,114 +1,188 @@
-//! `OverlayFs` — a union / overlay filesystem (Linux `overlayfs`).
+//! Linux-compatible union filesystem core.
 //!
-//! An overlay stacks a single writable **upper** directory over one or
-//! more read-only **lower** directories. A lookup consults the layers
-//! top-down (upper first, then each lower in registration order); the
-//! first hit wins, so an upper entry *shadows* a same-named lower one.
-//! Writes are directed at the upper layer — creating, `mkdir`-ing, and
-//! symlinking all land there, and a lower-only file opened for write is
-//! **copied up** into upper before the write proceeds. Removing a
-//! lower-only file leaves the lower untouched (it is read-only) and
-//! instead records a **whiteout** in upper, which hides the lower entry
-//! from every future lookup and enumeration of the union.
-//!
-//! This is the union filesystem containers and `systemd-nspawn` layer a
-//! rootfs with: an immutable base image as the lower(s) plus a writable
-//! scratch layer as the upper.
-//!
-//! ## What this implementation does / does not do
-//!
-//! - **Merged directories**: `lookup_dir` returns a fresh [`OverlayDir`]
-//!   that unions the same-named subdirectory across every layer that has
-//!   it, so descending into a directory present in both upper and a
-//!   lower still sees the union of their contents (and honours whiteouts
-//!   within). A subdirectory present in only one layer is still wrapped
-//!   in an `OverlayDir` (with a single backing layer) so a later write
-//!   under it copies up correctly.
-//!
-//! - **Whiteout representation**: real overlayfs marks a whiteout with a
-//!   character device `0:0` in the upper layer. NARF's writable backends
-//!   (`MemFs`) can't mint device nodes, so we represent a whiteout as a
-//!   zero-length regular file in the upper layer whose name is the
-//!   target name prefixed with [`WHITEOUT_PREFIX`] (`".wh."`), matching
-//!   the AUFS/overlayfs on-disk whiteout *naming* convention. `unlink`
-//!   of a lower-visible entry creates `.wh.<name>`; lookup/enumerate
-//!   treat a `.wh.<name>` in upper as "<name> is deleted from the union"
-//!   and never surface the `.wh.*` entries themselves.
-//!
-//! - **Copy-up** is implemented for the write path: [`OverlayDir::lookup`]
-//!   / `lookup_async` return an [`OverlayFile`] wrapper whose first
-//!   `write`/`truncate`/`set_*` copies the lower file's bytes into a new
-//!   upper file and then re-targets all subsequent ops at that upper
-//!   copy. Reads before any write go straight to the (cheaper) lower
-//!   file. A file already in upper is returned directly — no wrapper.
-//!
-//! - **`workdir`** (real overlayfs's atomic-rename staging area) is
-//!   accepted-and-ignored at mount time: our copy-up and whiteout ops
-//!   act directly on the upper directory rather than staging through a
-//!   workdir, which is correct for the single-threaded VFS here.
-//!
-//! - **Opaque directories** (a real-overlayfs `.wh..wh..opq` marker that
-//!   hides *all* lower entries under a copied-up directory) are not
-//!   implemented; per-entry whiteouts cover the cases the kernel-test
-//!   suite and container rootfs layering exercise.
+//! NARF uses regular `.wh.<name>` marker files because not every writable
+//! backend can create Linux overlayfs's character-device/xattr whiteouts.
+//! The markers are an internal representation and are never exposed through
+//! the merged view. `.wh..wh..opq` provides opaque-directory semantics.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::fmt;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Stat};
+use crate::{
+    DirEntry, DirOps, FileLock, FileOps, FileType, FsError, FsFuture, FsInstance, FsIoctlReply,
+    FsMappingRange, FsStatx, Stat,
+};
 
-/// Filename prefix marking an upper-layer whiteout. A zero-length file
-/// `.wh.<name>` in the upper layer means "<name> is deleted from the
-/// union" — it hides any same-named lower entry from lookup/enumerate
-/// and is itself never surfaced. Matches the AUFS/overlayfs on-disk
-/// whiteout naming convention.
+/// Prefix used by NARF's backing-store whiteout representation.
 pub const WHITEOUT_PREFIX: &str = ".wh.";
+/// Marker stored inside an opaque directory.
+pub const OPAQUE_MARKER: &str = ".wh..wh..opq";
 
-/// Build the whiteout marker name for `name` (`".wh." + name`).
+const COPY_CHUNK_SIZE: usize = 64 * 1024;
+
 fn whiteout_name(name: &str) -> String {
-    let mut s = String::with_capacity(WHITEOUT_PREFIX.len() + name.len());
-    s.push_str(WHITEOUT_PREFIX);
-    s.push_str(name);
-    s
+    let mut value = String::with_capacity(WHITEOUT_PREFIX.len() + name.len());
+    value.push_str(WHITEOUT_PREFIX);
+    value.push_str(name);
+    value
 }
 
-// ── OverlayFs (the mounted instance) ────────────────────────────────
+fn valid_visible_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.starts_with(WHITEOUT_PREFIX)
+}
 
-/// A mounted overlay filesystem. Owns the writable `upper` layer and an
-/// ordered list of read-only `lowers` (index 0 is highest priority,
-/// consulted right after upper). `root()` merges the layers' root
-/// directories into an [`OverlayDir`].
+fn has_whiteout(dir: &dyn DirOps, name: &str) -> bool {
+    dir.lookup(&whiteout_name(name)).is_some()
+}
+
+fn is_opaque(dir: &dyn DirOps) -> bool {
+    dir.lookup(OPAQUE_MARKER).is_some()
+}
+
+/// Lazily materialized upper-directory path. Each lower-only descendant has
+/// one slot pointing at its parent slot; a mutation walks to the nearest
+/// existing upper ancestor and creates the missing directory chain.
+struct UpperDir {
+    dir: IrqSafeSpinLock<Option<Arc<dyn DirOps>>>,
+    parent: Option<Arc<UpperDir>>,
+    name: Option<String>,
+    lower_metadata: Option<Arc<dyn DirOps>>,
+}
+
+impl UpperDir {
+    fn root(dir: Option<Arc<dyn DirOps>>) -> Arc<Self> {
+        Arc::new(Self {
+            dir: IrqSafeSpinLock::new(dir),
+            parent: None,
+            name: None,
+            lower_metadata: None,
+        })
+    }
+
+    fn child(
+        parent: Arc<Self>,
+        name: &str,
+        dir: Option<Arc<dyn DirOps>>,
+        lower_metadata: Option<Arc<dyn DirOps>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            dir: IrqSafeSpinLock::new(dir),
+            parent: Some(parent),
+            name: Some(name.to_string()),
+            lower_metadata,
+        })
+    }
+
+    fn get(&self) -> Option<Arc<dyn DirOps>> {
+        self.dir.lock().clone()
+    }
+
+    fn publish(&self, candidate: Arc<dyn DirOps>) -> Arc<dyn DirOps> {
+        let mut slot = self.dir.lock();
+        if let Some(existing) = slot.as_ref() {
+            return Arc::clone(existing);
+        }
+        *slot = Some(Arc::clone(&candidate));
+        candidate
+    }
+
+    fn ensure<'a>(self: &'a Arc<Self>) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move {
+            if let Some(dir) = self.get() {
+                return Ok(dir);
+            }
+
+            let mut missing: Vec<(Arc<UpperDir>, String)> = Vec::new();
+            let mut cursor = Arc::clone(self);
+            let mut parent_dir = loop {
+                if let Some(dir) = cursor.get() {
+                    break dir;
+                }
+                let parent = cursor.parent.as_ref().ok_or(FsError::ReadOnly)?;
+                let name = cursor.name.as_ref().ok_or(FsError::ReadOnly)?.clone();
+                missing.push((Arc::clone(&cursor), name));
+                cursor = Arc::clone(parent);
+            };
+
+            for (slot, name) in missing.into_iter().rev() {
+                if let Some(existing) = slot.get() {
+                    parent_dir = existing;
+                    continue;
+                }
+                let created = match parent_dir.mkdir(&name).await {
+                    Ok(dir) => dir,
+                    Err(FsError::Busy) => parent_dir
+                        .lookup_dir_async(&name)
+                        .await
+                        .map_err(|_| FsError::Busy)?,
+                    Err(error) => return Err(error),
+                };
+                if let Some(lower) = slot.lower_metadata.as_ref() {
+                    created.set_dir_mode(lower.dir_mode());
+                    let (uid, gid) = lower.dir_owners();
+                    created.set_dir_owners(uid, gid);
+                }
+                parent_dir = slot.publish(created);
+            }
+            Ok(parent_dir)
+        })
+    }
+}
+
+/// A mounted overlay. A missing upper creates Linux's read-only lower-only
+/// form; attempts to mutate it return `ReadOnly`.
 pub struct OverlayFs {
     name: &'static str,
-    upper: Arc<dyn DirOps>,
+    upper: Option<Arc<dyn DirOps>>,
     lowers: Vec<Arc<dyn DirOps>>,
+    mount_id: Arc<()>,
 }
 
 impl fmt::Debug for OverlayFs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OverlayFs")
             .field("name", &self.name)
+            .field("writable", &self.upper.is_some())
             .field("lowers", &self.lowers.len())
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
 impl OverlayFs {
-    /// Build an overlay from a writable `upper` directory and an ordered
-    /// list of read-only `lowers` (first = highest priority). At least
-    /// an upper is required; `lowers` may be empty (degenerate to a
-    /// pass-through of upper).
+    /// Construct a writable overlay. `lowers[0]` has the highest priority.
     pub fn new(name: &'static str, upper: Arc<dyn DirOps>, lowers: Vec<Arc<dyn DirOps>>) -> Self {
+        Self::from_layers(name, Some(upper), lowers)
+    }
+
+    /// Construct a read-only overlay from lower layers.
+    pub fn new_read_only(name: &'static str, lowers: Vec<Arc<dyn DirOps>>) -> Self {
+        Self::from_layers(name, None, lowers)
+    }
+
+    fn from_layers(
+        name: &'static str,
+        upper: Option<Arc<dyn DirOps>>,
+        mut lowers: Vec<Arc<dyn DirOps>>,
+    ) -> Self {
+        if let Some(opaque) = lowers.iter().position(|lower| is_opaque(lower.as_ref())) {
+            lowers.truncate(opaque + 1);
+        }
         Self {
             name,
             upper,
             lowers,
+            mount_id: Arc::new(()),
         }
     }
 }
@@ -116,9 +190,11 @@ impl OverlayFs {
 impl FsInstance for OverlayFs {
     fn root(&self) -> Arc<dyn DirOps> {
         Arc::new(OverlayDir {
-            upper: Arc::clone(&self.upper),
+            upper: UpperDir::root(self.upper.clone()),
             lowers: self.lowers.clone(),
-        }) as Arc<dyn DirOps>
+            mount_id: Arc::clone(&self.mount_id),
+            writable: self.upper.is_some(),
+        })
     }
 
     fn name(&self) -> &str {
@@ -126,64 +202,231 @@ impl FsInstance for OverlayFs {
     }
 }
 
-// ── OverlayDir (a merged directory) ─────────────────────────────────
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LayerKind {
+    File,
+    Dir,
+}
 
-/// A merged directory view: the union of one `upper` directory and zero
-/// or more `lowers`, with upper/earlier-lower shadowing later layers and
-/// upper-layer whiteouts hiding lower entries.
-///
-/// Every writable op is directed at `upper`. Because a fresh
-/// `OverlayDir` is minted per `lookup_dir`, each nested directory keeps
-/// the correct per-layer backing so copy-up and whiteouts happen against
-/// the right upper subdirectory.
 struct OverlayDir {
-    upper: Arc<dyn DirOps>,
+    upper: Arc<UpperDir>,
+    lowers: Vec<Arc<dyn DirOps>>,
+    mount_id: Arc<()>,
+    writable: bool,
+}
+
+struct ChildLayers {
+    upper: Option<Arc<dyn DirOps>>,
     lowers: Vec<Arc<dyn DirOps>>,
 }
 
 impl fmt::Debug for OverlayDir {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OverlayDir")
+            .field("upper_present", &self.upper.get().is_some())
             .field("lowers", &self.lowers.len())
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
 impl OverlayDir {
-    /// True if the upper layer holds a whiteout for `name` (so `name` is
-    /// deleted from the union regardless of what any lower holds).
-    fn is_whited_out(&self, name: &str) -> bool {
-        self.upper.lookup(&whiteout_name(name)).is_some()
+    fn upper_dir(&self) -> Option<Arc<dyn DirOps>> {
+        self.upper.get()
+    }
+
+    fn lower_kind(&self, name: &str) -> Option<LayerKind> {
+        for lower in &self.lowers {
+            if has_whiteout(lower.as_ref(), name) {
+                return None;
+            }
+            if lower.lookup(name).is_some() {
+                return Some(LayerKind::File);
+            }
+            if lower.lookup_dir(name).is_some() {
+                return Some(LayerKind::Dir);
+            }
+        }
+        None
+    }
+
+    fn lower_file(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        for lower in &self.lowers {
+            if has_whiteout(lower.as_ref(), name) || lower.lookup_dir(name).is_some() {
+                return None;
+            }
+            if let Some(file) = lower.lookup(name) {
+                return Some(file);
+            }
+        }
+        None
+    }
+
+    async fn remove_whiteout(&self, upper: &dyn DirOps, name: &str) -> Result<(), FsError> {
+        if has_whiteout(upper, name) {
+            match upper.unlink(&whiteout_name(name)).await {
+                Ok(()) | Err(FsError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn create_whiteout(&self, upper: &dyn DirOps, name: &str) -> Result<(), FsError> {
+        match upper.create(&whiteout_name(name)).await {
+            Ok(_) | Err(FsError::Busy) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn copy_up_file(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError> {
+        if let Some(upper) = self.upper_dir() {
+            if let Some(file) = upper.lookup(name) {
+                return Ok(file);
+            }
+        }
+        let lower = self.lower_file(name).ok_or(FsError::NotFound)?;
+        OverlayFile::new(Arc::clone(&self.upper), name.to_string(), lower)
+            .ensure_copied_up()
+            .await
+    }
+
+    fn child_layers(&self, name: &str) -> Option<ChildLayers> {
+        let upper = self.upper_dir();
+        if upper.as_ref().and_then(|dir| dir.lookup(name)).is_some() {
+            return None;
+        }
+        let upper_child = upper.as_ref().and_then(|dir| dir.lookup_dir(name));
+        if upper_child.is_none()
+            && upper
+                .as_ref()
+                .is_some_and(|dir| has_whiteout(dir.as_ref(), name))
+        {
+            return None;
+        }
+
+        let mut children = Vec::new();
+        let upper_opaque = upper_child
+            .as_ref()
+            .is_some_and(|dir| is_opaque(dir.as_ref()));
+        if !upper_opaque {
+            for lower in &self.lowers {
+                if has_whiteout(lower.as_ref(), name) || lower.lookup(name).is_some() {
+                    break;
+                }
+                if let Some(dir) = lower.lookup_dir(name) {
+                    let opaque = is_opaque(dir.as_ref());
+                    children.push(dir);
+                    if opaque {
+                        break;
+                    }
+                }
+            }
+        }
+        if upper_child.is_none() && children.is_empty() {
+            None
+        } else {
+            Some(ChildLayers {
+                upper: upper_child,
+                lowers: children,
+            })
+        }
+    }
+
+    async fn prepare_create(&self, name: &str) -> Result<Arc<dyn DirOps>, FsError> {
+        if !valid_visible_name(name) {
+            return Err(FsError::InvalidPath);
+        }
+        if self.lookup(name).is_some() || self.lookup_dir(name).is_some() {
+            return Err(FsError::Busy);
+        }
+        let upper = self.upper.ensure().await?;
+        self.remove_whiteout(upper.as_ref(), name).await?;
+        Ok(upper)
+    }
+
+    async fn prepare_destination(&self, name: &str) -> Result<Arc<dyn DirOps>, FsError> {
+        if !valid_visible_name(name) {
+            return Err(FsError::InvalidPath);
+        }
+        let upper = self.upper.ensure().await?;
+        self.remove_whiteout(upper.as_ref(), name).await?;
+        Ok(upper)
+    }
+
+    async fn remove_entry(&self, name: &str, directory: bool) -> Result<(), FsError> {
+        if !valid_visible_name(name) {
+            return Err(FsError::InvalidPath);
+        }
+        let visible_dir = self.lookup_dir(name);
+        let visible_file = self.lookup(name);
+        if directory {
+            let child = visible_dir.ok_or_else(|| {
+                if visible_file.is_some() {
+                    FsError::InvalidPath
+                } else {
+                    FsError::NotFound
+                }
+            })?;
+            if !child.enumerate(0, 1).is_empty() {
+                return Err(FsError::Busy);
+            }
+        } else if visible_file.is_none() {
+            return Err(if visible_dir.is_some() {
+                FsError::InvalidPath
+            } else {
+                FsError::NotFound
+            });
+        }
+
+        let lower_positive = self.lower_kind(name).is_some();
+        let upper = self.upper.ensure().await?;
+        if directory {
+            if let Some(raw_child) = upper.lookup_dir(name) {
+                // An empty merged directory may contain only internal markers.
+                for (marker, _) in raw_child.enumerate(0, usize::MAX) {
+                    if marker.starts_with(WHITEOUT_PREFIX) {
+                        raw_child.unlink(&marker).await?;
+                    }
+                }
+                upper.rmdir(name).await?;
+            }
+        } else if upper.lookup(name).is_some() {
+            upper.unlink(name).await?;
+        }
+        if lower_positive {
+            self.create_whiteout(upper.as_ref(), name).await?;
+        }
+        Ok(())
     }
 }
 
 impl DirOps for OverlayDir {
+    fn ino(&self) -> u64 {
+        self.upper_dir().map_or_else(
+            || self.lowers.first().map_or(0, |dir| dir.ino()),
+            |dir| dir.ino(),
+        )
+    }
+
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
-        // Never resolve the whiteout markers themselves.
-        if name.starts_with(WHITEOUT_PREFIX) {
+        if !valid_visible_name(name) {
             return None;
         }
-        // Upper wins outright — an entry there shadows every lower.
-        if let Some(f) = self.upper.lookup(name) {
-            return Some(f);
-        }
-        // A whiteout in upper deletes the name from the union even
-        // though upper has no live entry for it.
-        if self.is_whited_out(name) {
-            return None;
-        }
-        // Fall through the lowers in priority order. A lower-only file
-        // is wrapped so the first write copies it up into `upper`.
-        for lower in &self.lowers {
-            if let Some(f) = lower.lookup(name) {
-                return Some(Arc::new(OverlayFile::new(
-                    Arc::clone(&self.upper),
-                    name.to_string(),
-                    f,
-                )) as Arc<dyn FileOps>);
+        if let Some(upper) = self.upper_dir() {
+            if let Some(file) = upper.lookup(name) {
+                return Some(file);
+            }
+            if upper.lookup_dir(name).is_some() || has_whiteout(upper.as_ref(), name) {
+                return None;
             }
         }
-        None
+        self.lower_file(name).map(|file| {
+            Arc::new(OverlayFile::new(
+                Arc::clone(&self.upper),
+                name.to_string(),
+                file,
+            )) as Arc<dyn FileOps>
+        })
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
@@ -191,54 +434,17 @@ impl DirOps for OverlayDir {
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
-        if name.starts_with(WHITEOUT_PREFIX) {
+        if !valid_visible_name(name) {
             return None;
         }
-        // A whiteout hides a lower directory too. If upper itself holds
-        // a live directory we still surface it (a re-created directory
-        // over a whiteout); otherwise a whiteout blocks the lowers.
-        let upper_dir = self.upper.lookup_dir(name);
-        if upper_dir.is_none() && self.is_whited_out(name) {
-            return None;
-        }
-        // Collect the same-named subdirectory from every layer that has
-        // it, preserving priority order (upper first).
-        let mut lower_dirs: Vec<Arc<dyn DirOps>> = Vec::new();
-        for lower in &self.lowers {
-            if let Some(d) = lower.lookup_dir(name) {
-                lower_dirs.push(d);
-            }
-        }
-        match (upper_dir, lower_dirs.is_empty()) {
-            (None, true) => None,
-            (Some(u), _) => {
-                // Present in upper (and maybe lowers) → merged dir with
-                // the upper subdir as its writable layer.
-                Some(Arc::new(OverlayDir {
-                    upper: u,
-                    lowers: lower_dirs,
-                }) as Arc<dyn DirOps>)
-            }
-            (None, false) => {
-                // Lower-only directory. Writes into it must land in a
-                // *fresh* upper subdirectory (copy-up-on-write for the
-                // directory), so make the highest-priority lower the
-                // "upper" writable layer only if we can; since lowers
-                // are read-only, we instead surface the first lower as
-                // the writable slot and the rest as lowers. A write then
-                // fails ReadOnly rather than silently mutating a lower —
-                // matching "the parent hasn't been copied up yet". A
-                // create()/mkdir() at this level would need the parent
-                // copied up first; that is left to callers that mkdir
-                // the parent explicitly (documented limitation).
-                let mut it = lower_dirs.into_iter();
-                let writable = it.next()?;
-                Some(Arc::new(OverlayDir {
-                    upper: writable,
-                    lowers: it.collect(),
-                }) as Arc<dyn DirOps>)
-            }
-        }
+        let child = self.child_layers(name)?;
+        let metadata = child.lowers.first().cloned();
+        Some(Arc::new(OverlayDir {
+            upper: UpperDir::child(Arc::clone(&self.upper), name, child.upper, metadata),
+            lowers: child.lowers,
+            mount_id: Arc::clone(&self.mount_id),
+            writable: self.writable,
+        }))
     }
 
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
@@ -246,48 +452,41 @@ impl DirOps for OverlayDir {
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        // Names live in owned `String`s across layers — same constraint
-        // as MemFs: we can't synthesise `&'static str` without leaking.
-        // The readdir path uses `enumerate()` below.
         Box::new(core::iter::empty())
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
-        // Build the full deduped union first, then apply cursor/max.
-        // `seen` tracks names already emitted (upper/earlier-lower wins);
-        // `whiteouts` tracks names deleted by an upper whiteout so a
-        // lower entry with that name is suppressed. The `.wh.*` markers
-        // are consumed into `whiteouts` and never emitted themselves.
-        let mut merged: BTreeMap<String, FileType> = BTreeMap::new();
-        let mut whiteouts: BTreeSet<String> = BTreeSet::new();
-
-        // Upper first: record whiteouts and live entries.
-        for (name, ft) in self.upper.enumerate(0, usize::MAX) {
-            if let Some(target) = name.strip_prefix(WHITEOUT_PREFIX) {
-                whiteouts.insert(target.to_string());
-                continue;
-            }
-            merged.insert(name, ft);
+        let mut merged = BTreeMap::new();
+        let mut hidden = BTreeSet::new();
+        let mut layers = Vec::new();
+        if let Some(upper) = self.upper_dir() {
+            layers.push(upper);
         }
-        // Lowers in priority order: fill in names not already present
-        // and not whited-out.
-        for lower in &self.lowers {
-            for (name, ft) in lower.enumerate(0, usize::MAX) {
-                if name.starts_with(WHITEOUT_PREFIX) {
-                    // A lower-layer whiteout also hides deeper lowers.
-                    if let Some(target) = name.strip_prefix(WHITEOUT_PREFIX) {
-                        whiteouts.insert(target.to_string());
-                    }
+        layers.extend(self.lowers.iter().cloned());
+
+        for layer in layers {
+            let entries = layer.enumerate(0, usize::MAX);
+            let mut opaque = false;
+            for (name, _) in &entries {
+                if name == OPAQUE_MARKER {
+                    opaque = true;
+                } else if let Some(target) = name.strip_prefix(WHITEOUT_PREFIX) {
+                    hidden.insert(target.to_string());
+                }
+            }
+            for (name, file_type) in entries {
+                if name.starts_with(WHITEOUT_PREFIX)
+                    || hidden.contains(&name)
+                    || merged.contains_key(&name)
+                {
                     continue;
                 }
-                if whiteouts.contains(&name) || merged.contains_key(&name) {
-                    continue;
-                }
-                merged.insert(name, ft);
+                merged.insert(name, file_type);
+            }
+            if opaque {
+                break;
             }
         }
-
-        // `BTreeMap` gives a deterministic (sorted) order.
         merged.into_iter().skip(cursor).take(max).collect()
     }
 
@@ -299,142 +498,262 @@ impl DirOps for OverlayDir {
         Box::pin(async move { Ok(self.enumerate(cursor, max)) })
     }
 
-    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+    fn dir_mode(&self) -> u16 {
+        self.upper_dir().map_or_else(
+            || self.lowers.first().map_or(0o755, |dir| dir.dir_mode()),
+            |dir| dir.dir_mode(),
+        )
+    }
+
+    fn set_dir_mode(&self, perms: u16) {
+        if let Some(upper) = self.upper_dir() {
+            upper.set_dir_mode(perms);
+        }
+    }
+
+    fn dir_owners(&self) -> (u32, u32) {
+        self.upper_dir().map_or_else(
+            || self.lowers.first().map_or((0, 0), |dir| dir.dir_owners()),
+            |dir| dir.dir_owners(),
+        )
+    }
+
+    fn set_dir_owners(&self, uid: u32, gid: u32) {
+        if let Some(upper) = self.upper_dir() {
+            upper.set_dir_owners(uid, gid);
+        }
+    }
+
+    fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            if name.starts_with(WHITEOUT_PREFIX) {
-                return Err(FsError::InvalidPath);
-            }
-            // Is the name present in upper as a live entry? If so, remove
-            // it from upper directly.
-            let in_upper = self.upper.lookup(name).is_some();
-            if in_upper {
-                self.upper.unlink(name).await?;
-            } else if self.upper.lookup_dir(name).is_some() {
-                // An upper directory can't be unlink()'d (POSIX EISDIR).
-                return Err(FsError::InvalidPath);
-            }
-            // Does any lower still expose the name? If so, leave a
-            // whiteout so it disappears from the union. (The lower is
-            // read-only and untouched.)
-            let in_lower = self
-                .lowers
-                .iter()
-                .any(|l| l.lookup(name).is_some() || l.lookup_dir(name).is_some());
-            if in_lower {
-                // Create the whiteout marker in upper (idempotent —
-                // Busy means it already exists, which is fine).
-                match self.upper.create(&whiteout_name(name)).await {
-                    Ok(_) | Err(FsError::Busy) => {}
-                    Err(e) => return Err(e),
-                }
-                return Ok(());
-            }
-            // Neither upper (removed above) nor any lower has it → the
-            // unlink is done iff it was in upper; otherwise NotFound.
-            if in_upper {
-                Ok(())
+            if let Some(upper) = self.upper_dir() {
+                upper.fsync(data_only).await
+            } else if let Some(lower) = self.lowers.first() {
+                lower.fsync(data_only).await
             } else {
-                Err(FsError::NotFound)
+                Ok(())
             }
         })
     }
 
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(upper) = self.upper_dir() {
+                upper.syncfs().await
+            } else if let Some(lower) = self.lowers.first() {
+                lower.syncfs().await
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.remove_entry(name, false).await })
+    }
+
     fn create<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
-            if name.starts_with(WHITEOUT_PREFIX) {
-                return Err(FsError::InvalidPath);
-            }
-            // Creating over a whited-out lower name resurrects it: drop
-            // the whiteout first so the fresh upper file is visible.
-            if self.is_whited_out(name) {
-                let _ = self.upper.unlink(&whiteout_name(name)).await;
-            }
-            self.upper.create(name).await
+            let upper = self.prepare_create(name).await?;
+            upper.create(name).await
+        })
+    }
+
+    fn create_socket<'a>(&'a self, name: &'a str, perms: u16) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let upper = self.prepare_create(name).await?;
+            upper.create_socket(name, perms).await
+        })
+    }
+
+    fn mknod<'a>(
+        &'a self,
+        name: &'a str,
+        file_type: FileType,
+        rdev: u64,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let upper = self.prepare_create(name).await?;
+            upper.mknod(name, file_type, rdev).await
         })
     }
 
     fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
-            if name.starts_with(WHITEOUT_PREFIX) {
-                return Err(FsError::InvalidPath);
-            }
-            if self.is_whited_out(name) {
-                let _ = self.upper.unlink(&whiteout_name(name)).await;
-            }
-            self.upper.mkdir(name).await
+            let upper = self.prepare_create(name).await?;
+            upper.mkdir(name).await
         })
     }
 
     fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
-        Box::pin(async move {
-            if name.starts_with(WHITEOUT_PREFIX) {
-                return Err(FsError::InvalidPath);
-            }
-            let in_upper = self.upper.lookup_dir(name).is_some();
-            if in_upper {
-                self.upper.rmdir(name).await?;
-            }
-            // Whiteout a lower-visible directory of the same name so the
-            // union no longer shows it.
-            let in_lower = self.lowers.iter().any(|l| l.lookup_dir(name).is_some());
-            if in_lower {
-                match self.upper.create(&whiteout_name(name)).await {
-                    Ok(_) | Err(FsError::Busy) => {}
-                    Err(e) => return Err(e),
-                }
-                return Ok(());
-            }
-            if in_upper {
-                Ok(())
-            } else {
-                Err(FsError::NotFound)
-            }
-        })
+        Box::pin(async move { self.remove_entry(name, true).await })
     }
 
     fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
-            if name.starts_with(WHITEOUT_PREFIX) {
-                return Err(FsError::InvalidPath);
-            }
-            if self.is_whited_out(name) {
-                let _ = self.upper.unlink(&whiteout_name(name)).await;
-            }
-            self.upper.symlink(name, target).await
+            let upper = self.prepare_create(name).await?;
+            upper.symlink(name, target).await
         })
     }
 
     fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            if old_name.starts_with(WHITEOUT_PREFIX) || new_name.starts_with(WHITEOUT_PREFIX) {
+            if !self.writable {
+                return Err(FsError::ReadOnly);
+            }
+            if !valid_visible_name(old_name) || !valid_visible_name(new_name) {
                 return Err(FsError::InvalidPath);
             }
-            // Rename is only supported for entries that already live in
-            // upper (a lower-only rename would require copy-up of the
-            // source plus a whiteout of the old name; deferred). Delegate
-            // straight to the upper layer.
-            self.upper.rename(old_name, new_name).await
+            if old_name == new_name {
+                return (self.lookup(old_name).is_some() || self.lookup_dir(old_name).is_some())
+                    .then_some(())
+                    .ok_or(FsError::NotFound);
+            }
+            let lower_positive = self.lower_kind(old_name).is_some();
+            let source_is_dir = self.lookup_dir(old_name).is_some();
+            if source_is_dir && lower_positive {
+                // Linux's default redirect_dir=off behavior is EXDEV for a
+                // lower or merged directory.
+                return Err(FsError::CrossDevice);
+            }
+            if !source_is_dir && self.lookup(old_name).is_none() {
+                return Err(FsError::NotFound);
+            }
+            if !source_is_dir && self.upper_dir().and_then(|d| d.lookup(old_name)).is_none() {
+                self.copy_up_file(old_name).await?;
+            }
+            let upper = self.prepare_destination(new_name).await?;
+            upper.rename(old_name, new_name).await?;
+            if lower_positive {
+                self.create_whiteout(upper.as_ref(), old_name).await?;
+            }
+            Ok(())
         })
+    }
+
+    fn rename_to<'a>(
+        &'a self,
+        old_name: &'a str,
+        new_dir: &'a dyn DirOps,
+        new_name: &'a str,
+        flags: u32,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let destination = new_dir
+                .as_any()
+                .and_then(|any| any.downcast_ref::<OverlayDir>())
+                .filter(|dir| Arc::ptr_eq(&self.mount_id, &dir.mount_id))
+                .ok_or(FsError::CrossDevice)?;
+            if !self.writable {
+                return Err(FsError::ReadOnly);
+            }
+            if flags & !0x3 != 0 || flags == 0x3 {
+                return Err(FsError::Unsupported);
+            }
+            let lower_positive = self.lower_kind(old_name).is_some();
+            let source_is_dir = self.lookup_dir(old_name).is_some();
+            if source_is_dir && lower_positive {
+                return Err(FsError::CrossDevice);
+            }
+            if !source_is_dir && self.lookup(old_name).is_none() {
+                return Err(FsError::NotFound);
+            }
+            if flags == 0x2 && (lower_positive || destination.lower_kind(new_name).is_some()) {
+                return Err(FsError::Unsupported);
+            }
+            if flags == 0x1
+                && (destination.lookup(new_name).is_some()
+                    || destination.lookup_dir(new_name).is_some())
+            {
+                return Err(FsError::Busy);
+            }
+            if !source_is_dir && self.upper_dir().and_then(|d| d.lookup(old_name)).is_none() {
+                self.copy_up_file(old_name).await?;
+            }
+            let source_upper = self.upper.ensure().await?;
+            let destination_upper = destination.prepare_destination(new_name).await?;
+            source_upper
+                .rename_to(old_name, destination_upper.as_ref(), new_name, flags)
+                .await?;
+            if lower_positive {
+                self.create_whiteout(source_upper.as_ref(), old_name)
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn link<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.lookup_dir(old_name).is_some() {
+                return Err(FsError::InvalidPath);
+            }
+            if self
+                .upper_dir()
+                .and_then(|dir| dir.lookup(old_name))
+                .is_none()
+            {
+                self.copy_up_file(old_name).await?;
+            }
+            let upper = self.prepare_create(new_name).await?;
+            upper.link(old_name, new_name).await
+        })
+    }
+
+    fn link_to<'a>(
+        &'a self,
+        old_name: &'a str,
+        new_dir: &'a dyn DirOps,
+        new_name: &'a str,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let destination = new_dir
+                .as_any()
+                .and_then(|any| any.downcast_ref::<OverlayDir>())
+                .filter(|dir| Arc::ptr_eq(&self.mount_id, &dir.mount_id))
+                .ok_or(FsError::CrossDevice)?;
+            if self.lookup_dir(old_name).is_some() {
+                return Err(FsError::InvalidPath);
+            }
+            if self
+                .upper_dir()
+                .and_then(|dir| dir.lookup(old_name))
+                .is_none()
+            {
+                self.copy_up_file(old_name).await?;
+            }
+            let source_upper = self.upper.ensure().await?;
+            let destination_upper = destination.prepare_create(new_name).await?;
+            source_upper
+                .link_to(old_name, destination_upper.as_ref(), new_name)
+                .await
+        })
+    }
+
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
+    }
+
+    fn link_node<'a>(&'a self, name: &'a str, node: Arc<dyn FileOps>) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let upper = self.prepare_create(name).await?;
+            upper.link_node(name, node).await
+        })
+    }
+
+    fn tmpfile<'a>(&'a self, mode: u32) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { self.upper.ensure().await?.tmpfile(mode).await })
+    }
+
+    fn supports_tmpfile(&self) -> bool {
+        self.upper_dir().is_some_and(|dir| dir.supports_tmpfile())
     }
 }
 
-// ── OverlayFile (copy-up-on-write wrapper) ──────────────────────────
-
-/// Wraps a lower-layer [`FileOps`] so reads go to the (read-only) lower
-/// file until the first write, at which point the file's bytes are
-/// copied up into a fresh upper file and every subsequent op targets the
-/// upper copy. This is overlayfs's copy-up semantics on the file path.
-///
-/// The wrapper is minted only for lower-only files; a file already in
-/// upper is returned bare by [`OverlayDir::lookup`].
 struct OverlayFile {
-    /// The upper directory the copy-up target is created in.
-    upper: Arc<dyn DirOps>,
-    /// Name of the file within its directory (the copy-up target name).
+    upper: Arc<UpperDir>,
     name: String,
-    /// The read-only lower file we shadow until copy-up.
     lower: Arc<dyn FileOps>,
-    /// Once copy-up has happened, the upper file every op targets.
     upper_file: IrqSafeSpinLock<Option<Arc<dyn FileOps>>>,
 }
 
@@ -443,12 +762,12 @@ impl fmt::Debug for OverlayFile {
         f.debug_struct("OverlayFile")
             .field("name", &self.name)
             .field("copied_up", &self.upper_file.lock().is_some())
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
 impl OverlayFile {
-    fn new(upper: Arc<dyn DirOps>, name: String, lower: Arc<dyn FileOps>) -> Self {
+    fn new(upper: Arc<UpperDir>, name: String, lower: Arc<dyn FileOps>) -> Self {
         Self {
             upper,
             name,
@@ -457,109 +776,330 @@ impl OverlayFile {
         }
     }
 
-    /// Return the upper copy if copy-up has already happened.
     fn copied_up(&self) -> Option<Arc<dyn FileOps>> {
         self.upper_file.lock().clone()
     }
 
-    /// Perform copy-up if it hasn't happened yet, returning the upper
-    /// file to target. Copies the lower file's current bytes into a
-    /// fresh upper file of the same name, then remembers it.
-    async fn ensure_copied_up(&self) -> Result<Arc<dyn FileOps>, FsError> {
-        if let Some(f) = self.copied_up() {
-            return Ok(f);
-        }
-        // Read the whole lower file. Lower files here are in-memory /
-        // modestly sized; a chunked copy would be an easy refinement.
-        let size = self.lower.stat().size as usize;
-        let mut buf = alloc::vec![0u8; size];
-        let mut off = 0usize;
-        while off < size {
-            let n = self.lower.read(off as u64, &mut buf[off..]).await?;
-            if n == 0 {
+    fn active(&self) -> Arc<dyn FileOps> {
+        self.copied_up().unwrap_or_else(|| Arc::clone(&self.lower))
+    }
+
+    async fn copy_regular_data(
+        lower: &dyn FileOps,
+        upper: &dyn FileOps,
+        size: u64,
+    ) -> Result<(), FsError> {
+        let mut offset = 0u64;
+        let mut buffer = alloc::vec![0u8; COPY_CHUNK_SIZE];
+        while offset < size {
+            let wanted = core::cmp::min(buffer.len() as u64, size - offset) as usize;
+            let read = lower.read(offset, &mut buffer[..wanted]).await?;
+            if read == 0 {
                 break;
             }
-            off += n;
+            let mut written = 0usize;
+            while written < read {
+                let count = upper
+                    .write(offset + written as u64, &buffer[written..read])
+                    .await?;
+                if count == 0 {
+                    return Err(FsError::Io(crate::BlockError::IOError));
+                }
+                written += count;
+            }
+            offset += read as u64;
         }
-        buf.truncate(off);
-        // Create (or reuse) the upper copy and seed it with the bytes.
-        let upper_file = match self.upper.create(&self.name).await {
-            Ok(f) => f,
-            // Someone already copied it up (or created it) — use that.
-            Err(FsError::Busy) => self.upper.lookup(&self.name).ok_or(FsError::Busy)?,
-            Err(e) => return Err(e),
+        Ok(())
+    }
+
+    async fn copy_xattrs(lower: &dyn FileOps, upper: &dyn FileOps) -> Result<(), FsError> {
+        let names = match lower.list_xattr().await {
+            Ok(names) => names,
+            Err(FsError::Unsupported) => return Ok(()),
+            Err(error) => return Err(error),
         };
-        if !buf.is_empty() {
-            upper_file.write(0, &buf).await?;
+        for raw_name in names
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+        {
+            let name = core::str::from_utf8(raw_name).map_err(|_| FsError::InvalidData)?;
+            let value = lower.get_xattr(name).await?;
+            upper.set_xattr(name, &value, 0).await?;
         }
-        // Publish the copy-up result. If a racer beat us, keep theirs.
-        let mut g = self.upper_file.lock();
-        if let Some(existing) = g.clone() {
+        Ok(())
+    }
+
+    async fn ensure_copied_up(&self) -> Result<Arc<dyn FileOps>, FsError> {
+        if let Some(file) = self.copied_up() {
+            return Ok(file);
+        }
+        let upper_dir = self.upper.ensure().await?;
+        if let Some(existing) = upper_dir.lookup(&self.name) {
+            let mut slot = self.upper_file.lock();
+            *slot = Some(Arc::clone(&existing));
             return Ok(existing);
         }
-        *g = Some(Arc::clone(&upper_file));
+
+        let stat = self.lower.stat();
+        let create_result = match stat.mode.file_type {
+            FileType::File => upper_dir.create(&self.name).await,
+            FileType::Symlink => {
+                let mut target = alloc::vec![0u8; stat.size as usize];
+                let read = self.lower.read(0, &mut target).await?;
+                target.truncate(read);
+                let target = core::str::from_utf8(&target).map_err(|_| FsError::InvalidData)?;
+                upper_dir.symlink(&self.name, target).await
+            }
+            FileType::Socket => upper_dir.create_socket(&self.name, stat.mode.perms).await,
+            file_type => {
+                upper_dir
+                    .mknod(&self.name, file_type, self.lower.rdev())
+                    .await
+            }
+        };
+        let upper_file = match create_result {
+            Ok(file) => file,
+            Err(FsError::Busy) => {
+                let existing = upper_dir.lookup(&self.name).ok_or(FsError::Busy)?;
+                let mut slot = self.upper_file.lock();
+                *slot = Some(Arc::clone(&existing));
+                return Ok(existing);
+            }
+            Err(error) => return Err(error),
+        };
+
+        let copy_result = async {
+            if stat.mode.file_type == FileType::File {
+                Self::copy_regular_data(self.lower.as_ref(), upper_file.as_ref(), stat.size)
+                    .await?;
+            }
+            let (uid, gid) = self.lower.owners();
+            upper_file.set_owners(uid, gid).await?;
+            upper_file.set_perms(stat.mode.perms).await?;
+            if stat.mtime_cycles != 0 {
+                let mtime_ns = stat.mtime_cycles / narf_time::cycles_per_ns().max(1) as u64;
+                upper_file.set_times(None, Some(mtime_ns))?;
+            }
+            Self::copy_xattrs(self.lower.as_ref(), upper_file.as_ref()).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = copy_result {
+            let _ = upper_dir.unlink(&self.name).await;
+            return Err(error);
+        }
+
+        let mut slot = self.upper_file.lock();
+        if let Some(existing) = slot.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        *slot = Some(Arc::clone(&upper_file));
         Ok(upper_file)
     }
 }
 
 impl FileOps for OverlayFile {
-    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move {
-            // After copy-up, read the upper copy (it holds the writes);
-            // before, read straight from the cheaper lower file.
-            match self.copied_up() {
-                Some(f) => f.read(offset, buf).await,
-                None => self.lower.read(offset, buf).await,
-            }
-        })
+    fn read<'a>(&'a self, offset: u64, buffer: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { self.active().read(offset, buffer).await })
     }
 
-    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move {
-            let f = self.ensure_copied_up().await?;
-            f.write(offset, buf).await
-        })
+    fn write<'a>(&'a self, offset: u64, buffer: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { self.ensure_copied_up().await?.write(offset, buffer).await })
     }
 
     fn stat(&self) -> Stat {
-        match self.copied_up() {
-            Some(f) => f.stat(),
-            None => self.lower.stat(),
-        }
+        self.active().stat()
     }
 
     fn ino(&self) -> u64 {
-        match self.copied_up() {
-            Some(f) => f.ino(),
-            None => self.lower.ino(),
-        }
+        self.active().ino()
+    }
+
+    fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
+        Box::pin(async move { self.active().stat_async().await })
+    }
+
+    fn statx_async<'a>(&'a self, flags: u32, mask: u32) -> FsFuture<'a, FsStatx> {
+        Box::pin(async move { self.active().statx_async(flags, mask).await })
     }
 
     fn owners(&self) -> (u32, u32) {
-        match self.copied_up() {
-            Some(f) => f.owners(),
-            None => self.lower.owners(),
-        }
+        self.active().owners()
     }
 
     fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
-        Box::pin(async move {
-            let f = self.ensure_copied_up().await?;
-            f.truncate(len).await
-        })
+        Box::pin(async move { self.ensure_copied_up().await?.truncate(len).await })
     }
 
     fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
-        Box::pin(async move {
-            let f = self.ensure_copied_up().await?;
-            f.set_owners(uid, gid).await
-        })
+        Box::pin(async move { self.ensure_copied_up().await?.set_owners(uid, gid).await })
     }
 
     fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.ensure_copied_up().await?.set_perms(perms).await })
+    }
+
+    fn flush<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.active().flush().await })
+    }
+
+    fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.active().fsync(data_only).await })
+    }
+
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.active().syncfs().await })
+    }
+
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            let f = self.ensure_copied_up().await?;
-            f.set_perms(perms).await
+            self.ensure_copied_up()
+                .await?
+                .set_xattr(name, value, flags)
+                .await
         })
+    }
+
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move { self.active().get_xattr(name).await })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move { self.active().list_xattr().await })
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.ensure_copied_up().await?.remove_xattr(name).await })
+    }
+
+    fn access<'a>(&'a self, mask: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.active().access(mask).await })
+    }
+
+    fn get_lock<'a>(&'a self, owner: u64, lock: FileLock) -> FsFuture<'a, FileLock> {
+        Box::pin(async move { self.active().get_lock(owner, lock).await })
+    }
+
+    fn set_lock<'a>(&'a self, owner: u64, lock: FileLock, wait: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.ensure_copied_up()
+                .await?
+                .set_lock(owner, lock, wait)
+                .await
+        })
+    }
+
+    fn fallocate<'a>(&'a self, mode: u32, offset: u64, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.ensure_copied_up()
+                .await?
+                .fallocate(mode, offset, len)
+                .await
+        })
+    }
+
+    fn seek<'a>(&'a self, offset: u64, whence: u32) -> FsFuture<'a, u64> {
+        Box::pin(async move { self.active().seek(offset, whence).await })
+    }
+
+    fn bmap<'a>(&'a self, block: u64, block_size: u32) -> FsFuture<'a, u64> {
+        Box::pin(async move { self.active().bmap(block, block_size).await })
+    }
+
+    fn setup_mapping<'a>(
+        &'a self,
+        file_offset: u64,
+        len: u64,
+        flags: u64,
+        memory_offset: u64,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.ensure_copied_up()
+                .await?
+                .setup_mapping(file_offset, len, flags, memory_offset)
+                .await
+        })
+    }
+
+    fn remove_mappings<'a>(&'a self, ranges: &'a [FsMappingRange]) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.active().remove_mappings(ranges).await })
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        self.active().poll_readiness()
+    }
+
+    fn poll_readiness_at(&self, offset: u64) -> u32 {
+        self.active().poll_readiness_at(offset)
+    }
+
+    fn poll_edge_token(&self) -> (u64, u64) {
+        self.active().poll_edge_token()
+    }
+
+    fn acknowledge_poll_readiness(&self, readiness: u32) {
+        self.active().acknowledge_poll_readiness(readiness);
+    }
+
+    fn poll_deadline(&self) -> Option<u64> {
+        self.active().poll_deadline()
+    }
+
+    fn readiness_notifies(&self) -> bool {
+        self.active().readiness_notifies()
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        self.active().ioctl(cmd, arg)
+    }
+
+    fn ioctl_async<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        input: &'a [u8],
+        out_size: usize,
+    ) -> FsFuture<'a, FsIoctlReply> {
+        Box::pin(async move { self.active().ioctl_async(cmd, arg, input, out_size).await })
+    }
+
+    fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        self.active().mmap_frames(offset, len)
+    }
+
+    fn mmap_fault(&self, offset: u64) -> Result<u64, FsError> {
+        self.active().mmap_fault(offset)
+    }
+
+    fn rdev(&self) -> u64 {
+        self.active().rdev()
+    }
+
+    fn read_should_block(&self) -> bool {
+        self.active().read_should_block()
+    }
+
+    fn write_should_block(&self) -> bool {
+        self.active().write_should_block()
+    }
+
+    fn pipe_capacity(&self) -> Option<usize> {
+        self.active().pipe_capacity()
+    }
+
+    fn is_stream(&self) -> bool {
+        self.active().is_stream()
+    }
+
+    fn block_on_input(&self) -> bool {
+        self.active().block_on_input()
+    }
+
+    fn nonblock_read_eagain(&self) -> bool {
+        self.active().nonblock_read_eagain()
+    }
+
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
     }
 }

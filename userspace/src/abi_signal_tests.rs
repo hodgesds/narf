@@ -618,6 +618,37 @@ fn smoke_abi_signal_rt_kill_pending() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_rt_kill_pending);
 
+// A default-ignored SIGCHLD remains pending until the return-to-user delivery
+// path consumes it, but it must not interrupt wait4 with EINTR. A real handler
+// for the same signal does make it actionable, while SIG_IGN suppresses it.
+fn smoke_abi_signal_default_ignored_does_not_interrupt_wait() -> TestResult {
+    with_setup(|| {
+        const SIGCHLD: u32 = 17;
+        crate::handlers::raise_signal_pending(FAKE_TASK, SIGCHLD);
+        if !crate::handlers::is_signal_pending(FAKE_TASK) {
+            return Err("SIGCHLD should remain visible as pending");
+        }
+        if crate::handlers::has_interrupting_signal(FAKE_TASK) {
+            return Err("default-ignored SIGCHLD must not interrupt wait4");
+        }
+
+        crate::handlers::__test_set_sigaction(FAKE_TASK, SIGCHLD as usize, 0x4000);
+        if !crate::handlers::has_interrupting_signal(FAKE_TASK) {
+            return Err("caught SIGCHLD must wake an interruptible wait");
+        }
+
+        crate::handlers::__test_set_sigaction(FAKE_TASK, SIGCHLD as usize, 1);
+        if crate::handlers::has_interrupting_signal(FAKE_TASK) {
+            return Err("SIG_IGN SIGCHLD must not interrupt wait4");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_default_ignored_does_not_interrupt_wait
+);
+
 // sigprocmask must be able to block an RT signal: user sigset bit 32
 // == signal 33 (musl SIGCANCEL). Pre-widening the `as u32` truncation
 // dropped every bit above signal 31, so pthread_cancel's block of

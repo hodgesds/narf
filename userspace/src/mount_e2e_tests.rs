@@ -216,6 +216,86 @@ fn smoke_mount_tmpfs_applies_linux_options() -> TestResult {
 }
 kernel_test_in!("userspace/mount", smoke_mount_tmpfs_applies_linux_options);
 
+/// Overlay options come from Linux mount(2)'s data pointer, not from the
+/// information-free source string. Upper/work pairing is exercised too.
+fn smoke_mount_overlay_uses_linux_data_argument() -> TestResult {
+    use narf_filesystem::{FsInstance, MemFs};
+
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_0c);
+    crate::handlers::__test_root_dir_reset();
+    const LOWER: &str = "/overlay-data-lower";
+    const UPPER: &str = "/overlay-data-upper";
+    const WORK: &str = "/overlay-data-work";
+    const TARGET: &str = "/overlay-data-target";
+    for path in [TARGET, WORK, UPPER, LOWER] {
+        let _ = unmount_for_test(path);
+    }
+
+    let authority = narf_filesystem::bootstrap_mount_authority();
+    let lower = Arc::new(MemFs::with_seeds(
+        "overlay-data-lower",
+        &[("base", b"lower")],
+    ));
+    let upper = Arc::new(MemFs::new("overlay-data-upper"));
+    let work = Arc::new(MemFs::new("overlay-data-work"));
+    if narf_filesystem::registry()
+        .mount_arc(&authority, LOWER, lower.clone())
+        .is_err()
+        || narf_filesystem::registry()
+            .mount_arc(&authority, UPPER, upper.clone())
+            .is_err()
+        || narf_filesystem::registry()
+            .mount_arc(&authority, WORK, work)
+            .is_err()
+    {
+        return TestResult::Fail("could not mount overlay test layers");
+    }
+
+    let mut ctx = StubCtx {
+        args: mount_args_with_data(
+            b"overlay\0",
+            b"/overlay-data-target\0",
+            b"overlay\0",
+            0,
+            b"lowerdir=/overlay-data-lower,upperdir=/overlay-data-upper,workdir=/overlay-data-work\0",
+        ),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut ctx);
+    if !matches!(ctx.ret, Some(result) if result.value == 0) {
+        for path in [WORK, UPPER, LOWER] {
+            let _ = unmount_for_test(path);
+        }
+        return TestResult::Fail("overlay mount ignored or rejected Linux data argument");
+    }
+
+    let mounted = narf_filesystem::registry().fs_arc_at(TARGET);
+    let root = match mounted {
+        Some(fs) if fs.name() == "overlay" => fs.root(),
+        _ => return TestResult::Fail("overlay mount did not install an overlay instance"),
+    };
+    if root.lookup("base").is_none()
+        || !matches!(
+            crate::handlers::poll_blocking(root.create("local")),
+            Some(Ok(_))
+        )
+        || upper.root().lookup("local").is_none()
+        || lower.root().lookup("local").is_some()
+    {
+        return TestResult::Fail("mounted overlay did not merge/copy into upper");
+    }
+
+    for path in [TARGET, WORK, UPPER, LOWER] {
+        let _ = unmount_for_test(path);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/mount",
+    smoke_mount_overlay_uses_linux_data_argument
+);
+
 fn smoke_mount_ramfs_has_linux_identity() -> TestResult {
     let _kbuf = crate::handlers::kernel_buffers_guard();
     set_task(0x71_0b);

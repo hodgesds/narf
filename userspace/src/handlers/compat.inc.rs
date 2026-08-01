@@ -2715,6 +2715,40 @@ pub fn is_signal_pending(task_id: u64) -> bool {
     (pending & !mask) != 0
 }
 
+/// True when an unmasked pending signal can interrupt a blocking syscall.
+///
+/// A pending signal whose disposition is `SIG_IGN`, or whose default action
+/// is Ignore (notably `SIGCHLD`), is still visible through `sigpending(2)` but
+/// must not make `wait4(2)` return `EINTR`. Linux's signal wakeup path makes
+/// the same distinction between pending bits and a signal that requires an
+/// action. Keep `is_signal_pending` as the raw deliverability probe used by
+/// diagnostics and signal consumption; blocking waits use this filtered form.
+pub(crate) fn has_interrupting_signal(task_id: u64) -> bool {
+    let pending = {
+        let g = SIGNAL_PENDING.lock();
+        g.as_ref()
+            .and_then(|m| m.get(&task_id).copied())
+            .unwrap_or(0)
+    };
+    let mut deliverable = pending & !signal_mask_of(task_id);
+    while deliverable != 0 {
+        let signum = sig_from_bit(deliverable);
+        deliverable &= !sig_bit(signum);
+        let ignored = match sigaction_lookup_full(task_id, signum as usize) {
+            Some(action) if action.handler == 1 => true, // SIG_IGN
+            Some(action) if action.handler == 0 => {
+                default_signal_action(signum) == DefaultAction::Ignore
+            }
+            Some(_) => false,
+            None => default_signal_action(signum) == DefaultAction::Ignore,
+        };
+        if !ignored {
+            return true;
+        }
+    }
+    false
+}
+
 static SIGNAL_MASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 

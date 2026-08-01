@@ -190,9 +190,19 @@ int main(int argc, char **argv) {
 
         for (uint32_t slot = 0; slot < CHILDREN; slot++) {
             int status = 0;
-            if (waitpid(pids[slot], &status, 0) != pids[slot] ||
+            errno = 0;
+            pid_t waited = waitpid(pids[slot], &status, 0);
+            if (waited != pids[slot] ||
                 !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                fail("fork-exec-burst-fail: child exit\n");
+                char detail[160];
+                int len = snprintf(detail, sizeof(detail),
+                                   "fork-exec-burst-fail: child exit "
+                                   "round=%u slot=%u pid=%d waited=%d "
+                                   "status=0x%x errno=%d\n",
+                                   round, slot, (int)pids[slot], (int)waited,
+                                   status, errno);
+                if (len > 0)
+                    (void)!write(STDOUT_FILENO, detail, (size_t)len);
                 return 1;
             }
         }

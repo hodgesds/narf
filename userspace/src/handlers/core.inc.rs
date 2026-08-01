@@ -2335,7 +2335,8 @@ fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
 
 /// Map an `FsError` from `DirOps::rename` to the Linux errno userspace
 /// expects. `NotFound` → ENOENT (source is gone), `Busy` → EEXIST,
-/// `InvalidPath` → EINVAL, `ReadOnly` → EROFS, everything else → EPERM.
+/// `InvalidPath` → EINVAL, `CrossDevice` → EXDEV, `ReadOnly` → EROFS,
+/// everything else → EPERM.
 /// Never a bare -1 → systemd renames propagation dirs during mount
 /// teardown and a spurious EPERM there aborts the whole unit.
 fn rename_errno(e: narf_filesystem::FsError) -> u64 {
@@ -2344,6 +2345,7 @@ fn rename_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::NotFound => -2,     // -ENOENT
         FsError::Busy => -17,        // -EEXIST
         FsError::InvalidPath => -22, // -EINVAL
+        FsError::CrossDevice => -18, // -EXDEV
         FsError::ReadOnly => -30,    // -EROFS
         _ => -1,
     };
@@ -6368,7 +6370,7 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
         // syscall-return path (the caller returns straight after this) runs
         // the signal-delivery hook, so the handler executes and the syscall
         // returns -EINTR; musl's waitpid loop then re-issues the wait.
-        if is_signal_pending(parent) {
+        if has_interrupting_signal(parent) {
             crate::user_task::drop_wait_child_waker(parent);
             // Abandoning the wait — drop the staged rusage pointer so a
             // later wait4/pause can't consume a stale one.

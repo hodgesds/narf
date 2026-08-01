@@ -123,7 +123,7 @@ pub use memfs::{
 };
 #[cfg(feature = "linux-compat")]
 pub use mqueuefs::{MqueueAttr, MqueueError, MqueueFs, MqueueNotification, MqueueOpenOptions};
-pub use overlayfs::{OverlayFs, WHITEOUT_PREFIX};
+pub use overlayfs::{OverlayFs, OPAQUE_MARKER, WHITEOUT_PREFIX};
 pub use page_cache::{CachePage, Page, PageCache, PageKey, PAGE_SIZE};
 #[cfg(feature = "linux-compat")]
 pub use sysfs::{
@@ -356,6 +356,8 @@ pub enum FsError {
     PermissionDenied,
     Io(BlockError),
     InvalidPath,
+    /// Operation would cross a filesystem/overlay boundary. Maps to EXDEV.
+    CrossDevice,
     Busy,
     ReadOnly,
     NoSpace,
