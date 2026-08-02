@@ -284,6 +284,10 @@ impl<T: ?Sized> IrqSafeSpinLock<T> {
         // (~µs) is far under a shootdown sender's ack cap, so the peer never
         // stalls, while uncontended locks (no inner spin) pay nothing.
         let mut spins: u32 = 0;
+        // Whether this acquire published a contended-lock marker while spinning
+        // (see below). Uncontended acquires never do, so they can skip the
+        // marker clear — and, crucially, the `current_cpu()` read it needs.
+        let mut marked = false;
         while self
             .inner
             .locked
@@ -297,14 +301,24 @@ impl<T: ?Sized> IrqSafeSpinLock<T> {
                     let cpu = crate::percpu::current_cpu();
                     if let Some(slot) = CONTENDED_IRQ_LOCK.get(cpu) {
                         slot.store(self as *const Self as *const () as usize, Ordering::Release);
+                        marked = true;
                     }
                     run_lock_spin_hook();
                 }
             }
         }
-        let cpu = crate::percpu::current_cpu();
-        if let Some(slot) = CONTENDED_IRQ_LOCK.get(cpu) {
-            slot.store(0, Ordering::Release);
+        // Only clear the per-CPU contended marker — and pay the `current_cpu()`
+        // read it requires (RDTSCP on x86_64) — if this acquire actually set it
+        // while spinning. The common uncontended acquire never spun, so it
+        // publishes nothing and skips the read entirely. IRQs are masked for the
+        // whole of `lock()`, so the CPU cannot change between marking and
+        // clearing. An unconditional read here dominated the profile of
+        // allocation-heavy workloads, where nearly every lock is uncontended.
+        if marked {
+            let cpu = crate::percpu::current_cpu();
+            if let Some(slot) = CONTENDED_IRQ_LOCK.get(cpu) {
+                slot.store(0, Ordering::Release);
+            }
         }
         IrqSafeSpinLockGuard {
             lock: &self.inner,
