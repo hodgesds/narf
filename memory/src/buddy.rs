@@ -628,26 +628,6 @@ impl BuddyZone {
         debug_assert!(order <= MAX_ORDER);
         debug_assert_eq!(frame & (order_frames(order) - 1), 0);
         self.note_free(frame, order);
-        // Defensive double-free guard: scan every free list and
-        // bail out if `frame` overlaps an existing block. This is
-        // a safety net — the in-tree AS-drop path no longer
-        // creates duplicates post-fix (see `unmap_region_pages` +
-        // `free_user_pml4_tree`), but defence-in-depth keeps the
-        // buddy honest against future regressions or out-of-tree
-        // consumers calling `free` with a stale phys. Leaks the
-        // frame rather than corrupting the free list.
-        let block_lo = frame;
-        let block_hi = frame + order_frames(order);
-        for (o, list) in self.free_lists.iter().enumerate() {
-            let blk = order_frames(o as u8);
-            for &f in list.iter() {
-                let lo = f;
-                let hi = f + blk;
-                if lo < block_hi && block_lo < hi {
-                    return;
-                }
-            }
-        }
         self.free_frames += order_frames(order) as usize;
         let mut cur_order = order;
         let mut cur_frame = frame;
