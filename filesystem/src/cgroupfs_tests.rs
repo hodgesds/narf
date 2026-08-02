@@ -1128,6 +1128,70 @@ fn smoke_cgroup_charge_reentrancy_guard() -> TestResult {
 #[cfg(feature = "cgroup-memory")]
 kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_charge_reentrancy_guard);
 
+// A membership BTreeMap insertion/removal may allocate while TASK_CGROUP is
+// locked. The allocator's charge hook must bypass cgroup bookkeeping memory;
+// otherwise it calls cgroup_of(), recursively takes TASK_CGROUP with IRQs
+// disabled, and wedges every CPU. Drive the hook through the exact mutation
+// helper and verify both that it returns and that it does not alter accounting.
+#[cfg(feature = "cgroup-memory")]
+fn smoke_cgroup_membership_charge_reentry() -> TestResult {
+    use crate::cgroupfs::memory;
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+    with_root_controller("memory", "t_mem_membership_reentry", |cg| {
+        let pid: u64 = 4_200_000_101;
+        if attach_pid(cg, pid).is_err() {
+            return TestResult::Fail("attach pid failed");
+        }
+        let before = read_current(cg);
+        let allowed = crate::cgroupfs::membership_charge_reentry_for_test(pid, 4096);
+        let after = read_current(cg);
+        task_exited(pid);
+        if !allowed {
+            return TestResult::Fail("membership metadata charge was denied");
+        }
+        if after != before {
+            return TestResult::Fail("membership metadata was charged to task");
+        }
+        TestResult::Pass
+    })
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_membership_charge_reentry
+);
+
+// Controller callbacks and map growth have the same allocator recursion
+// shape as TASK_CGROUP: charging walks ctrl_state, so the map's own metadata
+// must be uncharged while the lock is held.
+#[cfg(feature = "cgroup-memory")]
+fn smoke_cgroup_ctrl_state_charge_reentry() -> TestResult {
+    use crate::cgroupfs::memory;
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+    with_root_controller("memory", "t_mem_ctrl_state_reentry", |cg| {
+        let pid: u64 = 4_200_000_102;
+        if attach_pid(cg, pid).is_err() {
+            return TestResult::Fail("attach pid failed");
+        }
+        let before = read_current(cg);
+        let allowed = crate::cgroupfs::ctrl_state_charge_reentry_for_test(pid, 4096);
+        let after = read_current(cg);
+        task_exited(pid);
+        if !allowed {
+            return TestResult::Fail("controller metadata charge was denied");
+        }
+        if after != before {
+            return TestResult::Fail("controller metadata was charged to task");
+        }
+        TestResult::Pass
+    })
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_ctrl_state_charge_reentry
+);
+
 // ── memory.max two-phase enforcement ────────────────────────────────
 //
 // A positive charge that would push a level over `memory.max` is denied

@@ -49,7 +49,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -79,19 +79,56 @@ const FILES: &[&str] = &[
 /// first time any `memory` cgroup state is created (`new_state`), so no
 /// external boot wiring is required.
 static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
-static IN_CHARGE: AtomicBool = AtomicBool::new(false);
+
+// Charge-hook recursion is local to the CPU executing the allocator. A
+// process on another CPU must still be accounted while this CPU is walking
+// its cgroup chain. The old single AtomicBool made every concurrent charge a
+// false "recursive" entry and silently let it through unaccounted.
+static IN_CHARGE: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+// Cgroup membership bookkeeping is kernel metadata, and mutating its
+// BTreeMap can itself allocate or free a slab page. The allocator charge hook
+// resolves membership through that same map, so charging while its lock is
+// held would recursively acquire the lock with IRQs disabled. This per-CPU
+// nesting count lets the narrow mutation helper in the parent module suppress
+// only those metadata charges. Its guard is entered after the IRQ-safe map
+// lock is acquired, so the CPU cannot migrate before it is dropped.
+static BYPASS_CHARGE: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+pub(super) struct ChargeBypassGuard {
+    cpu: usize,
+}
+
+impl Drop for ChargeBypassGuard {
+    fn drop(&mut self) {
+        let previous = BYPASS_CHARGE[self.cpu].fetch_sub(1, Ordering::Release);
+        debug_assert!(previous != 0, "unbalanced cgroup charge bypass");
+    }
+}
+
+pub(super) fn bypass_charge() -> ChargeBypassGuard {
+    let cpu = narf_lib::percpu::current_cpu();
+    BYPASS_CHARGE[cpu].fetch_add(1, Ordering::AcqRel);
+    ChargeBypassGuard { cpu }
+}
 
 fn charge_hook(pid: u64, delta_bytes: i64) -> bool {
-    if IN_CHARGE.swap(true, Ordering::AcqRel) {
+    let cpu = narf_lib::percpu::current_cpu();
+    if BYPASS_CHARGE[cpu].load(Ordering::Acquire) != 0 {
         return true;
     }
-    struct Guard;
+    if IN_CHARGE[cpu].swap(true, Ordering::AcqRel) {
+        return true;
+    }
+    struct Guard(usize);
     impl Drop for Guard {
         fn drop(&mut self) {
-            IN_CHARGE.store(false, Ordering::Release);
+            IN_CHARGE[self.0].store(false, Ordering::Release);
         }
     }
-    let _guard = Guard;
+    let _guard = Guard(cpu);
 
     // Collect the chain's `MemoryState`s once (clone the `Arc`s so we
     // can iterate them twice without holding the chain lock across the
@@ -147,7 +184,7 @@ pub fn charge_hook_for_test(pid: u64, delta_bytes: i64) -> bool {
 /// entry deterministically.
 #[doc(hidden)]
 pub fn in_charge_for_test() -> bool {
-    IN_CHARGE.load(Ordering::Acquire)
+    IN_CHARGE[narf_lib::percpu::current_cpu()].load(Ordering::Acquire)
 }
 
 /// Test-only seam: raise/lower the re-entrancy guard so a test can
@@ -155,7 +192,7 @@ pub fn in_charge_for_test() -> bool {
 /// the charge path itself allocates). Returns the previous value.
 #[doc(hidden)]
 pub fn set_in_charge_for_test(v: bool) -> bool {
-    IN_CHARGE.swap(v, Ordering::AcqRel)
+    IN_CHARGE[narf_lib::percpu::current_cpu()].swap(v, Ordering::AcqRel)
 }
 
 /// Install the allocator charge plumbing exactly once.
