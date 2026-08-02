@@ -997,6 +997,7 @@ mod tests {
         let mut call = TestCtx {
             args: SyscallArgs {
                 arg0: base,
+                arg1: PAGES as u64 * 4096,
                 ..SyscallArgs::default()
             },
             ret: None,

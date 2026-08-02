@@ -4367,7 +4367,7 @@ pub fn release_external_shared_frame(phys: u64) {
 // without `firmware-allow-unsigned` reject anything that isn't
 // signed by a trusted firmware signer).
 
-// ── Munmap — arg0=base ─────────────────────────────────────────────
+// ── Munmap — arg0=base, arg1=len ───────────────────────────────────
 
 // ── Batch 18: address-space-wide locking, secret memory, NUMA ────────
 

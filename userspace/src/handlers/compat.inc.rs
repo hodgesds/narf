@@ -6410,13 +6410,27 @@ pub fn abi_file_op_bridge(
             value: 0,
         };
     }
+    // The stable v1 ring operation is base-only and predates Linux-range
+    // munmap support. Preserve that ABI here instead of teaching raw syscall
+    // 11 to accept `len == 0` (Linux requires EINVAL for that call).
+    if kind == narf_abi::FileOpKind::Munmap {
+        let status = current_address_space()
+            .ok_or(())
+            .and_then(|as_ref| {
+                handler_sys_munmap::munmap_native_v1(&as_ref, args.a0)
+            })
+            .map(|()| 0)
+            .unwrap_or(1);
+        return narf_abi::FileOpReturn { status, value: 0 };
+    }
     let num: u32 = match kind {
         narf_abi::FileOpKind::Open => Syscall::OpenFile.raw(),
         narf_abi::FileOpKind::Read => Syscall::Read.raw(),
         narf_abi::FileOpKind::Write => Syscall::Write.raw(),
         narf_abi::FileOpKind::Close => Syscall::Close.raw(),
         narf_abi::FileOpKind::Mmap => Syscall::Mmap.raw(),
-        narf_abi::FileOpKind::Munmap => Syscall::Munmap.raw(),
+        // Returned by the native-v1 compatibility arm above.
+        narf_abi::FileOpKind::Munmap => unreachable!(),
     };
     let sargs = crate::SyscallArgs {
         arg0: args.a0,

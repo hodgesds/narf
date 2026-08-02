@@ -48,6 +48,14 @@ internal four-argument callers emit generic `epoll_pwait` number 22, whose
 zero-sigmask behavior shares the same handler; reverse lookup canonically
 returns `EpollPwait`.
 
+Linux `munmap(addr, len)` rejects an unaligned address or zero length and
+rounds a non-page-multiple length upward. It removes only the overlapping
+range, splitting VMAs as needed so a surviving prefix or suffix retains its
+backing, permissions, and file-mapping lifetime reference. This does not alter
+the v1 native `OpCode::Munmap` contract: that base-only ring operation still
+removes the whole VMA beginning at `inline[0]` through its compatibility
+bridge; changing it requires the ABI versioning process in `abi/` §4.
+
 The Linux-compatibility syscall surface includes stored `prctl(2)` process
 state required by service managers and brokers. Capability-shaped controls
 such as `PR_SET_KEEPCAPS` round-trip according to the Linux ABI but do not mint
