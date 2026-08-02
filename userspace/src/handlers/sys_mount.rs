@@ -520,11 +520,8 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // block-device name. Strip a leading "/dev/" so callers can
     // pass either form.
     let dev_name = source.strip_prefix("/dev/").unwrap_or(source.as_str());
-    let entry = match narf_block::block_devices()
-        .into_iter()
-        .find(|e| e.name == dev_name)
-    {
-        Some(e) => e,
+    let dev = match narf_block::find_block_device(dev_name) {
+        Some(dev) => dev,
         None => {
             // No backend, no register_fstype builder, and no such device: a
             // known block fstype with a missing device is ENOENT; a genuinely
@@ -540,7 +537,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
 
     let result = match fstype.as_str() {
         "fat" | "vfat" | "fat16" | "fat32" => {
-            let dev = narf_block::SyncBlock::new(entry.dev.clone());
+            let dev = narf_block::SyncBlock::new(dev.clone());
             let fut = narf_drivers_fs_fat::mount_fat(&auth, target.as_str(), dev, domain);
             poll_blocking(fut)
         }

@@ -116,6 +116,20 @@ device via `BlockSchedulerPolicy` if a specific workload demands it.
 - Consumers don't see queue multiplicity; they submit against the
   device, `block/` picks the queue (CPU-local preferred).
 
+### 3.5 Registry lookup
+
+```rust
+pub fn find_block_device(name: &str) -> Option<Arc<dyn BlockDeviceSync>>;
+pub fn find_block_device_indexed(
+    name: &str,
+) -> Option<(usize, Arc<dyn BlockDeviceSync>)>;
+```
+
+Targeted lookups clone only the matched device `Arc`; they do not allocate an
+owned registry snapshot. The indexed form captures the registration-order index
+and device under the same registry lock so `devfs` can derive a coherent Linux
+minor number across concurrent hot-unplug.
+
 ## 4. Invariants & safety properties
 
 - No byte of I/O data ever lives in `block/` address space; all

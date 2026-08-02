@@ -67,9 +67,6 @@ fn squashfs_fstype_builder(source: &str, options: &str) -> Result<Arc<dyn FsInst
         }
     }
     let name = source.strip_prefix("/dev/").unwrap_or(source);
-    let entry = narf_block::block_devices()
-        .into_iter()
-        .find(|entry| entry.name == name)
-        .ok_or(FsError::NotFound)?;
-    squashfs_factory(entry.dev)
+    let dev = narf_block::find_block_device(name).ok_or(FsError::NotFound)?;
+    squashfs_factory(dev)
 }
