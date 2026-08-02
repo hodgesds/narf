@@ -23,8 +23,16 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
     // resolve_cwd_path_user).
     let user_abs = resolve_cwd_path_user(task, &path);
     let abs = resolve_cwd_path(task, &path);
+    // Linux chdir(2) follows the final symlink.  The directory walker below
+    // deliberately accepts directories only, so expand links first instead
+    // of rejecting a valid link-to-directory (Fedora's
+    // /usr/share/X11/xkb -> ../xkeyboard-config-2 is one such path).
+    let Some(resolved) = resolve_vfs_symlink_path(&abs, true) else {
+        ctx.set_return(fail);
+        return;
+    };
     // Reject cd into a path that isn't a directory (ENOENT/ENOTDIR).
-    if resolve_dir_absolute(&abs).is_none() {
+    if resolve_dir_absolute(&resolved).is_none() {
         ctx.set_return(fail);
         return;
     }

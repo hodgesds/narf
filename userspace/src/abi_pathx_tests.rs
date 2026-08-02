@@ -895,6 +895,33 @@ fn smoke_abi_pathx_symlinkat_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_symlinkat_neg);
 
+// chdir(2) follows its final symlink.  Fedora's XKB data uses exactly this
+// layout (`/usr/share/X11/xkb -> ../xkeyboard-config-2`), so rejecting the
+// link prevents Xwayland from loading any keyboard map during Plasma boot.
+fn smoke_abi_pathx_chdir_follows_directory_symlink() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let target_dir = b"/p2/xkeyboard-config-2\0";
+        if call_mkdir(target_dir.as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir for chdir symlink target failed");
+        }
+
+        let target = b"xkeyboard-config-2\0";
+        let link = b"/p2/xkb\0";
+        if call_symlink(target.as_ptr() as u64, link.as_ptr() as u64) != Some(0) {
+            return Err("directory symlink creation failed");
+        }
+
+        match call(Syscall::Chdir.raw(), a0(link.as_ptr() as u64)) {
+            Some(0) => Ok(()),
+            _ => Err("chdir must follow a symlink to a directory"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_chdir_follows_directory_symlink
+);
+
 // ── unlinkat (dirfd, NUL-term path, flags) → 0 / -1 ────────────────
 //
 // flags=0 → unlink; AT_REMOVEDIR (0x200) → rmdir.
