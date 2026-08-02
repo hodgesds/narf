@@ -109,6 +109,12 @@ pub struct UserTaskCtx {
     /// activity into a tight epoll/poll return loop. A real missed
     /// source wake is recovered by the bounded I/O backstop timer.
     pub epoll_park_gen: AtomicU64,
+    /// epoll fd currently entering the park handshake, encoded as fd+1 (zero
+    /// means this I/O wait is not epoll). After registering the task waker,
+    /// the park path passively re-scans this instance before switching out.
+    /// That closes the level-triggered scan→register race without treating
+    /// unrelated changes to the global readiness generation as our event.
+    pub epoll_wait_fd: AtomicU64,
     /// Futex word address this task is blocked on (`FUTEX_WAIT`), or 0 when
     /// not futex-waiting. Set by `sys_futex` before it yields; the poll
     /// routine registers `cx.waker()` in the per-uaddr futex wait queue so a
@@ -325,6 +331,7 @@ impl UserTaskCtx {
             sleep_deadline_ns: AtomicU64::new(0),
             net_io_wait: AtomicBool::new(false),
             epoll_park_gen: AtomicU64::new(0),
+            epoll_wait_fd: AtomicU64::new(0),
             futex_uaddr: AtomicU64::new(0),
             futex_namespace: AtomicU64::new(0),
             futex_park_gen: AtomicU64::new(0),
@@ -642,6 +649,19 @@ fn park_should_block(
                     uc,
                     narf_net::readiness::generation(),
                 );
+                let encoded_epfd = uc.epoll_wait_fd.load(Ordering::Acquire);
+                if encoded_epfd != 0
+                    && crate::epoll::epoll_fd_has_ready(task_id, (encoded_epfd - 1) as u32)
+                {
+                    // Ready after the first userspace-facing scan but before
+                    // waiter registration. The waiter is now installed, so a
+                    // later transition is covered; do one immediate
+                    // re-execution for the already-level-ready event instead
+                    // of relying on the timer-wheel backstop.
+                    crate::handlers::drop_io_waiter(task_id);
+                    uc.sleep_deadline_ns.store(0, Ordering::Release);
+                    return false;
+                }
             }
             // FUTEX_WAIT: register on the per-uaddr queue + lost-wake guard.
             //
@@ -1657,6 +1677,18 @@ impl core::future::Future for UserTaskFuture {
                         &this.task.uctx,
                         narf_net::readiness::generation(),
                     );
+                    let encoded_epfd = this.task.uctx.epoll_wait_fd.load(Ordering::Acquire);
+                    if encoded_epfd != 0
+                        && crate::epoll::epoll_fd_has_ready(
+                            crate::handlers::current_task_id(),
+                            (encoded_epfd - 1) as u32,
+                        )
+                    {
+                        crate::handlers::drop_io_waiter(crate::handlers::current_task_id());
+                        this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                        cx.waker().wake_by_ref();
+                        return core::task::Poll::Pending;
+                    }
                 }
                 // FUTEX_WAIT: `sys_futex` published the futex word here.
                 // Register our waker on the per-uaddr wait queue so a

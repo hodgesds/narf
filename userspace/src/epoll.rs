@@ -468,6 +468,13 @@ fn epoll_ops(task: u64, epfd: u32) -> Option<Arc<dyn FileOps>> {
     fd::with_table(task, |t| t.get(epfd).map(|e| e.ops.clone())).flatten()
 }
 
+/// Passive post-registration readiness probe for the epoll park handshake.
+/// `FileOps::poll_readiness` mirrors what `collect_ready` would deliver but
+/// does not acknowledge sources, consume EPOLLET tokens, or disarm oneshots.
+pub(crate) fn epoll_fd_has_ready(task: u64, epfd: u32) -> bool {
+    epoll_ops(task, epfd).is_some_and(|ops| ops.poll_readiness() & narf_filesystem::POLL_IN != 0)
+}
+
 /// View an fd's ops as an `EpollInstance`, if it is one.
 fn as_epoll(ops: &Arc<dyn FileOps>) -> Option<&EpollInstance> {
     ops.as_any()?.downcast_ref::<EpollInstance>()
@@ -856,6 +863,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
         // live for this trap; both are atomic fields.
         unsafe {
             (*uctx_ptr).net_io_wait.store(false, Ordering::Release);
+            (*uctx_ptr).epoll_wait_fd.store(0, Ordering::Release);
             // Snapshot the net readiness generation BEFORE the
             // readiness check below, so the poll routine can detect a
             // notify that races our check→park window.
@@ -1015,6 +1023,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                             // wakeups (immediate re-poll on TCP data instead
                             // of waiting out the deadline).
                             uc.net_io_wait.store(true, Ordering::Release);
+                            uc.epoll_wait_fd.store((epfd as u64) + 1, Ordering::Release);
                             // Clamp the scheduler wake-up to the nearest armed
                             // timerfd in the interest set. A timerfd expiry does
                             // NOT fire a readiness notify (unlike socket data), so

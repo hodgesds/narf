@@ -1936,6 +1936,66 @@ fn smoke_epoll_shared_fd_table_cross_thread_wait() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_epoll_shared_fd_table_cross_thread_wait);
 
+/// The post-waiter-registration epoll probe closes the scan→register race,
+/// but it must be passive: probing an EPOLLET|EPOLLONESHOT item cannot consume
+/// its token or disarm it before the re-executed epoll_wait delivers it.
+fn smoke_epoll_post_registration_probe_is_passive() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+
+    let r = call(Syscall::EpollCreate, SyscallArgs::default());
+    if r.status != SyscallReturn::OK {
+        return TestResult::Fail("epoll_create1 failed");
+    }
+    let epfd = r.value as u32;
+    let watched = install_ready_file(task, narf_filesystem::POLL_IN);
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(
+        &(crate::epoll::EPOLLIN | crate::epoll::EPOLLET | crate::epoll::EPOLLONESHOT).to_ne_bytes(),
+    );
+    ev[4..12].copy_from_slice(&0x51A1_u64.to_ne_bytes());
+    let r = call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: watched as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if r.value != 0 {
+        return TestResult::Fail("epoll_ctl ADD failed");
+    }
+
+    if !crate::epoll::epoll_fd_has_ready(task, epfd)
+        || !crate::epoll::epoll_fd_has_ready(task, epfd)
+    {
+        return TestResult::Fail("passive post-registration probe missed ready epoll fd");
+    }
+
+    let mut out_ev = [0u8; 12];
+    let r = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out_ev.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 1 {
+        return TestResult::Fail("probe consumed the event before epoll_wait");
+    }
+    if crate::epoll::epoll_fd_has_ready(task, epfd) {
+        return TestResult::Fail("probe reported a disarmed oneshot as ready");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_post_registration_probe_is_passive);
+
 /// dup'd epfd aliases the same instance: ctl through the dup, wait
 /// through the original.
 fn smoke_epoll_dup_fd_aliases_same_instance() -> TestResult {
