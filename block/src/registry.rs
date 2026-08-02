@@ -132,11 +132,23 @@ pub fn block_device_count() -> usize {
 
 /// Look up a device by name.
 pub fn find_block_device(name: &str) -> Option<Arc<dyn BlockDeviceSync>> {
+    find_block_device_indexed(name).map(|(_, dev)| dev)
+}
+
+/// Look up a device by name together with its registration-order index.
+///
+/// The index is the Linux block-device minor used by `devfs`. Both values are
+/// captured under one registry lock, so a concurrent hot-unplug cannot pair a
+/// device with an index from a different registry state. Unlike
+/// [`block_devices`], this targeted lookup does not allocate or clone an owned
+/// registry snapshot; it clones only the matched device's [`Arc`].
+pub fn find_block_device_indexed(name: &str) -> Option<(usize, Arc<dyn BlockDeviceSync>)> {
     REGISTRY
         .lock()
         .iter()
-        .find(|e| e.name == name)
-        .map(|e| e.dev.clone())
+        .enumerate()
+        .find(|(_, entry)| entry.name == name)
+        .map(|(index, entry)| (index, entry.dev.clone()))
 }
 
 /// Unregister a block device by name.  No-op if the name is not

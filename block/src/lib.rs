@@ -55,8 +55,9 @@ pub use noop::NoopScheduler;
 #[cfg(feature = "cgroup")]
 pub use cgroup::{dev_id_from_ptr, install_cgroup_io_hook, IoCgroupHook};
 pub use registry::{
-    block_device_count, block_devices, find_block_device, register_block_device,
-    unregister_block_device, BlockDeviceSync, BlockIoError, RegisteredBlockDevice, SyncBlock,
+    block_device_count, block_devices, find_block_device, find_block_device_indexed,
+    register_block_device, unregister_block_device, BlockDeviceSync, BlockIoError,
+    RegisteredBlockDevice, SyncBlock,
 };
 
 use core::future::Future;

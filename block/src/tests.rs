@@ -820,8 +820,8 @@ fn smoke_block_registry_register_find_round_trip() -> TestResult {
     // Re-register with the same name replaces in place (no double-
     // count).
     use crate::registry::{
-        block_device_count, find_block_device, register_block_device, BlockDeviceSync,
-        BlockIoError, __reset_for_test, __restore_for_test, __snapshot_for_test,
+        block_device_count, find_block_device, find_block_device_indexed, register_block_device,
+        BlockDeviceSync, BlockIoError, __reset_for_test, __restore_for_test, __snapshot_for_test,
     };
     use alloc::sync::Arc;
 
@@ -863,6 +863,21 @@ fn smoke_block_registry_register_find_round_trip() -> TestResult {
     if find_block_device("nonexistent").is_some() {
         __restore_for_test(saved);
         return TestResult::Fail("find returned Some for missing device");
+    }
+    match find_block_device_indexed("smoke-stub-b") {
+        Some((1, _)) => {}
+        Some(_) => {
+            __restore_for_test(saved);
+            return TestResult::Fail("indexed find returned wrong registration index");
+        }
+        None => {
+            __restore_for_test(saved);
+            return TestResult::Fail("indexed find missed registered device");
+        }
+    }
+    if find_block_device_indexed("nonexistent").is_some() {
+        __restore_for_test(saved);
+        return TestResult::Fail("indexed find returned Some for missing device");
     }
     // Re-register same name → replaces in place; count stays 2.
     register_block_device("smoke-stub-a", Arc::new(Stub));

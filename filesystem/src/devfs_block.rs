@@ -270,15 +270,11 @@ impl FileOps for BlockFile {
 ///
 /// Called from `DevDir::lookup` after the static table misses.
 pub fn lookup_block_file(name: &str) -> Option<Arc<dyn FileOps>> {
-    narf_block::block_devices()
-        .into_iter()
-        .enumerate()
-        .find(|(_, registered)| registered.name == name)
-        .map(|(minor, registered)| {
-            let mut file = BlockFile::from_dev(registered.dev);
-            file.rdev = crate::devfs::linux_makedev(259, minor as u32);
-            Arc::new(file) as Arc<dyn FileOps>
-        })
+    narf_block::find_block_device_indexed(name).map(|(minor, dev)| {
+        let mut file = BlockFile::from_dev(dev);
+        file.rdev = crate::devfs::linux_makedev(259, minor as u32);
+        Arc::new(file) as Arc<dyn FileOps>
+    })
 }
 
 /// All registered block devices as `(name, FileType::Block)` pairs.
