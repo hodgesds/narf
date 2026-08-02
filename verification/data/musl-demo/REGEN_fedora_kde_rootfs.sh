@@ -124,7 +124,9 @@ chown -R 1000:1000 "$WORK/root/home/narf"
 # bus, gives it a private user-owned runtime directory, and starts Plasma
 # through a fresh session bus. logind is intentionally not a requirement:
 # Plasma can run without it, and a login-manager compatibility failure must
-# not suppress the graphical compositor.
+# not suppress the graphical compositor. Type=simple also avoids making the
+# session's lifetime depend on systemd's exec-notification handshake while the
+# Linux-compat process startup path is still slower than native Linux.
 printf '%s\n' \
   '[Unit]' \
   'Description=NARF Plasma Wayland Session' \
@@ -132,7 +134,7 @@ printf '%s\n' \
   'After=dbus-broker.service' \
   '' \
   '[Service]' \
-  'Type=exec' \
+  'Type=simple' \
   'User=narf' \
   'Environment=HOME=/home/narf' \
   'Environment=XDG_RUNTIME_DIR=/run/narf-plasma' \
@@ -146,15 +148,44 @@ printf '%s\n' \
   'RuntimeDirectory=narf-plasma' \
   'RuntimeDirectoryMode=0700' \
   'ExecStart=/usr/bin/dbus-run-session -- /usr/bin/startplasma-wayland' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
   'Restart=on-failure' \
   'RestartSec=3s' \
-  'TimeoutStartSec=180s' \
   '' \
   '[Install]' \
   'WantedBy=graphical.target' \
   > "$WORK/root/etc/systemd/system/narf-plasma.service"
 ln -sfn ../narf-plasma.service \
   "$WORK/root/etc/systemd/system/graphical.target.wants/narf-plasma.service"
+
+# Do not confuse Type=simple's successful fork with a working desktop. This
+# oneshot is ordered after the session service and keeps the graphical target
+# pending until both the compositor and shell have remained alive long enough
+# to be observed twice. Its console heartbeats also expose the last surviving
+# process when startup stalls.
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-plasma-probe.sh" \
+  "$WORK/root/usr/local/libexec/narf-plasma-probe"
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Verify NARF Plasma processes' \
+  'Requires=narf-plasma.service' \
+  'After=narf-plasma.service' \
+  '' \
+  '[Service]' \
+  'Type=oneshot' \
+  'User=narf' \
+  'ExecStart=/usr/local/libexec/narf-plasma-probe' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
+  'TimeoutStartSec=7min' \
+  '' \
+  '[Install]' \
+  'WantedBy=graphical.target' \
+  > "$WORK/root/etc/systemd/system/narf-plasma-probe.service"
+ln -sfn ../narf-plasma-probe.service \
+  "$WORK/root/etc/systemd/system/graphical.target.wants/narf-plasma-probe.service"
 
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-systemd-start.sh" \
