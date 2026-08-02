@@ -116,7 +116,9 @@ query to consume an event owned by its inner monitor.
 `open_instance` defaults to `None`. Clone devices return a fresh open-file
 object so lookup/stat and `O_PATH` remain side-effect free; the Linux open path
 calls it only after access checks. `/dev/pts/ptmx` returns a fresh PTY master
-and `/dev/fuse` returns a fresh FUSE daemon connection.
+and `/dev/fuse` returns a fresh FUSE daemon connection. The stable `/dev/fuse`
+clone node is mode 0666 so unprivileged filesystem and desktop-portal daemons
+can open it, matching Linux distribution tmpfiles/udev policy.
 
 `DevFs` identifies itself as `devtmpfs`. Character and block nodes remain
 distinct through VFS stat and readdir translation, carry Linux `st_rdev`

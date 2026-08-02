@@ -483,7 +483,11 @@ impl FileOps for DevFuseNode {
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                perms: 0o600,
+                // Linux distributions expose the FUSE clone device to
+                // unprivileged filesystem daemons. Fedora reinforces this
+                // with tmpfiles/udev rules, but the synthetic path must have
+                // the correct mode before those best-effort updates run.
+                perms: 0o666,
             },
             mtime_cycles: 0,
         }
@@ -2364,7 +2368,7 @@ fn smoke_dev_static_linux_metadata() -> TestResult {
         ("console", linux_makedev(5, 1), 0o600),
         ("tty", linux_makedev(5, 0), 0o666),
         ("uinput", linux_makedev(10, 223), 0o660),
-        ("fuse", linux_makedev(10, 229), 0o600),
+        ("fuse", linux_makedev(10, 229), 0o666),
     ];
     for (name, rdev, perms) in expected {
         let node = match dir.lookup(name) {
