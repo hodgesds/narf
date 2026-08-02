@@ -602,11 +602,22 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 inode: 0,
                 page_off: first_block / blocks_per_page as u64,
             };
+            // Most desktop startup reads are shared-library pages that have
+            // already been populated by another process. Do not queue those
+            // hits behind an unrelated device miss: PageCache::lookup clones
+            // the page Arc under its own lock, so reclaim cannot invalidate
+            // the data after this returns.
+            if let Some(page) = self.page_cache.lookup(key) {
+                dst.copy_from_slice(&page.data[in_page..in_page + bs]);
+                return Ok(());
+            }
             // Hold the fill lock across lookup→read→insert so parallel
-            // readers of the same block coalesce (first fills, rest hit).
+            // misses of the same block coalesce (first fills, rest hit).
             // The cache itself is an Arc reachable without this lock (so the
             // reclaimer can shrink it); its internal lock guards the map.
             let _fill = self.fill_lock.lock().await;
+            // Double-check after waiting: another reader may have filled this
+            // page between the lock-free fast-path lookup and this guard.
             if let Some(page) = self.page_cache.lookup(key) {
                 dst.copy_from_slice(&page.data[in_page..in_page + bs]);
                 return Ok(());
