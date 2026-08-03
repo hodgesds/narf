@@ -20,10 +20,23 @@ echo "PLASMA-CLASSIC-SUPERVISOR kded observed; launching ksmserver"
 ksm_pid=$!
 echo "PLASMA-CLASSIC-SUPERVISOR ksmserver pid=$ksm_pid"
 
-/usr/bin/plasma_waitforname --timeout 120 org.kde.ksmserver
+/usr/bin/plasma_waitforname --timeout 120 org.kde.ksmserver &
+ksm_wait_pid=$!
+completed_pid=
+wait -n -p completed_pid "$ksm_pid" "$ksm_wait_pid"
 status=$?
-if [ "$status" -ne 0 ]; then
-  echo "PLASMA-CLASSIC-SUPERVISOR ksm wait failed status=$status"
+
+if [ "$completed_pid" = "$ksm_pid" ]; then
+  echo "PLASMA-CLASSIC-SUPERVISOR ksmserver exited before name status=$status"
+  kill "$ksm_wait_pid" 2>/dev/null
+  wait "$ksm_wait_pid" 2>/dev/null
+  exit "$status"
+fi
+
+if [ "$completed_pid" != "$ksm_wait_pid" ] || [ "$status" -ne 0 ]; then
+  echo "PLASMA-CLASSIC-SUPERVISOR ksm wait failed pid=$completed_pid status=$status"
+  kill "$ksm_pid" 2>/dev/null
+  wait "$ksm_pid" 2>/dev/null
   exit "$status"
 fi
 
