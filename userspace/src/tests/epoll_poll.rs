@@ -953,7 +953,7 @@ fn smoke_epoll_epollet_unix_listener_drain_refill_before_wait() -> TestResult {
     if call(
         Syscall::SocketBind,
         SyscallArgs {
-            arg0: server as u64,
+            arg0: server,
             arg1: addr.as_ptr() as u64,
             arg2: addr_len,
             ..SyscallArgs::default()
@@ -964,7 +964,7 @@ fn smoke_epoll_epollet_unix_listener_drain_refill_before_wait() -> TestResult {
         || call(
             Syscall::SocketListen,
             SyscallArgs {
-                arg0: server as u64,
+                arg0: server,
                 arg1: 16,
                 ..SyscallArgs::default()
             },
@@ -984,7 +984,7 @@ fn smoke_epoll_epollet_unix_listener_drain_refill_before_wait() -> TestResult {
         SyscallArgs {
             arg0: epfd as u64,
             arg1: crate::epoll::EPOLL_CTL_ADD as u64,
-            arg2: server as u64,
+            arg2: server,
             arg3: event.as_ptr() as u64,
             ..SyscallArgs::default()
         },
@@ -1002,7 +1002,7 @@ fn smoke_epoll_epollet_unix_listener_drain_refill_before_wait() -> TestResult {
             || call(
                 Syscall::SocketConnect,
                 SyscallArgs {
-                    arg0: client as u64,
+                    arg0: client,
                     arg1: addr.as_ptr() as u64,
                     arg2: addr_len,
                     ..SyscallArgs::default()
@@ -1033,7 +1033,7 @@ fn smoke_epoll_epollet_unix_listener_drain_refill_before_wait() -> TestResult {
         let accepted = call(
             Syscall::SocketAccept,
             SyscallArgs {
-                arg0: server as u64,
+                arg0: server,
                 ..SyscallArgs::default()
             },
         );
