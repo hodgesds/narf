@@ -122,6 +122,14 @@ object/signal/job context, not QDBusServiceWatcher or main-event dispatch in a
 minimal Qt process. A scoped classic-session supervisor can bypass this one
 proven callback gate while preserving KWin, kded, and the normal session bus.
 
+The first supervisor replay crosses the original callback boundary and emits
+`kded observed; launching ksmserver`, with ksmserver PID 117 visible at probe
+23. That child exits before acquiring `org.kde.ksmserver` and is absent by
+probe 24, so plasmashell is intentionally not launched and `PLASMA-READY` is
+not reached. The next uncovered area is ksmserver's early process exit, not a
+return to the kded/epoll path; the supervisor needs to race the child status
+against the name waiter and report the exact exit result.
+
 For systemd PID 1, the important path is level-triggered, not edge-triggered:
 
 1. `/data/systemd/src/core/manager.c::manager_setup_signals` blocks `SIGCHLD`
@@ -2791,3 +2799,35 @@ then launch `plasmashell`. Marker lines around each action will distinguish
 process-start failure from the next service-registration gate. This bypasses
 only the proven broken classic-session continuation and leaves the lower
 kernel/Qt paths unchanged.
+
+### 2026-08-03 classic-session supervisor replay: ksmserver exits early
+
+The first acceptance image with the scoped supervisor used the usual
+8-GiB/SMP4/KVM command. Its capture is
+`/tmp/narf-fedora-plasma-classic-supervisor-kvm-8g-20260803.log`; it was
+stopped at a stable 1m59s plateau and did not emit `PLASMA-READY`.
+
+The supervisor successfully resumes execution exactly where Plasma's original
+job remains pending:
+
+```text
+86.757353 NameOwnerChanged("org.kde.kded6", "", ":1.15")
+PLASMA-GDBUS-WAIT kded observed
+PLASMA-CLASSIC-SUPERVISOR kded observed; launching ksmserver
+PLASMA-CLASSIC-SUPERVISOR ksmserver pid=117
+```
+
+Probe 23 sees that same ksmserver PID alive, proving that the executable was
+found and started with the live Plasma session environment. Probe 24 and every
+later sample show `ksm=[none]`. No `org.kde.ksmserver` ownership broadcast is
+emitted, so the supervisor correctly remains at its bounded name waiter and
+does not launch plasmashell. KWin, kded6, phase-one kcminit, and plasma_session
+remain alive throughout.
+
+This advances the boot boundary beyond kded and converts the next failure into
+a concrete early-process-exit case. The log contains no ksmserver diagnostic
+or fatal-fault record. The current supervisor observes only the D-Bus name, so
+the child's exit code/signal is an untested area. The next test must wait for
+both the child and the name watcher and report whichever completes first; if
+the child wins, record its exact wait status before changing ksmserver's
+environment or dependencies.
