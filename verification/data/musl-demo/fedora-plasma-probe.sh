@@ -42,12 +42,75 @@ proc_state() {
     "$pid" "$3" "$(( ${14} + ${15} ))"
 }
 
+live_count() {
+  local name="$1"
+  local -n result="$2"
+  local comm_path comm candidate _pid _comm state _rest
+  result=0
+  for comm_path in /proc/[0-9]*/comm; do
+    { IFS= read -r comm < "$comm_path"; } 2>/dev/null || continue
+    [ "$comm" = "$name" ] || continue
+    candidate=${comm_path#/proc/}
+    candidate=${candidate%/comm}
+    if { read -r _pid _comm state _rest < "/proc/$candidate/stat"; } 2>/dev/null &&
+       [ "$state" != Z ] && [ "$state" != X ]; then
+      (( result += 1 ))
+    fi
+  done
+}
+
+dump_kcminit_waits() {
+  local comm_path comm pid field_path field line fdinfo_path fd_path fd_type
+  echo 'PLASMA-DIAG kcminit wait snapshot begin'
+  for comm_path in /proc/[0-9]*/comm; do
+    { IFS= read -r comm < "$comm_path"; } 2>/dev/null || continue
+    [ "$comm" = kcminit_startup ] || continue
+    pid=${comm_path#/proc/}
+    pid=${pid%/comm}
+    for field in syscall wchan status; do
+      field_path=/proc/$pid/$field
+      [ -r "$field_path" ] || continue
+      while IFS= read -r line; do
+        printf 'PLASMA-DIAG pid=%s %s: %s\n' "$pid" "$field" "$line"
+      done < "$field_path"
+    done
+    for fdinfo_path in /proc/$pid/fdinfo/*; do
+      [ -r "$fdinfo_path" ] || continue
+      fd=${fdinfo_path##*/}
+      while IFS= read -r line; do
+        printf 'PLASMA-DIAG pid=%s fdinfo=%s: %s\n' "$pid" "$fd" "$line"
+      done < "$fdinfo_path"
+      fd_path=/proc/$pid/fd/$fd
+      fd_type=other
+      [ -p "$fd_path" ] && fd_type=pipe
+      [ -S "$fd_path" ] && fd_type=socket
+      [ -c "$fd_path" ] && fd_type=char
+      [ -b "$fd_path" ] && fd_type=block
+      [ -f "$fd_path" ] && fd_type=file
+      printf 'PLASMA-DIAG pid=%s fd=%s type=%s\n' "$pid" "$fd" "$fd_type"
+    done
+  done
+  echo 'PLASMA-DIAG kcminit wait snapshot end'
+}
+
 for i in {1..180}; do
   proc_state kwin_wayland kwin
   proc_state plasmashell plasma
   proc_state startplasma-way start
-  printf 'PLASMA-PROBE %s start=[%s] kwin=[%s] plasma=[%s]\n' \
-    "$i" "$start" "$kwin" "$plasma"
+  proc_state plasma_session session
+  proc_state kcminit_startup kcminit
+  live_count kcminit_startup kcminit_count
+  proc_state kded6 kded
+  proc_state ksmserver ksm
+  printf 'PLASMA-PROBE %s start=[%s] session=[%s] kwin=[%s] kcminit=[%s count=%s] kded=[%s] ksm=[%s] plasma=[%s]\n' \
+    "$i" "$start" "$session" "$kwin" "$kcminit" "$kcminit_count" "$kded" "$ksm" "$plasma"
+
+  # One delayed, cold-path snapshot is enough to identify the descriptor set
+  # behind a stable kcminit gate without tracing every poll or perturbing the
+  # scheduler's hot syscall path.
+  if [ "$i" -eq 40 ] && [ "$kcminit_count" -gt 0 ]; then
+    dump_kcminit_waits
+  fi
 
   live_pid kwin_wayland kwin_pid
   live_pid plasmashell plasma_pid
