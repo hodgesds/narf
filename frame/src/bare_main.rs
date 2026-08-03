@@ -3978,6 +3978,7 @@ fn boot_userspace_init() {
                     "fork_pipe_smoke",
                     narf_verification::NARF_FORK_PIPE_SMOKE_ELF,
                 ),
+                ("popenw_smoke", narf_verification::NARF_POPENW_SMOKE_ELF),
                 (
                     "fork_exec_burst_smoke",
                     narf_verification::NARF_FORK_EXEC_BURST_SMOKE_ELF,

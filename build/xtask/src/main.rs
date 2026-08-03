@@ -2414,6 +2414,10 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("oci_smoke", "oci-smoke-ok"),
         ("fs_smoke", "fs-ok"),
         ("fork_pipe_smoke", "fork-ok"),
+        // The mirror direction: the PARENT owns the last write end while a
+        // forked child reads and closes its inherited copy — X server
+        // Popen("w"), which is how Xwayland feeds xkbcomp its keymap.
+        ("popenw_smoke", "popenw-ok"),
         // Early-systemd process topology: sixteen children are released
         // together across available CPUs, self-exec with one explicitly
         // preserved fd, report their post-exec identity, exit, and are reaped.
