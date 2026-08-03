@@ -1192,6 +1192,72 @@ kernel_test_in!(
     smoke_cgroup_ctrl_state_charge_reentry
 );
 
+// Rendering controller attributes may allocate (for example every memory.*
+// read formats a fresh String). Controller callbacks must run after the
+// ctrl_state metadata lock is released, otherwise an allocator refill charges
+// memory by recursively taking that same IRQ-safe lock.
+#[cfg(feature = "cgroup-memory")]
+fn smoke_cgroup_ctrl_read_charge_reentry() -> TestResult {
+    use crate::cgroupfs::memory;
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+    with_root_controller("memory", "t_mem_ctrl_read_reentry", |cg| {
+        let pid: u64 = 4_200_000_103;
+        if attach_pid(cg, pid).is_err() {
+            return TestResult::Fail("attach pid failed");
+        }
+        let before = read_current(cg);
+        let allowed = crate::cgroupfs::ctrl_read_charge_reentry_for_test(pid, 4096);
+        let after = read_current(cg);
+        let _ = memory::charge_hook_for_test(pid, -4096);
+        task_exited(pid);
+        if !allowed {
+            return TestResult::Fail("controller read callback charge was denied");
+        }
+        if after != before + 4096 {
+            return TestResult::Fail("controller read callback did not charge exactly once");
+        }
+        TestResult::Pass
+    })
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_ctrl_read_charge_reentry);
+
+// memory.high and memory.max are themselves consulted by the charge path.
+// Their values must be copied out of their locks before formatting allocates.
+#[cfg(feature = "cgroup-memory")]
+fn smoke_cgroup_memory_limit_read_charge_reentry() -> TestResult {
+    use crate::cgroupfs::memory;
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+    with_root_controller("memory", "t_mem_limit_read_reentry", |cg| {
+        let pid: u64 = 4_200_000_104;
+        if attach_pid(cg, pid).is_err() {
+            return TestResult::Fail("attach pid failed");
+        }
+        let before = read_current(cg);
+        let mut charged = 0i64;
+        for file in ["memory.high", "memory.max"] {
+            if !crate::cgroupfs::memory_limit_read_charge_reentry_for_test(pid, file, 4096) {
+                let _ = memory::charge_hook_for_test(pid, -charged);
+                task_exited(pid);
+                return TestResult::Fail("memory limit read callback charge was denied");
+            }
+            charged += 4096;
+        }
+        let after = read_current(cg);
+        let _ = memory::charge_hook_for_test(pid, -charged);
+        task_exited(pid);
+        if after != before + 8192 {
+            return TestResult::Fail("memory limit reads did not charge exactly twice");
+        }
+        TestResult::Pass
+    })
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_memory_limit_read_charge_reentry
+);
+
 // ── memory.max two-phase enforcement ────────────────────────────────
 //
 // A positive charge that would push a level over `memory.max` is denied

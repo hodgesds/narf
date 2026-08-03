@@ -293,6 +293,28 @@ fn max_line(v: &Option<u64>) -> String {
     }
 }
 
+/// Snapshot a limit while its IRQ-safe lock is held, then run all callbacks
+/// and formatting after releasing the guard. Allocator charging re-enters the
+/// memory controller's `high`/`max` locks, so even a tiny `format!` under one
+/// of these guards can self-deadlock on a slab refill.
+fn locked_max_line_with(
+    limit: &IrqSafeSpinLock<Option<u64>>,
+    after_snapshot: impl FnOnce(),
+) -> String {
+    let value = *limit.lock();
+    after_snapshot();
+    max_line(&value)
+}
+
+fn locked_max_line(limit: &IrqSafeSpinLock<Option<u64>>) -> String {
+    locked_max_line_with(limit, || {})
+}
+
+fn locked_u64_line(value: &IrqSafeSpinLock<u64>) -> String {
+    let value = *value.lock();
+    format!("{value}\n")
+}
+
 fn parse_limit(buf: &[u8]) -> Result<Option<u64>, FsError> {
     let t = core::str::from_utf8(buf)
         .map_err(|_| FsError::InvalidData)?
@@ -313,6 +335,32 @@ fn parse_u64(buf: &[u8]) -> Result<u64, FsError> {
 }
 
 impl MemoryState {
+    /// Deterministically inject allocator charging between taking a locked
+    /// limit snapshot and formatting it. This shares the production helper,
+    /// so regressing the guard lifetime makes the test self-deadlock.
+    #[doc(hidden)]
+    pub fn limit_read_charge_reentry_for_test(
+        &self,
+        file: &str,
+        pid: u64,
+        delta_bytes: i64,
+    ) -> bool {
+        let mut allowed = false;
+        let inject = || {
+            allowed = charge_hook_for_test(pid, delta_bytes);
+        };
+        match file {
+            "memory.high" => {
+                let _ = locked_max_line_with(&self.high, inject);
+            }
+            "memory.max" => {
+                let _ = locked_max_line_with(&self.max, inject);
+            }
+            _ => return false,
+        }
+        allowed
+    }
+
     /// Would charging `amount` more bytes keep this level at or below
     /// `memory.max`? `None` max ⇒ unlimited ⇒ always true.
     fn can_charge(&self, amount: u64) -> bool {
@@ -404,18 +452,18 @@ impl ControllerState for MemoryState {
         match file {
             "memory.current" => format!("{}\n", self.current.load(Ordering::Acquire)),
             "memory.peak" => format!("{}\n", self.peak.load(Ordering::Acquire)),
-            "memory.min" => format!("{}\n", *self.min.lock()),
-            "memory.low" => format!("{}\n", *self.low.lock()),
-            "memory.high" => max_line(&self.high.lock()),
-            "memory.max" => max_line(&self.max.lock()),
+            "memory.min" => locked_u64_line(&self.min),
+            "memory.low" => locked_u64_line(&self.low),
+            "memory.high" => locked_max_line(&self.high),
+            "memory.max" => locked_max_line(&self.max),
             "memory.swap.current" => format!("{}\n", self.swap_current.load(Ordering::Acquire)),
-            "memory.swap.max" => max_line(&self.swap_max.lock()),
+            "memory.swap.max" => locked_max_line(&self.swap_max),
             "memory.oom.group" => format!("{}\n", u8::from(self.oom_group.load(Ordering::Acquire))),
             // memory.reclaim is write-only on Linux (0200); render
             // empty for a read that slips through.
             "memory.reclaim" => String::new(),
             "memory.zswap.current" => format!("{}\n", self.zswap_current.load(Ordering::Acquire)),
-            "memory.zswap.max" => max_line(&self.zswap_max.lock()),
+            "memory.zswap.max" => locked_max_line(&self.zswap_max),
             "memory.zswap.writeback" => {
                 format!(
                     "{}\n",

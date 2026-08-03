@@ -369,6 +369,14 @@ fn snapshot_ctrl_states(cg: &Cgroup) -> Vec<(&'static str, Arc<dyn ControllerSta
         .collect()
 }
 
+/// Clone one controller state under the metadata lock. Controller callbacks
+/// may allocate, and allocator charging walks this same map, so every caller
+/// must invoke the returned state only after this helper has released the
+/// lock.
+fn snapshot_ctrl_state(cg: &Cgroup, name: &'static str) -> Option<Arc<dyn ControllerState>> {
+    cg.ctrl_state.lock().get(name).cloned()
+}
+
 fn root() -> Arc<Cgroup> {
     let root = CGROUP_ROOT.get_or_init(Cgroup::new_root).clone();
 
@@ -605,6 +613,81 @@ pub fn membership_charge_reentry_for_test(pid: u64, delta_bytes: i64) -> bool {
 pub fn ctrl_state_charge_reentry_for_test(pid: u64, delta_bytes: i64) -> bool {
     let cg = cgroup_of(pid);
     mutate_ctrl_state(&cg, |_| memory::charge_hook_for_test(pid, delta_bytes))
+}
+
+/// Exercise a controller read callback that re-enters memory charging. This
+/// is the deterministic form of a formatted cgroup attribute read refilling
+/// the allocator while `ctrl_state` is held.
+#[cfg(feature = "cgroup-memory")]
+#[doc(hidden)]
+pub fn ctrl_read_charge_reentry_for_test(pid: u64, delta_bytes: i64) -> bool {
+    use core::any::Any;
+
+    #[derive(Debug)]
+    struct ChargeOnRead {
+        pid: u64,
+        delta_bytes: i64,
+        allowed: Arc<AtomicBool>,
+    }
+
+    impl ControllerState for ChargeOnRead {
+        fn files(&self) -> &'static [&'static str] {
+            &["__test.charge_on_read"]
+        }
+
+        fn read(&self, _file: &str) -> String {
+            self.allowed.store(
+                memory::charge_hook_for_test(self.pid, self.delta_bytes),
+                Ordering::Release,
+            );
+            String::new()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    let cg = cgroup_of(pid);
+    let allowed = Arc::new(AtomicBool::new(false));
+    mutate_ctrl_state(&cg, |states| {
+        states.insert(
+            "__test_charge_on_read",
+            Arc::new(ChargeOnRead {
+                pid,
+                delta_bytes,
+                allowed: allowed.clone(),
+            }),
+        );
+    });
+    let file = CgroupAttrFile {
+        cg: cg.clone(),
+        kind: FileKind::Ctrl("__test_charge_on_read", "__test.charge_on_read"),
+        ino: 0,
+        seen_gen: AtomicU64::new(0),
+    };
+    let _ = file.content();
+    mutate_ctrl_state(&cg, |states| {
+        states.remove("__test_charge_on_read");
+    });
+    allowed.load(Ordering::Acquire)
+}
+
+/// Inject memory charging after `memory.high`/`memory.max` has been copied
+/// out of its field lock but before the line is formatted.
+#[cfg(feature = "cgroup-memory")]
+#[doc(hidden)]
+pub fn memory_limit_read_charge_reentry_for_test(pid: u64, file: &str, delta_bytes: i64) -> bool {
+    let cg = cgroup_of(pid);
+    snapshot_ctrl_state(&cg, "memory")
+        .map(|state| {
+            state
+                .as_any()
+                .downcast_ref::<memory::MemoryState>()
+                .map(|state| state.limit_read_charge_reentry_for_test(file, pid, delta_bytes))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 // ── cgroup namespace (CLONE_NEWCGROUP) ──────────────────────────────
@@ -1344,11 +1427,7 @@ impl CgroupAttrFile {
     fn content(&self) -> String {
         match &self.kind {
             FileKind::Core(f) => render_core(&self.cg, *f),
-            FileKind::Ctrl(ctrl, file) => self
-                .cg
-                .ctrl_state
-                .lock()
-                .get(*ctrl)
+            FileKind::Ctrl(ctrl, file) => snapshot_ctrl_state(&self.cg, ctrl)
                 .map(|s| s.read(file))
                 .unwrap_or_default(),
             FileKind::CpuStatBase => render_cpu_stat_base(&self.cg),
@@ -1358,11 +1437,7 @@ impl CgroupAttrFile {
     fn is_writable(&self) -> bool {
         match &self.kind {
             FileKind::Core(f) => f.writable(),
-            FileKind::Ctrl(ctrl, file) => self
-                .cg
-                .ctrl_state
-                .lock()
-                .get(*ctrl)
+            FileKind::Ctrl(ctrl, file) => snapshot_ctrl_state(&self.cg, ctrl)
                 .map(|s| s.writable(file))
                 .unwrap_or(false),
             FileKind::CpuStatBase => false,
@@ -1404,7 +1479,7 @@ impl FileOps for CgroupAttrFile {
         let r = match &self.kind {
             FileKind::Core(f) => store_core(&self.cg, *f, buf),
             FileKind::Ctrl(ctrl, file) => {
-                let st = self.cg.ctrl_state.lock().get(*ctrl).cloned();
+                let st = snapshot_ctrl_state(&self.cg, ctrl);
                 match st {
                     Some(s) => s.write(file, buf).map(|()| buf.len()),
                     None => Err(FsError::NotFound),
@@ -1470,15 +1545,15 @@ impl CgroupDir {
 
     /// Active controller file on this cgroup as `(controller, file)`.
     fn ctrl_file(&self, name: &str) -> Option<(&'static str, &'static str)> {
-        let states = self.cg.ctrl_state.lock();
-        for (cname, state) in states.iter() {
+        let states = snapshot_ctrl_states(&self.cg);
+        for (cname, state) in &states {
             if let Some(f) = state
                 .files()
                 .iter()
                 .copied()
                 .find(|f| *f == name && controller_file_visible(&self.cg, f))
             {
-                return Some((cname, f));
+                return Some((*cname, f));
             }
         }
         None
