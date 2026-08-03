@@ -113,6 +113,15 @@ following plateau. The earlier `MatchRuleNotFound` is for Qt's internal
 `arg0='org.freedesktop.DBus'` removal, not kded. The unresolved boundary is
 therefore signal dispatch/callback execution after a valid persistent match.
 
+The Fedora-shipped `plasma_waitforname` now covers that generic Qt boundary:
+it uses the same Qt 6.10.3 `QDBusServiceWatcher`, independently watches kded,
+and prints `PLASMA-QT-WAIT kded observed` immediately after the same broadcast.
+Its expected `RemoveMatch` follows on clean exit. Plasma's original job remains
+pending. The remaining defect is therefore specific to `StartServiceJob`'s
+object/signal/job context, not QDBusServiceWatcher or main-event dispatch in a
+minimal Qt process. A scoped classic-session supervisor can bypass this one
+proven callback gate while preserving KWin, kded, and the normal session bus.
+
 For systemd PID 1, the important path is level-triggered, not edge-triggered:
 
 1. `/data/systemd/src/core/manager.c::manager_setup_signals` blocks `SIGCHLD`
@@ -2742,3 +2751,43 @@ is narrower: the matching bus message must traverse
 in the image is preferable for the next test if available; otherwise the
 acceptance image can bypass only this proven Qt callback gate using the
 independent GLib name waiter.
+
+### 2026-08-03 isolated Qt watcher test: QDBusServiceWatcher succeeds
+
+The next image added Fedora's shipped `plasma_waitforname` beside the GLib
+waiter. This executable is built from the same Plasma 6.7.3 tree and uses the
+same Qt 6.10.3 `QDBusServiceWatcher`: it installs a registration watch, enters
+a minimal `QCoreApplication` event loop, and exits from its `serviceRegistered`
+slot. The capture is
+`/tmp/narf-fedora-plasma-qt-wait-kvm-8g-20260803.log`; the usual
+8-GiB/SMP4/KVM run was stopped at a stable 2m3s plateau and did not emit
+`PLASMA-READY`.
+
+Both independent implementations complete on the one kded transition:
+
+```text
+81.132243 NameOwnerChanged("org.kde.kded6", "", owner)
+PLASMA-GDBUS-WAIT kded observed
+PLASMA-QT-WAIT kded observed
+```
+
+The Qt waiter's connection then issues the expected kded `RemoveMatch` while
+exiting. Plasma session, KWin, phase-one kcminit, and kded6 remain stable
+through probe 34; the original `StartServiceJob` still does not start
+ksmserver, and plasmashell remains absent.
+
+This passing focused test clears the untested generic Qt steps named by the
+previous replay: Qt receives a matched `NameOwnerChanged`, posts/delivers the
+watcher's notification, runs a Qt main event loop, invokes a connected slot,
+and exits normally on NARF. The live distinction is now the receiving object
+and continuation in `plasma_session`: `QDBusServiceWatcher::serviceRegistered`
+is connected directly to inherited `StartServiceJob::emitResult`, whose
+`KJob::finished` connection must start the already-constructed ksmserver job.
+
+Without a locally rebuildable Fedora Plasma/Frameworks development stack, the
+next test-first step is a narrowly scoped acceptance supervisor: wait for kded
+through the proven Qt helper, launch `ksmserver`, wait for its well-known name,
+then launch `plasmashell`. Marker lines around each action will distinguish
+process-start failure from the next service-registration gate. This bypasses
+only the proven broken classic-session continuation and leaves the lower
+kernel/Qt paths unchanged.
