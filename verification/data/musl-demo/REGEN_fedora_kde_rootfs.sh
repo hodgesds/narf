@@ -109,6 +109,11 @@ fi
 
 # --------------------------------------------------------------- staging ---
 echo "Staging NARF-specific bits..."
+# Fedora ships /usr/bin mode 0555. Several diagnostics below swap package
+# binaries for wrappers there, and the unprivileged build user owns the
+# directory but has no write bit. Open it for staging and restore the
+# packaged mode before mke2fs reads the tree.
+chmod u+w "$WORK/root/usr/bin"
 # dbus + Plasma both refuse to start without a machine-id.
 [ -s "$WORK/root/etc/machine-id" ] || \
   head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$WORK/root/etc/machine-id"
@@ -141,13 +146,21 @@ fi
 # to `render` at 0666. Keep both memberships for incremental work trees too;
 # this image has no logind seat manager to install per-user device ACLs.
 "$WORK/enter.sh" 'usermod --append --groups video,render narf'
-install -d -m 0755 "$WORK/root/home/narf/.config" "$WORK/root/etc/systemd/system/graphical.target.wants"
+install -d -m 0755 "$WORK/root/etc/systemd/system/graphical.target.wants"
 # Serial is already the acceptance console. Fedora's tty getty units cannot
 # own these synthetic terminals correctly yet and crash/restart throughout a
 # boot, consuming a vCPU and adding unrelated PID1/SIGCHLD/timer churn.
 ln -sfn /dev/null "$WORK/root/etc/systemd/system/console-getty.service"
 ln -sfn /dev/null "$WORK/root/etc/systemd/system/getty@tty1.service"
-printf '[General]\nsystemdBoot=false\n' > "$WORK/root/home/narf/.config/startkderc"
+# Everything under /home/narf belongs to uid 1000, which `--map-auto` places
+# on a subuid the invoking user cannot write to from outside the namespace.
+# Stage the per-user config through the same fake-root helper that created
+# the account, or an incremental rebuild fails with EACCES here.
+"$WORK/enter.sh" '
+  install -d -m 0755 -o narf -g narf /home/narf/.config
+  printf "[General]\nsystemdBoot=false\n" > /home/narf/.config/startkderc
+  printf "[KSplash]\nEngine=none\nTheme=None\n" > /home/narf/.config/ksplashrc
+  chown -R narf:narf /home/narf'
 # Fedora's global startkderc is selected before the per-user override during
 # this bootstrap path. This image has no per-user systemd manager, so force
 # classic startup globally as well; otherwise plasma_waitforname burns D-Bus's
@@ -156,13 +169,11 @@ printf '[General]\nsystemdBoot=false\n' > "$WORK/root/etc/xdg/startkderc"
 # The splash is cosmetic and not part of the compositor/shell acceptance
 # gate. Disable it while its independent userspace #GP is tracked separately.
 printf '[KSplash]\nEngine=none\nTheme=None\n' > "$WORK/root/etc/xdg/ksplashrc"
-printf '[KSplash]\nEngine=none\nTheme=None\n' > "$WORK/root/home/narf/.config/ksplashrc"
 # startplasma still probes the well-known splash name even with Theme=None.
 # Without a per-user systemd manager Fedora's activator runs
 # plasma_waitforname until D-Bus's 120-second timeout, so make the optional
 # name fail immediately instead of installing a guaranteed timeout path.
 rm -f "$WORK/root/usr/share/dbus-1/services/org.kde.KSplash.service"
-chown -R 1000:1000 "$WORK/root/home/narf"
 
 # Capture the narrow D-Bus gate between KWin startup and plasmashell startup.
 # The monitor runs on the same fresh session bus as Plasma, so serial and
@@ -230,6 +241,18 @@ install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-kcminit-wayland-guard.sh" \
   "$WORK/root/usr/bin/kcminit_startup"
 
+# Record whether plasma_session's own ksmserver StartServiceJob ever execs a
+# process. The real binary moves to a private directory but keeps its
+# basename, so /proc/<pid>/comm stays `ksmserver` for the acceptance probe.
+install -d "$WORK/root/usr/local/libexec/ksmserver-real"
+if [ ! -x "$WORK/root/usr/local/libexec/ksmserver-real/ksmserver" ]; then
+  mv "$WORK/root/usr/bin/ksmserver" \
+    "$WORK/root/usr/local/libexec/ksmserver-real/ksmserver"
+fi
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-ksmserver-trace.sh" \
+  "$WORK/root/usr/bin/ksmserver"
+
 # Restore the package binary if an older incremental work tree contains the
 # rejected QDBUS_DEBUG wrapper. That diagnostic changed the process identity,
 # emitted no Qt records, and perturbed the kcminit transition.
@@ -263,7 +286,7 @@ printf '%s\n' \
   'Environment=XDG_CURRENT_DESKTOP=KDE' \
   'Environment=XKB_DEFAULT_MODEL=pc105' \
   'Environment=XKB_DEFAULT_LAYOUT=us' \
-  'Environment=QT_LOGGING_RULES=org.kde.kcminit.debug=true' \
+  'Environment=QT_LOGGING_RULES=org.kde.kcminit.debug=true;kwin_core.debug=true;kwin_wayland_drm.debug=true;kwin_scene_opengl.debug=true;kwin_qpainter.debug=true' \
   'Environment=QT_QPA_PLATFORM=wayland' \
   'Environment=KWIN_DRM_NO_AMS=1' \
   'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \
@@ -325,6 +348,7 @@ install -m 0755 \
   "$WORK/root/narf-start.sh"
 
 # ------------------------------------------------------------------ pack ---
+chmod u-w "$WORK/root/usr/bin"
 for m in $(mount | grep "$WORK/root" | awk '{print $3}' | sort -r); do
   umount -l "$m" 2>/dev/null || true
 done
