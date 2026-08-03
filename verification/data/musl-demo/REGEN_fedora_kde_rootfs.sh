@@ -227,6 +227,14 @@ install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-kcminit-wayland-guard.sh" \
   "$WORK/root/usr/bin/kcminit_startup"
 
+# Restore the package binary if an older incremental work tree contains the
+# rejected QDBUS_DEBUG wrapper. That diagnostic changed the process identity,
+# emitted no Qt records, and perturbed the kcminit transition.
+if [ -e "$WORK/root/usr/bin/plasma_session.narf-real" ]; then
+  mv -f "$WORK/root/usr/bin/plasma_session.narf-real" \
+    "$WORK/root/usr/bin/plasma_session"
+fi
+
 # The graphical session is a normal systemd service, deliberately not the
 # legacy narf-start.sh diagnostic wrapper. PID 1 orders it after the system
 # bus, gives it a private user-owned runtime directory, and starts Plasma
@@ -252,7 +260,7 @@ printf '%s\n' \
   'Environment=XDG_CURRENT_DESKTOP=KDE' \
   'Environment=XKB_DEFAULT_MODEL=pc105' \
   'Environment=XKB_DEFAULT_LAYOUT=us' \
-  'Environment=QT_LOGGING_RULES=org.kde.kcminit.debug=true;org.kde.plasma.session.debug=true' \
+  'Environment=QT_LOGGING_RULES=org.kde.kcminit.debug=true' \
   'Environment=QT_QPA_PLATFORM=wayland' \
   'Environment=KWIN_DRM_NO_AMS=1' \
   'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \

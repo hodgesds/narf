@@ -15,7 +15,24 @@ echo "PLASMA-DBUS-MONITOR starting"
   "type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.kde.kded6'" \
   "type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.kde.ksmserver'" &
 
+# Test the GLib D-Bus delivery layer independently of Qt's
+# QDBusServiceWatcher. The external bus monitor proves that the daemon emits
+# NameOwnerChanged; this waiter proves that a separate GLib client can install
+# a match, park its main context, consume the same ownership transition, and
+# return. Keep it unbounded so a missing delivery remains visible for the
+# lifetime of the acceptance run.
+(
+  echo "PLASMA-GDBUS-WAIT kded start"
+  if /usr/bin/gdbus wait --session org.kde.kded6; then
+    echo "PLASMA-GDBUS-WAIT kded observed"
+  else
+    status=$?
+    echo "PLASMA-GDBUS-WAIT kded failed status=$status"
+  fi
+) &
+
 # Give the monitor time to install its match rules before startplasma can
-# launch KWin and submit the environment-update batch.
+# launch KWin and submit the environment-update batch. This also lets the
+# independent name waiter install its match before kded can be started.
 /usr/bin/sleep 1
 exec /usr/bin/startplasma-wayland

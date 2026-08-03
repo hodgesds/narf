@@ -86,6 +86,16 @@ live scan-to-waiter-registration race can be reproduced deterministically; the
 parallel source-level lead is the `StartServiceJob` state machine after the
 observed broadcast.
 
+A follow-up replay wrapped only `plasma_session` with `QDBUS_DEBUG=1`. The
+wrapper was demonstrably active, but Fedora's Qt 6.10.3 emitted none of the
+expected qdbus add/remove/dispatch records. The diagnostic also perturbed the
+startup sequence: it remained at KWin plus both phase-zero kcminit processes
+for 2m50s and never reached kded6. Therefore that replay is inconclusive about
+the persistent kded watcher and the wrapper must not become part of the normal
+image. The next test boundary is a separate GLib D-Bus name waiter, which can
+verify delivery of the same `org.kde.kded6` ownership transition without
+patching Qt or tracing the syscall hot path.
+
 For systemd PID 1, the important path is level-triggered, not edge-triggered:
 
 1. `/data/systemd/src/core/manager.c::manager_setup_signals` blocks `SIGCHLD`
@@ -2595,3 +2605,39 @@ temporary KWin watcher finishes. Exact Qt shows this can be a watcher
 `RemoveMatch`; it is a lead, not yet proof that the persistent kded match was
 absent. A plasma_session-only `QDBUS_DEBUG=1` replay can expose add/remove
 rules and signal dispatch without returning to broad syscall tracing.
+
+### 2026-08-03 QDBUS_DEBUG replay: no usable Qt records and an earlier plateau
+
+The next Fedora image wrapped only `/usr/bin/plasma_session`, exported
+`QDBUS_DEBUG=1`, and then executed the original binary under the temporary
+name `/usr/bin/plasma_session.narf-real`. It used the same 8-GiB/KVM command
+as the preceding replay. The capture is
+`/tmp/narf-fedora-plasma-qdbus-debug-kvm-8g-20260803.log`; it was stopped
+deliberately after 2m50s, once the state had remained unchanged for more than
+two minutes. It did not emit `PLASMA-READY`.
+
+The wrapper itself is confirmed by the early record
+`PLASMA-SESSION-QDBUS-DEBUG starting pid=123`, but no Qt qdbus diagnostic
+record follows. In particular, the log contains no match-rule installation,
+removal, signal dispatch, or internal QDBus message even while the external
+session-bus monitor is active. Fedora's Qt build therefore does not expose
+this proposed diagnostic surface in the current environment. Absence of that
+output cannot be used to infer that a watcher match or callback was absent.
+
+This run is also more perturbing than the two normal-image replays. KWin stays
+alive, but both initial `kcminit_startup` processes remain through the final
+probe, `org.kde.kded6` is never acquired, and neither ksmserver nor
+plasmashell appears. Repeated portal activation calls eventually time out.
+The probe's `session=[none]` field is an observer artifact: its exact-comm
+lookup no longer matches the renamed `plasma_session.narf-real`; the active
+wrapper/real process still owns the session connection visible as `:1.2`.
+The earlier kcminit plateau is real, but this one replay cannot distinguish a
+timing perturbation from an effect of the wrapper or debug environment.
+
+Consequently, `QDBUS_DEBUG` is rejected as an effective test here and the
+temporary wrapper should be removed before the next image. The untested area
+remains delivery above the already-covered AF_UNIX and eventfd primitives:
+does an independent GLib D-Bus name waiter observe `org.kde.kded6` when the
+normal session reaches that name? A bounded `gdbus wait --session
+org.kde.kded6` check exercises that boundary without adding syscall tracing
+or modifying Plasma's process identity.
