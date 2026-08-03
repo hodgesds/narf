@@ -124,6 +124,25 @@ for i in {1..180}; do
     if [ "$kwin_pid_after" = "$kwin_pid" ] &&
        [ "$plasma_pid_after" = "$plasma_pid" ]; then
       echo 'PLASMA-READY: kwin_wayland and plasmashell survived 10s'
+      # Liveness is not a drawn desktop. KWin presents its startup frames
+      # and then idles because no client window is ever mapped, so the
+      # interesting interval starts exactly where this oneshot used to
+      # exit. Hand the sampling to a background writer and let the start
+      # job complete, so graphical.target still gates on PLASMA-READY.
+      #
+      # A climbing CPU counter means the process is making progress and is
+      # merely slow; a flat one means it is parked. That distinction is
+      # what decides whether the shell needs more time or a lost wakeup.
+      (
+        for j in {1..600}; do
+          proc_state kwin_wayland kwin
+          proc_state plasmashell plasma
+          proc_state foot foot
+          printf 'PLASMA-WATCH %s kwin=[%s] plasma=[%s] foot=[%s]\n' \
+            "$j" "$kwin" "$plasma" "$foot"
+          sleep 5
+        done
+      ) &
       exit 0
     fi
   fi

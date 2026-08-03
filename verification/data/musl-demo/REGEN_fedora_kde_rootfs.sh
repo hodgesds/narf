@@ -289,6 +289,7 @@ printf '%s\n' \
   'Environment=QT_LOGGING_RULES=org.kde.kcminit.debug=true;kwin_core.debug=true;kwin_wayland_drm.debug=true;kwin_scene_opengl.debug=true;kwin_qpainter.debug=true' \
   'Environment=QT_QPA_PLATFORM=wayland' \
   'Environment=KWIN_DRM_NO_AMS=1' \
+  'Environment=KWIN_COMPOSE=Q' \
   'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \
   'Environment=LIBGL_ALWAYS_SOFTWARE=1' \
   'Environment=GALLIUM_DRIVER=llvmpipe' \
@@ -306,7 +307,10 @@ printf '%s\n' \
 ln -sfn ../narf-plasma.service \
   "$WORK/root/etc/systemd/system/graphical.target.wants/narf-plasma.service"
 
-# Do not confuse Type=simple's successful fork with a working desktop. This
+# Do not confuse Type=simple's successful fork with a working desktop.
+# KillMode=process: the probe leaves a background sampler running past
+# PLASMA-READY — the only window into whether the shell is parked or merely
+# slow — and the default control-group kill would reap it with the oneshot. This
 # oneshot is ordered after the session service and keeps the graphical target
 # pending until both the compositor and shell have remained alive long enough
 # to be observed twice. Its console heartbeats also expose the last surviving
@@ -327,6 +331,7 @@ printf '%s\n' \
   'StandardOutput=journal+console' \
   'StandardError=journal+console' \
   'TimeoutStartSec=15min' \
+  'KillMode=process' \
   '' \
   '[Install]' \
   'WantedBy=graphical.target' \

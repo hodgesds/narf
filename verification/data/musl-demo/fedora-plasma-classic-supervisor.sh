@@ -76,7 +76,14 @@ echo "PLASMA-CLASSIC-SUPERVISOR plasmashell pid=$plasma_pid"
 (
   /usr/bin/sleep 20
   echo "PLASMA-CLASSIC-SUPERVISOR launching foot control client"
-  /usr/bin/foot --log-level=info /bin/sh -c 'while :; do /usr/bin/sleep 5; done' &
+  # libwayland's own protocol tracer. KWin presents its startup frames and
+  # then never repaints, which means it is compositing an empty scene: no
+  # client window is ever mapped. This shows the exact request/event where
+  # the map handshake stops — in particular whether the client's
+  # xdg_surface.configure ever arrives, since without it a client may not
+  # attach a buffer and the compositor has nothing to draw.
+  WAYLAND_DEBUG=1 \
+    /usr/bin/foot --log-level=info /bin/sh -c 'while :; do /usr/bin/sleep 5; done' &
   foot_pid=$!
   echo "PLASMA-CLASSIC-SUPERVISOR foot pid=$foot_pid"
   wait "$foot_pid"
