@@ -79,8 +79,10 @@ identity at `connect`/`listen`/`socketpair`. Stored credentials are
 host-absolute and are translated into the receiving task's PID/user namespace,
 with unmapped uid/gid values reported as the overflow id.
 Invalid SCM_RIGHTS descriptors fail `sendmsg` with `EBADF` without sending the
-payload. `MSG_CMSG_CLOEXEC` marks installed received descriptors close-on-exec,
-and insufficient ancillary space reports `MSG_CTRUNC`. On byte-stream Unix
+payload. A received descriptor retains the sender's file status flags, including
+`O_NONBLOCK`; sender fd-slot flags are not copied, and `FD_CLOEXEC` is set only
+when the receiver requests `MSG_CMSG_CLOEXEC`. Insufficient ancillary space
+reports `MSG_CTRUNC`. On byte-stream Unix
 sockets, rights are associated with the first byte of their `sendmsg`; they are
 delivered only by a receive that reaches that byte, and an ordinary
 `read`/`recv` consumes and discards them rather than exposing them to a later

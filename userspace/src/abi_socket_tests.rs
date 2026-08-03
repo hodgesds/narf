@@ -17,6 +17,8 @@ const SHUT_RDWR: u64 = 2;
 /// SCM control-message types (SOL_SOCKET level).
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
+const O_NONBLOCK: i64 = 0o4000;
+const F_GETFL: u64 = 3;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 
 // A clearly-invalid fd that no freshly-created table will ever hand out.
@@ -2789,18 +2791,18 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
             return Err("ordinary prefix send failed");
         }
 
-        // The fd we pass: a second, independent socketpair end.
-        let mut sv2 = [0u8; 8];
-        if call(
-            Syscall::SocketPair.raw(),
-            a3(AF_UNIX, SOCK_STREAM, 0, sv2.as_mut_ptr() as u64),
+        // The fd we pass: an independent nonblocking socket.
+        // systemd hands dbus-broker its activation listener in exactly this
+        // shape. SCM_RIGHTS duplicates the open file description, so Linux
+        // preserves O_NONBLOCK on the descriptor installed by recvmsg.
+        let passed_fd = call(
+            Syscall::SocketOpen.raw(),
+            a2(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0),
         )
-        .ok_or("pair2 status")?
-            != 0
-        {
-            return Err("second socketpair setup failed");
+        .ok_or("nonblocking socket status")? as i32;
+        if passed_fd < 0 {
+            return Err("nonblocking socket setup failed");
         }
-        let passed_fd = i32::from_ne_bytes([sv2[0], sv2[1], sv2[2], sv2[3]]);
 
         // sendmsg with an SCM_RIGHTS cmsg carrying `passed_fd`.
         let payload = b"fd";
@@ -2880,6 +2882,19 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
         // The received fd is a distinct number, and closeable.
         if new_fd as u64 == fd1 {
             return Err("SCM_RIGHTS installed fd collided with the receiving fd");
+        }
+        let installed_status = fd::with_table(FAKE_TASK, |table| {
+            table.get(new_fd as u32).map(|entry| entry.status_flags)
+        })
+        .flatten()
+        .ok_or("received SCM_RIGHTS fd was absent from the fd table")?;
+        if installed_status & O_NONBLOCK as u32 == 0 {
+            return Err("SCM_RIGHTS receiver fd lost its O_NONBLOCK status");
+        }
+        let received_status = call(Syscall::Fcntl.raw(), a2(new_fd as u64, F_GETFL, 0))
+            .ok_or("F_GETFL on received SCM_RIGHTS fd failed")?;
+        if received_status & O_NONBLOCK == 0 {
+            return Err("SCM_RIGHTS did not preserve O_NONBLOCK");
         }
         let _ = call(Syscall::Close.raw(), a0(new_fd as u64));
         Ok(())

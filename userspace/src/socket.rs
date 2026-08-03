@@ -454,7 +454,7 @@ pub struct SocketFile {
     /// Datagram ancillary data is per-message, so this is overwritten exactly
     /// when `dispatch_unix_dgram(Recv)` dequeues that message and consumed by
     /// the following `recvmsg` (or discarded by a plain `read`).
-    last_recv_fds: IrqSafeSpinLock<Vec<Arc<dyn FileOps>>>,
+    last_recv_fds: IrqSafeSpinLock<Vec<ScmRightsFile>>,
     /// Readable-transition generation for connectionless datagram inboxes.
     /// A bound AF_UNIX DGRAM socket is the systemd `$NOTIFY_SOCKET` shape:
     /// after an EPOLLET consumer drains it, a refill can occur before epoll
@@ -702,6 +702,17 @@ enum SocketState {
     NetlinkNetfilter { replies: VecDeque<Vec<u8>> },
 }
 
+/// Open-file state transported by `SCM_RIGHTS`.
+///
+/// Descriptor flags such as `FD_CLOEXEC` belong to the sender's fd slot and
+/// are intentionally not carried. File status flags belong to the open file
+/// description and therefore must survive installation in the receiver.
+#[derive(Clone)]
+pub(crate) struct ScmRightsFile {
+    pub(crate) ops: Arc<dyn FileOps>,
+    pub(crate) status_flags: u32,
+}
+
 /// One enqueued UDP-style datagram. Owns the payload bytes (UDP
 /// has no concept of partial reads — each recv yields one whole
 /// packet, padded or truncated to the user buffer size).
@@ -717,7 +728,7 @@ pub struct DgramPacket {
     pub payload: Vec<u8>,
     /// Per-datagram SCM_RIGHTS payload. AF_UNIX datagrams preserve message
     /// boundaries, so these descriptors must not share the stream ring.
-    pub fds: Vec<Arc<dyn FileOps>>,
+    pub(crate) fds: Vec<ScmRightsFile>,
 }
 
 impl core::fmt::Debug for DgramPacket {
@@ -3824,7 +3835,7 @@ impl SocketFile {
     fn dispatch_unix_dgram_with_fds(
         self: &Arc<Self>,
         op: SocketOp<'_>,
-        fds: Vec<Arc<dyn FileOps>>,
+        fds: Vec<ScmRightsFile>,
     ) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => {
@@ -4255,7 +4266,11 @@ impl SocketFile {
     /// AF_UNIX `sendmsg` with an SCM_RIGHTS fd batch: writes `buf` to the
     /// stream and queues `fds` for the peer's next `recvmsg`. Only valid on
     /// a connected AF_UNIX stream socket.
-    pub fn unix_sendmsg(&self, buf: &[u8], fds: Vec<Arc<dyn FileOps>>) -> Result<usize, SockError> {
+    pub(crate) fn unix_sendmsg(
+        &self,
+        buf: &[u8],
+        fds: Vec<ScmRightsFile>,
+    ) -> Result<usize, SockError> {
         let state = self.state.lock();
         let tx = match &*state {
             SocketState::UnixConnected { tx, .. } => tx,
@@ -4290,7 +4305,7 @@ impl SocketFile {
         buf: &[u8],
         flags: u32,
         addr: Option<SockAddr>,
-        fds: Vec<Arc<dyn FileOps>>,
+        fds: Vec<ScmRightsFile>,
     ) -> Result<usize, SockError> {
         if self.domain != AF_UNIX || self.kind != SOCK_DGRAM {
             return Err(SockError::InvalidArg);
@@ -4305,7 +4320,7 @@ impl SocketFile {
     /// Pop the next received SCM_RIGHTS fd batch from an AF_UNIX stream
     /// socket's receive ring (empty for non-unix sockets or when none were
     /// passed).
-    pub fn unix_take_recv_fds(&self) -> Vec<Arc<dyn FileOps>> {
+    pub(crate) fn unix_take_recv_fds(&self) -> Vec<ScmRightsFile> {
         let from_dgram = core::mem::take(&mut *self.last_recv_fds.lock());
         if !from_dgram.is_empty() {
             return from_dgram;
@@ -4385,7 +4400,7 @@ struct RingInner {
     packet_bytes: usize,
     /// Ancillary batch attached to the record most recently consumed by
     /// recv/recvmsg. `recvmsg` takes it immediately after the data read.
-    delivered_packet_fds: Option<Vec<Arc<dyn FileOps>>>,
+    delivered_packet_fds: Option<Vec<ScmRightsFile>>,
     delivered_packet_cred: Option<Ucred>,
     /// Monotonic byte positions for stream ancillary association.
     stream_read_seq: u64,
@@ -4397,13 +4412,13 @@ struct RingInner {
 
 struct PacketRecord {
     data: Vec<u8>,
-    fds: Vec<Arc<dyn FileOps>>,
+    fds: Vec<ScmRightsFile>,
     cred: Ucred,
 }
 
 struct StreamControl {
     offset: u64,
-    fds: Vec<Arc<dyn FileOps>>,
+    fds: Vec<ScmRightsFile>,
 }
 
 impl core::fmt::Debug for RingInner {
@@ -4438,7 +4453,7 @@ impl RingBuf {
     }
 
     /// Take ancillary rights associated with the most recent receive.
-    fn take_fds(&self) -> Option<Vec<Arc<dyn FileOps>>> {
+    fn take_fds(&self) -> Option<Vec<ScmRightsFile>> {
         self.inner.lock().delivered_packet_fds.take()
     }
 
@@ -4465,7 +4480,7 @@ impl RingBuf {
         n
     }
 
-    fn write_stream_with_fds(&self, src: &[u8], fds: Vec<Arc<dyn FileOps>>) -> usize {
+    fn write_stream_with_fds(&self, src: &[u8], fds: Vec<ScmRightsFile>) -> usize {
         let mut g = self.inner.lock();
         let was_readable = g.len > 0 || !g.packets.is_empty();
         let avail = RING_CAP - g.len;
@@ -4498,7 +4513,7 @@ impl RingBuf {
         self.write_packet_with_fds(src, Vec::new(), cred)
     }
 
-    fn write_packet_with_fds(&self, src: &[u8], fds: Vec<Arc<dyn FileOps>>, cred: Ucred) -> usize {
+    fn write_packet_with_fds(&self, src: &[u8], fds: Vec<ScmRightsFile>, cred: Ucred) -> usize {
         let mut g = self.inner.lock();
         if src.len() > RING_CAP.saturating_sub(g.packet_bytes) {
             return 0;
@@ -4872,7 +4887,11 @@ fn smoke_unix_dgram_scm_rights_delivers_per_datagram() -> TestResult {
         return TestResult::Fail("failed to bind AF_UNIX datagram receiver");
     }
     let passed: Arc<dyn FileOps> = SocketFile::new(AF_UNIX, SOCK_STREAM);
-    match sender.unix_dgram_sendmsg(b"FDSTORE=1", 0, Some(addr), alloc::vec![passed.clone()]) {
+    let passed_right = ScmRightsFile {
+        ops: passed.clone(),
+        status_flags: 0,
+    };
+    match sender.unix_dgram_sendmsg(b"FDSTORE=1", 0, Some(addr), alloc::vec![passed_right]) {
         Ok(n) if n == b"FDSTORE=1".len() => {}
         _ => return TestResult::Fail("SCM_RIGHTS AF_UNIX datagram send failed"),
     }
@@ -4885,7 +4904,7 @@ fn smoke_unix_dgram_scm_rights_delivers_per_datagram() -> TestResult {
         _ => return TestResult::Fail("AF_UNIX datagram payload was not delivered"),
     }
     let received = receiver.unix_take_recv_fds();
-    if received.len() != 1 || !Arc::ptr_eq(&received[0], &passed) {
+    if received.len() != 1 || !Arc::ptr_eq(&received[0].ops, &passed) {
         return TestResult::Fail("AF_UNIX datagram SCM_RIGHTS batch was not delivered");
     }
     TestResult::Pass
@@ -5040,9 +5059,13 @@ kernel_test_in!(
 fn smoke_unix_stream_rights_follow_byte_boundaries() -> TestResult {
     let ring = RingBuf::new();
     let passed: Arc<dyn FileOps> = SocketFile::new(AF_UNIX, SOCK_STREAM);
+    let passed_right = ScmRightsFile {
+        ops: passed.clone(),
+        status_flags: 0,
+    };
 
     if ring.write(b"plain") != 5
-        || ring.write_stream_with_fds(b"fd", alloc::vec![passed.clone()]) != 2
+        || ring.write_stream_with_fds(b"fd", alloc::vec![passed_right]) != 2
     {
         return TestResult::Fail("failed to seed stream control boundary");
     }
@@ -5059,7 +5082,7 @@ fn smoke_unix_stream_rights_follow_byte_boundaries() -> TestResult {
     let Some(fds) = ring.take_fds() else {
         return TestResult::Fail("rights were not delivered at their marker byte");
     };
-    if fds.len() != 1 || !Arc::ptr_eq(&fds[0], &passed) {
+    if fds.len() != 1 || !Arc::ptr_eq(&fds[0].ops, &passed) {
         return TestResult::Fail("wrong rights batch delivered at stream marker");
     }
     if ring.take_fds().is_some() {
@@ -5076,10 +5099,18 @@ fn smoke_unix_stream_multiple_rights_batches_preserve_order() -> TestResult {
     let ring = RingBuf::new();
     let first: Arc<dyn FileOps> = SocketFile::new(AF_UNIX, SOCK_STREAM);
     let second: Arc<dyn FileOps> = SocketFile::new(AF_UNIX, SOCK_STREAM);
+    let first_right = ScmRightsFile {
+        ops: first.clone(),
+        status_flags: 0,
+    };
+    let second_right = ScmRightsFile {
+        ops: second.clone(),
+        status_flags: 0,
+    };
 
-    if ring.write_stream_with_fds(b"a", alloc::vec![first.clone()]) != 1
+    if ring.write_stream_with_fds(b"a", alloc::vec![first_right]) != 1
         || ring.write(b"-") != 1
-        || ring.write_stream_with_fds(b"b", alloc::vec![second.clone()]) != 1
+        || ring.write_stream_with_fds(b"b", alloc::vec![second_right]) != 1
     {
         return TestResult::Fail("failed to seed multiple stream control batches");
     }
@@ -5091,7 +5122,7 @@ fn smoke_unix_stream_multiple_rights_batches_preserve_order() -> TestResult {
     let Some(first_batch) = ring.take_fds() else {
         return TestResult::Fail("first rights batch was missing");
     };
-    if first_batch.len() != 1 || !Arc::ptr_eq(&first_batch[0], &first) {
+    if first_batch.len() != 1 || !Arc::ptr_eq(&first_batch[0].ops, &first) {
         return TestResult::Fail("first rights batch was reordered");
     }
 
@@ -5102,7 +5133,7 @@ fn smoke_unix_stream_multiple_rights_batches_preserve_order() -> TestResult {
     let Some(second_batch) = ring.take_fds() else {
         return TestResult::Fail("second rights batch was missing");
     };
-    if second_batch.len() != 1 || !Arc::ptr_eq(&second_batch[0], &second) {
+    if second_batch.len() != 1 || !Arc::ptr_eq(&second_batch[0].ops, &second) {
         return TestResult::Fail("second rights batch was reordered or duplicated");
     }
     TestResult::Pass

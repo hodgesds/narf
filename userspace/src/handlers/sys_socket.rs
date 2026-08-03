@@ -28,6 +28,12 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
         return;
     }
     let sock = crate::socket::SocketFile::with_protocol(domain, kind, proto);
+    if sock_nonblock {
+        // SocketFile carries the shared open-file-description view used by
+        // F_GETFL/F_SETFL across dup and SCM_RIGHTS. Keep it in sync with the
+        // fd-table status word installed below.
+        sock.set_nonblock(true);
+    }
     // Stamp the creator's credentials so SO_PEERCRED / SCM_CREDENTIALS on
     // the peer end report this process's real (pid, uid, gid).
     sock.set_local_cred(current_ucred());

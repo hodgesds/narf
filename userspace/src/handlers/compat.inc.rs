@@ -5904,7 +5904,7 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
 fn parse_scm_rights_fds(
     ctrl_ptr: u64,
     ctrl_len: usize,
-) -> Result<alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>>, i64> {
+) -> Result<alloc::vec::Vec<crate::socket::ScmRightsFile>, i64> {
     const SOL_SOCKET: i32 = 1;
     const SCM_RIGHTS: i32 = 1;
     // struct cmsghdr { u64 cmsg_len; i32 cmsg_level; i32 cmsg_type; } = 16 B.
@@ -5941,12 +5941,17 @@ fn parse_scm_rights_fds(
                 if fd < 0 {
                     return Err(9); // EBADF
                 }
-                let Some(ops) =
-                    fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten()
+                let Some(passed) = fd::with_table(task, |t| {
+                    t.get(fd as u32).map(|entry| crate::socket::ScmRightsFile {
+                        ops: entry.ops.clone(),
+                        status_flags: entry.status_flags,
+                    })
+                })
+                .flatten()
                 else {
                     return Err(9); // EBADF: send no payload or partial rights
                 };
-                out.push(ops);
+                out.push(passed);
             }
         }
         // Advance to the next cmsg (CMSG_ALIGN to 8 bytes).
@@ -6003,7 +6008,7 @@ fn install_netlink_ancillary(msg_ptr: u64, pktinfo_group: Option<u32>) {
 /// (0 when there's no ancillary data or the user control buffer is absent).
 fn install_recv_ancillary(
     msg_ptr: u64,
-    fds: alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
+    fds: alloc::vec::Vec<crate::socket::ScmRightsFile>,
     cred: Option<crate::socket::Ucred>,
     cloexec: bool,
 ) -> bool {
@@ -6032,12 +6037,12 @@ fn install_recv_ancillary(
     let mut truncated = rights_to_install < fds.len();
     let task = current_task_id();
     let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
-    for ops in fds.into_iter().take(rights_to_install) {
+    for passed in fds.into_iter().take(rights_to_install) {
         let entry = fd::FdEntry {
-            ops,
+            ops: passed.ops,
             offset: 0,
             flags: if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
-            status_flags: 0,
+            status_flags: passed.status_flags,
         };
         if let Some(newfd) = fd::with_table(task, |t| t.open(entry)) {
             new_fds.push(newfd as i32);
