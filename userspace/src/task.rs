@@ -152,6 +152,39 @@ pub fn dbg_park_snapshot() -> alloc::vec::Vec<(
         .collect()
 }
 
+/// Parked tasks whose epoll set already reports a ready descriptor —
+/// `(tid, pid, epfd)` for each.
+///
+/// A task in this list has been told, by the very readiness scan its own
+/// `epoll_wait` would run, that it has work; it is nonetheless asleep. That
+/// is a stranded wakeup, and it is the one thing that distinguishes a
+/// genuinely idle system from a wedged one: both have zero runnable tasks
+/// and a flat forward-progress counter.
+///
+/// Without this, a lost edge on (say) a compositor's Wayland socket looks
+/// exactly like an idle desktop — every CPU halts, the stall watchdog's
+/// `runnable > 0` guard never trips, and nothing is ever reported.
+pub fn dbg_stranded_wakes() -> alloc::vec::Vec<(u64, u64, u32)> {
+    let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
+    let mut out = alloc::vec::Vec::new();
+    for t in tasks {
+        if !t.uctx.parked_in_syscall.load(Ordering::Relaxed) {
+            continue;
+        }
+        // `epoll_wait_fd` is stored biased by one so zero means "not in an
+        // epoll wait" (fd 0 is a legitimate epoll descriptor).
+        let encoded = t.uctx.epoll_wait_fd.load(Ordering::Relaxed);
+        if encoded == 0 {
+            continue;
+        }
+        let epfd = (encoded - 1) as u32;
+        if crate::epoll::epoll_fd_has_ready(t.tid, epfd) {
+            out.push((t.tid, t.pid.load(Ordering::Relaxed), epfd));
+        }
+    }
+    out
+}
+
 /// The task currently executing on this CPU, if the scheduler has one
 /// published. `None` in kernel-test harness contexts.
 pub fn current_task() -> Option<Arc<Task>> {

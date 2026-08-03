@@ -94,6 +94,14 @@ mod stall_wd {
     static HIGH_WATER: AtomicU64 = AtomicU64::new(0);
     static FLAT_WINDOWS: AtomicU64 = AtomicU64::new(0);
     static DUMPED: AtomicBool = AtomicBool::new(false);
+    /// Flat windows during which NOTHING was runnable — idle, or a lost
+    /// wakeup. Counted separately from `FLAT_WINDOWS` so the two verdicts
+    /// cannot reset each other.
+    static IDLE_FLAT_WINDOWS: AtomicU64 = AtomicU64::new(0);
+    static STRANDED_DUMPED: AtomicBool = AtomicBool::new(false);
+    /// Identity of the last stranded set, so only a PERSISTENT strand
+    /// (the same tasks, window after window) is reported.
+    static LAST_STRANDED_SIG: AtomicU64 = AtomicU64::new(0);
 
     /// Called from the timer-tick path with the interrupted CPL3-or-not
     /// `cs` and `rip`. Records this CPU's last RIP/CPL, then (rate-limited
@@ -172,6 +180,66 @@ mod stall_wd {
         // wedge whose exact rate varies (2k-30k). A healthy run completes
         // (and qemu exits) well before the window count matters, so this
         // only ever fires on a genuine wedge.
+        // One-shot park census, well after the desktop session has settled.
+        // The stranded-epoll check below only sees tasks parked in
+        // epoll_wait; a glib main loop parks in ppoll, and a task blocked on
+        // a futex is invisible to both. When a process is wedged with a
+        // FROZEN cpu counter it is in none of the deadline parks — those
+        // re-fire on the 10 ms I/O backstop and would accumulate time — so
+        // the census is the only way to see which wait it is actually in.
+        if wc == 180 {
+            let _ = writeln!(TrapWriter, "PARK-CENSUS: begin");
+            for (tid, pid, st, dl, fu, fns, fgen, fval, netio, waitchild, flock, parked) in
+                narf_userspace::task::dbg_park_snapshot()
+            {
+                let _ = writeln!(
+                    TrapWriter,
+                    "PARK-CENSUS tid={tid} pid={pid} st={st} deadline={dl} futex={fu:#x} futex_ns={fns:#x} futex_gen={fgen} futex_val={fval:#x} netio={netio} waitchild={waitchild} flock={flock:#x} parked={parked}"
+                );
+            }
+            let _ = writeln!(TrapWriter, "PARK-CENSUS: end");
+        }
+
+        // A single wedged task does not stall the system: other tasks keep
+        // waking on timers, so forward progress never goes flat and the
+        // whole-scheduler check below never fires. That is how a compositor
+        // can sit parked forever while its own epoll set reports work and
+        // nothing anywhere reports a problem.
+        //
+        // Ask the narrower question every window instead: is some parked task
+        // being told it is ready, repeatedly, and still not running? Requiring
+        // the SAME task to stay in that state across consecutive windows keeps
+        // the ordinary race — ready between the scan and the wake — from
+        // reporting anything, since that resolves within one window.
+        if wc > 20 && !STRANDED_DUMPED.load(Ordering::Relaxed) {
+            let stranded = narf_userspace::task::dbg_stranded_wakes();
+            let signature = stranded.iter().fold(0u64, |acc, (tid, _, epfd)| {
+                acc ^ (tid.rotate_left(17) ^ (*epfd as u64))
+            });
+            if !stranded.is_empty()
+                && signature == LAST_STRANDED_SIG.swap(signature, Ordering::Relaxed)
+            {
+                let n = IDLE_FLAT_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n >= 3 {
+                    STRANDED_DUMPED.store(true, Ordering::Relaxed);
+                    let _ = writeln!(
+                        TrapWriter,
+                        "STALL-WD: {} parked task(s) held a READY epoll set across {n} windows — lost wakeup, not idle",
+                        stranded.len()
+                    );
+                    for (tid, pid, epfd) in stranded {
+                        let _ = writeln!(
+                            TrapWriter,
+                            "STALL-WD stranded tid={tid} pid={pid} epfd={epfd}"
+                        );
+                    }
+                    dump(sc);
+                }
+            } else {
+                IDLE_FLAT_WINDOWS.store(0, Ordering::Relaxed);
+                LAST_STRANDED_SIG.store(signature, Ordering::Relaxed);
+            }
+        }
         if wc > 20 && delta < 50_000 && progress == previous_progress && runnable > 0 {
             let flats = FLAT_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
             if flats >= 3 && !DUMPED.swap(true, Ordering::Relaxed) {

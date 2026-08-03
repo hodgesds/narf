@@ -491,7 +491,7 @@ fn epoll_ops(task: u64, epfd: u32) -> Option<Arc<dyn FileOps>> {
 /// Passive post-registration readiness probe for the epoll park handshake.
 /// `FileOps::poll_readiness` mirrors what `collect_ready` would deliver but
 /// does not acknowledge sources, consume EPOLLET tokens, or disarm oneshots.
-pub(crate) fn epoll_fd_has_ready(task: u64, epfd: u32) -> bool {
+pub fn epoll_fd_has_ready(task: u64, epfd: u32) -> bool {
     epoll_ops(task, epfd).is_some_and(|ops| ops.poll_readiness() & narf_filesystem::POLL_IN != 0)
 }
 
