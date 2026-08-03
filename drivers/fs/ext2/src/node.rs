@@ -163,6 +163,13 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
                 for b in dst[total..total + chunk].iter_mut() {
                     *b = 0;
                 }
+            } else if in_block == 0 && chunk == bs as usize {
+                // mmap materialization normally asks for one aligned 4 KiB
+                // filesystem block. Fill the caller's page directly instead
+                // of allocating and copying a same-sized temporary buffer.
+                self.volume
+                    .read_block(physical, &mut dst[total..total + chunk])
+                    .await?;
             } else {
                 let mut blockbuf = vec![0u8; bs as usize];
                 self.volume.read_block(physical, &mut blockbuf).await?;
