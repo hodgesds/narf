@@ -80,8 +80,30 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
             #[cfg(feature = "linux-compat")]
             {
                 let (uid, gid) = current_fs_ids();
-                directory.set_dir_owners(uid, gid);
-                directory.set_dir_mode((mode & !current_umask() & 0o7777) as u16);
+                let owner_result = poll_blocking(directory.set_dir_owners_async(uid, gid));
+                let mode_result = poll_blocking(
+                    // Linux mkdir accepts rwx + sticky. setuid is ignored;
+                    // setgid is inherited from the parent, which NARF's
+                    // simplified credential model does not yet implement.
+                    directory.set_dir_mode_async((mode & !current_umask() & 0o1777) as u16),
+                );
+                let metadata_error = owner_result
+                    .and_then(Result::err)
+                    .or_else(|| mode_result.and_then(Result::err));
+                if owner_result.is_none() || mode_result.is_none() || metadata_error.is_some() {
+                    // Do not report a successful-but-partially-initialized
+                    // directory. Best-effort rollback restores the pre-call
+                    // namespace when metadata persistence fails.
+                    let _ = poll_blocking(parent.rmdir(&leaf));
+                    let errno = match metadata_error {
+                        Some(narf_filesystem::FsError::PermissionDenied) => -13, // EACCES
+                        Some(narf_filesystem::FsError::ReadOnly) => -30, // EROFS
+                        Some(narf_filesystem::FsError::NoSpace) => -28, // ENOSPC
+                        _ => -5,                                       // EIO
+                    };
+                    ctx.set_return(SyscallReturn::ok((errno as i64) as u64));
+                    return;
+                }
                 crate::mqueue::notify_create(&path, true);
             }
             #[cfg(not(feature = "linux-compat"))]

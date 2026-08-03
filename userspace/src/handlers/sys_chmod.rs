@@ -8,9 +8,7 @@ use super::*;
 /// its `chmod(3)` on top of `fchmodat`, but a program (or a NARF-native
 /// caller) that issues the bare `chmod(2)` number must round-trip the
 /// mode too — systemd-tmpfiles `z`/`Z` (file) and `d`/`D` (dir) lines
-/// chmod a path and then stat it to confirm. The accept-and-ignore
-/// `sys_access_chmod_chown` proxy (still used by `access`/`chown`) drops
-/// the mode, so `chmod` gets its own entry point.
+/// chmod a path and then stat it to confirm.
 pub(crate) fn sys_chmod(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Legacy ABI: chmod(path, mode) — arg0 = path ptr, arg1 = mode.

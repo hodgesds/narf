@@ -56,11 +56,15 @@ pub const I_FLAGS_EXTENTS: u32 = 0x0008_0000;
 ///     32     4  i_flags
 ///     36     4  i_osd1 / reserved
 ///     40    60  i_block[15]
+///    120     2  l_i_uid_high (Linux i_osd2)
+///    122     2  l_i_gid_high (Linux i_osd2)
 /// ```
 #[derive(Debug, Copy, Clone)]
 pub struct Inode {
     /// `i_mode` — file type + permission bits.
     pub mode: u16,
+    /// POSIX owner id (`i_uid` plus Linux `l_i_uid_high`).
+    pub uid: u32,
     /// `i_size` — file size, low 32 bits.
     pub size: u32,
     /// `i_atime` — last access time (seconds since UNIX epoch).
@@ -69,6 +73,8 @@ pub struct Inode {
     pub ctime: u32,
     /// `i_mtime` — last data-content modification time.
     pub mtime: u32,
+    /// POSIX group owner id (`i_gid` plus Linux `l_i_gid_high`).
+    pub gid: u32,
     /// `i_blocks` — count of 512-byte sectors held by the file.
     pub blocks: u32,
     /// `i_links_count` (offset 26). Hard-link refcount.
@@ -90,10 +96,14 @@ impl Inode {
             return None;
         }
         let mode = u16::from_le_bytes([buf[0], buf[1]]);
+        let uid = u16::from_le_bytes([buf[2], buf[3]]) as u32
+            | ((u16::from_le_bytes([buf[120], buf[121]]) as u32) << 16);
         let size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
         let atime = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let ctime = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
         let mtime = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        let gid = u16::from_le_bytes([buf[24], buf[25]]) as u32
+            | ((u16::from_le_bytes([buf[122], buf[123]]) as u32) << 16);
         let links_count = u16::from_le_bytes([buf[26], buf[27]]);
         let blocks = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
         let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
@@ -104,10 +114,12 @@ impl Inode {
         }
         Some(Self {
             mode,
+            uid,
             size,
             atime,
             ctime,
             mtime,
+            gid,
             blocks,
             links_count,
             flags,
@@ -143,10 +155,12 @@ impl Inode {
             return;
         }
         buf[0..2].copy_from_slice(&self.mode.to_le_bytes());
+        buf[2..4].copy_from_slice(&(self.uid as u16).to_le_bytes());
         buf[4..8].copy_from_slice(&self.size.to_le_bytes());
         buf[8..12].copy_from_slice(&self.atime.to_le_bytes());
         buf[12..16].copy_from_slice(&self.ctime.to_le_bytes());
         buf[16..20].copy_from_slice(&self.mtime.to_le_bytes());
+        buf[24..26].copy_from_slice(&(self.gid as u16).to_le_bytes());
         buf[26..28].copy_from_slice(&self.links_count.to_le_bytes());
         buf[28..32].copy_from_slice(&self.blocks.to_le_bytes());
         buf[32..36].copy_from_slice(&self.flags.to_le_bytes());
@@ -154,16 +168,20 @@ impl Inode {
             let off = 40 + i * 4;
             buf[off..off + 4].copy_from_slice(&self.block[i].to_le_bytes());
         }
+        buf[120..122].copy_from_slice(&((self.uid >> 16) as u16).to_le_bytes());
+        buf[122..124].copy_from_slice(&((self.gid >> 16) as u16).to_le_bytes());
     }
 
     /// Build a fresh regular-file inode.
     pub fn new_regular(perms: u16) -> Self {
         Self {
             mode: S_IFREG | (perms & 0o777),
+            uid: 0,
             size: 0,
             atime: 0,
             ctime: 0,
             mtime: 0,
+            gid: 0,
             blocks: 0,
             links_count: 1,
             flags: 0,
@@ -175,10 +193,12 @@ impl Inode {
     pub fn new_directory(perms: u16) -> Self {
         Self {
             mode: S_IFDIR | (perms & 0o777),
+            uid: 0,
             size: 0,
             atime: 0,
             ctime: 0,
             mtime: 0,
+            gid: 0,
             blocks: 0,
             // Fresh dir has links_count = 2 ("." back-link + parent's
             // dirent). The parent gets bumped separately for "..".
@@ -194,10 +214,12 @@ impl Inode {
     pub fn new_symlink(perms: u16) -> Self {
         Self {
             mode: S_IFLNK | (perms & 0o777),
+            uid: 0,
             size: 0,
             atime: 0,
             ctime: 0,
             mtime: 0,
+            gid: 0,
             blocks: 0,
             links_count: 1,
             flags: 0,

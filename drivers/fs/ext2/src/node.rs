@@ -41,16 +41,15 @@ use narf_filesystem::{
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::dir::{for_each_entry, ftype};
-use super::inode::Inode;
+use super::inode::{Inode, S_IFMT};
 use super::volume::Ext2Volume;
 
 #[derive(Debug, Copy, Clone)]
 pub struct Ext2NodeState {
     pub inode_no: u32,
     pub stat: Stat,
-    /// Cached inode bytes, lazily populated on first I/O. We do not
-    /// persist mutations through this cache — all writes would
-    /// re-read on each operation. (Read-only cut: never written.)
+    /// Cached inode bytes, populated by lookup or lazily on first I/O and
+    /// refreshed after every data or metadata mutation.
     pub inode: Option<Inode>,
 }
 
@@ -72,6 +71,17 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         }
     }
 
+    pub(crate) fn from_inode(volume: Arc<Ext2Volume<B>>, inode_no: u32, inode: Inode) -> Self {
+        Self {
+            state: IrqSafeSpinLock::new(Ext2NodeState {
+                inode_no,
+                stat: Self::stat_from_inode(&volume, &inode),
+                inode: Some(inode),
+            }),
+            volume,
+        }
+    }
+
     /// Translate an on-disk inode into a VFS `Stat`. Block count is
     /// reported in 512-byte sectors (matching `i_blocks`).
     fn stat_from_inode(volume: &Ext2Volume<B>, inode: &Inode) -> Stat {
@@ -88,7 +98,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
             blocks: inode.blocks as u64,
             mode: Mode {
                 file_type,
-                perms: inode.mode & 0o777,
+                perms: inode.mode & 0o7777,
             },
             mtime_cycles: 0,
         }
@@ -217,11 +227,16 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
 
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            let mut inode = self.load_inode().await?;
+            let _update = self.volume.inode_update_lock.lock().await;
+            // Mutations must start from the current on-disk inode. Distinct
+            // open handles have independent read caches; writing a cached
+            // whole inode here could otherwise undo a chmod/chown completed
+            // through another handle.
+            let inode_no = self.state.lock().inode_no;
+            let mut inode = self.volume.read_inode(inode_no).await?;
             if inode.is_dir() {
                 return Err(FsError::InvalidPath);
             }
-            let inode_no = self.state.lock().inode_no;
             let n = self
                 .volume
                 .write_inode_data(&mut inode, offset, buf)
@@ -255,11 +270,12 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
 
     fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            let mut inode = self.load_inode().await?;
+            let _update = self.volume.inode_update_lock.lock().await;
+            let inode_no = self.state.lock().inode_no;
+            let mut inode = self.volume.read_inode(inode_no).await?;
             if inode.is_dir() {
                 return Err(FsError::InvalidPath);
             }
-            let inode_no = self.state.lock().inode_no;
             if len == 0 {
                 self.volume.truncate_inode(&mut inode).await?;
             } else if (len as u32) <= inode.size {
@@ -279,6 +295,51 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         })
     }
 
+    fn owners(&self) -> (u32, u32) {
+        self.state
+            .lock()
+            .inode
+            .map_or((0, 0), |inode| (inode.uid, inode.gid))
+    }
+
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let _update = self.volume.inode_update_lock.lock().await;
+            let inode_no = self.state.lock().inode_no;
+            let mut inode = self.volume.read_inode(inode_no).await?;
+            inode.uid = uid;
+            inode.gid = gid;
+            if !inode.is_dir() {
+                // Linux chown kills privilege-bearing mode bits on
+                // non-directories (ATTR_KILL_SUID/ATTR_KILL_SGID).
+                inode.mode &= !0o6000;
+            }
+            inode.touch_ctime(Ext2Volume::<B>::now_secs());
+            self.volume.write_inode(inode_no, &inode).await?;
+            let stat = Self::stat_from_inode(&self.volume, &inode);
+            let mut state = self.state.lock();
+            state.inode = Some(inode);
+            state.stat = stat;
+            Ok(())
+        })
+    }
+
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let _update = self.volume.inode_update_lock.lock().await;
+            let inode_no = self.state.lock().inode_no;
+            let mut inode = self.volume.read_inode(inode_no).await?;
+            inode.mode = (inode.mode & S_IFMT) | (perms & 0o7777);
+            inode.touch_ctime(Ext2Volume::<B>::now_secs());
+            self.volume.write_inode(inode_no, &inode).await?;
+            let stat = Self::stat_from_inode(&self.volume, &inode);
+            let mut state = self.state.lock();
+            state.inode = Some(inode);
+            state.stat = stat;
+            Ok(())
+        })
+    }
+
     /// Bridge an opened-directory fd to its `DirOps`. `resolve_async`
     /// returns a directory as an `Ext2Node` *FileOps* (see
     /// `lookup_async`), so `open(dir, O_DIRECTORY)` installs that
@@ -291,11 +352,18 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         if st.stat.mode.file_type != FileType::Dir {
             return None;
         }
-        Some(Arc::new(Ext2Node::new(self.volume.clone(), st.inode_no, st.stat)) as Arc<dyn DirOps>)
+        Some(Arc::new(Ext2Node {
+            volume: self.volume.clone(),
+            state: IrqSafeSpinLock::new(*st),
+        }) as Arc<dyn DirOps>)
     }
 }
 
 impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
+    fn ino(&self) -> u64 {
+        self.state.lock().inode_no as u64
+    }
+
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         // Ext2 lookups are fundamentally async (inode + directory-block reads),
         // but the sync VFS API must still work for callers that can't await —
@@ -329,8 +397,10 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 return Err(FsError::NotFound);
             }
             let target = self.volume.read_inode(found_ino).await?;
-            let stat = Self::stat_from_inode(&self.volume, &target);
-            Ok(Arc::new(Ext2Node::new(self.volume.clone(), found_ino, stat)) as Arc<dyn FileOps>)
+            Ok(
+                Arc::new(Ext2Node::from_inode(self.volume.clone(), found_ino, target))
+                    as Arc<dyn FileOps>,
+            )
         })
     }
 
@@ -368,8 +438,10 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
             if !target.is_dir() && found_type != ftype::DIR {
                 return Err(FsError::NotFound);
             }
-            let stat = Self::stat_from_inode(&self.volume, &target);
-            Ok(Arc::new(Ext2Node::new(self.volume.clone(), found_ino, stat)) as Arc<dyn DirOps>)
+            Ok(
+                Arc::new(Ext2Node::from_inode(self.volume.clone(), found_ino, target))
+                    as Arc<dyn DirOps>,
+            )
         })
     }
 
@@ -419,6 +491,50 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
         })
     }
 
+    fn dir_mode(&self) -> u16 {
+        self.state.lock().stat.mode.perms
+    }
+
+    fn set_dir_mode_async<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let _update = self.volume.inode_update_lock.lock().await;
+            let inode_no = self.state.lock().inode_no;
+            let mut inode = self.volume.read_inode(inode_no).await?;
+            inode.mode = (inode.mode & S_IFMT) | (perms & 0o7777);
+            inode.touch_ctime(Ext2Volume::<B>::now_secs());
+            self.volume.write_inode(inode_no, &inode).await?;
+            let stat = Self::stat_from_inode(&self.volume, &inode);
+            let mut state = self.state.lock();
+            state.inode = Some(inode);
+            state.stat = stat;
+            Ok(())
+        })
+    }
+
+    fn dir_owners(&self) -> (u32, u32) {
+        self.state
+            .lock()
+            .inode
+            .map_or((0, 0), |inode| (inode.uid, inode.gid))
+    }
+
+    fn set_dir_owners_async<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let _update = self.volume.inode_update_lock.lock().await;
+            let inode_no = self.state.lock().inode_no;
+            let mut inode = self.volume.read_inode(inode_no).await?;
+            inode.uid = uid;
+            inode.gid = gid;
+            inode.touch_ctime(Ext2Volume::<B>::now_secs());
+            self.volume.write_inode(inode_no, &inode).await?;
+            let stat = Self::stat_from_inode(&self.volume, &inode);
+            let mut state = self.state.lock();
+            state.inode = Some(inode);
+            state.stat = stat;
+            Ok(())
+        })
+    }
+
     // Directory-mutation surface — wired through to the
     // `dir_mut::dir_*` helpers on `Ext2Volume`. Each method:
     //   * resolves this node's parent-inode number,
@@ -432,8 +548,10 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 .dir_create_regular(parent_ino, name.as_bytes(), 0o644)
                 .await?;
             let target = self.volume.read_inode(new_ino).await?;
-            let stat = Self::stat_from_inode(&self.volume, &target);
-            Ok(Arc::new(Ext2Node::new(self.volume.clone(), new_ino, stat)) as Arc<dyn FileOps>)
+            Ok(
+                Arc::new(Ext2Node::from_inode(self.volume.clone(), new_ino, target))
+                    as Arc<dyn FileOps>,
+            )
         })
     }
     fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
@@ -444,8 +562,10 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 .dir_create_directory(parent_ino, name.as_bytes(), 0o755)
                 .await?;
             let target = self.volume.read_inode(new_ino).await?;
-            let stat = Self::stat_from_inode(&self.volume, &target);
-            Ok(Arc::new(Ext2Node::new(self.volume.clone(), new_ino, stat)) as Arc<dyn DirOps>)
+            Ok(
+                Arc::new(Ext2Node::from_inode(self.volume.clone(), new_ino, target))
+                    as Arc<dyn DirOps>,
+            )
         })
     }
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
@@ -481,8 +601,11 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 .dir_create_symlink(parent_ino, name.as_bytes(), target.as_bytes())
                 .await?;
             let target_inode = self.volume.read_inode(new_ino).await?;
-            let stat = Self::stat_from_inode(&self.volume, &target_inode);
-            Ok(Arc::new(Ext2Node::new(self.volume.clone(), new_ino, stat)) as Arc<dyn FileOps>)
+            Ok(Arc::new(Ext2Node::from_inode(
+                self.volume.clone(),
+                new_ino,
+                target_inode,
+            )) as Arc<dyn FileOps>)
         })
     }
 }

@@ -232,6 +232,53 @@ fn resolve_dir_absolute(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesyst
     .flatten()
 }
 
+/// Resolve a path to its file-shaped node in the current task's mount
+/// namespace. `follow_final` mirrors Linux's `LOOKUP_FOLLOW` choice for the
+/// chmod/chown families.
+fn resolve_file_absolute_ext(
+    path: &str,
+    follow_final: bool,
+) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
+    current_resolve_absolute(path, |fs, rel| {
+        if rel.is_empty() {
+            fs.root_file()
+        } else {
+            poll_blocking(narf_filesystem::resolve_async_ext(
+                fs.root(),
+                rel,
+                follow_final,
+            ))
+            .and_then(Result::ok)
+        }
+    })
+    .flatten()
+}
+
+/// Apply Linux `*at` anchoring before the ordinary cwd/chroot rewrite.
+/// Absolute paths ignore `dirfd`; relative paths require `AT_FDCWD` or an
+/// open directory fd. Errors are negative Linux errno values.
+fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::String, i64> {
+    const AT_FDCWD: i64 = -100;
+    if raw.starts_with('/') || dirfd == AT_FDCWD {
+        return Ok(alloc::string::String::from(raw));
+    }
+    if dirfd < 0 {
+        return Err(-9); // -EBADF
+    }
+    let is_directory = fd::with_table(task, |table| {
+        table
+            .get(dirfd as u32)
+            .map(|entry| entry.ops.as_dir().is_some())
+    })
+    .flatten()
+    .ok_or(-9i64)?;
+    if !is_directory {
+        return Err(-20); // -ENOTDIR
+    }
+    let base = fd_path_for_task(task, dirfd as u32).ok_or(-9i64)?;
+    Ok(alloc::format!("{}/{}", base.trim_end_matches('/'), raw))
+}
+
 /// Stat an absolute path, handling both files and directories.
 /// Files come from the FileOps `stat()`; directories (mount roots and
 /// sub-directories alike) synthesise a `DIR_RW`-shaped stat so callers
@@ -394,6 +441,16 @@ impl narf_filesystem::FileOps for DirFdFile {
     }
     fn owners(&self) -> (u32, u32) {
         self.dir.dir_owners()
+    }
+    fn set_owners<'a>(
+        &'a self,
+        uid: u32,
+        gid: u32,
+    ) -> narf_filesystem::FsFuture<'a, ()> {
+        self.dir.set_dir_owners_async(uid, gid)
+    }
+    fn set_perms<'a>(&'a self, perms: u16) -> narf_filesystem::FsFuture<'a, ()> {
+        self.dir.set_dir_mode_async(perms)
     }
     fn as_dir(&self) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
         Some(self.dir.clone())
@@ -7335,12 +7392,12 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(
         Syscall::Fchmod,
         "fchmod",
-        RawFnHandler(sys_fchmod_or_fchown),
+        RawFnHandler(sys_fchmod),
     );
     table.install_raw(
         Syscall::Fchown,
         "fchown",
-        RawFnHandler(sys_fchmod_or_fchown),
+        RawFnHandler(sys_fchown),
     );
     table.install_raw(Syscall::Fchmodat, "fchmodat", RawFnHandler(sys_fchmodat));
     table.install_raw(
@@ -7380,7 +7437,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(
         Syscall::Chown,
         "chown",
-        RawFnHandler(sys_access_chmod_chown),
+        RawFnHandler(sys_chown),
     );
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
@@ -7527,12 +7584,10 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     // Batch 14: filesystem misc (legacy x86_64-only entries).
     table.install_raw(Syscall::Creat, "creat", RawFnHandler(sys_creat));
-    // lchown shares the chmod/chown path handler (no symlink-follow
-    // distinction in NARF).
     table.install_raw(
         Syscall::Lchown,
         "lchown",
-        RawFnHandler(sys_access_chmod_chown),
+        RawFnHandler(sys_lchown),
     );
     table.install_raw(Syscall::Utime, "utime", RawFnHandler(sys_utime));
     table.install_raw(Syscall::Utimes, "utimes", RawFnHandler(sys_utimes));
@@ -8913,7 +8968,7 @@ pub(crate) use handler_sys_timerfd_gettime::*;
 pub use handler_sys_umount2_for_test::*;
 #[allow(unused_imports)]
 pub(crate) use {
-    handler_sys_access_chmod_chown::{sys_access, sys_access_chmod_chown, sys_faccessat},
+    handler_sys_access_chmod_chown::{sys_access, sys_chown, sys_faccessat, sys_lchown},
     handler_sys_adjtimex::sys_adjtimex,
     handler_sys_at2_reshape::sys_at2_reshape,
     handler_sys_bootstrap::sys_bootstrap,
@@ -8950,8 +9005,8 @@ pub(crate) use {
     handler_sys_fb_info::sys_fb_info,
     handler_sys_fb_ring_map::sys_fb_ring_map,
     handler_sys_fchdir::sys_fchdir,
-    handler_sys_fchmod_or_fchown::sys_fchmod_or_fchown,
-    handler_sys_fchmodat::sys_fchmodat,
+    handler_sys_fchmod_or_fchown::{sys_fchmod, sys_fchown},
+    handler_sys_fchmodat::{sys_fchmodat, sys_fchmodat2},
     handler_sys_fchmodat_or_fchownat::sys_fchmodat_or_fchownat,
     handler_sys_fcntl::sys_fcntl,
     handler_sys_fgetxattr::sys_fgetxattr,

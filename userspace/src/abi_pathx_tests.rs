@@ -5,13 +5,72 @@
 //! the fd-keyed fchmod/fchown, the legacy access/chmod/chown/lchown
 //! entries, statfs, the symlink pair, getdents64/listdir, and the
 //! utime/utimes/utimensat time-stamp no-ops. Uses the shared harness + a
-//! MemFs scratch mount. Most `*at` calls take `(dirfd, path_ptr, …)` with
-//! `dirfd = AT_FDCWD`; NARF ignores the dirfd and requires absolute paths.
+//! MemFs scratch mount. The `*at` cases cover both `AT_FDCWD` and real
+//! directory-fd anchoring.
 #![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
 
 const AT_FDCWD: u64 = (-100i64) as u64;
+
+fn file_owners(path: &str) -> Option<(u32, u32)> {
+    narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel)
+                .ok()
+                .map(|file| file.owners())
+        })
+        .flatten()
+}
+
+fn file_perms(path: &str) -> Option<u16> {
+    narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel)
+                .ok()
+                .map(|file| file.stat().mode.perms)
+        })
+        .flatten()
+}
+
+fn dir_owners(path: &str) -> Option<(u32, u32)> {
+    narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            let mut dir = fs.root();
+            for component in rel.split('/').filter(|part| !part.is_empty()) {
+                dir = dir.lookup_dir(component)?;
+            }
+            Some(dir.dir_owners())
+        })
+        .flatten()
+}
+
+fn dir_perms(path: &str) -> Option<u16> {
+    narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            let mut dir = fs.root();
+            for component in rel.split('/').filter(|part| !part.is_empty()) {
+                dir = dir.lookup_dir(component)?;
+            }
+            Some(dir.dir_mode())
+        })
+        .flatten()
+}
+
+fn lstat_owners(path: &[u8]) -> Option<(u32, u32)> {
+    let mut buf = [0u8; 144];
+    if call(
+        Syscall::Lstat.raw(),
+        a1(path.as_ptr() as u64, buf.as_mut_ptr() as u64),
+    ) != Some(0)
+    {
+        return None;
+    }
+    Some((
+        u32::from_ne_bytes(buf[28..32].try_into().ok()?),
+        u32::from_ne_bytes(buf[32..36].try_into().ok()?),
+    ))
+}
 
 // ── access (NUL-term path, mode) → 0 / -1 ──────────────────────────
 //
@@ -46,9 +105,9 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_access_neg);
 fn smoke_abi_pathx_chmod_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
-        match call_chmod(path.as_ptr() as u64, 0o644) {
-            Some(0) => Ok(()),
-            _ => Err("chmod(existing) should return 0"),
+        match call_chmod(path.as_ptr() as u64, 0o4754) {
+            Some(0) if file_perms("/p2/f") == Some(0o4754) => Ok(()),
+            _ => Err("chmod(existing) did not preserve special mode bits"),
         }
     })
 }
@@ -70,8 +129,8 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_chmod_neg);
 fn smoke_abi_pathx_chown_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
-        match call_chown(path.as_ptr() as u64, 0, 0) {
-            Some(0) => Ok(()),
+        match call_chown(path.as_ptr() as u64, 1000, 1001) {
+            Some(0) if file_owners("/p2/f") == Some((1000, 1001)) => Ok(()),
             _ => Err("chown(existing) should return 0"),
         }
     })
@@ -258,17 +317,14 @@ fn smoke_abi_pathx_faccessat2_empty_path_fd() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_faccessat2_empty_path_fd);
 
-// ── fchmod (fd, mode) → 0 / -1 ─────────────────────────────────────
-//
-// sys_fchmod_or_fchown: arg0 = fd; accept-and-ignore on a known fd,
-// -1 on a closed/unknown fd.
+// ── fchmod (fd, mode) → 0 / errno ──────────────────────────────────
 
 fn smoke_abi_pathx_fchmod_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let fd = open_fd(b"/p2/f\0")?;
-        match call(Syscall::Fchmod.raw(), a1(fd as u64, 0o644)) {
-            Some(0) => Ok(()),
-            _ => Err("fchmod(valid fd) should return 0"),
+        match call(Syscall::Fchmod.raw(), a1(fd as u64, 0o4754)) {
+            Some(0) if file_perms("/p2/f") == Some(0o4754) => Ok(()),
+            _ => Err("fchmod(valid fd) did not preserve special mode bits"),
         }
     })
 }
@@ -276,8 +332,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_fchmod_pos);
 
 fn smoke_abi_pathx_fchmod_neg() -> TestResult {
     with_setup(|| {
-        // bad fd → -1 sentinel.
-        // LINUX-GAP: Linux fchmod(2) on a bad fd returns -EBADF.
+        // Linux fchmod(2) on a bad fd returns -EBADF.
         match call(Syscall::Fchmod.raw(), a1(7373, 0o644)) {
             Some(v) if v == EBADF => Ok(()),
             _ => Err("expected -EBADF"),
@@ -286,13 +341,13 @@ fn smoke_abi_pathx_fchmod_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_fchmod_neg);
 
-// ── fchown (fd, uid, gid) → 0 / -1 (shares sys_fchmod_or_fchown) ───
+// ── fchown (fd, uid, gid) → 0 / -EBADF ─────────────────────────────
 
 fn smoke_abi_pathx_fchown_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let fd = open_fd(b"/p2/f\0")?;
-        match call(Syscall::Fchown.raw(), a2(fd as u64, 0, 0)) {
-            Some(0) => Ok(()),
+        match call(Syscall::Fchown.raw(), a2(fd as u64, 1000, 1001)) {
+            Some(0) if file_owners("/p2/f") == Some((1000, 1001)) => Ok(()),
             _ => Err("fchown(valid fd) should return 0"),
         }
     })
@@ -300,12 +355,9 @@ fn smoke_abi_pathx_fchown_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_pathx_fchown_pos);
 
 fn smoke_abi_pathx_fchown_neg() -> TestResult {
-    with_setup(|| {
-        // LINUX-GAP: Linux fchown(2) on a bad fd returns -EBADF; NARF -1.
-        match call(Syscall::Fchown.raw(), a2(7474, 0, 0)) {
-            Some(v) if v == EBADF => Ok(()),
-            _ => Err("expected -EBADF"),
-        }
+    with_setup(|| match call(Syscall::Fchown.raw(), a2(7474, 0, 0)) {
+        Some(v) if v == EBADF => Ok(()),
+        _ => Err("expected -EBADF"),
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_fchown_neg);
@@ -317,10 +369,10 @@ fn smoke_abi_pathx_fchmodat_pos() -> TestResult {
         let path = b"/p2/f\0";
         match call(
             Syscall::Fchmodat.raw(),
-            a3(AT_FDCWD, path.as_ptr() as u64, 0o644, 0),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0o2754, 0),
         ) {
-            Some(0) => Ok(()),
-            _ => Err("fchmodat(existing) should return 0"),
+            Some(0) if file_perms("/p2/f") == Some(0o2754) => Ok(()),
+            _ => Err("fchmodat(existing) did not preserve special mode bits"),
         }
     })
 }
@@ -340,6 +392,54 @@ fn smoke_abi_pathx_fchmodat_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_fchmodat_neg);
 
+fn smoke_abi_pathx_fchmodat_relative_dirfd_and_legacy_flags() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let dir = b"/p2\0";
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("opening fchmodat parent failed"),
+        };
+        let name = b"f\0";
+        // arg3 is outside legacy fchmodat's ABI. A stale nonzero register must
+        // not be interpreted as fchmodat2 flags.
+        let args = a3(dfd, name.as_ptr() as u64, 0o4750, u64::MAX);
+        if call(Syscall::Fchmodat.raw(), args) != Some(0) || file_perms("/p2/f") != Some(0o4750) {
+            return Err("legacy fchmodat did not anchor at dirfd or ignored arg3 incorrectly");
+        }
+        if call(
+            Syscall::Fchmodat2.raw(),
+            a3(dfd, name.as_ptr() as u64, 0o2750, 0),
+        ) != Some(0)
+            || file_perms("/p2/f") != Some(0o2750)
+        {
+            return Err("fchmodat2 did not resolve a relative path through dirfd");
+        }
+        if call(
+            Syscall::Fchmodat.raw(),
+            a3((-101i64) as u64, name.as_ptr() as u64, 0o600, 0),
+        ) != Some(EBADF)
+        {
+            return Err("fchmodat(relative, invalid negative dirfd) must return EBADF");
+        }
+        let file_fd = open_fd(b"/p2/f\0")?;
+        if call(
+            Syscall::Fchmodat.raw(),
+            a3(file_fd as u64, name.as_ptr() as u64, 0o600, 0),
+        ) != Some(ENOTDIR)
+        {
+            return Err("fchmodat(relative, non-directory fd) must return ENOTDIR");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_fchmodat_relative_dirfd_and_legacy_flags
+);
+
 // ── fchmodat2 (dirfd, NUL-term path, mode, flags) → 0 / -1 ─────────
 
 fn smoke_abi_pathx_fchmodat2_pos() -> TestResult {
@@ -347,10 +447,10 @@ fn smoke_abi_pathx_fchmodat2_pos() -> TestResult {
         let path = b"/p2/f\0";
         match call(
             Syscall::Fchmodat2.raw(),
-            a3(AT_FDCWD, path.as_ptr() as u64, 0o644, 0),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0o1754, 0),
         ) {
-            Some(0) => Ok(()),
-            _ => Err("fchmodat2(existing) should return 0"),
+            Some(0) if file_perms("/p2/f") == Some(0o1754) => Ok(()),
+            _ => Err("fchmodat2(existing) did not preserve special mode bits"),
         }
     })
 }
@@ -370,19 +470,71 @@ fn smoke_abi_pathx_fchmodat2_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_fchmodat2_neg);
 
+fn smoke_abi_pathx_fchmodat2_rejects_unknown_flags() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let path = b"/p2/f\0";
+        match call(
+            Syscall::Fchmodat2.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0o600, 0x4000_0000),
+        ) {
+            Some(EINVAL) if file_perms("/p2/f") != Some(0o600) => Ok(()),
+            _ => Err("fchmodat2 accepted unknown flags"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_fchmodat2_rejects_unknown_flags
+);
+
+// systemd-udevd opens a device O_PATH and applies its final rule metadata via
+// fchmodat2(fd, "", mode, AT_EMPTY_PATH). The empty path names the fd itself;
+// it must never fall through cwd resolution and chmod the caller's directory.
+fn smoke_abi_pathx_fchmodat2_empty_path_fd() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        const O_PATH: u64 = 0o10000000;
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        let path = b"/p2/f\0";
+        let fd = match call_open(path.as_ptr() as u64, O_PATH) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(O_PATH) for fchmodat2 failed"),
+        };
+        let before_dir = dir_perms("/p2");
+        let empty = b"\0";
+        match call(
+            Syscall::Fchmodat2.raw(),
+            a3(fd, empty.as_ptr() as u64, 0o640, AT_EMPTY_PATH),
+        ) {
+            Some(0) if file_perms("/p2/f") == Some(0o640) && dir_perms("/p2") == before_dir => {
+                Ok(())
+            }
+            _ => Err("fchmodat2(AT_EMPTY_PATH) did not update only the fd node"),
+        }?;
+        let dir = b"/p2\0";
+        if call(Syscall::Chdir.raw(), a0(dir.as_ptr() as u64)) != Some(0)
+            || call(
+                Syscall::Fchmodat2.raw(),
+                a3(AT_FDCWD, empty.as_ptr() as u64, 0o1701, AT_EMPTY_PATH),
+            ) != Some(0)
+            || dir_perms("/p2") != Some(0o1701)
+        {
+            return Err("fchmodat2(AT_EMPTY_PATH|AT_FDCWD) did not name cwd");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_fchmodat2_empty_path_fd);
+
 // ── fchownat (dirfd, NUL-term path, uid, gid, flags) → 0 / -1 ──────
 //
-// Shares sys_fchmodat_or_fchownat: only the (dirfd, path) prefix is
-// read; uid/gid/flags are ignored, existence decides the result.
-
 fn smoke_abi_pathx_fchownat_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
         match call(
             Syscall::Fchownat.raw(),
-            a3(AT_FDCWD, path.as_ptr() as u64, 0, 0),
+            a3(AT_FDCWD, path.as_ptr() as u64, 1000, 1001),
         ) {
-            Some(0) => Ok(()),
+            Some(0) if file_owners("/p2/f") == Some((1000, 1001)) => Ok(()),
             _ => Err("fchownat(existing) should return 0"),
         }
     })
@@ -402,6 +554,152 @@ fn smoke_abi_pathx_fchownat_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_fchownat_neg);
+
+fn smoke_abi_pathx_fchownat_empty_path_requires_flag() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        const O_PATH: u64 = 0o10000000;
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        let path = b"/p2/f\0";
+        let fd = match call_open(path.as_ptr() as u64, O_PATH) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(O_PATH) for fchownat failed"),
+        };
+        let empty = b"\0";
+        let with_flag = SyscallArgs {
+            arg0: fd,
+            arg1: empty.as_ptr() as u64,
+            arg2: 1234,
+            arg3: 5678,
+            arg4: AT_EMPTY_PATH,
+            arg5: 0,
+        };
+        if call(Syscall::Fchownat.raw(), with_flag) != Some(0)
+            || file_owners("/p2/f") != Some((1234, 5678))
+        {
+            return Err("fchownat(AT_EMPTY_PATH) did not update the fd node");
+        }
+        let without_flag = SyscallArgs {
+            arg4: 0,
+            arg2: 2222,
+            arg3: 3333,
+            ..with_flag
+        };
+        if call(Syscall::Fchownat.raw(), without_flag) != Some(ENOENT)
+            || file_owners("/p2/f") != Some((1234, 5678))
+        {
+            return Err("fchownat empty path without AT_EMPTY_PATH mutated the fd node");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_fchownat_empty_path_requires_flag
+);
+
+fn smoke_abi_pathx_fchownat_directory_persists() -> TestResult {
+    with_memfs("/p2", "p2", &[], || {
+        let dir = b"/p2/runtime-dir\0";
+        if call_mkdir(dir.as_ptr() as u64, 0o700) != Some(0) {
+            return Err("mkdir(runtime-dir) failed");
+        }
+        match call(
+            Syscall::Fchownat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 1000, 1000),
+        ) {
+            Some(0) if dir_owners("/p2/runtime-dir") == Some((1000, 1000)) => Ok(()),
+            _ => Err("fchownat(directory) did not persist ownership"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_fchownat_directory_persists);
+
+fn smoke_abi_pathx_fchownat_relative_and_minus_one_fields() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let dir = b"/p2\0";
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("opening fchownat parent failed"),
+        };
+        let name = b"f\0";
+        if call(
+            Syscall::Fchownat.raw(),
+            a3(dfd, name.as_ptr() as u64, 1234, 5678),
+        ) != Some(0)
+            || file_owners("/p2/f") != Some((1234, 5678))
+        {
+            return Err("fchownat relative dirfd did not update owners");
+        }
+        if call(
+            Syscall::Fchownat.raw(),
+            a3(dfd, name.as_ptr() as u64, u32::MAX as u64, 6789),
+        ) != Some(0)
+            || file_owners("/p2/f") != Some((1234, 6789))
+        {
+            return Err("fchownat uid=-1 did not preserve uid");
+        }
+        let unknown_flags = SyscallArgs {
+            arg0: dfd,
+            arg1: name.as_ptr() as u64,
+            arg2: 1,
+            arg3: 2,
+            arg4: 0x4000_0000,
+            arg5: 0,
+        };
+        if call(Syscall::Fchownat.raw(), unknown_flags) != Some(EINVAL) {
+            return Err("fchownat accepted unknown flags");
+        }
+        if call(
+            Syscall::Fchownat.raw(),
+            a3((-101i64) as u64, name.as_ptr() as u64, 1, 2),
+        ) != Some(EBADF)
+        {
+            return Err("fchownat(relative, invalid negative dirfd) must return EBADF");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_fchownat_relative_and_minus_one_fields
+);
+
+fn smoke_abi_pathx_chown_follow_and_lchown_nofollow() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let target = b"f\0";
+        let link = b"/p2/sl-meta\0";
+        if call_symlink(target.as_ptr() as u64, link.as_ptr() as u64) != Some(0) {
+            return Err("metadata symlink creation failed");
+        }
+        if call_chmod(link.as_ptr() as u64, 0o6755) != Some(0)
+            || file_perms("/p2/f") != Some(0o6755)
+            || call(
+                Syscall::Fchmodat2.raw(),
+                a3(AT_FDCWD, link.as_ptr() as u64, 0o600, 0x100),
+            ) != Some(-95)
+            || file_perms("/p2/f") != Some(0o6755)
+            || call(Syscall::Chown.raw(), a2(link.as_ptr() as u64, 1000, 1001)) != Some(0)
+            || file_owners("/p2/f") != Some((1000, 1001))
+            || file_perms("/p2/f") != Some(0o755)
+        {
+            return Err("chown did not follow symlink and clear privilege bits");
+        }
+        if call(Syscall::Lchown.raw(), a2(link.as_ptr() as u64, 2000, 2001)) != Some(0)
+            || lstat_owners(link) != Some((2000, 2001))
+            || file_owners("/p2/f") != Some((1000, 1001))
+        {
+            return Err("lchown did not update only the symlink inode");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_chown_follow_and_lchown_nofollow
+);
 
 // ── newfstatat (dirfd, NUL-term path, statbuf, flags) → 0 / -1 ─────
 

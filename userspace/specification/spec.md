@@ -135,6 +135,17 @@ minimal `sockaddr_un` containing only `sa_family` from `getpeername(2)`;
 truncated output still reports the full address length.
 `open(2)`/`openat(2)` reject an empty pathname with `ENOENT` before cwd
 normalization; an empty path never aliases the current directory.
+The chmod/chown syscall families resolve relative `*at` paths through a real
+directory fd, reject invalid flags and dirfd shapes with Linux errnos, and
+follow the final symlink unless `AT_SYMLINK_NOFOLLOW` selects the link inode.
+Legacy `fchmodat` always uses zero flags; `fchmodat2` supports
+`AT_EMPTY_PATH`, including `AT_FDCWD` naming cwd. Chmod preserves all `07777`
+mode bits. Chown preserves a field requested as `(uid_t)-1` and clears setuid
+and setgid on non-directories. Successful disk-backed metadata calls return
+only after persistence; failures do not emit an attribute notification.
+Credential-based authorization of these mutations is not yet enforced by the
+Linux-compatibility shim; capability-based filesystem authority remains the
+security boundary.
 `clock_gettime(2)` accepts realtime/monotonic coarse clocks and process/thread
 CPU clocks. Coarse clocks currently use the precise source; CPU clocks use the
 calling task's accumulated user and kernel accounting.

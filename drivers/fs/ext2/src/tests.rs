@@ -180,9 +180,13 @@ fn smoke_ext2_inode_parse_block_pointers() -> TestResult {
     // block pointers + a single-indirect pointer.
     let mut buf = vec![0u8; 128];
     buf[0..2].copy_from_slice(&0x41EDu16.to_le_bytes()); // S_IFDIR | 0755
+    buf[2..4].copy_from_slice(&0x5678u16.to_le_bytes()); // i_uid low
     buf[4..8].copy_from_slice(&1024u32.to_le_bytes()); // size
     buf[28..32].copy_from_slice(&2u32.to_le_bytes()); // i_blocks (sectors)
-                                                      // i_block[0..14]
+    buf[24..26].copy_from_slice(&0xdef0u16.to_le_bytes()); // i_gid low
+    buf[120..122].copy_from_slice(&0x1234u16.to_le_bytes()); // i_uid high
+    buf[122..124].copy_from_slice(&0x9abcu16.to_le_bytes()); // i_gid high
+                                                             // i_block[0..14]
     let ptrs: [u32; 15] = [
         9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 12 direct
         77, 0, 0, // single, double, triple
@@ -202,8 +206,20 @@ fn smoke_ext2_inode_parse_block_pointers() -> TestResult {
     if inode.size != 1024 {
         return TestResult::Fail("size mismatch");
     }
+    if inode.uid != 0x1234_5678 || inode.gid != 0x9abc_def0 {
+        return TestResult::Fail("32-bit inode owners mismatch");
+    }
     if inode.block[0] != 9 || inode.block[1] != 10 || inode.block[12] != 77 {
         return TestResult::Fail("block pointer mismatch");
+    }
+    let mut encoded = vec![0u8; 128];
+    inode.encode_into(&mut encoded);
+    let reparsed = match Inode::parse(&encoded) {
+        Some(inode) => inode,
+        None => return TestResult::Fail("encoded inode did not parse"),
+    };
+    if reparsed.uid != inode.uid || reparsed.gid != inode.gid {
+        return TestResult::Fail("32-bit inode owners did not encode round-trip");
     }
     TestResult::Pass
 }
@@ -1811,6 +1827,116 @@ fn smoke_ext2_mkdir_then_rmdir_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_mkdir_then_rmdir_round_trip);
+
+fn smoke_ext2_created_metadata_persists() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    let file = match poll_once(root.create("owned-file")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    // Cache the original inode in two independent handles before metadata is
+    // changed. A later chmod or data write through either handle must merge
+    // with the current inode, not restore its stale uid/gid snapshot.
+    let stale_mode = match poll_once(root.lookup_async("owned-file")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("stale chmod handle lookup failed"),
+    };
+    let stale_writer = match poll_once(root.lookup_async("owned-file")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("stale writer handle lookup failed"),
+    };
+    if poll_once(file.set_owners(0x1234_5678, 0x9abc_def0))
+        .and_then(Result::ok)
+        .is_none()
+        || poll_once(stale_mode.set_perms(0o4640))
+            .and_then(Result::ok)
+            .is_none()
+        || !matches!(poll_once(stale_writer.write(0, b"x")), Some(Ok(1)))
+    {
+        return TestResult::Fail("file metadata update failed");
+    }
+    drop(file);
+    let file = match poll_once(root.lookup_async("owned-file")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("file relookup failed"),
+    };
+    if file.owners() != (0x1234_5678, 0x9abc_def0) || file.stat().mode.perms != 0o4640 {
+        return TestResult::Fail("file metadata did not persist");
+    }
+    if poll_once(file.set_owners(1000, 1001))
+        .and_then(Result::ok)
+        .is_none()
+    {
+        return TestResult::Fail("second file ownership update failed");
+    }
+    let file = match poll_once(root.lookup_async("owned-file")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("file relookup after chown failed"),
+    };
+    if file.owners() != (1000, 1001) || file.stat().mode.perms != 0o640 {
+        return TestResult::Fail("chown did not clear file privilege bits");
+    }
+
+    let dir = match poll_once(root.mkdir("owned-dir")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    let stale_dir = match poll_once(root.lookup_dir_async("owned-dir")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("stale directory handle lookup failed"),
+    };
+    if poll_once(dir.set_dir_owners_async(2000, 2001))
+        .and_then(Result::ok)
+        .is_none()
+        || poll_once(stale_dir.set_dir_mode_async(0o2750))
+            .and_then(Result::ok)
+            .is_none()
+    {
+        return TestResult::Fail("directory metadata update failed");
+    }
+    drop(dir);
+    let dir = match poll_once(root.lookup_dir_async("owned-dir")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("directory relookup failed"),
+    };
+    if dir.dir_owners() != (2000, 2001) || dir.dir_mode() != 0o2750 {
+        return TestResult::Fail("directory metadata did not persist");
+    }
+
+    // `FsInstance::root()` creates a fresh handle each time. Metadata must
+    // come from inode 2, not from a synthetic 0555/root-owned sentinel.
+    let root_owner_handle = volume.root();
+    let root_mode_handle = volume.root();
+    if poll_once(root_owner_handle.set_dir_owners_async(3000, 3001))
+        .and_then(Result::ok)
+        .is_none()
+        || poll_once(root_mode_handle.set_dir_mode_async(0o1770))
+            .and_then(Result::ok)
+            .is_none()
+    {
+        return TestResult::Fail("root inode metadata update failed");
+    }
+    let fresh_root = volume.root();
+    if fresh_root.dir_owners() != (3000, 3001) || fresh_root.dir_mode() != 0o1770 {
+        return TestResult::Fail("fresh root handle did not observe inode 2 metadata");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_created_metadata_persists);
 
 fn smoke_ext2_rename_within_same_dir() -> TestResult {
     use narf_block::ram::RamBlockDevice;

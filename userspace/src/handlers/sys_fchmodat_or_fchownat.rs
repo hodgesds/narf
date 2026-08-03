@@ -1,72 +1,117 @@
 #[allow(unused_imports)]
 use super::*;
 
+fn chown_errno(error: narf_filesystem::FsError) -> i64 {
+    match error {
+        narf_filesystem::FsError::NotFound => -2,
+        narf_filesystem::FsError::PermissionDenied => -1,
+        narf_filesystem::FsError::InvalidPath => -22,
+        narf_filesystem::FsError::NoSpace => -28,
+        narf_filesystem::FsError::ReadOnly => -30,
+        narf_filesystem::FsError::Unsupported => -95,
+        _ => -5,
+    }
+}
+
+/// `fchownat(dirfd, path, uid, gid, flags)`.
 pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+
     let args = *ctx.args();
-    let dirfd = args.arg0 as i64;
-    let path_uptr = args.arg1;
-    // access(2) semantics: a missing path is ENOENT, not the -1 sentinel
-    // (which musl maps to EPERM). sd-device (libudev/elogind) keys
-    // `errno == ENOENT` when validating a /sys/devices/<...> node's
-    // `uevent`, so the wrong errno makes it reject the whole device.
-    let missing = SyscallReturn::ok((-2i64) as u64); // -ENOENT
-                                                     // Linux ABI: faccessat/fchmodat/fchownat take a NUL-terminated path
-                                                     // in arg1 — arg2 is mode/owner, NOT a length. (Reading arg2 as a
-                                                     // length truncated the path to mode-many bytes: `access("/dev/shm/
-                                                     // nums", R_OK)` opened "/dev/s" and failed, breaking busybox grep.)
-    let raw = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
+    let flags = args.arg4;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        return;
+    }
+    let raw = match copy_user_cstr(args.arg1, 4096) {
+        Some(path) => path,
         None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
             return;
         }
     };
-    // Honour a real directory fd for relative paths (mirrors `sys_openat`).
-    // `faccessat(dirfd, "uevent", F_OK)` is how sd-device probes whether a
-    // `/sys/devices/<...>` node is a real device; ignoring `dirfd` resolved
-    // "uevent" against the CWD (always missing) → EPERM → every input/evdev
-    // `TakeDevice` failed even though the node exists. `fd_path_of` returns
-    // the dir's chroot-relative path; `stat_path_dir_aware` re-applies the
-    // chroot, so a chrooted process (elogind under /mnt) resolves in its
-    // own namespace. See the twin fix in `sys_openat`.
-    const AT_FDCWD: i64 = -100;
-    // AT_EMPTY_PATH: an empty path names the fd ITSELF. glibc's access_fd()
-    // does faccessat2(fd, "", mode, AT_EMPTY_PATH) to test an O_PATH fd for
-    // X_OK — systemd's open_and_check_executable / find_executable_full relies
-    // on exactly this to confirm a service binary is executable before execve.
-    // An already-open fd trivially exists (NARF enforces existence, not mode),
-    // so report success. The relative-join arm below would instead append "/"
-    // to the fd's path (empty `raw`), turning a regular-file fd into a
-    // directory-shaped path that stat_path_dir_aware misses → ENOENT →
-    // every sandboxed service dying 203/EXIT_EXEC.
-    if raw.is_empty() && dirfd >= 0 {
-        let valid =
-            fd::with_table(current_task_id(), |t| t.get(dirfd as u32).is_some()).unwrap_or(false);
-        ctx.set_return(if valid {
-            SyscallReturn::ok(0)
+
+    if raw.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+            return;
+        }
+        if args.arg0 as i64 == -100 {
+            let path = resolve_cwd_path(current_task_id(), ".");
+            if let Some(dir) = resolve_dir_absolute(&path) {
+                let (old_uid, old_gid) = dir.dir_owners();
+                let uid = if args.arg2 as u32 == u32::MAX { old_uid } else { args.arg2 as u32 };
+                let gid = if args.arg3 as u32 == u32::MAX { old_gid } else { args.arg3 as u32 };
+                match poll_blocking(dir.set_dir_owners_async(uid, gid)) {
+                    Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
+                    Some(Err(error)) => ctx.set_return(SyscallReturn::ok(chown_errno(error) as u64)),
+                    None => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
+                }
+            } else {
+                ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+            }
+        } else if args.arg0 as i64 >= 0 {
+            let proxy_args = SyscallArgs {
+                arg0: args.arg0,
+                arg1: args.arg2,
+                arg2: args.arg3,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            };
+            let mut proxy = ArgReshape { inner: ctx, args: proxy_args };
+            sys_fchown(&mut proxy);
         } else {
-            SyscallReturn::ok((-9i64) as u64) // -EBADF
-        });
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        }
         return;
     }
-    let effective = if raw.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
-        raw
-    } else {
-        match fd_path_for_task(current_task_id(), dirfd as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
-            }
-            // Unknown / non-directory fd → best-effort cwd-relative resolve.
-            _ => raw,
+
+    let task = current_task_id();
+    let effective = match resolve_at_path(task, args.arg0 as i64, &raw) {
+        Ok(path) => path,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
         }
     };
-    let path = resolve_cwd_path(current_task_id(), &effective);
-    // Existence check over files AND directories. mode/uid/gid are
-    // structural-only state NARF doesn't enforce, so report success iff
-    // the path exists (covers access(2) F_OK and grants R/W/X).
-    if stat_path_dir_aware(&path).is_some() {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(missing);
+    let path = resolve_cwd_path(task, &effective);
+    let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let requested_uid = args.arg2 as u32;
+    let requested_gid = args.arg3 as u32;
+
+    if let Some(file) = resolve_file_absolute_ext(&path, follow_final) {
+        let (old_uid, old_gid) = file.owners();
+        let uid = if requested_uid == u32::MAX { old_uid } else { requested_uid };
+        let gid = if requested_gid == u32::MAX { old_gid } else { requested_gid };
+        match poll_blocking(file.set_owners(uid, gid)) {
+            Some(Ok(())) => {
+                #[cfg(feature = "linux-compat")]
+                crate::mqueue::notify_attrib(&path, file.as_dir().is_some());
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+            Some(Err(error)) => ctx.set_return(SyscallReturn::ok(chown_errno(error) as u64)),
+            None => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
+        }
+        return;
     }
+
+    if let Some(dir) = resolve_dir_absolute(&path) {
+        let (old_uid, old_gid) = dir.dir_owners();
+        let uid = if requested_uid == u32::MAX { old_uid } else { requested_uid };
+        let gid = if requested_gid == u32::MAX { old_gid } else { requested_gid };
+        match poll_blocking(dir.set_dir_owners_async(uid, gid)) {
+            Some(Ok(())) => {
+                #[cfg(feature = "linux-compat")]
+                crate::mqueue::notify_attrib(&path, true);
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+            Some(Err(error)) => ctx.set_return(SyscallReturn::ok(chown_errno(error) as u64)),
+            None => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
+        }
+        return;
+    }
+
+    ctx.set_return(SyscallReturn::ok((-2i64) as u64));
 }
