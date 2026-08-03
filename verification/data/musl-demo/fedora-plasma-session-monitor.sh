@@ -1,0 +1,47 @@
+#!/bin/bash
+# Keep this trace at the D-Bus protocol boundary: KWin's Wayland wrapper does
+# not claim org.kde.KWinWrapper until every launch-environment update replies.
+# The serial/reply_serial pairs identify the exact request holding that gate.
+echo "PLASMA-DBUS-MONITOR starting"
+/usr/bin/dbus-monitor --session --monitor \
+  "type='method_call',interface='org.kde.Startup',member='updateLaunchEnv'" \
+  "type='method_call',interface='org.freedesktop.DBus',member='UpdateActivationEnvironment'" \
+  "type='method_call',interface='org.freedesktop.DBus',member='StartServiceByName'" \
+  "type='method_call',interface='org.freedesktop.DBus',member='AddMatch'" \
+  "type='method_call',interface='org.freedesktop.DBus',member='RemoveMatch'" \
+  "type='method_call',interface='org.freedesktop.systemd1.Manager',member='SetEnvironment'" \
+  "type='method_return'" \
+  "type='error'" \
+  "type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.kde.KWinWrapper'" \
+  "type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.kde.kcminit'" \
+  "type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.kde.kded6'" \
+  "type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.kde.ksmserver'" &
+
+# Test the GLib D-Bus delivery layer independently of Qt's
+# QDBusServiceWatcher. The external bus monitor proves that the daemon emits
+# NameOwnerChanged; this waiter proves that a separate GLib client can install
+# a match, park its main context, consume the same ownership transition, and
+# return. Keep it unbounded so a missing delivery remains visible for the
+# lifetime of the acceptance run.
+(
+  echo "PLASMA-GDBUS-WAIT kded start"
+  /usr/bin/gdbus wait --session org.kde.kded6
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    echo "PLASMA-GDBUS-WAIT kded observed"
+  else
+    echo "PLASMA-GDBUS-WAIT kded failed status=$status"
+  fi
+) &
+
+# Resume the classic-session sequence after the one proven StartServiceJob
+# callback gate. The supervisor uses the same focused Qt watcher exercised by
+# the preceding replay and logs each process/name boundary.
+/usr/local/libexec/narf-plasma-classic-supervisor &
+
+# Give the monitor time to install its match rules before startplasma can
+# launch KWin and submit the environment-update batch. This also lets the
+# independent GLib waiter and classic supervisor install their matches before
+# kded can be started.
+/usr/bin/sleep 1
+exec /usr/bin/startplasma-wayland

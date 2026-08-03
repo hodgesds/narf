@@ -17,6 +17,21 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn poll_once<F: core::future::Future>(fut: F) -> Option<F::Output> {
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(|data| RawWaker::new(data, &VTABLE), |_| {}, |_| {}, |_| {});
+    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+    // SAFETY: VTABLE contains valid no-op operations and does not dereference data.
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = Context::from_waker(&waker);
+    let mut pinned = core::pin::pin!(fut);
+    match pinned.as_mut().poll(&mut cx) {
+        Poll::Ready(value) => Some(value),
+        Poll::Pending => None,
+    }
+}
+
 // ── Fake MMIO window ─────────────────────────────────────────────────────
 
 /// 16 MiB in-memory MMIO window.  `read16` / `write16` / `read32` /
@@ -1121,9 +1136,24 @@ fn smoke_devdri_card0_resolves() -> TestResult {
     }));
 
     let dir = DriDir;
-    match dir.lookup("card0") {
-        Some(_) => {}
+    let node = match dir.lookup("card0") {
+        Some(node) => node,
         None => return TestResult::Fail("/dev/dri/card0 not found via DriDir::lookup"),
+    };
+    if node.stat().mode.perms != 0o600 || node.owners() != (0, 0) {
+        return TestResult::Fail("/dev/dri/card0 initial metadata is not root:root 0600");
+    }
+    if !matches!(poll_once(node.set_owners(1234, 5678)), Some(Ok(())))
+        || !matches!(poll_once(node.set_perms(0o641)), Some(Ok(())))
+    {
+        return TestResult::Fail("/dev/dri/card0 metadata update failed");
+    }
+    let fresh = match dir.lookup("card0") {
+        Some(node) => node,
+        None => return TestResult::Fail("/dev/dri/card0 vanished after metadata update"),
+    };
+    if fresh.stat().mode.perms != 0o641 || fresh.owners() != (1234, 5678) {
+        return TestResult::Fail("/dev/dri/card0 metadata did not persist across lookup");
     }
 
     drm_registry::__reset_for_test();
@@ -1148,9 +1178,24 @@ fn smoke_devdri_render128_resolves() -> TestResult {
     }));
 
     let dir = DriDir;
-    match dir.lookup("renderD128") {
-        Some(_) => {}
+    let node = match dir.lookup("renderD128") {
+        Some(node) => node,
         None => return TestResult::Fail("/dev/dri/renderD128 not found via DriDir::lookup"),
+    };
+    if node.stat().mode.perms != 0o600 || node.owners() != (0, 0) {
+        return TestResult::Fail("/dev/dri/renderD128 initial metadata is not root:root 0600");
+    }
+    if !matches!(poll_once(node.set_owners(4321, 8765)), Some(Ok(())))
+        || !matches!(poll_once(node.set_perms(0o624)), Some(Ok(())))
+    {
+        return TestResult::Fail("/dev/dri/renderD128 metadata update failed");
+    }
+    let fresh = match dir.lookup("renderD128") {
+        Some(node) => node,
+        None => return TestResult::Fail("/dev/dri/renderD128 vanished after metadata update"),
+    };
+    if fresh.stat().mode.perms != 0o624 || fresh.owners() != (4321, 8765) {
+        return TestResult::Fail("/dev/dri/renderD128 metadata did not persist across lookup");
     }
 
     drm_registry::__reset_for_test();

@@ -130,6 +130,10 @@ pub struct EpollInstance {
 struct EpollInner {
     /// fd → interest record.
     interest: BTreeMap<i32, EpollItem>,
+    /// Last entry returned by a wait. Level-triggered entries remain ready,
+    /// so begin the next scan after this fd to match Linux ready-list
+    /// round-robin behavior when readiness exceeds `maxevents`.
+    scan_after: Option<i32>,
 }
 
 /// Poll one fd's readiness WITHOUT holding the fd-table lock across the
@@ -163,6 +167,7 @@ impl EpollInstance {
         Arc::new(Self {
             inner: IrqSafeSpinLock::new(EpollInner {
                 interest: BTreeMap::new(),
+                scan_after: None,
             }),
         })
     }
@@ -237,18 +242,23 @@ impl EpollInstance {
 
     /// Return a vector of (events, data) pairs for ready fds.
     /// Consults the current fd-table for each interest item.
-    fn collect_ready(&self, task_id: u64) -> Vec<(u32, u64)> {
+    fn collect_ready(&self, task_id: u64, maxevents: usize) -> Vec<(u32, u64)> {
         let owner_id = task_id; // simplified owner model
 
         // Snapshot interest table so we don't hold the lock across
         // the poll_readiness() calls (which may themselves lock).
         let snapshot: Vec<(i32, EpollItem)> = {
-            self.inner
-                .lock()
-                .interest
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect()
+            let g = self.inner.lock();
+            let mut entries: Vec<_> = g.interest.iter().map(|(k, v)| (*k, v.clone())).collect();
+            if let Some(after) = g.scan_after {
+                // Linux moves a delivered level-triggered item to the tail of
+                // its ready list. Rotating this rescan has the same observable
+                // fairness: successive short waits visit later ready fds.
+                if let Some(start) = entries.iter().position(|(fd, _)| *fd > after) {
+                    entries.rotate_left(start);
+                }
+            }
+            entries
         };
 
         let mut results = Vec::new();
@@ -259,6 +269,13 @@ impl EpollInstance {
         let mut observed = Vec::new();
         let mut delivered_fds = Vec::new();
         for (fd, item) in &snapshot {
+            // `maxevents` limits acceptance, not merely userspace copying.
+            // Do not poll, acknowledge, advance edge state, take an exclusive
+            // claim, or disarm a one-shot entry that this wait cannot return.
+            // Such entries must remain pending for the next epoll_wait.
+            if results.len() == maxevents {
+                break;
+            }
             // Disarmed EPOLLONESHOT items (events bitmask zeroed below)
             // are skipped immediately.
             if (item.events & EPOLLONESHOT) != 0
@@ -330,6 +347,9 @@ impl EpollInstance {
                         item.events &= EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE;
                     }
                 }
+            }
+            if let Some(fd) = delivered_fds.last() {
+                g.scan_after = Some(*fd);
             }
         }
 
@@ -466,6 +486,13 @@ impl FileOps for EpollInstance {
 /// Clone `epfd`'s `Arc<dyn FileOps>` out of `task`'s fd table.
 fn epoll_ops(task: u64, epfd: u32) -> Option<Arc<dyn FileOps>> {
     fd::with_table(task, |t| t.get(epfd).map(|e| e.ops.clone())).flatten()
+}
+
+/// Passive post-registration readiness probe for the epoll park handshake.
+/// `FileOps::poll_readiness` mirrors what `collect_ready` would deliver but
+/// does not acknowledge sources, consume EPOLLET tokens, or disarm oneshots.
+pub(crate) fn epoll_fd_has_ready(task: u64, epfd: u32) -> bool {
+    epoll_ops(task, epfd).is_some_and(|ops| ops.poll_readiness() & narf_filesystem::POLL_IN != 0)
 }
 
 /// View an fd's ops as an `EpollInstance`, if it is one.
@@ -856,6 +883,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
         // live for this trap; both are atomic fields.
         unsafe {
             (*uctx_ptr).net_io_wait.store(false, Ordering::Release);
+            (*uctx_ptr).epoll_wait_fd.store(0, Ordering::Release);
             // Snapshot the net readiness generation BEFORE the
             // readiness check below, so the poll routine can detect a
             // notify that races our check→park window.
@@ -902,8 +930,8 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
     };
 
     loop {
-        let ready = instance.collect_ready(task);
-        let n = ready.len().min(maxevents);
+        let ready = instance.collect_ready(task, maxevents);
+        let n = ready.len();
         if n > 0 {
             if let Some(uctx_ptr) = uctx_opt {
                 // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx` from
@@ -1015,6 +1043,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                             // wakeups (immediate re-poll on TCP data instead
                             // of waiting out the deadline).
                             uc.net_io_wait.store(true, Ordering::Release);
+                            uc.epoll_wait_fd.store((epfd as u64) + 1, Ordering::Release);
                             // Clamp the scheduler wake-up to the nearest armed
                             // timerfd in the interest set. A timerfd expiry does
                             // NOT fire a readiness notify (unlike socket data), so

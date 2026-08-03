@@ -116,7 +116,9 @@ query to consume an event owned by its inner monitor.
 `open_instance` defaults to `None`. Clone devices return a fresh open-file
 object so lookup/stat and `O_PATH` remain side-effect free; the Linux open path
 calls it only after access checks. `/dev/pts/ptmx` returns a fresh PTY master
-and `/dev/fuse` returns a fresh FUSE daemon connection.
+and `/dev/fuse` returns a fresh FUSE daemon connection. The stable `/dev/fuse`
+clone node is mode 0666 so unprivileged filesystem and desktop-portal daemons
+can open it, matching Linux distribution tmpfiles/udev policy.
 
 `DevFs` identifies itself as `devtmpfs`. Character and block nodes remain
 distinct through VFS stat and readdir translation, carry Linux `st_rdev`
@@ -223,13 +225,21 @@ pub fn rename(src: &DirCap, src_name: &str, dst: &DirCap, dst_name: &str, cap: â
 pub trait DirOps {
     fn dir_owners(&self) -> (u32, u32);
     fn set_dir_owners(&self, uid: u32, gid: u32);
+    async fn set_dir_owners_async(&self, uid: u32, gid: u32) -> Result<(), FsError>;
+    async fn set_dir_mode_async(&self, perms: u16) -> Result<(), FsError>;
 }
 ```
 
 Directory-owner accessors default to root ownership and a no-op setter for
 read-only/synthetic filesystems. Writable in-memory filesystems preserve the
 values through mount-root `uid=`/`gid=`, mkdir inheritance, path stat,
-directory-fd stat, and access checks.
+directory-fd stat, and access checks. Disk-backed filesystems override the
+asynchronous setters so `mkdir`, `chmod`, and ownership changes are persisted
+before the syscall completes; the default async implementations retain the
+synchronous setter behaviour for in-memory and synthetic filesystems. Mode
+setters carry Linux's low 12 `S_IALLUGO` bits (`07777`). A writable overlay
+copies up a lower-only directory before applying asynchronous mode or owner
+updates; a persistence or copy-up failure is returned to the syscall layer.
 
 ### 3.5 Mount
 
@@ -325,6 +335,8 @@ pub trait Filesystem: Send + Sync {
 pub trait DirOps: Send + Sync {
     fn dir_owners(&self) -> (u32, u32);
     fn set_dir_owners(&self, uid: u32, gid: u32);
+    async fn set_dir_owners_async(&self, uid: u32, gid: u32) -> Result<(), FsError>;
+    async fn set_dir_mode_async(&self, perms: u16) -> Result<(), FsError>;
     async fn fsync(&self, data_only: bool) -> Result<(), FsError>;
     async fn syncfs(&self) -> Result<(), FsError>;
     /* â€¦ */

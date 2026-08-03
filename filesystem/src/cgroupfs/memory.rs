@@ -49,7 +49,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -79,19 +79,56 @@ const FILES: &[&str] = &[
 /// first time any `memory` cgroup state is created (`new_state`), so no
 /// external boot wiring is required.
 static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
-static IN_CHARGE: AtomicBool = AtomicBool::new(false);
+
+// Charge-hook recursion is local to the CPU executing the allocator. A
+// process on another CPU must still be accounted while this CPU is walking
+// its cgroup chain. The old single AtomicBool made every concurrent charge a
+// false "recursive" entry and silently let it through unaccounted.
+static IN_CHARGE: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+// Cgroup membership bookkeeping is kernel metadata, and mutating its
+// BTreeMap can itself allocate or free a slab page. The allocator charge hook
+// resolves membership through that same map, so charging while its lock is
+// held would recursively acquire the lock with IRQs disabled. This per-CPU
+// nesting count lets the narrow mutation helper in the parent module suppress
+// only those metadata charges. Its guard is entered after the IRQ-safe map
+// lock is acquired, so the CPU cannot migrate before it is dropped.
+static BYPASS_CHARGE: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+pub(super) struct ChargeBypassGuard {
+    cpu: usize,
+}
+
+impl Drop for ChargeBypassGuard {
+    fn drop(&mut self) {
+        let previous = BYPASS_CHARGE[self.cpu].fetch_sub(1, Ordering::Release);
+        debug_assert!(previous != 0, "unbalanced cgroup charge bypass");
+    }
+}
+
+pub(super) fn bypass_charge() -> ChargeBypassGuard {
+    let cpu = narf_lib::percpu::current_cpu();
+    BYPASS_CHARGE[cpu].fetch_add(1, Ordering::AcqRel);
+    ChargeBypassGuard { cpu }
+}
 
 fn charge_hook(pid: u64, delta_bytes: i64) -> bool {
-    if IN_CHARGE.swap(true, Ordering::AcqRel) {
+    let cpu = narf_lib::percpu::current_cpu();
+    if BYPASS_CHARGE[cpu].load(Ordering::Acquire) != 0 {
         return true;
     }
-    struct Guard;
+    if IN_CHARGE[cpu].swap(true, Ordering::AcqRel) {
+        return true;
+    }
+    struct Guard(usize);
     impl Drop for Guard {
         fn drop(&mut self) {
-            IN_CHARGE.store(false, Ordering::Release);
+            IN_CHARGE[self.0].store(false, Ordering::Release);
         }
     }
-    let _guard = Guard;
+    let _guard = Guard(cpu);
 
     // Collect the chain's `MemoryState`s once (clone the `Arc`s so we
     // can iterate them twice without holding the chain lock across the
@@ -147,7 +184,7 @@ pub fn charge_hook_for_test(pid: u64, delta_bytes: i64) -> bool {
 /// entry deterministically.
 #[doc(hidden)]
 pub fn in_charge_for_test() -> bool {
-    IN_CHARGE.load(Ordering::Acquire)
+    IN_CHARGE[narf_lib::percpu::current_cpu()].load(Ordering::Acquire)
 }
 
 /// Test-only seam: raise/lower the re-entrancy guard so a test can
@@ -155,7 +192,7 @@ pub fn in_charge_for_test() -> bool {
 /// the charge path itself allocates). Returns the previous value.
 #[doc(hidden)]
 pub fn set_in_charge_for_test(v: bool) -> bool {
-    IN_CHARGE.swap(v, Ordering::AcqRel)
+    IN_CHARGE[narf_lib::percpu::current_cpu()].swap(v, Ordering::AcqRel)
 }
 
 /// Install the allocator charge plumbing exactly once.
@@ -256,6 +293,28 @@ fn max_line(v: &Option<u64>) -> String {
     }
 }
 
+/// Snapshot a limit while its IRQ-safe lock is held, then run all callbacks
+/// and formatting after releasing the guard. Allocator charging re-enters the
+/// memory controller's `high`/`max` locks, so even a tiny `format!` under one
+/// of these guards can self-deadlock on a slab refill.
+fn locked_max_line_with(
+    limit: &IrqSafeSpinLock<Option<u64>>,
+    after_snapshot: impl FnOnce(),
+) -> String {
+    let value = *limit.lock();
+    after_snapshot();
+    max_line(&value)
+}
+
+fn locked_max_line(limit: &IrqSafeSpinLock<Option<u64>>) -> String {
+    locked_max_line_with(limit, || {})
+}
+
+fn locked_u64_line(value: &IrqSafeSpinLock<u64>) -> String {
+    let value = *value.lock();
+    format!("{value}\n")
+}
+
 fn parse_limit(buf: &[u8]) -> Result<Option<u64>, FsError> {
     let t = core::str::from_utf8(buf)
         .map_err(|_| FsError::InvalidData)?
@@ -276,6 +335,32 @@ fn parse_u64(buf: &[u8]) -> Result<u64, FsError> {
 }
 
 impl MemoryState {
+    /// Deterministically inject allocator charging between taking a locked
+    /// limit snapshot and formatting it. This shares the production helper,
+    /// so regressing the guard lifetime makes the test self-deadlock.
+    #[doc(hidden)]
+    pub fn limit_read_charge_reentry_for_test(
+        &self,
+        file: &str,
+        pid: u64,
+        delta_bytes: i64,
+    ) -> bool {
+        let mut allowed = false;
+        let inject = || {
+            allowed = charge_hook_for_test(pid, delta_bytes);
+        };
+        match file {
+            "memory.high" => {
+                let _ = locked_max_line_with(&self.high, inject);
+            }
+            "memory.max" => {
+                let _ = locked_max_line_with(&self.max, inject);
+            }
+            _ => return false,
+        }
+        allowed
+    }
+
     /// Would charging `amount` more bytes keep this level at or below
     /// `memory.max`? `None` max ⇒ unlimited ⇒ always true.
     fn can_charge(&self, amount: u64) -> bool {
@@ -367,18 +452,18 @@ impl ControllerState for MemoryState {
         match file {
             "memory.current" => format!("{}\n", self.current.load(Ordering::Acquire)),
             "memory.peak" => format!("{}\n", self.peak.load(Ordering::Acquire)),
-            "memory.min" => format!("{}\n", *self.min.lock()),
-            "memory.low" => format!("{}\n", *self.low.lock()),
-            "memory.high" => max_line(&self.high.lock()),
-            "memory.max" => max_line(&self.max.lock()),
+            "memory.min" => locked_u64_line(&self.min),
+            "memory.low" => locked_u64_line(&self.low),
+            "memory.high" => locked_max_line(&self.high),
+            "memory.max" => locked_max_line(&self.max),
             "memory.swap.current" => format!("{}\n", self.swap_current.load(Ordering::Acquire)),
-            "memory.swap.max" => max_line(&self.swap_max.lock()),
+            "memory.swap.max" => locked_max_line(&self.swap_max),
             "memory.oom.group" => format!("{}\n", u8::from(self.oom_group.load(Ordering::Acquire))),
             // memory.reclaim is write-only on Linux (0200); render
             // empty for a read that slips through.
             "memory.reclaim" => String::new(),
             "memory.zswap.current" => format!("{}\n", self.zswap_current.load(Ordering::Acquire)),
-            "memory.zswap.max" => max_line(&self.zswap_max.lock()),
+            "memory.zswap.max" => locked_max_line(&self.zswap_max),
             "memory.zswap.writeback" => {
                 format!(
                     "{}\n",

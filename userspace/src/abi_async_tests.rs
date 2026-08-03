@@ -331,8 +331,8 @@ fn smoke_abi_async_epoll_wait_neg() -> TestResult {
 kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_wait_neg);
 
 // ════════════════════════════════════════════════════════════════════
-// epoll_pwait(2) — also wired to sys_epoll_wait (is_pwait set, but the
-// sigmask args are ignored when null). Same observable behavior.
+// epoll_pwait(2) — wired to sys_epoll_pwait so the temporary signal mask is
+// validated, installed for the wait, and restored before return.
 // ════════════════════════════════════════════════════════════════════
 
 fn smoke_abi_async_epoll_pwait_pos() -> TestResult {
@@ -372,6 +372,38 @@ fn smoke_abi_async_epoll_pwait_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_pwait_neg);
+
+/// The syscall table must route epoll_pwait through the pwait-aware wrapper,
+/// not plain epoll_wait. A bad non-null sigmask pointer is a deterministic
+/// discriminator: epoll_pwait must inspect it and fail, while epoll_wait would
+/// ignore arg4/arg5 and incorrectly report the empty instance as ready with
+/// zero events.
+fn smoke_abi_async_epoll_pwait_validates_sigmask() -> TestResult {
+    with_setup(|| {
+        const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+        let epfd = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("epoll_create1 failed"),
+        };
+        let mut evbuf = [0u8; 12];
+        let args = SyscallArgs {
+            arg0: epfd,
+            arg1: evbuf.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            arg4: BAD_PTR,
+            arg5: 8,
+        };
+        match call(Syscall::EpollPwait.raw(), args) {
+            Some(v) if v < 0 => Ok(()),
+            _ => Err("epoll_pwait ignored its non-null signal-mask argument"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_epoll_pwait_validates_sigmask
+);
 
 // ════════════════════════════════════════════════════════════════════
 // epoll_pwait2(2) — sys_epoll_pwait2. Like epoll_pwait but arg3 is a

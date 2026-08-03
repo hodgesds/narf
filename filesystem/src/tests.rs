@@ -4791,6 +4791,8 @@ fn smoke_overlay_lower_only_parent_copy_up() -> TestResult {
         Some(Ok(dir)) => dir,
         _ => return TestResult::Fail("could not seed lower conf directory"),
     };
+    conf.set_dir_mode(0o710);
+    conf.set_dir_owners(10, 20);
     if !matches!(poll_once_overlay(conf.create("base")), Some(Ok(_))) {
         return TestResult::Fail("could not seed lower base file");
     }
@@ -4805,6 +4807,15 @@ fn smoke_overlay_lower_only_parent_copy_up() -> TestResult {
         Some(dir) => dir,
         None => return TestResult::Fail("lower-only conf missing from overlay"),
     };
+    if !matches!(
+        poll_once_overlay(conf.set_dir_mode_async(0o2770)),
+        Some(Ok(()))
+    ) || !matches!(
+        poll_once_overlay(conf.set_dir_owners_async(30, 40)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("lower-only directory metadata did not copy up");
+    }
     if !matches!(poll_once_overlay(conf.create("local")), Some(Ok(_))) {
         return TestResult::Fail("create below lower-only parent did not copy parents up");
     }
@@ -4821,6 +4832,17 @@ fn smoke_overlay_lower_only_parent_copy_up() -> TestResult {
     };
     if raw_upper_conf.lookup("local").is_none() {
         return TestResult::Fail("nested create did not land in upper");
+    }
+    if raw_upper_conf.dir_mode() != 0o2770 || raw_upper_conf.dir_owners() != (30, 40) {
+        return TestResult::Fail("copied-up directory metadata update was not retained");
+    }
+    let raw_lower_conf = lower
+        .root()
+        .lookup_dir("etc")
+        .and_then(|dir| dir.lookup_dir("conf"))
+        .expect("seeded lower conf disappeared");
+    if raw_lower_conf.dir_mode() != 0o710 || raw_lower_conf.dir_owners() != (10, 20) {
+        return TestResult::Fail("directory metadata copy-up mutated the lower layer");
     }
     if lower
         .root()

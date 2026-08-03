@@ -221,14 +221,11 @@ impl Cgroup {
         // Build each child state, linking to the parent cgroup's state
         // for the same controller (for value inheritance) when present.
         let mut state = BTreeMap::new();
-        {
-            let enabled = parent.enabled.lock();
-            let parent_state = parent.ctrl_state.lock();
-            for &cname in enabled.iter() {
-                if let Some(ctrl) = controller::find(cname) {
-                    let parent_cs = parent_state.get(cname).cloned();
-                    state.insert(cname, ctrl.new_state(parent_cs));
-                }
+        let enabled: Vec<_> = parent.enabled.lock().iter().copied().collect();
+        for cname in enabled {
+            if let Some(ctrl) = controller::find(cname) {
+                let parent_cs = { parent.ctrl_state.lock().get(cname).cloned() };
+                state.insert(cname, ctrl.new_state(parent_cs));
             }
         }
         Arc::new(Cgroup {
@@ -336,6 +333,50 @@ static CGROUP_ROOT: OnceLock<Arc<Cgroup>> = OnceLock::new();
 static TASK_CGROUP: IrqSafeSpinLock<BTreeMap<u64, Arc<Cgroup>>> =
     IrqSafeSpinLock::new(BTreeMap::new());
 
+/// Mutate the reverse index without recursively charging allocations made by
+/// the map itself. The charge hook resolves a pid through `TASK_CGROUP`, so a
+/// BTreeMap node allocation/free while this lock is held must be treated as
+/// kernel cgroup metadata rather than charged to the current task.
+fn mutate_task_cgroup<R>(f: impl FnOnce(&mut BTreeMap<u64, Arc<Cgroup>>) -> R) -> R {
+    let mut membership = TASK_CGROUP.lock();
+    #[cfg(feature = "cgroup-memory")]
+    let _charge_bypass = memory::bypass_charge();
+    f(&mut membership)
+}
+
+/// Mutate a controller-state map without charging its own BTreeMap metadata.
+/// The memory charge hook walks these maps, so an allocation or final `Arc`
+/// drop while one is locked must not recursively enter that walk.
+fn mutate_ctrl_state<R>(
+    cg: &Cgroup,
+    f: impl FnOnce(&mut BTreeMap<&'static str, Arc<dyn ControllerState>>) -> R,
+) -> R {
+    let mut states = cg.ctrl_state.lock();
+    #[cfg(feature = "cgroup-memory")]
+    let _charge_bypass = memory::bypass_charge();
+    f(&mut states)
+}
+
+/// Clone the small controller-state set under its lock, then release the lock
+/// before invoking controller callbacks or allocating caller-owned output.
+fn snapshot_ctrl_states(cg: &Cgroup) -> Vec<(&'static str, Arc<dyn ControllerState>)> {
+    let states = cg.ctrl_state.lock();
+    #[cfg(feature = "cgroup-memory")]
+    let _charge_bypass = memory::bypass_charge();
+    states
+        .iter()
+        .map(|(&name, state)| (name, state.clone()))
+        .collect()
+}
+
+/// Clone one controller state under the metadata lock. Controller callbacks
+/// may allocate, and allocator charging walks this same map, so every caller
+/// must invoke the returned state only after this helper has released the
+/// lock.
+fn snapshot_ctrl_state(cg: &Cgroup, name: &'static str) -> Option<Arc<dyn ControllerState>> {
+    cg.ctrl_state.lock().get(name).cloned()
+}
+
 fn root() -> Arc<Cgroup> {
     let root = CGROUP_ROOT.get_or_init(Cgroup::new_root).clone();
 
@@ -347,10 +388,17 @@ fn root() -> Arc<Cgroup> {
     // controller registrations may add a controller after the root exists.
     for controller in controller::registered() {
         let name = controller.name();
-        let mut states = root.ctrl_state.lock();
-        states
-            .entry(name)
-            .or_insert_with(|| controller.new_state(None));
+        let present = { root.ctrl_state.lock().contains_key(name) };
+        if !present {
+            // Controller construction can allocate and install hooks. Do it
+            // without the ctrl_state lock, then use the narrow metadata
+            // mutation helper for the insertion itself. A concurrent root()
+            // may construct the same state, but entry insertion selects one.
+            let state = controller.new_state(None);
+            mutate_ctrl_state(&root, |states| {
+                states.entry(name).or_insert(state);
+            });
+        }
     }
 
     root
@@ -358,7 +406,11 @@ fn root() -> Arc<Cgroup> {
 
 /// Resolve the cgroup a pid currently belongs to (root if unplaced).
 fn cgroup_of(pid: u64) -> Arc<Cgroup> {
-    TASK_CGROUP.lock().get(&pid).cloned().unwrap_or_else(root)
+    // Keep the guard's lifetime explicit: `root()` may reconcile controller
+    // state and allocate. Running that fallback while TASK_CGROUP remained
+    // locked would let allocator charging recurse through cgroup_of().
+    let placed = { TASK_CGROUP.lock().get(&pid).cloned() };
+    placed.unwrap_or_else(root)
 }
 
 /// Pid of the process performing the current cgroupfs write, for the
@@ -415,7 +467,7 @@ fn charge_chain(cg: &Arc<Cgroup>) -> Vec<Arc<Cgroup>> {
 /// `cg`'s chain.
 fn detach_chain(cg: &Arc<Cgroup>, pid: u64) {
     for node in charge_chain(cg) {
-        for state in node.ctrl_state.lock().values() {
+        for (_, state) in snapshot_ctrl_states(&node) {
             state.on_detach(pid);
         }
     }
@@ -426,12 +478,12 @@ fn detach_chain(cg: &Arc<Cgroup>, pid: u64) {
 fn attach_chain(cg: &Arc<Cgroup>, pid: u64) -> Result<(), FsError> {
     let chain = charge_chain(cg);
     for node in &chain {
-        for state in node.ctrl_state.lock().values() {
+        for (_, state) in snapshot_ctrl_states(node) {
             state.can_attach(pid)?;
         }
     }
     for node in &chain {
-        for state in node.ctrl_state.lock().values() {
+        for (_, state) in snapshot_ctrl_states(node) {
             state.on_attach(pid);
         }
     }
@@ -467,7 +519,7 @@ fn place(pid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
         prev.members.lock().remove(&pid);
     }
     dst.members.lock().insert(pid);
-    TASK_CGROUP.lock().insert(pid, dst.clone());
+    mutate_task_cgroup(|membership| membership.insert(pid, dst.clone()));
     if let Some(prev) = &prev {
         prev.notify_events();
     }
@@ -487,12 +539,12 @@ fn place_forced(pid: u64, dst: &Arc<Cgroup>) {
         prev.members.lock().remove(&pid);
     }
     for node in charge_chain(dst) {
-        for state in node.ctrl_state.lock().values() {
+        for (_, state) in snapshot_ctrl_states(&node) {
             state.on_attach(pid);
         }
     }
     dst.members.lock().insert(pid);
-    TASK_CGROUP.lock().insert(pid, dst.clone());
+    mutate_task_cgroup(|membership| membership.insert(pid, dst.clone()));
     if let Some(prev) = &prev {
         prev.notify_events();
     }
@@ -533,13 +585,109 @@ pub fn attach_by_path(path: &str, pid: u64) -> Result<(), FsError> {
 
 /// A process exited: drop its membership and uncharge controllers.
 pub fn task_exited(pid: u64) {
-    let cg = TASK_CGROUP.lock().remove(&pid);
+    let cg = mutate_task_cgroup(|membership| membership.remove(&pid));
     if let Some(cg) = cg {
         detach_chain(&cg, pid);
         cg.members.lock().remove(&pid);
         cg.notify_events();
     }
     TASK_NS_ROOT.lock().remove(&pid);
+}
+
+/// Test-only seam for the lock/allocator recursion that can occur when a
+/// membership-map mutation needs a fresh BTreeMap node. The real allocator
+/// reaches the same charge hook from inside `insert`/`remove`; invoking it
+/// directly makes the regression deterministic instead of depending on slab
+/// state. Without `mutate_task_cgroup`'s bypass this call self-deadlocks.
+#[cfg(feature = "cgroup-memory")]
+#[doc(hidden)]
+pub fn membership_charge_reentry_for_test(pid: u64, delta_bytes: i64) -> bool {
+    mutate_task_cgroup(|_| memory::charge_hook_for_test(pid, delta_bytes))
+}
+
+/// Deterministically exercise allocator charging while the current cgroup's
+/// controller-state map is being mutated. Without the metadata bypass this
+/// re-enters `with_chain_states` and self-deadlocks on `ctrl_state`.
+#[cfg(feature = "cgroup-memory")]
+#[doc(hidden)]
+pub fn ctrl_state_charge_reentry_for_test(pid: u64, delta_bytes: i64) -> bool {
+    let cg = cgroup_of(pid);
+    mutate_ctrl_state(&cg, |_| memory::charge_hook_for_test(pid, delta_bytes))
+}
+
+/// Exercise a controller read callback that re-enters memory charging. This
+/// is the deterministic form of a formatted cgroup attribute read refilling
+/// the allocator while `ctrl_state` is held.
+#[cfg(feature = "cgroup-memory")]
+#[doc(hidden)]
+pub fn ctrl_read_charge_reentry_for_test(pid: u64, delta_bytes: i64) -> bool {
+    use core::any::Any;
+
+    #[derive(Debug)]
+    struct ChargeOnRead {
+        pid: u64,
+        delta_bytes: i64,
+        allowed: Arc<AtomicBool>,
+    }
+
+    impl ControllerState for ChargeOnRead {
+        fn files(&self) -> &'static [&'static str] {
+            &["__test.charge_on_read"]
+        }
+
+        fn read(&self, _file: &str) -> String {
+            self.allowed.store(
+                memory::charge_hook_for_test(self.pid, self.delta_bytes),
+                Ordering::Release,
+            );
+            String::new()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    let cg = cgroup_of(pid);
+    let allowed = Arc::new(AtomicBool::new(false));
+    mutate_ctrl_state(&cg, |states| {
+        states.insert(
+            "__test_charge_on_read",
+            Arc::new(ChargeOnRead {
+                pid,
+                delta_bytes,
+                allowed: allowed.clone(),
+            }),
+        );
+    });
+    let file = CgroupAttrFile {
+        cg: cg.clone(),
+        kind: FileKind::Ctrl("__test_charge_on_read", "__test.charge_on_read"),
+        ino: 0,
+        seen_gen: AtomicU64::new(0),
+    };
+    let _ = file.content();
+    mutate_ctrl_state(&cg, |states| {
+        states.remove("__test_charge_on_read");
+    });
+    allowed.load(Ordering::Acquire)
+}
+
+/// Inject memory charging after `memory.high`/`memory.max` has been copied
+/// out of its field lock but before the line is formatted.
+#[cfg(feature = "cgroup-memory")]
+#[doc(hidden)]
+pub fn memory_limit_read_charge_reentry_for_test(pid: u64, file: &str, delta_bytes: i64) -> bool {
+    let cg = cgroup_of(pid);
+    snapshot_ctrl_state(&cg, "memory")
+        .map(|state| {
+            state
+                .as_any()
+                .downcast_ref::<memory::MemoryState>()
+                .map(|state| state.limit_read_charge_reentry_for_test(file, pid, delta_bytes))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 // ── cgroup namespace (CLONE_NEWCGROUP) ──────────────────────────────
@@ -1112,16 +1260,15 @@ fn store_subtree_control(cg: &Arc<Cgroup>, text: &str) -> Result<(), FsError> {
             if let Some(ctrl) = controller::find(name) {
                 let parent_cs = cg.ctrl_state.lock().get(name).cloned();
                 for child in children.values() {
-                    child
-                        .ctrl_state
-                        .lock()
-                        .entry(name)
-                        .or_insert_with(|| ctrl.new_state(parent_cs.clone()));
+                    let state = ctrl.new_state(parent_cs.clone());
+                    mutate_ctrl_state(child, |states| {
+                        states.entry(name).or_insert(state);
+                    });
                 }
             }
         } else if !enable && enabled.remove(name) {
             for child in children.values() {
-                child.ctrl_state.lock().remove(name);
+                mutate_ctrl_state(child, |states| states.remove(name));
             }
         }
     }
@@ -1280,11 +1427,7 @@ impl CgroupAttrFile {
     fn content(&self) -> String {
         match &self.kind {
             FileKind::Core(f) => render_core(&self.cg, *f),
-            FileKind::Ctrl(ctrl, file) => self
-                .cg
-                .ctrl_state
-                .lock()
-                .get(*ctrl)
+            FileKind::Ctrl(ctrl, file) => snapshot_ctrl_state(&self.cg, ctrl)
                 .map(|s| s.read(file))
                 .unwrap_or_default(),
             FileKind::CpuStatBase => render_cpu_stat_base(&self.cg),
@@ -1294,11 +1437,7 @@ impl CgroupAttrFile {
     fn is_writable(&self) -> bool {
         match &self.kind {
             FileKind::Core(f) => f.writable(),
-            FileKind::Ctrl(ctrl, file) => self
-                .cg
-                .ctrl_state
-                .lock()
-                .get(*ctrl)
+            FileKind::Ctrl(ctrl, file) => snapshot_ctrl_state(&self.cg, ctrl)
                 .map(|s| s.writable(file))
                 .unwrap_or(false),
             FileKind::CpuStatBase => false,
@@ -1340,7 +1479,7 @@ impl FileOps for CgroupAttrFile {
         let r = match &self.kind {
             FileKind::Core(f) => store_core(&self.cg, *f, buf),
             FileKind::Ctrl(ctrl, file) => {
-                let st = self.cg.ctrl_state.lock().get(*ctrl).cloned();
+                let st = snapshot_ctrl_state(&self.cg, ctrl);
                 match st {
                     Some(s) => s.write(file, buf).map(|()| buf.len()),
                     None => Err(FsError::NotFound),
@@ -1406,15 +1545,15 @@ impl CgroupDir {
 
     /// Active controller file on this cgroup as `(controller, file)`.
     fn ctrl_file(&self, name: &str) -> Option<(&'static str, &'static str)> {
-        let states = self.cg.ctrl_state.lock();
-        for (cname, state) in states.iter() {
+        let states = snapshot_ctrl_states(&self.cg);
+        for (cname, state) in &states {
             if let Some(f) = state
                 .files()
                 .iter()
                 .copied()
                 .find(|f| *f == name && controller_file_visible(&self.cg, f))
             {
-                return Some((cname, f));
+                return Some((*cname, f));
             }
         }
         None
@@ -1515,19 +1654,17 @@ impl DirOps for CgroupDir {
         for f in core_files_for(&self.cg) {
             out.push((f.file_name().to_string(), FileType::File));
         }
-        {
-            let states = self.cg.ctrl_state.lock();
-            for state in states.values() {
-                for f in state.files() {
-                    if controller_file_visible(&self.cg, f) {
-                        out.push((f.to_string(), FileType::File));
-                    }
+        let states = snapshot_ctrl_states(&self.cg);
+        for (_, state) in &states {
+            for f in state.files() {
+                if controller_file_visible(&self.cg, f) {
+                    out.push((f.to_string(), FileType::File));
                 }
             }
-            // Base cpu.stat when the cpu controller isn't active here.
-            if !states.contains_key("cpu") {
-                out.push(("cpu.stat".to_string(), FileType::File));
-            }
+        }
+        // Base cpu.stat when the cpu controller isn't active here.
+        if !states.iter().any(|(name, _)| *name == "cpu") {
+            out.push(("cpu.stat".to_string(), FileType::File));
         }
         #[cfg(feature = "cgroup-psi")]
         for f in psi::file_names() {

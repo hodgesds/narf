@@ -232,6 +232,53 @@ fn resolve_dir_absolute(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesyst
     .flatten()
 }
 
+/// Resolve a path to its file-shaped node in the current task's mount
+/// namespace. `follow_final` mirrors Linux's `LOOKUP_FOLLOW` choice for the
+/// chmod/chown families.
+fn resolve_file_absolute_ext(
+    path: &str,
+    follow_final: bool,
+) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
+    current_resolve_absolute(path, |fs, rel| {
+        if rel.is_empty() {
+            fs.root_file()
+        } else {
+            poll_blocking(narf_filesystem::resolve_async_ext(
+                fs.root(),
+                rel,
+                follow_final,
+            ))
+            .and_then(Result::ok)
+        }
+    })
+    .flatten()
+}
+
+/// Apply Linux `*at` anchoring before the ordinary cwd/chroot rewrite.
+/// Absolute paths ignore `dirfd`; relative paths require `AT_FDCWD` or an
+/// open directory fd. Errors are negative Linux errno values.
+fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::String, i64> {
+    const AT_FDCWD: i64 = -100;
+    if raw.starts_with('/') || dirfd == AT_FDCWD {
+        return Ok(alloc::string::String::from(raw));
+    }
+    if dirfd < 0 {
+        return Err(-9); // -EBADF
+    }
+    let is_directory = fd::with_table(task, |table| {
+        table
+            .get(dirfd as u32)
+            .map(|entry| entry.ops.as_dir().is_some())
+    })
+    .flatten()
+    .ok_or(-9i64)?;
+    if !is_directory {
+        return Err(-20); // -ENOTDIR
+    }
+    let base = fd_path_for_task(task, dirfd as u32).ok_or(-9i64)?;
+    Ok(alloc::format!("{}/{}", base.trim_end_matches('/'), raw))
+}
+
 /// Stat an absolute path, handling both files and directories.
 /// Files come from the FileOps `stat()`; directories (mount roots and
 /// sub-directories alike) synthesise a `DIR_RW`-shaped stat so callers
@@ -394,6 +441,16 @@ impl narf_filesystem::FileOps for DirFdFile {
     }
     fn owners(&self) -> (u32, u32) {
         self.dir.dir_owners()
+    }
+    fn set_owners<'a>(
+        &'a self,
+        uid: u32,
+        gid: u32,
+    ) -> narf_filesystem::FsFuture<'a, ()> {
+        self.dir.set_dir_owners_async(uid, gid)
+    }
+    fn set_perms<'a>(&'a self, perms: u16) -> narf_filesystem::FsFuture<'a, ()> {
+        self.dir.set_dir_mode_async(perms)
     }
     fn as_dir(&self) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
         Some(self.dir.clone())
@@ -4073,16 +4130,42 @@ fn signal_target_exists(tid: u64) -> bool {
 /// Resolve the thread identifier supplied by a Linux signal syscall to the
 /// TaskId that owns NARF's signal state.  A thread-group leader is visible as
 /// its PID through gettid(2), while CLONE_THREAD siblings retain their
-/// distinct TaskId-derived TIDs.  Keep the latter in task space, then map a
-/// leader PID (including the caller's PID-namespace view) back to its task.
+/// distinct TaskId-derived TIDs.  Resolve the caller's own gettid value first:
+/// a leader PID can numerically collide with an unrelated sibling's raw
+/// TaskId, and treating raw task space as authoritative would misroute a
+/// self-directed tkill or make tgkill fail its tgid check with ESRCH.
+/// Keep other non-leader TIDs in task space, then map a leader PID (including
+/// the caller's PID-namespace view) back to its task.
 fn signal_tid_from_user(caller: u64, tid: u64) -> Option<u64> {
+    if tid == linux_tid_for_task(caller) {
+        return Some(caller);
+    }
     let is_non_leader_thread =
-        tid == caller || task_to_pid_raw(tid).is_some_and(|pid| pid_to_task_raw(pid) != Some(tid));
+        task_to_pid_raw(tid).is_some_and(|pid| pid_to_task_raw(pid) != Some(tid));
     if is_non_leader_thread {
         return Some(tid);
     }
     let pid = accept_pid_from(caller, tid)?;
     Some(pid_to_task_raw(pid).unwrap_or(pid))
+}
+
+/// Linux-visible gettid(2) value for `task`. A thread-group leader reports
+/// its process ID (translated into its own PID namespace); a CLONE_THREAD
+/// sibling reports its distinct scheduler-derived TID.
+fn linux_tid_for_task(task: u64) -> u64 {
+    match task_to_pid_raw(task) {
+        Some(pid) if pid_to_task_raw(pid) == Some(task) => {
+            #[cfg(feature = "container")]
+            {
+                crate::pid_ns::self_inner_pid(task, pid)
+            }
+            #[cfg(not(feature = "container"))]
+            {
+                pid
+            }
+        }
+        _ => task,
+    }
 }
 
 /// Copy `si_code` (offset 8), `si_pid` (offset 16) and `si_value` (the
@@ -5878,7 +5961,7 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
 fn parse_scm_rights_fds(
     ctrl_ptr: u64,
     ctrl_len: usize,
-) -> Result<alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>>, i64> {
+) -> Result<alloc::vec::Vec<crate::socket::ScmRightsFile>, i64> {
     const SOL_SOCKET: i32 = 1;
     const SCM_RIGHTS: i32 = 1;
     // struct cmsghdr { u64 cmsg_len; i32 cmsg_level; i32 cmsg_type; } = 16 B.
@@ -5915,12 +5998,17 @@ fn parse_scm_rights_fds(
                 if fd < 0 {
                     return Err(9); // EBADF
                 }
-                let Some(ops) =
-                    fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten()
+                let Some(passed) = fd::with_table(task, |t| {
+                    t.get(fd as u32).map(|entry| crate::socket::ScmRightsFile {
+                        ops: entry.ops.clone(),
+                        status_flags: entry.status_flags,
+                    })
+                })
+                .flatten()
                 else {
                     return Err(9); // EBADF: send no payload or partial rights
                 };
-                out.push(ops);
+                out.push(passed);
             }
         }
         // Advance to the next cmsg (CMSG_ALIGN to 8 bytes).
@@ -5977,7 +6065,7 @@ fn install_netlink_ancillary(msg_ptr: u64, pktinfo_group: Option<u32>) {
 /// (0 when there's no ancillary data or the user control buffer is absent).
 fn install_recv_ancillary(
     msg_ptr: u64,
-    fds: alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
+    fds: alloc::vec::Vec<crate::socket::ScmRightsFile>,
     cred: Option<crate::socket::Ucred>,
     cloexec: bool,
 ) -> bool {
@@ -6006,12 +6094,12 @@ fn install_recv_ancillary(
     let mut truncated = rights_to_install < fds.len();
     let task = current_task_id();
     let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
-    for ops in fds.into_iter().take(rights_to_install) {
+    for passed in fds.into_iter().take(rights_to_install) {
         let entry = fd::FdEntry {
-            ops,
+            ops: passed.ops,
             offset: 0,
             flags: if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
-            status_flags: 0,
+            status_flags: passed.status_flags,
         };
         if let Some(newfd) = fd::with_table(task, |t| t.open(entry)) {
             new_fds.push(newfd as i32);
@@ -6410,13 +6498,27 @@ pub fn abi_file_op_bridge(
             value: 0,
         };
     }
+    // The stable v1 ring operation is base-only and predates Linux-range
+    // munmap support. Preserve that ABI here instead of teaching raw syscall
+    // 11 to accept `len == 0` (Linux requires EINVAL for that call).
+    if kind == narf_abi::FileOpKind::Munmap {
+        let status = current_address_space()
+            .ok_or(())
+            .and_then(|as_ref| {
+                handler_sys_munmap::munmap_native_v1(&as_ref, args.a0)
+            })
+            .map(|()| 0)
+            .unwrap_or(1);
+        return narf_abi::FileOpReturn { status, value: 0 };
+    }
     let num: u32 = match kind {
         narf_abi::FileOpKind::Open => Syscall::OpenFile.raw(),
         narf_abi::FileOpKind::Read => Syscall::Read.raw(),
         narf_abi::FileOpKind::Write => Syscall::Write.raw(),
         narf_abi::FileOpKind::Close => Syscall::Close.raw(),
         narf_abi::FileOpKind::Mmap => Syscall::Mmap.raw(),
-        narf_abi::FileOpKind::Munmap => Syscall::Munmap.raw(),
+        // Returned by the native-v1 compatibility arm above.
+        narf_abi::FileOpKind::Munmap => unreachable!(),
     };
     let sargs = crate::SyscallArgs {
         arg0: args.a0,
@@ -7290,12 +7392,12 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(
         Syscall::Fchmod,
         "fchmod",
-        RawFnHandler(sys_fchmod_or_fchown),
+        RawFnHandler(sys_fchmod),
     );
     table.install_raw(
         Syscall::Fchown,
         "fchown",
-        RawFnHandler(sys_fchmod_or_fchown),
+        RawFnHandler(sys_fchown),
     );
     table.install_raw(Syscall::Fchmodat, "fchmodat", RawFnHandler(sys_fchmodat));
     table.install_raw(
@@ -7335,7 +7437,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(
         Syscall::Chown,
         "chown",
-        RawFnHandler(sys_access_chmod_chown),
+        RawFnHandler(sys_chown),
     );
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
@@ -7482,12 +7584,10 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     // Batch 14: filesystem misc (legacy x86_64-only entries).
     table.install_raw(Syscall::Creat, "creat", RawFnHandler(sys_creat));
-    // lchown shares the chmod/chown path handler (no symlink-follow
-    // distinction in NARF).
     table.install_raw(
         Syscall::Lchown,
         "lchown",
-        RawFnHandler(sys_access_chmod_chown),
+        RawFnHandler(sys_lchown),
     );
     table.install_raw(Syscall::Utime, "utime", RawFnHandler(sys_utime));
     table.install_raw(Syscall::Utimes, "utimes", RawFnHandler(sys_utimes));
@@ -7598,7 +7698,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(
         Syscall::EpollPwait,
         "epoll_pwait",
-        RawFnHandler(crate::epoll::sys_epoll_wait),
+        RawFnHandler(crate::epoll::sys_epoll_pwait),
     );
     table.install_raw(
         Syscall::EpollPwait2,
@@ -8868,7 +8968,7 @@ pub(crate) use handler_sys_timerfd_gettime::*;
 pub use handler_sys_umount2_for_test::*;
 #[allow(unused_imports)]
 pub(crate) use {
-    handler_sys_access_chmod_chown::{sys_access, sys_access_chmod_chown, sys_faccessat},
+    handler_sys_access_chmod_chown::{sys_access, sys_chown, sys_faccessat, sys_lchown},
     handler_sys_adjtimex::sys_adjtimex,
     handler_sys_at2_reshape::sys_at2_reshape,
     handler_sys_bootstrap::sys_bootstrap,
@@ -8905,8 +9005,8 @@ pub(crate) use {
     handler_sys_fb_info::sys_fb_info,
     handler_sys_fb_ring_map::sys_fb_ring_map,
     handler_sys_fchdir::sys_fchdir,
-    handler_sys_fchmod_or_fchown::sys_fchmod_or_fchown,
-    handler_sys_fchmodat::sys_fchmodat,
+    handler_sys_fchmod_or_fchown::{sys_fchmod, sys_fchown},
+    handler_sys_fchmodat::{sys_fchmodat, sys_fchmodat2},
     handler_sys_fchmodat_or_fchownat::sys_fchmodat_or_fchownat,
     handler_sys_fcntl::sys_fcntl,
     handler_sys_fgetxattr::sys_fgetxattr,

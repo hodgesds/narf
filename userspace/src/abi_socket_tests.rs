@@ -17,6 +17,8 @@ const SHUT_RDWR: u64 = 2;
 /// SCM control-message types (SOL_SOCKET level).
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
+const O_NONBLOCK: i64 = 0o4000;
+const F_GETFL: u64 = 3;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 
 // A clearly-invalid fd that no freshly-created table will ever hand out.
@@ -542,6 +544,137 @@ fn make_pair(kind: u64) -> Result<(u64, u64), &'static str> {
     let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
     Ok((fd0, fd1))
 }
+
+fn add_level_epollin(fd: u64) -> Result<u64, &'static str> {
+    let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+    if epfd < 0 {
+        return Err("epoll_create failed");
+    }
+    let mut interest = [0u8; 12];
+    interest[..4].copy_from_slice(&1u32.to_ne_bytes()); // EPOLLIN, no EPOLLET.
+    interest[4..].copy_from_slice(&0x4442_5553u64.to_ne_bytes());
+    if call(
+        Syscall::EpollCtl.raw(),
+        a3(epfd as u64, 1, fd, interest.as_ptr() as u64),
+    ) != Some(0)
+    {
+        return Err("epoll_ctl ADD level EPOLLIN failed");
+    }
+    Ok(epfd as u64)
+}
+
+fn epoll_ready_now(epfd: u64) -> Result<i64, &'static str> {
+    let mut event = [0u8; 12];
+    call(
+        Syscall::EpollWait.raw(),
+        a3(epfd, event.as_mut_ptr() as u64, 1, 0),
+    )
+    .ok_or("epoll_wait status")
+}
+
+/// D-Bus commonly queues a method reply and a following broadcast on the same
+/// connected AF_UNIX stream. If userspace consumes only the first complete
+/// message, level-triggered epoll must immediately return the still-readable
+/// fd again; it cannot require another peer write to manufacture a wake.
+fn smoke_abi_socket_stream_epoll_level_redelivers_queued_message() -> TestResult {
+    with_setup(|| {
+        let (tx, rx) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        let epfd = add_level_epollin(rx)?;
+        let reply = b"method-reply";
+        let broadcast = b"name-owner-changed";
+        for message in [reply.as_slice(), broadcast.as_slice()] {
+            if call(
+                Syscall::SocketSend.raw(),
+                a3(tx, message.as_ptr() as u64, message.len() as u64, 0),
+            ) != Some(message.len() as i64)
+            {
+                return Err("AF_UNIX stream message send failed");
+            }
+        }
+        if epoll_ready_now(epfd)? != 1 {
+            return Err("epoll did not report the queued method reply");
+        }
+        let mut first = [0u8; 12];
+        if call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, first.as_mut_ptr() as u64, first.len() as u64, 0),
+        ) != Some(reply.len() as i64)
+            || &first != reply
+        {
+            return Err("recv did not consume exactly the first queued message");
+        }
+        if epoll_ready_now(epfd)? != 1 {
+            return Err("level epoll lost the unread D-Bus-shaped broadcast");
+        }
+        let mut second = [0u8; 18];
+        if call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, second.as_mut_ptr() as u64, second.len() as u64, 0),
+        ) != Some(broadcast.len() as i64)
+            || &second != broadcast
+        {
+            return Err("recv did not deliver the queued broadcast");
+        }
+        if epoll_ready_now(epfd)? != 0 {
+            return Err("drained AF_UNIX stream remained spuriously readable");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_stream_epoll_level_redelivers_queued_message
+);
+
+/// Cover the same level-trigger rule when both logical messages arrive in one
+/// stream write and the first read stops inside a message. Message boundaries
+/// are userspace state; kernel readiness must depend only on unread bytes.
+fn smoke_abi_socket_stream_epoll_level_redelivers_partial_read() -> TestResult {
+    with_setup(|| {
+        let (tx, rx) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        let epfd = add_level_epollin(rx)?;
+        let wire = b"reply|broadcast";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(tx, wire.as_ptr() as u64, wire.len() as u64, 0),
+        ) != Some(wire.len() as i64)
+        {
+            return Err("coalesced AF_UNIX stream send failed");
+        }
+        if epoll_ready_now(epfd)? != 1 {
+            return Err("epoll did not report coalesced stream bytes");
+        }
+        let mut prefix = [0u8; 3];
+        if call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, prefix.as_mut_ptr() as u64, prefix.len() as u64, 0),
+        ) != Some(prefix.len() as i64)
+            || &prefix != b"rep"
+        {
+            return Err("partial stream recv returned the wrong prefix");
+        }
+        if epoll_ready_now(epfd)? != 1 {
+            return Err("level epoll lost unread bytes after a partial recv");
+        }
+        let mut rest = [0u8; 12];
+        if call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, rest.as_mut_ptr() as u64, rest.len() as u64, 0),
+        ) != Some(rest.len() as i64)
+            || &rest != b"ly|broadcast"
+        {
+            return Err("recv did not deliver the unread stream suffix");
+        }
+        if epoll_ready_now(epfd)? != 0 {
+            return Err("drained partial-read stream remained readable");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_stream_epoll_level_redelivers_partial_read
+);
 
 fn smoke_abi_socket_read_nonblock_empty_eagain() -> TestResult {
     with_setup(|| {
@@ -2789,18 +2922,18 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
             return Err("ordinary prefix send failed");
         }
 
-        // The fd we pass: a second, independent socketpair end.
-        let mut sv2 = [0u8; 8];
-        if call(
-            Syscall::SocketPair.raw(),
-            a3(AF_UNIX, SOCK_STREAM, 0, sv2.as_mut_ptr() as u64),
+        // The fd we pass: an independent nonblocking socket.
+        // systemd hands dbus-broker its activation listener in exactly this
+        // shape. SCM_RIGHTS duplicates the open file description, so Linux
+        // preserves O_NONBLOCK on the descriptor installed by recvmsg.
+        let passed_fd = call(
+            Syscall::SocketOpen.raw(),
+            a2(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0),
         )
-        .ok_or("pair2 status")?
-            != 0
-        {
-            return Err("second socketpair setup failed");
+        .ok_or("nonblocking socket status")? as i32;
+        if passed_fd < 0 {
+            return Err("nonblocking socket setup failed");
         }
-        let passed_fd = i32::from_ne_bytes([sv2[0], sv2[1], sv2[2], sv2[3]]);
 
         // sendmsg with an SCM_RIGHTS cmsg carrying `passed_fd`.
         let payload = b"fd";
@@ -2880,6 +3013,19 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
         // The received fd is a distinct number, and closeable.
         if new_fd as u64 == fd1 {
             return Err("SCM_RIGHTS installed fd collided with the receiving fd");
+        }
+        let installed_status = fd::with_table(FAKE_TASK, |table| {
+            table.get(new_fd as u32).map(|entry| entry.status_flags)
+        })
+        .flatten()
+        .ok_or("received SCM_RIGHTS fd was absent from the fd table")?;
+        if installed_status & O_NONBLOCK as u32 == 0 {
+            return Err("SCM_RIGHTS receiver fd lost its O_NONBLOCK status");
+        }
+        let received_status = call(Syscall::Fcntl.raw(), a2(new_fd as u64, F_GETFL, 0))
+            .ok_or("F_GETFL on received SCM_RIGHTS fd failed")?;
+        if received_status & O_NONBLOCK == 0 {
+            return Err("SCM_RIGHTS did not preserve O_NONBLOCK");
         }
         let _ = call(Syscall::Close.raw(), a0(new_fd as u64));
         Ok(())

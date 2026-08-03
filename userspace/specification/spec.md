@@ -48,6 +48,14 @@ internal four-argument callers emit generic `epoll_pwait` number 22, whose
 zero-sigmask behavior shares the same handler; reverse lookup canonically
 returns `EpollPwait`.
 
+Linux `munmap(addr, len)` rejects an unaligned address or zero length and
+rounds a non-page-multiple length upward. It removes only the overlapping
+range, splitting VMAs as needed so a surviving prefix or suffix retains its
+backing, permissions, and file-mapping lifetime reference. This does not alter
+the v1 native `OpCode::Munmap` contract: that base-only ring operation still
+removes the whole VMA beginning at `inline[0]` through its compatibility
+bridge; changing it requires the ABI versioning process in `abi/` §4.
+
 The Linux-compatibility syscall surface includes stored `prctl(2)` process
 state required by service managers and brokers. Capability-shaped controls
 such as `PR_SET_KEEPCAPS` round-trip according to the Linux ABI but do not mint
@@ -71,8 +79,10 @@ identity at `connect`/`listen`/`socketpair`. Stored credentials are
 host-absolute and are translated into the receiving task's PID/user namespace,
 with unmapped uid/gid values reported as the overflow id.
 Invalid SCM_RIGHTS descriptors fail `sendmsg` with `EBADF` without sending the
-payload. `MSG_CMSG_CLOEXEC` marks installed received descriptors close-on-exec,
-and insufficient ancillary space reports `MSG_CTRUNC`. On byte-stream Unix
+payload. A received descriptor retains the sender's file status flags, including
+`O_NONBLOCK`; sender fd-slot flags are not copied, and `FD_CLOEXEC` is set only
+when the receiver requests `MSG_CMSG_CLOEXEC`. Insufficient ancillary space
+reports `MSG_CTRUNC`. On byte-stream Unix
 sockets, rights are associated with the first byte of their `sendmsg`; they are
 delivered only by a receive that reaches that byte, and an ordinary
 `read`/`recv` consumes and discards them rather than exposing them to a later
@@ -85,6 +95,11 @@ duplicate descriptor keeps the watch live after the original descriptor
 closes, and final close invalidates the watch without the epoll instance
 artificially retaining the file. `EPOLLERR` and `EPOLLHUP` are delivered
 regardless of the registered interest mask, matching Linux epoll semantics.
+An epoll wait accepts at most `maxevents` entries. Only entries actually
+returned to the caller advance edge-trigger tokens, acknowledge provider-local
+readiness, take an exclusive claim, or disarm `EPOLLONESHOT`; additional ready
+entries remain pending for a later wait. Successive waits round-robin through
+ready level-triggered entries when the ready set exceeds `maxevents`.
 Poll and epoll pass the file-description offset to offset-sensitive readiness
 providers; `/dev/kmsg` is readable only while unread snapshot bytes remain.
 Edge-triggered epoll also records provider-local monotonic state tokens.
@@ -93,6 +108,10 @@ Connected socket rings advance their token only on readiness transitions
 leave readiness unchanged do not synthesize edges. A drain followed by new
 data before the next `epoll_wait` remains a deliverable edge even though both
 sampled readiness masks contain `POLL_IN`.
+AF_UNIX listeners likewise advance a readable token whenever `connect(2)`
+queues an accept-ready endpoint. Accepting the final pending endpoint followed
+by a new connection before the next epoll scan remains a deliverable
+`EPOLLIN|EPOLLET` edge even though both sampled masks contain `POLL_IN`.
 Readable and writable tokens are independent and epoll correlates each token
 only with its matching ready bit; a hidden receive-and-drain cycle cannot
 manufacture `EPOLLOUT` on a continuously writable socket.
@@ -116,13 +135,25 @@ minimal `sockaddr_un` containing only `sa_family` from `getpeername(2)`;
 truncated output still reports the full address length.
 `open(2)`/`openat(2)` reject an empty pathname with `ENOENT` before cwd
 normalization; an empty path never aliases the current directory.
+The chmod/chown syscall families resolve relative `*at` paths through a real
+directory fd, reject invalid flags and dirfd shapes with Linux errnos, and
+follow the final symlink unless `AT_SYMLINK_NOFOLLOW` selects the link inode.
+Legacy `fchmodat` always uses zero flags; `fchmodat2` supports
+`AT_EMPTY_PATH`, including `AT_FDCWD` naming cwd. Chmod preserves all `07777`
+mode bits. Chown preserves a field requested as `(uid_t)-1` and clears setuid
+and setgid on non-directories. Successful disk-backed metadata calls return
+only after persistence; failures do not emit an attribute notification.
+Credential-based authorization of these mutations is not yet enforced by the
+Linux-compatibility shim; capability-based filesystem authority remains the
+security boundary.
 `clock_gettime(2)` accepts realtime/monotonic coarse clocks and process/thread
 CPU clocks. Coarse clocks currently use the precise source; CPU clocks use the
 calling task's accumulated user and kernel accounting.
 Anonymous pipes implement `FIONREAD` on both ends and report the shared
 immediately-readable byte count. Writes and final endpoint closure publish a
 readiness notification so parked `poll`/`epoll` waiters wake without unrelated
-system activity.
+system activity. A write after the final reader closes raises `SIGPIPE` and
+returns `EPIPE`.
 Legacy `clone(2)` honors `CLONE_PIDFD` by installing a pidfd in the parent and
 writing its descriptor through the overloaded `parent_tid` pointer argument.
 Private futex wait queues are keyed by `(address-space identity, user address)`;

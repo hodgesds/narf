@@ -48,6 +48,10 @@ Deliberately under-specified at this stage. Expected shape:
 
 - Inbound: framebuffer attach, command-buffer submit.
 - Outbound: presentation ring (driver -> compositor, whenever that arrives).
+- Linux-compatible DRM devfs nodes have stable metadata shared across
+  lookups. Primary and render nodes start at the conservative devtmpfs policy
+  `0600 root:root`; `set_owners`/`set_perms` persist the distribution policy
+  subsequently applied by udev without embedding distribution-specific GIDs.
 
 ## 4. Invariants & safety properties
 

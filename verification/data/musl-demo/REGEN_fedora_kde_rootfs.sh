@@ -87,9 +87,23 @@ ENTEREOF
       kwin-wayland plasma-breeze qt6-qtwayland \
       mesa-dri-drivers mesa-libgbm mesa-libEGL \
       dbus-daemon dbus-tools \
-      xrdb \
+      xrdb cpp xkeyboard-config \
       bash coreutils util-linux procps-ng strace file less findutils \
       dejavu-sans-fonts kde-cli-tools konsole foot'
+  "$WORK/enter.sh" 'dnf clean all'
+fi
+
+# Older incremental work trees may predate xrdb's external preprocessor
+# dependency even though xrdb itself is installed.
+if [ ! -x "$WORK/root/usr/bin/cpp" ]; then
+  "$WORK/enter.sh" 'dnf -y --setopt=install_weak_deps=False install cpp'
+  "$WORK/enter.sh" 'dnf clean all'
+fi
+# KWin's Xwayland and the kcminit keyboard module require the compiled XKB
+# rules tree.  With weak dependencies disabled it is not guaranteed to arrive
+# with Plasma; without it kcminit never reaches its ready-pipe handoff.
+if [ ! -d "$WORK/root/usr/share/X11/xkb/rules" ]; then
+  "$WORK/enter.sh" 'dnf -y --setopt=install_weak_deps=False install xkeyboard-config'
   "$WORK/enter.sh" 'dnf clean all'
 fi
 
@@ -106,6 +120,14 @@ echo "Staging NARF-specific bits..."
 # every such call burn dbus's full 120s service_start_timeout before failing.
 # Drop it and dbus answers "not provided by any .service files" immediately.
 rm -f "$WORK/root/usr/share/dbus-1/services/org.freedesktop.systemd1.service"
+# Plasma synchronously queries org.freedesktop.locale1 before it can launch
+# plasma_session.  This verification image does not need the locale daemon's
+# keyboard-policy service, while activating its fully sandboxed systemd unit
+# exercises a still-incomplete broker/PID1 compatibility path and can wait
+# indefinitely.  With no activator, dbus-broker returns ServiceUnknown and
+# startplasma follows its documented warning/fallback path immediately.
+# Keep this scoped to the acceptance image; it is not a kernel wake fix.
+rm -f "$WORK/root/usr/share/dbus-1/system-services/org.freedesktop.locale1.service"
 # ld.so.cache: the image is built offline, so make sure it matches the tree.
 "$WORK/enter.sh" 'ldconfig' || true
 
@@ -115,29 +137,133 @@ rm -f "$WORK/root/usr/share/dbus-1/services/org.freedesktop.systemd1.service"
 if ! grep -q '^narf:' "$WORK/root/etc/passwd"; then
   "$WORK/enter.sh" 'useradd --create-home --uid 1000 --shell /bin/bash narf'
 fi
+# Fedora assigns primary DRM nodes to `video` (normally 0660) and render nodes
+# to `render` at 0666. Keep both memberships for incremental work trees too;
+# this image has no logind seat manager to install per-user device ACLs.
+"$WORK/enter.sh" 'usermod --append --groups video,render narf'
 install -d -m 0755 "$WORK/root/home/narf/.config" "$WORK/root/etc/systemd/system/graphical.target.wants"
+# Serial is already the acceptance console. Fedora's tty getty units cannot
+# own these synthetic terminals correctly yet and crash/restart throughout a
+# boot, consuming a vCPU and adding unrelated PID1/SIGCHLD/timer churn.
+ln -sfn /dev/null "$WORK/root/etc/systemd/system/console-getty.service"
+ln -sfn /dev/null "$WORK/root/etc/systemd/system/getty@tty1.service"
 printf '[General]\nsystemdBoot=false\n' > "$WORK/root/home/narf/.config/startkderc"
+# Fedora's global startkderc is selected before the per-user override during
+# this bootstrap path. This image has no per-user systemd manager, so force
+# classic startup globally as well; otherwise plasma_waitforname burns D-Bus's
+# full 120-second activation timeout waiting for user units that cannot start.
+printf '[General]\nsystemdBoot=false\n' > "$WORK/root/etc/xdg/startkderc"
+# The splash is cosmetic and not part of the compositor/shell acceptance
+# gate. Disable it while its independent userspace #GP is tracked separately.
+printf '[KSplash]\nEngine=none\nTheme=None\n' > "$WORK/root/etc/xdg/ksplashrc"
+printf '[KSplash]\nEngine=none\nTheme=None\n' > "$WORK/root/home/narf/.config/ksplashrc"
+# startplasma still probes the well-known splash name even with Theme=None.
+# Without a per-user systemd manager Fedora's activator runs
+# plasma_waitforname until D-Bus's 120-second timeout, so make the optional
+# name fail immediately instead of installing a guaranteed timeout path.
+rm -f "$WORK/root/usr/share/dbus-1/services/org.kde.KSplash.service"
 chown -R 1000:1000 "$WORK/root/home/narf"
+
+# Capture the narrow D-Bus gate between KWin startup and plasmashell startup.
+# The monitor runs on the same fresh session bus as Plasma, so serial and
+# reply_serial values can be correlated without syscall-level tracing.
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-plasma-session-monitor.sh" \
+  "$WORK/root/usr/local/libexec/narf-plasma-session-monitor"
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-plasma-classic-supervisor.sh" \
+  "$WORK/root/usr/local/libexec/narf-plasma-classic-supervisor"
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-drm-policy.sh" \
+  "$WORK/root/usr/local/libexec/narf-drm-policy"
+
+# Keep DRM policy setup in its own root service. The `+` executable prefix on
+# an ExecStartPre of a User= service exercises systemd's privileged-command
+# credential path, which the current Linux-compat layer does not yet complete.
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Apply NARF DRM device policy' \
+  '' \
+  '[Service]' \
+  'Type=oneshot' \
+  'User=root' \
+  'Group=root' \
+  'ExecStart=/usr/local/libexec/narf-drm-policy' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
+  > "$WORK/root/etc/systemd/system/narf-drm-policy.service"
+
+# Preserve the exact generated keymap stream that Xwayland hands to xkbcomp.
+# This is a diagnostic for the current Plasma gate: the image's static XKB
+# corpus compiles correctly offline, while the live compiler reports malformed
+# stdin.  Keep the package binary under a stable private name so incremental
+# image regeneration remains idempotent.
+if [ ! -x "$WORK/root/usr/bin/xkbcomp.narf-real" ]; then
+  mv "$WORK/root/usr/bin/xkbcomp" "$WORK/root/usr/bin/xkbcomp.narf-real"
+fi
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-xkbcomp-capture.sh" \
+  "$WORK/root/usr/bin/xkbcomp"
+
+# kcminit runs xrdb synchronously during its phase-zero fonts/style setup. If
+# Xwayland has already failed, a permanent X11 round trip must not prevent the
+# Wayland-only shell from starting. Preserve the package binary and bound only
+# this optional compatibility step.
+if [ ! -x "$WORK/root/usr/bin/xrdb.narf-real" ]; then
+  mv "$WORK/root/usr/bin/xrdb" "$WORK/root/usr/bin/xrdb.narf-real"
+fi
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-xrdb-guard.sh" \
+  "$WORK/root/usr/bin/xrdb"
+
+# Xwayland currently fails while compiling its generated XKB keymap but can
+# leave its display socket accepting connections.  The phase-zero style KCM
+# performs a synchronous XCB connect after xrdb returns, so clear DISPLAY only
+# for kcminit.  Native Wayland session processes keep the compositor's normal
+# environment, while this optional X11 compatibility initialization fails
+# quickly instead of gating sendReady().
+if [ ! -e "$WORK/root/usr/bin/kcminit_startup.narf-real" ]; then
+  mv "$WORK/root/usr/bin/kcminit_startup" \
+    "$WORK/root/usr/bin/kcminit_startup.narf-real"
+fi
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-kcminit-wayland-guard.sh" \
+  "$WORK/root/usr/bin/kcminit_startup"
+
+# Restore the package binary if an older incremental work tree contains the
+# rejected QDBUS_DEBUG wrapper. That diagnostic changed the process identity,
+# emitted no Qt records, and perturbed the kcminit transition.
+if [ -e "$WORK/root/usr/bin/plasma_session.narf-real" ]; then
+  mv -f "$WORK/root/usr/bin/plasma_session.narf-real" \
+    "$WORK/root/usr/bin/plasma_session"
+fi
 
 # The graphical session is a normal systemd service, deliberately not the
 # legacy narf-start.sh diagnostic wrapper. PID 1 orders it after the system
 # bus, gives it a private user-owned runtime directory, and starts Plasma
 # through a fresh session bus. logind is intentionally not a requirement:
 # Plasma can run without it, and a login-manager compatibility failure must
-# not suppress the graphical compositor.
+# not suppress the graphical compositor. Type=simple also avoids making the
+# session's lifetime depend on systemd's exec-notification handshake while the
+# Linux-compat process startup path is still slower than native Linux.
 printf '%s\n' \
   '[Unit]' \
   'Description=NARF Plasma Wayland Session' \
   'Wants=dbus-broker.service' \
-  'After=dbus-broker.service' \
+  'Requires=narf-drm-policy.service' \
+  'After=dbus-broker.service narf-drm-policy.service' \
   '' \
   '[Service]' \
-  'Type=exec' \
+  'Type=simple' \
   'User=narf' \
+  'Group=video' \
   'Environment=HOME=/home/narf' \
   'Environment=XDG_RUNTIME_DIR=/run/narf-plasma' \
   'Environment=XDG_SESSION_TYPE=wayland' \
   'Environment=XDG_CURRENT_DESKTOP=KDE' \
+  'Environment=XKB_DEFAULT_MODEL=pc105' \
+  'Environment=XKB_DEFAULT_LAYOUT=us' \
+  'Environment=QT_LOGGING_RULES=org.kde.kcminit.debug=true' \
   'Environment=QT_QPA_PLATFORM=wayland' \
   'Environment=KWIN_DRM_NO_AMS=1' \
   'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \
@@ -145,16 +271,54 @@ printf '%s\n' \
   'Environment=GALLIUM_DRIVER=llvmpipe' \
   'RuntimeDirectory=narf-plasma' \
   'RuntimeDirectoryMode=0700' \
-  'ExecStart=/usr/bin/dbus-run-session -- /usr/bin/startplasma-wayland' \
+  'ExecStart=/usr/bin/dbus-run-session -- /usr/local/libexec/narf-plasma-session-monitor' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
   'Restart=on-failure' \
   'RestartSec=3s' \
-  'TimeoutStartSec=180s' \
   '' \
   '[Install]' \
   'WantedBy=graphical.target' \
   > "$WORK/root/etc/systemd/system/narf-plasma.service"
 ln -sfn ../narf-plasma.service \
   "$WORK/root/etc/systemd/system/graphical.target.wants/narf-plasma.service"
+
+# Do not confuse Type=simple's successful fork with a working desktop. This
+# oneshot is ordered after the session service and keeps the graphical target
+# pending until both the compositor and shell have remained alive long enough
+# to be observed twice. Its console heartbeats also expose the last surviving
+# process when startup stalls.
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-plasma-probe.sh" \
+  "$WORK/root/usr/local/libexec/narf-plasma-probe"
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Verify NARF Plasma processes' \
+  'Wants=narf-plasma.service' \
+  'After=narf-plasma.service' \
+  '' \
+  '[Service]' \
+  'Type=oneshot' \
+  'User=narf' \
+  'ExecStart=/usr/local/libexec/narf-plasma-probe' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
+  'TimeoutStartSec=15min' \
+  '' \
+  '[Install]' \
+  'WantedBy=graphical.target' \
+  > "$WORK/root/etc/systemd/system/narf-plasma-probe.service"
+ln -sfn ../narf-plasma-probe.service \
+  "$WORK/root/etc/systemd/system/graphical.target.wants/narf-plasma-probe.service"
+# A Wants= symlink lets graphical.target succeed after a failed oneshot.
+# Make the probe a required, ordered start job so graphical.target is proof of
+# PLASMA-READY rather than merely proof that the probe was attempted.
+install -d "$WORK/root/etc/systemd/system/graphical.target.d"
+printf '%s\n' \
+  '[Unit]' \
+  'Requires=narf-plasma-probe.service' \
+  'After=narf-plasma-probe.service' \
+  > "$WORK/root/etc/systemd/system/graphical.target.d/narf-plasma-gate.conf"
 
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-systemd-start.sh" \

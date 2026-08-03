@@ -519,7 +519,7 @@ pub trait FileOps: Send + Sync {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 
-    /// Update the low-9 permission bits in `Stat::mode`. Default
+    /// Update the low 12 permission/special bits in `Stat::mode`. Default
     /// returns Unsupported; FSes that persist mode bits override.
     fn set_perms<'a>(&'a self, _perms: u16) -> FsFuture<'a, ()> {
         Box::pin(async move { Err(FsError::Unsupported) })
@@ -1103,6 +1103,14 @@ pub trait DirOps: Send + Sync {
     /// filesystems ignore it); memfs stores it so `dir_mode` reflects it.
     fn set_dir_mode(&self, _perms: u16) {}
 
+    /// Set this directory's permission bits asynchronously. Disk-backed
+    /// filesystems override this to persist the inode update; the default
+    /// preserves the synchronous behaviour of synthetic filesystems.
+    fn set_dir_mode_async<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        self.set_dir_mode(perms);
+        Box::pin(async { Ok(()) })
+    }
+
     /// POSIX owner ids for a directory inode. Writable filesystems override
     /// this so mount-root `uid=`/`gid=` and directory chown round-trip through
     /// path stat, fstat on directory fds, and access checks.
@@ -1113,6 +1121,13 @@ pub trait DirOps: Send + Sync {
     /// Update a directory inode's POSIX owner ids. Read-only/synthetic
     /// filesystems retain the no-op default.
     fn set_dir_owners(&self, _uid: u32, _gid: u32) {}
+
+    /// Update a directory inode's POSIX owner ids asynchronously.
+    /// Disk-backed filesystems override this to persist the inode update.
+    fn set_dir_owners_async<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        self.set_dir_owners(uid, gid);
+        Box::pin(async { Ok(()) })
+    }
 
     /// Commit directory entries and metadata (`data_only` models
     /// `fdatasync(2)` on an open directory descriptor).

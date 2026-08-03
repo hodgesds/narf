@@ -512,7 +512,7 @@ impl MemFile {
             _inode_lease: superblock
                 .reserve_inode()
                 .expect("unlimited memfs inode reservation"),
-            perms: AtomicU32::new((perms & 0o777) as u32),
+            perms: AtomicU32::new((perms & 0o7777) as u32),
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
             mtime_ns: AtomicU64::new(0),
@@ -530,7 +530,7 @@ impl MemFile {
             ino: alloc_ino(),
             data: IrqSafeSpinLock::new(FileData::default()),
             _inode_lease: superblock.reserve_inode()?,
-            perms: AtomicU32::new((perms & 0o777) as u32),
+            perms: AtomicU32::new((perms & 0o7777) as u32),
             uid: AtomicU32::new(0),
             gid: AtomicU32::new(0),
             mtime_ns: AtomicU64::new(0),
@@ -704,7 +704,7 @@ impl FileOps for MemFile {
                 } else {
                     FileType::File
                 },
-                perms: (self.perms.load(Ordering::Relaxed) & 0o777) as u16,
+                perms: (self.perms.load(Ordering::Relaxed) & 0o7777) as u16,
             },
             // Report wall-ns as cycles so the stat ABI's cycles→ns
             // division (`stat_linux`: mtime_cycles / cycles_per_ns)
@@ -729,14 +729,14 @@ impl FileOps for MemFile {
         Box::pin(async move {
             self.uid.store(uid, Ordering::Relaxed);
             self.gid.store(gid, Ordering::Relaxed);
+            self.perms.fetch_and(!0o6000, Ordering::Relaxed);
             Ok(())
         })
     }
 
     fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            // Persist only the low-9 rwxrwxrwx bits.
-            self.perms.store((perms & 0o777) as u32, Ordering::Relaxed);
+            self.perms.store((perms & 0o7777) as u32, Ordering::Relaxed);
             Ok(())
         })
     }
@@ -1009,7 +1009,7 @@ impl FileOps for MemSpecial {
             blocks: 0,
             mode: Mode {
                 file_type: self.file_type,
-                perms: (self.perms.load(Ordering::Relaxed) & 0o777) as u16,
+                perms: (self.perms.load(Ordering::Relaxed) & 0o7777) as u16,
             },
             mtime_cycles: 0,
         }
@@ -1026,13 +1026,14 @@ impl FileOps for MemSpecial {
         Box::pin(async move {
             self.uid.store(uid, Ordering::Relaxed);
             self.gid.store(gid, Ordering::Relaxed);
+            self.perms.fetch_and(!0o6000, Ordering::Relaxed);
             Ok(())
         })
     }
 
     fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            self.perms.store((perms & 0o777) as u32, Ordering::Relaxed);
+            self.perms.store((perms & 0o7777) as u32, Ordering::Relaxed);
             Ok(())
         })
     }
@@ -1667,7 +1668,7 @@ impl DirOps for MemDir {
     fn tmpfile<'a>(&'a self, mode: u32) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             let file = Arc::new(MemFile::new(&self.superblock, &[])?);
-            file.perms.store(mode & 0o777, Ordering::Relaxed);
+            file.perms.store(mode & 0o7777, Ordering::Relaxed);
             Ok(file as Arc<dyn FileOps>)
         })
     }
@@ -1760,7 +1761,7 @@ impl MemFs {
         let g = self.root.entries.lock();
         match g.get(name) {
             Some(Entry::File(f)) => {
-                f.perms.store((perms & 0o777) as u32, Ordering::Relaxed);
+                f.perms.store((perms & 0o7777) as u32, Ordering::Relaxed);
                 f.uid.store(uid, Ordering::Relaxed);
                 f.gid.store(gid, Ordering::Relaxed);
                 true

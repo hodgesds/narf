@@ -116,19 +116,24 @@ fn set_access_result(ctx: &mut dyn TrapContext, mode: u32, perms: u16, uid: u32,
     ctx.set_return(SyscallReturn::ok(if allowed { 0 } else { (-13i64) as u64 }));
 }
 
-pub(crate) fn sys_access_chmod_chown(ctx: &mut dyn TrapContext) {
+pub(crate) fn sys_chown(ctx: &mut dyn TrapContext) {
+    chown_legacy(ctx, 0);
+}
+
+pub(crate) fn sys_lchown(ctx: &mut dyn TrapContext) {
+    chown_legacy(ctx, 0x100); // AT_SYMLINK_NOFOLLOW
+}
+
+fn chown_legacy(ctx: &mut dyn TrapContext, flags: u64) {
     let args = *ctx.args();
     // Linux ABI for the three legacy entries:
     //   access(path, mode)      — arg1 = mode
     //   chmod(path, mode)       — arg1 = mode
     //   chown(path, uid, gid)   — arg1 = uid, arg2 = gid
     // All take an absolute path as a NUL-terminated cstr; the body
-    // forwards to `sys_fchmodat_or_fchownat` which only enforces
-    // the structural "path must be absolute" contract — we drop
-    // the mode/uid/gid in the proxy so the underlying path-len
-    // shape lines up.
+    // Forward legacy chown(path, uid, gid) to the fchownat ABI.
     let path_uptr = args.arg0;
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
+    let _path_str = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {
             // Unreadable user path pointer → EFAULT, not a bare -1 → EPERM.
@@ -159,11 +164,11 @@ pub(crate) fn sys_access_chmod_chown(ctx: &mut dyn TrapContext) {
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: (-100i64) as u64, // dirfd = AT_FDCWD (legacy access/chmod/chown).
+        arg0: (-100i64) as u64, // dirfd = AT_FDCWD.
         arg1: path_uptr,
-        arg2: path_str.len() as u64,
-        arg3: 0,
-        arg4: 0,
+        arg2: args.arg1,
+        arg3: args.arg2,
+        arg4: flags,
         arg5: 0,
     };
     let mut proxy = Reshape {

@@ -28,7 +28,7 @@
 //! arm callback converts to whatever unit the underlying
 //! timer hardware (HPET) wants.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::task::Waker;
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -79,6 +79,74 @@ impl WheelInner {
 }
 
 static WHEEL: IrqSafeSpinLock<WheelInner> = IrqSafeSpinLock::new(WheelInner::new());
+
+/// Cached minimum wheel deadline. `NEXT_DEADLINE_VALID` distinguishes an
+/// empty wheel from a real timer at `u64::MAX`.
+///
+/// `fire_due` is called from every CPU's executor loop, including the hot
+/// runnable path.  Walking all 1024 slots (and taking the global wheel lock
+/// once per slot) merely to discover that the next deadline is still in the
+/// future turns an SMP desktop workload into lock contention.  Keep the
+/// spec-required next-deadline cache so the common case is a small lock-free
+/// snapshot. All slot mutations publish while holding `WHEEL`; the sequence
+/// counter prevents readers from combining an old valid bit with a new
+/// deadline (or vice versa). A stale completed snapshot may be earlier than
+/// the true minimum during a concurrent drain, causing at most one unnecessary
+/// slow-path scan, but is never allowed to be later.
+static NEXT_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+static NEXT_DEADLINE_VALID: AtomicBool = AtomicBool::new(false);
+/// Even values describe a stable `(valid, deadline)` snapshot; odd values
+/// mean a writer is publishing. Writers are serialized by `WHEEL`.
+static NEXT_DEADLINE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn cached_min() -> Option<u64> {
+    loop {
+        let before = NEXT_DEADLINE_SEQ.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        let valid = NEXT_DEADLINE_VALID.load(Ordering::Relaxed);
+        let deadline = NEXT_DEADLINE.load(Ordering::Relaxed);
+        let after = NEXT_DEADLINE_SEQ.load(Ordering::Acquire);
+        if before == after {
+            return valid.then_some(deadline);
+        }
+    }
+}
+
+#[inline]
+fn cached_min_write_begin() {
+    // Acquire prevents the following wheel mutation and payload stores from
+    // moving before the odd marker. Writers are serialized by WHEEL.
+    let previous = NEXT_DEADLINE_SEQ.fetch_add(1, Ordering::AcqRel);
+    debug_assert_eq!(previous & 1, 0, "nested timer-wheel cache publication");
+}
+
+#[inline]
+fn cached_min_write_end(min: Option<u64>) {
+    if let Some(deadline) = min {
+        NEXT_DEADLINE.store(deadline, Ordering::Relaxed);
+        NEXT_DEADLINE_VALID.store(true, Ordering::Relaxed);
+    } else {
+        NEXT_DEADLINE_VALID.store(false, Ordering::Relaxed);
+    }
+    NEXT_DEADLINE_SEQ.fetch_add(1, Ordering::Release);
+}
+
+#[inline]
+fn publish_cached_min(min: Option<u64>) {
+    cached_min_write_begin();
+    cached_min_write_end(min);
+}
+
+#[inline]
+fn publish_min_locked(wheel: &WheelInner) -> Option<u64> {
+    let min = wheel.min_deadline();
+    publish_cached_min(min);
+    min
+}
 
 /// Function pointer the IRQ-side glue installs at boot. We
 /// store it as `usize` because `fn(u64)` doesn't have an
@@ -166,7 +234,7 @@ fn invoke_arm(deadline: u64) {
 pub fn register(deadline_cycles: u64, waker: Waker) -> Result<SleepHandle, WheelError> {
     let (handle, new_min) = {
         let mut w = WHEEL.lock();
-        let prev_min = w.min_deadline();
+        let prev_min = cached_min();
 
         let slot_idx = w
             .slots
@@ -179,13 +247,18 @@ pub fn register(deadline_cycles: u64, waker: Waker) -> Result<SleepHandle, Wheel
         // as a sentinel without ambiguity.
         w.next_gen = w.next_gen.wrapping_add(1).max(1);
 
+        // Mark the cache unstable before making an earlier deadline visible
+        // in the wheel. Otherwise a lock-free reader could accept the old,
+        // later cached minimum in the mutation-to-publication window.
+        cached_min_write_begin();
         w.slots[slot_idx] = Some(Slot {
             deadline_cycles,
             waker,
             gen,
         });
 
-        let new_min = w.min_deadline().expect("just inserted");
+        let new_min = prev_min.map_or(deadline_cycles, |p| p.min(deadline_cycles));
+        cached_min_write_end(Some(new_min));
         let arm = match prev_min {
             None => Some(new_min),
             Some(p) if new_min < p => Some(new_min),
@@ -220,7 +293,11 @@ pub fn cancel(handle: SleepHandle) {
     }
     if let Some(s) = w.slots[idx].as_ref() {
         if s.gen == handle.gen {
+            let removed_deadline = s.deadline_cycles;
             w.slots[idx] = None;
+            if cached_min() == Some(removed_deadline) {
+                publish_min_locked(&w);
+            }
         }
     }
 }
@@ -268,17 +345,27 @@ pub fn refresh_waker_at(handle: SleepHandle, deadline_cycles: u64, waker: Waker)
         if idx >= MAX_SLEEPERS {
             return false;
         }
-        let prev_min = w.min_deadline();
-        match w.slots[idx].as_mut() {
-            Some(s) if s.gen == handle.gen => {
-                s.deadline_cycles = deadline_cycles;
-                if !s.waker.will_wake(&waker) {
-                    s.waker = waker;
-                }
-            }
+        let prev_min = cached_min();
+        let old_deadline = match w.slots[idx].as_ref() {
+            Some(s) if s.gen == handle.gen => s.deadline_cycles,
             _ => return false,
+        };
+        // As in register(), an earlier replacement must not become visible
+        // while readers can still accept the old, later cached minimum.
+        cached_min_write_begin();
+        let s = w.slots[idx]
+            .as_mut()
+            .expect("validated timer slot disappeared while WHEEL was locked");
+        s.deadline_cycles = deadline_cycles;
+        if !s.waker.will_wake(&waker) {
+            s.waker = waker;
         }
-        let new_min = w.min_deadline().expect("slot present");
+        let new_min = if prev_min == Some(old_deadline) && deadline_cycles > old_deadline {
+            w.min_deadline().expect("slot present")
+        } else {
+            prev_min.map_or(deadline_cycles, |p| p.min(deadline_cycles))
+        };
+        cached_min_write_end(Some(new_min));
         match prev_min {
             Some(p) if new_min < p => Some(new_min),
             None => Some(new_min),
@@ -301,6 +388,9 @@ pub fn refresh_waker_at(handle: SleepHandle, deadline_cycles: u64, waker: Waker)
 /// chain) MUST use [`take_due`] instead and call wake() AFTER
 /// exiting IRQ context.
 pub fn fire_due(now_cycles: u64) -> usize {
+    if cached_min().is_none_or(|deadline| deadline > now_cycles) {
+        return 0;
+    }
     // O(1) stack + SINGLE PASS. Walk slot indices once with a cursor, taking +
     // waking each slot that is due at entry. Two invariants matter:
     //   - No ~1 KiB on-stack `[Option<Waker>; MAX_SLEEPERS]`: moving that array
@@ -327,6 +417,12 @@ pub fn fire_due(now_cycles: u64) -> usize {
             wk.wake();
             n += 1;
         }
+    }
+    // Publish while holding WHEEL so a concurrent registration cannot insert
+    // an earlier timer between the recompute and the store.
+    {
+        let w = WHEEL.lock();
+        publish_min_locked(&w);
     }
     n
 }
@@ -372,6 +468,7 @@ pub fn take_due_into(now_cycles: u64, out: &mut [Option<Waker>; MAX_SLEEPERS]) -
             }
         }
     }
+    publish_min_locked(&w);
     n
 }
 
@@ -390,59 +487,47 @@ pub fn take_due_into(now_cycles: u64, out: &mut [Option<Waker>; MAX_SLEEPERS]) -
 /// free) in IRQ context. The scheduler's idle path (`drain_and_wake`) wakes +
 /// drops them in a context where freeing is allowed.
 ///
-/// The wheel lock is released before each `push_pending` so the wheel and the
-/// deferred-queue locks are never held nested (no lock-ordering hazard).
+/// Lock order is `WHEEL` then the current CPU's deferred-wake queue.  No path
+/// takes those locks in the reverse order: `drain_and_wake` releases the queue
+/// before invoking a waker.  Keeping `WHEEL` locked through `try_push_one` is
+/// load-bearing: when the queue is full, the exact timer slot can be restored
+/// without a concurrent registration stealing its only recovery location.
 ///
 /// SINGLE PASS via an index cursor (same invariant as [`fire_due`]): each
 /// currently-due timer is drained at most once; a re-registration into a freed
 /// lower slot is deferred to the next tick, never re-drained this call.
 pub fn drain_due_to_deferred(now_cycles: u64) {
+    if cached_min().is_none_or(|deadline| deadline > now_cycles) {
+        return;
+    }
     for i in 0..MAX_SLEEPERS {
-        // Take this slot's due entry under the wheel lock, then release it
-        // before pushing (the wheel + deferred-queue locks never nest).
-        let taken = {
-            let mut w = WHEEL.lock();
-            match w.slots[i].as_ref() {
-                Some(s) if s.deadline_cycles <= now_cycles => w.slots[i].take(),
-                _ => None,
-            }
+        let mut w = WHEEL.lock();
+        let taken = match w.slots[i].as_ref() {
+            Some(s) if s.deadline_cycles <= now_cycles => w.slots[i].take(),
+            _ => None,
         };
         let Some(slot) = taken else { continue };
-        let deadline = slot.deadline_cycles;
-        if let Err(waker) = narf_lib::deferred_wake::try_push_one(slot.waker) {
-            // Deferred queue FULL. The old path dropped the waker here — but
-            // this slot is already vacated, so that drop was a PERMANENT
-            // lost wake (the module doc's "the next timer tick re-fires the
-            // still-pending wheel slot" recovery doesn't apply: the slot is
-            // gone). Put the sleeper back instead — still due, so it is
-            // re-drained on a later tick (or by the executor's non-IRQ
-            // `fire_due`) once the queue has room: bounded latency, never a
-            // loss. Prefer the just-vacated index; fall back to any free
-            // slot if a concurrent `register` grabbed it.
-            let mut w = WHEEL.lock();
-            let idx = if w.slots[i].is_none() {
-                Some(i)
-            } else {
-                w.slots.iter().position(|s| s.is_none())
-            };
-            match idx {
-                Some(j) => {
-                    let gen = w.next_gen;
-                    w.next_gen = w.next_gen.wrapping_add(1).max(1);
-                    w.slots[j] = Some(Slot {
-                        deadline_cycles: deadline,
-                        waker,
-                        gen,
-                    });
-                }
-                None => {
-                    // Deferred queue full AND the wheel refilled to full in
-                    // the take→push window: nowhere to stash the wake. Drop
-                    // it (the pre-existing worst case, now doubly-guarded).
-                    drop(waker);
-                }
-            }
+        let Slot {
+            deadline_cycles,
+            waker,
+            gen,
+        } = slot;
+        if let Err(waker) = narf_lib::deferred_wake::try_push_one(waker) {
+            // Queue full. Restore the same generation in the same slot while
+            // WHEEL is still locked, so neither the wake nor its SleepHandle
+            // identity can be lost. Leave later due slots untouched and retry
+            // them after the executor drains the deferred queue.
+            w.slots[i] = Some(Slot {
+                deadline_cycles,
+                waker,
+                gen,
+            });
+            break;
         }
+    }
+    {
+        let w = WHEEL.lock();
+        publish_min_locked(&w);
     }
 }
 
@@ -450,17 +535,14 @@ pub fn drain_due_to_deferred(now_cycles: u64) {
 /// empty. Used by the IRQ handler to decide whether to
 /// rearm.
 pub fn next_deadline_cycles() -> Option<u64> {
-    WHEEL.lock().min_deadline()
+    cached_min()
 }
 
-/// Like `next_deadline_cycles` but uses `try_lock`. Safe to call from IRQ
-/// context (e.g. the timer ISR's re-arm), where a blocking `lock()` would
-/// deadlock against an interrupted `register()`/`fire_due` holding the wheel.
-/// Returns None if the wheel is empty OR currently contended (the caller
-/// then arms the periodic fallback; the contending path re-arms via the
-/// arm-callback right after).
+/// IRQ-safe lock-free form of [`next_deadline_cycles`]. The versioned cache
+/// prevents an interrupted or concurrent wheel mutation from exposing a
+/// mixed snapshot, so this only returns `None` when the wheel is empty.
 pub fn next_deadline_cycles_try() -> Option<u64> {
-    WHEEL.try_lock().and_then(|w| w.min_deadline())
+    cached_min()
 }
 
 /// Diagnostic: number of currently-occupied slots.
@@ -475,6 +557,7 @@ pub fn __reset_for_test() {
         *s = None;
     }
     w.next_gen = 1;
+    publish_cached_min(None);
     drop(w);
     clear_arm_callback();
     ARM_FIRED.store(0, Ordering::Relaxed);

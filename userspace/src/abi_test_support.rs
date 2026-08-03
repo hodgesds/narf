@@ -44,6 +44,7 @@ pub const EINVAL: i64 = -22;
 pub const EMFILE: i64 = -24;
 pub const ENOTTY: i64 = -25;
 pub const ESPIPE: i64 = -29;
+pub const EPIPE: i64 = -32;
 pub const ERANGE: i64 = -34;
 pub const ENAMETOOLONG: i64 = -36;
 pub const ENOSYS: i64 = -38;

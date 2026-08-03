@@ -2531,7 +2531,8 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
         }
         let base = comp.result[0];
 
-        // Munmap(base).
+        // Munmap(base). The v1 native ring op retains its whole-VMA contract;
+        // Linux syscall 11 separately takes and validates an explicit length.
         let mut sub = Submission::noop(Tag::new(0x21));
         sub.op = OpCode::Munmap;
         sub.inline[0] = base;

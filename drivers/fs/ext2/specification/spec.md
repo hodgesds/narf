@@ -5,12 +5,13 @@
 A clean-room implementation of the Second Extended Filesystem (ext2) for
 NARF.
 
-- **Scope:** Read access to ext2 volumes, integration with NARF's VFS
-  (`narf_filesystem::FsInstance`), and cap-bound DMA block I/O via
-  `narf_io` + `narf_block`.
-- **Out of Scope (this iteration):** writes, journalling (ext3+),
-  HTREE directory indexes, extended attributes, symlinks (inline +
-  pointed), `fsck`-style repair, sparse-superblock variants.
+- **Scope:** Read/write access to ext2 volumes, integration with NARF's VFS
+  (`narf_filesystem::FsInstance`), persistent inode data/mode/owner metadata,
+  directory mutation, symlinks, and cap-bound DMA block I/O via `narf_io` +
+  `narf_block`.
+- **Out of Scope (this iteration):** journal writes (ext3+), HTREE leaf
+  splitting/rebalancing, extended attributes, `fsck`-style repair, and
+  extents-tree writes.
 
 ## 2. Assumptions
 
@@ -32,7 +33,9 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
 
 - `Ext2Volume<B: BlockDevice>`: Root structure for a mounted volume.
 - `Ext2Node<B: BlockDevice>`: Inode-backed node providing `read`,
-  `lookup_async`, `lookup_dir_async`, and `enumerate_async`.
+  `write`, `truncate`, persistent `set_perms`/`set_owners`, directory
+  metadata mutation, `lookup_async`, `lookup_dir_async`, and
+  `enumerate_async`.
 
 ## 4. Invariants
 
@@ -45,12 +48,18 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
   the volume cap via `Cap::derive::<Read>()`.
 - **Indirect block walks bounded** by the inode's `i_blocks` / file
   size; cycles in the indirect chain return `FsError::Io(IOError)`.
+- **Whole-inode mutations are serialized per volume.** Every data or metadata
+  read/modify/write starts from the current on-disk inode, so independent open
+  handles cannot restore stale mode or owner fields.
+- **Root metadata is real inode metadata.** Mount loads inode 2 and every
+  successful inode-2 write refreshes the synchronous `FsInstance::root()`
+  snapshot.
 
 ## 5. Architecture notes
 
 - **Async-First:** All I/O is async on the `BlockDevice` trait.
-- **Read-only first cut.** Write paths land alongside the journal /
-  ext3 work in a follow-up.
+- **Write scope.** Legacy direct/indirect block writes and inode/directory
+  metadata persist. Extents-tree and journal writes remain unsupported.
 - **Block-size flexibility.** Block size is `1024 << s_log_block_size`;
   the driver does not hard-code 4096.
 

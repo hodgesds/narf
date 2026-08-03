@@ -129,9 +129,9 @@ impl UpperDir {
                     Err(error) => return Err(error),
                 };
                 if let Some(lower) = slot.lower_metadata.as_ref() {
-                    created.set_dir_mode(lower.dir_mode());
+                    created.set_dir_mode_async(lower.dir_mode()).await?;
                     let (uid, gid) = lower.dir_owners();
-                    created.set_dir_owners(uid, gid);
+                    created.set_dir_owners_async(uid, gid).await?;
                 }
                 parent_dir = slot.publish(created);
             }
@@ -511,6 +511,13 @@ impl DirOps for OverlayDir {
         }
     }
 
+    fn set_dir_mode_async<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let upper = self.upper.ensure().await?;
+            upper.set_dir_mode_async(perms).await
+        })
+    }
+
     fn dir_owners(&self) -> (u32, u32) {
         self.upper_dir().map_or_else(
             || self.lowers.first().map_or((0, 0), |dir| dir.dir_owners()),
@@ -522,6 +529,13 @@ impl DirOps for OverlayDir {
         if let Some(upper) = self.upper_dir() {
             upper.set_dir_owners(uid, gid);
         }
+    }
+
+    fn set_dir_owners_async<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let upper = self.upper.ensure().await?;
+            upper.set_dir_owners_async(uid, gid).await
+        })
     }
 
     fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {

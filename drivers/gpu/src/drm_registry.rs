@@ -87,6 +87,49 @@ pub struct DrmCardEntry {
     pub mode_state: Option<Arc<IrqSafeSpinLock<crate::drm::card::Card>>>,
 }
 
+/// Mutable devfs policy applied by udev to one DRM node.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DrmNodeMetadata {
+    pub uid: u32,
+    pub gid: u32,
+    pub perms: u16,
+}
+
+fn default_primary_metadata() -> Arc<IrqSafeSpinLock<DrmNodeMetadata>> {
+    Arc::new(IrqSafeSpinLock::new(DrmNodeMetadata {
+        uid: 0,
+        gid: 0,
+        perms: 0o600,
+    }))
+}
+
+fn default_render_metadata() -> Arc<IrqSafeSpinLock<DrmNodeMetadata>> {
+    Arc::new(IrqSafeSpinLock::new(DrmNodeMetadata {
+        uid: 0,
+        gid: 0,
+        perms: 0o600,
+    }))
+}
+
+struct DrmCardMetadata {
+    primary: Arc<IrqSafeSpinLock<DrmNodeMetadata>>,
+    render: Arc<IrqSafeSpinLock<DrmNodeMetadata>>,
+}
+
+struct RegistryState {
+    cards: Vec<DrmCardEntry>,
+    metadata: Vec<DrmCardMetadata>,
+}
+
+impl RegistryState {
+    const fn new() -> Self {
+        Self {
+            cards: Vec::new(),
+            metadata: Vec::new(),
+        }
+    }
+}
+
 impl core::fmt::Debug for DrmCardEntry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DrmCardEntry")
@@ -96,7 +139,7 @@ impl core::fmt::Debug for DrmCardEntry {
     }
 }
 
-static REGISTRY: IrqSafeSpinLock<Vec<DrmCardEntry>> = IrqSafeSpinLock::new(Vec::new());
+static REGISTRY: IrqSafeSpinLock<RegistryState> = IrqSafeSpinLock::new(RegistryState::new());
 
 /// Register a DRM card and return its assigned index.
 ///
@@ -107,11 +150,15 @@ static REGISTRY: IrqSafeSpinLock<Vec<DrmCardEntry>> = IrqSafeSpinLock::new(Vec::
 /// Linux ref: `drm_dev_register` (drivers/gpu/drm/drm_drv.c).
 pub fn register_drm_card(card: Arc<dyn DrmCard>) -> u32 {
     let mut g = REGISTRY.lock();
-    let index = g.len() as u32;
-    g.push(DrmCardEntry {
+    let index = g.cards.len() as u32;
+    g.cards.push(DrmCardEntry {
         index,
         card,
         mode_state: None,
+    });
+    g.metadata.push(DrmCardMetadata {
+        primary: default_primary_metadata(),
+        render: default_render_metadata(),
     });
     index
 }
@@ -126,11 +173,15 @@ pub fn register_drm_card_with_state(
     mode_state: crate::drm::card::Card,
 ) -> u32 {
     let mut g = REGISTRY.lock();
-    let index = g.len() as u32;
-    g.push(DrmCardEntry {
+    let index = g.cards.len() as u32;
+    g.cards.push(DrmCardEntry {
         index,
         card,
         mode_state: Some(Arc::new(IrqSafeSpinLock::new(mode_state))),
+    });
+    g.metadata.push(DrmCardMetadata {
+        primary: default_primary_metadata(),
+        render: default_render_metadata(),
     });
     index
 }
@@ -140,7 +191,7 @@ pub fn register_drm_card_with_state(
 /// is out of range.
 pub fn attach_mode_state(index: u32, mode_state: crate::drm::card::Card) -> bool {
     let mut g = REGISTRY.lock();
-    if let Some(entry) = g.get_mut(index as usize) {
+    if let Some(entry) = g.cards.get_mut(index as usize) {
         entry.mode_state = Some(Arc::new(IrqSafeSpinLock::new(mode_state)));
         true
     } else {
@@ -154,23 +205,45 @@ pub fn attach_mode_state(index: u32, mode_state: crate::drm::card::Card) -> bool
 pub fn mode_state(index: u32) -> Option<Arc<IrqSafeSpinLock<crate::drm::card::Card>>> {
     REGISTRY
         .lock()
+        .cards
         .get(index as usize)
         .and_then(|e| e.mode_state.clone())
+}
+
+/// Return the shared metadata for one card's primary or render node.
+pub(crate) fn node_metadata(
+    index: u32,
+    render: bool,
+) -> Option<Arc<IrqSafeSpinLock<DrmNodeMetadata>>> {
+    REGISTRY.lock().metadata.get(index as usize).map(|entry| {
+        if render {
+            entry.render.clone()
+        } else {
+            entry.primary.clone()
+        }
+    })
 }
 
 /// Return a snapshot of all registered cards (clones the Arc pointers;
 /// does not clone card state). The lock is held only for the clone.
 pub fn cards() -> Vec<Arc<dyn DrmCard>> {
-    REGISTRY.lock().iter().map(|e| e.card.clone()).collect()
+    REGISTRY
+        .lock()
+        .cards
+        .iter()
+        .map(|e| e.card.clone())
+        .collect()
 }
 
 /// Number of registered DRM cards.
 pub fn count() -> usize {
-    REGISTRY.lock().len()
+    REGISTRY.lock().cards.len()
 }
 
 /// Clear the registry. TEST USE ONLY.
 #[doc(hidden)]
 pub fn __reset_for_test() {
-    REGISTRY.lock().clear();
+    let mut registry = REGISTRY.lock();
+    registry.cards.clear();
+    registry.metadata.clear();
 }

@@ -167,6 +167,14 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// the coalescing role the old `Mutex<PageCache>` played, split out so the
     /// cache itself is a lock-free-to-reach `Arc`.
     fill_lock: Mutex<()>,
+    /// Serializes whole-inode read/modify/write sequences across distinct
+    /// `Ext2Node` handles. Linux has one in-memory inode per on-disk inode;
+    /// this volume-wide async mutex provides the same lost-update guarantee
+    /// until NARF grows a keyed inode cache.
+    pub(crate) inode_update_lock: Mutex<()>,
+    /// Mount-root metadata must be available to the synchronous `root()`
+    /// interface. It is loaded during mount and refreshed by `write_inode`.
+    root_inode: IrqSafeSpinLock<Option<Inode>>,
 }
 
 /// Free-function indirect-pointer read used by the pre-construction
@@ -372,7 +380,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             indirect_cache: IrqSafeSpinLock::new(Vec::new()),
             page_cache: Arc::new(PageCache::new()),
             fill_lock: Mutex::new(()),
+            inode_update_lock: Mutex::new(()),
+            root_inode: IrqSafeSpinLock::new(None),
         });
+        let root_inode = volume.read_inode(super::EXT2_ROOT_INO).await?;
+        *volume.root_inode.lock() = Some(root_inode);
         // Register the page cache with the central memory reclaimer so its
         // clean pages can be shed under pressure (shrinker). Done after the
         // owning Arc exists so a Weak can be held without keeping it alive.
@@ -602,11 +614,22 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 inode: 0,
                 page_off: first_block / blocks_per_page as u64,
             };
+            // Most desktop startup reads are shared-library pages that have
+            // already been populated by another process. Do not queue those
+            // hits behind an unrelated device miss: PageCache::lookup clones
+            // the page Arc under its own lock, so reclaim cannot invalidate
+            // the data after this returns.
+            if let Some(page) = self.page_cache.lookup(key) {
+                dst.copy_from_slice(&page.data[in_page..in_page + bs]);
+                return Ok(());
+            }
             // Hold the fill lock across lookup→read→insert so parallel
-            // readers of the same block coalesce (first fills, rest hit).
+            // misses of the same block coalesce (first fills, rest hit).
             // The cache itself is an Arc reachable without this lock (so the
             // reclaimer can shrink it); its internal lock guards the map.
             let _fill = self.fill_lock.lock().await;
+            // Double-check after waiting: another reader may have filled this
+            // page between the lock-free fast-path lookup and this guard.
             if let Some(page) = self.page_cache.lookup(key) {
                 dst.copy_from_slice(&page.data[in_page..in_page + bs]);
                 return Ok(());
@@ -843,7 +866,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let mut buf = vec![0u8; inode_size];
         self.read_byte_range(inode_byte_off, &mut buf).await?;
         inode.encode_into(&mut buf);
-        self.write_byte_range(inode_byte_off, &buf).await
+        self.write_byte_range(inode_byte_off, &buf).await?;
+        if inode_no == super::EXT2_ROOT_INO {
+            *self.root_inode.lock() = Some(*inode);
+        }
+        Ok(())
     }
 
     // ── Bitmap allocator (Linux fs/ext2/balloc.c + ialloc.c) ─────
@@ -1384,21 +1411,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
 
 impl<B: BlockDevice + 'static> FsInstance for Ext2Volume<B> {
     fn root(&self) -> Arc<dyn DirOps> {
-        // The root directory is always inode 2 — see EXT2_ROOT_INO.
-        // Stat is filled in lazily on the first `stat()` call; for
-        // VFS bootstrap purposes we just hand back a dir-typed
-        // node.
-        Arc::new(super::node::Ext2Node::new(
+        let inode =
+            (*self.root_inode.lock()).expect("mounted ext2 volume lost root inode metadata");
+        Arc::new(super::node::Ext2Node::from_inode(
             self.self_weak
                 .upgrade()
                 .expect("Ext2Volume root called after drop"),
             super::EXT2_ROOT_INO,
-            narf_filesystem::Stat {
-                size: 0,
-                blocks: 0,
-                mode: narf_filesystem::Mode::DIR_RO,
-                mtime_cycles: 0,
-            },
+            inode,
         ))
     }
 
