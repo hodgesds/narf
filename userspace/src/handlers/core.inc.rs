@@ -7763,6 +7763,18 @@ pub(crate) fn current_fs_ids() -> (u32, u32) {
     (ids.fsuid, ids.fsgid)
 }
 
+/// Filesystem identity for a new pseudoterminal slave node, installed as
+/// `narf_filesystem::devfs_pty`'s credentials hook.
+///
+/// Linux stamps `current_fsuid()`/`current_fsgid()` on the `/dev/pts/<N>`
+/// inode when `/dev/ptmx` is opened (`fs/devpts/inode.c::devpts_pty_new`),
+/// and the node is mode 0620 — so these are what let a non-root session
+/// open its own terminal.
+pub fn pty_open_fs_ids() -> (u32, u32) {
+    let ids = read_uidgid(current_task_id());
+    (ids.fsuid, ids.fsgid)
+}
+
 /// The calling task's socket credentials (`struct ucred` shape): its
 /// visible pid plus effective uid/gid. Stamped onto every socket end at
 /// creation so `SO_PEERCRED` / `SCM_CREDENTIALS` report a real identity.
