@@ -2557,3 +2557,41 @@ that branch. A deterministic own-stack concurrency test is required before
 attributing the Plasma boundary to it. In parallel, exact Plasma/Qt source
 must establish whether `StartServiceJob` can remain pending even after its
 monitoring connection observes the well-known name.
+
+Exact Qt 6.10.3 source (the image contains `libQt6Core.so.6.10.3`) adds the
+next part of the call chain. `QDBusConnectionPrivate::socketRead` dispatches
+the bus message, `handleSignal` selects the service watch,
+`activateSignal` posts a `QDBusCallDeliveryEvent` to the watcher object's
+thread, and `QCoreApplication::postEvent` invokes that thread's event
+dispatcher wakeup. For the GLib dispatcher used here,
+`QEventDispatcherGlib::wakeUp` calls `g_main_context_wakeup`, whose Linux
+wakeup source is an eventfd. This means a successful D-Bus socket wake alone
+does not prove the `StartServiceJob::emitResult` callback reached
+`plasma_session`'s main thread.
+
+That cross-thread bridge was previously under-covered: the existing eventfd
+smoke only wrote and read the counter in one thread. It now retains that basic
+check and adds 64 SMP rounds in which the main pthread is pinned to CPU 0, a
+worker pthread is pinned to CPU 1, and the worker writes a shared eventfd while
+the main thread blocks indefinitely. Even rounds use `epoll_wait(-1)` and odd
+rounds use `ppoll(..., timeout=NULL)`, covering both the Qt socket-notifier and
+GLib main-loop wait shapes plus the own-stack scan/register race. The focused
+live result is:
+
+```text
+NARF_QEMU_SMP=2 XTASK_QEMU_NO_BALLOON=1 \
+cargo xtask run-interactive --arch=x86_64 \
+  --cmd /bin/eventfd_smoke --expect eventfd-ok
+PASS: 64 cross-CPU pthread wake rounds, eventfd-ok
+```
+
+Thus queued AF_UNIX bytes, a later AF_UNIX readiness transition, and the
+cross-thread eventfd wake bridge all have deterministic passing coverage. The
+remaining distinction is inside the real Qt connection: whether the kded
+`NameOwnerChanged` matches the watcher and is posted at all. The captured
+`plasma_session` connection (`:1.2`) also receives
+`org.freedesktop.DBus.Error.MatchRuleNotFound` for request serial 9 after the
+temporary KWin watcher finishes. Exact Qt shows this can be a watcher
+`RemoveMatch`; it is a lead, not yet proof that the persistent kded match was
+absent. A plasma_session-only `QDBUS_DEBUG=1` replay can expose add/remove
+rules and signal dispatch without returning to broad syscall tracing.
