@@ -4073,16 +4073,42 @@ fn signal_target_exists(tid: u64) -> bool {
 /// Resolve the thread identifier supplied by a Linux signal syscall to the
 /// TaskId that owns NARF's signal state.  A thread-group leader is visible as
 /// its PID through gettid(2), while CLONE_THREAD siblings retain their
-/// distinct TaskId-derived TIDs.  Keep the latter in task space, then map a
-/// leader PID (including the caller's PID-namespace view) back to its task.
+/// distinct TaskId-derived TIDs.  Resolve the caller's own gettid value first:
+/// a leader PID can numerically collide with an unrelated sibling's raw
+/// TaskId, and treating raw task space as authoritative would misroute a
+/// self-directed tkill or make tgkill fail its tgid check with ESRCH.
+/// Keep other non-leader TIDs in task space, then map a leader PID (including
+/// the caller's PID-namespace view) back to its task.
 fn signal_tid_from_user(caller: u64, tid: u64) -> Option<u64> {
+    if tid == linux_tid_for_task(caller) {
+        return Some(caller);
+    }
     let is_non_leader_thread =
-        tid == caller || task_to_pid_raw(tid).is_some_and(|pid| pid_to_task_raw(pid) != Some(tid));
+        task_to_pid_raw(tid).is_some_and(|pid| pid_to_task_raw(pid) != Some(tid));
     if is_non_leader_thread {
         return Some(tid);
     }
     let pid = accept_pid_from(caller, tid)?;
     Some(pid_to_task_raw(pid).unwrap_or(pid))
+}
+
+/// Linux-visible gettid(2) value for `task`. A thread-group leader reports
+/// its process ID (translated into its own PID namespace); a CLONE_THREAD
+/// sibling reports its distinct scheduler-derived TID.
+fn linux_tid_for_task(task: u64) -> u64 {
+    match task_to_pid_raw(task) {
+        Some(pid) if pid_to_task_raw(pid) == Some(task) => {
+            #[cfg(feature = "container")]
+            {
+                crate::pid_ns::self_inner_pid(task, pid)
+            }
+            #[cfg(not(feature = "container"))]
+            {
+                pid
+            }
+        }
+        _ => task,
+    }
 }
 
 /// Copy `si_code` (offset 8), `si_pid` (offset 16) and `si_value` (the

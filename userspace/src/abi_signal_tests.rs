@@ -512,8 +512,17 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_tkill_pos);
 fn smoke_abi_signal_tkill_accepts_leader_gettid() -> TestResult {
     with_setup(|| {
         const PID: u64 = 0xCAFE;
+        const OTHER_PID: u64 = 0xBEEF;
+        const OTHER_LEADER: u64 = 0xD00D;
         crate::handlers::register_task_to_pid(FAKE_TASK, PID);
         crate::handlers::register_pid_task_mapping(PID, FAKE_TASK);
+
+        // Reproduce the KDE thread-churn collision: this leader's Linux PID
+        // is also the raw TaskId of an unrelated group's non-leader thread.
+        // Raw-task-first resolution used to send tkill to PID and make
+        // tgkill(PID, PID, ..) fail its tgid consistency check with ESRCH.
+        crate::handlers::register_pid_task_mapping(OTHER_PID, OTHER_LEADER);
+        crate::handlers::register_task_to_pid(PID, OTHER_PID);
 
         let tid = call(Syscall::Gettid.raw(), a0(0));
         if tid != Some(PID as i64) {
@@ -524,6 +533,9 @@ fn smoke_abi_signal_tkill_accepts_leader_gettid() -> TestResult {
         }
         if crate::handlers::signal_pending_of(FAKE_TASK) & (1 << (10 - 1)) == 0 {
             return Err("tkill(gettid()) did not queue SIGUSR1 on the leader task");
+        }
+        if crate::handlers::signal_pending_of(PID) & (1 << (10 - 1)) != 0 {
+            return Err("tkill(gettid()) was misrouted to a colliding raw TaskId");
         }
         crate::handlers::clear_signal_pending(FAKE_TASK, 10);
 
