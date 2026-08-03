@@ -30,17 +30,20 @@ if [ "$completed_pid" = "$ksm_pid" ]; then
   echo "PLASMA-CLASSIC-SUPERVISOR ksmserver exited before name status=$status"
   kill "$ksm_wait_pid" 2>/dev/null
   wait "$ksm_wait_pid" 2>/dev/null
-  exit "$status"
-fi
-
-if [ "$completed_pid" != "$ksm_wait_pid" ] || [ "$status" -ne 0 ]; then
+  if [ "$status" -ne 134 ]; then
+    exit "$status"
+  fi
+  echo "PLASMA-CLASSIC-SUPERVISOR bypassing forced-XCB ksmserver abort"
+elif [ "$completed_pid" != "$ksm_wait_pid" ] || [ "$status" -ne 0 ]; then
   echo "PLASMA-CLASSIC-SUPERVISOR ksm wait failed pid=$completed_pid status=$status"
   kill "$ksm_pid" 2>/dev/null
   wait "$ksm_pid" 2>/dev/null
   exit "$status"
+else
+  echo "PLASMA-CLASSIC-SUPERVISOR ksm observed"
 fi
 
-echo "PLASMA-CLASSIC-SUPERVISOR ksm observed; launching plasmashell"
+echo "PLASMA-CLASSIC-SUPERVISOR launching plasmashell"
 /usr/bin/plasmashell &
 plasma_pid=$!
 echo "PLASMA-CLASSIC-SUPERVISOR plasmashell pid=$plasma_pid"
