@@ -70,16 +70,21 @@ two-vCPU ext2 QEMU test and its boot smoke pass. The next acceptance gate is
 still `PLASMA-READY` with stable KWin and plasmashell PIDs; until then, Plasma
 startup remains incomplete.
 
-The first 2026-08-03 Wayland-only kcminit replay crosses the former phase-zero
-gate: the bounded xrdb calls return, `org.kde.kcminit` and `org.kde.kded6` are
-acquired, and KWin stays live. It still does not launch ksmserver or
-plasmashell. Exact Plasma 6.7.3 source now makes that boundary a
-`StartServiceJob` transition after the observed kded registration, while the
-remaining kcminit process is the phase-one service endpoint rather than proof
-that its original parent pipe is still blocked. The next low-perturbation run
-must enable Plasma session debug logging and prove whether the kded service
-watcher advances to `Starting ksmserver`; no kernel poll change is justified
-before that distinction.
+The 2026-08-03 Wayland-only kcminit replays cross the former phase-zero gate:
+the bounded xrdb calls return, `org.kde.kcminit` and `org.kde.kded6` are
+acquired, and KWin stays live. They still do not launch ksmserver or
+plasmashell. The second replay's bus monitor records the broadcast
+`NameOwnerChanged("org.kde.kded6", "", ":1.5")`, but exact Plasma 6.7.3's
+`StartServiceJob` watcher does not visibly advance to the following ksmserver
+job. Enabling `org.kde.plasma.session.debug` produced no application debug
+messages, so that logging category is itself unvalidated and cannot establish
+whether Qt consumed the broadcast. Focused AF_UNIX/epoll regressions now pass
+for a method reply followed by a queued broadcast and for a coalesced write
+followed by a partial read. That rules out simple level-triggered redelivery of
+unread stream bytes. No kernel poll change is justified unless the remaining
+live scan-to-waiter-registration race can be reproduced deterministically; the
+parallel source-level lead is the `StartServiceJob` state machine after the
+observed broadcast.
 
 For systemd PID 1, the important path is level-triggered, not edge-triggered:
 
@@ -2472,3 +2477,83 @@ corresponding parent/child and wait primitive before any kernel change. The
 current untested observability area is per-thread `/proc` state and stable fd
 type/identity reporting; another process-level syscall trace would only repeat
 the ambiguity above.
+
+### 2026-08-03 Plasma-session debug replay: kded broadcast is on the wire
+
+The follow-up replay regenerated the Fedora image with
+`org.kde.plasma.session.debug=true` in the Plasma service's
+`QT_LOGGING_RULES`, then ran:
+
+```text
+NARF_VBLK_IMG=/data/narf/target/narf-fedora-vblk.img \
+NARF_QEMU_MEM_MB=8192 NARF_QEMU_SMP=4 \
+XTASK_QEMU_ACCEL=kvm XTASK_QEMU_SNAPSHOT=1 \
+XTASK_SYSTEMD_PID1_TIMEOUT_SECS=600 \
+cargo xtask systemd-pid1 --arch=x86_64 --display none
+```
+
+The capture is
+`/tmp/narf-fedora-plasma-session-debug-kvm-8g-20260803.log`. It was stopped
+deliberately at a stable 2m11s plateau. At the final probe,
+`plasma_session`, KWin, the phase-one kcminit endpoint, and kded6 were all
+still alive; ksmserver and plasmashell had never appeared, and the run did not
+emit `PLASMA-READY`.
+
+This run narrows the transition beyond process-name sampling. The session bus
+monitor records both of the relevant ownership broadcasts:
+
+```text
+65.396696 NameOwnerChanged("org.kde.kcminit", "", ":1.4")
+72.572247 NameOwnerChanged("org.kde.kded6", "", ":1.5")
+```
+
+The first broadcast coincides with the initial two kcminit processes
+collapsing to the intended phase-one endpoint. The second proves that kded6's
+well-known name was published on the same bus that `plasma_session` uses. No
+ksmserver process follows during the remaining capture. Exact Plasma 6.7.3
+source sequences `kcminit_startup`, a `StartServiceJob` for kded6, and then a
+`StartServiceJob` for ksmserver; the service job uses a
+`QDBusServiceWatcher` to finish when the requested well-known name is
+registered. Thus the old kcminit ready pipe is no longer the boundary, and a
+failure to publish the kded name is ruled out.
+
+The requested Plasma session debug category emitted no recognizable
+application messages—not even the expected `Starting` records—although the
+environment value is present in the captured activation traffic. That makes
+this debug-category path an untested/ineffective observability surface, not
+evidence that a particular callback did or did not run. The run also did not
+isolate the exact `plasma_session` thread or fd because NARF's current
+process-level `/proc` fields cannot do so.
+
+Semcode's exact NARF readiness chain is
+`sys_epoll_wait -> epoll_wait_common -> EpollInstance::collect_ready ->
+poll_item_readiness -> FileOps::poll_readiness_at`; when no entry is ready the
+handler publishes the park state and reaches `own_stack_block`. Linux's
+reference path keeps level-triggered items on the ready list in
+`/usr/src/linux/fs/eventpoll.c::ep_send_events`, while provider callbacks are
+registered on the source wait queue by `ep_ptable_queue_proc`.
+
+Two focused regressions now cover the D-Bus-shaped byte-stream cases:
+
+- two separate AF_UNIX writes queue a method reply and broadcast, userspace
+  consumes exactly the reply, and a second zero-timeout level-triggered
+  `epoll_wait` must return the still-readable fd;
+- one coalesced write is only partially consumed, and repeated epoll delivery
+  continues until all unread bytes are drained.
+
+Both new tests pass in the complete x86_64 `syscall_abi/socket` run:
+
+```text
+97 pass, 0 fail, 0 skip
+follow-on x86_64 boot-smoke: clean exit
+```
+
+This rules out the simplest unread-data redelivery failure without changing
+the implementation. The remaining untested kernel case is an event arriving
+between the initial readiness scan and waiter registration in a real parked
+task. NARF has an explicit post-registration `epoll_fd_has_ready` rescan, but
+the syscall-level harness has no live task context and therefore cannot cover
+that branch. A deterministic own-stack concurrency test is required before
+attributing the Plasma boundary to it. In parallel, exact Plasma/Qt source
+must establish whether `StartServiceJob` can remain pending even after its
+monitoring connection observes the well-known name.

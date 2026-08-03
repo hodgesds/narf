@@ -252,7 +252,7 @@ printf '%s\n' \
   'Environment=XDG_CURRENT_DESKTOP=KDE' \
   'Environment=XKB_DEFAULT_MODEL=pc105' \
   'Environment=XKB_DEFAULT_LAYOUT=us' \
-  'Environment=QT_LOGGING_RULES=org.kde.kcminit.debug=true' \
+  'Environment=QT_LOGGING_RULES=org.kde.kcminit.debug=true;org.kde.plasma.session.debug=true' \
   'Environment=QT_QPA_PLATFORM=wayland' \
   'Environment=KWIN_DRM_NO_AMS=1' \
   'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \
