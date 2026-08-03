@@ -105,6 +105,14 @@ complete NARF-to-GLib delivery path and moves the remaining boundary inside
 Qt/Plasma's watcher, queued callback, or job-lifetime logic; another generic
 kernel poll change is not supported by the evidence.
 
+The next replay captures the exact QDBus match lifecycle and rules out an
+absent or prematurely removed watcher. Plasma's connection `:1.3` adds the
+kded registration rule at 42.541850 s and the ksmserver rule at 43.053070 s;
+neither is removed before the kded broadcast at 89.527952 s or during the
+following plateau. The earlier `MatchRuleNotFound` is for Qt's internal
+`arg0='org.freedesktop.DBus'` removal, not kded. The unresolved boundary is
+therefore signal dispatch/callback execution after a valid persistent match.
+
 For systemd PID 1, the important path is level-triggered, not edge-triggered:
 
 1. `/data/systemd/src/core/manager.c::manager_setup_signals` blocks `SIGCHLD`
@@ -2693,3 +2701,44 @@ thread, whether that queued event is dispatched, and whether the receiving
 acceptance-image workaround at that boundary are preferable to more kernel
 tracing, because every lower wait primitive in the observed call chain now
 has direct passing coverage.
+
+### 2026-08-03 QDBus match-lifecycle replay: persistent kded rule is installed
+
+The follow-up image expanded the existing session-bus monitor to include
+`AddMatch` and `RemoveMatch` calls, preserving the independent GLib waiter.
+The capture is `/tmp/narf-fedora-plasma-dbus-match-kvm-8g-20260803.log`; the
+same 8-GiB/SMP4/KVM run was stopped at a stable 2m9s plateau and did not emit
+`PLASMA-READY`.
+
+Exact Plasma 6.7.3 constructs its kded and ksmserver `StartServiceJob` objects
+after the synchronous KWin-wrapper job completes. Exact Qt 6.10.3 implements
+each `QDBusServiceWatcher` through `watchService -> connectSignal`, which sends
+a `NameOwnerChanged` match restricted to the service and an empty old owner.
+The live protocol records match that source path on Plasma's connection
+`:1.3`:
+
+```text
+42.541850 AddMatch ... arg0='org.kde.kded6',arg1=''
+43.053070 AddMatch ... arg0='org.kde.ksmserver',arg1=''
+89.527952 NameOwnerChanged("org.kde.kded6", "", ":1.14")
+PLASMA-GDBUS-WAIT kded observed
+```
+
+There is no `RemoveMatch` for either Plasma rule before the broadcast or
+through the final probe. The previously suspicious
+`org.freedesktop.DBus.Error.MatchRuleNotFound` at reply serial 9 is now fully
+identified: connection `:1.3` had just removed the completed KWin-wrapper
+rule, then attempted to remove Qt's internal rule for
+`arg0='org.freedesktop.DBus'`. It is unrelated to the still-live kded watcher.
+
+The process state stays at Plasma session, KWin, phase-one kcminit, and kded6
+through probe 41; ksmserver and plasmashell remain absent. This rules out the
+two leading match-lifecycle hypotheses: the kded rule was neither omitted nor
+removed with the temporary KWin watcher. The remaining untested Qt boundary
+is narrower: the matching bus message must traverse
+`QDBusConnectionPrivate::handleSignal -> activateSignal`, post its
+`QDBusCallDeliveryEvent`, and have Plasma's main thread dispatch that event to
+`StartServiceJob::emitResult`. A focused Qt watcher executable already shipped
+in the image is preferable for the next test if available; otherwise the
+acceptance image can bypass only this proven Qt callback gate using the
+independent GLib name waiter.
