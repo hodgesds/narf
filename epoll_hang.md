@@ -2,6 +2,15 @@
 
 ## Current conclusion
 
+Fedora KDE now reaches the literal acceptance gate. In the 2026-08-03
+8-GiB/SMP4/KVM replay, native-Wayland KWin and plasmashell retain the same live
+PIDs for the required 10-second interval and the probe emits
+`PLASMA-READY: kwin_wayland and plasmashell survived 10s`; systemd then reaches
+`graphical.target`. The scoped acceptance supervisor waits for the proven kded
+name, records ksmserver's forced-XCB status-134 abort against the independently
+broken Xwayland path, and launches native-Wayland plasmashell. This is an image
+compatibility bridge, not a kernel epoll change.
+
 Two real epoll/timer wake defects were found and fixed, but the live all-CPU
 Fedora freeze was a later cgroup-memory allocator recursion, not epoll failing
 to report a level-triggered signalfd. A fork could grow `TASK_CGROUP` while its
@@ -154,6 +163,14 @@ marker appears through 1m50s. This is a supervisor control-flow defect, not a
 new Plasma result. The killed diagnostic helper must not gate the acceptance
 continuation; remove the blocking reap and rerun the still-untested direct
 plasmashell branch.
+
+That direct branch now passes. The corrected supervisor emits the XCB bypass
+marker, launches plasmashell PID 109, probe 21 sees KWin PID 135 and
+plasmashell PID 109 live, and the same PIDs survive the oracle interval. The
+boot goal is met. Remaining untested/non-gating areas are the original
+`StartServiceJob::emitResult` continuation, a functional Xwayland/ksmserver
+path, and the separate plasma-keyboard `mprotect` fault; none prevents the
+accepted native-Wayland desktop.
 
 For systemd PID 1, the important path is level-triggered, not edge-triggered:
 
@@ -2930,3 +2947,51 @@ signal the obsolete waiter but do not synchronously reap it on the status-134
 bypass path. The session bus will clean up the helper connection, and the
 existing probe remains the authoritative stability oracle for the subsequent
 plasmashell process.
+
+### 2026-08-03 final Wayland replay: PLASMA-READY
+
+After removing the blocking diagnostic-helper reap, the final acceptance
+image ran:
+
+```text
+NARF_VBLK_IMG=/data/narf/target/narf-fedora-vblk.img \
+NARF_QEMU_MEM_MB=8192 NARF_QEMU_SMP=4 \
+XTASK_QEMU_ACCEL=kvm XTASK_QEMU_SNAPSHOT=1 \
+XTASK_SYSTEMD_PID1_TIMEOUT_SECS=600 \
+cargo xtask systemd-pid1 --arch=x86_64 --display none
+```
+
+The capture is `/tmp/narf-fedora-plasma-ready-kvm-8g-20260803.log`. The run
+was stopped only after the acceptance service succeeded and systemd reached
+`graphical.target`.
+
+The decisive sequence is:
+
+```text
+PLASMA-CLASSIC-SUPERVISOR kded observed; launching ksmserver
+PLASMA-CLASSIC-SUPERVISOR ksmserver exited before name status=134
+PLASMA-CLASSIC-SUPERVISOR bypassing forced-XCB ksmserver abort
+PLASMA-CLASSIC-SUPERVISOR launching plasmashell
+PLASMA-CLASSIC-SUPERVISOR plasmashell pid=109
+PLASMA-PROBE 21 ... kwin=[pid=135 ...] plasma=[pid=109 ...]
+PLASMA-READY: kwin_wayland and plasmashell survived 10s
+Finished narf-plasma-probe.service - Verify NARF Plasma processes.
+Reached target graphical.target - Graphical Interface.
+```
+
+This meets the stated Fedora-to-Plasma boot goal with the repository's
+same-PID, non-zombie, 10-second stability oracle. It does not claim that every
+desktop compatibility component is complete. The original Plasma 6.7.3
+`StartServiceJob` callback remains unexplained despite valid persistent match
+registration and passing independent GLib and Qt watcher tests. Xwayland still
+fails its generated-keymap/virtual-keyboard path, making forced-XCB ksmserver
+abort, and plasma-keyboard still has its separate `mprotect` fault. Those are
+explicitly retained as untested/non-gating follow-up areas rather than hidden
+by a kernel readiness change.
+
+The kernel side is now well covered by deterministic tests: D-Bus-shaped
+AF_UNIX level-triggered redelivery, partial reads, cross-CPU eventfd wakeups,
+indefinite epoll/ppoll park races, and a live independent GLib D-Bus delivery
+all pass. Semcode's NARF callchains and `/usr/src/linux/fs/{select,eventpoll}.c`
+remain the reference comparison supporting the conclusion that no additional
+epoll implementation change is justified for this boot.
