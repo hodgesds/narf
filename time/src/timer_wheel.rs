@@ -390,58 +390,39 @@ pub fn take_due_into(now_cycles: u64, out: &mut [Option<Waker>; MAX_SLEEPERS]) -
 /// free) in IRQ context. The scheduler's idle path (`drain_and_wake`) wakes +
 /// drops them in a context where freeing is allowed.
 ///
-/// The wheel lock is released before each `push_pending` so the wheel and the
-/// deferred-queue locks are never held nested (no lock-ordering hazard).
+/// Lock order is `WHEEL` then the current CPU's deferred-wake queue.  No path
+/// takes those locks in the reverse order: `drain_and_wake` releases the queue
+/// before invoking a waker.  Keeping `WHEEL` locked through `try_push_one` is
+/// load-bearing: when the queue is full, the exact timer slot can be restored
+/// without a concurrent registration stealing its only recovery location.
 ///
 /// SINGLE PASS via an index cursor (same invariant as [`fire_due`]): each
 /// currently-due timer is drained at most once; a re-registration into a freed
 /// lower slot is deferred to the next tick, never re-drained this call.
 pub fn drain_due_to_deferred(now_cycles: u64) {
     for i in 0..MAX_SLEEPERS {
-        // Take this slot's due entry under the wheel lock, then release it
-        // before pushing (the wheel + deferred-queue locks never nest).
-        let taken = {
-            let mut w = WHEEL.lock();
-            match w.slots[i].as_ref() {
-                Some(s) if s.deadline_cycles <= now_cycles => w.slots[i].take(),
-                _ => None,
-            }
+        let mut w = WHEEL.lock();
+        let taken = match w.slots[i].as_ref() {
+            Some(s) if s.deadline_cycles <= now_cycles => w.slots[i].take(),
+            _ => None,
         };
         let Some(slot) = taken else { continue };
-        let deadline = slot.deadline_cycles;
-        if let Err(waker) = narf_lib::deferred_wake::try_push_one(slot.waker) {
-            // Deferred queue FULL. The old path dropped the waker here — but
-            // this slot is already vacated, so that drop was a PERMANENT
-            // lost wake (the module doc's "the next timer tick re-fires the
-            // still-pending wheel slot" recovery doesn't apply: the slot is
-            // gone). Put the sleeper back instead — still due, so it is
-            // re-drained on a later tick (or by the executor's non-IRQ
-            // `fire_due`) once the queue has room: bounded latency, never a
-            // loss. Prefer the just-vacated index; fall back to any free
-            // slot if a concurrent `register` grabbed it.
-            let mut w = WHEEL.lock();
-            let idx = if w.slots[i].is_none() {
-                Some(i)
-            } else {
-                w.slots.iter().position(|s| s.is_none())
-            };
-            match idx {
-                Some(j) => {
-                    let gen = w.next_gen;
-                    w.next_gen = w.next_gen.wrapping_add(1).max(1);
-                    w.slots[j] = Some(Slot {
-                        deadline_cycles: deadline,
-                        waker,
-                        gen,
-                    });
-                }
-                None => {
-                    // Deferred queue full AND the wheel refilled to full in
-                    // the take→push window: nowhere to stash the wake. Drop
-                    // it (the pre-existing worst case, now doubly-guarded).
-                    drop(waker);
-                }
-            }
+        let Slot {
+            deadline_cycles,
+            waker,
+            gen,
+        } = slot;
+        if let Err(waker) = narf_lib::deferred_wake::try_push_one(waker) {
+            // Queue full. Restore the same generation in the same slot while
+            // WHEEL is still locked, so neither the wake nor its SleepHandle
+            // identity can be lost. Leave later due slots untouched and retry
+            // them after the executor drains the deferred queue.
+            w.slots[i] = Some(Slot {
+                deadline_cycles,
+                waker,
+                gen,
+            });
+            break;
         }
     }
 }

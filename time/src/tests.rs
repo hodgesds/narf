@@ -566,6 +566,69 @@ fn smoke_wheel_desktop_scale_sleepers_fire() -> TestResult {
 }
 kernel_test_in!("time/wheel", smoke_wheel_desktop_scale_sleepers_fire);
 
+/// The IRQ drain's deferred queue holds 64 wakers. If more timers expire in
+/// one tick, overflow must leave the remainder live in the wheel rather than
+/// dropping their only waker. Draining the queue and retrying must wake all.
+fn smoke_wheel_deferred_overflow_retries_without_loss() -> TestResult {
+    use crate::timer_wheel;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    const BURST: usize = 65;
+
+    timer_wheel::__reset_for_test();
+    // Kernel tests share the per-CPU deferred queue. Start from an empty queue
+    // so this test's first 64 registrations fill it deterministically.
+    narf_lib::deferred_wake::drain_and_wake();
+
+    struct Counter(AtomicUsize);
+    impl Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let counter = Arc::new(Counter(AtomicUsize::new(0)));
+    for _ in 0..BURST {
+        if timer_wheel::register(100, counter.clone().into()).is_err() {
+            timer_wheel::__reset_for_test();
+            return TestResult::Fail("timer registration failed before overflow test");
+        }
+    }
+
+    timer_wheel::drain_due_to_deferred(100);
+    if timer_wheel::occupied() != 1 {
+        timer_wheel::__reset_for_test();
+        narf_lib::deferred_wake::drain_and_wake();
+        return TestResult::Fail("deferred overflow did not retain one due timer");
+    }
+    if narf_lib::deferred_wake::drain_and_wake() != 64 {
+        timer_wheel::__reset_for_test();
+        return TestResult::Fail("first deferred drain did not wake queue capacity");
+    }
+
+    timer_wheel::drain_due_to_deferred(100);
+    if timer_wheel::occupied() != 0 || narf_lib::deferred_wake::drain_and_wake() != 1 {
+        timer_wheel::__reset_for_test();
+        return TestResult::Fail("retained overflow timer did not wake on retry");
+    }
+    if counter.0.load(Ordering::Relaxed) != BURST {
+        timer_wheel::__reset_for_test();
+        return TestResult::Fail("deferred overflow permanently lost a wake");
+    }
+
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "time/wheel",
+    smoke_wheel_deferred_overflow_retries_without_loss
+);
+
 fn smoke_sleep_until_uses_wheel() -> TestResult {
     // SleepUntil registers with the wheel on first poll, then
     // returns Ready when fire_due crosses its deadline.
