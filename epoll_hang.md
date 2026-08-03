@@ -96,6 +96,15 @@ image. The next test boundary is a separate GLib D-Bus name waiter, which can
 verify delivery of the same `org.kde.kded6` ownership transition without
 patching Qt or tracing the syscall hot path.
 
+That independent test now passes in the normal-process image. An early
+`gdbus wait --session org.kde.kded6` installs its match before startplasma;
+when the bus publishes the kded name at guest time 79.411385 s, the parked
+GLib client immediately returns and prints `PLASMA-GDBUS-WAIT kded observed`.
+Plasma's own `StartServiceJob` still does not launch ksmserver. This clears the
+complete NARF-to-GLib delivery path and moves the remaining boundary inside
+Qt/Plasma's watcher, queued callback, or job-lifetime logic; another generic
+kernel poll change is not supported by the evidence.
+
 For systemd PID 1, the important path is level-triggered, not edge-triggered:
 
 1. `/data/systemd/src/core/manager.c::manager_setup_signals` blocks `SIGCHLD`
@@ -2641,3 +2650,46 @@ does an independent GLib D-Bus name waiter observe `org.kde.kded6` when the
 normal session reaches that name? A bounded `gdbus wait --session
 org.kde.kded6` check exercises that boundary without adding syscall tracing
 or modifying Plasma's process identity.
+
+### 2026-08-03 independent GLib name-wait test: kded delivery succeeds
+
+After removing the QDBUS_DEBUG wrapper and restoring the package
+`plasma_session` binary, the next image started an independent
+`gdbus wait --session org.kde.kded6` before `startplasma-wayland`. The capture
+is `/tmp/narf-fedora-plasma-gdbus-wait-kvm-8g-20260803.log`; it used the same
+8-GiB/SMP4/KVM command as the preceding replays and was stopped deliberately
+at a stable 2m25s plateau. It did not emit `PLASMA-READY`.
+
+This is a focused integration test rather than a syscall trace. The waiter
+first connects as `:1.1`, confirms that `org.kde.kded6` has no owner, installs
+its GLib D-Bus watch, and parks before Plasma begins. The normal startup then
+crosses kcminit phase zero. The external monitor records:
+
+```text
+79.411385 NameOwnerChanged("org.kde.kded6", "", ":1.13")
+PLASMA-GDBUS-WAIT kded observed
+```
+
+The success marker immediately follows the ownership broadcast. Thus an
+independent GLib main context can consume the exact well-known-name transition
+that Plasma's `QDBusServiceWatcher` needs. Together with the passing AF_UNIX
+level-redelivery and cross-CPU eventfd/epoll/ppoll regressions, this covers the
+kernel socket-readiness, park/wake, Qt/GLib-style cross-thread wake, and GLib
+D-Bus match/delivery layers. The earlier `MatchRuleNotFound` lead is not a
+generic lost bus signal.
+
+The state remains unchanged from probes 20 through 43: `plasma_session`, KWin,
+the phase-one kcminit endpoint, and kded6 are alive; neither ksmserver nor
+plasmashell appears. The independently observed name does not make Plasma's
+`StartServiceJob` complete. A `plasma-keyboard` helper still hits its separate
+`mprotect`/userspace fault and portal/KWallet activation still times out, but
+neither event stops KWin or removes the kded owner in this sample.
+
+The remaining untested area is now above GLib and specific to the in-process
+Qt/Plasma state machine: whether the `QDBusServiceWatcher` retains the kded
+match, whether `activateSignal` posts its delivery event to the intended
+thread, whether that queued event is dispatched, and whether the receiving
+`StartServiceJob` is still alive and connected. Exact-source tests or an
+acceptance-image workaround at that boundary are preferable to more kernel
+tracing, because every lower wait primitive in the observed call chain now
+has direct passing coverage.
