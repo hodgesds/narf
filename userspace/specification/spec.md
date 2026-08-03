@@ -93,6 +93,11 @@ duplicate descriptor keeps the watch live after the original descriptor
 closes, and final close invalidates the watch without the epoll instance
 artificially retaining the file. `EPOLLERR` and `EPOLLHUP` are delivered
 regardless of the registered interest mask, matching Linux epoll semantics.
+An epoll wait accepts at most `maxevents` entries. Only entries actually
+returned to the caller advance edge-trigger tokens, acknowledge provider-local
+readiness, take an exclusive claim, or disarm `EPOLLONESHOT`; additional ready
+entries remain pending for a later wait. Successive waits round-robin through
+ready level-triggered entries when the ready set exceeds `maxevents`.
 Poll and epoll pass the file-description offset to offset-sensitive readiness
 providers; `/dev/kmsg` is readable only while unread snapshot bytes remain.
 Edge-triggered epoll also records provider-local monotonic state tokens.

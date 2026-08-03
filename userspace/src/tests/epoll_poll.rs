@@ -2607,6 +2607,216 @@ fn smoke_wave64_epoll_watches_eventfd() -> TestResult {
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_wave64_epoll_watches_eventfd);
 
+/// Run one two-source epoll batch with `maxevents=1` and return the userdata
+/// from two successive waits. Both eventfds start readable before the first
+/// wait, so the second result proves that the undisclosed entry was preserved.
+#[cfg(feature = "linux-compat")]
+fn epoll_maxevents_two_ready(flags: u32) -> Result<[u64; 2], &'static str> {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    setup_poll_test();
+    let result = (|| {
+        let epfd = call(Syscall::EpollCreate, SyscallArgs::default());
+        if epfd.status != SyscallReturn::OK || epfd.value == (-1i64 as u64) {
+            return Err("epoll_create failed");
+        }
+
+        for userdata in [0x11u64, 0x22u64] {
+            let efd = call(
+                Syscall::Eventfd,
+                SyscallArgs {
+                    arg0: 1,
+                    arg1: 0,
+                    ..SyscallArgs::default()
+                },
+            );
+            if efd.status != SyscallReturn::OK || efd.value == (-1i64 as u64) {
+                return Err("ready eventfd creation failed");
+            }
+            let mut event = [0u8; 12];
+            event[..4].copy_from_slice(&(crate::epoll::EPOLLIN | flags).to_ne_bytes());
+            event[4..12].copy_from_slice(&userdata.to_ne_bytes());
+            let ctl = call(
+                Syscall::EpollCtl,
+                SyscallArgs {
+                    arg0: epfd.value,
+                    arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+                    arg2: efd.value,
+                    arg3: event.as_ptr() as u64,
+                    ..SyscallArgs::default()
+                },
+            );
+            if ctl.status != SyscallReturn::OK || ctl.value != 0 {
+                return Err("epoll_ctl add failed");
+            }
+        }
+
+        let mut seen = [0u64; 2];
+        for userdata in &mut seen {
+            let mut out = [0u8; 12];
+            let wait = call(
+                Syscall::EpollWait,
+                SyscallArgs {
+                    arg0: epfd.value,
+                    arg1: out.as_mut_ptr() as u64,
+                    arg2: 1,
+                    arg3: 0,
+                    ..SyscallArgs::default()
+                },
+            );
+            if wait.status != SyscallReturn::OK || wait.value != 1 {
+                return Err("successive maxevents=1 wait lost a ready entry");
+            }
+            *userdata = u64::from_ne_bytes(out[4..12].try_into().unwrap());
+        }
+        Ok(seen)
+    })();
+    crate::syscall::__test_clear_global();
+    result
+}
+
+/// Linux stops processing its ready list as soon as `maxevents` entries have
+/// been copied. An undisclosed entry therefore remains queued: its edge is not
+/// consumed and an EPOLLONESHOT registration is not disarmed. Level-triggered
+/// entries are requeued at the ready-list tail, giving successive short waits
+/// round-robin behavior.
+#[cfg(feature = "linux-compat")]
+fn smoke_epoll_maxevents_preserves_undisclosed_ready_entries() -> TestResult {
+    for flags in [0, crate::epoll::EPOLLET, crate::epoll::EPOLLONESHOT] {
+        let seen = match epoll_maxevents_two_ready(flags) {
+            Ok(seen) => seen,
+            Err(msg) => return TestResult::Fail(msg),
+        };
+        if seen[0] == seen[1] || !seen.iter().all(|data| matches!(*data, 0x11 | 0x22)) {
+            return TestResult::Fail("maxevents batching did not visit both ready entries");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_maxevents_preserves_undisclosed_ready_entries
+);
+
+#[derive(Debug)]
+struct AckClearsReadyFile(AtomicU32);
+
+impl narf_filesystem::FileOps for AckClearsReadyFile {
+    fn read<'a>(&'a self, _off: u64, _buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async move { Ok(0) })
+    }
+
+    fn write<'a>(&'a self, _off: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+        let len = buf.len();
+        alloc::boxed::Box::pin(async move { Ok(len) })
+    }
+
+    fn stat(&self) -> narf_filesystem::Stat {
+        narf_filesystem::Stat {
+            size: 0,
+            blocks: 0,
+            mode: narf_filesystem::Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        self.0.load(AtomicOrd::Relaxed)
+    }
+
+    fn acknowledge_poll_readiness(&self, readiness: u32) {
+        self.0.fetch_and(!readiness, AtomicOrd::Relaxed);
+    }
+}
+
+/// A provider-local readiness acknowledgement belongs only to an event copied
+/// into the current result batch. This models one-shot change sources whose
+/// acknowledgement itself clears readiness; acknowledging past `maxevents`
+/// would make the second source permanently disappear.
+#[cfg(feature = "linux-compat")]
+fn smoke_epoll_maxevents_does_not_ack_undisclosed_source() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+    let result = (|| {
+        let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
+        let mut sources = alloc::vec::Vec::new();
+        for userdata in [0x31u64, 0x32u64] {
+            let source = Arc::new(AckClearsReadyFile(AtomicU32::new(narf_filesystem::POLL_IN)));
+            let fd = crate::fd::with_table(task, |table| {
+                table.open(crate::fd::FdEntry {
+                    ops: source.clone(),
+                    offset: 0,
+                    flags: 0,
+                    status_flags: 0,
+                })
+            })
+            .ok_or("fd table unavailable")?;
+            sources.push(source);
+
+            let mut event = [0u8; 12];
+            event[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+            event[4..12].copy_from_slice(&userdata.to_ne_bytes());
+            if call(
+                Syscall::EpollCtl,
+                SyscallArgs {
+                    arg0: epfd as u64,
+                    arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+                    arg2: fd as u64,
+                    arg3: event.as_ptr() as u64,
+                    ..SyscallArgs::default()
+                },
+            )
+            .value
+                != 0
+            {
+                return Err("epoll_ctl add of acknowledging source failed");
+            }
+        }
+
+        let mut seen = [0u64; 2];
+        for (index, userdata) in seen.iter_mut().enumerate() {
+            let mut out = [0u8; 12];
+            if call(
+                Syscall::EpollWait,
+                SyscallArgs {
+                    arg0: epfd as u64,
+                    arg1: out.as_mut_ptr() as u64,
+                    arg2: 1,
+                    arg3: 0,
+                    ..SyscallArgs::default()
+                },
+            )
+            .value
+                != 1
+            {
+                return Err("undisclosed acknowledging source was lost");
+            }
+            *userdata = u64::from_ne_bytes(out[4..12].try_into().unwrap());
+            let still_ready = sources
+                .iter()
+                .filter(|source| source.0.load(AtomicOrd::Relaxed) != 0)
+                .count();
+            if still_ready != 1usize.saturating_sub(index) {
+                return Err("epoll acknowledged a source outside its result batch");
+            }
+        }
+        if seen[0] == seen[1] {
+            return Err("acknowledging source was delivered twice");
+        }
+        Ok(())
+    })();
+    crate::syscall::__test_clear_global();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_maxevents_does_not_ack_undisclosed_source
+);
+
 /// EPOLLET must observe an eventfd drain/refill transition even when no epoll
 /// scan occurs while the counter is zero. Both scans then see POLLIN, so the
 /// provider's readable transition token is the only evidence of the new edge.
