@@ -147,6 +147,14 @@ X11 prerequisite. The next scoped test should retain the recorded ksm attempt
 but launch native-Wayland plasmashell after status 134; this covers the actual
 desktop goal without misclassifying an X11 compatibility failure as epoll.
 
+The first direct-shell replay did not reach that launch: after reporting
+status 134, the supervisor signals the still-running Qt ksm name waiter and
+then blocks synchronously in `wait` while reaping it. No bypass or plasmashell
+marker appears through 1m50s. This is a supervisor control-flow defect, not a
+new Plasma result. The killed diagnostic helper must not gate the acceptance
+continuation; remove the blocking reap and rerun the still-untested direct
+plasmashell branch.
+
 For systemd PID 1, the important path is level-triggered, not edge-triggered:
 
 1. `/data/systemd/src/core/manager.c::manager_setup_signals` blocks `SIGCHLD`
@@ -2898,3 +2906,27 @@ manager and launch native-Wayland `plasmashell` directly. The existing probe's
 10-second same-PID oracle will determine whether that is sufficient to boot a
 stable Plasma desktop. Other ksm failures must remain hard failures so the
 workaround cannot hide a new regression.
+
+### 2026-08-03 first direct-shell replay: supervisor blocks reaping waiter
+
+The first image configured to continue after the known status 134 used the
+usual 8-GiB/SMP4/KVM command. Its capture is
+`/tmp/narf-fedora-plasma-wayland-direct-kvm-8g-20260803.log`; it was stopped
+at 1m50s and did not emit `PLASMA-READY`.
+
+The replay reaches `PLASMA-CLASSIC-SUPERVISOR ksmserver exited before name
+status=134`, then emits neither the intended `bypassing forced-XCB` marker nor
+the plasmashell launch marker. The surrounding probe remains at KWin, kded6,
+phase-one kcminit, and plasma_session. Inspection of the just-exercised shell
+branch identifies the cause: it sends SIGTERM to the outstanding
+`plasma_waitforname` child and immediately performs a blocking `wait` for that
+diagnostic helper before checking status 134. The helper's Qt signal handler
+does not exit promptly in this sample, so the supervisor itself becomes the
+gate.
+
+This run does not test direct plasmashell startup and adds no new kernel or KDE
+failure. The fix is mechanical and scoped to the acceptance supervisor:
+signal the obsolete waiter but do not synchronously reap it on the status-134
+bypass path. The session bus will clean up the helper connection, and the
+existing probe remains the authoritative stability oracle for the subsequent
+plasmashell process.

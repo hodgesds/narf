@@ -29,7 +29,6 @@ status=$?
 if [ "$completed_pid" = "$ksm_pid" ]; then
   echo "PLASMA-CLASSIC-SUPERVISOR ksmserver exited before name status=$status"
   kill "$ksm_wait_pid" 2>/dev/null
-  wait "$ksm_wait_pid" 2>/dev/null
   if [ "$status" -ne 134 ]; then
     exit "$status"
   fi
