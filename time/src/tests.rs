@@ -863,6 +863,47 @@ fn smoke_wheel_refresh_waker_at_updates_deadline() -> TestResult {
 }
 kernel_test_in!("time/wheel", smoke_wheel_refresh_waker_at_updates_deadline);
 
+fn smoke_wheel_cached_min_tracks_completed_mutations() -> TestResult {
+    // Exercise every direction in which the cached minimum can move. Once a
+    // mutation returns, the lock-free query must exactly match the wheel.
+    use crate::timer_wheel;
+
+    timer_wheel::__reset_for_test();
+    let h300 = timer_wheel::register(300, make_noop_waker()).unwrap();
+    let h100 = timer_wheel::register(100, make_noop_waker()).unwrap();
+    let h200 = timer_wheel::register(200, make_noop_waker()).unwrap();
+    if timer_wheel::next_deadline_cycles() != Some(100) {
+        return TestResult::Fail("cached minimum did not move earlier on register");
+    }
+
+    if !timer_wheel::refresh_waker_at(h100, 400, make_noop_waker()) {
+        return TestResult::Fail("refresh of cached-minimum slot failed");
+    }
+    if timer_wheel::next_deadline_cycles() != Some(200) {
+        return TestResult::Fail("cached minimum did not move later on refresh");
+    }
+
+    timer_wheel::cancel(h200);
+    if timer_wheel::next_deadline_cycles() != Some(300) {
+        return TestResult::Fail("cached minimum did not move later on cancel");
+    }
+    if timer_wheel::fire_due(350) != 1 || timer_wheel::next_deadline_cycles() != Some(400) {
+        return TestResult::Fail("cached minimum did not advance after expiry");
+    }
+
+    timer_wheel::cancel(h100);
+    timer_wheel::cancel(h300); // stale after expiry; must not disturb the cache.
+    if timer_wheel::next_deadline_cycles().is_some() {
+        return TestResult::Fail("cached minimum remained valid after final cancel");
+    }
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "time/wheel",
+    smoke_wheel_cached_min_tracks_completed_mutations
+);
+
 fn smoke_wheel_refresh_waker_rejects_recycled_handle() -> TestResult {
     // After fire_due reclaims the slot, the original handle's gen
     // is stale; refresh_waker against it must return false even if
