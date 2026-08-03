@@ -1440,7 +1440,7 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     }
 
     let argv = ["argv0", "alpha"];
-    let envp = ["KEY=val"];
+    let envp = ["KEY=val", "LANG=C"];
     let aux = [AuxEntry::Pagesz(4096), AuxEntry::Random(0x1234_5678)];
     // SAFETY: the single page `[user_base, stack_top)` was just mapped READ|WRITE
     // and materialised above, and the low-4-GiB identity map is live, meeting
@@ -1481,17 +1481,38 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
         return TestResult::Fail("argv NULL term");
     }
     let envp_p0 = read_u64(rsp_v + 32);
-    if read_u64(rsp_v + 40) != 0 {
+    let envp_p1 = read_u64(rsp_v + 40);
+    if read_u64(rsp_v + 48) != 0 {
         return TestResult::Fail("envp NULL term");
     }
-    if read_u64(rsp_v + 48) != 6 || read_u64(rsp_v + 56) != 4096 {
+    if read_u64(rsp_v + 56) != 6 || read_u64(rsp_v + 64) != 4096 {
         return TestResult::Fail("aux[0] (PAGESZ)");
     }
-    if read_u64(rsp_v + 64) != 25 || read_u64(rsp_v + 72) != 0x1234_5678 {
+    if read_u64(rsp_v + 72) != 25 || read_u64(rsp_v + 80) != 0x1234_5678 {
         return TestResult::Fail("aux[1] (RANDOM)");
     }
-    if read_u64(rsp_v + 80) != 0 || read_u64(rsp_v + 88) != 0 {
+    if read_u64(rsp_v + 88) != 0 || read_u64(rsp_v + 96) != 0 {
         return TestResult::Fail("aux AT_NULL");
+    }
+
+    // Linux-compatible startup strings form one ascending, contiguous
+    // argv-then-envp area. Avahi's process-title setup depends on this exact
+    // relationship when it computes the writable span from argv[0] through
+    // the end of the final environment string.
+    if argv_p1 != argv_p0 + argv[0].len() as u64 + 1 {
+        return TestResult::Fail("argv strings not ascending and contiguous");
+    }
+    if envp_p0 != argv_p1 + argv[1].len() as u64 + 1 {
+        return TestResult::Fail("envp does not immediately follow argv");
+    }
+    if envp_p1 != envp_p0 + envp[0].len() as u64 + 1 {
+        return TestResult::Fail("envp strings not ascending and contiguous");
+    }
+    let Some(title_span) = (envp_p1 + envp[1].len() as u64).checked_sub(argv_p0) else {
+        return TestResult::Fail("Avahi-style process-title span underflowed");
+    };
+    if title_span == 0 || title_span >= 4096 {
+        return TestResult::Fail("Avahi-style process-title span is out of bounds");
     }
 
     let check_str = |user_p: u64, expected: &str| -> bool {
@@ -1528,6 +1549,9 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     }
     if !check_str(envp_p0, "KEY=val") {
         return TestResult::Fail("envp[0]");
+    }
+    if !check_str(envp_p1, "LANG=C") {
+        return TestResult::Fail("envp[1]");
     }
 
     TestResult::Pass

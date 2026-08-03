@@ -669,8 +669,10 @@ pub unsafe fn load_user_process_with_root(
 //
 // The string area lives above the aux/env/argv pointer arrays so
 // the pointers can name absolute addresses inside the stack region
-// without forward-references; we lay out strings first (top-down),
-// then walk back filling the arrays.
+// without forward-references. Within that area Linux-compatible
+// startup code expects argv followed by envp at increasing addresses;
+// process-title helpers use the span from argv[0] through the final
+// environment string as one contiguous, positively sized buffer.
 
 /// Errors `init_sysv_stack` can surface.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -789,29 +791,29 @@ pub unsafe fn init_sysv_stack(
         Ok(())
     };
 
-    // String area: layout top-down. Walk argv first (highest addrs),
-    // then envp. Track each string's user vaddr in two parallel
-    // Vecs; we'll spill the pointer arrays in step 2.
+    // String area: lay argv followed by envp at increasing addresses.
+    // This is observable Linux startup-stack behaviour: process-title
+    // helpers compute `last_env_end - argv[0]` and expect a positive,
+    // contiguous span. Laying argv top-down before envp reverses that
+    // relationship and makes the subtraction underflow.
     let mut argv_ptrs = alloc::vec::Vec::with_capacity(argv.len());
     let mut envp_ptrs = alloc::vec::Vec::with_capacity(envp.len());
-    let mut cursor_vaddr = stack_top_vaddr;
+    let mut cursor_vaddr = stack_top_vaddr - strings_bytes;
     for s in argv.iter() {
-        let len = s.len() as u64 + 1;
-        cursor_vaddr -= len;
         for (i, &b) in s.as_bytes().iter().enumerate() {
             write_u8(cursor_vaddr + i as u64, b)?;
         }
         write_u8(cursor_vaddr + s.len() as u64, 0)?;
         argv_ptrs.push(cursor_vaddr);
+        cursor_vaddr += s.len() as u64 + 1;
     }
     for s in envp.iter() {
-        let len = s.len() as u64 + 1;
-        cursor_vaddr -= len;
         for (i, &b) in s.as_bytes().iter().enumerate() {
             write_u8(cursor_vaddr + i as u64, b)?;
         }
         write_u8(cursor_vaddr + s.len() as u64, 0)?;
         envp_ptrs.push(cursor_vaddr);
+        cursor_vaddr += s.len() as u64 + 1;
     }
 
     // The bottom of the layout (lowest addr, the user RSP) sits
