@@ -7,9 +7,9 @@
 //! Two `FileOps` per card:
 //!
 //! - `DriCardFile`   — full DRM master access (modeset privileged).
-//!   `stat` returns `FileType::Special`, mode `0o620` (crw--w----).
+//!   It starts `0600 root:root`; udev applies the distribution's device policy.
 //! - `DriRenderFile` — render-only (no modeset; for Mesa render worker).
-//!   `stat` returns `FileType::Special`, mode `0o666`.
+//!   It starts `0600 root:root`; udev applies the distribution's device policy.
 //!
 //! Both are placeholder FileOps for now. Real `DRM_IOCTL_*` dispatch needs
 //! a kernel ioctl path which is deferred (NARF has no ioctl gate yet).
@@ -53,13 +53,14 @@ pub(crate) fn render_rdev(index: u32) -> u64 {
 /// Placeholder file for `/dev/dri/card<N>` (DRM master node).
 ///
 /// Read returns 0 (EOF). Write returns `InvalidData` — real DRM
-/// operations go through ioctl (deferred). Stat mode is `0o620`
-/// matching Linux's `DRM_DEV_MODE` for the primary node.
+/// operations go through ioctl (deferred). The node starts at the conservative
+/// devtmpfs default `0o600`; udev normally changes it to `root:video 0o660`.
 ///
 /// Linux ref: `drivers/gpu/drm/drm_drv.c` + `include/uapi/linux/major.h`.
 #[derive(Debug)]
 pub struct DriCardFile {
     index: u32,
+    metadata: Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm_registry::DrmNodeMetadata>>,
 }
 
 /// Number of live `DriCardFile` (DRM master node) handles. When it falls
@@ -69,9 +70,10 @@ pub struct DriCardFile {
 static LIVE_CARD_FILES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 impl DriCardFile {
-    fn new(index: u32) -> Self {
+    fn new(index: u32) -> Option<Self> {
+        let metadata = crate::drm_registry::node_metadata(index, false)?;
         LIVE_CARD_FILES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        DriCardFile { index }
+        Some(DriCardFile { index, metadata })
     }
 }
 
@@ -133,14 +135,13 @@ impl FileOps for DriCardFile {
     }
 
     fn stat(&self) -> Stat {
+        let metadata = *self.metadata.lock();
         Stat {
             size: 0,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                // crw--w---- 0o620: DRM card node — full master.
-                // Linux: DRM_DEV_MODE (include/drm/drm_dev.h).
-                perms: 0o620,
+                perms: metadata.perms,
             },
             mtime_cycles: 0,
         }
@@ -149,6 +150,23 @@ impl FileOps for DriCardFile {
     /// `st_rdev` = DRM_MAJOR(226):minor(card index). See [`card_rdev`].
     fn rdev(&self) -> u64 {
         card_rdev(self.index)
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        let metadata = *self.metadata.lock();
+        (metadata.uid, metadata.gid)
+    }
+
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        let mut metadata = self.metadata.lock();
+        metadata.uid = uid;
+        metadata.gid = gid;
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        self.metadata.lock().perms = perms & 0o7777;
+        Box::pin(async { Ok(()) })
     }
 
     /// DRM_IOCTL_* dispatch for `/dev/dri/card<N>`. Primary-node fd
@@ -263,12 +281,13 @@ pub fn prime_export_fileops(card_index: u32, gem_handle: u32) -> Option<Arc<dyn 
 /// Placeholder file for `/dev/dri/renderD<N+128>` (render-only node).
 ///
 /// Mesa opens this for compute and render without needing DRM master.
-/// Mode `0o666` matches Linux's render-node permissions.
+/// Mode and ownership are shared across lookups so udev policy persists.
 ///
 /// Linux ref: `drivers/gpu/drm/drm_drv.c::drm_dev_register` render branch.
 #[derive(Debug)]
 pub struct DriRenderFile {
     index: u32,
+    metadata: Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm_registry::DrmNodeMetadata>>,
 }
 
 impl FileOps for DriRenderFile {
@@ -281,14 +300,13 @@ impl FileOps for DriRenderFile {
     }
 
     fn stat(&self) -> Stat {
+        let metadata = *self.metadata.lock();
         Stat {
             size: 0,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                // crw-rw-rw- 0o666: render node — accessible to all.
-                // Linux: RENDER_DEV_MODE (include/drm/drm_dev.h).
-                perms: 0o666,
+                perms: metadata.perms,
             },
             mtime_cycles: 0,
         }
@@ -297,6 +315,23 @@ impl FileOps for DriRenderFile {
     /// `st_rdev` = DRM_MAJOR(226):minor(128 + card index). See [`render_rdev`].
     fn rdev(&self) -> u64 {
         render_rdev(self.index)
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        let metadata = *self.metadata.lock();
+        (metadata.uid, metadata.gid)
+    }
+
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        let mut metadata = self.metadata.lock();
+        metadata.uid = uid;
+        metadata.gid = gid;
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        self.metadata.lock().perms = perms & 0o7777;
+        Box::pin(async { Ok(()) })
     }
 
     /// DRM_IOCTL_* dispatch for `/dev/dri/renderD<N+128>`. Render-node
@@ -327,7 +362,7 @@ impl DirOps for DriDir {
             if let Ok(idx) = rest.parse::<u32>() {
                 // Only expose registered cards.
                 if (idx as usize) < crate::drm_registry::count() {
-                    return Some(Arc::new(DriCardFile::new(idx)));
+                    return DriCardFile::new(idx).map(|file| Arc::new(file) as Arc<dyn FileOps>);
                 }
             }
         }
@@ -337,7 +372,11 @@ impl DirOps for DriDir {
                 if render_idx >= 128 {
                     let idx = render_idx - 128;
                     if (idx as usize) < crate::drm_registry::count() {
-                        return Some(Arc::new(DriRenderFile { index: idx }));
+                        let metadata = crate::drm_registry::node_metadata(idx, true)?;
+                        return Some(Arc::new(DriRenderFile {
+                            index: idx,
+                            metadata,
+                        }));
                     }
                 }
             }
