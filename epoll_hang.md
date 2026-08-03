@@ -130,6 +130,23 @@ not reached. The next uncovered area is ksmserver's early process exit, not a
 return to the kded/epoll path; the supervisor needs to race the child status
 against the name waiter and report the exact exit result.
 
+That race now reports `ksmserver exited before name status=134`, i.e. the
+child terminates via `SIGABRT`, consistently after being visible for one probe
+and before publishing its service. No fatal-fault record accompanies it. This
+rules out an exec failure or quiet normal exit and makes the next untested area
+ksmserver's early deliberate abort path. Source review and a focused startup
+environment test are required before deciding whether to bypass ksmserver and
+launch plasmashell directly.
+
+Exact Plasma 6.7.3 source explains the abort dependency: ksmserver forcibly
+sets `QT_QPA_PLATFORM=xcb`, constructs `QGuiApplication`, and immediately
+dereferences the native X11 display before registering its D-Bus service. The
+acceptance image's Xwayland still fails virtual-keyboard activation after its
+zero-byte xkbcomp input, so a Wayland-only session cannot satisfy ksmserver's
+X11 prerequisite. The next scoped test should retain the recorded ksm attempt
+but launch native-Wayland plasmashell after status 134; this covers the actual
+desktop goal without misclassifying an X11 compatibility failure as epoll.
+
 For systemd PID 1, the important path is level-triggered, not edge-triggered:
 
 1. `/data/systemd/src/core/manager.c::manager_setup_signals` blocks `SIGCHLD`
@@ -2831,3 +2848,53 @@ the child's exit code/signal is an untested area. The next test must wait for
 both the child and the name watcher and report whichever completes first; if
 the child wins, record its exact wait status before changing ksmserver's
 environment or dependencies.
+
+### 2026-08-03 ksmserver status replay: early exit is SIGABRT
+
+The supervisor now races the ksmserver child against the exact Qt name waiter
+using Bash `wait -n -p`. The capture is
+`/tmp/narf-fedora-ksm-exit-status-kvm-8g-20260803.log`; the normal
+8-GiB/SMP4/KVM replay was stopped at a stable 1m42s plateau and did not emit
+`PLASMA-READY`.
+
+The reproduced sequence is:
+
+```text
+PLASMA-CLASSIC-SUPERVISOR kded observed; launching ksmserver
+PLASMA-CLASSIC-SUPERVISOR ksmserver pid=112
+PLASMA-PROBE 23 ... ksm=[pid=112 state=R cpu=109] plasma=[none]
+PLASMA-CLASSIC-SUPERVISOR ksmserver exited before name status=134
+PLASMA-PROBE 24 ... ksm=[none] plasma=[none]
+```
+
+Shell status 134 is 128 plus signal 6 (`SIGABRT`). The child is therefore
+successfully executed and then deliberately aborts before registering
+`org.kde.ksmserver`; it is not a missing executable, ordinary exit, or missed
+name notification. NARF emits no fatal-fault record for this process, and the
+application writes no useful diagnostic before termination. The surrounding
+KWin, kded6, kcminit, and plasma_session processes remain alive.
+
+The newly uncovered area is ksmserver's early abort path and startup
+assumptions. Exact Plasma source should be checked for assertions/fatal exits
+before adding any trace. A narrow environment/argument test can then decide
+whether the supervisor omitted state normally supplied by `StartServiceJob`,
+or whether ksmserver is independently blocked by an incomplete compatibility
+surface. Plasmashell remains deliberately untested in this run because the
+supervisor does not cross an unacquired ksmserver gate.
+
+Exact Plasma 6.7.3 source makes the prerequisite explicit. In
+`ksmserver/main.cpp`, ksmserver unconditionally saves the incoming platform,
+sets `QT_QPA_PLATFORM=xcb`, constructs `QGuiApplication`, and calls
+`ConnectionNumber` on the native X11 display before constructing
+`KSMServer`. Only the later `KSMServer` constructor creates ICE sockets and
+the D-Bus object. This image's Xwayland is independently known to fail its
+generated-keymap compile and virtual-core-keyboard activation. Ksmserver's
+pre-registration abort is therefore consistent with its forced-XCB startup
+running against that incomplete Xwayland, not with another missed D-Bus wake.
+
+The next focused acceptance test should keep the ksmserver attempt and exact
+status marker, then treat status 134 as an unavailable optional X11 session
+manager and launch native-Wayland `plasmashell` directly. The existing probe's
+10-second same-PID oracle will determine whether that is sufficient to boot a
+stable Plasma desktop. Other ksm failures must remain hard failures so the
+workaround cannot hide a new regression.
