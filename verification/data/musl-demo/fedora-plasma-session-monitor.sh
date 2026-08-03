@@ -33,8 +33,23 @@ echo "PLASMA-DBUS-MONITOR starting"
   fi
 ) &
 
+# Exercise the exact Qt QDBusServiceWatcher implementation independently of
+# plasma_session's StartServiceJob. If this exits while StartServiceJob remains
+# pending, the remaining defect is in Plasma's job/callback context rather
+# than Qt's bus match and signal-delivery machinery as a whole.
+(
+  echo "PLASMA-QT-WAIT kded start"
+  if /usr/bin/plasma_waitforname --timeout -1 org.kde.kded6; then
+    echo "PLASMA-QT-WAIT kded observed"
+  else
+    status=$?
+    echo "PLASMA-QT-WAIT kded failed status=$status"
+  fi
+) &
+
 # Give the monitor time to install its match rules before startplasma can
 # launch KWin and submit the environment-update batch. This also lets the
-# independent name waiter install its match before kded can be started.
+# independent GLib and Qt name waiters install their matches before kded can
+# be started.
 /usr/bin/sleep 1
 exec /usr/bin/startplasma-wayland
