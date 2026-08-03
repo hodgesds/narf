@@ -7638,7 +7638,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(
         Syscall::EpollPwait,
         "epoll_pwait",
-        RawFnHandler(crate::epoll::sys_epoll_wait),
+        RawFnHandler(crate::epoll::sys_epoll_pwait),
     );
     table.install_raw(
         Syscall::EpollPwait2,
