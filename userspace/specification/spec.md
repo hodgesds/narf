@@ -106,6 +106,10 @@ Connected socket rings advance their token only on readiness transitions
 leave readiness unchanged do not synthesize edges. A drain followed by new
 data before the next `epoll_wait` remains a deliverable edge even though both
 sampled readiness masks contain `POLL_IN`.
+AF_UNIX listeners likewise advance a readable token whenever `connect(2)`
+queues an accept-ready endpoint. Accepting the final pending endpoint followed
+by a new connection before the next epoll scan remains a deliverable
+`EPOLLIN|EPOLLET` edge even though both sampled masks contain `POLL_IN`.
 Readable and writable tokens are independent and epoll correlates each token
 only with its matching ready bit; a hidden receive-and-drain cycle cannot
 manufacture `EPOLLOUT` on a continuously writable socket.

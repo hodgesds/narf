@@ -921,6 +921,137 @@ fn smoke_epoll_epollet_edge_triggered() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_epoll_epollet_edge_triggered);
 
+/// Accepting the final AF_UNIX connection and receiving another connection
+/// before the next scan is a real EPOLLET edge even though both epoll samples
+/// see the listener as POLLIN. Event-driven accept loops may exercise this
+/// sequence when another thread connects between their accept and rescan.
+fn smoke_epoll_epollet_unix_listener_drain_refill_before_wait() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    setup_poll_test();
+
+    let open_stream = || {
+        call(
+            Syscall::SocketOpen,
+            SyscallArgs {
+                arg0: crate::socket::AF_UNIX as u64,
+                arg1: crate::socket::SOCK_STREAM as u64,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+    let server = open_stream();
+    if server == u64::MAX {
+        return TestResult::Fail("EPOLLET listener socket failed");
+    }
+
+    let mut addr = [0u8; 128];
+    addr[..2].copy_from_slice(&crate::socket::AF_UNIX.to_le_bytes());
+    let path = b"/epoll-listener-edge";
+    addr[2..2 + path.len()].copy_from_slice(path);
+    let addr_len = (2 + path.len()) as u64;
+    if call(
+        Syscall::SocketBind,
+        SyscallArgs {
+            arg0: server as u64,
+            arg1: addr.as_ptr() as u64,
+            arg2: addr_len,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+        || call(
+            Syscall::SocketListen,
+            SyscallArgs {
+                arg0: server as u64,
+                arg1: 16,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+            != 0
+    {
+        return TestResult::Fail("EPOLLET listener bind/listen failed");
+    }
+
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value;
+    let mut event = [0u8; 12];
+    event[..4].copy_from_slice(&(crate::epoll::EPOLLIN | crate::epoll::EPOLLET).to_ne_bytes());
+    event[4..12].copy_from_slice(&0xA11CEu64.to_ne_bytes());
+    if call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: server as u64,
+            arg3: event.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("EPOLLET listener add failed");
+    }
+
+    let mut out = [0u8; 12];
+    for connection in 0..2 {
+        let client = open_stream();
+        if client == u64::MAX
+            || call(
+                Syscall::SocketConnect,
+                SyscallArgs {
+                    arg0: client as u64,
+                    arg1: addr.as_ptr() as u64,
+                    arg2: addr_len,
+                    ..SyscallArgs::default()
+                },
+            )
+            .value
+                != 0
+        {
+            return TestResult::Fail("EPOLLET listener connect failed");
+        }
+        let ready = call(
+            Syscall::EpollWait,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: out.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                ..SyscallArgs::default()
+            },
+        );
+        if ready.value != 1 {
+            return TestResult::Fail(if connection == 0 {
+                "EPOLLET listener initial edge missing"
+            } else {
+                "EPOLLET listener lost drain/refill edge"
+            });
+        }
+        let accepted = call(
+            Syscall::SocketAccept,
+            SyscallArgs {
+                arg0: server as u64,
+                ..SyscallArgs::default()
+            },
+        );
+        if accepted.value == u64::MAX {
+            return TestResult::Fail("EPOLLET listener accept failed");
+        }
+        // The next connect happens at the top of the loop before any empty
+        // epoll scan can clear the listener's remembered POLLIN mask.
+    }
+
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_epollet_unix_listener_drain_refill_before_wait
+);
+
 /// EPOLLET must retain an enqueue edge that occurs after a drain but before
 /// the next epoll_wait samples the socket.
 fn smoke_epoll_epollet_dgram_drain_refill_before_wait() -> TestResult {

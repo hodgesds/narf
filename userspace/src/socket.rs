@@ -460,6 +460,11 @@ pub struct SocketFile {
     /// after an EPOLLET consumer drains it, a refill can occur before epoll
     /// observes the temporary empty state. The generation preserves that edge.
     dgram_readable_token: AtomicU64,
+    /// Readable-generation for an AF_UNIX listener's pending accept queue.
+    /// An EPOLLET server can accept the final queued connection and receive a
+    /// new one before its next epoll scan, leaving the sampled mask at POLLIN
+    /// throughout. Each enqueue is nevertheless a new accept-ready edge.
+    listener_readable_token: AtomicU64,
     /// Receive-progress generation for AF_NETLINK queues.  A monitor can
     /// drain one message between EPOLLET scans; advancing this token on that
     /// drain preserves the next queued message's edge without manufacturing
@@ -829,6 +834,7 @@ impl SocketFile {
             last_recv_cred: IrqSafeSpinLock::new(Ucred::default()),
             last_recv_fds: IrqSafeSpinLock::new(Vec::new()),
             dgram_readable_token: AtomicU64::new(0),
+            listener_readable_token: AtomicU64::new(0),
             netlink_readable_token: AtomicU64::new(0),
             netlink_portid: AtomicU32::new(0),
             netlink_groups: AtomicU32::new(0),
@@ -1855,6 +1861,9 @@ impl FileOps for SocketFile {
             }
             SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => {
                 (self.dgram_readable_token.load(Ordering::Acquire), 0)
+            }
+            SocketState::UnixListener { .. } => {
+                (self.listener_readable_token.load(Ordering::Acquire), 0)
             }
             SocketState::NetlinkUevent { reader } => {
                 let rx_tok = if reader.has_pending() {
@@ -3259,6 +3268,9 @@ impl SocketFile {
                     let mut lst = listener.state.lock();
                     if let SocketState::UnixListener { pending, .. } = &mut *lst {
                         pending.push_back(server_end);
+                        listener
+                            .listener_readable_token
+                            .fetch_add(1, Ordering::Release);
                     } else {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
