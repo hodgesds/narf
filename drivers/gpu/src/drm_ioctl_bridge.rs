@@ -24,6 +24,7 @@ extern crate alloc;
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt::Write;
 use narf_filesystem::FsError;
 
 use crate::drm::ioctl::{dispatch, DrmIoctlError, DrmIoctlResult, IoctlCmd};
@@ -851,6 +852,19 @@ fn handle_atomic(
     };
     let policy = crate::drm::atomic::AtomicCheckPolicy::default();
 
+    // Loud on purpose: this handler commits an EMPTY state, so a client
+    // driving its frames through here presents nothing at all. If these
+    // lines appear while the screen stays blank, the property-array decode
+    // — not the blit path — is what is missing.
+    let (log, n) = should_log(&ATOMIC_N);
+    if log {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  drm: ATOMIC #{n} objs={} flags={:#x} — committed as EMPTY state, no pixels presented",
+            req.count_objs, req.flags
+        );
+    }
+
     let mut card = mode_state.lock();
     match crate::drm::atomic::atomic_check_and_commit(&mut card, &mut state, &policy, None) {
         Ok(()) => Ok(0),
@@ -1077,6 +1091,33 @@ fn free_dumb_backing(
     }
 }
 
+// ── Present-path telemetry ────────────────────────────────────────────
+//
+// A compositor that runs but shows nothing is indistinguishable, from the
+// serial log alone, from a compositor that never submitted a frame. These
+// counters make the scanout path observable without a debugger: which
+// submission ioctl the client actually drives, whether its framebuffer
+// resolved to backing pages, and whether the blit reached a live scanout.
+//
+// Kept quiet after the opening frames — the first four of each event, then
+// every 512th — so a steady 60 fps costs a line every ~8 seconds.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static SETCRTC_N: AtomicU64 = AtomicU64::new(0);
+static PAGEFLIP_N: AtomicU64 = AtomicU64::new(0);
+static ATOMIC_N: AtomicU64 = AtomicU64::new(0);
+static BLIT_N: AtomicU64 = AtomicU64::new(0);
+static NOBACKING_N: AtomicU64 = AtomicU64::new(0);
+static NOSCANOUT_N: AtomicU64 = AtomicU64::new(0);
+
+/// True when this occurrence should be logged: the first four, then every
+/// 512th. `n` is the pre-increment count.
+fn should_log(counter: &AtomicU64) -> (bool, u64) {
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    (n <= 4 || n.is_multiple_of(512), n)
+}
+
 /// DRM_IOCTL_MODE_SETCRTC — blit the named framebuffer's dumb buffer
 /// into the active scanout via `narf_fb::fbdev_info` + memcpy.
 ///
@@ -1132,11 +1173,40 @@ fn handle_setcrtc(
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
     }
 
+    let (log, n) = should_log(&SETCRTC_N);
+    if log {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  drm: SETCRTC #{n} crtc={} fb={} {}x{} pitch={} backing={}",
+            req.crtc_id,
+            req.fb_id,
+            src_w,
+            src_h,
+            src_pitch,
+            if src_phys.is_some() { "yes" } else { "NONE" }
+        );
+    }
+
     // Perform the blit if we have a valid source and a live scanout.
     if let Some(src) = src_phys {
         blit_to_scanout(src, src_pitch, src_w, src_h);
+    } else {
+        note_missing_backing("SETCRTC", req.fb_id);
     }
     Ok(0)
+}
+
+/// A submission named a framebuffer whose GEM handle has no dumb backing —
+/// nothing can be blitted, so the scanout keeps its previous contents. The
+/// live case is a client presenting GBM/PRIME buffers rather than dumb ones.
+fn note_missing_backing(op: &str, fb_id: u32) {
+    let (log, n) = should_log(&NOBACKING_N);
+    if log {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  drm: {op} fb={fb_id} has no dumb backing — nothing presented (#{n})"
+        );
+    }
 }
 
 /// DRM_IOCTL_MODE_PAGE_FLIP — same blit as SETCRTC, no vblank event.
@@ -1197,8 +1267,24 @@ fn handle_page_flip(
         }
     }
 
+    let (log, n) = should_log(&PAGEFLIP_N);
+    if log {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  drm: PAGE_FLIP #{n} crtc={} fb={} {}x{} event={} backing={}",
+            req.crtc_id,
+            req.fb_id,
+            src_w,
+            src_h,
+            req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0,
+            if src_phys.is_some() { "yes" } else { "NONE" }
+        );
+    }
+
     if let Some(src) = src_phys {
         blit_to_scanout(src, src_pitch, src_w, src_h);
+    } else {
+        note_missing_backing("PAGE_FLIP", req.fb_id);
     }
     Ok(0)
 }
@@ -1215,8 +1301,32 @@ fn handle_page_flip(
 fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
     let info = match crate::drm_fb_hook::query_scanout() {
         Some(i) => i,
-        None => return,
+        None => {
+            // No live scanout: the client's pixels are being dropped on the
+            // floor, which looks exactly like a compositor that never drew.
+            let (log, n) = should_log(&NOSCANOUT_N);
+            if log {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  drm: blit dropped — no live scanout (#{n})"
+                );
+            }
+            return;
+        }
     };
+    let (log, n) = should_log(&BLIT_N);
+    if log {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  drm: blit #{n} src {}x{} pitch={} -> scanout {}x{} stride={}",
+            src_w,
+            src_h,
+            src_pitch,
+            info.width,
+            info.height,
+            info.stride_bytes
+        );
+    }
     // A real DRM client is now driving the scanout — hand the framebuffer
     // over to it: detach the kernel console FB hook and suppress the FB
     // status-panel / cursor painters so they stop bleeding kernel chrome

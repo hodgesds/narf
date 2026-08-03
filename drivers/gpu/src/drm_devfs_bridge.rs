@@ -70,7 +70,7 @@ pub struct DriCardFile {
 static LIVE_CARD_FILES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 impl DriCardFile {
-    fn new(index: u32) -> Option<Self> {
+    pub(crate) fn new(index: u32) -> Option<Self> {
         let metadata = crate::drm_registry::node_metadata(index, false)?;
         LIVE_CARD_FILES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         Some(DriCardFile { index, metadata })
