@@ -171,6 +171,9 @@ install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-plasma-session-monitor.sh" \
   "$WORK/root/usr/local/libexec/narf-plasma-session-monitor"
 install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-plasma-classic-supervisor.sh" \
+  "$WORK/root/usr/local/libexec/narf-plasma-classic-supervisor"
+install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-drm-policy.sh" \
   "$WORK/root/usr/local/libexec/narf-drm-policy"
 

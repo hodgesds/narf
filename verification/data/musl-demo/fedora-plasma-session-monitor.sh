@@ -25,31 +25,23 @@ echo "PLASMA-DBUS-MONITOR starting"
 # lifetime of the acceptance run.
 (
   echo "PLASMA-GDBUS-WAIT kded start"
-  if /usr/bin/gdbus wait --session org.kde.kded6; then
+  /usr/bin/gdbus wait --session org.kde.kded6
+  status=$?
+  if [ "$status" -eq 0 ]; then
     echo "PLASMA-GDBUS-WAIT kded observed"
   else
-    status=$?
     echo "PLASMA-GDBUS-WAIT kded failed status=$status"
   fi
 ) &
 
-# Exercise the exact Qt QDBusServiceWatcher implementation independently of
-# plasma_session's StartServiceJob. If this exits while StartServiceJob remains
-# pending, the remaining defect is in Plasma's job/callback context rather
-# than Qt's bus match and signal-delivery machinery as a whole.
-(
-  echo "PLASMA-QT-WAIT kded start"
-  if /usr/bin/plasma_waitforname --timeout -1 org.kde.kded6; then
-    echo "PLASMA-QT-WAIT kded observed"
-  else
-    status=$?
-    echo "PLASMA-QT-WAIT kded failed status=$status"
-  fi
-) &
+# Resume the classic-session sequence after the one proven StartServiceJob
+# callback gate. The supervisor uses the same focused Qt watcher exercised by
+# the preceding replay and logs each process/name boundary.
+/usr/local/libexec/narf-plasma-classic-supervisor &
 
 # Give the monitor time to install its match rules before startplasma can
 # launch KWin and submit the environment-update batch. This also lets the
-# independent GLib and Qt name waiters install their matches before kded can
-# be started.
+# independent GLib waiter and classic supervisor install their matches before
+# kded can be started.
 /usr/bin/sleep 1
 exec /usr/bin/startplasma-wayland
