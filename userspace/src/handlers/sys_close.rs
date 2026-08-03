@@ -16,7 +16,20 @@ pub(crate) fn sys_close(ctx: &mut dyn TrapContext) {
         if !has_duplicate {
             let raw = alloc::sync::Arc::as_ptr(ops) as *const ();
             if let Some(sock) = socket_arc_lookup(raw) {
-                sock.unregister();
+                // `has_other_ops` only sees THIS process's descriptors. A
+                // fork gives every child its own table holding the same file
+                // description, so each of them looks like the last owner.
+                // A child dropping an inherited listener — which is what
+                // FD_CLOEXEC does on every exec in a desktop session — would
+                // then unbind the path out from under a parent that is still
+                // listening, and subsequent connects get ECONNREFUSED.
+                //
+                // Linux ties the binding to the socket's lifetime, not to one
+                // descriptor. Only release the name once no other process
+                // holds this description either.
+                if !sock.has_registration() || !fd::ops_held_by_other_task(task, ops) {
+                    sock.unregister();
+                }
             }
         }
     }

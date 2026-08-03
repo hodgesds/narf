@@ -1417,6 +1417,29 @@ impl SocketFile {
         }
     }
 
+    /// Whether this socket owns a name in one of the global registries —
+    /// i.e. whether [`Self::unregister`] would remove anything.
+    ///
+    /// Lets `sys_close` keep its expensive cross-process ownership scan off
+    /// the hot path: only a bound or listening socket can strand a name, and
+    /// those are a vanishing fraction of the sockets a system closes.
+    pub fn has_registration(&self) -> bool {
+        matches!(
+            &*self.state.lock(),
+            SocketState::UnixBound { .. }
+                | SocketState::UnixListener { .. }
+                | SocketState::UnixConnected {
+                    local_addr: Some(_),
+                    ..
+                }
+                | SocketState::InetListener { .. }
+                | SocketState::Inet6Listener { .. }
+                | SocketState::UnixDgram { addr: Some(_), .. }
+                | SocketState::InetDgram { .. }
+                | SocketState::InetWired { .. }
+        )
+    }
+
     /// Tear down listener / dgram-bound registry entries owned by
     /// this socket. Called from sys_close so the path / port is
     /// reusable on the next bind. Idempotent — Fresh / Connected

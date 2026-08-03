@@ -611,6 +611,7 @@ fn main() {
         "drm_smoke",
         "tfd_epoll_smoke",
         "unix_epoll_smoke",
+        "wlserve_smoke",
         "shmfork_smoke",
         "sigrt_smoke",
         "strace_smoke",

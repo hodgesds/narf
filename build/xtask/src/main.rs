@@ -2418,6 +2418,10 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // forked child reads and closes its inherited copy — X server
         // Popen("w"), which is how Xwayland feeds xkbcomp its keymap.
         ("popenw_smoke", "popenw-ok"),
+        // A Wayland compositor's exact wait shape: a server parked in
+        // epoll_wait(-1) over its listening socket plus accepted clients,
+        // and a client parked in poll(-1) for the reply.
+        ("wlserve_smoke", "wlserve-ok"),
         // Early-systemd process topology: sixteen children are released
         // together across available CPUs, self-exec with one explicitly
         // preserved fd, report their post-exec identity, exit, and are reaped.

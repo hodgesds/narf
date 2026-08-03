@@ -923,6 +923,51 @@ pub fn fork(parent: u64, child: u64) -> usize {
     copied
 }
 
+/// Whether any fd table OTHER than `closing_task`'s still holds `ops`.
+///
+/// `FdTable::has_other_ops` only sees one process's descriptors, so after a
+/// fork every process believes it owns the last copy of an inherited file
+/// description. For a bound AF_UNIX socket that is the difference between
+/// "the last descriptor closed, release the path" and "a child dropped its
+/// inherited copy while the parent is still listening".
+///
+/// CLONE_FILES siblings share one table `Arc`, so the closing task's table
+/// is identified by pointer and skipped wholesale: its own duplicates are
+/// already covered by `has_other_ops`.
+///
+/// Linear in live tasks, so callers must reach it only on the close of a
+/// descriptor that actually owns a registration — not on every close.
+pub fn ops_held_by_other_task(
+    closing_task: u64,
+    ops: &alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+) -> bool {
+    let own = TABLES[table_shard(closing_task)]
+        .lock()
+        .get(&closing_task)
+        .cloned();
+    for shard in TABLES.iter() {
+        // Clone the shard's table Arcs out from under its lock, so the
+        // per-table locks below are never taken while a shard lock is held.
+        let tables: Vec<Arc<IrqSafeSpinLock<FdTable>>> = shard.lock().values().cloned().collect();
+        for table in tables {
+            if let Some(own) = own.as_ref() {
+                if Arc::ptr_eq(&table, own) {
+                    continue;
+                }
+            }
+            let held = table.lock().slots.iter().any(|slot| {
+                slot.as_ref()
+                    .map(|entry| alloc::sync::Arc::ptr_eq(&entry.ops, ops))
+                    .unwrap_or(false)
+            });
+            if held {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// CLONE_FILES: install the SAME table `Arc` under the child's TaskId so the
 /// child and parent (and every other thread of the process) share one fd table
 /// — an fd opened by any thread is visible to all, and `close` in one closes it
