@@ -7,6 +7,8 @@ echo "PLASMA-DBUS-MONITOR starting"
   "type='method_call',interface='org.kde.Startup',member='updateLaunchEnv'" \
   "type='method_call',interface='org.freedesktop.DBus',member='UpdateActivationEnvironment'" \
   "type='method_call',interface='org.freedesktop.DBus',member='StartServiceByName'" \
+  "type='method_call',interface='org.freedesktop.DBus',member='AddMatch'" \
+  "type='method_call',interface='org.freedesktop.DBus',member='RemoveMatch'" \
   "type='method_call',interface='org.freedesktop.systemd1.Manager',member='SetEnvironment'" \
   "type='method_return'" \
   "type='error'" \
