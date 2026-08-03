@@ -130,7 +130,8 @@ calling task's accumulated user and kernel accounting.
 Anonymous pipes implement `FIONREAD` on both ends and report the shared
 immediately-readable byte count. Writes and final endpoint closure publish a
 readiness notification so parked `poll`/`epoll` waiters wake without unrelated
-system activity.
+system activity. A write after the final reader closes raises `SIGPIPE` and
+returns `EPIPE`.
 Legacy `clone(2)` honors `CLONE_PIDFD` by installing a pidfd in the parent and
 writing its descriptor through the overloaded `parent_tid` pointer argument.
 Private futex wait queues are keyed by `(address-space identity, user address)`;

@@ -21,8 +21,9 @@
 //! when the buffer is empty AND the writer side has been dropped;
 //! a 0-byte read with the writer still alive means "try again later"
 //! (POSIX would return EAGAIN here for a non-blocking fd). The
-//! writer side never EOFs; `write` on a closed reader silently
-//! drops bytes (POSIX SIGPIPE / EPIPE is a follow-up).
+//! writer side never EOFs; `write` on a closed reader returns
+//! `FsError::BrokenPipe`, which the Linux syscall layer translates to
+//! SIGPIPE plus `EPIPE`.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -52,8 +53,7 @@ struct PipeShared {
     /// this to flip empty-read from "try again" to EOF.
     writer_closed: AtomicBool,
     /// Set when the read half is dropped. The write half observes
-    /// this to discard further writes silently (Stage-4 simplification
-    /// — POSIX would surface SIGPIPE / EPIPE; deferred).
+    /// this and reports `BrokenPipe` to the syscall layer.
     reader_closed: AtomicBool,
     readable_token: AtomicU64,
     writable_token: AtomicU64,
@@ -240,10 +240,9 @@ impl FileOps for PipeWrite {
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            // Drop on a closed reader: silently discard. Stage-5
-            // adds SIGPIPE delivery + an EPIPE return path.
+            // The syscall layer turns this into SIGPIPE plus -EPIPE.
             if self.shared.reader_closed.load(Ordering::Acquire) {
-                return Ok(buf.len());
+                return Err(narf_filesystem::FsError::BrokenPipe);
             }
             let mut q = self.shared.queue.lock();
             let was_empty = q.is_empty();
@@ -307,8 +306,8 @@ impl FileOps for PipeWrite {
     fn write_should_block(&self) -> bool {
         // A full-pipe write returns 0; block the writer (POSIX blocking write
         // waits for room) as long as a reader is still open. When the reader
-        // has closed, write() returns buf.len() (discard) rather than 0, so
-        // this is only consulted while the reader is present.
+        // has closed, write() returns BrokenPipe rather than 0, so this is
+        // only consulted while the reader is present.
         !self.shared.reader_closed.load(Ordering::Acquire)
     }
 

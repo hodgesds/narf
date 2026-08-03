@@ -741,6 +741,28 @@ fn smoke_abi_fdio_pipe_fionread() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_fionread);
 
+fn smoke_abi_fdio_pipe_write_closed_reader_is_epipe() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_pipe()?;
+        if call(Syscall::Close.raw(), a0(rd as u64)) != Some(0) {
+            return Err("closing pipe reader failed");
+        }
+        let payload = b"x";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(EPIPE)
+        {
+            return Err("write with no pipe readers was not -EPIPE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_pipe_write_closed_reader_is_epipe
+);
+
 fn smoke_abi_fdio_pipe_neg() -> TestResult {
     with_setup(|| {
         // null out-pointer → InvalidOp.
