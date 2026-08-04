@@ -100,11 +100,6 @@ pub struct VirtioBlkPci {
     /// 64 bytes) — single-request driver until the multi-inflight
     /// path lands.
     pool: DmaBuffer,
-    /// Serialises submitters against `pool`, spun on WITHOUT masking
-    /// interrupts. Lives on the device rather than in a static so a
-    /// second controller would contend only with itself — a global gate
-    /// would make unrelated disks serialise against each other.
-    req_gate: core::sync::atomic::AtomicBool,
     /// Negotiated queue size.
     qsize: u16,
     /// `queue_notify_off` for queue 0, captured at probe time.
@@ -272,7 +267,6 @@ impl VirtioBlkPci {
             queue: IrqSafeSpinLock::new(Some(queue)),
             _q_buf: q_buf,
             pool,
-            req_gate: core::sync::atomic::AtomicBool::new(false),
             qsize,
             queue_notify_off,
             irq_vector: None,
@@ -1145,8 +1139,8 @@ impl VirtioBlkPci {
 /// `CompletionTimeout` so the upper layer can retry or abandon.
 pub async fn read_sector_irq_async(sector: u64) -> Result<[u8; 512], VirtioPciError> {
     let vector = {
-        let g = CONTROLLER.lock();
-        g.as_ref().ok_or(VirtioPciError::NoQueues)?.irq_vector
+        let (_gate, c) = probed_device().ok_or(VirtioPciError::NoQueues)?;
+        c.irq_vector
     };
     // Construct waiter BEFORE submit so a synchronously-delivered
     // MSI-X (QEMU completes virtio-blk reads inline) can't slip past
@@ -1154,8 +1148,7 @@ pub async fn read_sector_irq_async(sector: u64) -> Result<[u8; 512], VirtioPciEr
     let waiter = vector
         .map(|v| narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000)));
     let (head, payload, status_phys, payload_phys) = {
-        let g = CONTROLLER.lock();
-        let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
+        let (_gate, c) = probed_device().ok_or(VirtioPciError::NoQueues)?;
         c.submit_read(sector)?
     };
     if let Some(w) = waiter {
@@ -1168,8 +1161,7 @@ pub async fn read_sector_irq_async(sector: u64) -> Result<[u8; 512], VirtioPciEr
     }
     let mut out = [0u8; 512];
     let r = {
-        let g = CONTROLLER.lock();
-        let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
+        let (_gate, c) = probed_device().ok_or(VirtioPciError::NoQueues)?;
         c.drain_read(head, status_phys, payload_phys, &mut out)
     };
     drop(payload);
@@ -1181,14 +1173,13 @@ pub async fn read_sector_irq_async(sector: u64) -> Result<[u8; 512], VirtioPciEr
 /// the 5-second wait deadline.
 pub async fn write_sector_irq_async(sector: u64, data: [u8; 512]) -> Result<(), VirtioPciError> {
     let vector = {
-        let g = CONTROLLER.lock();
-        g.as_ref().ok_or(VirtioPciError::NoQueues)?.irq_vector
+        let (_gate, c) = probed_device().ok_or(VirtioPciError::NoQueues)?;
+        c.irq_vector
     };
     let waiter = vector
         .map(|v| narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000)));
     let (head, payload, status_phys) = {
-        let g = CONTROLLER.lock();
-        let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
+        let (_gate, c) = probed_device().ok_or(VirtioPciError::NoQueues)?;
         c.submit_write(sector, &data)?
     };
     if let Some(w) = waiter {
@@ -1197,8 +1188,7 @@ pub async fn write_sector_irq_async(sector: u64, data: [u8; 512]) -> Result<(), 
         }
     }
     let r = {
-        let g = CONTROLLER.lock();
-        let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
+        let (_gate, c) = probed_device().ok_or(VirtioPciError::NoQueues)?;
         c.drain_write(head, status_phys)
     };
     drop(payload);
@@ -1236,8 +1226,7 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         }
         // Interrupts stay enabled for the whole transfer: hold the device's
         // request gate, not the IRQ-masking CONTROLLER lock. See `ReqGate`.
-        let dev = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        let _gate = ReqGate::acquire(&dev.req_gate);
+        let (_gate, dev) = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
         {
             // Batch one 4 KiB page per virtio round-trip.
             let mut done: u16 = 0;
@@ -1277,14 +1266,45 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         let mut buf = [0u8; 512];
         buf.copy_from_slice(&data[..512]);
         // Same reasoning as `read` above.
-        let dev = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        let _gate = ReqGate::acquire(&dev.req_gate);
+        let (_gate, dev) = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
         dev.write_sector(lba, &buf)
             .map_err(|_| narf_block::BlockIoError::DriverError)
     }
 }
 
-static CONTROLLER: IrqSafeSpinLock<Option<VirtioBlkPci>> = IrqSafeSpinLock::new(None);
+/// The installed controller and the gate serialising access to it.
+///
+/// Leaked at install so the address is stable BY CONSTRUCTION rather than
+/// by invariant. The earlier version stored the device inline in the
+/// `Option` and handed out `&'static` references derived from a raw
+/// pointer, resting on "installed once, never moved, never dropped" —
+/// true today, but a later hot-unplug or re-probe change would turn it
+/// into a use-after-free reachable only under load, and a test pinning
+/// the invariant only catches that if someone runs it. Leaking removes
+/// the question: the allocation outlives every reference unconditionally.
+///
+/// The `UnsafeCell` is what keeps the one `&mut` path sound. `req_gate`
+/// admits a single holder at a time, so at most one `&mut VirtioBlkPci`
+/// can exist, and no shared reference can overlap it.
+struct InstalledDevice {
+    /// Serialises device round-trips and every reference into `dev`.
+    /// Spun on with interrupts ENABLED — see [`ReqGate`].
+    req_gate: core::sync::atomic::AtomicBool,
+    dev: core::cell::UnsafeCell<VirtioBlkPci>,
+}
+
+// SAFETY: every reference into `dev` is constructed while holding
+// `req_gate`, which admits one holder at a time, so accesses are
+// exclusive; `VirtioBlkPci` is `Send` (asserted below), so handing that
+// exclusive access to whichever CPU wins the gate is fine.
+unsafe impl Sync for InstalledDevice {}
+
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<VirtioBlkPci>()
+};
+
+static CONTROLLER: IrqSafeSpinLock<Option<&'static InstalledDevice>> = IrqSafeSpinLock::new(None);
 
 /// RAII holder for a device's request gate.
 ///
@@ -1329,47 +1349,35 @@ impl Drop for ReqGate<'_> {
     }
 }
 
-/// The probed controller, WITHOUT holding `CONTROLLER` for the caller's
-/// use of it.
+/// The installed slot, WITHOUT holding `CONTROLLER` for the caller's use
+/// of it.
 ///
-/// `CONTROLLER` is taken only long enough to read the address of the
-/// installed device, then released, so a long transfer runs with
-/// interrupts enabled.
+/// `CONTROLLER` is taken only long enough to copy the slot reference out,
+/// then released, so a transfer runs with interrupts enabled. The slot is
+/// leaked at install, so this reference is valid for the rest of the boot
+/// with no invariant to defend — see [`InstalledDevice`].
+fn probed_slot() -> Option<&'static InstalledDevice> {
+    *CONTROLLER.lock()
+}
+
+/// The installed controller for a read-only use, serialised by its gate.
 ///
-/// # Why the reference stays valid
-///
-/// The `Option` is written exactly once: [`probe`] returns early when a
-/// controller is already installed, and nothing ever stores `None` back.
-/// The `VirtioBlkPci` therefore is never moved, replaced or dropped after
-/// its single install, so a shared reference to it stays valid for the
-/// rest of the boot. `smoke_virtio_blk_device_address_is_stable` pins
-/// that invariant, because it is the kind of assumption a later "support
-/// hot-unplug" change would silently invalidate.
-///
-/// The one `&mut` path, [`enable_msix_for_probed`], takes the device's
-/// [`ReqGate`] so it cannot alias a reference handed out here.
-fn probed_device() -> Option<&'static VirtioBlkPci> {
-    let ptr: *const VirtioBlkPci = {
-        let g = CONTROLLER.lock();
-        match g.as_ref() {
-            Some(d) => d as *const VirtioBlkPci,
-            None => return None,
-        }
-    };
-    // SAFETY: install-once, never-moved, never-dropped — see above. The
-    // only writer of the slot after install is `enable_msix_for_probed`,
-    // which is excluded by the device's request gate.
-    Some(unsafe { &*ptr })
+/// Returns the gate guard alongside the reference so the caller cannot
+/// accidentally drop the guard while still holding the device.
+fn probed_device() -> Option<(ReqGate<'static>, &'static VirtioBlkPci)> {
+    let slot = probed_slot()?;
+    let gate = ReqGate::acquire(&slot.req_gate);
+    // SAFETY: `gate` is held for as long as the returned reference, and
+    // the gate admits one holder at a time, so no other reference into
+    // the cell — shared or exclusive — can overlap this one.
+    Some((gate, unsafe { &*slot.dev.get() }))
 }
 
 /// The installed controller's address, or `None` before probe. Test hook
 /// for the install-once invariant `with_device_unlocked` relies on.
 #[doc(hidden)]
 pub fn dbg_device_addr() -> Option<usize> {
-    CONTROLLER
-        .lock()
-        .as_ref()
-        .map(|d| d as *const VirtioBlkPci as usize)
+    probed_slot().map(|s| s.dev.get() as usize)
 }
 
 /// Probe entry — installed via `bus::register_pci_driver`.
@@ -1397,7 +1405,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    *CONTROLLER.lock() = Some(dev);
+    // Leak the slot: an in-flight transfer may hold a reference into it,
+    // and freeing that under a live guard would be a use-after-free
+    // reachable only under load. `probe` early-returns when a controller
+    // exists, so this happens once per boot.
+    let slot: &'static InstalledDevice =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(InstalledDevice {
+            req_gate: core::sync::atomic::AtomicBool::new(false),
+            dev: core::cell::UnsafeCell::new(dev),
+        }));
+    *CONTROLLER.lock() = Some(slot);
     // Register against the unified block-device registry.
     narf_block::register_block_device(
         "vblk0",
@@ -1428,7 +1445,8 @@ pub fn register_pci_driver() {
 
 /// Test-side accessor: run `f` against the probed controller.
 pub fn with_controller<R>(f: impl FnOnce(&VirtioBlkPci) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    let (_gate, dev) = probed_device()?;
+    Some(f(dev))
 }
 
 /// `true` once `probe` has installed a controller.
@@ -1444,14 +1462,14 @@ pub fn enable_msix_for_probed(
     cap: &Cap<BusDeviceCap, Write>,
     device: &BusDevice,
 ) -> Result<u8, VirtioPciError> {
-    // The only `&mut` access to the installed controller. `with_device_unlocked`
-    // hands out shared references that outlive the CONTROLLER lock, so this
-    // must exclude them the same way the synchronous I/O paths exclude each
-    // other — otherwise the `&mut` below could alias a live transfer's `&`.
-    let gate_dev = probed_device().ok_or(VirtioPciError::NoQueues)?;
-    let _gate = ReqGate::acquire(&gate_dev.req_gate);
-    let mut g = CONTROLLER.lock();
-    let dev = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+    // The only `&mut` access to the installed controller. The gate admits
+    // one holder at a time, so this cannot alias a shared reference handed
+    // to a live transfer.
+    let slot = probed_slot().ok_or(VirtioPciError::NoQueues)?;
+    let _gate = ReqGate::acquire(&slot.req_gate);
+    // SAFETY: `_gate` is held for the whole borrow and admits a single
+    // holder, so this `&mut` is exclusive.
+    let dev = unsafe { &mut *slot.dev.get() };
     if let Some(v) = dev.irq_vector {
         return Ok(v);
     }
@@ -1463,5 +1481,9 @@ pub fn enable_msix_for_probed(
 /// want to switch on MSI-X mid-suite. Wave-3a pragmatic surface;
 /// proper Wave-3b API has the registry hand back a typed handle.
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut VirtioBlkPci) -> R) -> Option<R> {
-    CONTROLLER.lock().as_mut().map(f)
+    let slot = probed_slot()?;
+    let _gate = ReqGate::acquire(&slot.req_gate);
+    // SAFETY: `_gate` is held for the whole borrow and admits a single
+    // holder, so this `&mut` cannot alias any other reference into the cell.
+    Some(f(unsafe { &mut *slot.dev.get() }))
 }
