@@ -2936,6 +2936,7 @@ pub fn runnable_task_count() -> usize {
 /// - `!halted && awake > 0` ⇒ the CPU is spinning but not polling — a
 ///   data-path/lock issue keeping it off the poll, OR a busy-loop bug.
 /// - `locked`               ⇒ a holder is stuck inside the queue lock.
+///
 /// Executor rounds completed per CPU. See the increment site.
 static EXEC_ROUNDS: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
@@ -2959,14 +2960,14 @@ pub fn dbg_exec_rounds(cpu: usize) -> u64 {
 /// homed on it is stranded regardless of its own state.
 #[allow(clippy::type_complexity)]
 pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, bool, u64, u64)> {
-    for cpu in 0..narf_lib::percpu::MAX_CPUS {
+    for (cpu, ready) in READY.iter().enumerate() {
         if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
             continue;
         }
         // try_lock: this runs from a timer tick, and blocking on a queue
         // lock held by the very CPU under investigation would deadlock the
         // reporter.
-        let Some(g) = READY[cpu].try_lock() else {
+        let Some(g) = ready.try_lock() else {
             continue;
         };
         let Some(d) = g.as_ref() else { continue };

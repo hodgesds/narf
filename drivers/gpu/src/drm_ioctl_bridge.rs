@@ -1115,7 +1115,9 @@ static NOSCANOUT_N: AtomicU64 = AtomicU64::new(0);
 /// 512th. `n` is the pre-increment count.
 fn should_log(counter: &AtomicU64) -> (bool, u64) {
     let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    (n <= 4 || n.is_multiple_of(512), n)
+    // `%`, not `u64::is_multiple_of` — the latter is stable only since
+    // 1.87 and this tree's MSRV is 1.85.
+    (n <= 4 || n % 512 == 0, n)
 }
 
 /// DRM_IOCTL_MODE_SETCRTC — blit the named framebuffer's dumb buffer
