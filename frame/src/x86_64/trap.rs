@@ -103,6 +103,29 @@ mod stall_wd {
     /// (the same tasks, window after window) is reported.
     static LAST_STRANDED_SIG: AtomicU64 = AtomicU64::new(0);
 
+    /// Whether an RCU CPU-stall timeout should be fatal.
+    ///
+    /// Off unless `rcu_stall_panic` is on the kernel command line, mirroring
+    /// Linux's `rcu_cpu_stall_panic` boot parameter (which likewise defaults
+    /// to warn-and-continue). Parsed once and cached; the command line does
+    /// not change after boot and this is read from a timer tick.
+    fn rcu_stall_panics() -> bool {
+        const UNSET: u8 = 0;
+        const NO: u8 = 1;
+        const YES: u8 = 2;
+        static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+        match CACHED.load(Ordering::Relaxed) {
+            NO => return false,
+            YES => return true,
+            _ => {}
+        }
+        let on = narf_boot::cmdline()
+            .split_ascii_whitespace()
+            .any(|t| t == "rcu_stall_panic" || t == "rcu_stall_panic=1");
+        CACHED.store(if on { YES } else { NO }, Ordering::Relaxed);
+        on
+    }
+
     /// Called from the timer-tick path with the interrupted CPL3-or-not
     /// `cs` and `rip`. Records this CPU's last RIP/CPL, then (rate-limited
     /// to ~once/second, on whatever CPU ticks) checks for a syscall-count
@@ -168,7 +191,23 @@ mod stall_wd {
                 "STALL-WD: RCU quiescent-state timeout mask={rcu_stalled:#x}"
             );
             dump(sc);
-            panic!("STALL-WD: RCU quiescent-state timeout");
+            // Linux warns on an RCU CPU stall and continues, and panics only
+            // when asked (`rcupdate.rcu_cpu_stall_panic=1` /
+            // `kernel.panic_on_rcu_stall`). Match that, because a stall is
+            // frequently a SYMPTOM of something still worth inspecting: a
+            // long spin under a contended lock trips this while the machine
+            // is otherwise diagnosable, and panicking destroys exactly the
+            // live state that identifies the culprit. During the virtio-blk
+            // livelock hunt this fired at ~40 s and killed the VM before the
+            // per-task census could run.
+            //
+            // The dump above is the diagnosis; the panic is a policy choice
+            // that belongs to whoever is running the kernel. CI wants it (a
+            // stall must fail the job); an interactive bring-up session does
+            // not.
+            if rcu_stall_panics() {
+                panic!("STALL-WD: RCU quiescent-state timeout");
+            }
         }
         // Wedge signature: past boot (window 20 ≈ 20 s uptime) and the
         // syscall RATE collapses far below healthy. A healthy 200-conn run
