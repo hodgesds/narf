@@ -353,6 +353,13 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
 pub(crate) struct WakeCell {
     flag: AtomicBool,
     cpu: AtomicU32,
+    /// Diagnostic: times `run_until_empty` popped this slot, and times it
+    /// re-queued it because the awake flag was clear. A stranded slot is
+    /// ambiguous without these — "the CPU is running rounds" does not say
+    /// whether THIS slot is reached, and "awake=true" does not say whether
+    /// the swap that would clear it was ever executed.
+    pops: AtomicU64,
+    not_awake_requeues: AtomicU64,
 }
 
 /// Per-CPU "about to halt / halted" flag, used to gate the reschedule
@@ -1160,6 +1167,8 @@ where
     let slot = TaskSlot {
         task: Box::pin(f),
         awake: Arc::new(WakeCell {
+            pops: AtomicU64::new(0),
+            not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
         }),
@@ -1343,6 +1352,8 @@ where
     let slot = TaskSlot {
         task,
         awake: Arc::new(WakeCell {
+            pops: AtomicU64::new(0),
+            not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
         }),
@@ -2222,7 +2233,11 @@ pub fn run_until_empty() {
 
             // Skip if no waker has fired since the last poll. The slot
             // stays in the queue, waiting for an external signal.
+            slot.awake.pops.fetch_add(1, Ordering::Relaxed);
             if !slot.awake.flag.swap(false, Ordering::Acquire) {
+                slot.awake
+                    .not_awake_requeues
+                    .fetch_add(1, Ordering::Relaxed);
                 enqueue_after_poll(cpu, slot);
                 continue;
             }
@@ -2942,7 +2957,8 @@ pub fn dbg_exec_rounds(cpu: usize) -> u64 {
 /// counter is ALSO advancing, the executor is iterating and skipping the
 /// slot; if it is flat, that CPU has stopped running rounds and every task
 /// homed on it is stranded regardless of its own state.
-pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, bool)> {
+#[allow(clippy::type_complexity)]
+pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, bool, u64, u64)> {
     for cpu in 0..narf_lib::percpu::MAX_CPUS {
         if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
             continue;
@@ -2970,6 +2986,8 @@ pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, 
                 allowed.bits(),
                 cpu as u32,
                 allowed.contains(CpuId(cpu as u32)),
+                slot.awake.pops.load(Ordering::Relaxed),
+                slot.awake.not_awake_requeues.load(Ordering::Relaxed),
             ));
         }
     }
@@ -3469,6 +3487,8 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     let awake = Arc::new(WakeCell {
         flag: AtomicBool::new(true),
         cpu: AtomicU32::new(narf_lib::percpu::current_cpu() as u32),
+        pops: AtomicU64::new(0),
+        not_awake_requeues: AtomicU64::new(0),
     });
     let waker = make_waker(awake.clone());
     let mut ctx = Context::from_waker(&waker);

@@ -279,10 +279,10 @@ mod stall_wd {
                 // second apart so a flat round counter is visible as flat
                 // rather than inferred from one reading.
                 match narf_scheduler::dbg_slot_state(tid) {
-                    Some((awake, home, rounds, qlen, aff, qcpu, allowed)) => {
+                    Some((awake, home, rounds, qlen, aff, qcpu, allowed, pops, requeues)) => {
                         let _ = writeln!(
                             TrapWriter,
-                            "STALL-WD   slot tid={tid} awake={awake} home_cpu={home} rounds={rounds} qlen={qlen} aff={aff:#x} queued_on={qcpu} cpu_allowed={allowed}"
+                            "STALL-WD   slot tid={tid} awake={awake} home_cpu={home} rounds={rounds} qlen={qlen} aff={aff:#x} queued_on={qcpu} cpu_allowed={allowed} pops={pops} notawake_requeues={requeues}"
                         );
                     }
                     None => {
