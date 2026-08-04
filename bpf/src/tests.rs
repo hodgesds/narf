@@ -717,6 +717,128 @@ fn smoke_bpf_structops_install_requires_matching_cap() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_structops_install_requires_matching_cap);
 
+// ── struct_ops: reaching a live slot via `#[commit(...)]` ────────────
+//
+// `DemoGovernor` above proves the macro, the adapter, and the cap-gated record.
+// What it does *not* prove is the last seam: an installed program set becoming
+// the implementation the subsystem's own hot path dispatches through. Without a
+// live slot the record is inert — `is_installed` sees it and nothing runs it.
+// `LiveGovernor` closes that gap. It owns the exact `IrqSafeSpinLock<Option<Box
+// <dyn Trait>>>` slot every `PLUGGABILITY.md` subsystem owns (standing in for
+// `power::IDLE_GOVERNOR` so the seam is exercised without a cross-crate dep),
+// and `#[commit(...)]` names the committer that moves the verified adapter into
+// it. The tests below load a program, install it, and observe the value coming
+// back out of the subsystem's own query path.
+
+crate::struct_ops! {
+    /// A pluggable trait that owns a live slot, exercising the `#[commit(...)]`
+    /// seam end to end.
+    #[cap(IdleGovernor)]
+    #[install(install_bpf_live_governor)]
+    #[desc(LIVE_GOVERNOR_OPS)]
+    #[adapter(BpfLiveGovernor)]
+    #[commit(commit_live_governor)]
+    pub trait LiveGovernor {
+        /// Pick an idle state for an expected idle duration.
+        fn select_state(&self, expected_idle_ns: u64) -> u32;
+    }
+}
+
+/// The live slot. The same shape `power::IDLE_GOVERNOR` has; `init()` or a
+/// native impl could occupy it just as well as a BPF program set.
+static LIVE_GOVERNOR: narf_lib::sync::IrqSafeSpinLock<Option<alloc::boxed::Box<dyn LiveGovernor>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// The committer named by `#[commit(commit_live_governor)]`. Moves the verified
+/// adapter into the live slot, exactly as `power::install_idle_governor` moves
+/// a native governor into its slot. Generic over the cap marker so any
+/// authority of the right kind works, which is what lets the generated install
+/// fn stay generic.
+fn commit_live_governor<M: narf_capabilities::CapType>(
+    cap: &Cap<M, Grant>,
+    adapter: BpfLiveGovernor,
+) -> Result<(), crate::structops::StructOpsError> {
+    // The set was validated before the adapter was built; this is the same
+    // last-moment liveness re-check the native install points perform.
+    cap.check_live()?;
+    *LIVE_GOVERNOR.lock() = Some(alloc::boxed::Box::new(adapter));
+    Ok(())
+}
+
+/// The subsystem's hot-path query, dispatching through whatever is installed.
+/// `None` until something occupies the slot, mirroring the "not yet" semantics
+/// of `power::current_idle_governor_name`.
+fn live_governor_select_state(expected_idle_ns: u64) -> Option<u32> {
+    LIVE_GOVERNOR
+        .lock()
+        .as_ref()
+        .map(|g| g.select_state(expected_idle_ns))
+}
+
+fn smoke_bpf_structops_commit_reaches_live_slot() -> TestResult {
+    // r0 = ctx[0] * 2. A value the program computes, so the answer proves the
+    // installed program — not a native default or a stale slot — served the
+    // query, and that the argument reached it as ctx[0].
+    let insns = asm(&[ldx(0, 1, 0), alu_reg(AluOp::Add, 0, 0), EXIT]);
+    let Ok(prog) = load("livegov", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected the governor program");
+    };
+
+    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
+    let set = crate::structops::ProgSet::new().with("select_state", prog);
+    if let Err(_e) = install_bpf_live_governor(&cap, set) {
+        return TestResult::Fail("commit install rejected a complete program set");
+    }
+
+    // The record still happens — a committed trait is `is_installed` too.
+    if !crate::structops::is_installed("LiveGovernor") {
+        return TestResult::Fail("committed install did not record the set");
+    }
+
+    // The whole point: the subsystem's own query now dispatches through the
+    // installed program.
+    match live_governor_select_state(21) {
+        Some(42) => {}
+        Some(_) => return TestResult::Fail("live slot returned the wrong value"),
+        None => return TestResult::Fail("commit did not populate the live slot"),
+    }
+    // A second call proves the slot stays populated and re-dispatches per call
+    // rather than caching the first answer.
+    if live_governor_select_state(50) != Some(100) {
+        return TestResult::Fail("live slot did not re-dispatch on a second call");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_structops_commit_reaches_live_slot);
+
+fn smoke_bpf_structops_commit_rejects_before_touching_slot() -> TestResult {
+    // The negative: a set that fails validation must never reach the live slot.
+    // Empty the slot first so a leftover install from another test can't make
+    // this pass for the wrong reason.
+    *LIVE_GOVERNOR.lock() = None;
+
+    // Wrong authority kind — validated and rejected before any adapter is
+    // built, so the committer never runs.
+    let wrong = Cap::<BpfProgLoad, Grant>::bootstrap();
+    let insns = asm(&[mov_imm(0, 1), EXIT]);
+    let Ok(prog) = load("livegov_bad", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected the governor program");
+    };
+    let set = crate::structops::ProgSet::new().with("select_state", prog);
+    match install_bpf_live_governor(&wrong, set) {
+        Err(crate::structops::StructOpsError::WrongCapability { .. }) => {}
+        _ => return TestResult::Fail("committed install accepted the wrong cap kind"),
+    }
+    if live_governor_select_state(1).is_some() {
+        return TestResult::Fail("a rejected install still reached the live slot");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_structops_commit_rejects_before_touching_slot
+);
+
 fn smoke_bpf_interp_wrapping_ctx_access_traps() -> TestResult {
     // r0 = -1; r1 = *(u8 *)(r0 + 0)
     //
