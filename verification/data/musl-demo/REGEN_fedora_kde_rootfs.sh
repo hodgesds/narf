@@ -295,7 +295,7 @@ printf '%s\n' \
   'Environment=GALLIUM_DRIVER=llvmpipe' \
   'RuntimeDirectory=narf-plasma' \
   'RuntimeDirectoryMode=0700' \
-  'ExecStart=/usr/bin/dbus-run-session -- /usr/local/libexec/narf-plasma-session-monitor' \
+  'ExecStart=/usr/local/libexec/narf-plasma-session-monitor' \
   'StandardOutput=journal+console' \
   'StandardError=journal+console' \
   'Restart=on-failure' \
