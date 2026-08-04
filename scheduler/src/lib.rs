@@ -3033,10 +3033,14 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
                 priority: s.spec.priority,
                 class: s.spec.class,
                 affinity: s.spec.affinity,
-                // Hard safety floor: an address-space-bearing (user)
-                // task must never migrate across CPUs. The default
-                // strategy's `allow_steal` refuses on this flag even
-                // if the task were mis-pinned to `Affinity::any()`.
+                // Marks an address-space-bearing (user) task. The default
+                // strategy's `allow_steal` refuses to steal one UNLESS
+                // `user_task_smp_enabled()` — see `steal.rs`. This was
+                // once an unconditional "never migrate" floor and the
+                // comment outlived the exception, which matters when
+                // reasoning about strands: a user task whose home CPU
+                // stops iterating its executor loop is only rescuable by
+                // another CPU if that flag is on.
                 addr_space: s.addr_space.is_some(),
             };
             strategy.allow_steal(thief, &meta)

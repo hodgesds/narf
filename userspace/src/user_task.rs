@@ -309,9 +309,15 @@ pub struct UserTaskCtx {
 
     // ── stall-watchdog diagnostics ──────────────────────────────────
     /// Monotonic count of park-condition re-checks: bumped on every
-    /// `park_should_block` pass (own-stack park loop), every deadline-branch
-    /// pass of `UserTaskFuture::poll` (longjmp parks), and every
-    /// `own_stack_wait_child` loop iteration.
+    /// `park_should_block` pass (own-stack park loop) and every
+    /// deadline-branch pass of `UserTaskFuture::poll` (longjmp parks).
+    ///
+    /// NOT bumped by `own_stack_wait_child` — a task parked in a blocking
+    /// wait4/waitid (or a ppoll misrouted there by a stale
+    /// `wait_child_pending`) shows a FROZEN counter even while healthy,
+    /// because that loop re-checks only on child-exit/signal wakes and
+    /// arms no wheel backstop. The stranded-poll report's `waitchild`
+    /// field is the discriminator.
     ///
     /// This is the signal that distinguishes the two ways a task can sit
     /// parked forever. A HEALTHY parked task re-checks its condition on the
