@@ -123,6 +123,53 @@ kernel_test_in!(
     smoke_virtio_blk_device_address_is_stable
 );
 
+/// Same install-once invariant as `smoke_virtio_blk_device_address_is_stable`,
+/// for virtio-gpu: `gpu_pci::probed_device` hands out a `&'static` after
+/// releasing the CONTROLLER lock so every framebuffer flush runs with
+/// interrupts enabled. That is only sound while `probe` installs the device
+/// exactly once and nothing ever stores `None` back or replaces the value.
+fn smoke_virtio_gpu_device_address_is_stable() -> TestResult {
+    use crate::gpu_pci;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, probe_all_pci};
+
+    // SAFETY: identity-mapped QEMU ECAM region.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    if !gpu_pci::is_probed() {
+        return TestResult::Skip("virtio-gpu-pci not probed");
+    }
+    let before = match gpu_pci::dbg_device_addr() {
+        Some(a) => a,
+        None => return TestResult::Fail("probed controller has no address"),
+    };
+
+    // A repeat probe must be refused, not re-install a fresh device.
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    match gpu_pci::dbg_device_addr() {
+        Some(a) if a == before => {}
+        Some(_) => return TestResult::Fail("re-probe MOVED the installed controller"),
+        None => return TestResult::Fail("re-probe removed the installed controller"),
+    }
+
+    // And it must survive ordinary traffic through the unlocked path.
+    // `flush` is best-effort here: on a controller whose scanout was
+    // never initialised the device rejects the command, which is fine —
+    // the invariant under test is address stability, not scanout state.
+    if let Some(d) = gpu_pci::probed_device() {
+        let _ = d.flush();
+    }
+    match gpu_pci::dbg_device_addr() {
+        Some(a) if a == before => TestResult::Pass,
+        Some(_) => TestResult::Fail("controller address changed across a flush"),
+        None => TestResult::Fail("controller vanished across a flush"),
+    }
+}
+kernel_test_in!(
+    "drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_device_address_is_stable
+);
+
 fn smoke_virtio_blk_pci_write_then_read() -> TestResult {
     use crate::blk_pci;
     use narf_bus::driver_match::__reset_for_test;

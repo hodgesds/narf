@@ -268,17 +268,14 @@ fn smoke_virtio_gpu_pci_live_paint_pattern() -> TestResult {
     if !gpu_pci::is_probed() {
         return TestResult::Skip("no virtio-gpu-pci device on this run");
     }
-    // SAFETY: live device + bring_up succeeded if `is_probed`; the
-    // lock guards concurrent submitters.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let r = gpu_pci::with_controller_mut(|c| unsafe {
-        c.init_scanout()?;
-        c.paint_test_pattern()
-    });
-    match r {
-        Some(Ok(())) => TestResult::Pass,
-        Some(Err(_)) => TestResult::Fail("paint_test_pattern failed"),
-        None => TestResult::Skip("controller missing"),
+    // The device's request gate guards concurrent submitters; no
+    // global lock is held across the round-trips.
+    let Some(c) = gpu_pci::probed_device() else {
+        return TestResult::Skip("controller missing");
+    };
+    match c.init_scanout().and_then(|()| c.paint_test_pattern()) {
+        Ok(()) => TestResult::Pass,
+        Err(_) => TestResult::Fail("paint_test_pattern failed"),
     }
 }
 kernel_test_in!(

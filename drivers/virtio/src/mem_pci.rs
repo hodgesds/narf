@@ -7,8 +7,9 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
@@ -24,6 +25,7 @@ use crate::pci::{
     CC_QUEUE_NOTIFY_OFF, CC_QUEUE_SELECT, CC_QUEUE_SIZE,
 };
 use crate::queue::{VirtqDesc, Virtqueue, VirtqueueLayout, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use crate::req_gate::ReqGate;
 use crate::{
     VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
     VIRTIO_STATUS_FEATURES_OK,
@@ -90,14 +92,21 @@ pub struct VirtioMemPci {
     request_dma: DmaBuffer,
     queue_notify_off: u16,
     online_blocks: IrqSafeSpinLock<Vec<u64>>,
-    config: VirtioMemConfig,
+    /// Cached device config. Interior-mutable so `reconcile` can run on
+    /// `&self`; taken only for a copy in/out, never across a round-trip.
+    config: IrqSafeSpinLock<VirtioMemConfig>,
+    /// Serialises `reconcile` (and with it the shared `request_dma`
+    /// scratch) WITHOUT masking interrupts while waiting — see
+    /// [`crate::req_gate`].
+    req_gate: AtomicBool,
     pub ready: bool,
 }
 
 impl core::fmt::Debug for VirtioMemPci {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let config = *self.config.lock();
         f.debug_struct("VirtioMemPci")
-            .field("config", &self.config)
+            .field("config", &config)
             .field("ready", &self.ready)
             .finish_non_exhaustive()
     }
@@ -229,7 +238,8 @@ impl VirtioMemPci {
             request_dma,
             queue_notify_off,
             online_blocks: IrqSafeSpinLock::new(Vec::new()),
-            config,
+            config: IrqSafeSpinLock::new(config),
+            req_gate: AtomicBool::new(false),
             ready: true,
         })
     }
@@ -290,7 +300,8 @@ impl VirtioMemPci {
         let phys = self.request_dma.phys_addr().raw();
         let ptr = self.request_dma.as_mut_ptr();
         // Request at +0 (24 bytes), response at +64 (8 bytes).
-        // SAFETY: page-sized coherent scratch is single-flight under queue lock.
+        // SAFETY: page-sized coherent scratch is single-flight under the
+        // request gate held by `reconcile`.
         unsafe {
             core::ptr::write_bytes(ptr, 0, 72);
             core::ptr::write_volatile(ptr.cast::<u16>(), request_type.to_le());
@@ -311,11 +322,13 @@ impl VirtioMemPci {
                 next: 0,
             },
         ];
-        let mut queue = self.queue.lock();
-        let virtqueue = queue.as_mut().ok_or(VirtioPciError::NoQueues)?;
-        let head = virtqueue
-            .add_buffer(&descriptors)
-            .ok_or(VirtioPciError::AddBufferFailed)?;
+        let head = {
+            let mut queue = self.queue.lock();
+            let virtqueue = queue.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            virtqueue
+                .add_buffer(&descriptors)
+                .ok_or(VirtioPciError::AddBufferFailed)?
+        };
         compiler_fence(Ordering::SeqCst);
         // SAFETY: notify window and queue offset came from the device caps.
         unsafe {
@@ -324,15 +337,40 @@ impl VirtioMemPci {
                 0,
             );
         }
+        // Re-take the queue lock per completion poll instead of holding
+        // it across the whole round-trip: `queue` is an IrqSafeSpinLock,
+        // so a long hold would keep this CPU interrupts-masked for up to
+        // the full deadline — the exact livelock class the request gate
+        // exists to avoid (see blk_pci / crate::req_gate).
+        let mut q_err = false;
         let done = narf_scheduler::responsive_spin_until(
-            || matches!(virtqueue.poll_used(), Some((id, _)) if id == head as u32),
+            || {
+                let elem = {
+                    let mut queue = self.queue.lock();
+                    match queue.as_mut() {
+                        Some(virtqueue) => virtqueue.poll_used(),
+                        None => {
+                            q_err = true;
+                            return true;
+                        }
+                    }
+                };
+                matches!(elem, Some((id, _)) if id == head as u32)
+            },
             narf_time::Deadline::after_ms(1_000),
         );
+        if q_err {
+            return Err(VirtioPciError::NoQueues.into());
+        }
+        {
+            let mut queue = self.queue.lock();
+            if let Some(virtqueue) = queue.as_mut() {
+                virtqueue.free_chain(head);
+            }
+        }
         if !done {
-            virtqueue.free_chain(head);
             return Err(VirtioPciError::CompletionTimeout.into());
         }
-        virtqueue.free_chain(head);
         compiler_fence(Ordering::Acquire);
         // SAFETY: device completed the writable response descriptor.
         let response = unsafe { core::ptr::read_volatile(ptr.add(64).cast::<u16>()) };
@@ -351,11 +389,12 @@ impl VirtioMemPci {
 
     fn online_block(&self, addr: u64) -> Result<(), VirtioMemError> {
         self.request(REQ_PLUG, addr)?;
-        let node = self.config.node_id as usize;
+        let config = *self.config.lock();
+        let node = config.node_id as usize;
         // SAFETY: virtio-mem's device-owned region is guest RAM mapped by the
         // platform and the host ACK proves this block is plugged.
         if let Err(error) = unsafe {
-            narf_memory::online_memory_range(PhysAddr::new(addr), self.config.block_size, node)
+            narf_memory::online_memory_range(PhysAddr::new(addr), config.block_size, node)
         } {
             let _ = self.request(REQ_UNPLUG, addr);
             return Err(error.into());
@@ -365,12 +404,13 @@ impl VirtioMemPci {
     }
 
     fn offline_block(&self, addr: u64) -> Result<(), VirtioMemError> {
-        let node = narf_memory::offline_memory_range(PhysAddr::new(addr), self.config.block_size)?;
+        let config = *self.config.lock();
+        let node = narf_memory::offline_memory_range(PhysAddr::new(addr), config.block_size)?;
         if let Err(error) = self.request(REQ_UNPLUG, addr) {
             // SAFETY: this exact block was managed immediately above and the
             // device rejected unplug, so it remains real mapped RAM.
             let _ = unsafe {
-                narf_memory::online_memory_range(PhysAddr::new(addr), self.config.block_size, node)
+                narf_memory::online_memory_range(PhysAddr::new(addr), config.block_size, node)
             };
             return Err(error);
         }
@@ -382,10 +422,17 @@ impl VirtioMemPci {
     }
 
     /// Reconcile device state and the host's requested size.
-    pub fn reconcile(&mut self) -> Result<(), VirtioMemError> {
+    ///
+    /// Serialised by the device's request gate (which also covers the
+    /// shared request scratch), NOT by the global `CONTROLLER` lock —
+    /// each not-yet-online block costs a device round-trip, so a
+    /// reconcile can wait on the device for a long time and must do so
+    /// with interrupts enabled.
+    pub fn reconcile(&self) -> Result<(), VirtioMemError> {
+        let _gate = ReqGate::acquire(&self.req_gate);
         let current = Self::read_config_stable(&self.common, &self.device_cfg)?;
         Self::validate_config(current)?;
-        self.config = current;
+        *self.config.lock() = current;
         let node = current.node_id as usize;
 
         // Recover already-plugged blocks (e.g. kexec/device reset) into the
@@ -440,7 +487,12 @@ impl VirtioMemPci {
     }
 }
 
-static CONTROLLER: IrqSafeSpinLock<Option<VirtioMemPci>> = IrqSafeSpinLock::new(None);
+/// The probed controller, behind an `Arc` so `poll_config` can snapshot
+/// the handle under a brief lock hold and release `CONTROLLER` BEFORE
+/// `reconcile`'s device round-trips (the same clone-and-release pattern
+/// as the mount registry and virtio-net). Serialisation of the actual
+/// work is the device's own `req_gate`.
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<VirtioMemPci>>> = IrqSafeSpinLock::new(None);
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -455,12 +507,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: the bus gives this probe exclusive authority over the function.
-    let mut controller = unsafe { VirtioMemPci::bring_up(&device, &cap) }
+    let controller = unsafe { VirtioMemPci::bring_up(&device, &cap) }
         .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     controller
         .reconcile()
         .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    *CONTROLLER.lock() = Some(controller);
+    *CONTROLLER.lock() = Some(Arc::new(controller));
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("vmem0"),
         kind: narf_drivers::BoundKind::Other,
@@ -483,11 +535,12 @@ pub fn register_pci_driver() {
 }
 
 pub fn poll_config() -> Result<(), VirtioMemError> {
-    let mut controller = CONTROLLER.lock();
-    controller
-        .as_mut()
-        .ok_or(VirtioMemError::InvalidConfig)?
-        .reconcile()
+    // Snapshot + release: `reconcile` issues a device round-trip per
+    // not-yet-online block, and `CONTROLLER` is an IRQ-masking lock, so
+    // it must not be held across that. The device's request gate keeps
+    // reconciles mutually exclusive.
+    let controller = CONTROLLER.lock().clone();
+    controller.ok_or(VirtioMemError::InvalidConfig)?.reconcile()
 }
 
 /// Reconcile live host resize requests on a bounded cadence.

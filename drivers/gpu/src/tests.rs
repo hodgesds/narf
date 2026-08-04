@@ -108,7 +108,7 @@ fn smoke_virtio_gpu_scanout_initialised() -> TestResult {
     if !gpu_pci::is_probed() {
         return TestResult::Skip("virtio-gpu-pci not present");
     }
-    match gpu_pci::with_controller(|d| d.ready) {
+    match gpu_pci::with_controller(|d| d.is_ready()) {
         Some(true) => TestResult::Pass,
         Some(false) => TestResult::Fail("virtio-gpu probed but scanout not ready"),
         None => TestResult::Skip("virtio-gpu-pci controller missing"),

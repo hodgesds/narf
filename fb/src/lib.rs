@@ -250,10 +250,10 @@ struct VirtioGpuScanout;
 
 impl FbScanout for VirtioGpuScanout {
     fn width(&self) -> u32 {
-        narf_drivers_virtio::gpu_pci::with_controller(|d| d.mode.width).unwrap_or(0)
+        narf_drivers_virtio::gpu_pci::with_controller(|d| d.mode().width).unwrap_or(0)
     }
     fn height(&self) -> u32 {
-        narf_drivers_virtio::gpu_pci::with_controller(|d| d.mode.height).unwrap_or(0)
+        narf_drivers_virtio::gpu_pci::with_controller(|d| d.mode().height).unwrap_or(0)
     }
     fn stride(&self) -> u32 {
         self.width()
@@ -270,10 +270,14 @@ impl FbScanout for VirtioGpuScanout {
     fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {
         // M0: flush always covers the full scanout. Per-rect flush
         // is a future TRANSFER_TO_HOST_2D + RESOURCE_FLUSH dance.
-        let _ = narf_drivers_virtio::gpu_pci::with_controller_mut(|d| {
-            // SAFETY: bring_up complete; caller serialised via cap.
-            unsafe { d.flush() }
-        });
+        //
+        // `probed_device` + the device's own request gate keep
+        // interrupts enabled while the TRANSFER + FLUSH round-trips
+        // are polled — holding the global controller lock here masked
+        // interrupts for the whole transfer on every flush.
+        if let Some(d) = narf_drivers_virtio::gpu_pci::probed_device() {
+            let _ = d.flush();
+        }
     }
     unsafe fn framebuffer(&self) -> Framebuffer {
         narf_drivers_virtio::gpu_pci::with_controller(|d| {
@@ -512,7 +516,8 @@ pub fn select_active() -> Option<&'static dyn FbScanout> {
         }
     }
     if narf_drivers_virtio::gpu_pci::is_probed() {
-        let ready = narf_drivers_virtio::gpu_pci::with_controller(|d| d.ready).unwrap_or(false);
+        let ready =
+            narf_drivers_virtio::gpu_pci::with_controller(|d| d.is_ready()).unwrap_or(false);
         if ready {
             return Some(&VIRTIO_GPU);
         }
