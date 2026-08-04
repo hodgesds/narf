@@ -584,12 +584,15 @@ impl VirtioBlkPci {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
 
-        // Copy the payload out.
-        // SAFETY: identity-mapped 4 KiB page.
+        // Copy the payload out. The completion check above is what makes the
+        // device's writes visible; fence so the compiler cannot hoist this
+        // bulk copy above it.
+        compiler_fence(Ordering::Acquire);
+        // SAFETY: identity-mapped DMA page of at least `out.len()` bytes,
+        // freshly allocated so it cannot overlap `out`. Bulk copy rather than
+        // a per-byte volatile loop — see `read_sectors`.
         unsafe {
-            for (i, slot) in out.iter_mut().enumerate() {
-                *slot = core::ptr::read_volatile((payload_phys + i as u64) as *const u8);
-            }
+            core::ptr::copy_nonoverlapping(payload_phys as *const u8, out.as_mut_ptr(), out.len());
         }
 
         // Free the descriptor chain.
@@ -645,10 +648,17 @@ impl VirtioBlkPci {
         let payload_phys = payload.phys_addr().raw();
         // SAFETY: coherent DMA buffer of >= `bytes`; zero the bytes we'll read
         // so a missed device write shows up clearly.
+        //
+        // `write_bytes`, not a volatile byte loop: this ran one
+        // `write_volatile` per byte, which the compiler cannot vectorise or
+        // turn into a `memset`, so every 4 KiB read paid 4096 separate
+        // single-byte stores. On a filesystem workload that is the dominant
+        // cost of a transfer — the stall watchdog caught a CPU sitting in
+        // exactly this loop. Volatility buys nothing here: the buffer is not
+        // MMIO, and the ordering that matters is the fence below, which is
+        // what publishes these zeroes before the device is notified.
         unsafe {
-            for i in 0..bytes {
-                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, 0);
-            }
+            core::ptr::write_bytes(payload_phys as *mut u8, 0, bytes);
         }
 
         let descs = [
@@ -724,11 +734,20 @@ impl VirtioBlkPci {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
 
-        // SAFETY: identity-mapped 4 KiB page; copy `bytes` out.
+        // The used-ring entry above is what makes the device's writes
+        // visible; keep the compiler from hoisting this copy above that
+        // check now that it is a single bulk move rather than a sequence of
+        // volatile reads.
+        compiler_fence(Ordering::Acquire);
+        // SAFETY: identity-mapped DMA page holding at least `bytes`, and
+        // `out` is `bytes` long (checked above); the regions cannot overlap
+        // because `payload` is a freshly allocated coherent buffer.
+        //
+        // A bulk copy for the same reason as the zeroing above: this was one
+        // `read_volatile` per byte, so a 4 KiB read cost 4096 single-byte
+        // loads that could not be vectorised.
         unsafe {
-            for (i, slot) in out[..bytes].iter_mut().enumerate() {
-                *slot = core::ptr::read_volatile((payload_phys + i as u64) as *const u8);
-            }
+            core::ptr::copy_nonoverlapping(payload_phys as *const u8, out.as_mut_ptr(), bytes);
         }
 
         let mut g = self.queue.lock();
@@ -849,11 +868,14 @@ impl VirtioBlkPci {
             }
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
-        // SAFETY: same.
+        // The completion check above makes the device's writes visible;
+        // fence so the bulk copy cannot be hoisted above it.
+        compiler_fence(Ordering::Acquire);
+        // SAFETY: identity-mapped DMA page of at least `out.len()` bytes,
+        // separately allocated so it cannot overlap `out`. Bulk copy rather
+        // than a per-byte volatile loop — see `read_sectors`.
         unsafe {
-            for (i, slot) in out.iter_mut().enumerate() {
-                *slot = core::ptr::read_volatile((payload_phys + i as u64) as *const u8);
-            }
+            core::ptr::copy_nonoverlapping(payload_phys as *const u8, out.as_mut_ptr(), out.len());
         }
         let mut g = self.queue.lock();
         if let Some(q) = g.as_mut() {
@@ -1088,11 +1110,14 @@ impl VirtioBlkPci {
             }
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
-        // SAFETY: same.
+        // The completion check above makes the device's writes visible;
+        // fence so the bulk copy cannot be hoisted above it.
+        compiler_fence(Ordering::Acquire);
+        // SAFETY: identity-mapped DMA page of at least `out.len()` bytes,
+        // separately allocated so it cannot overlap `out`. Bulk copy rather
+        // than a per-byte volatile loop — see `read_sectors`.
         unsafe {
-            for (i, slot) in out.iter_mut().enumerate() {
-                *slot = core::ptr::read_volatile((payload_phys + i as u64) as *const u8);
-            }
+            core::ptr::copy_nonoverlapping(payload_phys as *const u8, out.as_mut_ptr(), out.len());
         }
         let mut g = self.queue.lock();
         if let Some(q) = g.as_mut() {
