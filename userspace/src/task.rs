@@ -238,17 +238,36 @@ pub fn dbg_stranded_poll_waiters(
             // unambiguously "empty" rather than "fd 0".
             let fd = ((packed & 0xFFFF_FFFF) as u32).wrapping_sub(1) as i32;
             let want = (packed >> 32) as u32;
-            let ready =
-                crate::fd::with_table(t.tid, |tbl| tbl.get(fd as u32).map(|e| e.ops.clone()))
-                    .flatten()
-                    .map(|ops| ops.poll_readiness())
-                    .unwrap_or(0);
-            if ready & want != 0 {
+            // Ask the SAME question `poll_scan` asks, term for term:
+            //   * `poll_readiness_at` with the fd's CURRENT offset, ops
+            //     cloned out of the lock before polling (nested-epoll
+            //     re-entrancy, see `poll_scan`). The offset-less
+            //     `poll_readiness()` is a different oracle: `/dev/kmsg`
+            //     overrides only `poll_readiness_at` (readable iff
+            //     `offset < live_len`), so the trait default (`IN|OUT`)
+            //     made every fully drained kmsg reader parked in ppoll
+            //     report here as permanently POLLIN-stranded while
+            //     `poll_scan` correctly re-parked it.
+            //   * mask = `events | ERR|HUP|NVAL` — poll returns those
+            //     unrequested, so a HUP-only-ready fd is a strand too.
+            //   * closed fd → POLLNVAL: `poll_scan` returns immediately
+            //     on it, so a task still parked on one is stranded.
+            let always = crate::poll::POLL_ERR | crate::poll::POLL_HUP | crate::poll::POLL_NVAL;
+            let ready = crate::fd::with_table(t.tid, |tbl| {
+                tbl.get(fd as u32).map(|e| (e.ops.clone(), e.offset))
+            })
+            .flatten()
+            .map(|(ops, offset)| ops.poll_readiness_at(offset))
+            .unwrap_or(crate::poll::POLL_NVAL);
+            if ready & (want | always) != 0 {
                 out.push((
                     t.tid,
                     t.pid.load(Ordering::Relaxed),
                     fd,
-                    ready & want,
+                    // The revents `poll_scan` would have returned — the
+                    // unrequested-but-always-reported bits included, so a
+                    // HUP/NVAL strand prints its actual cause.
+                    ready & (want | always),
                     t.uctx.dbg_park_checks.load(Ordering::Relaxed),
                     t.uctx.sleep_deadline_ns.load(Ordering::Relaxed),
                     t.uctx.net_io_wait.load(Ordering::Relaxed),
