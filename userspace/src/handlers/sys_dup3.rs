@@ -16,9 +16,12 @@ pub(crate) fn sys_dup3(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(oldfd)?;
+        // dup3(2) shares the open file description — offset + status flags
+        // travel with the duplicate (LINUX-GAP: snapshotted, not aliased;
+        // see sys_dup).
         let clone = crate::fd::FdEntry {
             ops: entry.ops.clone(),
-            offset: 0,
+            offset: entry.offset,
             // Set FD_CLOEXEC when the caller passes O_CLOEXEC (stock
             // glibc/musl, bit 0x80000) OR the bare FD_CLOEXEC bit
             // (narf-libc). Either way the slot bit is FD_CLOEXEC.
@@ -27,7 +30,7 @@ pub(crate) fn sys_dup3(ctx: &mut dyn TrapContext) {
             } else {
                 0
             },
-            status_flags: 0,
+            status_flags: entry.status_flags,
         };
         t.set(newfd, clone);
         Some(())

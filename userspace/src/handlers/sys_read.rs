@@ -109,8 +109,16 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
             }
         });
     };
-    // Closure error channel: `Err(true)` ⇒ return EAGAIN, `Err(false)` ⇒
-    // invalid-op sentinel (bad fd / read error).
+    // Closure error channel.
+    enum ReadError {
+        /// Non-blocking read with nothing ready → -EAGAIN.
+        Again,
+        /// Descriptor's open mode forbids reading (a pipe write end):
+        /// -EBADF, per the FMODE_READ check in `fs/read_write.c::vfs_read`.
+        BadFd,
+        /// Anything else → invalid-op sentinel (read error).
+        Other,
+    }
     let outcome = Some((|| {
         let entry = &ops;
         let nonblock = status_flags & crate::fd::O_NONBLOCK != 0;
@@ -137,8 +145,9 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
                     Ok((n, false, false))
                 }
                 // Empty / would-block ⇒ EAGAIN.
-                Some(Ok(_)) | None => Err(true),
-                Some(Err(_)) => Err(false),
+                Some(Ok(_)) | None => Err(ReadError::Again),
+                Some(Err(narf_filesystem::FsError::BadFd)) => Err(ReadError::BadFd),
+                Some(Err(_)) => Err(ReadError::Other),
             };
         }
         let res = poll_blocking(entry.read(off, &mut kbuf[..]))
@@ -156,7 +165,7 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
                 // trying to read a line") killed the KDE session bus. musl's
                 // stdio/recv wrappers likewise expect EAGAIN, never a phantom 0.
                 if n == 0 && nonblock && entry.read_should_block() {
-                    return Err(true); // EAGAIN
+                    return Err(ReadError::Again);
                 }
                 // Block decision: a 0-byte read on a pipe/socket whose writer is
                 // still open must wait for data (POSIX), not return a
@@ -169,7 +178,8 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
                 advance(n);
                 Ok((n, should_block, input_block))
             }
-            Err(_) => Err(false),
+            Err(narf_filesystem::FsError::BadFd) => Err(ReadError::BadFd),
+            Err(_) => Err(ReadError::Other),
         }
     })());
     match outcome {
@@ -208,60 +218,14 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
         }
         Some(Ok((0, true, _))) => {
-            // Empty pipe, writer still open: park ~1ms and RE-EXECUTE the
-            // read on resume (rewind RIP, leave the syscall number in
-            // place — do NOT set a return value) so the read blocks until
-            // data arrives or the last writer closes (which now happens
-            // via fd::detach on the writer's exit), rather than handing
-            // userspace a 0 it would mis-read as end-of-file.
-            if let (Some(uctx), Some(hook)) = (
-                crate::user_task::current_user_task(),
-                crate::user_task::yield_hook(),
-            ) {
-                let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-                // Rewind past the 2-byte `syscall`/`int 0x80` instruction so
-                // re-entry re-runs this syscall with its original args.
-                let resume_rip = ctx.rip().wrapping_sub(2);
-                ctx.set_rip(resume_rip);
-                // SAFETY: `uctx` is the live per-task UserTaskCtx from
-                // current_user_task(); we hold the only reference while
-                // setting the deadline + saving the (RIP-rewound) CPU state
-                // before the yield hook hands the task to the executor.
-                unsafe {
-                    let uc = &*uctx;
-                    uc.sleep_deadline_ns
-                        .store(dl, core::sync::atomic::Ordering::Release);
-                    // Park on NET-I/O READINESS so a peer's `write` → `notify(0)`
-                    // wakes this blocking `read()` PROMPTLY, with the ~1ms
-                    // deadline as a mere backstop — mirroring `recv`/`accept`.
-                    // Without net_io_wait a blocking POSIX `read()` on an empty
-                    // AF_UNIX socket only re-polled off the 1ms timer wheel (no
-                    // io-waiter, no lost-wake gen guard), so under own-stack
-                    // cooperative scheduling with other busy tasks the reply sat
-                    // unread past the client's deadline — a real asymmetry vs
-                    // `recv`, and a likely cause of flaky D-Bus round-trips (Qt/
-                    // libdbus read the bus socket via read()). Snapshot the
-                    // readiness generation for the check→park lost-wake guard;
-                    // clear a stale futex_uaddr so this can't mis-route into the
-                    // futex branch. Harmless for pipes (no notify → the 1ms
-                    // backstop still fires exactly as before).
-                    uc.futex_uaddr
-                        .store(0, core::sync::atomic::Ordering::Release);
-                    uc.net_io_wait
-                        .store(true, core::sync::atomic::Ordering::Release);
-                    uc.epoll_park_gen.store(
-                        narf_net::readiness::generation(),
-                        core::sync::atomic::Ordering::Release,
-                    );
-                    ctx.save_user_state(uc.state.get() as *mut u8);
-                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                    if narf_scheduler::stackful::user_own_stack_enabled() {
-                        own_stack_block(ctx);
-                        return;
-                    }
-                    hook(uctx);
-                }
-                // unreachable — hook() longjmps to the executor
+            // Empty pipe, writer still open: park on net-I/O readiness (a
+            // peer's `write` → `notify(0)` wakes this read promptly, the
+            // ~1ms deadline is a backstop) and RE-EXECUTE the read on
+            // resume, so the read blocks until data arrives or the last
+            // writer closes rather than handing userspace a 0 it would
+            // mis-read as end-of-file. See `park_reexecute_on_io`.
+            if park_reexecute_on_io(ctx) {
+                return;
             }
             // No executor (kernel-test context): fall back to a 0 read.
             ctx.set_return(SyscallReturn::ok(0));
@@ -275,11 +239,16 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
             }
         }
         // Non-blocking read with nothing ready → EAGAIN (errno 11).
-        Some(Err(true)) => {
+        Some(Err(ReadError::Again)) => {
             ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
         }
-        // TODO(linux-gap): bad fd should be -EBADF, but this `_` also
-        // catches read I/O errors — needs surgical bad-fd-vs-error split.
+        // Wrong-direction descriptor (reading a pipe write end) → -EBADF,
+        // matching `fs/read_write.c::vfs_read`'s FMODE_READ check.
+        Some(Err(ReadError::BadFd)) => {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        }
+        // TODO(linux-gap): this `Other` arm catches remaining read I/O
+        // errors — still needs a per-errno split.
         _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }

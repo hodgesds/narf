@@ -19,6 +19,20 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // Pipes, FIFOs and sockets are not seekable: `fs/pipe.c`'s
+    // `pipefifo_fops` and net/socket.c's `socket_file_ops` define no
+    // .llseek, so `fs/read_write.c::vfs_llseek` fails with -ESPIPE
+    // (FMODE_LSEEK is never set on them). Succeeding here (the old
+    // behaviour) let seek-probing callers — glibc stdio, coreutils —
+    // believe a pipe had a movable file position.
+    {
+        use narf_filesystem::FileType;
+        let ty = ops.stat().mode.file_type;
+        if ty == FileType::Fifo || ty == FileType::Socket {
+            ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+            return;
+        }
+    }
     const SEEK_DATA: u64 = 3;
     const SEEK_HOLE: u64 = 4;
     if offset >= 0 && (whence == SEEK_DATA || whence == SEEK_HOLE) {

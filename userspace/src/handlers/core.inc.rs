@@ -4098,6 +4098,32 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool) {
         }
     };
     let task = current_task_id();
+    // Positioned I/O on a pipe/FIFO/socket is -ESPIPE:
+    // `fs/read_write.c::ksys_pread64` starts from `ret = -ESPIPE` and only
+    // proceeds when the file has FMODE_PREAD/FMODE_PWRITE, which streams
+    // never get. Consuming pipe bytes "at an offset" (the old behaviour)
+    // silently corrupted the stream position. pos == -1 is exempt: the
+    // preadv2/pwritev2 entry points route it to plain readv/writev
+    // (`fs/read_write.c::SYSCALL_DEFINE6(preadv2)`), which pipes support.
+    if off != u64::MAX {
+        let seekless = fd::with_table(task, |t| {
+            t.get(fd).map(|e| {
+                let ty = e.ops.stat().mode.file_type;
+                ty == narf_filesystem::FileType::Fifo || ty == narf_filesystem::FileType::Socket
+            })
+        });
+        match seekless {
+            Some(Some(true)) => {
+                ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+                return;
+            }
+            Some(None) => {
+                ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+                return;
+            }
+            _ => {}
+        }
+    }
     let mut total = 0usize;
     for i in 0..iovcnt {
         let o = i * 16;
@@ -6429,6 +6455,56 @@ pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn own_stack_block(_ctx: &mut dyn TrapContext) {
     unreachable!("own-stack is not supported on non-x86_64 architectures");
+}
+
+/// Park the current task on net-I/O readiness (with the ~1ms timer-wheel
+/// backstop) and RIP-rewind so the in-flight syscall RE-EXECUTES with its
+/// original arguments on resume. This is the shared park shape of a blocking
+/// `read(2)` on an empty pipe/socket and a blocking `write(2)` on a full one
+/// (see sys_read / sys_write for the origin story of each field): a peer's
+/// write/read bumps the readiness generation and wakes the task promptly,
+/// the deadline is only a backstop.
+///
+/// Returns `true` when the task parked — the caller must `return` WITHOUT
+/// setting a return value (the syscall has not completed; it will re-run).
+/// Returns `false` when there is no executor (kernel-test context) and the
+/// caller must fall back to a synchronous result.
+pub(crate) fn park_reexecute_on_io(ctx: &mut dyn TrapContext) -> bool {
+    use core::sync::atomic::Ordering;
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
+        let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
+        // Rewind past the 2-byte `syscall`/`int 0x80` instruction so
+        // re-entry re-runs this syscall with its original args.
+        let resume_rip = ctx.rip().wrapping_sub(2);
+        ctx.set_rip(resume_rip);
+        // SAFETY: `uctx` is the live per-task UserTaskCtx from
+        // current_user_task(); we hold the only reference while setting the
+        // deadline + saving the RIP-rewound CPU state before the yield hook
+        // hands the task to the executor.
+        unsafe {
+            let uc = &*uctx;
+            uc.sleep_deadline_ns.store(dl, Ordering::Release);
+            // Clear a stale futex_uaddr so this park can't mis-route into
+            // the futex branch; snapshot the readiness generation for the
+            // check→park lost-wake guard.
+            uc.futex_uaddr.store(0, Ordering::Release);
+            uc.net_io_wait.store(true, Ordering::Release);
+            uc.epoll_park_gen
+                .store(narf_net::readiness::generation(), Ordering::Release);
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return true;
+            }
+            hook(uctx);
+        }
+        // unreachable — hook() longjmps to the executor
+    }
+    false
 }
 
 /// Encode a `siginfo_t` (128 bytes, x86_64/aarch64 layout) describing a

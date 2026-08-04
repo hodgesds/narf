@@ -24,6 +24,20 @@ pub(crate) fn sys_pread64(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-9i64) as u64));
         return;
     }
+    // pread(2) on a pipe/FIFO/socket is -ESPIPE: `fs/read_write.c::
+    // ksys_pread64` starts from `ret = -ESPIPE` and only proceeds when the
+    // file has FMODE_PREAD, which streams never get. The old path CONSUMED
+    // pipe bytes "at an offset".
+    let seekless = fd::with_table(task, |t| {
+        t.get(fd).map(|e| {
+            let ty = e.ops.stat().mode.file_type;
+            ty == narf_filesystem::FileType::Fifo || ty == narf_filesystem::FileType::Socket
+        })
+    });
+    if seekless == Some(Some(true)) {
+        ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+        return;
+    }
     let mut kbuf = alloc::vec![0u8; len];
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;

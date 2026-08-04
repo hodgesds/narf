@@ -57,6 +57,32 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
         }
     };
 
+    // `fs/read_write.c::generic_file_rw_checks` ("Don't copy dirs, pipes,
+    // sockets..."): copy_file_range(2) is defined only between REGULAR
+    // files — a directory on either side is EISDIR, anything else
+    // non-regular (pipe, FIFO, socket, device) is EINVAL. This check is
+    // load-bearing for pipes: without it the fallback loop below read a
+    // transiently-empty pipe as 0 bytes and reported instant EOF, which is
+    // how GNU coreutils ≥ 9 `cat` (whose copy_cat path fires whenever
+    // `S_ISREG(fstat(stdin))`) silently truncated a pipe to zero bytes —
+    // the Fedora Xwayland→xkbcomp keymap loss. On Linux, cat never sees a
+    // regular-file pipe; if it did, EINVAL here makes it fall back to its
+    // read/write loop, which parks correctly on an empty-but-open pipe.
+    const EISDIR: i64 = -21;
+    let in_ty = in_ops.stat().mode.file_type;
+    let out_ty = out_ops.stat().mode.file_type;
+    {
+        use narf_filesystem::FileType;
+        if in_ty == FileType::Dir || out_ty == FileType::Dir {
+            ctx.set_return(SyscallReturn::ok(EISDIR as u64));
+            return;
+        }
+        if in_ty != FileType::File || out_ty != FileType::File {
+            ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+            return;
+        }
+    }
+
     match poll_blocking(in_ops.copy_file_range_to(cur_in, &*out_ops, cur_out, len as u64, flags)) {
         Some(Ok(n)) => {
             cur_in = cur_in.saturating_add(n);

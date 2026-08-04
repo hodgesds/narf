@@ -28,6 +28,18 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-9i64) as u64));
         return;
     }
+    // pwrite(2) on a pipe/FIFO/socket is -ESPIPE (`fs/read_write.c::
+    // ksys_pwrite64` — no FMODE_PWRITE on streams).
+    let seekless = fd::with_table(task, |t| {
+        t.get(fd).map(|e| {
+            let ty = e.ops.stat().mode.file_type;
+            ty == narf_filesystem::FileType::Fifo || ty == narf_filesystem::FileType::Socket
+        })
+    });
+    if seekless == Some(Some(true)) {
+        ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+        return;
+    }
     let outcome = fd::with_table(task, |t| {
         let entry = t
             .get(fd)

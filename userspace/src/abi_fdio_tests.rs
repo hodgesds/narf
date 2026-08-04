@@ -799,6 +799,657 @@ fn smoke_abi_fdio_pipe2_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe2_neg);
 
+/// pipe2(2) flag validation — `fs/pipe.c::do_pipe2`: any flag outside
+/// O_CLOEXEC | O_NONBLOCK | O_DIRECT | O_NOTIFICATION_PIPE is -EINVAL.
+/// LINUX-GAP: NARF also rejects O_DIRECT (packet mode unimplemented) with
+/// -EINVAL, where Linux would accept it.
+fn smoke_abi_fdio_pipe2_bad_flags_neg() -> TestResult {
+    with_setup(|| {
+        let mut buf = [0u8; 8];
+        // O_APPEND is not a pipe2 flag → -EINVAL.
+        const O_APPEND: u64 = 0o2000;
+        if call(Syscall::Pipe2.raw(), a1(buf.as_mut_ptr() as u64, O_APPEND)) != Some(EINVAL) {
+            return Err("pipe2(O_APPEND) was not -EINVAL");
+        }
+        // O_DIRECT (packet mode): unimplemented → -EINVAL (LINUX-GAP above).
+        const O_DIRECT: u64 = 0o40000;
+        if call(Syscall::Pipe2.raw(), a1(buf.as_mut_ptr() as u64, O_DIRECT)) != Some(EINVAL) {
+            return Err("pipe2(O_DIRECT) was not -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe2_bad_flags_neg);
+
+/// pipe2(O_NONBLOCK) must land O_NONBLOCK on both descriptors: a read on
+/// the empty pipe is -EAGAIN (not a blocking park, and NOT a spurious 0 =
+/// EOF), and F_GETFL reports the flag plus the access mode
+/// (`fs/pipe.c::create_pipe_files`: read end O_RDONLY, write end O_WRONLY).
+fn smoke_abi_fdio_pipe2_nonblock_pos() -> TestResult {
+    with_setup(|| {
+        const O_NONBLOCK: i64 = 0o4000;
+        const O_WRONLY: i64 = 0o1;
+        const F_GETFL: u64 = 3;
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(buf.as_mut_ptr() as u64, O_NONBLOCK as u64),
+        ) != Some(0)
+        {
+            return Err("pipe2(O_NONBLOCK) failed");
+        }
+        let rd = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+        let wr = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
+        // Empty pipe + open writer + O_NONBLOCK → -EAGAIN (fs/pipe.c::
+        // pipe_read: "if (filp->f_flags & O_NONBLOCK) { ret = -EAGAIN; }").
+        let mut b = [0u8; 4];
+        if call(Syscall::Read.raw(), a2(rd, b.as_mut_ptr() as u64, 4)) != Some(EAGAIN) {
+            return Err("nonblocking read of empty pipe was not -EAGAIN");
+        }
+        match call(Syscall::Fcntl.raw(), a2(wr, F_GETFL, 0)) {
+            Some(fl) if fl & O_NONBLOCK != 0 && fl & 0o3 == O_WRONLY => Ok(()),
+            _ => Err("F_GETFL on pipe write end lacks O_NONBLOCK|O_WRONLY"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe2_nonblock_pos);
+
+/// Both ends of an anonymous pipe fstat as a FIFO with zero size —
+/// `fs/pipe.c::create_pipe_files` (`S_IFIFO | S_IRUSR | S_IWUSR`), and
+/// pipefs never updates i_size. S_IFREG here sent GNU coreutils ≥ 9 `cat`
+/// down its copy_file_range path on a pipe stdin (the Fedora xkbcomp
+/// zero-byte keymap).
+fn smoke_abi_fdio_pipe_fstat_is_fifo_pos() -> TestResult {
+    with_setup(|| {
+        const S_IFMT: u32 = 0o170000;
+        const S_IFIFO: u32 = 0o010000;
+        let (rd, wr) = make_pipe()?;
+        // Queue bytes so a size-from-queue-length regression is visible.
+        let payload = b"sz";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("pipe write failed");
+        }
+        for fd in [rd, wr] {
+            let mut stat = [0u8; 256];
+            if call(
+                Syscall::Fstat.raw(),
+                a1(fd as u64, stat.as_mut_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("fstat on pipe fd failed");
+            }
+            // x86_64 struct stat: st_mode is the u32 at offset 24,
+            // st_size the i64 at offset 48.
+            let mode = u32::from_ne_bytes([stat[24], stat[25], stat[26], stat[27]]);
+            if mode & S_IFMT != S_IFIFO {
+                return Err("pipe fd does not fstat as S_IFIFO");
+            }
+            let size = i64::from_ne_bytes(stat[48..56].try_into().unwrap());
+            if size != 0 {
+                return Err("pipe fstat st_size was not 0");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_fstat_is_fifo_pos);
+
+/// lseek(2) on either pipe end is -ESPIPE — `fs/pipe.c`'s `pipefifo_fops`
+/// has no .llseek, so `fs/read_write.c::vfs_llseek` refuses (no
+/// FMODE_LSEEK). A "successful" pipe lseek let seek-probing callers
+/// believe a pipe had a movable file position.
+fn smoke_abi_fdio_pipe_lseek_espipe_neg() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_pipe()?;
+        // SEEK_CUR on the read end, SEEK_SET/SEEK_END on the write end.
+        if call(Syscall::Lseek.raw(), a2(rd as u64, 0, 1)) != Some(ESPIPE) {
+            return Err("lseek(pipe read end, SEEK_CUR) was not -ESPIPE");
+        }
+        if call(Syscall::Lseek.raw(), a2(wr as u64, 0, 0)) != Some(ESPIPE) {
+            return Err("lseek(pipe write end, SEEK_SET) was not -ESPIPE");
+        }
+        if call(Syscall::Lseek.raw(), a2(wr as u64, 0, 2)) != Some(ESPIPE) {
+            return Err("lseek(pipe write end, SEEK_END) was not -ESPIPE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_lseek_espipe_neg);
+
+/// Positioned I/O on a pipe is -ESPIPE — `fs/read_write.c::ksys_pread64`
+/// / `ksys_pwrite64` start from `ret = -ESPIPE` and only proceed with
+/// FMODE_PREAD/FMODE_PWRITE, which streams never get. The old handlers
+/// consumed pipe bytes "at an offset". Queued data must be untouched by
+/// the refusal.
+fn smoke_abi_fdio_pipe_pread_pwrite_espipe_neg() -> TestResult {
+    with_setup(|| {
+        const FIONREAD: u64 = 0x541B;
+        let (rd, wr) = make_pipe()?;
+        let payload = b"stays";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("pipe write failed");
+        }
+        let mut b = [0u8; 8];
+        if call(
+            Syscall::Pread64.raw(),
+            a3(rd as u64, b.as_mut_ptr() as u64, 4, 0),
+        ) != Some(ESPIPE)
+        {
+            return Err("pread64 on a pipe was not -ESPIPE");
+        }
+        if call(
+            Syscall::Pwrite64.raw(),
+            a3(wr as u64, b.as_ptr() as u64, 4, 0),
+        ) != Some(ESPIPE)
+        {
+            return Err("pwrite64 on a pipe was not -ESPIPE");
+        }
+        // preadv/pwritev share the check.
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(b.as_mut_ptr() as u64).to_le_bytes());
+        iov[8..].copy_from_slice(&(4u64).to_le_bytes());
+        if call(
+            Syscall::Preadv.raw(),
+            a3(rd as u64, iov.as_ptr() as u64, 1, 0),
+        ) != Some(ESPIPE)
+        {
+            return Err("preadv on a pipe was not -ESPIPE");
+        }
+        if call(
+            Syscall::Pwritev.raw(),
+            a3(wr as u64, iov.as_ptr() as u64, 1, 0),
+        ) != Some(ESPIPE)
+        {
+            return Err("pwritev on a pipe was not -ESPIPE");
+        }
+        // The refusals consumed nothing: all 5 bytes still queued.
+        let mut avail = 0i32;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(rd as u64, FIONREAD, (&mut avail as *mut i32) as u64),
+        ) != Some(0)
+            || avail != payload.len() as i32
+        {
+            return Err("ESPIPE refusal consumed pipe bytes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_pread_pwrite_espipe_neg);
+
+/// copy_file_range(2) is defined only between REGULAR files
+/// (`fs/read_write.c::generic_file_rw_checks`: "Don't copy dirs, pipes,
+/// sockets..." → -EINVAL). Accepting a pipe fd made the fallback loop
+/// read a transiently-empty pipe as instant EOF — how coreutils `cat`
+/// truncated the Xwayland→xkbcomp keymap to zero bytes.
+fn smoke_abi_fdio_copy_file_range_pipe_einval_neg() -> TestResult {
+    with_memfs("/abi", "abi", &[("src", b"payload"), ("dst", b"")], || {
+        let (rd, wr) = make_pipe()?;
+        let file = open_fd(b"/abi/dst\0")?;
+        let src = open_fd(b"/abi/src\0")?;
+        // Pipe read end as in-fd → -EINVAL (even with bytes queued).
+        let payload = b"queued";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("pipe write failed");
+        }
+        if call_raw(
+            Syscall::CopyFileRange.raw(),
+            SyscallArgs {
+                arg0: rd as u64,
+                arg1: 0,
+                arg2: file as u64,
+                arg3: 0,
+                arg4: 64,
+                ..Default::default()
+            },
+        )
+        .value as i64
+            != EINVAL
+        {
+            return Err("copy_file_range(pipe → file) was not -EINVAL");
+        }
+        // Pipe write end as out-fd → -EINVAL.
+        if call_raw(
+            Syscall::CopyFileRange.raw(),
+            SyscallArgs {
+                arg0: src as u64,
+                arg1: 0,
+                arg2: wr as u64,
+                arg3: 0,
+                arg4: 64,
+                ..Default::default()
+            },
+        )
+        .value as i64
+            != EINVAL
+        {
+            return Err("copy_file_range(file → pipe) was not -EINVAL");
+        }
+        // Positive control: regular file → regular file still copies.
+        match call_raw(
+            Syscall::CopyFileRange.raw(),
+            SyscallArgs {
+                arg0: src as u64,
+                arg1: 0,
+                arg2: file as u64,
+                arg3: 0,
+                arg4: 64,
+                ..Default::default()
+            },
+        )
+        .value as i64
+        {
+            7 => Ok(()),
+            _ => Err("copy_file_range(file → file) did not copy 7 bytes"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_copy_file_range_pipe_einval_neg
+);
+
+/// splice(2) argument shape — `fs/splice.c::__do_splice`: at least one fd
+/// must be a pipe (else -EINVAL) and an offset pointer for a pipe-side fd
+/// is -ESPIPE. An empty-but-open pipe source under SPLICE_F_NONBLOCK is
+/// -EAGAIN, never a transient-0 "EOF" (the lost-data shape).
+fn smoke_abi_fdio_splice_shape() -> TestResult {
+    with_memfs("/abi", "abi", &[("src", b"payload"), ("dst", b"")], || {
+        const SPLICE_F_NONBLOCK: u64 = 0x2;
+        let src = open_fd(b"/abi/src\0")?;
+        let dst = open_fd(b"/abi/dst\0")?;
+        let (rd, wr) = make_pipe()?;
+        let mk = |a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64| SyscallArgs {
+            arg0: a0,
+            arg1: a1,
+            arg2: a2,
+            arg3: a3,
+            arg4: a4,
+            arg5: a5,
+        };
+        // Neither side a pipe → -EINVAL.
+        if call(
+            Syscall::Splice.raw(),
+            mk(src as u64, 0, dst as u64, 0, 16, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("splice(file → file) was not -EINVAL");
+        }
+        // Offset pointer on the pipe side → -ESPIPE.
+        let off: u64 = 0;
+        if call(
+            Syscall::Splice.raw(),
+            mk(rd as u64, (&off as *const u64) as u64, dst as u64, 0, 16, 0),
+        ) != Some(ESPIPE)
+        {
+            return Err("splice(pipe with off_in) was not -ESPIPE");
+        }
+        // Empty pipe source, writer open, SPLICE_F_NONBLOCK → -EAGAIN.
+        if call(
+            Syscall::Splice.raw(),
+            mk(rd as u64, 0, dst as u64, 0, 16, SPLICE_F_NONBLOCK),
+        ) != Some(EAGAIN)
+        {
+            return Err("splice(empty pipe, NONBLOCK) was not -EAGAIN");
+        }
+        // Positive control: file → pipe still moves the bytes.
+        if call(
+            Syscall::Splice.raw(),
+            mk(src as u64, 0, wr as u64, 0, 64, 0),
+        ) != Some(7)
+        {
+            return Err("splice(file → pipe) did not move 7 bytes");
+        }
+        let mut b = [0u8; 16];
+        if call(
+            Syscall::Read.raw(),
+            a2(rd as u64, b.as_mut_ptr() as u64, 16),
+        ) != Some(7)
+            || &b[..7] != b"payload"
+        {
+            return Err("spliced bytes did not arrive in the pipe");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_splice_shape);
+
+/// Wrong-direction pipe access is -EBADF, not a silent no-op:
+/// `fs/read_write.c::vfs_read`/`vfs_write` fail the FMODE_READ /
+/// FMODE_WRITE check before the pipe op runs. The old Ok(0)s here turned
+/// "read the write end" into a fake EOF and "write the read end" into an
+/// infinite retry loop.
+fn smoke_abi_fdio_pipe_wrong_direction_ebadf_neg() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_pipe()?;
+        let mut b = [0u8; 4];
+        if call(Syscall::Read.raw(), a2(wr as u64, b.as_mut_ptr() as u64, 4)) != Some(EBADF) {
+            return Err("read on the pipe WRITE end was not -EBADF");
+        }
+        if call(Syscall::Write.raw(), a2(rd as u64, b.as_ptr() as u64, 4)) != Some(EBADF) {
+            return Err("write on the pipe READ end was not -EBADF");
+        }
+        // readv/writev share the vfs mode checks.
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(b.as_mut_ptr() as u64).to_le_bytes());
+        iov[8..].copy_from_slice(&(4u64).to_le_bytes());
+        if call(Syscall::Readv.raw(), a2(wr as u64, iov.as_ptr() as u64, 1)) != Some(EBADF) {
+            return Err("readv on the pipe WRITE end was not -EBADF");
+        }
+        if call(Syscall::Writev.raw(), a2(rd as u64, iov.as_ptr() as u64, 1)) != Some(EBADF) {
+            return Err("writev on the pipe READ end was not -EBADF");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_wrong_direction_ebadf_neg);
+
+/// POSIX PIPE_BUF atomicity — `fs/pipe.c::pipe_write`: a write of ≤ 4096
+/// bytes is all-or-nothing. Against a pipe with insufficient room it
+/// writes NOTHING and (under O_NONBLOCK) returns -EAGAIN; only writes
+/// larger than PIPE_BUF may land a partial prefix.
+fn smoke_abi_fdio_pipe_buf_atomicity() -> TestResult {
+    with_setup(|| {
+        const O_NONBLOCK: u64 = 0o4000;
+        const FIONREAD: u64 = 0x541B;
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(buf.as_mut_ptr() as u64, O_NONBLOCK),
+        ) != Some(0)
+        {
+            return Err("pipe2(O_NONBLOCK) failed");
+        }
+        let rd = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+        let wr = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
+        // Fill the pipe to capacity (64 KiB) with 4 KiB atomic chunks.
+        let chunk = [0x5Au8; 4096];
+        for _ in 0..16 {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr, chunk.as_ptr() as u64, chunk.len() as u64),
+            ) != Some(chunk.len() as i64)
+            {
+                return Err("filling the pipe did not take a full 4 KiB chunk");
+            }
+        }
+        // Full: a further nonblocking write of any size is -EAGAIN.
+        if call(Syscall::Write.raw(), a2(wr, chunk.as_ptr() as u64, 100)) != Some(EAGAIN) {
+            return Err("write to a full pipe was not -EAGAIN");
+        }
+        // Drain 50 bytes → 50 bytes of room.
+        let mut small = [0u8; 50];
+        if call(Syscall::Read.raw(), a2(rd, small.as_mut_ptr() as u64, 50)) != Some(50) {
+            return Err("draining 50 bytes failed");
+        }
+        // 100 ≤ PIPE_BUF with only 50 bytes of room: ATOMIC → -EAGAIN,
+        // not a 50-byte partial. (This is the arm the old truncating
+        // write failed.)
+        if call(Syscall::Write.raw(), a2(wr, chunk.as_ptr() as u64, 100)) != Some(EAGAIN) {
+            return Err("short-room write of ≤ PIPE_BUF was split, not atomic");
+        }
+        // FIONREAD confirms the atomic refusal wrote nothing.
+        let mut avail = 0i32;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(rd, FIONREAD, (&mut avail as *mut i32) as u64),
+        ) != Some(0)
+            || avail != 65536 - 50
+        {
+            return Err("atomic refusal still queued bytes");
+        }
+        // A > PIPE_BUF write MAY be partial: 8192 into 50 bytes of room
+        // lands exactly the 50-byte prefix (fs/pipe.c: only "atomic" for
+        // small writes).
+        let big = [0xA5u8; 8192];
+        if call(
+            Syscall::Write.raw(),
+            a2(wr, big.as_ptr() as u64, big.len() as u64),
+        ) != Some(50)
+        {
+            return Err("> PIPE_BUF write did not land the partial prefix");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_buf_atomicity);
+
+/// readv(2) on an open-but-empty O_NONBLOCK pipe is -EAGAIN — Linux
+/// `do_readv` ends in the same `pipe_read` as read(2), whose ONLY 0
+/// return is "no writers left". The old handler returned the transient 0
+/// as EOF, which ended every musl stdio stream (`__stdio_read` uses
+/// readv) at the first empty moment of a pipe.
+fn smoke_abi_fdio_pipe_readv_empty_eagain() -> TestResult {
+    with_setup(|| {
+        const O_NONBLOCK: u64 = 0o4000;
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(buf.as_mut_ptr() as u64, O_NONBLOCK),
+        ) != Some(0)
+        {
+            return Err("pipe2(O_NONBLOCK) failed");
+        }
+        let rd = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+        let wr = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
+        let mut dst = [0u8; 8];
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
+        iov[8..].copy_from_slice(&(dst.len() as u64).to_le_bytes());
+        // Empty + writer open + O_NONBLOCK → -EAGAIN, not 0.
+        if call(Syscall::Readv.raw(), a2(rd, iov.as_ptr() as u64, 1)) != Some(EAGAIN) {
+            return Err("readv of empty nonblocking pipe was not -EAGAIN");
+        }
+        // With data queued the same readv returns it.
+        let payload = b"iovec";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("pipe write failed");
+        }
+        if call(Syscall::Readv.raw(), a2(rd, iov.as_ptr() as u64, 1)) != Some(payload.len() as i64)
+        {
+            return Err("readv did not return the queued bytes");
+        }
+        if &dst[..payload.len()] != payload {
+            return Err("readv copied back the wrong bytes");
+        }
+        // Writer closed + empty → genuine EOF (0).
+        if call(Syscall::Close.raw(), a0(wr)) != Some(0) {
+            return Err("closing writer failed");
+        }
+        if call(Syscall::Readv.raw(), a2(rd, iov.as_ptr() as u64, 1)) != Some(0) {
+            return Err("readv after last-writer close was not EOF");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_readv_empty_eagain);
+
+/// writev(2) into a pipe with no readers is SIGPIPE + -EPIPE
+/// (`fs/pipe.c::pipe_write`), exactly like write(2) — the old handler
+/// answered a bare -EPERM and skipped the signal. A full O_NONBLOCK pipe
+/// is -EAGAIN, not a 0 count that stdio flush loops spin on.
+fn smoke_abi_fdio_pipe_writev_epipe_eagain() -> TestResult {
+    with_setup(|| {
+        const O_NONBLOCK: u64 = 0o4000;
+        // Arm 1: closed reader → -EPIPE.
+        let (rd, wr) = make_pipe()?;
+        if call(Syscall::Close.raw(), a0(rd as u64)) != Some(0) {
+            return Err("closing reader failed");
+        }
+        let payload = b"gone";
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_le_bytes());
+        iov[8..].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        if call(Syscall::Writev.raw(), a2(wr as u64, iov.as_ptr() as u64, 1)) != Some(EPIPE) {
+            return Err("writev with no pipe readers was not -EPIPE");
+        }
+        // Arm 2: full nonblocking pipe → -EAGAIN.
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(buf.as_mut_ptr() as u64, O_NONBLOCK),
+        ) != Some(0)
+        {
+            return Err("pipe2(O_NONBLOCK) failed");
+        }
+        let wr2 = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
+        let chunk = [0u8; 4096];
+        for _ in 0..16 {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr2, chunk.as_ptr() as u64, chunk.len() as u64),
+            ) != Some(chunk.len() as i64)
+            {
+                return Err("filling the pipe failed");
+            }
+        }
+        if call(Syscall::Writev.raw(), a2(wr2, iov.as_ptr() as u64, 1)) != Some(EAGAIN) {
+            return Err("writev into a full nonblocking pipe was not -EAGAIN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_writev_epipe_eagain);
+
+/// poll(2) readiness masks match `fs/pipe.c::pipe_poll`: the read end
+/// reports EPOLLIN only while data is queued and EPOLLHUP once the
+/// writers are gone; the write end reports EPOLLOUT while there is room
+/// and EPOLLERR once the readers are gone.
+fn smoke_abi_fdio_pipe_poll_hup_err() -> TestResult {
+    with_setup(|| {
+        const POLLIN: i16 = 0x001;
+        const POLLOUT: i16 = 0x004;
+        const POLLERR: i16 = 0x008;
+        const POLLHUP: i16 = 0x010;
+        // pollfd { fd: i32, events: i16, revents: i16 }
+        fn poll1(fd: u32, events: i16) -> Result<i16, &'static str> {
+            let mut pfd = [0u8; 8];
+            pfd[..4].copy_from_slice(&(fd as i32).to_ne_bytes());
+            pfd[4..6].copy_from_slice(&events.to_ne_bytes());
+            let r = call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0));
+            match r {
+                Some(n) if n >= 0 => Ok(i16::from_ne_bytes([pfd[6], pfd[7]])),
+                _ => Err("poll failed"),
+            }
+        }
+        let (rd, wr) = make_pipe()?;
+        // Empty pipe, writer open: no POLLIN, no POLLHUP.
+        if poll1(rd, POLLIN)? != 0 {
+            return Err("empty pipe with open writer reported readiness");
+        }
+        // Data queued: POLLIN.
+        let payload = b"p";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, payload.as_ptr() as u64, 1),
+        ) != Some(1)
+        {
+            return Err("pipe write failed");
+        }
+        if poll1(rd, POLLIN)? & POLLIN == 0 {
+            return Err("pipe with data did not report POLLIN");
+        }
+        // Writer closed, data still queued: POLLIN | POLLHUP.
+        if call(Syscall::Close.raw(), a0(wr as u64)) != Some(0) {
+            return Err("closing writer failed");
+        }
+        let rev = poll1(rd, POLLIN)?;
+        if rev & POLLIN == 0 || rev & POLLHUP == 0 {
+            return Err("EOF'd pipe with residual data was not POLLIN|POLLHUP");
+        }
+        // Drained: POLLHUP only (POLLIN must drop — HUP is reported even
+        // though the caller only asked for POLLIN).
+        let mut b = [0u8; 4];
+        if call(Syscall::Read.raw(), a2(rd as u64, b.as_mut_ptr() as u64, 4)) != Some(1) {
+            return Err("draining the last byte failed");
+        }
+        let rev = poll1(rd, POLLIN)?;
+        if rev & POLLHUP == 0 || rev & POLLIN != 0 {
+            return Err("drained EOF'd pipe was not bare POLLHUP");
+        }
+        // Fresh pair: write end with the reader closed → POLLOUT | POLLERR.
+        let (rd2, wr2) = make_pipe()?;
+        if poll1(wr2, POLLOUT)? != POLLOUT {
+            return Err("writable pipe was not bare POLLOUT");
+        }
+        if call(Syscall::Close.raw(), a0(rd2 as u64)) != Some(0) {
+            return Err("closing reader failed");
+        }
+        let rev = poll1(wr2, POLLOUT)?;
+        if rev & POLLERR == 0 {
+            return Err("reader-less pipe write end did not report POLLERR");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_poll_hup_err);
+
+/// dup2(2) shares the open file description — the duplicate carries the
+/// description's status flags (O_NONBLOCK) and file offset
+/// (`fs/file.c::do_dup2`: both fds point at the same `struct file`).
+/// LINUX-GAP: NARF snapshots these at dup time rather than aliasing them.
+fn smoke_abi_fdio_dup2_carries_description_pos() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        const O_NONBLOCK: i64 = 0o4000;
+        const F_GETFL: u64 = 3;
+        // Status flags: an O_NONBLOCK pipe end dup2'd keeps O_NONBLOCK.
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(buf.as_mut_ptr() as u64, O_NONBLOCK as u64),
+        ) != Some(0)
+        {
+            return Err("pipe2(O_NONBLOCK) failed");
+        }
+        let wr = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
+        if call_dup2(wr, 20) != Some(20) {
+            return Err("dup2 failed");
+        }
+        match call(Syscall::Fcntl.raw(), a2(20, F_GETFL, 0)) {
+            Some(fl) if fl & O_NONBLOCK != 0 => {}
+            _ => return Err("dup2 dropped O_NONBLOCK from the duplicate"),
+        }
+        // File offset: read 2 bytes, dup, and the duplicate continues at
+        // offset 2 rather than rewinding to 0.
+        let fd = open_fd(b"/abi/f\0")?;
+        let mut b2 = [0u8; 2];
+        if call(
+            Syscall::Read.raw(),
+            a2(fd as u64, b2.as_mut_ptr() as u64, 2),
+        ) != Some(2)
+        {
+            return Err("priming read failed");
+        }
+        if call_dup2(fd as u64, 21) != Some(21) {
+            return Err("dup2 of file fd failed");
+        }
+        if call(Syscall::Read.raw(), a2(21, b2.as_mut_ptr() as u64, 2)) != Some(2) {
+            return Err("read via duplicate failed");
+        }
+        if &b2 != b"cd" {
+            return Err("duplicate rewound to offset 0 instead of sharing it");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_dup2_carries_description_pos);
+
 // ── eventfd ────────────────────────────────────────────────────────
 //
 // Always succeeds (installs a fresh fd). No reachable error path from
