@@ -266,12 +266,32 @@ mod stall_wd {
             let mut stranded = narf_userspace::task::dbg_stranded_wakes();
             // A glib main loop parks in ppoll, not epoll_wait, so the
             // epoll-only view above cannot see the compositor at all.
-            for (tid, pid, fd, revents, checks) in narf_userspace::task::dbg_stranded_poll_waiters()
+            for (tid, pid, fd, revents, checks, deadline, netio, waitchild, stopped) in
+                narf_userspace::task::dbg_stranded_poll_waiters()
             {
                 let _ = writeln!(
                     TrapWriter,
-                    "STALL-WD poll-stranded tid={tid} pid={pid} fd={fd} revents={revents:#x} park_checks={checks}"
+                    "STALL-WD poll-stranded tid={tid} pid={pid} fd={fd} revents={revents:#x} park_checks={checks} deadline={deadline:#x} netio={netio} waitchild={waitchild} stopped={stopped}"
                 );
+                // Scheduler-side half of the verdict. `awake` says whether
+                // the wake actually reached the slot; `rounds` says whether
+                // the CPU that owns it is still iterating. Sampled twice a
+                // second apart so a flat round counter is visible as flat
+                // rather than inferred from one reading.
+                match narf_scheduler::dbg_slot_state(tid) {
+                    Some((awake, home, rounds, qlen)) => {
+                        let _ = writeln!(
+                            TrapWriter,
+                            "STALL-WD   slot tid={tid} awake={awake} home_cpu={home} rounds={rounds} qlen={qlen}"
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(
+                            TrapWriter,
+                            "STALL-WD   slot tid={tid} NOT QUEUED — no ready-queue slot owns this task"
+                        );
+                    }
+                }
                 stranded.push((tid, pid, fd as u32));
             }
             let signature = stranded.iter().fold(0u64, |acc, (tid, _, epfd)| {

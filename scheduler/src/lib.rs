@@ -2533,6 +2533,13 @@ pub fn run_until_empty() {
         // still run on the all-parked branch below (every idle cycle, i.e.
         // once per request/response since the loop idles between them), plus
         // a ~1 ms forced fallback so a perpetual self-waker can't starve them.
+        // One tick per executor round on this CPU. A parked task whose wake
+        // landed but never ran is ambiguous without this: it distinguishes
+        // "this CPU is looping and skipping the slot" from "this CPU stopped
+        // iterating entirely", which are different bugs. Diagnostic only.
+        if cpu < narf_lib::percpu::MAX_CPUS {
+            EXEC_ROUNDS[cpu].fetch_add(1, Ordering::Relaxed);
+        }
         let any_runnable = {
             let q = READY[cpu].lock();
             q.as_ref()
@@ -2914,6 +2921,52 @@ pub fn runnable_task_count() -> usize {
 /// - `!halted && awake > 0` ⇒ the CPU is spinning but not polling — a
 ///   data-path/lock issue keeping it off the poll, OR a busy-loop bug.
 /// - `locked`               ⇒ a holder is stuck inside the queue lock.
+/// Executor rounds completed per CPU. See the increment site.
+static EXEC_ROUNDS: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Rounds this CPU's executor loop has run.
+pub fn dbg_exec_rounds(cpu: usize) -> u64 {
+    if cpu >= narf_lib::percpu::MAX_CPUS {
+        return 0;
+    }
+    EXEC_ROUNDS[cpu].load(Ordering::Relaxed)
+}
+
+/// Scheduler-side state of the slot owning `task_id`, if it is queued:
+/// `(awake_flag, home_cpu, rounds_on_that_cpu, queue_len)`.
+///
+/// A parked task that has been woken but never re-polled leaves a specific
+/// fingerprint here. `awake == true` says the wake reached the slot, so
+/// the readiness and waker layers did their job; if the home CPU's round
+/// counter is ALSO advancing, the executor is iterating and skipping the
+/// slot; if it is flat, that CPU has stopped running rounds and every task
+/// homed on it is stranded regardless of its own state.
+pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize)> {
+    for cpu in 0..narf_lib::percpu::MAX_CPUS {
+        if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
+            continue;
+        }
+        // try_lock: this runs from a timer tick, and blocking on a queue
+        // lock held by the very CPU under investigation would deadlock the
+        // reporter.
+        let Some(g) = READY[cpu].try_lock() else {
+            continue;
+        };
+        let Some(d) = g.as_ref() else { continue };
+        if let Some(slot) = d.iter().find(|s| s.id.raw() == task_id) {
+            let home = slot.awake.cpu.load(Ordering::Relaxed);
+            return Some((
+                slot.awake.flag.load(Ordering::Acquire),
+                home,
+                dbg_exec_rounds(home as usize),
+                d.len(),
+            ));
+        }
+    }
+    None
+}
+
 pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool) {
     if cpu >= narf_lib::percpu::MAX_CPUS {
         return (0, 0, false, false);
