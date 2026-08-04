@@ -2942,7 +2942,7 @@ pub fn dbg_exec_rounds(cpu: usize) -> u64 {
 /// counter is ALSO advancing, the executor is iterating and skipping the
 /// slot; if it is flat, that CPU has stopped running rounds and every task
 /// homed on it is stranded regardless of its own state.
-pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize)> {
+pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, bool)> {
     for cpu in 0..narf_lib::percpu::MAX_CPUS {
         if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
             continue;
@@ -2956,11 +2956,20 @@ pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize)> {
         let Some(d) = g.as_ref() else { continue };
         if let Some(slot) = d.iter().find(|s| s.id.raw() == task_id) {
             let home = slot.awake.cpu.load(Ordering::Relaxed);
+            let allowed = slot.spec.affinity.allowed;
+            // `run_until_empty` pops a slot, and BEFORE consuming its awake
+            // flag re-queues it when its affinity excludes the CPU it is
+            // queued on. If that holds, the slot bounces on this queue
+            // forever with `awake` never cleared — so report whether this
+            // queue's CPU is even permitted to run it.
             return Some((
                 slot.awake.flag.load(Ordering::Acquire),
                 home,
                 dbg_exec_rounds(home as usize),
                 d.len(),
+                allowed.bits(),
+                cpu as u32,
+                allowed.contains(CpuId(cpu as u32)),
             ));
         }
     }
