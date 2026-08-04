@@ -502,14 +502,33 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         };
         let subtype = fstype.strip_prefix("fuse.").unwrap_or("fuse");
         let fs = alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseFs::new(subtype, conn));
-        // A mount is not usable until FUSE_INIT has negotiated a compatible
-        // protocol. Do not publish a half-initialized filesystem when the
-        // daemon rejects INIT, sends a malformed reply, disconnects, or never
-        // replies before the bounded synchronous bridge expires.
-        if !matches!(poll_blocking(fs.init()), Some(Ok(_))) {
-            ctx.set_return(einval);
-            return;
-        }
+        // FUSE_INIT is driven in the BACKGROUND, and the mount is published
+        // without waiting for it — this is what Linux does.
+        // `fuse_fill_super` calls `fuse_send_init()`, which submits INIT via
+        // `fuse_simple_background()` and returns; `process_init_reply()`
+        // later sets `fc->initialized` from the reply callback
+        // (`fs/fuse/inode.c`).
+        //
+        // Awaiting INIT inline here deadlocked every real mount. The only
+        // process that can answer FUSE_INIT is the daemon, and a daemon
+        // that issues mount(2) from the same thread it services /dev/fuse
+        // on — which libfuse's `fuse_mount` does — is sitting inside THIS
+        // syscall. Nobody reads the request, the bounded synchronous bridge
+        // expires, and the mount fails: xdg-document-portal's
+        // "fuse init failed: Can't mount path /run/narf-plasma/doc" on
+        // every Fedora Plasma boot, after which it span on the descriptors
+        // it had staged for the mount and burned a core through session
+        // startup.
+        //
+        // `init()`'s own doc says it must be awaited CONCURRENTLY with the
+        // daemon; a spawned task is what makes that true. INIT is enqueued
+        // ahead of any later request, so the daemon still negotiates before
+        // it serves traffic, and a failed negotiation leaves the connection
+        // uninitialized exactly as an aborted Linux connection would.
+        let init_fs = alloc::sync::Arc::clone(&fs);
+        narf_scheduler::spawn(async move {
+            let _ = init_fs.init().await;
+        });
         let fs_dyn: alloc::sync::Arc<dyn narf_filesystem::FsInstance> = fs;
         return match current_mount_arc(&auth, target.as_str(), fs_dyn) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
