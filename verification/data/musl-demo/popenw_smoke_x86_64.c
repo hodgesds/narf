@@ -33,6 +33,7 @@
 // Build: see REGEN_popenw_smoke.sh (musl-gcc, PIE).
 #define _GNU_SOURCE 1
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -198,7 +199,155 @@ static int stdio_round(size_t len) {
     return reap(c, "stdio");
 }
 
-int main(void) {
+// ── The child EXECs before it reads ───────────────────────────────────
+//
+// Everything above forks a consumer that reads the pipe directly. The real
+// X server path does NOT: XkbDDXCompileKeymapByNames runs
+// `Popen(cmd, "w")`, whose child execs `/bin/sh -c "xkbcomp ..."`, so the
+// keymap has to survive the child's execve(2) — twice, since the shell then
+// execs xkbcomp. Nothing here covered that, and it is where NARF loses the
+// data: xkbcomp read a ZERO-byte keymap ("XKBCOMP-CAPTURE ... bytes=0"),
+// which is what kills Xwayland's virtual core keyboard.
+//
+// The dup2'd read end must survive exec: fd 0 is not close-on-exec, and the
+// bytes the parent wrote before (or after) the exec must still be readable
+// by the newly-exec'd image.
+static char self_path[512];
+
+// `--drain N`: read stdin to EOF, verify the payload pattern and that
+// exactly N bytes arrived. This runs as a FRESH exec of this binary.
+static int drain_main(const char *expect_s) {
+    size_t expect = (size_t) atol(expect_s);
+    size_t got = 0;
+    unsigned char buf[4096];
+    for (;;) {
+        ssize_t r = read(STDIN_FILENO, buf, sizeof buf);
+        if (r == 0) {
+            break;
+        }
+        if (r < 0) {
+            return 42;
+        }
+        for (ssize_t i = 0; i < r; i++) {
+            if ((char) buf[i] != payload_byte(got + (size_t) i)) {
+                return 44;
+            }
+        }
+        got += (size_t) r;
+    }
+    if (got == 0 && expect != 0) {
+        return 43; // the live failure: EOF with nothing read
+    }
+    return got == expect ? 0 : 45;
+}
+
+// via_shell mirrors X's Popen exactly (`/bin/sh -c`); the direct arm isolates
+// whether a plain execve already loses the pipe, so a failure names the layer.
+static int exec_round(size_t len, int via_shell, const char *label) {
+    // Decide BEFORE opening the pipe. If the exec target is missing, the
+    // child exits without ever reading, and a parent that has already
+    // committed to writing a payload larger than the pipe buffer blocks
+    // against a reader that will never arrive.
+    if (via_shell && access("/bin/sh", X_OK) != 0) {
+        w("popenw-skip: no /bin/sh for the shell arm (");
+        w(label);
+        w(")\n");
+        return 1;
+    }
+    if (self_path[0] == 0) {
+        w("popenw-skip: self path unknown (");
+        w(label);
+        w(")\n");
+        return 1;
+    }
+    int p[2];
+    if (pipe(p) != 0) {
+        w("popenw-fail: exec pipe\n");
+        return 0;
+    }
+    char expect[32];
+    snprintf(expect, sizeof expect, "%zu", len);
+    pid_t c = fork();
+    if (c < 0) {
+        w("popenw-fail: exec fork\n");
+        return 0;
+    }
+    if (c == 0) {
+        close(p[1]); // drop the inherited writer, as Popen("w") does
+        if (dup2(p[0], STDIN_FILENO) < 0) {
+            _exit(90);
+        }
+        close(p[0]);
+        if (via_shell) {
+            char cmd[640];
+            snprintf(cmd, sizeof cmd, "exec '%s' --drain %s", self_path, expect);
+            execl("/bin/sh", "sh", "-c", cmd, (char *) 0);
+        } else {
+            execl(self_path, "popenw", "--drain", expect, (char *) 0);
+        }
+        _exit(91); // exec itself failed
+    }
+    close(p[0]);
+    size_t sent = 0;
+    char chunk[4096];
+    while (sent < len) {
+        size_t n = len - sent;
+        if (n > sizeof chunk) {
+            n = sizeof chunk;
+        }
+        for (size_t i = 0; i < n; i++) {
+            chunk[i] = payload_byte(sent + i);
+        }
+        ssize_t r = write(p[1], chunk, n);
+        if (r <= 0) {
+            w("popenw-fail: exec write ");
+            w(label);
+            w("\n");
+            close(p[1]);
+            waitpid(c, NULL, 0);
+            return 0;
+        }
+        sent += (size_t) r;
+    }
+    close(p[1]);
+    int st = 0;
+    if (waitpid(c, &st, 0) != c) {
+        w("popenw-fail: exec waitpid\n");
+        return 0;
+    }
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 91) {
+        // No shell (or no self path) in this image: report and skip rather
+        // than fail, so a missing /bin/sh never masquerades as a pipe bug.
+        w("popenw-skip: exec unavailable (");
+        w(label);
+        w(")\n");
+        return 1;
+    }
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 43) {
+            w("popenw-fail: exec'd consumer read ZERO bytes (");
+            w(label);
+            w(") — pipe data did not survive execve\n");
+        } else {
+            w("popenw-fail: exec'd consumer status (");
+            w(label);
+            w(")\n");
+        }
+        return 0;
+    }
+    return 1;
+}
+
+int main(int argc, char **argv) {
+    if (argc >= 3 && strcmp(argv[1], "--drain") == 0) {
+        return drain_main(argv[2]);
+    }
+    ssize_t n = readlink("/proc/self/exe", self_path, sizeof self_path - 1);
+    if (n > 0) {
+        self_path[n] = 0;
+    } else if (argc >= 1) {
+        snprintf(self_path, sizeof self_path, "%s", argv[0]);
+    }
     if (!raw_round(SMALL_LEN, 1, "delayed-small")) {
         return 1;
     }
@@ -206,6 +355,19 @@ int main(void) {
         return 1;
     }
     if (!stdio_round(LARGE_LEN)) {
+        return 1;
+    }
+    // The X shape: the consumer only exists after execve.
+    if (!exec_round(SMALL_LEN, 0, "exec-direct-small")) {
+        return 1;
+    }
+    if (!exec_round(LARGE_LEN, 0, "exec-direct-large")) {
+        return 1;
+    }
+    if (!exec_round(SMALL_LEN, 1, "exec-shell-small")) {
+        return 1;
+    }
+    if (!exec_round(LARGE_LEN, 1, "exec-shell-large")) {
         return 1;
     }
     w("popenw-ok\n");
