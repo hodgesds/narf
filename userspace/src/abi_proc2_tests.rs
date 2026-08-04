@@ -320,7 +320,9 @@ fn smoke_abi_proc2_waitid_ppid_no_child() -> TestResult {
     with_setup(|| {
         // waitid(P_PID, <pid>, infop, WNOHANG) with no matching child takes
         // the P_PID translation arm (want_pid = id, not -1) and then the
-        // WNOHANG no-child success → 0. The base file only drives P_ALL.
+        // no-eligible-child gate → -ECHILD. The base file only drives P_ALL.
+        // Linux: kernel/exit.c __do_wait leaves notask_error at -ECHILD when
+        // the requested pid has no task; WNOHANG does not turn that into 0.
         const P_PID: u64 = 1;
         const WNOHANG: u64 = 1;
         let mut si = [0u8; 128];
@@ -328,8 +330,8 @@ fn smoke_abi_proc2_waitid_ppid_no_child() -> TestResult {
             Syscall::Waitid.raw(),
             a3(P_PID, 4242, si.as_mut_ptr() as u64, WNOHANG),
         ) {
-            Some(0) => Ok(()),
-            _ => Err("waitid(P_PID, WNOHANG) with no child did not return 0"),
+            Some(v) if v == ECHILD => Ok(()),
+            _ => Err("waitid(P_PID, WNOHANG) with no child must return -ECHILD"),
         }
     })
 }
@@ -422,7 +424,10 @@ fn smoke_abi_proc2_waitid_wnowait_peek_keeps_zombie() -> TestResult {
         if i32::from_ne_bytes(si2[16..20].try_into().unwrap()) != CHILD as i32 {
             return Err("WNOWAIT peek consumed the exit — child not reapable");
         }
-        // Fully reaped now: another peek reports nothing (infop untouched).
+        // Fully reaped now: the child no longer exists, so another peek is
+        // -ECHILD and must leave infop untouched. (Linux: the reaped pid has
+        // no task, so notask_error stays -ECHILD.) This asserted 0 before
+        // waitid grew wait4's no-eligible-child gate.
         let mut si3 = [0u8; 128];
         let args = a3(
             P_PID,
@@ -431,8 +436,8 @@ fn smoke_abi_proc2_waitid_wnowait_peek_keeps_zombie() -> TestResult {
             WNOHANG | WEXITED | WNOWAIT,
         );
         match call(Syscall::Waitid.raw(), args) {
-            Some(0) => {}
-            _ => return Err("post-reap waitid did not return 0"),
+            Some(v) if v == ECHILD => {}
+            _ => return Err("post-reap waitid must return -ECHILD"),
         }
         if i32::from_ne_bytes(si3[16..20].try_into().unwrap()) != 0 {
             return Err("post-reap peek still reported the reaped child");

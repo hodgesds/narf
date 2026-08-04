@@ -731,17 +731,20 @@ fn smoke_abi_proc_wait4_wnohang_no_child() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_wait4_wnohang_no_child);
 
-// LINUX-GAP: wait4 with no children should return -ECHILD; the blocking
-// (non-WNOHANG, no-child) path is only exercised via the polling future,
-// so the immediate-return WNOHANG path above is the reachable surface and
-// returns 0 rather than -ECHILD.
+// The blocking (non-WNOHANG, no-child) wait4 path is only exercised via the
+// polling future, so the immediate-return WNOHANG path above is the
+// reachable surface here. Both now return -ECHILD, matching Linux.
 
 // ── waitid(2) — non-blocking + validation paths ──
 
 fn smoke_abi_proc_waitid_wnohang_no_child() -> TestResult {
     with_setup(|| {
-        // waitid(P_ALL, 0, infop, WNOHANG) with no child → 0 (POSIX:
-        // success, caller-prezeroed siginfo). P_ALL == 0, WNOHANG == 1.
+        // waitid(P_ALL, 0, infop, WNOHANG) with NO child at all → -ECHILD,
+        // exactly as the wait4 case above and for the same reason: Linux
+        // (kernel/exit.c __do_wait) leaves notask_error at -ECHILD and
+        // WNOHANG only turns it into 0 when an *eligible* child exists.
+        // This previously expected 0, which was NARF's pre-guard behaviour;
+        // a blocking waitid in that state parked forever with no backstop.
         const P_ALL: u64 = 0;
         const WNOHANG: u64 = 1;
         let mut si = [0u8; 128];
@@ -749,8 +752,8 @@ fn smoke_abi_proc_waitid_wnohang_no_child() -> TestResult {
             Syscall::Waitid.raw(),
             a3(P_ALL, 0, si.as_mut_ptr() as u64, WNOHANG),
         ) {
-            Some(0) => Ok(()),
-            _ => Err("waitid WNOHANG with no child did not return 0"),
+            Some(v) if v == ECHILD => Ok(()),
+            _ => Err("waitid WNOHANG with no child must return -ECHILD"),
         }
     })
 }

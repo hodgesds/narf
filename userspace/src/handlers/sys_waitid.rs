@@ -139,6 +139,25 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // No matching exit was queued. If the caller has no remaining child that
+    // could ever satisfy this wait, report ECHILD instead of blocking —
+    // `sys_wait4` has had this guard since a parent that had already reaped
+    // its last child blocked forever, and `waitid(2)` needs it for the same
+    // reason. Linux decides both in the same place (`kernel/exit.c::do_wait`,
+    // which returns -ECHILD when the tasklist walk finds no eligible child).
+    //
+    // It matters more here than in wait4: this park is `own_stack_wait_child`,
+    // which registers only the child-exit and signal wakers. It arms no
+    // timer-wheel backstop, so unlike a poll/epoll park there is nothing to
+    // re-float the task after a wake that can never come — the strand is
+    // unbounded, and invisible to the park-check heuristic because that path
+    // does not tick `dbg_park_checks` either.
+    if !has_living_child(parent, want_pid) {
+        const ECHILD: i64 = 10;
+        ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
+        return;
+    }
+
     if options & WNOHANG != 0 {
         // No child ready: POSIX leaves infop's si_signo as 0 (the
         // caller pre-zeros it). Return success.
