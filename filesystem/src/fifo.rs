@@ -33,10 +33,19 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::{FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_HUP, POLL_IN, POLL_OUT};
+use crate::{
+    FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_ERR, POLL_HUP, POLL_IN, POLL_OUT,
+};
 
-/// FIFO ring capacity, matching the anonymous-pipe buffer (one 4 KiB page).
-const FIFO_BUF_BYTES: usize = 4096;
+/// FIFO ring capacity, matching the anonymous-pipe buffer and Linux's
+/// default pipe size (`include/linux/pipe_fs_i.h`: 16 pages × 4 KiB —
+/// FIFOs use the same `pipe_inode_info` as anonymous pipes).
+const FIFO_BUF_BYTES: usize = 65536;
+
+/// POSIX `PIPE_BUF` (Linux `include/linux/limits.h`): writes of at most
+/// this many bytes are atomic — `fs/pipe.c::pipe_write` writes nothing
+/// rather than splitting them across a partial buffer.
+const PIPE_BUF: usize = 4096;
 
 /// The shared, mutable state of a named pipe: the byte queue plus live
 /// reader/writer OPEN counts. Both counts are the per-open population of
@@ -300,10 +309,10 @@ impl FileOps for FifoHandle {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             if !self.can_read {
-                // A write-only handle can't be read (POSIX EBADF); surface a
-                // 0-byte read so the caller doesn't spin — the syscall layer's
-                // EBADF check keys on the fd, not this path.
-                return Ok(0);
+                // Reading a write-only FIFO handle: EBADF on Linux
+                // (`fs/read_write.c::vfs_read`, FMODE_READ check). The old
+                // Ok(0) masqueraded as a clean EOF.
+                return Err(FsError::BadFd);
             }
             let mut q = self.shared.queue.lock();
             let avail = q.len();
@@ -325,7 +334,11 @@ impl FileOps for FifoHandle {
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             if !self.can_write {
-                return Err(FsError::BrokenPipe);
+                // Writing a read-only FIFO handle: EBADF on Linux
+                // (`fs/read_write.c::vfs_write`, FMODE_WRITE check). The old
+                // BrokenPipe here additionally raised a bogus SIGPIPE —
+                // Linux never reaches the pipe op for a wrong-mode fd.
+                return Err(FsError::BadFd);
             }
             // No readers left: broken pipe. The syscall layer raises SIGPIPE
             // and returns -EPIPE.
@@ -334,6 +347,12 @@ impl FileOps for FifoHandle {
             }
             let mut q = self.shared.queue.lock();
             let room = FIFO_BUF_BYTES.saturating_sub(q.len());
+            // POSIX PIPE_BUF atomicity (`fs/pipe.c::pipe_write`): a write of
+            // ≤ PIPE_BUF bytes is all-or-nothing; the 0-progress result makes
+            // the syscall layer park (blocking) or EAGAIN (O_NONBLOCK).
+            if buf.len() <= PIPE_BUF && room < buf.len() {
+                return Ok(0);
+            }
             let n = core::cmp::min(buf.len(), room);
             for &b in buf.iter().take(n) {
                 q.push_back(b);
@@ -343,8 +362,10 @@ impl FileOps for FifoHandle {
     }
 
     fn stat(&self) -> Stat {
+        // st_size on a FIFO is 0 on Linux (pipefs never updates i_size);
+        // FIONREAD is the way to count queued bytes.
         Stat {
-            size: self.shared.queue.lock().len() as u64,
+            size: 0,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Fifo,
@@ -359,20 +380,27 @@ impl FileOps for FifoHandle {
     }
 
     fn poll_readiness(&self) -> u32 {
+        // `fs/pipe.c::pipe_poll`: read side gets EPOLLIN only while data is
+        // queued and EPOLLHUP once the writers are gone (both may be set);
+        // write side gets EPOLLOUT while there is room and EPOLLERR once
+        // the readers are gone.
         let mut mask = 0;
         let q = self.shared.queue.lock();
-        if self.can_read && (!q.is_empty() || self.shared.writers.load(Ordering::Acquire) == 0) {
-            // Readable when data is queued OR the last writer has gone (the
-            // read will return EOF — POLLIN in Linux, plus POLLHUP).
-            mask |= POLL_IN;
+        if self.can_read {
+            if !q.is_empty() {
+                mask |= POLL_IN;
+            }
             if self.shared.writers.load(Ordering::Acquire) == 0 {
                 mask |= POLL_HUP;
             }
         }
-        if self.can_write
-            && (q.len() < FIFO_BUF_BYTES || self.shared.readers.load(Ordering::Acquire) == 0)
-        {
-            mask |= POLL_OUT;
+        if self.can_write {
+            if q.len() < FIFO_BUF_BYTES {
+                mask |= POLL_OUT;
+            }
+            if self.shared.readers.load(Ordering::Acquire) == 0 {
+                mask |= POLL_ERR;
+            }
         }
         mask
     }
@@ -391,11 +419,25 @@ impl FileOps for FifoHandle {
         !(q.is_empty() && self.shared.writers.load(Ordering::Acquire) == 0)
     }
 
+    fn write_should_block(&self) -> bool {
+        // A full-FIFO write that made no progress must PARK the writer while
+        // a reader is still open (`fs/pipe.c::pipe_write` waits for room).
+        // When the readers are gone, write() returns BrokenPipe instead of
+        // 0, so this is only consulted with a live reader.
+        self.can_write && self.shared.readers.load(Ordering::Acquire) > 0
+    }
+
     fn is_stream(&self) -> bool {
         // A FIFO is a non-seekable byte stream: reject it as a sendfile(2)
         // source (EINVAL) so consumers fall back to a read()/write() loop,
         // matching the anonymous pipe.
         true
+    }
+
+    fn pipe_capacity(&self) -> Option<usize> {
+        // `fcntl(F_GETPIPE_SZ)` works on FIFOs exactly as on anonymous
+        // pipes (both are `pipe_inode_info` buffers on Linux).
+        Some(FIFO_BUF_BYTES)
     }
 
     fn pipe_peek(&self, max: usize) -> Option<alloc::vec::Vec<u8>> {
