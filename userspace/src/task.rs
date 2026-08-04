@@ -62,7 +62,34 @@ pub struct Task {
     /// futex/epoll generations. Owned HERE (not by the future) so its
     /// address is valid for as long as ANY `Arc<Task>` lives.
     pub uctx: UserTaskCtx,
+    /// The file references an in-flight blocking `poll`/`ppoll` resolved at
+    /// syscall ENTRY, one slot per `pollfd` (`None` = the fd was already
+    /// closed then). Empty when no blocking poll is in flight.
+    ///
+    /// Linux's `do_sys_poll` resolves every fd to a `struct file` once, on
+    /// entry, and holds those references for the whole call — so a `close()`
+    /// from a SIBLING THREAD is invisible to a poll already in progress.
+    /// NARF's park re-executes the syscall on each wake, which re-read the fd
+    /// table every time; a sibling close then turned an in-flight poll into
+    /// an instant `POLLNVAL` return, and event loops that treat that as a
+    /// spurious wake re-poll immediately and spin.
+    ///
+    /// Holding the `Arc`s here reproduces Linux's lifetime rule: the file
+    /// stays alive for the duration of the poll, exactly as a referenced
+    /// `struct file` does. Per-TASK, deliberately — a global side table would
+    /// put a shared lock on every blocking poll.
+    ///
+    /// The stored offset is only a FALLBACK for an fd that has since been
+    /// closed. While the fd is still open the current offset is re-read from
+    /// the fd table, because in Linux the offset (`f_pos`) lives in the same
+    /// `struct file` being polled and stays live — that is what keeps an
+    /// offset-gated reader like `/dev/kmsg` re-evaluating correctly.
+    pub poll_files: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<PollFileSlot>>,
 }
+
+/// One entry of [`Task::poll_files`]: the resolved file and the offset it
+/// had at poll entry. `None` when the fd named no open file.
+pub type PollFileSlot = Option<(Arc<dyn narf_filesystem::FileOps>, u64)>;
 
 impl Task {
     /// Create and register a task under `tid`. The caller must have
@@ -77,6 +104,7 @@ impl Task {
             exit_code: AtomicI32::new(0),
             group_exiting: core::sync::atomic::AtomicBool::new(false),
             uctx: UserTaskCtx::new(),
+            poll_files: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
         });
         TASKS.lock().insert(tid, t.clone());
         // /proc/[pid]/stat starttime source — every task (spawn, fork,

@@ -3391,3 +3391,121 @@ fn smoke_poll_watchdog_oracle_matches_poll_scan() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_poll_watchdog_oracle_matches_poll_scan);
+
+/// A blocking `poll` must keep polling the files it resolved at ENTRY, so a
+/// `close()` from a sibling thread cannot turn an in-flight poll into an
+/// instant `POLLNVAL` return.
+///
+/// Linux ref: `fs/select.c::do_sys_poll` resolves every fd once (`fdget`) and
+/// holds those `struct file` references for the whole call — a concurrent
+/// close in another thread of the same process is invisible to a poll already
+/// in progress. NARF's park re-executes the syscall on every wake, which used
+/// to re-read the fd table each time; a sibling close then produced POLLNVAL,
+/// and an event loop that treats that as a spurious wake re-polls at once and
+/// spins on a dead descriptor (observed as two threads burning a core through
+/// the Fedora Plasma session startup).
+///
+/// Arms:
+///   * closed AFTER entry → NOT POLLNVAL; the held file's real readiness.
+///   * closed BEFORE entry → POLLNVAL, which is correct Linux behaviour
+///     (`fdget` fails at entry), so the fix must not swallow it.
+///   * the held references are released on the poll's return path.
+fn smoke_poll_holds_files_across_sibling_close() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    /// Never readable, always writable — a real poll over POLLIN parks on it.
+    #[derive(Debug)]
+    struct NeverReadable;
+    impl narf_filesystem::FileOps for NeverReadable {
+        fn read<'a>(
+            &'a self,
+            _off: u64,
+            _buf: &'a mut [u8],
+        ) -> narf_filesystem::FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _off: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> narf_filesystem::Stat {
+            narf_filesystem::Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+        fn poll_readiness(&self) -> u32 {
+            narf_filesystem::POLL_OUT
+        }
+    }
+
+    crate::fd::__test_reset();
+    const TID: u64 = 0xFACE_D0D2;
+    let task = crate::task::Task::new_registered(TID, TID);
+
+    let fd = match crate::fd::with_table(TID, |t| {
+        t.open(crate::fd::FdEntry {
+            ops: Arc::new(NeverReadable),
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        })
+    }) {
+        Some(fd) => fd,
+        None => {
+            crate::task::release_task(TID);
+            return TestResult::Fail("could not open the poll subject fd");
+        }
+    };
+
+    let mut fds = [crate::poll::PollFd {
+        fd: fd as i32,
+        events: narf_filesystem::POLL_IN as u16,
+        revents: 0,
+    }];
+
+    // Entry-time resolution, exactly as the blocking path performs it.
+    crate::poll::install_poll_files(TID, &fds);
+    // A sibling thread closes the fd while this poll is parked.
+    crate::fd::with_table(TID, |t| t.close(fd));
+
+    let n_after_close = crate::poll::poll_scan(TID, &mut fds);
+    let revents_after_close = fds[0].revents;
+
+    // Release, as every poll return path does, then confirm nothing is held.
+    crate::poll::clear_poll_wait_record(TID, &task.uctx);
+    let released = task.poll_files.lock().is_empty();
+
+    // Entry-time-closed arm: with no held resolution, a closed fd is
+    // POLLNVAL — Linux returns that too, and the fix must not mask it.
+    let mut fresh = [crate::poll::PollFd {
+        fd: fd as i32,
+        events: narf_filesystem::POLL_IN as u16,
+        revents: 0,
+    }];
+    let n_fresh = crate::poll::poll_scan(TID, &mut fresh);
+    let revents_fresh = fresh[0].revents;
+
+    task.uctx.poll_wait_nfds.store(0, Ordering::Release);
+    crate::task::release_task(TID);
+    crate::fd::__test_reset();
+
+    if revents_after_close & (narf_filesystem::POLL_NVAL as u16) != 0 {
+        return TestResult::Fail(
+            "a sibling close turned an in-flight poll into POLLNVAL — entry-time files not held",
+        );
+    }
+    if n_after_close != 0 || revents_after_close != 0 {
+        return TestResult::Fail("held file reported ready though it is never readable");
+    }
+    if !released {
+        return TestResult::Fail("poll return path leaked its entry-time file references");
+    }
+    if n_fresh != 1 || revents_fresh & (narf_filesystem::POLL_NVAL as u16) == 0 {
+        return TestResult::Fail("an fd closed BEFORE entry must still report POLLNVAL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_poll_holds_files_across_sibling_close);
