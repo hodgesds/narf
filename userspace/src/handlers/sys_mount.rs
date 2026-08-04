@@ -455,18 +455,33 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     }
 
     // FUSE mounts: `fstype == "fuse"` or `"fuse.<subtype>"`. Options carry
-    // `fd=N` naming the open `/dev/fuse` connection (passed via `source`
-    // since NARF's mount ABI has no `data` register). Parse fd, recover the
+    // `fd=N` naming the open `/dev/fuse` connection. Parse fd, recover the
     // connection, build a FuseFs, drive FUSE_INIT. Linux: fuse_fill_super.
+    //
+    // The options live in `data` — mount(2)'s 5th argument — NOT `source`.
+    // `source` is the device (`/dev/fuse`) or an arbitrary daemon-chosen
+    // label. This arm read them out of `source` for as long as NARF's mount
+    // ABI really was `(ptr, len, ...)` with no `data` register; that ABI was
+    // converted to the Linux shape above, and the arm was left behind. The
+    // result was that `fd=` was never found in any real caller's `source`,
+    // so EVERY fuse mount took the failure path — and returned EFAULT, which
+    // xdg-document-portal reports verbatim as "fuse: mount failed: Bad
+    // address" before spinning on the descriptors it had staged for it.
+    //
+    // The errnos are Linux's, not a bare fallback: `fuse_fill_super` rejects
+    // missing/unparsable options and an `fd` that is absent or is not a
+    // /dev/fuse connection with EINVAL. EFAULT means "unreadable user
+    // pointer" and misdirects a daemon (and anyone reading its log) toward
+    // an addressing bug.
     if fstype == "fuse" || fstype.starts_with("fuse.") {
-        let fd_opt = source
+        let fd_opt = data
             .split(',')
-            .find_map(|kv| kv.strip_prefix("fd="))
+            .find_map(|kv| kv.trim().strip_prefix("fd="))
             .and_then(|v| v.trim().parse::<u32>().ok());
         let fd = match fd_opt {
             Some(fd) => fd,
             None => {
-                ctx.set_return(fail);
+                ctx.set_return(einval);
                 return;
             }
         };
@@ -476,12 +491,12 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             Some(Some(o)) => match narf_filesystem::fuse_conn::DevFuse::connection_of(&o) {
                 Some(c) => c,
                 None => {
-                    ctx.set_return(fail);
+                    ctx.set_return(einval);
                     return;
                 }
             },
             _ => {
-                ctx.set_return(fail);
+                ctx.set_return(einval);
                 return;
             }
         };
@@ -492,7 +507,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         // daemon rejects INIT, sends a malformed reply, disconnects, or never
         // replies before the bounded synchronous bridge expires.
         if !matches!(poll_blocking(fs.init()), Some(Ok(_))) {
-            ctx.set_return(fail);
+            ctx.set_return(einval);
             return;
         }
         let fs_dyn: alloc::sync::Arc<dyn narf_filesystem::FsInstance> = fs;
