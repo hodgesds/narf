@@ -105,10 +105,18 @@ mod stall_wd {
     /// cannot reset each other.
     static IDLE_FLAT_WINDOWS: AtomicU64 = AtomicU64::new(0);
     static STRANDED_DUMPED: AtomicBool = AtomicBool::new(false);
-    /// Bounded count of strand reports emitted, so a persistent strand
-    /// cannot flood the serial log while still allowing later, different
-    /// strands to be seen.
-    static STRANDED_REPORTS: AtomicU64 = AtomicU64::new(0);
+    /// Window number of the most recent strand report, so reports are
+    /// SPACED rather than capped in total.
+    ///
+    /// A total cap is the same trap as a one-shot, just deferred: it is
+    /// spent on whichever tasks wedge earliest in boot, and anything that
+    /// wedges later never appears at all. That is exactly the case worth
+    /// seeing — kwin_wayland deadlocks minutes in, after PLASMA-READY, long
+    /// after a 12-report budget has been consumed by early-boot noise.
+    /// Spacing keeps the log bounded (one report per
+    /// `STRAND_REPORT_SPACING_WINDOWS` windows) while staying available for
+    /// the whole run.
+    static STRANDED_REPORT_WINDOW: AtomicU64 = AtomicU64::new(0);
     /// Identity of the last stranded set, so only a PERSISTENT strand
     /// (the same tasks, window after window) is reported.
     static LAST_STRANDED_SIG: AtomicU64 = AtomicU64::new(0);
@@ -264,16 +272,29 @@ mod stall_wd {
         // the SAME task to stay in that state across consecutive windows keeps
         // the ordinary race — ready between the scan and the wake — from
         // reporting anything, since that resolves within one window.
-        // Report repeatedly (bounded): the first strand is not necessarily
-        // the interesting one. A one-shot fires on whichever task wedges
-        // earliest in boot and then goes silent for the rest of the run,
-        // hiding every later strand — including the compositor's.
-        if wc > 20 && STRANDED_REPORTS.load(Ordering::Relaxed) < 12 {
+        // Report repeatedly, SPACED rather than capped: the first strand is
+        // not necessarily the interesting one. A one-shot — or a total
+        // budget, which is a slower one-shot — is spent on whichever task
+        // wedges earliest in boot and then goes silent for the rest of the
+        // run, hiding every later strand including the compositor's.
+        const STRAND_REPORT_SPACING_WINDOWS: u64 = 60;
+        let last_report = STRANDED_REPORT_WINDOW.load(Ordering::Relaxed);
+        let report_due =
+            last_report == 0 || wc.saturating_sub(last_report) >= STRAND_REPORT_SPACING_WINDOWS;
+        if wc > 20 && report_due {
             let mut stranded = narf_userspace::task::dbg_stranded_wakes();
             // A glib main loop parks in ppoll, not epoll_wait, so the
             // epoll-only view above cannot see the compositor at all.
+            let poll_waiters = narf_userspace::task::dbg_stranded_poll_waiters();
+            // Any line emitted below opens a fresh spacing interval. Without
+            // this the poll-waiter path never records a report, so
+            // `report_due` stays true and a persistent strand prints on
+            // EVERY window.
+            if !poll_waiters.is_empty() {
+                STRANDED_REPORT_WINDOW.store(wc, Ordering::Relaxed);
+            }
             for (tid, pid, fd, revents, checks, deadline, netio, waitchild, stopped, scans) in
-                narf_userspace::task::dbg_stranded_poll_waiters()
+                poll_waiters
             {
                 let _ = writeln!(
                     TrapWriter,
@@ -308,7 +329,7 @@ mod stall_wd {
             {
                 let n = IDLE_FLAT_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
                 if n >= 3 {
-                    STRANDED_REPORTS.fetch_add(1, Ordering::Relaxed);
+                    STRANDED_REPORT_WINDOW.store(wc, Ordering::Relaxed);
                     IDLE_FLAT_WINDOWS.store(0, Ordering::Relaxed);
                     let _ = writeln!(
                         TrapWriter,
