@@ -269,10 +269,20 @@ fi
 # not suppress the graphical compositor. Type=simple also avoids making the
 # session's lifetime depend on systemd's exec-notification handshake while the
 # Linux-compat process startup path is still slower than native Linux.
+# Wants/After user@1000.service: the user manager must be started by PID 1,
+# not by the session at runtime. narf-plasma.service runs as User=narf
+# (uid 1000), and an unprivileged `systemctl start user@1000.service` is
+# refused with "Access denied ... requires interactive authentication"
+# because that path goes through polkit. As a unit dependency root starts
+# it, with no polkit involved. user@.service in turn pulls in
+# user-runtime-dir@1000.service, which creates /run/user/1000 — where the
+# manager publishes the session bus the session then connects to.
 printf '%s\n' \
   '[Unit]' \
   'Description=NARF Plasma Wayland Session' \
   'Wants=dbus-broker.service' \
+  'Wants=user@1000.service' \
+  'After=user@1000.service' \
   'Requires=narf-drm-policy.service' \
   'After=dbus-broker.service narf-drm-policy.service' \
   '' \
