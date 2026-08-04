@@ -19,6 +19,7 @@ pub mod ahci;
 pub mod emmc;
 pub mod megaraid;
 pub mod mpt3sas;
+mod req_gate;
 pub mod rtsx;
 pub mod sd_proto;
 pub mod sdhci;
