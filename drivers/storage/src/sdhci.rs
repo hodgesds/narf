@@ -42,9 +42,13 @@
 //! transfer (no SDMA / ADMA scatter-gather yet — single 512-byte
 //! block per call through the Buffer Data Port).
 
+use core::sync::atomic::AtomicBool;
+
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
+
+use crate::req_gate::ReqGate;
 
 // SDHCI is a PCI class 0x08 / subclass 0x05 device. Each silicon
 // vendor has its own VID/DID, but the class triple is universally
@@ -187,6 +191,12 @@ pub struct SdCard {
 pub struct Sdhci {
     mmio: MmioRegion,
     pub card: IrqSafeSpinLock<Option<SdCard>>,
+    /// Serialises polled SD transfers across callers. Spun on WITHOUT
+    /// masking interrupts — see [`crate::req_gate::ReqGate`] for why
+    /// this replaces holding `CONTROLLER` across a multi-block PIO
+    /// loop (each block issues polled commands with 100 ms–1 s
+    /// deadlines; the aggregate hold scales with the block count).
+    req_gate: AtomicBool,
 }
 
 impl core::fmt::Debug for Sdhci {
@@ -213,6 +223,7 @@ impl Sdhci {
         let me = Sdhci {
             mmio,
             card: IrqSafeSpinLock::new(None),
+            req_gate: AtomicBool::new(false),
         };
 
         // AMD FCH SDHCI quirk: on Renoir / Phoenix / older FCH parts
@@ -625,7 +636,52 @@ impl Sdhci {
 
 // ── Driver-match registration ────────────────────────────────────────
 
+/// Slot for the live host controller produced by `probe`. Held only
+/// long enough to read the installed device's address
+/// (`probed_sdhci`) — NEVER across a transfer, whose polled SD
+/// commands run 100 ms–1 s deadlines per block. See
+/// [`crate::req_gate`] for the livelock this prevents.
 static CONTROLLER: IrqSafeSpinLock<Option<Sdhci>> = IrqSafeSpinLock::new(None);
+
+/// The probed host controller, WITHOUT holding `CONTROLLER` for the
+/// caller's use of it.
+///
+/// `CONTROLLER` is taken only long enough to read the address of the
+/// installed device, then released, so a multi-block PIO loop runs
+/// with interrupts enabled.
+///
+/// # Why the reference stays valid
+///
+/// The `Option` is written exactly once: [`probe`] returns early when
+/// a controller is already installed, and nothing ever stores `None`
+/// back. The `Sdhci` therefore is never moved, replaced or dropped
+/// after its single install, so a shared reference to it stays valid
+/// for the rest of the boot. `smoke_sdhci_device_address_is_stable`
+/// pins that invariant, because it is the kind of assumption a later
+/// "support hot-unplug" change would silently invalidate. There is no
+/// `&mut` path into the slot at all — every `Sdhci` method takes
+/// `&self` (card state lives behind its own inner lock).
+fn probed_sdhci() -> Option<&'static Sdhci> {
+    let ptr: *const Sdhci = {
+        let g = CONTROLLER.lock();
+        match g.as_ref() {
+            Some(d) => d as *const Sdhci,
+            None => return None,
+        }
+    };
+    // SAFETY: install-once, never-moved, never-dropped — see above.
+    Some(unsafe { &*ptr })
+}
+
+/// The installed controller's address, or `None` before probe. Test
+/// hook for the install-once invariant `probed_sdhci` relies on.
+#[doc(hidden)]
+pub fn dbg_device_addr() -> Option<usize> {
+    CONTROLLER
+        .lock()
+        .as_ref()
+        .map(|d| d as *const Sdhci as usize)
+}
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     use core::fmt::Write as _;
@@ -790,6 +846,16 @@ pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
+/// Run `f` against the probed controller, if any.
+///
+/// Holds the device's request gate — not the `CONTROLLER` spinlock —
+/// for the duration of `f`, so a multi-block PIO closure waits out
+/// its 100 ms–1 s per-command polls with interrupts enabled while
+/// still excluding every other user of the controller. Callers must
+/// not re-enter `with_controller` from inside `f` — the gate is not
+/// reentrant.
 pub fn with_controller<R>(f: impl FnOnce(&Sdhci) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    let ctrl = probed_sdhci()?;
+    let _gate = ReqGate::acquire(&ctrl.req_gate);
+    Some(f(ctrl))
 }
