@@ -241,6 +241,38 @@ static int drain_main(const char *expect_s) {
     return got == expect ? 0 : 45;
 }
 
+// `--chain N`: exec self AGAIN into `--drain N`. Two execve()s deep — the
+// `sh -c 'exec xkbcomp'` shape without needing a shell in the image.
+static int chain_main(const char *expect_s) {
+    execl(self_path, "popenw", "--drain", expect_s, (char *) 0);
+    return 91;
+}
+
+// `--chainfork N`: fork a grandchild that execs `--drain N` while this
+// (already once-exec'd) process waits — the wrapper-script shape, where
+// bash (exec'd by sh -c) forks `cat` to consume stdin. The pipe read end
+// on fd 0 is inherited across exec + fork + exec.
+static int chainfork_main(const char *expect_s) {
+    pid_t g = fork();
+    if (g < 0) {
+        return 90;
+    }
+    if (g == 0) {
+        execl(self_path, "popenw", "--drain", expect_s, (char *) 0);
+        _exit(91);
+    }
+    int st = 0;
+    if (waitpid(g, &st, 0) != g) {
+        return 90;
+    }
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 90;
+}
+
+// How the consumer reaches the payload. DIRECT/SHELL are the original two
+// arms; CHAIN/CHAINFORK are the shell shape decomposed for images with no
+// /bin/sh (two execs; two execs + a fork).
+enum exec_mode { VIA_DIRECT = 0, VIA_SHELL = 1, VIA_CHAIN = 2, VIA_CHAINFORK = 3 };
+
 // via_shell mirrors X's Popen exactly (`/bin/sh -c`); the direct arm isolates
 // whether a plain execve already loses the pipe, so a failure names the layer.
 static int exec_round(size_t len, int via_shell, const char *label) {
@@ -248,7 +280,7 @@ static int exec_round(size_t len, int via_shell, const char *label) {
     // child exits without ever reading, and a parent that has already
     // committed to writing a payload larger than the pipe buffer blocks
     // against a reader that will never arrive.
-    if (via_shell && access("/bin/sh", X_OK) != 0) {
+    if (via_shell == VIA_SHELL && access("/bin/sh", X_OK) != 0) {
         w("popenw-skip: no /bin/sh for the shell arm (");
         w(label);
         w(")\n");
@@ -278,12 +310,22 @@ static int exec_round(size_t len, int via_shell, const char *label) {
             _exit(90);
         }
         close(p[0]);
-        if (via_shell) {
+        switch (via_shell) {
+        case VIA_SHELL: {
             char cmd[640];
             snprintf(cmd, sizeof cmd, "exec '%s' --drain %s", self_path, expect);
             execl("/bin/sh", "sh", "-c", cmd, (char *) 0);
-        } else {
+            break;
+        }
+        case VIA_CHAIN:
+            execl(self_path, "popenw", "--chain", expect, (char *) 0);
+            break;
+        case VIA_CHAINFORK:
+            execl(self_path, "popenw", "--chainfork", expect, (char *) 0);
+            break;
+        default:
             execl(self_path, "popenw", "--drain", expect, (char *) 0);
+            break;
         }
         _exit(91); // exec itself failed
     }
@@ -348,6 +390,12 @@ int main(int argc, char **argv) {
     } else if (argc >= 1) {
         snprintf(self_path, sizeof self_path, "%s", argv[0]);
     }
+    if (argc >= 3 && strcmp(argv[1], "--chain") == 0) {
+        return chain_main(argv[2]);
+    }
+    if (argc >= 3 && strcmp(argv[1], "--chainfork") == 0) {
+        return chainfork_main(argv[2]);
+    }
     if (!raw_round(SMALL_LEN, 1, "delayed-small")) {
         return 1;
     }
@@ -364,10 +412,23 @@ int main(int argc, char **argv) {
     if (!exec_round(LARGE_LEN, 0, "exec-direct-large")) {
         return 1;
     }
-    if (!exec_round(SMALL_LEN, 1, "exec-shell-small")) {
+    if (!exec_round(SMALL_LEN, VIA_SHELL, "exec-shell-small")) {
         return 1;
     }
-    if (!exec_round(LARGE_LEN, 1, "exec-shell-large")) {
+    if (!exec_round(LARGE_LEN, VIA_SHELL, "exec-shell-large")) {
+        return 1;
+    }
+    // The sh -c shape decomposed for shell-less images: the payload must
+    // survive TWO execs (writer → sh → xkbcomp)...
+    if (!exec_round(SMALL_LEN, VIA_CHAIN, "exec-chain-small")) {
+        return 1;
+    }
+    if (!exec_round(LARGE_LEN, VIA_CHAIN, "exec-chain-large")) {
+        return 1;
+    }
+    // ...and the wrapper-script shape: two execs, then a FORKED grandchild
+    // (bash running `cat`) drains the inherited fd 0.
+    if (!exec_round(LARGE_LEN, VIA_CHAINFORK, "exec-chainfork-large")) {
         return 1;
     }
     w("popenw-ok\n");
