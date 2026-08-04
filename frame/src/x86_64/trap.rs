@@ -66,12 +66,18 @@ fn ensure_user_range_writable(lo: u64, hi: u64) -> bool {
 ///   - per CPU: ready-queue depth, # of awake (runnable) slots, the
 ///     published HALTED flag, whether the queue lock was held, and the
 ///     last-tick CPL/RIP (kernel RIP → addr2line offline).
+///
 /// Decision: `halted && awake>0` ⇒ lost wakeup; `!halted && awake>0` ⇒
 /// spinning-not-polling (data-path/lock); `locked` ⇒ stuck in the queue
-/// lock. Self-latches after one dump. Cheap (a few atomics per tick); the
-/// dump only ever runs once, from IRQ context, via the same TrapWriter the
-/// perf dump uses, then panics so CI cannot silently time out after a
-/// diagnosed stall.
+/// lock. Cheap (a few atomics per tick); the dumps run from IRQ context
+/// via the same TrapWriter the perf dump uses.
+///
+/// The per-CPU dump self-latches after one shot, but the stranded-task
+/// reports do NOT: they are capped at `STRANDED_REPORTS` occurrences,
+/// because a one-shot fires on whichever task wedges earliest in boot and
+/// then goes silent for every later strand — including the compositor's.
+/// An RCU stall only WARNS unless `rcu_cpu_stall_panic` is on the command
+/// line, so a diagnosed stall no longer takes the boot down by default.
 ///
 /// Off by default — build with `--features stall-watchdog` to arm it for
 /// an SMP-wedge investigation (a few atomics per tick; dumps once).
@@ -266,12 +272,12 @@ mod stall_wd {
             let mut stranded = narf_userspace::task::dbg_stranded_wakes();
             // A glib main loop parks in ppoll, not epoll_wait, so the
             // epoll-only view above cannot see the compositor at all.
-            for (tid, pid, fd, revents, checks, deadline, netio, waitchild, stopped) in
+            for (tid, pid, fd, revents, checks, deadline, netio, waitchild, stopped, scans) in
                 narf_userspace::task::dbg_stranded_poll_waiters()
             {
                 let _ = writeln!(
                     TrapWriter,
-                    "STALL-WD poll-stranded tid={tid} pid={pid} fd={fd} revents={revents:#x} park_checks={checks} deadline={deadline:#x} netio={netio} waitchild={waitchild} stopped={stopped}"
+                    "STALL-WD poll-stranded tid={tid} pid={pid} fd={fd} revents={revents:#x} park_checks={checks} scans={scans} deadline={deadline:#x} netio={netio} waitchild={waitchild} stopped={stopped}"
                 );
                 // Scheduler-side half of the verdict. `awake` says whether
                 // the wake actually reached the slot; `rounds` says whether

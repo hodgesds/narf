@@ -185,21 +185,40 @@ pub fn dbg_stranded_wakes() -> alloc::vec::Vec<(u64, u64, u32)> {
     out
 }
 
+/// One reported stranded `poll`/`ppoll` waiter:
+/// `(tid, pid, fd, revents, park_checks, deadline_ns, net_io_wait,
+/// wait_child_pending, stopped, scans)`.
+pub type StrandedPollWaiter = (u64, u64, i32, u32, u64, u64, bool, bool, bool, u64);
+
 /// Parked tasks whose recorded `poll`/`ppoll` fd set already contains a
-/// ready descriptor — `(tid, pid, fd, revents, park_checks)` for each.
+/// ready descriptor, and which have not re-scanned since the previous
+/// sighting (see the latch discussion below).
 ///
 /// The epoll-only [`dbg_stranded_wakes`] could not see the case that
 /// actually matters: a glib main loop (KWin, and every Qt application
 /// using the GLib event dispatcher) parks in `ppoll`, not `epoll_wait`,
 /// so its `epoll_wait_fd` is never set and it never appears there.
 ///
-/// `park_checks` is the discriminator that a readiness scan alone cannot
-/// give. It counts how many times the park loop re-evaluated this task.
-/// If it ADVANCES while an fd stays ready, the task is being reconsidered
-/// and something in the stay-parked decision is wrong. If it is FROZEN,
-/// the task is never reconsidered at all — a lost wake, not a bad
-/// decision. Those need opposite fixes, and the CPU counter alone cannot
-/// tell them apart.
+/// A ready fd on a "parked" task is NOT by itself evidence of a strand,
+/// and `park_checks` does not make it one. `parked_in_syscall` is set
+/// before the park but cleared only at syscall EXIT, so a task cycling
+/// park → wake → re-execute → scan → park reads as parked for the whole
+/// duration of a healthy blocking poll — with `park_checks` climbing
+/// ~100/s off the backstop the entire time. Sampling a ready fd anywhere
+/// in that window reports a WORKING compositor as stranded, which is
+/// exactly what this probe did before the latch below existed.
+///
+/// `scans` is the discriminator, applied as a two-sample latch (see
+/// [`crate::user_task::UserTaskCtx::dbg_poll_strand_latch`]): a task is
+/// reported only if it is seen twice with a ready fd and has NOT re-run
+/// its own `poll_common` readiness scan in between. A healthy poller
+/// re-scans within one ~10 ms backstop, so a full watchdog interval
+/// without one means the syscall genuinely never re-executes.
+///
+/// `park_checks` is still printed, but as a SECONDARY split of a
+/// confirmed strand: climbing means the park loop reconsiders the task
+/// and the stay-parked decision is wrong; frozen means the task is never
+/// reconsidered at all — a lost wake. Those need opposite fixes.
 ///
 /// The trailing fields discriminate WHICH park a frozen task is actually
 /// in — `dbg_park_checks` only counts `park_should_block` /
@@ -216,8 +235,12 @@ pub fn dbg_stranded_wakes() -> alloc::vec::Vec<(u64, u64, u32)> {
 ///     backstop armed). `deadline == 0` while parked means a
 ///     `wake_one` consumed the park state but the executor never
 ///     re-polled the slot — an executor/queue-side lost wake.
-pub fn dbg_stranded_poll_waiters(
-) -> alloc::vec::Vec<(u64, u64, i32, u32, u64, u64, bool, bool, bool)> {
+///   * `scans` — how many readiness passes this task's OWN poll park has
+///     run (`UserTaskCtx::dbg_poll_scans`). Sample it twice: advancing
+///     while an fd stays ready means `poll_scan` and this scan disagree
+///     about the same fd; frozen means the syscall never re-executes.
+///     `park_checks` cannot answer this — it climbs in both cases.
+pub fn dbg_stranded_poll_waiters() -> alloc::vec::Vec<StrandedPollWaiter> {
     let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
     let mut out = alloc::vec::Vec::new();
     for t in tasks {
@@ -229,6 +252,9 @@ pub fn dbg_stranded_poll_waiters(
             continue;
         }
         let recorded = n.min(crate::user_task::POLL_WAIT_RECORD_MAX);
+        let scans = t.uctx.dbg_poll_scans.load(Ordering::Relaxed);
+        let mut candidate = false;
+        let mut ready_fds: alloc::vec::Vec<(i32, u32)> = alloc::vec::Vec::new();
         for slot in t.uctx.poll_wait_fds.iter().take(recorded) {
             let packed = slot.load(Ordering::Relaxed);
             if packed == 0 {
@@ -260,6 +286,31 @@ pub fn dbg_stranded_poll_waiters(
             .map(|(ops, offset)| ops.poll_readiness_at(offset))
             .unwrap_or(crate::poll::POLL_NVAL);
             if ready & (want | always) != 0 {
+                candidate = true;
+                ready_fds.push((fd, ready & (want | always)));
+            }
+        }
+        // Two-sample latch (see `dbg_poll_strand_latch`), applied ONCE per
+        // task after the whole fd set has been scanned — never per fd. A
+        // per-fd decision arms the latch on the first ready fd and then
+        // reports the SECOND one in the same pass off that fresh arm,
+        // which defeats the two-sample rule for any multi-fd poll set (and
+        // a wedged compositor's set is always multi-fd).
+        //
+        // Report only a task seen with a ready fd AND an unchanged scan
+        // count since the previous sighting; otherwise arm/re-arm and stay
+        // quiet. Without this the report cannot tell a wedged poller from a
+        // working one, because `parked_in_syscall` stays true across a
+        // healthy poll's whole park → wake → re-execute → scan cycle.
+        if candidate {
+            let latch = t.uctx.dbg_poll_strand_latch.load(Ordering::Relaxed);
+            if latch != scans.wrapping_add(1) {
+                t.uctx
+                    .dbg_poll_strand_latch
+                    .store(scans.wrapping_add(1), Ordering::Relaxed);
+                continue;
+            }
+            for (fd, revents) in ready_fds {
                 out.push((
                     t.tid,
                     t.pid.load(Ordering::Relaxed),
@@ -267,14 +318,20 @@ pub fn dbg_stranded_poll_waiters(
                     // The revents `poll_scan` would have returned — the
                     // unrequested-but-always-reported bits included, so a
                     // HUP/NVAL strand prints its actual cause.
-                    ready & (want | always),
+                    revents,
                     t.uctx.dbg_park_checks.load(Ordering::Relaxed),
                     t.uctx.sleep_deadline_ns.load(Ordering::Relaxed),
                     t.uctx.net_io_wait.load(Ordering::Relaxed),
                     t.uctx.wait_child_pending.load(Ordering::Relaxed),
                     crate::handlers::is_task_stopped(t.tid),
+                    scans,
                 ));
             }
+        } else {
+            // Nothing ready this pass — disarm, so a task that becomes a
+            // candidate later gets a fresh two-sample window instead of
+            // being reported on its first sighting off a stale latch.
+            t.uctx.dbg_poll_strand_latch.store(0, Ordering::Relaxed);
         }
     }
     out

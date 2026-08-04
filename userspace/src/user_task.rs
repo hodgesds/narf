@@ -339,6 +339,39 @@ pub struct UserTaskCtx {
     /// True nfds of the recorded in-flight poll park (may exceed the
     /// recorded window above), or 0 when no blocking poll is parked.
     pub poll_wait_nfds: AtomicU32,
+    /// Monotonic count of readiness scans this task's own blocking `poll`
+    /// park has run (`poll_common`'s pre-park `poll_scan`).
+    ///
+    /// This is the progress signal `dbg_park_checks` cannot give for a
+    /// poll waiter. Both a healthy poller and a wedged one show a CLIMBING
+    /// `dbg_park_checks`, because an io-park re-executes its syscall on
+    /// every ~10 ms backstop wake and each re-execution parks again — so
+    /// "the counter moves" says only that the task is being reconsidered,
+    /// not that it is re-asking the readiness question.
+    ///
+    /// Comparing this against the watchdog's own scan splits the two
+    /// remaining hypotheses cleanly. If it ADVANCES while the watchdog
+    /// still sees a ready fd, the task IS re-scanning and `poll_scan`
+    /// disagrees with the watchdog about the same fd — a readiness-oracle
+    /// bug. If it is FROZEN, the syscall is never re-executed at all — a
+    /// wake/executor bug. They need opposite fixes.
+    pub dbg_poll_scans: AtomicU64,
+    /// Two-sample latch for the stranded-poller report: `dbg_poll_scans + 1`
+    /// as of the previous watchdog sighting of this task with a ready fd,
+    /// or 0 when unlatched.
+    ///
+    /// A single sample cannot tell a strand from a healthy poller.
+    /// `parked_in_syscall` is set before the park but cleared only at
+    /// syscall EXIT, so a task cycling park → wake → re-execute → scan →
+    /// park reads as "parked" for its entire blocking poll — and its
+    /// `dbg_park_checks` climbs the whole time. Sampling a ready fd in that
+    /// window reports a working compositor as stranded.
+    ///
+    /// The latch closes it: a candidate must be seen twice with `scans`
+    /// UNCHANGED. A healthy poller re-scans within one ~10 ms backstop, so
+    /// a full watchdog interval with a ready fd and no scan means the
+    /// syscall genuinely never re-executes.
+    pub dbg_poll_strand_latch: AtomicU64,
 }
 
 /// Recorded-fd window for [`UserTaskCtx::poll_wait_fds`]. Qt/glib main
@@ -407,6 +440,8 @@ impl UserTaskCtx {
             dbg_park_checks: AtomicU64::new(0),
             poll_wait_fds: [const { AtomicU64::new(0) }; POLL_WAIT_RECORD_MAX],
             poll_wait_nfds: AtomicU32::new(0),
+            dbg_poll_scans: AtomicU64::new(0),
+            dbg_poll_strand_latch: AtomicU64::new(0),
         }
     }
 }

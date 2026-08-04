@@ -3339,12 +3339,30 @@ fn smoke_poll_watchdog_oracle_matches_poll_scan() -> TestResult {
     task.uctx.poll_wait_nfds.store(3, Ordering::Release);
     task.uctx.parked_in_syscall.store(true, Ordering::Release);
 
+    // The probe is a TWO-SAMPLE latch: the first sighting only arms it, so a
+    // healthy poller (one that re-scans between watchdog ticks) is never
+    // reported. Sample once to arm...
+    let armed = crate::task::dbg_stranded_poll_waiters();
+    let armed_hit = armed.iter().any(|r| r.0 == TID);
+    // ...then again with the scan counter UNCHANGED: the task has not re-asked
+    // its own readiness question since, which is the actual strand condition.
     let reported = crate::task::dbg_stranded_poll_waiters();
     let hit_a = reported.iter().any(|r| r.0 == TID && r.2 == fd_a as i32);
     let hit_b = reported.iter().any(|r| r.0 == TID && r.2 == fd_b as i32);
     let hit_c = reported
         .iter()
         .any(|r| r.0 == TID && r.2 == fd_c as i32 && r.3 & narf_filesystem::POLL_NVAL != 0);
+
+    // Progress arm: a poller whose `poll_common` scan ran between two
+    // sightings is re-executing its syscall and re-scanning — a working
+    // poller, not a strand — so it must go unreported no matter how ready
+    // its fds are. This is the discriminator `dbg_park_checks` cannot give:
+    // that counter climbs for wedged and healthy pollers alike, because
+    // `parked_in_syscall` stays true across a healthy poll's whole
+    // park → wake → re-execute → scan cycle.
+    task.uctx.dbg_poll_scans.fetch_add(1, Ordering::Relaxed);
+    let progressed = crate::task::dbg_stranded_poll_waiters();
+    let hit_progressed = progressed.iter().any(|r| r.0 == TID);
 
     // Cleanup BEFORE asserting so a failure doesn't leak a fake parked task
     // into every later watchdog tick of the boot.
@@ -3353,6 +3371,11 @@ fn smoke_poll_watchdog_oracle_matches_poll_scan() -> TestResult {
     crate::task::release_task(TID);
     crate::fd::__test_reset();
 
+    if armed_hit {
+        return TestResult::Fail(
+            "watchdog reported a poller on its FIRST sighting (latch not armed)",
+        );
+    }
     if hit_a {
         return TestResult::Fail("watchdog reported a drained offset-gated fd as stranded-ready");
     }
@@ -3361,6 +3384,9 @@ fn smoke_poll_watchdog_oracle_matches_poll_scan() -> TestResult {
     }
     if !hit_c {
         return TestResult::Fail("watchdog missed a parked-on-closed-fd (POLLNVAL) strand");
+    }
+    if hit_progressed {
+        return TestResult::Fail("watchdog reported a poller that re-scanned between sightings");
     }
     TestResult::Pass
 }

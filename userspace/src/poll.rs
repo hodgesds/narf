@@ -520,7 +520,16 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         }
     };
 
-    // One readiness pass.
+    // One readiness pass. Count it: this is the park path's own readiness
+    // question, and the stall watchdog compares its answer against this
+    // task's (see `UserTaskCtx::dbg_poll_scans`). A parked poller whose
+    // scan count climbs while the watchdog still sees a ready fd is
+    // re-asking and getting a different answer; one whose count is frozen
+    // is not re-executing at all.
+    // SAFETY: `current_user_task()` returned Some, checked in `can_park`.
+    unsafe {
+        (*uctx_ptr).dbg_poll_scans.fetch_add(1, Ordering::Relaxed);
+    }
     let ready = poll_scan(task, &mut fds);
     if ready > 0 {
         // SAFETY: as above.
