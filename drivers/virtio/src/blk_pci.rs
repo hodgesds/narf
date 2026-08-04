@@ -100,6 +100,11 @@ pub struct VirtioBlkPci {
     /// 64 bytes) — single-request driver until the multi-inflight
     /// path lands.
     pool: DmaBuffer,
+    /// Serialises submitters against `pool`, spun on WITHOUT masking
+    /// interrupts. Lives on the device rather than in a static so a
+    /// second controller would contend only with itself — a global gate
+    /// would make unrelated disks serialise against each other.
+    req_gate: core::sync::atomic::AtomicBool,
     /// Negotiated queue size.
     qsize: u16,
     /// `queue_notify_off` for queue 0, captured at probe time.
@@ -267,6 +272,7 @@ impl VirtioBlkPci {
             queue: IrqSafeSpinLock::new(Some(queue)),
             _q_buf: q_buf,
             pool,
+            req_gate: core::sync::atomic::AtomicBool::new(false),
             qsize,
             queue_notify_off,
             irq_vector: None,
@@ -1228,10 +1234,11 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         if out.len() < need {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        // Interrupts stay enabled for the whole transfer: hold the request
-        // gate, not the IRQ-masking CONTROLLER lock. See `REQ_GATE`.
-        let _gate = ReqGate::acquire();
-        with_device_unlocked(|dev| {
+        // Interrupts stay enabled for the whole transfer: hold the device's
+        // request gate, not the IRQ-masking CONTROLLER lock. See `ReqGate`.
+        let dev = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let _gate = ReqGate::acquire(&dev.req_gate);
+        {
             // Batch one 4 KiB page per virtio round-trip.
             let mut done: u16 = 0;
             while done < n_blocks {
@@ -1258,8 +1265,7 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
                 done += chunk;
             }
             Ok(())
-        })
-        .unwrap_or(Err(narf_block::BlockIoError::DeviceRemoved))
+        }
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
         if n_blocks != 1 {
@@ -1271,21 +1277,18 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         let mut buf = [0u8; 512];
         buf.copy_from_slice(&data[..512]);
         // Same reasoning as `read` above.
-        let _gate = ReqGate::acquire();
-        with_device_unlocked(|dev| {
-            dev.write_sector(lba, &buf)
-                .map_err(|_| narf_block::BlockIoError::DriverError)
-        })
-        .unwrap_or(Err(narf_block::BlockIoError::DeviceRemoved))
+        let dev = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let _gate = ReqGate::acquire(&dev.req_gate);
+        dev.write_sector(lba, &buf)
+            .map_err(|_| narf_block::BlockIoError::DriverError)
     }
 }
 
 static CONTROLLER: IrqSafeSpinLock<Option<VirtioBlkPci>> = IrqSafeSpinLock::new(None);
 
-/// Serialises submitters against the single shared request scratch
-/// (`VirtioBlkPci::pool`) — spun on with **interrupts enabled**.
+/// RAII holder for a device's request gate.
 ///
-/// This is what the synchronous block paths hold instead of `CONTROLLER`.
+/// The synchronous block paths hold this instead of `CONTROLLER`.
 /// `CONTROLLER` is an `IrqSafeSpinLock`, so holding it across a device
 /// round-trip masks interrupts on the waiting CPU for the whole transfer
 /// and forces every other CPU to spin with interrupts masked too. With a
@@ -1298,17 +1301,14 @@ static CONTROLLER: IrqSafeSpinLock<Option<VirtioBlkPci>> = IrqSafeSpinLock::new(
 /// The device's own `queue` lock still provides virtqueue mutual
 /// exclusion, and `read_sectors` already releases it between completion
 /// polls, so this gate only has to cover the shared scratch pool.
-static REQ_GATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+struct ReqGate<'a>(&'a core::sync::atomic::AtomicBool);
 
-/// RAII holder for [`REQ_GATE`].
-struct ReqGate;
-
-impl ReqGate {
+impl<'a> ReqGate<'a> {
     /// Spin until the gate is ours. Interrupts keep their caller-supplied
     /// state — the whole point — so timer ticks, RCU quiescent states and
     /// the sleep pumps continue to run on this CPU while we wait.
-    fn acquire() -> ReqGate {
-        while REQ_GATE
+    fn acquire(flag: &'a core::sync::atomic::AtomicBool) -> ReqGate<'a> {
+        while flag
             .compare_exchange_weak(
                 false,
                 true,
@@ -1319,18 +1319,18 @@ impl ReqGate {
         {
             core::hint::spin_loop();
         }
-        ReqGate
+        ReqGate(flag)
     }
 }
 
-impl Drop for ReqGate {
+impl Drop for ReqGate<'_> {
     fn drop(&mut self) {
-        REQ_GATE.store(false, core::sync::atomic::Ordering::Release);
+        self.0.store(false, core::sync::atomic::Ordering::Release);
     }
 }
 
-/// Run `f` against the probed controller WITHOUT holding `CONTROLLER`
-/// for the duration.
+/// The probed controller, WITHOUT holding `CONTROLLER` for the caller's
+/// use of it.
 ///
 /// `CONTROLLER` is taken only long enough to read the address of the
 /// installed device, then released, so a long transfer runs with
@@ -1346,9 +1346,9 @@ impl Drop for ReqGate {
 /// that invariant, because it is the kind of assumption a later "support
 /// hot-unplug" change would silently invalidate.
 ///
-/// The one `&mut` path, [`enable_msix_for_probed`], takes [`ReqGate`] so
-/// it cannot alias a reference handed out here.
-fn with_device_unlocked<R>(f: impl FnOnce(&VirtioBlkPci) -> R) -> Option<R> {
+/// The one `&mut` path, [`enable_msix_for_probed`], takes the device's
+/// [`ReqGate`] so it cannot alias a reference handed out here.
+fn probed_device() -> Option<&'static VirtioBlkPci> {
     let ptr: *const VirtioBlkPci = {
         let g = CONTROLLER.lock();
         match g.as_ref() {
@@ -1358,8 +1358,8 @@ fn with_device_unlocked<R>(f: impl FnOnce(&VirtioBlkPci) -> R) -> Option<R> {
     };
     // SAFETY: install-once, never-moved, never-dropped — see above. The
     // only writer of the slot after install is `enable_msix_for_probed`,
-    // which is excluded by the caller's `ReqGate`.
-    Some(f(unsafe { &*ptr }))
+    // which is excluded by the device's request gate.
+    Some(unsafe { &*ptr })
 }
 
 /// The installed controller's address, or `None` before probe. Test hook
@@ -1448,7 +1448,8 @@ pub fn enable_msix_for_probed(
     // hands out shared references that outlive the CONTROLLER lock, so this
     // must exclude them the same way the synchronous I/O paths exclude each
     // other — otherwise the `&mut` below could alias a live transfer's `&`.
-    let _gate = ReqGate::acquire();
+    let gate_dev = probed_device().ok_or(VirtioPciError::NoQueues)?;
+    let _gate = ReqGate::acquire(&gate_dev.req_gate);
     let mut g = CONTROLLER.lock();
     let dev = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
     if let Some(v) = dev.irq_vector {
