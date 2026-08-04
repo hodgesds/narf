@@ -306,6 +306,53 @@ pub struct UserTaskCtx {
     /// re-checks the peer count against the already-installed fd rather than
     /// re-opening. Cleared (and the fd returned) once the peer appears.
     pub fifo_open_pending_fd: AtomicU64,
+
+    // ── stall-watchdog diagnostics ──────────────────────────────────
+    /// Monotonic count of park-condition re-checks: bumped on every
+    /// `park_should_block` pass (own-stack park loop), every deadline-branch
+    /// pass of `UserTaskFuture::poll` (longjmp parks), and every
+    /// `own_stack_wait_child` loop iteration.
+    ///
+    /// This is the signal that distinguishes the two ways a task can sit
+    /// parked forever. A HEALTHY parked task re-checks its condition on the
+    /// ~10 ms lost-wake backstop (infinite parks and io-parks both arm it),
+    /// so this counter climbs ~100/s even while the task never runs a user
+    /// instruction and accumulates no /proc CPU time. A counter that is
+    /// FROZEN while `parked_in_syscall` stays true means the task is never
+    /// re-polled at all — its backstop registration or executor wake was
+    /// lost — which no CPU-time metric can distinguish from ordinary idle.
+    pub dbg_park_checks: AtomicU64,
+    /// The fd set of an in-flight blocking `poll`/`ppoll` park, recorded at
+    /// park time so the stall watchdog can re-run the readiness scan for a
+    /// wedged poller (the poll twin of `epoll_wait_fd`): each slot is
+    /// `((events as u64) << 32) | (fd as u32 as u64 + 1)`, zero = empty.
+    /// Only the first [`POLL_WAIT_RECORD_MAX`] entries are recorded;
+    /// `poll_wait_nfds` carries the true set size. Cleared on every
+    /// `poll_common` return path.
+    pub poll_wait_fds: [AtomicU64; POLL_WAIT_RECORD_MAX],
+    /// True nfds of the recorded in-flight poll park (may exceed the
+    /// recorded window above), or 0 when no blocking poll is parked.
+    pub poll_wait_nfds: AtomicU32,
+}
+
+/// Recorded-fd window for [`UserTaskCtx::poll_wait_fds`]. Qt/glib main
+/// loops poll a handful of fds; 16 covers every set seen in a Plasma
+/// session while keeping the ctx growth bounded.
+pub const POLL_WAIT_RECORD_MAX: usize = 16;
+
+/// Whether parked tasks should record their polled fd set for the stall
+/// watchdog's strand detector. Off by default — see `record_poll_wait`.
+static POLL_WAIT_RECORDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Enable the diagnostic recording above. Called by the stall watchdog.
+pub fn enable_poll_wait_recording() {
+    POLL_WAIT_RECORDING.store(true, Ordering::Release);
+}
+
+#[inline]
+pub fn poll_wait_recording_enabled() -> bool {
+    POLL_WAIT_RECORDING.load(Ordering::Relaxed)
 }
 
 // SAFETY: cells are accessed only from the polling routine and
@@ -351,6 +398,9 @@ impl UserTaskCtx {
             console_read_pending: AtomicBool::new(false),
             blocking_deadline_ns: AtomicU64::new(0),
             fifo_open_pending_fd: AtomicU64::new(0),
+            dbg_park_checks: AtomicU64::new(0),
+            poll_wait_fds: [const { AtomicU64::new(0) }; POLL_WAIT_RECORD_MAX],
+            poll_wait_nfds: AtomicU32::new(0),
         }
     }
 }
@@ -575,6 +625,9 @@ fn park_should_block(
     sleep_handle: &mut Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
 ) -> bool {
     let task_id = crate::handlers::current_task_id();
+    // Watchdog liveness signal: this task's park loop ran (see
+    // `UserTaskCtx::dbg_park_checks`).
+    uc.dbg_park_checks.fetch_add(1, Ordering::Relaxed);
 
     // Job-control stop (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU): stay parked until
     // SIGCONT clears the stopped flag (SIGKILL=bit 9 still breaks through).
@@ -1606,6 +1659,11 @@ impl core::future::Future for UserTaskFuture {
         // long enough to keep heap pressure flat.
         let deadline = this.task.uctx.sleep_deadline_ns.load(Ordering::Acquire);
         if deadline != 0 {
+            // Watchdog liveness signal (see `UserTaskCtx::dbg_park_checks`).
+            this.task
+                .uctx
+                .dbg_park_checks
+                .fetch_add(1, Ordering::Relaxed);
             let now = narf_scheduler::narf_time::monotonic_ns();
             // An asynchronously-raised signal (e.g. SIGALRM from an
             // interval timer, a cross-process kill) must break ANY park —

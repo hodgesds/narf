@@ -185,6 +185,61 @@ pub fn dbg_stranded_wakes() -> alloc::vec::Vec<(u64, u64, u32)> {
     out
 }
 
+/// Parked tasks whose recorded `poll`/`ppoll` fd set already contains a
+/// ready descriptor — `(tid, pid, fd, revents, park_checks)` for each.
+///
+/// The epoll-only [`dbg_stranded_wakes`] could not see the case that
+/// actually matters: a glib main loop (KWin, and every Qt application
+/// using the GLib event dispatcher) parks in `ppoll`, not `epoll_wait`,
+/// so its `epoll_wait_fd` is never set and it never appears there.
+///
+/// `park_checks` is the discriminator that a readiness scan alone cannot
+/// give. It counts how many times the park loop re-evaluated this task.
+/// If it ADVANCES while an fd stays ready, the task is being reconsidered
+/// and something in the stay-parked decision is wrong. If it is FROZEN,
+/// the task is never reconsidered at all — a lost wake, not a bad
+/// decision. Those need opposite fixes, and the CPU counter alone cannot
+/// tell them apart.
+pub fn dbg_stranded_poll_waiters() -> alloc::vec::Vec<(u64, u64, i32, u32, u64)> {
+    let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
+    let mut out = alloc::vec::Vec::new();
+    for t in tasks {
+        if !t.uctx.parked_in_syscall.load(Ordering::Relaxed) {
+            continue;
+        }
+        let n = t.uctx.poll_wait_nfds.load(Ordering::Acquire) as usize;
+        if n == 0 {
+            continue;
+        }
+        let recorded = n.min(crate::user_task::POLL_WAIT_RECORD_MAX);
+        for slot in t.uctx.poll_wait_fds.iter().take(recorded) {
+            let packed = slot.load(Ordering::Relaxed);
+            if packed == 0 {
+                continue;
+            }
+            // Stored as `(events << 32) | (fd + 1)` so a zeroed slot is
+            // unambiguously "empty" rather than "fd 0".
+            let fd = ((packed & 0xFFFF_FFFF) as u32).wrapping_sub(1) as i32;
+            let want = (packed >> 32) as u32;
+            let ready =
+                crate::fd::with_table(t.tid, |tbl| tbl.get(fd as u32).map(|e| e.ops.clone()))
+                    .flatten()
+                    .map(|ops| ops.poll_readiness())
+                    .unwrap_or(0);
+            if ready & want != 0 {
+                out.push((
+                    t.tid,
+                    t.pid.load(Ordering::Relaxed),
+                    fd,
+                    ready & want,
+                    t.uctx.dbg_park_checks.load(Ordering::Relaxed),
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// The task currently executing on this CPU, if the scheduler has one
 /// published. `None` in kernel-test harness contexts.
 pub fn current_task() -> Option<Arc<Task>> {

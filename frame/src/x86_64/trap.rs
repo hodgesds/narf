@@ -99,6 +99,10 @@ mod stall_wd {
     /// cannot reset each other.
     static IDLE_FLAT_WINDOWS: AtomicU64 = AtomicU64::new(0);
     static STRANDED_DUMPED: AtomicBool = AtomicBool::new(false);
+    /// Bounded count of strand reports emitted, so a persistent strand
+    /// cannot flood the serial log while still allowing later, different
+    /// strands to be seen.
+    static STRANDED_REPORTS: AtomicU64 = AtomicU64::new(0);
     /// Identity of the last stranded set, so only a PERSISTENT strand
     /// (the same tasks, window after window) is reported.
     static LAST_STRANDED_SIG: AtomicU64 = AtomicU64::new(0);
@@ -148,6 +152,10 @@ mod stall_wd {
         // watchdog must enable it itself or its syscall signal is always 0.
         if !narf_lib::perf::enabled() {
             narf_lib::perf::set_enabled(true);
+            // The strand detector needs parked tasks to record their poll
+            // fd set; that recording is off by default because it costs
+            // atomic stores on every poll park.
+            narf_userspace::user_task::enable_poll_wait_recording();
         }
         let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
         let now = narf_scheduler::narf_time::now_cycles();
@@ -250,8 +258,22 @@ mod stall_wd {
         // the SAME task to stay in that state across consecutive windows keeps
         // the ordinary race — ready between the scan and the wake — from
         // reporting anything, since that resolves within one window.
-        if wc > 20 && !STRANDED_DUMPED.load(Ordering::Relaxed) {
-            let stranded = narf_userspace::task::dbg_stranded_wakes();
+        // Report repeatedly (bounded): the first strand is not necessarily
+        // the interesting one. A one-shot fires on whichever task wedges
+        // earliest in boot and then goes silent for the rest of the run,
+        // hiding every later strand — including the compositor's.
+        if wc > 20 && STRANDED_REPORTS.load(Ordering::Relaxed) < 12 {
+            let mut stranded = narf_userspace::task::dbg_stranded_wakes();
+            // A glib main loop parks in ppoll, not epoll_wait, so the
+            // epoll-only view above cannot see the compositor at all.
+            for (tid, pid, fd, revents, checks) in narf_userspace::task::dbg_stranded_poll_waiters()
+            {
+                let _ = writeln!(
+                    TrapWriter,
+                    "STALL-WD poll-stranded tid={tid} pid={pid} fd={fd} revents={revents:#x} park_checks={checks}"
+                );
+                stranded.push((tid, pid, fd as u32));
+            }
             let signature = stranded.iter().fold(0u64, |acc, (tid, _, epfd)| {
                 acc ^ (tid.rotate_left(17) ^ (*epfd as u64))
             });
@@ -260,7 +282,8 @@ mod stall_wd {
             {
                 let n = IDLE_FLAT_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
                 if n >= 3 {
-                    STRANDED_DUMPED.store(true, Ordering::Relaxed);
+                    STRANDED_REPORTS.fetch_add(1, Ordering::Relaxed);
+                    IDLE_FLAT_WINDOWS.store(0, Ordering::Relaxed);
                     let _ = writeln!(
                         TrapWriter,
                         "STALL-WD: {} parked task(s) held a READY epoll set across {n} windows — lost wakeup, not idle",
@@ -272,7 +295,9 @@ mod stall_wd {
                             "STALL-WD stranded tid={tid} pid={pid} epfd={epfd}"
                         );
                     }
-                    dump(sc);
+                    if !STRANDED_DUMPED.swap(true, Ordering::Relaxed) {
+                        dump(sc);
+                    }
                 }
             } else {
                 IDLE_FLAT_WINDOWS.store(0, Ordering::Relaxed);

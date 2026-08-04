@@ -364,6 +364,35 @@ fn poll_nearest_deadline(task_id: u64, fds: &[PollFd]) -> Option<u64> {
     best
 }
 
+/// Record a blocking poll park's fd set into the task ctx for the stall
+/// watchdog (see `UserTaskCtx::poll_wait_fds`): slot = `events<<32 | (fd+1)`.
+fn record_poll_wait(uc: &crate::user_task::UserTaskCtx, fds: &[PollFd]) {
+    use core::sync::atomic::Ordering;
+    // Diagnostics only: recording the fd set costs up to
+    // POLL_WAIT_RECORD_MAX atomic stores on EVERY poll park, which is a
+    // hot path. Off unless the stall watchdog asked for it, so a normal
+    // build pays one relaxed load.
+    if !crate::user_task::poll_wait_recording_enabled() {
+        return;
+    }
+    for (i, slot) in uc.poll_wait_fds.iter().enumerate() {
+        let v = match fds.get(i) {
+            Some(item) if item.fd >= 0 => {
+                ((item.events as u64) << 32) | ((item.fd as u32 as u64) + 1)
+            }
+            _ => 0,
+        };
+        slot.store(v, Ordering::Relaxed);
+    }
+    uc.poll_wait_nfds.store(fds.len() as u32, Ordering::Release);
+}
+
+/// Clear the watchdog poll-park record on a poll return path.
+fn clear_poll_wait_record(uc: &crate::user_task::UserTaskCtx) {
+    use core::sync::atomic::Ordering;
+    uc.poll_wait_nfds.store(0, Ordering::Release);
+}
+
 fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i64) {
     use core::sync::atomic::Ordering;
     let fail = SyscallReturn::ok((-1i64) as u64);
@@ -498,6 +527,7 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         unsafe {
             (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
             (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+            clear_poll_wait_record(&*uctx_ptr);
         }
         // SAFETY: same pointer/length as the parse step.
         unsafe { write_pollfds(ptr, &fds) };
@@ -512,6 +542,7 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
             unsafe {
                 (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
                 (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                clear_poll_wait_record(&*uctx_ptr);
             }
             // SAFETY: same pointer/length.
             unsafe { write_pollfds(ptr, &fds) };
@@ -529,6 +560,7 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
                 unsafe {
                     (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
                     (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                    clear_poll_wait_record(&*uctx_ptr);
                 }
                 ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // EINTR
                 return;
@@ -538,6 +570,11 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         unsafe {
             let uc = &*uctx_ptr;
             uc.net_io_wait.store(true, Ordering::Release);
+            // Record the parked fd set for the stall watchdog (the poll twin
+            // of `epoll_wait_fd`) so a wedged poller's readiness can be
+            // re-evaluated from the watchdog tick. Refreshed on every
+            // re-execution; cleared on every return path.
+            record_poll_wait(uc, &fds);
             // Clamp the scheduler wake-up to the nearest armed timerfd (its
             // expiry fires no readiness notify).
             if let Some(timer_dl) = poll_nearest_deadline(task, &fds) {
