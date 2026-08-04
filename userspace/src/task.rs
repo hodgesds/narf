@@ -200,7 +200,24 @@ pub fn dbg_stranded_wakes() -> alloc::vec::Vec<(u64, u64, u32)> {
 /// the task is never reconsidered at all — a lost wake, not a bad
 /// decision. Those need opposite fixes, and the CPU counter alone cannot
 /// tell them apart.
-pub fn dbg_stranded_poll_waiters() -> alloc::vec::Vec<(u64, u64, i32, u32, u64)> {
+///
+/// The trailing fields discriminate WHICH park a frozen task is actually
+/// in — `dbg_park_checks` only counts `park_should_block` /
+/// `UserTaskFuture::poll` passes, and two park sites bypass both the
+/// counter and the ~10 ms wheel backstop entirely:
+///   * `wait_child_pending` — the task parked through
+///     `own_stack_wait_child` (wait-child + signal waker only; no wheel
+///     slot, no io waiter, no counter bump). A ppoll that reaches
+///     `own_stack_block` with this flag stale-true is misrouted there.
+///   * `stopped` — the task parked through `park_should_block`'s
+///     job-stop arm (signal waker only; no wheel slot by design).
+///   * `deadline_ns`/`net_io_wait` — a healthy deadline-arm park shows
+///     `deadline != 0` + `net_io_wait == true` (io waiter + wheel
+///     backstop armed). `deadline == 0` while parked means a
+///     `wake_one` consumed the park state but the executor never
+///     re-polled the slot — an executor/queue-side lost wake.
+pub fn dbg_stranded_poll_waiters(
+) -> alloc::vec::Vec<(u64, u64, i32, u32, u64, u64, bool, bool, bool)> {
     let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
     let mut out = alloc::vec::Vec::new();
     for t in tasks {
@@ -233,6 +250,10 @@ pub fn dbg_stranded_poll_waiters() -> alloc::vec::Vec<(u64, u64, i32, u32, u64)>
                     fd,
                     ready & want,
                     t.uctx.dbg_park_checks.load(Ordering::Relaxed),
+                    t.uctx.sleep_deadline_ns.load(Ordering::Relaxed),
+                    t.uctx.net_io_wait.load(Ordering::Relaxed),
+                    t.uctx.wait_child_pending.load(Ordering::Relaxed),
+                    crate::handlers::is_task_stopped(t.tid),
                 ));
             }
         }
