@@ -1530,28 +1530,39 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_sendfile_neg);
 
 // ── splice ─────────────────────────────────────────────────────────
 //
-// splice(fd_in, off_in*, fd_out, off_out*, len, flags). NARF reuses the
-// sendfile copy core (no pipe requirement enforced), so a file→file
-// copy is the reachable success.
+// splice(fd_in, off_in*, fd_out, off_out*, len, flags). At least one
+// side must be a pipe (`fs/splice.c::__do_splice` → -EINVAL otherwise);
+// this positive arm splices file → pipe. The pipe-shape negatives
+// (file→file EINVAL, pipe-side offset ESPIPE, empty-pipe EAGAIN) live
+// in smoke_abi_fdio_splice_shape.
+//
+// HISTORY: this test used to assert a file→file splice SUCCEEDS —
+// NARF's old splice had no pipe requirement. That encoded the
+// divergence rather than pinning it; corrected to the Linux shape.
 
 fn smoke_abi_fdio_splice_pos() -> TestResult {
-    with_memfs("/abi", "abi", &[("src", b"xyz"), ("dst", b"")], || {
+    with_memfs("/abi", "abi", &[("src", b"xyz")], || {
         let in_fd = open_fd(b"/abi/src\0")?;
-        let out_fd = open_fd(b"/abi/dst\0")?;
-        // splice(in, NULL, out, NULL, 3, 0) → 3 bytes.
+        let (rd, wr) = make_pipe()?;
+        // splice(file, NULL, pipe_wr, NULL, 3, 0) → 3 bytes.
         match call_raw(
             Syscall::Splice.raw(),
             SyscallArgs {
                 arg0: in_fd as u64,
                 arg1: 0,
-                arg2: out_fd as u64,
+                arg2: wr as u64,
                 arg3: 0,
                 arg4: 3,
                 arg5: 0,
             },
         ) {
-            r if r.status == SyscallReturn::OK && r.value as i64 == 3 => Ok(()),
-            _ => Err("splice did not copy 3 bytes"),
+            r if r.status == SyscallReturn::OK && r.value as i64 == 3 => {}
+            _ => return Err("splice did not copy 3 bytes"),
+        }
+        let mut b = [0u8; 4];
+        match call(Syscall::Read.raw(), a2(rd as u64, b.as_mut_ptr() as u64, 4)) {
+            Some(3) if &b[..3] == b"xyz" => Ok(()),
+            _ => Err("spliced bytes did not arrive in the pipe"),
         }
     })
 }
@@ -1560,8 +1571,8 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_splice_pos);
 fn smoke_abi_fdio_splice_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("dst", b"")], || {
         let out_fd = open_fd(b"/abi/dst\0")?;
-        // bad fd_in → -1 sentinel.
-        // LINUX-GAP: Linux splice(2) returns -EBADF.
+        // bad fd_in → -EBADF (`fs/splice.c` fdget failure). Was the bare
+        // -1 sentinel before splice resolved both fds up front.
         match call_raw(
             Syscall::Splice.raw(),
             SyscallArgs {
@@ -1573,8 +1584,8 @@ fn smoke_abi_fdio_splice_neg() -> TestResult {
                 arg5: 0,
             },
         ) {
-            r if r.status == SyscallReturn::OK && r.value as i64 == -1 => Ok(()),
-            _ => Err("splice with bad fd_in was not -1"),
+            r if r.status == SyscallReturn::OK && r.value as i64 == EBADF => Ok(()),
+            _ => Err("splice with bad fd_in was not -EBADF"),
         }
     })
 }
@@ -1684,6 +1695,9 @@ fn smoke_abi_fdio_tee_pos() -> TestResult {
         let (rd1, _wr1) = make_pipe()?;
         let (_rd2, wr2) = make_pipe()?;
         // Empty source pipe → peek yields no bytes → tee returns 0.
+        // LINUX-GAP: with the writer still open, Linux `fs/splice.c::do_tee`
+        // BLOCKS here (or -EAGAINs under SPLICE_F_NONBLOCK); NARF's tee has
+        // no blocking path yet and reports the transient 0.
         match call(Syscall::Tee.raw(), a3(rd1 as u64, wr2 as u64, 16, 0)) {
             Some(0) => Ok(()),
             _ => Err("tee on an empty pipe did not return 0"),
