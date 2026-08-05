@@ -1067,6 +1067,370 @@ fn smoke_abi_bpf_map_get_next_key_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_map_get_next_key_neg);
 
+// ── BPF_MAP_*_BATCH ──────────────────────────────────────────────────
+
+const BPF_MAP_LOOKUP_BATCH: u64 = 24;
+const BPF_MAP_LOOKUP_AND_DELETE_BATCH: u64 = 25;
+const BPF_MAP_UPDATE_BATCH: u64 = 26;
+const BPF_MAP_DELETE_BATCH: u64 = 27;
+
+// `batch` field offsets. `map_fd` is at 36 here, not 0 as in `map_elem`.
+const BA_IN_BATCH: usize = 0;
+const BA_OUT_BATCH: usize = 8;
+const BA_KEYS: usize = 16;
+const BA_VALUES: usize = 24;
+const BA_COUNT: usize = 32;
+const BA_MAP_FD: usize = 36;
+const BA_ELEM_FLAGS: usize = 40;
+
+/// One batch command. `count` is in/out: the buffer's slot count going in, the
+/// number the kernel filled coming back — read from the attr the kernel wrote
+/// in place. Returns `(syscall_result, count_out)`.
+#[allow(clippy::too_many_arguments)]
+fn batch(
+    cmd: u64,
+    fd: i64,
+    in_batch: u64,
+    out_batch: u64,
+    keys: u64,
+    values: u64,
+    count: u32,
+    elem_flags: u64,
+) -> (Option<i64>, u32) {
+    let mut attr = [0u8; ATTR_LEN];
+    put_u64(&mut attr, BA_IN_BATCH, in_batch);
+    put_u64(&mut attr, BA_OUT_BATCH, out_batch);
+    put_u64(&mut attr, BA_KEYS, keys);
+    put_u64(&mut attr, BA_VALUES, values);
+    put_u32(&mut attr, BA_COUNT, count);
+    put_u32(&mut attr, BA_MAP_FD, fd as u32);
+    put_u64(&mut attr, BA_ELEM_FLAGS, elem_flags);
+    let r = call(
+        Syscall::Bpf.raw(),
+        a2(cmd, attr.as_ptr() as u64, ATTR_LEN as u64),
+    );
+    let count_out = u32::from_le_bytes([
+        attr[BA_COUNT],
+        attr[BA_COUNT + 1],
+        attr[BA_COUNT + 2],
+        attr[BA_COUNT + 3],
+    ]);
+    (r, count_out)
+}
+
+/// Whether the `(key, value)` pairs in `got` are exactly the set in `exp`,
+/// order-independent — a batch dump promises every element once, not an order.
+fn batch_set_matches(got_k: &[u32], got_v: &[u64], exp_k: &[u32], exp_v: &[u64]) -> bool {
+    if got_k.len() != exp_k.len() {
+        return false;
+    }
+    for j in 0..exp_k.len() {
+        let mut hits = 0;
+        for i in 0..got_k.len() {
+            if got_k[i] == exp_k[j] && got_v[i] == exp_v[j] {
+                hits += 1;
+            }
+        }
+        if hits != 1 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Seed a hash map with three `(key, value)` pairs through single updates.
+fn seed_three(fd: i64, ks: &[u32; 3], vs: &[u64; 3]) -> Result<(), &'static str> {
+    for i in 0..3 {
+        if elem(
+            BPF_MAP_UPDATE_ELEM,
+            fd,
+            (&ks[i]) as *const u32 as u64,
+            (&vs[i]) as *const u64 as u64,
+            BPF_ANY,
+        ) != Some(0)
+        {
+            return Err("seed update failed");
+        }
+    }
+    Ok(())
+}
+
+fn smoke_abi_bpf_map_lookup_batch_pos() -> TestResult {
+    with_setup(|| {
+        let fd = create_map(BPF_MAP_TYPE_HASH, 4, 8, 8).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let ks: [u32; 3] = [10, 20, 30];
+        let vs: [u64; 3] = [100, 200, 300];
+        seed_three(fd, &ks, &vs)?;
+
+        // One-shot dump: ask for more slots than exist. Every pair comes back,
+        // and the exhausted walk terminates with ENOENT — the signal libbpf's
+        // dump loop stops on — with `count` set to what was filled.
+        let mut ok = [0u32; 8];
+        let mut ov = [0u64; 8];
+        let mut cur = [0u8; 4];
+        let (r, n) = batch(
+            BPF_MAP_LOOKUP_BATCH,
+            fd,
+            0,
+            cur.as_mut_ptr() as u64,
+            ok.as_mut_ptr() as u64,
+            ov.as_mut_ptr() as u64,
+            8,
+            0,
+        );
+        if r != Some(ENOENT) {
+            return Err("an exhausted lookup batch did not return ENOENT");
+        }
+        if n != 3 {
+            return Err("lookup batch filled the wrong count");
+        }
+        if !batch_set_matches(&ok[..3], &ov[..3], &ks, &vs) {
+            return Err("lookup batch returned the wrong (key, value) set");
+        }
+
+        // Cursor resume: two elements at a time, feeding out_batch back in as
+        // in_batch, must visit every key exactly once across the split.
+        let mut seen_k = [0u32; 8];
+        let mut seen_v = [0u64; 8];
+        let mut total = 0usize;
+        let mut cursor = [0u8; 4];
+        let mut in_ptr = 0u64;
+        for _guard in 0..8 {
+            let mut bk = [0u32; 2];
+            let mut bv = [0u64; 2];
+            let (r, n) = batch(
+                BPF_MAP_LOOKUP_BATCH,
+                fd,
+                in_ptr,
+                cursor.as_mut_ptr() as u64,
+                bk.as_mut_ptr() as u64,
+                bv.as_mut_ptr() as u64,
+                2,
+                0,
+            );
+            for i in 0..n as usize {
+                seen_k[total] = bk[i];
+                seen_v[total] = bv[i];
+                total += 1;
+            }
+            in_ptr = cursor.as_ptr() as u64;
+            match r {
+                Some(0) => continue,
+                Some(x) if x == ENOENT => break,
+                _ => return Err("cursor lookup batch returned an unexpected code"),
+            }
+        }
+        if total != 3 {
+            return Err("cursor walk visited the wrong number of keys");
+        }
+        if !batch_set_matches(&seen_k[..3], &seen_v[..3], &ks, &vs) {
+            return Err("cursor walk returned the wrong (key, value) set");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_map_lookup_batch_pos);
+
+fn smoke_abi_bpf_map_lookup_and_delete_batch_drains() -> TestResult {
+    with_setup(|| {
+        let fd = create_map(BPF_MAP_TYPE_HASH, 4, 8, 8).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let ks: [u32; 3] = [10, 20, 30];
+        let vs: [u64; 3] = [100, 200, 300];
+        seed_three(fd, &ks, &vs)?;
+
+        let mut ok = [0u32; 8];
+        let mut ov = [0u64; 8];
+        let mut cur = [0u8; 4];
+        let (r, n) = batch(
+            BPF_MAP_LOOKUP_AND_DELETE_BATCH,
+            fd,
+            0,
+            cur.as_mut_ptr() as u64,
+            ok.as_mut_ptr() as u64,
+            ov.as_mut_ptr() as u64,
+            8,
+            0,
+        );
+        if r != Some(ENOENT) {
+            return Err("lookup-and-delete batch did not terminate with ENOENT");
+        }
+        if n != 3 || !batch_set_matches(&ok[..3], &ov[..3], &ks, &vs) {
+            return Err("lookup-and-delete batch returned the wrong set");
+        }
+
+        // The map is drained: a follow-up dump yields nothing, and single
+        // lookups miss.
+        let (r2, n2) = batch(
+            BPF_MAP_LOOKUP_BATCH,
+            fd,
+            0,
+            cur.as_mut_ptr() as u64,
+            ok.as_mut_ptr() as u64,
+            ov.as_mut_ptr() as u64,
+            8,
+            0,
+        );
+        if r2 != Some(ENOENT) || n2 != 0 {
+            return Err("lookup-and-delete batch did not drain the map");
+        }
+        let mut scratch: u64 = 0;
+        for k in &ks {
+            if elem(
+                BPF_MAP_LOOKUP_ELEM,
+                fd,
+                k as *const u32 as u64,
+                (&mut scratch) as *mut u64 as u64,
+                0,
+            ) != Some(ENOENT)
+            {
+                return Err("a drained key is still present");
+            }
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_bpf_map_lookup_and_delete_batch_drains
+);
+
+fn smoke_abi_bpf_map_update_and_delete_batch_pos() -> TestResult {
+    with_setup(|| {
+        let fd = create_map(BPF_MAP_TYPE_HASH, 4, 8, 8).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let ks: [u32; 3] = [1, 2, 3];
+        let vs: [u64; 3] = [11, 22, 33];
+        let (r, n) = batch(
+            BPF_MAP_UPDATE_BATCH,
+            fd,
+            0,
+            0,
+            ks.as_ptr() as u64,
+            vs.as_ptr() as u64,
+            3,
+            BPF_ANY,
+        );
+        if r != Some(0) || n != 3 {
+            return Err("update batch did not insert every element");
+        }
+        // Each pair is now individually visible.
+        for i in 0..3 {
+            let mut got: u64 = 0;
+            if elem(
+                BPF_MAP_LOOKUP_ELEM,
+                fd,
+                (&ks[i]) as *const u32 as u64,
+                (&mut got) as *mut u64 as u64,
+                0,
+            ) != Some(0)
+                || got != vs[i]
+            {
+                return Err("update batch did not store the right value");
+            }
+        }
+
+        // Delete two of the three by batch; the third survives.
+        let dk: [u32; 2] = [1, 2];
+        let (r, n) = batch(BPF_MAP_DELETE_BATCH, fd, 0, 0, dk.as_ptr() as u64, 0, 2, 0);
+        if r != Some(0) || n != 2 {
+            return Err("delete batch did not remove every named key");
+        }
+        let mut got: u64 = 0;
+        for k in &dk {
+            if elem(
+                BPF_MAP_LOOKUP_ELEM,
+                fd,
+                k as *const u32 as u64,
+                (&mut got) as *mut u64 as u64,
+                0,
+            ) != Some(ENOENT)
+            {
+                return Err("a batch-deleted key is still present");
+            }
+        }
+        let survivor: u32 = 3;
+        if elem(
+            BPF_MAP_LOOKUP_ELEM,
+            fd,
+            (&survivor) as *const u32 as u64,
+            (&mut got) as *mut u64 as u64,
+            0,
+        ) != Some(0)
+            || got != 33
+        {
+            return Err("delete batch removed a key it was not given");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_map_update_and_delete_batch_pos);
+
+fn smoke_abi_bpf_map_batch_neg() -> TestResult {
+    with_setup(|| {
+        // A per-element `BPF_F_LOCK` names spin-locked storage NARF has no
+        // implementation of; it must be refused, not silently ignored.
+        let fd = create_map(BPF_MAP_TYPE_HASH, 4, 8, 2).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let mut ok = [0u32; 4];
+        let mut ov = [0u64; 4];
+        let mut cur = [0u8; 4];
+        let (r, _) = batch(
+            BPF_MAP_LOOKUP_BATCH,
+            fd,
+            0,
+            cur.as_mut_ptr() as u64,
+            ok.as_mut_ptr() as u64,
+            ov.as_mut_ptr() as u64,
+            4,
+            BPF_F_LOCK,
+        );
+        if r != Some(EINVAL) {
+            return Err("lookup batch accepted an unsupported BPF_F_LOCK");
+        }
+
+        // Partial progress: the map holds two, so a three-element update stops
+        // at the third with E2BIG and reports exactly the two that landed.
+        let ks: [u32; 3] = [7, 8, 9];
+        let vs: [u64; 3] = [70, 80, 90];
+        let (r, n) = batch(
+            BPF_MAP_UPDATE_BATCH,
+            fd,
+            0,
+            0,
+            ks.as_ptr() as u64,
+            vs.as_ptr() as u64,
+            3,
+            BPF_NOEXIST,
+        );
+        if r != Some(E2BIG) {
+            return Err("an over-capacity update batch did not return E2BIG");
+        }
+        if n != 2 {
+            return Err("update batch did not report its partial progress in count");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_map_batch_neg);
+
 // ── per-CPU maps through the syscall ────────────────────────────────
 
 fn smoke_abi_bpf_map_percpu_value_width() -> TestResult {
