@@ -161,7 +161,8 @@ pub unsafe fn load_user_process_with(
     aux: &[AuxEntry],
 ) -> Result<UserProcess, ProcessLoadError> {
     // SAFETY: this is the default global-root form of the rooted loader below.
-    unsafe { load_user_process_with_root(bytes, argv, envp, aux, None) }
+    // Spawn semantics: a fresh process gets a fresh pid.
+    unsafe { load_user_process_with_root(bytes, argv, envp, aux, None, alloc_pid()) }
 }
 
 /// Load an ELF as a new process, resolving a filesystem-backed `PT_INTERP`
@@ -173,6 +174,12 @@ pub unsafe fn load_user_process_with(
 /// absolute VFS prefix explicitly.  The caller must install the same root on
 /// the reserved task before publishing it to the scheduler.
 ///
+/// `pid` is the ProcessId the returned `UserProcess` is stamped with.
+/// Spawn paths mint a fresh one (`alloc_pid()`); `execve` passes the calling
+/// process's EXISTING pid — exec replaces an image, it does not create a
+/// process, and the pre-fix `alloc_pid()` here leaked one pool entry per
+/// exec (never released, since exec discards the loader's pid).
+///
 /// # Safety
 /// Same contract as [`load_user_process_with`]. `root`, if present, must name
 /// an absolute mounted directory.
@@ -182,6 +189,7 @@ pub unsafe fn load_user_process_with_root(
     envp: &[&str],
     aux: &[AuxEntry],
     root: Option<&str>,
+    pid: crate::ProcessId,
 ) -> Result<UserProcess, ProcessLoadError> {
     // SAFETY: caller upholds this fn's `# Safety` contract (live low-4-GiB
     // identity map + initialised frame allocator), which is precisely what
@@ -628,7 +636,7 @@ pub unsafe fn load_user_process_with_root(
     let fs_base: Option<u64> = None;
 
     Ok(UserProcess {
-        pid: alloc_pid(),
+        pid,
         address_space,
         entry,
         stack_top: VirtAddr::new(rsp),

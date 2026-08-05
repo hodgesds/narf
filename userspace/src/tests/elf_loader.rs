@@ -2115,3 +2115,277 @@ fn smoke_unshare_pid_ns_sees_self_as_pid_one() -> TestResult {
 }
 #[cfg(feature = "container")]
 kernel_test_in!("userspace", smoke_unshare_pid_ns_sees_self_as_pid_one);
+
+// ── execve leak regression tests ─────────────────────────────────────
+//
+// Root causes pinned here (found via the Fedora-KDE 5-minute kernel-heap
+// OOM: "memory allocation of N bytes failed" under fork+exec churn):
+//
+//   1. `load_user_process_with` minted a fresh pid for EVERY load — but
+//      execve replaces an image inside an existing process, so the minted
+//      pid was discarded and never released: one pid-pool entry leaked
+//      per exec.
+//   2. The execve commit paths DIVERGE (own-stack `enter_user_mode_at_top`
+//      inline; longjmp-model via the EXECVE hook). Divergence abandons the
+//      syscall frames, so destructors of live locals never run — the new
+//      image's `UserProcess` (including a strong `Arc<AddressSpace>` that
+//      kept the whole post-exec AS alive FOREVER, surviving process exit),
+//      the ELF buffer, and the argv/envp copies all leaked per exec.
+
+/// Net pids currently allocated: ids minted past the watermark minus
+/// ids sitting in the free pool.
+#[cfg(target_arch = "x86_64")]
+fn net_allocated_pids() -> u64 {
+    (crate::pid_pool_watermark() - 1) - crate::pid_pool_free_count() as u64
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_does_not_leak_pid() -> TestResult {
+    // Drive the real execve handler over a valid staged ELF (same fixture
+    // as smoke_userspace_execve_loads_elf_then_bails_without_user_ctx: the
+    // load completes, then the handler bails for want of a user ctx). The
+    // pid pool must be EXACTLY as it was: exec replaces an image, it does
+    // not create a process. Pre-fix the loader minted (and leaked) one pid
+    // per exec — under a desktop boot's service churn that marched the pool
+    // toward PID_MAX exhaustion.
+    //
+    // The path pointer below is a kernel address; scope the kernel-buffer
+    // opt-in so the copy-in validators accept it and the handler really
+    // reaches the loader (without it the path copy can bail first and the
+    // pid assertion would vacuously pass).
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    crate::syscall::__test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let elf = build_minimal_elf_for_execve();
+    let mount = {
+        use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+        let auth = bootstrap_mount_authority();
+        registry()
+            .mount(
+                &auth,
+                "/execve-pid-leak",
+                MemFs::with_seeds("execve-pid-leak", &[("init", elf.as_slice())]),
+            )
+            .ok()
+    };
+
+    let before = net_allocated_pids();
+
+    let path = b"/execve-pid-leak/init\0";
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
+    let after = net_allocated_pids();
+
+    if let Some(h) = &mount {
+        let _ = narf_filesystem::registry().unmount(h, "/execve-pid-leak");
+    }
+    crate::syscall::__test_clear_global();
+
+    if ctx.ret != Some(SyscallReturn::invalid_op()) {
+        return TestResult::Fail("execve fixture drifted: expected the no-user-ctx bail");
+    }
+    if after != before {
+        return TestResult::Fail("execve leaked a pid (net allocated pids changed across exec)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_execve_does_not_leak_pid);
+
+#[cfg(target_arch = "x86_64")]
+struct ExecJmpCell(core::cell::UnsafeCell<narf_scheduler::JmpBuf>);
+#[cfg(target_arch = "x86_64")]
+// SAFETY: written by exactly one test, single-threaded kernel-test runner.
+unsafe impl Sync for ExecJmpCell {}
+#[cfg(target_arch = "x86_64")]
+static EXEC_LEAK_JMP: ExecJmpCell =
+    ExecJmpCell(core::cell::UnsafeCell::new(narf_scheduler::JmpBuf {
+        rbx: 0,
+        rbp: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rsp: 0,
+        rip: 0,
+    }));
+
+/// Stand-in for the production execve hook: longjmp straight back into
+/// the test, abandoning the execve syscall frames exactly the way the
+/// real hook abandons them into the polling routine.
+#[cfg(target_arch = "x86_64")]
+unsafe fn exec_leak_test_hook(_uctx: *mut crate::user_task::UserTaskCtx) -> ! {
+    // SAFETY: the jmp buf was filled by the setjmp in the test body below,
+    // whose frame is still live (it is waiting for this longjmp).
+    unsafe { narf_scheduler::longjmp(EXEC_LEAK_JMP.0.get(), 1) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_divergence_frees_address_space() -> TestResult {
+    // The execve commit path never returns to its caller — it longjmps (or
+    // iretqs) away, abandoning the syscall frames, so anything still owned
+    // by a local at that point leaks forever. This test runs the REAL
+    // handler with a longjmp hook (production shape) and then checks the
+    // one observable that matters: after the staged ExecRequest is consumed
+    // and dropped, the freshly-loaded address space must be GONE — live
+    // user-PML4 count back at baseline. Pre-fix the abandoned frame held a
+    // strong Arc<AddressSpace> (inside the leaked UserProcess), so every
+    // exec left one dead AS (PML4 tree + every mapped frame) behind — the
+    // Fedora-KDE 5-minute kernel-heap OOM.
+    use crate::user_task::{clear_current, install_current, UserTaskCtx};
+
+    // The path pointer below is a kernel address; with a user ctx installed
+    // the copy-in validators enforce the user half, so scope the kernel-
+    // buffer opt-in the way every syscall-driving e2e fixture does.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    crate::syscall::__test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let elf = build_minimal_elf_for_execve();
+    let mount = {
+        use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+        let auth = bootstrap_mount_authority();
+        registry()
+            .mount(
+                &auth,
+                "/execve-as-leak",
+                MemFs::with_seeds("execve-as-leak", &[("init", elf.as_slice())]),
+            )
+            .ok()
+    };
+
+    // A live user ctx (so execve reaches the hook) + the longjmp hook.
+    let uctx: *mut UserTaskCtx =
+        alloc::boxed::Box::into_raw(alloc::boxed::Box::new(UserTaskCtx::new()));
+    crate::user_task::install_execve_hook(exec_leak_test_hook);
+
+    let baseline = narf_memory::paging::user_pml4_live();
+
+    let path = b"/execve-as-leak/init\0";
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    // IRQs masked across install_current → execve → longjmp: the `CURRENT`
+    // uctx cell is per-CPU, and a timer preemption between the install and
+    // the handler's read can migrate this test task to another CPU, where
+    // the cell is empty — execve then takes the no-user-ctx bail instead of
+    // the hook. (The production poll path installs and reads on one CPU
+    // with the same no-preempt guarantee.)
+    let reached_hook = narf_lib::sync::without_interrupts(|| {
+        install_current(uctx);
+        // SAFETY: EXEC_LEAK_JMP is a valid JmpBuf; the hook longjmps back here.
+        let resumed = unsafe { narf_scheduler::setjmp(EXEC_LEAK_JMP.0.get()) };
+        if resumed == 0 {
+            kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
+            // The hook must have fired (and longjmp'd past this line).
+            return false;
+        }
+        true
+    });
+    if !reached_hook {
+        crate::user_task::__test_clear_execve_hook();
+        clear_current();
+        // SAFETY: uctx came from Box::into_raw above; nothing else owns it.
+        drop(unsafe { alloc::boxed::Box::from_raw(uctx) });
+        if let Some(h) = &mount {
+            let _ = narf_filesystem::registry().unmount(h, "/execve-as-leak");
+        }
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("execve never reached the exec hook (fixture drifted)");
+    }
+
+    // Back from the longjmp: consume the staged ExecRequest the way the
+    // polling routine would, then drop it — the LAST intended reference
+    // to the new image's address space.
+    // SAFETY: uctx is still owned by this test; execve published the
+    // request pointer with Box::into_raw.
+    let req_ptr = unsafe {
+        (*uctx)
+            .pending_exec
+            .swap(core::ptr::null_mut(), AtomicOrd::AcqRel)
+    };
+    let had_req = !req_ptr.is_null();
+    if had_req {
+        // SAFETY: non-null pending_exec is always a Box::into_raw'd ExecRequest.
+        drop(unsafe { alloc::boxed::Box::from_raw(req_ptr) });
+    }
+
+    crate::user_task::__test_clear_execve_hook();
+    clear_current();
+    // SAFETY: uctx came from Box::into_raw above; nothing else owns it.
+    drop(unsafe { alloc::boxed::Box::from_raw(uctx) });
+    if let Some(h) = &mount {
+        let _ = narf_filesystem::registry().unmount(h, "/execve-as-leak");
+    }
+    crate::syscall::__test_clear_global();
+
+    if !had_req {
+        return TestResult::Fail("execve staged no ExecRequest before the hook");
+    }
+    let after = narf_memory::paging::user_pml4_live();
+    if after != baseline {
+        return TestResult::Fail(
+            "execve divergence leaked the new address space (user PML4 live count did not return to baseline)",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_execve_divergence_frees_address_space
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_loader_stamps_caller_pid() -> TestResult {
+    // The rooted loader takes the ProcessId from its caller: exec passes the
+    // calling process's EXISTING pid, spawn paths mint a fresh one. The
+    // loader itself must neither mint nor release anything.
+    use crate::{load_user_process_with_root, ProcessId};
+
+    let elf = build_minimal_elf_for_execve();
+    let before = net_allocated_pids();
+    // SAFETY: kernel-test environment has the identity map + frame allocator.
+    let proc =
+        match unsafe { load_user_process_with_root(&elf, &[], &[], &[], None, ProcessId(4242)) } {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("rooted load failed on the minimal ELF"),
+        };
+    let stamped = proc.pid.raw();
+    drop(proc);
+    let after = net_allocated_pids();
+    if stamped != 4242 {
+        return TestResult::Fail("loader did not stamp the caller-supplied pid");
+    }
+    if after != before {
+        return TestResult::Fail(
+            "rooted loader touched the pid pool (must neither mint nor release)",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_loader_stamps_caller_pid);

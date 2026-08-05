@@ -894,12 +894,25 @@ fn do_execve_resolved(
     }
     let argv_refs: alloc::vec::Vec<&str> = cur_argv.iter().map(|s| s.as_str()).collect();
 
-    // Step 4: load the new image. SAFETY: load_user_process_with's
-    // contract — identity-mapped low 4 GiB, frame allocator
-    // initialised. Both hold by the time any user task is running.
+    let task = current_task_id();
+
+    // Step 4: load the new image. exec REPLACES this process's image, so the
+    // loaded `UserProcess` carries the caller's EXISTING pid — minting a fresh
+    // one here (the pre-fix `load_user_process_with` behaviour) leaked one
+    // pid-pool entry per exec, marching the pool toward PID_MAX exhaustion.
+    // SAFETY: load_user_process_with_root's contract — identity-mapped low
+    // 4 GiB, frame allocator initialised. Both hold by the time any user
+    // task is running.
     // SAFETY: Valid memory or trusted environment
     let new_proc = match unsafe {
-        crate::process::load_user_process_with(&elf_buf, &argv_refs, &envp_refs, &[])
+        crate::process::load_user_process_with_root(
+            &elf_buf,
+            &argv_refs,
+            &envp_refs,
+            &[],
+            None,
+            crate::ProcessId(task_to_pid_raw(task).unwrap_or(task)),
+        )
     } {
         Ok(p) => p,
         Err(_) => {
@@ -907,8 +920,6 @@ fn do_execve_resolved(
             return;
         }
     };
-
-    let task = current_task_id();
 
     // CLONE_VFORK release: this child is now replacing its image, so it no
     // longer needs the shared address space — wake a parent suspended in
@@ -960,7 +971,7 @@ fn do_execve_resolved(
     // Step 5: swap the scheduler slot's AS Arc. Without this the
     // poll path's later activate() would still target the old AS
     // until the future's process.address_space update lands.
-    let _prev_slot_as = narf_scheduler::replace_address_space(
+    let prev_slot_as = narf_scheduler::replace_address_space(
         narf_scheduler::TaskId(task),
         new_proc.address_space.clone(),
     );
@@ -969,11 +980,37 @@ fn do_execve_resolved(
     // ExecRequest after a longjmp. Apply the new image inline — activate the new
     // AS + TLS, then enter the new entry at the TOP of this task's own kernel
     // stack (abandoning the execve syscall frames), which DIVERGES.
+    //
+    // BECAUSE it diverges, no destructor of any local still live at the jump
+    // ever runs — the abandoned frames are simply overwritten by the next
+    // trap. Every heap-owning local must therefore be dropped BY HAND before
+    // the jump. The pre-fix version dropped nothing: each exec leaked the
+    // `UserProcess` (including one strong `Arc<AddressSpace>`, which kept the
+    // whole post-exec address space — PML4 tree + every faulted user frame —
+    // alive FOREVER, surviving process exit), the ELF image buffer, and the
+    // argv/envp copies. Under a process-churning desktop boot (~1 exec/s,
+    // ~15 MiB/exec) that exhausted 8 GiB in ~5 minutes: the
+    // "memory allocation of N bytes failed" kernel-heap OOM panic.
     #[cfg(target_arch = "x86_64")]
     if narf_scheduler::stackful::user_own_stack_enabled() {
         let entry = new_proc.entry.0.as_u64();
         let rsp = new_proc.stack_top.as_u64();
-        let _ = new_proc.address_space.activate();
+        let fs_base = new_proc.fs_base;
+        // The scheduler slot (PENDING_SLOT_AS entry from Step 5) holds the
+        // persistent reference that keeps the new AS alive while the task
+        // runs; this local clone only bridges the activate() below.
+        let new_as = new_proc.address_space.clone();
+        // Borrow-holders first, then owners.
+        drop(argv_refs);
+        drop(envp_refs);
+        drop(new_proc);
+        drop(elf_buf);
+        drop(cur_argv);
+        drop(cur_path);
+        drop(argv_strs);
+        drop(envp_strs);
+        drop(path_owned);
+        let _ = new_as.activate();
         // Publish the new CR3 so a later preempt/park resume re-activates the
         // post-execve AS (not the pre-execve one) — see set_current_user_cr3.
         {
@@ -985,10 +1022,16 @@ fn do_execve_resolved(
             }
             narf_scheduler::stackful::set_current_user_cr3(cr3);
         }
-        if let Some(fb) = new_proc.fs_base {
+        if let Some(fb) = fs_base {
             // SAFETY: canonical user vaddr from the new image's TLS staging.
             unsafe { narf_scheduler::set_user_fs_base(fb) };
         }
+        // The new AS is active and referenced by the slot; the pre-exec AS
+        // (if Step 5 displaced one) is dead to this task. Release both local
+        // refs now — after activate(), so teardown of a last-ref pre-exec AS
+        // never races the CR3 it used to back.
+        drop(new_as);
+        drop(prev_slot_as);
         let top = narf_scheduler::stackful::current_stackful_stack_top();
         // SAFETY: new AS active; entry/rsp mapped by the loader; resets RSP to
         // this task's own kernel-stack top and iretq's into the new image.
@@ -1042,6 +1085,22 @@ fn do_execve_resolved(
     }
     let hook = crate::user_task::execve_hook();
     if let Some(h) = hook {
+        // The hook longjmps back into the polling routine and never returns
+        // — the same divergence discipline as the own-stack branch above
+        // applies: destructors of locals still live here never run, so drop
+        // every heap-owning local by hand first. (`req` was consumed into
+        // `pending_exec`; the ExecRequest itself is freed by the poll that
+        // applies it.)
+        drop(argv_refs);
+        drop(envp_refs);
+        drop(new_proc);
+        drop(elf_buf);
+        drop(cur_argv);
+        drop(cur_path);
+        drop(argv_strs);
+        drop(envp_strs);
+        drop(path_owned);
+        drop(prev_slot_as);
         // SAFETY: hook is a fn ptr installed at boot; uctx is live.
         unsafe { h(uctx_ptr) };
         // longjmp doesn't return; if it does (no jmp buf installed),

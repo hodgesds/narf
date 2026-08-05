@@ -372,7 +372,23 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         }
     }
 
+    USER_PML4_LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(phys)
+}
+
+/// Live user PML4 trees: created by `new_user_pml4_on`, retired by
+/// `free_user_pml4_tree`. One per live user address space, so this is
+/// the ground-truth "how many user ASes exist" gauge — a count that
+/// climbs while the process population is flat means address spaces
+/// are leaking (the execve own-stack divergence leaked exactly one per
+/// exec until the fork+exec churn of a desktop boot OOM'd the kernel).
+/// Cheap (one relaxed atomic per AS create/destroy); kept as a
+/// permanent diagnostic and leak-test oracle.
+static USER_PML4_LIVE: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+/// Number of live user PML4 trees (created minus freed).
+pub fn user_pml4_live() -> i64 {
+    USER_PML4_LIVE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Write a value to physical memory while we're still in an
@@ -1066,6 +1082,7 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
     if pml4_phys.raw() == 0 {
         return;
     }
+    USER_PML4_LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     // Serialise teardown against any (stale) concurrent map/unmap on this root.
     let _pt_guard = pt_lock_for(pml4_phys).lock();
     // SAFETY: identity-reachable per caller contract.
