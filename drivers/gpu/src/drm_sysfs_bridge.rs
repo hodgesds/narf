@@ -158,6 +158,23 @@ fn populate_card_node(
 
     // ── device/ sub-kobject (PCI IDs Mesa reads for driver selection) ────
     let dev_kobj = Kobject::new_child(kobj.clone(), "device");
+    // `device/subsystem` → /sys/bus/pci. libdrm classifies a DRM node's bus by
+    // readlink()ing this and comparing the BASENAME against "pci"/"platform"/
+    // "usb" (drmGetDevice2 → drmParseSubsystemType). Without it the bus is
+    // unknown, so libdrm never fills in the PCI device info and Mesa's loader
+    // gives up with "MESA-LOADER: failed to retrieve device information" — no
+    // matter how correct the vendor/device attributes below are, because
+    // nothing tells it they are PCI ids in the first place.
+    //
+    // That failure is not cosmetic: kwin emits a burst of these while probing,
+    // then exits, and startplasma tears the session down behind it. The count
+    // is an exact multiple of 9 per session attempt across every boot, which
+    // is what ties it to the compositor's device probe rather than to noise.
+    //
+    // Path is relative to /sys/devices/platform/narf-drm/card<N>/device/, so
+    // five levels up reaches /sys. Linux ref: the real topology has a DRM
+    // card's device/subsystem pointing at /sys/bus/pci.
+    dev_kobj.add_symlink("subsystem", "../../../../../bus/pci");
     {
         let v = card.vendor_id();
         kobject_add_attr(&dev_kobj, "vendor", move || format!("0x{:04x}\n", v));
@@ -227,5 +244,71 @@ fn populate_card_node(
     char_dev_link(
         render_idx,
         &format!("../../devices/platform/narf-drm/{}", render_name),
+    );
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// `card<N>/device/subsystem` must resolve to `/sys/bus/pci`.
+    ///
+    /// libdrm classifies a DRM node's bus by readlink()ing this attribute and
+    /// comparing the BASENAME against "pci"/"platform"/"usb"
+    /// (`drmGetDevice2` → `drmParseSubsystemType`). Without it the bus is
+    /// unknown, libdrm never fills in the PCI device info, and Mesa's loader
+    /// fails with "MESA-LOADER: failed to retrieve device information" — the
+    /// vendor/device attributes are useless on their own because nothing
+    /// declares them to BE pci ids.
+    ///
+    /// Not cosmetic: kwin emits a burst of those while probing and then
+    /// exits, taking the Plasma session down with it.
+    ///
+    /// The count of `..` matters and is easy to get wrong, which is most of
+    /// why this test exists: the symlink sits at
+    /// `/sys/devices/platform/narf-drm/card<N>/device/`, five levels below
+    /// `/sys`, whereas the sibling `card<N>/subsystem` is four. An
+    /// off-by-one resolves to a nonexistent path and reproduces the exact
+    /// failure it is meant to prevent, silently.
+    fn smoke_drm_device_subsystem_points_at_pci() -> TestResult {
+        const DEPTH_TO_SYS: usize = 5;
+        let link = "../../../../../bus/pci";
+
+        let ups = link.matches("../").count();
+        if ups != DEPTH_TO_SYS {
+            return TestResult::Fail(
+                "card/device/subsystem link depth is wrong; it must reach /sys from \
+                 devices/platform/narf-drm/card<N>/device",
+            );
+        }
+        // The basename is what libdrm actually compares against.
+        if !link.ends_with("/bus/pci") {
+            return TestResult::Fail("card/device/subsystem must resolve to /sys/bus/pci");
+        }
+        // Resolve it by hand from the device dir and confirm it lands on
+        // exactly `bus/pci` with no leftover components.
+        let mut comps: alloc::vec::Vec<&str> = "devices/platform/narf-drm/card0/device"
+            .split('/')
+            .collect();
+        for part in link.split('/') {
+            match part {
+                ".." => {
+                    if comps.pop().is_none() {
+                        return TestResult::Fail("card/device/subsystem escapes above /sys");
+                    }
+                }
+                "" | "." => {}
+                other => comps.push(other),
+            }
+        }
+        if comps.join("/") != "bus/pci" {
+            return TestResult::Fail("card/device/subsystem does not resolve to /sys/bus/pci");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm_sysfs",
+        smoke_drm_device_subsystem_points_at_pci
     );
 }
