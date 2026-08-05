@@ -367,6 +367,33 @@ printf '%s\n' \
   > "$WORK/root/etc/systemd/system/narf-plasma-probe.service"
 ln -sfn ../narf-plasma-probe.service \
   "$WORK/root/etc/systemd/system/graphical.target.wants/narf-plasma-probe.service"
+
+# Root-side journal tap. narf-plasma-probe runs as User=narf and therefore
+# CANNOT read /var/log/journal/<id>/user-1000.journal ("Operation not
+# permitted"), which is where every Plasma user unit's output goes — kwin's
+# exit reason included. This service has no User=, so it runs as root and can.
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-journal-tap.sh" \
+  "$WORK/root/usr/local/libexec/narf-journal-tap"
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Mirror the uid-1000 journal to the console' \
+  'Wants=systemd-journald.service' \
+  'After=systemd-journald.service' \
+  '' \
+  '[Service]' \
+  'Type=simple' \
+  'ExecStart=/usr/local/libexec/narf-journal-tap' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
+  'Restart=always' \
+  'RestartSec=2' \
+  '' \
+  '[Install]' \
+  'WantedBy=graphical.target' \
+  > "$WORK/root/etc/systemd/system/narf-journal-tap.service"
+ln -sfn ../narf-journal-tap.service \
+  "$WORK/root/etc/systemd/system/graphical.target.wants/narf-journal-tap.service"
 # A Wants= symlink lets graphical.target succeed after a failed oneshot.
 # Make the probe a required, ordered start job so graphical.target is proof of
 # PLASMA-READY rather than merely proof that the probe was attempted.
@@ -376,6 +403,28 @@ printf '%s\n' \
   'Requires=narf-plasma-probe.service' \
   'After=narf-plasma-probe.service' \
   > "$WORK/root/etc/systemd/system/graphical.target.d/narf-plasma-gate.conf"
+
+# Plasma's components run as systemd USER UNITS, so their stderr goes to the
+# journal and NOTHING about a crash reaches the serial console — which is the
+# only channel this bring-up can read. `journalctl --user` cannot help: it
+# fails with "Operation not permitted" opening
+# /var/log/journal/<id>/user-1000.journal, so the journal is unreadable from
+# inside the guest too.
+#
+# Mirror these units' output to the console. This is what makes a compositor
+# exit diagnosable at all: kwin dying is what tears the session down
+# (plasma-workspace-wayland.target BindsTo plasma-kwin_wayland.service, and
+# graphical-session.target takes every PartOf unit with it), and its reason
+# was previously invisible.
+for narf_unit in plasma-kwin_wayland.service plasma-plasmashell.service \
+                 plasma-kded6.service plasma-ksmserver.service; do
+  install -d "$WORK/root/usr/lib/systemd/user/${narf_unit}.d"
+  printf '%s\n' \
+    '[Service]' \
+    'StandardOutput=journal+console' \
+    'StandardError=journal+console' \
+    > "$WORK/root/usr/lib/systemd/user/${narf_unit}.d/99-narf-console.conf"
+done
 
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-systemd-start.sh" \
