@@ -89,7 +89,9 @@ ENTEREOF
       dbus-daemon dbus-tools \
       xrdb cpp xkeyboard-config \
       bash coreutils util-linux procps-ng strace file less findutils \
-      dejavu-sans-fonts kde-cli-tools konsole foot'
+      dejavu-sans-fonts kde-cli-tools konsole foot \
+      kactivitymanagerd kglobalacceld kscreen \
+      xdg-desktop-portal xdg-desktop-portal-kde plasma-polkit-agent'
   "$WORK/enter.sh" 'dnf clean all'
 fi
 
@@ -104,6 +106,23 @@ fi
 # with Plasma; without it kcminit never reaches its ready-pipe handoff.
 if [ ! -d "$WORK/root/usr/share/X11/xkb/rules" ]; then
   "$WORK/enter.sh" 'dnf -y --setopt=install_weak_deps=False install xkeyboard-config'
+  "$WORK/enter.sh" 'dnf clean all'
+fi
+# Plasma session daemons that arrive as WEAK dependencies of plasma-workspace
+# and are therefore dropped by install_weak_deps=False. They are not optional
+# for a session that reaches a drawn desktop:
+#   kactivitymanagerd  — owns org.kde.ActivityManager; plasmashell blocks on
+#                        that name at startup and otherwise eats a 120 s D-Bus
+#                        activation timeout waiting for a name nobody provides.
+#   kglobalacceld      — owns org.kde.KGlobalAccel, started by plasma_session.
+#   kscreen            — kscreen_backend_launcher, output/geometry config.
+# Guarded per-binary so older incremental work trees top up without a full
+# rootfs rebuild (same idiom as cpp / xkeyboard-config above).
+if [ ! -x "$WORK/root/usr/bin/kactivitymanagerd" ] ||
+   [ ! -x "$WORK/root/usr/bin/kglobalacceld" ] ||
+   [ ! -x "$WORK/root/usr/bin/kscreen_backend_launcher" ]; then
+  "$WORK/enter.sh" 'dnf -y --setopt=install_weak_deps=False install \
+      kactivitymanagerd kglobalacceld kscreen'
   "$WORK/enter.sh" 'dnf clean all'
 fi
 
