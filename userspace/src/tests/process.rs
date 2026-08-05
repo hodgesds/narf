@@ -1862,6 +1862,79 @@ kernel_test_in!(
     smoke_userspace_execve_sets_comm_to_argv0_basename
 );
 
+// Regression: execve of a dynamic binary whose PT_INTERP interpreter is
+// unresolvable must FAIL with -ENOENT (Linux semantics) — never "succeed"
+// by starting the image without its dynamic linker. The old silent
+// fallback entered the program at its own entry with an unrelocated GOT,
+// killing the fresh process at rip=0 (#PF errcode 0x15) — the
+// intermittent fork+exec crash (journalctl/sleep victims).
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_interp_unresolvable_is_enoent() -> TestResult {
+    // Kernel-test fixture: kernel pointers stand in for user buffers
+    // (see smoke_userspace_execve_sets_comm_to_argv0_basename).
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    crate::syscall::__test_clear_global();
+    crate::interp::__test_clear_interpreters();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let elf = build_pt_interp_elf("/nonexistent/ld-narf-missing.so");
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let mounted = narf_filesystem::registry().mount(
+        &auth,
+        "/execve-interp",
+        narf_filesystem::MemFs::with_seeds("execve-interp", &[("prog", &elf)]),
+    );
+    if mounted.is_err() {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("mount of execve FS failed");
+    }
+
+    let path = b"/execve-interp/prog\0";
+    let arg0 = b"prog\0";
+    let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
+    let envp: [u64; 1] = [0];
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: argv.as_ptr() as u64,
+            arg2: envp.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
+    let r = match ctx.ret {
+        Some(r) => r,
+        None => {
+            if let Ok(h) = mounted {
+                let _ = narf_filesystem::registry().unmount(&h, "/execve-interp");
+            }
+            crate::syscall::__test_clear_global();
+            return TestResult::Fail("no return");
+        }
+    };
+    if let Ok(h) = mounted {
+        let _ = narf_filesystem::registry().unmount(&h, "/execve-interp");
+    }
+    crate::syscall::__test_clear_global();
+    if r.status == SyscallReturn::OK && (r.value as i64) == -2 {
+        TestResult::Pass
+    } else if r.status == SyscallReturn::OK && (r.value as i64) >= 0 {
+        TestResult::Fail("execve with unresolvable PT_INTERP must not succeed")
+    } else {
+        TestResult::Fail("execve with unresolvable PT_INTERP should be -ENOENT")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_execve_interp_unresolvable_is_enoent
+);
+
 /// The comm-scoped syscall tracer must test the task name while holding the
 /// comm table lock, rather than clone it for every unrelated syscall. Verify
 /// its Linux-style 15-byte comm prefixes and comma-separated filter syntax.

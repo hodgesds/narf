@@ -526,6 +526,38 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_load_user_process_with_interp);
 
+// Regression: a PT_INTERP binary whose interpreter cannot be resolved
+// (not registered in-memory, not readable through the VFS) must FAIL to
+// load with `ProcessLoadError::InterpUnavailable`. The old behaviour
+// silently fell through to the program's own entry — starting glibc's
+// `_start` against an unrelocated GOT, whose first indirect call lands
+// on a zeroed slot (#PF faultva=0 rip=0, pf-errcode 0x15). That silent
+// fallback intermittently killed freshly fork+exec'd processes whenever
+// the interp read transiently failed under contended block I/O.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_load_pt_interp_unresolvable_fails() -> TestResult {
+    use crate::{interp::__test_clear_interpreters, load_user_process_with, ProcessLoadError};
+
+    __test_clear_interpreters();
+    // Absolute path so the VFS fallback is exercised too — nothing is
+    // mounted there, so both resolution sources miss.
+    let prog = build_pt_interp_elf("/nonexistent/ld-narf-missing.so");
+
+    // SAFETY: test harness runs with the low 4 GiB identity-mapped and
+    // the frame allocator initialised (loader `# Safety` contract);
+    // `prog` outlives the call.
+    match unsafe { load_user_process_with(&prog, &[], &[], &[]) } {
+        Err(ProcessLoadError::InterpUnavailable) => TestResult::Pass,
+        Err(_) => TestResult::Fail("wrong error; expected InterpUnavailable"),
+        Ok(_) => TestResult::Fail("PT_INTERP binary must not load without its interpreter"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_load_pt_interp_unresolvable_fails
+);
+
 fn smoke_userspace_parse_pt_tls() -> TestResult {
     // PT_TLS parsing. Hand-build a minimal ELF with one PT_LOAD (so the
     // parser sees a "loadable" image) and one PT_TLS pointing at known

@@ -915,6 +915,15 @@ fn do_execve_resolved(
         )
     } {
         Ok(p) => p,
+        // Linux: a dynamic binary whose PT_INTERP interpreter can't be
+        // opened fails the execve with ENOENT. The loader hard-fails
+        // rather than starting the image without ld.so — that "fallback"
+        // executed _start against an unrelocated GOT and killed the fresh
+        // process at rip=0 (#PF errcode 0x15, instruction fetch at 0).
+        Err(crate::process::ProcessLoadError::InterpUnavailable) => {
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            return;
+        }
         Err(_) => {
             ctx.set_return(SyscallReturn::invalid_op());
             return;

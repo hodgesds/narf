@@ -193,6 +193,51 @@ fn build_minimal_elf_for_execve() -> alloc::vec::Vec<u8> {
     bytes
 }
 
+/// Minimal ET_EXEC ELF whose `PT_INTERP` names `interp_name`. One R|X
+/// PT_LOAD at 0x80_0000_1000 (entry +0x111), interp string stored after
+/// the phdr table. Used by the PT_INTERP-unresolvable regression tests:
+/// a dynamic binary must NEVER load without its interpreter (silent
+/// fallback ran `_start` against an unrelocated GOT → #PF rip=0).
+#[cfg(target_arch = "x86_64")]
+fn build_pt_interp_elf(interp_name: &str) -> alloc::vec::Vec<u8> {
+    const FSIZE: usize = 0x2000;
+    let mut b = alloc::vec![0u8; FSIZE];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // e_type ET_EXEC
+    b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes()); // e_machine x86_64
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // e_version
+    b[0x18..0x20].copy_from_slice(&0x0000_0080_0000_1111u64.to_le_bytes()); // e_entry
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
+                                                        // Interp string (NUL-terminated) right after the phdr table.
+    let interp_off = 64 + 2 * 56;
+    let name_bytes = interp_name.as_bytes();
+    assert!(interp_off + name_bytes.len() + 1 < 0x1000);
+    b[interp_off..interp_off + name_bytes.len()].copy_from_slice(name_bytes);
+    // Phdr 0 — PT_INTERP.
+    let mut ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&(interp_off as u64).to_le_bytes());
+    let ilen = (name_bytes.len() + 1) as u64; // include the NUL
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&ilen.to_le_bytes()); // p_filesz
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&ilen.to_le_bytes()); // p_memsz
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&1u64.to_le_bytes()); // p_align
+                                                                  // Phdr 1 — PT_LOAD R|X, file off 0x1000 → vaddr 0x80_0000_1000.
+    ph = 64 + 56;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes());
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+    b
+}
+
 struct SigGapCtx {
     args: SyscallArgs,
     ret: Option<SyscallReturn>,

@@ -98,6 +98,14 @@ pub struct UserProcess {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProcessLoadError {
     Load(LoadBytesError),
+    /// The image names a `PT_INTERP` interpreter that could not be
+    /// resolved (neither registered in-memory nor readable through the
+    /// VFS). A dynamic binary is unrunnable without its interpreter:
+    /// entering the program's own entry point leaves every GOT/PLT slot
+    /// unrelocated, so glibc's `_start` `call`s through a zeroed slot
+    /// and the process dies at rip=0 before its first instruction of
+    /// real code. execve maps this to -ENOENT (Linux semantics).
+    InterpUnavailable,
     StackAllocFailed,
     StackMapFailed,
     StackMaterializeFailed,
@@ -301,7 +309,22 @@ pub unsafe fn load_user_process_with_root(
     if let Some(name) = image.interp.as_deref() {
         let registered: Option<&[u8]> = interp::lookup_interpreter(name).map(|s| s as &[u8]);
         let interp_bytes_opt: Option<&[u8]> = registered.or(interp_fs_owned.as_deref());
-        if let Some(interp_bytes) = interp_bytes_opt {
+        let interp_bytes = match interp_bytes_opt {
+            Some(b) => b,
+            None => {
+                // HARD FAILURE — never fall through to the program's own
+                // entry. A PT_INTERP binary started without its interpreter
+                // has an unrelocated GOT: _start's very first indirect call
+                // lands on a zeroed slot (#PF faultva=0 rip=0). This exact
+                // fallback intermittently killed freshly fork+exec'd
+                // processes whenever the interp read transiently failed
+                // under contended block I/O. Linux fails the execve with
+                // ENOENT instead.
+                narf_console::klog!("execve: PT_INTERP {} unresolvable; failing load", name);
+                return Err(ProcessLoadError::InterpUnavailable);
+            }
+        };
+        {
             let interp_entry =
                 // SAFETY: `address_space` is the live AS from `load_elf_bytes`;
                 // INTERP_BIAS is a fixed user-range offset well-separated from the
@@ -895,42 +918,15 @@ fn aux_pair(e: &AuxEntry) -> (u32, u64) {
 // whatever `registry().resolve_absolute` finds — initramfs at "/"
 // covers `/lib/ld-musl-x86_64.so.1` once the CPIO stages it there.
 //
-// The narf-filesystem API is async; we spin-pump each future to
-// completion with the same shape `handlers::poll_blocking` uses —
-// in-memory FSes (initramfs / memfs) return Ready on the first poll,
-// and the disk-backed FSes (ext2 / FAT) drive their own block I/O
-// to completion. A bounded poll loop prevents wedging on a broken
-// future; on overrun the caller falls through to its no-interpreter
-// path (the program runs without one, which is the right failure
-// mode for a missing-interpreter ld-musl-style ELF).
-
-#[cfg(feature = "linux-compat")]
-fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
-    use core::pin::Pin;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    fn raw_waker() -> RawWaker {
-        unsafe fn no_clone(_: *const ()) -> RawWaker {
-            raw_waker()
-        }
-        unsafe fn no_op(_: *const ()) {}
-        const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
-        RawWaker::new(core::ptr::null(), &VTAB)
-    }
-
-    // SAFETY: vtable is null-pointer-clean; waker is never woken.
-    let waker = unsafe { Waker::from_raw(raw_waker()) };
-    let mut ctx = Context::from_waker(&waker);
-    // SAFETY: own `fut` by value; pin to stack temporary.
-    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
-    for _ in 0..4_000_000u64 {
-        match pinned.as_mut().poll(&mut ctx) {
-            Poll::Ready(v) => return Some(v),
-            Poll::Pending => continue,
-        }
-    }
-    None
-}
+// The narf-filesystem API is async; each future is pumped with
+// `handlers::poll_io_to_completion` (huge backstop, never drops the
+// future mid-flight). A small bounded budget here used to overrun
+// whenever the interp read contended with other block I/O — a
+// fork+exec loop plus journal writes was enough — and the overrun
+// ALSO dropped the in-flight read future, leaving its virtio-blk
+// request DMA'ing into a recycled scratch buffer. The resulting
+// `None` then silently loaded the program with NO interpreter,
+// which crashed it at rip=0 (see `ProcessLoadError::InterpUnavailable`).
 
 /// Read `abs_path` (a POSIX-style absolute path like
 /// `/lib/ld-musl-x86_64.so.1`) through the VFS into an owned byte
@@ -939,6 +935,7 @@ fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
 /// is <200 KiB), or any read short-circuits with `FsError`.
 #[cfg(feature = "linux-compat")]
 pub fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
+    use crate::handlers::poll_io_to_completion;
     use narf_filesystem::resolve_async;
 
     // 1. Walk the VFS to a FileOps for `abs_path`, through the CALLER'S mount
@@ -950,13 +947,13 @@ pub fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
     //    fell to the load bias and the process jumped to a null/uninitialised
     //    RIP (#PF faultva=0 rip=0, SIGSEGV) before executing a single syscall.
     let file = crate::handlers::current_resolve_absolute(abs_path, |fs, rel| {
-        poll_blocking(resolve_async(fs.root(), rel)).and_then(|r| r.ok())
+        poll_io_to_completion(resolve_async(fs.root(), rel)).and_then(|r| r.ok())
     })
     .flatten()?;
 
     // 2. stat() to size the read; cap at 64 MiB.
     const MAX_INTERP_BYTES: u64 = 64 * 1024 * 1024;
-    let stat = poll_blocking(file.stat_async()).and_then(|r| r.ok())?;
+    let stat = poll_io_to_completion(file.stat_async()).and_then(|r| r.ok())?;
     let size = stat.size;
     if size == 0 || size > MAX_INTERP_BYTES {
         return None;
@@ -968,8 +965,8 @@ pub fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
     let mut buf = alloc::vec![0u8; size as usize];
     let mut filled: u64 = 0;
     while filled < size {
-        let n =
-            poll_blocking(file.read(filled, &mut buf[filled as usize..])).and_then(|r| r.ok())?;
+        let n = poll_io_to_completion(file.read(filled, &mut buf[filled as usize..]))
+            .and_then(|r| r.ok())?;
         if n == 0 {
             // EOF before we hit `size` — truncate to what we got.
             buf.truncate(filled as usize);
