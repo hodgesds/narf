@@ -24,7 +24,17 @@ if [ -z "${NARF_USERBUS_TRIED:-}" ]; then
   systemctl start "user@$narf_uid.service" 2>&1 | sed 's/^/FED-USERBUS: /' || true
   narf_bus_ready=0
   for i in $(seq 1 60); do
-    if [ -S "$narf_user_bus" ]; then
+    # The socket FILE existing is NOT the readiness condition — systemd
+    # creates the listener up front and activates dbus on first connect, so
+    # a broken activation handoff leaves a socket that exists and answers
+    # nothing. Testing -S alone declared the bus ready, which suppressed the
+    # dbus-run-session fallback and stalled the whole session with no
+    # diagnosis. Require an actual round-trip.
+    if [ -S "$narf_user_bus" ] &&
+       DBUS_SESSION_BUS_ADDRESS="unix:path=$narf_user_bus" \
+       timeout 5 dbus-send --session --print-reply \
+         --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+         org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
       narf_bus_ready=1
       break
     fi
@@ -35,12 +45,41 @@ if [ -z "${NARF_USERBUS_TRIED:-}" ]; then
     fi
     sleep 1
   done
+  # Diagnostics run UNCONDITIONALLY, and after the exports below — two traps
+  # this block already fell into:
+  #   * inside the success branch they only fire when the bus WORKS, which is
+  #     the one case needing no diagnosis;
+  #   * before the exports, `systemctl --user` has no runtime dir and
+  #     dbus-send never uses the bus path at all — it tries to autolaunch and
+  #     dies on $DISPLAY, which reads as a bus failure but only measures the
+  #     missing environment.
+  # XDG_RUNTIME_DIR must agree with where the manager published its socket,
+  # or the session and the manager look at different runtime dirs.
+  export XDG_RUNTIME_DIR="/run/user/$narf_uid"
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$narf_user_bus"
+  echo "FED-BUSDIAG: bus_ready=$narf_bus_ready"
+  echo "FED-BUSDIAG: --- dbus.socket / dbus.service ---"
+  systemctl --user status dbus.socket dbus.service --no-pager -l 2>&1 \
+    | sed 's/^/FED-BUSDIAG: /' | head -40
+  echo "FED-BUSDIAG: --- failed units ---"
+  systemctl --user list-units --failed --no-pager --no-legend 2>&1 \
+    | sed 's/^/FED-BUSDIAG: /' | head -20
+  echo "FED-BUSDIAG: --- is the socket answering? ---"
+  # Capture the rc BEFORE any pipe — a pipeline's $? is the last stage's
+  # (sed's), which is always 0 and would report a hung bus as healthy.
+  narf_busout=$(timeout 10 dbus-send --session --print-reply \
+    --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+    org.freedesktop.DBus.ListNames 2>&1)
+  narf_busrc=$?
+  echo "FED-BUSDIAG: dbus-send rc=$narf_busrc (124=timeout/hung)"
+  printf '%s\n' "$narf_busout" | sed 's/^/FED-BUSDIAG: /' | head -6
+  echo "FED-BUSDIAG: --- socket + dbus processes ---"
+  ls -l "$narf_user_bus" 2>&1 | sed 's/^/FED-BUSDIAG: /'
+  ps -eo pid,user,comm 2>/dev/null | grep -iE "dbus|systemd" \
+    | sed 's/^/FED-BUSDIAG: /' | head -15
+
   if [ "$narf_bus_ready" -eq 1 ]; then
     echo "FED-USERBUS: user manager up; session bus at $narf_user_bus"
-    # XDG_RUNTIME_DIR must agree with where the manager published its
-    # socket, or the session and the manager look at different runtime dirs.
-    export XDG_RUNTIME_DIR="/run/user/$narf_uid"
-    export DBUS_SESSION_BUS_ADDRESS="unix:path=$narf_user_bus"
     # The manager inherits nothing from us; push the graphical-session
     # variables in, as a display manager does.
     systemctl --user import-environment \
