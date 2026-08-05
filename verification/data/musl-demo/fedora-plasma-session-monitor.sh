@@ -232,15 +232,42 @@ echo "PLASMA-DBUS-MONITOR starting"
   systemctl --user show-environment 2>&1 \
     | grep -iE "WAYLAND|DISPLAY|XDG_|QT_QPA" \
     | sed 's/^/PLASMA-FORCE-UNITS: /' | head -12
-  echo "PLASMA-FORCE-UNITS: starting plasma-kded6.service"
-  systemctl --user start plasma-kded6.service 2>&1 \
-    | sed 's/^/PLASMA-FORCE-UNITS: /' | head -8
-  echo "PLASMA-FORCE-UNITS: starting plasma-plasmashell.service"
-  systemctl --user start plasma-plasmashell.service 2>&1 \
-    | sed 's/^/PLASMA-FORCE-UNITS: /' | head -8
-  echo "PLASMA-FORCE-UNITS: start rc above; unit state follows"
-  systemctl --user list-units --no-pager --no-legend 'plasma-*' 2>&1 \
-    | sed 's/^/PLASMA-FORCE-UNITS: /' | head -25
+  # --no-block, ALWAYS. A blocking `systemctl start` on a Type=dbus unit
+  # waits for the name claim, so the previous version hung here, died with
+  # the session's cgroup, and produced no data at all about the thing it was
+  # measuring. Fire and poll instead.
+  #
+  # The effective Type is the first question: plasma-kded6.service sets
+  # BusName=org.kde.kded6 with NO explicit Type=, so whether systemd waits
+  # for a name claim decides whether "hangs" means kded is broken or merely
+  # slow to register.
+  for narf_unit in plasma-kded6.service plasma-plasmashell.service; do
+    echo "PLASMA-FORCE-UNITS: --- $narf_unit ---"
+    systemctl --user show "$narf_unit" \
+      -p Type -p BusName -p ExecStart -p Restart 2>&1 \
+      | sed "s/^/PLASMA-FORCE-UNITS: /" | head -6
+    systemctl --user start --no-block "$narf_unit" 2>&1 \
+      | sed "s/^/PLASMA-FORCE-UNITS: /" | head -5
+  done
+  # Poll the units AND the raw processes. A unit stuck "activating" with a
+  # live ExecMainPID means the binary runs but never claims its bus name —
+  # a very different bug from the binary dying or never being exec'd.
+  for narf_t in 5 15 30 60; do
+    /usr/bin/sleep "$narf_t"
+    for narf_unit in plasma-kded6.service plasma-plasmashell.service; do
+      systemctl --user show "$narf_unit" \
+        -p ActiveState -p SubState -p ExecMainPID -p ExecMainStatus -p Result 2>&1 \
+        | tr '\n' ' ' \
+        | sed "s|^|PLASMA-FORCE-UNITS[t+${narf_t}] $narf_unit: |"
+      echo
+    done
+    echo "PLASMA-FORCE-UNITS[t+${narf_t}]: names on bus:"
+    dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+      /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>&1 \
+      | grep -oE "org\.kde\.[A-Za-z0-9_.]+" | sort -u | tr '\n' ' ' \
+      | sed "s|^|PLASMA-FORCE-UNITS[t+${narf_t}]: |"
+    echo
+  done
   systemctl --user list-units --failed --no-pager --no-legend 2>&1 \
     | sed 's/^/PLASMA-FORCE-UNITS-FAILED: /' | head -15
 ) &
