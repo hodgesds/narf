@@ -180,6 +180,24 @@ pub struct Cgroup {
     events_gen: AtomicU64,
     /// Last-published `populated` bit, to detect transitions.
     last_populated: AtomicBool,
+    /// POSIX owner of this cgroup's DIRECTORY (`st_uid`/`st_gid`).
+    ///
+    /// Linux keeps ownership on the kernfs node: `cgroup_mkdir` stamps the
+    /// creating process's ids and `cgroup_kn_set_ugid` applies later
+    /// chowns. Ownership is load-bearing for DELEGATION — systemd's
+    /// `cg_set_access()` chowns a user's subtree to that uid so the
+    /// unprivileged `systemd --user` can manage its own cgroups. Without
+    /// it `user@UID.service` dies with 219/EXIT_CGROUP and no user session
+    /// exists at all.
+    owner: IrqSafeSpinLock<(u32, u32)>,
+    /// Per-attribute-file owners, keyed by the file's inode.
+    ///
+    /// Not folded into `owner`: `cg_set_access()` chowns the directory and
+    /// then `cgroup.procs` / `cgroup.subtree_control` / `cgroup.threads`
+    /// INDIVIDUALLY, and Linux tracks each kernfs node separately, so a
+    /// per-file entry is required rather than one owner for the whole
+    /// cgroup. Absent entry = root-owned, matching the kernfs default.
+    file_owners: IrqSafeSpinLock<BTreeMap<u64, (u32, u32)>>,
 }
 
 impl core::fmt::Debug for Cgroup {
@@ -212,6 +230,8 @@ impl Cgroup {
             psi_enabled: AtomicBool::new(true),
             events_gen: AtomicU64::new(0),
             last_populated: AtomicBool::new(false),
+            owner: IrqSafeSpinLock::new((0, 0)),
+            file_owners: IrqSafeSpinLock::new(BTreeMap::new()),
         })
     }
 
@@ -246,6 +266,8 @@ impl Cgroup {
             psi_enabled: AtomicBool::new(true),
             events_gen: AtomicU64::new(0),
             last_populated: AtomicBool::new(false),
+            owner: IrqSafeSpinLock::new((0, 0)),
+            file_owners: IrqSafeSpinLock::new(BTreeMap::new()),
         })
     }
 
@@ -1446,6 +1468,25 @@ impl CgroupAttrFile {
 }
 
 impl FileOps for CgroupAttrFile {
+    // Per-file ownership. The FileOps default is `Unsupported`, which is
+    // what made `cg_set_access()` fail: it chowns cgroup.procs /
+    // cgroup.subtree_control / cgroup.threads one by one after the
+    // directory, so a rejected file chown aborts delegation and
+    // `systemd --user` exits 219/EXIT_CGROUP.
+    fn owners(&self) -> (u32, u32) {
+        self.cg
+            .file_owners
+            .lock()
+            .get(&self.ino)
+            .copied()
+            .unwrap_or((0, 0))
+    }
+
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        self.cg.file_owners.lock().insert(self.ino, (uid, gid));
+        Box::pin(async { Ok(()) })
+    }
+
     fn ino(&self) -> u64 {
         self.ino
     }
@@ -1605,6 +1646,17 @@ fn valid_cgroup_name(name: &str) -> bool {
 }
 
 impl DirOps for CgroupDir {
+    // Directory ownership. The DirOps default silently DISCARDS the chown
+    // (`set_dir_owners` is an empty body returning Ok), so a delegated
+    // subtree reported root-owned however many times it was chowned.
+    fn dir_owners(&self) -> (u32, u32) {
+        *self.cg.owner.lock()
+    }
+
+    fn set_dir_owners(&self, uid: u32, gid: u32) {
+        *self.cg.owner.lock() = (uid, gid);
+    }
+
     fn ino(&self) -> u64 {
         self.cg.ino
     }
