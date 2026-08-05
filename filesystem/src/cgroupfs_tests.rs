@@ -2322,3 +2322,81 @@ kernel_test_in!(
     "filesystem/cgroupfs",
     smoke_cgroup_delegation_chown_persists
 );
+
+/// Delegation adjusts a subtree with systemd's `fchmod_and_chown()`, which
+/// CHMODS FIRST and then chowns. With `FileOps::set_perms` left at its
+/// `Unsupported` default every cgroup chmod returned ENOTSUP, the chown was
+/// never reached, and systemd reported it as "Failed to adjust ownership of
+/// '<path>': Operation not supported" — naming ownership for what was really
+/// a mode failure, which is why fixing `set_owners` alone did not clear it.
+///
+/// Covers all THREE object kinds, because they are three separate impls and
+/// fixing a subset is exactly how the ownership work stayed incomplete twice:
+/// the directory (`CgroupDir`), an ordinary attribute file
+/// (`CgroupAttrFile`), and a pressure file (`PsiFile`).
+///
+/// Linux ref: cgroupfs is kernfs-backed and `kernfs_iop_setattr` accepts
+/// mode changes.
+fn smoke_cgroup_delegation_chmod_persists() -> TestResult {
+    let root = root_dir();
+    let group = match poll_once(root.mkdir("t_chmod")) {
+        Some(Ok(group)) => group,
+        _ => return TestResult::Fail("chmod cgroup mkdir failed"),
+    };
+
+    // Directory: kernfs default is 0755, and a chmod must persist.
+    if group.dir_mode() != 0o755 {
+        let _ = poll_once(root.rmdir("t_chmod"));
+        return TestResult::Fail("a new cgroup directory was not 0755");
+    }
+    match poll_once(group.set_dir_mode_async(0o700)) {
+        Some(Ok(())) => {}
+        _ => {
+            let _ = poll_once(root.rmdir("t_chmod"));
+            return TestResult::Fail("cgroup directory rejected chmod");
+        }
+    }
+    if group.dir_mode() != 0o700 {
+        let _ = poll_once(root.rmdir("t_chmod"));
+        return TestResult::Fail("cgroup directory chmod did not persist");
+    }
+
+    for name in ["cgroup.procs", "cgroup.subtree_control", "memory.pressure"] {
+        let file = match group.lookup(name) {
+            Some(f) => f,
+            None => {
+                let _ = poll_once(root.rmdir("t_chmod"));
+                return TestResult::Fail("cgroup attribute file missing");
+            }
+        };
+        // The chmod itself must be ACCEPTED — returning Unsupported here is
+        // the exact defect, and it is what systemd trips over.
+        match poll_once(file.set_perms(0o600)) {
+            Some(Ok(())) => {}
+            _ => {
+                let _ = poll_once(root.rmdir("t_chmod"));
+                return TestResult::Fail("cgroup attribute file rejected chmod");
+            }
+        }
+        // ...and it must round-trip through stat(), not be swallowed.
+        if file.stat().mode.perms != 0o600 {
+            let _ = poll_once(root.rmdir("t_chmod"));
+            return TestResult::Fail("cgroup attribute file chmod did not persist");
+        }
+    }
+
+    // Per-file, not per-cgroup: chmod of one file must not move a sibling.
+    if let Some(sib) = group.lookup("cgroup.events") {
+        if sib.stat().mode.perms == 0o600 {
+            let _ = poll_once(root.rmdir("t_chmod"));
+            return TestResult::Fail("chmod leaked across cgroup attribute files");
+        }
+    }
+
+    let _ = poll_once(root.rmdir("t_chmod"));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_delegation_chmod_persists
+);

@@ -18,7 +18,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use crate::{FileOps, FsError, FsFuture, Mode, Stat};
+use crate::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 /// PSI resource axis.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -149,12 +149,35 @@ impl FileOps for PsiFile {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
 
+    // chmod, for the same reason as `set_owners` above: systemd adjusts a
+    // delegated subtree with `fchmod_and_chown()`, which chmods FIRST and
+    // reports the failure as "Failed to adjust ownership of
+    // '.../memory.pressure': Operation not supported". Leaving `set_perms`
+    // at its `Unsupported` default is what kept that message in every boot
+    // even after the ownership fix — the chown was never reached.
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        self.cg.file_modes.lock().insert(self.ino, perms & 0o7777);
+        Box::pin(async { Ok(()) })
+    }
+
     fn stat(&self) -> Stat {
-        Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode::FILE_RO,
-            mtime_cycles: 0,
+        let perms = self.cg.file_modes.lock().get(&self.ino).copied();
+        match perms {
+            Some(perms) => Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::File,
+                    perms,
+                },
+                mtime_cycles: 0,
+            },
+            None => Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode::FILE_RO,
+                mtime_cycles: 0,
+            },
         }
     }
 }
