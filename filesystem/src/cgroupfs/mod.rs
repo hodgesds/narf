@@ -1491,12 +1491,22 @@ impl FileOps for CgroupAttrFile {
     // directory, so a rejected file chown aborts delegation and
     // `systemd --user` exits 219/EXIT_CGROUP.
     fn owners(&self) -> (u32, u32) {
-        self.cg
-            .file_owners
-            .lock()
-            .get(&self.ino)
-            .copied()
-            .unwrap_or((0, 0))
+        // No explicit chown yet ⇒ inherit the CGROUP DIRECTORY's owner, not
+        // a hardcoded root. Linux stamps a new cgroup's interface files with
+        // the creating task's ids (`cgroup_mkdir` → `cgroup_kn_set_ugid`),
+        // which is what lets an unprivileged `systemd --user` write its own
+        // `cgroup.procs`. Reporting (0,0) with 0644 put uid 1000 in the
+        // "other" triplet (read-only), so open(O_WRONLY) was refused and the
+        // user manager's children died 219/EXIT_CGROUP.
+        //
+        // Bind the first lookup to a `let` so its lock guard is dropped at
+        // the end of the statement — matching on the guard directly would
+        // hold `file_owners` while taking `owner`.
+        let explicit = self.cg.file_owners.lock().get(&self.ino).copied();
+        match explicit {
+            Some(owner) => owner,
+            None => *self.cg.owner.lock(),
+        }
     }
 
     fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {

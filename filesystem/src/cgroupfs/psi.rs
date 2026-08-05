@@ -112,12 +112,14 @@ impl FileOps for PsiFile {
     // delegated subtree, so one rejecting file aborts delegation and
     // `systemd --user` exits 219/EXIT_CGROUP.
     fn owners(&self) -> (u32, u32) {
-        self.cg
-            .file_owners
-            .lock()
-            .get(&self.ino)
-            .copied()
-            .unwrap_or((0, 0))
+        // Same creator-inheritance rule as `CgroupAttrFile::owners` — see
+        // the note there. Bound to a `let` so the `file_owners` guard drops
+        // before `owner` is taken.
+        let explicit = self.cg.file_owners.lock().get(&self.ino).copied();
+        match explicit {
+            Some(owner) => owner,
+            None => *self.cg.owner.lock(),
+        }
     }
 
     fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
