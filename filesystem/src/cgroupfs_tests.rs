@@ -2277,7 +2277,11 @@ fn smoke_cgroup_delegation_chown_persists() -> TestResult {
     }
 
     // Each attribute file is chowned separately by cg_set_access().
-    for name in ["cgroup.procs", "cgroup.subtree_control"] {
+    // memory.pressure is served by a DIFFERENT FileOps impl (PsiFile) than
+    // the other attribute files (CgroupAttrFile). Covering only the latter
+    // left every *.pressure file rejecting chown, which still aborted
+    // delegation — so the pressure file is in this loop deliberately.
+    for name in ["cgroup.procs", "cgroup.subtree_control", "memory.pressure"] {
         let file = match group.lookup(name) {
             Some(f) => f,
             None => {

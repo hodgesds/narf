@@ -1672,7 +1672,7 @@ impl DirOps for CgroupDir {
         // included (Linux mirrors /proc/pressure there) — independent
         // of subtree_control.
         #[cfg(feature = "cgroup-psi")]
-        if let Some(f) = psi::pressure_file(name, self.cg.ino) {
+        if let Some(f) = psi::pressure_file(name, &self.cg) {
             return Some(f);
         }
         if let Some((ctrl, file)) = self.ctrl_file(name) {
