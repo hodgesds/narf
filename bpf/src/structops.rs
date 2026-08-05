@@ -101,7 +101,11 @@ pub fn descriptors() -> &'static [StructOpsDesc] {
 // ── program sets ────────────────────────────────────────────────────
 
 /// A method name bound to a verified program.
-#[derive(Debug)]
+///
+/// `Clone` is cheap — `prog` is an `Arc` — and it is what lets a committed
+/// trait keep a copy in the [`INSTALLED`] record while handing another to the
+/// live-slot adapter, both pointing at the same programs.
+#[derive(Debug, Clone)]
 pub struct Binding {
     /// The method this program implements.
     pub method: &'static str,
@@ -110,7 +114,7 @@ pub struct Binding {
 }
 
 /// A set of programs implementing one struct_ops trait.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ProgSet {
     bindings: Vec<Binding>,
 }
@@ -188,6 +192,14 @@ pub enum StructOpsError {
         /// The method whose binding was rejected.
         method: &'static str,
     },
+    /// The subsystem's live-slot installer rejected the adapter.
+    ///
+    /// Returned by a `#[commit(...)]` committer when moving the verified
+    /// adapter into the subsystem's `Box<dyn Trait>` slot fails for a reason
+    /// only the subsystem can name — a revoked slot authority, a governor that
+    /// refuses to be replaced while active, and so on. The set is validated
+    /// before the committer runs, so this never masks a malformed program set.
+    CommitFailed(&'static str),
 }
 
 impl From<CapError> for StructOpsError {
@@ -220,6 +232,34 @@ pub fn install<M: CapType>(
     cap: &Cap<M, Grant>,
     set: ProgSet,
 ) -> Result<(), StructOpsError> {
+    validate(desc, cap, &set)?;
+    let mut slot = INSTALLED.lock();
+    slot.retain(|(n, _)| *n != desc.name);
+    slot.push((desc.name, set));
+    Ok(())
+}
+
+/// Check that `set` is a legal implementation of `desc` under `cap`, without
+/// recording or committing anything.
+///
+/// Split out of [`install`] so a `#[commit(...)]` trait can prove the set good
+/// *before* building the adapter and handing it to the subsystem's live slot —
+/// a malformed set must never reach the slot, and validating first is what
+/// guarantees it. The checks are borrow-only, so the caller keeps ownership of
+/// `set` to both record it and build the adapter from it.
+///
+/// # Errors
+///
+/// [`StructOpsError::WrongCapability`] if `M` is not the kind the trait
+/// declares, [`StructOpsError::MissingMethod`] if a required method is unbound,
+/// [`StructOpsError::UnknownMethod`] if a binding names a method the trait does
+/// not declare, [`StructOpsError::WrongContext`] if a bound program was
+/// verified for a context struct_ops dispatch cannot provide.
+pub fn validate<M: CapType>(
+    desc: &StructOpsDesc,
+    cap: &Cap<M, Grant>,
+    set: &ProgSet,
+) -> Result<(), StructOpsError> {
     if M::KIND != desc.cap {
         return Err(StructOpsError::WrongCapability {
             required: desc.cap,
@@ -246,9 +286,6 @@ pub fn install<M: CapType>(
             return Err(StructOpsError::WrongContext { method: b.method });
         }
     }
-    let mut slot = INSTALLED.lock();
-    slot.retain(|(n, _)| *n != desc.name);
-    slot.push((desc.name, set));
     Ok(())
 }
 
@@ -320,6 +357,26 @@ pub const fn is_optional(name: &str, list: &[&str]) -> bool {
 /// choose between the two without lookahead into a fragment — a genuine local
 /// ambiguity, not a stylistic preference. Listing them together also puts the
 /// optional set in one visible place.
+///
+/// # Reaching a live slot: `#[commit(...)]`
+///
+/// Without `#[commit(...)]` the generated install entry point only *records*
+/// the verified program set (so `is_installed` can see it); nothing runs it,
+/// because there is no slot to run it from. A pluggable subsystem owns that
+/// slot — the `IrqSafeSpinLock<Option<Box<dyn Trait>>>` its hot path dispatches
+/// through — and names a committer with `#[commit(commit_fn)]`, placed *before*
+/// any `#[optional(...)]`. The committer has the shape
+///
+/// ```ignore
+/// fn commit_fn<M: CapType>(cap: &Cap<M, Grant>, adapter: TheAdapter)
+///     -> Result<(), StructOpsError>;
+/// ```
+///
+/// and moves the already-verified `adapter` into its slot. The generated
+/// install fn validates the set, records it, builds the adapter, and calls the
+/// committer — so a bad set never reaches the slot, and a good one becomes the
+/// live implementation the subsystem's own query path invokes. This is the seam
+/// that turns a loaded program set into behaviour.
 #[macro_export]
 macro_rules! struct_ops {
     ($(
@@ -328,6 +385,7 @@ macro_rules! struct_ops {
         #[install($install:ident)]
         #[desc($descname:ident)]
         #[adapter($descname2:ident)]
+        $(#[commit($commit:path)])?
         $(#[optional($($optm:ident),* $(,)?)])?
         $vis:vis trait $trait_name:ident {
             $(
@@ -462,7 +520,36 @@ macro_rules! struct_ops {
             cap: &$crate::reexport::Cap<M, $crate::reexport::Grant>,
             set: $crate::structops::ProgSet,
         ) -> ::core::result::Result<(), $crate::structops::StructOpsError> {
-            $crate::structops::install(&$descname, cap, set)
+            // A `#[commit(...)]` trait builds its live-slot adapter from a
+            // clone and keeps the original for the record — validating first so
+            // a malformed set can never reach the slot. An uncommitted trait
+            // builds nothing and lets the `install` below do the sole
+            // validation, so its path is unchanged.
+            #[allow(unused_mut, unused_variables)]
+            let mut __adapter: ::core::option::Option<$descname2> =
+                ::core::option::Option::None;
+            $(
+                let _ = ::core::stringify!($commit);
+                $crate::structops::validate(&$descname, cap, &set)?;
+                __adapter = ::core::option::Option::Some($descname2::new(
+                    <$crate::structops::ProgSet as ::core::clone::Clone>::clone(&set),
+                ));
+            )?
+            // Record the verified set so `is_installed`/`installed_count` see
+            // it — for both committed and uncommitted traits.
+            $crate::structops::install(&$descname, cap, set)?;
+            // Hand the adapter to the subsystem's live slot, if one was named.
+            // Uncommitted traits stop at the record above; there is nothing to
+            // dispatch through.
+            #[allow(unused_mut)]
+            let mut __result: ::core::result::Result<(), $crate::structops::StructOpsError> =
+                ::core::result::Result::Ok(());
+            $(
+                if let ::core::option::Option::Some(__a) = __adapter.take() {
+                    __result = $commit(cap, __a);
+                }
+            )?
+            __result
         }
     )*};
 }

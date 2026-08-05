@@ -31,7 +31,7 @@
 #[allow(unused_imports)]
 use super::*;
 
-use narf_bpf::map::{BpfMap, BpfMapCap, MapAttr, MapFile, MapKind};
+use narf_bpf::map::{BpfMap, BpfMapCap, MapAttr, MapError, MapFile, MapKind};
 use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadRequest, ProgFile};
 use narf_bpf_verifier::kfunc::Context;
 use narf_capabilities::{Cap, Grant};
@@ -44,6 +44,7 @@ const EAGAIN: i64 = 11;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const EFAULT: i64 = 14;
+const ENOENT: i64 = 2;
 /// Linux's `ENOTSUPP` is an internal 524; the userspace-visible spelling is
 /// `EOPNOTSUPP`, which on Linux equals `ENOTSUP` (95).
 const ENOTSUP: i64 = 95;
@@ -74,6 +75,10 @@ const BPF_LINK_GET_NEXT_ID: u32 = 33;
 const BPF_LINK_CREATE: u32 = 28;
 const BPF_LINK_UPDATE: u32 = 29;
 const BPF_LINK_DETACH: u32 = 34;
+const BPF_MAP_LOOKUP_BATCH: u32 = 24;
+const BPF_MAP_LOOKUP_AND_DELETE_BATCH: u32 = 25;
+const BPF_MAP_UPDATE_BATCH: u32 = 26;
+const BPF_MAP_DELETE_BATCH: u32 = 27;
 
 /// `union bpf_attr` is 120+ bytes and grows with every kernel release. Linux
 /// accepts any size and zero-extends, so that an older binary works on a newer
@@ -182,6 +187,12 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         BPF_MAP_DELETE_ELEM => map_delete_elem(attr_uptr, size),
         BPF_MAP_GET_NEXT_KEY => map_get_next_key(attr_uptr, size),
 
+        // Batch element commands — `sys_bpf.rs`, built on the same element ops.
+        BPF_MAP_LOOKUP_BATCH => map_batch_read(attr_uptr, size, false),
+        BPF_MAP_LOOKUP_AND_DELETE_BATCH => map_batch_read(attr_uptr, size, true),
+        BPF_MAP_UPDATE_BATCH => map_batch_write(attr_uptr, size, false),
+        BPF_MAP_DELETE_BATCH => map_batch_write(attr_uptr, size, true),
+
         // BTF — `sys_bpf_btf.rs`.
         BPF_BTF_LOAD => btf_load(attr_uptr, size),
 
@@ -208,13 +219,17 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         BPF_LINK_DETACH => bpf_link_detach(attr_uptr, size),
 
         // LINUX-GAP: everything else — `BPF_PROG_QUERY`, `BPF_TASK_FD_QUERY`,
-        // the batch element commands, the BPF token commands
-        // (`BPF_TOKEN_CREATE` — NARF has no token, and the privilege gate above
-        // is a credential check rather than a delegable one), and the iterator
-        // commands (`BPF_ITER_CREATE`, which needs a seq_file-shaped read
-        // surface no NARF fd provides). `ENOTSUP` rather than `EINVAL` so a
-        // probing loader can tell "this kernel does not do that" from "you
-        // passed nonsense".
+        // the BPF token commands (`BPF_TOKEN_CREATE` — NARF has no token, and
+        // the privilege gate above is a credential check rather than a
+        // delegable one), and the iterator commands (`BPF_ITER_CREATE`, which
+        // needs a seq_file-shaped read surface no NARF fd provides). `ENOTSUP`
+        // rather than `EINVAL` so a probing loader can tell "this kernel does
+        // not do that" from "you passed nonsense".
+        //
+        // The batch element commands are NOT in that list any more:
+        // `BPF_MAP_{LOOKUP,LOOKUP_AND_DELETE,UPDATE,DELETE}_BATCH` are
+        // implemented above, built on the same element ops as the single-key
+        // commands.
         //
         // Pinning is NOT in that list any more: `BPF_OBJ_PIN`/`BPF_OBJ_GET` are
         // implemented above via `filesystem::bpffs`. Both sides of this merge
@@ -679,6 +694,214 @@ fn map_get_next_key(attr_uptr: u64, size: usize) -> i64 {
         Ok(()) => 0,
         Err(e) => -(e as i64),
     }
+}
+
+// `struct { … } batch` field offsets within `union bpf_attr`. Distinct from
+// the `ME_*` element offsets — the batch struct puts `map_fd` at 36, not 0.
+const BA_IN_BATCH: usize = 0;
+const BA_OUT_BATCH: usize = 8;
+const BA_KEYS: usize = 16;
+const BA_VALUES: usize = 24;
+const BA_COUNT: usize = 32;
+const BA_MAP_FD: usize = 36;
+const BA_ELEM_FLAGS: usize = 40;
+const BA_FLAGS: usize = 48;
+
+/// `BPF_MAP_LOOKUP_BATCH` and `BPF_MAP_LOOKUP_AND_DELETE_BATCH`.
+///
+/// Walks the map with its own `next_key`, resuming *after* the caller's
+/// `in_batch` cursor — the last key the previous call handed back, or the first
+/// key when `in_batch` is NULL. Fills up to `count` (key, value) pairs into the
+/// caller's arrays, writes the resume cursor to `out_batch`, writes the number
+/// filled back to `count`, and returns `-ENOENT` once the walk is exhausted
+/// (with `count` still set), which is the terminating condition libbpf's
+/// `bpf_map_lookup_batch` loop keys off. `and_delete` removes each pair it
+/// returns, so it drains the map — and because `next_key` restarts at the first
+/// key when handed one the map no longer holds, a cursor pointing at a
+/// just-deleted key resumes correctly on the surviving elements.
+fn map_batch_read(attr_uptr: u64, size: usize, and_delete: bool) -> i64 {
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < BA_MAP_FD + 4 {
+        return -EINVAL;
+    }
+    let map = match map_from_fd(u32_at(&attr, BA_MAP_FD)) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    // No batch-level flags, and no per-element `BPF_F_LOCK`: NARF has no
+    // spin-locked maps, so any set bit names behaviour that would not happen.
+    if u64_at(&attr, BA_FLAGS) != 0 || u64_at(&attr, BA_ELEM_FLAGS) != 0 {
+        return -EINVAL;
+    }
+    let ops = map.ops();
+    let key_size = map.attr().key_size as usize;
+    let value_bytes = ops.syscall_value_bytes();
+    let count_in = u32_at(&attr, BA_COUNT);
+    let keys_uptr = u64_at(&attr, BA_KEYS);
+    let values_uptr = u64_at(&attr, BA_VALUES);
+    let in_batch = u64_at(&attr, BA_IN_BATCH);
+    let out_batch = u64_at(&attr, BA_OUT_BATCH);
+    if count_in != 0 && (keys_uptr == 0 || values_uptr == 0) {
+        return -EINVAL;
+    }
+
+    // The resume cursor: the key to walk *after*. A NULL `in_batch` starts the
+    // walk; otherwise it is the key-sized token a previous call handed back.
+    let mut prev: Option<alloc::vec::Vec<u8>> = if in_batch == 0 {
+        None
+    } else {
+        // SAFETY: `copy_from_user_vec` range-validates and brackets SMAP.
+        match unsafe { copy_from_user_vec(in_batch, key_size) } {
+            Ok(k) => Some(k),
+            Err(e) => return -(e as i64),
+        }
+    };
+
+    let mut key_buf = alloc::vec![0u8; key_size];
+    let mut val_buf = alloc::vec![0u8; value_bytes];
+    let mut filled: u32 = 0;
+    let mut result: i64 = 0;
+
+    while filled < count_in {
+        match ops.next_key(prev.as_deref(), &mut key_buf) {
+            Ok(()) => {}
+            // The walk is done: the batch's terminating condition.
+            Err(MapError::NotFound) => {
+                result = -ENOENT;
+                break;
+            }
+            Err(e) => {
+                result = -(i64::from(e.errno()));
+                break;
+            }
+        }
+        // A key `next_key` just handed us that `lookup` cannot find raced away
+        // under a concurrent delete. Stop cleanly; the caller re-drives from
+        // the cursor written below.
+        if ops.lookup(&key_buf, &mut val_buf).is_err() {
+            break;
+        }
+        if and_delete {
+            match ops.delete(&key_buf) {
+                Ok(()) => {}
+                // Same race — skip without counting it.
+                Err(MapError::NotFound) => {
+                    prev = Some(key_buf.clone());
+                    continue;
+                }
+                // e.g. an array kind, which has no removable slots.
+                Err(e) => {
+                    result = -(i64::from(e.errno()));
+                    break;
+                }
+            }
+        }
+        // SAFETY: each destination is range-validated inside `copy_to_user`.
+        let wrote_key =
+            unsafe { copy_to_user(keys_uptr + u64::from(filled) * key_size as u64, &key_buf) };
+        if let Err(e) = wrote_key {
+            return -(e as i64);
+        }
+        // SAFETY: as above.
+        let wrote_val =
+            unsafe { copy_to_user(values_uptr + u64::from(filled) * value_bytes as u64, &val_buf) };
+        if let Err(e) = wrote_val {
+            return -(e as i64);
+        }
+        prev = Some(key_buf.clone());
+        filled += 1;
+    }
+
+    // Hand back the resume cursor and the count where Linux writes them, so
+    // libbpf's next iteration finds them.
+    if out_batch != 0 {
+        if let Some(p) = &prev {
+            // SAFETY: `out_batch` is a caller-supplied key-sized buffer,
+            // range-validated inside `copy_to_user`.
+            if let Err(e) = unsafe { copy_to_user(out_batch, p) } {
+                return -(e as i64);
+            }
+        }
+    }
+    // SAFETY: `attr_uptr + BA_COUNT` lies inside the caller's `bpf_attr`.
+    if let Err(e) = unsafe { copy_to_user(attr_uptr + BA_COUNT as u64, &filled.to_le_bytes()) } {
+        return -(e as i64);
+    }
+    result
+}
+
+/// `BPF_MAP_UPDATE_BATCH` and `BPF_MAP_DELETE_BATCH`.
+///
+/// A straight walk over the caller's `keys` (and `values`, for update) array,
+/// applying the element op to each. No cursor — the caller supplies the keys.
+/// On the first element that fails it stops and writes the number that
+/// succeeded back to `count`, matching Linux's partial-progress contract, so a
+/// caller can tell exactly how far the batch got.
+fn map_batch_write(attr_uptr: u64, size: usize, delete: bool) -> i64 {
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < BA_MAP_FD + 4 {
+        return -EINVAL;
+    }
+    let map = match map_from_fd(u32_at(&attr, BA_MAP_FD)) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    if u64_at(&attr, BA_FLAGS) != 0 {
+        return -EINVAL;
+    }
+    let ops = map.ops();
+    let key_size = map.attr().key_size as usize;
+    let value_bytes = ops.syscall_value_bytes();
+    let count_in = u32_at(&attr, BA_COUNT);
+    let keys_uptr = u64_at(&attr, BA_KEYS);
+    let values_uptr = u64_at(&attr, BA_VALUES);
+    // For update this carries the per-element flags (`BPF_ANY`/`NOEXIST`/
+    // `EXIST`), validated inside `ops.update`. Delete takes no flags.
+    let elem_flags = u64_at(&attr, BA_ELEM_FLAGS);
+    if delete && elem_flags != 0 {
+        return -EINVAL;
+    }
+    if count_in != 0 && (keys_uptr == 0 || (!delete && values_uptr == 0)) {
+        return -EINVAL;
+    }
+
+    let mut done: u32 = 0;
+    let mut result: i64 = 0;
+    while done < count_in {
+        let koff = keys_uptr + u64::from(done) * key_size as u64;
+        // SAFETY: `copy_from_user_vec` range-validates and brackets SMAP.
+        let key = match unsafe { copy_from_user_vec(koff, key_size) } {
+            Ok(k) => k,
+            Err(e) => return -(e as i64),
+        };
+        let r = if delete {
+            ops.delete(&key)
+        } else {
+            let voff = values_uptr + u64::from(done) * value_bytes as u64;
+            // SAFETY: as above.
+            let value = match unsafe { copy_from_user_vec(voff, value_bytes) } {
+                Ok(v) => v,
+                Err(e) => return -(e as i64),
+            };
+            ops.update(&key, &value, elem_flags)
+        };
+        if let Err(e) = r {
+            result = -(i64::from(e.errno()));
+            break;
+        }
+        done += 1;
+    }
+    // SAFETY: `attr_uptr + BA_COUNT` lies inside the caller's `bpf_attr`.
+    if let Err(e) = unsafe { copy_to_user(attr_uptr + BA_COUNT as u64, &done.to_le_bytes()) } {
+        return -(e as i64);
+    }
+    result
 }
 
 /// Resolve every map a program's `LD_IMM64` immediates name.
