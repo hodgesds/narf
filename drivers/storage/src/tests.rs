@@ -279,6 +279,59 @@ fn smoke_ahci_hba_bring_up() -> TestResult {
 }
 kernel_test_in!("drivers/storage/ahci", smoke_ahci_hba_bring_up);
 
+/// The installed HBA must never move, be replaced, or be dropped.
+///
+/// `ahci::probed_ahci` reads the device's address under the CONTROLLER
+/// lock, releases the lock, and then uses that reference for the whole
+/// transfer — which is what lets a 30-second-budget CI/D2H poll run
+/// with interrupts enabled instead of livelocking every other CPU on
+/// an IRQ-masking spinlock. That is only sound because `probe`
+/// installs the device exactly once and nothing ever stores `None`
+/// back.
+///
+/// This is precisely the sort of assumption a later "support
+/// hot-unplug" or "re-probe on reset" change invalidates silently,
+/// leaving a use-after-free reachable only under load. Assert it
+/// directly: probing again must not move the device, and the address
+/// must stay put across I/O through the unlocked path.
+fn smoke_ahci_device_address_is_stable() -> TestResult {
+    use crate::ahci;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, probe_all_pci};
+
+    // SAFETY: identity-mapped QEMU ECAM region.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    if !ahci::is_probed() {
+        return TestResult::Skip("AHCI not probed");
+    }
+    let before = match ahci::dbg_device_addr() {
+        Some(a) => a,
+        None => return TestResult::Fail("probed HBA has no address"),
+    };
+
+    // A repeat probe must be refused, not re-install a fresh device.
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    match ahci::dbg_device_addr() {
+        Some(a) if a == before => {}
+        Some(_) => return TestResult::Fail("re-probe MOVED the installed HBA"),
+        None => return TestResult::Fail("re-probe removed the installed HBA"),
+    }
+
+    // And it must survive ordinary traffic through the unlocked path.
+    // The I/O result itself is irrelevant here; only the address
+    // matters.
+    use narf_block::BlockDeviceSync;
+    let mut sector = [0u8; 512];
+    let _ = ahci::AhciBlockSync.read(0, 1, &mut sector);
+    match ahci::dbg_device_addr() {
+        Some(a) if a == before => TestResult::Pass,
+        Some(_) => TestResult::Fail("HBA address changed across a read"),
+        None => TestResult::Fail("HBA vanished across a read"),
+    }
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_device_address_is_stable);
+
 fn smoke_ahci_identify_device() -> TestResult {
     // Issue IDENTIFY DEVICE on the first port whose probe-time
     // signature said "SATA". Verify the device-data block decodes
@@ -535,6 +588,53 @@ fn smoke_sdhci_register_class_match() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/storage/sdhci", smoke_sdhci_register_class_match);
+
+/// The installed SDHCI controller must never move, be replaced, or be
+/// dropped. Mirror of `smoke_ahci_device_address_is_stable` — see
+/// that test for the full rationale; `sdhci::with_controller` hands
+/// out a reference that outlives the CONTROLLER lock, which is only
+/// sound while `probe` installs exactly once and nothing stores
+/// `None` back.
+///
+/// QEMU's default machine has no SDHCI controller, so this usually
+/// Skips in CI; it pins the invariant on real hardware (AMD FCH SD
+/// host) and any future SDHCI-enabled QEMU config.
+fn smoke_sdhci_device_address_is_stable() -> TestResult {
+    use crate::sdhci;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, probe_all_pci};
+
+    // SAFETY: identity-mapped QEMU ECAM region.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    if !sdhci::is_probed() {
+        return TestResult::Skip("SDHCI not probed");
+    }
+    let before = match sdhci::dbg_device_addr() {
+        Some(a) => a,
+        None => return TestResult::Fail("probed SDHCI has no address"),
+    };
+
+    // A repeat probe must be refused, not re-install a fresh device.
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    match sdhci::dbg_device_addr() {
+        Some(a) if a == before => {}
+        Some(_) => return TestResult::Fail("re-probe MOVED the installed SDHCI"),
+        None => return TestResult::Fail("re-probe removed the installed SDHCI"),
+    }
+
+    // And it must survive traffic through the unlocked accessor.
+    let _ = sdhci::with_controller(|c| c.card.lock().is_some());
+    match sdhci::dbg_device_addr() {
+        Some(a) if a == before => TestResult::Pass,
+        Some(_) => TestResult::Fail("SDHCI address changed across an access"),
+        None => TestResult::Fail("SDHCI vanished across an access"),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci",
+    smoke_sdhci_device_address_is_stable
+);
 
 // ── Intel VMD smokes ───────────────────────────────────────────────
 

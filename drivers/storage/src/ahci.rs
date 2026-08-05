@@ -56,7 +56,9 @@
 //! | +0x34   | SACT  | SATA Active                     |
 //! | +0x38   | CI    | Command Issue                   |
 
-use core::sync::atomic::{compiler_fence, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+use crate::req_gate::ReqGate;
 
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
@@ -94,6 +96,21 @@ fn with_ahci_scratch<R>(f: impl FnOnce(&DmaBuffer) -> R) -> Option<R> {
 fn ahci_scratch_phys() -> u64 {
     with_ahci_scratch(|b| b.phys_addr().raw()).unwrap_or(0)
 }
+
+/// Byte offset of the data area inside the shared 4 KiB scratch
+/// (cmd_list@0x000, fis_recv@0x400, cmd_tbl@0x500, data@0x600).
+const SCRATCH_DATA_OFF: usize = 0x600;
+
+/// Payload bytes the scratch can hold past the command structures.
+///
+/// The scratch is ONE 4 KiB coherent page (`alloc_coherent` caps DMA
+/// allocations at a page), so a transfer is limited to
+/// `4096 - 0x600` = 2560 bytes = 5 sectors. The previous per-path
+/// checks allowed 8 sectors (4096 payload bytes), which let both the
+/// host-side zeroing and the device's PRDT DMA run up to 1536 bytes
+/// past the end of the page into whatever the allocator placed next —
+/// an out-of-bounds write reachable from any ≥6-sector registry read.
+const SCRATCH_DATA_MAX: usize = 4096 - SCRATCH_DATA_OFF;
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -227,6 +244,12 @@ pub struct Ahci {
     pub vs: u32,
     pub pi: u32,
     pub ports: alloc::vec::Vec<PortInfo>,
+    /// Serialises synchronous transfers (and the shared
+    /// `AHCI_SCRATCH` contents) across callers. Spun on WITHOUT
+    /// masking interrupts — see [`crate::req_gate::ReqGate`] for why
+    /// this replaces holding `CONTROLLER` across a 30-second-budget
+    /// CI/D2H poll.
+    req_gate: AtomicBool,
 }
 
 impl core::fmt::Debug for Ahci {
@@ -346,6 +369,7 @@ impl Ahci {
             vs,
             pi,
             ports,
+            req_gate: AtomicBool::new(false),
         })
     }
 
@@ -597,12 +621,14 @@ impl Ahci {
         let cmd_tbl = base + 0x500;
         let data_buf = base + 0x600;
 
-        // Zero the regions we touch.
+        // Zero the regions we touch. Bulk `write_bytes`, not a
+        // per-byte volatile loop — the scratch is coherent DMA memory,
+        // not MMIO, and the ordering that matters is the fence before
+        // the CI doorbell below, which publishes these stores before
+        // the device can look.
         // SAFETY: identity-mapped DMA page.
         unsafe {
-            for i in 0..(0x600 + 512) {
-                core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
-            }
+            core::ptr::write_bytes(base as *mut u8, 0, 0x600 + 512);
         }
 
         // Command List entry 0: H[5..0] = FIS length in DWORDs (5
@@ -715,14 +741,18 @@ impl Ahci {
             return Err(AhciError::ResetTimeout);
         }
 
-        // Copy out the IDENTIFY DEVICE response.
+        // Copy out the IDENTIFY DEVICE response. The CI-clear poll
+        // above is what makes the device's writes visible; fence so
+        // the bulk copy cannot be hoisted above it.
+        compiler_fence(Ordering::Acquire);
         let mut out = [0u8; 512];
-        for (i, byte) in out.iter_mut().enumerate() {
-            // SAFETY: `data_buf` is the base of the 512-byte DMA region the
-            // HBA filled with the IDENTIFY response; `i < 512` so each read is
-            // within that allocated, identity-mapped page.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            *byte = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
+        // SAFETY: `data_buf` is the base of the 512-byte DMA region the
+        // HBA filled with the IDENTIFY response; `out` is a stack array
+        // that cannot overlap the identity-mapped DMA page. Bulk copy
+        // rather than a per-byte volatile loop — the payload is
+        // coherent DMA memory, not MMIO.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data_buf as *const u8, out.as_mut_ptr(), 512);
         }
         // Stop the port.
         // SAFETY: caller-asserted.
@@ -745,7 +775,7 @@ pub unsafe fn ahci_write_lba(
     n_sectors: u16,
     data: &[u8],
 ) -> Result<(), AhciError> {
-    if n_sectors == 0 || (n_sectors as usize) * 512 > 4096 {
+    if n_sectors == 0 || (n_sectors as usize) * 512 > SCRATCH_DATA_MAX {
         return Err(AhciError::BarMapFailed);
     }
     if data.len() < (n_sectors as usize) * 512 {
@@ -768,15 +798,20 @@ pub unsafe fn ahci_write_lba(
     let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
     // Zero the cmd-list / FIS / cmd-table prefix; copy caller payload
-    // into the data buffer.
-    // SAFETY: identity-mapped DMA.
+    // into the data buffer. Bulk `write_bytes` / `copy_nonoverlapping`
+    // rather than per-byte volatile loops — the scratch is coherent
+    // DMA memory, not MMIO, and the fence before the CI doorbell below
+    // is what publishes these stores before the device can look.
+    // SAFETY: identity-mapped DMA; `data` is a kernel slice that
+    // cannot overlap the scratch page, and the caller-checked
+    // `n_sectors * 512 <= 4096` keeps the copy inside the data area.
     unsafe {
-        for i in 0..0x600 {
-            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
-        }
-        for (i, &b) in data.iter().enumerate().take((n_sectors as usize) * 512) {
-            core::ptr::write_volatile((data_buf + i as u64) as *mut u8, b);
-        }
+        core::ptr::write_bytes(base as *mut u8, 0, 0x600);
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            data_buf as *mut u8,
+            (n_sectors as usize) * 512,
+        );
     }
 
     // Cmd list slot 0: PRDT length = 1, CFL = 5, W bit = 1 (write).
@@ -878,7 +913,7 @@ pub unsafe fn ahci_read_lba(
     n_sectors: u16,
     out: &mut [u8],
 ) -> Result<(), AhciError> {
-    if n_sectors == 0 || (n_sectors as usize) * 512 > 4096 {
+    if n_sectors == 0 || (n_sectors as usize) * 512 > SCRATCH_DATA_MAX {
         return Err(AhciError::BarMapFailed);
     }
     if out.len() < (n_sectors as usize) * 512 {
@@ -900,11 +935,18 @@ pub unsafe fn ahci_read_lba(
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
-    // SAFETY: identity-mapped DMA.
+    // Bulk `write_bytes`, not a per-byte volatile loop: this ran one
+    // `write_volatile` per byte, which the compiler cannot vectorise
+    // or turn into a `memset`, so every read paid thousands of
+    // separate single-byte stores on the hottest path in the system.
+    // Volatility buys nothing here — the scratch is coherent DMA
+    // memory, not MMIO, and the fence before the CI doorbell below is
+    // what publishes these zeroes before the device is notified.
+    // SAFETY: identity-mapped DMA; extent is 0x600 + n_sectors*512
+    // ≤ 0x600 + SCRATCH_DATA_MAX = 4096 (checked at entry), i.e.
+    // within the one-page scratch.
     unsafe {
-        for i in 0..(0x600 + (n_sectors as usize) * 512) {
-            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
-        }
+        core::ptr::write_bytes(base as *mut u8, 0, 0x600 + (n_sectors as usize) * 512);
     }
 
     // Cmd list slot 0: PRDT length = 1, CFL = 5 (H2D FIS).
@@ -1000,12 +1042,22 @@ pub unsafe fn ahci_read_lba(
         return Err(AhciError::ResetTimeout);
     }
 
-    for (i, byte) in out.iter_mut().enumerate().take((n_sectors as usize) * 512) {
-        // SAFETY: `data_buf` is the base of the DMA region the HBA filled with
-        // the read payload; `i < n_sectors*512` bytes which is the size of that
-        // identity-mapped allocation, so each read is in-bounds.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        *byte = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
+    // The CI-clear poll above is what makes the device's writes
+    // visible; fence so the bulk copy cannot be hoisted above it.
+    compiler_fence(Ordering::Acquire);
+    // SAFETY: `data_buf` is the base of the DMA area the HBA filled
+    // with the read payload (n_sectors*512 ≤ SCRATCH_DATA_MAX and
+    // ≤ out.len(), both checked at entry); `out` is a kernel slice
+    // that cannot overlap the identity-mapped scratch page. Bulk copy
+    // rather than a per-byte volatile loop: the payload is coherent
+    // DMA memory, not MMIO, and per-byte volatility defeats
+    // vectorisation on the hottest path in the system.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data_buf as *const u8,
+            out.as_mut_ptr(),
+            (n_sectors as usize) * 512,
+        );
     }
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
@@ -1031,7 +1083,7 @@ pub async unsafe fn ahci_read_lba_async(
     n_sectors: u16,
     out: &mut [u8],
 ) -> Result<(), AhciError> {
-    if n_sectors == 0 || (n_sectors as usize) * 512 > 4096 {
+    if n_sectors == 0 || (n_sectors as usize) * 512 > SCRATCH_DATA_MAX {
         return Err(AhciError::BarMapFailed);
     }
     if out.len() < (n_sectors as usize) * 512 {
@@ -1053,11 +1105,11 @@ pub async unsafe fn ahci_read_lba_async(
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
-    // SAFETY: identity-mapped DMA.
+    // Bulk zero — see `ahci_read_lba` for why this is not a per-byte
+    // volatile loop.
+    // SAFETY: identity-mapped DMA; extent ≤ 4096 (checked at entry).
     unsafe {
-        for i in 0..(0x600 + (n_sectors as usize) * 512) {
-            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
-        }
+        core::ptr::write_bytes(base as *mut u8, 0, 0x600 + (n_sectors as usize) * 512);
     }
     // SAFETY: identity-mapped DMA.
     unsafe {
@@ -1114,12 +1166,21 @@ pub async unsafe fn ahci_read_lba_async(
     let r = unsafe { ahci.issue_and_wait_async(port_idx, 1).await };
     r?;
 
-    for (i, byte) in out.iter_mut().enumerate().take((n_sectors as usize) * 512) {
-        // SAFETY: `data_buf` is the base of the DMA region the HBA filled with
-        // the read payload; `i < n_sectors*512` bytes which is the size of that
-        // identity-mapped allocation, so each read is in-bounds.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        *byte = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
+    // The IRQ-signalled completion above is what makes the device's
+    // writes visible; fence so the bulk copy cannot be hoisted above
+    // it.
+    compiler_fence(Ordering::Acquire);
+    // SAFETY: `data_buf` is the base of the DMA area the HBA filled
+    // with the read payload (n_sectors*512 ≤ SCRATCH_DATA_MAX bytes,
+    // checked at entry); `out` is a kernel slice that cannot overlap
+    // the identity-mapped scratch page. Bulk copy rather than a
+    // per-byte volatile loop — see `ahci_read_lba`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data_buf as *const u8,
+            out.as_mut_ptr(),
+            (n_sectors as usize) * 512,
+        );
     }
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
@@ -1139,7 +1200,7 @@ pub async unsafe fn ahci_write_lba_async(
     n_sectors: u16,
     data: &[u8],
 ) -> Result<(), AhciError> {
-    if n_sectors == 0 || (n_sectors as usize) * 512 > 4096 {
+    if n_sectors == 0 || (n_sectors as usize) * 512 > SCRATCH_DATA_MAX {
         return Err(AhciError::BarMapFailed);
     }
     if data.len() < (n_sectors as usize) * 512 {
@@ -1161,14 +1222,18 @@ pub async unsafe fn ahci_write_lba_async(
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
-    // SAFETY: identity-mapped DMA.
+    // Bulk zero + payload copy — see `ahci_write_lba` for why these
+    // are not per-byte volatile loops.
+    // SAFETY: identity-mapped DMA; n_sectors*512 ≤ SCRATCH_DATA_MAX
+    // (checked at entry) keeps the copy inside the scratch page, and
+    // `data` is a kernel slice that cannot overlap it.
     unsafe {
-        for i in 0..0x600 {
-            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
-        }
-        for (i, &b) in data.iter().enumerate().take((n_sectors as usize) * 512) {
-            core::ptr::write_volatile((data_buf + i as u64) as *mut u8, b);
-        }
+        core::ptr::write_bytes(base as *mut u8, 0, 0x600);
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            data_buf as *mut u8,
+            (n_sectors as usize) * 512,
+        );
     }
     // SAFETY: identity-mapped DMA.
     unsafe {
@@ -1252,7 +1317,7 @@ pub unsafe fn ahci_read_lba_ncq(
 ) -> Result<(), AhciError> {
     if tag >= 32
         || n_sectors == 0
-        || (n_sectors as usize) * 512 > 4096
+        || (n_sectors as usize) * 512 > SCRATCH_DATA_MAX
         || out.len() < (n_sectors as usize) * 512
     {
         return Err(AhciError::BarMapFailed);
@@ -1289,7 +1354,7 @@ pub unsafe fn ahci_write_lba_ncq(
 ) -> Result<(), AhciError> {
     if tag >= 32
         || n_sectors == 0
-        || (n_sectors as usize) * 512 > 4096
+        || (n_sectors as usize) * 512 > SCRATCH_DATA_MAX
         || data.len() < (n_sectors as usize) * 512
     {
         return Err(AhciError::BarMapFailed);
@@ -1332,16 +1397,21 @@ unsafe fn ahci_lba_ncq(
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
-    // Zero scratch + (for writes) copy caller payload in.
-    // SAFETY: identity-mapped DMA.
+    // Zero scratch + (for writes) copy caller payload in. Bulk ops —
+    // see `ahci_read_lba` for why these are not per-byte volatile
+    // loops.
+    // SAFETY: identity-mapped DMA; the public NCQ wrappers check
+    // n_sectors*512 ≤ SCRATCH_DATA_MAX, keeping the copy inside the
+    // scratch page, and `data_in` is a kernel slice that cannot
+    // overlap it.
     unsafe {
-        for i in 0..0x600 {
-            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
-        }
+        core::ptr::write_bytes(base as *mut u8, 0, 0x600);
         if write {
-            for (i, &b) in data_in.iter().enumerate().take((n_sectors as usize) * 512) {
-                core::ptr::write_volatile((data_buf + i as u64) as *mut u8, b);
-            }
+            core::ptr::copy_nonoverlapping(
+                data_in.as_ptr(),
+                data_buf as *mut u8,
+                (n_sectors as usize) * 512,
+            );
         }
     }
 
@@ -1445,14 +1515,23 @@ unsafe fn ahci_lba_ncq(
         return Err(AhciError::ResetTimeout);
     }
 
-    // For reads, copy back.
+    // For reads, copy back. The CI-clear poll above is what makes the
+    // device's writes visible; fence so the bulk copy cannot be
+    // hoisted above it.
     if !write {
-        for (i, byte) in out.iter_mut().enumerate().take((n_sectors as usize) * 512) {
-            // SAFETY: `data_buf` is the base of the DMA region the HBA filled
-            // for this read; `i < n_sectors*512` which is that region's size, so
-            // the volatile read stays inside the identity-mapped allocation.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            *byte = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
+        compiler_fence(Ordering::Acquire);
+        // SAFETY: `data_buf` is the base of the DMA area the HBA
+        // filled for this read (n_sectors*512 ≤ SCRATCH_DATA_MAX and
+        // ≤ out.len(), both checked by the public wrapper); `out` is a
+        // kernel slice that cannot overlap the identity-mapped scratch
+        // page. Bulk copy rather than a per-byte volatile loop — see
+        // `ahci_read_lba`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data_buf as *const u8,
+                out.as_mut_ptr(),
+                (n_sectors as usize) * 512,
+            );
         }
     }
     // SAFETY: caller-asserted.
@@ -1542,12 +1621,11 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
 
-    // Zero the used range.
-    // SAFETY: identity-mapped DMA.
+    // Zero the used range. Bulk `write_bytes` — coherent DMA, not
+    // MMIO; the fence before the CI doorbell publishes it.
+    // SAFETY: identity-mapped DMA, extent within the 4 KiB scratch.
     unsafe {
-        for i in 0..(0x500 + 64) {
-            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
-        }
+        core::ptr::write_bytes(base as *mut u8, 0, 0x500 + 64);
     }
 
     // Command-list header 0: PRDT length = 0 (NODATA), CFL = 5.
@@ -1816,12 +1894,12 @@ pub unsafe fn atapi_send_cdb(
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
 
-    // Zero command-list + FIS receive area + command table.
-    // SAFETY: identity-mapped DMA.
+    // Zero command-list + FIS receive area + command table. Bulk
+    // `write_bytes` — coherent DMA, not MMIO; the fence before the CI
+    // doorbell publishes it.
+    // SAFETY: identity-mapped DMA, extent within the 4 KiB scratch.
     unsafe {
-        for i in 0..(0x500 + 0x90) {
-            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
-        }
+        core::ptr::write_bytes(base as *mut u8, 0, 0x500 + 0x90);
     }
 
     // Command-list header 0.
@@ -2183,39 +2261,124 @@ impl narf_block::BlockDeviceSync for AhciBlockSync {
         if (n_blocks as usize) * 512 > 4096 || out.len() < (n_blocks as usize) * 512 {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        let g = CONTROLLER.lock();
-        let ahci = g.as_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        // Interrupts stay enabled for the whole transfer: hold the
+        // device's request gate, not the IRQ-masking CONTROLLER lock.
+        // See `probed_ahci` / `crate::req_gate::ReqGate`.
+        let ahci = probed_ahci().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let _gate = ReqGate::acquire(&ahci.req_gate);
         let port = ahci
             .ports
             .iter()
             .find(|p| p.kind == PortKind::Sata)
             .map(|p| p.index)
             .unwrap_or(0);
-        // SAFETY: caller-trusted single-thread access.
-        unsafe { ahci_read_lba(ahci, port, lba, n_blocks, out) }
-            .map_err(|_| narf_block::BlockIoError::DriverError)
+        // Chunk to what the one-page scratch can hold past its command
+        // structures (SCRATCH_DATA_MAX); the registry contract allows
+        // up to 8 sectors per call.
+        let max_sectors = (SCRATCH_DATA_MAX / 512) as u16;
+        let mut done: u16 = 0;
+        while done < n_blocks {
+            let want = max_sectors.min(n_blocks - done);
+            let off = done as usize * 512;
+            // SAFETY: the request gate serialises transfers + scratch
+            // use.
+            unsafe {
+                ahci_read_lba(
+                    ahci,
+                    port,
+                    lba + done as u64,
+                    want,
+                    &mut out[off..off + want as usize * 512],
+                )
+            }
+            .map_err(|_| narf_block::BlockIoError::DriverError)?;
+            done += want;
+        }
+        Ok(())
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
         if (n_blocks as usize) * 512 > 4096 || data.len() < (n_blocks as usize) * 512 {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        let g = CONTROLLER.lock();
-        let ahci = g.as_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        // Same reasoning (gate + chunking) as `read` above.
+        let ahci = probed_ahci().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let _gate = ReqGate::acquire(&ahci.req_gate);
         let port = ahci
             .ports
             .iter()
             .find(|p| p.kind == PortKind::Sata)
             .map(|p| p.index)
             .unwrap_or(0);
-        // SAFETY: same.
-        unsafe { ahci_write_lba(ahci, port, lba, n_blocks, data) }
-            .map_err(|_| narf_block::BlockIoError::DriverError)
+        let max_sectors = (SCRATCH_DATA_MAX / 512) as u16;
+        let mut done: u16 = 0;
+        while done < n_blocks {
+            let want = max_sectors.min(n_blocks - done);
+            let off = done as usize * 512;
+            // SAFETY: the request gate serialises transfers + scratch
+            // use.
+            unsafe {
+                ahci_write_lba(
+                    ahci,
+                    port,
+                    lba + done as u64,
+                    want,
+                    &data[off..off + want as usize * 512],
+                )
+            }
+            .map_err(|_| narf_block::BlockIoError::DriverError)?;
+            done += want;
+        }
+        Ok(())
     }
 }
 
 // ── Driver-match registration ────────────────────────────────────────
 
+/// Slot for the live HBA produced by `probe`. Held only long enough
+/// to read the installed device's address (`probed_ahci`) — NEVER
+/// across a device round-trip, which busy-polls CI-clear/D2H with a
+/// 30-second budget. See [`crate::req_gate`] for the livelock this
+/// prevents.
 static CONTROLLER: IrqSafeSpinLock<Option<Ahci>> = IrqSafeSpinLock::new(None);
+
+/// The probed HBA, WITHOUT holding `CONTROLLER` for the caller's use
+/// of it.
+///
+/// `CONTROLLER` is taken only long enough to read the address of the
+/// installed device, then released, so a long transfer runs with
+/// interrupts enabled.
+///
+/// # Why the reference stays valid
+///
+/// The `Option` is written exactly once: [`probe`] returns early when
+/// an HBA is already installed, and nothing ever stores `None` back.
+/// The `Ahci` therefore is never moved, replaced or dropped after its
+/// single install, so a shared reference to it stays valid for the
+/// rest of the boot. `smoke_ahci_device_address_is_stable` pins that
+/// invariant, because it is the kind of assumption a later "support
+/// hot-unplug" change would silently invalidate. There is no `&mut`
+/// path into the slot at all — every `Ahci` method takes `&self`.
+fn probed_ahci() -> Option<&'static Ahci> {
+    let ptr: *const Ahci = {
+        let g = CONTROLLER.lock();
+        match g.as_ref() {
+            Some(d) => d as *const Ahci,
+            None => return None,
+        }
+    };
+    // SAFETY: install-once, never-moved, never-dropped — see above.
+    Some(unsafe { &*ptr })
+}
+
+/// The installed HBA's address, or `None` before probe. Test hook for
+/// the install-once invariant `probed_ahci` relies on.
+#[doc(hidden)]
+pub fn dbg_device_addr() -> Option<usize> {
+    CONTROLLER
+        .lock()
+        .as_ref()
+        .map(|d| d as *const Ahci as usize)
+}
 
 /// IDT vector our ISR is installed on, or 0 if no IRQ path was
 /// successfully negotiated. Loaded by both ISR and async waiters.
@@ -2446,8 +2609,19 @@ pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
+/// Run `f` against the probed HBA, if any.
+///
+/// Holds the device's request gate — not the `CONTROLLER` spinlock —
+/// for the duration of `f`, so closures that do polled I/O
+/// (`identify_device`, `ahci_read_lba`, ...) wait out the transfer
+/// with interrupts enabled while still excluding every other user of
+/// the HBA and its shared scratch. Callers must not re-enter
+/// `with_controller` (or the `AhciBlockSync` paths) from inside `f` —
+/// the gate is not reentrant.
 pub fn with_controller<R>(f: impl FnOnce(&Ahci) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    let ahci = probed_ahci()?;
+    let _gate = ReqGate::acquire(&ahci.req_gate);
+    Some(f(ahci))
 }
 
 #[allow(dead_code)]

@@ -95,6 +95,40 @@ fn smoke_acpi_ec_discovery() -> TestResult {
 }
 kernel_test_in!("drivers/platform/ec", smoke_acpi_ec_discovery);
 
+/// The installed EC must never move, be replaced, or be dropped.
+///
+/// `ec::probed_ec` reads the EC's address under the `GLOBAL_EC` lock,
+/// releases the lock, and hands out a `&'static AcpiEc` used for whole
+/// EC transactions — which is what lets the up-to-200 ms IBF/OBF waits
+/// run with interrupts enabled instead of masking them machine-wide.
+/// That is only sound because `init` installs the EC exactly once and
+/// nothing ever stores `None` back. A later "re-init the EC on resume"
+/// change would invalidate it silently, leaving a data race reachable
+/// only under a live SCI burst — so assert it directly: a repeat
+/// `init()` must be refused and must not move the installed EC.
+fn smoke_acpi_ec_address_is_stable() -> TestResult {
+    use crate::ec;
+    let before = match ec::dbg_ec_addr() {
+        Some(a) => a,
+        None => return TestResult::Skip("ACPI EC not initialized"),
+    };
+    // A repeat init must early-return, not rebuild (or even rewrite)
+    // the installed EC.
+    ec::init();
+    match ec::dbg_ec_addr() {
+        Some(a) if a == before => {}
+        Some(_) => return TestResult::Fail("re-init MOVED the installed EC"),
+        None => return TestResult::Fail("re-init removed the installed EC"),
+    }
+    // And the unlocked accessor must hand back exactly that EC.
+    match ec::probed_ec().map(|ec| ec as *const _ as usize) {
+        Some(a) if a == before => TestResult::Pass,
+        Some(_) => TestResult::Fail("probed_ec disagrees with the installed address"),
+        None => TestResult::Fail("probed_ec lost the installed EC"),
+    }
+}
+kernel_test_in!("drivers/platform/ec", smoke_acpi_ec_address_is_stable);
+
 fn smoke_acpi_thermal_discovery() -> TestResult {
     use narf_power::thermal::zone_count;
     // `zone_count()` returns a `usize`, so it is always >= 0 — just

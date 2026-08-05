@@ -375,6 +375,12 @@ pub enum FsError {
     /// remaining readers. Maps to POSIX `EPIPE`; the syscall layer also
     /// raises SIGPIPE on the writer.
     BrokenPipe,
+    /// The operation ran against a descriptor whose open mode forbids it —
+    /// reading a write-only pipe end, writing a read-only one. Linux fails
+    /// these with `EBADF` from the `f_mode` checks in
+    /// `fs/read_write.c::vfs_read` / `vfs_write` (FMODE_READ/FMODE_WRITE),
+    /// before the file op is ever called. Maps to `EBADF`.
+    BadFd,
 }
 
 impl From<CapError> for FsError {

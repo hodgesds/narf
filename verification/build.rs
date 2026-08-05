@@ -523,6 +523,7 @@ fn main() {
     });
     for test in [
         "fork_pipe_smoke",
+        "popenw_smoke",
         "fork_exec_burst_smoke",
         "sched_affinity_smp_smoke",
         "epoll_smoke",
@@ -610,6 +611,7 @@ fn main() {
         "drm_smoke",
         "tfd_epoll_smoke",
         "unix_epoll_smoke",
+        "wlserve_smoke",
         "shmfork_smoke",
         "sigrt_smoke",
         "strace_smoke",

@@ -306,6 +306,92 @@ pub struct UserTaskCtx {
     /// re-checks the peer count against the already-installed fd rather than
     /// re-opening. Cleared (and the fd returned) once the peer appears.
     pub fifo_open_pending_fd: AtomicU64,
+
+    // ── stall-watchdog diagnostics ──────────────────────────────────
+    /// Monotonic count of park-condition re-checks: bumped on every
+    /// `park_should_block` pass (own-stack park loop) and every
+    /// deadline-branch pass of `UserTaskFuture::poll` (longjmp parks).
+    ///
+    /// NOT bumped by `own_stack_wait_child` — a task parked in a blocking
+    /// wait4/waitid (or a ppoll misrouted there by a stale
+    /// `wait_child_pending`) shows a FROZEN counter even while healthy,
+    /// because that loop re-checks only on child-exit/signal wakes and
+    /// arms no wheel backstop. The stranded-poll report's `waitchild`
+    /// field is the discriminator.
+    ///
+    /// This is the signal that distinguishes the two ways a task can sit
+    /// parked forever. A HEALTHY parked task re-checks its condition on the
+    /// ~10 ms lost-wake backstop (infinite parks and io-parks both arm it),
+    /// so this counter climbs ~100/s even while the task never runs a user
+    /// instruction and accumulates no /proc CPU time. A counter that is
+    /// FROZEN while `parked_in_syscall` stays true means the task is never
+    /// re-polled at all — its backstop registration or executor wake was
+    /// lost — which no CPU-time metric can distinguish from ordinary idle.
+    pub dbg_park_checks: AtomicU64,
+    /// The fd set of an in-flight blocking `poll`/`ppoll` park, recorded at
+    /// park time so the stall watchdog can re-run the readiness scan for a
+    /// wedged poller (the poll twin of `epoll_wait_fd`): each slot is
+    /// `((events as u64) << 32) | (fd as u32 as u64 + 1)`, zero = empty.
+    /// Only the first [`POLL_WAIT_RECORD_MAX`] entries are recorded;
+    /// `poll_wait_nfds` carries the true set size. Cleared on every
+    /// `poll_common` return path.
+    pub poll_wait_fds: [AtomicU64; POLL_WAIT_RECORD_MAX],
+    /// True nfds of the recorded in-flight poll park (may exceed the
+    /// recorded window above), or 0 when no blocking poll is parked.
+    pub poll_wait_nfds: AtomicU32,
+    /// Monotonic count of readiness scans this task's own blocking `poll`
+    /// park has run (`poll_common`'s pre-park `poll_scan`).
+    ///
+    /// This is the progress signal `dbg_park_checks` cannot give for a
+    /// poll waiter. Both a healthy poller and a wedged one show a CLIMBING
+    /// `dbg_park_checks`, because an io-park re-executes its syscall on
+    /// every ~10 ms backstop wake and each re-execution parks again — so
+    /// "the counter moves" says only that the task is being reconsidered,
+    /// not that it is re-asking the readiness question.
+    ///
+    /// Comparing this against the watchdog's own scan splits the two
+    /// remaining hypotheses cleanly. If it ADVANCES while the watchdog
+    /// still sees a ready fd, the task IS re-scanning and `poll_scan`
+    /// disagrees with the watchdog about the same fd — a readiness-oracle
+    /// bug. If it is FROZEN, the syscall is never re-executed at all — a
+    /// wake/executor bug. They need opposite fixes.
+    pub dbg_poll_scans: AtomicU64,
+    /// Two-sample latch for the stranded-poller report: `dbg_poll_scans + 1`
+    /// as of the previous watchdog sighting of this task with a ready fd,
+    /// or 0 when unlatched.
+    ///
+    /// A single sample cannot tell a strand from a healthy poller.
+    /// `parked_in_syscall` is set before the park but cleared only at
+    /// syscall EXIT, so a task cycling park → wake → re-execute → scan →
+    /// park reads as "parked" for its entire blocking poll — and its
+    /// `dbg_park_checks` climbs the whole time. Sampling a ready fd in that
+    /// window reports a working compositor as stranded.
+    ///
+    /// The latch closes it: a candidate must be seen twice with `scans`
+    /// UNCHANGED. A healthy poller re-scans within one ~10 ms backstop, so
+    /// a full watchdog interval with a ready fd and no scan means the
+    /// syscall genuinely never re-executes.
+    pub dbg_poll_strand_latch: AtomicU64,
+}
+
+/// Recorded-fd window for [`UserTaskCtx::poll_wait_fds`]. Qt/glib main
+/// loops poll a handful of fds; 16 covers every set seen in a Plasma
+/// session while keeping the ctx growth bounded.
+pub const POLL_WAIT_RECORD_MAX: usize = 16;
+
+/// Whether parked tasks should record their polled fd set for the stall
+/// watchdog's strand detector. Off by default — see `record_poll_wait`.
+static POLL_WAIT_RECORDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Enable the diagnostic recording above. Called by the stall watchdog.
+pub fn enable_poll_wait_recording() {
+    POLL_WAIT_RECORDING.store(true, Ordering::Release);
+}
+
+#[inline]
+pub fn poll_wait_recording_enabled() -> bool {
+    POLL_WAIT_RECORDING.load(Ordering::Relaxed)
 }
 
 // SAFETY: cells are accessed only from the polling routine and
@@ -351,6 +437,11 @@ impl UserTaskCtx {
             console_read_pending: AtomicBool::new(false),
             blocking_deadline_ns: AtomicU64::new(0),
             fifo_open_pending_fd: AtomicU64::new(0),
+            dbg_park_checks: AtomicU64::new(0),
+            poll_wait_fds: [const { AtomicU64::new(0) }; POLL_WAIT_RECORD_MAX],
+            poll_wait_nfds: AtomicU32::new(0),
+            dbg_poll_scans: AtomicU64::new(0),
+            dbg_poll_strand_latch: AtomicU64::new(0),
         }
     }
 }
@@ -575,6 +666,9 @@ fn park_should_block(
     sleep_handle: &mut Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
 ) -> bool {
     let task_id = crate::handlers::current_task_id();
+    // Watchdog liveness signal: this task's park loop ran (see
+    // `UserTaskCtx::dbg_park_checks`).
+    uc.dbg_park_checks.fetch_add(1, Ordering::Relaxed);
 
     // Job-control stop (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU): stay parked until
     // SIGCONT clears the stopped flag (SIGKILL=bit 9 still breaks through).
@@ -1606,6 +1700,11 @@ impl core::future::Future for UserTaskFuture {
         // long enough to keep heap pressure flat.
         let deadline = this.task.uctx.sleep_deadline_ns.load(Ordering::Acquire);
         if deadline != 0 {
+            // Watchdog liveness signal (see `UserTaskCtx::dbg_park_checks`).
+            this.task
+                .uctx
+                .dbg_park_checks
+                .fetch_add(1, Ordering::Relaxed);
             let now = narf_scheduler::narf_time::monotonic_ns();
             // An asynchronously-raised signal (e.g. SIGALRM from an
             // interval timer, a cross-process kill) must break ANY park —

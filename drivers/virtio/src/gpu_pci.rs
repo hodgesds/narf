@@ -23,7 +23,7 @@
 //! enough that adding an MSI-X vector + waker isn't worth the
 //! complexity yet.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
@@ -39,6 +39,7 @@ use crate::pci::{
     CC_QUEUE_SELECT, CC_QUEUE_SIZE,
 };
 use crate::queue::{VirtqDesc, Virtqueue, VirtqueueLayout, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use crate::req_gate::ReqGate;
 use crate::{
     VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
     VIRTIO_STATUS_FEATURES_OK,
@@ -91,6 +92,12 @@ const HDR_LEN: usize = 24;
 const SCANOUT_W: u32 = 32;
 const SCANOUT_H: u32 = 32;
 
+// The scanout buffer is allocated once at bring-up and never replaced
+// (that stability is what lets `probed_device` hand out `&'static`
+// references and lets `/dev/fb0` alias the frames). It must therefore
+// fit the single page `alloc_coherent` can provide.
+const _: () = assert!((SCANOUT_W * SCANOUT_H * 4) as usize <= 4096);
+
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DisplayMode {
     pub width: u32,
@@ -116,19 +123,30 @@ pub struct VirtioGpuPci {
     req_buf: DmaBuffer,
     /// Response DMA buffer (device→driver).
     resp_buf: DmaBuffer,
-    /// Scanout pixel buffer, one host-side resource id = 1.
+    /// Scanout pixel buffer, one host-side resource id = 1. Allocated
+    /// once at bring-up and never replaced — see the const assert next
+    /// to `SCANOUT_W`.
     scanout_buf: DmaBuffer,
     ctrl_q_notify_off: u16,
-    pub mode: DisplayMode,
-    pub ready: bool,
-    last_err: Option<VirtioPciError>,
+    /// Cached scanout mode. Interior-mutable so `init_scanout` can run
+    /// on `&self`; taken only for a copy in/out, never across a device
+    /// round-trip.
+    mode: IrqSafeSpinLock<DisplayMode>,
+    /// Set once by `init_scanout` after the scanout is programmed.
+    ready: AtomicBool,
+    last_err: IrqSafeSpinLock<Option<VirtioPciError>>,
+    /// Serialises users of the shared `req_buf`/`resp_buf` scratch and
+    /// the multi-command sequences (`init_scanout`, `flush`) WITHOUT
+    /// masking interrupts while waiting — see [`crate::req_gate`].
+    req_gate: AtomicBool,
 }
 
 impl core::fmt::Debug for VirtioGpuPci {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mode = self.mode();
         f.debug_struct("VirtioGpuPci")
-            .field("ready", &self.ready)
-            .field("mode", &self.mode)
+            .field("ready", &self.is_ready())
+            .field("mode", &mode)
             .finish_non_exhaustive()
     }
 }
@@ -239,12 +257,18 @@ impl VirtioGpuPci {
             _cursor_layout_buf: cursor_buf,
             req_buf,
             resp_buf,
+            // Allocated once here — 32×32×4 fills the page exactly, so
+            // `init_scanout` attaches this buffer instead of swapping in
+            // a fresh one. Keeping the allocation stable is what makes
+            // `scanout_phys()` (and the `&'static` handed out by
+            // `probed_device`) sound for the controller's lifetime.
             scanout_buf: alloc_coherent(4096, DomainId::DRIVER_0)
-                .map_err(|_| VirtioPciError::BarMapFailed)?, // placeholder
+                .map_err(|_| VirtioPciError::BarMapFailed)?,
             ctrl_q_notify_off,
-            mode: DisplayMode::default(),
-            ready: false,
-            last_err: None,
+            mode: IrqSafeSpinLock::new(DisplayMode::default()),
+            ready: AtomicBool::new(false),
+            last_err: IrqSafeSpinLock::new(None),
+            req_gate: AtomicBool::new(false),
         };
 
         Ok(me)
@@ -253,32 +277,49 @@ impl VirtioGpuPci {
     /// Most recent error encountered during `init_scanout`, for boot
     /// diagnostics. `None` until something fails.
     pub fn last_error(&self) -> Option<VirtioPciError> {
-        self.last_err
+        *self.last_err.lock()
     }
 
-    /// Set up scanout 0 with a fresh DMA-backed resource. Separated
-    /// from `bring_up` so probe failures (out-of-memory, device
-    /// rejecting a command) leave the device in the bound list with
-    /// `ready = false` instead of being dropped silently.
+    /// Cached scanout mode (a copy — the lock is released before
+    /// returning).
+    pub fn mode(&self) -> DisplayMode {
+        *self.mode.lock()
+    }
+
+    /// Whether `init_scanout` has completed.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    /// Set up scanout 0 over the bring-up-allocated DMA resource.
+    /// Separated from `bring_up` so probe failures (out-of-memory,
+    /// device rejecting a command) leave the device in the bound list
+    /// with `ready = false` instead of being dropped silently.
     ///
-    /// # Safety
-    /// `bring_up` must have completed; BSP-only.
-    pub unsafe fn init_scanout(&mut self) -> Result<(), VirtioPciError> {
-        if self.ready {
+    /// Serialised against every other submitter by the device's request
+    /// gate, so it needs no external locking — and interrupts stay
+    /// enabled on this CPU for the control round-trips.
+    pub fn init_scanout(&self) -> Result<(), VirtioPciError> {
+        let _gate = ReqGate::acquire(&self.req_gate);
+        if self.is_ready() {
             return Ok(());
         }
         // Wrap the body so we can capture the failing step.
-        // SAFETY: bring_up completed; BSP-only as required by caller contract.
+        // SAFETY: the device is only reachable after bring_up; the gate
+        // excludes concurrent users of the request scratch.
         let r = unsafe { self.init_scanout_inner() };
         if let Err(e) = r {
-            self.last_err = Some(e);
+            *self.last_err.lock() = Some(e);
         }
         r
     }
 
     /// `init_scanout_inner` so the public wrapper can capture the
     /// failure step into `last_err`.
-    unsafe fn init_scanout_inner(&mut self) -> Result<(), VirtioPciError> {
+    ///
+    /// # Safety
+    /// Caller holds the request gate.
+    unsafe fn init_scanout_inner(&self) -> Result<(), VirtioPciError> {
         // Query GET_DISPLAY_INFO. We don't actually use the host
         // resolution — our scanout buffer is fixed at SCANOUT_W ×
         // SCANOUT_H (32×32) so it fits in one DMA page — but the
@@ -288,17 +329,13 @@ impl VirtioGpuPci {
         unsafe {
             self.fetch_display_info(&mut display_info)?;
         }
-        self.mode = DisplayMode {
+        *self.mode.lock() = DisplayMode {
             width: SCANOUT_W,
             height: SCANOUT_H,
             enabled: display_info[0].enabled,
         };
 
         let scanout_bytes = (SCANOUT_W * SCANOUT_H * 4) as usize;
-        let scanout_buf = alloc_coherent(scanout_bytes, DomainId::DRIVER_0)
-            .map_err(|_| VirtioPciError::BarMapFailed)?;
-        self.scanout_buf = scanout_buf;
-
         // SAFETY: queues + buffers prepared.
         unsafe {
             self.resource_create_2d(1, FMT_B8G8R8X8_UNORM, SCANOUT_W, SCANOUT_H)?;
@@ -310,7 +347,7 @@ impl VirtioGpuPci {
             self.set_scanout(0, 1, SCANOUT_W, SCANOUT_H)?;
         }
 
-        self.ready = true;
+        self.ready.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -344,31 +381,27 @@ impl VirtioGpuPci {
 
     /// Paint a solid 32-bit BGRA color across the entire scanout
     /// buffer, then issue TRANSFER + FLUSH so it's visible. Test
-    /// hook + sanity smoke.
-    ///
-    /// # Safety
-    /// `init_scanout` must have completed; no concurrent draw
-    /// in flight.
-    pub unsafe fn paint_solid(&mut self, bgra: u32) -> Result<(), VirtioPciError> {
+    /// hook + sanity smoke. Serialised by the device's request gate.
+    pub fn paint_solid(&self, bgra: u32) -> Result<(), VirtioPciError> {
+        let _gate = ReqGate::acquire(&self.req_gate);
         // SAFETY: scanout_buf is identity-mapped + sized w*h*4.
         unsafe {
             let p = self.scanout_buf.phys_addr().raw() as *mut u32;
             for i in 0..(SCANOUT_W * SCANOUT_H) as usize {
                 core::ptr::write_volatile(p.add(i), bgra);
             }
-            self.flush()
+            self.flush_inner()
         }
     }
 
     /// Paint a 32x32 BGRA test pattern centered in the scanout, on
     /// top of a contrasting fill — useful for visual confirmation
     /// that the TRANSFER + FLUSH path actually pushed pixels.
-    ///
-    /// # Safety
-    /// As `paint_solid`.
-    pub unsafe fn paint_test_pattern(&mut self) -> Result<(), VirtioPciError> {
+    /// Serialised by the device's request gate.
+    pub fn paint_test_pattern(&self) -> Result<(), VirtioPciError> {
+        let _gate = ReqGate::acquire(&self.req_gate);
         // Magenta background + cyan center square.
-        // SAFETY: caller-asserted preconditions.
+        // SAFETY: scanout_buf is identity-mapped + sized w*h*4.
         unsafe {
             let p = self.scanout_buf.phys_addr().raw() as *mut u32;
             for y in 0..SCANOUT_H as usize {
@@ -381,17 +414,30 @@ impl VirtioGpuPci {
                     core::ptr::write_volatile(p.add(y * SCANOUT_W as usize + x), c);
                 }
             }
-            self.flush()
+            self.flush_inner()
         }
     }
 
     /// TRANSFER_TO_HOST_2D + RESOURCE_FLUSH for the entire scanout.
     /// Call after every batch of FB writes the user wants visible.
     ///
+    /// This is the framebuffer hot path — it runs on every console
+    /// scroll / cursor blink — so it must NOT be reached through the
+    /// IRQ-masking global `CONTROLLER` lock. The request gate provides
+    /// the same mutual exclusion while leaving interrupts enabled on
+    /// the waiting CPU for the (up to two-second) device round-trips.
+    pub fn flush(&self) -> Result<(), VirtioPciError> {
+        let _gate = ReqGate::acquire(&self.req_gate);
+        // SAFETY: the device is only reachable after bring_up; the gate
+        // excludes concurrent users of the request scratch.
+        unsafe { self.flush_inner() }
+    }
+
+    /// Gate-free body of [`flush`], shared with the paint helpers.
+    ///
     /// # Safety
-    /// `bring_up` must have completed; ctrl queue serialised via
-    /// internal lock.
-    pub unsafe fn flush(&mut self) -> Result<(), VirtioPciError> {
+    /// Caller holds the request gate; `bring_up` must have completed.
+    unsafe fn flush_inner(&self) -> Result<(), VirtioPciError> {
         // SAFETY: req/resp buffers + queue prepared.
         unsafe {
             self.transfer_to_host_2d(1, 0, 0, SCANOUT_W, SCANOUT_H)?;
@@ -407,8 +453,10 @@ impl VirtioGpuPci {
     /// response written into `resp_buf` by the device).
     ///
     /// # Safety
-    /// `bring_up` complete; req body already written into req_buf.
-    unsafe fn submit(&mut self, req_len: usize, resp_len: usize) -> Result<(), VirtioPciError> {
+    /// `bring_up` complete; req body already written into req_buf;
+    /// caller holds the request gate (the ctrl queue has its own lock,
+    /// but the req/resp scratch does not).
+    unsafe fn submit(&self, req_len: usize, resp_len: usize) -> Result<(), VirtioPciError> {
         let descs = [
             VirtqDesc {
                 addr: self.req_buf.phys_addr().raw(),
@@ -480,9 +528,11 @@ impl VirtioGpuPci {
             core::ptr::write_volatile((hdr_phys + 8) as *mut u64, 0); // fence_id
             core::ptr::write_volatile((hdr_phys + 16) as *mut u32, 0); // ctx_id
             core::ptr::write_volatile((hdr_phys + 20) as *mut u32, 0); // padding
-            for (i, b) in body.iter().enumerate() {
-                core::ptr::write_volatile((hdr_phys + 24 + i as u64) as *mut u8, *b);
-            }
+                                                                       // Bulk copy the body — coherent DMA memory, not MMIO, so
+                                                                       // per-byte volatile buys nothing (see the virtio-blk DMA
+                                                                       // copy fix). Ordering vs. the device is provided by the
+                                                                       // SeqCst fence before the notify write in `submit`.
+            core::ptr::copy_nonoverlapping(body.as_ptr(), (hdr_phys + 24) as *mut u8, body.len());
         }
     }
 
@@ -495,7 +545,7 @@ impl VirtioGpuPci {
 
     /// Submit GET_DISPLAY_INFO and parse the response into `out`.
     unsafe fn fetch_display_info(
-        &mut self,
+        &self,
         out: &mut [DisplayMode; MAX_SCANOUTS],
     ) -> Result<(), VirtioPciError> {
         self.write_request(CMD_GET_DISPLAY_INFO, &[]);
@@ -529,7 +579,7 @@ impl VirtioGpuPci {
     }
 
     unsafe fn resource_create_2d(
-        &mut self,
+        &self,
         resource_id: u32,
         format: u32,
         w: u32,
@@ -552,7 +602,7 @@ impl VirtioGpuPci {
     }
 
     unsafe fn resource_attach_backing(
-        &mut self,
+        &self,
         resource_id: u32,
         phys: u64,
         len: u32,
@@ -577,7 +627,7 @@ impl VirtioGpuPci {
     }
 
     unsafe fn set_scanout(
-        &mut self,
+        &self,
         scanout_id: u32,
         resource_id: u32,
         w: u32,
@@ -603,7 +653,7 @@ impl VirtioGpuPci {
     }
 
     unsafe fn transfer_to_host_2d(
-        &mut self,
+        &self,
         resource_id: u32,
         x: u32,
         y: u32,
@@ -631,7 +681,7 @@ impl VirtioGpuPci {
     }
 
     unsafe fn resource_flush(
-        &mut self,
+        &self,
         resource_id: u32,
         x: u32,
         y: u32,
@@ -755,12 +805,56 @@ pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
+/// Brief-hold accessor for cheap reads (mode, phys addresses). The
+/// closure runs under the IRQ-masking `CONTROLLER` lock, so it must
+/// NOT perform a device round-trip — use [`probed_device`] for those —
+/// nor block.
 pub fn with_controller<R>(f: impl FnOnce(&VirtioGpuPci) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
 }
 
-pub fn with_controller_mut<R>(f: impl FnOnce(&mut VirtioGpuPci) -> R) -> Option<R> {
-    CONTROLLER.lock().as_mut().map(f)
+/// The probed controller, WITHOUT holding `CONTROLLER` for the
+/// caller's use of it.
+///
+/// `CONTROLLER` is an `IrqSafeSpinLock`; holding it across `flush`'s
+/// TRANSFER + FLUSH round-trips (each busy-polled for up to a second)
+/// masks interrupts on the waiting CPU for the whole transfer and makes
+/// every other CPU touching the GPU spin interrupts-masked too — the
+/// same livelock class fixed for virtio-blk. So the lock is taken only
+/// long enough to read the installed device's address, then released.
+///
+/// # Why the reference stays valid
+///
+/// The `Option` is written exactly once: [`probe`] returns early when a
+/// controller is already installed, and nothing ever stores `None`
+/// back. The `VirtioGpuPci` therefore is never moved, replaced or
+/// dropped after its single install, so a shared reference to it stays
+/// valid for the rest of the boot. Unlike virtio-blk there is no `&mut`
+/// path at all — every mutation is interior (`mode`/`ready`/`last_err`
+/// locks + the request gate) — so aliasing is a non-issue.
+/// `smoke_virtio_gpu_device_address_is_stable` pins the install-once
+/// invariant, because a later hot-unplug / re-probe change would break
+/// it silently.
+pub fn probed_device() -> Option<&'static VirtioGpuPci> {
+    let ptr: *const VirtioGpuPci = {
+        let g = CONTROLLER.lock();
+        match g.as_ref() {
+            Some(d) => d as *const VirtioGpuPci,
+            None => return None,
+        }
+    };
+    // SAFETY: install-once, never-moved, never-dropped — see above.
+    Some(unsafe { &*ptr })
+}
+
+/// The installed controller's address, or `None` before probe. Test
+/// hook for the install-once invariant `probed_device` relies on.
+#[doc(hidden)]
+pub fn dbg_device_addr() -> Option<usize> {
+    CONTROLLER
+        .lock()
+        .as_ref()
+        .map(|d| d as *const VirtioGpuPci as usize)
 }
 
 extern crate alloc;

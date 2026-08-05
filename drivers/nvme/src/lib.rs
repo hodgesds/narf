@@ -33,8 +33,9 @@ pub mod mi;
 
 mod tests;
 
+use core::cell::UnsafeCell;
 use core::future::Future;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 use narf_block::{
@@ -2191,8 +2192,9 @@ impl BlockDevice for NvmeBlockDevice {
     }
     async fn flush(&self) {
         // Wave-3a: the I/O-queue path is single-threaded behind the
-        // `CONTROLLER` lock and every `read_lba` / `write_lba` polls
-        // its own completion before returning. There is therefore no
+        // installed slot's `req_gate` and every `read_lba` /
+        // `write_lba` polls its own completion before returning.
+        // There is therefore no
         // outstanding-write set to drain. When the multi-queue
         // submission path lands (Wave 3b), this becomes a real Flush
         // (admin opcode 0x00) on each I/O queue.
@@ -2220,7 +2222,11 @@ fn nvme_submit_blocking(
     if blocks == 0 {
         return Ok(());
     }
-    let lba_bytes = with_controller(|c| c.lba_bytes).unwrap_or(512) as usize;
+    // Interrupts stay enabled for the whole transfer: hold the
+    // device's request gate, not the IRQ-masking CONTROLLER lock.
+    // See `InstalledController`.
+    let mut ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
+    let lba_bytes = ctrl.lba_bytes as usize;
     let total_bytes = (blocks as usize)
         .checked_mul(lba_bytes)
         .ok_or(BlockError::InvalidRange)?;
@@ -2238,9 +2244,6 @@ fn nvme_submit_blocking(
     // use read_lba_pages / write_lba_pages (PRP1+PRP2 or PRP-list).
     let base_phys = buffer.phys_addr();
     let n_pages = total_bytes.div_ceil(PAGE_SIZE as usize);
-
-    let mut g = CONTROLLER.lock();
-    let ctrl = g.as_mut().ok_or(BlockError::DeviceRemoved)?;
 
     if n_pages == 1 {
         // Fast-path: single PRP, no allocation.
@@ -2314,10 +2317,151 @@ pub const PCI_SUBCLASS_NVM: u8 = 0x08;
 /// PCI prog-if for NVMe (vs. AHCI / SATA / etc).
 pub const PCI_PROGIF_NVME: u8 = 0x02;
 
-/// Slot for the live controller produced by `probe`. Wave-3a
+/// Heap slot for the installed controller, leaked at install time.
+///
+/// Why a leaked slot instead of `IrqSafeSpinLock<Option<Controller>>`:
+/// every NVMe I/O is a device round-trip — submit an SQE, then
+/// busy-poll the CQ for up to 5 s (`wait_cqe`). Holding `CONTROLLER`
+/// (an `IrqSafeSpinLock`) across that transfer masks interrupts on the
+/// waiting CPU for the whole round-trip and forces every other CPU
+/// doing I/O to spin on the same lock, also interrupts-masked. Under a
+/// filesystem workload that starves timers and RCU and livelocks the
+/// machine — the stall watchdog caught three CPUs `SPIN-NOT-POLLING`
+/// on exactly this pattern in virtio-blk, and adding vCPUs makes it
+/// worse (thundering herd, not a race).
+///
+/// The fix splits the two things the lock was serialising:
+///  - *Finding* the controller: `CONTROLLER` is taken only long enough
+///    to copy this slot's `&'static` reference out, then released.
+///  - *Using* the controller: `req_gate`, a plain atomic spun on
+///    WITHOUT masking interrupts, so timer ticks, RCU quiescent states
+///    and the sleep pumps keep running while a CPU waits its turn.
+///
+/// The `UnsafeCell` is what makes handing out `&mut Controller` sound:
+/// the slot reference is `&'static` (never moves, never drops — even a
+/// kernel-test reinstall via [`install_controller`] leaks the old slot
+/// rather than dropping it, so a stale reference can dangle only
+/// logically, never point at freed memory), and `req_gate` guarantees
+/// at most one `ControllerGuard` — hence at most one live `&mut` —
+/// exists at a time.
+struct InstalledController {
+    /// Serialises device round-trips and all references into `ctrl`.
+    /// Acquired by [`probed_controller`]; spun on with interrupts
+    /// ENABLED.
+    req_gate: AtomicBool,
+    ctrl: UnsafeCell<Controller>,
+}
+
+// SAFETY: all access to `ctrl` goes through `req_gate` (see
+// `probed_controller` — the only constructor of references into the
+// cell), which admits one holder at a time; `Controller` itself is
+// Send (asserted below), so migrating that exclusive access across
+// CPUs is fine.
+unsafe impl Sync for InstalledController {}
+
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Controller>()
+};
+
+/// Slot pointer for the live controller produced by `probe`. Wave-3a
 /// single-instance — multi-controller support arrives with a real
 /// driver-handle table.
-static CONTROLLER: IrqSafeSpinLock<Option<Controller>> = IrqSafeSpinLock::new(None);
+///
+/// Held only long enough to copy the `&'static` slot reference out —
+/// NEVER across a device round-trip. See [`InstalledController`].
+static CONTROLLER: IrqSafeSpinLock<Option<&'static InstalledController>> =
+    IrqSafeSpinLock::new(None);
+
+/// Install `ctrl` as the live controller, replacing (and leaking) any
+/// previous slot.
+///
+/// The old slot is deliberately leaked, not dropped: a concurrent I/O
+/// path may still hold a `ControllerGuard` against it, and freeing the
+/// allocation under that guard would be a use-after-free reachable
+/// only under load. Leaking keeps every outstanding reference valid
+/// forever. Outside the kernel-test harness this is called exactly
+/// once per boot (probe early-returns when a controller exists), so
+/// nothing accumulates; the harness's reinstall path
+/// (`smoke_nvme_block_device_async_round_trip`) leaks one dead
+/// controller per run, which is bounded and intentional.
+pub(crate) fn install_controller(ctrl: Controller) {
+    let slot: &'static InstalledController =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(InstalledController {
+            req_gate: AtomicBool::new(false),
+            ctrl: UnsafeCell::new(ctrl),
+        }));
+    *CONTROLLER.lock() = Some(slot);
+}
+
+/// Exclusive handle to the installed controller for one device
+/// round-trip. Holds the slot's `req_gate`, NOT the `CONTROLLER`
+/// spinlock — interrupts stay enabled for the whole transfer.
+pub struct ControllerGuard {
+    slot: &'static InstalledController,
+}
+
+impl core::fmt::Debug for ControllerGuard {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ControllerGuard").finish_non_exhaustive()
+    }
+}
+
+impl core::ops::Deref for ControllerGuard {
+    type Target = Controller;
+    fn deref(&self) -> &Controller {
+        // SAFETY: `req_gate` is held (only `probed_controller` builds a
+        // guard, and it acquires the gate first), so no other reference
+        // into the cell exists; the slot itself is `&'static` and never
+        // freed.
+        unsafe { &*self.slot.ctrl.get() }
+    }
+}
+
+impl core::ops::DerefMut for ControllerGuard {
+    fn deref_mut(&mut self) -> &mut Controller {
+        // SAFETY: as in `deref` — the gate makes this the sole
+        // reference into the cell.
+        unsafe { &mut *self.slot.ctrl.get() }
+    }
+}
+
+impl Drop for ControllerGuard {
+    fn drop(&mut self) {
+        self.slot.req_gate.store(false, Ordering::Release);
+    }
+}
+
+/// Acquire exclusive access to the probed controller WITHOUT holding
+/// `CONTROLLER` for the caller's use of it.
+///
+/// `CONTROLLER` is taken only long enough to copy the slot reference,
+/// then released; the wait for our turn happens on the slot's
+/// `req_gate` with interrupts ENABLED, so a CPU parked here still
+/// takes timer ticks and reaches RCU quiescent states while another
+/// CPU's 5-second-budget completion poll runs.
+///
+/// `smoke_nvme_controller_slot_is_stable` pins the address-stability
+/// invariant this relies on: a repeat probe must not move or replace
+/// the installed slot.
+fn probed_controller() -> Option<ControllerGuard> {
+    let slot = (*CONTROLLER.lock())?;
+    while slot
+        .req_gate
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    Some(ControllerGuard { slot })
+}
+
+/// The installed slot's address, or `None` before probe. Test hook for
+/// the install-once invariant `probed_controller` relies on.
+#[doc(hidden)]
+pub fn dbg_slot_addr() -> Option<usize> {
+    (*CONTROLLER.lock()).map(|s| s as *const InstalledController as usize)
+}
 
 // ── BlockDeviceSync adapter (registry/lib.rs) ─────────────────────────
 
@@ -2329,20 +2473,29 @@ static CONTROLLER: IrqSafeSpinLock<Option<Controller>> = IrqSafeSpinLock::new(No
 pub struct NvmeBlockSync;
 
 /// Persistent DMA scratch shared by NvmeBlockSync::read + write.
-/// Both paths serialize on CONTROLLER.lock() so a single 4 KiB
-/// buffer is safe to share. Pre-fix every read/write call did
-/// `alloc_coherent(4096)` and dropped the result at function-end
-/// — under AMD-Vi the freed page could be reused while the
-/// controller still had a delayed DMA write in flight (audit #2).
-/// Lazy-init on first use; lives for the controller's lifetime.
-static NVME_SCRATCH_BUF: IrqSafeSpinLock<Option<DmaBuffer>> = IrqSafeSpinLock::new(None);
+/// Both paths hold the installed controller's `req_gate` (via
+/// [`probed_controller`]) for the whole transfer, so a single 4 KiB
+/// buffer is safe to share — the gate, not this lock, serialises the
+/// CONTENTS. This lock covers only the lazy init and the pointer
+/// read; it is never held across a device round-trip (holding an
+/// IRQ-masking spinlock across the CQ poll is the livelock the gate
+/// exists to prevent — see `InstalledController`).
+///
+/// The buffer is leaked on first use so the returned `&'static` can
+/// outlive the lock. Pre-fix every read/write call did
+/// `alloc_coherent(4096)` and dropped the result at function-end —
+/// under AMD-Vi the freed page could be reused while the controller
+/// still had a delayed DMA write in flight (audit #2).
+static NVME_SCRATCH_BUF: IrqSafeSpinLock<Option<&'static DmaBuffer>> = IrqSafeSpinLock::new(None);
 
-fn with_nvme_scratch<R>(f: impl FnOnce(&DmaBuffer) -> R) -> Option<R> {
+fn nvme_scratch() -> Option<&'static DmaBuffer> {
     let mut g = NVME_SCRATCH_BUF.lock();
     if g.is_none() {
-        *g = alloc_coherent(4096, DomainId::DRIVER_0).ok();
+        *g = alloc_coherent(4096, DomainId::DRIVER_0)
+            .ok()
+            .map(|b| &*alloc::boxed::Box::leak(alloc::boxed::Box::new(b)));
     }
-    g.as_ref().map(f)
+    *g
 }
 
 impl narf_block::BlockDeviceSync for NvmeBlockSync {
@@ -2365,29 +2518,31 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
         if need > 4096 {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        // Reuse the persistent NVMe scratch (audit #2). Both
-        // read+write serialize on CONTROLLER.lock() so the shared
-        // buffer is safe.
-        let res = with_nvme_scratch(|buf| -> Result<(), narf_block::BlockIoError> {
-            let phys = buf.phys_addr().raw();
-            let mut g = CONTROLLER.lock();
-            let ctrl = g.as_mut().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-            ctrl.read_lba(lba, n_blocks, buf)
-                .map_err(|_| narf_block::BlockIoError::DriverError)?;
-            for (i, slot) in out.iter_mut().enumerate().take(need) {
-                // SAFETY: `phys` is the identity-mapped 4 KiB scratch DMA
-                // page that the controller just filled via `read_lba`; `i`
-                // ranges over 0..need with need ≤ 4096 (checked above), so
-                // the read stays within that page.
-                // SAFETY: Valid MMIO bounds or trusted driver environment
-                *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
-            }
-            Ok(())
-        });
-        match res {
-            Some(r) => r,
-            None => Err(narf_block::BlockIoError::DriverError),
+        // Interrupts stay enabled for the whole transfer: hold the
+        // device's request gate, not the IRQ-masking CONTROLLER lock.
+        // The gate is what serialises the shared scratch, so acquire
+        // it BEFORE touching the buffer (audit #2 keeps the scratch
+        // persistent so a delayed device DMA can never land in a
+        // recycled page).
+        let mut ctrl = probed_controller().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let buf = nvme_scratch().ok_or(narf_block::BlockIoError::DriverError)?;
+        let phys = buf.phys_addr().raw();
+        ctrl.read_lba(lba, n_blocks, buf)
+            .map_err(|_| narf_block::BlockIoError::DriverError)?;
+        // The CQ poll inside `read_lba` is what makes the device's
+        // writes visible; fence so the compiler cannot hoist this bulk
+        // copy above it.
+        compiler_fence(Ordering::Acquire);
+        // SAFETY: `phys` is the identity-mapped 4 KiB scratch DMA page
+        // the controller just filled; `need` ≤ 4096 (checked above) and
+        // `out` is a kernel slice that cannot overlap the DMA page.
+        // Bulk copy rather than a per-byte volatile loop: the payload
+        // is coherent DMA memory, not MMIO, and per-byte volatility
+        // defeats vectorisation on the hottest path in the system.
+        unsafe {
+            core::ptr::copy_nonoverlapping(phys as *const u8, out.as_mut_ptr(), need);
         }
+        Ok(())
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
         let need = (n_blocks as usize) * 512;
@@ -2397,28 +2552,24 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
         if need > 4096 {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        let res = with_nvme_scratch(|buf| -> Result<(), narf_block::BlockIoError> {
-            let phys = buf.phys_addr().raw();
-            for (i, &byte) in data.iter().enumerate().take(need) {
-                // SAFETY: `phys` is the identity-mapped 4 KiB scratch DMA
-                // page; `i` ranges over 0..need with need ≤ 4096 (checked
-                // above), so the write stays within that page. The page is
-                // exclusively ours while CONTROLLER stays locked below.
-                // SAFETY: Valid MMIO bounds or trusted driver environment
-                unsafe {
-                    core::ptr::write_volatile((phys + i as u64) as *mut u8, byte);
-                }
-            }
-            let mut g = CONTROLLER.lock();
-            let ctrl = g.as_mut().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-            ctrl.write_lba(lba, n_blocks, buf)
-                .map_err(|_| narf_block::BlockIoError::DriverError)?;
-            Ok(())
-        });
-        match res {
-            Some(r) => r,
-            None => Err(narf_block::BlockIoError::DriverError),
+        // Same shape as `read` above: gate first (it owns the scratch
+        // contents), no IRQ-masking lock across the transfer.
+        let mut ctrl = probed_controller().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let buf = nvme_scratch().ok_or(narf_block::BlockIoError::DriverError)?;
+        let phys = buf.phys_addr().raw();
+        // SAFETY: `phys` is the identity-mapped 4 KiB scratch DMA page;
+        // `need` ≤ 4096 (checked above) and `data` is a kernel slice
+        // that cannot overlap the DMA page. Bulk copy rather than a
+        // per-byte volatile loop — see `read`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), phys as *mut u8, need);
         }
+        // Publish the payload before `write_lba` posts the SQE +
+        // doorbell that lets the device DMA-read it.
+        compiler_fence(Ordering::Release);
+        ctrl.write_lba(lba, n_blocks, buf)
+            .map_err(|_| narf_block::BlockIoError::DriverError)?;
+        Ok(())
     }
 }
 
@@ -2468,7 +2619,7 @@ pub fn probe(
     if ctrl.create_io_queue().is_err() {
         return Err(narf_bus::ProbeError::BadDevice);
     }
-    *CONTROLLER.lock() = Some(ctrl);
+    install_controller(ctrl);
     // Install the typed parameter surface so observers + tuners can
     // reach the driver via `Cap<DriverHandle, Write>`.
     PARAMS.install(NvmeParams {
@@ -2555,8 +2706,15 @@ pub fn is_probed() -> bool {
 /// receives `&Controller` for read-only inspection (capacity, model,
 /// etc.); `&mut` access for I/O is reserved for a Wave-3b API that
 /// threads the cap through.
+///
+/// Serialises on the slot's `req_gate` (not the `CONTROLLER` lock):
+/// the reference handed to `f` must not alias a live I/O path's
+/// `&mut Controller`, and the gate is what excludes those. Callers
+/// must not re-enter `with_controller` / `probed_controller` from
+/// inside `f` — the gate is not reentrant.
 pub fn with_controller<R>(f: impl FnOnce(&Controller) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    let g = probed_controller()?;
+    Some(f(&g))
 }
 
 // ── Typed parameter surface ───────────────────────────────────────────
@@ -2617,18 +2775,19 @@ impl narf_drivers::DriverParams for NvmeParams {
         // Pull controller-side fields from the live Controller, if
         // any. If the slot exists but the controller doesn't (a
         // pre-probe install path), the snapshot reports the host-
-        // side defaults and zero device fields.
-        let g = CONTROLLER.lock();
-        let (bar0, lba_bytes, nsze, irq, vid) = match g.as_ref() {
-            Some(c) => (
+        // side defaults and zero device fields. Goes through the
+        // gate-holding accessor so this `&Controller` cannot alias
+        // an I/O path's `&mut`.
+        let (bar0, lba_bytes, nsze, irq, vid) = with_controller(|c| {
+            (
                 c.bar0,
                 c.lba_bytes,
                 c.nsze,
                 c.irq_vector,
                 c.identify().map(|i| i.vid).unwrap_or(0),
-            ),
-            None => (0, 0, 0, None, 0),
-        };
+            )
+        })
+        .unwrap_or((0, 0, 0, None, 0));
         NvmeSnapshot {
             bar0,
             lba_bytes,

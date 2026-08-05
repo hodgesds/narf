@@ -22,7 +22,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Poll, Waker};
 use narf_drivers::{Driver, DriverEnv, DriverFuture};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -52,6 +52,54 @@ const EC_STS_SCI: u8 = 1 << 5; // SCI event pending
 pub struct AcpiEc {
     control_port: u16,
     data_port: u16,
+    /// Serialises multi-step EC port transactions (command byte,
+    /// address byte, data byte are separate port writes that must not
+    /// interleave between callers) — spun on with **interrupts
+    /// enabled**.
+    ///
+    /// This is what the transaction methods hold instead of the caller
+    /// keeping `GLOBAL_EC` locked around them. `GLOBAL_EC` is an
+    /// `IrqSafeSpinLock`, so holding it across `query`/`read_byte` —
+    /// each of which waits on IBF/OBF for up to 100 ms per step —
+    /// masked interrupts on the waiting CPU for the whole EC
+    /// round-trip, and an SCI pass drains up to 16 queued events
+    /// back-to-back. Same class as the virtio-blk CONTROLLER herd.
+    ///
+    /// **Task-context only.** No IRQ handler may enter an EC
+    /// transaction: `dispatch_sci` (the SCI ISR) only records pending
+    /// bits and wakes `sci_drain_task`, which runs the actual EC
+    /// queries from the async executor. An IRQ-context caller spinning
+    /// here while the interrupted task held the gate would deadlock a
+    /// single CPU — keep deferring, as `dispatch_sci` does.
+    txn_gate: AtomicBool,
+}
+
+/// RAII holder for [`AcpiEc::txn_gate`].
+struct EcTxnGate<'a> {
+    ec: &'a AcpiEc,
+}
+
+impl<'a> EcTxnGate<'a> {
+    /// Spin until the gate is ours. Interrupts keep their
+    /// caller-supplied state — the whole point — so timer ticks, RCU
+    /// quiescent states and the sleep pumps continue to run on this
+    /// CPU while we wait for another CPU's EC transaction to finish.
+    fn acquire(ec: &'a AcpiEc) -> Self {
+        while ec
+            .txn_gate
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        EcTxnGate { ec }
+    }
+}
+
+impl Drop for EcTxnGate<'_> {
+    fn drop(&mut self) {
+        self.ec.txn_gate.store(false, Ordering::Release);
+    }
 }
 
 impl AcpiEc {
@@ -59,6 +107,7 @@ impl AcpiEc {
         Self {
             control_port,
             data_port,
+            txn_gate: AtomicBool::new(false),
         }
     }
 
@@ -98,6 +147,7 @@ impl AcpiEc {
     }
 
     pub fn read_byte(&self, addr: u8) -> Result<u8, DriverError> {
+        let _gate = EcTxnGate::acquire(self);
         self.wait_ibf_empty()?;
         // SAFETY: control_port is the EC command register (ECDT-provided or
         // the ACPI standard 0x66). Writing EC_CMD_READ after IBF is clear is
@@ -124,6 +174,7 @@ impl AcpiEc {
     }
 
     pub fn write_byte(&self, addr: u8, val: u8) -> Result<(), DriverError> {
+        let _gate = EcTxnGate::acquire(self);
         self.wait_ibf_empty()?;
         // SAFETY: control_port is the EC command register. Writing EC_CMD_WRITE
         // once IBF is clear begins the EC write protocol (ACPI §12.3); the port
@@ -167,6 +218,15 @@ impl Driver for AcpiEc {
 static GLOBAL_EC: IrqSafeSpinLock<Option<AcpiEc>> = IrqSafeSpinLock::new(None);
 
 pub fn init() {
+    // Install-once: `probed_ec` hands out `&'static AcpiEc` references
+    // that outlive the `GLOBAL_EC` lock, which is only sound because
+    // the slot is written exactly once. A second init must not replace
+    // (or even rewrite identically) the installed EC while a reference
+    // is live — refuse it here the way `e1000::probe`/virtio-blk's
+    // `probe` refuse a re-probe.
+    if GLOBAL_EC.lock().is_some() {
+        return;
+    }
     // Preference order:
     //   1. ECDT (fastest, ACPI 6.5 §5.2.15 — guaranteed before namespace).
     //   2. PNP0C09 _CRS (decoded into oregion::EC_PORTS at parse_namespace
@@ -224,8 +284,51 @@ fn read_ec_gpe(ec_path: &str) -> Option<u32> {
     }
 }
 
+/// The installed EC, or `None` before [`init`].
+///
+/// `GLOBAL_EC` is taken only long enough to read the installed EC's
+/// address, then released — so an EC transaction (up to ~200 ms of
+/// IBF/OBF waiting per event, 16 events per SCI pass) runs with
+/// interrupts enabled instead of masking them for the whole wait.
+/// Serialisation of the port protocol moved onto the device:
+/// [`AcpiEc::txn_gate`], acquired inside each transaction method.
+///
+/// # Why the reference stays valid
+///
+/// The `Option` is written exactly once: [`init`] returns early when an
+/// EC is already installed, and nothing ever stores `None` back. The
+/// `AcpiEc` therefore is never moved, replaced or dropped after its
+/// single install, so a shared reference to it stays valid for the rest
+/// of the boot. `smoke_acpi_ec_address_is_stable` pins that invariant,
+/// because it is the kind of assumption a later "re-init on resume"
+/// change would silently invalidate.
+pub fn probed_ec() -> Option<&'static AcpiEc> {
+    let ptr: *const AcpiEc = {
+        let g = GLOBAL_EC.lock();
+        match g.as_ref() {
+            Some(ec) => ec as *const AcpiEc,
+            None => return None,
+        }
+    };
+    // SAFETY: install-once, never-moved, never-dropped — see above.
+    Some(unsafe { &*ptr })
+}
+
+/// Run `f` against the installed EC WITHOUT holding `GLOBAL_EC` for the
+/// duration — see [`probed_ec`]. `f` may run a full EC transaction;
+/// interrupts keep their caller-supplied state throughout.
 pub fn with_ec<R>(f: impl FnOnce(&AcpiEc) -> R) -> Option<R> {
-    GLOBAL_EC.lock().as_ref().map(f)
+    probed_ec().map(f)
+}
+
+/// The installed EC's address, or `None` before [`init`]. Test hook for
+/// the install-once invariant `probed_ec` relies on.
+#[doc(hidden)]
+pub fn dbg_ec_addr() -> Option<usize> {
+    GLOBAL_EC
+        .lock()
+        .as_ref()
+        .map(|ec| ec as *const AcpiEc as usize)
 }
 
 // ── Platform SCI events ─────────────────────────────────────────────
@@ -470,11 +573,16 @@ fn handle_gpe(gpe_num: u32) {
 fn handle_ec_gpe() {
     // Drain every queued event — EC firmware can stack a burst of
     // them between SCI deliveries (e.g. user mashes Fn-volume).
-    // Bound at 16 per pass to keep the IRQ handler bounded; if more
+    // Bound at 16 per pass to keep each drain pass bounded; if more
     // pile up, the next SCI will pick them up.
+    //
+    // Runs from `sci_drain_task` (task context, never the SCI ISR), so
+    // it is safe — and the point of `probed_ec` — that the up-to-200 ms
+    // IBF/OBF waits inside `query` happen with interrupts enabled and
+    // no `GLOBAL_EC` lock held.
     let ec_node = narf_aml::find_device_by_hid("PNP0C09");
     for _ in 0..16 {
-        let query = with_ec(|ec| ec.query()).unwrap_or(None);
+        let query = probed_ec().and_then(|ec| ec.query());
         let query = match query {
             Some(q) if q != 0 => q,
             _ => break,
@@ -502,6 +610,7 @@ impl AcpiEc {
     /// Issue `EC_QUERY` and read the returned query byte. `Ok(None)`
     /// means SCI fired but the EC reported no event (query byte 0).
     pub fn query(&self) -> Option<u8> {
+        let _gate = EcTxnGate::acquire(self);
         if self.wait_ibf_empty().is_err() {
             return None;
         }

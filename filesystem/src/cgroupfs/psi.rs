@@ -74,7 +74,12 @@ pub fn file_names() -> &'static [&'static str] {
 }
 
 /// Resolve a pressure filename to a `FileOps`, if it is one.
-pub fn pressure_file(name: &str, cgroup_ino: u64) -> Option<Arc<dyn FileOps>> {
+///
+/// Takes the owning `Cgroup`, not just its inode: a `*.pressure` file is
+/// chownable like any other cgroup attribute file, and its owner has to
+/// live somewhere that outlives this handle. It shares the cgroup's
+/// `file_owners` map, keyed by this file's own inode.
+pub fn pressure_file(name: &str, cg: &Arc<super::Cgroup>) -> Option<Arc<dyn FileOps>> {
     let (resource, stable_name) = match name {
         "cpu.pressure" => (Resource::Cpu, "cpu.pressure"),
         "memory.pressure" => (Resource::Memory, "memory.pressure"),
@@ -83,7 +88,8 @@ pub fn pressure_file(name: &str, cgroup_ino: u64) -> Option<Arc<dyn FileOps>> {
     };
     Some(Arc::new(PsiFile {
         resource,
-        ino: super::cgroup_attr_ino(cgroup_ino, stable_name),
+        ino: super::cgroup_attr_ino(cg.ino, stable_name),
+        cg: Arc::clone(cg),
     }))
 }
 
@@ -93,9 +99,32 @@ pub fn pressure_file(name: &str, cgroup_ino: u64) -> Option<Arc<dyn FileOps>> {
 struct PsiFile {
     resource: Resource,
     ino: u64,
+    /// Owning cgroup, for the shared `file_owners` map.
+    cg: Arc<super::Cgroup>,
 }
 
 impl FileOps for PsiFile {
+    // A `*.pressure` file must accept a chown like any other cgroup
+    // attribute file. Inheriting the `Unsupported` FileOps default is what
+    // left "Failed to adjust ownership of '.../memory.pressure', ignoring:
+    // Operation not supported" in every boot — harmless where systemd says
+    // "ignoring", fatal where it does not: `cg_set_access()` walks a
+    // delegated subtree, so one rejecting file aborts delegation and
+    // `systemd --user` exits 219/EXIT_CGROUP.
+    fn owners(&self) -> (u32, u32) {
+        self.cg
+            .file_owners
+            .lock()
+            .get(&self.ino)
+            .copied()
+            .unwrap_or((0, 0))
+    }
+
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        self.cg.file_owners.lock().insert(self.ino, (uid, gid));
+        Box::pin(async { Ok(()) })
+    }
+
     fn ino(&self) -> u64 {
         self.ino
     }

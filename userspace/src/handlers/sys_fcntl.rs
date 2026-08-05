@@ -44,9 +44,12 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             let cloexec = cmd == F_DUPFD_CLOEXEC;
             let outcome = fd::with_table(task, |t| {
                 let entry = t.get(fd)?;
+                // F_DUPFD shares the open file description — offset travels
+                // with the duplicate too (LINUX-GAP: snapshotted, not
+                // aliased; see sys_dup).
                 let clone = crate::fd::FdEntry {
                     ops: entry.ops.clone(),
-                    offset: 0,
+                    offset: entry.offset,
                     flags: if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
                     status_flags: entry.status_flags,
                 };

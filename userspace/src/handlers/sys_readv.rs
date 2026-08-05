@@ -3,6 +3,14 @@ use super::*;
 
 /// `readv(fd, iov, iovcnt)` — vectored read at the current file offset,
 /// advancing it (the position-tracking counterpart to `writev`).
+///
+/// Blocking discipline matches `sys_read` — and must: Linux `do_readv` ends
+/// in the same `pipe_read` as `read(2)`, so a readv on an EMPTY pipe whose
+/// writer is still open BLOCKS (or EAGAINs under O_NONBLOCK). The old body
+/// returned the transient 0 straight to userspace, a spurious EOF: musl's
+/// `__stdio_read` fills stdio buffers via readv, so every musl `fread` from
+/// a momentarily-empty pipe ended the stream — the same lost-data class as
+/// the sendfile/copy_file_range transient-EOF bugs.
 pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
@@ -22,6 +30,24 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         }
     };
     let task = current_task_id();
+    // Snapshot ops + offset and DROP the fd-table lock before calling into
+    // FileOps — same rule as `sys_read`: holding the non-reentrant table
+    // lock across a FileOps call self-deadlocks any file whose read
+    // consults the fd table (/proc fdinfo), and serialises CLONE_FILES
+    // siblings behind a slow read.
+    let snapshot = fd::with_table(task, |t| {
+        let e = t.get(fd)?;
+        Some((e.ops.clone(), e.offset, e.status_flags))
+    });
+    let (ops, start_off, status_flags) = match snapshot {
+        Some(Some(v)) => v,
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            return;
+        }
+    };
+    let nonblock = status_flags & crate::fd::O_NONBLOCK != 0;
+    let mut cur = start_off;
     let mut total: usize = 0;
     for i in 0..iovcnt {
         let o = i * 16;
@@ -31,29 +57,50 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
             continue;
         }
         let mut kbuf = alloc::vec![0u8; len];
-        let outcome = fd::with_table(task, |t| {
-            let entry = t.get_mut(fd).ok_or(())?;
-            let cur = entry.offset;
-            let res = poll_blocking(entry.ops.read(cur, &mut kbuf)).unwrap_or(Ok(0));
-            match res {
-                Ok(n) => {
-                    entry.offset = cur.saturating_add(n as u64);
-                    Ok(n)
+        let res = poll_blocking(ops.read(cur, &mut kbuf)).unwrap_or(Ok(0));
+        match res {
+            Ok(0) if total == 0 => {
+                // Nothing read yet and the stream is dry. An open-but-empty
+                // pipe/socket must NOT report EOF (`fs/pipe.c::pipe_read`:
+                // "!pipe->writers → 0" is the ONLY 0 return): O_NONBLOCK →
+                // -EAGAIN, blocking → park + RE-EXECUTE the whole readv (no
+                // bytes were consumed, so a re-run is idempotent).
+                if ops.read_should_block() {
+                    if nonblock {
+                        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                        return;
+                    }
+                    if park_reexecute_on_io(ctx) {
+                        return;
+                    }
                 }
-                Err(_) => Err(()),
+                // Genuine EOF (or kernel-test context with no executor).
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
             }
-        });
-        match outcome {
-            Some(Ok(n)) => {
+            Ok(n) => {
                 // SAFETY: `base` is the user iovec destination; copy_to_user
                 // validates the `n`-byte write.
-                let _ = unsafe { copy_to_user(base, &kbuf[..n]) };
+                if n > 0 && unsafe { copy_to_user(base, &kbuf[..n]) }.is_err() {
+                    if total == 0 {
+                        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+                        return;
+                    }
+                    break;
+                }
+                cur = cur.saturating_add(n as u64);
                 total = total.saturating_add(n);
                 if n < len {
-                    break; // short read / EOF
+                    break; // short read / EOF after data — return what we have
                 }
             }
-            _ => {
+            // Wrong-direction fd (reading a pipe write end) → -EBADF, per
+            // `fs/read_write.c::vfs_read`'s FMODE_READ check.
+            Err(narf_filesystem::FsError::BadFd) if total == 0 => {
+                ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+                return;
+            }
+            Err(_) => {
                 if total == 0 {
                     ctx.set_return(SyscallReturn::ok((-1i64) as u64));
                     return;
@@ -62,5 +109,10 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
             }
         }
     }
+    let _ = fd::with_table(task, |t| {
+        if let Some(e) = t.get_mut(fd) {
+            e.offset = cur;
+        }
+    });
     ctx.set_return(SyscallReturn::ok(total as u64));
 }

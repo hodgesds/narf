@@ -4693,6 +4693,19 @@ pub fn __test_futex_wake_scoped(namespace: u64, uaddr: u64, n: u32) -> usize {
     futex_wake_waiters_key(key, n)
 }
 
+/// Watchdog probe: is `tid`'s waker actually registered in the wait queue
+/// for `(namespace, uaddr)`? A task claiming (via `futex_uaddr`) to be
+/// blocked on a word while absent from its queue can never receive a
+/// `FUTEX_WAKE` — the lost-waiter signature the park census looks for.
+pub fn dbg_futex_waiter_registered(namespace: u64, uaddr: u64, tid: u64) -> bool {
+    let key = futex_key(namespace, uaddr);
+    FUTEX_WAITERS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&key).map(|set| set.contains_key(&tid)))
+        .unwrap_or(false)
+}
+
 /// Fatal-path futex snapshot: `(live_generation, registered_waiters)`.
 pub fn dbg_futex_state(namespace: u64, uaddr: u64) -> (u64, usize) {
     let key = futex_key(namespace, uaddr);

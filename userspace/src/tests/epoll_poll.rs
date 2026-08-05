@@ -3247,3 +3247,265 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_signalfd_epoll_wakes_on_signal);
+
+/// The stall watchdog's stranded-poller probe (`dbg_stranded_poll_waiters`)
+/// must ask the SAME readiness question `poll_scan` asks — namely
+/// `poll_readiness_at(<fd's current offset>)` — not the offset-less
+/// `poll_readiness()`. They are different oracles: `/dev/kmsg` overrides only
+/// the offset-aware query (readable iff `offset < live_len`), leaving the
+/// offset-less one at the trait default `POLL_IN | POLL_OUT`. That mismatch
+/// made every fully-drained kmsg reader parked in `ppoll` report as a
+/// permanent `STALL-WD poll-stranded ... revents=0x1` false positive while
+/// `poll_scan` correctly kept re-parking it.
+///
+/// Negative arm: a drained offset-gated fd must NOT be reported.
+/// Positive arm: the same FileOps at a readable offset MUST still be reported.
+/// Closed arm: a recorded-but-closed fd is POLLNVAL to `poll_scan` (immediate
+/// return), so a task still parked on one is stranded and MUST be reported.
+fn smoke_poll_watchdog_oracle_matches_poll_scan() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    /// `DevKmsg` twin: overrides ONLY `poll_readiness_at` (readable below
+    /// `len`); the offset-less `poll_readiness` stays at the trait default
+    /// (always `POLL_IN | POLL_OUT`) — exactly the divergence under test.
+    #[derive(Debug)]
+    struct OffsetGated {
+        len: u64,
+    }
+    impl narf_filesystem::FileOps for OffsetGated {
+        fn read<'a>(
+            &'a self,
+            _off: u64,
+            _buf: &'a mut [u8],
+        ) -> narf_filesystem::FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _off: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> narf_filesystem::Stat {
+            narf_filesystem::Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+        fn poll_readiness_at(&self, offset: u64) -> u32 {
+            if offset < self.len {
+                narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT
+            } else {
+                narf_filesystem::POLL_OUT
+            }
+        }
+    }
+
+    crate::fd::__test_reset();
+    // Fabricated tid far above anything a kernel-test boot allocates, so the
+    // registry entry and fd table are exclusively this test's.
+    const TID: u64 = 0xFACE_D0D0;
+    let task = crate::task::Task::new_registered(TID, TID);
+
+    // fd_a: drained (offset == len) — `poll_scan` re-parks on it.
+    // fd_b: readable (offset 0)     — `poll_scan` returns POLLIN.
+    let (fd_a, fd_b) = crate::fd::with_table(TID, |t| {
+        let a = t.open(crate::fd::FdEntry {
+            ops: Arc::new(OffsetGated { len: 4096 }),
+            offset: 4096,
+            flags: 0,
+            status_flags: 0,
+        });
+        let b = t.open(crate::fd::FdEntry {
+            ops: Arc::new(OffsetGated { len: 4096 }),
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        });
+        (a, b)
+    })
+    .unwrap();
+
+    // fd_c: recorded in the park set but closed since — `poll_scan` returns
+    // POLLNVAL on it immediately, so a task still parked on it is stranded.
+    let fd_c: u32 = 99;
+
+    // Fabricate the park record `record_poll_wait` would have written for a
+    // parked `ppoll([{fd_a, POLLIN}, {fd_b, POLLIN}, {fd_c, POLLIN}], 3, NULL)`.
+    let want = narf_filesystem::POLL_IN as u64;
+    task.uctx.poll_wait_fds[0].store((want << 32) | (fd_a as u64 + 1), Ordering::Relaxed);
+    task.uctx.poll_wait_fds[1].store((want << 32) | (fd_b as u64 + 1), Ordering::Relaxed);
+    task.uctx.poll_wait_fds[2].store((want << 32) | (fd_c as u64 + 1), Ordering::Relaxed);
+    task.uctx.poll_wait_nfds.store(3, Ordering::Release);
+    task.uctx.parked_in_syscall.store(true, Ordering::Release);
+
+    // The probe is a TWO-SAMPLE latch: the first sighting only arms it, so a
+    // healthy poller (one that re-scans between watchdog ticks) is never
+    // reported. Sample once to arm...
+    let armed = crate::task::dbg_stranded_poll_waiters();
+    let armed_hit = armed.iter().any(|r| r.0 == TID);
+    // ...then again with the scan counter UNCHANGED: the task has not re-asked
+    // its own readiness question since, which is the actual strand condition.
+    let reported = crate::task::dbg_stranded_poll_waiters();
+    let hit_a = reported.iter().any(|r| r.0 == TID && r.2 == fd_a as i32);
+    let hit_b = reported.iter().any(|r| r.0 == TID && r.2 == fd_b as i32);
+    let hit_c = reported
+        .iter()
+        .any(|r| r.0 == TID && r.2 == fd_c as i32 && r.3 & narf_filesystem::POLL_NVAL != 0);
+
+    // Progress arm: a poller whose `poll_common` scan ran between two
+    // sightings is re-executing its syscall and re-scanning — a working
+    // poller, not a strand — so it must go unreported no matter how ready
+    // its fds are. This is the discriminator `dbg_park_checks` cannot give:
+    // that counter climbs for wedged and healthy pollers alike, because
+    // `parked_in_syscall` stays true across a healthy poll's whole
+    // park → wake → re-execute → scan cycle.
+    task.uctx.dbg_poll_scans.fetch_add(1, Ordering::Relaxed);
+    let progressed = crate::task::dbg_stranded_poll_waiters();
+    let hit_progressed = progressed.iter().any(|r| r.0 == TID);
+
+    // Cleanup BEFORE asserting so a failure doesn't leak a fake parked task
+    // into every later watchdog tick of the boot.
+    task.uctx.parked_in_syscall.store(false, Ordering::Release);
+    task.uctx.poll_wait_nfds.store(0, Ordering::Release);
+    crate::task::release_task(TID);
+    crate::fd::__test_reset();
+
+    if armed_hit {
+        return TestResult::Fail(
+            "watchdog reported a poller on its FIRST sighting (latch not armed)",
+        );
+    }
+    if hit_a {
+        return TestResult::Fail("watchdog reported a drained offset-gated fd as stranded-ready");
+    }
+    if !hit_b {
+        return TestResult::Fail("watchdog missed a genuinely POLLIN-ready parked fd");
+    }
+    if !hit_c {
+        return TestResult::Fail("watchdog missed a parked-on-closed-fd (POLLNVAL) strand");
+    }
+    if hit_progressed {
+        return TestResult::Fail("watchdog reported a poller that re-scanned between sightings");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_poll_watchdog_oracle_matches_poll_scan);
+
+/// A blocking `poll` must keep polling the files it resolved at ENTRY, so a
+/// `close()` from a sibling thread cannot turn an in-flight poll into an
+/// instant `POLLNVAL` return.
+///
+/// Linux ref: `fs/select.c::do_sys_poll` resolves every fd once (`fdget`) and
+/// holds those `struct file` references for the whole call — a concurrent
+/// close in another thread of the same process is invisible to a poll already
+/// in progress. NARF's park re-executes the syscall on every wake, which used
+/// to re-read the fd table each time; a sibling close then produced POLLNVAL,
+/// and an event loop that treats that as a spurious wake re-polls at once and
+/// spins on a dead descriptor (observed as two threads burning a core through
+/// the Fedora Plasma session startup).
+///
+/// Arms:
+///   * closed AFTER entry → NOT POLLNVAL; the held file's real readiness.
+///   * closed BEFORE entry → POLLNVAL, which is correct Linux behaviour
+///     (`fdget` fails at entry), so the fix must not swallow it.
+///   * the held references are released on the poll's return path.
+fn smoke_poll_holds_files_across_sibling_close() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    /// Never readable, always writable — a real poll over POLLIN parks on it.
+    #[derive(Debug)]
+    struct NeverReadable;
+    impl narf_filesystem::FileOps for NeverReadable {
+        fn read<'a>(
+            &'a self,
+            _off: u64,
+            _buf: &'a mut [u8],
+        ) -> narf_filesystem::FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _off: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> narf_filesystem::Stat {
+            narf_filesystem::Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+        fn poll_readiness(&self) -> u32 {
+            narf_filesystem::POLL_OUT
+        }
+    }
+
+    crate::fd::__test_reset();
+    const TID: u64 = 0xFACE_D0D2;
+    let task = crate::task::Task::new_registered(TID, TID);
+
+    let fd = match crate::fd::with_table(TID, |t| {
+        t.open(crate::fd::FdEntry {
+            ops: Arc::new(NeverReadable),
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        })
+    }) {
+        Some(fd) => fd,
+        None => {
+            crate::task::release_task(TID);
+            return TestResult::Fail("could not open the poll subject fd");
+        }
+    };
+
+    let mut fds = [crate::poll::PollFd {
+        fd: fd as i32,
+        events: narf_filesystem::POLL_IN as u16,
+        revents: 0,
+    }];
+
+    // Entry-time resolution, exactly as the blocking path performs it.
+    crate::poll::install_poll_files(TID, &fds);
+    // A sibling thread closes the fd while this poll is parked.
+    crate::fd::with_table(TID, |t| t.close(fd));
+
+    let n_after_close = crate::poll::poll_scan(TID, &mut fds);
+    let revents_after_close = fds[0].revents;
+
+    // Release, as every poll return path does, then confirm nothing is held.
+    crate::poll::clear_poll_wait_record(TID, &task.uctx);
+    let released = task.poll_files.lock().is_empty();
+
+    // Entry-time-closed arm: with no held resolution, a closed fd is
+    // POLLNVAL — Linux returns that too, and the fix must not mask it.
+    let mut fresh = [crate::poll::PollFd {
+        fd: fd as i32,
+        events: narf_filesystem::POLL_IN as u16,
+        revents: 0,
+    }];
+    let n_fresh = crate::poll::poll_scan(TID, &mut fresh);
+    let revents_fresh = fresh[0].revents;
+
+    task.uctx.poll_wait_nfds.store(0, Ordering::Release);
+    crate::task::release_task(TID);
+    crate::fd::__test_reset();
+
+    if revents_after_close & (narf_filesystem::POLL_NVAL as u16) != 0 {
+        return TestResult::Fail(
+            "a sibling close turned an in-flight poll into POLLNVAL — entry-time files not held",
+        );
+    }
+    if n_after_close != 0 || revents_after_close != 0 {
+        return TestResult::Fail("held file reported ready though it is never readable");
+    }
+    if !released {
+        return TestResult::Fail("poll return path leaked its entry-time file references");
+    }
+    if n_fresh != 1 || revents_fresh & (narf_filesystem::POLL_NVAL as u16) == 0 {
+        return TestResult::Fail("an fd closed BEFORE entry must still report POLLNVAL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_poll_holds_files_across_sibling_close);

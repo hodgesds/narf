@@ -2234,3 +2234,91 @@ kernel_test_in!(
     "filesystem/cgroupfs",
     smoke_cgroup_namespace_sibling_relative_path
 );
+
+/// cgroup DELEGATION: a cgroup directory and its individual attribute files
+/// must accept and persist a chown.
+///
+/// This is what systemd's `cg_set_access()` does when starting
+/// `user@UID.service`: it chowns the user's subtree — the directory first,
+/// then `cgroup.procs` / `cgroup.subtree_control` / `cgroup.threads`
+/// INDIVIDUALLY — so the unprivileged `systemd --user` can manage its own
+/// cgroups. Linux tracks ownership per kernfs node (`cgroup_mkdir` stamps
+/// the creator, `cgroup_kn_set_ugid` applies later chowns).
+///
+/// Both halves failed differently before, and both were fatal to delegation:
+///   * the `DirOps::set_dir_owners` default is an EMPTY BODY returning Ok,
+///     so a directory chown was silently discarded — it "succeeded" and the
+///     directory still read back root-owned;
+///   * the `FileOps::set_owners` default returns `Unsupported`, so chowning
+///     an attribute file was rejected outright.
+///
+/// Live symptom: `user@1000.service` exited 219/EXIT_CGROUP, so no user
+/// manager existed, `org.freedesktop.systemd1` was "not provided by any
+/// .service files", and every Plasma systemd user unit fell back to D-Bus
+/// activation and timed out.
+fn smoke_cgroup_delegation_chown_persists() -> TestResult {
+    let root = root_dir();
+    let group = match poll_once(root.mkdir("t_delegate")) {
+        Some(Ok(group)) => group,
+        _ => return TestResult::Fail("delegation cgroup mkdir failed"),
+    };
+
+    // A freshly created cgroup is root-owned (kernfs default).
+    if group.dir_owners() != (0, 0) {
+        let _ = poll_once(root.rmdir("t_delegate"));
+        return TestResult::Fail("a new cgroup directory was not root-owned");
+    }
+
+    // Directory chown must PERSIST, not be silently swallowed.
+    group.set_dir_owners(1000, 1000);
+    if group.dir_owners() != (1000, 1000) {
+        let _ = poll_once(root.rmdir("t_delegate"));
+        return TestResult::Fail("cgroup directory chown did not persist");
+    }
+
+    // Each attribute file is chowned separately by cg_set_access().
+    // memory.pressure is served by a DIFFERENT FileOps impl (PsiFile) than
+    // the other attribute files (CgroupAttrFile). Covering only the latter
+    // left every *.pressure file rejecting chown, which still aborted
+    // delegation — so the pressure file is in this loop deliberately.
+    for name in ["cgroup.procs", "cgroup.subtree_control", "memory.pressure"] {
+        let file = match group.lookup(name) {
+            Some(f) => f,
+            None => {
+                let _ = poll_once(root.rmdir("t_delegate"));
+                return TestResult::Fail("cgroup attribute file missing");
+            }
+        };
+        if file.owners() != (0, 0) {
+            let _ = poll_once(root.rmdir("t_delegate"));
+            return TestResult::Fail("a new cgroup attribute file was not root-owned");
+        }
+        match poll_once(file.set_owners(1000, 1000)) {
+            Some(Ok(())) => {}
+            _ => {
+                let _ = poll_once(root.rmdir("t_delegate"));
+                return TestResult::Fail("cgroup attribute file rejected chown");
+            }
+        }
+        if file.owners() != (1000, 1000) {
+            let _ = poll_once(root.rmdir("t_delegate"));
+            return TestResult::Fail("cgroup attribute file chown did not persist");
+        }
+    }
+
+    // Per-file, not per-cgroup: chowning one attribute file must not have
+    // moved a sibling that cg_set_access() leaves alone.
+    if let Some(sib) = group.lookup("cgroup.events") {
+        if sib.owners() != (0, 0) {
+            let _ = poll_once(root.rmdir("t_delegate"));
+            return TestResult::Fail("chown leaked across cgroup attribute files");
+        }
+    }
+
+    let _ = poll_once(root.rmdir("t_delegate"));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_delegation_chown_persists
+);

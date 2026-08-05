@@ -2905,13 +2905,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
 
             narf_init::register(narf_init::Stage::Late, "virtio-gpu-splash", || {
                 use narf_graphics::Pixel32;
-                let painted = narf_drivers_virtio::gpu_pci::with_controller_mut(|d| {
-                    if !d.ready {
-                        // SAFETY: on the BSP after device bring-up, with
-                        // `&mut d` held exclusively by `with_controller_mut`,
-                        // so `init_scanout` programs the GPU uncontended.
-                        // SAFETY: Valid memory or trusted environment
-                        if let Err(e) = unsafe { d.init_scanout() } {
+                // `probed_device` avoids holding the IRQ-masking
+                // controller lock across the init/flush round-trips;
+                // the device's request gate serialises submitters.
+                let painted = narf_drivers_virtio::gpu_pci::probed_device().map(|d| {
+                    if !d.is_ready() {
+                        if let Err(e) = d.init_scanout() {
                             let _ = writeln!(
                                 console::Writer,
                                 "  splash: virtio-gpu init_scanout failed: {:?}",
@@ -2927,9 +2926,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     fb.fill_rect(half, 0, half, half, Pixel32::GREEN);
                     fb.fill_rect(0, half, half, half, Pixel32::BLUE);
                     fb.fill_rect(half, half, half, half, Pixel32::NARF_FG);
-                    // SAFETY: bring_up complete.
-                    let _ = unsafe { d.flush() };
-                    (d.mode.width, d.mode.height)
+                    let _ = d.flush();
+                    let mode = d.mode();
+                    (mode.width, mode.height)
                 });
                 match painted {
                     Some((w, h)) if w > 0 => {
@@ -3978,6 +3977,8 @@ fn boot_userspace_init() {
                     "fork_pipe_smoke",
                     narf_verification::NARF_FORK_PIPE_SMOKE_ELF,
                 ),
+                ("popenw_smoke", narf_verification::NARF_POPENW_SMOKE_ELF),
+                ("wlserve_smoke", narf_verification::NARF_WLSERVE_SMOKE_ELF),
                 (
                     "fork_exec_burst_smoke",
                     narf_verification::NARF_FORK_EXEC_BURST_SMOKE_ELF,

@@ -301,16 +301,43 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
 /// count. The blocking-park path uses this for its pre-park scan (the spin
 /// path keeps using `do_poll`). Same per-fd rules as `do_poll`: negative fd
 /// ignored, closed fd → POLLNVAL, open fd → `poll_readiness() & (events|ERR|HUP|NVAL)`.
-fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
+pub(crate) fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
     // Snapshot ops under the lock, poll OUTSIDE it — a nested epoll fd's
     // `poll_readiness` re-enters the fd-table lock (see `do_poll`).
+    //
+    // `entry_files` is the entry-time resolution held by `Task::poll_files`
+    // for a blocking poll. It is what makes a SIBLING THREAD's `close()`
+    // invisible to a poll already in flight, matching `do_sys_poll`, which
+    // resolves each fd once and holds the `struct file` for the whole call.
+    // Re-resolving on every park wake instead turned such a close into an
+    // instant POLLNVAL, and an event loop that reads that as a spurious wake
+    // re-polls at once and spins.
+    let entry_files = crate::task::task_get(task_id).and_then(|t| {
+        let held = t.poll_files.lock();
+        (held.len() == fds.len()).then(|| held.clone())
+    });
     let files: Vec<Option<(Arc<dyn FileOps>, u64)>> = fd::with_table(task_id, |t| {
         fds.iter()
-            .map(|item| {
+            .enumerate()
+            .map(|(i, item)| {
                 if item.fd < 0 {
-                    None
-                } else {
-                    t.get(item.fd as u32).map(|e| (e.ops.clone(), e.offset))
+                    return None;
+                }
+                let live = t.get(item.fd as u32).map(|e| (e.ops.clone(), e.offset));
+                match (&entry_files, live) {
+                    // Still open: poll the file we resolved at entry, at its
+                    // CURRENT offset. In Linux the offset lives inside the
+                    // very `struct file` being polled, so it stays live —
+                    // that is what keeps `/dev/kmsg` re-evaluating as its
+                    // reader drains.
+                    (Some(entry), Some((_, offset))) => {
+                        entry[i].as_ref().map(|(ops, _)| (ops.clone(), offset))
+                    }
+                    // Closed since entry: keep polling the file we hold, at
+                    // the offset it had. This is the whole point — the fd
+                    // number is gone but the file is not.
+                    (Some(entry), None) => entry[i].clone(),
+                    (None, live) => live,
                 }
             })
             .collect()
@@ -362,6 +389,89 @@ fn poll_nearest_deadline(task_id: u64, fds: &[PollFd]) -> Option<u64> {
         }
     }
     best
+}
+
+/// Record a blocking poll park's fd set into the task ctx for the stall
+/// watchdog (see `UserTaskCtx::poll_wait_fds`): slot = `events<<32 | (fd+1)`.
+fn record_poll_wait(uc: &crate::user_task::UserTaskCtx, fds: &[PollFd]) {
+    use core::sync::atomic::Ordering;
+    // Diagnostics only: recording the fd set costs up to
+    // POLL_WAIT_RECORD_MAX atomic stores on EVERY poll park, which is a
+    // hot path. Off unless the stall watchdog asked for it, so a normal
+    // build pays one relaxed load.
+    if !crate::user_task::poll_wait_recording_enabled() {
+        return;
+    }
+    for (i, slot) in uc.poll_wait_fds.iter().enumerate() {
+        let v = match fds.get(i) {
+            Some(item) if item.fd >= 0 => {
+                ((item.events as u64) << 32) | ((item.fd as u32 as u64) + 1)
+            }
+            _ => 0,
+        };
+        slot.store(v, Ordering::Relaxed);
+    }
+    uc.poll_wait_nfds.store(fds.len() as u32, Ordering::Release);
+}
+
+/// Clear the watchdog poll-park record on a poll return path, and RELEASE the
+/// entry-time file references this poll was holding (`Task::poll_files`).
+///
+/// `task_id` is passed explicitly rather than read from `current_task_id()`:
+/// the release must name the SAME task whose files were installed, and
+/// binding it to an implicit global made the release silently target a
+/// different task whenever the two diverge.
+///
+/// Called on every `poll_common` return path, which is what bounds the
+/// holder's lifetime to the syscall — the analogue of `do_sys_poll` dropping
+/// its `struct file` references when the call returns. Leaking them would
+/// keep a closed file alive indefinitely and, worse, make the NEXT poll on
+/// this task reuse a stale resolution.
+pub(crate) fn clear_poll_wait_record(task_id: u64, uc: &crate::user_task::UserTaskCtx) {
+    use core::sync::atomic::Ordering;
+    uc.poll_wait_nfds.store(0, Ordering::Release);
+    if let Some(t) = crate::task::task_get(task_id) {
+        let mut held = t.poll_files.lock();
+        if !held.is_empty() {
+            // Drop the Arcs OUTSIDE the lock: releasing the last reference to
+            // a file can run a destructor that takes other locks.
+            let files = core::mem::take(&mut *held);
+            drop(held);
+            drop(files);
+        }
+    }
+}
+
+/// Resolve every fd of a blocking poll ONCE, at syscall entry, and hold the
+/// resulting file references for the duration of the call (see
+/// [`crate::task::Task::poll_files`]). No-op when a resolution is already
+/// held — the park re-executes this syscall on every wake, and re-resolving
+/// then is precisely the bug this prevents.
+pub(crate) fn install_poll_files(task_id: u64, fds: &[PollFd]) {
+    let Some(t) = crate::task::task_get(task_id) else {
+        return;
+    };
+    {
+        let held = t.poll_files.lock();
+        if held.len() == fds.len() {
+            return;
+        }
+    }
+    let resolved: Vec<crate::task::PollFileSlot> = fd::with_table(task_id, |tbl| {
+        fds.iter()
+            .map(|item| {
+                if item.fd < 0 {
+                    None
+                } else {
+                    tbl.get(item.fd as u32).map(|e| (e.ops.clone(), e.offset))
+                }
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    if resolved.len() == fds.len() {
+        *t.poll_files.lock() = resolved;
+    }
 }
 
 fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i64) {
@@ -491,13 +601,28 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         }
     };
 
-    // One readiness pass.
+    // Resolve the fd set ONCE for this blocking poll and hold the files for
+    // the whole call, so a sibling thread's close() cannot turn it into a
+    // POLLNVAL return (Linux `do_sys_poll`). No-op on a park re-execution.
+    install_poll_files(task, &fds);
+
+    // One readiness pass. Count it: this is the park path's own readiness
+    // question, and the stall watchdog compares its answer against this
+    // task's (see `UserTaskCtx::dbg_poll_scans`). A parked poller whose
+    // scan count climbs while the watchdog still sees a ready fd is
+    // re-asking and getting a different answer; one whose count is frozen
+    // is not re-executing at all.
+    // SAFETY: `current_user_task()` returned Some, checked in `can_park`.
+    unsafe {
+        (*uctx_ptr).dbg_poll_scans.fetch_add(1, Ordering::Relaxed);
+    }
     let ready = poll_scan(task, &mut fds);
     if ready > 0 {
         // SAFETY: as above.
         unsafe {
             (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
             (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+            clear_poll_wait_record(task, &*uctx_ptr);
         }
         // SAFETY: same pointer/length as the parse step.
         unsafe { write_pollfds(ptr, &fds) };
@@ -512,6 +637,7 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
             unsafe {
                 (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
                 (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                clear_poll_wait_record(task, &*uctx_ptr);
             }
             // SAFETY: same pointer/length.
             unsafe { write_pollfds(ptr, &fds) };
@@ -529,6 +655,7 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
                 unsafe {
                     (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
                     (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                    clear_poll_wait_record(task, &*uctx_ptr);
                 }
                 ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // EINTR
                 return;
@@ -538,6 +665,11 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         unsafe {
             let uc = &*uctx_ptr;
             uc.net_io_wait.store(true, Ordering::Release);
+            // Record the parked fd set for the stall watchdog (the poll twin
+            // of `epoll_wait_fd`) so a wedged poller's readiness can be
+            // re-evaluated from the watchdog tick. Refreshed on every
+            // re-execution; cleared on every return path.
+            record_poll_wait(uc, &fds);
             // Clamp the scheduler wake-up to the nearest armed timerfd (its
             // expiry fires no readiness notify).
             if let Some(timer_dl) = poll_nearest_deadline(task, &fds) {

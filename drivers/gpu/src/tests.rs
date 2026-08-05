@@ -108,7 +108,7 @@ fn smoke_virtio_gpu_scanout_initialised() -> TestResult {
     if !gpu_pci::is_probed() {
         return TestResult::Skip("virtio-gpu-pci not present");
     }
-    match gpu_pci::with_controller(|d| d.ready) {
+    match gpu_pci::with_controller(|d| d.is_ready()) {
         Some(true) => TestResult::Pass,
         Some(false) => TestResult::Fail("virtio-gpu probed but scanout not ready"),
         None => TestResult::Skip("virtio-gpu-pci controller missing"),
@@ -4859,6 +4859,102 @@ fn smoke_drm_flip_event_format() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_flip_event_format);
+
+/// The flip event as a COMPOSITOR sees it: through `poll`/`read` on the
+/// card node, not by reaching into `Card::events`.
+///
+/// A compositor's render loop is `page flip -> poll(card fd) -> read ->
+/// submit next frame`. If `poll_readiness` never reports `POLL_IN`, or
+/// `read` doesn't drain the queued event, the loop believes a flip is
+/// still outstanding and stops presenting — the screen freezes on
+/// whatever frame was last scanned out while the compositor stays alive
+/// and idle. `smoke_drm_flip_event_format` above proves the event bytes
+/// are well-formed but pops them directly off the queue, so it cannot
+/// catch a break anywhere in the file layer between them.
+fn smoke_drm_card_file_delivers_flip_event() -> TestResult {
+    use crate::drm_devfs_bridge::DriCardFile;
+    use narf_filesystem::{FileOps, FsError, POLL_IN};
+
+    // The card node's read future resolves synchronously (it just pops a
+    // VecDeque under a spin lock), so one poll to completion is enough.
+    fn read_once(file: &DriCardFile, buf: &mut [u8]) -> Option<Result<usize, FsError>> {
+        use core::future::Future;
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VT)
+        }
+        static VT: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        // SAFETY: no-op vtable over a null data pointer — trivially valid.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = file.read(0, buf);
+        match core::pin::Pin::new(&mut fut).poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    crate::drm_registry::__reset_for_test();
+    let index = crate::drm_registry::register_drm_card_with_state(
+        alloc::sync::Arc::new(crate::drm_devfs_bridge::BochsCard::new("card0".into())),
+        make_test_card_for_ioctl(),
+    );
+    let file = match DriCardFile::new(index) {
+        Some(f) => f,
+        None => return TestResult::Fail("could not open the registered card node"),
+    };
+
+    // Quiescent: no queued event, so nothing to report and nothing to read.
+    if file.poll_readiness() & POLL_IN != 0 {
+        return TestResult::Fail("idle card node reports POLL_IN with no queued event");
+    }
+    let mut buf = [0u8; 64];
+    match read_once(&file, &mut buf) {
+        Some(Ok(0)) => {}
+        _ => return TestResult::Fail("idle card node returned bytes with no queued event"),
+    }
+
+    // Queue one flip completion, exactly as handle_page_flip does.
+    match crate::drm_registry::mode_state(index) {
+        Some(ms) => ms.lock().queue_flip_event(0x1122_3344_5566_7788, 3),
+        None => return TestResult::Fail("registered card has no mode state"),
+    }
+
+    if file.poll_readiness() & POLL_IN == 0 {
+        return TestResult::Fail("queued flip event does not make the card node readable");
+    }
+    let n = match read_once(&file, &mut buf) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read failed with an event queued"),
+    };
+    if n != 32 {
+        return TestResult::Fail("read did not drain a whole 32-byte drm_event_vblank");
+    }
+    if u32::from_le_bytes(buf[0..4].try_into().unwrap()) != 2 {
+        return TestResult::Fail("delivered event is not DRM_EVENT_FLIP_COMPLETE");
+    }
+    if u64::from_le_bytes(buf[8..16].try_into().unwrap()) != 0x1122_3344_5566_7788 {
+        return TestResult::Fail("delivered event lost the caller's user_data cookie");
+    }
+    if u32::from_le_bytes(buf[28..32].try_into().unwrap()) != 3 {
+        return TestResult::Fail("delivered event lost the crtc id");
+    }
+
+    // Drained: the compositor must not see the same flip twice, or it
+    // would credit a completion to a frame it has not submitted yet.
+    if file.poll_readiness() & POLL_IN != 0 {
+        return TestResult::Fail("card node still readable after its only event was drained");
+    }
+    match read_once(&file, &mut buf) {
+        Some(Ok(0)) => {}
+        _ => return TestResult::Fail("drained card node redelivered the flip event"),
+    }
+
+    crate::drm_registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_card_file_delivers_flip_event);
 
 fn smoke_drm_addfb2_rmfb_roundtrip() -> TestResult {
     use crate::drm::ioctl::{dispatch, DrmIoctlResult};

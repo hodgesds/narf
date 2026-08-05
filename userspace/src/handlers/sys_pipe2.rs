@@ -9,9 +9,29 @@ pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+    // `fs/pipe.c::do_pipe2`: any flag outside O_CLOEXEC | O_NONBLOCK |
+    // O_DIRECT | O_NOTIFICATION_PIPE is -EINVAL. LINUX-GAP: O_DIRECT
+    // (packet mode, `pipe_write`'s one-buffer-per-write regime) and
+    // watch-queue pipes are unimplemented, so those two are ALSO
+    // rejected with -EINVAL here rather than silently ignored — a
+    // caller that got a byte-stream pipe after asking for packet
+    // framing would corrupt its own record boundaries.
+    let nonblock_bit = crate::fd::O_NONBLOCK as u64;
+    if flags & !(O_CLOEXEC_BIT | nonblock_bit) != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
     let want_cloexec = (flags & O_CLOEXEC_BIT) != 0;
     let install_flags = if want_cloexec {
         crate::fd::FD_CLOEXEC
+    } else {
+        0
+    };
+    // O_NONBLOCK lands in the per-fd status flags (Linux stores it on the
+    // open file description; F_GETFL reports it). The access-mode bits
+    // mirror `create_pipe_files`: read end O_RDONLY, write end O_WRONLY.
+    let nb = if flags & nonblock_bit != 0 {
+        crate::fd::O_NONBLOCK
     } else {
         0
     };
@@ -23,13 +43,13 @@ pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
             ops: rd as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
             offset: 0,
             flags: install_flags,
-            status_flags: 0,
+            status_flags: crate::fd::O_RDONLY | nb,
         });
         let w = t.open(crate::fd::FdEntry {
             ops: wr as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
             offset: 0,
             flags: install_flags,
-            status_flags: 0,
+            status_flags: crate::fd::O_WRONLY | nb,
         });
         (r, w)
     });

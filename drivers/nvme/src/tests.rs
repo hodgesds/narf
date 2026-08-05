@@ -320,7 +320,7 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
     // through `NvmeBlockDevice` (the `block::BlockDevice` impl) and
     // confirm we get back the bytes we wrote. Exercises the
     // cap-resolution path that the VFS / filesystem stack will use.
-    use crate::{Controller, NvmeBlockDevice, CONTROLLER};
+    use crate::{Controller, NvmeBlockDevice};
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -364,7 +364,10 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
         if ctrl.create_io_queue().is_err() {
             return TestResult::Fail("Controller::create_io_queue failed");
         }
-        *CONTROLLER.lock() = Some(ctrl);
+        // `install_controller` leaks the previous slot rather than
+        // dropping it, so any reference an I/O path might still hold
+        // stays valid — see its doc comment.
+        crate::install_controller(ctrl);
     }
 
     // Build a 4-KiB DMA buffer, hand it to the I/O registry to mint a
@@ -2019,3 +2022,59 @@ fn smoke_security_send_receive_round_trip_qemu() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_security_send_receive_round_trip_qemu);
+
+/// The installed controller slot must never move, be replaced by a
+/// re-probe, or be dropped.
+///
+/// `probed_controller` copies the slot's `&'static` reference out
+/// under the CONTROLLER lock, releases the lock, and then uses that
+/// reference for the whole transfer — which is what lets an NVMe
+/// round-trip (up to a 5 s CQ poll) run with interrupts enabled
+/// instead of livelocking every other CPU on an IRQ-masking spinlock.
+/// That is only sound because `probe` installs the slot exactly once
+/// and nothing ever stores `None` back; the one sanctioned
+/// replacement path, `install_controller`, leaks the old slot instead
+/// of dropping it.
+///
+/// This is precisely the sort of assumption a later "support
+/// hot-unplug" or "re-probe on reset" change invalidates silently,
+/// leaving a use-after-free reachable only under load. Assert it
+/// directly: probing again must not move the slot, and the address
+/// must stay put across I/O through the unlocked path.
+fn smoke_nvme_controller_slot_is_stable() -> TestResult {
+    use crate as nvme;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, probe_all_pci};
+
+    // SAFETY: identity-mapped QEMU ECAM region.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    if !nvme::is_probed() {
+        return TestResult::Skip("NVMe not probed");
+    }
+    let before = match nvme::dbg_slot_addr() {
+        Some(a) => a,
+        None => return TestResult::Fail("probed controller has no slot address"),
+    };
+
+    // A repeat probe must be refused, not re-install a fresh slot.
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    match nvme::dbg_slot_addr() {
+        Some(a) if a == before => {}
+        Some(_) => return TestResult::Fail("re-probe MOVED the installed controller slot"),
+        None => return TestResult::Fail("re-probe removed the installed controller slot"),
+    }
+
+    // And it must survive ordinary traffic through the unlocked path.
+    // The I/O result itself is irrelevant here (earlier smokes may
+    // have reset the device's queues); only the address matters.
+    use narf_block::BlockDeviceSync;
+    let mut sector = [0u8; 512];
+    let _ = nvme::NvmeBlockSync.read(0, 1, &mut sector);
+    match nvme::dbg_slot_addr() {
+        Some(a) if a == before => TestResult::Pass,
+        Some(_) => TestResult::Fail("controller slot moved across a read"),
+        None => TestResult::Fail("controller slot vanished across a read"),
+    }
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_controller_slot_is_stable);

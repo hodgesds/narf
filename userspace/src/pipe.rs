@@ -33,10 +33,18 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
-/// Pipe ring capacity. Matches a single 4 KiB user page so a future
-/// kernel-only Stage-5 zero-copy revision can drop the VecDeque for
-/// a fixed-array-backed scheme without renumbering callers.
+/// Pipe ring capacity. Matches Linux's default pipe buffer
+/// (`include/linux/pipe_fs_i.h`: 16 pages × 4 KiB = 65536), which is
+/// what `fcntl(F_GETPIPE_SZ)` reports on a fresh pipe.
 const PIPE_BUF_BYTES: usize = 65536;
+
+/// POSIX `PIPE_BUF` (Linux `include/linux/limits.h`): writes of at most
+/// this many bytes are ATOMIC — `fs/pipe.c::pipe_write` refuses to split
+/// them across a partial buffer ("We must still wake up any pending
+/// writers... but only do an atomic write if buf is small enough"), so a
+/// short-on-room write of ≤ PIPE_BUF bytes writes NOTHING and blocks
+/// (or EAGAINs for O_NONBLOCK) until the whole payload fits.
+const PIPE_BUF: usize = 4096;
 
 /// Linux `FIONREAD` / `TIOCINQ`: write the immediately readable byte
 /// count as an `int` through the ioctl argument pointer.
@@ -151,20 +159,30 @@ impl FileOps for PipeRead {
     }
 
     fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
-        // Reading from the write fd / writing to the read fd is a
-        // POSIX EBADF; we surface a 0-byte write so callers loop
-        // forever — Stage-4 doesn't have an errno-on-the-wire path.
-        Box::pin(async move { Ok(0) })
+        // Writing the read end: Linux fails this with EBADF from the
+        // FMODE_WRITE check in `fs/read_write.c::vfs_write` — the pipe
+        // read end is opened O_RDONLY. Returning Ok(0) here (the old
+        // behaviour) made writers loop forever on a fd that can never
+        // make progress.
+        Box::pin(async move { Err(narf_filesystem::FsError::BadFd) })
     }
 
     fn stat(&self) -> Stat {
-        // `mode` is "named pipe" in POSIX (S_IFIFO = 0o010000); we
-        // don't carry the bit through `Mode` yet so report the
-        // FILE_RW shape — callers that care use `fstat` for size.
+        // An anonymous pipe fstats as a FIFO: `fs/pipe.c::create_pipe_files`
+        // creates the pipefs inode with `S_IFIFO | S_IRUSR | S_IWUSR`, and
+        // pipefs never updates i_size, so st_size is always 0 (FIONREAD is
+        // the sanctioned way to count queued bytes). Reporting S_IFREG here
+        // was not cosmetic: GNU coreutils ≥ 9 `cat` switches to its
+        // copy_file_range path when `S_ISREG(fstat(stdin))` holds, which on
+        // a pipe stdin turned every `cat < pipe > file` into an instant
+        // zero-byte "EOF" (the Fedora xkbcomp keymap-capture failure).
         Stat {
-            size: self.shared.queue.lock().len() as u64,
+            size: 0,
             blocks: 0,
-            mode: Mode::FILE_RW,
+            mode: Mode {
+                file_type: narf_filesystem::FileType::Fifo,
+                perms: 0o600,
+            },
             mtime_cycles: 0,
         }
     }
@@ -183,10 +201,20 @@ impl FileOps for PipeRead {
     }
 
     fn poll_readiness(&self) -> u32 {
+        // `fs/pipe.c::pipe_poll`, read side: EPOLLIN only while data is
+        // queued; EPOLLHUP once the last writer is gone (both may be set —
+        // an EOF'd pipe with residual data reports EPOLLIN | EPOLLHUP).
+        // The old mask granted a bare POLLIN for "empty + writer gone",
+        // hiding the hangup from callers that branch on POLLHUP. poll(2)/
+        // select(2)/epoll all deliver HUP regardless of the requested
+        // event set, so an EOF still terminates a POLLIN wait.
         let mut mask = 0;
         let q = self.shared.queue.lock();
-        if !q.is_empty() || self.shared.writer_closed.load(Ordering::Acquire) {
+        if !q.is_empty() {
             mask |= narf_filesystem::POLL_IN;
+        }
+        if self.shared.writer_closed.load(Ordering::Acquire) {
+            mask |= narf_filesystem::POLL_HUP;
         }
         mask
     }
@@ -235,7 +263,10 @@ impl FileOps for PipeRead {
 
 impl FileOps for PipeWrite {
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Ok(0) })
+        // Reading the write end: EBADF on Linux (`fs/read_write.c::vfs_read`
+        // FMODE_READ check — the pipe write end is opened O_WRONLY). The
+        // old Ok(0) here masqueraded as a clean EOF.
+        Box::pin(async move { Err(narf_filesystem::FsError::BadFd) })
     }
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
@@ -247,6 +278,15 @@ impl FileOps for PipeWrite {
             let mut q = self.shared.queue.lock();
             let was_empty = q.is_empty();
             let room = PIPE_BUF_BYTES.saturating_sub(q.len());
+            // POSIX PIPE_BUF atomicity (`fs/pipe.c::pipe_write`): a write of
+            // ≤ PIPE_BUF bytes is all-or-nothing — if it doesn't fit in the
+            // free space, write NOTHING. The 0-progress result makes the
+            // syscall layer park a blocking writer (re-executing until the
+            // reader drains room) or return EAGAIN for O_NONBLOCK, exactly
+            // Linux's split. Larger writes may land a partial prefix.
+            if buf.len() <= PIPE_BUF && room < buf.len() {
+                return Ok(0);
+            }
             let n = core::cmp::min(buf.len(), room);
             for &b in buf.iter().take(n) {
                 q.push_back(b);
@@ -263,10 +303,15 @@ impl FileOps for PipeWrite {
     }
 
     fn stat(&self) -> Stat {
+        // Same shape as the read end: S_IFIFO, zero size — see
+        // `PipeRead::stat` (fs/pipe.c::create_pipe_files).
         Stat {
-            size: self.shared.queue.lock().len() as u64,
+            size: 0,
             blocks: 0,
-            mode: Mode::FILE_RW,
+            mode: Mode {
+                file_type: narf_filesystem::FileType::Fifo,
+                perms: 0o600,
+            },
             mtime_cycles: 0,
         }
     }
@@ -287,10 +332,17 @@ impl FileOps for PipeWrite {
     }
 
     fn poll_readiness(&self) -> u32 {
+        // `fs/pipe.c::pipe_poll`, write side: EPOLLOUT while the buffer has
+        // room; EPOLLERR once the last reader is gone. The old mask granted
+        // POLLOUT on reader-close (instead of POLLERR), so a poller never
+        // saw the error condition Linux reports.
         let mut mask = 0;
         let q = self.shared.queue.lock();
-        if q.len() < PIPE_BUF_BYTES || self.shared.reader_closed.load(Ordering::Acquire) {
+        if q.len() < PIPE_BUF_BYTES {
             mask |= narf_filesystem::POLL_OUT;
+        }
+        if self.shared.reader_closed.load(Ordering::Acquire) {
+            mask |= narf_filesystem::POLL_ERR;
         }
         mask
     }
@@ -309,6 +361,12 @@ impl FileOps for PipeWrite {
         // has closed, write() returns BrokenPipe rather than 0, so this is
         // only consulted while the reader is present.
         !self.shared.reader_closed.load(Ordering::Acquire)
+    }
+
+    fn is_stream(&self) -> bool {
+        // Same non-seekable-stream marker as the read end: `lseek(2)` on
+        // either pipe end is ESPIPE (pipefifo_fops has no .llseek).
+        true
     }
 
     fn pipe_capacity(&self) -> Option<usize> {

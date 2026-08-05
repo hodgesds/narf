@@ -645,6 +645,129 @@ fn smoke_abi_fsx_mount_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_neg);
 
+// ── mount(2) FUSE options live in `data`, not `source` ────────────────
+//
+// Linux `fuse_fill_super` reads `fd=`/`rootmode=`/`user_id=`/`group_id=`
+// from mount(2)'s 5th argument. `source` is the device (`/dev/fuse`) or a
+// daemon-chosen label and carries no options.
+//
+// NARF's fuse arm parsed them out of `source` for as long as the mount ABI
+// really was NARF-native `(ptr, len, ...)` with no `data` register. The ABI
+// was converted to the Linux shape; the fuse arm was not, so `fd=` was
+// never found in any real caller's `source` and EVERY fuse mount failed —
+// as EFAULT, because the arm fell back to the handler's copy-in error.
+// xdg-document-portal logs that verbatim ("fuse: mount failed: Bad
+// address"), which points at an addressing bug that does not exist.
+//
+// Both arms below distinguish the fixed handler from the broken one by
+// ERRNO, which is exactly what the bug corrupted:
+//   * options in `data` (correct location) → the fd is looked up and
+//     rejected as "not a /dev/fuse connection" → EINVAL. Pre-fix: `data`
+//     was never read, so this returned EFAULT.
+//   * options in `source` (the retired location) → nothing to parse in
+//     `data` → EINVAL. Pre-fix: `source` WAS parsed, the bogus fd failed
+//     the connection lookup, and that path also returned EFAULT.
+
+fn smoke_abi_fsx_mount_fuse_opts_from_data() -> TestResult {
+    with_setup(|| {
+        let source = b"/dev/fuse\0";
+        let target = b"/abi-fuse-data\0";
+        let fstype = b"fuse\0";
+        // A syntactically valid option string naming an fd that is not an
+        // open /dev/fuse connection. Linux: EINVAL.
+        let data = b"fd=4242,rootmode=40000,user_id=0,group_id=0\0";
+        let args = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: data.as_ptr() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::Mount.raw(), args) {
+            Some(v) if v == EINVAL => Ok(()),
+            Some(v) if v == EFAULT => {
+                Err("fuse mount returned EFAULT — options are being read from `source`, not `data`")
+            }
+            _ => Err("fuse mount with a non-fuse fd in `data` must return -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_fuse_opts_from_data);
+
+fn smoke_abi_fsx_mount_fuse_opts_not_from_source() -> TestResult {
+    with_setup(|| {
+        // The retired NARF-native location. `data` is NULL, so a handler
+        // that reads only `data` finds no `fd=` at all → EINVAL.
+        let source = b"fd=4242,rootmode=40000,user_id=0,group_id=0\0";
+        let target = b"/abi-fuse-source\0";
+        let fstype = b"fuse.portal\0"; // the `fuse.<subtype>` arm too
+        let args = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0, // no data
+            ..Default::default()
+        };
+        match call(Syscall::Mount.raw(), args) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("fuse mount must not read its options from `source`"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_fuse_opts_not_from_source);
+
+// A fuse mount must be PUBLISHED without waiting for the daemon's FUSE_INIT
+// reply, because the daemon cannot send one while it is inside mount(2).
+//
+// Linux `fuse_fill_super` submits INIT through `fuse_simple_background()`
+// and returns; `process_init_reply()` sets `fc->initialized` later, from the
+// reply callback (fs/fuse/inode.c). NARF awaited INIT inline, so a daemon
+// that mounts from the thread it services /dev/fuse on — which libfuse's
+// `fuse_mount` does — deadlocked against itself until the bounded bridge
+// expired and the mount failed.
+//
+// The fd here is a real /dev/fuse connection with NO daemon behind it: a
+// handler that waits for INIT cannot succeed, and one that publishes and
+// negotiates in the background returns 0 immediately.
+fn smoke_abi_fsx_mount_fuse_publishes_without_init_reply() -> TestResult {
+    with_setup(|| {
+        let dev = narf_filesystem::fuse_conn::DevFuse::open_new();
+        let task = crate::handlers::current_task_id();
+        let fd = crate::fd::with_table(task, |t| {
+            t.open(crate::fd::FdEntry {
+                ops: dev.clone(),
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            })
+        })
+        .ok_or("could not install a /dev/fuse fd for the mount")?;
+
+        let source = b"/dev/fuse\0";
+        let target = b"/abi-fuse-live\0";
+        let fstype = b"fuse\0";
+        let data = alloc::format!("fd={fd},rootmode=40000,user_id=0,group_id=0\0");
+        let args = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: data.as_ptr() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::Mount.raw(), args) {
+            Some(0) => Ok(()),
+            _ => Err("fuse mount must publish without awaiting a FUSE_INIT reply"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_mount_fuse_publishes_without_init_reply
+);
+
 // ── umount2 ───────────────────────────────────────────────────────────
 //
 // arg0/arg1 = target ptr/len, arg2 = MNT_* flags. The registry pop-by-path

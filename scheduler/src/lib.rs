@@ -353,6 +353,13 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
 pub(crate) struct WakeCell {
     flag: AtomicBool,
     cpu: AtomicU32,
+    /// Diagnostic: times `run_until_empty` popped this slot, and times it
+    /// re-queued it because the awake flag was clear. A stranded slot is
+    /// ambiguous without these — "the CPU is running rounds" does not say
+    /// whether THIS slot is reached, and "awake=true" does not say whether
+    /// the swap that would clear it was ever executed.
+    pops: AtomicU64,
+    not_awake_requeues: AtomicU64,
 }
 
 /// Per-CPU "about to halt / halted" flag, used to gate the reschedule
@@ -1160,6 +1167,8 @@ where
     let slot = TaskSlot {
         task: Box::pin(f),
         awake: Arc::new(WakeCell {
+            pops: AtomicU64::new(0),
+            not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
         }),
@@ -1343,6 +1352,8 @@ where
     let slot = TaskSlot {
         task,
         awake: Arc::new(WakeCell {
+            pops: AtomicU64::new(0),
+            not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
         }),
@@ -2222,7 +2233,11 @@ pub fn run_until_empty() {
 
             // Skip if no waker has fired since the last poll. The slot
             // stays in the queue, waiting for an external signal.
+            slot.awake.pops.fetch_add(1, Ordering::Relaxed);
             if !slot.awake.flag.swap(false, Ordering::Acquire) {
+                slot.awake
+                    .not_awake_requeues
+                    .fetch_add(1, Ordering::Relaxed);
                 enqueue_after_poll(cpu, slot);
                 continue;
             }
@@ -2533,6 +2548,13 @@ pub fn run_until_empty() {
         // still run on the all-parked branch below (every idle cycle, i.e.
         // once per request/response since the loop idles between them), plus
         // a ~1 ms forced fallback so a perpetual self-waker can't starve them.
+        // One tick per executor round on this CPU. A parked task whose wake
+        // landed but never ran is ambiguous without this: it distinguishes
+        // "this CPU is looping and skipping the slot" from "this CPU stopped
+        // iterating entirely", which are different bugs. Diagnostic only.
+        if cpu < narf_lib::percpu::MAX_CPUS {
+            EXEC_ROUNDS[cpu].fetch_add(1, Ordering::Relaxed);
+        }
         let any_runnable = {
             let q = READY[cpu].lock();
             q.as_ref()
@@ -2914,6 +2936,65 @@ pub fn runnable_task_count() -> usize {
 /// - `!halted && awake > 0` ⇒ the CPU is spinning but not polling — a
 ///   data-path/lock issue keeping it off the poll, OR a busy-loop bug.
 /// - `locked`               ⇒ a holder is stuck inside the queue lock.
+///
+/// Executor rounds completed per CPU. See the increment site.
+static EXEC_ROUNDS: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Rounds this CPU's executor loop has run.
+pub fn dbg_exec_rounds(cpu: usize) -> u64 {
+    if cpu >= narf_lib::percpu::MAX_CPUS {
+        return 0;
+    }
+    EXEC_ROUNDS[cpu].load(Ordering::Relaxed)
+}
+
+/// Scheduler-side state of the slot owning `task_id`, if it is queued:
+/// `(awake_flag, home_cpu, rounds_on_that_cpu, queue_len)`.
+///
+/// A parked task that has been woken but never re-polled leaves a specific
+/// fingerprint here. `awake == true` says the wake reached the slot, so
+/// the readiness and waker layers did their job; if the home CPU's round
+/// counter is ALSO advancing, the executor is iterating and skipping the
+/// slot; if it is flat, that CPU has stopped running rounds and every task
+/// homed on it is stranded regardless of its own state.
+#[allow(clippy::type_complexity)]
+pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, bool, u64, u64)> {
+    for (cpu, ready) in READY.iter().enumerate() {
+        if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
+            continue;
+        }
+        // try_lock: this runs from a timer tick, and blocking on a queue
+        // lock held by the very CPU under investigation would deadlock the
+        // reporter.
+        let Some(g) = ready.try_lock() else {
+            continue;
+        };
+        let Some(d) = g.as_ref() else { continue };
+        if let Some(slot) = d.iter().find(|s| s.id.raw() == task_id) {
+            let home = slot.awake.cpu.load(Ordering::Relaxed);
+            let allowed = slot.spec.affinity.allowed;
+            // `run_until_empty` pops a slot, and BEFORE consuming its awake
+            // flag re-queues it when its affinity excludes the CPU it is
+            // queued on. If that holds, the slot bounces on this queue
+            // forever with `awake` never cleared — so report whether this
+            // queue's CPU is even permitted to run it.
+            return Some((
+                slot.awake.flag.load(Ordering::Acquire),
+                home,
+                dbg_exec_rounds(home as usize),
+                d.len(),
+                allowed.bits(),
+                cpu as u32,
+                allowed.contains(CpuId(cpu as u32)),
+                slot.awake.pops.load(Ordering::Relaxed),
+                slot.awake.not_awake_requeues.load(Ordering::Relaxed),
+            ));
+        }
+    }
+    None
+}
+
 pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool) {
     if cpu >= narf_lib::percpu::MAX_CPUS {
         return (0, 0, false, false);
@@ -3033,10 +3114,14 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
                 priority: s.spec.priority,
                 class: s.spec.class,
                 affinity: s.spec.affinity,
-                // Hard safety floor: an address-space-bearing (user)
-                // task must never migrate across CPUs. The default
-                // strategy's `allow_steal` refuses on this flag even
-                // if the task were mis-pinned to `Affinity::any()`.
+                // Marks an address-space-bearing (user) task. The default
+                // strategy's `allow_steal` refuses to steal one UNLESS
+                // `user_task_smp_enabled()` — see `steal.rs`. This was
+                // once an unconditional "never migrate" floor and the
+                // comment outlived the exception, which matters when
+                // reasoning about strands: a user task whose home CPU
+                // stops iterating its executor loop is only rescuable by
+                // another CPU if that flag is on.
                 addr_space: s.addr_space.is_some(),
             };
             strategy.allow_steal(thief, &meta)
@@ -3403,6 +3488,8 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     let awake = Arc::new(WakeCell {
         flag: AtomicBool::new(true),
         cpu: AtomicU32::new(narf_lib::percpu::current_cpu() as u32),
+        pops: AtomicU64::new(0),
+        not_awake_requeues: AtomicU64::new(0),
     });
     let waker = make_waker(awake.clone());
     let mut ctx = Context::from_waker(&waker);

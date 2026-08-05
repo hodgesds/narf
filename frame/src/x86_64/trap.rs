@@ -66,12 +66,18 @@ fn ensure_user_range_writable(lo: u64, hi: u64) -> bool {
 ///   - per CPU: ready-queue depth, # of awake (runnable) slots, the
 ///     published HALTED flag, whether the queue lock was held, and the
 ///     last-tick CPL/RIP (kernel RIP → addr2line offline).
+///
 /// Decision: `halted && awake>0` ⇒ lost wakeup; `!halted && awake>0` ⇒
 /// spinning-not-polling (data-path/lock); `locked` ⇒ stuck in the queue
-/// lock. Self-latches after one dump. Cheap (a few atomics per tick); the
-/// dump only ever runs once, from IRQ context, via the same TrapWriter the
-/// perf dump uses, then panics so CI cannot silently time out after a
-/// diagnosed stall.
+/// lock. Cheap (a few atomics per tick); the dumps run from IRQ context
+/// via the same TrapWriter the perf dump uses.
+///
+/// The per-CPU dump self-latches after one shot, but the stranded-task
+/// reports do NOT: they are capped at `STRANDED_REPORTS` occurrences,
+/// because a one-shot fires on whichever task wedges earliest in boot and
+/// then goes silent for every later strand — including the compositor's.
+/// An RCU stall only WARNS unless `rcu_cpu_stall_panic` is on the command
+/// line, so a diagnosed stall no longer takes the boot down by default.
 ///
 /// Off by default — build with `--features stall-watchdog` to arm it for
 /// an SMP-wedge investigation (a few atomics per tick; dumps once).
@@ -94,6 +100,49 @@ mod stall_wd {
     static HIGH_WATER: AtomicU64 = AtomicU64::new(0);
     static FLAT_WINDOWS: AtomicU64 = AtomicU64::new(0);
     static DUMPED: AtomicBool = AtomicBool::new(false);
+    /// Flat windows during which NOTHING was runnable — idle, or a lost
+    /// wakeup. Counted separately from `FLAT_WINDOWS` so the two verdicts
+    /// cannot reset each other.
+    static IDLE_FLAT_WINDOWS: AtomicU64 = AtomicU64::new(0);
+    static STRANDED_DUMPED: AtomicBool = AtomicBool::new(false);
+    /// Window number of the most recent strand report, so reports are
+    /// SPACED rather than capped in total.
+    ///
+    /// A total cap is the same trap as a one-shot, just deferred: it is
+    /// spent on whichever tasks wedge earliest in boot, and anything that
+    /// wedges later never appears at all. That is exactly the case worth
+    /// seeing — kwin_wayland deadlocks minutes in, after PLASMA-READY, long
+    /// after a 12-report budget has been consumed by early-boot noise.
+    /// Spacing keeps the log bounded (one report per
+    /// `STRAND_REPORT_SPACING_WINDOWS` windows) while staying available for
+    /// the whole run.
+    static STRANDED_REPORT_WINDOW: AtomicU64 = AtomicU64::new(0);
+    /// Identity of the last stranded set, so only a PERSISTENT strand
+    /// (the same tasks, window after window) is reported.
+    static LAST_STRANDED_SIG: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether an RCU CPU-stall timeout should be fatal.
+    ///
+    /// Off unless `rcu_stall_panic` is on the kernel command line, mirroring
+    /// Linux's `rcu_cpu_stall_panic` boot parameter (which likewise defaults
+    /// to warn-and-continue). Parsed once and cached; the command line does
+    /// not change after boot and this is read from a timer tick.
+    fn rcu_stall_panics() -> bool {
+        const UNSET: u8 = 0;
+        const NO: u8 = 1;
+        const YES: u8 = 2;
+        static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+        match CACHED.load(Ordering::Relaxed) {
+            NO => return false,
+            YES => return true,
+            _ => {}
+        }
+        let on = narf_boot::cmdline()
+            .split_ascii_whitespace()
+            .any(|t| t == "rcu_stall_panic" || t == "rcu_stall_panic=1");
+        CACHED.store(if on { YES } else { NO }, Ordering::Relaxed);
+        on
+    }
 
     /// Called from the timer-tick path with the interrupted CPL3-or-not
     /// `cs` and `rip`. Records this CPU's last RIP/CPL, then (rate-limited
@@ -117,6 +166,10 @@ mod stall_wd {
         // watchdog must enable it itself or its syscall signal is always 0.
         if !narf_lib::perf::enabled() {
             narf_lib::perf::set_enabled(true);
+            // The strand detector needs parked tasks to record their poll
+            // fd set; that recording is off by default because it costs
+            // atomic stores on every poll park.
+            narf_userspace::user_task::enable_poll_wait_recording();
         }
         let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
         let now = narf_scheduler::narf_time::now_cycles();
@@ -160,7 +213,23 @@ mod stall_wd {
                 "STALL-WD: RCU quiescent-state timeout mask={rcu_stalled:#x}"
             );
             dump(sc);
-            panic!("STALL-WD: RCU quiescent-state timeout");
+            // Linux warns on an RCU CPU stall and continues, and panics only
+            // when asked (`rcupdate.rcu_cpu_stall_panic=1` /
+            // `kernel.panic_on_rcu_stall`). Match that, because a stall is
+            // frequently a SYMPTOM of something still worth inspecting: a
+            // long spin under a contended lock trips this while the machine
+            // is otherwise diagnosable, and panicking destroys exactly the
+            // live state that identifies the culprit. During the virtio-blk
+            // livelock hunt this fired at ~40 s and killed the VM before the
+            // per-task census could run.
+            //
+            // The dump above is the diagnosis; the panic is a policy choice
+            // that belongs to whoever is running the kernel. CI wants it (a
+            // stall must fail the job); an interactive bring-up session does
+            // not.
+            if rcu_stall_panics() {
+                panic!("STALL-WD: RCU quiescent-state timeout");
+            }
         }
         // Wedge signature: past boot (window 20 ≈ 20 s uptime) and the
         // syscall RATE collapses far below healthy. A healthy 200-conn run
@@ -172,6 +241,116 @@ mod stall_wd {
         // wedge whose exact rate varies (2k-30k). A healthy run completes
         // (and qemu exits) well before the window count matters, so this
         // only ever fires on a genuine wedge.
+        // One-shot park census, well after the desktop session has settled.
+        // The stranded-epoll check below only sees tasks parked in
+        // epoll_wait; a glib main loop parks in ppoll, and a task blocked on
+        // a futex is invisible to both. When a process is wedged with a
+        // FROZEN cpu counter it is in none of the deadline parks — those
+        // re-fire on the 10 ms I/O backstop and would accumulate time — so
+        // the census is the only way to see which wait it is actually in.
+        if wc == 180 {
+            let _ = writeln!(TrapWriter, "PARK-CENSUS: begin");
+            for (tid, pid, st, dl, fu, fns, fgen, fval, netio, waitchild, flock, parked) in
+                narf_userspace::task::dbg_park_snapshot()
+            {
+                let _ = writeln!(
+                    TrapWriter,
+                    "PARK-CENSUS tid={tid} pid={pid} st={st} deadline={dl} futex={fu:#x} futex_ns={fns:#x} futex_gen={fgen} futex_val={fval:#x} netio={netio} waitchild={waitchild} flock={flock:#x} parked={parked}"
+                );
+            }
+            let _ = writeln!(TrapWriter, "PARK-CENSUS: end");
+        }
+
+        // A single wedged task does not stall the system: other tasks keep
+        // waking on timers, so forward progress never goes flat and the
+        // whole-scheduler check below never fires. That is how a compositor
+        // can sit parked forever while its own epoll set reports work and
+        // nothing anywhere reports a problem.
+        //
+        // Ask the narrower question every window instead: is some parked task
+        // being told it is ready, repeatedly, and still not running? Requiring
+        // the SAME task to stay in that state across consecutive windows keeps
+        // the ordinary race — ready between the scan and the wake — from
+        // reporting anything, since that resolves within one window.
+        // Report repeatedly, SPACED rather than capped: the first strand is
+        // not necessarily the interesting one. A one-shot — or a total
+        // budget, which is a slower one-shot — is spent on whichever task
+        // wedges earliest in boot and then goes silent for the rest of the
+        // run, hiding every later strand including the compositor's.
+        const STRAND_REPORT_SPACING_WINDOWS: u64 = 60;
+        let last_report = STRANDED_REPORT_WINDOW.load(Ordering::Relaxed);
+        let report_due =
+            last_report == 0 || wc.saturating_sub(last_report) >= STRAND_REPORT_SPACING_WINDOWS;
+        if wc > 20 && report_due {
+            let mut stranded = narf_userspace::task::dbg_stranded_wakes();
+            // A glib main loop parks in ppoll, not epoll_wait, so the
+            // epoll-only view above cannot see the compositor at all.
+            let poll_waiters = narf_userspace::task::dbg_stranded_poll_waiters();
+            // Any line emitted below opens a fresh spacing interval. Without
+            // this the poll-waiter path never records a report, so
+            // `report_due` stays true and a persistent strand prints on
+            // EVERY window.
+            if !poll_waiters.is_empty() {
+                STRANDED_REPORT_WINDOW.store(wc, Ordering::Relaxed);
+            }
+            for (tid, pid, fd, revents, checks, deadline, netio, waitchild, stopped, scans) in
+                poll_waiters
+            {
+                let _ = writeln!(
+                    TrapWriter,
+                    "STALL-WD poll-stranded tid={tid} pid={pid} fd={fd} revents={revents:#x} park_checks={checks} scans={scans} deadline={deadline:#x} netio={netio} waitchild={waitchild} stopped={stopped}"
+                );
+                // Scheduler-side half of the verdict. `awake` says whether
+                // the wake actually reached the slot; `rounds` says whether
+                // the CPU that owns it is still iterating. Sampled twice a
+                // second apart so a flat round counter is visible as flat
+                // rather than inferred from one reading.
+                match narf_scheduler::dbg_slot_state(tid) {
+                    Some((awake, home, rounds, qlen, aff, qcpu, allowed, pops, requeues)) => {
+                        let _ = writeln!(
+                            TrapWriter,
+                            "STALL-WD   slot tid={tid} awake={awake} home_cpu={home} rounds={rounds} qlen={qlen} aff={aff:#x} queued_on={qcpu} cpu_allowed={allowed} pops={pops} notawake_requeues={requeues}"
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(
+                            TrapWriter,
+                            "STALL-WD   slot tid={tid} NOT QUEUED — no ready-queue slot owns this task"
+                        );
+                    }
+                }
+                stranded.push((tid, pid, fd as u32));
+            }
+            let signature = stranded.iter().fold(0u64, |acc, (tid, _, epfd)| {
+                acc ^ (tid.rotate_left(17) ^ (*epfd as u64))
+            });
+            if !stranded.is_empty()
+                && signature == LAST_STRANDED_SIG.swap(signature, Ordering::Relaxed)
+            {
+                let n = IDLE_FLAT_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n >= 3 {
+                    STRANDED_REPORT_WINDOW.store(wc, Ordering::Relaxed);
+                    IDLE_FLAT_WINDOWS.store(0, Ordering::Relaxed);
+                    let _ = writeln!(
+                        TrapWriter,
+                        "STALL-WD: {} parked task(s) held a READY epoll set across {n} windows — lost wakeup, not idle",
+                        stranded.len()
+                    );
+                    for (tid, pid, epfd) in stranded {
+                        let _ = writeln!(
+                            TrapWriter,
+                            "STALL-WD stranded tid={tid} pid={pid} epfd={epfd}"
+                        );
+                    }
+                    if !STRANDED_DUMPED.swap(true, Ordering::Relaxed) {
+                        dump(sc);
+                    }
+                }
+            } else {
+                IDLE_FLAT_WINDOWS.store(0, Ordering::Relaxed);
+                LAST_STRANDED_SIG.store(signature, Ordering::Relaxed);
+            }
+        }
         if wc > 20 && delta < 50_000 && progress == previous_progress && runnable > 0 {
             let flats = FLAT_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
             if flats >= 3 && !DUMPED.swap(true, Ordering::Relaxed) {

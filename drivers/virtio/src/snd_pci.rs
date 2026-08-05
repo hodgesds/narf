@@ -19,8 +19,9 @@
 //! audio crate the "is_probed + topology snapshot" surface it needs
 //! to advertise a stream.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
+use alloc::sync::Arc;
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
@@ -34,6 +35,7 @@ use crate::pci::{
     CC_QUEUE_SELECT, CC_QUEUE_SIZE,
 };
 use crate::queue::{VirtqDesc, Virtqueue, VirtqueueLayout, VIRTQ_DESC_F_WRITE};
+use crate::req_gate::ReqGate;
 use crate::{
     VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
     VIRTIO_STATUS_FEATURES_OK,
@@ -108,7 +110,17 @@ pub struct VirtioSoundPci {
     /// Tracks whether the playback stream (id 0) is in the
     /// STARTED state. set_params + prepare + start are
     /// idempotent on first play; subsequent plays skip them.
-    started: IrqSafeSpinLock<bool>,
+    /// Written only under `req_gate`, so a plain atomic suffices —
+    /// crucially it is NOT an IRQ-masking lock held across the three
+    /// control round-trips the start sequence issues.
+    started: AtomicBool,
+    /// Serialises the shared ctrl/tx scratch and the SET_PARAMS →
+    /// PREPARE → START sequence WITHOUT masking interrupts while
+    /// waiting — see [`crate::req_gate`]. The device may legitimately
+    /// hold a PCM buffer for multiple milliseconds before acking, so
+    /// waiting here with interrupts masked (as the old global
+    /// CONTROLLER hold did) starved timers/RCU on every submit.
+    req_gate: AtomicBool,
     pub cfg: VirtioSndConfig,
     pub ready: bool,
 }
@@ -317,7 +329,8 @@ impl VirtioSoundPci {
             queue_notify_off,
             ctrl_buf: ctrl_scratch,
             tx_buf: tx_scratch,
-            started: IrqSafeSpinLock::new(false),
+            started: AtomicBool::new(false),
+            req_gate: AtomicBool::new(false),
             cfg,
             ready: true,
         })
@@ -327,17 +340,19 @@ impl VirtioSoundPci {
     /// `req` is copied into the ctrl scratch buffer at offset 0;
     /// the device writes its `virtio_snd_hdr { u32 status }` at
     /// offset 64. Returns the response status code.
+    ///
+    /// Caller must hold the request gate (the ctrl scratch is shared).
     fn ctrl_request(&self, req: &[u8]) -> Result<u32, VirtioPciError> {
         if req.len() > 60 {
             return Err(VirtioPciError::QueueTooSmall);
         }
         let req_phys = self.ctrl_buf.phys_addr().raw();
         let resp_phys = req_phys + 64;
-        // SAFETY: identity-mapped DMA.
+        // SAFETY: identity-mapped DMA. Bulk copy — coherent DMA memory,
+        // not MMIO; ordering vs. the device comes from the SeqCst fence
+        // before the notify write below.
         unsafe {
-            for (i, b) in req.iter().enumerate() {
-                core::ptr::write_volatile((req_phys + i as u64) as *mut u8, *b);
-            }
+            core::ptr::copy_nonoverlapping(req.as_ptr(), req_phys as *mut u8, req.len());
             // Pre-clear the response slot so we can detect a
             // device that didn't write anything.
             core::ptr::write_volatile(resp_phys as *mut u32, 0xFFFF_FFFF);
@@ -409,9 +424,13 @@ impl VirtioSoundPci {
 
     /// Run SET_PARAMS + PREPARE + START on stream id 0 if not
     /// already started. Idempotent.
+    ///
+    /// Caller must hold the request gate, which is what makes the
+    /// check-then-sequence race-free; `started` itself is a plain
+    /// atomic so no IRQ-masking lock is held across the three control
+    /// round-trips this issues on first play.
     fn ensure_started(&self, params: PcmParams) -> Result<(), VirtioPciError> {
-        let mut started = self.started.lock();
-        if *started {
+        if self.started.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -457,7 +476,7 @@ impl VirtioSoundPci {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
 
-        *started = true;
+        self.started.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -468,8 +487,25 @@ impl VirtioSoundPci {
     /// (single-page from a `narf-shmem` region, or any kernel
     /// `DmaBuffer`).
     ///
-    /// Blocks until the device acks via the tx vq used ring.
+    /// Blocks until the device acks via the tx vq used ring — which
+    /// routinely takes multiple milliseconds, since the device may not
+    /// ack a PCM buffer until it has consumed it. The wait happens
+    /// under the device's request gate with interrupts ENABLED; no
+    /// global or IRQ-masking lock is held.
     pub fn play_buffer_phys(
+        &self,
+        params: PcmParams,
+        payload_phys: u64,
+        payload_len: u32,
+    ) -> Result<(), VirtioPciError> {
+        let _gate = ReqGate::acquire(&self.req_gate);
+        self.play_buffer_phys_locked(params, payload_phys, payload_len)
+    }
+
+    /// Gate-free body of [`play_buffer_phys`]; caller must hold the
+    /// request gate (it protects the shared ctrl/tx scratch and the
+    /// single-outstanding-submission contract).
+    fn play_buffer_phys_locked(
         &self,
         params: PcmParams,
         payload_phys: u64,
@@ -583,15 +619,21 @@ impl VirtioSoundPci {
         if pcm.len() > 4032 {
             return Err(VirtioPciError::QueueTooSmall);
         }
+        // The gate must cover the payload copy too, or two concurrent
+        // players could interleave their copies into the shared scratch
+        // and then serialise only the submits.
+        let _gate = ReqGate::acquire(&self.req_gate);
         let base = self.tx_buf.phys_addr().raw();
         let payload_phys = base + 64;
-        // SAFETY: identity-mapped scratch DMA; we own the slot.
+        // SAFETY: identity-mapped scratch DMA; the gate makes the slot
+        // ours. Bulk copy — this is the per-PCM-buffer hot path, and a
+        // per-byte volatile loop paid 4032 single-byte stores per
+        // period. Ordering vs. the device comes from the SeqCst fence
+        // before the notify write in `play_buffer_phys_locked`.
         unsafe {
-            for (i, b) in pcm.iter().enumerate() {
-                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, *b);
-            }
+            core::ptr::copy_nonoverlapping(pcm.as_ptr(), payload_phys as *mut u8, pcm.len());
         }
-        self.play_buffer_phys(params, payload_phys, pcm.len() as u32)
+        self.play_buffer_phys_locked(params, payload_phys, pcm.len() as u32)
     }
 }
 
@@ -619,7 +661,21 @@ impl PcmParams {
     }
 }
 
-static CONTROLLER: IrqSafeSpinLock<Option<VirtioSoundPci>> = IrqSafeSpinLock::new(None);
+/// The probed controller, behind an `Arc` so callers can snapshot the
+/// handle under a brief lock hold and release `CONTROLLER` BEFORE the
+/// device round-trip (the same clone-and-release pattern as the mount
+/// registry and virtio-net). An `&'static` handout (as virtio-blk uses)
+/// would be unsound here: `__reset_for_test` legitimately drops the
+/// controller, so the install-once invariant that justifies `&'static`
+/// does not hold for this driver. The `Arc` keeps a snapshotted device
+/// alive across that window instead.
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<VirtioSoundPci>>> = IrqSafeSpinLock::new(None);
+
+/// Snapshot the installed controller. Takes `CONTROLLER` only long
+/// enough to clone the `Arc`.
+fn probed() -> Option<Arc<VirtioSoundPci>> {
+    CONTROLLER.lock().clone()
+}
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -638,7 +694,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    *CONTROLLER.lock() = Some(dev);
+    *CONTROLLER.lock() = Some(Arc::new(dev));
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("vsnd0"),
         kind: narf_drivers::BoundKind::Audio,
@@ -676,9 +732,14 @@ pub fn topology() -> Option<(u32, u32, u32)> {
 /// Submit one PCM buffer through the probed virtio-sound device's
 /// stream 0. Blocks until the device acks. Slice-friendly; copies
 /// into the per-controller scratch.
+///
+/// The `CONTROLLER` lock is released before the submit: the device
+/// may hold a PCM buffer for milliseconds before acking, and waiting
+/// that out under an IRQ-masking global lock starved timers/RCU on
+/// this CPU and spun every other audio submitter interrupts-masked.
+/// Mutual exclusion is provided by the device's own request gate.
 pub fn play_buffer(params: PcmParams, pcm: &[u8]) -> Result<(), VirtioPciError> {
-    let g = CONTROLLER.lock();
-    let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
+    let c = probed().ok_or(VirtioPciError::NoQueues)?;
     c.play_buffer(params, pcm)
 }
 
@@ -686,29 +747,33 @@ pub fn play_buffer(params: PcmParams, pcm: &[u8]) -> Result<(), VirtioPciError> 
 /// `(payload_phys, payload_len)`. The header + status still come
 /// from the per-controller scratch. Use this when the PCM source
 /// is already in DMA-coherent memory — typically a `narf-shmem`
-/// region's `phys_at(handle, offset)`.
+/// region's `phys_at(handle, offset)`. Locking as [`play_buffer`].
 pub fn play_buffer_phys(
     params: PcmParams,
     payload_phys: u64,
     payload_len: u32,
 ) -> Result<(), VirtioPciError> {
-    let g = CONTROLLER.lock();
-    let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
+    let c = probed().ok_or(VirtioPciError::NoQueues)?;
     c.play_buffer_phys(params, payload_phys, payload_len)
 }
 
 #[doc(hidden)]
 pub fn __reset_for_test() {
-    let mut controller = CONTROLLER.lock();
-    let Some(current) = controller.as_ref() else {
+    // Snapshot + release, then take the device's request gate so a
+    // submit that already snapshotted the controller finishes before
+    // the device is reset underneath it (the old whole-function
+    // CONTROLLER hold provided that exclusion implicitly).
+    let Some(current) = probed() else {
         return;
     };
+    let _gate = ReqGate::acquire(&current.req_gate);
     // Do not release queue-backed DMA while the device may still access it.
     // Failing loudly is preferable to either hiding a stale controller or
-    // manufacturing a use-after-free in the host device model.
+    // manufacturing a use-after-free in the host device model. The `Arc`
+    // keeps the allocation alive until the last in-flight snapshot drops.
     assert!(
         current.reset_device(),
         "virtio-snd device did not acknowledge reset"
     );
-    *controller = None;
+    *CONTROLLER.lock() = None;
 }

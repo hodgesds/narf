@@ -748,6 +748,97 @@ fn smoke_filesystem_fifo_eof_on_writer_close() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_filesystem_fifo_eof_on_writer_close);
 
+/// Wrong-direction FIFO access is `FsError::BadFd` (→ -EBADF), never a fake
+/// EOF or a SIGPIPE: Linux fails the fd-mode check in
+/// `fs/read_write.c::vfs_read`/`vfs_write` (FMODE_READ/FMODE_WRITE) before
+/// the pipe op runs.
+fn smoke_filesystem_fifo_wrong_direction_badfd() -> TestResult {
+    use crate::fifo::FifoNode;
+    use crate::{FileOps, FsError};
+
+    let node = FifoNode::new(0x5000, 0o666);
+    let shared = node.fifo_shared().expect("shared");
+    let writer = crate::fifo::FifoHandle::open(shared.clone(), 0x5000, 0o666, 0, 0, false, true);
+    let reader = crate::fifo::FifoHandle::open(shared.clone(), 0x5000, 0o666, 0, 0, true, false);
+
+    let mut buf = [0u8; 4];
+    // Reading the write-only handle: EBADF, not Ok(0) (a fake EOF).
+    if !matches!(
+        fifo_poll_once(writer.read(0, &mut buf)),
+        Some(Err(FsError::BadFd))
+    ) {
+        return TestResult::Fail("read on a write-only FIFO handle was not BadFd");
+    }
+    // Writing the read-only handle: EBADF, not BrokenPipe (which would
+    // additionally raise a bogus SIGPIPE at the syscall layer).
+    if !matches!(
+        fifo_poll_once(reader.write(0, b"x")),
+        Some(Err(FsError::BadFd))
+    ) {
+        return TestResult::Fail("write on a read-only FIFO handle was not BadFd");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_filesystem_fifo_wrong_direction_badfd);
+
+/// PIPE_BUF atomicity on the FIFO ring (`fs/pipe.c::pipe_write`): a write of
+/// ≤ 4096 bytes that doesn't fit writes NOTHING (0 progress → the syscall
+/// layer parks or EAGAINs); a larger write may land a partial prefix. And
+/// `poll_readiness` follows `pipe_poll`: POLLERR (not POLLOUT-forever) once
+/// the readers are gone, POLLIN only while data is queued.
+fn smoke_filesystem_fifo_pipe_buf_atomic_and_poll() -> TestResult {
+    use crate::fifo::FifoNode;
+    use crate::{FileOps, POLL_ERR, POLL_HUP, POLL_IN, POLL_OUT};
+
+    let node = FifoNode::new(0x6000, 0o666);
+    let shared = node.fifo_shared().expect("shared");
+    let writer = crate::fifo::FifoHandle::open(shared.clone(), 0x6000, 0o666, 0, 0, false, true);
+    let reader = crate::fifo::FifoHandle::open(shared.clone(), 0x6000, 0o666, 0, 0, true, false);
+
+    // Fill to capacity − 50.
+    let chunk = alloc::vec![0x5Au8; 4096];
+    for _ in 0..16 {
+        match fifo_poll_once(writer.write(0, &chunk)) {
+            Some(Ok(n)) if n == chunk.len() => {}
+            _ => return TestResult::Fail("filling the FIFO failed"),
+        }
+    }
+    let mut drain = [0u8; 50];
+    if !matches!(fifo_poll_once(reader.read(0, &mut drain)), Some(Ok(50))) {
+        return TestResult::Fail("draining 50 bytes failed");
+    }
+    // 100 ≤ PIPE_BUF into 50 bytes of room: atomic → 0 progress.
+    if !matches!(fifo_poll_once(writer.write(0, &chunk[..100])), Some(Ok(0))) {
+        return TestResult::Fail("short-room ≤PIPE_BUF FIFO write was split, not atomic");
+    }
+    // The refusal must want the syscall layer to PARK (reader still open).
+    if !writer.write_should_block() {
+        return TestResult::Fail("0-progress FIFO write with a live reader should block");
+    }
+    // > PIPE_BUF may land the partial 50-byte prefix.
+    let big = alloc::vec![0xA5u8; 8192];
+    if !matches!(fifo_poll_once(writer.write(0, &big)), Some(Ok(50))) {
+        return TestResult::Fail("> PIPE_BUF FIFO write did not land the partial prefix");
+    }
+    // Full again: writer side has no room → no POLLOUT; readers alive → no
+    // POLLERR; reader side has data → POLLIN, writers alive → no POLLHUP.
+    if writer.poll_readiness() & (POLL_OUT | POLL_ERR) != 0 {
+        return TestResult::Fail("full FIFO with live reader reported POLLOUT/POLLERR");
+    }
+    if reader.poll_readiness() & (POLL_IN | POLL_HUP) != POLL_IN {
+        return TestResult::Fail("FIFO with data + live writer was not bare POLLIN");
+    }
+    // Drop the reader: the write side must flip to POLLERR (pipe_poll:
+    // "if (!pipe->readers) mask |= EPOLLERR").
+    drop(reader);
+    let mask = writer.poll_readiness();
+    if mask & POLL_ERR == 0 {
+        return TestResult::Fail("reader-less FIFO write side did not report POLLERR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_filesystem_fifo_pipe_buf_atomic_and_poll);
+
 /// A write with NO readers left is a broken pipe (`FsError::BrokenPipe`), which
 /// the syscall layer turns into SIGPIPE + -EPIPE.
 fn smoke_filesystem_fifo_broken_pipe_no_readers() -> TestResult {

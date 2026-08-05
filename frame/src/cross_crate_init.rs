@@ -95,6 +95,11 @@ fn install_console_signal_hook() {
     narf_filesystem::devfs_pty::install_pty_signal_hook(
         narf_userspace::handlers::deliver_signal_to_pgrp,
     );
+    // Ownership of each new /dev/pts/<N>: Linux stamps the ptmx opener's
+    // fsuid/fsgid on the slave inode, and the node is mode 0620. Without
+    // this the slave stays root-owned and no non-root graphical session can
+    // open a terminal.
+    narf_filesystem::devfs_pty::install_pty_creds_hook(narf_userspace::handlers::pty_open_fs_ids);
 }
 
 #[cfg(feature = "linux-compat")]

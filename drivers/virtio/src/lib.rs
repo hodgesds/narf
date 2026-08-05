@@ -27,6 +27,7 @@ pub mod p9_pci;
 pub mod pci;
 pub mod pmem_pci;
 pub mod queue;
+pub(crate) mod req_gate;
 pub mod rng_pci;
 pub mod scsi_pci;
 pub mod snd_pci;

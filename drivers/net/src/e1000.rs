@@ -1514,8 +1514,13 @@ async fn e1000_tx_pump(device: Arc<E1000>, mut tx_cons: Consumer<Frame, TX_RING_
 /// SendFn registered with `narf_net::iface` at probe time. Routes
 /// the kernel-side TCP stack's outbound frames through E1000::tx.
 fn e1000_send_frame(frame: &[u8]) -> Result<(), ()> {
-    let g = CONTROLLER.lock();
-    let ctrl = g.as_ref().ok_or(())?;
+    // Clone the Arc out rather than holding the IRQ-masking CONTROLLER
+    // lock across `tx`, which busy-polls the DD bit for up to 250 ms.
+    // Holding it here masked interrupts on this CPU for the whole
+    // hardware wait and made every concurrent sender (and the RX pump)
+    // spin on the same lock, interrupts masked — a thundering herd that
+    // starves timers and RCU. See `probed_controller`.
+    let ctrl = probed_controller().ok_or(())?;
     ctrl.tx(frame).map_err(|_| ())
 }
 
@@ -1525,12 +1530,14 @@ fn e1000_send_frame(frame: &[u8]) -> Result<(), ()> {
 /// boot.
 pub fn rx_pump_step() -> bool {
     let mut buf = [0u8; 1600];
-    let n = {
-        let g = CONTROLLER.lock();
-        match g.as_ref() {
-            Some(c) => c.rx_recv(&mut buf),
-            None => 0,
-        }
+    // Same shape as `e1000_send_frame`: don't hold CONTROLLER across the
+    // ring drain, or a TX stuck in its 250 ms DD poll under the same
+    // lock stalls RX (and vice versa) with interrupts masked. `rx_recv`
+    // serializes against other RX consumers on the controller's own
+    // `rx_head` lock.
+    let n = match probed_controller() {
+        Some(c) => c.rx_recv(&mut buf),
+        None => 0,
     };
     if n == 0 {
         return false;
@@ -1814,8 +1821,27 @@ pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
+/// Clone the installed controller handle, holding `CONTROLLER` only for
+/// the refcount bump.
+///
+/// `CONTROLLER` is an `IrqSafeSpinLock`, so holding it across a device
+/// round-trip masks interrupts on the waiting CPU for the whole wait and
+/// forces every other CPU touching the NIC to spin with interrupts
+/// masked too — `tx` busy-polls the descriptor DD bit for up to 250 ms,
+/// which starves timers and RCU exactly like the virtio-blk CONTROLLER
+/// herd. Cloning the `Arc` out instead keeps the device alive without
+/// any lock held; mutual exclusion on the rings is provided by the
+/// controller's own `tx_tail`/`rx_head` locks, which are held only
+/// across the bounded descriptor post/drain, never across the DD poll.
+pub fn probed_controller() -> Option<Arc<E1000>> {
+    CONTROLLER.lock().clone()
+}
+
+/// Run `f` against the probed controller WITHOUT holding `CONTROLLER`
+/// for the duration — see [`probed_controller`]. `f` may block or poll
+/// the device; interrupts keep their caller-supplied state throughout.
 pub fn with_controller<R>(f: impl FnOnce(&E1000) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(|a| f(a))
+    probed_controller().map(|a| f(&a))
 }
 
 /// IRQ-driven RX. Constructs the `wait_for_irq` future *before*
@@ -1825,7 +1851,7 @@ pub fn with_controller<R>(f: impl FnOnce(&E1000) -> R) -> Option<R> {
 /// returns the byte count. Returns 0 if no controller is bound or
 /// no IRQ vector is wired (caller should fall back to `rx_recv`).
 pub async fn rx_async(out: &mut [u8]) -> usize {
-    let vector = match CONTROLLER.lock().as_ref().and_then(|c| c.irq_vector) {
+    let vector = match with_controller(|c| c.irq_vector).flatten() {
         Some(v) => v,
         None => return 0,
     };
@@ -1863,7 +1889,7 @@ pub async fn rx_async(out: &mut [u8]) -> usize {
 /// the caller on the IRQ instead of spinning on DD. Falls back to
 /// the polled `tx` path if no IRQ vector is wired.
 pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
-    let vector = match CONTROLLER.lock().as_ref().and_then(|c| c.irq_vector) {
+    let vector = match with_controller(|c| c.irq_vector).flatten() {
         Some(v) => v,
         None => {
             // No IRQ wired — synchronous path is the only option.

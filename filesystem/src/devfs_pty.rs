@@ -343,6 +343,25 @@ pub struct Pty {
     /// Allocation index; becomes the `/dev/pts/<N>` name.
     pub(crate) index: u32,
 
+    /// Owner of the `/dev/pts/<N>` slave node, captured from the task that
+    /// opened `/dev/ptmx`.
+    ///
+    /// Linux `fs/devpts/inode.c::devpts_pty_new`:
+    /// ```c
+    /// inode->i_uid = opts->setuid ? opts->uid : current_fsuid();
+    /// inode->i_gid = opts->setgid ? opts->gid : current_fsgid();
+    /// ```
+    /// Ownership MUST follow the opener: the slave is mode 0620, so a
+    /// hardcoded root owner makes every `open("/dev/pts/N")` by an ordinary
+    /// desktop user fail with EACCES — which is exactly how a terminal
+    /// emulator dies inside a normal (uid != 0) graphical session.
+    // LINUX-GAP: devpts `uid=`/`gid=` mount options are still not parsed
+    // (see the module header), so the `opts->setuid`/`setgid` branches above
+    // have no equivalent here and the caller's credentials always win.
+    pub(crate) uid: AtomicU32,
+    /// Group of the slave node — `current_fsgid()` at ptmx-open time.
+    pub(crate) gid: AtomicU32,
+
     /// Wave-76: per-tty foreground process group (TIOCSPGRP/TIOCGPGRP).
     /// Owned per pair so a write to a PTY master/slave does NOT clobber
     /// the global console's fg_pgrp. 0 = unset; tcsetpgrp(3) installs.
@@ -368,7 +387,7 @@ impl core::fmt::Debug for Pty {
 }
 
 impl Pty {
-    fn new(index: u32) -> Self {
+    fn new(index: u32, uid: u32, gid: u32) -> Self {
         Self {
             input: IrqSafeSpinLock::new(crate::ntty::LineState::new()),
             slave_tx_to_master: ByteRing::new(),
@@ -377,6 +396,8 @@ impl Pty {
             sid: AtomicU32::new(0),
             pgid: AtomicU32::new(0),
             index,
+            uid: AtomicU32::new(uid),
+            gid: AtomicU32::new(gid),
             fg_pgrp: AtomicU64::new(0),
             // Linux: ptmx_open() starts with the slave locked. unlockpt()
             // clears via TIOCSPTLCK(0) before the slave can be opened.
@@ -398,11 +419,42 @@ static PTY_TABLE: IrqSafeSpinLock<Vec<(u32, Arc<Pty>)>> = IrqSafeSpinLock::new(V
 
 static NEXT_PTY_INDEX: AtomicU32 = AtomicU32::new(0);
 
+/// `fn() -> (fsuid, fsgid)` for the calling task, installed by userspace.
+///
+/// Stored as a raw `usize` so this crate needs no dependency on the
+/// userspace credential table (mirrors `PTY_SIGNAL_HOOK` above). Until it
+/// is installed — in-kernel tests and very early boot — PTYs are opened on
+/// behalf of root, matching the credentials those callers actually run with.
+static PTY_CREDS_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the current-credentials accessor used to own new PTY slaves.
+pub fn install_pty_creds_hook(hook: fn() -> (u32, u32)) {
+    PTY_CREDS_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Credentials to stamp on a new slave node; `(0, 0)` when no hook is set.
+fn current_pty_creds() -> (u32, u32) {
+    let raw = PTY_CREDS_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        return (0, 0);
+    }
+    // SAFETY: `raw` was stored by `install_pty_creds_hook` from a
+    // `fn() -> (u32, u32)`, the only writer of this slot, and function
+    // pointers are never unmapped.
+    let hook: fn() -> (u32, u32) = unsafe { core::mem::transmute(raw) };
+    hook()
+}
+
 /// Allocate a fresh PTY index, create the shared `Pty`, and register it.
 /// Returns `(index, Arc<Pty>)`.
+///
+/// Called in the syscall context of `open("/dev/ptmx")`, so the credentials
+/// sampled here are the opener's — which is precisely what Linux stamps on
+/// the slave inode.
 pub fn ptmx_open() -> (u32, Arc<Pty>) {
     let index = NEXT_PTY_INDEX.fetch_add(1, Ordering::Relaxed);
-    let pty = Arc::new(Pty::new(index));
+    let (uid, gid) = current_pty_creds();
+    let pty = Arc::new(Pty::new(index, uid, gid));
     PTY_TABLE.lock().push((index, Arc::clone(&pty)));
     (index, pty)
 }
@@ -1120,8 +1172,14 @@ impl FileOps for PtySlave {
         0xd001_0000_0000_0000 | self.rdev().wrapping_add(1)
     }
 
+    /// The opener of `/dev/ptmx` owns the slave — see [`Pty::uid`]. With the
+    /// 0620 mode above, reporting root here instead denies the slave to every
+    /// non-root session.
     fn owners(&self) -> (u32, u32) {
-        (0, 5)
+        (
+            self.pty.uid.load(Ordering::Acquire),
+            self.pty.gid.load(Ordering::Acquire),
+        )
     }
 
     /// Wave-76: slave-side ioctls.

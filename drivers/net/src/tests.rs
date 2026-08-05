@@ -101,6 +101,49 @@ fn smoke_e1000_bring_up_and_tx() -> TestResult {
 }
 kernel_test_in!("drivers/net/e1000", smoke_e1000_bring_up_and_tx);
 
+/// The installed controller must never be replaced by a repeat probe.
+///
+/// `e1000::probed_controller` clones the `Arc` out of `CONTROLLER` and
+/// releases the lock, so callers run whole device round-trips (the
+/// 250 ms TX DD poll) against that handle with no lock held and
+/// interrupts enabled. The `Arc` makes that memory-safe regardless, but
+/// the driver's correctness still rests on `probe`'s install-once early
+/// return: if a re-probe ever built a SECOND `E1000` for the same
+/// silicon, old handles would keep driving the rings while the new
+/// instance reprogrammed them underneath. Pin the invariant: probing
+/// again must hand back the same controller, before and after traffic.
+fn smoke_e1000_controller_handle_is_stable() -> TestResult {
+    use crate::e1000;
+    use narf_bus::{bootstrap_registry_authority, probe_all_pci};
+
+    if !e1000::is_probed() {
+        return TestResult::Skip("e1000 not probed");
+    }
+    let before = match e1000::probed_controller() {
+        Some(c) => alloc::sync::Arc::as_ptr(&c) as usize,
+        None => return TestResult::Fail("probed controller has no handle"),
+    };
+
+    // A repeat probe must be refused, not install a fresh controller.
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    match e1000::probed_controller().map(|c| alloc::sync::Arc::as_ptr(&c) as usize) {
+        Some(a) if a == before => {}
+        Some(_) => return TestResult::Fail("re-probe REPLACED the installed controller"),
+        None => return TestResult::Fail("re-probe removed the installed controller"),
+    }
+
+    // And it must survive ordinary traffic through the unlocked path.
+    let mut buf = [0u8; 64];
+    let _ = e1000::with_controller(|c| c.rx_recv(&mut buf));
+    match e1000::probed_controller().map(|c| alloc::sync::Arc::as_ptr(&c) as usize) {
+        Some(a) if a == before => TestResult::Pass,
+        Some(_) => TestResult::Fail("controller handle changed across I/O"),
+        None => TestResult::Fail("controller vanished across I/O"),
+    }
+}
+kernel_test_in!("drivers/net/e1000", smoke_e1000_controller_handle_is_stable);
+
 fn smoke_e1000_rx_arp_request() -> TestResult {
     // Build + transmit an ARP "who has 10.0.2.2 tell us" frame, then
     // poll RX for ~250 ms. QEMU's user-mode backend at 10.0.2.2

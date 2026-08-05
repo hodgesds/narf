@@ -61,6 +61,9 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     enum WriteError {
         BrokenPipe,
         NoSpace,
+        /// Descriptor's open mode forbids writing (a pipe read end):
+        /// -EBADF, per the FMODE_WRITE check in `fs/read_write.c::vfs_write`.
+        BadFd,
         Other,
     }
     let outcome = Some({
@@ -78,6 +81,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
             // A write to a FIFO / pipe with no remaining readers: SIGPIPE + EPIPE.
             Err(narf_filesystem::FsError::BrokenPipe) => Err(WriteError::BrokenPipe),
             Err(narf_filesystem::FsError::NoSpace) => Err(WriteError::NoSpace),
+            Err(narf_filesystem::FsError::BadFd) => Err(WriteError::BadFd),
             Err(_) => Err(WriteError::Other),
         }
     });
@@ -90,39 +94,11 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
                 return;
             }
-            if let (Some(uctx), Some(hook)) = (
-                crate::user_task::current_user_task(),
-                crate::user_task::yield_hook(),
-            ) {
-                let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-                // Rewind past the 2-byte `syscall`/`int 0x80` so re-entry re-runs
-                // this write with its original args.
-                let resume_rip = ctx.rip().wrapping_sub(2);
-                ctx.set_rip(resume_rip);
-                // SAFETY: `uctx` is the live per-task UserTaskCtx; we hold the
-                // only reference while setting the park deadline + saving the
-                // RIP-rewound state before the yield hook hands off the task.
-                unsafe {
-                    let uc = &*uctx;
-                    uc.sleep_deadline_ns
-                        .store(dl, core::sync::atomic::Ordering::Release);
-                    uc.futex_uaddr
-                        .store(0, core::sync::atomic::Ordering::Release);
-                    uc.net_io_wait
-                        .store(true, core::sync::atomic::Ordering::Release);
-                    uc.epoll_park_gen.store(
-                        narf_net::readiness::generation(),
-                        core::sync::atomic::Ordering::Release,
-                    );
-                    ctx.save_user_state(uc.state.get() as *mut u8);
-                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                    if narf_scheduler::stackful::user_own_stack_enabled() {
-                        own_stack_block(ctx);
-                        return;
-                    }
-                    hook(uctx);
-                }
-                // unreachable — hook() longjmps to the executor
+            // Park on net-I/O readiness (a reader's drain wakes the writer
+            // promptly, ~1ms backstop) and RE-EXECUTE this write on resume.
+            // See `park_reexecute_on_io`.
+            if park_reexecute_on_io(ctx) {
+                return;
             }
             // No executor (kernel-test context): fall back to a 0-byte write.
             ctx.set_return(SyscallReturn::ok(0));
@@ -144,6 +120,11 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         }
         Some(Err(WriteError::NoSpace)) => {
             ctx.set_return(SyscallReturn::ok((-28i64) as u64)); // -ENOSPC
+        }
+        // Wrong-direction descriptor (writing a pipe read end) → -EBADF;
+        // no SIGPIPE — Linux never reaches the pipe op for these.
+        Some(Err(WriteError::BadFd)) => {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64));
         }
         // TODO(linux-gap): bad fd should be -EBADF, but this `_` also catches
         // write rejections (e.g. sealed memfd → -EPERM) — needs a split.

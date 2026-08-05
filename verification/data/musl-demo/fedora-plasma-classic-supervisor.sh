@@ -42,10 +42,53 @@ else
   echo "PLASMA-CLASSIC-SUPERVISOR ksm observed"
 fi
 
+# The compositor reaches the scanout (kernel DRM telemetry shows SETCRTC +
+# PAGE_FLIP blits) but never repaints after startup, so the desktop stays
+# black. That has two very different explanations: KWin cannot present a
+# CLIENT's surface at all, or plasmashell specifically never produces one.
+# Report the socket the clients will use, then run a minimal wl_shm client
+# beside the shell so one replay separates those cases.
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+  for sock in "$XDG_RUNTIME_DIR"/wayland-[0-9]*; do
+    case "$sock" in
+      *.lock) continue ;;
+    esac
+    [ -S "$sock" ] || continue
+    WAYLAND_DISPLAY=${sock##*/}
+    export WAYLAND_DISPLAY
+    break
+  done
+fi
+echo "PLASMA-CLASSIC-SUPERVISOR WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-<unset>}"
+
 echo "PLASMA-CLASSIC-SUPERVISOR launching plasmashell"
-/usr/bin/plasmashell &
+# Scoped to this one process: the question is whether the SHELL builds a
+# Wayland surface and attaches buffers, and the compositor's own Qt client
+# traffic would only add noise.
+QT_LOGGING_RULES="${QT_LOGGING_RULES:-};qt.qpa.wayland.debug=true" \
+  /usr/bin/plasmashell &
 plasma_pid=$!
 echo "PLASMA-CLASSIC-SUPERVISOR plasmashell pid=$plasma_pid"
+
+# foot is a small, self-contained wl_shm client: xdg-shell surface, no Qt,
+# no QML, no GPU path. If it paints while plasmashell does not, the
+# compositor's client-surface path is fine and the shell is the blocker.
+(
+  /usr/bin/sleep 20
+  echo "PLASMA-CLASSIC-SUPERVISOR launching foot control client"
+  # libwayland's own protocol tracer. KWin presents its startup frames and
+  # then never repaints, which means it is compositing an empty scene: no
+  # client window is ever mapped. This shows the exact request/event where
+  # the map handshake stops — in particular whether the client's
+  # xdg_surface.configure ever arrives, since without it a client may not
+  # attach a buffer and the compositor has nothing to draw.
+  WAYLAND_DEBUG=1 \
+    /usr/bin/foot --log-level=info /bin/sh -c 'while :; do /usr/bin/sleep 5; done' &
+  foot_pid=$!
+  echo "PLASMA-CLASSIC-SUPERVISOR foot pid=$foot_pid"
+  wait "$foot_pid"
+  echo "PLASMA-CLASSIC-SUPERVISOR foot exited status=$?"
+) &
 
 # Retain the helper for the shell's lifetime so an early exit is visible in
 # the serial record rather than becoming an unobserved background failure.
