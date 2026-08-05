@@ -296,6 +296,18 @@ fi
 # it, with no polkit involved. user@.service in turn pulls in
 # user-runtime-dir@1000.service, which creates /run/user/1000 — where the
 # manager publishes the session bus the session then connects to.
+#
+# QV4_FORCE_INTERPRETER / QT_ENABLE_REGEXP_JIT below: NARF enforces W^X —
+# nothing grants a W|X end state and the RW->RX flip needs CapKind::Jit
+# (userspace mprotect_core). Qt's QML JIT allocator performs exactly that
+# flip and gets EINVAL, which the journal shows as "mprotect failed in
+# ExecutableAllocator::makeWritable: Invalid argument". Run QML interpreted
+# rather than weaken a deliberate kernel security property for bring-up
+# convenience; plasmashell is QML-heavy so this sits on its critical path.
+#
+# NOTE: keep comments OUT of the printf argument list below. A `#` inside a
+# line-continued arg list silently swallows every remaining argument, and
+# `bash -n` still passes — so the unit file loses its ExecStart with no error.
 printf '%s\n' \
   '[Unit]' \
   'Description=NARF Plasma Wayland Session' \
@@ -317,6 +329,8 @@ printf '%s\n' \
   'Environment=XKB_DEFAULT_LAYOUT=us' \
   'Environment=QT_LOGGING_RULES=org.kde.kcminit.debug=true;kwin_core.debug=true;kwin_wayland_drm.debug=true;kwin_scene_opengl.debug=true;kwin_qpainter.debug=true' \
   'Environment=QT_QPA_PLATFORM=wayland' \
+  'Environment=QV4_FORCE_INTERPRETER=1' \
+  'Environment=QT_ENABLE_REGEXP_JIT=0' \
   'Environment=KWIN_DRM_NO_AMS=1' \
   'Environment=KWIN_COMPOSE=Q' \
   'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \
