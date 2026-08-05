@@ -1441,11 +1441,11 @@ fn smoke_abi_fsx_open_permission_denied_is_eacces() -> TestResult {
         // test task at uid 1000 and cascade into every later test.
         let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
         match opened {
-            Some(v) if v as i64 == EACCES => Ok(()),
-            Some(v) if v as i64 == EPERM => {
+            Some(v) if v == EACCES => Ok(()),
+            Some(v) if v == EPERM => {
                 Err("open() denial returned EPERM; Linux open(2) specifies EACCES")
             }
-            Some(v) if (v as i64) >= 0 => {
+            Some(v) if v >= 0 => {
                 // Vacuous-test guard: if the open SUCCEEDED the staging failed
                 // (memfs ignored the chmod, or the uid drop did not take), and
                 // this test would pass no matter what errno the gate returns.
