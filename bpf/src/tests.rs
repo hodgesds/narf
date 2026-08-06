@@ -4138,3 +4138,176 @@ fn smoke_bpf_ringbuf_reserve_null_when_oversize() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_bpf_ringbuf_reserve_null_when_oversize);
+
+// ── RingBuf: the mmap + poll consumer surface (Stage 4) ─────────────
+//
+// `MapFile` is the fd wrapper the `bpf(2)` handler installs; its `FileOps`
+// mmap/poll methods are the userspace zero-copy consumer surface. Both the ring
+// and its fd wrapper live in this crate, so the whole surface — including that
+// the mapped frames ARE the live producer backing — is testable here without a
+// userspace round-trip. The syscall-level `mmap` wiring is covered separately by
+// the `syscall_abi` subsystem.
+
+use crate::map::MapFile;
+use narf_filesystem::{FileOps, FsError, POLL_IN};
+
+/// The u64 living at the start of a physical page, read straight through the
+/// identity map — how a userspace consumer would read a mapped position cell.
+fn mapped_u64(phys: u64) -> u64 {
+    // SAFETY: `phys` is a frame address `mmap_frames` returned; offset 0 is the
+    // naturally aligned position cell, live for the map's lifetime.
+    unsafe { core::ptr::read_volatile(phys as *const u64) }
+}
+
+/// One byte of a mapped data page.
+fn mapped_byte(phys: u64, off: usize) -> u8 {
+    // SAFETY: `phys + off` is inside a data frame `mmap_frames` returned.
+    unsafe { core::ptr::read_volatile((phys as usize + off) as *const u8) }
+}
+
+fn smoke_bpf_ringbuf_mmap_frames_are_live_backing() -> TestResult {
+    checked(|| {
+        // Two data pages, so the frame list is consumer, producer, and two data
+        // pages — four entries.
+        let m = mk_ring(8192).map_err(|_| "RingBuf create failed")?;
+        let mf = MapFile::new(Arc::clone(&m));
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+
+        let page = 4096usize;
+        let total = rb.mmap_page_count();
+        if total != 4 {
+            return Err("an 8 KiB ring did not map as 2 control + 2 data pages");
+        }
+        // Mapping the whole range returns exactly one frame per page, and it
+        // agrees with the ring's own view.
+        let frames =
+            FileOps::mmap_frames(&mf, 0, total * page).map_err(|_| "mmap_frames failed")?;
+        if frames.len() != total || frames != rb.mmap_frames() {
+            return Err("mmap_frames did not return the ring's page frames");
+        }
+        // Every frame is a distinct, page-aligned address.
+        for (i, &f) in frames.iter().enumerate() {
+            if f == 0 || f % page as u64 != 0 {
+                return Err("a mapped frame was null or misaligned");
+            }
+            if frames[..i].contains(&f) {
+                return Err("a frame was mapped twice");
+            }
+        }
+        let consumer_page = frames[0];
+        let producer_page = frames[1];
+        let data_page0 = frames[2];
+
+        // A fresh ring: both positions read zero through the mapping.
+        if mapped_u64(consumer_page) != 0 || mapped_u64(producer_page) != 0 {
+            return Err("a fresh ring's mapped positions were not zero");
+        }
+
+        // The kernel producer writes a record; the mapped producer page and the
+        // mapped data page must reflect it with no copy in between — this is the
+        // whole point of the frame-backed storage.
+        rb.output(b"hello")
+            .map_err(|_| "output rejected a record that fits")?;
+        // producer_pos = 8-byte header + round_up8(5) = 16.
+        if mapped_u64(producer_page) != 16 {
+            return Err("the mapped producer position did not advance to the record footprint");
+        }
+        // The payload lands right after the 8-byte header in data page 0.
+        let expected = b"hello";
+        for (i, &b) in expected.iter().enumerate() {
+            if mapped_byte(data_page0, 8 + i) != b {
+                return Err("the mapped data page did not hold the record the producer wrote");
+            }
+        }
+        // A userspace consumer advances consumer_pos by writing the mapped cell.
+        // The kernel side then agrees the ring is drained.
+        // SAFETY: consumer page offset 0 is the shared consumer position cell.
+        unsafe { core::ptr::write_volatile(consumer_page as *mut u64, 16) };
+        if rb.available_data() != 0 || rb.consumer_pos() != 16 {
+            return Err("advancing the mapped consumer position did not drain the ring");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_mmap_frames_are_live_backing);
+
+fn smoke_bpf_ringbuf_mmap_frames_reject_bad_range() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let mf = MapFile::new(Arc::clone(&m));
+        let page = 4096u64;
+        // A 4 KiB ring is 3 pages (consumer, producer, one data).
+        let total = 3 * page as usize;
+
+        // A misaligned offset, a misaligned length, a zero length, and a range
+        // past the end are each rejected.
+        if FileOps::mmap_frames(&mf, 8, page as usize) != Err(FsError::InvalidData) {
+            return Err("a misaligned offset was accepted");
+        }
+        if FileOps::mmap_frames(&mf, 0, 100) != Err(FsError::InvalidData) {
+            return Err("a misaligned length was accepted");
+        }
+        if FileOps::mmap_frames(&mf, 0, 0) != Err(FsError::InvalidData) {
+            return Err("a zero-length mapping was accepted");
+        }
+        if FileOps::mmap_frames(&mf, 0, total + page as usize) != Err(FsError::InvalidData) {
+            return Err("a range past the end was accepted");
+        }
+        if FileOps::mmap_frames(&mf, total as u64, page as usize) != Err(FsError::InvalidData) {
+            return Err("an offset at the end was accepted");
+        }
+        // A valid sub-range — just the producer-plus-data tail — is the two
+        // frames at offset one page.
+        let tail =
+            FileOps::mmap_frames(&mf, page, 2 * page as usize).map_err(|_| "tail map failed")?;
+        if tail.len() != 2 || tail != m.ringbuf().unwrap().mmap_frames()[1..] {
+            return Err("a valid tail sub-range did not return the right frames");
+        }
+
+        // A keyed map fd has no mmap backing at all.
+        let arr = mk(MapKind::Array, 4, 8, 4).map_err(|_| "Array create failed")?;
+        let amf = MapFile::new(arr);
+        if FileOps::mmap_frames(&amf, 0, page as usize) != Err(FsError::Unsupported) {
+            return Err("a keyed map fd offered an mmap backing");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_mmap_frames_reject_bad_range);
+
+fn smoke_bpf_ringbuf_poll_readiness_tracks_data() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let mf = MapFile::new(Arc::clone(&m));
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+
+        // An empty ring is not readable, but it does advertise prompt notifies.
+        if FileOps::poll_readiness(&mf) != 0 {
+            return Err("an empty ring polled readable");
+        }
+        if !FileOps::readiness_notifies(&mf) {
+            return Err("a ring did not advertise readiness notifies");
+        }
+        // A record makes it readable...
+        rb.output(b"x")
+            .map_err(|_| "output rejected a record that fits")?;
+        if FileOps::poll_readiness(&mf) != POLL_IN {
+            return Err("a ring with data did not poll readable");
+        }
+        // ...and draining it makes it quiescent again.
+        rb.consume_one()
+            .ok_or("consume_one returned None with data present")?;
+        if FileOps::poll_readiness(&mf) != 0 {
+            return Err("a drained ring still polled readable");
+        }
+
+        // A keyed map fd is never readable this way and does not claim notifies.
+        let arr = mk(MapKind::Array, 4, 8, 4).map_err(|_| "Array create failed")?;
+        let amf = MapFile::new(arr);
+        if FileOps::poll_readiness(&amf) != 0 || FileOps::readiness_notifies(&amf) {
+            return Err("a keyed map fd advertised ring readiness");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_poll_readiness_tracks_data);

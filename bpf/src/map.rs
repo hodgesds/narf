@@ -1077,9 +1077,9 @@ impl BpfMap {
         let built = match attr.kind {
             MapKind::Array | MapKind::PerCpuArray => ArrayMap::new(attr).map(MapImpl::Array),
             MapKind::Hash | MapKind::PerCpuHash => HashMap::new(attr).map(MapImpl::Hash),
-            // Infallible past `check_ringbuf_attr` + `charge`: it only
-            // allocates the already-sized, already-charged data area.
-            MapKind::RingBuf => Ok(MapImpl::RingBuf(crate::ringbuf::RingBuf::new(attr))),
+            // Frame-backed, and its own cgroup accountant (see
+            // `footprint_bytes`): fallible if the frames cannot be allocated.
+            MapKind::RingBuf => crate::ringbuf::RingBuf::new(attr).map(MapImpl::RingBuf),
         };
         let ops = match built {
             Ok(o) => o,
@@ -1120,9 +1120,9 @@ impl BpfMap {
 
     /// The ring buffer behind this map, or `None` if it is a keyed kind.
     ///
-    /// The seam the producer path (`bpf_ringbuf_output`) and a future consumer
-    /// (`mmap` + `poll`) reach the stream through, since it is not part of the
-    /// keyed [`BpfMapOps`] surface.
+    /// The seam the producer path (`bpf_ringbuf_output`) and the consumer paths
+    /// ([`MapFile`]'s `mmap`/`poll`, and the in-kernel `consume_one`) reach the
+    /// stream through, since it is not part of the keyed [`BpfMapOps`] surface.
     #[must_use]
     pub fn ringbuf(&self) -> Option<&crate::ringbuf::RingBuf> {
         match &self.ops {
@@ -1247,10 +1247,12 @@ fn uncharge(bytes: u64) {
 /// under-reports.
 fn footprint_bytes(attr: MapAttr) -> u64 {
     if attr.kind == MapKind::RingBuf {
-        // The data area, plus the two control pages a future mmap surface adds
-        // (consumer position, producer position). Charged now so the cap is an
-        // over-estimate rather than an under-count.
-        return u64::from(attr.max_entries) + 2 * u64::from(RINGBUF_PAGE);
+        // A ring buffer's storage is frame-backed (`RingBuf::new` calls
+        // `alloc_pages_on`), and the buddy allocator charges those frames to
+        // the creating task's cgroup itself — data area plus the two control
+        // pages. Charging again here would double-count, so the map layer takes
+        // no separate footprint for a ring.
+        return 0;
     }
     let cpus = cpu_width(attr.kind) as u64;
     let n = u64::from(attr.max_entries);
@@ -1313,6 +1315,54 @@ impl narf_filesystem::FileOps for MapFile {
             mtime_cycles: 0,
         }
     }
+
+    /// `mmap(2)` a ring buffer's shared pages — the zero-copy consumer surface.
+    ///
+    /// The frame list [`crate::ringbuf::RingBuf::mmap_frames`] returns is the
+    /// consumer page, the producer page, then the data pages, in order. Both
+    /// `offset` and `len` are page-aligned by the syscall layer, so this maps
+    /// any aligned sub-range of that list — a consumer typically maps the
+    /// consumer page writable and the producer-plus-data range read-only in two
+    /// calls, the layout libbpf's `ring_buffer__new` expects. A non-ring map fd
+    /// has no `mmap` backing, matching Linux (`ENODEV` on a keyed map).
+    fn mmap_frames(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Result<alloc::vec::Vec<u64>, narf_filesystem::FsError> {
+        let rb = self
+            .map
+            .ringbuf()
+            .ok_or(narf_filesystem::FsError::Unsupported)?;
+        let all = rb.mmap_frames();
+        let page = RINGBUF_PAGE as usize;
+        let total = all.len() * page;
+        let off = offset as usize;
+        // The syscall layer aligns both, but the range must still land inside
+        // the ring's pages.
+        if off % page != 0 || len % page != 0 || len == 0 || off >= total || off + len > total {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        let start = off / page;
+        Ok(all[start..start + len / page].to_vec())
+    }
+
+    /// `poll(2)` readiness: readable exactly when the ring holds an unconsumed
+    /// record. A keyed map fd is never readable this way.
+    fn poll_readiness(&self) -> u32 {
+        match self.map.ringbuf() {
+            Some(rb) if rb.available_data() > 0 => narf_filesystem::POLL_IN,
+            _ => 0,
+        }
+    }
+
+    /// A ring buffer's [`crate::ringbuf::RingBuf::output`] fires a readiness
+    /// `notify` on publish, so a parked `poll`/`epoll` waiter wakes promptly
+    /// rather than only on the fallback re-scan.
+    fn readiness_notifies(&self) -> bool {
+        self.map.ringbuf().is_some()
+    }
+
     /// The hook every fd-to-map recovery goes through.
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)

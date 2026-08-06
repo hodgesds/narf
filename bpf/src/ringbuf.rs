@@ -7,8 +7,9 @@
 //! one of them returns [`MapError::Invalid`], which is exactly what Linux's
 //! `ringbuf_map_*` element ops return (`EINVAL`). It is reached instead through
 //! [`RingBuf::output`] (the producer path, which the `bpf_ringbuf_output` kfunc
-//! will call) and [`RingBuf::consume_one`] (the consumer path, which a future
-//! `mmap` + `poll` surface will replace with a shared-memory protocol).
+//! calls) and, on the consumer side, either [`RingBuf::consume_one`] (an
+//! in-kernel drain, used by tests and any kernel reader) or the shared-memory
+//! `mmap` protocol a userspace consumer drives through [`RingBuf::mmap_frames`].
 //!
 //! ## The wire protocol
 //!
@@ -29,15 +30,34 @@
 //! under the lock and never sets `BUSY`; the split reserve/submit path that
 //! does is a later stage, and the consumer already honours the bit so that path
 //! needs no change here.
+//!
+//! ## Backing storage
+//!
+//! The two positions and the data area live in **physical frames**, not on the
+//! heap, so the same bytes the kernel producer writes can be `mmap`ed straight
+//! into a userspace consumer with no copy. The positions sit at offset zero of
+//! two contiguous control pages — page 0 `consumer_pos`, page 1 `producer_pos`
+//! — as `AtomicU64`s a userspace mapping shares; the data area is one
+//! contiguous block of `data_size` bytes. All three are enumerated by
+//! [`RingBuf::mmap_frames`] in the order userspace expects (consumer, producer,
+//! data). Publication is a `Release` store to `producer_pos` after the payload
+//! is written, and a consumer's `Acquire` load of it is what makes the shared
+//! memory safe across the boundary — Linux's
+//! `smp_store_release`/`smp_load_acquire` ring-buffer discipline.
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_bpf_verifier::kfunc::{ArgDesc, ArgFlags, PtrKind, TypeKey, TypeKind, ValidityDomain};
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_memory::{alloc_pages_on, free_pages, PhysFrame};
 
 use crate::map::{BpfMapOps, MapAttr, MapError};
 use crate::types::BpfType;
+
+/// Bytes in a page — the granularity `mmap` maps at, and the size of each
+/// control page. 4 KiB on both supported arches.
+const PAGE: u64 = 4096;
 
 /// Bytes of record header: a 32-bit length (with flags) + a 32-bit page offset.
 const HDR_LEN: u64 = 8;
@@ -70,18 +90,13 @@ pub enum RingBufError {
     Full,
 }
 
-/// The mutable state, behind the lock.
-#[derive(Debug)]
-struct State {
-    /// `data_size` bytes; indexed by `pos & mask`.
-    buf: Box<[u8]>,
-    /// Next byte the consumer will read. Only the consumer advances it.
-    consumer_pos: u64,
-    /// Next byte the producer will write. Only a producer advances it.
-    producer_pos: u64,
-}
-
 /// A `BPF_MAP_TYPE_RINGBUF`.
+///
+/// The positions and the data area are frame-backed (see the module's *Backing
+/// storage* note) so a userspace consumer can `mmap` the very bytes the kernel
+/// producer writes. `PhysFrame` is a plain physical address, so every field is
+/// `Send`/`Sync`; the atomics and the producer lock are what make concurrent
+/// access sound.
 #[derive(Debug)]
 pub struct RingBuf {
     /// The map shape, so [`BpfMapOps::attr`] can report it. `key_size` and
@@ -91,29 +106,86 @@ pub struct RingBuf {
     data_size: u64,
     /// `data_size - 1`, for masking an offset to a physical index.
     mask: u64,
-    state: IrqSafeSpinLock<State>,
+    /// Buddy order of the [`data`](Self::data) block: `log2(data_size / PAGE)`.
+    data_order: u8,
+    /// Two contiguous control pages. Page 0 holds `consumer_pos`, page 1 holds
+    /// `producer_pos`, each an `AtomicU64` at offset zero shared with userspace.
+    control: PhysFrame,
+    /// The contiguous data area, `data_size` bytes, indexed by `pos & mask`.
+    data: PhysFrame,
+    /// Serialises producers and guards the data writes plus the `producer_pos`
+    /// publish. The consumer is lock-free: it reads `producer_pos` with
+    /// `Acquire` and advances only `consumer_pos`.
+    producer_lock: IrqSafeSpinLock<()>,
 }
 
 impl RingBuf {
     /// Create a ring buffer whose data area is `attr.max_entries` bytes.
     ///
     /// The caller ([`crate::map::BpfMap::create`]) has already validated that
-    /// `max_entries` is a non-zero power of two and a page multiple, and has
-    /// charged the footprint, so this only allocates.
-    #[must_use]
-    pub fn new(attr: MapAttr) -> Self {
+    /// `max_entries` is a non-zero power of two and a page multiple. The frames
+    /// are allocated here, and the buddy allocator is the ring's cgroup
+    /// accountant — the map layer takes no separate footprint charge for a ring
+    /// (see `footprint_bytes`).
+    ///
+    /// # Errors
+    ///
+    /// [`MapError::NoMemory`] if either the control pages or the data block
+    /// cannot be allocated (including a `memory.max` denial).
+    pub fn new(attr: MapAttr) -> Result<Self, MapError> {
         let data_size = u64::from(attr.max_entries);
-        let buf = alloc::vec![0u8; data_size as usize].into_boxed_slice();
-        Self {
+        // data_size is a page-multiple power of two, so its page count is a
+        // power of two and this is its exact buddy order.
+        let data_order = (data_size / PAGE).trailing_zeros() as u8;
+        // The two control pages are one order-1 (2-page) contiguous block.
+        let control = alloc_pages_on(0, 1).map_err(|_| MapError::NoMemory)?;
+        let data = match alloc_pages_on(0, data_order) {
+            Ok(f) => f,
+            Err(_) => {
+                free_pages(control, 1);
+                return Err(MapError::NoMemory);
+            }
+        };
+        // Positions start at zero and the data area must read clean until
+        // written.
+        // SAFETY: both blocks are freshly allocated, owned here, and
+        // identity-mapped for their full extents (2 pages / `data_size` bytes).
+        unsafe {
+            core::ptr::write_bytes(
+                control.start_address().raw() as *mut u8,
+                0,
+                (2 * PAGE) as usize,
+            );
+            core::ptr::write_bytes(data.start_address().raw() as *mut u8, 0, data_size as usize);
+        }
+        Ok(Self {
             attr,
             data_size,
             mask: data_size - 1,
-            state: IrqSafeSpinLock::new(State {
-                buf,
-                consumer_pos: 0,
-                producer_pos: 0,
-            }),
-        }
+            data_order,
+            control,
+            data,
+            producer_lock: IrqSafeSpinLock::new(()),
+        })
+    }
+
+    /// The `consumer_pos` cell, at offset zero of control page 0.
+    fn consumer(&self) -> &AtomicU64 {
+        // SAFETY: control page 0 is a live identity-mapped frame; offset zero is
+        // a naturally aligned `u64` shared with the userspace consumer mapping.
+        unsafe { &*(self.control.start_address().raw() as *const AtomicU64) }
+    }
+
+    /// The `producer_pos` cell, at offset zero of control page 1.
+    fn producer(&self) -> &AtomicU64 {
+        // SAFETY: control page 1 is the second frame of the order-1 block;
+        // offset zero there is a naturally aligned `u64`.
+        unsafe { &*((self.control.start_address().raw() + PAGE) as *const AtomicU64) }
+    }
+
+    /// The base of the contiguous data area.
+    fn data_ptr(&self) -> *mut u8 {
+        self.data.start_address().raw() as *mut u8
     }
 
     /// The data-area size in bytes.
@@ -126,20 +198,21 @@ impl RingBuf {
     /// `BPF_RB_AVAIL_DATA` answer.
     #[must_use]
     pub fn available_data(&self) -> u64 {
-        let st = self.state.lock();
-        st.producer_pos.wrapping_sub(st.consumer_pos)
+        let prod = self.producer().load(Ordering::Acquire);
+        let cons = self.consumer().load(Ordering::Acquire);
+        prod.wrapping_sub(cons)
     }
 
     /// The producer position — total bytes ever reserved. `BPF_RB_PROD_POS`.
     #[must_use]
     pub fn producer_pos(&self) -> u64 {
-        self.state.lock().producer_pos
+        self.producer().load(Ordering::Acquire)
     }
 
     /// The consumer position — total bytes ever drained. `BPF_RB_CONS_POS`.
     #[must_use]
     pub fn consumer_pos(&self) -> u64 {
-        self.state.lock().consumer_pos
+        self.consumer().load(Ordering::Acquire)
     }
 
     /// Whether a record of `len` payload bytes would fit right now.
@@ -153,16 +226,22 @@ impl RingBuf {
         if need > self.data_size {
             return false;
         }
-        let st = self.state.lock();
-        need <= self.data_size - st.producer_pos.wrapping_sub(st.consumer_pos)
+        let _guard = self.producer_lock.lock();
+        let used = self
+            .producer()
+            .load(Ordering::Relaxed)
+            .wrapping_sub(self.consumer().load(Ordering::Acquire));
+        need <= self.data_size - used
     }
 
     /// Append one record carrying `data`, atomically.
     ///
     /// The producer path a `bpf_ringbuf_output` call takes: reserve, copy, and
     /// commit under one lock, so a partially written record is never visible.
-    /// The payload is copied *before* `producer_pos` advances, so a consumer
-    /// reading `producer_pos` only ever sees fully written records.
+    /// The payload is copied *before* `producer_pos` advances (a `Release`
+    /// store), so a consumer whose `Acquire` load sees the new position also
+    /// sees the whole record. On success a readiness `notify` wakes any parked
+    /// `poll`/`epoll` consumer promptly.
     ///
     /// # Errors
     ///
@@ -176,41 +255,47 @@ impl RingBuf {
         if len > u64::from(LEN_MASK) || need > self.data_size {
             return Err(RingBufError::RecordTooBig);
         }
-        let mut st = self.state.lock();
-        let used = st.producer_pos.wrapping_sub(st.consumer_pos);
-        if need > self.data_size - used {
-            return Err(RingBufError::Full);
+        {
+            let _guard = self.producer_lock.lock();
+            let ppos = self.producer().load(Ordering::Relaxed);
+            let used = ppos.wrapping_sub(self.consumer().load(Ordering::Acquire));
+            if need > self.data_size - used {
+                return Err(RingBufError::Full);
+            }
+            let base = self.data_ptr();
+            // SAFETY: `base .. base + data_size` is the live contiguous data
+            // area; the producer lock gives this writer exclusive access to it,
+            // and every offset is masked into range. Payload first, then a
+            // committed (non-`BUSY`) header.
+            unsafe {
+                copy_in(base, self.data_size, self.mask, ppos + HDR_LEN, data);
+                write_header(base, self.mask, ppos, len as u32);
+            }
+            // Publish: the consumer's `Acquire` load pairs with this store.
+            self.producer().store(ppos + need, Ordering::Release);
         }
-        let ppos = st.producer_pos;
-        // Payload first, then a committed (non-`BUSY`) header, then publish by
-        // advancing `producer_pos`.
-        copy_in(&mut st.buf, self.mask, ppos + HDR_LEN, data);
-        write_header(&mut st.buf, self.mask, ppos, len as u32);
-        st.producer_pos = ppos + need;
+        narf_net::readiness::notify(0);
         Ok(())
     }
 
     /// Drain the next readable record, or `None` if the ring is caught up or its
     /// head record is still being written.
     ///
-    /// Skips abandoned ([`DISCARD`]) records. Allocates the returned `Vec`, so
-    /// it is a consumer-side (not program-side) call — the eventual `mmap`
-    /// surface reads in place without copying.
+    /// The in-kernel consumer; a userspace consumer instead reads the `mmap`ed
+    /// frames directly. Skips abandoned ([`DISCARD`]) records. Allocates the
+    /// returned `Vec` — the `mmap` surface reads in place without copying.
     #[must_use]
     pub fn consume_one(&self) -> Option<Vec<u8>> {
-        let mut st = self.state.lock();
+        let base = self.data_ptr();
         loop {
-            if st.consumer_pos >= st.producer_pos {
+            let cpos = self.consumer().load(Ordering::Relaxed);
+            let ppos = self.producer().load(Ordering::Acquire);
+            if cpos >= ppos {
                 return None;
             }
-            let hpos = st.consumer_pos;
-            let hoff = (hpos & self.mask) as usize;
-            let len_word = u32::from_le_bytes([
-                st.buf[hoff],
-                st.buf[hoff + 1],
-                st.buf[hoff + 2],
-                st.buf[hoff + 3],
-            ]);
+            // SAFETY: `base` spans the live data area; the header at `cpos` is
+            // within it and, being 8-aligned, never straddles the wrap.
+            let len_word = unsafe { read_len_word(base, self.mask, cpos) };
             // A record still being written blocks everything behind it.
             if len_word & BUSY != 0 {
                 return None;
@@ -218,46 +303,124 @@ impl RingBuf {
             let len = u64::from(len_word & LEN_MASK);
             let total = HDR_LEN + round_up8(len);
             if len_word & DISCARD != 0 {
-                st.consumer_pos = hpos + total;
+                self.consumer().store(cpos + total, Ordering::Release);
                 continue;
             }
-            let out = copy_out(&st.buf, self.mask, hpos + HDR_LEN, len as usize);
-            st.consumer_pos = hpos + total;
+            // SAFETY: same live data area; `[cpos + HDR_LEN, + len)` is a fully
+            // written payload, published by the producer's `Release` store the
+            // `Acquire` load above paired with.
+            let out = unsafe {
+                copy_out(
+                    base,
+                    self.data_size,
+                    self.mask,
+                    cpos + HDR_LEN,
+                    len as usize,
+                )
+            };
+            self.consumer().store(cpos + total, Ordering::Release);
             return Some(out);
         }
+    }
+
+    /// The number of pages a userspace `mmap` of this ring spans: the two
+    /// control pages plus the data pages.
+    #[must_use]
+    pub fn mmap_page_count(&self) -> usize {
+        2 + (self.data_size / PAGE) as usize
+    }
+
+    /// Physical frame addresses backing a userspace `mmap`, in the order
+    /// userspace expects: the consumer page, the producer page, then each data
+    /// page. One entry per 4 KiB page, exactly [`mmap_page_count`] long.
+    ///
+    /// [`mmap_page_count`]: Self::mmap_page_count
+    #[must_use]
+    pub fn mmap_frames(&self) -> Vec<u64> {
+        let mut frames = Vec::with_capacity(self.mmap_page_count());
+        let control = self.control.start_address().raw();
+        frames.push(control);
+        frames.push(control + PAGE);
+        let data = self.data.start_address().raw();
+        for i in 0..(self.data_size / PAGE) {
+            frames.push(data + i * PAGE);
+        }
+        frames
+    }
+}
+
+impl Drop for RingBuf {
+    fn drop(&mut self) {
+        free_pages(self.control, 1);
+        free_pages(self.data, self.data_order);
     }
 }
 
 /// Write an 8-byte record header at `pos`. `pos` is 8-aligned and the header
 /// never straddles the wrap, so this is a plain in-place write.
-fn write_header(buf: &mut [u8], mask: u64, pos: u64, len: u32) {
+///
+/// # Safety
+///
+/// `base` must point to a data area of at least `mask + 1` bytes to which the
+/// caller holds exclusive write access; `pos & mask` addresses an in-range
+/// 8-byte slot.
+unsafe fn write_header(base: *mut u8, mask: u64, pos: u64, len: u32) {
     let off = (pos & mask) as usize;
-    buf[off..off + 4].copy_from_slice(&len.to_le_bytes());
-    // `pg_off`: only the mmap reverse-mapping consults it. Zero here.
-    buf[off + 4..off + 8].copy_from_slice(&0u32.to_le_bytes());
+    // SAFETY: forwarded — the 8-byte header lies wholly within the data area.
+    unsafe {
+        core::ptr::copy_nonoverlapping(len.to_le_bytes().as_ptr(), base.add(off), 4);
+        // `pg_off`: only the mmap reverse-mapping consults it. Zero here.
+        core::ptr::write_bytes(base.add(off + 4), 0, 4);
+    }
+}
+
+/// Read a record's 4-byte length word (length + flags) at `pos`.
+///
+/// # Safety
+///
+/// As [`write_header`], for read access.
+unsafe fn read_len_word(base: *const u8, mask: u64, pos: u64) -> u32 {
+    let off = (pos & mask) as usize;
+    let mut bytes = [0u8; 4];
+    // SAFETY: forwarded — the 4-byte length word lies wholly within the area.
+    unsafe { core::ptr::copy_nonoverlapping(base.add(off), bytes.as_mut_ptr(), 4) };
+    u32::from_le_bytes(bytes)
 }
 
 /// Copy `src` into the ring at byte offset `start`, wrapping at the end.
-fn copy_in(buf: &mut [u8], mask: u64, start: u64, src: &[u8]) {
-    let n = buf.len();
+///
+/// # Safety
+///
+/// `base` addresses a `size`-byte data area (a power of two, `size == mask + 1`)
+/// the caller may write exclusively; `src` fits within it.
+unsafe fn copy_in(base: *mut u8, size: u64, mask: u64, start: u64, src: &[u8]) {
     let s = (start & mask) as usize;
-    let first = core::cmp::min(src.len(), n - s);
-    buf[s..s + first].copy_from_slice(&src[..first]);
-    if first < src.len() {
-        let rest = src.len() - first;
-        buf[..rest].copy_from_slice(&src[first..]);
+    let first = core::cmp::min(src.len(), size as usize - s);
+    // SAFETY: `s + first <= size` and, on wrap, `src.len() - first <= s`, so
+    // both copies stay inside the data area.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), base.add(s), first);
+        if first < src.len() {
+            core::ptr::copy_nonoverlapping(src.as_ptr().add(first), base, src.len() - first);
+        }
     }
 }
 
 /// Copy `len` bytes out of the ring from byte offset `start`, wrapping.
-fn copy_out(buf: &[u8], mask: u64, start: u64, len: usize) -> Vec<u8> {
-    let n = buf.len();
+///
+/// # Safety
+///
+/// As [`copy_in`], for read access; `len <= size`.
+unsafe fn copy_out(base: *const u8, size: u64, mask: u64, start: u64, len: usize) -> Vec<u8> {
     let s = (start & mask) as usize;
-    let first = core::cmp::min(len, n - s);
-    let mut out = Vec::with_capacity(len);
-    out.extend_from_slice(&buf[s..s + first]);
-    if first < len {
-        out.extend_from_slice(&buf[..len - first]);
+    let first = core::cmp::min(len, size as usize - s);
+    let mut out = alloc::vec![0u8; len];
+    // SAFETY: mirror of `copy_in`'s bounds; the destination `Vec` is `len` long.
+    unsafe {
+        core::ptr::copy_nonoverlapping(base.add(s), out.as_mut_ptr(), first);
+        if first < len {
+            core::ptr::copy_nonoverlapping(base, out.as_mut_ptr().add(first), len - first);
+        }
     }
     out
 }
