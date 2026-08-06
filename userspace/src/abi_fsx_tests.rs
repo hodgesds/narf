@@ -2093,3 +2093,102 @@ fn smoke_abi_fsx_stat_relative_uses_cwd() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_stat_relative_uses_cwd);
+
+/// `rename(2)` must ATOMICALLY REPLACE an existing destination.
+///
+/// POSIX and Linux both require it: if newpath exists it is replaced, and
+/// there is never a window where the name is absent. Only
+/// `renameat2(RENAME_NOREPLACE)` refuses, and that returns EEXIST.
+///
+/// This is the single operation Qt's QSaveFile performs on every write
+/// after the first: write a temp file beside the target, then rename it
+/// ONTO the (existing) target. KConfig, KSycoca and every KDE config write
+/// go through it. NARF returned EINVAL, and KConfig reports any failed
+/// commit as `Couldn't write "<path>" . Disk full?` — which sent this
+/// investigation looking at free space and directory ownership, both fine.
+///
+/// Measured in-guest before the fix, as uid 1000 on the real ext2 /home:
+///     QSF: rename(tmp -> target)   ok (0)          [target absent]
+///     QSF: rename over EXISTING    FAILED errno=22 (Invalid argument)
+///
+/// The first rename is asserted too: a test that only renamed onto a free
+/// name passes on the broken implementation, which is exactly why this went
+/// unnoticed.
+fn smoke_abi_fsx_rename_replaces_existing() -> TestResult {
+    with_memfs("/abi-rnrep", "rnrep", &[], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        const O_RDWR: u64 = 2;
+        const O_CREAT: u64 = 0o100;
+        const O_EXCL: u64 = 0o200;
+
+        let src = b"/abi-rnrep/tmp\0";
+        let dst = b"/abi-rnrep/target\0";
+
+        let mk = |p: &[u8]| -> bool {
+            match call(
+                Syscall::Openat.raw(),
+                a3(
+                    AT_FDCWD,
+                    p.as_ptr() as u64,
+                    O_CREAT | O_EXCL | O_RDWR,
+                    0o644,
+                ),
+            ) {
+                Some(v) if v >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(v as u64));
+                    true
+                }
+                _ => false,
+            }
+        };
+
+        // Pass 1: destination absent. This is the case a naive test covers,
+        // and it works even on the broken implementation.
+        if !mk(src) {
+            return Err("could not create the source file");
+        }
+        if call(
+            Syscall::Rename.raw(),
+            a1(src.as_ptr() as u64, dst.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("rename onto an ABSENT destination failed");
+        }
+
+        // Pass 2: destination now EXISTS. This is what QSaveFile does on
+        // every subsequent write, and what actually broke.
+        if !mk(src) {
+            return Err("could not re-create the source file");
+        }
+        let r = call(
+            Syscall::Rename.raw(),
+            a1(src.as_ptr() as u64, dst.as_ptr() as u64),
+        );
+        if r != Some(0) {
+            return Err(
+                "rename onto an EXISTING destination failed — POSIX requires atomic \
+                 replacement; this is Qt QSaveFile's write path (KConfig 'Disk full?')",
+            );
+        }
+
+        // The source name must be gone and the destination must remain.
+        let src_gone = !matches!(
+            call(Syscall::Openat.raw(), a3(AT_FDCWD, src.as_ptr() as u64, O_RDWR, 0)),
+            Some(v) if v >= 0
+        );
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dst.as_ptr() as u64, O_RDWR, 0),
+        ) {
+            Some(v) if v >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+            }
+            _ => return Err("destination missing after replacing rename"),
+        }
+        if !src_gone {
+            return Err("source still present after rename");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_rename_replaces_existing);

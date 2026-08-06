@@ -193,6 +193,18 @@ for i in {1..180}; do
     drm_probed=1
     drm_probe_in_session
     unit_diag_once
+    # KConfig/QSaveFile atomic writes fail in-session with kwin logging
+    # 'Couldn't write ".../kwinrc" . Disk full?'. The image is NOT full and
+    # the dirs are uid-1000 owned, so "Disk full?" is KConfig guessing.
+    # This names the failing syscall. Runs against the real ext2 /home —
+    # the ABI tests for this ran on memfs, which cannot see an ext2-only
+    # difference.
+    if [ -x /usr/local/libexec/narf-qsf-probe ]; then
+      /usr/local/libexec/narf-qsf-probe /home/narf/.config 2>&1 |
+        while IFS= read -r l; do printf 'QSFP: %s\n' "$l"; done
+    else
+      echo "QSFP: probe binary MISSING"
+    fi
   fi
   printf 'PLASMA-PROBE %s start=[%s] session=[%s] kwin=[%s] kcminit=[%s count=%s] kded=[%s] ksm=[%s] plasma=[%s]\n' \
     "$i" "$start" "$session" "$kwin" "$kcminit" "$kcminit_count" "$kded" "$ksm" "$plasma"

@@ -568,9 +568,49 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if !new_parent_probe.is_dir() {
             return Err(FsError::InvalidPath);
         }
-        if self.dir_lookup(&new_parent_probe, new_name).await.is_ok() {
-            // Destination exists — RENAME_NOREPLACE requires we fail.
-            return Err(FsError::InvalidPath);
+        // An existing destination is REPLACED, not rejected. POSIX and
+        // Linux both require plain rename(2) to swap the name atomically;
+        // only renameat2(RENAME_NOREPLACE) refuses, and the syscall layer
+        // already enforces that itself (returning the correct EEXIST), so
+        // failing here was both redundant and wrong — and it reported
+        // EINVAL rather than EEXIST.
+        //
+        // This is Qt QSaveFile's every-write path: write a temp beside the
+        // target, then rename it ONTO the existing target. Refusing broke
+        // every KConfig/KSycoca write on the ext2 rootfs, surfacing as
+        // kwin logging `Couldn't write ".../kwinrc" . Disk full?` (KConfig
+        // prints that for any failed commit; the disk had 2.5 GB free).
+        //
+        // Unlink the victim FIRST so `dir_insert` cannot leave a second
+        // dirent with the same name in the directory: insert-then-unlink
+        // would remove whichever entry matched first on the next pass.
+        let victim = self.dir_lookup(&new_parent_probe, new_name).await.ok();
+        if let Some((victim_ino, _)) = victim {
+            // Renaming a name onto ITSELF is a documented no-op that must
+            // leave the file intact, so do not unlink in that case.
+            if victim_ino == target_ino {
+                return Ok(());
+            }
+            let mut victim_parent = self.read_inode(new_parent_inode_no).await?;
+            self.dir_delete(new_parent_inode_no, &mut victim_parent, new_name)
+                .await?;
+            victim_parent.touch_ctime_mtime(now);
+            self.write_inode(new_parent_inode_no, &victim_parent)
+                .await?;
+            // Release the replaced inode exactly as dir_unlink does: drop a
+            // link, and free the blocks + inode when the last one goes.
+            // Skipping this would leak the overwritten file's blocks on
+            // every config save.
+            let mut victim_inode = self.read_inode(victim_ino).await?;
+            victim_inode.links_count = victim_inode.links_count.saturating_sub(1);
+            victim_inode.touch_ctime(now);
+            if victim_inode.links_count == 0 {
+                self.truncate_inode(&mut victim_inode).await?;
+                self.write_inode(victim_ino, &victim_inode).await?;
+                self.free_inode(victim_ino).await?;
+            } else {
+                self.write_inode(victim_ino, &victim_inode).await?;
+            }
         }
 
         // Insert into the new parent.
