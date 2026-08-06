@@ -122,6 +122,15 @@ fn jne_imm(dst: u8, v: i32, off: i16) -> Decoded {
         off,
     }
 }
+fn jeq_imm(dst: u8, v: i32, off: i16) -> Decoded {
+    Decoded::JumpCond {
+        wide: true,
+        op: CondOp::Eq,
+        dst: r(dst),
+        src: Source::Imm(v),
+        off,
+    }
+}
 fn ja(off: i32) -> Decoded {
     Decoded::Jump { off }
 }
@@ -4006,3 +4015,126 @@ fn smoke_bpf_ringbuf_output_kfunc_neg() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_bpf_ringbuf_output_kfunc_neg);
+
+// ── RingBuf: reserve / submit / discard ─────────────────────────────
+
+fn smoke_bpf_ringbuf_reserve_submit_kfunc() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+
+        // Reserve 16 bytes, write two words into the reserved region, submit.
+        //   0 r1=map; 1 r2=16; 2 r3=0; 3 r0=reserve
+        //   4 if r0==0 goto 11(out); 5 r6=r0
+        //   6 *(u64*)(r6+0)=0x1111; 7 *(u64*)(r6+8)=0x2222
+        //   8 r1=r6; 9 r2=0; 10 submit
+        //   11 r0=0; 12 exit
+        let prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 16),
+            mov_imm(3, 0),
+            call("narf_ringbuf_reserve"),
+            jeq_imm(0, 0, 6),
+            mov_reg(6, 0),
+            st_imm(6, 0, 0x1111),
+            st_imm(6, 8, 0x2222),
+            mov_reg(1, 6),
+            mov_imm(2, 0),
+            call("narf_ringbuf_submit"),
+            mov_imm(0, 0),
+            EXIT,
+        ];
+        let p = load_with_map("rbresv", asm(&prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(0)) => {}
+            Some(Outcome::Returned(_)) => return Err("reserve/submit program did not return 0"),
+            Some(Outcome::Trapped(_)) => return Err("reserve/submit program trapped"),
+            None => return Err("run declined"),
+        }
+
+        // The consumer sees the record the program filled through the reserved
+        // region — proof the writes landed and submit published them.
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+        let rec = rb.consume_one().ok_or("no record after reserve/submit")?;
+        if rec.len() != 16 {
+            return Err("the submitted record was the wrong length");
+        }
+        let w0 = u64::from_le_bytes(rec[0..8].try_into().map_err(|_| "bad slice")?);
+        let w1 = u64::from_le_bytes(rec[8..16].try_into().map_err(|_| "bad slice")?);
+        if w0 != 0x1111 || w1 != 0x2222 {
+            return Err("the submitted record did not hold what the program wrote");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_reserve_submit_kfunc);
+
+fn smoke_bpf_ringbuf_reserve_discard_publishes_nothing() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+
+        // Reserve, write, then discard: the consumer must see nothing.
+        let prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 16),
+            mov_imm(3, 0),
+            call("narf_ringbuf_reserve"),
+            jeq_imm(0, 0, 5),
+            mov_reg(6, 0),
+            st_imm(6, 0, 0x9999),
+            mov_reg(1, 6),
+            mov_imm(2, 0),
+            call("narf_ringbuf_discard"),
+            mov_imm(0, 0),
+            EXIT,
+        ];
+        let p = load_with_map("rbdisc", asm(&prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(0)) => {}
+            _ => return Err("reserve/discard program did not run to 0"),
+        }
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+        if rb.consume_one().is_some() {
+            return Err("a discarded reservation was published to the consumer");
+        }
+        if rb.available_data() != 0 {
+            return Err("a discarded reservation left data in the ring");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_reserve_discard_publishes_nothing);
+
+fn smoke_bpf_ringbuf_reserve_null_when_oversize() -> TestResult {
+    checked(|| {
+        // A reserve larger than the staging area returns null at run time; the
+        // program's null branch is taken and reports it. The non-null branch
+        // (never reached here) still verifies, which is what lets the program
+        // load at all.
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 1000), // > MAX_RESERVE (512)
+            mov_imm(3, 0),
+            call("narf_ringbuf_reserve"),
+            jeq_imm(0, 0, 4), // if null goto the sentinel at insn 9
+            mov_reg(6, 0),
+            mov_reg(1, 6),
+            mov_imm(2, 0),
+            call("narf_ringbuf_submit"),
+            mov_imm(0, 7), // sentinel: the null path was taken
+            EXIT,
+        ];
+        let p = load_with_map("rbovr", asm(&prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(7)) => {}
+            Some(Outcome::Returned(0)) => return Err("an oversize reserve did not return null"),
+            _ => return Err("oversize reserve program did not run"),
+        }
+        // Nothing was staged or published.
+        if m.ringbuf().and_then(|rb| rb.consume_one()).is_some() {
+            return Err("an oversize reserve still published a record");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_reserve_null_when_oversize);

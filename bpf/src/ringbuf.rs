@@ -33,9 +33,11 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use narf_bpf_verifier::kfunc::{ArgDesc, ArgFlags, PtrKind, TypeKey, TypeKind, ValidityDomain};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::map::{BpfMapOps, MapAttr, MapError};
+use crate::types::BpfType;
 
 /// Bytes of record header: a 32-bit length (with flags) + a 32-bit page offset.
 const HDR_LEN: u64 = 8;
@@ -138,6 +140,21 @@ impl RingBuf {
     #[must_use]
     pub fn consumer_pos(&self) -> u64 {
         self.state.lock().consumer_pos
+    }
+
+    /// Whether a record of `len` payload bytes would fit right now.
+    ///
+    /// The reserve path checks this up front so a reservation that could never
+    /// be committed is declined at `bpf_ringbuf_reserve` time — the caller then
+    /// null-checks, as the API requires.
+    #[must_use]
+    pub fn has_room(&self, len: usize) -> bool {
+        let need = HDR_LEN + round_up8(len as u64);
+        if need > self.data_size {
+            return false;
+        }
+        let st = self.state.lock();
+        need <= self.data_size - st.producer_pos.wrapping_sub(st.consumer_pos)
     }
 
     /// Append one record carrying `data`, atomically.
@@ -282,3 +299,109 @@ impl BpfMapOps for RingBuf {
         Err(MapError::Invalid)
     }
 }
+
+// ── reserve / submit / discard ──────────────────────────────────────
+//
+// These three are **interpreter intrinsics**: the interpreter intercepts their
+// ids and manipulates the VM's staged reservation directly, because a reserved
+// record is VM-local state a plain kfunc shim has no handle on. They are
+// registered as kfuncs all the same, so the verifier has their descriptors —
+// and the descriptors are what enforce the whole contract (an acquired, sized,
+// nullable region that must be submitted or discarded). The JIT refuses any
+// program that calls them (see [`is_intrinsic`]), since native code cannot
+// reach the VM state, so such a program always runs interpreted.
+
+/// A byte region acquired from `bpf_ringbuf_reserve`.
+///
+/// `Option<ReservedRegion>` in return position spells `KF_ACQUIRE |
+/// KF_RET_NULL`; a bare `ReservedRegion` in argument position (submit/discard)
+/// releases it. The region's size is the reserve's `Const` size argument, which
+/// the verifier reads to bound writes through it.
+///
+/// It holds the region's synthetic address, but the value is never
+/// dereferenced here: the interpreter routes accesses to the staged buffer and
+/// the shims below never run.
+#[derive(Debug)]
+pub struct ReservedRegion(u64);
+
+// SAFETY: `from_raw` stores the register verbatim and never dereferences it;
+// the interpreter is the only thing that turns the synthetic address into a
+// real access, and it bounds every one against the reserved length.
+unsafe impl BpfType for ReservedRegion {
+    const DESC: ArgDesc = ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::Mem,
+            key: TypeKey::NONE,
+        },
+        domain: ValidityDomain::Owned,
+        flags: ArgFlags::NONE,
+    };
+    #[inline]
+    unsafe fn from_raw(raw: u64, _next: u64) -> Self {
+        Self(raw)
+    }
+    #[inline]
+    fn into_raw(self) -> u64 {
+        self.0
+    }
+}
+
+crate::kfunc! {
+    /// Reserve a `size`-byte record in the ring buffer `map`, returning a
+    /// writable region to fill and then hand to [`narf_ringbuf_submit`] or
+    /// [`narf_ringbuf_discard`] — the `bpf_ringbuf_reserve` shape.
+    ///
+    /// `size` is a constant so the region can be bounded at verification time.
+    /// Returns null if `flags` names an unknown bit, `map` is not a ring
+    /// buffer, the record is too large to stage, or the ring is full — which is
+    /// why the return is an `Option` the verifier makes the program test.
+    ///
+    /// This body is unreachable: the interpreter intercepts the call. It
+    /// declines rather than panicking, so that if the interception is ever
+    /// bypassed the failure is a null reservation, not a wild write.
+    #[context(Atomic)]
+    pub fn narf_ringbuf_reserve(
+        map: crate::types::Trusted<crate::map::BpfMap>,
+        size: crate::types::Const<u64>,
+        flags: u64,
+    ) -> Option<ReservedRegion> {
+        let _ = (map, size, flags);
+        None
+    }
+
+    /// Commit a reservation from [`narf_ringbuf_reserve`], making the record
+    /// visible to the consumer — the `bpf_ringbuf_submit` shape. Consumes the
+    /// region. Interpreter intrinsic; this body is unreachable.
+    #[context(Atomic)]
+    pub fn narf_ringbuf_submit(region: ReservedRegion, flags: u64) -> () {
+        let _ = (region, flags);
+    }
+
+    /// Abandon a reservation from [`narf_ringbuf_reserve`] without publishing it
+    /// — the `bpf_ringbuf_discard` shape. Consumes the region. Interpreter
+    /// intrinsic; this body is unreachable.
+    #[context(Atomic)]
+    pub fn narf_ringbuf_discard(region: ReservedRegion, flags: u64) -> () {
+        let _ = (region, flags);
+    }
+}
+
+/// The kfunc id of `narf_ringbuf_reserve`, for the interpreter's interception
+/// and the JIT's refusal. Derived from the name exactly as the registry's ids
+/// are, so the two cannot drift.
+pub const RESERVE_ID: i32 = crate::types::fnv1a32_nonzero("narf_ringbuf_reserve") as i32;
+/// The kfunc id of `narf_ringbuf_submit`.
+pub const SUBMIT_ID: i32 = crate::types::fnv1a32_nonzero("narf_ringbuf_submit") as i32;
+/// The kfunc id of `narf_ringbuf_discard`.
+pub const DISCARD_ID: i32 = crate::types::fnv1a32_nonzero("narf_ringbuf_discard") as i32;
+
+/// Whether `id` names one of the reserve/submit/discard interpreter intrinsics.
+/// The JIT refuses any program that calls one, so it runs interpreted.
+#[must_use]
+pub fn is_intrinsic(id: i32) -> bool {
+    id == RESERVE_ID || id == SUBMIT_ID || id == DISCARD_ID
+}
+
+/// `bpf_ringbuf_reserve` wakeup-control flags — accepted and ignored (there is
+/// no consumer to wake yet); any other bit makes the reservation fail.
+pub const RESERVE_WAKEUP_FLAGS: u64 = 0b11;
