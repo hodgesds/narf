@@ -92,6 +92,17 @@ use crate::mem::StackFrame;
 pub const STACK_REGION: u64 = 0x0000_2000_0000_0000;
 /// Synthetic base of the read-only context tuple.
 pub const CTX_REGION: u64 = 0x0000_3000_0000_0000;
+/// Synthetic base of the current `bpf_ringbuf_reserve` record.
+///
+/// A distinct region so a write to a reserved record is routed to the staged
+/// buffer, and so a stray reserve pointer is recognisable in a diagnostic. Only
+/// one reservation is live at a time; the address is the same for each.
+pub const RESERVE_REGION: u64 = 0x0000_4000_0000_0000;
+
+/// Largest record `bpf_ringbuf_reserve` can stage. Larger records use
+/// `bpf_ringbuf_output`, which copies from the program's own buffer and has no
+/// staging area to bound. A reserve of more than this returns null.
+pub const MAX_RESERVE: usize = 512;
 
 /// Maximum context words. `tracing::dispatch::ProbeArgs` is `[u64; 4]`, which
 /// is already the BPF ctx-array shape — the trampoline Linux needs to spill
@@ -351,6 +362,18 @@ pub struct Vm<'a> {
     arenas: &'a [alloc::sync::Arc<crate::arena::ProgArena>],
     /// See [`VmProgram::maps`].
     maps: &'a [(i32, alloc::sync::Arc<crate::map::BpfMap>)],
+    /// The ring buffer a live `bpf_ringbuf_reserve` targets, or `None` when no
+    /// reservation is outstanding. Holding the `Arc` keeps the ring alive for
+    /// the reservation even if the program's own reference were somehow
+    /// dropped.
+    reserve_map: Option<alloc::sync::Arc<crate::map::BpfMap>>,
+    /// The reserved record's length. Meaningful only while [`Self::reserve_map`]
+    /// is `Some`; `reserve_buf[..reserve_len]` is the staged record the program
+    /// writes through [`RESERVE_REGION`] and `submit` copies into the ring.
+    reserve_len: usize,
+    /// The staged record bytes. A `u64` array so the whole `Vm` needs no
+    /// alignment beyond its other fields; only `reserve_len` bytes are used.
+    reserve_buf: [u8; MAX_RESERVE],
     /// Instructions retired, for diagnostics.
     steps: u64,
 }
@@ -404,6 +427,9 @@ impl<'a> Vm<'a> {
             context,
             arenas: &[],
             maps,
+            reserve_map: None,
+            reserve_len: 0,
+            reserve_buf: [0u8; MAX_RESERVE],
             steps: 0,
         }
     }
@@ -452,6 +478,24 @@ impl<'a> Vm<'a> {
         Some((off, off + len))
     }
 
+    /// The staged-record byte range an address falls in, or `None`.
+    ///
+    /// Bounded by `reserve_len`, not by the buffer's size, so a write proved
+    /// in bounds by the verifier (against the reserved size) lands in the
+    /// staged record and a wild one does not — the same shape as
+    /// [`Vm::stack_range`], for the same reason.
+    #[inline]
+    fn reserve_range(&self, addr: u64, len: usize) -> Option<(usize, usize)> {
+        self.reserve_map.as_ref()?;
+        let end = addr.checked_add(len as u64)?;
+        let limit = RESERVE_REGION.checked_add(self.reserve_len as u64)?;
+        if addr < RESERVE_REGION || end > limit {
+            return None;
+        }
+        let off = (addr - RESERVE_REGION) as usize;
+        Some((off, off + len))
+    }
+
     /// Resolve an arena handle to a real kernel address, or trap.
     ///
     /// `None` from [`crate::arena::resolve_in`] covers every way out of an arena:
@@ -485,6 +529,67 @@ impl<'a> Vm<'a> {
         self.maps.iter().find(|(f, _)| *f == fd).map(|(_, m)| m)
     }
 
+    /// The map a handle register carries, resolved by the address `map_addr`
+    /// hands out (`Arc::as_ptr`). `None` when no held map matches — the same
+    /// two-halves-disagreeing case [`Vm::map_addr`] traps on.
+    fn map_from_addr(&self, addr: u64) -> Option<&alloc::sync::Arc<crate::map::BpfMap>> {
+        self.maps
+            .iter()
+            .find(|(_, m)| alloc::sync::Arc::as_ptr(m) as u64 == addr)
+            .map(|(_, m)| m)
+    }
+
+    /// `bpf_ringbuf_reserve(map, size, flags)`: stage a record and hand back
+    /// [`RESERVE_REGION`], or `0` (null) if it cannot be staged. See
+    /// [`crate::ringbuf`].
+    fn ringbuf_reserve(&mut self, map_addr: u64, size: u64, flags: u64) -> u64 {
+        // Only the wakeup-control flags are defined; a live reservation blocks a
+        // second (one is staged at a time); the record must fit the staging
+        // area. Any of these declines with null, which the program null-checks.
+        if flags & !crate::ringbuf::RESERVE_WAKEUP_FLAGS != 0 || self.reserve_map.is_some() {
+            return 0;
+        }
+        let size = size as usize;
+        if size > MAX_RESERVE {
+            return 0;
+        }
+        let Some(map) = self.map_from_addr(map_addr) else {
+            return 0;
+        };
+        let Some(rb) = map.ringbuf() else {
+            return 0;
+        };
+        if !rb.has_room(size) {
+            return 0;
+        }
+        let map = alloc::sync::Arc::clone(map);
+        self.reserve_buf[..size].fill(0);
+        self.reserve_len = size;
+        self.reserve_map = Some(map);
+        RESERVE_REGION
+    }
+
+    /// `bpf_ringbuf_submit`: copy the staged record into the ring and clear the
+    /// reservation. A no-op if nothing is staged (the verifier prevents that).
+    fn ringbuf_submit(&mut self) {
+        if let Some(map) = self.reserve_map.take() {
+            if let Some(rb) = map.ringbuf() {
+                // Best-effort: `has_room` was checked at reserve, so under the
+                // single-producer model this always succeeds. A concurrent
+                // producer that filled the ring in between drops the record —
+                // a lost event, never a corrupt one.
+                let _ = rb.output(&self.reserve_buf[..self.reserve_len]);
+            }
+        }
+        self.reserve_len = 0;
+    }
+
+    /// `bpf_ringbuf_discard`: drop the staged record without publishing it.
+    fn ringbuf_discard(&mut self) {
+        self.reserve_map = None;
+        self.reserve_len = 0;
+    }
+
     /// The address a map handle carries.
     ///
     /// `Arc::as_ptr`, not a synthetic token: the kfunc shim reconstitutes a
@@ -510,6 +615,12 @@ impl<'a> Vm<'a> {
         if let Some((lo, hi)) = self.stack_range(addr, len) {
             let mut buf = [0u8; 8];
             buf[..len].copy_from_slice(&self.stack.bytes_mut()[lo..hi]);
+            return Ok(widen(u64::from_le_bytes(buf), size, signed));
+        }
+        // A read-back of the record being staged for `bpf_ringbuf_reserve`.
+        if let Some((lo, hi)) = self.reserve_range(addr, len) {
+            let mut buf = [0u8; 8];
+            buf[..len].copy_from_slice(&self.reserve_buf[lo..hi]);
             return Ok(widen(u64::from_le_bytes(buf), size, signed));
         }
         // The context tuple is word-addressed and read-only.
@@ -556,6 +667,13 @@ impl<'a> Vm<'a> {
         let bytes = value.to_le_bytes();
         if let Some((lo, hi)) = self.stack_range(addr, len) {
             self.stack.bytes_mut()[lo..hi].copy_from_slice(&bytes[..len]);
+            return Ok(());
+        }
+        // A write into the record being staged for `bpf_ringbuf_reserve`. The
+        // interpreter never hands the ring's own bytes to the program; the
+        // record is copied into the ring only at `submit`.
+        if let Some((lo, hi)) = self.reserve_range(addr, len) {
+            self.reserve_buf[lo..hi].copy_from_slice(&bytes[..len]);
             return Ok(());
         }
         // The context region is deliberately not tried here: it is read-only, so
@@ -1218,6 +1336,25 @@ impl<'a> Vm<'a> {
     }
 
     async fn call_kfunc(&mut self, at: u32, id: i32) -> Result<(), Trap> {
+        // The ring-buffer reserve/submit/discard kfuncs are intrinsics: they
+        // read and write the VM's staged reservation, which a plain shim cannot
+        // reach. Intercepted here before the registry dispatch, exactly as the
+        // JIT refuses to compile them (`ringbuf::is_intrinsic`), so the two
+        // backends agree that these run only interpreted. R1..R5 are the
+        // argument registers; the BPF ABI clobbers them across any call.
+        if crate::ringbuf::is_intrinsic(id) {
+            self.regs[0] = if id == crate::ringbuf::RESERVE_ID {
+                self.ringbuf_reserve(self.regs[1], self.regs[2], self.regs[3])
+            } else if id == crate::ringbuf::SUBMIT_ID {
+                self.ringbuf_submit();
+                0
+            } else {
+                self.ringbuf_discard();
+                0
+            };
+            self.regs[1..6].fill(0);
+            return Ok(());
+        }
         let entry = *self
             .registry
             .by_id(id)

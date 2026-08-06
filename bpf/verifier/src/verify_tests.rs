@@ -3382,3 +3382,421 @@ fn an_unreachable_call_is_not_recorded_so_the_emitter_must_fail_closed() {
         v.kfunc_calls
     );
 }
+
+// ── acquired byte regions: bpf_ringbuf_reserve / submit / discard ────
+//
+// `reserve` returns an acquired, nullable, *sized* `Mem` region — sized by its
+// constant size argument — that the program writes into and must hand back to
+// `submit` or `discard`. It exercises three verifier properties at once that no
+// other kfunc combines: a returned `Mem` region carries a length (so writes are
+// bounded), it carries a reference (so it must be released), and its size comes
+// from a constant argument. These are the checks a ring-buffer reserve leans on
+// and the ones a bug in would turn into an unbounded kernel write, so they are
+// tested exhaustively here rather than only through a booted kernel.
+
+/// A `Mem` region argument that releases its reference — `bpf_ringbuf_submit`
+/// / `bpf_ringbuf_discard` take one.
+static MEM_OWNED_ARG: &[ArgDesc] = &[ptr_desc(
+    PtrKind::Mem,
+    ValidityDomain::Owned,
+    ArgFlags::NONE,
+)];
+
+/// `fn reserve(size: Const<u64>) -> Option<{acquired region of `size` bytes}>`.
+fn reserve_kfunc() -> KfuncDesc {
+    kfunc(
+        "reserve",
+        CONST_ARG,
+        ArgDesc {
+            kind: TypeKind::Ptr {
+                kind: PtrKind::Mem,
+                key: TypeKey::NONE,
+            },
+            domain: ValidityDomain::Owned,
+            flags: ArgFlags::NULLABLE,
+        },
+        Context::Atomic,
+    )
+}
+
+/// `fn submit({region})` — releases the reference.
+fn submit_kfunc() -> KfuncDesc {
+    kfunc("submit", MEM_OWNED_ARG, ArgDesc::VOID, Context::Atomic)
+}
+
+/// `fn discard({region})` — also releases the reference.
+fn discard_kfunc() -> KfuncDesc {
+    kfunc("discard", MEM_OWNED_ARG, ArgDesc::VOID, Context::Atomic)
+}
+
+#[test]
+fn reserve_write_submit_is_the_whole_idiom() {
+    //   r1 = 64; r0 = reserve(r1)
+    //   if r0 == 0 goto out
+    //   r6 = r0; *(u64 *)(r6 + 0) = 0; submit(r6)
+    //   out: r0 = 0; exit
+    let k = [reserve_kfunc(), submit_kfunc()];
+    check_full(
+        &[
+            mov(1, 64),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 5),
+            movr(6, 0),
+            mov(2, 0),
+            stx(Size::Dw, 6, 0, 2),
+            movr(1, 6),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("reserve, test, write, submit is the whole idiom");
+}
+
+#[test]
+fn a_reserved_region_may_be_discarded_instead_of_submitted() {
+    let k = [reserve_kfunc(), discard_kfunc()];
+    check_full(
+        &[
+            mov(1, 64),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 3),
+            movr(6, 0),
+            movr(1, 6),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("discard releases the reservation just as submit does");
+}
+
+#[test]
+fn a_reserved_region_must_be_tested_before_it_is_written() {
+    // A write through the untested, maybe-null region is the null-deref the
+    // KF_RET_NULL obligation exists to prevent.
+    let k = [reserve_kfunc(), submit_kfunc()];
+    let e = check_full(
+        &[
+            mov(1, 64),
+            call(0),
+            mov(2, 0),
+            stx(Size::Dw, 0, 0, 2),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert_eq!(e, VerifyError::PossiblyNull { at: 3, reg: 0 });
+}
+
+#[test]
+fn a_reserved_region_must_be_tested_before_it_is_submitted() {
+    let k = [reserve_kfunc(), submit_kfunc()];
+    let e = check_full(
+        &[mov(1, 64), call(0), movr(1, 0), call(1), mov(0, 0), EXIT],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert_eq!(e, VerifyError::PossiblyNull { at: 3, reg: 1 });
+}
+
+#[test]
+fn an_unsubmitted_reservation_is_a_leak() {
+    // The non-null branch reaches exit with the reference still live.
+    let k = [reserve_kfunc(), submit_kfunc()];
+    let e = check_full(
+        &[
+            mov(1, 64),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 0),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::LeakedReference { .. }), "{e:?}");
+}
+
+#[test]
+fn submitting_a_reservation_twice_is_rejected() {
+    let k = [reserve_kfunc(), submit_kfunc()];
+    let e = check_full(
+        &[
+            mov(1, 64),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 5),
+            movr(6, 0),
+            movr(1, 6),
+            call(1),
+            movr(1, 6),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    // Releasing kills every register holding the reference, so the second use
+    // is either an unacquired release or a read of the now-dead register —
+    // exactly as the acquire/release pair's double-release is.
+    assert!(
+        matches!(
+            e,
+            VerifyError::ReleaseOfUnacquired { .. } | VerifyError::UninitRegister { .. }
+        ),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn submitting_after_discarding_is_rejected() {
+    // discard released the reference, so a following submit has nothing to give
+    // back — the use-after-release the reference model forbids.
+    let k = [reserve_kfunc(), submit_kfunc(), discard_kfunc()];
+    let e = check_full(
+        &[
+            mov(1, 64),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 5),
+            movr(6, 0),
+            movr(1, 6),
+            call(2),
+            movr(1, 6),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            VerifyError::ReleaseOfUnacquired { .. } | VerifyError::UninitRegister { .. }
+        ),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn submitting_a_region_never_reserved_is_rejected() {
+    // The frame pointer is a `Mem`-shaped writable region with no reference, so
+    // handing it to submit is a refcount underflow the class + reference checks
+    // must refuse.
+    let k = [submit_kfunc()];
+    let e = check_full(
+        &[movr(1, 10), call(0), mov(0, 0), EXIT],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            VerifyError::KfuncSignature { arg: 0, .. } | VerifyError::ReleaseOfUnacquired { .. }
+        ),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_write_past_the_reserved_size_is_out_of_bounds() {
+    // Reserve 8 bytes, write 8 at offset 16: the region's size is exactly its
+    // constant argument, and the store runs off the end of it.
+    let k = [reserve_kfunc(), submit_kfunc()];
+    let e = check_full(
+        &[
+            mov(1, 8),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 3),
+            movr(6, 0),
+            mov(2, 0),
+            stx(Size::Dw, 6, 16, 2),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::OutOfBounds { .. }), "{e:?}");
+}
+
+#[test]
+fn a_read_past_the_reserved_size_is_out_of_bounds() {
+    // The region bounds reads as well as writes. The out-of-bounds load faults
+    // the analysis before the reference-leak check the missing submit would
+    // otherwise trip, which is the point: bounds are proved at the access.
+    let k = [reserve_kfunc(), submit_kfunc()];
+    let e = check_full(
+        &[
+            mov(1, 8),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 2),
+            movr(6, 0),
+            ldx(Size::Dw, 2, 6, 16),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::OutOfBounds { .. }), "{e:?}");
+}
+
+#[test]
+fn a_write_at_the_edge_of_the_reserved_size_verifies() {
+    // Reserve 16, write 8 bytes at offset 8: the last in-bounds store.
+    let k = [reserve_kfunc(), submit_kfunc()];
+    check_full(
+        &[
+            mov(1, 16),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 5),
+            movr(6, 0),
+            mov(2, 0),
+            stx(Size::Dw, 6, 8, 2),
+            movr(1, 6),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("a store ending exactly at the region end is in bounds");
+}
+
+#[test]
+fn the_reserved_size_must_be_a_constant() {
+    // A non-constant size gives a region with no statically known bound, so the
+    // size argument is required to be `CONST`. Load it from the context, which
+    // is opaque, and the call fails its signature.
+    static CTX: &[ArgDesc] = &[ArgDesc::SCALAR64];
+    let k = [reserve_kfunc()];
+    let e = check_full(
+        &[ldx(Size::Dw, 1, 1, 0), call(0), mov(0, 0), EXIT],
+        CTX,
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, VerifyError::KfuncSignature { arg: 0, .. }),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn an_acquired_region_without_a_const_size_argument_is_malformed() {
+    // A reserve-shaped descriptor whose size cannot be read — no CONST argument
+    // — would hand back an unbounded writable region. The descriptor validator
+    // refuses it before any program is analysed.
+    let bad = kfunc(
+        "reserve_bad",
+        NO_ARGS,
+        ArgDesc {
+            kind: TypeKind::Ptr {
+                kind: PtrKind::Mem,
+                key: TypeKey::NONE,
+            },
+            domain: ValidityDomain::Owned,
+            flags: ArgFlags::NULLABLE,
+        },
+        Context::Atomic,
+    );
+    let e = check_full(&[mov(0, 0), EXIT], &[], &[bad], Context::Atomic).unwrap_err();
+    assert_eq!(
+        e,
+        VerifyError::Kfunc(crate::kfunc::KfuncError::AcquiredMemWithoutConstSize)
+    );
+}
+
+#[test]
+fn two_reservations_track_independently() {
+    // Two reserve sites mint two references; every path releases both. Keyed by
+    // site, so the two are distinct even though the kfunc is the same. The
+    // second reserve's null branch still has to release the first.
+    //
+    //  0 r1=16; 1 A=reserve; 2 if A==0 goto 13(exit); 3 r6=A
+    //  4 r1=16; 5 B=reserve; 6 if B==0 goto 10(submit A); 7 r7=B
+    //  8 r1=B; 9 submit; 10 r1=A; 11 submit; 12 r0=0; 13 exit
+    let k = [reserve_kfunc(), submit_kfunc()];
+    check_full(
+        &[
+            mov(1, 16),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 10),
+            movr(6, 0),
+            mov(1, 16),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 3),
+            movr(7, 0),
+            movr(1, 7),
+            call(1),
+            movr(1, 6),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect("two independent reservations, every path releasing both, verifies");
+}
+
+#[test]
+fn releasing_only_one_of_two_reservations_leaks_the_other() {
+    // Both reserved, only the first submitted: the second is live at exit.
+    //
+    //  0 r1=16; 1 A=reserve; 2 if A==0 goto 10(exit); 3 r6=A
+    //  4 r1=16; 5 B=reserve; 6 if B==0 goto 8(submit A); 7 r7=B
+    //  8 r1=A; 9 submit; 10 r0=0; 11 exit    (B leaks when both are non-null)
+    let k = [reserve_kfunc(), submit_kfunc()];
+    let e = check_full(
+        &[
+            mov(1, 16),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 7),
+            movr(6, 0),
+            mov(1, 16),
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 1),
+            movr(7, 0),
+            movr(1, 6),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .unwrap_err();
+    assert!(matches!(e, VerifyError::LeakedReference { .. }), "{e:?}");
+}

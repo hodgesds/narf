@@ -462,6 +462,16 @@ pub fn try_compile(
     if v.fault_sites.iter().any(|f| !f.arena) {
         return Err(JitSkip::HasFaultSites);
     }
+    // The ring-buffer reserve/submit/discard kfuncs are interpreter intrinsics
+    // — they manipulate the VM's staged reservation, which native code has no
+    // handle on. A program that calls one must run interpreted; the interpreter
+    // intercepts the same ids (`ringbuf::is_intrinsic`).
+    if v.kfunc_calls
+        .iter()
+        .any(|c| crate::ringbuf::is_intrinsic(c.id))
+    {
+        return Err(JitSkip::Unsupported);
+    }
     scan_program(v)?;
 
     let compiled = narf_bpf_jit::compile(v).map_err(|_| JitSkip::Unsupported)?;

@@ -122,6 +122,15 @@ fn jne_imm(dst: u8, v: i32, off: i16) -> Decoded {
         off,
     }
 }
+fn jeq_imm(dst: u8, v: i32, off: i16) -> Decoded {
+    Decoded::JumpCond {
+        wide: true,
+        op: CondOp::Eq,
+        dst: r(dst),
+        src: Source::Imm(v),
+        off,
+    }
+}
 fn ja(off: i32) -> Decoded {
     Decoded::Jump { off }
 }
@@ -3657,3 +3666,475 @@ fn smoke_bpf_map_value_pseudo_form_is_refused_at_load() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_bpf_map_value_pseudo_form_is_refused_at_load);
+
+// ── RingBuf ─────────────────────────────────────────────────────────
+
+use crate::ringbuf::RingBufError;
+
+/// A ring buffer of `bytes`, created through the map path so creation and the
+/// footprint charge are exercised too.
+fn mk_ring(bytes: u32) -> Result<Arc<BpfMap>, MapError> {
+    mk(MapKind::RingBuf, 0, 0, bytes)
+}
+
+fn smoke_bpf_ringbuf_output_consume_fifo() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let rb = m
+            .ringbuf()
+            .ok_or("ringbuf() returned None for a RingBuf map")?;
+
+        // An empty ring yields nothing.
+        if rb.consume_one().is_some() {
+            return Err("an empty ring produced a record");
+        }
+        // Distinct-length payloads, so a length or padding error shows up as a
+        // mismatched record rather than happening to line up.
+        let records: [&[u8]; 3] = [b"a", b"bcde", b"fghijklmno"];
+        for r in records {
+            rb.output(r)
+                .map_err(|_| "output rejected a record that fits")?;
+        }
+        if rb.available_data() == 0 {
+            return Err("available_data stayed zero after output");
+        }
+        // Records come back in the order they went in, byte-for-byte.
+        for expected in records {
+            let got = rb
+                .consume_one()
+                .ok_or("consume_one returned None too early")?;
+            if got.as_slice() != expected {
+                return Err("a consumed record did not match what was written");
+            }
+        }
+        if rb.consume_one().is_some() {
+            return Err("consume_one produced a record past the last one");
+        }
+        // Fully drained: the two positions meet.
+        if rb.available_data() != 0 || rb.consumer_pos() != rb.producer_pos() {
+            return Err("a drained ring did not settle with consumer == producer");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_output_consume_fifo);
+
+fn smoke_bpf_ringbuf_wraparound_preserves_data() -> TestResult {
+    checked(|| {
+        // The smallest ring, so a modest number of records forces the data area
+        // to wrap — the case where a payload straddles the physical end.
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+
+        // Each record is 200 bytes of payload → 208 with the header, so ~19 fit
+        // before the 4096-byte area wraps. Produce and consume in lockstep well
+        // past that, carrying a per-record marker byte to catch a mis-copied
+        // wrap.
+        let mut payload = [0u8; 200];
+        for round in 0u32..64 {
+            payload[0] = round as u8;
+            payload[199] = (round.wrapping_mul(7)) as u8;
+            rb.output(&payload)
+                .map_err(|_| "output rejected a record during the wrap walk")?;
+            let got = rb
+                .consume_one()
+                .ok_or("consume_one returned None during the wrap walk")?;
+            if got.len() != 200
+                || got[0] != round as u8
+                || got[199] != (round.wrapping_mul(7)) as u8
+            {
+                return Err("a record was corrupted across the ring wrap");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_wraparound_preserves_data);
+
+fn smoke_bpf_ringbuf_full_then_drain() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+
+        // Fill until the ring reports Full, without consuming.
+        let chunk = [0u8; 500];
+        let mut produced = 0;
+        loop {
+            match rb.output(&chunk) {
+                Ok(()) => produced += 1,
+                Err(RingBufError::Full) => break,
+                Err(_) => return Err("output failed for a reason other than Full"),
+            }
+            if produced > 100 {
+                return Err("the ring never reported Full");
+            }
+        }
+        if produced == 0 {
+            return Err("the ring was Full before a single record fit");
+        }
+        // Backpressure clears: draining one record frees room for one more.
+        rb.consume_one()
+            .ok_or("consume_one returned None on a full ring")?;
+        rb.output(&chunk)
+            .map_err(|_| "output still Full after a record was drained")?;
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_full_then_drain);
+
+fn smoke_bpf_ringbuf_record_too_big() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+
+        // A payload that, with its header, cannot fit an empty ring is refused
+        // as RecordTooBig — distinct from the transient Full — and leaves the
+        // ring untouched.
+        let too_big = [0u8; 4096];
+        match rb.output(&too_big) {
+            Err(RingBufError::RecordTooBig) => {}
+            _ => return Err("a record larger than the ring was not RecordTooBig"),
+        }
+        if rb.producer_pos() != 0 {
+            return Err("a rejected oversize record still advanced the producer");
+        }
+        // A zero-length record is legal: it is a header and nothing else.
+        rb.output(&[])
+            .map_err(|_| "a zero-length record was rejected")?;
+        let got = rb
+            .consume_one()
+            .ok_or("a zero-length record did not come back")?;
+        if !got.is_empty() {
+            return Err("a zero-length record came back non-empty");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_record_too_big);
+
+fn smoke_bpf_ringbuf_rejects_element_ops() -> TestResult {
+    checked(|| {
+        // A ring buffer answers the keyed surface only to refuse it — the same
+        // EINVAL Linux's ringbuf element ops return.
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let ops = m.ops();
+        let mut out = [0u8; 8];
+        if ops.lookup(&k32(0), &mut out) != Err(MapError::Invalid) {
+            return Err("RingBuf lookup was not EINVAL");
+        }
+        if ops.update(&k32(0), &[0u8; 8], BPF_ANY) != Err(MapError::Invalid) {
+            return Err("RingBuf update was not EINVAL");
+        }
+        if ops.delete(&k32(0)) != Err(MapError::Invalid) {
+            return Err("RingBuf delete was not EINVAL");
+        }
+        if ops.next_key(None, &mut out) != Err(MapError::Invalid) {
+            return Err("RingBuf next_key was not EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_rejects_element_ops);
+
+fn smoke_bpf_ringbuf_create_validation() -> TestResult {
+    checked(|| {
+        // Valid: a page-multiple power of two.
+        if mk_ring(4096).is_err() {
+            return Err("a valid RingBuf size was rejected");
+        }
+        if mk_ring(8192).is_err() {
+            return Err("a valid RingBuf size was rejected");
+        }
+        // Not a power of two.
+        if mk_ring(4096 + 8).map(|_| ()) != Err(MapError::Invalid) {
+            return Err("a non-power-of-two RingBuf size was accepted");
+        }
+        // A power of two, but smaller than a page.
+        if mk_ring(2048).map(|_| ()) != Err(MapError::Invalid) {
+            return Err("a sub-page RingBuf size was accepted");
+        }
+        // Zero.
+        if mk_ring(0).map(|_| ()) != Err(MapError::Invalid) {
+            return Err("a zero-size RingBuf was accepted");
+        }
+        // A non-zero key or value width has no meaning for a stream.
+        if mk(MapKind::RingBuf, 4, 0, 4096).map(|_| ()) != Err(MapError::Invalid) {
+            return Err("a RingBuf with a key width was accepted");
+        }
+        if mk(MapKind::RingBuf, 0, 8, 4096).map(|_| ()) != Err(MapError::Invalid) {
+            return Err("a RingBuf with a value width was accepted");
+        }
+        // Over the footprint cap.
+        if mk_ring(32 * 1024 * 1024).map(|_| ()) != Err(MapError::TooBig) {
+            return Err("an oversize RingBuf was not TooBig");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_create_validation);
+
+// ── RingBuf: the producer kfuncs ────────────────────────────────────
+
+fn smoke_bpf_ringbuf_output_kfunc_pos() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+
+        // A program that appends one 8-byte record it stashed on its stack:
+        //   *(u64 *)(r10-8) = 0xABCD
+        //   r1 = map; r2 = r10-8; r3 = 8; r4 = 0; call narf_ringbuf_output
+        let prog = alloc::vec![
+            st_imm(10, -8, 0xABCD),
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_reg(2, 10),
+            alu_imm(AluOp::Add, 2, -8),
+            mov_imm(3, 8),
+            mov_imm(4, 0),
+            call("narf_ringbuf_output"),
+            EXIT,
+        ];
+        let p = load_with_map("rbout", asm(&prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(0)) => {}
+            Some(Outcome::Returned(_)) => return Err("narf_ringbuf_output did not return 0"),
+            Some(Outcome::Trapped(_)) => return Err("narf_ringbuf_output trapped"),
+            None => return Err("run declined"),
+        }
+
+        // The kernel consumer sees exactly the program's record.
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+        let rec = rb.consume_one().ok_or("no record after a program output")?;
+        if rec.len() != 8 {
+            return Err("the consumed record was the wrong length");
+        }
+        let v = u64::from_le_bytes(
+            rec.as_slice()
+                .try_into()
+                .map_err(|_| "record not 8 bytes")?,
+        );
+        if v != 0xABCD {
+            return Err("the consumed record did not match what the program wrote");
+        }
+        // Running again appends a second, independent record.
+        p.run_atomic([0; 4], 4).ok_or("second run declined")?;
+        if rb.consume_one().is_none() {
+            return Err("a second program run did not append a second record");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_output_kfunc_pos);
+
+fn smoke_bpf_ringbuf_query_kfunc() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+
+        // A program returning `bpf_ringbuf_query(map, RB_RING_SIZE)`.
+        let ring_size_prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 1), // RB_RING_SIZE
+            call("narf_ringbuf_query"),
+            EXIT,
+        ];
+        let p = load_with_map("rbqsz", asm(&ring_size_prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(4096)) => {}
+            Some(Outcome::Returned(_)) => return Err("query(RING_SIZE) was not the ring size"),
+            _ => return Err("query(RING_SIZE) did not run"),
+        }
+
+        // After one 8-byte output the available data is header + padded payload
+        // = 16 bytes, which query(AVAIL_DATA) must report.
+        let out_prog = alloc::vec![
+            st_imm(10, -8, 0x11),
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_reg(2, 10),
+            alu_imm(AluOp::Add, 2, -8),
+            mov_imm(3, 8),
+            mov_imm(4, 0),
+            call("narf_ringbuf_output"),
+            EXIT,
+        ];
+        let op = load_with_map("rbqo", asm(&out_prog), &m).map_err(|_| "load rejected")?;
+        op.run_atomic([0; 4], 4).ok_or("output run declined")?;
+
+        let avail_prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 0), // RB_AVAIL_DATA
+            call("narf_ringbuf_query"),
+            EXIT,
+        ];
+        let ap = load_with_map("rbqa", asm(&avail_prog), &m).map_err(|_| "load rejected")?;
+        match ap.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(16)) => Ok(()),
+            Some(Outcome::Returned(_)) => Err("query(AVAIL_DATA) was not the record footprint"),
+            _ => Err("query(AVAIL_DATA) did not run"),
+        }
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_query_kfunc);
+
+fn smoke_bpf_ringbuf_output_kfunc_neg() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+
+        // An unknown flag bit is -EINVAL.
+        let bad_flags = alloc::vec![
+            st_imm(10, -8, 0x22),
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_reg(2, 10),
+            alu_imm(AluOp::Add, 2, -8),
+            mov_imm(3, 8),
+            mov_imm(4, 0x100), // no such flag
+            call("narf_ringbuf_output"),
+            EXIT,
+        ];
+        let p = load_with_map("rbbad", asm(&bad_flags), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(v)) if v as i64 == -22 => {}
+            _ => return Err("an unknown output flag was not -EINVAL"),
+        }
+
+        // Output on a map that is not a ring buffer is -EINVAL — the runtime
+        // guard, since the map handle type does not carry the kind.
+        let hash = mk(MapKind::Hash, 4, 8, 4).map_err(|_| "Hash create failed")?;
+        let on_hash = alloc::vec![
+            st_imm(10, -8, 0x33),
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_reg(2, 10),
+            alu_imm(AluOp::Add, 2, -8),
+            mov_imm(3, 8),
+            mov_imm(4, 0),
+            call("narf_ringbuf_output"),
+            EXIT,
+        ];
+        let hp = load_with_map("rbhash", asm(&on_hash), &hash).map_err(|_| "load rejected")?;
+        match hp.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(v)) if v as i64 == -22 => Ok(()),
+            _ => Err("output on a non-ring-buffer map was not -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_output_kfunc_neg);
+
+// ── RingBuf: reserve / submit / discard ─────────────────────────────
+
+fn smoke_bpf_ringbuf_reserve_submit_kfunc() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+
+        // Reserve 16 bytes, write two words into the reserved region, submit.
+        //   0 r1=map; 1 r2=16; 2 r3=0; 3 r0=reserve
+        //   4 if r0==0 goto 11(out); 5 r6=r0
+        //   6 *(u64*)(r6+0)=0x1111; 7 *(u64*)(r6+8)=0x2222
+        //   8 r1=r6; 9 r2=0; 10 submit
+        //   11 r0=0; 12 exit
+        let prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 16),
+            mov_imm(3, 0),
+            call("narf_ringbuf_reserve"),
+            jeq_imm(0, 0, 6),
+            mov_reg(6, 0),
+            st_imm(6, 0, 0x1111),
+            st_imm(6, 8, 0x2222),
+            mov_reg(1, 6),
+            mov_imm(2, 0),
+            call("narf_ringbuf_submit"),
+            mov_imm(0, 0),
+            EXIT,
+        ];
+        let p = load_with_map("rbresv", asm(&prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(0)) => {}
+            Some(Outcome::Returned(_)) => return Err("reserve/submit program did not return 0"),
+            Some(Outcome::Trapped(_)) => return Err("reserve/submit program trapped"),
+            None => return Err("run declined"),
+        }
+
+        // The consumer sees the record the program filled through the reserved
+        // region — proof the writes landed and submit published them.
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+        let rec = rb.consume_one().ok_or("no record after reserve/submit")?;
+        if rec.len() != 16 {
+            return Err("the submitted record was the wrong length");
+        }
+        let w0 = u64::from_le_bytes(rec[0..8].try_into().map_err(|_| "bad slice")?);
+        let w1 = u64::from_le_bytes(rec[8..16].try_into().map_err(|_| "bad slice")?);
+        if w0 != 0x1111 || w1 != 0x2222 {
+            return Err("the submitted record did not hold what the program wrote");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_reserve_submit_kfunc);
+
+fn smoke_bpf_ringbuf_reserve_discard_publishes_nothing() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+
+        // Reserve, write, then discard: the consumer must see nothing.
+        let prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 16),
+            mov_imm(3, 0),
+            call("narf_ringbuf_reserve"),
+            jeq_imm(0, 0, 5),
+            mov_reg(6, 0),
+            st_imm(6, 0, 0x9999),
+            mov_reg(1, 6),
+            mov_imm(2, 0),
+            call("narf_ringbuf_discard"),
+            mov_imm(0, 0),
+            EXIT,
+        ];
+        let p = load_with_map("rbdisc", asm(&prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(0)) => {}
+            _ => return Err("reserve/discard program did not run to 0"),
+        }
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+        if rb.consume_one().is_some() {
+            return Err("a discarded reservation was published to the consumer");
+        }
+        if rb.available_data() != 0 {
+            return Err("a discarded reservation left data in the ring");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_reserve_discard_publishes_nothing);
+
+fn smoke_bpf_ringbuf_reserve_null_when_oversize() -> TestResult {
+    checked(|| {
+        // A reserve larger than the staging area returns null at run time; the
+        // program's null branch is taken and reports it. The non-null branch
+        // (never reached here) still verifies, which is what lets the program
+        // load at all.
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 1000), // > MAX_RESERVE (512)
+            mov_imm(3, 0),
+            call("narf_ringbuf_reserve"),
+            jeq_imm(0, 0, 4), // if null goto the sentinel at insn 9
+            mov_reg(6, 0),
+            mov_reg(1, 6),
+            mov_imm(2, 0),
+            call("narf_ringbuf_submit"),
+            mov_imm(0, 7), // sentinel: the null path was taken
+            EXIT,
+        ];
+        let p = load_with_map("rbovr", asm(&prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(7)) => {}
+            Some(Outcome::Returned(0)) => return Err("an oversize reserve did not return null"),
+            _ => return Err("oversize reserve program did not run"),
+        }
+        // Nothing was staged or published.
+        if m.ringbuf().and_then(|rb| rb.consume_one()).is_some() {
+            return Err("an oversize reserve still published a record");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_reserve_null_when_oversize);

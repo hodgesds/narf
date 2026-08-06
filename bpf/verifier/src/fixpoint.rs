@@ -1341,6 +1341,13 @@ impl Analysis<'_, '_> {
 
         self.check_args(st, at, &desc)?;
 
+        // For a return that acquires a byte region (`bpf_ringbuf_reserve`), the
+        // region is sized by its constant size argument. Read it now, while the
+        // argument registers still hold it — they are cleared below — so the
+        // returned pointer can carry a size and a write through it be proved in
+        // bounds against exactly what was reserved.
+        let acquired_mem_size = self.acquired_mem_size(st, at, &desc)?;
+
         // Record the resolution for codegen. After `check_args`, so a site only
         // lands here once the call itself is well-typed — a program that fails
         // verification produces no `VerifiedProgram` at all, but keeping the
@@ -1406,8 +1413,64 @@ impl Analysis<'_, '_> {
         } else {
             NO_REF
         };
-        st.regs[Reg::R0.as_usize()] = value_of(&desc.ret, ret_ref);
+        let mut ret = value_of(&desc.ret, ret_ref);
+        // Stamp the acquired region's size (see above). Only an acquiring `Mem`
+        // return has one; every other return kind leaves `ret` untouched.
+        if let (AbsValue::Ptr(p), Some(sz)) = (&mut ret, acquired_mem_size) {
+            p.size = Some(sz);
+        }
+        st.regs[Reg::R0.as_usize()] = ret;
         Ok(())
+    }
+
+    /// The byte size of an acquired region return, from its constant size
+    /// argument — or `None` if the return does not acquire a byte region.
+    ///
+    /// `bpf_ringbuf_reserve(map, size, flags)` returns a region of exactly
+    /// `size` bytes, and `size` must be a proven constant so the region can be
+    /// bounded at verification time — Linux requires the same. The size is the
+    /// argument the descriptor marks [`ArgFlags::CONST`]; `check_args` has
+    /// already proved that argument is a single value.
+    fn acquired_mem_size(
+        &mut self,
+        st: &mut AbsState,
+        at: u32,
+        desc: &KfuncDesc,
+    ) -> Result<Option<u64>, VerifyError> {
+        let acquires_mem = matches!(
+            desc.ret.kind,
+            TypeKind::Ptr {
+                kind: PtrKind::Mem,
+                ..
+            }
+        ) && desc.ret.consumes_in_arg_position();
+        if !acquires_mem {
+            return Ok(None);
+        }
+        // A descriptor of this shape without exactly one `CONST` size argument
+        // is malformed. `KfuncDesc::validate` rejects it, but a missing size
+        // would leave the region unbounded, so guard rather than trust.
+        let sig_err = |arg| VerifyError::KfuncSignature {
+            at,
+            arg,
+            expected: desc.ret,
+        };
+        let idx = desc
+            .args
+            .iter()
+            .position(|a| a.flags.contains(ArgFlags::CONST))
+            .ok_or_else(|| sig_err(0))?;
+        let reg = Reg::new(idx as u8 + 1).ok_or_else(|| sig_err(idx))?;
+        let AbsValue::Scalar(s) = self.get(st, at, reg)? else {
+            return Err(sig_err(idx));
+        };
+        let c = s.as_const().ok_or_else(|| sig_err(idx))?;
+        // The runtime caps the actual reservation; the verifier's job is only
+        // to bound writes to what the program named. A `u64` reinterpretation
+        // of a negative constant is an absurdly large region the runtime will
+        // decline (returning null), which the mandatory null-check then
+        // catches — so it is sound, if useless, and needs no rejection here.
+        Ok(Some(c as u64))
     }
 
     fn check_args(
@@ -1453,7 +1516,18 @@ impl Analysis<'_, '_> {
                         PtrKind::MapValue => PtrClass::MapValue,
                         PtrKind::LockGuard => PtrClass::LockGuard,
                     };
-                    if kind == PtrKind::Mem {
+                    if kind == PtrKind::Mem && arg.consumes_in_arg_position() {
+                        // A released byte-region handle
+                        // (`bpf_ringbuf_submit`/`discard`): the whole acquired
+                        // region is handed back, so it must actually be a `Mem`
+                        // region and — as for every other non-`Mem` pointer
+                        // argument — its offset must be exactly zero. There is
+                        // no separate length to bound; the release is
+                        // discharged below.
+                        if p.class != PtrClass::Mem || p.off.as_const() != Some(0) {
+                            return Err(bad);
+                        }
+                    } else if kind == PtrKind::Mem {
                         // A byte region may be anything with a length: a stack
                         // slice, a map value, an arena range.
                         self.check_mem_arg(st, at, k, desc, &p)?;

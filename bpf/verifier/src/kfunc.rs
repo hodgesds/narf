@@ -328,8 +328,13 @@ impl ArgDesc {
                 kind: PtrKind::LockGuard,
                 ..
             } => true,
+            // An `Object` handle and an acquired byte region are both linear
+            // when their domain says so — `Owned<T>` (a refcounted object,
+            // released by a kfunc) and the region `bpf_ringbuf_reserve` hands
+            // back (released by `bpf_ringbuf_submit`/`discard`). Same rule for
+            // both: acquired in return position, released in argument position.
             TypeKind::Ptr {
-                kind: PtrKind::Object,
+                kind: PtrKind::Object | PtrKind::Mem,
                 ..
             } => self.domain.requires_release(),
             _ => false,
@@ -494,6 +499,31 @@ impl KfuncDesc {
         {
             return Err(KfuncError::SleepableLockGuard);
         }
+        // An acquired byte-region return (`bpf_ringbuf_reserve`) is sized by a
+        // constant argument, so a write through the region can be proved in
+        // bounds. Without exactly one `CONST` scalar argument the region would
+        // have no size the verifier could bound against — an unbounded writable
+        // pointer, which is the one thing a returned region must never be.
+        if matches!(
+            self.ret.kind,
+            TypeKind::Ptr {
+                kind: PtrKind::Mem,
+                ..
+            }
+        ) && self.ret.consumes_in_arg_position()
+        {
+            let mut consts = 0;
+            let mut i = 0;
+            while i < self.args.len() {
+                if self.args[i].flags.contains(ArgFlags::CONST) {
+                    consts += 1;
+                }
+                i += 1;
+            }
+            if consts != 1 {
+                return Err(KfuncError::AcquiredMemWithoutConstSize);
+            }
+        }
         Ok(())
     }
 }
@@ -527,6 +557,10 @@ pub enum KfuncError {
     /// not a rejection: `Scalar::signed_bits(0)` computes `1 << (bits - 1)` and
     /// underflowed.
     BadScalarWidth { at: usize, bits: u8 },
+    /// An acquired byte-region return (a `Mem` pointer whose domain requires
+    /// release) had no single `CONST` argument to size it, which would leave
+    /// the returned region unbounded.
+    AcquiredMemWithoutConstSize,
 }
 
 /// Validate one type descriptor in isolation.
