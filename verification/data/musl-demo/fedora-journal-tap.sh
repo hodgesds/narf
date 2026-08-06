@@ -66,9 +66,12 @@ if [ ! -f "$narf_cursor" ]; then
     + _SYSTEMD_USER_UNIT=plasma-kded6.service \
     + _SYSTEMD_USER_UNIT=plasma-ksmserver.service \
     + _SYSTEMD_USER_UNIT=plasma-kcminit.service \
+    + _SYSTEMD_USER_UNIT=plasma-kactivitymanagerd.service \
     + _COMM=kwin_wayland \
     + _COMM=kwin_wayland_wrapper \
     + _COMM=startplasma-wayland \
+    + _COMM=kactivitymanagerd \
+    + _COMM=plasmashell \
     --no-pager --output=cat 2>&1 |
     while IFS= read -r line; do
       [ -n "$line" ] || continue
@@ -84,9 +87,12 @@ while :; do
     + _SYSTEMD_USER_UNIT=plasma-kded6.service \
     + _SYSTEMD_USER_UNIT=plasma-ksmserver.service \
     + _SYSTEMD_USER_UNIT=plasma-kcminit.service \
+    + _SYSTEMD_USER_UNIT=plasma-kactivitymanagerd.service \
     + _COMM=kwin_wayland \
     + _COMM=kwin_wayland_wrapper \
     + _COMM=startplasma-wayland \
+    + _COMM=kactivitymanagerd \
+    + _COMM=plasmashell \
     --no-pager --output=cat 2>&1 |
     while IFS= read -r line; do
       [ -n "$line" ] || continue

@@ -171,6 +171,16 @@ unit_diag_once() {
   systemctl --user show plasma-kwin_wayland.service \
     -p Type -p BusName -p ActiveState -p SubState -p Result -p ExecMainPID 2>&1 |
     while IFS= read -r l; do printf 'UNITBLOCK: %s\n' "$l"; done
+  # Dump the FULL status of every failed user unit, not just its name.
+  # plasma-kactivitymanagerd.service ends `failed` and owns
+  # org.kde.ActivityManager, which plasmashell blocks on at startup — so
+  # its exit code and last log lines decide the whole desktop, and the
+  # unit list alone does not carry them.
+  echo "UNITBLOCK: --- failed user units, in full ---"
+  for u in $(systemctl --user list-units --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}'); do
+    systemctl --user status "$u" --no-pager -n 25 2>&1 |
+      while IFS= read -r l; do printf 'UNITFAIL: %s\n' "$l"; done
+  done
   echo "UNITBLOCK: --- names on session bus ---"
   DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" \
     dbus-send --session --print-reply --dest=org.freedesktop.DBus \
