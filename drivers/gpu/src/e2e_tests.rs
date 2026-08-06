@@ -1083,6 +1083,111 @@ fn smoke_drm_sysfs_device_id_attr() -> TestResult {
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_device_id_attr);
 
+// ── Smoke 15b: renderD<N> needs its OWN `device` link, same as card<N> ────
+
+/// The RENDER minor must carry a `device` symlink to the same PCI node the
+/// card minor points at.
+///
+/// libdrm enumerates `/dev/dri/*` and runs every node through
+/// `process_device()`, which rejects a node outright unless BOTH of these
+/// resolve — and both are phrased against the node's own devnum, so
+/// card0 having them does nothing for renderD128:
+///
+///   drmNodeIsDRM(226,128)        stat    /sys/dev/char/226:128/device/drm
+///   drmParseSubsystemType(...)   readlink /sys/dev/char/226:128/device
+///
+/// NARF built renderD<N> with only name/dev/uevent/subsystem, so both failed
+/// and libdrm silently DROPPED the render node from enumeration. The card
+/// still enumerated fine, so the resulting drmDevice had
+/// `available_nodes == 1 << DRM_NODE_PRIMARY` — no render bit.
+///
+/// That is precisely what Mesa tests. `loader_is_device_render_capable()` is
+/// nothing but a `drmGetDevice2()` plus that bit, and when it comes back
+/// false `dri2_initialize_drm()` falls through to
+/// `dri_query_compatible_render_only_device_fd()` and then bails with
+/// "DRI2: failed to get compatible render device" — kwin gets no EGL and
+/// takes the whole Plasma session down with it.
+///
+/// Note the failure needs the node MERGE to work, not just the link to
+/// exist: libdrm unions `available_nodes` across nodes whose bus info is
+/// equal, so if the two minors named different PCI addresses they would stay
+/// two separate single-node devices and the render bit would still be
+/// missing. Hence the equality assertion below rather than a shape check.
+#[cfg(feature = "linux-compat")]
+fn smoke_drm_render_node_device_link_matches_card() -> TestResult {
+    use crate::drm_registry;
+    use narf_filesystem::sysfs;
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "bochs",
+        vid: 0x1234,
+        did: 0x1111,
+    }));
+    crate::drm_sysfs_bridge::populate_drm_class();
+
+    let render = match drm_device_node("renderD128") {
+        Some(r) => r,
+        None => return TestResult::Fail("renderD128 node missing"),
+    };
+    let card = match drm_device_node("card0") {
+        Some(c) => c,
+        None => return TestResult::Fail("card0 node missing"),
+    };
+
+    let render_target = match render.get_symlink("device") {
+        Some(t) => t,
+        None => return TestResult::Fail("renderD128/device is not a symlink"),
+    };
+    let card_target = match card.get_symlink("device") {
+        Some(t) => t,
+        None => return TestResult::Fail("card0/device is not a symlink"),
+    };
+
+    // Both minors sit at the same depth (devices/platform/narf-drm/<node>),
+    // so an identical relative target is what makes drmParsePciBusInfo report
+    // one bus address for both and merge them into a single drmDevice.
+    if render_target != card_target {
+        return TestResult::Fail("renderD128/device must name the same PCI node as card0/device");
+    }
+
+    let addr = render_target.rsplit('/').next().unwrap_or("");
+    if addr.len() != 12 || !addr.starts_with("0000:") || !addr.contains('.') {
+        return TestResult::Fail("renderD128/device target is not a PCI address");
+    }
+
+    // drmNodeIsDRM stats `<node>/device/drm`, so the target must actually
+    // carry a `drm` directory — a dangling link passes the readlink but still
+    // gets the node rejected.
+    let pci = match sysfs::get_root()
+        .get_child("devices")
+        .and_then(|d| d.get_child("pci0000:00"))
+        .and_then(|p| p.get_child(addr))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("renderD128/device target does not resolve"),
+    };
+    let drm_dir = match pci.get_child("drm") {
+        Some(d) => d,
+        None => return TestResult::Fail("PCI node has no drm/ dir; drmNodeIsDRM would fail"),
+    };
+    if drm_dir.get_symlink("renderD128").is_none() {
+        return TestResult::Fail("device/drm/ does not list the render minor");
+    }
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_drm_render_node_device_link_matches_card
+);
+
 // ── Smoke 16: vbios_version attr readable ─────────────────────────────────
 
 #[cfg(feature = "linux-compat")]

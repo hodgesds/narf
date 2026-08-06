@@ -298,6 +298,34 @@ fn populate_card_node(
     kobject_add_uevent_attr(&render_kobj, render_uevent(render_idx, &driver));
     render_kobj.add_symlink("subsystem", "../../../../class/drm");
 
+    // `renderD<M>/device` → the SAME PCI node card<N>/device points at.
+    //
+    // Not redundant with the card's link: libdrm phrases both of its node
+    // filters against the node's OWN devnum, so having them on 226:N does
+    // nothing for 226:M. `process_device()` rejects a node unless
+    //
+    //   drmNodeIsDRM(226,M)       stat("/sys/dev/char/226:M/device/drm")
+    //   drmParseSubsystemType()   readlink("/sys/dev/char/226:M/device")
+    //
+    // both succeed. With no `device` entry here they both failed, so libdrm
+    // silently dropped the render node while still enumerating the card
+    // happily — leaving a drmDevice whose `available_nodes` held only
+    // `1 << DRM_NODE_PRIMARY`.
+    //
+    // That single missing bit is the whole failure. Mesa's
+    // `loader_is_device_render_capable()` is a `drmGetDevice2()` plus a test
+    // of exactly that bit; false sends `dri2_initialize_drm()` into
+    // `dri_query_compatible_render_only_device_fd()`, which also has nothing
+    // to find, and EGL dies with "DRI2: failed to get compatible render
+    // device". kwin then has no EGL and takes the Plasma session with it.
+    //
+    // The target must be byte-identical to the card's: libdrm unions
+    // `available_nodes` only across nodes whose parsed bus info compares
+    // equal, so two different addresses would stay two one-node devices and
+    // the render bit would still be absent. Same depth
+    // (devices/platform/narf-drm/<node>), so the same relative path.
+    render_kobj.add_symlink("device", format!("../../../pci0000:00/{}", pci_addr));
+
     // `card<N>/device/drm/{card<N>,renderD<M>}` — how a consumer walks from a
     // card to its RENDER node.
     //
