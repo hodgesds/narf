@@ -116,6 +116,42 @@ drm_probe_in_session() {
 }
 drm_probed=0
 
+# Why are the Plasma units not starting?
+#
+# They are NOT failing: every one reads "loaded inactive dead start" with a
+# Job id, i.e. a QUEUED start job that never runs, and Result=success /
+# ExecMainStatus=0 (never attempted). Something upstream is blocking them.
+#
+# From the image's own unit files the chain is:
+#   plasma-workspace-wayland.target Requires+BindsTo plasma-kwin_wayland.service
+#   plasma-core.target              After=           plasma-kwin_wayland.service
+#   plasma-kwin_wayland.service     BusName=org.kde.KWinWrapper, no Type=
+#                                   => systemd infers Type=dbus
+# so the whole workspace waits for that ONE name to appear on the session bus.
+#
+# `list-jobs` names the blocking job directly instead of inferring it from
+# dependency files, and ListNames says whether the name is actually there.
+# Ask the bus by explicit address: a bare dbus-send inherits whatever the
+# environment happens to hold and returned an EMPTY name list in one boot and
+# a populated one in another, which is an instrument difference, not a system
+# difference.
+unit_diag_once() {
+  echo "UNITBLOCK: --- systemctl --user list-jobs ---"
+  systemctl --user list-jobs --no-pager 2>&1 |
+    while IFS= read -r l; do printf 'UNITBLOCK: %s\n' "$l"; done
+  echo "UNITBLOCK: --- plasma-kwin_wayland.service ---"
+  systemctl --user show plasma-kwin_wayland.service \
+    -p Type -p BusName -p ActiveState -p SubState -p Result -p ExecMainPID 2>&1 |
+    while IFS= read -r l; do printf 'UNITBLOCK: %s\n' "$l"; done
+  echo "UNITBLOCK: --- names on session bus ---"
+  DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" \
+    dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+      /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>&1 |
+    grep -oE '"[^"]+"' |
+    while IFS= read -r l; do printf 'UNITBLOCK: name %s\n' "$l"; done
+  echo "UNITBLOCK: done"
+}
+
 for i in {1..180}; do
   proc_state kwin_wayland kwin
   proc_state plasmashell plasma
@@ -128,6 +164,7 @@ for i in {1..180}; do
   if [ "$drm_probed" = 0 ] && [ "$kwin" != "none" ]; then
     drm_probed=1
     drm_probe_in_session
+    unit_diag_once
   fi
   printf 'PLASMA-PROBE %s start=[%s] session=[%s] kwin=[%s] kcminit=[%s count=%s] kded=[%s] ksm=[%s] plasma=[%s]\n' \
     "$i" "$start" "$session" "$kwin" "$kcminit" "$kcminit_count" "$kded" "$ksm" "$plasma"
