@@ -1540,3 +1540,312 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_fsx_open_honours_supplementary_group
 );
+
+/// Replicate systemd-journald's runtime-journal create-and-rotate sequence.
+///
+/// On the Fedora KDE image journald logs, every boot:
+///
+///   /run/log/journal/<machine-id>/system.journal: Journal file uses a
+///   different sequence number ID, rotating.
+///   Failed to create new runtime journal: No such file or directory
+///
+/// and the runtime journal is then missing for the rest of the boot, which
+/// costs every later diagnostic ("No journal files were opened").
+///
+/// The ENOENT is the interesting part: the directory demonstrably EXISTS
+/// (journald just read the old journal out of it), yet creating the
+/// replacement reports "No such file or directory". So this replicates what
+/// journald actually does, step by step, rather than asserting the error:
+///
+///   mkdir -p <dir>                          (journal_directory_setup)
+///   openat(dir, name, O_CREAT|O_EXCL|O_RDWR, 0640)   (journal_file_open)
+///   ftruncate to the initial file size
+///   rename(name, name~)                     (journal_file_rotate)
+///   openat(dir, name, O_CREAT|O_EXCL|O_RDWR, 0640)   -- the create that fails
+///
+/// Each step is asserted separately so a failure names the syscall that
+/// broke, not just "journald is unhappy". If this passes, the fault is
+/// elsewhere (tmpfs-specific behaviour, or journald's dirfd handling) and
+/// that is a useful negative result too.
+fn smoke_abi_fsx_journald_rotate_sequence() -> TestResult {
+    with_memfs("/abi-jrnl", "jrnl", &[], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        const O_RDWR: u64 = 2;
+        const O_CREAT: u64 = 0o100;
+        const O_EXCL: u64 = 0o200;
+        const O_DIRECTORY: u64 = 0o200000;
+
+        // journald creates the machine-id directory tree first.
+        let dir = b"/abi-jrnl/log\0";
+        let dir2 = b"/abi-jrnl/log/journal\0";
+        let dir3 = b"/abi-jrnl/log/journal/mid\0";
+        for d in [&dir[..], &dir2[..], &dir3[..]] {
+            let r = call(
+                Syscall::Mkdirat.raw(),
+                a3(AT_FDCWD, d.as_ptr() as u64, 0o755, 0),
+            );
+            if r != Some(0) {
+                return Err("mkdir of the journal directory tree failed");
+            }
+        }
+
+        // journald holds an fd on the directory and creates the journal
+        // RELATIVE to it — that dirfd path is the part most likely to break.
+        let dfd = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir3.as_ptr() as u64, O_DIRECTORY, 0),
+        );
+        let dfd = match dfd {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("could not open the journal directory as a dirfd"),
+        };
+
+        let name = b"system.journal\0";
+        let fd = call(
+            Syscall::Openat.raw(),
+            a3(dfd, name.as_ptr() as u64, O_CREAT | O_EXCL | O_RDWR, 0o640),
+        );
+        let fd = match fd {
+            Some(v) if v >= 0 => v,
+            Some(v) => {
+                let _ = call(Syscall::Close.raw(), a0(dfd));
+                let _ = v;
+                return Err("openat(dirfd, system.journal, O_CREAT|O_EXCL) failed");
+            }
+            None => {
+                let _ = call(Syscall::Close.raw(), a0(dfd));
+                return Err("openat(dirfd, system.journal, O_CREAT|O_EXCL) returned nothing");
+            }
+        };
+        // journald sizes the file up front rather than appending.
+        if call(Syscall::Ftruncate.raw(), a1(fd as u64, 8 * 1024 * 1024)) != Some(0) {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            let _ = call(Syscall::Close.raw(), a0(dfd));
+            return Err("ftruncate of the new journal failed");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+        // Rotation: rename the live journal aside, then create a fresh one
+        // under the SAME name. This pair is what the boot log is doing.
+        let old = b"/abi-jrnl/log/journal/mid/system.journal\0";
+        let rotated = b"/abi-jrnl/log/journal/mid/system@0001.journal~\0";
+        if call(
+            Syscall::Rename.raw(),
+            a1(old.as_ptr() as u64, rotated.as_ptr() as u64),
+        ) != Some(0)
+        {
+            let _ = call(Syscall::Close.raw(), a0(dfd));
+            return Err("rename of the live journal aside (rotation) failed");
+        }
+
+        let fd2 = call(
+            Syscall::Openat.raw(),
+            a3(dfd, name.as_ptr() as u64, O_CREAT | O_EXCL | O_RDWR, 0o640),
+        );
+        let _ = call(Syscall::Close.raw(), a0(dfd));
+        match fd2 {
+            Some(v) if v >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+                Ok(())
+            }
+            Some(v) if v == ENOENT => {
+                Err("post-rotation create returned ENOENT — this is journald's \
+                 'Failed to create new runtime journal: No such file or directory'")
+            }
+            _ => Err("post-rotation openat(O_CREAT|O_EXCL) did not succeed"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_journald_rotate_sequence);
+
+/// `renameat(dirfd, …)` must resolve relative paths against the DIRFD.
+///
+/// Companion to `smoke_abi_fsx_journald_rotate_sequence`, and deliberately
+/// kept separate: that test rotates with absolute paths and PASSES, so on
+/// its own it certifies a rotation journald never performs. systemd's
+/// `journal_file_dispose()` rotates with
+/// `renameat(dir_fd, name, dir_fd, newname)` against the directory fd it
+/// already holds. NARF's `sys_renameat` discarded BOTH dirfds
+/// (`let _old_dirfd = args.arg0;`) and proxied straight to `sys_rename`, so
+/// a relative path resolved against the CWD instead — which fails outright,
+/// or, worse, renames a same-named file in the wrong directory.
+///
+/// Two tests rather than one tightened test because they fail for different
+/// reasons and a single combined case cannot tell "rename is broken" from
+/// "the dirfd is ignored".
+///
+/// Asserted three ways so a partial implementation cannot pass:
+///   1. the rename SUCCEEDS,
+///   2. the new name exists in the target directory,
+///   3. the old name is GONE from it — a handler that ignored the dirfd and
+///      happened to create something in the cwd would still trip this.
+fn smoke_abi_fsx_renameat_honours_dirfd() -> TestResult {
+    with_memfs("/abi-rnat", "rnat", &[], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        const O_RDWR: u64 = 2;
+        const O_CREAT: u64 = 0o100;
+        const O_EXCL: u64 = 0o200;
+        const O_DIRECTORY: u64 = 0o200000;
+
+        let dir = b"/abi-rnat/d\0";
+        if call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0o755, 0),
+        ) != Some(0)
+        {
+            return Err("mkdir of the rename directory failed");
+        }
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, O_DIRECTORY, 0),
+        ) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("could not open the directory as a dirfd"),
+        };
+
+        let src = b"live\0";
+        let dst = b"rotated~\0";
+        match call(
+            Syscall::Openat.raw(),
+            a3(dfd, src.as_ptr() as u64, O_CREAT | O_EXCL | O_RDWR, 0o640),
+        ) {
+            Some(v) if v >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+            }
+            _ => {
+                let _ = call(Syscall::Close.raw(), a0(dfd));
+                return Err("could not create the source file relative to the dirfd");
+            }
+        }
+
+        let r = call(
+            Syscall::Renameat.raw(),
+            a3(dfd, src.as_ptr() as u64, dfd, dst.as_ptr() as u64),
+        );
+        if r != Some(0) {
+            let _ = call(Syscall::Close.raw(), a0(dfd));
+            return Err(
+                "renameat(dirfd, relative) failed — journald's journal_file_dispose() \
+                 rotates exactly this way",
+            );
+        }
+
+        // The new name must exist IN THAT DIRECTORY...
+        let moved = call(
+            Syscall::Openat.raw(),
+            a3(dfd, dst.as_ptr() as u64, O_RDWR, 0),
+        );
+        let moved_ok = matches!(moved, Some(v) if v >= 0);
+        if let Some(v) = moved {
+            if v >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+            }
+        }
+        // ...and the old name must be gone from it.
+        let stale = call(
+            Syscall::Openat.raw(),
+            a3(dfd, src.as_ptr() as u64, O_RDWR, 0),
+        );
+        let stale_gone = !matches!(stale, Some(v) if v >= 0);
+        if let Some(v) = stale {
+            if v >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(dfd));
+
+        if !moved_ok {
+            return Err(
+                "renameat reported success but the new name is not in the dirfd's directory",
+            );
+        }
+        if !stale_gone {
+            return Err(
+                "renameat reported success but the old name is still in the dirfd's directory",
+            );
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_renameat_honours_dirfd);
+
+/// `renameat2(olddirfd, …, newdirfd, …)` must honour its dirfds too.
+///
+/// Same defect as `smoke_abi_fsx_renameat_honours_dirfd`, in a second
+/// handler that was documented as intentional: "dirfds are treated as
+/// AT_FDCWD — paths must be absolute". glibc implements plain `rename(2)`
+/// on top of renameat2, so this is the path a distro libc actually takes,
+/// and a relative path there resolved against the CWD.
+///
+/// Fixing one handler and not the other is exactly how this class of bug
+/// survives, so both are pinned separately.
+fn smoke_abi_fsx_renameat2_honours_dirfd() -> TestResult {
+    with_memfs("/abi-rn2", "rn2", &[], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        const O_RDWR: u64 = 2;
+        const O_CREAT: u64 = 0o100;
+        const O_EXCL: u64 = 0o200;
+        const O_DIRECTORY: u64 = 0o200000;
+
+        let dir = b"/abi-rn2/d\0";
+        if call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0o755, 0),
+        ) != Some(0)
+        {
+            return Err("mkdir failed");
+        }
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, O_DIRECTORY, 0),
+        ) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("could not open the directory as a dirfd"),
+        };
+
+        let src = b"a\0";
+        let dst = b"b\0";
+        match call(
+            Syscall::Openat.raw(),
+            a3(dfd, src.as_ptr() as u64, O_CREAT | O_EXCL | O_RDWR, 0o644),
+        ) {
+            Some(v) if v >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+            }
+            _ => {
+                let _ = call(Syscall::Close.raw(), a0(dfd));
+                return Err("could not create the source relative to the dirfd");
+            }
+        }
+
+        // flags = 0 (plain rename semantics), both dirfds = our directory.
+        // `a3` fills arg0..arg3 and leaves arg4 (flags) at its default 0.
+        let r = call(
+            Syscall::Renameat2.raw(),
+            a3(dfd, src.as_ptr() as u64, dfd, dst.as_ptr() as u64),
+        );
+        if r != Some(0) {
+            let _ = call(Syscall::Close.raw(), a0(dfd));
+            return Err("renameat2(dirfd, relative) failed");
+        }
+
+        let moved = call(
+            Syscall::Openat.raw(),
+            a3(dfd, dst.as_ptr() as u64, O_RDWR, 0),
+        );
+        let moved_ok = matches!(moved, Some(v) if v >= 0);
+        if let Some(v) = moved {
+            if v >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(dfd));
+        if !moved_ok {
+            return Err(
+                "renameat2 reported success but the new name is not in the dirfd's directory",
+            );
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_renameat2_honours_dirfd);
