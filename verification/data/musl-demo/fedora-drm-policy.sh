@@ -85,3 +85,22 @@ if [ -x /usr/local/libexec/narf-drm-probe ]; then
 else
   echo "DRMC: probe binary MISSING at /usr/local/libexec/narf-drm-probe"
 fi
+
+# ── The same probe, as uid 1000 ──────────────────────────────────────────
+#
+# Every "OPEN OK as uid 1000" check above uses `: < /dev/dri/cardN`, which is
+# O_RDONLY. kwin opens O_RDWR, and when logind cannot hand it an fd
+# ("Could not determine the active graphical session") that direct open is
+# the only path it has — then it reports "Failed to open drm device
+# /dev/dri/card0" and exits, taking the session with it.
+#
+# So the O_RDONLY result proves nothing about the case that actually matters.
+# narf-drm-probe opens O_RDWR, so running it under uid 1000 tests exactly what
+# kwin does. Prints unconditionally; a missing line here is itself a finding.
+if [ -x /usr/local/libexec/narf-drm-probe ]; then
+  echo "DRMC-U1000: running probe as uid 1000 (O_RDWR, as kwin does)"
+  /usr/bin/setpriv --reuid=1000 --regid=39 --clear-groups \
+    /usr/local/libexec/narf-drm-probe 2>&1 |
+    while IFS= read -r l; do printf 'DRMC-U1000: %s\n' "$l"; done
+  echo "DRMC-U1000: done"
+fi
