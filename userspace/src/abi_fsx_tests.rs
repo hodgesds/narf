@@ -1460,3 +1460,80 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_fsx_open_permission_denied_is_eacces
 );
+
+/// open(2) must consult the SUPPLEMENTARY group list, not just the fsgid.
+///
+/// The unit test in filesystem/ pins the permission algebra. This pins the
+/// WIRING, which is a separate thing and the half that actually broke: for a
+/// long time `setgroups`/`getgroups` round-tripped the list perfectly while
+/// `current_accessor()` never passed it to `posix_access_ok`, so every ABI
+/// test stayed green and uid 1000 still could not open a file owned by a
+/// group it holds supplementarily.
+///
+/// That is not an abstract gap — it is why KDE never rendered.
+/// /dev/dri/card0 is crw-rw---- root:video and `narf` is in `video`
+/// supplementarily, so kwin's open(O_RDWR) got EACCES and the session died.
+///
+/// Staged as: file owned by root:GID mode 0660, caller uid 1000 with a
+/// primary gid that does NOT match, holding GID only via setgroups.
+fn smoke_abi_fsx_open_honours_supplementary_group() -> TestResult {
+    with_memfs("/abi-suppgrp", "abi", &[("dev", b"x")], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        const GID: u32 = 39; // `video`, mirroring the DRM node that broke
+        let path = b"/abi-suppgrp/dev\0";
+
+        // root:GID, rw for owner and group, nothing for other — exactly the
+        // shape of a DRM primary node.
+        if call(
+            Syscall::Chown.raw(),
+            a2(path.as_ptr() as u64, 0, GID as u64),
+        ) != Some(0)
+        {
+            return Err("chown root:39 setup failed");
+        }
+        if call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o660)) != Some(0) {
+            return Err("chmod 0660 setup failed");
+        }
+
+        // Install GID supplementarily. Must happen while still privileged.
+        let groups = [GID];
+        if call(
+            Syscall::Setgroups.raw(),
+            a1(groups.len() as u64, groups.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setgroups([39]) setup failed");
+        }
+        // Primary gid deliberately NOT 39, so only the supplementary list can
+        // select the group triplet. Without that this passes vacuously.
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            return Err("setresgid(1000) setup failed");
+        }
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            return Err("setresuid(1000) setup failed");
+        }
+
+        let opened = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 2 /* O_RDWR */, 0),
+        );
+        // Restore BEFORE asserting so a failure cannot strand the task at
+        // uid 1000 and cascade into every later test.
+        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        let _ = call(Syscall::Setresgid.raw(), a2(0, 0, 0));
+        let _ = call(Syscall::Setgroups.raw(), a1(0, 0));
+
+        match opened {
+            Some(v) if v >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+                Ok(())
+            }
+            Some(v) if v == EACCES => Err(
+                "open(O_RDWR) denied despite holding the file's gid supplementarily — \
+                 current_accessor() is not passing the setgroups list through",
+            ),
+            _ => Err("open(O_RDWR) on a 0660 root:39 file with gid 39 supplementary must succeed"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_open_honours_supplementary_group);
