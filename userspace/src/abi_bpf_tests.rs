@@ -633,12 +633,13 @@ fn smoke_abi_bpf_map_create_unsupported_kinds() -> TestResult {
         // absent. `EOPNOTSUPP` rather than `EINVAL` so a probing loader can
         // tell "this kernel does not do that" from "you passed nonsense" —
         // libbpf's feature probes depend on exactly that difference.
+        // `BPF_MAP_TYPE_RINGBUF` is NOT here any more — it is implemented (see
+        // `smoke_abi_bpf_ringbuf_*`). The rest stay permanently absent.
         for kind in [
             BPF_MAP_TYPE_UNSPEC,
             BPF_MAP_TYPE_PROG_ARRAY,
             BPF_MAP_TYPE_LRU_HASH,
             BPF_MAP_TYPE_LPM_TRIE,
-            BPF_MAP_TYPE_RINGBUF,
             9999,
         ] {
             if create_map(kind, 4, 8, 4) != Some(EOPNOTSUPP) {
@@ -1430,6 +1431,65 @@ fn smoke_abi_bpf_map_batch_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_map_batch_neg);
+
+// ── BPF_MAP_TYPE_RINGBUF ─────────────────────────────────────────────
+
+fn smoke_abi_bpf_ringbuf_create_and_reject_elem() -> TestResult {
+    with_setup(|| {
+        // A page-multiple power of two creates. Key and value widths are zero —
+        // a ring buffer has neither.
+        let fd = create_map(BPF_MAP_TYPE_RINGBUF, 0, 0, 4096).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_MAP_CREATE refused a valid ring buffer");
+        }
+        // The keyed element commands are all EINVAL on a ring buffer, exactly
+        // as Linux's ringbuf element ops are — it is reached through mmap and
+        // kfuncs, not through the element syscalls.
+        let key: u32 = 0;
+        let kptr = (&key) as *const u32 as u64;
+        let mut val: u64 = 0;
+        let vptr = (&mut val) as *mut u64 as u64;
+        for cmd in [
+            BPF_MAP_LOOKUP_ELEM,
+            BPF_MAP_DELETE_ELEM,
+            BPF_MAP_GET_NEXT_KEY,
+        ] {
+            if elem(cmd, fd, kptr, vptr, 0) != Some(EINVAL) {
+                return Err("an element command on a ring buffer was not EINVAL");
+            }
+        }
+        if elem(BPF_MAP_UPDATE_ELEM, fd, kptr, vptr, BPF_ANY) != Some(EINVAL) {
+            return Err("update on a ring buffer was not EINVAL");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_ringbuf_create_and_reject_elem);
+
+fn smoke_abi_bpf_ringbuf_create_neg() -> TestResult {
+    with_setup(|| {
+        // Not a power of two, sub-page, and a non-zero key or value width are
+        // each EINVAL; a ring past the footprint cap is E2BIG.
+        if create_map(BPF_MAP_TYPE_RINGBUF, 0, 0, 4096 + 8) != Some(EINVAL) {
+            return Err("a non-power-of-two ring buffer was accepted");
+        }
+        if create_map(BPF_MAP_TYPE_RINGBUF, 0, 0, 2048) != Some(EINVAL) {
+            return Err("a sub-page ring buffer was accepted");
+        }
+        if create_map(BPF_MAP_TYPE_RINGBUF, 4, 0, 4096) != Some(EINVAL) {
+            return Err("a ring buffer with a key width was accepted");
+        }
+        if create_map(BPF_MAP_TYPE_RINGBUF, 0, 8, 4096) != Some(EINVAL) {
+            return Err("a ring buffer with a value width was accepted");
+        }
+        if create_map(BPF_MAP_TYPE_RINGBUF, 0, 0, 32 * 1024 * 1024) != Some(E2BIG) {
+            return Err("an oversize ring buffer was not E2BIG");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_ringbuf_create_neg);
 
 // ── per-CPU maps through the syscall ────────────────────────────────
 

@@ -19,9 +19,10 @@
 //! trade away for the extable and the arena guard slots — so the JIT must not
 //! be enabled before the real verifier is. [`provisional`] is the reminder.
 //!
-//! Not here yet: arenas and the `RingBuf` map kind (Phase 3 — the four keyed
-//! kinds are in [`map`]), struct_ops trampolines (Phase 5), and the net/perf
-//! attach surfaces (Phase 6).
+//! The [`ringbuf`] map kind's producer/consumer core is in place — a program
+//! reaches it through kfuncs (`bpf_ringbuf_output`, then reserve/submit) and a
+//! consumer will reach it through `mmap` + `poll`; both of those surfaces are
+//! still to come. The four keyed kinds and arenas are in [`map`] and [`arena`].
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -44,6 +45,7 @@ pub mod map;
 pub mod mem;
 pub mod prog;
 pub mod provisional;
+pub mod ringbuf;
 pub mod structops;
 pub mod types;
 

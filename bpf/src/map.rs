@@ -67,12 +67,16 @@ impl CapType for BpfMapCap {
     const KIND: CapKind = CapKind::BpfMap;
 }
 
-/// The four keyed map kinds.
+/// The map kinds NARF implements: four keyed kinds and the ring buffer.
 ///
 /// Discriminants are Linux's `enum bpf_map_type` values, so `kind as u32` is the
 /// wire value with nothing in between to drift. The reverse direction still needs
 /// a match — [`MapKind::from_linux`] — because most of Linux's values have no
 /// kind here and turning an arbitrary `u32` into one has to be able to fail.
+///
+/// [`MapKind::RingBuf`] is the odd one out: it is not keyed and has no value
+/// width, so it does not go through the element ops the other four share. See
+/// [`crate::ringbuf`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum MapKind {
@@ -85,6 +89,10 @@ pub enum MapKind {
     PerCpuHash = 5,
     /// [`MapKind::Array`] with one value slot per CPU.
     PerCpuArray = 6,
+    /// Multi-producer / single-consumer byte stream of variable-length
+    /// records. Not keyed; reached through [`crate::ringbuf::RingBuf`].
+    /// `max_entries` is the data-area size in bytes.
+    RingBuf = 27,
 }
 
 impl MapKind {
@@ -96,6 +104,7 @@ impl MapKind {
             2 => Some(MapKind::Array),
             5 => Some(MapKind::PerCpuHash),
             6 => Some(MapKind::PerCpuArray),
+            27 => Some(MapKind::RingBuf),
             _ => None,
         }
     }
@@ -354,7 +363,39 @@ fn this_cpu(width: usize) -> Result<usize, MapError> {
 }
 
 /// Validate the shape a create request asks for, per-kind.
+/// The largest ring-buffer data area, matching [`MAX_MAP_BYTES`]'s intent for
+/// the keyed kinds: a per-map footprint cap so one fd cannot pin the kernel.
+const MAX_RINGBUF_BYTES: u32 = 16 * 1024 * 1024;
+
+/// Page size the ring-buffer data area must be a multiple of. A ring is
+/// eventually `mmap`ed, and a mapping is page-granular, so a sub-page ring
+/// could never be handed to userspace whole. 4 KiB on both supported arches.
+const RINGBUF_PAGE: u32 = 4096;
+
+/// Validate a `BPF_MAP_TYPE_RINGBUF` creation.
+///
+/// Mirrors Linux's `ringbuf_map_alloc`: no key, no value, and `max_entries`
+/// (the data-area size) a non-zero power of two that is a page multiple.
+fn check_ringbuf_attr(attr: MapAttr) -> Result<(), MapError> {
+    if attr.key_size != 0 || attr.value_size != 0 {
+        return Err(MapError::Invalid);
+    }
+    if attr.max_entries == 0
+        || !attr.max_entries.is_power_of_two()
+        || attr.max_entries % RINGBUF_PAGE != 0
+    {
+        return Err(MapError::Invalid);
+    }
+    if attr.max_entries > MAX_RINGBUF_BYTES {
+        return Err(MapError::TooBig);
+    }
+    Ok(())
+}
+
 fn check_attr(attr: MapAttr) -> Result<(), MapError> {
+    if attr.kind == MapKind::RingBuf {
+        return check_ringbuf_attr(attr);
+    }
     if attr.max_entries == 0 || attr.value_size == 0 || attr.key_size == 0 {
         return Err(MapError::Invalid);
     }
@@ -996,6 +1037,7 @@ pub const MAX_BPF_PINS: u32 = 1024;
 enum MapImpl {
     Array(ArrayMap),
     Hash(HashMap),
+    RingBuf(crate::ringbuf::RingBuf),
 }
 
 impl BpfMap {
@@ -1035,6 +1077,9 @@ impl BpfMap {
         let built = match attr.kind {
             MapKind::Array | MapKind::PerCpuArray => ArrayMap::new(attr).map(MapImpl::Array),
             MapKind::Hash | MapKind::PerCpuHash => HashMap::new(attr).map(MapImpl::Hash),
+            // Infallible past `check_ringbuf_attr` + `charge`: it only
+            // allocates the already-sized, already-charged data area.
+            MapKind::RingBuf => Ok(MapImpl::RingBuf(crate::ringbuf::RingBuf::new(attr))),
         };
         let ops = match built {
             Ok(o) => o,
@@ -1059,11 +1104,30 @@ impl BpfMap {
     }
 
     /// The operations table.
+    ///
+    /// A ring buffer answers this too — with an ops table that refuses every
+    /// element command as `EINVAL`, which is what makes `BPF_MAP_LOOKUP_ELEM`
+    /// and friends on a ring-buffer fd fail cleanly rather than needing a
+    /// special case at every call site.
     #[must_use]
     pub fn ops(&self) -> &dyn BpfMapOps {
         match &self.ops {
             MapImpl::Array(a) => a,
             MapImpl::Hash(h) => h,
+            MapImpl::RingBuf(r) => r,
+        }
+    }
+
+    /// The ring buffer behind this map, or `None` if it is a keyed kind.
+    ///
+    /// The seam the producer path (`bpf_ringbuf_output`) and a future consumer
+    /// (`mmap` + `poll`) reach the stream through, since it is not part of the
+    /// keyed [`BpfMapOps`] surface.
+    #[must_use]
+    pub fn ringbuf(&self) -> Option<&crate::ringbuf::RingBuf> {
+        match &self.ops {
+            MapImpl::RingBuf(r) => Some(r),
+            _ => None,
         }
     }
 
@@ -1182,6 +1246,12 @@ fn uncharge(bytes: u64) {
 /// allocator adds on top is not counted, which is the one respect in which this
 /// under-reports.
 fn footprint_bytes(attr: MapAttr) -> u64 {
+    if attr.kind == MapKind::RingBuf {
+        // The data area, plus the two control pages a future mmap surface adds
+        // (consumer position, producer position). Charged now so the cap is an
+        // over-estimate rather than an under-count.
+        return u64::from(attr.max_entries) + 2 * u64::from(RINGBUF_PAGE);
+    }
     let cpus = cpu_width(attr.kind) as u64;
     let n = u64::from(attr.max_entries);
     let values = stride_for(attr.value_size) as u64 * cpus * n;

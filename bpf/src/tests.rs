@@ -3657,3 +3657,209 @@ fn smoke_bpf_map_value_pseudo_form_is_refused_at_load() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_bpf_map_value_pseudo_form_is_refused_at_load);
+
+// ── RingBuf ─────────────────────────────────────────────────────────
+
+use crate::ringbuf::RingBufError;
+
+/// A ring buffer of `bytes`, created through the map path so creation and the
+/// footprint charge are exercised too.
+fn mk_ring(bytes: u32) -> Result<Arc<BpfMap>, MapError> {
+    mk(MapKind::RingBuf, 0, 0, bytes)
+}
+
+fn smoke_bpf_ringbuf_output_consume_fifo() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let rb = m
+            .ringbuf()
+            .ok_or("ringbuf() returned None for a RingBuf map")?;
+
+        // An empty ring yields nothing.
+        if rb.consume_one().is_some() {
+            return Err("an empty ring produced a record");
+        }
+        // Distinct-length payloads, so a length or padding error shows up as a
+        // mismatched record rather than happening to line up.
+        let records: [&[u8]; 3] = [b"a", b"bcde", b"fghijklmno"];
+        for r in records {
+            rb.output(r)
+                .map_err(|_| "output rejected a record that fits")?;
+        }
+        if rb.available_data() == 0 {
+            return Err("available_data stayed zero after output");
+        }
+        // Records come back in the order they went in, byte-for-byte.
+        for expected in records {
+            let got = rb
+                .consume_one()
+                .ok_or("consume_one returned None too early")?;
+            if got.as_slice() != expected {
+                return Err("a consumed record did not match what was written");
+            }
+        }
+        if rb.consume_one().is_some() {
+            return Err("consume_one produced a record past the last one");
+        }
+        // Fully drained: the two positions meet.
+        if rb.available_data() != 0 || rb.consumer_pos() != rb.producer_pos() {
+            return Err("a drained ring did not settle with consumer == producer");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_output_consume_fifo);
+
+fn smoke_bpf_ringbuf_wraparound_preserves_data() -> TestResult {
+    checked(|| {
+        // The smallest ring, so a modest number of records forces the data area
+        // to wrap — the case where a payload straddles the physical end.
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+
+        // Each record is 200 bytes of payload → 208 with the header, so ~19 fit
+        // before the 4096-byte area wraps. Produce and consume in lockstep well
+        // past that, carrying a per-record marker byte to catch a mis-copied
+        // wrap.
+        let mut payload = [0u8; 200];
+        for round in 0u32..64 {
+            payload[0] = round as u8;
+            payload[199] = (round.wrapping_mul(7)) as u8;
+            rb.output(&payload)
+                .map_err(|_| "output rejected a record during the wrap walk")?;
+            let got = rb
+                .consume_one()
+                .ok_or("consume_one returned None during the wrap walk")?;
+            if got.len() != 200
+                || got[0] != round as u8
+                || got[199] != (round.wrapping_mul(7)) as u8
+            {
+                return Err("a record was corrupted across the ring wrap");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_wraparound_preserves_data);
+
+fn smoke_bpf_ringbuf_full_then_drain() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+
+        // Fill until the ring reports Full, without consuming.
+        let chunk = [0u8; 500];
+        let mut produced = 0;
+        loop {
+            match rb.output(&chunk) {
+                Ok(()) => produced += 1,
+                Err(RingBufError::Full) => break,
+                Err(_) => return Err("output failed for a reason other than Full"),
+            }
+            if produced > 100 {
+                return Err("the ring never reported Full");
+            }
+        }
+        if produced == 0 {
+            return Err("the ring was Full before a single record fit");
+        }
+        // Backpressure clears: draining one record frees room for one more.
+        rb.consume_one()
+            .ok_or("consume_one returned None on a full ring")?;
+        rb.output(&chunk)
+            .map_err(|_| "output still Full after a record was drained")?;
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_full_then_drain);
+
+fn smoke_bpf_ringbuf_record_too_big() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+
+        // A payload that, with its header, cannot fit an empty ring is refused
+        // as RecordTooBig — distinct from the transient Full — and leaves the
+        // ring untouched.
+        let too_big = [0u8; 4096];
+        match rb.output(&too_big) {
+            Err(RingBufError::RecordTooBig) => {}
+            _ => return Err("a record larger than the ring was not RecordTooBig"),
+        }
+        if rb.producer_pos() != 0 {
+            return Err("a rejected oversize record still advanced the producer");
+        }
+        // A zero-length record is legal: it is a header and nothing else.
+        rb.output(&[])
+            .map_err(|_| "a zero-length record was rejected")?;
+        let got = rb
+            .consume_one()
+            .ok_or("a zero-length record did not come back")?;
+        if !got.is_empty() {
+            return Err("a zero-length record came back non-empty");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_record_too_big);
+
+fn smoke_bpf_ringbuf_rejects_element_ops() -> TestResult {
+    checked(|| {
+        // A ring buffer answers the keyed surface only to refuse it — the same
+        // EINVAL Linux's ringbuf element ops return.
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+        let ops = m.ops();
+        let mut out = [0u8; 8];
+        if ops.lookup(&k32(0), &mut out) != Err(MapError::Invalid) {
+            return Err("RingBuf lookup was not EINVAL");
+        }
+        if ops.update(&k32(0), &[0u8; 8], BPF_ANY) != Err(MapError::Invalid) {
+            return Err("RingBuf update was not EINVAL");
+        }
+        if ops.delete(&k32(0)) != Err(MapError::Invalid) {
+            return Err("RingBuf delete was not EINVAL");
+        }
+        if ops.next_key(None, &mut out) != Err(MapError::Invalid) {
+            return Err("RingBuf next_key was not EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_rejects_element_ops);
+
+fn smoke_bpf_ringbuf_create_validation() -> TestResult {
+    checked(|| {
+        // Valid: a page-multiple power of two.
+        if mk_ring(4096).is_err() {
+            return Err("a valid RingBuf size was rejected");
+        }
+        if mk_ring(8192).is_err() {
+            return Err("a valid RingBuf size was rejected");
+        }
+        // Not a power of two.
+        if mk_ring(4096 + 8).map(|_| ()) != Err(MapError::Invalid) {
+            return Err("a non-power-of-two RingBuf size was accepted");
+        }
+        // A power of two, but smaller than a page.
+        if mk_ring(2048).map(|_| ()) != Err(MapError::Invalid) {
+            return Err("a sub-page RingBuf size was accepted");
+        }
+        // Zero.
+        if mk_ring(0).map(|_| ()) != Err(MapError::Invalid) {
+            return Err("a zero-size RingBuf was accepted");
+        }
+        // A non-zero key or value width has no meaning for a stream.
+        if mk(MapKind::RingBuf, 4, 0, 4096).map(|_| ()) != Err(MapError::Invalid) {
+            return Err("a RingBuf with a key width was accepted");
+        }
+        if mk(MapKind::RingBuf, 0, 8, 4096).map(|_| ()) != Err(MapError::Invalid) {
+            return Err("a RingBuf with a value width was accepted");
+        }
+        // Over the footprint cap.
+        if mk_ring(32 * 1024 * 1024).map(|_| ()) != Err(MapError::TooBig) {
+            return Err("an oversize RingBuf was not TooBig");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_create_validation);
