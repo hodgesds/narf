@@ -52,8 +52,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 
 use narf_filesystem::sysfs::{
-    class_register, get_or_create_child, get_root, kobject_add_attr, kobject_add_uevent_attr,
-    Kobject,
+    class_register, get_or_create_child, get_root, kobject_add_attr, kobject_add_bin_attr,
+    kobject_add_uevent_attr, Kobject,
 };
 
 /// DRM major device number.
@@ -175,6 +175,64 @@ fn populate_card_node(
     // five levels up reaches /sys. Linux ref: the real topology has a DRM
     // card's device/subsystem pointing at /sys/bus/pci.
     dev_kobj.add_symlink("subsystem", "../../../../../bus/pci");
+
+    // `device/config` — raw PCI configuration space.
+    //
+    // THIS is what libdrm actually reads. `drmParsePciDeviceInfo` opens
+    // `/sys/dev/char/<maj>:<min>/device/config` and pulls the ids straight out
+    // of the binary header; it does NOT parse the text vendor/device attrs
+    // below (those exist for other consumers). With no `config` file the read
+    // fails, `drmGetDevices2` cannot describe the device, and Mesa reports
+    // "MESA-LOADER: failed to retrieve device information" — the failure that
+    // makes kwin give up and take the Plasma session down with it.
+    //
+    // Measured, not assumed: a guest probe of `card0/device/` listed only
+    // device, subsystem, subsystem_device, subsystem_vendor, vendor. The
+    // subsystem symlink added earlier was present and resolving, and the error
+    // persisted at 18 per session attempt — so the symlink was necessary but
+    // never sufficient, and the missing blob is the real gap.
+    //
+    // Only the 64-byte type-0 header is synthesized, which is all
+    // drmParsePciDeviceInfo touches. Little-endian, offsets per PCI 3.0 §6.1:
+    //   0x00 vendor   0x02 device   0x08 revision   0x0a subclass  0x0b class
+    //   0x2c subsystem_vendor       0x2e subsystem_device
+    {
+        let vendor = card.vendor_id();
+        let device = card.device_id();
+        let sub_vendor = card.subsystem_vendor();
+        let sub_device = card.subsystem_device();
+        kobject_add_bin_attr(
+            &dev_kobj,
+            "config",
+            Arc::new(move |offset: usize, buf: &mut [u8]| -> usize {
+                let mut cfg = [0u8; 64];
+                cfg[0x00..0x02].copy_from_slice(&vendor.to_le_bytes());
+                cfg[0x02..0x04].copy_from_slice(&device.to_le_bytes());
+                // Command: I/O + memory + bus-master enabled.
+                cfg[0x04..0x06].copy_from_slice(&0x0007u16.to_le_bytes());
+                // Revision 0; class 0x030000 = Display / VGA compatible.
+                cfg[0x08] = 0x00;
+                cfg[0x09] = 0x00;
+                cfg[0x0a] = 0x00;
+                cfg[0x0b] = 0x03;
+                // Header type 0 (normal device) — libdrm relies on this to
+                // read the subsystem ids from 0x2c, which only exist in the
+                // type-0 layout.
+                cfg[0x0e] = 0x00;
+                cfg[0x2c..0x2e].copy_from_slice(&sub_vendor.to_le_bytes());
+                cfg[0x2e..0x30].copy_from_slice(&sub_device.to_le_bytes());
+                if offset >= cfg.len() {
+                    return 0;
+                }
+                let n = (cfg.len() - offset).min(buf.len());
+                buf[..n].copy_from_slice(&cfg[offset..offset + n]);
+                n
+            }),
+        );
+    }
+    // `revision` as text too — some consumers read it directly rather than
+    // going through the config blob, and it was absent entirely.
+    kobject_add_attr(&dev_kobj, "revision", || "0x00\n".into());
     {
         let v = card.vendor_id();
         kobject_add_attr(&dev_kobj, "vendor", move || format!("0x{:04x}\n", v));

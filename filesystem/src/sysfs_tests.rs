@@ -1186,3 +1186,77 @@ fn smoke_sysfs_power_supply_vfs_read() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_power_supply_vfs_read);
+
+// A registered BINARY attribute must be reachable from the VFS — both
+// openable by name and present in readdir.
+//
+// `kobject_add_bin_attr` inserted into a map that neither `lookup` nor
+// `enumerate` consulted, so every bin attr was invisible: userspace got
+// ENOENT, indistinguishable from never registering it. `has_attr` reported
+// true the whole time, so the kobject layer looked correct in isolation.
+//
+// Found via the DRM card's PCI `config` blob, which libdrm reads to identify
+// the device (drmParsePciDeviceInfo). Adding the attr changed nothing and
+// Mesa kept failing with "failed to retrieve device information"; the file
+// simply did not exist. `/sys/kernel/notes` was unreachable for the same
+// reason. This is the "verify the fix is observable before blaming the
+// consumer" case — the symptom is identical whether the producer omits the
+// data or the plumbing drops it.
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_bin_attr_reachable_from_vfs() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+
+    let class = class_register("binattr");
+    let node = class_device_register(class, "dev0");
+    crate::sysfs::kobject_add_bin_attr(
+        &node,
+        "config",
+        alloc::sync::Arc::new(|offset: usize, buf: &mut [u8]| -> usize {
+            let blob: [u8; 4] = [0x34, 0x12, 0x11, 0x11];
+            if offset >= blob.len() {
+                return 0;
+            }
+            let n = (blob.len() - offset).min(buf.len());
+            buf[..n].copy_from_slice(&blob[offset..offset + n]);
+            n
+        }),
+    );
+
+    // Bring DirOps into scope explicitly: enumerate/lookup are trait methods,
+    // and without the import the compiler resolves `enumerate` to Iterator.
+    use crate::DirOps as _;
+    let dir = crate::sysfs::SysKobjDir { kobj: node };
+
+    // 1. Present in readdir — `ls` must not deny it exists.
+    let listed = dir.enumerate(0, 64);
+    if !listed
+        .iter()
+        .any(|(n, t)| n == "config" && *t == FileType::File)
+    {
+        return TestResult::Fail("bin attr missing from readdir");
+    }
+
+    // 2. Openable by name and readable.
+    let file = match dir.lookup("config") {
+        Some(f) => f,
+        None => return TestResult::Fail("bin attr not found by lookup"),
+    };
+    let mut buf = [0u8; 8];
+    match poll_once(file.read(0, &mut buf)) {
+        Some(Ok(4)) if buf[..4] == [0x34, 0x12, 0x11, 0x11] => {}
+        Some(Ok(0)) => return TestResult::Fail("bin attr read returned 0 bytes"),
+        _ => return TestResult::Fail("bin attr read returned wrong data"),
+    }
+
+    // 3. Offset reads work — libdrm reads the PCI header at offsets, not
+    //    only from 0, so a reader that ignores `offset` would still pass a
+    //    naive read-from-zero check while returning nonsense in practice.
+    let mut tail = [0u8; 8];
+    match poll_once(file.read(2, &mut tail)) {
+        Some(Ok(2)) if tail[..2] == [0x11, 0x11] => TestResult::Pass,
+        _ => TestResult::Fail("bin attr ignored the read offset"),
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_bin_attr_reachable_from_vfs);
