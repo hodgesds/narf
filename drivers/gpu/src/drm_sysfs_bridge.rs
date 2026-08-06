@@ -295,6 +295,28 @@ fn populate_card_node(
     kobject_add_uevent_attr(&render_kobj, render_uevent(render_idx, &driver));
     render_kobj.add_symlink("subsystem", "../../../../class/drm");
 
+    // `card<N>/device/drm/{card<N>,renderD<M>}` — how a consumer walks from a
+    // card to its RENDER node.
+    //
+    // On Linux both minors hang off the parent device's `drm/` directory
+    // (…/drm/card0, …/drm/renderD128), so given the card you find its render
+    // node by listing that directory. NARF placed them as SIBLINGS under
+    // narf-drm with no `drm/` level, so nothing connected the two and Mesa
+    // failed with "DRI2: failed to get compatible render device" — the error
+    // that replaced the earlier device-info failure once driver selection was
+    // fixed. kwin then has no EGL and gives up.
+    //
+    // Symlinks rather than a second real node: the canonical kobjects stay
+    // where they are (systemd's sd-device already resolves devnum through
+    // them), and this only adds the parent-relative view Mesa walks.
+    // Relative to card<N>/device/drm/, THREE levels up is narf-drm
+    // (drm → device → card<N> → narf-drm).
+    {
+        let dev_drm = get_or_create_child(&dev_kobj, "drm");
+        dev_drm.add_symlink(card_name.clone(), format!("../../../{}", card_name));
+        dev_drm.add_symlink(render_name.clone(), format!("../../../{}", render_name));
+    }
+
     class_drm.add_symlink(
         render_name.clone(),
         format!("../../devices/platform/narf-drm/{}", render_name),

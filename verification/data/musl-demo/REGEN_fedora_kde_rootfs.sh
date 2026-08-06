@@ -336,6 +336,10 @@ printf '%s\n' \
   'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \
   'Environment=LIBGL_ALWAYS_SOFTWARE=1' \
   'Environment=GALLIUM_DRIVER=llvmpipe' \
+  'Environment=MESA_LOADER_DRIVER_OVERRIDE=kms_swrast' \
+  'Environment=MESA_DEBUG=1' \
+  'Environment=EGL_LOG_LEVEL=debug' \
+  'Environment=LIBGL_DEBUG=verbose' \
   'RuntimeDirectory=narf-plasma' \
   'RuntimeDirectoryMode=0700' \
   'ExecStart=/usr/local/libexec/narf-plasma-session-monitor' \
