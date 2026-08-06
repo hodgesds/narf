@@ -128,6 +128,37 @@ fi
 
 # --------------------------------------------------------------- staging ---
 echo "Staging NARF-specific bits..."
+
+# Raise the user manager's start timeouts.
+#
+# Everything renders in software here (llvmpipe/kms_swrast, QPainter), so
+# Plasma starts far slower than systemd's 90s default assumes.
+# kwin_wayland is Type=dbus: systemd waits for org.kde.KWinWrapper to appear
+# within DefaultTimeoutStartSec, routinely does not get it in time, and stops
+# the unit — at which point Fedora's 10-timeout-abort.conf drop-in
+# (TimeoutStopFailureMode=abort) SIGABRTs it.
+#
+# The unit then reads "signal=ABRT ... Mem peak: 1010.3M", which looks exactly
+# like a crash or an OOM and is NEITHER. kcminit and xdg-desktop-portal were
+# TERM'd by the same mechanism, as ordering victims.
+mkdir -p "$WORK/root/etc/systemd"
+printf '%s\n' \
+  '[Manager]' \
+  'DefaultTimeoutStartSec=600s' \
+  'DefaultTimeoutStopSec=120s' \
+  > "$WORK/root/etc/systemd/user.conf"
+
+# The PTY probe (see pty_probe.c) — why the foot terminal renders but shows
+# no prompt. Same build rule as the DRM probe: PIE, never -static.
+if command -v gcc >/dev/null 2>&1; then
+  if gcc -O1 -o "$WORK/root/usr/local/libexec/narf-pty-probe" \
+      "$ROOT/verification/data/musl-demo/pty_probe.c" 2>/dev/null; then
+    chmod 0755 "$WORK/root/usr/local/libexec/narf-pty-probe"
+    echo "Built narf-pty-probe"
+  else
+    echo "WARNING: narf-pty-probe failed to build"
+  fi
+fi
 # Fedora ships /usr/bin mode 0555. Several diagnostics below swap package
 # binaries for wrappers there, and the unprivileged build user owns the
 # directory but has no write bit. Open it for staging and restore the
