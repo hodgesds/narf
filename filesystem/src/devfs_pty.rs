@@ -908,6 +908,27 @@ impl FileOps for PtyMaster {
         Box::pin(async move { Ok(n) })
     }
 
+    /// An empty master read must WAIT, never report end-of-file.
+    ///
+    /// `read()` returning 0 on a PTY master means the slave side hung up.
+    /// Returning it merely because the ring is momentarily empty hands the
+    /// terminal a phantom EOF: it concludes the shell exited and stops
+    /// reading forever. That is exactly what left the `foot` window blank —
+    /// a probe walking a terminal's own sequence showed every step
+    /// succeeding, the child shell exiting 0, and the master read coming
+    /// back `n=0 errno=0` before the child's output arrived.
+    ///
+    /// `sys_read` turns this into a park for a blocking fd and EAGAIN for an
+    /// O_NONBLOCK one — the same treatment pipes and sockets get, and the
+    /// same class of bug fixed there for GLib/dbus ("Unexpected lack of
+    /// content trying to read a line").
+    ///
+    /// Linux ref: `pty_read` sleeps on the read wait queue; a master read
+    /// only reports 0/EIO once the last slave closes.
+    fn read_should_block(&self) -> bool {
+        self.pty.slave_tx_to_master.len() == 0
+    }
+
     /// Write bytes to the slave's input — through the shared n_tty line
     /// discipline. Cooked mode (ICANON) buffers into lines, ECHO mirrors
     /// the bytes back to the master read side, and ISIG control chars

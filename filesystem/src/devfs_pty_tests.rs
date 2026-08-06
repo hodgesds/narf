@@ -862,3 +862,81 @@ fn smoke_pty_poll_readiness_tracks_ring_depth() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_poll_readiness_tracks_ring_depth);
+
+/// An EMPTY master read must say "would block", never end-of-file.
+///
+/// `read()` returning 0 on a PTY master means the slave hung up. Reporting
+/// it merely because the ring is momentarily empty hands the terminal a
+/// phantom EOF: it concludes the shell exited and stops reading forever.
+///
+/// That is precisely why the `foot` window rendered its grid and cursor but
+/// never a prompt. A probe walking a terminal's own sequence in-guest
+/// (posix_openpt, grantpt, unlockpt, ptsname, open slave, fork,
+/// setsid+TIOCSCTTY+dup, exec) showed EVERY step succeeding and the child
+/// shell exiting 0, with the master read returning `n=0 errno=0` before the
+/// child's output landed. Allocation, exec and the shell were all fine; the
+/// slave->master path reported EOF.
+///
+/// `read_should_block()` is what `sys_read` consults to park a blocking fd
+/// or return EAGAIN for an O_NONBLOCK one — the same treatment pipes and
+/// sockets already get.
+///
+/// Both directions are asserted, because "block when empty" is only correct
+/// if it stops the moment data exists: a version that always blocked would
+/// pass a one-sided test and hang the terminal a different way.
+fn smoke_pty_master_empty_read_is_would_block_not_eof() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+
+    // Nothing written yet: the master must report would-block, not EOF.
+    if !master.read_should_block() {
+        return TestResult::Fail(
+            "empty master read reports EOF — a terminal takes that as the shell \
+             exiting and stops reading (blank foot window)",
+        );
+    }
+    let mut buf = [0u8; 32];
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(0)) => {}
+        _ => return TestResult::Fail("empty master read did not return 0 bytes"),
+    }
+
+    // Now the slave writes — as a shell's stdout does.
+    let slave_arc = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    let slave = PtySlave::new(Arc::clone(&slave_arc));
+    let payload = b"PTY-CHILD-ALIVE\n";
+    match poll_once(slave.write(0, payload)) {
+        Some(Ok(n)) if n == payload.len() => {}
+        _ => return TestResult::Fail("slave write failed"),
+    }
+
+    // With data pending the master must NOT block, and must hand it over.
+    if master.read_should_block() {
+        return TestResult::Fail(
+            "master still reports would-block with data queued — a terminal \
+             would park forever and never paint",
+        );
+    }
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(n)) if n == payload.len() => {
+            if &buf[..n] != payload {
+                return TestResult::Fail("master read returned the wrong bytes");
+            }
+        }
+        _ => return TestResult::Fail("master read did not return the slave's bytes"),
+    }
+
+    // Drained again → back to would-block, not EOF.
+    if !master.read_should_block() {
+        return TestResult::Fail("drained master reports EOF instead of would-block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_master_empty_read_is_would_block_not_eof
+);
