@@ -3863,3 +3863,146 @@ fn smoke_bpf_ringbuf_create_validation() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_bpf_ringbuf_create_validation);
+
+// ── RingBuf: the producer kfuncs ────────────────────────────────────
+
+fn smoke_bpf_ringbuf_output_kfunc_pos() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+
+        // A program that appends one 8-byte record it stashed on its stack:
+        //   *(u64 *)(r10-8) = 0xABCD
+        //   r1 = map; r2 = r10-8; r3 = 8; r4 = 0; call narf_ringbuf_output
+        let prog = alloc::vec![
+            st_imm(10, -8, 0xABCD),
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_reg(2, 10),
+            alu_imm(AluOp::Add, 2, -8),
+            mov_imm(3, 8),
+            mov_imm(4, 0),
+            call("narf_ringbuf_output"),
+            EXIT,
+        ];
+        let p = load_with_map("rbout", asm(&prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(0)) => {}
+            Some(Outcome::Returned(_)) => return Err("narf_ringbuf_output did not return 0"),
+            Some(Outcome::Trapped(_)) => return Err("narf_ringbuf_output trapped"),
+            None => return Err("run declined"),
+        }
+
+        // The kernel consumer sees exactly the program's record.
+        let rb = m.ringbuf().ok_or("ringbuf() returned None")?;
+        let rec = rb.consume_one().ok_or("no record after a program output")?;
+        if rec.len() != 8 {
+            return Err("the consumed record was the wrong length");
+        }
+        let v = u64::from_le_bytes(
+            rec.as_slice()
+                .try_into()
+                .map_err(|_| "record not 8 bytes")?,
+        );
+        if v != 0xABCD {
+            return Err("the consumed record did not match what the program wrote");
+        }
+        // Running again appends a second, independent record.
+        p.run_atomic([0; 4], 4).ok_or("second run declined")?;
+        if rb.consume_one().is_none() {
+            return Err("a second program run did not append a second record");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_output_kfunc_pos);
+
+fn smoke_bpf_ringbuf_query_kfunc() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+
+        // A program returning `bpf_ringbuf_query(map, RB_RING_SIZE)`.
+        let ring_size_prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 1), // RB_RING_SIZE
+            call("narf_ringbuf_query"),
+            EXIT,
+        ];
+        let p = load_with_map("rbqsz", asm(&ring_size_prog), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(4096)) => {}
+            Some(Outcome::Returned(_)) => return Err("query(RING_SIZE) was not the ring size"),
+            _ => return Err("query(RING_SIZE) did not run"),
+        }
+
+        // After one 8-byte output the available data is header + padded payload
+        // = 16 bytes, which query(AVAIL_DATA) must report.
+        let out_prog = alloc::vec![
+            st_imm(10, -8, 0x11),
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_reg(2, 10),
+            alu_imm(AluOp::Add, 2, -8),
+            mov_imm(3, 8),
+            mov_imm(4, 0),
+            call("narf_ringbuf_output"),
+            EXIT,
+        ];
+        let op = load_with_map("rbqo", asm(&out_prog), &m).map_err(|_| "load rejected")?;
+        op.run_atomic([0; 4], 4).ok_or("output run declined")?;
+
+        let avail_prog = alloc::vec![
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 0), // RB_AVAIL_DATA
+            call("narf_ringbuf_query"),
+            EXIT,
+        ];
+        let ap = load_with_map("rbqa", asm(&avail_prog), &m).map_err(|_| "load rejected")?;
+        match ap.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(16)) => Ok(()),
+            Some(Outcome::Returned(_)) => Err("query(AVAIL_DATA) was not the record footprint"),
+            _ => Err("query(AVAIL_DATA) did not run"),
+        }
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_query_kfunc);
+
+fn smoke_bpf_ringbuf_output_kfunc_neg() -> TestResult {
+    checked(|| {
+        let m = mk_ring(4096).map_err(|_| "RingBuf create failed")?;
+
+        // An unknown flag bit is -EINVAL.
+        let bad_flags = alloc::vec![
+            st_imm(10, -8, 0x22),
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_reg(2, 10),
+            alu_imm(AluOp::Add, 2, -8),
+            mov_imm(3, 8),
+            mov_imm(4, 0x100), // no such flag
+            call("narf_ringbuf_output"),
+            EXIT,
+        ];
+        let p = load_with_map("rbbad", asm(&bad_flags), &m).map_err(|_| "load rejected")?;
+        match p.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(v)) if v as i64 == -22 => {}
+            _ => return Err("an unknown output flag was not -EINVAL"),
+        }
+
+        // Output on a map that is not a ring buffer is -EINVAL — the runtime
+        // guard, since the map handle type does not carry the kind.
+        let hash = mk(MapKind::Hash, 4, 8, 4).map_err(|_| "Hash create failed")?;
+        let on_hash = alloc::vec![
+            st_imm(10, -8, 0x33),
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_reg(2, 10),
+            alu_imm(AluOp::Add, 2, -8),
+            mov_imm(3, 8),
+            mov_imm(4, 0),
+            call("narf_ringbuf_output"),
+            EXIT,
+        ];
+        let hp = load_with_map("rbhash", asm(&on_hash), &hash).map_err(|_| "load rejected")?;
+        match hp.run_atomic([0; 4], 4) {
+            Some(Outcome::Returned(v)) if v as i64 == -22 => Ok(()),
+            _ => Err("output on a non-ring-buffer map was not -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_ringbuf_output_kfunc_neg);

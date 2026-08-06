@@ -1531,3 +1531,76 @@ crate::kfunc! {
         drop(map);
     }
 }
+
+// ── ring buffer ─────────────────────────────────────────────────────
+
+/// `bpf_ringbuf_output` wakeup-control flags. There is no consumer to wake
+/// yet, so both are accepted and ignored; any other bit is rejected.
+const RB_NO_WAKEUP: u64 = 1 << 0;
+const RB_FORCE_WAKEUP: u64 = 1 << 1;
+
+/// `bpf_ringbuf_query` selectors: which statistic to read.
+const RB_AVAIL_DATA: u64 = 0;
+const RB_RING_SIZE: u64 = 1;
+const RB_CONS_POS: u64 = 2;
+const RB_PROD_POS: u64 = 3;
+
+/// `-EINVAL` / `-EAGAIN` as a kfunc `i64` return.
+const RB_EINVAL: i64 = -22;
+const RB_EAGAIN: i64 = -11;
+
+crate::kfunc! {
+    /// Append `data` as one record to the ring buffer `map`, atomically — the
+    /// `bpf_ringbuf_output` shape.
+    ///
+    /// Reserve, copy, and commit in one call: the program passes a buffer it
+    /// already holds (its stack, a map value) rather than being handed a
+    /// reserved region to fill, so there is no reference to track. Returns `0`,
+    /// `-EINVAL` for an unknown `flags` bit or a `map` that is not a ring
+    /// buffer, or `-EAGAIN` if the record does not fit — too large for the ring,
+    /// or the ring is full right now.
+    ///
+    /// `_data_len` is never read; it is the scalar length that bounds `data`,
+    /// and `data.len()` already is it (see [`narf_map_lookup`]).
+    #[context(Atomic)]
+    pub fn narf_ringbuf_output(map: crate::types::Trusted<BpfMap>, data: &[u8], _data_len: u64, flags: u64) -> i64 {
+        // Only the two wakeup-control flags are defined. They are accepted and
+        // ignored (nothing to wake yet); any other bit is a caller error.
+        if flags & !(RB_NO_WAKEUP | RB_FORCE_WAKEUP) != 0 {
+            return RB_EINVAL;
+        }
+        // SAFETY: see `map_of`.
+        let map = unsafe { map_of(&map) };
+        let Some(rb) = map.ringbuf() else {
+            return RB_EINVAL;
+        };
+        match rb.output(data) {
+            Ok(()) => 0,
+            // Both "too big for the ring" and "full right now" surface as
+            // `-EAGAIN`, exactly as Linux's `bpf_ringbuf_output` does.
+            Err(_) => RB_EAGAIN,
+        }
+    }
+
+    /// Read a statistic of the ring buffer `map` — the `bpf_ringbuf_query`
+    /// shape.
+    ///
+    /// `flags` selects: `0` bytes available to consume, `1` ring size, `2`
+    /// consumer position, `3` producer position. An unknown selector, or a
+    /// `map` that is not a ring buffer, reads as `0`, as Linux's does.
+    #[context(Atomic)]
+    pub fn narf_ringbuf_query(map: crate::types::Trusted<BpfMap>, flags: u64) -> u64 {
+        // SAFETY: see `map_of`.
+        let map = unsafe { map_of(&map) };
+        let Some(rb) = map.ringbuf() else {
+            return 0;
+        };
+        match flags {
+            RB_AVAIL_DATA => rb.available_data(),
+            RB_RING_SIZE => rb.ring_size(),
+            RB_CONS_POS => rb.consumer_pos(),
+            RB_PROD_POS => rb.producer_pos(),
+            _ => 0,
+        }
+    }
+}
