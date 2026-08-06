@@ -3949,6 +3949,12 @@ fn boot_userspace_init() {
                     "tfd_epoll_smoke",
                     narf_verification::NARF_TFD_EPOLL_SMOKE_ELF,
                 ),
+                // Pure-timeout poll/epoll park hammer (slab-canary
+                // false-positive regression pin). Success: `polltmo-ok`.
+                (
+                    "polltmo_hammer",
+                    narf_verification::NARF_POLLTMO_HAMMER_ELF,
+                ),
                 (
                     "unix_epoll_smoke",
                     narf_verification::NARF_UNIX_EPOLL_SMOKE_ELF,
