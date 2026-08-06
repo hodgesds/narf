@@ -350,7 +350,7 @@ printf '%s\n' \
   'Environment=XDG_CURRENT_DESKTOP=KDE' \
   'Environment=XKB_DEFAULT_MODEL=pc105' \
   'Environment=XKB_DEFAULT_LAYOUT=us' \
-  'Environment=QT_LOGGING_RULES=org.kde.kcminit.debug=true;kwin_core.debug=true;kwin_wayland_drm.debug=true;kwin_scene_opengl.debug=true;kwin_qpainter.debug=true' \
+  'Environment=QT_LOGGING_RULES=kwin_core.debug=true' \
   'Environment=QT_QPA_PLATFORM=wayland' \
   'Environment=QV4_FORCE_INTERPRETER=1' \
   'Environment=QT_ENABLE_REGEXP_JIT=0' \
@@ -360,9 +360,6 @@ printf '%s\n' \
   'Environment=LIBGL_ALWAYS_SOFTWARE=1' \
   'Environment=GALLIUM_DRIVER=llvmpipe' \
   'Environment=MESA_LOADER_DRIVER_OVERRIDE=kms_swrast' \
-  'Environment=MESA_DEBUG=1' \
-  'Environment=EGL_LOG_LEVEL=debug' \
-  'Environment=LIBGL_DEBUG=verbose' \
   'RuntimeDirectory=narf-plasma' \
   'RuntimeDirectoryMode=0700' \
   'ExecStart=/usr/local/libexec/narf-plasma-session-monitor' \
