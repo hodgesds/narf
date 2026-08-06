@@ -207,6 +207,29 @@ install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-drm-policy.sh" \
   "$WORK/root/usr/local/libexec/narf-drm-policy"
 
+# The libdrm probe narf-drm-policy runs. Built here rather than shipped as a
+# binary so it tracks the source; linked against the HOST's libdrm headers but
+# resolved at run time against the GUEST's libdrm.so.2, which is the whole
+# point — it reports what the guest's own libdrm concludes about NARF's DRM
+# nodes instead of what we think it should conclude.
+#
+# Non-fatal on purpose: a host without libdrm headers should still be able to
+# regenerate the image. But say so loudly, because narf-drm-policy prints
+# "probe binary MISSING" rather than failing, and a silently absent probe
+# looks exactly like a probe that found nothing.
+if command -v gcc >/dev/null 2>&1 && [ -f /usr/include/xf86drm.h ]; then
+  if gcc -O1 -o "$WORK/root/usr/local/libexec/narf-drm-probe" \
+      "$ROOT/verification/data/musl-demo/drm_device_probe.c" \
+      -I/usr/include/libdrm -ldrm 2>/dev/null; then
+    chmod 0755 "$WORK/root/usr/local/libexec/narf-drm-probe"
+    echo "Built narf-drm-probe (libdrm device probe)"
+  else
+    echo "WARNING: narf-drm-probe failed to build; DRM enumeration probe will be absent"
+  fi
+else
+  echo "WARNING: no gcc or libdrm headers on host; skipping narf-drm-probe"
+fi
+
 # Keep DRM policy setup in its own root service. The `+` executable prefix on
 # an ExecStartPre of a User= service exercises systemd's privileged-command
 # credential path, which the current Linux-compat layer does not yet complete.
