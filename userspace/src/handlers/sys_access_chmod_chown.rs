@@ -110,7 +110,7 @@ fn set_access_result(ctx: &mut dyn TrapContext, mode: u32, perms: u16, uid: u32,
     };
     let allowed = narf_filesystem::posix_access_ok(
         narf_filesystem::FileOwner { uid, gid, perms },
-        current_accessor(current_task_id()),
+        &current_accessor(current_task_id()),
         request,
     );
     ctx.set_return(SyscallReturn::ok(if allowed { 0 } else { (-13i64) as u64 }));

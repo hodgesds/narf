@@ -179,6 +179,72 @@ fn populate_card_node(
     // From /sys/devices/pci0000:00/<addr>/, three levels up is /sys.
     dev_kobj.add_symlink("subsystem", "../../../bus/pci");
 
+    // `device/uevent` — the ONLY thing that gives libdrm the bus address.
+    //
+    // This is not parity garnish; it decides whether any DRM node enumerates
+    // at all. `drmParsePciBusInfo()` does NOT parse the `device` symlink
+    // target (the assumption behind several earlier attempts here):
+    //
+    //     get_pci_path(maj, min, pci_path);        // realpath of .../device
+    //     value = sysfs_uevent_get(pci_path, "PCI_SLOT_NAME");
+    //     if (!value) return -ENOENT;
+    //
+    // and `sysfs_uevent_get` simply fopen()s `<pci_path>/uevent` and scans
+    // for a `KEY=` line. The card and render kobjects each had a uevent, but
+    // the PCI PARENT never did — so this returned -ENOENT,
+    // `drmProcessPciDevice()` failed, and `process_device()` dropped every
+    // node in /dev/dri.
+    //
+    // Measured in-guest with a probe linked against the guest's own libdrm,
+    // after the render-node `device` link went in:
+    //
+    //     DRMC: drmGetDevices2 count=0
+    //     DRMC: /dev/dri/card0      drmGetDevice2=-19   (-ENODEV)
+    //     DRMC: /dev/dri/renderD128 drmGetDevice2=-19
+    //
+    // while drmNodeIsDRM and both readlinks reported success — which is why
+    // reading the sysfs tree by hand kept suggesting nothing was wrong.
+    //
+    // No enumerated device means no `available_nodes`, so no render bit, so
+    // Mesa's loader_is_device_render_capable() is false and EGL dies with
+    // "DRI2: failed to get compatible render device".
+    //
+    // Format mirrors a real Linux PCI uevent, verified against
+    // /sys/dev/char/226:128/device/uevent on an amdgpu host. Only
+    // PCI_SLOT_NAME is load-bearing for libdrm; the rest is there because
+    // udev and modalias consumers read them. Linux writes the id fields in
+    // upper-case hex and the slot name in lower-case — match that exactly
+    // rather than normalizing, since MODALIAS is string-matched.
+    {
+        let vendor = card.vendor_id();
+        let device = card.device_id();
+        let sub_vendor = card.subsystem_vendor();
+        let sub_device = card.subsystem_device();
+        let drv = driver.clone();
+        let addr = String::from(pci_addr);
+        kobject_add_uevent_attr(
+            &dev_kobj,
+            format!(
+                "DRIVER={}\n\
+                 PCI_CLASS=30000\n\
+                 PCI_ID={:04X}:{:04X}\n\
+                 PCI_SUBSYS_ID={:04X}:{:04X}\n\
+                 PCI_SLOT_NAME={}\n\
+                 MODALIAS=pci:v{:08X}d{:08X}sv{:08X}sd{:08X}bc03sc00i00\n",
+                drv,
+                vendor,
+                device,
+                sub_vendor,
+                sub_device,
+                addr,
+                vendor as u32,
+                device as u32,
+                sub_vendor as u32,
+                sub_device as u32,
+            ),
+        );
+    }
+
     // `device/config` — raw PCI configuration space.
     //
     // THIS is what libdrm actually reads. `drmParsePciDeviceInfo` opens
@@ -297,6 +363,34 @@ fn populate_card_node(
     }
     kobject_add_uevent_attr(&render_kobj, render_uevent(render_idx, &driver));
     render_kobj.add_symlink("subsystem", "../../../../class/drm");
+
+    // `renderD<M>/device` → the SAME PCI node card<N>/device points at.
+    //
+    // Not redundant with the card's link: libdrm phrases both of its node
+    // filters against the node's OWN devnum, so having them on 226:N does
+    // nothing for 226:M. `process_device()` rejects a node unless
+    //
+    //   drmNodeIsDRM(226,M)       stat("/sys/dev/char/226:M/device/drm")
+    //   drmParseSubsystemType()   readlink("/sys/dev/char/226:M/device")
+    //
+    // both succeed. With no `device` entry here they both failed, so libdrm
+    // silently dropped the render node while still enumerating the card
+    // happily — leaving a drmDevice whose `available_nodes` held only
+    // `1 << DRM_NODE_PRIMARY`.
+    //
+    // That single missing bit is the whole failure. Mesa's
+    // `loader_is_device_render_capable()` is a `drmGetDevice2()` plus a test
+    // of exactly that bit; false sends `dri2_initialize_drm()` into
+    // `dri_query_compatible_render_only_device_fd()`, which also has nothing
+    // to find, and EGL dies with "DRI2: failed to get compatible render
+    // device". kwin then has no EGL and takes the Plasma session with it.
+    //
+    // The target must be byte-identical to the card's: libdrm unions
+    // `available_nodes` only across nodes whose parsed bus info compares
+    // equal, so two different addresses would stay two one-node devices and
+    // the render bit would still be absent. Same depth
+    // (devices/platform/narf-drm/<node>), so the same relative path.
+    render_kobj.add_symlink("device", format!("../../../pci0000:00/{}", pci_addr));
 
     // `card<N>/device/drm/{card<N>,renderD<M>}` — how a consumer walks from a
     // card to its RENDER node.

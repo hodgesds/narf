@@ -1,55 +1,59 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// `fstatat(dirfd, pathname, statbuf, flags)`.
+///
+/// The dirfd was previously DISCARDED (`let _dirfd = args.arg0;`) and this
+/// proxied to `sys_stat` with the raw user pointer, so a relative path was
+/// resolved against the CWD instead of the named directory.
+///
+/// `fstatat` is one of the most heavily used syscalls on a systemd system:
+/// sd-device walks sysfs a component at a time against parent-directory
+/// fds, and glibc implements `stat()`/`lstat()` on top of it. With the
+/// dirfd ignored a relative lookup either fails or, worse, silently stats a
+/// same-named file in the wrong directory and returns ITS metadata.
+///
+/// AT_EMPTY_PATH (an empty path naming the dirfd itself) is handled by
+/// resolving the descriptor's own path.
 pub(crate) fn sys_newfstatat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux ABI: `int fstatat(int dirfd, const char *pathname,
-    // struct stat *statbuf, int flags)`. arg2 is statbuf, not
-    // path_len.
-    let _dirfd = args.arg0;
+    // struct stat *statbuf, int flags)`.
+    let dirfd = args.arg0 as i64;
     let path_uptr = args.arg1;
-    let stat_out = args.arg2;
+    let out_ptr = args.arg2 as *mut StatBuf;
     let _flags = args.arg3;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if out_ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
     let path_str = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
             return;
         }
     };
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
+    let task = current_task_id();
+    // AT_EMPTY_PATH: stat the descriptor itself.
+    let joined = if path_str.is_empty() {
+        match fd_path_for_task(task, dirfd as u32) {
+            Some(p) if dirfd >= 0 && p.starts_with('/') => p,
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+                return;
+            }
         }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
+    } else {
+        match resolve_at_path(task, dirfd, &path_str) {
+            Ok(p) => p,
+            Err(e) => {
+                ctx.set_return(SyscallReturn::ok(e as u64));
+                return;
+            }
         }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    let proxy_args = SyscallArgs {
-        arg0: path_uptr,
-        arg1: path_str.len() as u64,
-        arg2: stat_out,
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
     };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_stat(&mut proxy);
+    let path = apply_chroot(&joined);
+    stat_absolute(ctx, &path, out_ptr);
 }

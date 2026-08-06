@@ -31,7 +31,18 @@ pub(crate) fn sys_stat(ctx: &mut dyn TrapContext) {
         }
     };
     let path_owned = apply_chroot(&path_owned);
-    let path: &str = &path_owned;
+    stat_absolute(ctx, &path_owned, out_ptr);
+}
+
+/// `stat` on an ALREADY chroot-resolved path, writing into `out_ptr`.
+///
+/// Split out so `sys_newfstatat` can join a relative path against its dirfd
+/// and share this body. The out-pointer is passed explicitly because it
+/// lives in a different argument slot for the two syscalls (arg1 for
+/// `stat`, arg2 for `fstatat`), which is exactly the kind of mismatch the
+/// old proxy-by-reshaping-args approach got wrong.
+pub(crate) fn stat_absolute(ctx: &mut dyn TrapContext, path: &str, out_ptr: *mut StatBuf) {
+    let fail = SyscallReturn::ok((-1i64) as u64);
     let ops = narf_filesystem::registry()
         .resolve_absolute(path, |fs, rel| {
             narf_filesystem::resolve(fs.root(), rel).ok()

@@ -470,7 +470,16 @@ pub(crate) fn install_poll_files(task_id: u64, fds: &[PollFd]) {
     })
     .unwrap_or_default();
     if resolved.len() == fds.len() {
-        *t.poll_files.lock() = resolved;
+        // Swap under the lock, drop the OLD resolution OUTSIDE it —
+        // releasing the last reference to a file can run a destructor
+        // that takes other locks (the same rule `clear_poll_wait_record`
+        // documents). A plain `*lock() = resolved` ran those drops while
+        // holding `poll_files`.
+        let old = {
+            let mut held = t.poll_files.lock();
+            core::mem::replace(&mut *held, resolved)
+        };
+        drop(old);
     }
 }
 

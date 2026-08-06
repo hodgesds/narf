@@ -1,57 +1,45 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// `unlinkat(dirfd, pathname, flags)`.
+///
+/// The dirfd was previously DISCARDED (`let _dirfd = args.arg0;`): this
+/// proxied to `sys_unlink` / `sys_rmdir` with the raw user pointer, so a
+/// relative path resolved against the CWD instead of the directory the
+/// caller named.
+///
+/// That is not a benign approximation. systemd-journald removes rotated
+/// journals with `unlinkat(dir_fd, name, 0)` against a directory fd it
+/// holds, and systemd-tmpfiles prunes trees the same way. With the dirfd
+/// ignored the call either fails or — with a same-named file under the cwd
+/// — DELETES THE WRONG FILE and reports success.
 pub(crate) fn sys_unlinkat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux ABI: `int unlinkat(int dirfd, const char *pathname,
     // int flags)`. arg2 is flags, not path_len.
-    let _dirfd = args.arg0;
+    let dirfd = args.arg0 as i64;
     let path_uptr = args.arg1;
     let flags = args.arg2;
     let path_str = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
             return;
         }
     };
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
+    let task = current_task_id();
+    let joined = match resolve_at_path(task, dirfd, &path_str) {
+        Ok(p) => p,
+        Err(e) => {
+            ctx.set_return(SyscallReturn::ok(e as u64));
+            return;
         }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    let proxy_args = SyscallArgs {
-        arg0: path_uptr,
-        arg1: path_str.len() as u64,
-        arg2: 0,
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
     };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
+    // Re-apply the caller's chroot exactly as the cwd form does.
+    let path = resolve_cwd_path(task, &joined);
     if (flags & AT_REMOVEDIR) != 0 {
-        sys_rmdir(&mut proxy);
+        rmdir_absolute(ctx, &path);
     } else {
-        sys_unlink(&mut proxy);
+        unlink_absolute(ctx, &path);
     }
 }

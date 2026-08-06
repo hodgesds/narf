@@ -2481,3 +2481,100 @@ kernel_test_in!(
     "filesystem/cgroupfs",
     smoke_cgroup_new_child_files_inherit_creator
 );
+
+/// A `populated` transition must emit inotify `IN_MODIFY` on
+/// `cgroup.events` — for the cgroup AND every ancestor.
+///
+/// systemd learns that a service's cgroup has settled ONLY through
+/// `inotify_add_watch(fd, "<cgroup>/cgroup.events", IN_MODIFY)`
+/// (systemd `src/core/cgroup.c`), re-reading `populated` from
+/// `unit_check_cgroup_events()`. It never poll()s the file.
+///
+/// NARF signalled the transition with a `POLLPRI` generation bump only.
+/// Every other IN_MODIFY here originates on a userspace write path
+/// (sys_write/sys_truncate → notify_modify_*), but this transition is
+/// kernel-side — a task entering or leaving the cgroup — so nothing on
+/// that path ever ran and systemd was never told.
+///
+/// Measured consequence: a `Type=forking` unit's start job never
+/// completes. `plasma-kcminit.service` sat in `start running` with no
+/// process alive, holding 20 other Plasma jobs in `waiting`; kwin
+/// composited an empty scene and KDE showed a black screen. This is not
+/// KDE-specific — it blocks any Type=forking unit without PIDFile=.
+///
+/// Ancestors are asserted because systemd watches every cgroup directory
+/// it manages, not just the leaf, and `notify_events()` already walks up:
+/// a fix that fired only for the emptied cgroup would still hang the
+/// parent slice's job.
+fn smoke_cgroup_events_emits_inotify_modify() -> TestResult {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    static SAW_CHILD: AtomicUsize = AtomicUsize::new(0);
+    static SAW_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+    fn record(path: &str) {
+        HITS.fetch_add(1, Ordering::AcqRel);
+        if !path.ends_with("/cgroup.events") {
+            return;
+        }
+        if path == "/sys/fs/cgroup/t_evt/cgroup.events" {
+            SAW_CHILD.fetch_add(1, Ordering::AcqRel);
+        }
+        if path == "/sys/fs/cgroup/cgroup.events" {
+            SAW_ROOT.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    HITS.store(0, Ordering::Release);
+    SAW_CHILD.store(0, Ordering::Release);
+    SAW_ROOT.store(0, Ordering::Release);
+    crate::set_modify_notifier(record);
+
+    let root = root_dir();
+    let _ = poll_once(root.rmdir("t_evt"));
+    let child = match poll_once(root.mkdir("t_evt")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir t_evt failed"),
+    };
+
+    // Empty → populated.
+    const PID: u64 = 909_101;
+    if attach_pid(&child, PID).is_err() {
+        let _ = poll_once(root.rmdir("t_evt"));
+        return TestResult::Fail("attaching pid to t_evt failed");
+    }
+    let after_attach = SAW_CHILD.load(Ordering::Acquire);
+    let root_after_attach = SAW_ROOT.load(Ordering::Acquire);
+
+    // Populated → empty. This is the edge systemd waits on for a
+    // Type=forking service, so it is the one that must not be lost.
+    task_exited(PID);
+    let after_exit = SAW_CHILD.load(Ordering::Acquire);
+    let root_after_exit = SAW_ROOT.load(Ordering::Acquire);
+
+    let _ = poll_once(root.rmdir("t_evt"));
+
+    if after_attach == 0 {
+        return TestResult::Fail(
+            "no IN_MODIFY on t_evt/cgroup.events when the cgroup became populated",
+        );
+    }
+    if after_exit <= after_attach {
+        return TestResult::Fail(
+            "no IN_MODIFY on t_evt/cgroup.events when the cgroup emptied — \
+             this is the edge a Type=forking start job waits on",
+        );
+    }
+    if root_after_attach == 0 || root_after_exit <= root_after_attach {
+        return TestResult::Fail(
+            "ancestor cgroup.events did not get IN_MODIFY; systemd watches every \
+             cgroup it manages, not just the leaf",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_events_emits_inotify_modify
+);

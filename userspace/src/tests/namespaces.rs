@@ -1270,33 +1270,19 @@ fn smoke_dac_shadow_denies_nonroot() -> TestResult {
         perms: 0o666,
     };
     // root reads the 0600 shadow.
-    if !posix_access_ok(shadow, Accessor { uid: 0, gid: 0 }, rd) {
+    if !posix_access_ok(shadow, &Accessor::new(0, 0), rd) {
         return TestResult::Fail("root was denied the 0600 shadow");
     }
     // a dropped-privilege process (uid/gid 1000) may not.
-    if posix_access_ok(
-        shadow,
-        Accessor {
-            uid: 1000,
-            gid: 1000,
-        },
-        rd,
-    ) {
+    if posix_access_ok(shadow, &Accessor::new(1000, 1000), rd) {
         return TestResult::Fail("uid 1000 was allowed to read the 0600 shadow");
     }
     // and is still denied even sharing root's group (0600 group bits = ---).
-    if posix_access_ok(shadow, Accessor { uid: 1000, gid: 0 }, rd) {
+    if posix_access_ok(shadow, &Accessor::new(1000, 0), rd) {
         return TestResult::Fail("a non-owner in gid 0 read the 0600 shadow");
     }
     // but the same process can read a world-rw 0o666 file.
-    if !posix_access_ok(
-        public,
-        Accessor {
-            uid: 1000,
-            gid: 1000,
-        },
-        rd,
-    ) {
+    if !posix_access_ok(public, &Accessor::new(1000, 1000), rd) {
         return TestResult::Fail("uid 1000 was denied a world-rw 0o666 file");
     }
     TestResult::Pass

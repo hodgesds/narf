@@ -17,18 +17,30 @@ pub(crate) fn sys_unlink(ctx: &mut dyn TrapContext) {
         }
     };
     let path = resolve_cwd_path(current_task_id(), &path);
+    unlink_absolute(ctx, &path);
+}
+
+/// Unlink a path that is ALREADY resolved to absolute.
+///
+/// Split out so `sys_unlinkat` can join a relative path against its dirfd
+/// and share this body. It previously proxied here with the raw user
+/// pointer, which forced the path through `resolve_cwd_path` and discarded
+/// the dirfd entirely.
+pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let _ = fail;
     // If this path is a live bound AF_UNIX socket, release its address so
     // it can be re-bound (Linux frees the address when the socket inode is
     // unlinked — dbus/wayland unlink a stale socket before re-binding).
-    let was_socket = crate::socket::unbind_path(&path);
+    let was_socket = crate::socket::unbind_path(path);
     let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(&path, |_fs, parent, leaf| {
+        .resolve_parent_absolute(path, |_fs, parent, leaf| {
             poll_blocking(parent.unlink(leaf))
         });
     match outcome {
         Some(Some(Ok(()))) => {
             #[cfg(feature = "linux-compat")]
-            crate::mqueue::notify_delete(&path, false);
+            crate::mqueue::notify_delete(path, false);
             ctx.set_return(SyscallReturn::ok(0));
         }
         // The address was freed even if no filesystem node backed the path

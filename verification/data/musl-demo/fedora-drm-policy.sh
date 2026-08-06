@@ -65,3 +65,42 @@ echo "DRMPROBE: --- render node open test (as narf) ---"
   /bin/sh -c ': < /dev/dri/card0' 2>&1 \
   && echo "DRMPROBE: card0 OPEN OK as uid 1000" \
   || echo "DRMPROBE: card0 OPEN FAILED as uid 1000"
+
+# ── Ask libdrm directly ──────────────────────────────────────────────────
+#
+# Everything above reports NARF's sysfs as NARF sees it. That is the wrong
+# oracle: what decides the outcome is what libdrm's own code makes of it, and
+# six rounds of reconstructing that from the sysfs side were all wrong.
+#
+# narf-drm-probe links against the guest's real libdrm.so.2 and calls
+# drmGetDevice2() / drmGetDevices2(), printing `available_nodes`. Mesa's
+# loader_is_device_render_capable() is exactly a test of the RENDER bit in
+# that word, so DRMC: ... RENDER_CAPABLE=1 is the precise success condition
+# for "DRI2: failed to get compatible render device" going away.
+#
+# Runs unconditionally and merges stderr: a probe that only prints on the
+# path you expect cannot distinguish "did not happen" from "not reached".
+if [ -x /usr/local/libexec/narf-drm-probe ]; then
+  /usr/local/libexec/narf-drm-probe 2>&1 || echo "DRMC: probe exited $?"
+else
+  echo "DRMC: probe binary MISSING at /usr/local/libexec/narf-drm-probe"
+fi
+
+# ── The same probe, as uid 1000 ──────────────────────────────────────────
+#
+# Every "OPEN OK as uid 1000" check above uses `: < /dev/dri/cardN`, which is
+# O_RDONLY. kwin opens O_RDWR, and when logind cannot hand it an fd
+# ("Could not determine the active graphical session") that direct open is
+# the only path it has — then it reports "Failed to open drm device
+# /dev/dri/card0" and exits, taking the session with it.
+#
+# So the O_RDONLY result proves nothing about the case that actually matters.
+# narf-drm-probe opens O_RDWR, so running it under uid 1000 tests exactly what
+# kwin does. Prints unconditionally; a missing line here is itself a finding.
+if [ -x /usr/local/libexec/narf-drm-probe ]; then
+  echo "DRMC-U1000: running probe as uid 1000 (O_RDWR, as kwin does)"
+  /usr/bin/setpriv --reuid=1000 --regid=39 --clear-groups \
+    /usr/local/libexec/narf-drm-probe 2>&1 |
+    while IFS= read -r l; do printf 'DRMC-U1000: %s\n' "$l"; done
+  echo "DRMC-U1000: done"
+fi

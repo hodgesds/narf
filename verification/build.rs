@@ -610,6 +610,7 @@ fn main() {
         "scm_smoke",
         "drm_smoke",
         "tfd_epoll_smoke",
+        "polltmo_hammer",
         "unix_epoll_smoke",
         "wlserve_smoke",
         "shmfork_smoke",

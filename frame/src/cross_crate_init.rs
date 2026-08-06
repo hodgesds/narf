@@ -56,6 +56,14 @@ fn install_proc_mountinfo_hook() {
         narf_userspace::handlers::proc_ns_mountinfo_generation,
     );
     narf_filesystem::install_mount_change_hook(wake_mountinfo_waiters);
+
+    // cgroup.events changes on a KERNEL-side transition (a task entering or
+    // leaving a cgroup), so no userspace write path exists to hang an
+    // inotify event off — yet systemd learns a service's cgroup has settled
+    // ONLY via inotify_add_watch(..., "cgroup.events", IN_MODIFY)
+    // (systemd src/core/cgroup.c). Without this, every Type=forking start
+    // job hangs forever waiting for a notification that never comes.
+    narf_filesystem::set_modify_notifier(narf_userspace::mqueue::notify_modify_path);
 }
 
 /// Wake poll/epoll waiters after a mount-table mutation. `/proc/*/mountinfo`

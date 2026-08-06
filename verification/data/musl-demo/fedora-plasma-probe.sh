@@ -93,6 +93,128 @@ dump_kcminit_waits() {
   echo 'PLASMA-DIAG kcminit wait snapshot end'
 }
 
+# One-shot DRM probe from INSIDE the session, as uid 1000, at the moment
+# kwin is actually up.
+#
+# narf-drm-policy already runs this probe, but it runs at BOOT and as root,
+# and both differences matter: kwin opens O_RDWR as uid 1000 while udev may
+# still re-apply device ownership afterwards, so a boot-time success says
+# nothing about kwin's moment. kwin reports "Failed to open drm device
+# /dev/dri/card0" and dies, yet the boot-time probe opens the same node
+# fine — so the measurement has to happen HERE, in the same identity and
+# the same window, and print errno.
+drm_probe_in_session() {
+  if [ -x /usr/local/libexec/narf-drm-probe ]; then
+    echo "DRMC-SESSION: probing as uid $(id -u) while kwin is up"
+    /usr/local/libexec/narf-drm-probe 2>&1 |
+      while IFS= read -r l; do printf 'DRMC-SESSION: %s\n' "$l"; done
+  else
+    echo "DRMC-SESSION: probe binary MISSING"
+  fi
+  ls -ln /dev/dri/ 2>&1 |
+    while IFS= read -r l; do printf 'DRMC-SESSION: ls %s\n' "$l"; done
+}
+drm_probed=0
+
+# Why are the Plasma units not starting?
+#
+# They are NOT failing: every one reads "loaded inactive dead start" with a
+# Job id, i.e. a QUEUED start job that never runs, and Result=success /
+# ExecMainStatus=0 (never attempted). Something upstream is blocking them.
+#
+# From the image's own unit files the chain is:
+#   plasma-workspace-wayland.target Requires+BindsTo plasma-kwin_wayland.service
+#   plasma-core.target              After=           plasma-kwin_wayland.service
+#   plasma-kwin_wayland.service     BusName=org.kde.KWinWrapper, no Type=
+#                                   => systemd infers Type=dbus
+# so the whole workspace waits for that ONE name to appear on the session bus.
+#
+# `list-jobs` names the blocking job directly instead of inferring it from
+# dependency files, and ListNames says whether the name is actually there.
+# Ask the bus by explicit address: a bare dbus-send inherits whatever the
+# environment happens to hold and returned an EMPTY name list in one boot and
+# a populated one in another, which is an instrument difference, not a system
+# difference.
+unit_diag_once() {
+  # This probe's own service has no XDG_RUNTIME_DIR, so systemctl --user
+  # could not reach the user bus at all and the first version of this
+  # diagnostic reported nothing but its own misconfiguration.
+  #
+  # Which runtime dir is the RIGHT one is itself the open question:
+  # narf-plasma.service sets XDG_RUNTIME_DIR=/run/narf-plasma while
+  # systemd --user for uid 1000 uses /run/user/1000. If kwin publishes
+  # org.kde.KWinWrapper on one bus while the systemd holding the queued jobs
+  # watches the other, a Type=dbus unit can never go active — which would
+  # explain the stall exactly. So report BOTH, and read kwin's actual
+  # environment rather than assuming either.
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
+  echo "UNITBLOCK: probe XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+  for d in /run/user/1000 /run/narf-plasma; do
+    printf 'UNITBLOCK: ls %s: ' "$d"
+    ls "$d" 2>&1 | tr '\n' ' '
+    echo
+  done
+  kpid=$(pgrep -x kwin_wayland 2>/dev/null | head -1)
+  [ -z "$kpid" ] && kpid=$(pgrep -f kwin_wayland 2>/dev/null | head -1)
+  echo "UNITBLOCK: kwin pid=${kpid:-none}"
+  if [ -n "$kpid" ] && [ -r "/proc/$kpid/environ" ]; then
+    tr '\0' '\n' < "/proc/$kpid/environ" 2>/dev/null |
+      grep -E '^(XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|WAYLAND_DISPLAY|XDG_SESSION_TYPE)=' |
+      while IFS= read -r l; do printf 'UNITBLOCK: kwin-env %s\n' "$l"; done
+  else
+    echo "UNITBLOCK: kwin environ unreadable"
+  fi
+  echo "UNITBLOCK: --- systemctl --user list-jobs ---"
+  systemctl --user list-jobs --no-pager 2>&1 |
+    while IFS= read -r l; do printf 'UNITBLOCK: %s\n' "$l"; done
+  echo "UNITBLOCK: --- plasma-kwin_wayland.service ---"
+  systemctl --user show plasma-kwin_wayland.service \
+    -p Type -p BusName -p ActiveState -p SubState -p Result -p ExecMainPID 2>&1 |
+    while IFS= read -r l; do printf 'UNITBLOCK: %s\n' "$l"; done
+  # Dump the FULL status of every failed user unit, not just its name.
+  # plasma-kactivitymanagerd.service ends `failed` and owns
+  # org.kde.ActivityManager, which plasmashell blocks on at startup — so
+  # its exit code and last log lines decide the whole desktop, and the
+  # unit list alone does not carry them.
+  # Can we even EXEC the /usr/libexec Plasma helpers?
+  #
+  # dbus reported "Failed to execute program
+  # org.freedesktop.impl.portal.desktop.kde: Input/output error" — EIO on
+  # execve, which is neither ENOENT (missing) nor EINVAL (NARF's non-PIE
+  # rejection). kactivitymanagerd lives in the same directory, is a similar
+  # size, and its unit fails; if it EIOs too then execve is the shared root
+  # cause of the black screen, not a side issue. Report each one's exit
+  # status explicitly rather than inferring from silence.
+  for b in /usr/libexec/kactivitymanagerd /usr/libexec/xdg-desktop-portal-kde \
+           /usr/bin/plasmashell /usr/bin/kded6; do
+    if [ -x "$b" ]; then
+      # Capture the BINARY's status, not a pipeline's. `x=$(cmd | head)`
+      # leaves $? as head's exit code, which reported rc=0 for binaries
+      # that never ran — the same pipeline-status trap that already bit
+      # this bring-up once. Redirect to a file, take $? immediately, and
+      # only then trim.
+      "$b" --version >/tmp/execprobe.out 2>&1
+      rc=$?
+      out=$(head -1 /tmp/execprobe.out 2>/dev/null)
+      printf 'EXECPROBE: %-46s rc=%s out=%s\n' "$b" "$rc" "${out:-<none>}"
+    else
+      printf 'EXECPROBE: %-46s NOT EXECUTABLE\n' "$b"
+    fi
+  done
+  echo "UNITBLOCK: --- failed user units, in full ---"
+  for u in $(systemctl --user list-units --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}'); do
+    systemctl --user status "$u" --no-pager -n 25 2>&1 |
+      while IFS= read -r l; do printf 'UNITFAIL: %s\n' "$l"; done
+  done
+  echo "UNITBLOCK: --- names on session bus ---"
+  DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" \
+    dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+      /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>&1 |
+    grep -oE '"[^"]+"' |
+    while IFS= read -r l; do printf 'UNITBLOCK: name %s\n' "$l"; done
+  echo "UNITBLOCK: done"
+}
+
 for i in {1..180}; do
   proc_state kwin_wayland kwin
   proc_state plasmashell plasma
@@ -102,6 +224,23 @@ for i in {1..180}; do
   live_count kcminit_startup kcminit_count
   proc_state kded6 kded
   proc_state ksmserver ksm
+  if [ "$drm_probed" = 0 ] && [ "$kwin" != "none" ]; then
+    drm_probed=1
+    drm_probe_in_session
+    unit_diag_once
+    # KConfig/QSaveFile atomic writes fail in-session with kwin logging
+    # 'Couldn't write ".../kwinrc" . Disk full?'. The image is NOT full and
+    # the dirs are uid-1000 owned, so "Disk full?" is KConfig guessing.
+    # This names the failing syscall. Runs against the real ext2 /home —
+    # the ABI tests for this ran on memfs, which cannot see an ext2-only
+    # difference.
+    if [ -x /usr/local/libexec/narf-qsf-probe ]; then
+      /usr/local/libexec/narf-qsf-probe /home/narf/.config 2>&1 |
+        while IFS= read -r l; do printf 'QSFP: %s\n' "$l"; done
+    else
+      echo "QSFP: probe binary MISSING"
+    fi
+  fi
   printf 'PLASMA-PROBE %s start=[%s] session=[%s] kwin=[%s] kcminit=[%s count=%s] kded=[%s] ksm=[%s] plasma=[%s]\n' \
     "$i" "$start" "$session" "$kwin" "$kcminit" "$kcminit_count" "$kded" "$ksm" "$plasma"
 

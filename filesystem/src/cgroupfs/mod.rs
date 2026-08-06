@@ -349,7 +349,28 @@ impl Cgroup {
         self.events_gen.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Re-publish `populated` and signal `cgroup.events` pollers if it
+    /// Absolute path of this cgroup's directory under `/sys/fs/cgroup`.
+    ///
+    /// Built by walking to the root, since inotify watches are keyed by
+    /// PATH and systemd registers one per cgroup directory.
+    fn abs_path(&self) -> String {
+        let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+        let mut cur = Some(self);
+        while let Some(c) = cur {
+            if !c.name.is_empty() {
+                parts.push(&c.name);
+            }
+            cur = c.parent.as_deref();
+        }
+        let mut path = String::from("/sys/fs/cgroup");
+        for seg in parts.iter().rev() {
+            path.push('/');
+            path.push_str(seg);
+        }
+        path
+    }
+
+    /// Re-publish `populated` and signal `cgroup.events` watchers if it
     /// transitioned, then walk up so an ancestor watching `events` also
     /// signals when a descendant empties.
     fn notify_events(&self) {
@@ -357,6 +378,30 @@ impl Cgroup {
         let was = self.last_populated.swap(now, Ordering::AcqRel);
         if now != was {
             self.bump_events();
+            // POLLPRI (bump_events) is NOT enough: systemd never polls this
+            // file. It registers
+            //   inotify_add_watch(fd, "<cgroup>/cgroup.events", IN_MODIFY)
+            // (systemd src/core/cgroup.c) and re-reads `populated` from
+            // unit_check_cgroup_events() when that fires.
+            //
+            // Every other IN_MODIFY in NARF originates on a userspace write
+            // path (sys_write/sys_truncate → notify_modify_*), but this
+            // transition is kernel-side — a task entering or leaving the
+            // cgroup — so nothing on the write path ever runs and systemd
+            // was never told.
+            //
+            // Consequence, measured: a Type=forking service's start job
+            // never completes, because systemd is waiting to observe the
+            // cgroup settle. plasma-kcminit.service stuck in `start
+            // running` with no process alive, holding 20 other Plasma jobs
+            // in `waiting` — kwin composited an empty scene and KDE showed
+            // a black screen. Affects ANY Type=forking unit, not just KDE.
+            //
+            // Fired for ancestors too (this walks up), because systemd
+            // watches each cgroup directory it manages, not just the leaf.
+            let mut path = self.abs_path();
+            path.push_str("/cgroup.events");
+            crate::notify_modify(&path);
         }
         if let Some(p) = &self.parent {
             p.notify_events();

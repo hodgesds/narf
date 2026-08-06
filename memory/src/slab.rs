@@ -112,10 +112,14 @@ struct FreeBlock {
 //
 // Protocol:
 //   * Entering the free state (`canary_on_free`): first CHECK the
-//     word — if it already holds this block's canary, the caller is
-//     freeing a block that is already free → panic naming the block
-//     (double-free caught at the second free, not later as silent
-//     heap corruption). Then write the canary.
+//     word — if it holds this block's canary AND the block is
+//     confirmed to still sit on a free structure
+//     (`double_free_confirmed`), the caller is freeing a block that
+//     is already free → panic naming the block (double-free caught
+//     at the second free, not later as silent heap corruption). A
+//     canary-shaped word on a block NOT in the free pool is the live
+//     owner's data (see the laundering note below) and the free
+//     proceeds normally. Then write the canary.
 //   * Leaving the free state (`canary_on_alloc`): CHECK the word
 //     still holds the canary — a mismatch means something wrote
 //     through a stale pointer while the block sat on a free list
@@ -129,17 +133,74 @@ struct FreeBlock {
 //     zeroed (`canary_clear_fresh`) for the same reason.
 //
 // The per-block XOR keeps a canary copied byte-for-byte into a
-// different block (memcpy of freed data) from validating there. The
-// only false-positive path is an owner storing exactly
-// `addr ^ SALT` at offset 8 of its own block — a 2⁻⁶⁴ coincidence.
+// different block (memcpy of freed data) from validating there.
+//
+// ── Canary laundering (the false positive this design must avoid) ──
+//
+// An owner storing exactly `addr ^ SALT` at offset 8 of its own live
+// block is NOT a 2⁻⁶⁴ coincidence if this module ever materializes
+// that value in a register while the block is being handed out.
+// rustc fills an enum's undefined padding lanes from whatever a
+// scratch register last held when a `Clone`/move writes the element
+// by value — and `Option<(Arc<dyn FileOps>, u64)>::None` defines only
+// its niche pointer, leaving bytes 8..23 as padding. When
+// `canary_on_alloc` computed the expected value `addr ^ SALT` for its
+// compare, the very next thing the caller did (clone a `[None]` poll
+// -file vec into the fresh block) copied that leftover into the
+// block's bytes 8..16 — recreating a perfect canary INSIDE a live
+// allocation. The block's eventual legitimate free then panicked
+// with a spurious "double free". Whether the leftover lands in the
+// padding is pure register-allocation luck, so entire kernel builds
+// were "cursed" or "blessed" by layout.
+//
+// Two defenses, both required:
+//   1. Never materialize: the full value `addr ^ SALT` may exist ONLY
+//      inside a genuinely free block. Every check compares in the XOR
+//      domain (`black_box(addr ^ word) == SALT`) so the expected
+//      value is never formed, and arming writes the canary a byte at
+//      a time so no register ever holds more than one byte of it.
+//      This starves the padding-laundering channel of the value.
+//   2. Confirm before panicking: a canary match on an incoming free
+//      is only a double free if the block is actually reachable from
+//      a magazine or the central list (`double_free_confirmed`).
+//      Owner data that merely collides with the canary — laundered
+//      or the honest 2⁻⁶⁴ accident — frees normally instead of
+//      killing the kernel.
 
 /// Salt for the free-state canary. Recognisable in raw memory dumps.
 const FREE_CANARY_SALT: u64 = 0xF7EE_B10C_5AB5_1AB5;
 
-/// The canary value for `blk` while it is free.
+/// Does `w1` hold `blk`'s free-state canary? Compares in the XOR
+/// domain through a `black_box` so the compiler cannot rewrite it as
+/// `w1 == addr ^ SALT` — this function must never materialize the
+/// block's own canary value (see the canary-laundering note above).
 #[inline]
-fn free_canary_value(blk: NonNull<FreeBlock>) -> u64 {
-    (blk.as_ptr() as u64) ^ FREE_CANARY_SALT
+fn canary_matches(blk: NonNull<FreeBlock>, w1: u64) -> bool {
+    core::hint::black_box((blk.as_ptr() as u64) ^ w1) == FREE_CANARY_SALT
+}
+
+/// Arm `blk`'s free-state canary: write `addr ^ SALT` into word 1 one
+/// byte at a time, computing each byte independently, so no register
+/// or spill slot ever holds more than a single byte of the full
+/// canary value (see the canary-laundering note above).
+///
+/// # Safety
+/// `blk` must be a block of at least `MIN_BLOCK` bytes that is
+/// entering (or in) the free state, with exclusive access.
+#[inline]
+unsafe fn canary_arm(blk: NonNull<FreeBlock>) {
+    let addr = blk.as_ptr() as u64;
+    // SAFETY: caller owns the block; word 1 is in bounds (see
+    // `canary_word`).
+    unsafe {
+        let w = canary_word(blk).cast::<u8>();
+        let mut i = 0usize;
+        while i < 8 {
+            let b = ((addr >> (8 * i)) as u8) ^ ((FREE_CANARY_SALT >> (8 * i)) as u8);
+            w.add(i).write_volatile(b);
+            i += 1;
+        }
+    }
 }
 
 /// Pointer to `blk`'s canary word (bytes 8..16).
@@ -153,32 +214,104 @@ unsafe fn canary_word(blk: NonNull<FreeBlock>) -> *mut u64 {
     unsafe { blk.as_ptr().cast::<u64>().add(1) }
 }
 
+/// Is `blk` actually reachable from one of this class's free
+/// structures — its per-CPU magazines or the central free list?
+///
+/// The disambiguator behind the double-free panic: an armed canary in
+/// an incoming block is only proof of a double free if the block is
+/// genuinely still parked somewhere in the free pool; otherwise the
+/// word is the LIVE OWNER'S DATA that merely collides with the canary
+/// (see the canary-laundering note — enum padding can legitimately
+/// reproduce it). Only consulted on a canary match, so the happy free
+/// path pays nothing.
+///
+/// `may_lock_central` guards the central-list walk: the IRQ-context
+/// free path (`try_dealloc_atomic`) exists precisely because taking
+/// the central head lock from IRQ context can deadlock against the
+/// interrupted owner, so that caller only gets the (lock-free)
+/// magazine scan — a rare unconfirmable match there frees normally
+/// rather than false-panicking. Cross-CPU magazine slots are read
+/// racily (volatile); this is a diagnostic net, and a torn read can
+/// at worst miss a genuine double free, never invent one.
+unsafe fn double_free_confirmed(
+    blk: NonNull<FreeBlock>,
+    class_idx: usize,
+    may_lock_central: bool,
+) -> bool {
+    let class = &CLASSES[class_idx];
+    let target = blk.as_ptr();
+    for mag in class.magazines.iter() {
+        // SAFETY: racy cross-CPU read of the magazine cell — see above.
+        let inner = mag.inner.get();
+        for si in 0..MAG_SIZE {
+            // SAFETY: fixed-size array read inside the cell.
+            let slot = unsafe { core::ptr::addr_of!((*inner).stack[si]).read_volatile() };
+            if slot.is_some_and(|b| core::ptr::eq(b.as_ptr(), target)) {
+                return true;
+            }
+        }
+    }
+    if may_lock_central {
+        let g = class.head.lock();
+        let mut cur = *g;
+        let mut steps = 0usize;
+        while let Some(b) = cur {
+            if core::ptr::eq(b.as_ptr(), target) {
+                return true;
+            }
+            if steps > 1_000_000 {
+                break; // corrupted/cyclic list — the walk must terminate
+            }
+            // SAFETY: central-list blocks are owned by this slab; we
+            // hold the head lock.
+            cur = unsafe { b.as_ref().next };
+            steps += 1;
+        }
+    }
+    false
+}
+
 /// Block enters the free state: reject a double free, then arm the
 /// canary.
 ///
 /// # Safety
 /// `blk` must be a block of size class `class_idx` that the caller
-/// is returning to this slab (exclusive access).
+/// is returning to this slab (exclusive access). `may_lock_central`
+/// must be false when the caller cannot tolerate taking the central
+/// head lock (IRQ context).
 #[inline]
-unsafe fn canary_on_free(blk: NonNull<FreeBlock>, class_idx: usize) {
+unsafe fn canary_on_free(blk: NonNull<FreeBlock>, class_idx: usize, may_lock_central: bool) {
     // SAFETY: caller owns the block being freed; see `canary_word`.
     unsafe {
         let w = canary_word(blk);
         let w1 = w.read();
-        // Capture the block's live shape BEFORE overwriting word 1 with
-        // the canary: for a `{data, vtable}` object word 1 is the vtable
-        // pointer that names the type if this block is later clobbered.
-        #[cfg(feature = "slab-free-audit")]
-        free_audit::note_free(blk, blk.as_ptr().cast::<u64>().read(), w1);
-        if w1 == free_canary_value(blk) {
+        // Double-free check FIRST, audit note second: on a double free the
+        // slot still holds the record of the block's FIRST free (its live
+        // shape — for a `{data, vtable}` object word 1 is the vtable that
+        // names the type). Noting before checking overwrote that record
+        // with the block's free-state shape (next=0, word1=canary), which
+        // told us nothing.
+        //
+        // A canary match alone is NOT proof: a live owner's bytes can
+        // legitimately collide with the canary (the padding-laundering
+        // false positive this module once panicked on). Confirm the
+        // block is actually parked in the free pool before declaring a
+        // double free; an unconfirmed match is owner data and the free
+        // proceeds normally.
+        if canary_matches(blk, w1) && double_free_confirmed(blk, class_idx, may_lock_central) {
             panic!(
-                "slab: double free of block {:p} (class {} B) — the block is already on a free list{}",
+                "slab: double free of block {:p} (class {} B) on cpu {} — the block is still on a free list{}",
                 blk.as_ptr(),
                 class_size(class_idx),
+                current_cpu(),
                 free_site_note(blk),
             );
         }
-        w.write(free_canary_value(blk));
+        // Capture the block's live shape BEFORE overwriting word 1 with
+        // the canary.
+        #[cfg(feature = "slab-free-audit")]
+        free_audit::note_free(blk, blk.as_ptr().cast::<u64>().read(), w1);
+        canary_arm(blk);
     }
 }
 
@@ -194,14 +327,16 @@ unsafe fn canary_on_alloc(blk: NonNull<FreeBlock>, class_idx: usize) {
     unsafe {
         let w = canary_word(blk);
         let got = w.read();
-        if got != free_canary_value(blk) {
+        if !canary_matches(blk, got) {
+            // The expected value is deliberately NOT printed: forming
+            // `addr ^ SALT` belongs to the panic path only, and the
+            // reader can XOR the two printed values.
             panic!(
-                "slab: free-block canary clobbered on block {:p} (class {} B): {:#x} != {:#x} — \
+                "slab: free-block canary clobbered on block {:p} (class {} B): got {:#x} — \
                  write-after-free while the block sat on a free list{}{}",
                 blk.as_ptr(),
                 class_size(class_idx),
                 got,
-                free_canary_value(blk),
                 free_site_note(blk),
                 CorruptionWindow(blk.as_ptr().cast()),
             );
@@ -221,14 +356,13 @@ unsafe fn canary_check_free(blk: NonNull<FreeBlock>, class_idx: usize) {
     // SAFETY: caller has exclusive reach to the free block.
     unsafe {
         let got = canary_word(blk).read();
-        if got != free_canary_value(blk) {
+        if !canary_matches(blk, got) {
             panic!(
-                "slab: free-block canary clobbered on block {:p} (class {} B): {:#x} != {:#x} — \
+                "slab: free-block canary clobbered on block {:p} (class {} B): got {:#x} — \
                  write-after-free while the block sat on a free list{}{}",
                 blk.as_ptr(),
                 class_size(class_idx),
                 got,
-                free_canary_value(blk),
                 free_site_note(blk),
                 CorruptionWindow(blk.as_ptr().cast()),
             );
@@ -247,7 +381,7 @@ unsafe fn canary_check_free(blk: NonNull<FreeBlock>, class_idx: usize) {
 unsafe fn canary_set_fresh(blk: NonNull<FreeBlock>) {
     // SAFETY: the grow path owns the whole fresh frame.
     unsafe {
-        canary_word(blk).write(free_canary_value(blk));
+        canary_arm(blk);
     }
 }
 
@@ -316,6 +450,10 @@ mod free_audit {
         const Z: AtomicU64 = AtomicU64::new(0);
         [Z; SLOTS]
     };
+    static SLOT_CPU: [AtomicU64; SLOTS] = {
+        const Z: AtomicU64 = AtomicU64::new(0);
+        [Z; SLOTS]
+    };
 
     /// Record a block's first two words at free time. `w0`/`w1` are
     /// read by the caller BEFORE the canary overwrites word 1, so `w1`
@@ -328,19 +466,21 @@ mod free_audit {
         SLOT_ADDR[i].store(addr, Ordering::Relaxed);
         SLOT_W0[i].store(w0, Ordering::Relaxed);
         SLOT_W1[i].store(w1, Ordering::Relaxed);
+        SLOT_CPU[i].store(narf_lib::percpu::current_cpu() as u64, Ordering::Relaxed);
     }
 
-    /// Recall the captured `(word0, word1)` for `blk`, or `None` if a
-    /// colliding free evicted it. Only runs on the (rare) canary-trip
-    /// panic path.
+    /// Recall the captured `(word0, word1, cpu)` for `blk`, or `None`
+    /// if a colliding free evicted it. Only runs on the (rare)
+    /// canary-trip panic path.
     #[inline]
-    pub(super) fn recall(blk: NonNull<FreeBlock>) -> Option<(u64, u64)> {
+    pub(super) fn recall(blk: NonNull<FreeBlock>) -> Option<(u64, u64, u64)> {
         let addr = blk.as_ptr() as u64;
         let i = idx(addr);
         if SLOT_ADDR[i].load(Ordering::Relaxed) == addr {
             Some((
                 SLOT_W0[i].load(Ordering::Relaxed),
                 SLOT_W1[i].load(Ordering::Relaxed),
+                SLOT_CPU[i].load(Ordering::Relaxed),
             ))
         } else {
             None
@@ -357,8 +497,8 @@ fn free_site_note(blk: NonNull<FreeBlock>) -> FreeSiteNote {
     #[cfg(feature = "slab-free-audit")]
     {
         match free_audit::recall(blk) {
-            Some((w0, w1)) => FreeSiteNote {
-                words: Some((w0, w1)),
+            Some((w0, w1, cpu)) => FreeSiteNote {
+                words: Some((w0, w1, cpu)),
             },
             None => FreeSiteNote { words: None },
         }
@@ -374,18 +514,18 @@ fn free_site_note(blk: NonNull<FreeBlock>) -> FreeSiteNote {
 /// when the audit feature captured the block, otherwise empty.
 struct FreeSiteNote {
     #[cfg(feature = "slab-free-audit")]
-    words: Option<(u64, u64)>,
+    words: Option<(u64, u64, u64)>,
 }
 
 impl core::fmt::Display for FreeSiteNote {
     #[cfg_attr(not(feature = "slab-free-audit"), allow(unused_variables))]
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         #[cfg(feature = "slab-free-audit")]
-        if let Some((w0, w1)) = self.words {
+        if let Some((w0, w1, cpu)) = self.words {
             return write!(
                 f,
-                " [freed as data={:#x} vtable={:#x} — addr2line vtable → concrete type]",
-                w0, w1
+                " [first freed on cpu {} as data={:#x} vtable={:#x} — addr2line vtable → concrete type]",
+                cpu, w0, w1
             );
         }
         Ok(())
@@ -715,8 +855,9 @@ pub unsafe fn try_dealloc_atomic(
         }
         let blk = ptr.cast::<FreeBlock>();
         // SAFETY: caller hands us ownership of the block; the push
-        // below is what publishes it as free.
-        unsafe { canary_on_free(blk, c) };
+        // below is what publishes it as free. IRQ context — the
+        // double-free disambiguator must not touch the central lock.
+        unsafe { canary_on_free(blk, c, false) };
         #[cfg(feature = "kasan")]
         kasan_free(ptr, c);
         mag.stack[mag.top] = Some(blk);
@@ -897,8 +1038,10 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
 
         // The block enters the free state exactly once, whichever
         // path below parks it: reject a double free + arm the canary.
-        // SAFETY: caller hands us ownership of the block.
-        unsafe { canary_on_free(ptr.cast::<FreeBlock>(), c) };
+        // SAFETY: caller hands us ownership of the block. Task context
+        // with no slab locks held — the disambiguator may take the
+        // central head lock.
+        unsafe { canary_on_free(ptr.cast::<FreeBlock>(), c, true) };
 
         // FAST PATH: push onto the per-CPU magazine.
         // SAFETY: per-CPU access invariant, IRQs masked above.
@@ -1143,8 +1286,8 @@ pub unsafe fn _test_magazine_push(class_idx: usize, cpu: usize, ptr: NonNull<u8>
     assert!(mag.top < MAG_SIZE);
     // The planted block enters the free state — arm its canary like
     // every other free-list entry so the eventual pop verifies clean.
-    // SAFETY: caller hands us ownership of the block.
-    unsafe { canary_on_free(ptr.cast::<FreeBlock>(), class_idx) };
+    // SAFETY: caller hands us ownership of the block; test context.
+    unsafe { canary_on_free(ptr.cast::<FreeBlock>(), class_idx, true) };
     mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
     mag.top += 1;
     // Mirror the accounting that `dealloc_class` would have done
@@ -1680,3 +1823,70 @@ fn smoke_slab_churn_no_double_issue() -> narf_kernel_test::TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_slab_churn_no_double_issue);
+
+/// Test: a LIVE owner writing the value `block_addr ^ FREE_CANARY_SALT`
+/// into its own block's bytes 8..16 must not be misread as a double
+/// free when the block is later freed, and must not corrupt the pool.
+///
+/// This is not a hypothetical 2⁻⁶⁴ coincidence: the canary checkers
+/// used to materialize exactly that value in a register while HANDING
+/// THE BLOCK OUT (`canary_on_alloc`'s expected-value compare), and
+/// rustc is free to fill an enum's padding lanes from whatever a
+/// scratch register last held when a `Clone` writes the full element
+/// by value. `poll_scan`'s clone of a `[None]` poll-file vec did
+/// precisely that — `Option<(Arc<dyn FileOps>, u64)>::None` defines
+/// only the niche pointer, so bytes 8..23 of the element store came
+/// from leftovers of the allocation that had JUST checked this very
+/// block's canary. Result: a spurious kernel panic
+/// ("slab: double free of block ... class 32 B") on the pure-timeout
+/// poll path, dependent purely on register allocation — an entire
+/// musl-demo run lived or died on the layout lottery.
+///
+/// The fix is two layers: the checkers no longer materialize the
+/// canary value while a block is live (XOR-domain compares via
+/// `black_box`, byte-wise arming) — starving the laundering channel —
+/// and a canary match on free is only treated as a double free when
+/// the block is CONFIRMED to still sit on a magazine or the central
+/// list (`double_free_confirmed`). This test simulates the laundering
+/// directly — write the canary value as the owner, free, realloc —
+/// which exercises the confirm layer and therefore stays red/green
+/// independent of codegen luck.
+fn smoke_slab_owner_written_canary_value_is_not_double_free() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    // 24 bytes → the 32 B class, the same shape as the poll-file vec
+    // buffer that hit this in the wild.
+    let layout = Layout::from_size_align(24, 8).expect("layout");
+    for _ in 0..64 {
+        let p = match alloc(layout) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("alloc failed"),
+        };
+        // The owner legitimately writes ITS OWN block's would-be canary
+        // value into bytes 8..16 — exactly what the None-padding copy
+        // did. The block is live, so this must be treated as data.
+        // SAFETY: `p` is our live 24-byte allocation; writing its
+        // bytes 0..24 is the owner's right.
+        unsafe {
+            let w = p.as_ptr().cast::<u64>();
+            w.write(0);
+            w.add(1).write((p.as_ptr() as u64) ^ FREE_CANARY_SALT);
+            w.add(2).write(0x7);
+        }
+        // Pre-fix: this free PANICKED the kernel with a spurious
+        // "double free of block ... — already on a free list".
+        // SAFETY: matching layout.
+        unsafe { dealloc(p, layout) };
+        // The block must come back usable.
+        let q = match alloc(layout) {
+            Ok(q) => q,
+            Err(_) => return TestResult::Fail("realloc failed"),
+        };
+        // SAFETY: matching layout.
+        unsafe { dealloc(q, layout) };
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_slab_owner_written_canary_value_is_not_double_free
+);

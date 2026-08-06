@@ -2922,3 +2922,94 @@ fn smoke_ext2_sync_deep_walk() -> TestResult {
     }
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_sync_deep_walk);
+
+/// ext2 `rename` must ATOMICALLY REPLACE an existing destination.
+///
+/// `dir_rename` unconditionally applied RENAME_NOREPLACE semantics:
+///
+///     // RENAME_NOREPLACE: fail if the destination already exists.
+///     if self.dir_lookup(&new_parent_probe, new_name).await.is_ok() {
+///         return Err(FsError::InvalidPath);
+///     }
+///
+/// POSIX and Linux require plain rename(2) to replace the destination.
+/// Only renameat2(RENAME_NOREPLACE) refuses — and the syscall layer already
+/// enforces that itself (returning the correct EEXIST), so this check was
+/// both redundant and wrong, and it mapped to EINVAL rather than EEXIST.
+///
+/// Impact: this is the exact operation Qt's QSaveFile performs on every
+/// write after the first — write a temp beside the target, rename it ONTO
+/// the existing target. So every KConfig/KSycoca write on the ext2 rootfs
+/// failed, surfacing as kwin logging
+/// `Couldn't write ".../kwinrc" . Disk full?` (KConfig prints that for any
+/// failed commit; the disk had 2.5 GB free).
+///
+/// Measured in-guest as uid 1000 before the fix:
+///     rename(tmp -> target)   ok        [destination absent]
+///     rename over EXISTING    errno=22  (EINVAL)
+///
+/// Note this could NOT be caught by the syscall-ABI suite: those tests run
+/// on memfs, which replaces correctly, while the guest's /home is ext2.
+/// The pass-1 assertion below (rename onto an ABSENT name) is kept because
+/// it succeeds even on the broken code — the two together are what
+/// distinguish "rename is broken" from "replacement is broken".
+fn smoke_ext2_rename_replaces_existing_destination() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"sentinel");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    // Pass 1: destination ABSENT — works even on the broken implementation.
+    if poll_once(root.rename("data", "target"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("rename onto an absent destination failed");
+    }
+
+    // Stage a second source alongside the now-existing destination.
+    if poll_once(root.create("tmp")).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("could not create the replacement source");
+    }
+
+    // Pass 2: destination EXISTS. QSaveFile's every-write case.
+    if poll_once(root.rename("tmp", "target"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail(
+            "rename onto an EXISTING destination failed — POSIX requires atomic \
+             replacement; this is Qt QSaveFile's path (KConfig 'Disk full?')",
+        );
+    }
+
+    let entries = match poll_once(root.enumerate_async(0, 32)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("enumerate after replacing rename failed"),
+    };
+    if entries.iter().any(|(n, _)| n == "tmp") {
+        return TestResult::Fail("source name still present after replacing rename");
+    }
+    if !entries.iter().any(|(n, _)| n == "target") {
+        return TestResult::Fail("destination missing after replacing rename");
+    }
+    // Exactly one `target` entry — a replace must not leave a duplicate
+    // directory entry behind, which a naive "insert then unlink" would.
+    if entries.iter().filter(|(n, _)| n == "target").count() != 1 {
+        return TestResult::Fail("duplicate directory entries for the replaced name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_rename_replaces_existing_destination
+);

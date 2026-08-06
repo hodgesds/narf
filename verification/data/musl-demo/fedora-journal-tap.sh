@@ -45,7 +45,41 @@ done
 # SYSTEM unit (narf-plasma.service, so _SYSTEMD_UNIT), whereas the Plasma
 # components are real user units, so this filter separates them exactly.
 # `+` is journalctl's OR between match groups.
+#
+# Do NOT add `-b` here. It is the obvious way to skip previous boots and it
+# silently produced ZERO output under NARF — 2 tap lines versus 148 without it.
+# That is far worse than the replay it was meant to prevent: it collapses
+# "kwin logged nothing" and "the tap is broken" into the same observation, and
+# it nearly got a false "no EGL errors this boot" reported as a fix.
+#
+# The replay is real, though: /var/log/journal is persistent while this cursor
+# lives on /run (tmpfs), so the first pass every boot drains the whole history,
+# previous boots included. Handle it by LABELLING rather than filtering —
+# drain once under a distinct JTAP-OLD: tag, print a boundary marker, then tail
+# live as JTAP:. Nothing is hidden and a stale line cannot be read as current.
 narf_cursor=/run/narf-jtap.cursor
+
+if [ ! -f "$narf_cursor" ]; then
+  journalctl --cursor-file="$narf_cursor" \
+    _SYSTEMD_USER_UNIT=plasma-kwin_wayland.service \
+    + _SYSTEMD_USER_UNIT=plasma-plasmashell.service \
+    + _SYSTEMD_USER_UNIT=plasma-kded6.service \
+    + _SYSTEMD_USER_UNIT=plasma-ksmserver.service \
+    + _SYSTEMD_USER_UNIT=plasma-kcminit.service \
+    + _SYSTEMD_USER_UNIT=plasma-kactivitymanagerd.service \
+    + _COMM=kwin_wayland \
+    + _COMM=kwin_wayland_wrapper \
+    + _COMM=startplasma-wayland \
+    + _COMM=kactivitymanagerd \
+    + _COMM=plasmashell \
+    --no-pager --output=cat 2>&1 |
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      printf 'JTAP-OLD: %s\n' "$line"
+    done
+  echo "JTAP: ==== end of replayed history; everything below is THIS boot ===="
+fi
+
 while :; do
   journalctl --cursor-file="$narf_cursor" \
     _SYSTEMD_USER_UNIT=plasma-kwin_wayland.service \
@@ -53,6 +87,12 @@ while :; do
     + _SYSTEMD_USER_UNIT=plasma-kded6.service \
     + _SYSTEMD_USER_UNIT=plasma-ksmserver.service \
     + _SYSTEMD_USER_UNIT=plasma-kcminit.service \
+    + _SYSTEMD_USER_UNIT=plasma-kactivitymanagerd.service \
+    + _COMM=kwin_wayland \
+    + _COMM=kwin_wayland_wrapper \
+    + _COMM=startplasma-wayland \
+    + _COMM=kactivitymanagerd \
+    + _COMM=plasmashell \
     --no-pager --output=cat 2>&1 |
     while IFS= read -r line; do
       [ -n "$line" ] || continue

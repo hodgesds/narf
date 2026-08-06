@@ -2455,6 +2455,12 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // armed via timerfd_settime, blocked on by epoll_wait(-1). Guards the
         // path the whole desktop repaint cadence rides on.
         ("tfd_epoll_smoke", "tfd-epoll-ok"),
+        // Pure-timeout poll/epoll park hammer — hundreds of no-fd timeout
+        // windows (with timerfd-in-epoll churn) across 8 concurrent
+        // processes. Pins the slab-canary false positive that
+        // tfd_epoll_smoke's single 120 ms step-F window only tripped on
+        // layout-cursed builds ("slab: double free ... class 32 B").
+        ("polltmo_hammer", "polltmo-ok"),
         // modetest (real libdrm) enumerates /dev/dri/card0 end-to-end —
         // VERSION + GET_CAP + GETRESOURCES + GETCONNECTOR/ENCODER/CRTC +
         // OBJ_GETPROPERTIES. Anchors on the enumerated 1280x800 mode.

@@ -1244,7 +1244,7 @@ fn open_impl(
             gid: file_gid,
             perms: stat.mode.perms,
         },
-        current_accessor(task),
+        &current_accessor(task),
         narf_filesystem::AccessRequest {
             read: want_r,
             write: want_w,
@@ -7958,13 +7958,28 @@ pub fn report_ucred_to(reader: u64, mut cred: crate::socket::Ucred) -> crate::so
 /// literals are in `tests.rs`.)
 fn current_accessor(task: u64) -> narf_filesystem::Accessor {
     let acc = read_uidgid(task);
+    // Supplementary groups are part of the identity, not an extra. Linux's
+    // group triplet test is in_group_p(), which matches the fsgid OR any
+    // group from setgroups(2). Dropping them here demotes the process to the
+    // "other" triplet for every file owned by a group it holds only
+    // supplementarily — which is precisely how kwin lost /dev/dri/card0
+    // (crw-rw---- root:video) despite narf being in `video`, and with it the
+    // whole Plasma session.
+    let groups = read_groups(task);
     #[cfg(feature = "container")]
     {
         let uns = crate::namespaces::current_user_ns(task);
         if !uns.is_initial() {
+            // File owners are host-absolute, so the supplementary list has to
+            // be translated exactly like fsgid or it would compare in-ns ids
+            // against host ids and match by coincidence.
             return narf_filesystem::Accessor {
                 uid: uns.translate_uid_to_host(acc.fsuid),
                 gid: uns.translate_gid_to_host(acc.fsgid),
+                groups: groups
+                    .iter()
+                    .map(|g| uns.translate_gid_to_host(*g))
+                    .collect(),
             };
         }
     }
@@ -7972,6 +7987,7 @@ fn current_accessor(task: u64) -> narf_filesystem::Accessor {
     narf_filesystem::Accessor {
         uid: acc.fsuid,
         gid: acc.fsgid,
+        groups,
     }
 }
 
