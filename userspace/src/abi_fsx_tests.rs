@@ -1536,4 +1536,7 @@ fn smoke_abi_fsx_open_honours_supplementary_group() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx_open_honours_supplementary_group);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_open_honours_supplementary_group
+);
