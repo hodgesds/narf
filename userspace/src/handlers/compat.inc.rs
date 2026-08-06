@@ -9204,7 +9204,7 @@ pub(crate) use {
     handler_sys_reboot::sys_reboot,
     handler_sys_removexattr::sys_removexattr,
     handler_sys_rename::{rename_absolute, sys_rename},
-    handler_sys_renameat::{resolve_at, sys_renameat},
+    handler_sys_renameat::sys_renameat,
     handler_sys_renameat2::sys_renameat2,
     handler_sys_restart_syscall::sys_restart_syscall,
     handler_sys_ring_kick::sys_ring_kick,

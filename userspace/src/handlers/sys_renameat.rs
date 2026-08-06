@@ -1,31 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// Resolve one `*at()` path against its dirfd, POSIX-style.
-///
-/// Mirrors `sys_openat`: an absolute path or `AT_FDCWD` resolves as usual; a
-/// relative path is joined onto the directory backing `dirfd`. Returns the
-/// errno to report when the descriptor cannot name a directory — Linux gives
-/// EBADF there, and resolving from the cwd instead would silently operate on
-/// a same-named file in the WRONG directory, which is worse than an error.
-pub(crate) fn resolve_at(dirfd: i64, path: &str, task: u64) -> Result<alloc::string::String, i64> {
-    const AT_FDCWD: i64 = -100;
-    if path.starts_with('/') || dirfd == AT_FDCWD {
-        return Ok(alloc::string::String::from(path));
-    }
-    if dirfd < 0 {
-        return Err(-9); // EBADF — AT_FDCWD is the only negative dirfd accepted
-    }
-    match fd_path_for_task(task, dirfd as u32) {
-        Some(dir) if dir.starts_with('/') => Ok(alloc::format!(
-            "{}/{}",
-            dir.trim_end_matches('/'),
-            path
-        )),
-        _ => Err(-9), // EBADF
-    }
-}
-
 /// `renameat(olddirfd, oldpath, newdirfd, newpath)`.
 ///
 /// Both dirfds are load-bearing and were previously DISCARDED
@@ -69,14 +44,14 @@ pub(crate) fn sys_renameat(ctx: &mut dyn TrapContext) {
     };
 
     let task = current_task_id();
-    let old_path = match resolve_at(old_dirfd, &old_str, task) {
+    let old_path = match resolve_at_path(task, old_dirfd, &old_str) {
         Ok(p) => p,
         Err(e) => {
             ctx.set_return(SyscallReturn::ok(e as u64));
             return;
         }
     };
-    let new_path = match resolve_at(new_dirfd, &new_str, task) {
+    let new_path = match resolve_at_path(task, new_dirfd, &new_str) {
         Ok(p) => p,
         Err(e) => {
             ctx.set_return(SyscallReturn::ok(e as u64));

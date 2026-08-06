@@ -43,14 +43,14 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
     // the path a distro's libc actually takes — it has to resolve
     // relative paths against the cwd exactly like `sys_rename` does.
     let task = current_task_id();
-    let old_path = match resolve_at(args.arg0 as i64, &old_path, task) {
+    let old_path = match resolve_at_path(task, args.arg0 as i64, &old_path) {
         Ok(p) => p,
         Err(e) => {
             ctx.set_return(SyscallReturn::ok(e as u64));
             return;
         }
     };
-    let new_path = match resolve_at(args.arg2 as i64, &new_path, task) {
+    let new_path = match resolve_at_path(task, args.arg2 as i64, &new_path) {
         Ok(p) => p,
         Err(e) => {
             ctx.set_return(SyscallReturn::ok(e as u64));

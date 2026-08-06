@@ -1974,3 +1974,122 @@ fn smoke_abi_fsx_at_family_honours_dirfd() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_at_family_honours_dirfd);
+
+/// `stat(2)` on a RELATIVE path must resolve against the cwd.
+///
+/// `sys_stat` resolves with `apply_chroot()` while nearly every other path
+/// syscall uses `resolve_cwd_path()`. `apply_chroot` applies the chroot but
+/// does NOT join the cwd (nor normalise `//`), so a relative path reaches
+/// the registry unanchored.
+///
+/// Whether that actually breaks stat is the question this test settles —
+/// it is written to FAIL LOUDLY either way rather than to confirm a guess:
+/// chdir into a directory, stat a name inside it relatively, and require
+/// the same result an absolute stat gives.
+///
+/// This matters beyond tidiness: busybox's shell stats its way along
+/// `$PATH`, and configure-style scripts stat relative paths constantly.
+fn smoke_abi_fsx_stat_relative_uses_cwd() -> TestResult {
+    with_memfs("/abi-statrel", "statrel", &[], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        const O_RDWR: u64 = 2;
+        const O_CREAT: u64 = 0o100;
+        const O_EXCL: u64 = 0o200;
+        let abs = b"/abi-statrel/sub/f\0";
+        let dir = b"/abi-statrel/sub\0";
+        let rel = b"f\0";
+
+        // Stage explicitly: a nested seed path is not created as a
+        // directory tree by with_memfs, which made an earlier version of
+        // this test fail on its own staging rather than on stat.
+        if call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0o755, 0),
+        ) != Some(0)
+        {
+            return Err("mkdir of the test subdirectory failed");
+        }
+        match call(
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                abs.as_ptr() as u64,
+                O_CREAT | O_EXCL | O_RDWR,
+                0o644,
+            ),
+        ) {
+            Some(v) if v >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+            }
+            _ => return Err("could not create the file to stat"),
+        }
+
+        // Baseline: the absolute stat must work, else the test is vacuous.
+        let mut st_abs = [0u8; 144];
+        if call(
+            Syscall::Stat.raw(),
+            a1(abs.as_ptr() as u64, st_abs.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("absolute stat of the seeded file failed — staging is broken");
+        }
+
+        // DISCRIMINATOR: from the root, the bare name must NOT resolve.
+        // Without this the test cannot tell "cwd was honoured" from "the
+        // name resolved by some other route", and would pass vacuously.
+        let root = b"/\0";
+        let _ = call(Syscall::Chdir.raw(), a0(root.as_ptr() as u64));
+        let mut st_pre = [0u8; 144];
+        if call(
+            Syscall::Stat.raw(),
+            a1(rel.as_ptr() as u64, st_pre.as_mut_ptr() as u64),
+        ) == Some(0)
+        {
+            return Err("the bare name resolved from / — this test cannot prove the cwd is used");
+        }
+
+        if call(Syscall::Chdir.raw(), a0(dir.as_ptr() as u64)) != Some(0) {
+            return Err("chdir into the seeded directory failed");
+        }
+        // chdir returning 0 does not prove the cwd MOVED. Read it back, so
+        // a silently-nop chdir cannot make the rest of this test look like
+        // a statement about relative resolution.
+        let mut cwd = [0u8; 256];
+        let n = call(
+            Syscall::Getcwd.raw(),
+            a1(cwd.as_mut_ptr() as u64, cwd.len() as u64),
+        );
+        let cwd_ok = match n {
+            Some(v) if v > 0 => {
+                let end = core::cmp::min(v as usize, cwd.len());
+                let got = &cwd[..end];
+                let got = match got.iter().position(|&b| b == 0) {
+                    Some(i) => &got[..i],
+                    None => got,
+                };
+                got == b"/abi-statrel/sub"
+            }
+            _ => false,
+        };
+        if !cwd_ok {
+            let _ = call(Syscall::Chdir.raw(), a0(root.as_ptr() as u64));
+            return Err("getcwd did not report /abi-statrel/sub after chdir");
+        }
+        let mut st_rel = [0u8; 144];
+        let r = call(
+            Syscall::Stat.raw(),
+            a1(rel.as_ptr() as u64, st_rel.as_mut_ptr() as u64),
+        );
+        // Restore cwd BEFORE asserting so a failure cannot strand later tests.
+        let _ = call(Syscall::Chdir.raw(), a0(root.as_ptr() as u64));
+
+        match r {
+            Some(0) => Ok(()),
+            _ => Err(
+                "stat() of a relative path after chdir failed — sys_stat resolves with \
+                 apply_chroot(), which does not join the cwd",
+            ),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_stat_relative_uses_cwd);

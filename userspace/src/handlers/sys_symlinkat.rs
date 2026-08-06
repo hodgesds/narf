@@ -35,7 +35,7 @@ pub(crate) fn sys_symlinkat(ctx: &mut dyn TrapContext) {
         }
     };
     let task = current_task_id();
-    let joined = match resolve_at(newdirfd, &link_str, task) {
+    let joined = match resolve_at_path(task, newdirfd, &link_str) {
         Ok(p) => p,
         Err(e) => {
             ctx.set_return(SyscallReturn::ok(e as u64));

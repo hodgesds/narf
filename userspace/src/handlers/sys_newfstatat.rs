@@ -46,7 +46,7 @@ pub(crate) fn sys_newfstatat(ctx: &mut dyn TrapContext) {
             }
         }
     } else {
-        match resolve_at(dirfd, &path_str, task) {
+        match resolve_at_path(task, dirfd, &path_str) {
             Ok(p) => p,
             Err(e) => {
                 ctx.set_return(SyscallReturn::ok(e as u64));

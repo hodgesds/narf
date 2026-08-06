@@ -28,7 +28,7 @@ pub(crate) fn sys_unlinkat(ctx: &mut dyn TrapContext) {
         }
     };
     let task = current_task_id();
-    let joined = match resolve_at(dirfd, &path_str, task) {
+    let joined = match resolve_at_path(task, dirfd, &path_str) {
         Ok(p) => p,
         Err(e) => {
             ctx.set_return(SyscallReturn::ok(e as u64));
