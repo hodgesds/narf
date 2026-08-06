@@ -136,6 +136,34 @@ drm_probed=0
 # a populated one in another, which is an instrument difference, not a system
 # difference.
 unit_diag_once() {
+  # This probe's own service has no XDG_RUNTIME_DIR, so systemctl --user
+  # could not reach the user bus at all and the first version of this
+  # diagnostic reported nothing but its own misconfiguration.
+  #
+  # Which runtime dir is the RIGHT one is itself the open question:
+  # narf-plasma.service sets XDG_RUNTIME_DIR=/run/narf-plasma while
+  # systemd --user for uid 1000 uses /run/user/1000. If kwin publishes
+  # org.kde.KWinWrapper on one bus while the systemd holding the queued jobs
+  # watches the other, a Type=dbus unit can never go active — which would
+  # explain the stall exactly. So report BOTH, and read kwin's actual
+  # environment rather than assuming either.
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
+  echo "UNITBLOCK: probe XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+  for d in /run/user/1000 /run/narf-plasma; do
+    printf 'UNITBLOCK: ls %s: ' "$d"
+    ls "$d" 2>&1 | tr '\n' ' '
+    echo
+  done
+  kpid=$(pgrep -x kwin_wayland 2>/dev/null | head -1)
+  [ -z "$kpid" ] && kpid=$(pgrep -f kwin_wayland 2>/dev/null | head -1)
+  echo "UNITBLOCK: kwin pid=${kpid:-none}"
+  if [ -n "$kpid" ] && [ -r "/proc/$kpid/environ" ]; then
+    tr '\0' '\n' < "/proc/$kpid/environ" 2>/dev/null |
+      grep -E '^(XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|WAYLAND_DISPLAY|XDG_SESSION_TYPE)=' |
+      while IFS= read -r l; do printf 'UNITBLOCK: kwin-env %s\n' "$l"; done
+  else
+    echo "UNITBLOCK: kwin environ unreadable"
+  fi
   echo "UNITBLOCK: --- systemctl --user list-jobs ---"
   systemctl --user list-jobs --no-pager 2>&1 |
     while IFS= read -r l; do printf 'UNITBLOCK: %s\n' "$l"; done
