@@ -26,15 +26,24 @@ pub(crate) fn sys_symlink(ctx: &mut dyn TrapContext) {
     // Resolve the link location against the cwd (the symlink *target*
     // stays verbatim — symlink targets may legitimately be relative).
     let link_path = resolve_cwd_path(current_task_id(), &link_path);
+    symlink_absolute(ctx, &target_str, &link_path);
+}
+
+/// Create a symlink whose LINK PATH is already absolute.
+///
+/// Split out so `sys_symlinkat` can join its relative linkpath against
+/// `newdirfd` and share this body. The target string stays verbatim —
+/// symlink targets may legitimately be relative and must not be rewritten.
+pub(crate) fn symlink_absolute(ctx: &mut dyn TrapContext, target_str: &str, link_path: &str) {
     let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(&link_path, |_fs, parent, leaf| {
-            poll_blocking(parent.symlink(leaf, &target_str))
+        .resolve_parent_absolute(link_path, |_fs, parent, leaf| {
+            poll_blocking(parent.symlink(leaf, target_str))
         });
     match outcome {
         Some(Some(Ok(_))) => {
             // inotify: a new symlink is IN_CREATE on the link path.
             #[cfg(feature = "linux-compat")]
-            crate::mqueue::notify_create(&link_path, false);
+            crate::mqueue::notify_create(link_path, false);
             ctx.set_return(SyscallReturn::ok(0))
         }
         // An existing link name is EEXIST — systemd-tmpfiles creates symlinks

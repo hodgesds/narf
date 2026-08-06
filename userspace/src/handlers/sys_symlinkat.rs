@@ -1,45 +1,47 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// `symlinkat(target, newdirfd, linkpath)`.
+///
+/// `newdirfd` was previously DISCARDED (`let _dirfd = args.arg1;`) and this
+/// proxied to `sys_symlink` with the raw pointers, so a relative linkpath
+/// was created relative to the CWD instead of the named directory.
+///
+/// udev creates every `/dev/` alias this way (by-id, by-path, by-uuid) from
+/// a directory fd, so an ignored dirfd puts the link in the wrong place —
+/// or fails — and the alias never appears.
+///
+/// Only the LINK PATH is resolved. A symlink target may legitimately be
+/// relative and is stored verbatim, exactly as Linux does.
 pub(crate) fn sys_symlinkat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux: symlinkat(const char *target, int newdirfd, const char *linkpath).
-    // arg0 = target (NUL-term), arg1 = newdirfd, arg2 = linkpath (NUL-term).
-    // (Was NARF-native (target_ptr, target_len, dirfd, link_ptr, link_len).)
     let target_ptr = args.arg0;
-    let _dirfd = args.arg1;
+    let newdirfd = args.arg1 as i64;
     let link_ptr = args.arg2;
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
+    let efault = SyscallReturn::ok((-14i64) as u64);
+    let target_str = match copy_user_cstr(target_ptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(efault);
+            return;
         }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    // sys_symlink is now Linux-shaped: arg0 = target ptr, arg1 = linkpath ptr.
-    let proxy_args = SyscallArgs {
-        arg0: target_ptr,
-        arg1: link_ptr,
-        ..Default::default()
     };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
+    let link_str = match copy_user_cstr(link_ptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(efault);
+            return;
+        }
     };
-    sys_symlink(&mut proxy);
+    let task = current_task_id();
+    let joined = match resolve_at(newdirfd, &link_str, task) {
+        Ok(p) => p,
+        Err(e) => {
+            ctx.set_return(SyscallReturn::ok(e as u64));
+            return;
+        }
+    };
+    let link_path = resolve_cwd_path(task, &joined);
+    symlink_absolute(ctx, &target_str, &link_path);
 }

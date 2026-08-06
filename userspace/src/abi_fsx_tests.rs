@@ -1849,3 +1849,128 @@ fn smoke_abi_fsx_renameat2_honours_dirfd() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_renameat2_honours_dirfd);
+
+/// The rest of the `*at()` family must honour its dirfd too.
+///
+/// `renameat`/`renameat2` were only the two that journald tripped over.
+/// The same defect — `let _dirfd = args.arg0;` then proxy to the non-`at`
+/// handler with the raw user pointer — was present in `unlinkat`,
+/// `newfstatat` and `symlinkat`. Each is exercised the way a real component
+/// uses it:
+///
+///   fstatat   sd-device walks sysfs one component at a time against
+///             parent-directory fds; glibc's stat()/lstat() sit on it.
+///   unlinkat  journald removes rotated journals, systemd-tmpfiles prunes
+///             trees, both against a held directory fd.
+///   symlinkat udev creates every /dev/by-id, by-path, by-uuid alias.
+///
+/// Each is asserted POSITIVELY (the operation took effect in the dirfd's
+/// directory), not merely "did not return an error" — with the dirfd
+/// ignored, a same-named file under the cwd makes these succeed while
+/// touching the WRONG file, which no error check would catch.
+fn smoke_abi_fsx_at_family_honours_dirfd() -> TestResult {
+    with_memfs("/abi-atfam", "atfam", &[], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        const O_RDWR: u64 = 2;
+        const O_CREAT: u64 = 0o100;
+        const O_EXCL: u64 = 0o200;
+        const O_DIRECTORY: u64 = 0o200000;
+
+        let dir = b"/abi-atfam/d\0";
+        if call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0o755, 0),
+        ) != Some(0)
+        {
+            return Err("mkdir failed");
+        }
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, O_DIRECTORY, 0),
+        ) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("could not open the directory as a dirfd"),
+        };
+        let close_dfd = || {
+            let _ = call(Syscall::Close.raw(), a0(dfd));
+        };
+
+        // ---- fstatat(dirfd, relative) ----------------------------------
+        let f = b"target\0";
+        match call(
+            Syscall::Openat.raw(),
+            a3(dfd, f.as_ptr() as u64, O_CREAT | O_EXCL | O_RDWR, 0o644),
+        ) {
+            Some(v) if v >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+            }
+            _ => {
+                close_dfd();
+                return Err("could not create the file relative to the dirfd");
+            }
+        }
+        let mut st = [0u8; 144];
+        let r = call(
+            Syscall::Newfstatat.raw(),
+            a3(dfd, f.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+        );
+        if r != Some(0) {
+            close_dfd();
+            return Err("fstatat(dirfd, relative) failed — sd-device walks sysfs this way");
+        }
+
+        // ---- symlinkat(target, newdirfd, relative link) ----------------
+        let tgt = b"target\0";
+        let link = b"alias\0";
+        if call(
+            Syscall::Symlinkat.raw(),
+            a2(tgt.as_ptr() as u64, dfd, link.as_ptr() as u64),
+        ) != Some(0)
+        {
+            close_dfd();
+            return Err(
+                "symlinkat(newdirfd, relative) failed — udev creates /dev aliases this way",
+            );
+        }
+        // The link must be IN the dirfd's directory: open it there.
+        match call(
+            Syscall::Openat.raw(),
+            a3(dfd, link.as_ptr() as u64, O_RDWR, 0),
+        ) {
+            Some(v) if v >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+            }
+            _ => {
+                close_dfd();
+                return Err(
+                    "symlinkat reported success but the link is not in the dirfd's directory",
+                );
+            }
+        }
+
+        // ---- unlinkat(dirfd, relative) ---------------------------------
+        if call(Syscall::Unlinkat.raw(), a2(dfd, link.as_ptr() as u64, 0)) != Some(0) {
+            close_dfd();
+            return Err(
+                "unlinkat(dirfd, relative) failed — journald removes rotated journals this way",
+            );
+        }
+        // ...and it must actually be gone FROM THAT DIRECTORY.
+        let still = call(
+            Syscall::Openat.raw(),
+            a3(dfd, link.as_ptr() as u64, O_RDWR, 0),
+        );
+        let gone = !matches!(still, Some(v) if v >= 0);
+        if let Some(v) = still {
+            if v >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+            }
+        }
+        close_dfd();
+        if !gone {
+            return Err("unlinkat reported success but the name is still in the dirfd's directory");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_at_family_honours_dirfd);
