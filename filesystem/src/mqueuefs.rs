@@ -375,7 +375,7 @@ pub fn open(
                     gid: queue.group,
                     perms: queue.mode,
                 },
-                Accessor { uid, gid },
+                &Accessor::new(uid, gid),
                 want,
             ) {
                 return Err(MqueueError::PermissionDenied);

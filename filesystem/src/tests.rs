@@ -1253,7 +1253,7 @@ fn smoke_fs_posix_access_root_bypass() -> TestResult {
                 gid: fg,
                 perms: fp,
             },
-            Accessor { uid: au, gid: ag },
+            &Accessor::new(au, ag),
             AccessRequest {
                 read: r,
                 write: w,
@@ -1279,6 +1279,84 @@ fn smoke_fs_posix_access_root_bypass() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_posix_access_root_bypass);
 
+/// A supplementary group must select the GROUP triplet, not "other".
+///
+/// Linux's check is `in_group_p(inode->i_gid)`, which matches the fsgid OR
+/// any group installed by `setgroups(2)`. NARF compared only `gid ==
+/// file.gid`, so a process holding a group supplementarily was silently
+/// demoted to the "other" triplet.
+///
+/// This is the exact shape that kept KDE off the screen, so it is pinned
+/// with those numbers: `narf` is uid 1000 / gid 1000 and is in `video`
+/// (gid 39) only via /etc/group, while /dev/dri/card0 is
+/// `crw-rw---- root:video`. Other is `---`, so kwin's
+/// open(O_RDWR) returned EACCES; kwin logged just "Failed to open drm
+/// device /dev/dri/card0" and took the whole session down with it.
+///
+/// setgroups/getgroups already round-tripped the list correctly — the list
+/// was stored and simply never consulted, which is why the ABI tests all
+/// passed while the desktop did not come up.
+fn smoke_fs_posix_access_supplementary_group() -> TestResult {
+    use crate::{AccessRequest, Accessor, FileOwner};
+    const VIDEO: u32 = 39;
+    let card0 = FileOwner {
+        uid: 0,
+        gid: VIDEO,
+        perms: 0o660,
+    };
+    let rw = AccessRequest {
+        read: true,
+        write: true,
+        exec: false,
+    };
+
+    // No supplementary groups → "other" triplet → denied. This is the
+    // pre-fix behaviour and must stay denied.
+    let bare = Accessor::new(1000, 1000);
+    if crate::posix_access_ok(card0, &bare, rw) {
+        return TestResult::Fail("uid1000 gid1000 with no groups got rw on 0660 root:video");
+    }
+
+    // Same identity, but holding `video` supplementarily → group triplet.
+    let with_video = Accessor {
+        uid: 1000,
+        gid: 1000,
+        groups: alloc::vec![4u32, VIDEO, 105],
+    };
+    if !crate::posix_access_ok(card0, &with_video, rw) {
+        return TestResult::Fail("supplementary video group did not grant rw on 0660 root:video");
+    }
+
+    // A non-matching supplementary list must NOT grant access — otherwise
+    // the test above would pass for the wrong reason (any list working).
+    let wrong = Accessor {
+        uid: 1000,
+        gid: 1000,
+        groups: alloc::vec![4u32, 105, 1001],
+    };
+    if crate::posix_access_ok(card0, &wrong, rw) {
+        return TestResult::Fail("unrelated supplementary groups granted rw");
+    }
+
+    // The owner triplet must still win over a group match, and the group
+    // triplet must not silently widen the bits: 0640 gives group r-- only.
+    let ro_group = FileOwner {
+        uid: 0,
+        gid: VIDEO,
+        perms: 0o640,
+    };
+    let w = AccessRequest {
+        read: false,
+        write: true,
+        exec: false,
+    };
+    if crate::posix_access_ok(ro_group, &with_video, w) {
+        return TestResult::Fail("supplementary group got write on group r-- (0640)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_posix_access_supplementary_group);
+
 fn smoke_fs_posix_access_owner_group_other() -> TestResult {
     use crate::{AccessRequest, Accessor, FileOwner};
     let check = |fu, fg, fp, au, ag, r, w, x| {
@@ -1288,7 +1366,7 @@ fn smoke_fs_posix_access_owner_group_other() -> TestResult {
                 gid: fg,
                 perms: fp,
             },
-            Accessor { uid: au, gid: ag },
+            &Accessor::new(au, ag),
             AccessRequest {
                 read: r,
                 write: w,

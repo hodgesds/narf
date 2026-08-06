@@ -269,10 +269,41 @@ pub struct FileOwner {
 }
 
 /// The accessing process's identity for a POSIX access check.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+///
+/// `groups` is the supplementary group list, i.e. what `setgroups(2)`
+/// installed. It is NOT optional decoration: Linux's group triplet test is
+/// `in_group_p(i_gid)`, which matches the fsgid **or any supplementary
+/// group**, and leaving it out silently demotes a process to the "other"
+/// triplet for every file owned by a group it only holds supplementarily.
+///
+/// That is not hypothetical — it is what kept KDE off the screen. `narf` is
+/// in `video` (gid 39) via /etc/group, but its primary gid is 1000, so
+/// `/dev/dri/card0` (crw-rw---- root:video) fell through to other=`---` and
+/// kwin's open failed with EACCES, reporting only "Failed to open drm device"
+/// before taking the whole session down.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Accessor {
     pub uid: u32,
     pub gid: u32,
+    /// Supplementary groups from `setgroups(2)`. Empty is legal.
+    pub groups: alloc::vec::Vec<u32>,
+}
+
+impl Accessor {
+    /// An accessor with no supplementary groups.
+    pub fn new(uid: u32, gid: u32) -> Self {
+        Accessor {
+            uid,
+            gid,
+            groups: alloc::vec::Vec::new(),
+        }
+    }
+
+    /// Linux `in_group_p()`: true if `gid` is the fsgid or any
+    /// supplementary group.
+    pub fn in_group(&self, gid: u32) -> bool {
+        self.gid == gid || self.groups.contains(&gid)
+    }
 }
 
 /// The set of access bits being requested (R=4, W=2, X=1).
@@ -290,7 +321,7 @@ pub struct AccessRequest {
 /// - UID 0 (root) is always allowed (POSIX privileged-process rule).
 /// - Otherwise: pick owner / group / other triplet by matching uid
 ///   then gid, and AND with the requested-mode bits (R=4, W=2, X=1).
-pub fn posix_access_ok(file: FileOwner, accessor: Accessor, want: AccessRequest) -> bool {
+pub fn posix_access_ok(file: FileOwner, accessor: &Accessor, want: AccessRequest) -> bool {
     if accessor.uid == 0 {
         // Root always has read+write; exec still requires *some*
         // exec bit on the file (matches Linux's get_acl_root path
@@ -303,7 +334,8 @@ pub fn posix_access_ok(file: FileOwner, accessor: Accessor, want: AccessRequest)
     }
     let triplet_shift = if accessor.uid == file.uid {
         6 // owner: bits 8..6
-    } else if accessor.gid == file.gid {
+    } else if accessor.in_group(file.gid) {
+        // Linux: in_group_p(i_gid) — fsgid OR any supplementary group.
         3 // group: bits 5..3
     } else {
         0 // other: bits 2..0
