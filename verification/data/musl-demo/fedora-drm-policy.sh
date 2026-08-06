@@ -46,3 +46,22 @@ printf 'DRMPROBE: config bytes read = '
 /usr/bin/dd if=/sys/class/drm/card0/device/config bs=64 count=1 2>/dev/null | /usr/bin/wc -c
 echo "DRMPROBE: --- first 16 bytes (expect 34 12 11 11 ...) ---"
 /usr/bin/od -An -tx1 -N16 /sys/class/drm/card0/device/config 2>&1 | head -2
+
+# Can the SESSION USER actually open the render node?
+#
+# eglInitialize fails with "DRI2: failed to get compatible render device"
+# AFTER Mesa has already picked a CPU renderer, so driver lookup succeeded
+# and the fault is in render-DEVICE selection. Kernel-side the render node
+# dispatches to the same card as card0 (dispatch_card render=true) and allows
+# VERSION/GET_CAP, so the nodes should be matchable — which leaves "can it be
+# opened at all, as uid 1000" as the untested assumption.
+echo "DRMPROBE: --- render node open test (as narf) ---"
+/usr/bin/ls -ln /dev/dri/renderD128 2>&1 | head -2
+/usr/bin/setpriv --reuid=1000 --regid=39 --clear-groups \
+  /bin/sh -c ': < /dev/dri/renderD128' 2>&1 \
+  && echo "DRMPROBE: renderD128 OPEN OK as uid 1000" \
+  || echo "DRMPROBE: renderD128 OPEN FAILED as uid 1000"
+/usr/bin/setpriv --reuid=1000 --regid=39 --clear-groups \
+  /bin/sh -c ': < /dev/dri/card0' 2>&1 \
+  && echo "DRMPROBE: card0 OPEN OK as uid 1000" \
+  || echo "DRMPROBE: card0 OPEN FAILED as uid 1000"
