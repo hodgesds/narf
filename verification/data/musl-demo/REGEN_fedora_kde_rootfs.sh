@@ -320,13 +320,14 @@ fi
 # user-runtime-dir@1000.service, which creates /run/user/1000 — where the
 # manager publishes the session bus the session then connects to.
 #
-# QV4_FORCE_INTERPRETER / QT_ENABLE_REGEXP_JIT below: NARF enforces W^X —
-# nothing grants a W|X end state and the RW->RX flip needs CapKind::Jit
-# (userspace mprotect_core). Qt's QML JIT allocator performs exactly that
-# flip and gets EINVAL, which the journal shows as "mprotect failed in
-# ExecutableAllocator::makeWritable: Invalid argument". Run QML interpreted
-# rather than weaken a deliberate kernel security property for bring-up
-# convenience; plasmashell is QML-heavy so this sits on its critical path.
+# Qt's QML JIT is ENABLED (no QV4_FORCE_INTERPRETER / QT_ENABLE_REGEXP_JIT).
+# Those were set when the RW->RX flip returned EINVAL, but the kernel now
+# implements it: mprotect's W^X arm returns WxTransition::NeedsCapJit, and
+# `jit_cap_default_policy` GRANTS a JitCap by default (memory/src/wx.rs) —
+# denial is opt-in per task, not the default — after which `jit_mprotect`
+# performs the flip. W^X is still enforced; nothing grants a W|X end state.
+# plasmashell is QML-heavy and this sits on its critical path, so running
+# interpreted was costing real startup time for no security benefit.
 #
 # NOTE: keep comments OUT of the printf argument list below. A `#` inside a
 # line-continued arg list silently swallows every remaining argument, and
@@ -350,10 +351,7 @@ printf '%s\n' \
   'Environment=XDG_CURRENT_DESKTOP=KDE' \
   'Environment=XKB_DEFAULT_MODEL=pc105' \
   'Environment=XKB_DEFAULT_LAYOUT=us' \
-  'Environment=QT_LOGGING_RULES=kwin_core.debug=true' \
   'Environment=QT_QPA_PLATFORM=wayland' \
-  'Environment=QV4_FORCE_INTERPRETER=1' \
-  'Environment=QT_ENABLE_REGEXP_JIT=0' \
   'Environment=KWIN_DRM_NO_AMS=1' \
   'Environment=KWIN_COMPOSE=Q' \
   'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \
