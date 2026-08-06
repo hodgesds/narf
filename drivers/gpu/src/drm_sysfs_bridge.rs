@@ -179,6 +179,72 @@ fn populate_card_node(
     // From /sys/devices/pci0000:00/<addr>/, three levels up is /sys.
     dev_kobj.add_symlink("subsystem", "../../../bus/pci");
 
+    // `device/uevent` — the ONLY thing that gives libdrm the bus address.
+    //
+    // This is not parity garnish; it decides whether any DRM node enumerates
+    // at all. `drmParsePciBusInfo()` does NOT parse the `device` symlink
+    // target (the assumption behind several earlier attempts here):
+    //
+    //     get_pci_path(maj, min, pci_path);        // realpath of .../device
+    //     value = sysfs_uevent_get(pci_path, "PCI_SLOT_NAME");
+    //     if (!value) return -ENOENT;
+    //
+    // and `sysfs_uevent_get` simply fopen()s `<pci_path>/uevent` and scans
+    // for a `KEY=` line. The card and render kobjects each had a uevent, but
+    // the PCI PARENT never did — so this returned -ENOENT,
+    // `drmProcessPciDevice()` failed, and `process_device()` dropped every
+    // node in /dev/dri.
+    //
+    // Measured in-guest with a probe linked against the guest's own libdrm,
+    // after the render-node `device` link went in:
+    //
+    //     DRMC: drmGetDevices2 count=0
+    //     DRMC: /dev/dri/card0      drmGetDevice2=-19   (-ENODEV)
+    //     DRMC: /dev/dri/renderD128 drmGetDevice2=-19
+    //
+    // while drmNodeIsDRM and both readlinks reported success — which is why
+    // reading the sysfs tree by hand kept suggesting nothing was wrong.
+    //
+    // No enumerated device means no `available_nodes`, so no render bit, so
+    // Mesa's loader_is_device_render_capable() is false and EGL dies with
+    // "DRI2: failed to get compatible render device".
+    //
+    // Format mirrors a real Linux PCI uevent, verified against
+    // /sys/dev/char/226:128/device/uevent on an amdgpu host. Only
+    // PCI_SLOT_NAME is load-bearing for libdrm; the rest is there because
+    // udev and modalias consumers read them. Linux writes the id fields in
+    // upper-case hex and the slot name in lower-case — match that exactly
+    // rather than normalizing, since MODALIAS is string-matched.
+    {
+        let vendor = card.vendor_id();
+        let device = card.device_id();
+        let sub_vendor = card.subsystem_vendor();
+        let sub_device = card.subsystem_device();
+        let drv = driver.clone();
+        let addr = String::from(pci_addr);
+        kobject_add_uevent_attr(
+            &dev_kobj,
+            format!(
+                "DRIVER={}\n\
+                 PCI_CLASS=30000\n\
+                 PCI_ID={:04X}:{:04X}\n\
+                 PCI_SUBSYS_ID={:04X}:{:04X}\n\
+                 PCI_SLOT_NAME={}\n\
+                 MODALIAS=pci:v{:08X}d{:08X}sv{:08X}sd{:08X}bc03sc00i00\n",
+                drv,
+                vendor,
+                device,
+                sub_vendor,
+                sub_device,
+                addr,
+                vendor as u32,
+                device as u32,
+                sub_vendor as u32,
+                sub_device as u32,
+            ),
+        );
+    }
+
     // `device/config` — raw PCI configuration space.
     //
     // THIS is what libdrm actually reads. `drmParsePciDeviceInfo` opens

@@ -1188,6 +1188,115 @@ kernel_test_in!(
     smoke_drm_render_node_device_link_matches_card
 );
 
+// ── Smoke 15c: the PCI node needs a `uevent` carrying PCI_SLOT_NAME ───────
+
+/// The PCI parent must expose `uevent` with a `PCI_SLOT_NAME=` line.
+///
+/// This is the single input that decides whether ANY DRM node enumerates.
+/// libdrm's `drmParsePciBusInfo()` does NOT parse the `device` symlink
+/// target, which is what every previous guess here assumed:
+///
+///     get_pci_path(maj, min, pci_path);          // realpath of .../device
+///     value = sysfs_uevent_get(pci_path, "PCI_SLOT_NAME");
+///     if (!value) return -ENOENT;                // ← node is DROPPED
+///
+/// `sysfs_uevent_get()` fopen()s `<pci_path>/uevent` and scans for the key.
+/// NARF gave the card and render kobjects a uevent but never the PCI parent,
+/// so this returned -ENOENT, `drmProcessPciDevice()` failed, and
+/// `process_device()` dropped EVERY node. Measured in-guest against the
+/// guest's own libdrm: `drmGetDevices2 count=0` and `drmGetDevice2=-19`
+/// (-ENODEV) for both minors — while `drmNodeIsDRM` and both readlinks
+/// succeeded, which is exactly why inspecting the sysfs tree by hand kept
+/// suggesting everything was fine.
+///
+/// With no device enumerated there is no `available_nodes`, hence no render
+/// bit, hence "DRI2: failed to get compatible render device" and no EGL for
+/// kwin.
+///
+/// Format mirrors a real Linux PCI uevent (verified against
+/// /sys/dev/char/226:128/device/uevent on an amdgpu host). Only
+/// PCI_SLOT_NAME is load-bearing for libdrm; the rest is parity for udev.
+#[cfg(feature = "linux-compat")]
+fn smoke_drm_pci_node_uevent_has_slot_name() -> TestResult {
+    use crate::drm_registry;
+    use narf_filesystem::sysfs;
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "bochs",
+        vid: 0x1234,
+        did: 0x1111,
+    }));
+    crate::drm_sysfs_bridge::populate_drm_class();
+
+    let card = match drm_device_node("card0") {
+        Some(c) => c,
+        None => return TestResult::Fail("card0 node missing"),
+    };
+    let target = match card.get_symlink("device") {
+        Some(t) => t,
+        None => return TestResult::Fail("card0/device is not a symlink"),
+    };
+    let addr = target.rsplit('/').next().unwrap_or("");
+    let pci = match sysfs::get_root()
+        .get_child("devices")
+        .and_then(|d| d.get_child("pci0000:00"))
+        .and_then(|p| p.get_child(addr))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("PCI device node missing"),
+    };
+
+    let uevent = match pci.attr_show("uevent") {
+        Some(u) => u,
+        None => return TestResult::Fail("PCI node has no uevent attr; drmParsePciBusInfo -ENOENT"),
+    };
+
+    // Parse it exactly as sysfs_uevent_get does: a line whose key matches up
+    // to a literal '='. A value embedded some other way would read fine to a
+    // human and still return NULL to libdrm.
+    let slot = uevent
+        .lines()
+        .find_map(|l| l.strip_prefix("PCI_SLOT_NAME="))
+        .map(|v| v.trim());
+    let slot = match slot {
+        Some(s) => s,
+        None => return TestResult::Fail("uevent has no PCI_SLOT_NAME= line"),
+    };
+
+    // And it must satisfy the sscanf that follows: "%04x:%02x:%02x.%1u".
+    if slot != addr {
+        return TestResult::Fail("PCI_SLOT_NAME does not match the device node's address");
+    }
+    let (domain_bus_dev, func) = match slot.rsplit_once('.') {
+        Some(p) => p,
+        None => return TestResult::Fail("PCI_SLOT_NAME has no .func suffix"),
+    };
+    let parts: alloc::vec::Vec<&str> = domain_bus_dev.split(':').collect();
+    if parts.len() != 3
+        || parts[0].len() != 4
+        || parts[1].len() != 2
+        || parts[2].len() != 2
+        || func.len() != 1
+    {
+        return TestResult::Fail("PCI_SLOT_NAME is not %04x:%02x:%02x.%1u shaped");
+    }
+    for p in parts.iter().chain(core::iter::once(&func)) {
+        if !p.chars().all(|c| c.is_ascii_hexdigit()) {
+            return TestResult::Fail("PCI_SLOT_NAME has non-hex components");
+        }
+    }
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("drivers/gpu/e2e", smoke_drm_pci_node_uevent_has_slot_name);
+
 // ── Smoke 16: vbios_version attr readable ─────────────────────────────────
 
 #[cfg(feature = "linux-compat")]
