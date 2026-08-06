@@ -19,10 +19,11 @@
 //! trade away for the extable and the arena guard slots — so the JIT must not
 //! be enabled before the real verifier is. [`provisional`] is the reminder.
 //!
-//! The [`ringbuf`] map kind's producer/consumer core is in place — a program
-//! reaches it through kfuncs (`bpf_ringbuf_output`, then reserve/submit) and a
-//! consumer will reach it through `mmap` + `poll`; both of those surfaces are
-//! still to come. The four keyed kinds and arenas are in [`map`] and [`arena`].
+//! The [`ringbuf`] map kind is complete: a program produces to it through
+//! kfuncs (`bpf_ringbuf_output`, and reserve/submit/discard), and a consumer
+//! drains it either in-kernel or by `mmap`ing the fd's shared frames and
+//! `poll`ing it (both on [`map::MapFile`]). The four keyed kinds and arenas are
+//! in [`map`] and [`arena`].
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
