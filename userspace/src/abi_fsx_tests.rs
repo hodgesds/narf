@@ -1404,3 +1404,59 @@ fn smoke_abi_fsx_mount_setattr_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_setattr_neg);
+
+// open(2) refused on permissions must be EACCES, not EPERM.
+//
+// Linux is explicit: EACCES is "the requested access to the file is not
+// allowed, or search permission is denied for one of the directories in the
+// path prefix". EPERM means something else. `open_impl` returned its generic
+// `fail` value (-1 == -EPERM) from the posix_access_ok gate, so every
+// permission denial surfaced as "Operation not permitted".
+//
+// Found via journalctl on the Fedora Plasma boot: "opening journal file ...:
+// Operation not permitted" reads as a capability/ownership bug and sends the
+// reader hunting for one, when the truth was an ordinary mode denial. Wrong
+// errno costs debugging time far out of proportion to the fix — same class as
+// the systemd EXIT_* findings.
+fn smoke_abi_fsx_open_permission_denied_is_eacces() -> TestResult {
+    with_memfs("/abi-perm", "abi", &[("secret", b"x")], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        let path = b"/abi-perm/secret\0";
+        // Root-owned and readable only by its owner.
+        if call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o600)) != Some(0) {
+            return Err("chmod 0600 setup failed — cannot stage a denial");
+        }
+        // Drop to an unprivileged uid: posix_access_ok short-circuits for
+        // uid 0, so as root this open would succeed and prove nothing.
+        // NARF's setresuid always returns 0 (see smoke_abi_creds_setresuid_neg),
+        // so the restore below is reliable.
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            return Err("setresuid(1000) setup failed");
+        }
+        let opened = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0, 0),
+        );
+        // Restore BEFORE asserting, so a failing assertion cannot strand the
+        // test task at uid 1000 and cascade into every later test.
+        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        match opened {
+            Some(v) if v == EACCES => Ok(()),
+            Some(v) if v == EPERM => {
+                Err("open() denial returned EPERM; Linux open(2) specifies EACCES")
+            }
+            Some(v) if v >= 0 => {
+                // Vacuous-test guard: if the open SUCCEEDED the staging failed
+                // (memfs ignored the chmod, or the uid drop did not take), and
+                // this test would pass no matter what errno the gate returns.
+                let _ = call(Syscall::Close.raw(), a0(v as u64));
+                Err("open succeeded as uid 1000 on a 0600 root file — staging is vacuous")
+            }
+            _ => Err("open() on a 0600 root-owned file as uid 1000 must return -EACCES"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_open_permission_denied_is_eacces
+);

@@ -217,7 +217,12 @@ pub type AttrStore = Arc<dyn Fn(&[u8]) -> Result<(), crate::FsError> + Send + Sy
 /// Binary-attribute read function: called with `(offset, buf)`.
 /// Returns the number of bytes written.
 /// Linux ref: `struct bin_attribute / read` (include/linux/sysfs.h:68).
-pub type BinAttrRead = fn(offset: usize, buf: &mut [u8]) -> usize;
+/// Boxed rather than a bare `fn` so a binary attribute can CAPTURE the
+/// state it renders. A plain fn pointer forced every bin attr to read from
+/// globals, which made per-device blobs (e.g. a DRM card's PCI config space,
+/// whose ids differ per card) impossible to express without one
+/// monomorphized function per device index.
+pub type BinAttrRead = Arc<dyn Fn(usize, &mut [u8]) -> usize + Send + Sync>;
 
 // ── Net interface snapshot hook ───────────────────────────────────────
 
@@ -399,6 +404,21 @@ impl Kobject {
         self.attrs.lock().keys().copied().collect()
     }
 
+    /// List binary attribute names.
+    ///
+    /// Separate from `attr_names` because the two maps are separate, but BOTH
+    /// must reach the VFS: a bin attr that is registered and not enumerated /
+    /// looked up is invisible to userspace, and reads of it fail with ENOENT
+    /// indistinguishably from never having been registered at all.
+    pub fn bin_attr_names(&self) -> Vec<&'static str> {
+        self.bin_attrs.lock().keys().copied().collect()
+    }
+
+    /// Recover the `&'static str` key of a BINARY attr matching `name`.
+    pub fn find_bin_attr_key(&self, name: &str) -> Option<&'static str> {
+        self.bin_attrs.lock().keys().copied().find(|&k| k == name)
+    }
+
     /// Call the show function for `name` and return its output.
     pub fn attr_show(&self, name: &str) -> Option<String> {
         let show = self.attrs.lock().get(name)?.clone();
@@ -428,7 +448,10 @@ impl Kobject {
 
     /// Call the bin-attr read function for `name`.
     pub fn bin_attr_read(&self, name: &str, offset: usize, buf: &mut [u8]) -> Option<usize> {
-        let read = *self.bin_attrs.lock().get(name)?;
+        // Clone the Arc and DROP the map lock before calling out: a reader
+        // that touches sysfs again would otherwise re-enter this
+        // non-reentrant lock.
+        let read = self.bin_attrs.lock().get(name)?.clone();
         Some(read(offset, buf))
     }
 
@@ -1031,7 +1054,7 @@ pub fn populate_kernel_dir() {
     let root = get_root();
     let kernel = get_or_create_child(&root, "kernel");
     kobject_add_attr(&kernel, "uevent_seqnum", crate::uevent::gen_uevent_seqnum);
-    kobject_add_bin_attr(&kernel, "notes", kernel_notes_read);
+    kobject_add_bin_attr(&kernel, "notes", Arc::new(kernel_notes_read));
 
     // /sys/kernel/mm/transparent_hugepage/ — THP policy knobs.
     // NARF implements no huge-page promotion; `[never]` is permanently active.
@@ -1982,6 +2005,18 @@ impl DirOps for SysKobjDir {
                 attr_name: attr_s,
             }));
         }
+        // Binary attrs. Previously omitted, which made every bin attr
+        // UNREACHABLE: `kobject_add_bin_attr` registered it, `has_attr`
+        // reported it, and userspace still got ENOENT because neither lookup
+        // nor enumerate consulted the map. That silently defeated the DRM
+        // card's PCI `config` blob (libdrm reads it to identify the device)
+        // and `/sys/kernel/notes`.
+        if let Some(bin) = self.kobj.find_bin_attr_key(name) {
+            return Some(Arc::new(SysBinAttrFile {
+                kobj: self.kobj.clone(),
+                attr_name: bin,
+            }));
+        }
         // Symlinks (subsystem/device/driver, …) — readlink reads the target.
         if let Some(target) = self.kobj.get_symlink(name) {
             return Some(Arc::new(SysSymlinkFile { target }));
@@ -2030,12 +2065,20 @@ impl DirOps for SysKobjDir {
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
         let child_names = self.kobj.child_names();
         let attr_names = self.kobj.attr_names();
+        // Binary attrs are files too. Omitting them here left every bin attr
+        // absent from readdir — so `ls` denied the file existed even when a
+        // by-name open would have worked, and consumers that scan a directory
+        // (rather than opening a fixed path) never found it.
+        let bin_attr_names = self.kobj.bin_attr_names();
         let symlink_names = self.kobj.symlink_names();
         let mut all: Vec<(String, FileType)> = Vec::new();
         for n in child_names {
             all.push((n, FileType::Dir));
         }
         for n in attr_names {
+            all.push((n.to_string(), FileType::File));
+        }
+        for n in bin_attr_names {
             all.push((n.to_string(), FileType::File));
         }
         for n in symlink_names {
@@ -2129,6 +2172,48 @@ impl FileOps for SysSymlinkFile {
 /// A text attribute file: read calls the show-fn on demand;
 /// write calls the store-fn if present, else returns `ReadOnly`.
 #[derive(Clone)]
+/// A binary sysfs attribute (`bin_attr`), read through the kobject's
+/// registered reader at an arbitrary offset. Linux ref: `struct
+/// bin_attribute` (include/linux/sysfs.h).
+struct SysBinAttrFile {
+    kobj: Arc<Kobject>,
+    attr_name: &'static str,
+}
+
+impl fmt::Debug for SysBinAttrFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SysBinAttrFile")
+            .field("attr", &self.attr_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileOps for SysBinAttrFile {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let n = self
+            .kobj
+            .bin_attr_read(self.attr_name, offset as usize, buf)
+            .unwrap_or(0);
+        Box::pin(async move { Ok(n) })
+    }
+
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::File,
+                perms: 0o444,
+            },
+            mtime_cycles: 0,
+        }
+    }
+}
+
 struct SysAttrFile {
     kobj: Arc<Kobject>,
     /// The key into `kobj.attrs`; must be `&'static str` because it

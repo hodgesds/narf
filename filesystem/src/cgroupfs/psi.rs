@@ -18,7 +18,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use crate::{FileOps, FsError, FsFuture, Mode, Stat};
+use crate::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 /// PSI resource axis.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -112,12 +112,14 @@ impl FileOps for PsiFile {
     // delegated subtree, so one rejecting file aborts delegation and
     // `systemd --user` exits 219/EXIT_CGROUP.
     fn owners(&self) -> (u32, u32) {
-        self.cg
-            .file_owners
-            .lock()
-            .get(&self.ino)
-            .copied()
-            .unwrap_or((0, 0))
+        // Same creator-inheritance rule as `CgroupAttrFile::owners` — see
+        // the note there. Bound to a `let` so the `file_owners` guard drops
+        // before `owner` is taken.
+        let explicit = self.cg.file_owners.lock().get(&self.ino).copied();
+        match explicit {
+            Some(owner) => owner,
+            None => *self.cg.owner.lock(),
+        }
     }
 
     fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
@@ -149,12 +151,35 @@ impl FileOps for PsiFile {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
 
+    // chmod, for the same reason as `set_owners` above: systemd adjusts a
+    // delegated subtree with `fchmod_and_chown()`, which chmods FIRST and
+    // reports the failure as "Failed to adjust ownership of
+    // '.../memory.pressure': Operation not supported". Leaving `set_perms`
+    // at its `Unsupported` default is what kept that message in every boot
+    // even after the ownership fix — the chown was never reached.
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        self.cg.file_modes.lock().insert(self.ino, perms & 0o7777);
+        Box::pin(async { Ok(()) })
+    }
+
     fn stat(&self) -> Stat {
-        Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode::FILE_RO,
-            mtime_cycles: 0,
+        let perms = self.cg.file_modes.lock().get(&self.ino).copied();
+        match perms {
+            Some(perms) => Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::File,
+                    perms,
+                },
+                mtime_cycles: 0,
+            },
+            None => Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode::FILE_RO,
+                mtime_cycles: 0,
+            },
         }
     }
 }

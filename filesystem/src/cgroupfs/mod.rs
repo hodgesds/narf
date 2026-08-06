@@ -198,6 +198,19 @@ pub struct Cgroup {
     /// per-file entry is required rather than one owner for the whole
     /// cgroup. Absent entry = root-owned, matching the kernfs default.
     file_owners: IrqSafeSpinLock<BTreeMap<u64, (u32, u32)>>,
+    /// Directory permission bits (kernfs default 0755).
+    mode: IrqSafeSpinLock<u16>,
+    /// Per-attribute-file permission bits, keyed by the file's inode.
+    ///
+    /// Required for the same reason as `file_owners`, and for a subtler one:
+    /// systemd adjusts a delegated subtree with `fchmod_and_chown()`, which
+    /// CHMODS FIRST and reports any failure as "Failed to adjust ownership
+    /// of '<path>': Operation not supported". With `FileOps::set_perms`
+    /// left at its `Unsupported` default the chmod rejected, the chown was
+    /// never even reached, and the message named ownership — which is why
+    /// fixing `set_owners` alone did not clear it. Absent entry = the
+    /// kind-derived default from `stat()`.
+    file_modes: IrqSafeSpinLock<BTreeMap<u64, u16>>,
 }
 
 impl core::fmt::Debug for Cgroup {
@@ -232,6 +245,8 @@ impl Cgroup {
             last_populated: AtomicBool::new(false),
             owner: IrqSafeSpinLock::new((0, 0)),
             file_owners: IrqSafeSpinLock::new(BTreeMap::new()),
+            mode: IrqSafeSpinLock::new(0o755),
+            file_modes: IrqSafeSpinLock::new(BTreeMap::new()),
         })
     }
 
@@ -268,6 +283,8 @@ impl Cgroup {
             last_populated: AtomicBool::new(false),
             owner: IrqSafeSpinLock::new((0, 0)),
             file_owners: IrqSafeSpinLock::new(BTreeMap::new()),
+            mode: IrqSafeSpinLock::new(0o755),
+            file_modes: IrqSafeSpinLock::new(BTreeMap::new()),
         })
     }
 
@@ -1474,16 +1491,34 @@ impl FileOps for CgroupAttrFile {
     // directory, so a rejected file chown aborts delegation and
     // `systemd --user` exits 219/EXIT_CGROUP.
     fn owners(&self) -> (u32, u32) {
-        self.cg
-            .file_owners
-            .lock()
-            .get(&self.ino)
-            .copied()
-            .unwrap_or((0, 0))
+        // No explicit chown yet ⇒ inherit the CGROUP DIRECTORY's owner, not
+        // a hardcoded root. Linux stamps a new cgroup's interface files with
+        // the creating task's ids (`cgroup_mkdir` → `cgroup_kn_set_ugid`),
+        // which is what lets an unprivileged `systemd --user` write its own
+        // `cgroup.procs`. Reporting (0,0) with 0644 put uid 1000 in the
+        // "other" triplet (read-only), so open(O_WRONLY) was refused and the
+        // user manager's children died 219/EXIT_CGROUP.
+        //
+        // Bind the first lookup to a `let` so its lock guard is dropped at
+        // the end of the statement — matching on the guard directly would
+        // hold `file_owners` while taking `owner`.
+        let explicit = self.cg.file_owners.lock().get(&self.ino).copied();
+        match explicit {
+            Some(owner) => owner,
+            None => *self.cg.owner.lock(),
+        }
     }
 
     fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
         self.cg.file_owners.lock().insert(self.ino, (uid, gid));
+        Box::pin(async { Ok(()) })
+    }
+
+    // chmod on a cgroup attribute file. Linux backs these with kernfs, whose
+    // `kernfs_iop_setattr` accepts mode changes; the `Unsupported` default
+    // made systemd's `fchmod_and_chown()` fail before it ever chowned.
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        self.cg.file_modes.lock().insert(self.ino, perms & 0o7777);
         Box::pin(async { Ok(()) })
     }
 
@@ -1532,12 +1567,13 @@ impl FileOps for CgroupAttrFile {
     }
 
     fn stat(&self) -> Stat {
-        let perms = match &self.kind {
+        let perms = self.cg.file_modes.lock().get(&self.ino).copied();
+        let perms = perms.unwrap_or_else(|| match &self.kind {
             // Linux exposes these command files as write-only.
             FileKind::Core(CoreFile::Kill) | FileKind::Ctrl(_, "memory.reclaim") => 0o200,
             _ if self.is_writable() => 0o644,
             _ => 0o444,
-        };
+        });
         Stat {
             // cgroupfs is kernfs-backed on Linux; virtual attribute files
             // report st_size == 0 regardless of their current rendered text.
@@ -1655,6 +1691,20 @@ impl DirOps for CgroupDir {
 
     fn set_dir_owners(&self, uid: u32, gid: u32) {
         *self.cg.owner.lock() = (uid, gid);
+    }
+
+    // Directory chmod. `cg_set_access()` adjusts the delegated cgroup
+    // DIRECTORY with the same `fchmod_and_chown()` helper it uses on the
+    // attribute files, so the directory needs a real mode too — the
+    // `dir_mode` default is a fixed constant and `set_dir_mode_async`
+    // would otherwise discard the change.
+    fn dir_mode(&self) -> u16 {
+        *self.cg.mode.lock()
+    }
+
+    fn set_dir_mode_async<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        *self.cg.mode.lock() = perms & 0o7777;
+        Box::pin(async { Ok(()) })
     }
 
     fn ino(&self) -> u64 {

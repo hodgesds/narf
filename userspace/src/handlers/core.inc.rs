@@ -1251,7 +1251,15 @@ fn open_impl(
             exec: false,
         },
     ) {
-        ctx.set_return(fail);
+        // -EACCES, not the generic `fail` (-1/-EPERM). Linux open(2) is
+        // explicit: EACCES is "the requested access to the file is not
+        // allowed, or search permission is denied for one of the directories
+        // in the path prefix"; EPERM means something else entirely. Reporting
+        // EPERM here made every permission denial read as "Operation not
+        // permitted" — e.g. journalctl's "opening journal file ...: Operation
+        // not permitted", which sends the reader looking for a capability or
+        // ownership bug instead of a plain mode/ACL denial.
+        ctx.set_return(SyscallReturn::ok((-13i64) as u64));
         return;
     }
 

@@ -1122,6 +1122,13 @@ pub fn __test_clear_hooks() {
     clear_current();
 }
 
+/// Test-only reset of the execve hook (a test that installs its own
+/// longjmp hook must not leave it behind for later execve tests).
+#[doc(hidden)]
+pub fn __test_clear_execve_hook() {
+    EXECVE_HOOK.store(core::ptr::null_mut(), Ordering::Release);
+}
+
 // ── wait4 cooperative parking support ────────────────────────────────
 //
 // Two global tables coordinate the "parent parked in wait4" pattern:

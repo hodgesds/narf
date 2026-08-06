@@ -987,10 +987,30 @@ fn smoke_drm_sysfs_device_vendor_attr() -> TestResult {
     }));
     crate::drm_sysfs_bridge::populate_drm_class();
 
-    let device_kobj = drm_device_node("card0").and_then(|c| c.get_child("device"));
-    let device_kobj = match device_kobj {
+    // `card0/device` is a SYMLINK to the PCI-address node, not a child
+    // kobject — libdrm readlink()s it and parses domain:bus:dev.func out of
+    // the target, so a real directory named "device" leaves it with no bus
+    // info. Follow the link the way a consumer does, and assert it actually
+    // points at a PCI-address-shaped name rather than just resolving.
+    let card = match drm_device_node("card0") {
+        Some(c) => c,
+        None => return TestResult::Fail("card0 node missing"),
+    };
+    let target = match card.get_symlink("device") {
+        Some(t) => t,
+        None => return TestResult::Fail("card0/device is not a symlink"),
+    };
+    let addr = target.rsplit('/').next().unwrap_or("");
+    if addr.len() != 12 || !addr.starts_with("0000:") || !addr.contains('.') {
+        return TestResult::Fail("card0/device target is not a PCI address");
+    }
+    let device_kobj = match sysfs::get_root()
+        .get_child("devices")
+        .and_then(|d| d.get_child("pci0000:00"))
+        .and_then(|p| p.get_child(addr))
+    {
         Some(k) => k,
-        None => return TestResult::Fail("card0/device kobject missing"),
+        None => return TestResult::Fail("PCI device node missing"),
     };
 
     match device_kobj.attr_show("vendor") {
@@ -1024,10 +1044,30 @@ fn smoke_drm_sysfs_device_id_attr() -> TestResult {
     }));
     crate::drm_sysfs_bridge::populate_drm_class();
 
-    let device_kobj = drm_device_node("card0").and_then(|c| c.get_child("device"));
-    let device_kobj = match device_kobj {
+    // `card0/device` is a SYMLINK to the PCI-address node, not a child
+    // kobject — libdrm readlink()s it and parses domain:bus:dev.func out of
+    // the target, so a real directory named "device" leaves it with no bus
+    // info. Follow the link the way a consumer does, and assert it actually
+    // points at a PCI-address-shaped name rather than just resolving.
+    let card = match drm_device_node("card0") {
+        Some(c) => c,
+        None => return TestResult::Fail("card0 node missing"),
+    };
+    let target = match card.get_symlink("device") {
+        Some(t) => t,
+        None => return TestResult::Fail("card0/device is not a symlink"),
+    };
+    let addr = target.rsplit('/').next().unwrap_or("");
+    if addr.len() != 12 || !addr.starts_with("0000:") || !addr.contains('.') {
+        return TestResult::Fail("card0/device target is not a PCI address");
+    }
+    let device_kobj = match sysfs::get_root()
+        .get_child("devices")
+        .and_then(|d| d.get_child("pci0000:00"))
+        .and_then(|p| p.get_child(addr))
+    {
         Some(k) => k,
-        None => return TestResult::Fail("card0/device kobject missing"),
+        None => return TestResult::Fail("PCI device node missing"),
     };
 
     match device_kobj.attr_show("device") {

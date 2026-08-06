@@ -3769,17 +3769,25 @@ fn boot_userspace_init() {
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         ];
         // SAFETY: boot has the loader's identity mapping and frame allocator.
-        let proc =
-            match unsafe { load_user_process_with_root(bytes, &argv, &envp, &[], Some(root)) } {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = writeln!(
-                        console::Writer,
-                        "  boot-init: {name}: direct load failed: {e:?}"
-                    );
-                    return false;
-                }
-            };
+        let proc = match unsafe {
+            load_user_process_with_root(
+                bytes,
+                &argv,
+                &envp,
+                &[],
+                Some(root),
+                narf_userspace::alloc_pid(),
+            )
+        } {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = writeln!(
+                    console::Writer,
+                    "  boot-init: {name}: direct load failed: {e:?}"
+                );
+                return false;
+            }
+        };
         let pid = proc.pid;
         let pending = narf_userspace::user_task::prepare_user_process_initial(
             proc,

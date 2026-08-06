@@ -14,7 +14,9 @@
 //!   cursor:    pump live      shell:     pid=2
 //!
 //! Each line wraps to ~60 chars max so a 1280-wide FB fits two
-//! columns of info. Real-HW diagnosis: if "I2C buses: 0" the AMD
+//! columns of info. STATE ONLY — no log tail: this panel repaints in
+//! place while the FB console scrolls the same log through the same
+//! screen, and rendering both made boot messages unreadable. Real-HW diagnosis: if "I2C buses: 0" the AMD
 //! FCH probe didn't find any controllers (AML namespace issue or
 //! HID mismatch); if "HID bound: 0" the touchpad is missing or
 //! the bind path errored out; if "i8042: skip" the laptop has no
@@ -34,16 +36,17 @@ const PANEL_FG: Pixel32 = Pixel32(0xFFE0_E0E0); // light grey
 /// Switching the panel to deep red makes "the kernel paniced"
 /// unmissable to a bare-metal operator across the room.
 const PANEL_BG_PANIC: Pixel32 = Pixel32(0xFF40_0000); // dark red
-/// Number of klog tail lines displayed under the live-state lines.
-/// 16 keeps recent boot output visible on a 1280×800 FB. Below
-/// that height the panel self-suppresses (line 65 guard).
-const KLOG_TAIL_LINES: usize = 16;
+/// The panel used to render 16 klog tail lines under the state lines.
+/// Removed: it repainted in place at ~4 Hz while the FB console scrolled
+/// the same log through the same screen, so the two writers produced
+/// interleaved, unreadable boot output. The log is already on the console
+/// and on serial; this panel's unique value is the state summary.
 /// Number of header lines: the 5 input/USB/AML/i8042 lines PLUS
 /// one diag line (boot phase + IRQ + heap + #PF/panic). Adding the
 /// diag line at the top is intentional — it's the densest
 /// real-HW-diagnostic line and operators read top-down.
 const HEADER_LINES: u32 = 6;
-const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + KLOG_TAIL_LINES as u32 + 1); // header + klog tail + separator
+const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + 1); // header lines + one pad row
 const PANEL_PAD: u32 = 4;
 
 /// Cheap fold of the panel's *meaningful* state — the things a viewer
@@ -61,8 +64,10 @@ fn change_signature() -> u64 {
         *h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    // klog tail (the bulk of the render) — `written` bumps on any output.
-    mix(&mut h, narf_console::klog::bytes_written());
+    // NOT klog::bytes_written() any more. With the log tail gone, log output
+    // changes nothing the panel draws, so folding it in would force a full
+    // repaint on every printed line for an identical image — exactly the
+    // ~700µs-at-5Hz executor stall this signature exists to avoid.
     mix(&mut h, narf_drivers_i2c::registered_bus_count() as u64);
     mix(
         &mut h,
@@ -333,27 +338,12 @@ pub fn paint(fb: &FbWriter) {
         fbm.draw_string_8x8(PANEL_PAD, y, line, PANEL_FG, bg);
         y += 8;
     }
-    // Separator + klog tail. Truncates each line to ~150 chars so a
-    // wide log line doesn't overflow the FB width (1280 / 8 = 160
-    // glyphs, leaves a small margin).
-    fbm.draw_string_8x8(
-        PANEL_PAD,
-        y,
-        "--- recent log (klog tail) ----------------------------------",
-        PANEL_FG,
-        bg,
-    );
-    y += 8;
-    let max_chars = ((w - PANEL_PAD * 2) / 8) as usize;
-    for line in narf_console::klog::tail(KLOG_TAIL_LINES).iter() {
-        let truncated = if line.len() > max_chars {
-            &line[..max_chars]
-        } else {
-            line.as_str()
-        };
-        fbm.draw_string_8x8(PANEL_PAD, y, truncated, PANEL_FG, bg);
-        y += 8;
-    }
+    // NO klog tail here. This panel repaints in place at ~4 Hz while the FB
+    // console is independently scrolling the SAME log through the SAME
+    // screen — two writers rendering overlapping text, which made boot
+    // messages unreadable. The panel's value is the state summary above
+    // (what enumerated), which the console cannot show at a glance; the log
+    // itself is already on the console and on serial.
     let _ = fb.flush(Rect::new(0, panel_y, w, PANEL_HEIGHT + PANEL_PAD));
 }
 

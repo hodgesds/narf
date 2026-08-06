@@ -89,7 +89,9 @@ ENTEREOF
       dbus-daemon dbus-tools \
       xrdb cpp xkeyboard-config \
       bash coreutils util-linux procps-ng strace file less findutils \
-      dejavu-sans-fonts kde-cli-tools konsole foot'
+      dejavu-sans-fonts kde-cli-tools konsole foot \
+      kactivitymanagerd kglobalacceld kscreen \
+      xdg-desktop-portal xdg-desktop-portal-kde plasma-polkit-agent'
   "$WORK/enter.sh" 'dnf clean all'
 fi
 
@@ -104,6 +106,23 @@ fi
 # with Plasma; without it kcminit never reaches its ready-pipe handoff.
 if [ ! -d "$WORK/root/usr/share/X11/xkb/rules" ]; then
   "$WORK/enter.sh" 'dnf -y --setopt=install_weak_deps=False install xkeyboard-config'
+  "$WORK/enter.sh" 'dnf clean all'
+fi
+# Plasma session daemons that arrive as WEAK dependencies of plasma-workspace
+# and are therefore dropped by install_weak_deps=False. They are not optional
+# for a session that reaches a drawn desktop:
+#   kactivitymanagerd  — owns org.kde.ActivityManager; plasmashell blocks on
+#                        that name at startup and otherwise eats a 120 s D-Bus
+#                        activation timeout waiting for a name nobody provides.
+#   kglobalacceld      — owns org.kde.KGlobalAccel, started by plasma_session.
+#   kscreen            — kscreen_backend_launcher, output/geometry config.
+# Guarded per-binary so older incremental work trees top up without a full
+# rootfs rebuild (same idiom as cpp / xkeyboard-config above).
+if [ ! -x "$WORK/root/usr/bin/kactivitymanagerd" ] ||
+   [ ! -x "$WORK/root/usr/bin/kglobalacceld" ] ||
+   [ ! -x "$WORK/root/usr/bin/kscreen_backend_launcher" ]; then
+  "$WORK/enter.sh" 'dnf -y --setopt=install_weak_deps=False install \
+      kactivitymanagerd kglobalacceld kscreen'
   "$WORK/enter.sh" 'dnf clean all'
 fi
 
@@ -277,6 +296,18 @@ fi
 # it, with no polkit involved. user@.service in turn pulls in
 # user-runtime-dir@1000.service, which creates /run/user/1000 — where the
 # manager publishes the session bus the session then connects to.
+#
+# QV4_FORCE_INTERPRETER / QT_ENABLE_REGEXP_JIT below: NARF enforces W^X —
+# nothing grants a W|X end state and the RW->RX flip needs CapKind::Jit
+# (userspace mprotect_core). Qt's QML JIT allocator performs exactly that
+# flip and gets EINVAL, which the journal shows as "mprotect failed in
+# ExecutableAllocator::makeWritable: Invalid argument". Run QML interpreted
+# rather than weaken a deliberate kernel security property for bring-up
+# convenience; plasmashell is QML-heavy so this sits on its critical path.
+#
+# NOTE: keep comments OUT of the printf argument list below. A `#` inside a
+# line-continued arg list silently swallows every remaining argument, and
+# `bash -n` still passes — so the unit file loses its ExecStart with no error.
 printf '%s\n' \
   '[Unit]' \
   'Description=NARF Plasma Wayland Session' \
@@ -298,11 +329,17 @@ printf '%s\n' \
   'Environment=XKB_DEFAULT_LAYOUT=us' \
   'Environment=QT_LOGGING_RULES=org.kde.kcminit.debug=true;kwin_core.debug=true;kwin_wayland_drm.debug=true;kwin_scene_opengl.debug=true;kwin_qpainter.debug=true' \
   'Environment=QT_QPA_PLATFORM=wayland' \
+  'Environment=QV4_FORCE_INTERPRETER=1' \
+  'Environment=QT_ENABLE_REGEXP_JIT=0' \
   'Environment=KWIN_DRM_NO_AMS=1' \
   'Environment=KWIN_COMPOSE=Q' \
   'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \
   'Environment=LIBGL_ALWAYS_SOFTWARE=1' \
   'Environment=GALLIUM_DRIVER=llvmpipe' \
+  'Environment=MESA_LOADER_DRIVER_OVERRIDE=kms_swrast' \
+  'Environment=MESA_DEBUG=1' \
+  'Environment=EGL_LOG_LEVEL=debug' \
+  'Environment=LIBGL_DEBUG=verbose' \
   'RuntimeDirectory=narf-plasma' \
   'RuntimeDirectoryMode=0700' \
   'ExecStart=/usr/local/libexec/narf-plasma-session-monitor' \
@@ -348,6 +385,33 @@ printf '%s\n' \
   > "$WORK/root/etc/systemd/system/narf-plasma-probe.service"
 ln -sfn ../narf-plasma-probe.service \
   "$WORK/root/etc/systemd/system/graphical.target.wants/narf-plasma-probe.service"
+
+# Root-side journal tap. narf-plasma-probe runs as User=narf and therefore
+# CANNOT read /var/log/journal/<id>/user-1000.journal ("Operation not
+# permitted"), which is where every Plasma user unit's output goes — kwin's
+# exit reason included. This service has no User=, so it runs as root and can.
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-journal-tap.sh" \
+  "$WORK/root/usr/local/libexec/narf-journal-tap"
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Mirror the uid-1000 journal to the console' \
+  'Wants=systemd-journald.service' \
+  'After=systemd-journald.service' \
+  '' \
+  '[Service]' \
+  'Type=simple' \
+  'ExecStart=/usr/local/libexec/narf-journal-tap' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
+  'Restart=always' \
+  'RestartSec=2' \
+  '' \
+  '[Install]' \
+  'WantedBy=graphical.target' \
+  > "$WORK/root/etc/systemd/system/narf-journal-tap.service"
+ln -sfn ../narf-journal-tap.service \
+  "$WORK/root/etc/systemd/system/graphical.target.wants/narf-journal-tap.service"
 # A Wants= symlink lets graphical.target succeed after a failed oneshot.
 # Make the probe a required, ordered start job so graphical.target is proof of
 # PLASMA-READY rather than merely proof that the probe was attempted.
@@ -357,6 +421,28 @@ printf '%s\n' \
   'Requires=narf-plasma-probe.service' \
   'After=narf-plasma-probe.service' \
   > "$WORK/root/etc/systemd/system/graphical.target.d/narf-plasma-gate.conf"
+
+# Plasma's components run as systemd USER UNITS, so their stderr goes to the
+# journal and NOTHING about a crash reaches the serial console — which is the
+# only channel this bring-up can read. `journalctl --user` cannot help: it
+# fails with "Operation not permitted" opening
+# /var/log/journal/<id>/user-1000.journal, so the journal is unreadable from
+# inside the guest too.
+#
+# Mirror these units' output to the console. This is what makes a compositor
+# exit diagnosable at all: kwin dying is what tears the session down
+# (plasma-workspace-wayland.target BindsTo plasma-kwin_wayland.service, and
+# graphical-session.target takes every PartOf unit with it), and its reason
+# was previously invisible.
+for narf_unit in plasma-kwin_wayland.service plasma-plasmashell.service \
+                 plasma-kded6.service plasma-ksmserver.service; do
+  install -d "$WORK/root/usr/lib/systemd/user/${narf_unit}.d"
+  printf '%s\n' \
+    '[Service]' \
+    'StandardOutput=journal+console' \
+    'StandardError=journal+console' \
+    > "$WORK/root/usr/lib/systemd/user/${narf_unit}.d/99-narf-console.conf"
+done
 
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-systemd-start.sh" \

@@ -52,8 +52,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 
 use narf_filesystem::sysfs::{
-    class_register, get_or_create_child, get_root, kobject_add_attr, kobject_add_uevent_attr,
-    Kobject,
+    class_register, get_or_create_child, get_root, kobject_add_attr, kobject_add_bin_attr,
+    kobject_add_uevent_attr, Kobject,
 };
 
 /// DRM major device number.
@@ -156,8 +156,86 @@ fn populate_card_node(
     // it can attach a device whose subsystem is "drm".
     kobj.add_symlink("subsystem", "../../../../class/drm");
 
-    // ── device/ sub-kobject (PCI IDs Mesa reads for driver selection) ────
-    let dev_kobj = Kobject::new_child(kobj.clone(), "device");
+    // ── the PCI device node, and card<N>/device as a SYMLINK to it ───────
+    //
+    // `device` MUST be a symlink whose target is named like a PCI address.
+    // libdrm's `drmParsePciBusInfo` does `readlink("/sys/dev/char/226:N/device")`
+    // and sscanf's "%04x:%02x:%02x.%1u" out of the TARGET to recover
+    // domain:bus:dev.func. A real directory named "device" (what this used to
+    // be) has no address to parse, so bus-info fails, `drmGetDevice2` cannot
+    // describe the device, and everything downstream — Mesa's loader, then
+    // EGL's "failed to get compatible render device" — falls over regardless
+    // of how correct the attributes are.
+    //
+    // Linux: /sys/class/drm/card0/device -> ../../../0000:00:02.0, with the
+    // real node under /sys/devices/pci0000:00/. Mirror that. QEMU's
+    // bochs-display sits at 00:02.0.
+    let pci_addr = "0000:00:02.0";
+    let pci_root = get_or_create_child(&devices, "pci0000:00");
+    let dev_kobj = get_or_create_child(&pci_root, pci_addr);
+    // From /sys/devices/platform/narf-drm/card<N>, three levels up is
+    // /sys/devices.
+    kobj.add_symlink("device", format!("../../../pci0000:00/{}", pci_addr));
+    // From /sys/devices/pci0000:00/<addr>/, three levels up is /sys.
+    dev_kobj.add_symlink("subsystem", "../../../bus/pci");
+
+    // `device/config` — raw PCI configuration space.
+    //
+    // THIS is what libdrm actually reads. `drmParsePciDeviceInfo` opens
+    // `/sys/dev/char/<maj>:<min>/device/config` and pulls the ids straight out
+    // of the binary header; it does NOT parse the text vendor/device attrs
+    // below (those exist for other consumers). With no `config` file the read
+    // fails, `drmGetDevices2` cannot describe the device, and Mesa reports
+    // "MESA-LOADER: failed to retrieve device information" — the failure that
+    // makes kwin give up and take the Plasma session down with it.
+    //
+    // Measured, not assumed: a guest probe of `card0/device/` listed only
+    // device, subsystem, subsystem_device, subsystem_vendor, vendor. The
+    // subsystem symlink added earlier was present and resolving, and the error
+    // persisted at 18 per session attempt — so the symlink was necessary but
+    // never sufficient, and the missing blob is the real gap.
+    //
+    // Only the 64-byte type-0 header is synthesized, which is all
+    // drmParsePciDeviceInfo touches. Little-endian, offsets per PCI 3.0 §6.1:
+    //   0x00 vendor   0x02 device   0x08 revision   0x0a subclass  0x0b class
+    //   0x2c subsystem_vendor       0x2e subsystem_device
+    {
+        let vendor = card.vendor_id();
+        let device = card.device_id();
+        let sub_vendor = card.subsystem_vendor();
+        let sub_device = card.subsystem_device();
+        kobject_add_bin_attr(
+            &dev_kobj,
+            "config",
+            Arc::new(move |offset: usize, buf: &mut [u8]| -> usize {
+                let mut cfg = [0u8; 64];
+                cfg[0x00..0x02].copy_from_slice(&vendor.to_le_bytes());
+                cfg[0x02..0x04].copy_from_slice(&device.to_le_bytes());
+                // Command: I/O + memory + bus-master enabled.
+                cfg[0x04..0x06].copy_from_slice(&0x0007u16.to_le_bytes());
+                // Revision 0; class 0x030000 = Display / VGA compatible.
+                cfg[0x08] = 0x00;
+                cfg[0x09] = 0x00;
+                cfg[0x0a] = 0x00;
+                cfg[0x0b] = 0x03;
+                // Header type 0 (normal device) — libdrm relies on this to
+                // read the subsystem ids from 0x2c, which only exist in the
+                // type-0 layout.
+                cfg[0x0e] = 0x00;
+                cfg[0x2c..0x2e].copy_from_slice(&sub_vendor.to_le_bytes());
+                cfg[0x2e..0x30].copy_from_slice(&sub_device.to_le_bytes());
+                if offset >= cfg.len() {
+                    return 0;
+                }
+                let n = (cfg.len() - offset).min(buf.len());
+                buf[..n].copy_from_slice(&cfg[offset..offset + n]);
+                n
+            }),
+        );
+    }
+    // `revision` as text too — some consumers read it directly rather than
+    // going through the config blob, and it was absent entirely.
+    kobject_add_attr(&dev_kobj, "revision", || "0x00\n".into());
     {
         let v = card.vendor_id();
         kobject_add_attr(&dev_kobj, "vendor", move || format!("0x{:04x}\n", v));
@@ -220,6 +298,36 @@ fn populate_card_node(
     kobject_add_uevent_attr(&render_kobj, render_uevent(render_idx, &driver));
     render_kobj.add_symlink("subsystem", "../../../../class/drm");
 
+    // `card<N>/device/drm/{card<N>,renderD<M>}` — how a consumer walks from a
+    // card to its RENDER node.
+    //
+    // On Linux both minors hang off the parent device's `drm/` directory
+    // (…/drm/card0, …/drm/renderD128), so given the card you find its render
+    // node by listing that directory. NARF placed them as SIBLINGS under
+    // narf-drm with no `drm/` level, so nothing connected the two and Mesa
+    // failed with "DRI2: failed to get compatible render device" — the error
+    // that replaced the earlier device-info failure once driver selection was
+    // fixed. kwin then has no EGL and gives up.
+    //
+    // Symlinks rather than a second real node: the canonical kobjects stay
+    // where they are (systemd's sd-device already resolves devnum through
+    // them), and this only adds the parent-relative view Mesa walks.
+    // Relative to card<N>/device/drm/, THREE levels up is narf-drm
+    // (drm → device → card<N> → narf-drm).
+    {
+        // From /sys/devices/pci0000:00/<addr>/drm/, four levels up is
+        // /sys/devices, then down into the platform container.
+        let dev_drm = get_or_create_child(&dev_kobj, "drm");
+        dev_drm.add_symlink(
+            card_name.clone(),
+            format!("../../../../platform/narf-drm/{}", card_name),
+        );
+        dev_drm.add_symlink(
+            render_name.clone(),
+            format!("../../../../platform/narf-drm/{}", render_name),
+        );
+    }
+
     class_drm.add_symlink(
         render_name.clone(),
         format!("../../devices/platform/narf-drm/{}", render_name),
@@ -227,5 +335,71 @@ fn populate_card_node(
     char_dev_link(
         render_idx,
         &format!("../../devices/platform/narf-drm/{}", render_name),
+    );
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// `card<N>/device/subsystem` must resolve to `/sys/bus/pci`.
+    ///
+    /// libdrm classifies a DRM node's bus by readlink()ing this attribute and
+    /// comparing the BASENAME against "pci"/"platform"/"usb"
+    /// (`drmGetDevice2` → `drmParseSubsystemType`). Without it the bus is
+    /// unknown, libdrm never fills in the PCI device info, and Mesa's loader
+    /// fails with "MESA-LOADER: failed to retrieve device information" — the
+    /// vendor/device attributes are useless on their own because nothing
+    /// declares them to BE pci ids.
+    ///
+    /// Not cosmetic: kwin emits a burst of those while probing and then
+    /// exits, taking the Plasma session down with it.
+    ///
+    /// The count of `..` matters and is easy to get wrong, which is most of
+    /// why this test exists: the symlink sits at
+    /// `/sys/devices/platform/narf-drm/card<N>/device/`, five levels below
+    /// `/sys`, whereas the sibling `card<N>/subsystem` is four. An
+    /// off-by-one resolves to a nonexistent path and reproduces the exact
+    /// failure it is meant to prevent, silently.
+    fn smoke_drm_device_subsystem_points_at_pci() -> TestResult {
+        const DEPTH_TO_SYS: usize = 5;
+        let link = "../../../../../bus/pci";
+
+        let ups = link.matches("../").count();
+        if ups != DEPTH_TO_SYS {
+            return TestResult::Fail(
+                "card/device/subsystem link depth is wrong; it must reach /sys from \
+                 devices/platform/narf-drm/card<N>/device",
+            );
+        }
+        // The basename is what libdrm actually compares against.
+        if !link.ends_with("/bus/pci") {
+            return TestResult::Fail("card/device/subsystem must resolve to /sys/bus/pci");
+        }
+        // Resolve it by hand from the device dir and confirm it lands on
+        // exactly `bus/pci` with no leftover components.
+        let mut comps: alloc::vec::Vec<&str> = "devices/platform/narf-drm/card0/device"
+            .split('/')
+            .collect();
+        for part in link.split('/') {
+            match part {
+                ".." => {
+                    if comps.pop().is_none() {
+                        return TestResult::Fail("card/device/subsystem escapes above /sys");
+                    }
+                }
+                "" | "." => {}
+                other => comps.push(other),
+            }
+        }
+        if comps.join("/") != "bus/pci" {
+            return TestResult::Fail("card/device/subsystem does not resolve to /sys/bus/pci");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm_sysfs",
+        smoke_drm_device_subsystem_points_at_pci
     );
 }

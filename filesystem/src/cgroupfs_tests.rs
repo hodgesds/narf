@@ -2289,10 +2289,16 @@ fn smoke_cgroup_delegation_chown_persists() -> TestResult {
                 return TestResult::Fail("cgroup attribute file missing");
             }
         };
-        if file.owners() != (0, 0) {
-            let _ = poll_once(root.rmdir("t_delegate"));
-            return TestResult::Fail("a new cgroup attribute file was not root-owned");
-        }
+        // NOTE: this used to assert the file was still root-owned here, i.e.
+        // that chowning the DIRECTORY left its files behind. That expectation
+        // was wrong and actively harmful: a new cgroup's files belong to its
+        // creator (`cgroup_kn_set_ugid`), and reporting root/0644 to an
+        // unprivileged `systemd --user` made open(O_WRONLY) on cgroup.procs
+        // fail, killing every user unit with 219/EXIT_CGROUP. The directory
+        // was chowned to 1000 above, so the file follows it — see
+        // smoke_cgroup_new_child_files_inherit_creator. The per-file
+        // independence this test cares about is still checked, by the
+        // explicit chown below and the sibling check at the end.
         match poll_once(file.set_owners(1000, 1000)) {
             Some(Ok(())) => {}
             _ => {
@@ -2306,10 +2312,17 @@ fn smoke_cgroup_delegation_chown_persists() -> TestResult {
         }
     }
 
-    // Per-file, not per-cgroup: chowning one attribute file must not have
-    // moved a sibling that cg_set_access() leaves alone.
+    // Per-file, not per-cgroup: chowning one attribute file must not move a
+    // sibling that cg_set_access() leaves alone. Use a uid DISTINCT from both
+    // the directory owner and the loop above, so this detects real leakage
+    // rather than the legitimate inherit-from-creator default (comparing
+    // against (0,0) here would just re-test inheritance and fail).
+    const LEAK_UID: u32 = 4242;
+    if let Some(f) = group.lookup("cgroup.procs") {
+        let _ = poll_once(f.set_owners(LEAK_UID, LEAK_UID));
+    }
     if let Some(sib) = group.lookup("cgroup.events") {
-        if sib.owners() != (0, 0) {
+        if sib.owners() == (LEAK_UID, LEAK_UID) {
             let _ = poll_once(root.rmdir("t_delegate"));
             return TestResult::Fail("chown leaked across cgroup attribute files");
         }
@@ -2321,4 +2334,150 @@ fn smoke_cgroup_delegation_chown_persists() -> TestResult {
 kernel_test_in!(
     "filesystem/cgroupfs",
     smoke_cgroup_delegation_chown_persists
+);
+
+/// Delegation adjusts a subtree with systemd's `fchmod_and_chown()`, which
+/// CHMODS FIRST and then chowns. With `FileOps::set_perms` left at its
+/// `Unsupported` default every cgroup chmod returned ENOTSUP, the chown was
+/// never reached, and systemd reported it as "Failed to adjust ownership of
+/// '<path>': Operation not supported" — naming ownership for what was really
+/// a mode failure, which is why fixing `set_owners` alone did not clear it.
+///
+/// Covers all THREE object kinds, because they are three separate impls and
+/// fixing a subset is exactly how the ownership work stayed incomplete twice:
+/// the directory (`CgroupDir`), an ordinary attribute file
+/// (`CgroupAttrFile`), and a pressure file (`PsiFile`).
+///
+/// Linux ref: cgroupfs is kernfs-backed and `kernfs_iop_setattr` accepts
+/// mode changes.
+fn smoke_cgroup_delegation_chmod_persists() -> TestResult {
+    let root = root_dir();
+    let group = match poll_once(root.mkdir("t_chmod")) {
+        Some(Ok(group)) => group,
+        _ => return TestResult::Fail("chmod cgroup mkdir failed"),
+    };
+
+    // Directory: kernfs default is 0755, and a chmod must persist.
+    if group.dir_mode() != 0o755 {
+        let _ = poll_once(root.rmdir("t_chmod"));
+        return TestResult::Fail("a new cgroup directory was not 0755");
+    }
+    match poll_once(group.set_dir_mode_async(0o700)) {
+        Some(Ok(())) => {}
+        _ => {
+            let _ = poll_once(root.rmdir("t_chmod"));
+            return TestResult::Fail("cgroup directory rejected chmod");
+        }
+    }
+    if group.dir_mode() != 0o700 {
+        let _ = poll_once(root.rmdir("t_chmod"));
+        return TestResult::Fail("cgroup directory chmod did not persist");
+    }
+
+    for name in ["cgroup.procs", "cgroup.subtree_control", "memory.pressure"] {
+        let file = match group.lookup(name) {
+            Some(f) => f,
+            None => {
+                let _ = poll_once(root.rmdir("t_chmod"));
+                return TestResult::Fail("cgroup attribute file missing");
+            }
+        };
+        // The chmod itself must be ACCEPTED — returning Unsupported here is
+        // the exact defect, and it is what systemd trips over.
+        match poll_once(file.set_perms(0o600)) {
+            Some(Ok(())) => {}
+            _ => {
+                let _ = poll_once(root.rmdir("t_chmod"));
+                return TestResult::Fail("cgroup attribute file rejected chmod");
+            }
+        }
+        // ...and it must round-trip through stat(), not be swallowed.
+        if file.stat().mode.perms != 0o600 {
+            let _ = poll_once(root.rmdir("t_chmod"));
+            return TestResult::Fail("cgroup attribute file chmod did not persist");
+        }
+    }
+
+    // Per-file, not per-cgroup: chmod of one file must not move a sibling.
+    if let Some(sib) = group.lookup("cgroup.events") {
+        if sib.stat().mode.perms == 0o600 {
+            let _ = poll_once(root.rmdir("t_chmod"));
+            return TestResult::Fail("chmod leaked across cgroup attribute files");
+        }
+    }
+
+    let _ = poll_once(root.rmdir("t_chmod"));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_delegation_chmod_persists
+);
+
+/// A new cgroup's interface files belong to whoever CREATED the cgroup, not
+/// to root. Linux stamps them in `cgroup_mkdir` via `cgroup_kn_set_ugid`.
+///
+/// This is load-bearing one level below `user@UID.service`: the unprivileged
+/// `systemd --user` makes a cgroup per unit and then writes its own pid into
+/// that cgroup's `cgroup.procs`. With the files reporting root/0644 the
+/// manager landed in the "other" triplet (read-only), `open(O_WRONLY)` was
+/// refused, and every user unit — including `dbus-broker.service`, hence the
+/// whole session bus — died 219/EXIT_CGROUP.
+fn smoke_cgroup_new_child_files_inherit_creator() -> TestResult {
+    let root = root_dir();
+    let group = match poll_once(root.mkdir("t_creator")) {
+        Some(Ok(group)) => group,
+        _ => return TestResult::Fail("creator cgroup mkdir failed"),
+    };
+
+    // Stand in for what sys_mkdir does: stamp the creating task's ids on the
+    // new directory. Everything below must follow from that alone — no
+    // explicit per-file chown.
+    group.set_dir_owners(1000, 1000);
+
+    for name in ["cgroup.procs", "cgroup.subtree_control", "memory.pressure"] {
+        let file = match group.lookup(name) {
+            Some(f) => f,
+            None => {
+                let _ = poll_once(root.rmdir("t_creator"));
+                return TestResult::Fail("cgroup attribute file missing");
+            }
+        };
+        if file.owners() != (1000, 1000) {
+            let _ = poll_once(root.rmdir("t_creator"));
+            return TestResult::Fail("new cgroup file did not inherit the creator");
+        }
+    }
+
+    // An explicit chown must still WIN over the inherited default, or
+    // cg_set_access() could not hand a single file to a different uid.
+    if let Some(f) = group.lookup("cgroup.procs") {
+        match poll_once(f.set_owners(0, 0)) {
+            Some(Ok(())) => {}
+            _ => {
+                let _ = poll_once(root.rmdir("t_creator"));
+                return TestResult::Fail("explicit chown rejected");
+            }
+        }
+        if f.owners() != (0, 0) {
+            let _ = poll_once(root.rmdir("t_creator"));
+            return TestResult::Fail("explicit chown did not override inheritance");
+        }
+    }
+
+    // The ROOT cgroup stays root-owned — inheritance must not hand the whole
+    // hierarchy to the last uid that created something.
+    if let Some(f) = root.lookup("cgroup.procs") {
+        if f.owners() != (0, 0) {
+            let _ = poll_once(root.rmdir("t_creator"));
+            return TestResult::Fail("root cgroup files stopped being root-owned");
+        }
+    }
+
+    let _ = poll_once(root.rmdir("t_creator"));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_new_child_files_inherit_creator
 );
