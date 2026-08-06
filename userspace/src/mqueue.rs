@@ -756,7 +756,7 @@ pub(crate) fn notify_attrib_fd(task: u64, fd: u32) {
 
 /// IN_MODIFY on `abs_path` — content changed via a path-keyed call
 /// (truncate(2)) with no fd to consult.
-pub(crate) fn notify_modify_path(abs_path: &str) {
+pub fn notify_modify_path(abs_path: &str) {
     fs_notify(abs_path, IN_MODIFY, false);
 }
 

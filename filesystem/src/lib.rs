@@ -259,6 +259,39 @@ pub struct FsMappingRange {
     pub len: u64,
 }
 
+/// Hook used to emit an inotify `IN_MODIFY` for a kernel-side content
+/// change, registered by `userspace` at init.
+///
+/// `filesystem` cannot call into `userspace` (that is the dependency
+/// direction), but some files change without any userspace write to hang
+/// a notification off. `cgroup.events` is the load-bearing case: it flips
+/// when a task enters or leaves a cgroup, and systemd watches it with
+/// `inotify_add_watch(..., IN_MODIFY)` to learn a service's cgroup has
+/// settled. With no event, `Type=forking` start jobs never complete.
+static MODIFY_NOTIFIER: IrqSafeSpinLock<Option<fn(&str)>> = IrqSafeSpinLock::new(None);
+
+/// Register the inotify-modify emitter. Called once from `userspace` init.
+pub fn set_modify_notifier(f: fn(&str)) {
+    *MODIFY_NOTIFIER.lock() = Some(f);
+}
+
+/// Emit `IN_MODIFY` for `abs_path` if a notifier is registered.
+///
+/// The guard is dropped before the call: the notifier reaches into the
+/// inotify tables and must not run under this lock.
+pub fn notify_modify(abs_path: &str) {
+    let f = *MODIFY_NOTIFIER.lock();
+    if let Some(f) = f {
+        f(abs_path);
+    }
+}
+
+/// Test-only: observe whether a notifier is installed.
+#[doc(hidden)]
+pub fn __modify_notifier_installed() -> bool {
+    MODIFY_NOTIFIER.lock().is_some()
+}
+
 /// A file's ownership triplet for a POSIX access check.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FileOwner {
