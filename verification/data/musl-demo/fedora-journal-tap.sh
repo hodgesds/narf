@@ -45,9 +45,18 @@ done
 # SYSTEM unit (narf-plasma.service, so _SYSTEMD_UNIT), whereas the Plasma
 # components are real user units, so this filter separates them exactly.
 # `+` is journalctl's OR between match groups.
+#
+# `-b` (current boot ONLY) is load-bearing, not tidiness. /var/log/journal is
+# persistent on this image while the cursor file lives on /run (tmpfs), so
+# every boot starts with no cursor and the first pass replayed the ENTIRE
+# journal — including previous boots' failures. That put stale
+# "eglInitialize failed" lines on the console of a boot whose kwin had not
+# even started yet, which reads exactly like the current boot still failing
+# and is how a fixed bug looks unfixed. Same class of trap as the netlink
+# monitor replaying stale boot "add" events.
 narf_cursor=/run/narf-jtap.cursor
 while :; do
-  journalctl --cursor-file="$narf_cursor" \
+  journalctl -b --cursor-file="$narf_cursor" \
     _SYSTEMD_USER_UNIT=plasma-kwin_wayland.service \
     + _SYSTEMD_USER_UNIT=plasma-plasmashell.service \
     + _SYSTEMD_USER_UNIT=plasma-kded6.service \
