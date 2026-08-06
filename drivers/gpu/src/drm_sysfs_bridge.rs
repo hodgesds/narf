@@ -156,25 +156,28 @@ fn populate_card_node(
     // it can attach a device whose subsystem is "drm".
     kobj.add_symlink("subsystem", "../../../../class/drm");
 
-    // ── device/ sub-kobject (PCI IDs Mesa reads for driver selection) ────
-    let dev_kobj = Kobject::new_child(kobj.clone(), "device");
-    // `device/subsystem` → /sys/bus/pci. libdrm classifies a DRM node's bus by
-    // readlink()ing this and comparing the BASENAME against "pci"/"platform"/
-    // "usb" (drmGetDevice2 → drmParseSubsystemType). Without it the bus is
-    // unknown, so libdrm never fills in the PCI device info and Mesa's loader
-    // gives up with "MESA-LOADER: failed to retrieve device information" — no
-    // matter how correct the vendor/device attributes below are, because
-    // nothing tells it they are PCI ids in the first place.
+    // ── the PCI device node, and card<N>/device as a SYMLINK to it ───────
     //
-    // That failure is not cosmetic: kwin emits a burst of these while probing,
-    // then exits, and startplasma tears the session down behind it. The count
-    // is an exact multiple of 9 per session attempt across every boot, which
-    // is what ties it to the compositor's device probe rather than to noise.
+    // `device` MUST be a symlink whose target is named like a PCI address.
+    // libdrm's `drmParsePciBusInfo` does `readlink("/sys/dev/char/226:N/device")`
+    // and sscanf's "%04x:%02x:%02x.%1u" out of the TARGET to recover
+    // domain:bus:dev.func. A real directory named "device" (what this used to
+    // be) has no address to parse, so bus-info fails, `drmGetDevice2` cannot
+    // describe the device, and everything downstream — Mesa's loader, then
+    // EGL's "failed to get compatible render device" — falls over regardless
+    // of how correct the attributes are.
     //
-    // Path is relative to /sys/devices/platform/narf-drm/card<N>/device/, so
-    // five levels up reaches /sys. Linux ref: the real topology has a DRM
-    // card's device/subsystem pointing at /sys/bus/pci.
-    dev_kobj.add_symlink("subsystem", "../../../../../bus/pci");
+    // Linux: /sys/class/drm/card0/device -> ../../../0000:00:02.0, with the
+    // real node under /sys/devices/pci0000:00/. Mirror that. QEMU's
+    // bochs-display sits at 00:02.0.
+    let pci_addr = "0000:00:02.0";
+    let pci_root = get_or_create_child(&devices, "pci0000:00");
+    let dev_kobj = get_or_create_child(&pci_root, pci_addr);
+    // From /sys/devices/platform/narf-drm/card<N>, three levels up is
+    // /sys/devices.
+    kobj.add_symlink("device", format!("../../../pci0000:00/{}", pci_addr));
+    // From /sys/devices/pci0000:00/<addr>/, three levels up is /sys.
+    dev_kobj.add_symlink("subsystem", "../../../bus/pci");
 
     // `device/config` — raw PCI configuration space.
     //
@@ -312,9 +315,17 @@ fn populate_card_node(
     // Relative to card<N>/device/drm/, THREE levels up is narf-drm
     // (drm → device → card<N> → narf-drm).
     {
+        // From /sys/devices/pci0000:00/<addr>/drm/, four levels up is
+        // /sys/devices, then down into the platform container.
         let dev_drm = get_or_create_child(&dev_kobj, "drm");
-        dev_drm.add_symlink(card_name.clone(), format!("../../../{}", card_name));
-        dev_drm.add_symlink(render_name.clone(), format!("../../../{}", render_name));
+        dev_drm.add_symlink(
+            card_name.clone(),
+            format!("../../../../platform/narf-drm/{}", card_name),
+        );
+        dev_drm.add_symlink(
+            render_name.clone(),
+            format!("../../../../platform/narf-drm/{}", render_name),
+        );
     }
 
     class_drm.add_symlink(
