@@ -176,6 +176,31 @@ unit_diag_once() {
   # org.kde.ActivityManager, which plasmashell blocks on at startup — so
   # its exit code and last log lines decide the whole desktop, and the
   # unit list alone does not carry them.
+  # Can we even EXEC the /usr/libexec Plasma helpers?
+  #
+  # dbus reported "Failed to execute program
+  # org.freedesktop.impl.portal.desktop.kde: Input/output error" — EIO on
+  # execve, which is neither ENOENT (missing) nor EINVAL (NARF's non-PIE
+  # rejection). kactivitymanagerd lives in the same directory, is a similar
+  # size, and its unit fails; if it EIOs too then execve is the shared root
+  # cause of the black screen, not a side issue. Report each one's exit
+  # status explicitly rather than inferring from silence.
+  for b in /usr/libexec/kactivitymanagerd /usr/libexec/xdg-desktop-portal-kde \
+           /usr/bin/plasmashell /usr/bin/kded6; do
+    if [ -x "$b" ]; then
+      # Capture the BINARY's status, not a pipeline's. `x=$(cmd | head)`
+      # leaves $? as head's exit code, which reported rc=0 for binaries
+      # that never ran — the same pipeline-status trap that already bit
+      # this bring-up once. Redirect to a file, take $? immediately, and
+      # only then trim.
+      "$b" --version >/tmp/execprobe.out 2>&1
+      rc=$?
+      out=$(head -1 /tmp/execprobe.out 2>/dev/null)
+      printf 'EXECPROBE: %-46s rc=%s out=%s\n' "$b" "$rc" "${out:-<none>}"
+    else
+      printf 'EXECPROBE: %-46s NOT EXECUTABLE\n' "$b"
+    fi
+  done
   echo "UNITBLOCK: --- failed user units, in full ---"
   for u in $(systemctl --user list-units --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}'); do
     systemctl --user status "$u" --no-pager -n 25 2>&1 |
