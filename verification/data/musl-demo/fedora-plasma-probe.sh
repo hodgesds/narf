@@ -93,6 +93,29 @@ dump_kcminit_waits() {
   echo 'PLASMA-DIAG kcminit wait snapshot end'
 }
 
+# One-shot DRM probe from INSIDE the session, as uid 1000, at the moment
+# kwin is actually up.
+#
+# narf-drm-policy already runs this probe, but it runs at BOOT and as root,
+# and both differences matter: kwin opens O_RDWR as uid 1000 while udev may
+# still re-apply device ownership afterwards, so a boot-time success says
+# nothing about kwin's moment. kwin reports "Failed to open drm device
+# /dev/dri/card0" and dies, yet the boot-time probe opens the same node
+# fine — so the measurement has to happen HERE, in the same identity and
+# the same window, and print errno.
+drm_probe_in_session() {
+  if [ -x /usr/local/libexec/narf-drm-probe ]; then
+    echo "DRMC-SESSION: probing as uid $(id -u) while kwin is up"
+    /usr/local/libexec/narf-drm-probe 2>&1 |
+      while IFS= read -r l; do printf 'DRMC-SESSION: %s\n' "$l"; done
+  else
+    echo "DRMC-SESSION: probe binary MISSING"
+  fi
+  ls -ln /dev/dri/ 2>&1 |
+    while IFS= read -r l; do printf 'DRMC-SESSION: ls %s\n' "$l"; done
+}
+drm_probed=0
+
 for i in {1..180}; do
   proc_state kwin_wayland kwin
   proc_state plasmashell plasma
@@ -102,6 +125,10 @@ for i in {1..180}; do
   live_count kcminit_startup kcminit_count
   proc_state kded6 kded
   proc_state ksmserver ksm
+  if [ "$drm_probed" = 0 ] && [ "$kwin" != "none" ]; then
+    drm_probed=1
+    drm_probe_in_session
+  fi
   printf 'PLASMA-PROBE %s start=[%s] session=[%s] kwin=[%s] kcminit=[%s count=%s] kded=[%s] ksm=[%s] plasma=[%s]\n' \
     "$i" "$start" "$session" "$kwin" "$kcminit" "$kcminit_count" "$kded" "$ksm" "$plasma"
 

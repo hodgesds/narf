@@ -10,8 +10,10 @@
 //
 // Built on the host, run in the guest: links only against libdrm.so.2 +
 // libc, both of which the Fedora rootfs already ships for kwin's sake.
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
@@ -74,10 +76,16 @@ static void probe_one(const char *path)
         printf("DRMC: %s subsystem -> %s\n", path, buf);
     }
 
+    // O_RDWR|O_CLOEXEC is exactly what kwin's NoopSession::openRestricted()
+    // does. Print errno on failure: "open=-1" alone cannot distinguish a
+    // permission problem from EBUSY from ENOENT, and those imply completely
+    // different fixes.
     int fd = open(path, O_RDWR | O_CLOEXEC);
-    printf("DRMC: %s open=%d\n", path, fd);
-    if (fd < 0)
+    if (fd < 0) {
+        printf("DRMC: %s open=-1 errno=%d (%s)\n", path, errno, strerror(errno));
         return;
+    }
+    printf("DRMC: %s open=%d\n", path, fd);
 
     drmDevicePtr d = NULL;
     int r = drmGetDevice2(fd, 0, &d);
