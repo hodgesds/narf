@@ -3309,6 +3309,33 @@ impl SocketFile {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
                 }
+                // Wayland/dbus connect-latency diagnostic: stamp WHO connected
+                // to WHICH listener path and WHEN, so a slow accept()or is
+                // measurable from the serial log (pairs with UNIXACC below).
+                //
+                // Also available under `unix-latency-trace` alone: the full
+                // syscall firehose writes every syscall to the SYNCHRONOUS
+                // serial console, which inflates the very gap these two lines
+                // measure. Measuring it needs a quiet boot.
+                #[cfg(any(feature = "syscall-trace", feature = "unix-latency-trace"))]
+                {
+                    use core::fmt::Write as _;
+                    let comm =
+                        crate::handlers::proc_comm_of_task(crate::handlers::current_task_id())
+                            .unwrap_or_default();
+                    let path = match &uaddr {
+                        UnixAddr::Path(p) => p.as_str(),
+                        UnixAddr::Abstract(_) => "<abstract>",
+                        UnixAddr::Unnamed => "<unnamed>",
+                    };
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "UNIXENQ ms={} from={} path={}",
+                        narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
+                        comm,
+                        path,
+                    );
+                }
                 // Wake a server parked in poll/accept on the listener so it
                 // accepts the new connection immediately (not on a fallback
                 // timer). notify(0) wakes AND bumps the readiness generation, so

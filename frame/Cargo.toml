@@ -116,6 +116,7 @@ stall-watchdog = []
 # no GPU and weston's drm-backend fails with "no drm device found".
 linux-compat = ["narf-userspace/linux-compat", "narf-drivers-gpu/linux-compat"]
 syscall-trace = ["narf-userspace/syscall-trace"]
+unix-latency-trace = ["narf-userspace/unix-latency-trace"]
 
 # Frame-scrub-on-free debug/hardening aids, forwarded to narf-memory.
 # Off by default; each adds a 4 KiB write to the genuine-free path.

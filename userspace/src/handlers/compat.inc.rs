@@ -5993,6 +5993,21 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
             socket_arc_register(&socket);
             let task = current_task_id();
+            // Pairs with UNIXENQ (socket.rs Connect): stamps when the
+            // listener's owner finally accept()ed, so connect→accept
+            // latency is measurable from the serial log.
+            #[cfg(any(feature = "syscall-trace", feature = "unix-latency-trace"))]
+            {
+                use core::fmt::Write as _;
+                let comm = proc_comm_of_task(task).unwrap_or_default();
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "UNIXACC ms={} by={} lfd={}",
+                    narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
+                    comm,
+                    fd,
+                );
+            }
             let new_fd = match fd::with_table(task, |t| {
                 t.open(crate::fd::FdEntry {
                     ops: socket,
