@@ -26,7 +26,7 @@
 //! *real* interpreter happens in-kernel, in `bpf/src/tests.rs`, which stops
 //! skipping now that `has_backend()` is true on aarch64.
 
-use narf_bpf_isa::{AluOp, AtomicOp, ByteOrder, CondOp, Decoded, Size, Source};
+use narf_bpf_isa::{AluOp, AtomicOp, ByteOrder, CondOp, Decoded, Imm64, Size, Source};
 
 use narf_bpf_verifier::Context;
 
@@ -587,6 +587,38 @@ fn a64_golden_div_and_mod() {
 }
 
 #[test]
+fn a64_golden_ld_imm64() {
+    // Two back-to-back wide constants — R1 = 42, R0 = 0 — then exit. LD_IMM64
+    // routes through the same `MOVZ`/`MOVK` materialisation `a64_golden_mov_imm`
+    // derives; this pins that it does, and that the two two-slot instructions lay
+    // out contiguously.
+    a64_body(
+        &[
+            Decoded::LoadImm64 {
+                dst: r(1),
+                value: Imm64::Value(42),
+            },
+            Decoded::LoadImm64 {
+                dst: r(0),
+                value: Imm64::Value(0),
+            },
+            EXIT,
+        ],
+        &[
+            0xd280_0541, // mov  x1, #42
+            0xf2a0_0001, // movk x1, #0, lsl #16
+            0xf2c0_0001, // movk x1, #0, lsl #32
+            0xf2e0_0001, // movk x1, #0, lsl #48
+            0xd280_0000, // mov  x0, #0
+            0xf2a0_0000, // movk x0, #0, lsl #16
+            0xf2c0_0000, // movk x0, #0, lsl #32
+            0xf2e0_0000, // movk x0, #0, lsl #48
+            0x1400_0001, // b -> epilogue
+        ],
+    );
+}
+
+#[test]
 fn a64_golden_atomics() {
     // Every lowered atomic form, dst = R10 (FP = x25), src = R6 (x19), off = 0
     // so the address is FP directly (the offset fold is exercised elsewhere),
@@ -1005,10 +1037,12 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
             },
         ),
         (
-            "ld_imm64",
+            // The plain-value LD_IMM64 is now emitted; a map pseudo-form is not,
+            // since it resolves to an address the emitter never has.
+            "map-pseudo-ld_imm64",
             Decoded::LoadImm64 {
                 dst: r(0),
-                value: narf_bpf_isa::Imm64::Value(1),
+                value: Imm64::MapFd(3),
             },
         ),
     ];

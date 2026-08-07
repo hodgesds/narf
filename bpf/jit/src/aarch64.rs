@@ -140,7 +140,7 @@
 use alloc::vec::Vec;
 
 use narf_bpf_isa::{
-    decode, AluOp, AtomicOp, ByteOrder, CallTarget, CondOp, Decoded, Reg, Size, Source,
+    decode, AluOp, AtomicOp, ByteOrder, CallTarget, CondOp, Decoded, Imm64, Reg, Size, Source,
 };
 use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
@@ -772,10 +772,10 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
             arena[i],
         )?;
         i += width;
-        // A wide instruction occupies two slots. `LD_IMM64` is the only one and
-        // it is `Unsupported` here, so `width` is always 1 today; the trailing
-        // slot records the *following* instruction's offset, which is only
-        // sound because the verifier rejects a jump into it.
+        // A wide instruction (`LD_IMM64`) occupies two slots. Its own offset is
+        // `out[i]`; the trailing slot records the *following* instruction's
+        // offset, which is sound because the verifier rejects a jump into it and
+        // keeps `out` at one entry per slot for the reloc patcher.
         for _ in 1..width {
             out.push(e.len());
         }
@@ -1275,6 +1275,14 @@ fn emit_insn(
                 mov_imm32(e, host(dst), ext as i32);
             }
         }
+
+        // A plain 64-bit constant is the `MOVZ`/`MOVK` sequence. The map and
+        // subprogram pseudo-forms resolve to addresses this pass does not have,
+        // so they fall through to `Unsupported` and run interpreted.
+        Decoded::LoadImm64 {
+            dst,
+            value: Imm64::Value(v),
+        } => mov_imm64(e, host(dst), v as i64),
 
         Decoded::Alu {
             wide,

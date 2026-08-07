@@ -38,10 +38,16 @@
 //!   to a move — see [`neutralise_dead_calls`].
 //!
 //! The instruction *repertoire* is deliberately exactly what the backends
-//! lower: a shape neither backend emits (`LD_IMM64`, the fetching bitwise
-//! atomics, BPF-to-BPF calls) would make every program containing it fall back,
-//! and a fuzzer whose subjects fall back is a fuzzer comparing the interpreter
-//! with itself.
+//! lower: a shape neither backend emits (a map pseudo-form `LD_IMM64`, the
+//! fetching bitwise atomics, BPF-to-BPF calls) would make every program
+//! containing it fall back, and a fuzzer whose subjects fall back is a fuzzer
+//! comparing the interpreter with itself.
+//!
+//! The plain-value `LD_IMM64` *is* lowered but is still not generated here: it
+//! is a two-slot instruction, and this generator's jump arithmetic is in
+//! single-slot index space, so a wide instruction would shift every later
+//! target. It carries no control flow or addressing to fuzz, so it is covered by
+//! goldens and `smoke_bpf_jit_ld_imm64_matches_the_interpreter` instead.
 //! [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`] pins that boundary,
 //! so extending a backend makes this module's repertoire go stale *loudly*.
 //!
@@ -1500,13 +1506,15 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
             ],
         ),
         (
-            // A wide immediate load has no single-instruction host analogue.
-            "ld_imm64",
+            // A BPF-to-BPF call: it needs the interpreter's frame push, which no
+            // backend emits yet. (The plain-value LD_IMM64 that used to sit here
+            // is now lowered.)
+            "subprog-call",
             alloc::vec![
-                Decoded::LoadImm64 {
-                    dst: r(0),
-                    value: narf_bpf_isa::Imm64::Value(0x1_0000_0001),
-                },
+                super::mov_imm(0, 0),
+                Decoded::Call(narf_bpf_isa::CallTarget::Subprog(1)),
+                Decoded::Exit,
+                super::mov_imm(0, 0),
                 Decoded::Exit,
             ],
         ),

@@ -95,7 +95,7 @@
 use alloc::vec::Vec;
 
 use narf_bpf_isa::{
-    decode, AluOp, AtomicOp, ByteOrder, CallTarget, CondOp, Decoded, Reg, Size, Source,
+    decode, AluOp, AtomicOp, ByteOrder, CallTarget, CondOp, Decoded, Imm64, Reg, Size, Source,
 };
 use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
@@ -754,14 +754,12 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
             arena[i],
         )?;
         i += width;
-        // A wide instruction occupies two slots. This records the *following*
-        // instruction's offset for the trailing slot, not the wide
-        // instruction's own — which is fine only because nothing can branch
-        // there: the verifier rejects a jump into an `LD_IMM64`'s second slot,
-        // and `LD_IMM64` is `Unsupported` here anyway so `width` is always 1
-        // today. An earlier comment claimed the two slots shared an offset,
-        // which the loop order does not do. Whichever is wanted must be
-        // decided before LD_IMM64 emission lands.
+        // A wide instruction (`LD_IMM64`) occupies two slots. Its own offset is
+        // `out[i]`, recorded above; this records the *following* instruction's
+        // offset for the trailing slot. That is sound because nothing branches
+        // there — the verifier rejects a jump into an `LD_IMM64`'s second slot —
+        // and it keeps `out` indexed one entry per slot, which is what the reloc
+        // patcher assumes.
         for _ in 1..width {
             out.push(e.len());
         }
@@ -1353,6 +1351,14 @@ fn emit_insn(
                 if wide { ext } else { ext & 0xFFFF_FFFF },
             );
         }
+
+        // A plain 64-bit constant is the 10-byte `mov r64, imm64`. The map and
+        // subprogram pseudo-forms resolve to addresses this pass does not have,
+        // so they fall through to `Unsupported` and run interpreted.
+        Decoded::LoadImm64 {
+            dst,
+            value: Imm64::Value(v),
+        } => mov_reg_imm64(e, host(dst), v as i64),
 
         Decoded::Alu {
             wide,

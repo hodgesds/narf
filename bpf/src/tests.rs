@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 
 use narf_bpf_isa::encode::encode;
-use narf_bpf_isa::{AluOp, AtomicOp, CallTarget, CondOp, Decoded, Insn, Reg, Size, Source};
+use narf_bpf_isa::{AluOp, AtomicOp, CallTarget, CondOp, Decoded, Imm64, Insn, Reg, Size, Source};
 use narf_bpf_verifier::kfunc::Context;
 use narf_capabilities::{Cap, Grant};
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -342,6 +342,47 @@ fn smoke_bpf_jit_atomics_match_the_interpreter() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_jit_atomics_match_the_interpreter);
+
+fn smoke_bpf_jit_ld_imm64_matches_the_interpreter() -> TestResult {
+    // LD_IMM64 is a two-slot instruction the differential fuzzer does not
+    // generate — its jump arithmetic is in single-slot index space — so it earns
+    // a targeted check: load each boundary value into R0 and return it, and
+    // require the JIT to agree with the interpreter and with the value itself
+    // (which exercises every halfword of the aarch64 MOVZ/MOVK materialisation).
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let values: [u64; 6] = [
+        0,
+        1,
+        0xFFFF_FFFF_FFFF_FFFF,
+        0x1122_3344_5566_7788,
+        0x0000_0000_FFFF_FFFF,
+        0xFFFF_FFFF_0000_0000,
+    ];
+    for v in values {
+        let insns = asm(&[
+            Decoded::LoadImm64 {
+                dst: r(0),
+                value: Imm64::Value(v),
+            },
+            EXIT,
+        ]);
+        let Ok(p) = load("ldimm64", insns, Context::Atomic) else {
+            return TestResult::Fail("load rejected an LD_IMM64 program");
+        };
+        match diff_run(&p, [0; 4]) {
+            Ok(()) => {}
+            Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+            Err(_) => return TestResult::Fail("LD_IMM64 diverged from the interpreter"),
+        }
+        if !matches!(p.run_atomic([0; 4], 4), Some(Outcome::Returned(r)) if r == v) {
+            return TestResult::Fail("LD_IMM64 did not load the exact constant");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_ld_imm64_matches_the_interpreter);
 
 fn smoke_bpf_interp_loop_terminates() -> TestResult {
     // r0 = 0; r1 = 10; loop { r0 += 1; r1 -= 1; if r1 != 0 goto loop } exit

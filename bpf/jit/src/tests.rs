@@ -12,7 +12,7 @@
 
 use narf_bpf_isa::encode::encode;
 use narf_bpf_isa::{
-    AluOp, AtomicOp, ByteOrder, CallTarget, CondOp, Decoded, Insn, Reg, Size, Source,
+    AluOp, AtomicOp, ByteOrder, CallTarget, CondOp, Decoded, Imm64, Insn, Reg, Size, Source,
 };
 use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
@@ -148,16 +148,17 @@ fn reports_unsupported_rather_than_emitting_wrong_code() {
     // encoding — the interpreter is a complete implementation, which is what
     // makes growing this backend incrementally safe.
     //
-    // This test previously used multiply, then an atomic; both are now emitted.
-    // Deliberately re-pointed at something still unhandled rather than deleted:
-    // the property under test is "unemitted means refused", not any one opcode,
-    // and it stops being tested at all the moment the chosen instruction gets
-    // an encoding. `LD_IMM64` is the durable choice — a wide immediate load has
-    // no single-instruction host analogue and stays interpreted.
+    // This test previously used multiply, then an atomic, then a plain
+    // `LD_IMM64` — all now emitted. Deliberately re-pointed at something still
+    // unhandled rather than deleted: the property under test is "unemitted means
+    // refused", not any one opcode, and it stops being tested at all the moment
+    // the chosen instruction gets an encoding. A *map pseudo-form* `LD_IMM64` is
+    // the durable choice — it resolves to an address the emitter never has, so
+    // it stays interpreted.
     let prog = verified(&[
         Decoded::LoadImm64 {
             dst: r(0),
-            value: narf_bpf_isa::Imm64::Value(1),
+            value: Imm64::MapFd(3),
         },
         EXIT,
     ]);
@@ -743,6 +744,52 @@ fn the_atomics_lower_to_locked_read_modify_writes() {
             0xF0, 0x0F, 0xC1, 0x5D, 0xF8, // lock xadd  [rbp-8], ebx  (word)
         ],
         "atomic lowering drifted"
+    );
+}
+
+#[test]
+fn ld_imm64_is_a_ten_byte_move() {
+    // Two back-to-back wide constants — R0 and R9 — then exit. Pins the
+    // `mov r64, imm64` encoding (including REX.B for r15) and, because each is a
+    // two-slot instruction, that they lay out contiguously with the right offset
+    // for the trailing slot.
+    let prog = verified(&[
+        Decoded::LoadImm64 {
+            dst: r(0),
+            value: Imm64::Value(0x1122_3344_5566_7788),
+        },
+        Decoded::LoadImm64 {
+            dst: r(9),
+            value: Imm64::Value(0xFFFF_FFFF_0000_0000),
+        },
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..20],
+        &[
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // movabs rax, ...
+            0x49, 0xBF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, // movabs r15, ...
+        ],
+        "LD_IMM64 must be a 10-byte mov r64, imm64"
+    );
+}
+
+#[test]
+fn a_map_pseudo_ld_imm64_is_refused() {
+    // Only the plain-value form is emitted; a map pseudo-form resolves to an
+    // address this pass does not have, so it runs interpreted.
+    let prog = verified(&[
+        Decoded::LoadImm64 {
+            dst: r(0),
+            value: Imm64::MapFd(3),
+        },
+        EXIT,
+    ]);
+    assert!(
+        matches!(compile(&prog), Err(JitError::Unsupported { .. })),
+        "a map pseudo LD_IMM64 must be refused, not mis-emitted"
     );
 }
 
