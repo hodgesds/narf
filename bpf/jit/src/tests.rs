@@ -11,7 +11,9 @@
 //! host cannot execute the bytes it emits.
 
 use narf_bpf_isa::encode::encode;
-use narf_bpf_isa::{AluOp, AtomicOp, CallTarget, CondOp, Decoded, Insn, Reg, Size, Source};
+use narf_bpf_isa::{
+    AluOp, AtomicOp, ByteOrder, CallTarget, CondOp, Decoded, Insn, Reg, Size, Source,
+};
 use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
 use crate::{compile, JitError};
@@ -541,6 +543,72 @@ fn a_sign_extending_word_load_is_movsxd() {
         // 48 63 56 08 — movsxd rdx, dword [rsi+8]   (R3 rdx, R2 rsi)
         &[0x48, 0x63, 0x56, 0x08],
         "a sign-extending word load must be movsxd"
+    );
+}
+
+#[test]
+fn a_register_movsx_sign_extends_a_byte() {
+    // MOVSX R3 = (s8)R2 into a 64-bit register: `movsx rdx, sil` — REX.W plus
+    // the byte source `sil`, which also needs the REX to be named at all.
+    let prog = verified(&[
+        Decoded::Mov {
+            wide: true,
+            dst: r(3),
+            src: Source::Reg(r(2)),
+            sign_extend: Some(8),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..4],
+        // 48 0F BE D6 — movsx rdx, sil   (R3 rdx, R2 rsi)
+        &[0x48, 0x0F, 0xBE, 0xD6],
+        "a byte MOVSX into a 64-bit register must be movsx r64, r/m8"
+    );
+}
+
+#[test]
+fn a_byteswap_reverses_or_masks_by_width() {
+    // A 32-bit swap is a single `bswap`; a 16-bit swap is `ror r16,8` then a
+    // `movzx` to clear the upper bits, matching `(v as u16).swap_bytes()`.
+    let swap32 = verified(&[
+        Decoded::End {
+            dst: r(0),
+            order: ByteOrder::Big,
+            width: 32,
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&swap32).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..2],
+        &[0x0F, 0xC8], // bswap eax
+        "a 32-bit byte swap must be a single bswap"
+    );
+
+    let swap16 = verified(&[
+        Decoded::End {
+            dst: r(0),
+            order: ByteOrder::Big,
+            width: 16,
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&swap16).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..7],
+        &[
+            0x66, 0xC1, 0xC8, 0x08, // ror ax, 8
+            0x0F, 0xB7, 0xC0, // movzx eax, ax
+        ],
+        "a 16-bit byte swap must swap the two bytes and zero-extend"
     );
 }
 

@@ -78,7 +78,7 @@
 
 use alloc::vec::Vec;
 
-use narf_bpf_isa::{AluOp, CondOp, Decoded, Size, Source};
+use narf_bpf_isa::{AluOp, ByteOrder, CondOp, Decoded, Size, Source};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{asm, call, call_arena_base, diff_run, load, r, NOT_COMPILED, NO_BACKEND};
@@ -281,6 +281,14 @@ const SLOT_OFFS: [i16; 10] = [-8, -16, -120, -128, -136, -248, -256, -264, -504,
 /// doubleword phase C wrote.
 const LDST_SIZES: [Size; 4] = [Size::B, Size::H, Size::W, Size::Dw];
 
+/// The `MOVSX` source widths both backends lower.
+const MOVSX_BITS: [u8; 3] = [8, 16, 32];
+
+/// The byte-swap orders and widths both backends lower. `Little` masks to
+/// width; `Big`/`Swap` reverse.
+const END_ORDERS: [ByteOrder; 3] = [ByteOrder::Little, ByteOrder::Big, ByteOrder::Swap];
+const END_WIDTHS: [u8; 3] = [16, 32, 64];
+
 /// The ALU operations both backends lower. `Div` and `Mod` are absent on
 /// purpose — see the module docs and
 /// [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`].
@@ -330,6 +338,8 @@ struct Classes {
     uncond_jump: u32,
     narrow: u32,
     narrow_mem: u32,
+    movsx: u32,
+    byteswap: u32,
 }
 
 impl Classes {
@@ -347,6 +357,8 @@ impl Classes {
         self.uncond_jump += o.uncond_jump;
         self.narrow += o.narrow;
         self.narrow_mem += o.narrow_mem;
+        self.movsx += o.movsx;
+        self.byteswap += o.byteswap;
     }
 }
 
@@ -595,14 +607,26 @@ fn emit_unit(
                 cls.narrow += 1;
             }
         }
-        // Negate.
+        // Negate — or a byte swap (`END`/`bswap`) a third of the time, which
+        // covers the rev/movzx lowering across the three widths and orders.
         40..=44 => {
-            let wide = rng.chance(50);
             let dst = rng.reg();
-            prog.push(Decoded::Neg { wide, dst: r(dst) });
-            cls.neg += 1;
-            if !wide {
-                cls.narrow += 1;
+            if rng.chance(33) {
+                let order = END_ORDERS[rng.below(END_ORDERS.len() as u32) as usize];
+                let width = END_WIDTHS[rng.below(END_WIDTHS.len() as u32) as usize];
+                prog.push(Decoded::End {
+                    dst: r(dst),
+                    order,
+                    width,
+                });
+                cls.byteswap += 1;
+            } else {
+                let wide = rng.chance(50);
+                prog.push(Decoded::Neg { wide, dst: r(dst) });
+                cls.neg += 1;
+                if !wide {
+                    cls.narrow += 1;
+                }
             }
         }
         // Move, immediate — the only thing that *clears* opacity.
@@ -621,19 +645,28 @@ fn emit_unit(
                 cls.narrow += 1;
             }
         }
-        // Move, register.
+        // Move, register — plain, or a sign-extending `MOVSX` a third of the
+        // time, which exercises the SBFM/movsx lowering against `widen`.
         54..=60 => {
             let wide = rng.chance(70);
             let dst = rng.reg();
             let src = rng.reg();
+            let sign_extend = if rng.chance(33) {
+                Some(MOVSX_BITS[rng.below(MOVSX_BITS.len() as u32) as usize])
+            } else {
+                None
+            };
             prog.push(Decoded::Mov {
                 wide,
                 dst: r(dst),
                 src: Source::Reg(r(src)),
-                sign_extend: None,
+                sign_extend,
             });
             opaque[dst as usize] = opaque[src as usize];
             cls.mov += 1;
+            if sign_extend.is_some() {
+                cls.movsx += 1;
+            }
             if !wide {
                 cls.narrow += 1;
             }
@@ -930,7 +963,7 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         pct(t.compiled, t.generated)
     );
     note!(
-        "bpf-fuzz: classes alu_i={} alu_r={} neg={} mov={} st={} ld={} ctx={} call={} fwd={} back={} ja={} 32bit={} narrowmem={}",
+        "bpf-fuzz: classes alu_i={} alu_r={} neg={} mov={} st={} ld={} ctx={} call={} fwd={} back={} ja={} 32bit={} narrowmem={} movsx={} bswap={}",
         cls.alu_imm,
         cls.alu_reg,
         cls.neg,
@@ -943,7 +976,9 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         cls.back_edge,
         cls.uncond_jump,
         cls.narrow,
-        cls.narrow_mem
+        cls.narrow_mem,
+        cls.movsx,
+        cls.byteswap
     );
 
     // Coverage assertions. Without these the test could stay green while the
@@ -973,6 +1008,8 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         || cls.stack_load == 0
         || cls.narrow == 0
         || cls.narrow_mem == 0
+        || cls.movsx == 0
+        || cls.byteswap == 0
     {
         return TestResult::Fail("the generator stopped covering a class it claims to cover");
     }
@@ -1339,7 +1376,7 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
     if !narf_bpf_jit::has_backend() {
         return TestResult::Skip(NO_BACKEND);
     }
-    let cases: [(&str, Vec<Decoded>); 4] = [
+    let cases: [(&str, Vec<Decoded>); 2] = [
         (
             "div",
             alloc::vec![
@@ -1363,31 +1400,6 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
                     signed: false,
                     dst: r(0),
                     src: Source::Imm(7),
-                },
-                Decoded::Exit,
-            ],
-        ),
-        (
-            "byte-swap",
-            alloc::vec![
-                super::mov_imm(0, 0x1234),
-                Decoded::End {
-                    dst: r(0),
-                    order: narf_bpf_isa::ByteOrder::Little,
-                    width: 32,
-                },
-                Decoded::Exit,
-            ],
-        ),
-        (
-            "MOVSX",
-            alloc::vec![
-                super::mov_imm(0, -1),
-                Decoded::Mov {
-                    wide: true,
-                    dst: r(0),
-                    src: Source::Reg(r(0)),
-                    sign_extend: Some(8),
                 },
                 Decoded::Exit,
             ],

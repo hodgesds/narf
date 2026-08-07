@@ -26,7 +26,7 @@
 //! *real* interpreter happens in-kernel, in `bpf/src/tests.rs`, which stops
 //! skipping now that `has_backend()` is true on aarch64.
 
-use narf_bpf_isa::{AluOp, CondOp, Decoded, Size, Source};
+use narf_bpf_isa::{AluOp, ByteOrder, CondOp, Decoded, Size, Source};
 
 use narf_bpf_verifier::Context;
 
@@ -485,6 +485,61 @@ fn a64_golden_narrower_store_and_sign_extending_load() {
 }
 
 #[test]
+fn a64_golden_movsx_and_byteswap() {
+    // MOVSX R3 = (s8)R2 into a 64-bit register: `SXTB x3, w2` (SBFM with N=1,
+    // immr=0, imms=7).
+    a64_body(
+        &[
+            Decoded::Mov {
+                wide: true,
+                dst: r(3),
+                src: Source::Reg(r(2)),
+                sign_extend: Some(8),
+            },
+            EXIT,
+        ],
+        &[
+            0x9340_1c43, // sxtb x3, w2  (sf=1, N=1)
+            0x1400_0001,
+        ],
+    );
+
+    // A 32-bit byte swap is a single `REV Wd,Wn`, which zero-extends the top
+    // half — matching `(v as u32).swap_bytes() as u64`.
+    a64_body(
+        &[
+            Decoded::End {
+                dst: r(0),
+                order: ByteOrder::Big,
+                width: 32,
+            },
+            EXIT,
+        ],
+        &[
+            0x5ac0_0800, // rev w0, w0
+            0x1400_0001,
+        ],
+    );
+
+    // A 16-bit swap is `REV16` then `UXTH` (UBFM #0,#15) to clear the top bits.
+    a64_body(
+        &[
+            Decoded::End {
+                dst: r(0),
+                order: ByteOrder::Big,
+                width: 16,
+            },
+            EXIT,
+        ],
+        &[
+            0x5ac0_0400, // rev16 w0, w0
+            0x5300_3c00, // uxth w0, w0
+            0x1400_0001,
+        ],
+    );
+}
+
+#[test]
 fn a64_golden_far_displacement_folds_into_the_address_register() {
     // `LDUR`'s `simm9` reaches ±256. Beyond that the displacement is folded
     // into `x17` and the access uses a zero displacement — reusing the one
@@ -789,7 +844,7 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
     // moment it gains an encoding, which is how the x86-64 suite's
     // "unsupported" test came to be pointed at multiply after multiply started
     // being emitted.
-    let cases: [(&str, Decoded); 6] = [
+    let cases: [(&str, Decoded); 4] = [
         (
             "atomic",
             Decoded::Atomic {
@@ -816,23 +871,6 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
                 signed: false,
                 dst: r(0),
                 src: Source::Reg(r(1)),
-            },
-        ),
-        (
-            "movsx",
-            Decoded::Mov {
-                wide: true,
-                dst: r(0),
-                src: Source::Reg(r(1)),
-                sign_extend: Some(8),
-            },
-        ),
-        (
-            "byteswap",
-            Decoded::End {
-                dst: r(0),
-                order: narf_bpf_isa::ByteOrder::Big,
-                width: 32,
             },
         ),
         (

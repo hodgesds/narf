@@ -94,7 +94,7 @@
 
 use alloc::vec::Vec;
 
-use narf_bpf_isa::{decode, AluOp, CallTarget, CondOp, Decoded, Reg, Size, Source};
+use narf_bpf_isa::{decode, AluOp, ByteOrder, CallTarget, CondOp, Decoded, Reg, Size, Source};
 use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
 use crate::blocks::{block_len, block_starts};
@@ -933,6 +933,118 @@ fn store_imm_tail(e: &mut Emit, size: Size, v: i32) {
     }
 }
 
+/// `mov reg, imm` — the ten-byte form for 64-bit, the five-byte zero-extending
+/// form for 32-bit (which is exactly BPF's `wide == false` move semantics).
+fn emit_mov_imm(e: &mut Emit, wide: bool, dst: u8, imm: i64) {
+    if wide {
+        mov_reg_imm64(e, dst, imm);
+    } else {
+        e.rex(false, 0, dst);
+        e.b(0xB8 | (dst & 7));
+        e.d32(imm as i32);
+    }
+}
+
+/// Sign-extend the low `bits` of `v` to 64 bits — the compile-time twin of
+/// `movsx`, for the immediate `MOVSX` form.
+fn sext_imm(v: i32, bits: u8) -> i64 {
+    match bits {
+        8 => v as i8 as i64,
+        16 => v as i16 as i64,
+        _ => i64::from(v),
+    }
+}
+
+/// `MOVSX`: sign-extend the low `bits` of `src` into `dst`. A 64-bit
+/// destination sign-extends to the full register; a 32-bit one sign-extends
+/// within 32 bits and zero-extends the upper half, both matching the
+/// interpreter's `raw as iN as i64` then the `wide` mask.
+fn emit_movsx_rr(e: &mut Emit, wide: bool, bits: u8, dst: u8, src: u8) {
+    match bits {
+        // `movsx r, r/m8`. A byte source register in `spl`/`sil`/`dil`/`bpl`
+        // needs a REX present to name its low byte — forced here for the 32-bit
+        // form, which is otherwise prefix-free.
+        8 => {
+            e.rex_forced(wide, dst, src, matches!(src, 4..=7));
+            e.bs(&[0x0F, 0xBE]);
+            e.modrm_rr(dst, src);
+        }
+        // `movsx r, r/m16`.
+        16 => {
+            e.rex(wide, dst, src);
+            e.bs(&[0x0F, 0xBF]);
+            e.modrm_rr(dst, src);
+        }
+        // `movsxd r64, r/m32`. A 32-bit destination cannot sign-extend from 32
+        // bits, so it is a plain 32-bit move (the interpreter masks to 32).
+        _ => {
+            if wide {
+                e.rex(true, dst, src);
+                e.b(0x63);
+                e.modrm_rr(dst, src);
+            } else {
+                mov_rr(e, false, dst, src);
+            }
+        }
+    }
+}
+
+/// `END` / `bswap`: reverse or truncate `dst` by width. `Little` keeps the
+/// bytes and only masks to width; `Big`/`Swap` reverses them. Both zero-extend
+/// the result, matching the interpreter's `byteswap`.
+fn emit_byteswap(
+    e: &mut Emit,
+    at: u32,
+    dst: u8,
+    order: ByteOrder,
+    width: u8,
+) -> Result<(), JitError> {
+    let swap = matches!(order, ByteOrder::Big | ByteOrder::Swap);
+    match (width, swap) {
+        // `ror r/m16, 8` swaps the two bytes; `movzx r32, r/m16` then zero-
+        // extends, clearing the upper 48 bits.
+        (16, true) => {
+            e.b(0x66);
+            e.rex(false, 0, dst);
+            e.b(0xC1);
+            e.modrm_rr(1, dst);
+            e.b(8);
+            e.rex(false, dst, dst);
+            e.bs(&[0x0F, 0xB7]);
+            e.modrm_rr(dst, dst);
+        }
+        // `movzx r32, r/m16` — value & 0xFFFF.
+        (16, false) => {
+            e.rex(false, dst, dst);
+            e.bs(&[0x0F, 0xB7]);
+            e.modrm_rr(dst, dst);
+        }
+        // `bswap r32` — reverses four bytes; the 32-bit form zero-extends.
+        (32, true) => {
+            e.rex(false, 0, dst);
+            e.b(0x0F);
+            e.b(0xC8 | (dst & 7));
+        }
+        // `mov r32, r32` — value & 0xFFFF_FFFF.
+        (32, false) => mov_rr(e, false, dst, dst),
+        // `bswap r64` — reverses all eight bytes.
+        (64, true) => {
+            e.rex(true, 0, dst);
+            e.b(0x0F);
+            e.b(0xC8 | (dst & 7));
+        }
+        // A 64-bit little-endian swap is the identity.
+        (64, false) => {}
+        _ => {
+            return Err(JitError::Unsupported {
+                at,
+                what: "byteswap width must be 16, 32, or 64",
+            })
+        }
+    }
+    Ok(())
+}
+
 fn emit_insn(
     e: &mut Emit,
     insn: &Decoded,
@@ -1011,18 +1123,32 @@ fn emit_insn(
             sign_extend: None,
         } => match src {
             Source::Reg(s) => mov_rr(e, wide, host(dst), host(s)),
-            Source::Imm(v) => {
-                if wide {
-                    mov_reg_imm64(e, host(dst), i64::from(v));
-                } else {
-                    // 32-bit mov zero-extends, which is exactly BPF's
-                    // semantics for a `wide == false` move.
-                    e.rex(false, 0, host(dst));
-                    e.b(0xB8 | (host(dst) & 7));
-                    e.d32(v);
-                }
-            }
+            Source::Imm(v) => emit_mov_imm(e, wide, host(dst), i64::from(v)),
         },
+
+        Decoded::Mov {
+            wide,
+            dst,
+            src: Source::Reg(s),
+            sign_extend: Some(bits),
+        } => emit_movsx_rr(e, wide, bits, host(dst), host(s)),
+
+        Decoded::Mov {
+            wide,
+            dst,
+            src: Source::Imm(v),
+            sign_extend: Some(bits),
+        } => {
+            // Sign-extending a constant is itself a constant, so materialise it
+            // — the interpreter's `raw as iN as i64 as u64`, then the `wide` mask.
+            let ext = sext_imm(v, bits);
+            emit_mov_imm(
+                e,
+                wide,
+                host(dst),
+                if wide { ext } else { ext & 0xFFFF_FFFF },
+            );
+        }
 
         Decoded::Alu {
             wide,
@@ -1045,6 +1171,8 @@ fn emit_insn(
             e.b(0xF7);
             e.modrm_rr(3, host(dst));
         }
+
+        Decoded::End { dst, order, width } => emit_byteswap(e, at, host(dst), order, width)?,
 
         Decoded::Alu { wide, op, dst, src } => {
             let Some((slash, rr)) = alu_forms(op) else {
