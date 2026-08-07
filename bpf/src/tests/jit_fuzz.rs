@@ -38,9 +38,10 @@
 //!   to a move — see [`neutralise_dead_calls`].
 //!
 //! The instruction *repertoire* is deliberately exactly what the backends
-//! lower: a shape neither backend emits (`LD_IMM64`, atomics, BPF-to-BPF calls)
-//! would make every program containing it fall back, and a fuzzer whose subjects
-//! fall back is a fuzzer comparing the interpreter with itself.
+//! lower: a shape neither backend emits (`LD_IMM64`, the fetching bitwise
+//! atomics, BPF-to-BPF calls) would make every program containing it fall back,
+//! and a fuzzer whose subjects fall back is a fuzzer comparing the interpreter
+//! with itself.
 //! [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`] pins that boundary,
 //! so extending a backend makes this module's repertoire go stale *loudly*.
 //!
@@ -340,6 +341,7 @@ struct Classes {
     movsx: u32,
     byteswap: u32,
     divmod: u32,
+    atomic: u32,
 }
 
 impl Classes {
@@ -360,6 +362,7 @@ impl Classes {
         self.movsx += o.movsx;
         self.byteswap += o.byteswap;
         self.divmod += o.divmod;
+        self.atomic += o.atomic;
     }
 }
 
@@ -574,6 +577,27 @@ fn divmod_insn(rng: &mut Rng, wide: bool, dst: u8, src: Source) -> Decoded {
     }
 }
 
+/// One atomic operation both backends lower. `src` is the store/operand
+/// register; `Cmpxchg` is only offered when it is not R0, which would alias
+/// aarch64 `CASAL`'s `Rs`/`Rt` and be refused. The fetching bitwise forms are
+/// deliberately absent — x86-64 has no single instruction for them.
+fn pick_atomic_op(rng: &mut Rng, src: u8) -> AtomicOp {
+    loop {
+        match rng.below(9) {
+            0 => return AtomicOp::Add { fetch: false },
+            1 => return AtomicOp::Add { fetch: true },
+            2 => return AtomicOp::Or { fetch: false },
+            3 => return AtomicOp::And { fetch: false },
+            4 => return AtomicOp::Xor { fetch: false },
+            5 => return AtomicOp::Xchg,
+            6 => return AtomicOp::LoadAcquire,
+            7 => return AtomicOp::StoreRelease,
+            _ if src != 0 => return AtomicOp::Cmpxchg,
+            _ => {}
+        }
+    }
+}
+
 /// Emit one body unit. A unit is one or more instructions that must not be
 /// jumped into the middle of.
 #[allow(clippy::too_many_arguments)]
@@ -782,6 +806,36 @@ fn emit_unit(
             // The return value is not a constant the verifier can see.
             opaque[0] = true;
             cls.call += 1;
+        }
+        // A stack atomic on an 8-aligned slot phase C initialised. Only the
+        // shapes both backends lower are generated — the fetching bitwise forms
+        // need an x86 cmpxchg loop and stay interpreted, and cmpxchg avoids R0
+        // as the store value (it would alias aarch64 `CASAL` Rs==Rt). See
+        // `smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`.
+        86..=90 => {
+            let k = rng.below(SLOT_OFFS.len() as u32) as usize;
+            let size = if rng.chance(50) { Size::Dw } else { Size::W };
+            let src = rng.reg();
+            let op = pick_atomic_op(rng, src);
+            prog.push(Decoded::Atomic {
+                size,
+                op,
+                dst: r(10),
+                src: r(src),
+                off: SLOT_OFFS[k],
+            });
+            // A fetching form writes the pre-op value into src; cmpxchg clobbers
+            // R0. Either makes the destination register verifier-opaque.
+            if op.writes_src() {
+                opaque[src as usize] = true;
+            }
+            if matches!(op, AtomicOp::Cmpxchg) {
+                opaque[0] = true;
+            }
+            cls.atomic += 1;
+            if size != Size::Dw {
+                cls.narrow_mem += 1;
+            }
         }
         // A jump. Target patched once the layout is known.
         _ => {
@@ -1002,7 +1056,7 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         pct(t.compiled, t.generated)
     );
     note!(
-        "bpf-fuzz: classes alu_i={} alu_r={} neg={} mov={} st={} ld={} ctx={} call={} fwd={} back={} ja={} 32bit={} narrowmem={} movsx={} bswap={} divmod={}",
+        "bpf-fuzz: classes alu_i={} alu_r={} neg={} mov={} st={} ld={} ctx={} call={} fwd={} back={} ja={} 32bit={} narrowmem={} movsx={} bswap={} divmod={} atomic={}",
         cls.alu_imm,
         cls.alu_reg,
         cls.neg,
@@ -1018,7 +1072,8 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         cls.narrow_mem,
         cls.movsx,
         cls.byteswap,
-        cls.divmod
+        cls.divmod,
+        cls.atomic
     );
 
     // Coverage assertions. Without these the test could stay green while the
@@ -1051,6 +1106,7 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         || cls.movsx == 0
         || cls.byteswap == 0
         || cls.divmod == 0
+        || cls.atomic == 0
     {
         return TestResult::Fail("the generator stopped covering a class it claims to cover");
     }
@@ -1419,7 +1475,9 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
     }
     let cases: [(&str, Vec<Decoded>); 2] = [
         (
-            "atomic-add",
+            // A fetching bitwise atomic: x86-64 would need a cmpxchg loop, so it
+            // stays interpreted, and aarch64 leaves it for parity.
+            "atomic-fetch-or",
             alloc::vec![
                 super::mov_imm(1, 7),
                 Decoded::Store {
@@ -1430,7 +1488,7 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
                 },
                 Decoded::Atomic {
                     size: Size::Dw,
-                    op: AtomicOp::Add { fetch: false },
+                    op: AtomicOp::Or { fetch: true },
                     dst: r(10),
                     src: r(1),
                     off: -8,
@@ -1442,23 +1500,13 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
             ],
         ),
         (
-            "atomic-xchg",
+            // A wide immediate load has no single-instruction host analogue.
+            "ld_imm64",
             alloc::vec![
-                super::mov_imm(1, 7),
-                Decoded::Store {
-                    size: Size::Dw,
-                    dst: r(10),
-                    off: -8,
-                    src: Source::Imm(0),
+                Decoded::LoadImm64 {
+                    dst: r(0),
+                    value: narf_bpf_isa::Imm64::Value(0x1_0000_0001),
                 },
-                Decoded::Atomic {
-                    size: Size::Dw,
-                    op: AtomicOp::Xchg,
-                    dst: r(10),
-                    src: r(1),
-                    off: -8,
-                },
-                super::mov_imm(0, 0),
                 Decoded::Exit,
             ],
         ),

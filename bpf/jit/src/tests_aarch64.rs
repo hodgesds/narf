@@ -26,7 +26,7 @@
 //! *real* interpreter happens in-kernel, in `bpf/src/tests.rs`, which stops
 //! skipping now that `has_backend()` is true on aarch64.
 
-use narf_bpf_isa::{AluOp, ByteOrder, CondOp, Decoded, Size, Source};
+use narf_bpf_isa::{AluOp, AtomicOp, ByteOrder, CondOp, Decoded, Size, Source};
 
 use narf_bpf_verifier::Context;
 
@@ -587,6 +587,106 @@ fn a64_golden_div_and_mod() {
 }
 
 #[test]
+fn a64_golden_atomics() {
+    // Every lowered atomic form, dst = R10 (FP = x25), src = R6 (x19), off = 0
+    // so the address is FP directly (the offset fold is exercised elsewhere),
+    // doubleword unless noted. Pins the LSE opcode field, the AL ordering, the
+    // fetch result routed through x16, the AND-via-`MVN`+`LDCLR`, `CASAL` with
+    // x0 as the comparand, and `LDAR`/`STLR`.
+    a64_body(
+        &[
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Add { fetch: false },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Add { fetch: true },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Xchg,
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Cmpxchg,
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Or { fetch: false },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::And { fetch: false },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Xor { fetch: false },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::LoadAcquire,
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::StoreRelease,
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::W,
+                op: AtomicOp::Add { fetch: false },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            EXIT,
+        ],
+        &[
+            0xf8f3_033f, // ldaddal x19, xzr, [x25]
+            0xf8f3_0330, // ldaddal x19, x16, [x25]
+            0xaa10_03f3, // mov     x19, x16
+            0xf8f3_8330, // swpal   x19, x16, [x25]
+            0xaa10_03f3, // mov     x19, x16
+            0xc8e0_ff33, // casal   x0, x19, [x25]
+            0xf8f3_333f, // ldsetal x19, xzr, [x25]
+            0xaa33_03f0, // mvn     x16, x19
+            0xf8f0_133f, // ldclral x16, xzr, [x25]
+            0xf8f3_233f, // ldeoral x19, xzr, [x25]
+            0xc8df_ff33, // ldar    x19, [x25]
+            0xc89f_ff33, // stlr    x19, [x25]
+            0xb8f3_033f, // ldaddal w19, wzr, [x25]  (word)
+            0x1400_0001,
+        ],
+    );
+}
+
+#[test]
 fn a64_golden_far_displacement_folds_into_the_address_register() {
     // `LDUR`'s `simm9` reaches ±256. Beyond that the displacement is folded
     // into `x17` and the access uses a zero displacement — reusing the one
@@ -893,12 +993,14 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
     // being emitted.
     let cases: [(&str, Decoded); 2] = [
         (
-            "atomic",
+            // A fetching bitwise atomic stays interpreted on both backends, for
+            // parity with x86-64 (which would need a cmpxchg loop).
+            "fetching-bitwise-atomic",
             Decoded::Atomic {
                 size: Size::Dw,
-                op: narf_bpf_isa::AtomicOp::Add { fetch: false },
+                op: narf_bpf_isa::AtomicOp::Or { fetch: true },
                 dst: r(10),
-                src: r(0),
+                src: r(1),
                 off: -8,
             },
         ),

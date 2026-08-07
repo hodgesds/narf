@@ -139,7 +139,9 @@
 
 use alloc::vec::Vec;
 
-use narf_bpf_isa::{decode, AluOp, ByteOrder, CallTarget, CondOp, Decoded, Reg, Size, Source};
+use narf_bpf_isa::{
+    decode, AluOp, AtomicOp, ByteOrder, CallTarget, CondOp, Decoded, Reg, Size, Source,
+};
 use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
 use crate::blocks::{block_len, block_starts};
@@ -270,6 +272,40 @@ const MSUB_X: u32 = 0x9B00_8000;
 /// `INT_MIN`, both without trapping — exactly the interpreter's semantics.
 const UDIV_X: u32 = 0x9AC0_0800;
 const SDIV_X: u32 = 0x9AC0_0C00;
+
+/// `ORN Rd, Rn, Rm` — `ORR` with the second operand inverted; `MVN` when
+/// `Rn == xzr`. Used to turn BPF's atomic AND into an `LDCLR`/`STCLR` (which
+/// clears the bits *set* in its operand, i.e. `&= ~operand`).
+const ORN_X: u32 = 0xAA20_0000;
+
+/// LSE atomic read-modify-writes, doubleword acquire+release forms. The
+/// operation is bits [14:12]; `SWP` sets bit 15. The word forms clear bit 30
+/// (see [`sz_atomic`]). `Rs` (bits [20:16]) is the operand, `Rt` (bits [4:0])
+/// receives the pre-op value (or `xzr` to discard it), `Rn` (bits [9:5]) is the
+/// address. Acquire on a discarded-result form is harmless, so one AL constant
+/// serves both the fetching and non-fetching lowerings.
+const LDADD_AL: u32 = 0xF8E0_0000;
+const LDCLR_AL: u32 = 0xF8E0_1000;
+const LDEOR_AL: u32 = 0xF8E0_2000;
+const LDSET_AL: u32 = 0xF8E0_3000;
+const SWP_AL: u32 = 0xF8E0_8000;
+/// `CASAL Rs, Rt, [Rn]` — compare `Rs` with `[Rn]`, store `Rt` on equal, and
+/// always load the pre-op value into `Rs`. With `Rs = x0` that is BPF cmpxchg.
+const CASAL: u32 = 0xC8E0_FC00;
+/// `LDAR Rt, [Rn]` and `STLR Rt, [Rn]` — the load-acquire / store-release pair.
+const LDAR: u32 = 0xC8DF_FC00;
+const STLR: u32 = 0xC89F_FC00;
+
+/// The atomic instructions carry their access size in bits [31:30] (`0b11`
+/// doubleword, `0b10` word), so a word form clears bit 30 of the doubleword
+/// base — unlike [`sf`], which clears bit 31 for the data-processing forms.
+const fn sz_atomic(base: u32, wide: bool) -> u32 {
+    if wide {
+        base
+    } else {
+        base & !(1 << 30)
+    }
+}
 /// Data-processing 2-source shift group. `LSLV` as encoded; `+0x400` selects
 /// `LSRV` and `+0x800` selects `ASRV`.
 const LSLV_X: u32 = 0x9AC0_2000;
@@ -954,6 +990,102 @@ fn addr_operand(e: &mut Emit, base: u8, off: i16) -> (u8, i32) {
     }
 }
 
+/// The LSE atomics address memory through `[Rn]` with no displacement, so a
+/// non-zero offset is folded into [`hr::ADDR`] first. A zero offset uses the
+/// base register directly.
+fn atomic_addr(e: &mut Emit, base: u8, off: i16) -> u8 {
+    if off == 0 {
+        base
+    } else {
+        mov_imm64(e, hr::ADDR, i64::from(off));
+        e.w(shifted_reg(ADD_X, true, hr::ADDR, base, hr::ADDR));
+        hr::ADDR
+    }
+}
+
+/// A BPF atomic against a certified base (stack or context), lowered to the LSE
+/// atomic instructions. Word and doubleword only (the ISA has no narrower
+/// atomic); a word form zero-extends any fetched value, matching the
+/// interpreter's `mask`.
+///
+/// Every form is one instruction (two where a value has to be moved out of a
+/// scratch, or AND inverted). The fetching forms take their result through
+/// [`hr::IMM`] rather than into the operand register directly, because `Rs == Rt`
+/// on an LSE atomic is `CONSTRAINED UNPREDICTABLE`. `Cmpxchg` where the source
+/// is R0 would hit the same `Rs == Rt` on `CASAL` and is refused (the fuzzer and
+/// verifier both keep R0 clear of it in practice); like the fetching bitwise
+/// forms on x86-64, that keeps the lowered repertoire identical on both backends.
+fn emit_atomic(
+    e: &mut Emit,
+    at: u32,
+    size: Size,
+    op: AtomicOp,
+    dst: Reg,
+    off: i16,
+    src: Reg,
+) -> Result<(), JitError> {
+    let wide = size == Size::Dw;
+    let s = host(src);
+    let addr = atomic_addr(e, host(dst), off);
+    // `<ldop>AL Rs=s, Rt=rt, [addr]`.
+    let rmw = |e: &mut Emit, base: u32, rt: u8| {
+        e.w(sz_atomic(base, wide) | ((s as u32) << 16) | ((addr as u32) << 5) | rt as u32);
+    };
+    match op {
+        // Non-fetching: discard the loaded value into xzr.
+        AtomicOp::Add { fetch: false } => rmw(e, LDADD_AL, hr::ZR),
+        AtomicOp::Or { fetch: false } => rmw(e, LDSET_AL, hr::ZR),
+        AtomicOp::Xor { fetch: false } => rmw(e, LDEOR_AL, hr::ZR),
+        AtomicOp::And { fetch: false } => {
+            // `LDCLR` clears the bits set in its operand (`&= ~operand`), so AND
+            // is the clear of `~src`.
+            e.w(shifted_reg(ORN_X, wide, hr::IMM, hr::ZR, s));
+            e.w(sz_atomic(LDCLR_AL, wide)
+                | ((hr::IMM as u32) << 16)
+                | ((addr as u32) << 5)
+                | u32::from(hr::ZR));
+        }
+        // Fetching: land the old value in IMM, then move it to the source (which
+        // is also the operand, so it cannot double as Rt).
+        AtomicOp::Add { fetch: true } => {
+            rmw(e, LDADD_AL, hr::IMM);
+            e.w(mov_rr(wide, s, hr::IMM));
+        }
+        AtomicOp::Xchg => {
+            rmw(e, SWP_AL, hr::IMM);
+            e.w(mov_rr(wide, s, hr::IMM));
+        }
+        // `CASAL x0, src, [addr]`: x0 (R0) is the comparand and receives the
+        // pre-op value; src is stored on a match.
+        AtomicOp::Cmpxchg => {
+            if s == 0 {
+                return Err(JitError::Unsupported {
+                    at,
+                    what: "cmpxchg with R0 as the store value aliases CASAL Rs==Rt",
+                });
+            }
+            // Rs = x0 (R0) is the comparand; its field is zero, so it is left
+            // out of the OR rather than written as `0 << 16`.
+            e.w(sz_atomic(CASAL, wide) | ((addr as u32) << 5) | s as u32);
+        }
+        AtomicOp::LoadAcquire => {
+            e.w(sz_atomic(LDAR, wide) | ((addr as u32) << 5) | s as u32);
+        }
+        AtomicOp::StoreRelease => {
+            e.w(sz_atomic(STLR, wide) | ((addr as u32) << 5) | s as u32);
+        }
+        AtomicOp::Or { fetch: true }
+        | AtomicOp::And { fetch: true }
+        | AtomicOp::Xor { fetch: true } => {
+            return Err(JitError::Unsupported {
+                at,
+                what: "fetching bitwise atomic is left interpreted for backend parity",
+            })
+        }
+    }
+    Ok(())
+}
+
 /// The whole of a kfunc call: the AAPCS64 shuffle, the target, and the `BLR`.
 ///
 /// BPF passes arguments in R1..R5 and AAPCS64 in `x0`..`x4`, so the map is
@@ -1216,6 +1348,14 @@ fn emit_insn(
                 | ((hr::ADDR as u32) << 5)
                 | host(dst) as u32);
         }
+
+        Decoded::Atomic {
+            size,
+            op,
+            dst,
+            src,
+            off,
+        } => emit_atomic(e, at, size, op, dst, off, src)?,
 
         Decoded::Neg { wide, dst } => {
             // `NEG Rd, Rd` — `SUB Rd, ZR, Rd`.

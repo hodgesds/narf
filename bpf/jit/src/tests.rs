@@ -80,6 +80,18 @@ pub(crate) fn mov(dst: u8, v: i32) -> Decoded {
     }
 }
 
+/// An atomic against the frame pointer (R10) — the base every generated and
+/// golden atomic uses. `src` is a BPF register index.
+pub(crate) fn atomic(size: Size, op: AtomicOp, src: u8, off: i16) -> Decoded {
+    Decoded::Atomic {
+        size,
+        op,
+        dst: r(10),
+        src: r(src),
+        off,
+    }
+}
+
 #[test]
 fn emits_a_trivial_program() {
     let c = compile(&verified(&[mov(0, 42), EXIT])).expect("should compile");
@@ -136,18 +148,16 @@ fn reports_unsupported_rather_than_emitting_wrong_code() {
     // encoding — the interpreter is a complete implementation, which is what
     // makes growing this backend incrementally safe.
     //
-    // This test previously used multiply, which is now emitted. Deliberately
-    // re-pointed at something still unhandled rather than deleted: the
-    // property under test is "unemitted means refused", not any one opcode,
+    // This test previously used multiply, then an atomic; both are now emitted.
+    // Deliberately re-pointed at something still unhandled rather than deleted:
+    // the property under test is "unemitted means refused", not any one opcode,
     // and it stops being tested at all the moment the chosen instruction gets
-    // an encoding.
+    // an encoding. `LD_IMM64` is the durable choice — a wide immediate load has
+    // no single-instruction host analogue and stays interpreted.
     let prog = verified(&[
-        Decoded::Atomic {
-            size: Size::Dw,
-            op: narf_bpf_isa::AtomicOp::Add { fetch: false },
-            dst: r(10),
-            src: r(0),
-            off: -8,
+        Decoded::LoadImm64 {
+            dst: r(0),
+            value: narf_bpf_isa::Imm64::Value(1),
         },
         EXIT,
     ]);
@@ -693,6 +703,61 @@ fn a_signed_mod_guards_zero_and_minus_one() {
             0x4C, 0x89, 0xDB, // mov rbx, r11
         ],
         "a signed mod must guard zero and the -1 overflow, result in rdx"
+    );
+}
+
+#[test]
+fn the_atomics_lower_to_locked_read_modify_writes() {
+    // Every lowered atomic form, dst = R10 (rbp), src = R6 (rbx), off = -8,
+    // doubleword unless noted. Pins the LOCK prefix, the implicit-lock xchg, the
+    // rax-implicit cmpxchg, and the plain-move load-acquire / store-release —
+    // and one word form to show REX.W drops out.
+    let prog = verified(&[
+        atomic(Size::Dw, AtomicOp::Add { fetch: false }, 6, -8),
+        atomic(Size::Dw, AtomicOp::Add { fetch: true }, 6, -8),
+        atomic(Size::Dw, AtomicOp::Xchg, 6, -8),
+        atomic(Size::Dw, AtomicOp::Cmpxchg, 6, -8),
+        atomic(Size::Dw, AtomicOp::Or { fetch: false }, 6, -8),
+        atomic(Size::Dw, AtomicOp::And { fetch: false }, 6, -8),
+        atomic(Size::Dw, AtomicOp::Xor { fetch: false }, 6, -8),
+        atomic(Size::Dw, AtomicOp::LoadAcquire, 6, -8),
+        atomic(Size::Dw, AtomicOp::StoreRelease, 6, -8),
+        atomic(Size::W, AtomicOp::Add { fetch: true }, 6, -8),
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..49],
+        &[
+            0xF0, 0x48, 0x01, 0x5D, 0xF8, // lock add   [rbp-8], rbx
+            0xF0, 0x48, 0x0F, 0xC1, 0x5D, 0xF8, // lock xadd  [rbp-8], rbx
+            0x48, 0x87, 0x5D, 0xF8, // xchg  [rbp-8], rbx (implicitly locked)
+            0xF0, 0x48, 0x0F, 0xB1, 0x5D, 0xF8, // lock cmpxchg [rbp-8], rbx
+            0xF0, 0x48, 0x09, 0x5D, 0xF8, // lock or    [rbp-8], rbx
+            0xF0, 0x48, 0x21, 0x5D, 0xF8, // lock and   [rbp-8], rbx
+            0xF0, 0x48, 0x31, 0x5D, 0xF8, // lock xor   [rbp-8], rbx
+            0x48, 0x8B, 0x5D, 0xF8, // mov   rbx, [rbp-8]  (load-acquire)
+            0x48, 0x89, 0x5D, 0xF8, // mov   [rbp-8], rbx  (store-release)
+            0xF0, 0x0F, 0xC1, 0x5D, 0xF8, // lock xadd  [rbp-8], ebx  (word)
+        ],
+        "atomic lowering drifted"
+    );
+}
+
+#[test]
+fn a_fetching_bitwise_atomic_is_refused_on_x86() {
+    // x86 has no atomic fetch-and-{or,and,xor}; it would need a cmpxchg loop, so
+    // the emitter refuses it and the program runs interpreted.
+    let prog = verified(&[
+        atomic(Size::Dw, AtomicOp::Or { fetch: true }, 6, -8),
+        mov(0, 0),
+        EXIT,
+    ]);
+    assert!(
+        matches!(compile(&prog), Err(JitError::Unsupported { .. })),
+        "a fetching bitwise atomic must be refused, not mis-emitted"
     );
 }
 

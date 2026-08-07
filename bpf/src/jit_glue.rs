@@ -421,6 +421,14 @@ fn scan_program(v: &VerifiedProgram) -> Result<(), JitSkip> {
             Decoded::Store { dst, .. } if !arena_here && !base_ok(dst) => {
                 return Err(JitSkip::UncheckedPointerBase)
             }
+            // An atomic dereferences its destination exactly as a store does, so
+            // its base must be certifiable too. A fetching bitwise form or a
+            // cmpxchg the emitter cannot shape simply returns `Unsupported` at
+            // emit time and the whole program falls back — this gate only guards
+            // the pointer base.
+            Decoded::Atomic { dst, .. } if !arena_here && !base_ok(dst) => {
+                return Err(JitSkip::UncheckedPointerBase)
+            }
             _ => {}
         }
         i += width;

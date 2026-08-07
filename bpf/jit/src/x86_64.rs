@@ -94,7 +94,9 @@
 
 use alloc::vec::Vec;
 
-use narf_bpf_isa::{decode, AluOp, ByteOrder, CallTarget, CondOp, Decoded, Reg, Size, Source};
+use narf_bpf_isa::{
+    decode, AluOp, AtomicOp, ByteOrder, CallTarget, CondOp, Decoded, Reg, Size, Source,
+};
 use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
 use crate::blocks::{block_len, block_starts};
@@ -521,6 +523,91 @@ fn emit_div_mod(e: &mut Emit, wide: bool, signed: bool, want_rem: bool, dst: u8,
     e.b(0x58 | hr::RDX); // pop rdx
     e.b(0x58 | hr::RAX); // pop rax
     mov_rr(e, wide, dst, hr::R11);
+}
+
+/// A BPF atomic against a certified base (stack or context), lowered to the
+/// x86 locked read-modify-write instructions.
+///
+/// The memory operand is `[base + off]`, the same addressing every stack access
+/// uses. Widths are word and doubleword only (the ISA has no narrower atomic),
+/// so no byte-register REX hazard arises. `LOCK` (`0xF0`) prefixes the
+/// non-implicitly-locked forms; `xchg` with a memory operand locks on its own.
+///
+/// The fetching bitwise forms (`fetch` on or/and/xor) are **not** emitted: x86
+/// has no atomic fetch-and-{or,and,xor}, only a `cmpxchg` retry loop, so they
+/// stay interpreted — [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`]
+/// pins that boundary. Every other form is one instruction.
+fn emit_atomic(
+    e: &mut Emit,
+    at: u32,
+    size: Size,
+    op: AtomicOp,
+    dst: Reg,
+    off: i16,
+    src: Reg,
+) -> Result<(), JitError> {
+    let wide = size == Size::Dw;
+    let m = host(dst);
+    let s = host(src);
+    let disp = i32::from(off);
+    // `lock; <op> [m + disp], s` for the group-1 read-modify-writes.
+    let locked_rmw = |e: &mut Emit, opcode: u8| {
+        e.b(0xF0);
+        e.rex(wide, s, m);
+        e.b(opcode);
+        e.modrm_mem(s, m, disp);
+    };
+    match op {
+        AtomicOp::Add { fetch: false } => locked_rmw(e, 0x01),
+        AtomicOp::Or { fetch: false } => locked_rmw(e, 0x09),
+        AtomicOp::And { fetch: false } => locked_rmw(e, 0x21),
+        AtomicOp::Xor { fetch: false } => locked_rmw(e, 0x31),
+        // `lock; xadd [m], s` — s receives the pre-op value, m gets m + s. A
+        // 32-bit form zero-extends s, matching the interpreter's `mask`.
+        AtomicOp::Add { fetch: true } => {
+            e.b(0xF0);
+            e.rex(wide, s, m);
+            e.bs(&[0x0F, 0xC1]);
+            e.modrm_mem(s, m, disp);
+        }
+        // `xchg [m], s` — implicitly locked; s receives the old value.
+        AtomicOp::Xchg => {
+            e.rex(wide, s, m);
+            e.b(0x87);
+            e.modrm_mem(s, m, disp);
+        }
+        // `lock; cmpxchg [m], s` — compares rax (R0) with m; on equal stores s,
+        // otherwise loads m into rax. That is exactly BPF cmpxchg: R0 is the
+        // comparand and receives the pre-op value.
+        AtomicOp::Cmpxchg => {
+            e.b(0xF0);
+            e.rex(wide, s, m);
+            e.bs(&[0x0F, 0xB1]);
+            e.modrm_mem(s, m, disp);
+        }
+        // x86 loads are acquire and stores are release under TSO, so these are
+        // plain moves into / out of the source register.
+        AtomicOp::LoadAcquire => {
+            e.rex(wide, s, m);
+            e.b(0x8B);
+            e.modrm_mem(s, m, disp);
+        }
+        AtomicOp::StoreRelease => {
+            e.rex(wide, s, m);
+            e.b(0x89);
+            e.modrm_mem(s, m, disp);
+        }
+        AtomicOp::Or { fetch: true }
+        | AtomicOp::And { fetch: true }
+        | AtomicOp::Xor { fetch: true } => {
+            return Err(JitError::Unsupported {
+                at,
+                what:
+                    "fetching bitwise atomic needs a cmpxchg loop the x86_64 backend does not emit",
+            })
+        }
+    }
+    Ok(())
 }
 
 const fn cond_cc(op: CondOp) -> u8 {
@@ -1294,6 +1381,14 @@ fn emit_insn(
             dst,
             src,
         } => emit_div_mod(e, wide, signed, true, host(dst), src),
+
+        Decoded::Atomic {
+            size,
+            op,
+            dst,
+            src,
+            off,
+        } => emit_atomic(e, at, size, op, dst, off, src)?,
 
         Decoded::Neg { wide, dst } => {
             // `neg r/m` — F7 /3. Included so the ALU differential sweep can be

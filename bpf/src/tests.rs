@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 
 use narf_bpf_isa::encode::encode;
-use narf_bpf_isa::{AluOp, CallTarget, CondOp, Decoded, Insn, Reg, Size, Source};
+use narf_bpf_isa::{AluOp, AtomicOp, CallTarget, CondOp, Decoded, Insn, Reg, Size, Source};
 use narf_bpf_verifier::kfunc::Context;
 use narf_capabilities::{Cap, Grant};
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -265,6 +265,83 @@ fn smoke_bpf_interp_stack_roundtrip() -> TestResult {
     }
 }
 kernel_test_in!("bpf", smoke_bpf_interp_stack_roundtrip);
+
+fn smoke_bpf_jit_atomics_match_the_interpreter() -> TestResult {
+    // Deterministic companion to the fuzzer's atomic coverage: each op runs on a
+    // stack slot and its *observable* effect is returned in R0 — the modified
+    // memory for every op, and the fetched value for the fetching forms — so the
+    // JIT's memory write and its register write are each compared against the
+    // interpreter at a known answer rather than only when a random program
+    // happens to route the effect into R0.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let ops = [
+        AtomicOp::Add { fetch: false },
+        AtomicOp::Add { fetch: true },
+        AtomicOp::Or { fetch: false },
+        AtomicOp::And { fetch: false },
+        AtomicOp::Xor { fetch: false },
+        AtomicOp::Xchg,
+        AtomicOp::Cmpxchg,
+        AtomicOp::LoadAcquire,
+        AtomicOp::StoreRelease,
+    ];
+    for size in [Size::W, Size::Dw] {
+        for &op in &ops {
+            let at = Decoded::Atomic {
+                size,
+                op,
+                dst: r(10),
+                src: r(1),
+                off: -8,
+            };
+            // R0 = 3 doubles as the cmpxchg comparand (equal to the initial
+            // value, so the swap takes); R1 = 5 is the operand / store value.
+            let prologue = [mov_imm(0, 3), mov_imm(1, 5), st_imm(10, -8, 3)];
+
+            // The modified memory, read back into R0.
+            let mut mem_prog = prologue.to_vec();
+            mem_prog.push(at);
+            mem_prog.push(ldx_size(size, 0, 10, -8));
+            mem_prog.push(EXIT);
+            let Ok(p) = load("atomic-mem", asm(&mem_prog), Context::Atomic) else {
+                return TestResult::Fail("an atomic memory probe did not verify");
+            };
+            match diff_run(&p, [0; 4]) {
+                Ok(()) => {}
+                Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+                Err(_) => return TestResult::Fail("an atomic's memory effect diverged"),
+            }
+
+            // The fetched value: cmpxchg leaves it in R0 already; the other
+            // fetching forms leave it in the source register, moved to R0 here.
+            if op.writes_src() || matches!(op, AtomicOp::Cmpxchg) {
+                let mut fetch_prog = prologue.to_vec();
+                fetch_prog.push(at);
+                if !matches!(op, AtomicOp::Cmpxchg) {
+                    fetch_prog.push(Decoded::Mov {
+                        wide: true,
+                        dst: r(0),
+                        src: Source::Reg(r(1)),
+                        sign_extend: None,
+                    });
+                }
+                fetch_prog.push(EXIT);
+                let Ok(p) = load("atomic-fetch", asm(&fetch_prog), Context::Atomic) else {
+                    return TestResult::Fail("an atomic fetch probe did not verify");
+                };
+                match diff_run(&p, [0; 4]) {
+                    Ok(()) => {}
+                    Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+                    Err(_) => return TestResult::Fail("an atomic's fetched value diverged"),
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_atomics_match_the_interpreter);
 
 fn smoke_bpf_interp_loop_terminates() -> TestResult {
     // r0 = 0; r1 = 10; loop { r0 += 1; r1 -= 1; if r1 != 0 goto loop } exit
