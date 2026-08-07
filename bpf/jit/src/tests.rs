@@ -613,6 +613,90 @@ fn a_byteswap_reverses_or_masks_by_width() {
 }
 
 #[test]
+fn an_unsigned_div_saves_rax_rdx_and_guards_zero() {
+    // R6 / R7 (rbx / r13), unsigned 64-bit. The whole shape is pinned: the
+    // divisor is captured into rcx before rax/rdx are pushed (R7 could have been
+    // R0 or R3), the dividend goes to rax, a zero divisor is branched around to a
+    // zero quotient, and the result is carried out through r11 past the pops.
+    let prog = verified(&[
+        Decoded::Div {
+            wide: true,
+            signed: false,
+            dst: r(6),
+            src: Source::Reg(r(7)),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..30],
+        &[
+            0x4C, 0x89, 0xE9, // mov rcx, r13     (divisor first)
+            0x50, // push rax
+            0x52, // push rdx
+            0x48, 0x89, 0xD8, // mov rax, rbx     (dividend)
+            0x48, 0x85, 0xC9, // test rcx, rcx
+            0x74, 0x07, // jz +7 -> divzero
+            0x31, 0xD2, // xor edx, edx
+            0x48, 0xF7, 0xF1, // div rcx
+            0xEB, 0x02, // jmp +2 -> done
+            0x31, 0xC0, // xor eax, eax     (divzero: quotient 0)
+            0x49, 0x89, 0xC3, // mov r11, rax     (done)
+            0x5A, // pop rdx
+            0x58, // pop rax
+            0x4C, 0x89, 0xDB, // mov rbx, r11
+        ],
+        "an unsigned div must save rax/rdx, guard zero, and carry out via r11"
+    );
+}
+
+#[test]
+fn a_signed_mod_guards_zero_and_minus_one() {
+    // R6 %s R7 (rbx / r13), signed 64-bit. Beyond the div shape this pins the two
+    // signed-only branches: `cmp rcx, -1` avoids the `idiv` overflow trap on
+    // `INT_MIN %s -1` (remainder 0), and the zero-divisor path leaves the
+    // dividend as the remainder. The result register is rdx, not rax.
+    let prog = verified(&[
+        Decoded::Mod {
+            wide: true,
+            signed: true,
+            dst: r(6),
+            src: Source::Reg(r(7)),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..44],
+        &[
+            0x4C, 0x89, 0xE9, // mov rcx, r13
+            0x50, // push rax
+            0x52, // push rdx
+            0x48, 0x89, 0xD8, // mov rax, rbx
+            0x48, 0x85, 0xC9, // test rcx, rcx
+            0x74, 0x10, // jz +16 -> divzero
+            0x48, 0x81, 0xF9, 0xFF, 0xFF, 0xFF, 0xFF, // cmp rcx, -1
+            0x74, 0x0C, // je +12 -> neg_one
+            0x48, 0x99, // cqo
+            0x48, 0xF7, 0xF9, // idiv rcx
+            0xEB, 0x07, // jmp +7 -> done
+            0x48, 0x89, 0xC2, // mov rdx, rax     (divzero: rem = dividend)
+            0xEB, 0x02, // jmp +2 -> done
+            0x31, 0xD2, // xor edx, edx     (neg_one: rem = 0)
+            0x49, 0x89, 0xD3, // mov r11, rdx     (done)
+            0x5A, // pop rdx
+            0x58, // pop rax
+            0x4C, 0x89, 0xDB, // mov rbx, r11
+        ],
+        "a signed mod must guard zero and the -1 overflow, result in rdx"
+    );
+}
+
+#[test]
 fn an_arena_atomic_the_emitter_cannot_shape_is_refused() {
     // Fail-closed, and specifically *not* by falling through to the plain
     // lowering. Atomics have no arena encoding here, and the wrong answer would

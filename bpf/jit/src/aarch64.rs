@@ -261,6 +261,15 @@ const ORR_X: u32 = 0xAA00_0000;
 const EOR_X: u32 = 0xCA00_0000;
 /// `MADD Rd, Rn, Rm, Ra`; with `Ra = xzr` it is `MUL`.
 const MADD_X: u32 = 0x9B00_0000;
+/// `MSUB Rd, Rn, Rm, Ra` — `Rd = Ra - Rn*Rm`, the `o0` bit of `MADD`. Used with
+/// a quotient to recover the remainder for `mod`.
+const MSUB_X: u32 = 0x9B00_8000;
+/// `UDIV Rd, Rn, Rm` and `SDIV Rd, Rn, Rm`, the data-processing 2-source group
+/// (same base as [`LSLV_X`], opcode in bits [15:10]). aarch64 division needs no
+/// guards: divide-by-zero produces zero and `INT_MIN / -1` produces the wrapping
+/// `INT_MIN`, both without trapping — exactly the interpreter's semantics.
+const UDIV_X: u32 = 0x9AC0_0800;
+const SDIV_X: u32 = 0x9AC0_0C00;
 /// Data-processing 2-source shift group. `LSLV` as encoded; `+0x400` selects
 /// `LSRV` and `+0x800` selects `ASRV`.
 const LSLV_X: u32 = 0x9AC0_2000;
@@ -1172,6 +1181,39 @@ fn emit_insn(
                 | ((rm as u32) << 16)
                 | ((hr::ZR as u32) << 10)
                 | ((host(dst) as u32) << 5)
+                | host(dst) as u32);
+        }
+
+        Decoded::Div {
+            wide,
+            signed,
+            dst,
+            src,
+        } => {
+            // `SDIV`/`UDIV Rd, Rn, Rm` writes the quotient straight into dst; the
+            // hardware already matches BPF for the zero and overflow cases.
+            let rm = src_reg(e, wide, src);
+            let base = if signed { SDIV_X } else { UDIV_X };
+            e.w(shifted_reg(base, wide, host(dst), host(dst), rm));
+        }
+
+        Decoded::Mod {
+            wide,
+            signed,
+            dst,
+            src,
+        } => {
+            // No remainder instruction: divide into a scratch, then
+            // `MSUB dst, quotient, divisor, dividend` = dividend - quotient*divisor.
+            // The quotient lands in ADDR rather than IMM so that an immediate
+            // divisor (materialised into IMM by `src_reg`) survives to the MSUB.
+            let rm = src_reg(e, wide, src);
+            let base = if signed { SDIV_X } else { UDIV_X };
+            e.w(shifted_reg(base, wide, hr::ADDR, host(dst), rm));
+            e.w(sf(MSUB_X, wide)
+                | ((rm as u32) << 16)
+                | ((host(dst) as u32) << 10)
+                | ((hr::ADDR as u32) << 5)
                 | host(dst) as u32);
         }
 

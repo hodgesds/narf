@@ -187,6 +187,30 @@ impl Emit {
         self.bs(&x.to_le_bytes());
     }
 
+    /// Emit a `jcc`/`jmp rel8` with a zero displacement and return the offset of
+    /// the displacement byte, to be resolved later by [`Emit::patch_rel8`]. Used
+    /// only for the short forward branches *within* a single instruction's
+    /// lowering (the `div`/`mod` guards), whose targets are a handful of bytes
+    /// away — never for inter-instruction control flow, which the reloc table
+    /// resolves as `rel32`.
+    fn jmp_rel8(&mut self, opcode: u8) -> u32 {
+        self.b(opcode);
+        let at = self.len();
+        self.b(0);
+        at
+    }
+
+    /// Fill in the `rel8` displacement of a branch whose byte was reserved by
+    /// [`Emit::jmp_rel8`], now that its target is the current end of the buffer.
+    fn patch_rel8(&mut self, at: u32) {
+        let rel = self.buf.len() as i64 - (at as i64 + 1);
+        debug_assert!(
+            (-128..=127).contains(&rel),
+            "rel8 branch target out of reach: {rel}"
+        );
+        self.buf[at as usize] = rel as i8 as u8;
+    }
+
     /// A REX prefix like [`Emit::rex`], but emitted even when it would be the
     /// bare `0x40` — which a byte store of `spl`/`bpl`/`sil`/`dil` requires to
     /// name the low byte rather than `ah`/`ch`/`dh`/`bh`.
@@ -404,6 +428,99 @@ fn emit_mul(e: &mut Emit, wide: bool, dst: u8, src: Source) {
             e.d32(v);
         }
     }
+}
+
+/// BPF `div`/`mod`, lowered to x86 `div`/`idiv`.
+///
+/// x86 division is hardwired to `rdx:rax` — quotient to `rax`, remainder to
+/// `rdx` — and both alias BPF registers (R0, R3), so they are saved on the stack
+/// around the sequence and the result is carried out through `r11`. `rcx` holds
+/// the divisor; neither `rcx`, `r11` nor `r12` (fuel) aliases a BPF register, so
+/// only the destination is disturbed. The `push`/`pop` are balanced within this
+/// one instruction and it contains no call, arena access or fuel check, so the
+/// "the body never moves `rsp`" invariant the fault epilogues rest on holds.
+///
+/// The two hardware traps are branched around rather than taken, matching the
+/// interpreter (and Linux): divide-by-zero yields a zero quotient and the
+/// dividend unchanged as the remainder, and the signed `INT_MIN / -1` overflow
+/// is the wrapping identity `x / -1 == -x`, `x % -1 == 0`.
+fn emit_div_mod(e: &mut Emit, wide: bool, signed: bool, want_rem: bool, dst: u8, src: Source) {
+    // Divisor into rcx first, while every BPF register still holds its value —
+    // src may be R0 (rax) or R3 (rdx), which the steps below overwrite.
+    match src {
+        Source::Reg(s) => mov_rr(e, wide, hr::RCX, host(s)),
+        Source::Imm(v) => emit_mov_imm(e, wide, hr::RCX, i64::from(v)),
+    }
+    // Preserve rax and rdx; the divide overwrites both.
+    e.b(0x50 | hr::RAX); // push rax
+    e.b(0x50 | hr::RDX); // push rdx
+                         // Dividend into rax. A 32-bit move zero-extends, leaving eax as the low half
+                         // and edx set below; a 64-bit move takes the whole register.
+    mov_rr(e, wide, hr::RAX, dst);
+
+    let result = if want_rem { hr::RDX } else { hr::RAX };
+
+    // Divide-by-zero guard: `test` the divisor, branch away if it is zero.
+    alu_rr(e, wide, 0x85, hr::RCX, hr::RCX);
+    let to_divzero = e.jmp_rel8(0x74); // jz divzero
+
+    let to_neg_one = if signed {
+        // `x / -1` overflows `idiv` for x == INT_MIN, so the whole `-1` divisor
+        // case is handled as the wrapping identity instead of dividing.
+        alu_ri(e, wide, 7, hr::RCX, -1); // cmp rcx, -1
+        Some(e.jmp_rel8(0x74)) // je neg_one
+    } else {
+        None
+    };
+
+    if signed {
+        // Sign-extend rax into rdx (cdq/cqo), then idiv.
+        if wide {
+            e.b(0x48);
+        }
+        e.b(0x99);
+        e.rex(wide, 0, hr::RCX);
+        e.b(0xF7);
+        e.modrm_rr(7, hr::RCX); // idiv rcx
+    } else {
+        // Zero rdx (a 32-bit xor clears the whole register), then div.
+        alu_rr(e, false, 0x31, hr::RDX, hr::RDX);
+        e.rex(wide, 0, hr::RCX);
+        e.b(0xF7);
+        e.modrm_rr(6, hr::RCX); // div rcx
+    }
+    let to_done_from_div = e.jmp_rel8(0xEB); // jmp done
+
+    // divzero: quotient 0, remainder = dividend (still in rax).
+    e.patch_rel8(to_divzero);
+    if want_rem {
+        mov_rr(e, wide, hr::RDX, hr::RAX);
+    } else {
+        alu_rr(e, false, 0x31, hr::RAX, hr::RAX); // xor eax, eax
+    }
+    let to_done_from_divzero = signed.then(|| e.jmp_rel8(0xEB)); // jmp done (skip neg_one)
+
+    // neg_one (signed only): quotient = -dividend, remainder 0.
+    if let Some(at) = to_neg_one {
+        e.patch_rel8(at);
+        if want_rem {
+            alu_rr(e, false, 0x31, hr::RDX, hr::RDX); // xor edx, edx
+        } else {
+            e.rex(wide, 0, hr::RAX);
+            e.b(0xF7);
+            e.modrm_rr(3, hr::RAX); // neg rax
+        }
+    }
+
+    // done: carry the result out past the pops, restore, and land it in dst.
+    e.patch_rel8(to_done_from_div);
+    if let Some(at) = to_done_from_divzero {
+        e.patch_rel8(at);
+    }
+    mov_rr(e, wide, hr::R11, result);
+    e.b(0x58 | hr::RDX); // pop rdx
+    e.b(0x58 | hr::RAX); // pop rax
+    mov_rr(e, wide, dst, hr::R11);
 }
 
 const fn cond_cc(op: CondOp) -> u8 {
@@ -1163,6 +1280,20 @@ fn emit_insn(
             dst,
             src,
         } => emit_mul(e, wide, host(dst), src),
+
+        Decoded::Div {
+            wide,
+            signed,
+            dst,
+            src,
+        } => emit_div_mod(e, wide, signed, false, host(dst), src),
+
+        Decoded::Mod {
+            wide,
+            signed,
+            dst,
+            src,
+        } => emit_div_mod(e, wide, signed, true, host(dst), src),
 
         Decoded::Neg { wide, dst } => {
             // `neg r/m` — F7 /3. Included so the ALU differential sweep can be

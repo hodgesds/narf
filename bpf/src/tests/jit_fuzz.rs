@@ -38,10 +38,9 @@
 //!   to a move — see [`neutralise_dead_calls`].
 //!
 //! The instruction *repertoire* is deliberately exactly what the backends
-//! lower: a shape neither backend emits (`div`, `mod`, `LD_IMM64`, atomics,
-//! byte-swap, sub-doubleword and sign-extending memory access) would make every
-//! program containing it fall back, and a fuzzer whose subjects fall back is a
-//! fuzzer comparing the interpreter with itself.
+//! lower: a shape neither backend emits (`LD_IMM64`, atomics, BPF-to-BPF calls)
+//! would make every program containing it fall back, and a fuzzer whose subjects
+//! fall back is a fuzzer comparing the interpreter with itself.
 //! [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`] pins that boundary,
 //! so extending a backend makes this module's repertoire go stale *loudly*.
 //!
@@ -78,7 +77,7 @@
 
 use alloc::vec::Vec;
 
-use narf_bpf_isa::{AluOp, ByteOrder, CondOp, Decoded, Size, Source};
+use narf_bpf_isa::{AluOp, AtomicOp, ByteOrder, CondOp, Decoded, Size, Source};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{asm, call, call_arena_base, diff_run, load, r, NOT_COMPILED, NO_BACKEND};
@@ -289,9 +288,9 @@ const MOVSX_BITS: [u8; 3] = [8, 16, 32];
 const END_ORDERS: [ByteOrder; 3] = [ByteOrder::Little, ByteOrder::Big, ByteOrder::Swap];
 const END_WIDTHS: [u8; 3] = [16, 32, 64];
 
-/// The ALU operations both backends lower. `Div` and `Mod` are absent on
-/// purpose — see the module docs and
-/// [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`].
+/// The binary ALU operations both backends lower through the shifted-register
+/// path. `Div`/`Mod` are their own `Decoded` variants (not `AluOp`s) and are
+/// woven into the ALU units directly — see [`emit_unit`].
 const ALU_OPS: [AluOp; 9] = [
     AluOp::Add,
     AluOp::Sub,
@@ -340,6 +339,7 @@ struct Classes {
     narrow_mem: u32,
     movsx: u32,
     byteswap: u32,
+    divmod: u32,
 }
 
 impl Classes {
@@ -359,6 +359,7 @@ impl Classes {
         self.narrow_mem += o.narrow_mem;
         self.movsx += o.movsx;
         self.byteswap += o.byteswap;
+        self.divmod += o.divmod;
     }
 }
 
@@ -551,6 +552,28 @@ fn pick_opaque(rng: &mut Rng, opaque: &[bool; 10]) -> u8 {
     candidates[rng.below(n as u32) as usize]
 }
 
+/// A `Div` or `Mod` with a random signedness, for the ALU units. Both variants
+/// and both signednesses are reachable, so a run covers the signed guard, the
+/// unsigned path, quotient and remainder across the two backends.
+fn divmod_insn(rng: &mut Rng, wide: bool, dst: u8, src: Source) -> Decoded {
+    let signed = rng.chance(50);
+    if rng.chance(50) {
+        Decoded::Mod {
+            wide,
+            signed,
+            dst: r(dst),
+            src,
+        }
+    } else {
+        Decoded::Div {
+            wide,
+            signed,
+            dst: r(dst),
+            src,
+        }
+    }
+}
+
 /// Emit one body unit. A unit is one or more instructions that must not be
 /// jumped into the middle of.
 #[allow(clippy::too_many_arguments)]
@@ -573,36 +596,52 @@ fn emit_unit(
         r => r,
     };
     match roll {
-        // ALU, immediate source.
+        // ALU, immediate source — a fifth of the time a `Div`/`Mod` instead,
+        // which exercises the x86 divide-by-zero and `INT_MIN / -1` guards (an
+        // immediate `0` divisor is a legal, and interesting, boundary) and the
+        // guard-free aarch64 `SDIV`/`UDIV`/`MSUB` path.
         0..=21 => {
             let wide = rng.chance(55);
             let dst = rng.reg();
-            let op = ALU_OPS[rng.below(ALU_OPS.len() as u32) as usize];
-            prog.push(Decoded::Alu {
-                wide,
-                op,
-                dst: r(dst),
-                src: Source::Imm(rng.imm()),
-            });
-            cls.alu_imm += 1;
+            if rng.chance(20) {
+                let divisor = Source::Imm(rng.imm());
+                prog.push(divmod_insn(rng, wide, dst, divisor));
+                cls.divmod += 1;
+            } else {
+                let op = ALU_OPS[rng.below(ALU_OPS.len() as u32) as usize];
+                prog.push(Decoded::Alu {
+                    wide,
+                    op,
+                    dst: r(dst),
+                    src: Source::Imm(rng.imm()),
+                });
+                cls.alu_imm += 1;
+            }
             if !wide {
                 cls.narrow += 1;
             }
         }
-        // ALU, register source.
+        // ALU, register source — likewise a fifth of the time a `Div`/`Mod`,
+        // whose register divisor is verifier-opaque and so can be zero at run
+        // time, differentiating the zero-divisor lowering against the interpreter.
         22..=39 => {
             let wide = rng.chance(55);
             let dst = rng.reg();
             let src = rng.reg();
-            let op = ALU_OPS[rng.below(ALU_OPS.len() as u32) as usize];
-            prog.push(Decoded::Alu {
-                wide,
-                op,
-                dst: r(dst),
-                src: Source::Reg(r(src)),
-            });
+            if rng.chance(20) {
+                prog.push(divmod_insn(rng, wide, dst, Source::Reg(r(src))));
+                cls.divmod += 1;
+            } else {
+                let op = ALU_OPS[rng.below(ALU_OPS.len() as u32) as usize];
+                prog.push(Decoded::Alu {
+                    wide,
+                    op,
+                    dst: r(dst),
+                    src: Source::Reg(r(src)),
+                });
+                cls.alu_reg += 1;
+            }
             opaque[dst as usize] |= opaque[src as usize];
-            cls.alu_reg += 1;
             if !wide {
                 cls.narrow += 1;
             }
@@ -963,7 +1002,7 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         pct(t.compiled, t.generated)
     );
     note!(
-        "bpf-fuzz: classes alu_i={} alu_r={} neg={} mov={} st={} ld={} ctx={} call={} fwd={} back={} ja={} 32bit={} narrowmem={} movsx={} bswap={}",
+        "bpf-fuzz: classes alu_i={} alu_r={} neg={} mov={} st={} ld={} ctx={} call={} fwd={} back={} ja={} 32bit={} narrowmem={} movsx={} bswap={} divmod={}",
         cls.alu_imm,
         cls.alu_reg,
         cls.neg,
@@ -978,7 +1017,8 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         cls.narrow,
         cls.narrow_mem,
         cls.movsx,
-        cls.byteswap
+        cls.byteswap,
+        cls.divmod
     );
 
     // Coverage assertions. Without these the test could stay green while the
@@ -1010,6 +1050,7 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         || cls.narrow_mem == 0
         || cls.movsx == 0
         || cls.byteswap == 0
+        || cls.divmod == 0
     {
         return TestResult::Fail("the generator stopped covering a class it claims to cover");
     }
@@ -1378,29 +1419,46 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
     }
     let cases: [(&str, Vec<Decoded>); 2] = [
         (
-            "div",
+            "atomic-add",
             alloc::vec![
-                super::mov_imm(0, 100),
                 super::mov_imm(1, 7),
-                Decoded::Div {
-                    wide: true,
-                    signed: false,
-                    dst: r(0),
-                    src: Source::Reg(r(1)),
+                Decoded::Store {
+                    size: Size::Dw,
+                    dst: r(10),
+                    off: -8,
+                    src: Source::Imm(0),
                 },
+                Decoded::Atomic {
+                    size: Size::Dw,
+                    op: AtomicOp::Add { fetch: false },
+                    dst: r(10),
+                    src: r(1),
+                    off: -8,
+                },
+                // R0 must be defined at exit, or the verifier rejects the probe
+                // before it can be evidence about the backends.
+                super::mov_imm(0, 0),
                 Decoded::Exit,
             ],
         ),
         (
-            "mod",
+            "atomic-xchg",
             alloc::vec![
-                super::mov_imm(0, 100),
-                Decoded::Mod {
-                    wide: true,
-                    signed: false,
-                    dst: r(0),
-                    src: Source::Imm(7),
+                super::mov_imm(1, 7),
+                Decoded::Store {
+                    size: Size::Dw,
+                    dst: r(10),
+                    off: -8,
+                    src: Source::Imm(0),
                 },
+                Decoded::Atomic {
+                    size: Size::Dw,
+                    op: AtomicOp::Xchg,
+                    dst: r(10),
+                    src: r(1),
+                    off: -8,
+                },
+                super::mov_imm(0, 0),
                 Decoded::Exit,
             ],
         ),

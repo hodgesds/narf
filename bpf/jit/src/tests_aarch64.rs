@@ -540,6 +540,53 @@ fn a64_golden_movsx_and_byteswap() {
 }
 
 #[test]
+fn a64_golden_div_and_mod() {
+    // aarch64 division needs no guards — divide-by-zero yields zero and
+    // `INT_MIN / -1` the wrapping `INT_MIN`, both trap-free — so `div` is a lone
+    // `SDIV`/`UDIV` and `mod` is a divide into the ADDR scratch followed by an
+    // `MSUB`. The quotient lands in ADDR (x17), not IMM (x16), so an immediate
+    // divisor materialised into IMM survives to the MSUB.
+    a64_body(
+        &[
+            Decoded::Div {
+                wide: true,
+                signed: false,
+                dst: r(0),
+                src: Source::Reg(r(1)),
+            },
+            Decoded::Div {
+                wide: true,
+                signed: true,
+                dst: r(6),
+                src: Source::Reg(r(7)),
+            },
+            Decoded::Mod {
+                wide: true,
+                signed: false,
+                dst: r(0),
+                src: Source::Reg(r(1)),
+            },
+            Decoded::Mod {
+                wide: false,
+                signed: true,
+                dst: r(2),
+                src: Source::Reg(r(3)),
+            },
+            EXIT,
+        ],
+        &[
+            0x9ac1_0800, // udiv x0, x0, x1
+            0x9ad4_0e73, // sdiv x19, x19, x20   (R6, R7)
+            0x9ac1_0811, // udiv x17, x0, x1
+            0x9b01_8220, // msub x0, x17, x1, x0
+            0x1ac3_0c51, // sdiv w17, w2, w3
+            0x1b03_8a22, // msub w2, w17, w3, w2
+            0x1400_0001,
+        ],
+    );
+}
+
+#[test]
 fn a64_golden_far_displacement_folds_into_the_address_register() {
     // `LDUR`'s `simm9` reaches ±256. Beyond that the displacement is folded
     // into `x17` and the access uses a zero displacement — reusing the one
@@ -844,7 +891,7 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
     // moment it gains an encoding, which is how the x86-64 suite's
     // "unsupported" test came to be pointed at multiply after multiply started
     // being emitted.
-    let cases: [(&str, Decoded); 4] = [
+    let cases: [(&str, Decoded); 2] = [
         (
             "atomic",
             Decoded::Atomic {
@@ -853,24 +900,6 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
                 dst: r(10),
                 src: r(0),
                 off: -8,
-            },
-        ),
-        (
-            "div",
-            Decoded::Div {
-                wide: true,
-                signed: false,
-                dst: r(0),
-                src: Source::Reg(r(1)),
-            },
-        ),
-        (
-            "mod",
-            Decoded::Mod {
-                wide: true,
-                signed: false,
-                dst: r(0),
-                src: Source::Reg(r(1)),
             },
         ),
         (
@@ -1262,6 +1291,88 @@ fn bpf_reference(items: &[Decoded], mut fuel: u64, mem: &mut Mem) -> Run {
                 reg[dst.as_usize()] = mask(v, wide);
                 pc += 1;
             }
+            Decoded::Div {
+                wide,
+                signed,
+                dst,
+                src,
+            } => {
+                // Divide-by-zero yields zero; signed division wraps on
+                // `INT_MIN / -1`. Exactly the interpreter's `div`.
+                let a = reg[dst.as_usize()];
+                let b = src_val(src, &reg);
+                let v = if wide {
+                    if signed {
+                        let (x, y) = (a as i64, b as i64);
+                        if y == 0 {
+                            0
+                        } else {
+                            x.wrapping_div(y) as u64
+                        }
+                    } else if b == 0 {
+                        0
+                    } else {
+                        a / b
+                    }
+                } else if signed {
+                    let (x, y) = (a as u32 as i32, b as u32 as i32);
+                    if y == 0 {
+                        0
+                    } else {
+                        x.wrapping_div(y) as u32 as u64
+                    }
+                } else {
+                    let (x, y) = (a as u32, b as u32);
+                    if y == 0 {
+                        0
+                    } else {
+                        u64::from(x / y)
+                    }
+                };
+                reg[dst.as_usize()] = mask(v, wide);
+                pc += 1;
+            }
+            Decoded::Mod {
+                wide,
+                signed,
+                dst,
+                src,
+            } => {
+                // Divide-by-zero leaves the dividend as the remainder; signed
+                // `INT_MIN % -1` is zero. Exactly the interpreter's `rem`.
+                let a = reg[dst.as_usize()];
+                let b = src_val(src, &reg);
+                let v = if wide {
+                    if signed {
+                        let (x, y) = (a as i64, b as i64);
+                        if y == 0 {
+                            a
+                        } else {
+                            x.wrapping_rem(y) as u64
+                        }
+                    } else if b == 0 {
+                        a
+                    } else {
+                        a % b
+                    }
+                } else if signed {
+                    let (x, y) = (a as u32 as i32, b as u32 as i32);
+                    if y == 0 {
+                        a & 0xffff_ffff
+                    } else {
+                        x.wrapping_rem(y) as u32 as u64
+                    }
+                } else {
+                    let (x, y) = (a as u32, b as u32);
+                    if y == 0 {
+                        u64::from(x)
+                    } else {
+                        u64::from(x % y)
+                    }
+                };
+                reg[dst.as_usize()] = mask(v, wide);
+                pc += 1;
+            }
             Decoded::Load {
                 size: Size::Dw,
                 sign_extend: false,
@@ -1530,6 +1641,48 @@ fn a64_execute(code: &[u8], fuel: u64, mem: Mem) -> Result<(Cpu, u64, u64), Run>
                 .read(rn, wide)
                 .wrapping_mul(cpu.read(rm, wide))
                 .wrapping_add(cpu.read(ra, wide));
+            cpu.write(rd, wide, v);
+        } else if w & 0x7fe0_8000 == 0x1b00_8000 {
+            // MSUB Rd, Rn, Rm, Ra — Rd = Ra - Rn*Rm, the remainder step of `mod`.
+            let ra = (w >> 10) & 31;
+            let v = cpu
+                .read(ra, wide)
+                .wrapping_sub(cpu.read(rn, wide).wrapping_mul(cpu.read(rm, wide)));
+            cpu.write(rd, wide, v);
+        } else if matches!(w & 0x7fe0_fc00, 0x1ac0_0800 | 0x1ac0_0c00) {
+            // UDIV / SDIV. The architecture defines divide-by-zero as zero and
+            // `INT_MIN / -1` as the wrapping `INT_MIN`, so neither traps.
+            let signed = w & 0x0000_0400 != 0;
+            let a = cpu.read(rn, wide);
+            let b = cpu.read(rm, wide);
+            let v = if wide {
+                if signed {
+                    let (x, y) = (a as i64, b as i64);
+                    if y == 0 {
+                        0
+                    } else {
+                        x.wrapping_div(y) as u64
+                    }
+                } else if b == 0 {
+                    0
+                } else {
+                    a / b
+                }
+            } else if signed {
+                let (x, y) = (a as u32 as i32, b as u32 as i32);
+                if y == 0 {
+                    0
+                } else {
+                    x.wrapping_div(y) as u32 as u64
+                }
+            } else {
+                let (x, y) = (a as u32, b as u32);
+                if y == 0 {
+                    0
+                } else {
+                    u64::from(x / y)
+                }
+            };
             cpu.write(rd, wide, v);
         } else if w & 0x7fe0_f000 == 0x1ac0_2000 {
             // LSLV / LSRV / ASRV
@@ -1824,6 +1977,45 @@ fn a64_diff_alu_sweep() {
                         ],
                         64,
                     );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a64_diff_divmod_sweep() {
+    // div and mod × signed/unsigned × both widths × immediate and register
+    // divisor × boundary operands. The zero divisor and the signed `INT_MIN / -1`
+    // overflow live in the sweep pools, so the trap-free lowering is checked
+    // against the reference at exactly the values that would fault a naive
+    // `idiv` — and, for `mod`, that the `MSUB` recovers the dividend on a zero
+    // divisor rather than the quotient's leftovers.
+    for signed in [false, true] {
+        for is_mod in [false, true] {
+            for wide in [false, true] {
+                let make = |src| {
+                    if is_mod {
+                        Decoded::Mod {
+                            wide,
+                            signed,
+                            dst: r(0),
+                            src,
+                        }
+                    } else {
+                        Decoded::Div {
+                            wide,
+                            signed,
+                            dst: r(0),
+                            src,
+                        }
+                    }
+                };
+                for &a in &SWEEP_VALS {
+                    for &b in &SWEEP_IMMS {
+                        a64_diff(&[mov(0, a), make(Source::Imm(b)), EXIT], 64);
+                        a64_diff(&[mov(0, a), mov(2, b), make(Source::Reg(r(2))), EXIT], 64);
+                    }
                 }
             }
         }
