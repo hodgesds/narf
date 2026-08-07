@@ -784,6 +784,86 @@ kernel_test_in!(
     smoke_abi_socket_read_eof_after_peer_shutdown
 );
 
+/// A server parked in `ppoll`/`epoll_wait` with an INFINITE timeout on a
+/// LISTENING AF_UNIX socket must wake within bounded time of a peer's
+/// `connect()` (a compositor's wayland-0 listener is exactly this shape).
+/// The park machinery (`park_should_block` + the readiness-generation
+/// lost-wake guard + the ~10 ms backstop) already bounds the re-scan for
+/// any event source that (a) publishes a readiness notify and (b) reports
+/// POLLIN when the re-executed scan asks again. This pins BOTH halves for
+/// the listen/accept side — the data side's equivalents are the shutdown
+/// generation check above and the eventfd `readiness_notifies` test in
+/// `tests/fd_io.rs`:
+///   1. `connect()` must bump the readiness generation (the wake channel
+///      that breaks an infinite park out of its re-park loop), and
+///   2. the same poll scan a parked poller re-executes on wake must flip
+///      the listener 0 → POLLIN once a connection is pending.
+/// Either half regressing re-opens the "listener never accepts /
+/// accepts only on an unrelated wake" class (weston no-serve).
+fn smoke_abi_socket_unix_listener_connect_wakes_parked_poller() -> TestResult {
+    with_setup(|| {
+        let srv = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-listener-wake");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("server bind failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0 {
+            return Err("server listen failed");
+        }
+
+        // pollfd { fd: srv, events: POLLIN(0x1), revents: 0 } — 8 bytes.
+        let mut pfd = [0u8; 8];
+        pfd[0..4].copy_from_slice(&(srv as i32).to_ne_bytes());
+        pfd[4..6].copy_from_slice(&0x1u16.to_ne_bytes());
+        // Negative half: an idle listener must NOT report POLLIN — a false
+        // positive here would make the parked server spin accept/EAGAIN.
+        if call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) != Some(0) {
+            return Err("idle listener reported ready before any connect");
+        }
+
+        let before = narf_net::readiness::generation();
+        let cli = open_unix_stream()?;
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("connect status")?
+            != 0
+        {
+            return Err("client connect failed");
+        }
+        // Half 1: the wake channel. Without this bump a poller parked with
+        // an infinite timeout only ever re-scans off the 10 ms backstop —
+        // and before that backstop existed, never.
+        if narf_net::readiness::generation() <= before {
+            return Err("connect() did not publish a readiness wake for a parked listener");
+        }
+        // Half 2: the re-scan's answer. poll(timeout=0) runs the same
+        // `poll_scan` a woken parked poller re-executes.
+        pfd[6..8].copy_from_slice(&0u16.to_ne_bytes()); // clear revents
+        match call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) {
+            Some(1) if u16::from_ne_bytes(pfd[6..8].try_into().unwrap()) & 0x1 != 0 => {}
+            _ => return Err("pending connection did not make the listener POLLIN"),
+        }
+        // And the accept the woken server then issues must deliver it.
+        let conn = call(Syscall::SocketAccept.raw(), a0(srv)).ok_or("accept status")?;
+        if conn < 0 {
+            return Err("accept() after the poll wake did not return a connection fd");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_listener_connect_wakes_parked_poller
+);
+
 // ─────────────────────────── SocketShutdown ───────────────────────────
 
 fn smoke_abi_socket_shutdown_pos() -> TestResult {
