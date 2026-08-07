@@ -77,11 +77,28 @@ impl SignalFdFile {
 }
 
 impl FileOps for SignalFdFile {
+    /// A signalfd with nothing pending must WAIT, never report end-of-file.
+    ///
+    /// The old comment below called `Ok(0)` an "EAGAIN shape" — but a bare
+    /// 0 is NOT EAGAIN at the syscall boundary, it is EOF, and userspace
+    /// reads it as the signal channel having hung up. These opt-ins are what
+    /// make `sys_read` actually produce EAGAIN (O_NONBLOCK) or a park
+    /// (blocking) from that same return.
+    ///
+    /// Same class as pipe / PtyMaster / uinput / EventFd / TimerFd.
+    fn nonblock_read_eagain(&self) -> bool {
+        true
+    }
+
+    /// Block while nothing in the mask is pending.
+    fn read_should_block(&self) -> bool {
+        self.pending() == 0
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let pending = self.pending();
             if pending == 0 {
-                // EAGAIN shape: short return for non-blocking caller.
                 return Ok(0);
             }
             if buf.len() < SIGNALFD_SIGINFO_LEN {

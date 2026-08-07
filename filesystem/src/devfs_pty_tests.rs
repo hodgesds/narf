@@ -940,3 +940,78 @@ kernel_test_in!(
     "filesystem/pty",
     smoke_pty_master_empty_read_is_would_block_not_eof
 );
+
+/// An empty slave read blocks — but a latched `^D` EOF still returns 0.
+///
+/// This is the one PTY case where a 0-byte read is sometimes CORRECT.
+/// Canonical mode latches `^D` as a genuine end-of-file a shell must see
+/// exactly once, so the empty case cannot simply be made to block: doing
+/// that would hang every shell at its first `^D` instead of exiting it.
+///
+/// But "no completed line yet" is NOT eof. A reader handed 0 there decides
+/// its input closed and exits — which is how an interactive shell dies the
+/// moment it starts, the slave-side twin of the blank `foot` window that
+/// `PtyMaster` caused.
+///
+/// So both halves are asserted together, because the fix is only correct if
+/// it distinguishes them:
+///   1. empty, no ^D        -> would-block (must NOT look like EOF)
+///   2. ^D latched          -> NOT would-block, and the read returns 0
+///   3. data queued         -> NOT would-block, read returns the data
+fn smoke_pty_slave_empty_blocks_but_ctrl_d_is_real_eof() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let slave_arc = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    let slave = PtySlave::new(Arc::clone(&slave_arc));
+
+    // 1. Nothing typed yet: must report would-block, not EOF.
+    if !slave.read_should_block() {
+        return TestResult::Fail(
+            "empty slave read reports EOF — a shell takes that as its input closing \
+             and exits immediately",
+        );
+    }
+
+    // 2. Master writes a complete line: data is ready, so no blocking.
+    match poll_once(master.write(0, b"hello\n")) {
+        Some(Ok(6)) => {}
+        _ => return TestResult::Fail("master write of a line failed"),
+    }
+    if slave.read_should_block() {
+        return TestResult::Fail("slave still reports would-block with a line queued");
+    }
+    let mut buf = [0u8; 32];
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(n)) if n == 6 && &buf[..n] == b"hello\n" => {}
+        _ => return TestResult::Fail("slave read did not return the queued line"),
+    }
+
+    // Drained again -> back to would-block.
+    if !slave.read_should_block() {
+        return TestResult::Fail("drained slave reports EOF instead of would-block");
+    }
+
+    // 3. ^D (EOT, 0x04) latches a REAL eof: must stop blocking and read 0.
+    match poll_once(master.write(0, b"\x04")) {
+        Some(Ok(1)) => {}
+        _ => return TestResult::Fail("master write of ^D failed"),
+    }
+    if slave.read_should_block() {
+        return TestResult::Fail(
+            "^D latched but the slave still blocks — the shell would never see its EOF",
+        );
+    }
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(0)) => {}
+        _ => return TestResult::Fail("^D did not produce a 0-byte end-of-file read"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_slave_empty_blocks_but_ctrl_d_is_real_eof
+);

@@ -620,3 +620,76 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_fdio2_os_release_missing_is_enoent_not_ebadf
 );
+
+/// eventfd / timerfd with nothing pending must WAIT, never report EOF.
+///
+/// `read() == 0` means hangup. Both of these returned a bare 0 when empty:
+///
+///   EventFd::read  -> Ok(0) when the counter is 0
+///   TimerFd::read  -> Ok(0) with no expirations, carrying the comment
+///                     "libc loops until non-zero" — which described the
+///                     SYMPTOM as if it were the contract. A caller handed 0
+///                     has nothing to wait on, so it re-reads at once and
+///                     BURNS CPU. That is a busy-spin the kernel inflicts on
+///                     userspace.
+///
+/// These are the wakeup and timing primitives under every Qt/GLib event
+/// loop, so a phantom EOF here is not a corner case — it is the shape of a
+/// desktop session spinning at 100% and never settling.
+///
+/// Asserted on the opt-ins rather than the read's return value: the `Ok(0)`
+/// is correct at the FileOps layer; `sys_read` is what turns it into a park
+/// or an EAGAIN, and only when these are declared. Both directions are
+/// checked, since a version that always blocked would hang instead.
+fn smoke_io_mux_empty_reads_are_not_eof() -> TestResult {
+    use crate::io_mux::{EventFd, TimerFd};
+    use narf_filesystem::FileOps;
+
+    // ---- eventfd: counter starts at 0 ----
+    let efd = EventFd::new(0, 0);
+    if !efd.nonblock_read_eagain() {
+        return TestResult::Fail("eventfd does not opt into EAGAIN-on-empty");
+    }
+    if !efd.read_should_block() {
+        return TestResult::Fail(
+            "eventfd with counter 0 reports EOF — an event loop takes that as its \
+             wakeup channel closing",
+        );
+    }
+    // A pending value must clear the block, or a woken reader parks forever.
+    let mut eight = [0u8; 8];
+    eight.copy_from_slice(&1u64.to_le_bytes());
+    {
+        // Minimal local pump: these ops complete without yielding.
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn nop(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VT)
+        }
+        static VT: RawWakerVTable = RawWakerVTable::new(clone, nop, nop, nop);
+        let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+        let mut cx = Context::from_waker(&w);
+        let mut fut = efd.write(0, &eight);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(8)) => {}
+            _ => return TestResult::Fail("eventfd write failed"),
+        }
+    }
+    if efd.read_should_block() {
+        return TestResult::Fail("eventfd still reports would-block with a value pending");
+    }
+
+    // ---- timerfd: never armed, so no expirations ----
+    let tfd = TimerFd::new();
+    if !tfd.nonblock_read_eagain() {
+        return TestResult::Fail("timerfd does not opt into EAGAIN-on-empty");
+    }
+    if !tfd.read_should_block() {
+        return TestResult::Fail(
+            "unexpired timerfd reports EOF — the caller re-reads immediately and \
+             burns CPU (the 'libc loops until non-zero' spin)",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_io_mux_empty_reads_are_not_eof);

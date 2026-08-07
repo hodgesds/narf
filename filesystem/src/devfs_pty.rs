@@ -1150,6 +1150,31 @@ impl FileOps for PtySlave {
         Box::pin(async move { Ok(n) })
     }
 
+    /// An empty slave read must WAIT — unless a `^D` EOF is latched.
+    ///
+    /// This is the one PTY case where a 0-byte read is sometimes CORRECT:
+    /// canonical mode latches `^D` as a genuine end-of-file that a shell
+    /// must see exactly once. But "no completed line yet" is NOT eof — a
+    /// reader handed 0 there concludes its input closed and exits, which is
+    /// how an interactive shell dies the instant it starts.
+    ///
+    /// `LineState::would_block()` already draws exactly that line ("no
+    /// completed input buffered AND no ^D pending"), so blocking is gated on
+    /// it rather than on `readable() == 0`. A latched EOF therefore still
+    /// returns 0 and is consumed by `take_eof()` above.
+    ///
+    /// Same class as pipe / PtyMaster / uinput / EventFd / TimerFd /
+    /// SignalFd, but the only one that must preserve a real EOF.
+    fn read_should_block(&self) -> bool {
+        self.pty.input.lock().would_block()
+    }
+
+    /// libc readers of a slave opened O_NONBLOCK expect EAGAIN on an empty
+    /// queue, not a phantom EOF. Gated the same way, so `^D` still lands.
+    fn nonblock_read_eagain(&self) -> bool {
+        self.pty.input.lock().would_block()
+    }
+
     /// Write bytes; with ECHO on, also copies them to `slave_tx_to_master`
     /// so the master "sees" what the slave wrote.
     ///

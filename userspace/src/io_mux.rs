@@ -149,6 +149,30 @@ impl FileOps for EventFd {
 
     /// eventfd `write` fires `readiness::notify` (above), so a blocking poll
     /// over an eventfd can PARK instead of busy-spinning — the write wakes it.
+    /// An empty eventfd read must WAIT, never report end-of-file.
+    ///
+    /// `read()` on an eventfd whose counter is 0 blocks on Linux, or returns
+    /// EAGAIN on an O_NONBLOCK fd. It NEVER returns 0 — `read() == 0` means
+    /// hangup, and eventfd is the wakeup primitive under every Qt/GLib event
+    /// loop, so a phantom EOF there makes the loop treat its own wakeup
+    /// channel as dead.
+    ///
+    /// The read op still returns `Ok(0)` on an empty counter; these two
+    /// opt-ins are what `sys_read` consults to turn that into a park or an
+    /// EAGAIN. Fourth instance of this class in the tree, after the pipe
+    /// (broke GLib's dbus line-read), PtyMaster (blank foot terminal) and
+    /// /dev/uinput.
+    fn nonblock_read_eagain(&self) -> bool {
+        true
+    }
+
+    /// Blocking readers park while the counter is 0 rather than seeing EOF.
+    /// False once a value is pending, so a woken reader proceeds instead of
+    /// parking again.
+    fn read_should_block(&self) -> bool {
+        self.counter.load(Ordering::Acquire) == 0
+    }
+
     fn readiness_notifies(&self) -> bool {
         true
     }
@@ -263,12 +287,37 @@ impl TimerFd {
 }
 
 impl FileOps for TimerFd {
+    /// An unexpired timerfd read must WAIT, never report end-of-file.
+    ///
+    /// Linux blocks a `read()` on a timerfd with no expirations, or returns
+    /// EAGAIN on an O_NONBLOCK fd. It never returns 0 — `read() == 0` means
+    /// hangup. The old comment here ("libc loops until non-zero") described
+    /// the SYMPTOM as if it were the contract: a caller handed a 0 has
+    /// nothing to wait on, so it re-reads immediately and BURNS CPU. That is
+    /// a busy-spin the kernel is inflicting on userspace, not libc's design.
+    ///
+    /// `sys_read` turns the `Ok(0)` below into a park or an EAGAIN once
+    /// these opt-ins are declared. Same class as the pipe (broke GLib's dbus
+    /// line-read), PtyMaster (blank foot terminal), /dev/uinput and EventFd.
+    fn nonblock_read_eagain(&self) -> bool {
+        true
+    }
+
+    /// Block while no expiration is pending; stop blocking the moment one
+    /// is, so a woken reader makes progress instead of parking again.
+    /// `tick()` first, so an already-elapsed deadline counts as ready rather
+    /// than parking a reader that should have been woken.
+    fn read_should_block(&self) -> bool {
+        self.tick();
+        self.state.lock().expirations == 0
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             self.tick();
             let mut s = self.state.lock();
             if s.expirations == 0 {
-                return Ok(0); // libc loops until non-zero
+                return Ok(0);
             }
             if buf.len() < 8 {
                 return Err(FsError::InvalidPath);
@@ -356,6 +405,24 @@ impl SignalFd {
 }
 
 impl FileOps for SignalFd {
+    /// A signalfd with nothing pending must WAIT, never report end-of-file.
+    ///
+    /// Linux blocks a `read()` on a signalfd with no pending signal in its
+    /// mask, or returns EAGAIN on an O_NONBLOCK fd; 0 would mean hangup.
+    /// Handing back 0 makes a signal-driven loop treat its own signal
+    /// channel as closed — and a caller that retries instead burns CPU.
+    ///
+    /// Same class as pipe / PtyMaster / uinput / EventFd / TimerFd.
+    fn nonblock_read_eagain(&self) -> bool {
+        true
+    }
+
+    /// Block while the pending set is empty; ready as soon as a signal in
+    /// the mask arrives.
+    fn read_should_block(&self) -> bool {
+        self.pending_in_mask() == 0
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let pending = self.pending_in_mask();

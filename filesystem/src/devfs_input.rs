@@ -710,11 +710,43 @@ impl FileOps for UinputControlFile {
         })
     }
 
-    /// The control file is write-only from userspace's perspective; reads
-    /// return 0 (Linux uinput supports reading FF requests, which NARF does
-    /// not synthesise, so EOF is the safe answer).
+    /// Reads drain pending force-feedback requests. NARF never synthesises
+    /// any, so this always comes back empty — but "empty" must NOT be
+    /// reported as a 0-byte read.
+    ///
+    /// `read() == 0` on a character device means END OF FILE: the reader
+    /// concludes the device went away and stops. Linux's uinput blocks an
+    /// empty read (or returns EAGAIN on an O_NONBLOCK fd) and only ever
+    /// returns 0 at a genuine hangup. The old comment here called EOF "the
+    /// safe answer"; it is the opposite — it is a phantom hangup, exactly
+    /// the bug that left the `foot` terminal blank when PtyMaster::read
+    /// returned 0 on an empty ring, and that broke GLib's dbus line-read
+    /// when a pipe did the same.
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Ok(0) })
+    }
+
+    /// An O_NONBLOCK reader must get EAGAIN, not a phantom EOF. `sys_read`
+    /// turns a 0-byte result into EAGAIN when this is set, which is what an
+    /// FF-aware client polling the control fd expects.
+    fn nonblock_read_eagain(&self) -> bool {
+        true
+    }
+
+    /// A BLOCKING reader parks instead of seeing EOF — Linux semantics: an
+    /// empty uinput read waits for an FF request rather than reporting the
+    /// device closed.
+    ///
+    /// Note the practical consequence, deliberately accepted: since NARF
+    /// synthesises no FF requests, a blocking reader now waits forever
+    /// where it previously got an immediate spurious EOF. That matches
+    /// Linux — on a real kernel the wait is equally unbounded until a
+    /// client uploads an effect — and a program that blocking-reads uinput
+    /// without poll() is already misusing it. Reporting a hangup that did
+    /// not happen is the worse failure: it makes the reader tear the device
+    /// down.
+    fn read_should_block(&self) -> bool {
+        true
     }
 
     /// Stat: character device, mode 0660 (matches `/dev/uinput` on Linux,

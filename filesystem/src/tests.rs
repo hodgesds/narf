@@ -5618,3 +5618,56 @@ fn smoke_devfs_console_vt_kd_probes_degrade() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_devfs_console_vt_kd_probes_degrade);
+
+/// An empty `/dev/uinput` read must NOT report end-of-file.
+///
+/// `read() == 0` on a character device means the device hung up. The control
+/// file previously returned `Ok(0)` unconditionally, with a comment calling
+/// EOF "the safe answer" — it is the opposite. A reader takes it as the
+/// device going away and tears it down.
+///
+/// Linux's uinput read drains pending force-feedback requests; with none
+/// pending it BLOCKS, or returns EAGAIN on an O_NONBLOCK fd. It returns 0
+/// only at a real hangup.
+///
+/// This is the third instance of this bug class in this tree: PtyMaster::read
+/// returning 0 on an empty ring left the `foot` terminal blank (the terminal
+/// concluded its shell had exited), and the same phantom 0 on a pipe broke
+/// GLib's dbus line-read ("Unexpected lack of content trying to read a
+/// line"). The kernel already carries both remedies — `nonblock_read_eagain`
+/// for O_NONBLOCK callers and `read_should_block` to park a blocking one —
+/// and uinput simply declared neither, inheriting the `false` defaults.
+///
+/// Both flags are asserted rather than the read's return value, because the
+/// 0 itself is correct at the FileOps layer: it is `sys_read` that turns it
+/// into EAGAIN or a park, and only if these opt-ins are set.
+fn smoke_dev_uinput_empty_read_is_not_eof() -> TestResult {
+    use crate::devfs_input::UinputControlFile;
+    use crate::FileOps;
+
+    let file = UinputControlFile::new();
+
+    if !file.nonblock_read_eagain() {
+        return TestResult::Fail(
+            "uinput does not opt into EAGAIN-on-empty; an O_NONBLOCK reader gets a \
+             phantom EOF and tears the device down",
+        );
+    }
+    if !file.read_should_block() {
+        return TestResult::Fail(
+            "uinput does not opt into blocking-on-empty; a blocking reader gets a \
+             phantom EOF instead of waiting for an FF request",
+        );
+    }
+
+    // The raw op still returns 0 bytes — that is the layer `sys_read`
+    // translates. Asserting it keeps the two halves honest: if this ever
+    // starts returning an error instead, the flags above would be wrong.
+    let mut buf = [0u8; 32];
+    match poll_once_devfs_input(file.read(0, &mut buf)) {
+        Some(Ok(0)) => TestResult::Pass,
+        Some(Ok(_)) => TestResult::Fail("uinput read returned bytes NARF never synthesises"),
+        _ => TestResult::Fail("uinput read did not complete"),
+    }
+}
+kernel_test_in!("filesystem", smoke_dev_uinput_empty_read_is_not_eof);
