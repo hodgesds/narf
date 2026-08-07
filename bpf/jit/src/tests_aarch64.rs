@@ -452,6 +452,39 @@ fn a64_golden_store_immediate() {
 }
 
 #[test]
+fn a64_golden_narrower_store_and_sign_extending_load() {
+    // *(u32*)(r10-8) = r0 ; r1 = *(s8*)(r10-8)
+    //
+    // The width rides the `[31:30]` size field of the same unscaled encoding —
+    // `size=10` for the word store — and a sign-extending load switches the
+    // `[23:22]` opc to `10`, which extends to the full 64-bit register to match
+    // the interpreter's `widen`.
+    a64_body(
+        &[
+            Decoded::Store {
+                size: Size::W,
+                dst: r(10),
+                off: -8,
+                src: Source::Reg(r(0)),
+            },
+            Decoded::Load {
+                size: Size::B,
+                sign_extend: true,
+                dst: r(1),
+                src: r(10),
+                off: -8,
+            },
+            EXIT,
+        ],
+        &[
+            0xb81f_8320, // stur  w0, [x25, #-8]   (size=10)
+            0x389f_8321, // ldursb x1, [x25, #-8]  (size=00, opc=10)
+            0x1400_0001,
+        ],
+    );
+}
+
+#[test]
 fn a64_golden_far_displacement_folds_into_the_address_register() {
     // `LDUR`'s `simm9` reaches ±256. Beyond that the displacement is folded
     // into `x17` and the access uses a zero displacement — reusing the one
@@ -756,7 +789,7 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
     // moment it gains an encoding, which is how the x86-64 suite's
     // "unsupported" test came to be pointed at multiply after multiply started
     // being emitted.
-    let cases: [(&str, Decoded); 8] = [
+    let cases: [(&str, Decoded); 6] = [
         (
             "atomic",
             Decoded::Atomic {
@@ -807,25 +840,6 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
             Decoded::LoadImm64 {
                 dst: r(0),
                 value: narf_bpf_isa::Imm64::Value(1),
-            },
-        ),
-        (
-            "byte load",
-            Decoded::Load {
-                size: Size::B,
-                sign_extend: false,
-                dst: r(0),
-                src: r(10),
-                off: -8,
-            },
-        ),
-        (
-            "word store",
-            Decoded::Store {
-                size: Size::W,
-                dst: r(10),
-                off: -8,
-                src: Source::Reg(r(0)),
             },
         ),
     ];
@@ -1037,16 +1051,18 @@ fn a64_a_non_arena_access_keeps_the_plain_shape() {
 }
 
 #[test]
-fn a64_an_arena_access_the_emitter_cannot_shape_is_refused() {
+fn a64_an_arena_atomic_the_emitter_cannot_shape_is_refused() {
     // Fail-closed, and specifically not by falling through to the plain
-    // lowering — which would be a bare dereference of a handle.
+    // lowering — which would be a bare dereference of a handle. Narrower loads
+    // and stores are emitted now; an atomic still has no arena shape.
     let prog = crate::tests::verified_arena(
         &[
-            Decoded::Store {
-                size: Size::W,
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: narf_bpf_isa::AtomicOp::Add { fetch: false },
                 dst: r(1),
+                src: r(0),
                 off: 8,
-                src: Source::Imm(1),
             },
             mov(0, 0),
             EXIT,

@@ -177,11 +177,33 @@ impl Emit {
     fn bs(&mut self, xs: &[u8]) {
         self.buf.extend_from_slice(xs);
     }
+    fn d16(&mut self, x: i16) {
+        self.bs(&x.to_le_bytes());
+    }
     fn d32(&mut self, x: i32) {
         self.bs(&x.to_le_bytes());
     }
     fn d64(&mut self, x: i64) {
         self.bs(&x.to_le_bytes());
+    }
+
+    /// A REX prefix like [`Emit::rex`], but emitted even when it would be the
+    /// bare `0x40` — which a byte store of `spl`/`bpl`/`sil`/`dil` requires to
+    /// name the low byte rather than `ah`/`ch`/`dh`/`bh`.
+    fn rex_forced(&mut self, w: bool, reg: u8, rm: u8, force: bool) {
+        let mut v = 0x40;
+        if w {
+            v |= 0x08;
+        }
+        if reg >= 8 {
+            v |= 0x04;
+        }
+        if rm >= 8 {
+            v |= 0x01;
+        }
+        if v != 0x40 || force {
+            self.b(v);
+        }
     }
 
     /// REX prefix. `w` selects 64-bit operand size; `r`/`b` extend the ModRM
@@ -808,6 +830,109 @@ fn emit_arena_addr(e: &mut Emit, handle: u8, off: i16) {
     }
 }
 
+/// The prefix + opcode of a memory load of `size` into host register `reg`,
+/// addressed through a base whose extension bit `rm` supplies. The caller emits
+/// the ModRM (and any SIB / displacement) next. Zero-extends when `sign_extend`
+/// is false and sign-extends to 64 bits otherwise — matching the interpreter's
+/// `widen`, which always produces a full-width register value.
+fn load_prefix_opcode(e: &mut Emit, size: Size, sign_extend: bool, reg: u8, rm: u8) {
+    match (size, sign_extend) {
+        // `movzx r32, r/m8|16` — the 32-bit destination zero-extends to 64.
+        (Size::B, false) => {
+            e.rex(false, reg, rm);
+            e.bs(&[0x0F, 0xB6]);
+        }
+        (Size::H, false) => {
+            e.rex(false, reg, rm);
+            e.bs(&[0x0F, 0xB7]);
+        }
+        // `mov r32, r/m32` — a 32-bit load likewise zero-extends the upper half.
+        (Size::W, false) => {
+            e.rex(false, reg, rm);
+            e.b(0x8B);
+        }
+        // `mov r64, r/m64`. A sign-extending doubleword load is a no-op widen,
+        // so it takes this same plain form.
+        (Size::Dw, _) => {
+            e.rex(true, reg, rm);
+            e.b(0x8B);
+        }
+        // `movsx r64, r/m8|16` and `movsxd r64, r/m32`.
+        (Size::B, true) => {
+            e.rex(true, reg, rm);
+            e.bs(&[0x0F, 0xBE]);
+        }
+        (Size::H, true) => {
+            e.rex(true, reg, rm);
+            e.bs(&[0x0F, 0xBF]);
+        }
+        (Size::W, true) => {
+            e.rex(true, reg, rm);
+            e.b(0x63);
+        }
+    }
+}
+
+/// The prefix + opcode of a register→memory store of `size` from host register
+/// `reg`. `0x66` gives the 16-bit operand size; a byte store forces a REX so it
+/// can reach the low byte of `rsi`/`rdi`/`rbp` (which R2/R1/R10 map to).
+fn store_reg_prefix_opcode(e: &mut Emit, size: Size, reg: u8, rm: u8) {
+    match size {
+        Size::B => {
+            e.rex_forced(false, reg, rm, matches!(reg, 4..=7));
+            e.b(0x88);
+        }
+        Size::H => {
+            e.b(0x66);
+            e.rex(false, reg, rm);
+            e.b(0x89);
+        }
+        Size::W => {
+            e.rex(false, reg, rm);
+            e.b(0x89);
+        }
+        Size::Dw => {
+            e.rex(true, reg, rm);
+            e.b(0x89);
+        }
+    }
+}
+
+/// The prefix + opcode of an immediate→memory store of `size` (`C6`/`C7 /0`).
+/// The caller emits the ModRM (reg field 0) and then the immediate through
+/// [`store_imm_tail`].
+fn store_imm_prefix_opcode(e: &mut Emit, size: Size, rm: u8) {
+    match size {
+        Size::B => {
+            e.rex(false, 0, rm);
+            e.b(0xC6);
+        }
+        Size::H => {
+            e.b(0x66);
+            e.rex(false, 0, rm);
+            e.b(0xC7);
+        }
+        Size::W => {
+            e.rex(false, 0, rm);
+            e.b(0xC7);
+        }
+        Size::Dw => {
+            e.rex(true, 0, rm);
+            e.b(0xC7);
+        }
+    }
+}
+
+/// The immediate tail of a `C6`/`C7` store: 1/2/4 bytes by width. A doubleword
+/// store carries an `imm32` the REX.W sign-extends, matching BPF's `ST`.
+fn store_imm_tail(e: &mut Emit, size: Size, v: i32) {
+    match size {
+        Size::B => e.b(v as u8),
+        Size::H => e.d16(v as i16),
+        Size::W | Size::Dw => e.d32(v),
+    }
+}
+
 fn emit_insn(
     e: &mut Emit,
     insn: &Decoded,
@@ -823,56 +948,52 @@ fn emit_insn(
     if arena {
         match *insn {
             Decoded::Load {
-                size: Size::Dw,
-                sign_extend: false,
+                size,
+                sign_extend,
                 dst,
                 src,
                 off,
             } => {
                 emit_arena_addr(e, host(src), off);
                 let fault_off = e.len();
-                e.rex(true, host(dst), hr::R11);
-                e.b(0x8B);
+                load_prefix_opcode(e, size, sign_extend, host(dst), hr::R11);
                 e.modrm_sib_index(host(dst), hr::R11, hr::RCX);
                 record_fault(e, fault_off);
                 return Ok(());
             }
             Decoded::Store {
-                size: Size::Dw,
+                size,
                 dst,
                 off,
                 src: Source::Reg(s),
             } => {
                 emit_arena_addr(e, host(dst), off);
                 let fault_off = e.len();
-                e.rex(true, host(s), hr::R11);
-                e.b(0x89);
+                store_reg_prefix_opcode(e, size, host(s), hr::R11);
                 e.modrm_sib_index(host(s), hr::R11, hr::RCX);
                 record_fault(e, fault_off);
                 return Ok(());
             }
             Decoded::Store {
-                size: Size::Dw,
+                size,
                 dst,
                 off,
                 src: Source::Imm(v),
             } => {
                 emit_arena_addr(e, host(dst), off);
                 let fault_off = e.len();
-                e.rex(true, 0, hr::R11);
-                e.b(0xC7);
+                store_imm_prefix_opcode(e, size, hr::R11);
                 e.modrm_sib_index(0, hr::R11, hr::RCX);
-                e.d32(v);
+                store_imm_tail(e, size, v);
                 record_fault(e, fault_off);
                 return Ok(());
             }
-            // An arena atomic, an arena access of any narrower width, or a
-            // sign-extending one. Refused rather than lowered as a *non*-arena
+            // An arena atomic. Refused rather than lowered as a *non*-arena
             // access, which is the failure this whole branch exists to prevent.
             _ => {
                 return Err(JitError::Unsupported {
                     at,
-                    what: "arena access shape not yet emitted by the x86_64 backend",
+                    what: "arena atomic not yet emitted by the x86_64 backend",
                 })
             }
         }
@@ -939,42 +1060,41 @@ fn emit_insn(
         }
 
         Decoded::Load {
-            size: Size::Dw,
-            sign_extend: false,
+            size,
+            sign_extend,
             dst,
             src,
             off,
         } => {
-            // `mov r64, [base + disp]`
-            e.rex(true, host(dst), host(src));
-            e.b(0x8B);
+            // `mov`/`movzx`/`movsx` r, [base + disp] — width and extension in
+            // the opcode.
+            load_prefix_opcode(e, size, sign_extend, host(dst), host(src));
             e.modrm_mem(host(dst), host(src), i32::from(off));
         }
 
         Decoded::Store {
-            size: Size::Dw,
+            size,
             dst,
             off,
             src: Source::Reg(s),
         } => {
-            e.rex(true, host(s), host(dst));
-            e.b(0x89);
+            store_reg_prefix_opcode(e, size, host(s), host(dst));
             e.modrm_mem(host(s), host(dst), i32::from(off));
         }
 
         Decoded::Store {
-            size: Size::Dw,
+            size,
             dst,
             off,
             src: Source::Imm(v),
         } => {
-            // `mov qword [base + disp], imm32` — C7 /0. The immediate is
-            // sign-extended to 64 bits by REX.W, which matches BPF's `ST`
-            // semantics (the interpreter does `imm as i64 as u64`).
-            e.rex(true, 0, host(dst));
-            e.b(0xC7);
+            // `mov [base + disp], imm` — C6/C7 /0. A doubleword's imm32 is
+            // sign-extended to 64 bits by REX.W; narrower widths carry a
+            // truncated immediate. Both match BPF's `ST` (`imm as i64 as u64`
+            // then a `size`-byte store).
+            store_imm_prefix_opcode(e, size, host(dst));
             e.modrm_mem(0, host(dst), i32::from(off));
-            e.d32(v);
+            store_imm_tail(e, size, v);
         }
 
         Decoded::Jump { off } => {

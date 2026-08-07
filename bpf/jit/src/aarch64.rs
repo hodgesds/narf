@@ -302,6 +302,54 @@ const fn stur(rt: u8, rn: u8, simm9: i32) -> u32 {
     0xF800_0000 | (((simm9 as u32) & 0x1FF) << 12) | ((rn as u32) << 5) | rt as u32
 }
 
+/// A load/store unscaled-immediate (`LDUR*`/`STUR*`) of any width.
+///
+/// `size2` is the width in the `[31:30]` field (0=byte, 1=half, 2=word,
+/// 3=doubleword) and `opc2` is the `[23:22]` field — `0b00` store, `0b01`
+/// zero-extending load, `0b10` load sign-extending to 64 bits. [`ldur`] and
+/// [`stur`] are the `size2 = 3` cases of this, kept as their own names because
+/// the doubleword forms are on every non-widened path.
+#[inline]
+const fn ldst_unscaled(size2: u32, opc2: u32, rt: u8, rn: u8, simm9: i32) -> u32 {
+    0x3800_0000
+        | (size2 << 30)
+        | (opc2 << 22)
+        | (((simm9 as u32) & 0x1FF) << 12)
+        | ((rn as u32) << 5)
+        | rt as u32
+}
+
+/// The `[31:30]` width field for a BPF access size.
+#[inline]
+const fn size_field(size: Size) -> u32 {
+    match size {
+        Size::B => 0,
+        Size::H => 1,
+        Size::W => 2,
+        Size::Dw => 3,
+    }
+}
+
+/// `LDUR*` of `size` into `rt`, zero- or sign-extending to a full 64-bit
+/// register to match the interpreter's `widen`.
+#[inline]
+const fn ldur_sized(size: Size, sign_extend: bool, rt: u8, rn: u8, simm9: i32) -> u32 {
+    // opc `0b10` sign-extends to the 64-bit register; `0b01` zero-extends. A
+    // doubleword fills the register either way, so it always takes `0b01`.
+    let opc = if sign_extend && !matches!(size, Size::Dw) {
+        0b10
+    } else {
+        0b01
+    };
+    ldst_unscaled(size_field(size), opc, rt, rn, simm9)
+}
+
+/// `STUR*` of the low `size` bytes of `rt`.
+#[inline]
+const fn stur_sized(size: Size, rt: u8, rn: u8, simm9: i32) -> u32 {
+    ldst_unscaled(size_field(size), 0b00, rt, rn, simm9)
+}
+
 /// `STP Rt, Rt2, [Rn, #imm]` with the addressing mode chosen by `base`.
 #[inline]
 const fn pair(base: u32, rt: u8, rt2: u8, rn: u8, byte_off: i32) -> u32 {
@@ -897,32 +945,32 @@ fn emit_insn(
     if arena {
         match *insn {
             Decoded::Load {
-                size: Size::Dw,
-                sign_extend: false,
+                size,
+                sign_extend,
                 dst,
                 src,
                 off,
             } => {
                 emit_arena_addr(e, host(src), off);
                 let fault_off = e.len();
-                e.w(ldur(host(dst), hr::ADDR, 0));
+                e.w(ldur_sized(size, sign_extend, host(dst), hr::ADDR, 0));
                 record_fault(e, fault_off);
                 return Ok(());
             }
             Decoded::Store {
-                size: Size::Dw,
+                size,
                 dst,
                 off,
                 src: Source::Reg(s),
             } => {
                 emit_arena_addr(e, host(dst), off);
                 let fault_off = e.len();
-                e.w(stur(host(s), hr::ADDR, 0));
+                e.w(stur_sized(size, host(s), hr::ADDR, 0));
                 record_fault(e, fault_off);
                 return Ok(());
             }
             Decoded::Store {
-                size: Size::Dw,
+                size,
                 dst,
                 off,
                 src: Source::Imm(v),
@@ -933,14 +981,15 @@ fn emit_insn(
                 emit_arena_addr(e, host(dst), off);
                 mov_imm64(e, hr::IMM, i64::from(v));
                 let fault_off = e.len();
-                e.w(stur(hr::IMM, hr::ADDR, 0));
+                e.w(stur_sized(size, hr::IMM, hr::ADDR, 0));
                 record_fault(e, fault_off);
                 return Ok(());
             }
+            // An arena atomic — no lowering yet, so it runs interpreted.
             _ => {
                 return Err(JitError::Unsupported {
                     at,
-                    what: "arena access shape not yet emitted by the aarch64 backend",
+                    what: "arena atomic not yet emitted by the aarch64 backend",
                 })
             }
         }
@@ -1026,39 +1075,39 @@ fn emit_insn(
         }
 
         Decoded::Load {
-            size: Size::Dw,
-            sign_extend: false,
+            size,
+            sign_extend,
             dst,
             src,
             off,
         } => {
             let (base, disp) = addr_operand(e, host(src), off);
-            e.w(ldur(host(dst), base, disp));
+            e.w(ldur_sized(size, sign_extend, host(dst), base, disp));
         }
 
         Decoded::Store {
-            size: Size::Dw,
+            size,
             dst,
             off,
             src: Source::Reg(s),
         } => {
             let (base, disp) = addr_operand(e, host(dst), off);
-            e.w(stur(host(s), base, disp));
+            e.w(stur_sized(size, host(s), base, disp));
         }
 
         Decoded::Store {
-            size: Size::Dw,
+            size,
             dst,
             off,
             src: Source::Imm(v),
         } => {
             // The stored value is the immediate sign-extended to 64 bits,
-            // matching the interpreter's `imm as i64 as u64`. `hr::IMM` holds
-            // the value and `hr::ADDR` the address, so the two scratch uses
-            // cannot collide.
+            // matching the interpreter's `imm as i64 as u64`; a narrower `STUR*`
+            // then keeps only the low bytes. `hr::IMM` holds the value and
+            // `hr::ADDR` the address, so the two scratch uses cannot collide.
             mov_imm64(e, hr::IMM, i64::from(v));
             let (base, disp) = addr_operand(e, host(dst), off);
-            e.w(stur(hr::IMM, base, disp));
+            e.w(stur_sized(size, hr::IMM, base, disp));
         }
 
         Decoded::Jump { off } => {

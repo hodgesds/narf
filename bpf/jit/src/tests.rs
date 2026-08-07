@@ -11,7 +11,7 @@
 //! host cannot execute the bytes it emits.
 
 use narf_bpf_isa::encode::encode;
-use narf_bpf_isa::{AluOp, CallTarget, CondOp, Decoded, Insn, Reg, Size, Source};
+use narf_bpf_isa::{AluOp, AtomicOp, CallTarget, CondOp, Decoded, Insn, Reg, Size, Source};
 use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
 use crate::{compile, JitError};
@@ -423,18 +423,140 @@ fn an_arena_load_and_a_register_store_take_the_same_shape() {
 }
 
 #[test]
-fn an_arena_access_the_emitter_cannot_shape_is_refused() {
-    // Fail-closed, and specifically *not* by falling through to the plain
-    // lowering. A word-sized arena store has no arena encoding here, and the
-    // wrong answer would be `mov dword [rsi+8], 1` — a bare dereference of a
-    // handle, which is the whole hazard.
-    let prog = verified_arena(
+fn a_narrower_arena_access_takes_the_slot_relative_shape() {
+    // A word-sized (4-byte) arena store of an immediate: the same slot-relative
+    // addressing as the doubleword form, with `C7 /0` and a 32-bit operand
+    // (no REX.W) so only four bytes are written. The wrong answer this pins
+    // against is `mov dword [rsi+8], 1` — a bare dereference of the handle.
+    let store = verified_arena(
         &[
             Decoded::Store {
                 size: Size::W,
                 dst: r(2),
-                off: 8,
+                off: 0,
                 src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&store).expect("a narrower arena store is emitted now");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..14],
+        &[
+            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x89, 0xF1, // mov ecx, esi
+            0x41, 0xC7, 0x04, 0x0B, // mov dword [r11 + rcx*1], ...  (REX.B, no REX.W)
+            0x01, 0x00, 0x00, 0x00, // imm32 = 1
+        ],
+        "a word arena store must be the slot-relative C7 /0 with a 32-bit operand"
+    );
+    assert_eq!(
+        c.faults.0.len(),
+        1,
+        "the narrower access is still a fault site"
+    );
+
+    // A byte register store from R2 (rsi): `88 /r`, storing the low byte. The
+    // REX here is `.B` for the r11 base (present on every arena access), so this
+    // pins the byte opcode; the *forced bare 0x40* that names `sil` on a
+    // low-base store is isolated by `a_byte_store_forces_a_rex_to_reach_sil`.
+    let byte_store = verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::B,
+                dst: r(1),
+                off: 0,
+                src: Source::Reg(r(2)),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&byte_store).expect("a byte arena store is emitted now");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..10],
+        &[
+            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x89, 0xF9, // mov ecx, edi  (R1 is rdi)
+            0x41, 0x88, 0x34, 0x0B, // mov byte [r11 + rcx*1], sil  (REX.B for r11)
+        ],
+        "a byte arena store must use the byte opcode with the slot-relative shape"
+    );
+}
+
+#[test]
+fn a_byte_store_forces_a_rex_to_reach_sil() {
+    // A byte store of R2 (rsi) to a low base (R10 → rbp) has no extension bit to
+    // set, so `Emit::rex` would elide the whole prefix — and `88 /r` with no REX
+    // names `dh`, not `sil`. The store must therefore force a bare `0x40`. This
+    // is the one memory-width edge with no doubleword analogue, so it earns a
+    // golden of its own rather than resting on the differential fuzzer.
+    let prog = verified(&[
+        Decoded::Store {
+            size: Size::B,
+            dst: r(10),
+            off: -8,
+            src: Source::Reg(r(2)),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..4],
+        // 40 88 75 F8 — mov byte [rbp-8], sil
+        &[0x40, 0x88, 0x75, 0xF8],
+        "a byte store of sil must force a REX prefix"
+    );
+}
+
+#[test]
+fn a_sign_extending_word_load_is_movsxd() {
+    // LDXSW: `movsxd r64, r/m32` — 48 63 /r. The other widths ride the same
+    // machinery; this pins the one whose opcode (0x63) is unique to sign
+    // extension, so a regression that dropped the sign would show here.
+    let prog = verified(&[
+        Decoded::Load {
+            size: Size::W,
+            sign_extend: true,
+            dst: r(3),
+            src: r(2),
+            off: 8,
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..4],
+        // 48 63 56 08 — movsxd rdx, dword [rsi+8]   (R3 rdx, R2 rsi)
+        &[0x48, 0x63, 0x56, 0x08],
+        "a sign-extending word load must be movsxd"
+    );
+}
+
+#[test]
+fn an_arena_atomic_the_emitter_cannot_shape_is_refused() {
+    // Fail-closed, and specifically *not* by falling through to the plain
+    // lowering. Atomics have no arena encoding here, and the wrong answer would
+    // be a bare dereference of the handle, which is the whole hazard.
+    let prog = verified_arena(
+        &[
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Add { fetch: false },
+                dst: r(2),
+                src: r(3),
+                off: 8,
             },
             mov(0, 0),
             EXIT,

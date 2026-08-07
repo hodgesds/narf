@@ -276,6 +276,11 @@ const IMM_POOL: [i32; 17] = [
 /// beyond the second so the scratch path is not only hit at its edge.
 const SLOT_OFFS: [i16; 10] = [-8, -16, -120, -128, -136, -248, -256, -264, -504, -512];
 
+/// The access widths both backends lower. Applied only at the 8-aligned
+/// [`SLOT_OFFS`], so every width is naturally aligned and stays within the
+/// doubleword phase C wrote.
+const LDST_SIZES: [Size; 4] = [Size::B, Size::H, Size::W, Size::Dw];
+
 /// The ALU operations both backends lower. `Div` and `Mod` are absent on
 /// purpose — see the module docs and
 /// [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`].
@@ -324,6 +329,7 @@ struct Classes {
     back_edge: u32,
     uncond_jump: u32,
     narrow: u32,
+    narrow_mem: u32,
 }
 
 impl Classes {
@@ -340,6 +346,7 @@ impl Classes {
         self.back_edge += o.back_edge;
         self.uncond_jump += o.uncond_jump;
         self.narrow += o.narrow;
+        self.narrow_mem += o.narrow_mem;
     }
 }
 
@@ -631,30 +638,40 @@ fn emit_unit(
                 cls.narrow += 1;
             }
         }
-        // Stack store.
+        // Stack store. Every `SLOT_OFFS` entry is 8-aligned, so a narrower
+        // store is aligned for its width and lands within the doubleword phase C
+        // initialised — which keeps the slot defined for any later load.
         61..=68 => {
             let k = rng.below(SLOT_OFFS.len() as u32) as usize;
+            let size = LDST_SIZES[rng.below(LDST_SIZES.len() as u32) as usize];
             let src = if rng.chance(60) {
                 Source::Reg(r(rng.reg()))
             } else {
                 Source::Imm(rng.imm())
             };
             prog.push(Decoded::Store {
-                size: Size::Dw,
+                size,
                 dst: r(10),
                 off: SLOT_OFFS[k],
                 src,
             });
             cls.stack_store += 1;
+            if size != Size::Dw {
+                cls.narrow_mem += 1;
+            }
         }
         // Stack load. Always from an offset phase C filled, so it is in bounds
-        // and reads a value this run wrote.
+        // and reads a value this run wrote. Narrower and sign-extending forms
+        // exercise the movzx/movsx (LDUR*) lowerings against the interpreter's
+        // `widen`.
         69..=76 => {
             let k = rng.below(SLOT_OFFS.len() as u32) as usize;
             let dst = rng.reg();
+            let size = LDST_SIZES[rng.below(LDST_SIZES.len() as u32) as usize];
+            let sign_extend = size != Size::Dw && rng.chance(50);
             prog.push(Decoded::Load {
-                size: Size::Dw,
-                sign_extend: false,
+                size,
+                sign_extend,
                 dst: r(dst),
                 src: r(10),
                 off: SLOT_OFFS[k],
@@ -663,6 +680,9 @@ fn emit_unit(
             // anything, so treat a load as opaque whenever phase C made it so.
             opaque[dst as usize] = slot_opaque[k];
             cls.stack_load += 1;
+            if size != Size::Dw {
+                cls.narrow_mem += 1;
+            }
         }
         // A kfunc call, plus the re-init of the registers it clobbers.
         //
@@ -910,7 +930,7 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         pct(t.compiled, t.generated)
     );
     note!(
-        "bpf-fuzz: classes alu_i={} alu_r={} neg={} mov={} st={} ld={} ctx={} call={} fwd={} back={} ja={} 32bit={}",
+        "bpf-fuzz: classes alu_i={} alu_r={} neg={} mov={} st={} ld={} ctx={} call={} fwd={} back={} ja={} 32bit={} narrowmem={}",
         cls.alu_imm,
         cls.alu_reg,
         cls.neg,
@@ -922,7 +942,8 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         cls.fwd_branch,
         cls.back_edge,
         cls.uncond_jump,
-        cls.narrow
+        cls.narrow,
+        cls.narrow_mem
     );
 
     // Coverage assertions. Without these the test could stay green while the
@@ -951,6 +972,7 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         || cls.back_edge == 0
         || cls.stack_load == 0
         || cls.narrow == 0
+        || cls.narrow_mem == 0
     {
         return TestResult::Fail("the generator stopped covering a class it claims to cover");
     }
@@ -1317,7 +1339,7 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
     if !narf_bpf_jit::has_backend() {
         return TestResult::Skip(NO_BACKEND);
     }
-    let cases: [(&str, Vec<Decoded>); 6] = [
+    let cases: [(&str, Vec<Decoded>); 4] = [
         (
             "div",
             alloc::vec![
@@ -1353,34 +1375,6 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
                     dst: r(0),
                     order: narf_bpf_isa::ByteOrder::Little,
                     width: 32,
-                },
-                Decoded::Exit,
-            ],
-        ),
-        (
-            "narrow stack load",
-            alloc::vec![
-                super::st_imm(10, -8, 0x5A5A),
-                Decoded::Load {
-                    size: Size::W,
-                    sign_extend: false,
-                    dst: r(0),
-                    src: r(10),
-                    off: -8,
-                },
-                Decoded::Exit,
-            ],
-        ),
-        (
-            "sign-extending load",
-            alloc::vec![
-                super::st_imm(10, -8, -1),
-                Decoded::Load {
-                    size: Size::W,
-                    sign_extend: true,
-                    dst: r(0),
-                    src: r(10),
-                    off: -8,
                 },
                 Decoded::Exit,
             ],
