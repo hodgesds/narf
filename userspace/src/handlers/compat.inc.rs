@@ -794,14 +794,41 @@ fn do_execve_resolved(
         // binary (e.g. systemd-udevd → ../../bin/udevadm) is invisible → ENOENT
         // → 203/EXIT_EXEC. (Global resolution only worked while a pivot_root bug
         // leaked the bind into the global registry.)
+        // Pump every FS future with `poll_io_to_completion`, NOT the
+        // budget-capped `poll_blocking`: the image read streams the whole
+        // binary, and under concurrent block I/O (KDE startup streams tens of
+        // MB of DSOs while services exec) one healthy read legitimately takes
+        // more re-polls than poll_blocking's budget. The overrun surfaced as
+        // execve(2) = EIO for large binaries exec'd at busy moments
+        // (plasmashell, xdg-desktop-portal-kde, systemd-executor) while the
+        // same binaries exec'd fine when quiet. Overrunning ALSO drops the
+        // in-flight read future, abandoning a virtio-blk request that is
+        // still DMA'ing into a scratch buffer Drop just returned to the pool
+        // — the exact hazard poll_io_to_completion exists for, and which the
+        // PT_INTERP read (read_path_from_vfs) already avoids the same way.
         let ops = match current_resolve_absolute(&ep, |fs, rel| {
-            poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
+            poll_io_to_completion(narf_filesystem::resolve_async(fs.root(), rel))
         }) {
             Some(Some(Ok(o))) => o,
             // Not found (or no mount) → ENOENT so execvp keeps searching PATH.
             None | Some(Some(Err(narf_filesystem::FsError::NotFound))) => return Err(-2),
-            // poll_blocking overran, or a real FS error → EIO.
-            Some(None) | Some(Some(Err(_))) => return Err(-5),
+            // Genuinely-wedged device (2G-poll backstop exhausted) → EIO.
+            // Loud: a silent EIO here cost a full debugging session (bash
+            // reports only "Input/output error").
+            Some(None) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "EXECVE-EIO resolve overrun path={ep}");
+                return Err(-5);
+            }
+            // A real FS error → EIO.
+            Some(Some(Err(e))) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "EXECVE-EIO resolve err={e:?} path={ep}"
+                );
+                return Err(-5);
+            }
         };
         let file_size = ops.stat().size as usize;
         if file_size == 0 {
@@ -813,10 +840,27 @@ fn do_execve_resolved(
         let mut buf = alloc::vec![0u8; file_size];
         let mut off = 0usize;
         while off < file_size {
-            match poll_blocking(ops.read(off as u64, &mut buf[off..])) {
+            match poll_io_to_completion(ops.read(off as u64, &mut buf[off..])) {
                 Some(Ok(0)) => break, // short read at EOF
                 Some(Ok(n)) => off += n,
-                _ => return Err(-5), // EIO
+                Some(Err(e)) => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "EXECVE-EIO read err={e:?} off={off} size={file_size} path={ep}"
+                    );
+                    return Err(-5);
+                }
+                // Only a genuinely-wedged device exhausts the 2G-poll
+                // backstop. Loud, then EIO — never silently truncate.
+                None => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "EXECVE-EIO read overrun off={off} size={file_size} path={ep}"
+                    );
+                    return Err(-5);
+                }
             }
         }
         buf.truncate(off);
@@ -1178,7 +1222,10 @@ fn read_fd_image(task: u64, fd: u32) -> Option<alloc::vec::Vec<u8>> {
     let mut buf = alloc::vec![0u8; size];
     let mut off = 0usize;
     while off < size {
-        match poll_blocking(ops.read(off as u64, &mut buf[off..])) {
+        // Same rule as the main image read in read_exec: an exec image read
+        // is never pumped with the budget-capped poll_blocking (overrun both
+        // fails a healthy exec AND drops an in-flight block-I/O future).
+        match poll_io_to_completion(ops.read(off as u64, &mut buf[off..])) {
             Some(Ok(0)) => break,
             Some(Ok(n)) => off += n,
             _ => return None,
