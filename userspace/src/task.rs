@@ -137,6 +137,85 @@ pub fn task_get(tid: u64) -> Option<Arc<Task>> {
     TASKS.lock().get(&tid).cloned()
 }
 
+/// `unix-latency-trace`: print a one-line park report for every task
+/// currently parked in a syscall.
+///
+/// The watchdog's own `PARK-CENSUS` cannot serve this purpose: it runs
+/// behind `stall_wd`'s `DUMPED` gate, which latches on the first dump of
+/// the boot (an early RCU stall trips it around t+25 s), so on a real
+/// desktop run the census never fires. This one is called from ahead of
+/// that gate and repeats, which is what a process that freezes MINUTES
+/// into the session requires.
+///
+/// `scans` (`dbg_poll_scans`) is the progress signal that matters: a
+/// healthy parked poller re-executes its syscall on a 1 ms deadline, so
+/// `scans`/`checks` climb. Both frozen across successive reports, with
+/// `parked=1`, is a park that never re-fires.
+///
+/// Called from the timer trap, so it inherits that context's hazards: it
+/// allocates (the snapshot Vec) and holds `Arc<Task>` clones. Both are
+/// things NARF's task-lifetime rules tell IRQ paths not to do. It is safe
+/// only because `TASKS` holds a ref for every task listed, so no drop here
+/// is ever the last one — and it is compiled out entirely without the
+/// feature. Do not promote this to a non-debug path.
+#[cfg(feature = "unix-latency-trace")]
+pub fn dbg_park_census(tag: &str) {
+    use core::fmt::Write as _;
+    let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
+    for t in tasks {
+        let uc = &t.uctx;
+        if !uc.parked_in_syscall.load(Ordering::Relaxed) {
+            continue;
+        }
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "PARKREP{tag} tid={} comm={} pid={} st={} scans={} checks={} pnfds={} epfd_enc={} netio={} waitchild={} futex={:#x} flock={:#x} deadline={:#x}",
+            t.tid,
+            crate::handlers::proc_comm_of_task_try(t.tid).unwrap_or_default(),
+            t.pid.load(Ordering::Relaxed),
+            t.state.load(Ordering::Relaxed),
+            uc.dbg_poll_scans.load(Ordering::Relaxed),
+            uc.dbg_park_checks.load(Ordering::Relaxed),
+            uc.poll_wait_nfds.load(Ordering::Relaxed),
+            uc.epoll_wait_fd.load(Ordering::Relaxed),
+            uc.net_io_wait.load(Ordering::Relaxed) as u8,
+            uc.wait_child_pending.load(Ordering::Relaxed) as u8,
+            uc.futex_uaddr.load(Ordering::Relaxed),
+            uc.flock_key.load(Ordering::Relaxed),
+            uc.sleep_deadline_ns.load(Ordering::Relaxed),
+        );
+        // The fd set itself, not just its size. "Parked in poll, scanning
+        // hard, and STILL not accepting" has two completely different
+        // causes, and only the set tells them apart: if the starved
+        // listener's fd is absent, the acceptor never asked about it (its
+        // own event loop); if present, the scan is being asked and
+        // answering wrong (ours). Truncated at POLL_WAIT_RECORD_MAX — the
+        // `+` marks a set too wide to see all of.
+        let n = uc.poll_wait_nfds.load(Ordering::Relaxed) as usize;
+        if n > 0 {
+            let shown = n.min(crate::user_task::POLL_WAIT_RECORD_MAX);
+            let _ = write!(narf_console::TrapWriter, "PARKFDS{tag} tid={} fds=", t.tid);
+            for i in 0..shown {
+                // Slot encoding (see poll::record_poll_wait):
+                // `events << 32 | (fd + 1)`; 0 = unused slot.
+                let slot = uc.poll_wait_fds[i].load(Ordering::Relaxed);
+                let _ = write!(
+                    narf_console::TrapWriter,
+                    "{}{}/{:#x}",
+                    if i == 0 { "" } else { "," },
+                    (slot as u32).wrapping_sub(1) as i32,
+                    (slot >> 32) as u32
+                );
+            }
+            let _ = writeln!(
+                narf_console::TrapWriter,
+                "{}",
+                if n > shown { "+" } else { "" }
+            );
+        }
+    }
+}
+
 /// Diagnostic snapshot for the stall watchdog: one entry per registered
 /// task — `(tid, pid, state, sleep_deadline_ns, futex_uaddr,
 /// futex_namespace, futex_park_gen, futex_val, net_io_wait,

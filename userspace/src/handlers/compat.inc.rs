@@ -3306,6 +3306,16 @@ pub fn proc_comm_of_task(tid: u64) -> Option<alloc::string::String> {
     g.as_ref().and_then(|m| m.get(&tid).cloned())
 }
 
+/// `proc_comm_of_task` for callers running in the timer trap, which can
+/// interrupt a CPU already holding `PROC_COMM` — blocking there deadlocks
+/// the machine the caller is trying to observe. Returns `None` on
+/// contention; a missing name in a diagnostic line is the right trade.
+#[cfg(feature = "unix-latency-trace")]
+pub fn proc_comm_of_task_try(tid: u64) -> Option<alloc::string::String> {
+    let g = PROC_COMM.try_lock()?;
+    g.as_ref().and_then(|m| m.get(&tid).cloned())
+}
+
 /// Check a task's Linux `comm` name against comma-separated prefixes without
 /// cloning it. A selector ending in `$` matches the complete comm name; other
 /// selectors retain prefix semantics. Diagnostic paths call this on every

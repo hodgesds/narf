@@ -156,6 +156,45 @@ mod stall_wd {
             LAST_CPL[cpu].store((cs & 3) as u8, Ordering::Relaxed);
             LAST_TASK[cpu].store(narf_scheduler::current_task_id().raw(), Ordering::Relaxed);
         }
+        // Starved-accept attribution for the UNIXENQ/UNIXACC latency trace.
+        // Deliberately AHEAD of the `DUMPED` gate and on its own cadence:
+        // that gate latches on the FIRST dump of the boot (an early RCU
+        // stall trips it around t+25 s), after which every later check in
+        // this function — including the park census — is dead for the rest
+        // of the run. This sweep must outlive it, because the accept
+        // starvation it observes happens minutes into the desktop session.
+        //
+        // Silent unless some AF_UNIX listener is actually holding an
+        // unaccepted connection at the sample instant, which is exactly
+        // what a long connect->accept gap is made of.
+        #[cfg(feature = "unix-latency-trace")]
+        {
+            static SWEEP_CYCLES: AtomicU64 = AtomicU64::new(0);
+            let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+            let now = narf_scheduler::narf_time::now_cycles();
+            let last = SWEEP_CYCLES.load(Ordering::Relaxed);
+            // ~2 s: fast enough to catch a transient queue, slow enough
+            // that the synchronous serial console does not itself become
+            // the reason the acceptor is late.
+            if now.wrapping_sub(last) >= cpns.saturating_mul(2_000_000_000)
+                && SWEEP_CYCLES
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                narf_userspace::socket::unix_listener_stall_sweep();
+                // A process can freeze with NO client waiting on it — kwin
+                // has been observed going flat before the first wayland
+                // client even launches, and the listener sweep is silent in
+                // that case because nothing is pending. Report every parked
+                // task periodically so a freeze is attributable whether or
+                // not anyone is knocking. Every 5th sweep (~10 s) to keep
+                // the synchronous console from becoming the perturbation.
+                static CENSUS_N: AtomicU64 = AtomicU64::new(0);
+                if CENSUS_N.fetch_add(1, Ordering::Relaxed) % 5 == 0 {
+                    narf_userspace::task::dbg_park_census("");
+                }
+            }
+        }
         if DUMPED.load(Ordering::Relaxed) {
             return;
         }

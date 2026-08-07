@@ -465,6 +465,18 @@ pub struct SocketFile {
     /// new one before its next epoll scan, leaving the sampled mask at POLLIN
     /// throughout. Each enqueue is nevertheless a new accept-ready edge.
     listener_readable_token: AtomicU64,
+    /// `unix-latency-trace` only: tid that called `listen()` on this socket.
+    /// The starved-accept sweep runs inside the watchdog's timer trap, where
+    /// walking every task's fd table to find the acceptor would take the fd
+    /// lock the interrupted CPU may already hold. Recording the acceptor at
+    /// listen() time makes the sweep a pure read.
+    #[cfg(feature = "unix-latency-trace")]
+    listen_owner_tid: AtomicU64,
+    /// `unix-latency-trace`: the fd `listen()` was called on, recorded by
+    /// `sys_socket_listen` (the dispatch layer below does not see it).
+    /// Compared against the acceptor's recorded poll fd set.
+    #[cfg(feature = "unix-latency-trace")]
+    listen_owner_fd: AtomicU32,
     /// Receive-progress generation for AF_NETLINK queues.  A monitor can
     /// drain one message between EPOLLET scans; advancing this token on that
     /// drain preserves the next queued message's edge without manufacturing
@@ -846,6 +858,10 @@ impl SocketFile {
             last_recv_fds: IrqSafeSpinLock::new(Vec::new()),
             dgram_readable_token: AtomicU64::new(0),
             listener_readable_token: AtomicU64::new(0),
+            #[cfg(feature = "unix-latency-trace")]
+            listen_owner_tid: AtomicU64::new(0),
+            #[cfg(feature = "unix-latency-trace")]
+            listen_owner_fd: AtomicU32::new(u32::MAX),
             netlink_readable_token: AtomicU64::new(0),
             netlink_portid: AtomicU32::new(0),
             netlink_groups: AtomicU32::new(0),
@@ -3208,6 +3224,9 @@ impl SocketFile {
                     addr: addr.clone(),
                     pending: VecDeque::new(),
                 };
+                #[cfg(feature = "unix-latency-trace")]
+                self.listen_owner_tid
+                    .store(narf_scheduler::current_task_id().raw(), Ordering::Relaxed);
                 // Pathname listeners insert into LISTENERS here. Abstract
                 // addresses were reserved in bind(), so this is a no-op.
                 if let UnixAddr::Path(p) = addr {
@@ -4708,6 +4727,112 @@ type Inet6Map = BTreeMap<([u8; 16], u16), Arc<SocketFile>>;
 
 static LISTENERS: IrqSafeSpinLock<Option<BTreeMap<UnixPathKey, Arc<SocketFile>>>> =
     IrqSafeSpinLock::new(None);
+
+/// `unix-latency-trace` starved-accept attribution sweep, called from the
+/// stall watchdog's ~1 s window tick.
+///
+/// The `UNIXENQ`/`UNIXACC` pair measures how long a `connect()` waited for
+/// its `accept()`, but a long gap has three mutually exclusive causes and
+/// the timestamps alone cannot tell them apart. This prints, for every
+/// named AF_UNIX listener with a non-empty pending queue, the listener's
+/// own poll readiness plus the park state of the task that called
+/// `listen()`:
+///
+///   * `ready` WITHOUT `POLLIN` (0x1) while `n > 0` — a poll_mask bug,
+///     right here: the queue is non-empty and the scan says otherwise, so
+///     no amount of waking helps.
+///   * `parked=1` with CLIMBING `scans` across repeated sweeps — the
+///     acceptor's poll re-scan keeps running and keeps not returning this
+///     listener. Kernel readiness bug (and `ready` above says which half).
+///   * `parked=1` with FROZEN `scans` and `checks` — the acceptor is in a
+///     park that never re-fires. Lost wake.
+///   * `parked=1` with `futex != 0`, or `pnfds=0` — the acceptor is
+///     blocked in a NON-poll wait, so this listener is in no polled set at
+///     all. The starvation is the acceptor's own event loop, not the
+///     AF_UNIX wake path.
+///   * `parked=0` with a climbing `scans` — it is running and simply has
+///     not got round to accepting.
+///
+/// Every lock here is `try_lock`: the sweep runs in the timer trap, which
+/// can interrupt a CPU already holding any of them. A skipped sample is
+/// the correct outcome there — blocking would deadlock the machine we are
+/// trying to observe.
+impl SocketFile {
+    /// Record the fd `listen()` was called on. See `listen_owner_fd`.
+    #[cfg(feature = "unix-latency-trace")]
+    pub fn set_listen_owner_fd(&self, fd: u32) {
+        self.listen_owner_fd.store(fd, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "unix-latency-trace")]
+pub fn unix_listener_stall_sweep() {
+    use core::fmt::Write as _;
+    let Some(guard) = LISTENERS.try_lock() else {
+        return;
+    };
+    let listeners: Vec<(String, Arc<SocketFile>)> = guard
+        .as_ref()
+        .map(|m| m.iter().map(|(k, v)| (k.name.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    drop(guard);
+    let now_ms = narf_scheduler::narf_time::monotonic_ns() / 1_000_000;
+    for (name, l) in listeners {
+        // Prefer the address recorded in the socket's own state: the
+        // registry key's `name` is empty for listeners registered at bind()
+        // time (abstract addresses), which is precisely the systemd/KDE
+        // shape this sweep is aimed at.
+        let (npend, addr) = match l.state.try_lock().as_deref() {
+            Some(SocketState::UnixListener { pending, addr }) => (
+                pending.len(),
+                match addr {
+                    UnixAddr::Path(p) => p.clone(),
+                    UnixAddr::Abstract(a) => alloc::format!(
+                        "<abstract:{}>",
+                        a.iter()
+                            .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+                            .collect::<String>()
+                    ),
+                    UnixAddr::Unnamed => String::from("<unnamed>"),
+                },
+            ),
+            _ => continue,
+        };
+        if npend == 0 {
+            continue;
+        }
+        let name = if name.is_empty() { addr } else { name };
+        let ready = narf_filesystem::FileOps::poll_readiness(&*l);
+        let tid = l.listen_owner_tid.load(Ordering::Relaxed);
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "UNIXPEND ms={now_ms} name={name} n={npend} ready={ready:#x} owner_tid={tid} owner_fd={}",
+            l.listen_owner_fd.load(Ordering::Relaxed) as i32
+        );
+        let Some(task) = crate::task::task_get(tid) else {
+            let _ = writeln!(
+                narf_console::TrapWriter,
+                "UNIXPEND-OWNER name={name} tid={tid} GONE — listener outlived its acceptor"
+            );
+            continue;
+        };
+        let uc = &task.uctx;
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "UNIXPEND-OWNER name={name} tid={tid} pid={} st={} parked={} scans={} checks={} pnfds={} epfd_enc={} netio={} futex={:#x} deadline={:#x}",
+            task.pid.load(Ordering::Relaxed),
+            task.state.load(Ordering::Relaxed),
+            uc.parked_in_syscall.load(Ordering::Relaxed) as u8,
+            uc.dbg_poll_scans.load(Ordering::Relaxed),
+            uc.dbg_park_checks.load(Ordering::Relaxed),
+            uc.poll_wait_nfds.load(Ordering::Relaxed),
+            uc.epoll_wait_fd.load(Ordering::Relaxed),
+            uc.net_io_wait.load(Ordering::Relaxed) as u8,
+            uc.futex_uaddr.load(Ordering::Relaxed),
+            uc.sleep_deadline_ns.load(Ordering::Relaxed),
+        );
+    }
+}
 
 /// Release a bound AF_UNIX pathname from the stream + dgram registries so
 /// the address can be re-bound. Called by `unlink(2)` on a socket path —
