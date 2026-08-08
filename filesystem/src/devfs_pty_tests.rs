@@ -1015,3 +1015,139 @@ kernel_test_in!(
     "filesystem/pty",
     smoke_pty_slave_empty_blocks_but_ctrl_d_is_real_eof
 );
+
+/// The PTY hangup matrix, both directions, against the Linux sources.
+///
+/// A PTY has TWO end-of-stream conditions and they are NOT symmetric.
+/// `drivers/tty/pty.c` `pty_close` sets `TTY_OTHER_CLOSED` on the peer
+/// whichever side closes, but the MASTER's close additionally
+/// `tty_vhangup(tty->link)`s the slave. The results differ accordingly:
+///
+/// | who closed | other side's read      | other side's poll |
+/// |------------|------------------------|-------------------|
+/// | last slave | **EIO**                | POLLHUP           |
+/// | master     | **0 / EOF**            | POLLHUP           |
+///
+///   * EIO — `n_tty.c` `n_tty_wait_for_input`:
+///     `if (test_bit(TTY_OTHER_CLOSED, &tty->flags)) return -EIO;`
+///     Checked in the WAIT path, so queued bytes drain FIRST.
+///   * 0/EOF — `tty_io.c` `tty_read` via `tty_hung_up_p()`. EOF is what
+///     makes a shell on a vanished terminal exit; EIO is what tells a
+///     terminal its child is gone. Swapping them wedges one side.
+///   * POLLHUP — `n_tty.c` `n_tty_poll`:
+///     `if (test_bit(TTY_OTHER_CLOSED, &tty->flags)) mask |= EPOLLHUP;`
+///     An event loop never issues a bare blocking read, so without the HUP
+///     bit it simply never wakes to learn the peer is gone.
+///
+/// This was found the hard way: the `ptyspawn` smoke's child failed to
+/// exec, every slave fd closed, and the parent's master read parked FOREVER
+/// instead of reporting EIO. The negative halves matter just as much — a
+/// master read before any slave opens must still WAIT (that is the phantom
+/// EOF that left `foot` blank), and re-opening a slave must clear the
+/// condition (`pty.c` clears the bit on open).
+fn smoke_pty_hangup_matrix_matches_linux() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let pty = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup failed for a fresh master"),
+    };
+
+    // ── Before any slave exists: WAIT, never EOF and never HUP. ──
+    if !master.read_should_block() {
+        return TestResult::Fail("master read reported end-of-stream before any slave was opened");
+    }
+    if FileOps::poll_readiness(&*master) & crate::POLL_HUP != 0 {
+        return TestResult::Fail("master reported POLLHUP before any slave was opened");
+    }
+
+    // ── Slave open, empty: still WAIT. ──
+    let slave = PtySlave::new(Arc::clone(&pty));
+    if !master.read_should_block() {
+        return TestResult::Fail("master read reported end-of-stream with a slave open and idle");
+    }
+    if FileOps::poll_readiness(&*master) & crate::POLL_HUP != 0 {
+        return TestResult::Fail("master reported POLLHUP with a slave still open");
+    }
+
+    // ── Slave writes, then closes. The DATA must drain before the hangup:
+    // those bytes are the child's output and Linux checks TTY_OTHER_CLOSED
+    // only in the wait path. ──
+    if poll_once(slave.write(0, b"last words")).is_none() {
+        return TestResult::Fail("slave write did not complete");
+    }
+    drop(slave);
+
+    if !pty.hung_up() {
+        return TestResult::Fail("dropping the last slave did not mark the pty hung up");
+    }
+    let mut buf = [0u8; 32];
+    match poll_once(FileOps::read(&*master, 0, &mut buf)) {
+        Some(Ok(n)) if n == b"last words".len() && &buf[..n] == b"last words" => {}
+        Some(Ok(0)) => {
+            return TestResult::Fail(
+                "hangup swallowed the slave's queued output — data must drain first",
+            )
+        }
+        _ => return TestResult::Fail("master could not read bytes queued before the hangup"),
+    }
+
+    // ── Drained AND hung up: EIO, not 0, and not a block. ──
+    if master.read_should_block() {
+        return TestResult::Fail(
+            "master read still blocks after the last slave closed — this is the hang the \
+             ptyspawn smoke caught, where a failed exec left the parent parked forever",
+        );
+    }
+    match poll_once(FileOps::read(&*master, 0, &mut buf)) {
+        Some(Err(FsError::Io(_))) => {}
+        Some(Ok(0)) => {
+            return TestResult::Fail("master read returned 0 on hangup; Linux n_tty returns -EIO")
+        }
+        _ => return TestResult::Fail("master read did not report EIO after the last slave closed"),
+    }
+    if FileOps::poll_readiness(&*master) & crate::POLL_HUP == 0 {
+        return TestResult::Fail("master poll did not set POLLHUP after the last slave closed");
+    }
+
+    // ── Re-opening a slave CLEARS the condition (pty.c clears the bit on
+    // open). Without this a pty is permanently poisoned after one close. ──
+    let slave2 = PtySlave::new(Arc::clone(&pty));
+    if pty.hung_up() {
+        return TestResult::Fail("re-opening a slave did not clear the hangup");
+    }
+    if !master.read_should_block() {
+        return TestResult::Fail("master still reports end-of-stream after a slave re-opened");
+    }
+    if FileOps::poll_readiness(&*master) & crate::POLL_HUP != 0 {
+        return TestResult::Fail("master still reports POLLHUP after a slave re-opened");
+    }
+
+    // ── The other direction: master closes, slave sees EOF (0), not EIO. ──
+    drop(master);
+    if slave2.read_should_block() {
+        return TestResult::Fail(
+            "slave read still blocks after the master closed — a shell whose terminal \
+             vanished would never exit",
+        );
+    }
+    if slave2.nonblock_read_eagain() {
+        return TestResult::Fail("O_NONBLOCK slave read reports EAGAIN after the master closed");
+    }
+    match poll_once(slave2.read(0, &mut buf)) {
+        Some(Ok(0)) => {}
+        Some(Err(_)) => {
+            return TestResult::Fail(
+                "slave read returned an error after the master closed; Linux tty_read \
+                 returns 0 for a hung-up tty (that EOF is how a shell exits)",
+            )
+        }
+        _ => return TestResult::Fail("slave read did not report EOF after the master closed"),
+    }
+    if FileOps::poll_readiness(&slave2) & crate::POLL_HUP == 0 {
+        return TestResult::Fail("slave poll did not set POLLHUP after the master closed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_pty_hangup_matrix_matches_linux);

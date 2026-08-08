@@ -148,11 +148,11 @@ printf '%s\n' \
   'DefaultTimeoutStopSec=120s' \
   > "$WORK/root/etc/systemd/user.conf"
 
-# The PTY probe (see pty_probe.c) — why the foot terminal renders but shows
+# The PTY probe (see ptyspawn_smoke_x86_64.c) — why the foot terminal renders but shows
 # no prompt. Same build rule as the DRM probe: PIE, never -static.
 if command -v gcc >/dev/null 2>&1; then
   if gcc -O1 -o "$WORK/root/usr/local/libexec/narf-pty-probe" \
-      "$ROOT/verification/data/musl-demo/pty_probe.c" 2>/dev/null; then
+      "$ROOT/verification/data/musl-demo/ptyspawn_smoke_x86_64.c" 2>/dev/null; then
     chmod 0755 "$WORK/root/usr/local/libexec/narf-pty-probe"
     echo "Built narf-pty-probe"
   else

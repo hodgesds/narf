@@ -39,8 +39,14 @@ static int step(const char *what, int rc)
     return rc;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    // Child half: the terminal's shell. Writes to fd 1, which the parent
+    // dup2'd onto the PTY slave, so the bytes must come back off the master.
+    if (argc > 1 && strcmp(argv[1], "--child") == 0) {
+        write(1, "PTY-CHILD-ALIVE\n", 16);
+        _exit(0);
+    }
     printf("PTY: probe start uid=%d\n", (int)getuid());
 
     int m = step("posix_openpt(O_RDWR|NOCTTY)", posix_openpt(O_RDWR | O_NOCTTY));
@@ -81,7 +87,14 @@ int main(void)
         // Echo a token the parent can look for, then exit. Using /bin/sh
         // rather than an interactive shell keeps the check deterministic:
         // we are testing the PTY path, not prompt rendering.
-        execl("/bin/sh", "sh", "-c", "echo PTY-CHILD-ALIVE", (char *)NULL);
+        // Exec OURSELVES, not /bin/sh. The smoke is staged at
+        // /bin/ptyspawn_smoke in NARF's own initramfs and exists in the
+        // distro image too, whereas /bin/sh exists only in the latter —
+        // with /bin/sh this passed in the Fedora image and hung forever in
+        // the native one, which measures the environment rather than the
+        // PTY. Same convention as fork_exec_burst_smoke / popenw_smoke.
+        // Still a real fork + setsid + dup2 + execve.
+        execl("/bin/ptyspawn_smoke", "ptyspawn_smoke", "--child", (char *)NULL);
         _exit(127); // exec failed
     }
 
@@ -109,6 +122,18 @@ int main(void)
         printf("PTY: waitpid                       FAILED errno=%d\n", errno);
 
     close(m);
+    // A SINGLE unambiguous success marker on its own line.
+    //
+    // The run-interactive matcher requires its needle to be followed by
+    // \r/\n, so a mid-line token silently never matches. And it must only
+    // appear when EVERY step succeeded: gating the xtask smoke on
+    // "probe done" (printed unconditionally) or on a substring of the
+    // master-read line would pass while the child's output never arrived,
+    // which is exactly the failure this probe exists to catch.
+    int ok = n > 0 && strstr(buf, "PTY-CHILD-ALIVE") != NULL &&
+             WIFEXITED(st) && WEXITSTATUS(st) == 0;
     printf("PTY: probe done\n");
-    return 0;
+    if (ok)
+        printf("ptyspawn-ok\n");
+    return ok ? 0 : 1;
 }

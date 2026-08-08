@@ -2481,6 +2481,11 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("getrandom_smoke", "getrandom-ok"),
         ("sockpair_smoke", "sockpair-ok"),
         ("accept4_smoke", "accept4-ok"),
+        // The terminal chain end to end (see ptyspawn_smoke_x86_64.c). Anchored
+        // on its own success line, which the probe prints ONLY when the
+        // child's output actually came back off the master — "probe done"
+        // prints unconditionally and would pass a silent failure.
+        ("ptyspawn_smoke", "ptyspawn-ok"),
         // Linux-compat round 2: mremap, sendfile, creds, waitid.
         ("mremap_smoke", "mremap-ok"),
         ("sendfile_smoke", "sendfile-ok"),

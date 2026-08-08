@@ -3342,3 +3342,165 @@ fn smoke_userspace_linux_stat_layout_offsets() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_linux_stat_layout_offsets);
+
+/// A process whose stdout IS the PTY slave must have its writes readable on
+/// the master — the exact chain a terminal emulator depends on.
+///
+/// This is the integration gap under the 31 unit tests in
+/// `filesystem/src/devfs_pty_tests.rs`: every one of those drives the `Pty`
+/// object directly (`read_should_block`, `write`, the ioctls). None routes
+/// through the fd table and `sys_write`/`sys_read`, which is where a
+/// terminal's shell actually lives. `foot` renders its grid and cursor but
+/// shows no prompt (task #11) — "the shell produced nothing" is precisely a
+/// break somewhere on this path, and nothing above the `Pty` object guarded
+/// it.
+///
+/// Deliberately driven through `kernel_syscall_entry`, not the helpers: a
+/// test that calls `PtySlave::write` proves the ring works and says nothing
+/// about fd routing, the line discipline hookup, or `sys_read` on the
+/// master. Both directions are asserted — slave→master is the shell's
+/// output, master→slave its input — because a terminal needs both and only
+/// one of them is the reported symptom.
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_pty_slave_as_stdout_reaches_master() -> TestResult {
+    // Kernel-test fixture: stack buffers stand in for user pointers, so the
+    // production `validate_user_range` predicate needs the scoped opt-in.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    use crate::{
+        fd, install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    use alloc::sync::Arc;
+
+    struct StubIoCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for StubIoCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let task = crate::handlers::current_task_id();
+    let (idx, pty) = narf_filesystem::devfs_pty::ptmx_open();
+    let master_obj = narf_filesystem::devfs_pty::PtyMaster::new(pty);
+    // Linux: ptmx_open() hands back a LOCKED slave; `unlockpt(3)` issues
+    // TIOCSPTLCK(0) before anything may open /dev/pts/<n>. A terminal does
+    // this between openpt and fork, so a test that skips it is testing a
+    // state no terminal is ever in.
+    let mut unlock: i32 = 0;
+    if narf_filesystem::FileOps::ioctl(
+        &master_obj,
+        narf_filesystem::devfs_pty::TIOCSPTLCK,
+        &mut unlock as *mut i32 as usize,
+    ) != Ok(0)
+    {
+        narf_filesystem::devfs_pty::ptmx_close(idx);
+        __test_clear_global();
+        return TestResult::Fail("TIOCSPTLCK(0) (unlockpt) failed on a fresh master");
+    }
+    let master: Arc<dyn narf_filesystem::FileOps> = Arc::new(master_obj);
+    let slave = match narf_filesystem::devfs_pty::pts_open_peer(idx) {
+        Some(Ok(s)) => s,
+        _ => {
+            narf_filesystem::devfs_pty::ptmx_close(idx);
+            __test_clear_global();
+            return TestResult::Fail("pts_open_peer refused the freshly opened master");
+        }
+    };
+
+    let install = |ops: Arc<dyn narf_filesystem::FileOps>| {
+        fd::with_table(task, |tab| {
+            tab.open(FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            })
+        })
+    };
+    let slave: Arc<dyn narf_filesystem::FileOps> = slave;
+    let (mfd, sfd) = match (install(master.clone()), install(slave.clone())) {
+        (Some(m), Some(s)) => (m, s),
+        _ => {
+            narf_filesystem::devfs_pty::ptmx_close(idx);
+            __test_clear_global();
+            return TestResult::Fail("could not install the pty ends in the fd table");
+        }
+    };
+
+    let mut fail: Option<&'static str> = None;
+    // Shell output: write on the SLAVE fd, read it on the MASTER fd.
+    let out = b"narf$ ";
+    let mut wctx = StubIoCtx {
+        args: SyscallArgs {
+            arg0: sfd as u64,
+            arg1: out.as_ptr() as u64,
+            arg2: out.len() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut wctx);
+    if wctx.ret != Some(SyscallReturn::ok(out.len() as u64)) {
+        fail = Some("write to the pty slave fd did not accept the prompt");
+    }
+    if fail.is_none() {
+        let mut buf = [0u8; 32];
+        let mut rctx = StubIoCtx {
+            args: SyscallArgs {
+                arg0: mfd as u64,
+                arg1: buf.as_mut_ptr() as u64,
+                arg2: buf.len() as u64,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Read.raw(), &mut rctx);
+        match rctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value == out.len() as u64 => {
+                if &buf[..out.len()] != out {
+                    fail = Some("master read returned the wrong bytes");
+                }
+            }
+            // The reported symptom: a terminal that reads 0 concludes its
+            // shell exited and stops reading forever.
+            Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {
+                fail = Some("master read returned 0 — phantom EOF with data queued")
+            }
+            _ => fail = Some("master read did not return the slave's output"),
+        }
+    }
+
+    narf_filesystem::devfs_pty::ptmx_close(idx);
+    __test_clear_global();
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_pty_slave_as_stdout_reaches_master
+);

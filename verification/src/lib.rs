@@ -4778,6 +4778,15 @@ define_smoke_elf!(
     "NARF_NETSERVE_SMOKE_ELF_X86_64",
     "NARF_NETSERVE_SMOKE_ELF_AARCH64"
 );
+// The full terminal chain: posix_openpt/grantpt/unlockpt/ptsname, then
+// fork + setsid + dup2 onto 0/1/2 + exec /bin/sh, then the parent reads the
+// child's output back off the master. Exactly what a terminal emulator does
+// before its shell.
+define_smoke_elf!(
+    NARF_PTYSPAWN_SMOKE_ELF,
+    "NARF_PTYSPAWN_SMOKE_ELF_X86_64",
+    "NARF_PTYSPAWN_SMOKE_ELF_AARCH64"
+);
 define_smoke_elf!(
     NARF_PIPEOF_SMOKE_ELF,
     "NARF_PIPEOF_SMOKE_ELF_X86_64",

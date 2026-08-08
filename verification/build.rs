@@ -598,6 +598,12 @@ fn main() {
         "navfs_smoke",
         "oci_smoke",
         "netserve_smoke",
+        // Full terminal chain: posix_openpt/grantpt/unlockpt/ptsname, then
+        // fork + setsid + dup2 onto 0/1/2 + exec /bin/sh, then the parent
+        // reads the child's output back off the master. This is exactly
+        // what a terminal emulator does before its shell, and it had been
+        // compiled into the KDE image since 6-Aug with NOTHING running it.
+        "ptyspawn_smoke",
         "pipeof_smoke",
         "relpaths_smoke",
         "consoletty_smoke",
