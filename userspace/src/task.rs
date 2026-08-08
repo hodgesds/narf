@@ -172,16 +172,23 @@ pub fn task_get(tid: u64) -> Option<Arc<Task>> {
 
 /// Number of distinct RIPs the profile can hold. Power of two — the
 /// index is a mask, not a modulo.
+#[cfg(feature = "unix-latency-trace")]
 const PROF_SLOTS: usize = 512;
+#[cfg(feature = "unix-latency-trace")]
 static PROF_RIP: [AtomicU64; PROF_SLOTS] = [const { AtomicU64::new(0) }; PROF_SLOTS];
+#[cfg(feature = "unix-latency-trace")]
 static PROF_CNT: [AtomicU64; PROF_SLOTS] = [const { AtomicU64::new(0) }; PROF_SLOTS];
 /// tid being profiled; 0 = profiling off. Set by [`dbg_proc_roster`].
+#[cfg(feature = "unix-latency-trace")]
 static PROF_TID: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "unix-latency-trace")]
 static PROF_SAMPLES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "unix-latency-trace")]
 static PROF_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// comm of the task to profile. Exact match, so `kwin_wayland` does not
 /// also catch `kwin_wayland_wr`.
+#[cfg(feature = "unix-latency-trace")]
 const PROF_COMM: &str = "kwin_wayland";
 
 /// Record one user-mode RIP sample. Called from the timer trap on every
