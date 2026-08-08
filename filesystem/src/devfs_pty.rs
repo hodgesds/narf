@@ -332,13 +332,13 @@ pub struct Pty {
     #[allow(dead_code)]
     pub(crate) window: IrqSafeSpinLock<WinSize>,
 
-    /// Session ID — placeholder; full session management is Stage 4.
-    #[allow(dead_code)]
-    pub(crate) sid: AtomicU32,
-
-    /// Foreground process group — placeholder; signal delivery is Stage 4.
-    #[allow(dead_code)]
-    pub(crate) pgid: AtomicU32,
+    /// The tty's session — Linux `tty->ctrl.session`. Installed together
+    /// with [`Self::fg_pgrp`] when a task acquires this PTY as its
+    /// controlling terminal (`TIOCSCTTY`). 0 = no session; `TIOCGSID` then
+    /// reports ENOTTY, as Linux does.
+    // Only read by the `linux-compat` ioctl path (TIOCSCTTY/TIOCGSID).
+    #[cfg_attr(not(feature = "linux-compat"), allow(dead_code))]
+    pub(crate) sid: AtomicU64,
 
     /// Allocation index; becomes the `/dev/pts/<N>` name.
     pub(crate) index: u32,
@@ -425,8 +425,7 @@ impl Pty {
             slave_tx_to_master: ByteRing::new(),
             termios: IrqSafeSpinLock::new(Termios::default()),
             window: IrqSafeSpinLock::new(WinSize::default()),
-            sid: AtomicU32::new(0),
-            pgid: AtomicU32::new(0),
+            sid: AtomicU64::new(0),
             index,
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
@@ -1349,9 +1348,37 @@ impl FileOps for PtySlave {
                 // filesystem layer can't reach the per-task session
                 // table directly — userspace::handlers wires it.
                 let _ = arg;
-                if let Some(hook) = CTTY_HOOK.lock().as_ref() {
-                    hook(self.pty.index);
+                // Copy the fn pointer out before calling: the hook takes
+                // userspace's own locks, and holding CTTY_HOOK across that
+                // would invert lock order.
+                let hook = *CTTY_HOOK.lock();
+                if let Some(hook) = hook {
+                    let (sid, pgid) = hook(self.pty.index);
+                    // Linux `__proc_set_tty` (drivers/tty/tty_jobctrl.c):
+                    //     tty->ctrl.pgrp    = get_pid(task_pgrp(current));
+                    //     tty->ctrl.session = get_pid(task_session(current));
+                    // Acquiring the controlling tty installs BOTH. Recording
+                    // only the ctty (what this did before) left fg_pgrp at 0,
+                    // so `tcgetpgrp()` returned 0, which never equals the
+                    // shell's own pgrp. bash's `initialize_job_control` then
+                    // loops sending itself SIGTTIN (default action: stop), so
+                    // an interactive shell on a PTY hung forever having
+                    // written not one byte — the empty `foot` window.
+                    self.pty.sid.store(sid, Ordering::Release);
+                    self.pty.fg_pgrp.store(pgid, Ordering::Release);
                 }
+                Ok(0)
+            }
+            TIOCGSID => {
+                // Linux `tiocgsid`: the session of the tty's session leader.
+                // ENOTTY while the tty has no session, matching Linux's
+                // `if (!real_tty->ctrl.session) return -ENOTTY;`.
+                let sid = self.pty.sid.load(Ordering::Acquire);
+                if sid == 0 {
+                    return Err(FsError::Unsupported);
+                }
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
+                unsafe { write_user_i32(arg, sid as i32)? };
                 Ok(0)
             }
             TIOCGWINSZ => {
@@ -1450,8 +1477,16 @@ impl FileOps for PtySlave {
 // the filesystem crate depend on userspace, we expose a function-pointer
 // hook the userspace crate installs at boot.
 
+/// Records the caller's controlling tty and reports back the caller's
+/// `(session id, process group id)` — both in the visible-pid space.
+///
+/// The return value is what lets `TIOCSCTTY` implement Linux's
+/// `__proc_set_tty` (drivers/tty/tty_jobctrl.c), which installs the tty's
+/// session AND its foreground process group as one operation. Without the
+/// pgrp half, `tcgetpgrp()` answers 0 forever and a job-control shell's
+/// `initialize_job_control` loop never converges — see the TIOCSCTTY arm.
 #[cfg(feature = "linux-compat")]
-type CttyHook = fn(pty_index: u32);
+type CttyHook = fn(pty_index: u32) -> (u64, u64);
 
 #[cfg(feature = "linux-compat")]
 static CTTY_HOOK: IrqSafeSpinLock<Option<CttyHook>> = IrqSafeSpinLock::new(None);

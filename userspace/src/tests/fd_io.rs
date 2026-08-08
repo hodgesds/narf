@@ -3504,3 +3504,109 @@ kernel_test_in!(
     "userspace",
     smoke_userspace_pty_slave_as_stdout_reaches_master
 );
+
+/// `TIOCSCTTY` on a PTY slave must install the tty's foreground process
+/// group, not merely record the controlling tty.
+///
+/// Linux `__proc_set_tty` (drivers/tty/tty_jobctrl.c) does both at once:
+///
+/// ```c
+/// tty->ctrl.pgrp    = get_pid(task_pgrp(current));
+/// tty->ctrl.session = get_pid(task_session(current));
+/// ```
+///
+/// NARF recorded only the ctty index, leaving `fg_pgrp` at 0. That is not a
+/// cosmetic gap. bash's `initialize_job_control` runs
+///
+/// ```c
+/// while ((terminal_pgrp = tcgetpgrp (shell_tty)) != -1) {
+///     if (shell_pgrp != terminal_pgrp) { /* SIG_DFL */ kill (0, SIGTTIN); continue; }
+///     break;
+/// }
+/// ```
+///
+/// so a `tcgetpgrp()` of 0 never equals the shell's own pgrp, and the shell
+/// signals ITSELF with SIGTTIN — default action: stop. The measured symptom
+/// was an interactive bash on a PTY that stayed alive forever having written
+/// zero bytes: the empty `foot` window (task #11).
+///
+/// The assertion is deliberately the shell's own convergence condition
+/// (`tcgetpgrp(slave) == getpgrp()`), not "fg_pgrp is nonzero" — a nonzero
+/// but wrong pgrp hangs bash exactly as hard as a zero one.
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_pty_tiocsctty_installs_foreground_pgrp() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    use alloc::sync::Arc;
+    use narf_filesystem::devfs_pty::{TIOCGPGRP, TIOCGSID, TIOCSCTTY, TIOCSPTLCK};
+    use narf_filesystem::FileOps;
+
+    let (idx, pty) = narf_filesystem::devfs_pty::ptmx_open();
+    let master = narf_filesystem::devfs_pty::PtyMaster::new(pty);
+    let mut unlock: i32 = 0;
+    if FileOps::ioctl(&master, TIOCSPTLCK, &mut unlock as *mut i32 as usize) != Ok(0) {
+        narf_filesystem::devfs_pty::ptmx_close(idx);
+        return TestResult::Fail("TIOCSPTLCK(0) (unlockpt) failed on a fresh master");
+    }
+    let slave = match narf_filesystem::devfs_pty::pts_open_peer(idx) {
+        Some(Ok(s)) => s,
+        _ => {
+            narf_filesystem::devfs_pty::ptmx_close(idx);
+            return TestResult::Fail("pts_open_peer refused the freshly opened master");
+        }
+    };
+
+    let mut fail: Option<&'static str> = None;
+
+    // NEGATIVE: before anyone acquires the tty it has no session, so
+    // TIOCGSID reports ENOTTY — Linux `tiocgsid`'s
+    // `if (!real_tty->ctrl.session) return -ENOTTY;`.
+    let mut sid_out: i32 = -1;
+    if FileOps::ioctl(&*slave, TIOCGSID, &mut sid_out as *mut i32 as usize).is_ok() {
+        fail = Some("TIOCGSID answered on a PTY that no session has acquired");
+    }
+
+    // POSITIVE: acquire the tty, then assert the shell's convergence
+    // condition holds.
+    if fail.is_none() && FileOps::ioctl(&*slave, TIOCSCTTY, 0).is_err() {
+        fail = Some("TIOCSCTTY on an unlocked PTY slave failed");
+    }
+    if fail.is_none() {
+        // Visible-pid space: this is what the shell's own getpgrp() returns.
+        let want = crate::handlers::current_task_pgid_user();
+        let mut got: i32 = -1;
+        if want == 0 {
+            // No scheduled task ⇒ the fixture cannot express the property.
+            // Say so rather than passing vacuously.
+            fail = Some("fixture has no current task: pgid 0, assertion would be vacuous");
+        } else if FileOps::ioctl(&*slave, TIOCGPGRP, &mut got as *mut i32 as usize).is_err() {
+            fail = Some("TIOCGPGRP failed after TIOCSCTTY");
+        } else if got == 0 {
+            // The exact pre-fix state.
+            fail = Some("tcgetpgrp() == 0 after TIOCSCTTY — bash would SIGTTIN-stop itself");
+        } else if got as u64 != want {
+            fail = Some("tcgetpgrp() != getpgrp() after TIOCSCTTY — job control cannot converge");
+        }
+    }
+    // The session half of the same `__proc_set_tty` store.
+    if fail.is_none() {
+        let want = crate::handlers::current_task_sid_user();
+        let mut got: i32 = -1;
+        match FileOps::ioctl(&*slave, TIOCGSID, &mut got as *mut i32 as usize) {
+            Ok(_) if got as u64 == want => {}
+            Ok(_) => fail = Some("TIOCGSID returned a session that is not the acquirer's"),
+            Err(_) => fail = Some("TIOCGSID still reports ENOTTY after TIOCSCTTY"),
+        }
+    }
+
+    drop(slave);
+    narf_filesystem::devfs_pty::ptmx_close(idx);
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_pty_tiocsctty_installs_foreground_pgrp
+);
