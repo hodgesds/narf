@@ -59,9 +59,9 @@
 //!
 //! What is left interpreted: the map and subprogram-address pseudo-forms of
 //! `LD_IMM64` (they resolve to addresses this pass does not have), arena atomics,
-//! `may_goto`, and arena accesses in a program that also makes BPF-to-BPF calls
-//! (the call frame moves `rsp`, which the arena base is parked relative to).
-//! Everything unemitted returns
+//! and arena accesses in a program that also makes BPF-to-BPF calls (the call
+//! frame moves `rsp`, which the arena base is parked relative to). Everything
+//! unemitted returns
 //! [`JitError::Unsupported`], which the caller answers by interpreting — the
 //! interpreter is a complete implementation, so an unemitted instruction costs
 //! speed and not correctness. That is the property that makes it safe to grow
@@ -1019,6 +1019,20 @@ fn emit_kfunc_call(e: &mut Emit, addr: usize) {
     e.modrm_rr(2, hr::R11);
 }
 
+/// An unconditional `jmp rel32` to the BPF instruction `at + 1 + off`. Shared by
+/// `Jump` and `may_goto`, whose `off` fields differ in width.
+fn emit_uncond_jump(e: &mut Emit, at: u32, off: i64, relocs: &mut Vec<Reloc>) {
+    e.b(0xE9);
+    let at_disp = e.len();
+    e.d32(0);
+    relocs.push(Reloc {
+        at: at_disp,
+        next: e.len(),
+        target: (at as i64 + 1 + off) as u32,
+        width: 4,
+    });
+}
+
 /// A BPF-to-BPF call, the JIT analogue of the interpreter's `push_frame`.
 ///
 /// R6..R10 must survive a call (BPF's ABI), so the five host registers they map
@@ -1562,20 +1576,12 @@ fn emit_insn(
             store_imm_tail(e, size, v);
         }
 
-        Decoded::Jump { off } => {
-            // Always `rel32`. A short form would save three bytes per branch
-            // but requires the sizing fixpoint this backend deliberately does
-            // not have — see `compile`.
-            e.b(0xE9);
-            let at_disp = e.len();
-            e.d32(0);
-            relocs.push(Reloc {
-                at: at_disp,
-                next: e.len(),
-                target: (at as i64 + 1 + i64::from(off)) as u32,
-                width: 4,
-            });
-        }
+        // `may_goto` is an unconditional jump here: the runtime always takes the
+        // back-edge (metered by fuel, which the block charge already pays), so it
+        // has the same lowering as `Jump` — see the interpreter's `MayGoto`. Its
+        // `off` is `i16` where `Jump`'s is `i32`, so it needs its own arm.
+        Decoded::Jump { off } => emit_uncond_jump(e, at, i64::from(off), relocs),
+        Decoded::MayGoto { off } => emit_uncond_jump(e, at, i64::from(off), relocs),
 
         Decoded::JumpCond {
             wide,

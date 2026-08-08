@@ -39,17 +39,19 @@
 //!
 //! The instruction *repertoire* is deliberately exactly what the backends
 //! lower: a shape neither backend emits (a map pseudo-form `LD_IMM64`, arena
-//! atomics, `may_goto`) would make every program containing it fall back, and a
-//! fuzzer whose subjects fall back is a fuzzer comparing the interpreter with
-//! itself.
+//! atomics) would make every program containing it fall back, and a fuzzer whose
+//! subjects fall back is a fuzzer comparing the interpreter with itself.
 //!
-//! The plain-value `LD_IMM64` *is* lowered but is still not generated here: it
-//! is a two-slot instruction, and this generator's jump arithmetic is in
-//! single-slot index space, so a wide instruction would shift every later
-//! target. It carries no control flow or addressing to fuzz, so it is covered by
-//! goldens and `smoke_bpf_jit_ld_imm64_matches_the_interpreter` instead.
-//! [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`] pins that boundary,
-//! so extending a backend makes this module's repertoire go stale *loudly*.
+//! Three lowered shapes are deliberately *not* generated here and are covered by
+//! goldens plus targeted `smoke_bpf_jit_*_matches_the_interpreter` tests instead:
+//! the plain-value `LD_IMM64` and BPF-to-BPF calls (both multi-slot, and this
+//! generator's jump arithmetic is single-slot index space, so a wide instruction
+//! would shift every later target), and `may_goto` (an always-taken back-edge,
+//! which would turn most programs into fuel-bounded spins). None carries the kind
+//! of interaction — flags, addressing, register aliasing — that the fuzzer
+//! exists to shake out.
+//! [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`] pins the boundary, so
+//! extending a backend makes this module's repertoire go stale *loudly*.
 //!
 //! ## Determinism and replay
 //!
@@ -1483,35 +1485,41 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
     if !narf_bpf_jit::has_backend() {
         return TestResult::Skip(NO_BACKEND);
     }
-    // `may_goto` is the durable shape that still both verifies through the real
-    // loader *and* falls back: the JIT refuses it (its hidden loop counter is
-    // separate from fuel), while the verifier treats it as a branch. (The
-    // multiply, atomic, LD_IMM64, BPF-to-BPF-call and fetching-bitwise-atomic
-    // probes that once lived here are all lowered now; the remaining unlowered
-    // *instruction* shapes — map pseudo-form LD_IMM64, arena atomics — do not
-    // verify without maps or an arena to set up.)
-    let cases: [(&str, Vec<Decoded>); 1] = [(
-        "may_goto",
-        alloc::vec![
-            super::mov_imm(0, 0),
-            super::alu_imm(AluOp::Add, 0, 1),
-            Decoded::MayGoto { off: -2 },
-            Decoded::Exit,
-        ],
-    )];
-    for (what, items) in cases {
-        let Ok(p) = load("unlowered", asm(&items), Context::Atomic) else {
-            // A shape the *verifier* refuses is not evidence about the
-            // backends, and silently skipping it would hollow this out.
-            note!("bpf-fuzz: the verifier rejected the '{what}' probe");
-            return TestResult::Fail("an unlowered-shape probe no longer verifies");
-        };
-        if p.is_jited() {
-            note!("bpf-fuzz: a backend now lowers '{what}' — add it to the fuzzer's repertoire");
-            return TestResult::Fail(
-                "a backend gained a shape the fuzzer does not generate — extend the repertoire",
-            );
-        }
+    // A map pseudo-form `LD_IMM64` is the durable probe: it verifies through the
+    // real loader (given a map to point at) yet resolves to an address the emit
+    // pass never has, so both backends leave it interpreted. (The multiply,
+    // atomic, LD_IMM64, BPF-to-BPF-call, fetching-bitwise-atomic and `may_goto`
+    // probes that once lived here are all lowered now; arena atomics are the only
+    // other unlowered instruction shape, and they need an arena to set up.)
+    let Ok(map) = crate::tests::mk(crate::map::MapKind::Array, 4, 8, 1) else {
+        return TestResult::Fail("could not create a map for the probe");
+    };
+    let items = alloc::vec![
+        // Load the map handle into R1 (unused) so the program is well-formed
+        // without dereferencing it; R0 = 0 is what it returns.
+        Decoded::LoadImm64 {
+            dst: r(1),
+            value: narf_bpf_isa::Imm64::MapFd(3),
+        },
+        super::mov_imm(0, 0),
+        Decoded::Exit,
+    ];
+    let Ok(p) = super::load_with_maps(
+        "unlowered",
+        asm(&items),
+        Context::Atomic,
+        alloc::vec![(3, map)],
+    ) else {
+        // A shape the *verifier* refuses is not evidence about the backends, and
+        // silently skipping it would hollow this out.
+        note!("bpf-fuzz: the verifier rejected the map-pseudo LD_IMM64 probe");
+        return TestResult::Fail("the unlowered-shape probe no longer verifies");
+    };
+    if p.is_jited() {
+        note!("bpf-fuzz: a backend now lowers a map-pseudo LD_IMM64 — extend the repertoire");
+        return TestResult::Fail(
+            "a backend gained a shape the fuzzer does not generate — extend the repertoire",
+        );
     }
     TestResult::Pass
 }

@@ -16,7 +16,7 @@ use narf_bpf_isa::{
 };
 use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
-use crate::{compile, JitError};
+use crate::{compile, Compiled, JitError};
 
 pub(crate) fn r(n: u8) -> Reg {
     Reg::new(n).expect("register in range")
@@ -786,6 +786,34 @@ fn ld_imm64_is_a_ten_byte_move() {
             0x49, 0xBF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, // movabs r15, ...
         ],
         "LD_IMM64 must be a 10-byte mov r64, imm64"
+    );
+}
+
+#[test]
+fn may_goto_is_an_unconditional_jump() {
+    // The runtime always takes `may_goto` (it is metered by fuel, not a hidden
+    // counter), so it lowers to the same `jmp rel32` (0xE9) as an unconditional
+    // `Jump` rather than being refused. Proven differentially: the same program
+    // with the `may_goto` removed emits exactly one fewer `jmp` — the `exit`'s.
+    let add = Decoded::Alu {
+        wide: true,
+        op: AluOp::Add,
+        dst: r(0),
+        src: Source::Imm(1),
+    };
+    let with = compile(&verified(&[
+        mov(0, 0),
+        add,
+        Decoded::MayGoto { off: -2 },
+        EXIT,
+    ]))
+    .expect("may_goto must compile");
+    let without = compile(&verified(&[mov(0, 0), add, EXIT])).expect("compiles");
+    let jmps = |c: &Compiled| c.code.iter().filter(|&&b| b == 0xE9).count();
+    assert_eq!(
+        jmps(&with),
+        jmps(&without) + 1,
+        "may_goto must add exactly one unconditional jump"
     );
 }
 

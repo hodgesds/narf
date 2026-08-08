@@ -147,13 +147,22 @@ fn load(
     insns: Vec<Insn>,
     ctx: Context,
 ) -> Result<alloc::sync::Arc<BpfProg>, &'static str> {
+    load_with_maps(name, insns, ctx, alloc::vec::Vec::new())
+}
+
+fn load_with_maps(
+    name: &str,
+    insns: Vec<Insn>,
+    ctx: Context,
+    maps: alloc::vec::Vec<(i32, Arc<crate::map::BpfMap>)>,
+) -> Result<alloc::sync::Arc<BpfProg>, &'static str> {
     BpfProg::load(
         load_cap(),
         LoadRequest {
             name: alloc::string::String::from(name),
             insns,
             context: ctx,
-            maps: alloc::vec::Vec::new(),
+            maps,
         },
     )
     .map_err(|_| "load rejected")
@@ -386,6 +395,38 @@ fn smoke_bpf_jit_ld_imm64_matches_the_interpreter() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_jit_ld_imm64_matches_the_interpreter);
+
+fn smoke_bpf_jit_may_goto_matches_the_interpreter() -> TestResult {
+    // `may_goto` is lowered as an unconditional back-edge, terminated here by a
+    // conditional exit rather than by fuel: R1 counts down from 5, R0 up, and the
+    // loop leaves when R1 hits 0 — so R0 = 5. The JIT (always-take-the-branch)
+    // must agree with the interpreter, which meters the same edge with fuel.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let insns = asm(&[
+        mov_imm(0, 0),
+        mov_imm(1, 5),
+        alu_imm(AluOp::Add, 0, 1),
+        alu_imm(AluOp::Sub, 1, 1),
+        jeq_imm(1, 0, 1),             // if R1 == 0 goto exit
+        Decoded::MayGoto { off: -4 }, // else loop back to the Add
+        EXIT,
+    ]);
+    let Ok(p) = load("maygoto", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected a may_goto loop");
+    };
+    match diff_run(&p, [0; 4]) {
+        Ok(()) => {}
+        Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+        Err(_) => return TestResult::Fail("may_goto diverged from the interpreter"),
+    }
+    if !matches!(p.run_atomic([0; 4], 4), Some(Outcome::Returned(5))) {
+        return TestResult::Fail("may_goto loop returned the wrong value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_may_goto_matches_the_interpreter);
 
 fn smoke_bpf_interp_loop_terminates() -> TestResult {
     // r0 = 0; r1 = 10; loop { r0 += 1; r1 -= 1; if r1 != 0 goto loop } exit

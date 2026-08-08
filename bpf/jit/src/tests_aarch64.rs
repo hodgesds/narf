@@ -719,6 +719,38 @@ fn a64_golden_atomics() {
 }
 
 #[test]
+fn a64_may_goto_is_an_unconditional_branch() {
+    // `may_goto` lowers to a plain `B` (the runtime always takes it, bounded by
+    // fuel), not a refusal. Proven differentially: removing it emits exactly one
+    // fewer `B` — the `exit`'s branch to the epilogue.
+    let add = Decoded::Alu {
+        wide: true,
+        op: AluOp::Add,
+        dst: r(0),
+        src: Source::Imm(1),
+    };
+    let with = aarch64::compile(&verified(&[
+        mov(0, 0),
+        add,
+        Decoded::MayGoto { off: -2 },
+        EXIT,
+    ]))
+    .expect("may_goto must compile");
+    let without = aarch64::compile(&verified(&[mov(0, 0), add, EXIT])).expect("compiles");
+    let branches = |c: &crate::Compiled| {
+        a64_words(&c.code)
+            .iter()
+            .filter(|&&w| w & 0xFC00_0000 == 0x1400_0000)
+            .count()
+    };
+    assert_eq!(
+        branches(&with),
+        branches(&without) + 1,
+        "may_goto must add exactly one unconditional branch"
+    );
+}
+
+#[test]
 fn a64_golden_fetching_bitwise_atomics() {
     // The LSE fetch forms, dst = R10 (FP = x25), src = R6 (x19), off = 0. OR and
     // XOR route the old value through x16; AND is `MVN` of the operand into x16
@@ -1068,14 +1100,18 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
     // being emitted.
     let cases: [(&str, Decoded); 2] = [
         (
-            // `may_goto` carries a hidden loop counter the emitter does not
-            // model (it is separate from fuel), so it stays interpreted.
-            "may_goto",
-            Decoded::MayGoto { off: -1 },
+            // A subprogram-address LD_IMM64 resolves to a code address the emit
+            // pass does not have, so it stays interpreted (the plain-value form
+            // is emitted).
+            "subprog-addr-ld_imm64",
+            Decoded::LoadImm64 {
+                dst: r(0),
+                value: Imm64::SubprogAddr(1),
+            },
         ),
         (
-            // The plain-value LD_IMM64 is now emitted; a map pseudo-form is not,
-            // since it resolves to an address the emitter never has.
+            // A map pseudo-form is likewise not emitted — it resolves to an
+            // address the emitter never has.
             "map-pseudo-ld_imm64",
             Decoded::LoadImm64 {
                 dst: r(0),

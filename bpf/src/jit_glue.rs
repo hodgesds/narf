@@ -348,8 +348,6 @@ pub enum JitSkip {
     Unsupported,
     /// Text allocation, writing, registration, or sealing failed.
     TextUnavailable,
-    /// Contains a back-edge, and no fuel is emitted to bound it.
-    Unbounded,
     /// Dereferences a register whose pointer class the emitter cannot certify:
     /// anything but the frame, or — in a program with no `call` — the context.
     UncheckedPointerBase,
@@ -409,9 +407,6 @@ fn scan_program(v: &VerifiedProgram) -> Result<(), JitSkip> {
         // for why a *missed* arena site cannot slip through this exemption.
         let arena_here = arena[i];
         match d {
-            // `may_goto` still declines: it carries a hidden counter the
-            // emitter does not model, which is separate from fuel.
-            Decoded::MayGoto { .. } => return Err(JitSkip::Unbounded),
             // A load or store base must be one the emitter can certify. Any
             // other register could hold a class it would lower to a bare
             // dereference.

@@ -93,8 +93,8 @@
 //! div/mod), `MOV`, `LD_IMM64`, loads and stores through R10/R1, atomics, jumps,
 //! conditional jumps, `exit`, **kfunc calls**, and **BPF-to-BPF calls** (see
 //! [`emit_subprog_call`]). Left interpreted: the map/subprogram-address pseudo
-//! forms of `LD_IMM64`, arena atomics, `may_goto`, and arena accesses in a
-//! program that also makes BPF-to-BPF calls. Everything unemitted returns
+//! forms of `LD_IMM64`, arena atomics, and arena accesses in a program that also
+//! makes BPF-to-BPF calls. Everything unemitted returns
 //! [`JitError::Unsupported`] and runs interpreted, which is a complete
 //! implementation — so an unemitted instruction costs speed, not correctness.
 //!
@@ -1181,6 +1181,18 @@ fn emit_kfunc_call(e: &mut Emit, addr: usize) {
     e.w(ldr_post(hr::LR, hr::SP, 16)); // ldr x30, [sp], #16
 }
 
+/// An unconditional `B` to the BPF instruction `at + 1 + off`. Shared by `Jump`
+/// and `may_goto`, whose `off` fields differ in width.
+fn emit_uncond_branch(e: &mut Emit, at: u32, off: i64, relocs: &mut Vec<Reloc>) {
+    let at_word = e.len();
+    e.w(b(0));
+    relocs.push(Reloc {
+        at: at_word,
+        target: (at as i64 + 1 + off) as u32,
+        kind: RelKind::B26,
+    });
+}
+
 /// A BPF-to-BPF call, the JIT analogue of the interpreter's `push_frame`.
 ///
 /// R6..R10 must survive a call (BPF's ABI) and `BL` clobbers `x30`, so the six
@@ -1529,15 +1541,11 @@ fn emit_insn(
             e.w(stur_sized(size, hr::IMM, base, disp));
         }
 
-        Decoded::Jump { off } => {
-            let at_word = e.len();
-            e.w(b(0));
-            relocs.push(Reloc {
-                at: at_word,
-                target: (at as i64 + 1 + i64::from(off)) as u32,
-                kind: RelKind::B26,
-            });
-        }
+        // `may_goto` is an unconditional branch here: the runtime always takes
+        // the back-edge (metered by fuel), so it lowers like `Jump`. Its `off` is
+        // `i16` where `Jump`'s is `i32`, so it needs its own arm.
+        Decoded::Jump { off } => emit_uncond_branch(e, at, i64::from(off), relocs),
+        Decoded::MayGoto { off } => emit_uncond_branch(e, at, i64::from(off), relocs),
 
         Decoded::JumpCond {
             wide,
