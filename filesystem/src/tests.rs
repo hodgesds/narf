@@ -1981,6 +1981,118 @@ kernel_test_in!(
     smoke_dev_input_dir_enumerate_finds_event0
 );
 
+/// A chown/chmod on an evdev node must OUTLIVE the fd that made it.
+///
+/// udev applies `GROUP="input", MODE="0660"` to every `/dev/input/event*`
+/// (50-udev-default.rules). `InputEventFile` implemented neither setter, so
+/// the trait defaults returned `Unsupported` and udev logged, once its event
+/// loop finally survived long enough to get here:
+///
+/// ```text
+/// event1: Failed to set owner/mode of /dev/input/event1 to uid=0, gid=104,
+///         mode=0660: Operation not supported
+/// ```
+///
+/// The node then stayed root:root. That reads as cosmetic because the mode was
+/// already 0660 — but 0660 root:root cannot be opened by a compositor running
+/// as uid 1000, which is the same failure shape that supplementary-group DAC
+/// support was added for on the DRM nodes.
+///
+/// The assertion is deliberately made through a SECOND, freshly-opened handle:
+/// every `open()` builds a new `InputEventFile`, so state kept on the instance
+/// would pass a same-handle read-back while still being useless to the next
+/// opener. This is the property that forced a shared node table.
+fn smoke_dev_input_chown_persists_across_reopen() -> TestResult {
+    use crate::devfs_input::{DeviceKind, InputEventFile};
+    use crate::FileOps;
+    use narf_input::evdev::{DeviceCaps, ROUTER};
+
+    const GID_INPUT: u32 = 104;
+    let (id, _node) = ROUTER.register_device(DeviceCaps::new());
+    let first = match InputEventFile::open(id, DeviceKind::Hardware) {
+        Some(f) => f,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("open returned None for live device");
+        }
+    };
+
+    // Boot default: root:root, 0660 — what Linux's evdev creates before udev.
+    let mut fail: Option<&'static str> = None;
+    if first.owners() != (0, 0) {
+        fail = Some("a fresh evdev node did not start out root-owned");
+    }
+    if fail.is_none() && first.stat().mode.perms != 0o660 {
+        fail = Some("a fresh evdev node did not start at mode 0660");
+    }
+
+    // What udev does.
+    if fail.is_none() {
+        if poll_once_devfs_input(first.set_owners(0, GID_INPUT)).is_none() {
+            fail = Some("set_owners returned Pending");
+        } else if poll_once_devfs_input(first.set_perms(0o660)).is_none() {
+            fail = Some("set_perms returned Pending");
+        }
+    }
+    // udev closes its fd; the compositor opens its own later.
+    drop(first);
+
+    if fail.is_none() {
+        match InputEventFile::open(id, DeviceKind::Hardware) {
+            Some(second) => {
+                if second.owners() != (0, GID_INPUT) {
+                    fail = Some("chown did not survive reopen — a later opener sees root:root");
+                } else if second.stat().mode.perms != 0o660 {
+                    fail = Some("mode did not survive reopen");
+                }
+            }
+            None => fail = Some("reopen returned None for live device"),
+        }
+    }
+
+    ROUTER.unregister_device(id);
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_dev_input_chown_persists_across_reopen
+);
+
+/// `EVDEV_NODE_META` keys ownership by event number and never removes
+/// entries. That is only safe because `ROUTER.register_device` allocates ids
+/// monotonically (`next_id += 1`) and never recycles them after an
+/// unregister — so a replugged device gets a FRESH node rather than
+/// inheriting the previous occupant's uid/gid.
+///
+/// That invariant lives in another crate (`narf-input`), where a future
+/// free-list or id-reuse optimisation would silently hand a new device the
+/// old one's permissions — a comment in this file would keep looking correct
+/// while being wrong. Pin it here instead.
+fn smoke_evdev_device_ids_are_never_recycled() -> TestResult {
+    use narf_input::evdev::{DeviceCaps, ROUTER};
+
+    let (first, _n1) = ROUTER.register_device(DeviceCaps::new());
+    ROUTER.unregister_device(first);
+    let (second, _n2) = ROUTER.register_device(DeviceCaps::new());
+    ROUTER.unregister_device(second);
+
+    if second == first {
+        // Reusing the id would make a fresh device inherit the previous
+        // node's ownership out of EVDEV_NODE_META.
+        return TestResult::Fail(
+            "device id was recycled after unregister — evdev node ownership can leak between devices",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_evdev_device_ids_are_never_recycled
+);
+
 /// 2. InputEventFile read with empty ring + zero-size buf → 0 bytes (non-blocking).
 fn smoke_dev_input_read_zero_buf_non_blocking() -> TestResult {
     use crate::devfs_input::{DeviceKind, InputEventFile};
