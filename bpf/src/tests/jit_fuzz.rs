@@ -38,12 +38,20 @@
 //!   to a move — see [`neutralise_dead_calls`].
 //!
 //! The instruction *repertoire* is deliberately exactly what the backends
-//! lower: a shape neither backend emits (`div`, `mod`, `LD_IMM64`, atomics,
-//! byte-swap, sub-doubleword and sign-extending memory access) would make every
+//! lower: a shape neither backend emits (an arena atomic) would make every
 //! program containing it fall back, and a fuzzer whose subjects fall back is a
 //! fuzzer comparing the interpreter with itself.
-//! [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`] pins that boundary,
-//! so extending a backend makes this module's repertoire go stale *loudly*.
+//!
+//! Three lowered shapes are deliberately *not* generated here and are covered by
+//! goldens plus targeted `smoke_bpf_jit_*_matches_the_interpreter` tests instead:
+//! the plain-value `LD_IMM64` and BPF-to-BPF calls (both multi-slot, and this
+//! generator's jump arithmetic is single-slot index space, so a wide instruction
+//! would shift every later target), and `may_goto` (an always-taken back-edge,
+//! which would turn most programs into fuel-bounded spins). None carries the kind
+//! of interaction — flags, addressing, register aliasing — that the fuzzer
+//! exists to shake out.
+//! [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`] pins the boundary, so
+//! extending a backend makes this module's repertoire go stale *loudly*.
 //!
 //! ## Determinism and replay
 //!
@@ -78,7 +86,7 @@
 
 use alloc::vec::Vec;
 
-use narf_bpf_isa::{AluOp, CondOp, Decoded, Size, Source};
+use narf_bpf_isa::{AluOp, AtomicOp, ByteOrder, CondOp, Decoded, Size, Source};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{asm, call, call_arena_base, diff_run, load, r, NOT_COMPILED, NO_BACKEND};
@@ -276,9 +284,22 @@ const IMM_POOL: [i32; 17] = [
 /// beyond the second so the scratch path is not only hit at its edge.
 const SLOT_OFFS: [i16; 10] = [-8, -16, -120, -128, -136, -248, -256, -264, -504, -512];
 
-/// The ALU operations both backends lower. `Div` and `Mod` are absent on
-/// purpose — see the module docs and
-/// [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`].
+/// The access widths both backends lower. Applied only at the 8-aligned
+/// [`SLOT_OFFS`], so every width is naturally aligned and stays within the
+/// doubleword phase C wrote.
+const LDST_SIZES: [Size; 4] = [Size::B, Size::H, Size::W, Size::Dw];
+
+/// The `MOVSX` source widths both backends lower.
+const MOVSX_BITS: [u8; 3] = [8, 16, 32];
+
+/// The byte-swap orders and widths both backends lower. `Little` masks to
+/// width; `Big`/`Swap` reverse.
+const END_ORDERS: [ByteOrder; 3] = [ByteOrder::Little, ByteOrder::Big, ByteOrder::Swap];
+const END_WIDTHS: [u8; 3] = [16, 32, 64];
+
+/// The binary ALU operations both backends lower through the shifted-register
+/// path. `Div`/`Mod` are their own `Decoded` variants (not `AluOp`s) and are
+/// woven into the ALU units directly — see [`emit_unit`].
 const ALU_OPS: [AluOp; 9] = [
     AluOp::Add,
     AluOp::Sub,
@@ -324,6 +345,11 @@ struct Classes {
     back_edge: u32,
     uncond_jump: u32,
     narrow: u32,
+    narrow_mem: u32,
+    movsx: u32,
+    byteswap: u32,
+    divmod: u32,
+    atomic: u32,
 }
 
 impl Classes {
@@ -340,6 +366,11 @@ impl Classes {
         self.back_edge += o.back_edge;
         self.uncond_jump += o.uncond_jump;
         self.narrow += o.narrow;
+        self.narrow_mem += o.narrow_mem;
+        self.movsx += o.movsx;
+        self.byteswap += o.byteswap;
+        self.divmod += o.divmod;
+        self.atomic += o.atomic;
     }
 }
 
@@ -532,6 +563,53 @@ fn pick_opaque(rng: &mut Rng, opaque: &[bool; 10]) -> u8 {
     candidates[rng.below(n as u32) as usize]
 }
 
+/// A `Div` or `Mod` with a random signedness, for the ALU units. Both variants
+/// and both signednesses are reachable, so a run covers the signed guard, the
+/// unsigned path, quotient and remainder across the two backends.
+fn divmod_insn(rng: &mut Rng, wide: bool, dst: u8, src: Source) -> Decoded {
+    let signed = rng.chance(50);
+    if rng.chance(50) {
+        Decoded::Mod {
+            wide,
+            signed,
+            dst: r(dst),
+            src,
+        }
+    } else {
+        Decoded::Div {
+            wide,
+            signed,
+            dst: r(dst),
+            src,
+        }
+    }
+}
+
+/// One atomic operation both backends lower. `src` is the store/operand
+/// register; `Cmpxchg` is only offered when it is not R0, which would alias
+/// aarch64 `CASAL`'s `Rs`/`Rt` and be refused. Every other form — including the
+/// fetching bitwise ones (an x86 cmpxchg loop, an aarch64 LSE fetch) — is
+/// generated.
+fn pick_atomic_op(rng: &mut Rng, src: u8) -> AtomicOp {
+    loop {
+        match rng.below(12) {
+            0 => return AtomicOp::Add { fetch: false },
+            1 => return AtomicOp::Add { fetch: true },
+            2 => return AtomicOp::Or { fetch: false },
+            3 => return AtomicOp::Or { fetch: true },
+            4 => return AtomicOp::And { fetch: false },
+            5 => return AtomicOp::And { fetch: true },
+            6 => return AtomicOp::Xor { fetch: false },
+            7 => return AtomicOp::Xor { fetch: true },
+            8 => return AtomicOp::Xchg,
+            9 => return AtomicOp::LoadAcquire,
+            10 => return AtomicOp::StoreRelease,
+            _ if src != 0 => return AtomicOp::Cmpxchg,
+            _ => {}
+        }
+    }
+}
+
 /// Emit one body unit. A unit is one or more instructions that must not be
 /// jumped into the middle of.
 #[allow(clippy::too_many_arguments)]
@@ -554,48 +632,76 @@ fn emit_unit(
         r => r,
     };
     match roll {
-        // ALU, immediate source.
+        // ALU, immediate source — a fifth of the time a `Div`/`Mod` instead,
+        // which exercises the x86 divide-by-zero and `INT_MIN / -1` guards (an
+        // immediate `0` divisor is a legal, and interesting, boundary) and the
+        // guard-free aarch64 `SDIV`/`UDIV`/`MSUB` path.
         0..=21 => {
             let wide = rng.chance(55);
             let dst = rng.reg();
-            let op = ALU_OPS[rng.below(ALU_OPS.len() as u32) as usize];
-            prog.push(Decoded::Alu {
-                wide,
-                op,
-                dst: r(dst),
-                src: Source::Imm(rng.imm()),
-            });
-            cls.alu_imm += 1;
+            if rng.chance(20) {
+                let divisor = Source::Imm(rng.imm());
+                prog.push(divmod_insn(rng, wide, dst, divisor));
+                cls.divmod += 1;
+            } else {
+                let op = ALU_OPS[rng.below(ALU_OPS.len() as u32) as usize];
+                prog.push(Decoded::Alu {
+                    wide,
+                    op,
+                    dst: r(dst),
+                    src: Source::Imm(rng.imm()),
+                });
+                cls.alu_imm += 1;
+            }
             if !wide {
                 cls.narrow += 1;
             }
         }
-        // ALU, register source.
+        // ALU, register source — likewise a fifth of the time a `Div`/`Mod`,
+        // whose register divisor is verifier-opaque and so can be zero at run
+        // time, differentiating the zero-divisor lowering against the interpreter.
         22..=39 => {
             let wide = rng.chance(55);
             let dst = rng.reg();
             let src = rng.reg();
-            let op = ALU_OPS[rng.below(ALU_OPS.len() as u32) as usize];
-            prog.push(Decoded::Alu {
-                wide,
-                op,
-                dst: r(dst),
-                src: Source::Reg(r(src)),
-            });
+            if rng.chance(20) {
+                prog.push(divmod_insn(rng, wide, dst, Source::Reg(r(src))));
+                cls.divmod += 1;
+            } else {
+                let op = ALU_OPS[rng.below(ALU_OPS.len() as u32) as usize];
+                prog.push(Decoded::Alu {
+                    wide,
+                    op,
+                    dst: r(dst),
+                    src: Source::Reg(r(src)),
+                });
+                cls.alu_reg += 1;
+            }
             opaque[dst as usize] |= opaque[src as usize];
-            cls.alu_reg += 1;
             if !wide {
                 cls.narrow += 1;
             }
         }
-        // Negate.
+        // Negate — or a byte swap (`END`/`bswap`) a third of the time, which
+        // covers the rev/movzx lowering across the three widths and orders.
         40..=44 => {
-            let wide = rng.chance(50);
             let dst = rng.reg();
-            prog.push(Decoded::Neg { wide, dst: r(dst) });
-            cls.neg += 1;
-            if !wide {
-                cls.narrow += 1;
+            if rng.chance(33) {
+                let order = END_ORDERS[rng.below(END_ORDERS.len() as u32) as usize];
+                let width = END_WIDTHS[rng.below(END_WIDTHS.len() as u32) as usize];
+                prog.push(Decoded::End {
+                    dst: r(dst),
+                    order,
+                    width,
+                });
+                cls.byteswap += 1;
+            } else {
+                let wide = rng.chance(50);
+                prog.push(Decoded::Neg { wide, dst: r(dst) });
+                cls.neg += 1;
+                if !wide {
+                    cls.narrow += 1;
+                }
             }
         }
         // Move, immediate — the only thing that *clears* opacity.
@@ -614,47 +720,66 @@ fn emit_unit(
                 cls.narrow += 1;
             }
         }
-        // Move, register.
+        // Move, register — plain, or a sign-extending `MOVSX` a third of the
+        // time, which exercises the SBFM/movsx lowering against `widen`.
         54..=60 => {
             let wide = rng.chance(70);
             let dst = rng.reg();
             let src = rng.reg();
+            let sign_extend = if rng.chance(33) {
+                Some(MOVSX_BITS[rng.below(MOVSX_BITS.len() as u32) as usize])
+            } else {
+                None
+            };
             prog.push(Decoded::Mov {
                 wide,
                 dst: r(dst),
                 src: Source::Reg(r(src)),
-                sign_extend: None,
+                sign_extend,
             });
             opaque[dst as usize] = opaque[src as usize];
             cls.mov += 1;
+            if sign_extend.is_some() {
+                cls.movsx += 1;
+            }
             if !wide {
                 cls.narrow += 1;
             }
         }
-        // Stack store.
+        // Stack store. Every `SLOT_OFFS` entry is 8-aligned, so a narrower
+        // store is aligned for its width and lands within the doubleword phase C
+        // initialised — which keeps the slot defined for any later load.
         61..=68 => {
             let k = rng.below(SLOT_OFFS.len() as u32) as usize;
+            let size = LDST_SIZES[rng.below(LDST_SIZES.len() as u32) as usize];
             let src = if rng.chance(60) {
                 Source::Reg(r(rng.reg()))
             } else {
                 Source::Imm(rng.imm())
             };
             prog.push(Decoded::Store {
-                size: Size::Dw,
+                size,
                 dst: r(10),
                 off: SLOT_OFFS[k],
                 src,
             });
             cls.stack_store += 1;
+            if size != Size::Dw {
+                cls.narrow_mem += 1;
+            }
         }
         // Stack load. Always from an offset phase C filled, so it is in bounds
-        // and reads a value this run wrote.
+        // and reads a value this run wrote. Narrower and sign-extending forms
+        // exercise the movzx/movsx (LDUR*) lowerings against the interpreter's
+        // `widen`.
         69..=76 => {
             let k = rng.below(SLOT_OFFS.len() as u32) as usize;
             let dst = rng.reg();
+            let size = LDST_SIZES[rng.below(LDST_SIZES.len() as u32) as usize];
+            let sign_extend = size != Size::Dw && rng.chance(50);
             prog.push(Decoded::Load {
-                size: Size::Dw,
-                sign_extend: false,
+                size,
+                sign_extend,
                 dst: r(dst),
                 src: r(10),
                 off: SLOT_OFFS[k],
@@ -663,6 +788,9 @@ fn emit_unit(
             // anything, so treat a load as opaque whenever phase C made it so.
             opaque[dst as usize] = slot_opaque[k];
             cls.stack_load += 1;
+            if size != Size::Dw {
+                cls.narrow_mem += 1;
+            }
         }
         // A kfunc call, plus the re-init of the registers it clobbers.
         //
@@ -690,6 +818,36 @@ fn emit_unit(
             // The return value is not a constant the verifier can see.
             opaque[0] = true;
             cls.call += 1;
+        }
+        // A stack atomic on an 8-aligned slot phase C initialised. Only the
+        // shapes both backends lower are generated — the fetching bitwise forms
+        // need an x86 cmpxchg loop and stay interpreted, and cmpxchg avoids R0
+        // as the store value (it would alias aarch64 `CASAL` Rs==Rt). See
+        // `smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`.
+        86..=90 => {
+            let k = rng.below(SLOT_OFFS.len() as u32) as usize;
+            let size = if rng.chance(50) { Size::Dw } else { Size::W };
+            let src = rng.reg();
+            let op = pick_atomic_op(rng, src);
+            prog.push(Decoded::Atomic {
+                size,
+                op,
+                dst: r(10),
+                src: r(src),
+                off: SLOT_OFFS[k],
+            });
+            // A fetching form writes the pre-op value into src; cmpxchg clobbers
+            // R0. Either makes the destination register verifier-opaque.
+            if op.writes_src() {
+                opaque[src as usize] = true;
+            }
+            if matches!(op, AtomicOp::Cmpxchg) {
+                opaque[0] = true;
+            }
+            cls.atomic += 1;
+            if size != Size::Dw {
+                cls.narrow_mem += 1;
+            }
         }
         // A jump. Target patched once the layout is known.
         _ => {
@@ -910,7 +1068,7 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         pct(t.compiled, t.generated)
     );
     note!(
-        "bpf-fuzz: classes alu_i={} alu_r={} neg={} mov={} st={} ld={} ctx={} call={} fwd={} back={} ja={} 32bit={}",
+        "bpf-fuzz: classes alu_i={} alu_r={} neg={} mov={} st={} ld={} ctx={} call={} fwd={} back={} ja={} 32bit={} narrowmem={} movsx={} bswap={} divmod={} atomic={}",
         cls.alu_imm,
         cls.alu_reg,
         cls.neg,
@@ -922,7 +1080,12 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         cls.fwd_branch,
         cls.back_edge,
         cls.uncond_jump,
-        cls.narrow
+        cls.narrow,
+        cls.narrow_mem,
+        cls.movsx,
+        cls.byteswap,
+        cls.divmod,
+        cls.atomic
     );
 
     // Coverage assertions. Without these the test could stay green while the
@@ -951,6 +1114,11 @@ fn smoke_bpf_jit_fuzz_generated_programs_match_the_interpreter() -> TestResult {
         || cls.back_edge == 0
         || cls.stack_load == 0
         || cls.narrow == 0
+        || cls.narrow_mem == 0
+        || cls.movsx == 0
+        || cls.byteswap == 0
+        || cls.divmod == 0
+        || cls.atomic == 0
     {
         return TestResult::Fail("the generator stopped covering a class it claims to cover");
     }
@@ -1317,101 +1485,42 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
     if !narf_bpf_jit::has_backend() {
         return TestResult::Skip(NO_BACKEND);
     }
-    let cases: [(&str, Vec<Decoded>); 6] = [
-        (
-            "div",
-            alloc::vec![
-                super::mov_imm(0, 100),
-                super::mov_imm(1, 7),
-                Decoded::Div {
-                    wide: true,
-                    signed: false,
-                    dst: r(0),
-                    src: Source::Reg(r(1)),
-                },
-                Decoded::Exit,
-            ],
-        ),
-        (
-            "mod",
-            alloc::vec![
-                super::mov_imm(0, 100),
-                Decoded::Mod {
-                    wide: true,
-                    signed: false,
-                    dst: r(0),
-                    src: Source::Imm(7),
-                },
-                Decoded::Exit,
-            ],
-        ),
-        (
-            "byte-swap",
-            alloc::vec![
-                super::mov_imm(0, 0x1234),
-                Decoded::End {
-                    dst: r(0),
-                    order: narf_bpf_isa::ByteOrder::Little,
-                    width: 32,
-                },
-                Decoded::Exit,
-            ],
-        ),
-        (
-            "narrow stack load",
-            alloc::vec![
-                super::st_imm(10, -8, 0x5A5A),
-                Decoded::Load {
-                    size: Size::W,
-                    sign_extend: false,
-                    dst: r(0),
-                    src: r(10),
-                    off: -8,
-                },
-                Decoded::Exit,
-            ],
-        ),
-        (
-            "sign-extending load",
-            alloc::vec![
-                super::st_imm(10, -8, -1),
-                Decoded::Load {
-                    size: Size::W,
-                    sign_extend: true,
-                    dst: r(0),
-                    src: r(10),
-                    off: -8,
-                },
-                Decoded::Exit,
-            ],
-        ),
-        (
-            "MOVSX",
-            alloc::vec![
-                super::mov_imm(0, -1),
-                Decoded::Mov {
-                    wide: true,
-                    dst: r(0),
-                    src: Source::Reg(r(0)),
-                    sign_extend: Some(8),
-                },
-                Decoded::Exit,
-            ],
-        ),
+    // An arena atomic is the durable probe: it verifies through the real loader
+    // (given an arena to point at) yet has no lowering — the arena addressing
+    // shape and the atomic/cmpxchg-loop scratch registers collide, so both
+    // backends leave it interpreted. (The multiply, atomic, LD_IMM64,
+    // BPF-to-BPF-call, fetching-bitwise-atomic, `may_goto` and map-pseudo
+    // LD_IMM64 probes that once lived here are all lowered now.)
+    let cap = crate::arena::kernel_arena_cap();
+    let group = match crate::arena::ArenaGroup::with_one(cap, 1) {
+        Ok(g) => alloc::sync::Arc::new(g),
+        Err(_) => return TestResult::Fail("could not reserve an arena for the probe"),
+    };
+    let items = alloc::vec![
+        call_arena_base(),    // R0 = the arena base handle
+        super::mov_reg(6, 0), // park it in R6, which survives the call
+        super::mov_imm(0, 0), // R0 = 0, so `exit` does not return a pointer
+        super::mov_imm(1, 7), // the addend
+        Decoded::Atomic {
+            size: Size::Dw,
+            op: AtomicOp::Add { fetch: false },
+            dst: r(6),
+            src: r(1),
+            off: 0,
+        },
+        Decoded::Exit,
     ];
-    for (what, items) in cases {
-        let Ok(p) = load("unlowered", asm(&items), Context::Atomic) else {
-            // A shape the *verifier* refuses is not evidence about the
-            // backends, and silently skipping it would hollow this out.
-            note!("bpf-fuzz: the verifier rejected the '{what}' probe");
-            return TestResult::Fail("an unlowered-shape probe no longer verifies");
-        };
-        if p.is_jited() {
-            note!("bpf-fuzz: a backend now lowers '{what}' — add it to the fuzzer's repertoire");
-            return TestResult::Fail(
-                "a backend gained a shape the fuzzer does not generate — extend the repertoire",
-            );
-        }
+    let Some(p) = load_against(&group, &items) else {
+        // A shape the *verifier* refuses is not evidence about the backends, and
+        // silently skipping it would hollow this out.
+        note!("bpf-fuzz: the verifier rejected the arena-atomic probe");
+        return TestResult::Fail("the unlowered-shape probe no longer verifies");
+    };
+    if p.is_jited() {
+        note!("bpf-fuzz: a backend now lowers an arena atomic — extend the repertoire");
+        return TestResult::Fail(
+            "a backend gained a shape the fuzzer does not generate — extend the repertoire",
+        );
     }
     TestResult::Pass
 }

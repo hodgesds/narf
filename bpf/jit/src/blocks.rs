@@ -58,6 +58,15 @@ pub fn block_starts(prog: &VerifiedProgram) -> Result<Vec<bool>, JitError> {
                     starts[next] = true;
                 }
             }
+            // `may_goto` is a back-edge the JIT emits as an unconditional jump
+            // (the runtime always takes it, bounded by fuel), so it ends a block
+            // and its target begins one — exactly like `Jump`.
+            Decoded::MayGoto { off } => {
+                mark_target(i64::from(off))?;
+                if next <= n {
+                    starts[next] = true;
+                }
+            }
             // `exit` ends a block; whatever follows begins one.
             Decoded::Exit => {
                 if next <= n {

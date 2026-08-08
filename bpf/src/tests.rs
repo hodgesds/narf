@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 
 use narf_bpf_isa::encode::encode;
-use narf_bpf_isa::{AluOp, CallTarget, CondOp, Decoded, Insn, Reg, Size, Source};
+use narf_bpf_isa::{AluOp, AtomicOp, CallTarget, CondOp, Decoded, Imm64, Insn, Reg, Size, Source};
 use narf_bpf_verifier::kfunc::Context;
 use narf_capabilities::{Cap, Grant};
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -147,13 +147,22 @@ fn load(
     insns: Vec<Insn>,
     ctx: Context,
 ) -> Result<alloc::sync::Arc<BpfProg>, &'static str> {
+    load_with_maps(name, insns, ctx, alloc::vec::Vec::new())
+}
+
+fn load_with_maps(
+    name: &str,
+    insns: Vec<Insn>,
+    ctx: Context,
+    maps: alloc::vec::Vec<(i32, Arc<crate::map::BpfMap>)>,
+) -> Result<alloc::sync::Arc<BpfProg>, &'static str> {
     BpfProg::load(
         load_cap(),
         LoadRequest {
             name: alloc::string::String::from(name),
             insns,
             context: ctx,
-            maps: alloc::vec::Vec::new(),
+            maps,
         },
     )
     .map_err(|_| "load rejected")
@@ -265,6 +274,197 @@ fn smoke_bpf_interp_stack_roundtrip() -> TestResult {
     }
 }
 kernel_test_in!("bpf", smoke_bpf_interp_stack_roundtrip);
+
+fn smoke_bpf_jit_atomics_match_the_interpreter() -> TestResult {
+    // Deterministic companion to the fuzzer's atomic coverage: each op runs on a
+    // stack slot and its *observable* effect is returned in R0 — the modified
+    // memory for every op, and the fetched value for the fetching forms — so the
+    // JIT's memory write and its register write are each compared against the
+    // interpreter at a known answer rather than only when a random program
+    // happens to route the effect into R0.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let ops = [
+        AtomicOp::Add { fetch: false },
+        AtomicOp::Add { fetch: true },
+        AtomicOp::Or { fetch: false },
+        AtomicOp::Or { fetch: true },
+        AtomicOp::And { fetch: false },
+        AtomicOp::And { fetch: true },
+        AtomicOp::Xor { fetch: false },
+        AtomicOp::Xor { fetch: true },
+        AtomicOp::Xchg,
+        AtomicOp::Cmpxchg,
+        AtomicOp::LoadAcquire,
+        AtomicOp::StoreRelease,
+    ];
+    for size in [Size::W, Size::Dw] {
+        for &op in &ops {
+            let at = Decoded::Atomic {
+                size,
+                op,
+                dst: r(10),
+                src: r(1),
+                off: -8,
+            };
+            // R0 = 3 doubles as the cmpxchg comparand (equal to the initial
+            // value, so the swap takes); R1 = 5 is the operand / store value.
+            let prologue = [mov_imm(0, 3), mov_imm(1, 5), st_imm(10, -8, 3)];
+
+            // The modified memory, read back into R0.
+            let mut mem_prog = prologue.to_vec();
+            mem_prog.push(at);
+            mem_prog.push(ldx_size(size, 0, 10, -8));
+            mem_prog.push(EXIT);
+            let Ok(p) = load("atomic-mem", asm(&mem_prog), Context::Atomic) else {
+                return TestResult::Fail("an atomic memory probe did not verify");
+            };
+            match diff_run(&p, [0; 4]) {
+                Ok(()) => {}
+                Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+                Err(_) => return TestResult::Fail("an atomic's memory effect diverged"),
+            }
+
+            // The fetched value: cmpxchg leaves it in R0 already; the other
+            // fetching forms leave it in the source register, moved to R0 here.
+            if op.writes_src() || matches!(op, AtomicOp::Cmpxchg) {
+                let mut fetch_prog = prologue.to_vec();
+                fetch_prog.push(at);
+                if !matches!(op, AtomicOp::Cmpxchg) {
+                    fetch_prog.push(Decoded::Mov {
+                        wide: true,
+                        dst: r(0),
+                        src: Source::Reg(r(1)),
+                        sign_extend: None,
+                    });
+                }
+                fetch_prog.push(EXIT);
+                let Ok(p) = load("atomic-fetch", asm(&fetch_prog), Context::Atomic) else {
+                    return TestResult::Fail("an atomic fetch probe did not verify");
+                };
+                match diff_run(&p, [0; 4]) {
+                    Ok(()) => {}
+                    Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+                    Err(_) => return TestResult::Fail("an atomic's fetched value diverged"),
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_atomics_match_the_interpreter);
+
+fn smoke_bpf_jit_ld_imm64_matches_the_interpreter() -> TestResult {
+    // LD_IMM64 is a two-slot instruction the differential fuzzer does not
+    // generate — its jump arithmetic is in single-slot index space — so it earns
+    // a targeted check: load each boundary value into R0 and return it, and
+    // require the JIT to agree with the interpreter and with the value itself
+    // (which exercises every halfword of the aarch64 MOVZ/MOVK materialisation).
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let values: [u64; 6] = [
+        0,
+        1,
+        0xFFFF_FFFF_FFFF_FFFF,
+        0x1122_3344_5566_7788,
+        0x0000_0000_FFFF_FFFF,
+        0xFFFF_FFFF_0000_0000,
+    ];
+    for v in values {
+        let insns = asm(&[
+            Decoded::LoadImm64 {
+                dst: r(0),
+                value: Imm64::Value(v),
+            },
+            EXIT,
+        ]);
+        let Ok(p) = load("ldimm64", insns, Context::Atomic) else {
+            return TestResult::Fail("load rejected an LD_IMM64 program");
+        };
+        match diff_run(&p, [0; 4]) {
+            Ok(()) => {}
+            Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+            Err(_) => return TestResult::Fail("LD_IMM64 diverged from the interpreter"),
+        }
+        if !matches!(p.run_atomic([0; 4], 4), Some(Outcome::Returned(r)) if r == v) {
+            return TestResult::Fail("LD_IMM64 did not load the exact constant");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_ld_imm64_matches_the_interpreter);
+
+fn smoke_bpf_jit_may_goto_matches_the_interpreter() -> TestResult {
+    // `may_goto` is lowered as an unconditional back-edge, terminated here by a
+    // conditional exit rather than by fuel: R1 counts down from 5, R0 up, and the
+    // loop leaves when R1 hits 0 — so R0 = 5. The JIT (always-take-the-branch)
+    // must agree with the interpreter, which meters the same edge with fuel.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let insns = asm(&[
+        mov_imm(0, 0),
+        mov_imm(1, 5),
+        alu_imm(AluOp::Add, 0, 1),
+        alu_imm(AluOp::Sub, 1, 1),
+        jeq_imm(1, 0, 1),             // if R1 == 0 goto exit
+        Decoded::MayGoto { off: -4 }, // else loop back to the Add
+        EXIT,
+    ]);
+    let Ok(p) = load("maygoto", insns, Context::Atomic) else {
+        return TestResult::Fail("load rejected a may_goto loop");
+    };
+    match diff_run(&p, [0; 4]) {
+        Ok(()) => {}
+        Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+        Err(_) => return TestResult::Fail("may_goto diverged from the interpreter"),
+    }
+    if !matches!(p.run_atomic([0; 4], 4), Some(Outcome::Returned(5))) {
+        return TestResult::Fail("may_goto loop returned the wrong value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_may_goto_matches_the_interpreter);
+
+fn smoke_bpf_jit_map_ld_imm64_matches_the_interpreter() -> TestResult {
+    // A map pseudo-form LD_IMM64 no longer forces the whole program to the
+    // interpreter: with the loader-resolved address (the map's Arc pointer) it
+    // JITs. The handle is loaded into R1 (a returned pointer is refused by the
+    // verifier), so what is observed is that the program compiled and that its
+    // scalar result agrees with the interpreter.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let Ok(map) = mk(MapKind::Array, 4, 8, 1) else {
+        return TestResult::Fail("could not create a map");
+    };
+    let insns = asm(&[
+        Decoded::LoadImm64 {
+            dst: r(1),
+            value: Imm64::MapFd(3),
+        },
+        mov_imm(0, 42),
+        EXIT,
+    ]);
+    let Ok(p) = load_with_maps("mapimm", insns, Context::Atomic, alloc::vec![(3, map)]) else {
+        return TestResult::Fail("load rejected a map-pseudo LD_IMM64 program");
+    };
+    if !p.is_jited() {
+        return TestResult::Fail("a map-pseudo LD_IMM64 program did not JIT");
+    }
+    match diff_run(&p, [0; 4]) {
+        Ok(()) => {}
+        Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+        Err(_) => return TestResult::Fail("map-pseudo LD_IMM64 diverged from the interpreter"),
+    }
+    if !matches!(p.run_atomic([0; 4], 4), Some(Outcome::Returned(42))) {
+        return TestResult::Fail("map-pseudo LD_IMM64 program returned the wrong value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_map_ld_imm64_matches_the_interpreter);
 
 fn smoke_bpf_interp_loop_terminates() -> TestResult {
     // r0 = 0; r1 = 10; loop { r0 += 1; r1 -= 1; if r1 != 0 goto loop } exit
@@ -928,6 +1128,12 @@ fn smoke_bpf_subprog_frames_do_not_overlap() -> TestResult {
     let Ok(p) = load("subcall", insns, Context::Atomic) else {
         return TestResult::Fail("load rejected a subprogram call");
     };
+    // The JIT now lowers this; require it to agree with the interpreter before
+    // trusting the value below (a no-op where there is no backend).
+    match diff_run(&p, [0; 4]) {
+        Ok(()) | Err(NO_BACKEND) => {}
+        Err(_) => return TestResult::Fail("native and interpreted frame layouts diverged"),
+    }
     match p.run_atomic([0; 4], 4) {
         Some(Outcome::Returned(0x11)) => TestResult::Pass,
         Some(Outcome::Returned(0x22)) => TestResult::Fail("callee frame overlapped the caller's"),
@@ -1897,7 +2103,7 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
 
     // Gate 3: a probe read — a fault site that is not an arena access — is
     // refused, and named as such.
-    if crate::jit_glue::try_compile(&base(false), true, 0).err()
+    if crate::jit_glue::try_compile(&base(false), true, 0, &[]).err()
         != Some(crate::jit_glue::JitSkip::HasFaultSites)
     {
         return TestResult::Fail("a non-arena fault site must still be refused by gate 3");
@@ -1905,7 +2111,7 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
     // Gate 2: an arena program with no arena has no slot base to be entered
     // with, and one with two has the straddling divergence.
     for n in [0usize, 2, 3] {
-        if crate::jit_glue::try_compile(&base(true), true, n).err()
+        if crate::jit_glue::try_compile(&base(true), true, n, &[]).err()
             != Some(crate::jit_glue::JitSkip::UsesArena)
         {
             return TestResult::Fail("gate 2 must refuse any arena count other than one");
@@ -1914,7 +2120,7 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
     // And a gate that refuses everything is not a gate: the same program with
     // exactly one arena is accepted, so the two refusals above are about the
     // count and the flag rather than about arena programs in general.
-    match crate::jit_glue::try_compile(&base(true), true, 1) {
+    match crate::jit_glue::try_compile(&base(true), true, 1, &[]) {
         Ok(image) => {
             // …and the emitted image really does contain the arena shape, so
             // `run_atomic`'s belt will demand a slot base for it. An `Ok` whose
@@ -2720,25 +2926,91 @@ kernel_test_in!(
     smoke_bpf_jit_refuses_a_context_dereference_in_a_calling_program
 );
 
-fn smoke_bpf_jit_refuses_a_subprogram_call() -> TestResult {
-    // Kfunc calls landing does not make BPF-to-BPF calls land: a subprogram
-    // call needs the frame push the interpreter does in `push_frame`, and a
-    // bare native `call` would run the callee on the caller's BPF frame.
-    let prog = [subprog_call(1), EXIT, mov_imm(0, 7), EXIT];
-    let Ok(p) = load("subcall", asm(&prog), Context::Atomic) else {
-        return TestResult::Fail("load rejected");
-    };
-    if p.is_jited() {
-        return TestResult::Fail("a subprogram call was compiled");
+fn smoke_bpf_jit_subprog_calls_match_the_interpreter() -> TestResult {
+    // BPF-to-BPF calls are lowered natively; each scenario exercises a distinct
+    // part of the frame protocol and must agree with the interpreter and return
+    // the hand-computed value. An argument in R1, a callee-saved R6 that the
+    // callee clobbers, a subprogram that itself calls a kfunc (which clobbers the
+    // aarch64 link register), and a two-deep nesting.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
     }
-    // …and it still runs, interpreted, which is the whole reason refusing is
-    // safe.
-    match p.run_atomic([0; 4], 4) {
-        Some(Outcome::Returned(7)) => TestResult::Pass,
-        _ => TestResult::Fail("the refused program did not run interpreted"),
+    let cases: [(&str, alloc::vec::Vec<Decoded>, u64); 4] = [
+        (
+            // R0 = R1 + 21, with R1 = 21 passed as an argument → 42.
+            "argument-and-return",
+            alloc::vec![
+                mov_imm(1, 21),
+                subprog_call(1),
+                EXIT,
+                mov_reg(0, 1),
+                alu_imm(AluOp::Add, 0, 21),
+                EXIT,
+            ],
+            42,
+        ),
+        (
+            // R6 = 99, the callee sets R6 = 7, and main returns R6 — which must
+            // still be 99 because R6..R9 are preserved across a call.
+            "callee-saved-preserved",
+            alloc::vec![
+                mov_imm(6, 99),
+                subprog_call(2),
+                mov_reg(0, 6),
+                EXIT,
+                mov_imm(6, 7),
+                mov_imm(0, 0),
+                EXIT,
+            ],
+            99,
+        ),
+        (
+            // The subprogram calls a kfunc, then overwrites R0 with 55. On
+            // aarch64 the kfunc's BLR clobbers x30; if the subprogram's return
+            // address were not saved, its RET would go astray.
+            "subprog-calls-kfunc",
+            alloc::vec![
+                mov_imm(0, 0),
+                subprog_call(1),
+                EXIT,
+                call("narf_test_stack_residue"),
+                mov_imm(0, 55),
+                EXIT,
+            ],
+            55,
+        ),
+        (
+            // Two-deep: main → sub1 → sub2. sub2 returns R1 (=10), sub1 adds 1.
+            "nested",
+            alloc::vec![
+                mov_imm(1, 10),
+                subprog_call(1),
+                EXIT,
+                subprog_call(2),
+                alu_imm(AluOp::Add, 0, 1),
+                EXIT,
+                mov_reg(0, 1),
+                EXIT,
+            ],
+            11,
+        ),
+    ];
+    for (what, prog, want) in cases {
+        let Ok(p) = load(what, asm(&prog), Context::Atomic) else {
+            return TestResult::Fail("a subprogram-call program did not verify");
+        };
+        match diff_run(&p, [0; 4]) {
+            Ok(()) => {}
+            Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+            Err(_) => return TestResult::Fail("a subprogram call diverged from the interpreter"),
+        }
+        if !matches!(p.run_atomic([0; 4], 4), Some(Outcome::Returned(r)) if r == want) {
+            return TestResult::Fail("a subprogram call returned the wrong value");
+        }
     }
+    TestResult::Pass
 }
-kernel_test_in!("bpf", smoke_bpf_jit_refuses_a_subprogram_call);
+kernel_test_in!("bpf", smoke_bpf_jit_subprog_calls_match_the_interpreter);
 // ════════════════════════════════════════════════════════════════════
 // Maps (`crate::map`).
 //

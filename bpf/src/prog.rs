@@ -247,7 +247,7 @@ impl BpfProg {
                 // group the program will run against, so the number cannot
                 // describe a different one.
                 let arena_count = arenas.as_ref().map_or(0, |g| g.arenas().len());
-                jit = crate::jit_glue::try_compile(&v, true, arena_count).ok();
+                jit = crate::jit_glue::try_compile(&v, true, arena_count, &req.maps).ok();
                 subprogs = v.subprogs;
                 v.max_stack_bytes.max(1)
             }

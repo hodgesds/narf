@@ -51,16 +51,21 @@
 //!
 //! ## What is emitted, and what is not
 //!
-//! Enough of the ISA to run the corpus the interpreter runs: ALU, MOV, loads
-//! and stores against the frame, conditional and unconditional jumps, exit, and
-//! **kfunc calls**. Subprogram calls (`CallTarget::Subprog`) are still refused:
-//! they need the BPF frame push the interpreter does in `push_frame`, which is
-//! a different feature from entering a C function.
+//! Enough of the ISA to run the corpus the interpreter runs: ALU (including
+//! div/mod), MOV, `LD_IMM64`, loads and stores against the frame, atomics,
+//! conditional and unconditional jumps, exit, **kfunc calls**, and **BPF-to-BPF
+//! calls** — the last being [`emit_subprog_call`]'s frame push, the JIT twin of
+//! the interpreter's `push_frame`.
 //!
-//! Everything else returns [`JitError::Unsupported`], which the caller answers
-//! by interpreting — the interpreter is a complete implementation, so an
-//! unemitted instruction costs speed and not correctness. That is the property
-//! that makes it safe to grow this file incrementally instead of all at once.
+//! What is left interpreted: the subprogram-address and BTF-id pseudo-forms of
+//! `LD_IMM64` (the map forms are emitted over the loader-resolved address; these
+//! two are never resolved), arena atomics, and arena accesses in a program that
+//! also makes BPF-to-BPF calls (the call frame moves `rsp`, which the arena base
+//! is parked relative to). Everything unemitted returns
+//! [`JitError::Unsupported`], which the caller answers by interpreting — the
+//! interpreter is a complete implementation, so an unemitted instruction costs
+//! speed and not correctness. That is the property that makes it safe to grow
+//! this file incrementally instead of all at once.
 //!
 //! ## The arena access shape
 //!
@@ -94,7 +99,9 @@
 
 use alloc::vec::Vec;
 
-use narf_bpf_isa::{decode, AluOp, CallTarget, CondOp, Decoded, Reg, Size, Source};
+use narf_bpf_isa::{
+    decode, AluOp, AtomicOp, ByteOrder, CallTarget, CondOp, Decoded, Imm64, Reg, Size, Source,
+};
 use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
 use crate::blocks::{block_len, block_starts};
@@ -177,11 +184,57 @@ impl Emit {
     fn bs(&mut self, xs: &[u8]) {
         self.buf.extend_from_slice(xs);
     }
+    fn d16(&mut self, x: i16) {
+        self.bs(&x.to_le_bytes());
+    }
     fn d32(&mut self, x: i32) {
         self.bs(&x.to_le_bytes());
     }
     fn d64(&mut self, x: i64) {
         self.bs(&x.to_le_bytes());
+    }
+
+    /// Emit a `jcc`/`jmp rel8` with a zero displacement and return the offset of
+    /// the displacement byte, to be resolved later by [`Emit::patch_rel8`]. Used
+    /// only for the short forward branches *within* a single instruction's
+    /// lowering (the `div`/`mod` guards), whose targets are a handful of bytes
+    /// away — never for inter-instruction control flow, which the reloc table
+    /// resolves as `rel32`.
+    fn jmp_rel8(&mut self, opcode: u8) -> u32 {
+        self.b(opcode);
+        let at = self.len();
+        self.b(0);
+        at
+    }
+
+    /// Fill in the `rel8` displacement of a branch whose byte was reserved by
+    /// [`Emit::jmp_rel8`], now that its target is the current end of the buffer.
+    fn patch_rel8(&mut self, at: u32) {
+        let rel = self.buf.len() as i64 - (at as i64 + 1);
+        debug_assert!(
+            (-128..=127).contains(&rel),
+            "rel8 branch target out of reach: {rel}"
+        );
+        self.buf[at as usize] = rel as i8 as u8;
+    }
+
+    /// A REX prefix like [`Emit::rex`], but emitted even when it would be the
+    /// bare `0x40` — which a byte store of `spl`/`bpl`/`sil`/`dil` requires to
+    /// name the low byte rather than `ah`/`ch`/`dh`/`bh`.
+    fn rex_forced(&mut self, w: bool, reg: u8, rm: u8, force: bool) {
+        let mut v = 0x40;
+        if w {
+            v |= 0x08;
+        }
+        if reg >= 8 {
+            v |= 0x04;
+        }
+        if rm >= 8 {
+            v |= 0x01;
+        }
+        if v != 0x40 || force {
+            self.b(v);
+        }
     }
 
     /// REX prefix. `w` selects 64-bit operand size; `r`/`b` extend the ModRM
@@ -384,6 +437,218 @@ fn emit_mul(e: &mut Emit, wide: bool, dst: u8, src: Source) {
     }
 }
 
+/// BPF `div`/`mod`, lowered to x86 `div`/`idiv`.
+///
+/// x86 division is hardwired to `rdx:rax` — quotient to `rax`, remainder to
+/// `rdx` — and both alias BPF registers (R0, R3), so they are saved on the stack
+/// around the sequence and the result is carried out through `r11`. `rcx` holds
+/// the divisor; neither `rcx`, `r11` nor `r12` (fuel) aliases a BPF register, so
+/// only the destination is disturbed. The `push`/`pop` are balanced within this
+/// one instruction and it contains no call, arena access or fuel check, so the
+/// "the body never moves `rsp`" invariant the fault epilogues rest on holds.
+///
+/// The two hardware traps are branched around rather than taken, matching the
+/// interpreter (and Linux): divide-by-zero yields a zero quotient and the
+/// dividend unchanged as the remainder, and the signed `INT_MIN / -1` overflow
+/// is the wrapping identity `x / -1 == -x`, `x % -1 == 0`.
+fn emit_div_mod(e: &mut Emit, wide: bool, signed: bool, want_rem: bool, dst: u8, src: Source) {
+    // Divisor into rcx first, while every BPF register still holds its value —
+    // src may be R0 (rax) or R3 (rdx), which the steps below overwrite.
+    match src {
+        Source::Reg(s) => mov_rr(e, wide, hr::RCX, host(s)),
+        Source::Imm(v) => emit_mov_imm(e, wide, hr::RCX, i64::from(v)),
+    }
+    // Preserve rax and rdx; the divide overwrites both.
+    e.b(0x50 | hr::RAX); // push rax
+    e.b(0x50 | hr::RDX); // push rdx
+                         // Dividend into rax. A 32-bit move zero-extends, leaving eax as the low half
+                         // and edx set below; a 64-bit move takes the whole register.
+    mov_rr(e, wide, hr::RAX, dst);
+
+    let result = if want_rem { hr::RDX } else { hr::RAX };
+
+    // Divide-by-zero guard: `test` the divisor, branch away if it is zero.
+    alu_rr(e, wide, 0x85, hr::RCX, hr::RCX);
+    let to_divzero = e.jmp_rel8(0x74); // jz divzero
+
+    let to_neg_one = if signed {
+        // `x / -1` overflows `idiv` for x == INT_MIN, so the whole `-1` divisor
+        // case is handled as the wrapping identity instead of dividing.
+        alu_ri(e, wide, 7, hr::RCX, -1); // cmp rcx, -1
+        Some(e.jmp_rel8(0x74)) // je neg_one
+    } else {
+        None
+    };
+
+    if signed {
+        // Sign-extend rax into rdx (cdq/cqo), then idiv.
+        if wide {
+            e.b(0x48);
+        }
+        e.b(0x99);
+        e.rex(wide, 0, hr::RCX);
+        e.b(0xF7);
+        e.modrm_rr(7, hr::RCX); // idiv rcx
+    } else {
+        // Zero rdx (a 32-bit xor clears the whole register), then div.
+        alu_rr(e, false, 0x31, hr::RDX, hr::RDX);
+        e.rex(wide, 0, hr::RCX);
+        e.b(0xF7);
+        e.modrm_rr(6, hr::RCX); // div rcx
+    }
+    let to_done_from_div = e.jmp_rel8(0xEB); // jmp done
+
+    // divzero: quotient 0, remainder = dividend (still in rax).
+    e.patch_rel8(to_divzero);
+    if want_rem {
+        mov_rr(e, wide, hr::RDX, hr::RAX);
+    } else {
+        alu_rr(e, false, 0x31, hr::RAX, hr::RAX); // xor eax, eax
+    }
+    let to_done_from_divzero = signed.then(|| e.jmp_rel8(0xEB)); // jmp done (skip neg_one)
+
+    // neg_one (signed only): quotient = -dividend, remainder 0.
+    if let Some(at) = to_neg_one {
+        e.patch_rel8(at);
+        if want_rem {
+            alu_rr(e, false, 0x31, hr::RDX, hr::RDX); // xor edx, edx
+        } else {
+            e.rex(wide, 0, hr::RAX);
+            e.b(0xF7);
+            e.modrm_rr(3, hr::RAX); // neg rax
+        }
+    }
+
+    // done: carry the result out past the pops, restore, and land it in dst.
+    e.patch_rel8(to_done_from_div);
+    if let Some(at) = to_done_from_divzero {
+        e.patch_rel8(at);
+    }
+    mov_rr(e, wide, hr::R11, result);
+    e.b(0x58 | hr::RDX); // pop rdx
+    e.b(0x58 | hr::RAX); // pop rax
+    mov_rr(e, wide, dst, hr::R11);
+}
+
+/// A BPF atomic against a certified base (stack or context), lowered to the
+/// x86 locked read-modify-write instructions.
+///
+/// The memory operand is `[base + off]`, the same addressing every stack access
+/// uses. Widths are word and doubleword only (the ISA has no narrower atomic),
+/// so no byte-register REX hazard arises. `LOCK` (`0xF0`) prefixes the
+/// non-implicitly-locked forms; `xchg` with a memory operand locks on its own.
+///
+/// The fetching bitwise forms (`fetch` on or/and/xor) are **not** emitted: x86
+/// has no atomic fetch-and-{or,and,xor}, only a `cmpxchg` retry loop, so they
+/// stay interpreted — [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`]
+/// pins that boundary. Every other form is one instruction.
+fn emit_atomic(
+    e: &mut Emit,
+    _at: u32,
+    size: Size,
+    op: AtomicOp,
+    dst: Reg,
+    off: i16,
+    src: Reg,
+) -> Result<(), JitError> {
+    let wide = size == Size::Dw;
+    let m = host(dst);
+    let s = host(src);
+    let disp = i32::from(off);
+    // `lock; <op> [m + disp], s` for the group-1 read-modify-writes.
+    let locked_rmw = |e: &mut Emit, opcode: u8| {
+        e.b(0xF0);
+        e.rex(wide, s, m);
+        e.b(opcode);
+        e.modrm_mem(s, m, disp);
+    };
+    match op {
+        AtomicOp::Add { fetch: false } => locked_rmw(e, 0x01),
+        AtomicOp::Or { fetch: false } => locked_rmw(e, 0x09),
+        AtomicOp::And { fetch: false } => locked_rmw(e, 0x21),
+        AtomicOp::Xor { fetch: false } => locked_rmw(e, 0x31),
+        // `lock; xadd [m], s` — s receives the pre-op value, m gets m + s. A
+        // 32-bit form zero-extends s, matching the interpreter's `mask`.
+        AtomicOp::Add { fetch: true } => {
+            e.b(0xF0);
+            e.rex(wide, s, m);
+            e.bs(&[0x0F, 0xC1]);
+            e.modrm_mem(s, m, disp);
+        }
+        // `xchg [m], s` — implicitly locked; s receives the old value.
+        AtomicOp::Xchg => {
+            e.rex(wide, s, m);
+            e.b(0x87);
+            e.modrm_mem(s, m, disp);
+        }
+        // `lock; cmpxchg [m], s` — compares rax (R0) with m; on equal stores s,
+        // otherwise loads m into rax. That is exactly BPF cmpxchg: R0 is the
+        // comparand and receives the pre-op value.
+        AtomicOp::Cmpxchg => {
+            e.b(0xF0);
+            e.rex(wide, s, m);
+            e.bs(&[0x0F, 0xB1]);
+            e.modrm_mem(s, m, disp);
+        }
+        // x86 loads are acquire and stores are release under TSO, so these are
+        // plain moves into / out of the source register.
+        AtomicOp::LoadAcquire => {
+            e.rex(wide, s, m);
+            e.b(0x8B);
+            e.modrm_mem(s, m, disp);
+        }
+        AtomicOp::StoreRelease => {
+            e.rex(wide, s, m);
+            e.b(0x89);
+            e.modrm_mem(s, m, disp);
+        }
+        // x86 has no atomic fetch-and-{or,and,xor}; a cmpxchg retry loop stands
+        // in. The group-1 opcode is the `op r/m, r` form, the same table
+        // `alu_forms` draws from.
+        AtomicOp::Or { fetch: true } => emit_atomic_fetch_bitwise(e, wide, 0x09, m, disp, s),
+        AtomicOp::And { fetch: true } => emit_atomic_fetch_bitwise(e, wide, 0x21, m, disp, s),
+        AtomicOp::Xor { fetch: true } => emit_atomic_fetch_bitwise(e, wide, 0x31, m, disp, s),
+    }
+    Ok(())
+}
+
+/// A fetching bitwise atomic — `src = *m; *m op= <old value of src>` — as a
+/// `cmpxchg` retry loop, x86 having no single instruction for it.
+///
+/// `rax` is `cmpxchg`'s comparand and result, so R0 is pushed and restored; the
+/// operand is captured into `rcx` *before* `rax` is loaded, because `src` may be
+/// R0. `r11` holds the candidate new value inside the loop and then carries the
+/// fetched old value out past the `pop`. In this kernel's single-threaded atomic
+/// context the loop runs once, but the `lock cmpxchg` keeps it correct if the
+/// line is contended.
+fn emit_atomic_fetch_bitwise(e: &mut Emit, wide: bool, opcode: u8, m: u8, disp: i32, s: u8) {
+    e.b(0x50); // push rax
+    mov_rr(e, wide, hr::RCX, s); // rcx = operand (before rax is clobbered)
+                                 // rax = *m — the initial comparand.
+    e.rex(wide, hr::RAX, m);
+    e.b(0x8B);
+    e.modrm_mem(hr::RAX, m, disp);
+    let retry = e.len();
+    mov_rr(e, wide, hr::R11, hr::RAX); // r11 = old
+    alu_rr(e, wide, opcode, hr::R11, hr::RCX); // r11 = old op operand
+                                               // lock cmpxchg [m], r11 — on equal stores r11 and sets ZF; else reloads rax.
+    e.b(0xF0);
+    e.rex(wide, hr::R11, m);
+    e.bs(&[0x0F, 0xB1]);
+    e.modrm_mem(hr::R11, m, disp);
+    // jnz retry
+    e.b(0x75);
+    let back = retry as i64 - (e.len() as i64 + 1);
+    debug_assert!(
+        (-128..=127).contains(&back),
+        "cmpxchg loop out of rel8 reach"
+    );
+    e.b(back as i8 as u8);
+    mov_rr(e, wide, hr::R11, hr::RAX); // r11 = old (fetched), survives the pop
+    e.b(0x58); // pop rax
+    mov_rr(e, wide, s, hr::R11); // src = old
+}
+
 const fn cond_cc(op: CondOp) -> u8 {
     match op {
         CondOp::Eq => 0x4,
@@ -481,7 +746,18 @@ fn emit_fuel_burn(e: &mut Emit, n: u32, relocs: &mut Vec<Reloc>) {
 /// with a real convergence argument — the Linux post-mortem is a genuine
 /// hazard, just not one this code was exposed to.
 pub fn compile(prog: &VerifiedProgram) -> Result<Compiled, JitError> {
-    let (e, _) = emit_pass(prog)?;
+    compile_resolved(prog, &[])
+}
+
+/// As [`compile`], but with the resolved addresses for map pseudo-form
+/// `LD_IMM64`s — `(instruction index, address)` pairs sorted by index. The
+/// loader resolves them (the verifier has no runtime map addresses); a map form
+/// whose index is absent falls back, as every one did before this existed.
+pub fn compile_resolved(
+    prog: &VerifiedProgram,
+    map_imm64: &[(u32, u64)],
+) -> Result<Compiled, JitError> {
+    let (e, _) = emit_pass(prog, map_imm64)?;
     Ok(Compiled {
         code: e.buf,
         faults: {
@@ -495,7 +771,10 @@ pub fn compile(prog: &VerifiedProgram) -> Result<Compiled, JitError> {
 
 /// One sizing/emission pass. Returns the emitter and the offset table this
 /// pass produced.
-fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
+fn emit_pass(
+    prog: &VerifiedProgram,
+    map_imm64: &[(u32, u64)],
+) -> Result<(Emit, Vec<u32>), JitError> {
     let mut e = Emit::default();
     let mut relocs: Vec<Reloc> = Vec::new();
     let mut out = Vec::with_capacity(prog.insns.len() + 1);
@@ -507,8 +786,28 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
 
     emit_prologue(&mut e, prog);
 
+    // Slot boundaries sorted by start, so the loop can track which subprogram
+    // each instruction belongs to: a subprogram `exit` returns to its caller
+    // rather than leaving the program, and a `call` descends the frame by the
+    // *caller's* stack size (matching the interpreter's `push_frame`).
+    let mut sp_starts: Vec<(u32, usize)> = prog
+        .subprogs
+        .iter()
+        .enumerate()
+        .map(|(k, s)| (s.start, k))
+        .collect();
+    sp_starts.sort_unstable();
+    let mut sp_ptr = 0usize;
+
     let mut i = 0usize;
     while i < prog.insns.len() {
+        while sp_ptr + 1 < sp_starts.len() && i as u32 >= sp_starts[sp_ptr + 1].0 {
+            sp_ptr += 1;
+        }
+        let (cur_start, cur_idx) = sp_starts.get(sp_ptr).copied().unwrap_or((0, 0));
+        let in_main = cur_start == 0;
+        let cur_stack = prog.subprogs.get(cur_idx).map_or(0, |s| s.stack_bytes);
+
         out.push(e.len());
         // Burn this block's worth of fuel on entry. Per block rather than per
         // instruction: the same bound, one `sub`/`jb` pair instead of one per
@@ -526,16 +825,17 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
             &mut relocs,
             &prog.kfunc_calls,
             arena[i],
+            in_main,
+            cur_stack,
+            map_imm64,
         )?;
         i += width;
-        // A wide instruction occupies two slots. This records the *following*
-        // instruction's offset for the trailing slot, not the wide
-        // instruction's own — which is fine only because nothing can branch
-        // there: the verifier rejects a jump into an `LD_IMM64`'s second slot,
-        // and `LD_IMM64` is `Unsupported` here anyway so `width` is always 1
-        // today. An earlier comment claimed the two slots shared an offset,
-        // which the loop order does not do. Whichever is wanted must be
-        // decided before LD_IMM64 emission lands.
+        // A wide instruction (`LD_IMM64`) occupies two slots. Its own offset is
+        // `out[i]`, recorded above; this records the *following* instruction's
+        // offset for the trailing slot. That is sound because nothing branches
+        // there — the verifier rejects a jump into an `LD_IMM64`'s second slot —
+        // and it keeps `out` indexed one entry per slot, which is what the reloc
+        // patcher assumes.
         for _ in 1..width {
             out.push(e.len());
         }
@@ -734,6 +1034,57 @@ fn emit_kfunc_call(e: &mut Emit, addr: usize) {
     e.modrm_rr(2, hr::R11);
 }
 
+/// An unconditional `jmp rel32` to the BPF instruction `at + 1 + off`. Shared by
+/// `Jump` and `may_goto`, whose `off` fields differ in width.
+fn emit_uncond_jump(e: &mut Emit, at: u32, off: i64, relocs: &mut Vec<Reloc>) {
+    e.b(0xE9);
+    let at_disp = e.len();
+    e.d32(0);
+    relocs.push(Reloc {
+        at: at_disp,
+        next: e.len(),
+        target: (at as i64 + 1 + off) as u32,
+        width: 4,
+    });
+}
+
+/// A BPF-to-BPF call, the JIT analogue of the interpreter's `push_frame`.
+///
+/// R6..R10 must survive a call (BPF's ABI), so the five host registers they map
+/// to are pushed and restored around it; R1..R5 are caller-saved and R0 carries
+/// the result, so none of those is saved. R10 (`rbp`) is then lowered by the
+/// *caller's* stack size, putting the callee's frame directly below the caller's
+/// — the same descent `push_frame` makes by the calling subprogram's bytes. The
+/// `call` itself is a `rel32` resolved against the offset table exactly like a
+/// jump, and the callee's `exit` is a `ret` back to it.
+///
+/// Five pushes plus the return address is 48 bytes, a multiple of 16, so a kfunc
+/// call inside the callee still finds `rsp` 16-aligned. The fuel register
+/// (`r12`) is deliberately not saved: the callee decrements the same running
+/// total, which is what makes the per-block charge a whole-program bound.
+fn emit_subprog_call(e: &mut Emit, at: u32, rel: i32, cur_stack: u32, relocs: &mut Vec<Reloc>) {
+    e.b(0x53); // push rbx  (R6)
+    e.bs(&[0x41, 0x55]); // push r13 (R7)
+    e.bs(&[0x41, 0x56]); // push r14 (R8)
+    e.bs(&[0x41, 0x57]); // push r15 (R9)
+    e.b(0x55); // push rbp  (R10)
+    alu_ri(e, true, 5, hr::RBP, cur_stack as i32); // sub rbp, <caller stack>
+    e.b(0xE8); // call rel32 -> callee entry
+    let at_disp = e.len();
+    e.d32(0);
+    relocs.push(Reloc {
+        at: at_disp,
+        next: e.len(),
+        target: (at as i64 + 1 + i64::from(rel)) as u32,
+        width: 4,
+    });
+    e.b(0x5D); // pop rbp
+    e.bs(&[0x41, 0x5F]); // pop r15
+    e.bs(&[0x41, 0x5E]); // pop r14
+    e.bs(&[0x41, 0x5D]); // pop r13
+    e.b(0x5B); // pop rbx
+}
+
 /// The call site the verifier resolved for the `call` at `at`, or a refusal.
 ///
 /// Every arm here is fail-closed and every one is reachable through a
@@ -808,6 +1159,222 @@ fn emit_arena_addr(e: &mut Emit, handle: u8, off: i16) {
     }
 }
 
+/// The prefix + opcode of a memory load of `size` into host register `reg`,
+/// addressed through a base whose extension bit `rm` supplies. The caller emits
+/// the ModRM (and any SIB / displacement) next. Zero-extends when `sign_extend`
+/// is false and sign-extends to 64 bits otherwise — matching the interpreter's
+/// `widen`, which always produces a full-width register value.
+fn load_prefix_opcode(e: &mut Emit, size: Size, sign_extend: bool, reg: u8, rm: u8) {
+    match (size, sign_extend) {
+        // `movzx r32, r/m8|16` — the 32-bit destination zero-extends to 64.
+        (Size::B, false) => {
+            e.rex(false, reg, rm);
+            e.bs(&[0x0F, 0xB6]);
+        }
+        (Size::H, false) => {
+            e.rex(false, reg, rm);
+            e.bs(&[0x0F, 0xB7]);
+        }
+        // `mov r32, r/m32` — a 32-bit load likewise zero-extends the upper half.
+        (Size::W, false) => {
+            e.rex(false, reg, rm);
+            e.b(0x8B);
+        }
+        // `mov r64, r/m64`. A sign-extending doubleword load is a no-op widen,
+        // so it takes this same plain form.
+        (Size::Dw, _) => {
+            e.rex(true, reg, rm);
+            e.b(0x8B);
+        }
+        // `movsx r64, r/m8|16` and `movsxd r64, r/m32`.
+        (Size::B, true) => {
+            e.rex(true, reg, rm);
+            e.bs(&[0x0F, 0xBE]);
+        }
+        (Size::H, true) => {
+            e.rex(true, reg, rm);
+            e.bs(&[0x0F, 0xBF]);
+        }
+        (Size::W, true) => {
+            e.rex(true, reg, rm);
+            e.b(0x63);
+        }
+    }
+}
+
+/// The prefix + opcode of a register→memory store of `size` from host register
+/// `reg`. `0x66` gives the 16-bit operand size; a byte store forces a REX so it
+/// can reach the low byte of `rsi`/`rdi`/`rbp` (which R2/R1/R10 map to).
+fn store_reg_prefix_opcode(e: &mut Emit, size: Size, reg: u8, rm: u8) {
+    match size {
+        Size::B => {
+            e.rex_forced(false, reg, rm, matches!(reg, 4..=7));
+            e.b(0x88);
+        }
+        Size::H => {
+            e.b(0x66);
+            e.rex(false, reg, rm);
+            e.b(0x89);
+        }
+        Size::W => {
+            e.rex(false, reg, rm);
+            e.b(0x89);
+        }
+        Size::Dw => {
+            e.rex(true, reg, rm);
+            e.b(0x89);
+        }
+    }
+}
+
+/// The prefix + opcode of an immediate→memory store of `size` (`C6`/`C7 /0`).
+/// The caller emits the ModRM (reg field 0) and then the immediate through
+/// [`store_imm_tail`].
+fn store_imm_prefix_opcode(e: &mut Emit, size: Size, rm: u8) {
+    match size {
+        Size::B => {
+            e.rex(false, 0, rm);
+            e.b(0xC6);
+        }
+        Size::H => {
+            e.b(0x66);
+            e.rex(false, 0, rm);
+            e.b(0xC7);
+        }
+        Size::W => {
+            e.rex(false, 0, rm);
+            e.b(0xC7);
+        }
+        Size::Dw => {
+            e.rex(true, 0, rm);
+            e.b(0xC7);
+        }
+    }
+}
+
+/// The immediate tail of a `C6`/`C7` store: 1/2/4 bytes by width. A doubleword
+/// store carries an `imm32` the REX.W sign-extends, matching BPF's `ST`.
+fn store_imm_tail(e: &mut Emit, size: Size, v: i32) {
+    match size {
+        Size::B => e.b(v as u8),
+        Size::H => e.d16(v as i16),
+        Size::W | Size::Dw => e.d32(v),
+    }
+}
+
+/// `mov reg, imm` — the ten-byte form for 64-bit, the five-byte zero-extending
+/// form for 32-bit (which is exactly BPF's `wide == false` move semantics).
+fn emit_mov_imm(e: &mut Emit, wide: bool, dst: u8, imm: i64) {
+    if wide {
+        mov_reg_imm64(e, dst, imm);
+    } else {
+        e.rex(false, 0, dst);
+        e.b(0xB8 | (dst & 7));
+        e.d32(imm as i32);
+    }
+}
+
+/// Sign-extend the low `bits` of `v` to 64 bits — the compile-time twin of
+/// `movsx`, for the immediate `MOVSX` form.
+fn sext_imm(v: i32, bits: u8) -> i64 {
+    match bits {
+        8 => v as i8 as i64,
+        16 => v as i16 as i64,
+        _ => i64::from(v),
+    }
+}
+
+/// `MOVSX`: sign-extend the low `bits` of `src` into `dst`. A 64-bit
+/// destination sign-extends to the full register; a 32-bit one sign-extends
+/// within 32 bits and zero-extends the upper half, both matching the
+/// interpreter's `raw as iN as i64` then the `wide` mask.
+fn emit_movsx_rr(e: &mut Emit, wide: bool, bits: u8, dst: u8, src: u8) {
+    match bits {
+        // `movsx r, r/m8`. A byte source register in `spl`/`sil`/`dil`/`bpl`
+        // needs a REX present to name its low byte — forced here for the 32-bit
+        // form, which is otherwise prefix-free.
+        8 => {
+            e.rex_forced(wide, dst, src, matches!(src, 4..=7));
+            e.bs(&[0x0F, 0xBE]);
+            e.modrm_rr(dst, src);
+        }
+        // `movsx r, r/m16`.
+        16 => {
+            e.rex(wide, dst, src);
+            e.bs(&[0x0F, 0xBF]);
+            e.modrm_rr(dst, src);
+        }
+        // `movsxd r64, r/m32`. A 32-bit destination cannot sign-extend from 32
+        // bits, so it is a plain 32-bit move (the interpreter masks to 32).
+        _ => {
+            if wide {
+                e.rex(true, dst, src);
+                e.b(0x63);
+                e.modrm_rr(dst, src);
+            } else {
+                mov_rr(e, false, dst, src);
+            }
+        }
+    }
+}
+
+/// `END` / `bswap`: reverse or truncate `dst` by width. `Little` keeps the
+/// bytes and only masks to width; `Big`/`Swap` reverses them. Both zero-extend
+/// the result, matching the interpreter's `byteswap`.
+fn emit_byteswap(
+    e: &mut Emit,
+    at: u32,
+    dst: u8,
+    order: ByteOrder,
+    width: u8,
+) -> Result<(), JitError> {
+    let swap = matches!(order, ByteOrder::Big | ByteOrder::Swap);
+    match (width, swap) {
+        // `ror r/m16, 8` swaps the two bytes; `movzx r32, r/m16` then zero-
+        // extends, clearing the upper 48 bits.
+        (16, true) => {
+            e.b(0x66);
+            e.rex(false, 0, dst);
+            e.b(0xC1);
+            e.modrm_rr(1, dst);
+            e.b(8);
+            e.rex(false, dst, dst);
+            e.bs(&[0x0F, 0xB7]);
+            e.modrm_rr(dst, dst);
+        }
+        // `movzx r32, r/m16` — value & 0xFFFF.
+        (16, false) => {
+            e.rex(false, dst, dst);
+            e.bs(&[0x0F, 0xB7]);
+            e.modrm_rr(dst, dst);
+        }
+        // `bswap r32` — reverses four bytes; the 32-bit form zero-extends.
+        (32, true) => {
+            e.rex(false, 0, dst);
+            e.b(0x0F);
+            e.b(0xC8 | (dst & 7));
+        }
+        // `mov r32, r32` — value & 0xFFFF_FFFF.
+        (32, false) => mov_rr(e, false, dst, dst),
+        // `bswap r64` — reverses all eight bytes.
+        (64, true) => {
+            e.rex(true, 0, dst);
+            e.b(0x0F);
+            e.b(0xC8 | (dst & 7));
+        }
+        // A 64-bit little-endian swap is the identity.
+        (64, false) => {}
+        _ => {
+            return Err(JitError::Unsupported {
+                at,
+                what: "byteswap width must be 16, 32, or 64",
+            })
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_insn(
     e: &mut Emit,
     insn: &Decoded,
@@ -815,6 +1382,9 @@ fn emit_insn(
     relocs: &mut Vec<Reloc>,
     calls: &[KfuncCallSite],
     arena: bool,
+    in_main: bool,
+    cur_stack: u32,
+    map_imm64: &[(u32, u64)],
 ) -> Result<(), JitError> {
     // The arena forms first: same instructions, different addressing, and a
     // recorded fault site. Only the doubleword width is emitted, matching the
@@ -823,56 +1393,52 @@ fn emit_insn(
     if arena {
         match *insn {
             Decoded::Load {
-                size: Size::Dw,
-                sign_extend: false,
+                size,
+                sign_extend,
                 dst,
                 src,
                 off,
             } => {
                 emit_arena_addr(e, host(src), off);
                 let fault_off = e.len();
-                e.rex(true, host(dst), hr::R11);
-                e.b(0x8B);
+                load_prefix_opcode(e, size, sign_extend, host(dst), hr::R11);
                 e.modrm_sib_index(host(dst), hr::R11, hr::RCX);
                 record_fault(e, fault_off);
                 return Ok(());
             }
             Decoded::Store {
-                size: Size::Dw,
+                size,
                 dst,
                 off,
                 src: Source::Reg(s),
             } => {
                 emit_arena_addr(e, host(dst), off);
                 let fault_off = e.len();
-                e.rex(true, host(s), hr::R11);
-                e.b(0x89);
+                store_reg_prefix_opcode(e, size, host(s), hr::R11);
                 e.modrm_sib_index(host(s), hr::R11, hr::RCX);
                 record_fault(e, fault_off);
                 return Ok(());
             }
             Decoded::Store {
-                size: Size::Dw,
+                size,
                 dst,
                 off,
                 src: Source::Imm(v),
             } => {
                 emit_arena_addr(e, host(dst), off);
                 let fault_off = e.len();
-                e.rex(true, 0, hr::R11);
-                e.b(0xC7);
+                store_imm_prefix_opcode(e, size, hr::R11);
                 e.modrm_sib_index(0, hr::R11, hr::RCX);
-                e.d32(v);
+                store_imm_tail(e, size, v);
                 record_fault(e, fault_off);
                 return Ok(());
             }
-            // An arena atomic, an arena access of any narrower width, or a
-            // sign-extending one. Refused rather than lowered as a *non*-arena
+            // An arena atomic. Refused rather than lowered as a *non*-arena
             // access, which is the failure this whole branch exists to prevent.
             _ => {
                 return Err(JitError::Unsupported {
                     at,
-                    what: "arena access shape not yet emitted by the x86_64 backend",
+                    what: "arena atomic not yet emitted by the x86_64 backend",
                 })
             }
         }
@@ -883,6 +1449,10 @@ fn emit_insn(
             emit_kfunc_call(e, site.addr);
         }
 
+        Decoded::Call(CallTarget::Subprog(rel)) => {
+            emit_subprog_call(e, at, rel, cur_stack, relocs);
+        }
+
         Decoded::Mov {
             wide,
             dst,
@@ -890,18 +1460,53 @@ fn emit_insn(
             sign_extend: None,
         } => match src {
             Source::Reg(s) => mov_rr(e, wide, host(dst), host(s)),
-            Source::Imm(v) => {
-                if wide {
-                    mov_reg_imm64(e, host(dst), i64::from(v));
-                } else {
-                    // 32-bit mov zero-extends, which is exactly BPF's
-                    // semantics for a `wide == false` move.
-                    e.rex(false, 0, host(dst));
-                    e.b(0xB8 | (host(dst) & 7));
-                    e.d32(v);
-                }
-            }
+            Source::Imm(v) => emit_mov_imm(e, wide, host(dst), i64::from(v)),
         },
+
+        Decoded::Mov {
+            wide,
+            dst,
+            src: Source::Reg(s),
+            sign_extend: Some(bits),
+        } => emit_movsx_rr(e, wide, bits, host(dst), host(s)),
+
+        Decoded::Mov {
+            wide,
+            dst,
+            src: Source::Imm(v),
+            sign_extend: Some(bits),
+        } => {
+            // Sign-extending a constant is itself a constant, so materialise it
+            // — the interpreter's `raw as iN as i64 as u64`, then the `wide` mask.
+            let ext = sext_imm(v, bits);
+            emit_mov_imm(
+                e,
+                wide,
+                host(dst),
+                if wide { ext } else { ext & 0xFFFF_FFFF },
+            );
+        }
+
+        // A plain 64-bit constant is the 10-byte `mov r64, imm64`. A map
+        // pseudo-form is the same instruction over the address the loader
+        // resolved (a stable `Arc` pointer the program keeps alive); the
+        // subprogram-address and BTF-id forms are never resolved, so they fall to
+        // `Unsupported` and run interpreted.
+        Decoded::LoadImm64 { dst, value } => {
+            let imm = match value {
+                Imm64::Value(v) => v as i64,
+                _ => match map_imm64.binary_search_by_key(&at, |&(i, _)| i) {
+                    Ok(k) => map_imm64[k].1 as i64,
+                    Err(_) => {
+                        return Err(JitError::Unsupported {
+                            at,
+                            what: "unresolved LD_IMM64 pseudo-form",
+                        })
+                    }
+                },
+            };
+            mov_reg_imm64(e, host(dst), imm);
+        }
 
         Decoded::Alu {
             wide,
@@ -917,6 +1522,28 @@ fn emit_insn(
             src,
         } => emit_mul(e, wide, host(dst), src),
 
+        Decoded::Div {
+            wide,
+            signed,
+            dst,
+            src,
+        } => emit_div_mod(e, wide, signed, false, host(dst), src),
+
+        Decoded::Mod {
+            wide,
+            signed,
+            dst,
+            src,
+        } => emit_div_mod(e, wide, signed, true, host(dst), src),
+
+        Decoded::Atomic {
+            size,
+            op,
+            dst,
+            src,
+            off,
+        } => emit_atomic(e, at, size, op, dst, off, src)?,
+
         Decoded::Neg { wide, dst } => {
             // `neg r/m` — F7 /3. Included so the ALU differential sweep can be
             // exhaustive over the operation space rather than skipping a hole.
@@ -924,6 +1551,8 @@ fn emit_insn(
             e.b(0xF7);
             e.modrm_rr(3, host(dst));
         }
+
+        Decoded::End { dst, order, width } => emit_byteswap(e, at, host(dst), order, width)?,
 
         Decoded::Alu { wide, op, dst, src } => {
             let Some((slash, rr)) = alu_forms(op) else {
@@ -939,58 +1568,49 @@ fn emit_insn(
         }
 
         Decoded::Load {
-            size: Size::Dw,
-            sign_extend: false,
+            size,
+            sign_extend,
             dst,
             src,
             off,
         } => {
-            // `mov r64, [base + disp]`
-            e.rex(true, host(dst), host(src));
-            e.b(0x8B);
+            // `mov`/`movzx`/`movsx` r, [base + disp] — width and extension in
+            // the opcode.
+            load_prefix_opcode(e, size, sign_extend, host(dst), host(src));
             e.modrm_mem(host(dst), host(src), i32::from(off));
         }
 
         Decoded::Store {
-            size: Size::Dw,
+            size,
             dst,
             off,
             src: Source::Reg(s),
         } => {
-            e.rex(true, host(s), host(dst));
-            e.b(0x89);
+            store_reg_prefix_opcode(e, size, host(s), host(dst));
             e.modrm_mem(host(s), host(dst), i32::from(off));
         }
 
         Decoded::Store {
-            size: Size::Dw,
+            size,
             dst,
             off,
             src: Source::Imm(v),
         } => {
-            // `mov qword [base + disp], imm32` — C7 /0. The immediate is
-            // sign-extended to 64 bits by REX.W, which matches BPF's `ST`
-            // semantics (the interpreter does `imm as i64 as u64`).
-            e.rex(true, 0, host(dst));
-            e.b(0xC7);
+            // `mov [base + disp], imm` — C6/C7 /0. A doubleword's imm32 is
+            // sign-extended to 64 bits by REX.W; narrower widths carry a
+            // truncated immediate. Both match BPF's `ST` (`imm as i64 as u64`
+            // then a `size`-byte store).
+            store_imm_prefix_opcode(e, size, host(dst));
             e.modrm_mem(0, host(dst), i32::from(off));
-            e.d32(v);
+            store_imm_tail(e, size, v);
         }
 
-        Decoded::Jump { off } => {
-            // Always `rel32`. A short form would save three bytes per branch
-            // but requires the sizing fixpoint this backend deliberately does
-            // not have — see `compile`.
-            e.b(0xE9);
-            let at_disp = e.len();
-            e.d32(0);
-            relocs.push(Reloc {
-                at: at_disp,
-                next: e.len(),
-                target: (at as i64 + 1 + i64::from(off)) as u32,
-                width: 4,
-            });
-        }
+        // `may_goto` is an unconditional jump here: the runtime always takes the
+        // back-edge (metered by fuel, which the block charge already pays), so it
+        // has the same lowering as `Jump` — see the interpreter's `MayGoto`. Its
+        // `off` is `i16` where `Jump`'s is `i32`, so it needs its own arm.
+        Decoded::Jump { off } => emit_uncond_jump(e, at, i64::from(off), relocs),
+        Decoded::MayGoto { off } => emit_uncond_jump(e, at, i64::from(off), relocs),
 
         Decoded::JumpCond {
             wide,
@@ -1028,11 +1648,18 @@ fn emit_insn(
             });
         }
 
+        Decoded::Exit if !in_main => {
+            // A subprogram `exit` returns to its caller — the `ret` matching the
+            // `call` that `emit_subprog_call` emitted. R0 (rax) is already the
+            // return value.
+            e.b(0xC3);
+        }
+
         Decoded::Exit => {
-            // Fall through to the epilogue by jumping to it. The epilogue is
-            // emitted once, after the body, so every `exit` is a branch to a
-            // shared block rather than a duplicated pop sequence — the same
-            // deduplication Linux does at `verifier.c:22608`.
+            // main's `exit`. Fall through to the epilogue by jumping to it. The
+            // epilogue is emitted once, after the body, so every `exit` is a
+            // branch to a shared block rather than a duplicated pop sequence —
+            // the same deduplication Linux does at `verifier.c:22608`.
             e.b(0xE9);
             let at_disp = e.len();
             e.d32(0);
@@ -1046,9 +1673,6 @@ fn emit_insn(
             });
         }
 
-        // Including `CallTarget::Subprog`: a BPF-to-BPF call needs the frame
-        // push the interpreter does in `push_frame` — saving R6..R9, moving
-        // the frame base, and a return path — none of which this emits.
         _ => {
             return Err(JitError::Unsupported {
                 at,

@@ -348,8 +348,6 @@ pub enum JitSkip {
     Unsupported,
     /// Text allocation, writing, registration, or sealing failed.
     TextUnavailable,
-    /// Contains a back-edge, and no fuel is emitted to bound it.
-    Unbounded,
     /// Dereferences a register whose pointer class the emitter cannot certify:
     /// anything but the frame, or — in a program with no `call` — the context.
     UncheckedPointerBase,
@@ -409,9 +407,6 @@ fn scan_program(v: &VerifiedProgram) -> Result<(), JitSkip> {
         // for why a *missed* arena site cannot slip through this exemption.
         let arena_here = arena[i];
         match d {
-            // `may_goto` still declines: it carries a hidden counter the
-            // emitter does not model, which is separate from fuel.
-            Decoded::MayGoto { .. } => return Err(JitSkip::Unbounded),
             // A load or store base must be one the emitter can certify. Any
             // other register could hold a class it would lower to a bare
             // dereference.
@@ -421,11 +416,55 @@ fn scan_program(v: &VerifiedProgram) -> Result<(), JitSkip> {
             Decoded::Store { dst, .. } if !arena_here && !base_ok(dst) => {
                 return Err(JitSkip::UncheckedPointerBase)
             }
+            // An atomic dereferences its destination exactly as a store does, so
+            // its base must be certifiable too. A fetching bitwise form or a
+            // cmpxchg the emitter cannot shape simply returns `Unsupported` at
+            // emit time and the whole program falls back — this gate only guards
+            // the pointer base.
+            Decoded::Atomic { dst, .. } if !arena_here && !base_ok(dst) => {
+                return Err(JitSkip::UncheckedPointerBase)
+            }
             _ => {}
         }
         i += width;
     }
     Ok(())
+}
+
+/// Resolve every map pseudo-form `LD_IMM64` to the address the interpreter would
+/// compute — the map's own `Arc` pointer, which the loaded program keeps alive.
+///
+/// `MapFd`/`MapIdx` (the map *handle*, the only forms a loaded program can carry
+/// — the value pseudo-forms are rejected at load) resolve here; anything else is
+/// left out and runs interpreted. The result is sorted by instruction index,
+/// which the emitter binary-searches.
+fn resolve_map_imm64(
+    v: &VerifiedProgram,
+    maps: &[(i32, alloc::sync::Arc<crate::map::BpfMap>)],
+) -> alloc::vec::Vec<(u32, u64)> {
+    use narf_bpf_isa::{decode, Decoded, Imm64};
+    let mut out = alloc::vec::Vec::new();
+    let mut i = 0usize;
+    while i < v.insns.len() {
+        let Ok((d, width)) = decode(&v.insns, i) else {
+            break;
+        };
+        if let Decoded::LoadImm64 { value, .. } = d {
+            let addr = match value {
+                Imm64::MapFd(fd) => maps.iter().find(|(f, _)| *f == fd).map(|(_, m)| m),
+                Imm64::MapIdx(idx) => usize::try_from(idx)
+                    .ok()
+                    .and_then(|k| maps.get(k))
+                    .map(|(_, m)| m),
+                _ => None,
+            };
+            if let Some(m) = addr {
+                out.push((i as u32, alloc::sync::Arc::as_ptr(m) as u64));
+            }
+        }
+        i += width;
+    }
+    out
 }
 
 /// Compile `v` and publish it as executable text.
@@ -446,6 +485,7 @@ pub fn try_compile(
     v: &VerifiedProgram,
     fully_verified: bool,
     arena_count: usize,
+    maps: &[(i32, alloc::sync::Arc<crate::map::BpfMap>)],
 ) -> Result<JitImage, JitSkip> {
     if !fully_verified {
         return Err(JitSkip::NotFullyVerified);
@@ -455,6 +495,14 @@ pub fn try_compile(
     // with two, an access straddling the boundary between two contiguously
     // placed arenas succeeds natively and traps interpreted.
     if v.uses_arena && arena_count != 1 {
+        return Err(JitSkip::UsesArena);
+    }
+    // A BPF-to-BPF call pushes the caller's saved registers onto the host stack,
+    // which moves `rsp`/`sp` — and the arena base is parked at a fixed offset
+    // from it by the prologue. The two together would make a callee's arena
+    // access read the wrong slot, so a program that uses both runs interpreted.
+    // (`subprogs.len() > 1` is exactly "there is a call target".)
+    if v.uses_arena && v.subprogs.len() > 1 {
         return Err(JitSkip::UsesArena);
     }
     // Gate 3, relaxed: an arena access *is* a fault site, so refusing all of
@@ -474,7 +522,9 @@ pub fn try_compile(
     }
     scan_program(v)?;
 
-    let compiled = narf_bpf_jit::compile(v).map_err(|_| JitSkip::Unsupported)?;
+    let map_imm64 = resolve_map_imm64(v, maps);
+    let compiled =
+        narf_bpf_jit::compile_resolved(v, &map_imm64).map_err(|_| JitSkip::Unsupported)?;
     let cap = jit_cap();
     let a = bpf_text::alloc(cap, compiled.code.len(), 0).map_err(|_| JitSkip::TextUnavailable)?;
 

@@ -11,10 +11,12 @@
 //! host cannot execute the bytes it emits.
 
 use narf_bpf_isa::encode::encode;
-use narf_bpf_isa::{AluOp, CallTarget, CondOp, Decoded, Insn, Reg, Size, Source};
+use narf_bpf_isa::{
+    AluOp, AtomicOp, ByteOrder, CallTarget, CondOp, Decoded, Imm64, Insn, Reg, Size, Source,
+};
 use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
-use crate::{compile, JitError};
+use crate::{compile, Compiled, JitError};
 
 pub(crate) fn r(n: u8) -> Reg {
     Reg::new(n).expect("register in range")
@@ -46,6 +48,19 @@ pub(crate) fn kcall(id: i32) -> Decoded {
     Decoded::Call(CallTarget::Kfunc(id))
 }
 
+/// As [`verified`], plus the subprogram table — `(start_slot, stack_bytes)`
+/// pairs — so the emitter can tell which `exit` returns to a caller and how far
+/// a `call` descends the frame. The verifier would have derived these; a codegen
+/// test states them directly.
+pub(crate) fn verified_subprogs(items: &[Decoded], subprogs: &[(u32, u32)]) -> VerifiedProgram {
+    let mut v = verified(items);
+    v.subprogs = subprogs
+        .iter()
+        .map(|&(start, stack_bytes)| narf_bpf_verifier::SubprogInfo { start, stack_bytes })
+        .collect();
+    v
+}
+
 /// As [`verified`], plus the resolved call table the verifier would have built.
 ///
 /// `sites` is `(insn_index, id, addr)`; the context is [`Context::Atomic`],
@@ -75,6 +90,18 @@ pub(crate) fn mov(dst: u8, v: i32) -> Decoded {
         dst: r(dst),
         src: Source::Imm(v),
         sign_extend: None,
+    }
+}
+
+/// An atomic against the frame pointer (R10) — the base every generated and
+/// golden atomic uses. `src` is a BPF register index.
+pub(crate) fn atomic(size: Size, op: AtomicOp, src: u8, off: i16) -> Decoded {
+    Decoded::Atomic {
+        size,
+        op,
+        dst: r(10),
+        src: r(src),
+        off,
     }
 }
 
@@ -129,23 +156,22 @@ fn sizing_converges_for_a_long_forward_branch() {
 
 #[test]
 fn reports_unsupported_rather_than_emitting_wrong_code() {
-    // Atomics are not emitted yet. The caller answers `Unsupported` by
-    // interpreting, so this must be an error and never a silently wrong
-    // encoding — the interpreter is a complete implementation, which is what
-    // makes growing this backend incrementally safe.
+    // The caller answers `Unsupported` by interpreting, so an unemitted shape
+    // must be an error and never a silently wrong encoding — the interpreter is a
+    // complete implementation, which is what makes growing this backend
+    // incrementally safe.
     //
-    // This test previously used multiply, which is now emitted. Deliberately
-    // re-pointed at something still unhandled rather than deleted: the
-    // property under test is "unemitted means refused", not any one opcode,
-    // and it stops being tested at all the moment the chosen instruction gets
-    // an encoding.
+    // This test previously used multiply, then an atomic, then a plain
+    // `LD_IMM64` — all now emitted. Deliberately re-pointed at something still
+    // unhandled rather than deleted: the property under test is "unemitted means
+    // refused", not any one opcode, and it stops being tested at all the moment
+    // the chosen instruction gets an encoding. A *map pseudo-form* `LD_IMM64` is
+    // the durable choice — it resolves to an address the emitter never has, so
+    // it stays interpreted.
     let prog = verified(&[
-        Decoded::Atomic {
-            size: Size::Dw,
-            op: narf_bpf_isa::AtomicOp::Add { fetch: false },
-            dst: r(10),
-            src: r(0),
-            off: -8,
+        Decoded::LoadImm64 {
+            dst: r(0),
+            value: Imm64::MapFd(3),
         },
         EXIT,
     ]);
@@ -423,18 +449,457 @@ fn an_arena_load_and_a_register_store_take_the_same_shape() {
 }
 
 #[test]
-fn an_arena_access_the_emitter_cannot_shape_is_refused() {
-    // Fail-closed, and specifically *not* by falling through to the plain
-    // lowering. A word-sized arena store has no arena encoding here, and the
-    // wrong answer would be `mov dword [rsi+8], 1` — a bare dereference of a
-    // handle, which is the whole hazard.
-    let prog = verified_arena(
+fn a_narrower_arena_access_takes_the_slot_relative_shape() {
+    // A word-sized (4-byte) arena store of an immediate: the same slot-relative
+    // addressing as the doubleword form, with `C7 /0` and a 32-bit operand
+    // (no REX.W) so only four bytes are written. The wrong answer this pins
+    // against is `mov dword [rsi+8], 1` — a bare dereference of the handle.
+    let store = verified_arena(
         &[
             Decoded::Store {
                 size: Size::W,
                 dst: r(2),
-                off: 8,
+                off: 0,
                 src: Source::Imm(1),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&store).expect("a narrower arena store is emitted now");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..14],
+        &[
+            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x89, 0xF1, // mov ecx, esi
+            0x41, 0xC7, 0x04, 0x0B, // mov dword [r11 + rcx*1], ...  (REX.B, no REX.W)
+            0x01, 0x00, 0x00, 0x00, // imm32 = 1
+        ],
+        "a word arena store must be the slot-relative C7 /0 with a 32-bit operand"
+    );
+    assert_eq!(
+        c.faults.0.len(),
+        1,
+        "the narrower access is still a fault site"
+    );
+
+    // A byte register store from R2 (rsi): `88 /r`, storing the low byte. The
+    // REX here is `.B` for the r11 base (present on every arena access), so this
+    // pins the byte opcode; the *forced bare 0x40* that names `sil` on a
+    // low-base store is isolated by `a_byte_store_forces_a_rex_to_reach_sil`.
+    let byte_store = verified_arena(
+        &[
+            Decoded::Store {
+                size: Size::B,
+                dst: r(1),
+                off: 0,
+                src: Source::Reg(r(2)),
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&byte_store).expect("a byte arena store is emitted now");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..10],
+        &[
+            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x89, 0xF9, // mov ecx, edi  (R1 is rdi)
+            0x41, 0x88, 0x34, 0x0B, // mov byte [r11 + rcx*1], sil  (REX.B for r11)
+        ],
+        "a byte arena store must use the byte opcode with the slot-relative shape"
+    );
+}
+
+#[test]
+fn a_byte_store_forces_a_rex_to_reach_sil() {
+    // A byte store of R2 (rsi) to a low base (R10 → rbp) has no extension bit to
+    // set, so `Emit::rex` would elide the whole prefix — and `88 /r` with no REX
+    // names `dh`, not `sil`. The store must therefore force a bare `0x40`. This
+    // is the one memory-width edge with no doubleword analogue, so it earns a
+    // golden of its own rather than resting on the differential fuzzer.
+    let prog = verified(&[
+        Decoded::Store {
+            size: Size::B,
+            dst: r(10),
+            off: -8,
+            src: Source::Reg(r(2)),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..4],
+        // 40 88 75 F8 — mov byte [rbp-8], sil
+        &[0x40, 0x88, 0x75, 0xF8],
+        "a byte store of sil must force a REX prefix"
+    );
+}
+
+#[test]
+fn a_sign_extending_word_load_is_movsxd() {
+    // LDXSW: `movsxd r64, r/m32` — 48 63 /r. The other widths ride the same
+    // machinery; this pins the one whose opcode (0x63) is unique to sign
+    // extension, so a regression that dropped the sign would show here.
+    let prog = verified(&[
+        Decoded::Load {
+            size: Size::W,
+            sign_extend: true,
+            dst: r(3),
+            src: r(2),
+            off: 8,
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..4],
+        // 48 63 56 08 — movsxd rdx, dword [rsi+8]   (R3 rdx, R2 rsi)
+        &[0x48, 0x63, 0x56, 0x08],
+        "a sign-extending word load must be movsxd"
+    );
+}
+
+#[test]
+fn a_register_movsx_sign_extends_a_byte() {
+    // MOVSX R3 = (s8)R2 into a 64-bit register: `movsx rdx, sil` — REX.W plus
+    // the byte source `sil`, which also needs the REX to be named at all.
+    let prog = verified(&[
+        Decoded::Mov {
+            wide: true,
+            dst: r(3),
+            src: Source::Reg(r(2)),
+            sign_extend: Some(8),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..4],
+        // 48 0F BE D6 — movsx rdx, sil   (R3 rdx, R2 rsi)
+        &[0x48, 0x0F, 0xBE, 0xD6],
+        "a byte MOVSX into a 64-bit register must be movsx r64, r/m8"
+    );
+}
+
+#[test]
+fn a_byteswap_reverses_or_masks_by_width() {
+    // A 32-bit swap is a single `bswap`; a 16-bit swap is `ror r16,8` then a
+    // `movzx` to clear the upper bits, matching `(v as u16).swap_bytes()`.
+    let swap32 = verified(&[
+        Decoded::End {
+            dst: r(0),
+            order: ByteOrder::Big,
+            width: 32,
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&swap32).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..2],
+        &[0x0F, 0xC8], // bswap eax
+        "a 32-bit byte swap must be a single bswap"
+    );
+
+    let swap16 = verified(&[
+        Decoded::End {
+            dst: r(0),
+            order: ByteOrder::Big,
+            width: 16,
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&swap16).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..7],
+        &[
+            0x66, 0xC1, 0xC8, 0x08, // ror ax, 8
+            0x0F, 0xB7, 0xC0, // movzx eax, ax
+        ],
+        "a 16-bit byte swap must swap the two bytes and zero-extend"
+    );
+}
+
+#[test]
+fn an_unsigned_div_saves_rax_rdx_and_guards_zero() {
+    // R6 / R7 (rbx / r13), unsigned 64-bit. The whole shape is pinned: the
+    // divisor is captured into rcx before rax/rdx are pushed (R7 could have been
+    // R0 or R3), the dividend goes to rax, a zero divisor is branched around to a
+    // zero quotient, and the result is carried out through r11 past the pops.
+    let prog = verified(&[
+        Decoded::Div {
+            wide: true,
+            signed: false,
+            dst: r(6),
+            src: Source::Reg(r(7)),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..30],
+        &[
+            0x4C, 0x89, 0xE9, // mov rcx, r13     (divisor first)
+            0x50, // push rax
+            0x52, // push rdx
+            0x48, 0x89, 0xD8, // mov rax, rbx     (dividend)
+            0x48, 0x85, 0xC9, // test rcx, rcx
+            0x74, 0x07, // jz +7 -> divzero
+            0x31, 0xD2, // xor edx, edx
+            0x48, 0xF7, 0xF1, // div rcx
+            0xEB, 0x02, // jmp +2 -> done
+            0x31, 0xC0, // xor eax, eax     (divzero: quotient 0)
+            0x49, 0x89, 0xC3, // mov r11, rax     (done)
+            0x5A, // pop rdx
+            0x58, // pop rax
+            0x4C, 0x89, 0xDB, // mov rbx, r11
+        ],
+        "an unsigned div must save rax/rdx, guard zero, and carry out via r11"
+    );
+}
+
+#[test]
+fn a_signed_mod_guards_zero_and_minus_one() {
+    // R6 %s R7 (rbx / r13), signed 64-bit. Beyond the div shape this pins the two
+    // signed-only branches: `cmp rcx, -1` avoids the `idiv` overflow trap on
+    // `INT_MIN %s -1` (remainder 0), and the zero-divisor path leaves the
+    // dividend as the remainder. The result register is rdx, not rax.
+    let prog = verified(&[
+        Decoded::Mod {
+            wide: true,
+            signed: true,
+            dst: r(6),
+            src: Source::Reg(r(7)),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..44],
+        &[
+            0x4C, 0x89, 0xE9, // mov rcx, r13
+            0x50, // push rax
+            0x52, // push rdx
+            0x48, 0x89, 0xD8, // mov rax, rbx
+            0x48, 0x85, 0xC9, // test rcx, rcx
+            0x74, 0x10, // jz +16 -> divzero
+            0x48, 0x81, 0xF9, 0xFF, 0xFF, 0xFF, 0xFF, // cmp rcx, -1
+            0x74, 0x0C, // je +12 -> neg_one
+            0x48, 0x99, // cqo
+            0x48, 0xF7, 0xF9, // idiv rcx
+            0xEB, 0x07, // jmp +7 -> done
+            0x48, 0x89, 0xC2, // mov rdx, rax     (divzero: rem = dividend)
+            0xEB, 0x02, // jmp +2 -> done
+            0x31, 0xD2, // xor edx, edx     (neg_one: rem = 0)
+            0x49, 0x89, 0xD3, // mov r11, rdx     (done)
+            0x5A, // pop rdx
+            0x58, // pop rax
+            0x4C, 0x89, 0xDB, // mov rbx, r11
+        ],
+        "a signed mod must guard zero and the -1 overflow, result in rdx"
+    );
+}
+
+#[test]
+fn the_atomics_lower_to_locked_read_modify_writes() {
+    // Every lowered atomic form, dst = R10 (rbp), src = R6 (rbx), off = -8,
+    // doubleword unless noted. Pins the LOCK prefix, the implicit-lock xchg, the
+    // rax-implicit cmpxchg, and the plain-move load-acquire / store-release —
+    // and one word form to show REX.W drops out.
+    let prog = verified(&[
+        atomic(Size::Dw, AtomicOp::Add { fetch: false }, 6, -8),
+        atomic(Size::Dw, AtomicOp::Add { fetch: true }, 6, -8),
+        atomic(Size::Dw, AtomicOp::Xchg, 6, -8),
+        atomic(Size::Dw, AtomicOp::Cmpxchg, 6, -8),
+        atomic(Size::Dw, AtomicOp::Or { fetch: false }, 6, -8),
+        atomic(Size::Dw, AtomicOp::And { fetch: false }, 6, -8),
+        atomic(Size::Dw, AtomicOp::Xor { fetch: false }, 6, -8),
+        atomic(Size::Dw, AtomicOp::LoadAcquire, 6, -8),
+        atomic(Size::Dw, AtomicOp::StoreRelease, 6, -8),
+        atomic(Size::W, AtomicOp::Add { fetch: true }, 6, -8),
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..49],
+        &[
+            0xF0, 0x48, 0x01, 0x5D, 0xF8, // lock add   [rbp-8], rbx
+            0xF0, 0x48, 0x0F, 0xC1, 0x5D, 0xF8, // lock xadd  [rbp-8], rbx
+            0x48, 0x87, 0x5D, 0xF8, // xchg  [rbp-8], rbx (implicitly locked)
+            0xF0, 0x48, 0x0F, 0xB1, 0x5D, 0xF8, // lock cmpxchg [rbp-8], rbx
+            0xF0, 0x48, 0x09, 0x5D, 0xF8, // lock or    [rbp-8], rbx
+            0xF0, 0x48, 0x21, 0x5D, 0xF8, // lock and   [rbp-8], rbx
+            0xF0, 0x48, 0x31, 0x5D, 0xF8, // lock xor   [rbp-8], rbx
+            0x48, 0x8B, 0x5D, 0xF8, // mov   rbx, [rbp-8]  (load-acquire)
+            0x48, 0x89, 0x5D, 0xF8, // mov   [rbp-8], rbx  (store-release)
+            0xF0, 0x0F, 0xC1, 0x5D, 0xF8, // lock xadd  [rbp-8], ebx  (word)
+        ],
+        "atomic lowering drifted"
+    );
+}
+
+#[test]
+fn ld_imm64_is_a_ten_byte_move() {
+    // Two back-to-back wide constants — R0 and R9 — then exit. Pins the
+    // `mov r64, imm64` encoding (including REX.B for r15) and, because each is a
+    // two-slot instruction, that they lay out contiguously with the right offset
+    // for the trailing slot.
+    let prog = verified(&[
+        Decoded::LoadImm64 {
+            dst: r(0),
+            value: Imm64::Value(0x1122_3344_5566_7788),
+        },
+        Decoded::LoadImm64 {
+            dst: r(9),
+            value: Imm64::Value(0xFFFF_FFFF_0000_0000),
+        },
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..20],
+        &[
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // movabs rax, ...
+            0x49, 0xBF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, // movabs r15, ...
+        ],
+        "LD_IMM64 must be a 10-byte mov r64, imm64"
+    );
+}
+
+#[test]
+fn may_goto_is_an_unconditional_jump() {
+    // The runtime always takes `may_goto` (it is metered by fuel, not a hidden
+    // counter), so it lowers to the same `jmp rel32` (0xE9) as an unconditional
+    // `Jump` rather than being refused. Proven differentially: the same program
+    // with the `may_goto` removed emits exactly one fewer `jmp` — the `exit`'s.
+    let add = Decoded::Alu {
+        wide: true,
+        op: AluOp::Add,
+        dst: r(0),
+        src: Source::Imm(1),
+    };
+    let with = compile(&verified(&[
+        mov(0, 0),
+        add,
+        Decoded::MayGoto { off: -2 },
+        EXIT,
+    ]))
+    .expect("may_goto must compile");
+    let without = compile(&verified(&[mov(0, 0), add, EXIT])).expect("compiles");
+    let jmps = |c: &Compiled| c.code.iter().filter(|&&b| b == 0xE9).count();
+    assert_eq!(
+        jmps(&with),
+        jmps(&without) + 1,
+        "may_goto must add exactly one unconditional jump"
+    );
+}
+
+#[test]
+fn an_unresolved_map_pseudo_ld_imm64_is_refused() {
+    // Without a resolved address, a map pseudo-form has nothing to materialise,
+    // so it runs interpreted rather than being mis-emitted. (`compile` is
+    // `compile_resolved` with an empty table.)
+    let prog = verified(&[
+        Decoded::LoadImm64 {
+            dst: r(0),
+            value: Imm64::MapFd(3),
+        },
+        EXIT,
+    ]);
+    assert!(
+        matches!(compile(&prog), Err(JitError::Unsupported { .. })),
+        "an unresolved map pseudo LD_IMM64 must be refused, not mis-emitted"
+    );
+}
+
+#[test]
+fn a_resolved_map_pseudo_ld_imm64_materialises_the_address() {
+    // Given the loader-resolved address, a map pseudo-form is the same 10-byte
+    // `mov r64, imm64` as a plain constant — over the address, here R6 (rbx).
+    let prog = verified(&[
+        Decoded::LoadImm64 {
+            dst: r(6),
+            value: Imm64::MapFd(3),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = crate::compile_resolved(&prog, &[(0, 0x1122_3344_5566_7788)]).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..10],
+        &[0x48, 0xBB, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11], // movabs rbx, ...
+        "a resolved map LD_IMM64 must materialise the address"
+    );
+}
+
+#[test]
+fn a_fetching_bitwise_atomic_is_a_cmpxchg_loop() {
+    // x86 has no atomic fetch-and-{or,and,xor}, so a fetch-OR of R6 (rbx) into
+    // [rbp-8] is a cmpxchg retry loop: the operand is captured in rcx, rax reads
+    // the current value, and the loop retries until the exchange sticks. R0
+    // (rax) is saved and the fetched value carried out through r11.
+    let prog = verified(&[
+        atomic(Size::Dw, AtomicOp::Or { fetch: true }, 6, -8),
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..29],
+        &[
+            0x50, // push rax
+            0x48, 0x89, 0xD9, // mov rcx, rbx        (operand, before rax is clobbered)
+            0x48, 0x8B, 0x45, 0xF8, // mov rax, [rbp-8]    (initial comparand)
+            0x49, 0x89, 0xC3, // mov r11, rax        (retry:)
+            0x49, 0x09, 0xCB, // or  r11, rcx
+            0xF0, 0x4C, 0x0F, 0xB1, 0x5D, 0xF8, // lock cmpxchg [rbp-8], r11
+            0x75, 0xF2, // jnz retry (-14)
+            0x49, 0x89, 0xC3, // mov r11, rax        (fetched old)
+            0x58, // pop rax
+            0x4C, 0x89, 0xDB, // mov rbx, r11
+        ],
+        "a fetching bitwise atomic must be a cmpxchg loop"
+    );
+}
+
+#[test]
+fn an_arena_atomic_the_emitter_cannot_shape_is_refused() {
+    // Fail-closed, and specifically *not* by falling through to the plain
+    // lowering. Atomics have no arena encoding here, and the wrong answer would
+    // be a bare dereference of the handle, which is the whole hazard.
+    let prog = verified_arena(
+        &[
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Add { fetch: false },
+                dst: r(2),
+                src: r(3),
+                off: 8,
             },
             mov(0, 0),
             EXIT,
@@ -986,16 +1451,45 @@ fn a_null_shim_address_is_refused() {
 }
 
 #[test]
-fn a_subprogram_call_is_still_unsupported() {
-    // Kfunc calls landing does not make BPF-to-BPF calls land. A subprogram
-    // call needs the frame push the interpreter does in `push_frame` — saving
-    // R6..R9, moving the frame base, and a return path — and emitting a bare
-    // `call` for one would run the callee on the *caller's* BPF frame.
-    let prog = verified(&[Decoded::Call(CallTarget::Subprog(1)), mov(0, 0), EXIT]);
-    assert!(matches!(
-        compile(&prog),
-        Err(JitError::Unsupported { at: 0, .. })
-    ));
+fn a_subprogram_call_saves_the_frame_and_returns() {
+    // main (stack 16) calls a subprogram (stack 0) that returns 7. The call
+    // saves R6..R9 and R10, descends the frame pointer by the caller's 16 bytes,
+    // and `call`s; the callee's `exit` is a `ret`. Displacement-independent bytes
+    // are pinned exactly; the `call` and the subprogram `ret` are checked to be
+    // present (their exact offsets depend on the fuel-burn layout).
+    let prog = verified_subprogs(
+        &[Decoded::Call(CallTarget::Subprog(1)), EXIT, mov(0, 7), EXIT],
+        &[(0, 16), (2, 0)],
+    );
+    let c = compile(&prog).expect("a subprogram call must compile");
+    let frame = [
+        0x53, // push rbx
+        0x41, 0x55, // push r13
+        0x41, 0x56, // push r14
+        0x41, 0x57, // push r15
+        0x55, // push rbp
+        0x48, 0x81, 0xED, 0x10, 0x00, 0x00, 0x00, // sub rbp, 16
+    ];
+    assert!(
+        c.code.windows(frame.len()).any(|w| w == frame),
+        "the call must save R6..R10 and descend the frame pointer"
+    );
+    let restore = [
+        0x5D, // pop rbp
+        0x41, 0x5F, // pop r15
+        0x41, 0x5E, // pop r14
+        0x41, 0x5D, // pop r13
+        0x5B, // pop rbx
+    ];
+    assert!(
+        c.code.windows(restore.len()).any(|w| w == restore),
+        "the call must restore R6..R10 afterwards"
+    );
+    assert!(c.code.contains(&0xE8), "a near `call` must be emitted");
+    assert!(
+        c.code.contains(&0xC3),
+        "the subprogram `exit` must be a `ret`"
+    );
 }
 
 #[test]

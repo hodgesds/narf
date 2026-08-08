@@ -89,13 +89,15 @@
 //!
 //! ## What is emitted, and what is not
 //!
-//! The subset `narf_bpf::jit_glue`'s gates admit: ALU (32 and 64 bit), `MOV`,
-//! doubleword loads and stores through R10/R1, jumps, conditional jumps,
-//! `exit`, and **kfunc calls**. Subprogram calls are still refused — they need
-//! a BPF frame push, which is a different feature from entering a C function.
-//! Everything else returns [`JitError::Unsupported`] and runs interpreted,
-//! which is a complete implementation — so an unemitted instruction costs
-//! speed, not correctness.
+//! The subset `narf_bpf::jit_glue`'s gates admit: ALU (32 and 64 bit, including
+//! div/mod), `MOV`, `LD_IMM64`, loads and stores through R10/R1, atomics, jumps,
+//! conditional jumps, `exit`, **kfunc calls**, and **BPF-to-BPF calls** (see
+//! [`emit_subprog_call`]). Left interpreted: the subprogram-address and BTF-id
+//! pseudo-forms of `LD_IMM64` (the map forms are emitted over the loader-resolved
+//! address), arena atomics, and arena accesses in a program that also makes
+//! BPF-to-BPF calls. Everything unemitted returns
+//! [`JitError::Unsupported`] and runs interpreted, which is a complete
+//! implementation — so an unemitted instruction costs speed, not correctness.
 //!
 //! Emitting a call cost this backend one thing the x86-64 one did not need: an
 //! `x30` save. `BLR` writes the link register, and the prologue had no reason
@@ -139,7 +141,9 @@
 
 use alloc::vec::Vec;
 
-use narf_bpf_isa::{decode, AluOp, CallTarget, CondOp, Decoded, Reg, Size, Source};
+use narf_bpf_isa::{
+    decode, AluOp, AtomicOp, ByteOrder, CallTarget, CondOp, Decoded, Imm64, Reg, Size, Source,
+};
 use narf_bpf_verifier::{Context, KfuncCallSite, VerifiedProgram};
 
 use crate::blocks::{block_len, block_starts};
@@ -261,6 +265,49 @@ const ORR_X: u32 = 0xAA00_0000;
 const EOR_X: u32 = 0xCA00_0000;
 /// `MADD Rd, Rn, Rm, Ra`; with `Ra = xzr` it is `MUL`.
 const MADD_X: u32 = 0x9B00_0000;
+/// `MSUB Rd, Rn, Rm, Ra` — `Rd = Ra - Rn*Rm`, the `o0` bit of `MADD`. Used with
+/// a quotient to recover the remainder for `mod`.
+const MSUB_X: u32 = 0x9B00_8000;
+/// `UDIV Rd, Rn, Rm` and `SDIV Rd, Rn, Rm`, the data-processing 2-source group
+/// (same base as [`LSLV_X`], opcode in bits [15:10]). aarch64 division needs no
+/// guards: divide-by-zero produces zero and `INT_MIN / -1` produces the wrapping
+/// `INT_MIN`, both without trapping — exactly the interpreter's semantics.
+const UDIV_X: u32 = 0x9AC0_0800;
+const SDIV_X: u32 = 0x9AC0_0C00;
+
+/// `ORN Rd, Rn, Rm` — `ORR` with the second operand inverted; `MVN` when
+/// `Rn == xzr`. Used to turn BPF's atomic AND into an `LDCLR`/`STCLR` (which
+/// clears the bits *set* in its operand, i.e. `&= ~operand`).
+const ORN_X: u32 = 0xAA20_0000;
+
+/// LSE atomic read-modify-writes, doubleword acquire+release forms. The
+/// operation is bits [14:12]; `SWP` sets bit 15. The word forms clear bit 30
+/// (see [`sz_atomic`]). `Rs` (bits [20:16]) is the operand, `Rt` (bits [4:0])
+/// receives the pre-op value (or `xzr` to discard it), `Rn` (bits [9:5]) is the
+/// address. Acquire on a discarded-result form is harmless, so one AL constant
+/// serves both the fetching and non-fetching lowerings.
+const LDADD_AL: u32 = 0xF8E0_0000;
+const LDCLR_AL: u32 = 0xF8E0_1000;
+const LDEOR_AL: u32 = 0xF8E0_2000;
+const LDSET_AL: u32 = 0xF8E0_3000;
+const SWP_AL: u32 = 0xF8E0_8000;
+/// `CASAL Rs, Rt, [Rn]` — compare `Rs` with `[Rn]`, store `Rt` on equal, and
+/// always load the pre-op value into `Rs`. With `Rs = x0` that is BPF cmpxchg.
+const CASAL: u32 = 0xC8E0_FC00;
+/// `LDAR Rt, [Rn]` and `STLR Rt, [Rn]` — the load-acquire / store-release pair.
+const LDAR: u32 = 0xC8DF_FC00;
+const STLR: u32 = 0xC89F_FC00;
+
+/// The atomic instructions carry their access size in bits [31:30] (`0b11`
+/// doubleword, `0b10` word), so a word form clears bit 30 of the doubleword
+/// base — unlike [`sf`], which clears bit 31 for the data-processing forms.
+const fn sz_atomic(base: u32, wide: bool) -> u32 {
+    if wide {
+        base
+    } else {
+        base & !(1 << 30)
+    }
+}
 /// Data-processing 2-source shift group. `LSLV` as encoded; `+0x400` selects
 /// `LSRV` and `+0x800` selects `ASRV`.
 const LSLV_X: u32 = 0x9AC0_2000;
@@ -289,6 +336,38 @@ const fn movk(wide: bool, rd: u8, hw: u8, imm: u16) -> u32 {
     sf(0xF280_0000, wide) | ((hw as u32) << 21) | ((imm as u32) << 5) | rd as u32
 }
 
+/// `REV Rd, Rn` — reverse all bytes of the register. The 32-bit form (`sf` off)
+/// reverses four bytes and zero-extends; the 64-bit form reverses all eight.
+#[inline]
+const fn rev(wide: bool, rd: u8, rn: u8) -> u32 {
+    // `REV Wd,Wn` = 0x5AC0_0800; the 64-bit `REV Xd,Xn` = 0xDAC0_0C00, which is
+    // `sf` plus the doubleword opcode bit — spelled directly to keep it obvious.
+    let base = if wide { 0xDAC0_0C00 } else { 0x5AC0_0800 };
+    base | ((rn as u32) << 5) | rd as u32
+}
+
+/// `REV16 Wd, Wn` — reverse the bytes within each 16-bit halfword.
+#[inline]
+const fn rev16(rd: u8, rn: u8) -> u32 {
+    0x5AC0_0400 | ((rn as u32) << 5) | rd as u32
+}
+
+/// A bitfield-move (`SBFM`/`UBFM`) with immediates `immr`/`imms`. The 64-bit
+/// form sets both `sf` (bit 31) and `N` (bit 22) together — `N` must equal `sf`
+/// or the encoding is unallocated. The base constants are the 32-bit forms
+/// (both bits clear), so unlike the `_X`-based helpers this does not go through
+/// [`sf`], which only clears bit 31 and would leave `sf = 0, N = 1`.
+#[inline]
+const fn bfm(base: u32, wide: bool, rd: u8, rn: u8, immr: u32, imms: u32) -> u32 {
+    let sfn = if wide { (1 << 31) | (1 << 22) } else { 0 };
+    base | sfn | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32
+}
+
+/// `UBFM` base, 32-bit form. `UXTH Wd,Wn` is `UBFM Wd,Wn,#0,#15`.
+const UBFM: u32 = 0x5300_0000;
+/// `SBFM` base, 32-bit form. `SXTB`/`SXTH`/`SXTW` are `SBFM Rd,Rn,#0,#{7,15,31}`.
+const SBFM: u32 = 0x1300_0000;
+
 /// `LDUR Rt, [Rn, #simm9]` — the unscaled form, so a negative or unaligned
 /// displacement needs no special case. `simm9` must be in `-256..=255`.
 #[inline]
@@ -300,6 +379,54 @@ const fn ldur(rt: u8, rn: u8, simm9: i32) -> u32 {
 #[inline]
 const fn stur(rt: u8, rn: u8, simm9: i32) -> u32 {
     0xF800_0000 | (((simm9 as u32) & 0x1FF) << 12) | ((rn as u32) << 5) | rt as u32
+}
+
+/// A load/store unscaled-immediate (`LDUR*`/`STUR*`) of any width.
+///
+/// `size2` is the width in the `[31:30]` field (0=byte, 1=half, 2=word,
+/// 3=doubleword) and `opc2` is the `[23:22]` field — `0b00` store, `0b01`
+/// zero-extending load, `0b10` load sign-extending to 64 bits. [`ldur`] and
+/// [`stur`] are the `size2 = 3` cases of this, kept as their own names because
+/// the doubleword forms are on every non-widened path.
+#[inline]
+const fn ldst_unscaled(size2: u32, opc2: u32, rt: u8, rn: u8, simm9: i32) -> u32 {
+    0x3800_0000
+        | (size2 << 30)
+        | (opc2 << 22)
+        | (((simm9 as u32) & 0x1FF) << 12)
+        | ((rn as u32) << 5)
+        | rt as u32
+}
+
+/// The `[31:30]` width field for a BPF access size.
+#[inline]
+const fn size_field(size: Size) -> u32 {
+    match size {
+        Size::B => 0,
+        Size::H => 1,
+        Size::W => 2,
+        Size::Dw => 3,
+    }
+}
+
+/// `LDUR*` of `size` into `rt`, zero- or sign-extending to a full 64-bit
+/// register to match the interpreter's `widen`.
+#[inline]
+const fn ldur_sized(size: Size, sign_extend: bool, rt: u8, rn: u8, simm9: i32) -> u32 {
+    // opc `0b10` sign-extends to the 64-bit register; `0b01` zero-extends. A
+    // doubleword fills the register either way, so it always takes `0b01`.
+    let opc = if sign_extend && !matches!(size, Size::Dw) {
+        0b10
+    } else {
+        0b01
+    };
+    ldst_unscaled(size_field(size), opc, rt, rn, simm9)
+}
+
+/// `STUR*` of the low `size` bytes of `rt`.
+#[inline]
+const fn stur_sized(size: Size, rt: u8, rn: u8, simm9: i32) -> u32 {
+    ldst_unscaled(size_field(size), 0b00, rt, rn, simm9)
 }
 
 /// `STP Rt, Rt2, [Rn, #imm]` with the addressing mode chosen by `base`.
@@ -378,6 +505,30 @@ const fn b(imm26: i32) -> u32 {
     0x1400_0000 | ((imm26 as u32) & 0x03FF_FFFF)
 }
 
+/// `BL #(4*imm26)` — branch with link, for a BPF-to-BPF call.
+#[inline]
+const fn bl(imm26: i32) -> u32 {
+    0x9400_0000 | ((imm26 as u32) & 0x03FF_FFFF)
+}
+
+/// `STR Xt, [Xn, #simm]!` — pre-indexed store.
+#[inline]
+const fn str_pre(rt: u8, rn: u8, simm9: i32) -> u32 {
+    0xF800_0C00 | (((simm9 as u32) & 0x1FF) << 12) | ((rn as u32) << 5) | rt as u32
+}
+
+/// `LDR Xt, [Xn], #simm` — post-indexed load.
+#[inline]
+const fn ldr_post(rt: u8, rn: u8, simm9: i32) -> u32 {
+    0xF840_0400 | (((simm9 as u32) & 0x1FF) << 12) | ((rn as u32) << 5) | rt as u32
+}
+
+/// `SUB Xd, Xn, #imm12` — used to descend the frame pointer at a call.
+#[inline]
+const fn sub_imm(rd: u8, rn: u8, imm12: u32) -> u32 {
+    0xD100_0000 | ((imm12 & 0xFFF) << 10) | ((rn as u32) << 5) | rd as u32
+}
+
 /// A byte sink that also records where things landed.
 #[derive(Debug, Default)]
 struct Emit {
@@ -436,6 +587,76 @@ fn mov_imm32(e: &mut Emit, dst: u8, v: i32) {
     let u = v as u32;
     e.w(movz(false, dst, 0, u as u16));
     e.w(movk(false, dst, 1, (u >> 16) as u16));
+}
+
+/// `MOV Rd, #imm` — sign-extended to 64 bits for a wide move, zero-extended
+/// from 32 for a narrow one, matching the interpreter's move semantics.
+fn emit_mov_imm(e: &mut Emit, wide: bool, dst: u8, v: i32) {
+    if wide {
+        mov_imm64(e, dst, i64::from(v));
+    } else {
+        mov_imm32(e, dst, v);
+    }
+}
+
+/// Sign-extend the low `bits` of `v` to 64 bits — the compile-time twin of the
+/// `MOVSX` register forms, for the immediate case.
+fn sext_imm(v: i32, bits: u8) -> i64 {
+    match bits {
+        8 => v as i8 as i64,
+        16 => v as i16 as i64,
+        _ => i64::from(v),
+    }
+}
+
+/// `MOVSX`: sign-extend the low `bits` of `src` into `dst` as one `SBFM`. A
+/// 32-bit destination extends within 32 bits and zero-extends the top half; a
+/// 32-bit-source extension to a 32-bit destination is the identity move.
+fn movsx(wide: bool, bits: u8, dst: u8, src: u8) -> u32 {
+    match bits {
+        8 => bfm(SBFM, wide, dst, src, 0, 7),
+        16 => bfm(SBFM, wide, dst, src, 0, 15),
+        _ if wide => bfm(SBFM, true, dst, src, 0, 31),
+        _ => mov_rr(false, dst, src),
+    }
+}
+
+/// `END` / `bswap`: reverse or truncate `dst` by width, matching the
+/// interpreter's `byteswap`. `Little` only masks to width; `Big`/`Swap`
+/// reverses. Every case zero-extends the result.
+fn emit_byteswap(
+    e: &mut Emit,
+    at: u32,
+    dst: u8,
+    order: ByteOrder,
+    width: u8,
+) -> Result<(), JitError> {
+    let swap = matches!(order, ByteOrder::Big | ByteOrder::Swap);
+    match (width, swap) {
+        // `REV16` swaps the bytes in the low halfword (and the high one); `UXTH`
+        // then keeps only the low 16 bits, matching `(v as u16).swap_bytes()`.
+        (16, true) => {
+            e.w(rev16(dst, dst));
+            e.w(bfm(UBFM, false, dst, dst, 0, 15));
+        }
+        // `UXTH` — value & 0xFFFF.
+        (16, false) => e.w(bfm(UBFM, false, dst, dst, 0, 15)),
+        // `REV Wd` reverses four bytes and zero-extends the top half.
+        (32, true) => e.w(rev(false, dst, dst)),
+        // `MOV Wd, Wd` — value & 0xFFFF_FFFF via the zero-extending W write.
+        (32, false) => e.w(mov_rr(false, dst, dst)),
+        // `REV Xd` reverses all eight bytes.
+        (64, true) => e.w(rev(true, dst, dst)),
+        // A 64-bit little-endian swap is the identity.
+        (64, false) => {}
+        _ => {
+            return Err(JitError::Unsupported {
+                at,
+                what: "byteswap width must be 16, 32, or 64",
+            })
+        }
+    }
+    Ok(())
 }
 
 /// Put an immediate operand in [`hr::IMM`] and return that register.
@@ -504,6 +725,8 @@ const OOF_EPILOGUE: u32 = u32::MAX - 1;
 enum RelKind {
     /// `B`, `imm26`, ±128 MiB.
     B26,
+    /// `BL`, `imm26`, ±128 MiB — a BPF-to-BPF call.
+    Bl26,
     /// `B.cond`, `imm19`, ±1 MiB.
     Cond19,
 }
@@ -532,7 +755,17 @@ struct Reloc {
 ///
 /// [`JitError`]. `Unsupported` means "run this one interpreted".
 pub fn compile(prog: &VerifiedProgram) -> Result<Compiled, JitError> {
-    let e = emit_pass(prog)?;
+    compile_resolved(prog, &[])
+}
+
+/// As [`compile`], but with the resolved addresses for map pseudo-form
+/// `LD_IMM64`s — `(instruction index, address)` pairs sorted by index. See the
+/// x86-64 twin for why the loader, not the verifier, supplies them.
+pub fn compile_resolved(
+    prog: &VerifiedProgram,
+    map_imm64: &[(u32, u64)],
+) -> Result<Compiled, JitError> {
+    let e = emit_pass(prog, map_imm64)?;
     Ok(Compiled {
         code: e.buf,
         faults: {
@@ -544,7 +777,7 @@ pub fn compile(prog: &VerifiedProgram) -> Result<Compiled, JitError> {
     })
 }
 
-fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
+fn emit_pass(prog: &VerifiedProgram, map_imm64: &[(u32, u64)]) -> Result<Emit, JitError> {
     let mut e = Emit::default();
     let mut relocs: Vec<Reloc> = Vec::new();
     let mut out = Vec::with_capacity(prog.insns.len() + 1);
@@ -555,8 +788,27 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
 
     emit_prologue(&mut e);
 
+    // Slot boundaries sorted by start, so the loop knows which subprogram each
+    // instruction belongs to: a subprogram `exit` returns to its caller, and a
+    // `call` descends the frame by the *caller's* stack size.
+    let mut sp_starts: Vec<(u32, usize)> = prog
+        .subprogs
+        .iter()
+        .enumerate()
+        .map(|(k, s)| (s.start, k))
+        .collect();
+    sp_starts.sort_unstable();
+    let mut sp_ptr = 0usize;
+
     let mut i = 0usize;
     while i < prog.insns.len() {
+        while sp_ptr + 1 < sp_starts.len() && i as u32 >= sp_starts[sp_ptr + 1].0 {
+            sp_ptr += 1;
+        }
+        let (cur_start, cur_idx) = sp_starts.get(sp_ptr).copied().unwrap_or((0, 0));
+        let in_main = cur_start == 0;
+        let cur_stack = prog.subprogs.get(cur_idx).map_or(0, |s| s.stack_bytes);
+
         out.push(e.len());
         // Burn this block's worth of fuel on entry. Per block rather than per
         // instruction: the same total as the interpreter charges, because a
@@ -575,12 +827,15 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
             &mut relocs,
             &prog.kfunc_calls,
             arena[i],
+            in_main,
+            cur_stack,
+            map_imm64,
         )?;
         i += width;
-        // A wide instruction occupies two slots. `LD_IMM64` is the only one and
-        // it is `Unsupported` here, so `width` is always 1 today; the trailing
-        // slot records the *following* instruction's offset, which is only
-        // sound because the verifier rejects a jump into it.
+        // A wide instruction (`LD_IMM64`) occupies two slots. Its own offset is
+        // `out[i]`; the trailing slot records the *following* instruction's
+        // offset, which is sound because the verifier rejects a jump into it and
+        // keeps `out` at one entry per slot for the reloc patcher.
         for _ in 1..width {
             out.push(e.len());
         }
@@ -624,6 +879,12 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
                     return Err(JitError::BadTarget { at: r.target });
                 }
                 b(words as i32)
+            }
+            RelKind::Bl26 => {
+                if !(-(1 << 25)..(1 << 25)).contains(&words) {
+                    return Err(JitError::BadTarget { at: r.target });
+                }
+                bl(words as i32)
             }
             RelKind::Cond19 => {
                 // Out of `imm19` range means the image is larger than 1 MiB.
@@ -795,6 +1056,113 @@ fn addr_operand(e: &mut Emit, base: u8, off: i16) -> (u8, i32) {
     }
 }
 
+/// The LSE atomics address memory through `[Rn]` with no displacement, so a
+/// non-zero offset is folded into [`hr::ADDR`] first. A zero offset uses the
+/// base register directly.
+fn atomic_addr(e: &mut Emit, base: u8, off: i16) -> u8 {
+    if off == 0 {
+        base
+    } else {
+        mov_imm64(e, hr::ADDR, i64::from(off));
+        e.w(shifted_reg(ADD_X, true, hr::ADDR, base, hr::ADDR));
+        hr::ADDR
+    }
+}
+
+/// A BPF atomic against a certified base (stack or context), lowered to the LSE
+/// atomic instructions. Word and doubleword only (the ISA has no narrower
+/// atomic); a word form zero-extends any fetched value, matching the
+/// interpreter's `mask`.
+///
+/// Every form is one instruction (two where a value has to be moved out of a
+/// scratch, or AND inverted). The fetching forms take their result through
+/// [`hr::IMM`] rather than into the operand register directly, because `Rs == Rt`
+/// on an LSE atomic is `CONSTRAINED UNPREDICTABLE`. `Cmpxchg` where the source
+/// is R0 would hit the same `Rs == Rt` on `CASAL` and is refused (the fuzzer and
+/// verifier both keep R0 clear of it in practice); like the fetching bitwise
+/// forms on x86-64, that keeps the lowered repertoire identical on both backends.
+fn emit_atomic(
+    e: &mut Emit,
+    at: u32,
+    size: Size,
+    op: AtomicOp,
+    dst: Reg,
+    off: i16,
+    src: Reg,
+) -> Result<(), JitError> {
+    let wide = size == Size::Dw;
+    let s = host(src);
+    let addr = atomic_addr(e, host(dst), off);
+    // `<ldop>AL Rs=s, Rt=rt, [addr]`.
+    let rmw = |e: &mut Emit, base: u32, rt: u8| {
+        e.w(sz_atomic(base, wide) | ((s as u32) << 16) | ((addr as u32) << 5) | rt as u32);
+    };
+    match op {
+        // Non-fetching: discard the loaded value into xzr.
+        AtomicOp::Add { fetch: false } => rmw(e, LDADD_AL, hr::ZR),
+        AtomicOp::Or { fetch: false } => rmw(e, LDSET_AL, hr::ZR),
+        AtomicOp::Xor { fetch: false } => rmw(e, LDEOR_AL, hr::ZR),
+        AtomicOp::And { fetch: false } => {
+            // `LDCLR` clears the bits set in its operand (`&= ~operand`), so AND
+            // is the clear of `~src`.
+            e.w(shifted_reg(ORN_X, wide, hr::IMM, hr::ZR, s));
+            e.w(sz_atomic(LDCLR_AL, wide)
+                | ((hr::IMM as u32) << 16)
+                | ((addr as u32) << 5)
+                | u32::from(hr::ZR));
+        }
+        // Fetching: land the old value in IMM, then move it to the source (which
+        // is also the operand, so it cannot double as Rt).
+        AtomicOp::Add { fetch: true } => {
+            rmw(e, LDADD_AL, hr::IMM);
+            e.w(mov_rr(wide, s, hr::IMM));
+        }
+        AtomicOp::Xchg => {
+            rmw(e, SWP_AL, hr::IMM);
+            e.w(mov_rr(wide, s, hr::IMM));
+        }
+        // `CASAL x0, src, [addr]`: x0 (R0) is the comparand and receives the
+        // pre-op value; src is stored on a match.
+        AtomicOp::Cmpxchg => {
+            if s == 0 {
+                return Err(JitError::Unsupported {
+                    at,
+                    what: "cmpxchg with R0 as the store value aliases CASAL Rs==Rt",
+                });
+            }
+            // Rs = x0 (R0) is the comparand; its field is zero, so it is left
+            // out of the OR rather than written as `0 << 16`.
+            e.w(sz_atomic(CASAL, wide) | ((addr as u32) << 5) | s as u32);
+        }
+        AtomicOp::LoadAcquire => {
+            e.w(sz_atomic(LDAR, wide) | ((addr as u32) << 5) | s as u32);
+        }
+        AtomicOp::StoreRelease => {
+            e.w(sz_atomic(STLR, wide) | ((addr as u32) << 5) | s as u32);
+        }
+        // Fetching bitwise: the LSE fetch forms land the old value in IMM (or
+        // AHANDLE for AND, whose operand `~src` occupies IMM), then move it to
+        // the source register.
+        AtomicOp::Or { fetch: true } => {
+            rmw(e, LDSET_AL, hr::IMM);
+            e.w(mov_rr(wide, s, hr::IMM));
+        }
+        AtomicOp::Xor { fetch: true } => {
+            rmw(e, LDEOR_AL, hr::IMM);
+            e.w(mov_rr(wide, s, hr::IMM));
+        }
+        AtomicOp::And { fetch: true } => {
+            e.w(shifted_reg(ORN_X, wide, hr::IMM, hr::ZR, s)); // IMM = ~src
+            e.w(sz_atomic(LDCLR_AL, wide)
+                | ((hr::IMM as u32) << 16)
+                | ((addr as u32) << 5)
+                | hr::AHANDLE as u32); // AHANDLE = old
+            e.w(mov_rr(wide, s, hr::AHANDLE));
+        }
+    }
+    Ok(())
+}
+
 /// The whole of a kfunc call: the AAPCS64 shuffle, the target, and the `BLR`.
 ///
 /// BPF passes arguments in R1..R5 and AAPCS64 in `x0`..`x4`, so the map is
@@ -804,11 +1172,14 @@ fn addr_operand(e: &mut Emit, base: u8, off: i16) -> (u8, i32) {
 /// value is R0, which a call clobbers by definition. Walking the other way
 /// would smear R5 across all five argument registers.
 ///
-/// Nothing is saved around the call. R0..R5 live in `x0`..`x5`, which AAPCS64
+/// The BPF registers need no saving: R0..R5 live in `x0`..`x5`, which AAPCS64
 /// lets the callee destroy and the BPF ABI likewise declares caller-saved;
 /// R6..R10 and the fuel counter live in `x19`..`x22`, `x24` and `x25`, which
-/// AAPCS64 requires the callee to preserve. `x30` is the one exception, and the
-/// prologue saves it — see [`hr::LR`].
+/// AAPCS64 requires the callee to preserve. `x30` is the exception: `BLR`
+/// overwrites it, and it holds the return address — main's from its prologue,
+/// or a subprogram's from the caller's `BL`. It is saved around the call so a
+/// subprogram that calls a kfunc still returns to its caller. (main also has it
+/// in `LR_SLOT`, so for main this save is redundant but harmless.)
 fn emit_kfunc_call(e: &mut Emit, addr: usize) {
     for k in 0..5u8 {
         e.w(mov_rr(true, k, k + 1));
@@ -817,7 +1188,54 @@ fn emit_kfunc_call(e: &mut Emit, addr: usize) {
     // exactly this, absent from [`REGS`], and caller-saved, so the callee is
     // welcome to destroy it.
     mov_imm64(e, hr::IMM, addr as i64);
+    e.w(str_pre(hr::LR, hr::SP, -16)); // str x30, [sp, #-16]!
     e.w(blr(hr::IMM));
+    e.w(ldr_post(hr::LR, hr::SP, 16)); // ldr x30, [sp], #16
+}
+
+/// An unconditional `B` to the BPF instruction `at + 1 + off`. Shared by `Jump`
+/// and `may_goto`, whose `off` fields differ in width.
+fn emit_uncond_branch(e: &mut Emit, at: u32, off: i64, relocs: &mut Vec<Reloc>) {
+    let at_word = e.len();
+    e.w(b(0));
+    relocs.push(Reloc {
+        at: at_word,
+        target: (at as i64 + 1 + off) as u32,
+        kind: RelKind::B26,
+    });
+}
+
+/// A BPF-to-BPF call, the JIT analogue of the interpreter's `push_frame`.
+///
+/// R6..R10 must survive a call (BPF's ABI) and `BL` clobbers `x30`, so the six
+/// host registers holding R6..R9, R10 and the link register are saved across the
+/// call in three `STP` pairs — 48 bytes, keeping `sp` 16-aligned. R1..R5 are
+/// caller-saved and R0 carries the result, so none of those is saved. R10
+/// (`x25`) is then lowered by the *caller's* stack size, putting the callee's
+/// frame directly below the caller's — the descent `push_frame` makes by the
+/// calling subprogram's bytes. The `BL` is a `imm26` resolved against the offset
+/// table like a branch, and the callee's `exit` is a `RET` back to it. The fuel
+/// register (`x24`) is deliberately not saved: the callee decrements the same
+/// running total.
+fn emit_subprog_call(e: &mut Emit, at: u32, rel: i32, cur_stack: u32, relocs: &mut Vec<Reloc>) {
+    debug_assert!(
+        cur_stack <= 0xFFF,
+        "a frame larger than a SUB immediate is not expressible here"
+    );
+    e.w(pair(STP_PRE, 19, 20, hr::SP, -48)); // stp x19, x20, [sp, #-48]!
+    e.w(pair(STP_OFF, 21, 22, hr::SP, 16)); // stp x21, x22, [sp, #16]
+    e.w(pair(STP_OFF, hr::FP, hr::LR, hr::SP, 32)); // stp x25, x30, [sp, #32]
+    e.w(sub_imm(hr::FP, hr::FP, cur_stack)); // sub x25, x25, #<caller stack>
+    let at_word = e.len();
+    e.w(bl(0)); // bl -> callee entry
+    relocs.push(Reloc {
+        at: at_word,
+        target: (at as i64 + 1 + i64::from(rel)) as u32,
+        kind: RelKind::Bl26,
+    });
+    e.w(pair(LDP_OFF, hr::FP, hr::LR, hr::SP, 32)); // ldp x25, x30, [sp, #32]
+    e.w(pair(LDP_OFF, 21, 22, hr::SP, 16)); // ldp x21, x22, [sp, #16]
+    e.w(pair(LDP_POST, 19, 20, hr::SP, 48)); // ldp x19, x20, [sp], #48
 }
 
 /// The call site the verifier resolved for the `call` at `at`, or a refusal.
@@ -882,6 +1300,7 @@ fn emit_arena_addr(e: &mut Emit, handle: u8, off: i16) {
     e.w(shifted_reg(ADD_X, true, hr::ADDR, hr::ADDR, hr::AHANDLE));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_insn(
     e: &mut Emit,
     insn: &Decoded,
@@ -889,6 +1308,9 @@ fn emit_insn(
     relocs: &mut Vec<Reloc>,
     calls: &[KfuncCallSite],
     arena: bool,
+    in_main: bool,
+    cur_stack: u32,
+    map_imm64: &[(u32, u64)],
 ) -> Result<(), JitError> {
     // The arena forms first: same instructions, different addressing, and a
     // recorded fault site. Only the doubleword width is emitted, matching the
@@ -897,32 +1319,32 @@ fn emit_insn(
     if arena {
         match *insn {
             Decoded::Load {
-                size: Size::Dw,
-                sign_extend: false,
+                size,
+                sign_extend,
                 dst,
                 src,
                 off,
             } => {
                 emit_arena_addr(e, host(src), off);
                 let fault_off = e.len();
-                e.w(ldur(host(dst), hr::ADDR, 0));
+                e.w(ldur_sized(size, sign_extend, host(dst), hr::ADDR, 0));
                 record_fault(e, fault_off);
                 return Ok(());
             }
             Decoded::Store {
-                size: Size::Dw,
+                size,
                 dst,
                 off,
                 src: Source::Reg(s),
             } => {
                 emit_arena_addr(e, host(dst), off);
                 let fault_off = e.len();
-                e.w(stur(host(s), hr::ADDR, 0));
+                e.w(stur_sized(size, host(s), hr::ADDR, 0));
                 record_fault(e, fault_off);
                 return Ok(());
             }
             Decoded::Store {
-                size: Size::Dw,
+                size,
                 dst,
                 off,
                 src: Source::Imm(v),
@@ -933,14 +1355,15 @@ fn emit_insn(
                 emit_arena_addr(e, host(dst), off);
                 mov_imm64(e, hr::IMM, i64::from(v));
                 let fault_off = e.len();
-                e.w(stur(hr::IMM, hr::ADDR, 0));
+                e.w(stur_sized(size, hr::IMM, hr::ADDR, 0));
                 record_fault(e, fault_off);
                 return Ok(());
             }
+            // An arena atomic — no lowering yet, so it runs interpreted.
             _ => {
                 return Err(JitError::Unsupported {
                     at,
-                    what: "arena access shape not yet emitted by the aarch64 backend",
+                    what: "arena atomic not yet emitted by the aarch64 backend",
                 })
             }
         }
@@ -951,6 +1374,10 @@ fn emit_insn(
             emit_kfunc_call(e, site.addr);
         }
 
+        Decoded::Call(CallTarget::Subprog(rel)) => {
+            emit_subprog_call(e, at, rel, cur_stack, relocs);
+        }
+
         Decoded::Mov {
             wide,
             dst,
@@ -958,16 +1385,51 @@ fn emit_insn(
             sign_extend: None,
         } => match src {
             Source::Reg(s) => e.w(mov_rr(wide, host(dst), host(s))),
-            Source::Imm(v) => {
-                if wide {
-                    mov_imm64(e, host(dst), i64::from(v));
-                } else {
-                    // A `W`-register write zero-extends, which is exactly
-                    // BPF's semantics for a 32-bit move.
-                    mov_imm32(e, host(dst), v);
-                }
-            }
+            Source::Imm(v) => emit_mov_imm(e, wide, host(dst), v),
         },
+
+        Decoded::Mov {
+            wide,
+            dst,
+            src: Source::Reg(s),
+            sign_extend: Some(bits),
+        } => e.w(movsx(wide, bits, host(dst), host(s))),
+
+        Decoded::Mov {
+            wide,
+            dst,
+            src: Source::Imm(v),
+            sign_extend: Some(bits),
+        } => {
+            // Sign-extending a constant is a constant; materialise it — the
+            // interpreter's `raw as iN as i64 as u64`, then the `wide` mask.
+            let ext = sext_imm(v, bits);
+            if wide {
+                mov_imm64(e, host(dst), ext);
+            } else {
+                mov_imm32(e, host(dst), ext as i32);
+            }
+        }
+
+        // A plain 64-bit constant is the `MOVZ`/`MOVK` sequence. A map pseudo-form
+        // is the same over the loader-resolved address; the subprogram-address
+        // and BTF-id forms are never resolved, so they fall to `Unsupported` and
+        // run interpreted.
+        Decoded::LoadImm64 { dst, value } => {
+            let imm = match value {
+                Imm64::Value(v) => v as i64,
+                _ => match map_imm64.binary_search_by_key(&at, |&(i, _)| i) {
+                    Ok(k) => map_imm64[k].1 as i64,
+                    Err(_) => {
+                        return Err(JitError::Unsupported {
+                            at,
+                            what: "unresolved LD_IMM64 pseudo-form",
+                        })
+                    }
+                },
+            };
+            mov_imm64(e, host(dst), imm);
+        }
 
         Decoded::Alu {
             wide,
@@ -1009,10 +1471,53 @@ fn emit_insn(
                 | host(dst) as u32);
         }
 
+        Decoded::Div {
+            wide,
+            signed,
+            dst,
+            src,
+        } => {
+            // `SDIV`/`UDIV Rd, Rn, Rm` writes the quotient straight into dst; the
+            // hardware already matches BPF for the zero and overflow cases.
+            let rm = src_reg(e, wide, src);
+            let base = if signed { SDIV_X } else { UDIV_X };
+            e.w(shifted_reg(base, wide, host(dst), host(dst), rm));
+        }
+
+        Decoded::Mod {
+            wide,
+            signed,
+            dst,
+            src,
+        } => {
+            // No remainder instruction: divide into a scratch, then
+            // `MSUB dst, quotient, divisor, dividend` = dividend - quotient*divisor.
+            // The quotient lands in ADDR rather than IMM so that an immediate
+            // divisor (materialised into IMM by `src_reg`) survives to the MSUB.
+            let rm = src_reg(e, wide, src);
+            let base = if signed { SDIV_X } else { UDIV_X };
+            e.w(shifted_reg(base, wide, hr::ADDR, host(dst), rm));
+            e.w(sf(MSUB_X, wide)
+                | ((rm as u32) << 16)
+                | ((host(dst) as u32) << 10)
+                | ((hr::ADDR as u32) << 5)
+                | host(dst) as u32);
+        }
+
+        Decoded::Atomic {
+            size,
+            op,
+            dst,
+            src,
+            off,
+        } => emit_atomic(e, at, size, op, dst, off, src)?,
+
         Decoded::Neg { wide, dst } => {
             // `NEG Rd, Rd` — `SUB Rd, ZR, Rd`.
             e.w(shifted_reg(SUB_X, wide, host(dst), hr::ZR, host(dst)));
         }
+
+        Decoded::End { dst, order, width } => emit_byteswap(e, at, host(dst), order, width)?,
 
         Decoded::Alu { wide, op, dst, src } => {
             let Some(base) = alu_base(op) else {
@@ -1026,50 +1531,46 @@ fn emit_insn(
         }
 
         Decoded::Load {
-            size: Size::Dw,
-            sign_extend: false,
+            size,
+            sign_extend,
             dst,
             src,
             off,
         } => {
             let (base, disp) = addr_operand(e, host(src), off);
-            e.w(ldur(host(dst), base, disp));
+            e.w(ldur_sized(size, sign_extend, host(dst), base, disp));
         }
 
         Decoded::Store {
-            size: Size::Dw,
+            size,
             dst,
             off,
             src: Source::Reg(s),
         } => {
             let (base, disp) = addr_operand(e, host(dst), off);
-            e.w(stur(host(s), base, disp));
+            e.w(stur_sized(size, host(s), base, disp));
         }
 
         Decoded::Store {
-            size: Size::Dw,
+            size,
             dst,
             off,
             src: Source::Imm(v),
         } => {
             // The stored value is the immediate sign-extended to 64 bits,
-            // matching the interpreter's `imm as i64 as u64`. `hr::IMM` holds
-            // the value and `hr::ADDR` the address, so the two scratch uses
-            // cannot collide.
+            // matching the interpreter's `imm as i64 as u64`; a narrower `STUR*`
+            // then keeps only the low bytes. `hr::IMM` holds the value and
+            // `hr::ADDR` the address, so the two scratch uses cannot collide.
             mov_imm64(e, hr::IMM, i64::from(v));
             let (base, disp) = addr_operand(e, host(dst), off);
-            e.w(stur(hr::IMM, base, disp));
+            e.w(stur_sized(size, hr::IMM, base, disp));
         }
 
-        Decoded::Jump { off } => {
-            let at_word = e.len();
-            e.w(b(0));
-            relocs.push(Reloc {
-                at: at_word,
-                target: (at as i64 + 1 + i64::from(off)) as u32,
-                kind: RelKind::B26,
-            });
-        }
+        // `may_goto` is an unconditional branch here: the runtime always takes
+        // the back-edge (metered by fuel), so it lowers like `Jump`. Its `off` is
+        // `i16` where `Jump`'s is `i32`, so it needs its own arm.
+        Decoded::Jump { off } => emit_uncond_branch(e, at, i64::from(off), relocs),
+        Decoded::MayGoto { off } => emit_uncond_branch(e, at, i64::from(off), relocs),
 
         Decoded::JumpCond {
             wide,
@@ -1091,9 +1592,17 @@ fn emit_insn(
             );
         }
 
+        Decoded::Exit if !in_main => {
+            // A subprogram `exit` returns to its caller — the `RET` matching the
+            // `BL` `emit_subprog_call` emitted. R0 (x0) is already the result,
+            // and x30 holds the return address (preserved across any kfunc call
+            // by `emit_kfunc_call`).
+            e.w(RET);
+        }
+
         Decoded::Exit => {
-            // Branch to the shared epilogue rather than duplicating the
-            // restore sequence at every `exit`.
+            // main's `exit`. Branch to the shared epilogue rather than
+            // duplicating the restore sequence at every `exit`.
             let at_word = e.len();
             e.w(b(0));
             relocs.push(Reloc {
@@ -1103,9 +1612,6 @@ fn emit_insn(
             });
         }
 
-        // Including `CallTarget::Subprog`: a BPF-to-BPF call needs the frame
-        // push the interpreter does in `push_frame`, which is a different
-        // feature from entering a C function.
         _ => {
             return Err(JitError::Unsupported {
                 at,

@@ -26,12 +26,12 @@
 //! *real* interpreter happens in-kernel, in `bpf/src/tests.rs`, which stops
 //! skipping now that `has_backend()` is true on aarch64.
 
-use narf_bpf_isa::{AluOp, CondOp, Decoded, Size, Source};
+use narf_bpf_isa::{AluOp, AtomicOp, ByteOrder, CondOp, Decoded, Imm64, Size, Source};
 
 use narf_bpf_verifier::Context;
 
 use crate::aarch64;
-use crate::tests::{kcall, mov, r, verified, verified_calling, EXIT};
+use crate::tests::{kcall, mov, r, verified, verified_calling, verified_subprogs, EXIT};
 use crate::JitError;
 
 /// The emitted image as instruction words. Every aarch64 instruction is four
@@ -452,6 +452,374 @@ fn a64_golden_store_immediate() {
 }
 
 #[test]
+fn a64_golden_narrower_store_and_sign_extending_load() {
+    // *(u32*)(r10-8) = r0 ; r1 = *(s8*)(r10-8)
+    //
+    // The width rides the `[31:30]` size field of the same unscaled encoding —
+    // `size=10` for the word store — and a sign-extending load switches the
+    // `[23:22]` opc to `10`, which extends to the full 64-bit register to match
+    // the interpreter's `widen`.
+    a64_body(
+        &[
+            Decoded::Store {
+                size: Size::W,
+                dst: r(10),
+                off: -8,
+                src: Source::Reg(r(0)),
+            },
+            Decoded::Load {
+                size: Size::B,
+                sign_extend: true,
+                dst: r(1),
+                src: r(10),
+                off: -8,
+            },
+            EXIT,
+        ],
+        &[
+            0xb81f_8320, // stur  w0, [x25, #-8]   (size=10)
+            0x389f_8321, // ldursb x1, [x25, #-8]  (size=00, opc=10)
+            0x1400_0001,
+        ],
+    );
+}
+
+#[test]
+fn a64_golden_movsx_and_byteswap() {
+    // MOVSX R3 = (s8)R2 into a 64-bit register: `SXTB x3, w2` (SBFM with N=1,
+    // immr=0, imms=7).
+    a64_body(
+        &[
+            Decoded::Mov {
+                wide: true,
+                dst: r(3),
+                src: Source::Reg(r(2)),
+                sign_extend: Some(8),
+            },
+            EXIT,
+        ],
+        &[
+            0x9340_1c43, // sxtb x3, w2  (sf=1, N=1)
+            0x1400_0001,
+        ],
+    );
+
+    // A 32-bit byte swap is a single `REV Wd,Wn`, which zero-extends the top
+    // half — matching `(v as u32).swap_bytes() as u64`.
+    a64_body(
+        &[
+            Decoded::End {
+                dst: r(0),
+                order: ByteOrder::Big,
+                width: 32,
+            },
+            EXIT,
+        ],
+        &[
+            0x5ac0_0800, // rev w0, w0
+            0x1400_0001,
+        ],
+    );
+
+    // A 16-bit swap is `REV16` then `UXTH` (UBFM #0,#15) to clear the top bits.
+    a64_body(
+        &[
+            Decoded::End {
+                dst: r(0),
+                order: ByteOrder::Big,
+                width: 16,
+            },
+            EXIT,
+        ],
+        &[
+            0x5ac0_0400, // rev16 w0, w0
+            0x5300_3c00, // uxth w0, w0
+            0x1400_0001,
+        ],
+    );
+}
+
+#[test]
+fn a64_golden_div_and_mod() {
+    // aarch64 division needs no guards — divide-by-zero yields zero and
+    // `INT_MIN / -1` the wrapping `INT_MIN`, both trap-free — so `div` is a lone
+    // `SDIV`/`UDIV` and `mod` is a divide into the ADDR scratch followed by an
+    // `MSUB`. The quotient lands in ADDR (x17), not IMM (x16), so an immediate
+    // divisor materialised into IMM survives to the MSUB.
+    a64_body(
+        &[
+            Decoded::Div {
+                wide: true,
+                signed: false,
+                dst: r(0),
+                src: Source::Reg(r(1)),
+            },
+            Decoded::Div {
+                wide: true,
+                signed: true,
+                dst: r(6),
+                src: Source::Reg(r(7)),
+            },
+            Decoded::Mod {
+                wide: true,
+                signed: false,
+                dst: r(0),
+                src: Source::Reg(r(1)),
+            },
+            Decoded::Mod {
+                wide: false,
+                signed: true,
+                dst: r(2),
+                src: Source::Reg(r(3)),
+            },
+            EXIT,
+        ],
+        &[
+            0x9ac1_0800, // udiv x0, x0, x1
+            0x9ad4_0e73, // sdiv x19, x19, x20   (R6, R7)
+            0x9ac1_0811, // udiv x17, x0, x1
+            0x9b01_8220, // msub x0, x17, x1, x0
+            0x1ac3_0c51, // sdiv w17, w2, w3
+            0x1b03_8a22, // msub w2, w17, w3, w2
+            0x1400_0001,
+        ],
+    );
+}
+
+#[test]
+fn a64_golden_ld_imm64() {
+    // Two back-to-back wide constants — R1 = 42, R0 = 0 — then exit. LD_IMM64
+    // routes through the same `MOVZ`/`MOVK` materialisation `a64_golden_mov_imm`
+    // derives; this pins that it does, and that the two two-slot instructions lay
+    // out contiguously.
+    a64_body(
+        &[
+            Decoded::LoadImm64 {
+                dst: r(1),
+                value: Imm64::Value(42),
+            },
+            Decoded::LoadImm64 {
+                dst: r(0),
+                value: Imm64::Value(0),
+            },
+            EXIT,
+        ],
+        &[
+            0xd280_0541, // mov  x1, #42
+            0xf2a0_0001, // movk x1, #0, lsl #16
+            0xf2c0_0001, // movk x1, #0, lsl #32
+            0xf2e0_0001, // movk x1, #0, lsl #48
+            0xd280_0000, // mov  x0, #0
+            0xf2a0_0000, // movk x0, #0, lsl #16
+            0xf2c0_0000, // movk x0, #0, lsl #32
+            0xf2e0_0000, // movk x0, #0, lsl #48
+            0x1400_0001, // b -> epilogue
+        ],
+    );
+}
+
+#[test]
+fn a64_a_resolved_map_pseudo_ld_imm64_materialises_the_address() {
+    // Given the loader-resolved address (here 42, into R6 = x19), a map
+    // pseudo-form is the same `MOVZ`/`MOVK` sequence as a plain constant.
+    let prog = verified(&[
+        Decoded::LoadImm64 {
+            dst: r(6),
+            value: Imm64::MapFd(3),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = aarch64::compile_resolved(&prog, &[(0, 42)]).expect("compiles");
+    let w = a64_words(&c.code);
+    let seq = [
+        0xd280_0553, // mov  x19, #42
+        0xf2a0_0013, // movk x19, #0, lsl #16
+        0xf2c0_0013, // movk x19, #0, lsl #32
+        0xf2e0_0013, // movk x19, #0, lsl #48
+    ];
+    assert!(
+        w.windows(seq.len()).any(|x| x == seq),
+        "a resolved map LD_IMM64 must materialise the address, got {w:08x?}"
+    );
+}
+
+#[test]
+fn a64_golden_atomics() {
+    // Every lowered atomic form, dst = R10 (FP = x25), src = R6 (x19), off = 0
+    // so the address is FP directly (the offset fold is exercised elsewhere),
+    // doubleword unless noted. Pins the LSE opcode field, the AL ordering, the
+    // fetch result routed through x16, the AND-via-`MVN`+`LDCLR`, `CASAL` with
+    // x0 as the comparand, and `LDAR`/`STLR`.
+    a64_body(
+        &[
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Add { fetch: false },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Add { fetch: true },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Xchg,
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Cmpxchg,
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Or { fetch: false },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::And { fetch: false },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Xor { fetch: false },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::LoadAcquire,
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::StoreRelease,
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::W,
+                op: AtomicOp::Add { fetch: false },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            EXIT,
+        ],
+        &[
+            0xf8f3_033f, // ldaddal x19, xzr, [x25]
+            0xf8f3_0330, // ldaddal x19, x16, [x25]
+            0xaa10_03f3, // mov     x19, x16
+            0xf8f3_8330, // swpal   x19, x16, [x25]
+            0xaa10_03f3, // mov     x19, x16
+            0xc8e0_ff33, // casal   x0, x19, [x25]
+            0xf8f3_333f, // ldsetal x19, xzr, [x25]
+            0xaa33_03f0, // mvn     x16, x19
+            0xf8f0_133f, // ldclral x16, xzr, [x25]
+            0xf8f3_233f, // ldeoral x19, xzr, [x25]
+            0xc8df_ff33, // ldar    x19, [x25]
+            0xc89f_ff33, // stlr    x19, [x25]
+            0xb8f3_033f, // ldaddal w19, wzr, [x25]  (word)
+            0x1400_0001,
+        ],
+    );
+}
+
+#[test]
+fn a64_may_goto_is_an_unconditional_branch() {
+    // `may_goto` lowers to a plain `B` (the runtime always takes it, bounded by
+    // fuel), not a refusal. Proven differentially: removing it emits exactly one
+    // fewer `B` — the `exit`'s branch to the epilogue.
+    let add = Decoded::Alu {
+        wide: true,
+        op: AluOp::Add,
+        dst: r(0),
+        src: Source::Imm(1),
+    };
+    let with = aarch64::compile(&verified(&[
+        mov(0, 0),
+        add,
+        Decoded::MayGoto { off: -2 },
+        EXIT,
+    ]))
+    .expect("may_goto must compile");
+    let without = aarch64::compile(&verified(&[mov(0, 0), add, EXIT])).expect("compiles");
+    let branches = |c: &crate::Compiled| {
+        a64_words(&c.code)
+            .iter()
+            .filter(|&&w| w & 0xFC00_0000 == 0x1400_0000)
+            .count()
+    };
+    assert_eq!(
+        branches(&with),
+        branches(&without) + 1,
+        "may_goto must add exactly one unconditional branch"
+    );
+}
+
+#[test]
+fn a64_golden_fetching_bitwise_atomics() {
+    // The LSE fetch forms, dst = R10 (FP = x25), src = R6 (x19), off = 0. OR and
+    // XOR route the old value through x16; AND is `MVN` of the operand into x16
+    // then `LDCLRAL` with the old value in x9 (x16 is taken by the operand).
+    a64_body(
+        &[
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Or { fetch: true },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Xor { fetch: true },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::And { fetch: true },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            EXIT,
+        ],
+        &[
+            0xf8f3_3330, // ldsetal x19, x16, [x25]
+            0xaa10_03f3, // mov     x19, x16
+            0xf8f3_2330, // ldeoral x19, x16, [x25]
+            0xaa10_03f3, // mov     x19, x16
+            0xaa33_03f0, // mvn     x16, x19
+            0xf8f0_1329, // ldclral x16, x9, [x25]
+            0xaa09_03f3, // mov     x19, x9
+            0x1400_0001,
+        ],
+    );
+}
+
+#[test]
 fn a64_golden_far_displacement_folds_into_the_address_register() {
     // `LDUR`'s `simm9` reaches ±256. Beyond that the displacement is folded
     // into `x17` and the access uses a zero displacement — reusing the one
@@ -756,76 +1124,26 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
     // moment it gains an encoding, which is how the x86-64 suite's
     // "unsupported" test came to be pointed at multiply after multiply started
     // being emitted.
-    let cases: [(&str, Decoded); 8] = [
+    let cases: [(&str, Decoded); 2] = [
         (
-            "atomic",
-            Decoded::Atomic {
-                size: Size::Dw,
-                op: narf_bpf_isa::AtomicOp::Add { fetch: false },
-                dst: r(10),
-                src: r(0),
-                off: -8,
-            },
-        ),
-        (
-            "div",
-            Decoded::Div {
-                wide: true,
-                signed: false,
-                dst: r(0),
-                src: Source::Reg(r(1)),
-            },
-        ),
-        (
-            "mod",
-            Decoded::Mod {
-                wide: true,
-                signed: false,
-                dst: r(0),
-                src: Source::Reg(r(1)),
-            },
-        ),
-        (
-            "movsx",
-            Decoded::Mov {
-                wide: true,
-                dst: r(0),
-                src: Source::Reg(r(1)),
-                sign_extend: Some(8),
-            },
-        ),
-        (
-            "byteswap",
-            Decoded::End {
-                dst: r(0),
-                order: narf_bpf_isa::ByteOrder::Big,
-                width: 32,
-            },
-        ),
-        (
-            "ld_imm64",
+            // A subprogram-address LD_IMM64 resolves to a code address the emit
+            // pass does not have, so it stays interpreted (the plain-value form
+            // is emitted).
+            "subprog-addr-ld_imm64",
             Decoded::LoadImm64 {
                 dst: r(0),
-                value: narf_bpf_isa::Imm64::Value(1),
+                value: Imm64::SubprogAddr(1),
             },
         ),
         (
-            "byte load",
-            Decoded::Load {
-                size: Size::B,
-                sign_extend: false,
+            // A map pseudo-form with no resolved address (the empty-table path,
+            // which `compile` uses) has nothing to materialise and is refused;
+            // given the loader's address it is emitted — see
+            // `a64_a_resolved_map_pseudo_ld_imm64_materialises_the_address`.
+            "unresolved-map-pseudo-ld_imm64",
+            Decoded::LoadImm64 {
                 dst: r(0),
-                src: r(10),
-                off: -8,
-            },
-        ),
-        (
-            "word store",
-            Decoded::Store {
-                size: Size::W,
-                dst: r(10),
-                off: -8,
-                src: Source::Reg(r(0)),
+                value: Imm64::MapFd(3),
             },
         ),
     ];
@@ -1037,16 +1355,18 @@ fn a64_a_non_arena_access_keeps_the_plain_shape() {
 }
 
 #[test]
-fn a64_an_arena_access_the_emitter_cannot_shape_is_refused() {
+fn a64_an_arena_atomic_the_emitter_cannot_shape_is_refused() {
     // Fail-closed, and specifically not by falling through to the plain
-    // lowering — which would be a bare dereference of a handle.
+    // lowering — which would be a bare dereference of a handle. Narrower loads
+    // and stores are emitted now; an atomic still has no arena shape.
     let prog = crate::tests::verified_arena(
         &[
-            Decoded::Store {
-                size: Size::W,
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: narf_bpf_isa::AtomicOp::Add { fetch: false },
                 dst: r(1),
+                src: r(0),
                 off: 8,
-                src: Source::Imm(1),
             },
             mov(0, 0),
             EXIT,
@@ -1203,6 +1523,88 @@ fn bpf_reference(items: &[Decoded], mut fuel: u64, mem: &mut Mem) -> Run {
                         } else {
                             u64::from((a as u32 as i32).wrapping_shr(s) as u32)
                         }
+                    }
+                };
+                reg[dst.as_usize()] = mask(v, wide);
+                pc += 1;
+            }
+            Decoded::Div {
+                wide,
+                signed,
+                dst,
+                src,
+            } => {
+                // Divide-by-zero yields zero; signed division wraps on
+                // `INT_MIN / -1`. Exactly the interpreter's `div`.
+                let a = reg[dst.as_usize()];
+                let b = src_val(src, &reg);
+                let v = if wide {
+                    if signed {
+                        let (x, y) = (a as i64, b as i64);
+                        if y == 0 {
+                            0
+                        } else {
+                            x.wrapping_div(y) as u64
+                        }
+                    } else if b == 0 {
+                        0
+                    } else {
+                        a / b
+                    }
+                } else if signed {
+                    let (x, y) = (a as u32 as i32, b as u32 as i32);
+                    if y == 0 {
+                        0
+                    } else {
+                        x.wrapping_div(y) as u32 as u64
+                    }
+                } else {
+                    let (x, y) = (a as u32, b as u32);
+                    if y == 0 {
+                        0
+                    } else {
+                        u64::from(x / y)
+                    }
+                };
+                reg[dst.as_usize()] = mask(v, wide);
+                pc += 1;
+            }
+            Decoded::Mod {
+                wide,
+                signed,
+                dst,
+                src,
+            } => {
+                // Divide-by-zero leaves the dividend as the remainder; signed
+                // `INT_MIN % -1` is zero. Exactly the interpreter's `rem`.
+                let a = reg[dst.as_usize()];
+                let b = src_val(src, &reg);
+                let v = if wide {
+                    if signed {
+                        let (x, y) = (a as i64, b as i64);
+                        if y == 0 {
+                            a
+                        } else {
+                            x.wrapping_rem(y) as u64
+                        }
+                    } else if b == 0 {
+                        a
+                    } else {
+                        a % b
+                    }
+                } else if signed {
+                    let (x, y) = (a as u32 as i32, b as u32 as i32);
+                    if y == 0 {
+                        a & 0xffff_ffff
+                    } else {
+                        x.wrapping_rem(y) as u32 as u64
+                    }
+                } else {
+                    let (x, y) = (a as u32, b as u32);
+                    if y == 0 {
+                        u64::from(x)
+                    } else {
+                        u64::from(x % y)
                     }
                 };
                 reg[dst.as_usize()] = mask(v, wide);
@@ -1476,6 +1878,48 @@ fn a64_execute(code: &[u8], fuel: u64, mem: Mem) -> Result<(Cpu, u64, u64), Run>
                 .read(rn, wide)
                 .wrapping_mul(cpu.read(rm, wide))
                 .wrapping_add(cpu.read(ra, wide));
+            cpu.write(rd, wide, v);
+        } else if w & 0x7fe0_8000 == 0x1b00_8000 {
+            // MSUB Rd, Rn, Rm, Ra — Rd = Ra - Rn*Rm, the remainder step of `mod`.
+            let ra = (w >> 10) & 31;
+            let v = cpu
+                .read(ra, wide)
+                .wrapping_sub(cpu.read(rn, wide).wrapping_mul(cpu.read(rm, wide)));
+            cpu.write(rd, wide, v);
+        } else if matches!(w & 0x7fe0_fc00, 0x1ac0_0800 | 0x1ac0_0c00) {
+            // UDIV / SDIV. The architecture defines divide-by-zero as zero and
+            // `INT_MIN / -1` as the wrapping `INT_MIN`, so neither traps.
+            let signed = w & 0x0000_0400 != 0;
+            let a = cpu.read(rn, wide);
+            let b = cpu.read(rm, wide);
+            let v = if wide {
+                if signed {
+                    let (x, y) = (a as i64, b as i64);
+                    if y == 0 {
+                        0
+                    } else {
+                        x.wrapping_div(y) as u64
+                    }
+                } else if b == 0 {
+                    0
+                } else {
+                    a / b
+                }
+            } else if signed {
+                let (x, y) = (a as u32 as i32, b as u32 as i32);
+                if y == 0 {
+                    0
+                } else {
+                    x.wrapping_div(y) as u32 as u64
+                }
+            } else {
+                let (x, y) = (a as u32, b as u32);
+                if y == 0 {
+                    0
+                } else {
+                    u64::from(x / y)
+                }
+            };
             cpu.write(rd, wide, v);
         } else if w & 0x7fe0_f000 == 0x1ac0_2000 {
             // LSLV / LSRV / ASRV
@@ -1770,6 +2214,45 @@ fn a64_diff_alu_sweep() {
                         ],
                         64,
                     );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a64_diff_divmod_sweep() {
+    // div and mod × signed/unsigned × both widths × immediate and register
+    // divisor × boundary operands. The zero divisor and the signed `INT_MIN / -1`
+    // overflow live in the sweep pools, so the trap-free lowering is checked
+    // against the reference at exactly the values that would fault a naive
+    // `idiv` — and, for `mod`, that the `MSUB` recovers the dividend on a zero
+    // divisor rather than the quotient's leftovers.
+    for signed in [false, true] {
+        for is_mod in [false, true] {
+            for wide in [false, true] {
+                let make = |src| {
+                    if is_mod {
+                        Decoded::Mod {
+                            wide,
+                            signed,
+                            dst: r(0),
+                            src,
+                        }
+                    } else {
+                        Decoded::Div {
+                            wide,
+                            signed,
+                            dst: r(0),
+                            src,
+                        }
+                    }
+                };
+                for &a in &SWEEP_VALS {
+                    for &b in &SWEEP_IMMS {
+                        a64_diff(&[mov(0, a), make(Source::Imm(b)), EXIT], 64);
+                        a64_diff(&[mov(0, a), mov(2, b), make(Source::Reg(r(2))), EXIT], 64);
+                    }
                 }
             }
         }
@@ -2180,7 +2663,9 @@ fn a64_golden_kfunc_call_sequence() {
             0xf2a2_4690, // movk x16, #0x1234, lsl #16
             0xf2d7_ddf0, // movk x16, #0xbeef, lsl #32
             0xf2fb_d5b0, // movk x16, #0xdead, lsl #48
+            0xf81f_0ffe, // str  x30, [sp, #-16]!  (preserve the return address)
             0xd63f_0200, // blr  x16
+            0xf841_07fe, // ldr  x30, [sp], #16
             0x1400_0001, // b -> epilogue
         ],
     );
@@ -2297,14 +2782,48 @@ fn a64_a_sleepable_kfuncs_shim_is_never_entered_from_native_code() {
 }
 
 #[test]
-fn a64_a_subprogram_call_is_still_unsupported() {
-    let prog = verified(&[
-        Decoded::Call(narf_bpf_isa::CallTarget::Subprog(1)),
-        mov(0, 0),
-        EXIT,
-    ]);
-    assert!(matches!(
-        aarch64::compile(&prog),
-        Err(JitError::Unsupported { at: 0, .. })
-    ));
+fn a64_a_subprogram_call_saves_the_frame_and_returns() {
+    // main (stack 16) calls a subprogram (stack 0) returning 7. The call saves
+    // R6..R9, R10 and the link register in three STP pairs, descends the frame
+    // pointer by the caller's 16 bytes, and `BL`s; the callee's `exit` is a
+    // `RET`. The save/restore words are pinned exactly (contiguous in the
+    // emission); the `BL` displacement and layout are not.
+    let prog = verified_subprogs(
+        &[
+            Decoded::Call(narf_bpf_isa::CallTarget::Subprog(1)),
+            EXIT,
+            mov(0, 7),
+            EXIT,
+        ],
+        &[(0, 16), (2, 0)],
+    );
+    let c = aarch64::compile(&prog).expect("a subprogram call must compile");
+    let w = a64_words(&c.code);
+    let save = [
+        0xa9bd_53f3, // stp x19, x20, [sp, #-48]!
+        0xa901_5bf5, // stp x21, x22, [sp, #16]
+        0xa902_7bf9, // stp x25, x30, [sp, #32]
+        0xd100_4339, // sub x25, x25, #16
+    ];
+    assert!(
+        w.windows(save.len()).any(|x| x == save),
+        "the call must save R6..R10/LR and descend the frame pointer, got {w:08x?}"
+    );
+    let restore = [
+        0xa942_7bf9, // ldp x25, x30, [sp, #32]
+        0xa941_5bf5, // ldp x21, x22, [sp, #16]
+        0xa8c3_53f3, // ldp x19, x20, [sp], #48
+    ];
+    assert!(
+        w.windows(restore.len()).any(|x| x == restore),
+        "the call must restore R6..R10/LR afterwards"
+    );
+    assert!(
+        w.iter().any(|&x| x & 0xFC00_0000 == 0x9400_0000),
+        "a BL must be emitted"
+    );
+    assert!(
+        w.contains(&0xD65F_03C0),
+        "the subprogram `exit` must be a RET"
+    );
 }
