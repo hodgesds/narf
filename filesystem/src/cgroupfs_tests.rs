@@ -2518,10 +2518,17 @@ fn smoke_cgroup_events_emits_inotify_modify() -> TestResult {
         if !path.ends_with("/cgroup.events") {
             return;
         }
-        if path == "/sys/fs/cgroup/t_evt/cgroup.events" {
+        if path == "/sys/fs/cgroup/t_evt_p/t_evt/cgroup.events" {
             SAW_CHILD.fetch_add(1, Ordering::AcqRel);
         }
-        if path == "/sys/fs/cgroup/cgroup.events" {
+        // The ancestor watched is an intermediate cgroup this test CREATES,
+        // not the global root. `populated` means "this cgroup or any
+        // descendant has a live process", so the root's value legitimately
+        // does not transition when some OTHER test has left a pid attached
+        // anywhere in the tree — and not emitting IN_MODIFY is then correct
+        // Linux behaviour, not a bug. Watching the root made this test pass
+        // alone and fail in the full suite purely on test ordering.
+        if path == "/sys/fs/cgroup/t_evt_p/cgroup.events" {
             SAW_ROOT.fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -2532,16 +2539,22 @@ fn smoke_cgroup_events_emits_inotify_modify() -> TestResult {
     crate::set_modify_notifier(record);
 
     let root = root_dir();
-    let _ = poll_once(root.rmdir("t_evt"));
-    let child = match poll_once(root.mkdir("t_evt")) {
+    let _ = poll_once(root.rmdir("t_evt_p/t_evt"));
+    let _ = poll_once(root.rmdir("t_evt_p"));
+    let parent = match poll_once(root.mkdir("t_evt_p")) {
         Some(Ok(d)) => d,
-        _ => return TestResult::Fail("mkdir t_evt failed"),
+        _ => return TestResult::Fail("mkdir t_evt_p failed"),
+    };
+    let child = match poll_once(parent.mkdir("t_evt")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir t_evt_p/t_evt failed"),
     };
 
     // Empty → populated.
     const PID: u64 = 909_101;
     if attach_pid(&child, PID).is_err() {
-        let _ = poll_once(root.rmdir("t_evt"));
+        let _ = poll_once(parent.rmdir("t_evt"));
+        let _ = poll_once(root.rmdir("t_evt_p"));
         return TestResult::Fail("attaching pid to t_evt failed");
     }
     let after_attach = SAW_CHILD.load(Ordering::Acquire);
@@ -2553,7 +2566,8 @@ fn smoke_cgroup_events_emits_inotify_modify() -> TestResult {
     let after_exit = SAW_CHILD.load(Ordering::Acquire);
     let root_after_exit = SAW_ROOT.load(Ordering::Acquire);
 
-    let _ = poll_once(root.rmdir("t_evt"));
+    let _ = poll_once(parent.rmdir("t_evt"));
+    let _ = poll_once(root.rmdir("t_evt_p"));
 
     if after_attach == 0 {
         return TestResult::Fail(
