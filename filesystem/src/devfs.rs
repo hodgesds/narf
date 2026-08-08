@@ -2610,3 +2610,78 @@ fn smoke_kmsg_read_at_matches_snapshot() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs", smoke_kmsg_read_at_matches_snapshot);
+
+/// udev's device-symlink sequence must work: mkdir a subdirectory under /dev,
+/// then create a symlink INSIDE it.
+///
+/// This is what every `/dev/char/<major>:<minor>`, `/dev/disk/by-id/*` and
+/// `/dev/input/by-path/*` entry needs. Measured failure on the Fedora KDE boot
+/// (task #12):
+///
+/// ```text
+/// Failed to create symlink '/dev/char/226:0' to '/dev/dri/card0': No such file
+///     or directory
+/// card0: Failed to create device symlink '/dev/char/226:0': No such file or
+///     directory
+/// ```
+///
+/// The two steps exercise DIFFERENT DirOps impls — `DevDir::mkdir` for the
+/// directory, then `DynamicDirectory::symlink` for the entry inside it — which
+/// is exactly the seam where "the root supports it" stops implying "the child
+/// does". Asserting only the mkdir, or only a symlink at the /dev root, would
+/// miss the case udev actually performs.
+fn smoke_dev_mkdir_then_symlink_inside_like_udev() -> TestResult {
+    let dir = DevDir;
+    // Unique name so repeated runs in one kernel image don't collide.
+    let sub = "narf-test-char";
+    let _ = poll_once_devfs(dir.rmdir(sub));
+
+    let made = match poll_once_devfs(dir.mkdir(sub)) {
+        Some(Ok(d)) => d,
+        Some(Err(_)) => {
+            return TestResult::Fail("mkdir under /dev failed — udev cannot make /dev/char")
+        }
+        None => return TestResult::Fail("mkdir under /dev returned Pending"),
+    };
+
+    // The entry udev writes: a symlink named "<major>:<minor>" inside it.
+    let link = match poll_once_devfs(made.symlink("226:0", "/dev/dri/card0")) {
+        Some(Ok(l)) => l,
+        Some(Err(_)) => {
+            let _ = poll_once_devfs(dir.rmdir(sub));
+            return TestResult::Fail(
+                "symlink INSIDE a /dev subdirectory failed — this is the /dev/char/226:0 failure",
+            );
+        }
+        None => {
+            let _ = poll_once_devfs(dir.rmdir(sub));
+            return TestResult::Fail("symlink inside a /dev subdirectory returned Pending");
+        }
+    };
+    if link.stat().mode.file_type != FileType::Symlink {
+        let _ = poll_once_devfs(dir.rmdir(sub));
+        return TestResult::Fail("created entry is not a symlink");
+    }
+
+    // The subdirectory must be findable again through the DIRECTORY lookup —
+    // that is the call a path resolver makes for a non-final segment of
+    // /dev/char/226:0. `lookup_async` is the FileOps lookup and legitimately
+    // NotFounds a directory, so asserting through it tests nothing about
+    // resolvability (see the lookup_dir_async fallback that /dev/pts needed).
+    let found_dir = dir.lookup_dir(sub).is_some();
+    // ...and the symlink must be findable INSIDE it, which is the final
+    // segment of that same path.
+    let found_link = made.lookup("226:0").is_some();
+    let _ = poll_once_devfs(dir.rmdir(sub));
+    if !found_dir {
+        return TestResult::Fail("the created /dev subdirectory is not resolvable via lookup_dir");
+    }
+    if !found_link {
+        return TestResult::Fail("the symlink inside the /dev subdirectory is not resolvable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs",
+    smoke_dev_mkdir_then_symlink_inside_like_udev
+);
