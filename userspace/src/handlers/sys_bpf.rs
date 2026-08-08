@@ -70,10 +70,16 @@ const BPF_MAP_GET_FD_BY_ID: u32 = 14;
 const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
 const BPF_BTF_GET_FD_BY_ID: u32 = 19;
 const BPF_BTF_GET_NEXT_ID: u32 = 23;
-const BPF_LINK_GET_FD_BY_ID: u32 = 32;
-const BPF_LINK_GET_NEXT_ID: u32 = 33;
+const BPF_PROG_QUERY: u32 = 16;
+const BPF_TASK_FD_QUERY: u32 = 20;
+const BPF_ITER_CREATE: u32 = 33;
 const BPF_LINK_CREATE: u32 = 28;
 const BPF_LINK_UPDATE: u32 = 29;
+// Linux numbers these 30/31 (an earlier draft had 32/33, which are actually
+// `BPF_ENABLE_STATS` and `BPF_ITER_CREATE`). Corrected so a libbpf loader's
+// `BPF_LINK_GET_*_BY_ID` reaches this handler and its iterator commands do not.
+const BPF_LINK_GET_FD_BY_ID: u32 = 30;
+const BPF_LINK_GET_NEXT_ID: u32 = 31;
 const BPF_LINK_DETACH: u32 = 34;
 const BPF_MAP_LOOKUP_BATCH: u32 = 24;
 const BPF_MAP_LOOKUP_AND_DELETE_BATCH: u32 = 25;
@@ -217,14 +223,15 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         BPF_LINK_CREATE => bpf_link_create(attr_uptr, size),
         BPF_LINK_UPDATE => bpf_link_update(attr_uptr, size),
         BPF_LINK_DETACH => bpf_link_detach(attr_uptr, size),
+        BPF_PROG_QUERY => bpf_prog_query(attr_uptr, size),
+        BPF_TASK_FD_QUERY => task_fd_query(attr_uptr, size),
+        BPF_ITER_CREATE => bpf_iter_create(attr_uptr, size),
 
-        // LINUX-GAP: everything else — `BPF_PROG_QUERY`, `BPF_TASK_FD_QUERY`,
-        // the BPF token commands (`BPF_TOKEN_CREATE` — NARF has no token, and
-        // the privilege gate above is a credential check rather than a
-        // delegable one), and the iterator commands (`BPF_ITER_CREATE`, which
-        // needs a seq_file-shaped read surface no NARF fd provides). `ENOTSUP`
-        // rather than `EINVAL` so a probing loader can tell "this kernel does
-        // not do that" from "you passed nonsense".
+        // LINUX-GAP: everything else — the BPF token commands (`BPF_TOKEN_CREATE`
+        // — NARF has no token, and the privilege gate above is a credential check
+        // rather than a delegable one), `BPF_ENABLE_STATS`, `BPF_PROG_BIND_MAP`,
+        // and `BPF_MAP_FREEZE`. `ENOTSUP` rather than `EINVAL` so a probing loader
+        // can tell "this kernel does not do that" from "you passed nonsense".
         //
         // The batch element commands are NOT in that list any more:
         // `BPF_MAP_{LOOKUP,LOOKUP_AND_DELETE,UPDATE,DELETE}_BATCH` are
@@ -252,6 +259,74 @@ fn read_attr(attr_uptr: u64, size: usize) -> Result<[u8; ATTR_BUF], i64> {
     // converts a fault into `Err(EFAULT)` rather than a kernel panic.
     unsafe { copy_from_user(&mut buf[..size], attr_uptr) }.map_err(|e| -(e as i64))?;
     Ok(buf)
+}
+
+// `struct { … } task_fd_query` field offsets.
+const TFQ_PID: usize = 0;
+const TFQ_FD: usize = 4;
+const TFQ_FLAGS: usize = 8;
+const TFQ_BUF_LEN: usize = 12;
+const TFQ_BUF: usize = 16;
+const TFQ_PROG_ID: usize = 24;
+const TFQ_FD_TYPE: usize = 28;
+const TFQ_PROBE_OFFSET: usize = 32;
+const TFQ_PROBE_ADDR: usize = 40;
+
+/// `BPF_TASK_FD_QUERY` — given a task's fd that carries a BPF program, report
+/// which program and what kind of fd it is.
+///
+/// NARF answers for the *calling* task's fds: `pid` must be zero or the caller's
+/// own pid. The one fd kind that carries a program is a perf event with one
+/// attached through `PERF_EVENT_IOC_SET_BPF`, which is tracepoint-shaped; the
+/// name buffer comes back empty, because NARF names its probes by id rather than
+/// by string. // LINUX-GAP: no cross-task query and no tracepoint-name string.
+fn task_fd_query(attr_uptr: u64, size: usize) -> i64 {
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < TFQ_PROBE_ADDR + 8 {
+        return -EINVAL;
+    }
+    if u32_at(&attr, TFQ_FLAGS) != 0 {
+        return -EINVAL;
+    }
+    let pid = u32_at(&attr, TFQ_PID);
+    let me = task_to_pid_raw(current_task_id()).unwrap_or(0) as u32;
+    if pid != 0 && pid != me {
+        return -ENOTSUP;
+    }
+    let (prog_id, fd_type) = match crate::perf_event::bpf_task_fd_query(u32_at(&attr, TFQ_FD)) {
+        Some(x) => x,
+        // An fd with no BPF program attached — Linux's `ENOTSUPP`.
+        None => return -ENOTSUP,
+    };
+
+    // Write the out-fields back into the caller's `attr`. Each is one field,
+    // range-checked inside `copy_to_user`, which brackets SMAP and turns a fault
+    // into `Err(EFAULT)`.
+    let put = |off: usize, bytes: &[u8]| -> Result<(), i64> {
+        // SAFETY: `copy_to_user` validates `[attr_uptr + off, +bytes.len())`.
+        unsafe { copy_to_user(attr_uptr + off as u64, bytes) }.map_err(|e| -(e as i64))
+    };
+    if let Err(e) = put(TFQ_PROG_ID, &prog_id.to_le_bytes())
+        .and_then(|()| put(TFQ_FD_TYPE, &fd_type.to_le_bytes()))
+        .and_then(|()| put(TFQ_PROBE_OFFSET, &0u64.to_le_bytes()))
+        .and_then(|()| put(TFQ_PROBE_ADDR, &0u64.to_le_bytes()))
+        // Empty name: report length 0.
+        .and_then(|()| put(TFQ_BUF_LEN, &0u32.to_le_bytes()))
+    {
+        return e;
+    }
+    // If the caller offered a name buffer, terminate it.
+    let buf_uptr = u64_at(&attr, TFQ_BUF);
+    if buf_uptr != 0 && u32_at(&attr, TFQ_BUF_LEN) > 0 {
+        // SAFETY: caller-supplied pointer, range-checked inside `copy_to_user`.
+        if let Err(e) = unsafe { copy_to_user(buf_uptr, &[0u8]) } {
+            return -(e as i64);
+        }
+    }
+    0
 }
 
 fn prog_load(attr_uptr: u64, size: usize) -> i64 {

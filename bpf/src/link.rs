@@ -146,16 +146,18 @@ static NEXT_LINK_ID: AtomicU32 = AtomicU32::new(1);
 ///
 /// So a detach *marks* its entry instead of removing it. The entry keeps
 /// refusing [`claim`] for the whole teardown and is removed only afterwards.
-static OWNERS: IrqSafeSpinLock<Vec<(LinkTarget, Owner, bool)>> = IrqSafeSpinLock::new(Vec::new());
+static OWNERS: IrqSafeSpinLock<Vec<(LinkTarget, Owner, bool, u32)>> =
+    IrqSafeSpinLock::new(Vec::new());
 
-/// Take the claim on `target` for `owner`. `false` if it is already claimed —
+/// Take the claim on `target` for `owner`, recording the id of the program it
+/// attaches so `BPF_PROG_QUERY` can name it. `false` if it is already claimed —
 /// including by an entry whose detach is still in flight.
-fn claim(target: &LinkTarget, owner: Owner) -> bool {
+fn claim(target: &LinkTarget, owner: Owner, prog_id: u32) -> bool {
     let mut g = OWNERS.lock();
-    if g.iter().any(|(t, _, _)| t == target) {
+    if g.iter().any(|(t, _, _, _)| t == target) {
         return false;
     }
-    g.push((target.clone(), owner, false));
+    g.push((target.clone(), owner, false, prog_id));
     true
 }
 
@@ -167,7 +169,7 @@ fn claim(target: &LinkTarget, owner: Owner) -> bool {
 /// Every caller must pair this with [`finish_unclaim`] once the hook is down.
 fn begin_unclaim(target: &LinkTarget, owner: Owner) -> bool {
     let mut g = OWNERS.lock();
-    for (t, o, detaching) in g.iter_mut() {
+    for (t, o, detaching, _) in g.iter_mut() {
         if t == target && *o == owner && !*detaching {
             *detaching = true;
             return true;
@@ -179,7 +181,7 @@ fn begin_unclaim(target: &LinkTarget, owner: Owner) -> bool {
 /// Remove the entry [`begin_unclaim`] marked, releasing `target`.
 fn finish_unclaim(target: &LinkTarget) {
     let mut g = OWNERS.lock();
-    g.retain(|(t, _, detaching)| !(t == target && *detaching));
+    g.retain(|(t, _, detaching, _)| !(t == target && *detaching));
 }
 
 /// Release `owner`'s claim outright.
@@ -190,13 +192,34 @@ fn finish_unclaim(target: &LinkTarget) {
 /// [`begin_unclaim`] / [`finish_unclaim`].
 fn release_claim(target: &LinkTarget, owner: Owner) {
     let mut g = OWNERS.lock();
-    g.retain(|(t, o, _)| !(t == target && *o == owner));
+    g.retain(|(t, o, _, _)| !(t == target && *o == owner));
+}
+
+/// The id of the program currently attached to `target`, or `None` if nothing is
+/// (or a detach is in flight). This is what `BPF_PROG_QUERY` reports.
+#[must_use]
+pub fn attached_prog_id(target: &LinkTarget) -> Option<u32> {
+    OWNERS
+        .lock()
+        .iter()
+        .find(|(t, _, detaching, _)| t == target && !*detaching)
+        .map(|(_, _, _, id)| *id)
+}
+
+/// Update the recorded program id after a link swaps its program in place, so
+/// `BPF_PROG_QUERY` keeps naming the *current* one.
+fn set_attached_prog_id(target: &LinkTarget, prog_id: u32) {
+    for entry in OWNERS.lock().iter_mut() {
+        if entry.0 == *target && !entry.2 {
+            entry.3 = prog_id;
+        }
+    }
 }
 
 /// Whether anything reached through `bpf(2)` is attached to `target`.
 #[must_use]
 pub fn is_claimed(target: &LinkTarget) -> bool {
-    OWNERS.lock().iter().any(|(t, _, _)| t == target)
+    OWNERS.lock().iter().any(|(t, _, _, _)| t == target)
 }
 
 impl From<AttachError> for LinkError {
@@ -246,7 +269,7 @@ pub fn prog_attach(
     caps.attach
         .check_live()
         .map_err(|_| LinkError::AuthorityRevoked)?;
-    if !claim(target, Owner::Prog) {
+    if !claim(target, Owner::Prog, prog.id) {
         return Err(LinkError::Busy);
     }
     if let Err(e) = do_attach(&caps, target, prog) {
@@ -340,7 +363,7 @@ impl BpfLink {
             .check_live()
             .map_err(|_| LinkError::AuthorityRevoked)?;
         let id = NEXT_LINK_ID.fetch_add(1, Ordering::Relaxed);
-        if !claim(&target, Owner::Link(id)) {
+        if !claim(&target, Owner::Link(id), prog.id) {
             return Err(LinkError::Busy);
         }
         if let Err(e) = do_attach(&caps, &target, Arc::clone(&prog)) {
@@ -459,6 +482,8 @@ impl BpfLink {
             }
         }
         crate::attach_xdp::attach(self.caps.attach, iface.clone(), Arc::clone(&new_prog))?;
+        // Keep `BPF_PROG_QUERY` naming the program now on the hook.
+        set_attached_prog_id(&self.target, new_prog.id);
         let old = slot.replace(new_prog);
         drop(slot);
         // As in `detach`: the old program's last reference may die here.
@@ -1257,7 +1282,7 @@ mod smokes {
         let owner = Owner::Link(u32::MAX);
         let racer = Owner::Link(u32::MAX - 1);
 
-        if !claim(&target, owner) {
+        if !claim(&target, owner, 1) {
             return TestResult::Fail("the test target was already claimed");
         }
         if !begin_unclaim(&target, owner) {
@@ -1265,7 +1290,7 @@ mod smokes {
             return TestResult::Fail("begin_unclaim refused a claim its owner held");
         }
         // Mid-tear-down. This is the racing `BPF_LINK_CREATE`.
-        if claim(&target, racer) {
+        if claim(&target, racer, 2) {
             release_claim(&target, racer);
             finish_unclaim(&target);
             return TestResult::Fail(
@@ -1286,7 +1311,7 @@ mod smokes {
         if is_claimed(&target) {
             return TestResult::Fail("the claim outlived the detach that completed");
         }
-        if !claim(&target, racer) {
+        if !claim(&target, racer, 2) {
             return TestResult::Fail("the target was not reattachable after the detach finished");
         }
         release_claim(&target, racer);

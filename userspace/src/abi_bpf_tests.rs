@@ -225,8 +225,11 @@ fn smoke_abi_bpf_unimplemented_cmds() -> TestResult {
         let attr = [0u8; ATTR_LEN];
         // `BPF_BTF_LOAD` used to be in this list; it is implemented now, and
         // its own conformance group lives in `abi_bpf_btf_tests.rs`. So were
-        // `BPF_OBJ_PIN` / `BPF_OBJ_GET`, whose group is at the end of this file.
-        for cmd in [BPF_PROG_QUERY, 9999] {
+        // `BPF_OBJ_PIN` / `BPF_OBJ_GET`, whose group is at the end of this file,
+        // and `BPF_PROG_QUERY`, whose group is below. `BPF_TASK_FD_QUERY` (20)
+        // is the remaining introspection gap; an out-of-range command is the
+        // catch-all.
+        for cmd in [20u64, 9999] {
             let r = call(
                 Syscall::Bpf.raw(),
                 a2(cmd, attr.as_ptr() as u64, ATTR_LEN as u64),
@@ -282,6 +285,102 @@ fn smoke_abi_bpf_requires_privilege() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_requires_privilege);
+
+// ── BPF_TASK_FD_QUERY ───────────────────────────────────────────────
+
+const BPF_TASK_FD_QUERY: u64 = 20;
+
+fn task_fd_query_attr(pid: u32, fd: u32) -> [u8; ATTR_LEN] {
+    let mut a = [0u8; ATTR_LEN];
+    put_u32(&mut a, 0, pid);
+    put_u32(&mut a, 4, fd);
+    // flags @8, buf_len @12, buf @16 all zero — no name buffer.
+    a
+}
+
+fn bpf_mut(cmd: u64, attr: &mut [u8; ATTR_LEN]) -> Option<i64> {
+    call(
+        Syscall::Bpf.raw(),
+        a2(cmd, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+    )
+}
+
+fn smoke_abi_bpf_task_fd_query_pos() -> TestResult {
+    with_setup(|| {
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a program");
+        }
+        let mut info = [0u8; INFO_BUF];
+        if obj_info(prog_fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD failed on the program");
+        }
+        let want_id = info_u32(&info, PI_ID);
+
+        let ev = open_tracepoint_event().ok_or("could not open a tracepoint event")?;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, prog_fd as u64),
+        ) != Some(0)
+        {
+            return Err("SET_BPF on the tracepoint event was refused");
+        }
+
+        // The query on the perf event fd names the attached program, and reports
+        // fd_type TRACEPOINT (1). `pid = 0` means "this task".
+        let mut q = task_fd_query_attr(0, ev);
+        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(0) {
+            return Err("BPF_TASK_FD_QUERY on an event with a program failed");
+        }
+        if get_u32(&q, 24) != want_id {
+            return Err("BPF_TASK_FD_QUERY returned the wrong program id");
+        }
+        if get_u32(&q, 28) != 1 {
+            return Err("BPF_TASK_FD_QUERY did not report fd_type TRACEPOINT");
+        }
+
+        // Detach, and the event no longer carries a program.
+        let _ = call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, u64::from(u32::MAX)),
+        );
+        let mut q = task_fd_query_attr(0, ev);
+        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(EOPNOTSUPP) {
+            return Err("query on an event with no program was not ENOTSUP");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(ev as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_task_fd_query_pos);
+
+fn smoke_abi_bpf_task_fd_query_neg() -> TestResult {
+    with_setup(|| {
+        // An fd that carries no BPF program (a fresh program fd is not a perf
+        // event) is ENOTSUP.
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        let mut q = task_fd_query_attr(0, prog_fd as u32);
+        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(EOPNOTSUPP) {
+            return Err("BPF_TASK_FD_QUERY on a non-perf fd was not ENOTSUP");
+        }
+        // A pid that is not this task is a cross-task query NARF does not do.
+        let mut q = task_fd_query_attr(0x7fff_0000, prog_fd as u32);
+        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(EOPNOTSUPP) {
+            return Err("BPF_TASK_FD_QUERY for another pid was not ENOTSUP");
+        }
+        // A nonzero flags is nonsense.
+        let mut q = task_fd_query_attr(0, prog_fd as u32);
+        put_u32(&mut q, 8, 1);
+        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(EINVAL) {
+            return Err("BPF_TASK_FD_QUERY with flags did not return EINVAL");
+        }
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_task_fd_query_neg);
 
 // ── PERF_EVENT_IOC_SET_BPF ──────────────────────────────────────────
 
@@ -1641,8 +1740,8 @@ const BPF_MAP_GET_NEXT_ID: u64 = 12;
 const BPF_PROG_GET_FD_BY_ID: u64 = 13;
 const BPF_MAP_GET_FD_BY_ID: u64 = 14;
 const BPF_OBJ_GET_INFO_BY_FD: u64 = 15;
-const BPF_LINK_GET_FD_BY_ID: u64 = 32;
-const BPF_LINK_GET_NEXT_ID: u64 = 33;
+const BPF_LINK_GET_FD_BY_ID: u64 = 30;
+const BPF_LINK_GET_NEXT_ID: u64 = 31;
 
 /// `sizeof(struct bpf_prog_info)` and `sizeof(struct bpf_map_info)`, as the
 /// handler reports them. Spelled out again rather than imported from
@@ -2652,6 +2751,7 @@ const BPF_ATTACH_TYPE_NONSENSE: u32 = 4242;
 const BPF_PROG_TYPE_SYSCALL: u32 = 31;
 
 const EBUSY: i64 = -16;
+const ENOSPC: i64 = -28;
 
 fn bpf(cmd: u64, attr: &[u8; ATTR_LEN]) -> Option<i64> {
     call(
@@ -2682,6 +2782,273 @@ fn link_attr(prog_fd: u32, target: u32, attach_type: u32) -> [u8; ATTR_LEN] {
 fn fresh_probe() -> u32 {
     narf_tracing::dispatch::reserve_probe_id()
 }
+
+// ── BPF iterators: BPF_LINK_CREATE(BPF_TRACE_ITER) + BPF_ITER_CREATE ──
+
+const BPF_TRACE_ITER: u32 = 28;
+const BPF_ITER_CREATE: u64 = 33;
+const ITER_KIND_MAP: u32 = 0;
+
+/// `r0 = *(u64 *)(r1 + 0); exit` — an iterator program that emits the id its
+/// context carries (NARF emits a program's return value, one u64 per object).
+fn iter_emit_id_prog() -> [u8; 16] {
+    let mut insns = [0u8; 16];
+    insns[0] = 0x79; // BPF_LDX | BPF_MEM | BPF_DW
+    insns[1] = 0x10; // dst = r0 (low nibble), src = r1 (high)
+                     // off = 0, so it reads context word 0
+    insns[8] = 0x95; // exit
+    insns
+}
+
+fn smoke_abi_bpf_iter_map_pos() -> TestResult {
+    with_setup(|| {
+        // Two maps to iterate, and their ids.
+        let m1 = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok_or("bpf() not Ok")?;
+        let m2 = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok_or("bpf() not Ok")?;
+        if m1 < 0 || m2 < 0 {
+            return Err("BPF_MAP_CREATE rejected an array map");
+        }
+        let id1 = map_id_of(m1)?;
+        let id2 = map_id_of(m2)?;
+
+        let prog_fd =
+            load_prog(BPF_PROG_TYPE_TRACING, &iter_emit_id_prog()).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected the iterator program");
+        }
+
+        // Bind the program to the map target, then create the iterator fd.
+        let link = bpf(
+            BPF_LINK_CREATE,
+            &link_attr(prog_fd as u32, ITER_KIND_MAP, BPF_TRACE_ITER),
+        )
+        .ok_or("bpf() not Ok")?;
+        if link < 0 {
+            return Err("BPF_LINK_CREATE(BPF_TRACE_ITER) failed");
+        }
+        let mut ic = [0u8; ATTR_LEN];
+        put_u32(&mut ic, 0, link as u32); // iter_create.link_fd
+        let iter = call(
+            Syscall::Bpf.raw(),
+            a2(BPF_ITER_CREATE, ic.as_ptr() as u64, ATTR_LEN as u64),
+        )
+        .ok_or("bpf() not Ok")?;
+        if iter < 0 {
+            return Err("BPF_ITER_CREATE failed");
+        }
+
+        // The iterator emits one u64 (a map id) per map.
+        let mut buf = [0u8; 4096];
+        let n = call(
+            Syscall::Read.raw(),
+            a2(iter as u64, buf.as_mut_ptr() as u64, buf.len() as u64),
+        )
+        .ok_or("read() not Ok")?;
+        if n <= 0 || n % 8 != 0 {
+            return Err("iterator read did not return whole u64 records");
+        }
+
+        // Both created maps must appear among the records.
+        let (mut saw1, mut saw2) = (false, false);
+        let mut off = 0usize;
+        while off + 8 <= n as usize {
+            let v = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+            saw1 |= v == u64::from(id1);
+            saw2 |= v == u64::from(id2);
+            off += 8;
+        }
+        if !saw1 || !saw2 {
+            return Err("the map iterator did not emit both created map ids");
+        }
+
+        // A second read from the end returns EOF (0), the whole-buffer contract.
+        let eof = call(
+            Syscall::Read.raw(),
+            a2(iter as u64, buf.as_mut_ptr() as u64, buf.len() as u64),
+        );
+        if eof != Some(0) {
+            return Err("a fully-drained iterator did not return EOF");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(iter as u64));
+        let _ = call(Syscall::Close.raw(), a0(link as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(m1 as u64));
+        let _ = call(Syscall::Close.raw(), a0(m2 as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_iter_map_pos);
+
+fn smoke_abi_bpf_iter_neg() -> TestResult {
+    with_setup(|| {
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(0)).ok_or("bpf() not Ok")?;
+
+        // ITER_CREATE on a fd that is not an iterator link is EINVAL.
+        let mut ic = [0u8; ATTR_LEN];
+        put_u32(&mut ic, 0, prog_fd as u32);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_ITER_CREATE, ic.as_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_ITER_CREATE on a non-link fd was not EINVAL");
+        }
+        // ITER_CREATE on an unopened fd is EBADF.
+        let mut ic = [0u8; ATTR_LEN];
+        put_u32(&mut ic, 0, 4095);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_ITER_CREATE, ic.as_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EBADF)
+        {
+            return Err("BPF_ITER_CREATE on an unopened fd was not EBADF");
+        }
+        // An out-of-range iterator kind is rejected at link create.
+        if bpf(
+            BPF_LINK_CREATE,
+            &link_attr(prog_fd as u32, 99, BPF_TRACE_ITER),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_LINK_CREATE(BPF_TRACE_ITER) with a bad kind was not EINVAL");
+        }
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_iter_neg);
+
+/// `bpf_attr.query` for `BPF_PROG_QUERY`.
+fn query_attr(target: u32, attach_type: u32, count: u32, prog_ids: u64) -> [u8; ATTR_LEN] {
+    let mut a = [0u8; ATTR_LEN];
+    put_u32(&mut a, 0, target); // target_fd / target_ifindex
+    put_u32(&mut a, 4, attach_type);
+    // query_flags @8 = 0, attach_flags (out) @12
+    put_u64(&mut a, 16, prog_ids);
+    put_u32(&mut a, 24, count);
+    a
+}
+
+/// Run `BPF_PROG_QUERY` on a mutable attr and hand back the syscall result. The
+/// caller reads the out-fields (`count` @24, `attach_flags` @12) from `attr`.
+fn prog_query(attr: &mut [u8; ATTR_LEN]) -> Option<i64> {
+    call(
+        Syscall::Bpf.raw(),
+        a2(BPF_PROG_QUERY, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+    )
+}
+
+// ── BPF_PROG_QUERY ──────────────────────────────────────────────────
+
+fn smoke_abi_bpf_prog_query_pos() -> TestResult {
+    with_setup(|| {
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a trivial program");
+        }
+        // The program's real id, to compare against what the query reports.
+        let mut info = [0u8; INFO_BUF];
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD failed on the program");
+        }
+        let want_id = info_u32(&info, PI_ID);
+        let probe = fresh_probe();
+        let mut ids = [0u32; 4];
+
+        // Nothing attached yet: the count comes back zero.
+        let mut q = query_attr(probe, BPF_TRACE_FENTRY, 4, ids.as_mut_ptr() as u64);
+        if prog_query(&mut q) != Some(0) {
+            return Err("BPF_PROG_QUERY on an unattached target did not succeed");
+        }
+        if get_u32(&q, 24) != 0 {
+            return Err("query on an unattached target reported a program");
+        }
+
+        // Attach, then the query names exactly that program.
+        if bpf(
+            BPF_PROG_ATTACH,
+            &attach_attr(probe, fd as u32, BPF_TRACE_FENTRY),
+        ) != Some(0)
+        {
+            return Err("BPF_PROG_ATTACH failed");
+        }
+        let mut q = query_attr(probe, BPF_TRACE_FENTRY, 4, ids.as_mut_ptr() as u64);
+        if prog_query(&mut q) != Some(0) {
+            return Err("BPF_PROG_QUERY on an attached target failed");
+        }
+        if get_u32(&q, 24) != 1 {
+            return Err("query did not report exactly one attached program");
+        }
+        if get_u32(&q, 12) != 0 {
+            return Err("query reported nonzero attach_flags — NARF has none");
+        }
+        if ids[0] != want_id {
+            return Err("query returned the wrong program id");
+        }
+
+        // A count-0, null-array probe learns the count without writing anything.
+        let mut q = query_attr(probe, BPF_TRACE_FENTRY, 0, 0);
+        if prog_query(&mut q) != Some(0) {
+            return Err("BPF_PROG_QUERY count-only probe failed");
+        }
+        if get_u32(&q, 24) != 1 {
+            return Err("count-only probe did not report one program");
+        }
+        // But a zero-capacity array that the count won't fit is ENOSPC.
+        let mut q = query_attr(probe, BPF_TRACE_FENTRY, 0, ids.as_mut_ptr() as u64);
+        if prog_query(&mut q) != Some(ENOSPC) {
+            return Err("BPF_PROG_QUERY into a too-small array did not return ENOSPC");
+        }
+
+        let _ = bpf(
+            BPF_PROG_DETACH,
+            &attach_attr(probe, fd as u32, BPF_TRACE_FENTRY),
+        );
+        let mut q = query_attr(probe, BPF_TRACE_FENTRY, 4, ids.as_mut_ptr() as u64);
+        let _ = prog_query(&mut q);
+        if get_u32(&q, 24) != 0 {
+            return Err("query still reported a program after detach");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_query_pos);
+
+fn smoke_abi_bpf_prog_query_neg() -> TestResult {
+    with_setup(|| {
+        // A truncated attr (before `count`) is EINVAL.
+        let mut q = [0u8; ATTR_LEN];
+        put_u32(&mut q, 4, BPF_TRACE_FENTRY);
+        put_u32(&mut q, 0, fresh_probe());
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_QUERY, q.as_mut_ptr() as u64, 8),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_QUERY with a truncated attr did not return EINVAL");
+        }
+        // A nonzero query_flags is nonsense here — NARF has no cgroup effective
+        // vs. attached distinction.
+        let mut q = query_attr(fresh_probe(), BPF_TRACE_FENTRY, 0, 0);
+        put_u32(&mut q, 8, 1);
+        if prog_query(&mut q) != Some(EINVAL) {
+            return Err("BPF_PROG_QUERY with query_flags did not return EINVAL");
+        }
+        // A target 0 is not a probe id (they start at 1).
+        let mut q = query_attr(0, BPF_TRACE_FENTRY, 0, 0);
+        if prog_query(&mut q) != Some(EINVAL) {
+            return Err("BPF_PROG_QUERY on probe id 0 did not return EINVAL");
+        }
+        // An attach type NARF has no surface for is ENOTSUP, not EINVAL.
+        let mut q = query_attr(1, 0, 0, 0);
+        if prog_query(&mut q) != Some(EOPNOTSUPP) {
+            return Err("BPF_PROG_QUERY with an unsupported attach type was not ENOTSUP");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_query_neg);
 
 // ── BPF_PROG_ATTACH / BPF_PROG_DETACH ───────────────────────────────
 

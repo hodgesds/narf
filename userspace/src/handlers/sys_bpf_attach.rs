@@ -82,6 +82,9 @@ const ATTR_BUF: usize = 256;
 // `enum bpf_attach_type`, from include/uapi/linux/bpf.h. Only the two NARF has
 // a surface for are named; the rest are handled by range.
 const BPF_TRACE_FENTRY: u32 = 24;
+/// `BPF_TRACE_ITER` — an iterator link (see `crate::bpf_iter`). Not a hook
+/// attachment, so it bypasses `resolve_target` and the claim table entirely.
+const BPF_TRACE_ITER: u32 = 28;
 const BPF_XDP: u32 = 37;
 /// `__MAX_BPF_ATTACH_TYPE` as of Linux 6.18. Anything at or above it is not a
 /// value Linux defines, so it is `EINVAL` rather than `ENOTSUP`.
@@ -150,6 +153,12 @@ fn link_caps() -> LinkCaps {
 
 fn u32_at(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+fn u64_at(buf: &[u8], off: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&buf[off..off + 8]);
+    u64::from_le_bytes(b)
 }
 
 /// Copy `size` bytes of `union bpf_attr` into a zeroed buffer of our own.
@@ -361,6 +370,12 @@ pub(crate) fn bpf_link_create(attr_uptr: u64, size: usize) -> i64 {
     if u32_at(&attr, LC_FLAGS) != 0 {
         return -EINVAL;
     }
+    // An iterator link is not a hook attachment — it binds a program to a target
+    // *kind* for `BPF_ITER_CREATE` to read — so it takes its own path, before
+    // `resolve_target` (which only knows the hooks) is consulted.
+    if u32_at(&attr, LC_ATTACH_TYPE) == BPF_TRACE_ITER {
+        return create_iter_link(&attr);
+    }
     let target = match resolve_target(u32_at(&attr, LC_ATTACH_TYPE), u32_at(&attr, LC_TARGET)) {
         Ok(t) => t,
         Err(e) => return e,
@@ -395,6 +410,66 @@ pub(crate) fn bpf_link_create(attr_uptr: u64, size: usize) -> i64 {
         // errno `sys_bpf.rs` already uses for the same shape.
         None => -EMFILE,
     }
+}
+
+/// Open a fresh close-on-exec fd over `ops`, returning the fd number or the
+/// errno. Shared by the link and iterator create paths; `O_CLOEXEC` because a
+/// leaked bpf object fd is a leaked capability (Linux does the same).
+fn open_cloexec_fd(ops: Arc<dyn narf_filesystem::FileOps>) -> i64 {
+    match fd::with_table(current_task_id(), |t| {
+        t.open(crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: crate::fd::FD_CLOEXEC,
+            status_flags: 0,
+        })
+    }) {
+        Some(n) => n as i64,
+        None => -EMFILE,
+    }
+}
+
+// `struct { … } iter_create` field offsets.
+const IC_LINK_FD: usize = 0;
+const IC_FLAGS: usize = 4;
+
+/// `BPF_ITER_CREATE` — turn an iterator link fd into a readable iterator fd.
+pub(crate) fn bpf_iter_create(attr_uptr: u64, size: usize) -> i64 {
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < IC_FLAGS + 4 {
+        return -EINVAL;
+    }
+    if u32_at(&attr, IC_FLAGS) != 0 {
+        return -EINVAL;
+    }
+    let link_fd = u32_at(&attr, IC_LINK_FD);
+    let ops = match fd::with_table(current_task_id(), |t| t.get(link_fd).map(|e| e.ops.clone())) {
+        Some(Some(o)) => o,
+        _ => return -EBADF,
+    };
+    match crate::bpf_iter::iter_from_link(&ops) {
+        Some(iter) => open_cloexec_fd(iter),
+        // The fd is real but is not an iterator link.
+        None => -EINVAL,
+    }
+}
+
+/// `BPF_LINK_CREATE(BPF_TRACE_ITER)` — bind a program to a target kind and hand
+/// back an iterator-link fd. The kind rides in `target_fd`, NARF's stand-in for
+/// Linux's BTF `iter_info`.
+fn create_iter_link(attr: &[u8; ATTR_BUF]) -> i64 {
+    let kind = u32_at(attr, LC_TARGET);
+    if kind >= crate::bpf_iter::ITER_KIND_COUNT {
+        return -EINVAL;
+    }
+    let prog = match prog_from_fd(u32_at(attr, LC_PROG_FD)) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    open_cloexec_fd(Arc::new(crate::bpf_iter::IterLinkFile::new(prog, kind)))
 }
 
 pub(crate) fn bpf_link_update(attr_uptr: u64, size: usize) -> i64 {
@@ -451,4 +526,71 @@ pub(crate) fn bpf_link_detach(attr_uptr: u64, size: usize) -> i64 {
         Ok(()) => 0,
         Err(e) => errno(e),
     }
+}
+
+// `struct { … } query` (BPF_PROG_QUERY) field offsets.
+const Q_TARGET: usize = 0;
+const Q_ATTACH_TYPE: usize = 4;
+const Q_QUERY_FLAGS: usize = 8;
+const Q_ATTACH_FLAGS: usize = 12;
+const Q_PROG_IDS: usize = 16;
+const Q_COUNT: usize = 24;
+
+/// `BPF_PROG_QUERY` — report the program(s) attached to a target.
+///
+/// NARF's hooks are single-slot, so the answer is at most one program id. The
+/// `count` field is the in/out capacity/actual convention every enumerating
+/// `bpf(2)` command uses: a caller does one call with `count = 0` (or a null
+/// `prog_ids`) to learn how many are attached, then sizes its array and calls
+/// again. `attach_flags` is always zero — NARF has none of Linux's cgroup
+/// multi-attach / override / replace flags, because it has none of those hooks.
+pub(crate) fn bpf_prog_query(attr_uptr: u64, size: usize) -> i64 {
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < Q_COUNT + 4 {
+        return -EINVAL;
+    }
+    // `query_flags` selects effective vs. attached programs on a cgroup; NARF
+    // has neither notion, so any bit is nonsense here rather than ignorable.
+    if u32_at(&attr, Q_QUERY_FLAGS) != 0 {
+        return -EINVAL;
+    }
+    let target = match resolve_target(u32_at(&attr, Q_ATTACH_TYPE), u32_at(&attr, Q_TARGET)) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    let attached = narf_bpf::link::attached_prog_id(&target);
+    let actual = u32::from(attached.is_some());
+    let capacity = u32_at(&attr, Q_COUNT);
+    let prog_ids_uptr = u64_at(&attr, Q_PROG_IDS);
+
+    // `attach_flags` (out) and `count` (out) go back into the caller's `attr`.
+    // SAFETY: each write is one field, range-checked inside `copy_to_user`,
+    // which brackets SMAP and turns a fault into `Err(EFAULT)`.
+    if let Err(e) = unsafe { copy_to_user(attr_uptr + Q_ATTACH_FLAGS as u64, &0u32.to_le_bytes()) } {
+        return -(e as i64);
+    }
+    // SAFETY: as above — one field, range-checked inside `copy_to_user`.
+    if let Err(e) = unsafe { copy_to_user(attr_uptr + Q_COUNT as u64, &actual.to_le_bytes()) } {
+        return -(e as i64);
+    }
+
+    if let Some(id) = attached {
+        if prog_ids_uptr != 0 {
+            // A buffer too small for the true count is `-ENOSPC`, and `count`
+            // above already told the caller how big to make it.
+            if capacity < actual {
+                return -ENOSPC;
+            }
+            // SAFETY: `capacity >= 1`, so the one id fits the array the caller
+            // described; the write is range-checked inside `copy_to_user`.
+            if let Err(e) = unsafe { copy_to_user(prog_ids_uptr, &id.to_le_bytes()) } {
+                return -(e as i64);
+            }
+        }
+    }
+    0
 }
