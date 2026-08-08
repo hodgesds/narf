@@ -31,7 +31,7 @@ use narf_bpf_isa::{AluOp, AtomicOp, ByteOrder, CondOp, Decoded, Imm64, Size, Sou
 use narf_bpf_verifier::Context;
 
 use crate::aarch64;
-use crate::tests::{kcall, mov, r, verified, verified_calling, EXIT};
+use crate::tests::{kcall, mov, r, verified, verified_calling, verified_subprogs, EXIT};
 use crate::JitError;
 
 /// The emitted image as instruction words. Every aarch64 instruction is four
@@ -2562,7 +2562,9 @@ fn a64_golden_kfunc_call_sequence() {
             0xf2a2_4690, // movk x16, #0x1234, lsl #16
             0xf2d7_ddf0, // movk x16, #0xbeef, lsl #32
             0xf2fb_d5b0, // movk x16, #0xdead, lsl #48
+            0xf81f_0ffe, // str  x30, [sp, #-16]!  (preserve the return address)
             0xd63f_0200, // blr  x16
+            0xf841_07fe, // ldr  x30, [sp], #16
             0x1400_0001, // b -> epilogue
         ],
     );
@@ -2679,14 +2681,48 @@ fn a64_a_sleepable_kfuncs_shim_is_never_entered_from_native_code() {
 }
 
 #[test]
-fn a64_a_subprogram_call_is_still_unsupported() {
-    let prog = verified(&[
-        Decoded::Call(narf_bpf_isa::CallTarget::Subprog(1)),
-        mov(0, 0),
-        EXIT,
-    ]);
-    assert!(matches!(
-        aarch64::compile(&prog),
-        Err(JitError::Unsupported { at: 0, .. })
-    ));
+fn a64_a_subprogram_call_saves_the_frame_and_returns() {
+    // main (stack 16) calls a subprogram (stack 0) returning 7. The call saves
+    // R6..R9, R10 and the link register in three STP pairs, descends the frame
+    // pointer by the caller's 16 bytes, and `BL`s; the callee's `exit` is a
+    // `RET`. The save/restore words are pinned exactly (contiguous in the
+    // emission); the `BL` displacement and layout are not.
+    let prog = verified_subprogs(
+        &[
+            Decoded::Call(narf_bpf_isa::CallTarget::Subprog(1)),
+            EXIT,
+            mov(0, 7),
+            EXIT,
+        ],
+        &[(0, 16), (2, 0)],
+    );
+    let c = aarch64::compile(&prog).expect("a subprogram call must compile");
+    let w = a64_words(&c.code);
+    let save = [
+        0xa9bd_53f3, // stp x19, x20, [sp, #-48]!
+        0xa901_5bf5, // stp x21, x22, [sp, #16]
+        0xa902_7bf9, // stp x25, x30, [sp, #32]
+        0xd100_4339, // sub x25, x25, #16
+    ];
+    assert!(
+        w.windows(save.len()).any(|x| x == save),
+        "the call must save R6..R10/LR and descend the frame pointer, got {w:08x?}"
+    );
+    let restore = [
+        0xa942_7bf9, // ldp x25, x30, [sp, #32]
+        0xa941_5bf5, // ldp x21, x22, [sp, #16]
+        0xa8c3_53f3, // ldp x19, x20, [sp], #48
+    ];
+    assert!(
+        w.windows(restore.len()).any(|x| x == restore),
+        "the call must restore R6..R10/LR afterwards"
+    );
+    assert!(
+        w.iter().any(|&x| x & 0xFC00_0000 == 0x9400_0000),
+        "a BL must be emitted"
+    );
+    assert!(
+        w.contains(&0xD65F_03C0),
+        "the subprogram `exit` must be a RET"
+    );
 }

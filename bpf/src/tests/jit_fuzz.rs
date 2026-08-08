@@ -39,9 +39,9 @@
 //!
 //! The instruction *repertoire* is deliberately exactly what the backends
 //! lower: a shape neither backend emits (a map pseudo-form `LD_IMM64`, the
-//! fetching bitwise atomics, BPF-to-BPF calls) would make every program
-//! containing it fall back, and a fuzzer whose subjects fall back is a fuzzer
-//! comparing the interpreter with itself.
+//! fetching bitwise atomics, arena atomics) would make every program containing
+//! it fall back, and a fuzzer whose subjects fall back is a fuzzer comparing the
+//! interpreter with itself.
 //!
 //! The plain-value `LD_IMM64` *is* lowered but is still not generated here: it
 //! is a two-slot instruction, and this generator's jump arithmetic is in
@@ -1479,46 +1479,36 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
     if !narf_bpf_jit::has_backend() {
         return TestResult::Skip(NO_BACKEND);
     }
-    let cases: [(&str, Vec<Decoded>); 2] = [
-        (
-            // A fetching bitwise atomic: x86-64 would need a cmpxchg loop, so it
-            // stays interpreted, and aarch64 leaves it for parity.
-            "atomic-fetch-or",
-            alloc::vec![
-                super::mov_imm(1, 7),
-                Decoded::Store {
-                    size: Size::Dw,
-                    dst: r(10),
-                    off: -8,
-                    src: Source::Imm(0),
-                },
-                Decoded::Atomic {
-                    size: Size::Dw,
-                    op: AtomicOp::Or { fetch: true },
-                    dst: r(10),
-                    src: r(1),
-                    off: -8,
-                },
-                // R0 must be defined at exit, or the verifier rejects the probe
-                // before it can be evidence about the backends.
-                super::mov_imm(0, 0),
-                Decoded::Exit,
-            ],
-        ),
-        (
-            // A BPF-to-BPF call: it needs the interpreter's frame push, which no
-            // backend emits yet. (The plain-value LD_IMM64 that used to sit here
-            // is now lowered.)
-            "subprog-call",
-            alloc::vec![
-                super::mov_imm(0, 0),
-                Decoded::Call(narf_bpf_isa::CallTarget::Subprog(1)),
-                Decoded::Exit,
-                super::mov_imm(0, 0),
-                Decoded::Exit,
-            ],
-        ),
-    ];
+    // A fetching bitwise atomic is the one shape that still both verifies
+    // through the real loader *and* falls back: x86-64 would need a cmpxchg loop
+    // for it, so it stays interpreted, and aarch64 leaves it for parity. (The
+    // multiply, atomic, LD_IMM64 and BPF-to-BPF-call probes that once lived here
+    // are all lowered now; the remaining unlowered shapes — map pseudo-form
+    // LD_IMM64, arena atomics — do not verify without maps or an arena to set
+    // up, so they cannot serve as probes here.)
+    let cases: [(&str, Vec<Decoded>); 1] = [(
+        "atomic-fetch-or",
+        alloc::vec![
+            super::mov_imm(1, 7),
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(10),
+                off: -8,
+                src: Source::Imm(0),
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Or { fetch: true },
+                dst: r(10),
+                src: r(1),
+                off: -8,
+            },
+            // R0 must be defined at exit, or the verifier rejects the probe
+            // before it can be evidence about the backends.
+            super::mov_imm(0, 0),
+            Decoded::Exit,
+        ],
+    )];
     for (what, items) in cases {
         let Ok(p) = load("unlowered", asm(&items), Context::Atomic) else {
             // A shape the *verifier* refuses is not evidence about the

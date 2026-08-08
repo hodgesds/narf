@@ -48,6 +48,19 @@ pub(crate) fn kcall(id: i32) -> Decoded {
     Decoded::Call(CallTarget::Kfunc(id))
 }
 
+/// As [`verified`], plus the subprogram table — `(start_slot, stack_bytes)`
+/// pairs — so the emitter can tell which `exit` returns to a caller and how far
+/// a `call` descends the frame. The verifier would have derived these; a codegen
+/// test states them directly.
+pub(crate) fn verified_subprogs(items: &[Decoded], subprogs: &[(u32, u32)]) -> VerifiedProgram {
+    let mut v = verified(items);
+    v.subprogs = subprogs
+        .iter()
+        .map(|&(start, stack_bytes)| narf_bpf_verifier::SubprogInfo { start, stack_bytes })
+        .collect();
+    v
+}
+
 /// As [`verified`], plus the resolved call table the verifier would have built.
 ///
 /// `sites` is `(insn_index, id, addr)`; the context is [`Context::Atomic`],
@@ -143,10 +156,10 @@ fn sizing_converges_for_a_long_forward_branch() {
 
 #[test]
 fn reports_unsupported_rather_than_emitting_wrong_code() {
-    // Atomics are not emitted yet. The caller answers `Unsupported` by
-    // interpreting, so this must be an error and never a silently wrong
-    // encoding — the interpreter is a complete implementation, which is what
-    // makes growing this backend incrementally safe.
+    // The caller answers `Unsupported` by interpreting, so an unemitted shape
+    // must be an error and never a silently wrong encoding — the interpreter is a
+    // complete implementation, which is what makes growing this backend
+    // incrementally safe.
     //
     // This test previously used multiply, then an atomic, then a plain
     // `LD_IMM64` — all now emitted. Deliberately re-pointed at something still
@@ -1372,16 +1385,45 @@ fn a_null_shim_address_is_refused() {
 }
 
 #[test]
-fn a_subprogram_call_is_still_unsupported() {
-    // Kfunc calls landing does not make BPF-to-BPF calls land. A subprogram
-    // call needs the frame push the interpreter does in `push_frame` — saving
-    // R6..R9, moving the frame base, and a return path — and emitting a bare
-    // `call` for one would run the callee on the *caller's* BPF frame.
-    let prog = verified(&[Decoded::Call(CallTarget::Subprog(1)), mov(0, 0), EXIT]);
-    assert!(matches!(
-        compile(&prog),
-        Err(JitError::Unsupported { at: 0, .. })
-    ));
+fn a_subprogram_call_saves_the_frame_and_returns() {
+    // main (stack 16) calls a subprogram (stack 0) that returns 7. The call
+    // saves R6..R9 and R10, descends the frame pointer by the caller's 16 bytes,
+    // and `call`s; the callee's `exit` is a `ret`. Displacement-independent bytes
+    // are pinned exactly; the `call` and the subprogram `ret` are checked to be
+    // present (their exact offsets depend on the fuel-burn layout).
+    let prog = verified_subprogs(
+        &[Decoded::Call(CallTarget::Subprog(1)), EXIT, mov(0, 7), EXIT],
+        &[(0, 16), (2, 0)],
+    );
+    let c = compile(&prog).expect("a subprogram call must compile");
+    let frame = [
+        0x53, // push rbx
+        0x41, 0x55, // push r13
+        0x41, 0x56, // push r14
+        0x41, 0x57, // push r15
+        0x55, // push rbp
+        0x48, 0x81, 0xED, 0x10, 0x00, 0x00, 0x00, // sub rbp, 16
+    ];
+    assert!(
+        c.code.windows(frame.len()).any(|w| w == frame),
+        "the call must save R6..R10 and descend the frame pointer"
+    );
+    let restore = [
+        0x5D, // pop rbp
+        0x41, 0x5F, // pop r15
+        0x41, 0x5E, // pop r14
+        0x41, 0x5D, // pop r13
+        0x5B, // pop rbx
+    ];
+    assert!(
+        c.code.windows(restore.len()).any(|w| w == restore),
+        "the call must restore R6..R10 afterwards"
+    );
+    assert!(c.code.contains(&0xE8), "a near `call` must be emitted");
+    assert!(
+        c.code.contains(&0xC3),
+        "the subprogram `exit` must be a `ret`"
+    );
 }
 
 #[test]

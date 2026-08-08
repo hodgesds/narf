@@ -89,13 +89,14 @@
 //!
 //! ## What is emitted, and what is not
 //!
-//! The subset `narf_bpf::jit_glue`'s gates admit: ALU (32 and 64 bit), `MOV`,
-//! doubleword loads and stores through R10/R1, jumps, conditional jumps,
-//! `exit`, and **kfunc calls**. Subprogram calls are still refused — they need
-//! a BPF frame push, which is a different feature from entering a C function.
-//! Everything else returns [`JitError::Unsupported`] and runs interpreted,
-//! which is a complete implementation — so an unemitted instruction costs
-//! speed, not correctness.
+//! The subset `narf_bpf::jit_glue`'s gates admit: ALU (32 and 64 bit, including
+//! div/mod), `MOV`, `LD_IMM64`, loads and stores through R10/R1, atomics, jumps,
+//! conditional jumps, `exit`, **kfunc calls**, and **BPF-to-BPF calls** (see
+//! [`emit_subprog_call`]). Left interpreted: the map/subprogram-address pseudo
+//! forms of `LD_IMM64`, the fetching bitwise atomics, and arena accesses in a
+//! program that also makes BPF-to-BPF calls. Everything unemitted returns
+//! [`JitError::Unsupported`] and runs interpreted, which is a complete
+//! implementation — so an unemitted instruction costs speed, not correctness.
 //!
 //! Emitting a call cost this backend one thing the x86-64 one did not need: an
 //! `x30` save. `BLR` writes the link register, and the prologue had no reason
@@ -503,6 +504,30 @@ const fn b(imm26: i32) -> u32 {
     0x1400_0000 | ((imm26 as u32) & 0x03FF_FFFF)
 }
 
+/// `BL #(4*imm26)` — branch with link, for a BPF-to-BPF call.
+#[inline]
+const fn bl(imm26: i32) -> u32 {
+    0x9400_0000 | ((imm26 as u32) & 0x03FF_FFFF)
+}
+
+/// `STR Xt, [Xn, #simm]!` — pre-indexed store.
+#[inline]
+const fn str_pre(rt: u8, rn: u8, simm9: i32) -> u32 {
+    0xF800_0C00 | (((simm9 as u32) & 0x1FF) << 12) | ((rn as u32) << 5) | rt as u32
+}
+
+/// `LDR Xt, [Xn], #simm` — post-indexed load.
+#[inline]
+const fn ldr_post(rt: u8, rn: u8, simm9: i32) -> u32 {
+    0xF840_0400 | (((simm9 as u32) & 0x1FF) << 12) | ((rn as u32) << 5) | rt as u32
+}
+
+/// `SUB Xd, Xn, #imm12` — used to descend the frame pointer at a call.
+#[inline]
+const fn sub_imm(rd: u8, rn: u8, imm12: u32) -> u32 {
+    0xD100_0000 | ((imm12 & 0xFFF) << 10) | ((rn as u32) << 5) | rd as u32
+}
+
 /// A byte sink that also records where things landed.
 #[derive(Debug, Default)]
 struct Emit {
@@ -699,6 +724,8 @@ const OOF_EPILOGUE: u32 = u32::MAX - 1;
 enum RelKind {
     /// `B`, `imm26`, ±128 MiB.
     B26,
+    /// `BL`, `imm26`, ±128 MiB — a BPF-to-BPF call.
+    Bl26,
     /// `B.cond`, `imm19`, ±1 MiB.
     Cond19,
 }
@@ -750,8 +777,27 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
 
     emit_prologue(&mut e);
 
+    // Slot boundaries sorted by start, so the loop knows which subprogram each
+    // instruction belongs to: a subprogram `exit` returns to its caller, and a
+    // `call` descends the frame by the *caller's* stack size.
+    let mut sp_starts: Vec<(u32, usize)> = prog
+        .subprogs
+        .iter()
+        .enumerate()
+        .map(|(k, s)| (s.start, k))
+        .collect();
+    sp_starts.sort_unstable();
+    let mut sp_ptr = 0usize;
+
     let mut i = 0usize;
     while i < prog.insns.len() {
+        while sp_ptr + 1 < sp_starts.len() && i as u32 >= sp_starts[sp_ptr + 1].0 {
+            sp_ptr += 1;
+        }
+        let (cur_start, cur_idx) = sp_starts.get(sp_ptr).copied().unwrap_or((0, 0));
+        let in_main = cur_start == 0;
+        let cur_stack = prog.subprogs.get(cur_idx).map_or(0, |s| s.stack_bytes);
+
         out.push(e.len());
         // Burn this block's worth of fuel on entry. Per block rather than per
         // instruction: the same total as the interpreter charges, because a
@@ -770,6 +816,8 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
             &mut relocs,
             &prog.kfunc_calls,
             arena[i],
+            in_main,
+            cur_stack,
         )?;
         i += width;
         // A wide instruction (`LD_IMM64`) occupies two slots. Its own offset is
@@ -819,6 +867,12 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<Emit, JitError> {
                     return Err(JitError::BadTarget { at: r.target });
                 }
                 b(words as i32)
+            }
+            RelKind::Bl26 => {
+                if !(-(1 << 25)..(1 << 25)).contains(&words) {
+                    return Err(JitError::BadTarget { at: r.target });
+                }
+                bl(words as i32)
             }
             RelKind::Cond19 => {
                 // Out of `imm19` range means the image is larger than 1 MiB.
@@ -1095,11 +1149,14 @@ fn emit_atomic(
 /// value is R0, which a call clobbers by definition. Walking the other way
 /// would smear R5 across all five argument registers.
 ///
-/// Nothing is saved around the call. R0..R5 live in `x0`..`x5`, which AAPCS64
+/// The BPF registers need no saving: R0..R5 live in `x0`..`x5`, which AAPCS64
 /// lets the callee destroy and the BPF ABI likewise declares caller-saved;
 /// R6..R10 and the fuel counter live in `x19`..`x22`, `x24` and `x25`, which
-/// AAPCS64 requires the callee to preserve. `x30` is the one exception, and the
-/// prologue saves it — see [`hr::LR`].
+/// AAPCS64 requires the callee to preserve. `x30` is the exception: `BLR`
+/// overwrites it, and it holds the return address — main's from its prologue,
+/// or a subprogram's from the caller's `BL`. It is saved around the call so a
+/// subprogram that calls a kfunc still returns to its caller. (main also has it
+/// in `LR_SLOT`, so for main this save is redundant but harmless.)
 fn emit_kfunc_call(e: &mut Emit, addr: usize) {
     for k in 0..5u8 {
         e.w(mov_rr(true, k, k + 1));
@@ -1108,7 +1165,42 @@ fn emit_kfunc_call(e: &mut Emit, addr: usize) {
     // exactly this, absent from [`REGS`], and caller-saved, so the callee is
     // welcome to destroy it.
     mov_imm64(e, hr::IMM, addr as i64);
+    e.w(str_pre(hr::LR, hr::SP, -16)); // str x30, [sp, #-16]!
     e.w(blr(hr::IMM));
+    e.w(ldr_post(hr::LR, hr::SP, 16)); // ldr x30, [sp], #16
+}
+
+/// A BPF-to-BPF call, the JIT analogue of the interpreter's `push_frame`.
+///
+/// R6..R10 must survive a call (BPF's ABI) and `BL` clobbers `x30`, so the six
+/// host registers holding R6..R9, R10 and the link register are saved across the
+/// call in three `STP` pairs — 48 bytes, keeping `sp` 16-aligned. R1..R5 are
+/// caller-saved and R0 carries the result, so none of those is saved. R10
+/// (`x25`) is then lowered by the *caller's* stack size, putting the callee's
+/// frame directly below the caller's — the descent `push_frame` makes by the
+/// calling subprogram's bytes. The `BL` is a `imm26` resolved against the offset
+/// table like a branch, and the callee's `exit` is a `RET` back to it. The fuel
+/// register (`x24`) is deliberately not saved: the callee decrements the same
+/// running total.
+fn emit_subprog_call(e: &mut Emit, at: u32, rel: i32, cur_stack: u32, relocs: &mut Vec<Reloc>) {
+    debug_assert!(
+        cur_stack <= 0xFFF,
+        "a frame larger than a SUB immediate is not expressible here"
+    );
+    e.w(pair(STP_PRE, 19, 20, hr::SP, -48)); // stp x19, x20, [sp, #-48]!
+    e.w(pair(STP_OFF, 21, 22, hr::SP, 16)); // stp x21, x22, [sp, #16]
+    e.w(pair(STP_OFF, hr::FP, hr::LR, hr::SP, 32)); // stp x25, x30, [sp, #32]
+    e.w(sub_imm(hr::FP, hr::FP, cur_stack)); // sub x25, x25, #<caller stack>
+    let at_word = e.len();
+    e.w(bl(0)); // bl -> callee entry
+    relocs.push(Reloc {
+        at: at_word,
+        target: (at as i64 + 1 + i64::from(rel)) as u32,
+        kind: RelKind::Bl26,
+    });
+    e.w(pair(LDP_OFF, hr::FP, hr::LR, hr::SP, 32)); // ldp x25, x30, [sp, #32]
+    e.w(pair(LDP_OFF, 21, 22, hr::SP, 16)); // ldp x21, x22, [sp, #16]
+    e.w(pair(LDP_POST, 19, 20, hr::SP, 48)); // ldp x19, x20, [sp], #48
 }
 
 /// The call site the verifier resolved for the `call` at `at`, or a refusal.
@@ -1173,6 +1265,7 @@ fn emit_arena_addr(e: &mut Emit, handle: u8, off: i16) {
     e.w(shifted_reg(ADD_X, true, hr::ADDR, hr::ADDR, hr::AHANDLE));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_insn(
     e: &mut Emit,
     insn: &Decoded,
@@ -1180,6 +1273,8 @@ fn emit_insn(
     relocs: &mut Vec<Reloc>,
     calls: &[KfuncCallSite],
     arena: bool,
+    in_main: bool,
+    cur_stack: u32,
 ) -> Result<(), JitError> {
     // The arena forms first: same instructions, different addressing, and a
     // recorded fault site. Only the doubleword width is emitted, matching the
@@ -1241,6 +1336,10 @@ fn emit_insn(
         Decoded::Call(CallTarget::Kfunc(id)) => {
             let site = resolve_call(calls, at, id)?;
             emit_kfunc_call(e, site.addr);
+        }
+
+        Decoded::Call(CallTarget::Subprog(rel)) => {
+            emit_subprog_call(e, at, rel, cur_stack, relocs);
         }
 
         Decoded::Mov {
@@ -1449,9 +1548,17 @@ fn emit_insn(
             );
         }
 
+        Decoded::Exit if !in_main => {
+            // A subprogram `exit` returns to its caller — the `RET` matching the
+            // `BL` `emit_subprog_call` emitted. R0 (x0) is already the result,
+            // and x30 holds the return address (preserved across any kfunc call
+            // by `emit_kfunc_call`).
+            e.w(RET);
+        }
+
         Decoded::Exit => {
-            // Branch to the shared epilogue rather than duplicating the
-            // restore sequence at every `exit`.
+            // main's `exit`. Branch to the shared epilogue rather than
+            // duplicating the restore sequence at every `exit`.
             let at_word = e.len();
             e.w(b(0));
             relocs.push(Reloc {
@@ -1461,9 +1568,6 @@ fn emit_insn(
             });
         }
 
-        // Including `CallTarget::Subprog`: a BPF-to-BPF call needs the frame
-        // push the interpreter does in `push_frame`, which is a different
-        // feature from entering a C function.
         _ => {
             return Err(JitError::Unsupported {
                 at,

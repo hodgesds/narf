@@ -465,6 +465,14 @@ pub fn try_compile(
     if v.uses_arena && arena_count != 1 {
         return Err(JitSkip::UsesArena);
     }
+    // A BPF-to-BPF call pushes the caller's saved registers onto the host stack,
+    // which moves `rsp`/`sp` — and the arena base is parked at a fixed offset
+    // from it by the prologue. The two together would make a callee's arena
+    // access read the wrong slot, so a program that uses both runs interpreted.
+    // (`subprogs.len() > 1` is exactly "there is a call target".)
+    if v.uses_arena && v.subprogs.len() > 1 {
+        return Err(JitSkip::UsesArena);
+    }
     // Gate 3, relaxed: an arena access *is* a fault site, so refusing all of
     // them refuses every arena program. A probe read still has no lowering.
     if v.fault_sites.iter().any(|f| !f.arena) {

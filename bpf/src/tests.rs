@@ -1046,6 +1046,12 @@ fn smoke_bpf_subprog_frames_do_not_overlap() -> TestResult {
     let Ok(p) = load("subcall", insns, Context::Atomic) else {
         return TestResult::Fail("load rejected a subprogram call");
     };
+    // The JIT now lowers this; require it to agree with the interpreter before
+    // trusting the value below (a no-op where there is no backend).
+    match diff_run(&p, [0; 4]) {
+        Ok(()) | Err(NO_BACKEND) => {}
+        Err(_) => return TestResult::Fail("native and interpreted frame layouts diverged"),
+    }
     match p.run_atomic([0; 4], 4) {
         Some(Outcome::Returned(0x11)) => TestResult::Pass,
         Some(Outcome::Returned(0x22)) => TestResult::Fail("callee frame overlapped the caller's"),
@@ -2838,25 +2844,91 @@ kernel_test_in!(
     smoke_bpf_jit_refuses_a_context_dereference_in_a_calling_program
 );
 
-fn smoke_bpf_jit_refuses_a_subprogram_call() -> TestResult {
-    // Kfunc calls landing does not make BPF-to-BPF calls land: a subprogram
-    // call needs the frame push the interpreter does in `push_frame`, and a
-    // bare native `call` would run the callee on the caller's BPF frame.
-    let prog = [subprog_call(1), EXIT, mov_imm(0, 7), EXIT];
-    let Ok(p) = load("subcall", asm(&prog), Context::Atomic) else {
-        return TestResult::Fail("load rejected");
-    };
-    if p.is_jited() {
-        return TestResult::Fail("a subprogram call was compiled");
+fn smoke_bpf_jit_subprog_calls_match_the_interpreter() -> TestResult {
+    // BPF-to-BPF calls are lowered natively; each scenario exercises a distinct
+    // part of the frame protocol and must agree with the interpreter and return
+    // the hand-computed value. An argument in R1, a callee-saved R6 that the
+    // callee clobbers, a subprogram that itself calls a kfunc (which clobbers the
+    // aarch64 link register), and a two-deep nesting.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
     }
-    // …and it still runs, interpreted, which is the whole reason refusing is
-    // safe.
-    match p.run_atomic([0; 4], 4) {
-        Some(Outcome::Returned(7)) => TestResult::Pass,
-        _ => TestResult::Fail("the refused program did not run interpreted"),
+    let cases: [(&str, alloc::vec::Vec<Decoded>, u64); 4] = [
+        (
+            // R0 = R1 + 21, with R1 = 21 passed as an argument → 42.
+            "argument-and-return",
+            alloc::vec![
+                mov_imm(1, 21),
+                subprog_call(1),
+                EXIT,
+                mov_reg(0, 1),
+                alu_imm(AluOp::Add, 0, 21),
+                EXIT,
+            ],
+            42,
+        ),
+        (
+            // R6 = 99, the callee sets R6 = 7, and main returns R6 — which must
+            // still be 99 because R6..R9 are preserved across a call.
+            "callee-saved-preserved",
+            alloc::vec![
+                mov_imm(6, 99),
+                subprog_call(2),
+                mov_reg(0, 6),
+                EXIT,
+                mov_imm(6, 7),
+                mov_imm(0, 0),
+                EXIT,
+            ],
+            99,
+        ),
+        (
+            // The subprogram calls a kfunc, then overwrites R0 with 55. On
+            // aarch64 the kfunc's BLR clobbers x30; if the subprogram's return
+            // address were not saved, its RET would go astray.
+            "subprog-calls-kfunc",
+            alloc::vec![
+                mov_imm(0, 0),
+                subprog_call(1),
+                EXIT,
+                call("narf_test_stack_residue"),
+                mov_imm(0, 55),
+                EXIT,
+            ],
+            55,
+        ),
+        (
+            // Two-deep: main → sub1 → sub2. sub2 returns R1 (=10), sub1 adds 1.
+            "nested",
+            alloc::vec![
+                mov_imm(1, 10),
+                subprog_call(1),
+                EXIT,
+                subprog_call(2),
+                alu_imm(AluOp::Add, 0, 1),
+                EXIT,
+                mov_reg(0, 1),
+                EXIT,
+            ],
+            11,
+        ),
+    ];
+    for (what, prog, want) in cases {
+        let Ok(p) = load(what, asm(&prog), Context::Atomic) else {
+            return TestResult::Fail("a subprogram-call program did not verify");
+        };
+        match diff_run(&p, [0; 4]) {
+            Ok(()) => {}
+            Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+            Err(_) => return TestResult::Fail("a subprogram call diverged from the interpreter"),
+        }
+        if !matches!(p.run_atomic([0; 4], 4), Some(Outcome::Returned(r)) if r == want) {
+            return TestResult::Fail("a subprogram call returned the wrong value");
+        }
     }
+    TestResult::Pass
 }
-kernel_test_in!("bpf", smoke_bpf_jit_refuses_a_subprogram_call);
+kernel_test_in!("bpf", smoke_bpf_jit_subprog_calls_match_the_interpreter);
 // ════════════════════════════════════════════════════════════════════
 // Maps (`crate::map`).
 //
