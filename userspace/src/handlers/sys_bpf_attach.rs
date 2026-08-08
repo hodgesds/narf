@@ -82,6 +82,9 @@ const ATTR_BUF: usize = 256;
 // `enum bpf_attach_type`, from include/uapi/linux/bpf.h. Only the two NARF has
 // a surface for are named; the rest are handled by range.
 const BPF_TRACE_FENTRY: u32 = 24;
+/// `BPF_TRACE_ITER` — an iterator link (see `crate::bpf_iter`). Not a hook
+/// attachment, so it bypasses `resolve_target` and the claim table entirely.
+const BPF_TRACE_ITER: u32 = 28;
 const BPF_XDP: u32 = 37;
 /// `__MAX_BPF_ATTACH_TYPE` as of Linux 6.18. Anything at or above it is not a
 /// value Linux defines, so it is `EINVAL` rather than `ENOTSUP`.
@@ -367,6 +370,12 @@ pub(crate) fn bpf_link_create(attr_uptr: u64, size: usize) -> i64 {
     if u32_at(&attr, LC_FLAGS) != 0 {
         return -EINVAL;
     }
+    // An iterator link is not a hook attachment — it binds a program to a target
+    // *kind* for `BPF_ITER_CREATE` to read — so it takes its own path, before
+    // `resolve_target` (which only knows the hooks) is consulted.
+    if u32_at(&attr, LC_ATTACH_TYPE) == BPF_TRACE_ITER {
+        return create_iter_link(&attr);
+    }
     let target = match resolve_target(u32_at(&attr, LC_ATTACH_TYPE), u32_at(&attr, LC_TARGET)) {
         Ok(t) => t,
         Err(e) => return e,
@@ -401,6 +410,66 @@ pub(crate) fn bpf_link_create(attr_uptr: u64, size: usize) -> i64 {
         // errno `sys_bpf.rs` already uses for the same shape.
         None => -EMFILE,
     }
+}
+
+/// Open a fresh close-on-exec fd over `ops`, returning the fd number or the
+/// errno. Shared by the link and iterator create paths; `O_CLOEXEC` because a
+/// leaked bpf object fd is a leaked capability (Linux does the same).
+fn open_cloexec_fd(ops: Arc<dyn narf_filesystem::FileOps>) -> i64 {
+    match fd::with_table(current_task_id(), |t| {
+        t.open(crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: crate::fd::FD_CLOEXEC,
+            status_flags: 0,
+        })
+    }) {
+        Some(n) => n as i64,
+        None => -EMFILE,
+    }
+}
+
+// `struct { … } iter_create` field offsets.
+const IC_LINK_FD: usize = 0;
+const IC_FLAGS: usize = 4;
+
+/// `BPF_ITER_CREATE` — turn an iterator link fd into a readable iterator fd.
+pub(crate) fn bpf_iter_create(attr_uptr: u64, size: usize) -> i64 {
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < IC_FLAGS + 4 {
+        return -EINVAL;
+    }
+    if u32_at(&attr, IC_FLAGS) != 0 {
+        return -EINVAL;
+    }
+    let link_fd = u32_at(&attr, IC_LINK_FD);
+    let ops = match fd::with_table(current_task_id(), |t| t.get(link_fd).map(|e| e.ops.clone())) {
+        Some(Some(o)) => o,
+        _ => return -EBADF,
+    };
+    match crate::bpf_iter::iter_from_link(&ops) {
+        Some(iter) => open_cloexec_fd(iter),
+        // The fd is real but is not an iterator link.
+        None => -EINVAL,
+    }
+}
+
+/// `BPF_LINK_CREATE(BPF_TRACE_ITER)` — bind a program to a target kind and hand
+/// back an iterator-link fd. The kind rides in `target_fd`, NARF's stand-in for
+/// Linux's BTF `iter_info`.
+fn create_iter_link(attr: &[u8; ATTR_BUF]) -> i64 {
+    let kind = u32_at(attr, LC_TARGET);
+    if kind >= crate::bpf_iter::ITER_KIND_COUNT {
+        return -EINVAL;
+    }
+    let prog = match prog_from_fd(u32_at(attr, LC_PROG_FD)) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    open_cloexec_fd(Arc::new(crate::bpf_iter::IterLinkFile::new(prog, kind)))
 }
 
 pub(crate) fn bpf_link_update(attr_uptr: u64, size: usize) -> i64 {
@@ -504,6 +573,7 @@ pub(crate) fn bpf_prog_query(attr_uptr: u64, size: usize) -> i64 {
     if let Err(e) = unsafe { copy_to_user(attr_uptr + Q_ATTACH_FLAGS as u64, &0u32.to_le_bytes()) } {
         return -(e as i64);
     }
+    // SAFETY: as above — one field, range-checked inside `copy_to_user`.
     if let Err(e) = unsafe { copy_to_user(attr_uptr + Q_COUNT as u64, &actual.to_le_bytes()) } {
         return -(e as i64);
     }

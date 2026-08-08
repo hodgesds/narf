@@ -72,6 +72,7 @@ const BPF_BTF_GET_FD_BY_ID: u32 = 19;
 const BPF_BTF_GET_NEXT_ID: u32 = 23;
 const BPF_PROG_QUERY: u32 = 16;
 const BPF_TASK_FD_QUERY: u32 = 20;
+const BPF_ITER_CREATE: u32 = 33;
 const BPF_LINK_CREATE: u32 = 28;
 const BPF_LINK_UPDATE: u32 = 29;
 // Linux numbers these 30/31 (an earlier draft had 32/33, which are actually
@@ -224,13 +225,13 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         BPF_LINK_DETACH => bpf_link_detach(attr_uptr, size),
         BPF_PROG_QUERY => bpf_prog_query(attr_uptr, size),
         BPF_TASK_FD_QUERY => task_fd_query(attr_uptr, size),
+        BPF_ITER_CREATE => bpf_iter_create(attr_uptr, size),
 
         // LINUX-GAP: everything else — the BPF token commands (`BPF_TOKEN_CREATE`
         // — NARF has no token, and the privilege gate above is a credential check
-        // rather than a delegable one), and the iterator commands
-        // (`BPF_ITER_CREATE`, which needs a seq_file-shaped read surface no NARF
-        // fd provides). `ENOTSUP` rather than `EINVAL` so a probing loader can
-        // tell "this kernel does not do that" from "you passed nonsense".
+        // rather than a delegable one), `BPF_ENABLE_STATS`, `BPF_PROG_BIND_MAP`,
+        // and `BPF_MAP_FREEZE`. `ENOTSUP` rather than `EINVAL` so a probing loader
+        // can tell "this kernel does not do that" from "you passed nonsense".
         //
         // The batch element commands are NOT in that list any more:
         // `BPF_MAP_{LOOKUP,LOOKUP_AND_DELETE,UPDATE,DELETE}_BATCH` are
@@ -301,9 +302,11 @@ fn task_fd_query(attr_uptr: u64, size: usize) -> i64 {
         None => return -ENOTSUP,
     };
 
-    // Write the out-fields back into the caller's `attr`. SAFETY: each is one
-    // field, range-checked inside `copy_to_user`, which brackets SMAP.
-    let mut put = |off: usize, bytes: &[u8]| -> Result<(), i64> {
+    // Write the out-fields back into the caller's `attr`. Each is one field,
+    // range-checked inside `copy_to_user`, which brackets SMAP and turns a fault
+    // into `Err(EFAULT)`.
+    let put = |off: usize, bytes: &[u8]| -> Result<(), i64> {
+        // SAFETY: `copy_to_user` validates `[attr_uptr + off, +bytes.len())`.
         unsafe { copy_to_user(attr_uptr + off as u64, bytes) }.map_err(|e| -(e as i64))
     };
     if let Err(e) = put(TFQ_PROG_ID, &prog_id.to_le_bytes())
@@ -318,6 +321,7 @@ fn task_fd_query(attr_uptr: u64, size: usize) -> i64 {
     // If the caller offered a name buffer, terminate it.
     let buf_uptr = u64_at(&attr, TFQ_BUF);
     if buf_uptr != 0 && u32_at(&attr, TFQ_BUF_LEN) > 0 {
+        // SAFETY: caller-supplied pointer, range-checked inside `copy_to_user`.
         if let Err(e) = unsafe { copy_to_user(buf_uptr, &[0u8]) } {
             return -(e as i64);
         }
