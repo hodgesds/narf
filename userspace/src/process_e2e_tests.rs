@@ -3406,6 +3406,72 @@ kernel_test_in!(
     smoke_pidfd_recycled_pid_does_not_inherit_exit
 );
 
+/// In-syscall CPU time must accumulate, and must NOT include time the
+/// syscall spent parked.
+///
+/// `ru_stime` / `tms_stime` / `/proc` stat field 15 all read one
+/// accumulator. It used to be filled by a single bracket around the whole
+/// syscall that was DISCARDED whenever the syscall parked — on the grounds
+/// that the span would otherwise include off-CPU sleep. Under the
+/// own-stack executor nearly every syscall parks at least once, so the
+/// accumulator stayed empty for every task on the system: measured on a
+/// full desktop boot, `kms=0` for all ~70 tasks.
+///
+/// Both halves are asserted, because fixing only the first is easy and
+/// wrong. Simply not skipping the fold would bill the sleep as CPU time,
+/// which is a worse lie than zero.
+///
+/// Tested against the span helpers directly, with a real `UserTaskCtx`.
+/// The ABI harness cannot reach this: it installs a task ID but no
+/// `UserTaskCtx`, so `current_user_task()` is `None` and the accounting is
+/// skipped entirely — a test written there passes for the wrong reason no
+/// matter which way the bug goes.
+fn smoke_kernel_time_accumulates_on_cpu_only() -> TestResult {
+    let tid = 0x5717_0000_u64;
+    let task = crate::task::Task::new_registered(tid, tid);
+    let uc = &task.uctx;
+    crate::handlers::__test_reset_kernel_time_for(tid);
+
+    // A closed span folds nothing — the idempotence the park sites rely on.
+    crate::handlers::close_kernel_span(uc, tid);
+    if crate::handlers::kern_time_ns_of(tid) != 0 {
+        return TestResult::Fail("closing an already-closed span invented CPU time");
+    }
+
+    // An open span across real work must accumulate.
+    crate::handlers::open_kernel_span(uc);
+    let spin_until = narf_scheduler::narf_time::monotonic_ns() + 2_000_000; // 2 ms
+    while narf_scheduler::narf_time::monotonic_ns() < spin_until {
+        core::hint::spin_loop();
+    }
+    crate::handlers::close_kernel_span(uc, tid);
+    let worked = crate::handlers::kern_time_ns_of(tid);
+    if worked == 0 {
+        return TestResult::Fail("an open span across 2 ms of work accumulated nothing");
+    }
+
+    // The gap between a close and the next open is sleep. It must not be
+    // billed — this is the half that makes the accumulator honest rather
+    // than merely non-zero.
+    let sleep_until = narf_scheduler::narf_time::monotonic_ns() + 5_000_000; // 5 ms
+    while narf_scheduler::narf_time::monotonic_ns() < sleep_until {
+        core::hint::spin_loop();
+    }
+    crate::handlers::open_kernel_span(uc);
+    crate::handlers::close_kernel_span(uc, tid);
+    let after_gap = crate::handlers::kern_time_ns_of(tid);
+    if after_gap.saturating_sub(worked) > 1_000_000 {
+        return TestResult::Fail("the gap between close and open was billed as CPU time");
+    }
+
+    crate::handlers::__test_reset_kernel_time_for(tid);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_kernel_time_accumulates_on_cpu_only
+);
+
 // ── Wave-65: clone3(CLONE_VM|CLONE_THREAD) + set_tid_address ──────────
 //
 // Three smokes that exercise the new clone3-shaped thread spawn:

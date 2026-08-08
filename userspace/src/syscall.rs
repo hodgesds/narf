@@ -3220,11 +3220,13 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
             trace_syscall_paths(table.name_of(variant).unwrap_or("?"), a);
         }
         // Kernel-time accounting (getrusage ru_stime / times tms_stime /
-        // /proc stat field 15): bracket the handler with two monotonic
-        // reads. A handler that parks/longjmps out (yield, blocking
-        // wait, exit) never reaches the fold — correct, since blocked
-        // time is not CPU time; only its pre-park work is undercounted.
-        let t0 = narf_scheduler::narf_time::monotonic_ns();
+        // /proc stat field 15).
+        // Open the on-CPU kernel span. Park sites close and re-open it, so
+        // what accumulates is execution time and never the sleep in between.
+        if let Some(u) = crate::user_task::current_user_task() {
+            // SAFETY: in-flight task's poller-pinned UserTaskCtx.
+            crate::handlers::open_kernel_span(unsafe { &*u });
+        }
         table.dispatch_ctx_versioned(variant, version, ctx);
         #[cfg(feature = "syscall-trace")]
         if syscall_trace_relevant(variant) {
@@ -3236,23 +3238,19 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
                 table.name_of(variant).unwrap_or("?"),
             );
         }
-        // Own-stack parks RETURN through this point after arbitrarily
-        // long sleeps — the parked flag (set at every kernel_switch
-        // yield) tells us the measured span includes off-CPU time, so
-        // skip the fold (the longjmp park paths never get here at all;
-        // skipping keeps both park styles consistently undercounted).
-        let parked = crate::user_task::current_user_task()
-            .map(|u| {
-                // SAFETY: in-flight task's poller-pinned UserTaskCtx.
-                unsafe {
-                    (*u).parked_in_syscall
-                        .swap(false, core::sync::atomic::Ordering::AcqRel)
-                }
-            })
-            .unwrap_or(false);
-        if !parked {
-            let dt = narf_scheduler::narf_time::monotonic_ns().saturating_sub(t0);
-            crate::handlers::account_kernel_cpu_ns(dt);
+        // Close the span. This used to SKIP the fold entirely whenever the
+        // syscall had parked, on the grounds that the bracket would include
+        // off-CPU sleep — but under the own-stack executor nearly every
+        // syscall parks at least once, so `TASK_KERN_NS` stayed empty for
+        // every task and `/proc` stime, `ru_stime` and `tms_stime` all read
+        // 0 forever. The span is now split at each park instead, so there is
+        // no sleep left in it to discard.
+        if let Some(u) = crate::user_task::current_user_task() {
+            // SAFETY: in-flight task's poller-pinned UserTaskCtx.
+            let uc = unsafe { &*u };
+            uc.parked_in_syscall
+                .store(false, core::sync::atomic::Ordering::Release);
+            crate::handlers::close_kernel_span(uc, crate::handlers::current_task_id());
         }
     } else {
         ctx.set_return(SyscallReturn::invalid_op());

@@ -2583,6 +2583,36 @@ pub fn cpu_split_ns_try(task: u64) -> Option<(u64, u64)> {
     Some((u, k))
 }
 
+/// Fold the currently-open on-CPU kernel span into `task`'s accumulator and
+/// close it. Idempotent: a closed span (start == 0) folds nothing.
+///
+/// Called at every point the task stops executing kernel code — the park
+/// sites and the syscall-dispatch exit — so what accumulates is on-CPU time
+/// only, never the sleep in between.
+pub fn close_kernel_span(uc: &crate::user_task::UserTaskCtx, task: u64) {
+    let start = uc.kern_span_start_ns.swap(0, core::sync::atomic::Ordering::AcqRel);
+    if start == 0 {
+        return;
+    }
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let delta = now.saturating_sub(start);
+    if delta == 0 {
+        return;
+    }
+    let mut g = TASK_KERN_NS.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let e = m.entry(task).or_insert(0);
+    *e = e.saturating_add(delta);
+}
+
+/// Open (or re-open) the on-CPU kernel span for the current task.
+pub fn open_kernel_span(uc: &crate::user_task::UserTaskCtx) {
+    uc.kern_span_start_ns.store(
+        narf_scheduler::narf_time::monotonic_ns(),
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
 /// This task's accumulated in-syscall (kernel) CPU time (ns).
 pub fn kern_time_ns_of(task: u64) -> u64 {
     TASK_KERN_NS
@@ -2598,6 +2628,16 @@ pub fn kern_time_ns_of(task: u64) -> u64 {
 /// (TCG) execution that cumulative time crosses one tick and flaps the `times`
 /// stime==0 assertion. The times test resets it first so it measures a fresh
 /// task, which is what the assertion means.
+/// Test hook: clear `task`'s accumulated in-syscall CPU time. The
+/// no-argument form only reaches the CURRENT task, which a test driving a
+/// stand-in `UserTaskCtx` is not.
+#[doc(hidden)]
+pub fn __test_reset_kernel_time_for(task: u64) {
+    if let Some(m) = TASK_KERN_NS.lock().as_mut() {
+        m.remove(&task);
+    }
+}
+
 #[doc(hidden)]
 pub fn __test_reset_kernel_time() {
     let task = current_task_id();
