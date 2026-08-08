@@ -938,6 +938,51 @@ pub fn populate_input_class() {
     let devices = get_or_create_child(&root, "devices");
     let platform = get_or_create_child(&devices, "platform");
     let narf_input = get_or_create_child(&platform, "narf-input");
+
+    // The platform PARENT needs a subsystem of its own, and a bus directory to
+    // point at. udev's `path_id` builtin composes ID_PATH by walking a device's
+    // parents and classifying each by its subsystem:
+    //
+    //     } else if (streq(subsys, "platform")) {
+    //             path_prepend(&path, "platform-%s", sysname);
+    //             supported_transport = true;
+    //             supported_parent = true;
+    //
+    // (systemd src/udev/udev-builtin-path_id.c). With no `subsystem` link here,
+    // sd_device_get_subsystem() on this parent returns -ENOENT, path_id
+    // composes nothing and fails outright — measured in-guest as
+    //
+    //     Builtin command 'path_id' fails: No such file or directory
+    //     71-seat.rules:75 IMPORT{builtin}="path_id": Failed to run builtin
+    //
+    // and 71-seat.rules is exactly the file that assigns the `seat` TAG that
+    // libinput enumerates by. Linux gives every platform device
+    // `subsystem -> ../../../bus/platform` plus a back-link under
+    // /sys/bus/platform/devices (drivers/base/bus.c `bus_add_device`).
+    {
+        let bus = get_or_create_child(&root, "bus");
+        let bus_platform = get_or_create_child(&bus, "platform");
+        let bus_platform_devices = get_or_create_child(&bus_platform, "devices");
+        // /sys/devices/platform/narf-input -> three levels up is /sys.
+        narf_input.add_symlink("subsystem", "../../../bus/platform");
+        // /sys/bus/platform/devices/narf-input -> four levels up is /sys.
+        bus_platform_devices.add_symlink("narf-input", "../../../../devices/platform/narf-input");
+        // Linux gives EVERY kobject a uevent attr (drivers/base/core.c
+        // `uevent_store`); `udevadm trigger` writes "add" to each one it walks.
+        let weak = alloc::sync::Arc::downgrade(&narf_input);
+        kobject_add_writable_attr(
+            &narf_input,
+            "uevent",
+            || String::from("DRIVER=narf-input\n"),
+            move |data: &[u8]| {
+                if let Some(k) = weak.upgrade() {
+                    kobject_emit_uevent(&k, uevent_action_from_write(data));
+                }
+                Ok(())
+            },
+        );
+    }
+
     let dev_dir = get_or_create_child(&root, "dev");
     let dev_char = get_or_create_child(&dev_dir, "char");
     // udev scandir()s both /sys/dev/{char,block}; keep block present too.
