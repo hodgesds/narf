@@ -3610,3 +3610,149 @@ kernel_test_in!(
     "userspace",
     smoke_userspace_pty_tiocsctty_installs_foreground_pgrp
 );
+
+/// An O_NONBLOCK `read(2)` on an eventfd whose counter is 0 must return
+/// **-EAGAIN**, never a bare 0.
+///
+/// Task #13 filed this as "EventFd::read returns Ok(0) — phantom EOF". The
+/// `Ok(0)` at the FileOps layer is CORRECT and deliberate: NARF has no
+/// `FsError::WouldBlock`, so "empty but open" is signalled as `Ok(0)` plus
+/// `read_should_block()`/`nonblock_read_eagain()`, and `sys_read` is what
+/// converts that into EAGAIN or a park (sys_read.rs). So the bug as filed does
+/// not exist.
+///
+/// What DID exist is a coverage hole. `smoke_io_mux_empty_reads_are_not_eof`
+/// asserts the two opt-ins on `EventFd` itself and says so in its own docs —
+/// it deliberately does not exercise the syscall. Nothing proved that
+/// `sys_read` still consults them for this fd type, so deleting the
+/// `entry.read_should_block()` check in sys_read would leave that test green
+/// while handing userspace the phantom EOF back.
+///
+/// That EOF is not cosmetic: a 0 from an eventfd tells an event loop its
+/// wakeup channel closed. The same shape (a spurious 0 on an O_NONBLOCK fd)
+/// previously killed the KDE session bus via GLib's line-reader — see the
+/// comment above the EAGAIN branch in sys_read.
+fn smoke_userspace_eventfd_nonblock_read_is_eagain_not_eof() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    use crate::{
+        fd, install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    use alloc::sync::Arc;
+
+    struct Ctx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for Ctx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let task = crate::handlers::current_task_id();
+    let efd = crate::io_mux::EventFd::new(0, 0);
+    let ops: Arc<dyn narf_filesystem::FileOps> = efd.clone();
+    let Some(fd_n) = fd::with_table(task, |tab| {
+        tab.open(FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+            status_flags: crate::fd::O_NONBLOCK,
+        })
+    }) else {
+        __test_clear_global();
+        return TestResult::Fail("could not install the eventfd in the fd table");
+    };
+
+    let mut fail: Option<&'static str> = None;
+    let mut buf = [0u8; 8];
+    let mut rctx = Ctx {
+        args: SyscallArgs {
+            arg0: fd_n as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: 8,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut rctx);
+    // -EAGAIN (11) as the negated value, matching how sys_read reports it.
+    let want_eagain = SyscallReturn::ok((-11i64) as u64);
+    match rctx.ret {
+        Some(r) if r == want_eagain => {}
+        // The exact regression: a bare 0 read as EOF by the event loop.
+        Some(r) if r == SyscallReturn::ok(0) => {
+            fail = Some("nonblocking eventfd read returned 0 — an event loop reads that as its wakeup channel closing")
+        }
+        _ => fail = Some("nonblocking eventfd read on an empty counter did not return -EAGAIN"),
+    }
+
+    // POSITIVE half: once a value is posted the SAME fd must deliver 8 bytes,
+    // so this cannot be satisfied by a version that always reports EAGAIN.
+    if fail.is_none() {
+        let one = 1u64.to_le_bytes();
+        let mut wctx = Ctx {
+            args: SyscallArgs {
+                arg0: fd_n as u64,
+                arg1: one.as_ptr() as u64,
+                arg2: 8,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Write.raw(), &mut wctx);
+        if wctx.ret != Some(SyscallReturn::ok(8)) {
+            fail = Some("eventfd write did not accept 8 bytes");
+        } else {
+            let mut rctx2 = Ctx {
+                args: SyscallArgs {
+                    arg0: fd_n as u64,
+                    arg1: buf.as_mut_ptr() as u64,
+                    arg2: 8,
+                    ..Default::default()
+                },
+                ret: None,
+            };
+            kernel_syscall_entry(Syscall::Read.raw(), &mut rctx2);
+            match rctx2.ret {
+                Some(r) if r == SyscallReturn::ok(8) => {
+                    if u64::from_le_bytes(buf) != 1 {
+                        fail = Some("eventfd read returned the wrong counter value");
+                    }
+                }
+                _ => fail = Some("eventfd read with a pending value did not return 8"),
+            }
+        }
+    }
+
+    let _ = fd::with_table(task, |tab| tab.close(fd_n));
+    __test_clear_global();
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_eventfd_nonblock_read_is_eagain_not_eof
+);
