@@ -6608,6 +6608,15 @@ pub(crate) fn parent_of_get(child: u64) -> Option<u64> {
     g.as_ref().and_then(|m| m.get(&child).copied())
 }
 
+/// `parent_of_get` for the timer trap, which can interrupt a CPU already
+/// holding `PARENT_OF`. Returns `None` on contention rather than
+/// deadlocking the machine under observation.
+#[cfg(feature = "unix-latency-trace")]
+pub(crate) fn parent_of_get_try(child: u64) -> Option<u64> {
+    let g = PARENT_OF.try_lock()?;
+    g.as_ref().and_then(|m| m.get(&child).copied())
+}
+
 /// Drop the child→parent record once the child has been reaped (or is an
 /// orphan being auto-released). Lets `has_living_child` correctly report
 /// ECHILD after the last child is reaped — without this, stale entries make

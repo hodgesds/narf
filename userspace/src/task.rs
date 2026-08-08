@@ -158,6 +158,40 @@ pub fn task_get(tid: u64) -> Option<Arc<Task>> {
 /// only because `TASKS` holds a ref for every task listed, so no drop here
 /// is ever the last one — and it is compiled out entirely without the
 /// feature. Do not promote this to a non-debug path.
+/// `unix-latency-trace`: compact roster of EVERY registered task —
+/// `tid comm pid pptid state`.
+///
+/// `pptid`, not `ppid`, and the name is doing real work: `PARENT_OF` is
+/// keyed by the child's visible PID but stores the parent's **TID**
+/// (`parent_of_set(child_visible_pid, current_task_id())`). Reading it as
+/// a pid silently produces a plausible-looking wrong tree.
+///
+/// [`dbg_park_census`] only reports PARKED tasks, so a child that is
+/// running (or spinning) is invisible to it. That is exactly the gap when
+/// the question is "which child is this parent blocked in `wait4` for":
+/// the parent shows `wantpid=N`, and without a roster there is nothing to
+/// resolve N against. Pair the two.
+///
+/// Same timer-trap hazards as [`dbg_park_census`]; see its note.
+#[cfg(feature = "unix-latency-trace")]
+pub fn dbg_proc_roster() {
+    use core::fmt::Write as _;
+    let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
+    for t in tasks {
+        let pid = t.pid.load(Ordering::Relaxed);
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "PROCREP tid={} comm={} pid={} pptid={} st={} parked={}",
+            t.tid,
+            crate::handlers::proc_comm_of_task_try(t.tid).unwrap_or_default(),
+            pid,
+            crate::handlers::parent_of_get_try(pid).map_or(-1i64, |p| p as i64),
+            t.state.load(Ordering::Relaxed),
+            t.uctx.parked_in_syscall.load(Ordering::Relaxed) as u8,
+        );
+    }
+}
+
 #[cfg(feature = "unix-latency-trace")]
 pub fn dbg_park_census(tag: &str) {
     use core::fmt::Write as _;
@@ -169,10 +203,12 @@ pub fn dbg_park_census(tag: &str) {
         }
         let _ = writeln!(
             narf_console::TrapWriter,
-            "PARKREP{tag} tid={} comm={} pid={} st={} scans={} checks={} pnfds={} epfd_enc={} netio={} waitchild={} futex={:#x} flock={:#x} deadline={:#x}",
+            "PARKREP{tag} tid={} comm={} pid={} pptid={} st={} scans={} checks={} pnfds={} epfd_enc={} netio={} waitchild={} wantpid={} futex={:#x} flock={:#x} deadline={:#x}",
             t.tid,
             crate::handlers::proc_comm_of_task_try(t.tid).unwrap_or_default(),
             t.pid.load(Ordering::Relaxed),
+            crate::handlers::parent_of_get_try(t.pid.load(Ordering::Relaxed))
+                .map_or(-1i64, |p| p as i64),
             t.state.load(Ordering::Relaxed),
             uc.dbg_poll_scans.load(Ordering::Relaxed),
             uc.dbg_park_checks.load(Ordering::Relaxed),
@@ -180,6 +216,11 @@ pub fn dbg_park_census(tag: &str) {
             uc.epoll_wait_fd.load(Ordering::Relaxed),
             uc.net_io_wait.load(Ordering::Relaxed) as u8,
             uc.wait_child_pending.load(Ordering::Relaxed) as u8,
+            // `wait4`'s target: >0 a specific pid, -1 any child, 0 own
+            // process group. Meaningless unless `waitchild=1`, but printed
+            // unconditionally so a stale value is visible rather than
+            // silently masked.
+            uc.wait_child_want_pid.load(Ordering::Relaxed),
             uc.futex_uaddr.load(Ordering::Relaxed),
             uc.flock_key.load(Ordering::Relaxed),
             uc.sleep_deadline_ns.load(Ordering::Relaxed),

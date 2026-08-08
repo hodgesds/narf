@@ -190,8 +190,16 @@ mod stall_wd {
                 // not anyone is knocking. Every 5th sweep (~10 s) to keep
                 // the synchronous console from becoming the perturbation.
                 static CENSUS_N: AtomicU64 = AtomicU64::new(0);
-                if CENSUS_N.fetch_add(1, Ordering::Relaxed) % 5 == 0 {
+                let n = CENSUS_N.fetch_add(1, Ordering::Relaxed);
+                if n % 5 == 0 {
                     narf_userspace::task::dbg_park_census("");
+                }
+                // The full roster, more sparsely (~30 s): it is what
+                // resolves a parent's `wantpid=N` to an actual child, and
+                // it sees children the park census cannot — a RUNNING
+                // child is in no park at all.
+                if n % 15 == 0 {
+                    narf_userspace::task::dbg_proc_roster();
                 }
             }
         }
