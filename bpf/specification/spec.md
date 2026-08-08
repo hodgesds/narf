@@ -677,6 +677,22 @@ and the perf event layer, all of which are closed.
     half, which cannot see a mapping. An implementation that never frees passes
     one and fails the other, and vice versa.
 
+14. **The BPF runtime has no hardware domain tag, so a verifier escape is a
+    full Ring-0 primitive.** Every other Ring-0 subsystem that the framekernel
+    does not fully trust sits behind a PKS/MTE domain; BPF — the one subsystem
+    that runs attacker-authored code — is the exception: JIT text at shared slot
+    273, maps on the global heap, arena at shared slot 275, no pkey anywhere. The
+    verifier is BPF's *software* isolation; the missing piece is the *hardware*
+    isolation that backs it up. Because NARF BPF already reaches memory only
+    through its own stack/ctx/maps/arena (no `probe_read`, no raw kernel deref —
+    §4, `interp.rs:613`), confining the runtime to one `DOMAIN_BPF` pkey costs
+    almost nothing and turns an escape from arbitrary-Ring-0 into
+    contained-to-BPF. Full design, threat model, the `run_atomic` enter/exit
+    seam, the maps-sharing wrinkle, the tracing read model (mediated
+    `narf_probe_read` off trusted pointers only, and why BTF is not the way
+    there), and the idle-governor first milestone are in
+    `domain-confinement.md`.
+
 ## 9. Post-review corrections
 
 A Fable review of the merged subsystem returned **do not land** with three
