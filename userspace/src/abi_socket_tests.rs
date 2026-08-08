@@ -977,6 +977,65 @@ kernel_test_in!(
     smoke_abi_socket_listener_readable_through_nested_epoll
 );
 
+/// A task parked in `epoll_wait` with an INFINITE timeout on a CONNECTED
+/// AF_UNIX socketpair must wake when its peer sends.
+///
+/// This is the shape a udev worker sits in: `epoll_wait(-1)` on its worker
+/// socket, waiting for udevd to hand it a device event. Measured on a real
+/// boot, those workers park with `checks` CLIMBING — the park re-fires and
+/// the scan re-runs — and still never see a message, until udevd is stuck
+/// at "18 children at max", `/run/udev/data` stays empty, no device gets a
+/// `seat` tag, and libinput enumerates nothing.
+///
+/// The neighbouring `..._epoll_level_redelivers_partial_read` covers the
+/// SCAN (`epoll_wait` with timeout 0, asking "is it ready now"). It cannot
+/// catch a missing wake, because a fresh scan finds the data whether or not
+/// anything was ever notified. Both halves are asserted here for the same
+/// reason they are on the listener test:
+///   1. `send()` must bump the readiness generation — the channel that
+///      breaks an infinite park out of its re-park loop.
+///   2. the re-executed scan must then report the fd ready.
+/// Half 1 failing is invisible to every timeout-0 epoll test in the file.
+fn smoke_abi_socket_connected_pair_send_wakes_parked_epoll() -> TestResult {
+    with_setup(|| {
+        let (tx, rx) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        let epfd = add_level_epollin(rx)?;
+
+        // Negative half: an idle pair must not report ready, or a parked
+        // worker degenerates into a read/EAGAIN spin.
+        if epoll_ready_now(epfd)? != 0 {
+            return Err("idle socketpair reported epoll-ready before any send");
+        }
+
+        let before = narf_net::readiness::generation();
+        let wire = b"udev-device-event";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(tx, wire.as_ptr() as u64, wire.len() as u64, 0),
+        ) != Some(wire.len() as i64)
+        {
+            return Err("send on the connected pair failed");
+        }
+
+        // Half 1: the wake channel. Without this bump a peer parked in
+        // `epoll_wait(-1)` only ever re-scans off the lost-wake backstop —
+        // which is exactly the "checks climbing, nothing ever ready" shape
+        // the udev workers show.
+        if narf_net::readiness::generation() <= before {
+            return Err("send() published no readiness wake for a parked epoll waiter");
+        }
+        // Half 2: the scan a woken waiter re-executes must see the data.
+        if epoll_ready_now(epfd)? != 1 {
+            return Err("sent bytes did not make the connected pair epoll-readable");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_connected_pair_send_wakes_parked_epoll
+);
+
 // ─────────────────────────── SocketShutdown ───────────────────────────
 
 fn smoke_abi_socket_shutdown_pos() -> TestResult {
