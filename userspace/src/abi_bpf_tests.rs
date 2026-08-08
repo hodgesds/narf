@@ -286,6 +286,102 @@ fn smoke_abi_bpf_requires_privilege() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_requires_privilege);
 
+// ── BPF_TASK_FD_QUERY ───────────────────────────────────────────────
+
+const BPF_TASK_FD_QUERY: u64 = 20;
+
+fn task_fd_query_attr(pid: u32, fd: u32) -> [u8; ATTR_LEN] {
+    let mut a = [0u8; ATTR_LEN];
+    put_u32(&mut a, 0, pid);
+    put_u32(&mut a, 4, fd);
+    // flags @8, buf_len @12, buf @16 all zero — no name buffer.
+    a
+}
+
+fn bpf_mut(cmd: u64, attr: &mut [u8; ATTR_LEN]) -> Option<i64> {
+    call(
+        Syscall::Bpf.raw(),
+        a2(cmd, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+    )
+}
+
+fn smoke_abi_bpf_task_fd_query_pos() -> TestResult {
+    with_setup(|| {
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a program");
+        }
+        let mut info = [0u8; INFO_BUF];
+        if obj_info(prog_fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD failed on the program");
+        }
+        let want_id = info_u32(&info, PI_ID);
+
+        let ev = open_tracepoint_event().ok_or("could not open a tracepoint event")?;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, prog_fd as u64),
+        ) != Some(0)
+        {
+            return Err("SET_BPF on the tracepoint event was refused");
+        }
+
+        // The query on the perf event fd names the attached program, and reports
+        // fd_type TRACEPOINT (1). `pid = 0` means "this task".
+        let mut q = task_fd_query_attr(0, ev);
+        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(0) {
+            return Err("BPF_TASK_FD_QUERY on an event with a program failed");
+        }
+        if get_u32(&q, 24) != want_id {
+            return Err("BPF_TASK_FD_QUERY returned the wrong program id");
+        }
+        if get_u32(&q, 28) != 1 {
+            return Err("BPF_TASK_FD_QUERY did not report fd_type TRACEPOINT");
+        }
+
+        // Detach, and the event no longer carries a program.
+        let _ = call(
+            Syscall::Ioctl.raw(),
+            a2(ev as u64, PERF_EVENT_IOC_SET_BPF, u64::from(u32::MAX)),
+        );
+        let mut q = task_fd_query_attr(0, ev);
+        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(EOPNOTSUPP) {
+            return Err("query on an event with no program was not ENOTSUP");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(ev as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_task_fd_query_pos);
+
+fn smoke_abi_bpf_task_fd_query_neg() -> TestResult {
+    with_setup(|| {
+        // An fd that carries no BPF program (a fresh program fd is not a perf
+        // event) is ENOTSUP.
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        let mut q = task_fd_query_attr(0, prog_fd as u32);
+        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(EOPNOTSUPP) {
+            return Err("BPF_TASK_FD_QUERY on a non-perf fd was not ENOTSUP");
+        }
+        // A pid that is not this task is a cross-task query NARF does not do.
+        let mut q = task_fd_query_attr(0x7fff_0000, prog_fd as u32);
+        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(EOPNOTSUPP) {
+            return Err("BPF_TASK_FD_QUERY for another pid was not ENOTSUP");
+        }
+        // A nonzero flags is nonsense.
+        let mut q = task_fd_query_attr(0, prog_fd as u32);
+        put_u32(&mut q, 8, 1);
+        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(EINVAL) {
+            return Err("BPF_TASK_FD_QUERY with flags did not return EINVAL");
+        }
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_task_fd_query_neg);
+
 // ── PERF_EVENT_IOC_SET_BPF ──────────────────────────────────────────
 
 /// `_IOW('$', 8, __u32)`.

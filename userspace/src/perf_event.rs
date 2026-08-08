@@ -2009,6 +2009,24 @@ struct PerfMapping<'a> {
     filename: &'a str,
 }
 
+/// `enum { … } fd_type` for `BPF_TASK_FD_QUERY`. NARF's
+/// `PERF_EVENT_IOC_SET_BPF` attaches to tracepoint-shaped events, so a queried
+/// fd that has a program is a tracepoint.
+const BPF_FD_TYPE_TRACEPOINT: u32 = 1;
+
+/// For `BPF_TASK_FD_QUERY`: if `fd` in the current task is a perf event with a
+/// BPF program attached, report `(prog_id, fd_type)`.
+///
+/// The name buffer the query also carries comes back empty — NARF names its
+/// probes by id, not by string (see `sys_bpf_attach.rs`), so there is no
+/// tracepoint name to report. // LINUX-GAP: no tracepoint-name string.
+pub(crate) fn bpf_task_fd_query(fd: u32) -> Option<(u32, u32)> {
+    let ops = fd::with_table(current_task_id(), |t| t.get(fd).map(|e| e.ops.clone()))??;
+    let event = ops.as_any()?.downcast_ref::<PerfEventFile>()?;
+    let prog = event.bpf_prog.lock().clone()?;
+    Some((prog.id, BPF_FD_TYPE_TRACEPOINT))
+}
+
 /// Apply Linux `enable_on_exec` at the point a task commits a new image.
 ///
 /// Events are owned by the monitoring process but keyed by the target task,
