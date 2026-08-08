@@ -271,6 +271,11 @@ pub fn release_pid(pid: ProcessId) {
     if raw == 0 || raw > PID_MAX {
         return;
     }
+    // Invalidate every pid-KEYED cache before the number becomes
+    // re-mintable. `pidfd`'s table is one: it maps pid → shared exit
+    // state, and a row left behind hands the next occupant of this pid a
+    // state that already says `exited`. See `pidfd::forget_pid`.
+    pidfd::forget_pid(raw);
     let mut g = PID_POOL.lock();
     pid_pool_init_if_needed(&mut g);
     g.as_mut().expect("pool inited").insert(raw);
