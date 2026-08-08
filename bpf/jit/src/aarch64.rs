@@ -93,7 +93,7 @@
 //! div/mod), `MOV`, `LD_IMM64`, loads and stores through R10/R1, atomics, jumps,
 //! conditional jumps, `exit`, **kfunc calls**, and **BPF-to-BPF calls** (see
 //! [`emit_subprog_call`]). Left interpreted: the map/subprogram-address pseudo
-//! forms of `LD_IMM64`, the fetching bitwise atomics, and arena accesses in a
+//! forms of `LD_IMM64`, arena atomics, `may_goto`, and arena accesses in a
 //! program that also makes BPF-to-BPF calls. Everything unemitted returns
 //! [`JitError::Unsupported`] and runs interpreted, which is a complete
 //! implementation — so an unemitted instruction costs speed, not correctness.
@@ -1128,13 +1128,24 @@ fn emit_atomic(
         AtomicOp::StoreRelease => {
             e.w(sz_atomic(STLR, wide) | ((addr as u32) << 5) | s as u32);
         }
-        AtomicOp::Or { fetch: true }
-        | AtomicOp::And { fetch: true }
-        | AtomicOp::Xor { fetch: true } => {
-            return Err(JitError::Unsupported {
-                at,
-                what: "fetching bitwise atomic is left interpreted for backend parity",
-            })
+        // Fetching bitwise: the LSE fetch forms land the old value in IMM (or
+        // AHANDLE for AND, whose operand `~src` occupies IMM), then move it to
+        // the source register.
+        AtomicOp::Or { fetch: true } => {
+            rmw(e, LDSET_AL, hr::IMM);
+            e.w(mov_rr(wide, s, hr::IMM));
+        }
+        AtomicOp::Xor { fetch: true } => {
+            rmw(e, LDEOR_AL, hr::IMM);
+            e.w(mov_rr(wide, s, hr::IMM));
+        }
+        AtomicOp::And { fetch: true } => {
+            e.w(shifted_reg(ORN_X, wide, hr::IMM, hr::ZR, s)); // IMM = ~src
+            e.w(sz_atomic(LDCLR_AL, wide)
+                | ((hr::IMM as u32) << 16)
+                | ((addr as u32) << 5)
+                | hr::AHANDLE as u32); // AHANDLE = old
+            e.w(mov_rr(wide, s, hr::AHANDLE));
         }
     }
     Ok(())

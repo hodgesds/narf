@@ -719,6 +719,49 @@ fn a64_golden_atomics() {
 }
 
 #[test]
+fn a64_golden_fetching_bitwise_atomics() {
+    // The LSE fetch forms, dst = R10 (FP = x25), src = R6 (x19), off = 0. OR and
+    // XOR route the old value through x16; AND is `MVN` of the operand into x16
+    // then `LDCLRAL` with the old value in x9 (x16 is taken by the operand).
+    a64_body(
+        &[
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Or { fetch: true },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Xor { fetch: true },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::And { fetch: true },
+                dst: r(10),
+                src: r(6),
+                off: 0,
+            },
+            EXIT,
+        ],
+        &[
+            0xf8f3_3330, // ldsetal x19, x16, [x25]
+            0xaa10_03f3, // mov     x19, x16
+            0xf8f3_2330, // ldeoral x19, x16, [x25]
+            0xaa10_03f3, // mov     x19, x16
+            0xaa33_03f0, // mvn     x16, x19
+            0xf8f0_1329, // ldclral x16, x9, [x25]
+            0xaa09_03f3, // mov     x19, x9
+            0x1400_0001,
+        ],
+    );
+}
+
+#[test]
 fn a64_golden_far_displacement_folds_into_the_address_register() {
     // `LDUR`'s `simm9` reaches ±256. Beyond that the displacement is folded
     // into `x17` and the access uses a zero displacement — reusing the one
@@ -1025,16 +1068,10 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
     // being emitted.
     let cases: [(&str, Decoded); 2] = [
         (
-            // A fetching bitwise atomic stays interpreted on both backends, for
-            // parity with x86-64 (which would need a cmpxchg loop).
-            "fetching-bitwise-atomic",
-            Decoded::Atomic {
-                size: Size::Dw,
-                op: narf_bpf_isa::AtomicOp::Or { fetch: true },
-                dst: r(10),
-                src: r(1),
-                off: -8,
-            },
+            // `may_goto` carries a hidden loop counter the emitter does not
+            // model (it is separate from fuel), so it stays interpreted.
+            "may_goto",
+            Decoded::MayGoto { off: -1 },
         ),
         (
             // The plain-value LD_IMM64 is now emitted; a map pseudo-form is not,

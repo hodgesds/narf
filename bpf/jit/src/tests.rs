@@ -807,17 +807,33 @@ fn a_map_pseudo_ld_imm64_is_refused() {
 }
 
 #[test]
-fn a_fetching_bitwise_atomic_is_refused_on_x86() {
-    // x86 has no atomic fetch-and-{or,and,xor}; it would need a cmpxchg loop, so
-    // the emitter refuses it and the program runs interpreted.
+fn a_fetching_bitwise_atomic_is_a_cmpxchg_loop() {
+    // x86 has no atomic fetch-and-{or,and,xor}, so a fetch-OR of R6 (rbx) into
+    // [rbp-8] is a cmpxchg retry loop: the operand is captured in rcx, rax reads
+    // the current value, and the loop retries until the exchange sticks. R0
+    // (rax) is saved and the fetched value carried out through r11.
     let prog = verified(&[
         atomic(Size::Dw, AtomicOp::Or { fetch: true }, 6, -8),
         mov(0, 0),
         EXIT,
     ]);
-    assert!(
-        matches!(compile(&prog), Err(JitError::Unsupported { .. })),
-        "a fetching bitwise atomic must be refused, not mis-emitted"
+    let c = compile(&prog).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..29],
+        &[
+            0x50, // push rax
+            0x48, 0x89, 0xD9, // mov rcx, rbx        (operand, before rax is clobbered)
+            0x48, 0x8B, 0x45, 0xF8, // mov rax, [rbp-8]    (initial comparand)
+            0x49, 0x89, 0xC3, // mov r11, rax        (retry:)
+            0x49, 0x09, 0xCB, // or  r11, rcx
+            0xF0, 0x4C, 0x0F, 0xB1, 0x5D, 0xF8, // lock cmpxchg [rbp-8], r11
+            0x75, 0xF2, // jnz retry (-14)
+            0x49, 0x89, 0xC3, // mov r11, rax        (fetched old)
+            0x58, // pop rax
+            0x4C, 0x89, 0xDB, // mov rbx, r11
+        ],
+        "a fetching bitwise atomic must be a cmpxchg loop"
     );
 }
 

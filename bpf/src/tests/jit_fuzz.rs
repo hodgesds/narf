@@ -38,10 +38,10 @@
 //!   to a move — see [`neutralise_dead_calls`].
 //!
 //! The instruction *repertoire* is deliberately exactly what the backends
-//! lower: a shape neither backend emits (a map pseudo-form `LD_IMM64`, the
-//! fetching bitwise atomics, arena atomics) would make every program containing
-//! it fall back, and a fuzzer whose subjects fall back is a fuzzer comparing the
-//! interpreter with itself.
+//! lower: a shape neither backend emits (a map pseudo-form `LD_IMM64`, arena
+//! atomics, `may_goto`) would make every program containing it fall back, and a
+//! fuzzer whose subjects fall back is a fuzzer comparing the interpreter with
+//! itself.
 //!
 //! The plain-value `LD_IMM64` *is* lowered but is still not generated here: it
 //! is a two-slot instruction, and this generator's jump arithmetic is in
@@ -585,19 +585,23 @@ fn divmod_insn(rng: &mut Rng, wide: bool, dst: u8, src: Source) -> Decoded {
 
 /// One atomic operation both backends lower. `src` is the store/operand
 /// register; `Cmpxchg` is only offered when it is not R0, which would alias
-/// aarch64 `CASAL`'s `Rs`/`Rt` and be refused. The fetching bitwise forms are
-/// deliberately absent — x86-64 has no single instruction for them.
+/// aarch64 `CASAL`'s `Rs`/`Rt` and be refused. Every other form — including the
+/// fetching bitwise ones (an x86 cmpxchg loop, an aarch64 LSE fetch) — is
+/// generated.
 fn pick_atomic_op(rng: &mut Rng, src: u8) -> AtomicOp {
     loop {
-        match rng.below(9) {
+        match rng.below(12) {
             0 => return AtomicOp::Add { fetch: false },
             1 => return AtomicOp::Add { fetch: true },
             2 => return AtomicOp::Or { fetch: false },
-            3 => return AtomicOp::And { fetch: false },
-            4 => return AtomicOp::Xor { fetch: false },
-            5 => return AtomicOp::Xchg,
-            6 => return AtomicOp::LoadAcquire,
-            7 => return AtomicOp::StoreRelease,
+            3 => return AtomicOp::Or { fetch: true },
+            4 => return AtomicOp::And { fetch: false },
+            5 => return AtomicOp::And { fetch: true },
+            6 => return AtomicOp::Xor { fetch: false },
+            7 => return AtomicOp::Xor { fetch: true },
+            8 => return AtomicOp::Xchg,
+            9 => return AtomicOp::LoadAcquire,
+            10 => return AtomicOp::StoreRelease,
             _ if src != 0 => return AtomicOp::Cmpxchg,
             _ => {}
         }
@@ -1479,33 +1483,19 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
     if !narf_bpf_jit::has_backend() {
         return TestResult::Skip(NO_BACKEND);
     }
-    // A fetching bitwise atomic is the one shape that still both verifies
-    // through the real loader *and* falls back: x86-64 would need a cmpxchg loop
-    // for it, so it stays interpreted, and aarch64 leaves it for parity. (The
-    // multiply, atomic, LD_IMM64 and BPF-to-BPF-call probes that once lived here
-    // are all lowered now; the remaining unlowered shapes — map pseudo-form
-    // LD_IMM64, arena atomics — do not verify without maps or an arena to set
-    // up, so they cannot serve as probes here.)
+    // `may_goto` is the durable shape that still both verifies through the real
+    // loader *and* falls back: the JIT refuses it (its hidden loop counter is
+    // separate from fuel), while the verifier treats it as a branch. (The
+    // multiply, atomic, LD_IMM64, BPF-to-BPF-call and fetching-bitwise-atomic
+    // probes that once lived here are all lowered now; the remaining unlowered
+    // *instruction* shapes — map pseudo-form LD_IMM64, arena atomics — do not
+    // verify without maps or an arena to set up.)
     let cases: [(&str, Vec<Decoded>); 1] = [(
-        "atomic-fetch-or",
+        "may_goto",
         alloc::vec![
-            super::mov_imm(1, 7),
-            Decoded::Store {
-                size: Size::Dw,
-                dst: r(10),
-                off: -8,
-                src: Source::Imm(0),
-            },
-            Decoded::Atomic {
-                size: Size::Dw,
-                op: AtomicOp::Or { fetch: true },
-                dst: r(10),
-                src: r(1),
-                off: -8,
-            },
-            // R0 must be defined at exit, or the verifier rejects the probe
-            // before it can be evidence about the backends.
             super::mov_imm(0, 0),
+            super::alu_imm(AluOp::Add, 0, 1),
+            Decoded::MayGoto { off: -2 },
             Decoded::Exit,
         ],
     )];

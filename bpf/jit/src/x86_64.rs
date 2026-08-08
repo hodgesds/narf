@@ -58,10 +58,10 @@
 //! the interpreter's `push_frame`.
 //!
 //! What is left interpreted: the map and subprogram-address pseudo-forms of
-//! `LD_IMM64` (they resolve to addresses this pass does not have), the fetching
-//! bitwise atomics (no single x86 instruction), and arena accesses in a program
-//! that also makes BPF-to-BPF calls (the call frame moves `rsp`, which the arena
-//! base is parked relative to). Everything unemitted returns
+//! `LD_IMM64` (they resolve to addresses this pass does not have), arena atomics,
+//! `may_goto`, and arena accesses in a program that also makes BPF-to-BPF calls
+//! (the call frame moves `rsp`, which the arena base is parked relative to).
+//! Everything unemitted returns
 //! [`JitError::Unsupported`], which the caller answers by interpreting — the
 //! interpreter is a complete implementation, so an unemitted instruction costs
 //! speed and not correctness. That is the property that makes it safe to grow
@@ -544,7 +544,7 @@ fn emit_div_mod(e: &mut Emit, wide: bool, signed: bool, want_rem: bool, dst: u8,
 /// pins that boundary. Every other form is one instruction.
 fn emit_atomic(
     e: &mut Emit,
-    at: u32,
+    _at: u32,
     size: Size,
     op: AtomicOp,
     dst: Reg,
@@ -602,17 +602,51 @@ fn emit_atomic(
             e.b(0x89);
             e.modrm_mem(s, m, disp);
         }
-        AtomicOp::Or { fetch: true }
-        | AtomicOp::And { fetch: true }
-        | AtomicOp::Xor { fetch: true } => {
-            return Err(JitError::Unsupported {
-                at,
-                what:
-                    "fetching bitwise atomic needs a cmpxchg loop the x86_64 backend does not emit",
-            })
-        }
+        // x86 has no atomic fetch-and-{or,and,xor}; a cmpxchg retry loop stands
+        // in. The group-1 opcode is the `op r/m, r` form, the same table
+        // `alu_forms` draws from.
+        AtomicOp::Or { fetch: true } => emit_atomic_fetch_bitwise(e, wide, 0x09, m, disp, s),
+        AtomicOp::And { fetch: true } => emit_atomic_fetch_bitwise(e, wide, 0x21, m, disp, s),
+        AtomicOp::Xor { fetch: true } => emit_atomic_fetch_bitwise(e, wide, 0x31, m, disp, s),
     }
     Ok(())
+}
+
+/// A fetching bitwise atomic — `src = *m; *m op= <old value of src>` — as a
+/// `cmpxchg` retry loop, x86 having no single instruction for it.
+///
+/// `rax` is `cmpxchg`'s comparand and result, so R0 is pushed and restored; the
+/// operand is captured into `rcx` *before* `rax` is loaded, because `src` may be
+/// R0. `r11` holds the candidate new value inside the loop and then carries the
+/// fetched old value out past the `pop`. In this kernel's single-threaded atomic
+/// context the loop runs once, but the `lock cmpxchg` keeps it correct if the
+/// line is contended.
+fn emit_atomic_fetch_bitwise(e: &mut Emit, wide: bool, opcode: u8, m: u8, disp: i32, s: u8) {
+    e.b(0x50); // push rax
+    mov_rr(e, wide, hr::RCX, s); // rcx = operand (before rax is clobbered)
+                                 // rax = *m — the initial comparand.
+    e.rex(wide, hr::RAX, m);
+    e.b(0x8B);
+    e.modrm_mem(hr::RAX, m, disp);
+    let retry = e.len();
+    mov_rr(e, wide, hr::R11, hr::RAX); // r11 = old
+    alu_rr(e, wide, opcode, hr::R11, hr::RCX); // r11 = old op operand
+                                               // lock cmpxchg [m], r11 — on equal stores r11 and sets ZF; else reloads rax.
+    e.b(0xF0);
+    e.rex(wide, hr::R11, m);
+    e.bs(&[0x0F, 0xB1]);
+    e.modrm_mem(hr::R11, m, disp);
+    // jnz retry
+    e.b(0x75);
+    let back = retry as i64 - (e.len() as i64 + 1);
+    debug_assert!(
+        (-128..=127).contains(&back),
+        "cmpxchg loop out of rel8 reach"
+    );
+    e.b(back as i8 as u8);
+    mov_rr(e, wide, hr::R11, hr::RAX); // r11 = old (fetched), survives the pop
+    e.b(0x58); // pop rax
+    mov_rr(e, wide, s, hr::R11); // src = old
 }
 
 const fn cond_cc(op: CondOp) -> u8 {
