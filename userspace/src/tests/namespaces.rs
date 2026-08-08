@@ -1527,7 +1527,7 @@ fn smoke_user_ns_dac_no_host_root_escape() -> TestResult {
         gid: 0,
         perms: 0o600,
     };
-    if posix_access_ok(host_shadow, acc, rd) {
+    if posix_access_ok(host_shadow, &acc, rd) {
         return TestResult::Fail("SECURITY: in-ns root read a host-root 0600 file");
     }
     // A file owned by the mapped outer uid (1000) at 0600 IS readable.
@@ -1536,7 +1536,7 @@ fn smoke_user_ns_dac_no_host_root_escape() -> TestResult {
         gid: 1000,
         perms: 0o600,
     };
-    if !posix_access_ok(owned, acc, rd) {
+    if !posix_access_ok(owned, &acc, rd) {
         return TestResult::Fail("in-ns root denied its own (mapped) file");
     }
 
@@ -1557,7 +1557,7 @@ fn smoke_user_ns_dac_no_host_root_escape() -> TestResult {
     crate::handlers::__test_set_fsids(task2, 0, 0);
     crate::namespaces::setns_user(task2, priv_ns);
     let acc2 = crate::handlers::__test_current_accessor(task2);
-    if acc2.uid != 0 || !posix_access_ok(host_shadow, acc2, rd) {
+    if acc2.uid != 0 || !posix_access_ok(host_shadow, &acc2, rd) {
         return TestResult::Fail("inner-0→host-0 mapping failed to grant host root");
     }
 
