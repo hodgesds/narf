@@ -56,7 +56,10 @@ impl FileOps for EventFd {
                 let mut cur = self.counter.load(Ordering::Acquire);
                 loop {
                     if cur == 0 {
-                        return Ok(0);
+                        // Linux fs/eventfd.c::eventfd_read — a zero counter is
+                        // -EAGAIN, never 0. Ok(0) here would read as EOF to any
+                        // consumer that did not also consult an opt-in.
+                        return Err(FsError::WouldBlock);
                     }
                     match self.counter.compare_exchange_weak(
                         cur,
@@ -71,7 +74,7 @@ impl FileOps for EventFd {
             } else {
                 let cur = self.counter.swap(0, Ordering::AcqRel);
                 if cur == 0 {
-                    return Ok(0);
+                    return Err(FsError::WouldBlock);
                 }
                 (cur, cur >= u64::MAX - 1)
             };
@@ -317,7 +320,9 @@ impl FileOps for TimerFd {
             self.tick();
             let mut s = self.state.lock();
             if s.expirations == 0 {
-                return Ok(0);
+                // Linux fs/timerfd.c::timerfd_read — an unexpired timer is
+                // -EAGAIN, never 0.
+                return Err(FsError::WouldBlock);
             }
             if buf.len() < 8 {
                 return Err(FsError::InvalidPath);
@@ -427,7 +432,9 @@ impl FileOps for SignalFd {
         Box::pin(async move {
             let pending = self.pending_in_mask();
             if pending == 0 {
-                return Ok(0);
+                // Linux fs/signalfd.c::signalfd_read — no pending signal is
+                // -EAGAIN, never 0.
+                return Err(FsError::WouldBlock);
             }
             // Drain the lowest pending bit. signalfd_siginfo is
             // 128 bytes; we fill only the first 4 (ssi_signo) and

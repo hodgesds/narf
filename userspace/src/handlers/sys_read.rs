@@ -144,7 +144,10 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
                     advance(n);
                     Ok((n, false, false))
                 }
-                // Empty / would-block ⇒ EAGAIN.
+                // Empty / would-block ⇒ EAGAIN. `WouldBlock` is the explicit
+                // signal; the bare `Ok(0)` arm covers file ops not yet
+                // converted to it.
+                Some(Err(narf_filesystem::FsError::WouldBlock)) => Err(ReadError::Again),
                 Some(Ok(_)) | None => Err(ReadError::Again),
                 Some(Err(narf_filesystem::FsError::BadFd)) => Err(ReadError::BadFd),
                 Some(Err(_)) => Err(ReadError::Other),
@@ -177,6 +180,18 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
                 let input_block = n == 0 && !nonblock && entry.block_on_input();
                 advance(n);
                 Ok((n, should_block, input_block))
+            }
+            // The explicit would-block signal, matching what Linux's file ops
+            // return directly (`-EAGAIN` from eventfd_read / pipe_read / …).
+            // O_NONBLOCK ⇒ EAGAIN; otherwise park, exactly as the `Ok(0)` +
+            // `read_should_block()` pair above does, but without relying on a
+            // consumer remembering to ask the second question.
+            Err(narf_filesystem::FsError::WouldBlock) => {
+                if nonblock {
+                    Err(ReadError::Again)
+                } else {
+                    Ok((0, true, entry.block_on_input()))
+                }
             }
             Err(narf_filesystem::FsError::BadFd) => Err(ReadError::BadFd),
             Err(_) => Err(ReadError::Other),
