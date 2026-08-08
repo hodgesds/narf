@@ -351,7 +351,20 @@ fi
 # user-runtime-dir@1000.service, which creates /run/user/1000 — where the
 # manager publishes the session bus the session then connects to.
 #
-# Qt's QML JIT is ENABLED (no QV4_FORCE_INTERPRETER / QT_ENABLE_REGEXP_JIT).
+# Qt's QML JIT is DISABLED. 7b6ab22b turned it on, reasoning that mprotect's
+# W^X arm returns NeedsCapJit and jit_cap_default_policy() grants a JitCap by
+# default, so the RW->RX flip no longer EINVALs. That reasoning was never
+# validated and it is wrong about which transition Qt asks for: JavaScriptCore's
+# ExecutableAllocator wants a W|X END STATE, and mprotect_core refuses that
+# outright for ANY task -- the cap gates the flip, and "nothing grants a W|X end
+# state". Measured consequence:
+#   kwin_wayland_wrapper: mprotect failed in ExecutableAllocator::makeWritable:
+#                         Invalid argument
+#   fatal-fault: comm=plasma-keyboard sig=11 #PF faultva=10 rax=0
+# i.e. the allocator returns NULL and the input method segfaults dereferencing
+# it. Do not re-enable without first running an A/B that shows plasma-keyboard
+# surviving; NARF's W^X refusal is a deliberate design position, not an
+# oversight to route around.
 # Those were set when the RW->RX flip returned EINVAL, but the kernel now
 # implements it: mprotect's W^X arm returns WxTransition::NeedsCapJit, and
 # `jit_cap_default_policy` GRANTS a JitCap by default (memory/src/wx.rs) —
@@ -387,6 +400,8 @@ printf '%s\n' \
   'Environment=KWIN_COMPOSE=Q' \
   'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \
   'Environment=LIBGL_ALWAYS_SOFTWARE=1' \
+  'Environment=QV4_FORCE_INTERPRETER=1' \
+  'Environment=QT_ENABLE_REGEXP_JIT=0' \
   'Environment=GALLIUM_DRIVER=llvmpipe' \
   'Environment=MESA_LOADER_DRIVER_OVERRIDE=kms_swrast' \
   'RuntimeDirectory=narf-plasma' \
