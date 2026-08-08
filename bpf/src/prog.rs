@@ -384,6 +384,13 @@ impl BpfProg {
     /// counter, so depth N+1 loses its invocation rather than corrupting the
     /// frame below it.
     pub fn run_atomic(&self, ctx: [u64; MAX_CTX_WORDS], ctx_len: usize) -> Option<Outcome> {
+        // Confine the whole run to the BPF hardware domain: a verifier or JIT
+        // escape that stores into another subsystem's domain (the cap table, the
+        // scheduler, a driver) takes a protection-key fault rather than
+        // corrupting it. FRAME stays reachable, so the interpreter's own stack,
+        // the kfunc shims, the maps on the heap, and the fault handler all keep
+        // working. A no-op unless the PKS backend is live. See `crate::domain`.
+        let _confined = crate::domain::enter();
         if let Some(image) = self.jit.as_ref() {
             // The belt to `jit_glue`'s gate-2 brace, in the shape the lifted gate
             // needs. It used to read "native only if the program has no arena",

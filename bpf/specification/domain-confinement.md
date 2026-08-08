@@ -83,9 +83,13 @@ primitive**.
 
 - **In scope.** A verifier bug (a program that passes verification but performs
   an out-of-bounds or type-confused load/store) or a JIT-lowering bug. Today
-  either is an arbitrary Ring-0 read/write. Goal: reduce it to an
-  arbitrary read/write **confined to `DOMAIN_BPF`'s pkey**, i.e. the program's
-  own text/stack/maps/arena — never the Frame's cap table, never another domain.
+  either is an arbitrary Ring-0 read/write. Goal: reduce its blast radius to the
+  two domains the fence leaves open — **FRAME** (shared kernel infrastructure)
+  and **`DOMAIN_BPF`** — so a store into any *other* subsystem's domain (the
+  capability table in `CAPS`, the scheduler in `SCHED`, the driver domains)
+  takes a protection-key `#PF`. A subsystem's state is protected exactly insofar
+  as it lives in its own domain rather than in FRAME; the fence denies those
+  domains, and that protection strengthens as subsystem memory-tagging lands.
 - **Out of scope.** A bug in the *Frame* itself (kfunc shims, the run_atomic
   bracket, the domain manager). These are TCB and confinement cannot fence the
   fence. This is the same trust boundary drivers already sit behind.
@@ -95,20 +99,33 @@ primitive**.
 
 ## 4. Design
 
-### 4.1 `DOMAIN_BPF`: one pkey for the BPF runtime
+### 4.1 `DOMAIN_BPF` and the FRAME-stays-writable model
 
-Allocate one domain id for BPF (a driver-pool id, 1–14). Every frame the runtime
-touches as **data** is tagged with that pkey at map time:
+`DOMAIN_BPF` is a dedicated domain id (as built: `DomainId::BPF = 14`, taking the
+former `DRIVER_5` slot — the 16-key budget was full).
 
-- interpreter stack + reserve buffer,
-- arena frames (slot 275) — already the program's private memory,
-- map key/value backing (see the tension in §5),
-- JIT text as a *data* alias is writable today (`spec.md` §4.2); tag its
-  writable alias so a stray write from a confined program cannot self-modify.
-  (Execute is unaffected — PKS ignores fetch.)
+**FRAME (domain 0) stays read-*write* during confinement, not read-only.** A
+read-only FRAME was the first design and is wrong: the interpreter runs Rust in
+domain 0 and writes its own call stack, the kfunc shims write kernel state, and
+the `#PF` handler writes its stack — under a read-only FRAME the first of those
+faults, and the fault handler faults trying to handle it, cascading to a triple
+fault. So the fence is the framekernel's ordinary `enter_domain(FRAME, BPF)`:
+allow FRAME + BPF, deny the other fourteen domains.
 
-FRAME (domain 0) stays readable throughout, so kfunc shims and the run_atomic
-machinery keep full visibility.
+A consequence worth stating plainly: because FRAME stays writable, confinement
+does **not** protect FRAME/domain-0 memory (the general kernel heap) from a wild
+store — only the memory that other subsystems have tagged into *their own*
+domains. That is the correct framekernel shape (protection is per-domain, not
+per-privilege), and it means:
+
+- BPF's own memory — interpreter stack, maps on the heap, arena frames (slot
+  275), JIT text — can stay in FRAME and keep working with **no tagging
+  required** for the core fence. (This is why wiring the fence was non-breaking:
+  every page BPF touches today is FRAME.)
+- The isolation the fence buys today is BPF-from-every-other-subsystem-domain.
+  Optionally tagging BPF's private memory into `DOMAIN_BPF` is *hardening* (so a
+  confined driver cannot read a map/arena either); it is not needed for the
+  escape-containment property and is deferred.
 
 ### 4.2 The enter/exit seam is `run_atomic`
 
@@ -199,12 +216,13 @@ One confinement model, one trust tier.
 
 ### 7.3 Reads are mediated, and only off trusted pointers
 
-There is a confinement asymmetry to state plainly: FRAME (domain 0) must stay
-**readable** from `DOMAIN_BPF` — kfunc shims and the interpreter's own text live
-there — while **writes** to it are denied (cap-table protection, §3). So the
-fence stops an escaped *write* to core kernel but not an escaped *read* of
-domain-0 memory. The read-side info leak is therefore closed by *mediation plus
-the verifier*, not by the domain tag. Concretely:
+There is a confinement asymmetry to state plainly: FRAME (domain 0) stays fully
+**read-write** during confinement (§4.1) — the interpreter's stack, the kfunc
+shims, and the `#PF` handler all need it. So the fence stops escaped *reads and
+writes* into *other subsystems'* domains, but neither a read nor a write into
+FRAME/domain-0 memory itself. A read of core-kernel state (the info-leak class)
+is therefore closed by *mediation plus the verifier*, not by the domain tag.
+Concretely:
 
 - `narf_probe_read(dst, src: Trusted<Object>, offset, len)` runs its
   fault-recoverable copy in the FRAME shim (full visibility) into the program's
@@ -291,3 +309,30 @@ the fence is load-bearing.
    (the idle governor fires from the scheduler idle loop) before committing.
 4. **Cross-domain map sharing** (§5) — is a shared-read pkey worth a permanent
    slot, or is Frame-mediated copy always acceptable?
+
+## 11. As built
+
+The struct_ops consumer and the confinement fence have both landed on PKS.
+
+- **Domain.** `DomainId::BPF = 14` (`lib/src/id.rs`), taking the former
+  `DRIVER_5` slot; the dedicated-driver pool is now `DRIVER_0..=DRIVER_4` (cap 5).
+- **Fence.** `bpf/src/domain.rs`: `enter() -> Confined` calls
+  `pks::enter_domain(FRAME, BPF)` when the PKS backend is live and restores on
+  `Drop`; a no-op on AMD PCID / aarch64 MTE (deferred, §8). `BpfProg::run_atomic`
+  holds the guard across the whole run, so **both** the interpreter and the JIT
+  path are confined — feasible precisely because FRAME stays rw (§4.1).
+- **Non-breaking.** Every page BPF touches today is FRAME (arena/text are mapped
+  with no `pk()`), so no memory-tagging was needed and all runtime smokes pass
+  with the fence live under real PKS.
+- **Proof.** `smoke_bpf_domain_confines_cross_domain_writes` (`bpf`, x86_64):
+  under `crate::domain::enter()`, a store into a `SCHED`-tagged page takes a
+  PK-`#PF` (vector 14, error-code bit 5) while a store into a `BPF`-tagged page
+  succeeds — the fence is load-bearing. Runs under QEMU (PKS exposed), skips
+  where PKS is absent.
+
+Deferred from here: kfunc-shim behaviour is already correct (shims run in FRAME,
+which stays rw), so the "no-kfunc only" restriction §7 anticipated proved
+unnecessary. Remaining: subsystem memory-tagging (which turns the fence from
+"isolates BPF from other domains" into "protects the cap table", once
+`capabilities/` tags its table into `CAPS`), optional BPF-private-memory tagging
+into `DOMAIN_BPF` (hardening), and the AMD PCID / aarch64 MTE backends.

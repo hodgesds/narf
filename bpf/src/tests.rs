@@ -4289,3 +4289,139 @@ fn smoke_bpf_ringbuf_poll_readiness_tracks_data() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_bpf_ringbuf_poll_readiness_tracks_data);
+
+// ── hardware-domain confinement ──────────────────────────────────────
+
+/// The fence `run_atomic` runs programs behind: while confined to the BPF
+/// domain, a store into another subsystem's domain (here SCHED, a stand-in
+/// for the cap table / scheduler / a driver) takes a protection-key `#PF`,
+/// while a store into the BPF domain's own memory succeeds and FRAME stays
+/// reachable throughout. This is the hardware analogue of
+/// `smoke_bpf_interp_wild_load_traps_not_faults`: the proof that a verifier
+/// or JIT escape reaching outside the program's memory is contained rather
+/// than catastrophic. Mirrors `memory`'s `smoke_pks_enforces_deny_all`, but
+/// through `crate::domain::enter()` — the exact path `run_atomic` takes.
+#[cfg(target_arch = "x86_64")]
+fn smoke_bpf_domain_confines_cross_domain_writes() -> TestResult {
+    use core::arch::asm;
+    use narf_arch::x86_64::{probe, Features};
+    use narf_lib::id::DomainId;
+    use narf_memory::paging::{map_4kb, read_cr3, unmap_4kb, PtFlags};
+    use narf_memory::{alloc_frame, free_frame, FrameAllocError, VirtAddr};
+
+    // SAFETY: CPUID is always legal.
+    if !unsafe { Features::probe() }.pks {
+        return TestResult::Skip("PKS not exposed");
+    }
+
+    // SAFETY: the allocator is up and read_cr3 is always safe.
+    let pml4 = unsafe { read_cr3() };
+    let denied = match alloc_frame() {
+        Ok(f) => f,
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    let owned = match alloc_frame() {
+        Ok(f) => f,
+        Err(_) => {
+            free_frame(denied);
+            return TestResult::Fail("alloc_frame failed");
+        }
+    };
+
+    // Two 4 KiB leaves in the kernel PML4's empty user-reserved range (the
+    // same range memory/'s PKS smoke uses), distinct pages so they never
+    // collide with it: one tagged into a domain the BPF fence denies, one
+    // into the BPF domain it allows.
+    let denied_va = VirtAddr::new(0x0000_0102_0000_2000);
+    let owned_va = VirtAddr::new(0x0000_0102_0000_3000);
+    // SAFETY: live PML4 modification into an empty range.
+    let mapped = unsafe {
+        map_4kb(
+            pml4,
+            denied_va,
+            denied.start_address(),
+            PtFlags::WRITABLE | PtFlags::pk(DomainId::SCHED.raw()),
+        )
+        .and_then(|()| {
+            map_4kb(
+                pml4,
+                owned_va,
+                owned.start_address(),
+                PtFlags::WRITABLE | PtFlags::pk(DomainId::BPF.raw()),
+            )
+        })
+    };
+    if mapped.is_err() {
+        // SAFETY: undo whatever mapped; unmapping an absent VA is harmless.
+        unsafe {
+            let _ = unmap_4kb(pml4, denied_va);
+            let _ = unmap_4kb(pml4, owned_va);
+        }
+        free_frame(denied);
+        free_frame(owned);
+        return TestResult::Fail("map_4kb of a test page failed");
+    }
+
+    // Enter the fence. FRAME stays rw — our stack, the probe machinery, and
+    // the #PF handler all keep working — while SCHED is denied and BPF
+    // allowed.
+    let confined = crate::domain::enter();
+
+    // (1) A store into the denied (SCHED) domain must PK-fault.
+    let recover_a: u64;
+    // SAFETY: LEA of a local label.
+    unsafe {
+        asm!("lea {r}, [2f + rip]", r = out(reg) recover_a, options(nostack, preserves_flags));
+    }
+    probe::arm(recover_a);
+    // SAFETY: a store expected to fault; recovery lands at label 2.
+    unsafe {
+        asm!("mov byte ptr [{p}], 1", "2:", p = in(reg) denied_va.raw(), options(nostack));
+    }
+    let denied_caught = probe::disarm();
+
+    // (2) A store into the program's own (BPF) domain must succeed.
+    let recover_b: u64;
+    // SAFETY: LEA of a local label.
+    unsafe {
+        asm!("lea {r}, [3f + rip]", r = out(reg) recover_b, options(nostack, preserves_flags));
+    }
+    probe::arm(recover_b);
+    // SAFETY: a store expected to succeed; label 3 is the fall-through.
+    unsafe {
+        asm!("mov byte ptr [{p}], 1", "3:", p = in(reg) owned_va.raw(), options(nostack));
+    }
+    let owned_caught = probe::disarm();
+
+    // Leave the fence before touching denied memory again (the unmap below
+    // walks page tables in FRAME, but restoring is the honest bracket).
+    drop(confined);
+
+    // SAFETY: live PML4 modification.
+    unsafe {
+        let _ = unmap_4kb(pml4, denied_va);
+        let _ = unmap_4kb(pml4, owned_va);
+    }
+    free_frame(denied);
+    free_frame(owned);
+
+    match denied_caught.vector {
+        None => {
+            return TestResult::Fail("a store into a denied domain did not fault under the fence")
+        }
+        Some(14) => {}
+        Some(_) => return TestResult::Fail("wrong vector (not #PF) on the denied store"),
+    }
+    if denied_caught.error_code & (1 << 5) == 0 {
+        return TestResult::Fail("denied store faulted, but not with the PK bit (5) set");
+    }
+    if owned_caught.vector.is_some() {
+        return TestResult::Fail("a store into the BPF domain faulted under the fence");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bpf", smoke_bpf_domain_confines_cross_domain_writes);

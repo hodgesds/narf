@@ -68,16 +68,17 @@ pub fn __reset_for_test() {
 }
 
 /// Pre-populate with the standard driver-domain slots from
-/// `narf_lib::id::DomainId::DRIVER_0..=DRIVER_5`. Bring-up code can
-/// also pass concrete names ("net", "block", "graphics") so module
-/// authors don't have to memorise numbers. Idempotent.
+/// `narf_lib::id::DomainId::DRIVER_0..=DRIVER_4`, plus the BPF runtime's
+/// own domain. Bring-up code can also pass concrete names ("net",
+/// "block", "graphics") so module authors don't have to memorise
+/// numbers. Idempotent.
 pub fn install_standard_domains() {
     register_domain("driver0", DomainId::DRIVER_0);
     register_domain("driver1", DomainId::DRIVER_1);
     register_domain("driver2", DomainId::DRIVER_2);
     register_domain("driver3", DomainId::DRIVER_3);
     register_domain("driver4", DomainId::DRIVER_4);
-    register_domain("driver5", DomainId::DRIVER_5);
+    register_domain("bpf", DomainId::BPF);
     register_domain("scratch", DomainId::SCRATCH);
     // Named aliases for the common driver subsystems.
     register_domain("net", DomainId::DRIVER_0);
@@ -85,7 +86,6 @@ pub fn install_standard_domains() {
     register_domain("graphics", DomainId::DRIVER_2);
     register_domain("input", DomainId::DRIVER_3);
     register_domain("crypto", DomainId::DRIVER_4);
-    register_domain("misc", DomainId::DRIVER_5);
 }
 
 /// Resolve a domain name (from a manifest) to a DomainId, returning

@@ -1014,7 +1014,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             (DomainId::DRIVER_2, "DRIVER_2"),
             (DomainId::DRIVER_3, "DRIVER_3"),
             (DomainId::DRIVER_4, "DRIVER_4"),
-            (DomainId::DRIVER_5, "DRIVER_5"),
+            (DomainId::BPF, "BPF"),
             (DomainId::SCRATCH, "SCRATCH"),
         ];
         let _ = writeln!(

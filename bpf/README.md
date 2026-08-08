@@ -53,18 +53,20 @@ once the verifier exists, which it now does.
 
 ## Hardware confinement (design)
 
-BPF is the one Ring-0 subsystem that runs attacker-authored code, and today it is
-the one with no framekernel domain tag: a verifier escape is a full Ring-0
-primitive. The next layer confines the BPF runtime to its own PKS/MTE domain, so
-an escape is contained to `DOMAIN_BPF` instead of reaching the Frame's capability
-table or another domain — hardware defense-in-depth *under* the verifier. Because
-NARF BPF already reaches memory only through its own stack/ctx/maps/arena (no raw
-kernel deref, no `bpf_probe_read`), confinement costs the policy/struct_ops path
-nothing. Observability, if it ever lands, reads through a Frame-mediated
-`narf_probe_read` kfunc that accepts only verifier-tracked pointers — never a raw
-address — so the fence holds even for tracing.
+BPF is the one Ring-0 subsystem that runs attacker-authored code. Its own
+framekernel domain, `DomainId::BPF`, now confines it: `run_atomic` runs every
+program behind `enter_domain(FRAME, BPF)` on PKS silicon, so a verifier or JIT
+escape that stores into another subsystem's domain (the cap table, the scheduler,
+a driver) takes a protection-key fault instead of an arbitrary Ring-0 write —
+hardware defense-in-depth *under* the verifier. FRAME stays reachable, so the
+interpreter, the kfunc shims, and the fault handler keep working; the fence is a
+no-op on AMD PCID / aarch64 MTE (deferred). Because NARF BPF already reaches
+memory only through its own stack/ctx/maps/arena (no raw kernel deref, no
+`bpf_probe_read`), it cost the runtime nothing. Observability, if it ever lands,
+reads through a Frame-mediated `narf_probe_read` kfunc that accepts only
+verifier-tracked pointers — never a raw address — so the fence holds for tracing.
 
-Full design, threat model, the `run_atomic` enter/exit seam, the tracing read
-model, why BTF is not the path there, and the first milestone (a PKS-confined BPF
-idle governor as the first `struct_ops` consumer) are in
+Full design, threat model, the FRAME-stays-writable rationale, the tracing read
+model, why BTF is not the path there, and what remains (subsystem memory-tagging,
+the PCID/MTE backends) are in
 [`specification/domain-confinement.md`](specification/domain-confinement.md).

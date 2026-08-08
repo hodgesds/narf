@@ -348,8 +348,10 @@ impl DriverRegistry {
                     .iter()
                     .filter(|r| r.manifest.domain_policy == DomainPolicy::Dedicated)
                     .count();
-                // security-model/ §4.1 caps dedicated-domain drivers at 6.
-                if count >= 6 {
+                // security-model/ §4.1 caps dedicated-domain drivers at 5
+                // (DRIVER_0..=DRIVER_4; the former DRIVER_5 is now
+                // DomainId::BPF, the BPF runtime's confinement domain).
+                if count >= 5 {
                     return Err(RegistrationError::NoDomain);
                 }
                 DomainId::new((1 + count) as u8)

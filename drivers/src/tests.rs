@@ -338,22 +338,19 @@ fn smoke_drivers_dedicated_domain_exhaustion() -> TestResult {
         domain_policy: DomainPolicy::Dedicated,
         caps_required: &[],
     };
-    static M6: DriverManifest = DriverManifest {
-        name: "ded.6",
-        domain_policy: DomainPolicy::Dedicated,
-        caps_required: &[],
-    };
 
+    // The dedicated-domain pool is DRIVER_0..=DRIVER_4 (5 slots) since the
+    // former DRIVER_5 became DomainId::BPF. Five register; the sixth fails.
     let a = bootstrap_authority();
-    for m in [&M0, &M1, &M2, &M3, &M4, &M5].iter().copied() {
+    for m in [&M0, &M1, &M2, &M3, &M4].iter().copied() {
         if registry().register(&a, m, NoopDriver::new()).is_err() {
             return TestResult::Fail("dedicated-domain register failed before limit");
         }
     }
-    match registry().register(&a, &M6, NoopDriver::new()) {
+    match registry().register(&a, &M5, NoopDriver::new()) {
         Err(RegistrationError::NoDomain) => TestResult::Pass,
         Err(_) => TestResult::Fail("wrong error variant on domain exhaustion"),
-        Ok(_) => TestResult::Fail("7th dedicated-domain register accepted"),
+        Ok(_) => TestResult::Fail("6th dedicated-domain register accepted"),
     }
 }
 kernel_test_in!("drivers", smoke_drivers_dedicated_domain_exhaustion);
