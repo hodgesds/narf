@@ -236,10 +236,19 @@ fn smoke_pty_slave_icanon_blocks_until_newline() -> TestResult {
     // Write bytes without a newline.
     poll_once(master.write(0, b"partial"));
 
-    // Slave read with ICANON on should return 0 (no complete line yet).
+    // ICANON with no completed line yet is WOULD-BLOCK, not end-of-file.
+    // It used to answer Ok(0) and rely on `read_should_block()` to say which
+    // it meant; a shell handed that 0 concludes its stdin closed and exits the
+    // instant it starts. A real `^D` EOF still returns Ok(0) — covered by
+    // smoke_pty_slave_ctrl_d_returns_eof.
     let mut buf = [0u8; 16];
     let r = poll_once(slave.read(0, &mut buf));
-    if !matches!(r, Some(Ok(0))) {
+    if matches!(r, Some(Ok(0))) {
+        return TestResult::Fail(
+            "slave ICANON read returned EOF before newline — a shell exits on that",
+        );
+    }
+    if !matches!(r, Some(Err(FsError::WouldBlock))) {
         return TestResult::Fail("slave ICANON read returned bytes before newline");
     }
 
@@ -446,8 +455,11 @@ fn smoke_pty_ctrl_c_raises_fg_pgrp_signal() -> TestResult {
     // The ^C must not surface to the slave.
     let slave = PtySlave::new(pts_lookup(idx).expect("slave"));
     let mut buf = [0u8; 4];
+    // Consumed as a signal character ⇒ nothing left to read ⇒ would-block,
+    // NOT a 0 that the slave would read as end-of-file.
     let n = match poll_once(slave.read(0, &mut buf)) {
         Some(Ok(n)) => n,
+        Some(Err(FsError::WouldBlock)) => 0,
         _ => 99,
     };
 
@@ -890,16 +902,20 @@ fn smoke_pty_master_empty_read_is_would_block_not_eof() -> TestResult {
     let idx = master.index();
 
     // Nothing written yet: the master must report would-block, not EOF.
-    if !master.read_should_block() {
-        return TestResult::Fail(
-            "empty master read reports EOF — a terminal takes that as the shell \
-             exiting and stops reading (blank foot window)",
-        );
-    }
+    // Asserted on the READ ITSELF, not on a separate opt-in. The read used to
+    // answer Ok(0) and leave the classification to `read_should_block()`; a
+    // consumer that skipped that second question saw a phantom EOF, concluded
+    // the shell had exited, and stopped reading — the blank `foot` window.
     let mut buf = [0u8; 32];
     match poll_once(master.read(0, &mut buf)) {
-        Some(Ok(0)) => {}
-        _ => return TestResult::Fail("empty master read did not return 0 bytes"),
+        Some(Err(FsError::WouldBlock)) => {}
+        Some(Ok(0)) => {
+            return TestResult::Fail(
+                "empty master read returned 0 — a terminal takes that as the shell \
+                 exiting and stops reading (blank foot window)",
+            )
+        }
+        _ => return TestResult::Fail("empty master read did not report would-block"),
     }
 
     // Now the slave writes — as a shell's stdout does.

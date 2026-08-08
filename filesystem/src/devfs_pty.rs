@@ -952,6 +952,12 @@ impl FileOps for PtyMaster {
             // this whole predicate exists to avoid.
             return Box::pin(async move { Err(FsError::Io(narf_block::BlockError::IOError)) });
         }
+        // Empty and NOT hung up: would-block. Decided here rather than via a
+        // separate `read_should_block()` question, so the ring state that
+        // produced n == 0 is the same state that classifies it.
+        if n == 0 {
+            return Box::pin(async move { Err(FsError::WouldBlock) });
+        }
         Box::pin(async move { Ok(n) })
     }
 
@@ -1219,12 +1225,33 @@ impl FileOps for PtySlave {
     /// Linux ref: `n_tty.c n_tty_read` → canonical buffer drain.
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let mut state = self.pty.input.lock();
-        let n = if state.readable() == 0 {
-            state.take_eof();
-            0
-        } else {
-            state.drain_into(buf)
-        };
+        if state.readable() == 0 {
+            // The ONE PTY case where 0 is correct: canonical mode latches ^D
+            // as a genuine EOF a shell must see exactly once. `take_eof()`
+            // consumes that latch and reports it; anything else is "no
+            // completed line yet", which is would-block, not end-of-file.
+            // A hung-up master is also a real EOF (Linux `tty_read` /
+            // `tty_hung_up_p`).
+            let latched_eof = state.take_eof();
+            let hung_up = self.pty.master_closed.load(Ordering::Acquire);
+            drop(state);
+            return Box::pin(async move {
+                if latched_eof || hung_up {
+                    Ok(0)
+                } else {
+                    Err(FsError::WouldBlock)
+                }
+            });
+        }
+        let n = state.drain_into(buf);
+        drop(state);
+        // `readable() != 0` counts buffered bytes, but ICANON only RELEASES a
+        // completed line — an incomplete line, or input consumed as a signal
+        // character (^C), drains 0. That is would-block, not end-of-file; the
+        // readable()==0 branch above is the only place a real EOF originates.
+        if n == 0 {
+            return Box::pin(async move { Err(FsError::WouldBlock) });
+        }
         Box::pin(async move { Ok(n) })
     }
 

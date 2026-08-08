@@ -1745,8 +1745,11 @@ impl FileOps for SocketFile {
                             let _ = rx.take_delivered_packet_cred();
                             Ok(n)
                         }
+                        // Closed peer = real EOF; empty-but-open =
+                        // would-block. Linux `unix_seqpacket_recvmsg` /
+                        // `unix_dgram_recvmsg` return -EAGAIN for the latter.
                         None if rx.is_closed() => Ok(0),
-                        None => Ok(0),
+                        None => Err(FsError::WouldBlock),
                     };
                 }
             }
@@ -1760,7 +1763,11 @@ impl FileOps for SocketFile {
                     drop(self.unix_take_recv_fds());
                     Ok(n)
                 }
-                Err(SockError::WouldBlock) => Ok(0),
+                // do_recv ALREADY distinguishes empty-but-open from EOF;
+                // collapsing that to Ok(0) here threw the answer away and made
+                // the syscall layer re-derive it via read_should_block(). Pass
+                // it through, as Linux's socket recv paths do (-EAGAIN).
+                Err(SockError::WouldBlock) => Err(FsError::WouldBlock),
                 Err(_) => Err(FsError::Unsupported),
             }
         })

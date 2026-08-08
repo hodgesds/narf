@@ -317,10 +317,16 @@ impl FileOps for FifoHandle {
             let mut q = self.shared.queue.lock();
             let avail = q.len();
             if avail == 0 {
-                // Empty: EOF only once every writer has closed. Otherwise a
-                // 0-byte read means "try again" and the syscall layer parks
-                // (see `read_should_block`).
-                return Ok(0);
+                // Empty: EOF only once every writer has closed; otherwise
+                // would-block. Linux `fs/pipe.c::pipe_read` splits these as
+                // 0 vs -EAGAIN. Decided under the SAME lock that saw the
+                // empty queue, so a writer arriving concurrently cannot be
+                // mistaken for end-of-file.
+                return if self.shared.writers.load(Ordering::Acquire) == 0 {
+                    Ok(0)
+                } else {
+                    Err(FsError::WouldBlock)
+                };
             }
             let n = core::cmp::min(buf.len(), avail);
             for slot in buf.iter_mut().take(n) {

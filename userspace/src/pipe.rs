@@ -137,12 +137,22 @@ impl FileOps for PipeRead {
             let mut q = self.shared.queue.lock();
             let avail = q.len();
             if avail == 0 {
-                // Empty: distinguish "writer still open" (try again)
-                // from "writer gone" (EOF). Both surface as Ok(0)
-                // today; the harness's reader loops at most once
-                // here, and the test cases drive write-before-read
-                // so the buffer is non-empty by the time read fires.
-                return Ok(0);
+                // Empty: "writer still open" is would-block, "writer gone" is
+                // a real EOF. Linux `fs/pipe.c::pipe_read` makes exactly this
+                // split (-EAGAIN vs 0).
+                //
+                // Deciding it HERE, under the same lock that observed the
+                // empty queue, is what makes it race-free. The previous
+                // arrangement returned Ok(0) and let sys_read re-ask
+                // `read_should_block()` in a SEPARATE lock acquisition, so a
+                // writer landing in between could turn arrived data into a
+                // spurious EOF — the hook had to be deliberately conservative
+                // to compensate. One atomic decision removes the need.
+                return if self.shared.writer_closed.load(Ordering::Acquire) {
+                    Ok(0)
+                } else {
+                    Err(narf_filesystem::FsError::WouldBlock)
+                };
             }
             let n = core::cmp::min(buf.len(), avail);
             for slot in buf.iter_mut().take(n) {

@@ -58,6 +58,28 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         }
         let mut kbuf = alloc::vec![0u8; len];
         let res = poll_blocking(ops.read(cur, &mut kbuf)).unwrap_or(Ok(0));
+        // The explicit would-block signal. Same two outcomes as the `Ok(0)` +
+        // `read_should_block()` pair below, but stated by the file op itself
+        // instead of re-derived here — a consumer that forgets the second
+        // question turns "nothing yet" into EOF, which is the bug this
+        // conversion exists to make unrepresentable.
+        let res = match res {
+            Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
+                if nonblock {
+                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    return;
+                }
+                if park_reexecute_on_io(ctx) {
+                    return;
+                }
+                // No executor (kernel-test context): fall through as a dry read.
+                Ok(0)
+            }
+            // Bytes already gathered: stop here and report them, exactly as a
+            // short read would.
+            Err(narf_filesystem::FsError::WouldBlock) => break,
+            other => other,
+        };
         match res {
             Ok(0) if total == 0 => {
                 // Nothing read yet and the stream is dry. An open-but-empty
