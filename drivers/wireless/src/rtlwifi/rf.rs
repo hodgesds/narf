@@ -138,7 +138,7 @@ impl RfRow {
 pub unsafe fn write_rf_table(mmio: &MmioRegion, path: RfPath, table: &[RfRow]) {
     for row in table {
         if row.addr == 0xFE {
-            narf_time::busy_wait_cycles(50 * 1_000 * narf_time::cycles_per_ns().max(1) as u64);
+            narf_time::busy_wait_cycles(narf_time::ns_to_cycles(50 * 1_000));
             continue;
         }
         // SAFETY: forwarded.
@@ -147,7 +147,7 @@ pub unsafe fn write_rf_table(mmio: &MmioRegion, path: RfPath, table: &[RfRow]) {
         }
         // Linux always pauses 1 µs between RF writes.  Source:
         // `_rtl92ee_config_rf_reg` (`phy.c:281`).
-        narf_time::busy_wait_cycles(1_000 * narf_time::cycles_per_ns().max(1) as u64);
+        narf_time::busy_wait_cycles(narf_time::ns_to_cycles(1_000));
     }
 }
 
@@ -196,7 +196,7 @@ pub unsafe fn iq_calibrate(mmio: &MmioRegion, is_2t: bool) -> Result<IqkResult, 
     // wait for the 50 ms documented convergence window and return
     // zeros.  Once the parafile blob is in-tree this body grows the
     // actual chip-specific trigger writes.
-    narf_time::busy_wait_cycles(50 * 1_000_000 * narf_time::cycles_per_ns().max(1) as u64);
+    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(50 * 1_000_000));
 
     // SAFETY: caller-asserted.
     unsafe {
@@ -252,7 +252,7 @@ pub unsafe fn lc_calibrate(mmio: &MmioRegion, is_2t: bool) -> Result<(), RfError
     }
 
     // Wait 100 ms for the VCO LC-tank to settle.
-    narf_time::busy_wait_cycles(100 * 1_000_000 * narf_time::cycles_per_ns().max(1) as u64);
+    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(100 * 1_000_000));
 
     // Restore TX-pause state.
     if tmpreg & 0x70 != 0 {

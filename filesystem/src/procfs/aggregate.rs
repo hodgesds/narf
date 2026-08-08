@@ -694,8 +694,7 @@ fn gen_timer_list() -> Vec<u8> {
     } else {
         let _ = writeln!(s, " pending timers: {}", occupied);
         if let Some(next) = narf_time::timer_wheel::next_deadline_cycles() {
-            let cpns = narf_time::cycles_per_ns() as u64;
-            let next_ns = if cpns > 0 { next / cpns } else { next };
+            let next_ns = narf_time::cycles_to_ns(next);
             let _ = writeln!(s, " next deadline: {} nsecs", next_ns);
         }
     }

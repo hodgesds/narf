@@ -164,6 +164,17 @@ pub fn __test_cyc_to_ns_for_hz(hz: u64, cyc: u64) -> u64 {
     ((cyc as u128 * mult as u128) >> shift) as u64
 }
 
+/// Test-only mirror of [`__test_cyc_to_ns_for_hz`] for the ns→cycles
+/// direction, which is what every "wait N ns" / "deadline N ns from now"
+/// site converts. The LAPIC period is computed this way, so an error here
+/// is an error in the system tick rate itself.
+#[doc(hidden)]
+pub fn __test_ns_to_cyc_for_hz(hz: u64, ns: u64) -> u64 {
+    let khz = (hz.max(1) / 1_000).clamp(1, u32::MAX as u64) as u32;
+    let (mult, shift) = calc_mult_shift(1_000_000, khz, 0);
+    ((ns as u128 * mult as u128) >> shift) as u64
+}
+
 /// The calibrated cycles→ns fixed-point pair `(mult, shift)` such that
 /// `ns = (cyc * mult) >> shift` — the exact conversion [`cycles_to_ns`] and
 /// hence [`monotonic_ns`] use. Published into the vDSO vvar page so the
@@ -267,8 +278,22 @@ pub fn set_cycles_per_ns(cpns: u32) {
     set_clock_hz(cpns.max(1) as u64 * 1_000_000_000);
 }
 
-/// Read the calibrated cycles-per-ns. Returns ≥ 1 even before
-/// calibration so divides stay well-defined.
+/// Read the TRUNCATED integer cycles-per-ns.
+///
+/// **Do not use this for conversions.** It is `hz / 1e9` clamped to
+/// `1..=6`, so a 3.293 GHz TSC reads back as 3 — a 9.8% error. Every
+/// duration conversion must go through [`ns_to_cycles`] / [`cycles_to_ns`],
+/// which use the calibrated mult/shift pair and are exact to <1 ppm.
+///
+/// It survives only where a coarse scalar RATE is genuinely wanted: TCP
+/// congestion control stores one per epoch, and a couple of status lines
+/// print it. Both of those should move to the exact scale too.
+///
+/// This truncation has now caused the same bug three times: userspace's
+/// monotonic clock running 10-20% fast (fixed by publishing mult/shift to
+/// the vvar), a pure-deadline park never firing (fixed in `user_task`),
+/// and the LAPIC period being 9.8% long so every CPU ticked at ~1097 Hz
+/// against a requested 1000 Hz.
 #[inline]
 pub fn cycles_per_ns() -> u32 {
     CYCLES_PER_NS.load(Ordering::Relaxed).max(1)

@@ -1848,8 +1848,8 @@ impl core::future::Future for UserTaskFuture {
                     // net that bounds the worst case to ~one tick. sleep_pumps
                     // still run in the executor's own idle path every round.
                     const FALLBACK_NS: u64 = 10_000_000; // ~1 tick (100 Hz)
-                    let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
-                    let fallback_cycles = now.saturating_add(FALLBACK_NS).saturating_mul(cpns);
+                    let fallback_cycles =
+                        narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(FALLBACK_NS));
                     // `refresh_waker_at` — keep the slot's fire time current
                     // across parks that reuse this handle (a stale earlier
                     // deadline would pin the backstop; see park_should_block).
@@ -1881,7 +1881,7 @@ impl core::future::Future for UserTaskFuture {
                 // executor can round-robin other tasks / idle instead of
                 // re-polling us every 1ms. Register once; refresh across any
                 // spurious re-poll so we never leak a slot.
-                let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+
                 // Finite io-wait park: clamp the wheel fire to a ~10ms lost-wake
                 // backstop (same rationale as `park_fire_deadline_ns` in the
                 // own-stack path) so a lost cross-core io-wake self-heals in
@@ -1891,7 +1891,7 @@ impl core::future::Future for UserTaskFuture {
                     now,
                     this.task.uctx.net_io_wait.load(Ordering::Acquire),
                 );
-                let deadline_cycles = fire_ns.saturating_mul(cpns);
+                let deadline_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
                 // `refresh_waker_at` — see the infinite-park note above.
                 let refreshed = this.sleep_handle.is_some_and(|h| {
                     narf_scheduler::narf_time::timer_wheel::refresh_waker_at(

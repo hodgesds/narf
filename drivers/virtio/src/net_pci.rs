@@ -1538,7 +1538,7 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
     // poll-only queue stalled up to ~22 ms — the p99.9 tail. 2 ms caps that
     // at the same bound as the IRQ pair; a truly idle NIC still parks (it
     // just wakes to poll every 2 ms — negligible CPU).
-    let slow_poll_cycles = (narf_time::cycles_per_ns().max(1) as u64) * 2_000_000;
+    let slow_poll_cycles = narf_time::ns_to_cycles(2_000_000);
 
     // Core-partitioned RX placement. Under multi-queue with enough cores,
     // give each per-queue forwarder its OWN low CPU (pair K → CPU K, pair

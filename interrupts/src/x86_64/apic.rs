@@ -414,9 +414,13 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
         let feats = unsafe { narf_arch::x86_64::Features::probe() };
         if feats.tsc_deadline {
             // Period in TSC cycles for the requested IRQ rate.
-            let cpns = narf_time::wall::cycles_per_ns().max(1) as u64;
+            //
+            // `ns_to_cycles`, NOT `* cycles_per_ns()`. The latter was a
+            // TRUNCATED integer GHz clamped to 1..=6, so a 3.293 GHz TSC
+            // read back as 3 and the period came out ~9.8% long — every
+            // CPU ticking at ~1097 Hz against the 1000 Hz this asks for.
             let period_ns = 1_000_000_000u64 / hz as u64;
-            let period_cycles = period_ns.saturating_mul(cpns).max(1);
+            let period_cycles = narf_time::wall::ns_to_cycles(period_ns).max(1);
             // SAFETY: caller upholds exclusive LAPIC access; we
             // gated on CPUID for TSC-deadline support.
             // SAFETY: Valid memory or trusted environment

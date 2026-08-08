@@ -285,8 +285,7 @@ fn cycles_to_ms(cycles: u64) -> u64 {
     // degenerate "cpns = 1 because uncalibrated" case by leaving
     // the math as-is — pre-calibration the budget check just
     // doesn't fire usefully, which is the right behaviour.
-    let cpns = narf_time::cycles_per_ns().max(1) as u64;
-    cycles / cpns / 1_000_000
+    narf_time::cycles_to_ns(cycles) / 1_000_000
 }
 
 /// Run every initcall registered under `stage`. Each call's result

@@ -132,13 +132,10 @@ pub enum InitError {
 }
 
 fn deadline_cycles(ms: u64) -> u64 {
-    let cpns = narf_time::cycles_per_ns() as u64;
-    let cpms = if cpns == 0 {
-        1_000_000
-    } else {
-        cpns * 1_000_000
-    };
-    narf_time::now_cycles().saturating_add(cpms.saturating_mul(ms))
+    // `ns_to_cycles` is the calibrated fixed-point scale — 5 ms means
+    // 5 ms at the ACTUAL TSC rate, not at a truncated integer GHz, and
+    // it floors rather than collapsing to zero before calibration.
+    narf_time::now_cycles().saturating_add(narf_time::ns_to_cycles(ms.saturating_mul(1_000_000)))
 }
 
 fn wait_input_clear_ms(ms: u64) -> Result<(), InitError> {

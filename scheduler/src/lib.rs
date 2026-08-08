@@ -467,8 +467,7 @@ fn arm_idle_backstop_ms(ms: u64) {
     if p == 0 {
         return;
     }
-    let cpns = narf_time::cycles_per_ns().max(1) as u64;
-    let deadline = narf_time::now_cycles().wrapping_add(cpns.saturating_mul(ms * 1_000_000));
+    let deadline = narf_time::now_cycles().wrapping_add(narf_time::ns_to_cycles(ms * 1_000_000));
     // SAFETY: `p` was set by `set_idle_backstop_hook` from a `fn(u64)`.
     let f: fn(u64) = unsafe { core::mem::transmute::<usize, fn(u64)>(p) };
     f(deadline);
@@ -2084,7 +2083,7 @@ fn idle_wait(next_deadline: Option<u64>) {
     let t0 = narf_time::now_cycles();
     idle_wait_inner(next_deadline);
     let dt_cycles = narf_time::now_cycles().wrapping_sub(t0);
-    let ns = dt_cycles / (narf_time::cycles_per_ns().max(1) as u64);
+    let ns = narf_time::cycles_to_ns(dt_cycles);
     let cpu = narf_lib::percpu::current_cpu();
     if let Some(slot) = PERCPU_IDLE_NS.get(cpu) {
         slot.fetch_add(ns, Ordering::Relaxed);
@@ -2106,8 +2105,7 @@ fn idle_wait_inner(next_deadline: Option<u64>) {
     // sleeps fire on time, slow enough not to pin the loop body tighter
     // than necessary. Capped at the deadline so we never overshoot a wake.
     const IDLE_POLL_SLICE_NS: u64 = 1_000_000;
-    let cpns = narf_time::cycles_per_ns().max(1) as u64;
-    let mut slice = IDLE_POLL_SLICE_NS.saturating_mul(cpns);
+    let mut slice = narf_time::ns_to_cycles(IDLE_POLL_SLICE_NS);
     if let Some(deadline) = next_deadline {
         let now = narf_time::now_cycles();
         if now >= deadline {
@@ -2144,10 +2142,7 @@ pub fn run_until_empty() {
     // forcing a pump if one hasn't run in ~1 ms of wall time regardless of
     // how busy the queue stays. Normal request/response idles between rounds,
     // so the all-parked branch pumps every cycle and this never trips.
-    let pump_interval_cycles = {
-        let cpns = narf_time::cycles_per_ns().max(1) as u64;
-        1_000_000u64.saturating_mul(cpns) // ~1 ms
-    };
+    let pump_interval_cycles = narf_time::ns_to_cycles(1_000_000); // ~1 ms
     let mut last_pump_cycles = narf_time::now_cycles();
     // Adaptive halt-poll window (cycles), per the KVM `halt_poll_ns`
     // model. Grows when an idle spin catches a quick wake (a busy
@@ -2684,11 +2679,10 @@ pub fn run_until_empty() {
                 // reliable tick (KVM / TSC-deadline); the InitialCount fallback
                 // already busy-spins inside `idle_wait`.
                 if narf_time::tick_reliable() {
-                    let cpns = narf_time::cycles_per_ns().max(1) as u64;
                     // Window bounds: cap at 60µs (the measured PING-wake
                     // sweet spot), seed a grown window at 8µs.
-                    let max_poll = 60_000u64.saturating_mul(cpns);
-                    let grow_start = 8_000u64.saturating_mul(cpns);
+                    let max_poll = narf_time::ns_to_cycles(60_000);
+                    let grow_start = narf_time::ns_to_cycles(8_000);
                     let mut woke = false;
                     if halt_poll_cycles > 0 {
                         let spin_start = narf_time::now_cycles();

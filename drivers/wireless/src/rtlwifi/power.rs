@@ -214,10 +214,14 @@ pub unsafe fn run_pwrseq(
                 // same so the sequence remains synchronous on bring-up
                 // paths where the scheduler hasn't started yet.
                 let count = cfg.offset as u64;
-                let cpns = narf_time::cycles_per_ns().max(1) as u64;
+
                 let cycles = match cfg.value {
-                    PWRSEQ_DELAY_MS => count.saturating_mul(1_000_000).saturating_mul(cpns),
-                    _ /* PWRSEQ_DELAY_US */ => count.saturating_mul(1_000).saturating_mul(cpns),
+                    PWRSEQ_DELAY_MS => {
+                        narf_time::ns_to_cycles(count.saturating_mul(1_000_000))
+                    }
+                    _ /* PWRSEQ_DELAY_US */ => {
+                        narf_time::ns_to_cycles(count.saturating_mul(1_000))
+                    }
                 };
                 narf_time::busy_wait_cycles(cycles);
             }

@@ -2077,8 +2077,7 @@ fn linux_stat_from_fs(
         narf_filesystem::FileType::Fifo => 0o010000,
     };
     let mode_word: u32 = ftype_bits | (s.mode.perms as u32 & 0o7777);
-    let cpns = narf_time::cycles_per_ns().max(1) as u64;
-    let mtime_ns = s.mtime_cycles / cpns;
+    let mtime_ns = narf_time::cycles_to_ns(s.mtime_cycles);
     let mtime = linux_compat::Timespec {
         tv_sec: (mtime_ns / 1_000_000_000) as i64,
         tv_nsec: (mtime_ns % 1_000_000_000) as i64,

@@ -43,6 +43,41 @@ fn smoke_clock_scale_fixed_point_accuracy() -> TestResult {
 }
 kernel_test_in!("time", smoke_clock_scale_fixed_point_accuracy);
 
+/// The ns→cycles direction, which sets the system tick rate.
+///
+/// `arm_periodic` turns "1000 Hz" into a TSC-deadline period of
+/// `ns_to_cycles(1_000_000)`. It used to be `1_000_000 * cycles_per_ns()`,
+/// and `cycles_per_ns()` is a TRUNCATED integer GHz clamped to 1..=6 — so
+/// a 3.293 GHz TSC (a real measured value: `tsc: calibrated to 3293 MHz`)
+/// read back as 3 and the period came out 9.8% long. Every CPU on the
+/// machine then ticked slow against the rate the kernel believed it had
+/// asked for, and every ns→cycles deadline in the tree inherited the same
+/// skew.
+///
+/// The bound here is deliberately tight enough (1 ppm) that reverting to
+/// the integer form fails it: the truncated answer is 3_000_000 cycles
+/// against a correct 3_293_000, ~89000x the tolerance.
+fn smoke_clock_ns_to_cycles_fixed_point_accuracy() -> TestResult {
+    // 1 ms at 3.293 GHz = 3_293_000 cycles.
+    let cyc = crate::wall::__test_ns_to_cyc_for_hz(3_293_000_000, 1_000_000);
+    if cyc.abs_diff(3_293_000) > 4 {
+        return TestResult::Fail("3.293 GHz ns->cyc off by >1 ppm (truncated integer rate?)");
+    }
+    // Round-trip: ns -> cycles -> ns must return the input at 1 ppm.
+    let back = crate::wall::__test_cyc_to_ns_for_hz(3_293_000_000, cyc);
+    if back.abs_diff(1_000_000) > 1 {
+        return TestResult::Fail("ns->cyc->ns round-trip lost more than 1 ppm");
+    }
+    // A second non-integer rate, and a full second so any per-unit drift
+    // is 1e9x amplified: 2.397 GHz.
+    let cyc2 = crate::wall::__test_ns_to_cyc_for_hz(2_397_000_000, 1_000_000_000);
+    if cyc2.abs_diff(2_397_000_000) > 2_400 {
+        return TestResult::Fail("2.397 GHz ns->cyc off by >1 ppm");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_clock_ns_to_cycles_fixed_point_accuracy);
+
 // ── RTC backstops (CMOS / PL031 / Qualcomm PMIC) ──────────────────
 
 fn smoke_rtc_cmos_bcd_to_bin_and_back() -> TestResult {
