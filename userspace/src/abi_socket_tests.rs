@@ -864,6 +864,118 @@ kernel_test_in!(
     smoke_abi_socket_unix_listener_connect_wakes_parked_poller
 );
 
+/// A listening AF_UNIX socket watched through an epoll fd that is ITSELF
+/// polled — libwayland's shape. `wl_event_loop` owns an epoll containing
+/// the display socket and hands its fd to the toolkit's main loop, which
+/// `poll(2)`s it alongside everything else. So a client's `connect()` has
+/// to travel: listener → epoll ready-list → the outer `poll` over the
+/// epoll fd. A break anywhere on that chain looks identical from outside
+/// — the compositor simply never accepts.
+///
+/// Covers both trigger modes deliberately. Level-triggered is a plain
+/// "is the ready list non-empty" query; EPOLLET adds the edge bookkeeping
+/// (`last_mask` / `poll_edge_token`) that `EpollInstance::poll_readiness`
+/// has to mirror from `collect_ready`, and a listener's edge comes from
+/// `listener_readable_token`, which only the enqueue in `connect()`
+/// advances.
+fn smoke_abi_socket_listener_readable_through_nested_epoll() -> TestResult {
+    with_setup(|| {
+        for (label, et) in [("level", 0u32), ("edge", crate::epoll::EPOLLET)] {
+            let srv = open_unix_stream()?;
+            let (addr, alen) = unix_sockaddr(if et == 0 {
+                b"/abi-nested-epoll-lvl"
+            } else {
+                b"/abi-nested-epoll-et"
+            });
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(srv, addr.as_ptr() as u64, alen),
+            )
+            .ok_or("bind status")?
+                != 0
+            {
+                return Err("listener bind failed");
+            }
+            if call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0 {
+                return Err("listen failed");
+            }
+
+            let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+            if epfd < 0 {
+                return Err("epoll_create failed");
+            }
+            let epfd = epfd as u64;
+            let mut interest = [0u8; 12];
+            interest[..4].copy_from_slice(&(1u32 | et).to_ne_bytes()); // EPOLLIN [| EPOLLET]
+            interest[4..].copy_from_slice(&0x4C49_5354u64.to_ne_bytes());
+            if call(
+                Syscall::EpollCtl.raw(),
+                a3(epfd, 1, srv, interest.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("epoll_ctl ADD of the listener failed");
+            }
+
+            // pollfd { fd: epfd, events: POLLIN, revents: 0 }.
+            let mut pfd = [0u8; 8];
+            pfd[0..4].copy_from_slice(&(epfd as i32).to_ne_bytes());
+            pfd[4..6].copy_from_slice(&0x1u16.to_ne_bytes());
+
+            // Negative half: an idle listener must not make the epoll fd
+            // readable, or the outer loop spins on an epoll_wait that
+            // returns nothing.
+            if call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) != Some(0) {
+                return Err("idle listener made the nested epoll fd readable");
+            }
+
+            let cli = open_unix_stream()?;
+            if call(
+                Syscall::SocketConnect.raw(),
+                a2(cli, addr.as_ptr() as u64, alen),
+            )
+            .ok_or("connect status")?
+                != 0
+            {
+                return Err("client connect failed");
+            }
+
+            // The epoll fd must now be POLLIN to an outer poll(2)...
+            pfd[6..8].copy_from_slice(&0u16.to_ne_bytes());
+            match call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) {
+                Some(1) if u16::from_ne_bytes(pfd[6..8].try_into().unwrap()) & 0x1 != 0 => {}
+                _ => {
+                    return Err(if et == 0 {
+                        "pending connection did not make the nested epoll fd POLLIN (level)"
+                    } else {
+                        "pending connection did not make the nested epoll fd POLLIN (edge)"
+                    })
+                }
+            }
+            // ...and the epoll_wait the woken loop then runs must agree.
+            // Disagreement here is worse than a miss: the outer poll returns
+            // ready, epoll_wait returns nothing, and the loop spins hot.
+            if epoll_ready_now(epfd)? != 1 {
+                return Err(if et == 0 {
+                    "outer poll said ready but epoll_wait delivered no event (level)"
+                } else {
+                    "outer poll said ready but epoll_wait delivered no event (edge)"
+                });
+            }
+            // And the accept it then issues must produce the connection.
+            let conn = call(Syscall::SocketAccept.raw(), a0(srv)).ok_or("accept status")?;
+            if conn < 0 {
+                return Err("accept after the nested-epoll wake returned no connection");
+            }
+            let _ = label;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_listener_readable_through_nested_epoll
+);
+
 // ─────────────────────────── SocketShutdown ───────────────────────────
 
 fn smoke_abi_socket_shutdown_pos() -> TestResult {
