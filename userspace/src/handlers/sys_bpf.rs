@@ -70,10 +70,14 @@ const BPF_MAP_GET_FD_BY_ID: u32 = 14;
 const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
 const BPF_BTF_GET_FD_BY_ID: u32 = 19;
 const BPF_BTF_GET_NEXT_ID: u32 = 23;
-const BPF_LINK_GET_FD_BY_ID: u32 = 32;
-const BPF_LINK_GET_NEXT_ID: u32 = 33;
+const BPF_PROG_QUERY: u32 = 16;
 const BPF_LINK_CREATE: u32 = 28;
 const BPF_LINK_UPDATE: u32 = 29;
+// Linux numbers these 30/31 (an earlier draft had 32/33, which are actually
+// `BPF_ENABLE_STATS` and `BPF_ITER_CREATE`). Corrected so a libbpf loader's
+// `BPF_LINK_GET_*_BY_ID` reaches this handler and its iterator commands do not.
+const BPF_LINK_GET_FD_BY_ID: u32 = 30;
+const BPF_LINK_GET_NEXT_ID: u32 = 31;
 const BPF_LINK_DETACH: u32 = 34;
 const BPF_MAP_LOOKUP_BATCH: u32 = 24;
 const BPF_MAP_LOOKUP_AND_DELETE_BATCH: u32 = 25;
@@ -217,14 +221,15 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         BPF_LINK_CREATE => bpf_link_create(attr_uptr, size),
         BPF_LINK_UPDATE => bpf_link_update(attr_uptr, size),
         BPF_LINK_DETACH => bpf_link_detach(attr_uptr, size),
+        BPF_PROG_QUERY => bpf_prog_query(attr_uptr, size),
 
-        // LINUX-GAP: everything else — `BPF_PROG_QUERY`, `BPF_TASK_FD_QUERY`,
-        // the BPF token commands (`BPF_TOKEN_CREATE` — NARF has no token, and
-        // the privilege gate above is a credential check rather than a
-        // delegable one), and the iterator commands (`BPF_ITER_CREATE`, which
-        // needs a seq_file-shaped read surface no NARF fd provides). `ENOTSUP`
-        // rather than `EINVAL` so a probing loader can tell "this kernel does
-        // not do that" from "you passed nonsense".
+        // LINUX-GAP: everything else — `BPF_TASK_FD_QUERY`, the BPF token
+        // commands (`BPF_TOKEN_CREATE` — NARF has no token, and the privilege
+        // gate above is a credential check rather than a delegable one), and the
+        // iterator commands (`BPF_ITER_CREATE`, which needs a seq_file-shaped
+        // read surface no NARF fd provides). `ENOTSUP` rather than `EINVAL` so a
+        // probing loader can tell "this kernel does not do that" from "you
+        // passed nonsense".
         //
         // The batch element commands are NOT in that list any more:
         // `BPF_MAP_{LOOKUP,LOOKUP_AND_DELETE,UPDATE,DELETE}_BATCH` are
