@@ -529,8 +529,8 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recv_neg);
 // or recv on an empty-but-OPEN stream socket returned 0 (which the caller
 // reads as EOF / peer-hangup) instead of -EAGAIN. GLib's GDBus/GSocket poll
 // loop treated that phantom 0 as a hangup and the KDE session-bus handshake
-// (and libdbus's next marshalled message) desynced. `read_should_block()` is
-// true exactly while the peer is still open, so EOF (peer closed) stays 0.
+// (and libdbus's next marshalled message) desynced. The file op now returns
+// `WouldBlock` while the peer is open, so EOF (peer closed) stays 0.
 const SOCK_NONBLOCK: u64 = 0x800;
 const MSG_DONTWAIT: u64 = 0x40;
 

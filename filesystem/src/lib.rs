@@ -457,7 +457,7 @@ pub enum FsError {
     ///
     /// It replaces an older NARF convention where a file op signalled
     /// would-block as `Ok(0)` and declared it out-of-band via a
-    /// `read_should_block()` opt-in. That split was the bug factory: `Ok(0)`
+    /// separate opt-in. That split was the bug factory: `Ok(0)`
     /// IS end-of-file for every other file, so any consumer that did not also
     /// consult the opt-in silently converted "nothing yet" into "the fd
     /// closed". A spurious 0 of exactly this shape killed the KDE session bus
@@ -923,12 +923,6 @@ pub trait FileOps: Send + Sync {
     /// opened evdev fd's `st_rdev` against udev's MAJOR:MINOR.
     fn rdev(&self) -> u64 {
         0
-    }
-
-    /// True when a blocking read on this fd (a pipe with an open writer
-    /// and empty buffer) should park rather than return a spurious 0.
-    fn read_should_block(&self) -> bool {
-        false
     }
 
     /// True when a blocking write that made no progress (returned 0) should

@@ -68,7 +68,7 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
         // Kernel-test context: fall through and report the 0-byte copy.
     }
     match copy_fd_to_fd(task, fd_in, fd_out, off_in_ptr, len) {
-        Some(0) if len > 0 && in_is_pipe && in_ops.read_should_block() => {
+        Some(Err(narf_filesystem::FsError::WouldBlock)) if len > 0 && in_is_pipe => {
             // Empty pipe source, writer still open: an empty first read
             // consumes nothing, so EAGAIN or park+re-exec is safe
             // (`fs/splice.c::splice_file_to_pipe` waits via pipe_wait_*).
@@ -82,7 +82,7 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
             }
             ctx.set_return(SyscallReturn::ok(0));
         }
-        Some(total) => ctx.set_return(SyscallReturn::ok(total as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
+        Some(Ok(total)) => ctx.set_return(SyscallReturn::ok(total as u64)),
+        Some(Err(_)) | None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
     }
 }

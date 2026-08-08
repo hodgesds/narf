@@ -1085,7 +1085,14 @@ impl FileOps for DevConsole {
         // bytes + translated keys). fd 0/1/2's `ConsoleFile` reads the
         // exact same stream, so there is one console, one termios.
         let written = crate::console_tty::read_into(buf);
-        Box::pin(async move { Ok(written) })
+        let would_block = written == 0 && crate::console_tty::block_on_input();
+        Box::pin(async move {
+            if would_block {
+                Err(FsError::WouldBlock)
+            } else {
+                Ok(written)
+            }
+        })
     }
 
     /// Park an empty `/dev/console` read on the input waker rather than

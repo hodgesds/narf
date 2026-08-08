@@ -637,10 +637,8 @@ kernel_test_in!(
 /// loop, so a phantom EOF here is not a corner case — it is the shape of a
 /// desktop session spinning at 100% and never settling.
 ///
-/// Asserted on the opt-ins rather than the read's return value: the `Ok(0)`
-/// is correct at the FileOps layer; `sys_read` is what turns it into a park
-/// or an EAGAIN, and only when these are declared. Both directions are
-/// checked, since a version that always blocked would hang instead.
+/// Assert the read result itself: empty-but-open is `FsError::WouldBlock`,
+/// never an ambiguous `Ok(0)` that a syscall consumer could mistake for EOF.
 fn smoke_io_mux_empty_reads_are_not_eof() -> TestResult {
     use crate::io_mux::{EventFd, TimerFd};
     use narf_filesystem::FileOps;
@@ -650,13 +648,7 @@ fn smoke_io_mux_empty_reads_are_not_eof() -> TestResult {
     if !efd.nonblock_read_eagain() {
         return TestResult::Fail("eventfd does not opt into EAGAIN-on-empty");
     }
-    if !efd.read_should_block() {
-        return TestResult::Fail(
-            "eventfd with counter 0 reports EOF — an event loop takes that as its \
-             wakeup channel closing",
-        );
-    }
-    // A pending value must clear the block, or a woken reader parks forever.
+    // A pending value must make the next read complete.
     let mut eight = [0u8; 8];
     eight.copy_from_slice(&1u64.to_le_bytes());
     {
@@ -673,14 +665,24 @@ fn smoke_io_mux_empty_reads_are_not_eof() -> TestResult {
         // it is never dereferenced — the contract `Waker::from_raw` requires.
         let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
         let mut cx = Context::from_waker(&w);
+        let mut empty = [0u8; 8];
+        let mut empty_read = efd.read(0, &mut empty);
+        match empty_read.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(narf_filesystem::FsError::WouldBlock)) => {}
+            _ => return TestResult::Fail("empty eventfd read did not report would-block"),
+        }
+        drop(empty_read);
         let mut fut = efd.write(0, &eight);
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(Ok(8)) => {}
             _ => return TestResult::Fail("eventfd write failed"),
         }
-    }
-    if efd.read_should_block() {
-        return TestResult::Fail("eventfd still reports would-block with a value pending");
+        drop(fut);
+        let mut value_read = efd.read(0, &mut empty);
+        match value_read.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(8)) => {}
+            _ => return TestResult::Fail("eventfd value read did not complete"),
+        }
     }
 
     // ---- timerfd: never armed, so no expirations ----
@@ -688,11 +690,22 @@ fn smoke_io_mux_empty_reads_are_not_eof() -> TestResult {
     if !tfd.nonblock_read_eagain() {
         return TestResult::Fail("timerfd does not opt into EAGAIN-on-empty");
     }
-    if !tfd.read_should_block() {
-        return TestResult::Fail(
-            "unexpired timerfd reports EOF — the caller re-reads immediately and \
-             burns CPU (the 'libc loops until non-zero' spin)",
-        );
+    {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn nop(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VT)
+        }
+        static VT: RawWakerVTable = RawWakerVTable::new(clone, nop, nop, nop);
+        // SAFETY: every vtable entry ignores the null data pointer.
+        let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+        let mut cx = Context::from_waker(&w);
+        let mut empty = [0u8; 8];
+        let mut read = tfd.read(0, &mut empty);
+        match read.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(narf_filesystem::FsError::WouldBlock)) => {}
+            _ => return TestResult::Fail("unexpired timerfd read did not report would-block"),
+        }
     }
     TestResult::Pass
 }

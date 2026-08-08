@@ -952,39 +952,12 @@ impl FileOps for PtyMaster {
             // this whole predicate exists to avoid.
             return Box::pin(async move { Err(FsError::Io(narf_block::BlockError::IOError)) });
         }
-        // Empty and NOT hung up: would-block. Decided here rather than via a
-        // separate `read_should_block()` question, so the ring state that
-        // produced n == 0 is the same state that classifies it.
+        // Empty and NOT hung up: would-block. The ring state that produced
+        // n == 0 also classifies it, without a second syscall query.
         if n == 0 {
             return Box::pin(async move { Err(FsError::WouldBlock) });
         }
         Box::pin(async move { Ok(n) })
-    }
-
-    /// An empty master read must WAIT, never report end-of-file.
-    ///
-    /// `read()` returning 0 on a PTY master means the slave side hung up.
-    /// Returning it merely because the ring is momentarily empty hands the
-    /// terminal a phantom EOF: it concludes the shell exited and stops
-    /// reading forever. That is exactly what left the `foot` window blank —
-    /// a probe walking a terminal's own sequence showed every step
-    /// succeeding, the child shell exiting 0, and the master read coming
-    /// back `n=0 errno=0` before the child's output arrived.
-    ///
-    /// `sys_read` turns this into a park for a blocking fd and EAGAIN for an
-    /// O_NONBLOCK one — the same treatment pipes and sockets get, and the
-    /// same class of bug fixed there for GLib/dbus ("Unexpected lack of
-    /// content trying to read a line").
-    ///
-    /// Linux ref: `pty_read` sleeps on the read wait queue; a master read
-    /// only reports 0/EIO once the last slave closes.
-    fn read_should_block(&self) -> bool {
-        // ...but NOT once every slave has closed. That is a real hangup, and
-        // blocking through it is how a terminal wedges forever instead of
-        // seeing its shell exit: measured with the ptyspawn smoke, whose
-        // child failed to exec and left the parent's master read parked with
-        // no slave left in existence.
-        self.pty.slave_tx_to_master.len() == 0 && !self.pty.hung_up()
     }
 
     /// Write bytes to the slave's input — through the shared n_tty line
@@ -1253,29 +1226,6 @@ impl FileOps for PtySlave {
             return Box::pin(async move { Err(FsError::WouldBlock) });
         }
         Box::pin(async move { Ok(n) })
-    }
-
-    /// An empty slave read must WAIT — unless a `^D` EOF is latched.
-    ///
-    /// This is the one PTY case where a 0-byte read is sometimes CORRECT:
-    /// canonical mode latches `^D` as a genuine end-of-file that a shell
-    /// must see exactly once. But "no completed line yet" is NOT eof — a
-    /// reader handed 0 there concludes its input closed and exits, which is
-    /// how an interactive shell dies the instant it starts.
-    ///
-    /// `LineState::would_block()` already draws exactly that line ("no
-    /// completed input buffered AND no ^D pending"), so blocking is gated on
-    /// it rather than on `readable() == 0`. A latched EOF therefore still
-    /// returns 0 and is consumed by `take_eof()` above.
-    ///
-    /// Same class as pipe / PtyMaster / uinput / EventFd / TimerFd /
-    /// SignalFd, but the only one that must preserve a real EOF.
-    fn read_should_block(&self) -> bool {
-        // ...but never once the master has closed. Linux `tty_read` returns
-        // 0 for a hung-up tty (`tty_hung_up_p`), which is exactly how a
-        // shell whose terminal vanished sees EOF and exits. Blocking through
-        // it strands the shell forever.
-        self.pty.input.lock().would_block() && !self.pty.master_closed.load(Ordering::Acquire)
     }
 
     /// libc readers of a slave opened O_NONBLOCK expect EAGAIN on an empty

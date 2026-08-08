@@ -2874,7 +2874,7 @@ fn copy_fd_to_fd(
     out_fd: u32,
     in_off_ptr: u64,
     count: usize,
-) -> Option<usize> {
+) -> Option<Result<usize, narf_filesystem::FsError>> {
     let use_off_ptr = in_off_ptr != 0;
     let mut in_off: u64 = if use_off_ptr {
         // SAFETY: `in_off_ptr` is a user `off_t*` in-pointer; copy_from_user_vec
@@ -2889,21 +2889,32 @@ fn copy_fd_to_fd(
     const CHUNK: usize = 4096;
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
-        let kbuf: alloc::vec::Vec<u8> = fd::with_table(task, |t| {
+        let read_result: Result<alloc::vec::Vec<u8>, narf_filesystem::FsError> = fd::with_table(task, |t| {
             let entry = t.get_mut(in_fd)?;
             let off = if use_off_ptr { in_off } else { entry.offset };
             let mut kbuf = alloc::vec![0u8; want];
             let n = match poll_blocking(entry.ops.read(off, &mut kbuf)) {
                 Some(Ok(n)) => n,
-                _ => 0,
+                Some(Err(error)) => return Some(Err(error)),
+                None => 0,
             };
             kbuf.truncate(n);
             if !use_off_ptr {
                 entry.offset = off.saturating_add(n as u64);
             }
-            Some(kbuf)
+            Some(Ok(kbuf))
         })
         .flatten()?;
+        let kbuf = match read_result {
+            Ok(kbuf) => kbuf,
+            // A short copy is reported normally; only an initial would-block
+            // must reach splice so it can park or return EAGAIN instead of
+            // mistaking the empty pipe for EOF.
+            Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
+                return Some(Err(narf_filesystem::FsError::WouldBlock));
+            }
+            Err(_) => break,
+        };
         if kbuf.is_empty() {
             break; // EOF on in_fd
         }
@@ -2930,7 +2941,7 @@ fn copy_fd_to_fd(
         // range-validates the 8-byte write-back of the advanced offset.
         let _ = unsafe { copy_to_user(in_off_ptr, &in_off.to_ne_bytes()) };
     }
-    Some(total)
+    Some(Ok(total))
 }
 
 /// Per-task robust-futex list head (`set_robust_list` / `get_robust_list`).

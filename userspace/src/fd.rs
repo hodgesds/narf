@@ -619,7 +619,14 @@ impl FileOps for ConsoleFile {
         // (the default) returns whole lines with echo + backspace;
         // a program that TCSETSes raw gets byte-at-a-time.
         let n = narf_filesystem::console_tty::read_into(buf);
-        Box::pin(async move { Ok(n) })
+        let would_block = n == 0 && narf_filesystem::console_tty::block_on_input();
+        Box::pin(async move {
+            if would_block {
+                Err(narf_filesystem::FsError::WouldBlock)
+            } else {
+                Ok(n)
+            }
+        })
     }
     /// Block an empty console read on the input waker (woken by the
     /// serial/keyboard IRQ) instead of returning a spurious 0. This is what

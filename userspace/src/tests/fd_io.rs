@@ -2251,12 +2251,11 @@ fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_getdents64_writes_linux_records);
 
-fn smoke_userspace_pipe_read_should_block_on_open_writer() -> TestResult {
+fn smoke_userspace_pipe_empty_read_is_would_block_until_writer_closes() -> TestResult {
     // The blocking-read decision behind shell `$(...)` substitution: a
     // pipe read end whose buffer is empty but whose writer is still open
-    // must report `read_should_block` (so sys_read parks and waits for
-    // data) — and must STOP reporting it once the last writer drops (so
-    // the read returns a real EOF instead of blocking forever). The
+    // must report `WouldBlock` (so sys_read parks and waits for data) — and
+    // must return EOF once the last writer drops. The
     // writer drops here via the `Arc<PipeWrite>` going out of scope,
     // mirroring what `fd::detach` does when a writer task exits.
     use narf_filesystem::FileOps;
@@ -2264,9 +2263,13 @@ fn smoke_userspace_pipe_read_should_block_on_open_writer() -> TestResult {
     if !r.readiness_notifies() || !w.readiness_notifies() {
         return TestResult::Fail("pipe endpoints must advertise readiness notifications");
     }
-    // Empty buffer + writer open → should block.
-    if !r.read_should_block() {
-        return TestResult::Fail("empty pipe with open writer should block");
+    // Empty buffer + writer open → would-block.
+    let mut empty = [0u8; 1];
+    if !matches!(
+        crate::handlers::poll_blocking(r.read(0, &mut empty)),
+        Some(Err(narf_filesystem::FsError::WouldBlock))
+    ) {
+        return TestResult::Fail("empty pipe with open writer did not report would-block");
     }
     let before_write = narf_net::readiness::generation();
     let wr = crate::handlers::poll_blocking(w.write(0, b"x"));
@@ -2283,20 +2286,23 @@ fn smoke_userspace_pipe_read_should_block_on_open_writer() -> TestResult {
     ) {
         return TestResult::Fail("pipe readiness test read failed");
     }
-    // Last writer closes → EOF; a read must NOT block (returns 0).
+    // Last writer closes → EOF.
     let before_close = narf_net::readiness::generation();
     drop(w);
     if narf_net::readiness::generation() <= before_close {
         return TestResult::Fail("pipe writer close did not notify readiness waiters");
     }
-    if r.read_should_block() {
-        return TestResult::Fail("closed writer should not block (EOF expected)");
+    if !matches!(
+        crate::handlers::poll_blocking(r.read(0, &mut empty)),
+        Some(Ok(0))
+    ) {
+        return TestResult::Fail("closed writer did not return EOF");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "userspace",
-    smoke_userspace_pipe_read_should_block_on_open_writer
+    smoke_userspace_pipe_empty_read_is_would_block_until_writer_closes
 );
 
 fn smoke_userspace_init_per_task_state_is_idempotent() -> TestResult {
@@ -3348,7 +3354,7 @@ kernel_test_in!("userspace", smoke_userspace_linux_stat_layout_offsets);
 ///
 /// This is the integration gap under the 31 unit tests in
 /// `filesystem/src/devfs_pty_tests.rs`: every one of those drives the `Pty`
-/// object directly (`read_should_block`, `write`, the ioctls). None routes
+/// object directly (`read`, `write`, the ioctls). None routes
 /// through the fd table and `sys_write`/`sys_read`, which is where a
 /// terminal's shell actually lives. `foot` renders its grid and cursor but
 /// shows no prompt (task #11) — "the shell produced nothing" is precisely a
@@ -3616,17 +3622,13 @@ kernel_test_in!(
 ///
 /// Task #13 filed this as "EventFd::read returns Ok(0) — phantom EOF". The
 /// `Ok(0)` at the FileOps layer is CORRECT and deliberate: NARF has no
-/// `FsError::WouldBlock`, so "empty but open" is signalled as `Ok(0)` plus
-/// `read_should_block()`/`nonblock_read_eagain()`, and `sys_read` is what
-/// converts that into EAGAIN or a park (sys_read.rs). So the bug as filed does
-/// not exist.
+/// `FsError::WouldBlock`; "empty but open" is explicit and `sys_read` turns
+/// it into EAGAIN or a park (sys_read.rs).
 ///
 /// What DID exist is a coverage hole. `smoke_io_mux_empty_reads_are_not_eof`
-/// asserts the two opt-ins on `EventFd` itself and says so in its own docs —
-/// it deliberately does not exercise the syscall. Nothing proved that
-/// `sys_read` still consults them for this fd type, so deleting the
-/// `entry.read_should_block()` check in sys_read would leave that test green
-/// while handing userspace the phantom EOF back.
+/// asserted only FileOps internals and deliberately did not exercise the
+/// syscall. The regression now pins the explicit file-op error and the
+/// syscall result, so neither layer can reintroduce a phantom EOF alone.
 ///
 /// That EOF is not cosmetic: a 0 from an eventfd tells an event loop its
 /// wakeup channel closed. The same shape (a spurious 0 on an O_NONBLOCK fd)

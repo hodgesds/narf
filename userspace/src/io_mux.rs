@@ -160,20 +160,10 @@ impl FileOps for EventFd {
     /// loop, so a phantom EOF there makes the loop treat its own wakeup
     /// channel as dead.
     ///
-    /// The read op still returns `Ok(0)` on an empty counter; these two
-    /// opt-ins are what `sys_read` consults to turn that into a park or an
-    /// EAGAIN. Fourth instance of this class in the tree, after the pipe
-    /// (broke GLib's dbus line-read), PtyMaster (blank foot terminal) and
-    /// /dev/uinput.
+    /// The read op returns [`FsError::WouldBlock`] on an empty counter, which
+    /// `sys_read` turns into a park or EAGAIN without re-classifying `Ok(0)`.
     fn nonblock_read_eagain(&self) -> bool {
         true
-    }
-
-    /// Blocking readers park while the counter is 0 rather than seeing EOF.
-    /// False once a value is pending, so a woken reader proceeds instead of
-    /// parking again.
-    fn read_should_block(&self) -> bool {
-        self.counter.load(Ordering::Acquire) == 0
     }
 
     fn readiness_notifies(&self) -> bool {
@@ -299,20 +289,10 @@ impl FileOps for TimerFd {
     /// nothing to wait on, so it re-reads immediately and BURNS CPU. That is
     /// a busy-spin the kernel is inflicting on userspace, not libc's design.
     ///
-    /// `sys_read` turns the `Ok(0)` below into a park or an EAGAIN once
-    /// these opt-ins are declared. Same class as the pipe (broke GLib's dbus
-    /// line-read), PtyMaster (blank foot terminal), /dev/uinput and EventFd.
+    /// `sys_read` turns its explicit `WouldBlock` result into a park or an
+    /// EAGAIN. Same class as the pipe, PTY, /dev/uinput, and EventFd.
     fn nonblock_read_eagain(&self) -> bool {
         true
-    }
-
-    /// Block while no expiration is pending; stop blocking the moment one
-    /// is, so a woken reader makes progress instead of parking again.
-    /// `tick()` first, so an already-elapsed deadline counts as ready rather
-    /// than parking a reader that should have been woken.
-    fn read_should_block(&self) -> bool {
-        self.tick();
-        self.state.lock().expirations == 0
     }
 
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
@@ -420,12 +400,6 @@ impl FileOps for SignalFd {
     /// Same class as pipe / PtyMaster / uinput / EventFd / TimerFd.
     fn nonblock_read_eagain(&self) -> bool {
         true
-    }
-
-    /// Block while the pending set is empty; ready as soon as a signal in
-    /// the mask arrives.
-    fn read_should_block(&self) -> bool {
-        self.pending_in_mask() == 0
     }
 
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {

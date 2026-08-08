@@ -1089,10 +1089,6 @@ impl FileOps for OverlayFile {
         self.active().rdev()
     }
 
-    fn read_should_block(&self) -> bool {
-        self.active().read_should_block()
-    }
-
     fn write_should_block(&self) -> bool {
         self.active().write_should_block()
     }

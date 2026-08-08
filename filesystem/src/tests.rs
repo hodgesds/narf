@@ -711,10 +711,10 @@ fn smoke_filesystem_fifo_rdwr_round_trip() -> TestResult {
 kernel_test_in!("filesystem", smoke_filesystem_fifo_rdwr_round_trip);
 
 /// EOF: once the last writer handle is dropped, a reader at an empty buffer
-/// reads 0 (end-of-file), and `read_should_block` reports false (don't park).
+/// reads 0; while a writer remains, it returns `WouldBlock`.
 fn smoke_filesystem_fifo_eof_on_writer_close() -> TestResult {
     use crate::fifo::FifoNode;
-    use crate::FileOps;
+    use crate::{FileOps, FsError};
     use alloc::sync::Arc;
 
     let node = FifoNode::new(0x2000, 0o666);
@@ -730,17 +730,17 @@ fn smoke_filesystem_fifo_eof_on_writer_close() -> TestResult {
         true,
     ));
 
-    // Writer open + empty buffer ⇒ the read must PARK (block), not EOF.
-    if !reader.read_should_block() {
-        return TestResult::Fail("empty FIFO with open writer should block");
+    // Writer open + empty buffer ⇒ would-block, not EOF.
+    let mut buf = [0u8; 8];
+    if !matches!(
+        fifo_poll_once(reader.read(0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail("empty FIFO with open writer did not report would-block");
     }
 
     // Drop the last writer: now an empty read is genuine EOF.
     drop(writer);
-    if reader.read_should_block() {
-        return TestResult::Fail("empty FIFO with no writer must not block (EOF)");
-    }
-    let mut buf = [0u8; 8];
     match fifo_poll_once(reader.read(0, &mut buf)) {
         Some(Ok(0)) => TestResult::Pass,
         _ => TestResult::Fail("closed-writer FIFO read did not report EOF (0)"),
@@ -1197,14 +1197,13 @@ fn smoke_filesystem_devfs_console_keystrokes() -> TestResult {
         return TestResult::Fail("translation produced unexpected bytes");
     }
 
-    // Second read with empty ring returns 0 (non-blocking).
+    // An empty console is an interrupt-driven blocking source, not EOF.
+    // Direct FileOps callers observe the explicit WouldBlock result; the
+    // syscall layer converts it to a parked read or O_NONBLOCK/EAGAIN.
     let mut buf = [0u8; 4];
-    let n = match poll_once(console.read(0, &mut buf)) {
-        Some(Ok(n)) => n,
-        _ => return TestResult::Fail("second /dev/console read returned Pending or Err"),
-    };
-    if n != 0 {
-        return TestResult::Fail("empty ring should return 0 bytes");
+    match poll_once(console.read(0, &mut buf)) {
+        Some(Err(crate::FsError::WouldBlock)) => {}
+        _ => return TestResult::Fail("empty console read should return WouldBlock"),
     }
     TestResult::Pass
 }
@@ -5746,16 +5745,11 @@ kernel_test_in!("filesystem", smoke_devfs_console_vt_kd_probes_degrade);
 /// returning 0 on an empty ring left the `foot` terminal blank (the terminal
 /// concluded its shell had exited), and the same phantom 0 on a pipe broke
 /// GLib's dbus line-read ("Unexpected lack of content trying to read a
-/// line"). The kernel already carries both remedies — `nonblock_read_eagain`
-/// for O_NONBLOCK callers and `read_should_block` to park a blocking one —
-/// and uinput simply declared neither, inheriting the `false` defaults.
-///
-/// Both flags are asserted rather than the read's return value, because the
-/// 0 itself is correct at the FileOps layer: it is `sys_read` that turns it
-/// into EAGAIN or a park, and only if these opt-ins are set.
+/// line"). The file op now expresses the empty-live-device case directly as
+/// `FsError::WouldBlock`; `sys_read` turns that into EAGAIN or a park.
 fn smoke_dev_uinput_empty_read_is_not_eof() -> TestResult {
     use crate::devfs_input::UinputControlFile;
-    use crate::FileOps;
+    use crate::{FileOps, FsError};
 
     let file = UinputControlFile::new();
 
@@ -5765,21 +5759,12 @@ fn smoke_dev_uinput_empty_read_is_not_eof() -> TestResult {
              phantom EOF and tears the device down",
         );
     }
-    if !file.read_should_block() {
-        return TestResult::Fail(
-            "uinput does not opt into blocking-on-empty; a blocking reader gets a \
-             phantom EOF instead of waiting for an FF request",
-        );
-    }
-
-    // The raw op still returns 0 bytes — that is the layer `sys_read`
-    // translates. Asserting it keeps the two halves honest: if this ever
-    // starts returning an error instead, the flags above would be wrong.
+    // The raw op explicitly distinguishes "no request yet" from EOF.
     let mut buf = [0u8; 32];
     match poll_once_devfs_input(file.read(0, &mut buf)) {
-        Some(Ok(0)) => TestResult::Pass,
+        Some(Err(FsError::WouldBlock)) => TestResult::Pass,
         Some(Ok(_)) => TestResult::Fail("uinput read returned bytes NARF never synthesises"),
-        _ => TestResult::Fail("uinput read did not complete"),
+        _ => TestResult::Fail("uinput empty read did not report would-block"),
     }
 }
 kernel_test_in!("filesystem", smoke_dev_uinput_empty_read_is_not_eof);

@@ -551,10 +551,6 @@ impl narf_filesystem::FileOps for CurrentTtyFile {
         self.inner.tty_tostop()
     }
 
-    fn read_should_block(&self) -> bool {
-        self.inner.read_should_block()
-    }
-
     fn write_should_block(&self) -> bool {
         self.inner.write_should_block()
     }

@@ -237,9 +237,9 @@ fn smoke_pty_slave_icanon_blocks_until_newline() -> TestResult {
     poll_once(master.write(0, b"partial"));
 
     // ICANON with no completed line yet is WOULD-BLOCK, not end-of-file.
-    // It used to answer Ok(0) and rely on `read_should_block()` to say which
-    // it meant; a shell handed that 0 concludes its stdin closed and exits the
-    // instant it starts. A real `^D` EOF still returns Ok(0) — covered by
+    // It used to answer Ok(0) and make a separate query say which it meant; a
+    // shell handed that 0 concludes its stdin closed and exits instantly. A
+    // real `^D` EOF still returns Ok(0) — covered by
     // smoke_pty_slave_ctrl_d_returns_eof.
     let mut buf = [0u8; 16];
     let r = poll_once(slave.read(0, &mut buf));
@@ -889,23 +889,16 @@ kernel_test_in!("filesystem/pty", smoke_pty_poll_readiness_tracks_ring_depth);
 /// child's output landed. Allocation, exec and the shell were all fine; the
 /// slave->master path reported EOF.
 ///
-/// `read_should_block()` is what `sys_read` consults to park a blocking fd
-/// or return EAGAIN for an O_NONBLOCK one — the same treatment pipes and
-/// sockets already get.
-///
-/// Both directions are asserted, because "block when empty" is only correct
-/// if it stops the moment data exists: a version that always blocked would
-/// pass a one-sided test and hang the terminal a different way.
+/// The file op returns `FsError::WouldBlock`, which `sys_read` converts to a
+/// park or EAGAIN. Both empty and data-ready directions are asserted.
 fn smoke_pty_master_empty_read_is_would_block_not_eof() -> TestResult {
     __reset_for_test();
     let master = open_ptmx();
     let idx = master.index();
 
     // Nothing written yet: the master must report would-block, not EOF.
-    // Asserted on the READ ITSELF, not on a separate opt-in. The read used to
-    // answer Ok(0) and leave the classification to `read_should_block()`; a
-    // consumer that skipped that second question saw a phantom EOF, concluded
-    // the shell had exited, and stopped reading — the blank `foot` window.
+    // Asserted on the read itself. The old out-of-band classification let a
+    // consumer turn an empty live PTY into a phantom EOF.
     let mut buf = [0u8; 32];
     match poll_once(master.read(0, &mut buf)) {
         Some(Err(FsError::WouldBlock)) => {}
@@ -930,13 +923,7 @@ fn smoke_pty_master_empty_read_is_would_block_not_eof() -> TestResult {
         _ => return TestResult::Fail("slave write failed"),
     }
 
-    // With data pending the master must NOT block, and must hand it over.
-    if master.read_should_block() {
-        return TestResult::Fail(
-            "master still reports would-block with data queued — a terminal \
-             would park forever and never paint",
-        );
-    }
+    // With data pending the master must hand it over.
     match poll_once(master.read(0, &mut buf)) {
         Some(Ok(n)) if n == payload.len() => {
             if &buf[..n] != payload {
@@ -946,9 +933,12 @@ fn smoke_pty_master_empty_read_is_would_block_not_eof() -> TestResult {
         _ => return TestResult::Fail("master read did not return the slave's bytes"),
     }
 
-    // Drained again → back to would-block, not EOF.
-    if !master.read_should_block() {
-        return TestResult::Fail("drained master reports EOF instead of would-block");
+    // Drained again → would-block, not EOF.
+    if !matches!(
+        poll_once(master.read(0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail("drained master did not report would-block");
     }
     TestResult::Pass
 }
@@ -985,9 +975,13 @@ fn smoke_pty_slave_empty_blocks_but_ctrl_d_is_real_eof() -> TestResult {
     let slave = PtySlave::new(Arc::clone(&slave_arc));
 
     // 1. Nothing typed yet: must report would-block, not EOF.
-    if !slave.read_should_block() {
+    let mut buf = [0u8; 32];
+    if !matches!(
+        poll_once(slave.read(0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
         return TestResult::Fail(
-            "empty slave read reports EOF — a shell takes that as its input closing \
+            "empty slave read did not report would-block — a shell takes EOF as its input closing \
              and exits immediately",
         );
     }
@@ -997,29 +991,23 @@ fn smoke_pty_slave_empty_blocks_but_ctrl_d_is_real_eof() -> TestResult {
         Some(Ok(6)) => {}
         _ => return TestResult::Fail("master write of a line failed"),
     }
-    if slave.read_should_block() {
-        return TestResult::Fail("slave still reports would-block with a line queued");
-    }
-    let mut buf = [0u8; 32];
     match poll_once(slave.read(0, &mut buf)) {
         Some(Ok(n)) if n == 6 && &buf[..n] == b"hello\n" => {}
         _ => return TestResult::Fail("slave read did not return the queued line"),
     }
 
     // Drained again -> back to would-block.
-    if !slave.read_should_block() {
-        return TestResult::Fail("drained slave reports EOF instead of would-block");
+    if !matches!(
+        poll_once(slave.read(0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail("drained slave did not report would-block");
     }
 
     // 3. ^D (EOT, 0x04) latches a REAL eof: must stop blocking and read 0.
     match poll_once(master.write(0, b"\x04")) {
         Some(Ok(1)) => {}
         _ => return TestResult::Fail("master write of ^D failed"),
-    }
-    if slave.read_should_block() {
-        return TestResult::Fail(
-            "^D latched but the slave still blocks — the shell would never see its EOF",
-        );
     }
     match poll_once(slave.read(0, &mut buf)) {
         Some(Ok(0)) => {}
@@ -1071,8 +1059,14 @@ fn smoke_pty_hangup_matrix_matches_linux() -> TestResult {
     };
 
     // ── Before any slave exists: WAIT, never EOF and never HUP. ──
-    if !master.read_should_block() {
-        return TestResult::Fail("master read reported end-of-stream before any slave was opened");
+    let mut buf = [0u8; 32];
+    if !matches!(
+        poll_once(FileOps::read(&*master, 0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail(
+            "master read did not report would-block before any slave was opened",
+        );
     }
     if FileOps::poll_readiness(&*master) & crate::POLL_HUP != 0 {
         return TestResult::Fail("master reported POLLHUP before any slave was opened");
@@ -1080,8 +1074,13 @@ fn smoke_pty_hangup_matrix_matches_linux() -> TestResult {
 
     // ── Slave open, empty: still WAIT. ──
     let slave = PtySlave::new(Arc::clone(&pty));
-    if !master.read_should_block() {
-        return TestResult::Fail("master read reported end-of-stream with a slave open and idle");
+    if !matches!(
+        poll_once(FileOps::read(&*master, 0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail(
+            "master read did not report would-block with a slave open and idle",
+        );
     }
     if FileOps::poll_readiness(&*master) & crate::POLL_HUP != 0 {
         return TestResult::Fail("master reported POLLHUP with a slave still open");
@@ -1098,7 +1097,6 @@ fn smoke_pty_hangup_matrix_matches_linux() -> TestResult {
     if !pty.hung_up() {
         return TestResult::Fail("dropping the last slave did not mark the pty hung up");
     }
-    let mut buf = [0u8; 32];
     match poll_once(FileOps::read(&*master, 0, &mut buf)) {
         Some(Ok(n)) if n == b"last words".len() && &buf[..n] == b"last words" => {}
         Some(Ok(0)) => {
@@ -1110,12 +1108,6 @@ fn smoke_pty_hangup_matrix_matches_linux() -> TestResult {
     }
 
     // ── Drained AND hung up: EIO, not 0, and not a block. ──
-    if master.read_should_block() {
-        return TestResult::Fail(
-            "master read still blocks after the last slave closed — this is the hang the \
-             ptyspawn smoke caught, where a failed exec left the parent parked forever",
-        );
-    }
     match poll_once(FileOps::read(&*master, 0, &mut buf)) {
         Some(Err(FsError::Io(_))) => {}
         Some(Ok(0)) => {
@@ -1133,8 +1125,11 @@ fn smoke_pty_hangup_matrix_matches_linux() -> TestResult {
     if pty.hung_up() {
         return TestResult::Fail("re-opening a slave did not clear the hangup");
     }
-    if !master.read_should_block() {
-        return TestResult::Fail("master still reports end-of-stream after a slave re-opened");
+    if !matches!(
+        poll_once(FileOps::read(&*master, 0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail("master did not report would-block after a slave re-opened");
     }
     if FileOps::poll_readiness(&*master) & crate::POLL_HUP != 0 {
         return TestResult::Fail("master still reports POLLHUP after a slave re-opened");
@@ -1142,12 +1137,6 @@ fn smoke_pty_hangup_matrix_matches_linux() -> TestResult {
 
     // ── The other direction: master closes, slave sees EOF (0), not EIO. ──
     drop(master);
-    if slave2.read_should_block() {
-        return TestResult::Fail(
-            "slave read still blocks after the master closed — a shell whose terminal \
-             vanished would never exit",
-        );
-    }
     if slave2.nonblock_read_eagain() {
         return TestResult::Fail("O_NONBLOCK slave read reports EAGAIN after the master closed");
     }

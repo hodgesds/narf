@@ -143,11 +143,10 @@ impl FileOps for PipeRead {
                 //
                 // Deciding it HERE, under the same lock that observed the
                 // empty queue, is what makes it race-free. The previous
-                // arrangement returned Ok(0) and let sys_read re-ask
-                // `read_should_block()` in a SEPARATE lock acquisition, so a
-                // writer landing in between could turn arrived data into a
-                // spurious EOF — the hook had to be deliberately conservative
-                // to compensate. One atomic decision removes the need.
+                // arrangement returned Ok(0) and made the syscall layer
+                // re-classify it in a separate lock acquisition, so a writer
+                // landing in between could turn arrived data into a spurious
+                // EOF. One atomic decision removes the ambiguity.
                 return if self.shared.writer_closed.load(Ordering::Acquire) {
                     Ok(0)
                 } else {
@@ -235,18 +234,6 @@ impl FileOps for PipeRead {
 
     fn poll_edge_token(&self) -> (u64, u64) {
         (self.shared.readable_token.load(Ordering::Acquire), 0)
-    }
-
-    fn read_should_block(&self) -> bool {
-        // Block (retry the read) unless we are TRULY at EOF: the queue is empty
-        // AND the writer has gone. Reporting "don't block" merely because the
-        // queue is non-empty would drop data: sys_read calls read() and this
-        // check under *separate* lock acquisitions, so if a writer on another
-        // CPU pushes bytes in between, read() already returned 0 — and treating
-        // that 0 as EOF (instead of re-reading) loses the bytes. Keying EOF on
-        // (empty AND writer_closed) makes a data-arrived race re-read instead.
-        let q = self.shared.queue.lock();
-        !(q.is_empty() && self.shared.writer_closed.load(Ordering::Acquire))
     }
 
     fn is_stream(&self) -> bool {

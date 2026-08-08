@@ -90,16 +90,13 @@ impl FileOps for SignalFdFile {
         true
     }
 
-    /// Block while nothing in the mask is pending.
-    fn read_should_block(&self) -> bool {
-        self.pending() == 0
-    }
-
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let pending = self.pending();
             if pending == 0 {
-                return Ok(0);
+                // Linux fs/signalfd.c::signalfd_read — no pending signal is
+                // -EAGAIN, never 0.
+                return Err(FsError::WouldBlock);
             }
             if buf.len() < SIGNALFD_SIGINFO_LEN {
                 return Err(FsError::InvalidData);

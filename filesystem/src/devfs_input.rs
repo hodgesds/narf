@@ -815,29 +815,19 @@ impl FileOps for UinputControlFile {
     /// returned 0 on an empty ring, and that broke GLib's dbus line-read
     /// when a pipe did the same.
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Ok(0) })
+        // uinput has no end-of-file: an empty read waits for a force-feedback
+        // request. NARF synthesises none, so this is always would-block —
+        // deliberately, and matching Linux, where the wait is equally
+        // unbounded until a client uploads an effect. Reporting a hangup that
+        // did not happen is the worse failure: the reader tears the device
+        // down.
+        Box::pin(async move { Err(FsError::WouldBlock) })
     }
 
     /// An O_NONBLOCK reader must get EAGAIN, not a phantom EOF. `sys_read`
     /// turns a 0-byte result into EAGAIN when this is set, which is what an
     /// FF-aware client polling the control fd expects.
     fn nonblock_read_eagain(&self) -> bool {
-        true
-    }
-
-    /// A BLOCKING reader parks instead of seeing EOF — Linux semantics: an
-    /// empty uinput read waits for an FF request rather than reporting the
-    /// device closed.
-    ///
-    /// Note the practical consequence, deliberately accepted: since NARF
-    /// synthesises no FF requests, a blocking reader now waits forever
-    /// where it previously got an immediate spurious EOF. That matches
-    /// Linux — on a real kernel the wait is equally unbounded until a
-    /// client uploads an effect — and a program that blocking-reads uinput
-    /// without poll() is already misusing it. Reporting a hangup that did
-    /// not happen is the worse failure: it makes the reader tear the device
-    /// down.
-    fn read_should_block(&self) -> bool {
         true
     }
 

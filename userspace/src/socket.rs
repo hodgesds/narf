@@ -1763,10 +1763,8 @@ impl FileOps for SocketFile {
                     drop(self.unix_take_recv_fds());
                     Ok(n)
                 }
-                // do_recv ALREADY distinguishes empty-but-open from EOF;
-                // collapsing that to Ok(0) here threw the answer away and made
-                // the syscall layer re-derive it via read_should_block(). Pass
-                // it through, as Linux's socket recv paths do (-EAGAIN).
+                // do_recv already distinguishes empty-but-open from EOF; pass
+                // its explicit would-block result through unchanged.
                 Err(SockError::WouldBlock) => Err(FsError::WouldBlock),
                 Err(_) => Err(FsError::Unsupported),
             }
@@ -1782,40 +1780,6 @@ impl FileOps for SocketFile {
                 Err(_) => Err(FsError::Unsupported),
             }
         })
-    }
-
-    fn read_should_block(&self) -> bool {
-        // `read`/`recv` maps an empty ring to `Ok(0)`, which is indistinguishable
-        // from a real EOF by byte count alone. `sys_read` only blocks a 0-byte
-        // read when this returns true; the default is `false`, so WITHOUT this a
-        // blocking recv on an empty-but-open socket returns a spurious EOF the
-        // instant it finds no data — a blocking server (e.g. one that accept()s
-        // then read()s a request, rather than poll()ing first like libwayland)
-        // sees "peer closed" and gives up. Block while the rx side is still OPEN;
-        // a genuine peer-close (rx closed) correctly falls through to EOF. Use
-        // `!is_closed()` (not `!has_data()`) so data arriving between the read and
-        // this check still re-executes the read instead of returning EOF.
-        let state = self.state.lock();
-        match &*state {
-            SocketState::UnixConnected { rx, .. }
-            | SocketState::InetConnected { rx, .. }
-            | SocketState::Inet6Connected { rx, .. } => !rx.is_closed(),
-            // Kernel-TCP-over-NIC (off-box) sockets: the rx lives in the TCB,
-            // not a RingBuf here, so `readable()` is the authority — it's true
-            // when RX data is buffered OR the peer closed / the connection is
-            // dead (read returns EOF). Block a 0-byte read only while the
-            // connection is OPEN-but-empty (`!readable`). WITHOUT this arm an
-            // `InetWired` socket fell to `_ => false`, so a blocking server
-            // that accept()s then read()s (netserve) saw a spurious EOF the
-            // instant it read before the peer's first segment arrived — the
-            // off-box net-smoke `netserve-fail: read` under slow (TCG) timing;
-            // masked under KVM only because the data always beat the read.
-            SocketState::InetWired { tcb_id, .. } => !narf_net::tcp_stack::readable(*tcb_id),
-            SocketState::UnixDgram { inbox, .. } | SocketState::InetDgram { inbox, .. } => {
-                inbox.is_empty()
-            }
-            _ => false,
-        }
     }
 
     /// A readiness transition on a socket fires `readiness::notify` (the

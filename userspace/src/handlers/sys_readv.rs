@@ -58,11 +58,8 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         }
         let mut kbuf = alloc::vec![0u8; len];
         let res = poll_blocking(ops.read(cur, &mut kbuf)).unwrap_or(Ok(0));
-        // The explicit would-block signal. Same two outcomes as the `Ok(0)` +
-        // `read_should_block()` pair below, but stated by the file op itself
-        // instead of re-derived here — a consumer that forgets the second
-        // question turns "nothing yet" into EOF, which is the bug this
-        // conversion exists to make unrepresentable.
+        // The explicit would-block signal. `Ok(0)` is EOF, so a consumer
+        // cannot accidentally turn an empty-but-open stream into a close.
         let res = match res {
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
                 if nonblock {
@@ -82,21 +79,7 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         };
         match res {
             Ok(0) if total == 0 => {
-                // Nothing read yet and the stream is dry. An open-but-empty
-                // pipe/socket must NOT report EOF (`fs/pipe.c::pipe_read`:
-                // "!pipe->writers → 0" is the ONLY 0 return): O_NONBLOCK →
-                // -EAGAIN, blocking → park + RE-EXECUTE the whole readv (no
-                // bytes were consumed, so a re-run is idempotent).
-                if ops.read_should_block() {
-                    if nonblock {
-                        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
-                        return;
-                    }
-                    if park_reexecute_on_io(ctx) {
-                        return;
-                    }
-                }
-                // Genuine EOF (or kernel-test context with no executor).
+                // A successful zero-byte read is genuine EOF.
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }

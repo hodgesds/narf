@@ -104,6 +104,11 @@ pub enum FileType {
 
 All operations submit through `abi/` rings when crossing the
 kernel↔user boundary; kernel-internal callers invoke directly.
+An open file that is healthy but temporarily has no readable data returns
+`FsError::WouldBlock`; `Ok(0)` is reserved for a real end-of-file. The syscall
+layer maps `WouldBlock` to `EAGAIN` for `O_NONBLOCK` or parks and re-executes a
+blocking read. File operations do not expose a separate readiness predicate
+for callers to re-classify a zero-byte result.
 `poll_readiness_at` defaults to `poll_readiness`; offset-sensitive device
 descriptions such as `/dev/kmsg` override it so EOF is not reported readable.
 `poll_edge_token` defaults to `(0, 0)`; stateful readiness providers advance

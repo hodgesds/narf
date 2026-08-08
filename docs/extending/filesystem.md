@@ -89,7 +89,6 @@ everything else has a default. The defaults you are most likely to override:
 | `truncate` | `:382` | `Unsupported` | resizable files |
 | `ioctl(&self, cmd, arg) -> Result<u64, FsError>` | `:461` | `Unsupported` | device-like nodes |
 | `poll_readiness(&self) -> u32` | `:411` | `POLL_IN\|POLL_OUT` | pollable streams |
-| `read_should_block(&self) -> bool` | `:538` | `false` | blocking streams (pipes, ttys) |
 | `as_dir(&self) -> Option<Arc<dyn DirOps>>` | `:523` | `None` | a node that is also a directory |
 | `mmap_frames(&self, off, len) -> Result<Vec<u64>, FsError>` | `:485` | `Unsupported` | file-backed mmap |
 | `rdev(&self) -> u64` | `:532` | `0` | char/block device major:minor |
@@ -99,6 +98,10 @@ The remaining defaults (`owners`, `set_owners`, `set_perms`, `tty_*`,
 `as_any`, …, `:389`–`:648`) are integration hooks for specific kernel
 subsystems and default to a safe no-op/`None`; a plain filesystem ignores
 them.
+
+`read` returns `Err(FsError::WouldBlock)` for a healthy open stream with no
+data available. `Ok(0)` is exclusively EOF; the syscall layer maps
+`WouldBlock` to `EAGAIN` for `O_NONBLOCK` or parks a blocking caller.
 
 ### Supporting types
 

@@ -157,35 +157,13 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
             .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
         match res {
             Ok(n) => {
-                // A NON-BLOCKING read that finds an empty-but-open stream
-                // (socket/pipe) must report EAGAIN, not a bare 0 — the caller
-                // would mis-read that 0 as EOF. `read_should_block()` is true
-                // exactly when the stream is open-but-empty (a real peer-close
-                // makes it false, so a genuine EOF still returns 0). GLib's
-                // GSocket/GDBus runs its own poll loop over O_NONBLOCK fds and
-                // treats `read()==0` as a peer hangup; the spurious EOF during
-                // the dbus EXTERNAL auth line-read ("Unexpected lack of content
-                // trying to read a line") killed the KDE session bus. musl's
-                // stdio/recv wrappers likewise expect EAGAIN, never a phantom 0.
-                if n == 0 && nonblock && entry.read_should_block() {
-                    return Err(ReadError::Again);
-                }
-                // Block decision: a 0-byte read on a pipe/socket whose writer is
-                // still open must wait for data (POSIX), not return a
-                // spurious EOF — unless the fd is O_NONBLOCK (handled above).
-                let should_block = n == 0 && !nonblock && entry.read_should_block();
-                // Console fds park on the input waker (serial/keyboard IRQ)
-                // instead of the 1ms re-poll, so an interactive shell truly
-                // sleeps on `read(stdin)` rather than busy-polling.
-                let input_block = n == 0 && !nonblock && entry.block_on_input();
                 advance(n);
-                Ok((n, should_block, input_block))
+                Ok((n, false, false))
             }
             // The explicit would-block signal, matching what Linux's file ops
             // return directly (`-EAGAIN` from eventfd_read / pipe_read / …).
-            // O_NONBLOCK ⇒ EAGAIN; otherwise park, exactly as the `Ok(0)` +
-            // `read_should_block()` pair above does, but without relying on a
-            // consumer remembering to ask the second question.
+            // O_NONBLOCK ⇒ EAGAIN; otherwise park. `Ok(0)` is exclusively
+            // EOF, so no consumer has to re-classify an ambiguous result.
             Err(narf_filesystem::FsError::WouldBlock) => {
                 if nonblock {
                     Err(ReadError::Again)
