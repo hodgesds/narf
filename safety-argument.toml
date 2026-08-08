@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "8b8e20989a9ad3650a89697df9b39d761092ffa12c888571dfb49837275bb5f8"
+prompt_hash = "e9eec650e484f39d69be916769bf6f9aa50e8e25c4d5a5f9c7d59de97330e6b1"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -222,3 +222,12 @@ argument = "Removing BuddyZone::free's vestigial overlap scan changes only the c
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The removed scan neither enforced capability checks nor assigned domain tags; it leaked an overlapping free after an ownership violation had already occurred. The audited address-space and page-table ownership fixes remain in place, while KASAN-capable kernel tests and stress teardown continue to exercise double-free and use-after-free failures."
+
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame edit only force-links the optional narf-bpf-leds seam and registers its initcalls beside the existing BPF consumer anchor. The new kfunc, bounded mailbox, LED registries, and worker remain outside the documented TCB; no trusted subsystem, capability authority, domain assignment, task state, or memory-mapping path is added."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "narf_led_submit accepts scalars only and, in atomic BPF context, performs a bounded sequence of atomic operations into fixed FRAME-visible storage. Device lookup, allocation, trigger locking, and potentially sleepable hardware access occur later in one Stage::Late worker. Unknown actions fail with EINVAL, queue saturation fails with EAGAIN, full-width invalid indices remain drain-time no-ops, and the kfunc neither dereferences program pointers nor changes capability or domain rights."

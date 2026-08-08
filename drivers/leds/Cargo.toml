@@ -17,6 +17,8 @@ narf-drivers-gpio = { path = "../gpio" }
 narf-pwm          = { path = "../../pwm" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-init         = { path = "../../init" }
+narf-scheduler    = { path = "../../scheduler" }
+narf-time         = { path = "../../time" }
 narf-filesystem   = { path = "../../filesystem" }
 async-trait       = "0.1"
 

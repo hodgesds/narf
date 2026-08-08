@@ -107,9 +107,9 @@ pub fn __reset_for_test() {
 // ── SimpleLed — software-only LED ─────────────────────────────────
 
 use alloc::string::String;
-use core::sync::atomic::AtomicU8;
 
-/// Simple LED device backed by atomics (no hardware GPIO/PWM).
+/// Simple LED device backed by an atomic brightness value and IRQ-safe trigger state
+/// (no hardware GPIO/PWM).
 ///
 /// Used for standard laptop indicator LEDs (CapsLock, NumLock,
 /// ScrollLock, power) that are driven by the HID / input layer.
@@ -124,7 +124,7 @@ pub struct SimpleLed {
     pub name: String,
     max: u32,
     brightness: AtomicU32,
-    trigger: AtomicU8,
+    trigger: IrqSafeSpinLock<Trigger>,
 }
 
 impl SimpleLed {
@@ -134,7 +134,7 @@ impl SimpleLed {
             name: alloc::string::String::from(name),
             max: 1,
             brightness: AtomicU32::new(0),
-            trigger: AtomicU8::new(0),
+            trigger: IrqSafeSpinLock::new(Trigger::None),
         }
     }
 
@@ -144,7 +144,7 @@ impl SimpleLed {
             name: alloc::string::String::from(name),
             max: 255,
             brightness: AtomicU32::new(0),
-            trigger: AtomicU8::new(0),
+            trigger: IrqSafeSpinLock::new(Trigger::None),
         }
     }
 }
@@ -168,28 +168,10 @@ impl LedDevice for SimpleLed {
     }
 
     fn current_trigger(&self) -> crate::triggers::Trigger {
-        use crate::triggers::Trigger;
-        match self.trigger.load(Ordering::Acquire) {
-            1 => Trigger::Heartbeat,
-            2 => Trigger::DiskActivity,
-            3 => Trigger::AcOnline,
-            4 => Trigger::BatteryCharging,
-            5 => Trigger::NetworkActivity { iface: "eth0" },
-            _ => Trigger::None,
-        }
+        self.trigger.lock().clone()
     }
 
     fn set_trigger(&self, trigger: crate::triggers::Trigger) {
-        use crate::triggers::Trigger;
-        let v = match trigger {
-            Trigger::None => 0,
-            Trigger::Heartbeat => 1,
-            Trigger::DiskActivity => 2,
-            Trigger::AcOnline => 3,
-            Trigger::BatteryCharging => 4,
-            Trigger::NetworkActivity { .. } => 5,
-            _ => 0,
-        };
-        self.trigger.store(v, Ordering::Release);
+        *self.trigger.lock() = trigger;
     }
 }

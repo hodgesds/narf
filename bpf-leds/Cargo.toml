@@ -1,0 +1,34 @@
+[package]
+name         = "narf-bpf-leds"
+description  = "BPF -> LED control: the narf_led_submit kfunc that enqueues brightness/blink/color commands for the LED engine worker to apply."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_bpf_leds"
+path = "src/lib.rs"
+
+[dependencies]
+narf-bpf          = { path = "../bpf" }
+narf-drivers-leds = { path = "../drivers/leds" }
+narf-init         = { path = "../init" }
+
+# Test-only: the smokes assemble and load a program that calls the kfunc.
+narf-lib          = { path = "../lib", optional = true }
+narf-bpf-isa      = { path = "../bpf/isa", optional = true }
+narf-bpf-verifier = { path = "../bpf/verifier", optional = true }
+narf-kernel-test  = { path = "../verification/kernel-test", optional = true }
+
+[features]
+kernel-test = [
+    "dep:narf-kernel-test",
+    "dep:narf-bpf-isa",
+    "dep:narf-bpf-verifier",
+    "dep:narf-lib",
+]
+
+[lints]
+workspace = true

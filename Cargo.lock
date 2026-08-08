@@ -735,6 +735,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-bpf-leds"
+version = "0.0.0"
+dependencies = [
+ "narf-bpf",
+ "narf-bpf-isa",
+ "narf-bpf-verifier",
+ "narf-drivers-leds",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-bpf-structops"
 version = "0.0.0"
 dependencies = [
@@ -1176,6 +1189,8 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-pwm",
+ "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -1661,6 +1676,7 @@ dependencies = [
  "narf-boot",
  "narf-bpf",
  "narf-bpf-idle",
+ "narf-bpf-leds",
  "narf-bus",
  "narf-console",
  "narf-crypto",
@@ -2159,6 +2175,7 @@ dependencies = [
  "narf-boot",
  "narf-bpf",
  "narf-bpf-idle",
+ "narf-bpf-leds",
  "narf-bpf-structops",
  "narf-bus",
  "narf-busybox",

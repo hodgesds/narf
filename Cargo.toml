@@ -28,6 +28,7 @@ members = [
     "bpf/jit",
     "bpf/structops",
     "bpf-idle",
+    "bpf-leds",
     "frame",
     "rcu",
     "bus",
