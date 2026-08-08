@@ -760,6 +760,15 @@ impl core::fmt::Debug for DgramPacket {
 struct NetlinkUserPacket {
     payload: Vec<u8>,
     sender_portid: u32,
+    /// Destination multicast group as a `sockaddr_nl.nl_groups` MASK
+    /// (0 for unicast). Linux reports this to the receiver via
+    /// `netlink_group_mask(NETLINK_CB(skb).dst_group)` in `netlink_recvmsg`,
+    /// and libudev's `device_monitor_receive_device` uses it to tell a
+    /// multicast broadcast from a unicast message: anything arriving with
+    /// `nl_groups == 0` is treated as unicast and DISCARDED unless it comes
+    /// from the monitor's trusted sender. Dropping this field would make
+    /// every udev broadcast silently ignored by its listeners.
+    group: u32,
 }
 
 impl SocketFile {
@@ -1071,11 +1080,33 @@ impl SocketFile {
         if destination == (0, 0) {
             return None;
         }
-        // Userspace multicast requires authority NARF does not grant through
-        // uid/capability emulation. Kernel-originated protocol notifications
-        // continue to use their dedicated broadcast paths.
+        // Multicast: deliver to every socket subscribed to the group.
+        //
+        // This used to return NotSupported outright, on the reasoning that
+        // "userspace multicast requires authority NARF does not grant". That
+        // broke udev completely (task #12). After a worker processes a
+        // device, udevd broadcasts the result to its libudev listeners on the
+        // UDEV_MONITOR_UDEV group; EOPNOTSUPP there is not a slow path, it is
+        // fatal:
+        //
+        //   sd-device-monitor(manager): Failed to send device to netlink
+        //       monitor: Operation not supported
+        //   Failed to broadcast event (SEQNUM=23) to libudev listeners
+        //   Worker [20] exited with return code 1.
+        //   Event loop failed: Operation not supported
+        //
+        // udevd's event loop dies, so /run/udev/data stays empty, no input
+        // device ever gets a `seat` tag, libinput enumerates nothing, and the
+        // Wayland seat advertises keyboard-only — the dead mouse.
+        //
+        // Linux does NOT refuse this. `netlink_sendmsg` gates multicast on
+        // `netlink_allowed(sock, NL_CFG_F_NONROOT_SEND)` and fails with
+        // EPERM, not EOPNOTSUPP — and udevd runs with CAP_NET_ADMIN, so it is
+        // allowed. Matching Linux's permission model properly is task #12's
+        // follow-up; refusing every sender was both the wrong errno and the
+        // wrong answer for the one sender that matters.
         if destination.1 != 0 {
-            return Some(SocketOpResult::Err(SockError::NotSupported));
+            return Some(self.broadcast_netlink_user(buf, destination.1));
         }
         let sender = self.ensure_netlink_portid();
         let mut sockets = NETLINK_SOCKETS.lock();
@@ -1093,10 +1124,61 @@ impl SocketFile {
             .push_back(NetlinkUserPacket {
                 payload: buf.to_vec(),
                 sender_portid: sender,
+                group: 0,
             });
         drop(sockets);
         narf_net::readiness::notify(0);
         Some(SocketOpResult::Ok(buf.len() as u64))
+    }
+
+    /// `sockaddr_nl.nl_groups` multicast send — Linux `netlink_broadcast`.
+    ///
+    /// `group_mask` is the raw `nl_groups` bitmask the sender supplied. Linux
+    /// derives the group NUMBER with `ffs()` (the index of the lowest set
+    /// bit, 1-based) and reports it back to receivers re-encoded as a mask
+    /// via `netlink_group_mask()`, so that round-trip is preserved here.
+    ///
+    /// Delivery is best-effort: Linux's `netlink_sendmsg` ignores
+    /// `netlink_broadcast`'s return value, so a broadcast with no subscribers
+    /// still succeeds. Returning an error for an empty listener set would
+    /// make udevd fail whenever nothing happened to be listening yet.
+    fn broadcast_netlink_user(&self, buf: &[u8], group_mask: u32) -> SocketOpResult {
+        // Linux `ffs(addr->nl_groups)`.
+        let group = group_mask.trailing_zeros() + 1;
+        let sender = self.ensure_netlink_portid();
+        let targets: Vec<Arc<SocketFile>> = {
+            let mut sockets = NETLINK_SOCKETS.lock();
+            sockets.retain(|weak| weak.strong_count() != 0);
+            sockets.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut delivered = 0usize;
+        for target in targets {
+            if target.protocol != self.protocol {
+                continue;
+            }
+            // Never loop a broadcast back to its sender (Linux skips
+            // `sk == ssk` in `do_one_broadcast`).
+            if target.netlink_portid.load(Ordering::Acquire) == sender {
+                continue;
+            }
+            if !target.netlink_memberships.lock().contains(&group) {
+                continue;
+            }
+            target
+                .netlink_user_inbox
+                .lock()
+                .push_back(NetlinkUserPacket {
+                    payload: buf.to_vec(),
+                    sender_portid: sender,
+                    group: group_mask,
+                });
+            delivered += 1;
+        }
+        if delivered > 0 {
+            // Wake any parked poll/epoll waiter on a subscribed socket.
+            narf_net::readiness::notify(0);
+        }
+        SocketOpResult::Ok(buf.len() as u64)
     }
 
     fn recv_netlink_user(&self, buf: &mut [u8], flags: u32) -> Option<SocketOpResult> {
@@ -1106,6 +1188,7 @@ impl SocketFile {
                 inbox.front().map(|packet| NetlinkUserPacket {
                     payload: packet.payload.clone(),
                     sender_portid: packet.sender_portid,
+                    group: packet.group,
                 })
             } else {
                 inbox.pop_front()
@@ -1116,8 +1199,15 @@ impl SocketFile {
         }
         let n = buf.len().min(packet.payload.len());
         buf[..n].copy_from_slice(&packet.payload[..n]);
-        self.netlink_last_recv_group.store(0, Ordering::Release);
-        let peer = Some(Self::netlink_sockaddr(packet.sender_portid, 0));
+        // Report the ORIGINATING group, not a hardcoded 0. Linux's
+        // `netlink_recvmsg` sets `addr->nl_groups =
+        // netlink_group_mask(NETLINK_CB(skb).dst_group)`, and libudev keys
+        // its unicast-vs-multicast trust decision on exactly this field: a
+        // broadcast that arrives claiming nl_groups==0 is treated as an
+        // untrusted unicast and dropped on the floor.
+        self.netlink_last_recv_group
+            .store(packet.group, Ordering::Release);
+        let peer = Some(Self::netlink_sockaddr(packet.sender_portid, packet.group));
         Some(if n < packet.payload.len() {
             SocketOpResult::ReceivedTruncated {
                 copied: n,
@@ -5120,6 +5210,158 @@ fn smoke_unregistered_netlink_kernel_send_is_refused() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_unregistered_netlink_kernel_send_is_refused
+);
+
+/// A userspace multicast send must REACH the group's subscribers.
+///
+/// This is task #12's root cause. `send_netlink_user` used to answer any
+/// `nl_groups != 0` with `NotSupported`, which is what udevd hit after every
+/// processed device:
+///
+/// ```text
+/// sd-device-monitor(manager): Failed to send device to netlink monitor:
+///     Operation not supported
+/// Failed to broadcast event (SEQNUM=23) to libudev listeners
+/// Worker [20] exited with return code 1.
+/// Event loop failed: Operation not supported
+/// ```
+///
+/// That killed udevd's event loop, so `/run/udev/data` stayed empty, no input
+/// device got a `seat` tag, libinput enumerated nothing, and the Wayland seat
+/// came up keyboard-only — the dead mouse.
+///
+/// Linux permits this: `netlink_sendmsg` gates multicast on
+/// `netlink_allowed(sock, NL_CFG_F_NONROOT_SEND)` and refuses with EPERM, not
+/// EOPNOTSUPP; udevd holds CAP_NET_ADMIN and is allowed.
+///
+/// The peer-group assertion is not decoration. libudev's
+/// `device_monitor_receive_device` treats a message arriving with
+/// `nl_groups == 0` as an untrusted UNICAST and discards it, so delivering
+/// the bytes while reporting group 0 would leave udev just as broken while
+/// making this test pass. Linux reports
+/// `netlink_group_mask(NETLINK_CB(skb).dst_group)`.
+fn smoke_netlink_multicast_broadcast_reaches_group_subscriber() -> TestResult {
+    const UDEV_GROUP_MASK: u32 = 2; // MONITOR_GROUP_UDEV
+    let sender = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let listener = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+
+    if !matches!(
+        listener.dispatch_op(SocketOp::Bind {
+            addr: SocketFile::netlink_sockaddr(0, UDEV_GROUP_MASK),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("listener could not bind to the udev multicast group");
+    }
+
+    let payload = b"add@/devices/platform/narf-input/input1/event1";
+    match sender.dispatch_op(SocketOp::Send {
+        buf: payload,
+        flags: 0,
+        addr: Some(SocketFile::netlink_sockaddr(0, UDEV_GROUP_MASK)),
+    }) {
+        SocketOpResult::Ok(n) if n == payload.len() as u64 => {}
+        // The exact pre-fix failure.
+        SocketOpResult::Err(SockError::NotSupported) => {
+            return TestResult::Fail(
+                "multicast send returned NotSupported — udevd's event loop dies here",
+            )
+        }
+        _ => return TestResult::Fail("multicast send did not report the full payload length"),
+    }
+
+    let mut buf = [0u8; 128];
+    let peer = match listener.dispatch_op(SocketOp::Recv {
+        buf: &mut buf,
+        flags: 0,
+    }) {
+        SocketOpResult::Received { n, peer } => {
+            if n != payload.len() || &buf[..n] != payload {
+                return TestResult::Fail("subscriber received the wrong broadcast bytes");
+            }
+            peer
+        }
+        _ => return TestResult::Fail("group subscriber never received the broadcast"),
+    };
+    match peer.as_ref().and_then(SocketFile::netlink_addr) {
+        Some((_, groups)) if groups == UDEV_GROUP_MASK => TestResult::Pass,
+        Some((_, 0)) => TestResult::Fail(
+            "broadcast reported nl_groups=0 — libudev discards that as untrusted unicast",
+        ),
+        _ => TestResult::Fail("broadcast reported the wrong nl_groups to the receiver"),
+    }
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_netlink_multicast_broadcast_reaches_group_subscriber
+);
+
+/// The negative half: a broadcast goes to the group's subscribers and to
+/// NOBODY else. Without this, "deliver to every netlink socket" would pass
+/// the positive test above while flooding unrelated listeners.
+///
+/// Covers three exclusions: a socket subscribed to a DIFFERENT group, a
+/// socket on a different PROTOCOL, and the sender itself (Linux skips
+/// `sk == ssk` in `do_one_broadcast`).
+fn smoke_netlink_multicast_skips_nonsubscribers_and_sender() -> TestResult {
+    const UDEV_GROUP_MASK: u32 = 2;
+    const KERNEL_GROUP_MASK: u32 = 1;
+    let sender = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let other_group = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let other_proto = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+
+    // The sender joins the very group it will broadcast to: even a genuine
+    // subscriber must not receive its own broadcast.
+    for (sock, mask) in [
+        (&sender, UDEV_GROUP_MASK),
+        (&other_group, KERNEL_GROUP_MASK),
+        (&other_proto, UDEV_GROUP_MASK),
+    ] {
+        if !matches!(
+            sock.dispatch_op(SocketOp::Bind {
+                addr: SocketFile::netlink_sockaddr(0, mask),
+            }),
+            SocketOpResult::Ok(_)
+        ) {
+            return TestResult::Fail("setup: netlink bind rejected a valid group mask");
+        }
+    }
+
+    if !matches!(
+        sender.dispatch_op(SocketOp::Send {
+            buf: b"add@/devices/virtual/should-not-fan-out",
+            flags: 0,
+            addr: Some(SocketFile::netlink_sockaddr(0, UDEV_GROUP_MASK)),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("setup: multicast send failed");
+    }
+
+    let mut buf = [0u8; 128];
+    for (sock, who) in [
+        (&sender, "the sender received its own broadcast"),
+        (
+            &other_group,
+            "a different-group subscriber received the broadcast",
+        ),
+        (
+            &other_proto,
+            "a different-protocol socket received the broadcast",
+        ),
+    ] {
+        if let SocketOpResult::Received { .. } = sock.dispatch_op(SocketOp::Recv {
+            buf: &mut buf,
+            flags: 0,
+        }) {
+            return TestResult::Fail(who);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_netlink_multicast_skips_nonsubscribers_and_sender
 );
 
 fn smoke_netlink_lists_high_membership_groups() -> TestResult {

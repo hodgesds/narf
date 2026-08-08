@@ -995,6 +995,7 @@ kernel_test_in!(
 ///   1. `send()` must bump the readiness generation — the channel that
 ///      breaks an infinite park out of its re-park loop.
 ///   2. the re-executed scan must then report the fd ready.
+///
 /// Half 1 failing is invisible to every timeout-0 epoll test in the file.
 fn smoke_abi_socket_connected_pair_send_wakes_parked_epoll() -> TestResult {
     with_setup(|| {
