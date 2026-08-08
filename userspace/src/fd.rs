@@ -309,6 +309,22 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
     Some(op(&mut table))
 }
 
+/// `with_table` for callers running in the timer trap, which can interrupt
+/// a CPU already holding either the shard lock or the table lock — blocking
+/// on those deadlocks the machine under observation. `None` on contention.
+///
+/// Also, unlike [`with_table`], this NEVER creates a table: a diagnostic
+/// probe that materialises the thing it is inspecting is not a probe.
+#[cfg(feature = "unix-latency-trace")]
+pub fn try_with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option<R> {
+    let arc = {
+        let map = TABLES[table_shard(task_id)].try_lock()?;
+        map.get(&task_id)?.clone()
+    };
+    let mut table = arc.try_lock()?;
+    Some(op(&mut table))
+}
+
 /// The fd numbers currently open for `task_id`, ascending. Returns an
 /// empty vec if the task has no table yet. Backs `/proc/<pid>/fd`.
 pub fn open_fds(task_id: u64) -> Vec<u32> {

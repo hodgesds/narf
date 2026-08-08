@@ -2560,6 +2560,29 @@ pub fn account_kernel_cpu_ns(delta_ns: u64) {
     *e = e.saturating_add(delta_ns);
 }
 
+/// Timer-trap-safe `(user_ns, kernel_ns)` for `task`. `None` on lock
+/// contention.
+///
+/// The split is the discriminator when a process burns tens of seconds
+/// before it starts serving: overwhelmingly USER time is compute the
+/// kernel cannot help with (llvmpipe/LLVM under a software renderer),
+/// while a large KERNEL share names the syscall or fault path as the
+/// cost, which IS ours.
+#[cfg(feature = "unix-latency-trace")]
+pub fn cpu_split_ns_try(task: u64) -> Option<(u64, u64)> {
+    let u = TASK_CPU_NS
+        .try_lock()?
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0);
+    let k = TASK_KERN_NS
+        .try_lock()?
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0);
+    Some((u, k))
+}
+
 /// This task's accumulated in-syscall (kernel) CPU time (ns).
 pub fn kern_time_ns_of(task: u64) -> u64 {
     TASK_KERN_NS
@@ -3313,6 +3336,16 @@ pub fn proc_comm_of_task(tid: u64) -> Option<alloc::string::String> {
 #[cfg(feature = "unix-latency-trace")]
 pub fn proc_comm_of_task_try(tid: u64) -> Option<alloc::string::String> {
     let g = PROC_COMM.try_lock()?;
+    g.as_ref().and_then(|m| m.get(&tid).cloned())
+}
+
+/// Timer-trap-safe argv lookup, keyed by TID (both `PROC_ARGV` and
+/// `PROC_COMM` are tid-keyed despite their `pid` parameter names — see
+/// `proc_argv_of`, which resolves pid→tid before indexing). Returns the
+/// NUL-separated pack; `None` on lock contention.
+#[cfg(feature = "unix-latency-trace")]
+pub fn proc_argv_of_task_try(tid: u64) -> Option<alloc::vec::Vec<u8>> {
+    let g = PROC_ARGV.try_lock()?;
     g.as_ref().and_then(|m| m.get(&tid).cloned())
 }
 

@@ -158,6 +158,141 @@ pub fn task_get(tid: u64) -> Option<Arc<Task>> {
 /// only because `TASKS` holds a ref for every task listed, so no drop here
 /// is ever the last one — and it is compiled out entirely without the
 /// feature. Do not promote this to a non-debug path.
+// ── `unix-latency-trace`: user-mode sampling profiler ────────────────
+//
+// "This process burns 41 s of user CPU before it starts serving" is where
+// the park census runs out. It says the task is computing, not stalled,
+// and nothing about WHAT. The timer trap already captures the interrupted
+// RIP on every tick, so a histogram of that RIP — sampled only while the
+// target task is in CPL 3 — is a profiler for free.
+//
+// Open-addressed, fixed-size, alloc-free: this runs in IRQ context on
+// every tick, where NARF forbids allocator calls. A full table drops
+// samples and says so rather than growing.
+
+/// Number of distinct RIPs the profile can hold. Power of two — the
+/// index is a mask, not a modulo.
+const PROF_SLOTS: usize = 512;
+static PROF_RIP: [AtomicU64; PROF_SLOTS] = [const { AtomicU64::new(0) }; PROF_SLOTS];
+static PROF_CNT: [AtomicU64; PROF_SLOTS] = [const { AtomicU64::new(0) }; PROF_SLOTS];
+/// tid being profiled; 0 = profiling off. Set by [`dbg_proc_roster`].
+static PROF_TID: AtomicU64 = AtomicU64::new(0);
+static PROF_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static PROF_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// comm of the task to profile. Exact match, so `kwin_wayland` does not
+/// also catch `kwin_wayland_wr`.
+const PROF_COMM: &str = "kwin_wayland";
+
+/// Record one user-mode RIP sample. Called from the timer trap on every
+/// tick that interrupted CPL 3; returns immediately (one relaxed load)
+/// unless `tid` is the profile target, so the non-target cost is a
+/// predictable branch.
+#[cfg(feature = "unix-latency-trace")]
+#[inline]
+pub fn dbg_profile_sample(tid: u64, rip: u64) {
+    if tid == 0 || PROF_TID.load(Ordering::Relaxed) != tid {
+        return;
+    }
+    PROF_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    // Bucket to 16 bytes: consecutive instructions in one hot basic block
+    // should land in one row rather than filling the table with
+    // near-duplicates.
+    let key = rip & !0xF;
+    let mut idx = ((key >> 4) as usize) & (PROF_SLOTS - 1);
+    for _ in 0..16 {
+        let cur = PROF_RIP[idx].load(Ordering::Relaxed);
+        if cur == key {
+            PROF_CNT[idx].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if cur == 0
+            && PROF_RIP[idx]
+                .compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            PROF_CNT[idx].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        idx = (idx + 1) & (PROF_SLOTS - 1);
+    }
+    PROF_DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Print the hottest sampled RIPs for the profiled task.
+///
+/// Addresses are raw and unsymbolized; resolve them offline against the
+/// task's mappings (the KDE work uses `INTERP_BIAS 0x4000_0000_0000`).
+/// Even unresolved the shape is informative: samples clustered in one
+/// narrow range are a hot loop, samples spread wide are broad work.
+#[cfg(feature = "unix-latency-trace")]
+fn dbg_profile_report() {
+    use core::fmt::Write as _;
+    let total = PROF_SAMPLES.load(Ordering::Relaxed);
+    if total == 0 {
+        return;
+    }
+    let tid = PROF_TID.load(Ordering::Relaxed);
+    let dropped = PROF_DROPPED.load(Ordering::Relaxed);
+    // System-wide perf deltas since the last report. Two things this
+    // gives that nothing else here does:
+    //
+    //  * `utick`/`ktick` — a CPL-sampled user/kernel split that does NOT
+    //    depend on `TASK_KERN_NS`, which the own-stack executor leaves at
+    //    zero (the fold in `dispatch` is skipped whenever the syscall
+    //    parked, i.e. almost always). Sampling cannot be defeated that way.
+    //  * `fault` — whether a task burning user time is actually executing
+    //    or thrashing on demand-paged mappings. `do_lookup_x` walking a
+    //    symbol table it has to fault in page by page looks exactly like
+    //    `do_lookup_x` doing arithmetic, until you count faults.
+    //
+    // System-wide, not per-task: fine while the profiled task dominates
+    // the machine, misleading otherwise. Read it as a rate, not a total.
+    static LAST: IrqSafeSpinLock<Option<narf_lib::perf::Snapshot>> = IrqSafeSpinLock::new(None);
+    let now = narf_lib::perf::snapshot();
+    let d = {
+        let mut g = LAST.lock();
+        let prev = g.replace(now);
+        prev.map(|p| {
+            (
+                now.syscalls.saturating_sub(p.syscalls),
+                now.page_faults.saturating_sub(p.page_faults),
+                now.ctx.saturating_sub(p.ctx),
+                now.user_ticks.saturating_sub(p.user_ticks),
+                now.kernel_ticks.saturating_sub(p.kernel_ticks),
+            )
+        })
+    };
+    let (sc, pf, cx, ut, kt) = d.unwrap_or((0, 0, 0, 0, 0));
+    let _ = writeln!(
+        narf_console::TrapWriter,
+        "PROFREP tid={tid} comm={PROF_COMM} samples={total} dropped={dropped} d_sysc={sc} d_fault={pf} d_ctx={cx} d_utick={ut} d_ktick={kt}"
+    );
+    // Top 8 by count. A linear rescan per pick keeps this alloc-free;
+    // 8 * 512 relaxed loads every 10 s is not worth a sort buffer.
+    let mut ceiling = u64::MAX;
+    for _ in 0..8 {
+        let mut best = (0usize, 0u64);
+        for i in 0..PROF_SLOTS {
+            let c = PROF_CNT[i].load(Ordering::Relaxed);
+            if c > best.1 && c < ceiling {
+                best = (i, c);
+            }
+        }
+        if best.1 == 0 {
+            break;
+        }
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "PROFTOP rip={:#x} n={} pct={}",
+            PROF_RIP[best.0].load(Ordering::Relaxed),
+            best.1,
+            best.1 * 100 / total
+        );
+        ceiling = best.1;
+    }
+}
+
 /// `unix-latency-trace`: compact roster of EVERY registered task —
 /// `tid comm pid pptid state`.
 ///
@@ -179,17 +314,67 @@ pub fn dbg_proc_roster() {
     let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
     for t in tasks {
         let pid = t.pid.load(Ordering::Relaxed);
+        let cpu = crate::handlers::cpu_split_ns_try(t.tid);
+        // Arm the profiler on the first task that matches. Done here
+        // because this is where comms are already being resolved; the
+        // trap-side sampler only does a relaxed compare against the tid.
+        if PROF_TID.load(Ordering::Relaxed) == 0
+            && crate::handlers::proc_comm_of_task_try(t.tid).as_deref() == Some(PROF_COMM)
+        {
+            PROF_TID.store(t.tid, Ordering::Relaxed);
+        }
         let _ = writeln!(
             narf_console::TrapWriter,
-            "PROCREP tid={} comm={} pid={} pptid={} st={} parked={}",
+            "PROCREP tid={} comm={} pid={} pptid={} st={} parked={} ums={} kms={}",
             t.tid,
             crate::handlers::proc_comm_of_task_try(t.tid).unwrap_or_default(),
             pid,
             crate::handlers::parent_of_get_try(pid).map_or(-1i64, |p| p as i64),
             t.state.load(Ordering::Relaxed),
             t.uctx.parked_in_syscall.load(Ordering::Relaxed) as u8,
+            // User vs in-syscall ms. A process that burns tens of seconds
+            // before it starts serving is either computing (user — nothing
+            // the kernel can fix) or paying for syscalls/faults (kernel —
+            // ours). The single summed figure /proc/<pid>/stat feeds the
+            // probe cannot tell those apart.
+            cpu.map_or(u64::MAX, |(u, _)| u / 1_000_000),
+            cpu.map_or(u64::MAX, |(_, k)| k / 1_000_000),
         );
+        // argv, on its own line. `comm` alone cannot distinguish
+        // `plasma-keyboard` run as a long-lived input method from the same
+        // binary run as a one-shot query — and that distinction is the whole
+        // question when a parent is blocked in `wait4` for it. PROC_ARGV is
+        // written at execve time against the exec'ing task, so cloned
+        // threads have no entry and drop out here on their own.
+        let Some(argv) = crate::handlers::proc_argv_of_task_try(t.tid) else {
+            continue;
+        };
+        if argv.is_empty() {
+            continue;
+        }
+        let _ = write!(narf_console::TrapWriter, "PROCARGV tid={} argv=", t.tid);
+        // NUL-separated pack -> one space-free token per argument, so a
+        // line mangled by cross-CPU interleaving is still parseable.
+        for (i, arg) in argv.split(|&b| b == 0).take(12).enumerate() {
+            if arg.is_empty() {
+                continue;
+            }
+            let _ = write!(
+                narf_console::TrapWriter,
+                "{}",
+                if i == 0 { "" } else { "|" }
+            );
+            for &b in arg.iter().take(64) {
+                let _ = write!(
+                    narf_console::TrapWriter,
+                    "{}",
+                    if b.is_ascii_graphic() { b as char } else { '.' }
+                );
+            }
+        }
+        let _ = writeln!(narf_console::TrapWriter);
     }
+    dbg_profile_report();
 }
 
 #[cfg(feature = "unix-latency-trace")]
@@ -203,7 +388,7 @@ pub fn dbg_park_census(tag: &str) {
         }
         let _ = writeln!(
             narf_console::TrapWriter,
-            "PARKREP{tag} tid={} comm={} pid={} pptid={} st={} scans={} checks={} pnfds={} epfd_enc={} netio={} waitchild={} wantpid={} futex={:#x} flock={:#x} deadline={:#x}",
+            "PARKREP{tag} tid={} comm={} pid={} pptid={} st={} scans={} checks={} pnfds={} epfd_enc={} netio={} waitchild={} wantpid={} waitid={} waitopts={:#x} futex={:#x} flock={:#x} deadline={:#x}",
             t.tid,
             crate::handlers::proc_comm_of_task_try(t.tid).unwrap_or_default(),
             t.pid.load(Ordering::Relaxed),
@@ -221,6 +406,12 @@ pub fn dbg_park_census(tag: &str) {
             // unconditionally so a stale value is visible rather than
             // silently masked.
             uc.wait_child_want_pid.load(Ordering::Relaxed),
+            // WHICH wait syscall, and with what options — a glibc
+            // `waitpid(pid, ., 0)` and a Qt/glib `waitid(P_PID, ., WEXITED)`
+            // look identical once parked, and they implicate completely
+            // different userspace machinery.
+            uc.wait_child_is_waitid.load(Ordering::Relaxed) as u8,
+            uc.wait_child_options.load(Ordering::Relaxed),
             uc.futex_uaddr.load(Ordering::Relaxed),
             uc.flock_key.load(Ordering::Relaxed),
             uc.sleep_deadline_ns.load(Ordering::Relaxed),
@@ -240,12 +431,43 @@ pub fn dbg_park_census(tag: &str) {
                 // Slot encoding (see poll::record_poll_wait):
                 // `events << 32 | (fd + 1)`; 0 = unused slot.
                 let slot = uc.poll_wait_fds[i].load(Ordering::Relaxed);
+                let fd = (slot as u32).wrapping_sub(1) as i32;
+                // The concrete FileOps type behind the fd, same source
+                // /proc/<pid>/fd uses for its `anon_inode:[Type]` link. An fd
+                // NUMBER says nothing; "this poller has been sitting on
+                // fd 50 for two minutes" only becomes a lead once fd 50 is
+                // named a socket, a timerfd, or an inotify.
+                // NOT `type_name_of_val(&*e.ops)`: `ops` is a `dyn FileOps`,
+                // and that returns the TRAIT object's name — every fd comes
+                // back "FileOps". (`/proc/<pid>/fd`'s `anon_inode:[…]` link
+                // has the same defect for the same reason.) `stat().file_type`
+                // is the real discriminator: Socket vs Fifo vs Special is
+                // exactly the distinction a starved poller turns on.
+                let kind = if fd >= 0 {
+                    crate::fd::try_with_table(t.tid, |tab| {
+                        tab.get(fd as u32)
+                            .map(|e| match e.ops.stat().mode.file_type {
+                                narf_filesystem::FileType::Socket => "sock",
+                                narf_filesystem::FileType::Fifo => "fifo",
+                                narf_filesystem::FileType::Special => "chr",
+                                narf_filesystem::FileType::Block => "blk",
+                                narf_filesystem::FileType::File => "reg",
+                                narf_filesystem::FileType::Dir => "dir",
+                                narf_filesystem::FileType::Symlink => "lnk",
+                            })
+                    })
+                    .flatten()
+                    .unwrap_or("?")
+                } else {
+                    "-"
+                };
                 let _ = write!(
                     narf_console::TrapWriter,
-                    "{}{}/{:#x}",
+                    "{}{}/{:#x}/{}",
                     if i == 0 { "" } else { "," },
-                    (slot as u32).wrapping_sub(1) as i32,
-                    (slot >> 32) as u32
+                    fd,
+                    (slot >> 32) as u32,
+                    kind
                 );
             }
             let _ = writeln!(

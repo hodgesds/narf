@@ -156,6 +156,14 @@ mod stall_wd {
             LAST_CPL[cpu].store((cs & 3) as u8, Ordering::Relaxed);
             LAST_TASK[cpu].store(narf_scheduler::current_task_id().raw(), Ordering::Relaxed);
         }
+        // User-mode sampling profile. The census can say a task is
+        // COMPUTING rather than stalled; only this says what it is
+        // computing. Ticks that interrupted the kernel are skipped — a
+        // kernel RIP is not the target's own code.
+        #[cfg(feature = "unix-latency-trace")]
+        if cs & 3 == 3 {
+            narf_userspace::task::dbg_profile_sample(narf_scheduler::current_task_id().raw(), rip);
+        }
         // Starved-accept attribution for the UNIXENQ/UNIXACC latency trace.
         // Deliberately AHEAD of the `DUMPED` gate and on its own cadence:
         // that gate latches on the FIRST dump of the boot (an early RCU
