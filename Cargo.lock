@@ -705,6 +705,20 @@ name = "narf-bpf-btf"
 version = "0.0.0"
 
 [[package]]
+name = "narf-bpf-idle"
+version = "0.0.0"
+dependencies = [
+ "narf-bpf",
+ "narf-bpf-isa",
+ "narf-bpf-structops",
+ "narf-bpf-verifier",
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-power",
+]
+
+[[package]]
 name = "narf-bpf-isa"
 version = "0.0.0"
 dependencies = [
@@ -718,6 +732,18 @@ dependencies = [
  "narf-bpf-isa",
  "narf-bpf-verifier",
  "narf-kernel-test",
+]
+
+[[package]]
+name = "narf-bpf-structops"
+version = "0.0.0"
+dependencies = [
+ "narf-bpf",
+ "narf-bpf-isa",
+ "narf-bpf-verifier",
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
 ]
 
 [[package]]
@@ -1634,6 +1660,7 @@ dependencies = [
  "narf-bluetooth",
  "narf-boot",
  "narf-bpf",
+ "narf-bpf-idle",
  "narf-bus",
  "narf-console",
  "narf-crypto",
@@ -2131,6 +2158,8 @@ dependencies = [
  "narf-block",
  "narf-boot",
  "narf-bpf",
+ "narf-bpf-idle",
+ "narf-bpf-structops",
  "narf-bus",
  "narf-busybox",
  "narf-capabilities",

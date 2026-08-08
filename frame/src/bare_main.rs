@@ -2243,6 +2243,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // (`bpf/specification/spec.md` §4.1) — is a direct call, not an
             // initcall, and arrives with the arena work.
             narf_bpf::register_initcalls();
+            // The BPF idle governor (a struct_ops consumer). Force-link anchor
+            // for its `narf.structops` descriptor; the governor itself is
+            // installed at runtime by a BPF program, not at boot.
+            #[cfg(feature = "bpf-idle")]
+            narf_bpf_idle::register_initcalls();
             narf_input::register_initcalls();
             narf_drivers_nvme::register_initcalls();
             narf_drivers_virtio::register_initcalls();

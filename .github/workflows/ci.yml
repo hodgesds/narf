@@ -161,13 +161,17 @@ jobs:
       # charge-PID provider in narf-scheduler, the affinity/priority hooks,
       # the block io accounting) are compiled and linted on BOTH arches —
       # otherwise the cgroup-gated code is never built in CI.
+      #
+      # `bpf-idle` is enabled for the same reason: the BPF struct_ops consumer
+      # crates (narf-bpf-idle, narf-bpf-structops) live behind that feature, so
+      # without it the kernel-target lint never compiles them on either arch.
       - name: cargo clippy (kernel / ${{ matrix.arch }})
         run: |
           cargo clippy -p narf-frame \
             --target ${{ matrix.arch }}-unknown-none \
             -Zbuild-std=core,compiler_builtins,alloc \
             -Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128 \
-            --features boot-smoke,cgroup-all \
+            --features boot-smoke,cgroup-all,bpf-idle \
             -- -D warnings
 
       - name: aarch64 UEFI loader tests + clippy

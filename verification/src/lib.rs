@@ -66,12 +66,23 @@ extern crate narf_crypto;
 static __FORCE_LINK_CRYPTO: fn() -> usize = || narf_crypto::blake3_hash(&[]).len();
 
 // narf-bpf contributes the `bpf` subsystem smokes. It also carries the only
-// writers of the `narf.kfuncs` and `narf.structops` link sections, so a
-// dropped compilation unit here costs more than a few tests: the kfunc
-// registry comes up empty and every program load fails to resolve a call.
+// writer of the `narf.kfuncs` link section, so a dropped compilation unit here
+// costs more than a few tests: the kfunc registry comes up empty and every
+// program load fails to resolve a call.
 extern crate narf_bpf;
 #[used]
 static __FORCE_LINK_BPF: fn() -> (usize, usize) = narf_bpf::summary;
+
+// narf-bpf-structops now carries the `narf.structops` link section (the
+// struct_ops descriptors) and the `bpf/structops` smokes; narf-bpf-idle carries
+// the `bpf/idle` smokes and installs a struct_ops descriptor of its own. Anchor
+// both so their sections survive dead-code elimination.
+extern crate narf_bpf_idle;
+extern crate narf_bpf_structops;
+#[used]
+static __FORCE_LINK_BPF_STRUCTOPS: fn() -> usize = narf_bpf_structops::summary;
+#[used]
+static __FORCE_LINK_BPF_IDLE: fn() = narf_bpf_idle::register_initcalls;
 
 use core::fmt::Write;
 

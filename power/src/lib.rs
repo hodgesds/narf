@@ -786,6 +786,29 @@ pub fn install_idle_governor<G: IdleGovernor>(
     Ok(())
 }
 
+/// Install an already-boxed idle governor under any authority of the
+/// idle-governor kind.
+///
+/// This is the entry a `struct_ops!` committer uses. The committer is generic
+/// over the cap marker (the macro makes it so), so it cannot present the
+/// concrete `Cap<IdleGov, Grant>` that [`install_idle_governor`] wants; the
+/// struct_ops layer has already proved the cap's kind matches the trait's
+/// declared `CapKind::IdleGovernor` before the committer runs. The runtime
+/// kind re-check here is the same belt-and-braces `structops::install` applies,
+/// so a caller reaching this directly still cannot install under the wrong
+/// authority.
+pub fn install_idle_governor_boxed<M: CapType>(
+    cap: &Cap<M, Grant>,
+    g: Box<dyn IdleGovernor>,
+) -> Result<(), PowerError> {
+    if M::KIND != CapKind::IdleGovernor {
+        return Err(PowerError::AuthorityRevoked);
+    }
+    cap.check_live()?;
+    *IDLE_GOVERNOR.lock() = Some(g);
+    Ok(())
+}
+
 /// Snapshot the active idle governor's name. Returns `None` if `init()`
 /// hasn't run yet. Mirrors `current_governor_name`.
 pub fn current_idle_governor_name() -> Option<&'static str> {

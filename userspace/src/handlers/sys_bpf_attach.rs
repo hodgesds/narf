@@ -273,7 +273,7 @@ fn resolve_target(attach_type: u32, target: u32) -> Result<LinkTarget, i64> {
         // LINUX-GAP: cgroup hooks, sockmap/sk_msg, LSM, flow dissector,
         // struct_ops-as-a-link, netfilter, tcx, perf events, kprobe/uprobe
         // multi, and the rest. NARF has no surface for any of them —
-        // `struct_ops` installs through `narf_bpf::structops::install`, which is
+        // `struct_ops` installs through `narf_bpf_structops::install`, which is
         // a kernel-side trait slot rather than an fd-shaped link. `ENOTSUP`
         // says "this kernel does not do that"; the `EINVAL` below says "that is
         // not a thing".

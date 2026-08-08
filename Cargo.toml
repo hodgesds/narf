@@ -26,6 +26,8 @@ members = [
     "bpf/isa",
     "bpf/verifier",
     "bpf/jit",
+    "bpf/structops",
+    "bpf-idle",
     "frame",
     "rcu",
     "bus",
