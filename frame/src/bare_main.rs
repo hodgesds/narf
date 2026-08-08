@@ -2248,6 +2248,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // installed at runtime by a BPF program, not at boot.
             #[cfg(feature = "bpf-idle")]
             narf_bpf_idle::register_initcalls();
+            // The BPF LED-control kfunc + its engine worker (blink ticks +
+            // command drain). Force-link anchor for the `narf_led_submit`
+            // `narf.kfuncs` entry.
+            #[cfg(feature = "bpf-leds")]
+            narf_bpf_leds::register_initcalls();
             narf_input::register_initcalls();
             narf_drivers_nvme::register_initcalls();
             narf_drivers_virtio::register_initcalls();

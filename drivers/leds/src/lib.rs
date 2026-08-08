@@ -51,9 +51,11 @@ pub mod leds_input_caps;
 pub mod leds_input_num;
 pub mod leds_input_scroll;
 pub mod leds_pwm;
+pub mod multicolor;
 #[cfg(feature = "linux-compat")]
 pub mod sysfs_bridge;
 pub mod triggers;
+pub mod worker;
 
 // Re-export the core types at crate root for convenience.
 pub use class::{
@@ -68,18 +70,23 @@ pub use leds_input_caps::{
 pub use leds_input_num::LedNumLock;
 pub use leds_input_scroll::LedScrollLock;
 pub use leds_pwm::LedPwm;
+pub use multicolor::{register_rgb_led, rgb_led_devices, RgbLed, SimpleRgbLed};
 pub use triggers::Trigger;
+pub use worker::{
+    submit_command, ACTION_BLINK, ACTION_OFF, ACTION_SET_BRIGHTNESS, ACTION_SET_COLOR,
+};
 
 // ── initcalls ─────────────────────────────────────────────────────
 
 /// Register LED subsystem initcalls. Call from the top-level
 /// `drivers::register_initcalls()` during Stage::Device.
 ///
-/// Currently registers:
-/// - The trigger-engine tick task (100 ms interval, implemented as a
-///   periodic wakeup once the scheduler's timer facility is wired up;
-///   today it is a stub so the subsystem compiles and tests without
-///   the full scheduler).
+/// Registers:
+/// - the LED class and (linux-compat) sysfs bridge, at `Stage::Device`;
+/// - the engine worker at `Stage::Late` — a periodic task that advances the
+///   trigger engine (so `Trigger::Timer`/`Heartbeat` blink actually ticks) and
+///   applies queued external commands (the BPF `narf_led_submit` path). Needs
+///   the scheduler, hence `Stage::Late`.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Device, "leds/class", || {
@@ -91,12 +98,18 @@ pub fn register_initcalls() {
         sysfs_bridge::populate_leds_class();
         InitResult::Ok
     });
+    narf_init::register(Stage::Late, "leds/worker", || {
+        worker::start_worker();
+        InitResult::Ok
+    });
 }
 
 /// Test helper: drain the LED registry and trigger-engine state.
 #[doc(hidden)]
 pub fn __reset_all_for_test() {
+    worker::__reset_for_test();
     class::__reset_for_test();
+    multicolor::__reset_for_test();
     triggers::__reset_for_test();
 }
 

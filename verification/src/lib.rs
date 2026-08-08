@@ -78,11 +78,16 @@ static __FORCE_LINK_BPF: fn() -> (usize, usize) = narf_bpf::summary;
 // the `bpf/idle` smokes and installs a struct_ops descriptor of its own. Anchor
 // both so their sections survive dead-code elimination.
 extern crate narf_bpf_idle;
+extern crate narf_bpf_leds;
 extern crate narf_bpf_structops;
 #[used]
 static __FORCE_LINK_BPF_STRUCTOPS: fn() -> usize = narf_bpf_structops::summary;
 #[used]
 static __FORCE_LINK_BPF_IDLE: fn() = narf_bpf_idle::register_initcalls;
+// narf-bpf-leds carries the `narf_led_submit` kfunc (a `narf.kfuncs` writer)
+// and the `bpf/leds` smoke; anchor it so both survive the link.
+#[used]
+static __FORCE_LINK_BPF_LEDS: fn() = narf_bpf_leds::register_initcalls;
 
 use core::fmt::Write;
 

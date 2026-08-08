@@ -95,6 +95,7 @@ narf-userspace       = { path = "../userspace" }
 narf-user-runtime    = { path = "../user-runtime" }
 narf-bpf             = { path = "../bpf" }
 narf-bpf-idle        = { path = "../bpf-idle", optional = true }
+narf-bpf-leds        = { path = "../bpf-leds", optional = true }
 narf-kernel-test     = { path = "../verification/kernel-test" }
 narf-verification    = { path = "../verification", optional = true }
 
@@ -281,13 +282,24 @@ kernel-test  = [
 # nothing an attacker sees. This feature turns on the smokes. It also pulls in
 # the BPF idle governor (a struct_ops consumer) and its `bpf/idle` +
 # `bpf/structops` smokes, so the struct_ops seam is exercised end to end.
-bpf = ["narf-bpf/kernel-test", "bpf-idle", "narf-bpf-idle/kernel-test"]
+bpf = [
+    "narf-bpf/kernel-test",
+    "bpf-idle",
+    "narf-bpf-idle/kernel-test",
+    "bpf-leds",
+    "narf-bpf-leds/kernel-test",
+]
 
 # The BPF idle governor: a struct_ops consumer that lets a runtime-supplied BPF
 # program drive `narf-power`'s C-state selector. Off by default during bring-up
 # (the confinement layer in specification/domain-confinement.md is not built
 # yet); enable to compile the consumer into the image.
 bpf-idle = ["dep:narf-bpf-idle"]
+
+# The BPF LED control kfunc (`narf_led_submit`): lets a program set an LED's
+# brightness, blink it, or set an RGB color, mediated through the LED engine
+# worker. Off by default; enable to compile the kfunc + start the worker.
+bpf-leds = ["dep:narf-bpf-leds"]
 
 # Chain into verification's opt-in user-mode smoke tests (round-trip,
 # yield_resume, poll_yield_exit, future yield_exit). These pass the

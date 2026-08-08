@@ -60,6 +60,7 @@ lowering of sleepable programs (§8.5).
 | `narf-bpf-verifier` | type graph, IR, abstract interpretation | `isa` |
 | `narf-bpf-jit` | x86_64 and aarch64 emitters | `isa`, `verifier` |
 | `narf-bpf` | kernel runtime, `kfunc!`/`struct_ops!`, attach adapters | the above + kernel crates |
+| `narf-bpf-leds` | atomic LED-command kfunc + worker-registration seam | `narf-bpf`, `narf-drivers-leds`, `narf-init` |
 
 The first three are dependency-free of the kernel and host-testable via
 `cargo xtask host-test`. `narf-bpf` must **not** depend on `narf-userspace` —
@@ -89,6 +90,18 @@ depends on `narf-bpf`.
 
 Descriptors go into a `narf.kfuncs` link section, collected at boot exactly as
 `narf-kernel-test` collects `narf.tests`.
+
+#### LED command kfunc
+
+`narf_led_submit(idx: u32, action: u32, value: u32) -> i64` is an
+`Atomic` kfunc provided by `narf-bpf-leds`. Actions are brightness (0),
+blink (1, `on_ms << 16 | off_ms`), off (2), and RGB color (3,
+`0x00RRGGBB`). It returns 0 after enqueue, -EAGAIN when the bounded mailbox
+cannot accept the command, and -EINVAL for an unknown action. Device lookup and
+hardware access occur only in the `Stage::Late` worker: the kfunc itself does
+not allocate, lock, sleep, or dereference driver state, preserving §4.6. An
+out-of-range device index is retained at full `u32` width and becomes a
+drain-time no-op.
 
 ### 3.3 Memory-subsystem interface (Stream B)
 

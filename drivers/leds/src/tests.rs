@@ -327,3 +327,111 @@ fn smoke_led_registry_multi() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/leds", smoke_led_registry_multi);
+
+// ── engine worker: the BPF command mailbox ─────────────────────────
+
+fn smoke_led_worker_applies_brightness_blink_off() -> TestResult {
+    use crate::class::SimpleLed;
+    use crate::worker::{drain, submit_command, ACTION_BLINK, ACTION_OFF, ACTION_SET_BRIGHTNESS};
+    crate::__reset_all_for_test();
+    register_led(Arc::new(SimpleLed::brightness_led("bpf-lvl")));
+    let idx = led_devices()
+        .iter()
+        .position(|d| d.name() == "bpf-lvl")
+        .expect("registered") as u32;
+
+    // Brightness.
+    if !submit_command(idx, ACTION_SET_BRIGHTNESS, 200) {
+        return TestResult::Fail("mailbox rejected a brightness command");
+    }
+    drain();
+    if led_devices()[idx as usize].brightness() != 200 {
+        return TestResult::Fail("brightness command did not reach the LED");
+    }
+
+    // Blink → Timer trigger (on 250 ms, off 100 ms).
+    let _ = submit_command(idx, ACTION_BLINK, (250u32 << 16) | 100);
+    drain();
+    match led_devices()[idx as usize].current_trigger() {
+        Trigger::Timer {
+            on_ms: 250,
+            off_ms: 100,
+        } => {}
+        _ => return TestResult::Fail("blink command did not set a Timer trigger"),
+    }
+
+    // Off → trigger cleared + brightness 0.
+    let _ = submit_command(idx, ACTION_OFF, 0);
+    drain();
+    if led_devices()[idx as usize].brightness() != 0
+        || led_devices()[idx as usize].current_trigger() != Trigger::None
+    {
+        return TestResult::Fail("off command did not clear the LED");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/leds",
+    smoke_led_worker_applies_brightness_blink_off
+);
+
+fn smoke_led_worker_sets_rgb_color() -> TestResult {
+    use crate::multicolor::{register_rgb_led, rgb_led_devices, SimpleRgbLed};
+    use crate::worker::{drain, submit_command, ACTION_SET_COLOR};
+    crate::__reset_all_for_test();
+    register_rgb_led(Arc::new(SimpleRgbLed::new("bpf-rgb")));
+
+    // 0xFF8000 = (255, 128, 0).
+    if !submit_command(0, ACTION_SET_COLOR, 0x00FF_8000) {
+        return TestResult::Fail("mailbox rejected a color command");
+    }
+    drain();
+    let devs = rgb_led_devices();
+    match devs.first() {
+        Some(dev) if dev.color() == (0xFF, 0x80, 0x00) => TestResult::Pass,
+        Some(_) => TestResult::Fail("color command did not reach the RGB LED"),
+        None => TestResult::Fail("RGB LED vanished"),
+    }
+}
+kernel_test_in!("drivers/leds", smoke_led_worker_sets_rgb_color);
+
+fn smoke_led_worker_mailbox_bounds_and_frees() -> TestResult {
+    use crate::class::SimpleLed;
+    use crate::worker::{drain, submit_command, ACTION_SET_BRIGHTNESS};
+    crate::__reset_all_for_test();
+    register_led(Arc::new(SimpleLed::onoff("bpf-full")));
+
+    // A lossy ring must eventually refuse rather than allocate or block —
+    // that is what makes the kfunc atomic-context safe.
+    while submit_command(0, ACTION_SET_BRIGHTNESS, 1) {}
+    if submit_command(0, ACTION_SET_BRIGHTNESS, 1) {
+        return TestResult::Fail("mailbox accepted past its capacity");
+    }
+    // Draining frees the slots.
+    drain();
+    if !submit_command(0, ACTION_SET_BRIGHTNESS, 1) {
+        return TestResult::Fail("mailbox did not free slots after a drain");
+    }
+    drain();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/leds", smoke_led_worker_mailbox_bounds_and_frees);
+
+fn smoke_led_worker_preserves_full_device_index() -> TestResult {
+    use crate::class::SimpleLed;
+    use crate::worker::{drain, submit_command, ACTION_SET_BRIGHTNESS};
+    crate::__reset_all_for_test();
+    register_led(Arc::new(SimpleLed::brightness_led("bpf-index-width")));
+
+    // The old packed mailbox silently truncated idx to 16 bits, turning 65536
+    // into device 0. A bad full-width index must remain bad at drain time.
+    if !submit_command(1 << 16, ACTION_SET_BRIGHTNESS, 99) {
+        return TestResult::Fail("mailbox rejected a representable u32 index");
+    }
+    drain();
+    if led_devices()[0].brightness() != 0 {
+        return TestResult::Fail("mailbox truncated a u32 device index");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/leds", smoke_led_worker_preserves_full_device_index);
