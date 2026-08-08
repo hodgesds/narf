@@ -667,6 +667,10 @@ fn smoke_io_mux_empty_reads_are_not_eof() -> TestResult {
             RawWaker::new(p, &VT)
         }
         static VT: RawWakerVTable = RawWakerVTable::new(clone, nop, nop, nop);
+        // SAFETY: `VT`'s four fn pointers are the ones defined just above and
+        // are valid for `'static`. The data pointer is null and every vtable
+        // entry ignores it (`nop` discards it; `clone` only re-wraps it), so
+        // it is never dereferenced — the contract `Waker::from_raw` requires.
         let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
         let mut cx = Context::from_waker(&w);
         let mut fut = efd.write(0, &eight);

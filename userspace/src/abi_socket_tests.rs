@@ -798,8 +798,9 @@ kernel_test_in!(
 ///      that breaks an infinite park out of its re-park loop), and
 ///   2. the same poll scan a parked poller re-executes on wake must flip
 ///      the listener 0 → POLLIN once a connection is pending.
-/// Either half regressing re-opens the "listener never accepts /
-/// accepts only on an unrelated wake" class (weston no-serve).
+///
+/// Either half regressing re-opens the "listener never accepts / accepts
+/// only on an unrelated wake" class (weston no-serve).
 fn smoke_abi_socket_unix_listener_connect_wakes_parked_poller() -> TestResult {
     with_setup(|| {
         let srv = open_unix_stream()?;
