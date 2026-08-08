@@ -431,6 +431,42 @@ fn scan_program(v: &VerifiedProgram) -> Result<(), JitSkip> {
     Ok(())
 }
 
+/// Resolve every map pseudo-form `LD_IMM64` to the address the interpreter would
+/// compute — the map's own `Arc` pointer, which the loaded program keeps alive.
+///
+/// `MapFd`/`MapIdx` (the map *handle*, the only forms a loaded program can carry
+/// — the value pseudo-forms are rejected at load) resolve here; anything else is
+/// left out and runs interpreted. The result is sorted by instruction index,
+/// which the emitter binary-searches.
+fn resolve_map_imm64(
+    v: &VerifiedProgram,
+    maps: &[(i32, alloc::sync::Arc<crate::map::BpfMap>)],
+) -> alloc::vec::Vec<(u32, u64)> {
+    use narf_bpf_isa::{decode, Decoded, Imm64};
+    let mut out = alloc::vec::Vec::new();
+    let mut i = 0usize;
+    while i < v.insns.len() {
+        let Ok((d, width)) = decode(&v.insns, i) else {
+            break;
+        };
+        if let Decoded::LoadImm64 { value, .. } = d {
+            let addr = match value {
+                Imm64::MapFd(fd) => maps.iter().find(|(f, _)| *f == fd).map(|(_, m)| m),
+                Imm64::MapIdx(idx) => usize::try_from(idx)
+                    .ok()
+                    .and_then(|k| maps.get(k))
+                    .map(|(_, m)| m),
+                _ => None,
+            };
+            if let Some(m) = addr {
+                out.push((i as u32, alloc::sync::Arc::as_ptr(m) as u64));
+            }
+        }
+        i += width;
+    }
+    out
+}
+
 /// Compile `v` and publish it as executable text.
 ///
 /// `fully_verified` must be `false` when the program reached
@@ -449,6 +485,7 @@ pub fn try_compile(
     v: &VerifiedProgram,
     fully_verified: bool,
     arena_count: usize,
+    maps: &[(i32, alloc::sync::Arc<crate::map::BpfMap>)],
 ) -> Result<JitImage, JitSkip> {
     if !fully_verified {
         return Err(JitSkip::NotFullyVerified);
@@ -485,7 +522,9 @@ pub fn try_compile(
     }
     scan_program(v)?;
 
-    let compiled = narf_bpf_jit::compile(v).map_err(|_| JitSkip::Unsupported)?;
+    let map_imm64 = resolve_map_imm64(v, maps);
+    let compiled =
+        narf_bpf_jit::compile_resolved(v, &map_imm64).map_err(|_| JitSkip::Unsupported)?;
     let cap = jit_cap();
     let a = bpf_text::alloc(cap, compiled.code.len(), 0).map_err(|_| JitSkip::TextUnavailable)?;
 

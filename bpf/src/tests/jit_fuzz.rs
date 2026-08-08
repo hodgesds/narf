@@ -38,9 +38,9 @@
 //!   to a move — see [`neutralise_dead_calls`].
 //!
 //! The instruction *repertoire* is deliberately exactly what the backends
-//! lower: a shape neither backend emits (a map pseudo-form `LD_IMM64`, arena
-//! atomics) would make every program containing it fall back, and a fuzzer whose
-//! subjects fall back is a fuzzer comparing the interpreter with itself.
+//! lower: a shape neither backend emits (an arena atomic) would make every
+//! program containing it fall back, and a fuzzer whose subjects fall back is a
+//! fuzzer comparing the interpreter with itself.
 //!
 //! Three lowered shapes are deliberately *not* generated here and are covered by
 //! goldens plus targeted `smoke_bpf_jit_*_matches_the_interpreter` tests instead:
@@ -1485,38 +1485,39 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
     if !narf_bpf_jit::has_backend() {
         return TestResult::Skip(NO_BACKEND);
     }
-    // A map pseudo-form `LD_IMM64` is the durable probe: it verifies through the
-    // real loader (given a map to point at) yet resolves to an address the emit
-    // pass never has, so both backends leave it interpreted. (The multiply,
-    // atomic, LD_IMM64, BPF-to-BPF-call, fetching-bitwise-atomic and `may_goto`
-    // probes that once lived here are all lowered now; arena atomics are the only
-    // other unlowered instruction shape, and they need an arena to set up.)
-    let Ok(map) = crate::tests::mk(crate::map::MapKind::Array, 4, 8, 1) else {
-        return TestResult::Fail("could not create a map for the probe");
+    // An arena atomic is the durable probe: it verifies through the real loader
+    // (given an arena to point at) yet has no lowering — the arena addressing
+    // shape and the atomic/cmpxchg-loop scratch registers collide, so both
+    // backends leave it interpreted. (The multiply, atomic, LD_IMM64,
+    // BPF-to-BPF-call, fetching-bitwise-atomic, `may_goto` and map-pseudo
+    // LD_IMM64 probes that once lived here are all lowered now.)
+    let cap = crate::arena::kernel_arena_cap();
+    let group = match crate::arena::ArenaGroup::with_one(cap, 1) {
+        Ok(g) => alloc::sync::Arc::new(g),
+        Err(_) => return TestResult::Fail("could not reserve an arena for the probe"),
     };
     let items = alloc::vec![
-        // Load the map handle into R1 (unused) so the program is well-formed
-        // without dereferencing it; R0 = 0 is what it returns.
-        Decoded::LoadImm64 {
-            dst: r(1),
-            value: narf_bpf_isa::Imm64::MapFd(3),
+        call_arena_base(),    // R0 = the arena base handle
+        super::mov_reg(6, 0), // park it in R6, which survives the call
+        super::mov_imm(0, 0), // R0 = 0, so `exit` does not return a pointer
+        super::mov_imm(1, 7), // the addend
+        Decoded::Atomic {
+            size: Size::Dw,
+            op: AtomicOp::Add { fetch: false },
+            dst: r(6),
+            src: r(1),
+            off: 0,
         },
-        super::mov_imm(0, 0),
         Decoded::Exit,
     ];
-    let Ok(p) = super::load_with_maps(
-        "unlowered",
-        asm(&items),
-        Context::Atomic,
-        alloc::vec![(3, map)],
-    ) else {
+    let Some(p) = load_against(&group, &items) else {
         // A shape the *verifier* refuses is not evidence about the backends, and
         // silently skipping it would hollow this out.
-        note!("bpf-fuzz: the verifier rejected the map-pseudo LD_IMM64 probe");
+        note!("bpf-fuzz: the verifier rejected the arena-atomic probe");
         return TestResult::Fail("the unlowered-shape probe no longer verifies");
     };
     if p.is_jited() {
-        note!("bpf-fuzz: a backend now lowers a map-pseudo LD_IMM64 — extend the repertoire");
+        note!("bpf-fuzz: a backend now lowers an arena atomic — extend the repertoire");
         return TestResult::Fail(
             "a backend gained a shape the fuzzer does not generate — extend the repertoire",
         );

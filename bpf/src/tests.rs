@@ -428,6 +428,44 @@ fn smoke_bpf_jit_may_goto_matches_the_interpreter() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_jit_may_goto_matches_the_interpreter);
 
+fn smoke_bpf_jit_map_ld_imm64_matches_the_interpreter() -> TestResult {
+    // A map pseudo-form LD_IMM64 no longer forces the whole program to the
+    // interpreter: with the loader-resolved address (the map's Arc pointer) it
+    // JITs. The handle is loaded into R1 (a returned pointer is refused by the
+    // verifier), so what is observed is that the program compiled and that its
+    // scalar result agrees with the interpreter.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let Ok(map) = mk(MapKind::Array, 4, 8, 1) else {
+        return TestResult::Fail("could not create a map");
+    };
+    let insns = asm(&[
+        Decoded::LoadImm64 {
+            dst: r(1),
+            value: Imm64::MapFd(3),
+        },
+        mov_imm(0, 42),
+        EXIT,
+    ]);
+    let Ok(p) = load_with_maps("mapimm", insns, Context::Atomic, alloc::vec![(3, map)]) else {
+        return TestResult::Fail("load rejected a map-pseudo LD_IMM64 program");
+    };
+    if !p.is_jited() {
+        return TestResult::Fail("a map-pseudo LD_IMM64 program did not JIT");
+    }
+    match diff_run(&p, [0; 4]) {
+        Ok(()) => {}
+        Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+        Err(_) => return TestResult::Fail("map-pseudo LD_IMM64 diverged from the interpreter"),
+    }
+    if !matches!(p.run_atomic([0; 4], 4), Some(Outcome::Returned(42))) {
+        return TestResult::Fail("map-pseudo LD_IMM64 program returned the wrong value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_jit_map_ld_imm64_matches_the_interpreter);
+
 fn smoke_bpf_interp_loop_terminates() -> TestResult {
     // r0 = 0; r1 = 10; loop { r0 += 1; r1 -= 1; if r1 != 0 goto loop } exit
     let insns = asm(&[
@@ -2065,7 +2103,7 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
 
     // Gate 3: a probe read — a fault site that is not an arena access — is
     // refused, and named as such.
-    if crate::jit_glue::try_compile(&base(false), true, 0).err()
+    if crate::jit_glue::try_compile(&base(false), true, 0, &[]).err()
         != Some(crate::jit_glue::JitSkip::HasFaultSites)
     {
         return TestResult::Fail("a non-arena fault site must still be refused by gate 3");
@@ -2073,7 +2111,7 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
     // Gate 2: an arena program with no arena has no slot base to be entered
     // with, and one with two has the straddling divergence.
     for n in [0usize, 2, 3] {
-        if crate::jit_glue::try_compile(&base(true), true, n).err()
+        if crate::jit_glue::try_compile(&base(true), true, n, &[]).err()
             != Some(crate::jit_glue::JitSkip::UsesArena)
         {
             return TestResult::Fail("gate 2 must refuse any arena count other than one");
@@ -2082,7 +2120,7 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
     // And a gate that refuses everything is not a gate: the same program with
     // exactly one arena is accepted, so the two refusals above are about the
     // count and the flag rather than about arena programs in general.
-    match crate::jit_glue::try_compile(&base(true), true, 1) {
+    match crate::jit_glue::try_compile(&base(true), true, 1, &[]) {
         Ok(image) => {
             // …and the emitted image really does contain the arena shape, so
             // `run_atomic`'s belt will demand a slot base for it. An `Ok` whose

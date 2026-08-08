@@ -619,6 +619,32 @@ fn a64_golden_ld_imm64() {
 }
 
 #[test]
+fn a64_a_resolved_map_pseudo_ld_imm64_materialises_the_address() {
+    // Given the loader-resolved address (here 42, into R6 = x19), a map
+    // pseudo-form is the same `MOVZ`/`MOVK` sequence as a plain constant.
+    let prog = verified(&[
+        Decoded::LoadImm64 {
+            dst: r(6),
+            value: Imm64::MapFd(3),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = aarch64::compile_resolved(&prog, &[(0, 42)]).expect("compiles");
+    let w = a64_words(&c.code);
+    let seq = [
+        0xd280_0553, // mov  x19, #42
+        0xf2a0_0013, // movk x19, #0, lsl #16
+        0xf2c0_0013, // movk x19, #0, lsl #32
+        0xf2e0_0013, // movk x19, #0, lsl #48
+    ];
+    assert!(
+        w.windows(seq.len()).any(|x| x == seq),
+        "a resolved map LD_IMM64 must materialise the address, got {w:08x?}"
+    );
+}
+
+#[test]
 fn a64_golden_atomics() {
     // Every lowered atomic form, dst = R10 (FP = x25), src = R6 (x19), off = 0
     // so the address is FP directly (the offset fold is exercised elsewhere),
@@ -1110,9 +1136,11 @@ fn a64_reports_unsupported_rather_than_emitting_wrong_code() {
             },
         ),
         (
-            // A map pseudo-form is likewise not emitted — it resolves to an
-            // address the emitter never has.
-            "map-pseudo-ld_imm64",
+            // A map pseudo-form with no resolved address (the empty-table path,
+            // which `compile` uses) has nothing to materialise and is refused;
+            // given the loader's address it is emitted — see
+            // `a64_a_resolved_map_pseudo_ld_imm64_materialises_the_address`.
+            "unresolved-map-pseudo-ld_imm64",
             Decoded::LoadImm64 {
                 dst: r(0),
                 value: Imm64::MapFd(3),

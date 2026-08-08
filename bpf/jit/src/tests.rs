@@ -818,9 +818,10 @@ fn may_goto_is_an_unconditional_jump() {
 }
 
 #[test]
-fn a_map_pseudo_ld_imm64_is_refused() {
-    // Only the plain-value form is emitted; a map pseudo-form resolves to an
-    // address this pass does not have, so it runs interpreted.
+fn an_unresolved_map_pseudo_ld_imm64_is_refused() {
+    // Without a resolved address, a map pseudo-form has nothing to materialise,
+    // so it runs interpreted rather than being mis-emitted. (`compile` is
+    // `compile_resolved` with an empty table.)
     let prog = verified(&[
         Decoded::LoadImm64 {
             dst: r(0),
@@ -830,7 +831,28 @@ fn a_map_pseudo_ld_imm64_is_refused() {
     ]);
     assert!(
         matches!(compile(&prog), Err(JitError::Unsupported { .. })),
-        "a map pseudo LD_IMM64 must be refused, not mis-emitted"
+        "an unresolved map pseudo LD_IMM64 must be refused, not mis-emitted"
+    );
+}
+
+#[test]
+fn a_resolved_map_pseudo_ld_imm64_materialises_the_address() {
+    // Given the loader-resolved address, a map pseudo-form is the same 10-byte
+    // `mov r64, imm64` as a plain constant — over the address, here R6 (rbx).
+    let prog = verified(&[
+        Decoded::LoadImm64 {
+            dst: r(6),
+            value: Imm64::MapFd(3),
+        },
+        mov(0, 0),
+        EXIT,
+    ]);
+    let c = crate::compile_resolved(&prog, &[(0, 0x1122_3344_5566_7788)]).expect("compiles");
+    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    assert_eq!(
+        &body[..10],
+        &[0x48, 0xBB, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11], // movabs rbx, ...
+        "a resolved map LD_IMM64 must materialise the address"
     );
 }
 

@@ -754,22 +754,16 @@ kernel_test_in!(
     smoke_bpf_kfunc_prog_owned_across_await_still_leaks_neg
 );
 
-// ── what the JIT does *not* cover ───────────────────────────────────
+// ── the JIT covers the acquire/release path too ─────────────────────
 
-/// A tripwire, not a wish: the acquire/release pair is reachable from the
-/// interpreter only, so no differential comparison covers it.
-///
-/// The reason is not the kfuncs — `crate::tests`' `narf_test_arg_mix` proves
-/// the emitter's kfunc call sequence against the interpreter. It is the map
-/// handle: `LD_IMM64`'s pseudo-forms have no lowering in either emitter, so
-/// `narf_bpf_jit::compile` declines any program that names a map, and
-/// `run_atomic` falls back to the interpreter.
-///
-/// Asserted rather than written in a comment because the day the emitter
-/// learns `LD_IMM64 MapFd` this smoke goes red, and the right response is to
-/// add the differential run — not to delete the assertion. A comment would
-/// simply have gone stale, silently, on the one commit where it mattered.
-fn body_acquire_path_is_interpreter_only() -> R {
+/// The acquire/release pair now has a native lowering: `LD_IMM64 MapFd`
+/// materialises the loader-resolved map handle, so a program that names a map
+/// JITs end to end (the kfunc call sequence was already emitted — see
+/// `crate::tests`' `narf_test_arg_mix`). This was a tripwire asserting the
+/// *absence* of that lowering; now that it exists, the tripwire has become the
+/// differential comparison it always said to add — native and interpreted must
+/// agree, and both must balance the map's refcount and pins.
+fn body_acquire_path_matches_the_interpreter() -> R {
     let map = a_map()?;
     let prog = load(
         "jit_probe",
@@ -786,14 +780,37 @@ fn body_acquire_path_is_interpreter_only() -> R {
         &map,
     )
     .map_err(|_| "acquire/test/release did not verify")?;
-    if prog.jited_len() != 0 {
-        return Err("the JIT now compiles a program that names a map, so the \
-                    acquire/release path has a native lowering and needs a \
-                    differential comparison against the interpreter");
+    // The map handle no longer forces a fallback, so the whole path is native.
+    // Where there is no backend at all there is nothing to compare — the
+    // interpreter alone still has to balance, which the run below checks.
+    let jited = prog.jited_len() != 0;
+    if !jited && narf_bpf_jit::has_backend() {
+        return Err("the acquire/release path names a map and should now JIT");
+    }
+    let baseline = Arc::strong_count(&map);
+
+    // Native and interpreted must take the same path and leave the same balance.
+    let native = prog
+        .run_atomic([0; crate::interp::MAX_CTX_WORDS], 0)
+        .ok_or("the native run was declined")?;
+    if native.value() != 1 {
+        return Err("the native run did not take the acquired path");
+    }
+    if Arc::strong_count(&map) != baseline || map.bpf_pins() != 0 {
+        return Err("the native run did not balance the map's refcount/pins");
+    }
+    let interp = prog
+        .run_atomic_interpreted([0; crate::interp::MAX_CTX_WORDS], 0)
+        .ok_or("the interpreted run was declined")?;
+    if interp.value() != native.value() {
+        return Err("native and interpreted acquire/release results differ");
+    }
+    if Arc::strong_count(&map) != baseline || map.bpf_pins() != 0 {
+        return Err("the interpreted run did not balance the map's refcount/pins");
     }
     Ok(())
 }
-fn smoke_bpf_kfunc_acquire_path_is_interpreter_only_neg() -> TestResult {
-    wrap(body_acquire_path_is_interpreter_only())
+fn smoke_bpf_kfunc_acquire_path_matches_the_interpreter() -> TestResult {
+    wrap(body_acquire_path_matches_the_interpreter())
 }
-kernel_test_in!("bpf", smoke_bpf_kfunc_acquire_path_is_interpreter_only_neg);
+kernel_test_in!("bpf", smoke_bpf_kfunc_acquire_path_matches_the_interpreter);

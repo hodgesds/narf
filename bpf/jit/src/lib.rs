@@ -246,19 +246,31 @@ pub const fn has_backend() -> bool {
 /// remains a complete implementation, so an un-emittable instruction means
 /// "run this one interpreted", not "reject the program".
 pub fn compile(prog: &VerifiedProgram) -> Result<Compiled, JitError> {
+    compile_resolved(prog, &[])
+}
+
+/// As [`compile`], but with the loader-resolved addresses for map pseudo-form
+/// `LD_IMM64`s — `(instruction index, address)` pairs, sorted by index. The
+/// verifier does not have these (an `Arc` pointer is a runtime value), so the
+/// loader supplies them; a map form whose index is absent runs interpreted, as
+/// every one did before.
+pub fn compile_resolved(
+    prog: &VerifiedProgram,
+    map_imm64: &[(u32, u64)],
+) -> Result<Compiled, JitError> {
     #[cfg(target_arch = "x86_64")]
     {
-        x86_64::compile(prog)
+        x86_64::compile_resolved(prog, map_imm64)
     }
     #[cfg(target_arch = "aarch64")]
     {
-        aarch64::compile(prog)
+        aarch64::compile_resolved(prog, map_imm64)
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         // Reported as `Unsupported` at instruction 0 so the caller's existing
         // fallback path handles it with no special case.
-        let _ = prog;
+        let _ = (prog, map_imm64);
         Err(JitError::Unsupported {
             at: 0,
             what: "no native backend for this architecture",

@@ -57,11 +57,11 @@
 //! calls** — the last being [`emit_subprog_call`]'s frame push, the JIT twin of
 //! the interpreter's `push_frame`.
 //!
-//! What is left interpreted: the map and subprogram-address pseudo-forms of
-//! `LD_IMM64` (they resolve to addresses this pass does not have), arena atomics,
-//! and arena accesses in a program that also makes BPF-to-BPF calls (the call
-//! frame moves `rsp`, which the arena base is parked relative to). Everything
-//! unemitted returns
+//! What is left interpreted: the subprogram-address and BTF-id pseudo-forms of
+//! `LD_IMM64` (the map forms are emitted over the loader-resolved address; these
+//! two are never resolved), arena atomics, and arena accesses in a program that
+//! also makes BPF-to-BPF calls (the call frame moves `rsp`, which the arena base
+//! is parked relative to). Everything unemitted returns
 //! [`JitError::Unsupported`], which the caller answers by interpreting — the
 //! interpreter is a complete implementation, so an unemitted instruction costs
 //! speed and not correctness. That is the property that makes it safe to grow
@@ -746,7 +746,18 @@ fn emit_fuel_burn(e: &mut Emit, n: u32, relocs: &mut Vec<Reloc>) {
 /// with a real convergence argument — the Linux post-mortem is a genuine
 /// hazard, just not one this code was exposed to.
 pub fn compile(prog: &VerifiedProgram) -> Result<Compiled, JitError> {
-    let (e, _) = emit_pass(prog)?;
+    compile_resolved(prog, &[])
+}
+
+/// As [`compile`], but with the resolved addresses for map pseudo-form
+/// `LD_IMM64`s — `(instruction index, address)` pairs sorted by index. The
+/// loader resolves them (the verifier has no runtime map addresses); a map form
+/// whose index is absent falls back, as every one did before this existed.
+pub fn compile_resolved(
+    prog: &VerifiedProgram,
+    map_imm64: &[(u32, u64)],
+) -> Result<Compiled, JitError> {
+    let (e, _) = emit_pass(prog, map_imm64)?;
     Ok(Compiled {
         code: e.buf,
         faults: {
@@ -760,7 +771,10 @@ pub fn compile(prog: &VerifiedProgram) -> Result<Compiled, JitError> {
 
 /// One sizing/emission pass. Returns the emitter and the offset table this
 /// pass produced.
-fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
+fn emit_pass(
+    prog: &VerifiedProgram,
+    map_imm64: &[(u32, u64)],
+) -> Result<(Emit, Vec<u32>), JitError> {
     let mut e = Emit::default();
     let mut relocs: Vec<Reloc> = Vec::new();
     let mut out = Vec::with_capacity(prog.insns.len() + 1);
@@ -813,6 +827,7 @@ fn emit_pass(prog: &VerifiedProgram) -> Result<(Emit, Vec<u32>), JitError> {
             arena[i],
             in_main,
             cur_stack,
+            map_imm64,
         )?;
         i += width;
         // A wide instruction (`LD_IMM64`) occupies two slots. Its own offset is
@@ -1369,6 +1384,7 @@ fn emit_insn(
     arena: bool,
     in_main: bool,
     cur_stack: u32,
+    map_imm64: &[(u32, u64)],
 ) -> Result<(), JitError> {
     // The arena forms first: same instructions, different addressing, and a
     // recorded fault site. Only the doubleword width is emitted, matching the
@@ -1471,13 +1487,26 @@ fn emit_insn(
             );
         }
 
-        // A plain 64-bit constant is the 10-byte `mov r64, imm64`. The map and
-        // subprogram pseudo-forms resolve to addresses this pass does not have,
-        // so they fall through to `Unsupported` and run interpreted.
-        Decoded::LoadImm64 {
-            dst,
-            value: Imm64::Value(v),
-        } => mov_reg_imm64(e, host(dst), v as i64),
+        // A plain 64-bit constant is the 10-byte `mov r64, imm64`. A map
+        // pseudo-form is the same instruction over the address the loader
+        // resolved (a stable `Arc` pointer the program keeps alive); the
+        // subprogram-address and BTF-id forms are never resolved, so they fall to
+        // `Unsupported` and run interpreted.
+        Decoded::LoadImm64 { dst, value } => {
+            let imm = match value {
+                Imm64::Value(v) => v as i64,
+                _ => match map_imm64.binary_search_by_key(&at, |&(i, _)| i) {
+                    Ok(k) => map_imm64[k].1 as i64,
+                    Err(_) => {
+                        return Err(JitError::Unsupported {
+                            at,
+                            what: "unresolved LD_IMM64 pseudo-form",
+                        })
+                    }
+                },
+            };
+            mov_reg_imm64(e, host(dst), imm);
+        }
 
         Decoded::Alu {
             wide,
