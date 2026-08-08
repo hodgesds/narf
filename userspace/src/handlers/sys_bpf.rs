@@ -272,6 +272,18 @@ const TFQ_FD_TYPE: usize = 28;
 const TFQ_PROBE_OFFSET: usize = 32;
 const TFQ_PROBE_ADDR: usize = 40;
 
+/// Resolve the program `(id, fd_type)` behind a task fd. Backed by the
+/// perf-event layer, a `linux-compat` feature; without it there is no fd kind
+/// that carries a program, so this is `None` and the query returns `ENOTSUP`.
+#[cfg(feature = "linux-compat")]
+fn task_fd_prog_id(fd: u32) -> Option<(u32, u32)> {
+    crate::perf_event::bpf_task_fd_query(fd)
+}
+#[cfg(not(feature = "linux-compat"))]
+fn task_fd_prog_id(_fd: u32) -> Option<(u32, u32)> {
+    None
+}
+
 /// `BPF_TASK_FD_QUERY` — given a task's fd that carries a BPF program, report
 /// which program and what kind of fd it is.
 ///
@@ -296,7 +308,7 @@ fn task_fd_query(attr_uptr: u64, size: usize) -> i64 {
     if pid != 0 && pid != me {
         return -ENOTSUP;
     }
-    let (prog_id, fd_type) = match crate::perf_event::bpf_task_fd_query(u32_at(&attr, TFQ_FD)) {
+    let (prog_id, fd_type) = match task_fd_prog_id(u32_at(&attr, TFQ_FD)) {
         Some(x) => x,
         // An fd with no BPF program attached — Linux's `ENOTSUPP`.
         None => return -ENOTSUP,

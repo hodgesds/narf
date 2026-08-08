@@ -1,0 +1,42 @@
+[package]
+name         = "narf-bpf-idle"
+description  = "BPF idle governor: the first struct_ops consumer, binding a verified BPF program set to narf-power's pluggable C-state selector."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_bpf_idle"
+path = "src/lib.rs"
+
+[dependencies]
+narf-capabilities  = { path = "../capabilities" }
+narf-bpf-structops = { path = "../bpf/structops" }
+narf-power         = { path = "../power" }
+
+# Test-only. The non-test surface names only `ProgSet` (from narf-bpf-structops)
+# and the power types, so the BPF runtime itself is pulled in only by the smokes
+# that assemble and load the programs they bind.
+narf-lib          = { path = "../lib", optional = true }
+narf-bpf          = { path = "../bpf", optional = true }
+narf-bpf-isa      = { path = "../bpf/isa", optional = true }
+narf-bpf-verifier = { path = "../bpf/verifier", optional = true }
+narf-kernel-test  = { path = "../verification/kernel-test", optional = true }
+
+[features]
+# In-kernel smokes, registered through `narf-kernel-test` into `narf.tests`.
+kernel-test = [
+    "dep:narf-kernel-test",
+    "dep:narf-bpf",
+    "dep:narf-bpf-isa",
+    "dep:narf-bpf-verifier",
+    "dep:narf-lib",
+    # Cascade the framework crate's smokes on too, so enabling the `bpf` test
+    # feature (which reaches this crate) also compiles the `bpf/structops` tests.
+    "narf-bpf-structops/kernel-test",
+]
+
+[lints]
+workspace = true

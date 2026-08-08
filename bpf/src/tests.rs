@@ -807,247 +807,6 @@ fn smoke_bpf_probe_attach_rejects_sleepable_program() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_probe_attach_rejects_sleepable_program);
 
-// ── struct_ops ──────────────────────────────────────────────────────
-
-crate::struct_ops! {
-    /// A minimal pluggable trait, exercising the `struct_ops!` macro, the
-    /// `narf.structops` section, the cap-gated install path, and the generated
-    /// adapter that dispatches through BPF programs.
-    #[cap(IdleGovernor)]
-    #[install(install_bpf_demo_governor)]
-    #[desc(DEMO_GOVERNOR_OPS)]
-    #[adapter(BpfDemoGovernor)]
-    #[optional(init)]
-    pub trait DemoGovernor {
-        /// Pick an idle state for an expected idle duration.
-        fn select_state(&self, expected_idle_ns: u64) -> u32;
-        /// Optional one-time setup.
-        fn init(&self) -> i32;
-    }
-}
-
-/// A native in-tree implementation.
-///
-/// The point of the whole `struct_ops!` design is that the trait comes out of
-/// the macro *unchanged*, so a Rust impl needs to know nothing about BPF. This
-/// is that claim, compiled.
-struct NativeDemoGovernor;
-
-impl DemoGovernor for NativeDemoGovernor {
-    fn select_state(&self, expected_idle_ns: u64) -> u32 {
-        if expected_idle_ns > 1_000_000 {
-            2
-        } else {
-            0
-        }
-    }
-    fn init(&self) -> i32 {
-        0
-    }
-}
-
-fn smoke_bpf_structops_native_impl_still_works() -> TestResult {
-    let g = NativeDemoGovernor;
-    if g.select_state(10) != 0 || g.select_state(2_000_000) != 2 || g.init() != 0 {
-        return TestResult::Fail("native impl of a struct_ops trait misbehaved");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("bpf", smoke_bpf_structops_native_impl_still_works);
-
-fn smoke_bpf_structops_descriptor_registered() -> TestResult {
-    let all = crate::structops::descriptors();
-    let Some(d) = all.iter().find(|d| d.name == "DemoGovernor") else {
-        return TestResult::Fail("narf.structops section did not carry DemoGovernor");
-    };
-    if d.cap != narf_capabilities::CapKind::IdleGovernor {
-        return TestResult::Fail("struct_ops descriptor carried the wrong CapKind");
-    }
-    if d.methods.len() != 2 {
-        return TestResult::Fail("struct_ops descriptor has the wrong method count");
-    }
-    // `#[optional(init)]` must reach the descriptor, or a program set could
-    // omit a required method and be installed anyway.
-    if d.methods[0].optional || !d.methods[1].optional {
-        return TestResult::Fail("#[optional] did not reach the method descriptors");
-    }
-    // The ctx tuple is the method's real argument list — one u64 here.
-    if d.methods[0].ctx.len() != 1 {
-        return TestResult::Fail("method ctx tuple was not derived from the signature");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("bpf", smoke_bpf_structops_descriptor_registered);
-
-/// The install authority for the demo trait.
-///
-/// `power::IdleGov` is the real marker for `CapKind::IdleGovernor`; declaring
-/// a local one keeps this crate off a `narf-power` dependency it otherwise has
-/// no use for. `CapType::KIND` is what `structops::install` compares, and both
-/// markers name the same kind.
-#[derive(Copy, Clone, Debug)]
-struct IdleGovInstall;
-impl narf_capabilities::CapType for IdleGovInstall {
-    const KIND: narf_capabilities::CapKind = narf_capabilities::CapKind::IdleGovernor;
-}
-
-fn smoke_bpf_structops_install_requires_matching_cap() -> TestResult {
-    use crate::structops::{ProgSet, StructOpsError};
-
-    let insns = asm(&[mov_imm(0, 1), EXIT]);
-    let Ok(prog) = load("gov", insns, Context::Atomic) else {
-        return TestResult::Fail("load rejected the governor program");
-    };
-
-    // Negative: the right shape, the wrong authority.
-    let wrong = Cap::<BpfProgLoad, Grant>::bootstrap();
-    let set = ProgSet::new().with("select_state", prog.clone());
-    match crate::structops::install(&DEMO_GOVERNOR_OPS, &wrong, set) {
-        Err(StructOpsError::WrongCapability { .. }) => {}
-        _ => return TestResult::Fail("install accepted a capability of the wrong kind"),
-    }
-
-    // Negative: right authority, missing a required method.
-    let right = Cap::<IdleGovInstall, Grant>::bootstrap();
-    match install_bpf_demo_governor(&right, ProgSet::new()) {
-        Err(StructOpsError::MissingMethod("select_state")) => {}
-        _ => return TestResult::Fail("install accepted a set missing a required method"),
-    }
-
-    // Positive: the optional method may be omitted.
-    let set = ProgSet::new().with("select_state", prog);
-    if install_bpf_demo_governor(&right, set).is_err() {
-        return TestResult::Fail("install rejected a complete program set");
-    }
-    if !crate::structops::is_installed("DemoGovernor") {
-        return TestResult::Fail("installed set was not recorded");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("bpf", smoke_bpf_structops_install_requires_matching_cap);
-
-// ── struct_ops: reaching a live slot via `#[commit(...)]` ────────────
-//
-// `DemoGovernor` above proves the macro, the adapter, and the cap-gated record.
-// What it does *not* prove is the last seam: an installed program set becoming
-// the implementation the subsystem's own hot path dispatches through. Without a
-// live slot the record is inert — `is_installed` sees it and nothing runs it.
-// `LiveGovernor` closes that gap. It owns the exact `IrqSafeSpinLock<Option<Box
-// <dyn Trait>>>` slot every `PLUGGABILITY.md` subsystem owns (standing in for
-// `power::IDLE_GOVERNOR` so the seam is exercised without a cross-crate dep),
-// and `#[commit(...)]` names the committer that moves the verified adapter into
-// it. The tests below load a program, install it, and observe the value coming
-// back out of the subsystem's own query path.
-
-crate::struct_ops! {
-    /// A pluggable trait that owns a live slot, exercising the `#[commit(...)]`
-    /// seam end to end.
-    #[cap(IdleGovernor)]
-    #[install(install_bpf_live_governor)]
-    #[desc(LIVE_GOVERNOR_OPS)]
-    #[adapter(BpfLiveGovernor)]
-    #[commit(commit_live_governor)]
-    pub trait LiveGovernor {
-        /// Pick an idle state for an expected idle duration.
-        fn select_state(&self, expected_idle_ns: u64) -> u32;
-    }
-}
-
-/// The live slot. The same shape `power::IDLE_GOVERNOR` has; `init()` or a
-/// native impl could occupy it just as well as a BPF program set.
-static LIVE_GOVERNOR: narf_lib::sync::IrqSafeSpinLock<Option<alloc::boxed::Box<dyn LiveGovernor>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
-
-/// The committer named by `#[commit(commit_live_governor)]`. Moves the verified
-/// adapter into the live slot, exactly as `power::install_idle_governor` moves
-/// a native governor into its slot. Generic over the cap marker so any
-/// authority of the right kind works, which is what lets the generated install
-/// fn stay generic.
-fn commit_live_governor<M: narf_capabilities::CapType>(
-    cap: &Cap<M, Grant>,
-    adapter: BpfLiveGovernor,
-) -> Result<(), crate::structops::StructOpsError> {
-    // The set was validated before the adapter was built; this is the same
-    // last-moment liveness re-check the native install points perform.
-    cap.check_live()?;
-    *LIVE_GOVERNOR.lock() = Some(alloc::boxed::Box::new(adapter));
-    Ok(())
-}
-
-/// The subsystem's hot-path query, dispatching through whatever is installed.
-/// `None` until something occupies the slot, mirroring the "not yet" semantics
-/// of `power::current_idle_governor_name`.
-fn live_governor_select_state(expected_idle_ns: u64) -> Option<u32> {
-    LIVE_GOVERNOR
-        .lock()
-        .as_ref()
-        .map(|g| g.select_state(expected_idle_ns))
-}
-
-fn smoke_bpf_structops_commit_reaches_live_slot() -> TestResult {
-    // r0 = ctx[0] * 2. A value the program computes, so the answer proves the
-    // installed program — not a native default or a stale slot — served the
-    // query, and that the argument reached it as ctx[0].
-    let insns = asm(&[ldx(0, 1, 0), alu_reg(AluOp::Add, 0, 0), EXIT]);
-    let Ok(prog) = load("livegov", insns, Context::Atomic) else {
-        return TestResult::Fail("load rejected the governor program");
-    };
-
-    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
-    let set = crate::structops::ProgSet::new().with("select_state", prog);
-    if let Err(_e) = install_bpf_live_governor(&cap, set) {
-        return TestResult::Fail("commit install rejected a complete program set");
-    }
-
-    // The record still happens — a committed trait is `is_installed` too.
-    if !crate::structops::is_installed("LiveGovernor") {
-        return TestResult::Fail("committed install did not record the set");
-    }
-
-    // The whole point: the subsystem's own query now dispatches through the
-    // installed program.
-    match live_governor_select_state(21) {
-        Some(42) => {}
-        Some(_) => return TestResult::Fail("live slot returned the wrong value"),
-        None => return TestResult::Fail("commit did not populate the live slot"),
-    }
-    // A second call proves the slot stays populated and re-dispatches per call
-    // rather than caching the first answer.
-    if live_governor_select_state(50) != Some(100) {
-        return TestResult::Fail("live slot did not re-dispatch on a second call");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("bpf", smoke_bpf_structops_commit_reaches_live_slot);
-
-fn smoke_bpf_structops_commit_rejects_before_touching_slot() -> TestResult {
-    // The negative: a set that fails validation must never reach the live slot.
-    // Empty the slot first so a leftover install from another test can't make
-    // this pass for the wrong reason.
-    *LIVE_GOVERNOR.lock() = None;
-
-    // Wrong authority kind — validated and rejected before any adapter is
-    // built, so the committer never runs.
-    let wrong = Cap::<BpfProgLoad, Grant>::bootstrap();
-    let insns = asm(&[mov_imm(0, 1), EXIT]);
-    let Ok(prog) = load("livegov_bad", insns, Context::Atomic) else {
-        return TestResult::Fail("load rejected the governor program");
-    };
-    let set = crate::structops::ProgSet::new().with("select_state", prog);
-    match install_bpf_live_governor(&wrong, set) {
-        Err(crate::structops::StructOpsError::WrongCapability { .. }) => {}
-        _ => return TestResult::Fail("committed install accepted the wrong cap kind"),
-    }
-    if live_governor_select_state(1).is_some() {
-        return TestResult::Fail("a rejected install still reached the live slot");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "bpf",
-    smoke_bpf_structops_commit_rejects_before_touching_slot
-);
-
 fn smoke_bpf_interp_wrapping_ctx_access_traps() -> TestResult {
     // r0 = -1; r1 = *(u8 *)(r0 + 0)
     //
@@ -2401,59 +2160,6 @@ fn smoke_bpf_jit_diff_stack_and_ctx_sweep() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_jit_diff_stack_and_ctx_sweep);
-
-fn smoke_bpf_structops_adapter_dispatches() -> TestResult {
-    // The generated adapter is what Linux spends a code generator on. Linux
-    // needs `arch_prepare_bpf_trampoline` (306 lines of assembly emission)
-    // because it patches into an arbitrary function's `__fentry__` nop, where
-    // there is no host language to interpose. NARF's struct_ops targets are
-    // trait slots with a Rust-level install point, so the adapter is an
-    // ordinary `impl` — this test is that claim, executed.
-    //
-    // The program returns its first context word doubled, so the result proves
-    // the argument reached it as ctx[0] rather than being zero or stale.
-    let insns = asm(&[ldx(0, 1, 0), alu_reg(AluOp::Add, 0, 0), EXIT]);
-    let Ok(prog) = load("gov", insns, Context::Atomic) else {
-        return TestResult::Fail("load rejected the governor program");
-    };
-    let set = crate::structops::ProgSet::new().with("select_state", prog);
-    let gov = BpfDemoGovernor::new(set);
-
-    if gov.select_state(21) != 42 {
-        return TestResult::Fail("adapter did not pass the argument as ctx[0]");
-    }
-    if gov.select_state(0) != 0 {
-        return TestResult::Fail("adapter returned a stale value");
-    }
-    // `init` is `#[optional]` and unbound, so it must fall back rather than
-    // fabricate. Returning nonsense from a policy hook is worse than returning
-    // the default.
-    if gov.init() != 0 {
-        return TestResult::Fail("unbound optional method did not fall back");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("bpf", smoke_bpf_structops_adapter_dispatches);
-
-fn smoke_bpf_structops_adapter_is_the_trait() -> TestResult {
-    // The adapter must be usable anywhere the trait is — that is the whole
-    // point of the trait coming out of the macro unchanged. Exercised through a
-    // `&dyn` so nothing can be specialised away.
-    let insns = asm(&[mov_imm(0, 7), EXIT]);
-    let Ok(prog) = load("gov7", insns, Context::Atomic) else {
-        return TestResult::Fail("load rejected");
-    };
-    let bpf = BpfDemoGovernor::new(crate::structops::ProgSet::new().with("select_state", prog));
-    let native = NativeDemoGovernor;
-    let both: [&dyn DemoGovernor; 2] = [&bpf, &native];
-    if both[0].select_state(1) != 7 {
-        return TestResult::Fail("BPF impl did not dispatch through &dyn");
-    }
-    // The native impl still works and still has no idea BPF exists.
-    let _ = both[1].select_state(1);
-    TestResult::Pass
-}
-kernel_test_in!("bpf", smoke_bpf_structops_adapter_is_the_trait);
 
 // ── XDP attach ──────────────────────────────────────────────────────
 
@@ -4583,3 +4289,139 @@ fn smoke_bpf_ringbuf_poll_readiness_tracks_data() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_bpf_ringbuf_poll_readiness_tracks_data);
+
+// ── hardware-domain confinement ──────────────────────────────────────
+
+/// The fence `run_atomic` runs programs behind: while confined to the BPF
+/// domain, a store into another subsystem's domain (here SCHED, a stand-in
+/// for the cap table / scheduler / a driver) takes a protection-key `#PF`,
+/// while a store into the BPF domain's own memory succeeds and FRAME stays
+/// reachable throughout. This is the hardware analogue of
+/// `smoke_bpf_interp_wild_load_traps_not_faults`: the proof that a verifier
+/// or JIT escape reaching outside the program's memory is contained rather
+/// than catastrophic. Mirrors `memory`'s `smoke_pks_enforces_deny_all`, but
+/// through `crate::domain::enter()` — the exact path `run_atomic` takes.
+#[cfg(target_arch = "x86_64")]
+fn smoke_bpf_domain_confines_cross_domain_writes() -> TestResult {
+    use core::arch::asm;
+    use narf_arch::x86_64::{probe, Features};
+    use narf_lib::id::DomainId;
+    use narf_memory::paging::{map_4kb, read_cr3, unmap_4kb, PtFlags};
+    use narf_memory::{alloc_frame, free_frame, FrameAllocError, VirtAddr};
+
+    // SAFETY: CPUID is always legal.
+    if !unsafe { Features::probe() }.pks {
+        return TestResult::Skip("PKS not exposed");
+    }
+
+    // SAFETY: the allocator is up and read_cr3 is always safe.
+    let pml4 = unsafe { read_cr3() };
+    let denied = match alloc_frame() {
+        Ok(f) => f,
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    let owned = match alloc_frame() {
+        Ok(f) => f,
+        Err(_) => {
+            free_frame(denied);
+            return TestResult::Fail("alloc_frame failed");
+        }
+    };
+
+    // Two 4 KiB leaves in the kernel PML4's empty user-reserved range (the
+    // same range memory/'s PKS smoke uses), distinct pages so they never
+    // collide with it: one tagged into a domain the BPF fence denies, one
+    // into the BPF domain it allows.
+    let denied_va = VirtAddr::new(0x0000_0102_0000_2000);
+    let owned_va = VirtAddr::new(0x0000_0102_0000_3000);
+    // SAFETY: live PML4 modification into an empty range.
+    let mapped = unsafe {
+        map_4kb(
+            pml4,
+            denied_va,
+            denied.start_address(),
+            PtFlags::WRITABLE | PtFlags::pk(DomainId::SCHED.raw()),
+        )
+        .and_then(|()| {
+            map_4kb(
+                pml4,
+                owned_va,
+                owned.start_address(),
+                PtFlags::WRITABLE | PtFlags::pk(DomainId::BPF.raw()),
+            )
+        })
+    };
+    if mapped.is_err() {
+        // SAFETY: undo whatever mapped; unmapping an absent VA is harmless.
+        unsafe {
+            let _ = unmap_4kb(pml4, denied_va);
+            let _ = unmap_4kb(pml4, owned_va);
+        }
+        free_frame(denied);
+        free_frame(owned);
+        return TestResult::Fail("map_4kb of a test page failed");
+    }
+
+    // Enter the fence. FRAME stays rw — our stack, the probe machinery, and
+    // the #PF handler all keep working — while SCHED is denied and BPF
+    // allowed.
+    let confined = crate::domain::enter();
+
+    // (1) A store into the denied (SCHED) domain must PK-fault.
+    let recover_a: u64;
+    // SAFETY: LEA of a local label.
+    unsafe {
+        asm!("lea {r}, [2f + rip]", r = out(reg) recover_a, options(nostack, preserves_flags));
+    }
+    probe::arm(recover_a);
+    // SAFETY: a store expected to fault; recovery lands at label 2.
+    unsafe {
+        asm!("mov byte ptr [{p}], 1", "2:", p = in(reg) denied_va.raw(), options(nostack));
+    }
+    let denied_caught = probe::disarm();
+
+    // (2) A store into the program's own (BPF) domain must succeed.
+    let recover_b: u64;
+    // SAFETY: LEA of a local label.
+    unsafe {
+        asm!("lea {r}, [3f + rip]", r = out(reg) recover_b, options(nostack, preserves_flags));
+    }
+    probe::arm(recover_b);
+    // SAFETY: a store expected to succeed; label 3 is the fall-through.
+    unsafe {
+        asm!("mov byte ptr [{p}], 1", "3:", p = in(reg) owned_va.raw(), options(nostack));
+    }
+    let owned_caught = probe::disarm();
+
+    // Leave the fence before touching denied memory again (the unmap below
+    // walks page tables in FRAME, but restoring is the honest bracket).
+    drop(confined);
+
+    // SAFETY: live PML4 modification.
+    unsafe {
+        let _ = unmap_4kb(pml4, denied_va);
+        let _ = unmap_4kb(pml4, owned_va);
+    }
+    free_frame(denied);
+    free_frame(owned);
+
+    match denied_caught.vector {
+        None => {
+            return TestResult::Fail("a store into a denied domain did not fault under the fence")
+        }
+        Some(14) => {}
+        Some(_) => return TestResult::Fail("wrong vector (not #PF) on the denied store"),
+    }
+    if denied_caught.error_code & (1 << 5) == 0 {
+        return TestResult::Fail("denied store faulted, but not with the PK bit (5) set");
+    }
+    if owned_caught.vector.is_some() {
+        return TestResult::Fail("a store into the BPF domain faulted under the fence");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bpf", smoke_bpf_domain_confines_cross_domain_writes);

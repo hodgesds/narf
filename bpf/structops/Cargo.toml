@@ -1,0 +1,28 @@
+[package]
+name         = "narf-bpf-structops"
+description  = "The struct_ops! extension macro and its program-set registry, split from narf-bpf so subsystem consumers depend on the seam, not the whole runtime."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_bpf_structops"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-capabilities = { path = "../../capabilities" }
+narf-bpf          = { path = ".." }
+narf-bpf-verifier = { path = "../verifier" }
+narf-bpf-isa      = { path = "../isa", optional = true }
+narf-kernel-test  = { path = "../../verification/kernel-test", optional = true }
+
+[features]
+# In-kernel smokes, registered through `narf-kernel-test` into `narf.tests`.
+# The isa helpers assemble the programs the smokes load, so they ride along.
+kernel-test = ["dep:narf-kernel-test", "dep:narf-bpf-isa"]
+
+[lints]
+workspace = true

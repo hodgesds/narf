@@ -22,19 +22,51 @@ Reading list: [`research/README.md`](research/README.md).
 
 ## Where it is
 
-Landed: the instruction layer, the kfunc/struct_ops contract, the runtime with
-its fuel-metered interpreter, `bpf(2)`'s `BPF_PROG_LOAD` and
-`BPF_PROG_TEST_RUN`, and the first attach surface (dynamic probes).
+Landed:
 
-Not yet: the abstract interpreter (`verify()` returns `NotImplemented` and
-`bpf/src/provisional.rs` carries a structural stand-in), maps and arenas, the
-JIT and its RX allocator, struct_ops trampolines, and the net/perf attach
-surfaces.
+- **Instruction layer** — encode/decode/disassemble for the whole ISA.
+- **Verifier** — the abstract interpreter is real: `verify()` runs
+  `fixpoint::run` over the type graph, enforcing pointer classes, bounds, and
+  the single validity-domain rule (sleep safety + lock discipline + reference
+  tracking). Raw pointer deref is rejected; there is no `bpf_probe_read`.
+- **Runtime** — the fuel-metered interpreter, and the x86_64/aarch64 **JIT**
+  behind it. `run_atomic` enters native code once the verifier has proved the
+  program and falls back to the interpreter otherwise. The JIT lowers the full
+  loadable instruction set; the residual falls back (below).
+- **Maps & arenas** — five map kinds (array, hash, per-CPU array/hash, ringbuf)
+  plus program arenas.
+- **Extension contracts** — the `kfunc!` and `struct_ops!` macros (Rust-native
+  type descriptors, no BTF, no trampoline).
+- **Attach surfaces** — dynamic probes, net classifier (XDP), perf, struct_ops.
+- **`bpf(2)`** — load, test-run, the full map element and batch ops, object info
+  and id/fd enumeration for progs/maps/links/BTF, pin/get, attach/detach, link
+  create/update/detach, prog-query, task-fd-query, and iterators.
 
-**The JIT must not be enabled before the real verifier is.** Today's safety
-comes from the interpreter never dereferencing a program-supplied address —
-pointers index synthetic regions and every access is bounds-checked. JITed
-code gives that up in exchange for the verifier plus the extable plus the
-arena guard slots, which is the right trade only once the verifier exists.
+Residual: JIT lowering of arena atomics and arena access under a subprogram call
+(register-allocation blockers — these fall back to the interpreter); typed
+object access for tracing; and hardware domain confinement (below).
 
-Stage 5+.
+The JIT is enabled **behind the verifier**: the interpreter's safety came from
+never dereferencing a program-supplied address, and native code trades that for
+the verifier plus the extable plus the arena guard slots — the right trade only
+once the verifier exists, which it now does.
+
+## Hardware confinement (design)
+
+BPF is the one Ring-0 subsystem that runs attacker-authored code. Its own
+framekernel domain, `DomainId::BPF`, now confines it: `run_atomic` runs every
+program behind `enter_domain(FRAME, BPF)` on PKS silicon, so a verifier or JIT
+escape that stores into another subsystem's domain (the cap table, the scheduler,
+a driver) takes a protection-key fault instead of an arbitrary Ring-0 write —
+hardware defense-in-depth *under* the verifier. FRAME stays reachable, so the
+interpreter, the kfunc shims, and the fault handler keep working; the fence is a
+no-op on AMD PCID / aarch64 MTE (deferred). Because NARF BPF already reaches
+memory only through its own stack/ctx/maps/arena (no raw kernel deref, no
+`bpf_probe_read`), it cost the runtime nothing. Observability, if it ever lands,
+reads through a Frame-mediated `narf_probe_read` kfunc that accepts only
+verifier-tracked pointers — never a raw address — so the fence holds for tracing.
+
+Full design, threat model, the FRAME-stays-writable rationale, the tracing read
+model, why BTF is not the path there, and what remains (subsystem memory-tagging,
+the PCID/MTE backends) are in
+[`specification/domain-confinement.md`](specification/domain-confinement.md).

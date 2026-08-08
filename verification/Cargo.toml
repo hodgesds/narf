@@ -22,6 +22,8 @@ narf-scheduler   = { path = "../scheduler" }
 narf-capabilities = { path = "../capabilities" }
 narf-tracing    = { path = "../tracing" }
 narf-bpf        = { path = "../bpf" }
+narf-bpf-structops = { path = "../bpf/structops" }
+narf-bpf-idle   = { path = "../bpf-idle" }
 narf-bus        = { path = "../bus" }
 narf-boot       = { path = "../boot" }
 narf-rcu        = { path = "../rcu" }

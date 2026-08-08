@@ -649,7 +649,7 @@ fn smoke_id_domain_constants_match_security_model() -> TestResult {
         (DomainId::DRIVER_2, 11, "DRIVER_2"),
         (DomainId::DRIVER_3, 12, "DRIVER_3"),
         (DomainId::DRIVER_4, 13, "DRIVER_4"),
-        (DomainId::DRIVER_5, 14, "DRIVER_5"),
+        (DomainId::BPF, 14, "BPF"),
         (DomainId::SCRATCH, 15, "SCRATCH"),
     ];
     for &(d, raw, _name) in pins {

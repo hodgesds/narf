@@ -77,7 +77,13 @@ impl DomainId {
     pub const DRIVER_2: Self = Self::new(11);
     pub const DRIVER_3: Self = Self::new(12);
     pub const DRIVER_4: Self = Self::new(13);
-    pub const DRIVER_5: Self = Self::new(14);
+    /// The BPF runtime's own PKS/MTE domain. A verified program's JIT'd
+    /// native code runs confined to this pkey, so a verifier escape is
+    /// contained here instead of reaching FRAME or a driver domain (see
+    /// `bpf/specification/domain-confinement.md`). Took the former
+    /// `DRIVER_5` slot — the driver pool is now `DRIVER_0..=DRIVER_4` —
+    /// because the 16-key hardware budget was full.
+    pub const BPF: Self = Self::new(14);
     pub const SCRATCH: Self = Self::new(15);
 }
 

@@ -273,7 +273,7 @@ fn resolve_target(attach_type: u32, target: u32) -> Result<LinkTarget, i64> {
         // LINUX-GAP: cgroup hooks, sockmap/sk_msg, LSM, flow dissector,
         // struct_ops-as-a-link, netfilter, tcx, perf events, kprobe/uprobe
         // multi, and the rest. NARF has no surface for any of them —
-        // `struct_ops` installs through `narf_bpf::structops::install`, which is
+        // `struct_ops` installs through `narf_bpf_structops::install`, which is
         // a kernel-side trait slot rather than an fd-shaped link. `ENOTSUP`
         // says "this kernel does not do that"; the `EINVAL` below says "that is
         // not a thing".
@@ -450,6 +450,14 @@ pub(crate) fn bpf_iter_create(attr_uptr: u64, size: usize) -> i64 {
         Some(Some(o)) => o,
         _ => return -EBADF,
     };
+    // Iterators live in `crate::bpf_iter`, a linux-compat module; without it
+    // the command has no backing.
+    #[cfg(not(feature = "linux-compat"))]
+    {
+        let _ = &ops;
+        -ENOTSUP
+    }
+    #[cfg(feature = "linux-compat")]
     match crate::bpf_iter::iter_from_link(&ops) {
         Some(iter) => open_cloexec_fd(iter),
         // The fd is real but is not an iterator link.
@@ -461,15 +469,24 @@ pub(crate) fn bpf_iter_create(attr_uptr: u64, size: usize) -> i64 {
 /// back an iterator-link fd. The kind rides in `target_fd`, NARF's stand-in for
 /// Linux's BTF `iter_info`.
 fn create_iter_link(attr: &[u8; ATTR_BUF]) -> i64 {
-    let kind = u32_at(attr, LC_TARGET);
-    if kind >= crate::bpf_iter::ITER_KIND_COUNT {
-        return -EINVAL;
+    // Iterator links live in `crate::bpf_iter`, a linux-compat module.
+    #[cfg(not(feature = "linux-compat"))]
+    {
+        let _ = attr;
+        -ENOTSUP
     }
-    let prog = match prog_from_fd(u32_at(attr, LC_PROG_FD)) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    open_cloexec_fd(Arc::new(crate::bpf_iter::IterLinkFile::new(prog, kind)))
+    #[cfg(feature = "linux-compat")]
+    {
+        let kind = u32_at(attr, LC_TARGET);
+        if kind >= crate::bpf_iter::ITER_KIND_COUNT {
+            return -EINVAL;
+        }
+        let prog = match prog_from_fd(u32_at(attr, LC_PROG_FD)) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        open_cloexec_fd(Arc::new(crate::bpf_iter::IterLinkFile::new(prog, kind)))
+    }
 }
 
 pub(crate) fn bpf_link_update(attr_uptr: u64, size: usize) -> i64 {

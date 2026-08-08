@@ -36,6 +36,7 @@ pub mod attach;
 pub mod attach_xdp;
 #[cfg(feature = "bench")]
 pub mod bench;
+pub mod domain;
 pub mod idreg;
 pub mod interp;
 pub mod jit_glue;
@@ -47,7 +48,6 @@ pub mod mem;
 pub mod prog;
 pub mod provisional;
 pub mod ringbuf;
-pub mod structops;
 pub mod types;
 
 #[cfg(feature = "kernel-test")]
@@ -55,11 +55,12 @@ mod kfunc_tests;
 #[cfg(feature = "kernel-test")]
 mod tests;
 
-/// Types the `kfunc!` and `struct_ops!` macros name in their expansions.
+/// Types the `kfunc!` macro names in its expansion.
 ///
-/// Re-exported so a crate that invokes them needs no direct dependency on
+/// Re-exported so a crate that invokes it needs no direct dependency on
 /// `narf-bpf-verifier` or `narf-capabilities` — the same courtesy
-/// `kernel_test!` extends by naming everything through `$crate`.
+/// `kernel_test!` extends by naming everything through `$crate`. The
+/// `struct_ops!` macro lives in `narf-bpf-structops`, which carries its own.
 pub mod reexport {
     pub use narf_bpf_verifier::kfunc::{ArgDesc, ArgFlags, Context, PtrKind, TypeKey, TypeKind};
     pub use narf_capabilities::{Cap, CapKind, CapType, Grant};
@@ -71,7 +72,6 @@ pub use kfunc::{KfuncEntry, KfuncShim, Registry, RegistryError};
 pub use link::{BpfLink, LinkCaps, LinkError, LinkFile, LinkTarget};
 pub use map::{ArrayMap, BpfMap, BpfMapCap, BpfMapOps, HashMap, MapAttr, MapError, MapKind};
 pub use prog::{BpfAttach, BpfProg, BpfProgLoad, LoadError, LoadRequest};
-pub use structops::{ProgSet, StructOpsDesc, StructOpsError};
 pub use types::{ArenaPtr, BpfObject, BpfType, Const, Guard, Owned, Rcu, SleepableRcu, Trusted};
 
 /// Boot-time bring-up.
@@ -181,6 +181,6 @@ impl Drop for ReclaimOnGracePeriod {
 pub fn summary() -> (usize, usize) {
     (
         kfunc::registry().map_or(0, kfunc::Registry::len),
-        structops::descriptors().len(),
+        idreg::progs().len(),
     )
 }

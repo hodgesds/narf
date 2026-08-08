@@ -44,7 +44,7 @@ use narf_bpf_verifier::kfunc::ArgDesc;
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::prog::BpfProg;
+use narf_bpf::prog::BpfProg;
 
 /// One method of a struct_ops trait, as the verifier sees it.
 #[derive(Copy, Clone, Debug)]
@@ -83,7 +83,7 @@ extern "Rust" {
 /// Every `struct_ops!`-declared trait in the image.
 #[must_use]
 pub fn descriptors() -> &'static [StructOpsDesc] {
-    // SAFETY: as `crate::kfunc::entries` — the linker synthesises the
+    // SAFETY: as `narf_bpf::kfunc::entries` — the linker synthesises the
     // bracketing symbols around the `narf.structops` section, whose only
     // writer is the `struct_ops!` macro, and `StructOpsDesc`'s size is a
     // multiple of its alignment so elements sit back to back.
@@ -515,7 +515,7 @@ macro_rules! struct_ops {
         ///
         /// # Errors
         ///
-        /// See [`narf_bpf::structops::install`](crate::structops::install).
+        /// See [`narf_bpf_structops::structops::install`](narf_bpf_structops::structops::install).
         $vis fn $install<M: $crate::reexport::CapType>(
             cap: &$crate::reexport::Cap<M, $crate::reexport::Grant>,
             set: $crate::structops::ProgSet,
